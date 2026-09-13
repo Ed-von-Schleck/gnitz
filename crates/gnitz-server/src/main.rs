@@ -228,7 +228,7 @@ fn main() {
     };
 
     gnitz_foundation::log::init(level, b"M");
-    let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level, tls_cli);
+    let rc = runtime::server_main(&data_dir, &socket_path, num_workers, tls_cli);
     process::exit(rc);
 }
 

@@ -67,6 +67,51 @@ def test_a_checkpoint_cut_resumes_live_and_replays_only_the_tail(own_server):
     _assert_doubled(own_server, "ct", range(1, 11), "cut + tail, each row once")
 
 
+def test_a_stateful_view_resumes_from_its_operator_traces(own_server):
+    """A GROUP BY view holds operator traces in `scratch_*` children of its own,
+    where a projection holds none — so it is the only shape whose resume verdict
+    reads trace manifests at all, and the only one that can catch an output store
+    stamped at a generation its traces never reached.
+
+    Two graceful stops, because the two boots compile the view by different
+    routes: the first checkpoints a view the CREATE compiled, the second one the
+    boot tick sweep compiled. A trace left behind by either shows up as a rebuild
+    on the boot after it."""
+    sn = "stateful"
+    rows = {k: (k % 3, k * 10) for k in range(1, 10)}
+    own_server.start()
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.create_schema(sn)
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
+            "val BIGINT NOT NULL)", schema_name=sn)
+        conn.execute_sql(
+            "CREATE VIEW g AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp",
+            schema_name=sn)
+        conn.execute_sql(
+            "INSERT INTO t VALUES " + ", ".join(
+                f"({k}, {grp}, {val})" for k, (grp, val) in rows.items()),
+            schema_name=sn)
+    own_server.stop_graceful()
+
+    own_server.start()
+    assert own_server.rebuilt_view_count() == 0, \
+        "a stateful view must resume from its checkpointed traces"
+    own_server.stop_graceful()
+
+    own_server.start()
+    assert own_server.rebuilt_view_count() == 0, \
+        "the boot checkpoint must re-stamp the traces of a view the sweep compiled"
+
+    totals = {}
+    for grp, val in rows.values():
+        totals[grp] = totals.get(grp, 0) + val
+    with gnitz.connect(own_server.sock_path) as conn:
+        assert bag(scanned(conn, sn, "g"), "grp", "total") == {
+            (grp, total): 1 for grp, total in totals.items()}, \
+            "a resumed aggregate must hold one row per group at its true sum"
+
+
 @pytest.mark.parametrize("stage", ["genbump", "reset", "sweep", "backfill"])
 def test_a_crash_in_the_recovery_window_forces_a_correct_rebuild(stage, own_server):
     """Recovery boot-flushes the base to cut + tail, then durably bumps the

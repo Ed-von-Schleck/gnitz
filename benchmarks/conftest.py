@@ -10,7 +10,7 @@ import multiprocessing
 import os
 import shutil
 import subprocess
-import time
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,6 +21,11 @@ from helpers.timing import BenchTimer, get_all_results, record_result
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Spawn and reap a benchmark server exactly as the E2E harness does. Not through
+# `ServerProc`, which caps `GNITZ_SAL_BYTES`: a benchmark wants production sizing,
+# which is also why an orphaned master here pins a GiB-scale mapping.
+sys.path.insert(0, str(REPO_ROOT / "crates/gnitz-py/tests"))
+from _serverproc import await_ready, kill_group, server_preexec  # noqa: E402
 # Per-tier schema-name prefix, keyed by the test file's parent directory (tier).
 _TIER_PREFIX = {"micro": "bench", "combined": "comb", "features": "feat"}
 _schema_counter = itertools.count()
@@ -117,18 +122,20 @@ def server(request, results_dir):
 
     cmd = [binary, str(data_dir), str(sock_path), f"--workers={workers}"]
     log_f = open(log_path, "w")
-    proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
+    # `server_preexec` ties the master's life to this process, so an interrupted
+    # run orphans nothing; `start_new_session` is what `kill_group` needs.
+    proc = subprocess.Popen(
+        cmd, stdout=log_f, stderr=log_f,
+        start_new_session=True, preexec_fn=server_preexec,
+    )
 
-    for _ in range(100):
-        if sock_path.exists():
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill()
-        proc.wait()
+    try:
+        await_ready(proc, lambda: log_path.read_text(errors="replace"), 10.0)
+    except (RuntimeError, TimeoutError) as e:
+        kill_group(proc)
         log_f.close()
         shutil.rmtree(tmpdir, ignore_errors=True)
-        pytest.fail("Benchmark server did not start within 10s")
+        pytest.fail(str(e))
 
     perf_recorder = None
     if request.config.getoption("--perf") or request.config.getoption("--perf-dwarf"):
@@ -151,8 +158,7 @@ def server(request, results_dir):
     if perf_stat:
         perf_stat.stop()
 
-    proc.kill()
-    proc.wait()
+    kill_group(proc)
     log_f.close()
 
     # Preserve forensic evidence on failure. The SAL file is huge (~1 GB

@@ -121,6 +121,10 @@ impl DagEngine {
         self.evict_meta(view_id);
     }
 
+    /// Drop every memo. Only `close` and the tests that assert a cold
+    /// recompile want this: a memo is a pure function of the circuit and the
+    /// registry's schemas, so clearing one discards work rather than staleness.
+    #[cfg(test)]
     pub(crate) fn invalidate_all(&mut self) {
         self.cache.clear();
         self.meta.clear();

@@ -578,7 +578,6 @@ fn test_store_detach() {
     let entry = engine.registry().relation_or_err(tid).unwrap();
     assert!(!entry.cursor().valid, "a detached store reads empty");
     assert_eq!(entry.current_lsn(), 0);
-    engine.dag_mut().invalidate_all();
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

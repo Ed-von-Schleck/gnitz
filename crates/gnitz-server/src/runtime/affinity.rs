@@ -44,15 +44,14 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// The boot record, one CPU list per process:
-    /// `W0 [0, 1] W1 [2, 3] master [4, 5, 6, 7]`.
-    pub fn describe(&self) -> String {
-        let mut s = String::new();
+    /// Write the boot record, one line per process. Per process because a log
+    /// line is a fixed-size buffer, and one list for the whole placement grows
+    /// with both the worker count and the host's CPU count.
+    pub fn log_placement(&self) {
         for (w, cpus) in self.workers.iter().enumerate() {
-            s.push_str(&format!("W{w} {cpus:?} "));
+            gnitz_note!("affinity: W{w} {cpus:?}");
         }
-        s.push_str(&format!("master {:?}", self.master));
-        s
+        gnitz_note!("affinity: master {:?}", self.master);
     }
 
     /// Confine the master to the CPUs no worker owns.

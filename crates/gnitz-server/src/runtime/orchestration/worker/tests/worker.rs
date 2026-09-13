@@ -24,7 +24,7 @@ fn pending_deltas_accumulate_per_relation() {
 }
 
 /// Stage 0 wire-protocol contract: every reply helper (`send_ack`,
-/// `send_response`, `send_error`) must echo the inbound request_id back
+/// `send_response`, `send_fault`) must echo the inbound request_id back
 /// on the W2M region so the master reactor can route it. We fake out the
 /// W2M writer with a real anonymous mmap, fire each helper with a
 /// distinct id, then read the messages back through `decode_wire` and
@@ -46,7 +46,7 @@ fn send_helpers_echo_the_request_id() {
     // The id round-trip is the assertion of interest.
     wp.send_response(route(8, req_resp, 0), None, ReplySchema::ClientAuthored, 0u128, 0)
         .unwrap();
-    wp.send_error("boom", req_err);
+    wp.send_fault(&gnitz_wire::WireFault::from("boom"), req_err);
 
     let decoded_ids: Vec<u64> = walk_frames(region_ptr)
         .iter()

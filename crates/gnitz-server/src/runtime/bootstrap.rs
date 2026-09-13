@@ -3,13 +3,12 @@
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
 //! runs SAL recovery, and enters the executor event loop.
 //!
-//! **Recovery order is a crash guard.** Each step in `run_server` is placed so a
-//! crash at any point rebuilds a view rather than silently resuming a stale one,
-//! and the monotonic checkpoint generation is what carries that. The bumps that
-//! do the carrying are commented inline, next to the code that would falsify
-//! them.
+//! **Recovery order is a crash guard**: every step is placed so a crash at any
+//! point rebuilds a view rather than silently resuming a stale one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ops::Range;
+use std::rc::Rc;
 
 use crate::catalog::CatalogEngine;
 use gnitz_foundation::fault::Seam;
@@ -26,17 +25,7 @@ use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
 use gnitz_store::relation::Relation;
-use gnitz_store::storage::Batch;
-
-/// One boot-progress line, raw and untagged, on stderr — the master's own, or
-/// `<data_dir>/worker_N.log` in a forked child.
-///
-/// Use it for a line that must appear whatever the log level; `gnitz_info!` is
-/// silent at the default QUIET. stderr rather than stdout because the harnesses
-/// discard the server's stdout and keep its stderr for post-mortem.
-fn boot_log(msg: &str) {
-    let _ = posix_io::write_all_fd(2, msg.as_bytes());
-}
+use gnitz_store::storage::{Batch, Slot};
 
 // ---------------------------------------------------------------------------
 // SAL recovery: both drivers below read the log through `sal::zone::CommittedTail`
@@ -59,16 +48,8 @@ fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, 
 /// the flushed LSNs, then ingests every committed DdlSync batch addressed
 /// to a system table — orphan COL_TAB rows from a crashed DDL are skipped
 /// because their zone never closed.
-///
-/// Returns the walk's epoch — the floor the next writer epoch and the workers'
-/// initial `expected_epoch` are taken from.
-fn recover_system_tables_from_sal(log: SalLog, catalog: &mut CatalogEngine) -> Result<u32, String> {
+fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut CatalogEngine) -> Result<(), String> {
     let family_lsns = catalog.registry().system_flushed_lsns();
-
-    // Derived once, before either pass: on a boot whose offset-0 header is
-    // damaged this costs a full-ring sweep, and both passes must anchor on the
-    // same answer anyway.
-    let epoch = log.walk_epoch();
     let tail = CommittedTail::open(log, epoch, SalMessageKind::DdlSync, &family_lsns)?;
 
     let mut replayed: u32 = 0;
@@ -93,9 +74,9 @@ fn recover_system_tables_from_sal(log: SalLog, catalog: &mut CatalogEngine) -> R
     }
 
     if replayed > 0 {
-        boot_log(&format!("SAL system table recovery: replayed {replayed} entries\n"));
+        gnitz_note!("SAL system table recovery: replayed {replayed} entries");
     }
-    Ok(epoch)
+    Ok(())
 }
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
@@ -114,64 +95,60 @@ fn inject_recovery_panic(stage: &str) {
     }
 }
 
-/// Base tables feeding ≥1 view, sorted for a reproducible drive order. The ONE
-/// definition of the recovery sweep set: each worker buffers exactly these
-/// tables' effective deltas during SAL replay, and the master's post-reset tick
-/// sweep drains exactly these — same function, so the swept set equals the
-/// buffered set by construction (no leak, no gap).
+/// Base tables feeding ≥1 view that is keeping its checkpointed state, sorted
+/// for a reproducible drive order. Keyed on the boot verdict and not on what the
+/// tail contained, because the sweep is also what compiles a view at boot, and
+/// the boot checkpoint publishes traces only for compiled views.
 fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
-    let view_ids = catalog.registry().view_ids();
+    let keeps_state: Vec<i64> = catalog
+        .registry()
+        .view_ids()
+        .into_iter()
+        .filter(|&vid| !catalog.view_is_invalid(vid))
+        .collect();
     let (dag, registry) = catalog.dag_and_registry_mut();
-    dag.base_tables_reachable_from(registry, view_ids)
+    dag.base_tables_reachable_from(registry, keeps_state)
 }
 
-/// Per-worker post-fork user-table replay for `rank` of `num_workers`. The apply
-/// closure decodes each Push group's batch and applies it through the
-/// PK-enforcement path (`ingest_returning_effective`, the exact call
-/// `handle_push` makes) so retractions cancel correctly, and — for every base
-/// table feeding ≥1
-/// view — buffers the returned effective delta into the returned map. That map
-/// seeds the worker's `pending_deltas`; the master's post-reset recovery tick
-/// sweep drains it into the views. Viewless bases ingest-and-discard (nothing to
-/// drive), so their tail never leaks into the sweep.
-///
-/// Storeless relations are absent from `family_lsns`, so a stream group the
-/// committer coalesced into a base table's commit batch is neither validated by
-/// pass 1 nor applied by pass 2 — nothing a stream ingested is ever recovered,
-/// and a torn one cannot cost the base push beside it its zone.
-///
-/// The tail is written pre-sliced, one slot per worker of the boot that wrote it.
-/// At the launched count this rank's own slot already holds exactly its rows; at
-/// any other count it holds neither all of them nor only them, so every written
-/// slot is walked and each partitioned group re-cut for the launched topology.
+/// Which of a group's slots `slot` replays, and whether what it reads is still
+/// cut for another width. `written` is the group's own slot count.
+fn replay_slots(written: u32, slot: Slot, replicated: bool) -> (Range<u32>, bool) {
+    if written == slot.of {
+        // This rank's own slot: its share of a partitioned group, or the whole
+        // copy of a replicated one.
+        (slot.rank..slot.rank + 1, false)
+    } else if replicated {
+        // Every slot holds the same whole copy, so reading a second would add
+        // those rows' weights again.
+        (0..1, false)
+    } else {
+        // Written for another width, so no slot holds this rank's rows: walk
+        // every written slot and re-cut each for the launched topology.
+        (0..written, true)
+    }
+}
+
+/// Per-worker post-fork user-table replay for `slot`, applying each Push group
+/// through `ingest_returning_effective` — the exact call `handle_push` makes, so
+/// retractions cancel correctly. The returned map seeds the worker's
+/// `pending_deltas` for the master's tick sweep to drain into the views.
 fn recover_from_sal(
     log: SalLog,
-    rank: u32,
-    num_workers: u32,
+    slot: Slot,
     walk_epoch: u32,
+    swept_bases: &[i64],
     catalog: &mut CatalogEngine,
 ) -> Result<HashMap<i64, Batch>, String> {
     let family_lsns = catalog.registry().user_flushed_lsns();
-
-    let buffered_bases: HashSet<i64> = swept_base_tables(catalog).into_iter().collect();
-
     let tail = CommittedTail::open(log, walk_epoch, SalMessageKind::Push, &family_lsns)?;
 
     let mut pending: HashMap<i64, Batch> = HashMap::new();
+    // Groups that applied at least one slot, and the width a re-sliced tail was
+    // written at — the boot record's re-slice marker. No boot writes at a
+    // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
-    // Groups re-cut for the launched topology, and the width the last of them
-    // was written at — the boot record's re-slice marker.
-    let mut resliced: u32 = 0;
-    let mut written_slots: u32 = 0;
+    let mut resliced_from: Option<u32> = None;
     for msg in tail.groups() {
-        // Each group's own slot count, off the header in hand and inside its
-        // digest. A tail-wide probe reads one header for all of them, and a torn
-        // one picks the wrong mode — losing every slot above `rank`.
-        let reslice = msg.slots() != num_workers;
-        if reslice {
-            resliced += 1;
-            written_slots = msg.slots();
-        }
         let tid = msg.target_id as i64;
         // The catalog's schema, not the wire's: only the catalog stamps the
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
@@ -181,44 +158,32 @@ fn recover_from_sal(
             .relation(tid)
             .map(Relation::schema)
             .ok_or_else(|| format!("SAL replay: no schema for table_id={tid} (lsn={})", msg.lsn))?;
-        // Broadcast, not sliced: every slot holds the whole copy, so a second slot
-        // would re-ingest the same rows and add their weights again. Never re-sliced
-        // either — this worker needs the full copy, not a share of it.
-        let replicated = schema.placement().is_replicated();
-        let sliced = if reslice { 0..msg.slots() } else { rank..rank + 1 };
-        // A broadcast repeats one copy in every slot, so exactly one is read — and
-        // none at all when that slot went unwritten, which beats double-counting.
-        let wanted = if replicated {
-            sliced.start..sliced.start + 1
-        } else {
-            sliced
-        };
+        // Each group's own slot count, off the header in hand and inside its
+        // digest. A tail-wide probe would read one header for all of them, and a
+        // torn one picks the wrong mode — losing every slot above this rank.
+        let (wanted, reslice) = replay_slots(msg.slots(), slot, schema.placement().is_replicated());
+        if reslice {
+            resliced_from = Some(msg.slots());
+        }
+        let mut applied = false;
         for (_, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
             let decoded = decode_group_slot(&msg, data)?;
             let Some(mut batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
                 continue;
             };
-            // The one place an old-width batch enters the engine. A pre-ALTER
-            // `Push` frame decodes against its own embedded schema block, but the
-            // catalog is already at its final width here (the master applied every
-            // catalog SAL entry pre-fork, and workers replay pushes only). Widen ahead
-            // of the reslice, which rebuilds through `Batch::from_indexed_rows(&mb, …,
-            // &schema)` and would read `schema`'s payload columns past the narrower
-            // source's regions; the non-reslice arm's `enforce_unique_pk` accumulator
-            // is already shaped by the table schema. One site covers both.
-            let in_schema = decoded
-                .schema
-                .ok_or_else(|| format!("SAL replay: push frame carries no schema (lsn={})", msg.lsn))?;
-            if in_schema.num_payload_cols() < schema.num_payload_cols() {
+            // Above both arms because both need it: the re-cut reads `schema`'s
+            // payload columns off the batch, and `ingest_batch` rejects a
+            // payload-count mismatch outright.
+            if batch.schema().num_payload_cols() < schema.num_payload_cols() {
                 batch = batch.widened_with_null_tail(&schema);
             }
-            let owned = if reslice && !replicated {
+            let owned = if reslice {
                 // Re-cut with the write path's own router, so what survives is exactly
                 // what the master would have written to this rank's slot: same
                 // distribution-prefix hash, same key→worker map.
                 let mb = batch.as_mem_batch();
-                crate::runtime::master::scatter::with_worker_indices(&batch, &schema, num_workers as usize, |wi| {
-                    Batch::from_indexed_rows(&mb, &wi[rank as usize], &schema)
+                crate::runtime::master::scatter::with_worker_indices(&batch, &schema, slot.of as usize, |wi| {
+                    Batch::from_indexed_rows(&mb, &wi[slot.rank as usize], &schema)
                 })
             } else {
                 batch
@@ -226,10 +191,6 @@ fn recover_from_sal(
             if owned.is_empty() {
                 continue;
             }
-            // The error rides the startup ACK: the master fails boot BEFORE zeroing
-            // the SAL is rewound, so the replayed data's only durable copy survives.
-            // A swallowed error here would let the rewind orphan the un-applied
-            // committed data.
             let effective = catalog
                 .registry_mut()
                 .ingest_returning_effective(tid, owned)
@@ -239,61 +200,48 @@ fn recover_from_sal(
                         msg.target_id, msg.lsn
                     )
                 })?;
-            // Buffer the effective delta for the sweep; viewless bases discard it
-            // (nothing to drive).
-            if buffered_bases.contains(&tid) {
+            if swept_bases.contains(&tid) {
                 buffer_pending_delta(&mut pending, tid, effective);
             }
-            replayed += 1;
+            applied = true;
         }
+        replayed += u32::from(applied);
     }
 
     if replayed > 0 {
-        let mut line = format!("SAL replay: replayed {replayed} group(s)");
-        if resliced > 0 {
-            line += &format!(", {resliced} re-sliced from a {written_slots}-worker tail");
+        match resliced_from {
+            Some(n) => gnitz_note!("SAL replay: replayed {replayed} group(s), re-sliced from a {n}-worker tail"),
+            None => gnitz_note!("SAL replay: replayed {replayed} group(s)"),
         }
-        line += "\n";
-        boot_log(&line);
     }
     Ok(pending)
 }
 
-/// Worker-boot catalog recovery. The order below is required:
-///
-/// 1. Re-home every secondary index slice-local, replacing the fork-inherited
-///    full parent-dir copy, and rebuild the ones that did not resume from their
-///    checkpoint — BEFORE SAL replay, which projects the committed unflushed tail
-///    into each index exactly once (`ingest_store_and_indices`), so a rebuild
-///    afterwards would double-count every replayed row.
-/// 2. Replay unflushed push data from the SAL.
-/// 3. Flush the replayed rows to shards before accepting requests: the boot rewind
-///    puts the write cursor back to 0, so a second crash before a checkpoint would
-///    overwrite SAL entries and make replayed data unreachable (the SAL walk
-///    stops at the first partially-overwritten group).
-///
-/// The Err rides the startup ACK (see worker.run): a failed boot must abort
-/// before the master rewinds the SAL, or the replayed rows' only durable copy is
-/// destroyed.
+/// Worker-boot catalog recovery. The `Err` rides the startup ACK, which fails
+/// the boot before the master rewinds the SAL — otherwise the rewind destroys
+/// the replayed rows' only durable copy.
 fn worker_boot_recovery(
     catalog: &mut CatalogEngine,
     log: SalLog,
-    rank: u32,
-    num_workers: u32,
+    slot: Slot,
     walk_epoch: u32,
+    swept_bases: &[i64],
 ) -> Result<HashMap<i64, Batch>, String> {
+    // Before any store is touched: each re-homes from the pre-fork master's
+    // child to this slot's own, and every plan compiled after this is baked with
+    // the slot.
+    catalog.become_worker(slot)?;
+    // Before the replay below, which projects the tail into each index exactly
+    // once: a rebuild after it would double-count every replayed row.
     let rebuilt = catalog
         .backfill_all_indexes()
         .map_err(|e| format!("boot index backfill failed: {e}"))?;
     // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
     // every index resumed from its checkpoint.
-    boot_log(&format!("recovery: rebuilding {rebuilt} index(es)\n"));
-    let pending_deltas = recover_from_sal(log, rank, num_workers, walk_epoch, catalog)?;
-    // Keep the boot flush: the non-windowed recovery resets the SAL before the
-    // master-driven tick sweep, so the replayed base rows must be shard-durable
-    // first — else the reset would drop acknowledged tail data. The recovery-start
-    // bump is what lets it publish: it is durable pre-fork, so nothing on disk
-    // resumes across it.
+    gnitz_note!("recovery: rebuilding {rebuilt} index(es)");
+    let pending_deltas = recover_from_sal(log, slot, walk_epoch, swept_bases, catalog)?;
+    // Before the master's boot rewind puts the write cursor back to 0: these rows
+    // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
         catalog.durable_generation() > catalog.registry().resume_generation(),
         "boot base flush without the recovery-start generation bump ahead of it",
@@ -304,7 +252,6 @@ fn worker_boot_recovery(
     if BOOT_FLUSH_ERROR.armed() {
         return Err("injected boot flush fault".to_string());
     }
-    inject_recovery_panic("bootflush");
     Ok(pending_deltas)
 }
 
@@ -317,14 +264,8 @@ fn worker_boot_recovery(
 /// enters the executor event loop.
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(
-    data_dir: &str,
-    socket_path: &str,
-    num_workers: u32,
-    log_level: u32,
-    tls_cli: Option<TlsCli>,
-) -> i32 {
-    match run_server(data_dir, socket_path, num_workers, log_level, tls_cli) {
+pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Option<TlsCli>) -> i32 {
+    match run_server(data_dir, socket_path, num_workers, tls_cli) {
         Ok(rc) => rc,
         Err(e) => {
             gnitz_error!("{e}");
@@ -344,6 +285,10 @@ struct SharedIpc {
     /// The mapped SAL's length — the one this boot passed to `map_file_reserved`,
     /// so every reader and the writer wrap on the bytes that actually exist.
     sal_len: usize,
+    /// The epoch every reader of this mapping walks, and the floor for the next
+    /// writer epoch. Derived once with the mapping: on a damaged offset-0 header
+    /// it costs a full-ring sweep, and every reader must anchor on one answer.
+    walk_epoch: u32,
     w2m_ptrs: Vec<*mut u8>,
     m2w_efds: Vec<i32>,
 }
@@ -379,6 +324,8 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     let sal_len = sal_mmap_size();
     let sal_ptr = posix_io::map_file_reserved(sal_fd, sal_len)
         .map_err(|e| format!("failed to map SAL ({sal_len} bytes): {e}"))?;
+    // SAFETY: the mapping above is `sal_len` bytes and outlives the process.
+    let walk_epoch = unsafe { SalLog::new(sal_ptr, sal_len) }.walk_epoch();
 
     let mut w2m_ptrs: Vec<*mut u8> = Vec::with_capacity(nw);
     let mut m2w_efds: Vec<i32> = Vec::with_capacity(nw);
@@ -395,26 +342,26 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
         sal_fd,
         sal_ptr,
         sal_len,
+        walk_epoch,
         w2m_ptrs,
         m2w_efds,
     })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
-/// `worker_N.log`, recover, and run the worker
-/// loop. Never returns — the worker exits via `libc::_exit`.
-#[allow(clippy::too_many_arguments)]
+/// `worker_N.log`, recover, and run the worker loop. Never returns — the worker
+/// exits via `libc::_exit`.
 fn run_worker_child(
-    w: usize,
-    num_workers: u32,
-    log_level: u32,
+    slot: Slot,
     data_dir: &str,
     master_pid: i32,
-    catalog_ptr: *mut CatalogEngine,
+    catalog: &mut CatalogEngine,
     ipc: &SharedIpc,
-    walk_epoch: u32,
+    swept_bases: &[i64],
     placement: Option<&affinity::Placement>,
 ) -> ! {
+    let w = slot.rank as usize;
+
     // Die immediately if the master exits for any reason. The `getppid` probe a
     // worker runs after a timed-out eventfd park is a belt-and-suspenders
     // fallback; this closes the ~30s polling gap.
@@ -445,7 +392,8 @@ fn run_worker_child(
 
     // Re-tag logging as this worker before any boot work, so every line the
     // recovery below emits carries `W{w}` rather than the inherited master tag.
-    gnitz_foundation::log::init(log_level, format!("W{w}").as_bytes());
+    // Only the tag: the level is a process-wide static the fork already copied.
+    gnitz_foundation::log::set_tag(format!("W{w}").as_bytes());
 
     // Pin after the log re-tag, so a failed pin is recorded in this worker's own
     // `worker_N.log` rather than the master's stdout, and before every
@@ -464,44 +412,23 @@ fn run_worker_child(
         }
     }
 
-    let catalog = unsafe { &mut *catalog_ptr };
-
-    let sal_reader = SalReader::new(ipc.sal_log(), w as u32, walk_epoch);
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
+    let catalog_ptr: *mut CatalogEngine = catalog;
 
-    // Become worker `(w, W)` before any flush: every inherited store re-homes
-    // from the pre-fork master's `w0of{W}` to this worker's own child, and every
-    // plan compiled from here on is baked with this slot.
-    //
-    // Then recover: rebuild indexes, replay the SAL tail (buffering effective base
-    // deltas), boot-flush the replayed rows durable. The buffered deltas seed
-    // `pending_deltas`; the master's post-reset tick sweep drives them into the
-    // views. All view derivation moved to the master's sweep + step-4 rebuild — no
-    // child-side view backfill.
-    //
-    // Either failure rides the startup ACK, which fails boot before the master
-    // rewinds the SAL.
-    let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
-        .become_worker(gnitz_store::storage::Slot::new(w as u32, num_workers))
-        .and_then(|()| worker_boot_recovery(catalog, ipc.sal_log(), w as u32, num_workers, walk_epoch))
-    {
-        Ok(pd) => (pd, None),
+    let pending_deltas = match worker_boot_recovery(catalog, ipc.sal_log(), slot, ipc.walk_epoch, swept_bases) {
+        Ok(pd) => pd,
         Err(e) => {
-            // stderr is redirected to worker_N.log above.
+            // The master reads this frame off the shared ring, which outlives the
+            // process that wrote it.
             gnitz_error!("{e}");
-            (HashMap::new(), Some(e))
+            w2m_writer.send_status(0, 0, gnitz_wire::STATUS_ERROR, e.as_bytes());
+            unsafe { libc::_exit(1) };
         }
     };
 
-    catalog.dag_mut().invalidate_all();
+    gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
-    boot_log(&format!(
-        "Worker {} (pid {}) of {}\n",
-        w,
-        unsafe { libc::getpid() },
-        num_workers
-    ));
-
+    let sal_reader = SalReader::new(ipc.sal_log(), slot.rank, ipc.walk_epoch);
     let mut worker = WorkerProcess::new(
         master_pid,
         catalog_ptr,
@@ -510,22 +437,140 @@ fn run_worker_child(
         ipc.m2w_efds[w],
         pending_deltas,
     );
-    let rc = worker.run(boot_err);
+    let rc = worker.run();
 
     unsafe {
         libc::_exit(rc);
     }
 }
 
-fn run_server(
+/// The master's half of recovery before any worker exists. Returns the sweep set
+/// the verdict below determines, which every worker inherits across the fork.
+fn master_pre_fork_recovery(
+    catalog: &mut CatalogEngine,
+    log: SalLog,
+    walk_epoch: u32,
+) -> Result<Vec<i64>, String> {
+    recover_system_tables_from_sal(log, walk_epoch, catalog)?;
+
+    // Checked, and before the gc below: the replayed DDL lives only in master
+    // memory until this makes it durable, so a swallowed failure lets the SAL
+    // reset destroy its only copy and the gc delete the shards it named.
+    catalog.flush_all_system_tables()?;
+    if SYS_FLUSH_ERROR.armed() {
+        return Err("injected system table flush fault".to_string());
+    }
+
+    // Reclaim directories whose DROP committed but whose deferred deletion was
+    // lost to a crash. After both replays, so a committed-but-unflushed CREATE is
+    // not mistaken for an orphan.
+    catalog.gc_orphan_directories();
+
+    // Drop the child directories this boot's worker count no longer owns, before
+    // each worker's `rehome` opens what is left.
+    catalog.registry().reconcile_child_dirs();
+
+    // Reads `resume_generation`, so it runs before the bump below advances the
+    // durable one. Pre-fork because it peeks every launched rank's manifest on
+    // behalf of workers that do not exist yet.
+    catalog.compute_invalid_views();
+
+    // Durably advance the checkpoint generation G → G+1 while the resume
+    // generation stays at G, closing the reset→boot_checkpoint crash window.
+    catalog
+        .recovery_start_generation_bump()
+        .map_err(|e| format!("recovery-start generation bump failed: {e}"))?;
+    inject_recovery_panic("genbump");
+
+    Ok(swept_base_tables(catalog))
+}
+
+/// Fork one child per worker, each of which never returns. Yields the parent's
+/// pid list.
+fn fork_workers(
+    catalog: &mut CatalogEngine,
     data_dir: &str,
-    socket_path: &str,
     num_workers: u32,
-    log_level: u32,
-    tls_cli: Option<TlsCli>,
-) -> Result<i32, String> {
-    // Raise fd limit (child directories + shard files)
-    raise_fd_limit(65536);
+    ipc: &SharedIpc,
+    swept_bases: &[i64],
+    placement: Option<&affinity::Placement>,
+) -> Result<Vec<i32>, String> {
+    let master_pid = unsafe { libc::getpid() };
+    let mut worker_pids: Vec<i32> = Vec::with_capacity(num_workers as usize);
+    for w in 0..num_workers {
+        match unsafe { libc::fork() } {
+            -1 => return Err("fork failed".to_string()),
+            0 => run_worker_child(
+                Slot::new(w, num_workers),
+                data_dir,
+                master_pid,
+                catalog,
+                ipc,
+                swept_bases,
+                placement,
+            ),
+            pid => worker_pids.push(pid),
+        }
+    }
+    Ok(worker_pids)
+}
+
+/// The master's half of recovery once the workers are alive, ending in the
+/// checkpoint a clean restart resumes from.
+fn master_post_fork_recovery(
+    disp: &MasterDispatcher,
+    walk_epoch: u32,
+    num_workers: u32,
+    swept_bases: &[i64],
+) -> Result<(), String> {
+    // Before the workers get anywhere: each is re-homing the very stores this
+    // process inherited handles to, and two live `Table`s on one directory is
+    // the hazard.
+    disp.cat().registry_mut().detach();
+
+    // Wait for all workers to complete recovery and signal readiness.
+    disp.collect_acks_and_relay("recovery sync", false)
+        .map_err(|e| format!("Error collecting worker acks: {e}"))?;
+
+    // Reset the SAL for fresh use, now that every worker has recovered, above the
+    // same `walk_epoch` the workers were launched with.
+    disp.boot_rewind_sal(walk_epoch);
+
+    inject_recovery_panic("reset");
+
+    // Drive the tail each worker buffered during replay into the views, one
+    // blocking tick per swept base. An empty source ticks too, so exchange views
+    // stay in lockstep and every view this reaches is compiled.
+    for &src in swept_bases {
+        disp.drain_tick_blocking(src)
+            .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
+    }
+
+    inject_recovery_panic("sweep");
+
+    // Rebuild only the views the boot verdict rejected, through the driver a live
+    // CREATE VIEW uses. Each was resumed from stale shards at open, so its
+    // rebuild starts by emptying the output store it loaded them into.
+    let invalid: Vec<i64> = disp.cat().invalid_views().collect();
+    // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
+    // E2E): 0 ⇒ every view resumed from its checkpoint.
+    gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
+    disp.backfill_views_in_dep_order(&invalid)
+        .map_err(|e| format!("invalid-view rebuild failed: {e}"))?;
+
+    inject_recovery_panic("backfill");
+
+    // A full checkpoint before the socket opens, so a clean restart resumes from
+    // it. No drain — recovery already drained everything and no pushes are
+    // admitted yet.
+    disp.boot_checkpoint(num_workers)
+        .map_err(|e| format!("boot checkpoint failed: {e}"))?;
+    Ok(())
+}
+
+fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Option<TlsCli>) -> Result<i32, String> {
+    // Child directories + shard files.
+    posix_io::raise_fd_limit(65536);
 
     // Pin the master before `CatalogEngine::open`: the boot-time system-table
     // flush below creates the master's first io_uring ring, and an io-wq pool
@@ -535,12 +580,12 @@ fn run_server(
     let nw = num_workers as usize;
     let placement = match affinity::plan(nw) {
         Ok(p) => {
-            boot_log(&format!("affinity: {}\n", p.describe()));
+            p.log_placement();
             p.pin_master();
             Some(p)
         }
         Err(why) => {
-            boot_log(&format!("affinity: not applied ({why})\n"));
+            gnitz_note!("affinity: not applied ({why})");
             None
         }
     };
@@ -549,182 +594,54 @@ fn run_server(
 
     // As the master: the pre-fork replay hooks skip the index backfill their
     // forked children run slice-local.
-    let mut catalog =
+    let catalog =
         CatalogEngine::open_master(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
 
-    boot_log(&format!("Starting {num_workers} workers\n"));
-    boot_log(&format!(
-        "Worker logs: {}/worker_N.log (N=0..{})\n",
-        data_dir,
-        num_workers - 1
-    ));
+    gnitz_note!("Starting {num_workers} workers");
+    gnitz_note!("Worker logs: {}/worker_N.log (N=0..{})", data_dir, num_workers - 1);
 
     let ipc = acquire_shared_ipc(data_dir, nw)?;
-
-    // --- System table SAL recovery (before forking workers) ---
-    //
-    // The recovered walk epoch is this boot's floor, so a previous boot's
-    // leftover always carries a strictly lower one than anything written now.
-    let walk_epoch = recover_system_tables_from_sal(ipc.sal_log(), &mut catalog)?;
-    {
-        // Abort before forking workers and long before the SAL reset: the
-        // replayed DDL lives only in master memory until this flush makes it
-        // durable, so a swallowed failure followed by the SAL reset destroys
-        // its only durable copy (and gc_orphan_directories would later delete
-        // the now-catalog-less entities' flushed shards).
-        catalog.flush_all_system_tables()?;
-        if SYS_FLUSH_ERROR.armed() {
-            return Err("injected system table flush fault".to_string());
-        }
-
-        // Reclaim table/view/index directories whose DROP committed but whose
-        // deferred deletion was lost to a crash before the next checkpoint.
-        // Runs only now that both shard replay and SAL replay have populated
-        // the registry, so a SAL-committed-but-unflushed CREATE is not mistaken
-        // for an orphan.
-        catalog.gc_orphan_directories();
-
-        // Drop the child directories this boot's worker count no longer owns.
-        // Must run after SAL replay (so the registry is complete and dropped
-        // subtrees are already gone) and before the fork, since each worker's
-        // `rehome` then opens what this leaves behind.
-        catalog.registry().reconcile_child_dirs();
-    }
-
-    // --- Boot invalid-view verdict + recovery-start generation bump ---
-    //
-    // Both pre-fork: the verdict peeks every launched rank's manifest on behalf
-    // of workers that do not exist yet, and the durable generation advance is
-    // COW-inherited by every worker (and is durable long before the parent resets
-    // the SAL after worker readiness).
-    {
-        // Per-view resume-vs-rebuild verdict against the checkpointed manifests
-        // (generation + topology + transitive source validity). Reads the
-        // catalog's `resume_generation` (the recovered G), so it runs BEFORE the
-        // recovery-start bump advances the durable generation.
-        catalog.compute_invalid_views();
-
-        // Durably advance the checkpoint generation G → G+1 while the resume
-        // generation stays at G, closing the reset→boot_checkpoint crash window.
-        catalog
-            .recovery_start_generation_bump()
-            .map_err(|e| format!("recovery-start generation bump failed: {e}"))?;
-        inject_recovery_panic("genbump");
-    }
-
-    // Log fd assignments
-    boot_log(&format!("SAL fd={}\n", ipc.sal_fd));
+    gnitz_debug!("SAL fd={}", ipc.sal_fd);
     for w in 0..nw {
-        boot_log(&format!("W{} m2w_efd={}\n", w, ipc.m2w_efds[w]));
+        gnitz_debug!("W{} m2w_efd={}", w, ipc.m2w_efds[w]);
     }
 
-    let master_pid = unsafe { libc::getpid() };
+    // Leaked: it outlives every borrow the dispatcher and reactor hold, and
+    // dropping it would run `CircuitState::drop`, which removes directories.
+    let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
 
-    // The catalog becomes a raw pointer only here, immediately above the fork:
-    // `run_worker_child` and `MasterDispatcher` are what need one, and everything
-    // above took `&mut`. Every store it holds is behind a `Box` the registry
-    // owns, so the move disturbs no address.
-    let catalog_ptr = Box::into_raw(Box::new(catalog));
+    let swept_bases = master_pre_fork_recovery(catalog, ipc.sal_log(), ipc.walk_epoch)?;
 
-    // --- Fork workers ---
-    let mut worker_pids: Vec<i32> = Vec::with_capacity(nw);
-    for w in 0..nw {
-        match unsafe { libc::fork() } {
-            -1 => return Err("fork failed".to_string()),
-            0 => run_worker_child(
-                w,
-                num_workers,
-                log_level,
-                data_dir,
-                master_pid,
-                catalog_ptr,
-                &ipc,
-                walk_epoch,
-                placement.as_ref(),
-            ),
-            pid => worker_pids.push(pid),
-        }
-    }
+    let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, placement.as_ref())?;
 
     // --- Parent process ---
     let SharedIpc {
         sal_fd,
         sal_ptr,
         sal_len,
+        walk_epoch,
         w2m_ptrs,
         m2w_efds,
     } = ipc;
 
-    let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_len, nw);
-    let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(w2m_ptrs));
-
     // `recovery_start_generation_bump` has already run, so this is the floor
     // every base round must publish past.
-    let boot_generation = unsafe { (*catalog_ptr).durable_generation() };
-    let dispatcher = MasterDispatcher::new(
+    let boot_generation = catalog.durable_generation();
+    let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
-        catalog_ptr,
+        catalog,
         boot_generation,
-        sal_writer,
-        w2m_receiver,
+        SalWriter::new(sal_ptr, sal_fd, sal_len, nw),
+        Rc::new(W2mReceiver::new(w2m_ptrs)),
         m2w_efds,
-    );
-    // Before the workers get anywhere: each is re-homing the very stores this
-    // process inherited handles to, and two live `Table`s on one directory is the
-    // hazard. Only constructors ran between the fork and here.
-    dispatcher.cat().registry_mut().detach();
-    let dispatcher_rc = std::rc::Rc::new(dispatcher);
+    ));
 
-    // Wait for all workers to complete recovery and signal readiness
-    let dispatcher = &*dispatcher_rc;
-    dispatcher
-        .collect_acks_and_relay("recovery sync", false)
-        .map_err(|e| format!("Error collecting worker acks: {e}"))?;
-
-    // Reset the SAL for fresh use, now that every worker has recovered, above the
-    // same `walk_epoch` the workers were launched with.
-    dispatcher.boot_rewind_sal(walk_epoch);
-
-    inject_recovery_panic("reset");
-
-    // Recovery tick sweep: drive the tail each worker buffered during replay into
-    // the views, one blocking tick per reachable base on the freshly-reset SAL.
-    // Empty sources tick too, so exchange views stay in lockstep. Resumed views are
-    // extended state-exactly; invalid ones are polluted and rebuilt below.
-    for src in swept_base_tables(dispatcher.cat()) {
-        dispatcher
-            .drain_tick_blocking(src)
-            .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
-    }
-
-    inject_recovery_panic("sweep");
-
-    // Step-4: rebuild only the views the boot verdict rejected, through the driver
-    // a live CREATE VIEW uses. It is view-scoped, so a resumed sibling's loaded
-    // shards are never re-derived and double-counted.
-    let invalid: Vec<i64> = dispatcher.cat().invalid_views().collect();
-    // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
-    // E2E): 0 ⇒ every view resumed from its checkpoint.
-    boot_log(&format!("recovery: rebuilding {} invalid view(s)\n", invalid.len()));
-    dispatcher
-        .backfill_views_in_dep_order(&invalid)
-        .map_err(|e| format!("invalid-view rebuild failed: {e}"))?;
-
-    inject_recovery_panic("backfill");
-
-    // Boot-end checkpoint: record the launched topology, bump the generation
-    // (G+1 → G+2), and durably checkpoint the resumed + rebuilt view state (base +
-    // ephemeral rounds) before the socket opens, so a clean restart resumes from
-    // it. No drain — recovery already drained everything and no pushes are admitted
-    // yet.
-    dispatcher
-        .boot_checkpoint(num_workers)
-        .map_err(|e| format!("boot checkpoint failed: {e}"))?;
+    master_post_fork_recovery(&dispatcher, walk_epoch, num_workers, &swept_bases)?;
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);
     // `UnixListener::bind` does not unlink; a socket left by an earlier run
-    // would be EADDRINUSE. Its backlog is `net.core.somaxconn` (std passes -1).
+    // would be EADDRINUSE.
     let _ = std::fs::remove_file(socket_path);
     let server_fd = std::os::unix::net::UnixListener::bind(socket_path)
         .and_then(|l| {
@@ -741,28 +658,9 @@ fn run_server(
         Some(cli) => Some(setup_tls_listener(data_dir, &cli)?),
         None => None,
     };
-    boot_log("GnitzDB ready\n");
+    gnitz_note!("GnitzDB ready");
 
-    Ok(ServerExecutor::run(
-        std::rc::Rc::clone(&dispatcher_rc),
-        server_fd,
-        tls_init,
-    ))
-}
-
-/// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
-/// limit. Best-effort: the engine opens far fewer descriptors than `target` on
-/// a small database, so a refusal only matters once the partition count grows,
-/// and then it surfaces as `EMFILE` at the open that could not be served.
-fn raise_fd_limit(target: u64) {
-    unsafe {
-        let mut rl: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 || rl.rlim_cur >= target as libc::rlim_t {
-            return;
-        }
-        rl.rlim_cur = (target as libc::rlim_t).min(rl.rlim_max);
-        libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
-    }
+    Ok(ServerExecutor::run(dispatcher, server_fd, tls_init))
 }
 
 #[cfg(test)]

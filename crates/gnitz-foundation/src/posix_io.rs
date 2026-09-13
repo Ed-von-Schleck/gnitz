@@ -71,6 +71,20 @@ pub fn renameat(olddirfd: c_int, old: &std::ffi::CStr, newdirfd: c_int, new: &st
     Ok(())
 }
 
+/// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
+/// limit. Best-effort: a refusal surfaces later as `EMFILE` at the open that
+/// could not be served.
+pub fn raise_fd_limit(target: u64) {
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 || rl.rlim_cur >= target as libc::rlim_t {
+            return;
+        }
+        rl.rlim_cur = (target as libc::rlim_t).min(rl.rlim_max);
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+    }
+}
+
 /// Create an anonymous temporary file (`O_TMPFILE`) on the filesystem backing
 /// `dir`.
 ///

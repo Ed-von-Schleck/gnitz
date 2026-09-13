@@ -86,6 +86,42 @@ def server_preexec():
         os._exit(1)
 
 
+def kill_group(proc):
+    """SIGKILL `proc`'s whole process group — master and workers together. The
+    master's PDEATHSIG reaps workers only asynchronously, so anything that
+    touches the data dir afterwards (a restart, an `rmtree`) would otherwise race
+    a worker still mapping `wal.sal`. Requires the spawn to have used
+    `start_new_session`, or this reaches the caller too."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
+
+
+def await_ready(proc, read_log, timeout):
+    """Block until `proc` prints the readiness marker, raising if it dies first.
+
+    Readiness is the server's own marker, not the socket file: `UnixListener::bind`
+    publishes that file several boot steps earlier, so a server that binds and then
+    dies leaves one behind, and waiting on it hands the caller a bare
+    `ECONNREFUSED` with the crash only in the log. Liveness is therefore checked
+    before readiness on every pass.
+
+    `read_log` returns this boot's output so far; the caller owns where that comes
+    from and what to do with a `proc` that never reported ready."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"server exited rc={proc.returncode} before becoming ready\n"
+                f"{read_log()[-4096:]}")
+        if _READY_MARKER in read_log():
+            return
+        time.sleep(_READY_POLL_S)
+    raise TimeoutError(f"server did not start (never reported ready)\n{read_log()[-4096:]}")
+
+
 def is_debug_build():
     """Whether the server under test still carries the `#[cfg(debug_assertions)]`
     injection seams. Cargo's default `cargo build` keeps them, and so does the
@@ -199,14 +235,6 @@ class ServerProc:
     def start(self, *, workers=None, extra_env=None, timeout=10.0):
         """Spawn and wait until the server declares itself ready. Returns self.
 
-        Readiness is the server's own `GnitzDB ready`, not the socket file:
-        `UnixListener::bind` publishes that file several steps earlier, so a
-        server that binds and then dies leaves one behind. Waiting on the file
-        would return here successfully and hand the test a bare `ECONNREFUSED`
-        at its first connect, with the crash that caused it only in the log.
-        Liveness is therefore checked before readiness on every pass, so such a
-        boot fails here naming the exit code and the log.
-
         `workers` sticks — a later `restart()` reboots at the same count.
         `extra_env` applies to *this boot only*, which is what a fault injected
         for one boot and then recovered from needs; put configuration that must
@@ -214,18 +242,12 @@ class ServerProc:
         if workers is not None:
             self.workers = workers
         self.proc = self._popen(extra_env)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                raise RuntimeError(
-                    f"server exited rc={self.proc.returncode} before becoming ready "
-                    f"on {self.sock_path}\n{self.log_tail()}"
-                )
-            if _READY_MARKER in self.log_text():
-                return self
-            time.sleep(_READY_POLL_S)
-        self.stop()
-        raise RuntimeError(f"server did not start (never reported ready)\n{self.log_tail()}")
+        try:
+            await_ready(self.proc, self.log_text, timeout)
+        except TimeoutError as e:
+            self.stop()
+            raise RuntimeError(str(e)) from None
+        return self
 
     def start_expecting_exit(self, *, workers=None, extra_env=None, timeout=20.0):
         """Spawn a server expected to die during boot. Returns its non-zero exit
@@ -248,16 +270,9 @@ class ServerProc:
     # ── stopping ─────────────────────────────────────────────────────────────
 
     def stop(self):
-        """SIGKILL the whole process group — master and workers together. The
-        master's PDEATHSIG reaps workers only asynchronously, and a restart on
-        the same data dir must not race a worker still mapping `wal.sal`."""
         if self.proc is None:
             return
-        try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        self.proc.wait()
+        kill_group(self.proc)
         self.proc = None
 
     def stop_graceful(self, timeout=30):

@@ -13,14 +13,6 @@ impl CatalogEngine {
     // accessor, and each one is where the next field behind it stops being
     // reachable.
 
-    /// The relation DAG: compiled circuits, the dependency map and the memoized
-    /// per-view metadata, for the callers that flush or re-order relations. The caches
-    /// this engine maintains index into the registry by id, so mutations here
-    /// must leave the id set alone unless they go through a hook.
-    pub(crate) fn dag_mut(&mut self) -> &mut DagEngine {
-        &mut self.dag
-    }
-
     /// Which relations exist, and the stores behind them. There are no thin
     /// delegators beside it: a `CatalogEngine::kind` would hide the rung
     /// its answer came from, and every call site has to be rewritten either way.

@@ -2,7 +2,7 @@
 //!
 //! Log format: `secs.millis tag LEVEL msg` on stderr (fd 2).
 //! Log levels:
-//!   0 = QUIET  (error/warn only)
+//!   0 = QUIET  (error/warn/note only)
 //!   1 = NORMAL (+ info)
 //!   2 = DEBUG  (+ debug)
 
@@ -21,12 +21,17 @@ pub const QUIET: u32 = 0;
 pub const NORMAL: u32 = 1;
 pub const DEBUG: u32 = 2;
 
-/// Set the log level and process tag. A tag is at most three bytes — the clamp
-/// keeps a release build from panicking rather than being a supported way to
-/// pass more; the caller's crate is where a longer tag would be ruled out.
+/// Set the log level and process tag.
 pub fn init(level: u32, tag: &[u8]) {
-    debug_assert!(tag.len() <= 3);
     LEVEL.store(level.min(DEBUG), Ordering::Relaxed);
+    set_tag(tag);
+}
+
+/// Re-tag this process, leaving the level alone — what a forked child that
+/// inherits the level needs. A tag is at most three bytes; a longer one is a
+/// caller bug, truncated rather than panicking in release.
+pub fn set_tag(tag: &[u8]) {
+    debug_assert!(tag.len() <= 3);
     let len = tag.len().min(3);
     let mut bytes = [0u8; 4];
     bytes[..len].copy_from_slice(&tag[..len]);
@@ -113,6 +118,16 @@ macro_rules! gnitz_error {
 macro_rules! gnitz_warn {
     ($($arg:tt)*) => {
         $crate::log::_emit("WARN", format_args!($($arg)*));
+    };
+}
+
+/// Log at NOTE level (always emits). For a line that must appear whatever the
+/// level and is not a fault — boot progress, chiefly, where `gnitz_info!` is
+/// silent at the default QUIET.
+#[macro_export]
+macro_rules! gnitz_note {
+    ($($arg:tt)*) => {
+        $crate::log::_emit("NOTE", format_args!($($arg)*));
     };
 }
 

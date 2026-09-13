@@ -98,13 +98,6 @@ impl WorkerProcess {
         self.w2m_writer.send_status(target_id, request_id, STATUS_OK, &[]);
     }
 
-    /// A rejection that carries no status of its own, and so is `STATUS_ERROR`
-    /// — [`Self::send_fault`] with the status every ordinary refusal carries.
-    pub(super) fn send_error(&self, error_msg: &str, request_id: u64) {
-        self.w2m_writer
-            .send_status(0, request_id, gnitz_wire::STATUS_ERROR, error_msg.as_bytes());
-    }
-
     /// One control-only failure frame carrying the fault's **own** status, so a
     /// refusal a worker mints (`STATUS_DELTA_EXPIRED`) reaches the client as a
     /// code rather than as a string. `target_id` `0`: the reactor routes a reply
