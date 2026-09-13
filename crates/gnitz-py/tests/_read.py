@@ -7,6 +7,8 @@ defines correctness as weights, so a row count, a `sorted(pks)` list or a
 weight-0 ghost as correct.
 """
 
+import math
+
 
 def rows(client, sn, q):
     """The rows of a one-statement SELECT, in result order. `client` is anything
@@ -25,11 +27,16 @@ def bag(rows, *cols):
     Summing rather than collecting is what makes the answer invariant to how a
     multiplicity is split across workers and entries, so the same expectation
     holds at every worker count.
+
+    A NaN is folded onto `math.nan` itself, so an expectation spelling
+    `math.nan` matches it: tuple equality tries identity before `==`, and by
+    `==` a NaN equals nothing — not even the NaN a retraction must cancel.
     """
     acc = {}
     for r in rows:
         d = r._asdict()
         k = tuple(d[c] for c in cols) if cols else tuple(r)
+        k = tuple(math.nan if v != v else v for v in k)
         acc[k] = acc.get(k, 0) + r.weight
     return {k: w for k, w in sorted(acc.items(), key=repr) if w != 0}
 

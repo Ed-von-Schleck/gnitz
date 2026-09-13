@@ -4,8 +4,7 @@ A scalar expression is lowered once and run by one evaluator, so a view
 projection, a view WHERE, an ad-hoc SELECT, an ad-hoc WHERE, a GROUP BY key, a
 DML residual and a SET right-hand side cannot disagree about what an expression
 means. That is the fact this file exists for; what an individual operator
-*computes* belongs to the per-class files beside it and, below them, to the
-evaluator's own kernel tests.
+*computes* belongs to the per-class files beside it.
 
 The surfaces are not one code path reached seven ways: a view filter is compiled
 into a maintained circuit and evaluated per worker partition, an ad-hoc read
@@ -17,95 +16,98 @@ import pytest
 import gnitz
 from _read import bag, rows, scanned
 
+U64_HIGH = 2**63 + 5  # past the signed boundary: a negative i64 bit pattern
+U64_MAX = 2**64 - 1
+
+# One row per interesting sign and width, by pk. `s` is the one nullable column,
+# so a NULL anywhere else is the expression's own.
+_ROWS = {1: "(1, -9, 'alpha', 0.5, 5)", 2: f"(2, 3, 'beta', 1.5, {U64_HIGH})",
+         3: "(3, -1, '100%', 2.7, 9)", 4: "(4, 0, NULL, 1e300, 0)"}
+
 
 @pytest.fixture
 def surf(client, schema_name):
-    """`t (pk, i, s, f, u)` holding one row per interesting sign and width, with
-    every column NOT NULL so a NULL anywhere below is the expression's own."""
+    """`t (pk, i, s, f, u)` holding `_ROWS`."""
     client.execute_sql(
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, "
-        "s TEXT NOT NULL, f DOUBLE NOT NULL, u BIGINT UNSIGNED NOT NULL)",
-        schema_name=schema_name)
-    client.execute_sql(
-        "INSERT INTO t VALUES (1, -9, 'alpha', 0.5, 5), (2, 3, 'beta', 1.5, 7), "
-        "(3, -1, 'alpha', 2.5, 9)", schema_name=schema_name)
+        "s TEXT, f DOUBLE NOT NULL, u BIGINT UNSIGNED NOT NULL)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS.values()),
+                       schema_name=schema_name)
     return schema_name
 
 
-def test_every_read_surface_answers_one_expression_the_same_way(client, surf):
-    """`ABS(i)` as a value and `ABS(i) > 5` as a predicate, through the maintained
-    projection, the maintained filter, the ad-hoc projection, the ad-hoc filter
-    and a group key. The maintained answers are weights over a circuit's output
-    store; the ad-hoc ones are weights over a residual scan."""
-    sn = surf
-    client.execute_sql("CREATE VIEW vp AS SELECT pk, ABS(i) AS a FROM t", schema_name=sn)
-    client.execute_sql("CREATE VIEW vw AS SELECT pk FROM t WHERE ABS(i) > 5",
-                       schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW vg AS SELECT ABS(i) AS k, COUNT(*) AS c FROM t GROUP BY ABS(i)",
-        schema_name=sn)
-
-    values = {(1, 9): 1, (2, 3): 1, (3, 1): 1}
-    assert bag(scanned(client, sn, "vp"), "pk", "a") == values
-    assert bag(rows(client, sn, "SELECT pk, ABS(i) AS a FROM t")) == values
-
-    assert bag(scanned(client, sn, "vw"), "pk") == {(1,): 1}
-    assert bag(rows(client, sn, "SELECT pk FROM t WHERE ABS(i) > 5")) == {(1,): 1}
-
-    # A written group key groups by the expression's value, not the column's.
-    assert bag(scanned(client, sn, "vg"), "k", "c") == {(9, 1): 1, (3, 1): 1, (1, 1): 1}
-
-
-def test_a_group_key_moves_its_row_when_the_key_expression_re_evaluates(client, surf):
-    """A retraction under a computed group key has to leave the old group as well
-    as join the new one; a stale group survives at weight 1 and a row count over
-    the groups cannot see it."""
-    sn = surf
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT LEFT(s, 1) AS k, COUNT(*) AS c FROM t GROUP BY LEFT(s, 1)",
-        schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "k", "c") == {("a", 2): 1, ("b", 1): 1}
-
-    client.execute_sql("UPDATE t SET s = 'gamma' WHERE pk = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "k", "c") == {
-        ("a", 1): 1, ("b", 1): 1, ("g", 1): 1}
-    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "k", "c") == {("a", 1): 1, ("g", 1): 1}
-
-
-@pytest.mark.parametrize("residual,survivors", [
-    # A string conjunct, a float comparison and an unsigned ordered compare: an
-    # integer-only client-side interpreter could serve none of the three.
-    ("s = 'alpha' AND pk = 1", {2, 3}),
-    ("f > 1.0", {1}),
-    ("u > 100", {1, 2, 3}),
-    ("UPPER(s) = 'BETA'", {1, 3}),
-    ("ABS(i) > 5", {2, 3}),
+# Each predicate against the pks it selects. Every operand class is here: an
+# integer-only interpreter could serve none of the string, float or unsigned
+# ones.
+_PREDICATES = {
+    "ABS(i) > 5": {1},
+    # pk 3 divides by zero: NULL, which a predicate does not keep.
+    "100 / (i + 1) > 1": {2, 4},
     # The binder const-folds a null test on a NOT NULL column to a true literal,
     # which the compiler reports as "no filter" — every row must still go.
-    ("i IS NOT NULL", set()),
-])
-def test_a_delete_residual_serves_every_operand_class(client, surf, residual, survivors):
-    """The residual is the same program a view WHERE compiles to, so it serves
-    the same operand classes and the same NULL rule."""
+    "i IS NOT NULL": {1, 2, 3, 4},
+    "f > 1.0": {2, 3, 4},
+    # A failed conversion is an ordinary NULL: 1e300 has no INT image, and
+    # U64_HIGH no SMALLINT one, so neither row passes either spelling.
+    "CAST(f AS INT) = 2": {3},
+    "CAST(u AS SMALLINT) <> 7": {1, 3, 4},
+    # U64_HIGH reads negative under a signed compare.
+    "u > 100": {2},
+    "s = 'alpha' AND pk = 1": {1},
+    "UPPER(s) = 'BETA'": {2},
+    "s < 'b'": {1, 3},
+    "s ILIKE 'A%'": {1},
+    "s NOT LIKE 'al%'": {2, 3},
+    r"s LIKE '100\%'": {3},
+    "s IN ('beta', 'x')": {2},
+    "s NOT IN ('beta', 'x')": {1, 3},
+}
+
+
+def test_every_surface_selects_the_same_rows(client, surf):
+    """For each predicate: what the maintained filter holds, the ad-hoc WHERE
+    returns and the DELETE residual removes — after which the view retracts
+    exactly those rows, and re-admits them when they return."""
     sn = surf
-    client.execute_sql(f"DELETE FROM t WHERE {residual}", schema_name=sn)
-    assert bag(scanned(client, sn, "t"), "pk") == {(p,): 1 for p in survivors}
+    views = {p: f"v{n}" for n, p in enumerate(_PREDICATES)}
+    for p, v in views.items():
+        client.execute_sql(f"CREATE VIEW {v} AS SELECT pk FROM t WHERE {p}", schema_name=sn)
+
+    for p, want in _PREDICATES.items():
+        selected = {(k,): 1 for k in want}
+        assert bag(scanned(client, sn, views[p])) == selected, p
+        assert bag(rows(client, sn, f"SELECT pk FROM t WHERE {p}")) == selected, p
+
+        client.execute_sql(f"DELETE FROM t WHERE {p}", schema_name=sn)
+        assert bag(scanned(client, sn, "t"), "pk") == {(k,): 1 for k in _ROWS.keys() - want}, p
+        assert bag(scanned(client, sn, views[p])) == {}, p
+        client.execute_sql("INSERT INTO t VALUES " + ", ".join(_ROWS[k] for k in sorted(want)),
+                           schema_name=sn)
 
 
-def test_a_residual_and_a_view_filter_cannot_disagree(client, surf):
-    """The same predicate on both surfaces, over data whose answer turns on the
-    NULL a zero divisor produces: whatever the view keeps, the residual must
-    delete, exactly."""
+def test_a_value_and_a_group_key_evaluate_alike_across_a_retraction(client, surf):
+    """The same expressions as a maintained projection and an ad-hoc one, and as
+    a written group key maintained and ad hoc. A retraction under a computed
+    group key has to leave the old group as well as join the new one; a stale
+    group survives at weight 1 and a row count over the groups cannot see it."""
     sn = surf
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT pk FROM t WHERE 100 / (i + 1) > 1", schema_name=sn)
-    kept = bag(scanned(client, sn, "v"), "pk")
-    assert kept == {(2,): 1}, "only the non-zero divisor with a quotient past 1"
+    proj = "SELECT pk, ABS(i) AS a, LEFT(s, 1) AS k, f * 2 AS f2, u / 2 AS h FROM t"
+    grouped = "SELECT LEFT(s, 1) AS k, COUNT(*) AS c, SUM(i) AS si FROM t GROUP BY LEFT(s, 1)"
+    client.execute_sql(f"CREATE VIEW vp AS {proj}", schema_name=sn)
+    client.execute_sql(f"CREATE VIEW vg AS {grouped}", schema_name=sn)
 
-    client.execute_sql("DELETE FROM t WHERE 100 / (i + 1) > 1", schema_name=sn)
-    assert bag(scanned(client, sn, "t"), "pk") == {(1,): 1, (3,): 1}
-    assert bag(scanned(client, sn, "v"), "pk") == {}, "the view retracts what was deleted"
+    unchanged = {(3, 1, "1", 5.4, 4): 1, (4, 0, None, 2e300, 0): 1}
+    assert bag(scanned(client, sn, "vp")) == bag(rows(client, sn, proj)) == {
+        (1, 9, "a", 1.0, 2): 1, (2, 3, "b", 3.0, U64_HIGH // 2): 1, **unchanged}
+    assert bag(scanned(client, sn, "vg")) == bag(rows(client, sn, grouped)) == {
+        ("a", 1, -9): 1, ("b", 1, 3): 1, ("1", 1, -1): 1, (None, 1, 0): 1}
+
+    client.execute_sql("UPDATE t SET s = 'gamma', i = 9 WHERE pk = 1", schema_name=sn)
+    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+    assert bag(scanned(client, sn, "vp")) == bag(rows(client, sn, proj)) == {
+        (1, 9, "g", 1.0, 2): 1, **unchanged}
+    assert bag(scanned(client, sn, "vg")) == bag(rows(client, sn, grouped)) == {
+        ("g", 1, 9): 1, ("1", 1, -1): 1, (None, 1, 0): 1}
 
 
 def test_a_set_right_hand_side_computes_over_every_column_it_can_read(client, schema_name):
@@ -116,109 +118,46 @@ def test_a_set_right_hand_side_computes_over_every_column_it_can_read(client, sc
     operand divides in the unsigned domain."""
     sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, "
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, "
         "s TEXT NOT NULL, u BIGINT UNSIGNED NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        f"INSERT INTO t VALUES (41, 0, 5, '  pad  ', {2**63 + 5}), "
-        "(7, 0, NULL, 'keep', 4)", schema_name=sn)
+    client.execute_sql(f"INSERT INTO t VALUES (41, NULL, '  pad  ', {U64_HIGH}), "
+                       "(7, 5, 'keep', 4)", schema_name=sn)
 
-    client.execute_sql("UPDATE t SET a = b + 1", schema_name=sn)
-    client.execute_sql("UPDATE t SET s = TRIM(s) WHERE pk = 41", schema_name=sn)
-    client.execute_sql("UPDATE t SET u = u / 2 WHERE pk = 41", schema_name=sn)
-
-    assert bag(scanned(client, sn, "t"), "pk", "a", "s", "u") == {
-        (41, 6, "pad", (2**63 + 5) // 2): 1,
-        (7, None, "keep", 4): 1,   # NULL + 1 stays NULL, not 0
+    client.execute_sql("UPDATE t SET a = a + pk, s = TRIM(s), u = u / 2", schema_name=sn)
+    assert bag(scanned(client, sn, "t")) == {
+        (41, None, "pad", U64_HIGH // 2): 1,   # NULL + 41 stays NULL, not 41
+        (7, 12, "keep", 2): 1,
     }
 
-    # The PK region reads like a payload column.
-    client.execute_sql("UPDATE t SET a = pk + 1", schema_name=sn)
-    assert bag(scanned(client, sn, "t"), "pk", "a") == {(41, 42): 1, (7, 8): 1}
 
+def test_a_wide_literal_is_checked_against_its_target_before_any_row(client, schema_name):
+    """An integer past `i64` has no register slot, so a residual naming one
+    cannot be compiled at all, and an assignment out of the target's range is
+    refused at plan time — even when the statement would touch no row, since
+    deferring the check would make it succeed silently on an empty match and
+    wrap two's-complement on a non-empty one. Nothing is written: no wrapped
+    value, and no row inserted by the upsert.
 
-@pytest.mark.parametrize("stmt,why", [
-    # An f64 register has no integer destination and nothing downstream can tell
-    # its bit pattern from an integer's, so the rule is the RHS's own class —
-    # not the target's.
-    ("UPDATE t SET a = f", "floating-point"),
-    ("UPDATE t SET f = f + 1.0", "floating-point"),
-    ("UPDATE t SET a = UPPER(s)", "cannot assign"),
-])
-def test_a_set_right_hand_side_of_the_wrong_class_is_refused(client, schema_name, stmt, why):
+    SET parses its literal against the *target's* type rather than against the
+    register file, so the top of the unsigned range is writable on both
+    assignment surfaces."""
     sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
-        "f DOUBLE NOT NULL, s TEXT NOT NULL)", schema_name=sn)
-    client.execute_sql("INSERT INTO t VALUES (1, 0, 1.5, 'abc')", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match=why):
-        client.execute_sql(stmt, schema_name=sn)
-
-
-# ---------------------------------------------------------------------------
-# A literal with no register slot, in the lazily-interpreted mutate positions
-# ---------------------------------------------------------------------------
-
-_U64_MAX = 18446744073709551615
-
-
-@pytest.fixture
-def wide(client, schema_name):
-    """`t (pk, v)` both `BIGINT UNSIGNED`, holding one row — so a statement that
-    should reject has a row it would otherwise have touched."""
-    client.execute_sql(
         "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
-        "v BIGINT UNSIGNED NOT NULL)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=schema_name)
-    return schema_name
+        "v BIGINT UNSIGNED NOT NULL)", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
 
+    for stmt in (f"DELETE FROM t WHERE v = {U64_MAX}",
+                 f"UPDATE t SET v = {U64_MAX + 1} WHERE pk = 999",
+                 "UPDATE t SET v = -1 WHERE pk = 999",
+                 f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX + 1}"):
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql(stmt, schema_name=sn)
+    assert bag(scanned(client, sn, "t")) == {(1, 100): 1}
 
-def test_a_wide_literal_the_register_file_cannot_hold_is_refused_not_ignored(
-        client, wide):
-    """An integer past `i64` has no register slot, so a residual naming one
-    cannot be compiled at all. The failure to avoid is silence: a predicate that
-    quietly matched nothing would report a successful zero-row DELETE, which is
-    indistinguishable from a row that legitimately was not there.
-
-    The row must survive, so the refusal is not a partial apply either.
-    """
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql(f"DELETE FROM t WHERE v = {_U64_MAX}", schema_name=wide)
-    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, 100): 1}
-
-
-def test_a_set_right_hand_side_reaches_the_target_columns_whole_domain(client, wide):
-    """SET parses its literal against the *target's* type rather than against the
-    register file, so the full unsigned range is writable — the same seam the key
-    codec uses, which is what makes the write and the seek accept one set of
-    values."""
-    client.execute_sql(f"UPDATE t SET v = {_U64_MAX}", schema_name=wide)
-    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, _U64_MAX): 1}
-
-
-@pytest.mark.parametrize("stmt", [
-    # The WHERE matches nothing and the ON CONFLICT target does not conflict, so
-    # in both the guard is the only thing that can fire.
-    f"UPDATE t SET v = {_U64_MAX + 1} WHERE pk = 999",
-    "UPDATE t SET v = -1 WHERE pk = 999",
-    f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {_U64_MAX + 1}",
-], ids=["update-over", "update-under", "on-conflict-over"])
-def test_an_out_of_range_assignment_is_refused_even_when_it_would_touch_no_row(
-        client, wide, stmt):
-    """The value is checked at plan time, not when a row reaches it. Deferring it
-    would make the statement succeed silently whenever the match set is empty,
-    and wrap two's-complement whenever it is not — so an empty match is exactly
-    the case that has to reject."""
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql(stmt, schema_name=wide)
-    # Nothing was written: no wrapped value, and no row inserted by the upsert.
-    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, 100): 1}
-
-
-def test_the_guard_admits_the_in_range_wide_literal_on_the_same_surface(client, wide):
-    """The rejection above is about the range, not about the width: the same
-    upsert with a literal at the top of the target's domain is served, and its
-    DO UPDATE applies when the key does conflict."""
     client.execute_sql(
-        f"INSERT INTO t VALUES (1, 1) ON CONFLICT (pk) DO UPDATE SET v = {_U64_MAX}",
-        schema_name=wide)
-    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, _U64_MAX): 1}
+        f"INSERT INTO t VALUES (1, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX}",
+        schema_name=sn)
+    assert bag(scanned(client, sn, "t")) == {(1, U64_MAX): 1}
+    client.execute_sql(f"UPDATE t SET v = {U64_MAX - 1}", schema_name=sn)
+    assert bag(scanned(client, sn, "t")) == {(1, U64_MAX - 1): 1}

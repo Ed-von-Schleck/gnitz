@@ -35,6 +35,12 @@ def rejected(server):
         conn.execute_sql(_ROWS, schema_name=sn)
         conn.execute_sql(_U, schema_name=sn)
         conn.execute_sql("INSERT INTO u VALUES (1, 10), (2, 20)", schema_name=sn)
+        conn.execute_sql(
+            "CREATE TABLE sx (id BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, "
+            "f DOUBLE NOT NULL, s TEXT NOT NULL, d DATE, price DECIMAL(10, 2) NOT NULL, "
+            "qty NUMERIC(8, 3))", schema_name=sn)
+        conn.execute_sql("INSERT INTO sx VALUES (1, 1, 1.5, 'abc', DATE '2024-02-29', 1.25, 2)",
+                         schema_name=sn)
         # A view, so a statement that requires a base table has a wrong-kind
         # name to be refused on.
         conn.execute_sql("CREATE VIEW vok AS SELECT pk, val FROM t", schema_name=sn)
@@ -248,6 +254,73 @@ def test_a_view_body_refuses_the_clauses_its_shape_would_drop(rejected, body, me
         conn.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
 
 
+_view = "CREATE VIEW v AS SELECT id, {} AS x FROM sx".format
+
+# A scalar expression no program can hold is decided once, while planning —
+# never accepted and then failing per row, or inside the engine's class
+# validator as an opaque internal enum. Each refusal names what is wrong with
+# the expression, not the node that rejected it.
+_UNSERVABLE_EXPRESSIONS = [
+    # A view is recomputed from deltas, so a clock read would make its contents
+    # depend on when a tick ran rather than on what the input said.
+    (_view("NOW()"), "non-deterministic"),
+    (_view("CURRENT_DATE"), "non-deterministic"),
+    (_view("EXTRACT(YEAR FROM i)"), "DATE or TIMESTAMP"),
+    (_view("DATE_TRUNC('fortnight', d)"), "not supported"),
+    # Summing day counts yields a number that is not a date and not meaningful.
+    ("CREATE VIEW v AS SELECT SUM(d) AS x FROM sx", "not supported"),
+    (_view("DATE '2024-02-30'"), "invalid DATE literal"),
+    (_view("CAST(i AS UUID)"), "not supported"),
+    (_view("CAST(i AS BOOLEAN)"), "BOOLEAN"),
+    # A wide integer literal has no register slot at all — the general limit of
+    # the 8-byte register file, not something CAST adds.
+    (_view("CAST(18446744073709551615 AS BIGINT UNSIGNED)"), "18446744073709551615"),
+    (_view("CAST('abc' AS DECIMAL(5, 2))"), "invalid DECIMAL literal"),
+    # Each product adds its operands' scales, so a chain of them runs past what
+    # the scaled integer can hold.
+    (_view("qty * qty * qty * qty * qty * qty * qty"), "scale"),
+    (_view("price + qty * qty * qty * qty * qty * qty * qty"), "scale"),
+    # A scale that no shift can represent, one that is not an integer, and one
+    # that is not a literal at all.
+    (_view("ROUND(f, 16)"), "scale must be an integer literal"),
+    (_view("ROUND(f, -16)"), "scale must be an integer literal"),
+    (_view("ROUND(f, 2.5)"), "scale must be an integer literal"),
+    (_view("ROUND(f, id)"), "scale must be an integer literal"),
+    # MOD is the integer selector; there is no float arm to fall back to.
+    (_view("MOD(f, 2)"), "modulo"),
+    (_view("POWER(i)"), "exactly two arguments"),
+    (_view("LOG(i, 2)"), "exactly one argument"),
+    # A string in a numeric position names the string operand.
+    (_view("GREATEST(s, s)"), 'column "s" is a string'),
+    (_view("SQRT(s)"), "string"),
+    (_view("s + 1"), "string"),
+    (_view("ABS(s)"), "string"),
+    (_view("-s"), "string"),
+    (_view("s || 1"), "expected a string value here"),
+    (_view("s AND i"), "is not supported on a string operand"),
+    (_view("s = i"), "needs both operands to be strings"),
+    # A trim set has to be a literal: it is tokenized once per program.
+    (_view("TRIM(s FROM s)"), "ASCII string literal"),
+    (_view("LEFT(s, f)"), "must be an integer"),
+    (_view("STRPOS(s, f)"), "string"),
+    (_view("REPLACE(s, 'a')"), "exactly three arguments"),
+    (_view("LPAD(s)"), "two or three arguments"),
+    # An f64 register has no integer destination and nothing downstream can tell
+    # its bit pattern from an integer's, so the rule is the SET right-hand side's
+    # own class — not the target's.
+    ("UPDATE sx SET i = f", "floating-point"),
+    ("UPDATE sx SET f = f + 1.0", "floating-point"),
+    ("UPDATE sx SET i = UPPER(s)", "cannot assign"),
+]
+
+
+@pytest.mark.parametrize("sql,message", _UNSERVABLE_EXPRESSIONS)
+def test_an_unservable_scalar_expression_is_refused_while_planning(rejected, sql, message):
+    conn, sn = rejected
+    with pytest.raises(gnitz.GnitzError, match=message):
+        conn.execute_sql(sql, schema_name=sn)
+
+
 def test_the_neighbouring_spellings_are_unaffected(client, schema_name):
     """Every clause above sits beside one that is served; rejecting the envelope
     must not take the ordinary statement with it."""
@@ -286,6 +359,8 @@ def test_the_neighbouring_spellings_are_unaffected(client, schema_name):
         "vsetop": "SELECT val FROM t UNION ALL SELECT pk FROM t",
         "vsetop_side": "SELECT DISTINCT val FROM t UNION ALL SELECT k FROM u GROUP BY k",
         "vrangeleft": "SELECT t.val FROM t LEFT JOIN u ON t.val < u.k WHERE t.val > 5",
+        # The ROUND scales just inside the representable range.
+        "vround": "SELECT pk, ROUND(val, 15) AS a, ROUND(val, -15) AS b FROM t",
     }.items():
         client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=schema_name)
         client.resolve_table(schema_name, name)

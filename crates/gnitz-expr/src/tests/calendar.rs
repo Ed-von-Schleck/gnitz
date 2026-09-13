@@ -53,7 +53,7 @@ fn extract_fields() {
     assert_eq!(eval(C::Epoch, ts, true), d * 86_400 + 13 * 3600 + 45 * 60 + 7);
     assert_eq!(eval(C::Epoch, d, false), d * 86_400);
     assert_eq!(eval(C::Hour, d, false), 0);
-    // A Sunday: DOW 0, ISODOW 7, and ISO week 52 of the previous year for
+    // A Sunday: DOW 0, ISODOW 7, and ISO week 53 of the previous year for
     // 2021-01-03.
     let sun = days_from_civil(2021, 1, 3);
     assert_eq!(eval(C::Dow, sun, false), 0);

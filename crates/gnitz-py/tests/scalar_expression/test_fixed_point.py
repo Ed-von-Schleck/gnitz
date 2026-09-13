@@ -8,8 +8,8 @@ scales), or leaves the class entirely (a division and a cast to DOUBLE produce a
 float), and a result at the right value but the wrong scale renders identically
 here while mis-keying a downstream join.
 
-So every case asserts the **declared type and scale of the computed column**
-beside its value. A value alone cannot distinguish `Decimal("37.50")` from
+So the **declared type and scale of the computed column** is asserted beside its
+value. A value alone cannot distinguish `Decimal("37.50")` from
 `Decimal("37.50000")` — Python compares them equal — which is exactly the
 distinction the catalog has to carry.
 
@@ -17,7 +17,7 @@ That DECIMAL is a type — its literals, its storage integer, its key behaviour 
 is `value_domain/test_decimal.py`.
 """
 
-from decimal import Decimal
+from decimal import Decimal as D
 
 import pytest
 import gnitz
@@ -40,103 +40,52 @@ def priced(client, schema_name):
     return schema_name
 
 
+def _declared(client, sn, name):
+    """`{column name: (type code, scale)}` of relation `name`."""
+    return {c.name: (c.type_code, c.scale) for c in client.resolve_table(sn, name)[1].columns}
+
+
+# Each operator against its value on ids 1..5. An operator propagates a NULL
+# operand; GREATEST instead skips it, as it does in PostgreSQL.
+_OPERATORS = {
+    # scale(price) + scale(qty) = 2 + 3.
+    "price * qty": [D("37.50000"), D("0.35000"), D("0.00713"), None, D("2.02000")],
+    "price * 1.1": [D("13.750"), D("0.110"), D("7.843"), D("-0.550"), D("1.111")],
+    "price + 0.005": [D("12.505"), D("0.105"), D("7.135"), D("-0.495"), D("1.015")],
+    # A division is not closed over the class.
+    "price / 4": [3.125, 0.025, 1.7825, -0.125, 0.2525],
+    "ROUND(price * qty, 2)": [D("37.50"), D("0.35"), D("0.01"), None, D("2.02")],
+    # A cast to an integer rounds half away from zero: -0.50 becomes -1.
+    "CAST(price AS BIGINT)": [13, 0, 7, -1, 1],
+    "FLOOR(price)": [D(12), D(0), D(7), D(-1), D(1)],
+    "CEIL(price)": [D(13), D(1), D(8), D(0), D(2)],
+    "CAST(price AS DECIMAL(6, 1))": [D("12.5"), D("0.1"), D("7.1"), D("-0.5"), D("1.0")],
+    "CAST(price AS DOUBLE)": [12.5, 0.1, 7.13, -0.5, 1.01],
+    "-price": [D("-12.50"), D("-0.10"), D("-7.13"), D("0.50"), D("-1.01")],
+    "price % 1": [D("0.50"), D("0.10"), D("0.13"), D("-0.50"), D("0.01")],
+    "GREATEST(price, qty)": [D("12.500"), D("3.500"), D("7.130"), D("-0.500"), D("2.000")],
+    "CASE WHEN price > 1 THEN price ELSE 0.5 END": [D("12.50"), D("0.50"), D("7.13"),
+                                                    D("0.50"), D("1.01")],
+}
+
+
 def test_each_operator_carries_its_own_result_scale(client, priced):
-    """One column per operator class, so the scale rule is one table. A product
-    adds scales, a sum keeps the wider, a division and a float cast leave the
-    class, and an integer cast truncates toward zero rather than rounding."""
+    """One column per operator class, so the scale rule is one table — served
+    alike by a maintained view and an ad-hoc read, and re-derived on the
+    retraction an UPDATE makes. A predicate parses its literal at the column's
+    scale, so `12.5` and `12.50` name one value while `12.501` names none."""
     sn = priced
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT id, price * qty AS total, price * 1.1 AS bumped, "
-        "price + 0.005 AS p3, price / 4 AS quarter, ROUND(price * qty, 2) AS r2, "
-        "CAST(price AS BIGINT) AS whole, FLOOR(price) AS fl, CEIL(price) AS ce, "
-        "CAST(price AS DECIMAL(6, 1)) AS p1, CAST(price AS DOUBLE) AS pf, "
-        "-price AS neg, price % 1 AS cents, GREATEST(price, qty) AS g, "
-        "CASE WHEN price > 1 THEN price ELSE 0.5 END AS c FROM t", schema_name=sn)
+    select = "SELECT id, " + ", ".join(
+        f"{e} AS c{n}" for n, e in enumerate(_OPERATORS)) + " FROM t"
+    client.execute_sql(f"CREATE VIEW v AS {select}", schema_name=sn)
 
-    _, vs = client.resolve_table(sn, "v")
-    scales = {c.name: (c.type_code, c.scale) for c in vs.columns}
-    # scale(price) + scale(qty) = 2 + 3; a division is not closed over the class.
-    assert scales["total"] == (DEC, 5)
-    assert scales["quarter"] == (F64, 0)
-    assert scales["whole"] == (I64, 0)
+    declared = _declared(client, sn, "v")
+    assert [declared[f"c{list(_OPERATORS).index(e)}"] for e in
+            ("price * qty", "price / 4", "CAST(price AS BIGINT)")] == [(DEC, 5), (F64, 0), (I64, 0)]
 
-    r = {x["id"]: x for x in scanned(client, sn, "v")}
-    r1, r2, r3, r4 = r[1], r[2], r[3], r[4]
-    assert r1["total"] == Decimal("37.50000") and r2["total"] == Decimal("0.35000")
-    assert r1["bumped"] == Decimal("13.750") and r2["bumped"] == Decimal("0.110")
-    assert r2["p3"] == Decimal("0.105") and r4["p3"] == Decimal("-0.495")
-    assert r1["quarter"] == 3.125 and r4["quarter"] == -0.125
-    assert r1["r2"] == Decimal("37.50") and r3["r2"] == Decimal("0.01")
-    # A cast to an integer truncates toward zero: -0.50 becomes -1, not 0.
-    assert (r1["whole"], r3["whole"], r4["whole"]) == (13, 7, -1)
-    assert (r1["fl"], r4["fl"], r1["ce"], r4["ce"]) == \
-        (Decimal(12), Decimal(-1), Decimal(13), Decimal(0))
-    assert r1["p1"] == Decimal("12.5") and r3["p1"] == Decimal("7.1")
-    assert r1["pf"] == 12.5 and r1["neg"] == Decimal("-12.50")
-    assert r1["cents"] == Decimal("0.50") and r3["cents"] == Decimal("0.13")
-    assert r1["g"] == Decimal("12.500") and r2["g"] == Decimal("3.500")
-    assert r1["c"] == Decimal("12.50") and r2["c"] == Decimal("0.50")
-    # An operator propagates a NULL operand; GREATEST instead skips it, as it
-    # does in PostgreSQL, so a row with one NULL argument still has a result.
-    assert r4["total"] is None and r4["r2"] is None and r4["g"] == Decimal("-0.500")
-
-
-def test_a_computed_decimal_is_maintained_across_a_retraction(client, priced):
-    """An UPDATE retracts the old computed row and inserts the new one, so the
-    expression runs again on the retraction. A computed column recomputed only on
-    the insert leaves the old row behind — visible here as a second row for the
-    same id, which is why the whole bag is asserted rather than one lookup."""
-    sn = priced
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT id, price * qty AS total FROM t", schema_name=sn)
-    client.execute_sql("UPDATE t SET price = 0.20, qty = 0.5 WHERE id = 2",
-                       schema_name=sn)
-
-    assert bag(scanned(client, sn, "v"), "id", "total") == {
-        (1, Decimal("37.50000")): 1,
-        (2, Decimal("0.10000")): 1,
-        (3, Decimal("0.00713")): 1,
-        (4, None): 1,
-        (5, Decimal("2.02000")): 1,
-    }
-
-
-def test_an_aggregate_over_a_decimal_keeps_the_class_or_leaves_it(client, priced):
-    """SUM, MIN and MAX are closed over the class and keep the argument's scale;
-    AVG divides and so lands in the float class. The grouped view is then
-    maintained across a retraction, which is where a scale recomputed only on
-    the insert path would drift."""
-    sn = priced
-    client.execute_sql(
-        "CREATE VIEW agg AS SELECT cat, SUM(price) AS s, MIN(price) AS lo, "
-        "MAX(qty) AS hi, AVG(price) AS a, COUNT(*) AS n, SUM(price * qty) AS tot "
-        "FROM t GROUP BY cat", schema_name=sn)
-    _, vs = client.resolve_table(sn, "agg")
-    scales = {c.name: (c.type_code, c.scale) for c in vs.columns}
-    assert (scales["s"], scales["lo"], scales["hi"]) == ((DEC, 2), (DEC, 2), (DEC, 3))
-    assert (scales["a"], scales["tot"]) == ((F64, 0), (DEC, 5))
-
-    r = {x["cat"]: x for x in scanned(client, sn, "agg")}
-    assert (r[1]["s"], r[1]["lo"], r[1]["hi"], r[1]["a"], r[1]["n"]) == \
-        (Decimal("12.60"), Decimal("0.10"), Decimal("3.500"), 6.3, 2)
-    assert r[1]["tot"] == Decimal("37.85000")
-    assert (r[2]["s"], r[2]["lo"], r[2]["tot"]) == \
-        (Decimal("6.63"), Decimal("-0.50"), Decimal("0.00713"))
-
-    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-    r = {x["cat"]: x for x in scanned(client, sn, "agg")}
-    assert (r[1]["s"], r[1]["n"], r[1]["a"]) == (Decimal("0.10"), 1, 0.1)
-
-    assert bag(rows(client, sn,
-                    "SELECT SUM(price) AS s, AVG(qty) AS a FROM t WHERE cat = 2")) == \
-        {(Decimal("6.63"), 0.001): 1}
-
-
-def test_a_decimal_predicate_compares_at_the_columns_scale(client, priced):
-    """A literal is parsed at the column's scale before the compare, so `12.5`
-    and `12.50` name one value while `12.501` names none. A predicate that
-    compared the literal at its own scale would answer all three the same."""
-    sn = priced
+    expected = {r: 1 for r in zip([1, 2, 3, 4, 5], *_OPERATORS.values())}
+    assert bag(scanned(client, sn, "v")) == expected
+    assert bag(rows(client, sn, select)) == expected
 
     def ids(where):
         return bag(rows(client, sn, f"SELECT id FROM t WHERE {where}"))
@@ -149,43 +98,53 @@ def test_a_decimal_predicate_compares_at_the_columns_scale(client, priced):
     assert ids("price * qty > 30") == {(1,): 1}
     assert ids("price BETWEEN 1 AND 8") == {(3,): 1, (5,): 1}
 
+    client.execute_sql("UPDATE t SET price = 0.20, qty = 0.5 WHERE id = 2", schema_name=sn)
+    after = bag(scanned(client, sn, "v"))
+    assert after == bag(rows(client, sn, select))
+    assert bag(scanned(client, sn, "v"), "id", "c0") == {
+        (1, D("37.50000")): 1, (2, D("0.10000")): 1, (3, D("0.00713")): 1, (4, None): 1,
+        (5, D("2.02000")): 1}
 
-def test_a_filtered_decimal_view_follows_its_rows_across_the_threshold(client, priced):
-    """Updates move rows over and back across the view's bound, including one
-    that rounds onto the bound exactly. Each crossing must retract or admit
-    exactly once."""
+
+def test_an_aggregate_keeps_the_class_or_leaves_it_as_rows_cross_a_bound(client, priced):
+    """SUM, MIN and MAX are closed over the class and keep the argument's scale;
+    AVG divides and so lands in the float class. Updates then move rows over
+    and back across a filtered view's bound — one rounding onto just past it —
+    and a delete retracts a group's extremum, which is where a scale recomputed
+    only on the insert path would drift."""
     sn = priced
-    client.execute_sql(
-        "CREATE VIEW cheap AS SELECT id, price FROM t WHERE price <= 1.005",
-        schema_name=sn)
-    assert bag(scanned(client, sn, "cheap"), "id") == {(2,): 1, (4,): 1}
+    agg = ("SELECT cat, SUM(price) AS s, MIN(price) AS lo, MAX(qty) AS hi, AVG(price) AS a, "
+           "COUNT(*) AS n, SUM(price * qty) AS tot FROM t GROUP BY cat")
+    client.execute_sql(f"CREATE VIEW agg AS {agg}", schema_name=sn)
+    client.execute_sql("CREATE VIEW cheap AS SELECT id, price FROM t WHERE price <= 1.005",
+                       schema_name=sn)
+    declared = _declared(client, sn, "agg")
+    assert [declared[k] for k in ("s", "lo", "hi", "a", "tot")] == \
+        [(DEC, 2), (DEC, 2), (DEC, 3), (F64, 0), (DEC, 5)]
+
+    assert bag(scanned(client, sn, "agg")) == bag(rows(client, sn, agg)) == {
+        (1, D("12.60"), D("0.10"), D("3.500"), 6.3, 2, D("37.85000")): 1,
+        (2, D("6.63"), D("-0.50"), D("0.001"), 3.315, 2, D("0.00713")): 1,
+        (3, D("1.01"), D("1.01"), D("2.000"), 1.01, 1, D("2.02000")): 1,
+    }
+    assert bag(scanned(client, sn, "cheap")) == {(2, D("0.10")): 1, (4, D("-0.50")): 1}
 
     # 1.005 rounds to 1.01 at scale 2, so it lands just above the bound.
     client.execute_sql("UPDATE t SET price = 1.005 WHERE id = 2", schema_name=sn)
-    client.execute_sql("UPDATE t SET price = price * 2 WHERE id = 1", schema_name=sn)
     client.execute_sql("UPDATE t SET qty = price WHERE id = 3", schema_name=sn)
     client.execute_sql("UPDATE t SET price = 3 WHERE id = 4", schema_name=sn)
+    client.execute_sql("UPDATE t SET price = 0.5 WHERE id = 5", schema_name=sn)
+    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
 
-    assert bag(scanned(client, sn, "cheap"), "id") == {}
-    assert bag(scanned(client, sn, "t"), "id", "price", "qty") == {
-        (1, Decimal("25.00"), Decimal("3.000")): 1,
-        (2, Decimal("1.01"), Decimal("3.500")): 1,
-        (3, Decimal("7.13"), Decimal("7.130")): 1,
-        (4, Decimal("3.00"), None): 1,
-        (5, Decimal("1.01"), Decimal("2.000")): 1,
+    assert bag(scanned(client, sn, "t")) == {
+        (2, 1, D("1.01"), D("3.500")): 1,
+        (3, 2, D("7.13"), D("7.130")): 1,
+        (4, 2, D("3.00"), None): 1,
+        (5, 3, D("0.50"), D("2.000")): 1,
     }
-
-
-@pytest.mark.parametrize("body,message", [
-    ("SELECT id, CAST('abc' AS DECIMAL(5, 2)) AS x FROM t", "invalid DECIMAL literal"),
-    # Each product adds its operands' scales, so a chain of them runs past what
-    # the scaled integer can hold — refused at compile time, not at the first row.
-    ("SELECT id, qty * qty * qty * qty * qty * qty * qty AS x FROM t", "scale"),
-    ("SELECT id, price + qty * qty * qty * qty * qty * qty * qty AS x FROM t", "scale"),
-], ids=["bad-literal", "scale-overflow", "scale-overflow-in-a-sum"])
-def test_an_expression_with_no_representable_scale_is_refused(
-        client, priced, body, message):
-    """The result scale is computed from the operand scales at plan time, so an
-    expression whose scale cannot exist is rejected before any row is read."""
-    with pytest.raises(gnitz.GnitzError, match=message):
-        client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=priced)
+    assert bag(scanned(client, sn, "cheap")) == {(5, D("0.50")): 1}
+    assert bag(scanned(client, sn, "agg")) == bag(rows(client, sn, agg)) == {
+        (1, D("1.01"), D("1.01"), D("3.500"), 1.01, 1, D("3.53500")): 1,
+        (2, D("10.13"), D("3.00"), D("7.130"), 5.065, 2, D("50.83690")): 1,
+        (3, D("0.50"), D("0.50"), D("2.000"), 0.5, 1, D("1.00000")): 1,
+    }
