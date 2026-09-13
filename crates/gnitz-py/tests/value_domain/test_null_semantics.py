@@ -163,20 +163,56 @@ def test_a_null_key_matches_neither_a_zero_nor_another_null(client, lr):
     assert bag(scanned(client, sn, "v"), "id", "name") == {(2, 900): 1, (3, 907): 1}
 
 
-def test_a_left_join_null_fills_a_null_key_once_beside_a_real_zero(client, lr):
-    """The preserved row whose key is NULL and the one whose key is `0` reindex
-    to the same synthetic key, so they are the pair that would merge or cancel if
-    the null were not carried separately. Each must appear exactly once — the
-    `0` row matched, the NULL row filled — and the weights are the assertion,
-    because a double-emit and a correct emit hold the same rows."""
-    sn = lr
+@pytest.mark.parametrize("key_sql,zero", [("BIGINT", "0"), ("TEXT", "''")], ids=["int", "text"])
+def test_a_null_key_fills_once_beside_its_types_zero(client, schema_name, key_sql, zero):
+    """The preserved row whose key is NULL and the one whose key is the type's
+    zero reindex to the same synthetic key, and both project the same `x`, so
+    only the retained key column and its null bit keep them apart — through a
+    LEFT JOIN's null-fill and a NOT EXISTS's alike. The zero-keyed row matches
+    twice, so a merge would cancel the NULL row's unmatched weight, and the
+    weights are the assertion because a double-emit holds the same rows."""
+    sn = schema_name
     client.execute_sql(
-        "CREATE VIEW v AS SELECT l.id AS id, r.name AS name "
-        "FROM l LEFT JOIN r ON l.fk = r.k", schema_name=sn)
-    client.execute_sql("INSERT INTO r VALUES (0, NULL, 900)", schema_name=sn)
-    client.execute_sql("INSERT INTO l VALUES (1, NULL), (2, 0)", schema_name=sn)
+        f"CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, k {key_sql}, x BIGINT NOT NULL); "
+        f"CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, k {key_sql} NOT NULL, name BIGINT NOT NULL); "
+        "CREATE VIEW lj AS SELECT l.x, r.name FROM l LEFT JOIN r ON l.k = r.k; "
+        "CREATE VIEW ne AS SELECT l.x FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k); "
+        f"INSERT INTO l VALUES (1, NULL, 5), (2, {zero}, 5); "
+        f"INSERT INTO r VALUES (10, {zero}, 100), (11, {zero}, 200)", schema_name=sn)
 
-    assert bag(scanned(client, sn, "v"), "id", "name") == {(1, None): 1, (2, 900): 1}
+    assert bag(scanned(client, sn, "lj"), "x", "name") == {(5, None): 1, (5, 100): 1, (5, 200): 1}
+    assert bag(scanned(client, sn, "ne"), "x") == {(5,): 1}
+
+
+def test_a_null_group_key_and_a_null_extremum_are_not_zero(client, schema_name):
+    """A NULL group key must not merge with the 0 group — in the grouping, in
+    each group's extremes, or in a HAVING null test. A NULL → 0 transition of a
+    MIN changes only the null bit, so the reduce's `old @ -1` / `new @ +1` pair
+    must still differ: were the trace compared null-blind the stale NULL row
+    would survive and surface on the next transition, which retracts it."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT, v BIGINT); "
+        "CREATE VIEW gv AS SELECT g, COUNT(*) AS c, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY g; "
+        "CREATE VIEW gn AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NULL; "
+        "CREATE VIEW m7 AS SELECT MIN(v) AS m FROM t WHERE g = 7; "
+        "INSERT INTO t VALUES (1, NULL, 100), (2, 0, 7), (3, NULL, 50), (4, 0, 9), (5, 7, NULL)",
+        schema_name=sn)
+
+    def expect(seven, null_group=(2, 50, 100), zero_group=(2, 7, 9)):
+        assert bag(scanned(client, sn, "gv"), "g", "c", "lo", "hi") == {
+            (None, *null_group): 1, (0, *zero_group): 1, (7, 1, seven, seven): 1}
+        assert bag(scanned(client, sn, "gn"), "g", "c") == {(None, null_group[0]): 1}
+        assert bag(scanned(client, sn, "m7"), "m") == {(seven,): 1}
+
+    expect(None)
+    # Lower the NULL group's MIN and raise the zero group's MAX: neither moves the other.
+    client.execute_sql("INSERT INTO t VALUES (6, NULL, 10), (7, 0, 999)", schema_name=sn)
+    expect(None, null_group=(3, 10, 100), zero_group=(3, 7, 999))
+    client.execute_sql("UPDATE t SET v = 0 WHERE pk = 5", schema_name=sn)
+    expect(0, null_group=(3, 10, 100), zero_group=(3, 7, 999))
+    client.execute_sql("UPDATE t SET v = 7 WHERE pk = 5", schema_name=sn)
+    expect(7, null_group=(3, 10, 100), zero_group=(3, 7, 999))
 
 
 @pytest.mark.parametrize("kind", ["JOIN", "LEFT JOIN"])

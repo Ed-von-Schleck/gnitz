@@ -15,7 +15,7 @@ import ctypes
 
 import pytest
 from _serverproc import NEEDS_MULTI
-import _oracle as oracle
+from _read import bag
 
 pytestmark = NEEDS_MULTI
 
@@ -69,7 +69,7 @@ def test_eliding_the_exchange_does_not_change_the_answer(
 
     for name in ("v_co", "v_ex"):
         vid, _ = client.resolve_table(schema_name, name)
-        oracle.assert_view_matches(client, vid, cols, want, name)
+        assert bag(client.scan(vid), *cols) == want, name
 
 
 def test_a_summed_partial_survives_the_merge(client, schema_name):
@@ -93,7 +93,7 @@ def test_a_summed_partial_survives_the_merge(client, schema_name):
         schema_name=schema_name)
 
     vid, _ = client.resolve_table(schema_name, "v")
-    oracle.assert_view_matches(client, vid, ["grp", "total"], {(1, sum(range(1, 101))): 1})
+    assert bag(client.scan(vid), "grp", "total") == {(1, sum(range(1, 101))): 1}
 
 
 def test_a_wide_u64_pk_range_round_trips(client, schema_name):

@@ -1,203 +1,171 @@
-"""The equi outer join: LEFT, RIGHT and FULL over an equality key.
+"""Outer joins — LEFT, RIGHT and FULL — over an equality key, a band and a pure
+range, and what a WHERE, a reduce or a cut does above one.
 
 There is no fused outer opcode. `LEFT JOIN = inner ∪ null_extend(ν)`, where `ν`
 is the unmatched preserved rows at their true multiplicity: per preserved
 identity `x` at weight `w_A ≥ 0`, and `S ≥ 0` the summed other-side weight it
-matches, `ν(x) = w_A · [S = 0]`. RIGHT is that construction with the two sides
-swapped; FULL runs it on both.
+matches, `ν(x) = w_A · [S = 0]`. RIGHT swaps the sides and FULL runs both. An
+equi or band ν subtracts the matched preserved rows from the unfiltered
+preserved input; a pure range decides existence from one threshold,
+`∃b. a.x < b.y ⟺ a.x < MAX(b.y)`, and supports LEFT only.
 
-Every assertion is a weighted bag. The failure mode of a wrong ν is a spurious
-weight-`w−1` null-fill beside a matched weight-`w` row, which a row count and a
-`sorted(pks)` list each read as correct.
-
-The band and pure-range orientations build ν differently and live in
-test_range_join.py.
+The expectation is the outer join's own definition over the rows the test
+wrote. A wrong ν is a spurious weight-`w−1` null-fill, a broadcast that fills
+per worker is weight W, and a matched row's leftover `(x, NULL)` tombstone is
+an extra row — each read as correct by a row count. The bag-valued preserved
+side is test_bag_valued_input.py's.
 
 Run with GNITZ_WORKERS=4: ν must cancel per worker, before the output exchange.
 """
+import operator
+from collections import Counter
 
-import pytest
-from _read import bag
-
-_COLS = ("oid", "amt", "cust", "cname")
-
-
-@pytest.fixture
-def oc(client, schema_name):
-    """Empty `orders(pk, ckey, amount)` / `customers(pk, ckey, name)` in a fresh
-    schema, joined on `orders.ckey = customers.ckey`.
-
-    The key is nullable on both sides so a row can be unmatched by 3VL as well as
-    by absence; every payload column is NOT NULL, so a NULL reaching a payload is
-    the outer join's widening and nothing else.
-    """
-    client.execute_sql(
-        "CREATE TABLE orders (pk BIGINT NOT NULL PRIMARY KEY, ckey BIGINT, "
-        "amount BIGINT NOT NULL)", schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE customers (pk BIGINT NOT NULL PRIMARY KEY, ckey BIGINT, "
-        "name BIGINT NOT NULL)", schema_name=schema_name)
-    return schema_name
+from _read import bag, scanned
 
 
-def _view(client, sn, kind, cols="orders.pk AS oid, orders.amount AS amt, "
-                                "customers.pk AS cust, customers.name AS cname"):
-    """`orders <kind> JOIN customers ON ckey`, returning the view id. `kind` is
-    the one thing that varies across the orientation cases."""
-    client.execute_sql(
-        f"CREATE VIEW v AS SELECT {cols} FROM orders {kind} JOIN customers "
-        f"ON orders.ckey = customers.ckey", schema_name=sn)
-    return client.resolve_table(sn, "v")[0]
+def _cmp(op):
+    """`op` under SQL 3VL: a comparison against NULL admits nothing."""
+    return lambda l, r: l is not None and r is not None and op(l, r)
 
 
-# Order 1 matches customer 100. Order 2 matches no customer, order 3 matches
-# nothing because its key is NULL; customer 200 and (by its NULL key) customer
-# 300 are the mirror pair on the right.
-_MATCHED = {(1, 50, 100, 7): 1}
-_LEFT_ONLY = {(2, 60, None, None): 1, (3, 70, None, None): 1}
-_RIGHT_ONLY = {(None, None, 200, 8): 1, (None, None, 300, 9): 1}
+_EQ, _LE, _LT, _GT = (_cmp(o) for o in (operator.eq, operator.le, operator.lt, operator.gt))
 
 
-@pytest.mark.parametrize("kind,want", [
-    ("INNER", _MATCHED),
-    ("LEFT", _MATCHED | _LEFT_ONLY),
-    ("RIGHT", _MATCHED | _RIGHT_ONLY),
-    ("FULL", _MATCHED | _LEFT_ONLY | _RIGHT_ONLY),
-])
-def test_an_orientation_emits_the_inner_rows_plus_its_own_side_null_fills(
-        client, oc, kind, want):
-    """Each orientation is the inner join plus the ν of each side it preserves,
-    every row at weight 1. ν reads the *unfiltered* input, so a preserved row
-    that matches nothing because its key is NULL null-fills exactly like one
-    whose key simply has no partner — INNER, which preserves neither side, drops
-    both."""
-    vid = _view(client, oc, kind)
-    client.execute_sql(
-        "INSERT INTO customers VALUES (100, 10, 7), (200, 20, 8), (300, NULL, 9)",
-        schema_name=oc)
-    client.execute_sql(
-        "INSERT INTO orders VALUES (1, 10, 50), (2, 99, 60), (3, NULL, 70)",
-        schema_name=oc)
-
-    assert bag(client.scan(vid), *_COLS) == want
+def _join(a, b, on, kind):
+    """`a <kind> JOIN b ON on` as (a row, b row) pairs, the absent side None."""
+    out = [(ar, br) for ar in a for br in b if on(ar, br)]
+    if kind in ("LEFT", "FULL"):
+        out += [(ar, None) for ar in a if not any(on(ar, br) for br in b)]
+    if kind in ("RIGHT", "FULL"):
+        out += [(None, br) for br in b if not any(on(ar, br) for ar in a)]
+    return out
 
 
-def test_a_preserved_row_null_fills_once_however_many_rows_match_its_partner(
-        client, oc):
-    """ν is `[S = 0]`, not a per-match count: a customer matched by two orders
-    yields two inner rows and no null-fill, and each unmatched row on either side
-    null-fills exactly once."""
-    vid = _view(client, oc, "FULL")
-    client.execute_sql(
-        "INSERT INTO customers VALUES (100, 10, 7), (200, 20, 8)", schema_name=oc)
-    client.execute_sql(
-        "INSERT INTO orders VALUES (1, 10, 50), (2, 10, 60), (3, 99, 70)",
-        schema_name=oc)
-
-    assert bag(client.scan(vid), *_COLS) == {
-        (1, 50, 100, 7): 1,
-        (2, 60, 100, 7): 1,
-        (3, 70, None, None): 1,
-        (None, None, 200, 8): 1,
-    }
+def _col(row, name):
+    return None if row is None else row[name]
 
 
-def test_a_null_fill_retracts_when_its_row_gains_a_match_and_returns_when_it_loses_one(
-        client, oc):
-    """The whole null-fill life cycle on both preserved sides at once. A row that
-    gains a partner has its ν retracted in the same epoch the inner row appears;
-    losing the partner re-emits ν. Deleting a *matched* preserved row retracts
-    only its inner row: the passthrough `+x` and the matched term's `−x` are
-    byte-identical and cancel, so no (x, NULL) tombstone survives."""
-    vid = _view(client, oc, "FULL")
+# name -> (SQL ON, the same predicate over a and b rows).
+_ON = {
+    "eq": ("a.k = b.k", lambda ar, br: _EQ(ar["k"], br["k"])),
+    "band": ("a.k = b.k AND a.x <= b.y", lambda ar, br: _EQ(ar["k"], br["k"]) and _LE(ar["x"], br["y"])),
+    "pair": ("a.k = b.k AND a.x = b.y", lambda ar, br: _EQ(ar["k"], br["k"]) and _EQ(ar["x"], br["y"])),
+    **{f"range_{n}": (f"a.x {op} b.y", lambda ar, br, f=_cmp(f): f(ar["x"], br["y"]))
+       for n, op, f in (("lt", "<", operator.lt), ("le", "<=", operator.le),
+                        ("gt", ">", operator.gt), ("ge", ">=", operator.ge))},
+}
 
-    def pairs():
-        return bag(client.scan(vid), "oid", "cust")
+# view -> (ON, kind, SQL WHERE or None, the same filter over the output pair).
+_VIEWS = {
+    **{f"eq_{k.lower()}": ("eq", k, None, None) for k in ("INNER", "LEFT", "RIGHT", "FULL")},
+    **{f"band_{k.lower()}": ("band", k, None, None) for k in ("LEFT", "RIGHT", "FULL")},
+    "pair_left": ("pair", "LEFT", None, None),
+    **{f"{on}_left": (on, "LEFT", None, None) for on in _ON if on.startswith("range_")},
+    # The WHERE is one 3VL filter over the post-null-fill output: a preserved-side
+    # predicate keeps the fills that pass, an other-side one drops every fill, and
+    # `IS NULL` over an other-side key selects exactly the unmatched rows.
+    "eq_left_where_a": ("eq", "LEFT", "a.x > 15", lambda ar, br: _GT(ar["x"], 15)),
+    "eq_left_where_b": ("eq", "LEFT", "b.y > 0", lambda ar, br: _GT(_col(br, "y"), 0)),
+    "eq_left_unmatched": ("eq", "LEFT", "b.id IS NULL", lambda ar, br: br is None),
+    "eq_full_where_a": ("eq", "FULL", "a.id2 IS NOT NULL", lambda ar, br: ar is not None),
+    "band_left_where_a": ("band", "LEFT", "a.x > 15", lambda ar, br: _GT(ar["x"], 15)),
+    "range_lt_left_where_a": ("range_lt", "LEFT", "a.x > 15", lambda ar, br: _GT(ar["x"], 15)),
+}
 
-    client.execute_sql("INSERT INTO orders VALUES (1, 10, 50)", schema_name=oc)
-    client.execute_sql("INSERT INTO customers VALUES (200, 20, 8)", schema_name=oc)
-    assert pairs() == {(1, None): 1, (None, 200): 1}, "neither side has a partner"
+_OUT = "a.id2 AS aid, a.s AS s, a.note AS note, b.id AS bid"
 
-    client.execute_sql("INSERT INTO customers VALUES (100, 10, 7)", schema_name=oc)
-    assert pairs() == {(1, 100): 1, (None, 200): 1}, "order 1's ν retracts"
+_DEL = object()
 
-    client.execute_sql("INSERT INTO orders VALUES (2, 20, 60)", schema_name=oc)
-    assert pairs() == {(1, 100): 1, (2, 200): 1}, "customer 200's ν retracts"
-
-    client.execute_sql("DELETE FROM customers WHERE pk = 100", schema_name=oc)
-    assert pairs() == {(1, None): 1, (2, 200): 1}, "order 1's ν returns"
-
-    client.execute_sql("DELETE FROM orders WHERE pk = 2", schema_name=oc)
-    assert pairs() == {(1, None): 1, (None, 200): 1}, "customer 200's ν returns"
-
-    client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=oc)
-    assert pairs() == {(None, 200): 1}, "deleting an unmatched row retracts its ν"
-
-    client.execute_sql("INSERT INTO orders VALUES (3, 20, 70)", schema_name=oc)
-    client.execute_sql("DELETE FROM orders WHERE pk = 3", schema_name=oc)
-    assert pairs() == {(None, 200): 1}, "a matched row leaves no ν tombstone"
-
-
-def test_the_null_fill_is_weight_exact_over_a_bag_valued_preserved_side(
-        client, schema_name):
-    """A preserved side whose identities carry weight > 1 — a `UNION ALL` view,
-    where two source rows collapse onto one `_set_pk` identity of weight 2.
-
-    ν subtracts the RAW matched multiplicity `w_A · S` and clamps the result, so
-    a matched weight-2 identity reaches `w_A · (1 − S) ≤ 0` and null-fills not at
-    all; an unmatched one null-fills at the full weight 2. Clamping the *witness*
-    to 1 instead would leak a weight-1 null-fill beside the matched rows.
-
-    Driven on the RIGHT side: the LEFT one is covered by the ν-coarsening cases
-    in test_join_payload_pruning.py and test_multiway_join.py.
-    """
-    sn = schema_name
-    for tbl in ("src", "other", "lt"):
-        client.execute_sql(
-            f"CREATE TABLE {tbl} (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)",
-            schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW u AS SELECT g FROM src UNION ALL SELECT g FROM other",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT u.g AS g, lt.pk AS lid FROM lt RIGHT JOIN u ON lt.g = u.g",
-        schema_name=sn)
-    vid = client.resolve_table(sn, "v")[0]
-
-    # g=5 twice (one matched weight-2 identity), g=9 twice (unmatched).
-    client.execute_sql("INSERT INTO src VALUES (1, 5), (2, 5), (3, 9), (4, 9)",
-                       schema_name=sn)
-    client.execute_sql("INSERT INTO lt VALUES (1, 5)", schema_name=sn)
-    assert bag(client.scan(vid), "g", "lid") == {(5, 1): 2, (9, None): 2}
-
-    # Retract the only match: the matched identity flips to a full weight-2 ν.
-    client.execute_sql("DELETE FROM lt WHERE pk = 1", schema_name=sn)
-    assert bag(client.scan(vid), "g", "lid") == {(5, None): 2, (9, None): 2}
+# (statement, changes to a by id2, changes to b by id) — rows as column dicts,
+# `_DEL` deleting the key. Every `a` row has id1 = 0.
+_CHURN = [
+    # No b yet: every preserved row fills, a NULL key and a NULL range column alike.
+    ("INSERT INTO a VALUES (0, 1, 1, 10, 'alpha', 7), (0, 2, 2, 20, 'beta', NULL), "
+     "(0, 3, NULL, 30, 'gamma', 42), (0, 4, 3, NULL, 'delta', NULL)",
+     {1: (1, 10, "alpha", 7), 2: (2, 20, "beta", None), 3: (None, 30, "gamma", 42),
+      4: (3, None, "delta", None)}, {}),
+    # b rows no key matches; b(2) is still a range match for `>`.
+    ("INSERT INTO b VALUES (1, NULL, NULL), (2, NULL, 5)", {}, {1: (None, None), 2: (None, 5)}),
+    # a(1)'s first match retracts its fill in the epoch the pair appears.
+    ("INSERT INTO b VALUES (3, 1, 50)", {}, {3: (1, 50)}),
+    # A second match leaves a(1) matched at weight 1; b(6) completes a(2)'s k=2 key.
+    ("INSERT INTO b VALUES (4, 1, 15), (6, 2, 20)", {}, {4: (1, 15), 6: (2, 20)}),
+    # The extreme `y`, and a b row no a row matches.
+    ("INSERT INTO b VALUES (5, 9, 100)", {}, {5: (9, 100)}),
+    # Deleting the extreme moves the pure-range threshold; the next b does not.
+    ("DELETE FROM b WHERE id = 5", {}, {5: _DEL}),
+    ("DELETE FROM b WHERE id = 4", {}, {4: _DEL}),
+    # A matched preserved row leaves no `(x, NULL)` tombstone.
+    ("DELETE FROM a WHERE id1 = 0 AND id2 = 1", {1: _DEL}, {}),
+    # b is seeded, so a new a's match is decided in the epoch it arrives.
+    ("INSERT INTO a VALUES (0, 5, 1, 12, 'epsilon', 3)", {5: (1, 12, "epsilon", 3)}, {}),
+    # A left-only and a right-only fill that both pack their pair key to zeros,
+    # told apart only by their null bitmaps.
+    ("INSERT INTO a VALUES (0, 0, 77, 1000, 'zero', NULL)", {0: (77, 1000, "zero", None)}, {}),
+    ("INSERT INTO b VALUES (0, 78, 1)", {}, {0: (78, 1)}),
+]
 
 
-def test_a_composite_key_null_fills_on_the_whole_key(client, schema_name):
-    """A k=2 equality key: ν subtracts on both key columns, so a left row that
-    agrees on only one of them is unmatched and null-fills, and the b-row that
-    completes the pair retracts that null-fill."""
+def test_an_outer_join_null_fills_exactly_its_unmatched_rows_through_churn(client, schema_name):
+    """Every orientation and shape over one churn: a preserved row null-fills
+    once while nothing matches it — however many rows match its partner, and
+    whether its key is absent or NULL — retracts the fill in the epoch a match
+    appears, and restores it when the last match leaves. The pure-range operators
+    each pick their own threshold (`< <=` against MAX, `> >=` against MIN), with
+    the exact-boundary rows in the data. Every view carries a string and a
+    nullable preserved payload, so a fill must carry the preserved row byte for
+    byte. Above the join, a reduce groups the fills as a NULL group, a DISTINCT
+    holds one NULL that leaves with its last carrier, a cut segment emits the
+    fills itself, and an INNER step keyed through a null-filled column matches
+    nothing — a NULL key and a residual `NULL = x` both drop the row."""
     sn = schema_name
     client.execute_sql(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
-        "y BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
-        "y BIGINT NOT NULL, bv BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT a.x, a.y, b.bv FROM a LEFT JOIN b "
-        "ON a.x = b.x AND a.y = b.y", schema_name=sn)
-    vid = client.resolve_table(sn, "v")[0]
+        "CREATE TABLE a (id1 BIGINT NOT NULL, id2 BIGINT NOT NULL, k BIGINT, x BIGINT, "
+        "s TEXT NOT NULL, note BIGINT, PRIMARY KEY (id1, id2)); "
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, y BIGINT); "
+        "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL); "
+        "INSERT INTO c VALUES (1, 50), (2, 5), (3, 0); "
+        + "; ".join(f"CREATE VIEW {name} AS SELECT {_OUT} FROM a {kind} JOIN b ON {_ON[on][0]}"
+                    + (f" WHERE {where}" if where else "")
+                    for name, (on, kind, where, _) in _VIEWS.items()) + "; "
+        "CREATE VIEW grouped AS SELECT b.y AS yy, COUNT(*) AS n FROM a LEFT JOIN b ON a.k = b.k "
+        "WHERE a.x > 15 GROUP BY b.y; "
+        "CREATE VIEW band_grouped AS SELECT b.y AS yy, COUNT(*) AS n "
+        "FROM a LEFT JOIN b ON a.k = b.k AND a.x <= b.y WHERE a.x > 15 GROUP BY b.y; "
+        "CREATE VIEW range_distinct AS SELECT DISTINCT b.id AS bid FROM a LEFT JOIN b ON a.x < b.y "
+        "WHERE a.x > 15; "
+        + "; ".join(f"CREATE VIEW cut_{on} AS WITH d AS (SELECT a.id2 AS aid, b.id AS bid "
+                    f"FROM a LEFT JOIN b ON {_ON[on][0]}) SELECT aid, bid FROM d"
+                    for on in ("band", "range_lt")) + "; "
+        "CREATE VIEW promoted AS SELECT a.id2 AS aid, c.id AS cid "
+        "FROM a LEFT JOIN b ON a.k = b.k JOIN c ON a.id2 = c.id WHERE b.y = c.w",
+        schema_name=sn)
+    c = {1: 50, 2: 5, 3: 0}
 
-    client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
-    # b1 agrees with a2 on x only — not a match.
-    client.execute_sql("INSERT INTO b VALUES (1, 10, 100, 11), (2, 20, 999, 22)",
-                       schema_name=sn)
-    assert bag(client.scan(vid), "x", "y", "bv") == {
-        (10, 100, 11): 1, (20, 200, None): 1}
+    a, b = {}, {}
+    for sql, a_changes, b_changes in _CHURN:
+        client.execute_sql(sql, schema_name=sn)
+        for state, changes, cols in ((a, a_changes, ("k", "x", "s", "note")), (b, b_changes, ("k", "y"))):
+            for key, row in changes.items():
+                if row is _DEL:
+                    del state[key]
+                else:
+                    state[key] = {"id": key, **dict(zip(cols, row))}
+        A, B = list(a.values()), list(b.values())
 
-    client.execute_sql("INSERT INTO b VALUES (3, 20, 200, 33)", schema_name=sn)
-    assert bag(client.scan(vid), "x", "y", "bv") == {
-        (10, 100, 11): 1, (20, 200, 33): 1}
+        for name, (on, kind, _, where) in _VIEWS.items():
+            assert bag(scanned(client, sn, name), "aid", "s", "note", "bid") == Counter(
+                (_col(ar, "id"), _col(ar, "s"), _col(ar, "note"), _col(br, "id"))
+                for ar, br in _join(A, B, _ON[on][1], kind) if where is None or where(ar, br)), (sql, name)
+        for name, on in (("grouped", "eq"), ("band_grouped", "band")):
+            assert bag(scanned(client, sn, name), "yy", "n") == dict.fromkeys(Counter(
+                _col(br, "y") for ar, br in _join(A, B, _ON[on][1], "LEFT") if _GT(ar["x"], 15)).items(), 1), \
+                (sql, name)
+        assert bag(scanned(client, sn, "range_distinct"), "bid") == {
+            (_col(br, "id"),): 1 for ar, br in _join(A, B, _ON["range_lt"][1], "LEFT") if _GT(ar["x"], 15)}, sql
+        for on in ("band", "range_lt"):
+            assert bag(scanned(client, sn, f"cut_{on}"), "aid", "bid") == Counter(
+                (ar["id"], _col(br, "id")) for ar, br in _join(A, B, _ON[on][1], "LEFT")), (sql, on)
+        assert bag(scanned(client, sn, "promoted"), "aid", "cid") == Counter(
+            (ar["id"], ar["id"]) for ar, br in _join(A, B, _ON["eq"][1], "LEFT")
+            if ar["id"] in c and _EQ(_col(br, "y"), c[ar["id"]])), sql

@@ -6,12 +6,11 @@ shared base, triples a diamond, under-fills a two-base join or truncates a
 chunked backfill names itself, and every shape costs one restart rather than one
 each.
 
-The comparison is `oracle.scan_multiset`: weights summed per projected tuple,
-ghosts dropped, floats canonicalized to bits. Row presence is not the observable
-— every historical regression here was a *weight*: an exchange closure re-derived
-once per (view, source) pair came back exactly doubled, a broadcast replayed per
-worker came back W-fold, and a per-key prefix is invisible to any comparison that
-keys by PK.
+The comparison is `_read.bag`: weights summed per projected tuple, ghosts
+dropped. Row presence is not the observable — every historical regression here
+was a *weight*: an exchange closure re-derived once per (view, source) pair came
+back exactly doubled, a broadcast replayed per worker came back W-fold, and a
+per-key prefix is invisible to any comparison that keys by PK.
 
 Where a live value is anchored below (`want`), it is because that shape's
 pre-restart value is what a regression moved; the rest are pinned live by
@@ -24,11 +23,9 @@ which is what once left an `ExchangeShard`-only classifier with an empty base se
 and the join a deterministic per-key prefix at W>1.
 """
 
-from collections import Counter
-
 import pytest
 import gnitz
-import _oracle as oracle
+from _read import bag
 from _serverproc import NUM_WORKERS
 
 
@@ -67,14 +64,14 @@ _FT = [(i, i % 4, (100 if i <= 18 else 5000)) for i in range(1, 25)]
 
 
 def _grouped(rows, key, *vals):
-    """`Counter({(key, *aggregates): 1})` — the reference a GROUP BY view must
+    """`{(key, *aggregates): 1}` — the reference a GROUP BY view must
     equal, where each `vals` entry is a row -> number to sum over the group."""
     acc = {}
     for r in rows:
         acc.setdefault(key(r), [0] * len(vals))
         for i, v in enumerate(vals):
             acc[key(r)][i] += v(r)
-    return Counter({(k, *tuple(v)): 1 for k, v in acc.items()})
+    return {(k, *tuple(v)): 1 for k, v in acc.items()}
 
 
 _SHAPES = {
@@ -104,8 +101,8 @@ _SHAPES = {
          "CREATE VIEW g AS SELECT s, COUNT(*) AS c FROM v GROUP BY s"],
         [f"INSERT INTO a VALUES {_values(_GG)}"],
         {"v": ["grp", "s"], "g": ["s", "c"]},
-        {"v": Counter({(0, 10): 1, (1, 20): 1}),
-         "g": Counter({(10, 1): 1, (20, 1): 1})}),
+        {"v": {(0, 10): 1, (1, 20): 1},
+         "g": {(10, 1): 1, (20, 1): 1}}),
 
     # `n` is cascade-reachable through `x`, so the worker non-exchange pass must
     # skip it: the `want` on `n` is weight exactly 1 per row, which is what a
@@ -116,8 +113,8 @@ _SHAPES = {
          "CREATE VIEW x AS SELECT p1, COUNT(*) AS c FROM n GROUP BY p1"],
         [f"INSERT INTO a VALUES {_values(_GP)}"],
         {"n": ["pk", "p1"], "x": ["p1", "c"]},
-        {"n": Counter({(pk, v + 1): 1 for pk, v in _GP}),
-         "x": Counter({(v + 1, 8): 1 for v in range(5)})}),
+        {"n": {(pk, v + 1): 1 for pk, v in _GP},
+         "x": {(v + 1, 8): 1 for v in range(5)}}),
 
     "projection_over_groupby": _shape(
         ["CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
@@ -134,7 +131,7 @@ _SHAPES = {
          "CREATE VIEW vx AS SELECT g, SUM(val) AS s FROM t GROUP BY g"],
         [f"INSERT INTO t VALUES {_values(_SIB)}"],
         {"vn": ["pk", "plus1"], "vx": ["g", "s"]},
-        {"vn": Counter({(pk, v + 1): 1 for pk, _, v in _SIB})}),
+        {"vn": {(pk, v + 1): 1 for pk, _, v in _SIB}}),
 
     # Both views are cascade-unreachable, so the depth sort must fill the inner
     # one first or the outer reads an empty source.
@@ -144,8 +141,8 @@ _SHAPES = {
          "CREATE VIEW v2 AS SELECT pk, a + 1 AS b FROM v1"],
         [f"INSERT INTO t VALUES {_values(_NEST)}"],
         {"v1": ["pk", "a"], "v2": ["pk", "b"]},
-        {"v1": Counter({(pk, v + 1): 1 for pk, v in _NEST}),
-         "v2": Counter({(pk, v + 2): 1 for pk, v in _NEST})}),
+        {"v1": {(pk, v + 1): 1 for pk, v in _NEST},
+         "v2": {(pk, v + 2): 1 for pk, v in _NEST}}),
 
     "joins_sharing_a_base": _shape(
         ["CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, "
@@ -173,7 +170,7 @@ _SHAPES = {
         [f"INSERT INTO ja VALUES {_values(_JA)}",
          f"INSERT INTO jb VALUES {_values(_JB)}"],
         {"jx": ["aid", "av", "bv"]},
-        {"jx": Counter({(i, av, k * 100): 1 for i, k, av in _JA})}),
+        {"jx": {(i, av, k * 100): 1 for i, k, av in _JA}}),
 
     # `x` reaches `a` by two paths; within one drive it is evaluated once per
     # incoming edge, which is correct multi-input behaviour and not a re-run.
@@ -196,7 +193,7 @@ _SHAPES = {
         [f"INSERT INTO ct VALUES {_values(_CT)}",
          f"INSERT INTO cu VALUES {_values(_CU)}"],
         {"cv": ["tid", "uid"]},
-        {"cv": Counter({(t, u): 1 for t, _ in _CT for u, _ in _CU})}),
+        {"cv": {(t, u): 1 for t, _ in _CT for u, _ in _CU}}),
 
     "range_join": _shape(
         ["CREATE TABLE ra (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
@@ -206,7 +203,7 @@ _SHAPES = {
         [f"INSERT INTO ra VALUES {_values(_RA)}",
          f"INSERT INTO rb VALUES {_values(_RA)}"],
         {"rv": ["x", "y"]},
-        {"rv": Counter({(x, y): 1 for _, x in _RA for _, y in _RA if x < y})}),
+        {"rv": {(x, y): 1 for _, x in _RA for _, y in _RA if x < y}}),
 
     # The DELETE removes group 0's MIN holder, so the live trace carries a
     # MIN-retraction recompute before the snapshot. AVG is one exact division,
@@ -245,7 +242,7 @@ _SHAPES = {
         [f"INSERT INTO dt VALUES {_values(_DT)}",
          "DELETE FROM dt WHERE pk = 0"],
         {"dv": ["g"]},
-        {"dv": Counter({(g,): 1 for g in range(7)})}),
+        {"dv": {(g,): 1 for g in range(7)}}),
 
     # A linear view over a CLUSTER BY proper prefix sits on the worker owning the
     # source's distribution prefix. That placement is folded at registration and
@@ -258,7 +255,7 @@ _SHAPES = {
          "CREATE VIEW cbv AS SELECT a, b, v FROM cbt WHERE v > 0"],
         [f"INSERT INTO cbt VALUES {_values(_CB)}"],
         {"cbv": ["a", "b", "v"]},
-        {"cbv": Counter({r: 1 for r in _CB})}),
+        {"cbv": {r: 1 for r in _CB}}),
 
     # A contiguous low-id range fails the predicate on every worker's first
     # chunks, so the relayed pre-phase payload for those rounds is empty.
@@ -282,14 +279,14 @@ _SHAPES = {
          "CREATE VIEW gv AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM gt"],
         [],
         {"gv": ["cnt", "total"]},
-        {"gv": Counter({(0, None): 1})}),
+        {"gv": {(0, None): 1}}),
 
     "global_agg_emptied": _shape(
         ["CREATE TABLE gt (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
          "CREATE VIEW gv AS SELECT COUNT(*) AS cnt, MIN(a) AS lo FROM gt"],
         ["INSERT INTO gt VALUES (1, 5), (2, 8)", "DELETE FROM gt"],
         {"gv": ["cnt", "lo"]},
-        {"gv": Counter({(0, None): 1})}),
+        {"gv": {(0, None): 1}}),
 
     # The replicated source takes the `i_am_owner` disjunct rather than the
     # partition route, and must still seed exactly one ground row.
@@ -299,7 +296,7 @@ _SHAPES = {
          "CREATE VIEW gv AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM gt"],
         [],
         {"gv": ["cnt", "total"]},
-        {"gv": Counter({(0, None): 1})}),
+        {"gv": {(0, None): 1}}),
 }
 
 
@@ -316,7 +313,7 @@ def _snapshot(conn):
     for name, sh in _SHAPES.items():
         for view, cols in sh["views"].items():
             vid, _ = conn.resolve_table(name, view)
-            out[f"{name}.{view}"] = oracle.scan_multiset(conn, vid, cols)
+            out[f"{name}.{view}"] = bag(conn.scan(vid), *cols)
     return out
 
 
@@ -400,17 +397,17 @@ def test_a_recovered_view_still_ticks_from_every_source(own_server):
         cbv, _ = conn.resolve_table("tick", "cbv")
         # Both branches carry val=10, so UNION ALL holds it at weight 2 — the one
         # multiplicity a row-set comparison of this view could not see.
-        assert oracle.scan_multiset(conn, ab, ["val"]) == Counter({(10,): 2})
+        assert bag(conn.scan(ab), "val") == {(10,): 2}
 
         conn.execute_sql("INSERT INTO a VALUES (3, 30)", schema_name="tick")
         conn.execute_sql("INSERT INTO b VALUES (4, 40)", schema_name="tick")
-        assert oracle.scan_multiset(conn, ab, ["val"]) == Counter(
-            {(10,): 2, (30,): 1, (40,): 1}), "the view must tick from both sources"
+        assert bag(conn.scan(ab), "val") == {(10,): 2, (30,): 1, (40,): 1}, \
+            "the view must tick from both sources"
 
         more = [(a, 9, a * 100 + 9) for a in range(1, 9)]
         conn.execute_sql(f"INSERT INTO cbt VALUES {_values(more)}", schema_name="tick")
-        assert oracle.scan_multiset(conn, cbv, ["a", "b", "v"]) == Counter(
-            {r: 1 for r in _CB + more}), "the post-restart insert must reach the view"
+        assert bag(conn.scan(cbv), "a", "b", "v") == {r: 1 for r in _CB + more}, \
+            "the post-restart insert must reach the view"
 
 
 def test_a_backfill_that_reclaims_the_sal_every_round_still_rebuilds_exactly(own_server):
@@ -434,7 +431,7 @@ def test_a_backfill_that_reclaims_the_sal_every_round_still_rebuilds_exactly(own
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
         vid, _ = conn.resolve_table("rr", "rv")
-        assert oracle.scan_multiset(conn, vid, ["x", "y"]) == sh["want"]["rv"]
+        assert bag(conn.scan(vid), "x", "y") == sh["want"]["rv"]
 
 
 def test_a_min_max_view_decodes_back_to_the_same_value_after_a_restart(own_server):
@@ -481,21 +478,19 @@ def test_a_min_max_view_decodes_back_to_the_same_value_after_a_restart(own_serve
 
     cols = ["grp", "i32_lo", "i32_hi", "u64_lo", "u64_hi",
             "f32_lo", "f32_hi", "f64_lo", "f64_hi"]
-    want = Counter({(7, -2147483648, 100000, 1, 9223372036854775809,
-                     -2.25, 4.0, -2.25, 4.0): 1})
+    want = {(7, -2147483648, 100000, 1, 9223372036854775809, -2.25, 4.0, -2.25, 4.0): 1}
     vid, _ = conn.resolve_table("mmr", "v")
-    oracle.assert_view_matches(conn, vid, cols, want, "pre-restart")
+    assert bag(conn.scan(vid), *cols) == want, "pre-restart"
     conn.close()
 
     own_server.restart()
     conn = gnitz.connect(own_server.sock_path)
     vid, _ = conn.resolve_table("mmr", "v")
-    oracle.assert_view_matches(conn, vid, cols, want, "post-restart")
+    assert bag(conn.scan(vid), *cols) == want, "post-restart"
 
     # A retraction after the restart forces the resumed view back through the
     # index: the extremum recedes to the next stored value, not to the delta's.
     conn.execute_sql("DELETE FROM t WHERE pk = 1", schema_name="mmr")
-    oracle.assert_view_matches(conn, vid, cols, Counter(
-        {(7, 256, 100000, 256, 9223372036854775809, 1.5, 4.0, 1.5, 4.0): 1}),
-        "after the extremum was retracted")
+    assert bag(conn.scan(vid), *cols) == {
+        (7, 256, 100000, 256, 9223372036854775809, 1.5, 4.0, 1.5, 4.0): 1}
     conn.close()

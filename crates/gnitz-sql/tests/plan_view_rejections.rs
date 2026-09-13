@@ -122,6 +122,14 @@ fn join_key_rules() {
         &cat,
         &[
             ("SELECT * FROM ty JOIN w ON ty.f = w.f", "Unsupported", "float"),
+            ("SELECT * FROM ty JOIN w ON ty.f < w.f", "Unsupported", "float"),
+            ("SELECT a.id FROM a FULL JOIN b USING (k)", "Unsupported", "COALESCE"),
+            ("SELECT a.id FROM a NATURAL FULL JOIN b", "Unsupported", "COALESCE"),
+            (
+                "SELECT a.id FROM a JOIN b USING (nope)",
+                "Bind",
+                "JOIN USING: column 'nope' not found",
+            ),
             ("SELECT * FROM ty JOIN a ON ty.big = a.k", "Unsupported", "signed-256"),
             (
                 "SELECT * FROM ty JOIN w ON ty.s = w.big",
@@ -244,6 +252,8 @@ fn subquery_rules() {
         "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AND EXISTS (SELECT 1 FROM b WHERE b.w = a.v)",
         "SELECT * FROM a WHERE EXISTS (SELECT 1 FROM a AS x WHERE x.k = a.k)",
         "SELECT * FROM a WHERE v = 1 OR EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+        // A nullable IN as a top-level conjunct is the anti-join's own semantics.
+        "SELECT * FROM n WHERE k IN (SELECT k FROM b)",
     ] {
         view(&cat, body);
     }
@@ -264,6 +274,13 @@ fn subquery_rules() {
             ("SELECT * FROM a WHERE k IN (SELECT k, w FROM b)", "Unsupported", "exactly one plain column"),
             ("SELECT * FROM a AS t WHERE EXISTS (SELECT 1 FROM b AS t WHERE t.k = t.k)", "Bind", "rename one"),
             ("SELECT id FROM n WHERE n.k IN (SELECT k FROM b) OR n.v = 1", "Unsupported", "IN (SELECT …) in a mark position"),
+            ("SELECT id, k IN (SELECT k FROM b) AS f FROM n", "Unsupported", "IN (SELECT …) in a mark position"),
+            ("SELECT id FROM n WHERE NOT (k IN (SELECT k FROM b))", "Unsupported", "NOT NULL"),
+            ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)", "Unsupported", "at most one EXISTS/IN subquery in a mark position"),
+            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k GROUP BY b.w) FROM a", "Unsupported", "GROUP BY"),
+            ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k < a.k) FROM a", "Unsupported", "range correlation"),
+            ("SELECT a.id, (SELECT COUNT(*) FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k) FROM a", "Unsupported", "single FROM table without JOINs"),
+            ("SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)", "Unsupported", "scalar subqueries are not supported"),
             ("SELECT a.id, (SELECT b.w FROM b WHERE b.k = a.k) FROM a", "Unsupported", "single aggregate over its correlation group"),
             ("SELECT a.id, (SELECT COUNT(*) FROM b) FROM a", "Unsupported", "only supported as a top-level WHERE"),
             ("SELECT a.id FROM a WHERE a.v <> (SELECT COUNT(*) FROM b)", "Unsupported", "only supported as a top-level WHERE"),
@@ -312,6 +329,11 @@ fn grouped_body_rules() {
                 "SELECT g FROM t HAVING SUM(v) > 1",
                 "Plan",
                 "column 'g' must appear in GROUP BY or an aggregate function",
+            ),
+            (
+                "SELECT a + 1 AS x, COUNT(*) AS c FROM m",
+                "Plan",
+                "column 'a' must appear in GROUP BY",
             ),
             (
                 "SELECT id, COUNT(*) AS c FROM ty GROUP BY id HAVING SUM(big) > 0",
@@ -452,6 +474,13 @@ fn set_op_and_distinct_rules() {
                 "Plan",
                 "type mismatch",
             ),
+            // U64 against I64 needs a 128-bit common type, past the 8-byte cap.
+            ("SELECT x FROM w UNION ALL SELECT id FROM t", "Plan", "type mismatch"),
+            (
+                "SELECT g FROM t UNION ALL BY NAME SELECT g FROM u",
+                "Unsupported",
+                "BY NAME",
+            ),
             (
                 "SELECT g AS x, v AS x FROM t UNION SELECT g AS x, v AS x FROM t",
                 "Plan",
@@ -543,13 +572,46 @@ fn cte_and_derived_table_rules() {
                 "cannot start with '_'",
             ),
             ("SELECT * FROM _seg4096", "Plan", "cannot start with '_'"),
+            (
+                "SELECT id FROM (SELECT id, v FROM t WHERE v > 10)",
+                "Unsupported",
+                "needs an alias",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn top_n_rules() {
+    let cat = cat();
+    rejects(
+        &cat,
+        &[
+            ("SELECT id FROM t ORDER BY v", "Unsupported", "ORDER BY without LIMIT"),
+            ("SELECT id FROM t LIMIT 3", "Unsupported", "LIMIT without ORDER BY"),
+            ("SELECT id FROM t ORDER BY v LIMIT 0", "Plan", "LIMIT 0"),
+            ("SELECT id FROM t OFFSET 5", "Unsupported", "OFFSET without"),
+            (
+                "SELECT DISTINCT g FROM t ORDER BY v LIMIT 1",
+                "Unsupported",
+                "selected column",
+            ),
+            (
+                "SELECT id FROM t UNION SELECT id FROM u ORDER BY v LIMIT 1",
+                "Unsupported",
+                "output column or position",
+            ),
         ],
     );
 }
 
 #[test]
 fn ambiguous_and_hidden_column_rules() {
-    let cat = cat();
+    let mut cat = cat();
+    // A merged name is one column, so a third step can pair with it.
+    view(&cat, "SELECT t.id AS x FROM t JOIN u USING (v) JOIN a USING (v)");
+    let sv = view(&cat, "SELECT v FROM t");
+    register(&mut cat, "sv", 50, &sv);
     rejects(
         &cat,
         &[
@@ -567,6 +629,13 @@ fn ambiguous_and_hidden_column_rules() {
                 "is ambiguous",
             ),
             ("SELECT _join_pk FROM jv", "Bind", "not found"),
+            (
+                "SELECT t.id AS x FROM t JOIN u ON t.id = u.id JOIN a USING (v)",
+                "Bind",
+                "'v' is ambiguous",
+            ),
+            // `sv` drops `t`'s PK, which rides hidden.
+            ("SELECT id FROM sv", "Bind", "not found"),
         ],
     );
 }
@@ -605,6 +674,7 @@ fn capacity_rules() {
         "SELECT t.id, u.v FROM t FULL JOIN u ON t.id = u.g",
         "SELECT t.id, u.v FROM t JOIN u ON t.id = u.g AND t.v < u.v",
         "SELECT t.id, u.v FROM t CROSS JOIN u",
+        "SELECT id FROM t ORDER BY v LIMIT 1",
     ] {
         view(&cat, body);
         let sql = format!("CREATE VIEW v WITH (capacity = '1 MB') AS {body}");

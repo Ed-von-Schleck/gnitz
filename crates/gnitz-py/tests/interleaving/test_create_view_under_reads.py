@@ -11,7 +11,7 @@ import threading
 
 import gnitz
 import pytest
-from _oracle import assert_view_matches
+from _read import bag, scanned
 from _serverproc import HANG_TIMEOUT, NEEDS_MULTI, join_or_fail
 
 pytestmark = NEEDS_MULTI
@@ -148,5 +148,4 @@ def test_a_view_created_over_a_table_being_written_holds_every_row(
         join_or_fail("the inserter hung — possible wedge", t)
     assert not errors, f"concurrent inserter failed: {errors}"
 
-    assert_view_matches(client, client.resolve_table(schema_name, "v")[0],
-                        list(cols), want(60))
+    assert bag(scanned(client, schema_name, "v"), *cols) == want(60)

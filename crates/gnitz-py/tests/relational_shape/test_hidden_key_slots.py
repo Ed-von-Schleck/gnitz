@@ -10,122 +10,68 @@ That exclusion is the contract, so the assertions here are over the presented
 field *names*, never a column count; and the weights alongside them are what
 shows the key is still doing its physical job.
 """
-
-import pytest
 from _read import bag, scanned
 
-
-def _sources(client, sn):
-    """The two sources every shape below reads. `a` carries the TEXT column the
-    shape whose group key cannot be a PK column needs."""
-    client.execute_sql(
-        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
-        "av BIGINT NOT NULL, cat TEXT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql("INSERT INTO a VALUES (1, 7, 100, 'x'), (2, 5, 100, 'y')", schema_name=sn)
-    client.execute_sql("INSERT INTO b VALUES (1, 7, 200), (2, 9, 200)", schema_name=sn)
-
-
-_SHAPES = [
-    pytest.param(
-        "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-        {"av", "bv"}, ("av", "bv"), {(100, 200): 1}, id="equi-join"),
-    pytest.param(
-        # Three (a, b) pairs satisfy a.k < b.k and all project to one tuple, so
-        # the pair key is what keeps them three elements rather than one.
-        "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k < b.k",
-        {"av", "bv"}, ("av", "bv"), {(100, 200): 3}, id="range-join"),
-    pytest.param(
-        "SELECT av FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
-        {"av"}, ("av",), {(100,): 1}, id="exists"),
-    pytest.param(
-        "SELECT av AS val FROM a UNION SELECT bv AS val FROM b",
-        {"val"}, ("val",), {(100,): 1, (200,): 1}, id="union"),
-    pytest.param(
-        "SELECT DISTINCT av FROM a",
-        {"av"}, ("av",), {(100,): 1}, id="distinct"),
-    pytest.param(
-        "SELECT cat, COUNT(*) AS cnt FROM a GROUP BY cat",
-        {"cat", "cnt"}, ("cat", "cnt"), {("x", 1): 1, ("y", 1): 1}, id="group-by-text"),
-    pytest.param(
-        # No synthetic key: the source PK the projection drops rides hidden, and
-        # is what keeps two rows sharing `av` two elements.
-        "SELECT av FROM a",
-        {"av"}, ("av",), {(100,): 2}, id="unprojected-source-pk"),
-]
+# view -> (body, its visible columns, its bag before and after `a(2)` leaves).
+_SHAPES = {
+    "equi_join": ("SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
+                  ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
+    # Three pairs satisfy a.k < b.k and all project to one tuple, so the pair key
+    # is what keeps them three elements rather than one.
+    "range_join": ("SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k < b.k",
+                   ("av", "bv"), {(100, 200): 3}, {(100, 200): 1}),
+    "exists": ("SELECT av FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+               ("av",), {(100,): 1}, {(100,): 1}),
+    "union": ("SELECT av AS val FROM a UNION SELECT bv AS val FROM b",
+              ("val",), {(100,): 1, (200,): 1}, {(100,): 1, (200,): 1}),
+    "distinct": ("SELECT DISTINCT av FROM a", ("av",), {(100,): 1}, {(100,): 1}),
+    "group_by_text": ("SELECT cat, COUNT(*) AS cnt FROM a GROUP BY cat",
+                      ("cat", "cnt"), {("x", 1): 1, ("y", 1): 1}, {("x", 1): 1}),
+    # No synthetic key: the source PK the projection drops rides hidden, and is
+    # what keeps two rows sharing `av` two elements.
+    "unprojected_source_pk": ("SELECT av FROM a", ("av",), {(100,): 2}, {(100,): 1}),
+    # A wildcard modifier decides the column list before any expression lowers;
+    # a dropped or renamed name must be absent from the row, not merely unread.
+    "wildcard_except_rename": ("SELECT * EXCEPT (cat) RENAME (av AS years) FROM a",
+                               ("pk", "k", "years"), {(1, 7, 100): 1, (2, 5, 100): 1}, {(1, 7, 100): 1}),
+    "wildcard_exclude": ("SELECT * EXCLUDE (k, cat) FROM a",
+                         ("pk", "av"), {(1, 100): 1, (2, 100): 1}, {(1, 100): 1}),
+    # A hidden key never re-enters through a downstream wildcard, however deep.
+    "stacked": ("SELECT * FROM over_jv1", ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
+    # Downstream identity is the projected content: two structurally identical
+    # join views meet UNION ALL as one tuple at weight 2 and UNION at weight 1.
+    "union_all_of_twins": ("SELECT * FROM jv1 UNION ALL SELECT * FROM jv2",
+                           ("av", "bv"), {(100, 200): 2}, {(100, 200): 2}),
+    "union_of_twins": ("SELECT * FROM jv1 UNION SELECT * FROM jv2",
+                       ("av", "bv"), {(100, 200): 1}, {(100, 200): 1}),
+}
 
 
-@pytest.mark.parametrize("body, fields, cols, want", _SHAPES)
-def test_a_key_slot_is_absent_from_every_client_row(client, schema_name, body, fields, cols, want):
+def test_a_key_slot_is_absent_from_every_client_row(client, schema_name):
     """For each emitter that fabricates or inherits a key, the presented fields
-    are exactly the projected names, and the weights show the key still keying."""
+    are exactly the projected names, and the weights show the key still keying
+    through a retraction. `include_hidden=True` is the debugging escape hatch: it
+    presents the synthetic key first, carrying the decoded join-key value."""
     sn = schema_name
-    _sources(client, sn)
-    client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
-
-    rows = scanned(client, sn, "v")
-    assert bag(rows, *cols) == want
-    for r in rows:
-        assert set(r._fields) == fields, r._fields
-
-
-def test_include_hidden_surfaces_the_key_at_its_physical_slot(client, schema_name):
-    """The debugging escape hatch: `include_hidden=True` presents the synthetic
-    key in its physical position — first, ahead of the payload — carrying the
-    decoded join-key value, not the raw ordered bytes."""
-    sn = schema_name
-    _sources(client, sn)
+    join = "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k"
     client.execute_sql(
-        "CREATE VIEW jv AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-        schema_name=sn)
-    vid = client.resolve_table(sn, "jv")[0]
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL, "
+        "cat TEXT NOT NULL); "
+        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL); "
+        f"CREATE VIEW jv1 AS {join}; CREATE VIEW jv2 AS {join}; "
+        "CREATE VIEW over_jv1 AS SELECT * FROM jv1; "
+        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, *_) in _SHAPES.items()) + "; "
+        "INSERT INTO a VALUES (1, 7, 100, 'x'), (2, 5, 100, 'y'); "
+        "INSERT INTO b VALUES (1, 7, 200), (2, 9, 200)", schema_name=sn)
 
-    raw = list(client.scan(vid, include_hidden=True))
-    assert len(raw) == 1, raw
-    assert raw[0]._fields[0] == "_join_pk", raw[0]._fields
-    assert (raw[0]["_join_pk"], raw[0]["av"], raw[0]["bv"]) == (7, 100, 200)
+    for step in ("before", "after"):
+        if step == "after":
+            client.execute_sql("DELETE FROM a WHERE pk = 2", schema_name=sn)
+        for name, (_, cols, before, after) in _SHAPES.items():
+            rows = scanned(client, sn, name)
+            assert bag(rows, *cols) == (before if step == "before" else after), (step, name)
+            assert all(set(r._fields) == set(cols) for r in rows), (step, name, rows)
 
-
-def test_a_hidden_key_never_re_enters_through_a_downstream_view(client, schema_name):
-    """`SELECT *` over a hidden-keyed view expands to the visible columns only,
-    however many layers deep, and naming a hidden column outright fails rather
-    than resolving."""
-    sn = schema_name
-    _sources(client, sn)
-    client.execute_sql(
-        "CREATE VIEW l1 AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-        schema_name=sn)
-    client.execute_sql("CREATE VIEW l2 AS SELECT * FROM l1", schema_name=sn)
-    client.execute_sql("CREATE VIEW l3 AS SELECT * FROM l2", schema_name=sn)
-    client.execute_sql("CREATE VIEW sv AS SELECT av FROM a", schema_name=sn)
-
-    rows = scanned(client, sn, "l3")
-    assert bag(rows, "av", "bv") == {(100, 200): 1}
-    for r in rows:
-        assert set(r._fields) == {"av", "bv"}, r._fields
-
-    # `sv` drops `a`'s PK, which rides hidden; a downstream view cannot name it.
-    with pytest.raises(Exception) as ei:
-        client.execute_sql("CREATE VIEW ds AS SELECT pk FROM sv", schema_name=sn)
-    assert "pk" in str(ei.value).lower() or "not found" in str(ei.value).lower(), str(ei.value)
-
-
-def test_a_set_op_over_two_identical_join_views_dedups_on_content(client, schema_name):
-    """Downstream identity is the projected content: two structurally identical
-    join views must reach UNION ALL as one tuple at weight 2 and collapse under
-    UNION to weight 1, rather than staying distinct on their upstream key."""
-    sn = schema_name
-    _sources(client, sn)
-    for name in ("jv1", "jv2"):
-        client.execute_sql(
-            f"CREATE VIEW {name} AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-            schema_name=sn)
-    client.execute_sql("CREATE VIEW ua AS SELECT * FROM jv1 UNION ALL SELECT * FROM jv2",
-                       schema_name=sn)
-    client.execute_sql("CREATE VIEW ud AS SELECT * FROM jv1 UNION SELECT * FROM jv2",
-                       schema_name=sn)
-
-    assert bag(scanned(client, sn, "ua"), "av", "bv") == {(100, 200): 2}
-    assert bag(scanned(client, sn, "ud"), "av", "bv") == {(100, 200): 1}
+    raw = list(client.scan(client.resolve_table(sn, "jv1")[0], include_hidden=True))
+    assert [r._fields[0] for r in raw] == ["_join_pk"], raw
+    assert bag(raw, "_join_pk", "av", "bv") == {(7, 100, 200): 1}

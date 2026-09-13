@@ -4,335 +4,131 @@ final view reads by name.
 A CTE, a derived table and an inline set-op or join side are three spellings of
 one bound tree, and the lowering — not the spelling — decides what is cut. So
 the facts here are: a cut body answers exactly as the uncut one, any body may be
-cut, any operator may read a cut segment, a chain of cuts backfills in
-dependency order, and a name crossing a cut resolves against what the segment
-exposes.
+cut, any operator may read a cut segment, and a name crossing a cut resolves
+against what the segment exposes. A chain of cuts over existing rows backfilling
+in dependency order is schema_lifetime's; an outer join inside a cut is
+test_outer_join.py's.
 
-Weights throughout: a segment feeding two consumers, or a chain seeding its
-backfill twice, shows up as a doubled weight and not as an extra row.
+Weights throughout: a segment feeding two consumers shows up as a doubled weight
+and not as an extra row.
 """
+from collections import Counter
 
-import pytest
 from _read import bag, scanned
 
 
-def _tu(client, sn):
-    """The two sources every body below is cut out of."""
-    for name in ("t", "u"):
-        client.execute_sql(
-            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-            schema_name=sn)
+def _set(vals):
+    return dict.fromkeys(((v,) for v in vals), 1)
 
 
-def test_a_cut_body_answers_the_same_as_the_uncut_one(client, schema_name):
-    """The filter feeding a join, spelled as a CTE, a derived table, a
-    pass-through CTE with the predicate in the final, and one inline body. The
-    first two cut a segment and the last two do not; all four carry the same
-    weights through every write."""
+def _t_a(t):
+    return [a for a, _ in t.values()]
+
+
+def _filter_into_join(t, u):
+    return {(i, u[i][1]): 1 for i, (a, _) in t.items() if a > 100 and i in u}
+
+
+# view -> (body, the columns it is read by, its bag over t and u as {id: (a, b)}).
+_VIEWS = {
+    # The filter feeding a join as a CTE and as a derived table (both cut), and as
+    # a pass-through CTE with the predicate in the final and one inline body
+    # (neither cut).
+    "cut_cte": ("WITH d AS (SELECT id, a FROM t WHERE a > 100) "
+                "SELECT d.id AS did, u.b AS ub FROM d JOIN u ON d.id = u.id",
+                ("did", "ub"), _filter_into_join),
+    "cut_derived": ("SELECT d.id AS did, u.b AS ub FROM (SELECT id, a FROM t WHERE a > 100) d "
+                    "JOIN u ON d.id = u.id", ("did", "ub"), _filter_into_join),
+    "uncut_pass_through": ("WITH d AS (SELECT * FROM t) SELECT d.id AS did, u.b AS ub "
+                           "FROM d JOIN u ON d.id = u.id WHERE d.a > 100", ("did", "ub"), _filter_into_join),
+    "uncut_inline": ("SELECT t.id AS did, u.b AS ub FROM t JOIN u ON t.id = u.id WHERE t.a > 100",
+                     ("did", "ub"), _filter_into_join),
+    # Any body behind the cut.
+    "body_set_op": ("WITH c AS (SELECT a FROM t UNION SELECT a FROM u) SELECT a FROM c",
+                    ("a",), lambda t, u: _set(_t_a(t) + _t_a(u))),
+    "body_grouped": ("WITH c AS (SELECT a, COUNT(*) AS n FROM t GROUP BY a) SELECT a, n FROM c",
+                     ("a", "n"), lambda t, u: dict.fromkeys(Counter(_t_a(t)).items(), 1)),
+    "body_join": ("WITH c AS (SELECT t.a AS ta, u.b AS ub FROM t JOIN u ON t.b = u.id) SELECT ta, ub FROM c",
+                  ("ta", "ub"), lambda t, u: Counter((a, u[b][1]) for a, b in t.values() if b in u)),
+    "body_distinct": ("SELECT a FROM (SELECT DISTINCT a FROM t) d", ("a",), lambda t, u: _set(_t_a(t))),
+    "body_nested": ("SELECT a FROM (SELECT a FROM (SELECT a, b FROM t WHERE a > 5) inner_d WHERE b < 100) d",
+                    ("a",), lambda t, u: Counter((a,) for a, b in t.values() if a > 5 and b < 100)),
+    # Any operator over the cut; the COUNT(*) narrows the segment to no payload.
+    "read_where": ("SELECT a FROM (SELECT a, b FROM t) d WHERE b > 10",
+                   ("a",), lambda t, u: Counter((a,) for a, b in t.values() if b > 10)),
+    "read_grouped": ("SELECT a, COUNT(*) AS n FROM (SELECT a FROM t WHERE b > 0) d GROUP BY a",
+                     ("a", "n"), lambda t, u: dict.fromkeys(Counter(a for a, b in t.values() if b > 0).items(), 1)),
+    "read_distinct": ("SELECT DISTINCT a FROM (SELECT a FROM t UNION ALL SELECT a FROM u) d",
+                      ("a",), lambda t, u: _set(_t_a(t) + _t_a(u))),
+    "read_set_op": ("SELECT a FROM (SELECT a, b FROM t WHERE b > 0) d UNION SELECT a FROM u",
+                    ("a",), lambda t, u: _set([a for a, b in t.values() if b > 0] + _t_a(u))),
+    "read_in": ("WITH c AS (SELECT a FROM u WHERE b > 0) SELECT id FROM t WHERE t.a IN (SELECT a FROM c)",
+                ("id",), lambda t, u: {(i,): 1 for i, (a, _) in t.items()
+                                       if a in {ua for ua, ub in u.values() if ub > 0}}),
+    "read_both_sides": ("SELECT x.a AS xa, y.b AS yb FROM (SELECT id, a FROM t WHERE a > 10) x "
+                        "JOIN (SELECT id, b FROM u WHERE b < 100) y ON x.id = y.id",
+                        ("xa", "yb"), lambda t, u: Counter((a, u[i][1]) for i, (a, _) in t.items()
+                                                           if a > 10 and i in u and u[i][1] < 100)),
+    "read_count": ("SELECT COUNT(*) AS n FROM (SELECT a FROM t WHERE b > 0) d",
+                   ("n",), lambda t, u: {(sum(b > 0 for _, b in t.values()),): 1}),
+    # An inner set op is a segment the outer re-hashes on its own identity, in a
+    # chain and across quantifiers; a leaf's identity may be computed.
+    "set_op_chain": ("SELECT a FROM t UNION SELECT a FROM u UNION SELECT b FROM t",
+                     ("a",), lambda t, u: _set(_t_a(t) + _t_a(u) + [b for _, b in t.values()])),
+    "set_op_mixed": ("(SELECT a FROM t UNION ALL SELECT a FROM u) INTERSECT SELECT b FROM t",
+                     ("a",), lambda t, u: _set(set(_t_a(t) + _t_a(u)) & {b for _, b in t.values()})),
+    "computed_distinct": ("SELECT DISTINCT a + 1 AS a1, b FROM t",
+                          ("a1", "b"), lambda t, u: dict.fromkeys(((a + 1, b) for a, b in t.values()), 1)),
+    "computed_except": ("SELECT a * 2 AS x FROM t EXCEPT SELECT b FROM u",
+                        ("x",), lambda t, u: _set({a * 2 for a in _t_a(t)} - {b for _, b in u.values()})),
+    # Column aliases live on what the FROM binder hands the scope, so a join step
+    # above them resolves `x.k` — as an ON key, a projection, and through an outer
+    # join's null-widening.
+    "alias_cte": ("WITH d(k, amt) AS (SELECT id, a FROM t WHERE a > 100) "
+                  "SELECT d.k AS kk, d.amt AS aa FROM d JOIN u ON d.k = u.id",
+                  ("kk", "aa"), lambda t, u: {(i, a): 1 for i, (a, _) in t.items() if a > 100 and i in u}),
+    "alias_derived": ("SELECT x.k AS xk, x.val AS xv, u.b AS ub FROM (SELECT id, a FROM t) AS x(k, val) "
+                      "JOIN u ON x.k = u.id",
+                      ("xk", "xv", "ub"), lambda t, u: {(i, a, u[i][1]): 1 for i, (a, _) in t.items() if i in u}),
+    "alias_left": ("SELECT x.k AS xk, u.b AS ub FROM (SELECT id, a FROM t) AS x(k, val) LEFT JOIN u ON x.k = u.id",
+                   ("xk", "ub"), lambda t, u: {(i, u[i][1] if i in u else None): 1 for i in t}),
+    # A non-LATERAL sibling is not in scope: `u` inside the second derived table
+    # binds the catalog table, since the first sibling has no `b` to resolve.
+    "sibling": ("SELECT x.b AS xb FROM (SELECT id FROM t) u JOIN (SELECT id, b FROM u) x ON u.id = x.id",
+                ("xb",), lambda t, u: Counter((u[i][1],) for i in t if i in u)),
+}
+
+# (statement, table, {id: (a, b)}); a `None` row deletes the id.
+_CHURN = [
+    ("INSERT INTO u VALUES (1, 30, 60), (2, 90, 0), (4, 7, 20), (7, 30, 0)",
+     "u", {1: (30, 60), 2: (90, 0), 4: (7, 20), 7: (30, 0)}),
+    # t(1) and t(2) share every column but the key, so a join through them carries weight 2.
+    ("INSERT INTO t VALUES (1, 10, 7), (2, 10, 7), (3, 20, 200), (4, 200, 50), (5, 150, 0)",
+     "t", {1: (10, 7), 2: (10, 7), 3: (20, 200), 4: (200, 50), 5: (150, 0)}),
+    ("UPDATE t SET a = 300 WHERE id = 2", "t", {2: (300, 7)}),
+    ("DELETE FROM t WHERE id = 1", "t", {1: None}),
+    ("DELETE FROM u WHERE id = 2", "u", {2: None}),
+    ("INSERT INTO t VALUES (6, 3, 7)", "t", {6: (3, 7)}),
+]
+
+
+def test_a_cut_segment_answers_as_the_body_it_was_cut_from(client, schema_name):
+    """Every cut, every consumer and every name crossing a cut, checked after
+    each epoch of a churn on both sources."""
     sn = schema_name
-    _tu(client, sn)
     client.execute_sql(
-        "CREATE VIEW v_cte AS WITH d AS (SELECT id, a FROM t WHERE a > 100) "
-        "SELECT d.id AS did, u.b AS ub FROM d JOIN u ON d.id = u.id", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_derived AS SELECT d.id AS did, u.b AS ub "
-        "FROM (SELECT id, a FROM t WHERE a > 100) d JOIN u ON d.id = u.id", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_passthrough AS WITH d AS (SELECT * FROM t) "
-        "SELECT d.id AS did, u.b AS ub FROM d JOIN u ON d.id = u.id WHERE d.a > 100", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_inline AS SELECT t.id AS did, u.b AS ub "
-        "FROM t JOIN u ON t.id = u.id WHERE t.a > 100", schema_name=sn)
-    names = ("v_cte", "v_derived", "v_passthrough", "v_inline")
-
-    def agree(want):
-        for v in names:
-            assert bag(scanned(client, sn, v), "did", "ub") == want, v
-
-    client.execute_sql("INSERT INTO u VALUES (1, 0, 10), (2, 0, 20), (3, 0, 30)", schema_name=sn)
-    client.execute_sql("INSERT INTO t VALUES (1, 200, 0), (2, 50, 0)", schema_name=sn)
-    agree({(1, 10): 1})
-    client.execute_sql("UPDATE t SET a = 300 WHERE id = 2", schema_name=sn)
-    agree({(1, 10): 1, (2, 20): 1})
-    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-    agree({(2, 20): 1})
-    client.execute_sql("INSERT INTO t VALUES (3, 150, 0)", schema_name=sn)
-    agree({(2, 20): 1, (3, 30): 1})
-
-
-def test_any_body_may_be_cut_to_a_segment(client, schema_name):
-    """A set operation, a GROUP BY, a join, a DISTINCT and a derived table nested
-    in a derived table each ride behind the cut, read by a trivial final."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql(
-        "CREATE VIEW v_setop AS WITH c AS (SELECT a FROM t UNION SELECT a FROM u) "
-        "SELECT a FROM c", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_grouped AS WITH c AS (SELECT a, COUNT(*) AS n FROM t GROUP BY a) "
-        "SELECT a, n FROM c", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_join AS WITH c AS (SELECT t.a AS ta, u.b AS ub FROM t JOIN u ON t.b = u.id) "
-        "SELECT ta, ub FROM c", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_distinct AS SELECT a FROM (SELECT DISTINCT a FROM t) d", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_nested AS SELECT a FROM "
-        "(SELECT a FROM (SELECT a, b FROM t WHERE a > 5) inner_d WHERE b < 100) d", schema_name=sn)
-
-    client.execute_sql("INSERT INTO t VALUES (1, 10, 7), (2, 10, 7), (3, 20, 200)", schema_name=sn)
-    client.execute_sql("INSERT INTO u VALUES (7, 30, 0), (8, 40, 0)", schema_name=sn)
-    assert bag(scanned(client, sn, "v_setop"), "a") == {(10,): 1, (20,): 1, (30,): 1, (40,): 1}
-    assert bag(scanned(client, sn, "v_grouped"), "a", "n") == {(10, 2): 1, (20, 1): 1}
-    # Both t rows with b=7 match u.id=7, so the joined pair carries weight 2.
-    assert bag(scanned(client, sn, "v_join"), "ta", "ub") == {(10, 0): 2}
-    assert bag(scanned(client, sn, "v_distinct"), "a") == {(10,): 1, (20,): 1}
-    assert bag(scanned(client, sn, "v_nested"), "a") == {(10,): 2}
-
-    client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "v_setop"), "a") == {(10,): 1, (20,): 1, (30,): 1, (40,): 1}
-    assert bag(scanned(client, sn, "v_grouped"), "a", "n") == {(10, 1): 1, (20, 1): 1}
-    assert bag(scanned(client, sn, "v_join"), "ta", "ub") == {(10, 0): 1}
-    assert bag(scanned(client, sn, "v_distinct"), "a") == {(10,): 1, (20,): 1}
-    assert bag(scanned(client, sn, "v_nested"), "a") == {(10,): 1}
-
-
-def test_any_operator_may_read_a_cut_segment(client, schema_name):
-    """A cut segment stands wherever a base relation does: under a WHERE, a
-    GROUP BY, a DISTINCT, one side of a set operation, an IN subquery, both
-    sides of a join, and a COUNT(*) whose keep set narrows the segment to zero
-    payload."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql(
-        "CREATE VIEW c_where AS SELECT a FROM (SELECT a, b FROM t) d WHERE b > 10", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW c_grouped AS SELECT a, COUNT(*) AS n "
-        "FROM (SELECT a FROM t WHERE b > 0) d GROUP BY a", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW c_distinct AS SELECT DISTINCT a "
-        "FROM (SELECT a FROM t UNION ALL SELECT a FROM u) d", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW c_setop AS SELECT a FROM (SELECT a, b FROM t WHERE b > 0) d "
-        "UNION SELECT a FROM u", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW c_subquery AS WITH c AS (SELECT a FROM u WHERE b > 0) "
-        "SELECT id FROM t WHERE t.a IN (SELECT a FROM c)", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW c_twojoin AS SELECT x.a AS xa, y.b AS yb "
-        "FROM (SELECT id, a FROM t WHERE a > 10) x JOIN (SELECT id, b FROM u WHERE b < 100) y "
-        "ON x.id = y.id", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW c_count AS SELECT COUNT(*) AS n FROM (SELECT a FROM t WHERE b > 0) d",
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
+        + "; ".join(f"CREATE VIEW {name} AS {body}" for name, (body, _, _) in _VIEWS.items()),
         schema_name=sn)
 
-    client.execute_sql("INSERT INTO t VALUES (1, 20, 50), (2, 20, 5), (3, 30, 0)", schema_name=sn)
-    client.execute_sql("INSERT INTO u VALUES (1, 20, 60), (2, 90, 0)", schema_name=sn)
-    assert bag(scanned(client, sn, "c_where"), "a") == {(20,): 1}
-    assert bag(scanned(client, sn, "c_grouped"), "a", "n") == {(20, 2): 1}
-    assert bag(scanned(client, sn, "c_distinct"), "a") == {(20,): 1, (30,): 1, (90,): 1}
-    assert bag(scanned(client, sn, "c_setop"), "a") == {(20,): 1, (90,): 1}
-    assert bag(scanned(client, sn, "c_subquery"), "id") == {(1,): 1, (2,): 1}
-    assert bag(scanned(client, sn, "c_twojoin"), "xa", "yb") == {(20, 60): 1, (20, 0): 1}
-    assert bag(scanned(client, sn, "c_count"), "n") == {(2,): 1}
-
-    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "c_where"), "a") == {}
-    assert bag(scanned(client, sn, "c_grouped"), "a", "n") == {(20, 1): 1}
-    assert bag(scanned(client, sn, "c_distinct"), "a") == {(20,): 1, (30,): 1, (90,): 1}
-    assert bag(scanned(client, sn, "c_setop"), "a") == {(20,): 1, (90,): 1}
-    assert bag(scanned(client, sn, "c_subquery"), "id") == {(2,): 1}
-    assert bag(scanned(client, sn, "c_twojoin"), "xa", "yb") == {(20, 0): 1}
-    assert bag(scanned(client, sn, "c_count"), "n") == {(1,): 1}
-
-
-def test_a_nested_set_op_is_cut_and_rehashed_by_the_outer(client, schema_name):
-    """An inner set operation is a segment whose synthetic key the outer must
-    re-hash on its own identity columns, in a chain and across quantifiers."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql(
-        "CREATE VIEW v_chain AS SELECT a FROM t UNION SELECT a FROM u UNION SELECT b FROM t",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_mixed AS (SELECT a FROM t UNION ALL SELECT a FROM u) "
-        "INTERSECT SELECT b FROM t", schema_name=sn)
-
-    client.execute_sql("INSERT INTO t VALUES (1, 7, 7), (2, 3, 9)", schema_name=sn)
-    client.execute_sql("INSERT INTO u VALUES (1, 9, 0)", schema_name=sn)
-    assert bag(scanned(client, sn, "v_chain"), "a") == {(3,): 1, (7,): 1, (9,): 1}
-    assert bag(scanned(client, sn, "v_mixed"), "a") == {(7,): 1, (9,): 1}
-
-    client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "v_chain"), "a") == {(7,): 1, (9,): 1}
-    assert bag(scanned(client, sn, "v_mixed"), "a") == {(7,): 1}
-
-
-def test_a_chain_of_cuts_backfills_in_dependency_order(client, schema_name):
-    """Views created over data that already exists: each segment must seed before
-    its consumer, or the consumer reads a still-empty sibling and silently loses
-    every pre-existing row. Still incremental afterwards."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql("INSERT INTO t VALUES (1, 10, 2), (2, 10, 3), (3, 20, 5)", schema_name=sn)
-    client.execute_sql("INSERT INTO u VALUES (7, 99, 0)", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_grouped AS SELECT a, COUNT(*) AS n "
-        "FROM (SELECT a FROM t WHERE b > 0) d GROUP BY a", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_chain AS SELECT a FROM t UNION SELECT a FROM u UNION SELECT b FROM t",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_grouped_side AS SELECT a AS k, SUM(b) AS s FROM t GROUP BY a "
-        "UNION ALL SELECT id, a FROM u", schema_name=sn)
-
-    assert bag(scanned(client, sn, "v_grouped"), "a", "n") == {(10, 2): 1, (20, 1): 1}
-    assert bag(scanned(client, sn, "v_chain"), "a") == {
-        (2,): 1, (3,): 1, (5,): 1, (10,): 1, (20,): 1, (99,): 1}
-    assert bag(scanned(client, sn, "v_grouped_side"), "k", "s") == {
-        (7, 99): 1, (10, 5): 1, (20, 5): 1}
-
-    client.execute_sql("INSERT INTO t VALUES (4, 20, 1)", schema_name=sn)
-    assert bag(scanned(client, sn, "v_grouped"), "a", "n") == {(10, 2): 1, (20, 2): 1}
-    assert bag(scanned(client, sn, "v_chain"), "a") == {
-        (1,): 1, (2,): 1, (3,): 1, (5,): 1, (10,): 1, (20,): 1, (99,): 1}
-    assert bag(scanned(client, sn, "v_grouped_side"), "k", "s") == {
-        (7, 99): 1, (10, 5): 1, (20, 6): 1}
-
-
-def test_a_combine_leafs_identity_may_be_a_computed_column(client, schema_name):
-    """DISTINCT and a set-op branch hash the identity they are given, so it may
-    be an expression the leaf materializes rather than a source column."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql("CREATE VIEW v_dist AS SELECT DISTINCT a + 1 AS a1, b FROM t", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_exc AS SELECT a * 2 AS x FROM t EXCEPT SELECT b FROM u", schema_name=sn)
-
-    client.execute_sql("INSERT INTO t VALUES (1, 1, 2), (2, 1, 2), (3, 3, 2)", schema_name=sn)
-    client.execute_sql("INSERT INTO u VALUES (1, 0, 6)", schema_name=sn)
-    assert bag(scanned(client, sn, "v_dist"), "a1", "b") == {(2, 2): 1, (4, 2): 1}
-    assert bag(scanned(client, sn, "v_exc"), "x") == {(2,): 1}
-
-    # One of the two rows behind (2, 2) goes; the computed identity survives.
-    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "v_dist"), "a1", "b") == {(2, 2): 1, (4, 2): 1}
-    client.execute_sql("DELETE FROM u WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "v_exc"), "x") == {(2,): 1, (6,): 1}
-
-
-def test_a_segments_column_aliases_survive_the_steps_above_it(client, schema_name):
-    """`WITH d(k, amt)` and `(SELECT ...) AS x(k, val)` rename what the segment
-    exposes, and the aliases live only on the columns the FROM binder hands the
-    scope — the bound subtree keeps its inner names. A join step that rebuilt its
-    scope from the tree would resolve `x.id` and reject `x.k`, as an ON key, as a
-    projection, and through an outer join's null-widening."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql(
-        "CREATE VIEW v_cte AS WITH d(k, amt) AS (SELECT id, a FROM t WHERE a > 100) "
-        "SELECT d.k AS kk, d.amt AS aa FROM d JOIN u ON d.k = u.id", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_join AS SELECT x.k AS xk, x.val AS xv, u.b AS ub "
-        "FROM (SELECT id, a FROM t) AS x(k, val) JOIN u ON x.k = u.id", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_left AS SELECT x.k AS xk, u.b AS ub "
-        "FROM (SELECT id, a FROM t) AS x(k, val) LEFT JOIN u ON x.k = u.id", schema_name=sn)
-
-    client.execute_sql("INSERT INTO t VALUES (1, 200, 0), (2, 50, 0)", schema_name=sn)
-    client.execute_sql("INSERT INTO u VALUES (1, 0, 7)", schema_name=sn)
-    assert bag(scanned(client, sn, "v_cte"), "kk", "aa") == {(1, 200): 1}
-    assert bag(scanned(client, sn, "v_join"), "xk", "xv", "ub") == {(1, 200, 7): 1}
-    assert bag(scanned(client, sn, "v_left"), "xk", "ub") == {(1, 7): 1, (2, None): 1}
-
-
-def test_a_sibling_derived_table_is_not_in_scope(client, schema_name):
-    """A non-LATERAL derived table is not correlated: a same-named reference in a
-    later sibling binds the catalog relation, not the sibling. If it bound the
-    sibling, `b.v` would not resolve at all."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, dummy BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT b.v AS bv "
-        "FROM (SELECT id FROM t) a JOIN (SELECT id, v FROM a) b ON a.id = b.id", schema_name=sn)
-
-    client.execute_sql("INSERT INTO a VALUES (1, 100), (2, 200)", schema_name=sn)
-    client.execute_sql("INSERT INTO t VALUES (1, 0), (2, 0)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "bv") == {(100,): 1, (200,): 1}
-
-
-def test_an_outer_join_inside_a_cut_segment_null_fills(client, schema_name):
-    """A join in a CTE body is cut, so its null-fill is emitted by the segment
-    rather than by the final view. A band join and a pure-range one, the latter
-    with several right rows per left row so the matched multiplicity is carried
-    rather than collapsed to a witness."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql(
-        "CREATE VIEW v_band AS WITH d AS ("
-        "SELECT t.id AS did, u.b AS ub FROM t LEFT JOIN u ON t.id = u.id AND t.a < u.b"
-        ") SELECT did, ub FROM d", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v_range AS WITH d AS ("
-        "SELECT t.id AS did, u.b AS ub FROM t LEFT JOIN u ON t.a < u.b"
-        ") SELECT did, ub FROM d", schema_name=sn)
-
-    client.execute_sql("INSERT INTO u VALUES (1, 0, 100), (2, 0, 50)", schema_name=sn)
-    client.execute_sql(
-        "INSERT INTO t VALUES (1, 30, 0), (2, 80, 0), (3, 40, 0), (4, 500, 0)", schema_name=sn)
-    assert bag(scanned(client, sn, "v_band"), "did", "ub") == {
-        (1, 100): 1, (2, None): 1, (3, None): 1, (4, None): 1}
-    assert bag(scanned(client, sn, "v_range"), "did", "ub") == {
-        (1, 100): 1, (1, 50): 1, (2, 100): 1, (3, 100): 1, (3, 50): 1, (4, None): 1}
-
-    # Retracting a matched row removes it and emits no stray null-fill.
-    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "v_band"), "did", "ub") == {
-        (2, None): 1, (3, None): 1, (4, None): 1}
-    assert bag(scanned(client, sn, "v_range"), "did", "ub") == {
-        (2, 100): 1, (3, 100): 1, (3, 50): 1, (4, None): 1}
-
-
-@pytest.mark.parametrize("body,base", [
-    ("SELECT x.a AS xa, y.b AS yb FROM t x JOIN t y ON x.b = y.id", "t"),
-    ("SELECT t.a AS ta, w.b AS wb FROM t JOIN u ON t.b = u.id JOIN w ON u.b = w.id", "u"),
-    ("WITH agg AS (SELECT a, SUM(b) AS s FROM t GROUP BY a) "
-     "SELECT u.b AS ub, agg.s AS s FROM agg JOIN u ON agg.a = u.id", "t"),
-], ids=["self-join-passthrough", "join-segment", "reduce-segment"])
-def test_a_generated_relation_is_a_real_node_in_the_dependency_graph(
-        client, schema_name, body, base):
-    """Whatever the lowering generates — a collision pass-through, a join segment,
-    a reduce segment — is a relation in the dependency graph like any other: it
-    holds a reference on its source, which is why the base refuses to drop under
-    a live view; and `DROP VIEW` retires the whole bundle, so the base is free
-    straight after. An orphaned generated relation would keep RESTRICTing it.
-
-    `base` is reached only through the generated relation in each case, so the
-    refusal is the segment's and not the final view's.
-    """
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql(
-        "CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
-
-    with pytest.raises(Exception, match="dependency"):
-        client.execute_sql(f"DROP TABLE {base}", schema_name=sn)
-
-    client.execute_sql("DROP VIEW v", schema_name=sn)
-    client.execute_sql(f"DROP TABLE {base}", schema_name=sn)
-
-
-def test_a_derived_table_without_an_alias_is_refused(client, schema_name):
-    """Nothing can name a segment that has no alias, so the cut is refused rather
-    than compiled to an unreachable relation."""
-    sn = schema_name
-    _tu(client, sn)
-    with pytest.raises(Exception) as ei:
-        client.execute_sql(
-            "CREATE VIEW v AS SELECT id FROM (SELECT id, a FROM t WHERE a > 10)", schema_name=sn)
-    assert "alias" in str(ei.value).lower(), str(ei.value)
+    state = {"t": {}, "u": {}}
+    for sql, table, changes in _CHURN:
+        client.execute_sql(sql, schema_name=sn)
+        for i, row in changes.items():
+            if row is None:
+                del state[table][i]
+            else:
+                state[table][i] = row
+        for name, (_, cols, want) in _VIEWS.items():
+            assert bag(scanned(client, sn, name), *cols) == want(state["t"], state["u"]), (sql, name)

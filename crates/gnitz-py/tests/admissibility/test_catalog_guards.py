@@ -80,3 +80,25 @@ def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, s
 
     client.drop_view(schema_name, "v")
     client.drop_schema(other)
+
+
+@pytest.mark.parametrize("body,base", [
+    ("SELECT x.a AS xa, y.b AS yb FROM t x JOIN t y ON x.b = y.id", "t"),
+    ("SELECT t.a AS ta, w.b AS wb FROM t JOIN u ON t.b = u.id JOIN w ON u.b = w.id", "u"),
+    ("WITH agg AS (SELECT a, SUM(b) AS s FROM t GROUP BY a) "
+     "SELECT u.b AS ub, agg.s AS s FROM agg JOIN u ON agg.a = u.id", "t"),
+], ids=["self-join-pass-through", "join-segment", "reduce-segment"])
+def test_a_generated_relation_holds_its_base_until_the_view_drops(client, schema_name, body, base):
+    """Whatever the lowering generates — a collision pass-through, a join
+    segment, a reduce segment — is a node of the dependency graph like any view:
+    it holds a reference on its source, so the base refuses to drop under the
+    live view, and `DROP VIEW` retires the whole bundle, so the base is free
+    straight after. An orphaned generated relation would keep refusing. In the
+    two segment cases `base` is reached only through the generated relation."""
+    client.execute_sql(
+        "; ".join(f"CREATE TABLE {n} (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
+                  "b BIGINT NOT NULL)" for n in ("t", "u", "w"))
+        + f"; CREATE VIEW v AS {body}", schema_name=schema_name)
+    with pytest.raises(gnitz.GnitzError, match="dependen"):
+        client.execute_sql(f"DROP TABLE {base}", schema_name=schema_name)
+    client.execute_sql(f"DROP VIEW v; DROP TABLE {base}", schema_name=schema_name)

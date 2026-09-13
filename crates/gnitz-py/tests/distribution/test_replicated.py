@@ -15,7 +15,7 @@ worker there is a single copy and none of it can happen, which is what the
 import pytest
 import gnitz
 from _serverproc import NEEDS_MULTI
-import _oracle as oracle
+from _read import bag, scanned
 
 _REPL = " WITH (replicated = true)"
 
@@ -96,7 +96,7 @@ def test_a_scan_of_a_replicated_table_returns_one_copy(client, schema_name):
         "INSERT INTO dim VALUES (1,100),(2,200),(3,300),(4,400),(5,500)",
         schema_name=schema_name)
     tid, _ = client.resolve_table(schema_name, "dim")
-    assert oracle.scan_multiset(client, tid, ["id", "name"]) == {
+    assert bag(client.scan(tid), "id", "name") == {
         (i, i * 100): 1 for i in range(1, 6)}
 
 
@@ -123,8 +123,7 @@ def test_an_aggregate_over_a_replicated_source_is_not_w_folded(client, schema_na
         schema_name=schema_name)
 
     vid, _ = client.resolve_table(schema_name, "v")
-    oracle.assert_view_matches(client, vid, ["grp", "cnt", "total"],
-                               {(10, 2, 300): 1, (20, 1, 350): 1})
+    assert bag(client.scan(vid), "grp", "cnt", "total") == {(10, 2, 300): 1, (20, 1, 350): 1}
 
 
 @NEEDS_MULTI
@@ -145,11 +144,11 @@ def test_a_replicated_source_grounds_exactly_once(client, schema_name):
     vid, _ = client.resolve_table(schema_name, "v")
     fid, _ = client.resolve_table(schema_name, "f")
 
-    oracle.assert_view_matches(client, vid, ["cnt", "total"], {(0, None): 1}, "empty")
-    oracle.assert_view_matches(client, fid, ["pk", "d"], {}, "empty")
+    assert bag(client.scan(vid), "cnt", "total") == {(0, None): 1}, "empty"
+    assert bag(client.scan(fid), "pk", "d") == {}, "empty"
     client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=schema_name)
-    oracle.assert_view_matches(client, vid, ["cnt", "total"], {(2, 12): 1}, "filled")
-    oracle.assert_view_matches(client, fid, ["pk", "d"], {(1, 10): 1, (2, 14): 1}, "filled")
+    assert bag(client.scan(vid), "cnt", "total") == {(2, 12): 1}, "filled"
+    assert bag(client.scan(fid), "pk", "d") == {(1, 10): 1, (2, 14): 1}, "filled"
 
 
 # ── Writes reach every copy ──────────────────────────────────────────────────
@@ -220,9 +219,9 @@ def test_a_mutation_reaches_every_copy(client, dim_fact_join, mutation, dim_afte
 
     client.execute_sql(mutation, schema_name=sn)
 
-    assert oracle.scan_multiset(client, tid, ["dim_id", "name"]) == {
+    assert bag(client.scan(tid), "dim_id", "name") == {
         (k, v): 1 for k, v in dim_after.items()}
-    oracle.assert_view_matches(client, jid, ["fid", "nm"], _joined(dim_after))
+    assert bag(client.scan(jid), "fid", "nm") == _joined(dim_after)
 
 
 @NEEDS_MULTI
@@ -239,12 +238,12 @@ def test_a_late_dim_delta_rejoins_the_waiting_facts(client, dim_fact_join):
         "INSERT INTO dim VALUES " + ", ".join(f"({k}, {v})" for k, v in early.items()),
         schema_name=sn)
     _insert_facts(client, sn)
-    oracle.assert_view_matches(client, jid, ["fid", "nm"], _joined(early), "before the late dim")
+    assert bag(client.scan(jid), "fid", "nm") == _joined(early), "before the late dim"
 
     client.execute_sql(
         "INSERT INTO dim VALUES " + ", ".join(
             f"({k}, {v})" for k, v in _DIMS.items() if k not in early), schema_name=sn)
-    oracle.assert_view_matches(client, jid, ["fid", "nm"], _joined(_DIMS), "after the late dim")
+    assert bag(client.scan(jid), "fid", "nm") == _joined(_DIMS), "after the late dim"
 
 
 @NEEDS_MULTI
@@ -261,7 +260,7 @@ def test_an_upsert_replaces_the_row_on_every_copy(client, schema_name):
         batch.append(id=1, name=name)
         client.push(tid, batch)
 
-    assert oracle.scan_multiset(client, tid, ["id", "name"]) == {(1, 200): 1}
+    assert bag(client.scan(tid), "id", "name") == {(1, 200): 1}
 
 
 # ── Joins: a replicated side is local on every worker ────────────────────────
@@ -297,8 +296,8 @@ def test_a_star_join_of_two_replicated_dims_stays_local(client, schema_name):
         schema_name=schema_name)
 
     jid, _ = client.resolve_table(schema_name, "j")
-    oracle.assert_view_matches(client, jid, ["fid", "a", "b"], {
-        (i, ((i % 2) + 1) * 11, (((i + 1) % 2) + 1) * 1000): 1 for i in range(1, 33)})
+    assert bag(client.scan(jid), "fid", "a", "b") == {
+        (i, ((i % 2) + 1) * 11, (((i + 1) % 2) + 1) * 1000): 1 for i in range(1, 33)}
 
 
 @NEEDS_MULTI
@@ -318,8 +317,7 @@ def test_a_join_of_two_replicated_tables_reads_one_copy(client, schema_name):
     client.execute_sql("INSERT INTO b VALUES (1,11),(2,22),(3,33)", schema_name=schema_name)
 
     jid, _ = client.resolve_table(schema_name, "j")
-    oracle.assert_view_matches(client, jid, ["id", "x", "y"],
-                               {(1, 10, 11): 1, (2, 20, 22): 1, (3, 30, 33): 1})
+    assert bag(client.scan(jid), "id", "x", "y") == {(1, 10, 11): 1, (2, 20, 22): 1, (3, 30, 33): 1}
 
 
 # ── Exchange-shaped views whose sources are all replicated ───────────────────
@@ -374,7 +372,7 @@ def test_replicated_set_ops_keep_their_weights(client, schema_name):
     }
     for name, expected in want.items():
         vid, _ = client.resolve_table(schema_name, name)
-        oracle.assert_view_matches(client, vid, ["pk", "val"], expected, name)
+        assert bag(client.scan(vid), "pk", "val") == expected, name
 
 
 @NEEDS_MULTI
@@ -397,12 +395,9 @@ def test_replicated_distinct_and_self_union(client, schema_name):
     client.execute_sql("INSERT INTO t VALUES (1,5),(2,5),(3,7),(4,7),(5,9)",
                        schema_name=schema_name)
 
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "v_dist")[0], ["val"],
-        {(5,): 1, (7,): 1, (9,): 1}, "distinct")
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "v_self")[0], ["id", "val"],
-        {(1, 5): 2, (2, 5): 2, (3, 7): 2, (4, 7): 2, (5, 9): 2}, "self-union")
+    assert bag(scanned(client, schema_name, "v_dist"), "val") == {(5,): 1, (7,): 1, (9,): 1}
+    assert bag(scanned(client, schema_name, "v_self"), "id", "val") == {
+        (1, 5): 2, (2, 5): 2, (3, 7): 2, (4, 7): 2, (5, 9): 2}
 
 
 @NEEDS_MULTI
@@ -428,11 +423,8 @@ def test_replicated_band_join_inner_and_left(client, schema_name):
 
     # a1(lo10): b1(t40), b2(t60); a2(lo50): b2(t60); a3(k2, lo5): b3(t100).
     matched = {(1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1}
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "vin")[0], ["aid", "bid"], matched, "inner")
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "vleft")[0], ["aid", "bid"],
-        {**matched, (4, None): 1}, "left")
+    assert bag(scanned(client, schema_name, "vin"), "aid", "bid") == matched, "inner"
+    assert bag(scanned(client, schema_name, "vleft"), "aid", "bid") == {**matched, (4, None): 1}
 
 
 @NEEDS_MULTI
@@ -462,11 +454,9 @@ def test_replicated_pure_range_join_inner_and_left(client, schema_name):
 
     # a1(10) < 20 and < 40; a2(30) < 40; a3(50) exceeds every y; a4 is NULL.
     matched = {(1, 1): 1, (1, 2): 1, (2, 2): 1}
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "vin")[0], ["aid", "bid"], matched, "inner")
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "vleft")[0], ["aid", "bid"],
-        {**matched, (3, None): 1, (4, None): 1}, "left")
+    assert bag(scanned(client, schema_name, "vin"), "aid", "bid") == matched, "inner"
+    assert bag(scanned(client, schema_name, "vleft"), "aid", "bid") == {
+        **matched, (3, None): 1, (4, None): 1}
 
 
 @NEEDS_MULTI
@@ -495,9 +485,8 @@ def test_replicated_keyless_join_sides(client, schema_name):
     def check(ctx, ids_r):
         for name, left, right in (("rk", ids_r, ids_k), ("kr", ids_k, ids_r),
                                   ("rr", ids_r, ids_r2)):
-            oracle.assert_view_matches(
-                client, client.resolve_table(schema_name, name)[0], ["a", "b"],
-                {(x, y): 1 for x in left for y in right}, f"{name} {ctx}")
+            assert bag(scanned(client, schema_name, name), "a", "b") == {
+                (x, y): 1 for x in left for y in right}, f"{name} {ctx}"
 
     check("initial", ids_r)
     client.execute_sql("DELETE FROM r WHERE id = 3", schema_name=schema_name)
@@ -536,14 +525,9 @@ def test_replicated_subquery_predicates(client, schema_name):
         schema_name=schema_name)
     client.execute_sql("INSERT INTO b VALUES (1,15,1),(2,15,3)", schema_name=schema_name)
 
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "semi")[0], ["v"], {(200,): 1}, "exists")
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "anti")[0], ["v"],
-        {(100,): 1, (300,): 1, (400,): 1}, "not exists")
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "inlist")[0], ["v"],
-        {(100,): 1, (300,): 1, (400,): 1}, "in")
+    assert bag(scanned(client, schema_name, "semi"), "v") == {(200,): 1}, "exists"
+    assert bag(scanned(client, schema_name, "anti"), "v") == {(100,): 1, (300,): 1, (400,): 1}
+    assert bag(scanned(client, schema_name, "inlist"), "v") == {(100,): 1, (300,): 1, (400,): 1}
 
 
 # ── Mixed views: one replicated source and one partitioned source ────────────
@@ -586,12 +570,10 @@ def test_mixed_union_all_weights_reach_a_downstream_aggregate(client, schema_nam
     client.execute_sql("INSERT INTO fact VALUES (1,10),(2,20)", schema_name=schema_name)
     client.execute_sql("INSERT INTO dim VALUES (3,30),(4,40)", schema_name=schema_name)
 
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "u")[0], ["pk", "val"],
-        {(1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1}, "union")
-    oracle.assert_view_matches(
-        client, client.resolve_table(schema_name, "g")[0], ["val", "cnt"],
-        {(10, 1): 1, (20, 1): 1, (30, 1): 1, (40, 1): 1}, "group by")
+    assert bag(scanned(client, schema_name, "u"), "pk", "val") == {
+        (1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1}
+    assert bag(scanned(client, schema_name, "g"), "val", "cnt") == {
+        (10, 1): 1, (20, 1): 1, (30, 1): 1, (40, 1): 1}
 
 
 @NEEDS_MULTI
@@ -611,7 +593,7 @@ def test_mixed_except_all_with_the_replicated_side_on_the_left(client, schema_na
     client.execute_sql("INSERT INTO fact VALUES (3,30),(4,40)", schema_name=schema_name)
 
     vid, _ = client.resolve_table(schema_name, "v")
-    oracle.assert_view_matches(client, vid, ["pk", "val"], {(1, 10): 1, (2, 20): 1})
+    assert bag(client.scan(vid), "pk", "val") == {(1, 10): 1, (2, 20): 1}
 
 
 @NEEDS_MULTI
@@ -635,8 +617,7 @@ def test_mixed_band_join_weights(client, schema_name):
 
     # f1(lo10): d1(t40), d2(t60); f2(lo50): d2(t60); f3(k2, lo5): d3(t100); f4: none.
     vid, _ = client.resolve_table(schema_name, "v")
-    oracle.assert_view_matches(client, vid, ["fid", "did"],
-                               {(1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1})
+    assert bag(client.scan(vid), "fid", "did") == {(1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1}
 
 
 @NEEDS_MULTI
@@ -656,8 +637,8 @@ def test_mixed_pure_range_left_join_weights(client, schema_name):
     client.execute_sql("INSERT INTO dim VALUES (1,20),(2,40)", schema_name=schema_name)
 
     vid, _ = client.resolve_table(schema_name, "v")
-    oracle.assert_view_matches(client, vid, ["fid", "did"], {
-        (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, None): 1, (4, None): 1})
+    assert bag(client.scan(vid), "fid", "did") == {
+        (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, None): 1, (4, None): 1}
 
 
 @NEEDS_MULTI
@@ -682,8 +663,7 @@ def test_mixed_union_all_over_a_replicated_view_keeps_multiplicity(client, schem
     client.execute_sql("INSERT INTO dim2 VALUES (2,20),(3,30)", schema_name=schema_name)
 
     vid, _ = client.resolve_table(schema_name, "v")
-    oracle.assert_view_matches(client, vid, ["pk", "val"],
-                               {(5, 50): 1, (1, 10): 1, (2, 20): 2, (3, 30): 1})
+    assert bag(client.scan(vid), "pk", "val") == {(5, 50): 1, (1, 10): 1, (2, 20): 2, (3, 30): 1}
 
 
 @NEEDS_MULTI

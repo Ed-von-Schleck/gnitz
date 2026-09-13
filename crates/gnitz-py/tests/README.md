@@ -33,5 +33,5 @@ value_domain.
 GNITZ_WORKERS is a suite-wide run mode, so distribution is for a test that
 varies worker count or placement, not one that merely needs W > 1.
 
-Helpers (conftest.py, _oracle.py, _serverproc.py) stay at this level and are
+Helpers (conftest.py, _read.py, _serverproc.py) stay at this level and are
 imported as top-level modules, from any subdirectory.

@@ -571,6 +571,17 @@ fn a_read_the_planner_rejects_names_its_rule() {
             "Unsupported",
             "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
         ),
+        (
+            "SELECT id, RANK() OVER (ORDER BY v) FROM t",
+            "Unsupported",
+            "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
+        ),
+        // The fold is one stateless pass over one scan: no DISTINCT segment.
+        (
+            "SELECT v, COUNT(DISTINCT w) FROM t GROUP BY v",
+            "Unsupported",
+            "CREATE VIEW body only",
+        ),
     ] {
         assert_rejects(sql, read(&cat, sql), variant, msg);
     }

@@ -22,7 +22,15 @@ def _values(rows):
 
 _A = ("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL); "
       f"INSERT INTO a VALUES {_values((i, i % 5, i * 10) for i in range(30))}")
+# `a` plus `b(id, bv)`, one row per `a.k`, with `bv = 100 · id`.
+_AB = (_A + "; CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL); "
+       f"INSERT INTO b VALUES {_values((j, j * 100) for j in range(5))}")
 _T = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)"
+_AI, _BJ = range(30), range(5)
+
+
+def _band(i):
+    return i * 10 < (i % 5) * 100
 
 # name -> (tables and their rows, the view DDL — several statements for a chain —,
 #          the columns the last view `v` is read by, its expected bag)
@@ -33,10 +41,49 @@ _SHAPES = {
             ("k", "c"), {(k, 6): 1 for k in range(5)}),
     "distinct": (_A, "CREATE VIEW v AS SELECT DISTINCT k FROM a",
                  ("k",), {(k,): 1 for k in range(5)}),
-    "join": (_A + "; CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL); "
-             f"INSERT INTO b VALUES {_values((j, j * 100) for j in range(5))}",
-             "CREATE VIEW v AS SELECT a.id AS aid, b.bv AS bv FROM a JOIN b ON a.k = b.id",
-             ("aid", "bv"), {(i, (i % 5) * 100): 1 for i in range(30)}),
+    "join": (_AB, "CREATE VIEW v AS SELECT a.id AS aid, b.bv AS bv FROM a JOIN b ON a.k = b.id",
+             ("aid", "bv"), {(i, (i % 5) * 100): 1 for i in _AI}),
+    "band": (_AB, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
+             "FROM a JOIN b ON a.k = b.id AND a.av < b.bv",
+             ("aid", "bid"), {(i, i % 5): 1 for i in _AI if _band(i)}),
+    "band_left": (_AB, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
+                  "FROM a LEFT JOIN b ON a.k = b.id AND a.av < b.bv",
+                  ("aid", "bid"), {(i, i % 5 if _band(i) else None): 1 for i in _AI}),
+    "range_left": (_AB, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
+                   "FROM a LEFT JOIN b ON a.av < b.bv",
+                   ("aid", "bid"), {(i, j): 1 for i in _AI for j in _BJ if i * 10 < j * 100}
+                   | {(i, None): 1 for i in _AI if i * 10 >= 400}),
+    "cross": (_AB, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a CROSS JOIN b",
+              ("aid", "bid"), {(i, j): 1 for i in _AI for j in _BJ}),
+    # The repeated occurrence is wrapped in a pass-through that must seed first.
+    "self_join": (_A, "CREATE VIEW v AS SELECT x.id AS xid, y.id AS yid FROM a x JOIN a y ON x.k = y.id",
+                  ("xid", "yid"), {(i, i % 5): 1 for i in _AI}),
+    "self_intersect": (_A, "CREATE VIEW v AS SELECT k FROM a INTERSECT SELECT k FROM a",
+                       ("k",), {(k,): 1 for k in _BJ}),
+    "exists": (_AB, "CREATE VIEW v AS SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.bv = a.av)",
+               ("id",), {(i,): 1 for i in (0, 10, 20)}),
+    "not_exists": (_AB, "CREATE VIEW v AS SELECT id FROM a "
+                   "WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.bv = a.av)",
+                   ("id",), {(i,): 1 for i in _AI if i not in (0, 10, 20)}),
+    "correlated_scalar": (_AB, "CREATE VIEW v AS SELECT b.id AS id, "
+                          "(SELECT COUNT(*) FROM a WHERE a.k = b.id) AS c FROM b",
+                          ("id", "c"), {(j, 6): 1 for j in _BJ}),
+    "uncorrelated_scalar": (_AB, "CREATE VIEW v AS SELECT id FROM b WHERE b.bv < (SELECT MAX(av) FROM a)",
+                            ("id",), {(0,): 1, (1,): 1, (2,): 1}),
+    # One join-output key spans six groups, so each group's MIN must isolate.
+    "min_over_fanout_join": (_AB, "CREATE VIEW v AS SELECT a.av AS g, MIN(a.id) AS lo, MAX(b.bv) AS hi "
+                             "FROM b JOIN a ON b.id = a.k GROUP BY a.av",
+                             ("g", "lo", "hi"), {(i * 10, i, (i % 5) * 100): 1 for i in _AI}),
+    "distinct_over_join": (_AB, "CREATE VIEW v AS SELECT DISTINCT b.bv AS bv FROM a JOIN b ON a.k = b.id",
+                           ("bv",), {(j * 100,): 1 for j in _BJ}),
+    "reduce_into_join": (_AB, "CREATE VIEW v AS WITH s AS (SELECT k, SUM(av) AS t FROM a GROUP BY k) "
+                         "SELECT b.bv AS bv, s.t AS t FROM s JOIN b ON s.k = b.id",
+                         ("bv", "t"), {(k * 100, sum(i * 10 for i in _AI if i % 5 == k)): 1 for k in _BJ}),
+    "grouped_set_op_side": (_AB, "CREATE VIEW v AS SELECT k AS x, COUNT(*) AS n FROM a GROUP BY k "
+                            "UNION ALL SELECT id, bv FROM b",
+                            ("x", "n"), {(k, 6): 1 for k in _BJ} | {(j, j * 100): 1 for j in _BJ}),
+    "set_op_chain": (_AB, "CREATE VIEW v AS SELECT k FROM a UNION SELECT id FROM b UNION SELECT bv FROM b",
+                     ("k",), {(x,): 1 for x in (0, 1, 2, 3, 4, 100, 200, 300, 400)}),
     "setop": ("CREATE TABLE s1 (id BIGINT NOT NULL PRIMARY KEY); "
               "CREATE TABLE s2 (id BIGINT NOT NULL PRIMARY KEY); "
               f"INSERT INTO s1 VALUES {_values((i,) for i in range(30))}; "

@@ -18,7 +18,6 @@ import time
 import pytest
 import gnitz
 from _read import bag, scanned
-from _oracle import assert_view_matches
 from _serverproc import START_TIMEOUT, join_or_fail
 
 
@@ -219,7 +218,7 @@ def test_a_view_created_over_committed_data_survives_a_checkpoint_window(checkpo
     conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g",
                      schema_name="ckv")
     vid, _ = conn.resolve_table("ckv", "v")
-    assert_view_matches(conn, vid, ["g", "c"], {(g, n // 10): 1 for g in range(10)})
+    assert bag(conn.scan(vid), "g", "c") == {(g, n // 10): 1 for g in range(10)}
 
 
 def test_a_low_space_relay_reclaims_without_aborting_the_master(relay_lowspace_server):

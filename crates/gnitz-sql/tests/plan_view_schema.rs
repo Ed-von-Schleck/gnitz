@@ -477,6 +477,22 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
             "evts",
             table(36, vec![col("id", i), col("grp", i), col("val", i)], vec![0]),
         ),
+        (
+            "nw",
+            table(
+                37,
+                vec![
+                    col("id", i),
+                    col("g", u),
+                    col("i8", TypeCode::I8),
+                    col("i16", TypeCode::I16),
+                    col("i32", TypeCode::I32),
+                    col("u32", TypeCode::U32),
+                    col("f32", TypeCode::F32),
+                ],
+                vec![0],
+            ),
+        ),
     ]);
     let rows: &[(&str, Shape, &[u32], &[TypeCode])] = &[
         (
@@ -564,6 +580,29 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
             &[0],
             &[TypeCode::U128, i, i],
         ),
+        // An integer extremum is one of its input values, so it keeps the source
+        // width; a float one widens to F64.
+        (
+            "SELECT g, MIN(i8) AS a, MAX(i16) AS b, MIN(i32) AS c, MAX(u32) AS d, MIN(f32) AS e \
+             FROM nw GROUP BY g",
+            sh(&[
+                ("g", false, false),
+                ("a", false, false),
+                ("b", false, false),
+                ("c", false, false),
+                ("d", false, false),
+                ("e", false, false),
+            ]),
+            &[0],
+            &[
+                u,
+                TypeCode::I8,
+                TypeCode::I16,
+                TypeCode::I32,
+                TypeCode::U32,
+                TypeCode::F64,
+            ],
+        ),
     ];
     for (body, shape, pk_cols, tcs) in rows {
         let chain = view(&cat, body);
@@ -613,6 +652,8 @@ fn a_join_view_is_keyed_on_its_join_key() {
         ("bb", table(44, vec![col("id", i), col("k", i), col("t", i)], vec![0])),
         ("t1", table(45, vec![col("id", i), col("k", i), col("lo", i)], vec![0])),
         ("t2", table(46, vec![col("id", i), col("k", i), col("lo", i)], vec![0])),
+        ("ix", table(47, vec![col("id", i), col("x", TypeCode::I32)], vec![0])),
+        ("pq", table(48, vec![col("id", i), col("p", i), col("q", i)], vec![0])),
     ]);
     let uv = view(&cat, "SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2");
     register(&mut cat, "uv", 60, &uv);
@@ -669,6 +710,18 @@ fn a_join_view_is_keyed_on_its_join_key() {
             ]),
             &[0, 1],
             &[i, i, i, i, i, i],
+        ),
+        // One left column fills two slots, each promoted against its own partner.
+        (
+            "SELECT ix.x AS ax, pq.id AS bid FROM ix JOIN pq ON ix.x = pq.p AND ix.x = pq.q",
+            sh(&[
+                ("_join_pk_0", true, false),
+                ("_join_pk_1", true, false),
+                ("ax", false, false),
+                ("bid", false, false),
+            ]),
+            &[0, 1],
+            &[i, i, TypeCode::I32, i],
         ),
         (
             "SELECT * FROM l JOIN r ON l.val = r.val",
@@ -757,6 +810,14 @@ fn a_chain_segment_keeps_only_its_live_columns() {
         output_shape(&chain),
         sh(&[("_join_pk", true, false), ("aid", false, false), ("ccv", false, false)])
     );
+    // `SELECT *` keeps every column live, and still each step's key replaces the
+    // accumulator's rather than being appended to it.
+    let star = view(&cat, "SELECT * FROM ja JOIN jb ON ja.k = jb.id JOIN jc ON ja.v = jc.id");
+    let keys: Vec<_> = output_shape(&star)
+        .into_iter()
+        .filter(|(name, hidden, _)| *hidden && name.starts_with("_join_pk"))
+        .collect();
+    assert_eq!(keys, sh(&[("_join_pk", true, false)]));
 }
 
 /// The pass-through wrapper the source-collision rule builds is a second

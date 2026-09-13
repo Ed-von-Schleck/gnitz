@@ -280,3 +280,64 @@ def test_a_string_round_trips_at_each_length_class(client, schema_name):
         schema_name=sn)
     assert bag(scanned(client, sn, "t"), "pk", "s") == {
         (i, v): 1 for i, v in enumerate(vals)}
+
+
+# (SQL type, four values in ascending order). The integer widths straddle the
+# sign and the byte boundaries; FLOAT widens to an F64 extremum, exactly since
+# the values are dyadic; TEXT shares a prefix past the inline length; UUID and
+# DECIMAL(38,0) order on all 16 bytes, the UUIDs differing only past byte 8.
+_ORDERED = [
+    ("TINYINT", [I8_MIN, -5, 0, I8_MAX]),
+    ("SMALLINT", [I16_MIN, -1, 256, I16_MAX]),
+    ("INT UNSIGNED", [0, 100, 2_147_483_648, U32_MAX]),
+    ("BIGINT", [I64_MIN, -1, 0, I64_MAX]),
+    ("FLOAT", [-2.25, 0.5, 1.5, 4.0]),
+    ("TEXT", ["", "shared/prefix/a", "shared/prefix/ab", "shared/prefix/abd"]),
+    ("UUID", ["550e8400-e29b-41d4-a716-446655430000", "550e8400-e29b-41d4-a716-446655440000",
+              "550e8400-e29b-41d4-a716-446655440001", "ffffffff-ffff-ffff-ffff-ffffffffffff"]),
+    ("DECIMAL(38,0)", [0, 5, (1 << 64) + 1, 10 ** 38 - 1]),
+]
+# Signed twins, so a group key compared without its sign reads a neighbour's.
+_GROUPS = [(-5, -7), (5, 7), (-5, 7), (5, -7)]
+# The PK column's values, straddling the sign and the high bytes.
+_KEY_IDS = [-5, 1, 256, 65536]
+
+
+def test_min_max_select_and_recede_by_each_familys_own_order(client, schema_name):
+    """MIN/MAX select by the column's own order and decode the selected value
+    back out of the value index. Each group holds a different three of the four
+    positions, so an extreme leaking across groups reads another group's value.
+    `id` is a PRIMARY KEY column, stored only as order-preserving bytes, so its
+    extremes must decode before they compare. Retracting both of a group's
+    extreme carriers recedes it to the survivor, and emptying the table empties
+    every view."""
+    sn = schema_name
+    cols = [f"c{j}" for j in range(len(_ORDERED))] + ["id"]
+    families = [vals for _, vals in _ORDERED] + [_KEY_IDS]
+    client.execute_sql(
+        "CREATE TABLE t (ka INT NOT NULL, kb BIGINT NOT NULL, id BIGINT NOT NULL, "
+        + "".join(f"c{j} {sql} NOT NULL, " for j, (sql, _) in enumerate(_ORDERED))
+        + "PRIMARY KEY (ka, kb, id)); "
+        + "; ".join(f"CREATE VIEW m_{c} AS SELECT ka, kb, MIN({c}) AS lo, MAX({c}) AS hi "
+                    "FROM t GROUP BY ka, kb" for c in cols), schema_name=sn)
+    # One statement per position, holding it in every group but its own.
+    for pos in range(4):
+        client.execute_sql("INSERT INTO t VALUES " + ", ".join(
+            "(" + ", ".join(map(repr, (*_GROUPS[g], _KEY_IDS[pos], *(v[pos] for _, v in _ORDERED)))) + ")"
+            for g in range(4) if g != pos), schema_name=sn)
+
+    def expect(held):
+        for c, vals in zip(cols, families):
+            assert bag(scanned(client, sn, f"m_{c}"), "ka", "kb", "lo", "hi") == {
+                (*_GROUPS[g], vals[min(ps)], vals[max(ps)]): 1 for g, ps in held.items()}, c
+
+    held = {g: [p for p in range(4) if p != g] for g in range(4)}
+    expect(held)
+    ka, kb = _GROUPS[1]
+    client.execute_sql(
+        f"DELETE FROM t WHERE ka = {ka} AND kb = {kb} AND id IN ({_KEY_IDS[0]}, {_KEY_IDS[3]})",
+        schema_name=sn)
+    held[1] = [2]
+    expect(held)
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    expect({})

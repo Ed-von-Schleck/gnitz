@@ -114,17 +114,6 @@ fn delta_reply_schema(
     rust_schema_to_py(py, &Arc::new(derived))
 }
 
-/// The `(name, discriminant)` circuit-opcode table, straight off `Opcode::ALL`.
-/// `_types.py` builds its `Opcode` IntEnum from this, so a test names the
-/// operator rather than re-typing its durable discriminant.
-#[pyfunction]
-fn circuit_opcodes() -> Vec<(String, u64)> {
-    gnitz_wire::Opcode::ALL
-        .iter()
-        .map(|&op| (format!("{op:?}"), op.as_wire()))
-        .collect()
-}
-
 /// The `(name, code)` column-type table, straight off `TypeCode::ALL`, which
 /// `_types.py` builds its `TypeCode` IntEnum from.
 #[pyfunction]
@@ -162,15 +151,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("GnitzNotFoundError", m.py().get_type::<GnitzNotFoundError>())?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
-    // a re-typed copy), as are the tables behind `type_codes()` and
-    // `circuit_opcodes()`.
+    // a re-typed copy), as is the table behind `type_codes()`.
     // Only the ids something addresses a relation by are exported.
     m.add("SCHEMA_TAB", gnitz_wire::SCHEMA_TAB)?;
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
     m.add("VIEW_TAB", gnitz_wire::VIEW_TAB)?;
     m.add("COL_TAB", gnitz_wire::COL_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
-    m.add("CIRCUIT_NODES_TAB", gnitz_wire::CIRCUIT_NODES_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
     // The schema-width cap, so a test locates the boundary instead of naming it.
     m.add("MAX_COLUMNS", gnitz_wire::MAX_COLUMNS)?;
@@ -182,6 +169,5 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDeltaReply>()?;
     m.add_function(wrap_pyfunction!(delta_reply_schema, m)?)?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
-    m.add_function(wrap_pyfunction!(circuit_opcodes, m)?)?;
     Ok(())
 }

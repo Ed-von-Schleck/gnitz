@@ -3,11 +3,11 @@ from gnitz._native import (
     GnitzSalFullError, GnitzMirrorPoisonedError, GnitzNotFoundError, Row, ScanResult,
     ColumnDef, Schema, ZSetBatch, GnitzClient, DeltaReply, delta_reply_schema,
     PollResult,
-    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, CIRCUIT_NODES_TAB,
+    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB,
     FIRST_USER_TABLE_ID, MAX_COLUMNS,
     debug_assertions,
 )
-from gnitz._types import Opcode, TypeCode
+from gnitz._types import TypeCode
 
 
 def connect(socket_path):

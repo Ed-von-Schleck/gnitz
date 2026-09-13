@@ -160,6 +160,11 @@ const SHAPES: &[Row] = &[
     ("SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v", 1, &[&[3]], &[(Reduce, 1)]),
     ("SELECT SUM(v) AS s, MIN(v) AS mn, MAX(v) AS mx FROM t", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
     ("SELECT SUM(v) AS s, COUNT(*) AS c FROM t", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
+    ("SELECT AVG(i32c) AS s FROM ty", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
+    ("SELECT COUNT(k) AS c FROM n", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
+    // A float SUM, and an AVG over one, would reassociate by worker count: funnel.
+    ("SELECT SUM(f) AS s FROM ty", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
+    ("SELECT AVG(f) AS s FROM ty", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
     ("SELECT v, COUNT(*) AS n FROM r GROUP BY v", 1, &[], &[(Reduce, 1)]),
     // DISTINCT and set operations: content-hashed leaves behind an exchange on
     // the hash key, then weight clamps; never a join.
