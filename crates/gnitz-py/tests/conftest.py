@@ -436,19 +436,6 @@ def seamed_server(dedicated_server):
 
 
 @pytest.fixture
-def race_server(seamed_server):
-    """
-    Server spawned with the `GNITZ_INJECT_TABLE_CREATE_DELAY_MS` seam, for the
-    DROP-directory-removal race regression test.
-
-    The seam makes every worker sleep between creating a table directory and
-    its partition subdirectories, deterministically widening the window in
-    which a master DROP `remove_dir_all` can race a lagging worker's CREATE.
-    """
-    return seamed_server({"GNITZ_INJECT_TABLE_CREATE_DELAY_MS": "50"})
-
-
-@pytest.fixture
 def adhoc_group_cap_server(seamed_server):
     """Server with a tiny ad-hoc aggregate per-worker group cap, to exercise the
     GROUP BY resource-exhaustion abort (`GNITZ_ADHOC_GROUP_CAP`). Not a debug-only
@@ -525,30 +512,6 @@ def tick_emit_fault_server(seamed_server):
     silent tick group and so cannot spend it, and it is one-shot, so the
     follow-up read observes the re-queued tid ticking and the view converging."""
     return seamed_server({"GNITZ_INJECT_TICK_EMIT_ERROR": "1"})
-
-
-@pytest.fixture
-def push_hold_target(dedicated_server):
-    """Connect target of a server whose FIRST client push is held between its
-    frame decode and its catalog read lock until a DDL changes the target's
-    schema version (GNITZ_INJECT_PUSH_HOLD_FOR_DDL), so a warm push is guaranteed
-    to reach the lock with a decode-time descriptor the catalog has already
-    replaced. That is the interleaving a queued `ALTER TABLE` writer produces in
-    production, since the catalog lock is writer-preferring. Ordering, not timing.
-
-    The target rather than a client: the race needs the push and the ALTER on two
-    connections."""
-    return dedicated_server({"GNITZ_INJECT_PUSH_HOLD_FOR_DDL": "1"}).target
-
-
-@pytest.fixture
-def relay_hold_server(seamed_server):
-    """Server whose FIRST steady-state exchange relay is held until a DDL asks the
-    tick loop to quiesce (GNITZ_INJECT_RELAY_HOLD_FOR_DDL), so that DDL is
-    guaranteed to arrive while every worker is parked inside its exchange wait
-    with a mid-epoch catalog. Ordering, not timing — nothing here depends on
-    machine speed."""
-    return seamed_server({"GNITZ_INJECT_RELAY_HOLD_FOR_DDL": "1"})
 
 
 @pytest.fixture

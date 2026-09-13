@@ -437,7 +437,7 @@ impl GnitzClient {
     }
 
     /// The client's current OCC basis (running max of observed watermarks).
-    /// Exposed read-only for tests and the SQL layer's autocommit/BEGIN basis.
+    /// Read by the SQL layer as its autocommit/BEGIN basis.
     pub fn last_seen_lsn(&self) -> u64 {
         self.last_seen_lsn
     }

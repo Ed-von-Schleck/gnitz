@@ -85,21 +85,22 @@ def test_an_empty_push_writes_nothing_and_keeps_the_connection_aligned(client, s
 
 
 def test_concurrent_pushes_coalesce_into_shared_commits(server, client, schema_name):
-    """Eight connections push at once. Each batch carries four rows under keys
-    no other connection writes, alternating inline and heap strings, plus one
-    row under the key every connection writes.
+    """Eight connections push at once, alternating between two tables. Each batch
+    carries four rows under keys no other connection writes, alternating inline
+    and heap strings, plus one row under the key every connection on its table
+    writes.
 
     A push that validates against no committed state holds its table lock
     shared, so concurrent pushes reach the committer together and fold into one
     merged batch under one SAL zone: fewer distinct LSNs come back than pushes
     were made. Eight connections is what makes that fold happen at all — the
     committer drains only what is already queued when it wakes. The merge
-    relocates every string into the merged batch's own heap, which a row count
-    cannot check, and leaves the shared key as exactly one pushed row at
-    weight 1."""
+    folds both tables into one zone, relocates every string into the merged
+    batch's own heap, which a row count cannot check, and leaves each table's
+    shared key as exactly one pushed row at weight 1."""
     conns, rounds, per = 8, 30, 4
     sn = schema_name
-    tid = client.create_table(sn, "t", _STR)
+    tids = [client.create_table(sn, f"t{i}", _STR) for i in range(2)]
     schema = gnitz.Schema(_STR)
 
     def value(pk):
@@ -116,7 +117,7 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client, schema_n
                     batch = gnitz.ZSetBatch(schema).extend(
                         [{"pk": pk, "val": value(pk)} for pk in range(base, base + per)]
                         + [{"pk": 0, "val": f"w{w}r{r}"}])
-                    lsns[w].append(c.push(tid, batch))
+                    lsns[w].append(c.push(tids[w % 2], batch))
         except Exception as e:  # noqa: BLE001 — re-raised below
             errors.append(e)
 
@@ -126,10 +127,13 @@ def test_concurrent_pushes_coalesce_into_shared_commits(server, client, schema_n
     join_or_fail("a concurrent push hung", *threads)
     assert not errors, errors
 
-    got = bag(scanned(client, sn, "t"))
-    [shared] = [k for k in got if k[0] == 0]
-    assert shared[1] in {f"w{w}r{r}" for w in range(conns) for r in range(rounds)}
-    assert got == {(pk, value(pk)): 1 for pk in range(1, 1 + conns * rounds * per)} | {shared: 1}
+    for i in range(2):
+        writers = range(i, conns, 2)
+        got = bag(scanned(client, sn, f"t{i}"))
+        [shared] = [k for k in got if k[0] == 0]
+        assert shared[1] in {f"w{w}r{r}" for w in writers for r in range(rounds)}
+        assert got == {(pk, value(pk)): 1 for w in writers
+                       for pk in range(1 + w * rounds * per, 1 + (w + 1) * rounds * per)} | {shared: 1}
 
     # Deliberately loose: that pushes coalesce at all, not how far.
     seen = [lsn for per_conn in lsns for lsn in per_conn]

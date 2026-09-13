@@ -36,11 +36,12 @@ use gnitz_wire::{PkColList, WireFault, STATUS_OK};
 /// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
 pub(super) static RELAY_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_RELAY_HOLD_FOR_DDL");
 
-/// Count of DDL tick-quiesce requests, bumped while [`RELAY_HOLD_FOR_DDL`] is
-/// armed — its only reader, so this folds away in release. It observes the
-/// request, not the window it opens: the window is entered only after the tick
-/// loop acks, which that seam is holding up.
-static DDL_QUIESCE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// DDL tick-quiesce requests the tick loop has not yet acked, counted while
+/// [`RELAY_HOLD_FOR_DDL`] is armed — its only reader, so this folds away in
+/// release. A level, not a running total: a request made before the held relay
+/// arrived still reads as waiting, where a delta against a snapshot taken at the
+/// hold would miss it.
+static DDL_QUIESCE_PENDING: AtomicU64 = AtomicU64::new(0);
 
 /// The window every DDL bundle runs inside: the tick loop is parked and
 /// `Shared::ddl_window` raised for exactly as long as the gate lives, so the
@@ -65,10 +66,14 @@ impl TickGate {
     /// acked — no tick is in flight and none will start until this gate drops.
     async fn enter(shared: &Rc<Shared>) -> Self {
         let acked_rx = request_quiesce(shared);
-        if RELAY_HOLD_FOR_DDL.armed() {
-            DDL_QUIESCE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let counted = RELAY_HOLD_FOR_DDL.armed();
+        if counted {
+            DDL_QUIESCE_PENDING.fetch_add(1, Ordering::Relaxed);
         }
         let park = acked_rx.await;
+        if counted {
+            DDL_QUIESCE_PENDING.fetch_sub(1, Ordering::Relaxed);
+        }
         shared.ddl_window.set(shared.ddl_window.get() + 1);
         TickGate {
             _release: park,
@@ -100,14 +105,14 @@ impl Shared {
 /// Poll bound for [`RELAY_HOLD_FOR_DDL`], in 1 ms ticks.
 const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
 
-/// Hold the FIRST steady-state exchange relay until a DDL has asked the tick loop
-/// to quiesce, keeping every worker parked in `do_exchange_wait` across that
-/// request — so the DDL reaches its catalog mutation while the workers' catalogs
-/// are mid-epoch. One-shot: the rest of the run relays at full speed.
+/// Hold the FIRST steady-state exchange relay until a DDL is waiting on the tick
+/// loop to quiesce, keeping every worker parked in `do_exchange_wait` while that
+/// DDL is already issued — so the DDL provably lands on a mid-epoch tick, whether
+/// its request came before or after this relay. One-shot: the rest of the run
+/// relays at full speed.
 pub(super) async fn hold_relay_for_ddl(shared: &Shared) {
-    let seen = DDL_QUIESCE_REQUESTS.load(Ordering::Relaxed);
     park_until(shared, HOLD_RELAY_MAX_POLLS, "relay hold", || {
-        DDL_QUIESCE_REQUESTS.load(Ordering::Relaxed) != seen
+        DDL_QUIESCE_PENDING.load(Ordering::Relaxed) > 0
     })
     .await
 }

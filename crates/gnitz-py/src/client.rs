@@ -109,13 +109,6 @@ impl PyGnitzClient {
         })
     }
 
-    /// The client's current OCC basis (the running max of observed server
-    /// watermarks, seeded from the HELLO ACK at connect). Read-only, for tests.
-    #[getter]
-    fn last_seen_lsn(&mut self) -> PyResult<u64> {
-        Ok(self.live()?.last_seen_lsn())
-    }
-
     /// Request frames this connection has written — what a test asserts a
     /// mirrored read does not move. Answers on a poisoned store.
     #[getter]

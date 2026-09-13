@@ -10,7 +10,7 @@ import threading
 
 import pytest
 import gnitz
-from _serverproc import NEEDS_MULTI
+from _serverproc import NEEDS_MULTI, join_or_fail
 from _read import bag, scanned
 from _uid import uid as _uid
 
@@ -46,11 +46,10 @@ def _race(*labelled_writes):
         except gnitz.GnitzError as e:
             errors.append((label, e))
 
-    threads = [threading.Thread(target=run, args=w) for w in labelled_writes]
+    threads = [threading.Thread(target=run, args=w, daemon=True) for w in labelled_writes]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    join_or_fail("a racing FK write hung", *threads)
     return errors
 
 

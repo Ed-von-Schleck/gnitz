@@ -7,6 +7,8 @@ import threading
 
 import pytest
 import gnitz
+from _read import bag
+from _serverproc import join_or_fail
 
 _DDL = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 
@@ -222,19 +224,16 @@ def test_create_schema_rejects_a_leading_underscore(client):
         client.create_schema("_reserved")
 
 
-def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server):
+def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server, client, schema_name, t):
     """`INSERT` ships conflict mode `Error`, whose duplicate-key rejection is a
     master-side pre-flight against committed state — there is no apply-time
     backstop. It therefore keeps the exclusive table guard even though binary
     upserts to the same table hold the shared one, and its verdict must survive
     that concurrency: a duplicate `INSERT` still raises, and never degrades
     into a silent upsert."""
-    sn = "err_upsert_race"
-    with gnitz.connect(server) as setup:
-        setup.create_schema(sn)
-        setup.execute_sql(_DDL, schema_name=sn)
-        tid, schema = setup.resolve_table(sn, "t")
-        setup.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
+    sn, tid = schema_name, t
+    schema = client.resolve_table(sn, "t")[1]
+    client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
 
     stop = threading.Event()
     failures = []
@@ -252,22 +251,18 @@ def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server):
         except Exception as e:  # noqa: BLE001 — surfaced after the join
             failures.append(e)
 
-    pushers = [threading.Thread(target=upserter, args=(s,)) for s in range(1, 5)]
+    pushers = [threading.Thread(target=upserter, args=(s,), daemon=True) for s in range(1, 5)]
     for p in pushers:
         p.start()
     try:
-        with gnitz.connect(server) as c:
-            for _ in range(20):
-                with pytest.raises(gnitz.GnitzError) as exc:
-                    c.execute_sql("INSERT INTO t VALUES (1, 20)", schema_name=sn)
-                assert "duplicate key" in str(exc.value).lower()
+        for _ in range(20):
+            with pytest.raises(gnitz.GnitzError) as exc:
+                client.execute_sql("INSERT INTO t VALUES (1, 20)", schema_name=sn)
+            assert "duplicate key" in str(exc.value).lower()
     finally:
         stop.set()
-        for p in pushers:
-            p.join()
+        join_or_fail("a concurrent upsert hung", *pushers)
     assert not failures, f"concurrent upserts failed: {failures}"
 
-    with gnitz.connect(server) as c:
-        # The rejected INSERTs left the original row untouched.
-        assert {row.pk: row.val for row in c.scan(tid)}[1] == 10
-        c.drop_schema(sn)
+    # The rejected INSERTs left the original row untouched, at weight 1.
+    assert {k: w for k, w in bag(client.scan(tid)).items() if k[0] == 1} == {(1, 10): 1}
