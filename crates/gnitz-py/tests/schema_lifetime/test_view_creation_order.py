@@ -13,18 +13,15 @@ Run at GNITZ_WORKERS=4 — the exchange/fanout paths only engage at W>1.
 import pytest
 from _read import bag, scanned
 from _serverproc import NEEDS_MULTI
+from _sql import values
 from _uid import uid
 
 
-def _values(rows):
-    return ", ".join("(" + ", ".join(str(c) for c in r) + ")" for r in rows)
-
-
 _A = ("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL); "
-      f"INSERT INTO a VALUES {_values((i, i % 5, i * 10) for i in range(30))}")
+      f"INSERT INTO a VALUES {values((i, i % 5, i * 10) for i in range(30))}")
 # `a` plus `b(id, bv)`, one row per `a.k`, with `bv = 100 · id`.
 _AB = (_A + "; CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL); "
-       f"INSERT INTO b VALUES {_values((j, j * 100) for j in range(5))}")
+       f"INSERT INTO b VALUES {values((j, j * 100) for j in range(5))}")
 _T = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)"
 _AI, _BJ = range(30), range(5)
 
@@ -86,14 +83,14 @@ _SHAPES = {
                      ("k",), {(x,): 1 for x in (0, 1, 2, 3, 4, 100, 200, 300, 400)}),
     "setop": ("CREATE TABLE s1 (id BIGINT NOT NULL PRIMARY KEY); "
               "CREATE TABLE s2 (id BIGINT NOT NULL PRIMARY KEY); "
-              f"INSERT INTO s1 VALUES {_values((i,) for i in range(30))}; "
-              f"INSERT INTO s2 VALUES {_values((i,) for i in range(20, 40))}",
+              f"INSERT INTO s1 VALUES {values((i,) for i in range(30))}; "
+              f"INSERT INTO s2 VALUES {values((i,) for i in range(20, 40))}",
               "CREATE VIEW v AS SELECT id FROM s1 UNION SELECT id FROM s2",
               ("id",), {(i,): 1 for i in range(40)}),
     "rangejoin": ("CREATE TABLE ra (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL); "
                   "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL); "
-                  f"INSERT INTO ra VALUES {_values((i, i) for i in range(10))}; "
-                  f"INSERT INTO rb VALUES {_values((j, j) for j in range(10))}",
+                  f"INSERT INTO ra VALUES {values((i, i) for i in range(10))}; "
+                  f"INSERT INTO rb VALUES {values((j, j) for j in range(10))}",
                   "CREATE VIEW v AS SELECT ra.x AS x, rb.y AS y FROM ra JOIN rb ON ra.x < rb.y",
                   ("x", "y"), {(i, j): 1 for i in range(10) for j in range(10) if i < j}),
     # A chain of separate DDLs: `v` backfills from a view the previous DDL filled.
@@ -246,9 +243,7 @@ def test_the_backfill_streams_long_strings_across_chunk_boundaries(tiny_ddl_chun
     At the 65 536-row default a test table is a single chunk and pins nothing;
     the 3-row fixture makes 10 rows span four.
     """
-    c = tiny_ddl_chunk_server
-    sn = "s" + uid()
-    c.create_schema(sn)
+    c, sn = tiny_ddl_chunk_server, "public"
     want = {(i, f"row_{i:02d}_" + "x" * 40): 1 for i in range(10)}
     c.execute_sql(
         "CREATE TABLE base (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL); "

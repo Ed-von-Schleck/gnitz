@@ -27,10 +27,7 @@ import pytest
 import gnitz
 from _read import bag
 from _serverproc import NUM_WORKERS
-
-
-def _values(rows):
-    return ", ".join("(" + ", ".join(str(c) for c in r) + ")" for r in rows)
+from _sql import values
 
 
 def _shape(ddl, rows, views, want=None):
@@ -83,7 +80,7 @@ _SHAPES = {
          "g BIGINT NOT NULL, val BIGINT NOT NULL)",
          "CREATE VIEW vx1 AS SELECT g, SUM(val) AS s FROM t GROUP BY g",
          "CREATE VIEW vx2 AS SELECT g, SUM(pk) AS s FROM t GROUP BY g"],
-        [f"INSERT INTO t VALUES {_values(_SB)}"],
+        [f"INSERT INTO t VALUES {values(_SB)}"],
         {"vx1": ["g", "s"], "vx2": ["g", "s"]},
         {"vx1": _grouped(_SB, lambda r: r[1], lambda r: r[2]),
          "vx2": _grouped(_SB, lambda r: r[1], lambda r: r[0])}),
@@ -99,7 +96,7 @@ _SHAPES = {
          "CREATE VIEW v AS SELECT grp, SUM(val) AS s FROM a GROUP BY grp",
          "CREATE VIEW decoy2 AS SELECT s, COUNT(*) AS c FROM v GROUP BY s",
          "CREATE VIEW g AS SELECT s, COUNT(*) AS c FROM v GROUP BY s"],
-        [f"INSERT INTO a VALUES {_values(_GG)}"],
+        [f"INSERT INTO a VALUES {values(_GG)}"],
         {"v": ["grp", "s"], "g": ["s", "c"]},
         {"v": {(0, 10): 1, (1, 20): 1},
          "g": {(10, 1): 1, (20, 1): 1}}),
@@ -111,7 +108,7 @@ _SHAPES = {
         ["CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
          "CREATE VIEW n AS SELECT pk, val + 1 AS p1 FROM a",
          "CREATE VIEW x AS SELECT p1, COUNT(*) AS c FROM n GROUP BY p1"],
-        [f"INSERT INTO a VALUES {_values(_GP)}"],
+        [f"INSERT INTO a VALUES {values(_GP)}"],
         {"n": ["pk", "p1"], "x": ["p1", "c"]},
         {"n": {(pk, v + 1): 1 for pk, v in _GP},
          "x": {(v + 1, 8): 1 for v in range(5)}}),
@@ -121,7 +118,7 @@ _SHAPES = {
          "g BIGINT NOT NULL, val BIGINT NOT NULL)",
          "CREATE VIEW vx AS SELECT g, SUM(val) AS s FROM t GROUP BY g",
          "CREATE VIEW vn AS SELECT g, s + 1 AS s1 FROM vx"],
-        [f"INSERT INTO t VALUES {_values(_PG)}"],
+        [f"INSERT INTO t VALUES {values(_PG)}"],
         {"vn": ["g", "s1"]}),
 
     "projection_sibling_of_groupby": _shape(
@@ -129,7 +126,7 @@ _SHAPES = {
          "g BIGINT NOT NULL, val BIGINT NOT NULL)",
          "CREATE VIEW vn AS SELECT pk, val + 1 AS plus1 FROM t",
          "CREATE VIEW vx AS SELECT g, SUM(val) AS s FROM t GROUP BY g"],
-        [f"INSERT INTO t VALUES {_values(_SIB)}"],
+        [f"INSERT INTO t VALUES {values(_SIB)}"],
         {"vn": ["pk", "plus1"], "vx": ["g", "s"]},
         {"vn": {(pk, v + 1): 1 for pk, _, v in _SIB}}),
 
@@ -139,7 +136,7 @@ _SHAPES = {
         ["CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
          "CREATE VIEW v1 AS SELECT pk, val + 1 AS a FROM t",
          "CREATE VIEW v2 AS SELECT pk, a + 1 AS b FROM v1"],
-        [f"INSERT INTO t VALUES {_values(_NEST)}"],
+        [f"INSERT INTO t VALUES {values(_NEST)}"],
         {"v1": ["pk", "a"], "v2": ["pk", "b"]},
         {"v1": {(pk, v + 1): 1 for pk, v in _NEST},
          "v2": {(pk, v + 2): 1 for pk, v in _NEST}}),
@@ -153,9 +150,9 @@ _SHAPES = {
          "FROM a JOIN b ON a.k = b.id",
          "CREATE VIEW y AS SELECT a.id AS aid, a.av AS av, c.cv AS cv "
          "FROM a JOIN c ON a.k = c.id"],
-        [f"INSERT INTO a VALUES {_values(_JA)}",
-         f"INSERT INTO b VALUES {_values(_JB)}",
-         f"INSERT INTO c VALUES {_values(_JB)}"],
+        [f"INSERT INTO a VALUES {values(_JA)}",
+         f"INSERT INTO b VALUES {values(_JB)}",
+         f"INSERT INTO c VALUES {values(_JB)}"],
         {"x": ["aid", "av", "bv"], "y": ["aid", "av", "cv"]}),
 
     # The minimal two-base equi-join, on bases nothing else reads: an
@@ -167,8 +164,8 @@ _SHAPES = {
          "CREATE TABLE jb (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
          "CREATE VIEW jx AS SELECT ja.id AS aid, ja.av AS av, jb.bv AS bv "
          "FROM ja JOIN jb ON ja.k = jb.id"],
-        [f"INSERT INTO ja VALUES {_values(_JA)}",
-         f"INSERT INTO jb VALUES {_values(_JB)}"],
+        [f"INSERT INTO ja VALUES {values(_JA)}",
+         f"INSERT INTO jb VALUES {values(_JB)}"],
         {"jx": ["aid", "av", "bv"]},
         {"jx": {(i, av, k * 100): 1 for i, k, av in _JA}}),
 
@@ -180,7 +177,7 @@ _SHAPES = {
          "CREATE VIEW v1 AS SELECT g, SUM(val) AS s FROM a GROUP BY g",
          "CREATE VIEW x AS SELECT a.id AS id, a.g AS g, v1.s AS s "
          "FROM a JOIN v1 ON a.g = v1.g"],
-        [f"INSERT INTO a VALUES {_values(_DIA)}"],
+        [f"INSERT INTO a VALUES {values(_DIA)}"],
         {"x": ["id", "g", "s"]}),
 
     # A keyless step broadcasts its delta instead of exchanging it, so a
@@ -190,8 +187,8 @@ _SHAPES = {
          "CREATE TABLE cu (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL)",
          "CREATE VIEW cv AS SELECT ct.id AS tid, cu.id AS uid "
          "FROM ct CROSS JOIN cu"],
-        [f"INSERT INTO ct VALUES {_values(_CT)}",
-         f"INSERT INTO cu VALUES {_values(_CU)}"],
+        [f"INSERT INTO ct VALUES {values(_CT)}",
+         f"INSERT INTO cu VALUES {values(_CU)}"],
         {"cv": ["tid", "uid"]},
         {"cv": {(t, u): 1 for t, _ in _CT for u, _ in _CU}}),
 
@@ -200,8 +197,8 @@ _SHAPES = {
          "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
          "CREATE VIEW rv AS SELECT ra.x AS x, rb.y AS y "
          "FROM ra JOIN rb ON ra.x < rb.y"],
-        [f"INSERT INTO ra VALUES {_values(_RA)}",
-         f"INSERT INTO rb VALUES {_values(_RA)}"],
+        [f"INSERT INTO ra VALUES {values(_RA)}",
+         f"INSERT INTO rb VALUES {values(_RA)}"],
         {"rv": ["x", "y"]},
         {"rv": {(x, y): 1 for _, x in _RA for _, y in _RA if x < y}}),
 
@@ -213,7 +210,7 @@ _SHAPES = {
          "g BIGINT NOT NULL, a BIGINT NOT NULL)",
          "CREATE VIEW v AS SELECT g, MIN(a) AS lo, MAX(a) AS hi, AVG(a) AS av, "
          "COUNT(*) AS c FROM t GROUP BY g"],
-        [f"INSERT INTO t VALUES {_values(_MM)}",
+        [f"INSERT INTO t VALUES {values(_MM)}",
          "DELETE FROM t WHERE pk = 0"],
         {"v": ["g", "lo", "hi", "av", "c"]}),
 
@@ -228,8 +225,8 @@ _SHAPES = {
          "CREATE VIEW v_union AS SELECT val FROM sa UNION SELECT val FROM sb",
          "CREATE VIEW v_isect AS SELECT val FROM sa INTERSECT SELECT val FROM sb",
          "CREATE VIEW v_exc AS SELECT val FROM sa EXCEPT SELECT val FROM sb"],
-        [f"INSERT INTO sa VALUES {_values(_SA)}",
-         f"INSERT INTO sb VALUES {_values(_SB_SET)}",
+        [f"INSERT INTO sa VALUES {values(_SA)}",
+         f"INSERT INTO sb VALUES {values(_SB_SET)}",
          "DELETE FROM sb WHERE pk IN (5, 25)"],
         {"v_all": ["val"], "v_union": ["val"],
          "v_isect": ["val"], "v_exc": ["val"]}),
@@ -239,7 +236,7 @@ _SHAPES = {
     "distinct": _shape(
         ["CREATE TABLE dt (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)",
          "CREATE VIEW dv AS SELECT DISTINCT g FROM dt"],
-        [f"INSERT INTO dt VALUES {_values(_DT)}",
+        [f"INSERT INTO dt VALUES {values(_DT)}",
          "DELETE FROM dt WHERE pk = 0"],
         {"dv": ["g"]},
         {"dv": {(g,): 1 for g in range(7)}}),
@@ -253,7 +250,7 @@ _SHAPES = {
         ["CREATE TABLE cbt (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
          "v BIGINT NOT NULL, PRIMARY KEY (a, b)) CLUSTER BY a",
          "CREATE VIEW cbv AS SELECT a, b, v FROM cbt WHERE v > 0"],
-        [f"INSERT INTO cbt VALUES {_values(_CB)}"],
+        [f"INSERT INTO cbt VALUES {values(_CB)}"],
         {"cbv": ["a", "b", "v"]},
         {"cbv": {r: 1 for r in _CB}}),
 
@@ -266,7 +263,7 @@ _SHAPES = {
          "category BIGINT NOT NULL, amount BIGINT NOT NULL)",
          "CREATE VIEW fv AS SELECT category, COUNT(*) AS cnt, SUM(amount) AS total "
          "FROM ft WHERE amount > 1000 GROUP BY category"],
-        [f"INSERT INTO ft VALUES {_values(_FT)}"],
+        [f"INSERT INTO ft VALUES {values(_FT)}"],
         {"fv": ["category", "cnt", "total"]},
         {"fv": _grouped([r for r in _FT if r[2] > 1000],
                         lambda r: r[1], lambda r: 1, lambda r: r[2])}),
@@ -405,7 +402,7 @@ def test_a_recovered_view_still_ticks_from_every_source(own_server):
             "the view must tick from both sources"
 
         more = [(a, 9, a * 100 + 9) for a in range(1, 9)]
-        conn.execute_sql(f"INSERT INTO cbt VALUES {_values(more)}", schema_name="tick")
+        conn.execute_sql(f"INSERT INTO cbt VALUES {values(more)}", schema_name="tick")
         assert bag(conn.scan(cbv), "a", "b", "v") == {r: 1 for r in _CB + more}, \
             "the post-restart insert must reach the view"
 

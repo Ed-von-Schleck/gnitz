@@ -290,8 +290,7 @@ def test_fk_holds_across_partitions_in_bulk(client, fk_pair):
         client.execute_sql(
             "INSERT INTO child VALUES " + ", ".join(f"({10000 + i}, {i})" for i in range(lo + 1, hi + 1)),
             schema_name=fk_pair)
-    ctid, _ = client.resolve_table(fk_pair, "child")
-    assert len(client.scan(ctid)) == n
+    assert bag(scanned(client, fk_pair, "child")) == {(10000 + i, i): 1 for i in range(1, n + 1)}
     with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
         client.execute_sql(f"INSERT INTO child VALUES (99999, {n + 1})", schema_name=fk_pair)
 

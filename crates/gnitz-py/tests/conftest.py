@@ -355,6 +355,20 @@ def schema_name(client):
     client.drop_schema(sn)
 
 
+@pytest.fixture(scope="module")
+def module_schema(server):
+    """`(conn, schema)` shared by one module, dropped whole at its end — for
+    fixtures whose data no test changes, built once instead of once per case.
+
+    Its own connection off the session server, since `client` is per-test.
+    """
+    with gnitz.connect(server) as conn:
+        sn = "m" + uid()
+        conn.create_schema(sn)
+        yield conn, sn
+        conn.drop_schema(sn)
+
+
 # ── mirror fixtures ───────────────────────────────────────────────────────────
 
 
@@ -427,7 +441,9 @@ def dedicated_server(monkeypatch, tmp_path_factory, _sock_path):
 @pytest.fixture
 def seamed_server(dedicated_server):
     """`dedicated_server`, returning a connected client instead of
-    `(target, proc)`, for a test that only reads and writes."""
+    `(target, proc)`, for a test that only reads and writes. The server and its
+    catalog die with the test, so the test works in the boot-time `public`
+    schema and tears nothing down."""
     with contextlib.ExitStack() as stack:
         def make(env: dict[str, str]):
             return stack.enter_context(gnitz.connect(dedicated_server(env).target))

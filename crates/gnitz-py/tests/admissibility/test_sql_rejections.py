@@ -17,35 +17,26 @@ _ROWS = "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)"
 
 
 @pytest.fixture(scope="module")
-def rejected(server):
+def rejected(module_schema):
     """`(conn, schema)` holding `p(k)`, `t(pk, val)` with five rows, and
     `u(pk, k)` with two, plus a view `vok` over `t` — for the rejection cases
-    only.
-
-    Module-scoped, and its own connection off the session server rather than the
-    function-scoped `client`: every test sharing it asserts a *refusal*, so none
-    of them can leave a mark on it. The alternative is rebuilding two tables
-    forty-odd times to run forty-odd statements that change nothing.
-    """
-    with gnitz.connect(server) as conn:
-        sn = "sqlrej"
-        conn.create_schema(sn)
-        conn.execute_sql("CREATE TABLE p (k BIGINT PRIMARY KEY)", schema_name=sn)
-        conn.execute_sql(_T, schema_name=sn)
-        conn.execute_sql(_ROWS, schema_name=sn)
-        conn.execute_sql(_U, schema_name=sn)
-        conn.execute_sql("INSERT INTO u VALUES (1, 10), (2, 20)", schema_name=sn)
-        conn.execute_sql(
-            "CREATE TABLE sx (id BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, "
-            "f DOUBLE NOT NULL, s TEXT NOT NULL, d DATE, price DECIMAL(10, 2) NOT NULL, "
-            "qty NUMERIC(8, 3))", schema_name=sn)
-        conn.execute_sql("INSERT INTO sx VALUES (1, 1, 1.5, 'abc', DATE '2024-02-29', 1.25, 2)",
-                         schema_name=sn)
-        # A view, so a statement that requires a base table has a wrong-kind
-        # name to be refused on.
-        conn.execute_sql("CREATE VIEW vok AS SELECT pk, val FROM t", schema_name=sn)
-        yield conn, sn
-        conn.drop_schema(sn)
+    only, so none of them can leave a mark on it."""
+    conn, sn = module_schema
+    conn.execute_sql("CREATE TABLE p (k BIGINT PRIMARY KEY)", schema_name=sn)
+    conn.execute_sql(_T, schema_name=sn)
+    conn.execute_sql(_ROWS, schema_name=sn)
+    conn.execute_sql(_U, schema_name=sn)
+    conn.execute_sql("INSERT INTO u VALUES (1, 10), (2, 20)", schema_name=sn)
+    conn.execute_sql(
+        "CREATE TABLE sx (id BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, "
+        "f DOUBLE NOT NULL, s TEXT NOT NULL, d DATE, price DECIMAL(10, 2) NOT NULL, "
+        "qty NUMERIC(8, 3))", schema_name=sn)
+    conn.execute_sql("INSERT INTO sx VALUES (1, 1, 1.5, 'abc', DATE '2024-02-29', 1.25, 2)",
+                     schema_name=sn)
+    # A view, so a statement that requires a base table has a wrong-kind
+    # name to be refused on.
+    conn.execute_sql("CREATE VIEW vok AS SELECT pk, val FROM t", schema_name=sn)
+    return conn, sn
 
 
 _DERIVATIONS = [
@@ -123,6 +114,10 @@ _UNHONOURED = [
     # ORDER BY and OFFSET are honoured by the client-side sink; only the
     # ClickHouse per-group `LIMIT ... BY` stays rejected on the LIMIT envelope.
     ("SELECT * FROM t LIMIT 2 BY val", r"LIMIT \.\.\. BY is not supported"),
+    # A non-literal cut must not degrade: `LIMIT 1+1` returning every row, or
+    # `OFFSET 1+1` skipping none.
+    ("SELECT * FROM t LIMIT 1+1", "LIMIT must be an integer literal"),
+    ("SELECT * FROM t LIMIT 1 OFFSET 1+1", "OFFSET must be an integer literal"),
     ("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", "FETCH is not supported"),
     ("SELECT pk FROM t PREWHERE val > 5", "PREWHERE is not supported"),
     ("SELECT TOP 2 pk FROM t", "TOP is not supported"),

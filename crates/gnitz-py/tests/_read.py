@@ -41,6 +41,12 @@ def bag(rows, *cols):
     return {k: w for k, w in sorted(acc.items(), key=repr) if w != 0}
 
 
+def ordered(rows):
+    """Each row as its `(name, value)` pairs and its weight, in result order —
+    `bag`'s counterpart for a result whose order is the thing under test."""
+    return [(tuple(r._asdict().items()), r.weight) for r in rows]
+
+
 def access(client, sn, q):
     """EXPLAIN's `access:` line for `q` — which walk the plan chose. Found by
     prefix rather than by row position, so adding a plan line cannot silently

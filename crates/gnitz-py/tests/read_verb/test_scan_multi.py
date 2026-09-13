@@ -20,33 +20,17 @@ from _read import bag
 from _serverproc import join_or_fail
 
 
+_KV = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+       gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+
+
 def _kv(client, sn, name):
-    """(pk U64 PK, val I64) table. Returns (tid, schema)."""
-    cols = [
-        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-    ]
-    return client.create_table(sn, name, cols), gnitz.Schema(cols)
+    """A `(pk U64 PK, val I64)` table's id."""
+    return client.create_table(sn, name, _KV)
 
 
-def _batch(schema, values):
-    b = gnitz.ZSetBatch(schema)
-    for pk, val in values:
-        b.append(pk=pk, val=val, _weight=1)
-    return b
-
-
-def test_scan_many_of_one_relation_is_a_scan(client, schema_name):
-    """A one-relation scan_many is exactly a scan: same rows, same weights, same
-    lsn."""
-    sn = schema_name
-    tid, sch = _kv(client, sn, "t")
-    client.push(tid, _batch(sch, [(1, 10), (2, 20), (3, 30)]))
-
-    single, multi = client.scan(tid), client.scan_many([tid])
-    assert len(multi) == 1
-    assert bag(multi[0]) == bag(single) == {(1, 10): 1, (2, 20): 1, (3, 30): 1}
-    assert multi[0].lsn == single.lsn
+def _batch(values):
+    return gnitz.ZSetBatch(gnitz.Schema(_KV)).extend({"pk": pk, "val": val} for pk, val in values)
 
 
 def test_the_results_line_up_with_the_requested_tids(client, schema_name):
@@ -55,11 +39,9 @@ def test_the_results_line_up_with_the_requested_tids(client, schema_name):
     forwards only frames carrying rows or a schema block — so its train is
     delimited by its master-authored terminal alone."""
     sn = schema_name
-    a, a_sch = _kv(client, sn, "a")
-    empty, _ = _kv(client, sn, "empty")
-    b, b_sch = _kv(client, sn, "b")
-    client.push(a, _batch(a_sch, [(pk, pk * 10) for pk in range(20)]))
-    client.push(b, _batch(b_sch, [(99, 990)]))
+    a, empty, b = (_kv(client, sn, name) for name in ("a", "empty", "b"))
+    client.push(a, _batch([(pk, pk * 10) for pk in range(20)]))
+    client.push(b, _batch([(99, 990)]))
 
     want_a = {(pk, pk * 10): 1 for pk in range(20)}
     res = client.scan_many([a, empty, b])
@@ -73,22 +55,21 @@ def test_a_base_and_a_view_snapshot_at_one_cut(client, schema_name):
     """One hash-partitioned base table and one aggregate view (single-row output,
     read via the replicated/unicast path) agree at the same cut."""
     sn = schema_name
-    t, sch = _kv(client, sn, "t")
-    client.push(t, _batch(sch, [(i, 1) for i in range(20)]))
+    t = _kv(client, sn, "t")
+    client.push(t, _batch([(i, 1) for i in range(20)]))
     client.execute_sql("CREATE VIEW v AS SELECT COUNT(*) AS c FROM t", schema_name=sn)
     v, _ = client.resolve_table(sn, "v")
 
-    res = client.scan_many([t, v])
-    assert len(bag(res[0])) == 20
-    assert bag(res[1]) == {(20,): 1}, "the aggregate view agrees with the base"
+    assert [bag(r) for r in client.scan_many([t, v])] == \
+        [{(i, 1): 1 for i in range(20)}, {(20,): 1}]
 
 
 def test_a_base_read_is_fresh_whatever_its_views_are_doing(client, schema_name):
     """A base table's own read is fully fresh the moment a push ACKs, whatever
     its dependent views are doing — a pending tick can only change what a VIEW
     sees. Three GROUP BY views ride on `t` so the tick queue is non-empty at read
-    time; both read verbs must still return every pushed row at weight 1, and the
-    scan_many/scan lsn equality must hold."""
+    time; both read verbs must still return every pushed row at weight 1, and a
+    one-relation scan_many is exactly a scan, lsn included."""
     sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT, v BIGINT)", schema_name=sn)
@@ -103,6 +84,7 @@ def test_a_base_read_is_fresh_whatever_its_views_are_doing(client, schema_name):
 
     want = {(i, i % 4, i): 1 for i in range(60)}
     single, multi = client.scan(tid), client.scan_many([tid])
+    assert len(multi) == 1
     assert bag(single) == bag(multi[0]) == want
     assert multi[0].lsn == single.lsn
 
@@ -123,8 +105,7 @@ def test_a_commit_is_never_observed_torn(server, schema_name):
     N = 400
     sn = schema_name
     with gnitz.connect(server) as wc:
-        a, a_sch = _kv(wc, sn, "a")
-        b, b_sch = _kv(wc, sn, "b")
+        a, b = _kv(wc, sn, "a"), _kv(wc, sn, "b")
 
         stop = threading.Event()
         bad, sizes = [], set()
@@ -133,8 +114,8 @@ def test_a_commit_is_never_observed_torn(server, schema_name):
             try:
                 for i in range(N):
                     with wc.transaction() as txn:
-                        txn.push(a, _batch(a_sch, [(i, i)]))
-                        txn.push(b, _batch(b_sch, [(i, i)]))
+                        txn.push(a, _batch([(i, i)]))
+                        txn.push(b, _batch([(i, i)]))
             finally:
                 stop.set()
 
@@ -166,12 +147,12 @@ def test_a_view_never_leads_its_base(server, schema_name):
     snapshot."""
     sn = schema_name
     with gnitz.connect(server) as wc:
-        t, sch = _kv(wc, sn, "t")
+        t = _kv(wc, sn, "t")
         wc.execute_sql(
             "CREATE VIEW v AS SELECT pk, val FROM t WHERE val >= 0", schema_name=sn)
         v, _ = wc.resolve_table(sn, "v")
 
-        wc.push(t, _batch(sch, [(i, i) for i in range(10)]))
+        wc.push(t, _batch([(i, i) for i in range(10)]))
         res = wc.scan_many([t, v])
         assert bag(res[0]) == bag(res[1]) == {(i, i): 1 for i in range(10)}
 
@@ -181,7 +162,7 @@ def test_a_view_never_leads_its_base(server, schema_name):
         def writer():
             try:
                 for i in range(10, 210):
-                    wc.push(t, _batch(sch, [(i, i)]))
+                    wc.push(t, _batch([(i, i)]))
             finally:
                 stop.set()
 
@@ -212,10 +193,9 @@ def test_a_cold_and_a_warm_schema_cache_decode_alike(server, schema_name):
     through the multi path."""
     sn = schema_name
     with gnitz.connect(server) as setup:
-        a, a_sch = _kv(setup, sn, "a")
-        b, b_sch = _kv(setup, sn, "b")
-        setup.push(a, _batch(a_sch, [(1, 1)]))
-        setup.push(b, _batch(b_sch, [(2, 2)]))
+        a, b = _kv(setup, sn, "a"), _kv(setup, sn, "b")
+        setup.push(a, _batch([(1, 1)]))
+        setup.push(b, _batch([(2, 2)]))
 
     want = [{(1, 1): 1}, {(2, 2): 1}]
     with gnitz.connect(server) as rc:
@@ -228,8 +208,8 @@ def test_a_cold_and_a_warm_schema_cache_decode_alike(server, schema_name):
 
 def test_every_refusal_leaves_the_server_serving(client, schema_name):
     sn = schema_name
-    t, sch = _kv(client, sn, "t")
-    client.push(t, _batch(sch, [(1, 1)]))
+    t = _kv(client, sn, "t")
+    client.push(t, _batch([(1, 1)]))
 
     for why, tids in [
         ("empty list", []),
@@ -258,44 +238,31 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_se
     here; the bags below are what rules out a silently reordered or truncated
     train once it does complete.
     """
-    c = reply_frame_budget_server
-    sn = "fifo"
-    c.create_schema(sn)
-    try:
-        big, big_sch = _kv(c, sn, "big")
-        # 4000 rows * 32 B/row wire ≈ 128 KiB total. Even split across 4 workers
-        # (~32 KiB each) it exceeds the 16 KiB budget, so every worker's train is
-        # genuinely multi-chunk — exercising the chunked-under-FIFO path — while
-        # staying far under any per-ring in-flight concern.
-        big_rows = [(i, i) for i in range(4000)]
-        c.push(big, _batch(big_sch, big_rows))
-        want_big = {(i, i): 1 for i in range(4000)}
+    c, sn = reply_frame_budget_server, "public"
+    big = _kv(c, sn, "big")
+    # 4000 rows * 32 B/row wire ≈ 128 KiB total. Even split across 4 workers
+    # (~32 KiB each) it exceeds the 16 KiB budget, so every worker's train is
+    # genuinely multi-chunk.
+    c.push(big, _batch([(i, i) for i in range(4000)]))
+    want_big = {(i, i): 1 for i in range(4000)}
 
-        smalls = []
-        for k in range(8):
-            tid, sch = _kv(c, sn, f"s{k}")
-            c.push(tid, _batch(sch, [(k, k * 10)]))
-            smalls.append((tid, {(k, k * 10): 1}))
+    ids = [_kv(c, sn, f"s{k}") for k in range(8)]
+    for k, tid in enumerate(ids):
+        c.push(tid, _batch([(k, k * 10)]))
+    wants = [{(k, k * 10): 1} for k in range(8)]
+    assert [bag(r) for r in c.scan_many([big] + ids)] == [want_big] + wants
+    assert [bag(r) for r in c.scan_many(ids + [big])] == wants + [want_big]
 
-        ids = [t for t, _ in smalls]
-        wants = [w for _, w in smalls]
-        assert [bag(r) for r in c.scan_many([big] + ids)] == [want_big] + wants
-        assert [bag(r) for r in c.scan_many(ids + [big])] == wants + [want_big]
-
-        # A blob-bearing sibling: a TEXT dimension must FIFO behind big too, and
-        # its own train chunks like any other. The values are past the 12-byte
-        # inline threshold, so every row points into the batch's string heap and
-        # each frame carries a heap compacted to its own rows: 400 * ~230 B is
-        # ~23 KiB per worker against the 16 KiB budget.
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("s", gnitz.TypeCode.STRING)]
-        dim = c.create_table(sn, "dim_text", cols)
-        db = gnitz.ZSetBatch(gnitz.Schema(cols))
-        names = [f"name-{i}-" + "z" * 200 for i in range(400)]
-        for i, nm in enumerate(names):
-            db.append(pk=i, s=nm, _weight=1)
-        c.push(dim, db)
-        assert [bag(r) for r in c.scan_many([big, dim])] == \
-            [want_big, {(i, nm): 1 for i, nm in enumerate(names)}]
-    finally:
-        c.drop_schema(sn)
+    # A blob-bearing sibling: a TEXT dimension must FIFO behind big too, and
+    # its own train chunks like any other. The values are past the 12-byte
+    # inline threshold, so every row points into the batch's string heap and
+    # each frame carries a heap compacted to its own rows: 400 * ~230 B is
+    # ~23 KiB per worker against the 16 KiB budget.
+    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("s", gnitz.TypeCode.STRING)]
+    dim = c.create_table(sn, "dim_text", cols)
+    names = [f"name-{i}-" + "z" * 200 for i in range(400)]
+    c.push(dim, gnitz.ZSetBatch(gnitz.Schema(cols)).extend(
+        {"pk": i, "s": nm} for i, nm in enumerate(names)))
+    assert [bag(r) for r in c.scan_many([big, dim])] == \
+        [want_big, {(i, nm): 1 for i, nm in enumerate(names)}]

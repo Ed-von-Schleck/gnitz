@@ -153,3 +153,19 @@ def test_a_pk_set_past_the_wire_cap_is_gathered_in_chunks(client, schema_name):
     res = client.execute_sql(f"DELETE FROM t WHERE id IN ({keys})", schema_name=sn)
     assert res[0]["count"] == len(present)
     assert bag(scanned(client, sn, "t")) == {(outside, outside): 1}
+
+
+def test_an_update_over_a_pk_set_reads_back_every_committed_row(client, schema_name):
+    """An UPDATE bounded by a PK set reads its committed rows back through the
+    PkSet gather, over keys spanning every worker, so a key the gather drops is
+    a row that silently keeps its old value."""
+    sn, n = schema_name, 400
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(n)),
+        schema_name=sn)
+    wanted = set(range(0, n, 7))
+    in_list = ", ".join(str(i) for i in sorted(wanted))
+    client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id IN ({in_list})", schema_name=sn)
+    assert bag(scanned(client, sn, "t")) == \
+        {(i, i * 10 + (i in wanted)): 1 for i in range(n)}

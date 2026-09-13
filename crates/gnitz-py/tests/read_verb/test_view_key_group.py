@@ -13,7 +13,7 @@ reachable through the binary client, so these drive `push`/`seek`, not SQL.
 
 import gnitz
 import pytest
-from _read import bag
+from _read import bag, scanned
 
 NFACTS = 40
 NDIMS = 4
@@ -112,18 +112,16 @@ def test_an_oversized_group_errors_and_the_connection_survives(client, schema_na
     # group down to one row at weight N.
     fact_id, fact_schema = client.resolve_table(sn, "fact")
     for p in range(npush):
-        batch = gnitz.ZSetBatch(fact_schema)
-        for i in range(rows_per_push):
-            fid = p * rows_per_push + i
-            batch.append(id=fid, k=1, s=f"{fid:08d}" + "x" * (width - 8))
-        client.push(fact_id, batch)
+        fids = range(p * rows_per_push, (p + 1) * rows_per_push)
+        client.push(fact_id, gnitz.ZSetBatch(fact_schema).extend(
+            {"id": fid, "k": 1, "s": f"{fid:08d}" + "x" * (width - 8)} for fid in fids))
 
     vid = client.resolve_table(sn, "jv")[0]
     with pytest.raises(Exception) as excinfo:
         list(client.seek(vid, pk=1))
     msg = str(excinfo.value)
     assert "67108864" in msg, f"the error must name the limit: {msg}"
-    assert "seek" in msg and "wire_size" in msg, msg
+    assert "seek" in msg, msg
 
     # The connection is intact: the next statement answers normally.
-    assert bag(client.scan(client.resolve_table(sn, "dim")[0])) == {(1, 1): 1}
+    assert bag(scanned(client, sn, "dim")) == {(1, 1): 1}

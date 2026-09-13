@@ -21,24 +21,16 @@ _STREAM = (
 
 
 @pytest.fixture(scope="module")
-def streamed(server):
+def streamed(module_schema):
     """`(conn, schema)` holding a stream `s` and an ordinary table `t` — for the
-    rejection cases only.
-
-    Module-scoped, and its own connection off the session server rather than the
-    function-scoped `client`: every test sharing it asserts a *refusal*, so none
-    of them can leave a mark on it.
-    """
-    with gnitz.connect(server) as conn:
-        sn = "streamrej"
-        conn.create_schema(sn)
-        conn.execute_sql(_STREAM, schema_name=sn)
-        conn.execute_sql(
-            "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, kind BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        yield conn, sn
-        conn.drop_schema(sn)
+    rejection cases only, so none of them can leave a mark on it."""
+    conn, sn = module_schema
+    conn.execute_sql(_STREAM, schema_name=sn)
+    conn.execute_sql(
+        "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, kind BIGINT NOT NULL)",
+        schema_name=sn,
+    )
+    return conn, sn
 
 
 # `(id, sql, message needle)`.
