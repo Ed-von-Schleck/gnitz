@@ -4,14 +4,14 @@
 
 mod pure;
 
-use gnitz_core::{CatalogSnapshot, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_core::{CatalogSnapshot, RelClass, TypeCode, PK_LIST_MAX_COLS};
 use pure::*;
 
 /// [`base`] plus the shapes the rejections need: `w` (a second typed table),
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column
 /// PK), `wide_a`/`wide_b` (one join key past the arity cap), `wl`/`wr` (33
-/// columns each), and two join views over duplicated names — `jv`, where `id`
-/// and `v` each appear twice, and `ju`, where only `v` does.
+/// columns each), `st` (a stream), and two join views over duplicated names —
+/// `jv`, where `id` and `v` each appear twice, and `ju`, where only `v` does.
 fn cat() -> CatalogSnapshot {
     let i = TypeCode::I64;
     let mut cat = base();
@@ -62,6 +62,17 @@ fn cat() -> CatalogSnapshot {
         ("wide_b", table(44, [vec![col("id", i)], keys()].concat(), vec![0])),
         ("wl", table(45, wide(), vec![0])),
         ("wr", table(46, wide(), vec![0])),
+        (
+            "st",
+            rel(
+                49,
+                RelClass::Stream,
+                false,
+                vec![col("id", i), col("v", i)],
+                vec![0],
+                &[],
+            ),
+        ),
     ] {
         cat.insert(SN, name, Some(desc));
     }
@@ -490,6 +501,9 @@ fn projection_and_envelope_rules() {
             ),
         ],
     );
+    // An alias list renames what the body produced; it does not disambiguate it.
+    let sql = "CREATE VIEW v (x, y) AS SELECT t.id, u.id FROM t JOIN u ON t.g = u.g";
+    assert_rejects(sql, plan(&cat, sql), "Plan", "duplicate column name");
 }
 
 #[test]
@@ -623,16 +637,24 @@ fn capacity_rules() {
     assert_rejects(sql, plan(&cat, sql), "Unsupported", "capacity-bounded");
 }
 
+/// Both retarget spellings: never onto a body that reads the view itself, and
+/// never over a relation that is not a view.
 #[test]
-fn alter_view_retargets_but_never_onto_itself() {
+fn a_retarget_never_reads_itself_nor_replaces_a_non_view() {
     let cat = cat();
     let chain = plan(&cat, "ALTER VIEW tv AS SELECT id, v FROM t").unwrap();
     assert_eq!(chain.name, "tv");
     assert_eq!(final_view(&chain).output_columns.len(), 2);
-    let sql = "ALTER VIEW tv AS SELECT id, v FROM tv";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "itself");
-    let sql = "ALTER VIEW t AS SELECT id, v FROM u";
-    assert_rejects(sql, plan(&cat, sql), "Unsupported", "is a table");
+    for verb in ["ALTER VIEW", "CREATE OR REPLACE VIEW"] {
+        for (target, body, needle) in [
+            ("tv", "SELECT id, v FROM tv", "itself"),
+            ("t", "SELECT id, v FROM u", "is a table"),
+            ("st", "SELECT id, v FROM u", "is a stream"),
+        ] {
+            let sql = format!("{verb} {target} AS {body}");
+            assert_rejects(&sql, plan(&cat, &sql), "Unsupported", needle);
+        }
+    }
 }
 
 /// The statement clauses `plan_view` itself turns away, on both spellings:
@@ -654,6 +676,10 @@ fn view_statement_rejected_clause_matrix() {
         (
             "ALTER VIEW tv WITH (security_barrier = true) AS SELECT id, v FROM t",
             "WITH options",
+        ),
+        (
+            "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT id FROM t",
+            "opposite outcomes",
         ),
     ] {
         assert_rejects(sql, plan(&cat, sql), "Unsupported", needle);

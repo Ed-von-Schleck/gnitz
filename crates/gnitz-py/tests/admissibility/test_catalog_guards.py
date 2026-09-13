@@ -7,6 +7,7 @@ is a shipped client binding that validates nothing on the way in.
 
 import pytest
 import gnitz
+from _uid import uid
 
 
 def _bad_schemas():
@@ -59,17 +60,23 @@ def test_system_relations_survive_a_rejected_drop(client):
     assert sys_ids() == before
 
 
-def test_drop_base_under_live_view_rejected_then_ordered_drop_succeeds(client, schema_name):
+def test_a_live_view_blocks_dropping_its_base_even_from_another_schema(client, schema_name):
     """The dependency graph the engine derives from a view's circuit gates DROP
-    TABLE; the rejected drop must leave the table intact."""
+    TABLE and the schema cascade that would reach the table, whichever schema
+    the view lives in. The rejected drops leave the table intact, and dropping
+    the view lifts both."""
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-    tid = client.create_table(schema_name, "t", cols)
+    other = "s" + uid()
+    client.create_schema(other)
+    tid = client.create_table(other, "t", cols)
     client.create_view(schema_name, "v", tid, gnitz.Schema(cols))
 
     with pytest.raises(gnitz.GnitzError):
-        client.drop_table(schema_name, "t")
-    assert client.resolve_table(schema_name, "t")[0] == tid
+        client.drop_table(other, "t")
+    with pytest.raises(gnitz.GnitzError):
+        client.drop_schema(other)
+    assert client.resolve_table(other, "t")[0] == tid
 
     client.drop_view(schema_name, "v")
-    client.drop_table(schema_name, "t")
+    client.drop_schema(other)

@@ -1,5 +1,5 @@
-"""ALTER TABLE renames and table-level constraints: the catalog names change
-while the ordinals underneath do not.
+"""ALTER renames, and the RESTRICT a dependent view puts on every schema change
+under it.
 
 An index and a foreign key bind by ordinal, so a rename must leave both
 working; a view's output store must not be re-derived by one. The column-level
@@ -13,27 +13,6 @@ from _read import access, bag, rows, scanned
 from _serverproc import NEEDS_MULTI
 
 
-def test_rename_table_keeps_its_rows_and_is_seen_by_a_second_connection(
-        client, schema_name, server):
-    """The old name stops resolving, the new one answers with the same Z-set,
-    and a connection that ran none of the DDL sees it on its next statement."""
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=schema_name)
-    client.execute_sql("ALTER TABLE t RENAME TO t2", schema_name=schema_name)
-
-    with pytest.raises(Exception):
-        client.resolve_table(schema_name, "t")
-    tid = client.resolve_table(schema_name, "t2")[0]
-    assert bag(client.scan(tid), "pk", "v") == {(1, 10): 1, (2, 20): 1}
-
-    with gnitz.connect(server) as c2:
-        assert c2.resolve_table(schema_name, "t2")[0] == tid
-        with pytest.raises(Exception):
-            c2.resolve_table(schema_name, "t")
-
-
 def test_rename_column_keeps_the_index_and_the_fk_bound_to_it(client, schema_name):
     """An index and a foreign key both bind by ordinal, so renaming the column
     each covers leaves them working under the new name.
@@ -43,29 +22,24 @@ def test_rename_column_keeps_the_index_and_the_fk_bound_to_it(client, schema_nam
     same result, so only the access line can tell the two apart.
     """
     client.execute_sql(
-        "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=schema_name)
-    client.execute_sql(
+        "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
         "CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, "
-        "ref BIGINT NOT NULL REFERENCES parent(id))", schema_name=schema_name)
-    client.execute_sql("CREATE INDEX iv ON parent(v)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO parent VALUES (1, 100), (2, 200)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO child VALUES (1, 1)", schema_name=schema_name)
+        "ref BIGINT NOT NULL REFERENCES parent(id)); "
+        "CREATE INDEX iv ON parent(v); "
+        "INSERT INTO parent VALUES (1, 100), (2, 200); "
+        "INSERT INTO child VALUES (1, 1); "
+        "ALTER TABLE parent RENAME COLUMN v TO w; "
+        "ALTER TABLE child RENAME TO child2; "
+        "ALTER TABLE parent RENAME TO parent2", schema_name=schema_name)
 
-    client.execute_sql("ALTER TABLE parent RENAME COLUMN v TO w", schema_name=schema_name)
-    client.execute_sql("ALTER TABLE child RENAME TO child2", schema_name=schema_name)
-    client.execute_sql("ALTER TABLE parent RENAME TO parent2", schema_name=schema_name)
-
-    # The index still serves a seek on the renamed column, through the renamed
-    # table, and still answers with the right rows.
     q = "SELECT id FROM parent2 WHERE w = 200"
-    assert "index" in access(client, schema_name, q), access(client, schema_name, q)
+    plan = access(client, schema_name, q)
+    assert "index" in plan, plan
     assert bag(rows(client, schema_name, q), "id") == {(2,): 1}
 
-    # The FK still validates against the renamed parent: a live reference is
-    # accepted and a dangling one refused.
+    # A live reference is accepted and a dangling one refused.
     client.execute_sql("INSERT INTO child2 VALUES (2, 1)", schema_name=schema_name)
-    with pytest.raises(Exception):
+    with pytest.raises(gnitz.GnitzError, match="Foreign Key violation"):
         client.execute_sql("INSERT INTO child2 VALUES (3, 999)", schema_name=schema_name)
 
 
@@ -75,16 +49,12 @@ def test_rename_populated_join_view_keeps_its_output_weights(client, schema_name
     output Z-set is asserted whole before and after, so a second fill shows as
     doubled weights rather than as extra rows."""
     client.execute_sql(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, av BIGINT NOT NULL)",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
-        schema_name=schema_name)
-    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, av BIGINT NOT NULL); "
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL); "
         "CREATE VIEW j AS SELECT a.id AS id, a.av AS av, b.bv AS bv "
-        "FROM a JOIN b ON a.id = b.id", schema_name=schema_name)
-    client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO b VALUES (1, 100), (2, 200)", schema_name=schema_name)
+        "FROM a JOIN b ON a.id = b.id; "
+        "INSERT INTO a VALUES (1, 10), (2, 20); "
+        "INSERT INTO b VALUES (1, 100), (2, 200)", schema_name=schema_name)
 
     want = {(10, 100): 1, (20, 200): 1}
     assert bag(scanned(client, schema_name, "j"), "av", "bv") == want
@@ -93,29 +63,38 @@ def test_rename_populated_join_view_keeps_its_output_weights(client, schema_name
     assert bag(scanned(client, schema_name, "j2"), "av", "bv") == want
 
 
-def test_add_and_drop_unique_constraint(client, schema_name):
-    """`ADD CONSTRAINT ... UNIQUE` builds an enforcing index that a duplicate
-    trips, `DROP CONSTRAINT` retires it by name, and the unnamed form builds one
-    that enforces just the same — asserted over a column that already holds a
-    duplicate, so a constraint that created nothing could not stand."""
+_RESTRICTED = [
+    "ALTER TABLE t ADD COLUMN c BIGINT",
+    "ALTER TABLE t ALTER COLUMN a DROP NOT NULL",
+    "ALTER TABLE t DROP COLUMN a",
+    "DROP VIEW IF EXISTS v",
+    "ALTER VIEW v AS SELECT id, b FROM t",
+    "CREATE OR REPLACE VIEW v AS SELECT id, b FROM t",
+]
+
+
+def test_a_dependent_view_restricts_until_it_is_dropped(client, schema_name):
+    """A column transition under a view that scans the table, and a drop or a
+    retarget of a view another view scans, are each refused — `IF EXISTS`
+    included, since it answers "no such object" only. Nothing is torn down on
+    the way: both views keep maintaining, and dropping them lifts the RESTRICT.
+    """
+    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=schema_name)
-    client.execute_sql("ALTER TABLE t ADD CONSTRAINT uq UNIQUE (v)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO t VALUES (1, 5)", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match="[Uu]nique index violation"):
-        client.execute_sql("INSERT INTO t VALUES (2, 5)", schema_name=schema_name)
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
+        "CREATE VIEW v AS SELECT id, a FROM t WHERE a > 5; "
+        "CREATE VIEW dep AS SELECT id FROM v; "
+        "INSERT INTO t VALUES (1, 10, 100)", schema_name=sn)
 
-    client.execute_sql("ALTER TABLE t DROP CONSTRAINT uq", schema_name=schema_name)
-    client.execute_sql("INSERT INTO t VALUES (2, 5)", schema_name=schema_name)
-    client.execute_sql("ALTER TABLE t DROP CONSTRAINT IF EXISTS nope", schema_name=schema_name)
+    for sql in _RESTRICTED:
+        with pytest.raises(gnitz.GnitzError, match="dependen"):
+            client.execute_sql(sql, schema_name=sn)
 
-    # The unnamed form builds an enforcing index too: it refuses to build over
-    # the duplicate that is now there, and once that is gone it refuses the next
-    # duplicate INSERT.
-    with pytest.raises(gnitz.GnitzError, match="contains duplicate values"):
-        client.execute_sql("ALTER TABLE t ADD CONSTRAINT UNIQUE (v)", schema_name=schema_name)
-    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=schema_name)
-    client.execute_sql("ALTER TABLE t ADD CONSTRAINT UNIQUE (v)", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match="[Uu]nique index violation"):
-        client.execute_sql("INSERT INTO t VALUES (3, 5)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (2, 20, 200)", schema_name=sn)
+    assert rows(client, sn, "SELECT * FROM t")[0]._fields == ("id", "a", "b")
+    assert bag(scanned(client, sn, "v"), "id", "a") == {(1, 10): 1, (2, 20): 1}
+    assert bag(scanned(client, sn, "dep"), "id") == {(1,): 1, (2,): 1}
+
+    client.execute_sql("DROP VIEW dep; DROP VIEW v; " + "; ".join(_RESTRICTED[:3]), schema_name=sn)
+    assert bag(rows(client, sn, "SELECT * FROM t"), "id", "b", "c") == {
+        (1, 100, None): 1, (2, 200, None): 1}

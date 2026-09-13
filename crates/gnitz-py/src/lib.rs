@@ -101,16 +101,6 @@ pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClie
     Ok(client)
 }
 
-/// Decode a persisted catalog column-list `u64` (`TABLE_TAB.pk_col_idx`,
-/// `IDX_TAB.source_col_idx`) into a list of column indices, through the shared
-/// `gnitz_wire` codec. An out-of-range packed count raises.
-#[pyfunction]
-fn unpack_pk_cols(v: u64) -> PyResult<Vec<u32>> {
-    gnitz_wire::unpack_pk_cols(v)
-        .map(|cols| cols.as_slice().to_vec())
-        .map_err(|rule| pyo3::exceptions::PyValueError::new_err(rule.to_string()))
-}
-
 /// The reply schema of an incremental delta poll, derived from a view's own
 /// schema: a `_tick` U64 key column, then the view's PK columns in PK order,
 /// then its payload columns in schema order. A bootstrap read is *not* in this
@@ -191,7 +181,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("debug_assertions", cfg!(debug_assertions))?;
     m.add_class::<PyDeltaReply>()?;
     m.add_function(wrap_pyfunction!(delta_reply_schema, m)?)?;
-    m.add_function(wrap_pyfunction!(unpack_pk_cols, m)?)?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     m.add_function(wrap_pyfunction!(circuit_opcodes, m)?)?;
     Ok(())

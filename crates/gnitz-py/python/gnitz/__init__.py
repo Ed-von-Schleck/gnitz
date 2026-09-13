@@ -5,7 +5,7 @@ from gnitz._native import (
     PollResult,
     SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, CIRCUIT_NODES_TAB,
     FIRST_USER_TABLE_ID, MAX_COLUMNS,
-    unpack_pk_cols, debug_assertions,
+    debug_assertions,
 )
 from gnitz._types import Opcode, TypeCode
 

@@ -446,11 +446,7 @@ fn run_worker_child(
 
 /// The master's half of recovery before any worker exists. Returns the sweep set
 /// the verdict below determines, which every worker inherits across the fork.
-fn master_pre_fork_recovery(
-    catalog: &mut CatalogEngine,
-    log: SalLog,
-    walk_epoch: u32,
-) -> Result<Vec<i64>, String> {
+fn master_pre_fork_recovery(catalog: &mut CatalogEngine, log: SalLog, walk_epoch: u32) -> Result<Vec<i64>, String> {
     recover_system_tables_from_sal(log, walk_epoch, catalog)?;
 
     // Checked, and before the gc below: the replayed DDL lives only in master

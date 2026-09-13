@@ -152,6 +152,14 @@ fn a_table_past_the_column_cap_is_unsupported() {
     assert_rejects(&sql, plan_table(&cat, &sql), "Unsupported", "65");
 }
 
+/// `OR REPLACE` would discard the table's rows; `DROP TABLE` says that out loud.
+#[test]
+fn or_replace_is_rejected() {
+    let cat = catalog(vec![]);
+    let sql = "CREATE OR REPLACE TABLE t (id BIGINT PRIMARY KEY)";
+    assert_rejects(sql, plan_table(&cat, sql), "Unsupported", "OR REPLACE");
+}
+
 /// A stream holds no rows, so it backs no index, enforces no referential action
 /// and seeds no SERIAL generator. The engine refuses all three by relation id;
 /// the planner names the column.

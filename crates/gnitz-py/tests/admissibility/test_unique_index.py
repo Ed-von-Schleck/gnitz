@@ -399,10 +399,12 @@ def test_preflight_spill_is_bounded_and_exact(unique_preflight_spill_server, pla
 @pytest.mark.parametrize("ddl", [
     _T + "; CREATE UNIQUE INDEX ON t(val)",
     "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT UNIQUE)",
-], ids=["create-index", "column-constraint"])
+    _T + "; ALTER TABLE t ADD CONSTRAINT UNIQUE (val)",
+], ids=["create-index", "column-constraint", "add-constraint"])
 def test_every_declaration_entry_point_enforces(client, schema_name, ddl):
-    """`CREATE UNIQUE INDEX` and a column-level `UNIQUE` register the same
-    index — the column form once discarded it silently."""
+    """`CREATE UNIQUE INDEX`, a column-level `UNIQUE` and an unnamed `ADD
+    CONSTRAINT ... UNIQUE` register the same index — the column form once
+    discarded it silently."""
     for stmt in ddl.split("; "):
         client.execute_sql(stmt, schema_name=schema_name)
     client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=schema_name)
