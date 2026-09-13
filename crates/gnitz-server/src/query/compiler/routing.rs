@@ -91,10 +91,14 @@ impl ViewMeta {
         // nodes as well as within one, so two scans on a source carrying the same
         // key resolve to one sequence rather than tripping the pack-key gate below.
         let mut seqs: FxHashMap<i64, Vec<load::ReindexKey>> = FxHashMap::default();
+        let mut outside_joins: FxHashSet<i64> = FxHashSet::default();
         for (nid, op) in loaded.ops() {
             let gnitz_wire::OpNode::ScanDelta { source, .. } = op else {
                 continue;
             };
+            if !load::scan_feeds_only_joins(loaded, nid) {
+                outside_joins.insert(*source as i64);
+            }
             let (node_seqs, orphaned) = load::scatter_key_of_scan(loaded, nid);
             if orphaned {
                 return Err(CompileError::Rejected(
@@ -130,7 +134,7 @@ impl ViewMeta {
         // no source distribution places them: nothing co-partitions, and every
         // source relays.
         let co_partitioned = match join_relay {
-            load::JoinRelay::WholeKey => compute_co_partitioned(&concatenated, host),
+            load::JoinRelay::WholeKey => compute_co_partitioned(&concatenated, host, &outside_joins),
             load::JoinRelay::EqPrefix { .. } | load::JoinRelay::Broadcast => FxHashSet::default(),
         };
 
@@ -174,9 +178,9 @@ impl ViewMeta {
     }
 
     /// True iff `source_id`'s delta must go through the join scatter: it carries a
-    /// join/group reindex key, and its native distribution does not already match
-    /// that key (nor is its partner replicated, which makes the exchange
-    /// unnecessary either way).
+    /// join/group reindex key, and neither its native distribution matching that
+    /// key nor a replicated partner met only through join terms makes the
+    /// exchange unnecessary.
     pub(in crate::query) fn scatters(&self, source_id: i64) -> bool {
         self.source_routes.get(&source_id).is_some_and(|relay| relay.scatter)
     }
@@ -228,22 +232,35 @@ fn shard_cols_match_dist_key(schema: &SchemaDescriptor, cols: &[u32]) -> bool {
     cols.len() == k && cols == &schema.pk_indices()[..k]
 }
 
-fn compute_co_partitioned(join_shard_map: &JoinShardMap, host: &dyn SchemaSource) -> FxHashSet<i64> {
-    // One replicated participant makes every participant skip: the replicated
-    // side already has every row on every worker, and its partner can therefore
-    // stay in its own PK partitioning and `cogroup` against the full local copy.
-    // Not folded into `shard_cols_match_dist_key`, which must stay the pure
-    // prefix predicate for the partner-less skip path.
-    let any_replicated = join_shard_map
-        .keys()
-        .any(|&tid| host.schema_of(tid).is_some_and(|s| s.placement().is_replicated()));
+/// The sources whose delta may skip the join scatter. `outside_joins` holds the
+/// sources the circuit also consumes other than as a join operand.
+fn compute_co_partitioned(
+    join_shard_map: &JoinShardMap,
+    host: &dyn SchemaSource,
+    outside_joins: &FxHashSet<i64>,
+) -> FxHashSet<i64> {
+    // A replicated participant met only through join terms makes every
+    // participant skip: it has every row on every worker, so its partner stays in
+    // its own PK partitioning and `cogroup`s against the full local copy, and each
+    // match is made once, on the partner's worker. A replicated delta the circuit
+    // also uses directly — the preserved side under an outer or semi join's
+    // clamp, a union branch, a reduce input — would count once per worker, so it
+    // withdraws the skip: every source scatters, and the relay takes the
+    // replicated delta from one worker. Not folded into
+    // `shard_cols_match_dist_key`, which must stay the pure prefix predicate for
+    // the partner-less skip path.
+    let replicated = |tid: i64| host.schema_of(tid).is_some_and(|s| s.placement().is_replicated());
+    let skip_all = join_shard_map.keys().any(|&tid| replicated(tid))
+        && join_shard_map
+            .keys()
+            .all(|tid| !replicated(*tid) || !outside_joins.contains(tid));
     let mut co_partitioned = FxHashSet::default();
     for (&tid, cols) in join_shard_map {
         let Some(ext_schema) = host.schema_of(tid) else {
             continue;
         };
 
-        if any_replicated {
+        if skip_all {
             co_partitioned.insert(tid);
             continue;
         }

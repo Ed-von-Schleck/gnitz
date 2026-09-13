@@ -80,7 +80,7 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     let compound = pk_payload_schema(&[type_code::U64; 2]);
     let ext = ext_tables([(7, compound)]);
     let co = |cols: Vec<gnitz_wire::ReindexSlot>| {
-        compute_co_partitioned(&JoinShardMap::from_iter([(7i64, cols)]), &ext).contains(&7)
+        compute_co_partitioned(&JoinShardMap::from_iter([(7i64, cols)]), &ext, &FxHashSet::default()).contains(&7)
     };
     assert!(co(vec![(0, None), (1, None)]), "shard [pk0, pk1] equals pk_indices()");
     assert!(
@@ -100,24 +100,36 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     let base = make_schema_u64_i64;
     let replicated = base().with_placement(Placement::Replicated);
     let join_on_payload = JoinShardMap::from_iter([(7i64, vec![(1u32, None)]), (8i64, vec![(1u32, None)])]);
-    let both_skip = |ext: ExtTables| {
-        let co = compute_co_partitioned(&join_on_payload, &ext);
+    let both_skip = |ext: ExtTables, outside_joins: &[i64]| {
+        let co = compute_co_partitioned(&join_on_payload, &ext, &outside_joins.iter().copied().collect());
         (co.contains(&7), co.contains(&8))
     };
     assert_eq!(
-        both_skip(ext_tables([(7, base()), (8, base())])),
+        both_skip(ext_tables([(7, base()), (8, base())]), &[]),
         (false, false),
         "two partitioned sides on a non-PK key both go through the exchange"
     );
     // A partitioned fact skips too when its partner is replicated: it stays in
     // its own PK partitioning and joins the full local dim copy.
     assert_eq!(
-        both_skip(ext_tables([(7, replicated), (8, base())])),
+        both_skip(ext_tables([(7, replicated), (8, base())]), &[]),
         (true, true),
         "a replicated dim lets both sides skip"
     );
     assert_eq!(
-        both_skip(ext_tables([(7, replicated), (8, replicated)])),
+        both_skip(ext_tables([(7, replicated), (8, base())]), &[8]),
+        (true, true),
+        "the partitioned side's own delta is on one worker either way"
+    );
+    // A replicated delta consumed outside the join — an outer join's preserved
+    // side under its clamp — would count once per worker.
+    assert_eq!(
+        both_skip(ext_tables([(7, replicated), (8, base())]), &[7]),
+        (false, false),
+        "a replicated side used outside its join terms makes both sides scatter"
+    );
+    assert_eq!(
+        both_skip(ext_tables([(7, replicated), (8, replicated)]), &[]),
         (true, true),
         "replicated ⋈ replicated"
     );
@@ -128,10 +140,48 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     assert!(
         compute_co_partitioned(
             &JoinShardMap::from_iter([(7i64, vec![(0u32, Some(TypeCode::I64))])]),
-            &ext_r
+            &ext_r,
+            &FxHashSet::default()
         )
         .contains(&7),
         "replicated source skips regardless of carried type-promotion"
+    );
+}
+
+/// `derive` reads "used outside a join" off the circuit: the replicated source 7
+/// and the partitioned source 8 meet in an equi join, and in the second fixture
+/// 7's reindexed delta also feeds a `Union` beside the join — the shape of an
+/// outer or semi join's preserved side.
+#[test]
+fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
+    let scatters = |also_union: bool| {
+        let mut nodes = vec![
+            (0, scan_delta(7)),
+            (1, scatter_reindex(&[1])),
+            (2, scan_delta(8)),
+            (3, scatter_reindex(&[1])),
+            (4, OpNode::Join(JoinKind::Equi)),
+            (5, OpNode::IntegrateSink),
+        ];
+        let mut edges = vec![(0, 1, SLOT_IN), (2, 3, SLOT_IN), (1, 4, SLOT_IN), (3, 4, SLOT_TRACE)];
+        if also_union {
+            nodes.push((6, OpNode::Union));
+            edges.extend([(1, 6, SLOT_IN), (4, 6, SLOT_TRACE), (6, 5, SLOT_IN)]);
+        } else {
+            edges.push((4, 5, SLOT_IN));
+        }
+        let ext = ext_tables([
+            (7, make_schema_u64_i64().with_placement(Placement::Replicated)),
+            (8, make_schema_u64_i64()),
+        ]);
+        let meta = ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).unwrap();
+        (meta.scatters(7), meta.scatters(8))
+    };
+    assert_eq!(scatters(false), (false, false), "join terms alone: both skip");
+    assert_eq!(
+        scatters(true),
+        (true, true),
+        "the replicated delta used directly: both scatter"
     );
 }
 

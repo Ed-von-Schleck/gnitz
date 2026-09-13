@@ -1,721 +1,303 @@
 """Replicated placement: a whole copy of the relation on every worker.
 
-Writes broadcast to every worker's ingest and SAL, reads single-source one copy,
-and a join against a partitioned fact runs locally on every worker with no
-exchange on either side.
+Writes broadcast to every worker's copy, a read of a replicated relation is
+served by one worker, and a mixed view's exchange relays a replicated source's
+delta from one worker only.
 
 Everything here is asserted by WEIGHT, never by row presence. The failures this
 placement admits leave the row *set* right and only the weights wrong — a read
 gathered from all W copies, a delta relayed once per worker and consolidated into
-one row at weight W — so a presence check passes under the bug either way. At one
-worker there is a single copy and none of it can happen, which is what the
-`NEEDS_MULTI` marks record rather than paper over.
+one row at weight W — so a presence check passes under them. At one worker there
+is a single copy and none of it can happen, so the whole module needs W > 1.
 """
 
-import pytest
+from collections import Counter
+
 import gnitz
+import pytest
 from _serverproc import NEEDS_MULTI
-from _read import bag, scanned
+from _read import bag, rows, scanned
+from _sql import insert, values
+
+pytestmark = NEEDS_MULTI
 
 _REPL = " WITH (replicated = true)"
 
 
-def _select(client, sn, sql):
-    """Positive-weight PKs of a direct SELECT, duplicates kept.
-
-    A ×W read inflation returns the same row once per worker, so it shows up as
-    repeated PKs here; a set or a dict comparison would hide it.
-    """
-    res = client.execute_sql(sql, schema_name=sn)
-    assert res[0]["type"] == "Rows", f"expected Rows, got {res[0]['type']}"
-    b = res[0]["rows"]
-    if b.schema is None:
-        return []
-    return sorted(pk for pk, w in zip(b.pks, b.weights) if w > 0)
+def _apply(state, changes):
+    """`changes` as `{pk: row}` onto `state`; a `None` row deletes the pk."""
+    for pk, row in changes.items():
+        if row is None:
+            del state[pk]
+        else:
+            state[pk] = row
 
 
-# ── Reads single-source one copy, whatever the verb ──────────────────────────
+# ── Reads return one copy, whatever the verb ─────────────────────────────────
 
-_NDIM = 40
+# (id, cust, val); ids past 40 pad the table so that an indexed predicate
+# selecting a few of the first 40 clears the worker's selectivity gate and
+# walks the index rather than falling back to a scan.
+_DIM = [(i, i % 7, i * 10) for i in range(1, 41)] + \
+       [(i, 1000 + i % 7, 1_000_000 + i) for i in range(41, 401)]
 
 
-@pytest.fixture
-def dim_indexed(client, schema_name):
-    """A replicated `dim` carrying both index kinds over 40 rows.
-
-    One table serves every read verb below, and the two indexes coexisting on a
-    replicated owner is itself a case none of the single-index spellings reached.
-    """
-    client.execute_sql(
+@pytest.fixture(scope="module")
+def dim(module_schema):
+    """A replicated `dim` carrying both index kinds. Read-only."""
+    conn, sn = module_schema
+    conn.execute_sql(
         "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, cust BIGINT NOT NULL, "
-        "val BIGINT NOT NULL)" + _REPL, schema_name=schema_name)
-    client.execute_sql(
-        "INSERT INTO dim VALUES " + ",".join(
-            f"({i}, {i % 7}, {i * 10})" for i in range(1, _NDIM + 1)),
-        schema_name=schema_name)
-    client.execute_sql("CREATE INDEX ON dim(cust)", schema_name=schema_name)
-    client.execute_sql("CREATE UNIQUE INDEX ON dim(val)", schema_name=schema_name)
-    return schema_name
+        "val BIGINT NOT NULL)" + _REPL, schema_name=sn)
+    insert(conn, sn, "dim", _DIM)
+    conn.execute_sql("CREATE INDEX ON dim(cust); CREATE UNIQUE INDEX ON dim(val)",
+                     schema_name=sn)
+    return sn
 
 
-_ONE_COPY_READS = [
-    ("non-unique-index-point", "cust = 0", [i for i in range(1, _NDIM + 1) if i % 7 == 0]),
-    ("non-unique-index-miss", "cust = 99", []),
-    ("unique-index-point", "val = 100", [10]),
-    ("unique-index-miss", "val = 7", []),
-    ("index-range", "val BETWEEN 100 AND 200", list(range(10, 21))),
-    ("index-open-range", "val > 350", list(range(36, _NDIM + 1))),
-    ("pk-in-list", "id IN (1, 9, 17, 25, 33)", [1, 9, 17, 25, 33]),
-    ("pk-point", "id = 23", [23]),
-    ("unindexed-predicate", "cust = 1 AND val < 200", [1, 8, 15]),
-]
+@pytest.mark.parametrize("where,keep", [
+    pytest.param(None, lambda i, c, v: True, id="scan"),
+    pytest.param("cust = 0", lambda i, c, v: c == 0, id="index-point"),
+    pytest.param("cust = 99", lambda i, c, v: False, id="index-miss"),
+    pytest.param("val = 100", lambda i, c, v: v == 100, id="unique-index-point"),
+    pytest.param("val = 7", lambda i, c, v: False, id="unique-index-miss"),
+    pytest.param("val BETWEEN 100 AND 200", lambda i, c, v: 100 <= v <= 200, id="index-range"),
+    pytest.param("val < 60", lambda i, c, v: v < 60, id="index-open-range"),
+    pytest.param("cust = 1 AND val < 200", lambda i, c, v: c == 1 and v < 200,
+                 id="index-and-residual"),
+    pytest.param("id = 23", lambda i, c, v: i == 23, id="pk-point"),
+    pytest.param("id IN (1, 9, 17, 25, 33)", lambda i, c, v: i in (1, 9, 17, 25, 33),
+                 id="pk-in-list"),
+    pytest.param("id BETWEEN 5 AND 12", lambda i, c, v: 5 <= i <= 12, id="pk-range"),
+])
+def test_a_read_of_a_replicated_table_returns_one_copy(client, dim, where, keep):
+    """Every worker's copy matches every predicate, so a read that gathered from
+    all of them returns each row at weight W. The PK-keyed reads carry the
+    opposite hazard: confining one to the worker its key would hash to under
+    partitioning is correct only by accident of which copy answers."""
+    got = (scanned(client, dim, "dim") if where is None
+           else rows(client, dim, f"SELECT * FROM dim WHERE {where}"))
+    assert bag(got, "id", "cust", "val") == {r: 1 for r in _DIM if keep(*r)}
 
 
-@NEEDS_MULTI
-@pytest.mark.parametrize("where,want", [c[1:] for c in _ONE_COPY_READS],
-                         ids=[c[0] for c in _ONE_COPY_READS])
-def test_a_read_of_a_replicated_table_returns_one_copy(client, dim_indexed, where, want):
-    """Every read verb single-sources one worker's copy.
-
-    A seek, an index range and a bounded PK read all broadcast and merge; on a
-    replicated owner every worker matches, so without single-sourcing the client
-    sees each row W times. The PK-keyed reads carry the opposite hazard: worker 0
-    holds one child covering the whole table, so confining the read to the keys
-    that worker would own under partitioning drops most of the answer.
-    """
-    assert _select(client, dim_indexed, f"SELECT * FROM dim WHERE {where}") == want
-
-
-@NEEDS_MULTI
-def test_a_scan_of_a_replicated_table_returns_one_copy(client, schema_name):
-    """The unbounded read, weight-exact: five rows at weight 1, not W."""
-    client.execute_sql(
-        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, name BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "INSERT INTO dim VALUES (1,100),(2,200),(3,300),(4,400),(5,500)",
-        schema_name=schema_name)
-    tid, _ = client.resolve_table(schema_name, "dim")
-    assert bag(client.scan(tid), "id", "name") == {
-        (i, i * 100): 1 for i in range(1, 6)}
-
-
-@NEEDS_MULTI
 @pytest.mark.parametrize("options", ["replicated = true", "stream = true, replicated = true"],
                          ids=["table", "stream"])
-def test_an_aggregate_over_a_replicated_source_is_not_w_folded(client, schema_name, options):
-    """A reduce over a replicated input must not shard.
+def test_an_aggregate_over_a_replicated_source_counts_one_copy(client, schema_name, options):
+    """Every worker reduces its own whole copy, so a reduce that exchanged or
+    combined across workers would multiply COUNT and SUM by W, and a global
+    aggregate over the empty source would ground once per worker instead of once.
+    A replicated stream holds no copy to read but must be placed the same way."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
+        f"amount BIGINT NOT NULL) WITH ({options}); "
+        "CREATE VIEW per_grp AS SELECT grp, COUNT(*) AS cnt, SUM(amount) AS total "
+        "FROM src GROUP BY grp; "
+        "CREATE VIEW overall AS SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM src",
+        schema_name=sn)
 
-    A sharded reduce would fold each of the W copies in, multiplying COUNT and
-    SUM by the worker count; the planner builds the shard-free local reduce and
-    the replicated output is single-sourced on read. The two groups carry
-    different totals, so swapping them fails too. A replicated stream must be
-    known as replicated just the same, though it holds no copy to read.
-    """
-    client.execute_sql(
-        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
-        f"amount BIGINT NOT NULL) WITH ({options})", schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT grp, COUNT(*) AS cnt, SUM(amount) AS total "
-        "FROM dim GROUP BY grp", schema_name=schema_name)
-    client.execute_sql(
-        "INSERT INTO dim VALUES (1, 10, 100), (2, 10, 200), (3, 20, 350)",
-        schema_name=schema_name)
-
-    vid, _ = client.resolve_table(schema_name, "v")
-    assert bag(client.scan(vid), "grp", "cnt", "total") == {(10, 2, 300): 1, (20, 1, 350): 1}
-
-
-@NEEDS_MULTI
-def test_a_replicated_source_grounds_exactly_once(client, schema_name):
-    """A global aggregate's ground row is where a backfill over an *empty*
-    replicated source can go wrong in both directions: drop the owner disjunct
-    and it emits none, forget the disjunct is exclusive and it emits one per
-    worker. The linear view alongside is the control — the same empty backfill
-    must produce no row at all there."""
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW f AS SELECT pk, a * 2 AS d FROM t WHERE a > 0", schema_name=schema_name)
-    vid, _ = client.resolve_table(schema_name, "v")
-    fid, _ = client.resolve_table(schema_name, "f")
-
-    assert bag(client.scan(vid), "cnt", "total") == {(0, None): 1}, "empty"
-    assert bag(client.scan(fid), "pk", "d") == {}, "empty"
-    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=schema_name)
-    assert bag(client.scan(vid), "cnt", "total") == {(2, 12): 1}, "filled"
-    assert bag(client.scan(fid), "pk", "d") == {(1, 10): 1, (2, 14): 1}, "filled"
+    assert bag(scanned(client, sn, "per_grp"), "grp", "cnt", "total") == {}
+    assert bag(scanned(client, sn, "overall"), "cnt", "total") == {(0, None): 1}
+    client.execute_sql("INSERT INTO src VALUES (1, 10, 100), (2, 10, 200), (3, 20, 350)",
+                       schema_name=sn)
+    assert bag(scanned(client, sn, "per_grp"), "grp", "cnt", "total") == {
+        (10, 2, 300): 1, (20, 1, 350): 1}
+    assert bag(scanned(client, sn, "overall"), "cnt", "total") == {(3, 650): 1}
 
 
 # ── Writes reach every copy ──────────────────────────────────────────────────
 
-_NFACT = 40
-_DIMS = {i: i * 100 for i in range(1, 5)}
+# fact id -> (dim id, dim2 id)
+_FACTS = {i: (i % 4 + 1, i % 2 + 1) for i in range(1, 41)}
 
 
-def _fact_dim(i):
-    """The dim row fact `i` references."""
-    return (i % 4) + 1
+def test_every_write_reaches_every_copy(client, schema_name):
+    """Replicated `dim` and `dim2`, a partitioned `fact`, and the star
+    `(fact ⋈ dim) ⋈ dim2` over them, checked after every write.
 
+    A scan of a replicated table is served by one worker, whose copy is fine even
+    when another's is not; the joins are the observable, because facts spread
+    over every worker and each joins against its own worker's copy. The dims
+    arrive in two rounds, so dims 3 and 4 re-join facts already in the trace, and
+    every half of a write — an UPDATE's retraction and insertion, a DELETE, a raw
+    push's upsert — must land on every copy exactly once.
 
-def _joined(dim_state):
-    """The join's expected weight-multiset given the dim rows still live."""
-    return {(i, dim_state[_fact_dim(i)]): 1
-            for i in range(1, _NFACT + 1) if _fact_dim(i) in dim_state}
-
-
-@pytest.fixture
-def dim_fact_join(client, schema_name):
-    """A replicated `dim`, a partitioned `fact`, and the join over them — DDL only.
-
-    The join is the observable, because a scan of the replicated table alone is
-    single-sourced to one worker whose copy is fine even when another worker's is
-    not. Facts spread over every worker by their own PK and the join runs locally
-    against each worker's copy, so a copy that missed a write shows up as missing
-    or mis-valued join rows.
+    `j` is keyed by its join key, the dim id, but its rows sit on their fact's
+    worker, so a seek of it must gather from every worker.
     """
+    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE dim (dim_id BIGINT NOT NULL PRIMARY KEY, name BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE fact (fact_id BIGINT NOT NULL PRIMARY KEY, dim_ref BIGINT NOT NULL)",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW j AS SELECT fact.fact_id AS fid, dim.name AS nm "
-        "FROM fact JOIN dim ON fact.dim_ref = dim.dim_id", schema_name=schema_name)
-    return (schema_name,
-            client.resolve_table(schema_name, "dim")[0],
-            client.resolve_table(schema_name, "j")[0])
+        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, nm BIGINT NOT NULL)" + _REPL + "; "
+        "CREATE TABLE dim2 (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)" + _REPL + "; "
+        "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, r1 BIGINT NOT NULL, "
+        "r2 BIGINT NOT NULL); "
+        "CREATE VIEW j AS SELECT fact.id AS fid, fact.r2 AS r2, dim.nm AS nm "
+        "FROM fact JOIN dim ON fact.r1 = dim.id; "
+        "CREATE VIEW star AS SELECT j.fid AS fid, j.nm AS nm, dim2.b AS b "
+        "FROM j JOIN dim2 ON j.r2 = dim2.id", schema_name=sn)
+    dim_id, dim_schema = client.resolve_table(sn, "dim")
+    jid = client.resolve_table(sn, "j")[0]
+
+    # (statement, table, changes); a `None` statement pushes the changes raw.
+    steps = [
+        ("INSERT INTO dim2 VALUES (1, 1000), (2, 2000)", "dim2", {1: 1000, 2: 2000}),
+        ("INSERT INTO dim VALUES (1, 100), (2, 200)", "dim", {1: 100, 2: 200}),
+        (f"INSERT INTO fact VALUES {values((i, *r) for i, r in _FACTS.items())}",
+         "fact", _FACTS),
+        ("INSERT INTO dim VALUES (3, 300), (4, 400)", "dim", {3: 300, 4: 400}),
+        ("UPDATE dim SET nm = 999 WHERE id = 2", "dim", {2: 999}),
+        ("DELETE FROM dim WHERE id = 3", "dim", {3: None}),
+        (None, "dim", {1: 555}),
+        ("DELETE FROM dim2 WHERE id = 1", "dim2", {1: None}),
+    ]
+    state = {"dim": {}, "dim2": {}, "fact": {}}
+    for sql, table, changes in steps:
+        if sql is None:
+            batch = gnitz.ZSetBatch(dim_schema)
+            for pk, nm in changes.items():
+                batch.append(id=pk, nm=nm)
+            client.push(dim_id, batch)
+        else:
+            client.execute_sql(sql, schema_name=sn)
+        _apply(state[table], changes)
+        dims, dims2 = state["dim"], state["dim2"]
+
+        # joined row -> the dim id it joined on, the key `j` is sought by
+        joined = {(f, r2, dims[r1]): r1 for f, (r1, r2) in state["fact"].items() if r1 in dims}
+        assert bag(scanned(client, sn, "dim"), "id", "nm") == dict.fromkeys(dims.items(), 1), sql
+        assert bag(scanned(client, sn, "j"), "fid", "r2", "nm") == dict.fromkeys(joined, 1), sql
+        assert bag(scanned(client, sn, "star"), "fid", "nm", "b") == {
+            (f, nm, dims2[r2]): 1 for f, r2, nm in joined if r2 in dims2}, sql
+        for k in range(1, 5):
+            assert bag(client.seek(jid, pk=k), "fid", "r2", "nm") == {
+                row: 1 for row, r1 in joined.items() if r1 == k}, (sql, k)
 
 
-def _insert_facts(client, sn):
-    client.execute_sql(
-        "INSERT INTO fact VALUES " + ", ".join(
-            f"({i}, {_fact_dim(i)})" for i in range(1, _NFACT + 1)), schema_name=sn)
+# ── Every shape over every replicated placement ──────────────────────────────
+
+_SETOPS = {"ua": "UNION ALL", "u": "UNION", "ia": "INTERSECT ALL", "i": "INTERSECT",
+           "ea": "EXCEPT ALL", "e": "EXCEPT"}
+_PAIR = "SELECT a.pk AS l, b.pk AS r FROM a"
+
+# view -> (columns read back, body)
+_VIEWS = {
+    **{n: (("k", "x"), f"SELECT k, x FROM a {op} SELECT k, y FROM b") for n, op in _SETOPS.items()},
+    "dist": (("k",), "SELECT DISTINCT k FROM a"),
+    "twice": (("k", "x"), "SELECT k, x FROM a UNION ALL SELECT k, x FROM a"),
+    "eq": (("l", "r"), f"{_PAIR} JOIN b ON a.k = b.k"),
+    "eq_left": (("l", "r"), f"{_PAIR} LEFT JOIN b ON a.k = b.k"),
+    "band": (("l", "r"), f"{_PAIR} JOIN b ON a.k = b.k AND a.x <= b.y"),
+    "band_left": (("l", "r"), f"{_PAIR} LEFT JOIN b ON a.k = b.k AND a.x <= b.y"),
+    "rng": (("l", "r"), f"{_PAIR} JOIN b ON a.x < b.y"),
+    "rng_left": (("l", "r"), f"{_PAIR} LEFT JOIN b ON a.x < b.y"),
+    "product": (("l", "r"), "SELECT a.pk AS l, b.pk AS r FROM a, b"),
+    "exists_lt": (("pk",), "SELECT pk FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y < a.x)"),
+    "not_exists_lt": (("pk",),
+                      "SELECT pk FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.y < a.x)"),
+    "in_b": (("pk",), "SELECT pk FROM a WHERE k IN (SELECT k FROM b)"),
+    "not_in_b": (("pk",), "SELECT pk FROM a WHERE k NOT IN (SELECT k FROM b)"),
+    "per_k": (("k", "n"), "SELECT k, COUNT(*) AS n FROM ua GROUP BY k"),
+    "c_and_ua": (("k", "x"), "SELECT k, x FROM c UNION ALL SELECT k, x FROM ua"),
+}
+
+# (k, x) rows of `a` repeat, some of them also in `b`, and `x` is sometimes
+# NULL; `c` is always partitioned.
+_A = {p: (p % 4, None if p % 7 == 0 else p % 6) for p in range(1, 17)}
+_B = {p: (p % 3, p % 5) for p in range(1, 13)}
+_C = {p: (p % 4, p % 6) for p in range(1, 7)}
+
+# (statement, table, changes)
+_CHURN = [
+    (f"INSERT INTO b VALUES {values((p, *r) for p, r in _B.items())}", "b", _B),
+    (f"INSERT INTO c VALUES {values((p, *r) for p, r in _C.items())}", "c", _C),
+    (f"INSERT INTO a VALUES {values((p, *r) for p, r in _A.items())}", "a", _A),
+    ("DELETE FROM a WHERE pk IN (5, 10, 15)", "a", dict.fromkeys((5, 10, 15))),
+    ("UPDATE b SET y = y + 3 WHERE pk IN (1, 5, 9)",
+     "b", {p: (_B[p][0], _B[p][1] + 3) for p in (1, 5, 9)}),
+    ("DELETE FROM b WHERE pk > 8", "b", dict.fromkeys(range(9, 13))),
+]
 
 
-@NEEDS_MULTI
-@pytest.mark.parametrize("mutation,dim_after", [
-    ("DELETE FROM dim WHERE dim_id = 3", {k: v for k, v in _DIMS.items() if k != 3}),
-    ("UPDATE dim SET name = 999 WHERE dim_id = 2", {**_DIMS, 2: 999}),
-], ids=["delete", "update"])
-def test_a_mutation_reaches_every_copy(client, dim_fact_join, mutation, dim_after):
-    """Both halves of a write broadcast to every worker's copy.
-
-    A DELETE is a retraction and an UPDATE is a retraction plus an insertion; a
-    copy that missed either half keeps joining the stale row. The join is checked
-    weight-exact, so a retraction applied twice — or to no copy at all — fails
-    where a comparison of the surviving fact ids would not.
-    """
-    sn, tid, jid = dim_fact_join
-    client.execute_sql(
-        "INSERT INTO dim VALUES " + ", ".join(f"({k}, {v})" for k, v in _DIMS.items()),
-        schema_name=sn)
-    _insert_facts(client, sn)
-
-    client.execute_sql(mutation, schema_name=sn)
-
-    assert bag(client.scan(tid), "dim_id", "name") == {
-        (k, v): 1 for k, v in dim_after.items()}
-    assert bag(client.scan(jid), "fid", "nm") == _joined(dim_after)
+def _lt(l, r):
+    return l is not None and r is not None and l < r
 
 
-@NEEDS_MULTI
-def test_a_late_dim_delta_rejoins_the_waiting_facts(client, dim_fact_join):
-    """A dim row arriving after the facts must broadcast and re-join on EVERY
-    worker — the symmetric DBSP term (dim delta ⋈ fact trace) realized against
-    each worker's own copy. Facts whose dim is absent produce nothing until it
-    lands; once it does, every such fact gains its row exactly once, wherever it
-    happens to live.
-    """
-    sn, _, jid = dim_fact_join
-    early = {k: v for k, v in _DIMS.items() if k in (1, 2)}
-    client.execute_sql(
-        "INSERT INTO dim VALUES " + ", ".join(f"({k}, {v})" for k, v in early.items()),
-        schema_name=sn)
-    _insert_facts(client, sn)
-    assert bag(client.scan(jid), "fid", "nm") == _joined(early), "before the late dim"
+def _want(a, b, c):
+    """Every view of `_VIEWS` over the rows `a`, `b`, `c` as `{pk: (k, x)}`."""
+    ca, cb = Counter(a.values()), Counter(b.values())
 
-    client.execute_sql(
-        "INSERT INTO dim VALUES " + ", ".join(
-            f"({k}, {v})" for k, v in _DIMS.items() if k not in early), schema_name=sn)
-    assert bag(client.scan(jid), "fid", "nm") == _joined(_DIMS), "after the late dim"
+    def pairs(on):
+        return {(l, r): 1 for l, (ak, x) in a.items() for r, (bk, y) in b.items()
+                if on(ak, x, bk, y)}
 
+    def left(on):
+        matched = pairs(on)
+        return {**matched, **{(l, None): 1 for l in a if not any(m[0] == l for m in matched)}}
 
-@NEEDS_MULTI
-def test_an_upsert_replaces_the_row_on_every_copy(client, schema_name):
-    """A raw push is an upsert: the second push of a key replaces the payload
-    once per copy, so the copies stay identical and the read still sees one row.
-    """
-    client.execute_sql(
-        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, name BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    tid, schema = client.resolve_table(schema_name, "dim")
-    for name in (100, 200):
-        batch = gnitz.ZSetBatch(schema)
-        batch.append(id=1, name=name)
-        client.push(tid, batch)
+    def where(keep):
+        return {(p,): 1 for p, (k, x) in a.items() if keep(k, x)}
 
-    assert bag(client.scan(tid), "id", "name") == {(1, 200): 1}
+    def band(ak, x, bk, y):
+        return ak == bk and x is not None and x <= y
 
+    def rng(ak, x, bk, y):
+        return _lt(x, y)
 
-# ── Joins: a replicated side is local on every worker ────────────────────────
-
-@NEEDS_MULTI
-def test_a_star_join_of_two_replicated_dims_stays_local(client, schema_name):
-    """One partitioned fact joined to two replicated dims, as the nested pair
-    gnitz builds (one JOIN per view). The inner view is partitioned by the fact's
-    own distribution; joining that to a second replicated dim is local again, and
-    neither hop may duplicate a row.
-    """
-    client.execute_sql(
-        "CREATE TABLE d1 (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE d2 (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY, r1 BIGINT NOT NULL, "
-        "r2 BIGINT NOT NULL)", schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW j1 AS SELECT fact.fid AS fid, fact.r2 AS r2, d1.a AS a "
-        "FROM fact JOIN d1 ON fact.r1 = d1.id", schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW j AS SELECT j1.fid AS fid, j1.a AS a, d2.b AS b "
-        "FROM j1 JOIN d2 ON j1.r2 = d2.id", schema_name=schema_name)
-
-    client.execute_sql("INSERT INTO d1 VALUES (1, 11), (2, 22)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO d2 VALUES (1, 1000), (2, 2000)", schema_name=schema_name)
-    client.execute_sql(
-        "INSERT INTO fact VALUES " + ", ".join(
-            f"({i}, {(i % 2) + 1}, {((i + 1) % 2) + 1})" for i in range(1, 33)),
-        schema_name=schema_name)
-
-    jid, _ = client.resolve_table(schema_name, "j")
-    assert bag(client.scan(jid), "fid", "a", "b") == {
-        (i, ((i % 2) + 1) * 11, (((i + 1) % 2) + 1) * 1000): 1 for i in range(1, 33)}
-
-
-@NEEDS_MULTI
-def test_a_join_of_two_replicated_tables_reads_one_copy(client, schema_name):
-    """A view over two replicated sources is itself replicated — every worker
-    computes the whole join — so its read must single-source like a table's."""
-    client.execute_sql(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW j AS SELECT a.id AS id, a.x AS x, b.y AS y "
-        "FROM a JOIN b ON a.id = b.id", schema_name=schema_name)
-    client.execute_sql("INSERT INTO a VALUES (1,10),(2,20),(3,30)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO b VALUES (1,11),(2,22),(3,33)", schema_name=schema_name)
-
-    jid, _ = client.resolve_table(schema_name, "j")
-    assert bag(client.scan(jid), "id", "x", "y") == {(1, 10, 11): 1, (2, 20, 22): 1, (3, 30, 33): 1}
-
-
-# ── Exchange-shaped views whose sources are all replicated ───────────────────
-#
-# A view over only replicated sources is read from one worker, but the set-op,
-# DISTINCT and range/band-join circuits scatter their output across every worker.
-# At more than one worker that silently drops the rows whose hash missed the
-# reading worker's partition and inflates the survivors (broadcast in × scatter
-# out). Every case below is weight-exact for that reason.
-
-
-def _mk_repl_ab(client, sn, a_extra="val BIGINT NOT NULL", b_extra="val BIGINT NOT NULL"):
-    """Two replicated single-PK tables `a`/`b` for the set-op and join cases."""
-    client.execute_sql(
-        f"CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, {a_extra})" + _REPL, schema_name=sn)
-    client.execute_sql(
-        f"CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, {b_extra})" + _REPL, schema_name=sn)
-
-
-@NEEDS_MULTI
-def test_replicated_set_ops_keep_their_weights(client, schema_name):
-    """Every set-op spelling over one pair of replicated tables.
-
-    `a` and `b` overlap on two rows, so UNION ALL carries them at weight 2 where
-    UNION DISTINCT clamps to 1. INTERSECT and EXCEPT coincide between their ALL
-    and DISTINCT forms here — each row is unique per source — but compile to
-    different clamp circuits, so both are exercised. The scatter bug drops rows
-    and inflates weights, and both show up here.
-    """
-    _mk_repl_ab(client, schema_name)
-    bodies = {
-        "v_all": "SELECT * FROM a UNION ALL SELECT * FROM b",
-        "v_dist": "SELECT * FROM a UNION SELECT * FROM b",
-        "v_int": "SELECT * FROM a INTERSECT SELECT * FROM b",
-        "v_int_all": "SELECT * FROM a INTERSECT ALL SELECT * FROM b",
-        "v_exc": "SELECT * FROM a EXCEPT SELECT * FROM b",
-        "v_exc_all": "SELECT * FROM a EXCEPT ALL SELECT * FROM b",
+    b_keys = {bk for bk, _ in b.values()}
+    return {
+        "ua": ca + cb, "u": dict.fromkeys(ca | cb, 1),
+        "ia": ca & cb, "i": dict.fromkeys(ca & cb, 1),
+        "ea": ca - cb, "e": dict.fromkeys(ca.keys() - cb.keys(), 1),
+        "dist": dict.fromkeys(((k,) for k, _ in a.values()), 1),
+        "twice": ca + ca,
+        "eq": pairs(lambda ak, x, bk, y: ak == bk),
+        "eq_left": left(lambda ak, x, bk, y: ak == bk),
+        "band": pairs(band), "band_left": left(band),
+        "rng": pairs(rng), "rng_left": left(rng),
+        "product": pairs(lambda *_: True),
+        "exists_lt": where(lambda k, x: any(_lt(y, x) for _, y in b.values())),
+        "not_exists_lt": where(lambda k, x: not any(_lt(y, x) for _, y in b.values())),
+        "in_b": where(lambda k, x: k in b_keys),
+        "not_in_b": where(lambda k, x: k not in b_keys),
+        "per_k": dict.fromkeys(Counter(k for k, _ in (ca + cb).elements()).items(), 1),
+        "c_and_ua": Counter(c.values()) + ca + cb,
     }
-    for name, body in bodies.items():
-        client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=schema_name)
-    client.execute_sql("INSERT INTO a VALUES (1,10),(2,20),(3,30),(4,40)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO b VALUES (3,30),(4,40),(5,50),(6,60)", schema_name=schema_name)
-
-    every = {(1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1, (5, 50): 1, (6, 60): 1}
-    want = {
-        "v_all": {**every, (3, 30): 2, (4, 40): 2},
-        "v_dist": every,
-        "v_int": {(3, 30): 1, (4, 40): 1},
-        "v_int_all": {(3, 30): 1, (4, 40): 1},
-        "v_exc": {(1, 10): 1, (2, 20): 1},
-        "v_exc_all": {(1, 10): 1, (2, 20): 1},
-    }
-    for name, expected in want.items():
-        vid, _ = client.resolve_table(schema_name, name)
-        assert bag(client.scan(vid), "pk", "val") == expected, name
 
 
-@NEEDS_MULTI
-def test_replicated_distinct_and_self_union(client, schema_name):
-    """DISTINCT over one replicated source, and `s UNION ALL s` over another.
+@pytest.mark.parametrize("a_repl,b_repl", [(True, True), (False, True), (True, False)],
+                         ids=["both-replicated", "b-replicated", "a-replicated"])
+def test_every_shape_keeps_its_weights_over_replicated_sources(client, schema_name,
+                                                               a_repl, b_repl):
+    """Each view equals its Z-set definition after every epoch, whichever of its
+    sources are replicated.
 
-    DISTINCT keys its output by a content hash, which scatters it — under the bug
-    the reading worker keeps only its hash slice and distinct values vanish. The
-    self-union is the companion: identical rows must come out at weight 2
-    (branch-id disambiguated), not 2×W, which pins that the local path does not
-    itself inflate the broadcast delta.
+    A view over only replicated sources is itself replicated: every worker
+    computes all of it and the read is served by one, so a set-op, DISTINCT or
+    range-join circuit that still scattered its output would lose the rows hashed
+    away from that worker and inflate the rest. A mixed view does exchange, and
+    relaying the replicated side's delta from every worker instead of one would
+    put W copies of each of its rows in the join trace or the union, where
+    consolidation sums them into one row at weight W. A replicated preserved side
+    of an outer, semi or anti join cannot stay local against a partitioned
+    partner either: every worker would clamp its whole copy against its own slice
+    of the partner, null-filling or keeping a row once per worker. `c_and_ua`
+    unions a partitioned table with `ua`, which is replicated when both its
+    sources are.
     """
+    sn = schema_name
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql("CREATE VIEW v_dist AS SELECT DISTINCT val FROM t", schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW v_self AS SELECT * FROM t UNION ALL SELECT * FROM t",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO t VALUES (1,5),(2,5),(3,7),(4,7),(5,9)",
-                       schema_name=schema_name)
-
-    assert bag(scanned(client, schema_name, "v_dist"), "val") == {(5,): 1, (7,): 1, (9,): 1}
-    assert bag(scanned(client, schema_name, "v_self"), "id", "val") == {
-        (1, 5): 2, (2, 5): 2, (3, 7): 2, (4, 7): 2, (5, 9): 2}
-
-
-@NEEDS_MULTI
-def test_replicated_band_join_inner_and_left(client, schema_name):
-    """Band join (`a.k = b.k AND a.lo <= b.t`, one equality) over two replicated
-    tables, INNER and LEFT. Band output rides the mandatory output exchange, so
-    the scatter bug drops pairs and inflates the rest. `a4` matches nothing, so
-    LEFT null-fills it.
-    """
-    _mk_repl_ab(client, schema_name,
-                a_extra="k BIGINT NOT NULL, lo BIGINT NOT NULL",
-                b_extra="k BIGINT NOT NULL, t BIGINT NOT NULL")
-    client.execute_sql(
-        "CREATE VIEW vin AS SELECT a.pk AS aid, b.pk AS bid "
-        "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW vleft AS SELECT a.pk AS aid, b.pk AS bid "
-        "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=schema_name)
-    client.execute_sql("INSERT INTO a VALUES (1,1,10),(2,1,50),(3,2,5),(4,3,1)",
-                       schema_name=schema_name)
-    client.execute_sql("INSERT INTO b VALUES (1,1,40),(2,1,60),(3,2,100)",
-                       schema_name=schema_name)
-
-    # a1(lo10): b1(t40), b2(t60); a2(lo50): b2(t60); a3(k2, lo5): b3(t100).
-    matched = {(1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1}
-    assert bag(scanned(client, schema_name, "vin"), "aid", "bid") == matched, "inner"
-    assert bag(scanned(client, schema_name, "vleft"), "aid", "bid") == {**matched, (4, None): 1}
-
-
-@NEEDS_MULTI
-def test_replicated_pure_range_join_inner_and_left(client, schema_name):
-    """Pure-range join (`a.x < b.y`, no equality) over two replicated tables.
-
-    A broadcast input is normally trimmed to the owning worker's slice by a
-    worker filter; under an all-replicated local run that filter must be absent
-    or it discards rows. The LEFT side carries a NULL range key, which exercises
-    the separate NULL branch and its own filter.
-    """
-    client.execute_sql(
-        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW vin AS SELECT a.pk AS aid, b.pk AS bid FROM a JOIN b ON a.x < b.y",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW vleft AS SELECT a.pk AS aid, b.pk AS bid FROM a LEFT JOIN b ON a.x < b.y",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO a VALUES (1,10),(2,30),(3,50),(4,NULL)",
-                       schema_name=schema_name)
-    client.execute_sql("INSERT INTO b VALUES (1,20),(2,40)", schema_name=schema_name)
-
-    # a1(10) < 20 and < 40; a2(30) < 40; a3(50) exceeds every y; a4 is NULL.
-    matched = {(1, 1): 1, (1, 2): 1, (2, 2): 1}
-    assert bag(scanned(client, schema_name, "vin"), "aid", "bid") == matched, "inner"
-    assert bag(scanned(client, schema_name, "vleft"), "aid", "bid") == {
-        **matched, (3, None): 1, (4, None): 1}
-
-
-@NEEDS_MULTI
-def test_replicated_keyless_join_sides(client, schema_name):
-    """The keyless (cross) product with a replicated side. Its delta relays
-    single-sourced and the trace filter partitions it like a keyed side, so the
-    product carries no W× duplication — for one replicated side, and for two,
-    where the view itself is replicated and runs correct-local."""
-    for name in ("r", "r2"):
-        client.execute_sql(
-            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)" + _REPL,
-            schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE k (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=schema_name)
-    for name, body in (("rk", "SELECT r.id AS a, k.id AS b FROM r CROSS JOIN k"),
-                       ("kr", "SELECT k.id AS a, r.id AS b FROM k CROSS JOIN r"),
-                       ("rr", "SELECT r.id AS a, r2.id AS b FROM r, r2")):
-        client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=schema_name)
-    ids_r, ids_r2, ids_k = list(range(1, 6)), list(range(50, 53)), list(range(10, 17))
-    for name, ids in (("r", ids_r), ("r2", ids_r2), ("k", ids_k)):
-        client.execute_sql(
-            f"INSERT INTO {name} VALUES " + ",".join(f"({i},0)" for i in ids),
-            schema_name=schema_name)
-
-    def check(ctx, ids_r):
-        for name, left, right in (("rk", ids_r, ids_k), ("kr", ids_k, ids_r),
-                                  ("rr", ids_r, ids_r2)):
-            assert bag(scanned(client, schema_name, name), "a", "b") == {
-                (x, y): 1 for x in left for y in right}, f"{name} {ctx}"
-
-    check("initial", ids_r)
-    client.execute_sql("DELETE FROM r WHERE id = 3", schema_name=schema_name)
-    check("after delete", [i for i in ids_r if i != 3])
-
-
-@NEEDS_MULTI
-def test_replicated_subquery_predicates(client, schema_name):
-    """Pure-range EXISTS/NOT EXISTS and an equi `IN`, all over replicated pairs.
-
-    The range pair lowers to a MIN threshold and carries the same broadcast-trim
-    filters as the pure-range LEFT join, with a NULL outer key exercising the
-    NOT EXISTS null branch. The equi `IN` is already local through the join-shard
-    co-partition skip; it pins that the all-replicated short-circuit keeps the
-    semi-join emitting each outer row once, at weight 1.
-    """
-    client.execute_sql(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT, k BIGINT NOT NULL, "
-        "v BIGINT NOT NULL)" + _REPL, schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, "
-        "k BIGINT NOT NULL)" + _REPL, schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW semi AS SELECT v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y < a.x)",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW anti AS SELECT v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.y < a.x)",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW inlist AS SELECT v FROM a WHERE k IN (SELECT k FROM b)",
-        schema_name=schema_name)
-
-    # MIN(b.y) = 15, and b holds k in {1, 3}.
-    client.execute_sql(
-        "INSERT INTO a VALUES (1,10,1,100),(2,20,2,200),(3,5,3,300),(4,NULL,1,400)",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO b VALUES (1,15,1),(2,15,3)", schema_name=schema_name)
-
-    assert bag(scanned(client, schema_name, "semi"), "v") == {(200,): 1}, "exists"
-    assert bag(scanned(client, schema_name, "anti"), "v") == {(100,): 1, (300,): 1, (400,): 1}
-    assert bag(scanned(client, schema_name, "inlist"), "v") == {(100,): 1, (300,): 1, (400,): 1}
-
-
-# ── Mixed views: one replicated source and one partitioned source ────────────
-#
-# A mixed view is neither read single-sourced nor run under the all-replicated
-# local intercept: its circuit really does exchange. The replicated side's delta
-# is identical on every worker, so relaying all W payloads routes each of its
-# rows to the hash owner W times and consolidation sums the byte-identical
-# entries into one row at weight W. The relay must take exactly one worker's
-# payload for a replicated source — the same single-sourcing the read applies.
-#
-# Under the bug the row set is right and only the weights are wrong, so every
-# case here is weight-exact.
-
-
-def _mk_mixed(client, sn, fact_extra="val BIGINT NOT NULL", dim_extra="val BIGINT NOT NULL"):
-    """One partitioned `fact` and one replicated `dim`."""
-    client.execute_sql(
-        f"CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, {fact_extra})", schema_name=sn)
-    client.execute_sql(
-        f"CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, {dim_extra})" + _REPL,
+        f"CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT)"
+        f"{_REPL if a_repl else ''}; "
+        f"CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, y BIGINT NOT NULL)"
+        f"{_REPL if b_repl else ''}; "
+        "CREATE TABLE c (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT); "
+        + "; ".join(f"CREATE VIEW {n} AS {body}" for n, (_, body) in _VIEWS.items()),
         schema_name=sn)
 
-
-@NEEDS_MULTI
-def test_mixed_union_all_weights_reach_a_downstream_aggregate(client, schema_name):
-    """`fact UNION ALL dim`, and a GROUP BY over it.
-
-    The union's own rows must all weigh 1 — the dim rows come out at W without
-    the relay collapse. The aggregate is what makes that escape into a
-    user-visible column: COUNT(*) would report W for a group holding one row.
-    """
-    _mk_mixed(client, schema_name)
-    client.execute_sql(
-        "CREATE VIEW u AS SELECT * FROM fact UNION ALL SELECT * FROM dim",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW g AS SELECT val, COUNT(*) AS cnt FROM u GROUP BY val",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO fact VALUES (1,10),(2,20)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO dim VALUES (3,30),(4,40)", schema_name=schema_name)
-
-    assert bag(scanned(client, schema_name, "u"), "pk", "val") == {
-        (1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1}
-    assert bag(scanned(client, schema_name, "g"), "val", "cnt") == {
-        (10, 1): 1, (20, 1): 1, (30, 1): 1, (40, 1): 1}
-
-
-@NEEDS_MULTI
-def test_mixed_except_all_with_the_replicated_side_on_the_left(client, schema_name):
-    """`dim EXCEPT ALL fact` with the replicated side on the left.
-
-    The shared row must cancel to nothing. At weight W on the left it would
-    survive at W−1; the mirror orientation cancels either way, since
-    `positive_part(1 − W) = 0`, so this is the orientation that pins the left
-    side's weight.
-    """
-    _mk_mixed(client, schema_name)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT * FROM dim EXCEPT ALL SELECT * FROM fact",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO dim VALUES (1,10),(2,20),(3,30)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO fact VALUES (3,30),(4,40)", schema_name=schema_name)
-
-    vid, _ = client.resolve_table(schema_name, "v")
-    assert bag(client.scan(vid), "pk", "val") == {(1, 10): 1, (2, 20): 1}
-
-
-@NEEDS_MULTI
-def test_mixed_band_join_weights(client, schema_name):
-    """Mixed band join (`f.k = d.k AND f.lo <= d.t`, one equality).
-
-    The join relays its raw INPUT delta and scatters it by the equality prefix,
-    so a replicated input relayed W times integrates into the trace W times and
-    EVERY output row — not only the replicated branch's — comes out at weight W.
-    """
-    _mk_mixed(client, schema_name,
-              fact_extra="k BIGINT NOT NULL, lo BIGINT NOT NULL",
-              dim_extra="k BIGINT NOT NULL, t BIGINT NOT NULL")
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT fact.pk AS fid, dim.pk AS did "
-        "FROM fact JOIN dim ON fact.k = dim.k AND fact.lo <= dim.t", schema_name=schema_name)
-    client.execute_sql("INSERT INTO fact VALUES (1,1,10),(2,1,50),(3,2,5),(4,3,1)",
-                       schema_name=schema_name)
-    client.execute_sql("INSERT INTO dim VALUES (1,1,40),(2,1,60),(3,2,100)",
-                       schema_name=schema_name)
-
-    # f1(lo10): d1(t40), d2(t60); f2(lo50): d2(t60); f3(k2, lo5): d3(t100); f4: none.
-    vid, _ = client.resolve_table(schema_name, "v")
-    assert bag(client.scan(vid), "fid", "did") == {(1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1}
-
-
-@NEEDS_MULTI
-def test_mixed_pure_range_left_join_weights(client, schema_name):
-    """Mixed pure-range LEFT join (`f.x < d.y`, no equality) — the input relay's
-    other destination arm, a broadcast rather than an equality-prefix scatter,
-    plus the null-fill pipeline. Matched rows weigh 1; the null-filled rows ride
-    the replicated threshold reduce and weigh 1 either way, so they pin that the
-    collapse disturbs nothing.
-    """
-    _mk_mixed(client, schema_name, fact_extra="x BIGINT", dim_extra="y BIGINT NOT NULL")
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT fact.pk AS fid, dim.pk AS did "
-        "FROM fact LEFT JOIN dim ON fact.x < dim.y", schema_name=schema_name)
-    client.execute_sql("INSERT INTO fact VALUES (1,10),(2,30),(3,50),(4,NULL)",
-                       schema_name=schema_name)
-    client.execute_sql("INSERT INTO dim VALUES (1,20),(2,40)", schema_name=schema_name)
-
-    vid, _ = client.resolve_table(schema_name, "v")
-    assert bag(client.scan(vid), "fid", "did") == {
-        (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, None): 1, (4, None): 1}
-
-
-@NEEDS_MULTI
-def test_mixed_union_all_over_a_replicated_view_keeps_multiplicity(client, schema_name):
-    """The replicated property is transitive, so a view over only replicated
-    sources is itself replicated and its relay must collapse too. The overlapping
-    row carries a genuine weight of 2 — the one case here above 1 — which pins
-    that the collapse drops duplicate payloads rather than clamping weights.
-    """
-    _mk_mixed(client, schema_name)
-    client.execute_sql(
-        "CREATE TABLE dim2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW rv AS SELECT * FROM dim UNION ALL SELECT * FROM dim2",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT * FROM fact UNION ALL SELECT * FROM rv",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO fact VALUES (5,50)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO dim VALUES (1,10),(2,20)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO dim2 VALUES (2,20),(3,30)", schema_name=schema_name)
-
-    vid, _ = client.resolve_table(schema_name, "v")
-    assert bag(client.scan(vid), "pk", "val") == {(5, 50): 1, (1, 10): 1, (2, 20): 2, (3, 30): 1}
-
-
-@NEEDS_MULTI
-def test_a_bounded_read_of_a_mixed_view_broadcasts(client, schema_name):
-    """A view with some — not all — replicated sources is built single-partition,
-    so its rows are not keyed by the PK hash and a bounded read of it must
-    broadcast. Confining it to one worker would answer from that worker alone and
-    come up short.
-    """
-    client.execute_sql(
-        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, name BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE fact (id BIGINT NOT NULL PRIMARY KEY, dim_id BIGINT NOT NULL, "
-        "amount BIGINT NOT NULL)", schema_name=schema_name)
-    client.execute_sql(
-        "CREATE VIEW j AS SELECT f.id AS fid, d.name AS name, f.amount AS amount "
-        "FROM fact f JOIN dim d ON f.dim_id = d.id", schema_name=schema_name)
-    client.execute_sql("INSERT INTO dim VALUES (1,100),(2,200),(3,300)", schema_name=schema_name)
-    client.execute_sql(
-        "INSERT INTO fact VALUES " + ",".join(
-            f"({i}, {i % 3 + 1}, {i * 10})" for i in range(60)), schema_name=schema_name)
-
-    res = client.execute_sql("SELECT fid, amount FROM j WHERE fid < 20",
-                             schema_name=schema_name)[0]["rows"]
-    assert sorted((r.fid, r.amount) for r in res) == [(i, i * 10) for i in range(20)]
-    res = client.execute_sql("SELECT amount FROM j WHERE fid = 47",
-                             schema_name=schema_name)[0]["rows"]
-    assert [r.amount for r in res] == [470]
-
-
-@NEEDS_MULTI
-def test_a_replicated_table_has_no_size_cap(client, schema_name):
-    """A replicated table may grow far past dimension scale.
-
-    Replication is meant for small dimensions, but no row or byte cap is
-    enforced: the cost of a large replicated copy — W× ingest, W× storage, scans
-    served by a single worker — is the user's to bound, not the engine's to
-    refuse. That is a decision, not an oversight, so it is pinned here. If a cap
-    is ever introduced this fails, and the trade gets made deliberately.
-    """
-    client.execute_sql(
-        "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)" + _REPL,
-        schema_name=schema_name)
-    tid, schema = client.resolve_table(schema_name, "dim")
-    n = 20_000
-    batch = gnitz.ZSetBatch(schema)
-    for i in range(n):
-        batch.append(id=i, v=i * 7)
-    client.push(tid, batch)
-
-    res = client.execute_sql(f"SELECT v FROM dim WHERE id = {n - 1}",
-                             schema_name=schema_name)[0]["rows"]
-    assert [r.v for r in res] == [(n - 1) * 7]
-    assert len(client.scan(tid)) == n, "every replicated row must be readable"
+    state = {"a": {}, "b": {}, "c": {}}
+    for sql, table, changes in _CHURN:
+        client.execute_sql(sql, schema_name=sn)
+        _apply(state[table], changes)
+        want = _want(state["a"], state["b"], state["c"])
+        for name, (cols, _) in _VIEWS.items():
+            assert bag(scanned(client, sn, name), *cols) == want[name], (sql, name)

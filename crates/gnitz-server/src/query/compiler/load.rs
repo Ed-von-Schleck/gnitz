@@ -246,6 +246,30 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
     (seqs, orphaned)
 }
 
+/// True iff the rows the scan at `scan_nid` emits reach anything past a `Join`
+/// only as that join's operand — forward through `Filter`, `Map` and
+/// `IntegrateTrace` alone. Any other consumer (a `Union`, a clamp, a `Reduce`,
+/// the sink) uses the delta itself rather than a join term over it.
+pub(super) fn scan_feeds_only_joins(loaded: &LoadedCircuit, scan_nid: i32) -> bool {
+    let mut queue = VecDeque::from([scan_nid]);
+    let mut visited = FxHashSet::default();
+    while let Some(cur) = queue.pop_front() {
+        if !visited.insert(cur) {
+            continue;
+        }
+        for &dst in loaded.outgoing.get(&cur).into_iter().flatten() {
+            match loaded.op(dst) {
+                gnitz_wire::OpNode::Join(_) => {}
+                gnitz_wire::OpNode::Filter(_) | gnitz_wire::OpNode::Map(_) | gnitz_wire::OpNode::IntegrateTrace => {
+                    queue.push_back(dst)
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 /// Walk back from an `ExchangeShard` (`enid`) through `Filter` nodes to the
 /// source `ScanDelta`, returning its table id — or `None` on a fan-in or any
 /// other node. `Filter` is the only operator transparent to the shard key: it is

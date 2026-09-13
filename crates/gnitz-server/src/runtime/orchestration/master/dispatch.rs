@@ -46,6 +46,48 @@ fn boot_nonce() -> u64 {
     nanos ^ ((std::process::id() as u64) << 32)
 }
 
+/// A seek's answer, in the shape its fan-out produced.
+pub(crate) enum SeekReply {
+    /// The one answering worker's reply frame, forwarded to the client verbatim.
+    Frame(W2mSlot),
+    /// Every worker's rows merged into one batch, or `None` when none matched.
+    Merged(Option<Box<Batch>>),
+}
+
+/// Merge every reply of a broadcast lookup into one batch, or `None` when no row
+/// matched. `op` names the verb in the errors.
+async fn merge_replies(
+    slots: Vec<W2mSlot>,
+    scan: &ScanDispatch,
+    reactor: &crate::runtime::reactor::Reactor,
+    op: &str,
+    expected: &SchemaDescriptor,
+) -> Result<Option<Batch>, WorkerFault> {
+    let mut acc: Option<Batch> = None;
+    let mut merged_bytes = 0usize;
+    drain_index_scan(slots, scan, reactor, op, expected, |mb, frame_len| {
+        // The merge goes back out as one frame, so it is bounded by what the
+        // client will read (`FRAME_CAP`). Σ frame bytes ≥ that merged encode
+        // size — every frame re-counts its header and the first one the schema
+        // block — so capping the sum never lets an unreadable reply through, and
+        // it bounds the master's merge heap on the way.
+        merged_bytes += frame_len;
+        if merged_bytes > crate::runtime::wire::FRAME_CAP {
+            return Err(format!(
+                "{op}: result exceeds the {} MiB reply cap",
+                crate::runtime::wire::FRAME_CAP >> 20
+            )
+            .into());
+        }
+        let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.len()));
+        a.append_mem_batch(mb);
+        Ok(())
+    })
+    .await?;
+    // The sink runs only for non-empty frames, so `Some` implies rows.
+    Ok(acc)
+}
+
 impl MasterDispatcher {
     /// `last_ephemeral_gen` seeds `note_flush_round`'s ordering check: the
     /// boot's recovered durable generation.
@@ -633,8 +675,11 @@ impl MasterDispatcher {
         self.collect_acks_and_relay("view tick drain", false)
     }
 
-    /// Point lookup: unicast to the worker owning `pk`, and hand its single
-    /// reply frame back verbatim.
+    /// Point lookup of `pk`. A key-routed relation's rows sit on the worker the
+    /// key hashes to, and a replicated one's on every worker, so one worker's
+    /// single reply frame is handed back verbatim. A `Local` relation's rows sit on
+    /// whichever worker produced them — a view key's group spans workers — so every
+    /// worker is asked and their replies are merged.
     pub(crate) async fn fan_out_seek(
         &self,
         reactor: &crate::runtime::reactor::Reactor,
@@ -642,25 +687,33 @@ impl MasterDispatcher {
         pk: u128,
         seek_pk_extra: &[u8],
         client_version: u16,
-    ) -> Result<W2mSlot, WorkerFault> {
+    ) -> Result<SeekReply, WorkerFault> {
         let num_workers = self.num_workers();
         let schema = self.schema_desc_for(target_id);
         // Decode the wire pair to the OPK bytes (width-universal), then route off
         // the distribution prefix via the shared `worker_for_pk`. A Seek
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
-        // pins exactly one worker — no broadcast clause. Hashing the native value
-        // instead of the OPK bytes would misroute signed and compound PKs.
+        // of a key-routed relation pins exactly one worker. Hashing the native
+        // value instead of the OPK bytes would misroute signed and compound PKs.
         let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
-        let worker = schema.worker_for_pk(opk.pk_bytes(), num_workers);
-        let (mut slots, _scan) = dispatch_scan_fanout(self, reactor, Fanout::One(worker), |targets| {
+        let fanout = match schema.placement().is_key_routed() {
+            true => Fanout::One(schema.worker_for_pk(opk.pk_bytes(), num_workers)),
+            false => read_fanout(self, target_id, None),
+        };
+        let (mut slots, scan) = dispatch_scan_fanout(self, reactor, fanout, |targets| {
             self.write_group(&DirectGroup {
                 template: wire::WireMsg {
                     target_id: target_id as u64,
-                    // The version the client already HAS, so the worker omits
-                    // the block on a hit — where `handle_scan` stamps the one the
-                    // client *will* have, its prelim frame having just sent it.
-                    flags: gnitz_wire::wire_flags_set_schema_version(0, client_version),
+                    // A unicast reply goes to the client verbatim, so it carries
+                    // the version the client already HAS and the worker omits the
+                    // block on a hit — where `handle_scan` stamps the one the
+                    // client *will* have, its prelim frame having just sent it. A
+                    // merge is re-encoded here, and negotiates on the way out.
+                    flags: match fanout {
+                        Fanout::One(_) => gnitz_wire::wire_flags_set_schema_version(0, client_version),
+                        Fanout::Broadcast => 0,
+                    },
                     seek_pk: pk,
                     seek_pk_extra,
                     ..Default::default()
@@ -670,11 +723,19 @@ impl MasterDispatcher {
             })
         })
         .await?;
-        let slot = slots.pop().expect("unicast fan-out returns one slot");
-        // A point seek's reply must fit one frame; a train would be forwarded
-        // truncated, so reject it rather than silently drop the remainder.
-        expect_single_frame(&slot, worker, "seek")?;
-        Ok(slot)
+        match fanout {
+            Fanout::One(worker) => {
+                let slot = slots.pop().expect("unicast fan-out returns one slot");
+                // A point seek's reply must fit one frame; a train would be
+                // forwarded truncated, so reject it rather than silently drop the
+                // remainder.
+                expect_single_frame(&slot, worker, "seek")?;
+                Ok(SeekReply::Frame(slot))
+            }
+            Fanout::Broadcast => merge_replies(slots, &scan, reactor, "seek", &schema)
+                .await
+                .map(|merged| SeekReply::Merged(merged.map(Box::new))),
+        }
     }
 
     /// Index lookup: fan one frame out and MERGE every matching base row into
@@ -694,7 +755,6 @@ impl MasterDispatcher {
         seek_pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<Option<Batch>, WorkerFault> {
-        const OP: &str = "seek_by_index";
         // Single-sourcing a REPLICATED owner is correctness here, not thrift: a
         // broadcast-and-merge appends each matching row `nw` times (weights
         // copied verbatim, no consolidation), handing the client `nw` duplicates
@@ -717,31 +777,7 @@ impl MasterDispatcher {
             })
         })
         .await?;
-
-        let mut acc: Option<Batch> = None;
-        let mut merged_bytes = 0usize;
-        drain_index_scan(slots, &scan, reactor, OP, &expected, |mb, frame_len| {
-            // The merge goes back out as one frame, so it is bounded by what the
-            // client will read (`FRAME_CAP`). Σ frame bytes ≥ that merged encode
-            // size — every frame re-counts its header and the first one the schema
-            // block — so capping the sum never lets an unreadable reply through,
-            // and it bounds the master's merge heap on the way.
-            merged_bytes += frame_len;
-            if merged_bytes > crate::runtime::wire::FRAME_CAP {
-                return Err(format!(
-                    "{OP}: result exceeds the {} MiB reply cap; add a tighter \
-                     predicate or LIMIT",
-                    crate::runtime::wire::FRAME_CAP >> 20
-                )
-                .into());
-            }
-            let a = acc.get_or_insert_with(|| Batch::with_capacity(&expected, mb.len()));
-            a.append_mem_batch(mb);
-            Ok(())
-        })
-        .await?;
-        // The sink runs only for non-empty frames, so `Some` implies rows.
-        Ok(acc)
+        merge_replies(slots, &scan, reactor, "seek_by_index", &expected).await
     }
 
     /// Fan out a SCAN to the workers `unicast` names and forward every response

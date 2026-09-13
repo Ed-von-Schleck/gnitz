@@ -515,8 +515,8 @@ impl WorkerProcess {
         let seek_col_idx = decoded.control.seek_col_idx;
         let client_id = decoded.control.client_id;
         let ctrl_wire_flags = decoded.control.flags;
-        // On a scan this is the version the client holds; on a seek the master
-        // stamps the same field with it too (see `fan_out_seek`'s template).
+        // On a scan this is the version the client holds; on a unicast seek the
+        // master stamps the same field with it too (see `fan_out_seek`'s template).
         let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
         let route = ReplyRoute {
             target_id: target_id as u64,

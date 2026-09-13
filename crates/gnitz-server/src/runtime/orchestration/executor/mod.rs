@@ -31,7 +31,7 @@ use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, P
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
     await_worker_acks, dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, read_fanout, Fanout,
-    MasterDispatcher, WorkerFault,
+    MasterDispatcher, SeekReply, WorkerFault,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
@@ -1254,8 +1254,8 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
 }
 
 /// Serve a point lookup: a catalog family reads master-locally; a user relation
-/// (base table or view) fans out to the owning worker by PK hash. SEEK unicasts
-/// to one worker, so no replicated fork.
+/// (base table or view) goes to the workers its placement names, and comes back
+/// either as one worker's frame verbatim or as their merged rows.
 ///
 /// Takes the catalog read lock itself, through the same `read_lock` entry point
 /// every other read verb uses. A base-table or system seek is the RMW hot path —
@@ -1286,7 +1286,10 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
             .fan_out_seek(&shared.reactor, target_id, pk, seek_pk_extra, client_version)
             .await
         {
-            Ok(slot) => peer.send_or_close(slot).await,
+            Ok(SeekReply::Frame(slot)) => peer.send_or_close(slot).await,
+            Ok(SeekReply::Merged(batch)) => {
+                send_ok_response(shared, peer, target_id, batch.as_deref(), client_id, pk, client_version)
+            }
             Err(f) => send_fault(peer, target_id, client_id, &f),
         }
     }

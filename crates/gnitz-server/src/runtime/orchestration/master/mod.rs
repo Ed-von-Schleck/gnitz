@@ -168,6 +168,7 @@ mod unique_filter;
 mod unique_preflight;
 
 use super::TxnFamily;
+pub(crate) use dispatch::SeekReply;
 use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
 pub(crate) use unique_filter::UniqueFilter;
 
