@@ -353,6 +353,11 @@ fn create_index_naming_and_rejections() {
     );
     exec(&mut client, &sn, "DROP INDEX my_idx");
     exec(&mut client, &sn, &format!("DROP INDEX {sn}__t__idx_a"));
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE st (id BIGINT PRIMARY KEY, v BIGINT) WITH (stream = true)",
+    );
     // `(a, b_c)` and `(a_b, c)` render the same base; the second gets `_2`.
     exec(&mut client, &sn, "CREATE INDEX ON t(a, b_c)");
     exec(&mut client, &sn, "CREATE INDEX ON t(a_b, c)");
@@ -370,9 +375,16 @@ fn create_index_naming_and_rejections() {
         ("CREATE INDEX ON t(s)", "Unsupported", "'s'"),
         ("CREATE INDEX ON t(f)", "Unsupported", "'f'"),
         ("CREATE UNIQUE INDEX ON t(s)", "Unsupported", "'s'"),
+        ("CREATE INDEX ON t(ghost)", "Bind", "ghost"),
+        ("CREATE INDEX ON t(a, a)", "Plan", "duplicate column"),
+        ("CREATE INDEX ix ON t (a) WHERE a > 0", "Unsupported", "partial index"),
+        // A stream holds no rows to index.
+        ("CREATE INDEX ON st(v)", "Unsupported", "is a stream"),
     ] {
         assert_rejects_variant(&mut client, &sn, sql, variant, needle);
     }
+    // BTREE is the one index method, so naming it is accepted.
+    exec(&mut client, &sn, "CREATE INDEX ixb ON t USING BTREE (c)");
 }
 
 // ── ALTER ────────────────────────────────────────────────────────────────────
@@ -520,7 +532,62 @@ fn alter_rejection_matrix() {
         &sn,
         "CREATE VIEW bv WITH (capacity = '1 MB') AS SELECT id, b FROM t",
     );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE st (id BIGINT PRIMARY KEY, v BIGINT) WITH (stream = true)",
+    );
     for (sql, variant, needle) in [
+        // ADD COLUMN honours a bare nullable append; each refused clause would
+        // need a value for the rows already there, a second catalog object, or a
+        // physical move, and names what to write instead where there is one.
+        ("ALTER TABLE t ADD COLUMN x BIGINT NOT NULL", "Unsupported", "NOT NULL"),
+        ("ALTER TABLE t ADD COLUMN x SERIAL", "Unsupported", "SERIAL"),
+        ("ALTER TABLE t ADD COLUMN x BIGINT DEFAULT 0", "Unsupported", "DEFAULT"),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT PRIMARY KEY",
+            "Unsupported",
+            "PRIMARY KEY",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT UNIQUE",
+            "Unsupported",
+            "CREATE UNIQUE INDEX",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT REFERENCES t (id)",
+            "Unsupported",
+            "ADD CONSTRAINT",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT CHECK (x > 0)",
+            "Unsupported",
+            "CHECK",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT COLLATE utf8",
+            "Unsupported",
+            "COLLATE",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS x BIGINT",
+            "Unsupported",
+            "IF NOT EXISTS",
+        ),
+        ("ALTER TABLE t ADD COLUMN x BIGINT FIRST", "Unsupported", "FIRST/AFTER"),
+        (
+            "ALTER TABLE t ADD COLUMN x BIGINT AFTER a",
+            "Unsupported",
+            "FIRST/AFTER",
+        ),
+        ("ALTER TABLE t ADD COLUMN a BIGINT", "Exec", "already exists"),
+        ("ALTER TABLE t ADD COLUMN id BIGINT", "Exec", "already exists"),
+        ("ALTER TABLE st ADD COLUMN x BIGINT", "Unsupported", "is a stream"),
+        (
+            "ALTER TABLE st ADD CONSTRAINT su UNIQUE (v)",
+            "Unsupported",
+            "is a stream",
+        ),
         ("ALTER TABLE t RENAME TO otherschema.t2", "Unsupported", "cross-schema"),
         ("ALTER TABLE nope RENAME TO x", "Bind", "does not exist"),
         ("ALTER TABLE t RENAME COLUMN a TO b", "Exec", "already exists"),

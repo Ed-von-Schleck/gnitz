@@ -9,7 +9,7 @@ routed to two comes back at weight 2. So every case here asserts the full result
 set *with its weights* over keys that span every worker — a PK list would see
 the first failure only by luck and the second not at all.
 
-What this path refuses is in `admissibility/test_sql_rejections.py`.
+What this path refuses is pinned in the planner's `gnitz-sql/tests/plan_read.rs`.
 """
 
 import gnitz

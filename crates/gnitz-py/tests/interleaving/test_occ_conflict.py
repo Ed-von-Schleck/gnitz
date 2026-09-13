@@ -5,6 +5,10 @@ WHERE, INSERT ... ON CONFLICT) commits only if its table has not been written
 since the connection's basis; a racing write is refused with a retryable
 conflict. The grain is the table. Autocommit statements retry internally,
 adopting the server's fresh basis; BEGIN/COMMIT surfaces the conflict.
+
+The writes that take no basis — a duplicate-key INSERT's pre-flight, and an FK
+check — hold their table guard instead, and their refusals must be exactly as
+decisive while other writers run.
 """
 
 import contextlib
@@ -181,3 +185,104 @@ def test_a_transaction_commits_only_if_no_table_it_modified_was_written(occ, via
         a.execute_sql("COMMIT", schema_name=sn)
         assert bag(a.scan(u_tid), "pk", "val") == {(1, 1): 1}
         assert bag(a.scan(ledger_tid), "pk", "val") == {(1, 101): 1, (2, 0): 1}
+
+
+# ── Refusals no concurrent writer may dilute ─────────────────────────────────
+
+def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server, client, schema_name):
+    """`INSERT` ships conflict mode `Error`, whose duplicate-key rejection is a
+    master-side pre-flight against committed state — there is no apply-time
+    backstop. It therefore keeps the exclusive table guard even though binary
+    upserts to the same table hold the shared one, and its verdict must survive
+    that concurrency: a duplicate `INSERT` still raises, and never degrades
+    into a silent upsert."""
+    sn = schema_name
+    client.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+                       "INSERT INTO t VALUES (1, 10)", schema_name=sn)
+    tid, schema = client.resolve_table(sn, "t")
+
+    stop = threading.Event()
+    failures = []
+
+    def upserter(seed):
+        # Disjoint PKs, so nothing here can be the source of a duplicate.
+        try:
+            with gnitz.connect(server) as c:
+                i = 0
+                while not stop.is_set():
+                    c.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": 1000 * seed + (i % 64) + 1, "val": i}]))
+                    i += 1
+        except Exception as e:  # noqa: BLE001 — surfaced after the join
+            failures.append(e)
+
+    pushers = [threading.Thread(target=upserter, args=(s,), daemon=True) for s in range(1, 5)]
+    for p in pushers:
+        p.start()
+    try:
+        for _ in range(20):
+            with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
+                client.execute_sql("INSERT INTO t VALUES (1, 20)", schema_name=sn)
+    finally:
+        stop.set()
+        join_or_fail("a concurrent upsert hung", *pushers)
+    assert not failures, f"concurrent upserts failed: {failures}"
+
+    # The rejected INSERTs left the original row untouched, at weight 1.
+    assert {k: w for k, w in bag(client.scan(tid)).items() if k[0] == 1} == {(1, 10): 1}
+
+
+@pytest.mark.parametrize("ddl,parent_table,parent,child_table,child", [
+    ("CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY); "
+     "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id))",
+     "parent", {"id": 1}, "child", {"cid": 2, "pid": 1}),
+    ("CREATE TABLE tree (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT REFERENCES tree(id))",
+     "tree", {"id": 1, "parent_id": None}, "tree", {"id": 2, "parent_id": 1}),
+], ids=["two-tables", "self-fk"])
+def test_fk_enforced_under_concurrent_push_and_delete(
+        server, client, schema_name, ddl, parent_table, parent, child_table, child):
+    """A binary push and a binary delete are both conflict-mode `Update`, so the
+    only thing keeping them off the shared table lock — where they would run
+    concurrently and each miss the other's uncommitted rows — is the FK terms of
+    the validator's predicate.
+
+    Each round races inserting a child against deleting its parent: exactly one
+    is rejected, and what is left is exactly the winner's outcome. With a self-FK
+    both endpoints are one table, so the lock set dedupes to a single tid — the
+    writer must still take that one guard exclusively."""
+    sn = schema_name
+    client.execute_sql(ddl, schema_name=sn)
+    ptid, pschema = client.resolve_table(sn, parent_table)
+    ctid, cschema = client.resolve_table(sn, child_table)
+    parent_row, child_row = tuple(parent.values()), tuple(child.values())
+    client.push(ptid, gnitz.ZSetBatch(pschema).extend([parent]))
+
+    with gnitz.connect(server) as a, gnitz.connect(server) as b:
+        for _ in range(20):
+            errors = []
+            start = threading.Barrier(2)
+
+            def race(label, write):
+                start.wait()
+                try:
+                    write()
+                except gnitz.GnitzError as e:
+                    errors.append((label, e))
+
+            threads = [threading.Thread(target=race, args=w, daemon=True) for w in (
+                ("push", lambda: a.push(ctid, gnitz.ZSetBatch(cschema).extend([child]))),
+                ("delete", lambda: b.delete(ptid, pschema, [parent_row[0]])),
+            )]
+            for t in threads:
+                t.start()
+            join_or_fail("a racing FK write hung", *threads)
+            assert len(errors) == 1, f"expected exactly one of the two writes to be rejected, got {errors}"
+
+            held = {**bag(scanned(client, sn, parent_table)), **bag(scanned(client, sn, child_table))}
+            push_won = errors[0][0] == "delete"
+            assert held == (dict.fromkeys([parent_row, child_row], 1) if push_won else {}), held
+            # Back to {parent present, child absent}, touching only what is
+            # there — a retraction of an absent row is not a no-op.
+            if push_won:
+                client.delete(ctid, cschema, [child_row[0]])
+            else:
+                client.push(ptid, gnitz.ZSetBatch(pschema).extend([parent]))

@@ -213,7 +213,8 @@ fn negative_zero_into_a_float_column_keeps_its_sign() {
 }
 
 /// The two kind rejections: a number into a String column, and a string into a
-/// column that is neither String nor UUID.
+/// column that is neither String nor UUID — a BLOB included, whose values are
+/// bytes, not text.
 #[test]
 fn a_literal_of_the_wrong_kind_is_rejected_by_the_column_type() {
     let e = encoded(TypeCode::String, &expr("5")).unwrap_err();
@@ -221,7 +222,7 @@ fn a_literal_of_the_wrong_kind_is_rejected_by_the_column_type() {
         format!("{e:?}").contains("number literal for string column"),
         "got {e:?}"
     );
-    for tc in [TypeCode::U32, TypeCode::F64] {
+    for tc in [TypeCode::U32, TypeCode::F64, TypeCode::Blob] {
         let e = encoded(tc, &expr("'5'")).unwrap_err();
         assert!(
             format!("{e:?}").contains("string literal for non-string column"),

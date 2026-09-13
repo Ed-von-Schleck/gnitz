@@ -2,7 +2,7 @@
 unchanged, a dropped relation's id retiring while its siblings keep serving,
 and a dropped index vanishing from the next statement another connection plans.
 
-The verdicts the catalog refuses live in `admissibility/test_catalog_guards.py`.
+The verdicts the catalog refuses live in `admissibility/test_errors.py`.
 """
 
 import gnitz

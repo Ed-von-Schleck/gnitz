@@ -1,67 +1,60 @@
-"""A view the engine refuses to compile must be an error, not a silent empty view.
+"""A view definition past a cap is refused naming the limit — never created and
+silently empty.
 
-The circuit is compiled on the master inside the DDL, before it is durable, so a
-rejection takes the ordinary ingest failure path and reaches the client with the
-view never created. Without that, the view is created, resolvable, and returns no
-rows forever — the same observable as a correct view over a source that happens
-to match nothing.
-
-Run with GNITZ_WORKERS=4: the pre-flight's premise is that a rank-0 compile
-speaks for every worker, and a single-worker run would not exercise that.
+The expression-register cap and the column-width caps are decided while
+planning, before anything is shipped. What only an end-to-end run can show is
+both sides of that boundary at once: every size the planner admits is served
+whole by the engine, rather than created, resolvable, and empty forever — the
+same observable as a correct view over a source that happens to match nothing.
 
 The sweep assertion is threshold-free, so it cannot rot when register allocation
 or companion-spec injection changes: for each N in a range spanning the limit,
-`CREATE VIEW` either errors or returns the correct rows — it never succeeds and
-returns zero. Each range below spans the limit measured today, so each sweep
-contains both outcomes and neither can pass vacuously. No test pins the limit
-itself: what a conjunct costs is a register-allocator detail, not a contract.
+`CREATE VIEW` either errors naming a cap or returns exactly the correct rows.
+Each range below spans the limit measured today, so each sweep contains both
+outcomes and neither can pass vacuously. No test pins the limit itself.
 """
-
-import os
 
 import pytest
 import gnitz
 from _caps import conjunct_ladder, first_rejected, names_a_cap
-from _uid import uid as _uid
+from _read import bag
 
 
-@pytest.fixture
-def caps(client, schema_name):
-    """A schema with every base relation the sweeps read, seeded so each
-    correct answer is non-empty (a zero-row answer would make the invariant
-    unfalsifiable)."""
-    sql = client.execute_sql
-    sql("CREATE TABLE probe (pk BIGINT NOT NULL PRIMARY KEY)", schema_name=schema_name)
-    sql("INSERT INTO probe VALUES (1)", schema_name=schema_name)
+@pytest.fixture(scope="module")
+def caps(module_schema):
+    """A schema with every base relation the sweeps read, seeded so each correct
+    answer is non-empty (a zero-row answer would make the invariant
+    unfalsifiable). Each sweep drops the view it creates, and no DML below
+    changes a row, so every test sees the same data."""
+    conn, sn = module_schema
 
-    sql("CREATE TABLE hg (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL)",
-        schema_name=schema_name)
-    sql("INSERT INTO hg VALUES (1, 1), (2, 1), (3, 2)", schema_name=schema_name)
+    def sql(q):
+        conn.execute_sql(q, schema_name=sn)
 
-    sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-        schema_name=schema_name)
-    sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=schema_name)
+    sql("CREATE TABLE hg (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL)")
+    sql("INSERT INTO hg VALUES (1, 1), (2, 1), (3, 2)")
 
-    sql("CREATE TABLE ts (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)",
-        schema_name=schema_name)
-    sql("INSERT INTO ts VALUES " + ", ".join(f"({i}, 'a{i}')" for i in range(5)),
-        schema_name=schema_name)
+    sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)")
+    sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 
-    # 16 NULLABLE BIGINTs: a nullable SUM finalizes as `sum / (cnt != 0)`,
-    # five registers each, so this is the register cap reached by ordinary
-    # SQL rather than by a hand-written predicate.
-    ncols = ", ".join(f"c{i} BIGINT" for i in range(16))
-    sql(f"CREATE TABLE wn (pk BIGINT NOT NULL PRIMARY KEY, {ncols})", schema_name=schema_name)
+    sql("CREATE TABLE ts (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)")
+    sql("INSERT INTO ts VALUES " + ", ".join(f"({i}, 'a{i}')" for i in range(5)))
+
+    # 16 NULLABLE BIGINTs: a nullable SUM finalizes as `sum / (cnt != 0)`, five
+    # registers each, so this is the register cap reached by ordinary SQL rather
+    # than by a hand-written predicate.
+    sql("CREATE TABLE wn (pk BIGINT NOT NULL PRIMARY KEY, "
+        + ", ".join(f"c{i} BIGINT" for i in range(16)) + ")")
     vals = ", ".join(str(i) for i in range(16))
-    sql(f"INSERT INTO wn VALUES (1, {vals}), (2, {vals})", schema_name=schema_name)
+    sql(f"INSERT INTO wn VALUES (1, {vals}), (2, {vals})")
 
     # 64 NOT NULL BIGINTs + pk = 65 columns: the reduce-output width cap.
-    wcols = ", ".join(f"c{i} BIGINT NOT NULL" for i in range(64))
-    sql(f"CREATE TABLE w (pk BIGINT NOT NULL PRIMARY KEY, {wcols})", schema_name=schema_name)
+    sql("CREATE TABLE w (pk BIGINT NOT NULL PRIMARY KEY, "
+        + ", ".join(f"c{i} BIGINT NOT NULL" for i in range(64)) + ")")
     row1 = ", ".join(str(i) for i in range(64))
     row2 = ", ".join(str(i + 100) for i in range(64))
-    sql(f"INSERT INTO w VALUES (1, {row1}), (2, {row2})", schema_name=schema_name)
-    return schema_name
+    sql(f"INSERT INTO w VALUES (1, {row1}), (2, {row2})")
+    return sn
 
 
 # `(id, range spanning the limit, body for n, rows the correct answer holds)`.
@@ -101,106 +94,20 @@ _SWEEPS = [
                          ids=[s[0] for s in _SWEEPS])
 def test_a_view_never_compiles_to_silently_empty(client, caps, ns, sql_for, expected_rows):
     """Across a range spanning the limit, `CREATE VIEW` either errors naming a
-    cap, or creates a view returning exactly the correct rows. Never a created
-    view with zero rows."""
+    cap, or creates a view holding exactly the correct rows, each once."""
     outcomes = set()
     for n in ns:
-        name = "v" + _uid()
         try:
-            client.execute_sql(f"CREATE VIEW {name} AS {sql_for(n)}", schema_name=caps)
+            client.execute_sql(f"CREATE VIEW v AS {sql_for(n)}", schema_name=caps)
         except gnitz.GnitzError as e:
             assert names_a_cap(e), f"n={n}: rejection must name a limit, got: {e}"
-            with pytest.raises(gnitz.GnitzError):
-                client.resolve_table(caps, name)
             outcomes.add("error")
             continue
-        vid = client.resolve_table(caps, name)[0]
-        rows = list(client.scan(vid))
-        assert len(rows) == expected_rows, f"n={n}: expected {expected_rows} rows, got {len(rows)}"
-        client.drop_view(caps, name)
+        weights = list(bag(client.scan(client.resolve_table(caps, "v")[0])).values())
+        client.drop_view(caps, "v")
+        assert weights == [1] * expected_rows, f"n={n}: expected {expected_rows} rows at weight 1, got {weights}"
         outcomes.add("ok")
     assert outcomes == {"ok", "error"}, f"the sweep must span the limit — outcomes were {outcomes}"
-
-
-def test_adhoc_over_cap_projection_names_the_limit(client, caps):
-    """The ad-hoc read path formats the same validator error: the limit itself,
-    not the internal enum variant that carries it."""
-    sql = "SELECT pk, " + ", ".join(f"a+{i} AS c{i}" for i in range(34)) + " FROM t"
-    with pytest.raises(gnitz.GnitzError) as e:
-        client.execute_sql(sql, schema_name=caps)
-    assert "registers" in str(e.value), f"got: {e.value}"
-    assert "TooManyRegs" not in str(e.value), f"internal enum leaked: {e.value}"
-
-
-def test_uncompilable_hidden_segment_leaves_nothing(client, caps):
-    """A chain whose *hidden* segment is the uncompilable one. The bundle is
-    atomic, so neither the hidden segment nor the named view survives — and the
-    name is free afterwards, which a leaked segment would deny."""
-    pred = conjunct_ladder("cat", 20)
-    with pytest.raises(gnitz.GnitzError) as e:
-        client.execute_sql(
-            f"CREATE VIEW vh AS WITH g AS (SELECT cat FROM hg GROUP BY cat HAVING {pred}) "
-            "SELECT cat FROM g", schema_name=caps)
-    assert names_a_cap(e.value), f"got: {e.value}"
-    with pytest.raises(gnitz.GnitzError):
-        client.resolve_table(caps, "vh")
-
-    client.execute_sql(
-        "CREATE VIEW vh AS WITH g AS (SELECT cat FROM hg GROUP BY cat HAVING cat = 1) "
-        "SELECT cat FROM g", schema_name=caps)
-    assert len(list(client.scan(client.resolve_table(caps, "vh")[0]))) == 1
-
-
-def test_alter_view_rejection_keeps_the_old_view(client, caps):
-    """ALTER VIEW is one DDL zone: a rejected new definition must leave the old
-    view serving its rows. A drop zone followed by a create zone would not."""
-    client.execute_sql("CREATE VIEW va AS SELECT cat FROM hg WHERE cat = 1", schema_name=caps)
-    vid = client.resolve_table(caps, "va")[0]
-    assert len(list(client.scan(vid))) == 2
-
-    with pytest.raises(gnitz.GnitzError) as e:
-        client.execute_sql(
-            f"ALTER VIEW va AS SELECT cat FROM hg GROUP BY cat HAVING {conjunct_ladder("cat", 20)}",
-            schema_name=caps)
-    assert names_a_cap(e.value), f"got: {e.value}"
-
-    # Untouched: same id, same rows.
-    assert client.resolve_table(caps, "va")[0] == vid
-    assert len(list(client.scan(vid))) == 2
-
-    # A valid redefinition still replaces it, under the same name.
-    client.execute_sql("ALTER VIEW va AS SELECT cat FROM hg WHERE cat = 2", schema_name=caps)
-    assert len(list(client.scan(client.resolve_table(caps, "va")[0]))) == 1
-
-
-def test_rejected_ddl_leaves_no_directory(own_server):
-    """The pre-flight compiles into a throwaway `_preflight_<vid>` root and
-    removes it on both paths, so a run of rejected statements adds nothing to
-    the data dir. A root that survived would leak one directory per rejection."""
-    own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("resid")
-        conn.execute_sql(
-            "CREATE TABLE hg (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL)",
-            schema_name="resid")
-        conn.execute_sql("INSERT INTO hg VALUES (1, 1), (2, 2)", schema_name="resid")
-        conn.execute_sql("CREATE VIEW keep AS SELECT cat FROM hg WHERE cat = 1",
-                         schema_name="resid")
-
-        schema_dir = os.path.join(own_server.data_dir, "resid")
-        before = sorted(os.listdir(schema_dir))
-
-        pred = conjunct_ladder("cat", 20)
-        for i in range(3):
-            for stmt in (f"CREATE VIEW bad{i} AS SELECT cat FROM hg GROUP BY cat HAVING {pred}",
-                         f"ALTER VIEW keep AS SELECT cat FROM hg GROUP BY cat HAVING {pred}"):
-                with pytest.raises(gnitz.GnitzError):
-                    conn.execute_sql(stmt, schema_name="resid")
-
-        assert sorted(os.listdir(schema_dir)) == before, (
-            "rejected CREATE/ALTER VIEW must leave no directory behind")
-        # And the view they tried to replace still works.
-        assert len(list(conn.scan(conn.resolve_table("resid", "keep")[0]))) == 1
 
 
 def test_a_dml_residual_crosses_the_same_cap_and_says_so(client, caps):

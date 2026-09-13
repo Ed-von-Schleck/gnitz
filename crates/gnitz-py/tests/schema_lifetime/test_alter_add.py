@@ -4,7 +4,7 @@ predates it, and is writable from then on.
 Run at GNITZ_WORKERS=4 — the widening has to reach every partition, or one left
 at the old width consolidates a padded row against a real one.
 
-The clause refusals are `admissibility/test_sql_rejections.py`'s; the crash and
+The clause refusals are `gnitz-sql/tests/engine_ddl.rs`'s; the crash and
 checkpoint replays are `state_lifetime/test_durability.py`'s; the ALTER racing
 live traffic is `interleaving/test_ddl_under_traffic.py`'s; the RESTRICT a
 dependent view imposes is `test_alter.py`'s.

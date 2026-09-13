@@ -529,8 +529,79 @@ fn a_read_the_planner_rejects_names_its_rule() {
     cat.insert(SN, "r", Some(r));
     let jv = view(&cat, "SELECT * FROM l JOIN r ON l.val = r.val");
     register(&mut cat, "jv", 32, &jv);
+    let st = rel(
+        33,
+        RelClass::Stream,
+        false,
+        vec![col("id", TypeCode::I64)],
+        vec![0],
+        &[],
+    );
+    cat.insert(SN, "st", Some(st));
 
     for (sql, variant, msg) in [
+        // A query deriving a new relation is refused from the AST alone, naming
+        // the construct and pointing at CREATE VIEW.
+        ("SELECT t.id FROM t JOIN u ON t.v = u.k", "Unsupported", "(JOIN)"),
+        (
+            "SELECT v FROM t UNION SELECT k FROM u",
+            "Unsupported",
+            "(set operation)",
+        ),
+        (
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.v)",
+            "Unsupported",
+            "(EXISTS/IN subquery)",
+        ),
+        (
+            "SELECT id FROM t WHERE v IN (SELECT k FROM u)",
+            "Unsupported",
+            "(EXISTS/IN subquery)",
+        ),
+        (
+            "SELECT id, (SELECT MAX(k) FROM u) FROM t",
+            "Unsupported",
+            "(scalar subquery)",
+        ),
+        (
+            "SELECT x FROM (SELECT v AS x FROM t) d",
+            "Unsupported",
+            "(derived table in FROM)",
+        ),
+        ("SELECT t.id FROM t, u WHERE t.v = u.k", "Unsupported", "CREATE VIEW"),
+        // A clause the parser accepts and the read path would otherwise drop.
+        ("SELECT DISTINCT ON (id) id FROM t", "Unsupported", "DISTINCT ON"),
+        ("SELECT * FROM t LIMIT 2 BY v", "Unsupported", "LIMIT ... BY"),
+        (
+            "SELECT * FROM t LIMIT 1+1",
+            "Unsupported",
+            "LIMIT must be an integer literal",
+        ),
+        (
+            "SELECT * FROM t LIMIT 1 OFFSET 1+1",
+            "Unsupported",
+            "OFFSET must be an integer literal",
+        ),
+        ("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", "Unsupported", "FETCH"),
+        ("SELECT id FROM t PREWHERE v > 5", "Unsupported", "PREWHERE"),
+        ("SELECT TOP 2 id FROM t", "Unsupported", "TOP"),
+        (
+            "SELECT id FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY id) = 1",
+            "Unsupported",
+            "QUALIFY",
+        ),
+        ("SELECT id FROM t FOR UPDATE", "Unsupported", "FOR UPDATE"),
+        ("SELECT id FROM t SETTINGS max_threads = 1", "Unsupported", "SETTINGS"),
+        ("SELECT id FROM t FORMAT JSON", "Unsupported", "FORMAT"),
+        ("SELECT * REPLACE (v + 1 AS v) FROM t", "Unsupported", "REPLACE"),
+        ("SELECT * ILIKE 'v%' FROM t", "Unsupported", "ILIKE"),
+        // Zero rows would make a stream indistinguishable from an empty table.
+        ("SELECT * FROM st", "Unsupported", "is a stream"),
+        (
+            "WITH c AS (SELECT id FROM st) SELECT id FROM c",
+            "Unsupported",
+            "is a stream",
+        ),
         (
             "SELECT w, COUNT(*) FROM tw GROUP BY w HAVING w > 5",
             "Unsupported",

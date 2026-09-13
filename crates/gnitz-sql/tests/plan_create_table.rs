@@ -192,6 +192,88 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
     assert!(c.props.stream && c.unique_indexes.is_empty());
 }
 
+/// A clause `CREATE TABLE` does not honour is named rather than dropped — a
+/// dropped CHECK or DEFAULT is a constraint never enforced — and a FOREIGN KEY
+/// target must be one stored, individually unique column.
+#[test]
+fn an_unhonoured_clause_or_fk_target_is_named() {
+    let mut known = fk_catalog();
+    let u = TypeCode::U64;
+    let cp = table(
+        42,
+        vec![col("a", u), col("b", u), ncol("payload", TypeCode::I64)],
+        vec![0, 1],
+    );
+    known.insert(SN, "cp", Some(cp));
+    let st = rel(
+        43,
+        RelClass::Stream,
+        false,
+        vec![col("id", TypeCode::I64)],
+        vec![0],
+        &[],
+    );
+    known.insert(SN, "st", Some(st));
+    for (sql, variant, needle) in [
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY) AS SELECT id FROM p",
+            "Unsupported",
+            "CTAS",
+        ),
+        (
+            "CREATE TEMPORARY TABLE t (id BIGINT PRIMARY KEY)",
+            "Unsupported",
+            "TEMPORARY",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT CHECK (x > 0))",
+            "Unsupported",
+            "CHECK",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT, CHECK (x > 0))",
+            "Unsupported",
+            "CHECK",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT DEFAULT 5)",
+            "Unsupported",
+            "DEFAULT",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES p(id) ON DELETE CASCADE)",
+            "Unsupported",
+            "ON DELETE",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES phantom(id))",
+            "Bind",
+            "does not exist",
+        ),
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES st(id))",
+            "Unsupported",
+            "is a stream",
+        ),
+        // A compound PK has no lone column, so a member qualifies only through a
+        // UNIQUE index of its own.
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT UNSIGNED REFERENCES cp(a))",
+            "Unsupported",
+            "UNIQUE index",
+        ),
+        (
+            "CREATE TABLE t (x BIGINT UNSIGNED, y BIGINT UNSIGNED, id BIGINT PRIMARY KEY, \
+             FOREIGN KEY (x, y) REFERENCES cp (a, b))",
+            "Unsupported",
+            "multi-column",
+        ),
+    ] {
+        let (plan, _) = resolving(&known, |c| plan_table(c, sql).map(|_| ()));
+        assert_rejects(sql, plan, variant, needle);
+    }
+}
+
 /// The generated id has no compound form, so a SERIAL column is the table's
 /// whole primary key: outside the PK, inside a compound one, or beside a second
 /// SERIAL it is refused.

@@ -19,7 +19,7 @@ use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{project, resolve_projection, RowGather};
 use crate::ir::{BExpr, BoundExpr};
-use crate::validate::reject_unhonored_insert_clauses;
+use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{
     push_zero_cell, ColumnDef, GnitzClient, RelClass, Schema, WireConflictMode, ZSetBatch, ZSetBatchView,
@@ -190,13 +190,9 @@ pub(crate) fn execute_insert(
             ));
         }
         Some(OnInsert::OnConflict(OnConflict { conflict_target, action })) => {
-            // A stream has no unique PK to conflict on, and no stored rows for
-            // either action to resolve the incoming one against.
-            if is_stream {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "'{table_name_str}' is a stream; ON CONFLICT needs stored rows to resolve against"
-                )));
-            }
+            // Both actions resolve the incoming row against stored rows, which a
+            // stream does not have.
+            require_class(&target, &table_name_str, ClassWant::BaseTable, "INSERT … ON CONFLICT")?;
             validate_conflict_target(conflict_target, schema)?;
 
             match action {
@@ -308,7 +304,7 @@ pub(crate) fn execute_insert(
                 .as_deref()
                 .map(|items| resolve_projection(items, schema, &table_name_str))
                 .transpose()?;
-            // The engine refuses `Error` on a stream (no unique PK, as above) and
+            // The engine refuses `Error` on a stream (its PK is not unique) and
             // leaves `Update` unread: the push appends, so the same row twice is
             // one element at weight 2.
             let mode = if is_stream {

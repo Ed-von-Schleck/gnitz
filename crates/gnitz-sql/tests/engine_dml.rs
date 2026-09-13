@@ -52,6 +52,131 @@ fn writes_and_indexes_need_a_base_table() {
     }
 }
 
+/// A write clause gnitz does not honour is named rather than dropped, as is a
+/// write its target cannot take; none of them writes anything.
+#[test]
+fn a_refused_write_names_its_rule_and_writes_nothing() {
+    let (_srv, mut client, sn) = boot(1);
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, s TEXT)",
+        "CREATE TABLE c (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT, PRIMARY KEY (a, b))",
+        "CREATE TABLE st (id BIGINT PRIMARY KEY, v BIGINT) WITH (stream = true)",
+        "INSERT INTO t VALUES (1, 10, 'a')",
+    ] {
+        exec(&mut client, &sn, sql);
+    }
+    for (sql, variant, needle) in [
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') LIMIT 1",
+            "Unsupported",
+            "LIMIT/OFFSET",
+        ),
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') FOR UPDATE",
+            "Unsupported",
+            "FOR UPDATE",
+        ),
+        ("INSERT IGNORE INTO t VALUES (2, 20, 'b')", "Unsupported", "IGNORE"),
+        ("REPLACE INTO t VALUES (2, 20, 'b')", "Unsupported", "REPLACE INTO"),
+        // RETURNING projects plain source columns, a PK among them, and not
+        // beside ON CONFLICT.
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') RETURNING v + 1",
+            "Unsupported",
+            "RETURNING",
+        ),
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') RETURNING v",
+            "Unsupported",
+            "PRIMARY KEY",
+        ),
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') RETURNING * REPLACE (v + 1 AS v)",
+            "Unsupported",
+            "REPLACE",
+        ),
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (id) DO NOTHING RETURNING id",
+            "Unsupported",
+            "RETURNING with ON CONFLICT",
+        ),
+        // A conflict target names exactly the primary key: not another column,
+        // not more, not a prefix.
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (v) DO NOTHING",
+            "Unsupported",
+            "primary key",
+        ),
+        (
+            "INSERT INTO t VALUES (2, 20, 'b') ON CONFLICT (id, v) DO NOTHING",
+            "Unsupported",
+            "primary key",
+        ),
+        (
+            "INSERT INTO c VALUES (1, 1, 10) ON CONFLICT (a) DO NOTHING",
+            "Unsupported",
+            "primary key",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 20, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v WHERE v > 5",
+            "Unsupported",
+            "DO UPDATE WHERE",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 20, 'b'), (1, 30, 'c') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+            "Bind",
+            "second time",
+        ),
+        (
+            "UPDATE t SET v = 9 WHERE id = 1 RETURNING id",
+            "Unsupported",
+            "RETURNING",
+        ),
+        ("DELETE FROM t WHERE id = 1 RETURNING id", "Unsupported", "RETURNING"),
+        ("DELETE FROM t LIMIT 1", "Unsupported", "LIMIT"),
+        ("DELETE FROM t ORDER BY id", "Unsupported", "ORDER BY"),
+        // The join forms are refused before any name resolves, so `other` need
+        // not exist.
+        (
+            "UPDATE t SET v = o.v FROM other o WHERE t.id = o.id",
+            "Unsupported",
+            "join-update",
+        ),
+        (
+            "DELETE FROM t USING other o WHERE t.id = o.id",
+            "Unsupported",
+            "join-delete",
+        ),
+        (
+            "UPDATE t JOIN c ON t.id = c.a SET v = 1",
+            "Unsupported",
+            "exactly one simple FROM",
+        ),
+        ("UPDATE t SET id = 9 WHERE id = 1", "Unsupported", "primary key"),
+        ("UPDATE t SET v = UPPER(s)", "Bind", "cannot assign a string value"),
+        // A written alias displaces the table name, and a qualifier naming
+        // anything else is not silently ignored.
+        ("UPDATE t AS x SET v = 1 WHERE t.v = 1", "Bind", "not found"),
+        ("DELETE FROM t WHERE nope.v = 1", "Bind", "not found"),
+        // A stream has no stored row to mutate or to resolve a conflict against.
+        ("UPDATE st SET v = 1 WHERE id = 1", "Unsupported", "is a stream"),
+        ("DELETE FROM st WHERE id = 1", "Unsupported", "is a stream"),
+        (
+            "INSERT INTO st VALUES (1, 2) ON CONFLICT (id) DO NOTHING",
+            "Unsupported",
+            "is a stream",
+        ),
+    ] {
+        assert_rejects_variant(&mut client, &sn, sql, variant, needle);
+    }
+    // The written alias is the one qualifier that answers.
+    exec(&mut client, &sn, "UPDATE t AS x SET v = 11 WHERE x.v = 10");
+    assert_eq!(
+        rows(&mut client, &sn, "SELECT id, v FROM t", &["id", "v"]),
+        at_weight_one(&[vec![1, 11]])
+    );
+}
+
 /// EXPLAIN issues strictly less than the SELECT already allowed inside a
 /// transaction, so it runs there and leaves the transaction open.
 #[test]

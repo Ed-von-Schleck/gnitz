@@ -10,7 +10,7 @@ so the two comparators must agree exactly: a divergence drops rows rather than
 merely reordering them. That is why the TEXT-with-NULLs and float cases pin
 values and not just an order.
 
-What the bound refuses is in `admissibility/test_sql_rejections.py`.
+What the bound refuses is pinned in the planner's `gnitz-sql/tests/plan_read.rs`.
 """
 
 import pytest

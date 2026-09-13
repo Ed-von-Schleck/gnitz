@@ -1,666 +1,264 @@
-"""Foreign keys: what a declaration registers, and what the constraint refuses.
+"""Foreign keys: which writes the constraint admits, and which it refuses.
 
-RESTRICT is checked against the *fold* a write produces, not against committed
-state row by row: a child the same write removes exempts its parent, and a
-referenced value the write re-adds under another row never leaves. That holds on
-the transaction path (INSERT/UPDATE/DELETE) and the plain path (binary
-push/delete) alike, and across workers — the suite runs at GNITZ_WORKERS=4.
+A write is checked against the *fold* it produces, not against committed state
+row by row: a child the same write removes exempts its parent, and a referenced
+value the write re-adds under another row never leaves. That holds on the
+statement path (autocommit or one transaction) and the plain path (binary
+push/delete) alike, and across workers — the suite runs at GNITZ_WORKERS=4. The
+declarations the planner refuses are pinned in its own tests.
 """
-import threading
 
 import pytest
 import gnitz
-from _serverproc import NEEDS_MULTI, join_or_fail
 from _read import bag, scanned
-from _uid import uid as _uid
+from _serverproc import NEEDS_MULTI
+from _sql import insert
 
 _PARENT = "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
-# The existence check broadcasts, so the parent's placement decides what each
-# worker can answer from: a replicated parent is whole on every worker.
-_PARENT_REPLICATED = _PARENT + " WITH (replicated = true)"
-_CHILD_INLINE = ("CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
-                 " pid BIGINT NOT NULL REFERENCES parent(id))")
-_CHILD_TABLE_LEVEL = ("CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
-                      " pid BIGINT NOT NULL, FOREIGN KEY (pid) REFERENCES parent(id))")
-
-# `p(pid, code UNIQUE)` with `c(cid, ref REFERENCES p(code))`: an FK whose target
-# is a non-PK UNIQUE column, which resolves the referenced value from committed
+_CHILD = ("CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
+          " pid BIGINT NOT NULL REFERENCES parent(id))")
+_FK_PAIR = f"{_PARENT}; {_CHILD}"
+_TREE = "CREATE TABLE tree (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT REFERENCES tree(id))"
+# A non-PK UNIQUE target, whose referenced value is resolved from committed
 # storage through the batched gather.
-_P_CODE = ("CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY,"
-           " code BIGINT UNSIGNED NOT NULL)")
-_C_CODE = ("CREATE TABLE {name} (cid BIGINT PRIMARY KEY,"
-           " ref BIGINT UNSIGNED REFERENCES p(code))")
+_CODE_PAIR = ("CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED); "
+              "CREATE UNIQUE INDEX p_code ON p(code); "
+              "CREATE TABLE c (cid BIGINT PRIMARY KEY, ref BIGINT UNSIGNED REFERENCES p(code))")
 
 
-def _race(*labelled_writes):
-    """Run each `(label, fn)` on its own thread, released together by a barrier,
-    and return the `(label, GnitzError)` pairs raised. Writes that contend for
-    the same FK lock set serialize, so one of a conflicting pair is rejected."""
-    errors = []
-    start = threading.Barrier(len(labelled_writes))
-
-    def run(label, fn):
-        start.wait()
-        try:
-            fn()
-        except gnitz.GnitzError as e:
-            errors.append((label, e))
-
-    threads = [threading.Thread(target=run, args=w, daemon=True) for w in labelled_writes]
-    for t in threads:
-        t.start()
-    join_or_fail("a racing FK write hung", *threads)
-    return errors
+def _seed(client, sn, ddl, seed):
+    client.execute_sql(ddl, schema_name=sn)
+    for table, rows in seed.items():
+        if rows:
+            insert(client, sn, table, rows)
 
 
-@pytest.fixture
-def fk_pair(client, schema_name):
-    """`parent(id, val)` and `child(cid, pid -> parent.id)`."""
-    client.execute_sql(_PARENT, schema_name=schema_name)
-    client.execute_sql(_CHILD_INLINE, schema_name=schema_name)
-    return schema_name
+def _held(client, sn, tables):
+    """Each named table's bag."""
+    return {t: bag(scanned(client, sn, t)) for t in tables}
 
 
-@pytest.fixture
-def code_pair(client, schema_name):
-    """`p(pid, code UNIQUE)` and `c(cid, ref -> p.code)`."""
-    client.execute_sql(_P_CODE, schema_name=schema_name)
-    client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=schema_name)
-    client.execute_sql(_C_CODE.format(name="c"), schema_name=schema_name)
-    return schema_name
+def _want(rows_by_table):
+    return {t: dict.fromkeys(rows, 1) for t, rows in rows_by_table.items()}
 
 
-@pytest.fixture
-def tree(client, schema_name):
-    """A self-referential `tree(id, parent_id -> tree.id)`; yields `(sn, tid, schema)`."""
-    client.execute_sql(
-        "CREATE TABLE tree (id BIGINT NOT NULL PRIMARY KEY,"
-        " parent_id BIGINT REFERENCES tree(id))",
-        schema_name=schema_name)
-    tid, schema = client.resolve_table(schema_name, "tree")
-    return schema_name, tid, schema
+# ── A reference lands only on a live target ──────────────────────────────────
 
-
-# ── Declaring the constraint ─────────────────────────────────────────────────
-
-@pytest.mark.parametrize("parent_ddl,child_ddl", [
-    pytest.param(_PARENT, _CHILD_INLINE, id="inline-references"),
-    pytest.param(_PARENT, _CHILD_TABLE_LEVEL, id="table-level"),
-    pytest.param(_PARENT_REPLICATED, _CHILD_INLINE, id="replicated-parent",
-                 marks=NEEDS_MULTI),
-])
-def test_fk_declared_and_enforced(client, schema_name, parent_ddl, child_ddl):
-    """Both spellings register the same constraint, and it holds against either
-    parent placement: a child row referencing a live parent lands, one
-    referencing nothing is refused."""
-    client.execute_sql(parent_ddl, schema_name=schema_name)
-    assert client.execute_sql(child_ddl, schema_name=schema_name)[0]["type"] == "TableCreated"
-
-    client.execute_sql("INSERT INTO parent VALUES (1, 100)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO child VALUES (10, 1)", schema_name=schema_name)
-    assert [r.cid for r in client.scan(client.resolve_table(schema_name, "child")[0])] == [10]
-
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql("INSERT INTO child VALUES (11, 999)", schema_name=schema_name)
-
-
-def test_fk_declaration_rejections(client, schema_name):
-    """A target that cannot carry a reference: an unresolvable relation, and a
-    column that is neither the PK nor a UNIQUE index."""
-    with pytest.raises(gnitz.GnitzError, match="(?i)does not exist"):
-        client.execute_sql(
-            "CREATE TABLE c1 (cid BIGINT NOT NULL PRIMARY KEY,"
-            " pid BIGINT NOT NULL REFERENCES phantom(id))", schema_name=schema_name)
-
-    client.execute_sql(_PARENT, schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match="(?i)primary key"):
-        client.execute_sql(
-            "CREATE TABLE c2 (cid BIGINT NOT NULL PRIMARY KEY,"
-            " pid BIGINT NOT NULL REFERENCES parent(val))", schema_name=schema_name)
-
-
-def test_fk_nullable_allows_null(client, schema_name):
-    """A NULL FK cell references nothing, so it is not checked."""
-    client.execute_sql(_PARENT, schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
-        " pid BIGINT REFERENCES parent(id))", schema_name=schema_name)
-    client.execute_sql("INSERT INTO child VALUES (10, NULL)", schema_name=schema_name)
-    tid, _ = client.resolve_table(schema_name, "child")
-    assert [(r.cid, r.pid) for r in client.scan(tid)] == [(10, None)]
-
-
-def test_fk_parent_pk_not_first_column(client, schema_name):
-    """Regression: parent PK declared at a NON-leading column position.
-
-    The distributed FK existence check (`build_check_batch`) resolved the probe
-    key's type and width from the parent's first declared column instead of its
-    PK column. Here the parent leads with a 16-byte STRING and its BIGINT PK is
-    the second column, so the probe was encoded at the wrong width and zeroed
-    out — a valid child reference was rejected (and a dangling one could be
-    silently accepted if an all-zero parent key existed).
-    """
-    client.execute_sql(
-        "CREATE TABLE users (label VARCHAR(255) NOT NULL, id BIGINT NOT NULL PRIMARY KEY)",
-        schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE orders (oid BIGINT NOT NULL PRIMARY KEY,"
-        " user_id BIGINT NOT NULL REFERENCES users(id))", schema_name=schema_name)
-    client.execute_sql("INSERT INTO users VALUES ('alice', 42)", schema_name=schema_name)
-    # Valid reference to users(id = 42) must succeed (pre-fix: rejected).
-    client.execute_sql("INSERT INTO orders VALUES (1, 42)", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql("INSERT INTO orders VALUES (2, 999)", schema_name=schema_name)
-
-
-def test_dup_name_fk_create_leaves_no_phantom_child(client, schema_name):
-    """A duplicate-name CREATE TABLE whose column REFERENCES a parent must not
-    strand a phantom FK child. Pre-fix, the COL_TAB families committed as a
-    separate RPC *before* the TABLE_TAB name check failed, so the running
-    master's fk_by_parent[parent] carried a phantom child and DROP TABLE parent
-    was blocked in the same session (and every reboot re-materialised it). Under
-    atomic CREATE the whole bundle rolls back in master memory.
-    """
-    client.execute_sql(_PARENT, schema_name=schema_name)
-    client.execute_sql("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY,"
-            " pref BIGINT NOT NULL REFERENCES parent(id))", schema_name=schema_name)
-    # The real `t` has no FK to parent, so the ONLY thing that could block this
-    # is a stranded phantom child.
-    client.execute_sql("DROP TABLE parent", schema_name=schema_name)
-
-
-def test_drop_is_gated_by_the_live_constraint(client, fk_pair):
-    """DROP TABLE on a referenced parent is refused while the child table
-    exists, and succeeds once it is gone — whether or not rows are present."""
-    client.execute_sql("INSERT INTO parent VALUES (1, 100)", schema_name=fk_pair)
-    client.execute_sql("INSERT INTO child VALUES (10, 1)", schema_name=fk_pair)
-
-    with pytest.raises(gnitz.GnitzError, match="(?i)integrity violation"):
-        client.execute_sql("DROP TABLE parent", schema_name=fk_pair)
-
-    client.execute_sql("DROP TABLE child", schema_name=fk_pair)
-    client.execute_sql("DROP TABLE parent", schema_name=fk_pair)
-
-
-# ── RESTRICT on the transaction path ─────────────────────────────────────────
-
-def test_delete_restrict(client, fk_pair):
-    """A referenced parent row cannot be deleted; once the child that references
-    it is gone it can, and an unreferenced row never blocked."""
-    client.execute_sql("INSERT INTO parent VALUES (1, 100), (2, 200)", schema_name=fk_pair)
-    client.execute_sql("INSERT INTO child VALUES (10, 1)", schema_name=fk_pair)
-    ptid, _ = client.resolve_table(fk_pair, "parent")
-
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql("DELETE FROM parent WHERE id = 1", schema_name=fk_pair)
-    # An unreferenced parent row was never blocked.
-    client.execute_sql("DELETE FROM parent WHERE id = 2", schema_name=fk_pair)
-    # Retiring the child frees the one that was.
-    client.execute_sql("DELETE FROM child WHERE cid = 10", schema_name=fk_pair)
-    client.execute_sql("DELETE FROM parent WHERE id = 1", schema_name=fk_pair)
-    assert not list(client.scan(ptid))
-
-
-def test_update_validates_the_new_value_only(client, fk_pair):
-    """An UPDATE of the child's FK column is checked against the value it writes;
-    an UPDATE of the parent's *payload* is an upsert, not a removal, so it is
-    never a RESTRICT event even while the row is referenced."""
-    client.execute_sql("INSERT INTO parent VALUES (1, 100), (2, 200)", schema_name=fk_pair)
-    client.execute_sql("INSERT INTO child VALUES (10, 1)", schema_name=fk_pair)
-
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql("UPDATE child SET pid = 999 WHERE cid = 10", schema_name=fk_pair)
-    client.execute_sql("UPDATE child SET pid = 2 WHERE cid = 10", schema_name=fk_pair)
-
-    client.execute_sql("UPDATE parent SET val = 999 WHERE id = 2", schema_name=fk_pair)
-    ptid, _ = client.resolve_table(fk_pair, "parent")
-    assert sorted((r.id, r.val) for r in client.scan(ptid)) == [(1, 100), (2, 999)]
-
-
-def test_delete_blocked_by_either_of_two_children(client, schema_name):
-    """Two children on one parent: whichever still holds a reference blocks."""
-    client.execute_sql(_PARENT, schema_name=schema_name)
-    for name in ("child1", "child2"):
-        client.execute_sql(
-            f"CREATE TABLE {name} (cid BIGINT NOT NULL PRIMARY KEY,"
-            " pid BIGINT NOT NULL REFERENCES parent(id))", schema_name=schema_name)
-    client.execute_sql("INSERT INTO parent VALUES (1, 100)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO child1 VALUES (10, 1)", schema_name=schema_name)
-
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql("DELETE FROM parent WHERE id = 1", schema_name=schema_name)
-    # child2 carries the constraint but holds no row, so retiring child1's row
-    # is enough.
-    client.execute_sql("DELETE FROM child1 WHERE cid = 10", schema_name=schema_name)
-    client.execute_sql("DELETE FROM parent WHERE id = 1", schema_name=schema_name)
-
-
-# (committed parent ids, committed child rows, a transaction body, the parents
-# and children after it — or None where it is refused and both keep what they
-# held). The bundle is checked against its fold, not statement by statement, so
-# order and a retire-then-restore of a referenced key never matter.
-_FK_BUNDLES = {
-    "a child before its parent": (
-        [], [], "INSERT INTO child VALUES (1, 100); INSERT INTO parent VALUES (100, 0)",
-        ([(100, 0)], [(1, 100)])),
-    "a parent re-inserted beside a new child": (
-        [100], [], "DELETE FROM parent WHERE id = 100; INSERT INTO parent VALUES (100, 1); "
-                   "INSERT INTO child VALUES (1, 100)",
-        ([(100, 1)], [(1, 100)])),
-    "a child re-pointed off the parent the bundle deletes": (
-        [100, 200], [(1, 100)],
-        "DELETE FROM parent WHERE id = 100; UPDATE child SET pid = 200 WHERE cid = 1",
-        ([(200, 0)], [(1, 200)])),
-    "a child inserted under the parent the bundle deletes": (
-        [100], [], "DELETE FROM parent WHERE id = 100; INSERT INTO child VALUES (1, 100)", None),
+# `(ddl, rows seeded per table, a (table, row) referencing nothing)`.
+_ENFORCED = {
+    "inline-references": (_FK_PAIR, {"parent": [(1, 100)], "child": [(10, 1)]}, ("child", (11, 999))),
+    "table-level": (
+        _PARENT + "; CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT NOT NULL,"
+                  " FOREIGN KEY (pid) REFERENCES parent(id))",
+        {"parent": [(1, 100)], "child": [(10, 1)]}, ("child", (11, 999))),
+    # The existence check broadcasts, so the parent's placement decides what
+    # each worker answers from.
+    "replicated-parent": pytest.param(
+        _PARENT + " WITH (replicated = true); " + _CHILD,
+        {"parent": [(1, 100)], "child": [(10, 1)]}, ("child", (11, 999)), marks=NEEDS_MULTI),
+    # A NULL cell references nothing, so it is not checked.
+    "null-reference": (
+        _PARENT + "; CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT REFERENCES parent(id))",
+        {"parent": [], "child": [(10, None)]}, ("child", (11, 999))),
+    # The probe key's type and width come from the parent's PK column, not from
+    # its first declared column.
+    "parent-pk-not-first": (
+        "CREATE TABLE parent (label TEXT NOT NULL, id BIGINT NOT NULL PRIMARY KEY); " + _CHILD,
+        {"parent": [("alice", 42)], "child": [(1, 42)]}, ("child", (2, 999))),
+    # An FK column that is also the PK has no payload slot, so the check reads
+    # the value out of the key region.
+    "fk-column-is-the-pk": (
+        "CREATE TABLE parent (id BIGINT UNSIGNED PRIMARY KEY); "
+        "CREATE TABLE child (cid BIGINT UNSIGNED PRIMARY KEY REFERENCES parent(id))",
+        {"parent": [(1,)], "child": [(1,)]}, ("child", (99,))),
+    # A row of the same batch satisfies a self-reference — its own included —
+    # where a committed-state probe would refuse both.
+    "self-reference": (_TREE, {"tree": [(1, None), (2, 1), (3, 3)]}, ("tree", (4, 99))),
 }
 
 
-@pytest.mark.parametrize("parents,children,body,after", _FK_BUNDLES.values(), ids=_FK_BUNDLES.keys())
-def test_a_transaction_is_checked_against_its_fold(client, fk_pair, parents, children, body, after):
-    sn = fk_pair
-    before = ([(p, 0) for p in parents], children)
-    for table, rows in zip(("parent", "child"), before):
-        if rows:
-            client.execute_sql(f"INSERT INTO {table} VALUES " + ", ".join(map(str, rows)),
-                               schema_name=sn)
+@pytest.mark.parametrize("ddl,seed,dangling", _ENFORCED.values(), ids=_ENFORCED.keys())
+def test_a_reference_lands_only_on_a_live_target(client, schema_name, ddl, seed, dangling):
+    sn = schema_name
+    _seed(client, sn, ddl, seed)
+    assert _held(client, sn, seed) == _want(seed)
+    table, row = dangling
+    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+        insert(client, sn, table, [row])
+    assert _held(client, sn, seed) == _want(seed)
+
+
+# ── A write lands only if every reference survives its fold ──────────────────
+
+_PARENT_CHILD = {"parent": [(1, 100), (2, 200)], "child": [(10, 1)]}
+_TWO_CHILDREN = _PARENT + "".join(
+    f"; CREATE TABLE {n} (cid BIGINT NOT NULL PRIMARY KEY, pid BIGINT NOT NULL REFERENCES parent(id))"
+    for n in ("child1", "child2"))
+_TREE_ROWS = {"tree": [(1, None), (2, 1)]}
+_CODES = [(i, 1000 + i) for i in range(1, 21)]
+# Children reference the codes of pid 1..10; pid 11..20 are unreferenced.
+_CODE_ROWS = {"p": _CODES, "c": _CODES[:10]}
+_NULL_CODE = {"p": [(1, None), (2, 500)], "c": [(1, 500)]}
+_TWO_COLUMNS = (
+    "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED NOT NULL,"
+    " email BIGINT UNSIGNED NOT NULL); "
+    "CREATE UNIQUE INDEX ON p(code); CREATE UNIQUE INDEX ON p(email); "
+    "CREATE TABLE c1 (cid BIGINT PRIMARY KEY, ref BIGINT UNSIGNED REFERENCES p(code)); "
+    "CREATE TABLE c2 (cid BIGINT PRIMARY KEY, eref BIGINT UNSIGNED REFERENCES p(email))")
+_TWO_COLUMN_ROWS = {"p": [(1, 1001, 7001), (2, 1002, 7002), (3, 1003, 7003)],
+                    "c1": [(1, 1001)], "c2": [(1, 7002)]}
+
+# `(ddl, rows seeded per table, statements, every table's rows after — or None
+# where the statements are refused and every table keeps its seed)`.
+_STATEMENTS = {
+    "a referenced parent's delete": (_FK_PAIR, _PARENT_CHILD, "DELETE FROM parent WHERE id = 1", None),
+    "an unreferenced parent's delete": (
+        _FK_PAIR, _PARENT_CHILD, "DELETE FROM parent WHERE id = 2",
+        {"parent": [(1, 100)], "child": [(10, 1)]}),
+    "a leaf, then its parent": (
+        _FK_PAIR, _PARENT_CHILD, "DELETE FROM child WHERE cid = 10; DELETE FROM parent WHERE id = 1",
+        {"parent": [(2, 200)], "child": []}),
+    # An UPDATE of the FK column is checked against the value it writes...
+    "a child re-pointed at nothing": (_FK_PAIR, _PARENT_CHILD, "UPDATE child SET pid = 999 WHERE cid = 10", None),
+    "a child re-pointed at a live parent": (
+        _FK_PAIR, _PARENT_CHILD, "UPDATE child SET pid = 2 WHERE cid = 10",
+        {"parent": [(1, 100), (2, 200)], "child": [(10, 2)]}),
+    # ...and one of a referenced parent's payload is an upsert, never a removal.
+    "a referenced parent's payload": (
+        _FK_PAIR, _PARENT_CHILD, "UPDATE parent SET val = 999 WHERE id = 1",
+        {"parent": [(1, 999), (2, 200)], "child": [(10, 1)]}),
+    # One transaction folds whole, so statement order and a retire-then-restore
+    # of a referenced key never matter.
+    "a child before its parent": (
+        _FK_PAIR, {"parent": [], "child": []},
+        "BEGIN; INSERT INTO child VALUES (1, 100); INSERT INTO parent VALUES (100, 0); COMMIT",
+        {"parent": [(100, 0)], "child": [(1, 100)]}),
+    "a parent re-inserted beside a new child": (
+        _FK_PAIR, {"parent": [(100, 0)], "child": []},
+        "BEGIN; DELETE FROM parent WHERE id = 100; INSERT INTO parent VALUES (100, 1); "
+        "INSERT INTO child VALUES (1, 100); COMMIT",
+        {"parent": [(100, 1)], "child": [(1, 100)]}),
+    "a child re-pointed off the parent the bundle deletes": (
+        _FK_PAIR, {"parent": [(100, 0), (200, 0)], "child": [(1, 100)]},
+        "BEGIN; DELETE FROM parent WHERE id = 100; UPDATE child SET pid = 200 WHERE cid = 1; COMMIT",
+        {"parent": [(200, 0)], "child": [(1, 200)]}),
+    "a child inserted under the parent the bundle deletes": (
+        _FK_PAIR, {"parent": [(100, 0)], "child": []},
+        "BEGIN; DELETE FROM parent WHERE id = 100; INSERT INTO child VALUES (1, 100); COMMIT", None),
+    # Whichever child still holds a reference blocks; one holding none does not.
+    "a parent one of two children references": (
+        _TWO_CHILDREN, {"parent": [(1, 100)], "child1": [(10, 1)], "child2": []},
+        "DELETE FROM parent WHERE id = 1", None),
+    "that child retired, then the parent": (
+        _TWO_CHILDREN, {"parent": [(1, 100)], "child1": [(10, 1)], "child2": []},
+        "DELETE FROM child1 WHERE cid = 10; DELETE FROM parent WHERE id = 1",
+        {"parent": [], "child1": [], "child2": []}),
+    # RESTRICT finds the children by seeking the child relation, so a child at a
+    # negative PK has to be reachable by that seek.
+    "a parent of children at negative keys": (
+        _FK_PAIR, {"parent": [(1, 0)], "child": [(-5, 1), (-1, 1)]}, "DELETE FROM parent WHERE id = 1", None),
+    "a referenced tree row": (_TREE, _TREE_ROWS, "DELETE FROM tree WHERE id = 1", None),
+    # A child removed by the same statement does not block its parent.
+    "a whole tree": (_TREE, _TREE_ROWS, "DELETE FROM tree", {"tree": []}),
+    "a tree, leaf first": (
+        _TREE, _TREE_ROWS, "DELETE FROM tree WHERE id = 2; DELETE FROM tree WHERE id = 1", {"tree": []}),
+    # A bulk write over many referenced codes, and the same write over the
+    # unreferenced half.
+    "a bulk delete of referenced codes": (_CODE_PAIR, _CODE_ROWS, "DELETE FROM p WHERE pid <= 10", None),
+    "a bulk delete of unreferenced codes": (
+        _CODE_PAIR, _CODE_ROWS, "DELETE FROM p WHERE pid > 10", {"p": _CODES[:10], "c": _CODES[:10]}),
+    "a bulk renumbering of referenced codes": (
+        _CODE_PAIR, _CODE_ROWS, "UPDATE p SET code = code + 500000 WHERE pid <= 10", None),
+    "a bulk renumbering of unreferenced codes": (
+        _CODE_PAIR, _CODE_ROWS, "UPDATE p SET code = code + 500000 WHERE pid > 10",
+        {"p": _CODES[:10] + [(pid, code + 500000) for pid, code in _CODES[10:]], "c": _CODES[:10]}),
+    # A NULL code blocks no child, and deleting an absent PK is a no-op.
+    "a NULL code and an absent row": (
+        _CODE_PAIR, _NULL_CODE, "DELETE FROM p WHERE pid = 1; DELETE FROM p WHERE pid = 999",
+        {"p": [(2, 500)], "c": [(1, 500)]}),
+    "a referenced code beside a NULL one": (_CODE_PAIR, _NULL_CODE, "DELETE FROM p WHERE pid = 2", None),
+    # Two children through two UNIQUE columns: the one hoisted gather resolves
+    # both, so each child's check sees its own referenced value.
+    "a row the code child references": (_TWO_COLUMNS, _TWO_COLUMN_ROWS, "DELETE FROM p WHERE pid = 1", None),
+    "a row the email child references": (_TWO_COLUMNS, _TWO_COLUMN_ROWS, "DELETE FROM p WHERE pid = 2", None),
+    "a row neither child references": (
+        _TWO_COLUMNS, _TWO_COLUMN_ROWS, "DELETE FROM p WHERE pid = 3",
+        {**_TWO_COLUMN_ROWS, "p": _TWO_COLUMN_ROWS["p"][:2]}),
+}
+
+
+@pytest.mark.parametrize("ddl,seed,stmts,after", _STATEMENTS.values(), ids=_STATEMENTS.keys())
+def test_a_statement_lands_only_if_every_reference_survives_its_fold(
+        client, schema_name, ddl, seed, stmts, after):
+    sn = schema_name
+    _seed(client, sn, ddl, seed)
     if after is None:
         with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-            client.execute_sql(f"BEGIN; {body}; COMMIT", schema_name=sn)
-        after = before
+            client.execute_sql(stmts, schema_name=sn)
+        after = seed
     else:
-        client.execute_sql(f"BEGIN; {body}; COMMIT", schema_name=sn)
-    assert (bag(scanned(client, sn, "parent")), bag(scanned(client, sn, "child"))) == tuple(
-        dict.fromkeys(rows, 1) for rows in after)
+        client.execute_sql(stmts, schema_name=sn)
+    assert _held(client, sn, after) == _want(after)
 
 
-def test_fk_holds_across_partitions_in_bulk(client, fk_pair):
-    """250 parents and 250 children over a PK spread that reaches every worker:
-    the check is distributed, and a dangling reference is still refused at the
-    far end of it."""
-    n = 250
-    for lo in range(0, n, 50):
-        hi = min(lo + 50, n)
-        client.execute_sql(
-            "INSERT INTO parent VALUES " + ", ".join(f"({i}, {i * 7})" for i in range(lo + 1, hi + 1)),
-            schema_name=fk_pair)
-        client.execute_sql(
-            "INSERT INTO child VALUES " + ", ".join(f"({10000 + i}, {i})" for i in range(lo + 1, hi + 1)),
-            schema_name=fk_pair)
-    assert bag(scanned(client, fk_pair, "child")) == {(10000 + i, i): 1 for i in range(1, n + 1)}
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql(f"INSERT INTO child VALUES (99999, {n + 1})", schema_name=fk_pair)
+# `(ddl, rows seeded per table, (verb, table, rows pushed or pks deleted), every
+# table's rows after — or None where the write is refused)`.
+_WRITES = {
+    # `retract(1)` beside `insert(2, parent=1)`: probing committed state finds 1
+    # present and would leave a durable dangling reference.
+    "a push removing the parent it references": (
+        _TREE, _TREE_ROWS,
+        ("push", "tree", [{"id": 1, "parent_id": None, "_weight": -1}, {"id": 2, "parent_id": 1}]), None),
+    # `insert(1)` then `retract(1)` nets to zero, yet the apply removes the
+    # committed row 1 — which row 2 references.
+    "a push netting a referenced row to zero": (
+        _TREE, _TREE_ROWS,
+        ("push", "tree", [{"id": 1, "parent_id": None}, {"id": 1, "parent_id": None, "_weight": -1}]), None),
+    "a push referencing nothing": (
+        _TREE, {"tree": []}, ("push", "tree", [{"id": 3, "parent_id": 99}]), None),
+    "a delete of a referenced row": (_TREE, _TREE_ROWS, ("delete", "tree", [1]), None),
+    # The only row referencing 1 leaves in the same push.
+    "a delete of a parent and its child": (_TREE, _TREE_ROWS, ("delete", "tree", [1, 2]), {"tree": []}),
+    # No referenced value leaves the parent, so the reference is intact at the
+    # end of the write: the engine checks NO ACTION, not per-row RESTRICT.
+    "a push swapping two codes": (
+        _CODE_PAIR, {"p": [(1, 100), (2, 200)], "c": [(1, 100)]},
+        ("push", "p", [{"pid": 1, "code": 200}, {"pid": 2, "code": 100}]),
+        {"p": [(1, 200), (2, 100)], "c": [(1, 100)]}),
+    # A delete carries filler payload, so the retired code is read from the
+    # committed row.
+    "a delete retiring a referenced code": (
+        _CODE_PAIR, {"p": [(1, 100), (2, 200), (3, 300)], "c": [(1, 200)]}, ("delete", "p", [1, 2]), None),
+    "a delete retiring unreferenced codes": (
+        _CODE_PAIR, {"p": [(1, 100), (2, 200), (3, 300)], "c": [(1, 200)]}, ("delete", "p", [1, 3]),
+        {"p": [(2, 200)], "c": [(1, 200)]}),
+}
 
 
-# ── The self-referential constraint ──────────────────────────────────────────
+@pytest.mark.parametrize("ddl,seed,write,after", _WRITES.values(), ids=_WRITES.keys())
+def test_a_binary_write_lands_only_if_every_reference_survives_its_fold(
+        client, schema_name, ddl, seed, write, after):
+    sn = schema_name
+    _seed(client, sn, ddl, seed)
+    verb, table, payload = write
+    tid, schema = client.resolve_table(sn, table)
 
-def test_self_referential_fk_registers_a_real_table_id(client, tree):
-    """The wire boundary, which is where the constraint used to be lost.
+    def run():
+        if verb == "push":
+            client.push(tid, gnitz.ZSetBatch(schema).extend(payload))
+        else:
+            client.delete(tid, schema, payload)
 
-    The planner cannot name the id of the table being created, so it ships a
-    marker the COL_TAB writer rewrites to the owner id. A behavioural test alone
-    would pass again the moment some path re-introduced a sentinel, because `0`
-    is also the engine's encoding for "this column has no FK".
-    """
-    sn, tid, _ = tree
-    assert tid > 0
-    cols = {r.col_idx: r.fk_table_id for r in client.scan(gnitz.COL_TAB) if r.owner_id == tid}
-    assert cols[0] == 0, "the PK column carries no FK"
-    assert cols[1] == tid, f"parent_id must reference tree itself, got {cols[1]}"
-
-
-def test_view_over_an_fk_table_is_not_an_fk_child(client, tree):
-    """A view's columns are clones of the projected source defs, so a projected
-    FK column would carry the source's `fk_table_id`. Registering that as a
-    constraint makes the view an FK child of the parent — and a view gets no FK
-    auto-index, so every parent delete then fails on a missing one. The same
-    view over a self-FK table would make the table its own second, spurious
-    child.
-    """
-    sn, tid, _ = tree
-    client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
-    client.execute_sql("CREATE VIEW tree_v AS SELECT id, parent_id FROM tree", schema_name=sn)
-
-    vid, _ = client.resolve_table(sn, "tree_v")
-    view_fks = [r.col_idx for r in client.scan(gnitz.COL_TAB)
-                if r.owner_id == vid and r.fk_table_id != 0]
-    assert not view_fks, f"view columns {view_fks} registered an FK"
-
-    # The real constraint still holds, and an unreferenced row deletes.
-    client.execute_sql("DELETE FROM tree WHERE id = 2", schema_name=sn)
-    assert {r.id for r in client.scan(tid)} == {1}
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql("INSERT INTO tree VALUES (3, 99)", schema_name=sn)
-
-
-def test_self_fk_column_referencing_itself_rejected(client, schema_name):
-    """A column that references the very column it is: a tautology, and its FK
-    auto-index would be skipped as a PK column, leaving parent deletes
-    unvalidatable."""
-    with pytest.raises(gnitz.GnitzError, match="(?i)referenced column itself"):
-        client.execute_sql(
-            "CREATE TABLE selfcol (id BIGINT NOT NULL PRIMARY KEY REFERENCES selfcol(id))",
-            schema_name=schema_name)
-
-
-def test_self_fk_accepts_a_parent_the_same_batch_supplies(client, tree):
-    """The ordinary way to seed a tree: the row satisfying the reference is in
-    the same batch — including a row that is its own parent. A committed-state
-    probe would reject both."""
-    sn, tid, _ = tree
-    client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
-    client.execute_sql("INSERT INTO tree VALUES (3, 3)", schema_name=sn)
-    assert {(r.id, r.parent_id) for r in client.scan(tid)} == {(1, None), (2, 1), (3, 3)}
-
-
-def test_self_fk_rejects_an_absent_parent(client, tree):
-    """On the transaction path and the plain push path alike."""
-    sn, tid, schema = tree
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql("INSERT INTO tree VALUES (3, 99)", schema_name=sn)
-    batch = gnitz.ZSetBatch(schema)
-    batch.append(id=3, parent_id=99)
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.push(tid, batch)
-    assert not list(client.scan(tid))
-
-
-def test_self_fk_delete_restrict_on_both_paths(client, tree):
-    """Removing a referenced row is refused whether the removal arrives as a
-    statement bundle or as a binary delete."""
-    sn, tid, schema = tree
-    client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
-
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.execute_sql("DELETE FROM tree WHERE id = 1", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.delete(tid, schema, [1])
-    assert {r.id for r in client.scan(tid)} == {1, 2}
-
-
-@pytest.mark.parametrize("rows,expect_error", [
-    # `retract(1)` beside `insert(2, parent_id=1)`: probing committed state
-    # finds 1 present and would leave a durable dangling reference.
-    ([(1, None, -1), (2, 1, 1)], True),
-    # `insert(1)` then `retract(1)` nets to weight zero, yet the apply removes
-    # the committed row 1 — which row 2 references.
-    ([(1, None, 1), (1, None, -1)], True),
-], ids=["removes-the-parent-it-references", "net-zero-removal"])
-def test_self_fk_push_is_checked_against_the_fold(client, tree, rows, expect_error):
-    sn, tid, schema = tree
-    client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
-    batch = gnitz.ZSetBatch(schema)
-    for rid, parent, w in rows:
-        batch.append(id=rid, parent_id=parent, _weight=w)
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.push(tid, batch)
-    assert {r.id for r in client.scan(tid)} == {1, 2}, "the write must not have applied"
-
-
-@pytest.mark.parametrize("teardown", [
-    "DELETE FROM tree",                                       # parent and child at once
-    "DELETE FROM tree WHERE id = 2; DELETE FROM tree WHERE id = 1",   # leaf first
-], ids=["together", "leaf-first"])
-def test_self_fk_teardown_accepted(client, tree, teardown):
-    """A child removed by the same statement does not block its parent."""
-    sn, tid, _ = tree
-    client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
-    for stmt in teardown.split("; "):
-        client.execute_sql(stmt, schema_name=sn)
-    assert not list(client.scan(tid))
-
-
-def test_binary_delete_of_parent_and_child_together(client, tree):
-    """One `delete` removing both `(1, NULL)` and `(2, parent=1)`: the only row
-    referencing 1 is in the same push. Dropping the child from that push leaves
-    2 referencing 1, and is refused."""
-    sn, tid, schema = tree
-    client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.delete(tid, schema, [1])
-    assert {r.id for r in client.scan(tid)} == {1, 2}
-    client.delete(tid, schema, [1, 2])
-    assert not list(client.scan(tid))
-
-
-def test_drop_self_referential_table_with_rows(client, tree):
-    """The drop guard skips a blocking child that is itself in the drop set, and
-    for a self-FK the child *is* the table being dropped."""
-    sn, _, _ = tree
-    client.execute_sql("INSERT INTO tree VALUES (1, NULL), (2, 1)", schema_name=sn)
-    client.execute_sql("DROP TABLE tree", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError):
-        client.resolve_table(sn, "tree")
-
-
-# ── RESTRICT against a non-PK UNIQUE target ──────────────────────────────────
-
-@pytest.mark.parametrize("retire", [
-    "DELETE FROM p WHERE pid <= 10",
-    "UPDATE p SET code = code + 500000 WHERE pid <= 10",
-], ids=["delete", "update"])
-def test_bulk_retirement_of_a_referenced_code_is_blocked(client, code_pair, retire):
-    """The referenced parent column is resolved from committed storage via the
-    batched gather, so the verdict must hold over a bulk write spanning many
-    values — and the same write over unreferenced rows must go through."""
-    n = 20
-    client.execute_sql(
-        "INSERT INTO p VALUES " + ", ".join(f"({i}, {1000 + i})" for i in range(1, n + 1)),
-        schema_name=code_pair)
-    # Children reference the codes of pid 1..10; pid 11..20 are unreferenced.
-    client.execute_sql(
-        "INSERT INTO c VALUES " + ", ".join(f"({i}, {1000 + i})" for i in range(1, 11)),
-        schema_name=code_pair)
-
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql(retire, schema_name=code_pair)
-    # The same write over the unreferenced half goes through.
-    client.execute_sql(retire.replace("<= 10", "> 10"), schema_name=code_pair)
-
-    ptid, _ = client.resolve_table(code_pair, "p")
-    rows = {r.pid: r.code for r in client.scan(ptid)}
-    # The referenced rows are untouched either way; the unreferenced half was
-    # deleted or renumbered by the second statement.
-    assert all(rows[i] == 1000 + i for i in range(1, 11))
-    if retire.startswith("DELETE"):
-        assert sorted(rows) == list(range(1, 11))
+    if after is None:
+        with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+            run()
+        after = seed
     else:
-        assert all(rows[i] == 1000 + i + 500000 for i in range(11, n + 1))
+        run()
+    assert _held(client, sn, after) == _want(after)
 
 
-def test_two_children_two_columns_single_gather(client, schema_name):
-    """Two children referencing two distinct non-PK UNIQUE columns of one
-    parent: the single hoisted gather must resolve both columns so each child's
-    RESTRICT check sees its own referenced value."""
-    client.execute_sql(
-        "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED NOT NULL,"
-        " email BIGINT UNSIGNED NOT NULL)", schema_name=schema_name)
-    client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=schema_name)
-    client.execute_sql("CREATE UNIQUE INDEX ON p(email)", schema_name=schema_name)
-    client.execute_sql(_C_CODE.format(name="c1"), schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE c2 (cid BIGINT PRIMARY KEY, eref BIGINT UNSIGNED REFERENCES p(email))",
-        schema_name=schema_name)
-    client.execute_sql(
-        "INSERT INTO p VALUES " + ", ".join(f"({i}, {1000 + i}, {7000 + i})" for i in range(1, 13)),
-        schema_name=schema_name)
-    # c1 references the code of pid=1; c2 the email of pid=2.
-    client.execute_sql("INSERT INTO c1 VALUES (1, 1001)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO c2 VALUES (1, 7002)", schema_name=schema_name)
-
-    for pid in (1, 2):
-        with pytest.raises(gnitz.GnitzError):
-            client.execute_sql(f"DELETE FROM p WHERE pid = {pid}", schema_name=schema_name)
-    client.execute_sql("DELETE FROM p WHERE pid = 3", schema_name=schema_name)
-
-    ptid, _ = client.resolve_table(schema_name, "p")
-    seen = sorted(r.pid for r in client.scan(ptid))
-    assert 3 not in seen and 1 in seen and 2 in seen
-
-
-def test_null_and_absent_referenced_value_never_block(client, schema_name):
-    """A NULL referenced value blocks no child, and deleting a non-existent PK
-    is a harmless no-op — neither must error or block."""
-    client.execute_sql(
-        "CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY, code BIGINT UNSIGNED)",
-        schema_name=schema_name)
-    client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=schema_name)
-    client.execute_sql(_C_CODE.format(name="c"), schema_name=schema_name)
-    client.execute_sql("INSERT INTO p (pid, code) VALUES (1, NULL), (2, 500)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO c VALUES (1, 500)", schema_name=schema_name)
-
-    client.execute_sql("DELETE FROM p WHERE pid = 1", schema_name=schema_name)   # NULL code
-    client.execute_sql("DELETE FROM p WHERE pid = 999", schema_name=schema_name)  # absent PK
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql("DELETE FROM p WHERE pid = 2", schema_name=schema_name)
-
-    ptid, _ = client.resolve_table(schema_name, "p")
-    assert sorted(r.pid for r in client.scan(ptid)) == [2]
-
-
-def test_referenced_value_swapped_between_parent_rows_accepted(client, code_pair):
-    """`p={(1,code=100),(2,code=200)}` with a child on 100; one push swaps the
-    two codes. No referenced value leaves the parent, so the reference is intact
-    at end of statement — the engine checks NO ACTION, not per-row RESTRICT."""
-    client.execute_sql("INSERT INTO p VALUES (1, 100), (2, 200)", schema_name=code_pair)
-    client.execute_sql("INSERT INTO c VALUES (1, 100)", schema_name=code_pair)
-
-    ptid, pschema = client.resolve_table(code_pair, "p")
-    b = gnitz.ZSetBatch(pschema)
-    b.append(pid=1, code=200)
-    b.append(pid=2, code=100)
-    client.push(ptid, b)
-    assert sorted((r.pid, r.code) for r in client.scan(ptid)) == [(1, 200), (2, 100)]
-
-
-def test_binary_delete_retiring_a_non_pk_referenced_column(client, code_pair):
-    """A plain push whose parent delete retires a non-PK referenced column: the
-    delete carries filler payload, so the retired `code` comes from the
-    committed row. Referenced codes block; unreferenced ones delete."""
-    client.execute_sql("INSERT INTO p VALUES (1, 100), (2, 200), (3, 300)", schema_name=code_pair)
-    client.execute_sql("INSERT INTO c VALUES (1, 200)", schema_name=code_pair)
-    ptid, pschema = client.resolve_table(code_pair, "p")
-
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
-        client.delete(ptid, pschema, [1, 2])
-    assert sorted(r.pid for r in client.scan(ptid)) == [1, 2, 3]
-
-    client.delete(ptid, pschema, [1, 3])
-    assert sorted(r.pid for r in client.scan(ptid)) == [2]
-
-
-def test_index_epoch_invalidates_a_cached_parent_index_list(client, server, schema_name):
-    """FK-target validation reads a durable, per-connection cache of the
-    parent's secondary-index metadata. A per-table index epoch makes that cache
-    invalidate across connections: when another connection's DDL adds a UNIQUE
-    index on the referenced column, the cached list must be re-fetched on the
-    next FK check rather than served stale. A second reference on the warm,
-    unchanged epoch must then reuse the cache without corrupting it.
-    """
-    with gnitz.connect(server) as b:
-        client.execute_sql(_P_CODE, schema_name=schema_name)
-        # B caches the parent's (empty) index list at the base epoch: no UNIQUE
-        # index on `code`, so an FK against it is rejected.
-        with pytest.raises(gnitz.GnitzError):
-            b.execute_sql(_C_CODE.format(name="c1"), schema_name=schema_name)
-        # A adds the UNIQUE index on a different connection → epoch bump.
-        client.execute_sql("CREATE UNIQUE INDEX ON p(code)", schema_name=schema_name)
-        # B's cached epoch is now stale; the FK check must re-fetch and succeed.
-        b.execute_sql(_C_CODE.format(name="c2"), schema_name=schema_name)
-        # A third reference resolves against the warm cache at an unchanged
-        # epoch: the "unchanged" reply must not drop the cached list.
-        b.execute_sql(_C_CODE.format(name="c3"), schema_name=schema_name)
-
-        # The resolved FK is actually enforced at insert time.
-        client.execute_sql("INSERT INTO p VALUES (1, 1000)", schema_name=schema_name)
-        b.execute_sql("INSERT INTO c2 VALUES (1, 1000)", schema_name=schema_name)
-        with pytest.raises(gnitz.GnitzError):
-            b.execute_sql("INSERT INTO c2 VALUES (2, 9999)", schema_name=schema_name)
-
-
-# ── Under concurrency ────────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("self_fk", [False, True], ids=["two-tables", "self-fk"])
-def test_fk_enforced_under_concurrent_push_and_delete(server, self_fk):
-    """A binary push and a binary delete are both conflict-mode `Update`, so the
-    only thing keeping them off the shared table lock — where they would run
-    concurrently and each miss the other's uncommitted rows — is the FK terms of
-    the validator's predicate.
-
-    Each round races inserting a child against deleting its parent: exactly one
-    must be rejected, and no round may leave a child referencing an absent
-    parent. With a self-FK both endpoints are one table, so the lock set dedupes
-    to a single tid — the writer must still take that one guard exclusively.
-    """
-    sn = "fkrace" + _uid()
-    with gnitz.connect(server) as setup:
-        setup.create_schema(sn)
-        if self_fk:
-            setup.execute_sql(
-                "CREATE TABLE tree (id BIGINT NOT NULL PRIMARY KEY,"
-                " parent_id BIGINT REFERENCES tree(id))", schema_name=sn)
-            ptid, pschema = setup.resolve_table(sn, "tree")
-            ctid, cschema = ptid, pschema
-        else:
-            setup.execute_sql("CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
-                              schema_name=sn)
-            setup.execute_sql(_CHILD_INLINE, schema_name=sn)
-            ptid, pschema = setup.resolve_table(sn, "parent")
-            ctid, cschema = setup.resolve_table(sn, "child")
-
-    def seed_parent(conn):
-        b = gnitz.ZSetBatch(pschema)
-        if self_fk:
-            b.append(id=1, parent_id=None)
-        else:
-            b.append(id=1)
-        conn.push(ptid, b)
-
-    def make_child():
-        b = gnitz.ZSetBatch(cschema)
-        if self_fk:
-            b.append(id=2, parent_id=1)
-        else:
-            b.append(cid=2, pid=1)
-        return b
-
-    def child_pks(conn):
-        return [r.id for r in conn.scan(ctid) if r.id != 1] if self_fk \
-            else [r.cid for r in conn.scan(ctid)]
-
-    try:
-        with gnitz.connect(server) as setup, gnitz.connect(server) as a, gnitz.connect(server) as b:
-            for _ in range(20):
-                # Reset to {parent present, child absent}, touching only what is
-                # actually there — a retraction of an absent row is not a no-op.
-                children = child_pks(setup)
-                if children:
-                    setup.delete(ctid, cschema, children)
-                if 1 not in [r.id for r in setup.scan(ptid)]:
-                    seed_parent(setup)
-
-                child = make_child()
-                errors = _race(("push", lambda: a.push(ctid, child)),
-                               ("delete", lambda: b.delete(ptid, pschema, [1])))
-
-                rows = [(r.id, r.parent_id) for r in setup.scan(ptid)] if self_fk \
-                    else [(r.cid, r.pid) for r in setup.scan(ctid)]
-                present = {r.id for r in setup.scan(ptid)}
-                orphans = [k for k, ref in rows if ref is not None and ref not in present]
-                assert not orphans, f"rows {orphans} reference an absent parent"
-                assert len(errors) == 1, (
-                    f"expected exactly one of the two writes to be rejected, got {errors}")
-    finally:
-        with gnitz.connect(server) as c:
-            c.drop_schema(sn)
-
-
-# ── At scale ─────────────────────────────────────────────────────────────────
-
-def test_restrict_over_more_values_than_one_write_carries(client, fk_pair):
+def test_restrict_over_more_values_than_one_write_carries(client, schema_name):
     """`DELETE FROM child; DELETE FROM parent;` in one transaction over 1500
     referenced values that each still have a committed child.
 
@@ -670,114 +268,67 @@ def test_restrict_over_more_values_than_one_write_carries(client, fk_pair):
     bundle's child-row count. Leaving a single child behind must still be fatal,
     whichever order the workers answer in.
     """
-    n = 1500
-    for lo in range(0, n, 500):
-        hi = min(lo + 500, n)
-        client.execute_sql(
-            "INSERT INTO parent VALUES " + ", ".join(f"({i}, {i * 7})" for i in range(lo, hi)),
-            schema_name=fk_pair)
-        client.execute_sql(
-            "INSERT INTO child VALUES " + ", ".join(f"({i}, {i})" for i in range(lo, hi)),
-            schema_name=fk_pair)
-    parent_tid, _ = client.resolve_table(fk_pair, "parent")
-    child_tid, _ = client.resolve_table(fk_pair, "child")
-    assert len(client.scan(parent_tid)) == n
+    sn, n = schema_name, 1500
+    seed = {"parent": [(i, i * 7) for i in range(n)], "child": [(i, i) for i in range(n)]}
+    _seed(client, sn, _FK_PAIR, seed)
 
-    # One child survives → the whole bundle is rejected and nothing is applied.
     with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
         client.execute_sql(
-            "BEGIN; DELETE FROM child WHERE cid <> 777; DELETE FROM parent; COMMIT",
-            schema_name=fk_pair)
-    assert len(client.scan(parent_tid)) == n
+            "BEGIN; DELETE FROM child WHERE cid <> 777; DELETE FROM parent; COMMIT", schema_name=sn)
+    assert _held(client, sn, seed) == _want(seed)
 
-    # Leaf-first in one atomic statement pair is the natural spelling, and works.
-    client.execute_sql("BEGIN; DELETE FROM child; DELETE FROM parent; COMMIT",
-                       schema_name=fk_pair)
-    assert len(client.scan(child_tid)) == 0
-    assert len(client.scan(parent_tid)) == 0
+    client.execute_sql("BEGIN; DELETE FROM child; DELETE FROM parent; COMMIT", schema_name=sn)
+    assert _held(client, sn, seed) == {"parent": {}, "child": {}}
 
 
-# ── Targets and key shapes the declaration refuses ───────────────────────────
+# ── What a declaration registers and what it gates ───────────────────────────
 
-def test_a_compound_pk_offers_no_lone_column_to_reference(client, schema_name):
-    """A compound PK has no single PK column, so a member of it qualifies as an
-    FK target only through a UNIQUE index of its own — a plain member and a plain
-    payload column fail alike. The rule is "unique", not "part of the key"."""
-    client.execute_sql(
-        "CREATE TABLE parent (a BIGINT UNSIGNED, b BIGINT UNSIGNED, payload BIGINT, "
-        "PRIMARY KEY (a, b))", schema_name=schema_name)
-    for col in ("a", "payload"):
-        with pytest.raises(gnitz.GnitzError, match="(?i)unique"):
-            client.execute_sql(
-                f"CREATE TABLE chi (cid BIGINT PRIMARY KEY, "
-                f"ref BIGINT UNSIGNED REFERENCES parent({col}))", schema_name=schema_name)
+def test_only_a_base_table_registers_an_fk_and_a_self_reference_names_itself(client, schema_name):
+    """The planner cannot name the id of the table being created, so it ships a
+    marker the COL_TAB writer rewrites to the owner id — and `0` is also the
+    engine's encoding for "no FK", so only the catalog row shows the constraint
+    was not lost. A view's columns are clones of the projected source defs, so a
+    projected FK column would carry the source's FK id and make the view an FK
+    child with no auto-index, failing every parent delete."""
+    sn = schema_name
+    client.execute_sql(_TREE + "; CREATE VIEW tree_v AS SELECT id, parent_id FROM tree", schema_name=sn)
+    tid, _ = client.resolve_table(sn, "tree")
+    vid, _ = client.resolve_table(sn, "tree_v")
+    fks = {(r.owner_id, r.col_idx): r.fk_table_id
+           for r in client.scan(gnitz.COL_TAB) if r.owner_id in (tid, vid)}
+    assert fks == {(tid, 0): 0, (tid, 1): tid, (vid, 0): 0, (vid, 1): 0}
 
 
-def test_a_multi_column_foreign_key_is_refused(client, schema_name):
-    """One reference resolves one value through one gather, so a two-column FK
-    has no runtime form and is refused where it is declared."""
-    client.execute_sql(
-        "CREATE TABLE parent (a BIGINT UNSIGNED, b BIGINT UNSIGNED, payload BIGINT, "
-        "PRIMARY KEY (a, b))", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match="(?i)multi-column"):
+def test_dup_name_fk_create_leaves_no_phantom_child(client, schema_name):
+    """A duplicate-name CREATE TABLE whose column REFERENCES a parent must not
+    strand a phantom FK child: the whole CREATE bundle rolls back, so nothing
+    blocks dropping the parent afterwards."""
+    client.execute_sql(_PARENT + "; CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)", schema_name=schema_name)
+    with pytest.raises(gnitz.GnitzError):
         client.execute_sql(
-            "CREATE TABLE chi (x BIGINT UNSIGNED, y BIGINT UNSIGNED, "
-            "cid BIGINT PRIMARY KEY, FOREIGN KEY (x, y) REFERENCES parent (a, b))",
-            schema_name=schema_name)
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY,"
+            " pref BIGINT NOT NULL REFERENCES parent(id))", schema_name=schema_name)
+    # The real `t` has no FK to parent, so the ONLY thing that could block this
+    # is a stranded phantom child.
+    client.execute_sql("DROP TABLE parent", schema_name=schema_name)
 
 
-def test_a_child_whose_fk_column_is_its_own_key_is_enforced(client, schema_name):
-    """An FK column that is also a PK column has no payload slot, so the
-    existence check has to read the value out of the key region. Reading it
-    through the payload index instead finds another column's bytes — or none."""
-    client.execute_sql("CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY)",
-                       schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE c (cid BIGINT UNSIGNED PRIMARY KEY REFERENCES p(pid))",
-        schema_name=schema_name)
-    client.execute_sql("INSERT INTO p (pid) VALUES (1)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO c (cid) VALUES (1)", schema_name=schema_name)
+def test_drop_self_referential_table_with_rows(client, schema_name):
+    """The drop guard skips a blocking child that is itself in the drop set, and
+    for a self-FK the child *is* the table being dropped."""
+    sn = schema_name
+    _seed(client, sn, _TREE, _TREE_ROWS)
+    client.execute_sql("DROP TABLE tree", schema_name=sn)
     with pytest.raises(gnitz.GnitzError):
-        client.execute_sql("INSERT INTO c (cid) VALUES (99)", schema_name=schema_name)
+        client.resolve_table(sn, "tree")
 
 
-def test_restrict_sees_a_child_whose_own_key_is_negative(client, schema_name):
-    """RESTRICT finds the referencing children by seeking the child relation, so
-    a child at a negative PK has to be reachable by that seek. One the seek
-    missed would leave the parent deletable and the reference dangling — a
-    silent loss of the constraint rather than an error."""
-    client.execute_sql("CREATE TABLE parent (pid BIGINT UNSIGNED PRIMARY KEY)",
-                       schema_name=schema_name)
-    client.execute_sql(
-        "CREATE TABLE child (cid BIGINT PRIMARY KEY, fk_val BIGINT UNSIGNED NOT NULL, "
-        "FOREIGN KEY (fk_val) REFERENCES parent(pid))", schema_name=schema_name)
-    client.execute_sql("INSERT INTO parent (pid) VALUES (1)", schema_name=schema_name)
-    client.execute_sql("INSERT INTO child (cid, fk_val) VALUES (-5, 1), (-1, 1)",
-                       schema_name=schema_name)
-
-    with pytest.raises(gnitz.GnitzError):
-        client.execute_sql("DELETE FROM parent WHERE pid = 1", schema_name=schema_name)
-
-
-def test_the_unique_index_an_fk_resolves_through_cannot_be_dropped(client, code_pair):
+def test_the_unique_index_an_fk_resolves_through_cannot_be_dropped(client, schema_name):
     """The index is how the referenced value is resolved, so dropping it would
-    leave the constraint with no way to answer. `DROP TABLE` on the parent is
-    gated by the child; this is the same gate one level down, on the structure
-    rather than the relation.
-
-    The index name is read from the catalog rather than spelled out: the
-    generated name is an internal convention, and pinning it would fail the test
-    on a rename that changed no behaviour.
-    """
-    sn = code_pair
-    idx = client.scan(gnitz.IDX_TAB)
-    pid, _ = client.resolve_table(sn, "p")
-    names = [n for w, o, n in zip(idx.weights, idx.scalars("owner_id"), idx.scalars("name"))
-             if w > 0 and o == pid]
-    assert len(names) == 1, names
-
+    leave the constraint with no way to answer — the same gate `DROP TABLE` on
+    the parent has, one level down."""
+    sn = schema_name
+    client.execute_sql(_CODE_PAIR, schema_name=sn)
     with pytest.raises(gnitz.GnitzError, match="(?i)integrity"):
-        client.execute_sql(f"DROP INDEX {names[0]}", schema_name=sn)
-    # With the referencing table gone the index is droppable again.
-    client.execute_sql("DROP TABLE c", schema_name=sn)
-    client.execute_sql(f"DROP INDEX {names[0]}", schema_name=sn)
+        client.execute_sql("DROP INDEX p_code", schema_name=sn)
+    client.execute_sql("DROP TABLE c; DROP INDEX p_code", schema_name=sn)

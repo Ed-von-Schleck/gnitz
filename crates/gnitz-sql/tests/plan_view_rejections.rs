@@ -4,13 +4,14 @@
 
 mod pure;
 
-use gnitz_core::{CatalogSnapshot, RelClass, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RelClass, TypeCode, PK_LIST_MAX_COLS};
 use pure::*;
 
 /// [`base`] plus the shapes the rejections need: `w` (a second typed table),
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column
 /// PK), `wide_a`/`wide_b` (one join key past the arity cap), `wl`/`wr` (33
-/// columns each), `st` (a stream), and two join views over duplicated names —
+/// columns each), `st` (a stream), `x` (a DATE and two DECIMAL columns beside an
+/// integer, a float and a string), and two join views over duplicated names —
 /// `jv`, where `id` and `v` each appear twice, and `ju`, where only `v` does.
 fn cat() -> CatalogSnapshot {
     let i = TypeCode::I64;
@@ -71,6 +72,22 @@ fn cat() -> CatalogSnapshot {
                 vec![col("id", i), col("v", i)],
                 vec![0],
                 &[],
+            ),
+        ),
+        (
+            "x",
+            table(
+                51,
+                vec![
+                    col("id", i),
+                    col("i", i),
+                    col("f", TypeCode::F64),
+                    col("s", TypeCode::String),
+                    ncol("d", TypeCode::Date),
+                    ColumnDef::typed("price", ColType { tc: TypeCode::Decimal, scale: 2 }, false),
+                    ColumnDef::typed("qty", ColType { tc: TypeCode::Decimal, scale: 3 }, true),
+                ],
+                vec![0],
             ),
         ),
     ] {
@@ -426,6 +443,7 @@ fn grouped_body_rules() {
                 "Unsupported",
                 "names a wildcard",
             ),
+            ("SELECT v FROM t GROUP BY ALL", "Unsupported", "GROUP BY"),
         ],
     );
 }
@@ -436,9 +454,30 @@ fn set_op_and_distinct_rules() {
     view(&cat, "SELECT id FROM ty UNION SELECT id FROM w");
     view(&cat, "SELECT DISTINCT g FROM t");
     view(&cat, "(SELECT g FROM t WHERE g > 0) UNION SELECT g FROM t");
+    // A grouped or DISTINCT set-op side becomes a hidden segment, so its clauses
+    // are consumed there rather than refused.
+    view(&cat, "SELECT DISTINCT v FROM t UNION ALL SELECT g FROM u GROUP BY g");
     rejects(
         &cat,
         &[
+            // A DISTINCT body consumes none of these, so each is named rather
+            // than dropped — DISTINCT ON included, rather than folded to DISTINCT.
+            ("SELECT DISTINCT ON (v) v, id FROM t", "Unsupported", "DISTINCT ON"),
+            (
+                "SELECT DISTINCT ON (v) v FROM t UNION SELECT id FROM t",
+                "Unsupported",
+                "DISTINCT ON",
+            ),
+            ("SELECT DISTINCT ON (v) v FROM t", "Unsupported", "DISTINCT ON"),
+            ("SELECT DISTINCT v FROM t GROUP BY v", "Unsupported", "GROUP BY"),
+            ("SELECT DISTINCT v FROM t HAVING v > 0", "Unsupported", "HAVING"),
+            ("SELECT DISTINCT v FROM t PREWHERE v > 5", "Unsupported", "PREWHERE"),
+            ("SELECT DISTINCT TOP 5 v FROM t", "Unsupported", "TOP"),
+            (
+                "SELECT DISTINCT v FROM t QUALIFY v > 1",
+                "Unsupported",
+                "QUALIFY needs a window function",
+            ),
             (
                 "SELECT f FROM ty UNION SELECT f FROM w",
                 "Unsupported",
@@ -528,11 +567,76 @@ fn projection_and_envelope_rules() {
                 "Unsupported",
                 "REPLACE",
             ),
+            ("SELECT v FROM t PREWHERE v > 5", "Unsupported", "PREWHERE"),
+            (
+                "SELECT v, COUNT(*) FROM t PREWHERE v > 5 GROUP BY v",
+                "Unsupported",
+                "PREWHERE",
+            ),
+            ("SELECT v FROM t FETCH FIRST 5 ROWS ONLY", "Unsupported", "FETCH"),
+            ("SELECT v FROM t SORT BY v", "Unsupported", "SORT BY"),
+            ("SELECT id FROM t FOR UPDATE", "Unsupported", "FOR UPDATE"),
+            ("SELECT id FROM t SETTINGS max_threads = 1", "Unsupported", "SETTINGS"),
+            ("SELECT id FROM t FORMAT JSON", "Unsupported", "FORMAT"),
         ],
     );
-    // An alias list renames what the body produced; it does not disambiguate it.
-    let sql = "CREATE VIEW v (x, y) AS SELECT t.id, u.id FROM t JOIN u ON t.g = u.g";
-    assert_rejects(sql, plan(&cat, sql), "Plan", "duplicate column name");
+    // An alias list renames what the body produced; it neither disambiguates it
+    // nor names more columns than it has.
+    for (sql, needle) in [
+        (
+            "CREATE VIEW v (x, y) AS SELECT t.id, u.id FROM t JOIN u ON t.g = u.g",
+            "duplicate column name",
+        ),
+        ("CREATE VIEW v (a, b) AS SELECT id FROM t", "column aliases"),
+    ] {
+        assert_rejects(sql, plan(&cat, sql), "Plan", needle);
+    }
+}
+
+/// A scalar expression no program can hold is refused while planning, naming
+/// what is wrong with the expression rather than the node that rejected it.
+#[test]
+fn scalar_expression_rules() {
+    let cat = cat();
+    // The ROUND scales just inside the representable range.
+    view(&cat, "SELECT id, ROUND(i, 15) AS a, ROUND(i, -15) AS b FROM x");
+    for (expr, variant, needle) in [
+        // A view is recomputed from deltas, so a clock read would make its
+        // contents depend on when a tick ran.
+        ("NOW()", "Unsupported", "non-deterministic"),
+        ("CURRENT_DATE", "Unsupported", "non-deterministic"),
+        ("EXTRACT(YEAR FROM i)", "Unsupported", "DATE or TIMESTAMP"),
+        ("DATE_TRUNC('fortnight', d)", "Unsupported", "fortnight"),
+        ("DATE '2024-02-30'", "Bind", "invalid DATE literal"),
+        ("CAST(i AS UUID)", "Unsupported", "UUID"),
+        ("CAST(i AS BOOLEAN)", "Unsupported", "BOOLEAN"),
+        // A wide integer literal has no register slot at all.
+        (
+            "CAST(18446744073709551615 AS BIGINT UNSIGNED)",
+            "Unsupported",
+            "18446744073709551615",
+        ),
+        ("CAST('abc' AS DECIMAL(5, 2))", "Bind", "invalid DECIMAL literal"),
+        // Each product adds its operands' scales, so a chain of them runs past
+        // what the scaled integer can hold.
+        (
+            "qty * qty * qty * qty * qty * qty * qty",
+            "Unsupported",
+            "DECIMAL scale",
+        ),
+        // A string in a numeric position names the string operand.
+        ("GREATEST(s, s)", "Unsupported", "column \"s\" is a string"),
+        ("-s", "Unsupported", "column \"s\" is a string"),
+        ("s + 1", "Unsupported", "string operand"),
+        ("s AND i", "Unsupported", "string operand"),
+        ("s || 1", "Unsupported", "expected a string value"),
+        ("STRPOS(s, f)", "Unsupported", "expected a string value"),
+        ("LEFT(s, f)", "Unsupported", "must be an integer"),
+    ] {
+        rejects(&cat, &[(&format!("SELECT id, {expr} AS y FROM x"), variant, needle)]);
+    }
+    // Summing day counts yields a number that is not a date.
+    rejects(&cat, &[("SELECT SUM(d) AS y FROM x", "Unsupported", "Date column")]);
 }
 
 #[test]
@@ -629,6 +733,8 @@ fn ambiguous_and_hidden_column_rules() {
                 "is ambiguous",
             ),
             ("SELECT _join_pk FROM jv", "Bind", "not found"),
+            // A qualifier naming no relation in scope is not a decoration.
+            ("SELECT b.id FROM t", "Bind", "not found"),
             (
                 "SELECT t.id AS x FROM t JOIN u ON t.id = u.id JOIN a USING (v)",
                 "Bind",
@@ -751,9 +857,17 @@ fn view_statement_rejected_clause_matrix() {
             "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT id FROM t",
             "opposite outcomes",
         ),
+        // Its keys are never read, so accepting it would build an unbounded
+        // view where a bounded one was asked for.
+        (
+            "CREATE VIEW v OPTIONS(capacity = '4 MB') AS SELECT id FROM t",
+            "OPTIONS",
+        ),
     ] {
         assert_rejects(sql, plan(&cat, sql), "Unsupported", needle);
     }
+    // Every gnitz view is incrementally materialized, so the keyword is accepted.
+    assert!(plan(&cat, "CREATE MATERIALIZED VIEW v AS SELECT id FROM t").is_ok());
     // The column list is consumed as positional output aliases on both.
     assert!(plan(&cat, "ALTER VIEW tv (x, y) AS SELECT id, v FROM t").is_ok());
 }
