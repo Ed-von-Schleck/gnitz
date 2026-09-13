@@ -87,3 +87,49 @@ def test_a_stream_refuses(streamed, sql, needle):
     conn, sn = streamed
     with pytest.raises(gnitz.GnitzError, match=needle):
         conn.execute_sql(sql, schema_name=sn)
+
+
+def test_a_stream_is_not_readable_by_sql_or_any_binary_read_verb(streamed):
+    """Zero rows would make a live stream indistinguishable from an empty table,
+    so every read path errors instead — each binary verb on its own."""
+    conn, sn = streamed
+    tid, schema = conn.resolve_table(sn, "s")
+
+    for sql in (
+        "SELECT * FROM s",
+        "SELECT kind FROM s WHERE amount > 0",
+        "SELECT COUNT(*) FROM s",
+        "WITH c AS (SELECT id FROM s) SELECT id FROM c",
+    ):
+        with pytest.raises(gnitz.GnitzError, match="stream"):
+            conn.execute_sql(sql, schema_name=sn)
+
+    for verb in (
+        lambda: list(conn.scan(tid)),
+        lambda: list(conn.seek(tid, 1)),
+        lambda: list(conn.seek_by_index(tid, [1], [0])),
+        lambda: conn.scan_many([tid]),
+        lambda: conn.delta_bootstrap(tid, schema),
+    ):
+        with pytest.raises(gnitz.GnitzError, match="stream"):
+            verb()
+
+
+def test_a_transaction_writing_a_stream_is_refused_whole(streamed):
+    """A transaction promises all-or-nothing recovery and stream data is never
+    recovered, so a transaction touching a stream is refused — its writes to the
+    ordinary table included, rather than lost after a partial commit."""
+    conn, sn = streamed
+    t_tid, t_schema = conn.resolve_table(sn, "t")
+    s_tid, s_schema = conn.resolve_table(sn, "s")
+    tb = gnitz.ZSetBatch(t_schema)
+    tb.append(id=1, kind=1, _weight=1)
+    sb = gnitz.ZSetBatch(s_schema)
+    sb.append(id=2, kind=2, amount=2, _weight=1)
+
+    with pytest.raises(gnitz.GnitzError, match="stream"):
+        with conn.transaction() as txn:
+            txn.push(t_tid, tb)
+            txn.push(s_tid, sb)
+
+    assert [r.weight for r in conn.scan(t_tid)] == [], "the table's write must be refused with it"

@@ -101,17 +101,20 @@ def test_a_scan_of_a_replicated_table_returns_one_copy(client, schema_name):
 
 
 @NEEDS_MULTI
-def test_an_aggregate_over_a_replicated_source_is_not_w_folded(client, schema_name):
+@pytest.mark.parametrize("options", ["replicated = true", "stream = true, replicated = true"],
+                         ids=["table", "stream"])
+def test_an_aggregate_over_a_replicated_source_is_not_w_folded(client, schema_name, options):
     """A reduce over a replicated input must not shard.
 
     A sharded reduce would fold each of the W copies in, multiplying COUNT and
     SUM by the worker count; the planner builds the shard-free local reduce and
     the replicated output is single-sourced on read. The two groups carry
-    different totals, so swapping them fails too.
+    different totals, so swapping them fails too. A replicated stream must be
+    known as replicated just the same, though it holds no copy to read.
     """
     client.execute_sql(
         "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
-        "amount BIGINT NOT NULL)" + _REPL, schema_name=schema_name)
+        f"amount BIGINT NOT NULL) WITH ({options})", schema_name=schema_name)
     client.execute_sql(
         "CREATE VIEW v AS SELECT grp, COUNT(*) AS cnt, SUM(amount) AS total "
         "FROM dim GROUP BY grp", schema_name=schema_name)

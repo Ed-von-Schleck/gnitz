@@ -43,17 +43,6 @@ def _zset(rows):
     return {k: w for k, w in out.items() if w != 0}
 
 
-def _rows(results):
-    """The `ScanResult` of a one-statement `execute_sql` that returned rows.
-
-    What `_zset` consumes, so a `SELECT` run through a client and the same
-    `SELECT` run through a mirror reduce to comparable values in one step.
-    """
-    assert len(results) == 1, f"expected one statement result, got {len(results)}"
-    assert results[0]["type"] == "Rows", f"statement returned {results[0]['type']}"
-    return results[0]["rows"]
-
-
 def _mk_feed(client, sn, name, body, feed=FEED):
     client.execute_sql(f"CREATE VIEW {name} WITH (delta = '{feed}') AS {body}", schema_name=sn)
 
@@ -80,8 +69,10 @@ def _churn(client, sn, lo, hi, chunk=None):
     is its own settle, so a caller that needs many spills — the capacity sweep
     budgets itself to one push-down per spill — asks for small ones.
     """
-    for a in range(lo, hi + 1, chunk or (hi - lo + 1)):
-        b = min(a + (chunk or (hi - lo + 1)) - 1, hi)
+    span = hi - lo + 1
+    step = chunk or span
+    for a in range(lo, hi + 1, step):
+        b = min(a + step - 1, hi)
         client.execute_sql(
             "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'body-{i:0>20}')" for i in range(a, b + 1)),
             schema_name=sn,
@@ -90,7 +81,6 @@ def _churn(client, sn, lo, hi, chunk=None):
             "INSERT INTO u VALUES " + ",".join(f"({i}, {i}, {i * 7})" for i in range(a, b + 1)),
             schema_name=sn,
         )
-    span = hi - lo + 1
     client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id >= {lo} AND id < {lo + span // 3}", schema_name=sn)
     # `u` loses the longer tail, so `t.id` is never a subset of `u.tid` and the
     # SETOP body (`t EXCEPT u`) holds rows. The other way round it is empty, and

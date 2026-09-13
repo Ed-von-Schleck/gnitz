@@ -515,6 +515,7 @@ fn retired_children_are_reclaimed() {
     }
     fabricate_dir(&format!("{rel}/w9of3"), "marker");
     fabricate_dir(&format!("{rel}/scratch_agg_w7"), "marker");
+    fabricate_dir(&format!("{rel}/delta_w5"), "marker");
     // Not a child at all: an index dir must be left alone.
     fabricate_dir(&format!("{rel}/idx_7"), "marker");
 
@@ -529,6 +530,10 @@ fn retired_children_are_reclaimed() {
     }
     assert!(!Path::new(&format!("{rel}/w9of3")).exists(), "rank 9 is not launched");
     assert!(!Path::new(&format!("{rel}/scratch_agg_w7")).exists());
+    assert!(
+        !Path::new(&format!("{rel}/delta_w5")).exists(),
+        "rank 5 is not launched"
+    );
     assert!(
         Path::new(&format!("{rel}/idx_7")).exists(),
         "an index dir is not a child"

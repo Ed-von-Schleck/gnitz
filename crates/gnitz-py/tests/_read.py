@@ -9,8 +9,11 @@ weight-0 ghost as correct.
 
 
 def rows(client, sn, q):
-    """The rows of a direct SELECT, in result order."""
-    res = client.execute_sql(q, schema_name=sn)[0]
+    """The rows of a one-statement SELECT, in result order. `client` is anything
+    with `execute_sql` — a connection or a mirroring client."""
+    results = client.execute_sql(q, schema_name=sn)
+    assert len(results) == 1, f"expected one statement result, got {len(results)}"
+    res = results[0]
     assert res["type"] == "Rows", f"expected Rows, got {res['type']}: {res}"
     return list(res["rows"])
 

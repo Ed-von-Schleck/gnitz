@@ -21,8 +21,9 @@ import pytest
 import gnitz
 from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP,
-    _base_tables, _churn, _flood, _key, _mk_feed, _rows, _zset,
+    _base_tables, _churn, _flood, _key, _mk_feed, _zset,
 )
+from _read import rows
 from _uid import uid as _uid
 import _mirrorproc
 
@@ -34,9 +35,9 @@ def _local(mirror, sn, vid, sql):
     """One read off the copy, with the proof that it was one."""
     assert mirror.mirrors(vid), f"{sql}: the view is not answered locally"
     before = mirror.requests_sent
-    rows = _rows(mirror.execute_sql(sql, schema_name=sn))
+    got = rows(mirror, sn, sql)
     assert mirror.requests_sent == before, f"{sql}: the read was delegated upstream"
-    return rows
+    return got
 
 
 def _same_zset(what, local_rows, remote_rows):
@@ -137,9 +138,9 @@ def test_a_mirrored_read_equals_the_server_read(client, mirror, kind):
     _quiesce(client, mirror, sn)
 
     for q in _READS[kind]["plain"]:
-        _same_zset(q, _local(mirror, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+        _same_zset(q, _local(mirror, sn, vid, q), rows(client, sn, q))
     q = _READS[kind]["ordered"]
-    _same_sequence(q, _local(mirror, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+    _same_sequence(q, _local(mirror, sn, vid, q), rows(client, sn, q))
 
 
 # ── P2 · delegation ──────────────────────────────────────────────────────────
@@ -159,17 +160,17 @@ def test_an_unmirrored_relation_is_delegated_and_a_forgotten_one_goes_back(clien
     _quiesce(client, mirror, sn)
 
     before = mirror.requests_sent
-    delegated = _rows(mirror.execute_sql("SELECT * FROM t", schema_name=sn))
+    delegated = rows(mirror, sn, "SELECT * FROM t")
     cost = mirror.requests_sent - before
-    _same_zset("a delegated read", delegated, _rows(client.execute_sql("SELECT * FROM t", schema_name=sn)))
+    _same_zset("a delegated read", delegated, rows(client, sn, "SELECT * FROM t"))
     assert cost == 2, f"a delegated scan must cost one resolve and one read, not {cost}"
 
     mirror.forget_view(vid)
     assert not mirror.mirrors(vid)
     before = mirror.requests_sent
-    after_forget = _rows(mirror.execute_sql("SELECT * FROM f", schema_name=sn))
+    after_forget = rows(mirror, sn, "SELECT * FROM f")
     assert mirror.requests_sent > before, "a forgotten view must be read upstream again"
-    _same_zset("a forgotten view", after_forget, _rows(client.execute_sql("SELECT * FROM f", schema_name=sn)))
+    _same_zset("a forgotten view", after_forget, rows(client, sn, "SELECT * FROM f"))
 
 
 # ── P3 · the handle's life in an interpreter ─────────────────────────────────
@@ -218,7 +219,7 @@ def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
             third.poll()
         assert "mirrors nothing" in str(e.value)
         # The connection is untouched.
-        assert _rows(third.execute_sql("SELECT * FROM t", schema_name=sn))
+        assert rows(third, sn, "SELECT * FROM t")
         third.mirror_at(base)
         assert third.mirror_view(sn, "f").view_id == r.view_id
 
@@ -375,12 +376,12 @@ def test_one_poll_mixes_a_moved_view_with_idle_ones(client, mirror):
         assert report[vid].cursor[1] >= prev[1], f"{vid}: the round never goes backwards"
 
     q = "SELECT * FROM f"
-    _same_zset(q, _local(mirror, sn, moved, q), _rows(client.execute_sql(q, schema_name=sn)))
+    _same_zset(q, _local(mirror, sn, moved, q), rows(client, sn, q))
     for name, vid in idle.items():
         q = f"SELECT * FROM {name}"
         local = _local(mirror, sn, vid, q)
         assert _zset(local) == idle_before[vid], f"{name}: nothing was pushed to it, so its copy must be unchanged"
-        _same_zset(q, local, _rows(client.execute_sql(q, schema_name=sn)))
+        _same_zset(q, local, rows(client, sn, q))
 
 
 def test_a_dead_view_fails_its_own_entry_and_stops_nothing_else(client, mirror):
@@ -411,7 +412,7 @@ def test_a_dead_view_fails_its_own_entry_and_stops_nothing_else(client, mirror):
     mirror.forget_view(dead)
     assert all(r.error is None for r in mirror.poll()), "the poll recovers once it is forgotten"
     q = "SELECT * FROM f"
-    _same_zset(q, _local(mirror, sn, alive, q), _rows(client.execute_sql(q, schema_name=sn)))
+    _same_zset(q, _local(mirror, sn, alive, q), rows(client, sn, q))
 
 
 def test_a_reconnect_after_a_restart_reseeds_and_converges(own_server, mirror_on, mirror_dir):
@@ -438,7 +439,7 @@ def test_a_reconnect_after_a_restart_reseeds_and_converges(own_server, mirror_on
         )
         _quiesce(client, m, sn)
         q = "SELECT * FROM f"
-        _same_zset(q, _local(m, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+        _same_zset(q, _local(m, sn, vid, q), rows(client, sn, q))
 
 
 # ── P6 · a mirror is not read-your-own-writes ────────────────────────────────
@@ -463,7 +464,7 @@ def test_a_mirror_is_not_read_your_own_writes(client, mirror):
     _quiesce(client, mirror, sn)
     after = _zset(_local(mirror, sn, vid, q))
     assert after != before, "a drain must carry the write into the copy"
-    _same_zset(q, _local(mirror, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+    _same_zset(q, _local(mirror, sn, vid, q), rows(client, sn, q))
 
 
 # ── P7 · cursor expiry recovers without the host seeing it ───────────────────
@@ -495,7 +496,7 @@ def test_an_expired_cursor_recovers_inside_the_poll(sweeping_server, mirror_on, 
 
         _quiesce(client, m, sn)
         q = "SELECT id, v FROM f WHERE id > 4000"
-        _same_zset(q, _local(m, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+        _same_zset(q, _local(m, sn, vid, q), rows(client, sn, q))
 
 
 # ── P8 · a host crash ────────────────────────────────────────────────────────
@@ -528,7 +529,7 @@ def test_a_killed_host_reopens_at_its_last_checkpoint(client, server, mirror_on,
     vid = m.mirror_view(sn, "f").view_id
     _quiesce(client, m, sn)
     for q in ("SELECT * FROM f", "SELECT COUNT(*) AS n, SUM(v) AS total FROM f"):
-        _same_zset(q, _local(m, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+        _same_zset(q, _local(m, sn, vid, q), rows(client, sn, q))
 
 
 # ── P9 · the mirror does not disturb the process ─────────────────────────────
@@ -552,7 +553,7 @@ def test_the_mirrors_own_connection_serves_every_other_statement(client, mirror)
     # Against the literal Z-set, not against the server: `k` is a table, which
     # the copy does not hold, so a mirror-versus-server comparison here would be
     # the server compared with itself and would pass however the writes landed.
-    assert _zset(_rows(client.execute_sql("SELECT * FROM k", schema_name=sn))) == {
+    assert _zset(rows(client, sn, "SELECT * FROM k")) == {
         (("id", 1), ("v", 99)): 1,
         (("id", 2), ("v", 20)): 1,
         (("id", 3), ("v", 30)): 1,
@@ -573,15 +574,15 @@ async def test_an_open_mirror_leaves_the_rest_of_the_process_alone(client, serve
         m.mirror_at(mirror_dir)
         vid = m.mirror_view(sn, "f").view_id
         _quiesce(client, m, sn)
-        expected = _zset(_rows(client.execute_sql("SELECT * FROM f", schema_name=sn)))
+        expected = _zset(rows(client, sn, "SELECT * FROM f"))
         assert expected, "the view must hold rows, or the reads below prove nothing"
         async with aio.connect(server) as aconn:
             assert _zset(await aconn.scan(vid)) == expected
-        assert _zset(_rows(client.execute_sql("SELECT * FROM f", schema_name=sn))) == expected
+        assert _zset(rows(client, sn, "SELECT * FROM f")) == expected
 
     async with aio.connect(server) as aconn:
         assert _zset(await aconn.scan(vid)) == expected
-    assert _zset(_rows(client.execute_sql("SELECT * FROM f", schema_name=sn))) == expected
+    assert _zset(rows(client, sn, "SELECT * FROM f")) == expected
 
 
 # ── P10 · the GIL across a mirror call ──────────────────────────────────────
@@ -664,14 +665,14 @@ def test_a_mirror_call_releases_the_gil(client, mirror):
 
         before = mirror.requests_sent
         held, read_dropped_gil = spin.wins(
-            lambda: mirror.execute_sql("SELECT * FROM f", schema_name=sn)
+            lambda: rows(mirror, sn, "SELECT * FROM f")
         )
         assert mirror.requests_sent == before, "the mirrored read must be answered off the copy"
 
         _, during_control = spin.during(lambda: mirror.mirrors(vid))
 
     assert polled, "the poll must have covered the registered view"
-    assert _rows(held), "the mirrored read must return rows, or it proves nothing"
+    assert held, "the mirrored read must return rows, or it proves nothing"
 
     assert poll_dropped_gil, "a poll must drop the GIL across its delta read"
     assert read_dropped_gil, "a mirrored read must drop the GIL across the engine scan"
@@ -694,7 +695,7 @@ def test_the_copy_answers_with_the_server_stopped(own_server, mirror_on, mirror_
         m = mirror_on(mirror_dir, own_server.sock_path)
         vid = m.mirror_view(sn, "f").view_id
         _quiesce(client, m, sn)
-        expected = _zset(_rows(client.execute_sql("SELECT * FROM f", schema_name=sn)))
+        expected = _zset(rows(client, sn, "SELECT * FROM f"))
 
     own_server.stop()
 
@@ -726,7 +727,7 @@ def test_replacing_a_mirrored_view_invalidates_the_copy(client, mirror):
     _churn(client, sn, 1, 40)
     _quiesce(client, mirror, sn)
     q = "SELECT * FROM f"
-    _same_zset(q, _local(mirror, sn, old_vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+    _same_zset(q, _local(mirror, sn, old_vid, q), rows(client, sn, q))
 
     # Replace through the mirroring client itself: the copy it holds is the one
     # being retired.
@@ -747,4 +748,4 @@ def test_replacing_a_mirrored_view_invalidates_the_copy(client, mirror):
     assert fresh_vid == new_vid
     _churn(client, sn, 41, 60)
     _quiesce(client, mirror, sn)
-    _same_zset(q, _local(mirror, sn, fresh_vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+    _same_zset(q, _local(mirror, sn, fresh_vid, q), rows(client, sn, q))

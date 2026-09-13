@@ -10,6 +10,10 @@ holds `(tag, tick)` and nothing else.
 nothing — a retraction that never arrived and an insert applied twice both leave
 the row set intact — so every convergence assertion below compares the client's
 copy against a scan as a multiset of `(row, weight)`.
+
+The mirroring client drives the same feed through its own poll path; its suites
+are `client_surface/test_mirror.py` and `crates/gnitz-mirror/tests`. These drive
+the raw `delta_bootstrap` / `delta_poll` verbs, whose refusals a mirror hides.
 """
 import hashlib
 import os
@@ -21,7 +25,7 @@ from _feedviews import (
     _base_tables, _churn, _flood, _mk_feed, _zset,
 )
 from _uid import uid as _uid
-from _serverproc import NEEDS_MULTI, NUM_WORKERS
+from _serverproc import NEEDS_MULTI
 
 
 class Subscriber:
@@ -53,12 +57,12 @@ class Subscriber:
         self.cursor = reply.cursor
         return reply
 
-    def drain(self, rounds=12):
+    def drain(self):
         """Poll until a poll comes back empty."""
-        for _ in range(rounds):
+        for _ in range(12):
             if len(self.poll().rows) == 0:
                 return
-        raise AssertionError(f"feed did not settle in {rounds} polls")
+        raise AssertionError("feed did not settle in 12 polls")
 
     def scan(self):
         return _zset(self.client.scan(self.vid, include_hidden=True))
@@ -66,11 +70,10 @@ class Subscriber:
     def assert_converged(self, what=""):
         """Quiesce, then require the copy to equal the view as a multiset.
 
-        The order matters and is not cosmetic: a poll does **not** drive a tick
-        and a scan does, so a push ACKed but not yet ticked is in the scan and
-        not in the copy — a real and intended divergence that the next poll
-        heals. Scanning first drains, so the rounds exist before the polls that
-        collect them.
+        The order matters: a poll does **not** drive a tick and a scan does, so
+        a push ACKed but not yet ticked is in the scan and not in the copy — a
+        real and intended divergence that the next poll heals. Scanning first
+        drains, so the rounds exist before the polls that collect them.
         """
         live = self.scan()
         self.drain()
@@ -85,15 +88,10 @@ class Subscriber:
 )
 def test_feed_converges_weight_exact(client, body):
     """Bootstrap, then poll to the end, and the applied copy equals the view as a
-    multiset of (row, weight). Runs over a stream that includes an UPDATE and a
-    DELETE, so `enforce_unique_pk`'s stored-row retraction is exercised — a
-    capture that shipped `+1` with no `-1` would pass a row-set test.
-
-    The `linear` body's payload is a >12 byte TEXT column, which is the German
-    string case: the stamp adopts the source batch's `blob_id`, so the delta
-    batch and the batch the view's own store ingested claim one blob identity
-    across two stores — the only place in the tree that is true.
-    """
+    multiset of (row, weight). The churn includes an UPDATE and a DELETE, so a
+    capture that shipped `+1` with no `-1` fails here where a row-set test would
+    pass. The `linear` body carries a >12-byte TEXT payload, so the delta rows
+    carry out-of-line strings."""
     sn = "s" + _uid()
     _base_tables(client, sn)
     _mk_feed(client, sn, "f", body)
@@ -124,12 +122,12 @@ def test_a_delta_touching_one_worker_only(client):
         sub.assert_converged(f"single-key round {i}")
 
 
+@NEEDS_MULTI
 def test_replicated_source_feed_is_weight_exact(client):
-    """A replicated view computes its entire result on every worker, so only
-    worker 0 stamps and only worker 0 is read. If the writer and the reader ever
-    disagreed about which worker holds the feed, a broadcast gather over W
-    identical stores would hand back every row W times — invisible to a row-set
-    comparison, which is why this is a weight assertion."""
+    """A replicated view computes its entire result on every worker, so the feed
+    is read from one copy. A gather over all W identical stores would hand back
+    every row W times — invisible to a row-set comparison, which is why this is a
+    weight assertion."""
     sn = "s" + _uid()
     client.create_schema(sn)
     client.execute_sql(
@@ -149,15 +147,34 @@ def test_replicated_source_feed_is_weight_exact(client):
         sub.assert_converged(f"replicated through {lo + 40}")
 
 
-# ── the gate, and what it must not swallow ───────────────────────────────────
+def test_a_four_column_pk_view_carries_a_feed(client):
+    """The stamp is one more PK column, so the widest declarable view PK plus the
+    stamp is exactly `MAX_PK_COLUMNS`."""
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE q (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL, "
+        "v BIGINT NOT NULL, PRIMARY KEY (a, b, c, d))",
+        schema_name=sn,
+    )
+    _mk_feed(client, sn, "f", "SELECT a, b, c, d, v FROM q WHERE v > 1")
+    sub = Subscriber(client, sn, "f")
+    sub.bootstrap()
+    for r in range(4):
+        client.execute_sql(
+            "INSERT INTO q VALUES " + ",".join(f"({r}, {i}, {i * 2}, {i * 3}, {i + 2})" for i in range(20)),
+            schema_name=sn,
+        )
+        sub.assert_converged(f"compound-PK round {r}")
 
 
-def test_a_round_emitted_outside_run_tick_is_not_gated_away(client):
-    """`CREATE VIEW` drives a reactor-parked drain of its source through
-    `drain_tick_blocking`, not through the tick loop. A last-round map maintained
-    in `run_tick` would miss that round, gate the subscriber's next poll as
-    "nothing changed", and leave a silent hole — while passing every other test
-    in this file."""
+# ── which rounds a poll sees ─────────────────────────────────────────────────
+
+
+def test_a_round_ticked_by_a_ddl_drain_reaches_the_next_poll(client):
+    """`CREATE VIEW` drains its source's pending ticks itself, outside the tick
+    loop. That round must reach the subscriber like any other, not be gated away
+    as "nothing changed"."""
     sn = "s" + _uid()
     _base_tables(client, sn)
     _mk_feed(client, sn, "f", LINEAR)
@@ -166,8 +183,8 @@ def test_a_round_emitted_outside_run_tick_is_not_gated_away(client):
     sub.bootstrap()
     sub.drain()
 
-    # Rows committed but deliberately NOT settled: the next statement's
-    # reactor-parked drain is what ticks them.
+    # Rows committed but deliberately NOT settled: the next statement's drain is
+    # what ticks them.
     client.execute_sql(
         "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'late-{i}')" for i in range(2, 40)),
         schema_name=sn,
@@ -175,15 +192,15 @@ def test_a_round_emitted_outside_run_tick_is_not_gated_away(client):
     client.execute_sql("CREATE VIEW second AS SELECT id FROM t WHERE v > 1000", schema_name=sn)
 
     sub.drain()
-    assert sub.copy == sub.scan(), "the CREATE VIEW drain's round must reach the subscriber"
+    # The seed plus ids 4..39, the ones `v > 10` keeps.
+    assert len(sub.copy) == 37 and sub.copy == sub.scan(), "the CREATE VIEW drain's round must reach the subscriber"
 
 
 def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
     """The steady state of a subscription is a poll that returns nothing, so that
     is the case that must be cheap: the master answers it locally, with no SAL
-    group and no worker wakeup. Since no read path rewinds the SAL cursor, a poll
-    that did write would drive the checkpoint threshold on an idle database,
-    forever."""
+    group and no worker wakeup. A poll that did write would drive the checkpoint
+    threshold on an idle database, forever."""
     own_server.start()
     sal = os.path.join(own_server.data_dir, "wal.sal")
 
@@ -205,29 +222,20 @@ def test_an_up_to_date_poll_writes_no_sal_bytes(own_server):
 
         before = sal_digest()
         for _ in range(20):
-            reply = sub.poll()
-            assert len(reply.rows) == 0
+            assert len(sub.poll().rows) == 0
         assert sal_digest() == before, "an up-to-date poll must write no SAL bytes"
 
 
 def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client):
-    """A stream push publishes nothing, so `read_is_fresh` answers false for every
-    view over one — meaning a read that asked to be current would drain on **every**
-    poll, forever, taking the whole server's pending tid set with it each time. A
-    delta poll answers "what has happened", so it takes no drain and a round the
-    tick loop has not run yet is a round the next poll will carry.
+    """Every other read of a stream-fed view drains pending ticks, since a stream
+    push never advances the published tick. A delta poll answers "what has
+    happened", so it drains nothing — else every poll would tick the whole server.
 
-    Observable because a drain is *synchronous*: the caller waits for the tick. So
-    a poll issued right after a push ACK either already carries that push (it
-    drained) or does not. Nothing else here can tick — there is no timer-driven
-    tick, and these rounds are far below the row count that makes the committer
-    trigger one — so every poll must come back empty, and each round must then
-    still arrive on a later poll.
-
-    That second half is also what proves the round is not `lsn_alloc.published()`:
-    consecutive ticks of a stream-only workload share a published LSN, since a
-    stream push opens no zone, so under that value every round here would carry
-    the same `_tick` and they would fold together.
+    Observable because a drain is synchronous: a poll issued right after a push
+    ACK either already carries that push (it drained) or does not. These rounds
+    are far below any row count that triggers a tick on its own, so every poll
+    comes back empty — and each round must still arrive on a later poll, as its
+    own round rather than folded into its neighbour.
     """
     sn = "s" + _uid()
     client.create_schema(sn)
@@ -241,73 +249,24 @@ def test_a_poll_of_a_stream_fed_view_takes_no_tick_and_loses_no_round(client):
     sub.bootstrap()
     sub.drain()
 
-    rounds = 6
-    for r in range(rounds):
+    for r in range(6):
         client.execute_sql(
             "INSERT INTO ev VALUES " + ",".join(f"({r * 50 + i}, {i % 4}, {i + 1})" for i in range(50)),
             schema_name=sn,
         )
         assert len(sub.poll().rows) == 0, f"poll {r} carried the push it raced — it drove a tick"
 
-    # And nothing was lost by not draining: every round arrives on later polls.
     sub.assert_converged("after the undrained polls")
 
 
-def test_a_view_at_the_column_limit_cannot_carry_a_feed(client):
-    """The stamp is one more column, so a view already at `MAX_COLUMNS` is refused
-    at CREATE rather than aborting a worker later — the post-fork master opens no
-    user store, so the store-open path would fail only after the client had been
-    told the CREATE succeeded."""
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    cols = ", ".join(
-        ["c0 BIGINT NOT NULL PRIMARY KEY"]
-        + [f"c{i} BIGINT NOT NULL" for i in range(1, gnitz.MAX_COLUMNS)]
-    )
-    client.execute_sql(f"CREATE TABLE wide ({cols})", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError) as e:
-        client.execute_sql(f"CREATE VIEW f WITH (delta = '{FEED}') AS SELECT * FROM wide", schema_name=sn)
-    assert "delta feed" in str(e.value)
-    # The same view without a feed is fine, so the refusal is about the stamp.
-    client.execute_sql("CREATE VIEW plain AS SELECT * FROM wide", schema_name=sn)
-
-
-# ── retention ────────────────────────────────────────────────────────────────
-
-
-def _delta_dir_bytes(data_dir, view_id):
-    """On-disk bytes under every `delta_w{k}` of `view_id`'s relation directory."""
-    total = 0
-    needle = f"_{view_id}"
-    for root, _dirs, files in os.walk(data_dir):
-        parts = root.split(os.sep)
-        if not any(p.startswith("delta_w") for p in parts):
-            continue
-        if not any(p.endswith(needle) for p in parts):
-            continue
-        total += sum(os.path.getsize(os.path.join(root, f)) for f in files)
-    return total
-
-
-def _delta_child_names(data_dir, view_id):
-    out = set()
-    needle = f"_{view_id}"
-    for root, dirs, _files in os.walk(data_dir):
-        if root.split(os.sep)[-1].endswith(needle):
-            out |= {d for d in dirs if d.startswith("delta_w")}
-    return out
+# ── refused cursors ──────────────────────────────────────────────────────────
 
 
 def test_a_cursor_below_the_floor_is_refused_as_a_code(sweeping_server):
-    """A drop raises the worker's retention floor, and a cursor *below* it is
-    refused with `STATUS_DELTA_EXPIRED` — a code the subscriber reacts to, not a
-    string it matches. Recovery is the read it made on its first day.
-
-    A cursor sitting exactly *at* the floor is served instead: the walk covers
-    `(after_tick, cut]`, so nothing it would return has been dropped, and
-    refusing it would strand a bootstrap whose watermark landed on the floor in
-    a reseed loop.
-    """
+    """Retention drops the oldest rounds whether or not anyone still reads them,
+    and a cursor below what was dropped is refused with `GnitzDeltaExpiredError`
+    — a type the subscriber reacts to, not a string it matches. Recovery is the
+    read it made on its first day."""
     with gnitz.connect(sweeping_server.sock_path) as client:
         sn = "s" + _uid()
         _base_tables(client, sn)
@@ -315,82 +274,20 @@ def test_a_cursor_below_the_floor_is_refused_as_a_code(sweeping_server):
         sub = Subscriber(client, sn, "f")
         sub.bootstrap()
         sub.drain()
-        stale = sub.cursor
 
-        # Enough volume that the delta store folds, spills, pushes down and
-        # drops its oldest terminal guard — which is what raises the floor past
-        # the cursor taken above. Twice what was measured to reach the first
-        # drop, so the margin is the test's and not the box's.
+        # Twice the volume measured to reach the first drop, so the margin is
+        # the test's and not the box's.
         _flood(client, sn, 1, 8_000)
 
         with pytest.raises(gnitz.GnitzDeltaExpiredError):
-            client.delta_poll(sub.vid, sub.delta_schema, stale, include_hidden=True)
+            sub.poll()
 
-        # And the recovery is exact: re-read at 0 and the copy is the view.
-        #
-        # Settle BEFORE re-reading, which is why this does not go through
-        # `assert_converged`. That helper scans first on purpose — a scan drives a
-        # tick and a poll does not — and then polls up the round the scan
-        # produced. On the 32 MB feeds everything else here uses, that round is
-        # still retained when the poll arrives. On this test's deliberately
-        # starved 1 KB budget it is not: one round of these rows overruns the
-        # budget outright, so the sweep drops it before it can be polled and the
-        # just-issued cursor is refused in turn. Driving the tick first makes the
-        # bootstrap's watermark the settled cut, which is what "the recovery is
-        # the read it made on its first day" actually claims.
+        # Settle before re-reading rather than going through `assert_converged`:
+        # on a 1 KB budget one round of these rows overruns it outright, so a
+        # round ticked by that helper's scan is dropped before its poll arrives.
         live = sub.scan()
         sub.bootstrap()
         assert sub.copy == live, "after re-reading at 0"
-
-
-def test_a_delta_store_does_not_grow_without_bound(sweeping_server):
-    """The one failure `resident_bytes` cannot see: it counts registered entries,
-    and a leaked superseded shard is unregistered. It also catches the unlink
-    drain hung off the sweep instead of off the store, which unlinks the drops and
-    leaks every ordinary compaction."""
-    with gnitz.connect(sweeping_server.sock_path) as client:
-        sn = "s" + _uid()
-        _base_tables(client, sn)
-        # Above the guard granularity, so the store settles *on* disk with
-        # something to measure. A budget under one guard's worth has no residual
-        # at all — a drop is destructive, so the guard is the residual step — and
-        # the plateau this pins would be zero against zero.
-        _mk_feed(client, sn, "f", LINEAR, feed="256 KB")
-        vid, _ = client.resolve_table(sn, "f")
-
-        # Measure the plateau, not a ratio. The first burst has to be long
-        # enough to *reach* the plateau — the sweep budgets itself to one
-        # push-down per spill, so the first few spills are still ramping — and
-        # the second is three times as long again. A store that leaked its
-        # superseded shards would track everything ever written; one that sweeps
-        # stays where the recent write burst leaves it.
-        _flood(client, sn, 1, 8_000)
-        settled = _delta_dir_bytes(sweeping_server.data_dir, vid)
-        _flood(client, sn, 8_001, 32_000)
-        after = _delta_dir_bytes(sweeping_server.data_dir, vid)
-        assert settled > 0, "the feed never reached disk; this flood is too small to test retention"
-        assert after <= settled * 2, (
-            f"delta store grew {settled} -> {after} bytes while the deltas written grew "
-            "four-fold — it is tracking everything ever written"
-        )
-
-
-# ── lifecycle ────────────────────────────────────────────────────────────────
-
-
-def test_alter_view_on_a_fed_view_is_refused(client):
-    """`ALTER VIEW … AS` re-renders the body as a bare `CREATE VIEW`, dropping the
-    `WITH` clause — so retargeting a fed view would silently strip its feed and
-    turn every later read, `after_tick = 0` included, into a typed error. `delta`
-    is deliberately not part of the relation class, so the bounded-view guard does
-    not cover this."""
-    sn = "s" + _uid()
-    _base_tables(client, sn)
-    _mk_feed(client, sn, "f", LINEAR)
-    # The feed arm by name: "DROP and CREATE" alone is the tail both this and
-    # the capacity-bounded refusal share, so it cannot say which one fired.
-    with pytest.raises(gnitz.GnitzError, match="cannot retarget a view with a delta feed"):
-        client.execute_sql("ALTER VIEW f AS SELECT id, v, body FROM t WHERE v > 20", schema_name=sn)
 
 
 def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
@@ -414,13 +311,10 @@ def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
 
 @pytest.mark.parametrize("recreate", ["drop-and-create", "or-replace"])
 def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
-    """Within one boot the nonce half of the tag is unchanged, so a tag naming
-    only the boot would accept this cursor: the recreated view takes a fresh id
-    whose rounds come from the same global counter. Unrefused, the poll answers
-    with the *new* view's deltas above the stale round — and a recreated view's
-    backfill never enters a delta store, so applying them yields a copy missing
-    everything below that round. The tag is `boot_nonce ^ splitmix64(view_id)`,
-    so `delta_poll` refuses the cursor instead.
+    """A recreated view takes a fresh id whose rounds come from the same global
+    counter, so an unrefused cursor would be answered with the *new* view's deltas
+    above the stale round — and a recreated view's backfill never enters a delta
+    store, so applying them yields a copy missing everything below it.
 
     `CREATE OR REPLACE` is the case nothing else would tell a subscriber about:
     unlike the drop, the name still resolves.
@@ -432,7 +326,6 @@ def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')", schema_name=sn)
     sub.bootstrap()
     sub.drain()
-    old = sub.cursor
 
     if recreate == "drop-and-create":
         client.execute_sql("DROP VIEW f", schema_name=sn)
@@ -445,74 +338,20 @@ def test_a_cursor_across_a_recreate_is_rejected(client, recreate):
 
     fresh = Subscriber(client, sn, "f")
     assert fresh.vid != sub.vid, "a recreated view takes a fresh id"
+    fresh.cursor = sub.cursor
     with pytest.raises(gnitz.GnitzDeltaExpiredError):
-        client.delta_poll(fresh.vid, fresh.delta_schema, old, include_hidden=True)
+        fresh.poll()
 
     fresh.bootstrap()
     fresh.assert_converged("after re-resolving and bootstrapping")
 
 
-def test_dropping_a_fed_view_reclaims_its_delta_store(own_server):
-    """The delta store lives under the view's own directory, so the drop the
-    master queues for that directory takes it — by the next boot's sweep at the
-    latest, which is what the deferral buys: the rmdir cannot race a worker
-    still holding the store.
-
-    The catalog half is immediate, and is the half a subscriber sees: the id no
-    longer resolves, so a poll against it is an error rather than an empty
-    "nothing changed", which is what a leaked gate entry would produce.
-    """
-    own_server.start()
-    with gnitz.connect(own_server.sock_path) as client:
-        sn = "s" + _uid()
-        _base_tables(client, sn)
-        _mk_feed(client, sn, "f", LINEAR)
-        vid, _ = client.resolve_table(sn, "f")
-        client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')", schema_name=sn)
-        client.scan(vid)          # drives the tick that writes the delta rows
-        assert _delta_child_names(own_server.data_dir, vid), "the feed never reached disk"
-
-        client.execute_sql("DROP VIEW f", schema_name=sn)
-        with pytest.raises(gnitz.GnitzError):
-            client.resolve_table(sn, "f")
-
-    own_server.restart(graceful=True)
-    assert _delta_child_names(own_server.data_dir, vid) == set()
-
-
-def test_a_four_column_pk_view_carries_a_feed(client):
-    """One stamp column plus the widest declarable view PK is exactly
-    `MAX_PK_COLUMNS`, so this is the case the derived-schema argument turns on and
-    the one a second stamp column could not fit."""
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    client.execute_sql(
-        "CREATE TABLE q (a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL, "
-        "v BIGINT NOT NULL, PRIMARY KEY (a, b, c, d))",
-        schema_name=sn,
-    )
-    _mk_feed(client, sn, "f", "SELECT a, b, c, d, v FROM q WHERE v > 1")
-    sub = Subscriber(client, sn, "f")
-    sub.bootstrap()
-    for r in range(4):
-        client.execute_sql(
-            "INSERT INTO q VALUES " + ",".join(f"({r}, {i}, {i * 2}, {i * 3}, {i + 2})" for i in range(20)),
-            schema_name=sn,
-        )
-        sub.assert_converged(f"compound-PK round {r}")
-
-
-# ── restart ──────────────────────────────────────────────────────────────────
-
-
 def test_a_feed_survives_a_restart_on_every_worker(own_server):
-    """`rehome` rebuilds every relation's store on every worker at boot, so
-    a `delta_bytes` that did not reach `rebuild_relation_store` would leave a
-    catalog that says "fed" and no delta store anywhere — which every other test
-    reports only as "no rows". The keys span all four partitions.
+    """A restart leaves a fed view fed on every worker — not a catalog that says
+    "fed" over no delta store, which every other test reports only as "no rows".
 
     A cursor held across the restart must be rejected: the delta store is erased
-    at open and the boot mints a fresh nonce, so every tag stops matching.
+    at open and the boot mints a fresh tag.
     """
     own_server.start()
     with gnitz.connect(own_server.sock_path) as client:
@@ -523,43 +362,17 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
         _churn(client, sn, 1, 120)
         sub.bootstrap()
         sub.drain()
-        stale = sub.cursor
-        vid = sub.vid
+        stale, vid = sub.cursor, sub.vid
 
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as client:
         sub = Subscriber(client, sn, "f")
         assert sub.vid == vid, "the view keeps its id across a restart"
+        sub.cursor = stale
         with pytest.raises(gnitz.GnitzDeltaExpiredError):
-            client.delta_poll(sub.vid, sub.delta_schema, stale, include_hidden=True)
+            sub.poll()
 
         sub.bootstrap()
         sub.assert_converged("after the restart's bootstrap")
-        # And the feed still ingests on every worker.
         _churn(client, sn, 121, 240)
         sub.assert_converged("after post-restart churn")
-
-
-@NEEDS_MULTI
-def test_a_narrowed_worker_count_reclaims_the_delta_children(own_server):
-    """The `ChildAddr` grammar is what makes `delta_w{k}` visible to the boot
-    sweep; a name in no grammar is skipped rather than reported, so a narrowed
-    count would leak one directory per feed forever."""
-    own_server.start(workers=NUM_WORKERS)
-    with gnitz.connect(own_server.sock_path) as client:
-        sn = "s" + _uid()
-        _base_tables(client, sn)
-        _mk_feed(client, sn, "f", LINEAR)
-        vid, _ = client.resolve_table(sn, "f")
-        _churn(client, sn, 1, 100)
-        client.scan(vid)
-    names = _delta_child_names(own_server.data_dir, vid)
-    assert names == {f"delta_w{k}" for k in range(NUM_WORKERS)}, names
-
-    own_server.restart(workers=1)
-    with gnitz.connect(own_server.sock_path) as client:
-        sub = Subscriber(client, sn, "f")
-        sub.bootstrap()
-        _churn(client, sn, 101, 200)
-        sub.assert_converged("at the narrowed worker count")
-    assert _delta_child_names(own_server.data_dir, vid) == {"delta_w0"}

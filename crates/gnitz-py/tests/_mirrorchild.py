@@ -14,7 +14,7 @@ import sys
 import time
 
 import gnitz
-from _feedviews import _rows
+from _read import rows
 
 SENTINEL = "MIRROR-CHILD-OK"
 READY = "MIRROR-CHILD-READY"
@@ -52,11 +52,11 @@ def poison():
     # copy must not take the connection's own reads down with it.
     [vid] = m.mirrored_ids()
     assert m.mirrors(vid) is False
-    assert _rows(m.execute_sql("SELECT * FROM f", schema_name=sn)), (
+    assert rows(m, sn, "SELECT * FROM f"), (
         "a read the copy cannot answer is delegated, poisoned store or not"
     )
     assert len(m.scan(vid)) > 0, "and so is a scan of it"
-    assert _rows(m.execute_sql("SELECT * FROM t", schema_name=sn))
+    assert rows(m, sn, "SELECT * FROM t")
 
     # `close_mirror` is the only way out of a poison, and it keeps the
     # connection: the copy goes, the directory is released, and the client can
@@ -104,7 +104,7 @@ def panic():
             pass
 
     # And a relation the copy does not hold is untouched.
-    assert _rows(m.execute_sql("SELECT * FROM t", schema_name=sn))
+    assert rows(m, sn, "SELECT * FROM t")
     m.close_mirror()
     m.close()
 
