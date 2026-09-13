@@ -10,8 +10,8 @@
 //! caller cannot — the hydrator, which is the catalog's *other* field.
 
 use super::*;
-use gnitz_store::read::IndexWalk;
 use gnitz_store::storage::SourceCursor;
+use gnitz_wire::IndexWalk;
 use gnitz_wire::{ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
 
@@ -147,7 +147,7 @@ impl CatalogEngine {
     /// decides how many rows are read. The open may COMPILE the view.
     ///
     /// A registered-but-empty table yields a cursor, and a provably empty range
-    /// yields `SourceCursor::Empty` — collapsing that into an error would skip
+    /// a bounded walk that drains nothing — collapsing that into an error would skip
     /// the source rather than feed it one empty epoch. `Err` is a view that does
     /// not compile, or an unregistered source: DDL_SYNC applies in SAL order, so
     /// a worker that cannot see the source has diverged from the catalog.

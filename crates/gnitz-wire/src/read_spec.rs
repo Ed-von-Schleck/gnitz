@@ -2,8 +2,8 @@
 // ReadSpec — the parameterized-scan descriptor for an ad-hoc bounded SELECT.
 //
 // One wire descriptor carries bound extraction, predicate evaluation, and the
-// sink — row forwarding (projection + ORDER BY / LIMIT top-k) or an aggregate
-// fold — out to the workers, executed single-pass over each worker's merged
+// sink — an optional map, then row forwarding (ORDER BY / LIMIT top-k) or an
+// aggregate fold — out to the workers, executed single-pass over each worker's merged
 // partition cursor. Both client (gnitz-core) and engine (gnitz-server worker)
 // share this encoder/decoder — the same drift-safety rule `RangeDescriptor`
 // follows. The master forwards the encoded blob verbatim (it never decodes the
@@ -15,7 +15,8 @@ use crate::circuit::{read_aggs, read_cols, read_compute_map, write_aggs, write_c
 use crate::circuit::{AggDescriptor, ComputeMap};
 use crate::codec::{Reader, Writer};
 use crate::range::{read_index_bound, read_range_descriptor, write_index_bound, write_range_descriptor};
-use crate::range::{IndexBound, RangeDescriptor};
+use crate::range::{IndexBound, IndexWalk, RangeDescriptor};
+use crate::MAX_PK_BYTES;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
@@ -25,7 +26,7 @@ pub const MAX_PK_SET_KEYS: usize = 65_536;
 /// Decode-side ceiling on a full encoded `ReadSpec` blob.
 pub(crate) const MAX_READ_SPEC_BYTES: usize = 2 << 20;
 
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 
 const BOUND_NONE: u8 = 0;
 const BOUND_PK_RANGE: u8 = 1;
@@ -78,44 +79,34 @@ pub(crate) fn read_order_key(r: &mut Reader) -> Result<OrderKey, String> {
     })
 }
 
-/// The fold sink's aggregate spec: a per-worker hash-fold over the scanned rows.
-/// `group_cols` and `aggs[].col_idx` index the **reduce input** — `pre`'s output
-/// when one is present, else the source schema (empty `group_cols` = a global
-/// aggregate; `aggs = []` = `SELECT DISTINCT`). `aggs` is the physical reduce
-/// layout `push_agg_specs` produces, not the SELECT list: AVG contributes
-/// `[Sum, CountNonNull]`, and HAVING-only aggregates append items.
+/// The fold sink's per-worker hash-fold. `aggs` is the physical reduce layout,
+/// not the SELECT list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggReadSpec {
     pub group_cols: Vec<u32>,
     pub aggs: Vec<AggDescriptor>,
-    /// The map between the predicate and the fold, so the reduce can group by or
-    /// aggregate an expression (`GROUP BY a + b`). Compiled over the SOURCE
-    /// schema; the worker rebuilds the reduce input as the source's PK columns
-    /// followed by the map's declared slots. `None` = the source *is* the input.
-    pub pre: Option<ComputeMap>,
 }
 
-impl AggReadSpec {
-    /// A fold that reads source columns directly — the shape every grouped
-    /// SELECT has until it groups by, or aggregates, an expression.
-    pub fn direct(group_cols: Vec<u32>, aggs: Vec<AggDescriptor>) -> Self {
-        AggReadSpec { group_cols, aggs, pre: None }
-    }
-}
-
-/// What the worker does with the rows surviving `bound` + `predicate` —
-/// exactly one of the two sinks. A fold carries no projection / ORDER BY /
-/// LIMIT because all SQL-level finishing on an aggregate result is
-/// client-side; the enum makes that unrepresentable rather than decode-checked.
+/// What the worker does with the rows surviving `bound` + `predicate`: an
+/// optional map, then exactly one of the two sink kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadSink {
-    /// Forward rows: projection → ORDER BY / LIMIT top-k.
+pub struct ReadSink {
+    /// The map between the predicate and the sink, compiled over the SOURCE
+    /// schema: its output is the source's PK columns followed by the declared
+    /// slots. `None` = the sink reads the source rows themselves.
+    pub map: Option<ComputeMap>,
+    pub kind: SinkKind,
+}
+
+/// The two sinks. A fold carries no ORDER BY / LIMIT because all SQL-level
+/// finishing on an aggregate result is client-side; the enum makes that
+/// unrepresentable rather than decode-checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinkKind {
+    /// Forward rows, ORDER BY / LIMIT top-k.
     Rows {
-        /// Compiled projection map program over the SOURCE schema → reply
-        /// payload columns. Empty = identity (reply schema == source schema).
-        projection: Vec<u8>,
-        /// ORDER BY keys applied in sequence; `col` indices refer to the REPLY
-        /// schema. `len ≤ MAX_ORDER_KEYS`.
+        /// ORDER BY keys applied in sequence; `col` indexes the sink input (=
+        /// the reply layout). `len ≤ MAX_ORDER_KEYS`.
         order: Vec<OrderKey>,
         /// OFFSET + LIMIT in logical rows (summed weight). 0 = unbounded.
         /// (`LIMIT 0` never reaches the wire — the SQL layer short-circuits an
@@ -123,25 +114,87 @@ pub enum ReadSink {
         limit_k: u64,
     },
     /// Fold rows into per-group accumulators (GROUP BY / global aggregate /
-    /// DISTINCT) and emit partial reduce-output rows.
+    /// DISTINCT) and emit partial reduce-output rows. `group_cols` /
+    /// `aggs[].col_idx` index the sink input.
     Fold(AggReadSpec),
 }
 
 impl ReadSink {
-    /// The identity sink: forward every surviving row unprojected, unordered,
+    /// The identity sink: forward every surviving row unmapped, unordered,
     /// unbounded.
     pub fn all_rows() -> Self {
-        ReadSink::Rows {
-            projection: Vec::new(),
-            order: Vec::new(),
-            limit_k: 0,
+        ReadSink {
+            map: None,
+            kind: SinkKind::Rows { order: Vec::new(), limit_k: 0 },
         }
     }
 }
 
-/// The bound a `ReadSpec` walks before predicate/projection. `RangeDescriptor`
-/// carries **native** values (packed LE `u128`); the worker is the sole OPK
-/// encoder.
+/// OPK keys of one stride, strictly ascending — the order a forward gather
+/// sweeps. Fields private: every constructor sorts and dedups, or validates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PkKeys {
+    stride: u8,
+    bytes: Vec<u8>,
+}
+
+impl PkKeys {
+    /// Sort and dedup `keys`, each exactly `stride` bytes.
+    pub fn from_keys<'a>(stride: usize, keys: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        let mut ks: Vec<&[u8]> = keys
+            .into_iter()
+            .inspect(|k| assert_eq!(k.len(), stride, "PkKeys: key width"))
+            .collect();
+        ks.sort_unstable();
+        ks.dedup();
+        PkKeys { stride: stride as u8, bytes: ks.concat() }
+    }
+
+    /// The most keys of `stride` one request carries: `MAX_PK_SET_KEYS`, and
+    /// no more bytes than that many 16-byte keys, so a wide compound key cannot
+    /// push a spec past `MAX_READ_SPEC_BYTES`.
+    pub const fn max_per_request(stride: usize) -> usize {
+        let by_bytes = MAX_PK_SET_KEYS * 16 / stride;
+        if by_bytes < MAX_PK_SET_KEYS {
+            by_bytes
+        } else {
+            MAX_PK_SET_KEYS
+        }
+    }
+
+    pub fn stride(&self) -> usize {
+        self.stride as usize
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len() / self.stride()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn iter(&self) -> std::slice::ChunksExact<'_, u8> {
+        self.bytes.chunks_exact(self.stride())
+    }
+
+    /// Consecutive sub-lists of at most [`Self::max_per_request`] keys.
+    pub fn per_request(&self) -> impl Iterator<Item = PkKeys> + '_ {
+        let n = Self::max_per_request(self.stride()) * self.stride();
+        self.bytes
+            .chunks(n)
+            .map(|c| PkKeys { stride: self.stride, bytes: c.to_vec() })
+    }
+}
+
+/// The bound a `ReadSpec` walks before the predicate and the sink. The range
+/// bounds' `RangeDescriptor` carries **native** values (packed LE `u128`), for
+/// which the worker is the sole OPK encoder; a `PkSet` carries OPK keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadBound {
     /// Full merged cursor — a plain scan with a server-side predicate.
@@ -150,21 +203,10 @@ pub enum ReadBound {
     /// point lookup is `n_eq = pk_count − 1` with degenerate cuts. Exact — no
     /// residual is needed for the bound itself.
     PkRange(RangeDescriptor),
-    /// Secondary-index range walk, and whether it must be exact.
-    ///
-    /// `exact` is the SQL layer's statement that it **stripped** the bounded
-    /// conjuncts from `predicate` — so the walk is the only thing that applies
-    /// them and must not be traded away. The worker then runs an un-gated
-    /// byte-exact `BoundedIndexCursor`. With `exact = false` the conjuncts are
-    /// still in `predicate`, so the walk is only an access optimization and the
-    /// worker may fall back to a full cursor when the range covers too much of
-    /// the table.
-    IndexRange { bound: IndexBound, exact: bool },
-    /// `pk IN (…)` for a single-column PK. Values are raw native keys widened to
-    /// `u128` (`FixedInt::pack`), and must be **distinct after truncation to the
-    /// PK's width** — the worker rejects the rest. Wire order is irrelevant: the
-    /// worker OPK-sorts the keys before its forward gather.
-    PkSet(Vec<u128>),
+    /// Secondary-index range walk.
+    IndexRange { bound: IndexBound, walk: IndexWalk },
+    /// `pk IN (…)`: the listed keys, at any PK arity.
+    PkSet(PkKeys),
     /// Every delta a fed view emitted after tick round `after_tick`, walked over
     /// the view's delta store rather than its output store. `after_tick = 0` is
     /// the bootstrap: it names the view's whole history, which is what the output
@@ -260,8 +302,8 @@ pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(SpecBytes<'_>, &[u8]), St
 /// bound kind, an unknown version, or a truncated prefix. Lets the master derive
 /// a routing decision without decoding the spec.
 ///
-/// Reads only the header and the range descriptor, never the predicate / order /
-/// projection / PkSet sections, so a `PkSet` spec at the key cap costs one byte
+/// Reads only the header and the range descriptor, never the predicate / map /
+/// order / PkSet sections, so a `PkSet` spec at the key cap costs one byte
 /// compare rather than a megabyte-scale parse. [`ReadSpec::decode`] remains the
 /// worker's full validating parse.
 pub fn peek_pk_range(spec: SpecBytes<'_>) -> Option<RangeDescriptor> {
@@ -306,25 +348,22 @@ impl ReadSpec {
         // Header: version | bound_kind | sink_tag | reserved. One up-front
         // reservation covering every section (64 covers the fixed header,
         // range descriptors, and section length prefixes).
-        let sink_tag = match sink {
-            ReadSink::Rows { .. } => SINK_ROWS,
-            ReadSink::Fold(_) => SINK_FOLD,
+        let sink_tag = match sink.kind {
+            SinkKind::Rows { .. } => SINK_ROWS,
+            SinkKind::Fold(_) => SINK_FOLD,
         };
         let cap = 64
             + predicate.len()
             + match bound {
-                ReadBound::PkSet(keys) => 16 * keys.len(),
+                ReadBound::PkSet(keys) => keys.as_bytes().len(),
                 ReadBound::PkRange(desc) => RangeDescriptor::encoded_len(desc.eq_vals().len()),
                 ReadBound::IndexRange { bound, .. } => RangeDescriptor::encoded_len(bound.desc.eq_vals().len()),
                 ReadBound::None | ReadBound::Delta { .. } => 0,
             }
-            + match sink {
-                ReadSink::Rows { projection, order, .. } => projection.len() + 4 * order.len(),
-                ReadSink::Fold(agg) => {
-                    4 * agg.group_cols.len()
-                        + 5 * agg.aggs.len()
-                        + agg.pre.as_ref().map_or(0, |p| p.program.len() + 2 * p.out_cols.len())
-                }
+            + sink.map.as_ref().map_or(0, |m| m.program.len() + 2 * m.out_cols.len())
+            + match &sink.kind {
+                SinkKind::Rows { order, .. } => 4 * order.len(),
+                SinkKind::Fold(agg) => 4 * agg.group_cols.len() + 5 * agg.aggs.len(),
             };
 
         let mut w = Writer::with_capacity(cap);
@@ -335,14 +374,15 @@ impl ReadSpec {
             ReadBound::PkRange(desc) => {
                 write_range_descriptor(&mut w, desc);
             }
-            ReadBound::IndexRange { bound, exact } => {
+            ReadBound::IndexRange { bound, walk } => {
                 write_index_bound(&mut w, bound);
-                w.u8(*exact as u8);
+                w.u8(match walk {
+                    IndexWalk::Optional => 0,
+                    IndexWalk::Required => 1,
+                });
             }
             ReadBound::PkSet(keys) => {
-                // One memcpy: on a little-endian target the `u128` slice already
-                // IS its wire image. A `pk IN (…)` set reaches MAX_PK_SET_KEYS.
-                w.u32(keys.len() as u32).raw(crate::as_le_bytes(keys));
+                w.u8(keys.stride).u32(keys.len() as u32).raw(keys.as_bytes());
             }
             ReadBound::Delta { after_tick } => {
                 w.u64(*after_tick);
@@ -351,35 +391,32 @@ impl ReadSpec {
 
         w.bytes32(predicate);
 
-        match sink {
-            ReadSink::Rows { projection, order, limit_k } => {
+        match &sink.map {
+            Some(m) => {
+                w.u8(1);
+                write_compute_map(&mut w, &m.out_cols, &m.program);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
+
+        match &sink.kind {
+            SinkKind::Rows { order, limit_k } => {
                 w.u8(order.len() as u8).u64(*limit_k);
                 for key in order {
                     write_order_key(&mut w, key);
                 }
-                w.bytes32(projection);
             }
-            ReadSink::Fold(agg) => {
+            SinkKind::Fold(agg) => {
                 write_cols(&mut w, &agg.group_cols);
                 write_aggs(&mut w, &agg.aggs);
-                // `None` is spelled as an empty program, so the pre-map section
-                // is unconditional.
-                let (program, out_cols) = match &agg.pre {
-                    Some(p) => (p.program.as_slice(), p.out_cols.as_slice()),
-                    None => (&[][..], &[][..]),
-                };
-                write_compute_map(&mut w, out_cols, program);
             }
         }
         w.into_vec()
     }
 
-    /// Decode and validate at the trust boundary. Rejects: an over-cap blob,
-    /// unknown version/kind/sink tag, order-key / PkSet / fold-section count
-    /// over cap, an unknown order flag bit or aggregate op, length
-    /// overflows/truncation, and trailing bytes. Duplicate PkSet keys are NOT
-    /// rejected here — that check needs the PK width and lives in the worker's
-    /// schema-aware gather.
+    /// Decode and validate at the trust boundary: a malformed frame is an `Err`.
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
         if buf.len() > MAX_READ_SPEC_BYTES {
             return Err(format!(
@@ -401,30 +438,32 @@ impl ReadSpec {
             BOUND_PK_RANGE => ReadBound::PkRange(read_range_descriptor(&mut r)?),
             BOUND_INDEX_RANGE => {
                 let bound = read_index_bound(&mut r).map_err(|e| format!("read_spec: {e}"))?;
-                let exact = match r.u8()? {
-                    0 => false,
-                    1 => true,
-                    other => return Err(format!("read_spec: IndexRange exact flag {other} is not 0 or 1")),
+                let walk = match r.u8()? {
+                    0 => IndexWalk::Optional,
+                    1 => IndexWalk::Required,
+                    other => return Err(format!("read_spec: IndexRange walk byte {other} is not 0 or 1")),
                 };
-                ReadBound::IndexRange { bound, exact }
+                ReadBound::IndexRange { bound, walk }
             }
             BOUND_PK_SET => {
-                let count = r.u32()? as usize;
-                if count > MAX_PK_SET_KEYS {
-                    return Err(format!("read_spec: PkSet count {count} exceeds cap {MAX_PK_SET_KEYS}"));
+                let stride = r.u8()? as usize;
+                if !(1..=MAX_PK_BYTES).contains(&stride) {
+                    return Err(format!("read_spec: PkSet stride {stride} outside 1..={MAX_PK_BYTES}"));
                 }
-                // Duplicates are NOT rejected here: this decoder has no schema, so
-                // a raw-`u128` set cannot see the wire keys that collide once
-                // truncated to the PK's width. The reject lives in the worker's
-                // schema-aware gather.
-                let raw = r.take(count * 16)?;
-                let keys = raw
-                    .as_chunks::<16>()
-                    .0
-                    .iter()
-                    .map(|c| u128::from_le_bytes(*c))
-                    .collect();
-                ReadBound::PkSet(keys)
+                let count = r.u32()? as usize;
+                let cap = PkKeys::max_per_request(stride);
+                if count > cap {
+                    return Err(format!("read_spec: PkSet count {count} exceeds cap {cap}"));
+                }
+                let bytes = r.take(count * stride)?;
+                if bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b) {
+                    ReadBound::PkSet(PkKeys {
+                        stride: stride as u8,
+                        bytes: bytes.to_vec(),
+                    })
+                } else {
+                    return Err("read_spec: PkSet keys are not strictly ascending".to_string());
+                }
             }
             BOUND_DELTA => ReadBound::Delta { after_tick: r.u64()? },
             other => return Err(format!("read_spec: unknown bound kind {other}")),
@@ -432,7 +471,13 @@ impl ReadSpec {
 
         let predicate = r.bytes32()?.to_vec();
 
-        let sink = match sink_tag {
+        let map = match r.u8()? {
+            0 => None,
+            1 => Some(read_compute_map(&mut r).map_err(|e| format!("read_spec: {e}"))?),
+            other => return Err(format!("read_spec: map presence byte {other} is not 0 or 1")),
+        };
+
+        let kind = match sink_tag {
             SINK_ROWS => {
                 let n_order = r.u8()? as usize;
                 if n_order > MAX_ORDER_KEYS {
@@ -443,34 +488,25 @@ impl ReadSpec {
                 for _ in 0..n_order {
                     order.push(read_order_key(&mut r)?);
                 }
-                let projection = r.bytes32()?.to_vec();
-                ReadSink::Rows { projection, order, limit_k }
+                SinkKind::Rows { order, limit_k }
             }
             SINK_FOLD => {
-                // The three counted sections take the circuit codec's caps and
-                // domain checks; only the pre-map's `Option` encoding is this
-                // sink's own.
+                // Both counted sections take the circuit codec's caps and
+                // domain checks.
                 let group_cols = read_cols(&mut r).map_err(|e| format!("read_spec: {e}"))?;
                 let aggs = read_aggs(&mut r).map_err(|e| format!("read_spec: {e}"))?;
-                let map = read_compute_map(&mut r).map_err(|e| format!("read_spec: {e}"))?;
-                // The two halves describe one reduce input: a program with no
-                // declared output slots cannot be resolved against a schema, and
-                // declared slots with no program would leave every one unwritten.
-                // A circuit `MapKind::Compute` has no such rule — it is
-                // unconditional, and a PK-only projection legitimately declares
-                // no slots — so this stays here rather than in the shared codec.
-                if map.program.is_empty() != map.out_cols.is_empty() {
-                    return Err("read_spec: fold pre-map program and column declarations disagree".to_string());
-                }
-                let pre = (!map.program.is_empty()).then_some(map);
-                ReadSink::Fold(AggReadSpec { group_cols, aggs, pre })
+                SinkKind::Fold(AggReadSpec { group_cols, aggs })
             }
             other => return Err(format!("read_spec: unknown sink tag {other}")),
         };
 
         r.expect_consumed()?;
 
-        Ok(ReadSpec { bound, predicate, sink })
+        Ok(ReadSpec {
+            bound,
+            predicate,
+            sink: ReadSink { map, kind },
+        })
     }
 }
 

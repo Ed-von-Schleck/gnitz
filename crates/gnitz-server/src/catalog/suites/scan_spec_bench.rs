@@ -27,7 +27,7 @@ use std::time::Instant;
 use super::*;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, OrderKey, ReadBound, ReadSink, ReadSpec};
+use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, OrderKey, ReadBound, ReadSink, ReadSpec, SinkKind};
 
 /// Sorted runs the cursor must merge (one ingest round each).
 const INGEST_ROUNDS: u64 = 8;
@@ -98,8 +98,8 @@ fn scan_spec_sinks_bench() {
     let (contiguous, fragmented) = (pred_lt_blob(1, 50), pred_lt_blob(2, 1));
 
     // Gather 3 of the 4 payload columns, permuted: c2→0, c3→1, c0→2.
-    let gather3 = proj_blob(&[(3, 0), (4, 1), (1, 2)]);
     let reply3 = i64_reply(3);
+    let gather3 = map_of(proj_blob(&[(3, 0), (4, 1), (1, 2)]), &reply3);
     for (label, pred) in [("contiguous", &contiguous), ("fragmented", &fragmented)] {
         let spec = rows_spec(pred.clone(), gather3.clone(), vec![], 0);
         cell(&format!("rows, sel~50% {label}, 3-col gather"), n, || {
@@ -108,7 +108,7 @@ fn scan_spec_sinks_bench() {
     }
 
     // No projection: whole-region range appends, no per-column gather.
-    let spec = rows_spec(fragmented.clone(), vec![], vec![], 0);
+    let spec = rows_spec(fragmented.clone(), None, vec![], 0);
     cell("rows, sel~50% fragmented, identity projection", n, || {
         e.scan_spec(tid, &spec, &src, 0).unwrap()
     });
@@ -126,8 +126,8 @@ fn scan_spec_sinks_bench() {
         eb.sink(gnitz_expr::Sink::Col(1));
         eb.build(None).expect("a well-formed program").to_blob_bytes()
     };
-    let spec = rows_spec(fragmented.clone(), compute_proj, vec![], 0);
     let reply2 = i64_reply(2);
+    let spec = rows_spec(fragmented.clone(), map_of(compute_proj, &reply2), vec![], 0);
     cell("rows, sel~50% fragmented, compute projection", n, || {
         e.scan_spec(tid, &spec, &reply2, 0).unwrap()
     });
@@ -136,6 +136,14 @@ fn scan_spec_sinks_bench() {
     let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
     let spec = rows_spec(contiguous.clone(), gather3.clone(), order, 100);
     cell("rows, ORDER BY .. LIMIT 100 (top-k)", n, || {
+        e.scan_spec(tid, &spec, &reply3, 0).unwrap()
+    });
+
+    // The same arm ordered by reply column 3, `c0`, which repeats across the
+    // survivors, so nearly every compare falls through to the identity tiebreak.
+    let order = vec![OrderKey { col: 3, desc: false, nulls_first: false }];
+    let spec = rows_spec(contiguous.clone(), gather3.clone(), order, 100);
+    cell("rows, ORDER BY c0 .. LIMIT 100 (top-k, tie-heavy)", n, || {
         e.scan_spec(tid, &spec, &reply3, 0).unwrap()
     });
 
@@ -151,13 +159,13 @@ fn scan_spec_sinks_bench() {
     });
 
     // The fold sink: GROUP BY c0 (100 groups), COUNT(*) + SUM(c2).
-    let agg = AggReadSpec::direct(
-        vec![1],
-        vec![
+    let agg = AggReadSpec {
+        group_cols: vec![1],
+        aggs: vec![
             AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 },
             AggDescriptor { agg_op: AggFunc::Sum, col_idx: 3 },
         ],
-    );
+    };
     // SyntheticFold reply: `_agg_pk` U128 PK, the group column, then one partial
     // per aggregate.
     let fold_reply = SchemaDescriptor::new(
@@ -173,12 +181,40 @@ fn scan_spec_sinks_bench() {
         let spec = ReadSpec {
             bound: ReadBound::None,
             predicate: pred.clone(),
-            sink: ReadSink::Fold(agg.clone()),
+            sink: ReadSink {
+                map: None,
+                kind: SinkKind::Fold(agg.clone()),
+            },
         };
         cell(&format!("fold, sel~50% {label}, GROUP BY COUNT+SUM"), n, || {
             e.scan_spec(tid, &spec, &fold_reply, 0).unwrap()
         });
     }
+
+    // The fold at many groups, where the group lookup rather than the
+    // accumulation dominates: `c3 = id / 7` below 60_000 names 60_000 groups.
+    let spec = ReadSpec {
+        bound: ReadBound::None,
+        predicate: pred_lt_blob(4, 60_000),
+        sink: ReadSink {
+            map: None,
+            kind: SinkKind::Fold(AggReadSpec {
+                group_cols: vec![4],
+                aggs: vec![AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 }],
+            }),
+        },
+    };
+    let many_reply = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    cell("fold, c3 < 60000, GROUP BY 60k groups COUNT", n, || {
+        e.scan_spec(tid, &spec, &many_reply, 0).unwrap()
+    });
 }
 
 /// The German-string path, whose mandatory per-cell relocation into the keeper
@@ -209,7 +245,12 @@ fn scan_spec_string_gather_bench() {
         ],
         &[0],
     );
-    let spec = rows_spec(pred_lt_blob(2, 1), proj_blob(&[(1, 0), (2, 1)]), vec![], 0);
+    let spec = rows_spec(
+        pred_lt_blob(2, 1),
+        map_of(proj_blob(&[(1, 0), (2, 1)]), &reply),
+        vec![],
+        0,
+    );
     cell("rows, sel~50% fragmented, gather incl. STRING", STRING_ROWS, || {
         e.scan_spec(tid, &spec, &reply, 0).unwrap()
     });

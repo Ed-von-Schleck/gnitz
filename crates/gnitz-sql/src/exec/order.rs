@@ -22,23 +22,7 @@ use crate::exec::batch::RowGather;
 use crate::tail::{key_slots, resolve_position, OrderKey, OrderTarget};
 use crate::validate::order_column;
 use gnitz_core::{ColumnDef, Schema, ZSetBatch, ZSetBatchView};
-use gnitz_expr::{cmp_order_keys, OrderLocator, RowSource, SchemaFacts};
-
-// ---------------------------------------------------------------------------
-// One sort key over the full pre-projection schema
-// ---------------------------------------------------------------------------
-
-/// Resolve one sort key against the pre-projection (`actual`) schema. Every
-/// address the comparator needs comes from the one [`gnitz_expr::ColumnLocator`],
-/// resolved once out of the O(n log n) comparator — the same record the engine's
-/// worker-side ORDER BY resolves through, feeding the same [`cmp_order_keys`].
-fn sort_key(schema: &Schema, ci: usize, asc: bool, nulls_first: bool) -> OrderLocator {
-    OrderLocator {
-        loc: SchemaFacts::locate(schema, ci),
-        desc: !asc,
-        nulls_first,
-    }
-}
+use gnitz_expr::{cmp_order_keys, push_identity_tiebreak, OrderLocator, RowSource, SchemaFacts};
 
 /// The client-side cut a sink applies to its own result. `limit: None` is
 /// unbounded.
@@ -112,25 +96,6 @@ fn emit_slot(
     out_cols.len() - 1
 }
 
-/// Append the deterministic identity tiebreak — every PK column in pk-list
-/// order, then every payload column in schema order, all ASC NULLS FIRST — so
-/// distinct logical rows tied on the ORDER BY keys order consistently across
-/// worker counts and a cut is a function of the data. Matches the worker's
-/// OPK-then-payload tiebreak.
-///
-/// **Precondition on the caller's schema: `pk_cols` must be data-derived** — a
-/// base-table key, or a synthetic key that is a pure function of row content
-/// (`_group_pk`, `_join_pk`, `_set_pk`). They lead the tiebreak, so a PK carrying
-/// anything else decides every tie before a payload column is ever reached.
-fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &Schema) {
-    for &ci in &schema.pk_cols {
-        keys.push(sort_key(schema, ci as usize, true, true));
-    }
-    for (_, ci, _) in schema.payload_columns() {
-        keys.push(sort_key(schema, ci, true, true));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Multiplicity walk (LIMIT / OFFSET over logical rows)
 // ---------------------------------------------------------------------------
@@ -179,13 +144,8 @@ pub(crate) fn wire_order(
     Ok(keys.iter().zip(slots).map(|(k, col)| k.wire(col)).collect())
 }
 
-/// Sort + window an already-server-projected ScanSpec reply by its wire
-/// `OrderKey`s (whose `col` is a full reply-schema column index — fed straight to
-/// `sort_key`, NOT resolved by name, so a projected-column / alias ORDER BY
-/// works and a hidden appended key stays addressable), then present under the
-/// identity projection (hidden columns stripped downstream). The worker's per-
-/// worker top-k selects the same order (shared comparators), so this re-sort of
-/// the concatenation yields the exact final window.
+/// Sort and window a projected ScanSpec reply by its wire `OrderKey`s, whose
+/// `col` indexes the reply schema, so a hidden appended key resolves.
 pub(crate) fn read_spec_finish(
     schema: Schema,
     batch: ZSetBatch,

@@ -59,15 +59,16 @@ fn assert_no_payload(reply: &ZSetBatch, reply_schema: &Schema) {
         .expect("the reply validates under its schema");
 }
 
-/// The keys-only rows sink: a zero-instruction projection, no ORDER BY, no limit.
+/// The keys-only rows sink: a zero-instruction map declaring no slot, no ORDER
+/// BY, no limit.
 fn keys_only_sink() -> ReadSink {
-    ReadSink::Rows {
-        projection: ExprBuilder::new()
-            .build(None)
-            .expect("a well-formed program")
-            .to_blob_bytes(),
-        order: Vec::new(),
-        limit_k: 0,
+    let program = ExprBuilder::new()
+        .build(None)
+        .expect("a well-formed program")
+        .to_blob_bytes();
+    ReadSink {
+        map: Some(gnitz_wire::ComputeMap { program, out_cols: vec![] }),
+        ..ReadSink::all_rows()
     }
 }
 

@@ -13,7 +13,7 @@ use crate::exec::order::Window;
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::sys_rows::SysRowSink;
-use gnitz_wire::{AggFunc, ReadBound};
+use gnitz_wire::{AggFunc, IndexWalk, ReadBound, SinkKind};
 
 /// Describe `plan` without running it: the EXPLAIN reply.
 pub(crate) fn execute_explain(plan: &ReadPlan) -> SqlResult {
@@ -106,13 +106,14 @@ fn order_limit_facts(spec: &SpecRead) -> Vec<String> {
     let mut facts = Vec::new();
     // The per-worker cut is OFFSET+LIMIT deep, because the client windows. With no
     // ORDER BY keys the same wire field just stops the worker early.
-    if let (SinkTail::Rows { .. }, Some(l)) = (&spec.tail, spec.window.limit) {
-        let limit_k = l.saturating_add(spec.window.offset);
-        facts.push(if spec.order.is_empty() {
-            format!("server early-stop {limit_k}")
-        } else {
-            format!("server top-{limit_k}")
-        });
+    if let SinkKind::Rows { order, limit_k } = &spec.sink.kind {
+        if *limit_k > 0 {
+            facts.push(if order.is_empty() {
+                format!("server early-stop {limit_k}")
+            } else {
+                format!("server top-{limit_k}")
+            });
+        }
     }
     facts.extend(window_facts(&spec.order, spec.window));
     facts
@@ -165,7 +166,7 @@ fn access_line(access: &Access, schema: &Schema) -> String {
         // It is reachable through the read verbs, where weights are native, and
         // nowhere else — so no planner ever builds one for EXPLAIN to describe.
         ReadBound::Delta { after_tick } => format!("delta feed after round {after_tick}"),
-        ReadBound::IndexRange { bound, exact } => {
+        ReadBound::IndexRange { bound, walk } => {
             let cols = bound
                 .idx_cols
                 .as_slice()
@@ -173,15 +174,11 @@ fn access_line(access: &Access, schema: &Schema) -> String {
                 .map(|&c| schema.columns[c as usize].name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // `exact` means the bounded conjuncts were stripped from the predicate,
-            // so the walk alone applies them and the worker runs it un-gated.
-            // Otherwise they still ride the predicate and the worker's selectivity
-            // gate may drop the walk (`ReadBound::IndexRange` in gnitz-wire is the
-            // authority on that rule).
-            if *exact {
-                format!("index range on ({cols}) — exact walk, never traded")
-            } else {
-                format!("index range on ({cols}) — may be traded for a full scan on low selectivity")
+            match walk {
+                IndexWalk::Required => format!("index range on ({cols}) — exact walk, never traded"),
+                IndexWalk::Optional => {
+                    format!("index range on ({cols}) — may be traded for a full scan on low selectivity")
+                }
             }
         }
     }

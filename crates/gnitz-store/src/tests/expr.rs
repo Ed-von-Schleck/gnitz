@@ -882,3 +882,36 @@ fn a_corrupt_compute_map_program_is_rejected() {
     });
     assert!(wire_rejection(&s, mk).starts_with("map: invalid program"));
 }
+
+/// A declaration wider than a schema holds is refused by the derivation, never
+/// reaching `SchemaDescriptor::new`'s release-active `assert!`.
+#[test]
+fn compute_map_refuses_an_over_wide_declaration() {
+    let schema = make_schema(0, &[type_code::U64, type_code::I64]);
+    let map = gnitz_wire::ComputeMap {
+        program: vec![1, 2, 3],
+        out_cols: (0..MAX_COLUMNS).map(|_| (type_code::I64, false)).collect(),
+    };
+    let Err(err) = MapPlan::from_compute_map(&schema, &map) else {
+        panic!("an over-wide compute map must be refused");
+    };
+    assert!(
+        err.to_string().contains("compute map: output exceeds MAX_COLUMNS"),
+        "{err}"
+    );
+}
+
+/// A corrupt program blob is refused by the program decoder, not decoded into a
+/// plan that maps garbage.
+#[test]
+fn compute_map_refuses_a_corrupt_program() {
+    let schema = make_schema(0, &[type_code::U64, type_code::I64]);
+    let map = gnitz_wire::ComputeMap {
+        program: vec![0xff; 8],
+        out_cols: vec![(type_code::I64, false)],
+    };
+    let Err(err) = MapPlan::from_compute_map(&schema, &map) else {
+        panic!("a corrupt compute map program must be refused");
+    };
+    assert!(err.to_string().contains("map: invalid program"), "{err}");
+}

@@ -290,7 +290,14 @@ fn a_partial_cover_of_a_unique_index_does_not_jump_the_queue() {
 /// The gather keys of `sql`, dropping the residual (which borrows the bound
 /// expression and so cannot outlive this call).
 fn pk_in_keys_of(sql: &str, schema: &Schema) -> Option<Vec<u128>> {
-    try_extract_pk_in(&bind_where(sql, schema), schema).map(|(keys, _)| keys)
+    try_extract_pk_in(&bind_where(sql, schema), schema).map(|(keys, _)| natives(schema, &keys))
+}
+
+/// A gather's OPK keys decoded back to native values, in key order.
+fn natives(schema: &Schema, keys: &PkKeys) -> Vec<u128> {
+    keys.iter()
+        .map(|k| u128::from_le_bytes(gnitz_core::native_le_key(schema, k)[..16].try_into().unwrap()))
+        .collect()
 }
 
 /// The gather needs a genuine multi-key list on a single-column PK: a compound
@@ -331,7 +338,8 @@ fn try_extract_pk_in_uuid_invalid_string_falls_back() {
 fn try_extract_pk_in_negative_i32_list() {
     assert_eq!(
         pk_in_keys_of("id IN (-1, -2)", &pk_schema(TypeCode::I32)),
-        Some(vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128])
+        // In key order: the gather sorts its keys, and -2 sorts first.
+        Some(vec![(-2i32 as u32) as u128, (-1i32 as u32) as u128])
     );
 }
 
@@ -344,7 +352,7 @@ fn pk_in_inside_an_and_tree_gathers_with_a_residual() {
     let schema = pk_schema(TypeCode::U64);
     let expr = bind_where("v > 5 AND id IN (7, 9)", &schema);
     let (keys, residual) = try_extract_pk_in(&expr, &schema).expect("the IN conjunct bounds the gather");
-    assert_eq!(keys, vec![7, 9]);
+    assert_eq!(natives(&schema, &keys), vec![7, 9]);
     assert_eq!(residual.len(), 1, "`v > 5` stays residual");
     assert_eq!(pk_in_keys_of("t.id IN (1, 2)", &schema), Some(vec![1, 2]));
 }
@@ -397,8 +405,8 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     let row = vec![literal.clone(), num_expr("0")];
     let got_insert = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
     assert_eq!(
-        gnitz_core::native_packed_key(&schema, got_insert.pk_bytes()),
-        expected,
+        got_insert,
+        gnitz_core::opk_key_packed(&schema, expected),
         "extract_pk_value"
     );
 
@@ -414,7 +422,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     // folds to the `Eq` leg 2 already covers); the dedup collapses it to one key.
     let in_e = bind1(&in_list_expr("id", vec![literal.clone(), literal]), &schema).expect("bind in");
     assert_eq!(
-        try_extract_pk_in(&[in_e], &schema).map(|(keys, _)| keys),
+        try_extract_pk_in(&[in_e], &schema).map(|(keys, _)| natives(&schema, &keys)),
         Some(vec![expected]),
         "try_extract_pk_in"
     );

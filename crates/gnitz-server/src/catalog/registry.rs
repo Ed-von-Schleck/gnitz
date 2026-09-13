@@ -38,11 +38,9 @@ impl CatalogEngine {
     /// walk below needs a bound test.
     fn open_column_band(&self, owner_id: i64) -> ReadCursor {
         let (start, end) = SysFamily::Column.band(owner_id);
-        let mut cursor = self
-            .sys_relation(SysFamily::Column)
-            .cursor_in_range(start.pk_bytes(), Some(end.pk_bytes()));
-        cursor.seek_range_bytes(start.pk_bytes(), Some(end.pk_bytes()));
-        cursor
+        self.sys_relation(SysFamily::Column)
+            .range_cursor(start.pk_bytes(), Some(end.pk_bytes()))
+            .0
     }
 
     /// Scan sys_columns for every positive-weight column record owned by

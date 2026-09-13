@@ -320,16 +320,11 @@ fn write_set_rows(
 /// DELETE's read shape: the source PK columns and nothing else. `build_read_projection`
 /// over an empty SELECT list is exactly that — the PK is always prepended, and
 /// there is no payload item to follow it — so the reply carries the key region
-/// and no blob heap, and the projection program relocates nothing.
+/// and no blob heap, and the map relocates nothing.
 fn pk_only_reply(schema: &Schema, alias: &str) -> Result<(Schema, ReadSink), GnitzSqlError> {
     let (items, out_cols) = build_read_projection(&[], schema, alias)?;
-    let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema)?;
-    let sink = ReadSink::Rows {
-        projection,
-        order: Vec::new(),
-        limit_k: 0, // unbounded
-    };
-    Ok((reply_schema, sink))
+    let (reply_schema, map) = read_reply_shape(&items, out_cols, schema)?;
+    Ok((reply_schema, ReadSink { map: Some(map), ..ReadSink::all_rows() }))
 }
 
 /// The rows a single-table UPDATE/DELETE `WHERE` (or its absence) resolves to,

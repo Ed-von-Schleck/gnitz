@@ -1,15 +1,15 @@
 //! `scan_spec` — the worker-side parameterized bounded read. The first
 //! group drives the bound walks (None / PkRange / PkSet) and the sink shapes
-//! (top-k / materialize / early-stop) with an **identity** spec (empty predicate
-//! and projection, so `reply_schema == source schema`), isolating the cursor +
+//! (top-k / materialize / early-stop) with an **identity** spec (no predicate
+//! and no map, so `reply_schema == source schema`), isolating the cursor +
 //! reduction mechanics from the expression VM (which the e2e suite covers). The
-//! second group drives the projection onto the keeper — gather, compute, and
+//! second group drives the map onto the keeper — gather, compute, and
 //! output-slot coverage.
 
 use super::*;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
-use gnitz_wire::{Cut, OrderKey, RangeDescriptor, ReadBound, ReadSpec};
+use gnitz_wire::{Cut, OrderKey, PkKeys, RangeDescriptor, ReadBound, ReadSpec};
 
 /// The `(id U64 PK | val I64)` schema both bases below use.
 fn id_val_cols() -> Vec<ColumnDef> {
@@ -56,7 +56,7 @@ fn triples(b: &Batch) -> Vec<(u128, i64, i64)> {
 fn identity_spec(bound: ReadBound, order: Vec<OrderKey>, limit_k: u64) -> ReadSpec {
     ReadSpec {
         bound,
-        ..rows_spec(vec![], vec![], order, limit_k)
+        ..rows_spec(vec![], None, order, limit_k)
     }
 }
 
@@ -64,6 +64,19 @@ fn run(engine: &mut CatalogEngine, tid: i64, spec: &ReadSpec) -> Vec<(u128, i64,
     let reply_schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     let keeper = engine.scan_spec(tid, spec, &reply_schema, 0).unwrap();
     triples(&keeper)
+}
+
+/// A `pk IN (…)` bound naming `keys` (native values) as `id`'s own OPK images.
+fn pk_set(engine: &CatalogEngine, id: i64, keys: impl IntoIterator<Item = u128>) -> ReadBound {
+    let schema = engine.registry().relation(id).map(Relation::schema).unwrap();
+    let opk: Vec<_> = keys.into_iter().map(|k| opk_pk(&schema, &[k])).collect();
+    ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), opk.iter().map(Vec::as_slice)))
+}
+
+/// [`run`] over an identity spec gathering `keys`.
+fn run_pk_set(engine: &mut CatalogEngine, id: i64, keys: impl IntoIterator<Item = u128>) -> Vec<(u128, i64, i64)> {
+    let bound = pk_set(engine, id, keys);
+    run(engine, id, &identity_spec(bound, vec![], 0))
 }
 
 #[test]
@@ -108,7 +121,7 @@ fn pk_range_bounded_above_truncates_at_end() {
 #[test]
 fn pk_set_gathers_named_keys() {
     let (mut e, tid) = fixture("ss_pkset", 10, |i| (i * 100) as i64);
-    let bound = ReadBound::PkSet(vec![2, 5, 7]);
+    let bound = pk_set(&e, tid, [2, 5, 7]);
     let mut got = run(&mut e, tid, &identity_spec(bound, vec![], 0));
     got.sort();
     assert_eq!(got, vec![(2u128, 200, 1), (5u128, 500, 1), (7u128, 700, 1)]);
@@ -122,7 +135,7 @@ fn pk_set_gathers_named_keys() {
 fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
     let sys_schema = e.registry().relation(TABLE_TAB_ID).map(Relation::schema).unwrap();
-    let spec = identity_spec(ReadBound::PkSet(vec![tid as u128]), vec![], 0);
+    let spec = identity_spec(pk_set(&e, TABLE_TAB_ID, [tid as u128]), vec![], 0);
     let keeper = e.scan_spec(TABLE_TAB_ID, &spec, &sys_schema, 0).unwrap();
     assert_eq!(
         (0..keeper.len()).map(|i| keeper.get_pk(i)).collect::<Vec<_>>(),
@@ -131,20 +144,19 @@ fn pk_set_over_a_system_table_keeps_every_key() {
     );
 }
 
-/// Two distinct wire keys can share one OPK image — `opk_key` truncates to
-/// `pk_stride`, so `5` and `5 + 2^64` are the same U64 PK. The decoder's
-/// schema-free view cannot see that; the gather's post-sort scan must, or the
-/// duplicate key re-walks the same PK group and emits it twice. Every worker
-/// walks the whole list, so the verdict is the same wherever the frame lands.
+/// A `PkSet` carries OPK keys at the stride of the schema the client planned
+/// against, so a list at any other stride cannot name this relation's keys — a
+/// stale or forged frame, refused rather than walked as misaligned bytes.
 #[test]
-fn pk_set_rejects_keys_colliding_after_truncation() {
-    let (mut e, tid) = fixture("ss_pkset_trunc", 10, |i| i as i64);
-    let spec = identity_spec(ReadBound::PkSet(vec![5, 5 + (1u128 << 64)]), vec![], 0);
+fn pk_set_rejects_a_key_stride_other_than_the_relations() {
+    let (mut e, tid) = fixture("ss_pkset_stride", 10, |i| i as i64);
+    let keys = PkKeys::from_keys(16, [&[0u8; 16][..]]);
+    let spec = identity_spec(ReadBound::PkSet(keys), vec![], 0);
     let reply_schema = e.registry().relation(tid).map(Relation::schema).unwrap();
     let Err(err) = e.scan_spec(tid, &spec, &reply_schema, 0) else {
-        panic!("colliding PkSet keys must be rejected, not gathered twice");
+        panic!("a PkSet at the wrong stride must be rejected");
     };
-    assert!(err.text.contains("duplicate"), "{err}");
+    assert!(err.text.contains("stride"), "{err}");
 }
 
 /// A REPLICATED base table holds a full copy of the dataset in this worker's own
@@ -201,11 +213,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
         .unwrap();
     assert_eq!(gathered.len(), N as usize, "every parent key must dereference");
 
-    let mut got = run(
-        &mut e,
-        tid,
-        &identity_spec(ReadBound::PkSet((0..N).collect()), vec![], 0),
-    );
+    let mut got = run_pk_set(&mut e, tid, 0..N);
     got.sort();
     assert_eq!(got, want);
 
@@ -248,17 +256,11 @@ fn keyed_reads_over_a_view_return_the_whole_pk_group() {
     assert_eq!(triples(&hit), want);
 
     // The `pk IN (…)` set gather.
-    assert_eq!(
-        run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![7]), vec![], 0)),
-        want
-    );
+    assert_eq!(run_pk_set(&mut e, vid, [7]), want);
 
     // A key the store does not name stays a miss on both.
     assert!(e.seek(vid, 8, &[]).unwrap().0.is_none());
-    assert_eq!(
-        run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![8]), vec![], 0)),
-        vec![]
-    );
+    assert_eq!(run_pk_set(&mut e, vid, [8]), vec![]);
 }
 
 /// The two keyed readers gate each row on a positive weight. That gate must be
@@ -274,10 +276,7 @@ fn keyed_reads_skip_a_retracted_group_head_and_keep_the_live_rows() {
 
     let hit = e.seek(vid, 5, &[]).unwrap().0.expect("seek must find the group");
     assert_eq!(triples(&hit), want);
-    assert_eq!(
-        run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![5]), vec![], 0)),
-        want
-    );
+    assert_eq!(run_pk_set(&mut e, vid, [5]), want);
 }
 
 /// A `PkSet` chunk tests the row budget before each key and then drains that
@@ -293,7 +292,7 @@ fn pk_set_drains_a_group_larger_than_the_chunk_budget() {
             .chain(std::iter::once((2u64, 99i64, 1i64))),
     );
     e.registry_mut().set_scan_chunk_rows(4);
-    let got = run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![1, 2]), vec![], 0));
+    let got = run_pk_set(&mut e, vid, [1, 2]);
     let want: Vec<_> = (0..10i64)
         .map(|v| (1u128, v, 1i64))
         .chain(std::iter::once((2u128, 99, 1)))
@@ -385,7 +384,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
 fn pk_set_missing_keys_miss_silently() {
     let (mut e, tid) = fixture("ss_pkset_miss", 5, |i| i as i64);
     // 3 present (0,4), 99 absent.
-    let bound = ReadBound::PkSet(vec![0, 99, 4]);
+    let bound = pk_set(&e, tid, [0, 99, 4]);
     let mut got = run(&mut e, tid, &identity_spec(bound, vec![], 0));
     got.sort();
     assert_eq!(got, vec![(0u128, 0, 1), (4u128, 4, 1)]);
@@ -509,7 +508,7 @@ fn gather_of_64_payload_columns_covers_every_slot() {
     // Identity-order gather of every payload column: src col k+1 → out slot k.
     let copies: Vec<(u32, u32)> = (0..P as u32).map(|k| (k + 1, k)).collect();
     let reply = e.registry().relation(tid).map(Relation::schema).unwrap();
-    let spec = rows_spec(vec![], proj_blob(&copies), vec![], 0);
+    let spec = rows_spec(vec![], map_of(proj_blob(&copies), &reply), vec![], 0);
     let got = e.scan_spec(tid, &spec, &reply, 0).unwrap();
     assert_eq!(got.len(), 40);
     for r in 0..got.len() {
@@ -539,7 +538,7 @@ fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
         ],
         &[0],
     );
-    let spec = rows_spec(vec![], proj_blob(&[(0, 0)]), vec![], 0);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[(0, 0)]), &reply), vec![], 0);
     let got = e.scan_spec(tid, &spec, &reply, 0).unwrap();
     assert_eq!(got.len(), 300, "10 chunks of 32 rows minus the short tail");
     for r in 0..got.len() {
@@ -590,7 +589,7 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
         ],
         &[0],
     );
-    let spec = rows_spec(vec![], proj_blob(&[(2, 0), (0, 1), (1, 2)]), vec![], 0);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[(2, 0), (0, 1), (1, 2)]), &reply), vec![], 0);
     let got = e.scan_spec(tid, &spec, &reply, 0).unwrap();
     assert_eq!(got.len() as u64, N);
 
@@ -663,7 +662,7 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
         eb.build(None).expect("a well-formed program").to_blob_bytes()
     };
     // `keep = id * 10 < 1000` keeps ids 0..99, interleaved with the chunking.
-    let spec = rows_spec(pred_lt_blob(2, 1000), projection, vec![], 0);
+    let spec = rows_spec(pred_lt_blob(2, 1000), map_of(projection, &reply), vec![], 0);
     let got = e.scan_spec(tid, &spec, &reply, 0).unwrap();
 
     let mut decoded: Vec<(u128, Option<i64>, i64)> = (0..got.len())
@@ -701,7 +700,7 @@ fn projection_missing_an_output_slot_errs() {
         ],
         &[0],
     );
-    let spec = rows_spec(vec![], proj_blob(&[(1, 0)]), vec![], 0);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[(1, 0)]), &reply), vec![], 0);
     let err = e.scan_spec(tid, &spec, &reply, 0).err().unwrap();
     assert!(err.text.contains("OutputSlotCountMismatch"), "{err}");
 }
@@ -716,7 +715,7 @@ fn gather_top_k_keeps_boundary_row_whole() {
     // Reply: id U64 PK | val I64 — a gather of the single payload column.
     let reply = e.registry().relation(tid).map(Relation::schema).unwrap();
     let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
-    let spec = rows_spec(vec![], proj_blob(&[(1, 0)]), order, 2);
+    let spec = rows_spec(vec![], map_of(proj_blob(&[(1, 0)]), &reply), order, 2);
     let got = e.scan_spec(tid, &spec, &reply, 0).unwrap();
     // LIMIT 2 is covered by the single smallest row's weight 3 — kept whole.
     assert_eq!(triples(&got), vec![(0u128, 0, 3)]);
@@ -738,7 +737,7 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
         bb.put_u64(id % 2);
     });
     let reply = e.registry().relation(tid).map(Relation::schema).unwrap();
-    let spec = rows_spec(pred_lt_blob(1, 1), proj_blob(&[(1, 0)]), vec![], 5);
+    let spec = rows_spec(pred_lt_blob(1, 1), map_of(proj_blob(&[(1, 0)]), &reply), vec![], 5);
     let got = e.scan_spec(tid, &spec, &reply, 0).unwrap();
     let total: i64 = (0..got.len()).map(|r| got.get_weight(r)).sum();
     assert!(total >= 5, "early-stop must cover the window weight, got {total}");

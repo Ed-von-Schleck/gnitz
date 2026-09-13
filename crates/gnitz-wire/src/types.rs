@@ -179,7 +179,7 @@ impl TypeCode {
     /// expression VM: a bound on such a column cannot be re-imposed by a
     /// compiled predicate, so a range walk over it must be byte-exact
     /// (un-gated). The SQL layer reads this when deciding which conjuncts it may
-    /// strip; it then ships the verdict as the `exact` bit on the bound.
+    /// strip; it then ships the verdict as the bound's `IndexWalk`.
     pub const fn is_wide_int(self) -> bool {
         is_wide_int(self as u8)
     }

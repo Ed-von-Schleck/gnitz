@@ -1,57 +1,33 @@
-//! Parameterized bounded read (`ReadSpec`) execution — the worker half of the
-//! ad-hoc SELECT scan. Runs **once per worker**: resolve the client's frame
-//! against the bound's source schema, open a cursor for the bound, then per
-//! chunk take the predicate's surviving row ranges and drive them into the sink
-//! — rows or the aggregate hash-fold. Nothing between the source chunk and the
-//! sink is materialized. No DBSP circuit, no operator state, no exchange.
-//!
-//! Resolve order is **source schema → predicate → sink → open**, and the open is
-//! last because it is the expensive step: a hydrating materialization for a
-//! capacity-bounded view, an encode and sort of the whole key list for a
-//! `PkSet`. A forged frame costs a comparison, not a walk.
-//!
-//! The cursor spans this worker's whole slice of the relation; a bound that
-//! names its keys narrows the walk within it. Which worker answers at all is the
-//! master's question (`SchemaDescriptor::confined_worker`), not this module's.
-//!
-//! The reply schema arrives as the client's raw wire block (decoded by the
-//! worker one layer up); this module takes the decoded `SchemaDescriptor`. The
-//! block itself never leaves the request — the client decodes the reply against
-//! its own copy.
+//! The worker half of an ad-hoc `ReadSpec` read, over this worker's slice: open
+//! the bound, filter, map, then forward rows or fold them. Hydrating a
+//! capacity-bounded view runs after every check.
 
-use std::cmp::Ordering;
-
-use gnitz_wire::{AggReadSpec, Cut, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec};
+use gnitz_wire::{Cut, OrderKey, RangeDescriptor, ReadBound, ReadSpec, SinkKind};
 
 use std::rc::Rc;
 
 use super::SkeletonHydrator;
-use crate::expr::{MapPlan, PkSource};
+use crate::expr::MapPlan;
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
-use crate::schema::key::{compare_pk_bytes, opk_key, pack_pk_be, IndexKeySpec};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{compare_rows, Batch, PkSetGather, ReadCursor, SourceCursor, StoreError};
-use gnitz_expr::{cmp_order_keys, Evaluator, LogicalProgram, OrderLocator};
+use crate::storage::{Batch, PkSetGather, ReadCursor, SourceCursor, StoreError};
+use gnitz_expr::{cmp_order_keys, push_identity_tiebreak, Evaluator, LogicalProgram, OrderLocator};
+
+/// The sink a request resolved to, ahead of any walk.
+enum Sink {
+    Fold(Box<AdhocFold>),
+    /// ORDER BY locators over the sink input, tiebreak appended when any key is
+    /// present, and the summed-weight window.
+    Rows {
+        order: Vec<OrderLocator>,
+        window: i64,
+    },
+}
 
 impl RelationRegistry {
-    /// Execute `spec` against `target_id` on this worker's slice,
-    /// returning one keeper batch in the `reply_schema` shape. The caller
-    /// (the worker dispatch arm) decoded `reply_schema` from the client's wire
-    /// block and replies with no block at all; this method does the bound walk,
-    /// predicate, projection, and ORDER BY / LIMIT reduction.
-    ///
-    /// `Err` on a corrupt program blob, a reply schema that does not match the
-    /// sink's expected shape (rows: PK-stride equality; fold: the derived
-    /// SyntheticFold layout), an index column list naming a column the table has
-    /// not got, an index an `exact` bound needs and cannot find — every one a
-    /// corrupt/stale frame, surfaced as a `STATUS_ERROR` reply — the fold's
-    /// per-worker group cap (a resource-exhaustion abort), or a delta cursor
-    /// below this worker's retention floor, which is [`StoreError::DeltaExpired`].
-    ///
-    /// `cut_tick` is the last tick round the master had emitted when it wrote
-    /// this read's group, and bounds an incremental delta read above. Every other
-    /// bound ignores it.
+    /// Execute `spec` on this worker's slice, replying in `reply_schema`'s layout.
+    /// `cut_tick` bounds a delta read above; every other bound ignores it.
     pub fn scan_spec(
         &self,
         target_id: i64,
@@ -60,396 +36,242 @@ impl RelationRegistry {
         cut_tick: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Batch, StoreError> {
-        let src_schema = self.scan_spec_source_schema(target_id, &spec.bound)?;
-
-        // Compile the predicate once per request, exactly as the circuit
-        // compiler does (`query/compiler/emit.rs`).
-        let predicate = match spec.predicate.is_empty() {
-            true => None,
-            false => Some(compile_predicate(&spec.predicate, &src_schema)?),
+        let (source, src_schema) = self.open_bound(target_id, &spec.bound, cut_tick)?;
+        let predicate = (!spec.predicate.is_empty())
+            .then(|| compile_predicate(&spec.predicate, &src_schema))
+            .transpose()?;
+        let map = spec
+            .sink
+            .map
+            .as_ref()
+            .map(|m| MapPlan::from_compute_map(&src_schema, m))
+            .transpose()
+            .map_err(|e| StoreError::rejected(format!("scan_spec map: {e}")))?;
+        let sink_in = map.as_ref().map_or(src_schema, |m| *m.out_schema());
+        let sink = match &spec.sink.kind {
+            SinkKind::Fold(agg) => Sink::Fold(Box::new(AdhocFold::new(&sink_in, agg, self.config.adhoc_group_cap)?)),
+            SinkKind::Rows { order, limit_k } => Sink::Rows {
+                order: resolve_order_locs(order, &sink_in)?,
+                window: saturated_window(*limit_k),
+            },
         };
-        let ctx = ScanSinkCtx {
-            predicate: predicate.as_ref(),
-            chunk_rows: self.config.scan_chunk_rows,
+        // The one reply guard: a keeper built in any other layout ships its
+        // regions under the client's strides.
+        let produced = match &sink {
+            Sink::Fold(f) => f.output_schema(),
+            Sink::Rows { .. } => &sink_in,
         };
-
-        // Each arm resolves its sink whole, then opens. The open is spelled
-        // twice rather than hoisted above the match: hoisting it is what would
-        // put the walk ahead of the frame's own rejections.
-        match &spec.sink {
-            ReadSink::Fold(agg) => {
-                // The reduce input: the pre-map's output when the fold carries
-                // one, else the source itself. Everything downstream — the fold's
-                // column indices, its accumulator types and its derived partial
-                // layout — is resolved against this, never against `src_schema`.
-                let pre = compile_fold_pre_map(agg, &src_schema)?;
-                let reduce_in = pre.as_ref().map_or(&src_schema, |(s, _)| s);
-                let fold = AdhocFold::new(reduce_in, reply_schema, agg, self.config.adhoc_group_cap)?;
-                let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema, cut_tick, hydrator)?;
-                run_scan_fold_sink(&mut source, ctx, pre.as_ref(), fold)
-            }
-            ReadSink::Rows { projection, order, limit_k } => {
-                let projection = resolve_rows_projection(projection, &src_schema, reply_schema)?;
-                let order_locs = resolve_order_locs(order, reply_schema)?;
-                let window = saturated_window(*limit_k);
-                let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema, cut_tick, hydrator)?;
-                Ok(match !order_locs.is_empty() && window > 0 {
-                    true => topk_rows(&mut source, ctx, projection.as_ref(), reply_schema, &order_locs, window),
-                    false => stream_rows(&mut source, ctx, projection.as_ref(), reply_schema, window),
-                })
-            }
+        if !reply_schema.same_physical_layout(produced) {
+            return Err(StoreError::rejected(
+                "scan_spec: reply schema does not match the sink's output layout",
+            ));
         }
+        let source = self.hydrated(target_id, source, hydrator)?;
+        let mut rows = Survivors { source, predicate, ranges: Vec::new() };
+        let chunk_rows = self.config.scan_chunk_rows;
+        Ok(match sink {
+            Sink::Fold(fold) => run_fold_sink(&mut rows, chunk_rows, map.as_ref(), *fold)?,
+            Sink::Rows { order, window } if !order.is_empty() && window > 0 => {
+                topk_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, &order, window)
+            }
+            Sink::Rows { window, .. } => stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window),
+        })
     }
 
-    /// The schema the bound's rows arrive in — what the predicate, the projection
-    /// and the identity-layout check below are all resolved against.
-    ///
-    /// Taken from the **bound**, not from the registry entry: an incremental delta
-    /// read walks the view's delta store, whose rows are `_tick ‖ view PK ‖ view
-    /// payload`. The bootstrap arm (`after_tick = 0`) is *the sum of every delta
-    /// after round 0*, which is the view's whole history — precisely what its own
-    /// output store holds — so it walks that, in the view's own schema.
-    ///
-    /// A `Delta` bound against a relation with no feed is refused at **every**
-    /// `after_tick`, zero included: the reply would otherwise promise a
-    /// continuation the server cannot serve.
-    fn scan_spec_source_schema(&self, target: i64, bound: &ReadBound) -> Result<SchemaDescriptor, StoreError> {
-        let entry = self.relation_or_err(target)?;
-        let ReadBound::Delta { after_tick } = bound else {
-            return Ok(entry.schema());
-        };
-        if entry.budgets().delta_bytes.is_none() {
-            return Err(StoreError::rejected(format!(
-                "scan_spec: relation {target} carries no delta feed; \
-                 create the view WITH (delta = '<size>') to subscribe to it"
-            )));
-        }
-        if *after_tick == 0 {
-            return Ok(entry.schema());
-        }
-        Ok(entry.delta_or_err()?.schema())
-    }
-
-    /// Open the source cursor for `bound` over `source`, bounded within this
-    /// worker's store by whatever the bound names.
-    ///
-    /// A walk that meets a skeleton row ([`ReadCursor::any_skeleton`]) is
-    /// hydrated whole first, so no sink below ever sees one — at the cost of this
-    /// module's streaming property for that read.
-    fn open_scan_spec_cursor(
+    /// Open `bound`'s source cursor, without walking it, and the schema its rows
+    /// arrive in — for a delta read, the delta store's rather than the relation's.
+    fn open_bound(
         &self,
-        source: i64,
+        id: i64,
         bound: &ReadBound,
-        src_schema: &SchemaDescriptor,
         cut_tick: u64,
-        hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<SourceCursor, StoreError> {
-        let (cursor, keys) = match bound {
-            // The delta bootstrap arm reads the view's own store, which is what
-            // `scan_spec_source_schema` already told the caller.
-            ReadBound::None | ReadBound::Delta { after_tick: 0 } => (self.relation_or_err(source)?.cursor(), None),
+    ) -> Result<(SourceCursor, SchemaDescriptor), StoreError> {
+        let entry = self.relation_or_err(id)?;
+        let full = |c: ReadCursor| SourceCursor::Full(Box::new(c));
+        Ok(match bound {
+            ReadBound::None => (full(entry.cursor()), entry.schema()),
             ReadBound::PkRange(desc) => {
-                let entry = self.relation_or_err(source)?;
-                match range_cursor(src_schema, desc, |s, e| entry.cursor_in_range(s, e))? {
-                    Some(c) => (c, None),
-                    None => return Ok(SourceCursor::Empty),
-                }
+                let schema = entry.schema();
+                let c = entry.store().pk_range_cursor(desc).map_err(StoreError::rejected)?;
+                (full(c), schema)
             }
             ReadBound::PkSet(keys) => {
-                let opk = pk_set_opk_keys(source, keys, src_schema)?;
-                let entry = self.relation_or_err(source)?;
+                let schema = entry.schema();
+                if keys.stride() != schema.pk_stride() {
+                    return Err(StoreError::rejected(format!(
+                        "scan_spec: PkSet key stride {} != pk_stride {} (table {id})",
+                        keys.stride(),
+                        schema.pk_stride()
+                    )));
+                }
                 // A key this worker holds no row for copies nothing — the request
                 // is broadcast, so at W workers most of the list belongs elsewhere.
-                let gather = PkSetGather::open(opk, *src_schema, |s, e| entry.cursor_in_range(s, e));
-                if !gather.any_skeleton() {
-                    return Ok(SourceCursor::PkSet(Box::new(gather)));
-                }
-                let (cursor, keys) = gather.into_parts();
-                (cursor, Some(keys))
+                let gather = PkSetGather::open(keys.as_bytes().to_vec(), schema, |s, e| entry.cursor_in_range(s, e));
+                (SourceCursor::PkSet(Box::new(gather)), schema)
             }
-            // Only base tables own index circuits, so an index bound names a base
-            // table, which never holds a skeleton row.
-            ReadBound::IndexRange { bound, exact } => return self.open_index_bound_cursor(source, bound, *exact),
-            // `capacity` and `delta` are refused together, so a fed view never
-            // holds a skeleton row either.
-            ReadBound::Delta { after_tick } => return self.open_delta_cursor(source, *after_tick, cut_tick),
+            ReadBound::IndexRange { bound, walk } => {
+                let cols = self.bound_cols_against(id, bound.idx_cols, "scan_spec")?;
+                (
+                    self.open_index_source(id, cols.as_slice(), &bound.desc, *walk)?,
+                    entry.schema(),
+                )
+            }
+            // Refused at every `after_tick` when no feed exists: the reply would
+            // promise a continuation the server cannot serve.
+            ReadBound::Delta { .. } if !entry.has_delta_feed() => {
+                return Err(StoreError::rejected(format!(
+                    "scan_spec: relation {id} carries no delta feed; \
+                     create the view WITH (delta = '<size>') to subscribe to it"
+                )))
+            }
+            // The bootstrap: every delta after round 0 is the view's whole history,
+            // which is what its own output store holds.
+            ReadBound::Delta { after_tick: 0 } => (full(entry.cursor()), entry.schema()),
+            ReadBound::Delta { after_tick } => {
+                let feed = entry.delta_or_err()?;
+                let dropped_through = feed.dropped_through();
+                if delta_cursor_expired(*after_tick, dropped_through) {
+                    return Err(StoreError::DeltaExpired(format!(
+                        "delta cursor {after_tick} of relation {id} is below the \
+                         retained floor {dropped_through}; re-read at 0"
+                    )));
+                }
+                let schema = feed.schema();
+                // Both ends `Cut::After`: no arithmetic on the client's
+                // `after_tick`, where `after_tick + 1` at `u64::MAX` would wrap.
+                let desc = RangeDescriptor::new(&[], Cut::After(*after_tick as u128), Cut::After(cut_tick as u128));
+                let c = feed.pk_range_cursor(&desc).map_err(StoreError::rejected)?;
+                (full(c), schema)
+            }
+        })
+    }
+
+    /// `source` unchanged unless the runs it opened hold a skeleton row, else
+    /// hydrated and materialized whole.
+    fn hydrated(
+        &self,
+        id: i64,
+        source: SourceCursor,
+        hydrator: Option<&mut dyn SkeletonHydrator>,
+    ) -> Result<SourceCursor, StoreError> {
+        let (cursor, keys) = match source {
+            SourceCursor::Full(c) if c.any_skeleton() => (*c, None),
+            SourceCursor::PkSet(g) if g.any_skeleton() => {
+                let (c, k) = g.into_parts();
+                (c, Some(k))
+            }
+            // An index owner is a base table, which never holds a skeleton row.
+            other => return Ok(other),
         };
-        if !cursor.any_skeleton() {
-            return Ok(SourceCursor::Full(Box::new(cursor)));
-        }
-        let rows = self.materialize_hydrated(source, cursor, keys.as_deref(), hydrator)?;
+        let schema = cursor.schema;
+        let rows = self.materialize_hydrated(id, cursor, keys.as_deref(), hydrator)?;
         Ok(SourceCursor::Full(Box::new(ReadCursor::over_batches(
             &[Rc::new(rows)],
-            *src_schema,
+            schema,
         ))))
     }
-
-    /// The `(after_tick, cut_tick]` walk over a fed view's delta store.
-    ///
-    /// Both ends are `Cut::After`, so the open end is exclusive and no arithmetic
-    /// touches the client's `after_tick` — `after_tick + 1` at `u64::MAX` would
-    /// panic in debug and wrap in release.
-    ///
-    /// Refused when this worker has dropped a round the walk covers; the floors
-    /// are independent across workers, so one refusal refuses the read. The walk
-    /// covers `(after_tick, cut]`, so a dropped row is inside it iff
-    /// `dropped_through > after_tick` — a cursor sitting *at* the floor is served
-    /// in full rather than being told to re-read at 0 forever.
-    fn open_delta_cursor(&self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, StoreError> {
-        let feed = self.relation_or_err(source)?.delta_or_err()?;
-        let dropped_through = feed.dropped_through();
-        if after_tick < dropped_through {
-            return Err(StoreError::DeltaExpired(format!(
-                "delta cursor {after_tick} of relation {source} is below the \
-                 retained floor {dropped_through}; re-read at 0"
-            )));
-        }
-        let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
-        Ok(
-            match range_cursor(&feed.schema(), &desc, |s, e| feed.cursor_in_range(s, e))? {
-                Some(c) => SourceCursor::Full(Box::new(c)),
-                None => SourceCursor::Empty,
-            },
-        )
-    }
-
-    /// A secondary-index range walk. `exact` says the SQL layer stripped the
-    /// bounded conjuncts from the predicate, so this walk is the only thing
-    /// applying them: run it un-gated, and fail rather than degrade if the index
-    /// is gone (a full cursor would return rows nothing re-filters). Otherwise
-    /// the conjuncts ride the predicate and the walk is an access optimization
-    /// the selectivity gate may trade away.
-    fn open_index_bound_cursor(
-        &self,
-        source: i64,
-        bound: &gnitz_wire::IndexBound,
-        exact: bool,
-    ) -> Result<SourceCursor, StoreError> {
-        let cols = self.bound_cols_against(source, bound.idx_cols, "scan_spec")?;
-        let walk = if exact {
-            super::IndexWalk::Required
-        } else {
-            super::IndexWalk::Optional
-        };
-        self.open_index_source(source, cols.as_slice(), &bound.desc, walk)
-    }
 }
 
-/// A cursor cut to the half-open key range `desc` names over `schema`'s PK
-/// space, or `None` for a provably-empty one. The one place a range descriptor
-/// becomes a cursor cut, so the `PkRange` bound over a relation's own store and
-/// the `Delta` bound over a fed view's share the zero-padded keys and the
-/// saturating `After` arm.
-fn range_cursor(
-    schema: &SchemaDescriptor,
-    desc: &RangeDescriptor,
-    open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
-) -> Result<Option<ReadCursor>, StoreError> {
-    let range_keys = IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride(), desc);
-    let Some((start, end_key)) = range_keys.map_err(StoreError::rejected)? else {
-        return Ok(None);
-    };
-    let end = end_key.as_ref().map(|e| e.pk_bytes());
-    let mut cursor = open(start.pk_bytes(), end);
-    cursor.seek_range_bytes(start.pk_bytes(), end);
-    Ok(Some(cursor))
+/// Whether a walk over rounds `(after_tick, cut]` misses a round this worker
+/// dropped: a cursor at the floor has lost nothing.
+fn delta_cursor_expired(after_tick: u64, dropped_through: u64) -> bool {
+    after_tick < dropped_through
 }
 
-/// The OPK images of a `pk IN (…)` key list, sorted ascending and concatenated —
-/// the walk order `PkSetGather` requires. OPK order IS typed PK order, so sorting
-/// the images makes the gather one monotone forward sweep regardless of wire key
-/// order.
-///
-/// Two trust-boundary rejections land here because the decoder has no schema:
-/// the packed key must fit the wire's 16-byte scalar form, and no two wire keys
-/// may share an OPK image (`opk_key` truncates to `pk_stride`, so `5` and
-/// `5 + 2^64` are the same U64 PK — left in, the pair would emit its row twice).
-/// Both are hard rejects; release builds must not clamp.
-fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) -> Result<Vec<u8>, StoreError> {
-    let stride = src_schema.pk_stride();
-    if stride > gnitz_wire::NARROW_PK_MAX_BYTES {
-        return Err(StoreError::rejected(format!(
-            "scan_spec: PkSet gather requires a PK of at most {} bytes (table {source})",
-            gnitz_wire::NARROW_PK_MAX_BYTES
-        )));
-    }
-    // The whole packed key fits `pack_pk_be`'s left-aligned `u128` sort key
-    // exactly — one allocation, and a register compare in both the sort and the
-    // duplicate scan.
-    let mut opk_keys: Vec<u128> = keys
-        .iter()
-        .map(|&k| pack_pk_be(opk_key(src_schema, &k.to_le_bytes()).pk_bytes()))
-        .collect();
-    opk_keys.sort_unstable();
-    // Adjacent after the sort. Tested against the list rather than against what
-    // was gathered, so every worker answers the same way.
-    if let Some(w) = opk_keys.windows(2).find(|w| w[0] == w[1]) {
-        return Err(StoreError::rejected(format!(
-            "scan_spec: PkSet duplicate key {:?} (table {source})",
-            &w[0].to_be_bytes()[..stride]
-        )));
-    }
-    let mut flat = Vec::with_capacity(opk_keys.len() * stride);
-    for k in &opk_keys {
-        flat.extend_from_slice(&k.to_be_bytes()[..stride]);
-    }
-    Ok(flat)
-}
-
-/// The rows sink's projection plan, or `None` for the identity reply, with the
-/// reply-schema guard each shape needs: an identity reply is copied region-wise
-/// off its own strides and so must be the source schema outright, where a
-/// projected one need only agree on `pk_stride`. Both guard the client's blob —
-/// a stride mismatch ships the keeper's uninitialized tail as its PK tiebreak.
-fn resolve_rows_projection(
-    blob: &[u8],
-    src_schema: &SchemaDescriptor,
-    reply_schema: &SchemaDescriptor,
-) -> Result<Option<MapPlan>, StoreError> {
-    if blob.is_empty() {
-        return match reply_schema.same_physical_layout(src_schema) {
-            true => Ok(None),
-            false => Err(StoreError::rejected(
-                "scan_spec: identity rows reply schema differs from the source",
-            )),
-        };
-    }
-    if reply_schema.pk_stride() != src_schema.pk_stride() {
-        return Err(StoreError::rejected(format!(
-            "scan_spec: reply pk_stride {} != source pk_stride {}",
-            reply_schema.pk_stride(),
-            src_schema.pk_stride()
-        )));
-    }
-    compile_projection(blob, src_schema, reply_schema).map(Some)
-}
-
-/// The client's `limit_k` (`OFFSET + LIMIT`; `0` = unbounded) as the summed-i64
-/// weight window every sink test is against. Unsaturated the cast wraps negative
-/// past `i64::MAX`, where the first survivor range satisfies the window and
-/// truncates the answer.
+/// The client's `limit_k` (`0` = unbounded) as an `i64` weight window, saturated:
+/// a wrapped negative window would truncate the answer.
 fn saturated_window(limit_k: u64) -> i64 {
     limit_k.min(i64::MAX as u64) as i64
 }
 
-/// The per-request context both sinks read on every chunk: the compiled
-/// predicate and the drain size.
-struct ScanSinkCtx<'a> {
-    predicate: Option<&'a Evaluator>,
+/// The rows surviving the bound and the predicate, one source chunk at a time —
+/// the one input every sink reads.
+struct Survivors {
+    source: SourceCursor,
+    predicate: Option<Evaluator>,
+    /// The current chunk's surviving row ranges; scratch reused across chunks.
+    ranges: Vec<(usize, usize)>,
+}
+
+impl Survivors {
+    /// The next non-empty source chunk and its surviving row ranges — the whole
+    /// chunk when there is no predicate — or `None` once the source is exhausted.
+    fn next(&mut self, max_rows: usize) -> Option<(Batch, &mut Vec<(usize, usize)>)> {
+        let chunk = loop {
+            let chunk = self.source.drain_chunk(max_rows)?;
+            if chunk.count > 0 {
+                break chunk;
+            }
+        };
+        match &self.predicate {
+            Some(f) => f.filter_ranges(&chunk.as_mem_batch(), &mut self.ranges),
+            None => {
+                self.ranges.clear();
+                self.ranges.push((0, chunk.count));
+            }
+        }
+        Some((chunk, &mut self.ranges))
+    }
+}
+
+/// Fold every surviving chunk, through `map` when there is one, into partial
+/// reduce-output rows; `Err` once the per-worker group cap is exceeded.
+fn run_fold_sink(
+    rows: &mut Survivors,
     chunk_rows: usize,
-}
-
-/// The fold's reduce-input schema and the pre-map producing it, or `None` when
-/// the spec carries no pre-map and the source *is* the reduce input. The same
-/// [`MapPlan::from_compute_map`] a circuit's computed `Map` node goes through, so
-/// the two paths cannot disagree on what a declared slot list means.
-fn compile_fold_pre_map(
-    agg: &AggReadSpec,
-    src_schema: &SchemaDescriptor,
-) -> Result<Option<(SchemaDescriptor, MapPlan)>, StoreError> {
-    let Some(pre) = &agg.pre else {
-        return Ok(None);
-    };
-    let plan = MapPlan::from_compute_map(src_schema, pre)
-        .map_err(|e| StoreError::rejected(format!("scan_spec fold pre-map: {e}")))?;
-    Ok(Some((*plan.out_schema(), plan)))
-}
-
-/// Run the fold sink over `source`: fold every surviving chunk into `fold`'s
-/// per-group accumulators and return the partial reduce-output rows — or `Err`
-/// when the per-worker group cap is exceeded (a resource-exhaustion abort,
-/// before any data frame is sent).
-///
-/// `pre` is the reduce's own map and the schema it produces, applied between the
-/// predicate and the fold — the position the view path's circuit puts it in, and
-/// fused with the filter so a chunk is never materialized twice.
-fn run_scan_fold_sink(
-    source: &mut SourceCursor,
-    ctx: ScanSinkCtx,
-    pre: Option<&(SchemaDescriptor, MapPlan)>,
+    map: Option<&MapPlan>,
     mut fold: AdhocFold,
 ) -> Result<Batch, StoreError> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    // The plan and its destination in one Option, so no arm can fold source-schema
-    // rows into a fold built for the reduce input. One reusable mapped batch:
-    // `clear` keeps the buffers (and resets the blob), so a wide scan pays one
-    // allocation, not one per chunk.
-    let mut pre = pre.map(|(schema, plan)| (plan, Batch::empty_with_schema(schema)));
-    while let Some(chunk) = source.drain_chunk(ctx.chunk_rows) {
-        if chunk.count == 0 {
-            continue;
-        }
-        survivor_ranges(ctx.predicate, &chunk, &mut ranges);
-        match &mut pre {
+    // One mapped batch for the whole scan: `clear` keeps its buffers.
+    let mut map = map.map(|p| (p, Batch::empty_with_schema(p.out_schema())));
+    while let Some((chunk, ranges)) = rows.next(chunk_rows) {
+        match &mut map {
             Some((plan, dst)) => {
                 dst.clear();
-                plan.append_map_ranges(&chunk, dst, &ranges);
+                plan.append_map_ranges(&chunk, dst, ranges);
                 // The map already dropped the non-survivors, so every row of
                 // `dst` folds — and a chunk none survived maps to nothing.
                 if dst.count > 0 {
                     fold.fold_ranges(dst, &[(0, dst.count)])?;
                 }
             }
-            None => fold.fold_ranges(&chunk, &ranges)?,
+            None => fold.fold_ranges(&chunk, ranges)?,
         }
     }
     Ok(fold.finish())
 }
 
-/// The filter's surviving row ranges over one chunk — the whole chunk when there
-/// is no predicate. `out` is per-request scratch reused across chunks.
-fn survivor_ranges(predicate: Option<&Evaluator>, chunk: &Batch, out: &mut Vec<(usize, usize)>) {
-    match predicate {
-        Some(f) => f.filter_ranges(&chunk.as_mem_batch(), out),
-        None => {
-            out.clear();
-            out.push((0, chunk.count));
-        }
-    }
-}
-
 /// Append one chunk's survivor ranges onto the keeper — straight, or through the
-/// projection. There is no intermediate survivor batch and no projected batch.
-fn append_survivors(projection: Option<&MapPlan>, chunk: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
-    match projection {
+/// map. There is no intermediate survivor batch and no mapped batch.
+fn append_survivors(map: Option<&MapPlan>, chunk: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
+    match map {
         None => keeper.append_ranges(&chunk.as_mem_batch(), ranges),
         Some(p) => p.append_map_ranges(chunk, keeper, ranges),
     }
 }
 
-/// The rows sink with no ORDER BY: append every survivor, stopping once the
-/// summed survivor weight reaches a `window > 0`.
-///
-/// The cut is applied to the range list too — at the first range that covers the
-/// window — so with survivors ≫ `window` that gathers ~`window` rows instead of
-/// the whole chunk's survivors. Ranges are whole rows, so the worker still
-/// returns a ≥ `window`-weight superset and the client applies the exact window.
+/// The rows sink with no ORDER BY: append survivors until their summed weight
+/// reaches a `window > 0`, cutting the range list at the range that covers it.
 fn stream_rows(
-    source: &mut SourceCursor,
-    ctx: ScanSinkCtx,
-    projection: Option<&MapPlan>,
-    reply_schema: &SchemaDescriptor,
+    rows: &mut Survivors,
+    chunk_rows: usize,
+    map: Option<&MapPlan>,
+    keeper_schema: &SchemaDescriptor,
     window: i64,
 ) -> Batch {
     let early_stop = window > 0;
     // `window`-sized chunks make the early stop O(window) rather than O(chunk),
     // but only while every drained row survives: with a predicate a tiny chunk
     // degrades to row-at-a-time cursor driving, so over-read a full one instead.
-    let drain_rows = match early_stop && ctx.predicate.is_none() {
-        true => (window as usize).clamp(1, ctx.chunk_rows),
-        false => ctx.chunk_rows,
+    let drain_rows = match early_stop && rows.predicate.is_none() {
+        true => (window as usize).clamp(1, chunk_rows),
+        false => chunk_rows,
     };
 
-    let mut keeper = Batch::empty_with_schema(reply_schema);
+    let mut keeper = Batch::empty_with_schema(keeper_schema);
     let mut summed: i64 = 0;
-    // Per-request scratch, reused across chunks.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
 
-    while let Some(chunk) = source.drain_chunk(drain_rows) {
-        if chunk.count == 0 {
-            continue;
-        }
-        survivor_ranges(ctx.predicate, &chunk, &mut ranges);
+    while let Some((chunk, ranges)) = rows.next(drain_rows) {
         if early_stop {
             // Weighed off the source — the same weights that land in the keeper,
             // read from a contiguous region rather than row-by-row off the
@@ -462,7 +284,7 @@ fn stream_rows(
                 }
             }
         }
-        append_survivors(projection, &chunk, &mut keeper, &ranges);
+        append_survivors(map, &chunk, &mut keeper, ranges);
         if early_stop && summed >= window {
             break;
         }
@@ -473,116 +295,104 @@ fn stream_rows(
 /// The rows sink with an ORDER BY and a `window > 0`: append every survivor and
 /// trim the keeper back down with [`topk_keep`], at two thresholds.
 fn topk_rows(
-    source: &mut SourceCursor,
-    ctx: ScanSinkCtx,
-    projection: Option<&MapPlan>,
-    reply_schema: &SchemaDescriptor,
-    order_locs: &[OrderLocator],
+    rows: &mut Survivors,
+    chunk_rows: usize,
+    map: Option<&MapPlan>,
+    keeper_schema: &SchemaDescriptor,
+    order: &[OrderLocator],
     window: i64,
 ) -> Batch {
     // Mid-scan the keeper is still growing, so a trim at `window` would re-sort
     // after every chunk to shed rows the next chunk replaces. Saturating: an
     // unbounded `limit_k` leaves this unfireable rather than overflowing.
     let residency_cap = window.saturating_mul(2);
-    let mut keeper = Batch::empty_with_schema(reply_schema);
+    let mut keeper = Batch::empty_with_schema(keeper_schema);
     // Summed survivor weight of what the keeper currently holds.
     let mut summed: i64 = 0;
-    // Per-request scratch, reused across chunks.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
 
-    while let Some(chunk) = source.drain_chunk(ctx.chunk_rows) {
-        if chunk.count == 0 {
-            continue;
-        }
-        survivor_ranges(ctx.predicate, &chunk, &mut ranges);
+    while let Some((chunk, ranges)) = rows.next(chunk_rows) {
         // Weighed off the source — the same weights that land in the keeper,
         // read from a contiguous region rather than row-by-row off the
         // destination.
         summed += ranges.iter().map(|&(s, e)| chunk.sum_weights(s, e)).sum::<i64>();
-        append_survivors(projection, &chunk, &mut keeper, &ranges);
+        append_survivors(map, &chunk, &mut keeper, ranges);
         if summed > residency_cap {
-            (keeper, summed) = topk_keep(keeper, order_locs, window);
+            (keeper, summed) = topk_keep(keeper, order, window);
         }
     }
     // The keeper IS the reply now, and a rows reply carrying a STRING/BLOB column
     // goes out as one frame — so shed down to the smallest superset the client
     // can still cut exactly. At or below the window it provably cuts nothing.
     if summed > window {
-        (keeper, _) = topk_keep(keeper, order_locs, window);
+        (keeper, _) = topk_keep(keeper, order, window);
     }
     keeper
 }
 
-/// Sort `keeper` by the ORDER BY comparator and keep the smallest prefix whose
-/// summed weight covers `window`, the boundary row kept **whole** — a per-worker
-/// row below the global cutoff needs its full weight, else a cross-worker
-/// under-count results. Returns the kept batch and its summed weight.
-///
-/// Every keeper row is a live consolidated group (weight ≥ 1), so the `window`
-/// comparator-smallest rows always cover it and only that prefix needs sorting.
-/// Clipping the boundary row and applying OFFSET stay the client's.
-fn topk_keep(keeper: Batch, order_locs: &[OrderLocator], window: i64) -> (Batch, i64) {
+/// The comparator-smallest rows of `keeper` whose summed weight covers `window`,
+/// in no particular order, and that weight. The boundary row stays whole: only
+/// the client, which sees every worker's rows, may clip it.
+fn topk_keep(keeper: Batch, order: &[OrderLocator], window: i64) -> (Batch, i64) {
     if keeper.count == 0 {
         return (keeper, 0);
     }
     let mut perm: Vec<u32> = (0..keeper.count as u32).collect();
-    let cmp = |a: &u32, b: &u32| scan_spec_cmp(order_locs, &keeper, *a as usize, *b as usize);
+    let cmp = |a: &u32, b: &u32| {
+        let (ra, rb) = (*a as usize, *b as usize);
+        cmp_order_keys(
+            order,
+            &keeper,
+            ra,
+            keeper.get_null_word(ra),
+            &keeper,
+            rb,
+            keeper.get_null_word(rb),
+        )
+    };
     let k = (window as usize).min(perm.len());
     if k < perm.len() {
         perm.select_nth_unstable_by(k - 1, cmp);
         perm.truncate(k);
     }
-    perm.sort_unstable_by(cmp);
-
-    let mut acc: i64 = 0;
-    let mut cut = perm.len();
-    for (i, &row) in perm.iter().enumerate() {
-        acc += keeper.get_weight(row as usize);
-        if acc >= window {
-            cut = i + 1; // keep [0, i] inclusive — the boundary row whole
-            break;
-        }
+    let mut acc: i64 = perm.iter().map(|&r| keeper.get_weight(r as usize)).sum();
+    // Every row weighs ≥ 1, so the k selected rows cover the window; a surplus is
+    // the only way a comparator-larger row among them is droppable.
+    if acc > window {
+        perm.sort_unstable_by(cmp);
+        acc = 0;
+        let cut = perm
+            .iter()
+            .position(|&r| {
+                acc += keeper.get_weight(r as usize);
+                acc >= window
+            })
+            .map_or(perm.len(), |i| i + 1);
+        perm.truncate(cut);
     }
     (
-        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm[..cut], keeper.schema()),
+        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm, keeper.schema()),
         acc,
     )
 }
 
-/// Resolve each ORDER BY key to its reply-schema locator.
-///
-/// `OrderKey.col` is a raw client `u16` reaching `reply_schema.locate`, whose
-/// bound is a release-active `assert!` — so a forged one is caught here, ahead
-/// of the open.
-fn resolve_order_locs(order: &[OrderKey], reply_schema: &SchemaDescriptor) -> Result<Vec<OrderLocator>, StoreError> {
-    order
+/// Resolve each ORDER BY key over the sink input — a forged column is a
+/// rejection — then append the identity tiebreak.
+fn resolve_order_locs(order: &[OrderKey], schema: &SchemaDescriptor) -> Result<Vec<OrderLocator>, StoreError> {
+    let mut locs = order
         .iter()
-        .map(|k| match (k.col as usize) < reply_schema.num_columns() {
-            true => Ok(OrderLocator::of(reply_schema.locate(k.col as usize), k)),
-            false => Err(StoreError::rejected(format!(
+        .map(|k| match schema.try_locate(k.col as usize) {
+            Some(loc) => Ok(OrderLocator::of(loc, k)),
+            None => Err(StoreError::rejected(format!(
                 "scan_spec: order key column {} out of range ({} cols)",
                 k.col,
-                reply_schema.num_columns()
+                schema.num_columns()
             ))),
         })
-        .collect()
-}
-
-/// [`cmp_order_keys`] over the user keys, then the engine's own deterministic
-/// tiebreak. The client applies an equivalent tiebreak over the same total
-/// order; it cannot share this one, which reads `compare_rows`.
-fn scan_spec_cmp(order_locs: &[OrderLocator], batch: &Batch, ra: usize, rb: usize) -> Ordering {
-    let a_null = batch.get_null_word(ra);
-    let b_null = batch.get_null_word(rb);
-    match cmp_order_keys(order_locs, batch, ra, a_null, batch, rb, b_null) {
-        Ordering::Equal => {}
-        ord => return ord,
+        .collect::<Result<Vec<_>, _>>()?;
+    if !locs.is_empty() {
+        push_identity_tiebreak(&mut locs, schema);
     }
-    // Deterministic tiebreak (never reversed): OPK bytes, then payload columns.
-    match compare_pk_bytes(batch.get_pk_bytes(ra), batch.get_pk_bytes(rb)) {
-        Ordering::Equal => compare_rows(batch.schema(), batch, ra, batch, rb),
-        ord => ord,
-    }
+    Ok(locs)
 }
 
 /// Decode + validate a client predicate blob against `schema`, then build its
@@ -592,21 +402,6 @@ fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<Evaluator
     LogicalProgram::from_blob(blob, "scan_spec predicate")
         .and_then(|p| p.resolve_filter(schema))
         .map_err(|e| StoreError::rejected(format!("scan_spec: invalid predicate program: {e}")))
-}
-
-/// Decode + validate a client projection (MAP) blob and build its [`MapPlan`] —
-/// the same path the circuit compiler runs. `validate` bounds every payload slot
-/// against `out_schema.num_payload_cols()` and requires the program to write all
-/// of them, so an OOB or unwritten slot is a clean `Err` rather than a panic or
-/// a shipped byte of the keeper's recycled tail.
-fn compile_projection(
-    blob: &[u8],
-    in_schema: &SchemaDescriptor,
-    out_schema: &SchemaDescriptor,
-) -> Result<MapPlan, StoreError> {
-    LogicalProgram::from_blob(blob, "scan_spec projection")
-        .and_then(|p| MapPlan::from_map(p, in_schema, out_schema, PkSource::Inherit))
-        .map_err(|e| StoreError::rejected(format!("scan_spec: invalid projection program: {e}")))
 }
 
 #[cfg(test)]

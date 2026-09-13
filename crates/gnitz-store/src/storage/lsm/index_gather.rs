@@ -118,22 +118,12 @@ impl BoundedIndexCursor {
 }
 
 /// A chunked source of `Batch`es over one relation, in every shape a bound can
-/// take. Interchangeable by construction for the circuit backfill: the circuit's
-/// `Filter` decides what the view contains, so which variant is chosen only
-/// decides how many rows the scan reads. The ad-hoc `ReadSpec` scan adds the
-/// `PkSet` shape and drives the same enum.
-///
-/// The cursor variants are boxed (a `ReadCursor` is several hundred bytes;
-/// clippy's `large_enum_variant`) — one allocation per scan, never per chunk.
+/// take.
 pub enum SourceCursor {
     Full(Box<ReadCursor>),
     Bounded(Box<BoundedIndexCursor>),
     /// `pk IN (…)` gather over a listed key set.
     PkSet(Box<PkSetGather>),
-    /// A provably-empty index range. Distinct from `Full` so nothing is scanned,
-    /// and a variant rather than an error so the source still feeds one empty
-    /// epoch (which is what mints a global aggregate's ground row).
-    Empty,
 }
 
 impl SourceCursor {
@@ -149,7 +139,6 @@ impl SourceCursor {
             SourceCursor::Full(c) => c.drain_chunk(max_rows),
             SourceCursor::Bounded(c) => c.drain_chunk(max_rows),
             SourceCursor::PkSet(g) => g.next_chunk(max_rows),
-            SourceCursor::Empty => None,
         }
     }
 }

@@ -83,9 +83,9 @@ impl SecondaryIndex {
         self.store.cursor()
     }
 
-    /// [`Self::cursor`] over `[start, end]` only.
-    pub(crate) fn cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
-        self.store.cursor_in_range(start, end)
+    /// This process's store of the index, for the crate's own read paths.
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
     }
 
     /// Write index rows directly. The one write to an index that does not ride a
@@ -335,6 +335,12 @@ impl Relation {
     /// [`Table::open_cursor_in_range`](crate::storage::Table::open_cursor_in_range).
     pub fn cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
         self.store.cursor_in_range(start, end)
+    }
+
+    /// This relation's rows positioned on `[start, end)`, and the raw entry count
+    /// in that range — see [`Store::range_cursor`].
+    pub fn range_cursor(&self, start: &[u8], end: Option<&[u8]>) -> (crate::storage::ReadCursor, usize) {
+        self.store.range_cursor(start, end)
     }
 
     /// Materialize every positive-weight row of this relation's store.

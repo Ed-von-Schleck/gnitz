@@ -2,7 +2,7 @@ use super::*;
 use crate::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::{BatchBuilder, Slot, StoreError};
-use gnitz_wire::Cut;
+use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, IndexWalk, ReadSink};
 
 // ── The executor — `scan_spec` over a registry built in-crate ────────
 //
@@ -60,7 +60,10 @@ fn rows_spec(order: Vec<OrderKey>, limit_k: u64) -> ReadSpec {
     ReadSpec {
         bound: ReadBound::None,
         predicate: Vec::new(),
-        sink: ReadSink::Rows { projection: Vec::new(), order, limit_k },
+        sink: ReadSink {
+            map: None,
+            kind: SinkKind::Rows { order, limit_k },
+        },
     }
 }
 
@@ -81,12 +84,14 @@ fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Batch, StoreE
 
 /// The reply is trimmed to the window, not to the mid-scan residency cap: five
 /// weight-1 rows against `LIMIT 3` sit in the band the mid-scan trim skips, so
-/// only the terminal trim can shed them, and it must.
+/// only the terminal trim can shed them, and it must. The reply's order is not a
+/// contract — the client re-sorts it — so the rows are compared as a set.
 #[test]
 fn top_k_trims_to_the_window_before_replying() {
     let mut r = rows_fixture("topk_band", 5, 1);
-    let got = run(&mut r, &rows_spec(val_desc(), 3)).unwrap();
-    assert_eq!(ids(&got), vec![(4u128, 1), (3, 1), (2, 1)], "the three largest, DESC");
+    let mut got = ids(&run(&mut r, &rows_spec(val_desc(), 3)).unwrap());
+    got.sort();
+    assert_eq!(got, vec![(2u128, 1), (3, 1), (4, 1)], "the three largest");
 }
 
 /// No window is too large for the top-k sink. The window counts summed *weight*,
@@ -127,7 +132,7 @@ fn an_out_of_range_order_key_is_rejected() {
 }
 
 /// A packed column word naming a column the table has not got is a corrupt
-/// frame, and is rejected on both walk kinds. An `exact == false` walk is the
+/// frame, and is rejected on both walk kinds. An `Optional` walk is the
 /// one a residual predicate could cover for, so it is the one where degrading to
 /// a full scan would answer the corrupt frame instead of refusing it.
 #[test]
@@ -139,7 +144,7 @@ fn an_out_of_range_index_column_is_rejected_even_when_inexact() {
                 idx_cols: gnitz_wire::PkColList::from_slice(&[99]),
                 desc: RangeDescriptor::new(&[], Cut::Before(0), Cut::After(u64::MAX as u128)),
             },
-            exact: false,
+            walk: IndexWalk::Optional,
         },
         ..rows_spec(Vec::new(), 0)
     };
@@ -219,80 +224,45 @@ fn a_bound_that_prunes_every_skeleton_shard_streams() {
     assert!(err.to_string().contains("skeleton rows"), "{err}");
 }
 
-// ---------------------------------------------------------------------------
-// Fold pre-map — the trust boundary
-//
-// `AggReadSpec.pre_map`/`pre_payload` are the client's, and the schema they
-// describe is *derived* here rather than shipped. These pin that a frame no
-// planner would send is refused rather than aborting the worker: the derivation
-// runs through `DerivedSchema`, whose `push`/`push_pk` reject exactly what
-// `SchemaDescriptor::new` asserts on (and its asserts are release-active).
-//
-// The fused map->fold loop over real rows is covered end-to-end by the Python
-// aggregate suite, which is the only place a *valid* pre-map program exists —
-// building one here would mean reimplementing the planner's expression compiler.
-// ---------------------------------------------------------------------------
-
-/// `(id U64 PK, v I64)` — a one-column key so the derived reduce input is the PK
-/// plus whatever `pre_payload` declares.
-fn premap_src() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
+/// A fold reply schema off the partial layout the fold derives — missing, then
+/// mistyping, its aggregate column — is rejected.
+#[test]
+fn a_fold_reply_schema_not_matching_its_partial_layout_is_rejected() {
+    let r = rows_fixture("fold_reply", 4, 1);
+    let spec = ReadSpec {
+        bound: ReadBound::None,
+        predicate: Vec::new(),
+        sink: ReadSink {
+            map: None,
+            kind: SinkKind::Fold(AggReadSpec {
+                group_cols: vec![1],
+                aggs: vec![AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 }],
+            }),
+        },
+    };
+    let partial = |last: Option<u8>| {
+        let mut cols = vec![
+            SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
-fn premap_spec(program: Vec<u8>, out_cols: Vec<(u8, bool)>) -> AggReadSpec {
-    AggReadSpec {
-        group_cols: vec![1],
-        aggs: vec![],
-        pre: Some(gnitz_wire::ComputeMap { program, out_cols }),
+        ];
+        cols.extend(last.map(|tc| SchemaColumn::new(tc, 0)));
+        SchemaDescriptor::new(&cols, &[0])
+    };
+    // The derived partial itself is accepted, which is what makes the two
+    // refusals below about the layout rather than about the spec.
+    assert!(r.scan_spec(TID, &spec, &partial(Some(type_code::I64)), 0, None).is_ok());
+    for bad in [partial(None), partial(Some(type_code::F64))] {
+        let Err(err) = r.scan_spec(TID, &spec, &bad, 0, None) else {
+            panic!("a reply schema off the partial layout must be rejected");
+        };
+        assert!(err.to_string().contains("reply schema does not match"), "{err}");
     }
 }
 
-/// The rejection message, or a panic naming the shape that was accepted.
-/// `MapPlan` is not `Debug`, so the `Ok` half cannot go through `unwrap_err`.
-fn premap_err(spec: &AggReadSpec) -> String {
-    match compile_fold_pre_map(spec, &premap_src()) {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("the pre-map derivation accepted a frame it must refuse"),
-    }
-}
-
-/// No pre-map is the ordinary fold: the source *is* the reduce input, and
-/// nothing is compiled.
 #[test]
-fn fold_pre_map_is_absent_without_a_program() {
-    let spec = AggReadSpec::direct(vec![1], vec![]);
-    assert!(compile_fold_pre_map(&spec, &premap_src()).unwrap().is_none());
-}
-
-/// A declaration wider than one schema can hold. `MAX_COLUMNS` payload columns
-/// on top of a 1-column key is one past the limit — the case that would reach
-/// `SchemaDescriptor::new`'s release-active `assert!` and abort the worker if the
-/// derivation did not go through `DerivedSchema` first.
-#[test]
-fn fold_pre_map_refuses_an_over_wide_declaration() {
-    let wide: Vec<(u8, bool)> = (0..crate::schema::MAX_COLUMNS)
-        .map(|_| (type_code::I64, false))
-        .collect();
-    let err = premap_err(&premap_spec(vec![1, 2, 3], wide));
-    assert!(
-        err.contains("compute map: output exceeds MAX_COLUMNS"),
-        "an over-wide pre-map must be refused by the derivation, got: {err}"
-    );
-}
-
-/// A corrupt program blob is refused by the shared map compiler, not decoded
-/// into a plan that folds over garbage.
-#[test]
-fn fold_pre_map_refuses_a_corrupt_program() {
-    let err = premap_err(&premap_spec(vec![0xff; 8], vec![(type_code::I64, false)]));
-    assert!(
-        err.contains("map: invalid program"),
-        "a corrupt pre-map blob must be refused by the program decoder, got: {err}"
-    );
+fn a_delta_cursor_expires_below_the_floor_and_not_at_it() {
+    assert!(!delta_cursor_expired(0, 0), "nothing dropped");
+    assert!(!delta_cursor_expired(5, 5), "at the floor");
+    assert!(!delta_cursor_expired(6, 5), "above the floor");
+    assert!(delta_cursor_expired(4, 5), "round 5 was dropped");
 }

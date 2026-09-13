@@ -28,8 +28,8 @@ use std::sync::Arc;
 use crate::dml::plan::{fetch_bound, AccessPlan};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
-use gnitz_core::{native_le_key, native_packed_key, GnitzClient, PkBuf, PkColumn, Schema, ZSetBatch};
-use gnitz_wire::{ReadBound, ReadSink};
+use gnitz_core::{GnitzClient, PkBuf, PkColumn, Schema, ZSetBatch};
+use gnitz_wire::{PkKeys, ReadBound, ReadSink};
 use std::collections::{HashMap, HashSet};
 
 /// A PK's net effect within the transaction so far. `Present` borrows the
@@ -64,7 +64,8 @@ pub(crate) fn effective_rows(
     let gather = RowGather::new(schema);
     let mut out = ZSetBatch::with_capacity(schema, pks.len());
     let mut verdicts: Vec<Conflict> = Vec::with_capacity(pks.len());
-    let mut undecided: Vec<PkBuf> = Vec::new();
+    // Flat OPK bytes, one key per `pk_stride`.
+    let mut undecided: Vec<u8> = Vec::new();
     // The buffer borrow is confined to this block, so it ends before the fetch.
     {
         let buf = client.txn_reads(tid);
@@ -83,7 +84,7 @@ pub(crate) fn effective_rows(
                 // A buffered delete is absent whatever the store holds.
                 Some(Buffered::Deleted) => verdicts.push(Conflict::Fresh),
                 None => {
-                    undecided.push(pks.get_tuple(i));
+                    undecided.extend_from_slice(key);
                     verdicts.push(Conflict::Fresh);
                 }
             }
@@ -109,43 +110,19 @@ pub(crate) fn effective_rows(
     Ok((out, verdicts))
 }
 
-/// The committed rows for `keys`. A single-column PK has a `PkSet` wire form, so
-/// the whole set is one gather (chunked by `fetch_bound` past the per-gather
-/// cap). Only a PK too wide for the wire's 16-byte scalar key has none, and
-/// falls back to a seek per key.
-///
-/// The reply is read back under the caller's own `schema`: a stored row is
-/// *assumed* to match the catalog, never checked against a server-echoed schema.
+/// The committed rows for `keys`, flat OPK bytes at `schema`'s stride, read back
+/// under the caller's `schema` rather than a server-echoed one.
 fn fetch_committed(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
-    keys: &[PkBuf],
+    keys: &[u8],
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    // `PkSet` ships each key in the wire's **native** key space, and `opk_key`
-    // encodes a packed key of any arity — so the wire's scalar width, not the
-    // PK's column count, is what bounds the batched form.
-    if schema.pk_stride() <= gnitz_wire::NARROW_PK_MAX_BYTES {
-        // No WHERE behind it, so nothing is residual and no predicate ships: the
-        // gather is the whole selection. ON CONFLICT needs the committed rows for
-        // a key set it already holds, so it takes this bound directly rather than
-        // re-deriving it from a synthetic `pk IN (…)`.
-        let keys = keys.iter().map(|k| native_packed_key(schema, k.pk_bytes())).collect();
-        let plan = AccessPlan::new(ReadBound::PkSet(keys), &[], Vec::new(), schema)?;
-        return fetch_bound(client, tid, &plan.access, &ReadSink::all_rows(), schema);
-    }
-    let gather = RowGather::new(schema);
-    let mut out = ZSetBatch::with_capacity(schema, keys.len());
-    for pk in keys {
-        let native = native_le_key(schema, pk.pk_bytes());
-        let (low, extra) = gnitz_wire::control::split_ctrl_key(&native[..schema.pk_stride()]);
-        if let Some(b) = client.seek(tid, low, extra)?.1.filter(|b| !b.pks.is_empty()) {
-            for i in 0..b.len() {
-                gather.copy(&b, i, &mut out);
-            }
-        }
-    }
-    Ok(out)
+    let stride = schema.pk_stride();
+    let keys = PkKeys::from_keys(stride, keys.chunks_exact(stride));
+    // No WHERE behind it, so the gather is the whole selection.
+    let plan = AccessPlan::new(ReadBound::PkSet(keys), &[], Vec::new(), schema)?;
+    fetch_bound(client, tid, &plan.access, &ReadSink::all_rows(), schema)
 }
 
 /// The transaction's net effect on `tid`: restricted to `keys` when the access

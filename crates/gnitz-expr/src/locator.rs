@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use crate::RowSource;
+use crate::{RowSource, SchemaFacts};
 
 /// Where a logical column's value physically lives in a row, resolved once from
 /// the schema. The only sanctioned way to read a column whose index is not
@@ -280,6 +280,22 @@ impl OrderLocator {
             nulls_first: wire.nulls_first,
         }
     }
+}
+
+/// Append the identity tiebreak — PK columns in key order, then payload columns,
+/// all ASC NULLS FIRST — making the order total over distinct rows. Assumes
+/// `schema`'s PK is a function of row content, since it leads.
+pub fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &dyn SchemaFacts) {
+    let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
+    let mut pk: Vec<(u8, ColumnLocator)> = (0..schema.num_columns())
+        .filter_map(|ci| match schema.locate(ci) {
+            loc @ ColumnLocator::Pk { byte_off, .. } => Some((byte_off, loc)),
+            ColumnLocator::Payload { .. } => None,
+        })
+        .collect();
+    pk.sort_unstable_by_key(|&(off, _)| off);
+    keys.extend(pk.into_iter().map(|(_, loc)| asc(loc)));
+    keys.extend((0..schema.num_payload_cols()).map(|pi| asc(schema.locate(schema.payload_col_idx(pi)))));
 }
 
 /// The one ORDER BY comparator, read by both the worker's top-k and the client's

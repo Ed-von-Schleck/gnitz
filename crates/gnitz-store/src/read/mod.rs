@@ -18,8 +18,6 @@
 mod scan_spec;
 mod store_io;
 
-pub use store_io::IndexWalk;
-
 use crate::relation::RelationRegistry;
 use crate::storage::{Batch, StoreError};
 

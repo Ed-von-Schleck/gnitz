@@ -454,8 +454,8 @@ pub(super) struct ShardIndex {
     budget: ShardBudget,
     /// Running **max** over the leading eight OPK bytes — the `_tick` — of every row
     /// this store has ever dropped. A delta read at `after_tick > dropped_through`
-    /// asks only for rows above it, and no such row was ever dropped; a read at or
-    /// below it is refused. Zero until the first drop, and always zero for a store
+    /// asks only for rows above it, and no such row was ever dropped; a read below
+    /// it is refused. Zero until the first drop, and always zero for a store
     /// that does not evict by dropping ([`ShardBudget::Drop`]).
     dropped_through: u64,
     /// Passed to every compaction's write. Held rather than derived from the

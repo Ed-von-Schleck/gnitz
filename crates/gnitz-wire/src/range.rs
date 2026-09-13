@@ -233,6 +233,14 @@ pub struct IndexBound {
     pub desc: RangeDescriptor,
 }
 
+/// Whether an index walk may be traded for a full scan: `Optional` when the caller
+/// re-imposes the range itself, `Required` when the walk is all that applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexWalk {
+    Required,
+    Optional,
+}
+
 pub(crate) fn write_index_bound(w: &mut Writer, b: &IndexBound) {
     w.u64(crate::pack_pk_cols(b.idx_cols.as_slice()));
     write_range_descriptor(w, &b.desc);

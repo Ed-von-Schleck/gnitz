@@ -177,7 +177,7 @@ fn an_index_walk_is_exact_only_when_the_predicate_cannot_carry_its_conjunct() {
     };
     let wide = two_col(TypeCode::U128); // `val` is U128
     let idx: &[(&[u32], bool)] = &[(&[1], false)];
-    for (schema, sql, want_exact, want_residual) in [
+    for (schema, sql, want_required, want_residual) in [
         (&narrow, "v = 5", false, 1),
         (&narrow, "v = 5 AND w = 9", false, 2),
         (&narrow, "v = 18446744073709551615", true, 0),
@@ -185,10 +185,10 @@ fn an_index_walk_is_exact_only_when_the_predicate_cannot_carry_its_conjunct() {
     ] {
         let where_expr = bind_where(sql, schema);
         let plan = plan_of(&where_expr, schema, idx, ReadBudget::OneRequest);
-        let ReadBound::IndexRange { exact, .. } = plan.access.bound else {
+        let ReadBound::IndexRange { walk, .. } = plan.access.bound else {
             panic!("{sql}: expected an index bound, got {}", shape(&plan.access.bound));
         };
-        assert_eq!(exact, want_exact, "{sql}: exactness");
+        assert_eq!(walk == IndexWalk::Required, want_required, "{sql}: walk");
         assert_eq!(plan.residual.len(), want_residual, "{sql}: residual");
     }
 }

@@ -116,7 +116,7 @@ fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
     eb.build(Some(r)).expect("a well-formed program").to_blob_bytes()
 }
 
-/// A pure-gather projection blob: `(src_col, out_payload_slot)` CopyCols and
+/// A pure-gather projection program: `(src_col, out_payload_slot)` CopyCols and
 /// nothing else.
 fn proj_blob(copies: &[(u32, u32)]) -> Vec<u8> {
     let mut eb = gnitz_expr::ExprBuilder::new();
@@ -126,18 +126,30 @@ fn proj_blob(copies: &[(u32, u32)]) -> Vec<u8> {
     eb.build(None).expect("a well-formed program").to_blob_bytes()
 }
 
-/// A `ReadSink::Rows` spec over the whole table. Shared by the `scan_spec` tests
-/// and bench; the bound-walk tests take the `identity_spec` alias.
+/// `program` as a sink map declaring `reply`'s payload columns — the slots a
+/// mapped rows reply carries after the PK it inherits.
+fn map_of(program: Vec<u8>, reply: &gnitz_store::schema::SchemaDescriptor) -> Option<gnitz_wire::ComputeMap> {
+    let out_cols = reply
+        .payload_columns()
+        .map(|(_, c)| (c.type_code, c.nullable != 0))
+        .collect();
+    Some(gnitz_wire::ComputeMap { program, out_cols })
+}
+
+/// A rows-sink spec over the whole table.
 fn rows_spec(
     predicate: Vec<u8>,
-    projection: Vec<u8>,
+    map: Option<gnitz_wire::ComputeMap>,
     order: Vec<gnitz_wire::OrderKey>,
     limit_k: u64,
 ) -> gnitz_wire::ReadSpec {
     gnitz_wire::ReadSpec {
         bound: gnitz_wire::ReadBound::None,
         predicate,
-        sink: gnitz_wire::ReadSink::Rows { projection, order, limit_k },
+        sink: gnitz_wire::ReadSink {
+            map,
+            kind: gnitz_wire::SinkKind::Rows { order, limit_k },
+        },
     }
 }
 

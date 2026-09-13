@@ -35,9 +35,10 @@ use super::sort::compare_by_group_cols;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
 
-/// The request-scoped fold state. `pub(crate)` so `read::scan_spec` can drive
-/// it; every reduce building block it composes is reached at `pub(super)` from
-/// this descendant of `ops::reduce`.
+/// The end of a [`AdhocFold::same_key`] chain.
+const NO_GROUP: u32 = u32::MAX;
+
+/// The request-scoped fold state.
 pub(crate) struct AdhocFold {
     /// The baked reduce plan — the single home of the schemas, group columns,
     /// the group keyer and comparator locators, the accumulator template, and
@@ -52,12 +53,12 @@ pub(crate) struct AdhocFold {
     /// Flat accumulator matrix: group `ord` owns
     /// `accs[ord * n_aggs .. (ord + 1) * n_aggs]`.
     accs: Vec<Accumulator>,
-    /// Group key → group ordinals sharing it (FxHash — the key is already a
-    /// uniform 128-bit XXH3 digest, so no second strong hash is needed). A
-    /// hashed key is confirmed by value with `compare_by_group_cols` before a
-    /// row joins a bucket, so two groups colliding on the digest stay distinct
-    /// partials; a canonical key is injective and skips that confirmation.
-    by_hash: FxHashMap<u128, Vec<u32>>,
+    /// Group key → the newest group ordinal carrying it. A digest can collide, so a
+    /// match is confirmed by value unless the key is canonical.
+    by_hash: FxHashMap<u128, u32>,
+    /// Per ordinal, the next-older ordinal sharing its key ([`NO_GROUP`] ends
+    /// it) — the 128-bit digest-collision chain a value confirmation walks.
+    same_key: Vec<u32>,
     /// Same-group memo: the previous row's `(key, ordinal)`. Consecutive rows
     /// of one group — per cluster, when the scan is ordered by the group
     /// column — resolve without a map probe.
@@ -66,18 +67,10 @@ pub(crate) struct AdhocFold {
 }
 
 impl AdhocFold {
-    /// Build the fold state from a decoded fold spec. The spec and the client's
-    /// reply schema are the trust boundary, and [`ReducePlan::for_adhoc_fold`]
-    /// is all of it: column ranges, aggregate types, output width, and the reply
-    /// schema against the layout the plan derived. (Aggregate-op validity is
-    /// already decode-enforced — `AggDescriptor.agg_op` is typed.)
-    pub(crate) fn new(
-        src_schema: &SchemaDescriptor,
-        reply_schema: &SchemaDescriptor,
-        agg: &AggReadSpec,
-        group_cap: usize,
-    ) -> Result<Self, StoreError> {
-        let plan = ReducePlan::for_adhoc_fold(src_schema, reply_schema, agg)
+    /// The fold of `agg` over `src_schema`; [`ReducePlan::for_adhoc_fold`] rejects
+    /// a spec the schema cannot serve.
+    pub(crate) fn new(src_schema: &SchemaDescriptor, agg: &AggReadSpec, group_cap: usize) -> Result<Self, StoreError> {
+        let plan = ReducePlan::for_adhoc_fold(src_schema, agg)
             .map_err(|e| StoreError::rejected(format!("scan_spec fold: {e}")))?;
 
         Ok(AdhocFold {
@@ -85,9 +78,15 @@ impl AdhocFold {
             rep_rows: Batch::empty_with_schema(src_schema),
             accs: Vec::new(),
             by_hash: FxHashMap::default(),
+            same_key: Vec::new(),
             last: None,
             group_cap,
         })
+    }
+
+    /// The partial reduce-output layout [`Self::finish`] emits.
+    pub(crate) fn output_schema(&self) -> &SchemaDescriptor {
+        &self.plan.output_schema
     }
 
     /// Fold every `[start, end)` row range of one source chunk into the group
@@ -104,6 +103,7 @@ impl AdhocFold {
             rep_rows,
             accs,
             by_hash,
+            same_key,
             last,
             group_cap,
         } = self;
@@ -158,7 +158,10 @@ impl AdhocFold {
             let ord = match *last {
                 Some((k, ord)) if k == key && same(ord) => ord,
                 _ => {
-                    let found = by_hash.get(&key).and_then(|b| b.iter().copied().find(|&o| same(o)));
+                    let found = std::iter::successors(by_hash.get(&key).copied(), |&o| {
+                        Some(same_key[o as usize]).filter(|&n| n != NO_GROUP)
+                    })
+                    .find(|&o| same(o));
                     let ord = match found {
                         Some(ord) => ord,
                         None => {
@@ -176,7 +179,7 @@ impl AdhocFold {
                             }
                             rep_rows.append_batch(chunk, row, row + 1);
                             new_accs(accs);
-                            by_hash.entry(key).or_default().push(ord as u32);
+                            same_key.push(by_hash.insert(key, ord as u32).unwrap_or(NO_GROUP));
                             rep_mb = rep_rows.as_mem_batch();
                             ord as u32
                         }

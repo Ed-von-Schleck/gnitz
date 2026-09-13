@@ -768,19 +768,6 @@ impl WorkerProcess {
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, &spec, &reply_schema, seek_pk as u64)?;
-        // No row of an incremental reply may exceed the cut: the interval is
-        // closed by construction there, and a below-bound regression — a round
-        // landing after the read group — is what this makes loud in the debug
-        // binary the E2E suite runs.
-        debug_assert!(
-            !matches!(spec.bound, gnitz_wire::ReadBound::Delta { after_tick } if after_tick > 0)
-                || (0..keeper.len()).all(|r| {
-                    let pk = keeper.get_pk_bytes(r);
-                    pk.len() >= 8 && u64::from_be_bytes(pk[..8].try_into().unwrap()) <= seek_pk as u64
-                }),
-            "delta reply carries a row above the cut {}",
-            seek_pk as u64,
-        );
         self.send_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
         Ok(())
     }

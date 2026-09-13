@@ -335,8 +335,8 @@ pub const STATUS_NO_INDEX: u32 = 3;
 /// or surfaces the conflict (BEGIN/COMMIT). Cleanly retryable — nothing validated,
 /// nothing written.
 pub const STATUS_TXN_CONFLICT: u32 = 4;
-/// A `Delta { after_tick }` read whose cursor is at or below the refusing
-/// worker's retention floor: the rounds it asks for were dropped by that store's
+/// A `Delta { after_tick }` read whose cursor is below the refusing worker's
+/// retention floor: the rounds it asks for were dropped by that store's
 /// capacity sweep. Control-only frame; the subscriber's recovery is the read it
 /// made on its first day, `after_tick = 0`. The one status a *worker* mints —
 /// `worker_error` carries the code to the client rather than flattening it into

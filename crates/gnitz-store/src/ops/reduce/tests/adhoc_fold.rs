@@ -15,27 +15,6 @@ fn src_schema() -> SchemaDescriptor {
     )
 }
 
-// Reply (SyntheticFold): _agg_pk(U128), grp(I64), then one I64 per agg spec.
-fn reply_schema(n_aggs: usize) -> SchemaDescriptor {
-    let mut cols = vec![
-        SchemaColumn::new(type_code::U128, 0),
-        SchemaColumn::new(type_code::I64, 0),
-    ];
-    for _ in 0..n_aggs {
-        cols.push(SchemaColumn::new(type_code::I64, 1));
-    }
-    SchemaDescriptor::new(&cols, &[0])
-}
-
-/// Global (group-less) reply: `_agg_pk(U128)` then one I64 per agg spec.
-fn reply_global(n_aggs: usize) -> SchemaDescriptor {
-    let mut cols = vec![SchemaColumn::new(type_code::U128, 0)];
-    for _ in 0..n_aggs {
-        cols.push(SchemaColumn::new(type_code::I64, 1));
-    }
-    SchemaDescriptor::new(&cols, &[0])
-}
-
 /// (pk, weight, grp, Option<val>) → a consolidated source batch.
 fn build(rows: &[(u64, i64, i64, Option<i64>)]) -> Batch {
     let s = src_schema();
@@ -51,6 +30,10 @@ fn build(rows: &[(u64, i64, i64, Option<i64>)]) -> Batch {
     }
     b.set_layout_unchecked(Layout::Consolidated);
     b
+}
+
+fn direct(group_cols: Vec<u32>, aggs: Vec<AggDescriptor>) -> AggReadSpec {
+    AggReadSpec { group_cols, aggs }
 }
 
 fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
@@ -94,7 +77,7 @@ fn fold_grouped_multi_agg_with_nulls() {
         (4, 2, 20, Some(50)),
         (5, 1, 30, None),
     ]);
-    let spec = AggReadSpec::direct(
+    let spec = direct(
         vec![1],
         vec![
             agg(AggFunc::Count, 0),
@@ -104,8 +87,8 @@ fn fold_grouped_multi_agg_with_nulls() {
             agg(AggFunc::Max, 2),
         ],
     );
-    let (src, reply) = (src_schema(), reply_schema(5));
-    let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
+    let src = src_schema();
+    let mut fold = AdhocFold::new(&src, &spec, 1000).unwrap();
     fold.fold_ranges(&batch, &[(0, batch.count)]).unwrap();
     let g = by_group(&fold.finish(), 5);
     assert_eq!(g.len(), 3);
@@ -116,9 +99,9 @@ fn fold_grouped_multi_agg_with_nulls() {
 
 #[test]
 fn fold_accumulates_across_chunks() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0), agg(AggFunc::Sum, 2)]);
-    let (src, reply) = (src_schema(), reply_schema(2));
-    let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
+    let spec = direct(vec![1], vec![agg(AggFunc::Count, 0), agg(AggFunc::Sum, 2)]);
+    let src = src_schema();
+    let mut fold = AdhocFold::new(&src, &spec, 1000).unwrap();
     let (c1, c2) = (
         build(&[(1, 1, 7, Some(10)), (2, 1, 7, Some(20))]),
         build(&[(3, 1, 7, Some(5)), (4, 1, 8, Some(99))]),
@@ -135,15 +118,15 @@ fn fold_accumulates_across_chunks() {
 /// range never appears.
 #[test]
 fn fold_ranges_folds_only_the_given_ranges() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0), agg(AggFunc::Sum, 2)]);
-    let (src, reply) = (src_schema(), reply_schema(2));
+    let spec = direct(vec![1], vec![agg(AggFunc::Count, 0), agg(AggFunc::Sum, 2)]);
+    let src = src_schema();
     let batch = build(&[
         (1, 1, 7, Some(10)),
         (2, 1, 9, Some(999)), // skipped
         (3, 1, 7, Some(20)),
         (4, 1, 7, Some(30)),
     ]);
-    let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
+    let mut fold = AdhocFold::new(&src, &spec, 1000).unwrap();
     // Two survivor ranges: [0,1) and [2,4) — row 1 (group 9) is filtered out.
     fold.fold_ranges(&batch, &[(0, 1), (2, 4)]).unwrap();
     let g = by_group(&fold.finish(), 2);
@@ -153,18 +136,9 @@ fn fold_ranges_folds_only_the_given_ranges() {
 
 #[test]
 fn fold_global_single_group() {
-    let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Count, 0), agg(AggFunc::Max, 2)]);
+    let spec = direct(vec![], vec![agg(AggFunc::Count, 0), agg(AggFunc::Max, 2)]);
     let src = src_schema();
-    // Global reply: _agg_pk(U128) + 2 agg cols (no group col).
-    let reply = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-    let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
+    let mut fold = AdhocFold::new(&src, &spec, 1000).unwrap();
     let b = build(&[(1, 1, 0, Some(3)), (2, 1, 0, Some(9)), (3, 1, 0, Some(1))]);
     fold.fold_ranges(&b, &[(0, b.count)]).unwrap();
     let out = fold.finish();
@@ -176,39 +150,13 @@ fn fold_global_single_group() {
 
 #[test]
 fn fold_group_cap_aborts() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0)]);
-    let (src, reply) = (src_schema(), reply_schema(1));
+    let spec = direct(vec![1], vec![agg(AggFunc::Count, 0)]);
+    let src = src_schema();
     // Cap of 2 distinct groups; a third distinct group trips it.
-    let mut fold = AdhocFold::new(&src, &reply, &spec, 2).unwrap();
+    let mut fold = AdhocFold::new(&src, &spec, 2).unwrap();
     let b = build(&[(1, 1, 1, Some(0)), (2, 1, 2, Some(0)), (3, 1, 3, Some(0))]);
     let err = fold.fold_ranges(&b, &[(0, b.count)]).unwrap_err();
     assert!(err.to_string().contains("CREATE VIEW"), "{err}");
-}
-
-/// A structurally valid reply schema that is not the derived SyntheticFold
-/// layout (here: missing the agg column) is a malformed frame — rejected,
-/// never fed to `ReducePlan::build` (whose `cbase` arithmetic would panic).
-#[test]
-fn fold_rejects_mismatched_reply_schema() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0)]);
-    let src = src_schema();
-    let too_few = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
-    assert!(AdhocFold::new(&src, &too_few, &spec, 1000).is_err());
-    let wrong_type = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::F64, 0), // COUNT partial is I64
-        ],
-        &[0],
-    );
-    assert!(AdhocFold::new(&src, &wrong_type, &spec, 1000).is_err());
 }
 
 /// pk(U64), s(STRING), w(U128) — the wide-column source both tests below read.
@@ -227,10 +175,10 @@ fn wide_src_schema() -> SchemaDescriptor {
 /// a STRING or a U128 has no scalar register image to add in.
 #[test]
 fn fold_rejects_a_sum_with_no_encoding() {
-    let (src, reply) = (wide_src_schema(), reply_schema(1));
+    let src = wide_src_schema();
     for col in [1u32, 2] {
-        let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Sum, col)]);
-        let Err(err) = AdhocFold::new(&src, &reply, &spec, 1000) else {
+        let spec = direct(vec![], vec![agg(AggFunc::Sum, col)]);
+        let Err(err) = AdhocFold::new(&src, &spec, 1000) else {
             panic!("SUM over column {col} must be rejected");
         };
         assert!(err.to_string().contains("no scalar register image"), "{err}");
@@ -243,25 +191,18 @@ fn fold_rejects_a_sum_with_no_encoding() {
 #[test]
 fn fold_accepts_a_row_selecting_aggregate_over_a_wide_column() {
     let src = wide_src_schema();
-    for (col, tc) in [(1u32, type_code::STRING), (2, type_code::U128)] {
-        let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Min, col)]);
-        let reply = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0), SchemaColumn::new(tc, 1)], &[0]);
-        assert!(
-            AdhocFold::new(&src, &reply, &spec, 1000).is_ok(),
-            "MIN over column {col}"
-        );
-        let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Count, col)]);
-        assert!(
-            AdhocFold::new(&src, &reply_global(1), &spec, 1000).is_ok(),
-            "COUNT over column {col}"
-        );
+    for col in [1u32, 2] {
+        let spec = direct(vec![], vec![agg(AggFunc::Min, col)]);
+        assert!(AdhocFold::new(&src, &spec, 1000).is_ok(), "MIN over column {col}");
+        let spec = direct(vec![], vec![agg(AggFunc::Count, col)]);
+        assert!(AdhocFold::new(&src, &spec, 1000).is_ok(), "COUNT over column {col}");
     }
 }
 
 #[test]
 fn fold_rejects_out_of_range_column() {
     // group column 9: no such column
-    let spec = AggReadSpec::direct(vec![9], vec![agg(AggFunc::Count, 0)]);
-    let (src, reply) = (src_schema(), reply_schema(1));
-    assert!(AdhocFold::new(&src, &reply, &spec, 1000).is_err());
+    let spec = direct(vec![9], vec![agg(AggFunc::Count, 0)]);
+    let src = src_schema();
+    assert!(AdhocFold::new(&src, &spec, 1000).is_err());
 }

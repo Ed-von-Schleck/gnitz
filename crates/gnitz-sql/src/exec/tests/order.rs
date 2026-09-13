@@ -451,7 +451,7 @@ fn sink_compound_pk_key_orders_by_typed_value() {
         order_limit_project(&select.projection, &schema, Some(b), q.order_by.as_ref(), 0, None).unwrap();
     // Read `b` from the compound PK region (physical col 1), addressed the
     // way the comparator addresses it rather than by re-deriving the offset.
-    let ColumnLocator::Pk { byte_off, size, type_code } = sort_key(&out_schema, 1, true, false).loc else {
+    let ColumnLocator::Pk { byte_off, size, type_code } = SchemaFacts::locate(&out_schema, 1) else {
         panic!("column 1 is a PK column");
     };
     let bs: Vec<i16> = (0..out.len())

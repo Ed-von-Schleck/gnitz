@@ -473,9 +473,9 @@ fn dropped_index_falls_back_to_full_scan() {
     engine.close();
 }
 
-/// An inverted range is `Empty` — provably no rows — and NOT an `Err`, which
-/// `handle_backfill` fails stop on. An `Empty` cursor still feeds one empty
-/// epoch, which is what mints a global aggregate's ground row.
+/// An inverted range is a cursor that drains nothing — provably no rows — and NOT
+/// an `Err`, which `handle_backfill` fails stop on. Such a cursor still feeds one
+/// empty epoch, which is what mints a global aggregate's ground row.
 #[test]
 fn inverted_range_is_empty_not_err() {
     // start After(900) is above end Before(300): x > 900 AND x < 300.
@@ -483,7 +483,6 @@ fn inverted_range_is_empty_not_err() {
     let mut cur = engine
         .open_source_cursor(vid, tid)
         .expect("an empty range is a cursor, never an error");
-    assert!(matches!(cur, SourceCursor::Empty));
     assert!(cur.drain_chunk(64).is_none());
     engine.close();
 }

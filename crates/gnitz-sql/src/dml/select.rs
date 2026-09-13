@@ -40,7 +40,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{AggDescriptor, AggReadSpec, ReadSink};
+use gnitz_wire::{AggDescriptor, AggReadSpec, ComputeMap, ReadSink, SinkKind};
 use sqlparser::ast::{Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
@@ -89,7 +89,6 @@ pub(super) struct Target {
     pub(super) desc: Arc<RelDescriptor>,
 }
 
-/// Which sink a validated ad-hoc SELECT lands on.
 /// Which sink a validated ad-hoc SELECT lands on, carrying the relation that
 /// sink reads. The target rides in the variant so the sink that reads nothing
 /// holds nothing.
@@ -470,10 +469,9 @@ fn plan_rows_read(query: &Query, select: &Select, window: Window, target: Target
     Ok(SpecRead {
         target,
         access,
-        sink: ReadSink::Rows {
-            projection: shape.projection,
-            order: shape.order.clone(),
-            limit_k,
+        sink: ReadSink {
+            map: Some(shape.projection),
+            kind: SinkKind::Rows { order: shape.order.clone(), limit_k },
         },
         order: shape.order,
         window,
@@ -491,15 +489,17 @@ fn plan_fold_read(query: &Query, select: &Select, window: Window, target: Target
     let (shape, order) = build_fold_shape(select, &target.schema, &target.alias, &keys)?;
     // `group_cols` / `src_col` index the reduce input — the pre-map's output when
     // the fold carries one, which is exactly what `shape` resolved them against.
-    let sink = ReadSink::Fold(AggReadSpec {
-        group_cols: shape.group_positions.iter().map(|&c| c as u32).collect(),
-        aggs: shape
-            .agg_specs
-            .iter()
-            .map(|s| AggDescriptor { agg_op: s.op, col_idx: s.col as u32 })
-            .collect(),
-        pre: shape.pre.clone(),
-    });
+    let sink = ReadSink {
+        map: shape.pre.clone(),
+        kind: SinkKind::Fold(AggReadSpec {
+            group_cols: shape.group_positions.iter().map(|&c| c as u32).collect(),
+            aggs: shape
+                .agg_specs
+                .iter()
+                .map(|s| AggDescriptor { agg_op: s.op, col_idx: s.col as u32 })
+                .collect(),
+        }),
+    };
     Ok(SpecRead {
         target,
         access,
@@ -644,8 +644,8 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
 /// The rows sink's reply shape: what the worker projects and how it orders.
 struct RowsShape {
     reply_schema: Schema,
-    /// The compiled projection-map program.
-    projection: Vec<u8>,
+    /// The projection map over the source.
+    projection: ComputeMap,
     order: Vec<gnitz_wire::OrderKey>,
 }
 
@@ -664,7 +664,7 @@ fn build_rows_shape(select: &Select, query: &Query, schema: &Schema, alias: &str
     let keys = parse_order_by(query.order_by.as_ref())?;
     let order = resolve_read_spec_order(&mut items, &mut out_cols, schema, alias, &keys)?;
 
-    // Reply schema + projection blob.
+    // Reply schema + projection map.
     let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema)?;
     Ok(RowsShape { reply_schema, projection, order })
 }

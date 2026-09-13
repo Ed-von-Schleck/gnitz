@@ -192,9 +192,7 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     let stride = feed.schema().pk_stride();
     let mut rounds: Vec<(u64, i64)> = Vec::new();
     let floor = vec![0u8; stride];
-    let mut cur = feed.cursor_in_range(&floor, None);
-    // A ranged open comes back unpositioned; every reader of one seeks first.
-    cur.seek_range_bytes(&floor, None);
+    let (mut cur, _) = feed.range_cursor(&floor, None);
     while cur.valid {
         // The delta PK is `round` big-endian, then the view's own PK.
         let tick = u64::from_be_bytes(cur.current_pk_bytes()[..8].try_into().unwrap());

@@ -64,8 +64,7 @@ pub(in crate::catalog) fn preflight_dir(base_dir: &str, schema_name: &str, vid: 
 /// The output batch is in `rel`'s own schema — a caller cannot hand it one the
 /// rows it copies are not laid out in.
 pub(in crate::catalog) fn retract_key_range(rel: &Relation, start: &[u8], end: &[u8]) -> Batch {
-    let mut cursor = rel.cursor_in_range(start, Some(end));
-    cursor.seek_range_bytes(start, Some(end));
+    let (mut cursor, _) = rel.range_cursor(start, Some(end));
     // Sized off the positioned walk's own upper bound, so the appends never
     // re-grow (each growth re-copies every live byte).
     let mut batch = Batch::with_capacity(&rel.schema(), cursor.estimated_length());

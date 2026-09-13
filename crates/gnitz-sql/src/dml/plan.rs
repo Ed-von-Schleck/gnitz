@@ -1,8 +1,8 @@
 //! WHERE → access-path **planning and fetching** for every direct-read verb: the
 //! one recognizer ladder ([`bound_and_predicate`], over **bound conjuncts**
 //! recognized by [`crate::access`]) turning a WHERE into an [`AccessPlan`], the
-//! `ReadSpec` dispatcher that walks it ([`fetch_bound`]), and the LIMIT/OFFSET
-//! literal readers. Read-only analysis and fetching — no row mutation lives here,
+//! `ReadSpec` dispatcher that walks it ([`fetch_bound`]). Read-only analysis and
+//! fetching — no row mutation lives here,
 //! and recognition itself lives in the `access` leaf. `select` and `mutate` sink
 //! into this module; it never references either.
 
@@ -14,8 +14,8 @@ use crate::access::{
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
-use gnitz_core::{opk_key_packed, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
-use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
+use gnitz_core::{GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
+use gnitz_wire::{IndexWalk, PkKeys, ReadBound, ReadSink, ReadSpec};
 
 // ---------------------------------------------------------------------------
 // The access-path ladder
@@ -129,7 +129,7 @@ impl<'e> AccessPlan<'e> {
     /// `PkBuf`.
     pub(crate) fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkBuf>>, &[&'e BoundExpr]) {
         let keys = match &self.access.bound {
-            ReadBound::PkSet(keys) => Some(keys.iter().map(|&k| opk_key_packed(schema, k)).collect()),
+            ReadBound::PkSet(keys) => Some(keys.iter().map(PkBuf::from_bytes).collect()),
             ReadBound::PkRange(desc) => pk_point_tuple(desc, schema).map(|k| vec![k]),
             _ => None,
         };
@@ -179,10 +179,9 @@ pub(crate) fn bound_and_predicate<'e>(
     let all: Vec<&'e BoundExpr> = conjuncts.iter().collect();
 
     // `pk IN (…)` → an exact gather of those keys, with the remaining conjuncts as
-    // the predicate. Keys ship deduplicated (`try_extract_pk_in`); the worker
-    // OPK-sorts before its forward sweep.
+    // the predicate.
     let gather = try_extract_pk_in(conjuncts, schema)
-        .filter(|(keys, _)| budget == ReadBudget::MayChunk || keys.len() <= gnitz_wire::MAX_PK_SET_KEYS);
+        .filter(|(keys, _)| budget == ReadBudget::MayChunk || keys.len() <= PkKeys::max_per_request(keys.stride()));
     if let Some((keys, residual)) = gather {
         return AccessPlan::new(ReadBound::PkSet(keys), &all, residual, schema);
     }
@@ -242,19 +241,9 @@ fn if_supported<T>(r: Result<T, GnitzSqlError>) -> Result<Option<T>, GnitzSqlErr
     }
 }
 
-/// An index candidate → its plan.
-///
-/// **Keeping the whole WHERE in the predicate is preferred**, because it leaves
-/// the worker free to trade the index walk for a full cursor when the range
-/// covers too much of the table. The bounded conjuncts are stripped — and the
-/// walk marked `exact`, which forbids that trade — exactly when the predicate
-/// cannot carry them (`whole_compiles` is false: a wide-int index column has no
-/// VM register, a literal past the VM's `i64` constant has no encoding). A
-/// residual that still cannot compile abandons this rung like any other.
-/// Stripping and exactness are set together, so a conjunct the predicate drops
-/// is always one the walk applies.
-///
-/// `whole` is the compiled whole WHERE, `None` when the VM cannot express it.
+/// An index candidate → its plan. The whole WHERE (`whole`, when it compiles)
+/// stays the predicate, leaving the walk `Optional`; otherwise the walk's own
+/// conjuncts are stripped and it is `Required`.
 fn index_plan<'e>(
     c: IndexRangeCandidate<'e>,
     all: &[&'e BoundExpr],
@@ -263,7 +252,10 @@ fn index_plan<'e>(
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
     let bound = ReadBound::IndexRange {
         bound: gnitz_wire::IndexBound { idx_cols: c.idx_cols, desc: c.desc },
-        exact: whole.is_none(),
+        walk: match whole {
+            Some(_) => IndexWalk::Optional,
+            None => IndexWalk::Required,
+        },
     };
     match whole {
         Some(predicate) => Ok(AccessPlan::whole(bound, all, predicate.to_vec())),
@@ -275,18 +267,9 @@ fn index_plan<'e>(
 // Fetching
 // ---------------------------------------------------------------------------
 
-/// Run `plan`'s bound as a `ReadSpec` under `sink` and `reply_schema`,
-/// concatenating the replies.
-///
-/// The read is local-first, and that is safe for the read-before-write callers
-/// too: only a view can be mirrored, and every writable target the binder admits
-/// is a table or a stream, so a DML `table_id` can never name a copy.
-///
-/// A `PkSet` is chunked at `MAX_PK_SET_KEYS` — the decoder's per-gather cap —
-/// which is what lets a [`ReadBudget::MayChunk`] caller plan a gather of any
-/// length; every other bound is one request. Absent keys contribute no rows, so
-/// a count taken off the reply reports rows actually touched. An empty result is
-/// an empty batch, not an absent one — no caller distinguishes the two.
+/// Run `access` under `sink`, concatenating the replies: one request, or one per
+/// [`PkKeys::per_request`] sub-list of a long `PkSet`. Local-first, which a DML
+/// read may take too: only a view is mirrored, and a view is never a DML target.
 pub(crate) fn fetch_bound(
     client: &mut GnitzClient,
     table_id: u64,
@@ -308,19 +291,15 @@ pub(crate) fn fetch_bound(
         Ok(())
     };
     match &access.bound {
-        ReadBound::PkSet(keys) if keys.len() > gnitz_wire::MAX_PK_SET_KEYS => {
-            for chunk in keys.chunks(gnitz_wire::MAX_PK_SET_KEYS) {
-                send(client, &ReadBound::PkSet(chunk.to_vec()))?;
+        ReadBound::PkSet(keys) if keys.len() > PkKeys::max_per_request(keys.stride()) => {
+            for part in keys.per_request() {
+                send(client, &ReadBound::PkSet(part))?;
             }
         }
         bound => send(client, bound)?,
     }
     Ok(out.unwrap_or_else(|| ZSetBatch::new(reply_schema)))
 }
-
-// ---------------------------------------------------------------------------
-// LIMIT / OFFSET
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Unit tests

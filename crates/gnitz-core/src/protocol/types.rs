@@ -414,7 +414,7 @@ fn native_row(schema: &Schema, opk: &[u8]) -> [u8; MAX_PK_BYTES] {
 /// One row's PK as OPK bytes, from the PK columns' native values in PK-list
 /// order — the one native→OPK column walk on the client, and the same bytes a
 /// [`PkColumn`] row holds. Crossing into the wire's *native* key space is named:
-/// this and [`opk_key_packed`] in, [`native_le_key`] / [`native_packed_key`] out.
+/// this and [`opk_key_packed`] in, [`native_le_key`] out.
 pub fn opk_key_cols(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> PkBuf {
     let mut key = PkBuf::zeroed(0);
     for ((w, tc), v) in schema.pk_col_codes().zip(natives) {
@@ -435,7 +435,7 @@ pub fn opk_key_native_bytes(schema: &Schema, native_le: &[u8]) -> PkBuf {
 }
 
 /// [`opk_key_native_bytes`] from a u128 whose low `pk_stride` bytes carry the PK
-/// columns' native images — a parsed PK literal, a `ReadBound::PkSet` key.
+/// columns' native images — a parsed PK literal.
 pub fn opk_key_packed(schema: &Schema, v: u128) -> PkBuf {
     let stride = schema.pk_stride();
     debug_assert!(stride <= 16);
@@ -446,12 +446,6 @@ pub fn opk_key_packed(schema: &Schema, v: u128) -> PkBuf {
 /// `0..key.len()`.
 pub fn native_le_key(schema: &Schema, key: &[u8]) -> [u8; MAX_PK_BYTES] {
     native_row(schema, key)
-}
-
-/// [`native_le_key`] packed into one word — the form a `ReadBound::PkSet`
-/// ships. Defined for a key of at most `NARROW_PK_MAX_BYTES`.
-pub fn native_packed_key(schema: &Schema, key: &[u8]) -> u128 {
-    gnitz_wire::control::split_ctrl_key(&native_le_key(schema, key)[..key.len()]).0
 }
 
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,

@@ -16,9 +16,11 @@
 
 use crate::codec::pk_codec::{bound_key_literal, col_key_literal, pack_num, BoundLit, NumLit};
 use crate::ir::{BExpr, BinOp, BoundExpr};
-use gnitz_core::{opk_key_cols, Cut, FixedInt, IndexMeta, PkBuf, PkColList, RangeDescriptor, Schema, TypeCode};
+use gnitz_core::{
+    opk_key_cols, opk_key_packed, Cut, FixedInt, IndexMeta, PkBuf, PkColList, RangeDescriptor, Schema, TypeCode,
+};
+use gnitz_wire::PkKeys;
 use std::cmp::Reverse;
-use std::collections::HashSet;
 
 /// Classify a bound binary op as `col OP literal`, the `ColRef` on either side.
 /// The returned operator always reads `col OP lit` — a literal on the left is
@@ -57,10 +59,7 @@ fn try_col_eq_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, u128)
     Some((col_idx, key))
 }
 
-/// The keys of a bound `pk IN (literal, …)` conjunct on a single-column PK, deduped
-/// (first occurrence wins). `None` for any other conjunct. `NOT IN` binds to
-/// `UnaryOp(Not, InList)` and so never matches here; a one-key `IN` folds to `Eq` at
-/// bind and is served by [`try_extract_pk_range`].
+/// The native keys of a bound `pk IN (literal, …)` conjunct on a single-column PK.
 fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
     // Compound PK has no IN-list fast path; the WHERE routes back to the
     // PK-range rung, then the index rung, then an unbounded scan.
@@ -78,32 +77,28 @@ fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
         return None;
     }
     let pk_col = &schema.columns[pk_idx];
-    let mut seen = HashSet::with_capacity(items.len());
-    let mut pks = Vec::with_capacity(items.len());
-    for item in items {
-        // `bound_key_literal` is the same rule `try_col_eq_literal` applies, so
-        // `IN (…)` and `= …` route identically. A NULL/float/non-literal or an
-        // unparseable UUID aborts to the slow scan.
-        let v = bound_key_literal(col_key_literal(item, pk_col)?, pk_col.type_code).ok()?;
-        if seen.insert(v) {
-            pks.push(v);
-        }
-    }
-    Some(pks)
+    items
+        .iter()
+        .map(|item| bound_key_literal(col_key_literal(item, pk_col)?, pk_col.type_code).ok())
+        .collect()
 }
 
-/// `Some((keys, residual))` when one of `conjuncts` is `pk IN (literal, …)` on a
-/// single-column PK: the gather keys plus the conjuncts to filter against the
-/// gathered rows, so `pk IN (1, 2) AND v > 5` is a two-key gather rather than a
-/// full scan. `None` routes the WHERE back to the seek/index/scan ladder.
+/// A `pk IN (literal, …)` conjunct's keys, plus the other conjuncts as residual:
+/// `pk IN (1, 2) AND v > 5` is a two-key gather.
 pub(crate) fn try_extract_pk_in<'e>(
     conjuncts: &'e [BoundExpr],
     schema: &Schema,
-) -> Option<(Vec<u128>, Vec<&'e BoundExpr>)> {
-    let (ci, keys) = conjuncts
+) -> Option<(PkKeys, Vec<&'e BoundExpr>)> {
+    let (ci, natives) = conjuncts
         .iter()
         .enumerate()
         .find_map(|(i, c)| pk_in_keys(c, schema).map(|k| (i, k)))?;
+    let stride = schema.pk_stride();
+    let mut flat = Vec::with_capacity(natives.len() * stride);
+    for &v in &natives {
+        flat.extend_from_slice(opk_key_packed(schema, v).pk_bytes());
+    }
+    let keys = PkKeys::from_keys(stride, flat.chunks_exact(stride));
     Some((keys, residual_conjuncts(conjuncts, &[ci])))
 }
 

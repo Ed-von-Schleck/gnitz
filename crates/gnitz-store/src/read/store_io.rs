@@ -11,6 +11,7 @@ use crate::relation::RelationRegistry;
 use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, BoundedIndexCursor, ReadCursor, SourceCursor, StoreError};
 use gnitz_expr::RowSource;
+use gnitz_wire::IndexWalk;
 
 impl RelationRegistry {
     /// Scan all positive-weight rows from a relation. One registry lookup serves
@@ -256,19 +257,13 @@ impl RelationRegistry {
         range: &gnitz_wire::RangeDescriptor,
     ) -> Result<(Option<Batch>, SchemaDescriptor), StoreError> {
         let src_schema = self.relation_or_err(id)?.schema();
-        // The wire seek IS one unchunked drain of the bounded cursor — the same
-        // walk/gather the backfill scan drives chunk-wise, so the two paths
-        // cannot diverge on the weight-consolidation subtleties. A provably-empty
-        // range drains `None`; the `.filter` maps the cursor's `Some(empty)`
-        // ("in-range entries, none resolved") back to this API's `None` too.
+        // `Some(empty)` is in-range index entries none of which resolved: a miss.
         let mut cur = self.open_index_source(id, col_indices, range, IndexWalk::Required)?;
         Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
     }
 
-    /// The one index-bounded source cursor opener: the walk over `desc` on `cols`
-    /// of `source`, `SourceCursor::Empty` for a provably-empty range, and — for
-    /// an [`IndexWalk::Optional`] walk — the full-scan cursor when
-    /// [`Self::open_index_range`]'s cost model declines.
+    /// The index walk over `desc` on `cols` of `source`, or — for an
+    /// [`IndexWalk::Optional`] walk that is declined — the full-scan cursor.
     pub fn open_index_source(
         &self,
         source: i64,
@@ -277,72 +272,50 @@ impl RelationRegistry {
         walk: IndexWalk,
     ) -> Result<SourceCursor, StoreError> {
         match self.open_index_range(source, cols, desc, walk) {
-            IndexScan::Cursor(c) => Ok(SourceCursor::Bounded(c)),
-            IndexScan::Empty => Ok(SourceCursor::Empty),
-            IndexScan::Decline(_) if walk == IndexWalk::Optional => {
+            Ok(c) => Ok(SourceCursor::Bounded(c)),
+            Err(_) if walk == IndexWalk::Optional => {
                 Ok(SourceCursor::Full(Box::new(self.relation_or_err(source)?.cursor())))
             }
-            IndexScan::Decline(e) => Err(e),
+            Err(e) => Err(e),
         }
     }
 
-    /// The one place an index-bounded walk is opened: resolve the circuit, encode
-    /// the range bounds, open the index cursor and measure the range — each
-    /// exactly once. An [`IndexWalk::Optional`] walk additionally applies the cost
-    /// model below, declining an unselective range before the base cursor is
-    /// opened.
-    ///
-    /// The cost model, and the only one: a bounded scan is not unconditionally
-    /// cheaper. For a range matching M of N rows it costs an index walk of M, an
-    /// M log M sort, and M galloping base probes, where a full scan is one
-    /// sequential columnar drain of N — so it loses badly as M → N
-    /// (`WHERE indexed > 0` matches everything). M is not estimated: positioning
-    /// the index cursor hands back an upper bound on it (raw entries, so a
-    /// cross-run duplicate counts twice) for free. N comes from `estimated_rows` —
-    /// arithmetic over the children's run and shard counts — rather than a
-    /// cursor's `estimated_length`, so the base cursor is never opened
-    /// speculatively. M also sizes the walk's per-chunk PK scratch exactly,
-    /// either way.
+    /// Open the index walk. `Err` is a decline: no such index, a malformed range,
+    /// or — for an [`IndexWalk::Optional`] walk only — an unselective one.
     fn open_index_range(
         &self,
         id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
         walk: IndexWalk,
-    ) -> IndexScan {
-        let entry = match self.relation_or_err(id) {
-            Ok(e) => e,
-            Err(e) => return IndexScan::Decline(e),
-        };
+    ) -> Result<Box<BoundedIndexCursor>, StoreError> {
+        let entry = self.relation_or_err(id)?;
         // The index was dropped since the plan compiled.
         let Some(ic) = entry.index_on(col_indices) else {
-            return IndexScan::Decline(StoreError::rejected(format!(
+            return Err(StoreError::rejected(format!(
                 "No index on cols {col_indices:?} for table {id}"
             )));
         };
-        let (start, end) = match ic.key_spec().range_keys(ic.schema().pk_stride(), range) {
-            Ok(Some(keys)) => keys,
-            Ok(None) => return IndexScan::Empty,
-            // Malformed: `n_eq` pins every column with no range column left.
-            Err(e) => return IndexScan::Decline(StoreError::rejected(e)),
-        };
-        let end_bytes = end.as_ref().map(|e| e.pk_bytes());
-        let mut idx = ic.cursor_in_range(start.pk_bytes(), end_bytes);
-        let matches = idx.seek_range_bytes(start.pk_bytes(), end_bytes);
+        let (idx, matches) = ic
+            .store()
+            .cursor_over(&ic.key_spec(), range)
+            .map_err(StoreError::rejected)?;
         if walk == IndexWalk::Optional {
             // Only user base tables own index circuits, so a resolved index
             // implies a base store unless this process detached it (the post-fork
             // master), which degrades to the full scan like any other decline.
             let Some(base) = entry.store().table() else {
-                return IndexScan::Decline(StoreError::rejected("index owner holds no local base store"));
+                return Err(StoreError::rejected("index owner holds no local base store"));
             };
             if matches > base.estimated_rows() / INDEX_SCAN_RATIO {
-                return IndexScan::Decline(StoreError::rejected(
+                return Err(StoreError::rejected(
                     "index range is not selective enough to pay for the walk",
                 ));
             }
         }
-        IndexScan::Cursor(Box::new(BoundedIndexCursor::new(
+        // Boxed here, so it reaches `SourceCursor::Bounded` without a second
+        // allocation.
+        Ok(Box::new(BoundedIndexCursor::new(
             idx,
             entry.cursor(),
             ic.key_spec(),
@@ -351,35 +324,9 @@ impl RelationRegistry {
     }
 }
 
-/// Whether the index walk is the only thing imposing the range.
-///
-/// `Required` — nothing else re-filters, so a walk the cost model declines is an
-/// error. `Optional` — the caller re-imposes the range itself (a circuit's
-/// `Filter`, a ScanSpec residual), so the walk is an access optimisation and a
-/// decline degrades to a full scan.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum IndexWalk {
-    Required,
-    Optional,
-}
-
-/// Use the index only when its range covers at most `1/INDEX_SCAN_RATIO` of the
-/// local base slice.
+/// An optional index walk is taken only while its range covers at most
+/// `1/INDEX_SCAN_RATIO` of the local base slice.
 const INDEX_SCAN_RATIO: usize = 16;
-
-/// The outcome of [`RelationRegistry::open_index_range`]. The cursor is boxed
-/// where it is built, so it reaches `SourceCursor::Bounded` without a second
-/// allocation.
-enum IndexScan {
-    Cursor(Box<BoundedIndexCursor>),
-    /// The range is provably empty — there is nothing to read either way.
-    Empty,
-    /// No walk: no such table or index, a malformed descriptor, or — only for an
-    /// [`IndexWalk::Optional`] walk — an unselective range or an unowned base
-    /// store. The opener answers an optional walk's decline with a full scan; a
-    /// required one's it surfaces.
-    Decline(StoreError),
-}
 
 /// Every live row of `pk`'s **group** off a cursor opened over it. A *group*,
 /// because a base table's PK is unique but a synthetic view key (`_join_pk`)

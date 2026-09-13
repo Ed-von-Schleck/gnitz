@@ -64,7 +64,7 @@ pub struct ReducePlan {
     pub(super) input_schema: SchemaDescriptor,
     /// The output layout, derived here so no caller derives it a second time to
     /// hand back in — the compiler reads it for the trace table and the delta
-    /// register, the ad-hoc fold checks the client's reply schema against it.
+    /// register, the ad-hoc read checks the client's reply schema against it.
     pub output_schema: SchemaDescriptor,
     /// The planner's SQL-intent discriminator for the global-aggregate ground
     /// row: the reduce must publish exactly one row even over an empty source
@@ -135,30 +135,20 @@ impl ReducePlan {
         )
     }
 
-    /// The ad-hoc `ReadSpec` fold's partial layout, checked against the reply
-    /// schema the client declared for it. Always `SyntheticFold`, and derived
-    /// here, so the client cannot describe a partial the fold does not produce.
-    /// The client synthesizes the empty-input ground row, so there is no owner.
+    /// The ad-hoc `ReadSpec` fold's plan: `SyntheticFold`, with no ground row.
     pub(crate) fn for_adhoc_fold(
         src_schema: &SchemaDescriptor,
-        reply_schema: &SchemaDescriptor,
         agg: &gnitz_wire::AggReadSpec,
     ) -> Result<Self, OpBuildErr> {
         check_cols(src_schema, &agg.group_cols, &agg.aggs)?;
-        let plan = Self::build(
+        Self::build(
             src_schema,
             &agg.group_cols,
             &agg.aggs,
             ReduceOutKey::SyntheticFold,
             false,
             false,
-        )?;
-        if !reply_schema.same_physical_layout(&plan.output_schema) {
-            return Err(OpBuildErr::shape(
-                "reduce: reply schema does not match the derived fold layout",
-            ));
-        }
-        Ok(plan)
+        )
     }
 
     fn build(
