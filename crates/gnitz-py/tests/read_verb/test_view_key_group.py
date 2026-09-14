@@ -45,13 +45,13 @@ def test_a_join_view_seek_returns_every_row_of_its_key(client, fact_dim):
     key must reproduce its whole group, weights included."""
     _, vid = fact_dim
     groups = {}
-    for r in client.scan(vid, include_hidden=True):
+    for r in client.scan(vid).including_hidden():
         groups.setdefault(r["_join_pk"], []).append(r)
     assert len(groups) == NDIMS, groups
 
     for key, want in groups.items():
         assert len(want) == NFACTS // NDIMS, f"fixture: key {key} -> {want}"
-        got = list(client.seek(vid, pk=key, include_hidden=True))
+        got = list(client.seek(vid, pk=key).including_hidden())
         assert bag(got, "fid", "did") == bag(want, "fid", "did"), f"seek(jv, {key})"
         assert all(r["_join_pk"] == key for r in got)
 

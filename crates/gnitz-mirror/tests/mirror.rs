@@ -167,7 +167,7 @@ impl Fixture {
     }
 
     /// Run one `SELECT` through the mirroring client.
-    fn local(&mut self, sql_text: &str) -> (Schema, ZSetBatch) {
+    fn local(&mut self, sql_text: &str) -> (std::sync::Arc<Schema>, ZSetBatch) {
         query(self.mirror.as_mut().unwrap(), "s", sql_text)
     }
 
@@ -371,7 +371,7 @@ fn integer_aggregates_are_exact_and_floats_are_close() {
     let q = "SELECT b, SUM(f) AS tf, AVG(f) AS af FROM v_keyed GROUP BY b";
     let local = fx.local(q);
     let remote = query(&mut fx.direct, "s", q);
-    let (la, ra) = (canonical(&local.0, &local.1), canonical(&remote.0, &remote.1));
+    let (la, ra) = (canonical(&local.1), canonical(&remote.1));
     assert_eq!(la.len(), ra.len(), "float aggregate must produce the same groups");
     for ((lk, lw), (rk, rw)) in la.iter().zip(ra.iter()) {
         assert_eq!(lk.0, rk.0, "float aggregate groups must line up by key");
@@ -871,8 +871,8 @@ fn blocking_fsync_fallback_child() {
     );
     let after = query(&mut mirror, "s", "SELECT * FROM v_keyed");
     assert_eq!(
-        canonical(&before.0, &before.1),
-        canonical(&after.0, &after.1),
+        canonical(&before.1),
+        canonical(&after.1),
         "the resumed copy must hold what the checkpoint made durable",
     );
     println!("{CHILD_OK}");
@@ -1011,8 +1011,8 @@ fn a_restart_resumes_rather_than_reseeds() {
     );
     let after = fx.local("SELECT * FROM v_keyed");
     assert_eq!(
-        canonical(&before.0, &before.1),
-        canonical(&after.0, &after.1),
+        canonical(&before.1),
+        canonical(&after.1),
         "a resumed copy must hold exactly what it held before the restart",
     );
     fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
@@ -1730,8 +1730,8 @@ fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
 
     let still = fx.local("SELECT * FROM v_repl");
     assert_eq!(
-        canonical(&before_repl.0, &before_repl.1),
-        canonical(&still.0, &still.1),
+        canonical(&before_repl.1),
+        canonical(&still.1),
         "the dropped view's copy answers its last round until it is forgotten",
     );
 
@@ -1901,7 +1901,7 @@ fn a_view_over_a_stream_follows_its_reset_across_a_restart() {
     fx.drain("s", &["v_stream"]);
     let before = fx.local("SELECT * FROM v_stream");
     assert!(
-        !canonical(&before.0, &before.1).is_empty(),
+        !canonical(&before.1).is_empty(),
         "the copy must hold the stream's aggregate before the restart",
     );
 
@@ -1923,7 +1923,7 @@ fn a_view_over_a_stream_follows_its_reset_across_a_restart() {
     // about nothing.
     let after = fx.local("SELECT * FROM v_stream");
     assert!(
-        canonical(&after.0, &after.1).is_empty(),
+        canonical(&after.1).is_empty(),
         "a view over a stream comes back with zero rows, and the copy must follow it there",
     );
 }

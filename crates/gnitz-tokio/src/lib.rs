@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use gnitz_core::{
-    qualified_name, ClientError, DeltaCursor, GnitzClient, Interest, LocalScanReply, MirrorStore, PollOutcome,
-    RelDescriptor, RelTarget, Reply, Request, ScanReply, Schema, Session, SlotId, WireConflictMode, ZSetBatch,
+    qualified_name, ClientError, DeltaCursor, GnitzClient, Interest, MirrorStore, PollOutcome, RelDescriptor,
+    RelTarget, Reply, Request, ScanReply, Schema, Session, SlotId, WireConflictMode, ZSetBatch,
 };
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::{mpsc, oneshot};
@@ -327,7 +327,7 @@ impl AsyncClient {
     ///
     /// [`Self::seek`] and [`Self::scan_many`] stay wire-only: no caller has
     /// needed a local-first form of either.
-    pub async fn scan_local_first(&self, tid: u64) -> Result<LocalScanReply, ClientError> {
+    pub async fn scan_local_first(&self, tid: u64) -> Result<ScanReply, ClientError> {
         // A slot we cannot read means an installed store — a poisoned lock
         // included, which `lock` below recovers. The guard drops with this
         // statement, so the hop does not wait on a lock this task holds.
@@ -339,12 +339,11 @@ impl AsyncClient {
                 None => Ok(None),
             })
             .await??;
-            if let Some((schema, batch)) = local {
-                return Ok((Some(schema), Some(batch), None));
+            if let Some(reply) = local {
+                return Ok(reply);
             }
         }
-        let (schema, batch, lsn) = self.scan(tid).await?;
-        Ok((schema, batch, Some(lsn)))
+        self.scan(tid).await
     }
 }
 

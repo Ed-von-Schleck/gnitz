@@ -18,10 +18,11 @@ use std::cmp::Ordering;
 use crate::bind::{bind_single_table, output_column};
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
-use crate::exec::batch::RowGather;
 use crate::tail::{key_slots, resolve_position, OrderKey, OrderTarget};
 use crate::validate::order_column;
-use gnitz_core::{ColumnDef, Schema, ZSetBatch, ZSetBatchView};
+use std::sync::Arc;
+
+use gnitz_core::{ColumnDef, Schema, ZSetBatch};
 use gnitz_expr::{cmp_order_keys, push_identity_tiebreak, OrderLocator, RowSource, SchemaFacts};
 
 /// The client-side cut a sink applies to its own result. `limit: None` is
@@ -35,8 +36,16 @@ pub(crate) struct Window {
 /// Lexicographic compare over the key list — the permutation's sort comparator.
 /// [`cmp_order_keys`] is the engine's own; the tiebreak the caller appends
 /// (`push_identity_tiebreak`) is what makes the order total here.
-fn cmp_rows(view: &ZSetBatchView, keys: &[OrderLocator], ra: usize, rb: usize) -> Ordering {
-    cmp_order_keys(keys, view, ra, view.get_null_word(ra), view, rb, view.get_null_word(rb))
+fn cmp_rows(batch: &ZSetBatch, keys: &[OrderLocator], ra: usize, rb: usize) -> Ordering {
+    cmp_order_keys(
+        keys,
+        batch,
+        ra,
+        batch.get_null_word(ra),
+        batch,
+        rb,
+        batch.get_null_word(rb),
+    )
 }
 
 /// The ORDER BY keys as wire `OrderKey`s over the (server-projected) ScanSpec
@@ -147,14 +156,14 @@ pub(crate) fn wire_order(
 /// Sort and window a projected ScanSpec reply by its wire `OrderKey`s, whose
 /// `col` indexes the reply schema, so a hidden appended key resolves.
 pub(crate) fn read_spec_finish(
-    schema: Schema,
+    schema: Arc<Schema>,
     batch: ZSetBatch,
     order_keys: &[gnitz_wire::OrderKey],
     window: Window,
-) -> (Schema, ZSetBatch) {
+) -> (Arc<Schema>, ZSetBatch) {
     let sort_keys: Vec<OrderLocator> = order_keys
         .iter()
-        .map(|k| OrderLocator::of(SchemaFacts::locate(&schema, k.col as usize), k))
+        .map(|k| OrderLocator::of(SchemaFacts::locate(schema.as_ref(), k.col as usize), k))
         .collect();
     finish_window(schema, batch, sort_keys, window)
 }
@@ -172,11 +181,11 @@ pub(crate) fn read_spec_finish(
 /// survives at most once; `full` is dropped right after). A boundary entry
 /// keeps its window-clipped multiplicity.
 fn finish_window(
-    schema: Schema,
+    schema: Arc<Schema>,
     full: ZSetBatch,
     mut sort_keys: Vec<OrderLocator>,
     Window { offset, limit }: Window,
-) -> (Schema, ZSetBatch) {
+) -> (Arc<Schema>, ZSetBatch) {
     let has_cut = limit.is_some() || offset > 0;
     if sort_keys.is_empty() && !has_cut {
         return (schema, full);
@@ -193,23 +202,20 @@ fn finish_window(
     let n = full.len();
     let mut perm: Vec<usize> = (0..n).collect();
     if !sort_keys.is_empty() {
-        // One region list for the whole sort: every comparison reads through it,
-        // and building it per comparison would dominate the compare itself.
-        let view = ZSetBatchView::new(&full, &schema);
         if has_cut {
-            push_identity_tiebreak(&mut sort_keys, &schema);
+            push_identity_tiebreak(&mut sort_keys, schema.as_ref());
             if let Some(l) = limit {
                 let k = offset.saturating_add(l).min(n);
                 if k == 0 {
                     perm.clear();
                 } else if k < n {
-                    perm.select_nth_unstable_by(k - 1, |&ra, &rb| cmp_rows(&view, &sort_keys, ra, rb));
+                    perm.select_nth_unstable_by(k - 1, |&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
                     perm.truncate(k);
                 }
             }
-            perm.sort_unstable_by(|&ra, &rb| cmp_rows(&view, &sort_keys, ra, rb));
+            perm.sort_unstable_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
         } else {
-            perm.sort_by(|&ra, &rb| cmp_rows(&view, &sort_keys, ra, rb));
+            perm.sort_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
         }
     }
 
@@ -217,13 +223,11 @@ fn finish_window(
     let hi = limit.map_or(u64::MAX, |l| off.saturating_add(l as u64));
     let ordered_weights: Vec<i64> = perm.iter().map(|&r| full.weights[r]).collect();
     let surviving_rows = paginate(&ordered_weights, off, hi);
-    let gather = RowGather::new(&schema);
     let mut gathered = ZSetBatch::with_capacity(&schema, surviving_rows.len());
     for (pos, surviving) in surviving_rows {
-        gather.copy(&full, perm[pos], &mut gathered);
-        // The gather copied the weight verbatim; overwrite with the
-        // window-clipped multiplicity (a boundary entry keeps a reduced one).
-        *gathered.weights.last_mut().unwrap() = surviving;
+        // Written at the window-clipped multiplicity (a boundary entry keeps a
+        // reduced one).
+        gathered.copy_row_at(&full, perm[pos], surviving);
     }
     (schema, gathered)
 }

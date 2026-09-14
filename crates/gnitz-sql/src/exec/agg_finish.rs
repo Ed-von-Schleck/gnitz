@@ -29,7 +29,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_core::{push_zero_cell, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, ZSetBatchView};
+use gnitz_core::{ColumnDef, PayloadColumn, PkColumn, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, Evaluator, ExprResults, SchemaFacts};
 use gnitz_wire::{AggFunc as WireAggFunc, ComputeMap};
 
@@ -199,12 +199,8 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
                 g
             }
         };
-        for (k, (acc, loc)) in accs[g * n_aggs..(g + 1) * n_aggs]
-            .iter_mut()
-            .zip(&locs[1 + n_group..])
-            .enumerate()
-        {
-            combine(acc, partial, loc, 1 + n_group + k, row, w);
+        for (acc, loc) in accs[g * n_aggs..(g + 1) * n_aggs].iter_mut().zip(&locs[1 + n_group..]) {
+            combine(acc, partial, loc, row, w);
         }
     }
 
@@ -221,21 +217,18 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
     //    it is bounded by the result the caller is about to sort and ship.
     let groups = fill_group_batch(spec, partial, &reps, &accs);
 
-    // 4. HAVING, then 5. finalize — both over **one** view: building one
-    //    allocates a region list.
-    let view = ZSetBatchView::new(&groups, &spec.partial_schema);
-
+    // 4. HAVING, then 5. finalize.
     // One batch, one drive — so the truth rule is the engine filter's own
     // (`bool_bits & !null_bits`). Without a HAVING every group is one range.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     match spec.having.as_ref() {
         None => ranges.push((0, groups.len())),
-        Some(ev) => ev.filter_ranges(&view, &mut ranges),
+        Some(ev) => ev.filter_ranges(&groups, &mut ranges),
     }
 
     // Zero surviving groups needs no guard: the range list is then empty and the
     // row loop never runs.
-    project_groups(spec, &view, &ranges)
+    project_groups(spec, &groups, &ranges)
 }
 
 /// One row per group in the partial-reply layout — the client's reduce output:
@@ -265,17 +258,16 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
     // `payload_columns` yields the payload slot as its enumeration ordinal, so
     // `pi` is also the column's position in this layout: slots `0..n_group` are
     // the group columns, the rest the agg partials.
-    for (pi, ci, col) in schema.payload_columns() {
-        let tc = col.type_code;
+    for (pi, ci, _) in schema.payload_columns() {
         if pi < n_group {
             // A group column keeps its source type, so its cell is copied whole.
             let loc = SchemaFacts::locate(schema, ci);
             for (g, &rep) in reps.iter().enumerate() {
                 let rep = rep.expect("a grouped result always has a representative row");
                 if loc.is_null_word(partial.nulls[rep]) {
-                    push_null_cell(&mut dst.columns[ci], &mut dst.nulls[g], tc, pi);
+                    push_null_cell(&mut dst.payload[pi], &mut dst.nulls[g], pi);
                 } else {
-                    dst.push_cell_from(ci, partial, ci, tc, rep);
+                    dst.push_cell_from(pi, partial, pi, rep);
                 }
             }
         } else {
@@ -283,7 +275,7 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
             // a time), so this column's cells are `n_aggs` apart.
             let k = pi - n_group;
             for g in 0..n {
-                push_acc_cell(&mut dst, ci, pi, g, &accs[g * n_aggs + k], partial, tc);
+                push_acc_cell(&mut dst, pi, g, &accs[g * n_aggs + k], partial);
             }
         }
     }
@@ -300,9 +292,9 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
 
 /// Append a NULL cell to `col` and record it at payload slot `pi` in `word` —
 /// the one place the null bitmap and the pushed filler bytes are kept in step.
-fn push_null_cell(col: &mut Vec<u8>, word: &mut u64, tc: TypeCode, pi: usize) {
+fn push_null_cell(col: &mut PayloadColumn, word: &mut u64, pi: usize) {
     gnitz_wire::null_word_set(word, pi, true);
-    push_zero_cell(col, tc);
+    col.push_zero();
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +307,11 @@ fn push_null_cell(col: &mut Vec<u8>, word: &mut u64, tc: TypeCode, pi: usize) {
 /// adjacent columns from aliasing) and allocation-free per row.
 ///
 /// `cols` is the group columns' locators in layout order, so `cols[g]` addresses
-/// column `1 + g`; a `Fixed` cell's stride is that locator's own size.
+/// column `1 + g`.
 fn group_key(partial: &ZSetBatch, cols: &[ColumnLocator], row: usize, key: &mut Vec<u8>) {
     key.clear();
     let null_word = partial.nulls[row];
-    for (g, loc) in cols.iter().enumerate() {
+    for loc in cols {
         if loc.is_null_word(null_word) {
             key.push(0);
             continue;
@@ -329,8 +321,7 @@ fn group_key(partial: &ZSetBatch, cols: &[ColumnLocator], row: usize, key: &mut 
             key.extend_from_slice(&(b.len() as u32).to_le_bytes());
             key.extend_from_slice(b);
         };
-        let s = loc.size();
-        let cell = &partial.columns[1 + g][row * s..(row + 1) * s];
+        let cell = loc.bytes(partial, row);
         if gnitz_wire::is_german_string(loc.type_code()) {
             put(gnitz_wire::german_string_content(cell, &partial.blob));
         } else {
@@ -339,7 +330,7 @@ fn group_key(partial: &ZSetBatch, cols: &[ColumnLocator], row: usize, key: &mut 
     }
 }
 
-fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, ci: usize, row: usize, w: i64) {
+fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, row: usize, w: i64) {
     if loc.is_null_word(partial.nulls[row]) {
         return; // NULL partials skip (COUNT/COUNT_NON_NULL partials are never null)
     }
@@ -348,16 +339,16 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, ci: usize
         // pattern is the true sum mod 2^64 — the same i64 accumulator the
         // engine folds).
         ColAcc::IntSum { bits, seen } => {
-            *bits = bits.wrapping_add(w.wrapping_mul(i64::from_le_bytes(read_le8(partial, ci, row))));
+            *bits = bits.wrapping_add(w.wrapping_mul(i64::from_le_bytes(read_le8(partial, loc, row))));
             *seen = true;
         }
         ColAcc::FloatSum { val, seen } => {
-            *val += (w as f64) * f64::from_le_bytes(read_le8(partial, ci, row));
+            *val += (w as f64) * f64::from_le_bytes(read_le8(partial, loc, row));
             *seen = true;
         }
         ColAcc::Extreme { best, is_max } => {
             let wanted = if *is_max { Ordering::Greater } else { Ordering::Less };
-            let cell = |row| fixed_slice(partial, ci, row, loc.size());
+            let cell = |row| loc.bytes(partial, row);
             // Both operands live in the same batch, so one blob heap backs both
             // sides of a German-string comparison.
             let replace = best.is_none_or(|b| {
@@ -370,30 +361,24 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, ci: usize
     }
 }
 
-fn fixed_slice(partial: &ZSetBatch, ci: usize, row: usize, stride: usize) -> &[u8] {
-    partial
-        .cell(ci, row, stride)
-        .expect("ad-hoc agg partial column is fixed-width and in range")
-}
-
 /// One 8-byte partial-aggregate cell; the caller picks how to read it.
-fn read_le8(partial: &ZSetBatch, ci: usize, row: usize) -> [u8; 8] {
-    fixed_slice(partial, ci, row, 8).try_into().unwrap()
+fn read_le8(partial: &ZSetBatch, loc: &ColumnLocator, row: usize) -> [u8; 8] {
+    loc.bytes(partial, row).try_into().unwrap()
 }
 
-/// Append group `g`'s cell for `acc` to column `ci`. An accumulator nothing
-/// contributed to is the global ground row, or an all-NULL group.
-fn push_acc_cell(dst: &mut ZSetBatch, ci: usize, pi: usize, g: usize, acc: &ColAcc, partial: &ZSetBatch, tc: TypeCode) {
+/// Append group `g`'s cell for `acc` to payload slot `pi`. An accumulator
+/// nothing contributed to is the global ground row, or an all-NULL group.
+fn push_acc_cell(dst: &mut ZSetBatch, pi: usize, g: usize, acc: &ColAcc, partial: &ZSetBatch) {
     match *acc {
         ColAcc::IntSum { seen: false, .. }
         | ColAcc::FloatSum { seen: false, .. }
-        | ColAcc::Extreme { best: None, .. } => push_null_cell(&mut dst.columns[ci], &mut dst.nulls[g], tc, pi),
-        ColAcc::IntSum { bits, .. } => push_fixed_bits(&mut dst.columns[ci], bits as u64, tc.wire_stride()),
-        ColAcc::FloatSum { val, .. } => push_fixed_bits(&mut dst.columns[ci], val.to_bits(), tc.wire_stride()),
+        | ColAcc::Extreme { best: None, .. } => push_null_cell(&mut dst.payload[pi], &mut dst.nulls[g], pi),
+        ColAcc::IntSum { bits, .. } => push_fixed_bits(&mut dst.payload[pi], bits as u64),
+        ColAcc::FloatSum { val, .. } => push_fixed_bits(&mut dst.payload[pi], val.to_bits()),
         // The partial column and this one are the same column of the same
         // schema, so the winner is copied exactly as a group column is — blob
         // relocation included.
-        ColAcc::Extreme { best: Some(row), .. } => dst.push_cell_from(ci, partial, ci, tc, row),
+        ColAcc::Extreme { best: Some(row), .. } => dst.push_cell_from(pi, partial, pi, row),
     }
 }
 
@@ -443,18 +428,16 @@ fn push_group_key(dst: &mut PkColumn, schema: &Schema, partial: &ZSetBatch, rep:
 /// loop, where a per-row drive would pay `eval_batch`'s prologue per group.
 /// The row loop is infallible, so nothing observable moves with the drive.
 struct Finalized {
-    /// Output column index, dense payload slot, and declared type.
-    ci: usize,
+    /// Output dense payload slot.
     pi: usize,
-    tc: TypeCode,
     values: FinalValues,
 }
 
 enum FinalValues {
-    /// Column `partial_ci` of the group batch, with the locator its NULL bit is
-    /// read through.
+    /// Payload slot `partial_pi` of the group batch, with the locator its NULL
+    /// bit is read through.
     PassThrough {
-        partial_ci: usize,
+        partial_pi: usize,
         loc: ColumnLocator,
     },
     Computed(ExprResults),
@@ -463,28 +446,23 @@ enum FinalValues {
 /// Project the surviving groups through the finalize items — the client's
 /// post-reduce MAP. Each group keeps the `_group_pk` it was combined under.
 ///
-/// `view` is the caller's one view of the group batch; the batch itself is
-/// reached back through it, so no second region list is built here.
-fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, usize)]) -> ZSetBatch {
-    let groups = view.batch();
+fn project_groups(spec: &FoldShape, groups: &ZSetBatch, ranges: &[(usize, usize)]) -> ZSetBatch {
     let n_out: usize = ranges.iter().map(|(s, e)| e - s).sum();
     let mut out = ZSetBatch::with_capacity(&spec.out_schema, n_out);
     // Output column 0 is the hidden PK, so finalize item `si` lands at `si + 1`:
-    // its dense payload slot and type are resolved once here, not once per group.
+    // its dense payload slot is resolved once here, not once per group.
     let items: Vec<Finalized> = spec
         .finalize
         .iter()
         .enumerate()
         .map(|(si, item)| Finalized {
-            ci: 1 + si,
             pi: spec.out_schema.payload_idx(1 + si),
-            tc: spec.out_schema.columns[1 + si].type_code,
             values: match item {
                 FinalizeItem::PassThrough { partial_ci } => FinalValues::PassThrough {
-                    partial_ci: *partial_ci,
+                    partial_pi: spec.partial_schema.payload_idx(*partial_ci),
                     loc: SchemaFacts::locate(spec.partial_schema.as_ref(), *partial_ci),
                 },
-                FinalizeItem::Computed { ev } => FinalValues::Computed(ev.eval_all(view)),
+                FinalizeItem::Computed { ev } => FinalValues::Computed(ev.eval_all(groups)),
             },
         })
         .collect();
@@ -496,22 +474,22 @@ fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, 
             let mut null_word: u64 = 0;
             for item in &items {
                 match &item.values {
-                    FinalValues::PassThrough { partial_ci, loc } => {
+                    FinalValues::PassThrough { partial_pi, loc } => {
                         if loc.is_null_word(groups.nulls[g]) {
-                            push_null_cell(&mut out.columns[item.ci], &mut null_word, item.tc, item.pi);
+                            push_null_cell(&mut out.payload[item.pi], &mut null_word, item.pi);
                         } else {
-                            out.push_cell_from(item.ci, groups, *partial_ci, item.tc, g);
+                            out.push_cell_from(item.pi, groups, *partial_pi, g);
                         }
                     }
                     FinalValues::Computed(ExprResults::Scalar(vals)) => match vals[g] {
-                        None => push_null_cell(&mut out.columns[item.ci], &mut null_word, item.tc, item.pi),
-                        Some(v) => push_fixed_bits(&mut out.columns[item.ci], v as u64, item.tc.wire_stride()),
+                        None => push_null_cell(&mut out.payload[item.pi], &mut null_word, item.pi),
+                        Some(v) => push_fixed_bits(&mut out.payload[item.pi], v as u64),
                     },
                     FinalValues::Computed(ExprResults::Str { bytes, spans }) => match spans[g] {
-                        None => push_null_cell(&mut out.columns[item.ci], &mut null_word, item.tc, item.pi),
+                        None => push_null_cell(&mut out.payload[item.pi], &mut null_word, item.pi),
                         Some((o, l)) => {
                             let cell = gnitz_wire::encode_german_string(&bytes[o..o + l], &mut out.blob);
-                            out.columns[item.ci].extend_from_slice(&cell);
+                            out.payload[item.pi].bytes.extend_from_slice(&cell);
                         }
                     },
                 }
@@ -522,11 +500,12 @@ fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, 
     out
 }
 
-/// Push the low `stride` bytes of `bits` into a Fixed output column — the
+/// Push the low `col.stride()` bytes of `bits` into a Fixed output column — the
 /// results that *are* a register image: an accumulated SUM / COUNT
 /// (`agg_output_type` keeps both ≤ 8 bytes) and the evaluator's own register.
-fn push_fixed_bits(col: &mut Vec<u8>, bits: u64, stride: usize) {
-    col.extend_from_slice(&bits.to_le_bytes()[..stride]);
+fn push_fixed_bits(col: &mut PayloadColumn, bits: u64) {
+    let stride = col.stride();
+    col.bytes.extend_from_slice(&bits.to_le_bytes()[..stride]);
 }
 
 #[cfg(test)]

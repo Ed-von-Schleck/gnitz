@@ -2,7 +2,7 @@
 
 What is async here is the transport: submit-on-call, pipelining, reply
 correlation across mixed verb kinds, error propagation out of a gather, and the
-loop's own costs. The decode is shared with the sync client (`triple_to_lazy`),
+loop's own costs. The decode is shared with the sync client (`scan_result`),
 so a value- or row-level claim belongs to the coordinate that owns it —
 `mutation_pattern`, `value_domain`, `read_verb` — not here.
 """

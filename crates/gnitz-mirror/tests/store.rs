@@ -93,7 +93,7 @@ fn registered(name: &str) -> (Mirror, String) {
 /// mangled pass unnoticed — the keys and their weights would still line up.
 fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
     let batch = store.scan(tid, &view_schema()).expect("a scan of a held copy");
-    let vals = &batch.columns[1];
+    let vals = &batch.payload[0].bytes;
     let mut out = BTreeMap::new();
     for row in 0..batch.weights.len() {
         let pk = batch.pks.get(&view_schema(), row) as u64;

@@ -42,18 +42,10 @@ fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
     b.build(Some(cond)).expect("a well-formed program").to_blob_bytes()
 }
 
-/// No payload data crossed the wire. `ZSetBatch::new` keeps one `columns` slot
-/// per *schema* column, so a PK-only reply still has `pk_count()` of them — every
-/// one an empty placeholder, and there is no blob heap behind them because the
-/// zero-instruction program relocates nothing.
+/// No payload data crossed the wire: the reply has no payload slot, and there is
+/// no blob heap behind it because the zero-instruction program relocates nothing.
 fn assert_no_payload(reply: &ZSetBatch, reply_schema: &Schema) {
-    assert_eq!(reply.columns.len(), reply_schema.pk_cols.len());
-    for (i, c) in reply.columns.iter().enumerate() {
-        assert!(
-            c.is_empty(),
-            "PK slot {i} of a PK-only reply must stay an empty placeholder"
-        );
-    }
+    assert!(reply.payload.is_empty());
     reply
         .validate(reply_schema)
         .expect("the reply validates under its schema");
@@ -105,8 +97,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     let spec = ReadSpec::encode_parts(&ReadBound::None, &gt_predicate(1, 150), &keys_only_sink());
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
-        .expect("a PK-only reply must not be rejected")
-        .expect("150 of 200 rows match");
+        .expect("a PK-only reply must not be rejected");
 
     // Weights reach the client unsummed: no top-k gate, one row per key.
     assert!(reply.weights.iter().all(|&w| w == 1), "per-row weights preserved");
@@ -162,8 +153,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     let spec = ReadSpec::encode_parts(&ReadBound::None, &gt_predicate(2, 15), &keys_only_sink());
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
-        .expect("a compound PK-only reply must not be rejected")
-        .expect("three rows match");
+        .expect("a compound PK-only reply must not be rejected");
 
     let mut got: Vec<Vec<u8>> = (0..reply.pks.len())
         .map(|i| reply.pks.get_tuple(i).pk_bytes().to_vec())
@@ -192,10 +182,9 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
             &ReadSpec::encode_parts(&ReadBound::None, &Vec::new(), &ReadSink::all_rows()),
             &schema,
         )
-        .unwrap()
-        .expect("the table is non-empty");
+        .unwrap();
     assert_eq!(
-        full.columns[1].len(),
+        full.payload[0].bytes.len(),
         rows.len() * 16,
         "the identity sink still returns the TEXT column",
     );

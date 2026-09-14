@@ -49,13 +49,13 @@ fn rows(start: i64, count: usize) -> ZSetBatch {
     for i in 0..count as i64 {
         a.extend_from_slice(&((start + i) * 3).to_le_bytes());
     }
-    ZSetBatch {
-        pks: PkColumn::from_natives(&local_schema(), (0..count as i64).map(|i| (start + i) as u128)),
-        weights: vec![1; count],
-        nulls: vec![0; count],
-        columns: vec![vec![], a],
-        blob: vec![],
-    }
+    let schema = local_schema();
+    let mut b = ZSetBatch::new(&schema);
+    b.pks = PkColumn::from_natives(&schema, (0..count as i64).map(|i| (start + i) as u128));
+    b.weights = vec![1; count];
+    b.nulls = vec![0; count];
+    b.payload[0].bytes = a;
+    b
 }
 
 /// The driver: park on `interest()`, step with what `poll` reported, drain
@@ -123,17 +123,15 @@ fn concurrent_pushes_and_scans(target: &str) {
             pushed += per;
             assert!(matches!(r, Reply::Lsn(_)), "a push completes as its ingest LSN");
         } else {
-            let Reply::Scan((_, data, _)) = r else { panic!("scan") };
-            let got = data.map_or(0, |b| b.len());
+            let Reply::Scan(data) = r else { panic!("scan") };
+            let got = data.batch.len();
             assert_eq!(got, pushed, "a scan sees every push submitted ahead of it");
         }
     }
     assert_eq!(s.interest(), Interest::NONE);
     // The blocking client and the driver agree on the table.
-    let (_, batch, _) = blocking.scan(tid).unwrap();
-    assert_eq!(batch.map_or(0, |b| b.len()), n * per);
-    let (_, row, _) = blocking.seek(tid, 7, &[]).unwrap();
-    assert!(row.is_some());
+    assert_eq!(blocking.scan(tid).unwrap().batch.len(), n * per);
+    assert_eq!(blocking.seek(tid, 7, &[]).unwrap().batch.len(), 1);
 }
 
 #[test]
@@ -183,10 +181,10 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     let scan = s.submit(Request::scan(tid)).unwrap();
     let (done, _) = drive_all(&mut s, 2);
     assert!(done[&abandoned].is_ok());
-    let Reply::Scan((_, data, _)) = done[&scan].as_ref().unwrap() else {
+    let Reply::Scan(data) = done[&scan].as_ref().unwrap() else {
         panic!("scan")
     };
-    assert_eq!(data.as_ref().map_or(0, |b| b.len()), 10);
+    assert_eq!(data.batch.len(), 10);
 
     // Now close with work pending.
     s.submit(Request::scan(tid)).unwrap();

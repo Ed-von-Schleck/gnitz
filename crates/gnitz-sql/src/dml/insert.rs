@@ -17,13 +17,11 @@ use crate::dml::mutate::{
 use crate::dml::overlay::{effective_rows, Conflict};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
-use crate::exec::batch::{project, resolve_projection, RowGather};
+use crate::exec::batch::{project, resolve_projection};
 use crate::ir::{BExpr, BoundExpr};
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{
-    push_zero_cell, ColumnDef, GnitzClient, RelClass, Schema, WireConflictMode, ZSetBatch, ZSetBatchView,
-};
+use gnitz_core::{ColumnDef, GnitzClient, RelClass, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
     SetExpr, TableObject, Values,
@@ -270,7 +268,7 @@ pub(crate) fn execute_insert(
                 // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
                 // bit left unset), keeping the batch rectangular and the table on
                 // the FixedIntNonnull comparator. The value is unobservable (§6).
-                push_zero_cell(&mut batch.columns[ci], col_def.type_code);
+                batch.payload[payload_idx].push_zero();
                 continue;
             }
             // Read off the *bound* constant, so `+NULL` is the NULL it spells;
@@ -284,11 +282,11 @@ pub(crate) fn execute_insert(
             if is_null {
                 gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);
             }
-            let ZSetBatch { columns, blob, .. } = &mut batch;
+            let ZSetBatch { payload: cols, blob, .. } = &mut batch;
             match cell {
-                Some(c) => append_value_to_col(&mut columns[ci], blob, col_def.ty(), c)?,
+                Some(c) => append_value_to_col(&mut cols[payload_idx].bytes, blob, col_def.ty(), c)?,
                 // `append_value_to_col` encodes a written NULL as exactly this.
-                None => push_zero_cell(&mut columns[ci], col_def.type_code),
+                None => cols[payload_idx].push_zero(),
             }
         }
         batch.nulls.push(null_bits);
@@ -317,8 +315,11 @@ pub(crate) fn execute_insert(
             match proj {
                 Some(proj) => {
                     client.push_with_mode(tid, schema, &batch, mode)?;
-                    let (proj_schema, proj_batch) = project(proj, schema, Some(batch));
-                    Ok(SqlResult::Rows { schema: proj_schema, batch: proj_batch })
+                    let (proj_schema, proj_batch) = project(proj, schema, batch);
+                    Ok(SqlResult::Rows {
+                        schema: Arc::new(proj_schema),
+                        batch: proj_batch,
+                    })
                 }
                 None => {
                     client.push_owned(tid, schema, batch, mode)?;
@@ -433,11 +434,10 @@ fn client_side_filter_do_nothing(
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let (_, verdicts) = effective_rows(client, tid, schema, &batch.pks)?;
     let mut out = ZSetBatch::with_capacity(schema, verdicts.len());
-    let gather = RowGather::new(schema);
     for (i, verdict) in verdicts.iter().enumerate() {
         // `Repeat` and `Existing` alike mean the PK is already claimed.
         if matches!(verdict, Conflict::Fresh) {
-            gather.copy(batch, i, &mut out);
+            out.copy_row_at(batch, i, batch.weights[i]);
         }
     }
     Ok(out)
@@ -459,20 +459,15 @@ fn client_side_merge_do_update(
     let (rows, verdicts) = effective_rows(client, tid, schema, &batch.pks)?;
 
     let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
-    let gather = RowGather::new(schema);
 
-    // Built once each: the resolved rows are one batch, so the `existing` view
-    // need not be rebuilt per row.
-    let excluded_view = ZSetBatchView::new(batch, schema);
-    let existing_view = ZSetBatchView::new(&rows, schema);
-    // Each RHS is bound to its own scope's view here, which drives every
+    // Each RHS is bound to its own scope's batch here, which drives every
     // computed one over that whole batch once; the row loop below then reads a
     // buffer instead of paying a single-row drive's prologue per conflict.
     let bound: Vec<SetValues<'_>> = assignments
         .iter()
         .map(|(_, p, scope)| match scope {
-            Scope::Existing => bind_set_program(p, &existing_view),
-            Scope::Excluded => bind_set_program(p, &excluded_view),
+            Scope::Existing => bind_set_program(p, &rows),
+            Scope::Excluded => bind_set_program(p, batch),
         })
         .collect();
     // Pre-index assignments by column for O(cols) lookup per row.
@@ -490,7 +485,7 @@ fn client_side_merge_do_update(
                         .to_string(),
                 ));
             }
-            Conflict::Fresh => gather.copy(batch, i, &mut out),
+            Conflict::Fresh => out.copy_row_at(batch, i, batch.weights[i]),
             // The stored row is `row` of the resolved batch; the incoming row is
             // row `i` of the VALUES batch.
             Conflict::Existing(row) => {

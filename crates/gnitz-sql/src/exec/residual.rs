@@ -46,12 +46,9 @@ pub(crate) fn matching_indices(
     let Some(ev) = compile_conjuncts_evaluator(preds.iter().copied(), schema)? else {
         return Ok((0..n).collect());
     };
-    // One view over the whole batch: building one allocates a region list, which
-    // a per-row view would pay per row. The row count comes from the view, so
-    // the drive cannot run past the batch's end.
-    let view = gnitz_core::ZSetBatchView::new(batch, schema);
+    // The row count comes from the batch, so the drive cannot run past its end.
     let mut ranges = Vec::new();
-    ev.filter_ranges(&view, &mut ranges);
+    ev.filter_ranges(batch, &mut ranges);
     // Ranges arrive in increasing order with `end` EXCLUSIVE, so `matched` keeps
     // the sorted-index contract its callers rely on.
     let mut matched = Vec::with_capacity(n);

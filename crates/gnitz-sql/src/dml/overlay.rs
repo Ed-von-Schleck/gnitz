@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 use crate::dml::plan::{fetch_bound, AccessPlan};
 use crate::error::GnitzSqlError;
-use crate::exec::batch::RowGather;
 use gnitz_core::{GnitzClient, PkBuf, PkColumn, Schema, ZSetBatch};
 use gnitz_wire::{PkKeys, ReadBound, ReadSink};
 use std::collections::{HashMap, HashSet};
@@ -61,7 +60,6 @@ pub(crate) fn effective_rows(
     schema: &Arc<Schema>,
     pks: &PkColumn,
 ) -> Result<(ZSetBatch, Vec<Conflict>), GnitzSqlError> {
-    let gather = RowGather::new(schema);
     let mut out = ZSetBatch::with_capacity(schema, pks.len());
     let mut verdicts: Vec<Conflict> = Vec::with_capacity(pks.len());
     // Flat OPK bytes, one key per `pk_stride`.
@@ -79,7 +77,7 @@ pub(crate) fn effective_rows(
             match buf.as_ref().and_then(|b| b.last_op(key)).map(|(b, r)| op_of(b, r)) {
                 Some(Buffered::Present(batch, row)) => {
                     verdicts.push(Conflict::Existing(out.len()));
-                    gather.copy(batch, row, &mut out);
+                    out.copy_row_at(batch, row, batch.weights[row]);
                 }
                 // A buffered delete is absent whatever the store holds.
                 Some(Buffered::Deleted) => verdicts.push(Conflict::Fresh),
@@ -94,7 +92,7 @@ pub(crate) fn effective_rows(
         let committed = fetch_committed(client, tid, schema, &undecided)?;
         let base = out.len();
         for i in 0..committed.len() {
-            gather.copy(&committed, i, &mut out);
+            out.copy_row_at(&committed, i, committed.weights[i]);
         }
         let found: HashMap<&[u8], usize> = (0..committed.len())
             .map(|i| (committed.pks.get_bytes(i), base + i))
@@ -148,16 +146,11 @@ pub(crate) fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, keys: Opti
 /// under `schema` as one batch. These are the rows no server-side walk ever saw,
 /// so they are the only ones a DML verb re-filters client-side.
 ///
-/// Copies under `schema` — a buffered batch is layout-identical to it, because
-/// DDL is barred inside a transaction, so both carry the same full physical
-/// schema (a DROP COLUMN'd base table has a hidden slot, but it is zero-filled
-/// NOT NULL on both sides — identical bytes).
 pub(crate) fn present_rows(net: &Net, schema: &Schema) -> ZSetBatch {
     let mut out = ZSetBatch::with_capacity(schema, net.len());
-    let gather = RowGather::new(schema);
     for op in net.values() {
         if let Buffered::Present(batch, row) = op {
-            gather.copy(batch, *row, &mut out);
+            out.copy_row_at(batch, *row, batch.weights[*row]);
         }
     }
     out

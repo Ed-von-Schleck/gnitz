@@ -5,6 +5,7 @@ use crate::test_support::{col_def, parse_query};
 use gnitz_core::TypeCode;
 use gnitz_expr::ColumnLocator;
 use sqlparser::ast::{Expr, OrderBy, SelectItem, SetExpr};
+use std::sync::Arc;
 
 // The per-type window comparison itself (`cmp_typed_le`) is pinned by
 // gnitz-wire's own tests; the tests here cover the sink built on it.
@@ -73,9 +74,9 @@ fn push_kv(b: &mut ZSetBatch, pk: u64, v: Option<i64>, s: Option<&str>, weight: 
         null_word |= 1 << 1; // payload idx 1 = s
     }
     b.nulls.push(null_word);
-    b.columns[1].extend_from_slice(&v.unwrap_or(0).to_le_bytes());
+    b.payload[0].bytes.extend_from_slice(&v.unwrap_or(0).to_le_bytes());
     let cell = gnitz_wire::encode_german_string(s.unwrap_or("").as_bytes(), &mut b.blob);
-    b.columns[2].extend_from_slice(&cell);
+    b.payload[1].bytes.extend_from_slice(&cell);
 }
 
 /// The two halves the fold tail runs, composed: resolve the ORDER BY over the
@@ -97,7 +98,8 @@ fn passthrough(
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     let keys = wire_order(&parsed, &schema, &placed, 0)?;
-    Ok(read_spec_finish(schema, batch, &keys, Window { offset, limit }))
+    let (schema, batch) = read_spec_finish(Arc::new(schema), batch, &keys, Window { offset, limit });
+    Ok((Arc::unwrap_or_clone(schema), batch))
 }
 
 /// Test-only sort → window → project: the production sinks window an
@@ -115,7 +117,7 @@ fn order_limit_project(
     let resolved = resolve_projection(projection, actual_schema, "t")?;
     let full = full_batch.unwrap_or_else(|| ZSetBatch::new(actual_schema));
     let (_, windowed) = passthrough(actual_schema.clone(), full, order_by, offset, limit)?;
-    Ok(project(resolved, actual_schema, Some(windowed)))
+    Ok(project(resolved, actual_schema, windowed))
 }
 
 /// Run the sink for `sql` over `batch`, returning the ordered `(id, v)` pairs.
@@ -145,7 +147,7 @@ fn run(sql: &str, schema: &Schema, batch: ZSetBatch) -> Result<Vec<(u64, Option<
             if gnitz_wire::null_word_get(out.nulls[i], out_schema.payload_idx(ci)) {
                 None
             } else {
-                let buf = &out.columns[ci];
+                let buf = &out.payload[out_schema.payload_idx(ci)].bytes;
                 Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
             }
         });
@@ -186,7 +188,7 @@ fn sink_order_by_alias_and_positional() {
         b.weights.push(1);
         b.nulls.push(0);
         {
-            let buf = &mut b.columns[1];
+            let buf = &mut b.payload[0].bytes;
             buf.extend_from_slice(&v.to_le_bytes());
         }
     };
@@ -275,7 +277,7 @@ fn expand_kv(schema: &Schema, out: &ZSetBatch) -> Vec<(u64, Option<i64>)> {
         let v = if gnitz_wire::null_word_get(out.nulls[i], schema.payload_idx(v_ci)) {
             None
         } else {
-            let buf = &out.columns[v_ci];
+            let buf = &out.payload[schema.payload_idx(v_ci)].bytes;
             Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
         };
         for _ in 0..out.weights[i] {
@@ -345,11 +347,11 @@ fn sink_positional_over_hidden_view_schema() {
         b.weights.push(1);
         b.nulls.push(0);
         {
-            let buf = &mut b.columns[1];
+            let buf = &mut b.payload[0].bytes;
             buf.extend_from_slice(&city.to_le_bytes());
         }
         {
-            let buf = &mut b.columns[2];
+            let buf = &mut b.payload[1].bytes;
             buf.extend_from_slice(&cnt.to_le_bytes());
         }
     };
@@ -369,7 +371,7 @@ fn sink_positional_over_hidden_view_schema() {
     let city_ci = out_schema.columns.iter().position(|c| c.name == "city").unwrap();
     let cities: Vec<u64> = (0..out.len())
         .map(|i| {
-            let buf = &out.columns[city_ci];
+            let buf = &out.payload[out_schema.payload_idx(city_ci)].bytes;
             u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap())
         })
         .collect();
@@ -390,7 +392,7 @@ fn sink_null_detected_via_bitmap_in_u128_column() {
         b.weights.push(1);
         b.nulls.push(if u.is_none() { 1 } else { 0 });
         {
-            let v = &mut b.columns[1];
+            let v = &mut b.payload[0].bytes;
             v.extend_from_slice(&u.unwrap_or(0).to_le_bytes());
         }
     };
@@ -433,7 +435,7 @@ fn sink_compound_pk_key_orders_by_typed_value() {
         b.weights.push(1);
         b.nulls.push(1); // w NULL (payload idx 0)
         {
-            let buf = &mut b.columns[2];
+            let buf = &mut b.payload[0].bytes;
             buf.extend_from_slice(&0i64.to_le_bytes());
         }
     };
@@ -456,7 +458,7 @@ fn sink_compound_pk_key_orders_by_typed_value() {
     };
     let bs: Vec<i16> = (0..out.len())
         .map(|i| {
-            let w = out.pks.col_window(i, byte_off as usize, size as usize);
+            let w = &out.pks.get_bytes(i)[byte_off as usize..(byte_off + size) as usize];
             let native = gnitz_wire::decode_pk_column_owned(w, type_code);
             i16::from_le_bytes(native[..2].try_into().unwrap())
         })

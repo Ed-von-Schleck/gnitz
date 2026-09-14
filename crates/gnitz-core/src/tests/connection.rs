@@ -66,6 +66,11 @@ mod spine_tests {
     use crate::protocol::transport::poll_fd;
     use crate::protocol::{BatchAppender, ColumnDef, Header, TypeCode};
     use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
+
+    /// The version a request for `tid` would stamp now; `0` = nothing cached.
+    fn stamped(s: &mut Session, tid: u64) -> u16 {
+        s.cached_hint(tid).map_or(0, |h| h.1)
+    }
     use std::os::fd::OwnedFd;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -208,13 +213,11 @@ mod spine_tests {
         assert_eq!(done.len(), 1);
         let (id, reply) = done.pop().unwrap();
         assert_eq!(id, slot);
-        let Reply::Scan((schema, data, _)) = reply.unwrap() else {
-            panic!("scan")
-        };
-        assert_eq!(data.unwrap().pks.to_vec_u128(&schema_a()), vec![1, 2, 3, 4, 5]);
-        assert!(schema.is_some(), "the block the train carried");
+        let Reply::Scan(r) = reply.unwrap() else { panic!("scan") };
+        assert_eq!(r.batch.pks.to_vec_u128(&schema_a()), vec![1, 2, 3, 4, 5]);
+        assert_eq!(*r.schema, schema_a(), "the block the train carried");
         // Absorbed into the cache under version 3.
-        assert_eq!(s.cached_schema_version(7), 3);
+        assert_eq!(stamped(&mut s, 7), 3);
         assert!(s.step(Interest::READ).unwrap().is_empty());
         assert_eq!(s.interest(), Interest::NONE);
     }
@@ -240,13 +243,14 @@ mod spine_tests {
             panic!("multi")
         };
         assert_eq!(replies.len(), 2);
-        let d0 = replies[0].1.as_ref().unwrap();
-        assert_eq!(d0.columns.len(), 2);
+        let d0 = &replies[0].batch;
+        assert_eq!(d0.payload.len(), 1);
         assert_eq!(d0.pks.to_vec_u128(&sa), vec![10, 11]);
-        let d1 = replies[1].1.as_ref().unwrap();
-        assert_eq!(d1.columns.len(), 3);
+        let d1 = &replies[1].batch;
+        assert_eq!(d1.payload.len(), 2);
         assert_eq!(d1.pks.to_vec_u128(&sb), vec![20, 21]);
-        let strs: Vec<&[u8]> = d1.columns[1]
+        let strs: Vec<&[u8]> = d1.payload[0]
+            .bytes
             .as_chunks::<16>()
             .0
             .iter()
@@ -254,9 +258,40 @@ mod spine_tests {
             .collect();
         assert_eq!(strs, [b"s20".as_slice(), b"s21".as_slice()]);
         // Each reply carries its own relation's schema, resolved off the cache.
-        assert_eq!(replies[0].0.as_ref().unwrap().columns.len(), 2);
-        assert_eq!(replies[1].0.as_ref().unwrap().columns.len(), 3);
+        assert_eq!(replies[0].schema.columns.len(), 2);
+        assert_eq!(replies[1].schema.columns.len(), 3);
         assert_eq!(s.interest(), Interest::NONE);
+    }
+
+    /// A warm read decodes under the hint its request was stamped with, even when
+    /// the cache entry is evicted before its reply arrives: 64 other relations'
+    /// schema blocks are absorbed between the submit and the reply.
+    #[test]
+    fn a_warm_read_decodes_under_its_stamped_hint_after_eviction() {
+        let (mut s, peer) = pair();
+        let sa = schema_a();
+        let t = 1000;
+        warm(&mut s, &peer, t, 7, &sa);
+
+        let others: Vec<u64> = (1..=64).collect();
+        for &k in &others {
+            s.submit(Request::scan(k)).unwrap();
+        }
+        let slot = s.submit(Request::scan(t)).unwrap();
+        s.step(Interest::WRITE).unwrap();
+        for _ in 0..=others.len() {
+            peer.drain_request();
+        }
+        let empty = ZSetBatch::new(&sa);
+        for &k in &others {
+            peer.send(&reply_cold(k, 1, &sa, &empty, 0, false));
+        }
+        peer.send(&reply_warm(t, 7, &sa, &batch_a(&[5, 6]), false));
+        let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
+            panic!("scan")
+        };
+        assert_eq!(r.batch.pks.to_vec_u128(&sa), vec![5, 6]);
+        assert_eq!(stamped(&mut s, t), 0, "the entry was evicted before the reply");
     }
 
     #[test]
@@ -278,10 +313,10 @@ mod spine_tests {
         s.step(Interest::WRITE).unwrap();
         peer.drain_request();
         peer.send(&reply_cold(3, 1, &sa, &batch_a(&[5]), 42, false));
-        let Reply::Scan((_, _, lsn)) = drive(&mut s, slot).unwrap() else {
+        let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
             panic!("scan")
         };
-        assert_eq!(lsn, 42);
+        assert_eq!(r.lsn, Some(42));
     }
 
     #[test]
@@ -292,17 +327,16 @@ mod spine_tests {
         s.step(Interest::WRITE).unwrap();
         peer.drain_request();
         peer.drain_request();
-        let mut both = framed(&reply_ctrl(1, 11));
-        both.extend(framed(&reply_ctrl(2, 22)));
+        let empty = ZSetBatch::new(&schema_a());
+        let mut both = framed(&reply_cold(1, 1, &schema_a(), &empty, 11, false));
+        both.extend(framed(&reply_cold(2, 1, &schema_a(), &empty, 22, false)));
         raw_send(&peer.0, &both);
         let done = s.step(Interest::READ).unwrap();
         let ids: Vec<SlotId> = done.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![s1, s2], "in request order");
         for (id, r) in done {
-            let Reply::Scan((_, _, lsn)) = r.unwrap() else {
-                panic!("scan")
-            };
-            assert_eq!(lsn, if id == s1 { 11 } else { 22 });
+            let Reply::Scan(r) = r.unwrap() else { panic!("scan") };
+            assert_eq!(r.lsn, Some(if id == s1 { 11 } else { 22 }));
         }
         assert_eq!(s.interest(), Interest::NONE);
     }
@@ -491,15 +525,15 @@ mod spine_tests {
         assert_eq!(s.interest(), Interest::READ, "the abandoned slot stays pending");
 
         // The peer answers both requests; the second call must get the second.
+        let empty = ZSetBatch::new(&schema_a());
         peer.drain_request();
-        peer.send(&reply_ctrl(1, 100));
+        peer.send(&reply_cold(1, 1, &schema_a(), &empty, 100, false));
         let h = std::thread::spawn(move || {
             peer.drain_request();
-            peer.send(&reply_ctrl(1, 200));
+            peer.send(&reply_cold(1, 1, &schema_a(), &empty, 200, false));
             peer
         });
-        let (_, _, lsn) = s.scan(1).unwrap();
-        assert_eq!(lsn, 200);
+        assert_eq!(s.scan(1).unwrap().lsn, Some(200));
         let _peer = h.join().unwrap();
         assert_eq!(s.interest(), Interest::NONE);
     }
@@ -534,7 +568,7 @@ mod spine_tests {
         let (b0, _) = crate::protocol::decode_wal_block(blocks[0].block(), &sa).unwrap();
         assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
         assert_eq!(terminal.target_id, 9);
-        assert_eq!(s.cached_schema_version(9), 0, "a scan_spec absorbs nothing");
+        assert_eq!(stamped(&mut s, 9), 0, "a scan_spec absorbs nothing");
     }
 
     #[test]
@@ -587,7 +621,7 @@ mod spine_tests {
         assert_eq!(id, a);
         assert!(matches!(r, Err(ClientError::SchemaMismatch)));
         assert!(!s.closed, "a per-slot error leaves the connection usable");
-        assert_eq!(s.cached_schema_version(4), 0, "the entry is gone");
+        assert_eq!(stamped(&mut s, 4), 0, "the entry is gone");
 
         // Submitted after the eviction: cold, longer by the schema block.
         let cold = push(&mut s);
@@ -614,7 +648,7 @@ mod spine_tests {
             panic!("push ACK")
         };
         assert_eq!(lsn, 999);
-        assert_eq!(s.cached_schema_version(4), 5);
+        assert_eq!(stamped(&mut s, 4), 5);
         push(&mut s);
         s.step(Interest::WRITE).unwrap();
         assert_eq!(peer.drain_request().len(), warm_len, "warm again");

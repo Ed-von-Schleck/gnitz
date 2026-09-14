@@ -2,7 +2,7 @@ use super::*;
 use crate::test_support::compound_schema_u64_u64;
 
 #[test]
-fn compound_pk_row_gather_preserves_compound_pk() {
+fn compound_pk_copy_row_at_preserves_compound_pk() {
     let schema = compound_schema_u64_u64();
     let mut src = ZSetBatch::new(&schema);
     let mut pk_bytes = [0u8; 16];
@@ -12,12 +12,12 @@ fn compound_pk_row_gather_preserves_compound_pk() {
     src.weights.push(1);
     src.nulls.push(0);
     {
-        let buf = &mut src.columns[2];
+        let buf = &mut src.payload[0].bytes;
         buf.extend_from_slice(&5i64.to_le_bytes());
     }
 
     let mut dst = ZSetBatch::new(&schema);
-    RowGather::new(&schema).copy(&src, 0, &mut dst);
+    dst.copy_row_at(&src, 0, src.weights[0]);
     assert_eq!(dst.pks.len(), 1);
     assert_eq!(dst.pks.region(), src.pks.region());
 }

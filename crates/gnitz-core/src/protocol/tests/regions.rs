@@ -1,6 +1,7 @@
 use super::*;
-use crate::protocol::types::{ColumnDef, PkColumn, TypeCode};
+use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
+use crate::test_support::payload_of;
 use gnitz_expr::{
     BatchView, CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, SchemaFacts,
 };
@@ -82,15 +83,16 @@ fn fixture_a_batch() -> ZSetBatch {
         // Row 1 nulls payload slot 1 (ci2); row 2 nulls slots 2 and 3
         // (ci4/ci5) — so the bitmap is not uniformly zero.
         nulls: vec![0, 0b10, 0b1100],
-        columns: vec![
-            vec![], // ci0: PK placeholder
-            c1,
-            c2,
-            vec![], // ci3: PK placeholder
-            german_col(&[Some(C4[0].as_bytes()), Some(C4[1].as_bytes()), None], &mut blob),
-            german_col(&[Some(C5[0]), Some(C5[1]), None], &mut blob),
-            C6.iter().flat_map(|v| v.to_le_bytes()).collect(),
-        ],
+        payload: payload_of(
+            &schema,
+            vec![
+                c1,
+                c2,
+                german_col(&[Some(C4[0].as_bytes()), Some(C4[1].as_bytes()), None], &mut blob),
+                german_col(&[Some(C5[0]), Some(C5[1]), None], &mut blob),
+                C6.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ],
+        ),
         blob,
     }
 }
@@ -132,7 +134,7 @@ fn fixture_b_batch() -> ZSetBatch {
         pks: PkColumn::from_natives(&fixture_b_schema(), B_PK.iter().map(|&x| x as u128)),
         weights: vec![1; 3],
         nulls: vec![0; 3],
-        columns: vec![vec![], v],
+        payload: payload_of(&fixture_b_schema(), vec![v]),
         blob: vec![],
     }
 }
@@ -149,14 +151,13 @@ fn a_pk_expect() -> [(Vec<u128>, u8, usize); 2] {
 }
 
 #[test]
-fn zsetbatchview_satisfies_the_region_per_row_contract() {
+fn zsetbatch_satisfies_the_region_per_row_contract() {
     let schema = fixture_a_schema();
     let batch = fixture_a_batch();
     {
-        let view = ZSetBatchView::new(&batch, &schema);
         let pk = a_pk_expect();
         gnitz_expr::assert_batchview_consistent(
-            &view,
+            &batch,
             3,
             &A_SLOTS,
             &[(pk[0].1, pk[0].2, &pk[0].0), (pk[1].1, pk[1].2, &pk[1].0)],
@@ -165,8 +166,7 @@ fn zsetbatchview_satisfies_the_region_per_row_contract() {
     // A residual can legitimately get an empty batch: every region length
     // must degrade to 0.
     let empty = ZSetBatch::new(&schema);
-    let view = ZSetBatchView::new(&empty, &schema);
-    gnitz_expr::assert_batchview_consistent(&view, 0, &A_SLOTS, &[]);
+    gnitz_expr::assert_batchview_consistent(&empty, 0, &A_SLOTS, &[]);
 }
 
 #[test]
@@ -177,7 +177,6 @@ fn locate_addresses_the_pk_region_the_builder_hands_out() {
     // PK-list walk fails here rather than reading a neighbouring column.
     let check =
         |schema: &Schema, batch: &ZSetBatch, rows: usize, cols: &[(usize, usize)], want: &[(usize, &[u128])]| {
-            let view = ZSetBatchView::new(batch, schema);
             let pk: Vec<gnitz_expr::PkColExpect<'_>> = want
                 .iter()
                 .map(|&(ci, vals)| match SchemaFacts::locate(schema, ci) {
@@ -185,7 +184,7 @@ fn locate_addresses_the_pk_region_the_builder_hands_out() {
                     other => panic!("column {ci} must locate to the PK region, got {other:?}"),
                 })
                 .collect();
-            gnitz_expr::assert_batchview_consistent(&view, rows, cols, &pk);
+            gnitz_expr::assert_batchview_consistent(batch, rows, cols, &pk);
         };
 
     let a_k0: Vec<u128> = PK3.iter().map(|&v| v as u128).collect();
@@ -208,7 +207,6 @@ fn locate_addresses_the_pk_region_the_builder_hands_out() {
 fn the_shared_evaluator_reads_a_client_batch() {
     let schema = fixture_a_schema();
     let batch = fixture_a_batch();
-    let view = ZSetBatchView::new(&batch, &schema);
 
     // ci3 is a PK column: `LoadColInt` accepts one (`ColKind::FixedIntCol` is
     // not payload-only) and lowers to `Instr::LoadPk`, so this exercises
@@ -230,7 +228,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
     .expect("program resolves against the client schema");
 
     for row in 0..3 {
-        let v = row_value(&ev, &view, row).expect("row {row} must not be null");
+        let v = row_value(&ev, &batch, row).expect("row {row} must not be null");
         assert_eq!(v, PK3[row] + C1[row] as i64, "row {row}");
         // The program names only non-nullable slots, so `no_nulls` is on.
     }
@@ -240,7 +238,6 @@ fn the_shared_evaluator_reads_a_client_batch() {
 fn nullable_payload_null_bits_reach_the_evaluator() {
     let schema = fixture_a_schema();
     let batch = fixture_a_batch();
-    let view = ZSetBatchView::new(&batch, &schema);
 
     // A different program from the one above: `analyze` tests only the
     // slots the instructions name, so naming ci2 (payload
@@ -261,16 +258,15 @@ fn nullable_payload_null_bits_reach_the_evaluator() {
     .resolve_scalar(&schema)
     .expect("program resolves against the client schema");
 
-    assert_eq!(row_value(&ev, &view, 0), Some(PK3[0] + C2[0]));
-    assert!(row_value(&ev, &view, 1).is_none(), "row 1 nulls the nullable column");
-    assert_eq!(row_value(&ev, &view, 2), Some(PK3[2] + C2[2]));
+    assert_eq!(row_value(&ev, &batch, 0), Some(PK3[0] + C2[0]));
+    assert!(row_value(&ev, &batch, 1).is_none(), "row 1 nulls the nullable column");
+    assert_eq!(row_value(&ev, &batch, 2), Some(PK3[2] + C2[2]));
 }
 
 #[test]
 fn filter_over_the_region_path() {
     let schema = fixture_a_schema();
     let batch = fixture_a_batch();
-    let view = ZSetBatchView::new(&batch, &schema);
 
     // ci2 > 0: row 0 passes (1000), row 1 is NULL (dropped by
     // `bool_bits & !null_bits`), row 2 fails (-3000).
@@ -287,7 +283,7 @@ fn filter_over_the_region_path() {
     .expect("predicate resolves against the client schema");
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    ev.filter_ranges(&view, &mut ranges);
+    ev.filter_ranges(&batch, &mut ranges);
     assert_eq!(ranges, vec![(0, 1)]);
 }
 
@@ -295,7 +291,6 @@ fn filter_over_the_region_path() {
 fn string_columns_compare_through_the_shared_blob_heap() {
     let schema = fixture_a_schema();
     let batch = fixture_a_batch();
-    let view = ZSetBatchView::new(&batch, &schema);
 
     // STRING (ci4) vs BLOB (ci5): both pass `check_col(GermanString)`.
     let ev = LogicalProgram::new(
@@ -311,20 +306,19 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     // bytes (and come out equal, not less-than).
     for row in 0..2 {
         let want = (C4[row].as_bytes() < C5[row]) as i64;
-        assert_eq!(row_value(&ev, &view, row), Some(want), "row {row}");
+        assert_eq!(row_value(&ev, &batch, row), Some(want), "row {row}");
     }
-    assert!(row_value(&ev, &view, 2).is_none(), "row 2 nulls both string columns");
+    assert!(row_value(&ev, &batch, 2).is_none(), "row 2 nulls both string columns");
 }
 
 #[test]
-#[should_panic(expected = "column 4: length")]
-fn the_region_list_rejects_a_column_whose_length_contradicts_the_schema() {
-    let schema = fixture_a_schema();
+#[should_panic(expected = "payload slot 2: length")]
+fn the_region_list_rejects_a_region_whose_length_contradicts_its_type() {
     let mut batch = fixture_a_batch();
     // The region list's own guard, for a batch that never went through
     // `ZSetBatch::validate` — which states the same rule for the push path.
-    batch.columns[4].truncate(16);
-    let _ = ZSetBatchView::new(&batch, &schema);
+    batch.payload[2].bytes.truncate(16);
+    let _ = regions(&batch);
 }
 
 // ── The encode path shares the builder ───────────────────────────────────
@@ -335,7 +329,7 @@ fn fixture_round_trips_through_encode_and_decode() {
         (fixture_a_schema(), fixture_a_batch(), 77u32),
         (fixture_b_schema(), fixture_b_batch(), 5u32),
     ] {
-        let encoded = encode_wal_block(&schema, tid, &batch);
+        let encoded = encode_wal_block(tid, &batch);
         let (decoded, got_tid) = decode_wal_block_verified(&encoded, &schema).expect("block decodes");
         assert_eq!(got_tid, tid);
         assert_eq!(decoded, batch, "batch must survive encode -> decode");

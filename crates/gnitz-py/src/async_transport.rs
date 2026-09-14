@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 
 use gnitz_core::{ClientError, WireConflictMode};
 
-use crate::read::triple_to_lazy;
+use crate::read::scan_result;
 use crate::write::{pk_key_from_py, PyZSetBatch};
 use crate::{build_pylist, client_err};
 
@@ -46,11 +46,11 @@ pub(crate) struct PyAsyncTransport {
 fn narrow(py: Python<'_>, reply: gnitz_core::Reply) -> PyResult<Py<PyAny>> {
     match reply {
         gnitz_core::Reply::Lsn(lsn) => Ok(lsn.into_pyobject(py)?.into_any().unbind()),
-        gnitz_core::Reply::Scan(r) => Ok(triple_to_lazy(py, r, false)?.into_any()),
+        gnitz_core::Reply::Scan(r) => Ok(scan_result(py, r)?.into_any()),
         // One PyScanResult per relation, in request order → a Python list,
         // resolving the single scan_many future.
         gnitz_core::Reply::Multi(replies) => {
-            let per_rel = replies.into_iter().map(|r| triple_to_lazy(py, r, false));
+            let per_rel = replies.into_iter().map(|r| scan_result(py, r));
             Ok(build_pylist(py, per_rel)?.into_any().unbind())
         }
         _ => unreachable!("this transport submits no verb with another reply shape"),

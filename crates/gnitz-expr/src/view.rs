@@ -21,9 +21,8 @@
 /// buffers it materializes and can only lend them for `&self`.
 pub trait RowSource {
     /// The row's packed PK-region bytes (`pk_stride` wide), **order-preserving
-    /// at-rest (OPK)** at every source — including client-side, where a
-    /// `ZSetBatch` keeps its keys native-LE but encodes them into the view it
-    /// presents. That is what the OPK-inverting readers on
+    /// at-rest (OPK)** at every source, a client `ZSetBatch` included. That is
+    /// what the OPK-inverting readers on
     /// [`crate::ColumnLocator`] assume; [`assert_batchview_consistent`] is where
     /// an implementor proves it.
     fn get_pk_bytes(&self, row: usize) -> &[u8];

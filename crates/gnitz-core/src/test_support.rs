@@ -94,3 +94,21 @@ pub(crate) fn raw_read_frame(fd: &OwnedFd) -> Vec<u8> {
     raw_read_exact(fd, &mut payload);
     payload
 }
+
+/// `schema`'s payload regions holding `regions`, one per payload slot in slot
+/// order, each typed as its schema column.
+pub(crate) fn payload_of(
+    schema: &crate::protocol::Schema,
+    regions: Vec<Vec<u8>>,
+) -> Vec<crate::protocol::PayloadColumn> {
+    assert_eq!(regions.len(), schema.num_payload_cols(), "one region per payload slot");
+    schema
+        .payload_columns()
+        .zip(regions)
+        .map(|((_, _, c), bytes)| {
+            let mut col = crate::protocol::PayloadColumn::new(c.type_code);
+            col.bytes = bytes;
+            col
+        })
+        .collect()
+}

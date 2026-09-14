@@ -83,6 +83,6 @@ fn slow_scan_client_is_evicted_after_deadline() {
         .i64_val(0)
         .i64_val(0);
     client.push(table_id, &schema, &more).unwrap();
-    let (_, batch, _) = client.scan(table_id).expect("scan after the eviction");
-    assert_eq!(batch.map(|b| b.len()).unwrap_or(0), 40_001);
+    let batch = client.scan(table_id).expect("scan after the eviction").batch;
+    assert_eq!(batch.len(), 40_001);
 }

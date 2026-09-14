@@ -68,7 +68,7 @@ pub(super) fn from_construct(from: DerivedFrom) -> &'static str {
 
 /// An empty `Rows` result over `schema` — the `LIMIT 0` short-circuit both sinks
 /// share (no request dispatched).
-fn empty_rows(schema: Schema) -> SqlResult {
+fn empty_rows(schema: Arc<Schema>) -> SqlResult {
     let batch = ZSetBatch::new(&schema);
     SqlResult::Rows { schema, batch }
 }
@@ -581,21 +581,17 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
         ReadCase::PlainScan(target) => {
             // The served LSN is dropped here: a `SELECT` holds no cursor across
             // reads, and a local answer carries none anyway.
-            let (schema_out, batch_opt, _lsn) = client.scan_local_first(target.tid)?;
-            let out_schema = schema_out
-                .map(|s| (*s).clone())
-                .unwrap_or_else(|| (*target.schema).clone());
-            let batch = batch_opt.unwrap_or_else(|| ZSetBatch::new(&out_schema));
-            return Ok(SqlResult::Rows { schema: out_schema, batch });
+            let r = client.scan_local_first(target.tid)?;
+            return Ok(SqlResult::Rows { schema: r.schema, batch: r.batch });
         }
         ReadCase::Constant(c) => {
             let ConstRead { shape, order, window } = *c;
             if window.limit == Some(0) {
-                return Ok(empty_rows(shape.out_schema));
+                return Ok(empty_rows(Arc::new(shape.out_schema)));
             }
             // No partials: the finish synthesizes the ground row and projects it.
             let batch = agg_finish(&shape, &ZSetBatch::new(&shape.partial_schema));
-            let (schema, batch) = read_spec_finish(shape.out_schema, batch, &order, window);
+            let (schema, batch) = read_spec_finish(Arc::new(shape.out_schema), batch, &order, window);
             return Ok(SqlResult::Rows { schema, batch });
         }
         ReadCase::Spec(spec) => spec,
@@ -614,14 +610,14 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
     let (out_schema, batch) = match tail {
         SinkTail::Rows { reply_schema } => {
             if window.limit == Some(0) {
-                return Ok(empty_rows(Arc::unwrap_or_clone(reply_schema)));
+                return Ok(empty_rows(reply_schema));
             }
             let batch = fetch_bound(client, tid, &access, &sink, &reply_schema)?;
-            (Arc::unwrap_or_clone(reply_schema), batch)
+            (reply_schema, batch)
         }
         SinkTail::Fold { shape, .. } => {
             if window.limit == Some(0) {
-                return Ok(empty_rows(shape.out_schema));
+                return Ok(empty_rows(Arc::new(shape.out_schema)));
             }
             // A wire error (including the runtime per-worker group cap) is hard: by
             // now the fold is mid-flight on the workers and cannot fall back.
@@ -629,7 +625,7 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             // Client finishing: combine by group value, ground row, AVG/NullfillSum,
             // HAVING, projection.
             let out_batch = agg_finish(&shape, &partial);
-            (shape.out_schema, out_batch)
+            (Arc::new(shape.out_schema), out_batch)
         }
     };
     // Sort the concatenation by the wire keys, window, present.

@@ -100,7 +100,7 @@ class AsyncConnection:
         """
         return self._transport.scan_many(target_ids)
 
-    def seek(self, table_id, pk=0):
+    def seek(self, table_id, pk):
         """Point-lookup by primary key.  Awaits to a ``ScanResult``."""
         return self._transport.seek(table_id, pk)
 

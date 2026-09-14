@@ -398,19 +398,6 @@ impl gnitz_expr::SchemaFacts for Schema {
     }
 }
 
-/// The inverse of [`opk_key_packed`]: `opk`'s columns decoded back to their
-/// native little-endian images, at the same offsets.
-fn native_row(schema: &Schema, opk: &[u8]) -> [u8; MAX_PK_BYTES] {
-    let mut buf = [0u8; MAX_PK_BYTES];
-    let mut off = 0;
-    for (w, tc) in schema.pk_col_codes() {
-        gnitz_wire::decode_pk_column(&opk[off..off + w], tc, &mut buf[off..off + w]);
-        off += w;
-    }
-    debug_assert_eq!(off, opk.len(), "native_row: schema stride != key width");
-    buf
-}
-
 /// One row's PK as OPK bytes, from the PK columns' native values in PK-list
 /// order — the one native→OPK column walk on the client, and the same bytes a
 /// [`PkColumn`] row holds. Crossing into the wire's *native* key space is named:
@@ -442,10 +429,18 @@ pub fn opk_key_packed(schema: &Schema, v: u128) -> PkBuf {
     opk_key_native_bytes(schema, &v.to_le_bytes()[..stride])
 }
 
-/// `key`, one row of OPK bytes, in the wire's native key space; valid bytes are
-/// `0..key.len()`.
+/// `key`, one row of OPK bytes, in the wire's native key space: its columns
+/// decoded back to their native little-endian images, at the same offsets. The
+/// inverse of [`opk_key_packed`]; valid bytes are `0..key.len()`.
 pub fn native_le_key(schema: &Schema, key: &[u8]) -> [u8; MAX_PK_BYTES] {
-    native_row(schema, key)
+    let mut buf = [0u8; MAX_PK_BYTES];
+    let mut off = 0;
+    for (w, tc) in schema.pk_col_codes() {
+        gnitz_wire::decode_pk_column(&key[off..off + w], tc, &mut buf[off..off + w]);
+        off += w;
+    }
+    debug_assert_eq!(off, key.len(), "native_le_key: schema stride != key width");
+    buf
 }
 
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
@@ -496,12 +491,6 @@ impl PkColumn {
         &self.buf
     }
 
-    /// The `size` OPK bytes at PK-region byte offset `off` of row `i`.
-    pub fn col_window(&self, i: usize, off: usize, size: usize) -> &[u8] {
-        let base = i * self.width() + off;
-        &self.buf[base..base + size]
-    }
-
     pub fn len(&self) -> usize {
         self.buf.len() / self.width()
     }
@@ -519,7 +508,7 @@ impl PkColumn {
             "PkColumn::get: a {}-byte key has no scalar form",
             opk.len(),
         );
-        let native = native_row(schema, opk);
+        let native = native_le_key(schema, opk);
         u128::from_le_bytes(native[..gnitz_wire::NARROW_PK_MAX_BYTES].try_into().unwrap())
     }
 
@@ -605,19 +594,57 @@ pub fn push_zero_cell(col: &mut Vec<u8>, tc: TypeCode) {
     col.extend(std::iter::repeat_n(0u8, tc.wire_stride()));
 }
 
-/// A batch in the §6 region shape: every column is its own wire region, and a
-/// STRING/BLOB column holds 16-byte German-string cells against [`Self::blob`].
-/// Nothing here is materialized — this is the form the wire carries and the
-/// shared evaluator reads.
+/// One payload region: its wire type and its cells, `tc.wire_stride()` bytes
+/// each (16-byte German cells for STRING/BLOB, into the batch's `blob`). The
+/// type is fixed at construction, as a `PkColumn`'s stride is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadColumn {
+    tc: TypeCode,
+    pub bytes: Vec<u8>,
+}
+
+impl PayloadColumn {
+    pub fn new(tc: TypeCode) -> Self {
+        PayloadColumn { tc, bytes: Vec::new() }
+    }
+
+    /// `rows` zero cells.
+    pub fn zeroed(tc: TypeCode, rows: usize) -> Self {
+        PayloadColumn {
+            tc,
+            bytes: vec![0; rows * tc.wire_stride()],
+        }
+    }
+
+    #[inline]
+    pub fn tc(&self) -> TypeCode {
+        self.tc
+    }
+
+    #[inline]
+    pub fn stride(&self) -> usize {
+        self.tc.wire_stride()
+    }
+
+    /// Append one zero cell: a NULL's filler, or a DROP COLUMN tombstone's value.
+    pub fn push_zero(&mut self) {
+        push_zero_cell(&mut self.bytes, self.tc)
+    }
+}
+
+/// A batch in the §6 region shape: every payload slot is its own wire region,
+/// and a STRING/BLOB slot holds 16-byte German-string cells against
+/// [`Self::blob`]. Nothing here is materialized — this is the form the wire
+/// carries and the shared evaluator reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZSetBatch {
     pub pks: PkColumn,
     pub weights: Vec<i64>,
     pub nulls: Vec<u64>,
-    /// One region per schema column; a PK column's slot stays empty, its values
-    /// living in `pks`.
-    pub columns: Vec<Vec<u8>>,
-    /// The arena the German cells in `columns` point into.
+    /// One region per payload slot, in slot order: slot `pi` is null-bitmap bit
+    /// `pi` and wire region `REG_PAYLOAD_START + pi`.
+    pub payload: Vec<PayloadColumn>,
+    /// The arena the German cells in `payload` point into.
     pub blob: Vec<u8>,
 }
 
@@ -627,61 +654,69 @@ impl ZSetBatch {
             pks: PkColumn::empty_for_schema(schema),
             weights: vec![],
             nulls: vec![],
-            columns: Self::filler_columns(schema, 0),
+            payload: schema
+                .payload_columns()
+                .map(|(_, _, c)| PayloadColumn::new(c.type_code))
+                .collect(),
             blob: vec![],
         }
     }
 
-    /// One region per schema column, zero-filled for `count` rows (a PK column's
-    /// slot stays empty whatever `count` is). `new` is the `count = 0` case; the
-    /// client's `delete` uses `count > 0` as inert payload filler for retraction
-    /// rows, which the server's `retract_pk` matches by PK alone.
-    pub(crate) fn filler_columns(schema: &Schema, count: usize) -> Vec<Vec<u8>> {
+    /// One region per payload slot, zero-filled for `count` rows. The client's
+    /// `delete` uses these as inert payload filler for retraction rows, which
+    /// the server's `retract_pk` matches by PK alone.
+    pub(crate) fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
         schema
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(ci, col)| {
-                let rows = if schema.is_pk_col(ci) { 0 } else { count };
-                vec![0u8; rows * col.type_code.wire_stride()]
-            })
+            .payload_columns()
+            .map(|(_, _, c)| PayloadColumn::zeroed(c.type_code, count))
             .collect()
     }
 
-    /// Append the `tc`-wide cell at row `i` of `src.columns[src_ci]` onto
-    /// `self.columns[dst_ci]`. A German cell is re-encoded against this batch's
+    /// Append the cell at row `i` of `src.payload[src_pi]` onto
+    /// `self.payload[dst_pi]`. A German cell is re-encoded against this batch's
     /// arena — its heap offset is relative to `src`'s and means nothing here.
-    pub fn push_cell_from(&mut self, dst_ci: usize, src: &ZSetBatch, src_ci: usize, tc: TypeCode, i: usize) {
+    pub fn push_cell_from(&mut self, dst_pi: usize, src: &ZSetBatch, src_pi: usize, i: usize) {
+        let col = &src.payload[src_pi];
+        let tc = col.tc();
+        debug_assert_eq!(self.payload[dst_pi].tc(), tc, "push_cell_from: slot type mismatch");
         let w = tc.wire_stride();
-        let cell = &src.columns[src_ci][i * w..(i + 1) * w];
+        let cell = &col.bytes[i * w..(i + 1) * w];
         if gnitz_wire::is_german_string(tc as u8) {
             let content = gnitz_wire::german_string_content(cell, &src.blob);
             let moved = gnitz_wire::encode_german_string(content, &mut self.blob);
-            self.columns[dst_ci].extend_from_slice(&moved);
+            self.payload[dst_pi].bytes.extend_from_slice(&moved);
         } else {
-            self.columns[dst_ci].extend_from_slice(cell);
+            self.payload[dst_pi].bytes.extend_from_slice(cell);
         }
     }
 
     /// Append row `i` of `src` to `self` at `weight`, verbatim — so a `-1`
     /// reproduces the stored row rather than relying on a decoder and an encoder
-    /// agreeing. `src` and `self` must both be built from `schema`.
-    pub fn copy_row_at(&mut self, src: &ZSetBatch, i: usize, weight: i64, schema: &Schema) {
+    /// agreeing. `src` and `self` must share a layout.
+    pub fn copy_row_at(&mut self, src: &ZSetBatch, i: usize, weight: i64) {
+        debug_assert!(self.same_layout(src), "copy_row_at: layout mismatch");
         self.pks.push_from(&src.pks, i);
         self.weights.push(weight);
         self.nulls.push(src.nulls[i]);
-        for (_pi, ci, def) in schema.payload_columns() {
-            self.push_cell_from(ci, src, ci, def.type_code, i);
+        for pi in 0..self.payload.len() {
+            self.push_cell_from(pi, src, pi, i);
         }
     }
 
-    /// Overwrite the STRING cell at `(row, ci)`. Addressable rather than "patch
+    /// Same PK stride and the same payload type list.
+    fn same_layout(&self, other: &ZSetBatch) -> bool {
+        self.pks.stride() == other.pks.stride()
+            && self.payload.len() == other.payload.len()
+            && self.payload.iter().zip(&other.payload).all(|(a, b)| a.tc() == b.tc())
+    }
+
+    /// Overwrite the STRING cell at `(row, pi)`. Addressable rather than "patch
     /// the row I just pushed", so a caller that copied two rows can name which
     /// one it means. The replaced cell's spill, if any, stays in the arena
     /// unreferenced.
-    pub fn set_string_cell(&mut self, row: usize, ci: usize, v: &str) {
+    pub fn set_string_cell(&mut self, row: usize, pi: usize, v: &str) {
         let cell = gnitz_wire::encode_german_string(v.as_bytes(), &mut self.blob);
-        self.columns[ci][row * 16..(row + 1) * 16].copy_from_slice(&cell);
+        self.payload[pi].bytes[row * 16..(row + 1) * 16].copy_from_slice(&cell);
     }
 
     /// An empty batch with every growth stream sized for `n` rows: the PK
@@ -690,18 +725,18 @@ impl ZSetBatch {
     /// column-at-a-time fill reallocates its way up from zero.
     pub fn with_capacity(schema: &Schema, n: usize) -> Self {
         let mut b = Self::new(schema);
-        b.reserve(schema, n);
+        b.reserve(n);
         b
     }
 
     /// Room for `n` more rows in every growth stream. Additive, as
     /// [`Vec::reserve`] is, so repeated appends to one batch compose.
-    pub fn reserve(&mut self, schema: &Schema, n: usize) {
+    pub fn reserve(&mut self, n: usize) {
         self.pks.reserve(n);
         self.weights.reserve(n);
         self.nulls.reserve(n);
-        for (_pi, ci, col) in schema.payload_columns() {
-            self.columns[ci].reserve(n * col.type_code.wire_stride());
+        for col in &mut self.payload {
+            col.bytes.reserve(n * col.stride());
         }
     }
 
@@ -711,12 +746,6 @@ impl ZSetBatch {
 
     pub fn is_empty(&self) -> bool {
         self.weights.is_empty()
-    }
-
-    /// The `stride`-byte wire cell at `row` of column `ci`, or `None` past the
-    /// end.
-    pub fn cell(&self, ci: usize, row: usize, stride: usize) -> Option<&[u8]> {
-        self.columns[ci].get(row * stride..(row + 1) * stride)
     }
 
     /// Indices of the live rows — those with positive weight. A `ZSetBatch`
@@ -735,27 +764,23 @@ impl ZSetBatch {
     /// Append all rows of `other`, consuming it: each region concatenates, and
     /// `other`'s arena lands on this one's tail, so every German cell it carries
     /// has its heap offset shifted by that much.
-    pub fn extend_from_owned(&mut self, mut other: ZSetBatch, schema: &Schema) {
-        assert_eq!(
-            self.columns.len(),
-            other.columns.len(),
-            "extend_from_owned: column count mismatch",
-        );
+    pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
         assert_eq!(
             self.pks.stride(),
             other.pks.stride(),
             "extend_from_owned: PK stride mismatch",
         );
+        assert!(self.same_layout(&other), "extend_from_owned: payload layout mismatch",);
         self.pks.append(&mut other.pks);
         self.weights.append(&mut other.weights);
         self.nulls.append(&mut other.nulls);
         let delta = self.blob.len();
         self.blob.append(&mut other.blob);
-        for (_pi, ci, col) in schema.payload_columns() {
-            let at = self.columns[ci].len();
-            self.columns[ci].append(&mut other.columns[ci]);
-            if gnitz_wire::is_german_string(col.type_code as u8) && delta != 0 {
-                for cell in self.columns[ci][at..].as_chunks_mut::<16>().0 {
+        for (dst, src) in self.payload.iter_mut().zip(&mut other.payload) {
+            let at = dst.bytes.len();
+            dst.bytes.append(&mut src.bytes);
+            if gnitz_wire::is_german_string(dst.tc() as u8) && delta != 0 {
+                for cell in dst.bytes[at..].as_chunks_mut::<16>().0 {
                     gnitz_wire::shift_german_string_heap(cell, delta);
                 }
             }
@@ -772,25 +797,55 @@ impl ZSetBatch {
 
     /// Drop everything appended since `mark` — used to undo a half-written row,
     /// its blob spill included.
-    pub fn rollback_to(&mut self, mark: BatchMark, schema: &Schema) {
+    pub fn rollback_to(&mut self, mark: BatchMark) {
         self.pks.truncate(mark.rows);
         self.weights.truncate(mark.rows);
         self.nulls.truncate(mark.rows);
         self.blob.truncate(mark.blob);
-        for (_pi, ci, col) in schema.payload_columns() {
-            self.columns[ci].truncate(mark.rows * col.type_code.wire_stride());
+        for col in &mut self.payload {
+            col.bytes.truncate(mark.rows * col.stride());
         }
     }
 
-    /// Every payload region is the length its declared type and row count imply.
+    /// Every payload region is the length its type and the row count imply.
     /// Split out of [`Self::validate`] because the region builder needs the same
     /// rule for a batch that never went through the push path.
-    pub(crate) fn check_columns(&self, schema: &Schema) -> Result<(), std::string::String> {
+    pub(crate) fn check_columns(&self) -> Result<(), std::string::String> {
         let n = self.len();
-        for (_pi, ci, col_def) in schema.payload_columns() {
-            let (got, want) = (self.columns[ci].len(), n * col_def.type_code.wire_stride());
+        for (pi, col) in self.payload.iter().enumerate() {
+            let (got, want) = (col.bytes.len(), n * col.stride());
             if got != want {
-                return Err(format!("column {ci}: length {got} != expected {want}"));
+                return Err(format!("payload slot {pi}: length {got} != expected {want}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The batch's layout is `schema`'s: PK stride, payload slot count, and each
+    /// slot's type.
+    pub fn layout_matches(&self, schema: &Schema) -> Result<(), std::string::String> {
+        if self.pks.stride() as usize != schema.pk_stride() {
+            return Err(format!(
+                "mismatched PK stride: expected {}, got {}",
+                schema.pk_stride(),
+                self.pks.stride()
+            ));
+        }
+        if self.payload.len() != schema.num_payload_cols() {
+            return Err(format!(
+                "payload slot count {} != schema payload column count {}",
+                self.payload.len(),
+                schema.num_payload_cols()
+            ));
+        }
+        for ((pi, _, def), col) in schema.payload_columns().zip(&self.payload) {
+            if col.tc() != def.type_code {
+                return Err(format!(
+                    "payload slot {pi} ('{}'): type {:?} != schema type {:?}",
+                    def.name,
+                    col.tc(),
+                    def.type_code
+                ));
             }
         }
         Ok(())
@@ -804,13 +859,7 @@ impl ZSetBatch {
         if self.pks.stride() == 0 {
             return Err("PK stride must be non-zero".into());
         }
-        if self.pks.stride() as usize != schema.pk_stride() {
-            return Err(format!(
-                "mismatched PK stride: expected {}, got {}",
-                schema.pk_stride(),
-                self.pks.stride()
-            ));
-        }
+        self.layout_matches(schema)?;
         if !self.pks.region().len().is_multiple_of(self.pks.stride() as usize) {
             return Err(format!(
                 "PK buffer length {} is not a multiple of stride {}",
@@ -825,14 +874,7 @@ impl ZSetBatch {
         if self.nulls.len() != n {
             return Err(format!("nulls length {} != row count {}", self.nulls.len(), n));
         }
-        if self.columns.len() != schema.num_columns() {
-            return Err(format!(
-                "column count {} != schema column count {}",
-                self.columns.len(),
-                schema.num_columns()
-            ));
-        }
-        self.check_columns(schema)?;
+        self.check_columns()?;
         // A null bit on a NOT NULL payload column would make FK/unique validation
         // skip the value (treating it as absent) while consolidation and decoders
         // read the raw bytes as live data — an inconsistency the schema forbids.
@@ -867,15 +909,12 @@ pub struct BatchMark {
 
 /// Builder for appending rows to a `ZSetBatch` with schema-aware column mapping.
 ///
-/// Columns are appended in non-PK order: the cursor automatically skips the PK
-/// column index, so callers supply only payload values.
+/// Columns are appended in payload-slot order, so callers supply only payload
+/// values; the cursor is the payload slot.
 pub struct BatchAppender<'a> {
     batch: &'a mut ZSetBatch,
     schema: &'a Schema,
     cursor: usize,
-    /// Payload cursor → schema column index (the N-th non-PK column), computed
-    /// once so `col_index` is an array read rather than a per-value scan.
-    payload_to_ci: Vec<usize>,
 }
 
 /// The client half of the shared catalog row codecs: the sink
@@ -903,8 +942,7 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
 
 impl<'a> BatchAppender<'a> {
     pub fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
-        let payload_to_ci: Vec<usize> = schema.payload_columns().map(|(_, ci, _)| ci).collect();
-        BatchAppender { batch, schema, cursor: 0, payload_to_ci }
+        BatchAppender { batch, schema, cursor: 0 }
     }
 
     /// Start a new row with the given single-column primary key and weight.
@@ -930,10 +968,10 @@ impl<'a> BatchAppender<'a> {
     fn check_row_complete(&self) {
         debug_assert_eq!(
             self.cursor,
-            self.payload_to_ci.len(),
+            self.batch.payload.len(),
             "BatchAppender: row got {} of {} payload columns",
             self.cursor,
-            self.payload_to_ci.len(),
+            self.batch.payload.len(),
         );
     }
 
@@ -949,19 +987,20 @@ impl<'a> BatchAppender<'a> {
     /// otherwise the region ends up the wrong size and every later row reads at
     /// the wrong offset.
     fn fixed_val(&mut self, bytes: &[u8]) -> &mut Self {
-        let ci = self.col_index();
-        let tc = self.schema.columns[ci].type_code;
+        let pi = self.col_index();
+        let col = &mut self.batch.payload[pi];
+        let tc = col.tc();
         assert!(
             !gnitz_wire::is_german_string(tc as u8),
-            "BatchAppender: a fixed-width value cannot be written to the {tc:?} column at schema index {ci}",
+            "BatchAppender: a fixed-width value cannot be written to the {tc:?} column at payload slot {pi}",
         );
         assert_eq!(
             bytes.len(),
             tc.wire_stride(),
-            "BatchAppender: {tc:?} column at schema index {ci} takes {} bytes",
+            "BatchAppender: {tc:?} column at payload slot {pi} takes {} bytes",
             tc.wire_stride(),
         );
-        self.batch.columns[ci].extend_from_slice(bytes);
+        col.bytes.extend_from_slice(bytes);
         self.cursor += 1;
         self
     }
@@ -1001,14 +1040,14 @@ impl<'a> BatchAppender<'a> {
 
     /// Append one German-string cell, spilling into the batch's arena.
     fn german_val(&mut self, b: &[u8]) -> &mut Self {
-        let ci = self.col_index();
-        let tc = self.schema.columns[ci].type_code;
+        let pi = self.col_index();
+        let tc = self.batch.payload[pi].tc();
         assert!(
             gnitz_wire::is_german_string(tc as u8),
-            "BatchAppender: a string/blob value cannot be written to the {tc:?} column at schema index {ci}",
+            "BatchAppender: a string/blob value cannot be written to the {tc:?} column at payload slot {pi}",
         );
         let cell = gnitz_wire::encode_german_string(b, &mut self.batch.blob);
-        self.batch.columns[ci].extend_from_slice(&cell);
+        self.batch.payload[pi].bytes.extend_from_slice(&cell);
         self.cursor += 1;
         self
     }
@@ -1020,9 +1059,8 @@ impl<'a> BatchAppender<'a> {
     /// The read side gates on `nulls[row] & (1 << payload_idx)` and reads the
     /// cell only when that bit is clear, so the two must agree.
     pub fn null(&mut self) -> &mut Self {
-        let ci = self.col_index();
-        push_zero_cell(&mut self.batch.columns[ci], self.schema.columns[ci].type_code);
-        let pi = self.schema.payload_idx(ci);
+        let pi = self.col_index();
+        self.batch.payload[pi].push_zero();
         let word = self
             .batch
             .nulls
@@ -1033,19 +1071,72 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Map the payload cursor to the actual schema column index, skipping every
-    /// PK column. Supports compound PKs (e.g. the catalog circuit table, keyed
-    /// `(view_id, node_id)`): payload value N targets the N-th non-PK column.
+    /// The payload slot the next value goes to.
     fn col_index(&self) -> usize {
         // Hard assert (not debug-only): a misbehaving caller gets a clear panic
-        // here instead of an OOB index panicking at the `columns[ci]` call site.
+        // here instead of an OOB index panicking at the `payload[pi]` call site.
         assert!(
-            self.cursor < self.payload_to_ci.len(),
+            self.cursor < self.batch.payload.len(),
             "BatchAppender: payload cursor {} exceeds {} payload columns",
             self.cursor,
-            self.payload_to_ci.len(),
+            self.batch.payload.len(),
         );
-        self.payload_to_ci[self.cursor]
+        self.cursor
+    }
+}
+
+/// Every method is `#[inline(always)]`; see [`gnitz_expr::BatchView`] for why
+/// the plain hint is not enough. The bodies slice `&[u8]`, not `Vec<u8>`, whose
+/// indexing stays an out-of-line call at opt-level 0.
+impl gnitz_expr::RowSource for ZSetBatch {
+    #[inline(always)]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        let (s, buf): (usize, &[u8]) = (self.pks.stride as usize, &self.pks.buf);
+        &buf[row * s..row * s + s]
+    }
+
+    #[inline(always)]
+    fn get_null_word(&self, row: usize) -> u64 {
+        self.nulls[row]
+    }
+
+    #[inline(always)]
+    fn get_col_ptr(&self, row: usize, pi: usize, sz: usize) -> &[u8] {
+        let col: &[u8] = &self.payload[pi].bytes;
+        &col[row * sz..row * sz + sz]
+    }
+
+    #[inline(always)]
+    fn blob(&self) -> &[u8] {
+        &self.blob
+    }
+
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.weights.len()
+    }
+}
+
+impl gnitz_expr::BatchView for ZSetBatch {
+    #[inline(always)]
+    fn col_data(&self, pi: usize, col_size: usize) -> &[u8] {
+        let col: &[u8] = &self.payload[pi].bytes;
+        debug_assert_eq!(
+            col.len(),
+            self.weights.len() * col_size,
+            "col_data({pi}, {col_size}) width mismatch"
+        );
+        col
+    }
+
+    #[inline(always)]
+    fn null_bmp(&self) -> &[u8] {
+        gnitz_wire::as_le_bytes(&self.nulls)
+    }
+
+    #[inline(always)]
+    fn pk_region(&self) -> (&[u8], usize) {
+        (&self.pks.buf, self.pks.stride as usize)
     }
 }
 

@@ -206,13 +206,13 @@ def test_a_wide_key_distinguishes_two_rows_that_share_their_first_sixteen_bytes(
     ((8, 8), [(1, 2), (3, 4), (5, 6)]),
     ((8, 8, 8), [(1, 1, 1), (1, 1, 2), (2, 2, 2)]),
 ], ids=["stride16", "stride24"])
-def test_a_retraction_names_its_row_by_the_same_packed_key(client, schema_name,
-                                                           widths, keys):
-    """The delete verb ships the key the client packs, at `pk_stride` — the
-    members' widths summed with no padding. A key packed at the wrong offset,
-    width or order names a row that does not exist, and the retraction is then
-    dropped without an error. Stride 24 is past the width a single packed compare
-    covers, so the engine locates it by a byte walk instead.
+def test_a_compound_retraction_names_its_row(client, schema_name, widths, keys):
+    """The delete verb takes a compound key as the tuple of its column values,
+    and the client packs it at `pk_stride` — the members' widths summed with no
+    padding. A key packed at the wrong offset, width or order names a row that
+    does not exist, and the retraction is then dropped without an error. Stride
+    24 is past the width a single packed compare covers, so the engine locates
+    it by a byte walk instead.
     """
     sn = schema_name
     cols = "abc"[:len(widths)]
@@ -224,8 +224,7 @@ def test_a_retraction_names_its_row_by_the_same_packed_key(client, schema_name,
     tid, schema = client.resolve_table(sn, "t")
 
     gone = keys[1]
-    packed = b"".join(v.to_bytes(w, "little") for v, w in zip(gone, widths))
-    client.delete(tid, schema, [packed])
+    client.delete(tid, schema, [gone])
 
     assert bag(scanned(client, sn, "t"), *cols, "payload") == \
         {k + (i,): 1 for i, k in enumerate(keys) if k != gone}

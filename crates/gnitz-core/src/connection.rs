@@ -55,18 +55,17 @@ pub const MAX_IN_FLIGHT: usize = 4096;
 /// without flushing.
 pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
-/// One relation's reply to a `scan`/`seek`/`seek_by_index`: the (cached)
-/// `Schema`, the materialised `ZSetBatch` if any rows came back, and the server
-/// LSN at which the read was served.
-pub type ScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
+/// One relation's read result. `lsn` is the server LSN the read was served
+/// at; a read answered off a mirrored copy has none.
+#[derive(Debug)]
+pub struct ScanReply {
+    pub schema: Arc<Schema>,
+    pub batch: ZSetBatch,
+    pub lsn: Option<u64>,
+}
 
 /// The single-relation read result.
 pub type ScanResult = Result<ScanReply, ClientError>;
-
-/// A [`ScanReply`] whose served LSN may be absent: a mirrored copy answers at a
-/// feed round rather than a server-side counter, so a locally answered read
-/// carries none. What the `_local_first` reads hand back.
-pub type LocalScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, Option<u64>);
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
 /// block's extent within it. `block()` is the block itself.
@@ -210,7 +209,7 @@ pub enum Request<'a> {
     },
     /// An id allocation: `flag` names the sequence, `count` the run length, and
     /// the answer rides the terminal frame's `target_id`. Uncorrelated: nothing
-    /// is absorbed into the cache, and it completes as [`Reply::Train`].
+    /// is absorbed into the cache, and it completes as [`Reply::Ack`].
     Alloc { target_id: u64, flag: u64, count: u64 },
     /// An atomic DDL transaction (`FLAG_DDL_TXN`): system-table family batches
     /// the server ingests under one durable SAL zone, each named by its system
@@ -291,27 +290,6 @@ impl<'a> Request<'a> {
     }
 }
 
-/// One reassembled train: every frame's rows concatenated into `data`, the
-/// schema they decoded under, and the terminal frame whole — `target_id` and
-/// `seek_pk` are where the answers of [`Reply::Train`]'s verbs live.
-#[derive(Debug)]
-pub struct ReplyTrain {
-    pub terminal: Message,
-    /// The block the train carried, else the one it decoded under — a warm
-    /// reply omits the block.
-    pub schema: Option<Arc<Schema>>,
-    pub data: Option<ZSetBatch>,
-}
-
-impl ReplyTrain {
-    /// The train as one relation's read result: its schema, its rows, and the
-    /// terminal watermark as a plain LSN. Distinct from [`Reply::into_scan`],
-    /// which projects an already-built one out of the enum.
-    fn into_scan_reply(self) -> ScanReply {
-        (self.schema, self.data, self.terminal.seek_pk as u64)
-    }
-}
-
 /// What a slot's verb asked for. The spine resolves a reply against the request
 /// that opened its slot, so no driver re-attaches a relation id.
 #[derive(Debug)]
@@ -325,9 +303,12 @@ pub enum Reply {
     /// A RESOLVE: the live id, the FK-complete schema and the descriptor, or
     /// `None` when no such relation exists.
     Resolve(Option<(u64, Arc<Schema>, RelDescriptorBlob)>),
-    /// The train itself, for the verbs whose answer is a field of the terminal
-    /// frame: the id allocations, the transaction ACKs, and `scan_spec`.
-    Train(ReplyTrain),
+    /// The terminal frame of a verb whose answer is one of its fields: the id
+    /// allocations and the transaction ACKs.
+    Ack(Message),
+    /// A decoded `scan_spec`: its rows under the slot's reply schema, and the
+    /// terminal watermark.
+    Rows { batch: ZSetBatch, watermark: u128 },
     /// The same train with each frame's data block left undecoded in its own
     /// frame buffer: `scan_spec_raw`, and the mirror's copy-free ingest. It
     /// carries no schema — the server sends no block back for a SCAN_SPEC.
@@ -346,7 +327,8 @@ impl Reply {
             Reply::Multi(_) => "Multi",
             Reply::Lsn(_) => "Lsn",
             Reply::Resolve(_) => "Resolve",
-            Reply::Train(_) => "Train",
+            Reply::Ack(_) => "Ack",
+            Reply::Rows { .. } => "Rows",
             Reply::Raw { .. } => "Raw",
             Reply::Polled => "Polled",
         }
@@ -394,14 +376,23 @@ impl Reply {
         }
     }
 
-    /// The reassembled train, for the verbs whose answer is a field of the
-    /// terminal frame.
+    /// The terminal frame, for the verbs whose answer is one of its fields.
     #[inline]
     #[track_caller]
-    pub fn into_train(self) -> ReplyTrain {
+    pub fn into_ack(self) -> Message {
         match self {
-            Reply::Train(t) => t,
-            other => wrong_shape(other.kind(), "Train"),
+            Reply::Ack(m) => m,
+            other => wrong_shape(other.kind(), "Ack"),
+        }
+    }
+
+    /// A decoded `scan_spec`'s rows and its terminal watermark.
+    #[inline]
+    #[track_caller]
+    pub fn into_rows(self) -> (ZSetBatch, u128) {
+        match self {
+            Reply::Rows { batch, watermark } => (batch, watermark),
+            other => wrong_shape(other.kind(), "Rows"),
         }
     }
 
@@ -428,13 +419,19 @@ fn wrong_shape(got: &'static str, want: &'static str) -> ! {
 
 pub type Completions = Vec<(SlotId, Result<Reply, ClientError>)>;
 
+/// The cached `(schema, version)` a request was stamped with.
+type Hint = (Arc<Schema>, u16);
+
 /// How a slot decodes its reply and what that reply becomes, read off the
 /// `Request` variant at `submit`.
 enum SlotKind {
-    /// A correlated read: frames decode under `tid`, and schema blocks are
-    /// absorbed under it.
+    /// A correlated read: frames name `tid`, schema blocks are absorbed under
+    /// it, and a hint-only frame decodes under `hint` — the cached `(schema,
+    /// version)` the request was stamped with, captured at submit so a later
+    /// eviction cannot take it away.
     Read {
         tid: u64,
+        hint: Option<Hint>,
     },
     /// A push: correlated the same way.
     Push {
@@ -446,8 +443,9 @@ enum SlotKind {
         reply_schema: Arc<Schema>,
         raw: bool,
     },
+    /// One position per relation, each with the hint its stamp was taken from.
     Multi {
-        tids: Vec<u64>,
+        tids: Vec<(u64, Option<Hint>)>,
     },
     /// One position per view, in request order. Its blocks stay raw, so no
     /// reply schema is needed here; the ids are what correlates each terminal —
@@ -481,7 +479,8 @@ struct Slot {
 /// The train-in-progress of the head slot.
 #[derive(Default)]
 struct Accumulator {
-    schema: Option<Arc<Schema>>,
+    /// The latest schema block the current train carried, with its version.
+    schema: Option<Hint>,
     data: Option<ZSetBatch>,
     blocks: Vec<RawBlock>,
     /// Narrowed results of a `scan_multi`.
@@ -623,9 +622,10 @@ impl Session {
                 seek_col_idx,
                 seek_pk_extra,
             } => {
-                let flags = self.versioned_flags(target_id, flags);
+                let hint = self.cached_hint(target_id);
+                let flags = wire_flags_set_schema_version(flags, hint.as_ref().map_or(0, |h| h.1));
                 let parts = encode_control_frame(target_id, client_id, flags, seek_pk, seek_col_idx, seek_pk_extra);
-                (parts, SlotKind::Read { tid: target_id })
+                (parts, SlotKind::Read { tid: target_id, hint })
             }
             Request::Alloc { target_id, flag, count } => {
                 // The run length rides in `seek_col_idx`, the field
@@ -668,8 +668,8 @@ impl Session {
                 // that the caller encoded under the same column types, and a
                 // schema-less frame under mismatched types is reinterpreted
                 // silently at rest.
-                let warm_version = match self.schema_cache.peek(&target_id) {
-                    Some((cached, v)) if *v != 0 && schema.types_match(cached.as_ref()) => Some(*v),
+                let warm_version = match self.cached_hint(target_id) {
+                    Some((cached, v)) if v != 0 && schema.types_match(&cached) => Some(v),
                     _ => None,
                 };
                 let parts = match warm_version {
@@ -706,7 +706,8 @@ impl Session {
                 // seek_pk_extra; `unpack_index_key_slots` reassembles them.
                 let (kbuf, klen) = gnitz_wire::pack_index_key_slots(key_vals);
                 let (seek_pk, seek_pk_extra) = gnitz_wire::control::split_ctrl_key(&kbuf[..klen]);
-                let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX);
+                let hint = self.cached_hint(table_id);
+                let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX, hint.as_ref().map_or(0, |h| h.1));
                 let parts = encode_control_frame(
                     table_id,
                     client_id,
@@ -715,12 +716,21 @@ impl Session {
                     gnitz_wire::pack_pk_cols(col_indices),
                     seek_pk_extra,
                 );
-                (parts, SlotKind::Read { tid: table_id })
+                (parts, SlotKind::Read { tid: table_id, hint })
             }
-            Request::ScanMulti(tids) => (
-                MessageParts::single(self.encode_scan_multi_frame(tids)?),
-                SlotKind::Multi { tids: tids.to_vec() },
-            ),
+            Request::ScanMulti(tids) => {
+                // Rejected here, in every build profile, before a frame exists.
+                // The case that matters is the empty list: it would encode a
+                // count=0 frame whose lone server error frame an N=0 accumulator
+                // never consumes, permanently shifting every later read on this
+                // connection by one frame.
+                txn_frame::validate_item_ids("SCAN_MULTI", tids, |&tid| tid)?;
+                let tids: Vec<(u64, Option<Hint>)> = tids.iter().map(|&tid| (tid, self.cached_hint(tid))).collect();
+                (
+                    MessageParts::single(self.encode_scan_multi_frame(&tids)),
+                    SlotKind::Multi { tids },
+                )
+            }
         };
         self.enqueue_slot(parts, kind)
     }
@@ -871,23 +881,27 @@ impl Session {
             SlotKind::DeltaPoll { views } => Some((views[accum.at], views.len())),
             _ => None,
         };
-        // The relation this frame must name, the schema a data block decodes
-        // against, and the cached version the frame must match.
-        let (correlate_tid, hint_owned, version) = match &head.kind {
-            SlotKind::Read { tid } | SlotKind::Push { tid } => {
-                let (schema, v) = cached_hint(schema_cache, *tid).unzip();
-                (Some(*tid), schema, v)
-            }
-            SlotKind::Uncorrelated | SlotKind::Resolve => (None, None, None),
-            // Client-authored: the server sends no schema block, and stamps 0.
-            SlotKind::ScanSpec { reply_schema, .. } => (None, Some(Arc::clone(reply_schema)), Some(0)),
-            SlotKind::Multi { tids } => {
-                let tid = tids[accum.at];
-                let (schema, v) = cached_hint(schema_cache, tid).unzip();
-                (Some(tid), schema, v)
-            }
-            // Client-authored too, and its blocks stay raw, so no schema.
-            SlotKind::DeltaPoll { .. } => (poll.map(|(view, _)| view), None, Some(0)),
+        // The relation this frame must name.
+        let correlate_tid = match &head.kind {
+            SlotKind::Read { tid, .. } | SlotKind::Push { tid } => Some(*tid),
+            SlotKind::Multi { tids } => Some(tids[accum.at].0),
+            SlotKind::DeltaPoll { .. } => poll.map(|(view, _)| view),
+            SlotKind::Uncorrelated | SlotKind::Resolve | SlotKind::ScanSpec { .. } => None,
+        };
+        // What a data block decodes under and the version a hint-only frame must carry.
+        let (slot_schema, slot_version) = match &head.kind {
+            SlotKind::Read { hint, .. } => hint.clone().unzip(),
+            SlotKind::Multi { tids } => tids[accum.at].1.clone().unzip(),
+            // Client-authored: the server sends no block and stamps 0.
+            SlotKind::ScanSpec { reply_schema, .. } => (Some(Arc::clone(reply_schema)), Some(0)),
+            SlotKind::DeltaPoll { .. } => (None, Some(0)),
+            SlotKind::Push { .. } | SlotKind::Uncorrelated | SlotKind::Resolve => (None, None),
+        };
+        // A block earlier in this train (the master's prelim frame) governs the
+        // hint-only worker frames after it.
+        let (hint_schema, version) = match &accum.schema {
+            Some((s, v)) => (Some(Arc::clone(s)), Some(*v)),
+            None => (slot_schema, slot_version),
         };
 
         let mut parsed = parse_response_frame(&buf, version)?;
@@ -921,11 +935,12 @@ impl Session {
         // Keyed on the tid the *frame* carries, which a correlated slot just
         // asserted is its own and a by-name RESOLVE (requested id 0) reports as
         // the live one.
-        if head.kind.absorbs_schema() {
-            if let Some(sch) = parsed.message.schema.as_ref() {
-                let version = wire_flags_get_schema_version(parsed.message.flags);
+        if let Some(sch) = parsed.message.schema.as_ref() {
+            let version = wire_flags_get_schema_version(parsed.message.flags);
+            if head.kind.absorbs_schema() {
                 schema_cache.put(parsed.message.target_id, (Arc::clone(sch), version));
             }
+            accum.schema = Some((Arc::clone(sch), version));
         }
 
         // Decoded straight into the accumulator: a train carries one data frame
@@ -933,7 +948,7 @@ impl Session {
         match parsed.data_block.take() {
             Some(r) if head.kind.keeps_blocks_raw() => accum.blocks.push(RawBlock { frame: buf, block: r }),
             Some(r) => {
-                let eff = parsed.effective(hint_owned.as_deref()).ok_or_else(|| {
+                let eff = parsed.effective(hint_schema.as_deref()).ok_or_else(|| {
                     ClientError::Protocol(ProtocolError::DecodeError("no schema for data block".into()))
                 })?;
                 let sink = accum.data.get_or_insert_with(|| ZSetBatch::new(eff));
@@ -942,37 +957,43 @@ impl Session {
             None => {}
         }
 
-        let mut msg = parsed.message;
-        let schema = msg.schema.take();
-        let terminal = msg;
-        accum.schema = accum.schema.take().or(schema);
+        let terminal = parsed.message;
         if terminal.flags & FLAG_CONTINUATION != 0 {
             return Ok(None);
         }
 
-        // The train terminated.
-        let train = ReplyTrain {
-            terminal,
-            schema: accum.schema.take().or(hint_owned),
-            data: accum.data.take(),
-        };
+        // The train terminated. These `take()`s also clear the accumulator
+        // between SCAN_MULTI positions.
+        let schema = accum.schema.take().map(|h| h.0).or(hint_schema);
+        let data = accum.data.take();
         if let Some((_, positions)) = poll {
             let blocks = std::mem::take(&mut accum.blocks);
-            let filled = Ok((blocks, train.terminal));
+            let filled = Ok((blocks, terminal));
             return Ok(Some(fill_poll_position(pending, accum, done, positions, filled)));
         }
+        let scan_reply = |schema: Option<Arc<Schema>>, data: Option<ZSetBatch>, terminal: &Message| {
+            let schema = schema.ok_or_else(no_schema)?;
+            Ok::<_, ClientError>(ScanReply {
+                batch: data.unwrap_or_else(|| ZSetBatch::new(&schema)),
+                schema,
+                lsn: Some(terminal.seek_pk as u64),
+            })
+        };
         let reply = match &head.kind {
-            SlotKind::Read { .. } => Ok(Reply::Scan(train.into_scan_reply())),
-            SlotKind::Push { .. } => Ok(Reply::Lsn(train.terminal.seek_pk as u64)),
-            SlotKind::Resolve => resolve_descriptor(train).map(Reply::Resolve),
-            SlotKind::Uncorrelated => Ok(Reply::Train(train)),
+            SlotKind::Read { .. } => Ok(Reply::Scan(scan_reply(schema, data, &terminal)?)),
+            SlotKind::Push { .. } => Ok(Reply::Lsn(terminal.seek_pk as u64)),
+            SlotKind::Resolve => resolve_descriptor(terminal, schema).map(Reply::Resolve),
+            SlotKind::Uncorrelated => Ok(Reply::Ack(terminal)),
             SlotKind::ScanSpec { raw: true, .. } => Ok(Reply::Raw {
                 blocks: std::mem::take(&mut accum.blocks),
-                terminal: train.terminal,
+                terminal,
             }),
-            SlotKind::ScanSpec { .. } => Ok(Reply::Train(train)),
+            SlotKind::ScanSpec { reply_schema, .. } => Ok(Reply::Rows {
+                batch: data.unwrap_or_else(|| ZSetBatch::new(reply_schema)),
+                watermark: terminal.seek_pk,
+            }),
             SlotKind::Multi { tids } => {
-                accum.replies.push(train.into_scan_reply());
+                accum.replies.push(scan_reply(schema, data, &terminal)?);
                 accum.at += 1;
                 if accum.at < tids.len() {
                     return Ok(None);
@@ -1037,9 +1058,9 @@ impl Session {
         }
     }
 
-    /// `round_trip` narrowed to a single train.
-    pub(crate) fn round_trip_train(&mut self, req: Request<'_>) -> Result<ReplyTrain, ClientError> {
-        self.round_trip(req).map(|r| r.into_train())
+    /// `round_trip` narrowed to a terminal frame.
+    pub(crate) fn round_trip_ack(&mut self, req: Request<'_>) -> Result<Message, ClientError> {
+        self.round_trip(req).map(|r| r.into_ack())
     }
 
     /// `round_trip` narrowed to a single relation's read result.
@@ -1051,8 +1072,7 @@ impl Session {
     /// the terminal frame's `target_id`.
     fn alloc(&mut self, target_id: u64, flag: u64, count: u64) -> Result<u64, ClientError> {
         Ok(self
-            .round_trip_train(Request::Alloc { target_id, flag, count })?
-            .terminal
+            .round_trip_ack(Request::Alloc { target_id, flag, count })?
             .target_id)
     }
 
@@ -1122,7 +1142,7 @@ impl Session {
     /// (via `encode_wal_block`) and the server resolves each family's schema from
     /// its own catalog.
     pub(crate) fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<u64, ClientError> {
-        Ok(self.round_trip_train(Request::DdlTxn(families))?.terminal.seek_pk as u64)
+        Ok(self.round_trip_ack(Request::DdlTxn(families))?.seek_pk as u64)
     }
 
     /// Send an atomic **user-table** push transaction (`FLAG_PUSH_TXN`): a bundle
@@ -1146,8 +1166,7 @@ impl Session {
         preconditions: &[(u64, u64)],
     ) -> Result<u64, ClientError> {
         Ok(self
-            .round_trip_train(Request::PushTxn { families, preconditions })?
-            .terminal
+            .round_trip_ack(Request::PushTxn { families, preconditions })?
             .seek_pk as u64)
     }
 
@@ -1240,46 +1259,38 @@ impl Session {
         target_id: u64,
         spec: &[u8],
         reply_schema: &ReplySchema,
-    ) -> Result<(Option<ZSetBatch>, u128), ClientError> {
-        let train = self.round_trip_train(Request::ScanSpec {
-            target_id,
-            spec,
-            reply_schema,
-            raw: false,
-        })?;
-        Ok((train.data, train.terminal.seek_pk))
+    ) -> Result<(ZSetBatch, u128), ClientError> {
+        Ok(self
+            .round_trip(Request::ScanSpec {
+                target_id,
+                spec,
+                reply_schema,
+                raw: false,
+            })?
+            .into_rows())
     }
 
-    /// The client's cached schema version for `tid` (`0` = no cached schema, so
-    /// the server sends the block). `peek` leaves LRU recency untouched — a
-    /// version probe is not an access.
-    fn cached_schema_version(&self, tid: u64) -> u16 {
-        self.schema_cache.peek(&tid).map(|(_, v)| *v).unwrap_or(0)
+    /// The cached `(schema, version)` for `tid`. `get`, so a relation in use
+    /// keeps its LRU recency; the version is what the request stamps.
+    fn cached_hint(&mut self, tid: u64) -> Option<Hint> {
+        self.schema_cache.get(&tid).map(|(s, v)| (Arc::clone(s), *v))
     }
 
-    /// Build a SCAN_MULTI request frame, stamping each tid with its cached schema
-    /// version. Rejects the list here, in every build profile, before a frame
-    /// exists. The case that matters is the empty list: it would encode a
-    /// count=0 frame whose lone server error frame an N=0 accumulator never
-    /// consumes, permanently shifting every later read on this connection by
-    /// one frame.
-    fn encode_scan_multi_frame(&self, tids: &[u64]) -> Result<Vec<u8>, ClientError> {
-        txn_frame::validate_item_ids("SCAN_MULTI", tids, |&tid| tid)?;
-        let relations: Vec<(u64, u16)> = tids.iter().map(|&tid| (tid, self.cached_schema_version(tid))).collect();
-        Ok(txn_frame::encode_scan_multi(self.client_id, &relations))
-    }
-
-    /// The cached schema version for `target_id` OR'd into the flag word, so a
-    /// warm-cache request lets the server omit the schema block.
-    fn versioned_flags(&self, target_id: u64, base: u64) -> u64 {
-        wire_flags_set_schema_version(base, self.cached_schema_version(target_id))
+    /// A SCAN_MULTI request frame, each tid stamped with the version of the
+    /// hint beside it.
+    fn encode_scan_multi_frame(&self, tids: &[(u64, Option<Hint>)]) -> Vec<u8> {
+        let relations: Vec<(u64, u16)> = tids
+            .iter()
+            .map(|(tid, h)| (*tid, h.as_ref().map_or(0, |h| h.1)))
+            .collect();
+        txn_frame::encode_scan_multi(self.client_id, &relations)
     }
 }
 
-/// The cached `(schema, version)` for `tid` as an owned decode hint.
-/// `get` (not `peek`) so a relation in use refreshes its LRU recency.
-fn cached_hint(cache: &mut LruCache<u64, (Arc<Schema>, u16)>, tid: u64) -> Option<(Arc<Schema>, u16)> {
-    cache.get(&tid).map(|(s, v)| (Arc::clone(s), *v))
+/// A read train that terminated with neither a schema block nor a hint to
+/// decode under: the framing can no longer be trusted.
+fn no_schema() -> ClientError {
+    ClientError::Protocol(ProtocolError::DecodeError("read reply carries no schema".into()))
 }
 
 /// A reply frame naming a relation the head slot's position does not expect.
@@ -1321,20 +1332,22 @@ fn complete_head(
     done.push((slot.id, result));
 }
 
-/// A RESOLVE train as `(live tid, schema, descriptor)`, or `None` when no such
-/// relation exists. The descriptor's foreign keys are merged into the schema
-/// here: `batch_to_schema` rebuilds every column-layout fact but leaves the FK
-/// fields at 0, because a reference to *another* relation rides the descriptor.
+/// A RESOLVE train, as its terminal frame and the schema block it carried, as
+/// `(live tid, schema, descriptor)`, or `None` when no such relation exists.
+/// The descriptor's foreign keys are merged into the schema here:
+/// `batch_to_schema` rebuilds every column-layout fact but leaves the FK fields
+/// at 0, because a reference to *another* relation rides the descriptor.
 /// `decode` bounded every `col_idx` against this schema's column count.
-fn resolve_descriptor(train: ReplyTrain) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
-    let msg = train.terminal;
-    let ncols = train.schema.as_ref().map_or(0, |s| s.columns.len());
+fn resolve_descriptor(
+    msg: Message,
+    schema: Option<Arc<Schema>>,
+) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
+    let ncols = schema.as_ref().map_or(0, |s| s.columns.len());
     let Some(desc) = RelDescriptorBlob::decode(&msg.seek_pk_extra, ncols)? else {
         return Ok(None);
     };
-    let mut schema = train
-        .schema
-        .ok_or_else(|| ClientError::ServerError("resolve reply carried no schema block".to_string()))?;
+    let mut schema =
+        schema.ok_or_else(|| ClientError::ServerError("resolve reply carried no schema block".to_string()))?;
     if !desc.fks.is_empty() {
         let cols = &mut Arc::make_mut(&mut schema).columns;
         for fk in &desc.fks {

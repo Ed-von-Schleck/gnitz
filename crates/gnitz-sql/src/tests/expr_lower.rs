@@ -1428,8 +1428,7 @@ fn eval_decimal_row(expr: &BoundExpr, p: i64, q: i64, i: i64) -> Option<i64> {
         .i64_val(q)
         .i64_val(i);
     let ev = compile_scalar_evaluator(expr, &schema).expect("lowers");
-    let view = gnitz_core::ZSetBatchView::new(&batch, &schema);
-    match ev.eval_all(&view) {
+    match ev.eval_all(&batch) {
         gnitz_expr::ExprResults::Scalar(vals) => vals[0],
         gnitz_expr::ExprResults::Str { .. } => panic!("a scalar expression"),
     }

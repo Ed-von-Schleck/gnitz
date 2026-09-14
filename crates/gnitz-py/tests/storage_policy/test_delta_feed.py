@@ -41,16 +41,16 @@ class Subscriber:
         self.cursor = (0, 0)
 
     def bootstrap(self):
-        reply = self.client.delta_bootstrap(self.vid, self.schema, include_hidden=True)
+        reply = self.client.delta_bootstrap(self.vid, self.schema)
         # A bootstrap replaces state; it does not add to it.
-        self.copy = _zset(reply.rows)
+        self.copy = _zset(reply.rows.including_hidden())
         self.cursor = reply.cursor
 
     def poll(self):
         # No hand-written tag check: `delta_poll` refuses a foreign cursor
         # itself, so a reply that arrives here is one this copy may apply.
-        reply = self.client.delta_poll(self.vid, self.delta_schema, self.cursor, include_hidden=True)
-        for k, w in _zset(reply.rows).items():
+        reply = self.client.delta_poll(self.vid, self.delta_schema, self.cursor)
+        for k, w in _zset(reply.rows.including_hidden()).items():
             self.copy[k] = self.copy.get(k, 0) + w
             if self.copy[k] == 0:
                 del self.copy[k]
@@ -65,7 +65,7 @@ class Subscriber:
         raise AssertionError("feed did not settle in 12 polls")
 
     def scan(self):
-        return _zset(self.client.scan(self.vid, include_hidden=True))
+        return _zset(self.client.scan(self.vid).including_hidden())
 
     def assert_converged(self, what=""):
         """Quiesce, then require the copy to equal the view as a multiset.

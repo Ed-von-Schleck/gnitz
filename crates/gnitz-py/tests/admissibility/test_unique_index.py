@@ -40,10 +40,7 @@ def _has_index(client, sn, table="t"):
     """True if any live IdxTab row names `table` as its owner."""
     batch = client.scan(gnitz.IDX_TAB)
     tid, _ = client.resolve_table(sn, table)
-    # Hoisted: every `.scalars`/`.weights` read rebuilds the whole list, so
-    # reading one inside the row loop is quadratic in the catalog size.
-    owners = batch.scalars("owner_id")
-    return any(w > 0 and o == tid for w, o in zip(batch.weights, owners))
+    return any(r._weight > 0 and r.owner_id == tid for r in batch)
 
 
 def _raw_table(client, sn):

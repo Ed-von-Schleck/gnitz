@@ -48,9 +48,22 @@ def test_index_seek_finds_every_key(client, schema_name, index_first):
 
     for i in range(1, n + 1):
         got = client.seek_by_index(tid, [1], [i * 100])
-        assert list(zip(got.pks, got.weights)) == [(i, 1)], f"cust_id={i * 100}"
+        assert bag(got, "pk") == {(i,): 1}, f"cust_id={i * 100}"
     # An absent value is an empty answer, not an error.
-    assert len(client.seek_by_index(tid, [1], [n * 100 + 1]).pks) == 0
+    assert len(client.seek_by_index(tid, [1], [n * 100 + 1])) == 0
+
+
+def test_index_seek_takes_a_negative_key(client, schema_name):
+    """A key value is the column's own integer, sign included: a negative
+    `BIGINT` key packs to the two's-complement word the column stores."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, delta BIGINT NOT NULL); "
+        "CREATE INDEX ON t(delta)", schema_name=sn)
+    tid, _ = client.resolve_table(sn, "t")
+    insert(client, sn, "t", [(1, -5), (2, 5), (3, -7)])
+    assert bag(client.seek_by_index(tid, [1], [-5]), "pk", "delta") == {(1, -5): 1}
+    assert bag(client.seek_by_index(tid, [1], [5]), "pk", "delta") == {(2, 5): 1}
 
 
 # ---------------------------------------------------------------------------

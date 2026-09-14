@@ -2,9 +2,9 @@
 //! surfaces, and every encode from a Python object to wire bytes.
 //!
 //! The per-cell encode table is private: what leaves this module is the key- and
-//! column-level entry points the client's own verbs call. `ZSetBatch`'s
-//! inspection getters read back through `read` — a pyclass crosses the
-//! directional pair, no codec does.
+//! column-level entry points the client's own verbs call. `ZSetBatch.rows()`
+//! reads back through `read::scan_result` — a pyclass crosses the directional
+//! pair, no codec does.
 
 use std::ffi::CStr;
 use std::sync::Arc;
@@ -12,50 +12,55 @@ use std::sync::Arc;
 use pyo3::ffi;
 use pyo3::impl_::extract_argument::argument_extraction_error;
 use pyo3::prelude::*;
-use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyList, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
+use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
 use pyo3::Borrowed;
 
-use gnitz_core::{push_zero_cell, ColType, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColType, PkColumn, ScanReply, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::decimal::{decimal_of_f64, parse_decimal, rescale};
 
-use crate::read::{pk_column_to_pylist, rust_batch_columns_to_py};
+use crate::read::{scan_result, PyScanResult};
 use crate::schema::resolve_py_schema;
 
-/// Encode the Python PK values `pks` (each an int/UUID for a single-column key,
-/// or packed `bytes`) into a `PkColumn` for `schema`. Shared by
-/// `PyGnitzClient::delete` and `PyTxn::delete`; a single-column key runs through
-/// the same encoder the append path uses.
+/// Encode the Python PK values `pks` into a `PkColumn` for `schema`: a
+/// single-column key is its value, a compound key a tuple of per-column values
+/// in PK order. Shared by `PyGnitzClient::delete` and `PyTxn::delete`; every
+/// column runs through the same encoder the append path uses.
 pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkColumn> {
-    let stride = schema.pk_stride();
     let mut pk_col = PkColumn::empty_for_schema(schema);
     pk_col.reserve(pks.len());
-    let single_pk = schema.pk_index_single().map(|ci| &schema.columns[ci as usize]);
-    let mut native = Vec::with_capacity(stride);
+    let mut native = Vec::with_capacity(schema.pk_stride());
     for pk_val in pks {
         native.clear();
-        if let Ok(bytes) = pk_val.cast::<pyo3::types::PyBytes>() {
-            let b = bytes.as_bytes();
-            if b.len() != stride {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "pk bytes length {} != schema pk_stride {}",
-                    b.len(),
-                    stride
-                )));
+        match schema.pk_index_single() {
+            Some(ci) => push_pk_col(&mut native, schema, ci as usize, pk_val)?,
+            None => {
+                let tuple = pk_val.cast::<PyTuple>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err("a compound pk must be a tuple of its column values")
+                })?;
+                if tuple.len() != schema.pk_count() {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "a compound pk takes {} values, got {}",
+                        schema.pk_count(),
+                        tuple.len()
+                    )));
+                }
+                for (&ci, v) in schema.pk_cols.iter().zip(tuple.as_slice()) {
+                    push_pk_col(&mut native, schema, ci as usize, v)?;
+                }
             }
-            native.extend_from_slice(b);
-        } else if let Some(col) = single_pk {
-            if pk_val.is_none() {
-                return Err(not_nullable_err(&col.name));
-            }
-            push_fixed_le(&mut native, col.ty(), pk_val)?;
-        } else {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "a compound pk must be passed as packed bytes",
-            ));
         }
         pk_col.push_bytes(schema, &native);
     }
     Ok(pk_col)
+}
+
+/// Append PK column `ci`'s value `v` to `native`, refusing `None`.
+fn push_pk_col(native: &mut Vec<u8>, schema: &Schema, ci: usize, v: &Bound<'_, PyAny>) -> PyResult<()> {
+    let col = &schema.columns[ci];
+    if v.is_none() {
+        return Err(not_nullable_err(&col.name));
+    }
+    push_fixed_le(native, col.ty(), v)
 }
 
 /// Stores batch data in Rust Vecs with a cached Schema. `append` / `extend`
@@ -90,7 +95,7 @@ impl PyZSetBatch {
         match body(self) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.batch.rollback_to(mark, self.schema.as_ref());
+                self.batch.rollback_to(mark);
                 Err(e)
             }
         }
@@ -340,7 +345,7 @@ impl PyZSetBatch {
         for (payload_idx, &PayloadPlan { ci, ty, nullable, src }) in plan.payload.iter().enumerate() {
             let v = match src {
                 PayloadSrc::Filler => {
-                    push_zero_cell(&mut batch.columns[ci], ty.tc);
+                    batch.payload[payload_idx].push_zero();
                     continue;
                 }
                 PayloadSrc::Arg(i) => Some(arg(i)),
@@ -348,15 +353,15 @@ impl PyZSetBatch {
             };
             match v {
                 Some(v) if !v.is_none() => {
-                    let ZSetBatch { columns, blob, .. } = &mut *batch;
-                    push_column_value(&mut columns[ci], blob, ty, &v)?
+                    let ZSetBatch { payload: cols, blob, .. } = &mut *batch;
+                    push_column_value(&mut cols[payload_idx].bytes, blob, ty, &v)?
                 }
                 _ => {
                     if !nullable {
                         return Err(not_nullable_err(&schema.columns[ci].name));
                     }
                     gnitz_wire::null_word_set(&mut nulls, payload_idx, true);
-                    push_zero_cell(&mut batch.columns[ci], ty.tc);
+                    batch.payload[payload_idx].push_zero();
                 }
             }
         }
@@ -533,7 +538,7 @@ impl PyZSetBatch {
             // A sized sequence lets every growth stream skip its climb from
             // zero; a generator has no `__len__`, so the probe is discarded.
             if let Ok(n) = rows.len() {
-                s.batch.reserve(s.schema.as_ref(), n);
+                s.batch.reserve(n);
             }
             for row_item in rows.try_iter()? {
                 let row_item = row_item?;
@@ -546,20 +551,16 @@ impl PyZSetBatch {
         Ok(slf)
     }
 
-    #[getter]
-    pub fn pks(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        pk_column_to_pylist(py, &self.schema, &self.batch)
-    }
-    #[getter]
-    pub fn columns(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        rust_batch_columns_to_py(py, self.schema.as_ref(), &self.batch)
-    }
-    /// Built straight off the weight region, as `ScanResult.weights` is —
-    /// returning a `Vec<i64>` would clone the whole region only for pyo3 to
-    /// walk the clone and drop it.
-    #[getter]
-    pub fn weights(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        Ok(PyList::new(py, &self.batch.weights)?.unbind())
+    /// The rows appended so far, as a `ScanResult` over a copy of the batch.
+    pub fn rows(&self, py: Python<'_>) -> PyResult<Py<PyScanResult>> {
+        scan_result(
+            py,
+            ScanReply {
+                schema: Arc::clone(&self.schema),
+                batch: self.batch.clone(),
+                lsn: None,
+            },
+        )
     }
 
     pub fn __len__(&self) -> usize {
@@ -582,8 +583,8 @@ impl PyZSetBatch {
 /// A string is UUID text — canonical or bare 32-hex — and nothing else
 /// (`gnitz_wire::parse_uuid`, the crate that owns wire-value text). Which
 /// *columns* a string may be written to is not decided here: this function is
-/// also reached from the schema-less wire paths (`pk_key_from_py`,
-/// `seek_by_index`), which have no type code to consult. The typed encoder
+/// also reached from the schema-less wire path [`py_scalar_key`], which has no
+/// type code to consult. The typed encoder
 /// [`push_fixed_le`] reaches it for UUID alone.
 pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
     // `cast` before `extract` on both arms: a failed `extract` builds *and
@@ -708,13 +709,11 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>) -> PyR
 }
 
 /// Split a Python seek key into the control block's `(seek_pk, seek_pk_extra)`
-/// pair. `bytes` is packed native-LE columns; an integer becomes a 16-byte key
-/// of which the server reads only the relation's own stride — a truncation, not
-/// a range check. The signed fallback keeps a negative key packing to the same
-/// two's-complement bytes the typed append path writes.
+/// pair. `bytes` is packed native-LE columns; anything else is one scalar
+/// ([`py_scalar_key`]).
 pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<(u128, Vec<u8>)> {
-    // bytes first: `extract_uuid_or_u128` below falls through to
-    // `getattr("int")`, which a bytes key would walk before failing.
+    // bytes first: `py_scalar_key` falls through to `getattr("int")`, which a
+    // bytes key would walk before failing.
     if let Ok(bytes) = pk.cast::<pyo3::types::PyBytes>() {
         let b = bytes.as_bytes();
         if b.is_empty() || b.len() > gnitz_core::MAX_PK_BYTES {
@@ -727,20 +726,28 @@ pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<(u128, Vec<u8>)>
         let (low, extra) = gnitz_wire::control::split_ctrl_key(b);
         return Ok((low, extra.to_vec()));
     }
+    Ok((py_scalar_key(pk)?, Vec::new()))
+}
+
+/// One scalar key value as the 16-byte native word the wire carries, of which
+/// the server reads only the column's own stride — a truncation, not a range
+/// check. The signed arm keeps a negative key packing to the same
+/// two's-complement bytes the typed append path writes.
+pub(crate) fn py_scalar_key(pk: &Bound<'_, PyAny>) -> PyResult<u128> {
     // `i128` first, so a negative key does not build and discard an
     // `OverflowError` on the unsigned arm; a `U128` key above `i128::MAX`, a
-    // `uuid.UUID` and UUID text all fall to the second.
+    // `uuid.UUID` and UUID text all fall to the last.
     if let Ok(val) = pk.extract::<i128>() {
-        return Ok((val as u128, Vec::new()));
+        return Ok(val as u128);
     }
-    // A `datetime` keys a TIMESTAMP relation and a `date` a DATE one; the
-    // server reads only the relation's own stride, which is what tells them
-    // apart from a plain integer key.
+    // A `datetime` keys a TIMESTAMP column and a `date` a DATE one; the server
+    // reads only the column's own stride, which is what tells them apart from a
+    // plain integer key.
     if pk.is_instance_of::<PyDateTime>() {
-        return Ok((extract_micros(pk)? as i128 as u128, Vec::new()));
+        return Ok(extract_micros(pk)? as i128 as u128);
     }
     if pk.is_instance_of::<PyDate>() {
-        return Ok((extract_days(pk)? as i128 as u128, Vec::new()));
+        return Ok(extract_days(pk)? as i128 as u128);
     }
-    extract_uuid_or_u128(pk).map(|v| (v, Vec::new()))
+    extract_uuid_or_u128(pk)
 }

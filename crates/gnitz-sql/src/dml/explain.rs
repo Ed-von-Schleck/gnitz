@@ -268,5 +268,8 @@ fn plan_rows(lines: &[String]) -> SqlResult {
             a.end_row();
         }
     }
-    SqlResult::Rows { schema, batch }
+    SqlResult::Rows {
+        schema: std::sync::Arc::new(schema),
+        batch,
+    }
 }

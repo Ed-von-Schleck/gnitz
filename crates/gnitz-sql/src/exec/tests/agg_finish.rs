@@ -89,9 +89,9 @@ fn fill_group_batch_lays_out_values_and_null_bits() {
         partial.pks.push_u128(&spec.partial_schema, key);
         partial.weights.push(1);
         partial.nulls.push(if row == 1 { 0b1 } else { 0 });
-        push_fixed_bits(&mut partial.columns[1], g as u64, 8);
-        push_fixed_bits(&mut partial.columns[2], sm as u16 as u64, 2);
-        push_fixed_bits(&mut partial.columns[3], 0, 8);
+        push_fixed_bits(&mut partial.payload[0], g as u64);
+        push_fixed_bits(&mut partial.payload[1], sm as u16 as u64);
+        push_fixed_bits(&mut partial.payload[2], 0);
     }
 
     let reps = [Some(0usize), Some(1usize)];
@@ -114,14 +114,14 @@ fn fill_group_batch_lays_out_values_and_null_bits() {
     assert_eq!(got.pks, PkColumn::from_natives(&spec.partial_schema, [0x77, 0x33]));
     // g: the copied value, then `push_null`'s zero filler.
     assert_eq!(
-        got.columns[1],
+        got.payload[0].bytes,
         10i64.to_le_bytes().iter().chain(&[0; 8]).copied().collect::<Vec<_>>()
     );
     // MIN(sm) truncated to its declared 2 bytes, then a zeroed NULL cell.
-    assert_eq!(got.columns[2], [0xfb, 0xff, 0, 0]);
+    assert_eq!(got.payload[1].bytes, [0xfb, 0xff, 0, 0]);
     // COUNT is never NULL.
     assert_eq!(
-        got.columns[3],
+        got.payload[2].bytes,
         2i64.to_le_bytes()
             .iter()
             .chain(&1i64.to_le_bytes())
@@ -143,7 +143,7 @@ fn fill_group_batch_handles_the_global_ground_row() {
     assert_eq!(got.len(), 1);
     // Slot 0 = MIN (NULL), slot 1 = COUNT (0, never NULL).
     assert_eq!(got.nulls, vec![0b01]);
-    assert_eq!(got.columns[2], 0i64.to_le_bytes());
+    assert_eq!(got.payload[1].bytes, 0i64.to_le_bytes());
 }
 
 /// The shape the fold path builds for one direct COUNT — `SELECT g, COUNT(*) …
@@ -198,8 +198,8 @@ fn the_output_row_carries_the_engine_group_key() {
         partial.pks.push_u128(&spec.partial_schema, key);
         partial.weights.push(1);
         partial.nulls.push(0);
-        push_fixed_bits(&mut partial.columns[1], g as u64, 8);
-        push_fixed_bits(&mut partial.columns[2], n as u64, 8);
+        push_fixed_bits(&mut partial.payload[0], g as u64);
+        push_fixed_bits(&mut partial.payload[1], n as u64);
     }
 
     let got = agg_finish(&spec, &partial);
@@ -209,8 +209,8 @@ fn the_output_row_carries_the_engine_group_key() {
     assert_eq!(got.pks, PkColumn::from_natives(&spec.partial_schema, [0x2222, 0x1111]));
     // The values stay paired with their keys: 0x2222 is g = 20 / COUNT 1,
     // 0x1111 is g = 10 / COUNT 2 + 3.
-    assert_eq!(got.columns[1], le(&[20, 10]));
-    assert_eq!(got.columns[2], le(&[1, 5]));
+    assert_eq!(got.payload[0].bytes, le(&[20, 10]));
+    assert_eq!(got.payload[1].bytes, le(&[1, 5]));
 }
 
 /// The synthesized global ground row has no partial to copy a key from, so
@@ -228,7 +228,7 @@ fn the_global_ground_row_is_keyed_at_v0() {
         got.pks,
         PkColumn::from_natives(&spec.partial_schema, [gnitz_wire::global_group_key()])
     );
-    assert_eq!(got.columns[1], le(&[0]));
+    assert_eq!(got.payload[0].bytes, le(&[0]));
 }
 
 /// A global `AVG(u)` over a `BIGINT UNSIGNED` column, built the way the planner
@@ -270,13 +270,13 @@ fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
         .push_u128(&spec.partial_schema, gnitz_wire::global_group_key());
     partial.weights.push(1);
     partial.nulls.push(0);
-    push_fixed_bits(&mut partial.columns[1], sum_bits as u64, 8);
-    push_fixed_bits(&mut partial.columns[2], cnt as u64, 8);
+    push_fixed_bits(&mut partial.payload[0], sum_bits as u64);
+    push_fixed_bits(&mut partial.payload[1], cnt as u64);
 
     let got = agg_finish(&spec, &partial);
     assert_eq!(got.len(), 1);
     (!gnitz_wire::null_word_get(got.nulls[0], 0))
-        .then(|| f64::from_bits(u64::from_le_bytes(got.columns[1][..8].try_into().unwrap())))
+        .then(|| f64::from_bits(u64::from_le_bytes(got.payload[0].bytes[..8].try_into().unwrap())))
 }
 
 /// AVG divides its SUM accumulator at the accumulator's declared type. A SUM

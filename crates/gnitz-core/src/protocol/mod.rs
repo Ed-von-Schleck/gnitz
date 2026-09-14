@@ -32,7 +32,6 @@ pub use message::{
     Message, MessageParts,
 };
 pub(crate) use message::{encode_control_frame, parse_response_frame};
-pub use regions::ZSetBatchView;
 // Only the `integration` suite drives a raw transport from outside; a shipped
 // build keeps it crate-private. The cfgs are complementary because two `use`
 // statements binding one name is `E0252` whatever their visibility.
@@ -42,6 +41,7 @@ pub use transport::{hello_handshake, ClientTransport};
 pub(crate) use transport::{hello_handshake, ClientTransport};
 pub use types::{
     native_le_key, opk_key_cols, opk_key_packed, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget,
-    PkBuf, PkColumn, ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    PayloadColumn, PkBuf, PkColumn, ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES,
+    PK_LIST_MAX_COLS,
 };
 pub use wal_block::decode_wal_block;

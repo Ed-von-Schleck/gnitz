@@ -64,22 +64,20 @@ fn misordered_chain(base_tid: u64, cols: &[ColumnDef]) -> Vec<PlannedView> {
 
 /// The vids of every live VIEW_TAB row naming `owner_vid` as its owner.
 fn segment_vids_of(client: &mut GnitzClient, owner_vid: u64) -> Vec<u64> {
-    let (_, batch, _) = client.scan(gnitz_wire::VIEW_TAB).expect("scan VIEW_TAB");
-    let Some(b) = batch else { return Vec::new() };
-    let owners = &b.columns[gnitz_wire::VIEWTAB_COL_OWNER_VIEW_ID];
+    let b = client.scan(gnitz_wire::VIEW_TAB).expect("scan VIEW_TAB").batch;
+    let view_tab = gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB);
+    let owners = &b.payload[view_tab.payload_idx(gnitz_wire::VIEWTAB_COL_OWNER_VIEW_ID)].bytes;
     (0..b.len())
         .filter(|&i| b.weights[i] > 0)
         .filter(|&i| u64::from_le_bytes(owners[i * 8..i * 8 + 8].try_into().unwrap()) == owner_vid)
-        .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
+        .map(|i| b.pks.get(view_tab, i) as u64)
         .collect()
 }
 
 /// `(pk, v, weight)` of every row a `(pk, v)` relation holds, sorted.
 fn weighted_rows(client: &mut GnitzClient, id: u64) -> Vec<(i64, i64, i64)> {
-    let (schema, batch, _) = client.scan(id).unwrap();
-    let Some(b) = batch else { return Vec::new() };
-    let schema = schema.expect("a cold scan carries the relation's schema block");
-    let vs = &b.columns[1];
+    let gnitz_core::ScanReply { schema, batch: b, .. } = client.scan(id).unwrap();
+    let vs = &b.payload[0].bytes;
     let mut out: Vec<(i64, i64, i64)> = (0..b.len())
         .map(|i| {
             let v = i64::from_le_bytes(vs[i * 8..i * 8 + 8].try_into().unwrap());
@@ -164,15 +162,11 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     // Nothing of the refused bundle committed: the only live views are `taken`
     // and no segment names it — or anything — as owner.
     assert!(segment_vids_of(&mut client, taken).is_empty());
-    let (_, views, _) = client.scan(gnitz_wire::VIEW_TAB).unwrap();
-    let live: Vec<u64> = views
-        .map(|b| {
-            (0..b.len())
-                .filter(|&i| b.weights[i] > 0)
-                .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
-                .collect()
-        })
-        .unwrap_or_default();
+    let b = client.scan(gnitz_wire::VIEW_TAB).unwrap().batch;
+    let live: Vec<u64> = (0..b.len())
+        .filter(|&i| b.weights[i] > 0)
+        .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
+        .collect();
     assert_eq!(live, vec![taken]);
     assert_eq!(weighted_rows(&mut client, taken), base_at_weight_one());
 

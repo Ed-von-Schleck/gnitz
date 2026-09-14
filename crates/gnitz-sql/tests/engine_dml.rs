@@ -297,13 +297,18 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
     // — checked by content, not by count: each frame's rows are appended into one
     // batch, and the null words and German cells of a frame are indexed by its
     // own row numbers, so a wrong offset moves values without losing any.
-    let (rschema, batch, _) = client.scan(tid).expect("an 85 MB TEXT reply chunks like any other");
-    let rschema = rschema.expect("a cold scan carries its schema block");
-    let batch = batch.expect("the table is not empty");
+    let gnitz_core::ScanReply { schema: rschema, batch, .. } =
+        client.scan(tid).expect("an 85 MB TEXT reply chunks like any other");
     assert_eq!(batch.len(), ROWS as usize);
     let (id_ci, v_ci, s_ci) = (col_idx(&rschema, "id"), col_idx(&rschema, "v"), col_idx(&rschema, "s"));
     let mut seen = vec![false; ROWS as usize];
-    for (row, cell) in batch.columns[s_ci].as_chunks::<16>().0.iter().enumerate() {
+    for (row, cell) in batch.payload[rschema.payload_idx(s_ci)]
+        .bytes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let id = cell_i64(&rschema, &batch, id_ci, row) as u64;
         assert!(
             id < ROWS && !std::mem::replace(&mut seen[id as usize], true),

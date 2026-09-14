@@ -1,4 +1,4 @@
-use crate::connection::{MultiScanResult, RawBlock, RelTarget, ScanResult, Session};
+use crate::connection::{MultiScanResult, RawBlock, RelTarget, ScanReply, ScanResult, Session};
 use crate::error::ClientError;
 use crate::protocol::{
     BatchAppender, ColumnDef, PkBuf, PkColumn, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::circuit::Circuit;
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
     RelClass, RelDescriptorBlob, TableProps, CIRCUIT_NODES_TAB, COL_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS,
@@ -18,11 +19,8 @@ use gnitz_wire::{
 
 // --- Module-private helpers ---
 
-fn col_u64(batch: &ZSetBatch, ci: usize, i: usize) -> Result<u64, ClientError> {
-    let cell = batch
-        .cell(ci, i, 8)
-        .ok_or_else(|| ClientError::ServerError(format!("col_u64: no 8-byte cell at row {i}")))?;
-    Ok(gnitz_wire::read_u64_le(cell, 0))
+fn col_u64(batch: &ZSetBatch, schema: &Schema, ci: usize, i: usize) -> u64 {
+    gnitz_wire::read_u64_le(SchemaFacts::locate(schema, ci).bytes(batch, i), 0)
 }
 
 /// Row `i` of a system-table STRING column. Every such column is declared
@@ -30,15 +28,13 @@ fn col_u64(batch: &ZSetBatch, ci: usize, i: usize) -> Result<u64, ClientError> {
 /// boundary that says so rather than substituting `""`. UTF-8 is validated here
 /// too: the region carries bytes.
 fn col_str<'a>(batch: &'a ZSetBatch, schema: &Schema, ci: usize, i: usize) -> Result<&'a str, ClientError> {
-    let cell = batch
-        .cell(ci, i, 16)
-        .ok_or_else(|| ClientError::ServerError(format!("col_str: row {i} out of bounds")))?;
-    if gnitz_wire::null_word_get(batch.nulls[i], schema.payload_idx(ci)) {
+    let loc = SchemaFacts::locate(schema, ci);
+    if loc.is_null(batch, i) {
         return Err(ClientError::ServerError(format!(
             "col_str: NULL in a non-nullable system column at row {i}"
         )));
     }
-    std::str::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob))
+    std::str::from_utf8(gnitz_wire::german_string_content(loc.bytes(batch, i), &batch.blob))
         .map_err(|e| ClientError::ServerError(format!("col_str: invalid UTF-8 at row {i}: {e}")))
 }
 
@@ -81,7 +77,7 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
         pks,
         weights: vec![-1; count],
         nulls: vec![0; count],
-        columns: ZSetBatch::filler_columns(schema, count),
+        payload: ZSetBatch::filler_columns(schema, count),
         blob: vec![],
     }
 }
@@ -614,7 +610,7 @@ impl GnitzClient {
         table_id: u64,
         spec: &[u8],
         reply_schema: &Arc<Schema>,
-    ) -> Result<Option<ZSetBatch>, ClientError> {
+    ) -> Result<ZSetBatch, ClientError> {
         // An ad-hoc SELECT holds no cursor across reads, so the terminal
         // watermark is dropped here rather than pushed through every caller.
         let rs = ReplySchema::new(Arc::clone(reply_schema), table_id);
@@ -680,13 +676,13 @@ impl GnitzClient {
     /// hold it and the read is the caller's to delegate — which an async handle
     /// does on its own connection rather than this one, and
     /// [`Self::scan_local_first`] does here.
-    pub fn scan_local(&mut self, table_id: u64) -> Result<Option<(Arc<Schema>, ZSetBatch)>, ClientError> {
+    pub fn scan_local(&mut self, table_id: u64) -> Result<Option<ScanReply>, ClientError> {
         let Some((view, store)) = self.local_read(table_id) else {
             return Ok(None);
         };
         let schema = Arc::clone(&view.desc.schema);
         let batch = store.scan(table_id, &schema)?;
-        Ok(Some((schema, batch)))
+        Ok(Some(ScanReply { schema, batch, lsn: None }))
     }
 
     /// [`Self::scan`], answered off the copy when it holds `table_id`.
@@ -694,12 +690,11 @@ impl GnitzClient {
     /// The served LSN is `None` for a local answer: it is a server-side counter,
     /// and a copy's freshness is a feed round — [`Self::cursor_of`] is where a
     /// host reads it.
-    pub fn scan_local_first(&mut self, table_id: u64) -> Result<crate::connection::LocalScanReply, ClientError> {
-        if let Some((schema, batch)) = self.scan_local(table_id)? {
-            return Ok((Some(schema), Some(batch), None));
+    pub fn scan_local_first(&mut self, table_id: u64) -> Result<ScanReply, ClientError> {
+        match self.scan_local(table_id)? {
+            Some(r) => Ok(r),
+            None => self.scan(table_id),
         }
-        let (schema, data, lsn) = self.scan(table_id)?;
-        Ok((schema, data, Some(lsn)))
     }
 
     /// [`Self::scan_spec`], answered off the copy when it holds `table_id`.
@@ -710,9 +705,9 @@ impl GnitzClient {
         table_id: u64,
         spec: &[u8],
         reply_schema: &Arc<Schema>,
-    ) -> Result<Option<ZSetBatch>, ClientError> {
+    ) -> Result<ZSetBatch, ClientError> {
         if let Some((_, store)) = self.local_read(table_id) {
-            return Ok(Some(store.scan_spec(table_id, spec, reply_schema)?));
+            return Ok(store.scan_spec(table_id, spec, reply_schema)?);
         }
         self.scan_spec(table_id, spec, reply_schema)
     }
@@ -764,7 +759,7 @@ impl GnitzClient {
         &mut self,
         view_id: u64,
         view_schema: &Arc<Schema>,
-    ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
+    ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
         self.delta_read(view_id, 0, &ReplySchema::new(Arc::clone(view_schema), view_id))
     }
 
@@ -787,7 +782,7 @@ impl GnitzClient {
         view_id: u64,
         cursor: DeltaCursor,
         reply_schema: &Arc<Schema>,
-    ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
+    ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
         let rs = ReplySchema::new(Arc::clone(reply_schema), view_id);
         let (data, next) = self.delta_read(view_id, cursor.poll_after()?, &rs)?;
         Ok((data, cursor.advanced_to(next)?))
@@ -824,7 +819,7 @@ impl GnitzClient {
         view_id: u64,
         after_tick: u64,
         reply_schema: &ReplySchema,
-    ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
+    ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
         let spec = Self::delta_spec(after_tick);
         let (data, watermark) = self.session.scan_spec(view_id, &spec, reply_schema)?;
         Ok((data, DeltaCursor::from_watermark(watermark)))
@@ -955,16 +950,12 @@ impl GnitzClient {
         let mut retired: Vec<usize> = Vec::with_capacity(index_names.len());
         for name in index_names {
             let name = gnitz_wire::canonical_identifier(name)?;
-            let found = match &scanned {
-                Some(b) => index_retraction(b, &name)?.map(|i| (b, i)),
-                None => None,
-            };
-            match found {
-                Some((b, i)) => {
+            match index_retraction(&scanned, &name)? {
+                Some(i) => {
                     // A repeated name retires once: the row is already in the batch.
                     if !retired.contains(&i) {
                         retired.push(i);
-                        batch.copy_row_at(b, i, -1, idx_schema);
+                        batch.copy_row_at(&scanned, i, -1);
                     }
                 }
                 None if if_exists => {}
@@ -981,13 +972,11 @@ impl GnitzClient {
     /// `(id, name, indexed columns)` of every live secondary index. Names come back
     /// canonical (lowercase): every writer folds them at store time.
     pub fn index_rows(&mut self) -> Result<Vec<(u64, String, gnitz_wire::PkColList)>, ClientError> {
-        let Some(idx_batch) = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)? else {
-            return Ok(Vec::new());
-        };
+        let idx_batch = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)?;
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)?.to_string();
-            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch, IDXTAB_COL_SOURCE_COLS, i)?)
+            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_SOURCE_COLS, i))
                 .map_err(|rule| ClientError::ServerError(format!("index '{name}': {rule}")))?;
             out.push((idx_batch.pks.get(sys_schema(IDX_TAB), i) as u64, name, cols));
         }
@@ -1441,7 +1430,7 @@ impl GnitzClient {
 
         // 0. The replaced view's retraction, ahead of the new chain's `+1`s.
         if let Some((scanned, i)) = &replaced {
-            view_batch.copy_row_at(scanned, *i, -1, view_s);
+            view_batch.copy_row_at(scanned, *i, -1);
         }
 
         {
@@ -1535,7 +1524,7 @@ impl GnitzClient {
             let id = scanned.pks.get(s, i) as u64;
             if !retired.contains(&id) {
                 retired.push(id);
-                batch.copy_row_at(&scanned, i, -1, s);
+                batch.copy_row_at(&scanned, i, -1);
             }
         }
         // Every name skipped: no zone, so no barrier and no fdatasync.
@@ -1551,12 +1540,10 @@ impl GnitzClient {
     fn schema_retractions(&mut self, family: u64, schema_id: u64) -> Result<ZSetBatch, ClientError> {
         let s = sys_schema(family);
         let mut out = ZSetBatch::new(s);
-        let Some(scanned) = checked_sys_rows(family, self.session.scan(family)?)? else {
-            return Ok(out);
-        };
+        let scanned = checked_sys_rows(family, self.session.scan(family)?)?;
         for i in scanned.live_rows() {
-            if col_u64(&scanned, RELTAB_COL_SCHEMA_ID, i)? == schema_id {
-                out.copy_row_at(&scanned, i, -1, s);
+            if col_u64(&scanned, s, RELTAB_COL_SCHEMA_ID, i) == schema_id {
+                out.copy_row_at(&scanned, i, -1);
             }
         }
         Ok(out)
@@ -1576,7 +1563,7 @@ impl GnitzClient {
         let Some(desc) = self.resolve(schema_name, name)? else {
             return Ok(None);
         };
-        let scanned = self.seek_sys_row(family, desc.tid)?.ok_or_else(missing)?;
+        let scanned = self.seek_sys_row(family, desc.tid)?;
         let i = scanned
             .live_row_with_pk(sys_schema(family), desc.tid)
             .ok_or_else(missing)?;
@@ -1606,12 +1593,12 @@ impl GnitzClient {
         // with only `name` patched.
         let family = if desc.class.is_view() { VIEW_TAB } else { TABLE_TAB };
         let s = sys_schema(family);
-        let scanned = self.seek_sys_row(family, desc.tid)?.ok_or_else(missing)?;
+        let scanned = self.seek_sys_row(family, desc.tid)?;
         let i = scanned.live_row_with_pk(s, desc.tid).ok_or_else(missing)?;
         let mut b = ZSetBatch::new(s);
-        b.copy_row_at(&scanned, i, -1, s);
-        b.copy_row_at(&scanned, i, 1, s);
-        b.set_string_cell(1, RELTAB_COL_NAME, &new_name);
+        b.copy_row_at(&scanned, i, -1);
+        b.copy_row_at(&scanned, i, 1);
+        b.set_string_cell(1, s.payload_idx(RELTAB_COL_NAME), &new_name);
         self.push_ddl_txn(&[(family, b)])?;
         if desc.class.is_view() {
             // The id, the layout and the rows are unchanged, so the copy is
@@ -1809,11 +1796,7 @@ impl GnitzClient {
     /// [`ClientError::NotFound`], like every other catalog absence.
     pub(crate) fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
         let batch = checked_sys_rows(SCHEMA_TAB, self.session.scan(SCHEMA_TAB)?)?;
-        match &batch {
-            Some(b) => find_schema_id(b, schema_name)?,
-            None => None,
-        }
-        .ok_or_else(|| ClientError::NotFound {
+        find_schema_id(&batch, schema_name)?.ok_or_else(|| ClientError::NotFound {
             noun: "schema",
             name: schema_name.to_string(),
         })
@@ -1823,7 +1806,7 @@ impl GnitzClient {
     /// in — one master-local SEEK, not a transfer of the whole family. The batch
     /// rather than a decoded row, because a caller reads the row back out of it to
     /// write the matching `-1`.
-    fn seek_sys_row(&mut self, family: u64, id: u64) -> Result<Option<ZSetBatch>, ClientError> {
+    fn seek_sys_row(&mut self, family: u64, id: u64) -> Result<ZSetBatch, ClientError> {
         // Every system family is keyed by a lone integer id, so the whole key
         // rides the control block's narrow word and the extra blob is empty.
         let reply = self.session.seek(family, id as u128, &[])?;
@@ -1915,11 +1898,7 @@ impl TxnBuffer {
         let last = self.families_of.get(&tid).and_then(|v| v.last().copied());
         match last.filter(|&i| self.families[i].mode == mode) {
             Some(i) => {
-                // Destructured, not cloned: `extend_from_owned` wants the
-                // schema by reference and the batch by `&mut`, and they are
-                // distinct fields of the same family.
-                let BufferedFamily { schema, batch: run, .. } = &mut self.families[i];
-                run.extend_from_owned(batch, schema);
+                self.families[i].batch.extend_from_owned(batch);
             }
             None => {
                 self.families_of.entry(tid).or_default().push(self.families.len());
@@ -2013,14 +1992,13 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
 /// reply is decoded against the server's block or this connection's cache — never
 /// against `sys_schema` — so the check is what makes that indexing a precondition
 /// rather than a cross-crate assumption.
-fn checked_sys_rows(family: u64, reply: crate::connection::ScanReply) -> Result<Option<ZSetBatch>, ClientError> {
-    let (schema, batch, _) = reply;
-    if batch.is_some() && !schema.as_deref().is_some_and(|s| s.types_match(sys_schema(family))) {
+fn checked_sys_rows(family: u64, reply: ScanReply) -> Result<ZSetBatch, ClientError> {
+    if !reply.schema.types_match(sys_schema(family)) {
         return Err(ClientError::ServerError(format!(
             "system family {family} answered in a schema that is not its own"
         )));
     }
-    Ok(batch)
+    Ok(reply.batch)
 }
 
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`.

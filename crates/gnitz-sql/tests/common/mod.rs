@@ -69,7 +69,7 @@ pub fn affected(client: &mut GnitzClient, sn: &str, sql: &str) -> usize {
 }
 
 /// Execute a row-returning statement and return its (schema, batch).
-pub fn read_sql(client: &mut GnitzClient, sn: &str, sql: &str) -> (Schema, ZSetBatch) {
+pub fn read_sql(client: &mut GnitzClient, sn: &str, sql: &str) -> (std::sync::Arc<Schema>, ZSetBatch) {
     match try_exec(client, sn, sql).unwrap().pop().unwrap() {
         SqlResult::Rows { schema, batch } => (schema, batch),
         other => panic!("expected Rows from `{sql}`, got {other:?}"),
@@ -93,28 +93,15 @@ pub fn col_idx(schema: &Schema, name: &str) -> usize {
 }
 
 /// Integer column `ci` of `row`, at its own width and signedness, from
-/// whichever region it lives in. A PK column is decoded out of the OPK region
-/// first; a payload column is native little-endian already.
+/// whichever region it lives in.
 pub fn cell_i64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
-    let tc = schema.columns[ci].type_code;
-    let width = tc.wire_stride();
-    let native;
-    let bytes = if schema.is_pk_col(ci) {
-        let opk = batch.pks.col_window(row, schema.pk_byte_offset(ci), width);
-        native = gnitz_wire::decode_pk_column_owned(opk, tc as u8);
-        &native[..width]
-    } else {
-        &batch.columns[ci][row * width..(row + 1) * width]
-    };
-    if gnitz_wire::is_signed_int(tc as u8) {
-        gnitz_wire::read_signed_exact(bytes)
-    } else {
-        gnitz_wire::read_unsigned_exact(bytes) as i64
-    }
+    let fi = gnitz_wire::FixedInt::from_type_code(schema.columns[ci].type_code).expect("an integer column");
+    gnitz_expr::SchemaFacts::locate(schema, ci).decode_i64(batch, row, fi)
 }
 
-pub fn cell_f64(batch: &ZSetBatch, ci: usize, row: usize) -> f64 {
-    f64::from_le_bytes(batch.columns[ci][row * 8..row * 8 + 8].try_into().unwrap())
+pub fn cell_f64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> f64 {
+    let bytes = gnitz_expr::SchemaFacts::locate(schema, ci).bytes(batch, row);
+    f64::from_le_bytes(bytes.try_into().unwrap())
 }
 
 /// Is payload column `ci` NULL in `row`?

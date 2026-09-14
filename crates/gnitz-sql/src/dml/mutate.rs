@@ -15,16 +15,13 @@ use crate::dml::overlay::{buffered_net, present_rows};
 use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, AccessPlan, ReadBudget};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
-use crate::exec::batch::RowGather;
 use crate::exec::residual::matching_indices;
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses};
 use crate::SqlResult;
-use gnitz_core::{
-    retraction_batch, ColumnDef, GnitzClient, Schema, TypeCode, WireConflictMode, ZSetBatch, ZSetBatchView,
-};
-use gnitz_expr::{BatchView, Evaluator, ExprResults, RowSource};
+use gnitz_core::{retraction_batch, ColumnDef, GnitzClient, Schema, TypeCode, WireConflictMode, ZSetBatch};
+use gnitz_expr::{Evaluator, ExprResults};
 use gnitz_wire::decimal::rescale;
 use gnitz_wire::ReadSink;
 use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
@@ -139,23 +136,23 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
 /// per-row drive would pay `eval_batch`'s prologue for one row.
 pub(crate) enum SetValues<'a> {
     Const(&'a ColumnValue),
-    /// A `TypeCode::String` payload slot of the bound batch, read verbatim
-    /// through the view it was bound against.
+    /// A `TypeCode::String` payload slot of the batch it was bound against,
+    /// read verbatim.
     StrCol {
-        view: &'a ZSetBatchView<'a>,
+        batch: &'a ZSetBatch,
         pi: usize,
     },
     Computed(ExprResults),
 }
 
-/// Bind `p` to `view`, driving its computed arm over every row up front. The
-/// view rides in the bound value, so a caller with two candidate scopes in scope
+/// Bind `p` to `batch`, driving its computed arm over every row up front. The
+/// batch rides in the bound value, so a caller with two candidate scopes in scope
 /// at once cannot read a value back through the wrong one.
-pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, view: &'a ZSetBatchView<'a>) -> SetValues<'a> {
+pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, batch: &'a ZSetBatch) -> SetValues<'a> {
     match p {
         SetProgram::Const(cv) => SetValues::Const(cv),
-        SetProgram::StrCol(c) => SetValues::StrCol { view, pi: *c },
-        SetProgram::Expr(ev) => SetValues::Computed(ev.eval_all(view)),
+        SetProgram::StrCol(c) => SetValues::StrCol { batch, pi: *c },
+        SetProgram::Expr(ev) => SetValues::Computed(ev.eval_all(batch)),
     }
 }
 
@@ -166,12 +163,12 @@ pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, view: &'a ZSetBatchView<'a
 pub(crate) fn eval_set_value(v: &SetValues<'_>, row: usize) -> ColumnValue {
     match v {
         SetValues::Const(cv) => (*cv).clone(),
-        SetValues::StrCol { view, pi } => {
-            if gnitz_wire::null_word_get(view.get_null_word(row), *pi) {
+        SetValues::StrCol { batch, pi } => {
+            if gnitz_wire::null_word_get(batch.nulls[row], *pi) {
                 ColumnValue::Null
             } else {
-                let cell = &view.col_data(*pi, 16)[row * 16..row * 16 + 16];
-                ColumnValue::Str(gnitz_wire::german_string_content(cell, view.blob()).to_vec())
+                let cell = &batch.payload[*pi].bytes[row * 16..row * 16 + 16];
+                ColumnValue::Str(gnitz_wire::german_string_content(cell, &batch.blob).to_vec())
             }
         }
         // A `match` rather than `map_or`: this module builds at opt-level 0,
@@ -241,8 +238,7 @@ pub(crate) fn merge_payload_plan(schema: &Schema) -> Vec<(usize, usize, &ColumnD
 /// `carry_src`. Shared by UPDATE SET (pk_src == carry_src) and ON CONFLICT DO
 /// UPDATE (PK from the incoming row, carry/null-seed from the existing row).
 ///
-/// `payload` is [`merge_payload_plan`], collected once by the caller for the
-/// same reason [`RowGather`] resolves its plan up front.
+/// `payload` is [`merge_payload_plan`], collected once by the caller.
 pub(crate) fn build_merged_row<F>(
     pk_src: &ZSetBatch,
     pk_idx: usize,
@@ -269,10 +265,10 @@ where
                 let is_null = matches!(cv, ColumnValue::Null);
                 check_not_null(col_def, is_null)?;
                 gnitz_wire::null_word_set(&mut null_bits, payload_idx, is_null);
-                let ZSetBatch { columns, blob, .. } = &mut *dst;
-                append_column_value(&mut columns[ci], blob, cv, col_def.type_code)?;
+                let ZSetBatch { payload: cols, blob, .. } = &mut *dst;
+                append_column_value(&mut cols[payload_idx].bytes, blob, cv, col_def.type_code)?;
             }
-            None => dst.push_cell_from(ci, carry_src, ci, col_def.type_code, carry_idx),
+            None => dst.push_cell_from(payload_idx, carry_src, payload_idx, carry_idx),
         }
     }
     dst.nulls.push(null_bits);
@@ -291,13 +287,10 @@ fn write_set_rows(
     schema: &Schema,
     dst: &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
-    // One view over `current` for the whole loop: building one allocates a
-    // region list, which a per-row view would pay per row.
-    let view = ZSetBatchView::new(current, schema);
     // Bound before the row loop, which then only reads a buffer — leaving
     // `build_merged_row` and `append_column_value` row-major, so the order their
     // errors are raised in is unchanged.
-    let bound: Vec<SetValues<'_>> = assignments.iter().map(|(_, p)| bind_set_program(p, &view)).collect();
+    let bound: Vec<SetValues<'_>> = assignments.iter().map(|(_, p)| bind_set_program(p, current)).collect();
     // Pre-index assignments by column for O(1) lookup per payload column
     // (closes the prior O(cols²) per-row `assignments.iter().find`).
     let mut asn_by_col: Vec<Option<&SetValues<'_>>> = vec![None; schema.columns.len()];
@@ -363,16 +356,23 @@ fn resolve_where_matches(
 
     let n = committed.len() + matched.len();
     let mut eff = ZSetBatch::with_capacity(reply_schema, n);
-    let gather = RowGather::new(reply_schema);
     for i in 0..committed.len() {
         // A PK the transaction has written is decided by its buffered version
         // below, whatever the committed row said.
         if !net.contains_key(committed.pks.get_bytes(i)) {
-            gather.copy(&committed, i, &mut eff);
+            eff.copy_row_at(&committed, i, committed.weights[i]);
         }
     }
     for i in matched {
-        gather.copy(&present, i, &mut eff);
+        // A buffered row carries the catalog layout. The reply is that layout
+        // (UPDATE) or the PK alone (DELETE), which takes the key and nothing else.
+        if eff.payload.is_empty() {
+            eff.pks.push_from(&present.pks, i);
+            eff.weights.push(present.weights[i]);
+            eff.nulls.push(0);
+        } else {
+            eff.copy_row_at(&present, i, present.weights[i]);
+        }
     }
     Ok(eff)
 }
@@ -480,10 +480,10 @@ pub(crate) fn execute_delete(
     // (autocommit: one-precondition TXN frame with bounded retry; in a
     // transaction: buffer + record the read-set). The build re-runs per retry.
     //
-    // The retraction is built under the CATALOG schema, whose payload placeholders
-    // `retraction_batch` fills, so an in-transaction DELETE buffers under the same
-    // schema INSERT does (`TxnBuffer` extends a tid's later batches into the first
-    // family's schema).
+    // The retraction is built under the CATALOG schema, whose payload slots
+    // `retraction_batch` zero-fills, so an in-transaction DELETE buffers in the
+    // same layout an INSERT does (`TxnBuffer` appends a tid's later batches to
+    // its family only when their payload layouts are equal).
     let count = commit_rmw_or_buffer(client, &table_name, table_id, schema, |client| {
         let matched = resolve_where_matches(client, table_id, schema, &plan, &sink, &reply_schema)?;
         let pks = matched.pks;

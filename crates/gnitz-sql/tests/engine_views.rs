@@ -147,13 +147,13 @@ fn aggregate_values_and_nulls() {
                 assert_eq!(cell_i64(&schema, &batch, ci(c), r), x, "{c} of group {g}");
             }
             assert!(!is_null_at(&schema, &batch, ci("ax"), r));
-            assert!((cell_f64(&batch, ci("ax"), r) - x as f64).abs() < 1e-9);
+            assert!((cell_f64(&schema, &batch, ci("ax"), r) - x as f64).abs() < 1e-9);
             assert_eq!(cell_i64(&schema, &batch, ci("cx"), r), count);
             assert_eq!(cell_i64(&schema, &batch, ci("ca"), r), all);
         }
         for r in 0..batch.len() {
             assert_eq!(batch.weights[r], 1);
-            assert!(cell_f64(&batch, ci("afx"), r).is_finite());
+            assert!(cell_f64(&schema, &batch, ci("afx"), r).is_finite());
         }
     };
 
@@ -161,8 +161,8 @@ fn aggregate_values_and_nulls() {
     let (schema, batch) = read_sql(&mut client, &sn, "SELECT * FROM vx");
     let r5 = row_where(&schema, &batch, "g", 5);
     assert_eq!(cell_i64(&schema, &batch, col_idx(&schema, "ca"), r5), 2);
-    assert!((cell_f64(&batch, col_idx(&schema, "sfx"), r5) - 4.0).abs() < 1e-9);
-    assert!((cell_f64(&batch, col_idx(&schema, "afx"), r5) - 2.0).abs() < 1e-9);
+    assert!((cell_f64(&schema, &batch, col_idx(&schema, "sfx"), r5) - 4.0).abs() < 1e-9);
+    assert!((cell_f64(&schema, &batch, col_idx(&schema, "afx"), r5) - 2.0).abs() < 1e-9);
     assert_eq!(
         view_rows(&mut client, &sn, "vg", &["sy", "mny", "mxy", "ca"]),
         vec![vec![20, 1, 10, 5, 1]]

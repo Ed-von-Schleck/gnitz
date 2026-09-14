@@ -79,11 +79,11 @@ fn filler_columns_encode_without_panic() {
         pks: PkColumn::from_natives(&schema, [10, 20]),
         weights: vec![-1; count],
         nulls: vec![0; count],
-        columns: ZSetBatch::filler_columns(&schema, count),
+        payload: ZSetBatch::filler_columns(&schema, count),
         blob: vec![],
     };
     batch.validate(&schema).expect("filler batch must validate");
-    let _ = crate::protocol::wal_block::encode_wal_block(&schema, 7, &batch);
+    let _ = crate::protocol::wal_block::encode_wal_block(7, &batch);
 }
 
 #[test]
@@ -337,9 +337,9 @@ fn test_validate_mismatched_strings() {
     batch.pks.push_u128(&schema, 1);
     batch.weights.push(1);
     batch.nulls.push(0);
-    // Strings column is empty — mismatch (a cell count, not a byte length)
+    // Strings column is empty — mismatch (16 bytes per German cell)
     let err = batch.validate(&schema).unwrap_err();
-    assert!(err.contains("column 1: length 0 != expected 1"), "{err}");
+    assert!(err.contains("payload slot 0: length 0 != expected 16"), "{err}");
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn test_validate_mismatched_fixed() {
     batch.nulls.push(0);
     // Fixed column 1 is empty (needs 8 bytes) — a byte length, not a count
     let err = batch.validate(&schema).unwrap_err();
-    assert!(err.contains("column 1: length 0 != expected 8"), "{err}");
+    assert!(err.contains("payload slot 0: length 0 != expected 8"), "{err}");
 }
 
 #[test]
@@ -427,7 +427,7 @@ fn test_validate_wide_pk_buffer_not_multiple_of_stride() {
         pks: PkColumn { stride: 16, buf: vec![0u8; 20] },
         weights: vec![1],
         nulls: vec![0],
-        columns: vec![vec![], vec![]],
+        payload: vec![],
         blob: vec![],
     };
     let err = batch.validate(&schema).unwrap_err();
@@ -443,7 +443,7 @@ fn test_validate_wide_pk_zero_stride() {
         pks: PkColumn { stride: 0, buf: vec![0u8; 16] },
         weights: vec![],
         nulls: vec![],
-        columns: vec![vec![], vec![]],
+        payload: vec![],
         blob: vec![],
     };
     let err = batch.validate(&schema).unwrap_err();
@@ -451,8 +451,8 @@ fn test_validate_wide_pk_zero_stride() {
 }
 
 #[test]
-#[should_panic(expected = "column count mismatch")]
-fn test_extend_from_column_count_mismatch_panics() {
+#[should_panic(expected = "payload layout mismatch")]
+fn test_extend_from_payload_count_mismatch_panics() {
     let schema2 = Schema {
         columns: vec![
             ColumnDef::new("pk", TypeCode::U64, false),
@@ -466,7 +466,23 @@ fn test_extend_from_column_count_mismatch_panics() {
     };
     let mut a = ZSetBatch::new(&schema1);
     let b = ZSetBatch::new(&schema2);
-    a.extend_from_owned(b, &schema1);
+    a.extend_from_owned(b);
+}
+
+/// Equal slot counts are not enough: a batch whose slot holds another type would
+/// have its cells read at that type's width.
+#[test]
+#[should_panic(expected = "payload layout mismatch")]
+fn extend_from_owned_refuses_a_different_payload_layout() {
+    let typed = |tc| Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::U64, false),
+            ColumnDef::new("v", tc, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let mut a = ZSetBatch::new(&typed(TypeCode::I64));
+    a.extend_from_owned(ZSetBatch::new(&typed(TypeCode::F64)));
 }
 
 /// `extend_from_owned` (move) concatenates rows across String and Bytes
@@ -494,16 +510,16 @@ fn test_extend_from_owned_concatenates() {
     };
 
     let mut acc = build(1);
-    acc.extend_from_owned(build(10), &schema);
+    acc.extend_from_owned(build(10));
 
     assert_eq!(acc.len(), 4);
     // Values from both halves survive in order.
     assert_eq!(acc.pks.to_vec_u128(&schema), vec![1u128, 2, 10, 11]);
     assert_eq!(acc.weights, vec![1, -1, 1, -1]);
     {
-        let v = &acc.columns[1];
+        let v = &acc.payload[0].bytes;
         assert_eq!(
-            german_strings(&acc, 1),
+            german_strings(&acc, 0),
             [
                 "hello world is long enough",
                 "short",
@@ -530,7 +546,7 @@ fn test_validate_wrong_column_count() {
     };
     let batch = ZSetBatch::new(&schema1);
     let err = batch.validate(&schema2).unwrap_err();
-    assert!(err.contains("column count"));
+    assert!(err.contains("payload slot count"), "{err}");
 }
 
 // --- Step 3: BatchAppender tests ---
@@ -554,11 +570,11 @@ fn test_appender_single_row() {
     assert_eq!(batch.pks.get(&schema, 0), 42);
     assert_eq!(batch.weights[0], 1);
     {
-        let buf = &batch.columns[1];
+        let buf = &batch.payload[0].bytes;
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
     }
     {
-        let buf = &batch.columns[2];
+        let buf = &batch.payload[1].bytes;
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 200);
     }
 }
@@ -583,7 +599,7 @@ fn test_appender_multi_row() {
     assert_eq!(batch.pks.to_vec_u128(&schema), vec![1u128, 2u128, 3u128]);
     assert_eq!(batch.weights, vec![1, 1, -1]);
     {
-        let buf = &batch.columns[1];
+        let buf = &batch.payload[0].bytes;
         assert_eq!(buf.len(), 24);
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
         assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 20);
@@ -607,7 +623,7 @@ fn test_appender_string_col() {
         .u64_val(42)
         .str_val("hello");
     assert_eq!(batch.len(), 1);
-    assert_eq!(german_strings(&batch, 2), ["hello"]);
+    assert_eq!(german_strings(&batch, 1), ["hello"]);
 }
 
 #[test]
@@ -623,7 +639,7 @@ fn test_appender_u128_col() {
     BatchAppender::new(&mut batch, &schema)
         .add_row(1u128, 1)
         .u128_val(((0xBEEF_u128) << 64) | 0xDEAD);
-    let b = &batch.columns[1];
+    let b = &batch.payload[0].bytes;
     assert_eq!(b, &(((0xBEEF_u128) << 64) | 0xDEAD).to_le_bytes());
 }
 
@@ -648,10 +664,13 @@ fn test_appender_mixed_types() {
         .i64_val(-5)
         .str_val("world");
     assert_eq!(batch.len(), 1);
-    assert_eq!(u64::from_le_bytes(batch.columns[1][0..8].try_into().unwrap()), 100);
-    assert_eq!(german_strings(&batch, 2), ["hello"]);
-    assert_eq!(i64::from_le_bytes(batch.columns[3][0..8].try_into().unwrap()), -5);
-    assert_eq!(german_strings(&batch, 4), ["world"]);
+    assert_eq!(
+        u64::from_le_bytes(batch.payload[0].bytes[0..8].try_into().unwrap()),
+        100
+    );
+    assert_eq!(german_strings(&batch, 1), ["hello"]);
+    assert_eq!(i64::from_le_bytes(batch.payload[2].bytes[0..8].try_into().unwrap()), -5);
+    assert_eq!(german_strings(&batch, 3), ["world"]);
 }
 
 #[test]
@@ -675,19 +694,15 @@ fn test_appender_pk_not_at_zero() {
 
     assert_eq!(batch.pks.get(&schema, 0), 99);
     {
-        let buf = &batch.columns[0];
+        let buf = &batch.payload[0].bytes;
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
     }
     {
-        let buf = &batch.columns[1];
+        let buf = &batch.payload[1].bytes;
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 20);
     }
     {
-        let buf = &batch.columns[2];
-        assert!(buf.is_empty(), "PK column should be empty placeholder");
-    }
-    {
-        let buf = &batch.columns[3];
+        let buf = &batch.payload[2].bytes;
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 30);
     }
 }
@@ -729,7 +744,7 @@ fn a_string_in_a_fixed_column_panics() {
 /// the declared stride can catch it — and it is caught at the write, not
 /// deferred to `validate`'s region-length check.
 #[test]
-#[should_panic(expected = "U64 column at schema index 1 takes 8 bytes")]
+#[should_panic(expected = "U64 column at payload slot 0 takes 8 bytes")]
 fn a_wide_value_in_a_narrow_column_panics() {
     let schema = kv_schema(TypeCode::U64);
     let mut batch = ZSetBatch::new(&schema);
@@ -808,12 +823,12 @@ fn a_null_cell_round_trips_as_null() {
         // No null_mask call — `null()` must be self-sufficient.
         a.add_row(42, 1).null().null();
     }
-    let encoded = encode_wal_block(&schema, 1, &batch);
+    let encoded = encode_wal_block(1, &batch);
     let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
     assert_eq!(decoded.nulls[0], batch.nulls[0], "null bitmap round-trips");
     // The read side gates on the bitmap; the cells themselves are zeroed.
-    assert_eq!(decoded.columns[1], [0u8; 16], "String NULL cell is zeroed");
-    assert_eq!(decoded.columns[2], [0u8; 16], "Blob NULL cell is zeroed");
+    assert_eq!(decoded.payload[0].bytes, [0u8; 16], "String NULL cell is zeroed");
+    assert_eq!(decoded.payload[1].bytes, [0u8; 16], "Blob NULL cell is zeroed");
 }
 
 // --- §5.2: add_row under-push tripwire ---
@@ -844,9 +859,10 @@ fn a_fresh_appender_writes_onto_a_populated_batch() {
     assert_eq!(batch.pks.len(), 2);
 }
 
-/// Every cell of a STRING column region, as content strings.
-fn german_strings(batch: &ZSetBatch, ci: usize) -> Vec<String> {
-    batch.columns[ci]
+/// Every cell of a STRING payload slot, as content strings.
+fn german_strings(batch: &ZSetBatch, pi: usize) -> Vec<String> {
+    batch.payload[pi]
+        .bytes
         .as_chunks::<16>()
         .0
         .iter()

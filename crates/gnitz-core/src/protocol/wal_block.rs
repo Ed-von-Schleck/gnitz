@@ -47,8 +47,8 @@ fn read_64bit_region_into<T: Copy>(
 /// For a lone block. A transaction frame instead hands `gnitz-wire` the region
 /// lists and lets it frame each block into the frame itself, which is one copy
 /// rather than two.
-pub(crate) fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
-    let regions = super::regions::regions(batch, schema);
+pub(crate) fn encode_wal_block(table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
+    let regions = super::regions::regions(batch);
     // Size the output to exactly one block, then frame in place, so encode never
     // returns BufferTooSmall. checksum = true: client frames always carry a body
     // checksum.
@@ -98,31 +98,18 @@ pub(crate) fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<
     Ok((sink, table_id))
 }
 
-/// `sink` is a well-formed batch of `schema` and so can be appended to: same PK
-/// stride, same column count, and every payload region at the length its
-/// declared type and row count imply.
+/// `sink` is a well-formed batch of `schema` and so can be appended to: its
+/// layout is `schema`'s, and every payload region is at the length its type and
+/// row count imply.
 ///
-/// [`ZSetBatch::check_columns`] is the shared column rule, not a second spelling
-/// of it. Not the whole of [`ZSetBatch::validate`]: its NOT NULL sweep walks
-/// every row, which across a train's frames would be quadratic — and the server
-/// runs that check anyway.
+/// [`ZSetBatch::layout_matches`] and [`ZSetBatch::check_columns`] are the shared
+/// rules, not a second spelling of them. Not the whole of
+/// [`ZSetBatch::validate`]: its NOT NULL sweep walks every row, which across a
+/// train's frames would be quadratic — and the server runs that check anyway.
 fn sink_matches(sink: &ZSetBatch, schema: &Schema) -> Result<(), ProtocolError> {
     let sink_err = |e: String| ProtocolError::DecodeError(format!("decode sink: {e}"));
-    if sink.pks.stride() as usize != schema.pk_stride() {
-        return Err(sink_err(format!(
-            "mismatched PK stride: expected {}, got {}",
-            schema.pk_stride(),
-            sink.pks.stride()
-        )));
-    }
-    if sink.columns.len() != schema.num_columns() {
-        return Err(sink_err(format!(
-            "column count {} != schema column count {}",
-            sink.columns.len(),
-            schema.num_columns()
-        )));
-    }
-    sink.check_columns(schema).map_err(sink_err)
+    sink.layout_matches(schema).map_err(sink_err)?;
+    sink.check_columns().map_err(sink_err)
 }
 
 fn decode_wal_block_impl(
@@ -184,7 +171,7 @@ fn decode_wal_block_impl(
 
     // Size every stream before any of them grows: the regions are exact, and a
     // frame carries as many rows as a 64 MiB reply budget holds.
-    sink.reserve(schema, count);
+    sink.reserve(count);
 
     // A `PkColumn` holds the same OPK bytes the region carries, so the whole
     // region moves in one copy — no per-row, per-column transcode.
@@ -202,7 +189,7 @@ fn decode_wal_block_impl(
 
     // Read column regions. The payload iterator supplies the slot, so payload
     // slot `pi` ↔ region `REG_PAYLOAD_START + pi` is stated, not produced as a
-    // side effect of a counter; PK slots keep their empty placeholder.
+    // side effect of a counter.
     for (pi, ci, col) in schema.payload_columns() {
         let (reg_off, reg_sz) = dir(REG_PAYLOAD_START + pi);
         // One width rule for every column kind: `wire_stride` is 16 for STRING,
@@ -213,7 +200,7 @@ fn decode_wal_block_impl(
                 "column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
             )));
         }
-        let dst = &mut sink.columns[ci];
+        let dst = &mut sink.payload[pi].bytes;
         let at = dst.len();
         dst.extend_from_slice(&data[reg_off..reg_off + reg_sz]);
         if gnitz_wire::is_german_string(col.type_code as u8) {

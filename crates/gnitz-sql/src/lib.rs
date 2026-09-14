@@ -60,7 +60,7 @@ pub enum SqlResult {
         count: usize,
     },
     Rows {
-        schema: Schema,
+        schema: std::sync::Arc<Schema>,
         batch: ZSetBatch,
     },
     /// `BEGIN` / `START TRANSACTION`: a client-side transaction buffer opened.

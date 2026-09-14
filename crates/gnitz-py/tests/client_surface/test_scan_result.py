@@ -1,6 +1,6 @@
-"""The client-side read path: `ScanResult`'s accessors and the `Row` objects
-they hand out — how a scanned batch is presented to Python, what each accessor
-promises on an empty result, and how a row addresses its fields.
+"""The client-side read path: `ScanResult` and the `Row` objects it hands out —
+how a scanned batch is presented to Python, what an empty result promises, and
+how a row addresses its fields.
 """
 import uuid
 
@@ -38,68 +38,52 @@ def scans(module_schema):
 
 
 # ---------------------------------------------------------------------------
-# ScanResult accessors
+# ScanResult
 # ---------------------------------------------------------------------------
 
 
-def test_accessors_agree_on_the_same_rows(scans):
-    """`all`, iteration, `mappings`, `scalars`, `pks` and `weights` are six
-    presentations of one batch — they must not disagree about its contents.
-
-    The batch is retained, so iteration is repeatable: a consumed-once iterator
-    would leave the second pass empty. `pks` and `weights` are positionally
-    aligned with each other, which is what lets a caller `zip` them.
-    """
+def test_iteration_presents_every_row_with_its_weight(scans):
+    """The batch is retained, so iteration is repeatable: a consumed-once
+    iterator would leave the second pass empty."""
     result = scans["kv"]
-    expected = {1: 10, 2: 20, 3: 30}
     assert len(result) == 3
-    assert {r.pk: r.val for r in result.all()} == expected
-    assert {r.pk: r.val for r in result} == expected
-    assert {r.pk: r.val for r in result} == expected      # re-iterable
-    assert {m["pk"]: m["val"] for m in result.mappings()} == expected
-    assert set(result.mappings()[0].keys()) == {"pk", "val"}
-    assert result.first() in result.all()
-    assert sorted(zip(result.pks, result.weights)) == [(1, 1), (2, 1), (3, 1)]
+    assert sorted((r.pk, r.val, r._weight) for r in result) == [(1, 10, 1), (2, 20, 1), (3, 30, 1)]
+    assert sorted((r.pk, r.val, r._weight) for r in result) == [(1, 10, 1), (2, 20, 1), (3, 30, 1)]
+    assert result.lsn is not None
 
 
-def test_scalars_resolution_modes(scans):
-    """`col` resolves three ways — omitted is presented column 0, a name is a
-    field lookup, an int is a presented position — and each way that can fail
-    names its own error."""
-    result = scans["kv"]
-    assert sorted(result.scalars()) == [1, 2, 3]            # col 0 = pk
-    assert sorted(result.scalars(col="val")) == [10, 20, 30]
-    assert sorted(result.scalars(col=1)) == [10, 20, 30]
-    with pytest.raises(KeyError):
-        result.scalars(col="nosuchcol")
-    with pytest.raises(IndexError):
-        result.scalars(col=99)
-    with pytest.raises(TypeError):
-        result.scalars(col=1.5)
+def test_a_uuid_column_reads_as_canonical_text(scans):
+    assert [r.id for r in scans["uuid"]] == [str(_UUID)]
 
 
-def test_scalars_of_a_uuid_column_matches_the_row_path(scans):
-    """A UUID reaches Python as canonical hyphenated text; `scalars` must decode
-    it the same way iteration does, not hand back the raw u128."""
-    result = scans["uuid"]
-    assert result.scalars("id") == [str(_UUID)]
-    assert result.first().id == str(_UUID)
-
-
-def test_every_accessor_on_an_empty_result(scans):
-    """Each accessor's empty case, including the schema: an empty result still
-    carries the table's schema, so a caller can read field names without
-    branching on emptiness."""
+def test_an_empty_result(scans):
+    """An empty result still carries the table's schema, so a caller can read
+    field names without branching on emptiness."""
     result = scans["empty"]
     assert len(result) == 0
+    assert not result
     assert list(result) == []
-    assert result.all() == []
-    assert result.first() is None
-    assert result.mappings() == []
-    assert result.scalars() == []
-    assert result.pks == []
-    assert result.weights == []
     assert [c.name for c in result.schema.columns] == ["pk", "val"]
+
+
+def test_including_hidden_presents_every_column_of_the_same_rows(module_schema):
+    """A dropped column is a hidden slot: absent from the default presentation,
+    first-class in `including_hidden()`, which reads the same batch at the same
+    LSN."""
+    conn, sn = module_schema
+    conn.execute_sql(
+        "CREATE TABLE hid (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
+        "INSERT INTO hid VALUES (1, 10, 100), (2, 20, 200); "
+        "ALTER TABLE hid DROP COLUMN a", schema_name=sn)
+    result = conn.scan(conn.resolve_table(sn, "hid")[0])
+    full = result.including_hidden()
+
+    assert [r._fields for r in result] == [("pk", "b")] * 2
+    assert sorted(tuple(r) for r in result) == [(1, 100), (2, 200)]
+    assert [r._fields for r in full] == [("pk", "a", "b")] * 2
+    assert sorted((r.pk, r.b, r._weight) for r in full) == [(1, 100, 1), (2, 200, 1)]
+    assert len(full) == len(result) and full.lsn == result.lsn
+    assert [c.name for c in full.schema.columns] == [c.name for c in result.schema.columns]
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +105,11 @@ def test_every_field_access_path_agrees(scans):
     assert row._asdict() == {"pk": 1, "val": 10}
     assert row._weight == 1
 
-    twin = Row(row._fields, tuple(row), _weight=99)
+    twin = type(row)(tuple(row), _weight=99)
+    assert twin._fields == row._fields
     assert row == twin and hash(row) == hash(twin)
     assert {row: "value"}[twin] == "value"
-    assert row != Row(row._fields, (1, 11))
+    assert row != type(row)((1, 11))
 
     with pytest.raises(AttributeError):
         _ = row.nonexistent
@@ -134,19 +119,18 @@ def test_every_field_access_path_agrees(scans):
         _ = row[1.5]
 
 
-def test_the_row_object_owns_only_its_underscore_names(scans):
+def test_the_row_object_keeps_only_the_names_it_answers(scans):
     """The schema is the authority on what a name means — the rule the write
     surface already states by spelling the row weight `_weight`.
 
     So a column named `weight` *is* `row.weight`, and `row._weight` is the Z-set
-    weight, which no column can ever be named. The underscore namespace belongs
-    to the row object (`_fields`, `_asdict`, `_weight`), so a column whose name
-    starts with `_` gets no attribute of its own — but it is still a presented
-    column, and the fallback answers for it.
+    weight. A name the row object itself answers (`_fields`, `_asdict`,
+    `_weight`) keeps that meaning; every other column, underscore-prefixed or
+    not, is an attribute.
     """
-    row = scans["under"].first()
-    assert row.weight == row["weight"] == 77     # the column, via its descriptor
-    assert row["_x"] == row[2] == row._x == 5    # no descriptor: the fallback
+    row = next(iter(scans["under"]))
+    assert row.weight == row["weight"] == 77
+    assert row["_x"] == row[2] == row._x == 5
     assert row._weight == 1                      # the Z-set weight, not 77
     assert row._fields == ("pk", "weight", "_x")
     assert row._asdict() == {"pk": 1, "weight": 77, "_x": 5}

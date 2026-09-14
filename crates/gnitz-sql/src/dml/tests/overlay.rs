@@ -10,7 +10,7 @@ fn batch(schema: &Schema, rows: &[(u128, i64, i64)]) -> ZSetBatch {
         b.weights.push(w);
         b.nulls.push(0);
         {
-            let buf = &mut b.columns[1];
+            let buf = &mut b.payload[0].bytes;
             buf.extend_from_slice(&val.to_le_bytes());
         }
     }
@@ -35,7 +35,7 @@ fn val_of(net: &Net, pk: u128) -> Option<i64> {
     match net.get(&key(pk)) {
         Some(Buffered::Present(batch, row)) => {
             let o = row * 8;
-            Some(i64::from_le_bytes(batch.columns[1][o..o + 8].try_into().unwrap()))
+            Some(i64::from_le_bytes(batch.payload[0].bytes[o..o + 8].try_into().unwrap()))
         }
         _ => None,
     }
@@ -54,7 +54,7 @@ fn rows_of(b: &ZSetBatch) -> Vec<(u128, i64)> {
     let mut out: Vec<(u128, i64)> = (0..b.len())
         .map(|i| {
             let pk = b.pks.get(&two_col(TypeCode::I64), i);
-            let val = b.cell(1, i, 8).map_or(0, |c| i64::from_le_bytes(c.try_into().unwrap()));
+            let val = i64::from_le_bytes(b.payload[0].bytes[i * 8..i * 8 + 8].try_into().unwrap());
             (pk, val)
         })
         .collect();

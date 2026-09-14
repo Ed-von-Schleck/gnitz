@@ -4,7 +4,7 @@ use crate::protocol::wal_block::decode_wal_block;
 use crate::protocol::wire_flags_set_schema_version;
 use crate::protocol::WireConflictMode;
 use crate::protocol::{ClientTransport, Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
-use crate::test_support::make_transport_pair;
+use crate::test_support::{make_transport_pair, payload_of};
 
 // ── FLAG_PUSH_TXN family assembly ──────────────────────────────────────
 
@@ -32,7 +32,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         pks: PkColumn::from_natives(&schema, [4]),
         weights: vec![-1],
         nulls: vec![0],
-        columns: ZSetBatch::filler_columns(&schema, 1),
+        payload: ZSetBatch::filler_columns(&schema, 1),
         blob: vec![],
     };
 
@@ -198,7 +198,7 @@ fn test_message_roundtrip_data() {
         pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: weights.clone(),
         nulls: nulls.clone(),
-        columns: vec![vec![], i64_bytes.clone(), f64_bytes.clone()],
+        payload: payload_of(&schema, vec![i64_bytes.clone(), f64_bytes.clone()]),
         blob: vec![],
     };
 
@@ -211,11 +211,11 @@ fn test_message_roundtrip_data() {
     assert_eq!(data.weights, weights);
 
     {
-        let got = &data.columns[1];
+        let got = &data.payload[0].bytes;
         assert_eq!(got, &i64_bytes);
     }
     {
-        let got = &data.columns[2];
+        let got = &data.payload[1].bytes;
         assert_eq!(got, &f64_bytes);
     }
 }
@@ -253,7 +253,10 @@ fn test_message_roundtrip_strings() {
         pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: weights.clone(),
         nulls: nulls.clone(),
-        columns: vec![vec![], german_col(&col1, &mut blob), german_col(&col2, &mut blob)],
+        payload: payload_of(
+            &schema,
+            vec![german_col(&col1, &mut blob), german_col(&col2, &mut blob)],
+        ),
         blob,
     };
 
@@ -263,8 +266,8 @@ fn test_message_roundtrip_strings() {
 
     let data = data.unwrap();
     assert_eq!(data.nulls, nulls);
-    assert_eq!(german_vals(&data, 1, 0), col1);
-    assert_eq!(german_vals(&data, 2, 1), col2);
+    assert_eq!(german_vals(&data, 0), col1);
+    assert_eq!(german_vals(&data, 1), col2);
 }
 
 /// A STRING column region from its values, spilling into `blob`; `None` is a
@@ -279,11 +282,11 @@ fn german_col(vals: &[Option<String>], blob: &mut Vec<u8>) -> Vec<u8> {
 }
 
 /// Read a STRING column region back out, `None` where null bit `pi` is set.
-fn german_vals(batch: &ZSetBatch, ci: usize, pi: usize) -> Vec<Option<String>> {
+fn german_vals(batch: &ZSetBatch, pi: usize) -> Vec<Option<String>> {
     (0..batch.len())
         .map(|row| {
             (!gnitz_wire::null_word_get(batch.nulls[row], pi)).then(|| {
-                let cell = &batch.columns[ci][row * 16..(row + 1) * 16];
+                let cell = &batch.payload[pi].bytes[row * 16..(row + 1) * 16];
                 String::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob).to_vec()).unwrap()
             })
         })
@@ -362,7 +365,7 @@ fn test_encode_parse_with_data() {
         pks: PkColumn::from_natives(&schema, [1, 2, 3]),
         weights: vec![1, 1, 1],
         nulls: vec![0, 0, 0],
-        columns: vec![vec![], val_bytes],
+        payload: payload_of(&schema, vec![val_bytes]),
         blob: vec![],
     };
 
@@ -428,7 +431,7 @@ fn hint_only_frame_returns_data_schema_none() {
         pks: PkColumn::from_natives(&schema, [1]),
         weights: vec![1],
         nulls: vec![0],
-        columns: vec![vec![], val_bytes],
+        payload: payload_of(&schema, vec![val_bytes]),
         blob: vec![],
     };
 

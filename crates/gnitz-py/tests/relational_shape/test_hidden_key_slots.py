@@ -50,7 +50,7 @@ _SHAPES = {
 def test_a_key_slot_is_absent_from_every_client_row(client, schema_name):
     """For each emitter that fabricates or inherits a key, the presented fields
     are exactly the projected names, and the weights show the key still keying
-    through a retraction. `include_hidden=True` is the debugging escape hatch: it
+    through a retraction. `including_hidden()` is the debugging escape hatch: it
     presents the synthetic key first, carrying the decoded join-key value."""
     sn = schema_name
     join = "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k"
@@ -72,6 +72,6 @@ def test_a_key_slot_is_absent_from_every_client_row(client, schema_name):
             assert bag(rows, *cols) == (before if step == "before" else after), (step, name)
             assert all(set(r._fields) == set(cols) for r in rows), (step, name, rows)
 
-    raw = list(client.scan(client.resolve_table(sn, "jv1")[0], include_hidden=True))
+    raw = list(client.scan(client.resolve_table(sn, "jv1")[0]).including_hidden())
     assert [r._fields[0] for r in raw] == ["_join_pk"], raw
     assert bag(raw, "_join_pk", "av", "bv") == {(7, 100, 200): 1}

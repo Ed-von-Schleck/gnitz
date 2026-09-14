@@ -133,10 +133,10 @@ fn test_uuid_non_pk_string_literal_accepted() {
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
     // col 1 is UUID
     let c = bind_constant(&uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")).unwrap();
-    let gnitz_core::ZSetBatch { columns, blob, .. } = &mut batch;
-    append_value_to_col(&mut columns[1], blob, ColType::of(TypeCode::UUID), &c).unwrap();
+    let gnitz_core::ZSetBatch { payload, blob, .. } = &mut batch;
+    append_value_to_col(&mut payload[0].bytes, blob, ColType::of(TypeCode::UUID), &c).unwrap();
     assert_eq!(
-        uuid_cell(&batch.columns[1]),
+        uuid_cell(&batch.payload[0].bytes),
         0x550e8400_e29b_41d4_a716_446655440000_u128
     );
 }

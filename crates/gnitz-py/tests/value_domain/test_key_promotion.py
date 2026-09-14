@@ -269,5 +269,5 @@ def test_a_cross_sign_join_key_surfaces_its_promoted_value(client, schema_name):
     # The hidden key slot rides at the physical key position; decoding it back
     # to 5 / 100 is exactly what the 128-bit sign flip has to undo.
     vid = client.resolve_table(sn, "v")[0]
-    got = list(client.scan(vid, include_hidden=True))
+    got = list(client.scan(vid).including_hidden())
     assert bag(got, "_join_pk", "amount") == {(5, 1000): 1, (5, 4000): 1, (100, 2000): 1}

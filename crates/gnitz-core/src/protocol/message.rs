@@ -4,7 +4,6 @@ use super::types::{Schema, ZSetBatch};
 use super::wal_block::encode_wal_block;
 use super::WAL_BLOCK_HEADER_SIZE;
 use super::{wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK};
-use crate::types::sys_schema;
 use gnitz_wire::txn_frame::WalBlock;
 
 /// One batch's region list, held for as long as the frame encoder needs it. A
@@ -167,7 +166,7 @@ fn encode_parts(
     MessageParts {
         ctrl: encode_control_block(&ctrl_hdr, "", seek_pk_extra),
         schema: schema_block,
-        data: data.map_or_else(Vec::new, |(s, b)| encode_wal_block(s, target_id as u32, b)),
+        data: data.map_or_else(Vec::new, |(_, b)| encode_wal_block(target_id as u32, b)),
     }
 }
 
@@ -246,7 +245,7 @@ pub fn encode_push_txn(
             (
                 mode.as_wire(),
                 encode_schema_block(schema, *tid as u32),
-                Regioned::new(*tid, batch, super::regions::regions(batch, schema)),
+                Regioned::new(*tid, batch, super::regions::regions(batch)),
             )
         })
         .collect();
@@ -260,13 +259,12 @@ pub fn encode_push_txn(
 /// carried by one such frame so the server ingests the whole bundle under one
 /// durable SAL zone.
 ///
-/// Each family is named by its system table id alone: the schema its batch is
-/// encoded against is that id's, derived here through [`sys_schema`], so a
-/// caller cannot pair one family's id with another's shape.
+/// Each family is named by its system table id alone; its batch carries its own
+/// layout, which `Session::submit` validates against that id's system schema.
 pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> {
     let regioned: Vec<Regioned<'_>> = families
         .iter()
-        .map(|(tid, batch)| Regioned::new(*tid, batch, super::regions::regions(batch, sys_schema(*tid))))
+        .map(|(tid, batch)| Regioned::new(*tid, batch, super::regions::regions(batch)))
         .collect();
     let refs: Vec<WalBlock<'_>> = regioned.iter().map(Regioned::wal).collect();
     gnitz_wire::txn_frame::encode_ddl_txn(client_id, &refs)

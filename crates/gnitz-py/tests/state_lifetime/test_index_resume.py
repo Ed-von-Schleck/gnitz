@@ -39,7 +39,7 @@ def test_an_index_resumes_across_a_clean_restart(own_server):
     with gnitz.connect(own_server.sock_path) as conn:
         tid, _ = conn.resolve_table("idxres", "t")
         for i in (0, 63):
-            assert sorted(conn.seek_by_index(tid, [1], [i * 10]).pks) == [i], \
+            assert bag(conn.seek_by_index(tid, [1], [i * 10]), "id") == {(i,): 1}, \
                 f"g={i * 10} must still resolve to its source PK after the restart"
 
     counts = own_server.rebuilt_index_counts()
@@ -107,12 +107,12 @@ def test_a_rebuilt_index_holds_exactly_its_own_slice(own_server):
         sx, _ = conn.resolve_table("slice", "sx")
 
         def holders():
-            return sorted(conn.seek_by_index(sx, [1], [7]).pks)
+            return bag(conn.seek_by_index(sx, [1], [7]), "id")
 
-        assert holders() == [i for i in range(30) if i % 3 == 0]
+        assert holders() == {(i,): 1 for i in range(30) if i % 3 == 0}
         conn.execute_sql("DELETE FROM sx WHERE id = 0", schema_name="slice")
         conn.execute_sql("INSERT INTO sx VALUES (100, 7)", schema_name="slice")
-        assert holders() == [i for i in range(3, 30) if i % 3 == 0] + [100]
+        assert holders() == {(i,): 1 for i in [*range(3, 30, 3), 100]}
         # The whole bag, not its length: a row the replay duplicated onto a
         # second worker arrives twice at weight 1 and keeps the count at 30.
         assert bag(scanned(conn, "slice", "sx"), "id", "g") == (

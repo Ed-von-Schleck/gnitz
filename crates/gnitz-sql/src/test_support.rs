@@ -34,7 +34,7 @@ pub(crate) fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -
     b.pks.push_u128(&schema, 1u128);
     b.weights.push(1);
     b.nulls.push(null_bits);
-    b.columns[1].extend(val_bytes);
+    b.payload[0].bytes.extend(val_bytes);
     b
 }
 

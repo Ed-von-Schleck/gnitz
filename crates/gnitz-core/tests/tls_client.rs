@@ -75,27 +75,14 @@ fn make_batch(schema: &Schema, start: u64, count: usize) -> ZSetBatch {
         a.extend_from_slice(&((pk as i64) * 3).to_le_bytes());
         b.extend_from_slice(&7i64.to_le_bytes());
     }
-    let columns: Vec<Vec<u8>> = schema
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(ci, _)| {
-            if schema.is_pk_col(ci) {
-                vec![]
-            } else if ci == 1 {
-                a.clone()
-            } else {
-                b.clone()
-            }
-        })
-        .collect();
-    ZSetBatch {
-        pks: PkColumn::from_natives(schema, pks.into_iter().map(u128::from)),
-        weights: vec![1i64; count],
-        nulls: vec![0u64; count],
-        columns,
-        blob: vec![],
+    let mut z = ZSetBatch::new(schema);
+    z.pks = PkColumn::from_natives(schema, pks.into_iter().map(u128::from));
+    z.weights = vec![1i64; count];
+    z.nulls = vec![0u64; count];
+    for (pi, ci, _) in schema.payload_columns() {
+        z.payload[pi].bytes = if ci == 1 { a.clone() } else { b.clone() };
     }
+    z
 }
 
 /// Pin both socket buffers small so backpressure paths engage well below
@@ -242,15 +229,14 @@ fn push_scan_roundtrip_over_tls() {
     retract.weights = vec![-1];
     client.push(tid, &schema, &retract).unwrap();
 
-    let (_, batch, _) = client.scan(tid).unwrap();
-    let batch = batch.expect("scan must return rows");
+    let batch = client.scan(tid).unwrap().batch;
     assert_eq!(batch.len(), 999, "1000 inserts − 1 retraction");
     assert!(batch.weights.iter().all(|&w| w == 1), "all net weights must be +1");
     // Spot-check payload integrity via a seek.
-    let (_, row, _) = client.seek(tid, 123, &[]).unwrap();
-    let row = row.expect("seek must find pk=123");
+    let row = client.seek(tid, 123, &[]).unwrap().batch;
+    assert_eq!(row.len(), 1, "seek must find pk=123");
     {
-        let bytes = &row.columns[1];
+        let bytes = &row.payload[0].bytes;
         assert_eq!(i64::from_le_bytes(bytes[0..8].try_into().unwrap()), 369);
     }
 }
@@ -266,8 +252,7 @@ fn big_push_and_multiframe_scan() {
     let count = 700_000;
     client.push(tid, &schema, &make_batch(&schema, 0, count)).unwrap();
     // ...and a scan whose train spans many worker frames.
-    let (_, batch, _) = client.scan(tid).unwrap();
-    let batch = batch.expect("scan must return rows");
+    let batch = client.scan(tid).unwrap().batch;
     assert_eq!(batch.len(), count);
 }
 
@@ -286,10 +271,8 @@ fn unix_and_tls_clients_share_a_table() {
         .push(utid, &uschema, &make_batch(&uschema, 100, 100))
         .unwrap();
 
-    let (_, via_tls, _) = tls_client.scan(tid).unwrap();
-    let (_, via_unix, _) = unix_client.scan(utid).unwrap();
-    assert_eq!(via_tls.map(|b| b.len()), Some(200));
-    assert_eq!(via_unix.map(|b| b.len()), Some(200));
+    assert_eq!(tls_client.scan(tid).unwrap().batch.len(), 200);
+    assert_eq!(unix_client.scan(utid).unwrap().batch.len(), 200);
 }
 
 // ── 6. wire-version mismatch HELLO ─────────────────────────────────────────
@@ -455,8 +438,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         );
 
         // The cluster keeps serving other clients.
-        let (_, batch, _) = setup.scan(tid).unwrap();
-        assert_eq!(batch.map(|b| b.len()), Some(200_000));
+        assert_eq!(setup.scan(tid).unwrap().batch.len(), 200_000);
     });
 }
 
@@ -497,8 +479,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         );
 
         // No cluster freeze / no mutex wedge: a concurrent client still works.
-        let (_, batch, _) = setup.scan(tid).unwrap();
-        assert_eq!(batch.map(|b| b.len()), Some(200_000));
+        assert_eq!(setup.scan(tid).unwrap().batch.len(), 200_000);
     });
 }
 
@@ -512,12 +493,8 @@ fn mtls_roundtrip_push_and_scan() {
     // works end to end.
     let (mut client, _sn, tid, schema) = client_with_table(&srv.mtls_target());
     client.push(tid, &schema, &make_batch(&schema, 0, 500)).unwrap();
-    let (_, batch, _) = client.scan(tid).unwrap();
-    assert_eq!(
-        batch.map(|b| b.len()),
-        Some(500),
-        "authenticated client's rows must round-trip"
-    );
+    let batch = client.scan(tid).unwrap().batch;
+    assert_eq!(batch.len(), 500, "authenticated client's rows must round-trip");
 }
 
 // ── 13. no client cert vs a required-mTLS server ───────────────────────────

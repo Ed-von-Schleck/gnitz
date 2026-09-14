@@ -2,37 +2,8 @@ use crate::ast_util::{aliased_def, expand_wildcard_item, is_bare_wildcard_projec
 use crate::bind::single_relation_col_idx;
 use crate::error::GnitzSqlError;
 use crate::validate::reject_duplicate_projection_names;
-use gnitz_core::{Schema, TypeCode, ZSetBatch};
+use gnitz_core::{Schema, ZSetBatch};
 use sqlparser::ast::SelectItem;
-
-/// One schema's payload copy plan: each payload column's index and type,
-/// resolved once. A row-at-a-time gather builds this before its loop —
-/// `Schema::payload_columns` re-scans `pk_cols` per column and re-matches each
-/// type code, which over a million-row ordered result dominates the copy itself.
-pub(crate) struct RowGather {
-    payload: Vec<(usize, TypeCode)>,
-}
-
-impl RowGather {
-    pub(crate) fn new(schema: &Schema) -> Self {
-        RowGather {
-            payload: schema
-                .payload_columns()
-                .map(|(_pi, ci, def)| (ci, def.type_code))
-                .collect(),
-        }
-    }
-
-    /// Append `src`'s row `i` to `dst`.
-    pub(crate) fn copy(&self, src: &ZSetBatch, i: usize, dst: &mut ZSetBatch) {
-        dst.pks.push_from(&src.pks, i);
-        dst.weights.push(src.weights[i]);
-        dst.nulls.push(src.nulls[i]);
-        for &(ci, tc) in &self.payload {
-            dst.push_cell_from(ci, src, ci, tc, i);
-        }
-    }
-}
 
 /// A resolved projection: the output schema and, per output column, its source
 /// column index. `None` is the passthrough — a wildcard, or a named projection
@@ -116,21 +87,20 @@ pub(crate) fn resolve_projection(
     Ok(Some((Schema { columns: out_defs, pk_cols: new_pk_cols }, col_indices)))
 }
 
-/// Apply a resolved projection to `batch` (absent = an empty batch). Infallible:
-/// every rejection happened in [`resolve_projection`]. The passthrough hands the
-/// source batch straight back — no copy.
-pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetBatch>) -> (Schema, ZSetBatch) {
+/// Apply a resolved projection to `batch`. Infallible: every rejection happened
+/// in [`resolve_projection`]. The passthrough hands the source batch straight
+/// back — no copy.
+pub(crate) fn project(resolved: Projection, schema: &Schema, src_batch: ZSetBatch) -> (Schema, ZSetBatch) {
     let Some((new_schema, col_indices)) = resolved else {
-        return (schema.clone(), batch.unwrap_or_else(|| ZSetBatch::new(schema)));
+        return (schema.clone(), src_batch);
     };
 
-    let src_batch = batch.unwrap_or_else(|| ZSetBatch::new(schema));
     let row_count = src_batch.len();
     let ZSetBatch {
         pks: src_pks,
         weights,
         nulls: src_nulls,
-        columns: mut src_columns,
+        payload: mut src_payload,
         blob,
     } = src_batch;
     let mut new_batch = ZSetBatch::new(&new_schema);
@@ -188,24 +158,22 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         }
     }
 
+    // Each output payload slot's source payload slot. Projected PKs become new
+    // PKs (not payload), so the source column is a payload column by
+    // construction — payload_idx is safe.
+    let pi_mappings: Vec<(usize, usize)> = new_schema
+        .payload_columns()
+        .map(|(new_pi, new_ci, _)| (new_pi, schema.payload_idx(col_indices[new_ci])))
+        .collect();
+
     // Null bitmap: move when the payload layout matches the source's; else
-    // rebuild bit-by-bit using a hoisted (new_pi, old_pi) mapping.
-    let payload_preserved = new_schema.num_payload_cols() == schema.num_payload_cols()
-        && new_schema
-            .payload_columns()
-            .zip(schema.payload_columns())
-            .all(|((_, new_ci, _), (_, old_ci, _))| col_indices[new_ci] == old_ci);
+    // rebuild bit-by-bit through `pi_mappings`.
+    let payload_preserved =
+        pi_mappings.len() == schema.num_payload_cols() && pi_mappings.iter().all(|&(new_pi, old_pi)| new_pi == old_pi);
 
     if payload_preserved {
         new_batch.nulls = src_nulls;
     } else {
-        // Projected PKs become new PKs (not payload), so old_ci is a
-        // source payload column by construction — payload_idx is safe.
-        let pi_mappings: Vec<(usize, usize)> = new_schema
-            .payload_columns()
-            .map(|(new_pi, new_ci, _)| (new_pi, schema.payload_idx(col_indices[new_ci])))
-            .collect();
-
         new_batch.nulls.reserve(row_count);
         for &old_word in &src_nulls {
             let mut new_word = 0u64;
@@ -218,20 +186,16 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         }
     }
 
-    // Payload columns: strictly payload→payload. `src_columns` is owned, so whole
-    // regions move rather than being copied cell by cell. A source column
-    // projected more than once is cloned for every occurrence but its last, which
-    // still takes the move.
-    let payload_maps: Vec<(usize, usize)> = new_schema
-        .payload_columns()
-        .map(|(_, new_ci, _)| (new_ci, col_indices[new_ci]))
-        .collect();
-    for (pos, &(new_ci, old_ci)) in payload_maps.iter().enumerate() {
-        let used_later = payload_maps[pos + 1..].iter().any(|&(_, o)| o == old_ci);
-        new_batch.columns[new_ci] = if used_later {
-            src_columns[old_ci].clone()
+    // Payload regions: strictly payload→payload. `src_payload` is owned, so whole
+    // regions move rather than being copied cell by cell. A source slot projected
+    // more than once is cloned for every occurrence but its last, which still
+    // takes the move. The destination keeps the type `ZSetBatch::new` gave it.
+    for (pos, &(new_pi, old_pi)) in pi_mappings.iter().enumerate() {
+        let used_later = pi_mappings[pos + 1..].iter().any(|&(_, o)| o == old_pi);
+        new_batch.payload[new_pi].bytes = if used_later {
+            src_payload[old_pi].bytes.clone()
         } else {
-            std::mem::take(&mut src_columns[old_ci])
+            std::mem::take(&mut src_payload[old_pi].bytes)
         };
     }
 

@@ -12,14 +12,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
 use gnitz_core::{
-    ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, Schema, TableProps, WireConflictMode,
+    ClientError, DeltaCursor, GnitzClient, PollOutcome, PollResult, ScanReply, Schema, TableProps, WireConflictMode,
 };
 use gnitz_mirror::Mirror;
 use gnitz_sql::{SqlPlanner, SqlResult};
 
-use crate::read::{batch_to_lazy, delta_reply_to_py, triple_to_lazy, PyDeltaReply, PyScanResult};
+use crate::read::{scan_result, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, rust_schema_to_py};
-use crate::write::{extract_uuid_or_u128, pk_key_from_py, py_pks_to_column, PyZSetBatch};
+use crate::write::{pk_key_from_py, py_pks_to_column, py_scalar_key, PyZSetBatch};
 use crate::{build_pylist, client_err, connect_client, gnitz_err, sql_err, GnitzError};
 
 /// What one view's poll did. `PollOutcome` flattened for Python, which has no
@@ -185,8 +185,8 @@ impl PyGnitzClient {
     }
 
     /// delete(target_id, schema, pks) — `schema` may be a `Schema` or a list of
-    /// `ColumnDef`; `pks` is a list where each element is either an int
-    /// (single-column PK) or bytes (a packed compound PK).
+    /// `ColumnDef`; `pks` is a list where each element is the key's value
+    /// (single-column PK) or a tuple of its column values (compound PK).
     pub fn delete(
         &mut self,
         py: Python<'_>,
@@ -241,35 +241,32 @@ impl PyGnitzClient {
         Ok(PyTuple::new(py, [tid_obj, py_schema])?.into_any().unbind())
     }
 
-    /// scan(target_id, include_hidden=False) -> ScanResult
+    /// scan(target_id) -> ScanResult
     ///
     /// Every row of the relation, off this client's local copy if it mirrors one
     /// and from the server if it does not. `lsn` is `None` for a local answer;
     /// a copy's freshness is `cursor(view_id)`.
-    #[pyo3(signature = (target_id, include_hidden = false))]
-    pub fn scan(&mut self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
-        let (schema, batch, lsn) = self.call(py, |c| c.scan_local_first(target_id))?;
-        batch_to_lazy(py, schema, batch, lsn, include_hidden)
+    pub fn scan(&mut self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyScanResult>> {
+        let reply = self.call(py, |c| c.scan_local_first(target_id))?;
+        scan_result(py, reply)
     }
 
-    /// delta_bootstrap(view_id, view_schema, include_hidden=False) -> DeltaReply
+    /// delta_bootstrap(view_id, view_schema) -> DeltaReply
     ///
     /// The view's whole current value, in the view's own schema, plus the cursor
     /// to poll from. Costs what a scan of the view costs. Apply it to a fresh
     /// copy: it replaces state, it does not add to it.
-    #[pyo3(signature = (view_id, view_schema, include_hidden = false))]
     pub fn delta_bootstrap(
         &mut self,
         py: Python<'_>,
         view_id: u64,
         #[pyo3(from_py_with = resolve_py_schema)] view_schema: Arc<Schema>,
-        include_hidden: bool,
     ) -> PyResult<Py<PyDeltaReply>> {
-        let out = self.call(py, |c| c.delta_bootstrap(view_id, &view_schema))?;
-        delta_reply_to_py(py, view_schema, out, include_hidden)
+        let (batch, cursor) = self.call(py, |c| c.delta_bootstrap(view_id, &view_schema))?;
+        PyDeltaReply::new(py, view_schema, batch, cursor)
     }
 
-    /// delta_poll(view_id, reply_schema, cursor, include_hidden=False) -> DeltaReply
+    /// delta_poll(view_id, reply_schema, cursor) -> DeltaReply
     ///
     /// Every delta the view emitted since `cursor`, in `delta_reply_schema`'s
     /// shape. `cursor` is the `(tag, tick)` a previous reply handed back. Apply
@@ -279,77 +276,54 @@ impl PyGnitzClient {
     /// A cursor whose rounds are gone, or that names a different boot or
     /// relation, is refused with `GnitzDeltaExpiredError` rather than answered
     /// with the wrong relation's rows. Bootstrap again.
-    #[pyo3(signature = (view_id, reply_schema, cursor, include_hidden = false))]
     pub fn delta_poll(
         &mut self,
         py: Python<'_>,
         view_id: u64,
         #[pyo3(from_py_with = resolve_py_schema)] reply_schema: Arc<Schema>,
         cursor: (u64, u64),
-        include_hidden: bool,
     ) -> PyResult<Py<PyDeltaReply>> {
         let cursor = DeltaCursor { tag: cursor.0, tick: cursor.1 };
-        let out = self.call(py, |c| c.delta_poll(view_id, cursor, &reply_schema))?;
-        delta_reply_to_py(py, reply_schema, out, include_hidden)
+        let (batch, cursor) = self.call(py, |c| c.delta_poll(view_id, cursor, &reply_schema))?;
+        PyDeltaReply::new(py, reply_schema, batch, cursor)
     }
 
-    /// scan_many(target_ids, include_hidden=False) -> list[ScanResult]
+    /// scan_many(target_ids) -> list[ScanResult]
     ///
     /// Consistent snapshot of N relations at one server-side SAL cut, in request
     /// order: an atomic multi-table transaction is never observed torn across it.
-    #[pyo3(signature = (target_ids, include_hidden = false))]
-    pub fn scan_many(
-        &mut self,
-        py: Python<'_>,
-        target_ids: Vec<u64>,
-        include_hidden: bool,
-    ) -> PyResult<Vec<Py<PyScanResult>>> {
+    pub fn scan_many(&mut self, py: Python<'_>, target_ids: Vec<u64>) -> PyResult<Vec<Py<PyScanResult>>> {
         let results = self.call(py, |c| c.scan_many(&target_ids))?;
-        results
-            .into_iter()
-            .map(|triple| triple_to_lazy(py, triple, include_hidden))
-            .collect()
+        results.into_iter().map(|reply| scan_result(py, reply)).collect()
     }
 
-    /// seek(table_id, pk=0, include_hidden=False) -> ScanResult.
-    /// `pk` may be an `int` (narrow single-PK tables) or `bytes` (compound or
+    /// seek(table_id, pk) -> ScanResult.
+    /// `pk` may be a scalar (single-PK tables) or `bytes` (compound or
     /// wide-byte PKs).
-    #[pyo3(signature = (table_id, pk = None, include_hidden = false))]
-    pub fn seek(
-        &mut self,
-        py: Python<'_>,
-        table_id: u64,
-        pk: Option<Bound<'_, PyAny>>,
-        include_hidden: bool,
-    ) -> PyResult<Py<PyScanResult>> {
-        let (low, extra) = match pk {
-            Some(ref obj) => pk_key_from_py(obj)?,
-            None => (0, Vec::new()),
-        };
-        let triple = self.call(py, move |c| c.seek(table_id, low, &extra))?;
-        triple_to_lazy(py, triple, include_hidden)
+    pub fn seek(&mut self, py: Python<'_>, table_id: u64, pk: Bound<'_, PyAny>) -> PyResult<Py<PyScanResult>> {
+        let (low, extra) = pk_key_from_py(&pk)?;
+        let reply = self.call(py, move |c| c.seek(table_id, low, &extra))?;
+        scan_result(py, reply)
     }
 
-    /// seek_by_index(table_id, col_indices, key_vals, include_hidden=False) -> ScanResult.
+    /// seek_by_index(table_id, col_indices, key_vals) -> ScanResult.
     ///
     /// `col_indices` is the index's FULL declared column list (the server matches
     /// the circuit by exact list); `key_vals` supplies the leading key values, and
     /// may be shorter for a leading-prefix seek.
-    #[pyo3(signature = (table_id, col_indices, key_vals, include_hidden = false))]
     pub fn seek_by_index(
         &mut self,
         py: Python<'_>,
         table_id: u64,
         col_indices: Vec<u32>,
         key_vals: Bound<'_, PyList>,
-        include_hidden: bool,
     ) -> PyResult<Py<PyScanResult>> {
-        let mut keys: Vec<u128> = Vec::with_capacity(key_vals.len());
-        for item in key_vals.iter() {
-            keys.push(extract_uuid_or_u128(&item)?);
-        }
-        let triple = self.call(py, move |c| c.seek_by_index(table_id, &col_indices, &keys))?;
-        triple_to_lazy(py, triple, include_hidden)
+        let keys = key_vals
+            .iter()
+            .map(|item| py_scalar_key(&item))
+            .collect::<PyResult<Vec<u128>>>()?;
+        let reply = self.call(py, move |c| c.seek_by_index(table_id, &col_indices, &keys))?;
+        scan_result(py, reply)
     }
 
     /// execute_sql(sql, schema_name="public") -> list of result dicts
@@ -515,7 +489,7 @@ fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyA
                 d.set_item(k_type, pyo3::intern!(py, "Rows"))?;
                 d.set_item(
                     pyo3::intern!(py, "rows"),
-                    batch_to_lazy(py, Some(Arc::new(schema)), Some(batch), None, false)?,
+                    scan_result(py, ScanReply { schema, batch, lsn: None })?,
                 )?;
             }
             SqlResult::TransactionStarted => {

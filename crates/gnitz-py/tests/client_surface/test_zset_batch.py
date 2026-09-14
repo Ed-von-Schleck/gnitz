@@ -22,6 +22,16 @@ from gnitz import TypeCode, ColumnDef, Schema, ZSetBatch
 KV = Schema([ColumnDef("pk", TypeCode.U64, primary_key=True),
              ColumnDef("val", TypeCode.I64)])
 
+def _col(batch, name):
+    """Column `name` of every row written so far."""
+    return [r[name] for r in batch.rows()]
+
+
+def _dump(batch):
+    """Every row written so far, hidden columns included, with its weight."""
+    return [(tuple(r), r._weight) for r in batch.rows().including_hidden()]
+
+
 _WRITERS = {"append": lambda b, row: b.append(**row),
             "extend": lambda b, row: b.extend([row])}
 _EACH_WRITER = pytest.mark.parametrize("write", list(_WRITERS.values()), ids=list(_WRITERS))
@@ -143,9 +153,8 @@ class TestAppendKeywordPlan:
             got.append(_weight=weight, **row)
             ref = ZSetBatch(schema)
             ref.extend([dict(row, _weight=weight)])
-            assert got.pks == ref.pks
-            assert got.columns == ref.columns
-            assert got.weights == ref.weights == [weight]
+            assert _dump(got) == _dump(ref)
+            assert [w for _, w in _dump(got)] == [weight]
         assert seen == set(_ALL_TYPES)
 
     def test_cycling_shapes_keeps_every_row_correct(self):
@@ -177,12 +186,13 @@ class TestAppendKeywordPlan:
             by_append.append(**row)
         by_extend = ZSetBatch(schema).extend(rows, 3)
 
-        assert by_append.pks == by_extend.pks == [r["pk"] for r in rows]
-        assert by_append.weights == [r.get("_weight", 1) for r in rows]   # append's default
-        assert by_extend.weights == [r.get("_weight", 3) for r in rows]   # extend's batch-wide
-        for col_i, name in enumerate(names, start=1):
+        appended, extended = list(by_append.rows()), list(by_extend.rows())
+        assert [r.pk for r in appended] == [r.pk for r in extended] == [r["pk"] for r in rows]
+        assert [r._weight for r in appended] == [r.get("_weight", 1) for r in rows]   # append's default
+        assert [r._weight for r in extended] == [r.get("_weight", 3) for r in rows]   # extend's batch-wide
+        for name in names:
             expected = [r.get(name) for r in rows]
-            assert by_append.columns[col_i] == by_extend.columns[col_i] == expected
+            assert [r[name] for r in appended] == [r[name] for r in extended] == expected
 
     def test_weight_keyword_yields_to_a_column_of_that_name(self):
         """`_weight` names the row weight only when no column claims it. The
@@ -193,10 +203,9 @@ class TestAppendKeywordPlan:
         ])
         got = ZSetBatch(schema).append(pk=1, _weight=5)
         ref = ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}])
-        assert got.columns == ref.columns == [[], [5]]
-        assert got.weights == ref.weights == [1]
+        assert _dump(got) == _dump(ref) == [((1, 5), 1)]
         # The batch-wide parameter still reaches such a schema.
-        assert ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}], -1).weights == [-1]
+        assert _dump(ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}], -1)) == [((1, 5), -1)]
 
     def test_positional_argument_rejected(self):
         with pytest.raises(TypeError, match="positional"):
@@ -251,10 +260,10 @@ class TestRowErrors:
         ]:
             with pytest.raises(exc, match=match):
                 write(batch, row)
-            assert batch.pks == [1]
+            assert _col(batch, "pk") == [1]
 
         write(batch, {"pk": 2, "a": 2, "b": 2})                      # still usable
-        assert batch.pks == [1, 2]
+        assert _col(batch, "pk") == [1, 2]
 
     @_EACH_WRITER
     def test_a_reentrant_write_raises_instead_of_aborting(self, write):
@@ -272,7 +281,7 @@ class TestRowErrors:
         with pytest.raises(RuntimeError):
             write(batch, {"pk": 1, "val": Reenter()})
         assert len(batch) == 0
-        assert write(batch, {"pk": 2, "val": 2}).pks == [2]       # still usable
+        assert _col(write(batch, {"pk": 2, "val": 2}), "pk") == [2]       # still usable
 
     def test_extend_is_atomic_across_rows(self):
         """`extend` is all-or-nothing: a bad row rolls back the good rows queued
@@ -280,8 +289,8 @@ class TestRowErrors:
         batch = ZSetBatch(KV).append(pk=1, val=10)
         with pytest.raises(TypeError):
             batch.extend([{"pk": 2, "val": 20}, {"pk": 3, "val": "not-an-int"}])
-        assert batch.pks == [1]
-        assert batch.extend([{"pk": 4, "val": 40}]).pks == [1, 4]
+        assert _col(batch, "pk") == [1]
+        assert _col(batch.extend([{"pk": 4, "val": 40}]), "pk") == [1, 4]
 
     def test_generator_rows_match_a_list_of_the_same_rows(self):
         """A generator has no `__len__`, so `extend` cannot pre-size for it.
@@ -289,9 +298,7 @@ class TestRowErrors:
         rows = [{"pk": i, "val": i * 10} for i in range(5)]
         from_list = ZSetBatch(KV).extend(rows)
         from_gen = ZSetBatch(KV).extend(dict(r) for r in rows)
-        assert from_gen.pks == from_list.pks
-        assert from_gen.columns == from_list.columns
-        assert from_gen.weights == from_list.weights
+        assert _dump(from_gen) == _dump(from_list)
 
 
 def test_a_dropped_column_is_a_tombstone_the_writer_fills(client, schema_name):
@@ -316,7 +323,7 @@ def test_a_dropped_column_is_a_tombstone_the_writer_fills(client, schema_name):
 
     batch = ZSetBatch(schema).append(id=1, a=10, b=100)
     batch.extend([{"id": 2, "a": 20, "b": 200}])
-    assert batch.columns[1:] == [[0, 0], [100, 200], [10, 20]]
+    assert _dump(batch) == [((1, 0, 100, 10), 1), ((2, 0, 200, 20), 1)]
     client.push(tid, batch)
 
     rows = list(client.scan(tid))
@@ -345,8 +352,8 @@ class TestValueCoercion:
                          ColumnDef("v", TypeCode.UUID)])
         for form in (canonical, canonical.replace("-", ""), uuid.UUID(canonical)):
             batch = ZSetBatch(schema).append(id=form, v=form)
-            assert batch.pks == [canonical]
-            assert batch.columns[1] == [canonical]
+            assert _col(batch, "id") == [canonical]
+            assert _col(batch, "v") == [canonical]
         with pytest.raises(ValueError):
             ZSetBatch(schema).append(id="not-a-uuid-string", v=canonical)
 
@@ -370,8 +377,8 @@ class TestValueCoercion:
         schema = Schema([ColumnDef("k", TypeCode.U128, primary_key=True),
                          ColumnDef("v", TypeCode.U128)])
         batch = ZSetBatch(schema).append(k=u128_max, v=u128_max)
-        assert batch.pks == [u128_max]
-        assert batch.columns[1] == [u128_max]
+        assert _col(batch, "k") == [u128_max]
+        assert _col(batch, "v") == [u128_max]
 
     def test_i128_keeps_its_full_signed_range(self):
         """The signed twin, and the half no join can reach: a matched join key
@@ -384,8 +391,8 @@ class TestValueCoercion:
         batch = ZSetBatch(schema)
         for v in values:
             batch.append(k=v, v=v)
-        assert batch.pks == values
-        assert batch.columns[1] == values
+        assert _col(batch, "k") == values
+        assert _col(batch, "v") == values
 
     def test_bytes_and_text_columns_stay_apart(self):
         """BLOB and STRING share one region form, so the extraction is where the
@@ -396,8 +403,8 @@ class TestValueCoercion:
                          ColumnDef("payload", TypeCode.BLOB),
                          ColumnDef("s", TypeCode.STRING)])
         batch = ZSetBatch(schema).append(pk=1, payload=b"hello\x00world", s="hi")
-        assert batch.columns[1] == [b"hello\x00world"]
-        assert batch.columns[2] == ["hi"]
+        assert _col(batch, "payload") == [b"hello\x00world"]
+        assert _col(batch, "s") == ["hi"]
 
         for bad in ({"payload": "not bytes", "s": "hi"},
                     {"payload": b"", "s": b"\xff\xfe not utf-8"}):
@@ -408,8 +415,7 @@ class TestValueCoercion:
         """A compound key is packed column by column, so a refusal on the
         *second* one leaves bytes already in the key scratch. Both refusals — a
         NULL and an omitted column — must roll it back rather than leave a
-        half-written key for the next row to inherit. A compound PK is presented
-        as its packed bytes, each column little-endian."""
+        half-written key for the next row to inherit."""
         schema = Schema([ColumnDef("a", TypeCode.U64),
                          ColumnDef("b", TypeCode.U32),
                          ColumnDef("v", TypeCode.I64)], pk_indices=[0, 1])
@@ -419,7 +425,7 @@ class TestValueCoercion:
                 batch.append(**row)
             assert len(batch) == 0
             batch.append(a=1, b=2, v=3)        # the scratch is clean
-            assert batch.pks == [(1).to_bytes(8, "little") + (2).to_bytes(4, "little")]
+            assert [(r.a, r.b, r.v) for r in batch.rows()] == [(1, 2, 3)]
 
     def test_a_decimal_column_takes_every_spelling_of_one_value(self):
         """A DECIMAL is a scaled integer, so the binding has to scale whatever it
@@ -438,7 +444,7 @@ class TestValueCoercion:
         batch = ZSetBatch(schema)
         for i, v in enumerate([Decimal("12.5"), 3, 1.1, "2.2505", Decimal("1E+2")], 1):
             batch.append(id=i, v=v)
-        assert batch.columns[1] == [Decimal("12.500"), Decimal("3.000"),
+        assert _col(batch, "v") == [Decimal("12.500"), Decimal("3.000"),
                                     Decimal("1.100"), Decimal("2.251"),
                                     Decimal("100.000")]
 
@@ -468,8 +474,8 @@ class TestValueCoercion:
         batch.append(id=1, d=d, ts=ts)
         batch.append(id=2, d=epoch_days, ts=epoch_days * 86_400_000_000)
         batch.append(id=3, d=ts, ts=d)
-        assert batch.columns[1] == [d, d, d]
-        assert batch.columns[2] == [ts, datetime(2024, 2, 29), datetime(2024, 2, 29)]
+        assert _col(batch, "d") == [d, d, d]
+        assert _col(batch, "ts") == [ts, datetime(2024, 2, 29), datetime(2024, 2, 29)]
 
         with pytest.raises(ValueError, match="naive"):
             ZSetBatch(schema).append(id=9, d=d, ts=datetime.now().astimezone())

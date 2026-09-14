@@ -31,7 +31,7 @@ pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {
 
 /// Run one `SELECT` and return `(schema, rows)`. Local-first: a client holding a
 /// valid copy of the relation answers off it.
-pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> (Schema, ZSetBatch) {
+pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> (std::sync::Arc<Schema>, ZSetBatch) {
     let mut results = SqlPlanner::new(client, schema)
         .execute(s)
         .unwrap_or_else(|e| panic!("{s}: {e}"));
@@ -48,18 +48,15 @@ pub type Row = (Vec<u8>, Vec<Option<Vec<u8>>>);
 /// The Z-set a reply denotes: `(OPK image, cells) → summed weight`, net-zero
 /// entries dropped.
 ///
-/// **PK-canonical because `ZSetBatch::pks` holds native LE**, not the OPK image:
-/// the client's block decoder walks the OPK region back and its encoder is the
-/// single point that re-encodes it. A comparison that chunked `pks.buf` raw
-/// would compare LE tuples against OPK images and pass only for an unsigned
-/// single-byte PK — it would fail on every signed and multi-byte one.
+/// **PK-canonical because `ZSetBatch::pks` holds OPK**, the store's own key
+/// bytes, so keys are compared directly: byte-equal is key-equal.
 ///
 /// **Weight-exact because that is what correctness means here.** A row-set
 /// comparison would accept a replicated view read as if it were keyed, which
 /// returns W copies and inflates every weight W-fold while replying OK.
-pub fn canonical(schema: &Schema, batch: &ZSetBatch) -> BTreeMap<Row, i64> {
+pub fn canonical(batch: &ZSetBatch) -> BTreeMap<Row, i64> {
     let mut out: BTreeMap<Row, i64> = BTreeMap::new();
-    for (row, w) in canonical_rows(schema, batch) {
+    for (row, w) in canonical_rows(batch) {
         *out.entry(row).or_insert(0) += w;
     }
     out.retain(|_, w| *w != 0);
@@ -69,21 +66,21 @@ pub fn canonical(schema: &Schema, batch: &ZSetBatch) -> BTreeMap<Row, i64> {
 /// The same canonical rows **in reply order**, weights beside them — what an
 /// `ORDER BY` comparison needs, since the multiset above is order-blind and so
 /// accepts the right rows in the wrong order.
-pub fn canonical_rows(schema: &Schema, batch: &ZSetBatch) -> Vec<(Row, i64)> {
+pub fn canonical_rows(batch: &ZSetBatch) -> Vec<(Row, i64)> {
     let mut out: Vec<(Row, i64)> = Vec::with_capacity(batch.weights.len());
     for row in 0..batch.weights.len() {
-        // The client column already holds the store's own OPK bytes, so the key
-        // is compared directly rather than re-encoded from a native image.
         let opk = batch.pks.get_bytes(row).to_vec();
-        let cells = schema
-            .payload_columns()
-            .map(|(pi, ci, cd)| {
+        let cells = batch
+            .payload
+            .iter()
+            .enumerate()
+            .map(|(pi, col)| {
                 if gnitz_wire::null_word_get(batch.nulls[row], pi) {
                     return None;
                 }
-                let w = cd.type_code.wire_stride();
-                let cell = &batch.columns[ci][row * w..(row + 1) * w];
-                Some(if gnitz_wire::is_german_string(cd.type_code as u8) {
+                let w = col.stride();
+                let cell = &col.bytes[row * w..(row + 1) * w];
+                Some(if gnitz_wire::is_german_string(col.tc() as u8) {
                     gnitz_wire::german_string_content(cell, &batch.blob).to_vec()
                 } else {
                     cell.to_vec()
@@ -106,7 +103,7 @@ pub fn assert_same_zset(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSet
         b.0.columns.len(),
         "{what}: the two replies have different shapes"
     );
-    let (ca, cb) = (canonical(a.0, a.1), canonical(b.0, b.1));
+    let (ca, cb) = (canonical(a.1), canonical(b.1));
     assert!(
         !(ca.is_empty() && cb.is_empty()),
         "{what}: both replies are empty, so they agree about nothing"
@@ -134,7 +131,7 @@ pub fn assert_same_zset(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSet
 /// unspecified, and the mirror is one partition where the server is W, so two
 /// correct replies legitimately differ in sequence.
 pub fn assert_same_sequence(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSetBatch)) -> usize {
-    let (ra, rb) = (canonical_rows(a.0, a.1), canonical_rows(b.0, b.1));
+    let (ra, rb) = (canonical_rows(a.1), canonical_rows(b.1));
     assert!(
         !ra.is_empty(),
         "{what}: the ordered reply is empty, so it agrees about nothing"

@@ -46,13 +46,13 @@ fn rows(start: i64, count: usize) -> ZSetBatch {
     for i in 0..count as i64 {
         a.extend_from_slice(&((start + i) * 3).to_le_bytes());
     }
-    ZSetBatch {
-        pks: PkColumn::from_natives(&local_schema(), (0..count as i64).map(|i| (start + i) as u128)),
-        weights: vec![1; count],
-        nulls: vec![0; count],
-        columns: vec![vec![], a],
-        blob: vec![],
-    }
+    let schema = local_schema();
+    let mut b = ZSetBatch::new(&schema);
+    b.pks = PkColumn::from_natives(&schema, (0..count as i64).map(|i| (start + i) as u128));
+    b.weights = vec![1; count];
+    b.nulls = vec![0; count];
+    b.payload[0].bytes = a;
+    b
 }
 
 /// Drive every future in **one** task: the first poll takes each through its
@@ -135,10 +135,8 @@ fn cloned_handles_across_tasks_each_get_their_own_result() {
     }
 
     // Every read verb, and a seek whose row is its own.
-    let (_, batch, _) = rt.block_on(client.scan(tid)).unwrap();
-    assert_eq!(batch.map_or(0, |b| b.len()), n * 10);
-    let (_, row, _) = rt.block_on(client.seek(tid, 7, &[])).unwrap();
-    assert_eq!(row.map_or(0, |b| b.len()), 1);
+    assert_eq!(rt.block_on(client.scan(tid)).unwrap().batch.len(), n * 10);
+    assert_eq!(rt.block_on(client.seek(tid, 7, &[])).unwrap().batch.len(), 1);
     let many = rt.block_on(client.scan_many(&[tid, tid])).unwrap_err();
     assert!(
         matches!(many, gnitz_core::ClientError::ServerError(_)),
@@ -146,7 +144,7 @@ fn cloned_handles_across_tasks_each_get_their_own_result() {
     );
     let many = rt.block_on(client.scan_many(&[tid])).unwrap();
     assert_eq!(many.len(), 1);
-    assert_eq!(many[0].1.as_ref().map_or(0, |b| b.len()), n * 10);
+    assert_eq!(many[0].batch.len(), n * 10);
 
     // `resolve` must agree with the blocking client's.
     let theirs = blocking.resolve(&sn, "t").unwrap().expect("the table exists");
@@ -261,9 +259,8 @@ fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
 
 /// `pk → summed weight`, so a comparison is weight-exact: a poll applied twice
 /// leaves the row set identical and doubles every weight in the interval.
-fn weights(batch: &Option<ZSetBatch>) -> std::collections::BTreeMap<u64, i64> {
+fn weights(b: &ZSetBatch) -> std::collections::BTreeMap<u64, i64> {
     let mut out = std::collections::BTreeMap::new();
-    let Some(b) = batch else { return out };
     for row in 0..b.weights.len() {
         let pk = b.pks.get(&local_schema(), row) as u64;
         *out.entry(pk).or_insert(0) += b.weights[row];
@@ -293,10 +290,11 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     // took no `spawn_blocking` is not assertable and is not asserted.
     let bare = rt.block_on(client.scan_local_first(vid)).unwrap();
     let plain = rt.block_on(client.scan(vid)).unwrap();
-    assert_eq!(weights(&bare.1), weights(&plain.1));
-    assert_eq!(bare.2, Some(plain.2), "an unmirrored read carries the server's LSN");
+    assert_eq!(weights(&bare.batch), weights(&plain.batch));
+    assert!(bare.lsn.is_some(), "an unmirrored read carries the server's LSN");
+    assert_eq!(bare.lsn, plain.lsn);
     assert!(
-        !weights(&bare.1).is_empty(),
+        !weights(&bare.batch).is_empty(),
         "the view must hold rows, or this proves nothing"
     );
 
@@ -336,7 +334,7 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     // lock, so they serialize instead of both fetching `(c, …]` and both
     // applying it.
     blocking.push(tid, &schema, &rows(50, 50)).unwrap();
-    let expected = weights(&blocking.scan(vid).unwrap().1);
+    let expected = weights(&blocking.scan(vid).unwrap().batch);
     let (a, b) = (client.clone(), client.clone());
     let (ra, rb) = rt.block_on(async { tokio::join!(a.poll_mirror(), b.poll_mirror()) });
     ra.expect("the first poll");
@@ -345,17 +343,17 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     rt.block_on(client.poll_mirror()).expect("a third, for the tail round");
 
     let local = rt.block_on(client.scan_local_first(vid)).unwrap();
-    assert!(local.2.is_none(), "a local answer carries no served LSN");
+    assert!(local.lsn.is_none(), "a local answer carries no served LSN");
     assert_eq!(
-        weights(&local.1),
+        weights(&local.batch),
         expected,
         "two concurrent polls must leave the weights one poll produces",
     );
 
     // A relation the copy does not hold still reads, over the wire.
     let unheld = rt.block_on(client.scan_local_first(tid)).unwrap();
-    assert!(unheld.2.is_some(), "a delegated read carries the server's LSN");
-    assert_eq!(weights(&unheld.1).len(), 100);
+    assert!(unheld.lsn.is_some(), "a delegated read carries the server's LSN");
+    assert_eq!(weights(&unheld.batch).len(), 100);
 
     rt.block_on(client.checkpoint_mirror()).expect("checkpoint");
     rt.block_on(client.forget_view(vid)).expect("forget");

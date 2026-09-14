@@ -123,7 +123,7 @@ def test_the_pair_pk_is_the_source_keys_at_their_own_width(client, schema_name):
         want = {(i, i * 2, j, j * 3): 1 for i in range(1, 13) for j in b_ids if i * 7 % 19 < j * 5 % 19}
         assert bag(scanned(client, sn, "wide"), "ak1", "ak2", "bk1", "bk2") == want
         wide = client.resolve_table(sn, "wide")[0]
-        assert bag(client.scan(wide, include_hidden=True),
+        assert bag(client.scan(wide).including_hidden(),
                    "_pair_pk_0", "_pair_pk_1", "_pair_pk_2", "_pair_pk_3") == want
 
     expect(range(1, 13))

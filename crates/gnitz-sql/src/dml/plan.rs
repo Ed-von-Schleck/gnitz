@@ -282,11 +282,10 @@ pub(crate) fn fetch_bound(
     // `client` and the borrow of `out` never overlap.
     let mut send = |client: &mut GnitzClient, bound: &ReadBound| -> Result<(), GnitzSqlError> {
         let blob = access.encode(bound, sink);
-        if let Some(batch) = client.scan_spec_local_first(table_id, &blob, reply_schema)? {
-            match out.as_mut() {
-                Some(acc) => acc.extend_from_owned(batch, reply_schema),
-                None => out = Some(batch),
-            }
+        let batch = client.scan_spec_local_first(table_id, &blob, reply_schema)?;
+        match out.as_mut() {
+            Some(acc) => acc.extend_from_owned(batch),
+            None => out = Some(batch),
         }
         Ok(())
     };
