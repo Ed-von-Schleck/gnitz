@@ -50,7 +50,7 @@ pub(crate) fn append_value_to_col(
         TypeCode::F32 | TypeCode::F64 => {
             // Negating the parsed magnitude is exact at every IEEE value, `-0.0`
             // and `-inf` included — which is why the sign travels beside it.
-            let mag = float_magnitude(c, tc)?;
+            let mag = float_magnitude(c)?;
             let v = if c.negated { -mag } else { mag };
             // F32 rounds through binary64, as `ZSetBatch::append` does for a
             // Python float, so the two ingest paths agree bit for bit.
@@ -95,13 +95,13 @@ pub(crate) fn append_value_to_col(
 /// A float column's value with the sign not yet applied. Every numeric spelling
 /// reaches one, a magnitude past `i128` included — which a DOUBLE holds and no
 /// integer parse would.
-fn float_magnitude(c: &Constant, tc: TypeCode) -> Result<f64, GnitzSqlError> {
+fn float_magnitude(c: &Constant) -> Result<f64, GnitzSqlError> {
+    if let Some(v) = c.lit.int_literal() {
+        return Ok(v as f64);
+    }
     match &c.lit {
-        BExpr::LitFloat(v) => Ok(*v),
-        BExpr::LitInt(v) => Ok(*v as f64),
-        BExpr::LitWide(s) => s
-            .parse::<f64>()
-            .map_err(|_| GnitzSqlError::Bind(format!("invalid {tc:?}: {s}"))),
+        BExpr::LitFloat { v, .. } => Ok(*v),
+        BExpr::LitWide(n) => Ok(n.mag as f64),
         _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
     }
 }

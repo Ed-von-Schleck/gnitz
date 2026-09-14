@@ -267,3 +267,19 @@ def test_a_null_string_key_matches_neither_the_empty_string_nor_another_null(
         "INSERT INTO l VALUES (1, NULL), (2, ''), (3, 'x')", schema_name=sn)
 
     assert bag(scanned(client, sn, "v"), "id", "name") == {(2, 900): 1, (3, 901): 1}
+
+
+def test_the_minimum_literal_and_a_negated_unsigned_column_compute_exactly(client, schema_name):
+    """`-9223372036854775808` is a BIGINT literal a filter compares like any other,
+    not only where a key seek or a written cell reads it; and ABS over `-u` of an
+    unsigned column computes both kernels, so it answers `u` — with a NULL row
+    left NULL rather than read as its zero."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE m (pk BIGINT NOT NULL PRIMARY KEY, b BIGINT, u INT UNSIGNED)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO m VALUES (1, -9223372036854775808, 4000000000), (2, 0, 7), (3, NULL, NULL)",
+        schema_name=sn)
+    assert bag(rows(client, sn, "SELECT pk FROM m WHERE b = -9223372036854775808")) == {(1,): 1}
+    assert bag(rows(client, sn, "SELECT pk, ABS(-u) AS a FROM m"), "pk", "a") == {
+        (1, 4000000000): 1, (2, 7): 1, (3, None): 1}

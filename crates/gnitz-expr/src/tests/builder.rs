@@ -62,3 +62,19 @@ fn a_lift_over_a_constant_folds_to_a_float_constant() {
     let prog = b.build(Some(lifted)).expect("a well-formed program");
     assert!(matches!(prog.instrs(), [L::LoadColInt { .. }, L::IntToFloat { .. }]));
 }
+
+/// A range check over a value already range-checked into the same type is that
+/// value, so a narrowing cast feeding a slot of its own width costs one check;
+/// over a different target it is a real narrowing and stays.
+#[test]
+fn a_range_check_over_the_same_range_check_folds() {
+    use gnitz_wire::FixedInt;
+    let mut b = ExprBuilder::new();
+    let col = b.emit(L::LoadColInt { col: 1 });
+    let narrow = b.emit(L::IntCast { a: col, fi: FixedInt::I16 });
+    assert_eq!(b.emit(L::IntCast { a: narrow, fi: FixedInt::I16 }), narrow);
+    let narrower = b.emit(L::IntCast { a: narrow, fi: FixedInt::I8 });
+    assert_ne!(narrower, narrow);
+    let prog = b.build(Some(narrower)).expect("a well-formed program");
+    assert_eq!(prog.instrs().len(), 3);
+}

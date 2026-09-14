@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{batch_2col, col_def, parse_stmt, two_col};
+use crate::test_support::{batch_2col, col_def, lit, parse_stmt, two_col};
 use gnitz_core::TypeCode;
 use sqlparser::ast::Statement;
 
@@ -277,11 +277,7 @@ fn set_numeric_over_a_nullable_column() {
         }
     }
     // SET a = b + 1
-    let rhs = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(2)),
-        crate::ir::BinOp::Add,
-        Box::new(BoundExpr::LitInt(1)),
-    );
+    let rhs = BoundExpr::bin(BoundExpr::ColRef(2), crate::ir::BinOp::Add, BoundExpr::LitInt(1));
     let mut dst = ZSetBatch::new(&schema);
     write_set_rows(&current, &programs(&[(1, rhs)], &schema), &schema, &mut dst).unwrap();
 
@@ -304,11 +300,7 @@ fn set_reads_the_pk_column() {
         buf.extend_from_slice(&0i64.to_le_bytes());
     }
     // SET val = pk + 1
-    let plus_one = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(0)),
-        crate::ir::BinOp::Add,
-        Box::new(BoundExpr::LitInt(1)),
-    );
+    let plus_one = BoundExpr::bin(BoundExpr::ColRef(0), crate::ir::BinOp::Add, BoundExpr::LitInt(1));
     let mut dst = ZSetBatch::new(&schema);
     write_set_rows(&current, &programs(&[(1, plus_one)], &schema), &schema, &mut dst).unwrap();
     assert_eq!(written_i64(&dst, 0), 42);
@@ -346,11 +338,7 @@ fn set_int_column_from_float_expression_rejects() {
         "error must name the cause: {err}"
     );
     // A float *comparison* is integer-valued (0/1) and stays servable.
-    let cmp = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(2)),
-        crate::ir::BinOp::Gt,
-        Box::new(BoundExpr::LitFloat(1.5)),
-    );
+    let cmp = BoundExpr::bin(BoundExpr::ColRef(2), crate::ir::BinOp::Gt, lit("1.5"));
     assert!(classify_set_rhs(&cmp, 1, &schema).is_ok());
 }
 

@@ -45,6 +45,16 @@ impl ExprBuilder {
                 },
                 _ => instr,
             },
+            // A range check of a value already range-checked into the same type is
+            // that value: it is whole in the target and carries the same U64 tracking.
+            LogicalInstr::IntCast { a, fi } => match self.instrs.get(a.0 as usize) {
+                Some(
+                    &LogicalInstr::IntCast { fi: g, .. }
+                    | &LogicalInstr::FloatToInt { fi: g, .. }
+                    | &LogicalInstr::StrToInt { fi: g, .. },
+                ) if g == fi => return a,
+                _ => instr,
+            },
             _ => instr,
         };
         if self.within_reg_cap() {

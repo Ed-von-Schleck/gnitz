@@ -60,7 +60,7 @@ fn test_bind_between_desugars_to_comparison_tree() {
     }
     // `c NOT BETWEEN 1 AND 9` ≡ NOT(c >= 1 AND c <= 9).
     match bind1(&parse_expr_sql("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
-        BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
+        BoundExpr::Not(inner) => {
             assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::And, _)))
         }
         other => panic!("expected Not(And(..)), got {other:?}"),
@@ -144,7 +144,7 @@ fn test_bind_in_list_folds_one_item_else_binds_faithful() {
     // NOT IN wraps whichever node the arity picked.
     for (src, folded) in [("c NOT IN (7)", true), ("c NOT IN (1, 2)", false)] {
         match bind1(&parse_expr_sql(src), &schema).unwrap() {
-            BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
+            BoundExpr::Not(inner) => {
                 assert_eq!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Eq, _)), folded, "{src}")
             }
             other => panic!("{src}: expected Not(_), got {other:?}"),
@@ -622,7 +622,7 @@ fn bind_str(src: &str) -> Result<BoundExpr, GnitzSqlError> {
 /// there.
 fn like_parts(src: &str) -> (String, Option<u8>, bool, bool) {
     let (e, negated) = match bind_str(src).unwrap() {
-        BoundExpr::UnaryOp(UnaryOp::Not, inner) => (*inner, true),
+        BoundExpr::Not(inner) => (*inner, true),
         other => (other, false),
     };
     match e {
@@ -900,20 +900,48 @@ fn substring_spellings_bind_to_one_node() {
         "SUBSTR(c FROM 2 FOR 3)",
     ] {
         match bind_str(src).unwrap() {
-            BExpr::Substr { start, len, .. } => {
-                assert!(matches!(*start, BExpr::LitInt(2)), "{src}");
-                assert!(matches!(len.as_deref(), Some(BExpr::LitInt(3))), "{src}");
+            BExpr::StrCall { f: StrFunc::Substr, args } => {
+                assert!(
+                    matches!(args.as_slice(), [_, BExpr::LitInt(2), BExpr::LitInt(3)]),
+                    "{src}"
+                );
             }
             other => panic!("{src}: expected Substr, got {other:?}"),
         }
     }
     match bind_str("SUBSTRING(c)").unwrap() {
-        BExpr::Substr { start, len, .. } => {
-            assert!(matches!(*start, BExpr::LitInt(1)), "an absent FROM starts at 1");
-            assert!(len.is_none());
-        }
+        BExpr::StrCall { f: StrFunc::Substr, args } => assert!(
+            matches!(args.as_slice(), [_, BExpr::LitInt(1)]),
+            "an absent FROM starts at 1 and an absent FOR stays absent"
+        ),
         other => panic!("expected Substr, got {other:?}"),
     }
+}
+
+/// A minus over a literal folds into it at bind, keeping `LitWide`'s invariant
+/// that its value does not fit `i64`; over anything else it is the numeric
+/// negation function.
+#[test]
+fn a_negated_literal_folds_and_keeps_the_wide_invariant() {
+    let schema = schema_with_val(TypeCode::I64);
+    let b = |src| bind1(&parse_expr_sql(src), &schema).unwrap();
+    assert_eq!(b("-9223372036854775808"), BExpr::LitInt(i64::MIN));
+    assert_eq!(
+        b("-(-9223372036854775808)"),
+        BExpr::LitWide(NumLit { mag: 1 << 63, neg: false })
+    );
+    assert_eq!(
+        b("-170141183460469231731687303715884105728"),
+        BExpr::LitWide(NumLit { mag: 1 << 127, neg: true })
+    );
+    assert_eq!(b("-1.5"), BExpr::LitFloat { v: -1.5, dec: Some((-15, 1)) });
+    assert_eq!(
+        b("-c"),
+        BExpr::Func {
+            f: NumFunc::Unary(FloatUnaryOp::Neg),
+            arg: Box::new(BExpr::ColRef(1)),
+        }
+    );
 }
 
 #[test]

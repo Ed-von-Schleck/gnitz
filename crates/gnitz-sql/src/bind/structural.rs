@@ -6,7 +6,7 @@ use crate::ast_util::{
     temporal_constant, Constant,
 };
 use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrFunc, TrimMode, UnaryOp};
+use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, NumLit, StrArg, StrFunc, TrimMode};
 use crate::types::{is_cast_target, sql_col_type};
 use gnitz_core::{ColumnDef, Schema};
 use gnitz_expr::CalendarOp;
@@ -122,8 +122,8 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
     }
     // The VM parses no calendar text, so a temporal literal is folded here and
     // a non-literal string cast to DATE/TIMESTAMP is refused at lowering.
-    if let Some((to, v)) = temporal_constant(expr)? {
-        return Ok(BExpr::temporal_lit(to, v));
+    if let Some((tc, v)) = temporal_constant(expr)? {
+        return Ok(BExpr::LitTemporal { tc, v });
     }
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
@@ -193,18 +193,19 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             substring_for,
             special: _,
             shorthand: _,
-        } => Ok(BExpr::Substr {
-            s: Box::new(bind_structural(e, leaf)?),
-            start: Box::new(match substring_from {
-                Some(f) => bind_structural(f, leaf)?,
-                None => BExpr::LitInt(1),
-            }),
-            len: substring_for
-                .as_deref()
-                .map(|l| bind_structural(l, leaf))
-                .transpose()?
-                .map(Box::new),
-        }),
+        } => {
+            let mut args = vec![
+                bind_structural(e, leaf)?,
+                match substring_from {
+                    Some(f) => bind_structural(f, leaf)?,
+                    None => BExpr::LitInt(1),
+                },
+            ];
+            if let Some(l) = substring_for {
+                args.push(bind_structural(l, leaf)?);
+            }
+            Ok(BExpr::StrCall { f: StrFunc::Substr, args })
+        }
         Expr::Trim {
             trim_where,
             trim_what,
@@ -246,14 +247,14 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             // Two never-NULL operands make the null branch dead, so the whole
             // CASE is the plain comparison.
             if let (Nullness::Never, Nullness::Never) = (nullness(&a, leaf), nullness(&b, leaf)) {
-                return Ok(BExpr::BinOp(Box::new(a), op, Box::new(b)));
+                return Ok(BExpr::bin(a, op, b));
             }
             let (a_null, b_null) = (null_test(a.clone(), true, leaf), null_test(b.clone(), true, leaf));
-            let cmp = BExpr::BinOp(Box::new(a), op, Box::new(b));
+            let cmp = BExpr::bin(a, op, b);
             Ok(BExpr::Case {
                 branches: vec![(
-                    BExpr::BinOp(Box::new(a_null.clone()), BinOp::Or, Box::new(b_null.clone())),
-                    BExpr::BinOp(Box::new(a_null), op, Box::new(b_null)),
+                    BExpr::bin(a_null.clone(), BinOp::Or, b_null.clone()),
+                    BExpr::bin(a_null, op, b_null),
                 )],
                 else_: Some(Box::new(cmp)),
             })
@@ -311,11 +312,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             let mut branches = Vec::with_capacity(conditions.len());
             for CaseWhen { condition, result } in conditions {
                 let cond = match &operand {
-                    Some(op) => BExpr::BinOp(
-                        Box::new(op.clone()),
-                        BinOp::Eq,
-                        Box::new(bind_structural(condition, leaf)?),
-                    ),
+                    Some(op) => BExpr::bin(op.clone(), BinOp::Eq, bind_structural(condition, leaf)?),
                     None => bind_structural(condition, leaf)?,
                 };
                 branches.push((cond, bind_structural(result, leaf)?));
@@ -330,20 +327,34 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         Expr::BinaryOp { left, op, right } => {
             let l = bind_structural(left, leaf)?;
             let r = bind_structural(right, leaf)?;
-            Ok(BExpr::BinOp(Box::new(l), map_binop(op)?, Box::new(r)))
+            Ok(BExpr::bin(l, map_binop(op)?, r))
         }
         Expr::UnaryOp { op, expr } => {
             let inner = bind_structural(expr, leaf)?;
             // A negated literal leaves here as the literal `-1`, the one shape
-            // every consumer reads a constant by. Unary `+` folds over a numeric
-            // literal and nothing else, as in PostgreSQL: a total identity would
-            // newly accept `+'abc'` and `+(a > 1)`.
+            // every consumer reads a constant by; the folds keep `LitWide`'s
+            // invariant that its value does not fit `i64`. Unary `+` folds over a
+            // numeric literal and nothing else, as in PostgreSQL: a total identity
+            // would newly accept `+'abc'` and `+(a > 1)`.
             match (op, inner) {
-                (UnaryOperator::Minus, BExpr::LitInt(v)) => Ok(BExpr::LitInt(-v)),
-                (UnaryOperator::Minus, BExpr::LitFloat(v)) => Ok(BExpr::LitFloat(-v)),
-                (UnaryOperator::Minus, inner) => Ok(BExpr::UnaryOp(UnaryOp::Neg, Box::new(inner))),
-                (UnaryOperator::Not, inner) => Ok(BExpr::UnaryOp(UnaryOp::Not, Box::new(inner))),
-                (UnaryOperator::Plus, inner @ (BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitWide(_))) => Ok(inner),
+                (UnaryOperator::Minus, BExpr::LitInt(v)) => Ok(v
+                    .checked_neg()
+                    .map_or(BExpr::LitWide(NumLit { mag: 1 << 63, neg: false }), BExpr::LitInt)),
+                (UnaryOperator::Minus, BExpr::LitFloat { v, dec }) => {
+                    Ok(BExpr::LitFloat { v: -v, dec: dec.map(|(u, s)| (-u, s)) })
+                }
+                (UnaryOperator::Minus, BExpr::LitWide(n)) => Ok(match n {
+                    NumLit { mag, neg: false } if mag == 1 << 63 => BExpr::LitInt(i64::MIN),
+                    NumLit { mag, neg } => BExpr::LitWide(NumLit { mag, neg: !neg }),
+                }),
+                (UnaryOperator::Minus, inner) => Ok(BExpr::Func {
+                    f: NumFunc::Unary(FloatUnaryOp::Neg),
+                    arg: Box::new(inner),
+                }),
+                (UnaryOperator::Not, inner) => Ok(BExpr::Not(Box::new(inner))),
+                (UnaryOperator::Plus, inner @ (BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_))) => {
+                    Ok(inner)
+                }
                 (o, _) => Err(GnitzSqlError::Unsupported(format!(
                     "unary operator {o:?} not supported"
                 ))),
@@ -355,16 +366,9 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // binds once and is cloned, for the simple-CASE operand's reason above.
         Expr::Between { expr: e, negated, low, high } => {
             let subject = bind_structural(e, leaf)?;
-            let ge = BExpr::BinOp(
-                Box::new(subject.clone()),
-                BinOp::Ge,
-                Box::new(bind_structural(low, leaf)?),
-            );
-            let le = BExpr::BinOp(Box::new(subject), BinOp::Le, Box::new(bind_structural(high, leaf)?));
-            Ok(maybe_negate(
-                BExpr::BinOp(Box::new(ge), BinOp::And, Box::new(le)),
-                *negated,
-            ))
+            let ge = BExpr::bin(subject.clone(), BinOp::Ge, bind_structural(low, leaf)?);
+            let le = BExpr::bin(subject, BinOp::Le, bind_structural(high, leaf)?);
+            Ok(maybe_negate(BExpr::bin(ge, BinOp::And, le), *negated))
         }
         // `e IN (l)` IS `e = l` — the same structural desugar as BETWEEN above, and
         // what makes the equality visible to the `access` recognizers, which all gate
@@ -375,11 +379,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         Expr::InList { expr: e, list, negated } => {
             let node = match list.as_slice() {
                 [] => return Err(GnitzSqlError::Unsupported("IN with an empty list".into())),
-                [only] => BExpr::BinOp(
-                    Box::new(bind_structural(e, leaf)?),
-                    BinOp::Eq,
-                    Box::new(bind_structural(only, leaf)?),
-                ),
+                [only] => BExpr::bin(bind_structural(e, leaf)?, BinOp::Eq, bind_structural(only, leaf)?),
                 _ => BExpr::InList {
                     inner: Box::new(bind_structural(e, leaf)?),
                     items: list
@@ -422,7 +422,7 @@ fn trim_set(trim_what: Option<&Expr>) -> Result<String, GnitzSqlError> {
 /// The `NOT` wrapper the negatable predicates (BETWEEN, IN, LIKE) share.
 fn maybe_negate<R>(node: BExpr<R>, negated: bool) -> BExpr<R> {
     if negated {
-        BExpr::UnaryOp(UnaryOp::Not, Box::new(node))
+        BExpr::Not(Box::new(node))
     } else {
         node
     }
@@ -522,8 +522,8 @@ impl Call {
             Call::Round | Call::Trim1(_) => (1, Some(2)),
             Call::Str(f) => {
                 let sig = f.signature();
-                // A trailing slot with a default may be omitted.
-                (sig.iter().filter(|a| a.default().is_none()).count(), Some(sig.len()))
+                // A trailing slot a call need not write may be omitted.
+                (sig.iter().filter(|a| a.required()).count(), Some(sig.len()))
             }
         }
     }
@@ -564,6 +564,7 @@ const SCALAR_CALLS: &[(&str, Call)] = &[
     ("LPAD", Call::Str(StrFunc::Lpad)),
     ("RPAD", Call::Str(StrFunc::Rpad)),
     ("SPLIT_PART", Call::Str(StrFunc::SplitPart)),
+    ("SUBSTRING", Call::Str(StrFunc::Substr)),
     ("IF", Call::If),
     ("IFNULL", Call::Ifnull),
     ("NVL", Call::Ifnull),
@@ -672,10 +673,7 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
             let a = bind_structural(args[0], leaf)?;
             let b = bind_structural(args[1], leaf)?;
             Ok(BExpr::Case {
-                branches: vec![(
-                    BExpr::BinOp(Box::new(a.clone()), BinOp::Eq, Box::new(b)),
-                    BExpr::LitNull,
-                )],
+                branches: vec![(BExpr::bin(a.clone(), BinOp::Eq, b), BExpr::LitNull)],
                 else_: Some(Box::new(a)),
             })
         }
@@ -699,7 +697,7 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
         Call::Binary(op) => {
             let a = bind_structural(args[0], leaf)?;
             let b = bind_structural(args[1], leaf)?;
-            Ok(BExpr::BinOp(Box::new(a), op, Box::new(b)))
+            Ok(BExpr::bin(a, op, b))
         }
         // NULL skipping is the MAX2/MIN2 opcode's, so no argument needs a
         // null-test rewrite and a computed argument is as good as a column.
@@ -741,15 +739,16 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
 }
 
 /// A string function call, its omitted trailing slots supplied as the literal
-/// defaults [`StrFunc::signature`] declares, so the node always carries the
-/// full signature.
+/// defaults [`StrFunc::signature`] declares, so the node carries every defaulted
+/// slot (an omitted `IntOpt` stays absent).
 fn bind_str_call<R: Clone, L: LeafBinder<R>>(f: StrFunc, args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
     let sig = f.signature();
     let mut bound = bind_all(args, leaf)?;
     bound.extend(
         sig[args.len()..]
             .iter()
-            .map(|a| BExpr::LitStr(a.default().expect("only a defaulted slot may be omitted").to_string())),
+            .filter_map(|a| StrArg::default(*a))
+            .map(|d| BExpr::LitStr(d.to_string())),
     );
     Ok(BExpr::StrCall { f, args: bound })
 }

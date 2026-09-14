@@ -1,10 +1,9 @@
 //! Literal parsing + PK/seek key packing — the partition-routing source of
 //! truth.
 //!
-//! `parse_pk_literal_packed` is the single helper through which every INSERT and
-//! SEEK PK literal flows ([`PkPlan::push`], plus `try_col_eq_literal` /
-//! `try_extract_pk_in` in the WHERE planner), so the master cannot route an
-//! INSERT and a DELETE for the same key to different workers.
+//! [`bound_key_literal`] is the one literal→key rule every INSERT and SEEK PK
+//! literal flows through, so the master cannot route an INSERT and a DELETE for
+//! the same key to different workers.
 //!
 //! One literal shape reaches those packers: the bound [`BoundLit`], read out of
 //! a `BoundExpr` by the WHERE recognizers and out of a [`Constant`] by INSERT
@@ -12,7 +11,7 @@
 
 use crate::ast_util::Constant;
 use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BoundExpr, UnaryOp};
+use crate::ir::{BExpr, BoundExpr, NumLit};
 #[cfg(test)]
 use gnitz_core::PkBuf;
 use gnitz_core::{ColType, ColumnDef, FixedInt, PkColumn, Schema, TypeCode};
@@ -22,54 +21,11 @@ pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
     gnitz_wire::parse_uuid(s).ok_or_else(|| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
 }
 
-/// Parse a numeric SQL literal as `i128`, applying `negated` (the literal sat
-/// under `Expr::UnaryOp(Minus, _)`). The magnitude parses as `u128` so a type
-/// minimum's own digit string is accepted — up to `2^127`, whose `as i128` is
-/// `i128::MIN` and whose `wrapping_neg` is itself; parse-as-`i128`-then-negate
-/// would reject it. `i128` covers every ≤8-byte type with room to spare, so an
-/// out-of-type-range literal is *representable* — callers classify it against
-/// `FixedInt::range` and decline or saturate, never wrap.
-pub(crate) fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
-    let m = n_str.parse::<u128>().ok()?;
-    if negated {
-        (m <= i128::MAX as u128 + 1).then(|| (m as i128).wrapping_neg())
-    } else {
-        (m <= i128::MAX as u128).then_some(m as i128)
-    }
-}
-
-/// Parse a numeric SQL literal into its packed-u128 PK form: the low
-/// `wire_stride` bytes carry the column's native LE encoding
-/// (`FixedInt::pack` — e.g. `-1_i8` → `0xFF`, not `0xFFFF_FFFF_FFFF_FFFF`),
-/// the rest stay zero. An out-of-type-range literal declines (`None`) instead
-/// of wrapping: without the `FixedInt::range` check, `x = 3000000000` on an
-/// I32 column would cast to `-1294967296` and seek the wrong value (silent
-/// wrong rows — the cff7c58-class trap).
-///
-/// This helper is the single source of truth for INSERT/SEEK PK routing —
-/// [`PkPlan::push`], `try_col_eq_literal`, and `try_extract_pk_in` all
-/// dispatch through it so the master cannot send INSERT and DELETE for the
-/// same key to different workers.
-pub(crate) fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
-    match tc {
-        // U128/UUID take the full unsigned range — beyond i128, so they parse as
-        // u128 directly rather than through the i128 value path.
-        TypeCode::U128 | TypeCode::UUID => {
-            if negated {
-                return None;
-            }
-            n_str.parse::<u128>().ok()
-        }
-        _ => pack_pk_value(tc, parse_literal_i128(n_str, negated)?),
-    }
-}
-
-/// Pack an already-parsed literal value into its packed-u128 PK form — the
-/// value-level half of [`parse_pk_literal_packed`], for callers holding a native
-/// integer (a `LitInt`) that would otherwise stringify only to re-parse. Same
-/// contract: an out-of-type-range value declines (`None`) instead of wrapping.
-/// (A U128/UUID value above `i128::MAX` cannot arrive here — such literals only
-/// exist as digit strings and take the u128 parse above.)
+/// Pack a literal value into its packed-u128 PK form: the low `wire_stride`
+/// bytes carry the column's native LE encoding (`FixedInt::pack` — e.g. `-1_i8`
+/// → `0xFF`), the rest stay zero. An out-of-type-range value declines (`None`)
+/// instead of wrapping: `x = 3000000000` on an I32 column must not seek
+/// `-1294967296`.
 pub(crate) fn pack_pk_value(tc: TypeCode, v: i128) -> Option<u128> {
     match tc {
         TypeCode::U128 | TypeCode::UUID => (v >= 0).then_some(v as u128),
@@ -88,68 +44,28 @@ pub(crate) fn pack_pk_value(tc: TypeCode, v: i128) -> Option<u128> {
 // The bound-literal seam
 // ---------------------------------------------------------------------------
 
-/// A bound numeric literal, sign applied. `LitInt` carries its own sign; a
-/// `LitWide` magnitude rides under an outer `Neg` when negative.
-#[derive(Clone, Copy)]
-pub(crate) enum NumLit<'e> {
-    /// A native literal (any i64, sign applied — `-(i64::MIN)` fits i128).
-    Small(i128),
-    /// A wide magnitude digit string + sign. Kept as the raw string because the
-    /// `i128`-vs-`u128` parse is the consumer's call: it holds the column
-    /// `TypeCode`, and a `LitWide` in the `(i128::MAX, u128::MAX]` band
-    /// (`U128`/`UUID`) needs the u128 parse a signed value could not represent.
-    Wide(&'e str, bool),
-}
-
-impl NumLit<'_> {
-    /// Whether the literal is below zero, without committing to a width its
-    /// magnitude may not fit.
-    fn is_negative(self) -> bool {
-        match self {
-            NumLit::Small(v) => v < 0,
-            NumLit::Wide(_, negated) => negated,
-        }
-    }
-
-    /// The literal as a signed value, for a consumer that classifies against a
-    /// ≤8-byte type's range. `None` for a magnitude past `i128` — only a
-    /// `U128`/`UUID` literal, which takes [`pack_num`]'s unsigned path instead.
-    pub(crate) fn to_i128(self) -> Option<i128> {
-        match self {
-            NumLit::Small(v) => Some(v),
-            NumLit::Wide(s, negated) => parse_literal_i128(s, negated),
-        }
-    }
-}
-
 /// The one seam from a bound numeric literal to a [`NumLit`].
-pub(crate) fn bound_num_literal(e: &BoundExpr) -> Option<NumLit<'_>> {
-    if let Some(v) = e.int_literal() {
-        return Some(NumLit::Small(v as i128));
-    }
+pub(crate) fn bound_num_literal(e: &BoundExpr) -> Option<NumLit> {
     match e {
-        BExpr::LitWide(s) => Some(NumLit::Wide(s, false)),
-        BExpr::UnaryOp(UnaryOp::Neg, inner) => match inner.as_ref() {
-            BExpr::LitWide(s) => Some(NumLit::Wide(s, true)),
-            _ => None,
-        },
-        _ => None,
+        BExpr::LitWide(n) => Some(*n),
+        e => e.int_literal().map(|v| NumLit::of_i128(v.into())),
     }
 }
 
 /// Pack a numeric literal as a seek/range key for column type `tc`, byte-exactly
-/// (an out-of-type-range literal declines, never wraps).
-pub(crate) fn pack_num(tc: TypeCode, lit: NumLit<'_>) -> Option<u128> {
-    match lit {
-        NumLit::Small(v) => pack_pk_value(tc, v),
-        NumLit::Wide(s, negated) => parse_pk_literal_packed(tc, s, negated),
+/// (an out-of-type-range literal declines, never wraps). U128/UUID take the full
+/// unsigned range, which no `i128` spells.
+pub(crate) fn pack_num(tc: TypeCode, lit: NumLit) -> Option<u128> {
+    match tc {
+        TypeCode::U128 | TypeCode::UUID => (!lit.is_negative()).then_some(lit.mag),
+        _ => pack_pk_value(tc, lit.to_i128()?),
     }
 }
 
 /// A bound literal accepted for a seek/range key: a numeric value + sign, or a
 /// string (a single-quoted UUID).
 pub(crate) enum BoundLit<'e> {
-    Num(NumLit<'e>),
+    Num(NumLit),
     Str(&'e str),
 }
 
@@ -171,7 +87,7 @@ pub(crate) fn col_key_literal<'e>(e: &'e BoundExpr, col: &ColumnDef) -> Option<B
     if col.type_code != TypeCode::Decimal {
         return bound_literal(e);
     }
-    Some(BoundLit::Num(NumLit::Small(e.exact_decimal(col.scale)? as i128)))
+    Some(BoundLit::Num(NumLit::of_i128(e.exact_decimal(col.scale)?.into())))
 }
 
 /// Why a bound literal is not a key for a column of a given type — classified
@@ -217,9 +133,12 @@ impl Constant {
     /// This constant as a [`BoundLit`], so a VALUES cell takes the bound-literal
     /// key rule rather than re-spelling the `Str`-vs-`Num` dispatch.
     fn bound_lit(&self) -> Option<BoundLit<'_>> {
+        if let Some(v) = self.lit.int_literal() {
+            let v = i128::from(v);
+            return Some(BoundLit::Num(NumLit::of_i128(if self.negated { -v } else { v })));
+        }
         Some(match &self.lit {
-            BExpr::LitInt(v) => BoundLit::Num(NumLit::Small(if self.negated { -(*v as i128) } else { *v as i128 })),
-            BExpr::LitWide(s) => BoundLit::Num(NumLit::Wide(s, self.negated)),
+            BExpr::LitWide(n) => BoundLit::Num(NumLit { mag: n.mag, neg: self.negated }),
             BExpr::LitStr(s) => BoundLit::Str(s),
             _ => return None,
         })
@@ -233,16 +152,10 @@ impl Constant {
         if ty.is_decimal() {
             let sign = if self.negated { -1 } else { 1 };
             let (v, s) = match &self.lit {
-                // `LitWide` is a digit run the parser already validated, so only
-                // its length can defeat the read; a written string can be
-                // anything.
-                BExpr::LitWide(digits) => parse_decimal_text(digits).ok_or(KeyLitError::OutOfRange)?,
                 BExpr::LitStr(text) => parse_decimal_text(text).ok_or(KeyLitError::NotOfType)?,
-                BExpr::LitInt(_) | BExpr::LitFloat(_) => self
-                    .lit
-                    .decimal_literal()
-                    .map(|(v, s)| (v as i128, s))
-                    .ok_or(KeyLitError::OutOfRange)?,
+                BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => {
+                    self.lit.decimal_literal().ok_or(KeyLitError::OutOfRange)?
+                }
                 _ => return Err(KeyLitError::NotNumeric),
             };
             let v = rescale(sign * v, s, ty.scale).ok_or(KeyLitError::OutOfRange)?;

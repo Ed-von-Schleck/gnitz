@@ -27,9 +27,10 @@ use gnitz_core::{ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
 /// - always nullable — an expression over a NOT NULL column can still be NULL
 ///   (division by zero, an unmatched CASE);
 /// - typed by the register image the engine's register sink stores whole, not
-///   the nominal type: `-f32col` computes in f64, so declaring the column `F32`
-///   would ship the low half of the double. STRING maps to itself, which
-///   `register_image` already accounts for.
+///   the nominal type: a narrowing integer cast types as its target and a window
+///   placeholder as the narrow value it stands in for, yet each rides a full
+///   8-byte register. STRING maps to itself, which `register_image` already
+///   accounts for.
 pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: ColType) -> ColumnDef {
     ColumnDef::typed(
         alias.unwrap_or_else(|| computed_column_name(idx)),

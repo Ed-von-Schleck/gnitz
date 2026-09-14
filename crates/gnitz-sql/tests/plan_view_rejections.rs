@@ -628,7 +628,7 @@ fn scalar_expression_rules() {
         ("GREATEST(s, s)", "Unsupported", "column \"s\" is a string"),
         ("-s", "Unsupported", "column \"s\" is a string"),
         ("s + 1", "Unsupported", "string operand"),
-        ("s AND i", "Unsupported", "string operand"),
+        ("s AND i", "Unsupported", "is a string"),
         ("s || 1", "Unsupported", "expected a string value"),
         ("STRPOS(s, f)", "Unsupported", "expected a string value"),
         ("LEFT(s, f)", "Unsupported", "must be an integer"),

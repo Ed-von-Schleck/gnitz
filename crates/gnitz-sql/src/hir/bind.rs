@@ -11,6 +11,7 @@ use super::{
     RelExpr, SetOpKind, SubqueryKind, SubqueryRef, TopNKey,
 };
 use crate::agg::default_agg_name;
+use crate::agg::AggFunc;
 use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, col_ref_parts, expand_wildcard_item,
     extract_table_name_and_alias, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery,
@@ -23,7 +24,7 @@ use crate::bind::{
 };
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::guards::{join_keys_and_type, JoinKeys};
-use crate::ir::{AggFunc, BExpr, BinOp};
+use crate::ir::{BExpr, BinOp};
 use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, OrderKey};
 use crate::validate::{
     as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
@@ -565,11 +566,11 @@ fn bind_scalar_item<L: ItemLeaf>(
 /// carrying the source column's def (alias only renames); anything else is a
 /// computed column, named and typed by [`crate::validate::computed_column`].
 ///
-/// A hidden column is computed, not passed through: it has no name the user
-/// wrote, so there is nothing to inherit. Only the grouped leaf can reach one —
-/// it resolves a written composite GROUP BY key to the pre-map column holding it
-/// — since every other leaf resolves names through `find_unique_column`, which
-/// skips hidden columns.
+/// A hidden column has no name the user wrote, so it takes a computed column's
+/// name — but it is still copied through, so it keeps its own type and
+/// nullability. Only the grouped leaf can reach one — it resolves a written
+/// composite GROUP BY key to the pre-map column holding it — since every other
+/// leaf resolves names through `find_unique_column`, which skips hidden columns.
 fn bind_proj_expr<L: ItemLeaf>(
     expr: &Expr,
     alias: Option<String>,
@@ -578,14 +579,16 @@ fn bind_proj_expr<L: ItemLeaf>(
     ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
-    // A leaf's own minted column (a window placeholder) is hidden, so it never
-    // passes through — the computed branch types it through `leaf.type_of`.
-    let src_def = as_col(&bound)
-        .and_then(|id| col_by_id(leaf.env(), id))
-        .map(|c| &c.def)
-        .filter(|d| !d.is_hidden);
+    // A leaf's own minted column (a window placeholder) is not in its env, so it
+    // takes the computed branch, typed through `leaf.type_of`.
+    let src_def = as_col(&bound).and_then(|id| col_by_id(leaf.env(), id)).map(|c| &c.def);
     let out_def = match src_def {
-        Some(d) => aliased_def(d, alias),
+        Some(d) if !d.is_hidden => aliased_def(d, alias),
+        Some(d) => ColumnDef::typed(
+            alias.unwrap_or_else(|| crate::validate::computed_column_name(idx)),
+            d.ty(),
+            d.is_nullable,
+        ),
         None => crate::validate::computed_column(alias, idx, bound.infer_ty_with(&|r| leaf.type_of(r))),
     };
     Ok(ProjEntry {
@@ -980,7 +983,7 @@ fn bind_quantifier_sub(
         sub: SubPolicy::PerKind,
     };
     let x = bind_structural(left, &outer_leaf)?;
-    let cmp = BExpr::BinOp(Box::new(x), bop, Box::new(BExpr::ColRef(m_leaf.clone())));
+    let cmp = BExpr::bin(x, bop, BExpr::ColRef(m_leaf.clone()));
     let value = if correlated {
         // ANY over ∅ = FALSE, ALL over ∅ = TRUE — the LEFT join sets m = NULL for
         // an empty group, so the explicit null test makes the edge a definite
@@ -990,7 +993,7 @@ fn bind_quantifier_sub(
             want_null: !is_any,
         };
         let op = if is_any { BinOp::And } else { BinOp::Or };
-        BExpr::BinOp(Box::new(m_test), op, Box::new(cmp))
+        BExpr::bin(m_test, op, cmp)
     } else if is_any {
         cmp
     } else {
@@ -1148,13 +1151,7 @@ fn fold_join_step(
         )?,
         _ => pairs
             .iter()
-            .map(|&(l, r)| {
-                BExpr::BinOp(
-                    Box::new(BExpr::ColRef(HirRef::Col(l))),
-                    BinOp::Eq,
-                    Box::new(BExpr::ColRef(HirRef::Col(r))),
-                )
-            })
+            .map(|&(l, r)| BExpr::bin(BExpr::ColRef(HirRef::Col(l)), BinOp::Eq, BExpr::ColRef(HirRef::Col(r))))
             .collect(),
     };
 

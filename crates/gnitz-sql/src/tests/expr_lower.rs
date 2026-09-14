@@ -1,4 +1,6 @@
 use super::*;
+use crate::ir::NumLit;
+use crate::test_support::lit;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_expr::{CmpOp, ExprValidateErr, FloatArithOp, IntUnaryOp, LogicalInstr, LogicalInstr as L};
 
@@ -162,7 +164,7 @@ fn cast_elision_preserves_u64_tracking() {
         cast_emits(&BoundExpr::ColRef(4), TypeCode::I64, &s),
         "u64 -> BIGINT emits"
     );
-    let neg = BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::ColRef(1)));
+    let neg = func(NumFunc::Unary(FloatUnaryOp::Neg), BoundExpr::ColRef(1));
     assert!(cast_emits(&neg, TypeCode::I32, &s), "CAST(-i32col AS INT) emits");
     assert!(
         !cast_emits(&BoundExpr::LitNull, TypeCode::I64, &s),
@@ -190,10 +192,7 @@ fn round_scaled_folds_integer_nonnegative_scale() {
         assert!(!isf, "n={n}: stays integer");
         assert!(!has(&instrs, is_float_op), "n={n}: no float arithmetic");
     }
-    assert!(
-        round_instrs(2, &BoundExpr::LitFloat(1.5), &s).1,
-        "float arg stays float"
-    );
+    assert!(round_instrs(2, &lit("1.5"), &s).1, "float arg stays float");
     let (instrs, isf) = round_instrs(-2, &icol, &s);
     assert!(isf, "negative scale yields F64");
     assert!(is_round(&instrs), "negative scale rounds");
@@ -203,7 +202,7 @@ fn round_scaled_folds_integer_nonnegative_scale() {
 #[test]
 fn unscaled_round_is_plain_round() {
     let s = cast_schema();
-    let (instrs, _) = lower_instrs_isf(&func(NumFunc::Unary(FloatUnaryOp::Round), BoundExpr::LitFloat(2.5)), &s);
+    let (instrs, _) = lower_instrs_isf(&func(NumFunc::Unary(FloatUnaryOp::Round), lit("2.5")), &s);
     assert!(is_round(&instrs));
     assert!(!has(&instrs, |i| matches!(
         i,
@@ -223,7 +222,7 @@ fn round_scaled_picks_the_scaling_direction() {
     // The scaling steps in order, spelled as one letter each: (M)ul, (D)iv,
     // (R)ound — everything else the lowering emits is dropped.
     let steps = |n: i8| -> String {
-        round_instrs(n, &BoundExpr::LitFloat(1.5), &s)
+        round_instrs(n, &lit("1.5"), &s)
             .0
             .iter()
             .filter_map(|i| match i {
@@ -240,6 +239,26 @@ fn round_scaled_picks_the_scaling_direction() {
 
 fn func(f: NumFunc, arg: BoundExpr) -> BoundExpr {
     BoundExpr::Func { f, arg: Box::new(arg) }
+}
+
+/// A negation computes in the i64 register, so ABS over it must compute too —
+/// even over an unsigned column, whose own ABS is the identity.
+#[test]
+fn abs_of_a_negated_unsigned_column_computes_both_kernels() {
+    let s = cast_schema(); // col 2 = u32
+    let neg = func(NumFunc::Unary(FloatUnaryOp::Neg), BoundExpr::ColRef(2));
+    let instrs = lower_instrs(&func(NumFunc::Unary(FloatUnaryOp::Abs), neg), &s);
+    assert!(
+        matches!(
+            instrs[..],
+            [
+                L::LoadColInt { .. },
+                L::IntUnary { op: IntUnaryOp::Neg, .. },
+                L::IntUnary { op: IntUnaryOp::Abs, .. }
+            ]
+        ),
+        "{instrs:?}"
+    );
 }
 
 /// The identity folds: rounding an integer is the integer, and an unsigned
@@ -270,7 +289,7 @@ fn integer_arguments_fold_the_unary_transforms_away() {
     ));
     // A float argument takes the float opcode in every case.
     assert!(has(
-        &lower_instrs(&func(NumFunc::Unary(FloatUnaryOp::Floor), BoundExpr::LitFloat(1.5)), &s),
+        &lower_instrs(&func(NumFunc::Unary(FloatUnaryOp::Floor), lit("1.5")), &s),
         |i| matches!(i, L::FloatUnary { op: FloatUnaryOp::Floor, .. })
     ));
 }
@@ -299,7 +318,7 @@ fn min_max_n_folds_linearly_and_picks_the_float_domain() {
     ));
     // One float argument lifts every integer argument and switches the whole
     // fold to the float opcodes — the same global unification CASE applies.
-    let mixed = min_max(true, vec![BoundExpr::ColRef(1), BoundExpr::LitFloat(1.5)]);
+    let mixed = min_max(true, vec![BoundExpr::ColRef(1), lit("1.5")]);
     let instrs = lower_instrs(&mixed, &s);
     assert!(has(&instrs, |i| matches!(i, L::FloatMinMax2 { is_max: true, .. })));
     assert!(has(&instrs, |i| matches!(i, L::IntToFloat { .. })));
@@ -378,7 +397,7 @@ fn min_max_n_arity_is_bounded_by_the_register_file() {
 fn cast_picks_the_conversion_opcode_from_the_source_domain() {
     let s = cast_schema();
     let cast = |e: BoundExpr, to: TypeCode| BoundExpr::Cast { expr: Box::new(e), to: to.into() };
-    let f = BoundExpr::LitFloat(2.7);
+    let f = lit("2.7");
 
     let to_f32 = |i: &LogicalInstr| matches!(i, L::FloatToF32 { .. });
     let lift = |i: &LogicalInstr| matches!(i, L::IntToFloat { .. });
@@ -438,7 +457,7 @@ fn string_cmp_interception_declines_non_comparisons() {
         "a declined shape must emit nothing"
     );
 
-    let add = BoundExpr::BinOp(Box::new(lit), BinOp::Add, Box::new(s));
+    let add = BoundExpr::bin(lit, BinOp::Add, s);
     let err = lower_err(&add, &schema);
     assert!(err.to_string().contains("Add"), "error must name op: {err}");
 }
@@ -497,13 +516,7 @@ fn case_schema() -> Schema {
 #[test]
 fn case_float_unification_lifts_int_branches() {
     let schema = case_schema();
-    let gt0 = || {
-        BoundExpr::BinOp(
-            Box::new(BoundExpr::ColRef(1)),
-            BinOp::Gt,
-            Box::new(BoundExpr::LitInt(0)),
-        )
-    };
+    let gt0 = || BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitInt(0));
 
     // All-int CASE: a SELECT, but no float lift.
     let case_int = BoundExpr::Case {
@@ -543,11 +556,7 @@ fn case_string_branches_compile_through_the_string_channel() {
     let schema = case_schema();
     let case_str = BoundExpr::Case {
         branches: vec![(
-            BoundExpr::BinOp(
-                Box::new(BoundExpr::ColRef(1)),
-                BinOp::Gt,
-                Box::new(BoundExpr::LitInt(0)),
-            ),
+            BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitInt(0)),
             BoundExpr::LitStr("x".into()),
         )],
         else_: Some(Box::new(BoundExpr::LitStr("y".into()))),
@@ -733,7 +742,7 @@ fn in_list_shares_an_integer_column_operand() {
 fn in_list_keeps_the_fused_compare_for_a_literal_operand() {
     let schema = str_schema();
     let prog =
-        compile_bound_expr_to_program(&in_list(lit("x"), vec![str_col(1), str_col(2)]), &schema.columns).unwrap();
+        compile_bound_expr_to_program(&in_list(str_lit("x"), vec![str_col(1), str_col(2)]), &schema.columns).unwrap();
     assert!(matches!(
         prog.instrs(),
         [
@@ -769,10 +778,7 @@ fn in_list_non_literal_item_falls_back_to_or_chain() {
 fn in_list_float_literal_item_falls_back_to_or_chain() {
     let schema = two_int_schema();
     let prog = compile_bound_expr_to_program(
-        &in_list(
-            BoundExpr::ColRef(1),
-            vec![BoundExpr::LitInt(1), BoundExpr::LitFloat(2.5)],
-        ),
+        &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), lit("2.5")]),
         &schema.columns,
     )
     .unwrap();
@@ -783,21 +789,20 @@ fn in_list_float_literal_item_falls_back_to_or_chain() {
 }
 
 /// A surviving `LitWide` literal (an un-servable wide comparison, e.g.
-/// `non_indexed_u64 = 18446744073709551615`) rejects at the compile boundary
-/// with the shared wide-int message — the honest surfacing of the VM's
-/// 8-byte-slot limitation, for every backend that funnels through this walk.
+/// `non_indexed_u64 = 18446744073709551615`) rejects at the compile boundary,
+/// naming the literal and the places it is usable.
 #[test]
 fn lit_wide_rejects_at_compile_boundary() {
     let schema = two_int_schema(); // (pk U64, a I64, b I64)
-    let expr = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(1)),
+    let expr = BoundExpr::bin(
+        BoundExpr::ColRef(1),
         BinOp::Eq,
-        Box::new(BoundExpr::LitWide("18446744073709551615".to_string())),
+        BoundExpr::LitWide(NumLit { mag: u64::MAX.into(), neg: false }),
     );
     let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err("wide literal must not compile");
     match err {
         GnitzSqlError::Unsupported(msg) => {
-            assert!(msg.contains(crate::ir::WIDE_INT_UNSUPPORTED), "message: {msg}");
+            assert!(msg.contains("does not fit a 64-bit register"), "message: {msg}");
             assert!(msg.contains("18446744073709551615"), "message names the literal: {msg}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
@@ -830,7 +835,7 @@ fn in_list_wide_int_operand_rejects() {
 fn str_col(i: usize) -> BoundExpr {
     BoundExpr::ColRef(i)
 }
-fn lit(s: &str) -> BoundExpr {
+fn str_lit(s: &str) -> BoundExpr {
     BoundExpr::LitStr(s.to_string())
 }
 
@@ -841,15 +846,9 @@ fn lit(s: &str) -> BoundExpr {
 #[test]
 fn plain_column_comparisons_keep_the_specialized_opcodes() {
     let schema = str_schema();
-    let instrs = lower_instrs(
-        &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x"))),
-        &schema,
-    );
+    let instrs = lower_instrs(&BoundExpr::bin(str_col(1), BinOp::Eq, str_lit("x")), &schema);
     assert!(matches!(instrs[..], [L::StrColConst { op: CmpOp::Eq, .. }]));
-    let cols = lower_instrs(
-        &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Lt, Box::new(str_col(2))),
-        &schema,
-    );
+    let cols = lower_instrs(&BoundExpr::bin(str_col(1), BinOp::Lt, str_col(2)), &schema);
     assert!(matches!(cols[..], [L::StrColCol { op: CmpOp::Lt, .. }]));
 }
 
@@ -859,13 +858,13 @@ fn plain_column_comparisons_keep_the_specialized_opcodes() {
 #[test]
 fn computed_operands_compare_through_the_register_channel() {
     let schema = str_schema();
-    let upper_eq = BoundExpr::BinOp(
-        Box::new(BoundExpr::StrCall {
+    let upper_eq = BoundExpr::bin(
+        BoundExpr::StrCall {
             f: StrFunc::Upper,
             args: vec![str_col(1)],
-        }),
+        },
         BinOp::Eq,
-        Box::new(lit("X")),
+        str_lit("X"),
     );
     let instrs = lower_instrs(&upper_eq, &schema);
     assert!(
@@ -895,7 +894,7 @@ fn register_compare_has_all_six_operators() {
         (BinOp::Lt, CmpOp::Lt),
         (BinOp::Le, CmpOp::Le),
     ] {
-        let instrs = lower_instrs(&BoundExpr::BinOp(Box::new(up(1)), op, Box::new(up(2))), &schema);
+        let instrs = lower_instrs(&BoundExpr::bin(up(1), op, up(2)), &schema);
         assert!(
             matches!(
                 instrs[..],
@@ -917,11 +916,11 @@ fn concat_operator_and_function_compile_and_differ_in_their_null_rule() {
     let schema = str_schema();
     // `||` is NULL-propagating, so `s || NULL` is a NULL string rather than a
     // type error — `str_operand` intercepts the literal before recursing.
-    let pipe_null = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitNull));
+    let pipe_null = BoundExpr::bin(str_col(1), BinOp::Concat, BoundExpr::LitNull);
     assert_str_program(&pipe_null, &schema);
     assert!(has(&lower_instrs(&pipe_null, &schema), |i| matches!(i, L::LoadNullStr)));
 
-    let pipe = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(lit("x")));
+    let pipe = BoundExpr::bin(str_col(1), BinOp::Concat, str_lit("x"));
     assert!(has(&lower_instrs(&pipe, &schema), |i| matches!(
         i,
         L::StrConcat { skip_null: false, .. }
@@ -948,14 +947,14 @@ fn concat_operator_and_function_compile_and_differ_in_their_null_rule() {
 fn concat_casts_numeric_arguments_but_the_operator_does_not() {
     let schema = str_schema();
     let mixed = BoundExpr::ConcatN {
-        args: vec![str_col(1), BoundExpr::LitInt(42), BoundExpr::LitFloat(1.5)],
+        args: vec![str_col(1), BoundExpr::LitInt(42), lit("1.5")],
     };
     let instrs = lower_instrs(&mixed, &schema);
     assert!(has(&instrs, |i| matches!(i, L::IntToStr { .. })), "{instrs:?}");
     assert!(has(&instrs, |i| matches!(i, L::FloatToStr { .. })), "{instrs:?}");
     assert_str_program(&mixed, &schema);
 
-    let pipe_int = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitInt(1)));
+    let pipe_int = BoundExpr::bin(str_col(1), BinOp::Concat, BoundExpr::LitInt(1));
     assert!(lower_err(&pipe_int, &schema).to_string().contains("string"));
 }
 
@@ -967,10 +966,7 @@ fn concat_casts_numeric_arguments_but_the_operator_does_not() {
 fn string_nullif_and_coalesce_desugars_compile() {
     let schema = str_schema();
     let nullif = BoundExpr::Case {
-        branches: vec![(
-            BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(str_col(2))),
-            BoundExpr::LitNull,
-        )],
+        branches: vec![(BoundExpr::bin(str_col(1), BinOp::Eq, str_col(2)), BoundExpr::LitNull)],
         else_: Some(Box::new(str_col(1))),
     };
     assert_str_program(&nullif, &schema);
@@ -983,7 +979,7 @@ fn string_nullif_and_coalesce_desugars_compile() {
             },
             str_col(1),
         )],
-        else_: Some(Box::new(lit("default"))),
+        else_: Some(Box::new(str_lit("default"))),
     };
     assert_str_program(&coalesce, &schema);
 }
@@ -998,7 +994,7 @@ fn an_all_null_case_still_types_as_an_integer() {
         branches: vec![(BoundExpr::LitInt(1), BoundExpr::LitNull)],
         else_: None,
     };
-    assert_eq!(all_null.infer_type(&schema.columns), TypeCode::I64);
+    assert_eq!(all_null.infer_ty(&schema.columns).tc, TypeCode::I64);
     assert_eq!(lower_instrs_kind(&all_null, &schema).1, ExprKind::Int);
 }
 
@@ -1006,7 +1002,7 @@ fn an_all_null_case_still_types_as_an_integer() {
 fn mixed_string_and_numeric_case_branches_are_a_typed_error() {
     let schema = str_schema();
     let mixed = BoundExpr::Case {
-        branches: vec![(BoundExpr::LitInt(1), lit("x"))],
+        branches: vec![(BoundExpr::LitInt(1), str_lit("x"))],
         else_: Some(Box::new(BoundExpr::LitInt(0))),
     };
     assert!(matches!(lower_err(&mixed, &schema), GnitzSqlError::Unsupported(_)));
@@ -1020,22 +1016,21 @@ fn strings_in_numeric_positions_are_rejected_by_lowering() {
     let schema = str_schema();
     let s = || str_col(1);
     let cases: Vec<BoundExpr> = vec![
-        BoundExpr::BinOp(Box::new(s()), BinOp::Add, Box::new(BoundExpr::LitInt(1))),
-        BoundExpr::BinOp(Box::new(s()), BinOp::And, Box::new(lit("x"))),
-        BoundExpr::BinOp(Box::new(s()), BinOp::Or, Box::new(lit("x"))),
+        BoundExpr::bin(s(), BinOp::Add, BoundExpr::LitInt(1)),
+        BoundExpr::bin(s(), BinOp::And, str_lit("x")),
+        BoundExpr::bin(s(), BinOp::Or, str_lit("x")),
         BoundExpr::Func {
             f: NumFunc::Unary(FloatUnaryOp::Abs),
             arg: Box::new(s()),
         },
         BoundExpr::Func { f: NumFunc::Round(2), arg: Box::new(s()) },
-        BoundExpr::MinMaxN { is_max: true, args: vec![s(), lit("x")] },
-        BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(s())),
-        BoundExpr::UnaryOp(UnaryOp::Not, Box::new(s())),
-        BoundExpr::Substr {
-            s: Box::new(s()),
-            start: Box::new(s()),
-            len: None,
+        BoundExpr::MinMaxN {
+            is_max: true,
+            args: vec![s(), str_lit("x")],
         },
+        func(NumFunc::Unary(FloatUnaryOp::Neg), s()),
+        BoundExpr::Not(Box::new(s())),
+        BoundExpr::StrCall { f: StrFunc::Substr, args: vec![s(), s()] },
     ];
     for e in &cases {
         assert!(
@@ -1045,9 +1040,9 @@ fn strings_in_numeric_positions_are_rejected_by_lowering() {
     }
     // A comparison carries no implicit cast either way — against a literal or
     // against an integer column (`pk` here).
-    let mixed = BoundExpr::BinOp(Box::new(s()), BinOp::Eq, Box::new(BoundExpr::LitInt(1)));
+    let mixed = BoundExpr::bin(s(), BinOp::Eq, BoundExpr::LitInt(1));
     assert!(lower_err(&mixed, &schema).to_string().contains("strings"));
-    let mixed_cols = BoundExpr::BinOp(Box::new(s()), BinOp::Gt, Box::new(BoundExpr::ColRef(0)));
+    let mixed_cols = BoundExpr::bin(s(), BinOp::Gt, BoundExpr::ColRef(0));
     assert!(lower_err(&mixed_cols, &schema).to_string().contains("strings"));
 }
 
@@ -1057,7 +1052,7 @@ fn strings_in_numeric_positions_are_rejected_by_lowering() {
 #[test]
 fn blob_columns_stay_outside_the_string_surface() {
     let schema = blob_schema();
-    let cmp = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x")));
+    let cmp = BoundExpr::bin(str_col(1), BinOp::Eq, str_lit("x"));
     assert!(matches!(
         lower_instrs(&cmp, &schema)[..],
         [L::StrColConst { op: CmpOp::Eq, .. }]
@@ -1111,7 +1106,7 @@ fn cast_to_text_emits_the_numeric_to_text_opcode_for_its_source_domain() {
         L::IntToStr { .. }
     )));
     let f = BoundExpr::Cast {
-        expr: Box::new(BoundExpr::LitFloat(1.5)),
+        expr: Box::new(lit("1.5")),
         to: TypeCode::String.into(),
     };
     assert!(has(&lower_instrs(&f, &schema), |i| matches!(i, L::FloatToStr { .. })));
@@ -1174,7 +1169,7 @@ fn like_takes_a_computed_subject_and_propagates_a_null_literal() {
         [L::LoadNullStr, L::StrLike { .. }]
     ));
     // The verdict is a boolean, so `NOT LIKE` reads it like any other.
-    let negated = BoundExpr::UnaryOp(UnaryOp::Not, Box::new(like_of(str_col(1), "a", Some(b'\\'), false)));
+    let negated = BoundExpr::Not(Box::new(like_of(str_col(1), "a", Some(b'\\'), false)));
     assert!(matches!(
         lower_instrs(&negated, &schema)[..],
         [L::LoadColStr { .. }, L::StrLike { .. }, L::BoolNot { .. }]
@@ -1216,7 +1211,7 @@ fn transcendentals_lift_and_sign_keeps_the_domain() {
             "{f:?}: {instrs:?}"
         );
         assert!(is_float);
-        let (instrs, _) = lower_instrs_isf(&func(f, BoundExpr::LitFloat(2.0)), &s);
+        let (instrs, _) = lower_instrs_isf(&func(f, lit("2.0")), &s);
         assert!(
             matches!(instrs.last(), Some(&L::FloatUnary { op, .. }) if op == want),
             "{f:?} over a float takes no lift"
@@ -1230,7 +1225,7 @@ fn transcendentals_lift_and_sign_keeps_the_domain() {
         ));
         assert!(!is_float);
     }
-    let (instrs, is_float) = lower_instrs_isf(&func(NumFunc::Unary(FloatUnaryOp::Sign), BoundExpr::LitFloat(-2.0)), &s);
+    let (instrs, is_float) = lower_instrs_isf(&func(NumFunc::Unary(FloatUnaryOp::Sign), lit("-2.0")), &s);
     assert!(matches!(
         instrs.last(),
         Some(L::FloatUnary { op: FloatUnaryOp::Sign, .. })
@@ -1242,11 +1237,7 @@ fn transcendentals_lift_and_sign_keeps_the_domain() {
 #[test]
 fn power_lifts_both_operands_to_float() {
     let s = cast_schema();
-    let pow = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(1)),
-        BinOp::Pow,
-        Box::new(BoundExpr::LitInt(2)),
-    );
+    let pow = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Pow, BoundExpr::LitInt(2));
     let (instrs, is_float) = lower_instrs_isf(&pow, &s);
     assert!(is_float);
     assert!(
@@ -1293,28 +1284,38 @@ fn string_calls_lower_to_their_opcodes() {
             ExprKind::Str,
         ),
         (
-            call(StrFunc::Pos, vec![str_col(1), lit("x")]),
+            call(StrFunc::Pos, vec![str_col(1), str_lit("x")]),
             |i| matches!(i, L::StrPos { .. }),
             ExprKind::Int,
         ),
         (
-            call(StrFunc::Replace, vec![str_col(1), lit("a"), lit("b")]),
+            call(StrFunc::Replace, vec![str_col(1), str_lit("a"), str_lit("b")]),
             |i| matches!(i, L::StrReplace { .. }),
             ExprKind::Str,
         ),
         (
-            call(StrFunc::Lpad, vec![str_col(1), n(), lit(" ")]),
+            call(StrFunc::Lpad, vec![str_col(1), n(), str_lit(" ")]),
             |i| matches!(i, L::StrPad { left: true, .. }),
             ExprKind::Str,
         ),
         (
-            call(StrFunc::Rpad, vec![str_col(1), n(), lit(" ")]),
+            call(StrFunc::Rpad, vec![str_col(1), n(), str_lit(" ")]),
             |i| matches!(i, L::StrPad { left: false, .. }),
             ExprKind::Str,
         ),
         (
-            call(StrFunc::SplitPart, vec![str_col(1), lit(","), n()]),
+            call(StrFunc::SplitPart, vec![str_col(1), str_lit(","), n()]),
             |i| matches!(i, L::StrSplitPart { .. }),
+            ExprKind::Str,
+        ),
+        (
+            call(StrFunc::Substr, vec![str_col(1), n()]),
+            |i| matches!(i, L::StrSubstr { len_reg: None, .. }),
+            ExprKind::Str,
+        ),
+        (
+            call(StrFunc::Substr, vec![str_col(1), n(), n()]),
+            |i| matches!(i, L::StrSubstr { len_reg: Some(_), .. }),
             ExprKind::Str,
         ),
     ] {
@@ -1324,12 +1325,14 @@ fn string_calls_lower_to_their_opcodes() {
     }
     // An integer position rejects a float, naming the function and position;
     // a string position rejects a number.
-    let err = lower_err(
-        &call(StrFunc::Left, vec![str_col(1), BoundExpr::LitFloat(1.5)]),
-        &schema,
-    );
+    let err = lower_err(&call(StrFunc::Left, vec![str_col(1), lit("1.5")]), &schema);
     assert!(err.to_string().contains("LEFT: argument 2 must be an integer"), "{err}");
-    let err = lower_err(&call(StrFunc::Replace, vec![str_col(1), n(), lit("b")]), &schema);
+    let err = lower_err(&call(StrFunc::Substr, vec![str_col(1), n(), lit("1.5")]), &schema);
+    assert!(
+        err.to_string().contains("SUBSTRING: argument 3 must be an integer"),
+        "{err}"
+    );
+    let err = lower_err(&call(StrFunc::Replace, vec![str_col(1), n(), str_lit("b")]), &schema);
     assert!(err.to_string().contains("expected a string value"), "{err}");
 }
 
@@ -1360,11 +1363,7 @@ fn null_test_lowers_by_its_operand() {
             L::IsNullReg { invert: false, .. }
         ]
     ));
-    let sum = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(0)),
-        BinOp::Add,
-        Box::new(BoundExpr::LitInt(1)),
-    );
+    let sum = BoundExpr::bin(BoundExpr::ColRef(0), BinOp::Add, BoundExpr::LitInt(1));
     let instrs = lower_instrs(&test(sum, false), &schema);
     assert!(matches!(instrs.last(), Some(L::IsNullReg { invert: true, .. })));
 }
@@ -1376,11 +1375,7 @@ fn null_test_lowers_by_its_operand() {
 #[test]
 fn filter_program_drops_true_constant_conjuncts_in_any_position() {
     let schema = two_int_schema();
-    let gt = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(1)),
-        BinOp::Gt,
-        Box::new(BoundExpr::LitInt(1)),
-    );
+    let gt = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitInt(1));
     let t = BoundExpr::LitInt(1);
     let f = BoundExpr::LitInt(0);
     let instrs = |conjuncts: &[&BoundExpr]| {
@@ -1418,15 +1413,18 @@ fn decimal_schema() -> Schema {
 }
 
 /// Evaluate `expr` over one row `(p, q, i)` of the decimal schema, as the
-/// stored integers.
-fn eval_decimal_row(expr: &BoundExpr, p: i64, q: i64, i: i64) -> Option<i64> {
+/// stored integers; `p` may be NULL.
+fn eval_decimal_row(expr: &BoundExpr, p: impl Into<Option<i64>>, q: i64, i: i64) -> Option<i64> {
     let schema = decimal_schema();
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
-    gnitz_core::BatchAppender::new(&mut batch, &schema)
-        .add_row(1u128, 1)
-        .i64_val(p)
-        .i64_val(q)
-        .i64_val(i);
+    let mut row = gnitz_core::BatchAppender::new(&mut batch, &schema);
+    row.add_row(1u128, 1);
+    match p.into() {
+        Some(p) => row.i64_val(p),
+        None => row.null(),
+    }
+    .i64_val(q)
+    .i64_val(i);
     let ev = compile_scalar_evaluator(expr, &schema).expect("lowers");
     match ev.eval_all(&batch) {
         gnitz_expr::ExprResults::Scalar(vals) => vals[0],
@@ -1440,34 +1438,45 @@ fn eval_decimal_row(expr: &BoundExpr, p: i64, q: i64, i: i64) -> Option<i64> {
 /// exact half-away-from-zero integer division.
 #[test]
 fn decimal_arithmetic_lowers_to_scaled_integer_ops() {
-    let bin = |l: BoundExpr, op, r: BoundExpr| BoundExpr::BinOp(Box::new(l), op, Box::new(r));
     let c = |i: usize| BoundExpr::ColRef(i);
     // p = 1.25, q = 0.005, i = 3
     let (p, q, i) = (125, 5, 3);
-    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Add, c(2)), p, q, i), Some(1255)); // 1.255
-    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Mul, c(2)), p, q, i), Some(625)); // 0.00625
-    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Mul, c(3)), p, q, i), Some(375)); // 3.75
     assert_eq!(
-        eval_decimal_row(&bin(c(1), BinOp::Sub, BoundExpr::LitInt(1)), p, q, i),
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Add, c(2)), p, q, i),
+        Some(1255)
+    ); // 1.255
+    assert_eq!(
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Mul, c(2)), p, q, i),
+        Some(625)
+    ); // 0.00625
+    assert_eq!(
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Mul, c(3)), p, q, i),
+        Some(375)
+    ); // 3.75
+    assert_eq!(
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Sub, BoundExpr::LitInt(1)), p, q, i),
         Some(25)
     ); // 0.25
     assert_eq!(
-        eval_decimal_row(&bin(c(1), BinOp::Add, BoundExpr::LitFloat(0.1)), p, q, i),
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Add, lit("0.1")), p, q, i),
         Some(135)
     );
     // A comparison against a longer literal widens the column, never rounds
     // the literal: 1.25 = 1.250 holds, 1.25 = 1.251 does not.
     assert_eq!(
-        eval_decimal_row(&bin(c(1), BinOp::Eq, BoundExpr::LitFloat(1.250)), p, q, i),
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Eq, lit("1.250")), p, q, i),
         Some(1)
     );
     assert_eq!(
-        eval_decimal_row(&bin(c(1), BinOp::Eq, BoundExpr::LitFloat(1.251)), p, q, i),
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Eq, lit("1.251")), p, q, i),
         Some(0)
     );
-    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Gt, c(2)), p, q, i), Some(1));
+    assert_eq!(
+        eval_decimal_row(&BoundExpr::bin(c(1), BinOp::Gt, c(2)), p, q, i),
+        Some(1)
+    );
     // Division is a float: 1.25 / 0.005 = 250.0.
-    let div = bin(c(1), BinOp::Div, c(2));
+    let div = BoundExpr::bin(c(1), BinOp::Div, c(2));
     assert_eq!(
         eval_decimal_row(&div, p, q, i).map(|b| f64::from_bits(b as u64)),
         Some(250.0)
@@ -1515,10 +1524,7 @@ fn decimal_casts_round_at_the_target_scale() {
     assert_eq!(eval_decimal_row(&cast(c(2), dec(2)), p, 4, i), Some(0));
     assert_eq!(eval_decimal_row(&cast(c(1), dec(3)), p, q, i), Some(1250));
     assert_eq!(eval_decimal_row(&cast(c(1), TypeCode::I64.into()), 150, q, i), Some(2));
-    assert_eq!(
-        eval_decimal_row(&cast(BoundExpr::LitFloat(1.005), dec(2)), p, q, i),
-        Some(101)
-    );
+    assert_eq!(eval_decimal_row(&cast(lit("1.005"), dec(2)), p, q, i), Some(101));
     assert_eq!(
         eval_decimal_row(&cast(BoundExpr::LitStr("2.5".into()), dec(2)), p, q, i),
         Some(250)
@@ -1536,10 +1542,9 @@ fn decimal_casts_round_at_the_target_scale() {
 fn decimal_in_set_is_exact_and_a_wide_product_is_refused() {
     let (p, q, i) = (125, 5, 3);
     let c = |i: usize| BoundExpr::ColRef(i);
-    let bin = |l: BoundExpr, op, r: BoundExpr| BoundExpr::BinOp(Box::new(l), op, Box::new(r));
     let in_list = BoundExpr::InList {
         inner: Box::new(c(1)),
-        items: vec![BoundExpr::LitFloat(1.25), BoundExpr::LitInt(2)],
+        items: vec![lit("1.25"), BoundExpr::LitInt(2)],
     };
     assert!(has(&lower_instrs(&in_list, &decimal_schema()), |i| matches!(
         i,
@@ -1549,8 +1554,15 @@ fn decimal_in_set_is_exact_and_a_wide_product_is_refused() {
     assert_eq!(eval_decimal_row(&in_list, 200, q, i), Some(1));
     assert_eq!(eval_decimal_row(&in_list, 201, q, i), Some(0));
     // A product past the scale cap is refused at plan time.
-    let wide = bin(bin(c(2), BinOp::Mul, c(2)), BinOp::Mul, bin(c(2), BinOp::Mul, c(2)));
-    let err = compile_bound_expr_to_program(&bin(wide.clone(), BinOp::Mul, wide), &decimal_schema().columns);
+    let wide = BoundExpr::bin(
+        BoundExpr::bin(c(2), BinOp::Mul, c(2)),
+        BinOp::Mul,
+        BoundExpr::bin(c(2), BinOp::Mul, c(2)),
+    );
+    let err = compile_bound_expr_to_program(
+        &BoundExpr::bin(wide.clone(), BinOp::Mul, wide),
+        &decimal_schema().columns,
+    );
     assert!(err.unwrap_err().to_string().contains("scale"));
 }
 
@@ -1561,11 +1573,10 @@ fn decimal_in_set_is_exact_and_a_wide_product_is_refused() {
 #[test]
 fn a_blend_past_the_scale_cap_is_refused_not_scaled() {
     let s = decimal_schema();
-    let bin = |l: BoundExpr, op, r: BoundExpr| BoundExpr::BinOp(Box::new(l), op, Box::new(r));
     let c = |i: usize| BoundExpr::ColRef(i);
     // q is scale 3, so q^7 types as scale 21 and p (scale 2) would widen by 19.
-    let q7 = (0..6).fold(c(2), |acc, _| bin(acc, BinOp::Mul, c(2)));
-    let err = compile_bound_expr_to_program(&bin(c(1), BinOp::Add, q7.clone()), &s.columns)
+    let q7 = (0..6).fold(c(2), |acc, _| BoundExpr::bin(acc, BinOp::Mul, c(2)));
+    let err = compile_bound_expr_to_program(&BoundExpr::bin(c(1), BinOp::Add, q7.clone()), &s.columns)
         .expect_err("a scale past the cap has no register");
     assert!(err.to_string().contains("scale"), "{err}");
     let case = BoundExpr::Case {
@@ -1574,4 +1585,57 @@ fn a_blend_past_the_scale_cap_is_refused_not_scaled() {
     };
     let err = compile_bound_expr_to_program(&case, &s.columns).expect_err("same cap through a CASE blend");
     assert!(err.to_string().contains("scale"), "{err}");
+}
+
+/// A comparison against a literal finer than the column's scale is decided at
+/// the column's scale, in either operand order: every ordering agrees with the
+/// exact rational comparison, `=` holds on no row and `<>` on every non-NULL
+/// one, and a NULL row stays NULL — including a literal whose scale-up would
+/// wrap an `i64`.
+#[test]
+fn a_comparison_against_a_finer_literal_is_exact() {
+    let schema = decimal_schema();
+    let ops = [BinOp::Eq, BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge];
+    for text in ["1.005", "1.000000000000000001"] {
+        let (v, s) = gnitz_wire::decimal::decimal_of_number_text(text).expect("a decimal");
+        for p in [None, Some(100), Some(101), Some(1000), Some(-1000)] {
+            for op in ops {
+                // p / 10^2 against v / 10^s, cross-multiplied.
+                let want = p.map(|p| {
+                    let (a, b) = (i128::from(p) * 10i128.pow(u32::from(s)), v * 100);
+                    let holds = match op {
+                        BinOp::Eq => a == b,
+                        BinOp::Ne => a != b,
+                        BinOp::Lt => a < b,
+                        BinOp::Le => a <= b,
+                        BinOp::Gt => a > b,
+                        _ => a >= b,
+                    };
+                    i64::from(holds)
+                });
+                let col_left = BoundExpr::bin(BoundExpr::ColRef(1), op, lit(text));
+                assert_eq!(eval_decimal_row(&col_left, p, 0, 0), want, "{p:?} {op:?} {text}");
+                let col_right = BoundExpr::bin(lit(text), op.converse(), BoundExpr::ColRef(1));
+                assert_eq!(
+                    eval_decimal_row(&col_right, p, 0, 0),
+                    want,
+                    "{text} {:?} {p:?}",
+                    op.converse()
+                );
+            }
+        }
+    }
+    // One comparison against the neighbour, no scale-up.
+    let instrs = lower_instrs(&BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Lt, lit("1.005")), &schema);
+    assert!(
+        matches!(
+            instrs[..],
+            [
+                L::LoadColInt { .. },
+                L::LoadConst { val: 101 },
+                L::Cmp { op: CmpOp::Lt, .. }
+            ]
+        ),
+        "{instrs:?}"
+    );
 }

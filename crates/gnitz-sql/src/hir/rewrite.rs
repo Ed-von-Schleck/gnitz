@@ -10,13 +10,14 @@ use super::{
     as_col, col_by_id, hircol_of, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, JoinOn,
     ProjEntry, RelExpr, SubqueryKind, SubqueryRef,
 };
+use crate::agg::AggFunc;
 use crate::error::GnitzSqlError;
 use crate::hir::guards::{
     converse_rel, reject_join_key_arity, reject_keyless_non_inner, reject_outer_with_residual, validate_join_key_pair,
     validate_range_join_key_pair,
 };
 use crate::hir::JoinType;
-use crate::ir::{AggFunc, BExpr, BinOp, UnaryOp};
+use crate::ir::{BExpr, BinOp};
 use gnitz_core::{ColumnDef, RangeRel};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -447,11 +448,7 @@ fn build_joined_subref(
             // The mark column is 1 iff the subquery matched; the node's truth is
             // `matched` (EXISTS) or `!matched` (NOT EXISTS).
             let val = if negated {
-                BExpr::BinOp(
-                    Box::new(BExpr::ColRef(HirRef::Col(mark_id))),
-                    BinOp::Eq,
-                    Box::new(BExpr::LitInt(0)),
-                )
+                BExpr::bin(BExpr::ColRef(HirRef::Col(mark_id)), BinOp::Eq, BExpr::LitInt(0))
             } else {
                 BExpr::ColRef(HirRef::Col(mark_id))
             };
@@ -522,10 +519,10 @@ fn build_uncorrelated_inner(
             (proj, key_id)
         }
     };
-    let on = vec![BExpr::BinOp(
-        Box::new(BExpr::ColRef(HirRef::Col(outer_col))),
+    let on = vec![BExpr::bin(
+        BExpr::ColRef(HirRef::Col(outer_col)),
         op,
-        Box::new(BExpr::ColRef(HirRef::Col(key_id))),
+        BExpr::ColRef(HirRef::Col(key_id)),
     )];
     Ok(RelExpr::join(cur, right, JoinType::Inner, on))
 }
@@ -560,7 +557,7 @@ fn scalar_value(s: &SubqueryRef, null_filled: bool) -> Result<HirExpr, GnitzSqlE
 /// negation: the node's own `negated` flag XORed with a wrapping `NOT`.
 fn as_bare_exists(pred: &HirExpr) -> Option<(&SubqueryRef, bool)> {
     let (inner, not_wrap) = match pred {
-        BExpr::UnaryOp(UnaryOp::Not, inner) => (inner.as_ref(), true),
+        BExpr::Not(inner) => (inner.as_ref(), true),
         _ => (pred, false),
     };
     match inner {
@@ -605,10 +602,10 @@ fn uncorr_scalar(e: &HirExpr) -> Option<&SubqueryRef> {
 fn corr_on(s: &SubqueryRef) -> Vec<HirExpr> {
     let mut on = s.correlation.clone();
     if let Some(p) = s.in_pair {
-        on.push(BExpr::BinOp(
-            Box::new(BExpr::ColRef(HirRef::Col(p.outer))),
+        on.push(BExpr::bin(
+            BExpr::ColRef(HirRef::Col(p.outer)),
             BinOp::Eq,
-            Box::new(BExpr::ColRef(HirRef::Col(p.inner))),
+            BExpr::ColRef(HirRef::Col(p.inner)),
         ));
     }
     on
@@ -617,7 +614,7 @@ fn corr_on(s: &SubqueryRef) -> Vec<HirExpr> {
 /// Replace every `HirRef::Subquery` leaf with its substituted value; a `Col` leaf
 /// passes through.
 fn substitute(e: &HirExpr, subst: &HashMap<*const RelExpr, HirExpr>) -> Result<HirExpr, GnitzSqlError> {
-    e.try_rebuild(&|r| match r {
+    e.try_rebuild(&mut |r| match r {
         HirRef::Subquery(s) => subst
             .get(&Rc::as_ptr(&s.rel))
             .cloned()

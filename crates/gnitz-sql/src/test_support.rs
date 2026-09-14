@@ -70,6 +70,11 @@ pub(crate) fn compound_schema_u64_u64() -> Schema {
     }
 }
 
+/// A numeric literal bound as the binder binds it, e.g. `lit("1.5")`.
+pub(crate) fn lit(n: &str) -> BoundExpr {
+    crate::ast_util::bind_literal(&Value::Number(n.into(), false)).expect("a numeric literal")
+}
+
 /// An unsigned decimal literal, e.g. `42`.
 pub(crate) fn num_expr(n: &str) -> Expr {
     Expr::value(Value::Number(n.into(), false))

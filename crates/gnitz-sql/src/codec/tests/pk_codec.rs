@@ -125,22 +125,34 @@ fn a_serial_id_past_the_type_maximum_is_exhausted() {
 }
 
 #[test]
-fn parse_pk_literal_packed_rejects_out_of_range() {
-    // The regression guard for the truncation fix: an I32 literal above the
-    // type max declines (None) instead of wrapping to -1294967296.
-    assert_eq!(parse_pk_literal_packed(TypeCode::I32, "3000000000", false), None);
-    assert_eq!(parse_pk_literal_packed(TypeCode::I32, "100", false), Some(100));
-    assert_eq!(
-        parse_pk_literal_packed(TypeCode::I32, "5", true),
-        Some((-5i32 as u32) as u128)
-    );
+fn pack_num_rejects_out_of_range() {
+    let n = |mag, neg| NumLit { mag, neg };
+    // An I32 literal above the type max declines (None) instead of wrapping to
+    // -1294967296.
+    assert_eq!(pack_num(TypeCode::I32, n(3000000000, false)), None);
+    assert_eq!(pack_num(TypeCode::I32, n(100, false)), Some(100));
+    assert_eq!(pack_num(TypeCode::I32, n(5, true)), Some((-5i32 as u32) as u128));
     // Unsigned ≤8B range-checks too.
-    assert_eq!(parse_pk_literal_packed(TypeCode::U8, "300", false), None);
-    assert_eq!(parse_pk_literal_packed(TypeCode::U8, "255", false), Some(255));
+    assert_eq!(pack_num(TypeCode::U8, n(300, false)), None);
+    assert_eq!(pack_num(TypeCode::U8, n(255, false)), Some(255));
     // I128 (the internal join-key type): full-width two's complement,
     // negatives included.
-    assert_eq!(
-        parse_pk_literal_packed(TypeCode::I128, "5", true),
-        Some((-5i128) as u128)
-    );
+    assert_eq!(pack_num(TypeCode::I128, n(5, true)), Some((-5i128) as u128));
+    // A negative zero is zero, which an unsigned column holds.
+    assert_eq!(pack_num(TypeCode::U128, n(0, true)), Some(0));
+}
+
+/// A written DECIMAL cell is the decimal the literal spells, rounded at the
+/// column's scale from however many digits it carries — not from a float's
+/// shortest print, which loses the digits past 17.
+#[test]
+fn a_decimal_cell_rounds_the_literal_it_spells() {
+    let cell = |text: &str| {
+        crate::ast_util::bind_constant(&num_expr(text))
+            .expect("a constant")
+            .key_packed(ColType::decimal(2))
+            .ok()
+    };
+    assert_eq!(cell("1234567890123456.78"), Some(123456789012345678));
+    assert_eq!(cell("0.1234567890123456789"), Some(12));
 }

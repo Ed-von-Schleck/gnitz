@@ -1,25 +1,16 @@
-use crate::error::GnitzSqlError;
 use gnitz_core::{ColType, ColumnDef, TypeCode};
 use gnitz_expr::CalendarOp;
-use gnitz_wire::decimal::{decimal_of_f64, rescale};
+use gnitz_wire::decimal::{rescale, MAX_DECIMAL_SCALE};
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
 pub(crate) use gnitz_expr::{FloatUnaryOp, TrimMode};
 
-#[derive(Clone, Debug, Copy, PartialEq)]
-pub(crate) enum AggFunc {
-    Count,
-    Sum,
-    Min,
-    Max,
-    Avg,
-}
-
 /// The bound-expression IR, generic over its leaf reference type `R`, which only
-/// `ColRef` carries. The ad-hoc read path pins `R = usize` (the [`BoundExpr`]
-/// alias), a resolved column index into a batch schema; the view path pins
-/// `R = HirRef`, a column identity that survives the structural rewrites.
+/// `ColRef` carries. `R` has three instantiations: `usize` (the [`BoundExpr`]
+/// alias), a resolved column index into a batch schema; `HirRef`, the view
+/// path's column identity that survives the structural rewrites; and
+/// `Infallible`, in a written `Constant`, where no column can occur.
 /// `PartialEq` is structural equality over the *bound* form — what makes "the same
 /// expression written twice" decidable after names resolve, so `t.a + b` and
 /// `a + b` are one expression. Not `Eq`, because `LitFloat` compares by `f64`.
@@ -27,24 +18,32 @@ pub(crate) enum AggFunc {
 pub(crate) enum BExpr<R> {
     ColRef(R),
     LitInt(i64),
-    LitFloat(f64),
+    /// A fractional or exponent literal: the float it reads as, and the decimal
+    /// its text spells at its smallest exact scale — `None` past `i128` or 38
+    /// fractional digits. A DECIMAL consumer reads `dec`, never `v`.
+    LitFloat {
+        v: f64,
+        dec: Option<(i128, u8)>,
+    },
     LitStr(String),
-    /// A non-fractional integer literal too wide for `i64` (`(i64::MAX, u128::MAX]`
-    /// unsigned, or the `i64::MIN` magnitude under an outer `Neg`). The payload is
-    /// the raw unsigned decimal magnitude (`Value::Number`'s digit string); a
-    /// negative wide literal rides as an outer `UnaryOp(Neg, LitWide)` — unlike a
-    /// `LitInt`, which carries its sign. `bind_literal` is schemaless, so it cannot choose `i128`-vs-`u128`
-    /// parsing — only the access-path recognizer, holding the column `TypeCode`,
-    /// parses the string (byte-exactly, via `pk_codec`) into a PK/index seek bound.
-    /// Everywhere else a `LitWide` is un-servable: the one reject arm in
-    /// `OpcodeBackend::lower` surfaces the VM's real 16-byte-slot limitation honestly.
-    LitWide(String),
+    /// An integer literal whose value does not fit `i64` (that is a `LitInt`),
+    /// sign folded in. No register holds one, so lowering refuses it; a seek key,
+    /// an INSERT cell and an UPDATE SET value read it against their column's type.
+    LitWide(NumLit),
+    /// A `DATE '…'` / `TIMESTAMP '…'` literal: its storage integer, typed as its
+    /// temporal type — a difference of two dates is an integer, a date shifted by
+    /// one is a date.
+    LitTemporal {
+        tc: TypeCode,
+        v: i64,
+    },
     /// SQL `NULL` literal / an implicit CASE ELSE. Lowers to `load_null`; its
     /// inferred type is `I64`, the neutral element of `unify_blend_type` (so a NULL
     /// branch never drags a U64/float sibling back down).
     LitNull,
     BinOp(Box<BExpr<R>>, BinOp, Box<BExpr<R>>),
-    UnaryOp(UnaryOp, Box<BExpr<R>>),
+    /// Boolean `NOT`. Negation is `Func` with `NumFunc::Unary(Neg)`.
+    Not(Box<BExpr<R>>),
     /// `EXTRACT` / `DATE_PART` / `DATE_TRUNC` over a DATE or TIMESTAMP
     /// argument; lowering checks the argument's type, the binder is schema-free.
     Calendar {
@@ -69,7 +68,7 @@ pub(crate) enum BExpr<R> {
     /// form — a `≤8-byte-integer` operand with all-integer-literal items compiles to
     /// one `IntInSet`; anything else falls back to the
     /// `inner = i0 OR inner = i1 OR …` chain. `NOT IN` is the outer
-    /// `UnaryOp(Not, InList)`. `items` always holds two or more entries: the binder
+    /// `Not(InList)`. `items` always holds two or more entries: the binder
     /// rejects `IN ()` and folds `IN (l)` to `Eq`, so the recognizers over bound
     /// conjuncts see a one-key list as the equality it is.
     InList {
@@ -92,13 +91,6 @@ pub(crate) enum BExpr<R> {
         f: StrFunc,
         args: Vec<BExpr<R>>,
     },
-    /// `SUBSTRING(s FROM start [FOR len])` / `SUBSTR(s, start[, len])`. The
-    /// bounds are arbitrary integer expressions, evaluated per row.
-    Substr {
-        s: Box<BExpr<R>>,
-        start: Box<BExpr<R>>,
-        len: Option<Box<BExpr<R>>>,
-    },
     /// The trim set is compile-time data, not an operand: an ASCII string
     /// literal the binder has already checked, defaulting to a single space.
     TrimCall {
@@ -110,7 +102,7 @@ pub(crate) enum BExpr<R> {
     /// operand plus compile-time data: the pattern and its escape (`None` =
     /// escaping disabled) are literals the binder has already checked, which the
     /// engine tokenizes once per program. `ci` is ILIKE's ASCII-only case
-    /// folding. `NOT LIKE` is the outer `UnaryOp(Not, Like)`.
+    /// folding. `NOT LIKE` is the outer `Not(Like)`.
     Like {
         s: Box<BExpr<R>>,
         pattern: String,
@@ -118,8 +110,7 @@ pub(crate) enum BExpr<R> {
         ci: bool,
     },
     /// `CONCAT(args…)` with PostgreSQL's semantics — a NULL argument is the
-    /// empty string, so the result is never NULL. Distinct from `BinOp::Concat`
-    /// (`||`), which propagates NULL.
+    /// empty string. Distinct from `BinOp::Concat` (`||`), which propagates NULL.
     ConcatN {
         args: Vec<BExpr<R>>,
     },
@@ -144,23 +135,32 @@ pub(crate) enum StrFunc {
     Lpad,
     Rpad,
     SplitPart,
+    /// `SUBSTRING(s FROM start [FOR len])` / `SUBSTR(s, start[, len])`.
+    Substr,
 }
 
 /// The class of one string-function argument. A trailing `StrOr` slot may be
-/// omitted from the call and then takes its default.
+/// omitted from the call and then takes its default; a trailing `IntOpt` slot
+/// may be omitted and then stays absent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StrArg {
     Str,
     Int,
     StrOr(&'static str),
+    IntOpt,
 }
 
 impl StrArg {
     pub(crate) fn default(self) -> Option<&'static str> {
         match self {
             StrArg::StrOr(d) => Some(d),
-            StrArg::Str | StrArg::Int => None,
+            StrArg::Str | StrArg::Int | StrArg::IntOpt => None,
         }
+    }
+
+    /// Whether a call must write this slot.
+    pub(crate) fn required(self) -> bool {
+        matches!(self, StrArg::Str | StrArg::Int)
     }
 }
 
@@ -179,7 +179,26 @@ impl StrFunc {
             | StrFunc::Replace
             | StrFunc::Lpad
             | StrFunc::Rpad
-            | StrFunc::SplitPart => TypeCode::String,
+            | StrFunc::SplitPart
+            | StrFunc::Substr => TypeCode::String,
+        }
+    }
+
+    /// Whether the kernel can make a NULL from non-NULL arguments: the arena
+    /// producers' length overflow, SPLIT_PART's zero field, SUBSTRING's negative
+    /// length (present only in its three-argument form).
+    pub(crate) fn may_null(self, args: usize) -> bool {
+        match self {
+            StrFunc::Replace | StrFunc::Lpad | StrFunc::Rpad | StrFunc::SplitPart => true,
+            StrFunc::Substr => args == 3,
+            StrFunc::Upper
+            | StrFunc::Lower
+            | StrFunc::LenBytes
+            | StrFunc::LenChars
+            | StrFunc::Reverse
+            | StrFunc::Left
+            | StrFunc::Right
+            | StrFunc::Pos => false,
         }
     }
 
@@ -187,7 +206,7 @@ impl StrFunc {
     /// function's arity, which the binder sizes the list by and lowering reads
     /// the operands through.
     pub(crate) fn signature(self) -> &'static [StrArg] {
-        use StrArg::{Int, Str};
+        use StrArg::{Int, IntOpt, Str};
         match self {
             StrFunc::Upper | StrFunc::Lower | StrFunc::LenBytes | StrFunc::LenChars | StrFunc::Reverse => &[Str],
             StrFunc::Left | StrFunc::Right => &[Str, Int],
@@ -195,6 +214,7 @@ impl StrFunc {
             StrFunc::Replace => &[Str, Str, Str],
             StrFunc::Lpad | StrFunc::Rpad => &[Str, Int, StrArg::StrOr(" ")],
             StrFunc::SplitPart => &[Str, Str, Int],
+            StrFunc::Substr => &[Str, Int, IntOpt],
         }
     }
 }
@@ -240,9 +260,40 @@ impl NumFunc {
 }
 
 /// The runtime bound-expression IR: [`BExpr`] with its leaf reference resolved to
-/// a `usize` column index. Every existing consumer names this alias, pinning
-/// `R = usize` at every construction and pattern.
+/// a `usize` column index.
 pub(crate) type BoundExpr = BExpr<usize>;
+
+/// An integer literal as sign and magnitude: a column of any integer type,
+/// U128 included, reads its value from this without a width it may not fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NumLit {
+    pub(crate) mag: u128,
+    pub(crate) neg: bool,
+}
+
+impl NumLit {
+    pub(crate) fn of_i128(v: i128) -> Self {
+        NumLit { mag: v.unsigned_abs(), neg: v < 0 }
+    }
+
+    pub(crate) fn is_negative(self) -> bool {
+        self.neg && self.mag != 0
+    }
+
+    pub(crate) fn to_i128(self) -> Option<i128> {
+        match self.neg {
+            true => (self.mag <= i128::MIN.unsigned_abs()).then(|| (self.mag as i128).wrapping_neg()),
+            false => i128::try_from(self.mag).ok(),
+        }
+    }
+}
+
+impl std::fmt::Display for NumLit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.is_negative() { "-" } else { "" };
+        write!(f, "{sign}{}", self.mag)
+    }
+}
 
 /// Common type for arithmetic and conditional blends, matching the engine's
 /// runtime register rule (`reg_u64`): any float operand → F64; else any DECIMAL
@@ -325,82 +376,81 @@ pub(crate) fn operand_ty_pair<R, F: Fn(&R) -> ColType>(l: &BExpr<R>, r: &BExpr<R
 }
 
 /// Re-read each float literal of `items` as the exact decimal it spells, where
-/// any operand is a DECIMAL. The adoption both [`operand_tys`] shapes share.
+/// any operand is a DECIMAL and the literal is itself a DECIMAL value — a scale
+/// a register holds and an unscaled value in `i64`. A literal past that keeps
+/// its float type. The adoption both [`operand_tys`] shapes share.
 fn adopt_decimal_literals<R>(items: &[&BExpr<R>], tys: &mut [ColType]) {
     if !tys.iter().any(|t| t.is_decimal()) {
         return;
     }
     for (e, ty) in items.iter().zip(tys) {
-        if let BExpr::LitFloat(v) = e {
-            if let Some((_, scale)) = decimal_of_f64(*v) {
-                *ty = ColType::decimal(scale);
+        if let BExpr::LitFloat { dec: Some((v, s)), .. } = e {
+            if *s <= MAX_DECIMAL_SCALE && i64::try_from(*v).is_ok() {
+                *ty = ColType::decimal(*s);
             }
         }
     }
 }
 
+/// The type a CASE's results or a GREATEST/LEAST's arguments blend to, from
+/// their [`operand_tys`]: [`unify_blend_type`] over each, seeded with I64 — so a
+/// one-item list types as its own register image. `LitNull` types as that
+/// neutral I64, so a NULL item never drags a U64/float sibling down.
+pub(crate) fn blend_type(tys: &[ColType]) -> ColType {
+    tys.iter().copied().fold(ColType::of(TypeCode::I64), unify_blend_type)
+}
+
 impl<R> BExpr<R> {
-    /// A `DATE '…'` / `TIMESTAMP '…'` literal: its storage integer under a cast
-    /// to its type, so it types as a DATE/TIMESTAMP where a bare integer would
-    /// not (a difference of two dates is an integer, a date shifted by one is
-    /// a date). [`Self::int_literal`] is the inverse.
-    pub(crate) fn temporal_lit(to: TypeCode, v: i64) -> Self {
-        BExpr::Cast {
-            expr: Box::new(BExpr::LitInt(v)),
-            to: ColType::of(to),
-        }
+    /// `l op r`.
+    pub(crate) fn bin(l: BExpr<R>, op: BinOp, r: BExpr<R>) -> Self {
+        BExpr::BinOp(Box::new(l), op, Box::new(r))
     }
 
-    /// The integer a literal spells: a plain `LitInt`, or one under the typed
-    /// cast a `DATE '…'` / `TIMESTAMP '…'` literal binds to — which is why the
-    /// seek and IN-set recognizers read literals through here.
+    /// The integer a literal spells: a `LitInt`, or a temporal literal's storage
+    /// integer — which is why the seek and IN-set recognizers read literals
+    /// through here.
     pub(crate) fn int_literal(&self) -> Option<i64> {
         match self {
-            BExpr::LitInt(v) => Some(*v),
-            BExpr::Cast { expr, to } if to.tc.is_temporal() => expr.int_literal(),
+            BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => Some(*v),
             _ => None,
         }
     }
 
     /// The decimal a numeric literal spells, as `(unscaled, scale)` — an integer
-    /// at scale 0, a float at the scale it was written with. The consumer
+    /// at scale 0, a fractional literal at its smallest exact scale. The consumer
     /// re-expresses it at a column's scale, exactly or by rounding as its own
     /// contract says.
-    pub(crate) fn decimal_literal(&self) -> Option<(i64, u8)> {
+    pub(crate) fn decimal_literal(&self) -> Option<(i128, u8)> {
         match self {
-            BExpr::LitInt(v) => Some((*v, 0)),
-            BExpr::LitFloat(v) => decimal_of_f64(*v),
+            BExpr::LitInt(v) => Some((i128::from(*v), 0)),
+            BExpr::LitWide(n) => n.to_i128().map(|v| (v, 0)),
+            BExpr::LitFloat { dec, .. } => *dec,
             _ => None,
         }
     }
 
     /// The `i64` this literal is at DECIMAL scale `scale` when it is exactly
-    /// representable there — an integer, or a float written with no more
+    /// representable there — an integer, or a fractional literal with no more
     /// fractional digits than the scale holds. A longer literal is not rounded:
     /// a key or a membership test against it must not match a neighbour.
     pub(crate) fn exact_decimal(&self, scale: u8) -> Option<i64> {
         let (v, s) = self.decimal_literal()?;
-        (s <= scale).then(|| rescale(v as i128, s, scale)).flatten()
+        (s <= scale).then(|| rescale(v, s, scale)).flatten()
     }
 
-    /// Infer the result type, parameterized over how a leaf reference is typed.
-    /// `ColRef` is the only leaf-typed arm — it consults `leaf_ty`; every other
-    /// arm is structural (literals fix a type, comparisons/tests are `I64`,
-    /// arithmetic/CASE fold via `unify_blend_type`). `NullTest`/`InList` are
-    /// boolean and never consult `leaf_ty`. The runtime `usize` entry point
-    /// is [`BExpr::infer_type`].
+    /// The type of the value this node computes, parameterized over how a leaf
+    /// reference is typed. A `ColRef` is the referenced column's declared type; a
+    /// narrowing integer `CAST` is its target (the cast range-checks the register
+    /// into it, which is what a narrow output slot admits); every other node is
+    /// the type of the register it computes.
     pub(crate) fn infer_ty_with<F: Fn(&R) -> ColType>(&self, leaf_ty: &F) -> ColType {
         let int = ColType::of(TypeCode::I64);
         match self {
             BExpr::ColRef(r) => leaf_ty(r),
-            BExpr::LitInt(_) => int,
-            BExpr::LitFloat(_) => ColType::of(TypeCode::F64),
+            BExpr::LitInt(_) | BExpr::LitWide(_) | BExpr::LitNull => int,
+            BExpr::LitFloat { .. } => ColType::of(TypeCode::F64),
             BExpr::LitStr(_) => ColType::of(TypeCode::String),
-            // A wide literal only ever appears in `col OP wide` (the `BinOp`
-            // comparison arm returns `I64` regardless), and no caller consults a
-            // wide *literal*'s type — so I64 is inert here, uniform with `LitInt`.
-            BExpr::LitWide(_) => int,
-            BExpr::LitNull => int,
+            BExpr::LitTemporal { tc, .. } => ColType::of(*tc),
             BExpr::BinOp(l, op, r) => {
                 let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
                 match op {
@@ -419,132 +469,119 @@ impl<R> BExpr<R> {
                     _ => unify_blend_type(lt, rt),
                 }
             }
-            BExpr::UnaryOp(UnaryOp::Neg, inner) => inner.infer_ty_with(leaf_ty),
-            BExpr::UnaryOp(UnaryOp::Not, _) => int,
-            BExpr::NullTest { .. } => int,
-            BExpr::Case { branches, else_ } => Self::case_type(branches, else_.as_deref(), leaf_ty),
+            BExpr::Not(_) | BExpr::NullTest { .. } => int,
+            BExpr::Case { branches, else_ } => {
+                let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain(else_.as_deref()).collect();
+                blend_type(&operand_tys(&results, leaf_ty))
+            }
             // The membership and pattern tests are booleans, like the comparison
             // `BinOp` arm.
             BExpr::InList { .. } | BExpr::Like { .. } => int,
             BExpr::Func { f, arg } => f.result_type(arg.infer_ty_with(leaf_ty)),
-            BExpr::Calendar { op, arg } => match op {
-                CalendarOp::ToMicros => ColType::of(TypeCode::Timestamp),
-                CalendarOp::ToDays => ColType::of(TypeCode::Date),
-                op if op.keeps_type() => arg.infer_ty_with(leaf_ty),
-                _ => int,
-            },
-            // Seeded with `unify_blend_type`'s neutral element, so a one-argument
-            // list types as its own register image and an empty one as I64.
-            BExpr::MinMaxN { args, .. } => operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty)
-                .into_iter()
-                .fold(int, unify_blend_type),
+            BExpr::Calendar { op, arg } if op.keeps_type() => arg.infer_ty_with(leaf_ty),
+            BExpr::Calendar { .. } => int,
+            BExpr::MinMaxN { args, .. } => blend_type(&operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty)),
+            BExpr::Cast { to, .. } if to.tc.is_float() => ColType::of(TypeCode::F64),
             BExpr::Cast { to, .. } => *to,
             BExpr::StrCall { f, .. } => ColType::of(f.result_type()),
-            BExpr::Substr { .. } | BExpr::TrimCall { .. } | BExpr::ConcatN { .. } => ColType::of(TypeCode::String),
+            BExpr::TrimCall { .. } | BExpr::ConcatN { .. } => ColType::of(TypeCode::String),
         }
     }
 
     /// Whether the expression can never evaluate to NULL, parameterized over
-    /// whether a leaf reference can: arithmetic other than a division,
-    /// comparison, and the connectives preserve non-nullness; a division by
-    /// anything but a non-zero literal, a CASE without an ELSE, a cast, and
-    /// every other node may produce NULL. Conservative: `false` is always safe.
+    /// whether a leaf reference can. Each arm mirrors which engine kernels make a
+    /// NULL of their own from non-NULL operands. Conservative: `false` is always
+    /// safe.
     pub(crate) fn never_null_with<F: Fn(&R) -> bool>(&self, leaf_nullable: &F) -> bool {
         let go = |e: &BExpr<R>| e.never_null_with(leaf_nullable);
         match self {
             BExpr::ColRef(r) => !leaf_nullable(r),
-            BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitStr(_) | BExpr::LitWide(_) => true,
+            BExpr::LitInt(_)
+            | BExpr::LitFloat { .. }
+            | BExpr::LitStr(_)
+            | BExpr::LitWide(_)
+            | BExpr::LitTemporal { .. } => true,
             BExpr::LitNull => false,
             BExpr::BinOp(l, BinOp::Div | BinOp::Mod, r) => matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0) && go(l),
-            BExpr::BinOp(_, BinOp::Pow, _) => false,
+            // A concatenation past `u32::MAX` bytes is NULL.
+            BExpr::BinOp(_, BinOp::Concat, _) => false,
             BExpr::BinOp(l, _, r) => go(l) && go(r),
-            BExpr::UnaryOp(_, inner) => go(inner),
+            BExpr::Not(inner) => go(inner),
             BExpr::NullTest { .. } => true,
             BExpr::Case { branches, else_ } => {
                 else_.as_deref().is_some_and(go) && branches.iter().all(|(_, result)| go(result))
             }
-            _ => false,
+            // The numeric kernels, LIKE and TRIM introduce no NULL of their own.
+            BExpr::Func { arg, .. } | BExpr::Like { s: arg, .. } | BExpr::TrimCall { s: arg, .. } => go(arg),
+            BExpr::Calendar { op, arg } => !op.may_null() && go(arg),
+            BExpr::InList { inner, items } => go(inner) && items.iter().all(go),
+            // GREATEST/LEAST skip a NULL argument.
+            BExpr::MinMaxN { args, .. } => args.iter().any(go),
+            BExpr::StrCall { f, args } => !f.may_null(args.len()) && args.iter().all(go),
+            // Text is a total rendering of any scalar; the other targets can refuse a value.
+            BExpr::Cast { expr, to } if to.tc == TypeCode::String => go(expr),
+            BExpr::Cast { .. } | BExpr::ConcatN { .. } => false,
         }
-    }
-
-    /// A CASE's result type, from its result branches and its else — the one
-    /// walk both `infer_ty_with` and lowering read it out of. Each branch is
-    /// inferred exactly once, which matters because a CASE nested in a CASE would
-    /// otherwise double per level.
-    ///
-    /// `unify_blend_type` over every branch and the else, seeded with I64 (the
-    /// implicit else), so a U64/float branch is preserved and any string branch
-    /// wins outright.
-    ///
-    /// `LitNull` carries no type signal — it infers as a hardcoded I64 — so it is
-    /// polymorphic here. The consequence is that an all-NULL CASE still types
-    /// I64 and so declares an I64 column, exactly as an all-NULL numeric CASE
-    /// does today.
-    pub(crate) fn case_type<F: Fn(&R) -> ColType>(
-        branches: &[(BExpr<R>, BExpr<R>)],
-        else_: Option<&BExpr<R>>,
-        leaf_ty: &F,
-    ) -> ColType {
-        let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain(else_).collect();
-        operand_tys(&results, leaf_ty)
-            .into_iter()
-            .fold(ColType::of(TypeCode::I64), unify_blend_type)
     }
 }
 
 impl<R> BExpr<R> {
     /// Rebuild the expression structurally, replacing each `ColRef` by whatever
     /// `leaf` returns for it — another leaf, or a whole sub-expression. The one
-    /// rebuilding walk (`for_each_ref` reads, `infer_ty_with` types), so a new
-    /// variant is added in three places and fails to compile until it is.
-    pub(crate) fn try_rebuild<S, E>(&self, leaf: &impl Fn(&R) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
-        let go = |e: &BExpr<R>| e.try_rebuild(leaf);
-        let boxed = |e: &BExpr<R>| go(e).map(Box::new);
-        let opt = |e: Option<&BExpr<R>>| e.map(boxed).transpose();
-        let all = |es: &[BExpr<R>]| es.iter().map(go).collect::<Result<Vec<_>, E>>();
+    /// rebuilding walk (`for_each_ref` reads, `infer_ty_with` types); the match
+    /// is exhaustive.
+    pub(crate) fn try_rebuild<S, E>(&self, leaf: &mut impl FnMut(&R) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
+        let mut go = |e: &BExpr<R>| e.try_rebuild(&mut *leaf);
         Ok(match self {
             BExpr::ColRef(r) => leaf(r)?,
             BExpr::NullTest { inner, want_null } => BExpr::NullTest {
-                inner: boxed(inner)?,
+                inner: Box::new(go(inner)?),
                 want_null: *want_null,
             },
             BExpr::LitInt(v) => BExpr::LitInt(*v),
-            BExpr::LitFloat(v) => BExpr::LitFloat(*v),
+            BExpr::LitFloat { v, dec } => BExpr::LitFloat { v: *v, dec: *dec },
             BExpr::LitStr(s) => BExpr::LitStr(s.clone()),
-            BExpr::LitWide(s) => BExpr::LitWide(s.clone()),
+            BExpr::LitWide(n) => BExpr::LitWide(*n),
+            BExpr::LitTemporal { tc, v } => BExpr::LitTemporal { tc: *tc, v: *v },
             BExpr::LitNull => BExpr::LitNull,
-            BExpr::BinOp(l, op, r) => BExpr::BinOp(boxed(l)?, *op, boxed(r)?),
-            BExpr::UnaryOp(op, inner) => BExpr::UnaryOp(*op, boxed(inner)?),
-            BExpr::Func { f, arg } => BExpr::Func { f: *f, arg: boxed(arg)? },
-            BExpr::Calendar { op, arg } => BExpr::Calendar { op: *op, arg: boxed(arg)? },
-            BExpr::MinMaxN { is_max, args } => BExpr::MinMaxN { is_max: *is_max, args: all(args)? },
-            BExpr::Cast { expr, to } => BExpr::Cast { expr: boxed(expr)?, to: *to },
+            BExpr::BinOp(l, op, r) => BExpr::BinOp(Box::new(go(l)?), *op, Box::new(go(r)?)),
+            BExpr::Not(inner) => BExpr::Not(Box::new(go(inner)?)),
+            BExpr::Func { f, arg } => BExpr::Func { f: *f, arg: Box::new(go(arg)?) },
+            BExpr::Calendar { op, arg } => BExpr::Calendar { op: *op, arg: Box::new(go(arg)?) },
+            BExpr::MinMaxN { is_max, args } => BExpr::MinMaxN {
+                is_max: *is_max,
+                args: args.iter().map(&mut go).collect::<Result<_, E>>()?,
+            },
+            BExpr::Cast { expr, to } => BExpr::Cast { expr: Box::new(go(expr)?), to: *to },
             BExpr::Case { branches, else_ } => BExpr::Case {
                 branches: branches
                     .iter()
                     .map(|(c, r)| Ok((go(c)?, go(r)?)))
                     .collect::<Result<_, E>>()?,
-                else_: opt(else_.as_deref())?,
+                else_: else_.as_deref().map(|e| go(e).map(Box::new)).transpose()?,
             },
-            BExpr::InList { inner, items } => BExpr::InList { inner: boxed(inner)?, items: all(items)? },
-            BExpr::StrCall { f, args } => BExpr::StrCall { f: *f, args: all(args)? },
-            BExpr::Substr { s, start, len } => BExpr::Substr {
-                s: boxed(s)?,
-                start: boxed(start)?,
-                len: opt(len.as_deref())?,
+            BExpr::InList { inner, items } => BExpr::InList {
+                inner: Box::new(go(inner)?),
+                items: items.iter().map(&mut go).collect::<Result<_, E>>()?,
+            },
+            BExpr::StrCall { f, args } => BExpr::StrCall {
+                f: *f,
+                args: args.iter().map(&mut go).collect::<Result<_, E>>()?,
             },
             BExpr::TrimCall { s, mode, set } => BExpr::TrimCall {
-                s: boxed(s)?,
+                s: Box::new(go(s)?),
                 mode: *mode,
                 set: set.clone(),
             },
             BExpr::Like { s, pattern, escape, ci } => BExpr::Like {
-                s: boxed(s)?,
+                s: Box::new(go(s)?),
                 pattern: pattern.clone(),
                 escape: *escape,
                 ci: *ci,
             },
-            BExpr::ConcatN { args } => BExpr::ConcatN { args: all(args)? },
+            BExpr::ConcatN { args } => BExpr::ConcatN {
+                args: args.iter().map(&mut go).collect::<Result<_, E>>()?,
+            },
         })
     }
 
@@ -554,12 +591,17 @@ impl<R> BExpr<R> {
         match self {
             BExpr::ColRef(r) => f(r),
             BExpr::NullTest { inner, .. } => inner.for_each_ref(f),
-            BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitStr(_) | BExpr::LitWide(_) | BExpr::LitNull => {}
+            BExpr::LitInt(_)
+            | BExpr::LitFloat { .. }
+            | BExpr::LitStr(_)
+            | BExpr::LitWide(_)
+            | BExpr::LitTemporal { .. }
+            | BExpr::LitNull => {}
             BExpr::BinOp(l, _, r) => {
                 l.for_each_ref(f);
                 r.for_each_ref(f);
             }
-            BExpr::UnaryOp(_, inner) => inner.for_each_ref(f),
+            BExpr::Not(inner) => inner.for_each_ref(f),
             BExpr::Func { arg, .. } | BExpr::Calendar { arg, .. } => arg.for_each_ref(f),
             BExpr::MinMaxN { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
             BExpr::Cast { expr, .. } => expr.for_each_ref(f),
@@ -579,13 +621,6 @@ impl<R> BExpr<R> {
                 }
             }
             BExpr::StrCall { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
-            BExpr::Substr { s, start, len } => {
-                s.for_each_ref(f);
-                start.for_each_ref(f);
-                if let Some(l) = len {
-                    l.for_each_ref(f);
-                }
-            }
             BExpr::TrimCall { s, .. } | BExpr::Like { s, .. } => s.for_each_ref(f),
             BExpr::ConcatN { args } => args.iter().for_each(|a| a.for_each_ref(f)),
         }
@@ -598,22 +633,6 @@ impl BExpr<usize> {
     pub(crate) fn infer_ty(&self, cols: &[ColumnDef]) -> ColType {
         self.infer_ty_with(&|idx: &usize| cols[*idx].ty())
     }
-
-    /// [`Self::infer_ty`]'s type code, for the consumers a DECIMAL's scale does
-    /// not concern.
-    pub(crate) fn infer_type(&self, cols: &[ColumnDef]) -> TypeCode {
-        self.infer_ty(cols).tc
-    }
-}
-
-/// The one message for every un-servable wide-integer literal.
-pub(crate) const WIDE_INT_UNSUPPORTED: &str = "wide-integer comparison is only servable as an indexed equality/range";
-
-/// The uniform un-servable-wide-literal error, naming the literal. Built at the
-/// compile boundary (`OpcodeBackend::lower`), which is the only place a
-/// `LitWide` can survive to.
-pub(crate) fn wide_int_error(lit: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{WIDE_INT_UNSUPPORTED}: {lit}"))
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -699,12 +718,6 @@ impl BinOp {
             other => other,
         }
     }
-}
-
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
-pub(crate) enum UnaryOp {
-    Neg,
-    Not,
 }
 
 #[cfg(test)]

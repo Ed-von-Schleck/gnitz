@@ -57,7 +57,7 @@ impl Frame {
 /// `HirRef::Subquery` leaf must have been consumed by decorrelation — its survival
 /// to physicalization is the one point that rejects it.
 pub(crate) fn resolve_refs(expr: &HirExpr, layout: &[ColId]) -> Result<BoundExpr, GnitzSqlError> {
-    expr.try_rebuild(&|r| match r {
+    expr.try_rebuild(&mut |r| match r {
         HirRef::Col(id) => slot_of(layout, *id).map(BoundExpr::ColRef),
         HirRef::Subquery(_) => Err(GnitzSqlError::Internal(
             "subquery leaf survived to physicalization".into(),

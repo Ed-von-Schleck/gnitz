@@ -8,8 +8,8 @@
 use crate::bind::structural::str_func_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{
-    decimal_compute_type, operand_ty_pair, operand_tys, unify_blend_type, BinOp, BoundExpr, NumFunc, StrArg, StrFunc,
-    TrimMode, UnaryOp,
+    blend_type, decimal_compute_type, operand_ty_pair, operand_tys, BinOp, BoundExpr, NumFunc, StrArg, StrFunc,
+    TrimMode,
 };
 use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
@@ -116,7 +116,8 @@ impl OpcodeBackend<'_> {
         match expr {
             BoundExpr::ColRef(c) => self.col_ref(*c),
             BoundExpr::LitInt(v) => Ok((self.eb.emit(L::LoadConst { val: *v }), ExprKind::Int)),
-            BoundExpr::LitFloat(v) => Ok((self.eb.const_f64(*v), ExprKind::Float)),
+            BoundExpr::LitFloat { v, .. } => Ok((self.eb.const_f64(*v), ExprKind::Float)),
+            BoundExpr::LitTemporal { v, .. } => Ok((self.eb.emit(L::LoadConst { val: *v }), ExprKind::Int)),
             BoundExpr::LitStr(s) => {
                 let idx = self.eb.add_const_string(s);
                 Ok((self.eb.emit(L::LoadConstStr { const_idx: idx }), ExprKind::Str))
@@ -124,11 +125,13 @@ impl OpcodeBackend<'_> {
             // The register file is 8 bytes wide, so a wide literal has no slot.
             // A *servable* wide seek is consumed into a PK/index bound by the
             // access-path recognizer and never gets here.
-            BoundExpr::LitWide(s) => Err(crate::ir::wide_int_error(s)),
+            BoundExpr::LitWide(lit) => Err(GnitzSqlError::Unsupported(format!(
+                "integer literal {lit} does not fit a 64-bit register; it is usable only as an indexed \
+                 equality/range key, an INSERT value or an UPDATE SET value"
+            ))),
             BoundExpr::LitNull => Ok((self.eb.emit(L::LoadNull), ExprKind::Int)),
             BoundExpr::BinOp(l, op, r) => self.binop(l, *op, r),
-            BoundExpr::UnaryOp(UnaryOp::Neg, inner) => self.func(NumFunc::Unary(FloatUnaryOp::Neg), inner),
-            BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
+            BoundExpr::Not(inner) => {
                 let (a, _) = self.lower_num(inner)?;
                 Ok((self.eb.emit(L::BoolNot { a }), ExprKind::Int))
             }
@@ -140,7 +143,6 @@ impl OpcodeBackend<'_> {
             BoundExpr::MinMaxN { is_max, args } => self.min_max_n(*is_max, args),
             BoundExpr::Cast { expr, to } => self.cast(expr, *to),
             BoundExpr::StrCall { f, args } => self.str_call(*f, args),
-            BoundExpr::Substr { s, start, len } => self.substr(s, start, len.as_deref()),
             BoundExpr::TrimCall { s, mode, set } => self.trim_call(s, *mode, set),
             BoundExpr::Like { s, pattern, escape, ci } => self.like(s, pattern, *escape, *ci),
             BoundExpr::ConcatN { args } => self.concat_n(args),
@@ -279,7 +281,7 @@ impl OpcodeBackend<'_> {
     fn lower_dec(&mut self, e: &BoundExpr, to: u8) -> Result<Reg, GnitzSqlError> {
         check_decimal_scale(to)?;
         if let Some((v, s)) = e.decimal_literal() {
-            let val = rescale(v as i128, s, to).ok_or_else(|| {
+            let val = rescale(v, s, to).ok_or_else(|| {
                 GnitzSqlError::Bind(format!("{} does not fit a DECIMAL of scale {to}", format_decimal(v, s)))
             })?;
             return Ok(self.eb.emit(L::LoadConst { val }));
@@ -344,7 +346,7 @@ impl OpcodeBackend<'_> {
         }
     }
 
-    /// The numeric functions, unary NEG included. Over an integer register the
+    /// The numeric functions. Over an integer register the
     /// rounding family and `ROUND(x, n >= 0)` are the identity, ABS of an
     /// unsigned register likewise, and only NEG, signed ABS and SIGN compute;
     /// over a DECIMAL the rounding family is integer arithmetic on the scale;
@@ -415,18 +417,18 @@ impl OpcodeBackend<'_> {
     /// anything else, which is every comparison that needs no coercion.
     fn temporal_str_lit(&self, e: &BoundExpr, other: &BoundExpr) -> Result<Option<BoundExpr>, GnitzSqlError> {
         let BoundExpr::LitStr(s) = e else { return Ok(None) };
-        let to = other.infer_type(self.cols);
-        match to.is_temporal() {
-            true => Ok(Some(BoundExpr::temporal_lit(
-                to,
-                crate::types::temporal_literal(to, s)?,
-            ))),
+        let tc = other.infer_ty(self.cols).tc;
+        match tc.is_temporal() {
+            true => Ok(Some(BoundExpr::LitTemporal {
+                tc,
+                v: crate::types::temporal_literal(tc, s)?,
+            })),
             false => Ok(None),
         }
     }
 
     fn calendar(&mut self, op: CalendarOp, arg: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let micros = match arg.infer_type(self.cols) {
+        let micros = match arg.infer_ty(self.cols).tc {
             TypeCode::Timestamp => true,
             TypeCode::Date => false,
             t => {
@@ -446,7 +448,9 @@ impl OpcodeBackend<'_> {
         for (k, (kind, a)) in f.signature().iter().zip(args).enumerate() {
             regs.push(match kind {
                 StrArg::Str | StrArg::StrOr(_) => self.str_operand(a, false)?,
-                StrArg::Int => self.int_operand(a, || format!("{}: argument {}", str_func_name(f), k + 1))?,
+                StrArg::Int | StrArg::IntOpt => {
+                    self.int_operand(a, || format!("{}: argument {}", str_func_name(f), k + 1))?
+                }
             });
         }
         let instr = match (f, regs.as_slice()) {
@@ -462,28 +466,11 @@ impl OpcodeBackend<'_> {
             (StrFunc::Lpad, &[s, n_reg, fill]) => L::StrPad { s, n_reg, fill, left: true },
             (StrFunc::Rpad, &[s, n_reg, fill]) => L::StrPad { s, n_reg, fill, left: false },
             (StrFunc::SplitPart, &[s, delim, n_reg]) => L::StrSplitPart { s, delim, n_reg },
+            (StrFunc::Substr, &[src, start_reg]) => L::StrSubstr { src, start_reg, len_reg: None },
+            (StrFunc::Substr, &[src, start_reg, len]) => L::StrSubstr { src, start_reg, len_reg: Some(len) },
             _ => unreachable!("the binder sizes a string call's arguments by its signature"),
         };
-        let kind = if f.result_type() == TypeCode::String {
-            ExprKind::Str
-        } else {
-            ExprKind::Int
-        };
-        Ok((self.eb.emit(instr), kind))
-    }
-
-    fn substr(
-        &mut self,
-        s: &BoundExpr,
-        start: &BoundExpr,
-        len: Option<&BoundExpr>,
-    ) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let src = self.str_operand(s, false)?;
-        let start_reg = self.int_operand(start, || "SUBSTRING: start".into())?;
-        let len_reg = len
-            .map(|l| self.int_operand(l, || "SUBSTRING: length".into()))
-            .transpose()?;
-        Ok((self.eb.emit(L::StrSubstr { src, start_reg, len_reg }), ExprKind::Str))
+        Ok((self.eb.emit(instr), ExprKind::of(ColType::of(f.result_type()))))
     }
 
     fn trim_call(&mut self, s: &BoundExpr, mode: TrimMode, set: &str) -> Result<(Reg, ExprKind), GnitzSqlError> {
@@ -527,9 +514,7 @@ impl OpcodeBackend<'_> {
     /// GREATEST/LEAST as a left fold of 2-ary extremum opcodes.
     fn min_max_n(&mut self, is_max: bool, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let types = operand_tys(&args.iter().collect::<Vec<_>>(), &|i: &usize| self.cols[*i].ty());
-        let ty = types
-            .iter()
-            .fold(ColType::of(TypeCode::I64), |acc, &t| unify_blend_type(acc, t));
+        let ty = blend_type(&types);
         // Every argument is a numeric operand: a string one is refused by the
         // numeric read, which names the column where the blend cannot.
         if ty.tc == TypeCode::String {
@@ -570,7 +555,7 @@ impl OpcodeBackend<'_> {
         let to = to.tc;
         let (r, kind) = self.lower(expr)?;
         if to.is_temporal() {
-            let from = expr.infer_type(self.cols);
+            let from = expr.infer_ty(self.cols).tc;
             match (kind, from, to) {
                 (ExprKind::Str, _, _) => {
                     return Err(GnitzSqlError::Unsupported(format!(
@@ -632,13 +617,12 @@ impl OpcodeBackend<'_> {
                 // `to`'s domain *with* `to`'s register image: the engine tracks a
                 // register as U64 iff its type is U64, so an elided cast must not
                 // change that bit. Only a bare column load qualifies for the
-                // exact-type half — `infer_type` types `-i32col` as I32, but the
-                // VM negate wraps on the i64 image, so `-(-2^31)` leaves I32.
+                // exact-type half.
                 let in_range = |v: i64| {
                     let (lo, hi) = fi.range();
                     (lo..=hi).contains(&(v as i128))
                 };
-                let elide = to == expr.infer_type(self.cols).register_image()
+                let elide = to == expr.infer_ty(self.cols).tc.register_image()
                     || matches!(expr, BoundExpr::ColRef(i) if self.cols[*i].type_code == to)
                     || matches!(expr, BoundExpr::LitInt(v) if in_range(*v));
                 if elide {
@@ -686,7 +670,8 @@ impl OpcodeBackend<'_> {
         branches: &[(BoundExpr, BoundExpr)],
         else_: Option<&BoundExpr>,
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let case_ty = BoundExpr::case_type(branches, else_, &|idx: &usize| self.cols[*idx].ty());
+        let results: Vec<&BoundExpr> = branches.iter().map(|(_, r)| r).chain(else_).collect();
+        let case_ty = blend_type(&operand_tys(&results, &|idx: &usize| self.cols[*idx].ty()));
         let is_str = case_ty.tc == TypeCode::String;
         let mut conds = Vec::with_capacity(branches.len());
         let mut results = Vec::with_capacity(branches.len());
@@ -740,6 +725,14 @@ impl OpcodeBackend<'_> {
     }
 
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        if let BinOp::And | BinOp::Or = op {
+            let (a, _) = self.lower_num(left)?;
+            let (b, _) = self.lower_num(right)?;
+            return Ok((
+                self.eb.emit(L::BoolBinary { a, b, is_or: op == BinOp::Or }),
+                ExprKind::Int,
+            ));
+        }
         // `d < '2024-01-01'`: a string literal compared against a temporal
         // operand is that operand's literal, as it is in a seek key or a
         // written cell.
@@ -760,17 +753,13 @@ impl OpcodeBackend<'_> {
             return Ok((self.eb.emit(L::StrConcat { a, b, skip_null: false }), ExprKind::Str));
         }
         let (lt, rt) = operand_ty_pair(left, right, &|i: &usize| self.cols[*i].ty());
-        if (lt.is_decimal() || rt.is_decimal()) && !matches!(op, BinOp::And | BinOp::Or) {
+        if lt.is_decimal() || rt.is_decimal() {
             return self.decimal_binop(left, op, right, lt, rt);
         }
         let (mut l, l_kind) = self.lower(left)?;
         let (mut r, r_kind) = self.lower(right)?;
         if l_kind == ExprKind::Str || r_kind == ExprKind::Str {
             return self.str_binop(op, (l, l_kind), (r, r_kind));
-        }
-        if let BinOp::And | BinOp::Or = op {
-            let reg = self.eb.emit(L::BoolBinary { a: l, b: r, is_or: op == BinOp::Or });
-            return Ok((reg, ExprKind::Int));
         }
         let (l_float, r_float) = (l_kind.is_float(), r_kind.is_float());
         // POWER has no integer form: both operands lift.
@@ -799,6 +788,21 @@ impl OpcodeBackend<'_> {
         lt: ColType,
         rt: ColType,
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        if let Some(cmp) = op.as_cmp() {
+            let lit = match (left.decimal_literal(), right.decimal_literal()) {
+                (None, Some(l)) if lt.is_decimal() && l.1 > lt.scale => Some((left, lt.scale, l, cmp)),
+                (Some(l), None) if rt.is_decimal() && l.1 > rt.scale => Some((
+                    right,
+                    rt.scale,
+                    l,
+                    op.converse().as_cmp().expect("a comparison's converse is one"),
+                )),
+                _ => None,
+            };
+            if let Some((other, scale, (v, s), cmp)) = lit {
+                return self.cmp_finer_literal(other, scale, v, s, cmp);
+            }
+        }
         let out = decimal_compute_type(op, lt, rt);
         if out.tc == TypeCode::String {
             return Err(GnitzSqlError::Unsupported(format!(
@@ -820,6 +824,36 @@ impl OpcodeBackend<'_> {
         let l = self.lower_dec(left, ls)?;
         let r = self.lower_dec(right, rs)?;
         self.emit_scalar_binop(l, op, r, ExprKind::Dec(out.scale))
+    }
+
+    /// `other CMP v·10^-s` where `s` exceeds `other`'s scale, so no value of
+    /// `other` equals the literal: an ordering compares against the neighbour on
+    /// its side, and `=` / `<>` are `other <> other` / `other = other` — false /
+    /// true on every row, NULL on a NULL one.
+    fn cmp_finer_literal(
+        &mut self,
+        other: &BoundExpr,
+        scale: u8,
+        v: i128,
+        s: u8,
+        cmp: CmpOp,
+    ) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        let c = self.lower_dec(other, scale)?;
+        let floor = v.div_euclid(10i128.pow(u32::from(s - scale)));
+        let bound = match cmp {
+            CmpOp::Eq => return Ok((self.eb.emit(L::Cmp { op: CmpOp::Ne, a: c, b: c }), ExprKind::Int)),
+            CmpOp::Ne => return Ok((self.eb.emit(L::Cmp { op: CmpOp::Eq, a: c, b: c }), ExprKind::Int)),
+            CmpOp::Lt | CmpOp::Ge => floor + 1,
+            CmpOp::Gt | CmpOp::Le => floor,
+        };
+        let val = i64::try_from(bound).map_err(|_| {
+            GnitzSqlError::Bind(format!(
+                "{} does not fit a DECIMAL of scale {scale}",
+                format_decimal(v, s)
+            ))
+        })?;
+        let k = self.eb.emit(L::LoadConst { val });
+        Ok((self.eb.emit(L::Cmp { op: cmp, a: c, b: k }), ExprKind::Int))
     }
 
     /// The comparison-or-arithmetic tail both binop paths end in: `out` is the

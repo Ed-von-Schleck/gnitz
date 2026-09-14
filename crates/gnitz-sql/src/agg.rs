@@ -3,10 +3,19 @@
 
 use crate::ast_util::agg_func_name;
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr, BinOp};
+use crate::ir::{BExpr, BinOp};
 use crate::types::has_scalar_register;
 use gnitz_core::{ColType, ColumnDef, Schema, TypeCode};
 use gnitz_wire::AggFunc as WireAggFunc;
+
+#[derive(Clone, Debug, Copy, PartialEq)]
+pub(crate) enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
 
 /// An aggregate's physical value op, and the count op its null-ness is read off
 /// when it has one. The one type gate every aggregate call goes through.
@@ -92,18 +101,14 @@ pub(crate) fn finalize_agg_bexpr<R>(value: BExpr<R>, count: Option<BExpr<R>>, fu
         return value;
     };
     if func == AggFunc::Avg {
-        // `* 1.0` forces float division; dividing by a zero count is NULL.
-        BExpr::BinOp(
-            Box::new(BExpr::BinOp(
-                Box::new(value),
-                BinOp::Mul,
-                Box::new(BExpr::LitFloat(1.0)),
-            )),
-            BinOp::Div,
-            Box::new(cnt),
-        )
+        // The cast makes the division a float one; dividing by a zero count is NULL.
+        let value = BExpr::Cast {
+            expr: Box::new(value),
+            to: ColType::of(TypeCode::F64),
+        };
+        BExpr::bin(value, BinOp::Div, cnt)
     } else {
-        let present = BExpr::BinOp(Box::new(cnt), BinOp::Ne, Box::new(BExpr::LitInt(0)));
+        let present = BExpr::bin(cnt, BinOp::Ne, BExpr::LitInt(0));
         BExpr::Case {
             branches: vec![(present, value)],
             else_: None,

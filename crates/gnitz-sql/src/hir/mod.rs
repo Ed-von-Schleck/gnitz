@@ -27,9 +27,10 @@ mod window;
 pub(crate) use create::{execute_alter_view, execute_create_view};
 pub use create::{plan_view, PlannedChain, ViewPlan};
 
+use crate::agg::AggFunc;
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr};
+use crate::ir::BExpr;
 use chain::{EmitPieces, ViewChain};
 use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode};
 use gnitz_wire::AggFunc as WireAggFunc;

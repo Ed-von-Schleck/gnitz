@@ -16,7 +16,7 @@ form is test_outer_join.py's.
 """
 from collections import Counter
 
-from _read import bag, scanned
+from _read import bag, rows, scanned
 
 _JOIN = "FROM orders JOIN customers ON orders.cid = customers.id"
 
@@ -108,3 +108,48 @@ def test_a_reduce_and_a_join_compose_in_either_order_through_churn(client, schem
             joined, lambda j: zones[j[2][1]], lambda rs: (sum(r[1] for r in rs),)), sql
         assert bag(scanned(client, sn, "star_distinct"), "grp") == Counter(
             {(zones[j[2][1]],): 1 for j in joined}), sql
+
+
+def test_a_computed_group_input_is_declared_as_the_value_it_computes(client, schema_name):
+    """A grouped view declares a column for each computed group key and aggregate
+    argument, and the declared type must be the value the expression computes: a
+    negation of a narrow integer lives in a 64-bit register (`-(-2^31)` leaves
+    INT, `-q` over an unsigned column goes negative), a cast to REAL computes a
+    double, and a narrowing cast is its target. Each view equals its ad-hoc
+    SELECT, which reads the register directly."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, q INT UNSIGNED NOT NULL, "
+        "i INT NOT NULL, x BIGINT NOT NULL)", schema_name=sn)
+    bodies = {
+        "neg_sum": ("SELECT g, SUM(-q) AS s FROM n GROUP BY g", ("g", "s")),
+        "neg_key": ("SELECT -i AS k, COUNT(*) AS c FROM n GROUP BY -i", ("k", "c")),
+        "real_sum": ("SELECT g, SUM(CAST(x AS REAL)) AS s FROM n GROUP BY g", ("g", "s")),
+        "narrow_key": ("SELECT CAST(x AS SMALLINT) AS k, COUNT(*) AS c FROM n GROUP BY CAST(x AS SMALLINT)",
+                       ("k", "c")),
+    }
+    for view, (body, _) in bodies.items():
+        client.execute_sql(f"CREATE VIEW {view} AS {body}", schema_name=sn)
+
+    def check(expected):
+        for view, (body, cols) in bodies.items():
+            got = bag(scanned(client, sn, view), *cols)
+            assert got == bag(rows(client, sn, body), *cols), view
+            assert got == expected[view], view
+
+    client.execute_sql(
+        "INSERT INTO n VALUES (1, 1, 4000000000, -2147483648, 5), (2, 1, 3, 7, 70000), "
+        "(3, 2, 10, -2147483648, -3)", schema_name=sn)
+    check({
+        "neg_sum": {(1, -4000000003): 1, (2, -10): 1},
+        "neg_key": {(2147483648, 2): 1, (-7, 1): 1},
+        "real_sum": {(1, 70005.0): 1, (2, -3.0): 1},
+        "narrow_key": {(5, 1): 1, (None, 1): 1, (-3, 1): 1},
+    })
+    client.execute_sql("DELETE FROM n WHERE id = 1", schema_name=sn)
+    check({
+        "neg_sum": {(1, -3): 1, (2, -10): 1},
+        "neg_key": {(2147483648, 1): 1, (-7, 1): 1},
+        "real_sum": {(1, 70000.0): 1, (2, -3.0): 1},
+        "narrow_key": {(None, 1): 1, (-3, 1): 1},
+    })

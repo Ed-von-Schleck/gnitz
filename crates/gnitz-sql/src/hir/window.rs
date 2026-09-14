@@ -43,13 +43,14 @@ use super::{
     as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, JoinType, ProjEntry, RelExpr, TopNKey,
 };
 use crate::agg::default_agg_name;
+use crate::agg::AggFunc;
 use crate::ast_util::{
     agg_func_from_name, classify_agg_shape, peel_nested, reject_fn_qualifiers, single_fn_name, unknown_function,
     Distinct,
 };
 use crate::bind::{bind_structural, LeafBinder};
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr, BinOp};
+use crate::ir::{BExpr, BinOp};
 use crate::validate::{reject_duplicate_projection_names, reject_float_key_of};
 use gnitz_core::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
@@ -614,10 +615,6 @@ struct Hoist<'a> {
     /// Subquery leaves, keyed by the relation they carry: `HirRef`'s equality
     /// never matches one, so they cannot be found by scanning `items`.
     by_sub: HashMap<*const RelExpr, ColId>,
-    /// Source columns, keyed by the id they were hoisted under — the `hoist`
-    /// return the first pass already computes, so the rebuild reads it back
-    /// rather than re-finding the entry by expression equality.
-    by_col: HashMap<ColId, ColId>,
 }
 
 impl<'a> Hoist<'a> {
@@ -631,7 +628,6 @@ impl<'a> Hoist<'a> {
             placeholders,
             items: Vec::new(),
             by_sub: HashMap::new(),
-            by_col: HashMap::new(),
         }
     }
 
@@ -656,31 +652,18 @@ impl<'a> Hoist<'a> {
     /// `e` with every source reference replaced by its `W` column: a column by
     /// its pass-through, a subquery leaf by the computed column evaluating it.
     fn refs(&mut self, e: &HirExpr) -> Result<HirExpr, GnitzSqlError> {
-        // `try_rebuild` takes a `Fn` and hoisting needs `&mut`, so every leaf is
-        // hoisted first and the rebuild reads the finished columns.
-        let mut pending: Vec<HirRef> = Vec::new();
-        e.for_each_ref(&mut |r| pending.push(r.clone()));
-        for r in pending {
-            match r {
-                HirRef::Col(id) if col_by_id(self.placeholders, id).is_some() => {}
-                HirRef::Col(id) => {
-                    let w = self.hoist(&BExpr::ColRef(HirRef::Col(id)));
-                    self.by_col.insert(id, w);
-                }
-                HirRef::Subquery(s) => {
-                    let key = Rc::as_ptr(&s.rel);
-                    if !self.by_sub.contains_key(&key) {
-                        let w = self.hoist(&BExpr::ColRef(HirRef::Subquery(s)));
-                        self.by_sub.insert(key, w);
-                    }
-                }
-            }
-        }
-        e.try_rebuild(&|r| -> Result<HirExpr, GnitzSqlError> {
+        e.try_rebuild(&mut |r| -> Result<HirExpr, GnitzSqlError> {
             let id = match r {
                 HirRef::Col(id) if col_by_id(self.placeholders, *id).is_some() => *id,
-                HirRef::Col(id) => *self.by_col.get(id).expect("every source reference was hoisted above"),
-                HirRef::Subquery(s) => self.by_sub[&Rc::as_ptr(&s.rel)],
+                HirRef::Col(_) => self.hoist(&BExpr::ColRef(r.clone())),
+                HirRef::Subquery(s) => match self.by_sub.get(&Rc::as_ptr(&s.rel)) {
+                    Some(&w) => w,
+                    None => {
+                        let w = self.hoist(&BExpr::ColRef(r.clone()));
+                        self.by_sub.insert(Rc::as_ptr(&s.rel), w);
+                        w
+                    }
+                },
             };
             Ok(BExpr::ColRef(HirRef::Col(id)))
         })
@@ -790,10 +773,10 @@ fn desugar(
         let on = keys
             .into_iter()
             .map(|(w_col, right_id)| {
-                BExpr::BinOp(
-                    Box::new(outer.col(w.pos[&w_col])),
+                BExpr::bin(
+                    outer.col(w.pos[&w_col]),
                     BinOp::Eq,
-                    Box::new(BExpr::ColRef(HirRef::Col(right_id))),
+                    BExpr::ColRef(HirRef::Col(right_id)),
                 )
             })
             .collect();
@@ -804,7 +787,7 @@ fn desugar(
     // The SELECT list and QUALIFY over the joined relation: a `W` reference
     // reads the outer side, a placeholder its window's value column.
     let remap = |e: &HirExpr| {
-        e.try_rebuild(&|r| -> Result<HirExpr, GnitzSqlError> {
+        e.try_rebuild(&mut |r| -> Result<HirExpr, GnitzSqlError> {
             let id = match r {
                 HirRef::Col(id) => *id,
                 HirRef::Subquery(_) => {
@@ -1025,7 +1008,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
     // same partition at or before it — `g2.O ≤lex g1.O` under each key's own
     // direction.
     let (g1, g2) = (Read::of(ids, &g), Read::of(ids, &g));
-    let cmp = |i: usize, op: BinOp| BExpr::BinOp(Box::new(g2.col(i)), op, Box::new(g1.col(i)));
+    let cmp = |i: usize, op: BinOp| BExpr::bin(g2.col(i), op, g1.col(i));
     let weak = |asc: bool| if asc { BinOp::Le } else { BinOp::Ge };
     let strict = |asc: bool| if asc { BinOp::Lt } else { BinOp::Gt };
     let mut on: Vec<HirExpr> = (0..np).map(|i| cmp(i, BinOp::Eq)).collect();
@@ -1035,8 +1018,8 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         let last = dirs.len() - 1;
         let mut lex = cmp(np + last, weak(dirs[last]));
         for (i, &asc) in dirs.iter().enumerate().rev().skip(1) {
-            let tie = BExpr::BinOp(Box::new(cmp(np + i, BinOp::Eq)), BinOp::And, Box::new(lex));
-            lex = BExpr::BinOp(Box::new(cmp(np + i, strict(asc))), BinOp::Or, Box::new(tie));
+            let tie = BExpr::bin(cmp(np + i, BinOp::Eq), BinOp::And, lex);
+            lex = BExpr::bin(cmp(np + i, strict(asc)), BinOp::Or, tie);
         }
         on.push(lex);
     }
@@ -1075,9 +1058,9 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
                     r_keys.push(g1.id(nkeys + gs[0]));
                 }
                 let (folded, _, _) = r_aggs.value(AggFunc::Sum, v2(gs[0]))?;
-                let before = BExpr::BinOp(Box::new(folded), BinOp::Sub, Box::new(g1.col(nkeys + gs[0])));
+                let before = BExpr::bin(folded, BinOp::Sub, g1.col(nkeys + gs[0]));
                 (
-                    BExpr::BinOp(Box::new(before), BinOp::Add, Box::new(BExpr::LitInt(1))),
+                    BExpr::bin(before, BinOp::Add, BExpr::LitInt(1)),
                     ColType::of(TypeCode::I64),
                     false,
                 )

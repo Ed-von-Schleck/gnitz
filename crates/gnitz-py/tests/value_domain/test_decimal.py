@@ -160,3 +160,22 @@ def test_two_decimals_meet_only_at_one_scale(client, priced):
     ):
         with pytest.raises(gnitz.GnitzError, match=message):
             client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=priced)
+
+
+def test_a_literal_is_the_decimal_it_spells(client, schema_name):
+    """A numeric literal carries every digit it was written with, not a float's
+    shortest print: a cell keeps digits past 17 and rounds from all of them, and
+    a comparison against a literal finer than the column is decided exactly —
+    no stored value equals it, and no scale-up of the column wraps."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE e (id BIGINT NOT NULL PRIMARY KEY, price DECIMAL(18, 2) NOT NULL); "
+        "CREATE TABLE f (id BIGINT NOT NULL PRIMARY KEY, price DECIMAL(18, 2) NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO e VALUES (1, 1234567890123456.78), (2, 0.1234567890123456789); "
+        "INSERT INTO f VALUES (1, 1.00), (2, 10.00)", schema_name=sn)
+    assert bag(scanned(client, sn, "e"), "id", "price") == {
+        (1, Decimal("1234567890123456.78")): 1, (2, Decimal("0.12")): 1}
+    assert bag(rows(client, sn, "SELECT id FROM f WHERE price = 1.000000000000000001")) == {}
+    assert bag(rows(client, sn, "SELECT price FROM f WHERE price < 1.000000000000000001")) == {
+        (Decimal("1.00"),): 1}

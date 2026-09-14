@@ -260,7 +260,7 @@ fn cell_to_py(py: Python<'_>, batch: &ZSetBatch, loc: ColumnLocator, ty: ColType
                 .unbind()
         }
         TypeCode::Decimal => py_decimal(py)?
-            .call1((format_decimal(gnitz_wire::read_signed_exact(b), ty.scale),))?
+            .call1((format_decimal(gnitz_wire::read_signed_exact(b).into(), ty.scale),))?
             .unbind(),
         // CPython validates the UTF-8 and raises `UnicodeDecodeError`.
         TypeCode::String => PyString::from_bytes(py, gnitz_wire::german_string_content(b, &batch.blob))?

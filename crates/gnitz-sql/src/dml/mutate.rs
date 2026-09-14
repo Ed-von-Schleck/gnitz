@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::ast_util::{classify_from, extract_ident_name, extract_table_name_and_alias, FromShape};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
-use crate::codec::pk_codec::{bound_num_literal, pack_pk_value, NumLit};
+use crate::codec::pk_codec::{bound_num_literal, pack_pk_value};
 use crate::dml::overlay::{buffered_net, present_rows};
 use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, rows_sink, AccessPlan, ReadBudget};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
@@ -17,6 +17,7 @@ use crate::error::GnitzSqlError;
 use crate::exec::residual::matching_indices;
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
+use crate::ir::NumLit;
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColumnDef, GnitzClient, Schema, TypeCode, WireConflictMode, ZSetBatch};
@@ -71,7 +72,7 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
     // cast to it, so the register written holds the stored integer.
     let literal = if target_ty.is_decimal() {
         expr.decimal_literal()
-            .and_then(|(v, s)| rescale(v as i128, s, target_ty.scale))
+            .and_then(|(v, s)| rescale(v, s, target_ty.scale))
             .map(i128::from)
     } else {
         bound_num_literal(expr).and_then(NumLit::to_i128)
@@ -95,7 +96,7 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
             // A SET value is written into a fixed-width integer or a string
             // column; an f64 register has no destination, and nothing downstream
             // can tell its bit pattern from an integer's.
-            _ if expr.infer_type(&schema.columns).is_float() => {
+            _ if expr.infer_ty(&schema.columns).tc.is_float() => {
                 return Err(GnitzSqlError::Unsupported(
                     "SET from a floating-point expression is not supported".to_string(),
                 ))

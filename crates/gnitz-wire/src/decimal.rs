@@ -45,6 +45,27 @@ pub fn parse_decimal_text(s: &str) -> Option<(i128, u8)> {
     Some((if neg { -v } else { v }, frac.len() as u8))
 }
 
+/// The decimal a SQL numeric literal spells, exponent included, as
+/// `(unscaled, scale)` at its smallest exact scale — `1.50` is `(15, 1)`.
+/// `None` past `i128` or 38 fractional digits.
+pub fn decimal_of_number_text(s: &str) -> Option<(i128, u8)> {
+    let (mantissa, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (s, 0),
+    };
+    let (mut v, scale) = parse_decimal_text(mantissa)?;
+    let mut scale = i32::from(scale).checked_sub(exp)?;
+    if scale < 0 {
+        v = v.checked_mul(10i128.checked_pow(scale.unsigned_abs())?)?;
+        scale = 0;
+    }
+    while scale > 0 && v % 10 == 0 {
+        v /= 10;
+        scale -= 1;
+    }
+    Some((v, u8::try_from(scale).ok().filter(|s| *s <= 38)?))
+}
+
 /// Text as the `i64` a column of scale `scale` stores, rounding a longer
 /// fraction half away from zero.
 pub fn parse_decimal(s: &str, scale: u8) -> Option<i64> {
@@ -52,9 +73,10 @@ pub fn parse_decimal(s: &str, scale: u8) -> Option<i64> {
     rescale(v, from, scale)
 }
 
-/// The text a stored value prints as — exactly `scale` fractional digits, so a
-/// column's values line up and round-trip through [`parse_decimal`].
-pub fn format_decimal(v: i64, scale: u8) -> String {
+/// The text a value at scale `scale` prints as — exactly `scale` fractional
+/// digits, so a column's values line up and round-trip through
+/// [`parse_decimal`].
+pub fn format_decimal(v: i128, scale: u8) -> String {
     let sign = if v < 0 { "-" } else { "" };
     let scale = scale as usize;
     // Padded to `scale + 1`, so the point always has a digit in front of it.
@@ -66,8 +88,7 @@ pub fn format_decimal(v: i64, scale: u8) -> String {
     format!("{sign}{int}.{frac}")
 }
 
-/// The decimal a float spells at the scale of its shortest round-trip text —
-/// which for a literal a user wrote is the literal itself, digit for digit.
+/// The decimal a float spells at the scale of its shortest round-trip print.
 /// `None` when it is not finite or has more digits than `i64` holds.
 pub fn decimal_of_f64(v: f64) -> Option<(i64, u8)> {
     if !v.is_finite() {

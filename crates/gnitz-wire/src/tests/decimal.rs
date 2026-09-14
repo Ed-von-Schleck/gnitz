@@ -24,7 +24,7 @@ fn text_round_trips_at_the_column_scale() {
         (0, 3, "0.000"),
         (-1234, 1, "-123.4"),
     ] {
-        assert_eq!(format_decimal(v, scale), want);
+        assert_eq!(format_decimal(v.into(), scale), want);
         assert_eq!(parse_decimal(want, scale), Some(v));
     }
 }
@@ -51,6 +51,25 @@ fn a_float_literal_is_the_decimal_it_was_written_as() {
     assert_eq!(decimal_of_f64(1e30), None);
 }
 
+/// A numeric literal's text is the decimal it spells, exponent applied, at its
+/// smallest exact scale — digits no float print could carry included.
+#[test]
+fn a_number_text_is_the_decimal_it_spells() {
+    for (text, want) in [
+        ("1.10", Some((11, 1))),
+        ("1.0", Some((1, 0))),
+        ("0.0000000100", Some((1, 8))),
+        ("1.5e3", Some((1500, 0))),
+        ("25e-1", Some((25, 1))),
+        ("1234567890123456.78", Some((123456789012345678, 2))),
+        ("0.1234567890123456789", Some((1234567890123456789, 19))),
+        ("1e39", None),
+        ("1e-2147483648", None),
+    ] {
+        assert_eq!(decimal_of_number_text(text), want, "{text}");
+    }
+}
+
 /// `format_decimal` is the inverse of `parse_decimal` at the same scale, over
 /// every scale a column may declare and at the edges of `i64` — the property
 /// the Python `Decimal(str)` construction and every error message depend on.
@@ -58,7 +77,7 @@ fn a_float_literal_is_the_decimal_it_was_written_as() {
 fn format_and_parse_are_inverse_at_every_scale() {
     for scale in 0..=MAX_DECIMAL_SCALE {
         for v in [0, 1, -1, 5, -5, 999, -999, i64::MAX, i64::MIN + 1] {
-            let text = format_decimal(v, scale);
+            let text = format_decimal(v.into(), scale);
             assert_eq!(parse_decimal(&text, scale), Some(v), "{v} at scale {scale} → {text:?}");
             // Exactly `scale` fractional digits, so a column's values line up.
             let frac = text.split_once('.').map_or(0, |(_, f)| f.len());
@@ -67,5 +86,5 @@ fn format_and_parse_are_inverse_at_every_scale() {
         }
     }
     // `i64::MIN` has no positive magnitude; it still prints and re-reads.
-    assert_eq!(parse_decimal(&format_decimal(i64::MIN, 4), 4), Some(i64::MIN));
+    assert_eq!(parse_decimal(&format_decimal(i64::MIN.into(), 4), 4), Some(i64::MIN));
 }

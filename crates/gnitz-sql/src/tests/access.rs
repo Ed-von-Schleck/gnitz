@@ -463,9 +463,16 @@ fn every_pk_type_routes_to_one_packed_key() {
 #[test]
 fn parse_range_cut_saturates() {
     use Cut::{After, Before};
-    // The wide (digit-string) arm exercises the same value classification the
-    // native arm takes, so one literal shape covers both.
-    let ck = |tc, s, neg, mk: fn(u128) -> Cut| parse_range_cut(tc, NumLit::Wide(s, neg), mk);
+    let ck = |tc, s: &str, neg, mk: fn(u128) -> Cut| {
+        parse_range_cut(
+            tc,
+            NumLit {
+                mag: s.parse().expect("a digit run"),
+                neg,
+            },
+            mk,
+        )
+    };
     assert_eq!(ck(TypeCode::I32, "5", false, Before), Some(Before(5)));
     assert_eq!(ck(TypeCode::I32, "5", false, After), Some(After(5)));
     assert_eq!(

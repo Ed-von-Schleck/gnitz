@@ -41,7 +41,7 @@ pub(crate) fn multi_null_filter_prog(
     let op = if want_null { BinOp::Or } else { BinOp::And };
     let mut expr = leaf(cols[0]);
     for &c in &cols[1..] {
-        expr = BoundExpr::BinOp(Box::new(expr), op, Box::new(leaf(c)));
+        expr = BoundExpr::bin(expr, op, leaf(c));
     }
     compile_bound_expr_to_program(&expr, coldefs)
 }

@@ -1,6 +1,7 @@
 use super::*;
+use crate::agg::AggFunc;
 use crate::agg::{agg_col_def, finalize_agg_bexpr};
-use crate::ir::{AggFunc, BExpr, BinOp};
+use crate::ir::{BExpr, BinOp};
 use crate::test_support::col_def;
 use gnitz_core::{PkColumn, TypeCode};
 use gnitz_wire::AggDescriptor;
@@ -133,7 +134,7 @@ fn null_bits(b: &ZSetBatch, pi: usize) -> Vec<bool> {
 }
 
 fn gt(ci: usize, v: i64) -> BoundExpr {
-    BExpr::BinOp(Box::new(BExpr::ColRef(ci)), BinOp::Gt, Box::new(BExpr::LitInt(v)))
+    BExpr::bin(BExpr::ColRef(ci), BinOp::Gt, BExpr::LitInt(v))
 }
 
 /// The partial mirrors what `fetch_bound` concatenates: replies in worker
@@ -321,7 +322,7 @@ fn having_compacts_before_an_identity_finalize() {
 fn a_projecting_finalize_runs_the_map() {
     let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
     let partial = partial_schema(&[2], &specs);
-    let plus_one = BExpr::BinOp(Box::new(BExpr::ColRef(2)), BinOp::Add, Box::new(BExpr::LitInt(1)));
+    let plus_one = BExpr::bin(BExpr::ColRef(2), BinOp::Add, BExpr::LitInt(1));
     let f = finish_of(
         &partial,
         &specs,

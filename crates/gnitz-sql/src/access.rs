@@ -14,7 +14,8 @@
 //! Residuals are **borrows** of the caller's bound WHERE — at most one candidate
 //! is ever used, so only the winner's residual is cloned or compiled.
 
-use crate::codec::pk_codec::{bound_key_literal, col_key_literal, pack_num, BoundLit, NumLit};
+use crate::codec::pk_codec::{bound_key_literal, col_key_literal, pack_num, BoundLit};
+use crate::ir::NumLit;
 use crate::ir::{BExpr, BinOp, BoundExpr};
 use gnitz_core::{
     opk_key_cols, opk_key_packed, Cut, FixedInt, IndexMeta, PkBuf, PkColList, RangeDescriptor, Schema, TypeCode,
@@ -229,10 +230,10 @@ struct RangeEndEntry {
 /// an in-range value (`Cut::After` above the literal's duplicate group,
 /// `Cut::Before` below). A literal past the type's min/max SATURATES to that edge
 /// rather than wrapping; a type carrying no ordered range gives `None`.
-fn parse_range_cut(tc: TypeCode, lit: NumLit<'_>, mk: fn(u128) -> Cut) -> Option<Cut> {
+fn parse_range_cut(tc: TypeCode, lit: NumLit, mk: fn(u128) -> Cut) -> Option<Cut> {
     // U128: full unsigned range — saturation is impossible (an i128 cannot
-    // represent its upper half), and a literal past u128::MAX fails the parse,
-    // keeping the conjunct a residual. `pack_num` is exactly that classification,
+    // represent its upper half), and a literal past u128::MAX binds as no
+    // integer literal at all, keeping the conjunct a residual. `pack_num` is exactly that classification,
     // and declines the negative literal a U128 column cannot hold.
     if tc == TypeCode::U128 {
         return pack_num(tc, lit).map(mk);

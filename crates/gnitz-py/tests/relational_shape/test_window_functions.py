@@ -11,7 +11,7 @@ Run with GNITZ_WORKERS=4 — the desugared joins exchange.
 """
 from collections import Counter
 
-from _read import bag, scanned
+from _read import bag, rows, scanned
 
 
 def _agg(kind, vals):
@@ -204,3 +204,37 @@ def test_every_window_moves_with_the_data(client, schema_name):
         nr = _rank(kept, ["parity"], [("a2", False)])
         check("named", ("id", "parity", "a", "s", "r"),
               [(x["id"], x["parity"], x["a"], ns[x["id"]], nr[x["id"]]) for x in kept])
+
+
+def test_a_computed_window_argument_or_key_is_declared_as_the_value_it_computes(client, schema_name):
+    """A window hoists each computed argument and key into a column of its own,
+    declared as the value it computes: `-q` over an unsigned column is a negative
+    64-bit value, a cast to REAL a double. A date difference over a NOT NULL date
+    is a provably NOT NULL key — a date literal is never NULL — and partitions
+    exactly as the date does."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, q INT UNSIGNED NOT NULL, "
+        "x BIGINT NOT NULL, d DATE NOT NULL); "
+        "CREATE VIEW neg AS SELECT id, g, SUM(-q) OVER (PARTITION BY g) AS s FROM w; "
+        "CREATE VIEW reals AS SELECT id, g, SUM(CAST(x AS REAL)) OVER (PARTITION BY g) AS s FROM w; "
+        "CREATE VIEW by_day AS SELECT id, COUNT(*) OVER (PARTITION BY d - DATE '2020-01-01') AS c FROM w; "
+        "CREATE VIEW by_d AS SELECT id, COUNT(*) OVER (PARTITION BY d) AS c FROM w", schema_name=sn)
+
+    def check():
+        for view, agg in (("neg", "SUM(-q)"), ("reals", "SUM(CAST(x AS REAL))")):
+            per_group = {g: s for (g, s) in bag(rows(client, sn, f"SELECT g, {agg} AS s FROM w GROUP BY g"), "g", "s")}
+            got = bag(scanned(client, sn, view), "id", "g", "s")
+            assert got == {(i, g, per_group[g]): 1 for (i, g, _) in got}, view
+            assert {g for (_, g, _) in got} == set(per_group), view
+        assert bag(scanned(client, sn, "by_day"), "id", "c") == bag(scanned(client, sn, "by_d"), "id", "c")
+
+    client.execute_sql(
+        "INSERT INTO w VALUES (1, 1, 4000000000, 5, DATE '2020-01-03'), (2, 1, 3, -7, DATE '2020-01-03'), "
+        "(3, 2, 10, 70000, DATE '2019-12-31')", schema_name=sn)
+    check()
+    assert bag(scanned(client, sn, "neg"), "id", "s") == {(1, -4000000003): 1, (2, -4000000003): 1, (3, -10): 1}
+    assert bag(scanned(client, sn, "by_day"), "id", "c") == {(1, 2): 1, (2, 2): 1, (3, 1): 1}
+    client.execute_sql("UPDATE w SET d = DATE '2019-12-31', g = 2 WHERE id = 2", schema_name=sn)
+    check()
+    assert bag(scanned(client, sn, "by_day"), "id", "c") == {(1, 1): 1, (2, 2): 1, (3, 2): 1}

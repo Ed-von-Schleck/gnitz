@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::GnitzSqlError;
-use crate::test_support::parse_expr_sql;
+use crate::test_support::{lit, parse_expr_sql};
 use gnitz_core::TypeCode;
 
 /// One row per operand position `bind_structural` recurses into. A position
@@ -153,31 +153,41 @@ fn a_wildcard_expands_through_its_modifiers() {
 // The one literal / constant decoder
 // ---------------------------------------------------------------------------
 
-fn num(n: &str) -> Result<crate::ir::BoundExpr, GnitzSqlError> {
-    bind_literal(&Value::Number(n.into(), false))
-}
-
 #[test]
 fn bind_literal_wide_int_to_litwide() {
     // u64::MAX overflows i64 and is non-fractional → bound faithfully as a
-    // `LitWide` carrying the raw magnitude string (not coerced to f64, not an
-    // error). The recognizer parses it byte-exactly; the un-servable case
-    // rejects at the compile boundary.
-    match num("18446744073709551615") {
-        Ok(BExpr::LitWide(s)) => assert_eq!(s, "18446744073709551615"),
+    // `LitWide` magnitude (not coerced to f64, not an error). The recognizer
+    // packs it byte-exactly; the un-servable case rejects at the compile
+    // boundary.
+    match lit("18446744073709551615") {
+        BExpr::LitWide(n) => assert_eq!(n, NumLit { mag: u64::MAX.into(), neg: false }),
         other => panic!("expected LitWide, got {other:?}"),
     }
+    // Past `u128` an integer spelling is the float a DOUBLE cell holds.
+    assert!(matches!(
+        lit("340282366920938463463374607431768211456"),
+        BExpr::LitFloat { .. }
+    ));
 }
 
 #[test]
 fn bind_literal_accepts_fractional_and_exponent_floats() {
-    assert!(matches!(num("1.5"), Ok(BExpr::LitFloat(_))));
-    assert!(matches!(num("1e3"), Ok(BExpr::LitFloat(_))));
+    assert!(matches!(lit("1.5"), BExpr::LitFloat { v: 1.5, dec: Some((15, 1)) }));
+    assert!(matches!(lit("1e3"), BExpr::LitFloat { dec: Some((1000, 0)), .. }));
+}
+
+/// A written temporal constant is the same literal an expression binds, so a
+/// VALUES cell and a WHERE operand cannot disagree on what `DATE '…'` is.
+#[test]
+fn bind_constant_binds_a_date_to_its_temporal_literal() {
+    let c = bind_constant(&parse_expr_sql("DATE '2020-01-01'")).expect("a constant");
+    assert!(matches!(c.lit, BExpr::LitTemporal { tc: TypeCode::Date, v: 18262 }));
+    assert!(!c.negated);
 }
 
 #[test]
 fn bind_literal_accepts_in_range_integer() {
-    assert!(matches!(num("42"), Ok(BExpr::LitInt(42))));
+    assert!(matches!(lit("42"), BExpr::LitInt(42)));
 }
 
 /// A constant position peels parentheses and one sign, in either order, and

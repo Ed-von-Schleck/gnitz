@@ -4,9 +4,11 @@
 
 use std::convert::Infallible;
 
+use crate::agg::AggFunc;
 use crate::error::{reject_if, GnitzSqlError};
-use crate::ir::{AggFunc, BExpr};
+use crate::ir::{BExpr, NumLit};
 use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_wire::decimal::decimal_of_number_text;
 use sqlparser::ast::{
     ExcludeSelectItem, Expr, RenameSelectItem, SelectItem, UnaryOperator, Value, WildcardAdditionalOptions,
 };
@@ -89,21 +91,23 @@ pub(crate) fn group_by_is_present(group_by: &sqlparser::ast::GroupByExpr) -> boo
 }
 
 /// SQL literal → `BExpr`. Leaf-free (no `ColRef` produced), so it is generic
-/// over `R` without a `Clone` bound. A magnitude past `i64` binds to `LitWide`,
-/// for the reason [`BExpr::LitWide`] states.
+/// over `R` without a `Clone` bound. An integer past `i64` binds to `LitWide`
+/// up to `u128::MAX`; a fraction, an exponent or a longer integer to `LitFloat`.
 pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
     match v {
         Value::Null => Ok(BExpr::LitNull),
         Value::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
-                Ok(BExpr::LitInt(i))
-            } else if n.contains(['.', 'e', 'E']) {
-                n.parse::<f64>()
-                    .map(BExpr::LitFloat)
-                    .map_err(|_| GnitzSqlError::Plan(format!("invalid number literal: {n}")))
-            } else {
-                Ok(BExpr::LitWide(n.clone()))
+                return Ok(BExpr::LitInt(i));
             }
+            if n.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(mag) = n.parse::<u128>() {
+                    return Ok(BExpr::LitWide(NumLit { mag, neg: false }));
+                }
+            }
+            n.parse::<f64>()
+                .map(|v| BExpr::LitFloat { v, dec: decimal_of_number_text(n) })
+                .map_err(|_| GnitzSqlError::Plan(format!("invalid number literal: {n}")))
         }
         Value::SingleQuotedString(s) => Ok(BExpr::LitStr(s.clone())),
         _ => Err(GnitzSqlError::Unsupported(format!(
@@ -160,8 +164,9 @@ impl std::fmt::Display for Constant {
         let sign = if self.negated { "-" } else { "" };
         match &self.lit {
             BExpr::LitInt(v) => write!(f, "{sign}{v}"),
-            BExpr::LitFloat(v) => write!(f, "{sign}{v}"),
-            BExpr::LitWide(s) => write!(f, "{sign}{s}"),
+            BExpr::LitFloat { v, .. } => write!(f, "{sign}{v}"),
+            BExpr::LitWide(n) => write!(f, "{sign}{n}"),
+            BExpr::LitTemporal { v, .. } => write!(f, "{v}"),
             BExpr::LitStr(s) => write!(f, "'{s}'"),
             _ => write!(f, "NULL"),
         }
@@ -184,8 +189,11 @@ pub(crate) fn bind_constant(e: &Expr) -> Result<Constant, GnitzSqlError> {
     };
     // A temporal literal is already the integer its column stores; a sign over
     // one is refused below like a sign over a string.
-    if let (None, Some((_, v))) = (sign, temporal_constant(inner)?) {
-        return Ok(Constant { lit: BExpr::LitInt(v), negated: false });
+    if let (None, Some((tc, v))) = (sign, temporal_constant(inner)?) {
+        return Ok(Constant {
+            lit: BExpr::LitTemporal { tc, v },
+            negated: false,
+        });
     }
     let Expr::Value(vws) = inner else {
         return Err(GnitzSqlError::Unsupported(format!(
@@ -209,7 +217,7 @@ pub(crate) fn expr_usize_literal(e: &Expr, what: &str) -> Result<usize, GnitzSql
     match &c.lit {
         // `bind_literal` yields the magnitude, so an unnegated `LitInt` is ≥ 0.
         BExpr::LitInt(n) if !c.negated => Ok(*n as usize),
-        BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitWide(_) => Err(GnitzSqlError::Unsupported(format!(
+        BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::Unsupported(format!(
             "{what} must be a non-negative integer literal, got '{c}'"
         ))),
         _ => Err(not_a_literal()),

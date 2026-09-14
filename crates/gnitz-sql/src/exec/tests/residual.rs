@@ -1,6 +1,6 @@
 use super::*;
 use crate::ir::BinOp;
-use crate::test_support::{batch_2col, compound_schema_u64_u64, pk_schema, two_col, uuid_schema_payload};
+use crate::test_support::{batch_2col, compound_schema_u64_u64, lit, pk_schema, two_col, uuid_schema_payload};
 use gnitz_core::{BatchAppender, TypeCode};
 
 /// Which rows `pred` selects — the real path (fold → compile → adapter →
@@ -9,12 +9,8 @@ fn matches(pred: &BoundExpr, batch: &ZSetBatch, schema: &Schema) -> Vec<usize> {
     matching_indices(&[pred], batch, schema).expect("residual must compile")
 }
 
-fn binop(l: BoundExpr, op: BinOp, r: BoundExpr) -> BoundExpr {
-    BoundExpr::BinOp(Box::new(l), op, Box::new(r))
-}
-
 fn eq(col: usize, v: i64) -> BoundExpr {
-    binop(BoundExpr::ColRef(col), BinOp::Eq, BoundExpr::LitInt(v))
+    BoundExpr::bin(BoundExpr::ColRef(col), BinOp::Eq, BoundExpr::LitInt(v))
 }
 
 /// One row: PK `pk`, a single zero payload cell. The shape every PK-addressing
@@ -135,9 +131,9 @@ fn float_payload_residual_filters() {
     ] {
         let schema = two_col(tc);
         let batch = batch_2col(bytes, tc, 0);
-        let gt = binop(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitFloat(0.5));
+        let gt = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, lit("0.5"));
         assert_eq!(matches(&gt, &batch, &schema), vec![0], "{tc:?} > 0.5");
-        let lt = binop(BoundExpr::ColRef(1), BinOp::Lt, BoundExpr::LitFloat(0.5));
+        let lt = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Lt, lit("0.5"));
         assert!(matches(&lt, &batch, &schema).is_empty(), "{tc:?} < 0.5");
     }
 }
@@ -151,7 +147,7 @@ fn string_column_residual_filters() {
     for (i, s) in ["alpha", "beta"].iter().enumerate() {
         app.add_row(i as u128 + 1, 1).str_val(s);
     }
-    let pred = binop(BoundExpr::ColRef(1), BinOp::Eq, BoundExpr::LitStr("beta".to_string()));
+    let pred = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Eq, BoundExpr::LitStr("beta".to_string()));
     assert_eq!(matches(&pred, &batch, &schema), vec![1]);
 }
 
