@@ -243,7 +243,7 @@ impl Table {
             table.resumed_from_checkpoint = rederived;
         } else if rederived {
             // So a later re-open cannot re-peek what this one rejected.
-            let _ = std::fs::remove_file(&path);
+            table.unlink_manifest();
         }
         table.shard_index.gc_orphans();
 
@@ -257,10 +257,10 @@ impl Table {
         self.memtable.set_budget(budget);
     }
 
-    /// The highest tick round this delta store's capacity sweep has dropped.
-    /// See [`ShardIndex::dropped_through`].
-    pub(crate) fn dropped_through(&self) -> u64 {
-        self.shard_index.dropped_through()
+    /// The highest key this store's capacity sweep has dropped.
+    /// See [`ShardIndex::dropped_max`].
+    pub(crate) fn dropped_max(&self) -> PkBuf {
+        self.shard_index.dropped_max()
     }
 
     /// Whether a read of this store can meet a skeleton row it has to hydrate.
@@ -313,21 +313,20 @@ impl Table {
         let _ = std::fs::remove_file(self.manifest_full_path());
     }
 
-    /// Publish `schema` across this store (any column ALTER): re-open every
-    /// registered shard under it, then install the result.
-    ///
-    /// The re-open runs first and mutates nothing, so a failure leaves the store
-    /// entirely on the old schema, never half-widened where a NULL could
-    /// consolidate against a real `0`.
-    /// `cached_full_scan` was materialized under the old column set, so it is
-    /// dropped either way.
+    /// Publish `schema` across this store (any column ALTER). All-or-nothing:
+    /// only the shard index's swap can fail, and it runs first.
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
-        let staged = self.shard_index.reopen_all(&schema)?;
+        self.shard_index.swap_schema(schema)?;
         self.memtable.widen_runs(&schema);
         self.ram_tier.widen_runs(&schema);
-        self.shard_index.install_reopened(staged, schema);
         self.cached_full_scan.set(None);
         Ok(())
+    }
+
+    /// Never spill again: a process that holds this store as a read replica of
+    /// another process's directory must not write into it.
+    pub(crate) fn hold_in_ram(&mut self) {
+        self.ram_tier.set_budget(usize::MAX);
     }
 
     // ------------------------------------------------------------------
@@ -404,18 +403,12 @@ impl Table {
     }
 
     /// The heap-resident runs that can hold a key in `bound` — `None` taking
-    /// them all, an inclusive `[start, end]` (open above at `None`) pruning by
-    /// each run's own PK range.
+    /// them all, an inclusive `[lo, hi]` pruning by each run's own PK range.
     ///
     /// No guard partitions these runs, so what the prune is worth is the data's
     /// to say: a monotone key (a delta store's `_tick`-led PK, a `SERIAL`) drops
     /// most runs, a hashed one drops none.
-    fn mem_runs(&self, bound: Option<(&[u8], Option<&[u8]>)>) -> impl Iterator<Item = Run> + '_ {
-        let stride = self.shard_index.schema.pk_stride();
-        let bound = bound.map(|(start, end)| {
-            let hi = end.map_or_else(|| PkBuf::max(stride), PkBuf::from_bytes);
-            (PkBuf::from_bytes(start), hi)
-        });
+    fn mem_runs(&self, bound: Option<(PkBuf, PkBuf)>) -> impl Iterator<Item = Run> + '_ {
         let [memtable, ram_tier] = self.ram_tiers();
         memtable
             .runs()
@@ -463,12 +456,22 @@ impl Table {
     /// meaning the top of the key space, and **unpositioned** — every caller
     /// seeks or probes within the bound it named.
     ///
-    /// The gather over-approximates on both tiers (a whole guard for one key, a
-    /// whole run for one key it straddles), so a half-open `end` is safe to pass.
+    /// Both bounds are exactly `pk_stride` OPK bytes. The gather over-approximates
+    /// on both tiers, so a half-open `end` is safe to pass.
     pub(crate) fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
+        let stride = self.shard_index.schema.pk_stride();
+        debug_assert_eq!(start.len(), stride, "open_cursor_in_range: start is not pk_stride wide");
+        debug_assert!(
+            end.is_none_or(|e| e.len() == stride),
+            "open_cursor_in_range: end is not pk_stride wide",
+        );
+        let (lo, hi) = (
+            PkBuf::from_bytes(start),
+            end.map_or_else(|| PkBuf::max(stride), PkBuf::from_bytes),
+        );
         let runs = self
-            .mem_runs(Some((start, end)))
-            .chain(self.shard_index.shard_arcs_in_range(start, end).map(Run::Shard));
+            .mem_runs(Some((lo, hi)))
+            .chain(self.shard_index.shard_arcs_in_range(lo, hi).map(Run::Shard));
         read_cursor::from_runs_unpositioned(runs, self.shard_index.schema, self.mem_run_count())
     }
 
@@ -610,18 +613,8 @@ impl Table {
     // Compaction
     // ------------------------------------------------------------------
 
-    /// Run L0→L1+ compaction if the disk tier crossed its threshold. No manifest
-    /// publish and no dir fsync happen here — the barrier is the sole
-    /// manifest-publish point, and it fsyncs everything the new manifest
-    /// references. Compaction only swaps the in-memory index and appends the
-    /// superseded inputs to `pending_deletions`.
-    ///
-    /// The superseded inputs are not unlinked here for a store that publishes a
-    /// manifest: unlinking mid-epoch would strand the last-published one over
-    /// deleted files, so `flush_barrier` drains them once it has republished over
-    /// the compacted index. A fed view's delta store publishes none and is in
-    /// neither checkpoint round, so it unlinks at the end of each compaction
-    /// instead — see the shard index's own `ShardBudget::Drop`.
+    /// Run L0→L1+ compaction if the disk tier crossed its threshold. Publishes no
+    /// manifest: the barrier is the sole publish point.
     pub(crate) fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());
@@ -639,10 +632,11 @@ impl Table {
 
 /// Where `key`'s matching rows begin in a PK-sorted RAM-tier run, or `None` when
 /// it holds none — the run's own PK range rejects most keys before the binary
-/// search runs, and the equality test rejects the rest.
+/// search runs, and the equality test rejects the rest. A `RunSet` never stores
+/// an empty run.
 fn pk_match_start(run: &Batch, key: &[u8]) -> Option<usize> {
     let count = run.count;
-    if count == 0 || !pk_in_range(run.get_pk_bytes(0), run.get_pk_bytes(count - 1), key) {
+    if !pk_in_range(run.get_pk_bytes(0), run.get_pk_bytes(count - 1), key) {
         return None;
     }
     let start = run.find_lower_bound_bytes(key);

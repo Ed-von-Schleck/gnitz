@@ -4,9 +4,7 @@ use super::super::shard_file;
 use super::*;
 use crate::schema::key::probe_key;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::test_support::{
-    make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_only_schema, pk_payload_schema,
-};
+use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_payload_schema};
 
 /// Test-only adapters: production budgets a store at construction and reads its
 /// manifest in `Table::new`, where a case here does both against a live index.
@@ -426,9 +424,8 @@ fn test_try_cleanup() {
     idx.pending_deletions
         .push(dir.path().join("nonexistent.db").to_str().unwrap().to_string());
 
-    let deleted = idx.try_cleanup();
-    // All 3 should count as deleted (2 real + 1 NotFound)
-    assert_eq!(deleted, 3);
+    // A missing file counts as deleted, so nothing stays queued.
+    idx.try_cleanup();
     assert!(idx.pending_deletions.is_empty());
     assert!(!std::path::Path::new(&path1).exists());
     assert!(!std::path::Path::new(&path2).exists());
@@ -436,7 +433,7 @@ fn test_try_cleanup() {
 
 /// Every shard the index registers is unsynced until a barrier sweeps it:
 /// spills on the way in, compaction outputs on the way out, and the inputs a
-/// compaction consumed drop out (they move to `pending_deletions`).
+/// compaction consumed drop out (an unpublished input is unlinked).
 #[test]
 fn test_unsynced_tracking_register_prune_clear() {
     let dir = tempfile::tempdir().unwrap();
@@ -456,10 +453,11 @@ fn test_unsynced_tracking_register_prune_clear() {
     assert!(idx.should_compact());
     idx.run_compact().unwrap();
     assert!(
-        !idx.pending_deletions.is_empty(),
-        "compacted inputs queued for deletion"
+        idx.pending_deletions.is_empty(),
+        "an unpublished input does not wait for the barrier"
     );
     for p in &spills {
+        assert!(!std::path::Path::new(p).exists(), "unpublished input {p} is unlinked");
         assert!(
             !idx.unsynced_paths().any(|q| q == p),
             "consumed input {p} must leave the unsynced set"
@@ -501,9 +499,11 @@ fn reload_and_widen_owe_no_sweep() {
         ],
         &[0],
     );
-    let staged = idx.reopen_all(&wide).unwrap();
-    assert_eq!(staged.len(), 3, "a payload widen re-opens every shard");
-    idx.install_reopened(staged, wide);
+    idx.swap_schema(wide).unwrap();
+    assert!(
+        idx.all_entries().all(|e| e.shard.col_regions.len() == 2),
+        "a payload widen re-maps every shard"
+    );
     assert!(idx.unsynced_paths().next().is_none(), "a re-mmap moves no durability");
 }
 
@@ -587,7 +587,7 @@ fn a_vertical_does_not_lose_keys_below_the_destination_guard() {
         seed_guard(&mut idx, 0, gk(100), &path, 100);
     }
 
-    // L1 guard at key=500: 1 shard (so worst_guard picks key=100)
+    // L1 guard at key=500: 1 shard
     {
         let path = write_test_shard(dir.path(), "high.db", &[500], &[5000]);
         seed_guard(&mut idx, 0, gk(500), &path, 50);
@@ -690,13 +690,8 @@ fn a_vertical_bands_its_source_at_the_destination_partition() {
     assert_all_found(&idx, src_pks.into_iter().chain(dest_pks));
 }
 
-/// Regression: two vertical compactions that select different worst guards
-/// routing to *disjoint* destination guards, both topping at the same
-/// `max_lsn`, must emit distinct output basenames. Without the per-call
-/// `compact_seq` + destination-guard-key naming, both calls would emit the
-/// same name (shared lsn tag + positional loop index), the second rename
-/// would clobber the first call's live shard, and a reload would lose that
-/// guard's key range.
+/// Verticals into disjoint destination guards at the same `max_lsn` name their
+/// outputs apart, so neither rename clobbers the other's live shard.
 #[test]
 fn test_vertical_disjoint_guards_no_name_collision() {
     let dir = tempfile::tempdir().unwrap();
@@ -715,9 +710,8 @@ fn test_vertical_disjoint_guards_no_name_collision() {
         seed_guard(&mut idx, 0, gk(5000), &p, 100);
     }
     // L2 pre-seed: guard gk(100) (keys 250…) and guard gk(5000) (keys 6000…)
-    // at the same max_lsn, so both vertical calls compute the identical
-    // `vert_max_lsn` — the pre-fix collision tag. Stable-sized, so the
-    // trailing rebalance keeps them two guards.
+    // at the same max_lsn. Stable-sized, so the trailing rebalance keeps them
+    // two guards.
     let mut l2_pks = Vec::new();
     for (name, base, key) in [("l2a.db", 250u64, gk(100)), ("l2b.db", 6000, gk(5000))] {
         let (p, pks) = write_stable_shard(dir.path(), name, base);
@@ -835,7 +829,7 @@ fn gc_orphans_removes_exactly_the_unreferenced_files_of_its_own_table() {
         std::fs::write(dir.path().join(name), b"x").unwrap();
     }
 
-    assert_eq!(idx.gc_orphans(), doomed.len());
+    idx.gc_orphans();
 
     let mut survivors: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -863,13 +857,13 @@ fn gc_orphans_on_an_empty_index_removes_every_shard_of_its_table() {
     let stray = dir.path().join(naming::spill_shard_name(42, 7));
     std::fs::write(&stray, b"orphan").unwrap();
 
-    assert_eq!(idx.gc_orphans(), 1);
+    idx.gc_orphans();
     assert!(!stray.exists());
 }
 
-/// Golden values for the single-PK probe range gate and the L0 sort order.
+/// Golden values for the single-PK probe range gate.
 #[test]
-fn test_single_pk_probe_and_sort_golden() {
+fn test_single_pk_probe_golden() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
 
@@ -884,45 +878,19 @@ fn test_single_pk_probe_and_sort_golden() {
     assert!(probe(&e_lo, &20u64.to_be_bytes()).is_some());
     assert!(probe(&e_lo, &25u64.to_be_bytes()).is_none(), "25 outside [10,20]");
     assert!(probe(&e_hi, &5u64.to_be_bytes()).is_none(), "5 below [30,40]");
-
-    // L0 sort orders by pk_min, empty entries last (golden order).
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
-    let p_empty = write_test_shard(dir.path(), "empty.db", &[], &[]);
-    idx.add_unsynced_shard(&p_hi, 1).unwrap();
-    idx.add_unsynced_shard(&p_lo, 1).unwrap();
-    idx.add_unsynced_shard(&p_empty, 1).unwrap();
-    let order: Vec<bool> = idx.l0.iter().map(|e| e.is_empty()).collect();
-    // pk_min holds OPK bytes; widen_pk_be recovers the native U64 value.
-    let pk_min_val = |e: &ShardEntry| {
-        let b = e.pk_min.pk_bytes();
-        gnitz_wire::widen_pk_be(b)
-    };
-    assert_eq!(pk_min_val(&idx.l0[0]), 10, "lowest pk_min sorts first");
-    assert_eq!(pk_min_val(&idx.l0[1]), 30);
-    assert_eq!(order, vec![false, false, true], "empty entry sinks last");
 }
 
-/// Empty-shard sentinel: is_empty fails every range check under both
-/// a single-PK and a synthetic compound schema, without ever calling
-/// get_pk_bytes on a count == 0 shard.
+/// Every shard writer skips an empty output, so a zero-row file can only be
+/// damage, and the open refuses it rather than register an entry with no
+/// bounds.
 #[test]
-fn test_empty_shard_sentinel() {
+fn a_zero_row_shard_is_refused_at_open() {
     let dir = tempfile::tempdir().unwrap();
-
-    let single = make_schema_u64_i64();
-    let p = write_test_shard(dir.path(), "e_single.db", &[], &[]);
-    let e = ShardEntry::open(&p, &single, 0, true).unwrap();
-    assert!(e.is_empty());
-    assert!(probe(&e, &0u64.to_be_bytes()).is_none());
-    assert!(probe(&e, &u64::MAX.to_be_bytes()).is_none());
-
-    let compound = compound_schema();
-    let pc = write_compound_shard(dir.path(), "e_compound.db", &[], &[]);
-    let ec = ShardEntry::open(&pc, &compound, 0, true).unwrap();
-    assert!(ec.is_empty());
-    assert_eq!(ec.pk_min.width(), compound.pk_stride());
-    // Short-circuits before the stride assert / pk_in_range.
-    assert!(probe(&ec, &opk2(1, 1)).is_none());
+    let p = write_test_shard(dir.path(), "empty.db", &[], &[]);
+    assert!(matches!(
+        ShardEntry::open(&p, &make_schema_u64_i64(), 0, true),
+        Err(StorageError::InvalidShard)
+    ));
 }
 
 /// Compound range-prune correctness: pk_min is numerically greater
@@ -963,8 +931,8 @@ fn test_compound_range_prune() {
         "key above the true compound range must be pruned",
     );
 
-    // probe_pk_bytes's compound arm prunes an out-of-range key (exercises
-    // the stride assert + pk_in_range wiring).
+    // probe_pk_bytes's compound arm prunes an out-of-range key (exercises the
+    // pk_in_range wiring).
     let dir = tempfile::tempdir().unwrap();
     let p = write_compound_shard(dir.path(), "compound.db", &[(1, 5), (1, 9), (2, 3)], &[10, 20, 30]);
     let entry = ShardEntry::open(&p, &schema, 1, true).unwrap();
@@ -974,23 +942,6 @@ fn test_compound_range_prune() {
         probe(&entry, &opk2(3, 0)).is_none(),
         "out-of-range compound key must be pruned by probe_pk_bytes",
     );
-}
-
-/// Wide (`pk_stride > 16`) 3×U64 schema. Guard keys are whole OPK keys, so this
-/// width is handled uniformly.
-fn wide_schema() -> SchemaDescriptor {
-    pk_only_schema(&[type_code::U64; 3])
-}
-
-/// An empty table has no L0 shards, so `l1_guard_keys` returns the zero anchor
-/// guard — at the schema's own stride, for every PK width, wide included.
-#[test]
-fn test_l1_guard_keys_wide_bypass() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = wide_schema();
-    assert_eq!(schema.pk_stride(), 24);
-    let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
-    assert_eq!(idx.l1_guard_keys(), vec![PkBuf::zeroed(24)]);
 }
 
 // -----------------------------------------------------------------------
@@ -1524,8 +1475,7 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
         seed_guard(&mut idx, 0, gk(base), &p, i + 1);
     }
     let count = |lo: u64, hi: Option<u64>| {
-        let hi = hi.map(u64::to_be_bytes);
-        idx.shard_arcs_in_range(&lo.to_be_bytes(), hi.as_ref().map(|b| &b[..]))
+        idx.shard_arcs_in_range(gk(lo), hi.map_or_else(|| PkBuf::max(8), gk))
             .count()
     };
 
@@ -1574,6 +1524,26 @@ fn the_guard_target_tracks_the_l0_folds_the_store_has_seen() {
         idx.l0_run_bytes, folded,
         "a running max never shrinks under a small fold"
     );
+
+    // A guard can outgrow `R` — one of a single distinct key cannot be cut — so
+    // the largest guard is not the unit a reload may recover.
+    let p = write_dense_shard(tmp.path(), "outgrown.db", 10_000_000, 50_000);
+    seed_guard(&mut idx, TERMINAL_LEVEL_IDX, gk(10_000_000), &p, 200);
+    assert!(
+        idx.levels.iter().flat_map(|l| &l.guards).any(|g| g.bytes() > folded),
+        "premise: a guard larger than R"
+    );
+    let manifest_path = tmp.path().join("MANIFEST");
+    publish_manifest(&idx, &manifest_path);
+    let mut reloaded = ShardIndex::new(
+        1,
+        tmp.path().to_str().unwrap(),
+        make_schema_u64_i64(),
+        ShardBudget::Unbounded,
+        false,
+    );
+    reloaded.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    assert_eq!(reloaded.l0_run_bytes, folded, "R survives a restart as it was observed");
 }
 
 /// The terminal level of a budgeted store takes one sweep step, clamped into
@@ -1638,9 +1608,7 @@ fn index_with_l0(dir: &std::path::Path, n: u64) -> ShardIndex {
         false,
     );
     for s in 0..n {
-        let pks: Vec<u64> = (0..40).map(|i| s * 1000 + i + 1).collect();
-        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
-        let p = write_test_shard(dir, &format!("l0_{s}.db"), &pks, &vals);
+        let p = write_dense_shard(dir, &format!("l0_{s}.db"), s * 1000 + 1, 40);
         idx.add_unsynced_shard(&p, s + 1).unwrap();
     }
     idx
@@ -1651,8 +1619,7 @@ fn terminal_split(idx: &ShardIndex) -> (Vec<usize>, Vec<usize>) {
     let mut dehy = Vec::new();
     let mut hyd = Vec::new();
     for (gi, g) in idx.levels[TERMINAL_LEVEL_IDX].guards.iter().enumerate() {
-        if g.entries.is_empty() {
-        } else if g.dehydrated() {
+        if g.dehydrated() {
             dehy.push(gi);
         } else {
             hyd.push(gi);
@@ -1723,9 +1690,8 @@ fn on_disk_shards(dir: &std::path::Path) -> Vec<String> {
 }
 
 /// A delta store's sweep **drops** its victim rather than dehydrating it: the
-/// guard is removed, its file unlinked at once, and the highest round it held
-/// becomes the retention floor. A read at `after_tick > dropped_through` asks
-/// only for rounds above it, and no such round was ever dropped.
+/// guard is removed, its file unlinked at once, and the highest key it held
+/// becomes the retention floor.
 #[test]
 fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1734,7 +1700,7 @@ fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
     const LAST_KEY: u64 = (SHARDS - 1) * 1000 + 40;
     let mut idx = index_with_l0(tmp.path(), SHARDS);
     idx.set_delta_budget(1);
-    assert_eq!(idx.dropped_through(), 0, "nothing dropped yet");
+    assert_eq!(idx.dropped_max(), PkBuf::zeroed(8), "nothing dropped yet");
 
     // Same shape as the skeleton floor's convergence: one push-down per call,
     // dehydration — here, dropping — unbudgeted above it.
@@ -1751,20 +1717,16 @@ fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
     );
     assert_eq!(idx.resident_bytes(), 0, "a delta store has no floor to stop above");
     assert_eq!(
-        idx.dropped_through(),
-        LAST_KEY,
-        "the watermark is the HIGHEST round dropped, taken from the victim's pk_max"
+        idx.dropped_max(),
+        gk(LAST_KEY),
+        "the watermark is the HIGHEST key dropped, taken from the victim's pk_max"
     );
     assert!(on_disk_shards(tmp.path()).is_empty(), "every dropped shard is unlinked");
     assert!(idx.pending_deletions.is_empty());
 }
 
-/// The residue is a **per-call** parameter, and only the sweep's own eviction
-/// step may pass anything but `Derived`. A store-scoped residue would be the
-/// shorter change and a silent data-loss bug: a delta store runs every
-/// ordinary compaction too, and those would then delete live, un-evicted rows
-/// and raise the floor past rounds nothing asked to evict — with no error and
-/// no row-set difference.
+/// Only `enforce_capacity` drops: a delta store's ordinary compactions keep
+/// every row and leave the floor at zero.
 #[test]
 fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1779,7 +1741,7 @@ fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
     }
     idx.enforce_capacity().unwrap();
 
-    assert_eq!(idx.dropped_through(), 0, "ordinary compaction drops nothing");
+    assert_eq!(idx.dropped_max(), PkBuf::zeroed(8), "ordinary compaction drops nothing");
     assert!(idx.resident_bytes() > 0, "the rows survived");
     assert!(
         idx.resident_bytes() <= before,
@@ -1791,44 +1753,48 @@ fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
     assert_eq!(live, 4 * 40, "every row survived the folds");
 }
 
-/// A delta store publishes no manifest and is in neither checkpoint round, so
-/// the post-publish drain every other store defers to never runs at all.
-/// Deferring there would leak every dropped **and every compacted-away** shard
-/// for the life of the process — invisibly to `resident_bytes`, which counts
-/// registered entries.
-///
-/// The trigger is the **store**, not the residue: an ordinary compaction is
-/// what a delta store runs most often, so draining only on a drop would unlink
-/// the sweep's victims and leak everything else.
 #[test]
-fn a_delta_stores_superseded_shards_unlink_at_once() {
+fn a_superseded_shard_waits_for_the_barrier_only_if_a_manifest_names_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let plain_dir = tmp.path().join("plain");
-    std::fs::create_dir_all(&plain_dir).unwrap();
-    let mut plain = index_with_l0(&plain_dir, 4);
-    plain.run_compact().unwrap();
-    assert!(
-        !plain.pending_deletions.is_empty(),
-        "every other store defers its superseded inputs to the checkpoint barrier",
-    );
+    let files = |idx: &ShardIndex| {
+        let mut f: Vec<String> = idx.all_entries().map(|e| e.filename.clone()).collect();
+        f.sort();
+        f
+    };
+    let exists = |p: &String| std::path::Path::new(p).exists();
 
-    let dir = tmp.path().join("delta");
+    let dir = tmp.path().join("published");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut idx = index_with_l0(&dir, 4);
-    let inputs = on_disk_shards(&dir);
-    idx.set_delta_budget(idx.resident_bytes() * 8);
+    let manifest_path = dir.join("MANIFEST");
+    publish_manifest(&index_with_l0(&dir, 5), &manifest_path);
+    let mut idx = ShardIndex::new(
+        1,
+        dir.to_str().unwrap(),
+        make_schema_u64_i64(),
+        ShardBudget::Unbounded,
+        false,
+    );
+    idx.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    let inputs = files(&idx);
+    assert_eq!(inputs.len(), 5);
     idx.run_compact().unwrap();
+    let mut queued = idx.pending_deletions.clone();
+    queued.sort();
+    assert_eq!(queued, inputs, "every published input waits for the barrier");
+    assert!(inputs.iter().all(exists), "and is still on disk until then");
 
+    let dir = tmp.path().join("unpublished");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut idx = index_with_l0(&dir, 5);
+    let inputs = files(&idx);
+    idx.run_compact().unwrap();
+    assert!(idx.pending_deletions.is_empty(), "nothing waits for the barrier");
+    assert!(!inputs.iter().any(exists), "every unpublished input is gone");
+    let outputs = files(&idx);
     assert!(
-        idx.pending_deletions.is_empty(),
-        "unlinked at the end of the compaction"
+        !outputs.is_empty() && outputs.iter().all(exists),
+        "the outputs are present"
     );
-    let after = on_disk_shards(&dir);
-    assert!(
-        after.iter().all(|f| !inputs.contains(f)),
-        "the compaction's inputs are gone: {inputs:?} -> {after:?}",
-    );
-    assert!(!after.is_empty(), "its output is not");
 }
 
 /// A store fed one spill's worth per round, swept every round — the shape a
@@ -1850,9 +1816,7 @@ fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
     let mut early = 0u64;
     for round in 0..60u64 {
         // Ascending keys, as a `_tick`-led delta store's always are.
-        let pks: Vec<u64> = (0..40).map(|i| round * 1000 + i + 1).collect();
-        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
-        let p = write_test_shard(tmp.path(), &format!("spill_{round}.db"), &pks, &vals);
+        let p = write_dense_shard(tmp.path(), &format!("spill_{round}.db"), round * 1000 + 1, 40);
         idx.add_unsynced_shard(&p, round + 1).unwrap();
         if idx.should_compact() {
             idx.run_compact().unwrap();
@@ -1869,7 +1833,7 @@ fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
         "footprint grew {early} -> {late} bytes over 50 further rounds of the same \
          write rate — the sweep is not keeping pace",
     );
-    assert!(idx.dropped_through() > 0, "the sweep dropped something");
+    assert!(idx.dropped_max() > PkBuf::zeroed(8), "the sweep dropped something");
     // Nothing left behind on disk beyond what the index still registers.
     let registered: usize = idx.all_entries().count();
     assert_eq!(on_disk_shards(tmp.path()).len(), registered, "no orphan shard files");
@@ -1898,11 +1862,10 @@ fn a_drop_removes_nothing_above_the_floor_it_raises() {
     let add = |idx: &mut ShardIndex, written: &mut Vec<u64>, round: u64| {
         // Ascending and distinct, as a `_tick`-led delta store's keys are, so
         // nothing cancels in a fold and a row count is a faithful census.
-        let pks: Vec<u64> = (0..40).map(|i| round * 1000 + i + 1).collect();
-        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
-        let p = write_test_shard(tmp.path(), &format!("spill_{round}.db"), &pks, &vals);
+        let base = round * 1000 + 1;
+        let p = write_dense_shard(tmp.path(), &format!("spill_{round}.db"), base, 40);
         idx.add_unsynced_shard(&p, round + 1).unwrap();
-        written.extend_from_slice(&pks);
+        written.extend(base..base + 40);
     };
 
     // Fill unbudgeted first, so the budget below is a size the store has
@@ -1921,15 +1884,18 @@ fn a_drop_removes_nothing_above_the_floor_it_raises() {
         idx.enforce_capacity().unwrap();
     }
 
-    let floor = idx.dropped_through();
+    let floor = idx.dropped_max();
     let retained: usize = idx.all_entries().map(|e| e.shard.count).sum();
-    assert!(floor > 0, "the sweep dropped nothing — nothing is being tested");
+    assert!(
+        floor > PkBuf::zeroed(8),
+        "the sweep dropped nothing — nothing is being tested"
+    );
     assert!(retained > 0, "the sweep emptied the store — nothing is being tested");
 
-    let above = written.iter().filter(|&&k| k > floor).count();
+    let above = written.iter().filter(|&&k| gk(k) > floor).count();
     assert_eq!(
         retained, above,
-        "floor {floor}: every one of the {above} rows above it must survive, and \
+        "floor {floor:?}: every one of the {above} rows above it must survive, and \
          every row at or below it must be gone — {retained} retained",
     );
 }
@@ -1951,15 +1917,10 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     let (dehy, hyd) = terminal_split(&idx);
     assert!(dehy.is_empty() && hyd.len() >= 2, "several hydrated terminal guards");
 
-    let lsn_of = |idx: &ShardIndex, gi: usize| {
-        idx.levels[TERMINAL_LEVEL_IDX].guards[gi]
-            .entries
-            .iter()
-            .map(|e| e.max_lsn)
-            .max()
-            .unwrap()
-    };
-    let oldest = *hyd.iter().min_by_key(|&&gi| lsn_of(&idx, gi)).unwrap();
+    let oldest = *hyd
+        .iter()
+        .min_by_key(|&&gi| idx.levels[TERMINAL_LEVEL_IDX].guards[gi].newest_lsn())
+        .unwrap();
     let oldest_key = idx.levels[TERMINAL_LEVEL_IDX].guards[oldest].guard_key;
     let live_before: Vec<(u128, i64)> = {
         let g = &idx.levels[TERMINAL_LEVEL_IDX].guards[oldest];
@@ -1998,9 +1959,7 @@ fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
     );
     // One key band, so every later fold routes back into the same guard.
     for s in 0..2u64 {
-        let pks: Vec<u64> = (0..20).map(|i| i + 1).collect();
-        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
-        let p = write_test_shard(tmp.path(), &format!("a{s}.db"), &pks, &vals);
+        let p = write_dense_shard(tmp.path(), &format!("a{s}.db"), 1, 20);
         idx.add_unsynced_shard(&p, s + 1).unwrap();
     }
     idx.run_compact().unwrap();
@@ -2012,16 +1971,13 @@ fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
     // New hydrated data over the same keys, folded down by the ordinary path:
     // under a capacity this tight `run_compact` drains L1 to the terminal
     // level itself.
-    let pks: Vec<u64> = (0..20).map(|i| i + 1).collect();
-    let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
-    let p = write_test_shard(tmp.path(), "b.db", &pks, &vals);
+    let p = write_dense_shard(tmp.path(), "b.db", 1, 20);
     idx.add_unsynced_shard(&p, 99).unwrap();
     idx.run_compact().unwrap();
     assert!(idx.levels[0].guards.is_empty(), "the drain emptied L1");
 
     let (dehy, hyd) = terminal_split(&idx);
     assert!(hyd.is_empty() && !dehy.is_empty(), "the derived rule kept it skeleton");
-    assert!(idx.all_entries().all(|e| !e.shard.is_skeleton() || e.shard.count > 0));
 }
 
 /// `vertical_fold` bounds its destination range by the source guard's true

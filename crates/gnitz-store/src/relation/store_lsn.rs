@@ -62,6 +62,13 @@ impl RelationRegistry {
         );
         let previous = std::mem::replace(&mut self.slot, slot);
         self.residency = Residency::Worker;
+        // The master's system-family stores stay open here and replay the same
+        // catalog deltas, but only the master writes `_sys/` shards.
+        for entry in self.tables.values_mut() {
+            if let (RelationKind::SystemCatalog, Some(t)) = (entry.kind(), entry.store.table_mut()) {
+                t.hold_in_ram();
+            }
+        }
         if previous == slot {
             return Ok(());
         }

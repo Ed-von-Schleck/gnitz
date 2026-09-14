@@ -203,14 +203,13 @@ fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
 /// and half-written `.tmp` files are never carried over. A published shard is
 /// never rewritten in place, so the link is byte-equivalent at O(shards).
 ///
-/// The manifest is rewritten rather than linked, because `layout_seq` differs;
-/// `compact_seq` carries over verbatim, so a later compaction cannot name an
-/// output after a value already baked into a shard just linked in.
+/// The manifest is rewritten under `layout_seq`; the rest of `source_header`
+/// carries over.
 pub(super) fn link_child(
     source: &str,
     target: &str,
     entries: &[manifest::ManifestEntryRaw],
-    compact_seq: u64,
+    source_header: manifest::ManifestHeader,
     layout_seq: u64,
 ) -> Result<(), StorageError> {
     fs::create_dir_all(target)?;
@@ -223,11 +222,7 @@ pub(super) fn link_child(
     manifest::publish_sync(
         target,
         entries,
-        manifest::ManifestHeader {
-            compact_seq,
-            checkpoint_gen: 0,
-            layout_seq,
-        },
+        manifest::ManifestHeader { layout_seq, ..source_header },
     )
 }
 

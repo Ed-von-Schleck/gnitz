@@ -8,7 +8,7 @@ use std::ffi::CStr;
 use super::super::error::StorageError;
 use super::super::manifest::{self, ManifestEntryRaw, ManifestHeader};
 use super::super::StagedFile;
-use super::{LevelGuard, ShardEntry, ShardIndex, MAX_LEVELS};
+use super::{ShardEntry, ShardIndex, MIN_GUARD_BYTES};
 use crate::schema::key::PkBuf;
 
 /// Basename of a shard's full path — its manifest identity. Shard files always
@@ -73,52 +73,33 @@ impl ShardIndex {
             if raw.level == 0 {
                 self.l0.push(entry);
             } else {
-                // A corrupt manifest can name any level at all; the tier stack
-                // is `MAX_LEVELS` deep and indexing it is unchecked below.
-                if raw.level >= MAX_LEVELS as u64 {
-                    return Err(StorageError::InvalidVersion);
-                }
                 // The read side of `ShardIndex::level_num`, which every writer
-                // goes through.
-                let level_idx = raw.level as usize - 1;
+                // goes through. A corrupt manifest can name any level at all.
+                let Some(level) = (raw.level as usize).checked_sub(1).and_then(|i| self.levels.get_mut(i)) else {
+                    return Err(StorageError::InvalidVersion);
+                };
                 // Every stored guard key is exactly `pk_stride` wide (a sample
                 // key, a shard bound, or a synthetic key minted at that stride),
                 // zero-padded into the field — so the schema recovers the width
                 // and the manifest carries no length.
                 let gk = PkBuf::from_bytes(&raw.guard_key[..stride]);
-                self.levels[level_idx].get_or_create_guard(gk).entries.push(entry);
+                level.get_or_create_guard(gk).entries.push(entry);
             }
         }
-        self.sort_l0();
-        // Every guard was held at the `R` of the session that wrote it, so the
-        // largest one recovers that unit. Without it a resumed store carries the
-        // `MIN_GUARD_BYTES` floor until its first fold and shatters every guard
-        // it loaded against a target orders of magnitude too small.
-        self.l0_run_bytes = self.l0_run_bytes.max(
-            self.levels
-                .iter()
-                .flat_map(|l| l.guards.iter().map(LevelGuard::bytes))
-                .max()
-                .unwrap_or(0),
-        );
+        self.l0_run_bytes = header.run_bytes.max(MIN_GUARD_BYTES);
         Ok(())
     }
 
     /// Startup GC: removes orphaned shard/compaction files and stale `.tmp`
     /// artifacts left by crashes.  Must run after a successful `install_manifest`
     /// so the live set is populated before files are deleted.
-    pub(crate) fn gc_orphans(&self) -> usize {
+    pub(crate) fn gc_orphans(&self) {
         let live: HashSet<&str> = self.all_entries().map(|e| shard_basename(&e.filename)).collect();
 
-        let mut removed = 0usize;
-
         // Stray manifest .tmp from a crash mid-publish.
-        let manifest_tmp = super::super::manifest::tmp_path(&self.output_dir);
-        if std::fs::remove_file(&manifest_tmp).is_ok() {
-            removed += 1;
-        }
+        let _ = std::fs::remove_file(super::super::manifest::tmp_path(&self.output_dir));
 
-        removed + super::super::naming::remove_shard_files(&self.output_dir, self.table_id, &live)
+        super::super::naming::remove_shard_files(&self.output_dir, self.table_id, &live);
     }
 
     /// Serialize the current index into a manifest `.tmp`, returning the prepared
@@ -139,6 +120,7 @@ impl ShardIndex {
             compact_seq: self.compact_seq,
             checkpoint_gen,
             layout_seq: self.layout_seq,
+            run_bytes: self.l0_run_bytes,
         };
         manifest::prepare_file(manifest_path, &entries, header)
     }

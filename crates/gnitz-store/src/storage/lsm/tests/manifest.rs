@@ -19,6 +19,7 @@ fn hdr(compact_seq: u64, checkpoint_gen: u64) -> ManifestHeader {
         compact_seq,
         checkpoint_gen,
         layout_seq: 0,
+        run_bytes: 1 << 20,
     }
 }
 
@@ -196,14 +197,16 @@ fn peek_header_roundtrip() {
     // Absent file ⇒ Ok(None).
     assert_eq!(peek_header(&cpath).unwrap(), None);
 
-    // The two sequence fields are independent and both round-trip.
+    // Every header field is independent and round-trips.
     let full = ManifestHeader {
         compact_seq: 3,
         checkpoint_gen: 42,
         layout_seq: 7,
+        run_bytes: 9 << 20,
     };
     write_manifest(&cpath, &[make_entry(1, "shard_1.db")], full);
     assert_eq!(peek_header(&cpath).unwrap(), Some(full));
+    assert_eq!(peek_header(&cpath).unwrap().unwrap().run_bytes, 9 << 20);
 
     // Republish at generation 0 (the base-round stamp).
     write_manifest(&cpath, &[make_entry(1, "shard_1.db")], hdr(3, 0));

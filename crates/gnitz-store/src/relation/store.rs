@@ -2,7 +2,7 @@
 //! Every store the registry holds is one of these, so no owner and no caller
 //! names a residency.
 
-use crate::schema::key::PkBuf;
+use crate::schema::key::{leading_u64, PkBuf};
 use crate::schema::{IndexKeySpec, SchemaDescriptor};
 use crate::storage::{Batch, ReadCursor, StorageError, Table};
 
@@ -113,10 +113,10 @@ impl Store {
         }
     }
 
-    /// The highest tick round this store's capacity sweep has dropped; `0` if it
-    /// has dropped nothing.
+    /// The highest tick round this store's capacity sweep has dropped — the
+    /// `_tick` leading a delta store's highest dropped key; `0` if none.
     pub(crate) fn dropped_through(&self) -> u64 {
-        self.table().map_or(0, Table::dropped_through)
+        self.table().map_or(0, |t| leading_u64(t.dropped_max().pk_bytes()))
     }
 
     /// Ingest a `Batch` by move — no copy, and the caller does not keep it.

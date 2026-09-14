@@ -45,7 +45,7 @@ struct SourceManifest {
     /// manifest.
     rank: u32,
     entries: Vec<ManifestEntryRaw>,
-    compact_seq: u64,
+    header: ManifestHeader,
 }
 
 /// What one `w*of{of}` child set's surviving children say about it.
@@ -148,11 +148,7 @@ fn classify(rel_dir: &str, launched: u32, replicated: bool) -> Result<Layout, St
         let max_lsn = entries.iter().map(|e| e.max_lsn).max().unwrap_or(0);
         let survey = sets.entry(of).or_insert_with(|| SetSurvey {
             ranks: HashMap::new(),
-            source: SourceManifest {
-                rank,
-                entries,
-                compact_seq: header.compact_seq,
-            },
+            source: SourceManifest { rank, entries, header },
         });
         survey.ranks.insert(rank, (header.layout_seq, max_lsn));
     }
@@ -272,7 +268,7 @@ fn link_targets(rel_dir: &str, source: &SourceSet, launched: u32, seq: u64) -> R
             &source_dir,
             &target.dir(rel_dir),
             &source.source.entries,
-            source.source.compact_seq,
+            source.source.header,
             seq,
         )?;
     }
@@ -286,6 +282,9 @@ struct TargetChild {
     buffer: Batch,
     entries: Vec<ManifestEntryRaw>,
     next_seq: u64,
+    /// The largest shard written so far — the `R` this child's guards were
+    /// written at, which its manifest carries.
+    run_bytes: u64,
 }
 
 impl TargetChild {
@@ -295,6 +294,7 @@ impl TargetChild {
             buffer: Batch::empty_with_schema(schema),
             entries: Vec::new(),
             next_seq: 0,
+            run_bytes: 0,
         }
     }
 
@@ -322,10 +322,10 @@ impl TargetChild {
         // Each shard draws its own `next_seq`, so the part index is always 0.
         let name = super::naming::compact_shard_name(table_id, self.next_seq, level, 0);
         self.next_seq += 1;
-        self.buffer.write_as_shard(
-            &super::cstr(format!("{}/{name}", self.dir))?,
-            ShardWriteOpts::COMPACTION,
-        )?;
+        let path = format!("{}/{name}", self.dir);
+        self.buffer
+            .write_as_shard(&super::cstr(path.as_str())?, ShardWriteOpts::COMPACTION)?;
+        self.run_bytes = self.run_bytes.max(std::fs::metadata(&path)?.len());
         self.entries
             .push(ManifestEntryRaw::new(&name, floor, level as u64, guard_key));
         // Keeps the buffer's capacity, so each shard is filled into the
@@ -350,6 +350,7 @@ impl TargetChild {
                 compact_seq: self.next_seq,
                 checkpoint_gen: 0,
                 layout_seq: seq,
+                run_bytes: self.run_bytes,
             },
         )
     }

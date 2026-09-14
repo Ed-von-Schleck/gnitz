@@ -123,12 +123,10 @@ impl Table {
     /// the spill and barrier paths.
     ///
     /// The name is unique for this `Table`: `current_lsn` bumps once per ingest
-    /// and at most one shard is written per ingest. Two *processes* writing one
-    /// directory (secondary-index dirs, the workers' inherited `SalReplay` `_sys`
-    /// copies) can still collide — those directories need a single writer. It is
-    /// also why the boot repartition writes through the compaction grammar
-    /// instead: it stamps a manifest LSN floor below the names it just wrote, and
-    /// this counter is re-derived from that floor at the next open.
+    /// and at most one shard is written per ingest, so a directory needs a single
+    /// writing process. The boot repartition writes through the compaction
+    /// grammar instead, because it stamps a manifest LSN floor below the names it
+    /// wrote and this counter is re-derived from that floor at the next open.
     ///
     /// Transactional. The run is borrowed — not removed — so a write failure
     /// leaves heap intact for retry with nothing on disk; a registration

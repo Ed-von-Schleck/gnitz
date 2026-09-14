@@ -114,9 +114,7 @@ impl RunSet {
         self.bytes > self.budget
     }
 
-    /// Shrink the budget so a test can drive the drain path without ingesting
-    /// megabytes. A production store's budgets are fixed at its open.
-    #[cfg(test)]
+    /// Rebind the ceiling a drain is judged against.
     pub(super) fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
         self.bloom.take(); // its key capacity was sized from the old budget

@@ -121,24 +121,23 @@ impl ShardIndex {
             levels.join(" ")
         )
     }
+
+    /// The tree's shape as counts: L0 shards, then each level's guards. What a
+    /// test asserts a placement against, where `tree_report` is for reading.
+    pub(crate) fn level_shape(&self) -> (usize, [usize; FLSM_LEVELS]) {
+        (self.l0.len(), std::array::from_fn(|i| self.levels[i].guards.len()))
+    }
 }
 
-/// Serialized level bound: level numbers run 0 (L0) ..= `FLSM_LEVELS`, and
-/// `install_manifest` rejects anything at or above `MAX_LEVELS`.
-const MAX_LEVELS: usize = 3;
 /// Guarded levels below L0 — L1 and L2.
-pub(super) const FLSM_LEVELS: usize = MAX_LEVELS - 1;
+pub(super) const FLSM_LEVELS: usize = 2;
 /// Index of the deepest guarded level (L2). The one level whose guards fold to a
 /// single file, and the only one whose guards may be dehydrated.
 pub(super) const TERMINAL_LEVEL_IDX: usize = FLSM_LEVELS - 1;
 /// L0 shards past this count trigger the fold into L1.
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
-/// Files one guard of a shallower guarded level holds before it folds — the
-/// wider fan-in the deepest level does not keep.
+/// Files one guard holds before it folds.
 const GUARD_FILE_THRESHOLD: usize = 4;
-/// Files one terminal-level guard holds before it folds: the deepest guarded
-/// level folds each guard down to a single file.
-const LMAX_FILE_THRESHOLD: usize = 1;
 /// Floor under every guard byte target. It bounds the guard *count*: a store
 /// holds `resident / target` guards, so a target derived from a tiny budget
 /// would otherwise shatter one fold into shards of a few hundred bytes.
@@ -178,25 +177,14 @@ pub(super) struct ShardEntry {
     max_lsn: u64,
     pk_min: PkBuf,
     pk_max: PkBuf,
-    /// Has an `fdatasync` reached this file? False for a shard this session
-    /// wrote, true for one a published manifest named. Carried on the entry so a
-    /// superseded shard takes its own flag out of the index with it — nothing
-    /// can be left behind naming a deleted file.
-    synced: bool,
+    /// Named by a published manifest, which the barrier fdatasyncs a file before
+    /// — so an unpublished file is exactly one that owes the sweep.
+    published: bool,
 }
 
 impl ShardEntry {
-    /// An empty shard must fail every range check, and its bounds cannot say so:
-    /// `MappedShard::pk_bounds` answers the zero key, which no comparison tells
-    /// apart from a real row there. So probe, sort and key extent short-circuit
-    /// on the row count instead.
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.shard.count == 0
-    }
-
     /// The one mapping call: [`open`](Self::open) builds a fresh entry around it,
-    /// [`reopen`](Self::reopen) swaps it into an existing one.
+    /// [`ShardIndex::swap_schema`] swaps it into an existing one.
     fn map(path: &str, schema: &SchemaDescriptor) -> Result<Rc<MappedShard>, StorageError> {
         Ok(Rc::new(MappedShard::open(&super::super::cstr(path)?, schema, false)?))
     }
@@ -205,35 +193,29 @@ impl ShardEntry {
         path: &str,
         schema: &SchemaDescriptor,
         max_lsn: u64,
-        synced: bool,
+        published: bool,
     ) -> Result<Self, StorageError> {
         let shard = Self::map(path, schema)?;
-        let (pk_min, pk_max) = shard.pk_bounds();
+        // Every writer skips an empty output, so a zero-row file is damage.
+        if shard.count == 0 {
+            return Err(StorageError::InvalidShard);
+        }
+        let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
+        let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1));
         Ok(ShardEntry {
             shard,
             filename: path.to_string(),
             max_lsn,
             pk_min,
             pk_max,
-            synced,
+            published,
         })
-    }
-
-    /// Re-`mmap` this entry's own file under `schema`, yielding **only** the new
-    /// mapping: a payload widen rewrites `col_regions` and `null_pad_mask` and
-    /// nothing else, so every other field is already right. Exchanging just the
-    /// `Rc` is what keeps a reopen from dropping a field it does not know about.
-    fn reopen(&self, schema: &SchemaDescriptor) -> Result<Rc<MappedShard>, StorageError> {
-        Self::map(&self.filename, schema)
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
     /// wide). `filter_key` is `probe_key(key)` — the caller hoists it because
     /// it is the same value for every shard in one sweep.
     fn probe_pk_bytes(&self, key: &[u8], filter_key: u64) -> Option<(Rc<MappedShard>, usize)> {
-        if self.is_empty() {
-            return None;
-        }
         if !pk_in_range(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key) {
             return None;
         }
@@ -258,26 +240,22 @@ impl LevelGuard {
         LevelGuard { guard_key: gk, entries: Vec::new() }
     }
 
-    /// Whether this guard holds only skeleton shards — the state a capacity
-    /// sweep leaves behind. Derived from the shard headers rather than persisted,
-    /// so it survives any manifest reload with no new manifest field to keep in
-    /// step. An empty guard is not dehydrated: there is nothing to say it of, and
-    /// answering `true` would make the next fold into it skeletonize data the
-    /// sweep never chose to evict.
-    ///
-    /// Only terminal-level guards are ever dehydrated (L0 and L1 always hold
-    /// full-width shards), and a terminal guard is held at
-    /// [`LMAX_FILE_THRESHOLD`] files — so as long as that is one, "uniformly
-    /// skeleton or uniformly hydrated" holds by construction.
+    /// Whether this guard holds skeleton shards — the state a capacity sweep
+    /// leaves behind, read off the shard headers. Only a terminal guard is ever
+    /// dehydrated, and it holds one shard.
     fn dehydrated(&self) -> bool {
-        !self.entries.is_empty() && self.entries.iter().all(|e| e.shard.is_skeleton())
+        self.entries.iter().all(|e| e.shard.is_skeleton())
     }
 
-    /// When this guard was last written, as the newest LSN over its entries —
-    /// `None` for an empty guard, which was never written. The only recency signal
-    /// the tree carries; the capacity sweep orders its victims by it.
-    fn newest_lsn(&self) -> Option<u64> {
-        self.entries.iter().map(|e| e.max_lsn).max()
+    /// When this guard was last written, as the newest LSN over its entries. The
+    /// only recency signal the tree carries; the capacity sweep orders its
+    /// victims by it.
+    fn newest_lsn(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|e| e.max_lsn)
+            .max()
+            .expect("a guard holds at least one shard")
     }
 
     /// Total registered bytes of this guard's entries.
@@ -303,8 +281,8 @@ impl LevelGuard {
     fn fold_destinations(&self, target: u64) -> Vec<PkBuf> {
         let mut keys = vec![self.guard_key];
         let parts = self.bytes().div_ceil(target).min(MAX_PARTS) as usize;
-        let cuttable = self.key_extent().is_some_and(|(lo, hi)| lo < hi);
-        if parts >= 2 && cuttable {
+        let (lo, hi) = self.key_extent();
+        if parts >= 2 && lo < hi {
             let sample = self.sample_keys();
             let parts = parts.min(sample.len());
             keys.extend((1..parts).map(|i| sample[i * sample.len() / parts]));
@@ -321,7 +299,7 @@ impl LevelGuard {
         let rows: usize = self.entries.iter().map(|e| e.shard.count).sum();
         let step = (rows / SPLIT_SAMPLES).max(1);
         let mut sample: Vec<PkBuf> = Vec::with_capacity(SPLIT_SAMPLES + self.entries.len());
-        for e in self.entries.iter().filter(|e| !e.is_empty()) {
+        for e in &self.entries {
             sample.extend(
                 (0..e.shard.count)
                     .step_by(step)
@@ -333,13 +311,13 @@ impl LevelGuard {
         sample
     }
 
-    /// The key span this guard's entries actually cover, or `None` for a guard
-    /// holding no rows. The guard *key* is only the span's lower fence, so a fold
-    /// out of this guard must route by this instead — see
-    /// [`ShardIndex::vertical_fold`].
-    fn key_extent(&self) -> Option<(PkBuf, PkBuf)> {
-        let live = || self.entries.iter().filter(|e| !e.is_empty());
-        Some((live().map(|e| e.pk_min).min()?, live().map(|e| e.pk_max).max()?))
+    /// The key span this guard's entries actually cover. The guard *key* is only
+    /// the span's lower fence, so a fold out of this guard must route by this
+    /// instead — see [`ShardIndex::vertical_fold`].
+    fn key_extent(&self) -> (PkBuf, PkBuf) {
+        let lo = self.entries.iter().map(|e| e.pk_min).min();
+        let hi = self.entries.iter().map(|e| e.pk_max).max();
+        lo.zip(hi).expect("a guard holds at least one shard")
     }
 }
 
@@ -352,23 +330,16 @@ impl FLSMLevel {
         FLSMLevel { guards: Vec::new() }
     }
 
-    fn find_guard_idx(&self, key: &[u8]) -> Option<usize> {
-        // Empty level → `None` (skip this level).
-        (!self.guards.is_empty()).then(|| guard_slot(&self.guards, key, |g| g.guard_key.pk_bytes()))
+    /// The guard owning `key`: the last one `≤ key`, or 0 below the first — and
+    /// 0 on an empty level, which callers bound against `guards.len()`.
+    fn slot(&self, key: &[u8]) -> usize {
+        guard_slot(&self.guards, key, |g| g.guard_key.pk_bytes())
     }
 
     /// The guards overlapping `[range_min, range_max]` — a contiguous run,
     /// because guards partition the key line, so callers may `drain` it.
-    ///
-    /// Both ends route through [`guard_slot`]: the run ends one past the guard
-    /// owning `range_max`, which is what keeps it non-empty while a guard exists
-    /// even for a range falling entirely below the partition.
     fn find_guards_for_range(&self, range_min: &[u8], range_max: &[u8]) -> std::ops::Range<usize> {
-        // `find_guard_idx` is `None` exactly for an empty level.
-        let Some(start) = self.find_guard_idx(range_min) else {
-            return 0..0;
-        };
-        start..guard_slot(&self.guards, range_max, |g| g.guard_key.pk_bytes()) + 1
+        self.slot(range_min)..(self.slot(range_max) + 1).min(self.guards.len())
     }
 
     /// Total registered bytes of every guard in this level.
@@ -376,15 +347,8 @@ impl FLSMLevel {
         self.guards.iter().map(LevelGuard::bytes).sum()
     }
 
-    /// The guard keyed exactly `gk` — a guard's identity wherever a fold may have
-    /// moved indices under the caller. [`Self::find_guard_idx`] answers the
-    /// routing question instead.
-    fn find_exact_guard(&self, gk: PkBuf) -> Option<usize> {
-        self.guards.binary_search_by_key(&gk, |g| g.guard_key).ok()
-    }
-
     fn get_or_create_guard(&mut self, gk: PkBuf) -> &mut LevelGuard {
-        let pos = match self.guards.binary_search_by_key(&gk, |g| g.guard_key) {
+        let pos = match self.guards.binary_search_by(|g| g.guard_key.cmp(&gk)) {
             Ok(pos) => pos,
             Err(pos) => {
                 self.guards.insert(pos, LevelGuard::new(gk));
@@ -404,11 +368,7 @@ pub(crate) enum ShardBudget {
     /// `CREATE VIEW … WITH (capacity = …)`: evict by leaving skeleton rows behind.
     Dehydrate(u64),
     /// A view's delta store: evict by unlinking the guard outright — its rows are
-    /// the change itself, so there is no summed weight worth a stub of. It
-    /// publishes no manifest, so it also unlinks each compaction's superseded
-    /// inputs at once; deferring them to the post-publish drain that never runs
-    /// would leak every dropped *and* every compacted-away shard for the life of
-    /// the process, invisibly to `resident_bytes`.
+    /// the change itself, so there is no summed weight worth a stub of.
     Drop(u64),
 }
 
@@ -437,27 +397,18 @@ pub(super) struct ShardIndex {
     /// dense: a compaction that fails after drawing one burns it.
     compact_seq: u64,
     pending_deletions: Vec<String>,
-    /// Running **max** over the registered L0 bytes each `run_compact` consumed —
-    /// `R`, the unit every byte target is stated in. Observed rather than taken
-    /// from the RAM-tier ceiling, which budgets heap bytes and bounds a spill from
-    /// below rather than above.
-    ///
-    /// Never below [`MIN_GUARD_BYTES`], and `install_manifest` raises it to the
-    /// largest guard it reloads, so a resumed store does not shatter guards built
-    /// under a larger `R`.
+    /// `R`, the unit every byte target is stated in: the running max of the
+    /// registered L0 bytes one `run_compact` consumed, floored at
+    /// [`MIN_GUARD_BYTES`] and persisted in the manifest header.
     l0_run_bytes: u64,
     /// This child set's layout sequence — see `ManifestHeader::layout_seq`.
     layout_seq: u64,
     /// What bounds this store's registered on-disk shard bytes, and how a sweep
     /// evicts. Unbounded for every store but a capacity-bounded view's output
-    /// store and a view's delta store, both of which pay nothing.
+    /// store and a view's delta store.
     budget: ShardBudget,
-    /// Running **max** over the leading eight OPK bytes — the `_tick` — of every row
-    /// this store has ever dropped. A delta read at `after_tick > dropped_through`
-    /// asks only for rows above it, and no such row was ever dropped; a read below
-    /// it is refused. Zero until the first drop, and always zero for a store
-    /// that does not evict by dropping ([`ShardBudget::Drop`]).
-    dropped_through: u64,
+    /// The highest key any drop removed. Zero until the first drop.
+    dropped_max: PkBuf,
     /// Passed to every compaction's write. Held rather than derived from the
     /// input shards: a derivation would let one filterless input turn the filter
     /// off for this table's whole descendant line, permanently and invisibly.
@@ -465,14 +416,6 @@ pub(super) struct ShardIndex {
 }
 
 impl ShardIndex {
-    /// The tree's shape as counts: L0 shards, then each level's guards. What a
-    /// test asserts a placement against, where `tree_report` is for reading —
-    /// outside the `cfg(test)` block above because `gnitz-server`'s tests
-    /// reach it through [`Table::level_shape`], across the crate seam.
-    #[cfg(test)]
-    pub(crate) fn level_shape(&self) -> (usize, [usize; FLSM_LEVELS]) {
-        (self.l0.len(), std::array::from_fn(|i| self.levels[i].guards.len()))
-    }
     /// The 1-based level *number* of a 0-based tier index — used only by the two
     /// serde boundaries that carry it, the shard filename and the manifest field.
     pub(super) fn level_num(level_idx: usize) -> usize {
@@ -499,7 +442,7 @@ impl ShardIndex {
             l0_run_bytes: MIN_GUARD_BYTES,
             layout_seq: 0,
             budget,
-            dropped_through: 0,
+            dropped_max: PkBuf::zeroed(schema.pk_stride()),
             skip_pk_filter,
         }
     }
@@ -518,46 +461,26 @@ impl ShardIndex {
         self.skip_pk_filter = skip;
     }
 
-    /// The highest round this store has dropped; see [`Self::dropped_through`].
-    pub(super) fn dropped_through(&self) -> u64 {
-        self.dropped_through
+    /// The highest key any drop removed; see [`Self::drop_guard`].
+    pub(super) fn dropped_max(&self) -> PkBuf {
+        self.dropped_max
     }
 
-    /// Fallible half of a schema swap: re-open every registered shard under
-    /// `new_schema` without touching `self`, so a failure on any one file leaves
-    /// the index exactly as it was.
-    ///
-    /// Empty at an unchanged payload arity: the equal-region ALTERs (RENAME
-    /// COLUMN, DROP COLUMN, DROP NOT NULL) change only how existing bytes are
-    /// compared. Only a widen (ADD COLUMN) re-opens, because `MappedShard` is
-    /// `Rc`-shared with no interior mutability, so its `col_regions` and
-    /// `null_pad_mask` cannot be retrofitted. Old `Rc`s held by in-flight
-    /// consumers stay valid and drop naturally.
-    ///
-    /// Re-opening re-reads each shard's PK filter, so this costs one extra
-    /// filter allocation per shard until the commit drops the old handles.
-    pub(super) fn reopen_all(&self, new_schema: &SchemaDescriptor) -> Result<Vec<Rc<MappedShard>>, StorageError> {
-        if new_schema.num_payload_cols() == self.schema.num_payload_cols() {
-            return Ok(Vec::new());
+    /// Publish `schema`, re-mapping every registered shard when its payload arity
+    /// changed — a mapping's column regions are fixed at open. A failure on any
+    /// file leaves the index on the old schema.
+    pub(super) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
+        if schema.num_payload_cols() != self.schema.num_payload_cols() {
+            let remapped: Vec<Rc<MappedShard>> = self
+                .all_entries()
+                .map(|e| ShardEntry::map(&e.filename, &schema))
+                .collect::<Result<_, _>>()?;
+            for (e, shard) in self.all_entries_mut().zip(remapped) {
+                e.shard = shard;
+            }
         }
-        self.all_entries().map(|e| e.reopen(new_schema)).collect()
-    }
-
-    /// Infallible half: install the mappings [`reopen_all`](Self::reopen_all)
-    /// staged, in the same (deterministic) `all_entries` order, and publish
-    /// `new_schema`. `staged` is empty for an equal-region swap, in which case
-    /// only the comparator schema moves — `ShardIndex::compact_into` /
-    /// `ShardEntry::open` read `&self.schema` per call, so every subsequent
-    /// compaction uses the new comparator.
-    pub(super) fn install_reopened(&mut self, staged: Vec<Rc<MappedShard>>, new_schema: SchemaDescriptor) {
-        debug_assert!(
-            staged.is_empty() || staged.len() == self.all_entries().count(),
-            "install_reopened: staged count must match the index it was prepared from",
-        );
-        for (slot, shard) in self.all_entries_mut().zip(staged) {
-            slot.shard = shard;
-        }
-        self.schema = new_schema;
+        self.schema = schema;
+        Ok(())
     }
 }
 

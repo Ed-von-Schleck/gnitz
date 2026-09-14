@@ -8,7 +8,6 @@ use super::super::merge::{
     prorated_blob_cap, relocate_german_string_vec, should_relocate_blob, BlobCacheGuard, ColPtr, UnifiedSource,
 };
 use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion, ZERO_CELL};
-use crate::schema::key::PkBuf;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
@@ -66,23 +65,6 @@ impl MappedShard {
     pub(crate) fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let width = self.pk_stride as usize;
         &self.data()[self.pk.row_off(row)..][..width]
-    }
-
-    /// `(pk_min, pk_max)` OPK bounds for this shard, in `self.pk_stride`-wide
-    /// `PkBuf`s. Derived from `count`, never serialized. An empty shard
-    /// (`count == 0`) has no row to read `get_pk_bytes` from, so it returns
-    /// zero-key bounds; an empty shard is never probed, so these bounds are
-    /// only a defensive backstop.
-    pub(crate) fn pk_bounds(&self) -> (PkBuf, PkBuf) {
-        if self.count > 0 {
-            (
-                PkBuf::from_bytes(self.get_pk_bytes(0)),
-                PkBuf::from_bytes(self.get_pk_bytes(self.count - 1)),
-            )
-        } else {
-            let e = PkBuf::zeroed(self.pk_stride as usize);
-            (e, e)
-        }
     }
 
     #[inline]

@@ -34,20 +34,16 @@ pub(super) fn shard_prefix(table_id: u32) -> String {
 }
 
 /// Remove every one of `table_id`'s shard files in `dir` whose basename is not
-/// in `keep`. `keep = ∅` erases them all. Returns the number of matching files
-/// attempted, best-effort per file.
-pub(super) fn remove_shard_files(dir: &str, table_id: u32, keep: &HashSet<&str>) -> usize {
+/// in `keep`. `keep = ∅` erases them all. Best-effort per file.
+pub(super) fn remove_shard_files(dir: &str, table_id: u32, keep: &HashSet<&str>) {
     let prefix = shard_prefix(table_id);
-    let mut removed = 0usize;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 if name.starts_with(&prefix) && !keep.contains(name) {
                     let _ = std::fs::remove_file(entry.path());
-                    removed += 1;
                 }
             }
         }
     }
-    removed
 }

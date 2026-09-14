@@ -10,14 +10,15 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 // Manifest file format
 // ---------------------------------------------------------------------------
 //
-// Header (56 bytes):
+// Header (64 bytes):
 //   [0,8)   Magic   0x4D414E49464E5447
-//   [8,16)  Version u64 (10)
+//   [8,16)  Version u64 (11)
 //   [16,24) Count   u64
 //   [24,32) Compaction sequence u64
 //   [32,40) Checkpoint generation u64
 //   [40,48) Layout sequence u64
-//   [48,56) Checksum — XXH3-64 over the whole file, these eight bytes excluded
+//   [48,56) R — the shard index's guard byte unit, u64
+//   [56,64) Checksum — XXH3-64 over the whole file, these eight bytes excluded
 //
 // Entry, laid out by the `W_*` widths below (224 bytes at MAX_PK_BYTES = 80):
 //   max_lsn    u64
@@ -27,7 +28,7 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 //
 // The manifest records only what `install_manifest` consumes: which shard files
 // are live, their tier placement (level, guard) and LSN watermark, plus the
-// two header counters that must survive a restart. PK bounds are re-derived
+// header fields that must survive a restart. PK bounds are re-derived
 // from each shard's mmap at open (`ShardEntry::open`), so they are not
 // serialized. `guard_key` is a whole OPK key — the same key the compaction
 // writer routes by and the read router probes with. It carries no length:
@@ -35,15 +36,16 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 // `install_manifest` holds the schema, exactly as `ShardEntry::open` does.
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 10;
-const HEADER_SIZE: usize = 56;
+const VERSION: u64 = 11;
+const HEADER_SIZE: usize = 64;
 
 // Header offsets.
 const OFF_ENTRY_COUNT: usize = 16;
 const OFF_COMPACT_SEQ: usize = 24;
 const OFF_CHECKPOINT_GEN: usize = 32;
 const OFF_LAYOUT_SEQ: usize = 40;
-const OFF_CHECKSUM: usize = 48;
+const OFF_RUN_BYTES: usize = 48;
+const OFF_CHECKSUM: usize = 56;
 
 // One entry's field widths, in layout order. Each offset is the running sum of
 // the widths before it and `ENTRY_SIZE` is the total, so a width edit moves the
@@ -121,6 +123,9 @@ pub(crate) struct ManifestHeader {
     /// source's, which is what decides the live set when two complete sets
     /// survive a crash.
     pub layout_seq: u64,
+    /// The shard index's `R`. Stored, not derived: a guard of one distinct key
+    /// outgrows `R` and cannot be split, so no shard size recovers it.
+    pub run_bytes: u64,
 }
 
 /// Serialize manifest entries into `out_buf`.
@@ -142,6 +147,7 @@ fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], header: ManifestH
     write_u64_le(out_buf, OFF_COMPACT_SEQ, header.compact_seq);
     write_u64_le(out_buf, OFF_CHECKPOINT_GEN, header.checkpoint_gen);
     write_u64_le(out_buf, OFF_LAYOUT_SEQ, header.layout_seq);
+    write_u64_le(out_buf, OFF_RUN_BYTES, header.run_bytes);
 
     // Write entries field-by-field (symmetric with parse; immune to padding changes).
     for (i, e) in entries.iter().enumerate() {
@@ -202,6 +208,7 @@ fn verify(buf: &[u8]) -> Result<(ManifestHeader, usize), StorageError> {
             compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
             checkpoint_gen: read_u64_le(buf, OFF_CHECKPOINT_GEN),
             layout_seq: read_u64_le(buf, OFF_LAYOUT_SEQ),
+            run_bytes: read_u64_le(buf, OFF_RUN_BYTES),
         },
         count,
     ))

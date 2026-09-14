@@ -137,7 +137,7 @@ fn linked_child_shard_opens_under_its_linked_name() {
     )];
 
     let target = ChildAddr::Worker { rank: 1, of: 2 }.dir(&rel_dir);
-    link_child(&source, &target, &entries, 0, 1).unwrap();
+    link_child(&source, &target, &entries, manifest::ManifestHeader::default(), 1).unwrap();
 
     let shard = MappedShard::open(&cstr(format!("{target}/{name}")).unwrap(), &schema, true)
         .expect("a hard-linked shard keeps its basename, so its digest still validates");

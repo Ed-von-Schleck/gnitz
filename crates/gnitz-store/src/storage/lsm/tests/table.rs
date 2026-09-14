@@ -1567,10 +1567,28 @@ fn barrier_gate_matrix() {
     }
 }
 
-/// F5. A `Rederive` table publishes on the **ephemeral** round, so that is
-/// what drains its superseded compaction inputs — the base round leaves them,
-/// since a manifest could still reference them. Nothing leaks across a
-/// checkpoint.
+/// Every shard file of `table_id` on disk is either `published` or one the index
+/// still registers unpublished — no unpublished file outlives the entry naming it.
+fn assert_unpublished_inputs_gone(t: &Table, dir: &std::path::Path, table_id: u32, published: &str) {
+    let live: Vec<&str> = t
+        .shard_index
+        .unsynced_paths()
+        .map(|p| p.rsplit('/').next().unwrap())
+        .collect();
+    let prefix = super::super::naming::shard_prefix(table_id);
+    for f in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = f.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) {
+            assert!(
+                name == published || live.contains(&name.as_str()),
+                "superseded unpublished shard {name} is still on disk"
+            );
+        }
+    }
+}
+
+/// F5. A `Rederive` table's published compaction input waits for the
+/// ephemeral round, which republishes; the base round drains nothing.
 #[test]
 fn rederive_ephemeral_flush_drains_deferred_compaction() {
     let dir = tempfile::tempdir().unwrap();
@@ -1579,12 +1597,23 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
     let mut t = new_table(&tdir, schema, 8000, 96, RecoverySource::Rederive { resume_at: None });
     t.ram_tier.set_budget(100);
 
+    // One published shard, so the churn below supersedes a file a manifest names.
+    t.ingest_owned_batch(make_batch(&[(10_000, 1, 1)])).unwrap();
+    super::super::flush_barrier::flush_barrier([&mut t], FlushRound::Ephemeral(1)).unwrap();
+    let published = shard_db_files(&tdir, 8000);
+    assert_eq!(published.len(), 1, "the publish wrote one shard");
+
     for r in 0..8u64 {
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
         assert_eq!(t.ram_tier.len(), 0, "round {r} spilled");
     }
     assert!(compaction_output_count(&tdir, 8000) > 0, "compaction must have run");
+    assert_unpublished_inputs_gone(&t, &tdir, 8000, &published[0]);
+    assert!(
+        tdir.join(&published[0]).exists(),
+        "the published input waits for the barrier"
+    );
 
     let files_before = all_shard_file_count(&tdir, 8000);
     t.flush().unwrap();
@@ -1594,14 +1623,13 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
         "the base round must publish nothing for a Rederive table, so nothing drains"
     );
 
-    let g = 1;
-    super::super::flush_barrier::flush_barrier([&mut t], super::super::flush_barrier::FlushRound::Ephemeral(g))
-        .unwrap();
+    super::super::flush_barrier::flush_barrier([&mut t], FlushRound::Ephemeral(2)).unwrap();
     assert!(
-        all_shard_file_count(&tdir, 8000) < files_before,
-        "the ephemeral round republishes over the compacted index and drains the inputs"
+        !tdir.join(&published[0]).exists(),
+        "the ephemeral round republishes over the compacted index and drains the published input"
     );
 
+    assert!(t.has_pk(10_000), "the published row survives compaction");
     for r in 0..8u64 {
         for k in 0..10u64 {
             assert!(t.has_pk((r * 100 + k) as u128), "row survives compaction");
@@ -1609,10 +1637,8 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
     }
 }
 
-/// F-sys. A `SalReplay` table stands in for a master `_sys` table:
-/// `compact_if_needed` defers cleanup (a manifest could strand the inputs),
-/// and the synchronous `flush()` republishes over the compacted index and
-/// drains the deferred inputs — no intra-session leak.
+/// F-sys. A `SalReplay` table's published compaction input waits for the
+/// `flush()` that republishes.
 #[test]
 fn salreplay_flush_drains_deferred_compaction() {
     let dir = tempfile::tempdir().unwrap();
@@ -1621,29 +1647,65 @@ fn salreplay_flush_drains_deferred_compaction() {
     let mut t = new_table(&tdir, schema, 8100, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
 
+    // One published shard, so the churn below supersedes a file a manifest names.
+    t.ingest_owned_batch(make_batch(&[(10_000, 1, 1)])).unwrap();
+    t.flush().unwrap();
+    let published = shard_db_files(&tdir, 8100);
+    assert_eq!(published.len(), 1, "the publish wrote one shard");
+
     for r in 0..6u64 {
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
     }
     assert!(compaction_output_count(&tdir, 8100) > 0, "compaction ran");
-    let files_before = all_shard_file_count(&tdir, 8100);
+    assert_unpublished_inputs_gone(&t, &tdir, 8100, &published[0]);
+    assert!(
+        tdir.join(&published[0]).exists(),
+        "the published input waits for the barrier"
+    );
 
     t.flush().unwrap();
     assert!(
-        all_shard_file_count(&tdir, 8100) < files_before,
-        "flush must drain the deferred compaction inputs (no intra-session leak)"
+        !tdir.join(&published[0]).exists(),
+        "flush must drain the published compaction input (no intra-session leak)"
     );
 
-    for r in 0..6u64 {
-        for k in 0..10u64 {
-            assert!(t.has_pk((r * 100 + k) as u128), "row present after flush-drain");
-        }
+    let all_keys =
+        || std::iter::once(10_000u128).chain((0..6u64).flat_map(|r| (0..10).map(move |k| (r * 100 + k) as u128)));
+    for k in all_keys() {
+        assert!(t.has_pk(k), "row {k} present after flush-drain");
     }
 
     let t2 = new_table(&tdir, schema, 8100, 96, RecoverySource::SalReplay);
-    for r in 0..6u64 {
+    for k in all_keys() {
+        assert!(t2.has_pk(k), "row {k} survives flush-drain + reopen");
+    }
+}
+
+/// A store held as a read replica of another process's directory never writes
+/// into it, however far past its RAM-tier ceiling it grows.
+#[test]
+fn a_store_held_in_ram_never_spills() {
+    let dir = tempfile::tempdir().unwrap();
+    let tdir = dir.path().join("held_in_ram");
+    let schema = make_schema_u64_i64();
+    let mut t = new_table(&tdir, schema, 8300, 96, RecoverySource::SalReplay);
+    t.ram_tier.set_budget(96);
+    t.hold_in_ram();
+
+    for r in 0..20u64 {
+        let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+        t.ingest_owned_batch(make_batch(&rows)).unwrap();
+    }
+    assert!(t.all_shard_arcs().is_empty(), "nothing reached the shard tier");
+    assert_eq!(
+        count_files(&tdir, |n| n.ends_with(".db")),
+        0,
+        "no shard file was written"
+    );
+    for r in 0..20u64 {
         for k in 0..10u64 {
-            assert!(t2.has_pk((r * 100 + k) as u128), "row survives flush-drain + reopen");
+            assert!(t.has_pk((r * 100 + k) as u128), "row held in RAM");
         }
     }
 }
