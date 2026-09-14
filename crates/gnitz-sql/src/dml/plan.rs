@@ -251,7 +251,7 @@ fn index_plan<'e>(
     schema: &Schema,
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
     let bound = ReadBound::IndexRange {
-        bound: gnitz_wire::IndexBound { idx_cols: c.idx_cols, desc: c.desc },
+        bound: c.bound(),
         walk: match whole {
             Some(_) => IndexWalk::Optional,
             None => IndexWalk::Required,

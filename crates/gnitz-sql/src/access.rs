@@ -357,6 +357,11 @@ pub(crate) struct IndexRangeCandidate<'e> {
 }
 
 impl IndexRangeCandidate<'_> {
+    /// The walk's wire bound.
+    pub(crate) fn bound(&self) -> gnitz_wire::IndexBound {
+        gnitz_wire::IndexBound { idx_cols: self.idx_cols, desc: self.desc }
+    }
+
     /// A point pinning every column of a UNIQUE index: at most one row, whatever
     /// the walk costs — the one fact comparable against a PK candidate.
     pub(crate) fn is_unique_point(&self) -> bool {

@@ -446,19 +446,14 @@ fn a_non_reindex_map_contributes_no_scatter_key() {
     assert!(load::scatter_key_of_scan(&loaded, 0).0.is_empty());
 }
 
-// ── scan_tid_through_filters: the backward (shard → scan) walk ──────────
+// ── scan_through_row_local: the backward (shard → scan) walk ────────────
 //
 // The view exchange-skip detector's source resolution. Exchanging is also
 // correct, so the skip has no observable "fired" signal at the E2E layer; these
 // are what pin that the walk engages exactly when it should.
 
-/// `Filter` is the only operator transparent to the shard key: it is
-/// row-selective, never re-keys the PK region and never moves a row off-worker.
-/// A re-keying `Map` rewrites the PK, and a `WorkerFilter` is a different
-/// variant altogether — neither is crossed, and a `Filter` below either does not
-/// rescue it.
 #[test]
-fn the_shard_walk_crosses_filters_and_nothing_else() {
+fn the_shard_walk_crosses_row_local_nodes_and_nothing_else() {
     let chain = |mids: Vec<OpNode>| {
         let shard = mids.len() as i32 + 1;
         let mut nodes = HashMap::from([
@@ -469,16 +464,38 @@ fn the_shard_walk_crosses_filters_and_nothing_else() {
             nodes.insert(i as i32 + 1, op);
         }
         let edges = (0..shard).map(|i| (i, i + 1, SLOT_IN)).collect();
-        scan_tid_through_filters(&loaded_for_test(nodes, edges), shard)
+        scan_through_row_local(&loaded_for_test(nodes, edges), shard)
     };
     let filter = || OpNode::Filter(dummy_expr_blob());
     let rekey = || scatter_reindex(&[2]);
-    assert_eq!(chain(vec![]), Some(7), "a bare scan resolves on the first hop");
-    assert_eq!(chain(vec![filter()]), Some(7));
+    let copy = || OpNode::Map(MapKind::Projection(vec![1]));
+    let compute = || {
+        OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
+            program: dummy_expr_blob(),
+            out_cols: vec![],
+        }))
+    };
+    assert_eq!(chain(vec![]), Some((7, false)), "a bare scan resolves on the first hop");
+    assert_eq!(chain(vec![filter()]), Some((7, false)));
     assert_eq!(
         chain(vec![filter(), filter()]),
-        Some(7),
+        Some((7, false)),
         "a Filter chain is transparent"
+    );
+    assert_eq!(
+        chain(vec![copy()]),
+        Some((7, true)),
+        "a copy list carries the PK region"
+    );
+    assert_eq!(
+        chain(vec![compute()]),
+        Some((7, true)),
+        "an expression map carries the PK region"
+    );
+    assert_eq!(
+        chain(vec![filter(), compute(), filter()]),
+        Some((7, true)),
+        "filters and maps interleave"
     );
     assert_eq!(chain(vec![rekey()]), None, "a reindex Map re-keys the PK");
     assert_eq!(
@@ -507,7 +524,7 @@ fn the_shard_walk_bails_at_a_fan_in() {
         }
         let mut edges = vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)];
         edges.extend((2..shard).map(|i| (i, i + 1, SLOT_IN)));
-        scan_tid_through_filters(&loaded_for_test(nodes, edges), shard)
+        scan_through_row_local(&loaded_for_test(nodes, edges), shard)
     };
     assert_eq!(union_then(vec![]), None, "the Union feeds the shard directly");
     assert_eq!(

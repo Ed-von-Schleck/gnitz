@@ -165,6 +165,11 @@ pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, GnitzSqlErro
         .ok_or_else(|| GnitzSqlError::Internal("HIR column reference has no layout slot".into()))
 }
 
+/// [`slot_of`] for each of `ids`, in order.
+pub(crate) fn slots_of(layout: &[ColId], ids: &[ColId]) -> Result<Vec<usize>, GnitzSqlError> {
+    ids.iter().map(|&id| slot_of(layout, id)).collect()
+}
+
 /// Leaf reference for HIR expressions: a resolved column, or a bound subquery
 /// awaiting decorrelation. A `Subquery` leaf is minted by bind (an EXISTS/IN/
 /// scalar node bound in place) and consumed entirely by the decorrelation rewrite
@@ -305,22 +310,12 @@ pub(crate) enum RelExpr {
         /// The ON predicate, in whichever of its two forms the pipeline has reached.
         on: JoinOn,
     },
-    /// A GROUP BY / aggregate reduce over `pre` applied to `input`. Its output is
-    /// the group columns, then each aggregate's raw value and (AVG / nullable SUM)
-    /// its `COUNT_NON_NULL` companion — the **raw** shape the finalize `Project`
-    /// above renders.
-    ///
-    /// The hidden cardinality COUNT the engine gates group existence on is *not*
-    /// modelled here: it is a physical emission artifact with no logical identity
-    /// (nothing can reference it), appended by `agg::ensure_cardinality_count` at
-    /// the layer that owns spec layout.
+    /// A GROUP BY / aggregate reduce: the group columns, then each aggregate's raw
+    /// value and companion, which the finalize `Project` above renders. The
+    /// engine's cardinality COUNT has no logical column here.
     Reduce {
         input: Rc<RelExpr>,
-        /// The pre-map bind inserted so the reduce can group by, or aggregate, an
-        /// expression (`GROUP BY a + b`): `input`'s columns passed through, then
-        /// one item per materialized expression. Empty when there is none.
-        pre: Vec<ProjEntry>,
-        /// `ColId`s of the reduce's input — `pre`'s outputs, or `input`'s own.
+        /// `ColId`s of `input`'s columns; an expression key is a `Project` column below.
         group_cols: Vec<ColId>,
         aggs: Vec<HirAgg>,
     },
@@ -729,13 +724,8 @@ impl RelExpr {
 
     /// A reduce. `aggs` are already validated + nullability-stamped by bind (which
     /// holds the input env), so this is a plain node build — parity by construction.
-    pub(crate) fn reduce(
-        input: Rc<RelExpr>,
-        pre: Vec<ProjEntry>,
-        group_cols: Vec<ColId>,
-        aggs: Vec<HirAgg>,
-    ) -> Rc<RelExpr> {
-        Rc::new(RelExpr::Reduce { input, pre, group_cols, aggs })
+    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: Vec<HirAgg>) -> Rc<RelExpr> {
+        Rc::new(RelExpr::Reduce { input, group_cols, aggs })
     }
 
     /// A DISTINCT over its input's visible columns.
@@ -904,13 +894,8 @@ impl RelExpr {
             RelExpr::Project { input, items } => one!(input, |n| RelExpr::project(n, items.clone())),
             RelExpr::Distinct { input } => one!(input, RelExpr::distinct),
             RelExpr::Alias { input, cols } => one!(input, |n| Rc::new(RelExpr::Alias { input: n, cols: cols.clone() })),
-            RelExpr::Reduce { input, pre, group_cols, aggs } => {
-                one!(input, |n| RelExpr::reduce(
-                    n,
-                    pre.clone(),
-                    group_cols.clone(),
-                    aggs.clone()
-                ))
+            RelExpr::Reduce { input, group_cols, aggs } => {
+                one!(input, |n| RelExpr::reduce(n, group_cols.clone(), aggs.clone()))
             }
             RelExpr::Join { left, right, kind, on } => two!(left, right, |l, r| Rc::new(RelExpr::Join {
                 left: l,
@@ -935,22 +920,14 @@ impl RelExpr {
         })
     }
 
-    /// The node's output columns. `Get` returns its minted cols; `Filter` passes
-    /// through; `Project` is its `ProjEntry.out`s; `Join` is left ++ right with
-    /// the null-providing side widened per `kind` (right nullable for Left, left
-    /// for Right, both for Full) — exactly `combined_payload_coldefs`, applied to
-    /// the `HirCol` defs (same `ColId`s — widening changes only nullability).
+    /// The node's output columns.
     pub(crate) fn cols(&self) -> Vec<HirCol> {
         match self {
             RelExpr::Get { cols, .. } => cols.clone(),
             RelExpr::Filter { input, .. } => input.cols(),
             RelExpr::Project { items, .. } => items.iter().map(|e| e.out.clone()).collect(),
             RelExpr::Join { left, right, kind, .. } => match kind {
-                // A semi/anti join carries only the left (outer) columns; a mark
-                // join appends its synthetic `0/1` column after them. The equi/
-                // outer joins are left ++ right with the null-providing side widened
-                // per `kind` (`combined_payload_coldefs`, applied to the `HirCol`
-                // defs — same `ColId`s, widening changes only nullability).
+                // `join_frame`'s widening, over the logical columns.
                 JoinType::Semi | JoinType::Anti => left.cols(),
                 JoinType::Mark(id) => {
                     let mut cols = left.cols();
@@ -968,15 +945,11 @@ impl RelExpr {
                     cols
                 }
             },
-            RelExpr::Reduce { input, pre, group_cols, aggs } => {
+            RelExpr::Reduce { input, group_cols, aggs } => {
                 // Group cols keep their source `HirCol`s (from the reduce's input);
                 // then each aggregate's raw value + companion columns. The physical
                 // cardinality COUNT has no logical column and is absent here.
-                let in_cols = if pre.is_empty() {
-                    input.cols()
-                } else {
-                    pre.iter().map(|e| e.out.clone()).collect()
-                };
+                let in_cols = input.cols();
                 let mut cols: Vec<HirCol> = group_cols.iter().map(|id| hircol_of(&in_cols, *id).clone()).collect();
                 for a in aggs {
                     cols.push(a.out.clone());

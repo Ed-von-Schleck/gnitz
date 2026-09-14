@@ -1,30 +1,24 @@
-//! The set-operation and DISTINCT emission shell. Each side is content-hashed to
-//! a synthetic PK (reusing `hash_shard_side`) and combined with the retained
-//! join-free `union`/`negate`/`positive_diff`/`distinct` arithmetic
-//! (`set_op_leaves`). A pure pass-through plain side reads its base relation
-//! directly (its source columns hash by value); every other side — a computed
-//! projection, a combine — is cut to a hidden segment by the shared rule, so the
-//! set identity is materialized before it is hashed. The shared source-collision
-//! rule then wraps a repeated relation (`t EXCEPT t`) in a pass-through segment.
+//! The set-operation and DISTINCT shell: each side, opened through the spine, is
+//! content-hashed to a synthetic PK and combined by weight arithmetic.
 
-use super::super::{slot_of, ColId, HirCol, HirExpr, ProjEntry, RelExpr, SetOpKind};
+use super::super::{slots_of, ColId, HirCol, RelExpr, SetOpKind};
 use super::prims::self_derived_key;
-use super::{emit_filter, resolve_collisions, resolve_in_place, resolve_input, CutMemo, Frame, SegInput};
+use super::spine::{open, Spine, Top};
+use super::{materialize, CutMemo};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
-use crate::hir::physical;
-use crate::ir::BoundExpr;
+use crate::hir::physical::Frame;
 use crate::validate::reject_float_keys;
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexSlot, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, ReindexSlot, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
 
-/// Lower a `SetOp` body to circuit pieces + output `ColId` layout.
-pub(crate) fn lower_setop(
+/// Lower a `SetOp` body to circuit pieces.
+pub(super) fn lower_setop(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     setop: &RelExpr,
-) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
+) -> Result<EmitPieces, GnitzSqlError> {
     let RelExpr::SetOp { op, all, left, right, out } = setop else {
         unreachable!("lower_setop receives a SetOp");
     };
@@ -36,37 +30,35 @@ pub(crate) fn lower_setop(
     // a distinct branch id; every deduplicating op uses branch 0.
     let right_branch_id = matches!((op, all), (SetOpKind::Union, true)) as u8;
 
-    let mut cb = CircuitBuilder::new(0);
-    let side_ids: [Vec<ColId>; 2] = [
+    let ids: [Vec<ColId>; 2] = [
         out.iter().map(|c| c.left).collect(),
         out.iter().map(|c| c.right).collect(),
     ];
-    let (l_node, l_slots, r_node, r_slots) = lower_sides(
-        &mut cb,
-        chain,
-        memo,
-        [left, right],
-        &side_ids,
-        // UNION / UNION ALL are exempt from the collision rule: they are linear
-        // merges the dag drives by cloning one epoch's delta to both sides.
-        matches!(op, SetOpKind::Union),
-    )?;
-
-    // Each side's hashed columns, carrying the promotion target `RelExpr::set_op`
-    // stamped per pair.
-    let left_key: Vec<ReindexSlot> = l_slots
-        .iter()
-        .zip(out)
-        .map(|(&s, c)| (s as u32, c.left_target))
-        .collect();
-    let right_key: Vec<ReindexSlot> = r_slots
-        .iter()
-        .zip(out)
-        .map(|(&s, c)| (s as u32, c.right_target))
-        .collect();
-
-    let left_node = hash_shard_side(&mut cb, l_node, &left_key, 0);
-    let right_node = hash_shard_side(&mut cb, r_node, &right_key, right_branch_id);
+    let live = |ids: &[ColId]| ids.iter().copied().collect::<HashSet<ColId>>();
+    let mut sides = [
+        open(chain, memo, left, &live(&ids[0]))?,
+        open(chain, memo, right, &live(&ids[1]))?,
+    ];
+    // UNION / UNION ALL are linear merges the dag drives by cloning one epoch's
+    // delta to both sides; every other operator needs two distinct sources.
+    if *op != SetOpKind::Union && sides[0].tid() == sides[1].tid() {
+        sides[1] = Spine::segment(materialize(chain, memo, right, &live(&ids[1]))?);
+    }
+    let mut cb = CircuitBuilder::new();
+    let mut hashed = Vec::with_capacity(2);
+    for (i, side) in sides.into_iter().enumerate() {
+        let (node, frame) = side.emit(&mut cb, Top::Slots, "set operation input")?;
+        // Each side's hashed columns, carrying the promotion target
+        // `RelExpr::set_op` stamped per pair.
+        let key: Vec<ReindexSlot> = slots_of(&frame.layout, &ids[i])?
+            .into_iter()
+            .zip(out)
+            .map(|(s, c)| (s as u32, if i == 0 { c.left_target } else { c.right_target }))
+            .collect();
+        let branch_id = if i == 0 { 0 } else { right_branch_id };
+        hashed.push(hash_shard_side(&mut cb, node, &key, branch_id));
+    }
+    let (left_node, right_node) = (hashed[0], hashed[1]);
 
     let out_node = match op {
         SetOpKind::Union if *all => cb.union(left_node, right_node),
@@ -88,177 +80,47 @@ pub(crate) fn lower_setop(
         }
     };
     cb.sink(out_node);
-    hashed_out(cb, "_set_pk", out.iter().map(|c| &c.out))
+    Ok(EmitPieces {
+        circuit: cb.build(),
+        out: hashed_out("_set_pk", out.iter().map(|c| &c.out)),
+    })
 }
 
 /// Lower a `SELECT DISTINCT` body (`Distinct(Project(...))`) — dedup over the
 /// projected content via the synthetic hash key.
-pub(crate) fn lower_distinct(
+pub(super) fn lower_distinct(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     input: &Rc<RelExpr>,
-) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
+) -> Result<EmitPieces, GnitzSqlError> {
     let side_cols = input.cols();
     // A float set-identity column breaks content-hash equality (IEEE-754).
     reject_float_keys(side_cols.iter().map(|c| &c.def), "SELECT DISTINCT")?;
-    let side_ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
-    let mut cb = CircuitBuilder::new(0);
-    let (seg, kind) = resolve_set_input(chain, memo, input, &side_ids)?;
-    let (node, slots) = emit_side(&mut cb, &seg, &kind, &side_ids)?;
+    let ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
+    let spine = open(chain, memo, input, &ids.iter().copied().collect())?;
+    let mut cb = CircuitBuilder::new();
+    let (node, frame) = spine.emit(&mut cb, Top::Slots, "SELECT DISTINCT input")?;
+    let slots = slots_of(&frame.layout, &ids)?;
     let sharded = hash_shard_side(&mut cb, node, &self_derived_key(&slots), 0);
     let distinct_node = cb.distinct(sharded);
     cb.sink(distinct_node);
-    hashed_out(cb, "_distinct_pk", side_cols.iter())
+    Ok(EmitPieces {
+        circuit: cb.build(),
+        out: hashed_out("_distinct_pk", side_cols.iter()),
+    })
 }
 
-/// Finish a content-hashed body: build the circuit and pair the synthetic hidden
-/// U128 hash PK with the body's output columns, returning the pieces plus the
-/// output `ColId` layout. One home for the `_set_pk` / `_distinct_pk` convention.
+/// A content-hashed body's output frame: the synthetic hidden U128 hash PK, then
+/// the body's output columns. One home for the `_set_pk` / `_distinct_pk`
+/// convention.
 ///
 /// No duplicate-name guard: bind runs one over the projection these columns come
 /// from, and neither shell renames anything.
-fn hashed_out<'a>(
-    cb: CircuitBuilder,
-    pk_name: &str,
-    cols: impl Iterator<Item = &'a HirCol>,
-) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
-    let circuit = cb.build();
-    let (mut out_cols, mut layout) = (
+fn hashed_out<'a>(pk_name: &str, cols: impl Iterator<Item = &'a HirCol>) -> Frame {
+    Frame::keyed(
         vec![ColumnDef::new(pk_name, TypeCode::U128, false).hidden()],
-        vec![ColId::NONE],
-    );
-    for c in cols {
-        out_cols.push(c.def.clone());
-        layout.push(c.id);
-    }
-    Ok((EmitPieces { circuit, out_cols, pk_arity: 1 }, layout))
-}
-
-/// Lower both sides of a set operation, then apply the source-collision rule over
-/// their **resolved** tids — so a side that already became its own segment is
-/// correctly seen as distinct and never wrapped redundantly.
-fn lower_sides(
-    cb: &mut CircuitBuilder,
-    chain: &mut ViewChain,
-    memo: &mut CutMemo,
-    sides: [&Rc<RelExpr>; 2],
-    side_ids: &[Vec<ColId>; 2],
-    exempt: bool,
-) -> Result<(NodeId, Vec<usize>, NodeId, Vec<usize>), GnitzSqlError> {
-    let (l_seg, l_kind) = resolve_set_input(chain, memo, sides[0], &side_ids[0])?;
-    let (r_seg, r_kind) = resolve_set_input(chain, memo, sides[1], &side_ids[1])?;
-    // The collision rule may re-point a side at a pass-through wrapper segment; the
-    // wrapper's layout still carries the source ids, so the addressing kind holds.
-    // Its demand is the side's set-identity columns plus the WHERE a
-    // `PassThrough` side still applies over it.
-    let live = [side_live(&side_ids[0], &l_kind), side_live(&side_ids[1], &r_kind)];
-    let mut inputs = [l_seg, r_seg];
-    resolve_collisions(chain, &mut inputs, &live, exempt)?;
-    let [l_seg, r_seg] = inputs;
-    let (l_node, l_slots) = emit_side(cb, &l_seg, &l_kind, &side_ids[0])?;
-    let (r_node, r_slots) = emit_side(cb, &r_seg, &r_kind, &side_ids[1])?;
-    Ok((l_node, l_slots, r_node, r_slots))
-}
-
-/// One set-op side's demand on the source a pass-through wrapper would be built
-/// over — exactly what [`emit_side`] resolves against that side's layout: the
-/// item expressions plus the still-to-be-inlined WHERE for a pass-through side,
-/// the set-identity output ids for a segment one.
-fn side_live(side_ids: &[ColId], kind: &SetSideKind<'_>) -> HashSet<ColId> {
-    let mut live: HashSet<ColId> = HashSet::new();
-    match kind {
-        SetSideKind::PassThrough { items, where_preds } => super::Demand { items, where_preds }.refs(&mut live),
-        SetSideKind::Segment => live.extend(side_ids.iter().copied()),
-    }
-    live
-}
-
-/// How a resolved set-op side addresses its set-identity columns — **not** the
-/// same `ColId` space for the two shapes, so the discrimination is made once at
-/// resolve time and carried, rather than re-derived (and re-validated) at emit.
-enum SetSideKind<'a> {
-    /// A pure pass-through plain side, read straight off its base relation: the
-    /// layout carries the *source* ids, so a slot comes from resolving the
-    /// projection item's own expression — and the side's WHERE is still to be
-    /// inlined at emit (the segment shape already materialized its own).
-    PassThrough {
-        items: &'a [ProjEntry],
-        where_preds: &'a [HirExpr],
-    },
-    /// Every other shape — a computed projection, a combine — cut to a hidden
-    /// segment so the set identity is materialized before it is hashed. Its layout
-    /// carries the projection's *output* ids, so a slot is `slot_of(out_id)`.
-    Segment,
-}
-
-/// Resolve one set-op side to its delta source plus the addressing kind, making
-/// the pass-through-vs-segment decision once.
-fn resolve_set_input<'a>(
-    chain: &mut ViewChain,
-    memo: &mut CutMemo,
-    side: &'a Rc<RelExpr>,
-    side_ids: &[ColId],
-) -> Result<(SegInput, SetSideKind<'a>), GnitzSqlError> {
-    // A pass-through side is one only while its base is read in place: a base
-    // that must be cut has no set identity until it is materialized, so the side
-    // becomes an ordinary segment.
-    if let Some((base, items, where_preds)) = passthrough_parts(side) {
-        if let Some(seg) = resolve_in_place(chain, memo, base)? {
-            return Ok((seg, SetSideKind::PassThrough { items, where_preds }));
-        }
-    }
-    let live: HashSet<ColId> = side_ids.iter().copied().collect();
-    Ok((resolve_input(chain, memo, side, &live)?, SetSideKind::Segment))
-}
-
-/// A `Project(Filter?(_))` whose every item is a bare column ref, split into its
-/// base, projection items and WHERE — else `None`, since a computed item has no
-/// set identity until it is materialized. Returning the parts (rather than just
-/// the base) is what lets the emit below consume the shape without re-matching.
-fn passthrough_parts(side: &Rc<RelExpr>) -> Option<(&Rc<RelExpr>, &[ProjEntry], &[HirExpr])> {
-    let RelExpr::Project { input, items } = side.as_ref() else {
-        return None;
-    };
-    if super::projection_is_computed(items) {
-        return None;
-    }
-    let (where_preds, inner) = crate::hir::split_filter(input);
-    Some((inner, items, where_preds))
-}
-
-/// Emit one resolved side's delta input and return it with the slots
-/// `hash_shard_side` projects, in set-op column order.
-fn emit_side(
-    cb: &mut CircuitBuilder,
-    seg: &SegInput,
-    kind: &SetSideKind<'_>,
-    side_ids: &[ColId],
-) -> Result<(NodeId, Vec<usize>), GnitzSqlError> {
-    let inp = cb.input_delta_tagged(seg.tid);
-    match kind {
-        SetSideKind::Segment => {
-            let slots = side_ids
-                .iter()
-                .map(|id| slot_of(&seg.layout, *id))
-                .collect::<Result<_, _>>()?;
-            Ok((inp, slots))
-        }
-        SetSideKind::PassThrough { items, where_preds } => {
-            let node = emit_filter(cb, inp, *where_preds, &Frame::of(&seg.layout, &seg.schema))?;
-            // Every item is a bare column ref — that is what makes the side
-            // pass-through — so each resolves to exactly one source slot.
-            let slots = items
-                .iter()
-                .map(|e| match physical::resolve_refs(&e.expr, &seg.layout)? {
-                    BoundExpr::ColRef(s) => Ok(s),
-                    _ => Err(GnitzSqlError::Internal(
-                        "pass-through side item is not a column ref".into(),
-                    )),
-                })
-                .collect::<Result<_, _>>()?;
-            Ok((node, slots))
-        }
-    }
+        cols.map(|c| (c.id, c.def.clone())),
+    )
 }
 
 /// Hash the projected columns to a synthetic content PK — widening each column

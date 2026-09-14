@@ -1,29 +1,14 @@
-//! HIR → fold lowering: the ad-hoc read path's half of the reduce, the sibling
-//! of `lower::reduce`'s circuit half.
-//!
-//! Both consume the same bound `Project(Filter_having?(Reduce(Get)))` and derive
-//! the same physical facts from the same shared rules — the pre-map
-//! (`physicalize_pre_map` / `pre_map_blob`), the spec decomposition
-//! (`push_agg_specs`), and the reduce-output layout. They differ only in the
-//! sink: the view emits a circuit whose reduce strategy `ReduceShape` picks,
-//! while an ad-hoc fold is **always** `SyntheticFold` (the stateless per-worker
-//! hash-fold has one partial layout), carries no `should_emit` cardinality
-//! COUNT, and hands its finishing to the client.
-//!
-//! `Distinct(Project(Get))` — an ad-hoc `SELECT DISTINCT` — folds here too, as a
-//! reduce with zero aggregates whose group set is the projection.
-//!
-//! What leaves here is layout, not execution: positions, a wire program, and
-//! `BoundExpr`s over the partial-reply schema. Compiling those to evaluators and
-//! running them is `dml::select` / `exec::agg_finish`'s work, which keeps this
-//! module (like every other `hir` one) free of the exec layer.
+//! HIR → fold lowering: the ad-hoc read's reduce — or `SELECT DISTINCT`, a fold
+//! with no aggregate — as layout for a stateless `SyntheticFold` the client
+//! finishes. It shares `lower::reduce`'s rules and builds no evaluator.
 
-use super::super::{physical, slot_of};
-use super::super::{split_filter, ColId, GetSource, RelExpr};
-use super::{physicalize_pre_map, pre_map_blob, reduce_input_of, reduce_out_layout, resolve_reduce_specs, ReduceSpecs};
-use crate::agg::{fold_partial_schema, AggSpec, ReduceLayout};
+use super::super::physical::{self, Frame};
+use super::super::{as_col, split_filter, ColId, GetSource, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::{reduce_out_layout, resolve_reduce_specs, ReduceSpecs};
+use crate::agg::{fold_partial_schema, AggSpec};
+use crate::codec::project_schema::read_reply_shape;
 use crate::error::GnitzSqlError;
-use crate::ir::BoundExpr;
+use crate::ir::{BExpr, BoundExpr};
 use crate::validate::reject_float_keys;
 use gnitz_core::{ColumnDef, Schema};
 use gnitz_wire::ComputeMap;
@@ -72,131 +57,124 @@ fn adhoc_get(base: &RelExpr) -> Result<(&Arc<Schema>, Vec<ColId>), GnitzSqlError
     Ok((schema, cols.iter().map(|c| c.id).collect()))
 }
 
-/// Lower a bound ad-hoc grouped body to its fold pieces.
+/// Lower a bound ad-hoc grouped or `SELECT DISTINCT` body to its fold pieces.
 pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
-    if let RelExpr::Distinct { input } = rel {
-        return lower_distinct_fold(input);
-    }
-    let RelExpr::Project { input, items } = rel else {
-        return Err(GnitzSqlError::Internal(
+    match rel {
+        RelExpr::Distinct { input } => {
+            let RelExpr::Project { input: base, items } = input.as_ref() else {
+                return Err(GnitzSqlError::Internal(
+                    "ad-hoc SELECT DISTINCT body is not a projection".into(),
+                ));
+            };
+            // A float set-identity column breaks content-hash equality (IEEE-754) —
+            // the same gate a DISTINCT view is lowered under.
+            reject_float_keys(items.iter().map(|e| &e.out.def), "SELECT DISTINCT")?;
+            // Bare items group the source columns where they lie; any computed item
+            // makes the projection the pre-map and groups its columns.
+            let (pre, group_cols) = match items.iter().map(|e| as_col(&e.expr)).collect::<Option<Vec<_>>>() {
+                Some(ids) => (None, ids),
+                None => (Some(items.as_slice()), items.iter().map(|e| e.out.id).collect()),
+            };
+            // Every item passes its own group column through: the reduce already
+            // evaluated a computed one into that column.
+            let finalize: Vec<ProjEntry> = items
+                .iter()
+                .zip(&group_cols)
+                .map(|(e, &id)| ProjEntry {
+                    expr: BExpr::ColRef(HirRef::Col(id)),
+                    out: e.out.clone(),
+                })
+                .collect();
+            fold(
+                base,
+                pre,
+                &group_cols,
+                &[],
+                &[],
+                &finalize,
+                "SELECT DISTINCT over a computed column",
+            )
+        }
+        RelExpr::Project { input, items } => {
+            // HAVING is a Filter between the projection and the reduce.
+            let (having, reduce) = split_filter(input);
+            let RelExpr::Reduce { input, group_cols, aggs } = reduce.as_ref() else {
+                return Err(GnitzSqlError::Internal("ad-hoc grouped body has no reduce".into()));
+            };
+            let (pre, base) = match input.as_ref() {
+                RelExpr::Project { input, items } => (Some(items.as_slice()), input),
+                _ => (None, input),
+            };
+            fold(
+                base,
+                pre,
+                group_cols,
+                aggs,
+                having,
+                items,
+                "GROUP BY over a computed key or aggregate argument",
+            )
+        }
+        _ => Err(GnitzSqlError::Internal(
             "ad-hoc grouped body is not a projection".into(),
-        ));
+        )),
+    }
+}
+
+/// The fold of `group_cols` / `aggs` over `pre` (or the source itself) applied to
+/// `base`, then `having` and `finalize` over the partial reply. `what` names a
+/// pre-map whose schema is inadmissible.
+fn fold(
+    base: &RelExpr,
+    pre: Option<&[ProjEntry]>,
+    group_cols: &[ColId],
+    aggs: &[HirAgg],
+    having: &[HirExpr],
+    finalize: &[ProjEntry],
+    what: &str,
+) -> Result<FoldPieces, GnitzSqlError> {
+    let (source_schema, base_layout) = adhoc_get(base)?;
+    // The pre-map, physicalized over the source — the same projection `lower_reduce`
+    // fuses, so the reduce input's column order is identical on both paths. Only
+    // its payload slots are written: the PK region rides through verbatim.
+    let (reduce_in, map) = match pre {
+        None => (
+            Frame {
+                layout: base_layout,
+                schema: Arc::clone(source_schema),
+            },
+            None,
+        ),
+        Some(items) => {
+            let p = physical::physicalize_projection(items, &base_layout, source_schema)?;
+            let columns = Arc::unwrap_or_clone(p.out.schema).columns;
+            let (schema, map) = read_reply_shape(&p.items, columns, source_schema, what)?;
+            (
+                Frame {
+                    layout: p.out.layout,
+                    schema: Arc::new(schema),
+                },
+                Some(map),
+            )
+        }
     };
-    // HAVING is a Filter between the projection and the reduce; without one the
-    // projection sits straight on the reduce.
-    let (having_preds, reduce) = split_filter(input);
-    let RelExpr::Reduce { input, pre, group_cols, aggs } = reduce.as_ref() else {
-        return Err(GnitzSqlError::Internal("ad-hoc grouped body has no reduce".into()));
-    };
-    let (source_schema, base_layout) = adhoc_get(input)?;
-
-    // The pre-map, physicalized over the source — the same call `lower_reduce`
-    // makes, so the reduce input's column order is identical on both paths.
-    let pre = physicalize_pre_map(pre, &base_layout, source_schema)?;
-    let (reduce_schema, reduce_layout) = reduce_input_of(
-        &pre,
-        &base_layout,
-        source_schema,
-        "GROUP BY over a computed key or aggregate argument",
-    )?;
-
-    let ReduceSpecs {
-        group_positions,
-        specs: agg_specs,
-        agg_starts,
-    } = resolve_reduce_specs(group_cols, aggs, reduce_layout, &reduce_schema)?;
-
+    let ReduceSpecs { group_positions, specs, agg_starts } =
+        resolve_reduce_specs(group_cols, aggs, &reduce_in.layout, &reduce_in.schema)?;
     // The partial reply layout, which every expression below resolves against.
-    let ReduceLayout {
-        schema: partial_schema,
-        group_slots,
-        agg_col_offset,
-    } = fold_partial_schema(&reduce_schema, &group_positions, &agg_specs)?;
-
-    let out_layout = reduce_out_layout(
-        partial_schema.columns.len(),
-        group_cols,
-        &group_slots,
-        aggs,
-        &agg_starts,
-        agg_col_offset,
-    );
-
-    let having = having_preds
-        .iter()
-        .map(|p| physical::resolve_refs(p, &out_layout))
-        .collect::<Result<Vec<_>, _>>()?;
-    let finalize = items
+    let partial = fold_partial_schema(&reduce_in.schema, &group_positions, &specs)?;
+    let out_layout = reduce_out_layout(&partial, group_cols, aggs, &agg_starts);
+    let having = physical::resolve_preds(having, &out_layout)?;
+    let finalize = finalize
         .iter()
         .map(|e| Ok((physical::resolve_refs(&e.expr, &out_layout)?, e.out.def.clone())))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-
-    let pre_map = pre_map_blob(&pre, source_schema)?;
-
     Ok(FoldPieces {
-        reduce_schema,
+        reduce_schema: reduce_in.schema,
         group_positions,
-        agg_specs,
-        partial_schema,
-        pre: pre_map,
+        agg_specs: specs,
+        partial_schema: partial.schema,
+        pre: map,
         having,
-        finalize,
-    })
-}
-
-/// Lower a bound ad-hoc `SELECT DISTINCT` body (`Distinct(Project(Get))`) to the
-/// same fold pieces a grouped body produces: zero aggregates, one group column
-/// per projected item in SELECT order, and an all-pass-through finalize.
-fn lower_distinct_fold(input: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
-    let RelExpr::Project { input: base, items } = input else {
-        return Err(GnitzSqlError::Internal(
-            "ad-hoc SELECT DISTINCT body is not a projection".into(),
-        ));
-    };
-    // A float set-identity column breaks content-hash equality (IEEE-754) — the
-    // same gate a DISTINCT view is lowered under.
-    reject_float_keys(items.iter().map(|e| &e.out.def), "SELECT DISTINCT")?;
-
-    let (source_schema, base_layout) = adhoc_get(base)?;
-    let phys = physical::physicalize_projection(items, &base_layout, source_schema)?;
-    // Each item's own slot — never a PK `place_pk_front` prepended, which the user
-    // did not project and which is not part of the set identity.
-    let slots: Vec<usize> = items
-        .iter()
-        .map(|e| slot_of(&phys.layout, e.out.id))
-        .collect::<Result<_, _>>()?;
-    // Identity elision: a projection of bare source columns groups them where they
-    // already lie, so the common case carries no map program.
-    let source_slots: Option<Vec<usize>> = slots.iter().map(|&s| phys.items[s].passthrough_src()).collect();
-    let (pre, group_positions) = match source_slots {
-        Some(cols) => (None, cols),
-        None => (Some(phys), slots),
-    };
-    let (reduce_schema, _) = reduce_input_of(
-        &pre,
-        &base_layout,
-        source_schema,
-        "SELECT DISTINCT over a computed column",
-    )?;
-
-    let ReduceLayout { schema: partial_schema, group_slots, .. } =
-        fold_partial_schema(&reduce_schema, &group_positions, &[])?;
-    // Every item is a pass-through of its own group slot: the reduce already
-    // evaluated a computed one into that slot.
-    let finalize = group_slots
-        .into_iter()
-        .zip(items)
-        .map(|(slot, e)| (BoundExpr::ColRef(slot), e.out.def.clone()))
-        .collect();
-    let pre_map = pre_map_blob(&pre, source_schema)?;
-
-    Ok(FoldPieces {
-        reduce_schema,
-        group_positions,
-        agg_specs: Vec::new(),
-        partial_schema,
-        pre: pre_map,
-        having: Vec::new(),
         finalize,
     })
 }

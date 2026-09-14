@@ -244,32 +244,16 @@ def test_a_computed_key_reaches_every_position_as_one_column(client, orders):
     assert all(r.k == r.again for r in got)
 
 
-def test_a_premap_needs_a_free_column_slot(client, schema_name):
-    """A pre-map on a source already at the schema's column limit.
-
-    The pre-map's output is the source's columns *plus* the computed ones, so a
-    maximally wide source has no room for one. That has to be a plan-time feature
-    message naming the limit, not a server error for a legal statement.
-
-    The control matters as much as the rejection — one column narrower, the same
-    query must compile — or a gate that simply rejected every wide table would
-    pass the first half.
-    """
+def test_a_premap_over_a_source_at_the_column_limit(client, schema_name):
+    """The pre-map carries only the PK and what the fold reads, so a computed key
+    over a maximally wide source still fits."""
     sn = schema_name
-    # The limit counts the PK: at it there is no room for a computed key, one
-    # below it exactly one.
-    for n_cols, should_compile in ((gnitz.MAX_COLUMNS - 1, True), (gnitz.MAX_COLUMNS, False)):
-        name = f"w{n_cols}"
-        payload = ", ".join(f"c{i} BIGINT NOT NULL" for i in range(n_cols - 1))
-        client.execute_sql(
-            f"CREATE TABLE {name} (pk BIGINT PRIMARY KEY, {payload})", schema_name=sn)
-        insert(client, sn, name, [range(n_cols)])
-        q = f"SELECT c0 + 1 AS k, COUNT(*) AS c FROM {name} GROUP BY c0 + 1"
-        if should_compile:
-            assert bag(rows(client, sn, q)) == {(2, 1): 1}
-        else:
-            with pytest.raises(gnitz.GnitzError, match=str(gnitz.MAX_COLUMNS)):
-                rows(client, sn, q)
+    name = f"w{gnitz.MAX_COLUMNS}"
+    payload = ", ".join(f"c{i} BIGINT NOT NULL" for i in range(gnitz.MAX_COLUMNS - 1))
+    client.execute_sql(f"CREATE TABLE {name} (pk BIGINT PRIMARY KEY, {payload})", schema_name=sn)
+    insert(client, sn, name, [range(gnitz.MAX_COLUMNS)])
+    q = f"SELECT c0 + 1 AS k, COUNT(*) AS c FROM {name} GROUP BY c0 + 1"
+    assert bag(rows(client, sn, q)) == {(2, 1): 1}
 
 
 @pytest.mark.parametrize("where,select,group,keep,key,value", [

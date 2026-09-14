@@ -75,21 +75,23 @@ impl Circuit {
 /// Fluent builder for DBSP circuit graphs, producing a typed [`Circuit`]
 /// for `GnitzClient::create_view_chain`.
 ///
-/// Sequential `node_id`s start at 1. `primary_source_id` is fixed at
-/// construction and becomes the source of every `input_delta()` node, so it is
-/// not threaded through each call; `input_delta_tagged` names its own source.
+/// Sequential `node_id`s start at 1.
 #[derive(Clone)]
 pub struct CircuitBuilder {
-    primary_source_id: u64,
     next_node_id: u64,
     nodes: std::collections::BTreeMap<NodeId, OpNode>,
     inputs: std::collections::BTreeMap<NodeId, [Option<NodeId>; 2]>,
 }
 
+impl Default for CircuitBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CircuitBuilder {
-    pub fn new(primary_source_id: u64) -> Self {
+    pub fn new() -> Self {
         CircuitBuilder {
-            primary_source_id,
             next_node_id: 1,
             nodes: std::collections::BTreeMap::new(),
             inputs: std::collections::BTreeMap::new(),
@@ -113,25 +115,10 @@ impl CircuitBuilder {
         nid
     }
 
-    /// Primary delta input. Carries the `primary_source_id` set at builder
-    /// construction.
-    pub fn input_delta(&mut self) -> NodeId {
-        self.input_delta_bounded(None)
-    }
-
-    /// Primary delta input whose **backfill scan** is bounded to a secondary-index
-    /// range. Identical to [`Self::input_delta`] except that the initial
-    /// full-source scan reads only the index range; steady-state deltas ignore the
-    /// bound entirely. The caller still emits the full `Filter` downstream — the
-    /// bound narrows what is read, never what the view contains.
-    pub fn input_delta_bounded(&mut self, bound: Option<gnitz_wire::IndexBound>) -> NodeId {
-        self.alloc_wired(OpNode::ScanDelta { source: self.primary_source_id, bound }, &[])
-    }
-
-    /// Tagged secondary delta input for multi-input views (e.g. equijoin).
-    /// `source_table_id` becomes a real dependency.
-    pub fn input_delta_tagged(&mut self, source_table_id: u64) -> NodeId {
-        self.alloc_wired(OpNode::ScanDelta { source: source_table_id, bound: None }, &[])
+    /// A source's delta input. `bound` narrows only the source's backfill scan,
+    /// never the rows the view holds, so the caller still emits the full `Filter`.
+    pub fn input_delta(&mut self, source: u64, bound: Option<gnitz_wire::IndexBound>) -> NodeId {
+        self.alloc_wired(OpNode::ScanDelta { source, bound }, &[])
     }
 
     /// A predicate node. There is no "no `WHERE`" spelling: a caller with no
@@ -374,8 +361,25 @@ impl CircuitBuilder {
         self.alloc_wired(OpNode::IntegrateSink, &[input])
     }
 
-    /// Finalises the circuit.
-    pub fn build(self) -> Circuit {
+    /// Finalises the circuit. The engine narrows one backfill scan per circuit,
+    /// shared by every scan of its source, so one bound survives: the first on a
+    /// source scanned once.
+    pub fn build(mut self) -> Circuit {
+        let mut scans: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for op in self.nodes.values() {
+            if let OpNode::ScanDelta { source, .. } = op {
+                *scans.entry(*source).or_default() += 1;
+            }
+        }
+        let mut bounded = false;
+        for op in self.nodes.values_mut() {
+            if let OpNode::ScanDelta { source, bound } = op {
+                if bounded || scans[source] > 1 {
+                    *bound = None;
+                }
+                bounded |= bound.is_some();
+            }
+        }
         Circuit { nodes: self.nodes, inputs: self.inputs }
     }
 }

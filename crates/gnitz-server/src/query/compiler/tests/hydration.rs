@@ -2,7 +2,7 @@ use super::*;
 use gnitz_wire::{JoinKind, MapKind, OpNode};
 use std::collections::HashMap;
 
-/// The inner-equi-join shape `emit_equi_join_terms` produces, as node ids:
+/// The inner-equi-join shape `equi_prologue` produces, as node ids:
 /// two `ScanDelta`s, a reindex `Map` and an `IntegrateTrace` per side, the
 /// two cross-wired `Join(Equi)` terms behind their normalization maps,
 /// a `Union`, a residual `Filter`, a projection `Map`, and the sink.

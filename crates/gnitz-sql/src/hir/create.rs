@@ -9,12 +9,12 @@
 use crate::bind::{apply_positional_aliases, probe, Binder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::bind::ViewSurface;
-use crate::hir::chain::{debug_assert_exchange_topology, reject_circuit_column_overflow, ViewChain};
+use crate::hir::chain::ViewChain;
 use crate::validate::{
     kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, validate_user_name, QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, Schema};
+use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass};
 use sqlparser::ast::{CreateTableOptions, Ident, ObjectName, Query, Statement, Value, ValueWithSpan};
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
@@ -389,22 +389,10 @@ fn build_query_segments(
     surface: ViewSurface,
 ) -> Result<(), GnitzSqlError> {
     let capacity = options.capacity;
-    // Every view shape — linear, join, GROUP BY, DISTINCT, set operation, CTEs,
-    // and every subquery form (EXISTS/IN, scalar aggregate, ANY/ALL) — routes
-    // through the HIR pipeline: bind the `query` to a logical `RelExpr` tree,
-    // decorrelate subqueries into `Join`/`Reduce` structure, classify predicates,
-    // then lower to circuit(s) — nested combine segments, shared CTE subtrees and
-    // self-collision pass-through wrappers land on `chain`, and the final step
-    // becomes the chain's slot-0 view.
     let pieces = crate::hir::bind_and_lower(cat, binder, chain, query, capacity.is_some(), surface)?;
 
-    // Structural eligibility, over what the body actually compiled to rather than
-    // over the shapes it was written in: both bounded shapes are a single segment,
-    // and anything that cut — a derived table, EXISTS, a nested join, a
-    // non-trivial CTE — left a hidden unbounded segment holding the same rows at
-    // full width, so a capacity above it would bound nothing. `lower_body`'s
-    // per-arm rejections name the shape and come first; this catches the shapes
-    // that reach an eligible arm through a cut input, which no arm can see.
+    // Both bounded shapes compile to one segment; a body that cut left an unbounded
+    // copy of its rows behind, which a capacity would not bound.
     if capacity.is_some() && !chain.segments.is_empty() {
         return Err(GnitzSqlError::Unsupported(
             "CREATE VIEW WITH (capacity …): this body compiles to more than one view, whose \
@@ -415,28 +403,8 @@ fn build_query_segments(
     }
 
     // The final segment: the hidden segments already sit on the chain in
-    // dependency order; append the (user-named or synthetic) final view. The
-    // hidden ones were checked inside `add_segment`; this is the other of the two
-    // paths every emitted circuit reaches.
-    debug_assert_exchange_topology(&pieces.circuit);
-    // The admissibility rules only — not `schema_of`, whose `Schema::from_parts`
-    // deep-clones every `ColumnDef` for a value nothing here reads.
-    let pk_col_list = crate::hir::chain::pk_col_list(pieces.pk_arity);
-    Schema::validate_parts(&pk_col_list, &pieces.out_cols)
-        .map_err(|e| GnitzSqlError::Unsupported(format!("view output: {e}")))?;
-    // After the output schema, so a view too wide to register is named by its own
-    // columns; this catches the narrow-output body whose intermediates are wide.
-    reject_circuit_column_overflow(&pieces.circuit)?;
-    chain.segments.push(PlannedView {
-        // The user-named view is always the chain's slot 0.
-        seg: 0,
-        circuit: pieces.circuit,
-        output_columns: pieces.out_cols,
-        pk_cols: pk_col_list,
-        capacity_bytes: capacity,
-        delta_bytes: options.delta,
-    });
-    Ok(())
+    // dependency order; append the (user-named or synthetic) final view.
+    chain.push_final(pieces, capacity, options.delta)
 }
 
 #[cfg(test)]

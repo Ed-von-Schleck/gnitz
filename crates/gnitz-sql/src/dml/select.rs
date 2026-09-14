@@ -661,6 +661,6 @@ fn build_rows_shape(select: &Select, query: &Query, schema: &Schema, alias: &str
     let order = resolve_read_spec_order(&mut items, &mut out_cols, schema, alias, &keys)?;
 
     // Reply schema + projection map.
-    let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema)?;
+    let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema, "read-spec reply schema is invalid")?;
     Ok(RowsShape { reply_schema, projection, order })
 }

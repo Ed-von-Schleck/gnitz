@@ -389,8 +389,8 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
         .unwrap();
     let first = client.create_view("mixed", "v", tid, &cols).unwrap();
 
-    let mut cb = gnitz_core::CircuitBuilder::new(tid);
-    let scan = cb.input_delta();
+    let mut cb = gnitz_core::CircuitBuilder::new();
+    let scan = cb.input_delta(tid, None);
     cb.sink(scan);
     let vids = client
         .create_view_chain(

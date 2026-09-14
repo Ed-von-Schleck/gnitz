@@ -193,16 +193,12 @@ fn reduce_over_distinct(sql: &str) -> Option<Vec<String>> {
     let RelExpr::Project { input, .. } = rel.as_ref() else {
         panic!("{sql}: no projection")
     };
-    let RelExpr::Reduce { input, pre, .. } = input.as_ref() else {
+    let RelExpr::Reduce { input, .. } = input.as_ref() else {
         panic!("{sql}: no reduce")
     };
     let RelExpr::Distinct { input } = input.as_ref() else {
         return None;
     };
-    assert!(
-        pre.is_empty(),
-        "{sql}: the reduce kept a pre-map beside its distinct input"
-    );
     let RelExpr::Project { items, .. } = input.as_ref() else {
         panic!("{sql}: no distinct projection")
     };

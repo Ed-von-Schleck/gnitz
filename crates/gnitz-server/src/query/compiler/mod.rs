@@ -30,7 +30,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 // `pub(super)` by default: `dag` is the only module that names the compiler, so
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
 pub(super) use load::for_each_scan_edge;
-use load::scan_tid_through_filters;
+use load::scan_through_row_local;
 pub(crate) use routing::RelayRoute;
 pub(super) use routing::ViewMeta;
 
@@ -413,11 +413,8 @@ pub(super) struct CompileOutput {
     /// The combine phase every side's relayed batch seeds — and, for a circuit
     /// with no `ExchangeShard`, the whole plan.
     pub(in crate::query) post: SubPlan,
-    /// The `(source table id, secondary-index range)` the planner pushed onto the
-    /// primary source's `ScanDelta`, consulted only by the two circuit backfill
-    /// drivers (a steady-state delta never opens the source cursor). A **physical
-    /// access hint**: `None` means "full-scan", which is always correct, and the
-    /// circuit's `Filter` carries the full predicate either way.
+    /// The backfill drivers' scan bound (`load::circuit_source_bound`): a hint, since
+    /// the circuit's `Filter` carries the full predicate either way.
     pub(in crate::query) source_bound: Option<(i64, gnitz_wire::IndexBound)>,
     /// How a capacity-bounded view recomputes one key's output rows. `None` for
     /// every unbounded view — the walk runs only under a capacity, and any

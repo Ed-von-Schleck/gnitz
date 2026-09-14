@@ -297,7 +297,7 @@ fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
         // CTE is never read and never cut.
         (
             "WITH x AS (SELECT a AS ca FROM ab) SELECT * FROM (SELECT b AS cb FROM ab) x",
-            2,
+            1,
             sh(&[("a", true, false), ("cb", false, false)]),
         ),
     ];
@@ -820,12 +820,10 @@ fn a_chain_segment_keeps_only_its_live_columns() {
     assert_eq!(keys, sh(&[("_join_pk", true, false)]));
 }
 
-/// The pass-through wrapper the source-collision rule builds is a second
-/// materialized relation, so it carries only what its own side demands — the
-/// self-join's projected and ON columns, the set-op side's set identity — not
-/// every visible column of the source.
+/// The segment cut for a repeated side carries only what that side reads, not
+/// every column of the source.
 #[test]
-fn a_collision_wrapper_keeps_only_its_live_columns() {
+fn a_collision_segment_keeps_only_its_live_columns() {
     let i = TypeCode::I64;
     let cat = catalog(vec![(
         "emp",

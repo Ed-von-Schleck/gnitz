@@ -11,8 +11,10 @@ fn seg(ids: &ColIdGen, names: &[(&str, bool)], pk_cols: Vec<u32>) -> SegInput {
         .collect();
     SegInput {
         tid: 1,
-        layout: cols.iter().map(|_| ids.next()).collect(),
-        schema: Arc::new(Schema::from_parts(cols, pk_cols).unwrap()),
+        frame: Frame {
+            layout: cols.iter().map(|_| ids.next()).collect(),
+            schema: Arc::new(Schema::from_parts(cols, pk_cols).unwrap()),
+        },
         desc: None,
     }
 }
@@ -31,8 +33,8 @@ fn a_pinned_side_keeps_its_pk_alone() {
     let left = seg(&ids, &[("v", false), ("id", false)], vec![1]);
     let right = seg(&ids, &[("id", false), ("w", false)], vec![0]);
     let range = super::super::HirRange {
-        left: left.layout[0],
-        right: right.layout[1],
+        left: left.frame.layout[0],
+        right: right.frame.layout[1],
         op: gnitz_core::RangeRel::Lt,
         tc: TypeCode::U64,
     };
@@ -54,8 +56,8 @@ fn an_unreferenced_equi_join_keeps_one_left_column() {
     let right = seg(&ids, &[("k", false), ("w", false)], vec![0]);
     let cls = class(
         vec![EqPair {
-            left: left.layout[0],
-            right: right.layout[0],
+            left: left.frame.layout[0],
+            right: right.frame.layout[0],
             tc: TypeCode::U64,
         }],
         None,
@@ -74,8 +76,8 @@ fn a_preserved_side_keeps_its_nullable_key() {
     let right = seg(&ids, &[("id", false), ("k", true)], vec![0]);
     let cls = class(
         vec![EqPair {
-            left: left.layout[1],
-            right: right.layout[1],
+            left: left.frame.layout[1],
+            right: right.frame.layout[1],
             tc: TypeCode::U64,
         }],
         None,

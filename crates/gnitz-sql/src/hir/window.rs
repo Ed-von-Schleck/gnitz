@@ -966,7 +966,7 @@ fn whole_partition(
             _ => (BExpr::LitInt(1), ColType::of(TypeCode::I64), false),
         });
     }
-    let reduce = RelExpr::reduce(wf.rel, Vec::new(), keys.clone(), aggs.list);
+    let reduce = RelExpr::reduce(wf.rel, keys.clone(), aggs.list);
     Ok(windowed(
         ids,
         reduce,
@@ -1017,7 +1017,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         });
     }
     let g_values = g_aggs.list.iter().map(HirAgg::as_value).collect();
-    let reduce = RelExpr::reduce(wf.rel, Vec::new(), g_keys.clone(), g_aggs.list);
+    let reduce = RelExpr::reduce(wf.rel, g_keys.clone(), g_aggs.list);
     let (g, _, _) = present(ids, reduce, &g_keys, "g", g_values);
 
     // The band self-join: g1 is the current peer group, g2 every group of the
@@ -1086,7 +1086,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         });
     }
     let projected_keys: Vec<ColId> = r_keys[..nkeys].to_vec();
-    let reduce = RelExpr::reduce(band, Vec::new(), r_keys, r_aggs.list);
+    let reduce = RelExpr::reduce(band, r_keys, r_aggs.list);
     Ok(windowed(ids, reduce, &projected_keys, w_keys, "r", calls, per_call))
 }
 

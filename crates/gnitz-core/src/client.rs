@@ -1315,8 +1315,8 @@ impl GnitzClient {
     ) -> Result<u64, ClientError> {
         // A minimal SCAN_DELTA → INTEGRATE_SINK circuit, built through the typed
         // builder so the row materialisation matches the stored layout exactly.
-        let mut cb = crate::circuit::CircuitBuilder::new(source_table_id);
-        let scan = cb.input_delta();
+        let mut cb = crate::circuit::CircuitBuilder::new();
+        let scan = cb.input_delta(source_table_id, None);
         cb.sink(scan);
 
         let vids = self.create_view_chain(

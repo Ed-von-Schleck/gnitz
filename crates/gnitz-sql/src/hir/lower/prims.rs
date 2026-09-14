@@ -4,10 +4,11 @@
 //! [`super::joincore`]. The pass-neutral key-pair validators live in
 //! `hir::guards`.
 
+use super::JoinSide;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr_to_program;
 use crate::ir::{BinOp, BoundExpr};
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole, ReindexSlot, Schema};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole, ReindexSlot};
 
 /// Multi-column NULL predicate for a Filter over a composite equijoin key,
 /// reusing the WHERE-clause bound-expr → program path so each column index
@@ -72,40 +73,11 @@ pub(crate) fn self_derived_key(cols: &[usize]) -> Vec<ReindexSlot> {
     cols.iter().map(|&c| (c as u32, None)).collect()
 }
 
-/// [`self_derived_key`] over a schema's own PK column list.
-pub(crate) fn self_derived_pk_key(schema: &Schema) -> Vec<ReindexSlot> {
-    schema.pk_cols.iter().map(|&c| (c, None)).collect()
-}
-
-/// Re-key `node` onto its own source PK, self-deriving each key slot's type and
-/// keeping `keep` as payload; `keep` indexes the *source* row, as the key does.
-/// One home, so two operands of a null-fill subtraction cannot drift apart.
-fn rekey_on_source_pk(
-    cb: &mut CircuitBuilder,
-    node: NodeId,
-    schema: &Schema,
-    keep: &[u32],
-    role: ReindexRole,
-) -> NodeId {
-    cb.map_reindex(node, &self_derived_pk_key(schema), keep, role)
-}
-
-/// [`rekey_on_source_pk`] for an internal operand: the `P_all` of a null-fill's
-/// `positive_part(P_all − π_P(inner))`, or the NULL-key bypass.
-pub(crate) fn rekey_aux_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema, keep: &[u32]) -> NodeId {
-    rekey_on_source_pk(cb, node, schema, keep, ReindexRole::Auxiliary)
-}
-
-/// [`rekey_on_source_pk`] as a source's route key — the reindex the relay reads a
-/// scan's scatter key off. A source whose every reindex is `Auxiliary` is refused,
-/// so this is what a keyless join's per-side trace key must use.
-pub(crate) fn rekey_scatter_on_source_pk(
-    cb: &mut CircuitBuilder,
-    node: NodeId,
-    schema: &Schema,
-    keep: &[u32],
-) -> NodeId {
-    rekey_on_source_pk(cb, node, schema, keep, ReindexRole::ScatterKey)
+/// Re-key `node`, which carries `side`'s source rows, onto that source's PK. A trace
+/// key is `ScatterKey`; an internal operand `Auxiliary`.
+pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, side: &JoinSide, role: ReindexRole) -> NodeId {
+    let key: Vec<ReindexSlot> = side.seg.frame.schema.pk_cols.iter().map(|&c| (c, None)).collect();
+    cb.map_reindex(node, &key, &side.keep, role)
 }
 
 #[cfg(test)]

@@ -9,6 +9,48 @@ use crate::codec::project_schema::{place_pk_front, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{ColumnDef, Schema};
+use std::sync::Arc;
+
+/// A relation's physical addressing: the `ColId` at each slot and the schema
+/// typing those slots. A reference resolves to a position in `layout` and is
+/// typed against `schema` at that position, so the two travel as one value.
+#[derive(Clone)]
+pub(crate) struct Frame {
+    pub(crate) layout: Vec<ColId>,
+    pub(crate) schema: Arc<Schema>,
+}
+
+impl Frame {
+    /// `columns` behind a leading key region of `npk` slots.
+    pub(crate) fn leading(layout: Vec<ColId>, columns: Vec<ColumnDef>, npk: usize) -> Frame {
+        debug_assert_eq!(layout.len(), columns.len(), "a frame's two halves are parallel");
+        Frame {
+            layout,
+            schema: Arc::new(Schema {
+                columns,
+                pk_cols: (0..npk as u32).collect(),
+            }),
+        }
+    }
+
+    /// `pk_cols` as the leading key region — identity-free slots nothing can
+    /// reference — then one iterator of `(id, def)` driving both halves.
+    pub(crate) fn keyed(pk_cols: Vec<ColumnDef>, payload: impl IntoIterator<Item = (ColId, ColumnDef)>) -> Frame {
+        let npk = pk_cols.len();
+        let mut layout = vec![ColId::NONE; npk];
+        let mut columns = pk_cols;
+        for (id, def) in payload {
+            layout.push(id);
+            columns.push(def);
+        }
+        Frame::leading(layout, columns, npk)
+    }
+
+    /// The key region's width.
+    pub(crate) fn npk(&self) -> usize {
+        self.schema.pk_cols.len()
+    }
+}
 
 /// Substitute every `HirRef::Col(id)` leaf with `ColRef(position of id in
 /// layout)`. A `HirRef` with no layout slot is an internal compile error, and a
@@ -32,39 +74,14 @@ pub(crate) fn resolve_preds<'a>(
     preds.into_iter().map(|p| resolve_refs(p, layout)).collect()
 }
 
-/// A physicalized projection: the emission items, the output column defs, the
-/// leading key arity, and the output `ColId` at each physical slot.
+/// A physicalized projection: the emission items and the output frame.
 pub(crate) struct PhysProjection {
     pub items: Vec<ProjItem>,
-    pub out_cols: Vec<ColumnDef>,
-    pub pk_arity: usize,
-    pub layout: Vec<ColId>,
+    pub out: Frame,
 }
 
-/// Physicalize a projection over `input_layout` / `input_schema` — the HIR
-/// realization of the linear projection: resolve each `ProjEntry.expr`, classify a
-/// bare `ColRef(i)` as `PassThrough`/else `Computed`, take the output def from
-/// `ProjEntry.out`, then pin the source PK to the leading slots. The returned
-/// `layout` is reordered through the same `place_pk_front` permutation (an
-/// auto-prepended hidden PK slot is [`ColId::NONE`] — the user never named that
-/// column, so nothing can reference it), so a cut linear segment exposes its layout
-/// exactly like a combine one.
-/// Append each entry's emission item and its output def, keeping the two vectors
-/// parallel — the pairing every projection emit depends on, so it is made once
-/// here rather than by two loops that could fall out of step.
-pub(crate) fn resolve_items(
-    items: &[ProjEntry],
-    layout: &[ColId],
-    out_items: &mut Vec<ProjItem>,
-    out_cols: &mut Vec<ColumnDef>,
-) -> Result<(), GnitzSqlError> {
-    for entry in items {
-        out_items.push(ProjItem::from_bound(resolve_refs(&entry.expr, layout)?));
-        out_cols.push(entry.out.def.clone());
-    }
-    Ok(())
-}
-
+/// Physicalize a projection over `input_layout` / `input_schema`, the source PK
+/// pinned to the leading slots; an auto-prepended PK slot has no identity.
 pub(crate) fn physicalize_projection(
     items: &[ProjEntry],
     input_layout: &[ColId],
@@ -72,7 +89,10 @@ pub(crate) fn physicalize_projection(
 ) -> Result<PhysProjection, GnitzSqlError> {
     let mut proj_items: Vec<ProjItem> = Vec::with_capacity(items.len());
     let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(items.len());
-    resolve_items(items, input_layout, &mut proj_items, &mut out_cols)?;
+    for entry in items {
+        proj_items.push(ProjItem::from_bound(resolve_refs(&entry.expr, input_layout)?));
+        out_cols.push(entry.out.def.clone());
+    }
     let perm = place_pk_front(&mut proj_items, &mut out_cols, input_schema);
     let layout = perm
         .into_iter()
@@ -83,8 +103,6 @@ pub(crate) fn physicalize_projection(
         .collect();
     Ok(PhysProjection {
         items: proj_items,
-        out_cols,
-        pk_arity: input_schema.pk_count(),
-        layout,
+        out: Frame::leading(layout, out_cols, input_schema.pk_count()),
     })
 }

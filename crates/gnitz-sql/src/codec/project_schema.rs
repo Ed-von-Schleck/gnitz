@@ -106,7 +106,7 @@ pub(crate) fn payload_map(
 /// class-agnostic here — the engine splits it by the source register's class,
 /// storing the raw 8-byte image for a scalar and a German-string cell for a
 /// string.
-pub(crate) fn compile_projection_map(
+fn compile_projection_map(
     items: &[ProjItem],
     out_cols: &[ColumnDef],
     schema: &Schema,
@@ -227,17 +227,19 @@ pub(crate) fn build_read_projection(
     Ok((items, out_cols))
 }
 
-/// The `(reply_schema, map)` a `ReadSpec` rows sink replies under, from
-/// [`build_read_projection`]'s items: the source PK, then what the map fills.
+/// The `(schema, map)` a leading-key projection over `source_schema` produces:
+/// the source PK, then what the map fills. `what` names the shape if the schema
+/// is invalid.
 pub(crate) fn read_reply_shape(
     items: &[ProjItem],
     out_cols: Vec<ColumnDef>,
     source_schema: &Schema,
+    what: &str,
 ) -> Result<(Schema, ComputeMap), GnitzSqlError> {
     let k = source_schema.pk_cols.len();
     let map = payload_map(&items[k..], &out_cols[k..], source_schema)?;
     let reply_schema = Schema::from_parts(out_cols, (0..k as u32).collect())
-        .map_err(|e| GnitzSqlError::Unsupported(format!("read-spec reply schema is invalid: {e}")))?;
+        .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))?;
     Ok((reply_schema, map))
 }
 

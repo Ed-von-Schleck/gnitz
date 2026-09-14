@@ -157,7 +157,7 @@ const SHAPES: &[Row] = &[
     ("SELECT g, COUNT(*) AS n, SUM(v) AS s FROM t GROUP BY g", 1, &[&[1]], &[(Reduce, 1)]),
     ("SELECT a AS ka, b AS kb, COUNT(*) AS n, SUM(v) AS s FROM c GROUP BY a, b", 1, &[&[0, 1]], &[(Reduce, 1)]),
     ("SELECT g, SUM(v) AS s FROM t GROUP BY g HAVING SUM(v) > 10", 1, &[&[1]], &[(Reduce, 1), (Filter, 1)]),
-    ("SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v", 1, &[&[3]], &[(Reduce, 1)]),
+    ("SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v", 1, &[&[1]], &[(Reduce, 1)]),
     ("SELECT SUM(v) AS s, MIN(v) AS mn, MAX(v) AS mx FROM t", 1, &[&[]], &[(Reduce, 1), (GlobalGround, 1)]),
     ("SELECT SUM(v) AS s, COUNT(*) AS c FROM t", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
     ("SELECT AVG(i32c) AS s FROM ty", 1, &[&[]], &[(Reduce, 2), (GlobalGround, 1)]),
@@ -175,20 +175,22 @@ const SHAPES: &[Row] = &[
     ("SELECT g FROM t INTERSECT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 2), (PositivePart, 1)]),
     ("SELECT g FROM t EXCEPT ALL SELECT g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
     ("SELECT g FROM t INTERSECT ALL SELECT g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
-    // Segments: a derived table, a non-trivial CTE and a subquery each cut a
-    // materialized segment; a computed group key or aggregate argument does not,
-    // and neither does a computed projection over a join — the join emits it.
+    // Segments: a non-trivial CTE and a subquery cut; a derived table over one
+    // relation, a computed group key and a projection over a join do not.
     ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1), (PositivePart, 1), (NullExtend, 1)]),
     ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[&[], &[0, 1]], &[(RangeJoin, 2), (Reduce, 1), (GlobalGround, 1), (WorkerFilter, 2), (Filter, 1)]),
     ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
-    ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 2, &[], &[(Filter, 1)]),
+    ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 1, &[], &[(Filter, 1)]),
     ("WITH c AS (SELECT id, v FROM t WHERE v > 1) SELECT id FROM c", 2, &[], &[(Filter, 1)]),
     // A linear final over a grouped CTE: the segment's reduce keeps its exchange,
     // and the final — which neither re-keys nor redistributes — adds none.
     ("WITH c AS (SELECT g, SUM(v) AS s FROM t GROUP BY g) SELECT g FROM c WHERE s > 10", 2, &[&[1]], &[(Reduce, 1), (Filter, 1)]),
     ("WITH c AS (SELECT * FROM t) SELECT g FROM c WHERE v = 5", 1, &[], &[(Filter, 1)]),
     ("SELECT g, SUM(v * 2) AS s FROM t WHERE v > 5 GROUP BY g", 1, &[&[1]], &[(Reduce, 1), (Filter, 1)]),
-    ("SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v HAVING SUM(g * v) > 3", 1, &[&[3]], &[(Reduce, 1), (Filter, 1)]),
+    ("SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v HAVING SUM(g * v) > 3", 1, &[&[1]], &[(Reduce, 1), (Filter, 1)]),
+    ("SELECT k, COUNT(*) AS n FROM (SELECT id, g AS k FROM t) d GROUP BY k", 1, &[&[1]], &[(Reduce, 1)]),
+    ("SELECT DISTINCT g + 1 AS g1, v FROM t", 1, &[&[0]], &[(Distinct, 1)]),
+    ("SELECT v * 2 AS x FROM t EXCEPT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 2), (PositivePart, 1)]),
 ];
 
 #[test]
@@ -305,9 +307,12 @@ fn indexed_predicates_bound_the_backfill_scan() {
         (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", Some(&[2, 3])),
         (&on_ind, "SELECT g, other FROM t WHERE ind = 5", Some(&[2])),
         (&on_ind, "WITH c AS (SELECT * FROM t) SELECT g, COUNT(*) AS n FROM c WHERE ind = 5 GROUP BY g", Some(&[2])),
-        (&on_ind, "SELECT g, COUNT(*) AS n FROM (SELECT * FROM t) d WHERE ind = 5 GROUP BY g", None),
+        (&on_ind, "SELECT g, COUNT(*) AS n FROM (SELECT * FROM t) d WHERE ind = 5 GROUP BY g", Some(&[2])),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE other = 5 GROUP BY g", None),
-        (&on_ind, "SELECT DISTINCT g FROM t WHERE ind = 5", None),
+        (&on_ind, "SELECT DISTINCT g FROM t WHERE ind = 5", Some(&[2])),
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 EXCEPT SELECT val FROM u", Some(&[2])),
+        // One source scanned twice takes no bound.
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", None),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk = 5 GROUP BY g", None),
         (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", None),
         (&unindexed, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", None),

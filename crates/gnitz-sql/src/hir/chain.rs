@@ -5,27 +5,17 @@
 //! structural backstop every emitted circuit passes through.
 
 use super::lower::SegInput;
-use super::ColId;
+use super::physical::Frame;
 use crate::error::GnitzSqlError;
-use gnitz_core::{segment_id, Circuit, ColumnDef, PlannedView, Schema};
+use gnitz_core::{segment_id, Circuit, PlannedView, Schema};
 use std::sync::Arc;
 
-/// How many leading output columns are the PK region. Every emitter puts the PK
-/// at the front, so the arity is the whole pk-list — `pk_col_list` spells it out
-/// at the wire boundary, and nothing in between carries the redundant vector.
-pub(crate) type PkArity = usize;
-
-/// The wire's pk-list for a [`PkArity`].
-pub(crate) fn pk_col_list(pk: PkArity) -> Vec<u32> {
-    (0..pk as u32).collect()
-}
-
-/// What every view emitter returns for a pre-allocated view id; the caller wraps
-/// it into a `PlannedView`.
+/// What every view emitter returns: the circuit and its output frame, whose
+/// schema is the view's and whose layout is what a cut segment exposes to its
+/// parent.
 pub(crate) struct EmitPieces {
     pub circuit: Circuit,
-    pub out_cols: Vec<ColumnDef>,
-    pub pk_arity: PkArity,
+    pub out: Frame,
 }
 
 /// Structural check of every emitted circuit's exchange topology, catching a
@@ -39,9 +29,7 @@ pub(crate) struct EmitPieces {
 /// Structural only — a wrong-*columns* cut still passes, so the weight pins are
 /// the real net.
 ///
-/// One home, on the two paths every circuit reaches: `add_segment` (hidden
-/// segments) and the final view push (`create::build_query_segments`). No emitter
-/// has to remember to call it, and none can be added that escapes it.
+/// One home, inside `ViewChain::push`, which every emitted circuit reaches.
 pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
     if !cfg!(debug_assertions) {
         return;
@@ -143,14 +131,9 @@ pub(crate) fn reject_circuit_column_overflow(circuit: &Circuit) -> Result<(), Gn
     Ok(())
 }
 
-/// A `Schema` from emitted pieces: the output columns, of which the leading
-/// [`PkArity`] are the PK region. Runs the shared admissibility rules
-/// (`Schema::from_parts`) here, where `what` names the stage, instead of leaving
-/// them to the DDL gateway — whose verdict is identical but names only a segment
-/// index, and which the ad-hoc fold's pre-map never reaches.
-pub(crate) fn schema_of(cols: &[ColumnDef], pk: PkArity, what: &str) -> Result<Arc<Schema>, GnitzSqlError> {
-    Schema::from_parts(cols.to_vec(), pk_col_list(pk))
-        .map(Arc::new)
+/// `Schema::validate_parts`, with a rejection naming the stage `what`.
+pub(crate) fn admit(schema: &Schema, what: &str) -> Result<(), GnitzSqlError> {
+    Schema::validate_parts(&schema.pk_cols, &schema.columns)
         .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))
 }
 
@@ -183,50 +166,79 @@ impl ViewChain {
         k
     }
 
+    /// Push one emitted circuit at `seg`: the one path every circuit, hidden or
+    /// final, reaches — so no emitter has to remember the checks, and none can be
+    /// added that escapes them.
+    fn push(
+        &mut self,
+        seg: u32,
+        circuit: Circuit,
+        schema: Schema,
+        capacity_bytes: Option<u64>,
+        delta_bytes: Option<u64>,
+        what: &str,
+    ) -> Result<(), GnitzSqlError> {
+        debug_assert_exchange_topology(&circuit);
+        // Before the node cap, so a view too wide to register is named by its own
+        // columns rather than by whichever node first exceeds the cap.
+        admit(&schema, what)?;
+        reject_circuit_column_overflow(&circuit)?;
+        self.segments.push(PlannedView {
+            seg,
+            circuit,
+            output_columns: schema.columns,
+            pk_cols: schema.pk_cols,
+            capacity_bytes,
+            delta_bytes,
+        });
+        Ok(())
+    }
+
     /// Mint one hidden segment: take its chain-local slot, run `emit` (the
     /// emitter may push its own upstream segments first — it gets `self` back),
-    /// and push the emitted pieces. Returns the segment's `(symbolic view id,
-    /// schema)` plus whatever `emit` returned alongside its pieces.
+    /// and push the emitted pieces. Returns the segment as a `SegInput`.
     ///
     /// The mint order is the invariant this owns: the slot is taken before the
     /// circuit is built, so a downstream circuit can reference this segment, and
     /// segments land on the chain in dependency order.
     pub(crate) fn add_segment(
         &mut self,
-        emit: impl FnOnce(&mut ViewChain) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError>,
+        emit: impl FnOnce(&mut ViewChain) -> Result<EmitPieces, GnitzSqlError>,
     ) -> Result<SegInput, GnitzSqlError> {
         let seg = self.mint();
-        let (pieces, layout) = emit(self)?;
-        debug_assert_exchange_topology(&pieces.circuit);
-        // After the output schema, so a segment too wide to register is named by
-        // its own columns rather than by whichever node first exceeds the cap.
-        let schema = schema_of(&pieces.out_cols, pieces.pk_arity, "view segment output")?;
-        reject_circuit_column_overflow(&pieces.circuit)?;
-        self.push_hidden(seg, pieces.out_cols, pieces.pk_arity, pieces.circuit);
+        let EmitPieces { circuit, out } = emit(self)?;
+        // Capacity and delta feeds belong to the user-named view alone.
+        self.push(
+            seg,
+            circuit,
+            Schema::clone(&out.schema),
+            None,
+            None,
+            "view segment output",
+        )?;
         Ok(SegInput {
             tid: segment_id(seg as u64),
-            schema,
-            layout,
+            frame: out,
             // A chain-minted id, not a catalog one: no kind, no index bound.
             desc: None,
         })
     }
 
-    /// Append an internal segment. It carries no name: `create_view_chain` names
-    /// every non-final element of a bundle from its own allocated id, and records
-    /// the user view as its owner in a column.
-    fn push_hidden(&mut self, seg: u32, cols: Vec<ColumnDef>, pk: PkArity, circuit: Circuit) {
-        self.segments.push(PlannedView {
-            seg,
+    /// Push the user-named view, always the chain's slot 0.
+    pub(crate) fn push_final(
+        &mut self,
+        pieces: EmitPieces,
+        capacity_bytes: Option<u64>,
+        delta_bytes: Option<u64>,
+    ) -> Result<(), GnitzSqlError> {
+        let EmitPieces { circuit, out } = pieces;
+        self.push(
+            0,
             circuit,
-            output_columns: cols,
-            pk_cols: pk_col_list(pk),
-            // A hidden segment is never bounded — it is the unbounded
-            // materialization a bounded view may not sit on — and never fed: the
-            // feed belongs to the final segment, the one the client names and the
-            // only one whose store it can read.
-            capacity_bytes: None,
-            delta_bytes: None,
-        });
+            Arc::unwrap_or_clone(out.schema),
+            capacity_bytes,
+            delta_bytes,
+            "view output",
+        )
     }
 }

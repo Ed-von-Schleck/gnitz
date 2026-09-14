@@ -38,8 +38,8 @@ fn make_base(client: &mut GnitzClient, sn: &str) -> (u64, Vec<ColumnDef>) {
 
 /// One identity segment at chain-local slot `seg` reading `source_id`.
 fn segment(seg: u32, source_id: u64, cols: &[ColumnDef]) -> PlannedView {
-    let mut cb = gnitz_core::CircuitBuilder::new(source_id);
-    let inp = cb.input_delta();
+    let mut cb = gnitz_core::CircuitBuilder::new();
+    let inp = cb.input_delta(source_id, None);
     cb.sink(inp);
     PlannedView {
         seg,

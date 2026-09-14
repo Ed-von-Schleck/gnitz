@@ -1095,7 +1095,7 @@ fn scalar_leaf(
     let agg = HirAgg::new(ids, func, arg, &ir.inner_cols, group_cols.is_empty())?;
     Ok(HirRef::Subquery(Box::new(SubqueryRef {
         kind: SubqueryKind::Scalar,
-        rel: RelExpr::reduce(ir.rel, Vec::new(), group_cols, vec![agg]),
+        rel: RelExpr::reduce(ir.rel, group_cols, vec![agg]),
         correlation: ir.correlation,
         in_pair: None,
     })))
@@ -1369,17 +1369,6 @@ impl<'a> PreMap<'a> {
         &self.env[..self.env.len() - self.extra.len()]
     }
 
-    /// The reduce's pre-map: the source columns passed through, then the
-    /// materialized ones — empty when nothing was materialized.
-    fn items(&self) -> Vec<ProjEntry> {
-        if self.extra.is_empty() {
-            return Vec::new();
-        }
-        let mut items = RelExpr::passthrough_items(self.source_cols().iter().cloned());
-        items.extend(self.extra.iter().cloned());
-        items
-    }
-
     /// The projection computing exactly `ids`: a materialized column by its
     /// expression, a source column passed through.
     fn items_for(&self, ids: &[ColId]) -> Vec<ProjEntry> {
@@ -1624,28 +1613,28 @@ fn bind_grouped_suffix(
             "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
         ));
     }
-    // A DISTINCT aggregate reduces over `Distinct(Project(group cols ∪ {arg}))`,
-    // which absorbs the pre-map — hence the reduce's own is empty.
-    let (input, pre_items) = match distinct_arg(&calls)? {
+    // What the reduce reads: its group columns, then each aggregate argument. A
+    // DISTINCT aggregate reduces over `Distinct` of exactly that projection.
+    let mut reads = group_cols.clone();
+    for id in calls.iter().filter_map(|c| c.arg.ignoring_distinct()) {
+        if !reads.contains(&id) {
+            reads.push(id);
+        }
+    }
+    let input = match distinct_arg(&calls)? {
         Some(arg) => {
             reject_float_key(&hircol_of(&pre.env, arg).def, "DISTINCT aggregate")?;
-            let mut keys = group_cols.clone();
-            if !keys.contains(&arg) {
-                keys.push(arg);
-            }
-            (
-                RelExpr::distinct(RelExpr::project(input, pre.items_for(&keys))),
-                Vec::new(),
-            )
+            RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)))
         }
-        None => (input, pre.items()),
+        None if pre.extra.is_empty() => input,
+        None => RelExpr::project(input, pre.items_for(&reads)),
     };
     let aggs = calls
         .iter()
         .map(|c| HirAgg::new(ids, c.func, c.arg.ignoring_distinct(), &pre.env, is_global))
         .collect::<Result<Vec<HirAgg>, _>>()?;
 
-    let mut rel = RelExpr::reduce(input, pre_items, group_cols.clone(), aggs.clone());
+    let mut rel = RelExpr::reduce(input, group_cols.clone(), aggs.clone());
 
     // The pre-map's columns, extended with each aggregate's raw value and
     // companion: everything a `ColId` in an expression over the reduce output can

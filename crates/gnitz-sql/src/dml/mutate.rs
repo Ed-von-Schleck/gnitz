@@ -316,7 +316,7 @@ fn write_set_rows(
 /// and no blob heap, and the map relocates nothing.
 fn pk_only_reply(schema: &Schema, alias: &str) -> Result<(Schema, ReadSink), GnitzSqlError> {
     let (items, out_cols) = build_read_projection(&[], schema, alias)?;
-    let (reply_schema, map) = read_reply_shape(&items, out_cols, schema)?;
+    let (reply_schema, map) = read_reply_shape(&items, out_cols, schema, "read-spec reply schema is invalid")?;
     Ok((reply_schema, ReadSink { map: Some(map), ..ReadSink::all_rows() }))
 }
 

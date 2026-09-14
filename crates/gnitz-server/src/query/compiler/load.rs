@@ -270,14 +270,11 @@ pub(super) fn scan_feeds_only_joins(loaded: &LoadedCircuit, scan_nid: i32) -> bo
     true
 }
 
-/// Walk back from an `ExchangeShard` (`enid`) through `Filter` nodes to the
-/// source `ScanDelta`, returning its table id — or `None` on a fan-in or any
-/// other node. `Filter` is the only operator transparent to the shard key: it is
-/// row-selective, never re-keys the PK region and never moves a row off-worker.
-/// Terminates without a visited guard: `topo_sorted` rejects a cycle, and each
-/// hop takes the one incoming edge.
-pub(super) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Option<i64> {
-    let mut cur = enid;
+/// Walk back from the `ExchangeShard` at `enid` through nodes that keep rows on
+/// their worker and the PK region verbatim, to its `ScanDelta`: `(table id, whether
+/// a map was crossed)`. `topo_sorted` rejects a cycle, so no visited guard.
+pub(super) fn scan_through_row_local(loaded: &LoadedCircuit, enid: i32) -> Option<(i64, bool)> {
+    let (mut cur, mut mapped) = (enid, false);
     loop {
         // Bail on a fan-in: a multi-input node (Union, set op) draws from more
         // than one source, so no single table's distribution prefix governs the
@@ -286,10 +283,14 @@ pub(super) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
             return None;
         };
         match loaded.op(src_nid) {
-            gnitz_wire::OpNode::ScanDelta { source: t, .. } => return Some(*t as i64),
-            gnitz_wire::OpNode::Filter(_) => cur = src_nid,
+            gnitz_wire::OpNode::ScanDelta { source: t, .. } => return Some((*t as i64, mapped)),
+            gnitz_wire::OpNode::Filter(_) => {}
+            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(_) | gnitz_wire::MapKind::Compute(_)) => {
+                mapped = true
+            }
             _ => return None,
         }
+        cur = src_nid;
     }
 }
 
@@ -337,11 +338,8 @@ pub(super) fn circuit_join_relay(loaded: &LoadedCircuit) -> JoinRelay {
         .unwrap_or(JoinRelay::WholeKey)
 }
 
-/// The `(source table id, bound)` the planner pushed onto a `ScanDelta`'s
-/// backfill scan. At most one exists by construction — only the primary source
-/// can carry a bound. A hint: `None` means "full-scan", which is always correct,
-/// so a hand-crafted circuit with several takes the topologically first and lets
-/// the rest degrade, the same way on every worker.
+/// The `(source table id, bound)` on a `ScanDelta`'s backfill scan. A hint — `None`
+/// scans in full — so a circuit carrying several takes the topologically first.
 pub(super) fn circuit_source_bound(loaded: &LoadedCircuit) -> Option<(i64, gnitz_wire::IndexBound)> {
     loaded.ops().find_map(|(_, op)| match op {
         gnitz_wire::OpNode::ScanDelta { source, bound: Some(b) } => Some((*source as i64, *b)),

@@ -70,6 +70,35 @@ fn the_output_exchange_skips_only_at_the_two_ends_of_the_prefix() {
     // The key must still BE the distribution prefix.
     assert!(!skips(three_col_pk_schema(1), vec![1]), "not the leading column");
     assert!(!skips(three_col_placed(Placement::Local), vec![0, 1, 2]), "unkeyed");
+
+    // Behind a PK-preserving map the shard columns index the map's output, whose
+    // leading slots are the source PK — here the source's column 2.
+    let behind_a_map = |shard_cols: Vec<u32>| {
+        let schema = SchemaDescriptor::new(
+            &[
+                gnitz_store::schema::SchemaColumn::new(type_code::I64, 0),
+                gnitz_store::schema::SchemaColumn::new(type_code::I64, 0),
+                gnitz_store::schema::SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[2],
+        )
+        .with_placement(Placement::Keyed { prefix_len: 1 });
+        let loaded = loaded_for_test(
+            [
+                (0, scan_delta(7)),
+                (1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![0, 1]))),
+                (2, gnitz_wire::OpNode::ExchangeShard { shard_cols }),
+            ],
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
+        );
+        let ext = ext_tables([(7, schema)]);
+        ViewMeta::derive(&loaded, &ext).unwrap().skips_exchange
+    };
+    assert!(behind_a_map(vec![0]), "the map's slot 0 is the source PK");
+    assert!(
+        !behind_a_map(vec![1]),
+        "a payload slot is never the distribution prefix"
+    );
 }
 
 /// The exchange is skipped where the join key is exactly a source's distribution

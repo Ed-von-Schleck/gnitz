@@ -293,15 +293,23 @@ fn output_route_returns_to_the_input_partition(shard_cols: &[u32], schema: &Sche
     shard_cols.len() <= 1 || shard_cols.len() == schema.pk_indices().len()
 }
 
-/// True iff the view's output `ExchangeShard` at `enid` is a no-op: it reads a
-/// scan — through any Filter chain — whose distribution prefix is exactly the
-/// shard key, and the pipeline's output routes back to that same partition.
+/// True iff the view's output `ExchangeShard` at `enid` is a no-op: its scan's
+/// distribution prefix is exactly the shard key, and the output routes back to
+/// that same partition.
 fn skips_output_exchange(loaded: &LoadedCircuit, enid: i32, shard_cols: &[u32], host: &dyn SchemaSource) -> bool {
-    let Some(tid) = scan_tid_through_filters(loaded, enid) else {
+    let Some((tid, mapped)) = scan_through_row_local(loaded, enid) else {
         return false;
     };
     host.schema_of(tid).is_some_and(|schema| {
-        shard_cols_match_dist_key(&schema, shard_cols)
+        // Behind a map, shard column `c` is source PK column `c`, or a payload slot.
+        let source_cols: Option<Vec<u32>> = match mapped {
+            false => Some(shard_cols.to_vec()),
+            true => shard_cols
+                .iter()
+                .map(|&c| schema.pk_indices().get(c as usize).copied())
+                .collect(),
+        };
+        source_cols.is_some_and(|cols| shard_cols_match_dist_key(&schema, &cols))
             && output_route_returns_to_the_input_partition(shard_cols, &schema)
     })
 }

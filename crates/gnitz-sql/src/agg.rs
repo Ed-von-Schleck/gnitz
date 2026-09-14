@@ -208,6 +208,19 @@ impl<'a> ReduceShape<'a> {
     pub(crate) fn global_ground(&self) -> bool {
         self.group_cols.is_empty()
     }
+
+    /// A global aggregate folded per worker and combined: exact only for linear
+    /// aggregates, and not for a float SUM, whose addition reassociates by worker
+    /// count.
+    pub(crate) fn two_phase(&self) -> bool {
+        self.global_ground()
+            && !self.source_replicated
+            && self.specs.iter().all(|s| s.op.is_linear())
+            && !self
+                .specs
+                .iter()
+                .any(|s| s.op == WireAggFunc::Sum && s.out_type.tc.is_float())
+    }
 }
 
 /// The reduce output schema for a group set, plus the offset of the first
@@ -230,6 +243,11 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> Result<ReduceLayout,
             .map(|s| ColumnDef::typed("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
     );
     let agg_col_offset = r.cols.len() - agg_specs.len();
+    // The combine phase appends its COUNT-of-partials existence gate, a reduce
+    // output column like any other.
+    if sh.two_phase() {
+        r.cols.push(ColumnDef::typed("_agg", ColType::of(TypeCode::I64), false));
+    }
     let schema = Schema::from_parts(r.cols, r.pk_cols)
         .map_err(|e| GnitzSqlError::Unsupported(format!("GROUP BY output: {e}")))?;
     Ok(ReduceLayout {
@@ -277,23 +295,7 @@ pub(crate) fn emit_reduce(
     // The circuit builder needs only (op, col) per spec; out_type is the
     // planner's concern and already shaped the reduce schema above.
     let circuit_specs: Vec<(WireAggFunc, usize)> = agg_specs.iter().map(|s| (s.op, s.col)).collect();
-    let all_linear = agg_specs.iter().all(|s| s.op.is_linear());
-    // Two-phase (distributable) path for an all-linear, integer, partitioned GLOBAL
-    // aggregate: fold a per-worker partial locally (no exchange), then exchange only
-    // the ≤ N partials to V₀'s owner and combine them. A linear aggregate satisfies
-    // Agg(A+B)=Agg(A)+Agg(B), so this replaces the single-worker full-delta funnel.
-    // Float SUM (and AVG over a float, whose SUM component is float) is excluded:
-    // IEEE-754 addition is non-associative, so summing per-worker partials would make
-    // the result depend on the worker count — those keep the deterministic funnel.
-    // `two_phase ⊆ global_ground`: it is the distributable refinement of the
-    // ungrouped (empty group set) case, so it reuses that predicate.
-    let two_phase = sh.global_ground()
-        && !sh.source_replicated
-        && all_linear
-        && !agg_specs
-            .iter()
-            .any(|s| s.op == WireAggFunc::Sum && s.out_type.tc.is_float());
-    if two_phase {
+    if sh.two_phase() {
         // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
         // (a worker with no local rows contributes no partial, never a ground row).
         // Output: [_group_pk:U128 (col 0, PK), agg0 (col 1), agg1 (col 2), ...].
