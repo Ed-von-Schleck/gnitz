@@ -765,7 +765,7 @@ pub(crate) fn execute_create_index(
     client: &mut GnitzClient,
     schema_name: &str,
     ci: &sqlparser::ast::CreateIndex,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_create_index_clauses(ci)?;
     let table_name = extract_object_name(&ci.table_name, schema_name, "CREATE INDEX")?;

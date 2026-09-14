@@ -199,8 +199,8 @@ impl WorkerProcess {
         self.queue_train(route, Rc::new(batch), block, version);
     }
 
-    /// [`Self::send_scan_response`] for a batch this worker keeps a handle to —
-    /// a cached full-scan snapshot.
+    /// [`Self::send_scan_response`] for a batch already behind an `Rc` — a cached
+    /// full-scan snapshot, or a `ReadSpec` reply that may be one.
     ///
     /// A `route` marked `fifo` queues even a fitting reply so this relation
     /// reaches the ring in request order (the multi-scan FIFO contract).

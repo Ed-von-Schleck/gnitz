@@ -35,7 +35,19 @@ impl RelationRegistry {
         reply_schema: &SchemaDescriptor,
         cut_tick: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<Batch, StoreError> {
+    ) -> Result<Rc<Batch>, StoreError> {
+        // Nothing bounded, filtered, mapped or cut (a worker orders only under a cut): the
+        // relation whole, off the store's cached snapshot.
+        if let (ReadBound::None, true, None, SinkKind::Rows { order, limit_k: 0 }) =
+            (&spec.bound, spec.predicate.is_empty(), &spec.sink.map, &spec.sink.kind)
+        {
+            let schema = self.relation_or_err(target_id)?.schema();
+            resolve_order_locs(order, &schema)?;
+            if !reply_schema.same_physical_layout(&schema) {
+                return Err(layout_mismatch());
+            }
+            return Ok(self.scan(target_id, hydrator)?.0);
+        }
         let (source, src_schema) = self.open_bound(target_id, &spec.bound, cut_tick)?;
         let predicate = (!spec.predicate.is_empty())
             .then(|| compile_predicate(&spec.predicate, &src_schema))
@@ -55,27 +67,23 @@ impl RelationRegistry {
                 window: saturated_window(*limit_k),
             },
         };
-        // The one reply guard: a keeper built in any other layout ships its
-        // regions under the client's strides.
         let produced = match &sink {
             Sink::Fold(f) => f.output_schema(),
             Sink::Rows { .. } => &sink_in,
         };
         if !reply_schema.same_physical_layout(produced) {
-            return Err(StoreError::rejected(
-                "scan_spec: reply schema does not match the sink's output layout",
-            ));
+            return Err(layout_mismatch());
         }
         let source = self.hydrated(target_id, source, hydrator)?;
         let mut rows = Survivors { source, predicate, ranges: Vec::new() };
         let chunk_rows = self.config.scan_chunk_rows;
-        Ok(match sink {
+        Ok(Rc::new(match sink {
             Sink::Fold(fold) => run_fold_sink(&mut rows, chunk_rows, map.as_ref(), *fold)?,
             Sink::Rows { order, window } if !order.is_empty() && window > 0 => {
                 topk_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, &order, window)
             }
             Sink::Rows { window, .. } => stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window),
-        })
+        }))
     }
 
     /// Open `bound`'s source cursor, without walking it, and the schema its rows
@@ -170,6 +178,12 @@ impl RelationRegistry {
             schema,
         ))))
     }
+}
+
+/// The one reply guard's refusal: a keeper built in any other layout would ship its
+/// regions under the client's strides.
+fn layout_mismatch() -> StoreError {
+    StoreError::rejected("scan_spec: reply schema does not match the sink's output layout")
 }
 
 /// Whether a walk over rounds `(after_tick, cut]` misses a round this worker

@@ -1,7 +1,7 @@
 //! WAL-block encode/decode for the client wire codec.
 
 use super::error::ProtocolError;
-use super::types::{Schema, ZSetBatch};
+use super::types::{check_not_null, Schema, ZSetBatch};
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -12,24 +12,22 @@ use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 /// Correct on little-endian.
 fn read_64bit_region_into<T: Copy>(
     dst: &mut Vec<T>,
-    data: &[u8],
-    off: usize,
-    sz: usize,
+    src: &[u8],
     count: usize,
     label: &str,
 ) -> Result<(), ProtocolError> {
     debug_assert_eq!(std::mem::size_of::<T>(), 8);
     let expected = count * 8;
-    if sz != expected {
+    if src.len() != expected {
         return Err(ProtocolError::DecodeError(format!(
-            "{label} region size mismatch: expected {expected}, got {sz}"
+            "{label} region size mismatch: expected {expected}, got {}",
+            src.len()
         )));
     }
-    let src = &data[off..off + expected];
     let base = dst.len();
     dst.reserve(count);
-    // SAFETY: src is `expected` bytes (bounds-checked above); `reserve` leaves
-    // room for `count` more Ts = `expected` bytes past `base`. Both are valid,
+    // SAFETY: src is `expected` bytes (checked above); `reserve` leaves room for
+    // `count` more Ts = `expected` bytes past `base`. Both are valid,
     // non-overlapping regions, and the copy initializes every element `set_len`
     // then publishes.
     unsafe {
@@ -65,10 +63,6 @@ pub(crate) fn encode_wal_block(table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
 /// runs over a trusted stream (OS-delivered Unix socket bytes or a TLS
 /// record layer) where transport integrity is already guaranteed. Use
 /// [`decode_wal_block_verified`] where the checksum itself is under test.
-///
-/// Public because a locally-served read has to end in a `ZSetBatch` too, and it
-/// must be *this* function: a local reply and a remote one decoded by two
-/// different rules could disagree.
 pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
     let mut sink = ZSetBatch::new(schema);
     let table_id = decode_wal_block_impl(data, schema, false, &mut sink)?;
@@ -98,14 +92,7 @@ pub(crate) fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<
     Ok((sink, table_id))
 }
 
-/// `sink` is a well-formed batch of `schema` and so can be appended to: its
-/// layout is `schema`'s, and every payload region is at the length its type and
-/// row count imply.
-///
-/// [`ZSetBatch::layout_matches`] and [`ZSetBatch::check_columns`] are the shared
-/// rules, not a second spelling of them. Not the whole of
-/// [`ZSetBatch::validate`]: its NOT NULL sweep walks every row, which across a
-/// train's frames would be quadratic — and the server runs that check anyway.
+/// `sink` is a well-formed batch of `schema`, and so can be appended to.
 fn sink_matches(sink: &ZSetBatch, schema: &Schema) -> Result<(), ProtocolError> {
     let sink_err = |e: String| ProtocolError::DecodeError(format!("decode sink: {e}"));
     sink.layout_matches(schema).map_err(sink_err)?;
@@ -120,14 +107,30 @@ fn decode_wal_block_impl(
 ) -> Result<u32, ProtocolError> {
     // Shared framer validates format: version, `total_size` in-bounds, body
     // checksum, region count ≤ cap, and every region's [off, off+sz) extent
-    // within the block. On success `dir` can index each region unchecked.
+    // within the block. On success each region slices unchecked.
     let mut region_offsets = [0u64; gnitz_wire::MAX_WIRE_REGIONS];
     let mut region_sizes = [0u32; gnitz_wire::MAX_WIRE_REGIONS];
     let header = gnitz_wire::wal::validate_and_parse(data, &mut region_offsets, &mut region_sizes, verify_checksum)?;
-    let table_id = header.table_id;
     let num_regions = header.num_regions as usize;
+    let mut regions: [&[u8]; gnitz_wire::MAX_WIRE_REGIONS] = [&[]; gnitz_wire::MAX_WIRE_REGIONS];
+    for (r, region) in regions[..num_regions].iter_mut().enumerate() {
+        let off = region_offsets[r] as usize;
+        *region = &data[off..off + region_sizes[r] as usize];
+    }
+    decode_regions_into(sink, &regions[..num_regions], header.entry_count as usize, schema)?;
+    Ok(header.table_id)
+}
 
+/// Decode `count` rows laid out as `regions` (canonical order, blob last) under `schema`,
+/// appending to `sink`: the one rule for a WAL block's body and an engine batch's regions.
+pub fn decode_regions_into(
+    sink: &mut ZSetBatch,
+    regions: &[&[u8]],
+    count: usize,
+    schema: &Schema,
+) -> Result<(), ProtocolError> {
     // Client's half of the split: schema conformance.
+    let num_regions = regions.len();
     let expected_num_regions = gnitz_wire::wal::num_regions(schema.num_payload_cols());
     if num_regions != expected_num_regions {
         return Err(ProtocolError::DecodeError(format!(
@@ -136,28 +139,20 @@ fn decode_wal_block_impl(
     }
     let pk_stride = schema.pk_stride();
 
-    // Index the framer-filled offset/size arrays directly — no per-decode heap
-    // Vec (the engine's `decode_mem_batch_inner`/`decode_schema_block` do the same).
-    let dir = |r: usize| (region_offsets[r] as usize, region_sizes[r] as usize);
-
-    let count = header.entry_count as usize;
-
     if count == 0 {
-        return Ok(table_id);
+        return Ok(());
     }
 
     sink_matches(sink, schema)?;
 
     // Read system regions, by the shared §6 index — the same rule the encoder
     // builds the list with, rather than a counter that happens to agree.
-    let (pk_off, pk_sz) = dir(REG_PK);
-    let (wt_off, wt_sz) = dir(REG_WEIGHT);
-    let (null_off, null_sz) = dir(REG_NULL_BMP);
-
+    let pk = regions[REG_PK];
     let expected_pk_sz = count * pk_stride;
-    if pk_sz != expected_pk_sz {
+    if pk.len() != expected_pk_sz {
         return Err(ProtocolError::DecodeError(format!(
-            "pk region size mismatch: expected {expected_pk_sz}, got {pk_sz}"
+            "pk region size mismatch: expected {expected_pk_sz}, got {}",
+            pk.len()
         )));
     }
     // Bound the stride so the `as u8` a `PkColumn` holds stays lossless, and so
@@ -175,15 +170,17 @@ fn decode_wal_block_impl(
 
     // A `PkColumn` holds the same OPK bytes the region carries, so the whole
     // region moves in one copy — no per-row, per-column transcode.
-    sink.pks.push_region_bytes(&data[pk_off..pk_off + pk_sz]);
-    read_64bit_region_into(&mut sink.weights, data, wt_off, wt_sz, count, "weights")?;
-    read_64bit_region_into(&mut sink.nulls, data, null_off, null_sz, count, "nulls")?;
+    sink.pks.push_region_bytes(pk);
+    read_64bit_region_into(&mut sink.weights, regions[REG_WEIGHT], count, "weights")?;
+    let nulls_at = sink.nulls.len();
+    read_64bit_region_into(&mut sink.nulls, regions[REG_NULL_BMP], count, "nulls")?;
+    // Over exactly the words this block appended, so a train stays linear.
+    check_not_null(&sink.nulls[nulls_at..], schema).map_err(ProtocolError::DecodeError)?;
 
     // Blob region (always last). A German cell's heap offset is relative to the
     // arena it was encoded against, so an appending decode shifts every cell of
     // this block by where that arena lands in the sink's.
-    let (blob_off, blob_sz) = dir(num_regions - 1);
-    let block_blob = &data[blob_off..blob_off + blob_sz];
+    let block_blob = regions[num_regions - 1];
     let blob_base = sink.blob.len();
     sink.blob.extend_from_slice(block_blob);
 
@@ -191,18 +188,19 @@ fn decode_wal_block_impl(
     // slot `pi` ↔ region `REG_PAYLOAD_START + pi` is stated, not produced as a
     // side effect of a counter.
     for (pi, ci, col) in schema.payload_columns() {
-        let (reg_off, reg_sz) = dir(REG_PAYLOAD_START + pi);
+        let region = regions[REG_PAYLOAD_START + pi];
         // One width rule for every column kind: `wire_stride` is 16 for STRING,
         // BLOB and the three 16-byte int types alike.
         let expected_sz = count * col.type_code.wire_stride();
-        if reg_sz != expected_sz {
+        if region.len() != expected_sz {
             return Err(ProtocolError::DecodeError(format!(
-                "column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
+                "column {ci} region size mismatch: expected {expected_sz}, got {}",
+                region.len()
             )));
         }
         let dst = &mut sink.payload[pi].bytes;
         let at = dst.len();
-        dst.extend_from_slice(&data[reg_off..reg_off + reg_sz]);
+        dst.extend_from_slice(region);
         if gnitz_wire::is_german_string(col.type_code as u8) {
             for cell in dst[at..].as_chunks_mut::<16>().0 {
                 // The cells arrive verbatim, so this is where a heap extent that
@@ -219,7 +217,7 @@ fn decode_wal_block_impl(
         }
     }
 
-    Ok(table_id)
+    Ok(())
 }
 
 #[cfg(test)]

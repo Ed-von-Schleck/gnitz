@@ -14,38 +14,41 @@ use std::sync::Arc;
 
 #[test]
 fn paginate_all_weight_one_is_entry_counting() {
-    let w = vec![1i64; 5];
+    let w = [1i64; 5];
     // LIMIT 3.
-    assert_eq!(paginate(&w, 0, 3), vec![(0, 1), (1, 1), (2, 1)]);
+    assert_eq!(paginate(w.iter().copied(), 0, 3), vec![(0, 1), (1, 1), (2, 1)]);
     // OFFSET 2 LIMIT 2.
-    assert_eq!(paginate(&w, 2, 4), vec![(2, 1), (3, 1)]);
+    assert_eq!(paginate(w.iter().copied(), 2, 4), vec![(2, 1), (3, 1)]);
 }
 
 #[test]
 fn paginate_boundary_entry_keeps_reduced_weight() {
     // Entries [2,3,2]; LIMIT 3 lands inside entry 1 (weight 3 → 1 survives).
-    let w = vec![2i64, 3, 2];
-    assert_eq!(paginate(&w, 0, 3), vec![(0, 2), (1, 1)]);
+    let w = [2i64, 3, 2];
+    assert_eq!(paginate(w.iter().copied(), 0, 3), vec![(0, 2), (1, 1)]);
     // The surviving logical-row count is exactly 3 (bag semantics).
-    assert_eq!(paginate(&w, 0, 3).iter().map(|(_, x)| *x).sum::<i64>(), 3);
+    assert_eq!(
+        paginate(w.iter().copied(), 0, 3).iter().map(|(_, x)| *x).sum::<i64>(),
+        3
+    );
 }
 
 #[test]
 fn paginate_offset_and_limit_inside_one_entry() {
     // Weight-5 entry, OFFSET 1 LIMIT 1 → the overlap formula yields weight 1
     // (a two-independent-passes impl gets this wrong).
-    let w = vec![5i64];
-    assert_eq!(paginate(&w, 1, 2), vec![(0, 1)]);
+    let w = [5i64];
+    assert_eq!(paginate(w.iter().copied(), 1, 2), vec![(0, 1)]);
 }
 
 #[test]
 fn paginate_weight3_straddles_cut() {
     // A weight-3 entry straddling the window keeps only the overlapping part.
-    let w = vec![3i64, 3, 3];
+    let w = [3i64, 3, 3];
     // window [0,4): entry0 whole (3), entry1 clipped to 1.
-    assert_eq!(paginate(&w, 0, 4), vec![(0, 3), (1, 1)]);
+    assert_eq!(paginate(w.iter().copied(), 0, 4), vec![(0, 3), (1, 1)]);
     // window [4,7): entry1 clipped low (2), entry2 clipped high (1).
-    assert_eq!(paginate(&w, 4, 7), vec![(1, 2), (2, 1)]);
+    assert_eq!(paginate(w.iter().copied(), 4, 7), vec![(1, 2), (2, 1)]);
 }
 
 // ---- sink integration ----
@@ -364,14 +367,10 @@ fn sink_positional_over_hidden_view_schema() {
     push(200, 10, 1);
     push(300, 20, 1);
 
-    // ORDER BY 1 → the first visible column `city`, ascending.
+    // ORDER BY 1 → the first visible column `city`, ascending. `SELECT *` over the
+    // view reproduces it, so only the ordering finish runs.
     let q = parse_query("SELECT * FROM v ORDER BY 1");
-    let select = match q.body.as_ref() {
-        SetExpr::Select(s) => s,
-        _ => unreachable!(),
-    };
-    let (out_schema, out) =
-        order_limit_project(&select.projection, &schema, Some(b), q.order_by.as_ref(), 0, None).unwrap();
+    let (out_schema, out) = passthrough(schema, b, q.order_by.as_ref(), 0, None).unwrap();
     // Read `city` (physical col 1) in output order.
     let city_ci = out_schema.columns.iter().position(|c| c.name == "city").unwrap();
     let cities: Vec<u64> = (0..out.len())

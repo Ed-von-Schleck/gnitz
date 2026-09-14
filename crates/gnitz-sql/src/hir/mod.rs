@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// tree is whole; the lowering decides what each shared subtree becomes.
 pub(crate) fn bind_and_lower(
     cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
     chain: &mut ViewChain,
     query: &sqlparser::ast::Query,
     bounded: bool,
@@ -377,14 +377,14 @@ pub(crate) struct TopNKey {
 /// source, which names its relation in the `ReadSpec` instead — so it has no
 /// `tid` and no descriptor here, and never reaches the circuit lowering.
 pub(crate) enum GetSource {
-    Catalog { tid: u64, desc: Arc<RelDescriptor> },
+    Catalog { desc: Arc<RelDescriptor> },
     AdHoc,
 }
 
 impl GetSource {
     /// A stream holds no rows, so nothing read from one has a row identity.
     fn is_stream(&self) -> bool {
-        matches!(self, GetSource::Catalog { desc, .. } if desc.class == gnitz_core::RelClass::Stream)
+        matches!(self, GetSource::Catalog { desc } if desc.class == gnitz_core::RelClass::Stream)
     }
 }
 
@@ -673,8 +673,9 @@ impl RelExpr {
     /// A base table or committed/hidden-view source: one fresh `ColId` per
     /// registered schema column, in schema order (so a `ColId`'s env position is
     /// its schema position).
-    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Arc<Schema>, desc: Arc<RelDescriptor>) -> Rc<RelExpr> {
-        Self::get_of(ids, GetSource::Catalog { tid, desc }, schema)
+    pub(crate) fn get(ids: &ColIdGen, desc: Arc<RelDescriptor>) -> Rc<RelExpr> {
+        let schema = Arc::clone(&desc.schema);
+        Self::get_of(ids, GetSource::Catalog { desc }, schema)
     }
 
     /// The ad-hoc read's source, under the same column minting.

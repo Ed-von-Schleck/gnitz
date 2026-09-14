@@ -758,7 +758,7 @@ impl WorkerProcess {
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, &spec, &reply_schema, seek_pk as u64)?;
-        self.send_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
+        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
         Ok(())
     }
 

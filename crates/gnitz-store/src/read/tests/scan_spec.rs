@@ -77,7 +77,7 @@ fn ids(b: &Batch) -> Vec<(u128, i64)> {
     (0..b.count).map(|i| (b.get_pk(i), b.get_weight(i))).collect()
 }
 
-fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Batch, StoreError> {
+fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Rc<Batch>, StoreError> {
     let schema = id_val_schema();
     registry.scan_spec(TID, spec, &schema, 0, None)
 }
@@ -117,6 +117,33 @@ fn a_maximal_limit_k_neither_overflows_nor_trims() {
     let mut r = rows_fixture("topk_max_limit", 5, 100_000);
     let got = run(&mut r, &rows_spec(val_desc(), u64::MAX)).unwrap();
     assert_eq!(got.count, 5);
+}
+
+/// A whole-relation spec, ordered or not, is the store's cached snapshot, and still
+/// refuses a forged order column or a foreign reply layout.
+#[test]
+fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
+    let mut r = rows_fixture("whole_relation", 4, 1);
+    let (snapshot, _) = r.scan(TID, None).unwrap();
+    for spec in [rows_spec(Vec::new(), 0), rows_spec(val_desc(), 0)] {
+        assert!(Rc::ptr_eq(&run(&mut r, &spec).unwrap(), &snapshot));
+    }
+    let forged = vec![OrderKey { col: 99, desc: false, nulls_first: false }];
+    let Err(err) = run(&mut r, &rows_spec(forged, 0)) else {
+        panic!("a forged order column must be refused on the snapshot path");
+    };
+    assert!(err.to_string().contains("order key column 99"), "{err}");
+    let mismatched = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::F64, 0),
+        ],
+        &[0],
+    );
+    let Err(err) = r.scan_spec(TID, &rows_spec(Vec::new(), 0), &mismatched, 0, None) else {
+        panic!("a reply layout off the relation's must be refused on the snapshot path");
+    };
+    assert!(err.to_string().contains("reply schema does not match"), "{err}");
 }
 
 /// A malformed ORDER BY key is rejected before the cursor is opened, so the walk

@@ -1,8 +1,7 @@
 use crate::ast_util::col_ref_parts;
 use crate::error::GnitzSqlError;
-use gnitz_core::{CatalogSnapshot, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
+use gnitz_core::{CatalogSnapshot, ColumnDef, GnitzClient, RelClass, RelDescriptor};
 use sqlparser::ast::{Expr, Ident};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Find the column named `col_name` in `columns`, case-insensitively.
@@ -55,21 +54,8 @@ pub(crate) fn output_column<'a>(
     }
 }
 
-/// One Binder cache entry: a name's resolved id and schema, plus the catalog
-/// descriptor the id came from.
-struct CachedRelation {
-    table_id: u64,
-    schema: Arc<Schema>,
-    desc: Arc<RelDescriptor>,
-}
-
-/// A resolved relation: its id, the schema references resolve through, and its
-/// catalog descriptor.
-pub(crate) type Resolved = (u64, Arc<Schema>, Arc<RelDescriptor>);
-
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
-    cache: HashMap<String, CachedRelation>,
     /// This binder is binding a view *body* (CREATE VIEW / ALTER VIEW), where
     /// the leaf rule applies: a capacity-bounded view may not be a source.
     view_body: bool,
@@ -77,16 +63,10 @@ pub(crate) struct Binder<'a> {
 
 impl<'a> Binder<'a> {
     pub(crate) fn new(schema_name: &'a str) -> Self {
-        Binder {
-            schema_name,
-            cache: HashMap::new(),
-            view_body: false,
-        }
+        Binder { schema_name, view_body: false }
     }
 
-    /// The session schema every name this binder resolves is scoped to. Returned
-    /// at the binder's own lifetime, so a caller needing `&mut self` in the same
-    /// expression is not blocked by the borrow.
+    /// The session schema every name this binder resolves is scoped to.
     pub(crate) fn schema_name(&self) -> &'a str {
         self.schema_name
     }
@@ -99,42 +79,18 @@ impl<'a> Binder<'a> {
         self
     }
 
-    /// Cache a `name → relation` entry, keyed by the canonical ASCII-lowercase
-    /// form — the single fold site, so a case-varying reference (`WITH Cc … FROM
-    /// cc`) hits regardless of which caller inserted (SQL identifiers are
-    /// case-insensitive).
-    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, desc: Arc<RelDescriptor>) {
-        self.cache
-            .insert(name.to_ascii_lowercase(), CachedRelation { table_id, schema, desc });
-    }
-
-    /// Resolve `name` to its id, schema and descriptor against the statement's
-    /// catalog snapshot. The descriptor rides the same cache entry as the id, so
-    /// the two cannot disagree.
-    ///
-    /// A name the snapshot does not hold raises [`GnitzSqlError::CatalogMiss`],
-    /// which `dispatch::plan_resolving` answers by resolving it and re-running the
-    /// pass. A name it holds as a recorded absence is the ordinary "not found".
-    pub(crate) fn resolve(&mut self, cat: &CatalogSnapshot, name: &str) -> Result<Resolved, GnitzSqlError> {
-        // Probe with the canonical key.
-        if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
-            return Ok((entry.table_id, Arc::clone(&entry.schema), entry.desc.clone()));
-        }
+    /// Resolve `name` against the statement's catalog snapshot; a name it has not
+    /// probed is a [`GnitzSqlError::CatalogMiss`], a recorded absence "not found".
+    pub(crate) fn resolve(&self, cat: &CatalogSnapshot, name: &str) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
         // Referenced relations obey the same reserved-prefix rule as created
         // ones: a fresh catalog probe of a leading-`_` name can only be a user
         // naming internal plumbing (a chain segment), and honoring it leaks a
-        // dependency that makes the owner view undroppable. Placed after the
-        // cache check — every cached name passed the same rule on insert
-        // (`cache_relation` is fed from these already-validated probes), never
-        // a raw internal catalog name.
+        // dependency that makes the owner view undroppable.
         crate::validate::validate_user_name(name)?;
-        let rel = cat
-            .get(self.schema_name, name)
-            .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))?
-            // Nothing server-side failed — the statement names a relation the
-            // catalog does not hold, which is the `Bind` class.
+        // Nothing server-side failed — the statement names a relation the catalog
+        // does not hold, which is the `Bind` class.
+        let rel = probe(cat, self.schema_name, name)?
             .ok_or_else(|| crate::error::missing_relation("Table or view", self.schema_name, name))?;
-        let schema = Arc::clone(&rel.schema);
         // Leaf rule. A bounded view's store keeps only skeleton rows past its
         // capacity, and hydrating them replays *sources* — so a view over one
         // would have to hydrate through it, and its own store would be a second
@@ -154,8 +110,7 @@ impl<'a> Binder<'a> {
                 "'{name}' is a stream; it holds no rows and can only be read inside a view body"
             )));
         }
-        self.cache_relation(name, rel.tid, Arc::clone(&schema), Arc::clone(&rel));
-        Ok((rel.tid, schema, rel))
+        Ok(rel)
     }
 
     /// Resolve a write/index target that must be a base table: UPDATE, DELETE and
@@ -171,7 +126,7 @@ impl<'a> Binder<'a> {
     /// answers id, schema and class together, so "is a view" and "does not exist" are
     /// distinguished without a second probe.
     pub(crate) fn resolve_base_table(
-        &mut self,
+        &self,
         client: &mut GnitzClient,
         name: &str,
         op: &str,
@@ -179,17 +134,14 @@ impl<'a> Binder<'a> {
         crate::validate::validate_user_name(name)?;
         let rel = client.resolve_relation(self.schema_name, name)?;
         crate::validate::require_class(&rel, name, crate::validate::ClassWant::BaseTable, op)?;
-        self.cache_relation(name, rel.tid, Arc::clone(&rel.schema), Arc::clone(&rel));
         Ok(rel)
     }
 
     /// Resolve an INSERT target, which may be a base table or a stream — the one
     /// writable-target caller that admits a stream. Same name rule as
-    /// [`Self::resolve_base_table`]. Deliberately does not cache: [`Self::resolve`]
-    /// returns on a cache hit before its class rules run, so a cached stream would
-    /// let a later reference to the name pass as an ordinary readable relation.
+    /// [`Self::resolve_base_table`].
     pub(crate) fn resolve_push_target(
-        &mut self,
+        &self,
         client: &mut GnitzClient,
         name: &str,
     ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {

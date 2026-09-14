@@ -584,3 +584,44 @@ fn wide_pk_extend_from_concatenates() {
         assert_eq!(got.len(), 16);
     }
 }
+
+/// A null bit under a NOT NULL column is refused at decode, naming the column.
+#[test]
+fn a_null_bit_under_a_not_null_column_is_a_decode_error() {
+    let schema = u64_schema();
+    let mut b = ZSetBatch::new(&schema);
+    b.pks = PkColumn::from_natives(&schema, [1u128, 2]);
+    b.weights = vec![1, 1];
+    b.nulls = vec![0, 1];
+    b.payload[0].bytes = [7i64, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let block = encode_wal_block(3, &b);
+    match decode_wal_block(&block, &schema) {
+        Err(ProtocolError::DecodeError(m)) => assert!(m.contains("NOT NULL column 'v'"), "{m}"),
+        other => panic!("expected a NOT NULL decode error, got {other:?}"),
+    }
+}
+
+/// Decoding a batch's own region list is decoding the block framed from it.
+#[test]
+fn decoding_regions_equals_decoding_the_framed_block() {
+    let schema = str_schema();
+    let vals = [
+        Some("a string long enough to spill past the inline prefix"),
+        None,
+        Some("short"),
+        Some("another long string that spills into the heap"),
+    ];
+    let mut b = ZSetBatch::new(&schema);
+    b.pks = PkColumn::from_natives(&schema, 1u128..=4);
+    b.weights = vec![1, 2, 1, 3];
+    b.nulls = vals.iter().map(|v| v.is_none() as u64).collect();
+    let mut blob = Vec::new();
+    b.payload[0].bytes = german_col(&vals, &mut blob);
+    b.blob = blob;
+
+    let regions = crate::protocol::regions::regions(&b);
+    let mut local = ZSetBatch::new(&schema);
+    decode_regions_into(&mut local, &regions, b.len(), &schema).unwrap();
+    let (remote, _) = decode_wal_block(&encode_wal_block(9, &b), &schema).unwrap();
+    assert_eq!(local, remote);
+}

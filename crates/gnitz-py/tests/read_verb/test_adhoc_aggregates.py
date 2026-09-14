@@ -732,8 +732,6 @@ def test_an_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_dd
     client, sn = tiny_ddl_chunk_server, "public"
     _float_table(client, sn)
     src = "FROM f WHERE cat >= 5 AND cat < 13"
-    # A strict subset of the columns, so this cannot route as the unprojected
-    # plain scan and its access line is unambiguous.
     rows_q = f"SELECT pk, x {src}"
     exact_q = f"SELECT COUNT(*) AS c, SUM(pk) AS sp, MIN(x) AS mn, MAX(x) AS mx {src}"
     float_q = f"SELECT SUM(x) AS s {src}"

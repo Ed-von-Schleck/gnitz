@@ -263,10 +263,8 @@ impl Schema {
             .map(|(i, _)| i)
     }
 
-    /// True iff any **non-PK** column is hidden. Both call sites ask about a
-    /// *source relation*, where that means an `ALTER … DROP COLUMN` slot and
-    /// nothing else: a view's synthetic hidden keys are PK columns, so the
-    /// bare-`SELECT *` / `RETURNING *` fast paths keep their raw passthrough.
+    /// True iff any **non-PK** column is hidden. A view's synthetic hidden keys
+    /// are PK columns, so they never count.
     #[inline]
     pub fn has_hidden_payload(&self) -> bool {
         (0..self.columns.len()).any(|i| self.is_hidden_payload(i))
@@ -872,7 +870,8 @@ impl ZSetBatch {
         Ok(())
     }
 
-    /// Validate that all vectors are consistently sized for the given schema.
+    /// Validate that all vectors are consistently sized for the given schema, and
+    /// that no NULL sits under a NOT NULL column.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
         // The PK buffer's own shape, checked before `PkColumn::len` divides by
         // the stride. A stride that disagrees with the schema would make every
@@ -896,29 +895,77 @@ impl ZSetBatch {
             return Err(format!("nulls length {} != row count {}", self.nulls.len(), n));
         }
         self.check_columns()?;
-        // A null bit on a NOT NULL payload column would make FK/unique validation
-        // skip the value (treating it as absent) while consolidation and decoders
-        // read the raw bytes as live data — an inconsistency the schema forbids.
-        // One OR-fold and one test: the conforming case walks every row either
-        // way, and only a rejection re-walks, to name the row and the column.
-        let not_null_mask = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
-        if self.nulls.iter().fold(0u64, |a, &w| a | w) & not_null_mask != 0 {
-            let (row, offending) = self
-                .nulls
-                .iter()
-                .enumerate()
-                .map(|(row, &w)| (row, w & not_null_mask))
-                .find(|&(_, o)| o != 0)
-                .expect("the fold found a NOT NULL bit set");
-            let pi = offending.trailing_zeros() as usize;
-            let name = schema
-                .payload_columns()
-                .find(|(p, _, _)| *p == pi)
-                .map_or("?", |(_, _, c)| c.name.as_str());
-            return Err(format!("row {row} sets a null bit on NOT NULL column '{name}'"));
-        }
-        Ok(())
+        check_not_null(&self.nulls, schema)
     }
+
+    /// The rows `rows` names, in order, at their paired weights; each row at most once.
+    /// When every row survives the arena moves whole, else only survivors' strings are copied.
+    pub fn gather(self, rows: &[(usize, i64)]) -> ZSetBatch {
+        debug_assert!(
+            {
+                let mut seen = vec![false; self.len()];
+                rows.iter().all(|&(r, _)| !std::mem::replace(&mut seen[r], true))
+            },
+            "gather: a row named twice"
+        );
+        let n = rows.len();
+        let whole = n == self.len();
+        let mut blob = Vec::new();
+        let mut pks = PkColumn {
+            stride: self.pks.stride,
+            buf: Vec::with_capacity(n * self.pks.width()),
+        };
+        for &(r, _) in rows {
+            pks.push_from(&self.pks, r);
+        }
+        let payload = self
+            .payload
+            .iter()
+            .map(|src| {
+                let s = src.stride();
+                let mut bytes = Vec::with_capacity(n * s);
+                if !whole && gnitz_wire::is_german_string(src.tc as u8) {
+                    for &(r, _) in rows {
+                        let content = gnitz_wire::german_string_content(&src.bytes[r * s..(r + 1) * s], &self.blob);
+                        bytes.extend_from_slice(&gnitz_wire::encode_german_string(content, &mut blob));
+                    }
+                } else {
+                    for &(r, _) in rows {
+                        bytes.extend_from_slice(&src.bytes[r * s..(r + 1) * s]);
+                    }
+                }
+                PayloadColumn { tc: src.tc, bytes }
+            })
+            .collect();
+        ZSetBatch {
+            pks,
+            weights: rows.iter().map(|&(_, w)| w).collect(),
+            nulls: rows.iter().map(|&(r, _)| self.nulls[r]).collect(),
+            payload,
+            blob: if whole { self.blob } else { blob },
+        }
+    }
+}
+
+/// No row sets a null bit on a NOT NULL payload column of `schema`, whose declaration
+/// every reader past the decoder trusts.
+pub(crate) fn check_not_null(nulls: &[u64], schema: &Schema) -> Result<(), String> {
+    let not_null_mask = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
+    if nulls.iter().fold(0u64, |a, &w| a | w) & not_null_mask == 0 {
+        return Ok(());
+    }
+    let (row, offending) = nulls
+        .iter()
+        .enumerate()
+        .map(|(row, &w)| (row, w & not_null_mask))
+        .find(|&(_, o)| o != 0)
+        .expect("the fold found a NOT NULL bit set");
+    let pi = offending.trailing_zeros() as usize;
+    let name = schema
+        .payload_columns()
+        .find(|(p, _, _)| *p == pi)
+        .map_or("?", |(_, _, c)| c.name.as_str());
+    Err(format!("row {row} sets a null bit on NOT NULL column '{name}'"))
 }
 
 /// A [`ZSetBatch`]'s extent at one moment, taken by [`ZSetBatch::mark`].

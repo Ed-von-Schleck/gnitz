@@ -102,6 +102,15 @@ pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
 }
 
+/// An ad-hoc SELECT reads one relation; this query derives a new one, which a view
+/// maintains. `construct` names what was detected.
+pub(crate) fn derivation(construct: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!(
+        "ad-hoc SELECT reads a single relation; this query derives a new one ({construct}).\n\
+         CREATE VIEW <name> AS <your query> — the engine maintains it incrementally — then SELECT from it."
+    ))
+}
+
 /// The one "this relation is not there" rejection — a disagreement with the
 /// catalog, hence [`GnitzSqlError::Bind`]. The name is reported **raw**: someone
 /// who wrote `MyTable` must be told about `MyTable`, not its folded spelling.

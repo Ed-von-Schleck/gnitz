@@ -22,6 +22,7 @@
 //! rather than per-row copies dominate.
 
 use std::hint::black_box;
+use std::rc::Rc;
 use std::time::Instant;
 
 use super::*;
@@ -41,7 +42,7 @@ const REPS: usize = 5;
 /// Run `f` once untimed, then `REPS` timed repetitions; report the median as
 /// million scanned rows/s over `scanned` (the rows the cursor walked, not the
 /// rows returned — the sink's real work unit).
-fn cell(label: &str, scanned: u64, mut f: impl FnMut() -> Batch) {
+fn cell(label: &str, scanned: u64, mut f: impl FnMut() -> Rc<Batch>) {
     black_box(f());
     let mut secs: Vec<f64> = Vec::with_capacity(REPS);
     for _ in 0..REPS {

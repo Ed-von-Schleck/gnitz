@@ -11,13 +11,11 @@
 //! establishes that by concatenating every frame's batch before returning one; a
 //! local reply is already one.
 //!
-//! **The read path encodes and decodes; the ingest path does not.** A read ends
-//! in a `ZSetBatch` whatever happens — that is what the finishers consume — so
-//! the copy only relocates work the remote path pays too. An applied delta ends
-//! in an engine `Batch`, where a detour through `ZSetBatch` would be a second
-//! conversion on a path that already pays one (`apply.rs`'s strip).
+//! A local reply decodes the engine batch's regions through the client's own
+//! block decoder, so a local and a remote reply are decoded by one rule, with no
+//! wire buffer between.
 
-use gnitz_core::protocol::decode_wal_block;
+use gnitz_core::protocol::decode_regions_into;
 use gnitz_core::{MirrorError, Schema, ZSetBatch};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
@@ -30,11 +28,11 @@ impl Mirror {
     /// its registration resolved.
     pub(crate) fn scan_inner(&mut self, table_id: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
         let (batch, desc) = self.registry.scan(table_id as i64, None).map_err(engine)?;
-        reply_batch(&batch, &desc, table_id, schema)
+        reply_batch(&batch, &desc, schema)
     }
 
     /// Run the spec against the copy through the engine's own executor, and reply
-    /// through the same encode the worker runs.
+    /// through the client's block decoder.
     ///
     /// The tick cut it takes is the master's, which only a `Delta` bound reads;
     /// `0` is passed, and a `Delta` bound never reaches it — a copy is registered
@@ -56,28 +54,22 @@ impl Mirror {
             .registry
             .scan_spec(table_id as i64, &spec, &reply_desc, 0, None)
             .map_err(engine)?;
-        reply_batch(&keeper, &reply_desc, table_id, reply_schema)
+        reply_batch(&keeper, &reply_desc, reply_schema)
     }
 }
 
-/// Turn an engine `Batch` into the `ZSetBatch` the client finishers consume, by
-/// the same wire block a remote reply would have carried.
-///
-/// The decode is the client's own block decoder — the step `parse_response`
-/// calls — so a local reply and a remote one cannot be decoded by different
-/// rules.
-fn reply_batch(
-    batch: &Batch,
-    desc: &SchemaDescriptor,
-    table_id: u64,
-    schema: &Schema,
-) -> Result<ZSetBatch, MirrorError> {
-    let block = batch.encode_to_wire_vec(table_id as u32, false);
+/// The engine batch as the `ZSetBatch` the client finishers consume, decoded from its own
+/// regions by the client's block decoder.
+fn reply_batch(batch: &Batch, desc: &SchemaDescriptor, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
     debug_assert_eq!(
         desc.num_columns(),
         schema.num_columns(),
-        "a local reply must be encoded under the schema it is decoded against",
+        "a local reply must be produced under the schema it is decoded against",
     );
-    let (rows, _) = decode_wal_block(&block, schema).map_err(|e| MirrorError::Engine(e.to_string()))?;
+    let mut regions: [&[u8]; gnitz_wire::MAX_WIRE_REGIONS] = [&[]; gnitz_wire::MAX_WIRE_REGIONS];
+    let n = batch.fill_regions(&mut regions);
+    let mut rows = ZSetBatch::new(schema);
+    decode_regions_into(&mut rows, &regions[..n], batch.len(), schema)
+        .map_err(|e| MirrorError::Engine(e.to_string()))?;
     Ok(rows)
 }

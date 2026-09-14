@@ -85,11 +85,8 @@ pub trait MirrorStore: Send {
     fn ingest(&mut self, tid: u64, blocks: Vec<RawBlock>, shape: Shape, next: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Every row of `tid`'s copy, decoded under `schema` — the client-side schema
-    /// its registration resolved, hidden columns included. Not
-    /// [`Self::scan_spec`] with an all-rows spec: a bare `SELECT *` with no
-    /// WHERE, ORDER BY, LIMIT or OFFSET over a relation with no hidden payload
-    /// column builds no `ReadSpec` at all, so this is the shape the planner
-    /// actually asks for there.
+    /// its registration resolved, hidden columns included: the whole-copy read
+    /// the client's `scan_local` verb asks for.
     fn scan(&mut self, tid: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError>;
 
     /// Run the encoded `ReadSpec` `spec` against `tid`'s copy, replying under

@@ -833,22 +833,9 @@ pub(crate) enum FromShape<'a> {
     Empty,
     /// Exactly one plain relation name, no joins.
     SinglePlainRelation(&'a sqlparser::ast::TableFactor),
-    /// A FROM that derives a relation rather than naming one.
-    Derived(DerivedFrom),
-}
-
-/// The FROM shapes that derive a relation, kept apart so a rejection can name
-/// the shape the user actually wrote.
-#[derive(Clone, Copy)]
-pub(crate) enum DerivedFrom {
-    /// Multiple comma-separated FROM items (an implicit comma join). A view body
-    /// serves it as an INNER join keyed from the WHERE.
-    CommaJoin,
-    /// One FROM item carrying an explicit JOIN chain.
-    Join,
-    /// One FROM item that is not a plain relation name (a derived table, a table
-    /// function, …).
-    DerivedTable,
+    /// A FROM that derives a relation rather than naming one, carrying the
+    /// construct a rejection names.
+    Derived(&'static str),
 }
 
 pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShape<'_> {
@@ -856,14 +843,19 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
         [] => FromShape::Empty,
         [single] => {
             if !single.joins.is_empty() {
-                FromShape::Derived(DerivedFrom::Join)
+                // One FROM item carrying an explicit JOIN chain.
+                FromShape::Derived("JOIN")
             } else if matches!(single.relation, sqlparser::ast::TableFactor::Table { .. }) {
                 FromShape::SinglePlainRelation(&single.relation)
             } else {
-                FromShape::Derived(DerivedFrom::DerivedTable)
+                // One FROM item that is not a plain relation name (a derived
+                // table, a table function, …).
+                FromShape::Derived("derived table in FROM")
             }
         }
-        _ => FromShape::Derived(DerivedFrom::CommaJoin),
+        // Multiple comma-separated FROM items (an implicit comma join). A view
+        // body serves it as an INNER join keyed from the WHERE.
+        _ => FromShape::Derived("comma-join FROM"),
     }
 }
 

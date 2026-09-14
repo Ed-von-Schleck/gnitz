@@ -1,7 +1,8 @@
 //! WHERE → access-path **planning and fetching** for every direct-read verb: the
 //! one recognizer ladder ([`bound_and_predicate`], over **bound conjuncts**
 //! recognized by [`crate::access`]) turning a WHERE into an [`AccessPlan`], the
-//! `ReadSpec` dispatcher that walks it ([`fetch_bound`]). Read-only analysis and
+//! rows sink a read ships under it ([`rows_sink`]), and the `ReadSpec` dispatcher
+//! that walks it ([`fetch_bound`]). Read-only analysis and
 //! fetching — no row mutation lives here,
 //! and recognition itself lives in the `access` leaf. `select` and `mutate` sink
 //! into this module; it never references either.
@@ -11,11 +12,15 @@ use std::sync::Arc;
 use crate::access::{
     pk_point_tuple, ranked_index_bounds, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
 };
+use crate::codec::project_schema::{build_read_projection, read_reply_shape, ProjItem};
 use crate::error::GnitzSqlError;
+use crate::exec::order::resolve_read_spec_order;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
-use gnitz_core::{GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
-use gnitz_wire::{IndexWalk, PkKeys, ReadBound, ReadSink, ReadSpec};
+use crate::tail::parse_order_by;
+use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
+use gnitz_wire::{IndexWalk, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind};
+use sqlparser::ast::{OrderBy, SelectItem};
 
 // ---------------------------------------------------------------------------
 // The access-path ladder
@@ -261,6 +266,55 @@ fn index_plan<'e>(
         Some(predicate) => Ok(AccessPlan::whole(bound, all, predicate.to_vec())),
         None => AccessPlan::new(bound, all, c.residual, schema),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The rows sink
+// ---------------------------------------------------------------------------
+
+/// The rows sink a read ships, the schema its reply decodes under, and its ORDER BY keys
+/// over that reply. A projection reproducing the relation ships no map and replies in the
+/// relation's own layout.
+pub(crate) fn rows_sink(
+    projection: &[SelectItem],
+    order_by: Option<&OrderBy>,
+    schema: &Arc<Schema>,
+    alias: &str,
+    limit_k: u64,
+) -> Result<(Arc<Schema>, ReadSink, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
+    let (mut items, mut out_cols) = build_read_projection(projection, schema, alias)?;
+    let keys = parse_order_by(order_by)?;
+    let mut order = resolve_read_spec_order(&mut items, &mut out_cols, schema, alias, &keys)?;
+    let (reply_schema, map) = if reproduces(schema, &items, &out_cols) {
+        for key in &mut order {
+            key.col = items[key.col as usize]
+                .passthrough_src()
+                .expect("a reproducing projection only copies") as u16;
+        }
+        (Arc::clone(schema), None)
+    } else {
+        let (reply, map) = read_reply_shape(&items, out_cols, schema, "read-spec reply schema is invalid")?;
+        (Arc::new(reply), Some(map))
+    };
+    let sink = ReadSink {
+        map,
+        kind: SinkKind::Rows { order: order.clone(), limit_k },
+    };
+    Ok((reply_schema, sink, order))
+}
+
+/// Whether the reply past its hidden PK prefix is the relation's visible columns, each
+/// copied in place, visible, under its own name.
+fn reproduces(schema: &Schema, items: &[ProjItem], out_cols: &[ColumnDef]) -> bool {
+    let k = schema.pk_cols.len();
+    let reply = items[k..]
+        .iter()
+        .zip(&out_cols[k..])
+        .map(|(item, col)| (item.passthrough_src(), col.is_hidden, col.name.as_str()));
+    let relation = schema
+        .visible_columns()
+        .map(|(i, col)| (Some(i), false, col.name.as_str()));
+    !schema.has_hidden_payload() && reply.eq(relation)
 }
 
 // ---------------------------------------------------------------------------

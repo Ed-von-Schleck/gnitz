@@ -147,7 +147,7 @@ fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape,
 pub(crate) fn execute_insert(
     client: &mut GnitzClient,
     insert: &Insert,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_insert_clauses(insert)?;
     let table_name_str = match &insert.table {

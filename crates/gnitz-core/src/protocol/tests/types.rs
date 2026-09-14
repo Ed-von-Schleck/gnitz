@@ -930,3 +930,78 @@ fn german_strings(batch: &ZSetBatch, pi: usize) -> Vec<String> {
         .map(|cell| String::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob).to_vec()).unwrap())
         .collect()
 }
+
+/// `(pk U64 | s STRING | n I64)`, row `i` carrying `vals[i]`, `n = 10 i` and weight `i + 1`.
+fn string_batch(vals: &[&str]) -> (Schema, ZSetBatch) {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::U64, false),
+            ColumnDef::new("s", TypeCode::String, false),
+            ColumnDef::new("n", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let mut b = ZSetBatch::new(&schema);
+    for (i, v) in vals.iter().enumerate() {
+        b.pks.push_u128(&schema, i as u128);
+        b.weights.push(i as i64 + 1);
+        b.nulls.push(0);
+        let cell = gnitz_wire::encode_german_string(v.as_bytes(), &mut b.blob);
+        b.payload[0].bytes.extend_from_slice(&cell);
+        b.payload[1].bytes.extend_from_slice(&(i as i64 * 10).to_le_bytes());
+    }
+    (schema, b)
+}
+
+/// Every STRING cell's content, in row order.
+fn string_contents(b: &ZSetBatch) -> Vec<Vec<u8>> {
+    b.payload[0]
+        .bytes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| gnitz_wire::german_string_content(c, &b.blob).to_vec())
+        .collect()
+}
+
+const GATHER_VALS: [&str; 4] = [
+    "a long string that spills past the inline prefix",
+    "tiny",
+    "another long string that also spills into the heap",
+    "x",
+];
+
+/// A cut gather is the row-by-row rebuild, cell for cell, and its arena holds
+/// exactly the survivors' spilled bytes — which the rebuild's re-encode also holds.
+#[test]
+fn a_cut_gather_matches_a_row_by_row_rebuild() {
+    let (schema, b) = string_batch(&GATHER_VALS);
+    let rows = [(2usize, 1i64), (0, 1), (3, 4)];
+    let mut want = ZSetBatch::new(&schema);
+    for &(r, w) in &rows {
+        want.copy_row_at(&b, r, w);
+    }
+    let got = b.gather(&rows);
+    assert_eq!(got.pks, want.pks);
+    assert_eq!(got.weights, want.weights);
+    assert_eq!(got.nulls, want.nulls);
+    assert_eq!(got.payload[1], want.payload[1]);
+    assert_eq!(string_contents(&got), string_contents(&want));
+    assert_eq!(got.blob.len(), want.blob.len(), "only the survivors' heap bytes");
+    got.validate(&schema).unwrap();
+}
+
+/// A gather keeping every row moves the arena whole: every cell keeps its offset.
+#[test]
+fn a_whole_gather_moves_the_arena() {
+    let (schema, b) = string_batch(&GATHER_VALS);
+    let perm = [(3usize, 1i64), (1, 1), (0, 2), (2, 1)];
+    let contents = string_contents(&b);
+    let want: Vec<Vec<u8>> = perm.iter().map(|&(r, _)| contents[r].clone()).collect();
+    let arena = b.blob.as_ptr();
+    let got = b.gather(&perm);
+    assert_eq!(got.blob.as_ptr(), arena);
+    assert_eq!(string_contents(&got), want);
+    assert_eq!(got.weights, [1, 1, 2, 1]);
+    got.validate(&schema).unwrap();
+}

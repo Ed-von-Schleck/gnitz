@@ -10,9 +10,8 @@ use crate::ast_util::{classify_from, extract_ident_name, extract_table_name_and_
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
 use crate::codec::pk_codec::{bound_num_literal, pack_pk_value, NumLit};
-use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::overlay::{buffered_net, present_rows};
-use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, AccessPlan, ReadBudget};
+use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, rows_sink, AccessPlan, ReadBudget};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::residual::matching_indices;
@@ -310,16 +309,6 @@ fn write_set_rows(
 // WHERE resolution — one read for both verbs, under the sink each one needs
 // ---------------------------------------------------------------------------
 
-/// DELETE's read shape: the source PK columns and nothing else. `build_read_projection`
-/// over an empty SELECT list is exactly that — the PK is always prepended, and
-/// there is no payload item to follow it — so the reply carries the key region
-/// and no blob heap, and the map relocates nothing.
-fn pk_only_reply(schema: &Schema, alias: &str) -> Result<(Schema, ReadSink), GnitzSqlError> {
-    let (items, out_cols) = build_read_projection(&[], schema, alias)?;
-    let (reply_schema, map) = read_reply_shape(&items, out_cols, schema, "read-spec reply schema is invalid")?;
-    Ok((reply_schema, ReadSink { map: Some(map), ..ReadSink::all_rows() }))
-}
-
 /// The rows a single-table UPDATE/DELETE `WHERE` (or its absence) resolves to,
 /// under `reply_schema`. Every row of the result matches, so the caller writes
 /// the whole batch — UPDATE reads it under the catalog schema (an identity sink)
@@ -384,7 +373,7 @@ fn resolve_where_matches(
 pub(crate) fn execute_update(
     client: &mut GnitzClient,
     update: &sqlparser::ast::Update,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_update_clauses(update)?;
     let (table, assignments_raw, selection) = (&update.table, &update.assignments, &update.selection);
@@ -455,7 +444,7 @@ pub(crate) fn execute_update(
 pub(crate) fn execute_delete(
     client: &mut GnitzClient,
     del: &sqlparser::ast::Delete,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_delete_clauses(del)?;
     let tables = match &del.from {
@@ -473,8 +462,8 @@ pub(crate) fn execute_delete(
 
     let where_expr = bind_where(schema, &table_alias, del.selection.as_ref())?;
     let plan = bound_and_predicate(schema, &where_expr, ReadBudget::MayChunk, &target.indexes)?;
-    let (reply_schema, sink) = pk_only_reply(schema, &table_alias)?;
-    let reply_schema = Arc::new(reply_schema);
+    // An empty projection is the source PK alone: the key region, no blob heap.
+    let (reply_schema, sink, _) = rows_sink(&[], None, schema, &table_alias, 0)?;
 
     // Resolve the target PKs and build the retraction batch under the RMW driver
     // (autocommit: one-precondition TXN frame with bounded retry; in a

@@ -252,7 +252,7 @@ fn churn(client: &mut GnitzClient, lo: i64, hi: i64) {
 // ---------------------------------------------------------------------------
 
 /// A mirrored read equals the same read against the server, over every sink a
-/// direct SELECT can route to: the plain scan, the bounded/projected rows sink,
+/// direct SELECT can land on: the whole-relation read, the bounded/projected rows sink,
 /// and the aggregate fold.
 ///
 /// The comparison runs after the ordinary client-side finishing on both sides,

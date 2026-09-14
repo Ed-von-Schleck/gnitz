@@ -7,8 +7,7 @@
 
 use crate::access::pk_point_tuple;
 use crate::dml::plan::Access;
-use crate::dml::select::{ReadCase, ReadPlan, SinkTail, SpecRead, Target};
-use crate::exec::order::Window;
+use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::sys_rows::SysRowSink;
@@ -22,118 +21,74 @@ pub(crate) fn execute_explain(plan: &ReadPlan) -> SqlResult {
 /// The five lines EXPLAIN renders for `plan`: what is read, the access path,
 /// where the predicate runs, the sink's shape, and the ORDER BY / LIMIT tail.
 pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
-    let spec = match &plan.case {
-        // The bare-`*` scan ships no `ReadSpec`, so it reads through a different
-        // request kind than any other full scan. It projects nothing and orders by
-        // nothing, so the reply is the source's own visible width.
-        ReadCase::PlainScan(target) => {
-            return vec![
-                read_line(target),
-                "access: full scan (unprojected)".to_string(),
-                "predicate: none".to_string(),
-                projection_line(target.schema.visible_columns().count(), 0),
-                "order/limit: none".to_string(),
-            ];
-        }
-        ReadCase::Constant(c) => {
-            let facts = window_facts(&[], c.window);
+    let order_limit = order_limit_line(plan);
+    let (read, shape) = match &plan.case {
+        ReadCase::Constant { schema, .. } => {
             return vec![
                 "read nothing (constant row)".to_string(),
                 "access: none".to_string(),
                 "predicate: none".to_string(),
-                projection_line(
-                    c.finish.out_schema.visible_columns().count(),
-                    hidden_payload(&c.finish.out_schema),
-                ),
-                order_limit_line(facts),
-            ];
+                projection_line(schema, false),
+                order_limit,
+            ]
         }
-        ReadCase::Spec(spec) => spec,
-    };
-    let schema = &*spec.target.schema;
-
-    // Line 4 is the sink's own shape: what the fold accumulates, or how wide the
-    // projected reply is.
-    let shape_line = match &spec.tail {
-        // The hidden columns `resolve_read_spec_order` appended for an ORDER BY
-        // key that is not an output column. The prepended source PK is hidden
-        // too, but is a PK column rather than a payload one.
-        SinkTail::Rows { reply_schema } => {
-            projection_line(reply_schema.visible_columns().count(), hidden_payload(reply_schema))
-        }
-        SinkTail::Fold { finish, reduce_schema, is_distinct } => {
-            let SinkKind::Fold(agg) = &spec.sink.kind else {
-                unreachable!("a fold tail ships a fold sink")
+        ReadCase::Rows { read, reply_schema } => (read, projection_line(reply_schema, read.sink.map.is_none())),
+        ReadCase::Fold { read, finish, reduce_schema, is_distinct } => {
+            let SinkKind::Fold(agg) = &read.sink.kind else {
+                unreachable!("a fold read ships a fold sink")
             };
-            fold_line(agg, reduce_schema, finish.having.is_some(), *is_distinct)
+            (
+                read,
+                fold_line(agg, reduce_schema, finish.having.is_some(), *is_distinct),
+            )
         }
     };
-
-    let facts = order_limit_facts(spec);
     vec![
-        read_line(&spec.target),
-        format!("access: {}", access_line(&spec.access, schema)),
+        read_line(read),
+        format!("access: {}", access_line(&read.access, &read.desc.schema)),
         format!(
             "predicate: {}",
-            if spec.access.has_predicate() {
+            if read.access.has_predicate() {
                 "server-side"
             } else {
                 "none"
             }
         ),
-        shape_line,
-        order_limit_line(facts),
+        shape,
+        order_limit,
     ]
 }
 
-fn hidden_payload(schema: &Schema) -> usize {
-    (0..schema.columns.len())
-        .filter(|&i| schema.is_hidden_payload(i))
-        .count()
-}
-
-fn order_limit_line(facts: Vec<String>) -> String {
+/// Where the ORDER BY / LIMIT / OFFSET work happens.
+fn order_limit_line(plan: &ReadPlan) -> String {
+    if plan.window.limit == Some(0) {
+        return "order/limit: no request (LIMIT 0)".to_string();
+    }
+    let mut facts = Vec::new();
+    // The per-worker cut is OFFSET+LIMIT deep, because the client windows. With no
+    // ORDER BY keys the same wire field just stops the worker early.
+    if let ReadCase::Rows { read, .. } = &plan.case {
+        if let SinkKind::Rows { limit_k, .. } = &read.sink.kind {
+            if *limit_k > 0 {
+                facts.push(if plan.order.is_empty() {
+                    format!("server early-stop {limit_k}")
+                } else {
+                    format!("server top-{limit_k}")
+                });
+            }
+        }
+    }
+    if !plan.order.is_empty() {
+        facts.push("client sort".to_string());
+    }
+    if plan.window.offset > 0 || plan.window.limit.is_some() {
+        facts.push("client window".to_string());
+    }
     if facts.is_empty() {
         "order/limit: none".to_string()
     } else {
         format!("order/limit: {}", facts.join(", "))
     }
-}
-
-/// Where the ORDER BY / LIMIT / OFFSET work happens. Only the rows sink pushes
-/// anything down; all fold finishing is client-side.
-fn order_limit_facts(spec: &SpecRead) -> Vec<String> {
-    // Both tails short-circuit `LIMIT 0` to an empty result before dispatching.
-    if spec.window.limit == Some(0) {
-        return vec!["no request (LIMIT 0)".to_string()];
-    }
-    let mut facts = Vec::new();
-    // The per-worker cut is OFFSET+LIMIT deep, because the client windows. With no
-    // ORDER BY keys the same wire field just stops the worker early.
-    if let SinkKind::Rows { order, limit_k } = &spec.sink.kind {
-        if *limit_k > 0 {
-            facts.push(if order.is_empty() {
-                format!("server early-stop {limit_k}")
-            } else {
-                format!("server top-{limit_k}")
-            });
-        }
-    }
-    facts.extend(window_facts(&spec.order, spec.window));
-    facts
-}
-
-/// The client's share: it sorts the union of the per-worker replies, which no
-/// per-worker cut orders, and windows it.
-fn window_facts(order: &[gnitz_wire::OrderKey], window: Window) -> Vec<String> {
-    let mut facts = Vec::new();
-    if !order.is_empty() {
-        facts.push("client sort".to_string());
-    }
-    if window.offset > 0 || window.limit.is_some() {
-        facts.push("client window".to_string());
-    }
-    facts
 }
 
 // ---------------------------------------------------------------------------
@@ -144,12 +99,12 @@ fn window_facts(order: &[gnitz_wire::OrderKey], window: Window) -> Vec<String> {
 /// source closure has a committed-but-unticked write drains the pending ticks
 /// before serving. EXPLAIN cannot know staleness at plan time, so it names the
 /// condition, not a verdict.
-fn read_line(target: &Target) -> String {
-    let class = target.desc.class;
+fn read_line(read: &SpecRead) -> String {
+    let class = read.desc.class;
     if class.is_view() {
-        format!("read view {} (drains pending ticks when stale)", target.name)
+        format!("read view {} (drains pending ticks when stale)", read.name)
     } else {
-        format!("read {} {}", class.noun(), target.name)
+        format!("read {} {}", class.noun(), read.name)
     }
 }
 
@@ -188,14 +143,22 @@ fn access_line(access: &Access, schema: &Schema) -> String {
     }
 }
 
-/// How wide the reply is: the columns the client sees, plus any appended purely
-/// to order the result.
-fn projection_line(visible: usize, extra: usize) -> String {
-    if extra > 0 {
+/// How wide the reply is: its visible columns, the hidden ones appended to order it, and
+/// whether it ships no map.
+fn projection_line(schema: &Schema, unprojected: bool) -> String {
+    let visible = schema.visible_columns().count();
+    let extra = (0..schema.columns.len())
+        .filter(|&i| schema.is_hidden_payload(i))
+        .count();
+    let mut line = if extra > 0 {
         format!("projection: {visible} columns (+{extra} for ordering)")
     } else {
         format!("projection: {visible} columns")
+    };
+    if unprojected {
+        line.push_str(" (unprojected)");
     }
+    line
 }
 
 /// What the worker folds: the PHYSICAL aggregate list, which is why an AVG shows

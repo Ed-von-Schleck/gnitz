@@ -44,4 +44,4 @@ pub use types::{
     PayloadColumn, PkBuf, PkColumn, ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES,
     PK_LIST_MAX_COLS,
 };
-pub use wal_block::decode_wal_block;
+pub use wal_block::{decode_regions_into, decode_wal_block};

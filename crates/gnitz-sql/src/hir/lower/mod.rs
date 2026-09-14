@@ -346,11 +346,11 @@ pub(crate) fn resolve_in_place(
 ) -> Result<Option<SegInput>, GnitzSqlError> {
     match input.as_ref() {
         RelExpr::Get {
-            source: GetSource::Catalog { tid, desc },
+            source: GetSource::Catalog { desc },
             schema,
             cols,
         } => Ok(Some(SegInput {
-            tid: *tid,
+            tid: desc.tid,
             frame: Frame {
                 layout: cols.iter().map(|c| c.id).collect(),
                 schema: Arc::clone(schema),

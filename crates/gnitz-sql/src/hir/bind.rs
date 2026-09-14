@@ -128,7 +128,7 @@ impl ViewSurface {
 /// set-operation side and a subquery bind against the same five.
 pub(crate) struct BindCx<'c, 'b> {
     pub(crate) cat: &'c CatalogSnapshot,
-    pub(crate) binder: &'c mut Binder<'b>,
+    pub(crate) binder: &'c Binder<'b>,
     pub(crate) ids: &'c ColIdGen,
     /// `CREATE VIEW` or `ALTER VIEW … AS`, so a rejection names the statement
     /// the user wrote.
@@ -140,7 +140,7 @@ pub(crate) struct BindCx<'c, 'b> {
 impl<'c, 'b> BindCx<'c, 'b> {
     pub(crate) fn new(
         cat: &'c CatalogSnapshot,
-        binder: &'c mut Binder<'b>,
+        binder: &'c Binder<'b>,
         ids: &'c ColIdGen,
         surface: ViewSurface,
     ) -> Self {
@@ -162,8 +162,7 @@ fn resolve_relation(cx: &mut BindCx<'_, '_>, name: &str) -> Result<Rc<RelExpr>, 
     if let Some(cte) = cx.ctes.get(&name.to_ascii_lowercase()) {
         return Ok(RelExpr::alias_as(cx.ids, Rc::clone(&cte.rel), &cte.defs));
     }
-    let (tid, schema, desc) = cx.binder.resolve(cx.cat, name)?;
-    Ok(RelExpr::get(cx.ids, tid, schema, desc))
+    Ok(RelExpr::get(cx.ids, cx.binder.resolve(cx.cat, name)?))
 }
 
 /// A view body's `ORDER BY … LIMIT n [OFFSET m]` tail — the top-N the body
@@ -299,8 +298,7 @@ fn resolve_table_factor(
         };
         // The alias is a user-visible name, so it is held to the general
         // user-identifier rule (a leading `_` is reserved for the `_seg…`
-        // hidden-segment namespace) even though an inline derived subtree never
-        // enters the binder's alias cache.
+        // hidden-segment namespace).
         validate_user_name(&alias.name.value)?;
         let ctx = format!("derived table '{}'", alias.name.value);
         reject_if(*lateral, &ctx, "LATERAL")?;
@@ -1499,7 +1497,7 @@ fn distinct_arg(calls: &[AggKey]) -> Result<Option<ColId>, GnitzSqlError> {
 /// Bind an ad-hoc single-relation grouped body to
 /// `Project(Filter_having?(Reduce(PreMap?(Get))))` — the same suffix, over the
 /// same leaf, that a grouped `CREATE VIEW` body binds. The fold lowering
-/// (`dml::group_by`) reads the result instead of running a second binder, which
+/// (`dml::select`) reads the result instead of running a second binder, which
 /// is what makes one written statement mean one thing on both paths.
 ///
 /// The WHERE is deliberately *not* bound here: the ad-hoc read path carries it

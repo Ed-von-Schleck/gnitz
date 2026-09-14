@@ -206,3 +206,55 @@ fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
         "an index bound never pins a PK key"
     );
 }
+
+/// `rows_sink` over `sql` against `schema`, read as relation `t`.
+fn rows_sink_of(sql: &str, schema: &Arc<Schema>) -> (Arc<Schema>, ReadSink, Vec<gnitz_wire::OrderKey>) {
+    let q = crate::test_support::parse_query(sql);
+    let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() else {
+        panic!("`{sql}` is not a plain SELECT");
+    };
+    rows_sink(&sel.projection, q.order_by.as_ref(), schema, "t", 0).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+}
+
+/// A projection reproducing the relation replies in its layout with no map, ORDER BY keys
+/// on source columns; any other projection ships a map.
+#[test]
+fn only_a_reproducing_projection_ships_no_map() {
+    let u = TypeCode::U64;
+    let schema = |cols: [&str; 3], pk: u32| {
+        Arc::new(Schema {
+            columns: cols.iter().map(|n| col_def(n, u, false)).collect(),
+            pk_cols: vec![pk],
+        })
+    };
+    let t = schema(["id", "v", "w"], 0);
+    for (sql, keys) in [
+        ("SELECT * FROM t", vec![]),
+        ("SELECT id, v, w FROM t", vec![]),
+        ("SELECT * FROM t ORDER BY w", vec![2u16]),
+    ] {
+        let (reply, sink, order) = rows_sink_of(sql, &t);
+        assert!(Arc::ptr_eq(&reply, &t), "`{sql}`: the source schema itself");
+        assert!(sink.map.is_none(), "`{sql}`");
+        assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), keys, "`{sql}`");
+        let SinkKind::Rows { order: shipped, .. } = &sink.kind else {
+            panic!("`{sql}`: a rows sink");
+        };
+        assert_eq!(shipped, &order, "`{sql}`: the worker orders by the same keys");
+    }
+    let mid = schema(["v", "id", "w"], 1);
+    let (reply, sink, order) = rows_sink_of("SELECT * FROM t ORDER BY id", &mid);
+    assert!(Arc::ptr_eq(&reply, &mid) && sink.map.is_none());
+    assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), [1u16]);
+    for sql in [
+        "SELECT v, id, w FROM t",
+        "SELECT * FROM t ORDER BY v + 1",
+        "SELECT id AS x, v, w FROM t",
+        // The hidden key appended for `w` sits where the omitted column would.
+        "SELECT id, v FROM t ORDER BY w",
+    ] {
+        let (reply, sink, _) = rows_sink_of(sql, &t);
+        assert!(sink.map.is_some(), "`{sql}`");
+        assert!(!Arc::ptr_eq(&reply, &t), "`{sql}`");
+    }
+}

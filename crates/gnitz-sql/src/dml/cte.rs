@@ -12,8 +12,7 @@ use crate::ast_util::{
     extract_table_name_and_alias, is_bare_wildcard_projection, object_name_ident, scalar_projection_item, FromShape,
 };
 use crate::bind::{apply_positional_aliases, reject_foreign_qualifier, single_relation_col_idx, Binder};
-use crate::dml::select::{from_construct, reject_derivation};
-use crate::error::{unsupported_clause, GnitzSqlError};
+use crate::error::{derivation, unsupported_clause, GnitzSqlError};
 use crate::validate::{
     as_plain_select, computed_column_name, cte_body, non_recursive_ctes, reject_duplicate_projection_names,
     reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
@@ -43,7 +42,7 @@ struct Cte {
 /// Expand `query`'s CTEs into its body. `None` when it has no `WITH`.
 pub(super) fn inline_ctes(
     cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
     query: &Query,
 ) -> Result<Option<Query>, GnitzSqlError> {
     let ctes = non_recursive_ctes(query)?;
@@ -58,7 +57,7 @@ pub(super) fn inline_ctes(
         let body = as_plain_select(cte_body(cte, &ctx)?, &ctx)?;
         reject_unhonored_select_clauses(body, HonoredClauses::for_body(true, false), &ctx)?;
         if body_is_grouped(body) {
-            return reject_derivation("grouped CTE");
+            return Err(derivation("grouped CTE"));
         }
         let mut body = body.clone();
         expand(&macros, &mut body, None, binder.schema_name())?;
@@ -98,7 +97,7 @@ pub(super) fn inline_ctes(
 /// route would reject it.
 fn cte_columns(
     cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
     body: &Select,
     ctx: &str,
 ) -> Result<Vec<(ColumnDef, Expr)>, GnitzSqlError> {
@@ -115,12 +114,12 @@ fn cte_columns(
         let tf = match classify_from(&body.from) {
             FromShape::SinglePlainRelation(tf) => tf,
             FromShape::Empty => return Err(unsupported_clause(ctx, "SELECT * without FROM")),
-            FromShape::Derived(d) => return reject_derivation(from_construct(d)),
+            FromShape::Derived(c) => return Err(derivation(c)),
         };
         let (table, _) = extract_table_name_and_alias(tf, binder.schema_name(), ctx)?;
-        let (_, schema, _) = binder.resolve(cat, &table)?;
-        for (i, def) in expand_wildcard_item(o, &schema.columns, ctx)? {
-            cols.push((def, Expr::Identifier(Ident::new(schema.columns[i].name.clone()))));
+        let desc = binder.resolve(cat, &table)?;
+        for (i, def) in expand_wildcard_item(o, &desc.schema.columns, ctx)? {
+            cols.push((def, Expr::Identifier(Ident::new(desc.schema.columns[i].name.clone()))));
         }
     }
     Ok(cols)

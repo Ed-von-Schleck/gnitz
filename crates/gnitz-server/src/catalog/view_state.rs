@@ -14,6 +14,7 @@ use gnitz_store::storage::SourceCursor;
 use gnitz_wire::IndexWalk;
 use gnitz_wire::{ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
+use std::rc::Rc;
 
 impl CatalogEngine {
     /// [`RelationRegistry::scan`] with this engine's own circuit layer as
@@ -48,7 +49,7 @@ impl CatalogEngine {
         spec: &ReadSpec,
         reply_schema: &SchemaDescriptor,
         cut_tick: u64,
-    ) -> Result<Batch, WireFault> {
+    ) -> Result<Rc<Batch>, WireFault> {
         let (dag, registry) = self.dag_and_registry_mut();
         registry
             .scan_spec(target_id, spec, reply_schema, cut_tick, Some(dag))

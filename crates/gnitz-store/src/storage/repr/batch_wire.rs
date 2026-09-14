@@ -182,8 +182,9 @@ impl Batch {
 
     /// Fill `out` with every fixed region followed by the blob heap, in
     /// canonical order. Returns the region count — the `&[&[u8]]` both the WAL
-    /// framer and the shard writer take, built on the caller's stack.
-    pub(super) fn fill_regions<'a>(&'a self, out: &mut [&'a [u8]; MAX_WIRE_REGIONS]) -> usize {
+    /// framer and the shard writer take, built on the caller's stack, and the
+    /// mirror's decode input.
+    pub fn fill_regions<'a>(&'a self, out: &mut [&'a [u8]; MAX_WIRE_REGIONS]) -> usize {
         let blob_idx = self.num_regions();
         for (i, region) in out[..blob_idx].iter_mut().enumerate() {
             *region = self.region_or_blob(i);

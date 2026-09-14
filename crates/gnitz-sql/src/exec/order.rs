@@ -116,10 +116,10 @@ fn emit_slot(
 /// `max(0, min(Cᵢ+wᵢ, hi) − max(Cᵢ, offset))`. This one overlap formula handles
 /// OFFSET mid-entry, LIMIT mid-entry, and both cuts inside the same entry. The
 /// walk requires `wᵢ ≥ 1`, which its one caller checks over the whole batch.
-fn paginate(weights: &[i64], offset: u64, hi: u64) -> Vec<(usize, i64)> {
+fn paginate(weights: impl IntoIterator<Item = i64>, offset: u64, hi: u64) -> Vec<(usize, i64)> {
     let mut cum: u64 = 0;
     let mut out = Vec::new();
-    for (i, &w) in weights.iter().enumerate() {
+    for (i, w) in weights.into_iter().enumerate() {
         let lo_i = cum;
         let hi_i = cum.saturating_add(w as u64);
         let surviving = hi_i.min(hi).saturating_sub(lo_i.max(offset));
@@ -175,9 +175,9 @@ pub(crate) fn read_spec_finish(
 /// group, so a cut appends the identity tiebreak; every tie is then between
 /// *identical* rows, and an unstable partial selection is exact however it
 /// splits a tie group. Without a cut, a stable sort so ties keep their fetch
-/// order. Then the logical window is walked and the survivors gathered, moving
-/// each row's String/Blob cells out of the owned `full` (every source row
-/// survives at most once; `full` is dropped right after). A boundary entry
+/// order. Then the logical window is walked and the survivors gathered column
+/// by column from the owned `full` (`ZSetBatch::gather`; every source row
+/// survives at most once). A boundary entry
 /// keeps its window-clipped multiplicity.
 fn finish_window(
     schema: Arc<Schema>,
@@ -220,15 +220,13 @@ fn finish_window(
 
     let off = offset as u64;
     let hi = limit.map_or(u64::MAX, |l| off.saturating_add(l as u64));
-    let ordered_weights: Vec<i64> = perm.iter().map(|&r| full.weights[r]).collect();
-    let surviving_rows = paginate(&ordered_weights, off, hi);
-    let mut gathered = ZSetBatch::with_capacity(&schema, surviving_rows.len());
-    for (pos, surviving) in surviving_rows {
-        // Written at the window-clipped multiplicity (a boundary entry keeps a
-        // reduced one).
-        gathered.copy_row_at(&full, perm[pos], surviving);
+    // Each survivor at its window-clipped multiplicity (a boundary entry keeps a
+    // reduced one), named by its row in `full`.
+    let mut survivors = paginate(perm.iter().map(|&r| full.weights[r]), off, hi);
+    for s in &mut survivors {
+        s.0 = perm[s.0];
     }
-    (schema, gathered)
+    (schema, full.gather(&survivors))
 }
 
 #[cfg(test)]

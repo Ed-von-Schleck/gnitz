@@ -4,7 +4,7 @@
 
 use gnitz_core::{CatalogSnapshot, RelClass, TypeCode};
 use gnitz_sql::sqlparser::ast::Statement;
-use gnitz_sql::{explain_lines, GnitzSqlError, ReadKind};
+use gnitz_sql::{explain_lines, GnitzSqlError};
 
 mod pure;
 use pure::*;
@@ -57,14 +57,14 @@ fn explain_names_every_decision() {
     let cat = cat();
     const TRADED: &str = "access: index range on (v) — may be traded for a full scan on low selectivity";
     for (sql, want) in [
-        // The bare `*` scan ships no spec; projecting the same columns does.
+        // A projection reproducing the relation's columns ships no map.
         (
             "SELECT * FROM t",
             [
                 "read table t",
-                "access: full scan (unprojected)",
+                "access: full scan",
                 "predicate: none",
-                "projection: 3 columns",
+                "projection: 3 columns (unprojected)",
                 "order/limit: none",
             ],
         ),
@@ -74,8 +74,39 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: full scan",
                 "predicate: none",
+                "projection: 3 columns (unprojected)",
+                "order/limit: none",
+            ],
+        ),
+        (
+            "SELECT * FROM t WHERE v = 3 ORDER BY w",
+            [
+                "read table t",
+                TRADED,
+                "predicate: server-side",
+                "projection: 3 columns (unprojected)",
+                "order/limit: client sort",
+            ],
+        ),
+        // Renaming a column is not reproducing it.
+        (
+            "SELECT id AS x, v, w FROM t",
+            [
+                "read table t",
+                "access: full scan",
+                "predicate: none",
                 "projection: 3 columns",
                 "order/limit: none",
+            ],
+        ),
+        (
+            "SELECT 1 AS a LIMIT 0",
+            [
+                "read nothing (constant row)",
+                "access: none",
+                "predicate: none",
+                "projection: 1 columns",
+                "order/limit: no request (LIMIT 0)",
             ],
         ),
         (
@@ -322,9 +353,9 @@ fn explain_names_every_decision() {
             "SELECT * FROM tv",
             [
                 "read view tv (drains pending ticks when stale)",
-                "access: full scan (unprojected)",
+                "access: full scan",
                 "predicate: none",
-                "projection: 3 columns",
+                "projection: 3 columns (unprojected)",
                 "order/limit: none",
             ],
         ),
@@ -332,9 +363,9 @@ fn explain_names_every_decision() {
             "WITH c AS (SELECT * FROM tv) SELECT * FROM c",
             [
                 "read view tv (drains pending ticks when stale)",
-                "access: full scan (unprojected)",
+                "access: full scan",
                 "predicate: none",
-                "projection: 3 columns",
+                "projection: 3 columns (unprojected)",
                 "order/limit: none",
             ],
         ),
@@ -373,7 +404,7 @@ fn explain_plans_the_query_it_describes_and_shares_its_rejection() {
     ] {
         let direct = read(&cat, sql).unwrap();
         let described = read(&cat, &format!("EXPLAIN {sql}")).unwrap();
-        assert_eq!(direct.kind(), described.kind(), "`{sql}`");
+        assert_eq!(explain_lines(&direct), explain_lines(&described), "`{sql}`");
         assert_eq!(direct.encoded_spec(), described.encoded_spec(), "`{sql}`");
     }
     for (sql, variant, msg) in [
@@ -424,38 +455,38 @@ fn explain_rejected_clause_matrix() {
 
 // ── Read shapes ──────────────────────────────────────────────────────────────
 
-/// Every ad-hoc read shape plans to the sink it belongs on and says whether a
-/// request goes out at all.
+/// Every ad-hoc read shape plans to the sink it belongs on, reads the relation it
+/// names, ships a spec, and says whether a request goes out at all.
 #[test]
 fn every_read_shape_plans_to_its_sink() {
     let cat = base();
-    for (sql, kind, dispatches) in [
-        ("SELECT * FROM t", ReadKind::PlainScan, true),
-        ("SELECT id FROM t", ReadKind::Rows, true),
-        ("SELECT * FROM t WHERE id = 3", ReadKind::Rows, true),
-        ("SELECT * FROM t WHERE v = 3", ReadKind::Rows, true),
-        ("SELECT id FROM t ORDER BY v LIMIT 5 OFFSET 2", ReadKind::Rows, true),
-        ("SELECT id FROM t LIMIT 0", ReadKind::Rows, false),
-        ("SELECT COUNT(*) FROM t", ReadKind::Fold, true),
-        ("SELECT g, SUM(v) AS s FROM t GROUP BY g", ReadKind::Fold, true),
-        ("SELECT DISTINCT g FROM t", ReadKind::Fold, true),
-        ("SELECT COUNT(*) FROM t LIMIT 0", ReadKind::Fold, false),
-        ("WITH c AS (SELECT * FROM t) SELECT id FROM c", ReadKind::Rows, true),
+    for (sql, fold, dispatches) in [
+        ("SELECT * FROM t", false, true),
+        ("SELECT id FROM t", false, true),
+        ("SELECT * FROM t WHERE id = 3", false, true),
+        ("SELECT * FROM t WHERE v = 3", false, true),
+        ("SELECT id FROM t ORDER BY v LIMIT 5 OFFSET 2", false, true),
+        ("SELECT id FROM t LIMIT 0", false, false),
+        ("SELECT COUNT(*) FROM t", true, true),
+        ("SELECT g, SUM(v) AS s FROM t GROUP BY g", true, true),
+        ("SELECT DISTINCT g FROM t", true, true),
+        ("SELECT COUNT(*) FROM t LIMIT 0", true, false),
+        ("WITH c AS (SELECT * FROM t) SELECT id FROM c", false, true),
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        assert_eq!(plan.kind(), kind, "`{sql}`");
-        assert_eq!(plan.target_id(), Some(16), "`{sql}`: the relation it reads");
-        assert_eq!(plan.dispatches(), dispatches, "`{sql}`");
-        let plain = kind == ReadKind::PlainScan;
+        let lines = explain_lines(&plan);
+        assert_eq!(lines[0], "read table t", "`{sql}`: the relation it reads");
+        let shape = if fold { "fold:" } else { "projection:" };
+        assert!(lines[3].starts_with(shape), "`{sql}`: {}", lines[3]);
         assert_eq!(
-            plan.reply_schema().is_none(),
-            plain,
-            "`{sql}`: only a plain scan projects nothing"
+            lines[4] == "order/limit: no request (LIMIT 0)",
+            !dispatches,
+            "`{sql}`: {}",
+            lines[4]
         );
-        assert_eq!(
-            plan.encoded_spec().is_none(),
-            plain,
-            "`{sql}`: only a plain scan ships no spec"
+        assert!(
+            plan.encoded_spec().is_some(),
+            "`{sql}`: every relation read ships a spec"
         );
     }
 }
@@ -482,15 +513,11 @@ fn a_parenthesized_column_reference_reads_like_a_bare_one() {
         let p = read(&cat, parens).unwrap_or_else(|e| panic!("`{parens}`: {e:?}"));
         let b = read(&cat, bare).unwrap();
         assert_eq!(p.encoded_spec(), b.encoded_spec(), "`{parens}`");
-        assert_eq!(
-            p.reply_schema().map(visible),
-            b.reply_schema().map(visible),
-            "`{parens}`"
-        );
+        assert_eq!(visible(p.reply_schema()), visible(b.reply_schema()), "`{parens}`");
     }
     // Peeling the wrapper must not turn a computed item into a column reference.
     let s = read(&cat, "SELECT (v + 1) AS x FROM t").unwrap();
-    assert_eq!(visible(s.reply_schema().unwrap()), ["x"]);
+    assert_eq!(visible(s.reply_schema()), ["x"]);
 }
 
 fn visible(s: &gnitz_core::Schema) -> Vec<String> {
@@ -510,7 +537,7 @@ fn a_reads_reply_schema_hides_the_source_pk_behind_the_select_list() {
         ("SELECT id, g AS g1, g AS g2 FROM t", vec!["id", "g1", "g2"]),
     ] {
         let s = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        let schema = s.reply_schema().unwrap();
+        let schema = s.reply_schema();
         assert_eq!(visible(schema), want, "`{sql}`");
         assert!(schema.columns[0].is_hidden && schema.columns[0].name == "id", "`{sql}`");
     }
@@ -626,6 +653,14 @@ fn a_read_the_planner_rejects_names_its_rule() {
         // `AS d(x, y)` renames the columns positionally; honoring only the
         // relation alias would answer under `t`'s own column names.
         ("SELECT * FROM t AS d(x, y)", "Unsupported", "positional column aliases"),
+        // The FROM name is checked before the clause gate, on either sink.
+        (
+            "SELECT DISTINCT ON (v) * FROM t AS d(x, y)",
+            "Unsupported",
+            "positional column aliases",
+        ),
+        // The projection binds before ORDER BY is parsed.
+        ("SELECT nope FROM t ORDER BY 1.5", "Bind", "nope"),
         ("SELECT id FROM jv", "Bind", "is ambiguous"),
         ("SELECT * FROM jv WHERE id = 5", "Bind", "is ambiguous"),
         ("SELECT _join_pk FROM jv", "Bind", "not found"),
@@ -709,9 +744,9 @@ fn a_cte_expands_to_the_flat_query() {
     ] {
         let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
         let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
-        assert_eq!(c.kind(), f.kind(), "`{cte}`");
+        assert_eq!(explain_lines(&c), explain_lines(&f), "`{cte}`");
         assert_eq!(c.encoded_spec(), f.encoded_spec(), "`{cte}`");
-        assert_eq!(c.reply_schema().map(visible), f.reply_schema().map(visible), "`{cte}`");
+        assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
     }
     for (sql, variant, msg) in [
         (
@@ -844,13 +879,12 @@ fn an_order_by_key_binds_where_the_select_list_does() {
         "SELECT g + 1 AS h FROM t GROUP BY g + 1 ORDER BY (g + 1) * 2",
         "SELECT DISTINCT v AS w FROM t ORDER BY w DESC, 1",
     ] {
-        let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        assert_eq!(plan.kind(), ReadKind::Fold, "`{sql}`");
+        assert!(explain(&cat, sql)[3].starts_with("fold:"), "`{sql}`");
     }
     // An aggregate named only in ORDER BY is collected into the reduce: the
     // partial reply carries its accumulator beside the group column.
     let plan = read(&cat, "SELECT g FROM t GROUP BY g ORDER BY COUNT(*)").unwrap();
-    assert_eq!(visible(plan.reply_schema().unwrap()), ["g", "_agg"]);
+    assert_eq!(visible(plan.reply_schema()), ["g", "_agg"]);
     // A hidden ordering column is tied to its key by the key's position in the
     // whole ORDER BY, so a positional key ahead of an expression one does not
     // shift the tie: both spellings of one order plan the same output shape.
@@ -866,11 +900,7 @@ fn an_order_by_key_binds_where_the_select_list_does() {
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         let twin = read(&cat, named).unwrap_or_else(|e| panic!("`{named}`: {e:?}"));
-        assert_eq!(
-            visible(plan.reply_schema().unwrap()),
-            visible(twin.reply_schema().unwrap()),
-            "`{sql}`"
-        );
+        assert_eq!(visible(plan.reply_schema()), visible(twin.reply_schema()), "`{sql}`");
         assert_eq!(explain(&cat, sql), explain(&cat, named), "`{sql}`");
     }
     for (sql, variant, msg) in [
@@ -903,11 +933,9 @@ fn a_from_less_select_plans_a_constant_row() {
         ("SELECT 1 AS a ORDER BY 1 + 1", vec!["a"]),
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
-        assert_eq!(plan.kind(), ReadKind::Constant, "`{sql}`");
-        assert_eq!(plan.target_id(), None, "`{sql}`");
-        assert!(!plan.dispatches(), "`{sql}`");
+        assert_eq!(explain(&cat, sql)[0], "read nothing (constant row)", "`{sql}`");
         assert!(plan.encoded_spec().is_none(), "`{sql}`");
-        assert_eq!(visible(plan.reply_schema().unwrap()), cols, "`{sql}`");
+        assert_eq!(visible(plan.reply_schema()), cols, "`{sql}`");
     }
     assert_eq!(
         explain(&cat, "SELECT 1 AS a ORDER BY 1 + 1 LIMIT 1"),

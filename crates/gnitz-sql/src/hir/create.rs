@@ -127,11 +127,9 @@ fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
 /// every earlier segment is an internal one it depends on, which is the
 /// dependency order `create_view_chain` wants anyway.
 pub fn plan_view(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> Result<ViewPlan, GnitzSqlError> {
-    // A fresh binder per pass: the alias cache a re-run's discarded pass filled
-    // must not reach the next one.
-    let mut binder = Binder::new(schema_name).for_view_body();
+    let binder = Binder::new(schema_name).for_view_body();
     match stmt {
-        Statement::CreateView(cv) => plan_create_view(cat, schema_name, cv, &mut binder),
+        Statement::CreateView(cv) => plan_create_view(cat, schema_name, cv, &binder),
         // `columns` is the positional output alias list, honored exactly as
         // `CREATE VIEW v (a, b) AS` is.
         Statement::AlterView { name, query, columns, with_options } => {
@@ -139,7 +137,7 @@ pub fn plan_view(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
             // the clause-less form silently drop one. `CREATE OR REPLACE VIEW`
             // restates both.
             reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
-            plan_alter_view(cat, schema_name, name, columns, query, &mut binder)
+            plan_alter_view(cat, schema_name, name, columns, query, &binder)
         }
         _ => Err(GnitzSqlError::Unsupported(
             "plan_view describes a CREATE VIEW or an ALTER VIEW … AS; this statement is neither".to_string(),
@@ -168,7 +166,7 @@ fn plan_create_view(
     cat: &CatalogSnapshot,
     schema_name: &str,
     cv: &sqlparser::ast::CreateView,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
 ) -> Result<ViewPlan, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
     let query: &Query = &cv.query;
@@ -236,7 +234,7 @@ fn plan_alter_view(
     name: &ObjectName,
     columns: &[Ident],
     query: &Query,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
 ) -> Result<ViewPlan, GnitzSqlError> {
     let view_name = crate::ast_util::extract_object_name(name, schema_name, "ALTER VIEW")?;
     validate_user_name(&view_name)?;
@@ -383,7 +381,7 @@ fn resolve_view_id(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Resu
 fn build_query_segments(
     cat: &CatalogSnapshot,
     query: &Query,
-    binder: &mut Binder<'_>,
+    binder: &Binder<'_>,
     chain: &mut ViewChain,
     options: ViewOptions,
     surface: ViewSurface,

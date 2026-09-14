@@ -24,7 +24,7 @@ mod types;
 mod validate;
 
 pub use ddl::{plan_create_table, TablePlan};
-pub use dml::{explain_lines, plan_read, ReadKind, ReadPlan};
+pub use dml::{explain_lines, plan_read, ReadPlan};
 pub use error::GnitzSqlError;
 pub use hir::{plan_view, PlannedChain, ViewPlan};
 // The planning entry points take a `sqlparser::ast::Statement`, so a caller must

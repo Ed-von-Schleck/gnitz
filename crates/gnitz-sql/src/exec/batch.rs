@@ -1,4 +1,4 @@
-use crate::ast_util::{aliased_def, expand_wildcard_item, is_bare_wildcard_projection, scalar_projection_item};
+use crate::ast_util::{aliased_def, expand_wildcard_item, scalar_projection_item};
 use crate::bind::single_relation_col_idx;
 use crate::error::GnitzSqlError;
 use crate::validate::reject_duplicate_projection_names;
@@ -19,14 +19,6 @@ pub(crate) fn resolve_projection(
     schema: &Schema,
     rel_alias: &str,
 ) -> Result<Projection, GnitzSqlError> {
-    // Only a *bare* `*` on a schema with no hidden payload column is the no-op
-    // passthrough; a `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`),
-    // or a DROP COLUMN'd base table, falls through to the expansion arm so the
-    // dropped slot is filtered out (§6).
-    if is_bare_wildcard_projection(projection) && !schema.has_hidden_payload() {
-        return Ok(None);
-    }
-
     // One output column per projection item (`SELECT a, a` yields two columns —
     // the convention every other surface follows): the source column index and
     // its output `ColumnDef` (alias applied).
