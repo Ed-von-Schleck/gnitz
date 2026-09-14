@@ -797,6 +797,10 @@ impl WorkerProcess {
             dag.reset_view_for_rebuild(registry, view_id)?;
             self.cat().clear_invalid_view(view_id);
         }
+        // Compiled before the first chunk: a failure here is an error reply, where the
+        // same failure inside a chunk's epoch is a fatal abort mid-round.
+        let (dag, registry) = self.cat().dag_and_registry_mut();
+        dag.ensure_compiled(registry, view_id)?;
         let chunk_rows = self.cat().registry().scan_chunk_rows();
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see

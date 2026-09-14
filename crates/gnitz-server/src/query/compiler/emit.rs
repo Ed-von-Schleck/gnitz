@@ -25,13 +25,11 @@ pub(super) struct EmitCtx<'a> {
     /// rows this worker legitimately owns a copy of), and `emit_reduce` makes
     /// every worker the owner of the global-aggregate seed.
     pub(in crate::query) placement: gnitz_store::schema::Placement,
-    pub(in crate::query) ext_tables: &'a dyn SchemaSource,
     pub(in crate::query) site: super::ViewSite<'a>,
     pub(in crate::query) builder: ProgramBuilder,
     pub(in crate::query) out_reg_of: FxHashMap<i32, OutReg>,
     pub(in crate::query) reg_meta: Vec<RegisterMeta>,
     pub(in crate::query) source_reg_map: FxHashMap<i64, DeltaReg>,
-    pub(in crate::query) sink_reg_id: Option<DeltaReg>,
 }
 
 /// What a node's emission left its value in — the one place the two register
@@ -43,17 +41,17 @@ pub(super) enum OutReg {
 }
 
 impl OutReg {
-    pub(super) fn delta(self) -> Result<DeltaReg, CompileError> {
+    pub(super) fn delta(self) -> Result<DeltaReg, String> {
         match self {
             OutReg::Delta(r) => Ok(r),
-            OutReg::Trace(_) => Err(CompileError::Rejected("operand port takes a delta, not an integral")),
+            OutReg::Trace(_) => Err("operand port takes a delta, not an integral".into()),
         }
     }
 
-    pub(super) fn trace(self) -> Result<TraceReg, CompileError> {
+    pub(super) fn trace(self) -> Result<TraceReg, String> {
         match self {
             OutReg::Trace(r) => Ok(r),
-            OutReg::Delta(_) => Err(CompileError::Rejected("operand port takes an integral, not a delta")),
+            OutReg::Delta(_) => Err("operand port takes an integral, not a delta".into()),
         }
     }
 }
@@ -61,7 +59,7 @@ impl OutReg {
 impl EmitCtx<'_> {
     /// Open one child store of this plan's operator state. The returned
     /// [`StateIdx`] is the only way to reach it.
-    fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<StateIdx, CompileError> {
+    fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<StateIdx, String> {
         self.builder
             .state
             .open_child(
@@ -71,14 +69,14 @@ impl EmitCtx<'_> {
                 child_name,
                 schema,
             )
-            .map_err(|e| CompileError::StorageFailed("child table create failed", e))
+            .map_err(|e| format!("child table create failed: {e}"))
     }
 
     /// Allocate a trace register and the child store backing it
     /// (`bind_trace_cursors` opens a cursor on it each epoch). Returns the
     /// register and no index: the register is how every instruction reaches the
     /// store ([`crate::query::vm::Program::trace_table_idx`]).
-    fn push_trace_reg(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<TraceReg, CompileError> {
+    fn push_trace_reg(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<TraceReg, String> {
         let idx = self.create_child_table(child_name, schema)?;
         let id = TraceReg(self.mint_reg());
         self.reg_meta.push(RegisterMeta::trace(schema, idx));
@@ -88,26 +86,26 @@ impl EmitCtx<'_> {
     /// The register `src` produced. The one rejection left after `topo_sorted`
     /// held every edge set to `OpNode::arity()`: a plan covers a *slice* of the
     /// circuit, so a producer outside this side has no register at all.
-    fn reg_of(&self, src: i32) -> Result<OutReg, CompileError> {
+    fn reg_of(&self, src: i32) -> Result<OutReg, String> {
         self.out_reg_of
             .get(&src)
             .copied()
-            .ok_or(CompileError::Rejected("operand is produced outside this plan"))
+            .ok_or_else(|| "operand is produced outside this plan".to_string())
     }
 
     /// The delta feeding a unary operator.
-    fn unary_delta_in(&self, nid: i32) -> Result<DeltaReg, CompileError> {
+    fn unary_delta_in(&self, nid: i32) -> Result<DeltaReg, String> {
         self.reg_of(self.loaded.inputs(nid).unary())?.delta()
     }
 
     /// The two deltas feeding a binary operator, in port order.
-    fn binary_delta_in(&self, nid: i32) -> Result<(DeltaReg, DeltaReg), CompileError> {
+    fn binary_delta_in(&self, nid: i32) -> Result<(DeltaReg, DeltaReg), String> {
         let (a, b) = self.loaded.inputs(nid).binary();
         Ok((self.reg_of(a)?.delta()?, self.reg_of(b)?.delta()?))
     }
 
     /// A join's `(delta, trace)` operands.
-    fn join_in(&self, nid: i32) -> Result<(DeltaReg, TraceReg), CompileError> {
+    fn join_in(&self, nid: i32) -> Result<(DeltaReg, TraceReg), String> {
         let (d, t) = self.loaded.inputs(nid).binary();
         Ok((self.reg_of(d)?.delta()?, self.reg_of(t)?.trace()?))
     }
@@ -145,7 +143,7 @@ impl EmitCtx<'_> {
 /// aliases it (an identity `Map`, a `WorkerFilter` this worker cannot narrow,
 /// the sink). Returning it is what keeps a register from being reserved for a
 /// node that never writes one.
-pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) -> Result<OutReg, CompileError> {
+pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) -> Result<OutReg, String> {
     match op {
         // `bound` is a backfill-scan hint consumed by the source drive, not by the
         // VM: emission is identical bounded or not.
@@ -153,9 +151,11 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             // A circuit scanning an unknown table is corrupt: the planner
             // registers every source before shipping the circuit.
             let schema = ctx
-                .ext_tables
-                .schema_of(*tid as i64)
-                .ok_or(CompileError::Rejected("scan-delta: unknown source table"))?;
+                .site
+                .registry
+                .relation(*tid as i64)
+                .map(Relation::schema)
+                .ok_or("scan-delta: unknown source table")?;
             let reg = ctx.push_delta_reg(schema);
             ctx.source_reg_map.insert(*tid as i64, reg);
             Ok(OutReg::Delta(reg))
@@ -169,7 +169,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             // into WHERE TRUE; fail the compile instead.
             let pred = LogicalProgram::from_blob(blob, "filter")
                 .and_then(|p| p.resolve_filter(&in_schema))
-                .map_err(|e| CompileError::RejectedExpr("filter: invalid predicate program", e))?;
+                .map_err(|e| OpBuildErr::Program("filter: invalid predicate program", e))?;
             let pred_idx = ctx.builder.push_predicate(pred);
             let out_reg = ctx.push_delta_reg(in_schema);
             ctx.builder.push(Instr::Filter { in_reg, out_reg, pred_idx });
@@ -187,8 +187,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
 
         gnitz_wire::OpNode::Union => {
             let (in_a, in_b) = ctx.binary_delta_in(nid)?;
-            let out_schema = gnitz_store::ops::union_nullability_merge(&ctx.reg_schema(in_a), &ctx.reg_schema(in_b))
-                .map_err(CompileError::RejectedOp)?;
+            let out_schema = gnitz_store::ops::union_nullability_merge(&ctx.reg_schema(in_a), &ctx.reg_schema(in_b))?;
             let out_reg = ctx.push_delta_reg(out_schema);
             ctx.builder.push(Instr::Union { in_a, in_b, out_reg });
             Ok(OutReg::Delta(out_reg))
@@ -204,8 +203,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
         gnitz_wire::OpNode::TopN { group_cols, order, limit, offset } => {
             let in_reg = ctx.unary_delta_in(nid)?;
             let plan =
-                gnitz_store::ops::TopNPlan::from_wire(&ctx.reg_schema(in_reg), group_cols, order, *limit, *offset)
-                    .map_err(CompileError::RejectedOp)?;
+                gnitz_store::ops::TopNPlan::from_wire(&ctx.reg_schema(in_reg), group_cols, order, *limit, *offset)?;
             let out_schema = plan.output_schema;
             let trace_out_reg = ctx.push_trace_reg(&format!("_topn_{}_{nid}", ctx.site.id), out_schema)?;
             let out_reg = ctx.push_delta_reg(out_schema);
@@ -230,13 +228,13 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             // so the schema, the register meta and the operand registers are shared.
             let probe = match kind {
                 gnitz_wire::JoinKind::Equi => JoinProbe::Equi,
-                gnitz_wire::JoinKind::Range { n_eq, rel } => JoinProbe::Range(
-                    RangeProbe::new(&a_schema, &b_schema, *n_eq, *rel).map_err(CompileError::Rejected)?,
-                ),
+                gnitz_wire::JoinKind::Range { n_eq, rel } => {
+                    JoinProbe::Range(RangeProbe::new(&a_schema, &b_schema, *n_eq, *rel)?)
+                }
                 gnitz_wire::JoinKind::Cross => JoinProbe::Cross,
             };
-            let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
-                .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
+            let out_schema =
+                merge_schemas_for_join(&a_schema, &b_schema).ok_or("join: merged schema exceeds MAX_COLUMNS")?;
             let out_reg = ctx.push_delta_reg(out_schema);
             ctx.builder.push(Instr::JoinDT { delta_reg, trace_reg, out_reg, probe });
             Ok(OutReg::Delta(out_reg))
@@ -245,9 +243,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
         gnitz_wire::OpNode::IntegrateSink => {
             // Emits no instruction: the sink register's batch is what
             // `execute_epoch_multi` extracts at epoch end.
-            let in_reg = ctx.unary_delta_in(nid)?;
-            ctx.sink_reg_id = Some(in_reg);
-            Ok(OutReg::Delta(in_reg))
+            Ok(OutReg::Delta(ctx.unary_delta_in(nid)?))
         }
 
         gnitz_wire::OpNode::IntegrateTrace => {
@@ -262,11 +258,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {
-            // A side's node list is the ancestors of its own exchange input, with
-            // no exchange filter — so a shard upstream of another shard's input
-            // lands here. Only a hand-built circuit produces that shape, and
-            // rejecting is what keeps it from aborting a worker.
-            Err(CompileError::Rejected("chained exchange nodes"))
+            unreachable!("carve keeps every ExchangeShard out of every plan's node list")
         }
 
         gnitz_wire::OpNode::WorkerFilter => {
@@ -294,8 +286,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             let in_reg = ctx.unary_delta_in(nid)?;
             // Built once and homed in `reg_meta`; the op derives its
             // appended-column count from it.
-            let out_schema = gnitz_store::ops::null_extend_output_schema(&ctx.reg_schema(in_reg), type_codes)
-                .map_err(CompileError::RejectedOp)?;
+            let out_schema = gnitz_store::ops::null_extend_output_schema(&ctx.reg_schema(in_reg), type_codes)?;
             let out_reg = ctx.push_delta_reg(out_schema);
             ctx.builder.push(Instr::NullExtend { in_reg, out_reg });
             Ok(OutReg::Delta(out_reg))
@@ -309,7 +300,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
 
 /// `distinct` and `positive_part` differ in nothing but their preset, which the
 /// caller's own match arm supplies.
-fn emit_clamp(ctx: &mut EmitCtx, nid: i32, preset: ClampPreset) -> Result<OutReg, CompileError> {
+fn emit_clamp(ctx: &mut EmitCtx, nid: i32, preset: ClampPreset) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let schema = ctx.reg_schema(in_reg);
     let hist_reg = ctx.push_trace_reg(&format!("_hist_{}_{nid}", ctx.site.id), schema)?;
@@ -326,9 +317,9 @@ fn emit_clamp(ctx: &mut EmitCtx, nid: i32, preset: ClampPreset) -> Result<OutReg
 /// Every `MapKind`'s output schema, program and PK source are one fact, derived
 /// by [`MapPlan::from_wire`]; this arm resolves the operand, asks for the plan,
 /// and either elides it or allocates a register for it.
-fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<OutReg, CompileError> {
+fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
-    let plan = MapPlan::from_wire(&ctx.reg_schema(in_reg), mk).map_err(CompileError::RejectedOp)?;
+    let plan = MapPlan::from_wire(&ctx.reg_schema(in_reg), mk)?;
     // A MAP that reproduces its input row verbatim emits nothing; the node's
     // consumers read the input register instead.
     if plan.is_identity() {
@@ -351,7 +342,7 @@ fn emit_reduce(
     group_cols: &[u32],
     agg: &[AggDescriptor],
     global_ground: bool,
-) -> Result<OutReg, CompileError> {
+) -> Result<OutReg, String> {
     let loaded = ctx.loaded;
     let in_reg_id = ctx.unary_delta_in(nid)?;
     let in_reg_schema = ctx.reg_schema(in_reg_id);
@@ -372,9 +363,7 @@ fn emit_reduce(
         _ => None,
     };
     if global_ground && shard_cols.is_some_and(|c| !c.is_empty()) {
-        return Err(CompileError::Rejected(
-            "reduce: a global aggregate under a keyed exchange shard",
-        ));
+        return Err("reduce: a global aggregate under a keyed exchange shard".into());
     }
     let unsharded = shard_cols.is_none();
     let slot = ctx.site.registry.slot();
@@ -382,8 +371,7 @@ fn emit_reduce(
         || unsharded
         || slot.rank as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), slot.of as usize);
 
-    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_reg_schema, group_cols, agg, global_ground, i_am_owner)
-        .map_err(CompileError::RejectedOp)?;
+    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_reg_schema, group_cols, agg, global_ground, i_am_owner)?;
     let reduce_out_schema = plan.output_schema;
 
     let trace_reg = ctx.push_trace_reg(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema)?;
@@ -416,85 +404,35 @@ fn emit_reduce(
 // build_plan — one plan, pre or post exchange
 // ---------------------------------------------------------------------------
 
+/// Emit `ordered` into one sub-plan whose output is node `out`'s register.
+/// `seeds` names the exchange nodes the plan reads as relayed batches, each with
+/// its batch schema; their registers are in the returned map.
 pub(super) fn build_plan(
     loaded: &LoadedCircuit,
     ordered: &[i32],
-    ext_tables: &dyn SchemaSource,
     site: super::ViewSite<'_>,
     placement: gnitz_store::schema::Placement,
-    target: PlanTarget,
-) -> Result<(SubPlan, FxHashMap<i32, OutReg>), CompileError> {
-    let exchange_inputs: &[(i32, SchemaDescriptor)] = match target {
-        PlanTarget::ViewOutput { seeds, .. } => seeds,
-        PlanTarget::Subgraph { .. } => &[],
-    };
-
-    // One seed register per exchange input, allocated first (the post phase of an
-    // exchange view reads each side's relayed batch from its own register).
-    let mut out_reg_of: FxHashMap<i32, OutReg> = FxHashMap::default();
-    let mut reg_meta: Vec<RegisterMeta> = Vec::new();
-    let mut first_seed = None;
-    for (ex_nid, ex_schema) in exchange_inputs {
-        let reg = DeltaReg(reg_meta.len() as u16);
-        reg_meta.push(RegisterMeta::delta(*ex_schema));
-        out_reg_of.insert(*ex_nid, OutReg::Delta(reg));
-        first_seed.get_or_insert(reg);
-    }
-
+    seeds: &[(i32, SchemaDescriptor)],
+    out: i32,
+) -> Result<(SubPlan, FxHashMap<i32, OutReg>), String> {
     let mut ctx = EmitCtx {
         loaded,
         placement,
-        ext_tables,
         site,
         builder: ProgramBuilder::new(),
-        out_reg_of,
-        reg_meta,
+        out_reg_of: FxHashMap::default(),
+        reg_meta: Vec::new(),
         source_reg_map: FxHashMap::default(),
-        sink_reg_id: None,
     };
-
+    for &(ex_nid, schema) in seeds {
+        let reg = ctx.push_delta_reg(schema);
+        ctx.out_reg_of.insert(ex_nid, OutReg::Delta(reg));
+    }
     for &nid in ordered {
         let reg = emit_node(&mut ctx, nid, loaded.op(nid))?;
         ctx.out_reg_of.insert(nid, reg);
     }
-
-    // The exchange seeds come first; failing that, the plan is driven from a
-    // source register. `min_by_key` rather than an arbitrary map entry so a
-    // multi-source plan picks the same register on every worker. The seed branch
-    // only keeps `in_reg` total — an exchanged post plan is never driven through
-    // it, since `run_plan` passes every side's seed explicitly.
-    let input_delta_reg_id = first_seed
-        .or_else(|| {
-            ctx.source_reg_map
-                .iter()
-                .min_by_key(|&(&tid, _)| tid)
-                .map(|(_, &reg)| reg)
-        })
-        .ok_or(CompileError::Rejected("plan has no input delta register"))?;
-
-    let sink_reg = match target {
-        PlanTarget::ViewOutput { .. } => ctx.sink_reg_id,
-        // A side's node list is the ancestors of its exchange input, so the sink
-        // is downstream of the shard and outside it. `out` is the one register no
-        // emit arm resolved, so this is also where a subgraph ending at an
-        // `IntegrateTrace` is refused.
-        PlanTarget::Subgraph { out } => match ctx.sink_reg_id {
-            Some(_) => return Err(CompileError::Rejected("subgraph contains the sink")),
-            None => ctx.out_reg_of.get(&out).copied().map(OutReg::delta).transpose()?,
-        },
-    }
-    .ok_or(CompileError::Rejected("plan has no output register"))?;
-
-    if let PlanTarget::ViewOutput { out_schema, .. } = target {
-        let sink_schema = ctx.reg_schema(sink_reg);
-        // A column-count match is not enough: two schemas with equal column
-        // counts but mismatched types (e.g. I64 vs German-string) let the client
-        // read a 16-byte string descriptor out of 8-byte integer storage.
-        if !sink_schema.same_physical_layout(out_schema) {
-            return Err(CompileError::Rejected("sink schema does not match view output schema"));
-        }
-    }
-
+    let out_reg = ctx.reg_of(out)?.delta()?;
     let EmitCtx {
         builder,
         reg_meta,
@@ -502,16 +440,11 @@ pub(super) fn build_plan(
         out_reg_of,
         ..
     } = ctx;
-    let vm = builder.build(reg_meta, sink_reg);
-
-    Ok((
-        SubPlan {
-            vm,
-            in_reg: input_delta_reg_id,
-            source_reg_map,
-        },
-        out_reg_of,
-    ))
+    let plan = SubPlan {
+        vm: builder.build(reg_meta, out_reg),
+        source_reg_map,
+    };
+    Ok((plan, out_reg_of))
 }
 
 // ---------------------------------------------------------------------------

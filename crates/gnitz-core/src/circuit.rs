@@ -361,25 +361,8 @@ impl CircuitBuilder {
         self.alloc_wired(OpNode::IntegrateSink, &[input])
     }
 
-    /// Finalises the circuit. The engine narrows one backfill scan per circuit,
-    /// shared by every scan of its source, so one bound survives: the first on a
-    /// source scanned once.
-    pub fn build(mut self) -> Circuit {
-        let mut scans: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        for op in self.nodes.values() {
-            if let OpNode::ScanDelta { source, .. } = op {
-                *scans.entry(*source).or_default() += 1;
-            }
-        }
-        let mut bounded = false;
-        for op in self.nodes.values_mut() {
-            if let OpNode::ScanDelta { source, bound } = op {
-                if bounded || scans[source] > 1 {
-                    *bound = None;
-                }
-                bounded |= bound.is_some();
-            }
-        }
+    /// Finalises the circuit.
+    pub fn build(self) -> Circuit {
         Circuit { nodes: self.nodes, inputs: self.inputs }
     }
 }

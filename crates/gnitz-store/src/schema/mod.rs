@@ -51,6 +51,14 @@ impl std::fmt::Display for OpBuildErr {
     }
 }
 
+/// The server's error plumbing is string-typed; this keeps `?` working where a
+/// compile hands an operator constructor's rejection on.
+impl From<OpBuildErr> for String {
+    fn from(e: OpBuildErr) -> String {
+        e.to_string()
+    }
+}
+
 pub(crate) use gnitz_wire::type_code;
 pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;

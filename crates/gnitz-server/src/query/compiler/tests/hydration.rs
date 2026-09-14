@@ -1,4 +1,5 @@
 use super::*;
+use crate::query::compiler::fixtures::*;
 use gnitz_wire::{JoinKind, MapKind, OpNode};
 use std::collections::HashMap;
 
@@ -94,14 +95,11 @@ fn hydration_of_a_linear_circuit_names_its_source() {
 /// branches carry distinct messages, so a rejection says which one it came from.
 #[test]
 fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
-    let rejected = |lc: LoadedCircuit, want: &str| match hydration_nodes(&lc) {
-        Err(CompileError::Rejected(guard)) => assert_eq!(guard, want),
-        other => panic!("expected {want:?}, got {:?}", other.map(|h| format!("{h:?}"))),
-    };
+    let rejected = |lc: LoadedCircuit, want: &str| assert_eq!(rejection(hydration_nodes(&lc)), want);
 
     rejected(
         loaded_for_test([(0, scan_delta(1))], vec![]),
-        "bounded view: circuit has no IntegrateSink",
+        "circuit has no IntegrateSink",
     );
     // A shape the walk cannot replay (a Reduce under the sink).
     rejected(

@@ -1,4 +1,5 @@
 use super::*;
+use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_batch, make_schema_u64_i64, pk_only_schema, pk_payload_schema, sum_weights};
 use gnitz_store::relation::{CircuitState, OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
 use gnitz_store::schema::SchemaColumn;
@@ -8,11 +9,8 @@ use std::collections::HashMap;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
 
-/// The `ScanDelta(10) → mid → IntegrateSink` circuit: everything a guard test
-/// needs to isolate one crafted field on `mid`. Entered on `build_plan`'s
-/// `PlanTarget::Subgraph` path, which suppresses the sink-schema contract —
-/// what a test isolating a *mid-node* guard wants, since the mid node's output
-/// schema is exactly what it is varying.
+/// `ScanDelta(10) → mid → IntegrateSink`, planned up to `mid`: a guard test varies
+/// one field of `mid`.
 struct MidCircuit {
     in_schema: SchemaDescriptor,
     /// Homes the mid node's scratch children, and outlives every plan `build`
@@ -28,18 +26,18 @@ impl MidCircuit {
         }
     }
 
-    fn build(&self, mid: gnitz_wire::OpNode) -> Result<(SubPlan, FxHashMap<i32, OutReg>), CompileError> {
+    fn build(&self, mid: gnitz_wire::OpNode) -> Result<(SubPlan, FxHashMap<i32, OutReg>), String> {
         let loaded = loaded_for_test(
             [(0, scan_delta(10)), (1, mid), (2, gnitz_wire::OpNode::IntegrateSink)],
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         );
         build_plan(
             &loaded,
-            &loaded.subgraph_ordered(1),
-            &ext_tables([(10i64, self.in_schema)]),
-            home(self.tmp.path().to_str().unwrap(), 1).site(),
+            &subgraph_ordered(&loaded, 1),
+            home(self.tmp.path().to_str().unwrap(), 1, [(10, self.in_schema)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 1 },
+            &[],
+            1,
         )
     }
 
@@ -47,12 +45,6 @@ impl MidCircuit {
     fn rejection(&self, mid: gnitz_wire::OpNode) -> String {
         rejection(self.build(mid))
     }
-}
-
-/// The guard that rejected a build. Naming it is what makes a guard test
-/// attributable: a bare `is_err()` also passes when an unrelated guard fires.
-fn rejection<T>(r: Result<T, CompileError>) -> String {
-    r.map(|_| "a plan").expect_err("expected a rejection").to_string()
 }
 
 /// Where one test's compile is homed: the throwaway root its scratch children
@@ -74,11 +66,11 @@ impl Home {
     }
 }
 
-/// A home whose view is registered under `dir`, so the emit arms open their
-/// children at the policy production gives them. Nothing under `dir` was ever
-/// checkpointed, so they resume nothing.
-fn home(dir: &str, id: u64) -> Home {
+/// A home whose view is registered under `dir`, beside the source `rows` its circuit
+/// scans, so children open at the policy production gives them.
+fn home(dir: &str, id: u64, rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>) -> Home {
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    register_sources(&mut registry, rows);
     registry
         .register(
             RelationSpec {
@@ -94,23 +86,21 @@ fn home(dir: &str, id: u64) -> Home {
     Home { dir: dir.to_string(), id, registry }
 }
 
-/// A home with no view registered and no root — what a guard rejected before any
-/// child opens needs.
-fn bare_home(id: u64) -> Home {
+/// A home with no view registered and no root, holding only the source `rows` — what a
+/// guard rejected before any child opens needs.
+fn bare_home(id: u64, rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>) -> Home {
     Home {
         dir: String::new(),
         id,
-        registry: RelationRegistry::new(Slot::SOLO, StoreConfig::default()),
+        registry: sources(rows),
     }
 }
 
-// ── Plan targets and the sink contract ──────────────────────────────────
+// ── The plan's output ───────────────────────────────────────────────────
 
-/// A `Subgraph`'s output register is the named node's, and a node list that
-/// reached the sink is rejected — production carves an exchange side out of
-/// the shard input's ancestors, so the sink is never in one.
+/// A plan's output register is the named node's, which its node list must hold.
 #[test]
-fn a_subgraph_outputs_the_named_node_and_must_not_hold_the_sink() {
+fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),
@@ -119,68 +109,24 @@ fn a_subgraph_outputs_the_named_node_and_must_not_hold_the_sink() {
         ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
-    let ext = ext_tables([(10i64, pk_only_schema(&[type_code::U64]))]);
     let plan = |ordered: &[i32]| {
         build_plan(
             &loaded,
             ordered,
-            &ext,
-            bare_home(1).site(),
+            bare_home(1, [(10, pk_only_schema(&[type_code::U64]))]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 1 },
+            &[],
+            1,
         )
     };
 
-    let (carved, out_reg_of) = plan(&loaded.subgraph_ordered(1)).expect("the carve production performs");
+    let (carved, out_reg_of) = plan(&subgraph_ordered(&loaded, 1)).expect("the carve production performs");
     assert_eq!(
         carved.vm.program.out_reg,
         out_reg_of[&1].delta().expect("node 1 is a delta"),
         "a subgraph outputs the register of the node it names"
     );
-    assert_eq!(rejection(plan(&loaded.ordered)), "subgraph contains the sink");
-}
-
-/// A sink register whose schema is not the view's output schema is rejected
-/// rather than emitted: the view store would then be written through a
-/// descriptor its rows do not match. A column-count match is not enough —
-/// equal counts with mismatched types would let the client read a 16-byte
-/// string descriptor out of 8-byte integer storage.
-#[test]
-fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
-    let view_schema = pk_only_schema(&[type_code::U64]);
-    let string_payload = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-        ],
-        &[0],
-    );
-    let loaded = loaded_for_test(
-        [(0, scan_delta(10)), (1, gnitz_wire::OpNode::IntegrateSink)],
-        vec![(0, 1, SLOT_IN)],
-    );
-    let against = |view_schema: &SchemaDescriptor, source: SchemaDescriptor| {
-        build_plan(
-            &loaded,
-            &loaded.ordered,
-            &ext_tables([(10i64, source)]),
-            bare_home(1).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::ViewOutput { out_schema: view_schema, seeds: &[] },
-        )
-    };
-    assert!(against(&view_schema, view_schema).is_ok(), "an equal pair compiles");
-    for source in [make_schema_u64_i64(), string_payload] {
-        assert_eq!(
-            rejection(against(&view_schema, source)),
-            "sink schema does not match view output schema",
-        );
-    }
-    // Equal column counts, different types: the same guard, on the sharper input.
-    assert_eq!(
-        rejection(against(&string_payload, make_schema_u64_i64())),
-        "sink schema does not match view output schema",
-    );
+    assert_eq!(rejection(plan(&[0])), "operand is produced outside this plan");
 }
 
 /// A trace register routed into a delta port reads permanent emptiness — a
@@ -204,10 +150,10 @@ fn a_trace_register_reaching_a_delta_port_is_rejected() {
         build_plan(
             &loaded,
             &loaded.ordered,
-            &ext_tables([(10i64, one)]),
-            home(dir.path().to_str().unwrap(), 1).site(),
+            home(dir.path().to_str().unwrap(), 1, [(10, one)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 2 },
+            &[],
+            2,
         )
         .map(drop)
     };
@@ -240,10 +186,10 @@ fn a_plan_whose_output_is_an_integral_is_rejected() {
     let result = build_plan(
         &loaded,
         &loaded.ordered,
-        &ext_tables([(10i64, make_schema_u64_i64())]),
-        home(dir.path().to_str().unwrap(), 1).site(),
+        home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 1 },
+        &[],
+        1,
     );
     assert_eq!(rejection(result), "operand port takes a delta, not an integral");
 }
@@ -278,18 +224,13 @@ fn a_global_aggregate_under_a_keyed_shard_is_rejected() {
         // The post phase: the shard is a seed register, exactly as `compile_view`
         // hands it over.
         let dir = tempfile::tempdir().unwrap();
-        // `SyntheticFold`: the `_group_pk` U128 key, then the COUNT column.
-        let out_schema = pk_payload_schema(&[type_code::U128]);
         build_plan(
             &loaded,
             &loaded.ordered_where(|n| n >= 2),
-            &ext_tables([(10i64, schema)]),
-            home(dir.path().to_str().unwrap(), 1).site(),
+            home(dir.path().to_str().unwrap(), 1, [(10, schema)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::ViewOutput {
-                out_schema: &out_schema,
-                seeds: &[(1, schema)],
-            },
+            &[(1, schema)],
+            3,
         )
         .map(drop)
     };
@@ -396,7 +337,7 @@ fn plan_two_source_join(
     kind: gnitz_wire::JoinKind,
     delta_schema: SchemaDescriptor,
     trace_schema: SchemaDescriptor,
-) -> Result<(), CompileError> {
+) -> Result<(), String> {
     use gnitz_wire::OpNode;
     let dir = tempfile::tempdir().unwrap();
     let loaded = loaded_for_test(
@@ -411,11 +352,16 @@ fn plan_two_source_join(
     );
     build_plan(
         &loaded,
-        &loaded.subgraph_ordered(3),
-        &ext_tables([(10i64, delta_schema), (11, trace_schema)]),
-        home(dir.path().to_str().unwrap(), 1).site(),
+        &subgraph_ordered(&loaded, 3),
+        home(
+            dir.path().to_str().unwrap(),
+            1,
+            [(10, delta_schema), (11, trace_schema)],
+        )
+        .site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 3 },
+        &[],
+        3,
     )
     .map(drop)
 }
@@ -443,10 +389,10 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
         build_plan(
             &loaded,
             &loaded.ordered,
-            &ext_tables([(10i64, two_col), (11, two_col)]),
-            home(dir.path().to_str().unwrap(), 1).site(),
+            home(dir.path().to_str().unwrap(), 1, [(10, two_col), (11, two_col)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 3 },
+            &[],
+            3,
         )
         .map(drop)
     };
@@ -473,11 +419,11 @@ fn a_wide_pk_join_compiles() {
     // inside the assert rather than binding it past `dir`'s scope.
     assert!(build_plan(
         &loaded,
-        &loaded.subgraph_ordered(2),
-        &ext_tables([(10i64, schema), (20, schema)]),
-        home(dir.path().to_str().unwrap(), 1).site(),
+        &subgraph_ordered(&loaded, 2),
+        home(dir.path().to_str().unwrap(), 1, [(10, schema), (20, schema)]).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 2 }
+        &[],
+        2
     )
     .is_ok());
 }
@@ -502,11 +448,11 @@ fn a_failed_compile_removes_the_scratch_dirs_it_created() {
     );
     let result = build_plan(
         &loaded,
-        &loaded.subgraph_ordered(2),
-        &ext_tables([(10i64, make_schema_u64_i64())]),
-        home(view_dir.to_str().unwrap(), 1).site(),
+        &subgraph_ordered(&loaded, 2),
+        home(view_dir.to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 2 },
+        &[],
+        2,
     );
     assert_eq!(
         rejection(result),
@@ -523,46 +469,6 @@ fn a_failed_compile_removes_the_scratch_dirs_it_created() {
         leftover.is_empty(),
         "scratch dirs must be removed on compile failure, found: {leftover:?}",
     );
-}
-
-/// `compile_view` filters the exchange nids out of the *post* phase's node
-/// list, but a side's list is `ancestors_inclusive` of its own exchange input
-/// with no such filter — so a shard upstream of another shard's input lands
-/// inside that side and reaches `emit_node`. It must reject, not panic: a panic
-/// there is a worker abort, and a worker crash takes the cluster down. No
-/// planner path emits the shape, but a circuit hand-built through
-/// `gnitz_core::CircuitBuilder` bypasses the planner entirely.
-#[test]
-fn a_chained_exchange_is_rejected_instead_of_panicking() {
-    let dir = tempfile::tempdir().unwrap();
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(10)),
-            (1, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] }),
-            (2, gnitz_wire::OpNode::Negate),
-            (3, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] }),
-            (4, gnitz_wire::OpNode::IntegrateSink),
-        ],
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN), (3, 4, SLOT_IN)],
-    );
-
-    // The carve `compile_view` performs for the sink-nearest shard.
-    let ex_in = loaded.inputs(3).unary();
-    let side_ordered = loaded.subgraph_ordered(ex_in);
-    assert!(
-        side_ordered.contains(&1),
-        "fixture must place the upstream shard inside the side's node list, got {side_ordered:?}"
-    );
-
-    let result = build_plan(
-        &loaded,
-        &side_ordered,
-        &ext_tables([(10i64, make_schema_u64_i64())]),
-        home(dir.path().to_str().unwrap(), 1).site(),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: ex_in },
-    );
-    assert_eq!(rejection(result), "chained exchange nodes");
 }
 
 // ── Weight-clamp presets ────────────────────────────────────────────────
@@ -629,7 +535,6 @@ fn consume_flags(plan: &SubPlan) -> Vec<(&'static str, bool)> {
 #[test]
 fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let ext = ext_tables([(10i64, make_schema_u64_i64())]);
     let flags = |distinct_id: i32, reader_id: i32| {
         let loaded = loaded_for_test(
             [
@@ -642,10 +547,10 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
         let plan = build_plan(
             &loaded,
             &loaded.ordered,
-            &ext,
-            home(dir.path().to_str().unwrap(), 1).site(),
+            home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: distinct_id },
+            &[],
+            distinct_id,
         )
         .expect("both orderings compile")
         .0;
@@ -676,10 +581,10 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
         let plan = build_plan(
             &loaded,
             &loaded.ordered,
-            &ext_tables([(10i64, two_col), (11, two_col)]),
-            bare_home(1).site(),
+            bare_home(1, [(10, two_col), (11, two_col)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out },
+            &[],
+            out,
         )
         .expect("a union plan compiles")
         .0;
@@ -747,6 +652,7 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
             OnRegister::Live,
         )
         .unwrap();
+    register_sources(&mut registry, [(10, schema)]);
 
     // A checkpointed operator trace: one row, published at generation G.
     let mut committed = CircuitState::new();
@@ -771,11 +677,11 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
     assert_eq!(
         rejection(build_plan(
             &loaded,
-            &loaded.subgraph_ordered(2),
-            &ext_tables([(10i64, schema)]),
+            &subgraph_ordered(&loaded, 2),
             site,
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 2 },
+            &[],
+            2,
         )),
         "projection map: column 200 is not a payload column of a 2-column schema"
     );

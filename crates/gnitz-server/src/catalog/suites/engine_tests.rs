@@ -702,6 +702,7 @@ fn test_dep_map_view_on_view_chain() {
     // The dependency order every cascade walks — `hook_relation_register`'s
     // registration order and `compute_invalid_views`' invalidity propagation.
     assert_eq!(engine.dag.order_by_view_deps(&engine.registry, &[8, 7]), vec![7, 8]);
+    assert_eq!(engine.dag.order_by_view_deps(&engine.registry, &[8, 7, 8]), vec![7, 8]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

@@ -33,23 +33,12 @@ pub(in crate::query) enum HydrationSeed {
 
 /// The graph half of a bounded view's hydration plan: which relation a linear
 /// body replays over, or which delta/trace node pair a join body seeds from.
-///
-/// The walk is over `loaded`, not the emitted instruction list, for the same
-/// reason the five sibling `CompileOutput` annotations are: the instruction
-/// stream elides nodes (an identity `Map` vanishes, `ScanDelta` and
-/// `IntegrateSink` emit nothing) and drops
-/// `WorkerFilter` at `num_workers <= 1`, so it is worker-count dependent. Split
-/// from [`derive_hydration`] because this half is the drift-prone one and needs
-/// nothing but the circuit, so its rejections are directly testable.
-fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileError> {
+/// Read off the graph: which nodes emit instructions depends on the worker count.
+fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
     use gnitz_wire::{JoinKind, OpNode};
 
     // 1. From the sink's input, walk back through single-input Filter/Map nodes.
-    let sink = loaded
-        .ops()
-        .find_map(|(nid, op)| matches!(op, OpNode::IntegrateSink).then_some(nid))
-        .ok_or(CompileError::Rejected("bounded view: circuit has no IntegrateSink"))?;
-    let mut cur = loaded.inputs(sink).unary();
+    let mut cur = loaded.inputs(loaded.sink()?).unary();
     loop {
         match loaded.op(cur) {
             OpNode::Filter(_) | OpNode::Map(_) => cur = loaded.inputs(cur).unary(),
@@ -59,7 +48,7 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
                 return Ok(HydrationNodes::Relation { nid: cur, source: *source as i64 })
             }
             OpNode::Union => break,
-            _ => return Err(CompileError::Rejected("bounded view: unsupported circuit shape")),
+            _ => return Err("bounded view: unsupported circuit shape".into()),
         }
     }
     let union = cur;
@@ -69,15 +58,13 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
     //    identity the emitter elides on one branch, a real permutation on the
     //    other — both are in the circuit either way).
     let (branch_a, branch_b) = loaded.inputs(union).binary();
-    let join_of = |mut nid: i32| -> Result<i32, CompileError> {
+    let join_of = |mut nid: i32| -> Result<i32, String> {
         if matches!(loaded.op(nid), OpNode::Map(_)) {
             nid = loaded.inputs(nid).unary();
         }
         matches!(loaded.op(nid), OpNode::Join(JoinKind::Equi))
             .then_some(nid)
-            .ok_or(CompileError::Rejected(
-                "bounded view: union input is not an inner delta/trace join",
-            ))
+            .ok_or_else(|| "bounded view: union input is not an inner delta/trace join".to_string())
     };
     let trace_of = |j: i32| -> Option<i32> {
         let t = loaded.inputs(j).binary().1;
@@ -93,16 +80,10 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
     //    `D_b` is empty and `J_b` unions in nothing. `T_b` integrates the other
     //    branch's delta, so the seed is the trace whose input node is `D_a`.
     let d_a = loaded.inputs(j_a).binary().0;
-    trace_of(j_a).ok_or(CompileError::Rejected(
-        "bounded view: the seeded join's trace port is not an integral",
-    ))?;
-    let t_a = trace_of(j_b).ok_or(CompileError::Rejected(
-        "bounded view: the sibling join's trace port is not an integral",
-    ))?;
+    trace_of(j_a).ok_or("bounded view: the seeded join's trace port is not an integral")?;
+    let t_a = trace_of(j_b).ok_or("bounded view: the sibling join's trace port is not an integral")?;
     if loaded.inputs(t_a).unary() != d_a {
-        return Err(CompileError::Rejected(
-            "bounded view: the join's trace port is not the other branch's delta integral",
-        ));
+        return Err("bounded view: the join's trace port is not the other branch's delta integral".into());
     }
 
     Ok(HydrationNodes::Join { d_a, t_a })
@@ -127,11 +108,12 @@ pub(super) fn derive_hydration(
     loaded: &LoadedCircuit,
     plan: &SubPlan,
     out_reg_of: &FxHashMap<i32, OutReg>,
-) -> Result<Hydration, CompileError> {
+) -> Result<Hydration, String> {
     let reg_of = |nid: i32| {
-        out_reg_of.get(&nid).copied().ok_or(CompileError::Rejected(
-            "bounded view: a hydration node is not in the plan",
-        ))
+        out_reg_of
+            .get(&nid)
+            .copied()
+            .ok_or_else(|| "bounded view: a hydration node is not in the plan".to_string())
     };
 
     let hydration = match hydration_nodes(loaded)? {
@@ -161,14 +143,12 @@ pub(super) fn derive_hydration(
 /// silently-mutating read. `writes_state_during_replay` is exhaustive over
 /// `Instr` and lives beside the arm that does the suppressing, so a new
 /// state-writing opcode cannot slip past this and the two cannot drift.
-fn reject_state_writers(plan: &SubPlan, start_pc: usize) -> Result<(), CompileError> {
+fn reject_state_writers(plan: &SubPlan, start_pc: usize) -> Result<(), String> {
     if plan.vm.program.instructions[start_pc..]
         .iter()
         .any(crate::query::vm::writes_state_during_replay)
     {
-        return Err(CompileError::Rejected(
-            "bounded view: the replayed program writes operator state",
-        ));
+        return Err("bounded view: the replayed program writes operator state".into());
     }
     Ok(())
 }

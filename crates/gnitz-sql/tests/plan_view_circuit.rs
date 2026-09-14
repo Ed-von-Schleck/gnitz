@@ -301,21 +301,21 @@ fn indexed_predicates_bound_the_backfill_scan() {
     let on_ind_other = indexed(&[&[2, 3]]);
     let unindexed = indexed(&[]);
     #[rustfmt::skip]
-    let rows: &[(&CatalogSnapshot, &str, Option<&[u32]>)] = &[
-        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", Some(&[2])),
-        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind BETWEEN 5 AND 9 GROUP BY g", Some(&[2])),
-        (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", Some(&[2, 3])),
-        (&on_ind, "SELECT g, other FROM t WHERE ind = 5", Some(&[2])),
-        (&on_ind, "WITH c AS (SELECT * FROM t) SELECT g, COUNT(*) AS n FROM c WHERE ind = 5 GROUP BY g", Some(&[2])),
-        (&on_ind, "SELECT g, COUNT(*) AS n FROM (SELECT * FROM t) d WHERE ind = 5 GROUP BY g", Some(&[2])),
-        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE other = 5 GROUP BY g", None),
-        (&on_ind, "SELECT DISTINCT g FROM t WHERE ind = 5", Some(&[2])),
-        (&on_ind, "SELECT g FROM t WHERE ind = 5 EXCEPT SELECT val FROM u", Some(&[2])),
-        // One source scanned twice takes no bound.
-        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", None),
-        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk = 5 GROUP BY g", None),
-        (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", None),
-        (&unindexed, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", None),
+    let rows: &[(&CatalogSnapshot, &str, &[&[u32]])] = &[
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &[&[2]]),
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind BETWEEN 5 AND 9 GROUP BY g", &[&[2]]),
+        (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", &[&[2, 3]]),
+        (&on_ind, "SELECT g, other FROM t WHERE ind = 5", &[&[2]]),
+        (&on_ind, "WITH c AS (SELECT * FROM t) SELECT g, COUNT(*) AS n FROM c WHERE ind = 5 GROUP BY g", &[&[2]]),
+        (&on_ind, "SELECT g, COUNT(*) AS n FROM (SELECT * FROM t) d WHERE ind = 5 GROUP BY g", &[&[2]]),
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE other = 5 GROUP BY g", &[]),
+        (&on_ind, "SELECT DISTINCT g FROM t WHERE ind = 5", &[&[2]]),
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 EXCEPT SELECT val FROM u", &[&[2]]),
+        // Each scan carries its bound; the engine drops a twice-scanned source's.
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", &[&[2], &[2]]),
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk = 5 GROUP BY g", &[]),
+        (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", &[]),
+        (&unindexed, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &[]),
     ];
     for &(cat, body, want) in rows {
         let chain = view(cat, body);
@@ -328,7 +328,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
                 _ => None,
             })
             .collect();
-        let want: Vec<Vec<u32>> = want.into_iter().map(|w| w.to_vec()).collect();
+        let want: Vec<Vec<u32>> = want.iter().map(|w| w.to_vec()).collect();
         assert_eq!(bounds, want, "`{body}`");
     }
 }

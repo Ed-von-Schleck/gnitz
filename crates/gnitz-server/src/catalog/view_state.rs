@@ -81,7 +81,7 @@ impl CatalogEngine {
     /// The topology word is decided once for the whole set. Then phase 1 decides
     /// each view's **local** validity (direct sources + child manifests), and
     /// phase 2 propagates invalidity to any view scanning an invalid source,
-    /// walking the views in dependency order so one pass reaches the whole cascade.
+    /// following scan edges forward from every locally invalid view.
     pub(crate) fn compute_invalid_views(&mut self) {
         let topo_valid = self.registry.topology_matches();
 
@@ -115,42 +115,18 @@ impl CatalogEngine {
                 invalid.insert(vid);
             }
         }
-        if invalid.is_empty() {
-            // Clean restart: nothing to propagate, so skip the ordering walk below.
-            self.invalid_views = invalid;
-            return;
-        }
 
-        // Phase 2: propagate invalidity to any still-valid view that scans an
-        // invalid source. Base and stream sources never enter `invalid`, so they
-        // pass — a stream's own dependents were caught in phase 1 instead. A
-        // source view precedes every view scanning it in `order_by_view_deps`,
-        // so a single pass carries invalidity down the whole chain.
-        for vid in self.dag.order_by_view_deps(&self.registry, &view_ids) {
-            if !invalid.contains(&vid)
-                && self
-                    .dag
-                    .get_source_ids(&self.registry, vid)
-                    .iter()
-                    .any(|s| invalid.contains(s))
-            {
-                invalid.insert(vid);
-            }
-        }
+        // Phase 2: every registered view downstream of an invalid one.
+        let view_set: FxHashSet<i64> = view_ids.iter().copied().collect();
+        let seeds = invalid.iter().copied().collect();
+        let reached = self.dag.dependent_closure(&self.registry, seeds);
+        invalid.extend(reached.into_iter().filter(|v| view_set.contains(v)));
         self.invalid_views = invalid;
     }
 
-    /// The source cursor for driving `source` through `view_id`'s circuit: an
-    /// index-bounded cursor when the compiled plan pushed a bound down and
-    /// `open_index_source`'s gate takes it, else the full-scan cursor.
-    /// The circuit's `Filter` is authoritative either way, so the choice only
-    /// decides how many rows are read. The open may COMPILE the view.
-    ///
-    /// A registered-but-empty table yields a cursor, and a provably empty range
-    /// a bounded walk that drains nothing — collapsing that into an error would skip
-    /// the source rather than feed it one empty epoch. `Err` is a view that does
-    /// not compile, or an unregistered source: DDL_SYNC applies in SAL order, so
-    /// a worker that cannot see the source has diverged from the catalog.
+    /// The cursor driving `source` through `view_id`'s circuit: index-bounded when
+    /// the circuit carries a bound for `source` and `open_index_source` takes it,
+    /// else a full scan. The circuit's `Filter` is authoritative either way.
     pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Result<SourceCursor, String> {
         // A store-less handle reads empty rather than erroring: correct for a
         // stream, a wrong answer for a process whose store is elsewhere. Hard, not
@@ -159,15 +135,8 @@ impl CatalogEngine {
             self.registry.residency().owns_stores(),
             "source cursor in a process owning no base store (view {view_id}, source {source})",
         );
-        // Must precede `source_scan_bound`: `handle_backfill` reaches here before
-        // anything compiles the view, and an uncached plan would silently report
-        // "no bound" — the motivating GROUP BY case would full-scan invisibly.
-        // Cache-first and idempotent.
         let CatalogEngine { registry, dag, .. } = self;
-        let bound = dag
-            .ensure_compiled(registry, view_id)?
-            .then(|| dag.source_scan_bound(view_id, source))
-            .flatten();
+        let bound = dag.source_scan_bound(registry, view_id, source);
         let Some(bound) = bound else {
             return Ok(SourceCursor::Full(Box::new(registry.relation_or_err(source)?.cursor())));
         };

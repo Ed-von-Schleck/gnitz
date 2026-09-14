@@ -1,12 +1,12 @@
 use super::*;
-use crate::query::compiler::{scan_delta, scatter_reindex, ExtTables, SLOT_IN};
+use crate::query::compiler::fixtures::{loaded_for_test, scan_delta, scatter_reindex, sources, SLOT_IN};
 use gnitz_wire::OpNode;
 use std::collections::HashMap;
 
 /// A `ViewMeta` whose relay routing names `src` — the shape `evict_meta`'s
 /// `retain` predicate keys on.
 fn meta_scanning(src: i64) -> ViewMeta {
-    let loaded = compiler::loaded_for_test(
+    let loaded = loaded_for_test(
         HashMap::from([
             (0, scan_delta(src as u64)),
             (1, scatter_reindex(&[0])),
@@ -14,7 +14,7 @@ fn meta_scanning(src: i64) -> ViewMeta {
         ]),
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
-    ViewMeta::derive(&loaded, &ExtTables::default()).expect("fixture routes")
+    ViewMeta::derive(&loaded, &sources([])).expect("fixture routes")
 }
 
 /// `evict_meta` must drop the metadata mentioning the id as the owning view OR as

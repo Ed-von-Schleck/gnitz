@@ -497,13 +497,9 @@ fn unregistered_source_is_err() {
     engine.close();
 }
 
-/// `open_source_cursor` must compile the plan itself before reading the bound.
-///
-/// `handle_backfill` — the one driver for every new view and every
-/// post-recovery rebuild — reaches the cursor open BEFORE anything compiles the
-/// view. With a cold cache and no `ensure_compiled`, the bound would read back as
-/// "absent" and the motivating case would ship silently dead: every other test
-/// here still passes, because a full scan is never *wrong*.
+/// `open_source_cursor` reads the bound off the view's circuit, so a cold plan
+/// cache — what a freshly reset view looks like when `handle_backfill` opens its
+/// cursor — still finds it.
 #[test]
 fn cold_plan_cache_still_finds_the_bound() {
     let (mut engine, tid, vid) = fixture("srccur_cold", Some(val_bound(Cut::Before(500), Cut::Before(600))));
@@ -513,7 +509,7 @@ fn cold_plan_cache_still_finds_the_bound() {
     let cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
         matches!(cur, SourceCursor::Bounded(_)),
-        "a cold plan cache must compile, not silently report 'no bound'"
+        "a cold plan cache must still find the bound"
     );
     engine.close();
 }

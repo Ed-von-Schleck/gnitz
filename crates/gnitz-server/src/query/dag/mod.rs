@@ -144,9 +144,6 @@ impl DagEngine {
     /// operator state the pre-flight's throwaway root never had. An `Err` is
     /// therefore unrecoverable for a server — the alternative to aborting is a
     /// view that has stopped integrating while still answering reads.
-    ///
-    /// The error is `String` rather than `CompileError`, which is `pub(crate)`
-    /// and so cannot appear in a `pub fn`'s signature.
     pub(crate) fn ensure_compiled(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<bool, String> {
         if self.cache.contains_key(&view_id) {
             return Ok(true);
@@ -165,22 +162,21 @@ impl DagEngine {
             })?;
         gnitz_debug!("dag: compiled view_id={}", view_id);
         // The compile already walked this circuit, so seed the memo from what it
-        // derived rather than let the first metadata touch read the same three
-        // system tables again.
+        // derived rather than let the first metadata touch read the circuit table
+        // again.
         self.meta.insert(view_id, Rc::new(compiled.meta));
         self.cache.insert(view_id, compiled.output);
         Ok(true)
     }
 
-    /// The backfill-scan bound for `source` under `view_id`, if the compiled plan
-    /// pushed one down. By value (`IndexBound: Copy`) so callers can re-borrow
-    /// `self` without holding this borrow.
-    pub(crate) fn source_scan_bound(&self, view_id: i64, source: i64) -> Option<gnitz_wire::IndexBound> {
-        self.cache
-            .get(&view_id)
-            .and_then(|co| co.source_bound)
-            .filter(|&(s, _)| s == source)
-            .map(|(_, b)| b)
+    /// The backfill-scan bound for `source` under `view_id`, if its circuit carries one.
+    pub(crate) fn source_scan_bound(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: i64,
+        source: i64,
+    ) -> Option<gnitz_wire::IndexBound> {
+        self.view_meta(registry, view_id)?.source_bounds.get(&source).copied()
     }
 
     /// Read `view_id`'s circuit out of the system tables and compile it, homing
@@ -192,7 +188,7 @@ impl DagEngine {
         view_id: i64,
         dir: &str,
         entry: &Relation,
-    ) -> Result<compiler::CompiledView, compiler::CompileError> {
+    ) -> Result<compiler::CompiledView, String> {
         let site = compiler::ViewSite { dir, id: view_id as u64, registry };
         // The compiler layer sees only the circuit system table, never `VIEW_TAB`,
         // so it cannot derive whether the view is capacity-bounded.
@@ -227,9 +223,7 @@ impl DagEngine {
             .map_err(|e| format!("pre-flight: {e}"))?;
         // `map(drop)` closes the plan — and the child stores it opened under
         // `root` — before the caller removes the directory.
-        self.compile_circuit(registry, view_id, root, entry)
-            .map(drop)
-            .map_err(|e| e.to_string())
+        self.compile_circuit(registry, view_id, root, entry).map(drop)
     }
 
     /// Close the DagEngine, dropping all cached plans. Reached from the

@@ -16,15 +16,18 @@ struct Step {
     producer: i64,
 }
 
-/// What a side's relay rounds are keyed by, so a view's two sides cannot collide
-/// in the master's accumulator. Its own type because the other `i64` in reach is
-/// a table id, and the two are not interchangeable.
+/// The key a side's relay round runs under, which the master routes it by.
 #[derive(Clone, Copy)]
 struct RelayKey(i64);
 
 impl RelayKey {
-    /// The key a view with a single side relays under: its own shard columns.
+    /// A unary side's output routes by the view's shard key, not its source's.
     const OWN_SHARD: RelayKey = RelayKey(0);
+
+    /// A set-op side is row-local over its source, so it routes as that source.
+    fn source(src_id: i64) -> RelayKey {
+        RelayKey(src_id)
+    }
 }
 
 /// The exchange transport of one view's epoch, with the view it relays for and
@@ -82,9 +85,7 @@ impl DagEngine {
         let elide = match meta.as_ref() {
             // A replicated view holds every source in full: nothing to repartition.
             None => true,
-            // A lone side's rows already sit on the worker that owns them; a
-            // set-op pair's two sides must still meet on one worker.
-            Some(m) => m.skips_exchange && matches!(plan.sides, Sides::Unary(_)),
+            Some(m) => m.skips_exchange,
         };
         let mut relay = Relay { exchange, view_id, elide };
         Self::run_plan(&mut plan.sides, &mut plan.post, input, src_id, &mut relay).map_err(|e| e.to_string())
@@ -104,7 +105,7 @@ impl DagEngine {
         // Each arm hands `execute_epoch_multi` a fixed-size array: the seed count
         // is the side count, known here, so no arm heap-allocates to carry it.
         match sides {
-            Sides::Unexchanged => {
+            Sides::Unexchanged { .. } => {
                 let seed = sub_seed(post, input, src_id);
                 vm::execute_epoch_multi(&mut post.vm, [seed])
             }
@@ -112,19 +113,19 @@ impl DagEngine {
                 let seed = Self::run_side(side, Some(input), src_id, RelayKey::OWN_SHARD, relay)?;
                 vm::execute_epoch_multi(&mut post.vm, [seed])
             }
-            Sides::Pair([(key_a, a), (key_b, b)]) => {
-                // A side takes the delta iff it scans the delta's source, so
-                // `a UNION a` runs both. The last taker is handed the batch and
-                // the other a copy.
-                let (da, db) = match (*key_a == src_id, *key_b == src_id) {
+            Sides::Pair([a, b]) => {
+                // `a UNION a` scans the source on both sides, so both take the delta.
+                let takes = |s: &Side| s.plan.source_reg_map.contains_key(&src_id);
+                let (da, db) = match (takes(a), takes(b)) {
                     (true, true) => (Some(input.clone_batch()), Some(input)),
                     (true, false) => (Some(input), None),
                     (false, true) => (None, Some(input)),
                     (false, false) => (None, None),
                 };
+                let key = RelayKey::source(src_id);
                 let seeds = [
-                    Self::run_side(a, da, src_id, RelayKey(*key_a), relay)?,
-                    Self::run_side(b, db, src_id, RelayKey(*key_b), relay)?,
+                    Self::run_side(a, da, src_id, key, relay)?,
+                    Self::run_side(b, db, src_id, key, relay)?,
                 ];
                 vm::execute_epoch_multi(&mut post.vm, seeds)
             }
@@ -144,10 +145,8 @@ impl DagEngine {
         key: RelayKey,
         relay: &mut Relay<'_>,
     ) -> Result<(vm::DeltaReg, Batch), StorageError> {
-        // `exchange_schema()` IS the side's out-register schema, which the VM
-        // stamps on what it returns — so the wire encode sees the side's
-        // pre-exchange schema, never the view's combine-widened final one.
-        let schema = side.exchange_schema();
+        // The pre-exchange schema, never the view's combine-widened one.
+        let schema = side.plan.vm.program.out_schema();
         let Some(delta) = delta else {
             return Ok((side.seed_reg, Batch::empty_with_schema(&schema)));
         };
@@ -177,7 +176,7 @@ impl DagEngine {
                 // relation the registry no longer holds.
                 if registry.has_id(view) {
                     schedule.push(Step {
-                        depth: self.dep.depth.get(&view).copied().unwrap_or(0),
+                        depth: self.dep.depth_of(view),
                         view,
                         producer,
                     });
@@ -394,12 +393,13 @@ impl Emit {
     }
 }
 
-/// The `(register, batch)` that seeds a sub-pipeline with `source_id`'s delta:
-/// the register that source routes to, or the plan's single input where it
-/// routes no source of that id.
+/// The `(register, batch)` seeding a sub-plan with `source_id`'s delta.
 fn sub_seed(sub: &SubPlan, input: Batch, source_id: i64) -> (vm::DeltaReg, Batch) {
-    let in_reg = sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg);
-    (in_reg, input)
+    let reg = sub.source_reg_map.get(&source_id).copied();
+    (
+        reg.expect("the dep map names only sources the view's circuit scans"),
+        input,
+    )
 }
 
 // ---------------------------------------------------------------------------

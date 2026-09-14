@@ -1,19 +1,20 @@
 use super::*;
+use crate::query::compiler::fixtures::*;
 use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
 use gnitz_store::storage::Slot;
-use gnitz_wire::{MapKind, OpNode, ReindexRole};
+use gnitz_wire::OpNode;
 use std::collections::HashMap;
 
 #[test]
 fn a_cyclic_circuit_is_rejected() {
     let nodes = HashMap::from([(0, OpNode::Negate), (1, OpNode::Negate)]);
-    assert!(matches!(
-        load::topo_sorted(
+    assert_eq!(
+        rejection(load::topo_sorted(
             nodes.into_iter().collect(),
             wire_slots(&[(0, 1, SLOT_IN), (1, 0, SLOT_IN)])
-        ),
-        Err(CompileError::Rejected("circuit graph has a cycle"))
-    ));
+        )),
+        "circuit graph has a cycle"
+    );
 }
 
 // ── load_circuit against the real system tables ─────────────────────────
@@ -112,9 +113,9 @@ impl CircuitTables {
         );
     }
 
-    /// Loaded straight off the registry: it is the `SchemaSource` the engine
-    /// loads through, so the fixture exercises the same lookup production does.
-    fn load(&mut self) -> Result<LoadedCircuit, CompileError> {
+    /// Loaded straight off the registry the engine loads through, so the fixture
+    /// exercises the same lookup production does.
+    fn load(&mut self) -> Result<LoadedCircuit, String> {
         load_circuit(&self.registry, Self::VIEW_ID)
     }
 }
@@ -128,8 +129,9 @@ fn a_malformed_row_aborts_the_load_and_names_the_check() {
     // interpolated value and all — not a bare "failed to decode".
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| CircuitTables::raw_row(bb, CircuitTables::VIEW_ID, 1, 9999, None, None, None));
-    assert!(
-        matches!(c.load(), Err(CompileError::RejectedNode(why)) if why == "unknown opcode 9999"),
+    assert_eq!(
+        rejection(c.load()),
+        "unknown opcode 9999",
         "the decoder's own rejection must reach the caller",
     );
 
@@ -140,10 +142,7 @@ fn a_malformed_row_aborts_the_load_and_names_the_check() {
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, scan_delta(99), None);
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, OpNode::IntegrateSink, Some(7));
     });
-    assert!(matches!(
-        c.load(),
-        Err(CompileError::Rejected("a node's input is not a node of the circuit"))
-    ));
+    assert_eq!(rejection(c.load()), "a node's input is not a node of the circuit");
 }
 
 /// The load is filtered to one view's rows by the `view_id` OPK prefix, and a
@@ -174,10 +173,10 @@ fn the_load_takes_one_views_rows_and_keeps_a_damaged_program_present() {
 /// error the load has to report.
 #[test]
 fn a_load_from_unopened_system_tables_fails() {
-    assert!(matches!(
-        load_circuit(&ext_tables([]), 0),
-        Err(CompileError::Rejected("the circuit system table is not open"))
-    ));
+    assert_eq!(
+        rejection(load_circuit(&sources([]), 0)),
+        "the circuit system table is not open"
+    );
 }
 
 /// Slot 1 is filled solely by a binary join, but the circuit family carries no
@@ -191,14 +190,10 @@ fn arity_violations_fail_at_load() {
         let nodes = HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, dst)]);
         load::topo_sorted(nodes.into_iter().collect(), wire_slots(edges))
     };
-    let rejected = |r: Result<LoadedCircuit, CompileError>, what: &str| {
-        assert!(
-            matches!(
-                r,
-                Err(CompileError::Rejected(
-                    "node's inputs do not match its operator's arity"
-                ))
-            ),
+    let rejected = |r: Result<LoadedCircuit, String>, what: &str| {
+        assert_eq!(
+            rejection(r),
+            "node's inputs do not match its operator's arity",
             "{what} must fail at load",
         );
     };
@@ -225,315 +220,6 @@ fn arity_violations_fail_at_load() {
     rejected(load(OpNode::Union, &[(0, 2, SLOT_IN)]), "a Union wired on one slot");
 }
 
-/// The join relay is read off the `Join` node's kind, never off
-/// `has_join_shard && has_exchange`: that predicate is also true of every GROUP
-/// BY view (a group reindex plus an output shard), so keying on it would divert
-/// those views into the broadcast relay and corrupt them. A circuit without a
-/// join routes by the whole key, and each join kind names its own relay.
-#[test]
-fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key() {
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(7)),
-            (1, scatter_reindex(&[1])),
-            (2, OpNode::ExchangeShard { shard_cols: vec![1] }),
-            (
-                3,
-                OpNode::Reduce {
-                    group_cols: vec![1],
-                    agg: vec![gnitz_wire::AggDescriptor {
-                        agg_op: gnitz_wire::AggFunc::Count,
-                        col_idx: 0,
-                    }],
-                    global_ground: false,
-                },
-            ),
-            (4, OpNode::IntegrateSink),
-        ],
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN), (3, 4, SLOT_IN)],
-    );
-    assert_eq!(load::circuit_join_relay(&loaded), load::JoinRelay::WholeKey);
-
-    let joined = |kind: gnitz_wire::JoinKind| {
-        loaded_for_test(
-            [
-                (0, scan_delta(7)),
-                (1, scan_delta(9)),
-                (2, OpNode::IntegrateTrace),
-                (3, OpNode::Join(kind)),
-                (4, OpNode::IntegrateSink),
-            ],
-            vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
-        )
-    };
-    let range = |n_eq| gnitz_wire::JoinKind::Range { n_eq, rel: gnitz_wire::RangeRel::Lt };
-    for (kind, want) in [
-        (gnitz_wire::JoinKind::Equi, load::JoinRelay::WholeKey),
-        (range(2), load::JoinRelay::EqPrefix { n_eq: 2 }),
-        (range(0), load::JoinRelay::Broadcast),
-        (gnitz_wire::JoinKind::Cross, load::JoinRelay::Broadcast),
-    ] {
-        assert_eq!(load::circuit_join_relay(&joined(kind)), want, "{kind:?}");
-    }
-}
-
-// ── scatter_key_of_scan: the forward (scan → reindex Map) walk ──────────
-
-/// The pure-range-join shape the planner emits at `n_eq == 0`: the reindex Map
-/// feeds the `Join(Range)` DIRECTLY as the delta term AND feeds a
-/// `WorkerFilter → IntegrateTrace` toward the trace term. Its key is collected
-/// once, from the flag — the fan-out is not a second contribution — and the
-/// `WorkerFilter` is not a `Filter`, so the walk never steps through it.
-#[test]
-fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(99)),
-            (1, scatter_reindex(&[2])),
-            (2, OpNode::WorkerFilter),
-            (3, OpNode::IntegrateTrace),
-            (
-                4,
-                OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 0, rel: gnitz_wire::RangeRel::Le }),
-            ),
-        ],
-        vec![
-            (0, 1, SLOT_IN),
-            (1, 4, SLOT_IN), // reindex Map → Join (delta term, DIRECT edge)
-            (1, 2, SLOT_IN), // reindex Map → WorkerFilter (toward the trace)
-            (2, 3, SLOT_IN),
-            (3, 4, SLOT_TRACE),
-        ],
-    );
-    assert_eq!(load::scatter_key_of_scan(&loaded, 0).0, vec![vec![(2, None)]]);
-}
-
-/// A source joined on two different keys (`t ⋈ t1 ON t.a = t1.x ⋈ t2 ON t.b =
-/// t2.y`) fans into two reindex Maps, and both sequences must be collected as
-/// SEPARATE sequences: it is the sequence count, not the column count, that
-/// decides whether one pack key can route the source at all.
-#[test]
-fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(42)),
-            (1, scatter_reindex(&[2])),
-            (2, OpNode::Filter(dummy_expr_blob())),
-            (3, scatter_reindex(&[5])),
-        ],
-        // The second reindex sits behind a Filter, which the walk steps through.
-        vec![(0, 1, SLOT_IN), (0, 2, SLOT_IN), (2, 3, SLOT_IN)],
-    );
-    assert_eq!(
-        load::scatter_key_of_scan(&loaded, 0).0,
-        vec![vec![(2, None)], vec![(5, None)]],
-        "two distinct keys stay two sequences"
-    );
-}
-
-/// Within one sequence, duplicate columns are PRESERVED: an overlapping key
-/// (`a.x = b.p AND a.x = b.q`) reindexes `[x, x]`, possibly with distinct
-/// per-slot promotion targets, and the scatter packer must mirror the trace-side
-/// `ReindexPacker` slot-for-slot. Across sibling Maps carrying an IDENTICAL
-/// sequence (the not-null / null-key branches of a nullable LEFT-join key) it
-/// collapses to one, which concatenating would double.
-#[test]
-fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
-    let overlapping = loaded_for_test(
-        [
-            (0, scan_delta(42)),
-            (
-                1,
-                OpNode::Map(MapKind::Reindex {
-                    keep: vec![0],
-                    key: vec![(3, None), (3, Some(gnitz_wire::TypeCode::I64))],
-                    role: ReindexRole::ScatterKey,
-                }),
-            ),
-        ],
-        vec![(0, 1, SLOT_IN)],
-    );
-    assert_eq!(
-        load::scatter_key_of_scan(&overlapping, 0).0,
-        vec![vec![(3, None), (3, Some(gnitz_wire::TypeCode::I64))]],
-        "duplicate slots and their promotion targets survive"
-    );
-
-    let siblings = loaded_for_test(
-        [
-            (0, scan_delta(7)),
-            (1, OpNode::Filter(dummy_expr_blob())),
-            (2, scatter_reindex(&[2])),
-            (3, OpNode::Filter(dummy_expr_blob())),
-            (4, scatter_reindex(&[2])),
-        ],
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 3, SLOT_IN), (3, 4, SLOT_IN)],
-    );
-    assert_eq!(
-        load::scatter_key_of_scan(&siblings, 0).0,
-        vec![vec![(2, None)]],
-        "identical sibling sequences collapse to one"
-    );
-}
-
-/// Only the join reindex defines a source's scatter key, and the planner says
-/// which one it is by flagging the role. A band LEFT join's left scan also feeds
-/// an `Auxiliary` `a.pk` re-key for the null-fill; concatenating that would
-/// corrupt the eq-prefix scatter. A scan reaching ONLY auxiliary maps is instead
-/// a planner call site that forgot its role, and is reported as orphaned.
-#[test]
-fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
-    let aux_rekey = || {
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            key: vec![(0, None)],
-            role: ReindexRole::Auxiliary,
-        })
-    };
-    let circuit = |join_reindex: OpNode, aux_rekey: OpNode| {
-        loaded_for_test(
-            [
-                (0, scan_delta(10)),
-                (1, join_reindex),
-                (
-                    2,
-                    OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 1, rel: gnitz_wire::RangeRel::Le }),
-                ),
-                (3, OpNode::IntegrateTrace),
-                (4, aux_rekey),
-                (5, OpNode::Map(MapKind::Projection(vec![]))),
-                (6, OpNode::Distinct),
-            ],
-            vec![
-                (0, 1, SLOT_IN),
-                (1, 2, SLOT_IN),
-                (1, 3, SLOT_IN), // join reindex → its own integral
-                (3, 2, SLOT_TRACE),
-                (0, 4, SLOT_IN),
-                (4, 5, SLOT_IN),
-                (5, 6, SLOT_IN), // aux a.pk re-key → proj → distinct
-            ],
-        )
-    };
-    assert_eq!(
-        load::scatter_key_of_scan(&circuit(scatter_reindex(&[1, 2]), aux_rekey()), 0),
-        (vec![vec![(1, None), (2, None)]], false),
-        "only the trace/probe-feeding reindex defines the scatter key"
-    );
-    assert_eq!(
-        load::scatter_key_of_scan(&circuit(aux_rekey(), aux_rekey()), 0),
-        (vec![], true),
-        "a scan reaching no ScatterKey map at all is orphaned"
-    );
-}
-
-/// A `Map` that does not re-key contributes nothing to the scatter.
-#[test]
-fn a_non_reindex_map_contributes_no_scatter_key() {
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(7)),
-            (
-                1,
-                OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
-                    program: dummy_expr_blob(),
-                    out_cols: vec![],
-                })),
-            ),
-        ],
-        vec![(0, 1, SLOT_IN)],
-    );
-    assert!(load::scatter_key_of_scan(&loaded, 0).0.is_empty());
-}
-
-// ── scan_through_row_local: the backward (shard → scan) walk ────────────
-//
-// The view exchange-skip detector's source resolution. Exchanging is also
-// correct, so the skip has no observable "fired" signal at the E2E layer; these
-// are what pin that the walk engages exactly when it should.
-
-#[test]
-fn the_shard_walk_crosses_row_local_nodes_and_nothing_else() {
-    let chain = |mids: Vec<OpNode>| {
-        let shard = mids.len() as i32 + 1;
-        let mut nodes = HashMap::from([
-            (0, scan_delta(7)),
-            (shard, OpNode::ExchangeShard { shard_cols: vec![0] }),
-        ]);
-        for (i, op) in mids.into_iter().enumerate() {
-            nodes.insert(i as i32 + 1, op);
-        }
-        let edges = (0..shard).map(|i| (i, i + 1, SLOT_IN)).collect();
-        scan_through_row_local(&loaded_for_test(nodes, edges), shard)
-    };
-    let filter = || OpNode::Filter(dummy_expr_blob());
-    let rekey = || scatter_reindex(&[2]);
-    let copy = || OpNode::Map(MapKind::Projection(vec![1]));
-    let compute = || {
-        OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
-            program: dummy_expr_blob(),
-            out_cols: vec![],
-        }))
-    };
-    assert_eq!(chain(vec![]), Some((7, false)), "a bare scan resolves on the first hop");
-    assert_eq!(chain(vec![filter()]), Some((7, false)));
-    assert_eq!(
-        chain(vec![filter(), filter()]),
-        Some((7, false)),
-        "a Filter chain is transparent"
-    );
-    assert_eq!(
-        chain(vec![copy()]),
-        Some((7, true)),
-        "a copy list carries the PK region"
-    );
-    assert_eq!(
-        chain(vec![compute()]),
-        Some((7, true)),
-        "an expression map carries the PK region"
-    );
-    assert_eq!(
-        chain(vec![filter(), compute(), filter()]),
-        Some((7, true)),
-        "filters and maps interleave"
-    );
-    assert_eq!(chain(vec![rekey()]), None, "a reindex Map re-keys the PK");
-    assert_eq!(
-        chain(vec![rekey(), filter()]),
-        None,
-        "a Filter below the Map does not rescue it"
-    );
-    assert_eq!(chain(vec![OpNode::WorkerFilter]), None, "WorkerFilter is not a Filter");
-}
-
-/// A fan-in draws from more than one source, so no single table's distribution
-/// prefix governs the shard key. The walk must bail at it — whether it is the
-/// shard's own input or one `Filter` further in.
-#[test]
-fn the_shard_walk_bails_at_a_fan_in() {
-    let union_then = |tail: Vec<OpNode>| {
-        let shard = tail.len() as i32 + 3;
-        let mut nodes = HashMap::from([
-            (0, scan_delta(7)),
-            (1, scan_delta(8)),
-            (2, OpNode::Union),
-            (shard, OpNode::ExchangeShard { shard_cols: vec![0] }),
-        ]);
-        for (i, op) in tail.into_iter().enumerate() {
-            nodes.insert(i as i32 + 3, op);
-        }
-        let mut edges = vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)];
-        edges.extend((2..shard).map(|i| (i, i + 1, SLOT_IN)));
-        scan_through_row_local(&loaded_for_test(nodes, edges), shard)
-    };
-    assert_eq!(union_then(vec![]), None, "the Union feeds the shard directly");
-    assert_eq!(
-        union_then(vec![OpNode::Filter(dummy_expr_blob())]),
-        None,
-        "a Filter is transparent, so the walk reaches the Union and bails there"
-    );
-}
-
 /// The node cap is what keeps every downstream `u16` id — registers, tables —
 /// in range without any per-plan arithmetic, so it is enforced in the one
 /// constructor every plan passes through rather than at each plan build.
@@ -549,8 +235,7 @@ fn a_circuit_over_the_node_limit_is_rejected() {
     assert_eq!(
         load::topo_sorted(nodes.clone().into_iter().collect(), wire_slots(&edges))
             .map(|_| "a circuit")
-            .expect_err("over the limit")
-            .to_string(),
+            .expect_err("over the limit"),
         "circuit exceeds the node limit"
     );
     nodes.remove(&(n - 1));

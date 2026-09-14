@@ -20,7 +20,7 @@ pub(super) struct DepMap {
     pub(in crate::query) forward: FxHashMap<i64, Vec<i64>>,
     pub(in crate::query) reverse: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
     /// view_id → longest scan chain beneath it; a relation with no scan edge is 0.
-    pub(in crate::query) depth: FxHashMap<i64, i32>,
+    depth: FxHashMap<i64, i32>,
     pub(in crate::query) valid: bool,
 }
 
@@ -63,6 +63,12 @@ impl DepMap {
         }
         self.valid = true;
         &self.forward
+    }
+
+    /// `id`'s longest scan chain, 0 for a relation with no scan edge. Read after
+    /// `get_or_rebuild`.
+    pub(super) fn depth_of(&self, id: i64) -> i32 {
+        self.depth.get(&id).copied().unwrap_or(0)
     }
 
     /// `id`'s depth: one more than the deepest source it scans, memoized so a
@@ -146,47 +152,18 @@ impl DagEngine {
         self.get_dep_map(registry).contains_key(&id)
     }
 
-    /// The distinct ids of `view_ids` in dependency order (Kahn's algorithm over
-    /// `get_source_ids(vid) ∩ view_ids`): a source view precedes every dependent
-    /// that scans it, so it is registered and backfilled first. Neither order a
-    /// batch of views arrives in is dependency order — a DDL bundle carries the
-    /// client's submission order, boot replay carries VIEW_TAB PK order — so this
-    /// is where the order is established. Acyclic by construction; the no-progress
-    /// fallback appends the remainder so a malformed input terminates instead of
-    /// spinning.
+    /// The distinct ids of `view_ids`, sources before dependents: by dep-map depth,
+    /// which exceeds every source's, then by id.
     pub(crate) fn order_by_view_deps(&mut self, registry: &RelationRegistry, view_ids: &[i64]) -> Vec<i64> {
-        let mut ids: Vec<i64> = Vec::with_capacity(view_ids.len());
-        let mut bundle: FxHashSet<i64> = FxHashSet::default();
-        for &vid in view_ids {
-            if bundle.insert(vid) {
-                ids.push(vid);
-            }
-        }
-        if ids.len() <= 1 {
-            return ids;
+        if view_ids.len() <= 1 {
+            return view_ids.to_vec();
         }
         self.get_dep_map(registry);
-        let reverse = &self.dep.reverse;
-        let mut emitted: FxHashSet<i64> = FxHashSet::default();
-        let mut order: Vec<i64> = Vec::with_capacity(ids.len());
-        while order.len() < ids.len() {
-            let before = order.len();
-            for &vid in &ids {
-                let ready = reverse
-                    .get(&vid)
-                    .into_iter()
-                    .flatten()
-                    .all(|s| *s == vid || !bundle.contains(s) || emitted.contains(s));
-                if ready && emitted.insert(vid) {
-                    order.push(vid);
-                }
-            }
-            if order.len() == before {
-                debug_assert!(false, "cycle in view dependencies: {ids:?}");
-                order.extend(ids.iter().copied().filter(|v| !emitted.contains(v)));
-            }
-        }
-        order
+        let dep = &self.dep;
+        let mut ids = view_ids.to_vec();
+        ids.sort_unstable_by_key(|&v| (dep.depth_of(v), v));
+        ids.dedup();
+        ids
     }
 
     /// Transitive base-table sources of `seeds` (views), deduplicated and
@@ -223,7 +200,7 @@ impl DagEngine {
     #[cfg(test)]
     pub(crate) fn depth_of(&mut self, registry: &RelationRegistry, id: i64) -> i32 {
         self.get_dep_map(registry);
-        self.dep.depth.get(&id).copied().unwrap_or(0)
+        self.dep.depth_of(id)
     }
 
     /// Where a view's rows live — the value `Relation` stamps — folded from

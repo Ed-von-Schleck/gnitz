@@ -50,9 +50,12 @@ impl SkeletonHydrator for DagEngine {
         // passed, so only a real compile failure leaves here.
         let compiled = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;
         debug_assert!(compiled, "ensure_compiled false for a registered view");
-        let hydration = self.cache[&view_id].hydration.ok_or_else(|| {
-            StoreError::rejected(format!("hydrate: view {view_id} was not compiled as capacity-bounded"))
-        })?;
+        let Sides::Unexchanged { hydration: Some(hydration) } = &self.cache[&view_id].sides else {
+            return Err(StoreError::rejected(format!(
+                "hydrate: view {view_id} was not compiled as capacity-bounded"
+            )));
+        };
+        let hydration = *hydration;
 
         let mut out = Batch::empty_with_schema(&view_schema);
         if keys.is_empty() {
@@ -69,11 +72,6 @@ impl SkeletonHydrator for DagEngine {
         // `Rc`, so both borrows of the registry end here and the VM is free to
         // run below.
         let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted the plan");
-        if !matches!(plan.sides, Sides::Unexchanged) {
-            return Err(StoreError::rejected(format!(
-                "hydrate: view {view_id} is not a single-phase plan"
-            )));
-        }
         let sub = &mut plan.post;
         let seed_schema = *sub.vm.program.schema_of(hydration.in_reg);
         // The gather opens over the range its own key list spans.
