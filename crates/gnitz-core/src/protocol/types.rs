@@ -807,6 +807,27 @@ impl ZSetBatch {
         }
     }
 
+    /// Keep only the rows in `ranges` (ascending, disjoint, `end` exclusive), in order, moving each
+    /// region's survivors down in place. The arena is untouched, so German cells stay valid.
+    pub fn retain_ranges(&mut self, ranges: &[(usize, usize)]) {
+        if ranges == [(0, self.len())] {
+            return;
+        }
+        let ps = self.pks.width();
+        let mut dst = 0;
+        for &(s, e) in ranges {
+            self.pks.buf.copy_within(s * ps..e * ps, dst * ps);
+            self.weights.copy_within(s..e, dst);
+            self.nulls.copy_within(s..e, dst);
+            for col in &mut self.payload {
+                let w = col.stride();
+                col.bytes.copy_within(s * w..e * w, dst * w);
+            }
+            dst += e - s;
+        }
+        self.rollback_to(BatchMark { rows: dst, blob: self.blob.len() });
+    }
+
     /// Every payload region is the length its type and the row count imply.
     /// Split out of [`Self::validate`] because the region builder needs the same
     /// rule for a batch that never went through the push path.

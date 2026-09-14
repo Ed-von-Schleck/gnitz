@@ -26,9 +26,9 @@ pub fn checksum_128(data: &[u8]) -> u128 {
 }
 
 /// `V₀` — the group key of the ungrouped (global) aggregate: the digest over no
-/// group columns at all. The single definition both ends share, so the engine's
-/// emitted ground row and the client's synthesized one carry the same key with
-/// no literal embedded on either side.
+/// group columns at all. Every row keyed at V₀ — a global reduce's row and the
+/// FROM-less SELECT's constant row — carries this key, with no literal embedded
+/// on either end.
 #[inline]
 pub fn global_group_key() -> u128 {
     checksum_128(b"")

@@ -1555,6 +1555,16 @@ impl LogicalProgram {
             .then_some(base as usize)
     }
 
+    /// Whether this program, run as a map from `in_schema` to `out_schema` with the input PK carried
+    /// through, reproduces its input: every column locates identically, and the program copies each
+    /// payload column into its own slot and computes nothing.
+    pub fn is_identity_map(&self, in_schema: &dyn SchemaFacts, out_schema: &dyn SchemaFacts) -> bool {
+        let n = in_schema.num_columns();
+        n == out_schema.num_columns()
+            && (0..n).all(|ci| in_schema.locate(ci) == out_schema.locate(ci))
+            && self.sequential_copy_base() == Some(n - in_schema.num_payload_cols())
+    }
+
     /// Lower to the resolved form under one [`Role`], running the one-shot
     /// analysis (nullability, register roles, U64 tracking) over the instruction
     /// stream. [`Role::Map`]'s output schema fixes each copy's destination width

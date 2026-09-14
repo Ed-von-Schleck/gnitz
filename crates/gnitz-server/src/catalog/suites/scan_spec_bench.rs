@@ -166,7 +166,7 @@ fn scan_spec_sinks_bench() {
             AggDescriptor { agg_op: AggFunc::Sum, col_idx: 3 },
         ],
     };
-    // SyntheticFold reply: `_agg_pk` U128 PK, the group column, then one partial
+    // SyntheticFold reply: `_group_pk` U128 PK, the group column, then one partial
     // per aggregate.
     let fold_reply = SchemaDescriptor::new(
         &[

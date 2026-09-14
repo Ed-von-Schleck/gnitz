@@ -588,10 +588,10 @@ def test_the_per_worker_group_cap_aborts_and_the_worker_keeps_serving(adhoc_grou
 # ---------------------------------------------------------------------------
 # Which rows a tied cut returns is a function of (data, query) alone
 #
-# The ad-hoc output's hidden `_agg_pk` leads the ordering sink's identity
+# The ad-hoc output's hidden `_group_pk` leads the ordering sink's identity
 # tiebreak, so it fully decides every tie the ORDER BY keys leave open. It is the
-# engine's `_group_pk` for the group — a pure function of the group's column
-# values — carried out of the representative partial reply.
+# engine's key for the group — a pure function of the group's column values —
+# carried out of the partial reply.
 # ---------------------------------------------------------------------------
 
 

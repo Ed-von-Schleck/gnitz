@@ -29,6 +29,18 @@ fn projection(schema: &Schema, srcs: &[Option<usize>]) -> (Vec<ProjItem>, Vec<Co
     (items, cols)
 }
 
+/// The unencoded program and the shipped map are one compile: encoding the one
+/// yields exactly the other's bytes, under the same schema.
+#[test]
+fn reply_program_encodes_to_the_read_reply_shape_map() {
+    let s = schema(&["id", "a", "b"], &[0]);
+    let (items, cols) = projection(&s, &[Some(0), Some(2), None]);
+    let (program_schema, program) = reply_program(&items, cols.clone(), &s, "reply").unwrap();
+    let (map_schema, map) = read_reply_shape(&items, cols, &s, "reply").unwrap();
+    assert_eq!(program_schema, map_schema);
+    assert_eq!(program.to_blob_bytes(), map.program);
+}
+
 /// Every source PK column lands in slots `0..k` in PK order: one already there
 /// stays, a later one is moved (shifting what it passes), an absent one is
 /// prepended hidden, and a second reference to a PK column stays a payload

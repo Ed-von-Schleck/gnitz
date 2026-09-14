@@ -531,6 +531,67 @@ fn test_extend_from_owned_concatenates() {
     }
 }
 
+/// `(pk U64 | v I64 | s STRING)` over pks `0..n`, each `s` spilled to the arena.
+fn retain_fixture(n: u128) -> (Schema, ZSetBatch) {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::U64, false),
+            ColumnDef::new("v", TypeCode::I64, false),
+            ColumnDef::new("s", TypeCode::String, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let mut z = ZSetBatch::new(&schema);
+    {
+        let mut a = BatchAppender::new(&mut z, &schema);
+        for pk in 0..n {
+            a.add_row(pk, pk as i64 + 1)
+                .i64_val(pk as i64 * 10)
+                .str_val(&format!("a spilled string number {pk}"));
+        }
+    }
+    (schema, z)
+}
+
+/// Several runs compact down in order, and a moved German cell still reads its
+/// spilled body out of the untouched arena.
+#[test]
+fn retain_ranges_keeps_the_named_runs_in_order() {
+    let (schema, mut z) = retain_fixture(6);
+    z.retain_ranges(&[(1, 2), (3, 5)]);
+    assert!(z.validate(&schema).is_ok());
+    assert_eq!(z.pks.to_vec_u128(&schema), vec![1u128, 3, 4]);
+    assert_eq!(z.weights, vec![2, 4, 5]);
+    assert_eq!(
+        z.payload[0].bytes,
+        [10i64, 30, 40].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        german_strings(&z, 1),
+        [
+            "a spilled string number 1",
+            "a spilled string number 3",
+            "a spilled string number 4"
+        ]
+    );
+}
+
+#[test]
+fn retain_ranges_over_the_whole_batch_is_a_no_op() {
+    let (_, mut z) = retain_fixture(3);
+    let before = z.clone();
+    z.retain_ranges(&[(0, 3)]);
+    assert_eq!(z, before);
+}
+
+#[test]
+fn retain_ranges_with_no_ranges_empties_the_batch() {
+    let (schema, mut z) = retain_fixture(3);
+    z.retain_ranges(&[]);
+    assert!(z.is_empty());
+    assert!(z.validate(&schema).is_ok());
+}
+
 #[test]
 fn test_validate_wrong_column_count() {
     let schema2 = Schema {

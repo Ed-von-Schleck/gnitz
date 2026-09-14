@@ -5170,7 +5170,7 @@ fn emit_global_ground_renders_count_family_zero_null_clear() {
     let mut raw_output = Batch::with_capacity(&out_schema, 1);
     let v0 = [0u8; 16]; // U128 ground PK (V₀)
     let plan = make_plan(&in_schema, &[], &descs, true, true);
-    emit_global_ground(&mut raw_output, &v0, &plan);
+    emit_global_ground(&mut raw_output, &v0, &plan.acc_template);
 
     assert_eq!(raw_output.count, 1, "ground row emitted");
     let out_mb = raw_output.as_mem_batch();

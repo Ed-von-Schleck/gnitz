@@ -278,7 +278,7 @@ fn a_global_aggregate_under_a_keyed_shard_is_rejected() {
         // The post phase: the shard is a seed register, exactly as `compile_view`
         // hands it over.
         let dir = tempfile::tempdir().unwrap();
-        // `SyntheticFold`: the `_agg_pk` U128 key, then the COUNT column.
+        // `SyntheticFold`: the `_group_pk` U128 key, then the COUNT column.
         let out_schema = pk_payload_schema(&[type_code::U128]);
         build_plan(
             &loaded,

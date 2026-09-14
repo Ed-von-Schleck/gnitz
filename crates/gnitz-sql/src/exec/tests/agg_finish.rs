@@ -1,185 +1,127 @@
 use super::*;
-use crate::agg::{finalize_agg_bexpr, fold_partial_schema, push_agg_specs};
-use crate::expr_lower::compile_scalar_evaluator;
-use crate::ir::AggFunc;
+use crate::agg::{finalize_agg_bexpr, fold_partial_schema, push_agg_specs, AggSpec};
+use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::test_support::col_def;
-use gnitz_core::PkColumn;
-use std::sync::Arc;
+use gnitz_core::{PkColumn, TypeCode};
 
-/// `(pk U64 | g I64 nullable | sm I16 nullable)` — one nullable group column
-/// and a narrow aggregate source, so the fill exercises a NULL group value
-/// and a sub-8-byte width.
+/// A long body, spilled to the arena rather than inlined in its German cell.
+const LONG_M: &str = "a string past the inline prefix: m";
+const LONG_Z: &str = "a string past the inline prefix: z";
+
+/// One partial cell: `Int` truncated to its column's stride, `Null` a zeroed cell
+/// under a set bit.
+#[derive(Clone, Copy)]
+enum Cell<'a> {
+    Int(i64),
+    F64(f64),
+    Str(&'a str),
+    Null,
+}
+use self::Cell::{Int, Null, Str, F64};
+
+/// `(pk U64 | g I64 | s STRING | sm I16 | x I64 | f F64)`, every payload nullable.
 fn source_schema() -> Schema {
     Schema {
         columns: vec![
             col_def("pk", TypeCode::U64, false),
             col_def("g", TypeCode::I64, true),
+            col_def("s", TypeCode::String, true),
             col_def("sm", TypeCode::I16, true),
+            col_def("x", TypeCode::I64, true),
+            col_def("f", TypeCode::F64, true),
         ],
         pk_cols: vec![0],
     }
 }
 
-/// Two specs so `accs` is genuinely group-major with a stride of 2:
-/// `MIN(sm)` at the source's own 2-byte width, then `COUNT(*)`.
-fn agg_specs() -> Vec<AggSpec> {
-    vec![
-        AggSpec {
-            op: WireAggFunc::Min,
-            col: 2,
-            out_type: TypeCode::I16.into(),
-        },
-        AggSpec {
-            op: WireAggFunc::Count,
-            col: 0,
-            out_type: TypeCode::I64.into(),
-        },
-    ]
+fn spec(op: WireAggFunc, col: usize, tc: TypeCode) -> AggSpec {
+    AggSpec { op, col, out_type: tc.into() }
 }
 
-fn partial_schema(src: &Schema, group_cols: &[usize], specs: &[AggSpec]) -> Schema {
-    fold_partial_schema(src, group_cols, specs)
+fn partial_schema(group: &[usize], specs: &[AggSpec]) -> Schema {
+    fold_partial_schema(&source_schema(), group, specs)
         .expect("the SyntheticFold layout is a valid client schema")
         .schema
 }
 
-/// The concatenated LE images of `vs` — what a `Fixed` i64 column holds.
-fn le(vs: &[i64]) -> Vec<u8> {
-    vs.iter().flat_map(|v| v.to_le_bytes()).collect()
+/// Every partial column passed through under a name of its own: an identity
+/// finalize.
+fn passthrough_all(partial: &Schema) -> Vec<(BoundExpr, ColumnDef)> {
+    (1..partial.columns.len())
+        .map(|ci| {
+            let c = &partial.columns[ci];
+            (
+                BExpr::ColRef(ci),
+                ColumnDef::new(format!("c{ci}"), c.type_code, c.is_nullable),
+            )
+        })
+        .collect()
 }
 
-/// A combined COUNT accumulator, in the shape `ColAcc::new` builds for a
-/// `SumZero` merge.
-fn count_acc(n: i64) -> ColAcc {
-    ColAcc::IntSum { bits: n, seen: true }
+fn finish_of(
+    partial: &Schema,
+    specs: &[AggSpec],
+    having: &[BoundExpr],
+    finalize: Vec<(BoundExpr, ColumnDef)>,
+) -> FoldFinish {
+    FoldFinish::new(partial.clone(), specs.iter().map(|s| s.op), having, finalize).unwrap()
 }
 
-/// A shape with no finalize items — enough for the two `fill_group_batch`
-/// tests, which never project.
-fn fill_only_shape(src: &Schema, group_positions: Vec<usize>, agg_specs: Vec<AggSpec>) -> FoldShape {
-    let partial_schema = partial_schema(src, &group_positions, &agg_specs);
-    FoldShape {
-        reduce_schema: Arc::new(src.clone()),
-        group_positions,
-        agg_specs,
-        pre: None,
-        partial_schema: Arc::new(partial_schema),
-        // `fill_group_batch` never reads the output schema; it only has to exist.
-        out_schema: Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap(),
-        having: None,
-        finalize: Vec::new(),
+/// A concatenated partial reply over `schema`: one weight-1 row per
+/// `(key, cells)`, one cell per payload slot.
+fn batch(schema: &Schema, rows: &[(u128, &[Cell])]) -> ZSetBatch {
+    let mut b = ZSetBatch::new(schema);
+    for &(key, cells) in rows {
+        b.pks.push_u128(schema, key);
+        b.weights.push(1);
+        let mut nulls = 0u64;
+        for (pi, cell) in cells.iter().enumerate() {
+            let stride = b.payload[pi].stride();
+            match *cell {
+                Int(v) => b.payload[pi].bytes.extend_from_slice(&v.to_le_bytes()[..stride]),
+                F64(v) => b.payload[pi].bytes.extend_from_slice(&v.to_le_bytes()),
+                Str(s) => {
+                    let c = gnitz_wire::encode_german_string(s.as_bytes(), &mut b.blob);
+                    b.payload[pi].bytes.extend_from_slice(&c);
+                }
+                Null => {
+                    gnitz_wire::null_word_set(&mut nulls, pi, true);
+                    b.payload[pi].push_zero();
+                }
+            }
+        }
+        b.nulls.push(nulls);
     }
+    b
 }
 
-/// The group batch the HAVING filter and the finalize map both run over: group
-/// columns copied from each representative partial row, aggregate partials taken
-/// from `accs` at the declared width, and one null bit per payload slot. A wrong
-/// bit here is a silently wrong HAVING verdict, not a crash.
-#[test]
-fn fill_group_batch_lays_out_values_and_null_bits() {
-    let src = source_schema();
-    let spec = fill_only_shape(&src, vec![1], agg_specs());
-
-    // Two representative partial rows: group 0 has g = 10, group 1 has g NULL
-    // (payload slot 0). Row 0 also carries the MIN winner an `Extreme` names by
-    // row index. The keys are deliberately not `0, 1`, so a staging batch that
-    // stamped the group ordinal instead of copying the key would not coincide.
-    let mut partial = ZSetBatch::new(&spec.partial_schema);
-    for (row, (key, g, sm)) in [(0x77u128, 10i64, -5i16), (0x33, 0, 0)].into_iter().enumerate() {
-        partial.pks.push_u128(&spec.partial_schema, key);
-        partial.weights.push(1);
-        partial.nulls.push(if row == 1 { 0b1 } else { 0 });
-        push_fixed_bits(&mut partial.payload[0], g as u64);
-        push_fixed_bits(&mut partial.payload[1], sm as u16 as u64);
-        push_fixed_bits(&mut partial.payload[2], 0);
-    }
-
-    let reps = [Some(0usize), Some(1usize)];
-    let accs = vec![
-        // Group 0: MIN(sm) = -5 (partial row 0), COUNT = 2.
-        ColAcc::Extreme { best: Some(0), is_max: false },
-        count_acc(2),
-        // Group 1: an all-NULL MIN group, COUNT = 1.
-        ColAcc::Extreme { best: None, is_max: false },
-        count_acc(1),
-    ];
-
-    let got = fill_group_batch(&spec, &partial, &reps, &accs);
-
-    assert_eq!(got.len(), 2);
-    assert_eq!(got.weights, vec![1, 1]);
-    // Slot 0 = g, slot 1 = MIN(sm), slot 2 = COUNT. Group 1 nulls g and MIN.
-    assert_eq!(got.nulls, vec![0, 0b011]);
-    // `_group_pk` is the representative row's key, copied.
-    assert_eq!(got.pks, PkColumn::from_natives(&spec.partial_schema, [0x77, 0x33]));
-    // g: the copied value, then `push_null`'s zero filler.
-    assert_eq!(
-        got.payload[0].bytes,
-        10i64.to_le_bytes().iter().chain(&[0; 8]).copied().collect::<Vec<_>>()
-    );
-    // MIN(sm) truncated to its declared 2 bytes, then a zeroed NULL cell.
-    assert_eq!(got.payload[1].bytes, [0xfb, 0xff, 0, 0]);
-    // COUNT is never NULL.
-    assert_eq!(
-        got.payload[2].bytes,
-        2i64.to_le_bytes()
-            .iter()
-            .chain(&1i64.to_le_bytes())
-            .copied()
-            .collect::<Vec<_>>()
-    );
+/// Payload slot `pi` of an 8-byte integer column.
+fn ints(b: &ZSetBatch, pi: usize) -> Vec<i64> {
+    b.payload[pi]
+        .bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
+        .collect()
 }
 
-/// The global ground row: no group columns, every aggregate uncontributed.
-/// `reps[0] == None` must not be dereferenced.
-#[test]
-fn fill_group_batch_handles_the_global_ground_row() {
-    let src = source_schema();
-    let spec = fill_only_shape(&src, vec![], agg_specs());
-    let empty = ZSetBatch::new(&spec.partial_schema);
-    let accs = vec![ColAcc::Extreme { best: None, is_max: false }, count_acc(0)];
-    let got = fill_group_batch(&spec, &empty, &[None], &accs);
-
-    assert_eq!(got.len(), 1);
-    // Slot 0 = MIN (NULL), slot 1 = COUNT (0, never NULL).
-    assert_eq!(got.nulls, vec![0b01]);
-    assert_eq!(got.payload[1].bytes, 0i64.to_le_bytes());
+fn strs(b: &ZSetBatch, pi: usize) -> Vec<String> {
+    b.payload[pi]
+        .bytes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| String::from_utf8(gnitz_wire::german_string_content(c, &b.blob).to_vec()).unwrap())
+        .collect()
 }
 
-/// The shape the fold path builds for one direct COUNT — `SELECT g, COUNT(*) …
-/// GROUP BY g` at `group_positions = [1]`, `SELECT COUNT(*)` at `[]`. Both
-/// finalize items are pass-throughs: a group column, and a `Direct` aggregate
-/// whose finalize composite is its own raw column.
-fn count_shape(src: &Schema, group_positions: Vec<usize>) -> FoldShape {
-    let grouped = !group_positions.is_empty();
-    let agg_specs = vec![AggSpec {
-        op: WireAggFunc::Count,
-        col: 0,
-        out_type: TypeCode::I64.into(),
-    }];
-    let partial_schema = partial_schema(src, &group_positions, &agg_specs);
-    // `[_group_pk | g? | COUNT]` — the aggregate trails the group columns.
-    let count_ci = 1 + group_positions.len();
-    let finalize: Vec<FinalizeItem> = grouped
-        .then_some(FinalizeItem::PassThrough { partial_ci: 1 })
-        .into_iter()
-        .chain([FinalizeItem::PassThrough { partial_ci: count_ci }])
-        .collect();
-    let out_cols: Vec<_> = grouped
-        .then(|| col_def("g", TypeCode::I64, true))
-        .into_iter()
-        .chain([col_def("c", TypeCode::I64, false)])
-        .collect();
-    FoldShape {
-        reduce_schema: Arc::new(src.clone()),
-        group_positions,
-        agg_specs,
-        pre: None,
-        out_schema: build_agg_out_schema(out_cols.clone()).unwrap().0,
-        partial_schema: Arc::new(partial_schema),
-        having: None,
-        finalize,
-    }
+fn null_bits(b: &ZSetBatch, pi: usize) -> Vec<bool> {
+    b.nulls.iter().map(|&w| gnitz_wire::null_word_get(w, pi)).collect()
+}
+
+fn gt(ci: usize, v: i64) -> BoundExpr {
+    BExpr::BinOp(Box::new(BExpr::ColRef(ci)), BinOp::Gt, Box::new(BExpr::LitInt(v)))
 }
 
 /// The partial mirrors what `fetch_bound` concatenates: replies in worker
@@ -188,92 +130,245 @@ fn count_shape(src: &Schema, group_positions: Vec<usize>) -> FoldShape {
 /// order and value, and only the key is a function of the data.
 #[test]
 fn the_output_row_carries_the_engine_group_key() {
-    let src = source_schema();
-    let spec = count_shape(&src, vec![1]);
+    let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
+    let partial = partial_schema(&[1], &specs);
+    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
+    let reply = batch(
+        &partial,
+        &[
+            (0x2222, &[Int(20), Int(1)]),
+            (0x1111, &[Int(10), Int(2)]),
+            (0x1111, &[Int(10), Int(3)]),
+        ],
+    );
 
-    // (group key, g, this worker's COUNT partial). Worker 0 emits groups
-    // 0x2222 then 0x1111; worker 1 emits the rest of 0x1111.
-    let mut partial = ZSetBatch::new(&spec.partial_schema);
-    for (key, g, n) in [(0x2222u128, 20i64, 1i64), (0x1111, 10, 2), (0x1111, 10, 3)] {
-        partial.pks.push_u128(&spec.partial_schema, key);
-        partial.weights.push(1);
-        partial.nulls.push(0);
-        push_fixed_bits(&mut partial.payload[0], g as u64);
-        push_fixed_bits(&mut partial.payload[1], n as u64);
-    }
+    let got = f.apply(f.combine(reply));
 
-    let got = agg_finish(&spec, &partial);
-
-    assert_eq!(got.len(), 2);
-    // First-encounter ordinals would be `[0, 1]`; the group keys are not.
-    assert_eq!(got.pks, PkColumn::from_natives(&spec.partial_schema, [0x2222, 0x1111]));
-    // The values stay paired with their keys: 0x2222 is g = 20 / COUNT 1,
-    // 0x1111 is g = 10 / COUNT 2 + 3.
-    assert_eq!(got.payload[0].bytes, le(&[20, 10]));
-    assert_eq!(got.payload[1].bytes, le(&[1, 5]));
+    assert_eq!(got.pks, PkColumn::from_natives(&partial, [0x2222, 0x1111]));
+    assert_eq!(ints(&got, 0), [20, 10]);
+    assert_eq!(ints(&got, 1), [1, 5]);
 }
 
-/// The synthesized global ground row has no partial to copy a key from, so
-/// it takes V₀ — the same key the engine stamps on the ground row it emits
-/// when a worker did contribute one, so one logical row has one key either
-/// way.
+/// Every worker emits a global fold's row, most of them the ground row; merged
+/// into a computed row it changes nothing, and grounds alone stay the ground.
 #[test]
-fn the_global_ground_row_is_keyed_at_v0() {
-    let src = source_schema();
-    let spec = count_shape(&src, vec![]);
-    let empty = ZSetBatch::new(&spec.partial_schema);
-    let got = agg_finish(&spec, &empty);
+fn ground_rows_are_the_merge_identity() {
+    let specs = [
+        spec(WireAggFunc::Count, 0, TypeCode::I64),
+        spec(WireAggFunc::Sum, 4, TypeCode::I64),
+        spec(WireAggFunc::Min, 3, TypeCode::I16),
+        spec(WireAggFunc::Max, 2, TypeCode::String),
+    ];
+    let partial = partial_schema(&[], &specs);
+    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
+    let v0 = gnitz_wire::global_group_key();
+    let ground: &[Cell] = &[Int(0), Null, Null, Null];
 
-    assert_eq!(
-        got.pks,
-        PkColumn::from_natives(&spec.partial_schema, [gnitz_wire::global_group_key()])
+    let got = f.combine(batch(
+        &partial,
+        &[
+            (v0, ground),
+            (v0, &[Int(3), Int(40), Int(-2), Str(LONG_M)]),
+            (v0, ground),
+        ],
+    ));
+    assert_eq!(got.len(), 1);
+    assert_eq!(got.nulls, [0]);
+    assert_eq!(ints(&got, 0), [3]);
+    assert_eq!(ints(&got, 1), [40]);
+    assert_eq!(got.payload[2].bytes, (-2i16).to_le_bytes());
+    assert_eq!(strs(&got, 3), [LONG_M]);
+
+    let got = f.combine(batch(&partial, &[(v0, ground), (v0, ground)]));
+    assert_eq!(got.len(), 1);
+    assert_eq!(ints(&got, 0), [0]);
+    assert_eq!(got.nulls, [0b1110]);
+}
+
+/// A winner replaces the held value by its own type's order — signed at a
+/// sub-8-byte width, by content past a German cell's prefix — and a NULL neither
+/// wins nor blocks a later winner.
+#[test]
+fn extremes_merge_by_value_including_strings() {
+    let specs = [
+        spec(WireAggFunc::Min, 3, TypeCode::I16),
+        spec(WireAggFunc::Max, 2, TypeCode::String),
+    ];
+    let partial = partial_schema(&[], &specs);
+    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
+    let v0 = gnitz_wire::global_group_key();
+
+    let got = f.combine(batch(
+        &partial,
+        &[
+            (v0, &[Int(-5), Null]),
+            (v0, &[Int(3), Str(LONG_Z)]),
+            (v0, &[Int(-7), Str(LONG_M)]),
+        ],
+    ));
+
+    assert_eq!(got.len(), 1);
+    assert_eq!(got.nulls, [0]);
+    assert_eq!(got.payload[0].bytes, (-7i16).to_le_bytes());
+    assert_eq!(strs(&got, 1), [LONG_Z]);
+}
+
+#[test]
+fn sums_wrap_and_floats_add() {
+    let specs = [
+        spec(WireAggFunc::Sum, 4, TypeCode::I64),
+        spec(WireAggFunc::Sum, 5, TypeCode::F64),
+    ];
+    let partial = partial_schema(&[], &specs);
+    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
+    let v0 = gnitz_wire::global_group_key();
+
+    let got = f.combine(batch(
+        &partial,
+        &[
+            (v0, &[Int(i64::MAX), F64(1.5)]),
+            (v0, &[Int(1), F64(2.25)]),
+            (v0, &[Null, Null]),
+        ],
+    ));
+
+    assert_eq!(got.nulls, [0]);
+    assert_eq!(ints(&got, 0), [i64::MIN]);
+    assert_eq!(got.payload[1].bytes, 3.75f64.to_le_bytes());
+}
+
+/// Rows sharing a `_group_pk` but not their group values stay apart, a NULL
+/// group value included — which is also not the zero its cell holds.
+#[test]
+fn a_digest_collision_keeps_groups_apart() {
+    let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
+    let partial = partial_schema(&[1], &specs);
+    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
+
+    let got = f.combine(batch(
+        &partial,
+        &[
+            (0x42, &[Int(10), Int(1)]),
+            (0x42, &[Int(20), Int(2)]),
+            (0x42, &[Null, Int(5)]),
+            (0x42, &[Int(10), Int(3)]),
+            (0x42, &[Int(0), Int(7)]),
+            (0x42, &[Null, Int(11)]),
+        ],
+    ));
+
+    assert_eq!(got.pks, PkColumn::from_natives(&partial, [0x42; 4]));
+    assert_eq!(null_bits(&got, 0), [false, false, true, false]);
+    assert_eq!(ints(&got, 0), [10, 20, 0, 0]);
+    assert_eq!(ints(&got, 1), [4, 2, 16, 7]);
+}
+
+#[test]
+fn a_reply_sharing_no_group_is_returned_whole() {
+    let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
+    let partial = partial_schema(&[1], &specs);
+    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
+    let reply = batch(
+        &partial,
+        &[
+            (0x1, &[Int(1), Int(1)]),
+            (0x2, &[Int(2), Int(2)]),
+            (0x3, &[Null, Int(3)]),
+        ],
     );
-    assert_eq!(got.payload[0].bytes, le(&[0]));
+
+    assert_eq!(f.combine(reply.clone()), reply);
+}
+
+#[test]
+fn having_compacts_before_an_identity_finalize() {
+    let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
+    let partial = partial_schema(&[1], &specs);
+    let f = finish_of(&partial, &specs, &[gt(2, 1)], passthrough_all(&partial));
+    assert!(f.identity);
+
+    let got = f.apply(batch(
+        &partial,
+        &[
+            (0x1, &[Int(1), Int(1)]),
+            (0x2, &[Int(2), Int(3)]),
+            (0x3, &[Int(3), Int(1)]),
+            (0x4, &[Int(4), Int(5)]),
+        ],
+    ));
+
+    assert_eq!(got.pks, PkColumn::from_natives(&partial, [0x2, 0x4]));
+    assert_eq!(ints(&got, 0), [2, 4]);
+    assert_eq!(ints(&got, 1), [3, 5]);
+}
+
+/// `SELECT COUNT(*) AS c, s, COUNT(*) + 1 AS c1 … GROUP BY s HAVING COUNT(*) > 1`:
+/// the map moves the STRING group column behind a COUNT, carrying its NULL bit
+/// to the new slot, and computes over the surviving groups only.
+#[test]
+fn a_projecting_finalize_runs_the_map() {
+    let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
+    let partial = partial_schema(&[2], &specs);
+    let plus_one = BExpr::BinOp(Box::new(BExpr::ColRef(2)), BinOp::Add, Box::new(BExpr::LitInt(1)));
+    let f = finish_of(
+        &partial,
+        &specs,
+        &[gt(2, 1)],
+        vec![
+            (BExpr::ColRef(2), ColumnDef::new("c", TypeCode::I64, false)),
+            (BExpr::ColRef(1), ColumnDef::new("s", TypeCode::String, true)),
+            (plus_one, ColumnDef::new("c1", TypeCode::I64, true)),
+        ],
+    );
+    assert!(!f.identity);
+
+    let got = f.apply(batch(
+        &partial,
+        &[
+            (0x1, &[Null, Int(2)]),
+            (0x2, &[Str(LONG_M), Int(4)]),
+            (0x3, &[Str("x"), Int(1)]),
+        ],
+    ));
+
+    assert!(got.validate(&f.out_schema).is_ok());
+    assert_eq!(got.pks, PkColumn::from_natives(&f.out_schema, [0x1, 0x2]));
+    assert_eq!(got.weights, [1, 1]);
+    assert_eq!(got.nulls, [0b010, 0]);
+    assert_eq!(ints(&got, 0), [2, 4]);
+    assert_eq!(strs(&got, 1)[1], LONG_M);
+    assert_eq!(ints(&got, 2), [3, 5]);
 }
 
 /// A global `AVG(u)` over a `BIGINT UNSIGNED` column, built the way the planner
 /// builds one: `push_agg_specs` splits it into `[Sum, CountNonNull]`, and the
-/// finalize item is the shared composite over the two partial columns. That
-/// composite is the *only* place the division happens on this path, so these
-/// tests exercise it rather than a helper of their own.
-fn avg_shape() -> FoldShape {
+/// finalize item is the shared composite over the two partial columns — the
+/// *only* place the division happens on this path. Drives one worker partial
+/// `(sum bits, count)` through the whole finish and reads the AVG cell back.
+fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
     let src = Schema {
         columns: vec![col_def("pk", TypeCode::U64, false), col_def("u", TypeCode::U64, true)],
         pk_cols: vec![0],
     };
-    let mut agg_specs = Vec::new();
-    push_agg_specs(AggFunc::Avg, Some(1), &src.columns, &mut agg_specs).unwrap();
-    let partial_schema = partial_schema(&src, &[], &agg_specs);
-    // A global aggregate has no group columns, so the SUM lands at partial
-    // column 1 and its COUNT_NON_NULL companion at 2.
-    let ev = compile_scalar_evaluator(&finalize_agg_bexpr(1, Some(2), AggFunc::Avg), &partial_schema).unwrap();
-    assert!(!ev.result_is_str(), "AVG finalizes to a scalar");
-    FoldShape {
-        reduce_schema: Arc::new(src),
-        group_positions: Vec::new(),
-        agg_specs,
-        pre: None,
-        out_schema: build_agg_out_schema(vec![col_def("a", TypeCode::F64, true)]).unwrap().0,
-        partial_schema: Arc::new(partial_schema),
-        having: None,
-        finalize: vec![FinalizeItem::Computed { ev: Box::new(ev) }],
-    }
-}
+    let mut specs = Vec::new();
+    push_agg_specs(AggFunc::Avg, Some(1), &src.columns, &mut specs).unwrap();
+    let partial = fold_partial_schema(&src, &[], &specs).unwrap().schema;
+    // No group columns: the SUM lands at partial column 1, its companion at 2.
+    let f = finish_of(
+        &partial,
+        &specs,
+        &[],
+        vec![(
+            finalize_agg_bexpr(1, Some(2), AggFunc::Avg),
+            col_def("a", TypeCode::F64, true),
+        )],
+    );
+    let reply = batch(
+        &partial,
+        &[(gnitz_wire::global_group_key(), &[Int(sum_bits), Int(cnt)])],
+    );
 
-/// Drive one worker partial `(sum bits, count)` through the whole finish and
-/// read the AVG cell back.
-fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
-    let spec = avg_shape();
-    let mut partial = ZSetBatch::new(&spec.partial_schema);
-    partial
-        .pks
-        .push_u128(&spec.partial_schema, gnitz_wire::global_group_key());
-    partial.weights.push(1);
-    partial.nulls.push(0);
-    push_fixed_bits(&mut partial.payload[0], sum_bits as u64);
-    push_fixed_bits(&mut partial.payload[1], cnt as u64);
-
-    let got = agg_finish(&spec, &partial);
+    let got = f.apply(f.combine(reply));
     assert_eq!(got.len(), 1);
     (!gnitz_wire::null_word_get(got.nulls[0], 0))
         .then(|| f64::from_bits(u64::from_le_bytes(got.payload[0].bytes[..8].try_into().unwrap())))

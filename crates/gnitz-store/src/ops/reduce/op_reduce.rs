@@ -156,7 +156,7 @@ pub fn op_reduce(
             let has_v0 = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
             if !has_v0 {
                 let mut raw_output = Batch::with_capacity(output_schema, 1);
-                emit_global_ground(&mut raw_output, out_pk_bytes, plan);
+                emit_global_ground(&mut raw_output, out_pk_bytes, &plan.acc_template);
                 return raw_output;
             }
         }
@@ -316,7 +316,7 @@ pub fn op_reduce(
             // must still publish exactly one row, so the ground replaces it. The
             // `has_old` retraction above already cancelled whatever stood at V₀,
             // so computed→ground, ground→computed and value changes all net to one.
-            emit_global_ground(&mut raw_output, out_pk_bytes, plan);
+            emit_global_ground(&mut raw_output, out_pk_bytes, &plan.acc_template);
         }
 
         num_groups += 1;

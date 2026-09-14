@@ -29,18 +29,20 @@ use crate::dml::cte::inline_ctes;
 use crate::dml::group_by::build_fold_shape;
 use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, Access, ReadBudget};
 use crate::error::{reject_if, GnitzSqlError};
-use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, FinalizeItem, FoldShape};
-use crate::exec::order::{read_spec_finish, resolve_read_spec_order, wire_order, Window};
+use crate::exec::agg_finish::FoldFinish;
+use crate::exec::order::{read_spec_finish, resolve_read_spec_order, Window};
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
-use crate::tail::{extract_limit, extract_offset, order_exprs, parse_order_by};
+use crate::tail::{extract_limit, extract_offset, parse_order_by, resolve_position, OrderTarget};
 use crate::validate::{
-    computed_column, order_column, reject_duplicate_projection_names, reject_unhonored_query_clauses,
+    computed_column, reject_duplicate_projection_names, reject_unhonored_query_clauses,
     reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{AggDescriptor, AggReadSpec, ComputeMap, ReadSink, SinkKind};
+use gnitz_core::{
+    BatchAppender, CatalogSnapshot, ClientError, GnitzClient, ProtocolError, RelDescriptor, Schema, ZSetBatch,
+};
+use gnitz_wire::{ComputeMap, ReadSink, SinkKind};
 use sqlparser::ast::{Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
@@ -281,8 +283,7 @@ pub(super) enum ReadCase {
 pub(super) struct ConstRead {
     /// Zero groups, zero aggregates: every finalize item is a constant
     /// expression, evaluated over the one ground row.
-    pub(super) shape: FoldShape,
-    pub(super) order: Vec<gnitz_wire::OrderKey>,
+    pub(super) finish: FoldFinish,
     pub(super) window: Window,
 }
 
@@ -308,9 +309,12 @@ pub(super) enum SinkTail {
     /// may chunk one read into several requests, and each would otherwise
     /// deep-clone the schema onto its pending slot.
     Rows { reply_schema: Arc<Schema> },
-    /// Finish the partial fold, then window.
+    /// Combine and finish the partial fold, then window.
     Fold {
-        shape: Box<FoldShape>,
+        finish: Box<FoldFinish>,
+        /// The reduce input: the schema the shipped fold spec's columns index,
+        /// and what `EXPLAIN` names them against.
+        reduce_schema: Arc<Schema>,
         /// Whether the shape came from `DISTINCT`. Nothing in the layout
         /// distinguishes a DISTINCT fold from a zero-aggregate GROUP BY, and
         /// `EXPLAIN` names them differently.
@@ -350,7 +354,7 @@ impl ReadPlan {
         match &self.case {
             ReadCase::PlainScan(_) => None,
             ReadCase::Spec(s) => Some(s.reply_schema()),
-            ReadCase::Constant(c) => Some(&c.shape.out_schema),
+            ReadCase::Constant(c) => Some(&c.finish.out_schema),
         }
     }
 
@@ -381,7 +385,7 @@ impl SpecRead {
     pub(super) fn reply_schema(&self) -> &Schema {
         match &self.tail {
             SinkTail::Rows { reply_schema } => reply_schema,
-            SinkTail::Fold { shape, .. } => &shape.partial_schema,
+            SinkTail::Fold { finish, .. } => &finish.partial_schema,
         }
     }
 }
@@ -486,39 +490,22 @@ fn plan_fold_read(query: &Query, select: &Select, window: Window, target: Target
     // The keys bind with the SELECT list, so one over a column the grouping does
     // not cover rejects before the fold is dispatched, as HAVING already does.
     let keys = parse_order_by(query.order_by.as_ref())?;
-    let (shape, order) = build_fold_shape(select, &target.schema, &target.alias, &keys)?;
-    // `group_cols` / `src_col` index the reduce input — the pre-map's output when
-    // the fold carries one, which is exactly what `shape` resolved them against.
-    let sink = ReadSink {
-        map: shape.pre.clone(),
-        kind: SinkKind::Fold(AggReadSpec {
-            group_cols: shape.group_positions.iter().map(|&c| c as u32).collect(),
-            aggs: shape
-                .agg_specs
-                .iter()
-                .map(|s| AggDescriptor { agg_op: s.op, col_idx: s.col as u32 })
-                .collect(),
-        }),
-    };
+    let (sink, tail, order) = build_fold_shape(select, &target.schema, &target.alias, &keys)?;
     Ok(SpecRead {
         target,
         access,
         sink,
         order,
         window,
-        tail: SinkTail::Fold {
-            is_distinct: select.distinct.is_some(),
-            shape: Box::new(shape),
-        },
+        tail,
     })
 }
 
 /// A FROM-less SELECT has no columns: each item is a constant expression,
-/// compiled as a fold's finalize item over the ground row; an ORDER BY
-/// expression rides as a hidden one.
+/// compiled as a fold's finalize item over the ground row.
 fn plan_const_read(query: &Query, select: &Select, window: Window) -> Result<ConstRead, GnitzSqlError> {
     const CTX: &str = "SELECT without FROM";
-    let ground = Arc::new(ground_partial_schema());
+    let ground = ground_partial_schema();
     // No relation is in scope: the ground row's one column is hidden, so every
     // written name is unresolvable, a qualified one included.
     let bind = |e: &sqlparser::ast::Expr| bind_single_table(e, &ground, "");
@@ -529,45 +516,23 @@ fn plan_const_read(query: &Query, select: &Select, window: Window) -> Result<Con
         let def = computed_column(alias, idx, bound.infer_ty(&ground.columns));
         items.push((bound, def));
     }
-    // A key that is not an output item is bound and appended as a hidden one.
-    let keys = parse_order_by(query.order_by.as_ref())?;
-    let mut placed = Vec::new();
-    for (i, e) in order_exprs(&keys).into_iter().enumerate() {
-        placed.push(match output_column(e, items.iter().map(|(_, d)| d))? {
-            Some(at) => at,
-            None => {
-                let bound = bind(e)?;
-                let def = order_column(i, bound.infer_ty(&ground.columns));
-                items.push((bound, def));
-                items.len() - 1
-            }
-        });
-    }
     reject_duplicate_projection_names(&select.projection, items.iter().map(|(_, d)| d), CTX)?;
-    let finalize = items
-        .iter()
-        .map(|(bound, _)| {
-            Ok(FinalizeItem::Computed {
-                ev: Box::new(compile_scalar_evaluator(bound, &ground)?),
-            })
-        })
-        .collect::<Result<_, GnitzSqlError>>()?;
-    let (out_schema, base) = build_agg_out_schema(items.into_iter().map(|(_, d)| d).collect())?;
-    let order = wire_order(&keys, &out_schema, &placed, base)?;
-    Ok(ConstRead {
-        shape: FoldShape {
-            reduce_schema: Arc::clone(&ground),
-            group_positions: Vec::new(),
-            agg_specs: Vec::new(),
-            pre: None,
-            partial_schema: ground,
-            out_schema,
-            having: None,
-            finalize,
-        },
-        order,
-        window,
-    })
+    // One row sorts to itself: a key is refused where invalid, never placed.
+    let visible: Vec<usize> = (0..items.len()).collect();
+    for key in &parse_order_by(query.order_by.as_ref())? {
+        match key.target {
+            OrderTarget::Position(pos) => {
+                resolve_position(pos, &visible)?;
+            }
+            OrderTarget::Expr(e) => {
+                if output_column(e, items.iter().map(|(_, d)| d))?.is_none() {
+                    compile_scalar_evaluator(&bind(e)?, &ground)?;
+                }
+            }
+        }
+    }
+    let finish = FoldFinish::new(ground, [], &[], items)?;
+    Ok(ConstRead { finish, window })
 }
 
 // ---------------------------------------------------------------------------
@@ -585,13 +550,13 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             return Ok(SqlResult::Rows { schema: r.schema, batch: r.batch });
         }
         ReadCase::Constant(c) => {
-            let ConstRead { shape, order, window } = *c;
+            let ConstRead { finish, window } = *c;
             if window.limit == Some(0) {
-                return Ok(empty_rows(Arc::new(shape.out_schema)));
+                return Ok(empty_rows(Arc::clone(&finish.out_schema)));
             }
-            // No partials: the finish synthesizes the ground row and projects it.
-            let batch = agg_finish(&shape, &ZSetBatch::new(&shape.partial_schema));
-            let (schema, batch) = read_spec_finish(Arc::new(shape.out_schema), batch, &order, window);
+            let mut ground = ZSetBatch::with_capacity(&finish.partial_schema, 1);
+            BatchAppender::new(&mut ground, &finish.partial_schema).add_row(gnitz_wire::global_group_key(), 1);
+            let (schema, batch) = read_spec_finish(Arc::clone(&finish.out_schema), finish.apply(ground), &[], window);
             return Ok(SqlResult::Rows { schema, batch });
         }
         ReadCase::Spec(spec) => spec,
@@ -615,17 +580,19 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             let batch = fetch_bound(client, tid, &access, &sink, &reply_schema)?;
             (reply_schema, batch)
         }
-        SinkTail::Fold { shape, .. } => {
+        SinkTail::Fold { finish, .. } => {
             if window.limit == Some(0) {
-                return Ok(empty_rows(Arc::new(shape.out_schema)));
+                return Ok(empty_rows(Arc::clone(&finish.out_schema)));
             }
             // A wire error (including the runtime per-worker group cap) is hard: by
             // now the fold is mid-flight on the workers and cannot fall back.
-            let partial = fetch_bound(client, tid, &access, &sink, &shape.partial_schema)?;
-            // Client finishing: combine by group value, ground row, AVG/NullfillSum,
-            // HAVING, projection.
-            let out_batch = agg_finish(&shape, &partial);
-            (Arc::new(shape.out_schema), out_batch)
+            let partial = fetch_bound(client, tid, &access, &sink, &finish.partial_schema)?;
+            // The decoder skips the NOT NULL sweep; a stray bit under a NOT NULL column would put the
+            // resolved programs on their no-nulls arm over a NULL cell.
+            partial
+                .validate(&finish.partial_schema)
+                .map_err(|e| ClientError::Protocol(ProtocolError::DecodeError(format!("fold reply: {e}"))))?;
+            (Arc::clone(&finish.out_schema), finish.apply(finish.combine(partial)))
         }
     };
     // Sort the concatenation by the wire keys, window, present.

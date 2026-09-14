@@ -66,28 +66,12 @@ pub(super) fn emit_reduce_row(
     output.commit_row(null_word);
 }
 
-/// Emit the synthetic **ground row** of a global (ungrouped) aggregate at PK
-/// `out_pk_bytes` (= `V₀`) — `COUNT(*)=0`, `SUM/MIN/MAX/AVG=NULL`, the one row SQL
-/// scalar-aggregate semantics require over an empty or fully-retracted source.
-/// Rendered from the plan's own untouched accumulator template, so it cannot drift
-/// from a computed row. Emitted at weight +1; the caller nets it to one row (the
-/// `has_old` retraction in `n>0`, the `!trace_out_has_V0` guard in `n==0`).
-pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], plan: &ReducePlan) {
-    // A global-aggregate output schema is `[_group_pk, aggs…]`: no exemplar column,
-    // so there is no source row to read — which is what lets the empty-delta seed,
-    // which has no input batch at all, emit the aggregate columns directly here
-    // rather than through `emit_reduce_row`.
-    debug_assert!(
-        plan.exemplar_locs().is_empty(),
-        "global_ground output schema must have zero group-exemplar columns",
-    );
-
-    // The plan's template is exactly the empty-group state — every accumulator
-    // untouched, never stepped — and `emit_agg_col` renders each by
-    // `empty_renders_zero`, so the ground row shares the one render path with a
-    // normal row.
+/// Emit a global (ungrouped) aggregate's one row at PK `out_pk_bytes` (= `V₀`) from `accs`.
+/// Untouched accumulators render the ground row (`COUNT(*)=0`, `SUM/MIN/MAX/AVG=NULL`).
+/// Emitted at weight +1.
+pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], accs: &[Accumulator]) {
     raw_output.begin_row(out_pk_bytes, 1);
     let mut null_word: u64 = 0;
-    emit_agg_cols(raw_output, &plan.acc_template, 0, &mut null_word);
+    emit_agg_cols(raw_output, accs, 0, &mut null_word);
     raw_output.commit_row(null_word);
 }

@@ -16,10 +16,11 @@
 //! positive-net-weight rows (ghosts excluded, base tables DML-forced
 //! non-negative), so with no history there is no retraction arithmetic — the
 //! accumulator over such rows *is* the aggregate. The fold has no `should_emit`
-//! gate: it emits one partial per present group (over positive weights a present
-//! group always has net cardinality > 0, matching the view). It carries no
-//! COUNT(*) cardinality companion — that is a `should_emit` signal the stateless
-//! fold does not need.
+//! gate: a grouped fold emits one partial per present group (over positive
+//! weights a present group always has net cardinality > 0, matching the view),
+//! and a global fold its one row, over no input included. It carries no COUNT(*)
+//! cardinality companion — that is a `should_emit` signal the stateless fold does
+//! not need.
 
 use std::cmp::Ordering;
 
@@ -29,9 +30,10 @@ use gnitz_wire::AggReadSpec;
 
 use super::agg::Accumulator;
 
-use super::emit::emit_reduce_row;
+use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::ReducePlan;
 use super::sort::compare_by_group_cols;
+use crate::schema::key::NarrowPkOpk;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
 
@@ -45,8 +47,9 @@ pub(crate) struct AdhocFold {
     /// the emission roles the fold reads (`ReducePlan::for_adhoc_fold` derives them
     /// once).
     plan: ReducePlan,
-    /// One representative source row per group, in group-discovery order; the
-    /// row index IS the group ordinal (and `rep_rows.count` the group count).
+    /// Grouped folds only: one representative source row per group, in
+    /// group-discovery order; the row index IS the group ordinal (and
+    /// `rep_rows.count` the group count).
     /// `emit_reduce_row` reads the group columns from it, and the group key is
     /// re-derived from it at `finish` (a pure function of the group columns).
     rep_rows: Batch,
@@ -74,9 +77,13 @@ impl AdhocFold {
             .map_err(|e| StoreError::rejected(format!("scan_spec fold: {e}")))?;
 
         Ok(AdhocFold {
+            accs: if plan.global_ground {
+                plan.acc_template.clone()
+            } else {
+                Vec::new()
+            },
             plan,
             rep_rows: Batch::empty_with_schema(src_schema),
-            accs: Vec::new(),
             by_hash: FxHashMap::default(),
             same_key: Vec::new(),
             last: None,
@@ -113,18 +120,14 @@ impl AdhocFold {
         // grows amortized, where a per-group allocation would be one malloc per
         // group, up to the cap.
         let new_accs = |accs: &mut Vec<Accumulator>| accs.extend_from_slice(&plan.acc_template);
-        if plan.group_key.cols.is_empty() {
-            // Global aggregate: one group at ordinal 0, created on the first
-            // surviving row — no per-row key hash, memo, or comparator probe.
+        if plan.global_ground {
+            // Global aggregate: its one group's accumulators exist from `new` — no
+            // per-row key hash, memo, or comparator probe.
             for row in ranges.iter().flat_map(|&(s, e)| s..e) {
                 let w = mb.get_weight(row);
                 debug_assert!(w > 0, "adhoc fold: scan cursor must deliver positive weights");
                 if w <= 0 {
                     continue;
-                }
-                if rep_rows.count == 0 {
-                    rep_rows.append_batch(chunk, row, row + 1);
-                    new_accs(accs);
                 }
                 for acc in &mut accs[..n_aggs] {
                     acc.step_from_batch(&mb, row, w);
@@ -197,18 +200,21 @@ impl AdhocFold {
     }
 
     /// Emit one partial reduce-output row per present group (weight +1), in the
-    /// synthetic-fold reply layout and group-discovery order. A worker that saw
-    /// no rows emits an empty batch (the client synthesizes the global ground
-    /// row when needed).
+    /// synthetic-fold reply layout and group-discovery order — or a global fold's
+    /// one row, which a worker that saw no rows emits as the ground row.
     pub(crate) fn finish(self) -> Batch {
         let n_aggs = self.plan.acc_template.len();
         // The exact output row count is the group count — reserve once.
         let mut output = Batch::with_capacity(&self.plan.output_schema, self.rep_rows.count.max(1));
+        if self.plan.global_ground {
+            let v0 = NarrowPkOpk::new(gnitz_wire::global_group_key(), self.plan.output_schema.pk_stride());
+            emit_global_ground(&mut output, v0.bytes(), &self.accs);
+            return output;
+        }
         let rep_mb = self.rep_rows.as_mem_batch();
         for ord in 0..self.rep_rows.count {
-            // Synthetic `_agg_pk`, off the retained representative row — a pure
-            // function of its group columns. An empty group set folds to
-            // `global_group_key()`, the same V₀ a view's ground row lands on.
+            // Synthetic `_group_pk`, off the retained representative row — a pure
+            // function of its group columns.
             let pk = self.plan.out_pk(&rep_mb, ord);
             emit_reduce_row(
                 &mut output,

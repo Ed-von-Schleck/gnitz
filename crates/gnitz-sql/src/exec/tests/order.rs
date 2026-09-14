@@ -1,6 +1,6 @@
 use super::*;
 use crate::exec::batch::{project, resolve_projection};
-use crate::tail::{order_exprs, parse_order_by};
+use crate::tail::{key_slots, order_exprs, parse_order_by};
 use crate::test_support::{col_def, parse_query};
 use gnitz_core::TypeCode;
 use gnitz_expr::ColumnLocator;
@@ -97,7 +97,12 @@ fn passthrough(
             output_column(e, &schema.columns)?.ok_or_else(|| GnitzSqlError::Bind("ORDER BY column not found".into()))
         })
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-    let keys = wire_order(&parsed, &schema, &placed, 0)?;
+    let visible: Vec<usize> = schema.visible_columns().map(|(i, _)| i).collect();
+    let keys: Vec<_> = parsed
+        .iter()
+        .zip(key_slots(&parsed, &visible, &placed)?)
+        .map(|(k, col)| k.wire(col))
+        .collect();
     let (schema, batch) = read_spec_finish(Arc::new(schema), batch, &keys, Window { offset, limit });
     Ok((Arc::unwrap_or_clone(schema), batch))
 }

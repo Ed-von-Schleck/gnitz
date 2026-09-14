@@ -68,7 +68,8 @@ pub struct ReducePlan {
     pub output_schema: SchemaDescriptor,
     /// The planner's SQL-intent discriminator for the global-aggregate ground
     /// row: the reduce must publish exactly one row even over an empty source
-    /// (see `op_reduce`). Read on its own by the cardinality-zero arm.
+    /// (see `op_reduce`). Read on its own by the cardinality-zero arm, and by
+    /// `AdhocFold`, which owns a global fold's one group from the start.
     pub(super) global_ground: bool,
     // ── Derived (single home: `new`) ────────────────────────────────────────
     /// This worker mints the global-aggregate ground row's seed — the
@@ -135,7 +136,8 @@ impl ReducePlan {
         )
     }
 
-    /// The ad-hoc `ReadSpec` fold's plan: `SyntheticFold`, with no ground row.
+    /// The ad-hoc `ReadSpec` fold's plan: `SyntheticFold`; a global fold emits its one row even
+    /// over no input.
     pub(crate) fn for_adhoc_fold(
         src_schema: &SchemaDescriptor,
         agg: &gnitz_wire::AggReadSpec,
@@ -146,7 +148,7 @@ impl ReducePlan {
             &agg.group_cols,
             &agg.aggs,
             ReduceOutKey::SyntheticFold,
-            false,
+            agg.group_cols.is_empty(),
             false,
         )
     }
@@ -159,6 +161,10 @@ impl ReducePlan {
         global_ground: bool,
         i_am_owner: bool,
     ) -> Result<Self, OpBuildErr> {
+        debug_assert!(
+            !global_ground || group_by_cols.is_empty(),
+            "a ground-seeding reduce groups on nothing"
+        );
         let output_schema = build_reduce_output_schema(input_schema, group_by_cols, agg_descs, out_key)
             .ok_or_else(|| OpBuildErr::shape("reduce: output exceeds MAX_COLUMNS"))?;
 

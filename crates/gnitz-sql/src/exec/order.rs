@@ -139,16 +139,15 @@ fn paginate(weights: &[i64], offset: u64, hi: u64) -> Vec<(usize, i64)> {
 // ---------------------------------------------------------------------------
 
 /// The wire `OrderKey`s [`read_spec_finish`] windows an already-projected result
-/// by. `placed` is relative to the projection, which starts `base` columns into
-/// the schema the keys index.
+/// by. `placed` is relative to the projection, which starts after `schema`'s PK
+/// columns.
 pub(crate) fn wire_order(
     keys: &[OrderKey<'_>],
     schema: &Schema,
     placed: &[usize],
-    base: usize,
 ) -> Result<Vec<gnitz_wire::OrderKey>, GnitzSqlError> {
     let visible: Vec<usize> = schema.visible_columns().map(|(i, _)| i).collect();
-    let placed: Vec<usize> = placed.iter().map(|at| base + at).collect();
+    let placed: Vec<usize> = placed.iter().map(|at| schema.pk_cols.len() + at).collect();
     let slots = key_slots(keys, &visible, &placed)?;
     Ok(keys.iter().zip(slots).map(|(k, col)| k.wire(col)).collect())
 }

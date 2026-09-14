@@ -1,6 +1,6 @@
 //! The aggregate layout model — the shared contract between the two reduce
 //! lowerings (`hir::lower::reduce` for a view's circuit, `hir::lower::fold` for
-//! an ad-hoc read) and the client finisher (`exec::agg_finish`). Owns the
+//! an ad-hoc read) and the client finisher (`exec::agg_finish::FoldFinish`). Owns the
 //! physical spec layout (`push_agg_specs` is the single authority for how many
 //! specs an aggregate materialises and their output types), the finalize
 //! composite that renders one (`finalize_agg_bexpr`), and the SyntheticFold
@@ -130,7 +130,7 @@ pub(crate) fn group_pk_def() -> ColumnDef {
 
 /// The fold's partial layout with no group columns and no aggregates: the one
 /// hidden `_group_pk`. A FROM-less SELECT finalizes its constant row over it,
-/// through the same client finish a global aggregate takes.
+/// through the same `FoldFinish` a global aggregate takes.
 pub(crate) fn ground_partial_schema() -> Schema {
     Schema::from_parts(vec![group_pk_def()], vec![0]).expect("one hidden U128 key is a valid schema")
 }

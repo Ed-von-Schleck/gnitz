@@ -2308,6 +2308,47 @@ fn sequential_copy_projection() {
     assert_eq!(computed.sequential_copy_base(), None);
 }
 
+/// A map reproduces its input only when it copies every payload column into its
+/// own slot, computes nothing, and the two schemas locate every column alike.
+#[test]
+fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
+    let schema = TestSchema::new(
+        &[(type_code::U64, false), (type_code::I64, true), (type_code::I64, false)],
+        &[0],
+    );
+    assert!(LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&schema, &schema));
+    assert!(
+        !LogicalProgram::copy_cols(&[2, 1]).is_identity_map(&schema, &schema),
+        "reordered copy"
+    );
+    let computed = LogicalProgram::new(
+        vec![LogicalInstr::LoadColInt { col: 2 }],
+        Output::Slots(vec![Sink::Col(1), Sink::Reg(Reg(0))]),
+        vec![],
+    );
+    assert!(!computed.is_identity_map(&schema, &schema), "computed sink");
+    let other_payload = TestSchema::new(
+        &[(type_code::U64, false), (type_code::I64, true), (type_code::I32, false)],
+        &[0],
+    );
+    assert!(
+        !LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&schema, &other_payload),
+        "different payload type"
+    );
+    let other_pk = TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::I64, false),
+            (type_code::I64, false),
+        ],
+        &[1],
+    );
+    assert!(
+        !LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&schema, &other_pk),
+        "different PK layout"
+    );
+}
+
 /// The three shapes [`NullPerm`] collapses a copy list to, and the window each
 /// writes. A source that cannot carry a set bit contributes no pair.
 #[test]

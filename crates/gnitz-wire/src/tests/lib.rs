@@ -20,6 +20,14 @@ fn checksum_matches_c_xxh3_64bits() {
 /// The null-bitmap convention, pinned where it is now defined: setting and
 /// clearing bit `pi` must leave every other payload slot untouched.
 #[test]
+fn as_le_bytes_mut_writes_through_to_the_typed_slice() {
+    let mut words = [0u64; 2];
+    as_le_bytes_mut(&mut words)[8..16].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    assert_eq!(words, [0, 0x0102_0304_0506_0708]);
+    assert_eq!(&as_le_bytes(&words)[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
+}
+
+#[test]
 fn null_word_get_set_roundtrip() {
     let mut w = 0u64;
     assert!(!null_word_get(w, 3));

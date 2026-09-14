@@ -8,12 +8,11 @@
 use crate::access::pk_point_tuple;
 use crate::dml::plan::Access;
 use crate::dml::select::{ReadCase, ReadPlan, SinkTail, SpecRead, Target};
-use crate::exec::agg_finish::FoldShape;
 use crate::exec::order::Window;
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::sys_rows::SysRowSink;
-use gnitz_wire::{AggFunc, IndexWalk, ReadBound, SinkKind};
+use gnitz_wire::{AggFunc, AggReadSpec, IndexWalk, ReadBound, SinkKind};
 
 /// Describe `plan` without running it: the EXPLAIN reply.
 pub(crate) fn execute_explain(plan: &ReadPlan) -> SqlResult {
@@ -37,14 +36,14 @@ pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
             ];
         }
         ReadCase::Constant(c) => {
-            let facts = window_facts(&c.order, c.window);
+            let facts = window_facts(&[], c.window);
             return vec![
                 "read nothing (constant row)".to_string(),
                 "access: none".to_string(),
                 "predicate: none".to_string(),
                 projection_line(
-                    c.shape.out_schema.visible_columns().count(),
-                    hidden_payload(&c.shape.out_schema),
+                    c.finish.out_schema.visible_columns().count(),
+                    hidden_payload(&c.finish.out_schema),
                 ),
                 order_limit_line(facts),
             ];
@@ -62,7 +61,12 @@ pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
         SinkTail::Rows { reply_schema } => {
             projection_line(reply_schema.visible_columns().count(), hidden_payload(reply_schema))
         }
-        SinkTail::Fold { shape, is_distinct } => fold_line(shape, *is_distinct),
+        SinkTail::Fold { finish, reduce_schema, is_distinct } => {
+            let SinkKind::Fold(agg) = &spec.sink.kind else {
+                unreachable!("a fold tail ships a fold sink")
+            };
+            fold_line(agg, reduce_schema, finish.having.is_some(), *is_distinct)
+        }
     };
 
     let facts = order_limit_facts(spec);
@@ -197,23 +201,22 @@ fn projection_line(visible: usize, extra: usize) -> String {
 /// What the worker folds: the PHYSICAL aggregate list, which is why an AVG shows
 /// as its SUM + COUNT_NON_NULL pair and why the match below is over the *wire*
 /// enum — the one carrying `SumZero` and no `Avg`.
-fn fold_line(shape: &FoldShape, is_distinct: bool) -> String {
+fn fold_line(agg: &AggReadSpec, reduce_schema: &Schema, has_having: bool, is_distinct: bool) -> String {
     // Named against the reduce input, not the source: with a pre-map the reduce
     // groups and aggregates columns the source does not have, and the hidden
     // `_preN` the pre-map minted for the written expression is the only name one
     // of those has.
-    let schema = &shape.reduce_schema;
-    let cols = shape
-        .group_positions
+    let cols = agg
+        .group_cols
         .iter()
-        .map(|&c| schema.columns[c].name.as_str())
+        .map(|&c| reduce_schema.columns[c as usize].name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let ops = shape
-        .agg_specs
+    let ops = agg
+        .aggs
         .iter()
         .map(|s| {
-            let op = match s.op {
+            let op = match s.agg_op {
                 AggFunc::Count => return "COUNT(*)".to_string(),
                 AggFunc::Sum => "SUM",
                 AggFunc::Min => "MIN",
@@ -221,21 +224,21 @@ fn fold_line(shape: &FoldShape, is_distinct: bool) -> String {
                 AggFunc::CountNonNull => "COUNT_NON_NULL",
                 AggFunc::SumZero => "SUM_ZERO",
             };
-            format!("{op}({})", schema.columns[s.col].name)
+            format!("{op}({})", reduce_schema.columns[s.col_idx as usize].name)
         })
         .collect::<Vec<_>>()
         .join(", ");
 
     let mut line = if is_distinct {
         format!("fold: distinct on ({cols})")
-    } else if shape.global_ground() {
+    } else if agg.group_cols.is_empty() {
         format!("fold: global aggregate: {ops}")
     } else if ops.is_empty() {
         format!("fold: group by ({cols})")
     } else {
         format!("fold: group by ({cols}): {ops}")
     };
-    if shape.having.is_some() {
+    if has_having {
         line.push_str("; HAVING applied client-side");
     }
     line

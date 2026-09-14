@@ -915,8 +915,8 @@ fn a_from_less_select_plans_a_constant_row() {
             "read nothing (constant row)",
             "access: none",
             "predicate: none",
-            "projection: 1 columns (+1 for ordering)",
-            "order/limit: client sort, client window",
+            "projection: 1 columns",
+            "order/limit: client window",
         ]
     );
     for (sql, variant, msg) in [
@@ -930,6 +930,12 @@ fn a_from_less_select_plans_a_constant_row() {
         ),
         ("SELECT COUNT(*)", "Unsupported", "aggregate"),
         ("SELECT 1 AS a, 2 AS a", "Plan", "duplicate column name 'a'"),
+        (
+            "SELECT 1 AS a ORDER BY 2",
+            "Unsupported",
+            "ORDER BY position 2 is out of range",
+        ),
+        ("SELECT 1 AS a ORDER BY x", "Bind", "column 'x' not found"),
         ("SELECT (SELECT 1)", "Unsupported", "scalar subquery"),
     ] {
         assert_rejects(sql, read(&cat, sql), variant, msg);

@@ -34,8 +34,8 @@ pub(crate) struct FoldPieces {
     /// The fold sink's pre-map over the source schema, `None` when the reduce
     /// groups and aggregates source columns directly.
     pub(crate) pre: Option<ComputeMap>,
-    /// HAVING over the raw reduce output, `None` when the body has none or the
-    /// binder folded it to a true constant.
+    /// HAVING over the raw reduce output; empty when the body has none or it
+    /// folded to true.
     pub(crate) having: Vec<BoundExpr>,
     /// The finalize projection in SELECT order: an expression over
     /// `partial_schema` and the output column it lands in. An aggregate's

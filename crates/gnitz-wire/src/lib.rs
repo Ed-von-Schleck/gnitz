@@ -207,6 +207,14 @@ pub fn as_le_bytes<T: LeScalar>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
+/// [`as_le_bytes`] for writing: every byte pattern is a valid `LeScalar`.
+#[inline(always)]
+pub fn as_le_bytes_mut<T: LeScalar>(v: &mut [T]) -> &mut [u8] {
+    // SAFETY: `size_of_val(v)` initialized bytes exclusively borrowed from `v`; `LeScalar` admits
+    // only padding-free integers, so any written value is a valid `T`.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
 /// Read a whole 1/2/4/8-byte little-endian **signed** cell, sign-extended to
 /// i64 — the native-LE payload/decoded-PK read. `bytes.len()` IS the column
 /// width. Sibling of [`read_unsigned_exact`]; the two are the one pair every

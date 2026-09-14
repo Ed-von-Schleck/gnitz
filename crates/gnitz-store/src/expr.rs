@@ -431,9 +431,7 @@ impl MapPlan {
     ) -> Result<Self, ExprValidateErr> {
         // Read before `resolve_map` consumes the logical form. Only under
         // `Inherit`: a reindex or hash-row overwrites every row's PK.
-        let is_identity = matches!(pk_source, PkSource::Inherit)
-            && in_schema.same_physical_layout(out_schema)
-            && logical.sequential_copy_base() == Some(in_schema.pk_indices().len());
+        let is_identity = matches!(pk_source, PkSource::Inherit) && logical.is_identity_map(in_schema, out_schema);
         let ev = logical.resolve_map(in_schema, out_schema)?;
         let copies_a_string = ev
             .copies()

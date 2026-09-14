@@ -94,10 +94,16 @@ pub(crate) fn payload_map(
     cols: &[ColumnDef],
     schema: &Schema,
 ) -> Result<ComputeMap, GnitzSqlError> {
-    Ok(ComputeMap {
-        program: compile_projection_map(items, cols, schema)?.to_blob_bytes(),
+    Ok(compute_map(compile_projection_map(items, cols, schema)?, cols))
+}
+
+/// A compiled payload program paired with the `(type_code, nullable)` declaration of the slots
+/// it writes — the two halves must describe the same slice.
+fn compute_map(program: LogicalProgram, cols: &[ColumnDef]) -> ComputeMap {
+    ComputeMap {
+        program: program.to_blob_bytes(),
         out_cols: cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect(),
-    })
+    }
 }
 
 /// Compile the *payload* slice of a projection (`items` must exclude the
@@ -227,20 +233,31 @@ pub(crate) fn build_read_projection(
     Ok((items, out_cols))
 }
 
-/// The `(schema, map)` a leading-key projection over `source_schema` produces:
-/// the source PK, then what the map fills. `what` names the shape if the schema
-/// is invalid.
+/// The `(schema, payload program)` a leading-key projection over `source_schema` produces: the
+/// source PK, then what the program fills. `what` names the shape if the schema is invalid.
+pub(crate) fn reply_program(
+    items: &[ProjItem],
+    out_cols: Vec<ColumnDef>,
+    source_schema: &Schema,
+    what: &str,
+) -> Result<(Schema, LogicalProgram), GnitzSqlError> {
+    let k = source_schema.pk_cols.len();
+    let program = compile_projection_map(&items[k..], &out_cols[k..], source_schema)?;
+    let schema = Schema::from_parts(out_cols, (0..k as u32).collect())
+        .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))?;
+    Ok((schema, program))
+}
+
+/// [`reply_program`], encoded for the wire.
 pub(crate) fn read_reply_shape(
     items: &[ProjItem],
     out_cols: Vec<ColumnDef>,
     source_schema: &Schema,
     what: &str,
 ) -> Result<(Schema, ComputeMap), GnitzSqlError> {
-    let k = source_schema.pk_cols.len();
-    let map = payload_map(&items[k..], &out_cols[k..], source_schema)?;
-    let reply_schema = Schema::from_parts(out_cols, (0..k as u32).collect())
-        .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))?;
-    Ok((reply_schema, map))
+    let (schema, program) = reply_program(items, out_cols, source_schema, what)?;
+    let map = compute_map(program, &schema.columns[source_schema.pk_cols.len()..]);
+    Ok((schema, map))
 }
 
 #[cfg(test)]

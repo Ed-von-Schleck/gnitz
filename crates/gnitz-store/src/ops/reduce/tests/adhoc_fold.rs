@@ -148,6 +148,40 @@ fn fold_global_single_group() {
     assert_eq!(out.as_mem_batch().get_weight(0), 1);
 }
 
+/// A global fold owns its one group from the start, so a worker that folded no
+/// rows still emits the ground row: COUNT a concrete, null-clear 0, MAX NULL.
+#[test]
+fn fold_global_over_no_rows_emits_the_ground_row() {
+    let spec = direct(vec![], vec![agg(AggFunc::Count, 0), agg(AggFunc::Max, 2)]);
+    let src = src_schema();
+    let fold = AdhocFold::new(&src, &spec, 1000).unwrap();
+    let out = fold.finish();
+    assert_eq!(out.count, 1);
+    let mb = out.as_mem_batch();
+    assert_eq!(mb.get_weight(0), 1);
+    assert_eq!(
+        mb.get_pk_bytes(0),
+        NarrowPkOpk::new(gnitz_wire::global_group_key(), 16).bytes()
+    );
+    assert_eq!(read_i64_le(out.col_data(0), 0), 0); // COUNT*
+    assert!(
+        !gnitz_wire::null_word_get(mb.get_null_word(0), 0),
+        "COUNT(*) is null-clear"
+    );
+    assert!(
+        gnitz_wire::null_word_get(mb.get_null_word(0), 1),
+        "MAX over nothing is NULL"
+    );
+}
+
+#[test]
+fn fold_grouped_over_no_rows_emits_nothing() {
+    let spec = direct(vec![1], vec![agg(AggFunc::Count, 0)]);
+    let src = src_schema();
+    let fold = AdhocFold::new(&src, &spec, 1000).unwrap();
+    assert_eq!(fold.finish().count, 0);
+}
+
 #[test]
 fn fold_group_cap_aborts() {
     let spec = direct(vec![1], vec![agg(AggFunc::Count, 0)]);
