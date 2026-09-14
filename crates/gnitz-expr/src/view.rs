@@ -120,7 +120,12 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
             "PK column at offset {byte_off}: one expected value per row"
         );
         for (row, &want) in vals.iter().enumerate() {
-            let native = gnitz_wire::decode_pk_column_owned(&v.get_pk_bytes(row)[byte_off..byte_off + size], type_code);
+            let mut native = [0u8; 16];
+            gnitz_wire::decode_pk_column(
+                &v.get_pk_bytes(row)[byte_off..byte_off + size],
+                type_code,
+                &mut native[..size],
+            );
             assert_eq!(
                 &native[..size],
                 &want.to_le_bytes()[..size],

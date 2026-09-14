@@ -404,6 +404,8 @@ fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
             u128::MAX as i128,
             "340282366920938463463374607431768211455",
         ),
+        (type_code::I128, -1, "-1"),
+        (type_code::I128, i128::MIN, "-170141183460469231731687303715884105728"),
     ] {
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(tc, 0)], &[0]);
         assert_eq!(

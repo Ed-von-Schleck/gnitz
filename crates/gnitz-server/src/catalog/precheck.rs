@@ -292,10 +292,10 @@ impl CatalogEngine {
             entry.schema().columns[col.fk_col_idx as usize].type_code
         };
 
-        // Domain fit, not promoted equality: the lone-PK probe encodes the child
-        // value into a slot of the parent's *raw* width, so an I64 child and an
-        // I32 parent promote alike and still have no slot to encode into.
-        if !gnitz_wire::fk_child_fits(col.type_code, target_type) {
+        // The preflight compares child and parent values as the referenced
+        // column's key image, so both columns carry one type; SQL adopts the
+        // parent's type before the engine sees the column.
+        if col.type_code != target_type {
             return Err(format!(
                 "FK type mismatch: child type code {} cannot reference target type code {target_type}",
                 col.type_code

@@ -72,53 +72,6 @@ fn decode_pk_column_roundtrips_every_pk_type() {
     }
 }
 
-/// The property the two key spaces exist for: a value stored as a PK column
-/// and the same value stored as a payload column must produce the same key
-/// in each space, or the two sides of a distributed join land on different
-/// workers (routing) or miss each other's index entries (native).
-///
-/// Float, string and blob columns have no PK counterpart, so the two payload
-/// readers must agree with each other instead: neither applies the OPK flip.
-#[test]
-fn pk_and_payload_keys_agree_on_one_logical_value() {
-    for tc in TypeCode::ALL {
-        let (raw, sz) = (tc as u8, tc.wire_stride());
-        for p in PATTERNS {
-            let le = p.to_le_bytes();
-            let native = &le[..sz];
-            if tc.is_pk_eligible() {
-                let mut opk = [0u8; 16];
-                encode_pk_column(native, raw, &mut opk[..sz]);
-                assert_eq!(
-                    pk_route_key(&opk[..sz], 0, sz),
-                    payload_route_key(native, 0, sz, raw),
-                    "route keys diverge for tc={raw} p={p:#x}",
-                );
-                assert_eq!(
-                    pk_native_key(&opk[..sz], 0, sz, raw),
-                    payload_native_key(native, 0, sz, raw),
-                    "native keys diverge for tc={raw} p={p:#x}",
-                );
-            } else {
-                assert_eq!(
-                    payload_route_key(native, 0, sz, raw),
-                    payload_native_key(native, 0, sz, raw),
-                    "an unflippable column must read the same in both spaces: tc={raw} p={p:#x}",
-                );
-            }
-        }
-    }
-    // The native space zero-extends: a signed source keeps its
-    // two's-complement bits in the low source-width bytes and is NOT
-    // sign-extended to 128 bits (`has_pk` re-encodes from the source width).
-    assert_eq!(
-        payload_native_key(&(-1i32).to_le_bytes(), 0, 4, type_code::I32),
-        0xFFFF_FFFF
-    );
-    assert_eq!(payload_native_key(&(-1i16).to_le_bytes(), 0, 2, type_code::I16), 0xFFFF);
-    assert_eq!(payload_native_key(&[0xFFu8], 0, 1, type_code::I8), 0xFF);
-}
-
 /// `decode_opk_i64` fuses the OPK decode with `FixedInt`'s widening, so it must
 /// return the value that was encoded, over each type's whole range. A wrong XOR
 /// arm is otherwise a silent wrong answer on every PK predicate.
@@ -152,31 +105,40 @@ fn decode_opk_i64_recovers_the_encoded_value() {
     assert_eq!(decode_opk_i64(&opk, FixedInt::U64), -1i64);
 }
 
-/// `promote_opk_column`'s identity arm must equal the general
-/// decode-then-re-encode path it short-circuits, at every PK-eligible width.
+/// `store_opk_image` writes what decode → widen → encode writes, for every
+/// promotion the engine performs.
 #[test]
-fn promote_opk_column_identity_matches_decode_encode() {
-    for &(t, sz) in &[
-        (type_code::I8, 1usize),
-        (type_code::U8, 1),
-        (type_code::I16, 2),
-        (type_code::U16, 2),
-        (type_code::I32, 4),
-        (type_code::U32, 4),
-        (type_code::I64, 8),
-        (type_code::U64, 8),
-    ] {
-        for &v in &[0i128, 1, -1, i64::MIN as i128, i64::MAX as i128, u64::MAX as i128] {
-            let le = (v as u128).to_le_bytes();
-            let native = &le[..sz];
-            let (mut opk, mut got) = ([0u8; 16], [0u8; 16]);
-            encode_pk_column(native, t, &mut opk[..sz]);
-            promote_opk_column(&opk[..sz], t, t, &mut got[..sz]);
-            let decoded = decode_pk_column_owned(&opk[..sz], t);
+fn store_opk_image_matches_decode_widen_encode() {
+    let pk_types: Vec<u8> = TypeCode::ALL
+        .iter()
+        .filter(|t| t.is_pk_eligible())
+        .map(|t| *t as u8)
+        .collect();
+    let mut pairs: Vec<(u8, u8)> = Vec::new();
+    for &src in &pk_types {
+        for &target in &pk_types {
+            if src == target || crate::int_domain_fits(src, target) {
+                pairs.push((src, target));
+            }
+        }
+    }
+    pairs.push((type_code::UUID, type_code::U128));
+    for (src, target) in pairs {
+        let (sw, tw) = (crate::wire_stride(src), crate::wire_stride(target));
+        for p in PATTERNS {
+            let le = p.to_le_bytes();
+            let native = &le[..sw];
+            let mut opk_src = [0u8; 16];
+            encode_pk_column(native, src, &mut opk_src[..sw]);
+
+            let mut got = [0u8; 16];
+            store_opk_image(widen_pk_be(&opk_src[..sw]), src, sw, target, &mut got[..tw]);
+
+            let mut wide = [0u8; 16];
+            widen_native_le(native, src, &mut wide[..tw]);
             let mut want = [0u8; 16];
-            encode_pk_column_promoted(&decoded[..sz], t, t, &mut want[..sz]);
-            assert_eq!(got[..sz], want[..sz], "tc={t} v={v}");
-            assert_eq!(got[..sz], opk[..sz], "identity must be the verbatim OPK bytes");
+            encode_pk_column(&wide[..tw], target, &mut want[..tw]);
+            assert_eq!(got[..tw], want[..tw], "src={src} target={target} p={p:#x}");
         }
     }
 }
@@ -220,7 +182,7 @@ fn load_spread(keys: &[u128], nw: usize) -> f64 {
 fn router_spreads_structured_keys_evenly() {
     const N: u128 = 100_000;
     let sequential: Vec<u128> = (0..N).collect();
-    // i64 spanning zero, in the canonical (sign-flipped) routing space.
+    // i64 spanning zero, as OPK images (sign-flipped).
     let signed: Vec<u128> = (0..N)
         .map(|i| (i as i64 - N as i64 / 2) as u64 as u128 ^ (1u128 << 63))
         .collect();
@@ -300,8 +262,8 @@ fn router_spreads_random_keys_evenly() {
 
 /// `worker_for_pk_bytes` on a narrow OPK region is `worker_for_key` of the
 /// widened value, by construction — the invariant that makes a distributed
-/// join's two sides agree, since `ColumnLocator::route_key` funnels through
-/// `widen_pk_be` too.
+/// join's two sides agree, since `ColumnLocator::opk_image` computes the same
+/// integer for a payload column.
 #[test]
 fn worker_for_pk_bytes_matches_widened_key() {
     for &(tc, sz) in &[
@@ -330,47 +292,13 @@ fn worker_for_pk_bytes_matches_widened_key() {
     }
 }
 
-/// `encode_pk_column_promoted` with `src_tc == target_tc` is exactly
-/// `encode_pk_column` — the no-widening fast path.
-#[test]
-fn promoted_identity_matches_encode_pk_column() {
-    for &(tc, sz) in &[
-        (type_code::I8, 1usize),
-        (type_code::I16, 2),
-        (type_code::I32, 4),
-        (type_code::I64, 8),
-        (type_code::U8, 1),
-        (type_code::U16, 2),
-        (type_code::U32, 4),
-        (type_code::U64, 8),
-        (type_code::U128, 16),
-        (type_code::I128, 16),
-    ] {
-        for v in [0i128, 1, -1, 127, -128, i64::MIN as i128, i64::MAX as i128] {
-            let le = v.to_le_bytes();
-            let mut expect = vec![0u8; sz];
-            encode_pk_column(&le[..sz], tc, &mut expect);
-            let mut got = vec![0u8; sz];
-            encode_pk_column_promoted(&le[..sz], tc, tc, &mut got);
-            assert_eq!(got, expect, "no-widening fast path differs for tc={tc} v={v}");
-        }
-    }
-}
-
 // ── Co-partition property: both join sides pack equal values identically.
 
-/// OPK-encode `v` (held in i128, low `wire_stride(tc)` LE bytes are its image)
-/// as source type `tc` into a `target`-width slot, through the exact promoted
-/// encoder both join sides use.
+/// `v`, read at source type `tc`, OPK-encoded into a `target`-width slot.
 fn promote(v: i128, tc: u8, target: u8) -> [u8; 16] {
-    let le = v.to_le_bytes();
+    let key = encode_pk_natives([(tc, target)], [v as u128]);
     let mut out = [0u8; 16];
-    encode_pk_column_promoted(
-        &le[..crate::wire_stride(tc)],
-        tc,
-        target,
-        &mut out[..crate::wire_stride(target)],
-    );
+    out[..key.width()].copy_from_slice(key.pk_bytes());
     out
 }
 

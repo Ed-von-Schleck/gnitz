@@ -2,9 +2,8 @@
 //!
 //! Unlike [`super::shared`], this file is compiled once, inside `gnitz-store`,
 //! so it names crate-internals through `crate::` and needs nothing published on
-//! its behalf — `encode_leading_opk` and `SchemaDescriptor::pk_columns` are both
-//! `pub(crate)` and reachable here, where the shared file would have had to
-//! publish them.
+//! its behalf — `SchemaDescriptor::pk_columns` is `pub(crate)` and reachable
+//! here, where the shared file would have had to publish it.
 
 use std::cmp::Ordering;
 

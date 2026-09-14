@@ -386,7 +386,7 @@ impl ReadCursor {
     pub fn current_key_narrow(&self) -> u128 {
         debug_assert!(self.valid, "current_key_narrow on an invalid cursor");
         let bytes = self.current_pk_bytes();
-        assert!(bytes.len() <= 16, "narrow PK cursor");
+        assert!(bytes.len() <= gnitz_wire::NARROW_PK_MAX_BYTES, "narrow PK cursor");
         gnitz_wire::widen_pk_be(bytes)
     }
 

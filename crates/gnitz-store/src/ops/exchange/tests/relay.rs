@@ -561,11 +561,11 @@ fn test_repartition_routing_contract() {
     assert_eq!(total_rows(&sub_batches), vals.len());
 
     for &v in &vals {
-        // Routing by a payload column uses the canonical route key (signed
-        // columns are sign-flipped via payload_route_key) so a payload FK
-        // routes identically to the same value stored as a PK column.
-        let route_key = gnitz_wire::payload_route_key(&v.to_le_bytes(), 0, 8, type_code::I64);
-        let expected_worker = worker_for_key(route_key, num_workers);
+        // Routing by a payload column uses the value's OPK image, so a payload
+        // FK routes identically to the same value stored as a PK column.
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut opk);
+        let expected_worker = worker_for_pk_bytes(&opk, num_workers);
         let found = (0..sub_batches[expected_worker].count).any(|r| {
             i64::from_le_bytes(
                 sub_batches[expected_worker].col_data(0)[r * 8..r * 8 + 8]

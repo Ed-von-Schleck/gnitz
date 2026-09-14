@@ -186,74 +186,32 @@ impl ColumnLocator {
         }
     }
 
-    /// Encode this column's value in `row` as the OPK image of `out_tc`, into
-    /// `dst` (exactly `out_tc`'s width). For an **integer** source: order-
-    /// preserving, sign-correct and equality-correct at any source width, and the
-    /// identity copy when `out_tc` already equals this column's type. A **float**
-    /// source is equality-correct only: `widen_native_le` sign-extends on
-    /// `is_signed_int`, false for F32/F64, so `-1.0` encodes above `1.0`.
-    /// Callers must [`Self::is_null`]-gate a nullable payload column first.
-    ///
-    /// One method rather than the same dispatch at each site because index-key
-    /// projection and join-key repartitioning must emit byte-identical keys for
-    /// one logical value.
+    /// Write this column's value in `row` as `out_tc`'s OPK bytes into `dst`; `out_tc`
+    /// must hold every value of this column's type. Index projection and join
+    /// repartitioning both encode through here, so their keys agree byte for byte.
     #[inline(always)]
     pub fn encode_opk_promoted(&self, mb: &impl RowSource, row: usize, out_tc: u8, dst: &mut [u8]) {
-        let src = self.bytes(mb, row);
-        match *self {
-            ColumnLocator::Pk { type_code, .. } => gnitz_wire::promote_opk_column(src, type_code, out_tc, dst),
-            ColumnLocator::Payload { type_code, .. } => {
-                gnitz_wire::encode_pk_column_promoted(src, type_code, out_tc, dst)
-            }
-        }
+        gnitz_wire::store_opk_image(self.opk_image(mb, row), self.type_code(), self.size(), out_tc, dst);
     }
 
-    /// Canonical native u128 key for the value in `row` (sign-aware; the form
-    /// `has_pk` and the index seeks compare on). A NULL payload cell has no key,
-    /// so a caller over a nullable column reads through [`Self::native_key_opt`];
-    /// a PK column is never null.
+    /// The value's image: its OPK bytes at its own type as a big-endian integer, which
+    /// a payload column computes from its native bytes. `is_null`-gate first; a
+    /// STRING/BLOB column's content is the caller's to hash.
     #[inline(always)]
-    pub fn native_key(&self, mb: &impl RowSource, row: usize) -> u128 {
+    pub fn opk_image(&self, mb: &impl RowSource, row: usize) -> u128 {
+        let cell = self.bytes(mb, row);
         match *self {
-            ColumnLocator::Pk { byte_off, size, type_code } => {
-                gnitz_wire::pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code)
+            ColumnLocator::Pk { .. } => gnitz_wire::widen_pk_be(cell),
+            ColumnLocator::Payload { size, type_code, .. } => {
+                // `opk_bias`'s u128 shift, spelled at the cell's width: −8% instructions on
+                // `reindex_pack_bench` against the `u128` form.
+                let signed = gnitz_wire::is_signed_int(type_code);
+                if size == 16 {
+                    u128::from_le_bytes(cell.try_into().unwrap()) ^ ((signed as u128) << 127)
+                } else {
+                    (gnitz_wire::read_unsigned_exact(cell) ^ ((signed as u64) << (size * 8 - 1))) as u128
+                }
             }
-            ColumnLocator::Payload { slot, size, type_code } => gnitz_wire::payload_native_key(
-                mb.get_col_ptr(row, slot as usize, size as usize),
-                0,
-                size as usize,
-                type_code,
-            ),
-        }
-    }
-
-    /// [`Self::native_key`] with its NULL gate folded in: `None` for a NULL
-    /// payload cell, and always `Some` for a PK column, which cannot be null.
-    #[inline(always)]
-    pub fn native_key_opt(&self, mb: &impl RowSource, row: usize) -> Option<u128> {
-        (!self.is_null(mb, row)).then(|| self.native_key(mb, row))
-    }
-
-    /// Canonical sign-aware *routing* key for the value in `row` — the form
-    /// `worker_for_pk_bytes` compares on, and the routing counterpart to
-    /// [`Self::native_key`]. A PK column widens its OPK
-    /// bytes; a payload column OPK-encodes then widens, so equal logical values
-    /// route to the same worker whether stored as a PK or a payload column.
-    /// Callers must `is_null`-gate first. STRING/BLOB have no order-preserving
-    /// routing image (this returns `payload_route_key`'s raw low-8-byte image for
-    /// them); a caller routing by string content hashes it before reaching here.
-    #[inline(always)]
-    pub fn route_key(&self, mb: &impl RowSource, row: usize) -> u128 {
-        match *self {
-            ColumnLocator::Pk { byte_off, size, .. } => {
-                gnitz_wire::pk_route_key(mb.get_pk_bytes(row), byte_off as usize, size as usize)
-            }
-            ColumnLocator::Payload { slot, size, type_code } => gnitz_wire::payload_route_key(
-                mb.get_col_ptr(row, slot as usize, size as usize),
-                0,
-                size as usize,
-                type_code,
-            ),
         }
     }
 }

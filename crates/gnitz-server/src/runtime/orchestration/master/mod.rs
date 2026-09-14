@@ -15,7 +15,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::catalog::CatalogEngine;
 use gnitz_store::schema::{IndexKeySpec, SchemaDescriptor};
-use gnitz_wire::{payload_native_key, pk_native_key};
 use gnitz_wire::{BoundPeek, PkColList};
 
 use crate::query::RelayRoute;

@@ -34,14 +34,10 @@ fn pk_locator_reads_decode_the_opk_sign_flip() {
         unsigned.native_le_bytes(&v, 2, &mut scratch),
         &u32::MAX.to_le_bytes()[..]
     );
-    // `native_key` is the zero-extended two's-complement value.
-    assert_eq!(signed.native_key(&v, 0), (-1i64) as u64 as u128);
-    assert_eq!(signed.native_key(&v, 2), i64::MIN as u64 as u128);
-    assert_eq!(unsigned.native_key(&v, 0), 7u128);
-    // `route_key` is the widened OPK image — sign-flipped, so -1 lands below 0.
-    assert!(signed.route_key(&v, 2) < signed.route_key(&v, 0));
-    assert!(signed.route_key(&v, 0) < signed.route_key(&v, 1));
-    assert_eq!(unsigned.route_key(&v, 0), 7u128);
+    // `opk_image` is the widened OPK image — sign-flipped, so -1 lands below 0.
+    assert!(signed.opk_image(&v, 2) < signed.opk_image(&v, 0));
+    assert!(signed.opk_image(&v, 0) < signed.opk_image(&v, 1));
+    assert_eq!(unsigned.opk_image(&v, 0), 7u128);
     // `decode_i64` fuses the OPK inverse with the widening, so it must land on
     // the same value the two-step read does at both signednesses and widths.
     assert_eq!(signed.decode_i64(&v, 0, gnitz_wire::FixedInt::I64), -1);
@@ -49,11 +45,7 @@ fn pk_locator_reads_decode_the_opk_sign_flip() {
     assert_eq!(unsigned.decode_i64(&v, 2, gnitz_wire::FixedInt::U32), u32::MAX as i64);
 }
 
-/// `encode_opk_promoted` exists so that index-key projection and join-key
-/// repartitioning emit byte-identical keys for one logical value. The two reach
-/// it through *different* arms — a PK column re-encodes an OPK image, a payload
-/// column encodes native LE — so the property only holds if both arms agree, and
-/// nothing else in the suite drives them against each other.
+/// A PK column and a payload column holding one value promote to the same bytes.
 #[test]
 fn a_promoted_key_is_the_same_bytes_whichever_arm_encodes_it() {
     // One logical U32 value in a PK column and in a payload column of the same
@@ -117,11 +109,9 @@ fn payload_locator_reads_are_verbatim_native_le() {
     assert_eq!(narrow.bytes(&v, 1), &(-3i32).to_le_bytes()[..]);
     let mut scratch = [0u8; 16];
     assert_eq!(narrow.native_le_bytes(&v, 1, &mut scratch), &(-3i32).to_le_bytes()[..]);
-    assert_eq!(narrow.native_key(&v, 1), (-3i32) as u32 as u128);
     // A 16-byte cell reads all 16 bytes, not a zero-extended low 8.
     assert_eq!(wide.bytes(&v, 2), &(1u128 << 100).to_le_bytes()[..]);
-    assert_eq!(wide.native_key(&v, 2), 1u128 << 100);
-    assert_eq!(wide.route_key(&v, 2), 1u128 << 100);
+    assert_eq!(wide.opk_image(&v, 2), 1u128 << 100);
 }
 
 #[test]
@@ -135,25 +125,60 @@ fn is_null_reads_the_addressed_slot_bit() {
     assert!(!slot2.is_null(&v, 0));
     assert!(!slot0.is_null(&v, 1), "a set bit at slot 2 must not read as slot 0");
     assert!(!pk.is_null(&v, 1), "PK columns are never null");
-
-    // `native_key_opt` is that gate and `native_key` in one: no key for a NULL
-    // payload cell, and never `None` on a PK column.
-    assert_eq!(slot2.native_key_opt(&v, 1), None);
-    assert_eq!(slot2.native_key_opt(&v, 0), Some(slot2.native_key(&v, 0)));
-    assert_eq!(pk.native_key_opt(&v, 1), Some(pk.native_key(&v, 1)));
 }
 
-/// `order_bits`' integer half against an independent oracle: the OPK promotion
-/// the rest of the engine keys on. `encode_pk_column_promoted` into the type's own
-/// index key type is the same total order in big-endian bytes and has its own
-/// tests, so this pins the AVI's stored byte format without restating it.
+/// One value has one image whether a PK or a payload column holds it.
+#[test]
+fn opk_image_agrees_across_regions() {
+    const PATTERNS: &[u128] = &[
+        0,
+        1,
+        2,
+        0x7F,
+        0x80,
+        0xFF,
+        0x100,
+        i64::MAX as u128,
+        1 << 63,
+        u64::MAX as u128,
+        1 << 64,
+        i128::MAX as u128,
+        1 << 127,
+        u128::MAX,
+    ];
+    for t in gnitz_wire::TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let (type_code, w) = (*t as u8, t.wire_stride());
+        let mut v = TestView::new(PATTERNS.len(), w);
+        assert_eq!(v.push_col(w), 0);
+        for (row, p) in PATTERNS.iter().enumerate() {
+            let native = &p.to_le_bytes()[..w];
+            v.set_pk_col(row, 0, native, type_code);
+            v.set_payload(row, 0, native);
+        }
+        let from_pk = ColumnLocator::Pk { byte_off: 0, size: w as u8, type_code };
+        let from_payload = ColumnLocator::Payload { slot: 0, size: w as u8, type_code };
+        for (row, p) in PATTERNS.iter().enumerate() {
+            let mut opk = [0u8; 16];
+            gnitz_wire::encode_pk_column(&p.to_le_bytes()[..w], type_code, &mut opk[..w]);
+            let want = gnitz_wire::widen_pk_be(&opk[..w]);
+            assert_eq!(from_pk.opk_image(&v, row), want, "tc={type_code} p={p:#x}: pk arm");
+            assert_eq!(
+                from_payload.opk_image(&v, row),
+                want,
+                "tc={type_code} p={p:#x}: payload arm"
+            );
+        }
+    }
+}
+
+/// `order_bits`' integer half is the value's index key (`encode_pk_natives` at
+/// `index_key_type`), on both arms.
 #[test]
 fn order_bits_matches_the_opk_promotion_on_both_arms() {
-    fn oracle(native_le: &[u8], type_code: u8) -> u64 {
-        let mut key = [0u8; 8];
+    fn oracle(native: u64, type_code: u8) -> u64 {
         let target = gnitz_wire::index_key_type(type_code).unwrap();
-        gnitz_wire::encode_pk_column_promoted(native_le, type_code, target, &mut key);
-        u64::from_be_bytes(key)
+        let key = gnitz_wire::encode_pk_natives([(type_code, target)], [native as u128]);
+        u64::from_be_bytes(key.pk_bytes().try_into().unwrap())
     }
 
     // (FixedInt, type code, the values to check as raw native-LE u64s.)
@@ -195,7 +220,7 @@ fn order_bits_matches_the_opk_promotion_on_both_arms() {
         let from_payload = ColumnLocator::Payload { slot: 0, size: w as u8, type_code };
         let kind = ScalarKind::Int(fi);
         for (row, &x) in vals.iter().enumerate() {
-            let want = oracle(&x.to_le_bytes()[..w], type_code);
+            let want = oracle(x, type_code);
             assert_eq!(from_pk.order_bits(&v, row, kind), want, "{fi:?} pk arm, value {x:#x}");
             assert_eq!(
                 from_payload.order_bits(&v, row, kind),

@@ -8,13 +8,13 @@ use crate::storage::MemBatch;
 use gnitz_expr::RowSource;
 
 /// Whether the group key of `group_by_cols` can be emitted through the
-/// canonical (order-preserving) fast path — `ColumnLocator::route_key` on the
+/// canonical (order-preserving) fast path — `ColumnLocator::opk_image` on the
 /// single group column — rather than the XXH3 fold (multi-column, nullable, or
 /// non-routable type). Two shapes qualify: a single PK (sub-)column, whose OPK
 /// window widens directly; and a single non-nullable routable-int payload
 /// column, which OPK-encodes then widens to the same image — so a value routes
 /// identically whether it is the PK on one side of a join or a payload FK on
-/// the other. `route_key` dispatches on the locator, so the two need no
+/// the other. `opk_image` dispatches on the locator, so the two need no
 /// separate arm here.
 ///
 /// A canonical key is **injective** on the group value, which is what lets a
@@ -37,8 +37,8 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
         .is_some_and(|_| schema.columns[c].nullable == 0 && gnitz_wire::is_pk_eligible(schema.columns[c].type_code))
 }
 
-/// The 128-bit group key of a row: the canonical single-column route key where
-/// the group set has one, else an XXH3 fold of the per-column canonical
+/// The 128-bit group key of a row: the single group column's OPK image where
+/// the group set is canonical, else an XXH3 fold of the per-column canonical
 /// material. Per-column locators are resolved once at bake time, so the per-row
 /// body is the fold alone.
 ///
@@ -66,7 +66,7 @@ impl GroupKeyCols {
         }
     }
 
-    /// The single column the group key is the canonical `route_key` of, or
+    /// The single column the group key is the canonical `opk_image` of, or
     /// `None` when the key is the hash fold. `Some` is exactly "the key is
     /// injective and order-preserving on the group value".
     #[inline]
@@ -80,7 +80,7 @@ impl GroupKeyCols {
     #[inline]
     pub(super) fn key_row<R: RowSource>(&self, src: &R, row: usize) -> u128 {
         if let Some(col) = self.canonical_col() {
-            return col.route_key(src, row);
+            return col.opk_image(src, row);
         }
         self.cols.key_row(src, row, src.get_null_word(row))
     }

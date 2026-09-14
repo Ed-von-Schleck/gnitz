@@ -120,12 +120,12 @@ fn test_fk_invalid_targets() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_fk_narrowing_child_rejected ─────────────────────────────────
+// ── test_fk_child_type_must_equal_parent ─────────────────────────────
 
-/// I64 and I32 promote to the same index-key code, so a promoted-equality gate
-/// admitted the pair and the lone-PK probe then wrote 8 bytes into a 4-byte slot.
+/// FK values are compared as the referenced column's key image, which is injective
+/// at one type only, so a child column must carry exactly the parent's type.
 #[test]
-fn test_fk_narrowing_child_rejected() {
+fn test_fk_child_type_must_equal_parent() {
     let dir = temp_dir("fk_narrowing");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -144,12 +144,22 @@ fn test_fk_narrowing_child_rejected() {
         .expect_err("a narrowing FK child must be refused");
     assert!(err.contains("FK type mismatch"), "got: {err}");
 
-    // The widening direction the encoder handles correctly stays admitted.
+    // A narrower child: SQL rewrites it to the parent's type, so the engine
+    // refuses it too.
     let widening = vec![
         col_def("cid", type_code::I64),
         fk_def("pid", type_code::I16, parent_tid, 0),
     ];
-    engine.create_table("public.c_wide", &widening, &[0]).unwrap();
+    let err = engine
+        .create_table("public.c_wide", &widening, &[0])
+        .expect_err("a narrower FK child must be refused");
+    assert!(err.contains("FK type mismatch"), "got: {err}");
+
+    let same = vec![
+        col_def("cid", type_code::I64),
+        fk_def("pid", type_code::I32, parent_tid, 0),
+    ];
+    engine.create_table("public.c_same", &same, &[0]).unwrap();
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

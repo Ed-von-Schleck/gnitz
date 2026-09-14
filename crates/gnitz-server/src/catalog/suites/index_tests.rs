@@ -1520,7 +1520,7 @@ fn index_key_spec_equals_projected_leading_span() {
 // ── Signed secondary-index ordering (order-preserving signed leading key) ────
 
 /// Zero-extended native u128 (two's-complement low `sz` bytes) of a value — the
-/// exact form `payload_native_key`/`pk_native_key` produce.
+/// form a `RangeDescriptor` carries.
 fn native_u128_at(v: i64, sz: usize) -> u128 {
     let mask = if sz >= 16 { u128::MAX } else { (1u128 << (sz * 8)) - 1 };
     (v as u64 as u128) & mask
@@ -1545,12 +1545,8 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
 
 #[test]
 fn signed_index_width_ladder_promotes_to_i64_and_orders() {
-    // Every signed width promotes to the 8-byte signed I64 index key (so the
-    // record stride is unchanged) and produces an ORDER-PRESERVING leading key
-    // at its own width — the `encode_pk_column_promoted` sign-extension puts
-    // negatives below non-negatives, the invariant a future range / ordered
-    // index scan relies on. Fails under the old U64 promotion (negatives sorted
-    // AFTER non-negatives); passes now.
+    // Every signed width promotes to the 8-byte I64 index key, and its spans sort
+    // numerically — negatives below non-negatives.
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
     use gnitz_wire::type_code as tc;
     for &(t, sz) in &[(tc::I8, 1usize), (tc::I16, 2), (tc::I32, 4), (tc::I64, 8)] {
@@ -1579,19 +1575,11 @@ fn signed_index_width_ladder_promotes_to_i64_and_orders() {
 
 // ── IndexKeySpec::write_span byte-equivalence ───────────────────────────────
 //
-// `write_span` reduces two operand paths to claimed identities: an unpromoted PK
-// source is copied verbatim out of the OPK region (skipping decode∘encode), and
-// a payload source is handed to the encoder straight from its slot (skipping the
-// widen-into-u128-and-reslice). A wrong byte in either silently corrupts a
-// secondary index, so both are pinned against an explicit oracle rather than
-// inferred — plus a structural gate on the source→index type pair set the
-// identities depend on.
+// A wrong `write_span` byte silently corrupts a secondary index, so both source
+// regions are pinned against an independent oracle.
 
-/// Independent oracle for `write_span`: `IndexKeySpec::seek_prefix` is the
-/// **seek-side** encoder, maintained separately, and it consumes native `u128`
-/// values rather than reading a row — so feeding it `ColumnLocator::native_key`
-/// exercises a read path `write_span` no longer takes (`write_span` reads raw
-/// `bytes` and promotes; this decodes to native first). `None` is the NULL skip.
+/// Oracle for `write_span`: decodes each column to its native value and encodes
+/// through the seek side. `None` is the NULL skip.
 fn write_span_reference(
     owner: &SchemaDescriptor,
     spec: &IndexKeySpec,
@@ -1605,7 +1593,11 @@ fn write_span_reference(
         if loc.is_null(mb, row) {
             return None;
         }
-        natives.push(loc.native_key(mb, row));
+        let mut scratch = [0u8; 16];
+        let native = loc.native_le_bytes(mb, row, &mut scratch);
+        let mut wide = [0u8; 16];
+        wide[..native.len()].copy_from_slice(native);
+        natives.push(u128::from_le_bytes(wide));
     }
     Some(spec.seek_prefix(&natives))
 }
@@ -1674,10 +1666,8 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
 
 #[test]
 fn write_span_matches_seek_prefix_across_type_ladder() {
-    // Write/seek byte-equality: the projected leading-key span (write side) must
-    // byte-equal `index_opk_prefix` (seek side) for the same value, at every
-    // type — the equality a partial application of the signed-encoding change
-    // would break (and which keeps `WHERE col = v` seeks correct).
+    // The projected span must byte-equal `seek_prefix` for the same value at every
+    // type, or `WHERE col = v` seeks miss.
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
     use gnitz_wire::type_code as tc;
     let cases: &[(u8, usize, &[i64])] = &[
@@ -1708,7 +1698,7 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
         for &v in values {
             let native = native_u128_at(v, sz);
             let write_span = project_leading_span(src, &idx, native);
-            let seek = gnitz_store::schema::key::index_opk_prefix(native, t, idx_type);
+            let seek = IndexKeySpec::new(&[1], &src).unwrap().seek_prefix(&[native]);
             assert_eq!(
                 &write_span[..],
                 seek.padded(idx_size),

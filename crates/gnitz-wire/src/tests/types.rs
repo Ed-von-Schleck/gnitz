@@ -68,10 +68,6 @@ fn type_predicates_partition_the_type_table() {
 /// unsigned ≤8-byte ints → U64, signed ≤8-byte ints → I64 (an order-preserving
 /// signed leading key), U128/UUID keep their width, everything else is
 /// index-ineligible.
-///
-/// Width equality coincides with type identity, which is what makes
-/// `promote_opk_column`'s identity arm length-safe *and* makes
-/// `src_tc == target_tc` the correct selector for it.
 #[test]
 fn index_key_type_pins_the_whole_promotion_map() {
     use type_code as tc;

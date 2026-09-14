@@ -42,14 +42,14 @@ fn test_worker_filter_empty_in_empty_out() {
 }
 
 /// The `ScatterKey` collapse replaced the single-column `route_partition_key`
-/// (routable-int → `route_key`, string → `german_string_promote_key`) and the
+/// (routable-int → `opk_image`, string → `german_string_promote_key`) and the
 /// `compound_join_packer` path with one packed-`ReindexPacker` route.
 /// For every reachable `JoinKey` shape, the packed owner must equal
 /// what the pre-collapse routing produced — so no row moves workers. The
 /// NULL arms are null-blind by design (they read the canonically-zeroed key
 /// slot), exactly as the deleted `route_partition_key` was.
 #[test]
-fn test_scatter_key_packed_matches_legacy_routing() {
+fn test_scatter_key_packed_matches_image_routing() {
     use crate::storage::MemBatch;
 
     // Run the `JoinKey` `ScatterKey` over `row` and return its worker.
@@ -83,8 +83,8 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         b.count += 1;
         let mb = b.as_mem_batch();
         for row in 0..2 {
-            // Legacy: routable-int → loc.route_key → worker_for_key (null-blind).
-            let legacy = worker_for_key(schema.locate(1).route_key(&mb, row), NW);
+            // Image: routable-int → loc.opk_image → worker_for_key (null-blind).
+            let legacy = worker_for_key(schema.locate(1).opk_image(&mb, row), NW);
             assert_eq!(packed(&schema, &[1], &mb, row), legacy, "I64 row {row}");
         }
     }
@@ -111,7 +111,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         b.count += 1;
         let mb = b.as_mem_batch();
         for row in 0..2 {
-            // Legacy: string → german_string_promote_key → worker_for_key.
+            // Image: string → german_string_promote_key → worker_for_key.
             let legacy = worker_for_key(
                 crate::schema::key::german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob),
                 NW,
@@ -121,7 +121,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
     }
 
     // (5) U128 payload key: `is_pk_eligible` includes U128, so the
-    // wide arm of `loc.route_key` fed `worker_for_key`.
+    // wide arm of `loc.opk_image` fed `worker_for_key`.
     {
         let schema = SchemaDescriptor::new(
             &[
@@ -137,13 +137,13 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         b.extend_col(0, &(u128::MAX - 7).to_le_bytes());
         b.count += 1;
         let mb = b.as_mem_batch();
-        let legacy = worker_for_key(schema.locate(1).route_key(&mb, 0), NW);
+        let legacy = worker_for_key(schema.locate(1).opk_image(&mb, 0), NW);
         assert_eq!(packed(&schema, &[1], &mb, 0), legacy, "U128 payload");
     }
 
     // (6) single sub-column of a compound PK — the one legacy join-key
     // shape that fell through `route_partition_key`'s non-PK guard to the
-    // group fold `GroupKeyCols::key_row` (its Pk arm is `pk_route_key`).
+    // group fold `GroupKeyCols::key_row` (its Pk arm is `opk_image`).
     {
         let schema = SchemaDescriptor::new(
             &[

@@ -367,9 +367,8 @@ pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
 /// mis-order a BLOB key. In `gnitz-wire` because the client-side comparators are
 /// held to the same order as the engine's.
 ///
-/// `#[inline(always)]` for the reason [`crate::promote_opk_column`] carries it:
-/// this is one payload comparison of a sort, monomorphised into crates that
-/// build at opt-level 0, where a plain hint inlines nothing.
+/// `#[inline(always)]`: one payload comparison of a sort, monomorphised into
+/// crates that build at opt-level 0, where a plain hint inlines nothing.
 #[inline(always)]
 pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_code: u8) -> Ordering {
     if is_german_string(type_code) {
@@ -720,14 +719,6 @@ pub const fn int_domain_fits(src: u8, target: u8) -> bool {
     } else {
         is_signed_int(target) && wire_stride(target) > wire_stride(src)
     }
-}
-
-/// Whether an FK child of type `child` may reference a parent of type `parent`:
-/// the same type, or a domain that fits inside it — exactly the precondition
-/// [`encode_pk_column_promoted`] needs, the parent slot never narrower than the
-/// value it must hold.
-pub const fn fk_child_fits(child: u8, parent: u8) -> bool {
-    child == parent || int_domain_fits(child, parent)
 }
 
 /// True iff `target` is a value-preserving *widening promotion* of `src` — the
@@ -1142,7 +1133,7 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     // cannot represent the unsigned operand's full range, so distinct values
     // would alias — and (b) at least as wide as the signed operand. The unsigned
     // side zero-extends and the signed side sign-extends into it
-    // (`encode_pk_column_promoted`), so equal numeric values pack byte-identically.
+    // (`store_opk_image`), so equal numeric values pack byte-identically.
     // wu ∈ {1,2,4,8,16}; only a U128/UUID unsigned operand (wu == 16) needs a
     // signed-256 type that does not exist → None.
     if is_pk_eligible(l) && is_pk_eligible(r) {

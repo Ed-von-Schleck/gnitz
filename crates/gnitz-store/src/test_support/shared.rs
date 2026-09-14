@@ -245,12 +245,10 @@ pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) ->
 /// produces. Signed columns are passed as `v as u128` (the low `size()`
 /// little-endian bytes are the two's-complement image the encoder sign-flips).
 ///
-/// Read back out of a one-row batch rather than encoded here, so the oracle is
-/// [`Batch::extend_pk_opk`] itself and not a second spelling of it.
+/// The oracle is `opk_key_cols` itself — the encoder the ingest path writes
+/// through — not a second spelling of it.
 pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
-    let mut b = Batch::with_capacity(schema, 1);
-    b.extend_pk_opk(vals);
-    b.get_pk_bytes(0).to_vec()
+    gnitz_store::schema::key::opk_key_cols(schema, vals).pk_bytes().to_vec()
 }
 
 /// [`make_batch_raw`] over [`make_schema_u128_i64`]-shaped schemas — native

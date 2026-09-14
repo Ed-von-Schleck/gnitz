@@ -87,15 +87,16 @@ fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
         .with_placement(schema.placement())
 }
 
-/// Build a check batch from narrow `u128` keys, encoded through [`enc_key`].
-/// `src_type` is the type of the column they came from — the child FK column,
-/// or the parent PK/indexed column — which is what a signed source sign-extends
-/// from. The source-PK suffix of an index key is left zero: only the leading
-/// column is prefix-matched.
-fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128], src_type: u8) -> Batch {
+/// A check batch whose rows carry `keys` — images at type `ref_tc` — in the leading
+/// key column of `schema`'s PK, the rest of each key zero.
+fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128], ref_tc: u8) -> Batch {
+    let key_tc = schema.columns[schema.pk_indices()[0] as usize].type_code;
+    let (ref_w, key_w) = (gnitz_wire::wire_stride(ref_tc), gnitz_wire::wire_stride(key_tc));
+    let mut key = [0u8; gnitz_wire::MAX_PK_BYTES];
     let mut batch = Batch::with_capacity(schema, keys.len());
     for &k in keys {
-        batch.push_key_row(enc_key(schema, k, src_type).pk_bytes(), 1);
+        gnitz_wire::store_opk_image(k, ref_tc, ref_w, key_tc, &mut key[..key_w]);
+        batch.push_key_row(&key[..schema.pk_stride()], 1);
     }
     batch
 }
@@ -391,19 +392,6 @@ impl UniquePlan<'_> {
     fn span(&self, i: u32) -> &[u8] {
         &self.probe_key(i)[..self.spec.key_size()]
     }
-}
-
-/// Encode a native value `v` (from a column of type `src_type`) into the OPK
-/// leading-key image of `schema`'s primary key — the one encoder for these
-/// probe keys, so a reply that echoes one compares byte-identical.
-///
-/// The leading key column is `pk_indices()[0]`, not `columns[0]`: it is column
-/// 0 for an index schema and for a projected probe schema, but a catalog
-/// schema's lone PK may be declared at any position.
-fn enc_key(schema: &SchemaDescriptor, v: u128, src_type: u8) -> PkBuf {
-    let key_col = schema.pk_indices()[0] as usize;
-    let idx_key_type = schema.columns[key_col].type_code;
-    gnitz_store::schema::key::index_opk_prefix(v, src_type, idx_key_type).widened(schema.pk_stride())
 }
 
 /// Fire every check in `checks` as ONE SAL cut and drain the replies, handing
@@ -834,7 +822,9 @@ fn plan_fk_existence(
         let mut seen: FxHashSet<u128> = FxHashSet::default();
         let mut values: Vec<u128> = Vec::new();
         for (_pk, fam, row) in b.surviving(tid) {
-            let Some(v) = loc.native_key_opt(b.mem(fam), row as usize) else {
+            let m = b.mem(fam);
+            let r = row as usize;
+            let Some(v) = (!loc.is_null(m, r)).then(|| loc.opk_image(m, r)) else {
                 continue;
             };
             if seen.insert(v) {
@@ -850,7 +840,7 @@ fn plan_fk_existence(
         // selector routes by broadcast since index entries are distributed
         // independently of the PK.
         let parent_schema = disp.cat().registry().relation_or_err(parent_tid)?.schema();
-        let src_type = loc.type_code();
+        let ref_tc = loc.type_code();
         let (key_schema, keyspace) = if parent_schema.is_lone_pk_col(parent_col) {
             (probe_schema(&parent_schema), Keyspace::OwnPk)
         } else {
@@ -867,7 +857,7 @@ fn plan_fk_existence(
             keyspace,
             mode: gnitz_wire::WireProbeMode::Exists,
             mode_param: 0,
-            batch: build_check_batch(&key_schema, &values, src_type),
+            batch: build_check_batch(&key_schema, &values, ref_tc),
             schema: wire::WireSchema::encoded(parent_tid, key_schema),
             reply: None,
         });
@@ -967,32 +957,22 @@ async fn resolve_parent_deltas(
     // The reply's one payload column, off the projected schema rather than the
     // parent's — and not column 0, since `project_schema` keeps the PK region
     // ahead of it.
-    let locators: Vec<(usize, usize, u8)> = checks
+    let locators: Vec<ColumnLocator> = checks
         .iter()
         .map(|c| {
             let expected = c.reply.as_ref().expect("a projecting probe carries its reply schema");
-            let projected = SchemaFacts::payload_col_idx(expected, 0);
-            let ColumnLocator::Payload { slot, size, type_code } = expected.locate(projected) else {
-                unreachable!("a projecting probe answers with one payload column")
-            };
-            (slot as usize, size as usize, type_code)
+            expected.locate(SchemaFacts::payload_col_idx(expected, 0))
         })
         .collect();
 
-    // `pk → promoted index key`, absent when the committed row is absent or
-    // holds NULL there — a NULL referenced value is unindexed either way.
+    // `pk → key image`, absent when the committed row is absent or holds NULL
+    // there — a NULL referenced value is unindexed either way.
     let mut gathered: Vec<FxHashMap<PkBuf, u128>> = (0..checks.len()).map(|_| FxHashMap::default()).collect();
     execute_probe_burst(disp, &checks, |i, rows| {
-        let (slot, size, type_code) = locators[i];
-        // Invariant across a frame's rows, where `ColumnLocator`'s own readers
-        // re-resolve the window per row through `get_col_ptr`.
-        let col_data = rows.col_data(slot, size);
+        let loc = locators[i];
         for j in 0..rows.len() {
-            if !gnitz_wire::null_word_get(rows.get_null_word(j), slot) {
-                gathered[i].insert(
-                    PkBuf::from_bytes(rows.get_pk_bytes(j)),
-                    payload_native_key(col_data, j * size, size, type_code),
-                );
+            if !loc.is_null(rows, j) {
+                gathered[i].insert(PkBuf::from_bytes(rows.get_pk_bytes(j)), loc.opk_image(rows, j));
             }
         }
         Ok(())
@@ -1027,10 +1007,10 @@ fn parent_retired_added(
 
     // Old committed value per touched PK (non-NULL only).
     let mut old_of: FxHashMap<&[u8], u128> = FxHashMap::default();
-    if let ColumnLocator::Pk { byte_off, size, type_code } = loc {
+    if let ColumnLocator::Pk { byte_off, size, .. } = loc {
         let (off, size) = (byte_off as usize, size as usize);
         for p in b.touched_committed(parent_tid) {
-            old_of.insert(p, pk_native_key(p, off, size, type_code));
+            old_of.insert(p, gnitz_wire::widen_pk_be(&p[off..off + size]));
         }
     } else if let Some(g) = gathered {
         for p in b.touched_committed(parent_tid) {
@@ -1044,7 +1024,10 @@ fn parent_retired_added(
     let mut retired: FxHashMap<u128, RetireVerb> = FxHashMap::default();
     for (p, e) in b.overlay(parent_tid) {
         let surviving_val: Option<u128> = match e.last {
-            FoldOp::Inserted(f, r) => loc.native_key_opt(b.mem(f), r as usize),
+            FoldOp::Inserted(f, r) => {
+                let (m, r) = (b.mem(f), r as usize);
+                (!loc.is_null(m, r)).then(|| loc.opk_image(m, r))
+            }
             FoldOp::Deleted => None,
         };
         if let Some(sv) = surviving_val {
@@ -1070,7 +1053,7 @@ struct RestrictPlan {
     /// Splits a reply entry into `[span ‖ holder PK]`, and re-encodes a
     /// surviving holder's own span for the exemption test.
     spec: IndexKeySpec,
-    /// Probed span → the native referenced value it encodes, paired while the
+    /// Probed span → the referenced value's key image it encodes, paired while the
     /// probe batch is built: a reply names a span, the rejection names a value.
     values: FxHashMap<PkBuf, u128>,
     /// The bundle touches this child, so a committed holder it retires is
@@ -1119,11 +1102,10 @@ async fn txn_check_fk_restrict(
             .and_then(|r| r.index_on(&[fk_col as u32]))
             .map(|ic| (ic.schema(), ic.key_spec()))
             .ok_or_else(|| format!("FK RESTRICT: no index on child {child_tid} col {fk_col}"))?;
-        // `enc_key`, not `IndexKeySpec::seek_prefix`: `v` comes from the
-        // PARENT's column while the index belongs to the child, and the index
-        // owner's own source type would sign-mangle a negative narrow value.
-        let src_type = b.schema(parent_tid).columns[parent_col].type_code;
-        let batch = build_check_batch(&idx_schema, &v_check, src_type);
+        // `v` is a key image, not a native value, so the batch is built by
+        // `build_check_batch`.
+        let ref_tc = b.schema(parent_tid).columns[parent_col].type_code;
+        let batch = build_check_batch(&idx_schema, &v_check, ref_tc);
         let key_size = spec.key_size();
         let mut values: FxHashMap<PkBuf, u128> = FxHashMap::default();
         for (j, &v) in v_check.iter().enumerate() {

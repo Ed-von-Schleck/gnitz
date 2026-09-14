@@ -809,8 +809,7 @@ impl Batch {
     /// `BatchBuilder::begin_row_opk`, and through it the `SysRowSink` the
     /// catalog writes rows with, dispatches to.
     pub fn extend_pk_opk(&mut self, native_col_vals: &[u128]) {
-        let cols = self.schema.pk_columns().map(|(_, col)| (col.type_code, *col));
-        self.extend_pk_bytes(crate::schema::key::encode_leading_opk(cols, native_col_vals).pk_bytes());
+        self.extend_pk_bytes(crate::schema::key::opk_key_cols(&self.schema, native_col_vals).pk_bytes());
     }
 
     /// Fill `nbytes` of zeros at the current row position in a payload column.

@@ -2,32 +2,23 @@ use super::*;
 use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::type_code;
 
-/// Base table `(label STRING, id U64 PRIMARY KEY)` — PK at column 1. The FK
-/// parent fast-path encodes against a base-table schema whose lone PK may be
-/// declared at any column position; resolving the leading key column from
-/// `columns[0]` (the STRING) would encode the probe at the wrong type and
-/// width, and mangle the existence check.
-///
-/// The probe batch itself is built against `probe_schema`, where the PK is
-/// renumbered to column 0 — so this exercises `enc_key`'s general contract, the
-/// one that keeps that renumbering an optimisation rather than a premise.
+/// An I32 `-1` image lands as the I64 `-1` an index key holds, source-PK suffix zero.
 #[test]
-fn enc_key_encodes_a_nonleading_pk_at_its_own_column() {
+fn build_check_batch_promotes_the_key_image_into_the_leading_column() {
     let cols = vec![
-        SchemaColumn::new(type_code::STRING, 0),
+        SchemaColumn::new(type_code::I64, 0),
         SchemaColumn::new(type_code::U64, 0),
     ];
-    let schema = SchemaDescriptor::new(&cols, &[1]);
+    let idx = SchemaDescriptor::new(&cols, &[0, 1]);
 
-    let key = enc_key(&schema, 42u128, type_code::U64);
+    let batch = build_check_batch(&idx, &[0x7FFF_FFFFu128], type_code::I32);
 
+    assert_eq!(batch.len(), 1);
     let mut expected = [0u8; 8];
-    gnitz_wire::encode_pk_column(&42u64.to_le_bytes(), type_code::U64, &mut expected);
-    assert_eq!(
-        key.pk_bytes(),
-        &expected[..],
-        "probe key must equal the stored OPK PK for a non-leading PK column"
-    );
+    gnitz_wire::encode_pk_column(&(-1i64).to_le_bytes(), type_code::I64, &mut expected);
+    let key = batch.get_pk_bytes(0);
+    assert_eq!(&key[..8], &expected[..], "the leading column holds the promoted value");
+    assert_eq!(&key[8..], &[0u8; 8], "the source-PK suffix stays zero");
 }
 
 /// A probe batch carries the target's KEY and nothing else, whatever the

@@ -632,22 +632,19 @@ impl SchemaDescriptor {
     pub fn format_pk_bytes(&self, pk_bytes: &[u8]) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut off = 0usize;
-        for &ci in self.pk_indices() {
-            let col = self.columns[ci as usize];
+        for (_, col) in self.pk_columns() {
             let size = col.size() as usize;
-            // Decode OPK back to native before reading the scalar: read as native
-            // LE, a signed column's flipped sign bit renders garbage.
-            let v = gnitz_wire::pk_native_key(pk_bytes, off, size, col.type_code);
+            let mut le = [0u8; 16];
+            gnitz_wire::decode_pk_column(&pk_bytes[off..off + size], col.type_code, &mut le[..size]);
+            let le = &le[..size];
             // Through the storage type: a calendar column renders as the signed
             // integer it is, not as the unsigned fallthrough.
             parts.push(match gnitz_wire::storage_type_code(col.type_code) {
-                type_code::UUID => gnitz_wire::format_uuid(v),
-                type_code::U128 => format!("{v}"),
-                type_code::I64 => format!("{}", v as u64 as i64),
-                type_code::I32 => format!("{}", v as u64 as i32),
-                type_code::I16 => format!("{}", v as u64 as i16),
-                type_code::I8 => format!("{}", v as u64 as i8),
-                _ => format!("{}", v as u64),
+                type_code::UUID => gnitz_wire::format_uuid(u128::from_le_bytes(le.try_into().unwrap())),
+                type_code::U128 => format!("{}", u128::from_le_bytes(le.try_into().unwrap())),
+                type_code::I128 => format!("{}", i128::from_le_bytes(le.try_into().unwrap())),
+                t if gnitz_wire::is_signed_int(t) => format!("{}", gnitz_wire::read_signed_exact(le)),
+                _ => format!("{}", gnitz_wire::read_unsigned_exact(le)),
             });
             off += size;
         }

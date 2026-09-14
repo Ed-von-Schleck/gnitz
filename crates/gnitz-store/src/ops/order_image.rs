@@ -78,7 +78,12 @@ pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -
         v.iter_mut().for_each(|b| *b = !*b);
     }
     match kind {
-        WideKind::Fixed(tc) => gnitz_wire::decode_pk_column_owned(&v, tc as u8).to_vec(),
+        WideKind::Fixed(tc) => {
+            let (n, mut native) = (v.len(), [0u8; 16]);
+            gnitz_wire::decode_pk_column(&v, tc as u8, &mut native[..n]);
+            v.copy_from_slice(&native[..n]);
+            v
+        }
         WideKind::Bytes => {
             debug_assert!(v.ends_with(&[0, 0]), "a byte-string image ends in its terminator");
             let n = v.len() - 2;

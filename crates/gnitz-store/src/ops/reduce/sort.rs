@@ -30,9 +30,8 @@ fn argsort_by_key<K: Ord>(n: usize, key: impl Fn(usize) -> K) -> Vec<u32> {
 /// so the merge is already decided elsewhere.
 ///
 /// The `u64` arm is exact, not a truncation: a canonical key over a ≤8-byte
-/// column fits 64 bits (`pk_route_key` widens a ≤8-byte OPK window;
-/// `payload_route_key`'s narrow arm is an 8-byte unsigned read XOR a sign bit
-/// below `2^63`), and it halves the sorted payload for `GROUP BY <BIGINT>`.
+/// column fits 64 bits (`ColumnLocator::opk_image` of a ≤8-byte column is its
+/// ≤8-byte OPK image), and it halves the sorted payload for `GROUP BY <BIGINT>`.
 pub(super) fn argsort_delta(mb: &MemBatch, keyer: &GroupKeyCols) -> Vec<u32> {
     let n = mb.count;
     if n <= 1 {

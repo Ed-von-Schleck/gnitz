@@ -12,13 +12,8 @@
 //! the legitimate downward direction. This module is the one import path: every
 //! caller, storage included, names `crate::schema::key::X`.
 //!
-//! Native→OPK encoding has a three-way seam, and this module is one face of it:
-//! `gnitz_wire::pk` is the untyped per-column codec shared with the client,
-//! `gnitz_expr::locator` the row-sourced face (what `write_span` and `pack_into`
-//! read through), and this module the schema-typed, value-sourced face — every
-//! such encoder in this crate lives here, so the write, seek and route sides
-//! cannot spell one differently. The client encodes through `gnitz_wire::pk`
-//! directly, so its PK regions are byte-identical to the ones built here.
+//! The per-column codec and tuple encoders are `gnitz_wire::pk`'s, shared with the
+//! client; this module composes schema-typed and row-sourced keys from them.
 
 use std::cmp::Ordering;
 
@@ -35,11 +30,7 @@ use crate::schema::{
 
 /// Raw byte comparator for PK regions.
 ///
-/// After the OPK-at-rest flip every PK region at rest holds order-preserving
-/// big-endian bytes, so unsigned lexicographic byte comparison is numerically
-/// identical to the typed comparison of the PK columns for any width. `a.cmp(b)`
-/// compiles to an optimal `memcmp`. `a` and `b` are the OPK bytes produced by
-/// `Batch::get_pk_bytes` / `MappedShard::get_pk_bytes`.
+/// Unsigned byte order over OPK regions, which is the typed PK order at any width.
 ///
 /// This and [`compare_pk_ordering`] return the same `Ordering` for equal-width
 /// inputs. The rule between them: this one is **total** — it accepts operands of
@@ -126,31 +117,24 @@ pub fn opk_key(schema: &SchemaDescriptor, native_le: &[u8]) -> PkBuf {
         "opk_key: native_le ({}) shorter than pk_stride ({stride})",
         native_le.len(),
     );
-    let mut out = PkBuf::zeroed(0);
-    out.append(stride, |dst| {
-        gnitz_wire::encode_pk_tuple(
-            schema.pk_columns().map(|(_, col)| (col.size() as usize, col.type_code)),
-            &native_le[..stride],
-            dst,
-        );
-    });
-    out
+    gnitz_wire::encode_pk_tuple(
+        schema.pk_columns().map(|(_, c)| (c.size() as usize, c.type_code)),
+        &native_le[..stride],
+    )
 }
 
-/// [`opk_key`]'s per-column form: one native value per PK column, in PK-list
-/// order, rather than one packed native image. Prefer it wherever the caller
-/// holds the columns separately — the packed image leaves which half a column
-/// occupies to convention, and a compound key is where that convention bites.
-///
-/// Encodes through the same `encode_leading_opk` as `Batch::extend_pk_opk`, so a
-/// key built here is byte-identical to the one the ingest path wrote.
+/// [`opk_key`] from one native value per PK column, in PK-list order — prefer it
+/// wherever the columns are held separately.
 pub fn opk_key_cols(schema: &SchemaDescriptor, natives: &[u128]) -> PkBuf {
     debug_assert_eq!(
         natives.len(),
         schema.pk_indices().len(),
         "opk_key_cols: one native value per PK column",
     );
-    encode_leading_opk(schema.pk_columns().map(|(_, col)| (col.type_code, *col)), natives)
+    gnitz_wire::encode_pk_natives(
+        schema.pk_columns().map(|(_, c)| (c.type_code, c.type_code)),
+        natives.iter().copied(),
+    )
 }
 
 /// [`gnitz_wire::control::join_ctrl_key`] then [`opk_key`]: the shared seek-key
@@ -165,53 +149,6 @@ pub fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Res
     let mut le = [0u8; MAX_PK_BYTES];
     gnitz_wire::control::join_ctrl_key(low, extra, &mut le[..stride])?;
     Ok(opk_key(schema, &le[..stride]))
-}
-
-/// OPK-encode native key values into one leading-key span: column `i` reads
-/// `natives[i]`'s low source-width bytes and encodes at its target column's
-/// (possibly promoted) width, packed tightly in span order. The returned
-/// [`PkBuf`] is exactly the span — bytes past it stay zero, so it is also the
-/// minimum full key of its group and may be widened with [`PkBuf::padded`].
-///
-/// The one native→OPK leading-span encoder, shared by the index seek path
-/// (whose sources promote to wider index columns) and the base-table PK range
-/// path (whose source and target types are equal, making the promotion the
-/// identity arm of `encode_pk_column_promoted`).
-///
-/// Its bytes must equal the write side's, which reaches the encoding through
-/// `ColumnLocator::encode_opk_promoted` rather than through here. They do:
-/// both bottom out in `gnitz_wire::encode_pk_column_promoted`, and the write
-/// side's PK arm reaches the same image through `promote_opk_column`, which is
-/// that call composed with `encode_pk_column`'s inverse.
-pub(crate) fn encode_leading_opk(cols: impl IntoIterator<Item = (u8, SchemaColumn)>, natives: &[u128]) -> PkBuf {
-    let mut out = PkBuf::zeroed(0);
-    for ((src_tc, target), native) in cols.into_iter().zip(natives) {
-        out.append(target.size() as usize, |dst| {
-            gnitz_wire::encode_pk_column_promoted(
-                &native.to_le_bytes()[..gnitz_wire::wire_stride(src_tc)],
-                src_tc,
-                target.type_code,
-                dst,
-            );
-        });
-    }
-    out
-}
-
-/// OPK-encode a native index-key value into an index's leading key column, for a
-/// prefix seek or a check-batch composite PK — the scalar sibling of
-/// `IndexKeySpec::seek_prefix` for callers whose source column lives in another
-/// table's schema (FK probes). `src_type` is the *source* column type (the value
-/// in `native` is zero-extended): a signed source sign-extends from its native
-/// width before OPK-encoding at the promoted `idx_key_type`, byte-identical to
-/// the write-side `IndexKeySpec::write_span`.
-///
-/// The returned `PkBuf` is exactly the leading column; a caller matching against
-/// a wider composite (the source-PK suffix is zero) widens it with
-/// [`PkBuf::padded`].
-#[inline]
-pub fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> PkBuf {
-    encode_leading_opk([(src_type, SchemaColumn::new(idx_key_type, 0))], &[native])
 }
 
 // ---------------------------------------------------------------------------
@@ -266,11 +203,14 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
 
 /// The leading eight OPK bytes as a `u64`, right-zero-padded for a narrower key.
 /// A value accessor, where [`pack_pk_be`] is deliberately not one.
+#[inline(always)]
 pub(crate) fn leading_u64(pk_bytes: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    let n = pk_bytes.len().min(8);
-    buf[..n].copy_from_slice(&pk_bytes[..n]);
-    u64::from_be_bytes(buf)
+    if pk_bytes.len() >= 8 {
+        u64::from_be_bytes(pk_bytes[..8].try_into().unwrap())
+    } else {
+        // `pack_pk_be` left-aligns a narrow key with register loads at 2 and 4.
+        (pack_pk_be(pk_bytes) >> 64) as u64
+    }
 }
 
 /// The `stride` OPK bytes of a narrow PK value that is **already in OPK/route
@@ -358,16 +298,7 @@ pub(crate) use pk_width_dispatch;
 impl PkSortKey for u64 {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u64 {
-        // Dispatched only for strides ≤ 8; the `== 8` arm loads the dominant
-        // U64/I64 key straight into a register (no memcpy). The narrower strides
-        // left-align at the MSB end so a raw `u64` compare is the OPK byte order.
-        if opk.len() == 8 {
-            u64::from_be_bytes(opk.try_into().unwrap())
-        } else {
-            let mut x = [0u8; 8];
-            x[..opk.len()].copy_from_slice(opk);
-            u64::from_be_bytes(x)
-        }
+        leading_u64(opk)
     }
 }
 
@@ -407,19 +338,9 @@ impl PkSortKey for [u128; 2] {
 /// The 64-bit fingerprint of an OPK byte span — a row's whole PK region, or an
 /// index's leading-key span. Every approximate-membership structure over OPK
 /// keys derives its key here, so a probe key always equals the key inserted.
-///
-/// A narrow span right-aligns its big-endian bytes into a `u128`; a wider one
-/// collapses to the xxh3 checksum of the whole span. Either way the full span
-/// is hashed to 64 bits, keeping its entropy — this is deliberately not
-/// `worker_for_pk_bytes`, which reduces the same two images to a worker index.
 #[inline]
 pub fn probe_key(opk: &[u8]) -> u64 {
-    let fingerprint = if opk.len() > NARROW_PK_MAX_BYTES {
-        gnitz_wire::checksum(opk) as u128
-    } else {
-        gnitz_wire::widen_pk_be(opk)
-    };
-    gnitz_wire::checksum(&fingerprint.to_le_bytes())
+    gnitz_wire::checksum(opk)
 }
 
 // ---------------------------------------------------------------------------
@@ -527,9 +448,8 @@ impl IndexKeySpec {
         Some(b.finish())
     }
 
-    /// A base table's own PK as the degenerate span: each column encodes at its
-    /// own type, which is `encode_pk_column_promoted`'s identity arm. Lets a PK
-    /// range walk read through the same [`Self::range_keys`] an index walk does.
+    /// A base table's own PK as the degenerate span, each column at its own type, so a
+    /// PK range walk reads through [`Self::range_keys`] as an index walk does.
     pub(crate) fn for_pk(schema: &SchemaDescriptor) -> Self {
         let mut spec = IndexKeySpec {
             n: schema.pk_indices().len() as u8,
@@ -548,24 +468,9 @@ impl IndexKeySpec {
         self.key_size as usize
     }
 
-    /// Write one row's OPK leading-key span into `dst[..key_size()]`. Returns
-    /// `false` (skip — the row is not indexed, `dst` partially written) when ANY
-    /// indexed column is NULL: SQL NULL-distinctness, a row with a NULL in any
-    /// indexed column never collides. The per-column encode is byte-identical
-    /// to the seek-side [`Self::seek_prefix`], so the in-memory key, the
-    /// projected index entry, and the seek prefix agree by construction.
-    ///
-    /// Each column bottoms out in `encode_pk_column_promoted`, sign-extending a
-    /// signed source from its native width before OPK-encoding at the promoted
-    /// index column: the span is order-preserving for every type (a signed source
-    /// promotes to a signed `I64`/`I128` index column whose sign-flip puts
-    /// negatives below non-negatives), and equality-correct (equal logical values
-    /// pack byte-identically regardless of source/target width). A column whose
-    /// source already matches the index type (`U128`/`UUID`, base unsigned ≤8B)
-    /// reduces to a copy of its at-rest OPK window.
-    ///
-    /// The sibling [`ReindexPacker::pack_into`] emits byte-identical keys for one
-    /// logical value; both reach `gnitz_wire::encode_pk_column_promoted`.
+    /// Write one row's leading-key span into `dst[..key_size()]` — the bytes
+    /// [`Self::seek_prefix`] and [`ReindexPacker::pack_into`] produce for the same values.
+    /// `false` when any indexed column is NULL: the row is unindexed, `dst` partly written.
     pub fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
         let mut off = 0;
@@ -613,28 +518,22 @@ impl IndexKeySpec {
     /// insert. `out` comes back `key_size()` wide with a zero tail, so a caller
     /// may take `out.padded(stride)` as the span zero-padded to any wider one.
     pub fn key_bytes(&self, mb: &impl RowSource, row: usize, out: &mut PkBuf) -> bool {
-        out.try_write(self.key_size(), |dst| self.write_span(mb, row, dst))
+        out.write(self.key_size(), |dst| self.write_span(mb, row, dst))
     }
 
-    /// Seek-side counterpart of [`Self::write_span`]: OPK-encode native key
-    /// values (zero-extended, as `pk_native_key`/`payload_native_key` produce
-    /// them) into the leading-key span, returned as a [`PkBuf`] of exactly
-    /// the encoded span's width. Encodes through [`encode_leading_opk`], which
-    /// bottoms out in the same `gnitz_wire::encode_pk_column_promoted` the write
-    /// side reaches, so the seek prefix matches the projected entries. Bytes
-    /// past the span stay zero (the source-PK suffix is not part of it).
-    ///
-    /// A leading-prefix seek passes fewer values than the spec has columns and
-    /// gets the corresponding prefix of the span — the spec's leading `k`
-    /// columns are the same read/encode plan whether or not the trailing ones
-    /// are supplied, so no sub-spec has to be derived to seek by a prefix.
+    /// The leading-key span of `natives`, one per leading spec column as a
+    /// `RangeDescriptor` carries them: what [`Self::write_span`] writes for those values.
+    /// Fewer values than columns give that prefix of the span.
     pub fn seek_prefix(&self, natives: &[u128]) -> PkBuf {
         let k = natives.len();
         debug_assert!(
             k >= 1 && k <= self.n as usize,
             "seek_prefix: one native value per leading spec column"
         );
-        encode_leading_opk(self.cols[..k].iter().map(|c| (c.loc.type_code(), c.out)), natives)
+        gnitz_wire::encode_pk_natives(
+            self.cols[..k].iter().map(|c| (c.loc.type_code(), c.out.type_code)),
+            natives.iter().copied(),
+        )
     }
 
     /// The half-open OPK key range `[start, end)` for `range` over this key
@@ -738,7 +637,7 @@ impl<'a> KeyCut<'a> {
     /// exactly on the first key of the next equality group.
     fn key(&self, stride: usize) -> Option<PkBuf> {
         let mut k = PkBuf::from_bytes(self.group);
-        let exists = !self.above || k.edit(increment_key_in_place);
+        let exists = !self.above || k.write(k.width(), increment_key_in_place);
         exists.then(|| k.widened(stride))
     }
 }
@@ -771,7 +670,7 @@ fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> boo
     let last = match end {
         Some(e) => {
             let mut l = *e;
-            l.edit(decrement_key_in_place);
+            l.write(l.width(), decrement_key_in_place);
             l
         }
         None => PkBuf::max(start.width()),
@@ -828,7 +727,7 @@ impl SchemaDescriptor {
 /// Shared by the group-key fold below and the set-op row-identity hash
 /// (`reindex_hash_row`) so a string column contributes the same bytes to both.
 /// The two *digests* still differ by construction and are meant to: the group
-/// fold streams each column's canonical `route_key` under a `1`/`0` null marker,
+/// fold streams each column's `opk_image` under a `1`/`0` null marker,
 /// the row hash streams raw native cell bytes under the inverted marker and a
 /// leading branch discriminator. Only this per-column body is shared.
 #[inline]
@@ -858,10 +757,9 @@ fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, nul
         ColumnLocator::Payload { slot, size, type_code } if gnitz_wire::is_german_string(type_code) => {
             hash_german_string_content(hasher, src.get_col_ptr(row, slot as usize, size as usize), src.blob());
         }
-        // Canonical (sign-flipped/widened) value, so a payload FK hashes like the
-        // same value stored as a PK column. U128/UUID included: their
-        // `payload_route_key` arm is `u128::from_le_bytes(cell)`.
-        _ => hasher.update(&loc.route_key(src, row).to_le_bytes()),
+        // The value's image, so a payload FK hashes like the same value stored
+        // as a PK column.
+        _ => hasher.update(&loc.opk_image(src, row).to_le_bytes()),
     }
 }
 
@@ -913,7 +811,7 @@ impl FoldCols {
                     continue;
                 }
                 buf[n] = 1; // non-null marker
-                buf[n + 1..n + 17].copy_from_slice(&loc.route_key(src, row).to_le_bytes());
+                buf[n + 1..n + 17].copy_from_slice(&loc.opk_image(src, row).to_le_bytes());
                 n += 17;
             }
             return gnitz_wire::checksum_128(&buf[..n]);

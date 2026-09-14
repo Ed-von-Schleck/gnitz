@@ -221,6 +221,13 @@ fn leading_u64_reads_eight_bytes_at_every_stride() {
             u64::from_be_bytes(want),
             "width {width}: the leading eight bytes, right-zero-padded",
         );
+        if width <= 8 {
+            assert_eq!(
+                <u64 as PkSortKey>::from_opk(&bytes[..width]),
+                leading_u64(&bytes[..width]),
+                "width {width}: the sort key is the value accessor at strides ≤ 8",
+            );
+        }
     }
 }
 
@@ -420,10 +427,7 @@ fn pkbuf_reused_buffer_matches_a_fresh_key_of_the_same_width() {
     // the new width must not survive into eq/hash, or a reused key would stop
     // matching the fresh one it is supposed to equal.
     let mut a = PkBuf::from_bytes(&[0xABu8; 12]);
-    a.try_write(8, |dst| {
-        dst.copy_from_slice(&7u64.to_le_bytes());
-        true
-    });
+    a.write(8, |dst| dst.copy_from_slice(&7u64.to_le_bytes()));
     let b = PkBuf::from_bytes(&7u64.to_le_bytes());
     assert_eq!(a, b);
     let mut set: HashSet<PkBuf> = HashSet::new();
@@ -1370,22 +1374,19 @@ mod pack_proptest {
                 pk_packer.pack_into(&mut pk_buf[..stride], &pk_mb, 0);
 
                 // (1) Absolute.
-                let (mut off, mut src_off) = (0usize, 0usize);
+                let mut off = 0usize;
                 for (i, &tc) in types.iter().enumerate() {
                     let out_tc = gnitz_wire::resolve_reindex_type(tc, target(tc));
                     let w = gnitz_wire::wire_stride(out_tc);
                     let src_w = gnitz_wire::wire_stride(tc);
 
-                    let mut want_pay = vec![0u8; w];
-                    gnitz_wire::encode_pk_column_promoted(&vals[i], tc, out_tc, &mut want_pay);
-                    prop_assert_eq!(&pay_buf[off..off + w], &want_pay[..], "payload slot {}", i);
-
-                    let mut want_pk = vec![0u8; w];
-                    gnitz_wire::promote_opk_column(&opk[src_off..src_off + src_w], tc, out_tc, &mut want_pk);
-                    prop_assert_eq!(&pk_buf[off..off + w], &want_pk[..], "pk slot {}", i);
+                    let mut native = [0u8; 16];
+                    native[..src_w].copy_from_slice(&vals[i]);
+                    let want = gnitz_wire::encode_pk_natives([(tc, out_tc)], [u128::from_le_bytes(native)]);
+                    prop_assert_eq!(&pay_buf[off..off + w], want.pk_bytes(), "payload slot {}", i);
+                    prop_assert_eq!(&pk_buf[off..off + w], want.pk_bytes(), "pk slot {}", i);
 
                     off += w;
-                    src_off += src_w;
                 }
                 prop_assert_eq!(off, stride, "slot widths sum to out_stride");
 
@@ -1477,11 +1478,10 @@ fn reindex_pack_bench() {
     }
 }
 
-/// `probe_key` keeps the whole span's entropy at both widths: a span past
-/// `NARROW_PK_MAX_BYTES` takes the xxh3 branch, where a `u128` image could not
-/// hold it, so two spans sharing a 16-byte prefix must not collapse together.
+/// `probe_key` keeps the whole span's entropy: two spans sharing a 16-byte
+/// prefix must not collapse together.
 #[test]
-fn probe_key_distinguishes_spans_past_the_narrow_width() {
+fn probe_key_distinguishes_spans_sharing_a_prefix() {
     let narrow = [7u64.to_be_bytes(), 8u64.to_be_bytes()].concat();
     assert_eq!(narrow.len(), NARROW_PK_MAX_BYTES);
     assert_ne!(
@@ -1492,9 +1492,6 @@ fn probe_key_distinguishes_spans_past_the_narrow_width() {
     let wide = |tail: u64| [&7u128.to_be_bytes()[..], &tail.to_be_bytes()[..]].concat();
     assert_eq!(wide(3)[..16], wide(4)[..16], "the two spans share a 16-byte prefix");
     assert_ne!(probe_key(&wide(3)), probe_key(&wide(4)));
-
-    // A narrow span right-aligns, so leading zeros are not information.
-    assert_eq!(probe_key(&[0, 0, 0, 5]), probe_key(&[5]));
 }
 
 // ---------------------------------------------------------------------------

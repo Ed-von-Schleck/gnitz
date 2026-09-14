@@ -2,9 +2,8 @@
 //!
 //! A PK region at rest holds **order-preserving big-endian** bytes: for every
 //! pair of encoded keys `memcmp(a, b)` equals the typed lexicographic
-//! comparison of the PK columns. Both the client write path (`gnitz-core`) and
-//! the server read path (`gnitz-server`) encode/decode through these functions,
-//! so the primitive lives here in `gnitz-wire`, the crate both depend on.
+//! comparison of the PK columns. Client and engine encode and decode through
+//! this module, which is why it lives in `gnitz-wire`, the crate both depend on.
 //!
 //! All PK columns are fixed-width integer scalars (floats/strings/blobs are
 //! rejected at DDL), so the transform is a fixed-width bijection: unsigned types
@@ -12,7 +11,7 @@
 
 /// Order-preserving big-endian encoding of one PK column.
 ///
-/// `src` and `dst` are both exactly `col.size()` bytes (1/2/4/8/16). Native
+/// `src` and `dst` are both exactly the column's width (1/2/4/8/16). Native
 /// little-endian input is byte-reversed to big-endian; signed types additionally
 /// flip the sign bit so the signed range maps monotonically onto the unsigned
 /// range. The result's unsigned lexicographic order equals the numeric order of
@@ -49,27 +48,80 @@ pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     }
 }
 
-/// OPK-encode a whole PK tuple: [`encode_pk_column`] over `cols` — the PK
-/// columns as `(width, type_code)` in **PK-list order** — tightly packed, no
-/// inter-column padding. `src` and `dst` are both the tuple's `pk_stride`
-/// bytes.
-///
-/// The one packing walk, so a caller cannot pair the right per-column encoder
-/// with the wrong column order: PK-list order is what makes the result's
-/// unsigned byte comparison the typed PK order, and it is independent of column
-/// order (`PRIMARY KEY (b, a)`).
+/// OPK-encode a PK tuple from its native little-endian image. `cols` are the PK
+/// columns' `(width, type_code)` in PK-list order, the order the key compares in.
 #[inline(always)]
-pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8], dst: &mut [u8]) {
+pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8]) -> PkBuf {
+    let mut out = PkBuf::zeroed(0);
     let mut off = 0;
     for (cs, tc) in cols {
-        encode_pk_column(&src[off..off + cs], tc, &mut dst[off..off + cs]);
+        out.append(cs, |dst| encode_pk_column(&src[off..off + cs], tc, dst));
         off += cs;
     }
-    debug_assert_eq!(off, dst.len(), "pk tuple width != sum of column widths");
+    debug_assert_eq!(off, src.len(), "pk tuple width != sum of column widths");
+    out
+}
+
+/// OPK-encode one native value per `(src_tc, target_tc)` column, each promoted to
+/// `target_tc` and packed in order.
+pub fn encode_pk_natives(cols: impl IntoIterator<Item = (u8, u8)>, natives: impl IntoIterator<Item = u128>) -> PkBuf {
+    let mut out = PkBuf::zeroed(0);
+    for ((src_tc, target_tc), native) in cols.into_iter().zip(natives) {
+        let src_w = crate::wire_stride(src_tc);
+        let low = if src_w == 16 {
+            native
+        } else {
+            native & ((1u128 << (src_w * 8)) - 1)
+        };
+        out.append(crate::wire_stride(target_tc), |dst| {
+            store_opk_image(low ^ opk_bias(src_tc, src_w), src_tc, src_w, target_tc, dst)
+        });
+    }
+    out
+}
+
+/// The image of zero in a `width`-byte column of type `tc`: `2^(width·8−1)` if
+/// signed, else 0. A value's image — its OPK bytes as a big-endian integer — is
+/// `value + opk_bias`.
+#[inline(always)]
+pub fn opk_bias(tc: u8, width: usize) -> u128 {
+    (crate::is_signed_int(tc) as u128) << (width * 8 - 1)
+}
+
+/// Write into `dst` the OPK bytes at `target_tc` of the value whose image at `src_tc`
+/// (width `src_w`) is `image`. `target_tc` must hold every `src_tc` value.
+#[inline(always)]
+pub fn store_opk_image(image: u128, src_tc: u8, src_w: usize, target_tc: u8, dst: &mut [u8]) {
+    // Skipping the re-bias at identity measured −19% instructions on `reindex_pack_bench`.
+    let v = if src_tc == target_tc {
+        image
+    } else {
+        image
+            .wrapping_sub(opk_bias(src_tc, src_w))
+            .wrapping_add(opk_bias(target_tc, dst.len()))
+    };
+    debug_assert!(
+        dst.len() == 16 || v >> (dst.len() * 8) == 0,
+        "store_opk_image: target narrower than the value"
+    );
+    macro_rules! store {
+        ($ty:ty) => {{
+            let d: &mut [u8; std::mem::size_of::<$ty>()] = dst.try_into().unwrap();
+            *d = (v as $ty).to_be_bytes();
+        }};
+    }
+    match dst.len() {
+        16 => store!(u128),
+        8 => store!(u64),
+        4 => store!(u32),
+        2 => store!(u16),
+        1 => dst[0] = v as u8,
+        _ => unreachable!("store_opk_image: PK column width is 1/2/4/8/16"),
+    }
 }
 
 /// Symmetric inverse of [`encode_pk_column`]: decode an OPK column back to
-/// native little-endian bytes. `src` and `dst` are both `col.size()` bytes. The
+/// native little-endian bytes. `src` and `dst` are both the column's width. The
 /// big-endian image is read, its sign bit un-flipped for signed types, and the
 /// native little-endian value stored — the mirror of the encoder, arm for arm,
 /// and likewise never a read-modify-write of `dst`.
@@ -100,31 +152,8 @@ pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     }
 }
 
-/// [`decode_pk_column`] into an owned 16-byte buffer: the decoded native
-/// little-endian value occupies the leading `src.len()` bytes (the column size,
-/// which must be ≤ 16). For callers that want an owned scratch buffer rather
-/// than threading one through; slice the result with `&buf[..src.len()]`.
-///
-/// Reached per row through `ColumnLocator::native_le_bytes` (SUM / MIN / MAX
-/// accumulation, index-span writes, reindex promotion).
-#[inline(always)]
-pub fn decode_pk_column_owned(src: &[u8], tc: u8) -> [u8; 16] {
-    // `src.len()` is a schema-derived column stride and never exceeds 16; the
-    // `buf[..src.len()]` slice below already panics past 16, so document the
-    // contract loudly (the promoted ColPromoter Pk arm newly leans on this).
-    debug_assert!(src.len() <= 16, "decode_pk_column_owned: column stride > 16");
-    let mut buf = [0u8; 16];
-    decode_pk_column(src, tc, &mut buf[..src.len()]);
-    buf
-}
-
-/// Widen a native-LE integer of type `src_tc` into the wider native-LE slot
-/// `dst` (`dst.len() >= src.len()`), sign-extending a signed source and
-/// zero-extending an unsigned one. This is the one definition of value-
-/// preserving integer widening for identity-critical bytes: the cross-width
-/// join key promotion ([`encode_pk_column_promoted`]) and the set-op payload
-/// promotion (`copy_column`) both go through it, so equal numeric values widen
-/// to byte-identical representations on every path.
+/// Sign- or zero-extend a native-LE integer of type `src_tc` into the wider slot
+/// `dst`, as `copy_column` widens a payload cell.
 #[inline]
 pub fn widen_native_le(src: &[u8], src_tc: u8, dst: &mut [u8]) {
     let src_width = src.len();
@@ -136,57 +165,9 @@ pub fn widen_native_le(src: &[u8], src_tc: u8, dst: &mut [u8]) {
     dst[src_width..].fill(if is_neg { 0xFF } else { 0x00 });
 }
 
-/// OPK-encode a native-LE value of type `src_tc` into a `target_tc` slot.
-/// `dst.len() == wire_stride(target_tc) >= src.len()`. [`widen_native_le`]s the
-/// value to the target width, then [`encode_pk_column`]s at `target_tc`. When
-/// `src_tc == target_tc` this is exactly `encode_pk_column` (no widening) — the
-/// no-widening fast path.
-///
-/// Both the trace-side reindex Map and the delta-scatter routing key go through
-/// this single primitive, so equal numeric values from either side of a
-/// cross-width join pack into byte-identical keys and co-partition.
-#[inline]
-pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mut [u8]) {
-    debug_assert_eq!(dst.len(), crate::wire_stride(target_tc));
-    if src_tc == target_tc {
-        encode_pk_column(src, src_tc, dst);
-        return;
-    }
-    // `dst` is already the target width (asserted above), so read it from there
-    // rather than re-deriving it through the `wire_stride` table — the identity
-    // arm above is the common per-row case and must not pay for the slow one.
-    // The fixed 16-byte `scratch` caps the in-scope target width; every promoted
-    // `T` is a PK-eligible ≤16-byte scalar (the decode trust boundary validates
-    // this), so this documents the contract a wider future type would have to
-    // grow. A violation is a planner/compiler bug, never input — so it must fail
-    // loudly rather than silently emit a wrong (mis-joining) key.
-    let target_width = dst.len();
-    debug_assert!((src.len()..=16).contains(&target_width));
-
-    let mut scratch = [0u8; 16];
-    widen_native_le(src, src_tc, &mut scratch[..target_width]);
-    encode_pk_column(&scratch[..target_width], target_tc, dst);
-}
-
-/// BE value widener for an OPK region slice. Right-aligns (left-zero-pads) the
-/// `stride` bytes into a `u128` and reads big-endian, recovering the native
-/// value for UNSIGNED PKs (OPK == BE for unsigned). Signed PKs return the OPK
-/// value (sign-flipped) — use [`decode_pk_column`] to recover the true integer.
-///
-/// Schema-free OPK byte primitive (sibling of [`encode_pk_column`]). A stride
-/// `> 16` is a wide region and a caller bug. Right-aligned, unlike the engine's
-/// left-aligning `pack_pk_be`: this one recovers a value, that one builds a sort
-/// key. Never conflate them.
-///
-/// The width is the slice's own length; every caller holds an exact-width window.
-///
-/// Specialized on the scalar widths, like the left-aligned sort-key packer it
-/// mirrors: the general arm's `copy_from_slice` has a runtime length, so it
-/// lowers to a zeroed 16-byte stack buffer plus a `memcpy` call, while a whole-
-/// width arm is one load and one `bswap`. This is the bottom of every PK→u128
-/// conversion — partition routing, shard PK-filter probes, the merge path. Compound widths
-/// 9..=15 (e.g. `(U32, U64)` = 12) get two overlapping loads for the same reason;
-/// only 3/5/6/7 still reach the buffer.
+/// A narrow OPK region's image: its bytes read as a big-endian integer. Right-aligned,
+/// unlike the left-aligned sort key `pack_pk_be`; width-specialized so only strides
+/// 3/5/6/7 pay a `memcpy`.
 #[inline(always)]
 pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
     let stride = pk_bytes.len();
@@ -247,43 +228,6 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
     }
 }
 
-/// Re-encode an at-rest OPK column at a promoted index/join type — the OPK→OPK
-/// sibling of [`encode_pk_column_promoted`] (native→OPK).
-///
-/// `src_tc == target_tc` is the **identity**: [`decode_pk_column`] and
-/// [`encode_pk_column`] are documented mutual fixed-width bijections, so
-/// decoding and re-encoding at the same type reproduces the input bytes. The
-/// fast path copies them verbatim instead. That equality also implies
-/// `dst.len() == src_opk.len()` (both are `wire_stride(tc)`), so the copy is
-/// length-safe.
-///
-/// One home for the rule: the secondary-index leading-key span
-/// (`IndexKeySpec::write_span`) and the reindex synthetic-key promotion
-/// (`ColPromoter`) must produce byte-identical output for the same logical
-/// value, and they did so only by spelling the same branch twice.
-/// `#[inline(always)]`, not `#[inline]`: this is a per-row call on two hot paths
-/// (`IndexKeySpec::write_span`'s PK arm, `ReindexPacker::pack_into`), and at
-/// `opt-level=0` — the debug binary the E2E suite runs — LLVM runs only the
-/// always-inline pass, so a plain hint would leave a real call frame around what
-/// is otherwise a `copy_from_slice`. (The `debug_assert!` is deliberately not
-/// `debug_assert_eq!`: the latter takes both lengths by reference and spills
-/// them, for a message the following `copy_from_slice` panic already implies.)
-#[inline(always)]
-pub fn promote_opk_column(src_opk: &[u8], src_tc: u8, target_tc: u8, dst: &mut [u8]) {
-    if src_tc == target_tc {
-        debug_assert!(
-            dst.len() == src_opk.len(),
-            "promote_opk_column: identity width mismatch"
-        );
-        dst.copy_from_slice(src_opk);
-        return;
-    }
-    // `decode_pk_column_owned` yields exactly the zero-filled native-LE image
-    // the encoder wants.
-    let native = decode_pk_column_owned(src_opk, src_tc);
-    encode_pk_column_promoted(&native[..src_opk.len()], src_tc, target_tc, dst);
-}
-
 /// Widest PK region that still fits in a packed `u128` word, the boundary where
 /// a key stops fitting one register. At or below it [`widen_pk_be`] recovers the
 /// exact key as a `u128` (wider regions must be read as bytes) and
@@ -300,10 +244,9 @@ fn bucket(h: u64, num_workers: usize) -> usize {
     ((h as u128 * num_workers as u128) >> 64) as usize
 }
 
-/// Upper bound on a cluster's worker count. Every routing surface derives from
-/// it: the SAL's per-worker slot arrays, and the relay's per-source scratch. It
-/// lives beside the routing functions rather than in the engine's SAL module so
-/// the operator layer can size an array by it without an up-edge into L7.
+/// Upper bound on a cluster's worker count: it bounds `--workers`, sizes the
+/// SAL's per-worker group slot arrays, and caps the exchange accumulator's
+/// worker count.
 pub const MAX_WORKERS: usize = 64;
 
 /// Which worker owns `key`.
@@ -325,119 +268,15 @@ pub fn worker_for_key(pk: u128, num_workers: usize) -> usize {
     )
 }
 
-/// Route an OPK PK region (any width) to a worker. For a narrow region the OPK
-/// bytes are big-endian, so [`widen_pk_be`] right-aligns them to recover the
-/// native unsigned value (sign-flipped for signed) and the result is
-/// `worker_for_key(widen_pk_be(bytes))` by construction. This is the invariant
-/// the join router relies on: `ColumnLocator::route_key` (both PK and
-/// OPK-encoded payload paths) also funnels through `widen_pk_be`, so the two
-/// sides of a distributed join agree. A wide region takes the xxh3 of the OPK
-/// bytes (uniformly distributed already) through the same multiply-shift.
+/// Route an OPK PK region to a worker: a narrow one by its image, which
+/// `ColumnLocator::opk_image` equals for a payload column so both join sides agree,
+/// a wide one by its xxh3.
 #[inline]
 pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
     if bytes.len() <= NARROW_PK_MAX_BYTES {
         worker_for_key(widen_pk_be(bytes), num_workers)
     } else {
         bucket(crate::checksum(bytes), num_workers)
-    }
-}
-
-// Two distinct key spaces derive a `u128` from a column. They coincide for
-// unsigned types and differ for signed:
-//
-// * ROUTING (`*_route_key`): the canonical `widen_pk_be(OPK)` value — sign-
-//   flipped for signed. Used by the exchange's group-key fold, matching
-//   `worker_for_pk_bytes`, which is schema-less and *cannot* decode, so it
-//   must hash the OPK bytes' widened value. Both sides of a distributed join
-//   agree only in this space.
-// * INDEX (`*_native_key`): the native value (signed integers keep their
-//   two's-complement bits, zero-extended). Used by FK validation, unique-index
-//   maintenance, `has_pk`, and an index range read, which all re-encode native →
-//   OPK at the storage boundary (`Table::opk_key`, `batch_project_index`), so
-//   they need the native value back, not the sign-flipped one.
-//
-// Each space has a PK-side and a payload-side reader because the two regions
-// store the same logical value differently (OPK big-endian vs native LE); the
-// pair agrees by construction, which is what lets a value route and probe the
-// same whether it is a PK column or a payload FK.
-
-/// The addressed column's bytes — `col_size` bytes at `offset` — for the four
-/// key readers below. One bounds contract and one message for all four, instead
-/// of the same `debug_assert!` re-worded per function.
-#[inline(always)]
-fn cell(data: &[u8], offset: usize, col_size: usize) -> &[u8] {
-    debug_assert!(data.len() >= offset + col_size, "key column runs past its region");
-    &data[offset..offset + col_size]
-}
-
-/// ROUTING key for one PK column's OPK bytes (canonical / sign-flipped).
-/// `col_size` is the addressed column's width (≤ 16); `offset` its byte offset
-/// within the PK region (0 for a lone PK).
-#[inline]
-pub fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
-    widen_pk_be(cell(pk_bytes, offset, col_size))
-}
-
-/// The OPK↔native sign flip for a `col_size`-byte column of type `tc`: the top
-/// bit of the column's own width for a signed type, zero otherwise.
-///
-/// This is the whole difference between the two key spaces. `encode_pk_column`
-/// XORs exactly this bit before the byte swap, and the swap itself cancels once
-/// both sides are read as integers — so a route key is a native key XOR this,
-/// with no encode/decode round trip and no scratch buffer.
-#[inline(always)]
-fn opk_flip(tc: u8, col_size: usize) -> u128 {
-    (crate::is_signed_int(tc) as u128) << (col_size * 8 - 1)
-}
-
-/// ROUTING key for one native little-endian payload column (canonical). Integer
-/// columns carry the OPK sign flip, so a payload FK column routes to the same
-/// partition as the same value stored as a PK column. U128/UUID are unsigned
-/// (OPK == native). Float/String/Blob have no PK counterpart; they keep a
-/// zero-extended low-8-byte key.
-#[inline]
-pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    // Every schema this reaches passed a decode boundary that rejects an unknown
-    // code, so classifying by predicate rather than by decoded enum keeps the
-    // tripwire where the tests run without a per-row branch on the release path.
-    debug_assert!(
-        crate::is_valid_type_code(type_code_val),
-        "payload_route_key: unknown type code"
-    );
-    let src = cell(col_data, offset, col_size);
-    if crate::is_wide_int(type_code_val) {
-        u128::from_le_bytes(src.try_into().unwrap()) ^ opk_flip(type_code_val, col_size)
-    } else if crate::is_float(type_code_val) || crate::is_german_string(type_code_val) {
-        crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128
-    } else {
-        crate::read_unsigned_exact(src) as u128 ^ opk_flip(type_code_val, col_size)
-    }
-}
-
-/// INDEX key for one PK column's OPK bytes: decode back to the native value
-/// (signed bits preserved), zero-extended to `u128`. Feeds `has_pk` /
-/// an index range read, which re-encode native → OPK to hit the OPK-stored index.
-/// `offset + col_size` must lie within the OPK PK region (`pk_bytes`); a
-/// mismatched `col_size` slices past the column and panics.
-#[inline]
-pub fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    widen_pk_be(cell(pk_bytes, offset, col_size)) ^ opk_flip(type_code_val, col_size)
-}
-
-/// INDEX key for one native little-endian payload column: the native value,
-/// zero-extended. U128/UUID read all 16 bytes; narrower types zero-extend the
-/// low ≤8 bytes. Float/String/Blob keep the same zero-extended low-8-byte key.
-#[inline]
-pub fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    debug_assert!(
-        crate::is_valid_type_code(type_code_val),
-        "payload_native_key: unknown type code"
-    );
-    let src = cell(col_data, offset, col_size);
-    if crate::is_wide_int(type_code_val) {
-        u128::from_le_bytes(src.try_into().unwrap())
-    } else {
-        crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128
     }
 }
 
@@ -500,8 +339,7 @@ impl Ord for PkBuf {
 }
 
 impl PkBuf {
-    /// All-zero key of the given width — the empty-shard / placeholder form, and
-    /// the `zeroed(0)` seed every [`Self::append`] build starts from.
+    /// All-zero key of the given width — the empty-shard / placeholder form.
     #[inline(always)] // per-row across the crate boundary; dev builds inline nothing else
     pub fn zeroed(len: usize) -> Self {
         debug_assert!(len <= crate::MAX_PK_BYTES);
@@ -539,27 +377,18 @@ impl PkBuf {
 
     /// Extend the key by `n` bytes, written by `f` into exactly that span.
     #[inline(always)]
-    pub fn append(&mut self, n: usize, f: impl FnOnce(&mut [u8])) {
+    fn append(&mut self, n: usize, f: impl FnOnce(&mut [u8])) {
         let at = self.len as usize;
         f(&mut self.bytes[at..at + n]);
         self.len = (at + n) as u8;
     }
 
-    /// Rewrite the key's meaningful bytes in place at its current width,
-    /// returning whatever `f` returns.
+    /// Re-tag the key as `width` bytes (zeroing anything a wider key left past it)
+    /// and hand them to `f`, returning what `f` returns.
     #[inline(always)]
-    pub fn edit<R>(&mut self, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        f(&mut self.bytes[..self.len as usize])
-    }
-
-    /// Overwrite this key as `width` bytes written by `f`, whose `bool` says
-    /// whether it produced one. A `false` key is well-formed — `width` bytes,
-    /// zero tail — but holds no meaningful value.
-    #[inline(always)]
-    pub fn try_write(&mut self, width: usize, f: impl FnOnce(&mut [u8]) -> bool) -> bool {
-        let wrote = f(&mut self.bytes[..width]);
+    pub fn write<R>(&mut self, width: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         self.set_len(width);
-        wrote
+        f(&mut self.bytes[..width])
     }
 
     /// The key's OPK bytes — the single PK accessor.

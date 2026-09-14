@@ -463,7 +463,8 @@ fn sink_compound_pk_key_orders_by_typed_value() {
     let bs: Vec<i16> = (0..out.len())
         .map(|i| {
             let w = &out.pks.get_bytes(i)[byte_off as usize..(byte_off + size) as usize];
-            let native = gnitz_wire::decode_pk_column_owned(w, type_code);
+            let mut native = [0u8; 16];
+            gnitz_wire::decode_pk_column(w, type_code, &mut native[..w.len()]);
             i16::from_le_bytes(native[..2].try_into().unwrap())
         })
         .collect();

@@ -21,7 +21,7 @@ use gnitz_wire::{read_u32_le, read_u64_le};
 use xorf::{BinaryFuse8, BinaryFuse8Ref, Descriptor, DmaSerializable, Filter, FilterRef};
 
 /// Build from probe keys. Sorted and deduplicated first: `probe_key` is a
-/// 64-bit digest of a 128-bit value, so distinct PKs collide, and the caller's
+/// 64-bit digest, so distinct PKs collide, and the caller's
 /// adjacent-byte-equal pre-shrink cannot see it. The construction requires
 /// distinct keys and asserts it under `debug_assertions`.
 ///

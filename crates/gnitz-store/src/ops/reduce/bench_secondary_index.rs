@@ -186,10 +186,7 @@ fn secondary_index_single_u64_pk_sort_bench() {
 }
 
 /// Per-row cost of composing one secondary-index entry key
-/// (`IndexKeySpec::write_entry` = leading-key span ‖ source-PK suffix) — the
-/// only bench that reaches the resolved-addressing free functions
-/// (`pk_native_key` / `payload_native_key`) and the `ColumnLocator` accessors
-/// they sit behind.
+/// (`IndexKeySpec::write_entry` = leading-key span ‖ source-PK suffix).
 ///
 /// Four shapes, chosen to separate the encode paths: a **U64 PK** source (no
 /// promotion — the span is a verbatim copy of the OPK bytes already in the PK
@@ -224,33 +221,6 @@ fn index_write_span_bench() {
         });
         let ns = ns_per_row(elapsed);
         println!("  {label}  {ns:7.2} ns/row   ({:.2} Mrows/s)", 1000.0 / ns);
-    }
-
-    // What the identity arm buys, priced directly: the same unpromoted U64 PK
-    // column through `promote_opk_column`'s general decode∘encode path. Without
-    // this row the four numbers above have nothing to be compared against.
-    let stride = src.pk_stride();
-    for (label, identity) in [("identity (copy)   ", true), ("decode∘encode     ", false)] {
-        let elapsed = bench_time(ITERS, || {
-            let mut key = [0u8; MAX_PK_BYTES];
-            for row in 0..N_ROWS {
-                let s = &mb.get_pk_bytes(row)[..stride];
-                if identity {
-                    gnitz_wire::promote_opk_column(s, type_code::U64, type_code::U64, &mut key[..stride]);
-                } else {
-                    let native = gnitz_wire::decode_pk_column_owned(s, type_code::U64);
-                    gnitz_wire::encode_pk_column_promoted(
-                        &native[..stride],
-                        type_code::U64,
-                        type_code::U64,
-                        &mut key[..stride],
-                    );
-                }
-                std::hint::black_box(&key);
-            }
-        });
-        let ns = ns_per_row(elapsed);
-        println!("  unpromoted PK OPK→OPK, {label}  {ns:7.2} ns/row");
     }
 }
 

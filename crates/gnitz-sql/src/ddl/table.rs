@@ -44,13 +44,14 @@ fn disambiguate_index_name(base: String, taken: &HashSet<String>) -> String {
     unreachable!("u32 range exhausted")
 }
 
-/// [`gnitz_wire::fk_child_fits`]'s rejection message, under the DECIMAL rule:
-/// a child adopts the referenced type, and adopting another scale would restate
-/// its values.
+/// The FK child-type rule: a child adopts the referenced type, so its type must
+/// equal it or hold a domain that fits inside it, and under DECIMAL adopting
+/// another scale would restate its values.
 fn check_fk_type_compat(fk_col: &ColumnDef, parent_col: &ColumnDef) -> Result<(), GnitzSqlError> {
     let (fk_col_type, parent_col_type) = (fk_col.ty(), parent_col.ty());
     let fits = fk_col_type.decimal_domains_match(parent_col_type)
-        && gnitz_wire::fk_child_fits(fk_col_type.tc as u8, parent_col_type.tc as u8);
+        && (fk_col_type.tc == parent_col_type.tc
+            || gnitz_wire::int_domain_fits(fk_col_type.tc as u8, parent_col_type.tc as u8));
     if !fits {
         return Err(GnitzSqlError::Bind(format!(
             "FK type mismatch: column type {fk_col_type} cannot reference column type \
@@ -598,8 +599,8 @@ pub fn plan_create_table(
     })?;
 
     // A SERIAL column must be the table's sole, single-column PRIMARY KEY: the
-    // INSERT path spells the generated id as `PkBuf::from_u128(stride, id)`, which
-    // has no compound form.
+    // INSERT path pushes the generated id as one native value
+    // (`PkColumn::push_u128`), which has no compound form.
     let mut serials = cols.iter().enumerate().filter(|(_, c)| c.is_serial);
     if let Some((sci, _)) = serials.next() {
         if serials.next().is_some() {

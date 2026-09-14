@@ -135,7 +135,7 @@ impl AdhocFold {
             }
             return Ok(());
         }
-        // A canonical key is `route_key` over one non-nullable `is_pk_eligible`
+        // A canonical key is `opk_image` over one non-nullable `is_pk_eligible`
         // column, so key equality *is* group equality and the value confirmation
         // below cannot change the answer.
         let injective_key = plan.group_key.canonical_col().is_some();

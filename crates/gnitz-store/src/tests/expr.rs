@@ -487,7 +487,7 @@ fn map_with_pack_pk_source_promotes_payload_to_pk() {
     assert_eq!(out.count, 3);
     // Each output row's PK is the sign-aware OPK image of its source payload
     // value (col 1 is I64): `widen_pk_be(encode_pk_column(v))`, i.e. the value
-    // with its sign bit flipped, matching how `ColumnLocator::route_key` routes the same
+    // with its sign bit flipped, matching how `ColumnLocator::opk_image` routes the same
     // value. A raw-native `== 200` assertion would falsely fail signed reindex.
     let opk_i64 = |v: i64| ((v as u64) ^ 0x8000_0000_0000_0000) as u128;
     assert_eq!(out.get_pk(0), opk_i64(200));
