@@ -609,7 +609,7 @@ ORDER BY extended by the input's row key, so it needs one.
 ## Delta feeds
 
 `CREATE VIEW … WITH (delta = '32 MB')` retains a view's recent deltas, read back
-through `ReadBound::Delta { after_tick }` as ordinary batches — **weights and
+through a `DELTA_POLL` item's `after_tick` as ordinary batches — **weights and
 all**, so a row-set comparison of a feed tests nothing. No subscription verb and
 no server-side cursor registry: the engine stays request/response, the cursor
 lives on the client, nothing retained survives a restart, `capacity` is refused

@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
@@ -16,6 +17,7 @@ use gnitz_core::{
 };
 use gnitz_mirror::Mirror;
 use gnitz_sql::{SqlPlanner, SqlResult};
+use gnitz_wire::{IndexBound, IndexWalk, PkColList, RangeDescriptor, ReadBound, ReadSpec};
 
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, rust_schema_to_py};
@@ -306,15 +308,14 @@ impl PyGnitzClient {
         scan_result(py, reply)
     }
 
-    /// seek_by_index(table_id, col_indices, key_vals) -> ScanResult.
+    /// seek_by_index(table_id, schema, col_indices, key_vals) -> ScanResult.
     ///
-    /// `col_indices` is the index's FULL declared column list (the server matches
-    /// the circuit by exact list); `key_vals` supplies the leading key values, and
-    /// may be shorter for a leading-prefix seek.
+    /// `key_vals` may name a leading prefix of the index's `col_indices`.
     pub fn seek_by_index(
         &mut self,
         py: Python<'_>,
         table_id: u64,
+        #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
         col_indices: Vec<u32>,
         key_vals: Bound<'_, PyList>,
     ) -> PyResult<Py<PyScanResult>> {
@@ -322,8 +323,27 @@ impl PyGnitzClient {
             .iter()
             .map(|item| py_scalar_key(&item))
             .collect::<PyResult<Vec<u128>>>()?;
-        let reply = self.call(py, move |c| c.seek_by_index(table_id, &col_indices, &keys))?;
-        scan_result(py, reply)
+        gnitz_wire::validate_pk_col_list(&col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
+            .map_err(|e| PyValueError::new_err(format!("seek_by_index: {e}")))?;
+        let (&last, eq) = keys
+            .split_last()
+            .filter(|_| keys.len() <= col_indices.len())
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "seek_by_index: key value count {} must be in 1..={}",
+                    keys.len(),
+                    col_indices.len()
+                ))
+            })?;
+        let spec = ReadSpec::all_rows(ReadBound::IndexRange {
+            bound: IndexBound {
+                idx_cols: PkColList::from_slice(&col_indices),
+                desc: RangeDescriptor::point(eq, last),
+            },
+            walk: IndexWalk::Required,
+        });
+        let batch = self.call(py, |c| c.scan_spec(table_id, &spec, &schema))?;
+        scan_result(py, ScanReply { schema, batch, lsn: None })
     }
 
     /// execute_sql(sql, schema_name="public") -> list of result dicts

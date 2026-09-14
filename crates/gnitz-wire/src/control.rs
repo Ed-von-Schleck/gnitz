@@ -155,7 +155,7 @@ pub const fn ctrl_block_size(error_msg_len: usize, seek_pk_extra_len: usize) -> 
 /// Split a packed key into the `(seek_pk, seek_pk_extra)` pair the two control
 /// columns above carry: the low [`crate::NARROW_PK_MAX_BYTES`] bytes as the
 /// `U128` word, the rest as the BLOB tail. Opaque bytes — it serves the PK seek
-/// channel and `seek_by_index`'s slot array alike. [`join_ctrl_key`] inverts it.
+/// channel. [`join_ctrl_key`] inverts it.
 #[inline]
 pub fn split_ctrl_key(key: &[u8]) -> (u128, &[u8]) {
     let n = key.len().min(crate::NARROW_PK_MAX_BYTES);

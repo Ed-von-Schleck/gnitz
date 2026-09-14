@@ -655,9 +655,9 @@ impl MasterDispatcher {
     /// CHECKPOINT verdict would advance only the master's epoch and wedge the
     /// cluster (see `collect_exclusive`).
     ///
-    /// Writes under no SAL mutex, so `fn` rather than `async fn` is what keeps
-    /// its group out of `fan_out_scan`'s sampled round: making it `async` lets
-    /// the reactor interleave it and breaks that read-freshness contract.
+    /// Writes under no SAL mutex, so `fn` rather than `async fn` is what keeps its
+    /// group out of `dispatch_scan_multi_fanout`'s sampled round: making it `async`
+    /// lets the reactor interleave it and breaks that read-freshness contract.
     pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
         self.exclusive_round("view tick drain", false, |t| self.write_tick_group(source_id, t))
     }
@@ -685,7 +685,7 @@ impl MasterDispatcher {
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let fanout = match schema.placement().is_key_routed() {
             true => Fanout::One(schema.worker_for_pk(opk.pk_bytes(), num_workers)),
-            false => read_fanout(self, target_id, None),
+            false => read_fanout(self, target_id),
         };
         let (mut slots, scan) = dispatch_scan_fanout(self, fanout, |targets| {
             self.write_group(&DirectGroup {
@@ -724,56 +724,12 @@ impl MasterDispatcher {
         }
     }
 
-    /// Index lookup: fan one frame out and MERGE every matching base row into
-    /// one batch via the train drain, or `None` when no row matches.
-    ///
-    /// A secondary index is one unpartitioned table per worker, so nothing
-    /// derives the owning worker from an indexed value and every arity, unique or
-    /// not, must ask all of them.
-    ///
-    /// `seek_col_idx` and `seek_pk_extra` are forwarded verbatim: the worker is
-    /// the sole OPK encoder, and the caller validated the packed column list.
-    pub(crate) async fn fan_out_seek_by_index_collect(
-        &self,
-        target_id: i64,
-        seek_col_idx: u64,
-        seek_pk: u128,
-        seek_pk_extra: &[u8],
-    ) -> Result<Option<Batch>, WorkerFault> {
-        // Single-sourcing a REPLICATED owner is correctness here, not thrift: a
-        // broadcast-and-merge appends each matching row `nw` times (weights
-        // copied verbatim, no consolidation), handing the client `nw` duplicates
-        // of every row.
-        let unicast = read_fanout(self, target_id, None);
-        // The master's own reply guard, not something the group carries: the
-        // worker's `seek_by_index` arm resolves the schema from its own catalog.
-        let expected = self.schema_desc_for(target_id);
-        let (slots, scan) = dispatch_scan_fanout(self, unicast, |targets| {
-            self.write_group(&DirectGroup {
-                template: wire::WireMsg {
-                    target_id: target_id as u64,
-                    seek_pk,
-                    seek_col_idx,
-                    seek_pk_extra,
-                    ..Default::default()
-                },
-                targets,
-                ..DirectGroup::new(SalMessageKind::SeekByIndex)
-            })
-        })
-        .await?;
-        merge_replies(slots, &scan, "seek_by_index", &expected).await
-    }
-
     /// Fan out a SCAN to the workers `unicast` names and forward every response
     /// frame straight to the client, continuation chunks included. `Ok(false)` on
     /// a mid-stream client disconnect.
     ///
-    /// `kind`/`wire_flags`/`seek_pk_extra` select the read shape: a plain scan
-    /// negotiates its schema block through `wire_flags`, while a `ReadSpec` read
-    /// passes the client's spec blob **verbatim** in `seek_pk_extra` and
-    /// negotiates nothing — the master reads only the bound header, to route, and
-    /// the worker is the sole `ReadSpec`/OPK decoder.
+    /// A plain scan negotiates its schema block through `wire_flags`; a `ReadSpec`
+    /// read carries its request blob in `seek_pk_extra`, or one per worker in `extras`.
     ///
     /// `forward_scan_slots` returns on the FIRST worker fault, decode error or
     /// client disconnect, without draining the doomed trains: the scan's lease
@@ -781,18 +737,6 @@ impl MasterDispatcher {
     /// boundary, so a still-streaming worker cannot wedge in
     /// `W2mWriter::send_msg`. The fault frame can therefore reach a client that
     /// already read earlier data frames; its reply accumulator discards those.
-    ///
-    /// **It also returns the tick round it sampled**, and samples it *inside* the
-    /// closure `dispatch_scan_fanout` runs under `sal_writer_excl`, the same
-    /// window the read's group is written in. That is what makes the round a
-    /// property of the SAL prefix rather than of a tick's success: every worker
-    /// sees the read group after exactly the tick groups of rounds `<= T`. The
-    /// mutex earns its place against the *committer*, which holds it across an
-    /// fsync and would otherwise put a read group inside a commit zone.
-    ///
-    /// The round also rides in the group's `seek_pk`, free there because neither
-    /// scan arm reads it, so the worker cuts the delta interval at it rather than
-    /// walking to the end of its store.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fan_out_scan(
         &self,
@@ -803,27 +747,24 @@ impl MasterDispatcher {
         kind: SalMessageKind,
         wire_flags: u64,
         seek_pk_extra: &[u8],
-    ) -> Result<(bool, u64), WorkerFault> {
-        let mut sampled = 0u64;
+        extras: Option<&[Vec<u8>]>,
+    ) -> Result<bool, WorkerFault> {
         let (slots, scan) = dispatch_scan_fanout(self, unicast, |targets| {
-            let round = self.last_tick_round();
-            sampled = round;
             self.write_group(&DirectGroup {
                 template: wire::WireMsg {
                     target_id: target_id as u64,
                     client_id,
                     flags: wire_flags,
-                    seek_pk: round as u128,
                     seek_pk_extra,
                     ..Default::default()
                 },
+                extras,
                 targets,
                 ..DirectGroup::new(kind)
             })
         })
         .await?;
-        let ok = forward_scan_slots(peer, slots, &scan).await?;
-        Ok((ok, sampled))
+        forward_scan_slots(peer, slots, &scan).await
     }
 
     /// Broadcast a DDL batch to every worker inside `scope`'s zone — one LSN

@@ -47,7 +47,7 @@ const DESC_FLAG_BOUNDED: u8 = 1 << 2;
 const DESC_FLAG_STREAM: u8 = 1 << 3;
 const DESC_FLAG_CLASS: u8 = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_STREAM;
 /// Descriptor `flags` bit 4: the view was created `WITH (delta = …)`, so it keeps
-/// its recent deltas in a store of its own and answers `ReadBound::Delta`.
+/// its recent deltas in a store of its own and answers a DELTA_POLL.
 ///
 /// A bool beside the class rather than a fourth [`RelClass`] variant: the two are
 /// orthogonal in principle — `capacity` and `delta` are refused together today

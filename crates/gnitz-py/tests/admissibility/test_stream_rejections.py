@@ -32,7 +32,7 @@ def test_no_binary_read_verb_serves_a_stream(streamed):
     for verb in (
         lambda: conn.scan(tid),
         lambda: conn.seek(tid, 1),
-        lambda: conn.seek_by_index(tid, [1], [0]),
+        lambda: conn.seek_by_index(tid, schema, [1], [0]),
         lambda: conn.scan_many([tid]),
         lambda: conn.delta_bootstrap(tid, schema),
     ):

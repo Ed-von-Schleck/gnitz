@@ -35,7 +35,7 @@ use crate::client::{delta_reply_schema, DeltaCursor, GnitzClient, RelDescriptor}
 use crate::connection::{Interest, PolledView, RawBlock, SlotId};
 use crate::error::ClientError;
 use crate::protocol::{ReplySchema, Schema, ZSetBatch};
-use gnitz_wire::txn_frame::DELTA_POLL_MAX_VIEWS;
+use gnitz_wire::txn_frame::{DeltaPollItem, DELTA_POLL_MAX_VIEWS};
 use gnitz_wire::RelClass;
 
 // ---------------------------------------------------------------------------
@@ -89,9 +89,13 @@ pub trait MirrorStore: Send {
     /// the client's `scan_local` verb asks for.
     fn scan(&mut self, tid: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError>;
 
-    /// Run the encoded `ReadSpec` `spec` against `tid`'s copy, replying under
-    /// `reply_schema`.
-    fn scan_spec(&mut self, tid: u64, spec: &[u8], reply_schema: &Schema) -> Result<ZSetBatch, MirrorError>;
+    /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
+    fn scan_spec(
+        &mut self,
+        tid: u64,
+        spec: gnitz_wire::ReadSpec,
+        reply_schema: &Schema,
+    ) -> Result<ZSetBatch, MirrorError>;
 
     /// The round `tid`'s copy answers at, and by its presence that the copy is
     /// valid at all — the store half of the readability gate.
@@ -629,9 +633,9 @@ impl GnitzClient {
         // A cursor at round 0 names the bootstrap bound, which would read the
         // whole view in the wrong shape: the caller's bug, raised before
         // anything is encoded.
-        let specs = views
+        let afters = views
             .iter()
-            .map(|(_, prev, _)| prev.poll_after().map(Self::delta_spec))
+            .map(|(_, prev, _)| prev.poll_after())
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut applied = Vec::with_capacity(views.len());
@@ -642,10 +646,14 @@ impl GnitzClient {
         let mut open: Vec<(SlotId, Range<usize>)> = Vec::new();
         for (chunk_at, chunk) in views.chunks(DELTA_POLL_MAX_VIEWS).enumerate() {
             let start = chunk_at * DELTA_POLL_MAX_VIEWS;
-            let batch: Vec<(u64, &[u8], &[u8])> = chunk
+            let batch: Vec<DeltaPollItem> = chunk
                 .iter()
                 .enumerate()
-                .map(|(i, (tid, _, schema))| (*tid, specs[start + i].as_slice(), schema.block()))
+                .map(|(i, (tid, _, schema))| DeltaPollItem {
+                    view_id: *tid,
+                    after_tick: afters[start + i],
+                    reply_block: schema.block(),
+                })
                 .collect();
             let range = start..start + chunk.len();
             match session.submit_delta_poll(&batch) {

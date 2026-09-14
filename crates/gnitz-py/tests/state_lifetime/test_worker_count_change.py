@@ -214,9 +214,9 @@ def test_an_index_rehomes_onto_the_launched_ranks(own_server):
     own_server.restart(graceful=True, workers=2)
 
     with gnitz.connect(own_server.sock_path) as conn:
-        tid, _ = conn.resolve_table("idxres", "t")
+        tid, schema = conn.resolve_table("idxres", "t")
         for i in (0, 63):
-            assert bag(conn.seek_by_index(tid, [1], [i * 10]), "id") == {(i,): 1}, \
+            assert bag(conn.seek_by_index(tid, schema, [1], [i * 10]), "id") == {(i,): 1}, \
                 f"g={i * 10} must still resolve to its source PK after the relayout"
 
     assert own_server.rebuilt_index_counts() == [1, 1], (

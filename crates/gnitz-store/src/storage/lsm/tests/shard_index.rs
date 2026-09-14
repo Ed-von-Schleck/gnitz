@@ -1875,7 +1875,7 @@ fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
     assert_eq!(on_disk_shards(tmp.path()).len(), registered, "no orphan shard files");
 }
 
-/// The contract the delta bound's expiry refusal is derived from: a drop removes
+/// The contract a delta read's expiry refusal is derived from: a drop removes
 /// only rows **at or below** the floor it raises, so every round above the
 /// floor survives it whole.
 ///

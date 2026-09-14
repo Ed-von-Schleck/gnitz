@@ -27,19 +27,18 @@ enum Sink {
 
 impl RelationRegistry {
     /// Execute `spec` on this worker's slice, replying in `reply_schema`'s layout.
-    /// `cut_tick` bounds a delta read above; every other bound ignores it.
     pub fn scan_spec(
         &self,
         target_id: i64,
-        spec: &ReadSpec,
+        spec: ReadSpec,
         reply_schema: &SchemaDescriptor,
-        cut_tick: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, StoreError> {
+        let ReadSpec { bound, predicate, sink } = spec;
         // Nothing bounded, filtered, mapped or cut (a worker orders only under a cut): the
         // relation whole, off the store's cached snapshot.
         if let (ReadBound::None, true, None, SinkKind::Rows { order, limit_k: 0 }) =
-            (&spec.bound, spec.predicate.is_empty(), &spec.sink.map, &spec.sink.kind)
+            (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
             let schema = self.relation_or_err(target_id)?.schema();
             resolve_order_locs(order, &schema)?;
@@ -48,19 +47,18 @@ impl RelationRegistry {
             }
             return Ok(self.scan(target_id, hydrator)?.0);
         }
-        let (source, src_schema) = self.open_bound(target_id, &spec.bound, cut_tick)?;
-        let predicate = (!spec.predicate.is_empty())
-            .then(|| compile_predicate(&spec.predicate, &src_schema))
+        let (source, src_schema) = self.open_bound(target_id, bound)?;
+        let predicate = (!predicate.is_empty())
+            .then(|| compile_predicate(&predicate, &src_schema))
             .transpose()?;
-        let map = spec
-            .sink
+        let map = sink
             .map
             .as_ref()
             .map(|m| MapPlan::from_compute_map(&src_schema, m))
             .transpose()
             .map_err(|e| StoreError::rejected(format!("scan_spec map: {e}")))?;
         let sink_in = map.as_ref().map_or(src_schema, |m| *m.out_schema());
-        let sink = match &spec.sink.kind {
+        let sink = match &sink.kind {
             SinkKind::Fold(agg) => Sink::Fold(Box::new(AdhocFold::new(&sink_in, agg, self.config.adhoc_group_cap)?)),
             SinkKind::Rows { order, limit_k } => Sink::Rows {
                 order: resolve_order_locs(order, &sink_in)?,
@@ -87,20 +85,15 @@ impl RelationRegistry {
     }
 
     /// Open `bound`'s source cursor, without walking it, and the schema its rows
-    /// arrive in — for a delta read, the delta store's rather than the relation's.
-    fn open_bound(
-        &self,
-        id: i64,
-        bound: &ReadBound,
-        cut_tick: u64,
-    ) -> Result<(SourceCursor, SchemaDescriptor), StoreError> {
+    /// arrive in.
+    fn open_bound(&self, id: i64, bound: ReadBound) -> Result<(SourceCursor, SchemaDescriptor), StoreError> {
         let entry = self.relation_or_err(id)?;
         let full = |c: ReadCursor| SourceCursor::Full(Box::new(c));
         Ok(match bound {
             ReadBound::None => (full(entry.cursor()), entry.schema()),
             ReadBound::PkRange(desc) => {
                 let schema = entry.schema();
-                let c = entry.store().pk_range_cursor(desc).map_err(StoreError::rejected)?;
+                let c = entry.store().pk_range_cursor(&desc).map_err(StoreError::rejected)?;
                 (full(c), schema)
             }
             ReadBound::PkSet(keys) => {
@@ -112,46 +105,73 @@ impl RelationRegistry {
                         schema.pk_stride()
                     )));
                 }
-                // A key this worker holds no row for copies nothing — the request
-                // is broadcast, so at W workers most of the list belongs elsewhere.
-                let gather = PkSetGather::open(keys.as_bytes().to_vec(), schema, |s, e| entry.cursor_in_range(s, e));
+                // A key this worker holds no row for copies nothing.
+                let gather = PkSetGather::open(keys.into_bytes(), schema, |s, e| entry.cursor_in_range(s, e));
                 (SourceCursor::PkSet(Box::new(gather)), schema)
             }
             ReadBound::IndexRange { bound, walk } => {
                 let cols = self.bound_cols_against(id, bound.idx_cols, "scan_spec")?;
                 (
-                    self.open_index_source(id, cols.as_slice(), &bound.desc, *walk)?,
+                    self.open_index_source(id, cols.as_slice(), &bound.desc, walk)?,
                     entry.schema(),
                 )
             }
-            // Refused at every `after_tick` when no feed exists: the reply would
-            // promise a continuation the server cannot serve.
-            ReadBound::Delta { .. } if !entry.has_delta_feed() => {
-                return Err(StoreError::rejected(format!(
-                    "scan_spec: relation {id} carries no delta feed; \
-                     create the view WITH (delta = '<size>') to subscribe to it"
-                )))
-            }
-            // The bootstrap: every delta after round 0 is the view's whole history,
-            // which is what its own output store holds.
-            ReadBound::Delta { after_tick: 0 } => (full(entry.cursor()), entry.schema()),
-            ReadBound::Delta { after_tick } => {
-                let feed = entry.delta_or_err()?;
-                let dropped_through = feed.dropped_through();
-                if delta_cursor_expired(*after_tick, dropped_through) {
-                    return Err(StoreError::DeltaExpired(format!(
-                        "delta cursor {after_tick} of relation {id} is below the \
-                         retained floor {dropped_through}; re-read at 0"
-                    )));
-                }
-                let schema = feed.schema();
-                // Both ends `Cut::After`: no arithmetic on the client's
-                // `after_tick`, where `after_tick + 1` at `u64::MAX` would wrap.
-                let desc = RangeDescriptor::new(&[], Cut::After(*after_tick as u128), Cut::After(cut_tick as u128));
-                let c = feed.pk_range_cursor(&desc).map_err(StoreError::rejected)?;
-                (full(c), schema)
-            }
         })
+    }
+
+    /// Every delta `id`'s feed recorded in rounds `(after_tick, cut_tick]`, in the
+    /// delta store's schema — or, at `after_tick = 0`, the view's own output store.
+    pub fn delta_read(
+        &self,
+        id: i64,
+        after_tick: u64,
+        cut_tick: u64,
+        reply_schema: &SchemaDescriptor,
+    ) -> Result<Rc<Batch>, StoreError> {
+        let entry = self.relation_or_err(id)?;
+        if !entry.has_delta_feed() {
+            return Err(StoreError::rejected(format!(
+                "delta_read: relation {id} carries no delta feed; \
+                 create the view WITH (delta = '<size>') to subscribe to it"
+            )));
+        }
+        // Everything after round 0 is the output store itself. A fresh cursor: the
+        // cached snapshot would pin a second copy of the view until its next ingest.
+        if after_tick == 0 {
+            if !reply_schema.same_physical_layout(&entry.schema()) {
+                return Err(layout_mismatch());
+            }
+            // A fed view carries no capacity, so no skeleton row needs hydrating.
+            return Ok(entry.cursor().materialize());
+        }
+        let feed = entry.delta_or_err()?;
+        let dropped_through = feed.dropped_through();
+        if delta_cursor_expired(after_tick, dropped_through) {
+            return Err(StoreError::DeltaExpired(format!(
+                "delta cursor {after_tick} of relation {id} is below the \
+                 retained floor {dropped_through}; re-read at 0"
+            )));
+        }
+        let schema = feed.schema();
+        if !reply_schema.same_physical_layout(&schema) {
+            return Err(layout_mismatch());
+        }
+        // Both ends `Cut::After`: no arithmetic on the client's `after_tick`,
+        // where `after_tick + 1` at `u64::MAX` would wrap.
+        let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
+        let cursor = feed.pk_range_cursor(&desc).map_err(StoreError::rejected)?;
+        let mut rows = Survivors {
+            source: SourceCursor::Full(Box::new(cursor)),
+            predicate: None,
+            ranges: Vec::new(),
+        };
+        Ok(Rc::new(stream_rows(
+            &mut rows,
+            self.config.scan_chunk_rows,
+            None,
+            &schema,
+            0,
+        )))
     }
 
     /// `source` unchanged unless the runs it opened hold a skeleton row, else
@@ -180,10 +200,10 @@ impl RelationRegistry {
     }
 }
 
-/// The one reply guard's refusal: a keeper built in any other layout would ship its
+/// The reply guard's refusal: a keeper built in any other layout would ship its
 /// regions under the client's strides.
 fn layout_mismatch() -> StoreError {
-    StoreError::rejected("scan_spec: reply schema does not match the sink's output layout")
+    StoreError::rejected("reply schema does not match the output layout")
 }
 
 /// Whether a walk over rounds `(after_tick, cut]` misses a round this worker

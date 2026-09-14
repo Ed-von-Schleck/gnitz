@@ -1106,7 +1106,7 @@ impl Batch {
     /// Runs for every layout including `Raw`, since an unsorted arrival (a union
     /// concat, a null-extend widening) is exactly where a null-fill enters.
     ///
-    /// Consumers are free to read the bit raw (`compare_by_group_cols`) or to
+    /// Consumers are free to read the bit raw (`cmp_group_cols`) or to
     /// believe the declaration (`FixedIntNonnull`, the evaluator's
     /// `nullable_slots`, a projection's `NullPerm`) only because this holds.
     #[cfg(debug_assertions)]

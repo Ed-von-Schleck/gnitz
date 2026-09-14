@@ -405,7 +405,7 @@ fn explain_plans_the_query_it_describes_and_shares_its_rejection() {
         let direct = read(&cat, sql).unwrap();
         let described = read(&cat, &format!("EXPLAIN {sql}")).unwrap();
         assert_eq!(explain_lines(&direct), explain_lines(&described), "`{sql}`");
-        assert_eq!(direct.encoded_spec(), described.encoded_spec(), "`{sql}`");
+        assert_eq!(direct.spec(), described.spec(), "`{sql}`");
     }
     for (sql, variant, msg) in [
         (
@@ -484,10 +484,7 @@ fn every_read_shape_plans_to_its_sink() {
             "`{sql}`: {}",
             lines[4]
         );
-        assert!(
-            plan.encoded_spec().is_some(),
-            "`{sql}`: every relation read ships a spec"
-        );
+        assert!(plan.spec().is_some(), "`{sql}`: every relation read ships a spec");
     }
 }
 
@@ -512,7 +509,7 @@ fn a_parenthesized_column_reference_reads_like_a_bare_one() {
     ] {
         let p = read(&cat, parens).unwrap_or_else(|e| panic!("`{parens}`: {e:?}"));
         let b = read(&cat, bare).unwrap();
-        assert_eq!(p.encoded_spec(), b.encoded_spec(), "`{parens}`");
+        assert_eq!(p.spec(), b.spec(), "`{parens}`");
         assert_eq!(visible(p.reply_schema()), visible(b.reply_schema()), "`{parens}`");
     }
     // Peeling the wrapper must not turn a computed item into a column reference.
@@ -745,7 +742,7 @@ fn a_cte_expands_to_the_flat_query() {
         let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
         let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
         assert_eq!(explain_lines(&c), explain_lines(&f), "`{cte}`");
-        assert_eq!(c.encoded_spec(), f.encoded_spec(), "`{cte}`");
+        assert_eq!(c.spec(), f.spec(), "`{cte}`");
         assert_eq!(visible(c.reply_schema()), visible(f.reply_schema()), "`{cte}`");
     }
     for (sql, variant, msg) in [
@@ -805,7 +802,7 @@ fn a_cte_expands_to_the_flat_query() {
     let (cte, flat) = ("WITH x AS (SELECT * FROM jv) SELECT * FROM x", "SELECT * FROM jv");
     let c = read(&jv, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
     let f = read(&jv, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
-    assert_eq!(c.encoded_spec(), f.encoded_spec(), "`{cte}`");
+    assert_eq!(c.spec(), f.spec(), "`{cte}`");
     // Defining one over the duplicate is fine — the CTE names no output column
     // of its own, so nothing is duplicated until something reads it by name.
     let ok = "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT 1 AS one FROM x";
@@ -935,7 +932,7 @@ fn a_from_less_select_plans_a_constant_row() {
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         assert_eq!(explain(&cat, sql)[0], "read nothing (constant row)", "`{sql}`");
-        assert!(plan.encoded_spec().is_none(), "`{sql}`");
+        assert!(plan.spec().is_none(), "`{sql}`");
         assert_eq!(visible(plan.reply_schema()), cols, "`{sql}`");
     }
     assert_eq!(

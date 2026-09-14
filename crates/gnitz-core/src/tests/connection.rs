@@ -36,7 +36,6 @@ fn check_response_classifies_every_status() {
         err(STATUS_TXN_CONFLICT, ""),
         ClientError::TxnConflict { fresh_basis: 77 }
     ));
-    assert!(matches!(err(STATUS_NO_INDEX, ""), ClientError::ServerError(m) if m.contains("no index")));
     assert!(matches!(err(999, ""), ClientError::ServerError(m) if m.contains("unrecognized status 999")));
 
     // The server formats real text for STATUS_SAL_FULL, and it must survive the
@@ -539,36 +538,27 @@ mod spine_tests {
     }
 
     #[test]
-    fn raw_scan_spec_keeps_blocks_undecoded_and_off_the_cache() {
+    fn a_delta_read_keeps_blocks_undecoded_and_off_the_cache() {
         let (mut s, peer) = pair();
         let sa = schema_a();
         let reply_schema = crate::protocol::ReplySchema::new(std::sync::Arc::new(sa.clone()), 9);
-        let spec = [1u8, 2, 3];
-        let slot = s
-            .submit(Request::ScanSpec {
-                target_id: 9,
-                spec: &spec,
-                reply_schema: &reply_schema,
-                raw: true,
-            })
-            .unwrap();
-        s.step(Interest::WRITE).unwrap();
-        let req = peer.drain_request();
-        assert!(
-            req.len() >= spec.len() + encode_schema_block(&sa, 9).len(),
-            "the spec and the reply schema both ride the request"
-        );
-        // Two hint-only frames: the server sends no schema block for a SCAN_SPEC.
-        peer.send(&reply_warm(9, 0, &sa, &batch_a(&[1, 2]), true));
-        peer.send(&reply_warm(9, 0, &sa, &batch_a(&[3]), false));
-        let Reply::Raw { blocks, terminal } = drive(&mut s, slot).unwrap() else {
-            panic!("raw")
-        };
+        let block_len = encode_schema_block(&sa, 9).len();
+        let peer_schema = sa.clone();
+        let h = std::thread::spawn(move || {
+            let req = peer.drain_request();
+            assert!(req.len() >= block_len, "the reply schema rides the request");
+            // Two hint-only frames: the server sends no schema block for a delta read.
+            peer.send(&reply_warm(9, 0, &peer_schema, &batch_a(&[1, 2]), true));
+            peer.send(&reply_warm(9, 0, &peer_schema, &batch_a(&[3]), false));
+            peer
+        });
+        let (blocks, terminal) = s.delta_read(9, 4, &reply_schema).unwrap();
+        let _peer = h.join().unwrap();
         assert_eq!(blocks.len(), 2);
         let (b0, _) = crate::protocol::decode_wal_block(blocks[0].block(), &sa).unwrap();
         assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
         assert_eq!(terminal.target_id, 9);
-        assert_eq!(stamped(&mut s, 9), 0, "a scan_spec absorbs nothing");
+        assert_eq!(stamped(&mut s, 9), 0, "a delta read absorbs nothing");
     }
 
     #[test]

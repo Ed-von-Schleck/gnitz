@@ -79,7 +79,7 @@ pub enum ScatterSpec<'a> {
 ///   PK — the two must agree or the result is mis-gathered. The fold keeps
 ///   NULL distinct because a NULL group and a 0 group must not collide on one
 ///   output PK; scatter routing has no such requirement, but local grouping
-///   (`compare_by_group_cols`) still separates co-located groups.
+///   (`cmp_group_cols`) still separates co-located groups.
 // One `ScatterKey` is built per scatter (a stack local) and read per row, so
 // the `ReindexPacker` and its scratch stay inline — boxing would add a heap
 // alloc and a per-row pointer chase for no benefit.

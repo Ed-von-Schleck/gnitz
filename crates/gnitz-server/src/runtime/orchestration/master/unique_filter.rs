@@ -275,7 +275,7 @@ pub(super) async fn ensure_unique_filters_warm(disp: &MasterDispatcher, table_id
     // Cost only, not correctness: the filter is a set, so a fan-out's `nw`
     // copies of every row dedup away — but the extra `nw - 1` full-table
     // scans are pure waste.
-    let unicast = read_fanout(disp, table_id, None);
+    let unicast = read_fanout(disp, table_id);
 
     // `scan` holds the lease across the full continuation drain below; its workers
     // stream multi-frame trains, and on an early error return (or a

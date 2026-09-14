@@ -99,8 +99,8 @@ def test_seek_by_index(client, schema_name, bench_timer, scale_mode):
     reads = _reads(scale_mode)
     for i in range(reads):
         key = i % NGROUP
-        bench_timer.measure_rows(client.seek_by_index, tid, [1], [key], rows_fn=len)
-    assert len(client.seek_by_index(tid, [1], [0])) > 0
+        bench_timer.measure_rows(client.seek_by_index, tid, schema, [1], [key], rows_fn=len)
+    assert len(client.seek_by_index(tid, schema, [1], [0])) > 0
 
 
 # ---------------------------------------------------------------------------

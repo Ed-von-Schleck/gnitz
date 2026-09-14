@@ -40,7 +40,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{ReadSink, SinkKind};
+use gnitz_wire::{ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
@@ -97,13 +97,13 @@ impl ReadPlan {
         }
     }
 
-    /// The encoded `ReadSpec` this read ships; `None` for a constant row. One, not a
-    /// list: an over-cap `PkSet` gather needs `ReadBudget::MayChunk`, and a read
-    /// plans under `OneRequest`.
-    pub fn encoded_spec(&self) -> Option<Vec<u8>> {
+    /// The `ReadSpec` this read ships; `None` for a constant row. One, not a list:
+    /// an over-cap `PkSet` gather needs `ReadBudget::MayChunk`, and a read plans
+    /// under `OneRequest`.
+    pub fn spec(&self) -> Option<ReadSpec> {
         match &self.case {
             ReadCase::Rows { read, .. } | ReadCase::Fold { read, .. } => {
-                Some(read.access.encode(read.access.bound(), &read.sink))
+                Some(read.access.spec(read.access.bound().clone(), &read.sink))
             }
             ReadCase::Constant { .. } => None,
         }

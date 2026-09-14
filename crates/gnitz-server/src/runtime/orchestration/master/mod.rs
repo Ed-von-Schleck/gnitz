@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::catalog::CatalogEngine;
 use gnitz_store::schema::{IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::{payload_native_key, pk_native_key};
-use gnitz_wire::{PkColList, SpecBytes};
+use gnitz_wire::{BoundPeek, PkColList};
 
 use crate::query::RelayRoute;
 use crate::runtime::peer::Peer;
@@ -206,23 +206,50 @@ pub(crate) enum Fanout {
     One(usize),
 }
 
-/// Which workers answer a read of `target_id`: the one read-routing rule, taking
-/// the `ReadSpec` its verb already unpacked when there is one.
-///
-/// Single-sourcing a replicated relation is **correctness**, not thrift, for two
-/// of the callers: a fan-out returns the same row `nw` times, which
-/// `fan_out_seek_by_index_collect` merges into `nw` duplicates for the client and
-/// `PreflightAccumulator::offer` reads as a duplicate key.
-pub(crate) fn read_fanout(disp: &MasterDispatcher, target_id: i64, spec: Option<SpecBytes<'_>>) -> Fanout {
-    let Some(entry) = disp.cat().registry().relation(target_id) else {
-        return Fanout::Broadcast;
-    };
-    if entry.is_replicated() {
-        return Fanout::One(0);
+/// Which workers answer a read of `target_id`. A replicated relation is read off
+/// worker 0 alone: a broadcast would return every row once per worker.
+pub(crate) fn read_fanout(disp: &MasterDispatcher, target_id: i64) -> Fanout {
+    match disp.cat().registry().relation(target_id) {
+        Some(entry) if entry.is_replicated() => Fanout::One(0),
+        _ => Fanout::Broadcast,
     }
-    spec.and_then(gnitz_wire::peek_pk_range)
-        .and_then(|r| entry.schema().confined_worker(&r, disp.num_workers()))
-        .map_or(Fanout::Broadcast, Fanout::One)
+}
+
+/// Where a SCAN_SPEC goes, and what each slot carries. `per_worker` is `Some`
+/// only for a `PkSet` spread across workers: slot `w`'s blob names `w`'s own keys.
+pub(crate) struct SpecRoute {
+    pub(crate) fanout: Fanout,
+    pub(crate) per_worker: Option<Vec<Vec<u8>>>,
+}
+
+/// [`read_fanout`], narrowed by the request's bound: a confined PK range unicasts,
+/// and a key set goes only to the workers owning its keys, each with its own.
+pub(crate) fn spec_route(disp: &MasterDispatcher, target_id: i64, blob: &[u8]) -> SpecRoute {
+    let same = |fanout| SpecRoute { fanout, per_worker: None };
+    let fanout = read_fanout(disp, target_id);
+    let (Fanout::Broadcast, Some(entry)) = (fanout, disp.cat().registry().relation(target_id)) else {
+        return same(fanout);
+    };
+    let (schema, nw) = (entry.schema(), disp.num_workers());
+    match gnitz_wire::peek_bound(blob) {
+        Some(BoundPeek::PkRange(r)) => same(schema.confined_worker(&r, nw).map_or(Fanout::Broadcast, Fanout::One)),
+        Some(BoundPeek::PkSet(set)) => match schema.keys_by_owner(set.stride, set.keys, nw) {
+            None => same(Fanout::Broadcast),
+            Some(by_owner) => {
+                let mut owners = by_owner.iter().enumerate().filter(|(_, k)| !k.is_empty());
+                match (owners.next(), owners.next()) {
+                    (Some((w, _)), None) => same(Fanout::One(w)),
+                    // An empty set still owes its reply (a fold its ground row).
+                    (None, _) => same(Fanout::One(0)),
+                    _ => SpecRoute {
+                        fanout: Fanout::Broadcast,
+                        per_worker: Some(by_owner.iter().map(|k| set.with_keys(k)).collect()),
+                    },
+                }
+            }
+        },
+        None => same(Fanout::Broadcast),
+    }
 }
 
 /// A dispatched scan: reply `i` arrives on its lease's id `i`, from

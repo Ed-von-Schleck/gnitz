@@ -33,8 +33,8 @@ use crate::protocol::{
     wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
     FkTarget, Message, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
     FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
-    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND,
-    STATUS_NO_INDEX, STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK,
+    STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::txn_frame;
 use gnitz_wire::RelDescriptorBlob;
@@ -114,7 +114,6 @@ fn check_response(msg: &mut Message) -> Result<(), ClientError> {
     match msg.status {
         STATUS_OK => Ok(()),
         STATUS_SCHEMA_MISMATCH => Err(ClientError::SchemaMismatch),
-        STATUS_NO_INDEX => Err(ClientError::ServerError("no index on requested column".into())),
         STATUS_DELTA_EXPIRED => Err(ClientError::DeltaExpired),
         // The frame's `target_id` is the relation the request named, so the id is
         // the whole of what there is to say.
@@ -197,14 +196,13 @@ pub struct SlotId(u64);
 /// where the verb names do. It borrows its inputs; the borrow ends at
 /// `submit`, which encodes there and then.
 pub enum Request<'a> {
-    /// A correlated read — SCAN, SEEK, SEEK_BY_INDEX: the reply's `target_id`
+    /// A correlated read — SCAN, SEEK: the reply's `target_id`
     /// must be this one, any schema block it carries is absorbed into the cache
     /// under it, and it completes as [`Reply::Scan`].
     Read {
         target_id: u64,
         flags: u64,
         seek_pk: u128,
-        seek_col_idx: u64,
         seek_pk_extra: &'a [u8],
     },
     /// An id allocation: `flag` names the sequence, `count` the run length, and
@@ -242,23 +240,12 @@ pub enum Request<'a> {
         mode: WireConflictMode,
     },
     /// SCAN_SPEC, carrying the caller's reply schema — the decode hint for
-    /// every frame of the train, since the server sends none back — and
-    /// whether to keep the data blocks raw. Uncorrelated and off the cache in
-    /// both directions.
+    /// every frame of the train, since the server sends none back. Uncorrelated
+    /// and off the cache in both directions.
     ScanSpec {
         target_id: u64,
-        spec: &'a [u8],
+        spec: &'a gnitz_wire::ReadSpec,
         reply_schema: &'a ReplySchema,
-        raw: bool,
-    },
-    /// SEEK_BY_INDEX — a point read of a secondary index by its FULL declared
-    /// column list, with native key values (fewer than columns for a
-    /// leading-prefix seek). Correlated like [`Self::Read`]; its own variant
-    /// because packing the key asserts contracts `submit` must check first.
-    SeekByIndex {
-        table_id: u64,
-        col_indices: &'a [u32],
-        key_vals: &'a [u128],
     },
     /// SCAN_MULTI: N trains in request order, each decoded under its own
     /// relation.
@@ -272,7 +259,6 @@ impl<'a> Request<'a> {
             target_id,
             flags: 0,
             seek_pk: 0,
-            seek_col_idx: 0,
             seek_pk_extra: &[],
         }
     }
@@ -284,7 +270,6 @@ impl<'a> Request<'a> {
             target_id,
             flags: FLAG_SEEK,
             seek_pk,
-            seek_col_idx: 0,
             seek_pk_extra,
         }
     }
@@ -294,7 +279,7 @@ impl<'a> Request<'a> {
 /// that opened its slot, so no driver re-attaches a relation id.
 #[derive(Debug)]
 pub enum Reply {
-    /// SCAN / SEEK / SEEK_BY_INDEX.
+    /// SCAN / SEEK.
     Scan(ScanReply),
     /// `scan_multi`: N per-relation results in request order.
     Multi(Vec<ScanReply>),
@@ -306,13 +291,8 @@ pub enum Reply {
     /// The terminal frame of a verb whose answer is one of its fields: the id
     /// allocations and the transaction ACKs.
     Ack(Message),
-    /// A decoded `scan_spec`: its rows under the slot's reply schema, and the
-    /// terminal watermark.
-    Rows { batch: ZSetBatch, watermark: u128 },
-    /// The same train with each frame's data block left undecoded in its own
-    /// frame buffer: `scan_spec_raw`, and the mirror's copy-free ingest. It
-    /// carries no schema — the server sends no block back for a SCAN_SPEC.
-    Raw { blocks: Vec<RawBlock>, terminal: Message },
+    /// A decoded `scan_spec`: its rows under the slot's reply schema.
+    Rows(ZSetBatch),
     /// A delta poll: the slot is done, and every view's blocks went to the
     /// poll's own listener as that view's terminal arrived.
     Polled,
@@ -328,8 +308,7 @@ impl Reply {
             Reply::Lsn(_) => "Lsn",
             Reply::Resolve(_) => "Resolve",
             Reply::Ack(_) => "Ack",
-            Reply::Rows { .. } => "Rows",
-            Reply::Raw { .. } => "Raw",
+            Reply::Rows(_) => "Rows",
             Reply::Polled => "Polled",
         }
     }
@@ -344,7 +323,7 @@ impl Reply {
         }
     }
 
-    /// One relation's read result: SCAN, SEEK, SEEK_BY_INDEX.
+    /// One relation's read result: SCAN, SEEK.
     #[inline]
     #[track_caller]
     pub fn into_scan(self) -> ScanReply {
@@ -386,23 +365,13 @@ impl Reply {
         }
     }
 
-    /// A decoded `scan_spec`'s rows and its terminal watermark.
+    /// A decoded `scan_spec`'s rows.
     #[inline]
     #[track_caller]
-    pub fn into_rows(self) -> (ZSetBatch, u128) {
+    pub fn into_rows(self) -> ZSetBatch {
         match self {
-            Reply::Rows { batch, watermark } => (batch, watermark),
+            Reply::Rows(batch) => batch,
             other => wrong_shape(other.kind(), "Rows"),
-        }
-    }
-
-    /// A raw `scan_spec`'s undecoded blocks and its terminal frame.
-    #[inline]
-    #[track_caller]
-    pub fn into_raw(self) -> (Vec<RawBlock>, Message) {
-        match self {
-            Reply::Raw { blocks, terminal } => (blocks, terminal),
-            other => wrong_shape(other.kind(), "Raw"),
         }
     }
 }
@@ -441,7 +410,6 @@ enum SlotKind {
     Resolve,
     ScanSpec {
         reply_schema: Arc<Schema>,
-        raw: bool,
     },
     /// One position per relation, each with the hint its stamp was taken from.
     Multi {
@@ -467,7 +435,7 @@ impl SlotKind {
 
     /// Whether this slot's data blocks stay undecoded in their frame buffers.
     fn keeps_blocks_raw(&self) -> bool {
-        matches!(self, SlotKind::ScanSpec { raw: true, .. } | SlotKind::DeltaPoll { .. })
+        matches!(self, SlotKind::DeltaPoll { .. })
     }
 }
 
@@ -615,16 +583,10 @@ impl Session {
         }
         let client_id = self.client_id;
         let (parts, kind) = match req {
-            Request::Read {
-                target_id,
-                flags,
-                seek_pk,
-                seek_col_idx,
-                seek_pk_extra,
-            } => {
+            Request::Read { target_id, flags, seek_pk, seek_pk_extra } => {
                 let hint = self.cached_hint(target_id);
                 let flags = wire_flags_set_schema_version(flags, hint.as_ref().map_or(0, |h| h.1));
-                let parts = encode_control_frame(target_id, client_id, flags, seek_pk, seek_col_idx, seek_pk_extra);
+                let parts = encode_control_frame(target_id, client_id, flags, seek_pk, 0, seek_pk_extra);
                 (parts, SlotKind::Read { tid: target_id, hint })
             }
             Request::Alloc { target_id, flag, count } => {
@@ -681,42 +643,12 @@ impl Session {
                 };
                 (parts, SlotKind::Push { tid: target_id })
             }
-            Request::ScanSpec { target_id, spec, reply_schema, raw } => {
-                // The reply schema rides the request blob (the master forwards it
-                // verbatim) and stays with the slot as the decode hint.
-                let extra = gnitz_wire::pack_scan_spec_extra(spec, reply_schema.block());
+            Request::ScanSpec { target_id, spec, reply_schema } => {
+                // The reply schema rides the request blob and stays with the slot
+                // as the decode hint.
+                let extra = spec.encode(reply_schema.block());
                 let parts = encode_control_frame(target_id, client_id, FLAG_SCAN_SPEC, 0, 0, &extra);
-                (parts, SlotKind::ScanSpec { reply_schema: reply_schema.schema(), raw })
-            }
-            Request::SeekByIndex { table_id, col_indices, key_vals } => {
-                // Both packers below assert their contracts, so the list and
-                // the arity are admitted here, in every build profile.
-                gnitz_wire::validate_pk_col_list(col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
-                    .map_err(|e| ClientError::ServerError(format!("seek_by_index: {e}")))?;
-                // K rides as the wire byte count, so an empty `key_vals` reads
-                // at the worker as one value `0`.
-                if key_vals.is_empty() || key_vals.len() > col_indices.len() {
-                    return Err(ClientError::ServerError(format!(
-                        "seek_by_index: key value count {} must be in 1..={}",
-                        key_vals.len(),
-                        col_indices.len()
-                    )));
-                }
-                // `split_ctrl_key` routes slot 0 → seek_pk and the rest to
-                // seek_pk_extra; `unpack_index_key_slots` reassembles them.
-                let (kbuf, klen) = gnitz_wire::pack_index_key_slots(key_vals);
-                let (seek_pk, seek_pk_extra) = gnitz_wire::control::split_ctrl_key(&kbuf[..klen]);
-                let hint = self.cached_hint(table_id);
-                let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX, hint.as_ref().map_or(0, |h| h.1));
-                let parts = encode_control_frame(
-                    table_id,
-                    client_id,
-                    flags,
-                    seek_pk,
-                    gnitz_wire::pack_pk_cols(col_indices),
-                    seek_pk_extra,
-                );
-                (parts, SlotKind::Read { tid: table_id, hint })
+                (parts, SlotKind::ScanSpec { reply_schema: reply_schema.schema() })
             }
             Request::ScanMulti(tids) => {
                 // Rejected here, in every build profile, before a frame exists.
@@ -735,19 +667,15 @@ impl Session {
         self.enqueue_slot(parts, kind)
     }
 
-    /// DELTA_POLL: one frame naming N mirrored views, each with its own encoded
-    /// delta `ReadSpec` and reply-schema block, answered as one train and
-    /// terminal per view in this order. Its results leave through the
-    /// [`PollSink`] a [`Self::step_polling`] drain supplies, not through the
-    /// completion — which is why it is not a [`Request`] a public driver can
-    /// reach: without that sink every view's blocks are dropped.
-    pub(crate) fn submit_delta_poll(&mut self, views: &[(u64, &[u8], &[u8])]) -> Result<SlotId, ClientError> {
-        txn_frame::validate_item_ids("DELTA_POLL", views, |v| v.0)?;
+    /// DELTA_POLL: one train per item, in order, delivered to the [`PollSink`] of a
+    /// [`Self::step_polling`] drain — without which they are dropped, hence no [`Request`].
+    pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem<'_>]) -> Result<SlotId, ClientError> {
+        txn_frame::validate_item_ids("DELTA_POLL", views, |v| v.view_id)?;
         let parts = MessageParts::single(txn_frame::encode_delta_poll(self.client_id, views));
         self.enqueue_slot(
             parts,
             SlotKind::DeltaPoll {
-                views: views.iter().map(|(id, _, _)| *id).collect(),
+                views: views.iter().map(|v| v.view_id).collect(),
             },
         )
     }
@@ -984,14 +912,9 @@ impl Session {
             SlotKind::Push { .. } => Ok(Reply::Lsn(terminal.seek_pk as u64)),
             SlotKind::Resolve => resolve_descriptor(terminal, schema).map(Reply::Resolve),
             SlotKind::Uncorrelated => Ok(Reply::Ack(terminal)),
-            SlotKind::ScanSpec { raw: true, .. } => Ok(Reply::Raw {
-                blocks: std::mem::take(&mut accum.blocks),
-                terminal,
-            }),
-            SlotKind::ScanSpec { reply_schema, .. } => Ok(Reply::Rows {
-                batch: data.unwrap_or_else(|| ZSetBatch::new(reply_schema)),
-                watermark: terminal.seek_pk,
-            }),
+            SlotKind::ScanSpec { reply_schema } => {
+                Ok(Reply::Rows(data.unwrap_or_else(|| ZSetBatch::new(reply_schema))))
+            }
             SlotKind::Multi { tids } => {
                 accum.replies.push(scan_reply(schema, data, &terminal)?);
                 accum.at += 1;
@@ -1195,10 +1118,6 @@ impl Session {
         self.round_trip_scan(Request::seek(target_id, pk, pk_extra))
     }
 
-    pub(crate) fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
-        self.round_trip_scan(Request::SeekByIndex { table_id, col_indices, key_vals })
-    }
-
     /// Describe one relation in a single round trip: `(live tid, schema,
     /// descriptor)`, or `None` when no such relation exists — a successful
     /// answer the caller renders in its own wording.
@@ -1229,45 +1148,55 @@ impl Session {
         encode_control_frame(target_id, self.client_id, FLAG_RESOLVE, 0, 0, qname.as_bytes())
     }
 
-    /// [`Self::scan_spec`] keeping the reply's raw data blocks instead of a
-    /// decoded batch; the caller decodes them itself.
-    pub(crate) fn scan_spec_raw(
-        &mut self,
-        target_id: u64,
-        spec: &[u8],
-        reply_schema: &ReplySchema,
-    ) -> Result<(Vec<RawBlock>, u128), ClientError> {
-        let (blocks, terminal) = self
-            .round_trip(Request::ScanSpec { target_id, spec, reply_schema, raw: true })?
-            .into_raw();
-        Ok((blocks, terminal.seek_pk))
-    }
-
-    /// Ship a parameterized bounded read (`ReadSpec`) and reassemble its result.
-    /// `spec` is the encoded `ReadSpec`; `reply_schema` is the schema the caller
-    /// built for the result — it is encoded into the request blob (bundled with
-    /// `spec` by [`gnitz_wire::pack_scan_spec_extra`], which the master forwards
-    /// verbatim) and is the decode hint for every reply frame, since the server
-    /// sends no schema block back. Returns one concatenated batch. Like `scan`, it
-    /// advances no commit watermark and — critically — never touches the schema
-    /// cache: a per-query projected schema keyed under the table id would corrupt
-    /// a later plain scan of the same relation.
-    /// The terminal frame's whole watermark word comes back with the rows: a
-    /// delta read needs both halves of it, and every other caller drops it.
+    /// A parameterized bounded read, its replies concatenated under `reply_schema`.
     pub(crate) fn scan_spec(
         &mut self,
         target_id: u64,
-        spec: &[u8],
+        spec: &gnitz_wire::ReadSpec,
         reply_schema: &ReplySchema,
-    ) -> Result<(ZSetBatch, u128), ClientError> {
+    ) -> Result<ZSetBatch, ClientError> {
         Ok(self
-            .round_trip(Request::ScanSpec {
-                target_id,
-                spec,
-                reply_schema,
-                raw: false,
-            })?
+            .round_trip(Request::ScanSpec { target_id, spec, reply_schema })?
             .into_rows())
+    }
+
+    /// One view's DELTA_POLL, driven to completion: its raw blocks and terminal frame.
+    pub(crate) fn delta_read(
+        &mut self,
+        view_id: u64,
+        after_tick: u64,
+        reply: &ReplySchema,
+    ) -> Result<(Vec<RawBlock>, Message), ClientError> {
+        let slot = self.submit_delta_poll(&[txn_frame::DeltaPollItem {
+            view_id,
+            after_tick,
+            reply_block: reply.block(),
+        }])?;
+        let mut got: Option<PolledView> = None;
+        let mut ready = Interest::WRITE;
+        loop {
+            let done = match self.step_polling(ready, &mut |s, view| {
+                if s == slot {
+                    got = Some(view)
+                }
+            }) {
+                Ok(done) => done,
+                Err(e) => {
+                    self.close();
+                    return Err(e);
+                }
+            };
+            if let Some((_, completed)) = done.into_iter().find(|(s, _)| *s == slot) {
+                // A per-view fault fills the position (`got`); only a frame-level
+                // rejection completes the slot without one.
+                return match (got, completed) {
+                    (Some(view), _) => view,
+                    (None, Err(e)) => Err(e),
+                    (None, Ok(_)) => unreachable!("a one-view poll completes by filling its position"),
+                };
+            }
+            ready = self.park()?;
+        }
     }
 
     /// The cached `(schema, version)` for `tid`. `get`, so a relation in use

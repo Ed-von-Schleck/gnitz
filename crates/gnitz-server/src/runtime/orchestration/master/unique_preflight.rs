@@ -286,7 +286,7 @@ impl MasterDispatcher {
         // check, and the seed reflects true cardinality. Hashed owners keep the
         // full fan-out (genuine cross-partition duplicates surface as equal
         // spans from different workers).
-        let unicast = read_fanout(self, owner_id, None);
+        let unicast = read_fanout(self, owner_id);
 
         // Fan out the pre-flight command (the packed column list rides in
         // seek_col_idx); each worker answers with its sorted-span

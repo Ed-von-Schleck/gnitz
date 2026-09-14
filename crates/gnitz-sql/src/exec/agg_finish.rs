@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use gnitz_core::{ColumnDef, Schema, ZSetBatch};
-use gnitz_expr::{ColumnLocator, Evaluator, SchemaFacts};
+use gnitz_expr::{cmp_group_cols, ColumnLocator, Evaluator, SchemaFacts};
 use gnitz_wire::AggFunc as WireAggFunc;
 use rustc_hash::FxHashMap;
 
@@ -119,7 +119,7 @@ impl FoldFinish {
             debug_assert_eq!(partial.weights[row], 1, "a fold partial is one reduce row");
             let key = u128::from_le_bytes(partial.pks.get_bytes(row).try_into().expect("_group_pk is 16 bytes"));
             let hit = std::iter::successors(newest.get(&key).copied(), |&r| Some(older[r]).filter(|&o| o != NO_ROW))
-                .find(|&first| same_group(group_locs, &partial, row, first));
+                .find(|&first| cmp_group_cols(&partial, row, &partial, first, group_locs).is_eq());
             match hit {
                 Some(first) => {
                     older.push(NO_ROW);
@@ -209,16 +209,6 @@ impl FoldFinish {
         out.weights = weights;
         out
     }
-}
-
-/// Whether rows `a` and `b` hold the same group values: NULL equals NULL, non-NULL values
-/// compare by `cmp_non_null` (the engine's `compare_by_group_cols` rule).
-fn same_group(locs: &[ColumnLocator], batch: &ZSetBatch, a: usize, b: usize) -> bool {
-    let (aw, bw) = (batch.nulls[a], batch.nulls[b]);
-    locs.iter().all(|l| match (l.is_null_word(aw), l.is_null_word(bw)) {
-        (false, false) => l.cmp_non_null(batch, a, batch, b).is_eq(),
-        (x, y) => x == y,
-    })
 }
 
 /// Merge row `row`'s cell at payload slot `pi` into row `first`. `wins` is the ordering by

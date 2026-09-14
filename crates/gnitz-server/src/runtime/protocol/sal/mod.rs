@@ -177,6 +177,9 @@ pub(crate) struct DirectGroup<'a> {
     /// [`SalMessageKind::schema_survives_a_rowless_slot`] states.
     pub(crate) template: WireMsg<'a>,
     pub(crate) data: GroupData<'a>,
+    /// Slot `w`'s `seek_pk_extra` in place of the template's, when every worker
+    /// is sent its own.
+    pub(crate) extras: Option<&'a [Vec<u8>]>,
     pub(crate) targets: GroupTargets,
 }
 
@@ -189,6 +192,7 @@ impl<'a> DirectGroup<'a> {
             lsn: 0,
             template: WireMsg::default(),
             data: GroupData::NONE,
+            extras: None,
             targets: GroupTargets::AllUnaddressed,
         }
     }
@@ -217,6 +221,7 @@ impl<'a> DirectGroup<'a> {
                 GroupTargets::One { req_id, .. } => req_id,
             },
             schema_block: self.template.schema_block.filter(|_| keeps_schema),
+            seek_pk_extra: self.extras.map_or(self.template.seek_pk_extra, |e| &e[w]),
             ..self.template
         }
     }
@@ -385,13 +390,12 @@ gnitz_wire::wire_enum! {
         Push = 9,
         /// Drive one view-maintenance tick.
         Tick = 10,
-        SeekByIndex = 11,
         Seek = 12,
         /// A parameterized bounded read (`ReadSpec`).
         ScanSpec = 13,
-        /// A `ScanSpec` with a delta bound. Its own kind because the worker's
-        /// inline-vs-defer matrix is a function of `(context, kind)` alone.
-        DeltaScanSpec = 14,
+        /// One DELTA_POLL view: `seek_col_idx` = `after_tick`, `seek_pk` = the cut
+        /// round, `seek_pk_extra` = the reply block.
+        DeltaRead = 14,
         /// The zone-closing commit sentinel: a slotless group no worker acts on.
         /// All preceding groups at the same LSN belong to the zone; recovery
         /// applies them only when this reaches disk.
@@ -408,8 +412,8 @@ impl SalMessageKind {
         use SalMessageKind::*;
         match self {
             Push | HasPk => false,
-            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | Backfill | UniquePreflight | Tick
-            | SeekByIndex | Seek | ScanSpec | DeltaScanSpec | ZoneCommit => true,
+            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | Backfill | UniquePreflight | Tick | Seek
+            | ScanSpec | DeltaRead | ZoneCommit => true,
         }
     }
 }

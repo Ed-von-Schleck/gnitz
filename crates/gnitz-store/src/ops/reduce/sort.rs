@@ -1,50 +1,10 @@
 //! Group-column comparator and PK-ordered argsort used by the reduce operator.
 
-use std::cmp::Ordering;
-
+use crate::schema::key::PkSortKey;
 use crate::schema::key::{compare_pk_bytes, pk_width_dispatch};
-use crate::schema::{key::PkSortKey, ColumnLocator};
 use crate::storage::MemBatch;
-use gnitz_expr::RowSource;
 
 use super::super::group_key::GroupKeyCols;
-
-/// Compare two rows by group columns through pre-resolved [`ColumnLocator`]s
-/// (the reduce plan's baked `group_key.cols`). Generic over two
-/// [`ColumnarSource`]s, so the group-walk boundary test and the ad-hoc fold's
-/// bucket confirmation share this one body.
-pub(super) fn compare_by_group_cols<A: RowSource, B: RowSource>(
-    src_a: &A,
-    row_a: usize,
-    src_b: &B,
-    row_b: usize,
-    descs: &[ColumnLocator],
-) -> Ordering {
-    let a_null_word = src_a.get_null_word(row_a);
-    let b_null_word = src_b.get_null_word(row_b);
-
-    for loc in descs {
-        // NULLs sort before non-NULLs (NULLS FIRST), so all NULLs on a column are
-        // adjacent and form a single group. A non-nullable column never has the
-        // bit set, so the gate is harmless there; a PK column answers `false` on
-        // both sides and falls through to the value compare.
-        match (loc.is_null_word(a_null_word), loc.is_null_word(b_null_word)) {
-            (true, true) => continue,
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            (false, false) => {}
-        }
-        // Addressing and order rule both come off the locator: a PK column
-        // compares its own OPK byte window, not the whole PK region — the latter
-        // would split compound-PK groups that agree on the addressed column but
-        // differ elsewhere in the key.
-        let ord = loc.cmp_non_null(src_a, row_a, src_b, row_b);
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
 
 /// Argsort `0..n` by a per-row key, materialised ONCE — `key` is never
 /// re-invoked per comparison (nor a 32-byte `[u128; 2]` key re-copied, as
@@ -64,7 +24,7 @@ fn argsort_by_key<K: Ord>(n: usize, key: impl Fn(usize) -> K) -> Vec<u32> {
 /// Argsort a delta batch into group order: the rows of one group land
 /// contiguously, ordered by the plan's baked group key.
 ///
-/// Sorting by the key rather than by `compare_by_group_cols` cannot fragment a
+/// Sorting by the key rather than by `cmp_group_cols` cannot fragment a
 /// group — every row of one group yields the identical key. A non-injective key
 /// can only *merge* two groups, and the emitted output PK is that same digest,
 /// so the merge is already decided elsewhere.

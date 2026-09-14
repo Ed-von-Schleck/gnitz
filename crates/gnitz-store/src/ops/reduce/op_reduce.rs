@@ -8,7 +8,8 @@ use crate::storage::{Batch, MemBatch, ReadCursor};
 use super::agg::Accumulator;
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::ReducePlan;
-use super::sort::{argsort_delta, argsort_pk_canonical, compare_by_group_cols};
+use super::sort::{argsort_delta, argsort_pk_canonical};
+use gnitz_expr::cmp_group_cols;
 
 /// Per-group delta rows the AVI probe-skip path will pre-step into a MIN/MAX
 /// accumulator before giving up and probing. Pre-stepping is O(positive rows),
@@ -55,7 +56,7 @@ impl<'a> GroupBoundary<'a> {
         match *self {
             GroupBoundary::Pk(pk) => pk_bytes_eq(mb.get_pk_bytes(row), pk),
             GroupBoundary::Cols { descs, exemplar } => {
-                compare_by_group_cols(mb, row, mb, exemplar, descs) == std::cmp::Ordering::Equal
+                cmp_group_cols(mb, row, mb, exemplar, descs) == std::cmp::Ordering::Equal
             }
             GroupBoundary::Single => true,
         }

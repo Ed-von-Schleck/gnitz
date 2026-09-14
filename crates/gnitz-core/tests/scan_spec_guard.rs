@@ -6,7 +6,7 @@
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{ClientError, GnitzClient, TABLE_TAB};
 use gnitz_test_harness::ServerHandle;
-use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
+use gnitz_wire::{ReadBound, ReadSpec};
 
 #[test]
 fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
@@ -16,7 +16,7 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
     let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    let spec = ReadSpec::encode_parts(&ReadBound::None, &[], &ReadSink::all_rows());
+    let spec = ReadSpec::all_rows(ReadBound::None);
 
     // `handle_scan_spec` rejects the system tid at the verb, before a single
     // worker is dispatched — so the reply schema below is never consulted.

@@ -7,7 +7,7 @@
 //!
 //! Semantics parity with a CREATE VIEW of the same statement is **structural**,
 //! not reimplemented: the accumulation kernel (`Accumulator::step_from_batch`),
-//! the group comparator (`compare_by_group_cols`), the group-key hash
+//! the group comparator (`cmp_group_cols`), the group-key hash
 //! (`GroupKeyCols`), and the emission path (`emit_reduce_row` driven by a
 //! `ReducePlan`) are the exact shared code a view's reduce runs, so partial agg
 //! columns are byte-identical to a view's reduce output.
@@ -24,6 +24,7 @@
 
 use std::cmp::Ordering;
 
+use gnitz_expr::cmp_group_cols;
 use rustc_hash::FxHashMap;
 
 use gnitz_wire::AggReadSpec;
@@ -32,7 +33,6 @@ use super::agg::Accumulator;
 
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::ReducePlan;
-use super::sort::compare_by_group_cols;
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
@@ -155,8 +155,7 @@ impl AdhocFold {
             // probe alike, so a digest collision can never merge two groups.
             let same = |ord: u32| {
                 injective_key
-                    || compare_by_group_cols(&mb, row, &rep_mb, ord as usize, plan.group_key.cols.locs())
-                        == Ordering::Equal
+                    || cmp_group_cols(&mb, row, &rep_mb, ord as usize, plan.group_key.cols.locs()) == Ordering::Equal
             };
             let ord = match *last {
                 Some((k, ord)) if k == key && same(ord) => ord,

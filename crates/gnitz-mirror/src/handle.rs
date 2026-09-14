@@ -348,7 +348,12 @@ impl MirrorStore for Mirror {
         self.touching("scanning a copy", |m| m.scan_inner(tid, schema))
     }
 
-    fn scan_spec(&mut self, tid: u64, spec: &[u8], reply_schema: &Schema) -> Result<ZSetBatch, MirrorError> {
+    fn scan_spec(
+        &mut self,
+        tid: u64,
+        spec: gnitz_wire::ReadSpec,
+        reply_schema: &Schema,
+    ) -> Result<ZSetBatch, MirrorError> {
         self.touching("running a read spec", |m| m.scan_spec_inner(tid, spec, reply_schema))
     }
 

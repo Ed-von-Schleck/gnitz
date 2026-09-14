@@ -157,6 +157,7 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
             target_id: 77,
             client_id: 0xC1,
             seek_pk: 4242,
+            seek_col_idx: 31,
             seek_pk_extra: &[9, 8, 7],
             ..Default::default()
         }
@@ -168,14 +169,17 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
         .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::Tick, 999, 3), control_frame(999))
         .is_none());
     assert!(wp
-        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::DeltaScanSpec, 77, 0), frame)
+        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::DeltaRead, 77, 0), frame)
         .is_none());
     assert_eq!(wp.exchange.deferred_replay.len(), 2, "one queue, in SAL order");
     assert_eq!(wp.exchange.deferred_replay[0].kind, SalMessageKind::Tick);
     let read = &wp.exchange.deferred_replay[1];
-    assert_eq!(read.kind, SalMessageKind::DeltaScanSpec);
+    assert_eq!(read.kind, SalMessageKind::DeltaRead);
     let ctrl = &read.wire.control;
-    assert_eq!((ctrl.target_id, ctrl.client_id, ctrl.seek_pk), (77, 0xC1, 4242));
+    assert_eq!(
+        (ctrl.target_id, ctrl.client_id, ctrl.seek_pk, ctrl.seek_col_idx),
+        (77, 0xC1, 4242, 31)
+    );
     assert_eq!(ctrl.seek_pk_extra.as_slice(), &[9, 8, 7]);
 }
 

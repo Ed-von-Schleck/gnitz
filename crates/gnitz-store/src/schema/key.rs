@@ -800,6 +800,19 @@ impl SchemaDescriptor {
         range_shares_prefix(&start, end.as_ref(), self.dist_stride())
             .then(|| self.worker_for_pk(start.pk_bytes(), num_workers))
     }
+
+    /// OPK `keys` split by owning worker, each slot in list order. `None` unless
+    /// this placement routes by key and `stride` is its PK stride.
+    pub fn keys_by_owner(&self, stride: usize, keys: &[u8], num_workers: usize) -> Option<Vec<Vec<u8>>> {
+        if !self.placement().is_key_routed() || stride != self.pk_stride() {
+            return None;
+        }
+        let mut by_owner = vec![Vec::new(); num_workers];
+        for key in keys.chunks_exact(stride) {
+            by_owner[self.worker_for_pk(key, num_workers)].extend_from_slice(key);
+        }
+        Some(by_owner)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -828,7 +841,7 @@ pub(crate) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &
 /// Hash one group column into the streaming fold — the single per-column body
 /// [`FoldCols::key_row`] streams.
 ///
-/// Reads the null bit unconditionally, like the sibling `compare_by_group_cols`:
+/// Reads the null bit unconditionally, like the sibling `cmp_group_cols`:
 /// a NOT NULL column never carries one, so masking it off would cost a per-row
 /// AND to change nothing.
 #[inline]

@@ -510,7 +510,8 @@ def test_the_zero_image_holder_survives_a_flood_of_nulls(client, schema_name, co
     insert(client, sn, "t", [(_HOLDER_PK, value)])
     insert(client, sn, "t", _NULLS)
 
-    assert bag(client.seek_by_index(tid, [1], [seek_key])) == {(_HOLDER_PK, value): 1}
+    _, schema = client.resolve_table(sn, "t")
+    assert bag(client.seek_by_index(tid, schema, [1], [seek_key])) == {(_HOLDER_PK, value): 1}
     for stmt in (f"UPDATE t SET a = {value} WHERE a = {value}", f"DELETE FROM t WHERE a = {value}"):
         res = client.execute_sql(stmt, schema_name=sn)
         assert (res[0]["type"], res[0]["count"]) == ("RowsAffected", 1), stmt
@@ -543,7 +544,8 @@ def test_a_value_moved_across_the_drop_index_window(client, schema_name):
         f"DROP INDEX ix; DELETE FROM t WHERE pk = {_HOLDER_PK}; INSERT INTO t VALUES ({moved}, 7); "
         "CREATE UNIQUE INDEX ix ON t(a)", schema_name=sn)
 
-    assert bag(client.seek_by_index(tid, [1], [7])) == {(moved, 7): 1}
+    _, schema = client.resolve_table(sn, "t")
+    assert bag(client.seek_by_index(tid, schema, [1], [7])) == {(moved, 7): 1}
     with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
         client.execute_sql(f"INSERT INTO t VALUES ({other}, 88), ({fresh}, 7)" + _UPSERT_A, schema_name=sn)
     assert bag(scanned(client, sn, "t")) == {(moved, 7): 1, (other, 77): 1}

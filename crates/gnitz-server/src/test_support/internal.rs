@@ -246,3 +246,39 @@ pub fn try_register_identity_view(
 pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: i64, name: &str, cols: &[ColumnDef]) -> i64 {
     try_register_identity_view(engine, source_tid, name, cols, 0, 0).unwrap()
 }
+
+/// The rows an `IndexRange`/`Required` read of `range` over `cols` returns, or
+/// `None` when none match — the production read, through `open_bound`.
+pub fn seek_by_index_range(
+    engine: &mut CatalogEngine,
+    tid: i64,
+    cols: &[u32],
+    range: gnitz_wire::RangeDescriptor,
+) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
+    let schema = engine
+        .registry()
+        .relation_or_err(tid)
+        .map_err(|e| gnitz_wire::WireFault::from(e.to_string()))?
+        .schema();
+    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::IndexRange {
+        bound: gnitz_wire::IndexBound {
+            idx_cols: gnitz_wire::PkColList::from_slice(cols),
+            desc: range,
+        },
+        walk: gnitz_wire::IndexWalk::Required,
+    });
+    let rows = engine.scan_spec(tid, spec, &schema)?;
+    Ok(((!rows.is_empty()).then_some(rows), schema))
+}
+
+/// [`seek_by_index_range`] at the point `natives` names: equality on every
+/// supplied value, fewer than `cols` for a prefix seek.
+pub fn seek_by_index(
+    engine: &mut CatalogEngine,
+    tid: i64,
+    cols: &[u32],
+    natives: &[u128],
+) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
+    let (&last, eq) = natives.split_last().expect("at least one key value");
+    seek_by_index_range(engine, tid, cols, gnitz_wire::RangeDescriptor::point(eq, last))
+}

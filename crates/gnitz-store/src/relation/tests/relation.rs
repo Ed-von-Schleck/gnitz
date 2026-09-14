@@ -66,7 +66,7 @@ fn test_add_remove_index_circuit() {
     registry.close();
 }
 
-/// `SeekByIndex` hands `index_cols` its `seek_col_idx` raw, where `HasPk` would
+/// `UniquePreflight` hands `index_cols` its `seek_col_idx` raw, where `HasPk` would
 /// have read `0` through `probe_key_columns` as the relation's own PK store.
 /// Neither `0` nor a garbage non-zero word names a column list.
 #[test]
@@ -81,11 +81,11 @@ fn a_flag_clear_seek_col_idx_names_no_index() {
     registry.add_index(50, 999, &[2], false).unwrap();
 
     assert!(registry
-        .index_cols(50, gnitz_wire::pack_pk_cols(&[2]), "seek_by_index")
+        .index_cols(50, gnitz_wire::pack_pk_cols(&[2]), "unique pre-flight")
         .is_ok());
     for raw in [gnitz_wire::PROBE_KEYSPACE_PK, 2] {
         let err = registry
-            .index_cols(50, raw, "seek_by_index")
+            .index_cols(50, raw, "unique pre-flight")
             .expect_err("a flag-clear word names no column list");
         assert!(err.to_string().contains("invalid column list"), "{raw}: {err}");
     }

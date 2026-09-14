@@ -192,7 +192,7 @@ fn test_seek_by_index_found() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Seek by index: val=200 → should find PK=20
-    let result = engine.registry_mut().seek_by_index(tid, &[1], &[200u128]).unwrap().0;
+    let result = seek_by_index(&mut engine, tid, &[1], &[200u128]).unwrap().0;
     assert!(result.is_some());
     let row = result.unwrap();
     assert_eq!(row.len(), 1);
@@ -219,7 +219,7 @@ fn test_seek_by_index_not_found() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Seek by index: val=999 → should return None
-    let result = engine.registry_mut().seek_by_index(tid, &[1], &[999u128]).unwrap().0;
+    let result = seek_by_index(&mut engine, tid, &[1], &[999u128]).unwrap().0;
     assert!(result.is_none());
 
     engine.close();
@@ -256,23 +256,19 @@ fn test_seek_by_index_negative_i64() {
     // The seek key is the value's native bit pattern (2's complement); the index
     // stores it order-preserving (signed I64 OPK) and the seek re-encodes
     // identically, so an equality lookup finds it regardless of sign.
-    let result = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1], &[(-1i64) as u64 as u128])
+    let result = seek_by_index(&mut engine, tid, &[1], &[(-1i64) as u64 as u128])
         .unwrap()
         .0;
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
-    let result2 = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1], &[(-5i64) as u64 as u128])
+    let result2 = seek_by_index(&mut engine, tid, &[1], &[(-5i64) as u64 as u128])
         .unwrap()
         .0;
     assert!(result2.is_some(), "index must find row with score=-5");
     assert_eq!(result2.unwrap().get_pk(0), 1);
 
-    let result3 = engine.registry_mut().seek_by_index(tid, &[1], &[10u128]).unwrap().0;
+    let result3 = seek_by_index(&mut engine, tid, &[1], &[10u128]).unwrap().0;
     assert!(result3.is_some(), "index must still find positive values");
     assert_eq!(result3.unwrap().get_pk(0), 4);
 
@@ -307,23 +303,19 @@ fn test_seek_by_index_negative_i32() {
     // The seek key is the I32 value's zero-extended native bit pattern; projection
     // and seek both sign-extend it from I32 into the promoted signed I64 index
     // column, so the equality lookup matches.
-    let result = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1], &[(-1i32) as u32 as u128])
+    let result = seek_by_index(&mut engine, tid, &[1], &[(-1i32) as u32 as u128])
         .unwrap()
         .0;
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 1);
 
-    let result2 = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1], &[(-100i32) as u32 as u128])
+    let result2 = seek_by_index(&mut engine, tid, &[1], &[(-100i32) as u32 as u128])
         .unwrap()
         .0;
     assert!(result2.is_some(), "index must find row with score=-100");
     assert_eq!(result2.unwrap().get_pk(0), 2);
 
-    let result3 = engine.registry_mut().seek_by_index(tid, &[1], &[42u128]).unwrap().0;
+    let result3 = seek_by_index(&mut engine, tid, &[1], &[42u128]).unwrap().0;
     assert!(result3.is_some(), "index must still find positive values");
     assert_eq!(result3.unwrap().get_pk(0), 3);
 
@@ -352,11 +344,11 @@ fn test_seek_by_index_u8_column() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let result = engine.registry_mut().seek_by_index(tid, &[1], &[42u128]).unwrap().0;
+    let result = seek_by_index(&mut engine, tid, &[1], &[42u128]).unwrap().0;
     assert!(result.is_some(), "U8 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 10);
 
-    let result2 = engine.registry_mut().seek_by_index(tid, &[1], &[99u128]).unwrap().0;
+    let result2 = seek_by_index(&mut engine, tid, &[1], &[99u128]).unwrap().0;
     assert!(result2.is_some());
     assert_eq!(result2.unwrap().get_pk(0), 20);
 
@@ -383,7 +375,7 @@ fn test_seek_by_index_u16_column() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let result = engine.registry_mut().seek_by_index(tid, &[1], &[443u128]).unwrap().0;
+    let result = seek_by_index(&mut engine, tid, &[1], &[443u128]).unwrap().0;
     assert!(result.is_some(), "U16 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
@@ -610,16 +602,16 @@ fn test_compound_pk_secondary_index_seek() {
     engine.registry_mut().flush(tid).unwrap();
 
     // val=100 → exactly one match
-    let r = engine.registry_mut().seek_by_index(tid, &[2], &[100u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[2], &[100u128]).unwrap().0;
     assert!(r.is_some(), "val=100 should find a row");
     assert_eq!(r.unwrap().len(), 1);
 
     // val=300 → one match (a=10, b=2)
-    let r = engine.registry_mut().seek_by_index(tid, &[2], &[300u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[2], &[300u128]).unwrap().0;
     assert!(r.is_some(), "val=300 should find a row");
 
     // val=999 → miss
-    let r = engine.registry_mut().seek_by_index(tid, &[2], &[999u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[2], &[999u128]).unwrap().0;
     assert!(r.is_none(), "val=999 should miss");
 
     engine.close();
@@ -648,12 +640,7 @@ fn test_compound_pk_secondary_index_retract() {
     engine.ingest_to_family(tid, &b).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    assert!(engine
-        .registry_mut()
-        .seek_by_index(tid, &[2], &[500u128])
-        .unwrap()
-        .0
-        .is_some());
+    assert!(seek_by_index(&mut engine, tid, &[2], &[500u128]).unwrap().0.is_some());
 
     // Retract the same row.
     let mut rb = BatchBuilder::new(schema);
@@ -665,12 +652,7 @@ fn test_compound_pk_secondary_index_retract() {
     engine.registry_mut().flush(tid).unwrap();
 
     assert!(
-        engine
-            .registry_mut()
-            .seek_by_index(tid, &[2], &[500u128])
-            .unwrap()
-            .0
-            .is_none(),
+        seek_by_index(&mut engine, tid, &[2], &[500u128]).unwrap().0.is_none(),
         "after retraction the indexed value must not resolve to a row"
     );
 
@@ -796,7 +778,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
 
     // The indexed value resolves to an orphan whose source row is missing.
     // Must return None and, crucially, must not hang.
-    let r = engine.registry_mut().seek_by_index(tid, &[1], &[777u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[1], &[777u128]).unwrap().0;
     assert!(r.is_none(), "orphan index entry must resolve to no source row");
 
     engine.close();
@@ -1179,21 +1161,13 @@ fn test_composite_index_full_key_seek() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Full-key seek (a=1, b=200) → PK 20 only. cols a=1, b=2.
-    let r = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1, 2], &[1u128, 200u128])
-        .unwrap()
-        .0;
+    let r = seek_by_index(&mut engine, tid, &[1, 2], &[1u128, 200u128]).unwrap().0;
     let r = r.expect("full-key composite seek must find a row");
     assert_eq!(r.len(), 1);
     assert_eq!(r.get_pk(0), 20);
 
     // A full key that matches no row → None.
-    let none = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1, 2], &[1u128, 999u128])
-        .unwrap()
-        .0;
+    let none = seek_by_index(&mut engine, tid, &[1, 2], &[1u128, 999u128]).unwrap().0;
     assert!(none.is_none());
 
     engine.close();
@@ -1231,7 +1205,7 @@ fn test_composite_index_leading_prefix_seek() {
 
     // Leading-prefix seek over (a, b) supplying only a=1 (K=1 < N=2) must match
     // every row with a=1 (PKs 10 and 20), regardless of b.
-    let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[1, 2], &[1u128]).unwrap().0;
     let r = r.expect("leading-prefix seek must find rows");
     let mut pks: Vec<u128> = (0..r.len()).map(|i| r.get_pk(i)).collect();
     pks.sort();
@@ -1274,9 +1248,7 @@ fn test_composite_index_signed_unsigned_u128_mix() {
     engine.registry_mut().flush(tid).unwrap();
 
     // i32(-5) is its zero-extended u32 bit pattern as the native key.
-    let r = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1, 2, 3], &[(-5i32) as u32 as u128, 7u128, big])
+    let r = seek_by_index(&mut engine, tid, &[1, 2, 3], &[(-5i32) as u32 as u128, 7u128, big])
         .unwrap()
         .0;
     let r = r.expect("mixed-width composite seek must find the row");
@@ -1315,7 +1287,7 @@ fn test_composite_index_null_in_any_key_skipped() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Leading-prefix seek a=1 must find only PK 20 (PK 10 has NULL b → not indexed).
-    let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[1, 2], &[1u128]).unwrap().0;
     let r = r.expect("seek must find the non-null row");
     assert_eq!(r.len(), 1);
     assert_eq!(r.get_pk(0), 20);
@@ -1823,7 +1795,7 @@ const OPEN_ABOVE: Cut = Cut::type_edges(TypeCode::U64).unwrap().1;
 /// Collect the positive-weight source PKs returned by a range scan, sorted.
 fn range_pks(engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128], start: Cut, end: Cut) -> Vec<u128> {
     let desc = RangeDescriptor::new(eq, start, end);
-    let r = engine.registry_mut().seek_by_index_range(tid, cols, &desc).unwrap().0;
+    let r = seek_by_index_range(engine, tid, cols, desc).unwrap().0;
     let mut pks: Vec<u128> = match r {
         Some(b) => (0..b.len())
             .filter(|&i| b.get_weight(i) > 0)
@@ -2120,9 +2092,12 @@ fn test_seek_by_index_range_no_range_column_errs() {
 
     // n_eq == arity → no range column; the pub method must self-guard with Err,
     // never panic indexing past the column list.
-    let r = engine
-        .registry_mut()
-        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[10], After(0), OPEN_ABOVE));
+    let r = seek_by_index_range(
+        &mut engine,
+        tid,
+        &[1],
+        RangeDescriptor::new(&[10], After(0), OPEN_ABOVE),
+    );
     assert!(r.is_err(), "n_eq == index arity must be rejected");
     assert!(r.err().unwrap().to_string().contains("no range column"));
 
@@ -2251,7 +2226,7 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
 /// Collect `(pk, payload_col0, weight)` for every positive-weight row of a
 /// narrow-PK result batch, sorted by PK — the order-insensitive reference form
 /// for comparing a seek result against an expected multiset.
-fn result_triples(r: Option<Batch>) -> Vec<(u128, u64, i64)> {
+fn result_triples(r: Option<Rc<Batch>>) -> Vec<(u128, u64, i64)> {
     let mut out: Vec<(u128, u64, i64)> = match r {
         Some(b) => {
             let col = b.col_data(0);
@@ -2294,9 +2269,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     engine.registry_mut().flush(tid).unwrap();
 
     // x ∈ [10, 20] → all six rows, each at weight 1.
-    let r = engine
-        .registry_mut()
-        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
+    let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
         .unwrap()
         .0;
     assert_eq!(
@@ -2313,9 +2286,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     engine.ingest_to_family(tid, &rb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let r = engine
-        .registry_mut()
-        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
+    let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
         .unwrap()
         .0;
     assert_eq!(
@@ -2364,9 +2335,7 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Prefix seek a=7 → PKs {1,2,5,8}, all with a=7; PK 99 (a=8) absent.
-    let r = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1, 2], &[7u128])
+    let r = seek_by_index(&mut engine, tid, &[1, 2], &[7u128])
         .unwrap()
         .0
         .expect("prefix seek must find the a=7 rows");
@@ -2410,9 +2379,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let r = engine
-        .registry_mut()
-        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], After(15), Before(25)))
+    let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], After(15), Before(25)))
         .unwrap()
         .0;
     assert!(
@@ -2483,9 +2450,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     engine.registry_mut().flush(tid).unwrap();
 
     // x ∈ [10, 30] → all three wide-PK rows, resolved by their full 24-byte key.
-    let r = engine
-        .registry_mut()
-        .seek_by_index_range(tid, &[3], &RangeDescriptor::new(&[], Before(10), After(30)))
+    let r = seek_by_index_range(&mut engine, tid, &[3], RangeDescriptor::new(&[], Before(10), After(30)))
         .unwrap()
         .0
         .expect("wide-PK range scan must resolve all three rows");
@@ -2529,9 +2494,7 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let r = engine
-        .registry_mut()
-        .seek_by_index(tid, &[1], &[50u128])
+    let r = seek_by_index(&mut engine, tid, &[1], &[50u128])
         .unwrap()
         .0
         .expect("full-arity equality seek must find the x=50 group");
@@ -2551,15 +2514,15 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
 
 /// Collect `(pk, a, b, weight)` (payload slots 0, 1) for every positive-weight
 /// row, sorted — the composite-index reference form.
-fn result_ab_quads(r: Option<Batch>) -> Vec<(u128, u64, u64, i64)> {
+fn result_ab_quads(r: Option<Rc<Batch>>) -> Vec<(u128, u64, u64, i64)> {
     let mut out: Vec<(u128, u64, u64, i64)> = match r {
         Some(b) => (0..b.len())
             .filter(|&i| b.get_weight(i) > 0)
             .map(|i| {
                 (
                     b.get_pk(i),
-                    payload_u64(&b, i, 0),
-                    payload_u64(&b, i, 1),
+                    payload_u64(&*b, i, 0),
+                    payload_u64(&*b, i, 1),
                     b.get_weight(i),
                 )
             })
@@ -2602,7 +2565,7 @@ fn test_seek_by_index_composite_prefix_null_gate() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[5u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[1, 2], &[5u128]).unwrap().0;
     assert_eq!(
         result_ab_quads(r),
         vec![(1, 5, 9, 1)],
@@ -2634,13 +2597,11 @@ fn test_seek_by_index_multi_value_regression() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let r = engine.registry_mut().seek_by_index(tid, &[1], &[20u128]).unwrap().0;
+    let r = seek_by_index(&mut engine, tid, &[1], &[20u128]).unwrap().0;
     assert_eq!(result_triples(r), vec![(2, 20, 1)]);
 
     // val ∈ [10, 20]
-    let rr = engine
-        .registry_mut()
-        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
+    let rr = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
         .unwrap()
         .0;
     assert_eq!(result_triples(rr), vec![(1, 10, 1), (2, 20, 1)]);
@@ -2675,7 +2636,7 @@ fn compensated_drop_index_refills_the_restored_circuit() {
 
     engine.compensate_stage_a(None).unwrap();
 
-    let found = engine.registry_mut().seek_by_index(tid, &[1], &[200u128]).unwrap().0;
+    let found = seek_by_index(&mut engine, tid, &[1], &[200u128]).unwrap().0;
     let row = found.expect("the restored index must hold the flushed row");
     assert_eq!(row.get_pk(0), 20);
 

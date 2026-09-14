@@ -191,18 +191,18 @@ def test_an_acked_create_index_survives_a_crash(own_server):
                          schema_name="idxcrash")
 
         conn.execute_sql("CREATE INDEX ON c1(val)", schema_name="idxcrash")
-        c1, _ = conn.resolve_table("idxcrash", "c1")
+        c1, c1_schema = conn.resolve_table("idxcrash", "c1")
         VAL_COL = 5  # cid, f1..f4, val
-        assert bag(conn.seek_by_index(c1, [VAL_COL], [77]), "cid") == {(1,): 1}, \
+        assert bag(conn.seek_by_index(c1, c1_schema, [VAL_COL], [77]), "cid") == {(1,): 1}, \
             "index missing pre-crash"
 
     # SIGKILL before any further checkpoint: the CREATE INDEX lives only in the
     # SAL, guarded by the watermark dedup.
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
-        c1_again, _ = conn.resolve_table("idxcrash", "c1")
+        c1_again, c1_schema_again = conn.resolve_table("idxcrash", "c1")
         assert c1_again == c1
-        assert bag(conn.seek_by_index(c1_again, [VAL_COL], [77]), "cid") == {(1,): 1}, \
+        assert bag(conn.seek_by_index(c1_again, c1_schema_again, [VAL_COL], [77]), "cid") == {(1,): 1}, \
             "acknowledged CREATE INDEX lost after crash recovery"
 
 

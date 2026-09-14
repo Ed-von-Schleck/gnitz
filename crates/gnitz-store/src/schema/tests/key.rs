@@ -1665,6 +1665,36 @@ fn confined_worker_follows_the_distribution_prefix() {
     );
 }
 
+/// Every key lands in its owner's slot, in list order, and nothing else does;
+/// a key list whose stride is not the schema's, or a placement no key routes,
+/// has no owners to split by.
+#[test]
+fn keys_by_owner_splits_in_list_order_and_declines_the_rest() {
+    let s = pk_only_schema(&[type_code::U64]);
+    let keys: Vec<u8> = (0..200u64).flat_map(|k| opk_pk(&s, &[k as u128])).collect();
+    let by_owner = s.keys_by_owner(8, &keys, NW).expect("a key-routed schema splits");
+    assert_eq!(by_owner.len(), NW);
+    let mut union: Vec<&[u8]> = Vec::new();
+    for (w, slot) in by_owner.iter().enumerate() {
+        assert!(slot.chunks_exact(8).is_sorted_by(|a, b| a < b), "slot {w} ascends");
+        for key in slot.chunks_exact(8) {
+            assert_eq!(s.worker_for_pk(key, NW), w, "a key sits in its owner's slot");
+        }
+        union.extend(slot.chunks_exact(8));
+    }
+    union.sort();
+    assert_eq!(
+        union,
+        keys.chunks_exact(8).collect::<Vec<_>>(),
+        "the slots partition the list"
+    );
+
+    assert_eq!(s.keys_by_owner(16, &keys, NW), None, "a foreign stride");
+    for p in [Placement::Replicated, Placement::Local] {
+        assert_eq!(s.with_placement(p).keys_by_owner(8, &keys, NW), None, "{p:?}");
+    }
+}
+
 /// A maximal-value point carries out of `succ`, so its range has no `end` —
 /// the all-`0xFF` last key must still confine it rather than broadcast. The
 /// signed maximum's OPK is all-`0xFF` too (sign-flip).

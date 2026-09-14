@@ -102,7 +102,12 @@ impl MirrorStore for StubStore {
         Ok(ZSetBatch::new(schema))
     }
 
-    fn scan_spec(&mut self, _tid: u64, _spec: &[u8], reply_schema: &Schema) -> Result<ZSetBatch, MirrorError> {
+    fn scan_spec(
+        &mut self,
+        _tid: u64,
+        _spec: gnitz_wire::ReadSpec,
+        reply_schema: &Schema,
+    ) -> Result<ZSetBatch, MirrorError> {
         Ok(ZSetBatch::new(reply_schema))
     }
 
@@ -166,7 +171,7 @@ impl Peer {
         gnitz_wire::txn_frame::decode_delta_poll(&frame)
             .expect("a delta poll")
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|v| v.view_id)
             .collect()
     }
 
@@ -365,14 +370,13 @@ fn only_a_vanished_relation_pays_a_probe() {
 fn a_leftover_slot_does_not_shift_the_replies() {
     let schema = Arc::new(view_schema());
     let rs = ReplySchema::new(Arc::clone(&schema), 7);
-    let spec = gnitz_wire::ReadSpec::encode_parts(&gnitz_wire::ReadBound::None, &[], &gnitz_wire::ReadSink::all_rows());
+    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
     // A slot submitted and never drained: what an aborting park leaves behind.
     let (mut client, peer, _log) = fixture_priming(&[(7, "a", 4), (8, "b", 4)], |s| {
         s.submit(Request::ScanSpec {
             target_id: 7,
             spec: &spec,
             reply_schema: &rs,
-            raw: true,
         })
         .unwrap();
     });
@@ -431,7 +435,7 @@ fn no_recovery_runs_before_every_ingest_has() {
         peer.reply_resolved(9);
         peer.expect_request("the re-resolve");
         peer.reply_resolved(9);
-        peer.expect_request("the bootstrap");
+        assert_eq!(peer.expect_poll("the bootstrap"), vec![9]);
         peer.reply_watermark(9, TAG, 20);
         (peer, ids[0], ids[1])
     });
@@ -482,7 +486,7 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
         // copy is advanced from where phase 1 left it rather than re-read.
         peer.expect_request("the re-resolve");
         peer.reply_resolved(8);
-        assert_eq!(peer.expect_request("the follow-up poll"), 8);
+        assert_eq!(peer.expect_poll("the follow-up poll"), vec![8]);
         peer.reply_watermark(8, TAG, 12);
         peer.quiet("the live copy is not re-read");
         peer

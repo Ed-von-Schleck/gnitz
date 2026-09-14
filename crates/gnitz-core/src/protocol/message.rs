@@ -174,8 +174,8 @@ fn encode_parts(
 /// `ClientTransport::send_parts`, or hand them to the outbound queue, for
 /// framing.
 ///
-/// `seek_pk` / `seek_pk_extra` carry the seek key for `FLAG_SEEK` /
-/// `FLAG_SEEK_BY_INDEX` frames, already in the wire's two-field form
+/// `seek_pk` / `seek_pk_extra` carry the seek key for `FLAG_SEEK` frames,
+/// already in the wire's two-field form
 /// (`gnitz_wire::control::split_ctrl_key`); a non-seek frame passes `(0, &[])`.
 ///
 /// `data` pairs the rows with the schema they were encoded against, so a data
@@ -272,9 +272,8 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> 
 
 /// Encode one control-only frame: no schema block, no data block.
 ///
-/// This channel also carries the SEEK_BY_INDEX_RANGE `RangeDescriptor` — up to
-/// 82 bytes at max arity, past the `MAX_PK_BYTES - 16` a split seek key can
-/// reach. The control block's BLOB column has no such cap.
+/// This channel also carries a SCAN_SPEC request blob, which the control
+/// block's BLOB column takes at any length.
 pub(crate) fn encode_control_frame(
     target_id: u64,
     client_id: u64,

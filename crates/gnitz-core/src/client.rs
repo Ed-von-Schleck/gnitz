@@ -264,7 +264,7 @@ pub struct RelDescriptor {
     pub tid: u64,
     pub class: RelClass,
     pub replicated: bool,
-    /// The view keeps a delta feed, so `ReadBound::Delta` against it is answerable.
+    /// The view keeps a delta feed, so a DELTA_POLL of it is answerable.
     pub delta: bool,
     pub schema: Arc<Schema>,
     pub indexes: Arc<Vec<IndexMeta>>,
@@ -599,22 +599,16 @@ impl GnitzClient {
         self.session.scan(table_id)
     }
 
-    /// Run a parameterized bounded read (`ReadSpec`) — the ad-hoc SELECT access
-    /// path. `spec` is the encoded `ReadSpec`; `reply_schema` is the projected
-    /// reply schema, shipped with the request and used to decode every reply
-    /// frame (the server sends none back). Returns one batch; the SQL layer
-    /// applies the client-side ORDER BY / LIMIT window. Bypasses the schema
-    /// cache, so it never poisons a later plain `scan` of the same table.
+    /// Run a parameterized bounded read — the ad-hoc SELECT access path — decoding
+    /// every reply frame under `reply_schema`, since the server sends no schema block.
     pub fn scan_spec(
         &mut self,
         table_id: u64,
-        spec: &[u8],
+        spec: &gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Result<ZSetBatch, ClientError> {
-        // An ad-hoc SELECT holds no cursor across reads, so the terminal
-        // watermark is dropped here rather than pushed through every caller.
         let rs = ReplySchema::new(Arc::clone(reply_schema), table_id);
-        self.session.scan_spec(table_id, spec, &rs).map(|(b, _)| b)
+        self.session.scan_spec(table_id, spec, &rs)
     }
 
     // ── The read seam ──────────────────────────────────────────────────────
@@ -703,13 +697,13 @@ impl GnitzClient {
     pub fn scan_spec_local_first(
         &mut self,
         table_id: u64,
-        spec: &[u8],
+        spec: gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Result<ZSetBatch, ClientError> {
         if let Some((_, store)) = self.local_read(table_id) {
             return Ok(store.scan_spec(table_id, spec, reply_schema)?);
         }
-        self.scan_spec(table_id, spec, reply_schema)
+        self.scan_spec(table_id, &spec, reply_schema)
     }
 
     /// Replace the connection and keep the copies — what a host does after a
@@ -743,18 +737,9 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Bootstrap a view's delta feed: the view's whole current value, in the
-    /// view's own schema, together with the cursor to poll from.
-    ///
-    /// `Delta { after_tick: 0 }` is *the sum of every delta after round 0* —
-    /// the view's entire history, which is precisely what its output store
-    /// holds — so this costs exactly what a scan of the view costs, because it
-    /// is one. That is the price of joining, and it is paid once per subscriber
-    /// rather than once per poll.
-    ///
-    /// The reply carries true net weights: a bag-valued view's weight-3 row
-    /// arrives as weight 3, not as a presence bit. Apply it to a fresh copy —
-    /// this replaces state, it does not add to it.
+    /// Bootstrap a view's delta feed: the view's whole current value at its true
+    /// net weights, in the view's own schema, and the cursor to poll from. It
+    /// replaces a copy's state; it does not add to it.
     pub fn delta_bootstrap(
         &mut self,
         view_id: u64,
@@ -802,27 +787,21 @@ impl GnitzClient {
         self.delta_read_raw(view_id, 0, view_schema)
     }
 
-    /// The one request every delta call makes: a `ScanSpec` with a
-    /// `ReadBound::Delta` and an identity sink.
-    pub(crate) fn delta_spec(after_tick: u64) -> Vec<u8> {
-        gnitz_wire::ReadSpec::encode_parts(
-            &gnitz_wire::ReadBound::Delta { after_tick },
-            &[],
-            &gnitz_wire::ReadSink::all_rows(),
-        )
-    }
-
-    /// [`Self::delta_spec`] shipped, returning the rows and the terminal frame's
-    /// `(tag, T)` pair.
+    /// One view's delta read, decoded under `reply_schema`, with the terminal
+    /// frame's `(tag, T)` pair as a cursor.
     fn delta_read(
         &mut self,
         view_id: u64,
         after_tick: u64,
         reply_schema: &ReplySchema,
     ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
-        let spec = Self::delta_spec(after_tick);
-        let (data, watermark) = self.session.scan_spec(view_id, &spec, reply_schema)?;
-        Ok((data, DeltaCursor::from_watermark(watermark)))
+        let (blocks, cursor) = self.delta_read_raw(view_id, after_tick, reply_schema)?;
+        let schema = reply_schema.schema();
+        let mut data = ZSetBatch::new(&schema);
+        for b in &blocks {
+            crate::protocol::wal_block::decode_wal_block_into(&mut data, b.block(), &schema)?;
+        }
+        Ok((data, cursor))
     }
 
     /// [`Self::delta_read`] keeping the reply's raw blocks. The watermark comes
@@ -834,9 +813,8 @@ impl GnitzClient {
         after_tick: u64,
         reply_schema: &ReplySchema,
     ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        let spec = Self::delta_spec(after_tick);
-        let (blocks, watermark) = self.session.scan_spec_raw(view_id, &spec, reply_schema)?;
-        Ok((blocks, DeltaCursor::from_watermark(watermark)))
+        let (blocks, terminal) = self.session.delta_read(view_id, after_tick, reply_schema)?;
+        Ok((blocks, DeltaCursor::from_watermark(terminal.seek_pk)))
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
@@ -851,16 +829,6 @@ impl GnitzClient {
     /// the relation's schema, so no caller here needs one.
     pub fn seek(&mut self, table_id: u64, pk: u128, pk_extra: &[u8]) -> ScanResult {
         self.session.seek(table_id, pk, pk_extra)
-    }
-
-    /// Seek a secondary index by `col_indices` (the index's FULL declared column
-    /// list — the server matches the circuit by exact list) supplying `key_vals`
-    /// native key values. `key_vals.len()` may be `< col_indices.len()` for a
-    /// leading-prefix seek; the column list and the arity are validated in
-    /// `submit`, before a frame exists. The SQL planner does not come through
-    /// here — it ships a `ReadBound::IndexRange` through `scan_spec`.
-    pub fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
-        self.session.seek_by_index(table_id, col_indices, key_vals)
     }
 
     /// The statement's descriptor for `tid` — the by-id twin of [`Self::resolve`].

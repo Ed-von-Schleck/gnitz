@@ -1,8 +1,7 @@
-//! Read I/O on relation families — whole-relation scan, point and range seek
-//! (including secondary-index lookup), the batched FK parent probe, and the
-//! index-bounded cursor opener. Every one is a direct cursor walk except one
-//! that meets a capacity-bounded view's skeleton row, which goes through
-//! [`RelationRegistry::materialize_hydrated`].
+//! Read I/O on relation families — whole-relation scan, point and range seek,
+//! the batched FK parent probe, and the index-bounded cursor opener. Every one is
+//! a direct cursor walk except one that meets a capacity-bounded view's skeleton
+//! row, which goes through [`RelationRegistry::materialize_hydrated`].
 
 use std::rc::Rc;
 
@@ -207,59 +206,6 @@ impl RelationRegistry {
             }
         }
         Ok((out, result_schema))
-    }
-
-    /// Index-assisted lookup: the source rows whose leading `natives.len()`
-    /// indexed columns equal `natives` (`natives.len()` may be
-    /// `< col_indices.len()` for a leading-prefix scan).
-    ///
-    /// An equality seek IS the degenerate point range on the last supplied
-    /// column — by the OPK group-key property its cuts bound exactly the whole
-    /// duplicate group of the full supplied prefix — so this delegates to
-    /// [`Self::seek_by_index_range`]: one walk/gather mechanism under the
-    /// point seek, the range seek, and the bounded backfill.
-    ///
-    /// Rows with a NULL in ANY indexed column are absent from the index
-    /// (`batch_project_index` skips them), so a prefix scan returns only rows
-    /// whose trailing indexed columns are all non-NULL — the SQL planner must
-    /// not serve a prefix predicate from an index whose uncovered trailing
-    /// columns are nullable. (The gather's full-arity entry filter re-applies
-    /// that gate; see `BoundedIndexCursor::drain_chunk`.)
-    pub fn seek_by_index(
-        &self,
-        id: i64,
-        col_indices: &[u32],
-        natives: &[u128],
-    ) -> Result<(Option<Batch>, SchemaDescriptor), StoreError> {
-        let (&last, eq) = natives
-            .split_last()
-            .ok_or_else(|| StoreError::rejected("seek_by_index: no key values supplied"))?;
-        let range = gnitz_wire::RangeDescriptor::point(eq, last);
-        self.seek_by_index_range(id, col_indices, &range)
-    }
-
-    /// Ordered range scan over a secondary index: the leading
-    /// `range.eq_vals().len()` columns are equality-pinned, and the next index
-    /// column is bounded by the descriptor's half-open cut interval
-    /// `[start, end)`. The cut → byte-key mapping and its correctness argument
-    /// live on [`crate::schema::IndexKeySpec::range_keys`]; the walk is then
-    /// uniform — seek to `start`, advance while `key < end`. SQL bound semantics (inclusivity,
-    /// unboundedness, out-of-range saturation) are resolved to cuts in the
-    /// planner; none of them reach this layer.
-    ///
-    /// Returns this worker's matching source rows; the master broadcasts to every
-    /// worker and merges (the index shadows this worker's own base slice, so a
-    /// range's matches scatter across workers).
-    pub fn seek_by_index_range(
-        &self,
-        id: i64,
-        col_indices: &[u32],
-        range: &gnitz_wire::RangeDescriptor,
-    ) -> Result<(Option<Batch>, SchemaDescriptor), StoreError> {
-        let src_schema = self.relation_or_err(id)?.schema();
-        // `Some(empty)` is in-range index entries none of which resolved: a miss.
-        let mut cur = self.open_index_source(id, col_indices, range, IndexWalk::Required)?;
-        Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
     }
 
     /// The index walk over `desc` on `cols` of `source`, or — for an

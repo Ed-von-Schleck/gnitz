@@ -10,7 +10,7 @@
 //! PUSH_TXN    ctrl | u32 n | n × [u8 mode][schema block][data block]
 //!                          | u32 p | p × [u64 tid][u64 basis_lsn]
 //! SCAN_MULTI  ctrl | u32 n | n × [u64 tid][u16 schema_version]
-//! DELTA_POLL  ctrl | u32 n | n × [u64 view_id][u32 len][spec][reply block]
+//! DELTA_POLL  ctrl | u32 n | n × [u64 view_id][u64 after_tick][u32 len][reply block]
 //! ```
 //!
 //! Defining them here rather than once per crate is what keeps the item widths —
@@ -29,7 +29,6 @@
 
 use crate::codec::{Reader, Writer};
 use crate::control::{ctrl_block_size, encode_ctrl_block, peek_control_block, ControlHeader};
-use crate::read_spec::scan_spec_extra_len;
 use crate::wal;
 use crate::{
     read_u32_le, FLAG_DDL_TXN, FLAG_DELTA_POLL, FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_OK, WAL_HEADER_SIZE, WAL_OFF_TID,
@@ -40,9 +39,9 @@ use crate::{
 /// schema block).
 pub(crate) const RELATION_BYTES: usize = 8 + 2;
 
-/// The least one `DELTA_POLL` view record occupies: its `u64` id and the `u32`
-/// length of a (never actually empty) request blob.
-const MIN_POLL_VIEW_BYTES: usize = 8 + 4;
+/// The least one `DELTA_POLL` view record occupies: its `u64` id, its `u64`
+/// `after_tick` and the `u32` length of a (never actually empty) reply block.
+const MIN_POLL_VIEW_BYTES: usize = 8 + 8 + 4;
 
 /// Bytes one OCC precondition occupies: `[u64 tid][u64 basis_lsn]`.
 pub(crate) const PRECONDITION_BYTES: usize = 8 + 8;
@@ -221,21 +220,22 @@ pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
     w.into_vec()
 }
 
+/// One DELTA_POLL item: every delta `view_id` recorded after round `after_tick`
+/// (`0` = the whole view), in `reply_block`'s layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaPollItem<'a> {
+    pub view_id: u64,
+    pub after_tick: u64,
+    pub reply_block: &'a [u8],
+}
+
 /// Encode a **delta poll** frame (`FLAG_DELTA_POLL`), without the 4-byte frame
-/// header: N mirrored views answered as one terminal frame each, in this order.
-/// Each view's `(spec, reply block)` pair is written in the `seek_pk_extra` shape
-/// a single-view SCAN_SPEC carries, so the master forwards it verbatim.
-pub fn encode_delta_poll(client_id: u64, views: &[(u64, &[u8], &[u8])]) -> Vec<u8> {
-    let body: usize = views
-        .iter()
-        .map(|(_, spec, block)| MIN_POLL_VIEW_BYTES + scan_spec_extra_len(spec, block))
-        .sum();
+/// header.
+pub fn encode_delta_poll(client_id: u64, views: &[DeltaPollItem<'_>]) -> Vec<u8> {
+    let body: usize = views.iter().map(|v| MIN_POLL_VIEW_BYTES + v.reply_block.len()).sum();
     let mut w = prologue(client_id, FLAG_DELTA_POLL, views.len(), body);
-    for (view_id, spec, block) in views {
-        w.u64(*view_id)
-            .u32(scan_spec_extra_len(spec, block) as u32)
-            .bytes32(spec)
-            .bytes32(block);
+    for v in views {
+        w.u64(v.view_id).u64(v.after_tick).bytes32(v.reply_block);
     }
     w.into_vec()
 }
@@ -385,15 +385,18 @@ pub fn decode_scan_multi(data: &[u8]) -> Result<Vec<(u64, u16)>, String> {
     Ok(relations)
 }
 
-/// Decode a `DELTA_POLL` frame into `(view id, request blob)` pairs, each blob
-/// borrowed from `data` and shaped exactly like a SCAN_SPEC's `seek_pk_extra`.
-pub fn decode_delta_poll(data: &[u8]) -> Result<Vec<(u64, &[u8])>, String> {
+/// Decode a `DELTA_POLL` frame into its items, each block borrowed from `data`.
+pub fn decode_delta_poll(data: &[u8]) -> Result<Vec<DeltaPollItem<'_>>, String> {
     const CTX: &str = "DELTA_POLL";
     let (count, off) = decode_prologue(data, CTX, MIN_POLL_VIEW_BYTES, DELTA_POLL_MAX_VIEWS)?;
     let mut r = Reader::new(&data[off..], CTX);
     let mut views = Vec::with_capacity(count);
     for _ in 0..count {
-        views.push((r.u64()?, r.bytes32()?));
+        views.push(DeltaPollItem {
+            view_id: r.u64()?,
+            after_tick: r.u64()?,
+            reply_block: r.bytes32()?,
+        });
     }
     Ok(views)
 }

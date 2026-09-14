@@ -37,9 +37,9 @@ def test_an_index_resumes_across_a_clean_restart(own_server):
     own_server.restart(graceful=True)
 
     with gnitz.connect(own_server.sock_path) as conn:
-        tid, _ = conn.resolve_table("idxres", "t")
+        tid, schema = conn.resolve_table("idxres", "t")
         for i in (0, 63):
-            assert bag(conn.seek_by_index(tid, [1], [i * 10]), "id") == {(i,): 1}, \
+            assert bag(conn.seek_by_index(tid, schema, [1], [i * 10]), "id") == {(i,): 1}, \
                 f"g={i * 10} must still resolve to its source PK after the restart"
 
     counts = own_server.rebuilt_index_counts()
@@ -104,10 +104,10 @@ def test_a_rebuilt_index_holds_exactly_its_own_slice(own_server):
         #    and tracks post-restart writes. Read through the distributed seek,
         #    which merges every worker's slice-local index and resolves the hits
         #    against that worker's own base slice.
-        sx, _ = conn.resolve_table("slice", "sx")
+        sx, sx_schema = conn.resolve_table("slice", "sx")
 
         def holders():
-            return bag(conn.seek_by_index(sx, [1], [7]), "id")
+            return bag(conn.seek_by_index(sx, sx_schema, [1], [7]), "id")
 
         assert holders() == {(i,): 1 for i in range(30) if i % 3 == 0}
         conn.execute_sql("DELETE FROM sx WHERE id = 0", schema_name="slice")

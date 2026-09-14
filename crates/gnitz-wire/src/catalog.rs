@@ -759,63 +759,6 @@ pub fn unpack_pk_cols(packed: u64) -> Result<PkColList, crate::PkRule> {
     Ok(PkColList { cols, len: n })
 }
 
-/// Width of one `seek_by_index` key slot on the wire: a native `u128`, LE.
-pub(crate) const INDEX_KEY_SLOT: usize = 16;
-
-/// Pack K native index-key values into the `PkBuf` a `seek_by_index` request
-/// carries — one 16-byte LE slot each, which [`crate::control::split_ctrl_key`]
-/// then routes as slot 0 → `seek_pk` and slots 1..K → `seek_pk_extra`. A prefix
-/// seek supplies K < the
-/// index's arity. Returns the packed bytes; K is bounded by [`PK_LIST_MAX_COLS`],
-/// so at most `PK_LIST_MAX_COLS * INDEX_KEY_SLOT` of the buffer is ever written.
-pub fn pack_index_key_slots(key_vals: &[u128]) -> ([u8; MAX_PK_BYTES], usize) {
-    assert!(
-        pk_list_arity_ok(key_vals.len()),
-        "pack_index_key_slots: count {} out of range 1..={PK_LIST_MAX_COLS}",
-        key_vals.len(),
-    );
-    let mut buf = [0u8; MAX_PK_BYTES];
-    for (i, &v) in key_vals.iter().enumerate() {
-        buf[i * INDEX_KEY_SLOT..(i + 1) * INDEX_KEY_SLOT].copy_from_slice(&v.to_le_bytes());
-    }
-    (buf, key_vals.len() * INDEX_KEY_SLOT)
-}
-
-/// Recover the K key values a `seek_by_index` request packed, from the wire pair
-/// `seek_pk` (slot 0) + `seek_pk_extra` (slots 1..K). Validates at the trust
-/// boundary: a misaligned `extra` or a K beyond `arity` is rejected rather than
-/// silently dropping trailing bytes or over-reading the index.
-pub fn unpack_index_key_slots(seek_pk: u128, extra: &[u8], arity: usize) -> Result<PkKeyVals, String> {
-    if !extra.len().is_multiple_of(INDEX_KEY_SLOT) {
-        return Err(format!(
-            "seek_by_index: key tail of {} bytes is not a multiple of {INDEX_KEY_SLOT}",
-            extra.len()
-        ));
-    }
-    let len = 1 + extra.len() / INDEX_KEY_SLOT;
-    if len > arity.min(PK_LIST_MAX_COLS) {
-        return Err(format!("seek_by_index: {len} key values exceed index arity {arity}"));
-    }
-    let mut vals = [0u128; PK_LIST_MAX_COLS];
-    vals[0] = seek_pk;
-    for (i, slot) in extra.as_chunks::<INDEX_KEY_SLOT>().0.iter().enumerate() {
-        vals[i + 1] = u128::from_le_bytes(*slot);
-    }
-    Ok(PkKeyVals { vals, len })
-}
-
-/// The K native key values of a `seek_by_index` request, inline.
-pub struct PkKeyVals {
-    vals: [u128; PK_LIST_MAX_COLS],
-    len: usize,
-}
-
-impl PkKeyVals {
-    pub fn as_slice(&self) -> &[u128] {
-        &self.vals[..self.len]
-    }
-}
-
 // ---------------------------------------------------------------------------
 // TABLE_TAB.flags layout — the single source of truth shared by the gnitz-core
 // writer and the gnitz-server reader, so the bit packing cannot drift.

@@ -27,8 +27,8 @@ use std::fs;
 
 use crate::test_support::{
     col_def, fk_def, idx_tab_batch, nullable_def, opk_pk, pk_payload_schema, push_col_tab_row, push_table_tab_row,
-    push_view_tab_row, register_identity_view, scratch_dir, sum_weights, try_register_identity_view, uuid_def,
-    write_circuit_chain, write_identity_circuit,
+    push_view_tab_row, register_identity_view, scratch_dir, seek_by_index, seek_by_index_range, sum_weights,
+    try_register_identity_view, uuid_def, write_circuit_chain, write_identity_circuit,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table

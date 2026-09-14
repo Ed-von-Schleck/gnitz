@@ -88,7 +88,7 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         SalMessageKind::Tick => InEval::DeferPostAck,
         // Answered mid-wait, a delta read spans a half-ingested round, and a
         // client that advanced its cursor over it would lose the rest silently.
-        SalMessageKind::DeltaScanSpec => InEval::DeferPostAck,
+        SalMessageKind::DeltaRead => InEval::DeferPostAck,
         // An inline catalog mutation races the in-flight evaluation.
         SalMessageKind::DdlSync => InEval::DeferPreAck,
         // Deferring deadlocks: `flush_round` holds `sal_writer_excl` across the
@@ -102,7 +102,6 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         SalMessageKind::Scan
         | SalMessageKind::ScanSpec
         | SalMessageKind::Seek
-        | SalMessageKind::SeekByIndex
         | SalMessageKind::HasPk
         | SalMessageKind::UniquePreflight
         | SalMessageKind::Backfill
@@ -601,26 +600,6 @@ impl WorkerProcess {
                 Ok(())
             }
 
-            SalMessageKind::SeekByIndex => {
-                let cols = self
-                    .cat()
-                    .registry()
-                    .index_cols(target_id, seek_col_idx, "seek_by_index")?;
-                // A prefix seek supplies fewer values than the index's arity.
-                let keys = gnitz_wire::unpack_index_key_slots(seek_pk, &seek_pk_extra, cols.as_slice().len())?;
-                let (result, schema) =
-                    self.cat()
-                        .registry_mut()
-                        .seek_by_index(target_id, cols.as_slice(), keys.as_slice())?;
-                // A miss replies with a zero-row frame rather than a dataless
-                // one: `drain_index_scan` skips it either way, and the frame
-                // still carries the schema block its `validate_schema_match`
-                // guard reads.
-                let batch = result.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-                self.send_scan_response(route, batch, ReplySchema::Table(&schema), 0);
-                Ok(())
-            }
-
             SalMessageKind::Seek => {
                 // The full seek key arrives as the wire pair seek_pk (low ≤16
                 // native bytes) + seek_pk_extra (the 16..stride suffix, empty for
@@ -645,9 +624,8 @@ impl WorkerProcess {
                 Ok(())
             }
 
-            SalMessageKind::ScanSpec | SalMessageKind::DeltaScanSpec => {
-                self.answer_scan_spec(route, seek_pk, &seek_pk_extra)
-            }
+            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &seek_pk_extra),
+            SalMessageKind::DeltaRead => self.answer_delta_read(route, seek_col_idx, seek_pk as u64, &seek_pk_extra),
 
             SalMessageKind::UniquePreflight => {
                 // CREATE UNIQUE INDEX global pre-flight: project this worker's
@@ -729,35 +707,29 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// Answer one `ReadSpec` read: split the control block's `seek_pk_extra` into
-    /// the encoded spec and the client's reply-schema block, run the read, and
-    /// stream the keeper back with no schema block of its own — the client
-    /// authored that schema and decodes against its own copy.
-    ///
-    /// Shared by the inline dispatch arm and by the replay of a deferred delta
-    /// read, so a deferred read answers with the frame train it would have
-    /// answered with inline.
-    ///
-    /// `seek_pk`'s low half is the cut the master sampled when it wrote this
-    /// read's group — the last tick round it had emitted — which bounds an
-    /// incremental delta read above. Every other bound ignores it.
-    ///
-    /// A refusal that is not `STATUS_ERROR` — today only a delta cursor below this
-    /// worker's retention floor — needs nothing of its own: the fault carries its
-    /// status out through the one reply path every other failure here takes.
-    fn answer_scan_spec(
-        &mut self,
-        route: ReplyRoute,
-        seek_pk: u128,
-        seek_pk_extra: &[u8],
-    ) -> Result<(), gnitz_wire::WireFault> {
+    /// Answer one `ReadSpec` read, streaming the keeper back without a schema block.
+    fn answer_scan_spec(&mut self, route: ReplyRoute, seek_pk_extra: &[u8]) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
-        let (spec_bytes, reply_block) =
-            gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
-        let spec = gnitz_wire::ReadSpec::decode(spec_bytes.0).map_err(|e| format!("scan_spec: {e}"))?;
+        let (spec, reply_block) = gnitz_wire::ReadSpec::decode(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
-        let keeper = self.cat().scan_spec(target_id, &spec, &reply_schema, seek_pk as u64)?;
+        let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
+        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
+        Ok(())
+    }
+
+    /// Answer one DELTA_POLL view: its deltas in rounds `(after_tick, cut_tick]`.
+    fn answer_delta_read(
+        &mut self,
+        route: ReplyRoute,
+        after_tick: u64,
+        cut_tick: u64,
+        reply_block: &[u8],
+    ) -> Result<(), gnitz_wire::WireFault> {
+        let target_id = route.target_id as i64;
+        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
+            .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
+        let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
         self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
         Ok(())
     }

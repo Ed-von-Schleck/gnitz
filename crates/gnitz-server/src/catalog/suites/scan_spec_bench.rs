@@ -104,14 +104,14 @@ fn scan_spec_sinks_bench() {
     for (label, pred) in [("contiguous", &contiguous), ("fragmented", &fragmented)] {
         let spec = rows_spec(pred.clone(), gather3.clone(), vec![], 0);
         cell(&format!("rows, sel~50% {label}, 3-col gather"), n, || {
-            e.scan_spec(tid, &spec, &reply3, 0).unwrap()
+            e.scan_spec(tid, spec.clone(), &reply3).unwrap()
         });
     }
 
     // No projection: whole-region range appends, no per-column gather.
     let spec = rows_spec(fragmented.clone(), None, vec![], 0);
     cell("rows, sel~50% fragmented, identity projection", n, || {
-        e.scan_spec(tid, &spec, &src, 0).unwrap()
+        e.scan_spec(tid, spec.clone(), &src).unwrap()
     });
 
     // Compute-bearing projection, fragmented — where compacting the survivors
@@ -130,14 +130,14 @@ fn scan_spec_sinks_bench() {
     let reply2 = i64_reply(2);
     let spec = rows_spec(fragmented.clone(), map_of(compute_proj, &reply2), vec![], 0);
     cell("rows, sel~50% fragmented, compute projection", n, || {
-        e.scan_spec(tid, &spec, &reply2, 0).unwrap()
+        e.scan_spec(tid, spec.clone(), &reply2).unwrap()
     });
 
     // ORDER BY .. LIMIT — the bounded top-k arm and its `topk_keep` compactions.
     let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
     let spec = rows_spec(contiguous.clone(), gather3.clone(), order, 100);
     cell("rows, ORDER BY .. LIMIT 100 (top-k)", n, || {
-        e.scan_spec(tid, &spec, &reply3, 0).unwrap()
+        e.scan_spec(tid, spec.clone(), &reply3).unwrap()
     });
 
     // The same arm ordered by reply column 3, `c0`, which repeats across the
@@ -145,7 +145,7 @@ fn scan_spec_sinks_bench() {
     let order = vec![OrderKey { col: 3, desc: false, nulls_first: false }];
     let spec = rows_spec(contiguous.clone(), gather3.clone(), order, 100);
     cell("rows, ORDER BY c0 .. LIMIT 100 (top-k, tie-heavy)", n, || {
-        e.scan_spec(tid, &spec, &reply3, 0).unwrap()
+        e.scan_spec(tid, spec.clone(), &reply3).unwrap()
     });
 
     // No-ORDER-BY LIMIT — the early-stop arm. With a predicate the sink drains
@@ -156,7 +156,7 @@ fn scan_spec_sinks_bench() {
     let spec = rows_spec(contiguous.clone(), gather3.clone(), vec![], 100);
     let chunk = e.registry().scan_chunk_rows() as u64;
     cell("rows, LIMIT 100 (early stop, 1 chunk)", chunk, || {
-        e.scan_spec(tid, &spec, &reply3, 0).unwrap()
+        e.scan_spec(tid, spec.clone(), &reply3).unwrap()
     });
 
     // The fold sink: GROUP BY c0 (100 groups), COUNT(*) + SUM(c2).
@@ -188,7 +188,7 @@ fn scan_spec_sinks_bench() {
             },
         };
         cell(&format!("fold, sel~50% {label}, GROUP BY COUNT+SUM"), n, || {
-            e.scan_spec(tid, &spec, &fold_reply, 0).unwrap()
+            e.scan_spec(tid, spec.clone(), &fold_reply).unwrap()
         });
     }
 
@@ -214,7 +214,7 @@ fn scan_spec_sinks_bench() {
         &[0],
     );
     cell("fold, c3 < 60000, GROUP BY 60k groups COUNT", n, || {
-        e.scan_spec(tid, &spec, &many_reply, 0).unwrap()
+        e.scan_spec(tid, spec.clone(), &many_reply).unwrap()
     });
 }
 
@@ -253,6 +253,6 @@ fn scan_spec_string_gather_bench() {
         0,
     );
     cell("rows, sel~50% fragmented, gather incl. STRING", STRING_ROWS, || {
-        e.scan_spec(tid, &spec, &reply, 0).unwrap()
+        e.scan_spec(tid, spec.clone(), &reply).unwrap()
     });
 }

@@ -352,7 +352,7 @@ pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
 //   agree only in this space.
 // * INDEX (`*_native_key`): the native value (signed integers keep their
 //   two's-complement bits, zero-extended). Used by FK validation, unique-index
-//   maintenance, `has_pk`, and `seek_by_index`, which all re-encode native →
+//   maintenance, `has_pk`, and an index range read, which all re-encode native →
 //   OPK at the storage boundary (`Table::opk_key`, `batch_project_index`), so
 //   they need the native value back, not the sign-flipped one.
 //
@@ -416,7 +416,7 @@ pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_c
 
 /// INDEX key for one PK column's OPK bytes: decode back to the native value
 /// (signed bits preserved), zero-extended to `u128`. Feeds `has_pk` /
-/// `seek_by_index`, which re-encode native → OPK to hit the OPK-stored index.
+/// an index range read, which re-encode native → OPK to hit the OPK-stored index.
 /// `offset + col_size` must lie within the OPK PK region (`pk_bytes`); a
 /// mismatched `col_size` slices past the column and panics.
 #[inline]

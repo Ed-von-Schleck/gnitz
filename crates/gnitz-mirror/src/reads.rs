@@ -1,6 +1,6 @@
 //! Answering a read off a copy.
 //!
-//! The store takes an **encoded `ReadSpec` plus a reply schema** — the wire read
+//! The store takes a **`ReadSpec` plus a reply schema** — the wire read
 //! verbs, not SQL. The engine has no parser and the SQL crate is where a query
 //! becomes a spec, and the crate graph runs `gnitz-sql → gnitz-core`; SQL at this
 //! seam would invert that.
@@ -34,25 +34,18 @@ impl Mirror {
     /// Run the spec against the copy through the engine's own executor, and reply
     /// through the client's block decoder.
     ///
-    /// The tick cut it takes is the master's, which only a `Delta` bound reads;
-    /// `0` is passed, and a `Delta` bound never reaches it — a copy is registered
-    /// with no delta budget, and a `Delta` bound is refused against a relation
-    /// whose feed is absent at every round.
-    ///
     /// The hydrator is `None`, which the compiler can see: no copy holds a
     /// skeleton row, because none is registered with a capacity budget.
     pub(crate) fn scan_spec_inner(
         &mut self,
         table_id: u64,
-        spec: &[u8],
+        spec: gnitz_wire::ReadSpec,
         reply_schema: &Schema,
     ) -> Result<ZSetBatch, MirrorError> {
-        let spec =
-            gnitz_wire::ReadSpec::decode(spec).map_err(|e| MirrorError::Engine(format!("mirror: read spec: {e}")))?;
         let reply_desc = descriptor_of(reply_schema)?;
         let keeper = self
             .registry
-            .scan_spec(table_id as i64, &spec, &reply_desc, 0, None)
+            .scan_spec(table_id as i64, spec, &reply_desc, None)
             .map_err(engine)?;
         reply_batch(&keeper, &reply_desc, reply_schema)
     }

@@ -15,13 +15,11 @@
 /// is ACKed as a no-op push (LSN 0) instead of being mistaken for a scan.
 pub const FLAG_PUSH: u64 = 32;
 pub const FLAG_SEEK: u64 = 128;
-pub const FLAG_SEEK_BY_INDEX: u64 = 256;
 /// SCAN_SPEC request flag. The client→master leg of a parameterized bounded
 /// read (`ReadSpec`).
 pub const FLAG_SCAN_SPEC: u64 = 1 << 10;
-/// DELTA_POLL request flag. The batched form of [`FLAG_SCAN_SPEC`]: one frame
-/// naming N mirrored views, each with its own delta-bounded `ReadSpec` and
-/// client-authored reply schema.
+/// DELTA_POLL request flag. A delta read of N views: one frame naming N fed
+/// views, each with its own cursor and client-authored reply schema.
 pub const FLAG_DELTA_POLL: u64 = 1 << 11;
 
 pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
@@ -114,7 +112,6 @@ const _: () = {
     let flags = [
         FLAG_PUSH,
         FLAG_SEEK,
-        FLAG_SEEK_BY_INDEX,
         FLAG_SCAN_SPEC,
         FLAG_DELTA_POLL,
         FLAG_HAS_SCHEMA,
@@ -154,7 +151,6 @@ wire_enum! {
         Scan = 0,
         Push = FLAG_PUSH,
         Seek = FLAG_SEEK,
-        SeekByIndex = FLAG_SEEK_BY_INDEX,
         ScanSpec = FLAG_SCAN_SPEC,
         DeltaPoll = FLAG_DELTA_POLL,
         Resolve = FLAG_RESOLVE,
@@ -322,10 +318,6 @@ pub const STATUS_ERROR: u32 = 1;
 /// Server-side version mismatch on schema-less PUSH: client must evict its
 /// schema cache entry for the target table and retry with the full schema.
 pub const STATUS_SCHEMA_MISMATCH: u32 = 2;
-/// SEEK_BY_INDEX against a column with no secondary index. Control-only frame
-/// (no schema/data/error payload); the SQL planner uses it to fall back to a
-/// scan or a CREATE INDEX hint without a prior catalog probe.
-pub const STATUS_NO_INDEX: u32 = 3;
 /// A user-table TXN failed an OCC precondition: some table it declared a basis
 /// for was written since that basis. Control-only frame carrying the fresh basis
 /// (`published()`) in `seek_pk` and an empty message; the client synthesizes any
@@ -333,9 +325,8 @@ pub const STATUS_NO_INDEX: u32 = 3;
 /// or surfaces the conflict (BEGIN/COMMIT). Cleanly retryable — nothing validated,
 /// nothing written.
 pub const STATUS_TXN_CONFLICT: u32 = 4;
-/// A `Delta { after_tick }` read whose cursor is below the refusing worker's
-/// retention floor: the rounds it asks for were dropped by that store's
-/// capacity sweep. Control-only frame; the subscriber's recovery is the read it
+/// A delta read whose cursor is below the refusing worker's retention floor: the
+/// rounds it asks for were dropped by that store's capacity sweep. Control-only frame; the subscriber's recovery is the read it
 /// made on its first day, `after_tick = 0`. The one status a *worker* mints —
 /// `worker_error` carries the code to the client rather than flattening it into
 /// a string.
@@ -349,9 +340,8 @@ pub const STATUS_DELTA_EXPIRED: u32 = 5;
 pub const STATUS_SAL_FULL: u32 = 6;
 /// The relation a request names does not exist — minted where the catalog probe
 /// comes back empty and nowhere else, so it says *gone* rather than *refused*.
-/// A code for the same reason [`STATUS_NO_INDEX`] is one: a subscriber whose
-/// view vanished takes a recovery no other refusal calls for, and prose is all
-/// it could otherwise branch on.
+/// A code because a subscriber whose view vanished takes a recovery no other
+/// refusal calls for, and prose is all it could otherwise branch on.
 pub const STATUS_NOT_FOUND: u32 = 7;
 
 /// A failure as the reply frame carries it: one of the `STATUS_*` words above

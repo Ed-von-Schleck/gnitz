@@ -897,7 +897,7 @@ impl Eq for SchemaDescriptor {}
 /// Layout: `(promoted_c0, promoted_c1, …, src_pk_0, src_pk_1, …)` — every
 /// indexed column promoted independently and packed in declared order, then the
 /// source PK columns, all in the PK with zero payload columns. The leading
-/// indexed-key region is `Σ promoted widths`; `seek_by_index` prefix-scans it
+/// indexed-key region is `Σ promoted widths`; an index range read prefix-scans it
 /// (full or leading-prefix), then reads the source PK bytes directly out of the
 /// index PK suffix. The 1-element list is the single-column index.
 ///

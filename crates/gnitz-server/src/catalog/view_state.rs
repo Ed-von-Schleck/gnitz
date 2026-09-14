@@ -1,13 +1,7 @@
 //! What the catalog owns above the registry because it needs both rungs: the
-//! boot resume verdict, the source cursor a circuit backfill drives, and the
-//! three read entries that can meet a skeleton row.
-//!
-//! Those three are the only wrappers the catalog keeps over the read rung.
-//! Every other registry name a caller reaches is spelled `registry()` at its
-//! site: a `CatalogEngine::kind` would hide the rung its answer came
-//! from, and a delegator layer would be a dozen functions that can drift from
-//! what they forward to. These three earn their place by supplying something a
-//! caller cannot — the hydrator, which is the catalog's *other* field.
+//! boot resume verdict, the source cursor a circuit backfill drives, and the read
+//! wrappers that add what a caller cannot — the hydrator, or a delta read's expiry
+//! status. Every other registry name is spelled `registry()` at its site.
 
 use super::*;
 use gnitz_store::storage::SourceCursor;
@@ -40,19 +34,31 @@ impl CatalogEngine {
         Ok((registry.seek(table_id, opk.pk_bytes(), Some(dag))?, schema))
     }
 
-    /// [`RelationRegistry::scan_spec`], hydrating. The one site where a
-    /// store error becomes a wire fault: an expired delta cursor keeps its own
-    /// status, everything else is `STATUS_ERROR`.
+    /// [`RelationRegistry::scan_spec`], hydrating.
     pub(crate) fn scan_spec(
         &mut self,
         target_id: i64,
-        spec: &ReadSpec,
+        spec: ReadSpec,
         reply_schema: &SchemaDescriptor,
-        cut_tick: u64,
     ) -> Result<Rc<Batch>, WireFault> {
         let (dag, registry) = self.dag_and_registry_mut();
         registry
-            .scan_spec(target_id, spec, reply_schema, cut_tick, Some(dag))
+            .scan_spec(target_id, spec, reply_schema, Some(dag))
+            .map_err(|e| WireFault::from(e.to_string()))
+    }
+
+    /// [`RelationRegistry::delta_read`]. The one site where a delta read's store
+    /// error becomes a wire fault: an expired cursor keeps its own status,
+    /// everything else is `STATUS_ERROR`.
+    pub(crate) fn delta_read(
+        &self,
+        target_id: i64,
+        after_tick: u64,
+        cut_tick: u64,
+        reply_schema: &SchemaDescriptor,
+    ) -> Result<Rc<Batch>, WireFault> {
+        self.registry
+            .delta_read(target_id, after_tick, cut_tick, reply_schema)
             .map_err(|e| match e {
                 StoreError::DeltaExpired(text) => WireFault {
                     status: gnitz_wire::STATUS_DELTA_EXPIRED,

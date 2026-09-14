@@ -16,8 +16,9 @@ use super::agg::Accumulator;
 use super::avi::AviBake;
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::{build_reduce_output_schema, ReducePlan};
-use super::sort::{argsort_delta, compare_by_group_cols};
+use super::sort::argsort_delta;
 use crate::schema::ColumnLocator;
+use gnitz_expr::cmp_group_cols;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
@@ -1210,15 +1211,15 @@ fn test_argsort_delta_f32_group() {
 }
 
 #[test]
-fn test_compare_by_group_cols_f32_negative() {
+fn test_cmp_group_cols_f32_negative() {
     let schema = make_schema_u64_f32();
     let batch = make_batch_f32(&schema, &[(1, 1, -5.0f32), (2, 1, 3.0f32)]);
     let mb = batch.as_mem_batch();
     let descs_v = locate_cols(&schema, &[1]);
     let descs = &descs_v[..];
-    let ord = compare_by_group_cols(&mb, 0, &mb, 1, descs);
+    let ord = cmp_group_cols(&mb, 0, &mb, 1, descs);
     assert_eq!(ord, std::cmp::Ordering::Less);
-    let ord2 = compare_by_group_cols(&mb, 1, &mb, 0, descs);
+    let ord2 = cmp_group_cols(&mb, 1, &mb, 0, descs);
     assert_eq!(ord2, std::cmp::Ordering::Greater);
 }
 
@@ -1452,8 +1453,8 @@ fn uuid_min_max_recede_through_the_value_index() {
 }
 
 #[test]
-fn test_compare_by_group_cols_uuid_non_pk() {
-    // UUID non-PK column used as GROUP BY column. Before the fix, compare_by_group_cols
+fn test_cmp_group_cols_uuid_non_pk() {
+    // UUID non-PK column used as GROUP BY column. Before the fix, cmp_group_cols
     // falls to the else branch with cs=16, panicking on a_buf[..16] (buf is [u8; 8]).
     let schema = make_schema_u64_pk_uuid_payload();
     let uuid_lo: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0001u128;
@@ -1464,21 +1465,21 @@ fn test_compare_by_group_cols_uuid_non_pk() {
     let descs = &descs_v[..];
 
     // uuid_lo < uuid_hi (compare by the 128-bit value)
-    let ord = compare_by_group_cols(&mb, 0, &mb, 1, descs);
+    let ord = cmp_group_cols(&mb, 0, &mb, 1, descs);
     assert_eq!(
         ord,
         std::cmp::Ordering::Less,
         "uuid_lo row must compare less than uuid_hi row"
     );
 
-    let ord2 = compare_by_group_cols(&mb, 1, &mb, 0, descs);
+    let ord2 = cmp_group_cols(&mb, 1, &mb, 0, descs);
     assert_eq!(
         ord2,
         std::cmp::Ordering::Greater,
         "uuid_hi row must compare greater than uuid_lo row"
     );
 
-    let ord3 = compare_by_group_cols(&mb, 0, &mb, 0, descs);
+    let ord3 = cmp_group_cols(&mb, 0, &mb, 0, descs);
     assert_eq!(ord3, std::cmp::Ordering::Equal, "same row must compare equal to itself");
 }
 
@@ -1601,7 +1602,7 @@ fn test_group_key_includes_pk_pki1() {
 }
 
 #[test]
-fn test_compare_by_group_cols_includes_pk() {
+fn test_cmp_group_cols_includes_pk() {
     // Sort/compare path must dispatch on the PK sentinel rather than
     // dereferencing a fake pi for the PK column.
     let schema = make_schema_pk0_u64_i64();
@@ -1613,12 +1614,9 @@ fn test_compare_by_group_cols_includes_pk() {
     // First locator covers PK — must resolve to the Pk variant.
     assert!(matches!(descs[0], ColumnLocator::Pk { .. }));
 
-    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
-    assert_eq!(
-        compare_by_group_cols(&mb, 1, &mb, 0, descs),
-        std::cmp::Ordering::Greater
-    );
-    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 0, descs), std::cmp::Ordering::Equal);
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
+    assert_eq!(cmp_group_cols(&mb, 1, &mb, 0, descs), std::cmp::Ordering::Greater);
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 0, descs), std::cmp::Ordering::Equal);
 }
 
 #[test]
@@ -1678,7 +1676,7 @@ fn test_group_key_null_distinct_from_zero() {
 }
 
 #[test]
-fn test_compare_by_group_cols_nulls_first() {
+fn test_cmp_group_cols_nulls_first() {
     let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let batch = build_pk_null_i64(&schema, &[(1, Some(7)), (2, None), (3, None)]);
     let mb = batch.as_mem_batch();
@@ -1686,13 +1684,10 @@ fn test_compare_by_group_cols_nulls_first() {
     let descs = &descs_v[..];
 
     // NULL < 7 (NULLS FIRST)
-    assert_eq!(compare_by_group_cols(&mb, 1, &mb, 0, descs), std::cmp::Ordering::Less);
-    assert_eq!(
-        compare_by_group_cols(&mb, 0, &mb, 1, descs),
-        std::cmp::Ordering::Greater
-    );
+    assert_eq!(cmp_group_cols(&mb, 1, &mb, 0, descs), std::cmp::Ordering::Less);
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Greater);
     // NULL == NULL → equal (same group)
-    assert_eq!(compare_by_group_cols(&mb, 1, &mb, 2, descs), std::cmp::Ordering::Equal);
+    assert_eq!(cmp_group_cols(&mb, 1, &mb, 2, descs), std::cmp::Ordering::Equal);
 }
 
 #[test]
@@ -1941,11 +1936,11 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
 // that share the addressed PK column but differ in other PK columns).
 // -----------------------------------------------------------------------
 
-/// compare_by_group_cols on the PK-sentinel branch must compare only
+/// cmp_group_cols on the PK-sentinel branch must compare only
 /// the addressed PK column. Two rows that share `pk_col_0` but differ
 /// in `pk_col_1` must compare Equal under `GROUP BY pk_col_0`.
 #[test]
-fn test_compare_by_group_cols_pk_sentinel_compound_subset() {
+fn test_cmp_group_cols_pk_sentinel_compound_subset() {
     let schema = pk_payload_schema(&[type_code::U64; 2]);
     let batch = make_batch_compound_2xu64(&schema, &[(10, 7, 1, 100), (10, 9, 1, 200), (20, 7, 1, 300)]);
     let mb = batch.as_mem_batch();
@@ -1959,22 +1954,19 @@ fn test_compare_by_group_cols_pk_sentinel_compound_subset() {
 
     // Same pk_col_0 (10), different pk_col_1 → Equal under GROUP BY pk_col_0.
     assert_eq!(
-        compare_by_group_cols(&mb, 0, &mb, 1, descs),
+        cmp_group_cols(&mb, 0, &mb, 1, descs),
         std::cmp::Ordering::Equal,
         "rows with same pk_col_0 must form one group regardless of pk_col_1",
     );
     // Different pk_col_0 → ordering follows pk_col_0.
-    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Less);
-    assert_eq!(
-        compare_by_group_cols(&mb, 2, &mb, 0, descs),
-        std::cmp::Ordering::Greater
-    );
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Less);
+    assert_eq!(cmp_group_cols(&mb, 2, &mb, 0, descs), std::cmp::Ordering::Greater);
 }
 
-/// compare_by_group_cols on PK-sentinel with `GROUP BY pk_col_1`
+/// cmp_group_cols on PK-sentinel with `GROUP BY pk_col_1`
 /// (non-zero PK byte offset) must isolate pk_col_1.
 #[test]
-fn test_compare_by_group_cols_pk_sentinel_compound_pk_col_1() {
+fn test_cmp_group_cols_pk_sentinel_compound_pk_col_1() {
     let schema = pk_payload_schema(&[type_code::U64; 2]);
     let batch = make_batch_compound_2xu64(&schema, &[(1, 50, 1, 100), (2, 50, 1, 200), (3, 60, 1, 300)]);
     let mb = batch.as_mem_batch();
@@ -1987,15 +1979,15 @@ fn test_compare_by_group_cols_pk_sentinel_compound_pk_col_1() {
     );
 
     // Same pk_col_1 (50), different pk_col_0 → Equal.
-    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Equal);
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Equal);
     // Different pk_col_1 → ordering follows pk_col_1.
-    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Less);
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Less);
 }
 
 /// Single-PK U64 with `GROUP BY pk` must be bit-identical to the prior
 /// whole-region widen path — byte offset 0, size = pk_stride = 8.
 #[test]
-fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
+fn test_cmp_group_cols_pk_sentinel_single_pk_bit_identical() {
     let schema = make_schema_u64_i64();
     let batch = build_pk_other(&schema, &[(10, 100), (20, 100), (10, 200)]);
     let mb = batch.as_mem_batch();
@@ -2004,12 +1996,9 @@ fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
     let descs = &descs_v[..];
     assert!(matches!(descs[0], ColumnLocator::Pk { byte_off: 0, size: 8, .. }));
 
-    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
-    assert_eq!(
-        compare_by_group_cols(&mb, 1, &mb, 0, descs),
-        std::cmp::Ordering::Greater
-    );
-    assert_eq!(compare_by_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Equal);
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
+    assert_eq!(cmp_group_cols(&mb, 1, &mb, 0, descs), std::cmp::Ordering::Greater);
+    assert_eq!(cmp_group_cols(&mb, 0, &mb, 2, descs), std::cmp::Ordering::Equal);
 }
 
 /// The group key of `GROUP BY pk_col_0` (single PK column of a
@@ -4615,7 +4604,7 @@ fn test_group_key_128bit_collision_resistance() {
 // Fix C: BLOB as a grouping key.
 //
 // BLOB shares the 16-byte German-string layout with STRING; the two
-// group-membership compare (compare_by_group_cols) now
+// group-membership compare (cmp_group_cols) now
 // dispatch BLOB through compare_german_strings instead of `unreachable!`-ing.
 // Mirrors test_distinct_blob_payload_no_panic. Long (>12-byte) blobs that share
 // a 4-byte prefix force the full-content heap tail comparison.
@@ -4654,7 +4643,7 @@ fn make_batch_blob_grp_i64(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8], 
 }
 
 #[test]
-fn test_compare_by_group_cols_blob_no_panic() {
+fn test_cmp_group_cols_blob_no_panic() {
     // Two long blobs sharing the 4-byte prefix "PREF" and the same length, so
     // compare_german_strings must walk the heap tail (not just the inline
     // prefix). Pre-fix this `unreachable!`s; post-fix it orders by content.
@@ -4669,16 +4658,13 @@ fn test_compare_by_group_cols_blob_no_panic() {
     let descs = &descs_v[..];
 
     assert_eq!(
-        compare_by_group_cols(&mb, 0, &mb, 1, descs),
+        cmp_group_cols(&mb, 0, &mb, 1, descs),
         std::cmp::Ordering::Less,
         "blob_a < blob_b by content tail"
     );
+    assert_eq!(cmp_group_cols(&mb, 1, &mb, 0, descs), std::cmp::Ordering::Greater);
     assert_eq!(
-        compare_by_group_cols(&mb, 1, &mb, 0, descs),
-        std::cmp::Ordering::Greater
-    );
-    assert_eq!(
-        compare_by_group_cols(&mb, 0, &mb, 0, descs),
+        cmp_group_cols(&mb, 0, &mb, 0, descs),
         std::cmp::Ordering::Equal,
         "same blob compares equal"
     );

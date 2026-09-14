@@ -585,6 +585,43 @@ fn footprint_equals_emitted_bytes() {
     );
 }
 
+/// A group carrying per-worker extras writes each slot its own `seek_pk_extra`,
+/// sized to that blob rather than to the template's.
+#[test]
+fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
+    use crate::runtime::wire::{decode_wire, WireMsg};
+
+    let nw = 3;
+    let log = TestLog::new(1 << 20, nw, 1);
+    let extras: Vec<Vec<u8>> = vec![vec![1; 40], Vec::new(), vec![3; 400]];
+    let group = DirectGroup {
+        template: WireMsg {
+            target_id: 16,
+            seek_pk_extra: &[9; 7],
+            ..Default::default()
+        },
+        extras: Some(&extras),
+        ..DirectGroup::new(SalMessageKind::ScanSpec)
+    };
+
+    let predicted = log.writer.footprint(&group);
+    let before = log.cursor();
+    log.writer.write(&group).expect("group fits");
+    assert_eq!((log.cursor() - before) as usize, predicted);
+
+    let msg = group_at(log.log(), before);
+    for (w, extra) in extras.iter().enumerate() {
+        let slot = msg.slot(w as u32).expect("every worker is written");
+        let decoded = decode_wire(slot).expect("a slot decodes");
+        assert_eq!(decoded.control.seek_pk_extra, *extra, "worker {w}");
+    }
+    let sizes: Vec<usize> = (0..nw as u32).map(|w| msg.slot(w).unwrap().len()).collect();
+    assert!(
+        sizes[1] < sizes[0] && sizes[0] < sizes[2],
+        "each slot sized to its blob: {sizes:?}"
+    );
+}
+
 /// A schema with no German-string column takes the one-copy scatter, whatever
 /// its column widths: `with_group` hands the writer [`WireData::Scattered`]
 /// slots rather than per-worker sub-`Batch`es. A stride-4 payload column is the

@@ -9,7 +9,7 @@
 //! client process, so it is a convenience, never a trust boundary. The bit it
 //! lets through is one the engine's two camps read differently: `is_null`
 //! (index projection, FK probe) and
-//! `compare_by_group_cols` believe the bit, while the evaluator's
+//! `cmp_group_cols` believe the bit, while the evaluator's
 //! `nullable_slots`, a projection's `NullPerm` and the `FixedIntNonnull` row
 //! comparator believe the schema. This test drives the frame the client library
 //! would never build.

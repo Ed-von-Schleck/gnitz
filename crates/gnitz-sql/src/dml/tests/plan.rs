@@ -20,7 +20,6 @@ fn shape(bound: &ReadBound) -> &'static str {
         ReadBound::PkRange(_) => "PkRange",
         ReadBound::IndexRange { .. } => "IndexRange",
         ReadBound::PkSet(_) => "PkSet",
-        ReadBound::Delta { .. } => "Delta",
     }
 }
 

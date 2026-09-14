@@ -94,7 +94,11 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     assert_eq!(reply_schema.num_payload_cols(), 0, "the reply is nothing but the key");
     assert_eq!(reply_schema.pk_stride(), schema.pk_stride());
 
-    let spec = ReadSpec::encode_parts(&ReadBound::None, &gt_predicate(1, 150), &keys_only_sink());
+    let spec = ReadSpec {
+        bound: ReadBound::None,
+        predicate: gt_predicate(1, 150),
+        sink: keys_only_sink(),
+    };
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
         .expect("a PK-only reply must not be rejected");
@@ -150,7 +154,11 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     assert_eq!(reply_schema.num_payload_cols(), 0);
 
     // c2 > 15 → every row but the first
-    let spec = ReadSpec::encode_parts(&ReadBound::None, &gt_predicate(2, 15), &keys_only_sink());
+    let spec = ReadSpec {
+        bound: ReadBound::None,
+        predicate: gt_predicate(2, 15),
+        sink: keys_only_sink(),
+    };
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
         .expect("a compound PK-only reply must not be rejected");
@@ -177,11 +185,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     // The un-projected read of the same rows carries the payload the DELETE shape
     // drops — the whole point of the projection.
     let full = client
-        .scan_spec(
-            tid,
-            &ReadSpec::encode_parts(&ReadBound::None, &Vec::new(), &ReadSink::all_rows()),
-            &schema,
-        )
+        .scan_spec(tid, &ReadSpec::all_rows(ReadBound::None), &schema)
         .unwrap();
     assert_eq!(
         full.payload[0].bytes.len(),

@@ -33,7 +33,7 @@ use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
     dispatch_scan_multi_fanout,
     exchange::{ExchangeAccumulator, PendingRelay},
-    read_fanout, Fanout, MasterDispatcher, SeekReply, WorkerFault, WORKER_WATCH,
+    read_fanout, spec_route, Fanout, MasterDispatcher, SeekReply, WorkerFault, WORKER_WATCH,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, Reactor, ReadGuard, WriteGuard};
@@ -42,8 +42,8 @@ use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
-use gnitz_wire::txn_frame::validate_item_ids;
-use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
+use gnitz_wire::txn_frame::{validate_item_ids, DeltaPollItem};
+use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, STATUS_SCHEMA_MISMATCH};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 
@@ -984,7 +984,6 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         }
 
         ClientVerb::Seek => serve_seek(shared, peer, &ctrl, client_version).await,
-        ClientVerb::SeekByIndex => handle_seek_by_index(shared, peer, &ctrl, client_version).await,
         ClientVerb::ScanSpec => handle_scan_spec(shared, peer, client_id, target_id, &ctrl.seek_pk_extra).await,
 
         // A plain read guard, not `read_lock`: a resolve answers catalog shape,
@@ -1240,8 +1239,7 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
     let target_id = ctrl.target_id as i64;
     let pk = ctrl.seek_pk;
     let seek_pk_extra = ctrl.seek_pk_extra.as_slice();
-    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, Access::Read, ReadFreshness::Current).await
-    else {
+    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, Access::Read).await else {
         return;
     };
     if kind == RelationKind::SystemCatalog {
@@ -1461,7 +1459,7 @@ fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch,
 }
 
 /// A client-supplied batch must not set a null bit on a payload column the
-/// schema declares NOT NULL. `is_null` and `compare_by_group_cols` read such a
+/// schema declares NOT NULL. `is_null` and `cmp_group_cols` read such a
 /// bit as a live NULL, while the evaluator's `nullable_slots`, a projection's
 /// `NullPerm` and the `FixedIntNonnull` row comparator believe the schema
 /// instead — a split that can turn a rejected UNIQUE duplicate into a committed,
@@ -1556,85 +1554,6 @@ async fn target_kind_or_reject(
             send_fault(peer, target_id, client_id, &f);
             None
         }
-    }
-}
-
-/// Serve a secondary-index point lookup. [`Access::UserRead`] refuses a system
-/// family, which is also how "never carries a secondary index" is enforced.
-///
-/// `seek_col_idx` is `pack_pk_cols(col_indices)` and the key rides in `seek_pk` +
-/// `seek_pk_extra`; all three are forwarded to the fan-out verbatim.
-async fn handle_seek_by_index(
-    shared: &Rc<Shared>,
-    peer: &Peer,
-    ctrl: &gnitz_wire::control::DecodedControl,
-    client_version: u16,
-) {
-    let client_id = ctrl.client_id;
-    let target_id = ctrl.target_id as i64;
-    let seek_col_idx = ctrl.seek_col_idx;
-    let seek_pk = ctrl.seek_pk;
-    let seek_pk_extra = ctrl.seek_pk_extra.as_slice();
-    let Some((_g, _kind)) = read_lock(
-        shared,
-        peer,
-        client_id,
-        target_id,
-        Access::UserRead,
-        ReadFreshness::Current,
-    )
-    .await
-    else {
-        return;
-    };
-    // Bind the result before matching on it: an `if let Err(_)` scrutinee would
-    // hold the `&mut CatalogEngine` temporary across the await below.
-    let admitted = shared
-        .cat()
-        .registry()
-        .index_cols(target_id, seek_col_idx, "seek_by_index");
-    let cols = match admitted {
-        Ok(cols) => cols,
-        Err(e) => {
-            send_error(peer, target_id, client_id, e.to_string().as_bytes());
-            return;
-        }
-    };
-    // Single catalog scan (exact list match) answers "is there an index for this
-    // column list"; the borrow ends with the condition, so none is held across
-    // the await below.
-    if shared
-        .cat()
-        .registry()
-        .relation(target_id)
-        .and_then(|r| r.index_on(cols.as_slice()))
-        .is_none()
-    {
-        // No secondary index for this column list: a dedicated control-only
-        // status, caught here with zero worker dispatch, so the SQL planner falls
-        // back to a scan or a CREATE INDEX hint without a prior catalog probe.
-        send_control_only(peer, target_id, client_id, STATUS_NO_INDEX);
-        return;
-    }
-    // Forward the wire frame verbatim (packed seek_col_idx, seek_pk +
-    // seek_pk_extra) to the broadcast-and-merge fan-out.
-    match shared
-        .disp()
-        .fan_out_seek_by_index_collect(target_id, seek_col_idx, seek_pk, seek_pk_extra)
-        .await
-    {
-        Ok(merged) => {
-            send_ok_response(
-                shared,
-                peer,
-                target_id,
-                merged.as_ref(),
-                client_id,
-                seek_pk,
-                client_version,
-            );
-        }
-        Err(f) => send_fault(peer, target_id, client_id, &f),
     }
 }
 
@@ -1813,24 +1732,6 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
         .all(|s| shared.commit_lsn_of(s) <= ticked)
 }
 
-/// What a read owes the writes that came before it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReadFreshness {
-    /// Drain pending ticks when the target is a view `read_is_fresh` reports
-    /// stale — every read verb that answers "what is current".
-    Current,
-    /// Answer against whatever the tick loop has already run. A delta read
-    /// answers "what has happened", not "what is current", so a round the tick
-    /// loop has not run yet is one the next poll carries — and the gate stays
-    /// sound, because it keys on the last round that *reached* the view and an
-    /// unticked push has reached nothing.
-    ///
-    /// Draining here would also cost out of proportion to the read: a `Drain`
-    /// takes *every* pending tid, not just this view's, so polling subscribers
-    /// would defeat the committer's row-threshold coalescing server-wide.
-    AsOfLastTick,
-}
-
 /// Drop the caller's read guard, tick everything pending, and hand back a fresh
 /// guard. Taking the guard by value is the deadlock precondition made structural:
 /// the drain parks on the tick loop's reply, and this writer-preferring guard held
@@ -1847,8 +1748,8 @@ async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadG
 }
 
 /// Take the catalog read lock and resolve `target_id`'s kind from the same probe
-/// that validated it, draining first when `freshness` asks and the target is a
-/// stale view. `None` means the target was rejected and the error is already sent.
+/// that validated it, draining first when the target is a stale view. `None`
+/// means the target was rejected and the error is already sent.
 ///
 /// The one read-lock entry point for every single-target read verb: each passes
 /// the `Access` its realization can serve and routes on the returned kind, rather
@@ -1860,11 +1761,10 @@ async fn read_lock(
     client_id: u64,
     target_id: i64,
     access: Access,
-    freshness: ReadFreshness,
 ) -> Option<(ReadGuard, RelationKind)> {
     let g = shared.catalog_rwlock.read().await;
     let kind = target_kind_or_reject(shared, peer, client_id, target_id, access).await?;
-    if freshness == ReadFreshness::AsOfLastTick || read_is_fresh(shared, target_id) {
+    if read_is_fresh(shared, target_id) {
         return Some((g, kind));
     }
     // No preliminary frame has gone out yet (`schema_block_for_reply`'s block is
@@ -1915,8 +1815,7 @@ fn prelim_schema_msg(tid: i64, client_id: u64, server_version: u16, block: &[u8]
 /// id — so a scan of an id below the user floor that names no family is rejected
 /// by the same "not found" the other verbs give, rather than by `scan`.
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
-    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, Access::Read, ReadFreshness::Current).await
-    else {
+    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, Access::Read).await else {
         return;
     };
     if kind == RelationKind::SystemCatalog {
@@ -1933,7 +1832,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
         );
     }
 
-    let unicast = read_fanout(shared.disp(), target_id, None);
+    let unicast = read_fanout(shared.disp(), target_id);
     // Embed the client's schema version in wire_flags so workers can decide
     // whether to include the schema block in their response.
     let result = shared
@@ -1946,19 +1845,14 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
             SalMessageKind::Scan,
             gnitz_wire::wire_flags_set_schema_version(0, server_version),
             &[],
+            None,
         )
         .await;
-    // A plain scan has only an LSN to report, so the sampled round is dropped
-    // explicitly here rather than hidden inside the fan-out.
-    finish_scan_fanout(peer, target_id, client_id, lsn as u128, result.map(|(ok, _)| ok)).await;
+    finish_scan_fanout(peer, target_id, client_id, lsn as u128, result).await;
 }
 
-/// The terminal frame of a reply train: `STATUS_OK`, no schema block, no data.
-///
-/// `seek_pk` is the read's watermark, and the field is already a `u128`. A plain
-/// scan puts the last-committed LSN there; a delta read puts the pair
-/// `(cursor tag, T)`, tag in the high half — so the whole cursor a subscriber
-/// stores costs no wire bytes.
+/// A reply train's terminal frame. `seek_pk` is the read's watermark: the
+/// last-committed LSN, or a DELTA_POLL position's packed `(cursor tag, T)`.
 fn terminal_scan_msg(target_id: i64, client_id: u64, seek_pk: u128) -> ipc::WireMsg<'static> {
     ipc::WireMsg {
         target_id: target_id as u64,
@@ -1991,72 +1885,30 @@ async fn finish_scan_fanout(
     }
 }
 
-/// Parameterized bounded read (`ReadSpec`). The scan pipeline, minus schema
-/// negotiation: the client authors the reply schema and ships it in
-/// `seek_pk_extra`, so the reply carries no schema block. Terminal-frame and
-/// failure handling are identical to `handle_scan`; the routing differs, since a
-/// bound can confine the read to one worker, and a **delta** bound differs in
-/// three more ways.
-///
-/// The request blob is unpacked **once**, at the top, and the resulting spec
-/// drives all three of the dispatch classification, the routing and the gate —
-/// `read_fanout` takes that spec rather than unpacking the blob again to reach
-/// the same bytes.
-///
-/// 1. It takes no drain ([`ReadFreshness::AsOfLastTick`]).
-/// 2. Its group is a `DeltaScanSpec`, which is what makes the worker
-///    defer it out of an in-flight evaluation.
-/// 3. Its terminal frame reports `(cursor tag, T)` instead of the last-committed
-///    LSN, and an up-to-date poll is answered here, master-locally.
+/// SCAN_SPEC: the scan pipeline under a client-authored reply schema, so no schema
+/// block goes back, routed by the request's bound.
 async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
-    // The one unpack of the request blob on this side; `read_fanout` takes the
-    // spec it yields rather than reaching the same bytes a second time. A blob
-    // that does not split is left to the worker — the sole `ReadSpec` decoder and
-    // trust boundary — and routes meanwhile as an empty spec, which names no PK
-    // range and so confines nothing.
-    let spec = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra)
-        .map(|(spec, _block)| spec)
-        .unwrap_or(gnitz_wire::SpecBytes(&[]));
-    let delta_cursor = gnitz_wire::peek_delta_bound(spec);
-    let freshness = match delta_cursor {
-        Some(_) => ReadFreshness::AsOfLastTick,
-        None => ReadFreshness::Current,
-    };
     // `UserRead`: a `ReadSpec` has only a fan-out realization, which a catalog
     // family has no form of.
-    let Some((_g, _kind)) = read_lock(shared, peer, client_id, target_id, Access::UserRead, freshness).await else {
+    let Some((_g, _kind)) = read_lock(shared, peer, client_id, target_id, Access::UserRead).await else {
         return;
     };
-
-    // No await between the gate and the round, so the terminal cannot report one
-    // from after a tick the gate was tested against. `terminal_scan_msg` and not
-    // `send_control_only`: the latter leaves `seek_pk` zero, a tag the client
-    // never matches, which is the permanent re-read loop this gate avoids.
-    if delta_cursor.is_some_and(|after| delta_up_to_date(shared, target_id, after)) {
-        let disp = shared.disp();
-        let seek_pk = delta_terminal_seek_pk(disp, target_id, disp.last_tick_round());
-        send_msg(peer, terminal_scan_msg(target_id, client_id, seek_pk));
-        return;
-    }
-
-    // A PK range confined to one partition unicasts: one SAL slot instead of W,
-    // each of which would carry its own copy of the spec blob under the exclusive
-    // SAL mutex.
-    let unicast = read_fanout(shared.disp(), target_id, Some(spec));
-    let msg_kind = if delta_cursor.is_some() {
-        SalMessageKind::DeltaScanSpec
-    } else {
-        SalMessageKind::ScanSpec
-    };
+    let route = spec_route(shared.disp(), target_id, seek_pk_extra);
     let result = shared
         .disp()
-        .fan_out_scan(unicast, target_id, client_id, peer, msg_kind, 0, seek_pk_extra)
+        .fan_out_scan(
+            route.fanout,
+            target_id,
+            client_id,
+            peer,
+            SalMessageKind::ScanSpec,
+            0,
+            seek_pk_extra,
+            route.per_worker.as_deref(),
+        )
         .await;
-    let seek_pk = match (&result, delta_cursor) {
-        (Ok((_, round)), Some(_)) => delta_terminal_seek_pk(shared.disp(), target_id, *round),
-        _ => shared.last_tick_lsn.get() as u128,
-    };
-    finish_scan_fanout(peer, target_id, client_id, seek_pk, result.map(|(ok, _)| ok)).await;
+    let lsn = shared.last_tick_lsn.get() as u128;
+    finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
 }
 
 /// DELTA_POLL: advance N mirrored views in one request, one catalog lock and —
@@ -2064,6 +1916,9 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
 ///
 /// A fault at `target_id = 0` rejects the frame; a fault naming a view ends that
 /// view's position and no other.
+///
+/// Never drains pending ticks: a delta read reports what has happened, and a
+/// round not yet ticked is one the next poll carries.
 async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
     match delta_poll_body(shared, peer, client_id, data).await {
         // Every view's train and terminal is already out.
@@ -2091,7 +1946,7 @@ enum PollPosition {
 /// that view's own fault frame and the rest of the poll continues.
 async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, WireFault> {
     let views = gnitz_wire::txn_frame::decode_delta_poll(data).map_err(|e| format!("decode error: {e}"))?;
-    validate_item_ids("DELTA_POLL", &views, |v| v.0)?;
+    validate_item_ids("DELTA_POLL", &views, |v| v.view_id)?;
 
     // ── Phase 1: classify under the catalog lock, dispatch one cut ─────────
     // No await between a view's gate test and the round its terminal reports, so
@@ -2105,35 +1960,36 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         let disp = shared.disp();
         let up_to_date_round = disp.last_tick_round();
         let mut positions = Vec::with_capacity(views.len());
-        let mut moved: Vec<(u64, &[u8], Fanout)> = Vec::with_capacity(views.len());
-        for &(view_id, extra) in &views {
-            let tid = view_id as i64;
-            let position = match poll_read_for_view(shared, tid, extra) {
+        let mut moved: Vec<(DeltaPollItem, Fanout)> = Vec::with_capacity(views.len());
+        for &item in &views {
+            let tid = item.view_id as i64;
+            let position = match target_kind(shared, tid, Access::UserRead) {
                 Err(f) => PollPosition::Fault(f),
-                Ok(None) => PollPosition::UpToDate,
-                Ok(Some(spec)) => {
-                    moved.push((view_id, extra, read_fanout(disp, tid, Some(spec))));
+                Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
+                Ok(_) => {
+                    moved.push((item, read_fanout(disp, tid)));
                     PollPosition::Moved
                 }
             };
             positions.push((tid, position));
         }
 
-        let fanouts: Vec<Fanout> = moved.iter().map(|&(_, _, f)| f).collect();
+        let fanouts: Vec<Fanout> = moved.iter().map(|&(_, f)| f).collect();
         let (dispatches, dispatch_round) =
             dispatch_scan_multi_fanout(disp, &fanouts, |i, targets, wire_flags, round| {
-                let (view_id, extra, _) = moved[i];
+                let (item, _) = moved[i];
                 disp.write_group(&DirectGroup {
                     template: ipc::WireMsg {
-                        target_id: view_id,
+                        target_id: item.view_id,
                         client_id,
                         flags: wire_flags,
                         seek_pk: round as u128,
-                        seek_pk_extra: extra,
+                        seek_col_idx: item.after_tick,
+                        seek_pk_extra: item.reply_block,
                         ..Default::default()
                     },
                     targets,
-                    ..DirectGroup::new(SalMessageKind::DeltaScanSpec)
+                    ..DirectGroup::new(SalMessageKind::DeltaRead)
                 })
             })
             .await?;
@@ -2167,23 +2023,6 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         }
     }
     Ok(true)
-}
-
-/// The read this view needs, or `None` where it already sits at its last round
-/// and its terminal is master-local. Takes the caller's catalog read lock.
-///
-/// A blob carrying any bound but `Delta` is a fault: served here it would answer
-/// "what is current" without the drain that owes.
-fn poll_read_for_view<'a>(
-    shared: &Rc<Shared>,
-    tid: i64,
-    extra: &'a [u8],
-) -> Result<Option<gnitz_wire::SpecBytes<'a>>, WireFault> {
-    let fault = |e: String| -> WireFault { format!("delta_poll: {tid}: {e}").into() };
-    target_kind(shared, tid, Access::UserRead)?;
-    let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(extra).map_err(fault)?;
-    let after = gnitz_wire::peek_delta_bound(spec).ok_or_else(|| fault("read carries no delta bound".to_string()))?;
-    Ok((!delta_up_to_date(shared, tid, after)).then_some(spec))
 }
 
 /// Whether a delta read after `after_tick` already sits at the view's last round,
@@ -2279,7 +2118,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             // master-locally.
             // Status dropped for the reason `push_txn_body`'s is.
             target_kind(shared, tid, Access::UserRead).map_err(|f| f.text)?;
-            fanout.push(read_fanout(shared.disp(), tid, None));
+            fanout.push(read_fanout(shared.disp(), tid));
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
             let (server_version, block) = schema_block_for_reply(shared, tid, client_ver);

@@ -503,10 +503,8 @@ impl OpNode {
 // One fixed layout per opcode, through the crate's shared `Writer`/`Reader`. The
 // opcode *is* the layout tag, so no field carries a discriminant.
 //
-// `write_cols`, `write_aggs`, `write_compute_map` and their readers are
-// `pub(crate)` because `read_spec` ships the same three shapes in a fold's
-// descriptor: one codec, so the durable catalog blob and the ad-hoc read frame
-// cannot drift on width or on which values they admit.
+// The list codecs below are `pub(crate)` so `read_spec`'s sinks ship the same
+// shapes through them, never a second spelling of their widths or domains.
 
 const PARAMS_CTX: &str = "circuit params";
 
@@ -572,6 +570,53 @@ fn write_cols_with_tcs(w: &mut Writer, slots: &[ReindexSlot]) {
     for &(col, tc) in slots {
         w.u32(col).u8(tc.map_or(0, |t| t as u8));
     }
+}
+
+const ORDER_DESC: u8 = 1 << 0;
+const ORDER_NULLS_FIRST: u8 = 1 << 1;
+
+/// One order key's four wire bytes: column, flags, one reserved byte.
+fn write_order_key(w: &mut Writer, key: &crate::OrderKey) {
+    let mut flags = 0u8;
+    if key.desc {
+        flags |= ORDER_DESC;
+    }
+    if key.nulls_first {
+        flags |= ORDER_NULLS_FIRST;
+    }
+    w.u16(key.col).u8(flags).u8(0);
+}
+
+/// [`write_order_key`]'s inverse; an unknown flag bit is a refusal.
+fn read_order_key(r: &mut Reader) -> Result<crate::OrderKey, String> {
+    let col = r.u16()?;
+    let flags = r.u8()?;
+    if flags & !(ORDER_DESC | ORDER_NULLS_FIRST) != 0 {
+        return Err(format!("order key has unknown flag bits {flags:#04x}"));
+    }
+    let _rsv = r.u8()?;
+    Ok(crate::OrderKey {
+        col,
+        desc: flags & ORDER_DESC != 0,
+        nulls_first: flags & ORDER_NULLS_FIRST != 0,
+    })
+}
+
+/// A counted order-key list, shared by the rows sink and a circuit's `TopN`
+/// node, so the two cannot drift.
+pub(crate) fn write_order_keys(w: &mut Writer, keys: &[crate::OrderKey]) {
+    write_count(w, keys.len(), "order keys");
+    for k in keys {
+        write_order_key(w, k);
+    }
+}
+
+pub(crate) fn read_order_keys(r: &mut Reader) -> Result<Vec<crate::OrderKey>, String> {
+    let n = read_count(r, "order keys")?;
+    if n > crate::MAX_ORDER_KEYS {
+        return Err(format!("order keys: {n} exceeds cap {}", crate::MAX_ORDER_KEYS));
+    }
+    (0..n).map(|_| read_order_key(r)).collect()
 }
 
 pub(crate) fn write_aggs(w: &mut Writer, aggs: &[AggDescriptor]) {
@@ -690,10 +735,7 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
         OpNode::TopN { group_cols, order, limit, offset } => {
             w.u64(limit).u64(offset);
             write_cols(&mut w, &group_cols);
-            write_count(&mut w, order.len(), "TOP_N order keys");
-            for key in &order {
-                crate::read_spec::write_order_key(&mut w, key);
-            }
+            write_order_keys(&mut w, &order);
             (Opcode::TopN, None, Some(w.into_vec()))
         }
     }
@@ -802,14 +844,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
                 return Err("TOP_N carries a zero limit".to_string());
             }
             let group_cols = read_cols(&mut r)?;
-            let n = read_count(&mut r, "TOP_N order keys")?;
-            if n > crate::MAX_ORDER_KEYS {
-                return Err(format!("TOP_N: {n} order keys exceeds cap {}", crate::MAX_ORDER_KEYS));
-            }
-            let mut order = Vec::with_capacity(n);
-            for _ in 0..n {
-                order.push(crate::read_spec::read_order_key(&mut r)?);
-            }
+            let order = read_order_keys(&mut r)?;
             OpNode::TopN { group_cols, order, limit, offset }
         }
     };

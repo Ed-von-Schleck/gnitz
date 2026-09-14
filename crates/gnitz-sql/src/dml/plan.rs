@@ -19,7 +19,7 @@ use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use crate::tail::parse_order_by;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
-use gnitz_wire::{IndexWalk, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind};
+use gnitz_wire::{IndexWalk, ReadBound, ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, SelectItem};
 
 // ---------------------------------------------------------------------------
@@ -64,11 +64,15 @@ impl Access {
         !self.predicate.is_empty()
     }
 
-    /// The `ReadSpec` blob this access ships under `sink`, walking `bound` rather
-    /// than [`Self::bound`], so a chunked `PkSet` gather can send a sub-range per
-    /// request under the same predicate and sink. The one encode site.
-    pub(crate) fn encode(&self, bound: &ReadBound, sink: &ReadSink) -> Vec<u8> {
-        ReadSpec::encode_parts(bound, &self.predicate, sink)
+    /// The `ReadSpec` this access ships under `sink`, walking `bound` rather than
+    /// [`Self::bound`], so a chunked `PkSet` gather sends a sub-list per request
+    /// under the same predicate and sink.
+    pub(crate) fn spec(&self, bound: ReadBound, sink: &ReadSink) -> ReadSpec {
+        ReadSpec {
+            bound,
+            predicate: self.predicate.clone(),
+            sink: sink.clone(),
+        }
     }
 }
 
@@ -186,7 +190,7 @@ pub(crate) fn bound_and_predicate<'e>(
     // `pk IN (…)` → an exact gather of those keys, with the remaining conjuncts as
     // the predicate.
     let gather = try_extract_pk_in(conjuncts, schema)
-        .filter(|(keys, _)| budget == ReadBudget::MayChunk || keys.len() <= PkKeys::max_per_request(keys.stride()));
+        .filter(|(keys, _)| budget == ReadBudget::MayChunk || keys.fits_one_request());
     if let Some((keys, residual)) = gather {
         return AccessPlan::new(ReadBound::PkSet(keys), &all, residual, schema);
     }
@@ -322,7 +326,7 @@ fn reproduces(schema: &Schema, items: &[ProjItem], out_cols: &[ColumnDef]) -> bo
 // ---------------------------------------------------------------------------
 
 /// Run `access` under `sink`, concatenating the replies: one request, or one per
-/// [`PkKeys::per_request`] sub-list of a long `PkSet`. Local-first, which a DML
+/// [`gnitz_wire::PkKeys::per_request`] sub-list of a long `PkSet`. Local-first, which a DML
 /// read may take too: only a view is mirrored, and a view is never a DML target.
 pub(crate) fn fetch_bound(
     client: &mut GnitzClient,
@@ -334,9 +338,8 @@ pub(crate) fn fetch_bound(
     let mut out: Option<ZSetBatch> = None;
     // The client stays an argument rather than a capture, so the borrow of
     // `client` and the borrow of `out` never overlap.
-    let mut send = |client: &mut GnitzClient, bound: &ReadBound| -> Result<(), GnitzSqlError> {
-        let blob = access.encode(bound, sink);
-        let batch = client.scan_spec_local_first(table_id, &blob, reply_schema)?;
+    let mut send = |client: &mut GnitzClient, spec: ReadSpec| -> Result<(), GnitzSqlError> {
+        let batch = client.scan_spec_local_first(table_id, spec, reply_schema)?;
         match out.as_mut() {
             Some(acc) => acc.extend_from_owned(batch),
             None => out = Some(batch),
@@ -344,12 +347,12 @@ pub(crate) fn fetch_bound(
         Ok(())
     };
     match &access.bound {
-        ReadBound::PkSet(keys) if keys.len() > PkKeys::max_per_request(keys.stride()) => {
+        ReadBound::PkSet(keys) if !keys.fits_one_request() => {
             for part in keys.per_request() {
-                send(client, &ReadBound::PkSet(part))?;
+                send(client, access.spec(ReadBound::PkSet(part), sink))?;
             }
         }
-        bound => send(client, bound)?,
+        bound => send(client, access.spec(bound.clone(), sink))?,
     }
     Ok(out.unwrap_or_else(|| ZSetBatch::new(reply_schema)))
 }

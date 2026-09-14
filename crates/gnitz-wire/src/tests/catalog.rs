@@ -139,34 +139,3 @@ fn table_flags_roundtrip() {
         props(true, true, 2),
     );
 }
-
-/// The two halves of the `seek_by_index` key wire format are inverses at
-/// every arity, including a prefix seek that supplies fewer values than the
-/// index has columns.
-#[test]
-fn index_key_slots_roundtrip() {
-    let all: [u128; PK_LIST_MAX_COLS] = [1, u128::MAX, 1 << 100, 0];
-    for k in 1..=PK_LIST_MAX_COLS {
-        let vals = &all[..k];
-        let (buf, len) = pack_index_key_slots(vals);
-        assert_eq!(len, k * INDEX_KEY_SLOT);
-        // `split_ctrl_key` routes slot 0 to seek_pk and the rest to the tail.
-        let seek_pk = u128::from_le_bytes(buf[..INDEX_KEY_SLOT].try_into().unwrap());
-        let extra = &buf[INDEX_KEY_SLOT..len];
-        let back = unpack_index_key_slots(seek_pk, extra, PK_LIST_MAX_COLS).expect("well-formed");
-        assert_eq!(back.as_slice(), vals, "arity {k}");
-        // A prefix seek is accepted; more values than the arity is not.
-        assert!(unpack_index_key_slots(seek_pk, extra, k).is_ok());
-        if k > 1 {
-            assert!(unpack_index_key_slots(seek_pk, extra, k - 1).is_err(), "over-arity");
-        }
-    }
-}
-
-/// A tail that is not a whole number of slots is rejected rather than
-/// silently dropping its trailing bytes.
-#[test]
-fn index_key_slots_reject_a_misaligned_tail() {
-    assert!(unpack_index_key_slots(7, &[0u8; 15], PK_LIST_MAX_COLS).is_err());
-    assert!(unpack_index_key_slots(7, &[0u8; 17], PK_LIST_MAX_COLS).is_err());
-}

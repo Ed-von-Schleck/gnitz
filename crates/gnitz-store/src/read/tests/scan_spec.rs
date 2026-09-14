@@ -79,7 +79,7 @@ fn ids(b: &Batch) -> Vec<(u128, i64)> {
 
 fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Rc<Batch>, StoreError> {
     let schema = id_val_schema();
-    registry.scan_spec(TID, spec, &schema, 0, None)
+    registry.scan_spec(TID, spec.clone(), &schema, None)
 }
 
 /// The reply is trimmed to the window, not to the mid-scan residency cap: five
@@ -140,7 +140,7 @@ fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
         ],
         &[0],
     );
-    let Err(err) = r.scan_spec(TID, &rows_spec(Vec::new(), 0), &mismatched, 0, None) else {
+    let Err(err) = r.scan_spec(TID, rows_spec(Vec::new(), 0), &mismatched, None) else {
         panic!("a reply layout off the relation's must be refused on the snapshot path");
     };
     assert!(err.to_string().contains("reply schema does not match"), "{err}");
@@ -277,9 +277,11 @@ fn a_fold_reply_schema_not_matching_its_partial_layout_is_rejected() {
     };
     // The derived partial itself is accepted, which is what makes the two
     // refusals below about the layout rather than about the spec.
-    assert!(r.scan_spec(TID, &spec, &partial(Some(type_code::I64)), 0, None).is_ok());
+    assert!(r
+        .scan_spec(TID, spec.clone(), &partial(Some(type_code::I64)), None)
+        .is_ok());
     for bad in [partial(None), partial(Some(type_code::F64))] {
-        let Err(err) = r.scan_spec(TID, &spec, &bad, 0, None) else {
+        let Err(err) = r.scan_spec(TID, spec.clone(), &bad, None) else {
             panic!("a reply schema off the partial layout must be rejected");
         };
         assert!(err.to_string().contains("reply schema does not match"), "{err}");

@@ -190,19 +190,13 @@ fn drain_index_scan_merges_chunked_and_single_frame_trains() {
     let slots = fx.initial_slots();
 
     let mut rows: Vec<(u128, i64)> = Vec::new();
-    let result = poll_once(drain_index_scan(
-        slots,
-        &fx.scan,
-        "seek_by_index",
-        &schema,
-        |mb, frame_len| {
-            assert!(frame_len > 0, "sink receives the raw frame byte length");
-            for i in 0..mb.len() {
-                rows.push((gnitz_wire::widen_pk_be(mb.get_pk_bytes(i)), mb.get_weight(i)));
-            }
-            Ok(())
-        },
-    ));
+    let result = poll_once(drain_index_scan(slots, &fx.scan, "seek", &schema, |mb, frame_len| {
+        assert!(frame_len > 0, "sink receives the raw frame byte length");
+        for i in 0..mb.len() {
+            rows.push((gnitz_wire::widen_pk_be(mb.get_pk_bytes(i)), mb.get_weight(i)));
+        }
+        Ok(())
+    }));
     result.expect("healthy trains must drain cleanly");
     assert_eq!(
         rows,
@@ -258,8 +252,8 @@ fn drain_index_scan_sink_error_aborts_drain() {
 
     let slots = fx.initial_slots();
 
-    let result = poll_once(drain_index_scan(slots, &fx.scan, "seek_by_index", &schema, |_, _| {
-        Err("seek_by_index: result exceeds the reply cap".into())
+    let result = poll_once(drain_index_scan(slots, &fx.scan, "seek", &schema, |_, _| {
+        Err("seek: result exceeds the reply cap".into())
     }));
     let err = result.expect_err("sink error must abort the drain");
     assert!(err.text.contains("reply cap"), "sink error surfaces verbatim: {err}");

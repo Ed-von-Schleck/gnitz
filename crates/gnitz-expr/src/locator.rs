@@ -298,6 +298,33 @@ pub fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &dyn SchemaF
     keys.extend((0..schema.num_payload_cols()).map(|pi| asc(schema.locate(schema.payload_col_idx(pi)))));
 }
 
+/// The one group order: column by column, NULLs first and equal to each other,
+/// values by [`ColumnLocator::cmp_non_null`].
+pub fn cmp_group_cols<A: RowSource, B: RowSource>(
+    src_a: &A,
+    row_a: usize,
+    src_b: &B,
+    row_b: usize,
+    descs: &[ColumnLocator],
+) -> Ordering {
+    let a_null_word = src_a.get_null_word(row_a);
+    let b_null_word = src_b.get_null_word(row_b);
+
+    for loc in descs {
+        match (loc.is_null_word(a_null_word), loc.is_null_word(b_null_word)) {
+            (true, true) => continue,
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) => {}
+        }
+        let ord = loc.cmp_non_null(src_a, row_a, src_b, row_b);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// The one ORDER BY comparator, read by both the worker's top-k and the client's
 /// ordering sink. Lexicographic over the keys; NULL placement is absolute —
 /// `nulls_first` decides it and `desc` does not flip it. `Equal` means the keys
