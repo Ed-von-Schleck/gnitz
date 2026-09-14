@@ -7,24 +7,9 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::protocol::{encode_message_parts, hello_handshake, ClientTransport};
+use gnitz_core::protocol::{encode_message_parts, hello_handshake, set_sockopt_int, ClientTransport};
 use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TableProps, TypeCode, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
-
-/// Shrink a socket's receive buffer so the first scan frame's server-side send
-/// stalls against a non-draining peer.
-fn set_tiny_rcvbuf(fd: RawFd) {
-    let bufsz: libc::c_int = 4096;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &bufsz as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-}
 
 /// Wait up to `deadline_ms` for the server to shut down its end of `fd`,
 /// detected via POLLHUP/POLLRDHUP without reading — reading would drain the
@@ -63,8 +48,10 @@ fn slow_scan_client_is_evicted_after_deadline() {
     client.push(table_id, &schema, &batch).unwrap();
 
     // A raw connection that issues the scan and never reads.
-    let mut slow = ClientTransport::connect(srv.sock_path()).expect("connect");
-    set_tiny_rcvbuf(slow.as_raw_fd());
+    let mut slow = ClientTransport::connect(srv.sock_path(), None).expect("connect");
+    // A tiny receive buffer stalls the first scan frame's server-side send
+    // against a non-draining peer.
+    set_sockopt_int(slow.as_raw_fd(), libc::SO_RCVBUF, 4096);
     hello_handshake(&mut slow, None).expect("hello");
     let scan = encode_message_parts(table_id, 0xB0BA, 0, 0, &[], 0, None);
     slow.send_parts(scan, None).expect("send scan");

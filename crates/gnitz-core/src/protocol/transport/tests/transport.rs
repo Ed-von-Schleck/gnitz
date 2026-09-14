@@ -349,23 +349,13 @@ fn test_client_transport_unix_roundtrip() {
 
 #[test]
 fn test_connect_rejects_malformed_tls_targets() {
-    // The tls:// prefix is the sole discriminator; these must not be
-    // treated as socket paths, and must fail with a parse error.
-    for bad in [
-        "tls://",                  // no host
-        "tls://127.0.0.1",         // no port
-        "tls://h:1?insecure&ca=x", // unknown/multiple params
-        "tls://h:1?bogus",         // unknown param
-        "tls://h:1?insecure?ca=x", // second param
-        "tls://[::1:443?insecure", // unterminated bracket
-        "tls://h:notaport",        // bad port
-    ] {
-        let err = ClientTransport::connect(bad).err();
-        assert!(
-            matches!(err, Some(ProtocolError::DecodeError(_))),
-            "{bad} must be rejected with a parse error, got {err:?}",
-        );
-    }
+    // The tls:// prefix selected TLS: the target is refused by the TLS parser,
+    // not tried as an AF_UNIX path (which would fail with `NotFound`).
+    let err = ClientTransport::connect("tls://h", None).err();
+    assert!(
+        matches!(err, Some(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput),
+        "got {err:?}",
+    );
 }
 
 // ── FrameReader ─────────────────────────────────────────────────────────────

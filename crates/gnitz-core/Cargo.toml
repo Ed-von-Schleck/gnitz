@@ -18,6 +18,7 @@ webpki-roots = "1"
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 # The loopback TLS peer the framing tests drive a real `connect_tls` against.
 rcgen.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

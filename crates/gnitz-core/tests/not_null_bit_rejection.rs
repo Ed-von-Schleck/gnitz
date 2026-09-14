@@ -67,7 +67,7 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
     // A second, raw connection: `GnitzClient`'s own session is private, and a
     // pre-encoded frame written straight to the socket is what walks past the
     // validator.
-    let mut raw = ClientTransport::connect(srv.sock_path()).unwrap();
+    let mut raw = ClientTransport::connect(srv.sock_path(), None).unwrap();
     hello_handshake(&mut raw, None).unwrap();
 
     // The same rows, unmodified, are accepted — so the rejection below is about

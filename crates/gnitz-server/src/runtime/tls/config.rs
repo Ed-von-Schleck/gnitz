@@ -34,9 +34,6 @@ pub(super) fn server_crypto(
                 .map_err(|e| format!("tls cert {cert_path:?}: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("tls cert {cert_path:?}: {e}"))?;
-            if chain.is_empty() {
-                return Err(format!("tls cert {cert_path:?}: no certificates found"));
-            }
             let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| format!("tls key {key_path:?}: {e}"))?;
             (chain, key, None)
         }
@@ -53,31 +50,23 @@ pub(super) fn server_crypto(
         }
     };
 
-    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| format!("tls config: {e}"))?;
+    let builder = rustls::ServerConfig::builder();
     // Required-mTLS when a client CA is configured; server-auth-only otherwise.
     let auth = match client_ca {
         Some(path) => {
             use rustls::pki_types::pem::PemObject;
             let mut roots = rustls::RootCertStore::empty();
-            let (added, _) = roots.add_parsable_certificates(
+            roots.add_parsable_certificates(
                 CertificateDer::pem_file_iter(path)
                     .map_err(|e| format!("tls client-ca {path:?}: {e}"))?
                     .filter_map(Result::ok),
             );
-            if added == 0 {
-                return Err(format!("tls client-ca {path:?}: no usable certificates"));
-            }
             // Built WITHOUT `.allow_unauthenticated()`, so the default
             // `AnonymousClientPolicy::Deny` makes a client cert mandatory (a
             // no-cert handshake fails with `CertificateRequired`).
-            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-                Arc::new(roots),
-                Arc::new(rustls::crypto::ring::default_provider()),
-            )
-            .build()
-            .map_err(|e| format!("tls client-ca {path:?}: verifier build failed: {e}"))?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| format!("tls client-ca {path:?}: verifier build failed: {e}"))?;
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),

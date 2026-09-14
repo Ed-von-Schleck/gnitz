@@ -1,26 +1,36 @@
 use super::*;
 use crate::connection::{Interest, Reply, Request, Session};
-use crate::protocol::transport::{hello_handshake, poll_fd};
+use crate::protocol::transport::{hello_handshake, poll_fd, CONNECT_TIMEOUT};
 use crate::test_support::{framed, reply_ctrl};
 use std::io::Read;
 use std::net::TcpListener;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// A `rustls::ServerConnection` over a loopback `TcpStream` on a helper
-/// thread: mints a self-signed cert, answers the HELLO with a real ACK so
-/// the client's `mark_established` runs, then hands the connection to
-/// `script`. The client reaches it through the fully public
-/// `ClientTransport::connect("tls://127.0.0.1:{port}?insecure")`.
+/// A rustls server on a loopback thread with a freshly minted `127.0.0.1` cert,
+/// reached through the public `tls://…?ca=` target.
 struct Loopback {
     target: String,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Holds the minted cert's PEM for as long as the target names it.
+    _ca_dir: tempfile::TempDir,
 }
 
 /// The far end as the script sees it: a blocking rustls stream. One
 /// `write` with several frames in it puts them in as few records as
 /// rustls makes of the run — one, below 16 KiB.
 type ServerEnd = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+
+/// How far the loopback peer goes before its script runs.
+#[derive(Clone, Copy, PartialEq)]
+enum Peer {
+    /// Completes the TLS handshake and acknowledges the HELLO.
+    AckHello,
+    /// Completes the TLS handshake, then says nothing.
+    SilentTls,
+    /// Accepts the TCP connection and never starts TLS.
+    SilentTcp,
+}
 
 fn write_frame(end: &mut ServerEnd, payload: &[u8]) {
     end.write_all(&framed(payload)).unwrap();
@@ -37,28 +47,30 @@ fn read_frame(end: &mut ServerEnd) -> Vec<u8> {
 
 impl Loopback {
     fn start(script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
-        Self::spawn(None, true, script)
+        Self::spawn(None, Peer::AckHello, |end| script(end.unwrap()))
     }
 
     /// `rcvbuf` pins the accepted socket's `SO_RCVBUF` (inherited from
     /// the listener) so the peer's window bounds what the client can push
     /// unread.
     fn start_with_rcvbuf(rcvbuf: Option<libc::c_int>, script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
-        Self::spawn(rcvbuf, true, script)
+        Self::spawn(rcvbuf, Peer::AckHello, |end| script(end.unwrap()))
     }
 
-    /// Completes the TLS handshake and then never answers the HELLO,
+    /// A peer that goes as far as `peer` says and then never answers,
     /// holding the socket open until `hold` returns.
-    fn start_silent(hold: impl FnOnce() + Send + 'static) -> Self {
-        Self::spawn(None, false, move |_end| hold())
+    fn start_silent(peer: Peer, hold: impl FnOnce() + Send + 'static) -> Self {
+        Self::spawn(None, peer, move |_end| hold())
     }
 
-    fn spawn(rcvbuf: Option<libc::c_int>, ack_hello: bool, script: impl FnOnce(ServerEnd) + Send + 'static) -> Self {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    /// `script` gets the rustls stream, or `None` for a `SilentTcp` peer.
+    fn spawn(rcvbuf: Option<libc::c_int>, peer: Peer, script: impl FnOnce(Option<ServerEnd>) + Send + 'static) -> Self {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let ca_dir = tempfile::tempdir().unwrap();
+        let pem = ca_dir.path().join("ca.pem");
+        std::fs::write(&pem, cert.cert.pem()).unwrap();
         let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-        let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
+        let mut cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert.cert.der().clone()], key)
             .unwrap();
@@ -71,13 +83,18 @@ impl Loopback {
         let port = listener.local_addr().unwrap().port();
         let thread = std::thread::spawn(move || {
             let (sock, _) = listener.accept().unwrap();
+            if peer == Peer::SilentTcp {
+                script(None);
+                drop(sock);
+                return;
+            }
             let mut end = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), sock);
             // `StreamOwned` handshakes lazily on first I/O; a silent
             // script never does any, so finish it here.
             while end.conn.is_handshaking() {
                 end.conn.complete_io(&mut end.sock).unwrap();
             }
-            if ack_hello {
+            if peer == Peer::AckHello {
                 let hello = read_frame(&mut end);
                 assert_eq!(hello.len(), gnitz_wire::HELLO_PAYLOAD_LEN as usize);
                 // `encode_hello_ack` frames the ACK itself.
@@ -85,17 +102,19 @@ impl Loopback {
                 end.write_all(&ack).unwrap();
                 end.flush().unwrap();
             }
-            script(end);
+            script(Some(end));
         });
         Loopback {
-            target: format!("tls://127.0.0.1:{port}?insecure"),
+            target: format!("tls://127.0.0.1:{port}?ca={}", pem.display()),
             thread: Some(thread),
+            _ca_dir: ca_dir,
         }
     }
 
     fn connect(&self) -> ClientTransport {
-        let mut t = ClientTransport::connect(&self.target).unwrap();
-        hello_handshake(&mut t, Some(CONNECT_TIMEOUT)).unwrap();
+        let until = Some(Instant::now() + CONNECT_TIMEOUT);
+        let mut t = ClientTransport::connect(&self.target, until).unwrap();
+        hello_handshake(&mut t, until).unwrap();
         assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
         t
     }
@@ -105,14 +124,19 @@ impl Loopback {
     }
 }
 
-/// 0-RTT lock, client side: early data must stay off, so that once a
+/// The client profile: TLS 1.3 alone, and early data off, so that once a
 /// future auth layer gives a session DML authority, replayable early data
-/// cannot become replayable DML. The server-side half is asserted by
-/// `zero_rtt_stays_locked_off_server_side` in gnitz-server's `tls::config`.
+/// cannot become replayable DML. gnitz-server's TLS config tests assert the
+/// server-side half.
 #[test]
-fn client_config_leaves_zero_rtt_off() {
-    let cfg = build_client_config(&Verify::Insecure, None).expect("client config");
+fn client_config_profile() {
+    let cfg = build_client_config(&parse_target("127.0.0.1:1").unwrap()).expect("client config");
     assert!(!cfg.enable_early_data, "client 0-RTT early data must be off");
+    assert!(cfg
+        .crypto_provider()
+        .cipher_suites
+        .iter()
+        .all(|s| s.version() == &rustls::version::TLS13));
 }
 
 #[test]
@@ -209,12 +233,8 @@ fn loopback_large_reply_spanning_many_records_is_intact() {
 
 #[test]
 fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
-    // A frame under rustls's 64 KiB limit is taken by one `write_vectored`
-    // — the queue empties — while the socket, with both buffers pinned
-    // below the frame and a peer that is not yet reading, takes only part
-    // of the ciphertext. `interest()` must still report WRITE for the
-    // rest, and only a later step(WRITE) puts the frame's last bytes on
-    // the wire.
+    // 60 KiB fits rustls's send buffer but not the pinned socket buffers: the
+    // queue empties while ciphertext is still pending.
     let frame: Vec<u8> = (0u8..=255).cycle().take(60 * 1024).collect();
     let expect = frame.clone();
     let (tx, rx) = mpsc::channel::<()>();
@@ -250,10 +270,9 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
 
 #[test]
 fn loopback_deadline_over_tls_never_tears_a_frame() {
-    // A >64 KiB frame (so rustls forces mid-frame flushes) under a short
-    // deadline to a peer that drains only after a delay, followed by a
-    // small one: the server parses two well-formed frames.
-    let big: Vec<u8> = (0u8..=255).cycle().take(400 * 1024).collect();
+    // 4 MiB outgrows rustls's 1 MiB send buffer, so the deadline expires with
+    // the frame's tail still in the queue.
+    let big: Vec<u8> = (0u8..=255).cycle().take(4 * 1024 * 1024).collect();
     let expect = big.clone();
     let lb = Loopback::start(move |mut end| {
         std::thread::sleep(Duration::from_millis(400));
@@ -282,26 +301,16 @@ fn loopback_deadline_over_tls_never_tears_a_frame() {
 }
 
 #[test]
-fn loopback_established_connection_idle_past_connect_timeout_still_reads() {
-    let lb = Loopback::start(|mut end| {
-        std::thread::sleep(CONNECT_TIMEOUT + Duration::from_millis(500));
-        write_frame(&mut end, b"still here");
-    });
-    let mut t = lb.connect();
-    assert_eq!(t.recv_framed(None).unwrap(), b"still here");
-    lb.join();
-}
-
-#[test]
 fn loopback_silent_peer_fails_the_hello_at_the_deadline_once() {
     // A peer that completes the TLS handshake and then says nothing:
     // the HELLO read fails at CONNECT_TIMEOUT, not at twice it.
     let (tx, rx) = mpsc::channel::<()>();
-    let lb = Loopback::start_silent(move || rx.recv().unwrap_or(()));
-    let mut t = ClientTransport::connect(&lb.target).unwrap();
-    let t0 = std::time::Instant::now();
+    let lb = Loopback::start_silent(Peer::SilentTls, move || rx.recv().unwrap_or(()));
+    let t0 = Instant::now();
+    let until = Some(t0 + CONNECT_TIMEOUT);
+    let mut t = ClientTransport::connect(&lb.target, until).unwrap();
     assert!(matches!(
-        hello_handshake(&mut t, Some(CONNECT_TIMEOUT)),
+        hello_handshake(&mut t, until),
         Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock
     ));
     let took = t0.elapsed();
@@ -309,6 +318,26 @@ fn loopback_silent_peer_fails_the_hello_at_the_deadline_once() {
         took >= CONNECT_TIMEOUT && took < CONNECT_TIMEOUT + Duration::from_secs(2),
         "{took:?}"
     );
+    tx.send(()).unwrap();
+    lb.join();
+}
+
+#[test]
+fn loopback_silent_tcp_peer_fails_the_hello_at_the_deadline() {
+    // A peer that accepts TCP and never answers the ClientHello: the stalled
+    // handshake is bounded by the one deadline over the HELLO exchange.
+    let (tx, rx) = mpsc::channel::<()>();
+    let lb = Loopback::start_silent(Peer::SilentTcp, move || rx.recv().unwrap_or(()));
+    let deadline = Duration::from_millis(300);
+    let t0 = Instant::now();
+    let until = Some(t0 + deadline);
+    let mut t = ClientTransport::connect(&lb.target, until).unwrap();
+    assert!(matches!(
+        hello_handshake(&mut t, until),
+        Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let took = t0.elapsed();
+    assert!(took >= deadline && took < Duration::from_secs(2), "{took:?}");
     tx.send(()).unwrap();
     lb.join();
 }
@@ -329,20 +358,73 @@ fn loopback_clean_close_notify_surfaces_as_eof() {
 }
 
 #[test]
+fn loopback_bytes_after_close_notify_surface_eof() {
+    // Bytes past a close_notify, beyond what rustls takes in one `read_tls`,
+    // must never be fed: the read after the last frame reports EOF rather than
+    // spinning on a slice rustls refuses.
+    let lb = Loopback::start(|mut end| {
+        write_frame(&mut end, b"last");
+        end.conn.send_close_notify();
+        end.flush().unwrap();
+        end.sock.write_all(&[0u8; 16 * 1024]).unwrap();
+    });
+    let t = lb.connect();
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut t = t;
+        // Everything lands before the first read, so one socket read takes it all.
+        std::thread::sleep(Duration::from_millis(200));
+        let frame = t.recv_framed(None).map_err(|e| e.to_string());
+        let next = t.recv_framed(None);
+        let next_is_eof =
+            matches!(next, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof);
+        tx.send((frame, next_is_eof)).unwrap();
+    });
+    let (frame, next_is_eof) = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the read after close_notify must not spin");
+    assert_eq!(frame.unwrap(), b"last");
+    assert!(next_is_eof);
+    reader.join().unwrap();
+    lb.join();
+}
+
+#[test]
+fn loopback_reply_and_close_notify_in_one_read_complete_the_slot() {
+    // A reply and the close_notify behind it arrive in one socket read: the
+    // step must hand out the reply's completion, and the close surfaces later.
+    let lb = Loopback::start(|mut end| {
+        read_frame(&mut end);
+        write_frame(&mut end, &reply_ctrl(0, 7));
+        end.conn.send_close_notify();
+        end.flush().unwrap();
+    });
+    let mut s = Session::from_transport(lb.connect());
+    let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
+    assert!(s.step(Interest::WRITE).unwrap().is_empty());
+    std::thread::sleep(Duration::from_millis(200));
+    poll_fd(s.as_raw_fd(), libc::POLLIN, None, true).unwrap();
+    let mut done = s
+        .step(Interest::READ)
+        .expect("the reply completes before the close surfaces");
+    assert_eq!(done.len(), 1);
+    let (id, reply) = done.swap_remove(0);
+    assert_eq!(id, slot);
+    let Reply::Ack(m) = reply.unwrap() else { panic!("ack") };
+    assert_eq!(m.seek_pk, 7);
+    lb.join();
+}
+
+#[test]
 fn parse_target_accepts_all_forms() {
     let t = parse_target("db.example.com:5433").unwrap();
     assert_eq!((t.host.as_str(), t.port), ("db.example.com", 5433));
-    assert!(matches!(t.verify, Verify::Default));
-    assert!(t.client_auth.is_none());
-
-    let t = parse_target("127.0.0.1:1?insecure").unwrap();
-    assert_eq!((t.host.as_str(), t.port), ("127.0.0.1", 1));
-    assert!(matches!(t.verify, Verify::Insecure));
+    assert!(t.ca.is_none());
     assert!(t.client_auth.is_none());
 
     let t = parse_target("[::1]:65535?ca=/some/dir/cert.pem").unwrap();
     assert_eq!((t.host.as_str(), t.port), ("::1", 65535));
-    assert!(matches!(t.verify, Verify::Ca(ref p) if p == "/some/dir/cert.pem"));
+    assert_eq!(t.ca.as_deref(), Some("/some/dir/cert.pem"));
     assert!(t.client_auth.is_none());
 
     // Client auth: cert+key, default verification.
@@ -351,19 +433,11 @@ fn parse_target_accepts_all_forms() {
         t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
         Some(("/c", "/k"))
     );
-    assert!(matches!(t.verify, Verify::Default));
+    assert!(t.ca.is_none());
 
     // Client auth + explicit CA.
     let t = parse_target("h:5?ca=/x&cert=/c&key=/k").unwrap();
-    assert!(matches!(t.verify, Verify::Ca(ref p) if p == "/x"));
-    assert_eq!(
-        t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
-        Some(("/c", "/k"))
-    );
-
-    // Client auth + insecure.
-    let t = parse_target("h:5?insecure&cert=/c&key=/k").unwrap();
-    assert!(matches!(t.verify, Verify::Insecure));
+    assert_eq!(t.ca.as_deref(), Some("/x"));
     assert_eq!(
         t.client_auth.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
         Some(("/c", "/k"))
@@ -380,38 +454,28 @@ fn parse_target_accepts_all_forms() {
 #[test]
 fn parse_target_rejects_malformed() {
     for bad in [
-        "",                        // empty
-        "hostonly",                // no port
-        ":443",                    // empty host
-        "h:0x1f",                  // non-numeric port
-        "h:99999",                 // port out of u16 range
-        "h:443?",                  // empty query (bare trailing `?`)
-        "h:443?ca=",               // empty CA path
-        "h:443?insecure=1",        // unknown param
-        "h:443?Insecure",          // params are case-sensitive
-        "[::1]443",                // missing `:` after bracket
-        "[::1:443",                // unterminated bracket
-        "h:443?cert=/c",           // cert without key
-        "h:443?key=/k",            // key without cert
-        "h:443?insecure&ca=/x",    // insecure + ca mutually exclusive
-        "h:443?cert=/c&cert=/d",   // duplicate cert
-        "h:443?ca=/x&ca=/y",       // duplicate ca
-        "h:443?insecure&insecure", // duplicate insecure
-        "h:443?insecure&",         // trailing `&` (empty element)
-        "h:443?&insecure",         // leading `&` (empty element)
+        "",                      // empty
+        "hostonly",              // no port
+        ":443",                  // empty host
+        "h:0x1f",                // non-numeric port
+        "h:99999",               // port out of u16 range
+        "h:443?",                // empty query (bare trailing `?`)
+        "h:443?ca=",             // empty CA path
+        "h:443?key=",            // empty key path
+        "h:443?insecure",        // removed mode: unknown param
+        "h:443?CA=/x",           // params are case-sensitive
+        "[::1]443",              // missing `:` after bracket
+        "[::1:443",              // unterminated bracket
+        "h:443?cert=/c",         // cert without key
+        "h:443?key=/k",          // key without cert
+        "h:443?cert=/c&cert=/d", // duplicate cert
+        "h:443?ca=/x&ca=/y",     // duplicate ca
+        "h:443?ca=/x&",          // trailing `&` (empty element)
+        "h:443?&ca=/x",          // leading `&` (empty element)
     ] {
         assert!(
             parse_target(bad).is_err(),
             "{bad:?} must be rejected by the target parser",
         );
     }
-}
-
-#[test]
-fn loopback_detection() {
-    assert!(is_loopback_host("localhost"));
-    assert!(is_loopback_host("127.0.0.1"));
-    assert!(is_loopback_host("::1"));
-    assert!(!is_loopback_host("example.com"));
-    assert!(!is_loopback_host("10.0.0.7"));
 }

@@ -36,7 +36,7 @@ pub(crate) use message::{encode_control_frame, parse_response_frame};
 // build keeps it crate-private. The cfgs are complementary because two `use`
 // statements binding one name is `E0252` whatever their visibility.
 #[cfg(any(test, feature = "integration"))]
-pub use transport::{hello_handshake, ClientTransport};
+pub use transport::{hello_handshake, set_sockopt_int, ClientTransport};
 #[cfg(not(any(test, feature = "integration")))]
 pub(crate) use transport::{hello_handshake, ClientTransport};
 pub use types::{

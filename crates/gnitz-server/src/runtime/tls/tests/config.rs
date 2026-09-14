@@ -10,6 +10,11 @@ fn dev_cert_mint_builds_server_config() {
     // client-side mirror.
     assert_eq!(cfg.max_early_data_size, 0, "0-RTT early data must be disabled");
     assert_eq!(cfg.send_tls13_tickets, 0, "and no resumption ticket is issued");
+    assert!(cfg
+        .crypto_provider()
+        .cipher_suites
+        .iter()
+        .all(|s| s.version() == &rustls::version::TLS13));
     let pem = dev_pem.expect("mint path must return the public PEM");
     assert!(pem.contains("BEGIN CERTIFICATE"));
     assert!(

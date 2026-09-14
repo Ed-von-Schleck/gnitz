@@ -180,13 +180,11 @@ impl PyAsyncTransport {
 #[pymethods]
 impl PyAsyncTransport {
     #[new]
-    fn new(py: Python<'_>, socket_path: &str, event_loop: Py<PyAny>) -> PyResult<Self> {
+    fn new(py: Python<'_>, target: &str, event_loop: Py<PyAny>) -> PyResult<Self> {
         // Connect + HELLO run on the calling (loop) thread, GIL dropped across
         // the blocking syscalls. A bare `Session`, not a `GnitzClient`: no OCC
         // basis to track, so the HELLO ACK's `published_lsn` is discarded.
-        let (session, _published_lsn) = py
-            .detach(|| gnitz_core::Session::connect(socket_path))
-            .map_err(client_err)?;
+        let (session, _published_lsn) = py.detach(|| gnitz_core::Session::connect(target)).map_err(client_err)?;
         let fd = session.as_raw_fd();
         let create_future = event_loop.getattr(py, "create_future")?;
         Ok(PyAsyncTransport {

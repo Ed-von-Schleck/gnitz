@@ -1,4 +1,4 @@
-"""The Python clients over ``tls://…?insecure`` against the session server's
+"""The Python clients over ``tls://…?ca=`` against the session server's
 always-on TLS listener, whatever GNITZ_TRANSPORT the suite runs under.
 
 The TLS transport itself is gnitz-core's and is tested there, and `make e2e-tls`

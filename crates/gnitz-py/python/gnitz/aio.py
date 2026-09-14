@@ -8,10 +8,9 @@ Usage::
         lsn = await conn.push(table_id, batch)
         result = await conn.scan(table_id)
 
-The target may also be a TLS address: ``tls://HOST:PORT`` with an optional
-single param — ``?insecure`` (skip certificate verification; dev/test) or
-``?ca=PATH`` (PEM root override). Anything without the ``tls://`` prefix is
-an AF_UNIX socket path.
+The target may also be ``tls://HOST:PORT[?QUERY]``, ``QUERY`` being
+``&``-separated ``ca=PATH`` (PEM roots, default webpki), ``cert=PATH`` and
+``key=PATH`` (mTLS).
 
 Every method submits when called and returns its future, so pipelining is
 just not awaiting yet — several operations ride one round-trip when they are
@@ -28,8 +27,9 @@ together, and each future resolves to its own operation's result.
 Three limitations are choices, not oversights:
 
 * **Connect is synchronous** — connect + HELLO run on the calling thread, so a
-  ``tls://`` connect to a slow host blocks the loop for both, and the 10 s
-  connect timeout is per resolved address. ``asyncio.wait_for`` around
+  ``tls://`` connect to a slow host blocks the loop: name resolution, then the
+  TCP connect, TLS handshake and HELLO under one connect deadline.
+  ``asyncio.wait_for`` around
   ``connect`` therefore bounds nothing: the socket is already open by the time
   it sees the object. Harmless for loopback. Moving the connect to a thread
   would fix it and cost a thread — which is the one thing this client does not
@@ -46,13 +46,13 @@ import asyncio
 from gnitz._native import AsyncTransport
 
 
-def connect(socket_path):
+def connect(target):
     """Connect to a gnitz server.
 
-    Usable as both ``conn = await connect(path)``
-    and ``async with connect(path) as conn:``.
+    Usable as both ``conn = await connect(target)``
+    and ``async with connect(target) as conn:``.
     """
-    return AsyncConnection(socket_path)
+    return AsyncConnection(target)
 
 
 async def _immediate_return(value):
@@ -76,8 +76,8 @@ class AsyncConnection:
 
     __slots__ = ("_transport",)
 
-    def __init__(self, socket_path):
-        self._transport = AsyncTransport(socket_path, asyncio.get_running_loop())
+    def __init__(self, target):
+        self._transport = AsyncTransport(target, asyncio.get_running_loop())
         # Two steps: binding the loop callbacks needs the transport object,
         # which its constructor cannot hand itself.
         self._transport.install()

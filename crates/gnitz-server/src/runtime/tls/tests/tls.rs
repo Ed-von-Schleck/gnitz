@@ -22,10 +22,7 @@ fn handshaken_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
     let mut roots = rustls::RootCertStore::empty();
     let certs = rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes());
     roots.add_parsable_certificates(certs.filter_map(Result::ok));
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
+    let mut client_cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     client_cfg.alpn_protocols = vec![gnitz_wire::ALPN_GNITZ.to_vec()];

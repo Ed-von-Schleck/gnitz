@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use gnitz_core::protocol::set_sockopt_int;
 use gnitz_core::{
     ColumnDef, GnitzClient, Interest, PkColumn, Reply, Request, Schema, Session, SlotId, TableProps, TypeCode,
     WireConflictMode, ZSetBatch, MAX_IN_FLIGHT,
@@ -95,7 +96,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     let (mut s, _lsn) = Session::connect(target).unwrap();
     // Small socket buffers so the outbound queue is drained across several
     // steps rather than in one writev.
-    set_sndbuf(s.as_raw_fd(), 64 * 1024);
+    set_sockopt_int(s.as_raw_fd(), libc::SO_SNDBUF, 64 * 1024);
     let sent_before = s.requests_sent();
     let n = 40usize;
     let per = 5_000usize;
@@ -203,19 +204,6 @@ fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'
         schema,
         batch,
         mode: WireConflictMode::Update,
-    }
-}
-
-fn set_sndbuf(fd: std::os::fd::RawFd, bytes: libc::c_int) {
-    // SAFETY: setsockopt with a properly sized c_int.
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &bytes as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
     }
 }
 

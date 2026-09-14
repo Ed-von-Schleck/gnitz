@@ -64,8 +64,11 @@ class _Server:
     `ServerProc`, which reboots on the same data dir and skips the per-boot cert
     minting and TCP bind.
 
+    The TLS target survives restarts: later boots rebind the first boot's port,
+    and every boot's dev cert is copied to one fixed CA path.
+
     Lifecycle:
-        _Server(sock_path, factory)  → __init__ pins the socket path and TLS port
+        _Server(sock_path, factory)  → __init__ pins the socket path and CA path
         .start()                     → spawns first process in a fresh data_dir
         .restart()                   → kills process, discards data_dir, spawns again
         .teardown()                  → copies worker logs, kills process, removes dirs
@@ -75,11 +78,9 @@ class _Server:
         self._binary = server_binary()
         self._factory = tmp_path_factory
         self.sock_path = sock_path
-        # One free TCP port, allocated once and passed on EVERY spawn
-        # (including restarts): the TLS address must be as stable across
-        # restarts as the socket path, so fixtures holding a target string
-        # survive a server restart.
-        self.tls_port = _probe_free_port()
+        # 0 until the first boot publishes the port it bound.
+        self.tls_port = 0
+        self.tls_ca_path = sock_path + ".ca.pem"
         self.proc = None
         self._stderr_f = None
         self._data_dir: str | None = None
@@ -91,23 +92,12 @@ class _Server:
     # ── public ────────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        # Bounded retry with a fresh port: the pre-allocated port can be
-        # stolen between the probe and the bind. A port stolen *between
-        # restarts* still fails fast — the stable-target requirement forbids
-        # re-porting mid-session.
-        for attempt in range(3):
-            try:
-                self._spawn()
-                return
-            except RuntimeError:
-                if attempt == 2:
-                    raise
-                self.tls_port = _probe_free_port()
+        self._spawn()
 
     @property
     def tls_target(self) -> str:
         """TLS connect string for the always-on TLS listener."""
-        return f"tls://127.0.0.1:{self.tls_port}?insecure"
+        return f"tls://127.0.0.1:{self.tls_port}?ca={self.tls_ca_path}"
 
     @property
     def target(self) -> str:
@@ -178,14 +168,15 @@ class _Server:
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._stderr_f,
                                      env=env, preexec_fn=server_preexec)
         # Readiness = socket file + TLS endpoint published (the endpoint file
-        # is rename-published after the TCP bind, just before "GnitzDB ready").
+        # is rename-published after the TCP bind and the dev cert's write, just
+        # before "GnitzDB ready").
         tls_endpoint = os.path.join(data_dir, "tls_endpoint")
         for _ in range(10_000):
             if os.path.exists(self.sock_path) and os.path.exists(tls_endpoint):
                 break
-            # Fail fast on a dead process (e.g. the pre-allocated port was
-            # stolen) instead of blind-waiting the full 10 s and cascading a
-            # generic error through the session.
+            # Fail fast on a dead process (e.g. a restart's port was taken)
+            # instead of blind-waiting the full 10 s and cascading a generic
+            # error through the session.
             if self.proc.poll() is not None:
                 self._stderr_f.close()
                 self._stderr_f = None
@@ -201,14 +192,11 @@ class _Server:
             self._stderr_f.close()
             self._stderr_f = None
             raise RuntimeError("Server did not start within 10 s")
-
-
-def _probe_free_port() -> int:
-    """Bind 127.0.0.1:0, read the assigned port back, close."""
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        with open(tls_endpoint) as f:
+            self.tls_port = int(f.read().strip().rsplit(":", 1)[1])
+        tmp_ca = self.tls_ca_path + ".tmp"
+        shutil.copyfile(os.path.join(data_dir, "tls_dev_cert.pem"), tmp_ca)
+        os.replace(tmp_ca, self.tls_ca_path)
 
 
 def _log_tail(max_bytes: int = 8192) -> str:

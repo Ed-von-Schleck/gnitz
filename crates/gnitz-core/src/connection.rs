@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::os::fd::{OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error::ClientError;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
@@ -496,16 +497,17 @@ pub struct Session {
 pub type ParkHook = Box<dyn FnMut() -> Result<(), ClientError> + Send + Sync>;
 
 impl Session {
-    /// `target` is an AF_UNIX socket path or a `tls://HOST:PORT[?PARAM]`
-    /// address (see `ClientTransport::connect`). Returns the session paired with
+    /// `target` is an AF_UNIX socket path or a `tls://` target (see
+    /// `ClientTransport::connect`). Returns the session paired with
     /// the server durability watermark from the HELLO ACK, which
     /// `GnitzClient::connect` adopts as the seed for its OCC basis.
     pub fn connect(target: &str) -> Result<(Self, u64), ClientError> {
-        let mut transport = ClientTransport::connect(target)?;
+        let until = Some(Instant::now() + CONNECT_TIMEOUT);
+        let mut transport = ClientTransport::connect(target, until)?;
         // Run the HELLO handshake before any data flows. The server
         // accepts the first frame at an 8-byte limit, so this must
         // happen before a control block would be emitted.
-        let published_lsn = hello_handshake(&mut transport, Some(CONNECT_TIMEOUT))?;
+        let published_lsn = hello_handshake(&mut transport, until)?;
         Ok((Self::over(transport), published_lsn))
     }
 

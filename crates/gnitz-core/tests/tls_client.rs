@@ -3,8 +3,8 @@
 //! End-to-end TLS transport tests against a real `gnitz-server` with a
 //! `--tls-listen` listener (self-signed dev cert, ephemeral port).
 //!
-//! Covers the full committed surface: verification modes (`?insecure`,
-//! `?ca=`, default webpki roots, wrong CA, ALPN mismatch), data integrity
+//! Covers the full committed surface: verification modes (`?ca=`, default
+//! webpki roots, wrong CA, ALPN mismatch), data integrity
 //! and weights over TLS, big frames in both directions, UNIX+TLS
 //! coexistence, HELLO version rejection, restart fail-fast, pipelining
 //! liveness (the four-party deadlock shape), and the per-send eviction
@@ -15,7 +15,8 @@ use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use gnitz_core::protocol::{
-    encode_message_parts, hello_handshake, parse_response, ClientTransport, FLAG_CONTINUATION, STATUS_ERROR,
+    encode_message_parts, hello_handshake, parse_response, set_sockopt_int, ClientTransport, FLAG_CONTINUATION,
+    STATUS_ERROR,
 };
 
 /// One control-only frame, blocking until it is on the wire.
@@ -92,17 +93,8 @@ fn make_batch(schema: &Schema, start: u64, count: usize) -> ZSetBatch {
 /// exponential RTO backoff (cwnd=1, ~26 s retransmits) — which reads as a
 /// deadlock but is a test artifact.
 fn set_small_bufs(fd: RawFd) {
-    let bufsz: libc::c_int = 128 * 1024;
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                opt,
-                &bufsz as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+        set_sockopt_int(fd, opt, 128 * 1024);
     }
 }
 
@@ -138,10 +130,10 @@ fn with_watchdog(secs: u64, f: impl FnOnce() + Send + 'static) {
     handle.join().unwrap();
 }
 
-// ── 1. insecure connect + HELLO + alloc roundtrip ─────────────────────────
+// ── 1. connect + HELLO + alloc roundtrip ───────────────────────────────────
 
 #[test]
-fn insecure_connect_hello_and_alloc_roundtrip() {
+fn connect_hello_and_alloc_roundtrip() {
     let srv = ServerHandle::start_tls(4);
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("tls connect");
     let id1 = client.alloc_table_id().unwrap();
@@ -156,26 +148,23 @@ fn ca_pin_connects_and_bad_verifications_fail() {
     let srv = ServerHandle::start_tls(1);
 
     // ?ca=dev cert: full verification against the minted self-signed cert.
-    let mut pinned = GnitzClient::connect(&srv.tls_ca_target()).expect("ca-pinned connect");
+    let mut pinned = GnitzClient::connect(&srv.tls_target()).expect("ca-pinned connect");
     pinned.alloc_table_id().unwrap();
 
     // Default webpki roots must REJECT the self-signed dev cert.
-    let bare = srv.tls_target().replace("?insecure", "");
-    let err = ClientTransport::connect(&bare).err().expect("webpki roots must reject");
+    let err = GnitzClient::connect(&format!("tls://{}", srv.tls_endpoint()))
+        .err()
+        .expect("webpki roots must reject");
     assert!(
-        err.to_string().to_lowercase().contains("handshake"),
-        "expected a handshake/certificate error, got: {err}"
+        err.to_string().to_lowercase().contains("certificate"),
+        "expected a certificate error, got: {err}"
     );
 
     // Wrong CA: a *different* server's dev cert must not verify this one.
     let other = ServerHandle::start_tls(1);
-    let endpoint = srv.tls_ca_target();
-    let (host_port, _) = endpoint.split_once('?').unwrap();
-    let other_ca = other.tls_ca_target();
-    let (_, other_param) = other_ca.split_once('?').unwrap();
-    let wrong_ca = format!("{host_port}?{other_param}");
+    let wrong_ca = format!("tls://{}?ca={}", srv.tls_endpoint(), other.tls_ca_path().display());
     assert!(
-        ClientTransport::connect(&wrong_ca).is_err(),
+        GnitzClient::connect(&wrong_ca).is_err(),
         "a foreign CA must fail verification"
     );
 
@@ -183,20 +172,14 @@ fn ca_pin_connects_and_bad_verifications_fail() {
     // the handshake (the server pins a non-empty ALPN list). The client
     // verifies for real against the dev cert — no skip-verifier — so the
     // ALPN mismatch is the only possible failure cause.
-    let addr = {
-        let t = srv.tls_target();
-        t.strip_prefix("tls://").unwrap().split_once('?').unwrap().0.to_string()
-    };
+    let addr = srv.tls_endpoint();
     let mut roots = rustls::RootCertStore::empty();
     let certs = {
         use rustls::pki_types::pem::PemObject;
         rustls::pki_types::CertificateDer::pem_file_iter(srv.tls_ca_path()).unwrap()
     };
     roots.add_parsable_certificates(certs.filter_map(Result::ok));
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
+    let mut cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -280,7 +263,7 @@ fn unix_and_tls_clients_share_a_table() {
 #[test]
 fn wire_version_mismatch_hello_gets_status_error() {
     let srv = ServerHandle::start_tls(1);
-    let mut t = ClientTransport::connect(&srv.tls_target()).unwrap();
+    let mut t = ClientTransport::connect(&srv.tls_target(), None).unwrap();
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
     t.send_framed(&payload, None).unwrap();
     let buf = t.recv_framed(None).unwrap();
@@ -332,7 +315,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         // Raw pipelining connection with both socket buffers pinned small
         // (default autotuned buffers can absorb the whole exchange and
         // false-green the test).
-        let mut t = ClientTransport::connect(&target).unwrap();
+        let mut t = ClientTransport::connect(&target, None).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t, None).unwrap();
 
@@ -384,12 +367,9 @@ fn ipv6_loopback_connect_and_ca_verify() {
     let srv = ServerHandle::start_tls_v6(1);
     let target = srv.tls_target();
     assert!(target.starts_with("tls://[::1]:"), "v6 endpoint expected, got {target}");
-    let mut client = GnitzClient::connect(&target).expect("tls over [::1]");
-    client.alloc_table_id().unwrap();
-
     // Full verification against the dev cert's ::1 IP SAN.
-    let mut pinned = GnitzClient::connect(&srv.tls_ca_target()).expect("ca-pinned over [::1]");
-    pinned.alloc_table_id().unwrap();
+    let mut client = GnitzClient::connect(&target).expect("ca-pinned tls over [::1]");
+    client.alloc_table_id().unwrap();
 }
 
 // ── 10. teardown under write backpressure (recv-side / inbound-cap path) ──
@@ -411,7 +391,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
                 .unwrap();
         }
 
-        let mut t = ClientTransport::connect(&target).unwrap();
+        let mut t = ClientTransport::connect(&target, None).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t, None).unwrap();
         // Ask for the scan, then never read: the train stalls, pinning
@@ -467,7 +447,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
                 .unwrap();
         }
 
-        let mut t = ClientTransport::connect(&target).unwrap();
+        let mut t = ClientTransport::connect(&target, None).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t, None).unwrap();
         send_control(&mut t, tid, 0xB0BA, 0).unwrap();
@@ -501,13 +481,11 @@ fn mtls_roundtrip_push_and_scan() {
 #[test]
 fn mtls_server_rejects_client_without_cert() {
     let srv = ServerHandle::start_mtls(1);
-    // `tls_ca_target()` verifies the server but presents NO client cert. The
-    // rejection may surface at the TLS handshake or at the first framed
-    // exchange (a TLS 1.3 client finishes 0.5-RTT before the server validates
-    // its cert), so drive a full connect (handshake + HELLO) and require it
-    // to fail.
+    // `tls_target()` verifies the server but presents NO client cert. The
+    // handshake completes inside the HELLO exchange, so a full connect
+    // (handshake + HELLO) must fail.
     assert!(
-        GnitzClient::connect(&srv.tls_ca_target()).is_err(),
+        GnitzClient::connect(&srv.tls_target()).is_err(),
         "an mTLS-required server must reject a client presenting no certificate"
     );
 }
@@ -519,13 +497,12 @@ fn mtls_server_rejects_untrusted_client_cert() {
     let srv = ServerHandle::start_mtls(1);
     let other = ServerHandle::start_mtls(1);
     // Present `other`'s leaf (signed by other's CA) against `srv`, which trusts
-    // only its OWN client CA. Reuse the existing wrong-CA target-splicing
-    // pattern: srv's endpoint + srv's dev cert (?ca=) + other's leaf.
+    // only its OWN client CA: srv's endpoint + srv's dev cert + other's leaf.
     let (foreign_cert, foreign_key) = other.mtls_client_cert_key();
-    let srv_ca_target = srv.tls_ca_target(); // tls://IP:PORT?ca=<srv dev cert>
-    let (host_port, srv_ca_param) = srv_ca_target.split_once('?').unwrap();
     let target = format!(
-        "{host_port}?{srv_ca_param}&cert={}&key={}",
+        "tls://{}?ca={}&cert={}&key={}",
+        srv.tls_endpoint(),
+        srv.tls_ca_path().display(),
         foreign_cert.display(),
         foreign_key.display()
     );
@@ -573,10 +550,10 @@ fn global_connection_cap_closes_excess() {
     let _c1 = GnitzClient::connect(&target).expect("1st connection under the cap");
     let c2 = GnitzClient::connect(&target).expect("2nd connection under the cap");
 
-    // The 3rd is closed immediately (fd closed before any TLS work), so its
-    // handshake cannot complete.
+    // The 3rd is closed immediately (fd closed before any TLS work): its TCP
+    // connect succeeds, and the handshake inside HELLO cannot complete.
     assert!(
-        ClientTransport::connect(&target).is_err(),
+        GnitzClient::connect(&target).is_err(),
         "a connection accepted past the cap must be closed"
     );
 
@@ -603,17 +580,11 @@ fn first_frame_deadline_reaps_silent_connections() {
     use std::net::TcpStream;
 
     let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_TLS_HELLO_TIMEOUT_MS", "500")]);
-    // Raw loopback IP:PORT (strip the `tls://` scheme and `?insecure`).
-    let addr = {
-        let t = srv.tls_target();
-        t.strip_prefix("tls://").unwrap().split_once('?').unwrap().0.to_string()
-    };
-
     // A raw TCP connection that sends NO bytes never starts the TLS handshake,
     // so its first frame never deframes. The 500 ms deadline must close it —
     // well before our 3 s read timeout (which, absent the deadline, is the
     // only thing that would ever return).
-    let mut sock = TcpStream::connect(&addr).expect("tcp connect");
+    let mut sock = TcpStream::connect(srv.tls_endpoint()).expect("tcp connect");
     sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     let t0 = Instant::now();
     let mut buf = [0u8; 1];
@@ -637,23 +608,4 @@ fn first_frame_deadline_reaps_silent_connections() {
     // A normal client (HELLO well within 500 ms) is unaffected.
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("a normal client must connect");
     client.alloc_table_id().unwrap();
-}
-
-// ── 18. client `?insecure` fail-closed against a non-loopback host ─────────
-
-#[test]
-fn insecure_non_loopback_is_fail_closed() {
-    // Pure client-side: the refusal fires before any socket work, so no server
-    // is needed. Skip if the override happens to be set in this process env.
-    if std::env::var("GNITZ_TLS_INSECURE").as_deref() == Ok("1") {
-        return;
-    }
-    let err = ClientTransport::connect("tls://example.com:9?insecure")
-        .err()
-        .expect("non-loopback ?insecure must be refused without GNITZ_TLS_INSECURE=1");
-    assert!(
-        err.to_string().to_lowercase().contains("non-loopback"),
-        "expected a fail-closed refusal before any connect, got: {err}"
-    );
-    // Loopback `?insecure` stays allowed — covered by every tls_target() test.
 }

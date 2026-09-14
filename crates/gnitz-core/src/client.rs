@@ -389,10 +389,10 @@ const _: fn() = || {
 };
 
 impl GnitzClient {
-    pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
+    pub fn connect(target: &str) -> Result<Self, ClientError> {
         // Seed the OCC basis from the HELLO ACK watermark. A restart yields a
         // fresh GnitzClient re-seeded from the new ACK, so a basis never spans it.
-        let (session, last_seen_lsn) = Session::connect(socket_path)?;
+        let (session, last_seen_lsn) = Session::connect(target)?;
         Ok(GnitzClient {
             session,
             serial_cache: HashMap::new(),

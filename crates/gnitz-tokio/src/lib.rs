@@ -81,22 +81,19 @@ fn lock(slot: &Mutex<Option<GnitzClient>>) -> MutexGuard<'_, Option<GnitzClient>
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ClientError> {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| ClientError::ServerError(format!("mirror task failed: {e}")))
+        .map_err(|e| ClientError::ServerError(format!("blocking task failed: {e}")))
 }
 
 /// Connect to `target` and hand back the handle paired with the driver that
 /// serves it. Nothing reaches the connection until the [`Connection`] is
 /// polled.
 ///
-/// The TCP connect and TLS handshake block — a dual-stack `tls://` host can
-/// spend tens of seconds in them — so they run on `spawn_blocking`.
+/// The TCP connect, TLS handshake and HELLO block under one connect deadline,
+/// after name resolution, so they run on `spawn_blocking`.
 pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientError> {
     let target: Arc<str> = Arc::from(target);
     let connect_to = Arc::clone(&target);
-    let session = tokio::task::spawn_blocking(move || Session::connect(&connect_to))
-        .await
-        .map_err(|e| ClientError::ServerError(format!("connect task failed: {e}")))?
-        .map(|(session, _published_lsn)| session)?;
+    let (session, _published_lsn) = blocking(move || Session::connect(&connect_to)).await??;
     // A `dup`, so the reactor deregisters a descriptor whose life it owns
     // rather than a number the session may already have closed and the kernel
     // handed out again.

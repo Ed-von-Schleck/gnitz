@@ -475,8 +475,9 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
 }
 
 /// Pre-auth first-frame deadline (`GNITZ_TLS_HELLO_TIMEOUT_MS`, default
-/// 15 000 ms). Comfortably exceeds the client's ~10 s post-connect
-/// handshake+HELLO budget, so legitimate slow-link clients are not reaped.
+/// 15 000 ms). Exceeds the client's single connect deadline (`CONNECT_TIMEOUT`,
+/// covering TCP connect, handshake and HELLO), so a client is reaped only once
+/// it has given up itself.
 fn tls_hello_timeout() -> std::time::Duration {
     static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *T.get_or_init(|| {

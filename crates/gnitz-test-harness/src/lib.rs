@@ -192,7 +192,7 @@ impl ServerHandle {
     /// `<data_dir>/tls_endpoint` (rename makes existence imply complete
     /// content). Polls with the same backoff as the socket wait — the file
     /// is written between the AF_UNIX `listen()` and "GnitzDB ready".
-    fn tls_endpoint(&self) -> String {
+    pub fn tls_endpoint(&self) -> String {
         assert!(self.tls, "tls_endpoint requires a start_tls server");
         let path = self.paths.data_dir.join("tls_endpoint");
         let endpoint = poll_with_backoff(|| {
@@ -206,20 +206,15 @@ impl ServerHandle {
         endpoint.unwrap_or_else(|| panic!("server did not publish {} within {STARTUP_TIMEOUT:?}", path.display()))
     }
 
-    /// `tls://127.0.0.1:PORT?insecure` for the bound listener.
+    /// `tls://IP:PORT?ca=<data_dir>/tls_dev_cert.pem` for the bound listener —
+    /// verifies the server's minted dev certificate.
     pub fn tls_target(&self) -> String {
-        format!("tls://{}?insecure", self.tls_endpoint())
+        format!("tls://{}?ca={}", self.tls_endpoint(), self.tls_ca_path().display())
     }
 
     /// Path of the server's minted dev certificate (public PEM).
     pub fn tls_ca_path(&self) -> PathBuf {
         self.paths.data_dir.join("tls_dev_cert.pem")
-    }
-
-    /// `tls://IP:PORT?ca=<data_dir>/tls_dev_cert.pem` — verifies the
-    /// server's minted dev certificate.
-    pub fn tls_ca_target(&self) -> String {
-        format!("tls://{}?ca={}", self.tls_endpoint(), self.tls_ca_path().display())
     }
 
     /// The minted client leaf `(cert_pem, key_pem)` paths for a
@@ -231,21 +226,14 @@ impl ServerHandle {
             .expect("mtls_client_cert_key requires a start_mtls server")
     }
 
-    /// `tls://IP:PORT?cert=<leaf>&key=<leafkey>&ca=<server dev cert>` — the
-    /// full mTLS target: presents the CA-signed client leaf and verifies the
-    /// server's minted dev certificate. Requires a [`Self::start_mtls`] server.
+    /// [`Self::tls_target`] presenting the CA-signed client leaf. Requires a
+    /// [`Self::start_mtls`] server.
     pub fn mtls_target(&self) -> String {
         let (cert, key) = self
             .mtls_client
             .as_ref()
             .expect("mtls_target requires a start_mtls server");
-        format!(
-            "tls://{}?cert={}&key={}&ca={}",
-            self.tls_endpoint(),
-            cert.display(),
-            key.display(),
-            self.tls_ca_path().display(),
-        )
+        format!("{}&cert={}&key={}", self.tls_target(), cert.display(), key.display())
     }
 
     /// Kill the server and respawn it on the same data dir and socket path.

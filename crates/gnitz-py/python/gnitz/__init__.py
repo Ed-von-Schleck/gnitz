@@ -10,5 +10,5 @@ from gnitz._native import (
 from gnitz._types import TypeCode
 
 
-def connect(socket_path):
-    return GnitzClient(socket_path)
+def connect(target):
+    return GnitzClient(target)

@@ -23,9 +23,7 @@ use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
 use std::mem::MaybeUninit;
 use std::ops::Range;
-use std::os::fd::AsRawFd;
-#[cfg(test)]
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -35,15 +33,14 @@ use super::message::MessageParts;
 
 mod tls;
 
-/// One bound over everything a connect does: the TCP connect, the TLS
-/// handshake, and the HELLO exchange after it.
+/// The one deadline over a connect: the TCP connect, then the TLS handshake and HELLO
+/// exchange, which run as one. Name resolution runs before it, unbounded.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One connected client transport. All framed I/O goes through these
 /// methods; the wire bytes are identical across transports ("ZSets over the
-/// wire" rides verbatim inside the TLS stream). The inner enum is private:
-/// construction goes through `connect`, so a `ClientTransport` is always a
-/// fully-handshaken connection, and rustls types stay out of the public API.
+/// wire" rides verbatim inside the TLS stream). On TLS the handshake completes
+/// inside the first exchange (HELLO), where certificate failures surface.
 pub struct ClientTransport {
     inner: Inner,
     reader: FrameReader,
@@ -83,7 +80,7 @@ impl Inner {
     /// the main thread during I/O.
     fn read_into(&mut self, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, ProtocolError> {
         match self {
-            Inner::Unix(s) => unix_read_into(s.as_raw_fd(), buf),
+            Inner::Unix(s) => recv_into(s.as_raw_fd(), buf),
             Inner::Tls(t) => t.read_into(buf),
         }
     }
@@ -93,20 +90,7 @@ impl Inner {
     /// itself, so a caller may pass any number of slices and gets a prefix.
     fn write_slices(&mut self, slices: &[IoSlice<'_>]) -> Result<WriteOutcome, ProtocolError> {
         match self {
-            Inner::Unix(s) => loop {
-                match (&*s).write_vectored(slices) {
-                    Ok(0) => {
-                        return Err(ProtocolError::IoError(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "writev returned 0",
-                        )))
-                    }
-                    Ok(n) => return Ok(WriteOutcome::Written(n)),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(WriteOutcome::WouldBlock),
-                    Err(e) => return Err(ProtocolError::IoError(e)),
-                }
-            },
+            Inner::Unix(s) => write_nonblocking(|| (&*s).write_vectored(slices)),
             Inner::Tls(t) => t.write_slices(slices),
         }
     }
@@ -124,21 +108,34 @@ impl Inner {
     fn ship_ciphertext(&mut self) -> Result<(), ProtocolError> {
         match self {
             Inner::Unix(_) => Ok(()),
-            Inner::Tls(t) => t.ship_nonblocking().map(|_| ()),
+            Inner::Tls(t) => t.ship(),
         }
     }
 
-    fn as_raw_fd(&self) -> RawFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         match self {
-            Inner::Unix(s) => s.as_raw_fd(),
-            Inner::Tls(t) => t.as_raw_fd(),
+            Inner::Unix(s) => s.as_fd(),
+            Inner::Tls(t) => t.as_fd(),
+        }
+    }
+}
+
+/// One non-blocking socket write: `EINTR` retried, `EAGAIN` reported, a zero-byte write refused.
+fn write_nonblocking(mut write: impl FnMut() -> std::io::Result<usize>) -> Result<WriteOutcome, ProtocolError> {
+    loop {
+        match write() {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Ok(n) => return Ok(WriteOutcome::Written(n)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(WriteOutcome::WouldBlock),
+            Err(e) => return Err(e.into()),
         }
     }
 }
 
 /// `setsockopt(SOL_SOCKET, opt)` with a `c_int` value; a refused option is
 /// not an error worth surfacing anywhere this is called.
-pub(crate) fn set_sockopt_int(fd: RawFd, opt: libc::c_int, val: libc::c_int) {
+pub fn set_sockopt_int(fd: RawFd, opt: libc::c_int, val: libc::c_int) {
     // SAFETY: setsockopt on a valid fd with a properly-sized option value.
     unsafe {
         libc::setsockopt(
@@ -151,17 +148,9 @@ pub(crate) fn set_sockopt_int(fd: RawFd, opt: libc::c_int, val: libc::c_int) {
     }
 }
 
-fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
-    // SAFETY: fcntl on a valid fd.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// One `recv` into possibly-uninitialised storage. The Unix read core.
-fn unix_read_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, ProtocolError> {
+/// One `recv` into possibly-uninitialised storage: the Unix read core, and the
+/// TLS arm's ciphertext read.
+fn recv_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, ProtocolError> {
     loop {
         // SAFETY: pointer/len come from a valid &mut [MaybeUninit<u8>].
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
@@ -181,6 +170,11 @@ fn unix_read_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome,
     }
 }
 
+/// A deadline's expiry, as a deadlined blocking call reports it: `WouldBlock`.
+fn timed_out() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, "socket operation timed out")
+}
+
 /// `poll(2)` on one fd for `events` until `until`; `None` waits untimed.
 /// Expiry surfaces as `WouldBlock`, as a deadlined blocking call would.
 pub(crate) fn poll_fd(
@@ -189,7 +183,6 @@ pub(crate) fn poll_fd(
     until: Option<Instant>,
     retry_eintr: bool,
 ) -> std::io::Result<libc::c_short> {
-    let timed_out = || std::io::Error::new(std::io::ErrorKind::WouldBlock, "socket operation timed out");
     loop {
         let timeout_ms: libc::c_int = match until {
             None => -1,
@@ -221,36 +214,32 @@ pub(crate) fn poll_fd(
 }
 
 impl ClientTransport {
-    fn new(inner: Inner) -> Result<Self, ProtocolError> {
-        set_nonblocking(inner.as_raw_fd()).map_err(ProtocolError::IoError)?;
-        Ok(ClientTransport {
+    fn new(inner: Inner) -> Self {
+        ClientTransport {
             inner,
             reader: FrameReader::new(gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE),
             queue: OutQueue::default(),
             egress_limit: gnitz_wire::MAX_FRAME_PAYLOAD_SERVER,
-        })
+        }
     }
 
     /// A `dup` of the underlying stream socket — the AF_UNIX socket, or the
     /// `TcpStream` under TLS. The copy shares the open file description, so it
     /// reports the same readiness, and closing it leaves this transport open.
-    pub fn try_clone_fd(&self) -> Result<std::os::fd::OwnedFd, ProtocolError> {
-        // SAFETY: the transport owns this fd for the whole of the borrow.
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
-            .try_clone_to_owned()
-            .map_err(ProtocolError::IoError)
+    pub fn try_clone_fd(&self) -> Result<OwnedFd, ProtocolError> {
+        Ok(self.inner.as_fd().try_clone_to_owned()?)
     }
 
-    /// Connect to `target`: a literal `tls://HOST:PORT[?insecure|?ca=PATH]`
-    /// prefix selects TLS; anything else (including any path containing
-    /// `:`) is an AF_UNIX socket path — the prefix is the sole
-    /// discriminator.
-    pub fn connect(target: &str) -> Result<Self, ProtocolError> {
+    /// Connect to `tls://HOST:PORT[?QUERY]`, or else to an AF_UNIX socket path.
+    /// `QUERY` is `&`-separated, each at most once: `ca=PATH` (PEM roots, default
+    /// webpki), `cert=PATH` and `key=PATH` (mTLS). `until` bounds a TCP connect.
+    pub fn connect(target: &str, until: Option<Instant>) -> Result<Self, ProtocolError> {
         if let Some(rest) = target.strip_prefix("tls://") {
-            return tls::connect_tls(rest);
+            return tls::connect_tls(rest, until);
         }
-        let stream = UnixStream::connect(target).map_err(ProtocolError::IoError)?;
-        ClientTransport::new(Inner::Unix(stream))
+        let stream = UnixStream::connect(target)?;
+        stream.set_nonblocking(true)?;
+        Ok(ClientTransport::new(Inner::Unix(stream)))
     }
 
     /// Wrap an already-connected AF_UNIX stream socket (the transport closes
@@ -258,13 +247,15 @@ impl ClientTransport {
     /// `mark_established`.
     #[cfg(test)]
     pub(crate) fn from_unix_fd(fd: OwnedFd) -> Self {
-        ClientTransport::new(Inner::Unix(UnixStream::from(fd))).expect("O_NONBLOCK on a fresh socket")
+        let stream = UnixStream::from(fd);
+        stream.set_nonblocking(true).expect("O_NONBLOCK on a fresh socket");
+        ClientTransport::new(Inner::Unix(stream))
     }
 
     /// The stream socket every driver polls: the AF_UNIX socket, or the
     /// `TcpStream` under TLS. Never used for framed I/O on the TLS variant.
     pub fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
+        self.inner.as_fd().as_raw_fd()
     }
 
     /// The payload ceiling `recv_framed` enforces: the pre-handshake bound
@@ -376,7 +367,14 @@ impl ClientTransport {
             match self.next_frame(true)? {
                 Next::Frame(f) => return Ok(f),
                 Next::Pending => {
-                    self.park(libc::POLLIN, until)?;
+                    // A read can queue ciphertext nothing else will send: during the handshake,
+                    // the client's Finished flight and the plaintext buffered behind it.
+                    let events = if self.flush()? {
+                        libc::POLLIN | libc::POLLOUT
+                    } else {
+                        libc::POLLIN
+                    };
+                    self.park(events, until)?;
                     self.begin_read();
                 }
             }
@@ -687,9 +685,9 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
 
 /// Send HELLO, parse the ACK, and mark the transport established under its
 /// payload limit. Returns the server's `published_lsn`, which seeds the client's
-/// OCC basis. `timeout` bounds the exchange as a whole, not each leg.
-pub fn hello_handshake(t: &mut ClientTransport, timeout: Option<Duration>) -> Result<u64, ProtocolError> {
-    let until = timeout.map(|d| Instant::now() + d);
+/// OCC basis. `until` bounds the exchange as a whole — on TLS the handshake
+/// included — not each leg.
+pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<u64, ProtocolError> {
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16);
     t.send_parts(MessageParts::single(payload.to_vec()), until)?;
 

@@ -105,9 +105,9 @@ impl PyGnitzClient {
 #[pymethods]
 impl PyGnitzClient {
     #[new]
-    pub fn new(py: Python<'_>, socket_path: &str) -> PyResult<Self> {
+    pub fn new(py: Python<'_>, target: &str) -> PyResult<Self> {
         Ok(PyGnitzClient {
-            inner: Mutex::new(Some(connect_client(py, socket_path)?)),
+            inner: Mutex::new(Some(connect_client(py, target)?)),
         })
     }
 
