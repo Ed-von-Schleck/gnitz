@@ -400,67 +400,6 @@ fn a_retired_slot_unparks_the_writer() {
 
 // -- park / wake ---------------------------------------------------------
 
-/// `wait_any(0b1111)` arms every ring, so a publish on ring 3 wakes it well
-/// before the ceiling. A narrower mask would not — which is why every caller
-/// passes its whole pending set.
-#[test]
-fn wait_any_is_woken_by_a_publish_on_another_ring() {
-    unsafe {
-        let rings: Vec<SharedRegion> = (0..4).map(|_| make_ring(64, 4, 8)).collect();
-        let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
-        let pub_ptr = rings[3].ptr() as usize;
-        let handle = std::thread::spawn(move || {
-            // `wait_any` sets FLAG_MASTER_SYNC on every ring in the mask before
-            // it parks, so this publishes into a parked master rather than
-            // racing one and degrading to the fast return.
-            let hdr = W2mRingHeader::from_raw(pub_ptr as *mut u8);
-            while hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC == 0 {
-                std::hint::spin_loop();
-            }
-            publish(pub_ptr as *mut u8, 64, 0, |s| s[0] = 7).expect("ring 3 has room");
-        });
-        let start = std::time::Instant::now();
-        receiver.wait_any(0b1111, 5000); // any ring's wake reaches it
-        let elapsed = start.elapsed().as_millis();
-        handle.join().unwrap();
-        assert!(
-            elapsed < 2000,
-            "wait_any must be woken by ring 3's publish, slept {elapsed}ms"
-        );
-        assert!(receiver.try_read_slot(3).is_some(), "ring 3 really did publish");
-    }
-}
-
-/// NEGATIVE: with no publisher, `wait_any` sleeps to the deadline.
-#[test]
-fn wait_any_times_out_with_no_publisher() {
-    unsafe {
-        let region = make_ring(64, 4, 8);
-        let receiver = W2mReceiver::new(vec![region.ptr()]);
-        let start = std::time::Instant::now();
-        let rc = receiver.wait_any(1, 20);
-        let elapsed = start.elapsed().as_millis();
-        assert_eq!(rc, Parked::TimedOut, "no publisher → the park must time out");
-        assert!(elapsed >= 15, "wait_any must sleep to its deadline, slept {elapsed}ms");
-    }
-}
-
-/// `wait_any` must leave no park flag behind: a stale bit would make every
-/// later publish spend a `FUTEX_WAKE` on a word nobody is parked on.
-#[test]
-fn wait_any_clears_its_park_flag() {
-    unsafe {
-        let region = make_ring(64, 4, 8);
-        let receiver = W2mReceiver::new(vec![region.ptr()]);
-        receiver.wait_any(1, 1);
-        assert_eq!(
-            receiver.header(0).master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC,
-            0,
-            "wait_any must clear its own park flag on return",
-        );
-    }
-}
-
 /// A publish takes the master gate, so the next publish in the same window
 /// finds it clear and spends no syscall.
 #[test]
@@ -478,9 +417,9 @@ fn publish_takes_the_master_gate() {
 
         publish(ptr, 64, 0, |s| s[0] = 1).expect("an empty ring has room");
         assert_eq!(
-            hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_ANY,
+            hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_WAITV,
             0,
-            "a publish must clear both master park bits",
+            "a publish must clear the master park bit",
         );
     }
 }
@@ -520,7 +459,7 @@ fn w2m_publish_drain_bench() {
         let t = Instant::now();
         let mut woke_master = 0u64;
         for req in 1..=N {
-            if hdr.master_park.flags.load(Ordering::Relaxed) & FLAG_MASTER_ANY != 0 {
+            if hdr.master_park.flags.load(Ordering::Relaxed) & FLAG_MASTER_WAITV != 0 {
                 woke_master += 1;
             }
             writer.send_status(0, req, gnitz_wire::STATUS_OK, &[]);
@@ -543,7 +482,11 @@ fn w2m_publish_drain_bench() {
             }
             None => {
                 parks += 1;
-                receiver.wait_any(1, 100);
+                let mut waitv = [FutexWaitV::new(); 1];
+                if let Some(armed) = receiver.arm_waitv(&mut waitv) {
+                    let _ = futex_waitv_u32(armed, 100);
+                }
+                receiver.clear_waitv();
             }
         }
     }

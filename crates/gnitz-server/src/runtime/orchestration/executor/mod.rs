@@ -3,9 +3,9 @@
 //! catalog-zone write path is the child `ddl`.
 //!
 //! The master owns one `Reactor` driving the accept socket, a task per
-//! connection, the committer (group commit + checkpoint + fsync), the tick task,
-//! the relay task and the worker-crash watchdog. The reactor queues exchange
-//! frames for the relay task, which accumulates them into completed rounds.
+//! connection, the committer (group commit + checkpoint + fsync), the tick task
+//! and the worker-crash watchdog. A tick relays its own exchange rounds while it
+//! awaits its ACKs.
 //!
 //! A handler that splits into `handle_x` + `x_body` does so for one reason: every
 //! rejection inside the body is a plain `Err`, so the handler above owns the
@@ -31,8 +31,9 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, read_fanout, worker_error, Fanout, MasterDispatcher,
-    SeekReply, WorkerFault,
+    dispatch_scan_multi_fanout,
+    exchange::{ExchangeAccumulator, PendingRelay},
+    read_fanout, Fanout, MasterDispatcher, SeekReply, WorkerFault, WORKER_WATCH,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, Reactor, ReadGuard, WriteGuard};
@@ -45,13 +46,16 @@ use gnitz_wire::txn_frame::validate_item_ids;
 use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
-const WORKER_WATCH_MS: u64 = 100;
 
 /// `GNITZ_INJECT_RELAY_SPACE_LOW`: report one exchange relay's SAL space as low,
 /// so tests drive the reclamation protocol (worker re-epoch, master
 /// `checkpoint_reset`, epoch advancing) over a small table that would never
 /// approach the 1 GiB mmap.
 static RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_RELAY_SPACE_LOW");
+
+/// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next tick emit, once, as a full SAL
+/// would.
+static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
 /// `GNITZ_INJECT_PUSH_HOLD_FOR_DDL`: see `hold_push_for_ddl`.
 static PUSH_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_PUSH_HOLD_FOR_DDL");
@@ -112,9 +116,16 @@ enum TickTrigger {
 }
 
 /// Holding one parks the tick loop; dropping it is the release, so no path can
-/// forget to send one — the tick loop's `release.await` resolves `None` either
-/// way.
-pub(super) type TickPark = oneshot::Sender<()>;
+/// forget to send one.
+pub(super) struct TickPark(Option<oneshot::Sender<()>>);
+
+impl Drop for TickPark {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release.send(());
+        }
+    }
+}
 
 /// Ask the tick loop to tick everything pending and report the tick's verdict.
 pub(super) fn request_drain(shared: &Shared) -> oneshot::Receiver<Result<(), WireFault>> {
@@ -124,7 +135,7 @@ pub(super) fn request_drain(shared: &Shared) -> oneshot::Receiver<Result<(), Wir
 }
 
 /// Ask the tick loop to park. The reply carries the token whose drop releases
-/// it; `None` means the tick loop was already gone, so there is nothing parked.
+/// it.
 pub(super) fn request_quiesce(shared: &Shared) -> oneshot::Receiver<TickPark> {
     let (acked, rx) = oneshot::channel();
     shared.tick_tx.send(TickTrigger::Quiesce { acked });
@@ -135,7 +146,7 @@ pub(super) fn request_quiesce(shared: &Shared) -> oneshot::Receiver<TickPark> {
 async fn await_barrier(shared: &Shared, kind: BarrierKind) {
     let (tx, rx) = oneshot::channel::<()>();
     shared.committer_tx.send(CommitRequest::Barrier { kind, done: tx });
-    let _ = rx.await;
+    rx.await;
 }
 
 /// Shared executor state held by every task.
@@ -143,7 +154,7 @@ pub struct Shared {
     pub reactor: Rc<Reactor>,
     dispatcher: Rc<MasterDispatcher>,
     committer_tx: chan::Sender<CommitRequest>,
-    catalog_rwlock: Rc<AsyncRwLock>,
+    catalog_rwlock: AsyncRwLock,
     /// Tick trigger sender. Reached only through `request_drain`,
     /// `request_quiesce` and [`Shared::note_commit_rows`], so every trigger this
     /// process sends is minted in one place.
@@ -161,7 +172,7 @@ pub struct Shared {
     /// state (`push_reads_committed_state`) and every transaction take the write
     /// guard; a push that reads no committed state takes the read guard, so
     /// same-table pushes reach the committer concurrently and share one fsync.
-    table_locks: RefCell<FxHashMap<i64, Rc<AsyncRwLock>>>,
+    table_locks: RefCell<FxHashMap<i64, AsyncRwLock>>,
     /// Set true by the graceful-shutdown watcher before it sends the final
     /// Shutdown barrier. Read only by [`Shared::enqueue_commit`], which is what
     /// makes the test and the send one step.
@@ -214,14 +225,8 @@ impl Shared {
         &self.dispatcher
     }
 
-    fn table_lock(&self, tid: i64) -> Rc<AsyncRwLock> {
-        let mut locks = self.table_locks.borrow_mut();
-        if let Some(l) = locks.get(&tid) {
-            return Rc::clone(l);
-        }
-        let l = Rc::new(AsyncRwLock::default());
-        locks.insert(tid, Rc::clone(&l));
-        l
+    fn table_lock(&self, tid: i64) -> AsyncRwLock {
+        self.table_locks.borrow_mut().entry(tid).or_default().clone()
     }
 
     /// Take the write guard on every table in `tids`, sorting and deduping here
@@ -359,19 +364,7 @@ impl ServerExecutor {
     /// the bound TCP listen fd, the rustls server configuration, and the
     /// global live-connection cap.
     pub fn run(dispatcher: Rc<MasterDispatcher>, server_fd: i32, tls: Option<TlsListener>, lsn_seed: u64) -> i32 {
-        // 256 SQEs. Not a bound on outstanding work: `IoUringRing::push` flushes
-        // a full SQ rather than refusing, so this sets submit batching, not depth.
-        let reactor = match Reactor::new(
-            256,
-            crate::runtime::reactor::Limits::from_env(),
-            dispatcher.w2m_receiver(),
-        ) {
-            Ok(r) => Rc::new(r),
-            Err(e) => {
-                gnitz_error!("io_uring init failed: {e}");
-                return 1;
-            }
-        };
+        let reactor = Rc::clone(dispatcher.reactor());
         reactor.attach_listener(server_fd);
         if let Some(tl) = &tls {
             reactor.attach_listener(tl.fd());
@@ -388,7 +381,7 @@ impl ServerExecutor {
             reactor: Rc::clone(&reactor),
             dispatcher,
             committer_tx,
-            catalog_rwlock: Rc::new(AsyncRwLock::default()),
+            catalog_rwlock: AsyncRwLock::default(),
             tick_tx,
             lsn_alloc: ZoneLsnAllocator::new(initial_lsn),
             last_tick_lsn: Cell::new(initial_lsn),
@@ -408,12 +401,11 @@ impl ServerExecutor {
         reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
         reactor.spawn(accept_loop(Rc::clone(&shared), accept_ctx));
         reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
-        reactor.spawn(relay_loop(Rc::clone(&shared)));
         reactor.spawn(watchdog(Rc::clone(&shared)));
 
         reactor.block_until_shutdown();
-        // `2` separates a dead worker from the `1` above (a failure before or
-        // instead of the event loop) and from `gnitz_fatal_abort!`'s `134`.
+        // `2` separates a dead worker from a failed boot's `1` and from
+        // `gnitz_fatal_abort!`'s `134`.
         if shared.worker_crashed.get() {
             2
         } else {
@@ -624,16 +616,13 @@ fn install_shutdown_signal_handlers() {
 /// timer poll is the established pattern.
 async fn watchdog(shared: Rc<Shared>) {
     loop {
-        shared
-            .reactor
-            .timer(Instant::now() + Duration::from_millis(WORKER_WATCH_MS))
-            .await;
+        shared.reactor.timer(Instant::now() + WORKER_WATCH).await;
 
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             // Let a quiescing DDL finish first. Its tick loop is parked, so the
             // Shutdown barrier would resolve without a checkpoint and
-            // `shutdown_workers()` would then kill the workers under a live
-            // backfill, whose `fail_if_worker_dead` fatal-aborts.
+            // `shutdown_workers()` would then kill the workers under the DDL's
+            // exclusive rounds, whose worker probe fails the DDL fatally.
             if shared.ddl_window.get() != 0 {
                 continue;
             }
@@ -710,13 +699,11 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     // Reused across every tick; `drain_live_tick_rows_into` clears it before
     // refilling so capacity is retained.
     let mut tids_scratch: Vec<i64> = Vec::new();
+    // Rounds complete within the tick that opened them, so this is empty between
+    // ticks; kept to reuse its map.
+    let mut acc = ExchangeAccumulator::new(nw);
     loop {
-        let first = match rx.recv().await {
-            Some(t) => t,
-            // Needs an arm but cannot arrive; see the committer's `rx.recv()`.
-            None => return,
-        };
-        triggers.push(first);
+        triggers.push(rx.recv().await);
 
         // Drain anything already queued.
         while let Some(more) = rx.try_recv() {
@@ -731,8 +718,8 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
             match trigger {
                 TickTrigger::Quiesce { acked } => {
                     let (release_tx, release_rx) = oneshot::channel();
-                    acked.send(release_tx);
-                    let _ = release_rx.await;
+                    acked.send(TickPark(Some(release_tx)));
+                    release_rx.await;
                 }
                 TickTrigger::Drain { done } => dones.push(done),
                 TickTrigger::Auto => {}
@@ -744,7 +731,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
         // Run the tick. Errors are reported in logs AND handed to every Drain
         // trigger's `done`: the waiting reader's view is stale, so reporting
         // success would serve stale rows under STATUS_OK.
-        let tick_result = run_tick(&shared, &tids_scratch, nw).await;
+        let tick_result = run_tick(&shared, &tids_scratch, nw, &mut acc).await;
         if let Err(e) = &tick_result {
             gnitz_warn!("tick error: {}", e);
         }
@@ -754,14 +741,20 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     }
 }
 
-/// Emit Tick groups for every `tid` and await the per-worker ACKs.
+/// Emit Tick groups for every `tid` and await the per-worker ACKs, relaying each
+/// exchange round the tick opens as it completes.
 ///
 /// The emit-and-await lock shape: the ACK lease taken before any lock,
 /// `catalog_rwlock.read()` (so DDL cannot mutate schemas mid-emission) +
 /// `sal_writer_excl` covering only the contiguous emission window, one
 /// `signal_all` inside it, both released before awaiting so other reactor work
 /// proceeds concurrently with worker DAG eval.
-async fn run_tick(shared: &Rc<Shared>, tids: &[i64], nw: usize) -> Result<(), WireFault> {
+async fn run_tick(
+    shared: &Rc<Shared>,
+    tids: &[i64],
+    nw: usize,
+    acc: &mut ExchangeAccumulator,
+) -> Result<(), WireFault> {
     // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
@@ -794,6 +787,10 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], nw: usize) -> Result<(), Wi
         let disp = shared.disp();
         let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
+            if TICK_EMIT_ERROR.take_once() {
+                result = Err(format!("injected tick emit error (tid={tid})").into());
+                break;
+            }
             if let Err(e) = disp.write_tick_group(tid, GroupTargets::All(req_ids.id(i * nw))) {
                 result = Err(e);
                 break;
@@ -820,7 +817,13 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], nw: usize) -> Result<(), Wi
     // only produce a no-op tick that then reports success and masks this failure.
     shared.requeue_tick_tids(&tids[n..]);
 
-    let worker_err = req_ids.acks(0..n * nw, |w, c| worker_error(w, "tick", c)).await;
+    let worker_err = loop {
+        match shared.disp().next_relay(&req_ids, n * nw, "tick", acc).await {
+            Ok(Some(relay)) => relay_steady(shared, relay).await,
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
     if let Some(e) = emit.err().or(worker_err.err()) {
         return Err(e);
     }
@@ -829,13 +832,11 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], nw: usize) -> Result<(), Wi
 }
 
 // ---------------------------------------------------------------------------
-// Relay loop
+// Steady relay
 // ---------------------------------------------------------------------------
 
-/// Accumulate the reactor's exchange frames into rounds and write each
-/// completed round back as an ExchangeRelay group. Its own task because the
-/// write needs `catalog_rwlock.read` and `sal_writer_excl`, neither of which a
-/// CQE handler can block-acquire.
+/// Write one completed steady-state exchange round back as an ExchangeRelay
+/// group. A tick round never pads, so its verdict is `BACKFILL_DECISION_CONTINUE`.
 ///
 /// A lost relay wedges workers blocked in `do_exchange_wait` forever
 /// (they ACK neither tick nor relay and the master stays alive), so both
@@ -843,86 +844,74 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], nw: usize) -> Result<(), Wi
 /// checkpoint — `gnitz_fatal_abort!` rather than warn-and-drop: a loud,
 /// recoverable crash (workers self-exit via `getppid()`, operator
 /// restarts) beats a silent permanent cluster wedge.
-async fn relay_loop(shared: Rc<Shared>) {
-    let mut acc = ExchangeAccumulator::new(shared.disp().num_workers());
+async fn relay_steady(shared: &Shared, relay: PendingRelay) {
+    if RELAY_HOLD_FOR_DDL.take_once() {
+        hold_relay_for_ddl(shared).await;
+    }
+
+    // Phase 1: CPU work + catalog read only — no SAL mutex.
+    let prep = {
+        let _cat = shared.catalog_rwlock.read().await;
+        match guard_panic("prepare_relay", || shared.disp().prepare_relay(relay)) {
+            Ok(p) => p,
+            Err(e) => gnitz_fatal_abort!("prepare_relay failed: {}", e),
+        }
+    };
+
+    // Phase 2: emit under the SAL mutex. The space check shares the
+    // lock with the write, so no other SAL writer can consume the
+    // margin in between. The barrier await MUST happen with the lock
+    // dropped: the committer's checkpoint takes sal_writer_excl, so
+    // holding it across the barrier deadlocks master-side.
+    let mut reclaimed = false;
+    // Spent here, not inside the retry: a genuinely low first iteration must
+    // not leave the latch to fire after the reclaim, where `reclaimed` turns
+    // it into the fatal "exhausted even after a forced checkpoint".
+    let mut inject_low = RELAY_SPACE_LOW.take_once();
     loop {
-        let (w, frame) = shared.reactor.next_exchange().await;
-        let Some(relay) = acc.process(w, frame) else {
-            continue;
-        };
-
-        if RELAY_HOLD_FOR_DDL.take_once() {
-            hold_relay_for_ddl(&shared).await;
-        }
-
-        // Phase 1: CPU work + catalog read only — no SAL mutex.
-        let prep = {
-            let _cat = shared.catalog_rwlock.read().await;
-            match guard_panic("prepare_relay", || shared.disp().prepare_relay(relay)) {
-                Ok(p) => p,
-                Err(e) => gnitz_fatal_abort!("prepare_relay failed: {}", e),
+        {
+            let _sal = shared.disp().sal_excl().lock().await;
+            let mut fit = shared.disp().relay_fit(prep.footprint);
+            if inject_low {
+                inject_low = false;
+                fit = SalFit::Transient;
             }
-        };
-
-        // Phase 2: emit under the SAL mutex. The space check shares the
-        // lock with the write, so no other SAL writer can consume the
-        // margin in between. The barrier await MUST happen with the lock
-        // dropped: the committer's checkpoint takes sal_writer_excl, so
-        // holding it across the barrier deadlocks master-side.
-        let mut reclaimed = false;
-        // Spent here, not inside the retry: a genuinely low first iteration must
-        // not leave the latch to fire after the reclaim, where `reclaimed` turns
-        // it into the fatal "exhausted even after a forced checkpoint".
-        let mut inject_low = RELAY_SPACE_LOW.take_once();
-        loop {
-            {
-                let _sal = shared.disp().sal_excl().lock().await;
-                let mut fit = shared.disp().relay_fit(prep.footprint);
-                if inject_low {
-                    inject_low = false;
-                    fit = SalFit::Transient;
+            match fit {
+                // Written whole. Chunking it as the W2M up-leg is chunked
+                // would not help: a parked worker cannot consume a partial
+                // train, so every chunk would be SAL-resident at once.
+                SalFit::Terminal => {
+                    gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it")
                 }
-                match fit {
-                    // Written whole. Chunking it as the W2M up-leg is chunked
-                    // would not help: a parked worker cannot consume a partial
-                    // train, so every chunk would be SAL-resident at once.
-                    SalFit::Terminal => {
-                        gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it")
-                    }
-                    SalFit::Fits => {
-                        // Always CONTINUE: only steady-state tick exchanges reach
-                        // this loop (both chunked-backfill drivers collect their
-                        // relays synchronously in `collect_acks_and_relay`, the
-                        // sole STOP/CHECKPOINT stamper), and a tick round never pads.
-                        if let Err(e) = guard_panic("emit_relay", || {
-                            shared
-                                .disp()
-                                .emit_relay_with_decision(&prep, BACKFILL_DECISION_CONTINUE)
-                        }) {
-                            gnitz_fatal_abort!(
-                                "emit_relay failed; a lost relay wedges workers \
-                                 blocked in exchange wait: {}",
-                                e
-                            );
-                        }
-                        break;
-                    }
-                    SalFit::Transient if reclaimed => {
+                SalFit::Fits => {
+                    if let Err(e) = guard_panic("emit_relay", || {
+                        shared
+                            .disp()
+                            .emit_relay_with_decision(&prep, BACKFILL_DECISION_CONTINUE)
+                    }) {
                         gnitz_fatal_abort!(
-                            "SAL space exhausted even after forced checkpoint; \
-                             cannot deliver exchange relay — aborting to prevent \
-                             cluster deadlock"
-                        )
+                            "emit_relay failed; a lost relay wedges workers \
+                             blocked in exchange wait: {}",
+                            e
+                        );
                     }
-                    SalFit::Transient => {}
+                    break;
                 }
+                SalFit::Transient if reclaimed => {
+                    gnitz_fatal_abort!(
+                        "SAL space exhausted even after forced checkpoint; \
+                         cannot deliver exchange relay — aborting to prevent \
+                         cluster deadlock"
+                    )
+                }
+                SalFit::Transient => {}
             }
-            gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
-            // `forced`: this relay's own byte count says it does not fit, which
-            // the committer's ambient space test cannot see.
-            await_barrier(&shared, BarrierKind::Reclaim { forced: true }).await;
-            reclaimed = true;
         }
+        gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
+        // `forced`: this relay's own byte count says it does not fit, which
+        // the committer's ambient space test cannot see.
+        await_barrier(shared, BarrierKind::Reclaim { forced: true }).await;
+        reclaimed = true;
     }
 }
 
@@ -1181,7 +1170,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     let family = TxnFamily { tid: target_id, mode, batch };
     if let Err(e) = shared
         .disp()
-        .validate_txn_distributed(&shared.reactor, std::slice::from_ref(&family))
+        .validate_txn_distributed(std::slice::from_ref(&family))
         .await
     {
         send_fault(peer, target_id, client_id, &e);
@@ -1205,7 +1194,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         return;
     }
     match rx.await {
-        Some(Ok(zone_lsn)) => {
+        Ok(zone_lsn) => {
             // Record the commit LSN for OCC while the table-lock guard is still
             // held (a concurrent precondition check reads it under the write guard
             // on the same lock, which excludes this one, so the bump lands before
@@ -1233,8 +1222,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
                 client_version,
             );
         }
-        Some(Err(fault)) => send_fault(peer, target_id, client_id, &fault),
-        None => send_error(peer, target_id, client_id, b"committer shut down"),
+        Err(fault) => send_fault(peer, target_id, client_id, &fault),
     }
 }
 
@@ -1268,7 +1256,7 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
     } else {
         match shared
             .disp()
-            .fan_out_seek(&shared.reactor, target_id, pk, seek_pk_extra, client_version)
+            .fan_out_seek(target_id, pk, seek_pk_extra, client_version)
             .await
         {
             Ok(SeekReply::Frame(slot)) => peer.send_or_close(slot).await,
@@ -1401,10 +1389,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     }
 
     // 4. Distributed bundle validation (the four rules).
-    shared
-        .disp()
-        .validate_txn_distributed(&shared.reactor, &families)
-        .await?;
+    shared.disp().validate_txn_distributed(&families).await?;
 
     // 5. Route through the committer and wait for the zone ACK. `families` is
     //    moved here; `family_tids` was captured above for the bump. The drain
@@ -1412,9 +1397,8 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     //    one step.
     let (tx, rx) = oneshot::channel::<Result<u64, WireFault>>();
     shared.enqueue_commit(CommitRequest::Txn(PendingTxn { families, done: tx }))?;
-    // Double `?`: the outer unwraps a channel cancel, the inner a committer
-    // `Err` — so the bump below is reached ONLY on a successful commit.
-    let lsn = rx.await.ok_or("committer shut down")??;
+    // The bump below is reached ONLY on a successful commit.
+    let lsn = rx.await?;
 
     // 6. Record the commit LSN for every family tid while the table locks are
     //    still held (`_tlocks` in scope), so a later same-tid txn cannot pass its
@@ -1636,7 +1620,7 @@ async fn handle_seek_by_index(
     // seek_pk_extra) to the broadcast-and-merge fan-out.
     match shared
         .disp()
-        .fan_out_seek_by_index_collect(&shared.reactor, target_id, seek_col_idx, seek_pk, seek_pk_extra)
+        .fan_out_seek_by_index_collect(target_id, seek_col_idx, seek_pk, seek_pk_extra)
         .await
     {
         Ok(merged) => {
@@ -1858,10 +1842,7 @@ enum ReadFreshness {
 /// its views are stale, and serving them under `STATUS_OK` is a silent stale read.
 async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadGuard, WireFault> {
     drop(guard);
-    // A cancelled receiver means the tick loop is gone; treat it as done.
-    if let Some(Err(e)) = request_drain(shared).await {
-        return Err(e);
-    }
+    request_drain(shared).await?;
     Ok(shared.catalog_rwlock.read().await)
 }
 
@@ -1958,7 +1939,6 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
     let result = shared
         .disp()
         .fan_out_scan(
-            &shared.reactor,
             unicast,
             target_id,
             client_id,
@@ -2070,16 +2050,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     };
     let result = shared
         .disp()
-        .fan_out_scan(
-            &shared.reactor,
-            unicast,
-            target_id,
-            client_id,
-            peer,
-            msg_kind,
-            0,
-            seek_pk_extra,
-        )
+        .fan_out_scan(unicast, target_id, client_id, peer, msg_kind, 0, seek_pk_extra)
         .await;
     let seek_pk = match (&result, delta_cursor) {
         (Ok((_, round)), Some(_)) => delta_terminal_seek_pk(shared.disp(), target_id, *round),
@@ -2150,7 +2121,7 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
 
         let fanouts: Vec<Fanout> = moved.iter().map(|&(_, _, f)| f).collect();
         let (dispatches, dispatch_round) =
-            dispatch_scan_multi_fanout(disp, &shared.reactor, &fanouts, |i, targets, wire_flags, round| {
+            dispatch_scan_multi_fanout(disp, &fanouts, |i, targets, wire_flags, round| {
                 let (view_id, extra, _) = moved[i];
                 disp.write_group(&DirectGroup {
                     template: ipc::WireMsg {
@@ -2315,21 +2286,20 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             plans.push(ScanMultiRelPlan { tid, server_version, block });
         }
         let disp = shared.disp();
-        let (dispatches, _) =
-            dispatch_scan_multi_fanout(disp, &shared.reactor, &fanout, |i, targets, wire_flags, _| {
-                let plan = &plans[i];
-                disp.write_group(&DirectGroup {
-                    template: ipc::WireMsg {
-                        target_id: plan.tid as u64,
-                        client_id,
-                        flags: gnitz_wire::wire_flags_set_schema_version(wire_flags, plan.server_version),
-                        ..Default::default()
-                    },
-                    targets,
-                    ..DirectGroup::new(SalMessageKind::Scan)
-                })
+        let (dispatches, _) = dispatch_scan_multi_fanout(disp, &fanout, |i, targets, wire_flags, _| {
+            let plan = &plans[i];
+            disp.write_group(&DirectGroup {
+                template: ipc::WireMsg {
+                    target_id: plan.tid as u64,
+                    client_id,
+                    flags: gnitz_wire::wire_flags_set_schema_version(wire_flags, plan.server_version),
+                    ..Default::default()
+                },
+                targets,
+                ..DirectGroup::new(SalMessageKind::Scan)
             })
-            .await?;
+        })
+        .await?;
         // Release the catalog read lock here: Phase 2 touches no catalog state
         // (the snapshot is worker-frozen and the schemas are captured), so
         // holding it across the whole bulk read would needlessly block DDL.

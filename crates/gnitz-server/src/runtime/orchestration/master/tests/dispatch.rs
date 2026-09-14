@@ -1,5 +1,6 @@
-use super::super::fixtures::{test_dispatcher, test_dispatcher_with_efds};
+use super::super::fixtures::{test_dispatcher, test_dispatcher_with_efds, test_dispatcher_with_writers};
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
+use crate::runtime::sal::GroupTargets;
 use gnitz_foundation::posix_io::retry_eintr;
 
 /// Fork a child that exits immediately and block until it is a zombie *without*
@@ -27,12 +28,11 @@ fn spawn_and_reap_dead() -> i32 {
     pid
 }
 
-/// `check_workers` reports the first dead worker and zeroes its slot, so each
-/// death is reported exactly once. Both dead arms are covered: worker 1's
-/// zombie is reaped by the probe's own `waitpid`, worker 2 was reaped already
-/// and answers ECHILD.
+/// `check_workers` reports the first dead worker on every probe, and leaves the
+/// pid set as it was. Both dead arms are covered: worker 1's zombie is reaped by
+/// the first probe's own `waitpid`, and answers ECHILD on every probe after.
 #[test]
-fn check_workers_reports_each_dead_worker_exactly_once() {
+fn check_workers_keeps_reporting_a_dead_worker() {
     // `PR_SET_PDEATHSIG` on the forking thread: a panicking test unwinds off
     // this thread and takes the paused child with it, rather than orphaning it.
     let live = unsafe { libc::fork() };
@@ -49,12 +49,12 @@ fn check_workers_reports_each_dead_worker_exactly_once() {
     let disp = test_dispatcher(vec![live, zombie, reaped], std::ptr::null_mut());
 
     assert_eq!(disp.check_workers(), Some(1), "the unreaped zombie is detected dead");
-    assert_eq!(disp.check_workers(), Some(2), "then the already-reaped worker");
-    assert_eq!(disp.check_workers(), None, "a zeroed worker is never re-reported");
+    assert_eq!(disp.check_workers(), Some(1), "and still reported once reaped");
+    assert_eq!(disp.check_workers(), Some(1), "on every probe");
     assert_eq!(
         *disp.worker_pids.borrow(),
-        vec![live, 0, 0],
-        "a dead worker's pid is zeroed"
+        vec![live, zombie, reaped],
+        "a probe leaves the pid set unchanged"
     );
 
     unsafe {
@@ -64,18 +64,34 @@ fn check_workers_reports_each_dead_worker_exactly_once() {
     }
 }
 
-/// ACK collection makes no progress on an empty ring and reaches its park arm,
-/// whose liveness probe must surface the dead worker as a clean error naming the
-/// worker and the caller's own phase — not loop on the park.
+/// An exclusive round no worker answers must surface a dead worker as a clean
+/// error naming the worker and the caller's own phase — not wait on the ACK.
 #[test]
 fn ack_collection_errors_when_a_worker_is_dead() {
     for ctx in ["checkpoint base round", "backfill relay"] {
         let disp = test_dispatcher(vec![spawn_and_reap_dead()], std::ptr::null_mut());
         let err = disp
-            .collect_acks_and_relay(ctx, false)
+            .exclusive_round(ctx, false, |_| Ok(()))
             .expect_err("a dead worker must fail ack collection");
         assert!(err.contains("worker 0") && err.contains(ctx), "{err}");
     }
+}
+
+/// A worker that fails before it joins a round leaves the others in their
+/// exchange wait, never ACKing: the error ends the round without their ACKs.
+#[test]
+fn an_exclusive_round_fails_on_a_worker_error_without_the_other_acks() {
+    let (disp, writers) = test_dispatcher_with_writers(vec![0, 0]);
+    let err = disp
+        .exclusive_round("backfill relay", false, |targets| {
+            let GroupTargets::All(base) = targets else {
+                unreachable!("an exclusive round broadcasts")
+            };
+            writers[0].send_status(0, base, gnitz_wire::STATUS_ERROR, b"boom");
+            Ok(())
+        })
+        .expect_err("a worker's error ACK must fail the round");
+    assert!(err.contains("worker 0") && err.contains("boom"), "{err}");
 }
 
 /// The checkpoint finalizer flushes system tables before resetting the SAL. A

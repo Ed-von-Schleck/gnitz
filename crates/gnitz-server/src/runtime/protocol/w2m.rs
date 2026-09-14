@@ -40,13 +40,19 @@ use io_uring::types::FutexWaitV;
 
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg, FRAME_CAP};
 use gnitz_foundation::posix_io;
+use gnitz_wire::align8;
 use gnitz_wire::control::{peek_control_block_ipc, DecodedControl};
-use gnitz_wire::{align8, BitIter};
 
 /// The ring id every worker exchange frame rides. The master's request-id
 /// counter never hands it out, so a ring prefix alone tells an exchange frame
 /// from a reply before anything decodes it.
 pub(crate) const W2M_EXCHANGE_RING_ID: u32 = u32::MAX;
+
+/// The request id worker `w`'s boot verdict answers on: an id of the reactor's
+/// first lease, which starts at 1.
+pub(crate) const fn boot_ready_request_id(w: usize) -> u64 {
+    1 + w as u64
+}
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -78,10 +84,9 @@ const _: () = assert!(
     "a cursor advance must always move its low 32 bits — the futex word (see `futex_word`)",
 );
 
-// `arm_park` builds a `futex_waitv` word list of at most `num_workers` entries.
-// The kernel's `FUTEX_WAITV_MAX` is 128; past it the syscall returns EINVAL,
-// which the caller absorbs as a timeout, silently degenerating the relay to
-// polling. Make a `MAX_WORKERS` bump that outgrows it a build error.
+// `arm_waitv` builds a `futex_waitv` word list of `num_workers` entries. The
+// kernel's `FUTEX_WAITV_MAX` is 128; past it the wait fails with EINVAL. Make a
+// `MAX_WORKERS` bump that outgrows it a build error.
 const _: () = assert!(gnitz_wire::MAX_WORKERS <= 128);
 
 /// Bytes of the 8-byte slot prefix that carry the client's frame length prefix.
@@ -126,14 +131,9 @@ fn unpack_prefix(prefix: u64) -> (u32, u32) {
 /// Set by the worker while parked on `release_cursor`; cleared by the worker
 /// once its wait returns. The master reads it before spending a `FUTEX_WAKE`.
 const FLAG_WRITER_PARKED: u32 = 1 << 0;
-/// Set by the reactor while its `FUTEX_WAITV` SQE is armed on `write_cursor`.
+/// Set by the reactor while its `FUTEX_WAITV` SQE is armed on `write_cursor` —
+/// the master's one park, and the worker's publish gate, taken by [`wake_master`].
 const FLAG_MASTER_WAITV: u32 = 1 << 1;
-/// Set by `W2mReceiver::wait_any` while it is synchronously parked. A bit of its
-/// own because both master parks can be armed at once from the same thread, so
-/// one bit would let whichever unparked first disarm the other's still-live gate.
-const FLAG_MASTER_SYNC: u32 = 1 << 2;
-/// Either master park — the worker's publish gate, taken by [`wake_master`].
-const FLAG_MASTER_ANY: u32 = FLAG_MASTER_WAITV | FLAG_MASTER_SYNC;
 
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, one cache line per writer)
@@ -422,7 +422,6 @@ fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32, site: &str) {
 
 /// Wait on one or more futex words (`SYS_futex_waitv`), returning when ANY
 /// differs from its expected value or is woken; `timeout_ms < 0` blocks forever.
-/// The synchronous analogue of the reactor's `IORING_OP_FUTEX_WAITV`.
 fn futex_waitv_u32(waiters: &[FutexWaitV], timeout_ms: i32) -> Parked {
     if waiters.is_empty() {
         return Parked::Retry;
@@ -480,13 +479,11 @@ fn wake_writer(park: &ParkWord, flags: u32) {
 /// the syscall.
 #[inline]
 fn wake_master(park: &ParkWord, flags: u32) {
-    if flags & FLAG_MASTER_ANY == 0 {
+    if flags & FLAG_MASTER_WAITV == 0 {
         return;
     }
-    park.disarm(FLAG_MASTER_ANY);
-    // `count_ones()` folds to 2 — the number of master parks, and an upper bound
-    // on the waiters, since either may have unparked since the flags were read.
-    futex_wake_u32(futex_word(&park.cursor), FLAG_MASTER_ANY.count_ones(), "wake_master");
+    park.disarm(FLAG_MASTER_WAITV);
+    futex_wake_u32(futex_word(&park.cursor), 1, "wake_master");
 }
 
 // ---------------------------------------------------------------------------
@@ -779,8 +776,8 @@ impl InFlightState {
 /// Dropping advances `release_cursor` (possibly past multiple slots when
 /// out-of-order slots complete a contiguous prefix) and wakes a parked writer.
 pub struct W2mSlot {
-    /// Length prefix and payload, borrowed in place: `frame_bytes` hands it to
-    /// `send_buffer` unchanged, and [`Self::bytes`] is its tail.
+    /// Length prefix and payload, borrowed in place: `frame_bytes` hands it to a
+    /// client send unchanged, and [`Self::bytes`] is its tail.
     frame: &'static [u8],
     push_idx: u64,
     /// `internal_req_id` from the slot prefix, set by the worker via
@@ -799,7 +796,7 @@ impl W2mSlot {
     pub fn bytes(&self) -> &[u8] {
         &self.frame[SLOT_LEN_PREFIX_BYTES..]
     }
-    /// The framed bytes ready for `send_buffer`: `[sz_as_u32_le | payload]`.
+    /// The framed bytes ready for a client send: `[sz_as_u32_le | payload]`.
     pub(crate) fn frame_bytes(&self) -> &[u8] {
         self.frame
     }
@@ -945,58 +942,28 @@ impl W2mReceiver {
         unsafe { self.rings[worker].take_next() }
     }
 
-    /// Arm `bit` — the caller's own park flag — on every ring in `mask` and fill
-    /// `out` with the futex words to wait on, returning the filled prefix.
-    /// `None` means a ring already has unread data: drain and retry, never park.
-    fn arm_park<'a>(&self, mask: u64, bit: u32, out: &'a mut [FutexWaitV]) -> Option<&'a [FutexWaitV]> {
-        let mut n = 0;
-        for w in BitIter(mask) {
-            let ring = &self.rings[w];
+    /// Arm the reactor's `FUTEX_WAITV` park on every ring, filling `out` with the
+    /// words its SQE watches. `None` means a ring already has unread data: every
+    /// ring is disarmed again, and the caller drains and retries, never parks.
+    pub fn arm_waitv<'a>(&self, out: &'a mut [FutexWaitV]) -> Option<&'a [FutexWaitV]> {
+        for (w, ring) in self.rings.iter().enumerate() {
             let park = &ring.hdr.master_park;
-            let vwc = park.arm(bit);
+            let vwc = park.arm(FLAG_MASTER_WAITV);
             if vwc != ring.read_cursor() {
+                self.clear_waitv();
                 return None;
             }
-            out[n] = futex_waitv_entry(futex_word(&park.cursor), vwc as u32);
-            n += 1;
+            out[w] = futex_waitv_entry(futex_word(&park.cursor), vwc as u32);
         }
-        Some(&out[..n])
-    }
-
-    fn clear_park(&self, mask: u64, bit: u32) {
-        for w in BitIter(mask) {
-            self.rings[w].hdr.master_park.disarm(bit);
-        }
-    }
-
-    fn all_rings(&self) -> u64 {
-        gnitz_wire::low_bits_mask(self.rings.len())
-    }
-
-    /// Arm the reactor's persistent `FUTEX_WAITV` park on every ring, filling
-    /// `out` with the words its SQE watches.
-    pub fn arm_waitv<'a>(&self, out: &'a mut [FutexWaitV]) -> Option<&'a [FutexWaitV]> {
-        self.arm_park(self.all_rings(), FLAG_MASTER_WAITV, out)
+        Some(&out[..self.rings.len()])
     }
 
     /// Drop the reactor's park. The flag is also cleared by any worker's publish,
     /// so this only has to cover the rings no publish reached.
     pub fn clear_waitv(&self) {
-        self.clear_park(self.all_rings(), FLAG_MASTER_WAITV);
-    }
-
-    /// Wait until any worker in `workers` publishes, or `timeout_ms` elapses —
-    /// the synchronous analogue of the reactor's `FUTEX_WAITV`. Returns at once
-    /// if any ring already has unread data. `workers` must be the caller's whole
-    /// pending set: only the rings this armed can wake it.
-    pub fn wait_any(&self, workers: u64, timeout_ms: i32) -> Parked {
-        let mut waiters = [FutexWaitV::new(); gnitz_wire::MAX_WORKERS];
-        let rc = match self.arm_park(workers, FLAG_MASTER_SYNC, &mut waiters) {
-            Some(armed) => futex_waitv_u32(armed, timeout_ms),
-            None => Parked::Retry,
-        };
-        self.clear_park(workers, FLAG_MASTER_SYNC);
-        rc
+        for ring in self.rings.iter() {
+            ring.hdr.master_park.disarm(FLAG_MASTER_WAITV);
+        }
     }
 
     pub fn num_workers(&self) -> usize {

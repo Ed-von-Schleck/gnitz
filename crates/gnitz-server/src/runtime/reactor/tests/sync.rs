@@ -17,7 +17,7 @@ fn oneshot_deliver_value() {
     let got2 = Rc::clone(&got);
     let (tx, rx) = oneshot::channel::<i32>();
     r.spawn(async move {
-        let v = rx.await.unwrap();
+        let v = rx.await;
         got2.set(v);
     });
     // Drive one tick so the receiver registers its waker, then send.
@@ -25,22 +25,6 @@ fn oneshot_deliver_value() {
     tx.send(42);
     r.block_until_idle();
     assert_eq!(got.get(), 42);
-}
-
-#[test]
-fn oneshot_sender_drop_cancels() {
-    let r = make_reactor();
-    let cancelled: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-    let cancelled2 = Rc::clone(&cancelled);
-    let (tx, rx) = oneshot::channel::<i32>();
-    r.spawn(async move {
-        let res = rx.await;
-        cancelled2.set(res.is_none());
-    });
-    r.tick(false);
-    drop(tx);
-    r.block_until_idle();
-    assert!(cancelled.get(), "dropping the sender must resolve the receiver to None");
 }
 
 /// Sending to a cancelled receiver is not an error and never was to any caller:
@@ -58,29 +42,6 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
     drop(rx);
     tx.send(Tattle(Rc::clone(&dropped)));
     assert!(dropped.get(), "the undeliverable value must be dropped, not leaked");
-}
-
-/// The last sender's drop is what ends the stream: `recv()` resolves to `None`,
-/// which is how the committer's and the tick loop's `run` loops shut down.
-#[test]
-fn chan_sender_drop_ends_the_stream() {
-    let r = make_reactor();
-    let got: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
-    let got2 = Rc::clone(&got);
-    let (tx, mut rx) = chan::unbounded::<i32>();
-    tx.send(10);
-    tx.send(20);
-    drop(tx);
-    r.block_on(async move {
-        while let Some(v) = rx.recv().await {
-            got2.borrow_mut().push(v);
-        }
-    });
-    assert_eq!(
-        *got.borrow(),
-        vec![10, 20],
-        "a single-consumer queue delivers in send order"
-    );
 }
 
 #[test]
@@ -257,7 +218,7 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
 
-    // cancel channel: dropping the sender unblocks select2 in Task B.
+    // cancel channel: sending on it resolves select2 in Task B.
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
     // Task A: holds read lock for many ticks so B stays parked.
@@ -270,7 +231,7 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     });
 
     // Task B: races write acquisition vs cancel_rx. WriteFuture parks
-    // (writers_waiting=1); cancel_rx stays Pending until we drop cancel_tx.
+    // (writers_waiting=1); cancel_rx stays Pending until cancel_tx sends.
     let l_b = Rc::clone(&lock);
     r.spawn(async move {
         let _ = select2(l_b.write(), cancel_rx).await;
@@ -291,7 +252,7 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     assert!(!done.get(), "C must be blocked while write waiter B is alive");
 
     // Cancel B: dropping the last live write waiter must wake C.
-    drop(cancel_tx);
+    cancel_tx.send(());
     for _ in 0..5 {
         r.tick(false);
     }

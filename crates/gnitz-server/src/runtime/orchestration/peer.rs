@@ -7,7 +7,6 @@ use std::rc::Rc;
 
 use crate::runtime::reactor::{ClientConn, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
-use crate::runtime::w2m::W2mSlot;
 use crate::runtime::wire::COALESCE_MAX_BYTES;
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 
@@ -75,8 +74,7 @@ impl Peer {
         self.cork_with(|acc| acc.extend_from_slice(frame))
     }
 
-    /// Bytes currently corked (test observability).
-    #[cfg(test)]
+    /// Bytes currently corked.
     pub fn corked_len(&self) -> usize {
         self.egress.borrow().as_ref().map_or(0, |b| b.0.len())
     }
@@ -105,15 +103,27 @@ impl Peer {
         self.send_raw(SendBody::Pooled(buf)).await
     }
 
-    /// Send one owned payload, behind whatever is corked — so nothing can
-    /// overtake a reply already written. `< 0` (disconnect or eviction) means
-    /// the client is gone.
-    async fn send(&self, body: SendBody) -> i32 {
-        let rc = self.flush_egress().await;
-        if rc < 0 {
-            return rc;
+    /// Send one payload behind whatever is corked. It is corked — copied, releasing a
+    /// ring slot at once — when it fits beside bytes already corked, or is at most half
+    /// of [`COALESCE_MAX_BYTES`] so what follows can join it: a copy of at most the
+    /// budget per send saved. Otherwise the cork is flushed and the payload goes out
+    /// alone, zero-copy, holding its ring slot until the send completes. `< 0`: the
+    /// client is gone; a corked payload reports that at its flush.
+    pub async fn send(&self, body: impl Into<SendBody>) -> i32 {
+        let body = body.into();
+        let len = body.bytes().len();
+        let corked = self.corked_len();
+        if !(corked > 0 && corked + len <= COALESCE_MAX_BYTES) {
+            let rc = self.flush_egress().await;
+            if rc < 0 {
+                return rc;
+            }
+            if len > COALESCE_MAX_BYTES / 2 {
+                return self.send_raw(body).await;
+            }
         }
-        self.send_raw(body).await
+        self.cork(body.bytes());
+        0
     }
 
     /// The transport send itself.
@@ -124,30 +134,15 @@ impl Peer {
         }
     }
 
-    /// Send an owned buffer to the client.
-    pub async fn send_buffer(&self, buf: PooledSendBuf) -> i32 {
-        self.send(SendBody::Pooled(buf)).await
-    }
-
-    /// Forward a worker W2M ring slot to the client. Holding the slot until the
-    /// send completes is what preserves the worker's W2M backpressure, and is
-    /// why the send deadline matters most on this path.
-    pub async fn send_slot(&self, slot: W2mSlot) -> i32 {
-        self.send(SendBody::Slot(slot)).await
-    }
-
     /// Send the OK HELLO ACK frame, seeding the client's OCC basis with
     /// `published_lsn` (the durability watermark at connect). The ACK's contents
     /// (status, advertised server frame limit) are protocol policy decided once
-    /// here, for every transport. `published_lsn` is a runtime value, so the frame
-    /// cannot be a compile-time `const` shipped by a zero-copy `'static` send:
-    /// it is copied into a pooled send buffer and dispatched through the shared
-    /// `send_buffer` path (per-connection, so the extra copy is off any hot path).
+    /// here, for every transport.
     pub async fn send_hello_ack(&self, published_lsn: u64) -> i32 {
         let ack = gnitz_wire::encode_hello_ack(crate::runtime::wire::FRAME_CAP as u32, published_lsn);
-        let mut buf = gnitz_store::storage::batch_pool::acquire_buf();
+        let mut buf = acquire_buf();
         buf.extend_from_slice(&ack);
-        self.send_buffer(PooledSendBuf(buf)).await
+        self.send(PooledSendBuf(buf)).await
     }
 
     /// Terminal reply send: close the connection on transport failure. Once
@@ -155,7 +150,7 @@ impl Peer {
     /// connection, so a negative send rc (peer gone / write error) simply
     /// schedules the close.
     pub async fn send_or_close(&self, payload: impl Into<SendBody>) {
-        if self.send(payload.into()).await < 0 {
+        if self.send(payload).await < 0 {
             self.close();
         }
     }

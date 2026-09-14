@@ -3,32 +3,28 @@
 //! (backfill / seek / scan / index), the checkpoint rounds, the tick-round
 //! counter and worker reaping.
 
+use std::time::{Duration, Instant};
+
+use super::exchange::ExchangeAccumulator;
 use super::*;
-use crate::runtime::w2m::W2M_EXCHANGE_RING_ID;
+use crate::runtime::reactor::{select2, Either};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_store::relation::Relation;
 use gnitz_wire::{low_bits_mask, BitIter};
 
-/// A worker set rides in one word (`signal_reached`, `collect_acks_and_relay`),
-/// so a worker past bit 63 would never be signalled and never be waited on.
+/// A worker set rides in one word (`signal_reached`), so a worker past bit 63
+/// would never be signalled.
 const _: () = assert!(gnitz_wire::MAX_WORKERS <= u64::BITS as usize);
 
-/// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop
-/// below, and so also the loop's `fail_if_worker_dead` cadence: a worker that
-/// dies without publishing is noticed within this long. A publish wakes the loop
-/// directly, so on every live path the ceiling is unhit.
-const W2M_SYNC_WAIT_MS: i32 = 10;
+/// How often a worker's death is probed for.
+pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
 
 /// `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW`: report SAL relay space as low for the
 /// backfill on every non-stop round, so tests drive the reclamation protocol over
 /// a small table. The steady-state relay's equivalent is `executor`'s own
 /// `RELAY_SPACE_LOW`, beside the loop it perturbs.
 static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW");
-
-/// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next replied tick emit, once, as a
-/// full SAL would.
-static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
 /// A `u64` from the OS entropy pool for [`MasterDispatcher::delta_cursor_tag`],
 /// whose doc states what the tag is for. From the OS rather than from a seeded
@@ -96,7 +92,7 @@ impl MasterDispatcher {
         catalog: *mut CatalogEngine,
         last_ephemeral_gen: u64,
         sal: SalWriter,
-        w2m: Rc<W2mReceiver>,
+        reactor: Rc<Reactor>,
         m2w_efds: Vec<i32>,
     ) -> Self {
         debug_assert_eq!(m2w_efds.len(), worker_pids.len(), "one wakeup eventfd per worker");
@@ -110,7 +106,7 @@ impl MasterDispatcher {
             sal,
             sal_writer_excl: AsyncMutex::default(),
             m2w_efds,
-            w2m,
+            reactor,
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
             last_ephemeral_gen: Cell::new(last_ephemeral_gen),
@@ -218,129 +214,124 @@ impl MasterDispatcher {
         self.sal.sal_fd()
     }
 
-    /// A handle on the W2M receiver for the reactor, which reads the same rings.
-    /// Both sides hold a clone: the dispatcher's synchronous collect helpers stay
-    /// usable during the reactor-parked stop-the-world CREATE-VIEW backfill,
-    /// where the reactor (the only other reader) is parked inside that call.
-    pub(crate) fn w2m_receiver(&self) -> Rc<W2mReceiver> {
-        Rc::clone(&self.w2m)
-    }
-
-    /// Liveness gate for the pre-reactor bootstrap wait loops. A crashed worker
-    /// (panic / OOM-kill / SIGKILL) leaves its `write_cursor` frozen, so the park
-    /// only ever times out and the wait loop would spin forever. Callers probe
-    /// before parking and surface the dead worker as an error instead of hanging
-    /// the master; `ctx` names the phase the caller is in. On these paths workers
-    /// stay alive after acking, so a reaped worker has not published the awaited
-    /// frame — no ack is lost.
-    fn fail_if_worker_dead(&self, ctx: &str) -> Result<(), String> {
-        match self.check_workers() {
-            Some(dead) => Err(format!("worker {dead} exited during {ctx}")),
-            None => Ok(()),
-        }
+    /// The master's event loop.
+    pub(crate) fn reactor(&self) -> &Rc<Reactor> {
+        &self.reactor
     }
 
     pub(crate) fn num_workers(&self) -> usize {
         self.sal.num_workers()
     }
 
-    /// Collect ACKs from all workers, relaying exchange messages inline by
-    /// walking each ring serially and servicing any exchange round through a
-    /// private `ExchangeAccumulator`.
+    /// The next exchange round `lease`'s first `n` ids wait on, or `None` once all have
+    /// answered. A worker ACKs a tick or backfill only after its relays are written, so
+    /// `None` leaves no partial round in `acc`.
     ///
-    /// The caller must exclude every other SAL writer and have no concurrent
-    /// relay to service — either by running before the reactor is up, or by
-    /// running with it parked under the catalog write lock, which is what stops
-    /// the async `relay_loop` taking the read lock and deadlocking against this.
+    /// At most one caller may await this at a time: the exchange queue holds a
+    /// single waker.
+    pub(crate) async fn next_relay(
+        &self,
+        lease: &Lease,
+        n: usize,
+        ctx: &str,
+        acc: &mut ExchangeAccumulator,
+    ) -> Result<Option<PendingRelay>, WorkerFault> {
+        let mut acks = std::pin::pin!(lease.acks(n, |w, c| worker_error(w, ctx, c)));
+        loop {
+            match select2(acks.as_mut(), self.reactor.next_exchange()).await {
+                Either::A(r) => return r.map(|()| None),
+                Either::B((w, frame)) => {
+                    if let Some(relay) = acc.process(w, frame) {
+                        return Ok(Some(relay));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Block until `lease`'s first `n` ids have answered, relaying each round inline;
+    /// nothing else on the reactor runs. Fails on a worker's error ACK or death.
     ///
     /// `checkpoint_allowed`: a backfill may stamp CHECKPOINT to reclaim SAL
     /// space mid-stream (workers re-epoch inline). A drain TICK must NOT —
     /// it carries no backfill pad, so a CHECKPOINT would advance the master
-    /// epoch while workers stay on the old one and wedge the cluster; pass
-    /// `false` to force CONTINUE.
+    /// epoch while workers stay on the old one and wedge the cluster.
     ///
-    /// `ctx` names the phase in a worker-fault or dead-worker error, so it must
-    /// be the phase this call is in rather than the collector's own busiest use.
-    pub(crate) fn collect_acks_and_relay(&self, ctx: &str, checkpoint_allowed: bool) -> Result<(), String> {
-        let nw = self.num_workers();
-        // One bit per worker still owing its ACK.
-        let mut pending_mask: u64 = low_bits_mask(nw);
-        let mut acc = super::exchange::ExchangeAccumulator::new(nw);
-        // Armed when a round is stamped CHECKPOINT; the actual SAL reset is
-        // deferred to the next round barrier (see the decision block below).
-        let mut pending_reset = false;
-
-        while pending_mask != 0 {
-            // One full pass over the still-pending workers per iteration. If a
-            // pass makes no progress, wait on all of them. Exchange replies from
-            // any worker may trigger further SAL writes + replies, so we loop
-            // broadly.
-            let mut progressed = false;
-            for w in BitIter(pending_mask) {
-                let Some(slot) = self.w2m.try_read_slot(w) else {
-                    continue;
-                };
-                progressed = true;
-                if slot.internal_req_id != W2M_EXCHANGE_RING_ID {
-                    let ctrl = slot.control(w);
-                    drop(slot);
-                    if let Some(e) = worker_error(w, ctx, &ctrl) {
-                        return Err(e.text);
+    /// `ctx` names the phase in a worker-fault or dead-worker error.
+    pub(crate) fn collect_exclusive(
+        &self,
+        lease: &Lease,
+        n: usize,
+        ctx: &str,
+        checkpoint_allowed: bool,
+    ) -> Result<(), String> {
+        self.reactor.block_on_exclusive(async {
+            let collect = async {
+                let mut acc = ExchangeAccumulator::new(self.num_workers());
+                // Set when a round is stamped CHECKPOINT; the reset lands at the next
+                // round barrier, after every worker consumed that relay — so the next
+                // round is written at cursor 0 of the epoch the workers already
+                // expect. A bare `checkpoint_reset`, never `checkpoint_post_ack`: a
+                // mid-backfill flush would orphan unconsumed backfill groups.
+                let mut pending_reset = false;
+                while let Some(relay) = self.next_relay(lease, n, ctx, &mut acc).await.map_err(|f| f.text)? {
+                    if std::mem::take(&mut pending_reset) {
+                        self.sal.checkpoint_reset();
                     }
-                    pending_mask &= !(1u64 << w);
-                    continue;
+                    // Stop takes precedence: an all-pad round ends the backfill, and its
+                    // leftover SAL is reclaimed by the post-backfill checkpoint. A
+                    // CHECKPOINT verdict cannot rescue this round — it is written at the
+                    // current cursor either way.
+                    let all_pad = relay.all_pad;
+                    let prep = self.prepare_relay(relay)?;
+                    let decision = if all_pad {
+                        BACKFILL_DECISION_STOP
+                    } else if checkpoint_allowed
+                        && (self.relay_fit(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
+                    {
+                        pending_reset = true;
+                        BACKFILL_DECISION_CHECKPOINT
+                    } else {
+                        BACKFILL_DECISION_CONTINUE
+                    };
+                    self.emit_relay_with_decision(&prep, decision)?;
                 }
-                let frame = slot.decode(w);
-                drop(slot); // released before the relay is prepared and written
-                let Some(relay) = acc.process(w, frame) else {
-                    continue; // round still incomplete
-                };
-                // A round just completed. If a prior round was stamped
-                // CHECKPOINT, every worker has now consumed that relay — a worker
-                // issues its next round only after consuming the prior relay and
-                // bumping its read epoch inline, so this round's `num_workers`
-                // reports prove it. Reclaim the SAL write side NOW, before
-                // writing this round, so this round lands at write_cursor 0 in
-                // the new epoch the workers already expect. Direct
-                // checkpoint_reset only — never checkpoint_post_ack / Flush,
-                // which a mid-backfill flush would race, orphaning unconsumed
-                // backfill groups and hanging boot.
-                if pending_reset {
-                    self.sal.checkpoint_reset();
-                    pending_reset = false;
-                }
-                // Decide this round's collective verdict, stamped onto its relay.
-                // Stop takes precedence: an all-pad round ends the backfill and
-                // its leftover SAL is reclaimed by the normal post-backfill
-                // checkpoint. Otherwise, when space runs short against this
-                // round's own size, stamp CHECKPOINT (continue + tell workers to
-                // re-epoch inline) and arm the reset for the next round barrier.
-                // That cannot rescue this round — the reset only lands at the
-                // next barrier, so this round is written at the current cursor
-                // either way.
-                let all_pad = relay.all_pad;
-                let prep = self.prepare_relay(relay)?;
-                let decision = if all_pad {
-                    BACKFILL_DECISION_STOP
-                } else if checkpoint_allowed
-                    && (self.relay_fit(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
-                {
-                    pending_reset = true;
-                    BACKFILL_DECISION_CHECKPOINT
-                } else {
-                    BACKFILL_DECISION_CONTINUE
-                };
-                self.emit_relay_with_decision(&prep, decision)?;
+                Ok::<(), String>(())
+            };
+            match select2(collect, self.round_failure(lease, n, ctx)).await {
+                Either::A(r) => r,
+                Either::B(e) => Err(e),
             }
-            if !progressed {
-                self.fail_if_worker_dead(ctx)?;
-                // Wait on ALL still-pending workers at once: any could be the next
-                // to publish, and a single-word wait would miss a wake on a
-                // different worker's ring.
-                self.w2m.wait_any(pending_mask, W2M_SYNC_WAIT_MS);
+        })
+    }
+
+    /// Resolves once a worker has answered `lease` with an error or has died, probing
+    /// every `WORKER_WATCH`. A worker failing before it joins a round leaves the others
+    /// in their exchange wait, so an error must end the round without the other ACKs.
+    async fn round_failure(&self, lease: &Lease, n: usize, ctx: &str) -> String {
+        loop {
+            self.reactor.timer(Instant::now() + WORKER_WATCH).await;
+            if let Some(e) = lease.first_error(n, |w, c| worker_error(w, ctx, c)) {
+                return e.text;
+            }
+            if let Some(w) = self.check_workers() {
+                return format!("worker {w} exited during {ctx}");
             }
         }
-        Ok(())
+    }
+
+    /// Write the group `write` builds on a fresh ACK lease, signal, collect exclusively.
+    fn exclusive_round(
+        &self,
+        ctx: &str,
+        checkpoint_allowed: bool,
+        write: impl FnOnce(GroupTargets) -> Result<(), WorkerFault>,
+    ) -> Result<(), String> {
+        let nw = self.num_workers();
+        let lease = self.reactor.lease_acks(nw);
+        write(GroupTargets::All(lease.base())).map_err(|f| f.text)?;
+        self.signal_all();
+        self.collect_exclusive(&lease, nw, ctx, checkpoint_allowed)
     }
 
     // -----------------------------------------------------------------------
@@ -354,11 +345,11 @@ impl MasterDispatcher {
         self.cat().durable_generation() > self.last_ephemeral_gen.get()
     }
 
-    /// Invariant: the caller must own SAL checkpoint exclusivity — either by
-    /// running before the reactor, or with it parked under the catalog write
-    /// lock and the committer proven idle. The *async* fan-out / tick /
-    /// steady-state DDL paths must NOT call this: a concurrent Flush races the
-    /// committer's own and orphans SAL writes straddling `sal.checkpoint_reset`.
+    /// Invariant: the caller must own SAL checkpoint exclusivity — an exclusive
+    /// round at boot, or in a DDL window under the catalog write lock with the
+    /// committer proven idle. The *async* fan-out / tick / steady-state DDL
+    /// paths must NOT call this: a concurrent Flush races the committer's own and
+    /// orphans SAL writes straddling `sal.checkpoint_reset`.
     ///
     /// Publish every base table's shards and reset the SAL, invalidating
     /// checkpointed derived state first. The bump is not optional: this path
@@ -372,14 +363,14 @@ impl MasterDispatcher {
     /// uses.
     ///
     /// Half a checkpoint on its own: it must be paired with `restamp_derived` in
-    /// the same reactor-parked span.
+    /// the same exclusive window.
     fn reclaim_base(&self) -> Result<(), String> {
         self.cat().bump_checkpoint_generation()?;
         self.sync_round(0, SalMessageKind::Flush)
     }
 
     /// Re-stamp the derived state a `reclaim_base` invalidated, inside the
-    /// caller's reactor-parked window: tick every source carrying buffered deltas
+    /// caller's exclusive window: tick every source carrying buffered deltas
     /// up to the published base cut, then persist every view trace, view output
     /// and index at the durable generation.
     ///
@@ -397,9 +388,8 @@ impl MasterDispatcher {
         self.sync_round(self.cat().durable_generation(), SalMessageKind::FlushEph)
     }
 
-    /// One synchronous round (pre-reactor W2M path, or a reactor-parked window):
-    /// emit the flush group, block for every worker's ACK, finalize.
-    /// A `FlushEph` round's `lsn` IS the checkpoint generation (workers
+    /// One exclusive round: emit the flush group, block for every worker's ACK,
+    /// finalize. A `FlushEph` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_resume_generation`); the base round passes 0.
     fn sync_round(&self, lsn: u64, kind: SalMessageKind) -> Result<(), String> {
         // `kind` already discriminates the two callers, so it names the phase a
@@ -409,10 +399,7 @@ impl MasterDispatcher {
         } else {
             "checkpoint base round"
         };
-        self.write_checkpoint_group(lsn, kind, GroupTargets::AllUnaddressed)
-            .map_err(|f| f.text)?;
-        self.signal_all();
-        self.collect_acks_and_relay(ctx, false)?;
+        self.exclusive_round(ctx, false, |t| self.write_checkpoint_group(lsn, kind, t))?;
         self.checkpoint_post_ack()
     }
 
@@ -490,7 +477,7 @@ impl MasterDispatcher {
 
     /// CPU-only first half of exchange relay: looks up shard columns via
     /// the catalog DAG, scatters the payloads into per-worker batches, and
-    /// collects column names. No SAL write yet — `relay_loop` runs this
+    /// collects column names. No SAL write yet — a steady tick relay runs this
     /// without `sal_writer_excl` so the lock covers only the synchronous
     /// SAL write in `emit_relay_with_decision`.
     pub(crate) fn prepare_relay(&self, relay: PendingRelay) -> Result<RelayPrepared, String> {
@@ -581,9 +568,8 @@ impl MasterDispatcher {
     /// `BACKFILL_DECISION_*`) onto the relay's `seek_col_idx`. No awaits inside.
     ///
     /// The caller must exclude every other SAL writer, by either of the two means
-    /// this codebase has: `relay_loop` holds `sal_writer_excl` across the call,
-    /// while `collect_acks_and_relay` instead runs with the reactor parked, so
-    /// no other task can reach the SAL at all.
+    /// this codebase has: a steady tick relay holds `sal_writer_excl` across the
+    /// call, while an exclusive round polls no task, so none can reach the SAL.
     pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
         self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| {
             self.write_group(g)
@@ -603,10 +589,10 @@ impl MasterDispatcher {
     /// rebuild next to resumed siblings) that a closure re-drive would
     /// double-count.
     ///
-    /// Reclaims SAL space before a large source; the collect loop may further
+    /// Reclaims SAL space before a large source; the exclusive round may further
     /// CHECKPOINT mid-stream. Both are safe on the SAL-exclusive,
-    /// no-concurrent-relay paths this runs on (boot; the reactor-parked DDL
-    /// window). A reclaim here bumps the generation, leaving every checkpointed
+    /// no-concurrent-relay paths this runs on (boot; a DDL window's exclusive
+    /// rounds). A reclaim here bumps the generation, leaving every checkpointed
     /// view and index invalid until an ephemeral round re-stamps them — so a
     /// caller must run `restamp_derived` before its window closes whenever
     /// [`Self::derived_needs_restamp`] answers true afterwards.
@@ -622,16 +608,17 @@ impl MasterDispatcher {
         // Dataless, but it still carries a schema block: that block is what
         // stamps `Batch.schema` on the worker side.
         let source = wire::WireSchema::encoded(source_id, self.schema_desc_for(source_id));
-        self.write_group(&DirectGroup {
-            template: source.frame(wire::WireMsg {
-                seek_pk: view_id as u128,
-                ..Default::default()
-            }),
-            ..DirectGroup::new(SalMessageKind::Backfill)
+        let template = source.frame(wire::WireMsg {
+            seek_pk: view_id as u128,
+            ..Default::default()
+        });
+        self.exclusive_round("backfill relay", true, |t| {
+            self.write_group(&DirectGroup {
+                template,
+                targets: t,
+                ..DirectGroup::new(SalMessageKind::Backfill)
+            })
         })
-        .map_err(|f| f.text)?;
-        self.signal_all();
-        self.collect_acks_and_relay("backfill relay", true)
     }
 
     /// Backfill every view in `view_ids`, in dependency order, from each of its
@@ -660,23 +647,19 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Synchronously drain one source's pending ticks during the reactor-parked
-    /// CREATE-VIEW window: emit a Tick, signal, and collect each worker's
-    /// ACK while relaying its exchange dependents inline. The `handle_ddl_txn`
-    /// caller holds the catalog write lock and the tick gate with the committer
-    /// idle, so the async `relay_loop` cannot run (no deadlock) and no other tick
-    /// races this. Checkpointing is forced off: a tick carries no backfill pad,
-    /// so a CHECKPOINT verdict would advance only the master's epoch and wedge
-    /// the cluster (see `collect_acks_and_relay`).
+    /// Synchronously drain one source's pending ticks in an exclusive round: emit a
+    /// Tick, signal, and collect each worker's ACK while relaying its exchange
+    /// dependents inline. The `handle_ddl_txn` caller holds the catalog write lock
+    /// and the tick gate with the committer idle, so no other tick races this.
+    /// Checkpointing is forced off: a tick carries no backfill pad, so a
+    /// CHECKPOINT verdict would advance only the master's epoch and wedge the
+    /// cluster (see `collect_exclusive`).
     ///
     /// Writes under no SAL mutex, so `fn` rather than `async fn` is what keeps
     /// its group out of `fan_out_scan`'s sampled round: making it `async` lets
     /// the reactor interleave it and breaks that read-freshness contract.
     pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
-        self.write_tick_group(source_id, GroupTargets::AllUnaddressed)
-            .map_err(|f| f.text)?;
-        self.signal_all();
-        self.collect_acks_and_relay("view tick drain", false)
+        self.exclusive_round("view tick drain", false, |t| self.write_tick_group(source_id, t))
     }
 
     /// Point lookup of `pk`. A key-routed relation's rows sit on the worker the
@@ -686,7 +669,6 @@ impl MasterDispatcher {
     /// worker is asked and their replies are merged.
     pub(crate) async fn fan_out_seek(
         &self,
-        reactor: &crate::runtime::reactor::Reactor,
         target_id: i64,
         pk: u128,
         seek_pk_extra: &[u8],
@@ -705,7 +687,7 @@ impl MasterDispatcher {
             true => Fanout::One(schema.worker_for_pk(opk.pk_bytes(), num_workers)),
             false => read_fanout(self, target_id, None),
         };
-        let (mut slots, scan) = dispatch_scan_fanout(self, reactor, fanout, |targets| {
+        let (mut slots, scan) = dispatch_scan_fanout(self, fanout, |targets| {
             self.write_group(&DirectGroup {
                 template: wire::WireMsg {
                     target_id: target_id as u64,
@@ -753,7 +735,6 @@ impl MasterDispatcher {
     /// the sole OPK encoder, and the caller validated the packed column list.
     pub(crate) async fn fan_out_seek_by_index_collect(
         &self,
-        reactor: &crate::runtime::reactor::Reactor,
         target_id: i64,
         seek_col_idx: u64,
         seek_pk: u128,
@@ -767,7 +748,7 @@ impl MasterDispatcher {
         // The master's own reply guard, not something the group carries: the
         // worker's `seek_by_index` arm resolves the schema from its own catalog.
         let expected = self.schema_desc_for(target_id);
-        let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
+        let (slots, scan) = dispatch_scan_fanout(self, unicast, |targets| {
             self.write_group(&DirectGroup {
                 template: wire::WireMsg {
                     target_id: target_id as u64,
@@ -815,7 +796,6 @@ impl MasterDispatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fan_out_scan(
         &self,
-        reactor: &crate::runtime::reactor::Reactor,
         unicast: Fanout,
         target_id: i64,
         client_id: u64,
@@ -825,7 +805,7 @@ impl MasterDispatcher {
         seek_pk_extra: &[u8],
     ) -> Result<(bool, u64), WorkerFault> {
         let mut sampled = 0u64;
-        let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
+        let (slots, scan) = dispatch_scan_fanout(self, unicast, |targets| {
             let round = self.last_tick_round();
             sampled = round;
             self.write_group(&DirectGroup {
@@ -890,12 +870,6 @@ impl MasterDispatcher {
         let round = self.tick_round.get() + 1;
         self.tick_round.set(round);
         self.record_delta_round(tid, round);
-        // Only a replied tick: the CREATE-VIEW, boot-sweep and restamp drains
-        // write `AllUnaddressed` and would otherwise spend the one-shot before
-        // test's own tick ever reaches the tick loop.
-        if matches!(targets, GroupTargets::All(_)) && TICK_EMIT_ERROR.take_once() {
-            return Err(format!("injected tick emit error (tid={tid})").into());
-        }
         self.write_group(&DirectGroup {
             template: wire::WireMsg {
                 target_id: tid as u64,
@@ -984,8 +958,8 @@ impl MasterDispatcher {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    /// The first dead worker, reported exactly once: its pid slot is zeroed, so
-    /// the next probe skips it rather than re-reading ECHILD off a non-child.
+    /// The first dead worker. A dead worker is reported on every probe until
+    /// `shutdown_workers` reaps the set: a reaped pid answers ECHILD every time.
     ///
     /// Probes each worker by its own pid, not `waitpid(-1)`. A per-pid `waitpid`
     /// returns ECHILD — a detected death — even if the zombie was reaped
@@ -1008,7 +982,6 @@ impl MasterDispatcher {
                 Err(e) => e.raw_os_error() == Some(libc::ECHILD),
             };
             if dead {
-                self.worker_pids.borrow_mut()[w] = 0;
                 return Some(w);
             }
         }
@@ -1108,7 +1081,7 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Synchronous boot-end checkpoint (pre-reactor W2M path): record the
+    /// Boot-end checkpoint, as exclusive rounds: record the
     /// launched topology, then reclaim and re-stamp. The drain set is empty —
     /// recovery already drained everything and no pushes are admitted yet (the
     /// socket is not open), so `pending_deltas` is empty. Freshly backfilled

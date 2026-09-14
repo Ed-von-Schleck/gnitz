@@ -18,10 +18,11 @@ use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
 use crate::runtime::m2w;
 use crate::runtime::master::MasterDispatcher;
+use crate::runtime::reactor::{Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
-use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
+use crate::runtime::w2m::{self, boot_ready_request_id, W2mReceiver, W2mWriter};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
 use gnitz_store::relation::Relation;
@@ -416,7 +417,7 @@ fn run_worker_child(
             // The master reads this frame off the shared ring, which outlives the
             // process that wrote it.
             gnitz_error!("{e}");
-            w2m_writer.send_status(0, 0, gnitz_wire::STATUS_ERROR, e.as_bytes());
+            w2m_writer.send_status(0, boot_ready_request_id(w), gnitz_wire::STATUS_ERROR, e.as_bytes());
             unsafe { libc::_exit(1) };
         }
     };
@@ -432,7 +433,7 @@ fn run_worker_child(
         ipc.m2w_efds[w],
         pending_deltas,
     );
-    let rc = worker.run();
+    let rc = worker.run(boot_ready_request_id(w));
 
     unsafe {
         libc::_exit(rc);
@@ -526,8 +527,17 @@ fn master_post_fork_recovery(
     disp.cat().registry_mut().detach();
 
     // Wait for all workers to complete recovery and signal readiness.
-    disp.collect_acks_and_relay("recovery sync", false)
+    let nw = disp.num_workers();
+    // Before any drain: a drain drops frames no lease routes.
+    let ready = disp.reactor().lease_acks(nw);
+    assert_eq!(
+        ready.base(),
+        boot_ready_request_id(0),
+        "the ready ACKs name the reactor's first lease"
+    );
+    disp.collect_exclusive(&ready, nw, "recovery sync", false)
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
+    drop(ready);
 
     // Reset the SAL for fresh use, now that every worker has recovered, above the
     // same `walk_epoch` the workers were launched with.
@@ -624,12 +634,17 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     // `recovery_start_generation_bump` has already run, so this is the floor
     // every base round must publish past.
     let boot_generation = catalog.durable_generation();
+    // 256 SQEs sets submit batching, not depth: a full SQ is flushed.
+    let reactor = Rc::new(
+        Reactor::new(256, Limits::from_env(), Rc::new(W2mReceiver::new(w2m_ptrs)))
+            .map_err(|e| format!("io_uring init failed: {e}"))?,
+    );
     let dispatcher = Rc::new(MasterDispatcher::new(
         worker_pids,
         catalog,
         boot_generation,
         SalWriter::new(sal_ptr, sal_fd, sal_len, nw),
-        Rc::new(W2mReceiver::new(w2m_ptrs)),
+        reactor,
         m2w_efds,
     ));
 

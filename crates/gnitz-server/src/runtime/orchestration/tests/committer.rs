@@ -13,9 +13,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-/// One non-blocking poll: `Ready(Some(v))` once resolved, `Ready(None)` once the
-/// sender is gone without having sent, `Pending` while the verdict is still owed.
-fn poll_once<T>(rx: &mut oneshot::Receiver<T>) -> Poll<Option<T>> {
+/// One non-blocking poll: `Ready(v)` once resolved, `Pending` while the verdict is
+/// still owed.
+fn poll_once<T>(rx: &mut oneshot::Receiver<T>) -> Poll<T> {
     Pin::new(rx).poll(&mut Context::from_waker(Waker::noop()))
 }
 
@@ -161,10 +161,10 @@ fn every_coalesced_client_of_a_push_unit_resolves_exactly_once() {
     .resolve(42);
 
     for rx in [&mut rx0, &mut rx1] {
-        assert!(matches!(poll_once(rx), Poll::Ready(Some(Ok(42)))));
-        // `send` consumes the sender, so a second poll can only report it gone —
-        // one verdict per client, never two.
-        assert!(matches!(poll_once(rx), Poll::Ready(None)));
+        assert!(matches!(poll_once(rx), Poll::Ready(Ok(42))));
+        // `send` consumes the sender and the poll took its value, so a second poll
+        // parks — one verdict per client, never two.
+        assert!(matches!(poll_once(rx), Poll::Pending));
     }
 }
 
@@ -181,7 +181,7 @@ fn a_push_units_group_error_reaches_every_client() {
 
     for rx in [&mut rx0, &mut rx1] {
         match poll_once(rx) {
-            Poll::Ready(Some(Err(e))) => assert_eq!(e.text, "SAL full"),
+            Poll::Ready(Err(e)) => assert_eq!(e.text, "SAL full"),
             _ => panic!("every coalesced client is owed the group's error"),
         }
     }
@@ -197,7 +197,7 @@ fn a_transaction_resolves_ok_only_when_every_family_committed() {
         outcome: Outcome::Txn(done),
     }
     .resolve(9);
-    assert!(matches!(poll_once(&mut rx), Poll::Ready(Some(Ok(9)))));
+    assert!(matches!(poll_once(&mut rx), Poll::Ready(Ok(9))));
 
     // One failed family fails the bundle, and the first error wins — the group
     // order, not the last one seen.
@@ -212,7 +212,7 @@ fn a_transaction_resolves_ok_only_when_every_family_committed() {
     }
     .resolve(9);
     match poll_once(&mut rx) {
-        Poll::Ready(Some(Err(e))) => assert_eq!(e.text, "second family"),
+        Poll::Ready(Err(e)) => assert_eq!(e.text, "second family"),
         _ => panic!("a transaction with a failed family resolves Err"),
     }
 }

@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 pub(super) use super::runloop::make_waker;
 use super::*;
-pub(super) use crate::runtime::test_support::make_reactor;
+pub(super) use crate::runtime::test_support::{make_reactor, make_reactor_over, make_reactor_with};
 use crate::runtime::w2m::W2mWriter;
 
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
@@ -23,27 +23,18 @@ impl Reactor {
     {
         let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
         let out_capture = Rc::clone(&out);
-        let root_key = self.spawn(async move {
+        self.spawn(async move {
             let v = fut.await;
             *out_capture.borrow_mut() = Some(v);
         });
 
-        // Drive the reactor until the root task completes. The `tasks`
-        // map removes the entry on completion, so `contains_key(root_key)`
-        // returning false is the termination signal.
+        // Drive the reactor until the root task has produced its output.
         loop {
             self.tick(true);
-            if !self.inner.tasks.borrow().contains_key(&root_key) {
-                break;
+            if let Some(v) = out.borrow_mut().take() {
+                return v;
             }
         }
-
-        // SAFETY: spawn ran the future to completion, so Some.
-        let v = out
-            .borrow_mut()
-            .take()
-            .expect("block_on root task did not produce output");
-        v
     }
 
     /// Bounded: the tests that use this are the ones guarding against lost
@@ -76,7 +67,7 @@ pub(super) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
         .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) }.leak())
         .collect();
     let writers = ptrs.iter().map(|&p| W2mWriter::new(p)).collect();
-    let r = Reactor::new(16, Limits::TEST, Rc::new(W2mReceiver::new(ptrs))).expect("reactor");
+    let r = make_reactor_over(Rc::new(W2mReceiver::new(ptrs)));
     (r, writers)
 }
 
@@ -153,8 +144,7 @@ pub(super) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Rc<Reactor>, 
             }
         }
     }
-    let r = Rc::new(Reactor::new(16, limits, Rc::new(W2mReceiver::new(vec![]))).expect("reactor"));
-    (r, sender, receiver)
+    (Rc::new(make_reactor_with(limits)), sender, receiver)
 }
 
 /// Read `expect` bytes off `fd` and close it, so the send under test never
@@ -203,35 +193,4 @@ pub(super) fn fake_listener() -> i32 {
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     assert!(fd >= 0, "socket");
     fd
-}
-
-/// Build a W2M ring carrying `n` scan frames, all tagged with
-/// `internal_req_id` but with distinct wire request_ids (100, 101, …) so the
-/// caller can verify arrival order. The returned `W2mReceiver` owns the
-/// `InFlightState` the slots reference; caller reads frames via
-/// `receiver.try_read_slot(0)`; the returned `SharedRegion` unmaps the ring
-/// on drop, after both receiver and all slots drop.
-pub(super) unsafe fn make_scan_ring(
-    internal_req_id: u32,
-    n: usize,
-) -> (
-    crate::runtime::w2m::W2mReceiver,
-    crate::runtime::test_support::SharedRegion,
-) {
-    use crate::runtime::wire as ipc;
-
-    let region = crate::runtime::w2m::fixtures::test_ring(64 * 1024);
-    let ptr = region.ptr();
-
-    let writer = W2mWriter::new(ptr);
-    let receiver = W2mReceiver::new(vec![ptr]);
-    for i in 0..n {
-        let wire_req = 100u64 + i as u64;
-        let msg = ipc::WireMsg {
-            request_id: wire_req,
-            ..Default::default()
-        };
-        writer.send_msg(internal_req_id as u64, &msg);
-    }
-    (receiver, region)
 }

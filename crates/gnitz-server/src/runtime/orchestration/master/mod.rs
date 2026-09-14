@@ -20,9 +20,9 @@ use gnitz_wire::{PkColList, SpecBytes};
 
 use crate::query::RelayRoute;
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{AsyncMutex, Lease};
+use crate::runtime::reactor::{AsyncMutex, Lease, Reactor};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalScope, SalWriter};
-use crate::runtime::w2m::{W2mReceiver, W2mSlot};
+use crate::runtime::w2m::W2mSlot;
 use crate::runtime::wire::{
     self, unique_preflight_wire_schema, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
     BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
@@ -81,10 +81,8 @@ pub struct MasterDispatcher {
     /// the SAL writer decides a group's shape from its own worker count, and this
     /// only tells the workers to go look.
     m2w_efds: Vec<i32>,
-    /// Shared with the reactor, which is the other reader. Every `W2mReceiver`
-    /// method takes `&self` (its cursors live in the shared-memory rings), so
-    /// both hold a clone rather than handing ownership across.
-    w2m: Rc<W2mReceiver>,
+    /// The master's one event loop, which reads every worker's replies.
+    reactor: Rc<Reactor>,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     /// Per-(table_id, column list) filter skipping redundant unique-index
@@ -168,7 +166,7 @@ mod unique_filter;
 mod unique_preflight;
 
 use super::TxnFamily;
-pub(crate) use dispatch::SeekReply;
+pub(crate) use dispatch::{SeekReply, WORKER_WATCH};
 use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
 pub(crate) use unique_filter::UniqueFilter;
 
@@ -253,8 +251,8 @@ impl ScanDispatch {
     /// The slots this scan's group writes, and the id each answers on.
     pub(crate) fn targets(&self) -> GroupTargets {
         match self.worker {
-            None => GroupTargets::All(self.lease.id(0)),
-            Some(worker) => GroupTargets::One { worker, req_id: self.lease.id(0) },
+            None => GroupTargets::All(self.lease.base()),
+            Some(worker) => GroupTargets::One { worker, req_id: self.lease.base() },
         }
     }
 
@@ -303,14 +301,13 @@ impl ScanDispatch {
 /// would skip it, and the caller would hang waiting for an ACK.
 pub(crate) async fn dispatch_scan_fanout<F>(
     disp: &MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
     unicast: Fanout,
     submit: F,
 ) -> Result<(Vec<W2mSlot>, ScanDispatch), WorkerFault>
 where
     F: FnOnce(GroupTargets) -> Result<(), WorkerFault>,
 {
-    let scan = ScanDispatch::alloc(reactor, disp.num_workers(), unicast);
+    let scan = ScanDispatch::alloc(disp.reactor(), disp.num_workers(), unicast);
 
     {
         let _guard = disp.sal_excl().lock().await;
@@ -342,7 +339,6 @@ where
 /// closure. An empty `fanouts` takes no hold and signals no worker.
 pub(crate) async fn dispatch_scan_multi_fanout<F>(
     disp: &MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
     fanouts: &[Fanout],
     mut submit: F,
 ) -> Result<(Vec<ScanDispatch>, u64), WorkerFault>
@@ -357,7 +353,7 @@ where
     // write).
     let dispatches: Vec<ScanDispatch> = fanouts
         .iter()
-        .map(|&unicast| ScanDispatch::alloc(reactor, nw, unicast))
+        .map(|&unicast| ScanDispatch::alloc(disp.reactor(), nw, unicast))
         .collect();
     let fifo = if fanouts.len() > 1 {
         gnitz_wire::FLAG_SCAN_FIFO_REPLY

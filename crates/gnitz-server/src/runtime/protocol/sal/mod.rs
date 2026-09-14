@@ -129,8 +129,7 @@ fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = u32> + '_ {
 /// Which of a group's slots are written, and the request id each answers on.
 #[derive(Clone, Copy)]
 pub(crate) enum GroupTargets {
-    /// Broadcast on request id 0. A slot that answers anyway is harvested by
-    /// ring position — `Flush`, `FlushEph` and `Tick` all do.
+    /// Broadcast on request id 0, which no lease holds: nothing answers.
     AllUnaddressed,
     /// Broadcast; slot `w` answers on `base + w`.
     All(u64),

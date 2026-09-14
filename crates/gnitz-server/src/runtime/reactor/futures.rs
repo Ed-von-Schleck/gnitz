@@ -50,50 +50,56 @@ impl Lease {
         (self.base + i as u32) as u64
     }
 
+    /// The first id; worker `w` of a broadcast answers on `base + w`.
+    pub(crate) fn base(&self) -> u64 {
+        self.base as u64
+    }
+
     fn ids(&self) -> Range<u32> {
         self.base..self.base + self.len
     }
 
-    /// Once every id in `range` has its ACK, `check` each in id order with the
-    /// worker that sent it, returning the first `Some` as `Err`.
+    /// Once each of the first `n` ids has its ACK, `check` each in id order with
+    /// the worker that sent it, returning the first `Some` as `Err`.
     pub(crate) async fn acks<E>(
         &self,
-        range: Range<usize>,
+        n: usize,
         mut check: impl FnMut(usize, &DecodedControl) -> Option<E>,
     ) -> Result<(), E> {
-        debug_assert!(range.end <= self.len as usize);
-        let ids = self.base + range.start as u32..self.base + range.end as u32;
+        debug_assert!(n <= self.len as usize);
+        let end = self.base + n as u32;
+        // Every id below `next` is answered; only `next`'s route holds a waker.
+        let mut next = self.base;
         std::future::poll_fn(|cx| {
             let mut routes = self.inner.routes.borrow_mut();
-            let mut pending = false;
-            for id in ids.clone() {
-                match routes.get_mut(&id).expect("a leased id is routed") {
-                    Route::Ack { ack: Some(_), .. } => {}
+            while next < end {
+                match routes.get_mut(&next).expect("a leased id is routed") {
+                    Route::Ack { ack: Some(_), .. } => next += 1,
                     Route::Ack { ack: None, waker } => {
-                        match waker {
-                            Some(w) => w.clone_from(cx.waker()),
-                            None => *waker = Some(cx.waker().clone()),
-                        }
-                        pending = true;
+                        park_waker(waker, cx.waker());
+                        return Poll::Pending;
                     }
                     Route::Train(_) => unreachable!("ACKs awaited on a train lease"),
                 }
             }
-            if pending {
-                return Poll::Pending;
-            }
-            // By reference: the verdict stays in the route until the lease drops.
-            for id in ids.clone() {
-                let Some(Route::Ack { ack: Some((w, ctrl)), .. }) = routes.get(&id) else {
-                    unreachable!("every ACK checked present above");
-                };
-                if let Some(e) = check(*w, ctrl) {
-                    return Poll::Ready(Err(e));
-                }
-            }
-            Poll::Ready(Ok(()))
+            drop(routes);
+            Poll::Ready(self.first_error(n, &mut check).map_or(Ok(()), Err))
         })
         .await
+    }
+
+    /// The first failed ACK among the first `n` ids that have arrived, in id order.
+    pub(crate) fn first_error<E>(
+        &self,
+        n: usize,
+        mut check: impl FnMut(usize, &DecodedControl) -> Option<E>,
+    ) -> Option<E> {
+        let routes = self.inner.routes.borrow();
+        // By reference: the verdict stays in the route until the lease drops.
+        (self.base..self.base + n as u32).find_map(|id| match routes.get(&id) {
+            Some(Route::Ack { ack: Some((w, ctrl)), .. }) => check(*w, ctrl),
+            _ => None,
+        })
     }
 
     /// The first frame of every id, in id order.
@@ -125,20 +131,21 @@ impl Lease {
     /// The next frame on id `i`.
     pub(crate) async fn next_frame(&self, i: usize) -> W2mSlot {
         let id = self.id(i) as u32;
-        std::future::poll_fn(|cx| {
-            train(&mut self.inner.routes.borrow_mut(), id)
-                .poll(cx)
-                .map(|s| s.expect("a route is never closed"))
-        })
-        .await
+        std::future::poll_fn(|cx| train(&mut self.inner.routes.borrow_mut(), id).poll(cx)).await
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let mut routes = self.inner.routes.borrow_mut();
-        for id in self.ids() {
-            routes.remove(&id);
+        {
+            let mut routes = self.inner.routes.borrow_mut();
+            for id in self.ids() {
+                routes.remove(&id);
+            }
+        }
+        // Every lease, not only a train: the waiter re-checks the routes itself.
+        if let Some(w) = self.inner.trains_idle.take() {
+            w.wake();
         }
     }
 }
@@ -147,6 +154,7 @@ impl Drop for Lease {
 // TimerFuture
 // ---------------------------------------------------------------------------
 
+/// A deadline. Its entry in the deadline map lives until the future drops.
 pub(super) struct TimerFuture {
     deadline: Instant,
     id: u64,
@@ -163,84 +171,47 @@ impl Future for TimerFuture {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if Instant::now() >= self.deadline {
-            self.inner.cancel_wake(self.deadline, self.id);
             return Poll::Ready(());
         }
-        self.inner.wake_at(self.deadline, self.id, cx.waker());
-        Poll::Pending
-    }
-}
-
-impl Drop for TimerFuture {
-    fn drop(&mut self) {
-        self.inner.cancel_wake(self.deadline, self.id);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FsyncFuture / SendFuture
-// ---------------------------------------------------------------------------
-
-pub struct FsyncFuture {
-    pub(super) id: u64,
-    pub(super) inner: Rc<ReactorShared>,
-}
-
-impl Future for FsyncFuture {
-    type Output = i32;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
-        self.inner.fsyncs.poll(self.id, cx).map(|(rc, ())| rc)
-    }
-}
-
-impl Drop for FsyncFuture {
-    fn drop(&mut self) {
-        self.inner.fsyncs.abandon(self.id);
-    }
-}
-
-/// One `OP_SEND` on `fd`. Past `deadline` it evicts the client (`shutdown`), which
-/// errors the send out; the result is then clamped negative.
-pub(super) struct SendFuture {
-    pub(super) send_id: u64,
-    pub(super) fd: i32,
-    pub(super) deadline: Instant,
-    pub(super) evicted: bool,
-    pub(super) inner: Rc<ReactorShared>,
-}
-
-impl Future for SendFuture {
-    type Output = (i32, SendBody);
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<(i32, SendBody)> {
-        if let Poll::Ready((rc, body)) = self.inner.sends.poll(self.send_id, cx) {
-            self.inner.cancel_wake(self.deadline, self.send_id);
-            return Poll::Ready((if self.evicted { rc.min(-1) } else { rc }, body));
-        }
-        if !self.evicted {
-            if Instant::now() >= self.deadline {
-                gnitz_warn!(
-                    "client fd={} made no send progress for {:?}; evicting",
-                    self.fd,
-                    self.inner.limits.client_send_timeout
-                );
-                shutdown(self.fd);
-                self.evicted = true;
-            } else {
-                self.inner.wake_at(self.deadline, self.send_id, cx.waker());
+        match self.inner.deadlines.borrow_mut().entry((self.deadline, self.id)) {
+            Entry::Occupied(mut e) => e.get_mut().clone_from(cx.waker()),
+            Entry::Vacant(e) => {
+                e.insert(cx.waker().clone());
             }
         }
         Poll::Pending
     }
 }
 
-impl Drop for SendFuture {
+impl Drop for TimerFuture {
     fn drop(&mut self) {
-        self.inner.cancel_wake(self.deadline, self.send_id);
-        self.inner.sends.abandon(self.send_id);
+        self.inner.deadlines.borrow_mut().remove(&(self.deadline, self.id));
     }
 }
 
-// (oneshot, chan, AsyncMutex, AsyncRwLock, select2 live in sync.rs)
+// ---------------------------------------------------------------------------
+// OpFuture
+// ---------------------------------------------------------------------------
+
+/// One submitted op awaiting its CQE: the result and what the op carried.
+/// Dropped early, it abandons the slot, which keeps the carry until the CQE.
+pub(super) struct OpFuture {
+    pub(super) id: u64,
+    pub(super) inner: Rc<ReactorShared>,
+}
+
+impl Future for OpFuture {
+    type Output = (i32, Option<SendBody>);
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<(i32, Option<SendBody>)> {
+        self.inner.ops.poll(self.id, cx)
+    }
+}
+
+impl Drop for OpFuture {
+    fn drop(&mut self) {
+        self.inner.ops.abandon(self.id);
+    }
+}
 
 #[cfg(test)]
 #[path = "tests/futures.rs"]

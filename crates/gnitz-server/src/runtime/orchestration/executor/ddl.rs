@@ -12,6 +12,7 @@
 //! its accessors included — with no visibility widened, and the DDL seams sit
 //! beside the code they perturb.
 
+use std::future::Future;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +27,6 @@ use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::FsyncFuture;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::Relation;
@@ -48,16 +48,12 @@ static DDL_QUIESCE_PENDING: AtomicU64 = AtomicU64::new(0);
 /// window ends on every exit path of `handle_ddl_txn`.
 ///
 /// While the depth is non-zero no checkpoint round may run: its drain would
-/// never complete against a parked tick loop, and the DDL's own synchronous W2M
-/// collectors read the rings by position, so they would eat the round's ACKs and
-/// park the committer forever holding `sal_writer_excl`.
-///
-/// A depth rather than a flag: at shutdown the tick loop returns and drops every
-/// queued `Quiesce` sender at once, so several `enter`s resolve together.
+/// never complete against a parked tick loop, and the committer's rounds would
+/// hold `sal_writer_excl` while the DDL's exclusive rounds, which poll no task,
+/// write under none.
 struct TickGate {
-    /// See [`TickPark`]: dropping it releases the tick loop. `None` when the
-    /// loop was already gone — nothing parked, nothing to release.
-    _release: Option<TickPark>,
+    /// See [`TickPark`]: dropping it releases the tick loop.
+    _release: TickPark,
     shared: Rc<Shared>,
 }
 
@@ -220,7 +216,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         .unwrap_or_default();
 
     // A CREATE VIEW is a stop-the-world op (source drain + distributed backfill,
-    // reactor parked). The VIEW_TAB family's +1 rows, if any, are the new views;
+    // as exclusive rounds). The VIEW_TAB family's +1 rows, if any, are the new views;
     // they alone need the lock-held barrier and the in-loop source drain below.
     let new_view_ids = views.creates;
     let view_create = !new_view_ids.is_empty();
@@ -236,8 +232,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // checkpoint can run once the window below is open.
     await_barrier(shared, BarrierKind::Ddl).await;
 
-    // Quiesce the ticks before the write lock (run_tick/relay_loop take the read
-    // lock, so a write-lock-held quiesce would deadlock) and after the barrier
+    // Quiesce the ticks before the write lock (run_tick takes the read lock, so a
+    // write-lock-held quiesce would deadlock) and after the barrier
     // (a Quiesce queued ahead of the checkpoint sequence's own Drain parks the
     // tick loop on a release this handler sends only once that barrier returns).
     //
@@ -262,6 +258,14 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         // committer stays idle for the rest of the handler (the write lock blocks
         // new pushes).
         await_barrier(shared, BarrierKind::Ddl).await;
+    }
+
+    // Exclusive rounds follow: the view's source drain and backfill, or the restamp a
+    // failed checkpoint drain left owed. No train may be live for them, and none can
+    // start under the write lock. A live train's client egress (each send bounded by
+    // `client_send_timeout`) holds this DDL, and every reader behind it, until it ends.
+    if view_create || shared.disp().derived_needs_restamp() {
+        shared.reactor.trains_idle().await;
     }
 
     // Discard any stale queue entries from a prior failed DDL so they don't
@@ -289,7 +293,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     {
         match shared
             .disp()
-            .validate_unique_index_create(&shared.reactor, owner_id, cols.as_slice())
+            .validate_unique_index_create(owner_id, cols.as_slice())
             .await
         {
             // No zone LSN reserved, no catalog mutation yet: just surface
@@ -431,8 +435,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         );
     });
 
-    // Finish the checkpoint here, while the reactor is still parked and the tick
-    // loop still quiesced, rather than leaving the database rebuild-on-boot until
+    // Finish the checkpoint here, while the tick loop is still quiesced, rather
+    // than leaving the database rebuild-on-boot until
     // something wakes the committer.
     if shared.disp().derived_needs_restamp() {
         let mut pending = Vec::new();
@@ -453,7 +457,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
 /// Caller holds `sal_writer_excl`, so reservation order == SAL write order. Every
 /// failure aborts: this runs after the in-memory catalog mutation, so a partial
 /// emit diverges master and worker permanently.
-fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> FsyncFuture {
+fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> impl Future<Output = i32> {
     let disp = shared.disp();
     let drained = shared.cat_mut().drain_pending_broadcasts();
     // Nothing inside the scope is visible until it commits, so a refused group
@@ -484,7 +488,7 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> FsyncFu
 /// Await `fsync`, then publish `zone`. Paired for the same reason
 /// `ZoneLsnAllocator` pairs reserve and publish: no caller can publish an LSN
 /// whose bytes are not yet on disk.
-async fn publish_after_fsync(alloc: &ZoneLsnAllocator, op: &'static str, zone: u64, fsync: FsyncFuture) {
+async fn publish_after_fsync(alloc: &ZoneLsnAllocator, op: &'static str, zone: u64, fsync: impl Future<Output = i32>) {
     let rc = fsync.await;
     if rc < 0 {
         gnitz_fatal_abort!("SAL fdatasync ({}) failed rc={}", op, rc);

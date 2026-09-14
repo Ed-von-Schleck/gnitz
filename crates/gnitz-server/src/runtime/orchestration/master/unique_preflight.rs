@@ -247,7 +247,6 @@ impl MasterDispatcher {
     /// An unknown table yields an empty set (nothing to validate).
     pub async fn validate_unique_index_create(
         &self,
-        reactor: &crate::runtime::reactor::Reactor,
         owner_id: i64,
         col_indices: &[u32],
     ) -> Result<UniqueFilter, WorkerFault> {
@@ -294,7 +293,7 @@ impl MasterDispatcher {
         // continuation-frame train. `scan` holds the lease to end of scope: when
         // the merge returns early (error or duplicate verdict) the lease drop
         // discards the undrained trains at the ring boundary.
-        let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
+        let (slots, scan) = dispatch_scan_fanout(self, unicast, |targets| {
             // The worker's `UniquePreflight` arm resolves the owner's schema
             // from its own catalog.
             self.write_group(&DirectGroup {

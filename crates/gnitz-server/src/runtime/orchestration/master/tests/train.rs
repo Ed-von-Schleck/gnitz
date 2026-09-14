@@ -45,10 +45,7 @@ impl DrainFixture {
         // Pinned for the same reason: a parked slot points into it.
         std::mem::forget(Rc::clone(&receiver));
 
-        let reactor = Rc::new(
-            crate::runtime::reactor::Reactor::new(16, crate::runtime::reactor::Limits::TEST, Rc::clone(&receiver))
-                .expect("reactor"),
-        );
+        let reactor = Rc::new(crate::runtime::test_support::make_reactor_over(Rc::clone(&receiver)));
         let scan = ScanDispatch::alloc(&reactor, n_workers, Fanout::Broadcast);
         let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(partner);
@@ -273,9 +270,9 @@ fn drain_index_scan_sink_error_aborts_drain() {
 
 /// A scan frame carrying neither rows nor a schema block — every worker that
 /// matched nothing on a selective broadcast read — is dropped rather than
-/// forwarded. Without the drop branch `peer.send_slot` parks awaiting a CQE the
-/// fixture never drives and the poll returns `Pending`; the cursor
-/// assertion adds that the slot was *released* at the ring, not leaked.
+/// forwarded. Without the drop branch `peer.send` would take it; the cursor
+/// assertion is that the slot was *released* at the ring, not leaked, with the
+/// peer holding nothing corked.
 #[test]
 fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
     let (fx, writers) = DrainFixture::new(1);
@@ -286,20 +283,19 @@ fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
     let slot = slots.pop().expect("first frame");
 
     let before = fx.receiver.release_cursor(0);
-    let head = classify_head(&slot, 0).expect("healthy header");
-    assert!(!head.observable, "a frame with neither rows nor a schema block");
-    let drained = poll_once(drain_scan_train(&fx.peer, &fx.scan, 0, slot, head)).expect("healthy train");
+    let drained = poll_once(drain_scan_train(&fx.peer, &fx.scan, 0, slot)).expect("healthy train");
     assert!(drained, "the train drained without a client disconnect");
     assert!(
         fx.receiver.release_cursor(0) > before,
         "the dropped slot was released at the ring"
     );
+    assert_eq!(fx.peer.corked_len(), 0, "and nothing of it was corked");
 }
 
-/// Corking the observable heads copies each out and releases its ring slot
-/// without parking, so the forward finishes in one poll. The per-worker fallback
-/// would instead pin worker 0's slot awaiting a CQE this reader-less peer never
-/// produces, which is what makes the one poll decisive.
+/// Small single-frame heads are corked: each is copied out and its ring slot
+/// released without parking, so the forward finishes in one poll. A zero-copy
+/// send would instead pin worker 0's slot awaiting a CQE this fixture never
+/// drives, which is what makes the one poll decisive.
 #[test]
 fn forward_scan_slots_coalesces_single_frame_heads() {
     let schema = two_col_schema();

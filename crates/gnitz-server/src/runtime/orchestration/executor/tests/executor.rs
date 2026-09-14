@@ -1,5 +1,17 @@
 use super::*;
+use crate::runtime::test_support::try_poll_once;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+
+/// Dropping a `TickPark` is the release: the tick loop's wait resolves with no
+/// other send, so no path out of a DDL window can leave the loop parked.
+#[test]
+fn tick_park_drop_releases_the_tick_loop() {
+    let (release_tx, mut release_rx) = oneshot::channel::<()>();
+    let park = TickPark(Some(release_tx));
+    assert!(try_poll_once(&mut release_rx).is_none(), "parked while the token lives");
+    drop(park);
+    assert!(try_poll_once(&mut release_rx).is_some(), "the drop releases the loop");
+}
 
 /// A batch whose rows carry `weights`, one distinct PK each.
 fn weighted(weights: &[i64]) -> Batch {

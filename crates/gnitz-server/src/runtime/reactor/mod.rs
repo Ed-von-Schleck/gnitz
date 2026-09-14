@@ -34,8 +34,8 @@ mod wake_queue;
 
 pub(crate) use conn::{shutdown, SendBody};
 
-pub(crate) use futures::{FsyncFuture, Lease};
-use futures::{Route, TimerFuture};
+pub(crate) use futures::Lease;
+use futures::{OpFuture, Route, TimerFuture};
 use park::ParkMap;
 use runloop::{RunQueue, REACTOR_RUN_QUEUE};
 use wake_queue::WakeQueue;
@@ -87,14 +87,11 @@ impl Limits {
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
 // ---------------------------------------------------------------------------
 
-const KIND_FSYNC: u64 = 3;
+/// A one-shot op whose CQE lands in `ops`.
+const KIND_OP: u64 = 3;
 const KIND_FUTEX_WAITV: u64 = 4;
 const KIND_ACCEPT: u64 = 5;
 const KIND_RECV: u64 = 6;
-const KIND_SEND: u64 = 7;
-/// The CQE of a recv's `AsyncCancel`, whose effect lands on the recv's own CQE.
-/// The dispatch arm is a no-op sink.
-const KIND_CANCEL_SINK: u64 = 9;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -114,12 +111,18 @@ const fn udata_id(u: u64) -> u64 {
     u & ID_MASK
 }
 
+/// Leave `waker` in `slot` for the next wake, reusing the waker already there.
+fn park_waker(slot: &mut Option<Waker>, waker: &Waker) {
+    match slot {
+        Some(w) => w.clone_from(waker),
+        None => *slot = Some(waker.clone()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reactor
 // ---------------------------------------------------------------------------
 
-/// One spawned task. An alias, not a newtype: nothing is added to the boxed
-/// future, and a newtype only adds a construction and a field access.
 type Task = Pin<Box<dyn Future<Output = ()>>>;
 
 /// Field order is drop order, and both ends of it are fixed; see `ring` and
@@ -144,11 +147,14 @@ struct ReactorShared {
     /// Every leased W2M request id and where its frames go. An entry lives
     /// exactly as long as the [`Lease`] that created it.
     routes: RefCell<FxHashMap<u32, Route>>,
+    /// The one [`Reactor::trains_idle`] awaiter, woken by every lease drop.
+    trains_idle: Cell<Option<Waker>>,
     /// The next request id a lease starts from. Never 0 (`AllUnaddressed`) and
     /// never [`W2M_EXCHANGE_RING_ID`]; see [`Reactor::lease`].
     next_request_id: Cell<u32>,
-    /// In-flight fdatasyncs; the CQE result is the fdatasync return code.
-    fsyncs: ParkMap<i32>,
+    /// In-flight one-shot ops, each holding what the kernel may still read until
+    /// its CQE.
+    ops: ParkMap,
     /// The array the `FUTEX_WAITV` SQE is prepped over, one entry per worker
     /// ring. The kernel copies it at submit, so it need not outlive the SQE.
     futex_waitv: RefCell<Box<[FutexWaitV]>>,
@@ -168,38 +174,23 @@ struct ReactorShared {
     limits: Limits,
     /// Accepted `(conn_fd, listener_fd)` pairs not yet claimed.
     accepts: RefCell<WakeQueue<(i32, i32)>>,
-    /// In-flight client sends, each carrying its body until the CQE.
-    sends: ParkMap<i32, SendBody>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
-    /// Exchange frames, as `(worker, frame)`, awaiting the relay task. The queue
-    /// exists from `Reactor::new`, so a frame published before that task is
-    /// spawned is delivered rather than dropped.
+    /// Exchange frames, as `(worker, frame)`, awaiting their round's driver. The
+    /// queue exists from `Reactor::new`, so a frame published before the driver
+    /// awaits is delivered rather than dropped.
     exchanges: RefCell<WakeQueue<(usize, DecodedWire)>>,
     /// Last: every `W2mSlot` an earlier field holds releases through it on drop.
     w2m: Rc<W2mReceiver>,
 }
 
 impl ReactorShared {
-    /// Next local op id, lossless when packed into a CQE's `user_data`.
+    /// Next local op id, lossless when packed into a CQE's `user_data`: the
+    /// 56-bit counter does not wrap within a process's life.
     fn alloc_op_id(&self) -> u64 {
         let id = self.next_op_id.get();
-        self.next_op_id.set(if id >= ID_MASK { 1 } else { id + 1 });
+        self.next_op_id.set(id + 1);
         id
-    }
-
-    /// Wake `waker` at `at` (replacing any waker already registered under the key).
-    fn wake_at(&self, at: Instant, id: u64, waker: &Waker) {
-        match self.deadlines.borrow_mut().entry((at, id)) {
-            Entry::Occupied(mut e) => e.get_mut().clone_from(waker),
-            Entry::Vacant(e) => {
-                e.insert(waker.clone());
-            }
-        }
-    }
-
-    fn cancel_wake(&self, at: Instant, id: u64) {
-        self.deadlines.borrow_mut().remove(&(at, id));
     }
 }
 
@@ -221,8 +212,9 @@ impl Reactor {
             run_queue: RefCell::new(RunQueue::new()),
             tick_scratch: Cell::new(Vec::with_capacity(16)),
             routes: RefCell::new(FxHashMap::default()),
+            trains_idle: Cell::new(None),
             next_request_id: Cell::new(1),
-            fsyncs: ParkMap::default(),
+            ops: ParkMap::default(),
             futex_waitv: RefCell::new(futex_waitv),
             futex_waitv_armed: Cell::new(false),
             deadlines: RefCell::new(BTreeMap::new()),
@@ -231,7 +223,6 @@ impl Reactor {
             inbound: Rc::new(io::InboundBudget::new(limits.inbound_cap)),
             limits,
             accepts: RefCell::new(WakeQueue::default()),
-            sends: ParkMap::default(),
             shutdown: Cell::new(false),
             exchanges: RefCell::new(WakeQueue::default()),
             w2m,
@@ -289,6 +280,25 @@ impl Reactor {
         Lease::new(Rc::clone(&self.inner), base, n)
     }
 
+    /// Resolves once no train lease is live. One awaiter at a time.
+    pub(crate) fn trains_idle(&self) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(|cx| {
+            if !self
+                .inner
+                .routes
+                .borrow()
+                .values()
+                .any(|r| matches!(r, Route::Train(_)))
+            {
+                return Poll::Ready(());
+            }
+            let mut slot = self.inner.trains_idle.take();
+            park_waker(&mut slot, cx.waker());
+            self.inner.trains_idle.set(slot);
+            Poll::Pending
+        })
+    }
+
     /// Future that completes at `deadline`.
     pub fn timer(&self, deadline: Instant) -> impl Future<Output = ()> {
         TimerFuture::new(deadline, Rc::clone(&self.inner))
@@ -297,58 +307,79 @@ impl Reactor {
     /// The next exchange frame a worker published, as `(worker, frame)`. Rounds
     /// are orchestration policy, assembled by the consumer.
     pub async fn next_exchange(&self) -> (usize, DecodedWire) {
-        std::future::poll_fn(|cx| {
-            self.inner
-                .exchanges
-                .borrow_mut()
-                .poll(cx)
-                .map(|frame| frame.expect("the exchange queue is never closed"))
-        })
-        .await
+        std::future::poll_fn(|cx| self.inner.exchanges.borrow_mut().poll(cx)).await
     }
 
-    /// Drain every worker's ring.
-    fn drain_all_w2m(&self) {
+    /// Route every unread slot of every worker's ring on its ring id, before
+    /// anything decodes it. True when any slot was taken.
+    fn drain_all_w2m(&self) -> bool {
+        let mut routed = false;
         for w in 0..self.inner.w2m.num_workers() {
-            self.drain_w2m_for_worker(w);
+            while let Some(slot) = self.inner.w2m.try_read_slot(w) {
+                routed = true;
+                let id = slot.internal_req_id;
+                if id == W2M_EXCHANGE_RING_ID {
+                    let frame = slot.decode(w);
+                    drop(slot); // free the ring space before the round driver runs
+                    self.inner.exchanges.borrow_mut().push((w, frame));
+                    continue;
+                }
+                match self.inner.routes.borrow_mut().get_mut(&id) {
+                    // No live lease: the request or scan was abandoned. Dropping the
+                    // slot undecoded releases its ring space.
+                    None => {}
+                    Some(Route::Train(q)) => q.push(slot),
+                    Some(Route::Ack { ack, waker }) => {
+                        // A worker answers each request id once.
+                        debug_assert!(ack.is_none(), "worker {w} answered request id {id} twice");
+                        *ack = Some((w, slot.control(w)));
+                        drop(slot);
+                        if let Some(waker) = waker.take() {
+                            waker.wake();
+                        }
+                    }
+                }
+            }
         }
+        routed
     }
 
-    /// Arm the W2M park for a tick about to sleep. False, arming nothing, when the
-    /// drain it runs first woke a task.
-    fn arm_futex_waitv(&self) -> bool {
+    /// Arm the W2M park for a sleep. False, arming nothing, when `found` reports
+    /// work turned up by the drain run first.
+    fn arm_futex_waitv(&self, found: &impl Fn(bool) -> bool) -> bool {
         let w2m = &self.inner.w2m;
         if w2m.num_workers() == 0 {
             return true; // nothing to watch, and a zero-length FUTEX_WAITV is -EINVAL
         }
         let mut waitv = self.inner.futex_waitv.borrow_mut();
-        let mut refused = false;
         loop {
-            self.drain_all_w2m();
-            if !self.inner.run_queue.borrow().is_empty() {
-                if refused {
-                    w2m.clear_waitv(); // a refused arm left some rings' flags set
-                }
+            if found(self.drain_all_w2m()) {
                 return false;
             }
-            match w2m.arm_waitv(&mut waitv) {
-                Some(armed) => {
-                    // SAFETY: the kernel copies the array at submit, and it lives in
-                    // `futex_waitv` for the reactor's life regardless; every `uaddr`
-                    // is a word of a W2M mapping that is never unmapped.
-                    unsafe {
-                        self.inner.ring.borrow_mut().prep_futex_waitv(
-                            armed.as_ptr(),
-                            armed.len() as u32,
-                            udata(KIND_FUTEX_WAITV, 0),
-                        );
-                    }
-                    self.inner.futex_waitv_armed.set(true);
-                    return true;
+            if let Some(armed) = w2m.arm_waitv(&mut waitv) {
+                // SAFETY: the kernel copies the array at submit, and it lives in
+                // `futex_waitv` for the reactor's life regardless; every `uaddr`
+                // is a word of a W2M mapping that is never unmapped.
+                unsafe {
+                    self.inner.ring.borrow_mut().prep_futex_waitv(
+                        armed.as_ptr(),
+                        armed.len() as u32,
+                        udata(KIND_FUTEX_WAITV, 0),
+                    );
                 }
-                None => refused = true,
+                self.inner.futex_waitv_armed.set(true);
+                return true;
             }
         }
+    }
+
+    /// Queue one op SQE, prepped by `prep` under its `user_data`, holding `carry`
+    /// until its CQE.
+    fn submit_op(&self, prep: impl FnOnce(&mut IoUringRing, u64), carry: Option<SendBody>) -> OpFuture {
+        let id = self.inner.alloc_op_id();
+        prep(&mut self.inner.ring.borrow_mut(), udata(KIND_OP, id));
+        self.inner.ops.open(id, carry);
+        OpFuture { id, inner: Rc::clone(&self.inner) }
     }
 
     /// Submit an fdatasync and await its completion. Returns the CQE `res`
@@ -356,15 +387,17 @@ impl Reactor {
     /// kernel immediately so the fsync can overlap with subsequent CPU work —
     /// `commit_pushes` awaits its worker ACKs and fires the tick between the
     /// submit and the CQE, and depends on it.
-    pub fn fsync(&self, fd: i32) -> FsyncFuture {
-        let id = self.inner.alloc_op_id();
-        {
-            let mut ring = self.inner.ring.borrow_mut();
-            ring.prep_fsync(fd, udata(KIND_FSYNC, id));
-            ring.flush_sqes("fsync");
+    pub fn fsync(&self, fd: i32) -> impl Future<Output = i32> {
+        // Built outside the async block, so dropping the result unpolled still
+        // abandons the op.
+        let op = self.submit_op(|ring, u| ring.prep_fsync(fd, u), None);
+        if let Err(e) = self.inner.ring.borrow_mut().submit() {
+            gnitz_error!(
+                "reactor: fsync SQE submit failed (errno={}); it goes out with the next tick",
+                e
+            );
         }
-        self.inner.fsyncs.open(id, ());
-        FsyncFuture { id, inner: Rc::clone(&self.inner) }
+        async move { op.await.0 }
     }
 
     /// Drive the reactor forever; returns when `request_shutdown` is
@@ -372,34 +405,6 @@ impl Reactor {
     pub fn block_until_shutdown(&self) {
         while !self.inner.shutdown.get() {
             self.tick(true);
-        }
-    }
-
-    /// Route every unread slot of worker `w` on its ring id, before anything decodes it.
-    fn drain_w2m_for_worker(&self, w: usize) {
-        while let Some(slot) = self.inner.w2m.try_read_slot(w) {
-            let id = slot.internal_req_id;
-            if id == W2M_EXCHANGE_RING_ID {
-                let frame = slot.decode(w);
-                drop(slot); // free the ring space before the relay task runs
-                self.inner.exchanges.borrow_mut().push((w, frame));
-                continue;
-            }
-            match self.inner.routes.borrow_mut().get_mut(&id) {
-                // No live lease: the request or scan was abandoned. Dropping the
-                // slot undecoded releases its ring space.
-                None => {}
-                Some(Route::Train(q)) => q.push(slot),
-                Some(Route::Ack { ack, waker }) => {
-                    // A worker answers each request id once.
-                    debug_assert!(ack.is_none(), "worker {w} answered request id {id} twice");
-                    *ack = Some((w, slot.control(w)));
-                    drop(slot);
-                    if let Some(waker) = waker.take() {
-                        waker.wake();
-                    }
-                }
-            }
         }
     }
 }

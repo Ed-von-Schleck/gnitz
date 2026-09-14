@@ -280,7 +280,8 @@ fn ddl_sync_defers_inside_exchange() {
 /// `Flush` and `Push` run INLINE inside an exchange wait — neither queue may
 /// grow, and both must ACK from inside the wait. Flush is the deadlock cell: it
 /// would never ACK, so `flush_round` would hold `sal_writer_excl` forever and
-/// `relay_loop` could never write the relay this worker is parked on.
+/// the tick's relay could never be written for the exchange this worker is
+/// parked on.
 #[test]
 fn flush_and_push_run_inline_inside_exchange() {
     const SAL_SIZE: usize = 1 << 20;

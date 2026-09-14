@@ -51,23 +51,26 @@ fn waker_clone_outlives_original() {
 /// the same tick task — cost one poll, not N.
 #[test]
 fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
-    /// Counts its polls and never completes, so every wake is one more poll.
-    struct CountPolls(Rc<StdCell<u32>>);
+    /// Counts its polls and never completes, so every wake is one more poll. Keeps
+    /// the waker its first poll was handed.
+    struct CountPolls(Rc<StdCell<u32>>, Rc<RefCell<Option<Waker>>>);
     impl Future for CountPolls {
         type Output = ();
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             self.0.set(self.0.get() + 1);
+            self.1.borrow_mut().get_or_insert_with(|| cx.waker().clone());
             Poll::Pending
         }
     }
 
     let r = make_reactor();
     let polls: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
-    let key = r.spawn(CountPolls(Rc::clone(&polls)));
+    let first_waker: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+    r.spawn(CountPolls(Rc::clone(&polls), Rc::clone(&first_waker)));
     r.tick(false); // the spawn's own first poll
     assert_eq!(polls.get(), 1);
 
-    let waker = make_waker(key);
+    let waker = first_waker.borrow().clone().expect("the first poll kept its waker");
     for _ in 0..16 {
         waker.wake_by_ref();
     }

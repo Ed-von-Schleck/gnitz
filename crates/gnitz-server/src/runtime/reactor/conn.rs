@@ -5,7 +5,6 @@ use std::os::fd::OwnedFd;
 
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
-use super::futures::SendFuture;
 use super::io::{ClientConn, RecvFilter};
 use super::*;
 
@@ -114,14 +113,7 @@ impl Reactor {
     /// The next newly-accepted `(conn_fd, listener_fd)` pair. Called by the
     /// accept-loop task.
     pub async fn accept(&self) -> (i32, i32) {
-        std::future::poll_fn(|cx| {
-            self.inner
-                .accepts
-                .borrow_mut()
-                .poll(cx)
-                .map(|pair| pair.expect("the accept queue is never closed"))
-        })
-        .await
+        std::future::poll_fn(|cx| self.inner.accepts.borrow_mut().poll(cx)).await
     }
 
     /// A connection over `fd`, charging the reactor's inbound budget. Nothing is
@@ -149,17 +141,14 @@ impl Reactor {
         debug_assert!(prev.is_none(), "fd={fd} registered while an entry still holds it");
     }
 
-    /// End `conn`'s recv side now: close its queue and, if a recv is armed, prep an
-    /// `AsyncCancel` of `udata(KIND_RECV, fd)` — nothing else would complete it for a
-    /// client that goes silent after being refused.
+    /// End `conn`'s recv side now: close its queue and, if a recv is armed, shut
+    /// the socket down — nothing else would complete that recv for a client that
+    /// goes silent after being refused.
     pub(crate) fn close_conn(&self, conn: &ClientConn) {
         conn.q.borrow_mut().close();
-        let fd = conn.fd();
-        if self.inner.conns.borrow().contains_key(&fd) {
-            self.inner
-                .ring
-                .borrow_mut()
-                .prep_async_cancel(udata(KIND_RECV, fd as u32 as u64), udata(KIND_CANCEL_SINK, 0));
+        // A recv that already ended retired its entry.
+        if self.inner.conns.borrow().contains_key(&conn.fd()) {
+            shutdown(conn.fd());
         }
     }
 
@@ -191,7 +180,8 @@ impl Reactor {
 
     /// Send `body`'s whole byte range on `conn`, returning the bytes sent (>= 0) or a
     /// negative errno, and `body` back. Loops on short sends; each kernel send has
-    /// its own `Limits::client_send_timeout` deadline (see `SendFuture`).
+    /// its own `Limits::client_send_timeout` deadline, past which the client is
+    /// evicted.
     pub(crate) async fn send_owned(&self, conn: &ClientConn, mut body: SendBody) -> (i32, SendBody) {
         let (ptr, len) = {
             let b = body.bytes();
@@ -199,26 +189,29 @@ impl Reactor {
         };
         let mut sent = 0usize;
         while sent < len {
-            let send_id = self.inner.alloc_op_id();
-            self.inner.ring.borrow_mut().prep_send(
-                conn.fd(),
-                unsafe { ptr.add(sent) },
-                (len - sent) as u32,
-                udata(KIND_SEND, send_id),
+            // `body`'s bytes are heap- or mapping-backed, so moving it into the op
+            // leaves `ptr` valid; the op holds it until this send's CQE.
+            let op = self.submit_op(
+                |ring, u| ring.prep_send(conn.fd(), unsafe { ptr.add(sent) }, (len - sent) as u32, u),
+                Some(body),
             );
-            // `body`'s bytes are heap- or mapping-backed, so moving it into the slot
-            // leaves `ptr` valid; the slot holds it until this send's CQE.
-            self.inner.sends.open(send_id, body);
+            let mut op = std::pin::pin!(op);
             let deadline = Instant::now() + self.inner.limits.client_send_timeout;
-            let (rc, back) = SendFuture {
-                send_id,
-                fd: conn.fd(),
-                deadline,
-                evicted: false,
-                inner: Rc::clone(&self.inner),
-            }
-            .await;
-            body = back;
+            let (rc, back) = match select2(op.as_mut(), self.timer(deadline)).await {
+                Either::A(done) => done,
+                // Evicted: `shutdown` errors the send out; a result that raced it counts as failed.
+                Either::B(()) => {
+                    gnitz_warn!(
+                        "client fd={} made no send progress for {:?}; evicting",
+                        conn.fd(),
+                        self.inner.limits.client_send_timeout
+                    );
+                    shutdown(conn.fd());
+                    let (rc, back) = op.await;
+                    (rc.min(-1), back)
+                }
+            };
+            body = back.expect("a send carries its body");
             if rc <= 0 {
                 return (if rc < 0 { rc } else { sent as i32 }, body);
             }

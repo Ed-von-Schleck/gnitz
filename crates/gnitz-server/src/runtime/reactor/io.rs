@@ -123,10 +123,13 @@ impl Drop for RecvBuf {
 /// Size of the per-connection read staging buffer.
 const CARRY_BYTES: usize = 32 * 1024;
 
-/// The deframer. One read fills the carry; every length prefix found in it
-/// allocates its own payload buffer and the bytes behind it move straight
-/// across, so a pipelined run costs one read rather than one per frame.
-struct RecvState {
+/// The inbound half of one client connection: the deframer, the frames it has
+/// completed, the single task awaiting them, and the recv-closed verdict. Both
+/// transports embed one, so the whole ingress policy is written once.
+pub(crate) struct RecvQueue {
+    /// The deframer's staging buffer. One read fills it; every length prefix found
+    /// in it allocates its own payload buffer and the bytes behind it move straight
+    /// across, so a pipelined run costs one read rather than one per frame.
     carry: Box<[u8]>,
     /// Bytes at the front of `carry` the parse has not consumed. At most a split
     /// length prefix: [`RecvQueue::deliver`] compacts before it returns.
@@ -134,21 +137,39 @@ struct RecvState {
     /// The payload a length prefix has been parsed for, and how much of it has
     /// arrived. `None` between frames, and while it is `Some` the carry is empty.
     pending: Option<(RecvBuf, usize)>,
+    /// Per-connection ceiling on incoming frame payload size. Initialised to
+    /// `HELLO_PRE_HANDSHAKE_LEN` (HELLO payload size) so a peer sending garbage
+    /// as its first frame cannot drive an allocation larger than the HELLO
+    /// message. Elevated to the negotiated transport limit after HELLO
+    /// validation.
+    max_payload_len: usize,
+    /// Complete messages awaiting pickup by `recv().await`, and the one task
+    /// awaiting them. A queue, not a slot: with one slot a pipelined client
+    /// deadlocks once the kernel socket buffer fills.
+    frames: WakeQueue<RecvBuf>,
+    /// No further frame will be queued: set on disconnect, forced close, or a
+    /// protocol/cap failure. A drained queue then resolves to `None`.
+    closed: bool,
+    budget: Rc<InboundBudget>,
 }
 
-impl RecvState {
-    fn new() -> Self {
-        RecvState {
+impl RecvQueue {
+    pub(crate) fn new(budget: Rc<InboundBudget>) -> Self {
+        RecvQueue {
             carry: vec![0u8; CARRY_BYTES].into_boxed_slice(),
             filled: 0,
             pending: None,
+            max_payload_len: HELLO_PRE_HANDSHAKE_LEN,
+            frames: WakeQueue::default(),
+            closed: false,
+            budget,
         }
     }
 
     /// The window the next bytes must land in. A payload whose unfilled tail
     /// would take a whole read on its own is read into directly, so a large frame
     /// is not copied through the carry a carry at a time.
-    fn remaining(&mut self) -> (*mut u8, u32) {
+    pub(crate) fn remaining(&mut self) -> (*mut u8, u32) {
         if let Some((buf, pos)) = &self.pending {
             if buf.len - *pos >= self.carry.len() {
                 // SAFETY: `pos <= buf.len`, and the buffer is exclusively ours.
@@ -161,48 +182,13 @@ impl RecvState {
             (self.carry.len() - self.filled) as u32,
         )
     }
-}
-
-/// The inbound half of one client connection: the deframer, the frames it has
-/// completed, the single task awaiting them, and the recv-closed verdict. Both
-/// transports embed one, so the whole ingress policy is written once.
-pub(crate) struct RecvQueue {
-    state: RecvState,
-    /// Per-connection ceiling on incoming frame payload size. Initialised to
-    /// `HELLO_PRE_HANDSHAKE_LEN` (HELLO payload size) so a peer sending garbage
-    /// as its first frame cannot drive an allocation larger than the HELLO
-    /// message. Elevated to the negotiated transport limit after HELLO
-    /// validation.
-    max_payload_len: usize,
-    /// Complete messages awaiting pickup by `recv().await`, and the one task
-    /// awaiting them. A queue, not a slot: with one slot a pipelined client
-    /// deadlocks once the kernel socket buffer fills. Closed on disconnect,
-    /// forced close, or a protocol/cap failure.
-    frames: WakeQueue<RecvBuf>,
-    budget: Rc<InboundBudget>,
-}
-
-impl RecvQueue {
-    pub(crate) fn new(budget: Rc<InboundBudget>) -> Self {
-        RecvQueue {
-            state: RecvState::new(),
-            max_payload_len: HELLO_PRE_HANDSHAKE_LEN,
-            frames: WakeQueue::default(),
-            budget,
-        }
-    }
-
-    /// The window the next bytes must be written into.
-    pub(crate) fn remaining(&mut self) -> (*mut u8, u32) {
-        self.state.remaining()
-    }
 
     pub(crate) fn set_max_payload_len(&mut self, limit: usize) {
         self.max_payload_len = limit;
     }
 
     pub(crate) fn recv_closed(&self) -> bool {
-        self.frames.is_closed()
+        self.closed
     }
 
     /// Advance by `n` bytes just written into the window, queueing every frame
@@ -211,7 +197,15 @@ impl RecvQueue {
     /// oversize frame, cap breach, or the zero-length sentinel; `fd` names the
     /// connection in the cap-breach log.
     pub(crate) fn deliver(&mut self, n: usize, fd: i32) -> Result<(*mut u8, u32), ()> {
-        let RecvState { carry, filled, pending } = &mut self.state;
+        let RecvQueue {
+            carry,
+            filled,
+            pending,
+            max_payload_len,
+            frames,
+            budget,
+            ..
+        } = self;
         // Where the bytes landed — the same test `remaining` chose the window by.
         match pending {
             Some((buf, pos)) if buf.len - *pos >= carry.len() => *pos += n,
@@ -238,7 +232,7 @@ impl RecvQueue {
                 }
                 // The charged `RecvBuf` moves from the deframer into the
                 // delivery queue; its accounting rides along untouched.
-                self.frames.push(buf);
+                frames.push(buf);
                 continue;
             }
             if *filled - cur < FRAME_LEN_PREFIX_BYTES {
@@ -247,16 +241,16 @@ impl RecvQueue {
             let hdr: [u8; FRAME_LEN_PREFIX_BYTES] = carry[cur..cur + FRAME_LEN_PREFIX_BYTES].try_into().unwrap();
             let plen = u32::from_le_bytes(hdr) as usize;
             // Zero is the close sentinel, not a frame.
-            if plen == 0 || plen > self.max_payload_len {
+            if plen == 0 || plen > *max_payload_len {
                 return Err(());
             }
-            let Some(buf) = self.budget.alloc(plen) else {
+            let Some(buf) = budget.alloc(plen) else {
                 gnitz_warn!(
                     "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
                     fd,
-                    self.budget.held.get(),
+                    budget.held.get(),
                     frame_weight(plen),
-                    self.budget.cap,
+                    budget.cap,
                 );
                 return Err(());
             };
@@ -268,7 +262,7 @@ impl RecvQueue {
         // next window is the rest of the carry.
         carry.copy_within(cur..*filled, 0);
         *filled -= cur;
-        Ok(self.state.remaining())
+        Ok(self.remaining())
     }
 
     /// Take a completed frame without parking, beside [`Self::poll_recv`].
@@ -281,13 +275,21 @@ impl RecvQueue {
     /// once the caller is done, so the buffer stays accounted for its full
     /// residency.
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<RecvBuf>> {
-        self.frames.poll(cx)
+        if let Some(buf) = self.frames.pop() {
+            return Poll::Ready(Some(buf));
+        }
+        if self.closed {
+            return Poll::Ready(None);
+        }
+        self.frames.park(cx);
+        Poll::Pending
     }
 
     /// Finish the recv side and wake the parked task, so its `recv().await`
     /// resolves to `None` once the queue drains. Idempotent.
     pub(crate) fn close(&mut self) {
-        self.frames.close();
+        self.closed = true;
+        self.frames.wake();
     }
 
     #[cfg(test)]

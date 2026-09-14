@@ -9,7 +9,7 @@ use gnitz_wire::type_code;
 use super::MasterDispatcher;
 use crate::runtime::sal::SalWriter;
 use crate::runtime::test_support::SharedRegion;
-use crate::runtime::w2m::W2mReceiver;
+use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 
 /// The OPK leading-key span of an unsigned integer value at `width` bytes —
 /// unsigned OPK is plain big-endian, so this is exactly what `key_bytes`
@@ -40,37 +40,51 @@ pub(super) fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, Optio
 }
 
 /// An inert dispatcher for the paths that never reach a live cluster: one empty
-/// W2M ring per worker, so the wait loops always reach their no-progress arm,
-/// and `-1` eventfds, which nothing parks on. Its mappings are leaked, so
-/// nothing here has a lifetime a caller could get wrong. `catalog` may be null
-/// only where the path under test never calls `cat()`.
+/// W2M ring per worker under its own reactor, and `-1` eventfds, which nothing
+/// parks on. Its mappings are leaked, so nothing here has a lifetime a caller
+/// could get wrong. `catalog` may be null only where the path under test never
+/// calls `cat()`.
 pub(super) fn test_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> MasterDispatcher {
     let nw = worker_pids.len();
-    inert_dispatcher(worker_pids, catalog, vec![-1; nw])
+    inert_dispatcher(worker_pids, catalog, vec![-1; nw]).0
 }
 
 /// [`test_dispatcher`] with real wake descriptors, for the one test that asserts
 /// on which workers were signalled.
 pub(super) fn test_dispatcher_with_efds(worker_pids: Vec<i32>, m2w_efds: Vec<i32>) -> MasterDispatcher {
-    inert_dispatcher(worker_pids, std::ptr::null_mut(), m2w_efds)
+    inert_dispatcher(worker_pids, std::ptr::null_mut(), m2w_efds).0
 }
 
-fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine, m2w_efds: Vec<i32>) -> MasterDispatcher {
+/// [`test_dispatcher`] with each worker ring's writer, for a test that answers in
+/// a worker's place.
+pub(super) fn test_dispatcher_with_writers(worker_pids: Vec<i32>) -> (MasterDispatcher, Vec<W2mWriter>) {
+    let nw = worker_pids.len();
+    inert_dispatcher(worker_pids, std::ptr::null_mut(), vec![-1; nw])
+}
+
+fn inert_dispatcher(
+    worker_pids: Vec<i32>,
+    catalog: *mut CatalogEngine,
+    m2w_efds: Vec<i32>,
+) -> (MasterDispatcher, Vec<W2mWriter>) {
     const RING_CAP: usize = 64 * 1024;
     const SAL_SIZE: usize = 4096;
     let nw = worker_pids.len();
-    let rings = (0..nw)
+    let rings: Vec<*mut u8> = (0..nw)
         .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(RING_CAP) }.leak())
         .collect();
+    let writers = rings.iter().map(|&p| W2mWriter::new(p)).collect();
+    let reactor = crate::runtime::test_support::make_reactor_over(Rc::new(W2mReceiver::new(rings)));
     // A real SAL page: `rewind`/`checkpoint_reset` store through the base
     // pointer, so it must not be null.
     let sal = SharedRegion::new(SAL_SIZE).leak();
-    MasterDispatcher::new(
+    let disp = MasterDispatcher::new(
         worker_pids,
         catalog,
         0,
         SalWriter::new(sal, -1, SAL_SIZE, nw),
-        Rc::new(W2mReceiver::new(rings)),
+        Rc::new(reactor),
         m2w_efds,
-    )
+    );
+    (disp, writers)
 }

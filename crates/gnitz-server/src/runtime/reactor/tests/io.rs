@@ -10,8 +10,7 @@ use crate::runtime::test_support::try_poll_once;
 
 /// A reactor with no W2M rings and an inbound cap of `cap`.
 fn capped_reactor(cap: usize) -> Reactor {
-    let no_rings = Rc::new(W2mReceiver::new(vec![]));
-    Reactor::new(16, Limits { inbound_cap: cap, ..Limits::TEST }, no_rings).expect("reactor")
+    make_reactor_with(Limits { inbound_cap: cap, ..Limits::TEST })
 }
 
 /// A registered connection over one end of a fresh socketpair, and the other end.

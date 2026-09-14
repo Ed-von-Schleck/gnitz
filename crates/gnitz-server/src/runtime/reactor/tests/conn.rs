@@ -35,8 +35,24 @@ fn read_available(fd: &OwnedFd, cap: usize) -> Vec<u8> {
     buf
 }
 
+/// A fresh ring holding one frame whose error text is `pad` bytes, read back as a
+/// slot. The ring is leaked, so the slot outlives any test scope.
+fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
+    let ptr = unsafe { crate::runtime::w2m::fixtures::test_ring(256 * 1024) }.leak();
+    let error_msg = vec![0x42u8; pad];
+    let msg = crate::runtime::wire::WireMsg {
+        request_id: 100,
+        error_msg: &error_msg,
+        ..Default::default()
+    };
+    crate::runtime::w2m::W2mWriter::new(ptr).send_msg(1, &msg);
+    let receiver = W2mReceiver::new(vec![ptr]);
+    let slot = receiver.try_read_slot(0).expect("a frame");
+    (receiver, slot)
+}
+
 // ─────────────────────────────────────────────────────────────────
-// KIND_SEND CQE dispatch + SendFuture lifecycle.
+// KIND_OP CQE dispatch + a send op's lifecycle.
 //
 // Regression guards for:
 //   (a) partial-send handling in `send_owned` (OP_SEND on a stream
@@ -49,69 +65,53 @@ fn read_available(fd: &OwnedFd, cap: usize) -> Vec<u8> {
 #[test]
 fn send_cqe_wakes_its_waker_and_returns_the_body() {
     let r = make_reactor();
-    r.inner.sends.open(77, SendBody::Cipher(vec![0xAB; 16]));
-    let mut fut = std::pin::pin!(SendFuture {
-        send_id: 77,
-        fd: -1,
-        deadline: Instant::now() + Duration::from_secs(60),
-        evicted: false,
-        inner: Rc::clone(&r.inner),
-    });
+    r.inner.ops.open(77, Some(SendBody::Cipher(vec![0xAB; 16])));
+    let mut fut = std::pin::pin!(OpFuture { id: 77, inner: Rc::clone(&r.inner) });
     let waker = make_waker(11);
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
-    assert_eq!(
-        r.inner.deadlines.borrow().len(),
-        1,
-        "the pending send registers its deadline"
-    );
 
-    cqe(&r, KIND_SEND, 77, 16);
+    cqe(&r, KIND_OP, 77, 16);
     assert!(
         r.inner.run_queue.borrow().is_queued(11),
-        "KIND_SEND must wake the send future"
+        "KIND_OP must wake the op future"
     );
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready((rc, body)) => {
-            assert_eq!(rc, 16, "KIND_SEND must deliver the CQE rc verbatim");
-            assert_eq!(body.bytes(), &[0xAB; 16], "and hand the body back");
+            assert_eq!(rc, 16, "KIND_OP must deliver the CQE rc verbatim");
+            assert_eq!(
+                body.expect("a send carries its body").bytes(),
+                &[0xAB; 16],
+                "and hand the body back"
+            );
         }
         Poll::Pending => panic!("a completed send must resolve"),
     }
-    assert_eq!(r.inner.sends.len(), 0, "a resolved send must retire its slot");
-    assert!(r.inner.deadlines.borrow().is_empty(), "and its deadline");
+    assert_eq!(r.inner.ops.len(), 0, "a resolved send must retire its slot");
 }
 
 /// A dropped send keeps its body until the late CQE — a ring slot here, whose
 /// `release_cursor` shows when it drops.
 #[test]
 fn dropped_send_future_keeps_its_body_until_the_cqe() {
-    let (receiver, _region) = unsafe { make_scan_ring(1, 1) };
-    let slot = receiver.try_read_slot(0).expect("a frame");
+    let (receiver, slot) = ring_slot(0);
     let held = receiver.release_cursor(0);
 
     let r = make_reactor();
-    r.inner.sends.open(88, SendBody::Slot(slot));
+    r.inner.ops.open(88, Some(SendBody::Slot(slot)));
     {
-        let mut fut = Box::pin(SendFuture {
-            send_id: 88,
-            fd: -1,
-            deadline: Instant::now() + Duration::from_secs(60),
-            evicted: false,
-            inner: Rc::clone(&r.inner),
-        });
+        let mut fut = Box::pin(OpFuture { id: 88, inner: Rc::clone(&r.inner) });
         assert!(fut.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
     }
-    assert!(r.inner.sends.is_abandoned(88), "drop must abandon the slot");
-    assert!(r.inner.deadlines.borrow().is_empty(), "and remove its deadline");
+    assert!(r.inner.ops.is_abandoned(88), "drop must abandon the slot");
     assert_eq!(
         receiver.release_cursor(0),
         held,
         "the kernel may still read the body — it must outlive the future"
     );
 
-    cqe(&r, KIND_SEND, 88, 64);
-    assert_eq!(r.inner.sends.len(), 0, "the late CQE must retire the abandoned slot");
+    cqe(&r, KIND_OP, 88, 64);
+    assert_eq!(r.inner.ops.len(), 0, "the late CQE must retire the abandoned slot");
     assert!(receiver.release_cursor(0) > held, "and free the body");
 }
 
@@ -149,10 +149,10 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
     assert_eq!(partner.read(&mut buf).ok(), Some(0), "and closes with its last holder");
 }
 
-/// `close_conn` cancels an armed recv, even one not yet submitted, so a silent peer
+/// `close_conn` ends an armed recv, even one not yet submitted, so a silent peer
 /// cannot pin the connection.
 #[test]
-fn close_conn_cancels_an_armed_recv() {
+fn close_conn_ends_an_armed_recv() {
     let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
@@ -160,11 +160,11 @@ fn close_conn_cancels_an_armed_recv() {
     r.register_conn(&conn, None);
     r.close_conn(&conn);
 
-    // The peer neither writes nor closes: only the cancellation can complete
-    // the recv.
+    // The peer neither writes nor closes: only the shutdown can complete the
+    // recv.
     assert!(
         poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
-        "close_conn must cancel the armed recv; without it the entry lives until the peer acts"
+        "close_conn must end the armed recv; without it the entry lives until the peer acts"
     );
     drop(partner);
 }
@@ -400,13 +400,13 @@ fn corked_replies_leave_as_one_send() {
     drop(receiver);
 }
 
-/// A `send_slot` issued with bytes corked puts the corked bytes on the wire
-/// first: a ring-slot forward may not overtake a reply already written.
+/// A slot too large to cork, sent with bytes corked, puts the corked bytes on the
+/// wire first: a zero-copy forward may not overtake a reply already written.
 #[test]
 fn a_slot_forward_cannot_overtake_a_corked_reply() {
-    let (receiver_w2m, _region) = unsafe { make_scan_ring(1, 1) };
-    let slot = receiver_w2m.try_read_slot(0).expect("a frame");
+    let (_ring, slot) = ring_slot(COALESCE_MAX_BYTES);
     let slot_bytes = slot.frame_bytes().to_vec();
+    assert!(slot_bytes.len() > COALESCE_MAX_BYTES, "the slot goes out alone");
 
     let (r, sender, receiver) = egress_pair(Limits::TEST, None);
     let peer = Peer::unix(sender, Rc::clone(&r));
@@ -415,13 +415,43 @@ fn a_slot_forward_cannot_overtake_a_corked_reply() {
     let c = corked.clone();
     r.block_on(async move {
         peer.cork(&c);
-        assert!(peer.send_slot(slot).await > 0, "the slot forward must send");
+        assert!(peer.send(slot).await > 0, "the slot forward must send");
     });
 
-    let seen = read_available(&receiver, 64 * 1024);
+    let seen = read_available(&receiver, 256 * 1024);
     let mut expected = corked;
     expected.extend_from_slice(&slot_bytes);
     assert_eq!(seen, expected, "the corked bytes precede the forwarded slot");
+    drop(receiver);
+}
+
+/// A small slot sent with bytes corked joins them: nothing reaches the wire until
+/// a flush, and that one flush carries both.
+#[test]
+fn a_small_slot_is_corked_behind_corked_bytes() {
+    let (_ring, slot) = ring_slot(64);
+    let slot_bytes = slot.frame_bytes().to_vec();
+
+    let (r, sender, receiver) = egress_pair(Limits::TEST, None);
+    let receiver = Rc::new(receiver);
+    let peer = Peer::unix(sender, Rc::clone(&r));
+    let corked = vec![0x5Au8; 128];
+
+    let (c, rx) = (corked.clone(), Rc::clone(&receiver));
+    r.block_on(async move {
+        peer.cork(&c);
+        assert_eq!(peer.send(slot).await, 0, "a small slot is corked, not sent");
+        assert!(read_available(&rx, 4096).is_empty(), "nothing is on the wire yet");
+        assert!(peer.flush_egress().await > 0, "the flush must send");
+    });
+
+    let mut expected = corked;
+    expected.extend_from_slice(&slot_bytes);
+    assert_eq!(
+        read_available(&receiver, 4096),
+        expected,
+        "one flush carries both, in order"
+    );
     drop(receiver);
 }
 

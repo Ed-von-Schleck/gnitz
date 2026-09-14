@@ -309,9 +309,7 @@ async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
         }
         // Coalesce a burst of notifications: park on the next, then drain
         // any that piled up so we make exactly one more flush pass, not N.
-        if rx.recv().await.is_none() {
-            return;
-        }
+        rx.recv().await;
         while rx.try_recv().is_some() {}
     }
 }

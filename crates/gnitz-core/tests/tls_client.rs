@@ -451,13 +451,12 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
     // deadline can fire. Holding send_mutex across an unbounded send would
     // wedge the connection forever; the deadline's shutdown must evict
     // instead. This exercises the one guarded send primitive every TLS
-    // send shares (`Peer::send` → `send_bytes` → `send_owned`): the
-    // send_slot, send_buffer, and HELLO-ACK paths differ only in the byte
+    // send shares (`Peer::send` → `send_bytes` → `send_owned`): a forwarded
+    // ring slot, a pooled reply, and the HELLO-ACK differ only in the byte
     // source, so the eviction proven here is the eviction for all of them.
-    // (A separate send_buffer stall scenario is not constructible
-    // deterministically: every send_buffer reply is a bounded control /
-    // schema frame that the kernel socket buffer absorbs without parking
-    // the send.)
+    // (A separate pooled-reply stall scenario is not constructible
+    // deterministically: every such reply is a bounded control / schema
+    // frame that the kernel socket buffer absorbs without parking the send.)
     let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_CLIENT_SEND_TIMEOUT_MS", "1500")]);
     let target = srv.tls_target();
     with_watchdog(120, move || {

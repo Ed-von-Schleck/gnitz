@@ -77,40 +77,21 @@ impl IoUringRing {
         self.push(opcode::FutexWaitV::new(futexv, nr).build().user_data(user_data));
     }
 
-    /// Submit an `AsyncCancel` op targeting an in-flight SQE by its
-    /// `target_user_data`. The cancelled SQE's CQE arrives first (with
-    /// `res = -ECANCELED`), the AsyncCancel's own CQE after it.
-    pub(super) fn prep_async_cancel(&mut self, target_user_data: u64, user_data: u64) {
-        self.push(opcode::AsyncCancel::new(target_user_data).build().user_data(user_data));
-    }
-
-    /// Eagerly flush pending SQEs to the kernel (no wait). On failure the
-    /// SQEs stay queued and go out with the next tick's submit — log and
-    /// continue; `what` names the operation for the log line.
-    pub(super) fn flush_sqes(&mut self, what: &str) {
-        if let Err(e) = self.submit() {
-            gnitz_error!(
-                "reactor: {} SQE flush failed (errno={}); SQE queued — will submit on next tick",
-                what,
-                e,
-            );
-        }
-    }
-
-    /// Submit pending SQEs without waiting. No syscall when the SQ is empty.
-    pub(super) fn submit(&mut self) -> Result<i32, i32> {
+    /// Submit pending SQEs without waiting. No syscall when the SQ is empty. On
+    /// failure the SQEs stay queued for the next submit.
+    pub(super) fn submit(&mut self) -> Result<(), i32> {
         if self.ring.submission().is_empty() {
-            return Ok(0);
+            return Ok(());
         }
         self.ring
             .submit()
-            .map(|n| n as i32)
+            .map(|_| ())
             .map_err(|e| e.raw_os_error().unwrap_or(-1))
     }
 
     /// Submit pending SQEs and wait for one CQE, for at most `timeout` when one
-    /// is given. An expired timeout or a signal returns `Ok(0)`.
-    pub(super) fn wait(&mut self, timeout: Option<Duration>) -> Result<i32, i32> {
+    /// is given. An expired timeout or a signal is not an error.
+    pub(super) fn wait(&mut self, timeout: Option<Duration>) -> Result<(), i32> {
         let rc = match timeout {
             None => self.ring.submitter().submit_and_wait(1),
             Some(d) => {
@@ -120,8 +101,8 @@ impl IoUringRing {
             }
         };
         match rc {
-            Ok(n) => Ok(n as i32),
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => Ok(0),
+            Ok(_) => Ok(()),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => Ok(()),
             Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
         }
     }

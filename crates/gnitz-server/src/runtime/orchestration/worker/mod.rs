@@ -92,8 +92,8 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         // An inline catalog mutation races the in-flight evaluation.
         SalMessageKind::DdlSync => InEval::DeferPreAck,
         // Deferring deadlocks: `flush_round` holds `sal_writer_excl` across the
-        // ACK wait, and `relay_loop` needs it to write the relay this worker is
-        // parked on — so a flush that waits for the relay waits forever.
+        // ACK wait, and the tick's relay needs it to write the relay this worker
+        // is parked on — so a flush that waits for the relay waits forever.
         SalMessageKind::Flush | SalMessageKind::FlushEph => InEval::Inline,
         // Correct to defer (`commit_pushes` drops its lock before the ACK wait),
         // but it would park the ingest ACK behind an exchange round-trip.
@@ -339,10 +339,10 @@ impl WorkerProcess {
     // ── Main event loop ────────────────────────────────────────────────
 
     /// Never returns normally. A boot that failed does not reach here at all:
-    /// the fork child reports it on the W2M ring and exits.
-    pub fn run(&mut self) -> i32 {
-        // Startup ACK is unsolicited; request_id=0 is the reserved untagged slot.
-        self.send_ack(0, 0);
+    /// the fork child reports it on the W2M ring and exits. The ready ACK answers
+    /// `ready_request_id`, which the master leases before it collects.
+    pub fn run(&mut self, ready_request_id: u64) -> i32 {
+        self.send_ack(0, ready_request_id);
 
         loop {
             // Skip the SAL wait while a chunked reply train is in progress: the

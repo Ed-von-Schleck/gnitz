@@ -18,7 +18,7 @@
 //!   col  9: seek_pk_extra BLOB   (nullable) -- PK region bytes 16.. for a wide PK
 //!
 //! Reserved request_id values:
-//!   0          -- "unsolicited"/"untagged" (pre-reactor reply path)
+//!   0          -- untagged: a broadcast whose replies no one awaits
 //!   u64::MAX   -- unused; master->worker only, a reply's ring prefix being 32-bit
 //!   other      -- master-allocated, monotonic per request
 

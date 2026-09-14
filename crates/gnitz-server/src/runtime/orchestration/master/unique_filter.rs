@@ -238,11 +238,7 @@ impl MasterDispatcher {
 /// of the committed table, feeding each worker's reply frames straight into
 /// the filters. Nothing is concatenated master-side: on a table of tens of
 /// millions of rows a merged `Batch` would peak at the whole scan size.
-pub(super) async fn ensure_unique_filters_warm(
-    disp: &MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
-    table_id: i64,
-) -> Result<(), WorkerFault> {
+pub(super) async fn ensure_unique_filters_warm(disp: &MasterDispatcher, table_id: i64) -> Result<(), WorkerFault> {
     let (missing, mut guard): (Vec<UniqueIndexDesc>, WarmupGuard) = {
         let mut filters = disp.unique_filters.borrow_mut();
         // Tested before it is built: the steady state is that every filter is
@@ -285,7 +281,7 @@ pub(super) async fn ensure_unique_filters_warm(
     // stream multi-frame trains, and on an early error return (or a
     // mid-scan cancellation) the lease drop discards every undrained
     // frame at the ring boundary.
-    let (slots, scan) = dispatch_scan_fanout(disp, reactor, unicast, |targets| {
+    let (slots, scan) = dispatch_scan_fanout(disp, unicast, |targets| {
         disp.write_group(&DirectGroup {
             template: wire::WireMsg {
                 target_id: table_id as u64,

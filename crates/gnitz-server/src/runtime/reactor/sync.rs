@@ -16,8 +16,8 @@ use std::task::{Context, Poll, Waker};
 // oneshot
 // ---------------------------------------------------------------------------
 //
-// Single-threaded, cancellable: the committer's per-commit result back to the
-// handler that pushed, and the DDL window's release, which is sender-drop alone.
+// Single-threaded. A receiver resolves only on a send: a sender dropped unsent
+// leaves it pending forever.
 
 pub mod oneshot {
     use super::*;
@@ -25,7 +25,6 @@ pub mod oneshot {
     struct State<T> {
         value: Option<T>,
         waker: Option<Waker>,
-        sender_alive: bool,
     }
 
     pub struct Sender<T> {
@@ -36,11 +35,7 @@ pub mod oneshot {
     }
 
     pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-        let s = Rc::new(RefCell::new(State {
-            value: None,
-            waker: None,
-            sender_alive: true,
-        }));
+        let s = Rc::new(RefCell::new(State { value: None, waker: None }));
         (Sender { inner: Rc::clone(&s) }, Receiver { inner: s })
     }
 
@@ -48,37 +43,25 @@ pub mod oneshot {
         /// Send the result. A cancelled receiver is not an error: the value is
         /// parked in state nothing will read, and dropped with the `Rc`.
         pub fn send(self, v: T) {
-            let mut s = self.inner.borrow_mut();
-            s.value = Some(v);
-            if let Some(w) = s.waker.take() {
-                w.wake();
-            }
-        }
-    }
-
-    impl<T> Drop for Sender<T> {
-        fn drop(&mut self) {
-            let mut s = self.inner.borrow_mut();
-            s.sender_alive = false;
-            if let Some(w) = s.waker.take() {
+            let waker = {
+                let mut s = self.inner.borrow_mut();
+                s.value = Some(v);
+                s.waker.take()
+            };
+            if let Some(w) = waker {
                 w.wake();
             }
         }
     }
 
     impl<T> Future for Receiver<T> {
-        /// `None` once the sender is gone without having sent — which the DDL
-        /// tick gate uses as its release signal rather than an explicit value.
-        type Output = Option<T>;
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        type Output = T;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
             let mut s = self.inner.borrow_mut();
             if let Some(v) = s.value.take() {
-                return Poll::Ready(Some(v));
+                return Poll::Ready(v);
             }
-            if !s.sender_alive {
-                return Poll::Ready(None);
-            }
-            s.waker = Some(cx.waker().clone());
+            crate::runtime::reactor::park_waker(&mut s.waker, cx.waker());
             Poll::Pending
         }
     }
@@ -88,12 +71,8 @@ pub mod oneshot {
 // chan (unbounded)
 // ---------------------------------------------------------------------------
 //
-// The committer's and the tick loop's request channel. `chan`, not `spsc`:
-// many tasks send, reaching the one `Sender` through a shared `Rc<Shared>`.
-// It is that one — `Sender` is not cloneable — so its drop closes the queue and
-// the receiver's next `recv` resolves to `None`. Neither loop exits that way in
-// practice: `Shared` owns the sender and each loop's task holds an `Rc<Shared>`
-// for its whole life, so both exit by reactor shutdown dropping the task.
+// Unbounded, with every sender reaching the one `Sender` through a shared
+// owner. The stream has no end: a receiving task ends by being dropped.
 
 pub mod chan {
     use super::*;
@@ -117,14 +96,8 @@ pub mod chan {
         }
     }
 
-    impl<T> Drop for Sender<T> {
-        fn drop(&mut self) {
-            self.inner.borrow_mut().close();
-        }
-    }
-
     impl<T> Receiver<T> {
-        pub async fn recv(&mut self) -> Option<T> {
+        pub async fn recv(&mut self) -> T {
             std::future::poll_fn(|cx| self.inner.borrow_mut().poll(cx)).await
         }
 
@@ -146,7 +119,7 @@ pub mod chan {
 /// protects lives outside. Exposing no shared mode is the point — the SAL
 /// writer and the TLS send path would both compile, and both break, given one.
 #[derive(Default)]
-pub struct AsyncMutex(Rc<AsyncRwLock>);
+pub struct AsyncMutex(AsyncRwLock);
 
 impl AsyncMutex {
     pub fn lock(&self) -> WriteFuture {
@@ -191,18 +164,18 @@ impl RwLockInner {
     }
 }
 
-#[derive(Default)]
-pub struct AsyncRwLock {
-    inner: RefCell<RwLockInner>,
-}
+/// A handle on one lock; clones share it. Every future and guard holds a clone,
+/// so none borrows the handle it came from.
+#[derive(Clone, Default)]
+pub struct AsyncRwLock(Rc<RefCell<RwLockInner>>);
 
 impl AsyncRwLock {
-    pub fn read(self: &Rc<Self>) -> ReadFuture {
-        ReadFuture { lock: Rc::clone(self) }
+    pub fn read(&self) -> ReadFuture {
+        ReadFuture { lock: self.clone() }
     }
 
-    pub fn write(self: &Rc<Self>) -> WriteFuture {
-        WriteFuture { lock: Rc::clone(self), parked: false }
+    pub fn write(&self) -> WriteFuture {
+        WriteFuture { lock: self.clone(), parked: false }
     }
 
     /// Wake every future the current state now admits — writers first, readers
@@ -217,7 +190,7 @@ impl AsyncRwLock {
         // Scoped so the borrow cannot span the wakes: a wake re-enters the run
         // queue and can drive a poll that borrows this state again.
         let wakers = {
-            let mut s = self.inner.borrow_mut();
+            let mut s = self.0.borrow_mut();
             if s.write_ok() && s.writers_waiting > 0 {
                 std::mem::take(&mut s.write_waiters)
             } else if s.read_ok() {
@@ -232,12 +205,12 @@ impl AsyncRwLock {
     }
 
     fn release_read(&self) {
-        self.inner.borrow_mut().readers -= 1;
+        self.0.borrow_mut().readers -= 1;
         self.wake_next();
     }
 
     fn release_write(&self) {
-        self.inner.borrow_mut().has_writer = false;
+        self.0.borrow_mut().has_writer = false;
         self.wake_next();
     }
 
@@ -245,22 +218,22 @@ impl AsyncRwLock {
     /// part of it — they retain stale wakers by design; see their own doc.
     #[cfg(test)]
     pub(super) fn is_quiescent(&self) -> bool {
-        let s = self.inner.borrow();
+        let s = self.0.borrow();
         s.readers == 0 && !s.has_writer && s.writers_waiting == 0
     }
 }
 
 pub struct ReadFuture {
-    lock: Rc<AsyncRwLock>,
+    lock: AsyncRwLock,
 }
 
 impl Future for ReadFuture {
     type Output = ReadGuard;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReadGuard> {
-        let mut s = self.lock.inner.borrow_mut();
+        let mut s = self.lock.0.borrow_mut();
         if s.read_ok() {
             s.readers += 1;
-            return Poll::Ready(ReadGuard { lock: Rc::clone(&self.lock) });
+            return Poll::Ready(ReadGuard { lock: self.lock.clone() });
         }
         s.read_waiters.push_back(cx.waker().clone());
         Poll::Pending
@@ -268,7 +241,7 @@ impl Future for ReadFuture {
 }
 
 pub struct ReadGuard {
-    lock: Rc<AsyncRwLock>,
+    lock: AsyncRwLock,
 }
 
 impl Drop for ReadGuard {
@@ -278,7 +251,7 @@ impl Drop for ReadGuard {
 }
 
 pub struct WriteFuture {
-    lock: Rc<AsyncRwLock>,
+    lock: AsyncRwLock,
     /// Whether this future is counted in `writers_waiting`. Re-polling a parked
     /// future must not count it twice, and a `select2` re-polls a parked future
     /// on every wake.
@@ -288,17 +261,17 @@ pub struct WriteFuture {
 impl Future for WriteFuture {
     type Output = WriteGuard;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
-        // Split borrow rather than an `Rc` clone: `parked` is written while
-        // `lock.inner` is borrowed, and the two fields are disjoint.
+        // Split borrow: `parked` is written while `lock`'s state is borrowed, and
+        // the two fields are disjoint.
         let Self { lock, parked } = self.get_mut();
-        let mut s = lock.inner.borrow_mut();
+        let mut s = lock.0.borrow_mut();
         if s.write_ok() {
             s.has_writer = true;
             if *parked {
                 s.writers_waiting -= 1;
                 *parked = false;
             }
-            return Poll::Ready(WriteGuard { lock: Rc::clone(lock) });
+            return Poll::Ready(WriteGuard { lock: lock.clone() });
         }
         if !*parked {
             s.writers_waiting += 1;
@@ -314,13 +287,13 @@ impl Drop for WriteFuture {
         if !self.parked {
             return;
         }
-        self.lock.inner.borrow_mut().writers_waiting -= 1;
+        self.lock.0.borrow_mut().writers_waiting -= 1;
         self.lock.wake_next();
     }
 }
 
 pub struct WriteGuard {
-    lock: Rc<AsyncRwLock>,
+    lock: AsyncRwLock,
 }
 
 impl Drop for WriteGuard {

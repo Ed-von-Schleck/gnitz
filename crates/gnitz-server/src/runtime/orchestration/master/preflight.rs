@@ -420,7 +420,6 @@ fn enc_key(schema: &SchemaDescriptor, v: u128, src_type: u8) -> PkBuf {
 /// FIFO flag is for.
 async fn execute_probe_burst(
     disp: &MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
     checks: &[PipelinedCheck],
     mut sink: impl FnMut(usize, &MemBatch<'_>) -> Result<(), WorkerFault>,
 ) -> Result<(), WorkerFault> {
@@ -431,7 +430,7 @@ async fn execute_probe_burst(
     // holds a slice of the key list, a broadcast one because index entries are
     // partitioned independently of the probe key.
     let fanouts = vec![Fanout::Broadcast; checks.len()];
-    let (dispatches, _) = dispatch_scan_multi_fanout(disp, reactor, &fanouts, |i, targets, wire_flags, _| {
+    let (dispatches, _) = dispatch_scan_multi_fanout(disp, &fanouts, |i, targets, wire_flags, _| {
         let check = &checks[i];
         let g = DirectGroup {
             template: check.schema.frame(wire::WireMsg {
@@ -479,11 +478,7 @@ impl MasterDispatcher {
     /// and F2 takes a third, because its probed values are the gathers' answer.
     /// Merging the probes does not merge the verdicts — those still run in the
     /// order below, which is the order violations are reported in.
-    pub async fn validate_txn_distributed(
-        &self,
-        reactor: &crate::runtime::reactor::Reactor,
-        families: &[TxnFamily],
-    ) -> Result<(), WorkerFault> {
+    pub async fn validate_txn_distributed(&self, families: &[TxnFamily]) -> Result<(), WorkerFault> {
         // No family whose write reads committed state ⇒ every rule below would
         // find nothing to check, so the bundle (an O(rows) fold) is not built.
         let cat = self.cat();
@@ -505,7 +500,7 @@ impl MasterDispatcher {
                 .is_some_and(Relation::has_unique_index)
                 && b.surviving(t.tid).next().is_some()
             {
-                ensure_unique_filters_warm(self, reactor, t.tid).await?;
+                ensure_unique_filters_warm(self, t.tid).await?;
             }
         }
 
@@ -530,7 +525,7 @@ impl MasterDispatcher {
 
         // U-PK's answer lands on the fold; U-SEC's and F1's are found sets.
         let mut found: Vec<FxHashSet<PkBuf>> = (0..checks.len()).map(|_| FxHashSet::default()).collect();
-        execute_probe_burst(self, reactor, &checks, |i, rows| {
+        execute_probe_burst(self, &checks, |i, rows| {
             if i < n_pk {
                 let merged = b.fold_mut(pk_tids[i]);
                 for j in 0..rows.len() {
@@ -554,13 +549,13 @@ impl MasterDispatcher {
         pk_verdict(self, &b)?;
 
         // ── Burst 2: the parent gathers, keyed by U-PK's answer ──────────
-        let deltas = resolve_parent_deltas(self, reactor, &b, &constraints, &children).await?;
+        let deltas = resolve_parent_deltas(self, &b, &constraints, &children).await?;
 
         unique_verdict(self, &b, &uniq_plans, &found[n_pk..n_uniq])?;
         fk_existence_verdict(self, &f1_plans, &checks[n_uniq..], &found[n_uniq..], &deltas)?;
 
         // ── Burst 3: F2, keyed by the deltas ─────────────────────────────
-        txn_check_fk_restrict(self, reactor, &b, &children, &deltas).await
+        txn_check_fk_restrict(self, &b, &children, &deltas).await
     }
 }
 
@@ -918,7 +913,6 @@ fn fk_existence_verdict(
 /// only in the bytes that come back.
 async fn resolve_parent_deltas(
     disp: &MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
     b: &TxnBundle<'_>,
     constraints: &[FkEdge],
     children: &[FkEdge],
@@ -988,7 +982,7 @@ async fn resolve_parent_deltas(
     // `pk → promoted index key`, absent when the committed row is absent or
     // holds NULL there — a NULL referenced value is unindexed either way.
     let mut gathered: Vec<FxHashMap<PkBuf, u128>> = (0..checks.len()).map(|_| FxHashMap::default()).collect();
-    execute_probe_burst(disp, reactor, &checks, |i, rows| {
+    execute_probe_burst(disp, &checks, |i, rows| {
         let (slot, size, type_code) = locators[i];
         // Invariant across a frame's rows, where `ColumnLocator`'s own readers
         // re-resolve the window per row through `get_col_ptr`.
@@ -1100,7 +1094,6 @@ struct RestrictPlan {
 /// before-image of the FK value it removes.
 async fn txn_check_fk_restrict(
     disp: &MasterDispatcher,
-    reactor: &crate::runtime::reactor::Reactor,
     b: &TxnBundle<'_>,
     children: &[FkEdge],
     deltas: &ParentDeltas,
@@ -1163,7 +1156,7 @@ async fn txn_check_fk_restrict(
     // A streaming fold: the first non-exempt holder aborts the drain, whose
     // scan lease drop discards every train still in flight.
     let mut hspan = PkBuf::zeroed(0);
-    execute_probe_burst(disp, reactor, &checks, |i, rows| {
+    execute_probe_burst(disp, &checks, |i, rows| {
         let plan = &plans[i];
         let retired = &deltas[&delta_key(&plan.edge)].0;
         for j in 0..rows.len() {

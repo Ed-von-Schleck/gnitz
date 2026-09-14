@@ -11,10 +11,8 @@
 //! terminal one — [`train_has_more`], the engine's one train-end rule — reports
 //! the worker.
 //!
-//! Two drivers accumulate rounds, which is why this sits with them rather than
-//! in the reactor that delivers the frames: `relay_loop` for the steady state,
-//! and `MasterDispatcher::collect_acks_and_relay` for a boot backfill, which
-//! runs before a reactor exists.
+//! Rounds are orchestration policy, which is why this sits here rather than in
+//! the reactor that delivers the frames.
 
 use rustc_hash::FxHashMap;
 
@@ -26,9 +24,8 @@ use gnitz_wire::{low_bits_mask, MAX_WORKERS};
 
 /// Per-view accumulator for exchange frames, keyed by `(view_id, source_id)`.
 ///
-/// A worker dying mid-round leaves its entries here and the tick's `acks`
-/// parked forever — survivable only because `watchdog` shuts the reactor down
-/// on any worker crash.
+/// A worker dying mid-round leaves its entries here and a steady tick's wait
+/// parked forever unless something probes for the death.
 pub struct ExchangeAccumulator {
     rounds: FxHashMap<(i64, i64), ExchangeRound>,
     nw: usize,
@@ -68,8 +65,7 @@ pub struct PendingRelay {
     pub schema: SchemaDescriptor,
     pub source_id: i64,
     /// True iff every worker reported a backfill pad for this round (the final,
-    /// all-pad round). The boot backfill relay (`collect_acks_and_relay`) reads
-    /// this to decide the stop signal; the steady-state relay path ignores it.
+    /// all-pad round): a backfill's stop signal. A tick round never pads.
     pub all_pad: bool,
 }
 
