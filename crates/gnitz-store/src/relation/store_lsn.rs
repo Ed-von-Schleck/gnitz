@@ -222,12 +222,8 @@ impl RelationRegistry {
             .collect()
     }
 
-    /// Maximum `current_lsn` across all tables — system and user. The
-    /// executor seeds its zone-LSN allocator from this at boot and passes it
-    /// as the reservation floor per DDL, so every allocated zone LSN is
-    /// strictly greater than each table's current counter: no recovery
-    /// watermark a checkpoint persisted can cover a committed-but-unflushed
-    /// zone, and a failed zone's pinned LSN is never reused.
+    /// Maximum `current_lsn` across every store this process holds; a detached store
+    /// counts as `0`.
     pub fn max_current_lsn(&self) -> u64 {
         self.all_store_lsns().map(|(_, _, lsn)| lsn).max().unwrap_or(0)
     }

@@ -1,5 +1,5 @@
-//! The reactor's futures: timers, fsync, the scan-frame stream and its lease,
-//! and the drop hygiene each one owes its park slot or queue.
+//! The reactor's futures: timers, fsync, a train lease's frame stream, and the
+//! park slot every CQE-driven future waits in.
 
 use std::time::Duration;
 
@@ -7,24 +7,16 @@ use super::super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
 
-/// A timer fires no earlier than its deadline, and returns its `Timespec` to
-/// the pool either way — which is what keeps the per-egress-frame timer
-/// allocation-free after the first one. No upper bound: "fired late" is a
-/// statement about the machine, not about the reactor.
+/// A timer fires no earlier than its deadline, and leaves no deadline behind.
+/// No upper bound: "fired late" is a statement about the machine, not about the
+/// reactor.
 #[test]
-fn a_timer_fires_after_its_deadline_and_recycles_its_timespec() {
+fn a_timer_fires_after_its_deadline() {
     let r = make_reactor();
-    assert_eq!(r.inner.spec_pool.borrow().len(), 0);
-    for _ in 0..2 {
-        let start = Instant::now();
-        r.block_on(r.timer(start + Duration::from_millis(5)));
-        assert!(start.elapsed() >= Duration::from_millis(5), "timer fired early");
-        assert_eq!(
-            r.inner.spec_pool.borrow().len(),
-            1,
-            "the box is recycled, then reused rather than re-allocated"
-        );
-    }
+    let start = Instant::now();
+    r.block_on(r.timer(start + Duration::from_millis(5)));
+    assert!(start.elapsed() >= Duration::from_millis(5), "timer fired early");
+    assert!(r.inner.deadlines.borrow().is_empty());
 }
 
 /// A timer in the past resolves on the very first poll instead of
@@ -36,12 +28,31 @@ fn timer_in_the_past_resolves_immediately() {
         try_poll_once(r.timer(Instant::now() - Duration::from_secs(1))).is_some(),
         "a past deadline must resolve on the first poll"
     );
-    assert_eq!(r.inner.timers.len(), 0, "and submit no SQE at all");
+    assert!(r.inner.deadlines.borrow().is_empty(), "and register no deadline");
+}
+
+/// A dropped timer removes its deadline, so it neither wakes its waker nor
+/// bounds a later sleep.
+#[test]
+fn a_dropped_timer_leaves_no_deadline() {
+    let r = make_reactor();
+    let waker = make_waker(999);
+    let mut tf = Box::pin(r.timer(Instant::now() + Duration::from_millis(1)));
+    assert!(tf.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+    assert_eq!(r.inner.deadlines.borrow().len(), 1, "the poll registers the deadline");
+    drop(tf);
+    assert!(r.inner.deadlines.borrow().is_empty(), "the drop removes it");
+
+    std::thread::sleep(Duration::from_millis(2));
+    r.tick(false);
+    assert!(
+        !r.inner.run_queue.borrow().is_queued(999),
+        "a dropped timer must not wake its original waker"
+    );
 }
 
 /// Submitting fdatasync on an fd that is not in the process's fd
 /// table returns a negative rc (typically -EBADF) from the kernel.
-/// Direct replacement for the deleted fork-based ipc test.
 ///
 /// Uses `i32::MAX` rather than `close(real_fd); submit(real_fd)` so
 /// the test is race-free under the parallel test runner — a freshly
@@ -86,294 +97,140 @@ fn fsync_submit_flushes_sqe_before_returning() {
     );
 }
 
-/// A dropped timer abandons its park slot, so the `-ECANCELED` CQE retires the
-/// entry — recycling its `Timespec` — without waking the waker that registered.
+/// A train route is a queue, not a slot: more frames than any worker count all
+/// wait in it, and come out in arrival order.
 #[test]
-fn dropped_timer_is_cancelled_without_waking_its_waker() {
-    let r = make_reactor();
-    let waker = make_waker(999);
-    let mut tf = Box::pin(r.timer(Instant::now() + Duration::from_secs(60)));
-    let _ = tf.as_mut().poll(&mut Context::from_waker(&waker));
-    assert_eq!(r.inner.timers.len(), 1, "the first poll submits the Timeout SQE");
-    drop(tf);
-
-    // A 60 s deadline cannot fire on its own, so only the cancel can retire it.
-    assert!(
-        poll_until(&r, 10_000, || r.inner.spec_pool.borrow().len() == 1),
-        "the cancelled timer's Timespec must come back to the pool"
-    );
-    assert!(
-        !r.inner.run_queue.borrow().is_queued(999),
-        "cancelled timer must not wake its original waker"
-    );
-}
-
-#[test]
-fn scan_queue_grows_past_worker_count() {
-    let r = make_reactor();
-    let req_id = r.alloc_scan_request_id() as u32;
-    const N: usize = 100; // > 64
-    let (recv, _region) = unsafe { make_scan_ring(req_id, N) };
-    let _lease = r.scan_lease(&[req_id]);
-
-    for _ in 0..N {
-        let s = recv.try_read_slot(0).expect("frame");
-        r.route_scan_slot(s);
+fn a_train_route_queues_past_worker_count_in_arrival_order() {
+    const N: usize = 100; // > MAX_WORKERS
+    let (r, writers) = reactor_with_rings(1);
+    let lease = r.lease_train(1);
+    for i in 0..N {
+        let msg = crate::runtime::wire::WireMsg {
+            request_id: 100 + i as u64,
+            ..Default::default()
+        };
+        writers[0].send_msg(lease.id(0), &msg);
     }
-    assert_eq!(
-        r.inner.scans.borrow().get(&req_id).map(|s| s.len()),
-        Some(N),
-        "all {N} frames must be queued — none dropped or overwritten"
-    );
+    r.drain_all_w2m();
 
     for i in 0..N {
-        let f = try_poll_once(r.await_scan_slot(req_id)).expect("a routed slot resolves on the first poll");
+        let f = try_poll_once(lease.next_frame(0)).expect("a routed frame resolves on the first poll");
         let rid = gnitz_wire::control::peek_control_block_ipc(f.bytes())
             .unwrap()
             .request_id;
         assert_eq!(rid, 100 + i as u64, "frame {i} delivered in arrival order");
-        drop(f);
     }
-    assert!(
-        r.inner.scans.borrow().values().all(|s| s.len() == 0),
-        "queue emptied after drain"
-    );
-
-    drop(_lease);
-    drop(recv);
+    assert!(try_poll_once(lease.next_frame(0)).is_none(), "the queue is drained");
 }
 
-/// Dropping the `ScanLease` purges the parked queue (dropping each queued
-/// `W2mSlot` advances `release_cursor`) and deregisters the active scan.
+/// `first_frames` hands out nothing until every id has a frame, so no frame is
+/// taken by a poll that then parks.
 #[test]
-fn scan_lease_drop_frees_queued_slots() {
-    let r = make_reactor();
-    let req_id = r.alloc_scan_request_id() as u32;
-    let (recv, _region) = unsafe { make_scan_ring(req_id, 1) };
-    let lease = r.scan_lease(&[req_id]);
+fn first_frames_waits_for_every_id_before_taking_any() {
+    let (r, writers) = reactor_with_rings(2);
+    let lease = r.lease_train(2);
+    let mut fut = std::pin::pin!(lease.first_frames());
+    let mut cx = Context::from_waker(Waker::noop());
 
-    let s0 = recv.try_read_slot(0).expect("frame 0");
-    r.route_scan_slot(s0); // queued (active)
-    assert!(r.inner.scans.borrow().contains_key(&req_id));
-
-    let cc_before = recv.release_cursor(0);
-    drop(lease); // purge parked queue → drop queued slot → advance release_cursor
+    writers[0].send_msg(lease.id(0), &Default::default());
+    r.drain_all_w2m();
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(
-        r.inner.scans.borrow().values().all(|s| s.len() == 0),
-        "lease drop purges parked queue"
+        matches!(&r.inner.routes.borrow()[&(lease.id(0) as u32)], Route::Train(q) if q.len() == 1),
+        "the pending poll left id 0's frame queued"
     );
-    assert!(
-        r.inner.scans.borrow().values().all(|s| !s.has_waiter()),
-        "lease drop purges wakers"
-    );
-    assert!(r.inner.scans.borrow().is_empty(), "lease drop deregisters active scan");
-    let cc_after = recv.release_cursor(0);
-    assert!(cc_after > cc_before, "dropped queued slot must advance release_cursor");
 
-    drop(recv);
+    writers[1].send_msg(lease.id(1), &Default::default());
+    r.drain_all_w2m();
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(slots) => assert_eq!(slots.len(), 2),
+        Poll::Pending => panic!("both ids have a frame"),
+    }
 }
 
-/// Failure mode 1: a frame whose scan has no live lease is discarded
-/// (freeing ring space), not parked — so the still-streaming worker never
-/// wedges on a full ring.
+/// Dropping a train lease releases the frames it still holds, and a frame for
+/// its id arriving afterwards is released at the ring.
 #[test]
-fn abandoned_scan_frame_is_discarded_not_parked() {
-    let r = make_reactor();
-    let req_id = r.alloc_scan_request_id() as u32;
-    let (recv, _region) = unsafe { make_scan_ring(req_id, 1) };
+fn a_dropped_lease_releases_held_and_late_frames() {
+    let (r, writers) = reactor_with_rings(1);
+    let lease = r.lease_train(1);
+    let id = lease.id(0);
+    writers[0].send_msg(id, &Default::default());
+    r.drain_all_w2m();
 
-    // No lease held: route_scan_slot must drop the slot, not park it.
-    let s0 = recv.try_read_slot(0).expect("frame 0");
-    let cc_before = recv.release_cursor(0);
-    r.route_scan_slot(s0); // dropped here (inactive)
-    assert!(
-        r.inner.scans.borrow().values().all(|s| s.len() == 0),
-        "abandoned-scan frame must be discarded, not parked"
-    );
-    let cc_after = recv.release_cursor(0);
-    assert!(
-        cc_after > cc_before,
-        "discarded slot must advance release_cursor (ring freed)"
-    );
+    let held = r.inner.w2m.release_cursor(0);
+    drop(lease);
+    assert!(r.inner.routes.borrow().is_empty());
+    assert!(r.inner.w2m.release_cursor(0) > held, "the held frame is released");
 
-    drop(recv);
+    writers[0].send_msg(id, &Default::default());
+    let late = r.inner.w2m.release_cursor(0);
+    r.drain_all_w2m();
+    assert!(r.inner.w2m.release_cursor(0) > late, "the late frame is released");
+    assert!(r.inner.routes.borrow().is_empty(), "and routes nothing");
 }
 
-/// End-to-end Failure mode 1 guard: a worker streams more frames than the
-/// ring holds; the master takes a lease, queues 2 (filling the ring and
-/// parking the writer), then drops the lease mid-train. The freed slots +
-/// the gate discarding every later frame must let the writer finish all its
-/// writes instead of wedging in `W2mWriter::send_msg`.
+/// Dropping a lease mid-train releases its held and later frames, so a writer
+/// blocked on the full ring finishes.
 #[test]
-fn dropped_scan_lease_unblocks_streaming_writer() {
+fn a_dropped_lease_unblocks_a_streaming_writer() {
     use crate::runtime::w2m::fixtures::make_ring;
-    use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+    use crate::runtime::w2m::W2mWriter;
     use crate::runtime::wire as ipc;
-    use std::time::{Duration, Instant};
 
     const TOTAL: usize = 8;
 
-    // Ring sized for exactly 2 small frames.
+    // Ring sized for exactly 2 small frames; declared first so it unmaps last.
     let region = unsafe { make_ring(ipc::WireMsg::default().size(), 2, 8) };
     let ptr = region.ptr();
 
-    let r = make_reactor();
-    let req_id = r.alloc_scan_request_id() as u32;
+    let r = Reactor::new(16, Limits::TEST, Rc::new(W2mReceiver::new(vec![ptr]))).expect("reactor");
+    let lease = r.lease_train(1);
+    let id = lease.id(0);
     let writer = W2mWriter::new(ptr);
-    let receiver = W2mReceiver::new(vec![ptr]);
 
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
         for _ in 0..TOTAL {
-            let msg = ipc::WireMsg::default();
-            writer.send_msg(req_id as u64, &msg);
+            writer.send_msg(id, &ipc::WireMsg::default());
         }
         let _ = done_tx.send(());
     });
 
-    let lease = r.scan_lease(&[req_id]);
-
-    // Read+queue 2 frames (active) — fills the ring, parking the writer.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut queued = 0;
-    while queued < 2 {
-        if let Some(slot) = receiver.try_read_slot(0) {
-            r.route_scan_slot(slot);
-            queued += 1;
-        } else if Instant::now() > deadline {
-            panic!("writer never produced the first 2 frames");
-        } else {
-            receiver.wait_any(1, 5);
+    let queued = |r: &Reactor| match &r.inner.routes.borrow()[&(id as u32)] {
+        Route::Train(q) => q.len(),
+        Route::Ack { .. } => unreachable!(),
+    };
+    while queued(&r) < 2 {
+        assert!(Instant::now() < deadline, "writer never produced the first 2 frames");
+        r.drain_all_w2m();
+        if queued(&r) < 2 {
+            r.inner.w2m.wait_any(1, 5);
         }
     }
 
-    // Drop the lease mid-train: queued slots free, later frames are gated.
+    // Drop the lease mid-train: held slots free, later frames are released.
     drop(lease);
 
-    let mut read = queued;
-    while read < TOTAL {
-        if let Some(slot) = receiver.try_read_slot(0) {
-            r.route_scan_slot(slot); // discarded (lease gone)
-            read += 1;
-        } else if Instant::now() > deadline {
-            panic!("scan lease drop failed to free the ring — writer wedged at {read}/{TOTAL}");
-        } else {
-            receiver.wait_any(1, 5);
+    loop {
+        r.drain_all_w2m();
+        if done_rx.try_recv().is_ok() {
+            break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "the lease drop failed to free the ring — writer wedged"
+        );
+        r.inner.w2m.wait_any(1, 5);
     }
-
-    done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("writer thread must finish — never wedge on a full ring");
     handle.join().expect("writer thread panicked");
+    r.drain_all_w2m();
 
     assert_eq!(
-        receiver.release_cursor(0),
-        receiver.write_cursor(0),
+        r.inner.w2m.release_cursor(0),
+        r.inner.w2m.write_cursor(0),
         "every emitted slot must be freed (release_cursor reaches write_cursor)",
-    );
-
-    drop(receiver);
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Cancellation. Abandoning a park slot is the one mechanism behind
-// all of these: the slot's presence is the op's liveness, so a late
-// completion can always tell "deliver" from "the awaiter is gone".
-// ─────────────────────────────────────────────────────────────────
-
-/// A dropped `ReplyFuture` withdraws nothing: the slot belongs to the
-/// [`ReplyLease`], so a reply landing after a `select2` loser is dropped is
-/// still parked and collected by the next `await_reply` for that id. Dropping
-/// the lease is what discards it.
-#[test]
-fn a_dropped_reply_future_leaves_the_leases_slot_open() {
-    let r = make_reactor();
-    let lease = r.alloc_replies(1);
-    let req_id = lease[0];
-    {
-        let mut fut = Box::pin(r.await_reply(req_id));
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(fut.as_mut().poll(&mut cx).is_pending(), "no reply parked yet");
-        assert!(r.inner.replies.has_waker(req_id), "poll must register the waker");
-    } // fut dropped
-    assert!(r.inner.replies.is_open(req_id), "the lease still owns the slot");
-
-    r.route_reply(0, req_id as u32, synthetic_decoded_wire(req_id));
-    assert!(
-        try_poll_once(r.await_reply(req_id)).is_some(),
-        "the reply must still be there for the next awaiter"
-    );
-
-    drop(lease);
-    assert_eq!(r.inner.replies.len(), 0, "the lease closes every slot it opened");
-}
-
-/// Waker hygiene across every `WakeQueue` user: a dropped awaiter must leave
-/// no waker behind, or the next push wakes a task that is no longer listening.
-#[test]
-fn a_dropped_awaiter_leaves_no_waker_in_any_wake_queue() {
-    let r = make_reactor();
-    let w = make_waker(1);
-    let mut cx = Context::from_waker(&w);
-
-    {
-        let mut fut = Box::pin(r.accept());
-        assert!(fut.as_mut().poll(&mut cx).is_pending());
-        assert!(r.inner.accepts.borrow().has_waiter(), "poll registers a waiter");
-    }
-    assert!(!r.inner.accepts.borrow().has_waiter(), "accept queue");
-
-    {
-        let mut fut = Box::pin(r.next_exchange());
-        assert!(fut.as_mut().poll(&mut cx).is_pending());
-        assert!(r.inner.exchanges.borrow().has_waiter(), "poll registers a waiter");
-    }
-    assert!(!r.inner.exchanges.borrow().has_waiter(), "exchange queue");
-
-    let req_id = r.alloc_scan_request_id() as u32;
-    let _lease = r.scan_lease(&[req_id]);
-    {
-        let mut fut = Box::pin(r.await_scan_slot(req_id));
-        assert!(fut.as_mut().poll(&mut cx).is_pending());
-        assert!(r.inner.scans.borrow()[&req_id].has_waiter(), "poll registers a waiter");
-    }
-    assert!(!r.inner.scans.borrow()[&req_id].has_waiter(), "scan route");
-
-    let (read_end, write_end) = unsafe { pipe_pair() };
-    r.register_conn(read_end);
-    assert!(try_poll_once(r.recv(read_end)).is_none());
-    assert!(
-        !r.inner.conns.borrow()[&read_end].q.has_waiter(),
-        "recv queue — the polled recv future is already dropped"
-    );
-    r.close_fd(read_end);
-    unsafe { libc::close(write_end) };
-
-    // The fifth user: a `chan::Receiver`, whose `RecvOne` a `select2` loser
-    // drops while parked.
-    let (tx, mut rx) = chan::unbounded::<u8>();
-    {
-        let mut fut = Box::pin(rx.recv());
-        assert!(fut.as_mut().poll(&mut cx).is_pending());
-    }
-    tx.send(1);
-    assert!(
-        !r.inner.run_queue.borrow().is_queued(1),
-        "chan queue — a send after the receiver dropped must wake nobody"
-    );
-
-    // The sixth: a `oneshot::Receiver`, which parks its waker inline rather
-    // than in a `WakeQueue` but owes the same hygiene.
-    let (one_tx, one_rx) = oneshot::channel::<u8>();
-    {
-        let mut fut = Box::pin(one_rx);
-        assert!(fut.as_mut().poll(&mut cx).is_pending());
-    }
-    one_tx.send(1);
-    assert!(
-        !r.inner.run_queue.borrow().is_queued(1),
-        "oneshot — a send after the receiver dropped must wake nobody"
     );
 }
 
@@ -388,7 +245,7 @@ fn a_park_slot_ends_by_completion_abandonment_or_reclaim() {
 
     // 1. Dropped while pending: the slot is abandoned, so the late CQE retires
     //    it rather than parking a result nobody will collect.
-    r.inner.fsyncs.open(1, None);
+    r.inner.fsyncs.open(1, ());
     {
         let mut fut = fsync_future(1);
         assert!(fut.as_mut().poll(&mut cx).is_pending(), "no result yet");
@@ -401,7 +258,7 @@ fn a_park_slot_ends_by_completion_abandonment_or_reclaim() {
 
     // 2. Completion beats the drop: `Drop` reclaims the orphaned result. This
     //    is the case a tombstone set grew one entry per durable commit for.
-    r.inner.fsyncs.open(2, None);
+    r.inner.fsyncs.open(2, ());
     let mut fut = fsync_future(2);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     cqe(&r, KIND_FSYNC, 2, 0);
@@ -412,7 +269,7 @@ fn a_park_slot_ends_by_completion_abandonment_or_reclaim() {
     //    delivers the CQE `res` verbatim, which the caller's `rc < 0` fatal
     //    branch depends on.
     for rc in [0, -libc::EBADF] {
-        r.inner.fsyncs.open(3, None);
+        r.inner.fsyncs.open(3, ());
         let mut fut = fsync_future(3);
         cqe(&r, KIND_FSYNC, 3, rc);
         assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(rc));

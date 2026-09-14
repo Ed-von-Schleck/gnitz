@@ -1,10 +1,8 @@
-//! The inbound half of a client connection: the global inbound-memory
-//! budget, the frame deframer, and the [`RecvQueue`] that turns "n bytes
-//! landed" into completed frames under one policy. Both client transports
-//! embed a `RecvQueue`; they differ only in who writes into its window — an
-//! io_uring recv CQE, or `rustls::Reader::read`.
+//! The inbound half of a client connection: the inbound-memory budget, the
+//! deframer, and the [`ClientConn`] owning a socket and its [`RecvQueue`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
@@ -12,11 +10,8 @@ use gnitz_wire::FRAME_LEN_PREFIX_BYTES;
 
 use super::wake_queue::WakeQueue;
 
-/// Pre-handshake limit applied to every newly registered connection.
-/// Equals the HELLO payload size in bytes; any first frame larger than
-/// this is rejected before allocation. The handshake elevates the
-/// limit to the negotiated value via `Reactor::set_max_payload_len`.
-pub(crate) const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
+/// A new connection's frame ceiling, until [`ClientConn::set_max_payload_len`] raises it.
+const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
 
 /// Lower/upper bounds on the global inbound-memory cap (see
 /// [`resolve_inbound_cap`]). The floor guarantees even a tiny memory budget
@@ -51,12 +46,12 @@ fn frame_weight(len: usize) -> usize {
 /// order and consume / reap / task-cancel all refund with no shadow counter.
 pub(crate) struct InboundBudget {
     held: Cell<usize>,
-    cap: Cell<usize>,
+    cap: usize,
 }
 
 impl InboundBudget {
     pub(crate) fn new(cap: usize) -> Self {
-        InboundBudget { held: Cell::new(0), cap: Cell::new(cap) }
+        InboundBudget { held: Cell::new(0), cap }
     }
 
     /// Bytes currently held (test observability).
@@ -71,7 +66,7 @@ impl InboundBudget {
     /// uncounted bytes; `None` = cap breach (refused before malloc, so the
     /// budget never overshoots) or malloc failure.
     fn alloc(self: &Rc<Self>, plen: usize) -> Option<RecvBuf> {
-        if self.held.get() + frame_weight(plen) > self.cap.get() {
+        if self.held.get() + frame_weight(plen) > self.cap {
             return None; // refuse before malloc — no overshoot
         }
         // SAFETY: plen > 0 (zero-length frames are the close sentinel,
@@ -105,7 +100,7 @@ pub struct RecvBuf {
 impl RecvBuf {
     /// Take ownership of a freshly-malloc'd `len`-byte payload buffer and charge
     /// its `frame_weight` to `budget`. The matching refund is in `Drop`.
-    pub(crate) fn new(ptr: *mut u8, len: usize, budget: Rc<InboundBudget>) -> Self {
+    fn new(ptr: *mut u8, len: usize, budget: Rc<InboundBudget>) -> Self {
         budget.held.set(budget.held.get() + frame_weight(len));
         RecvBuf { ptr, len, budget }
     }
@@ -261,7 +256,7 @@ impl RecvQueue {
                     fd,
                     self.budget.held.get(),
                     frame_weight(plen),
-                    self.budget.cap.get(),
+                    self.budget.cap,
                 );
                 return Err(());
             };
@@ -289,12 +284,6 @@ impl RecvQueue {
         self.frames.poll(cx)
     }
 
-    /// Waker hygiene: the queue must not hold a stale waker after the awaiting
-    /// task is cancelled.
-    pub(crate) fn clear_waiter(&mut self) {
-        self.frames.clear_waiter();
-    }
-
     /// Finish the recv side and wake the parked task, so its `recv().await`
     /// resolves to `None` once the queue drains. Idempotent.
     pub(crate) fn close(&mut self) {
@@ -305,38 +294,62 @@ impl RecvQueue {
     pub(super) fn queued(&self) -> usize {
         self.frames.len()
     }
-
-    #[cfg(test)]
-    pub(super) fn has_waiter(&self) -> bool {
-        self.frames.has_waiter()
-    }
 }
 
-/// Everything the reactor knows about one client fd. Removing a `Conn` frees
-/// every buffer that fd charged to the inbound budget and is also the verdict
-/// `recv()` reads as "peer gone", so no per-fd state outlives the connection
-/// into a later incarnation of the same fd number.
-pub(super) struct Conn {
-    pub(super) q: RecvQueue,
-    pub(super) recv_armed: bool,
-    pub(super) send_inflight: usize,
-    /// A `PeerToken` still hands out this fd number; see its docs.
-    pub(super) peer_held: bool,
+/// One client connection: its socket and the frames deframed off it. The socket
+/// closes with the last holder, and every SQE naming it is queued through one.
+pub(crate) struct ClientConn {
+    fd: OwnedFd,
+    /// Closed when the recv side ends, after which a completing recv never
+    /// re-arms.
+    pub(super) q: RefCell<RecvQueue>,
 }
 
-impl Conn {
-    pub(crate) fn new(budget: Rc<InboundBudget>) -> Self {
-        Conn {
-            q: RecvQueue::new(budget),
-            recv_armed: false,
-            send_inflight: 0,
-            peer_held: false,
+impl ClientConn {
+    pub(super) fn new(fd: OwnedFd, budget: Rc<InboundBudget>) -> Self {
+        ClientConn {
+            fd,
+            q: RefCell::new(RecvQueue::new(budget)),
         }
     }
 
-    pub(super) fn has_outstanding(&self) -> bool {
-        self.recv_armed || self.send_inflight > 0 || self.peer_held
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd.as_raw_fd()
     }
+
+    /// Next frame, or `None` once the recv side is closed and drained.
+    pub(crate) async fn recv(&self) -> Option<RecvBuf> {
+        std::future::poll_fn(|cx| self.q.borrow_mut().poll_recv(cx)).await
+    }
+
+    /// The next already-deframed frame without parking. `None` means nothing is
+    /// queued right now, not that the peer is gone.
+    pub(crate) fn try_recv(&self) -> Option<RecvBuf> {
+        self.q.borrow_mut().try_recv()
+    }
+
+    /// Must run before the caller's next `.await`: the recv re-arms as soon as the
+    /// current frame is deframed, and a frame arriving before the raise is refused
+    /// at the old ceiling.
+    pub(crate) fn set_max_payload_len(&self, limit: usize) {
+        self.q.borrow_mut().set_max_payload_len(limit);
+    }
+
+    pub(crate) fn recv_closed(&self) -> bool {
+        self.q.borrow().recv_closed()
+    }
+}
+
+/// What stands between a socket and its `RecvQueue` when the socket's bytes are
+/// not the frames themselves.
+pub(crate) trait RecvFilter {
+    /// Where the next socket bytes land; valid until the recv completes.
+    fn window(&mut self) -> (*mut u8, u32);
+    /// `n` bytes landed in the window: queue the frames they complete. `Err`
+    /// ends the recv side.
+    fn ingest(&mut self, n: usize, q: &mut RecvQueue, fd: i32) -> Result<(), ()>;
+    /// The recv side ended.
+    fn recv_closed(&mut self, fd: i32);
 }
 
 #[cfg(test)]

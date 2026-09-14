@@ -5,7 +5,8 @@
 //! dispatcher and worker ACKs, so they stay covered end to end.
 
 use super::*;
-use crate::runtime::reactor::{Limits, Reactor};
+use crate::runtime::reactor::Reactor;
+use crate::runtime::test_support::make_reactor;
 use crate::test_support::make_schema_u64_i64;
 use gnitz_wire::{WireConflictMode, STATUS_ERROR};
 use std::future::Future;
@@ -138,16 +139,11 @@ fn a_leading_barrier_ends_the_batch_alone() {
     assert!(rx.try_recv().is_some(), "the push behind it rides the next batch");
 }
 
-/// A `ReplyLease` needs a reactor; nothing else in these tests touches it.
-fn test_reactor() -> Reactor {
-    Reactor::new(16, Limits::TEST).expect("io_uring reactor")
-}
-
 fn group_of(reactor: &Reactor, tid: i64, write_err: Option<WireFault>) -> GroupInfo {
     GroupInfo {
         tid,
         recoverable: true,
-        req_ids: reactor.alloc_replies(1),
+        req_ids: reactor.lease_acks(1),
         merged: Batch::empty_with_schema(&make_schema_u64_i64()),
         write_err,
     }
@@ -155,7 +151,7 @@ fn group_of(reactor: &Reactor, tid: i64, write_err: Option<WireFault>) -> GroupI
 
 #[test]
 fn every_coalesced_client_of_a_push_unit_resolves_exactly_once() {
-    let reactor = test_reactor();
+    let reactor = make_reactor();
     let (d0, mut rx0) = oneshot::channel();
     let (d1, mut rx1) = oneshot::channel();
     CommitUnit {
@@ -174,7 +170,7 @@ fn every_coalesced_client_of_a_push_unit_resolves_exactly_once() {
 
 #[test]
 fn a_push_units_group_error_reaches_every_client() {
-    let reactor = test_reactor();
+    let reactor = make_reactor();
     let (d0, mut rx0) = oneshot::channel();
     let (d1, mut rx1) = oneshot::channel();
     CommitUnit {
@@ -193,7 +189,7 @@ fn a_push_units_group_error_reaches_every_client() {
 
 #[test]
 fn a_transaction_resolves_ok_only_when_every_family_committed() {
-    let reactor = test_reactor();
+    let reactor = make_reactor();
 
     let (done, mut rx) = oneshot::channel();
     CommitUnit {

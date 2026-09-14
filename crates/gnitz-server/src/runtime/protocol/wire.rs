@@ -17,13 +17,9 @@ use gnitz_wire::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 /// The server's *ingress* limit is the wire constant itself.
 pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
 
-/// Ceiling on a concatenation of client-bound frames — the scan heads a fan-out
-/// coalesces, and the replies `Peer` holds corked — bounding the copy paid to
-/// save their per-frame `OP_SEND`/`OP_TIMEOUT`/`OP_ASYNC_CANCEL` triples.
-///
-/// `fanout_coalesced_egress_bench` (reactor tests) sweeps it: the win grows with
-/// worker count and shrinks with total size, breaking even around 128 KiB at two
-/// workers and still large there at eight.
+/// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
+/// replies): the copy paid to save per-frame sends. `fanout_coalesced_egress_bench`
+/// measures the trade.
 pub(crate) const COALESCE_MAX_BYTES: usize = 32 * 1024;
 
 /// The one text for a reply that cannot be framed, shared by the two producers
@@ -52,7 +48,7 @@ pub(crate) use gnitz_wire::FLAG_SCAN_LAST;
 // `seek_col_idx`, whose `0` reads as "no backfill coordination" — which is what
 // a steady-state exchange already sends.
 
-/// Up-leg (worker→master, on `FLAG_EXCHANGE`): the per-chunk PAD bit. Set when
+/// Up-leg (worker→master, on an exchange frame): the per-chunk PAD bit. Set when
 /// this worker's `drain_chunk` returned `None` — its partition is exhausted and
 /// the chunk it is participating in is an empty pad. The master ANDs this bit
 /// across all workers for a round; an all-pad round is the final round.

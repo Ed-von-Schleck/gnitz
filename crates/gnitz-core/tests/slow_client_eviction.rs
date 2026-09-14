@@ -1,7 +1,7 @@
 #![cfg(feature = "integration")]
 
-//! The master's per-frame egress deadline: a client that issues a SCAN and
-//! then stops draining its socket is `shutdown()` and evicted once a frame
+//! The master's per-send egress deadline: a client that issues a SCAN and
+//! then stops draining its socket is `shutdown()` and evicted once a send
 //! makes no progress for `GNITZ_CLIENT_SEND_TIMEOUT_MS`, freeing the W2M ring
 //! slot it pinned; every other client keeps progressing throughout.
 

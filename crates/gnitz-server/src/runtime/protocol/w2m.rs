@@ -40,7 +40,13 @@ use io_uring::types::FutexWaitV;
 
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg, FRAME_CAP};
 use gnitz_foundation::posix_io;
+use gnitz_wire::control::{peek_control_block_ipc, DecodedControl};
 use gnitz_wire::{align8, BitIter};
+
+/// The ring id every worker exchange frame rides. The master's request-id
+/// counter never hands it out, so a ring prefix alone tells an exchange frame
+/// from a reply before anything decodes it.
+pub(crate) const W2M_EXCHANGE_RING_ID: u32 = u32::MAX;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -661,8 +667,7 @@ pub struct W2mWriter {
 }
 
 // SAFETY: the raw `base` inside the cursor is a `MAP_SHARED` region valid in
-// every process for its whole life. `reactor::mod.rs` moves a writer into a
-// thread closure; sole-producer is what the type still requires, and moving does
+// every process for its whole life. A writer may be moved into a thread closure; sole-producer is what the type still requires, and moving does
 // not duplicate it.
 unsafe impl Send for W2mWriter {}
 
@@ -784,8 +789,8 @@ pub struct W2mSlot {
     pub(crate) internal_req_id: u32,
     /// The ring's `InFlightState`, which lives inside a `Box<[WorkerRing]>` that
     /// has no `push`, so its address is stable for the receiver's life. The
-    /// `W2mReceiver` must outlive every slot; `ReactorShared::w2m` names who
-    /// holds it alive.
+    /// `W2mReceiver` must outlive every slot; `ReactorShared::w2m` names what
+    /// keeps it alive for the slots the reactor holds.
     state: *mut InFlightState,
 }
 
@@ -805,6 +810,19 @@ impl W2mSlot {
         match decode_wire_ipc(self.bytes()) {
             Ok(decoded) => decoded,
             Err(e) => gnitz_fatal_abort!("w2m: worker={} slot decode failed: {:?} — ring corrupt", worker, e),
+        }
+    }
+
+    /// The slot's control block alone, aborting on failure as `decode` does — for
+    /// an ACK, whose only content is its status and error text.
+    pub(crate) fn control(&self, worker: usize) -> DecodedControl {
+        match peek_control_block_ipc(self.bytes()) {
+            Ok(ctrl) => ctrl,
+            Err(e) => gnitz_fatal_abort!(
+                "w2m: worker={} slot control decode failed: {} — ring corrupt",
+                worker,
+                e
+            ),
         }
     }
 }
@@ -925,12 +943,6 @@ impl W2mReceiver {
     pub fn try_read_slot(&self, worker: usize) -> Option<W2mSlot> {
         // SAFETY: the master thread is the sole consumer of every ring.
         unsafe { self.rings[worker].take_next() }
-    }
-
-    /// [`Self::try_read_slot`] decoded and released in one step, for the
-    /// synchronous master paths that never forward a slot's bytes.
-    pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
-        Some(self.try_read_slot(worker)?.decode(worker))
     }
 
     /// Arm `bit` — the caller's own park flag — on every ring in `mask` and fill

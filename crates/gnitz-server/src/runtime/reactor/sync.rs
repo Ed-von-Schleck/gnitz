@@ -1,5 +1,5 @@
 //! Async primitives for the reactor's single thread: `oneshot`, `chan`,
-//! `AsyncMutex`, `AsyncRwLock`, `join_all_unpin` / `join_into` and `select2`.
+//! `AsyncMutex`, `AsyncRwLock` and `select2`.
 //!
 //! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the reactor never leaves
 //! its thread, so a channel send costs no atomic and a waker registration no
@@ -82,15 +82,6 @@ pub mod oneshot {
             Poll::Pending
         }
     }
-
-    impl<T> Drop for Receiver<T> {
-        fn drop(&mut self) {
-            // Same hygiene every other parking awaiter in the reactor owes: a
-            // receiver that loses a `select2` must not leave a waker for the
-            // next `send` to fire.
-            self.inner.borrow_mut().waker = None;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +124,8 @@ pub mod chan {
     }
 
     impl<T> Receiver<T> {
-        pub fn recv(&mut self) -> RecvOne<'_, T> {
-            RecvOne { inner: &self.inner }
+        pub async fn recv(&mut self) -> Option<T> {
+            std::future::poll_fn(|cx| self.inner.borrow_mut().poll(cx)).await
         }
 
         /// Non-blocking receive: returns `Some(T)` if the queue has an item,
@@ -143,25 +134,6 @@ pub mod chan {
         /// on a timer for more.
         pub fn try_recv(&mut self) -> Option<T> {
             self.inner.borrow_mut().pop()
-        }
-    }
-
-    pub struct RecvOne<'a, T> {
-        inner: &'a Rc<RefCell<WakeQueue<T>>>,
-    }
-
-    impl<T> Future for RecvOne<'_, T> {
-        type Output = Option<T>;
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-            self.inner.borrow_mut().poll(cx)
-        }
-    }
-
-    impl<T> Drop for RecvOne<'_, T> {
-        fn drop(&mut self) {
-            // Same hygiene every other `WakeQueue` awaiter owes: a `recv()` that
-            // loses a `select2` must not leave a waker for the next `send` to fire.
-            self.inner.borrow_mut().clear_waiter();
         }
     }
 }
@@ -308,8 +280,8 @@ impl Drop for ReadGuard {
 pub struct WriteFuture {
     lock: Rc<AsyncRwLock>,
     /// Whether this future is counted in `writers_waiting`. Re-polling a parked
-    /// future must not count it twice, and `guard_egress_deadline` re-polls one
-    /// on every deadline expiry.
+    /// future must not count it twice, and a `select2` re-polls a parked future
+    /// on every wake.
     parked: bool,
 }
 
@@ -358,73 +330,6 @@ impl Drop for WriteGuard {
 }
 
 // ---------------------------------------------------------------------------
-// join_all
-// ---------------------------------------------------------------------------
-
-/// Future driving `futs` to completion, writing values in input order into
-/// `out`. Both buffers are the caller's, so the committer and the executor
-/// reuse one pair across every commit and tick rather than allocating per
-/// fan-out; nothing here allocates once their capacity suffices.
-pub struct JoinInto<'a, F, T> {
-    futs: &'a mut [F],
-    out: &'a mut Vec<Option<T>>,
-}
-
-impl<F: Future<Output = T> + Unpin, T> Future for JoinInto<'_, F, T> {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = &mut *self;
-        let n = this.futs.len();
-        let mut remaining = 0;
-        for i in 0..n {
-            if this.out[i].is_some() {
-                continue;
-            }
-            match Pin::new(&mut this.futs[i]).poll(cx) {
-                Poll::Ready(v) => {
-                    this.out[i] = Some(v);
-                }
-                Poll::Pending => {
-                    remaining += 1;
-                }
-            }
-        }
-        if remaining == 0 {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-/// Drive every future in `futs` to completion, writing each result into
-/// the same index in `out`. `out` is cleared and resized to `futs.len()`
-/// on entry; allocation only happens when its capacity is too small.
-pub fn join_into<'a, F, T>(futs: &'a mut [F], out: &'a mut Vec<Option<T>>) -> JoinInto<'a, F, T>
-where
-    F: Future<Output = T> + Unpin,
-{
-    let n = futs.len();
-    out.clear();
-    out.resize_with(n, || None);
-    JoinInto { futs, out }
-}
-
-/// Drive every future in `futs` to completion, return values in input order.
-/// Requires `F: Unpin`, so the futures can be polled in place out of one
-/// buffer; a caller whose future is not `Unpin` must `Box::pin` it.
-pub async fn join_all_unpin<F, T, I>(futs: I) -> Vec<T>
-where
-    I: IntoIterator<Item = F>,
-    F: Future<Output = T> + Unpin,
-{
-    let mut futs: Vec<F> = futs.into_iter().collect();
-    let mut out: Vec<Option<T>> = Vec::new();
-    join_into(&mut futs, &mut out).await;
-    out.into_iter().map(|o| o.unwrap()).collect()
-}
-
-// ---------------------------------------------------------------------------
 // select2
 // ---------------------------------------------------------------------------
 
@@ -434,10 +339,8 @@ pub enum Either<A, B> {
     B(B),
 }
 
-/// Race two futures; return whichever completes first.  The loser is
-/// dropped — its `Drop` impl is responsible for releasing any registered
-/// state (e.g. `TimerFuture::Drop` flips the cancellation bit on its
-/// heap entry so the timer loop skips it).
+/// Race two futures; return whichever completes first. The loser is dropped,
+/// and its `Drop` releases what it registered.
 pub async fn select2<A, B>(a: A, b: B) -> Either<A::Output, B::Output>
 where
     A: Future,

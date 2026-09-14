@@ -20,11 +20,11 @@ use gnitz_wire::{PkColList, SpecBytes};
 
 use crate::query::RelayRoute;
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{AsyncMutex, ScanLease};
+use crate::runtime::reactor::{AsyncMutex, Lease};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalScope, SalWriter};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
-    self, unique_preflight_wire_schema, DecodedWire, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
+    self, unique_preflight_wire_schema, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
     BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
 };
 use exchange::PendingRelay;
@@ -32,7 +32,7 @@ use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated, op_rep
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::peek_control_block_ipc;
-use gnitz_wire::{WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
+use gnitz_wire::{WireConflictMode, FLAG_CONTINUATION, FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 use scatter::{with_commit_indices, with_group, with_worker_indices};
 
 // ---------------------------------------------------------------------------
@@ -198,35 +198,6 @@ pub(crate) fn worker_error(w: usize, op: &str, ctrl: &gnitz_wire::control::Decod
     })
 }
 
-/// The first worker error across a fan-out's replies, in worker-index order.
-/// Slots are `Some` once `join_into`'s future resolves; a `None` is a bug in
-/// the join driver.
-pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) -> Option<WorkerFault> {
-    decoded.iter().enumerate().find_map(|(w, d)| {
-        let d = d.as_ref().expect("join_into left a None slot — logic bug");
-        worker_error(w, op, &d.control)
-    })
-}
-
-/// Await one ACK per id in `ids`, returning the first worker error. Clears
-/// `acks` before returning so the `DecodedWire` heap fields (data batch, error
-/// message) are freed rather than held while the caller parks; the capacity of
-/// both scratch vectors survives for the next round.
-pub(crate) async fn await_worker_acks(
-    reactor: &crate::runtime::reactor::Reactor,
-    ids: &[u64],
-    op: &str,
-    futs: &mut Vec<crate::runtime::reactor::ReplyFuture>,
-    acks: &mut Vec<Option<DecodedWire>>,
-) -> Result<(), WorkerFault> {
-    futs.clear();
-    futs.extend(ids.iter().map(|&id| reactor.await_reply(id)));
-    crate::runtime::reactor::join_into(futs, acks).await;
-    let err = first_worker_error_opt(op, acks);
-    acks.clear();
-    err.map_or(Ok(()), Err)
-}
-
 /// Which workers a scan-shaped dispatch goes to, before any request id exists.
 #[derive(Clone, Copy)]
 pub(crate) enum Fanout {
@@ -256,69 +227,50 @@ pub(crate) fn read_fanout(disp: &MasterDispatcher, target_id: i64, spec: Option<
         .map_or(Fanout::Broadcast, Fanout::One)
 }
 
-/// A dispatched scan: who answers it, on which request ids, and the lease
-/// keeping those ids registered until the caller finishes draining.
-///
-/// Replies are addressed only through [`Self::reply`], which returns the
-/// producing worker and its request id together.
-///
-/// Dropping it releases the lease, which deregisters the ids; `route_scan_slot`
-/// then discards every queued and future frame at the ring boundary — what
-/// cancels a scan on client death. The drain verbs take `&self`, so no drain
-/// outlives the lease that keeps its frames arriving.
+/// A dispatched scan: reply `i` arrives on its lease's id `i`, from
+/// [`Self::worker`]. Dropping it discards every frame not yet drained.
 pub(crate) struct ScanDispatch {
-    /// Reply `i` arrives on `ids[i]`, for `i < n`. Indexed by **reply**, never
-    /// by worker — a unicast has one reply, so it uses one slot.
-    ids: [u64; gnitz_wire::MAX_WORKERS],
-    n: usize,
+    lease: Lease,
     /// The one worker a unicast wrote to; `None` when reply `i` is worker `i`'s.
     worker: Option<usize>,
-    _lease: ScanLease,
 }
 
 impl ScanDispatch {
-    /// Allocate this fan-out's request ids and register them into a fresh
-    /// `ScanLease`, before any await.
+    /// Lease this fan-out's request ids, before any await.
     fn alloc(reactor: &crate::runtime::reactor::Reactor, nw: usize, fanout: Fanout) -> ScanDispatch {
-        let mut ids = [0u64; gnitz_wire::MAX_WORKERS];
-        let n = match fanout {
-            Fanout::Broadcast => nw,
-            Fanout::One(_) => 1,
-        };
-        let mut scan_ids = [0u32; gnitz_wire::MAX_WORKERS];
-        for (r, s) in ids[..n].iter_mut().zip(&mut scan_ids[..n]) {
-            *r = reactor.alloc_scan_request_id();
-            *s = *r as u32;
-        }
-        ScanDispatch {
-            ids,
-            n,
-            worker: match fanout {
-                Fanout::Broadcast => None,
-                Fanout::One(w) => Some(w),
+        match fanout {
+            Fanout::Broadcast => ScanDispatch {
+                lease: reactor.lease_train(nw),
+                worker: None,
             },
-            _lease: reactor.scan_lease(&scan_ids[..n]),
+            Fanout::One(w) => ScanDispatch {
+                lease: reactor.lease_train(1),
+                worker: Some(w),
+            },
         }
     }
 
     /// The slots this scan's group writes, and the id each answers on.
-    pub(crate) fn targets(&self) -> GroupTargets<'_> {
+    pub(crate) fn targets(&self) -> GroupTargets {
         match self.worker {
-            None => GroupTargets::All(&self.ids[..self.n]),
-            Some(worker) => GroupTargets::One { worker, req_id: self.ids[0] },
+            None => GroupTargets::All(self.lease.id(0)),
+            Some(worker) => GroupTargets::One { worker, req_id: self.lease.id(0) },
         }
     }
 
-    /// Reply `i`: the worker that produced it, and the request id it arrives on.
-    pub(crate) fn reply(&self, i: usize) -> (usize, u64) {
-        (self.worker.unwrap_or(i), self.ids[i])
+    /// The worker that produced reply `i`.
+    pub(crate) fn worker(&self, i: usize) -> usize {
+        self.worker.unwrap_or(i)
     }
 
-    /// Await the first reply slot of every worker this scan dispatched to, in
-    /// reply order.
-    pub(crate) async fn await_slots(&self, reactor: &crate::runtime::reactor::Reactor) -> Vec<W2mSlot> {
-        crate::runtime::reactor::join_all_unpin((0..self.n).map(|i| reactor.await_scan_slot(self.reply(i).1 as u32)))
-            .await
+    /// Await the first frame of every reply, in reply order.
+    pub(crate) async fn await_slots(&self) -> Vec<W2mSlot> {
+        self.lease.first_frames().await
+    }
+
+    /// The next frame of reply `i`'s train.
+    pub(crate) async fn next_frame(&self, i: usize) -> W2mSlot {
+        self.lease.next_frame(i).await
     }
 
     /// Await this scan's replies and forward every worker's train to the client
@@ -330,13 +282,9 @@ impl ScanDispatch {
     /// supported usage: under `FLAG_SCAN_FIFO_REPLY` each worker streams the
     /// relations in request order, so relation `i`'s frames sit at the front of
     /// every ring with a live consumer.
-    pub(crate) async fn await_and_forward(
-        &self,
-        reactor: &crate::runtime::reactor::Reactor,
-        peer: &Peer,
-    ) -> Result<bool, WorkerFault> {
-        let slots = self.await_slots(reactor).await;
-        forward_scan_slots(reactor, peer, slots, self).await
+    pub(crate) async fn await_and_forward(&self, peer: &Peer) -> Result<bool, WorkerFault> {
+        let slots = self.await_slots().await;
+        forward_scan_slots(peer, slots, self).await
     }
 }
 
@@ -360,7 +308,7 @@ pub(crate) async fn dispatch_scan_fanout<F>(
     submit: F,
 ) -> Result<(Vec<W2mSlot>, ScanDispatch), WorkerFault>
 where
-    F: FnOnce(GroupTargets<'_>) -> Result<(), WorkerFault>,
+    F: FnOnce(GroupTargets) -> Result<(), WorkerFault>,
 {
     let scan = ScanDispatch::alloc(reactor, disp.num_workers(), unicast);
 
@@ -369,7 +317,7 @@ where
         submit(scan.targets())?;
         disp.signal_reached([unicast]);
     }
-    let slots = scan.await_slots(reactor).await;
+    let slots = scan.await_slots().await;
     Ok((slots, scan))
 }
 
@@ -399,14 +347,14 @@ pub(crate) async fn dispatch_scan_multi_fanout<F>(
     mut submit: F,
 ) -> Result<(Vec<ScanDispatch>, u64), WorkerFault>
 where
-    F: FnMut(usize, GroupTargets<'_>, u64, u64) -> Result<(), WorkerFault>,
+    F: FnMut(usize, GroupTargets, u64, u64) -> Result<(), WorkerFault>,
 {
     if fanouts.is_empty() {
         return Ok((Vec::new(), 0));
     }
     let nw = disp.num_workers();
-    // Allocate ids + register every request's lease BEFORE the lock (no await
-    // between here and the write).
+    // Lease every request's ids BEFORE the lock (no await between here and the
+    // write).
     let dispatches: Vec<ScanDispatch> = fanouts
         .iter()
         .map(|&unicast| ScanDispatch::alloc(reactor, nw, unicast))

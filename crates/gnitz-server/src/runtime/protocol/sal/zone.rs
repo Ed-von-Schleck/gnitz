@@ -107,6 +107,11 @@ impl<'a> CommittedTail<'a> {
                 .is_some_and(|&f| msg.lsn > f)
     }
 
+    /// The highest committed zone LSN in the tail, of any kind; `0` for none.
+    pub(crate) fn max_committed_lsn(&self) -> u64 {
+        self.committed.iter().copied().max().unwrap_or(0)
+    }
+
     /// Pass 2: this walk's groups from every committed zone, in log order.
     ///
     /// Yielded whole rather than as bytes — a worker re-reads one group across

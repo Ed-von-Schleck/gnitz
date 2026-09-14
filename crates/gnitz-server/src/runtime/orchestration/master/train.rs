@@ -22,7 +22,7 @@ pub(super) fn scan_decode_err(w: usize, what: &str, e: &'static str) -> WorkerFa
 
 /// Parse one frame header of worker `w`'s train. Returns the control block plus
 /// whether more frames follow, or `Err` (prefixed with `what`) on a fault frame
-/// or a corrupt header. Every caller holds the `ScanLease` from
+/// or a corrupt header. Every caller holds the scan's lease from
 /// `dispatch_scan_fanout`, so propagating the `Err` is the whole disposal story:
 /// the lease drop discards the undrained remainder at the ring boundary.
 ///
@@ -31,7 +31,7 @@ pub(super) fn scan_decode_err(w: usize, what: &str, e: &'static str) -> WorkerFa
 /// `status = STATUS_ERROR` and flags `0` (no `FLAG_SCAN_LAST`), and the worker
 /// emits nothing more for the request. The error therefore MUST stop the drain:
 /// keying `has_more` off `FLAG_SCAN_LAST` alone would read the fault frame's `0`
-/// flags as "more coming" and block forever in `await_scan_slot`.
+/// flags as "more coming" and block forever in `next_frame`.
 pub(super) fn parse_train_header(
     slot: &W2mSlot,
     w: usize,
@@ -80,12 +80,7 @@ pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Resul
 /// Shared by the unique-filter warmup and the collect paths (index seek,
 /// constraint probe).
 ///
-/// Returns on the FIRST error — worker fault, corrupt frame, schema mismatch, or
-/// an `Err` from `on_batch` — without draining the rest. All callers hold the
-/// `ScanLease` from `dispatch_scan_fanout`; when the early `Err` unwinds it, the
-/// lease drop frees every parked slot and `route_scan_slot` discards later
-/// frames at the ring boundary, advancing `release_cursor`, so a still-streaming
-/// worker cannot wedge in `W2mWriter::send_msg`.
+/// Returns on the first error; dropping the caller's scan lease discards the rest.
 ///
 /// `expected` guards each train's first schema-bearing frame. Worker reply
 /// schemas can lag the master's during DDL races (`run_tick` releases the
@@ -99,13 +94,12 @@ pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Resul
 pub(super) async fn drain_index_scan(
     slots: Vec<W2mSlot>,
     scan: &ScanDispatch,
-    reactor: &crate::runtime::reactor::Reactor,
     what: &str,
     expected: &SchemaDescriptor,
     mut on_batch: impl FnMut(&gnitz_store::storage::MemBatch<'_>, usize) -> Result<(), WorkerFault>,
 ) -> Result<(), WorkerFault> {
     for (i, mut slot) in slots.into_iter().enumerate() {
-        let (w, req_id) = scan.reply(i);
+        let w = scan.worker(i);
         let mut saved_schema: Option<SchemaDescriptor> = None;
         loop {
             let (ctrl, has_more) = parse_train_header(&slot, w, what)?;
@@ -130,7 +124,7 @@ pub(super) async fn drain_index_scan(
             if !has_more {
                 break;
             }
-            slot = reactor.await_scan_slot(req_id as u32).await;
+            slot = scan.next_frame(i).await;
         }
     }
     Ok(())
@@ -169,21 +163,20 @@ fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, WorkerFault
 /// the concatenation needs nothing synthesized between frames. Anything else
 /// falls back to [`drain_scan_train`] per worker.
 pub(super) async fn forward_scan_slots(
-    reactor: &crate::runtime::reactor::Reactor,
     peer: &Peer,
     slots: Vec<W2mSlot>,
     scan: &ScanDispatch,
 ) -> Result<bool, WorkerFault> {
     // Classify every head before sending anything: whether they can leave as one
     // buffer is not known until every train has been seen. Both arms then run
-    // off these, so no head is parsed twice. `slots.len()` is the worker count,
-    // which `await_scan_slots` caps at MAX_WORKERS.
+    // off these, so no head is parsed twice. `slots.len()` is the reply count,
+    // at most the worker count, which MAX_WORKERS caps.
     let mut heads = [TrainHead::default(); MAX_WORKERS];
     let mut observable = 0usize;
     let mut total = 0usize;
     let mut any_tail = false;
     for (i, slot) in slots.iter().enumerate() {
-        heads[i] = classify_head(slot, scan.reply(i).0)?;
+        heads[i] = classify_head(slot, scan.worker(i))?;
         any_tail |= heads[i].has_more;
         if heads[i].observable {
             observable += 1;
@@ -195,8 +188,7 @@ pub(super) async fn forward_scan_slots(
         // next worker's head, reordering the client's rows. A lone frame goes
         // zero-copy from the ring instead of being copied to join the terminal.
         for (i, slot) in slots.into_iter().enumerate() {
-            let (w, req_id) = scan.reply(i);
-            if !drain_scan_train(reactor, peer, slot, heads[i], req_id as u32, w).await? {
+            if !drain_scan_train(peer, scan, i, slot, heads[i]).await? {
                 return Ok(false);
             }
         }
@@ -216,7 +208,7 @@ pub(super) async fn forward_scan_slots(
     Ok(true)
 }
 
-/// Forward one worker's train to the client: send each frame to `peer` (dropping
+/// Forward reply `i`'s train to the client: send each frame to `peer` (dropping
 /// it before awaiting the next, per the W2M ring contract) and loop until the
 /// header reports no more frames. `slot` is the first, already-awaited frame and
 /// `head` its classification. `Ok(false)` if the client disconnects mid-stream,
@@ -228,17 +220,16 @@ pub(super) async fn forward_scan_slots(
 /// `parse_train_header` returns `Err` on a non-zero status — and the train's
 /// terminal frame is master-authored, so the client still sees the train end.
 ///
-/// The send is deadline-guarded inside `send_slot`: a client that stops draining
+/// The send carries the eviction deadline: a client that stops draining
 /// this zero-copy slot is evicted, rc goes negative, and the caller drops the
-/// `ScanLease`, discarding the rest of the train and advancing release_cursor so
-/// the worker unblocks.
+/// scan's lease, discarding the rest of the train and advancing release_cursor
+/// so the worker unblocks.
 async fn drain_scan_train(
-    reactor: &crate::runtime::reactor::Reactor,
     peer: &Peer,
+    scan: &ScanDispatch,
+    i: usize,
     mut slot: W2mSlot,
     mut head: TrainHead,
-    req_id: u32,
-    worker: usize,
 ) -> Result<bool, WorkerFault> {
     loop {
         if !head.observable {
@@ -249,8 +240,8 @@ async fn drain_scan_train(
         if !head.has_more {
             break;
         }
-        slot = reactor.await_scan_slot(req_id).await;
-        head = classify_head(&slot, worker)?;
+        slot = scan.next_frame(i).await;
+        head = classify_head(&slot, scan.worker(i))?;
     }
     Ok(true)
 }

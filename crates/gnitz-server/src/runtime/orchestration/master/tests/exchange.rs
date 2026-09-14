@@ -1,6 +1,6 @@
 use super::*;
 use gnitz_wire::control::DecodedControl;
-use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST};
+use gnitz_wire::{FLAG_CONTINUATION, FLAG_SCAN_LAST};
 
 /// The one-U64-PK, zero-payload fixture every batch here is built over.
 fn u64_pk_only() -> SchemaDescriptor {
@@ -15,7 +15,7 @@ fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> Deco
     DecodedWire {
         control: DecodedControl {
             target_id: view_id as u64,
-            flags: FLAG_EXCHANGE | FLAG_CONTINUATION | FLAG_SCAN_LAST,
+            flags: FLAG_CONTINUATION | FLAG_SCAN_LAST,
             seek_pk: source_id as u128,
             seek_col_idx: if pad { BACKFILL_PAD_BIT } else { 0 },
             ..Default::default()
@@ -44,10 +44,7 @@ fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> Decoded
     DecodedWire {
         control: DecodedControl {
             target_id: view_id as u64,
-            flags: FLAG_EXCHANGE
-                | FLAG_CONTINUATION
-                | gnitz_wire::FLAG_BATCH_CONSOLIDATED
-                | if last { FLAG_SCAN_LAST } else { 0 },
+            flags: FLAG_CONTINUATION | gnitz_wire::FLAG_BATCH_CONSOLIDATED | if last { FLAG_SCAN_LAST } else { 0 },
             seek_pk: source_id as u128,
             ..Default::default()
         },

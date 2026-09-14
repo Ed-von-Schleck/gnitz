@@ -4,8 +4,8 @@
 //!
 //! The master owns one `Reactor` driving the accept socket, a task per
 //! connection, the committer (group commit + checkpoint + fsync), the tick task,
-//! the relay task and the worker-crash watchdog. The reactor demuxes
-//! FLAG_EXCHANGE wires into an accumulator and hands completed views to the relay.
+//! the relay task and the worker-crash watchdog. The reactor queues exchange
+//! frames for the relay task, which accumulates them into completed rounds.
 //!
 //! A handler that splits into `handle_x` + `x_body` does so for one reason: every
 //! rejection inside the body is a plain `Err`, so the handler above owns the
@@ -14,6 +14,7 @@
 mod ddl;
 
 use std::cell::{Cell, RefCell};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -30,13 +31,11 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    await_worker_acks, dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, read_fanout, Fanout,
-    MasterDispatcher, SeekReply, WorkerFault,
+    dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, read_fanout, worker_error, Fanout, MasterDispatcher,
+    SeekReply, WorkerFault,
 };
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{
-    chan, oneshot, select2, AsyncRwLock, Either, Reactor, ReadGuard, ReplyFuture, WriteGuard,
-};
+use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, Reactor, ReadGuard, WriteGuard};
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION_CONTINUE};
 use gnitz_store::relation::{Relation, RelationKind};
@@ -359,30 +358,29 @@ impl ServerExecutor {
     /// `tls` is the optional TLS listener bootstrap from `server_main`:
     /// the bound TCP listen fd, the rustls server configuration, and the
     /// global live-connection cap.
-    pub fn run(dispatcher: Rc<MasterDispatcher>, server_fd: i32, tls: Option<TlsListener>) -> i32 {
+    pub fn run(dispatcher: Rc<MasterDispatcher>, server_fd: i32, tls: Option<TlsListener>, lsn_seed: u64) -> i32 {
         // 256 SQEs. Not a bound on outstanding work: `IoUringRing::push` flushes
         // a full SQ rather than refusing, so this sets submit batching, not depth.
-        let reactor = match Reactor::new(256, crate::runtime::reactor::Limits::from_env()) {
+        let reactor = match Reactor::new(
+            256,
+            crate::runtime::reactor::Limits::from_env(),
+            dispatcher.w2m_receiver(),
+        ) {
             Ok(r) => Rc::new(r),
             Err(e) => {
                 gnitz_error!("io_uring init failed: {e}");
                 return 1;
             }
         };
-        // Hand the W2M receiver over so the reactor-parked CREATE-VIEW backfill
-        // can drive a synchronous collect (the reactor's `OnceCell` slot is
-        // stable for its lifetime).
-        reactor.attach_w2m(dispatcher.w2m_receiver());
         reactor.attach_listener(server_fd);
         if let Some(tl) = &tls {
             reactor.attach_listener(tl.fd());
         }
         let accept_ctx = AcceptCtx { unix_fd: server_fd, tls };
 
-        // Seed the zone-LSN allocator above every table's current_lsn so each
-        // new zone LSN is strictly greater, keeping the `submit` path's direct
-        // current_lsn assignment monotonic across restarts.
-        let initial_lsn = dispatcher.cat().registry().max_current_lsn();
+        // Every zone LSN this boot allocates exceeds `lsn_seed`; the boot
+        // recovery that computes it states what it dominates.
+        let initial_lsn = lsn_seed;
 
         let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
@@ -439,12 +437,14 @@ struct AcceptCtx {
 
 async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
     loop {
-        let (fd, listener) = shared.reactor.accept().await;
-        if fd < 0 {
+        let (raw_fd, listener) = shared.reactor.accept().await;
+        if raw_fd < 0 {
             continue;
         }
+        // SAFETY: a freshly-accepted fd, owned by nothing else. Every early
+        // `continue` below closes it by dropping this.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
         if listener == ctx.unix_fd {
-            shared.reactor.register_conn(fd);
             let peer = Peer::unix(fd, Rc::clone(&shared.reactor));
             let s = Rc::clone(&shared);
             // No pre-auth deadline: access here is gated by the socket path's
@@ -454,27 +454,21 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
             continue;
         }
         let Some(tl) = ctx.tls.as_ref().filter(|tl| listener == tl.fd()) else {
-            gnitz_warn!("accept from unknown listener fd={listener}; closing conn fd={fd}");
-            // SAFETY: freshly-accepted fd we own; no SQE references it.
-            unsafe { libc::close(fd) };
+            gnitz_warn!("accept from unknown listener fd={listener}; closing conn fd={raw_fd}");
             continue;
         };
         // Global connection cap: close the freshly-accepted fd before any TLS
         // work when the live count is at the cap.
         let Some(guard) = tl.admit() else {
-            gnitz_warn!("tls: connection cap {} reached; closing fd={fd}", tl.max_conns);
-            // SAFETY: freshly-accepted fd we own; no SQE references it.
-            unsafe { libc::close(fd) };
+            gnitz_warn!("tls: connection cap {} reached; closing fd={raw_fd}", tl.max_conns);
             continue;
         };
         let conn = match TlsShared::start(Rc::clone(&shared.reactor), fd, std::sync::Arc::clone(&tl.cfg), guard) {
             Ok(conn) => conn,
             Err(e) => {
-                // `guard` was moved into `start`; on the error path it already
-                // dropped (decrementing) inside `start`'s frame.
-                gnitz_warn!("tls: session init failed for fd={fd}: {e}");
-                // SAFETY: freshly-accepted fd we own; no SQE references it.
-                unsafe { libc::close(fd) };
+                // `fd` and `guard` were moved into `start`; on the error path they
+                // already dropped (closing and decrementing) inside its frame.
+                gnitz_warn!("tls: session init failed for fd={raw_fd}: {e}");
                 continue;
             }
         };
@@ -523,9 +517,8 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: O
 ///
 /// Returns when the peer is gone or refused; the caller closes.
 async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline: Option<Instant>) {
-    // No HELLO in time (`Either::B`) → `None`. `select2` drops the losing recv
-    // (clears its waker) and the losing timer (cancels its SQE), so the happy
-    // path leaves no timer behind.
+    // No HELLO in time (`Either::B`) → `None`. `select2` drops the losing timer,
+    // which removes its deadline, so the happy path leaves no timer behind.
     let first = match first_frame_deadline {
         Some(deadline) => match select2(peer.recv(), shared.reactor.timer(deadline)).await {
             Either::A(opt) => opt,
@@ -557,7 +550,7 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
 }
 
 /// Validate a HELLO frame, elevate the connection's payload limit, and
-/// reply with the symmetric ACK. See `Reactor::set_max_payload_len` for
+/// reply with the symmetric ACK. See `ClientConn::set_max_payload_len` for
 /// why the limit must be raised before any `.await` here.
 async fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> HelloOutcome {
     // `decode_hello_payload` validates the 8-byte length; the magic
@@ -711,8 +704,6 @@ async fn watchdog(shared: Rc<Shared>) {
 /// guarded by `guard_panic` inside `run_tick`.
 async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     let nw = shared.disp().num_workers();
-    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
-    let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
     let mut triggers: Vec<TickTrigger> = Vec::new();
     // The batch's `Drain` repliers, held across the tick they are waiting on.
     let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
@@ -753,7 +744,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
         // Run the tick. Errors are reported in logs AND handed to every Drain
         // trigger's `done`: the waiting reader's view is stale, so reporting
         // success would serve stale rows under STATUS_OK.
-        let tick_result = run_tick(&shared, &tids_scratch, nw, &mut fut_slots, &mut ack_slots).await;
+        let tick_result = run_tick(&shared, &tids_scratch, nw).await;
         if let Err(e) = &tick_result {
             gnitz_warn!("tick error: {}", e);
         }
@@ -765,18 +756,12 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
 
 /// Emit Tick groups for every `tid` and await the per-worker ACKs.
 ///
-/// The emit-and-await lock shape: the reply lease taken before any lock,
+/// The emit-and-await lock shape: the ACK lease taken before any lock,
 /// `catalog_rwlock.read()` (so DDL cannot mutate schemas mid-emission) +
 /// `sal_writer_excl` covering only the contiguous emission window, one
 /// `signal_all` inside it, both released before awaiting so other reactor work
 /// proceeds concurrently with worker DAG eval.
-async fn run_tick(
-    shared: &Rc<Shared>,
-    tids: &[i64],
-    nw: usize,
-    fut_slots: &mut Vec<ReplyFuture>,
-    ack_slots: &mut Vec<Option<ipc::DecodedWire>>,
-) -> Result<(), WireFault> {
+async fn run_tick(shared: &Rc<Shared>, tids: &[i64], nw: usize) -> Result<(), WireFault> {
     // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
@@ -793,7 +778,7 @@ async fn run_tick(
         return Ok(());
     }
 
-    let req_ids = shared.reactor.alloc_replies(tids.len() * nw);
+    let req_ids = shared.reactor.lease_acks(tids.len() * nw);
 
     let _cat_read = shared.catalog_rwlock.read().await;
     let _sal_excl = shared.disp().sal_excl().lock().await;
@@ -809,7 +794,7 @@ async fn run_tick(
         let disp = shared.disp();
         let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
-            if let Err(e) = disp.write_tick_group(tid, GroupTargets::All(&req_ids[i * nw..(i + 1) * nw])) {
+            if let Err(e) = disp.write_tick_group(tid, GroupTargets::All(req_ids.id(i * nw))) {
                 result = Err(e);
                 break;
             }
@@ -835,7 +820,7 @@ async fn run_tick(
     // only produce a no-op tick that then reports success and masks this failure.
     shared.requeue_tick_tids(&tids[n..]);
 
-    let worker_err = await_worker_acks(&shared.reactor, &req_ids[..n * nw], "tick", fut_slots, ack_slots).await;
+    let worker_err = req_ids.acks(0..n * nw, |w, c| worker_error(w, "tick", c)).await;
     if let Some(e) = emit.err().or(worker_err.err()) {
         return Err(e);
     }
@@ -847,7 +832,7 @@ async fn run_tick(
 // Relay loop
 // ---------------------------------------------------------------------------
 
-/// Accumulate the reactor's `FLAG_EXCHANGE` frames into rounds and write each
+/// Accumulate the reactor's exchange frames into rounds and write each
 /// completed round back as an ExchangeRelay group. Its own task because the
 /// write needs `catalog_rwlock.read` and `sal_writer_excl`, neither of which a
 /// CQE handler can block-acquire.
@@ -2197,7 +2182,7 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             // its train at the ring boundary.
             PollPosition::Moved => {
                 let d = dispatches.next().expect("one dispatch per moved view");
-                match d.await_and_forward(&shared.reactor, peer).await {
+                match d.await_and_forward(peer).await {
                     Ok(true) => send_msg(peer, terminal_scan_msg(tid, client_id, watermark(dispatch_round))),
                     Ok(false) => return Ok(false),
                     Err(fault) => send_fault(peer, tid, client_id, &fault),
@@ -2284,9 +2269,9 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, dat
 
 /// Body of `handle_scan_multi`. `Ok(true)` once every relation's train and
 /// terminal have been sent; `Ok(false)` on client disconnect; `Err(msg)` on a
-/// shape/tid rejection or a mid-stream worker fault. All `ScanLease`s live in
-/// the `dispatches` vec and drop on return, so any error/disconnect return
-/// deregisters every id and discards undrained frames at the ring boundary.
+/// shape/tid rejection or a mid-stream worker fault. Every scan's lease lives in
+/// the `dispatches` vec and drops on return, so any error/disconnect return
+/// removes every route and discards undrained frames at the ring boundary.
 async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, WireFault> {
     // ── Phase 0: decode + frame-local shape rules ──────────────────────────
     // The authoritative run of the shared shape validator — a client may skip
@@ -2362,7 +2347,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
-        match d.await_and_forward(&shared.reactor, peer).await {
+        match d.await_and_forward(peer).await {
             Ok(true) => {}
             Ok(false) => return Ok(false),
             Err(f) => return Err(f),

@@ -281,7 +281,7 @@ pub(super) async fn ensure_unique_filters_warm(
     // scans are pure waste.
     let unicast = read_fanout(disp, table_id, None);
 
-    // `_lease` held across the full continuation drain below; its workers
+    // `scan` holds the lease across the full continuation drain below; its workers
     // stream multi-frame trains, and on an early error return (or a
     // mid-scan cancellation) the lease drop discards every undrained
     // frame at the ring boundary.
@@ -305,7 +305,7 @@ pub(super) async fn ensure_unique_filters_warm(
     // On failure (worker crash mid-scan or cancellation) the guard is left
     // armed, so its Drop removes the cold entries and the next validation
     // retries warmup from scratch.
-    drain_index_scan(slots, &scan, reactor, "scan", &schema, |mb, _| {
+    drain_index_scan(slots, &scan, "scan", &schema, |mb, _| {
         let mut filters = disp.unique_filters.borrow_mut();
         for d in &missing {
             if let Some(filter) = filters.get_mut(&(table_id, d.cols)) {

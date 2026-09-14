@@ -1,24 +1,16 @@
 //! Stream delivery: where a reactor future waits for the *next* of many values.
-//!
-//! [`super::park::ParkMap`] is the one-shot half of the same job. This is the
-//! other half — accepted connections, a worker's continuation frames, inbound
-//! client frames, exchange frames and `chan` — each of which would otherwise
-//! spell out its own queue, waker slot and end-of-stream flag.
-//!
-//! No interior mutability: every user already holds one behind a `RefCell`.
 
 use std::collections::VecDeque;
 use std::task::{Context, Poll, Waker};
 
 pub(super) struct WakeQueue<T> {
     queue: VecDeque<T>,
-    /// The one awaiter parked on this queue. One, not a list: every user is a
-    /// single consumer — one accept loop, one scan awaiter, one connection
-    /// handler, one relay task, one `chan::Receiver`.
+    /// The one awaiter. One left by a dropped awaiter at most re-polls a live task:
+    /// task keys are never reused.
     waker: Option<Waker>,
     /// No further value will be pushed, so a drained queue resolves to `None`
-    /// rather than parking. Never set by the users whose stream has no end
-    /// (accept, scan routing); their futures unwrap the `Option`.
+    /// rather than parking. Never set on a stream with no end, whose futures
+    /// unwrap the `Option`.
     closed: bool,
 }
 
@@ -49,13 +41,25 @@ impl<T> WakeQueue<T> {
         if self.closed {
             return Poll::Ready(None);
         }
-        self.waker = Some(cx.waker().clone());
+        self.park(cx);
         Poll::Pending
+    }
+
+    /// Register `cx`'s waker for the next push or close, without taking a value.
+    pub(super) fn park(&mut self, cx: &Context<'_>) {
+        match &mut self.waker {
+            Some(w) => w.clone_from(cx.waker()),
+            None => self.waker = Some(cx.waker().clone()),
+        }
     }
 
     /// Take the next value without parking. For a caller that must not await.
     pub(super) fn pop(&mut self) -> Option<T> {
         self.queue.pop_front()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 
     /// End the stream and wake the parked awaiter, so its poll past the
@@ -69,17 +73,6 @@ impl<T> WakeQueue<T> {
 
     pub(super) fn is_closed(&self) -> bool {
         self.closed
-    }
-
-    /// Waker hygiene: a cancelled awaiter must leave no waker behind, or the
-    /// next push wakes a task that is no longer listening.
-    pub(super) fn clear_waiter(&mut self) {
-        self.waker = None;
-    }
-
-    #[cfg(test)]
-    pub(super) fn has_waiter(&self) -> bool {
-        self.waker.is_some()
     }
 
     #[cfg(test)]

@@ -595,7 +595,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
             // everything the writer published was already consumed. Reading it
             // after would blame a frame the writer had not published yet.
             let writer_done = done.load(Ordering::Acquire);
-            match receiver.try_read(0) {
+            match receiver.try_read_slot(0).map(|s| s.decode(0)) {
                 Some(decoded) => {
                     assert_eq!(
                         decoded.control.request_id, next_expected,
@@ -627,7 +627,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
     // finishes rather than unwinding straight into `join`.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(drain));
     while !done.load(Ordering::Acquire) {
-        while receiver.try_read(0).is_some() {}
+        while receiver.try_read_slot(0).map(|s| s.decode(0)).is_some() {}
         std::thread::yield_now();
     }
     writer_thread.join().expect("writer thread");
@@ -657,7 +657,10 @@ fn w2m_control_only_reply_has_no_backing() {
     writer.send_status(0, 42, STATUS_OK, b"");
 
     let receiver = W2mReceiver::new(vec![ptr]);
-    let decoded = receiver.try_read(0).expect("ACK must decode");
-    assert_eq!(decoded.control.request_id, 42);
-    assert!(decoded.data_batch.is_none(), "control-only ACK must have no data_batch");
+    let slot = receiver.try_read_slot(0).expect("an ACK");
+    assert_eq!(slot.control(0).request_id, 42);
+    assert!(
+        slot.decode(0).data_batch.is_none(),
+        "control-only ACK must have no data_batch"
+    );
 }

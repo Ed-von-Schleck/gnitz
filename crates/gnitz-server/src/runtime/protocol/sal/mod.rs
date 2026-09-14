@@ -128,12 +128,12 @@ fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = u32> + '_ {
 
 /// Which of a group's slots are written, and the request id each answers on.
 #[derive(Clone, Copy)]
-pub(crate) enum GroupTargets<'a> {
+pub(crate) enum GroupTargets {
     /// Broadcast on request id 0. A slot that answers anyway is harvested by
     /// ring position — `Flush`, `FlushEph` and `Tick` all do.
     AllUnaddressed,
-    /// Broadcast; slot `w` answers on `ids[w]`. `ids.len()` must be `nw`.
-    All(&'a [u64]),
+    /// Broadcast; slot `w` answers on `base + w`.
+    All(u64),
     /// Only `worker`'s slot is written, and it answers on `req_id`.
     One { worker: usize, req_id: u64 },
 }
@@ -178,7 +178,7 @@ pub(crate) struct DirectGroup<'a> {
     /// [`SalMessageKind::schema_survives_a_rowless_slot`] states.
     pub(crate) template: WireMsg<'a>,
     pub(crate) data: GroupData<'a>,
-    pub(crate) targets: GroupTargets<'a>,
+    pub(crate) targets: GroupTargets,
 }
 
 impl<'a> DirectGroup<'a> {
@@ -214,7 +214,7 @@ impl<'a> DirectGroup<'a> {
             data,
             request_id: match self.targets {
                 GroupTargets::AllUnaddressed => 0,
-                GroupTargets::All(ids) => ids[w],
+                GroupTargets::All(base) => base + w as u64,
                 GroupTargets::One { req_id, .. } => req_id,
             },
             schema_block: self.template.schema_block.filter(|_| keeps_schema),
@@ -971,9 +971,6 @@ impl SalWriter {
     /// `zone_start`. The one encode path, for both writers above.
     fn lay_out(&self, g: &DirectGroup, lsn: u64, zone_start: bool) -> Result<(usize, u64), WireFault> {
         let nw = self.num_workers;
-        if let GroupTargets::All(ids) = g.targets {
-            assert_eq!(ids.len(), nw, "req_ids.len()={} != num_workers={}", ids.len(), nw);
-        }
         if let GroupData::PerWorker(d) = g.data {
             assert_eq!(d.len(), nw, "worker_data.len()={} != num_workers={}", d.len(), nw);
         }

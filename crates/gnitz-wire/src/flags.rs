@@ -5,11 +5,10 @@
 // Wire protocol flags
 // ---------------------------------------------------------------------------
 
-// Bits 0-15 hold the request verbs and the W2M exchange flag; bits 16-41 are
+// Bits 0-15 hold the request verbs; bits 16-41 are
 // wire-level fields (conflict mode, schema version, probe mode) encoded by the
 // sender and decoded by the receiver; bits 48+ are booleans.
 
-pub const FLAG_EXCHANGE: u64 = 16;
 /// Marks a frame as a data push, on both the client→master and master→SAL/
 /// worker legs. Client push frames carry it so push-vs-scan routing never
 /// depends on data presence: an empty batch (a legitimate empty Z-set delta)
@@ -113,7 +112,6 @@ const _: () = {
     assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
     assert!(WIRE_PROBE_MODE_MASK & (WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK) == 0);
     let flags = [
-        FLAG_EXCHANGE,
         FLAG_PUSH,
         FLAG_SEEK,
         FLAG_SEEK_BY_INDEX,

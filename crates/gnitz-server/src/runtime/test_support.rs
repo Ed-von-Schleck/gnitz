@@ -28,6 +28,13 @@ pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     );
 }
 
+/// A reactor with no W2M rings, for the tests that route no worker traffic.
+pub(crate) fn make_reactor() -> crate::runtime::reactor::Reactor {
+    use crate::runtime::reactor::{Limits, Reactor};
+    let no_rings = std::rc::Rc::new(crate::runtime::w2m::W2mReceiver::new(vec![]));
+    Reactor::new(16, Limits::TEST, no_rings).expect("reactor")
+}
+
 /// Poll a future exactly once with a noop waker; `None` if it is still pending.
 /// For the tests that assert what a *single* poll does and then discard the
 /// future — one that is re-polled needs its own pinned handle instead.

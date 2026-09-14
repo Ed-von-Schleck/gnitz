@@ -52,7 +52,7 @@ pub(crate) const PRECONDITION_BYTES: usize = 8 + 8;
 /// physically remain.
 const MIN_PUSH_FAMILY_BYTES: usize = 1 + 2 * WAL_HEADER_SIZE;
 
-/// Maximum relations in one `SCAN_MULTI`. The master holds one `ScanLease` and
+/// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
 /// covers a realistic consistent snapshot.
 pub const SCAN_MULTI_MAX_RELATIONS: usize = 16;

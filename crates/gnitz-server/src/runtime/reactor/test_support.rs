@@ -4,11 +4,15 @@
 //! attached to `conn`, `io` or `futures` reaches the same fixtures without any
 //! of them becoming crate API.
 
+use std::os::fd::{AsRawFd, OwnedFd};
+
 pub(super) use super::runloop::make_waker;
 use super::*;
+pub(super) use crate::runtime::test_support::make_reactor;
+use crate::runtime::w2m::W2mWriter;
 
-/// The two drivers every reactor suite runs on. An inherent impl here rather
-/// than in `runloop`/`mod`, so the production files carry no test-only method.
+/// The drivers every reactor suite runs on. An inherent impl here rather than in
+/// `runloop`/`mod`, so the production files carry no test-only method.
 impl Reactor {
     /// Drive `fut` to completion. Single-threaded, blocking. Spawns the
     /// future as a task internally and returns its output via a shared cell.
@@ -56,10 +60,45 @@ impl Reactor {
         }
         panic!("reactor: {MAX_TICKS} ticks without reaching idle — lost wake or deadlock");
     }
+
+    /// Route every frame the W2M rings hold, as a tick's drain does — for a
+    /// fixture that publishes frames and never ticks.
+    pub(crate) fn route_w2m_for_test(&self) {
+        self.drain_all_w2m();
+    }
 }
 
-pub(super) fn make_reactor() -> Reactor {
-    Reactor::new(16, Limits::TEST).expect("reactor")
+/// A reactor over `n` fresh W2M rings, with the writer of each. The rings
+/// are leaked: a `W2mSlot` a failing assert leaves routed writes through its
+/// ring on drop, so never unmapping makes teardown order irrelevant.
+pub(super) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
+    let ptrs: Vec<*mut u8> = (0..n)
+        .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) }.leak())
+        .collect();
+    let writers = ptrs.iter().map(|&p| W2mWriter::new(p)).collect();
+    let r = Reactor::new(16, Limits::TEST, Rc::new(W2mReceiver::new(ptrs))).expect("reactor");
+    (r, writers)
+}
+
+/// Run `f` on its own thread and fail if it has not returned within `limit`, so
+/// a tick that sleeps when it must not fails the test instead of wedging the
+/// run. A timed-out thread is left blocked; the harness exits past it.
+pub(super) fn within(limit: std::time::Duration, f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(()) => handle.join().expect("test thread panicked"),
+        // The sender dropped without sending: `f` panicked.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("did not finish within {limit:?}"),
+    }
 }
 
 /// Drive `dispatch_cqe` with a synthetic completion tagged `kind`/`id`,
@@ -96,61 +135,46 @@ impl Future for YieldOnce {
     }
 }
 
-/// Build a minimal `DecodedWire` for tests — only `request_id` matters.
-pub(super) fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
-    use gnitz_wire::control::DecodedControl;
-    DecodedWire {
-        control: DecodedControl { request_id: req_id, ..Default::default() },
-        schema: None,
-        data_batch: None,
-    }
-}
-
-/// A socketpair set up for an egress test: the reactor, the sender fd, and the
-/// receiver end. The `Conn` is inserted directly rather than via
-/// `register_conn`, which would also arm a recv these tests never complete;
-/// `send_inflight` accounting only needs the entry to exist. `sndbuf` shrinks
-/// both socket buffers, so a payload larger than it is guaranteed to split
-/// across several OP_SEND CQEs. The caller closes both fds.
-pub(super) unsafe fn egress_pair(sndbuf: Option<i32>) -> (Rc<Reactor>, i32, i32) {
-    let (sender, receiver) = stream_pair();
+/// A reactor built with `limits` and a socketpair `(sender, receiver)`, nothing
+/// registered. `sndbuf` shrinks both socket buffers.
+pub(super) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Rc<Reactor>, OwnedFd, OwnedFd) {
+    let (sender, receiver) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let (sender, receiver) = (OwnedFd::from(sender), OwnedFd::from(receiver));
     if let Some(bytes) = sndbuf {
-        for (fd, opt) in [(sender, libc::SO_SNDBUF), (receiver, libc::SO_RCVBUF)] {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                opt,
-                &bytes as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
+        for (fd, opt) in [(&sender, libc::SO_SNDBUF), (&receiver, libc::SO_RCVBUF)] {
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    &bytes as *const _ as *const libc::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
         }
     }
-    let r: Rc<Reactor> = Rc::new(make_reactor());
-    r.inner
-        .conns
-        .borrow_mut()
-        .insert(sender, Box::new(io::Conn::new(Rc::clone(&r.inner.inbound))));
+    let r = Rc::new(Reactor::new(16, limits, Rc::new(W2mReceiver::new(vec![]))).expect("reactor"));
     (r, sender, receiver)
 }
 
 /// Read `expect` bytes off `fd` and close it, so the send under test never
 /// stalls on a full socket buffer. Returns what it actually saw.
-pub(super) fn spawn_drain(fd: i32, expect: usize) -> std::thread::JoinHandle<usize> {
-    std::thread::spawn(move || unsafe {
+pub(super) fn spawn_drain(fd: OwnedFd, expect: usize) -> std::thread::JoinHandle<usize> {
+    std::thread::spawn(move || {
         let mut seen = 0usize;
         let mut scratch = vec![0u8; 64 * 1024];
         while seen < expect {
             // EINTR is not EOF: breaking on it would close `fd` early and fail
             // the sender under test with EPIPE.
-            let n = gnitz_foundation::posix_io::retry_eintr(|| {
-                libc::read(fd, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len()) as libc::c_int
+            let n = gnitz_foundation::posix_io::retry_eintr(|| unsafe {
+                libc::read(fd.as_raw_fd(), scratch.as_mut_ptr() as *mut libc::c_void, scratch.len()) as libc::c_int
             });
             match n {
                 Ok(n) if n > 0 => seen += n as usize,
                 _ => break,
             }
         }
-        libc::close(fd);
+        drop(fd);
         seen
     })
 }
@@ -161,25 +185,6 @@ pub(super) fn framed(payload: &[u8]) -> Vec<u8> {
     v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     v.extend_from_slice(payload);
     v
-}
-
-/// AF_UNIX SOCK_STREAM pair, as `(reactor_end, test_end)`. The reactor
-/// registers or sends on the first; the test writes framed bytes into, or
-/// drains, the second. Both directions work — a socketpair is symmetric.
-pub(super) unsafe fn stream_pair() -> (i32, i32) {
-    let mut fds = [0i32; 2];
-    let rc = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
-    assert_eq!(rc, 0, "socketpair");
-    (fds[1], fds[0])
-}
-
-/// `(read_end, write_end)` of a fresh pipe. Tests that need a real,
-/// owned fd number — `reap_closing_conns` calls `libc::close` on what it
-/// reaps, so a magic number would race a parallel test that owns it.
-pub(super) unsafe fn pipe_pair() -> (i32, i32) {
-    let mut fds = [0i32; 2];
-    assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "pipe");
-    (fds[0], fds[1])
 }
 
 /// Drive the reactor up to `max` non-blocking ticks, returning `true` as
@@ -213,7 +218,6 @@ pub(super) unsafe fn make_scan_ring(
     crate::runtime::w2m::W2mReceiver,
     crate::runtime::test_support::SharedRegion,
 ) {
-    use crate::runtime::w2m::{W2mReceiver, W2mWriter};
     use crate::runtime::wire as ipc;
 
     let region = crate::runtime::w2m::fixtures::test_ring(64 * 1024);

@@ -22,8 +22,8 @@ struct PreflightKeyStream {
     /// Worker index, for error attribution only — the merge addresses streams
     /// by reply position.
     w: usize,
-    /// Scan request id, for frame pulls.
-    req_id: u64,
+    /// Reply index into the scan, for frame pulls.
+    reply: usize,
     /// The frame currently being read; pins its ring bytes until replaced.
     slot: Option<W2mSlot>,
     /// Byte offset of the frame's PK region into the slot, and its key count;
@@ -38,10 +38,10 @@ struct PreflightKeyStream {
 }
 
 impl PreflightKeyStream {
-    fn new(w: usize, req_id: u64) -> Self {
+    fn new(w: usize, reply: usize) -> Self {
         PreflightKeyStream {
             w,
-            req_id,
+            reply,
             slot: None,
             pk_off: 0,
             count: 0,
@@ -52,7 +52,7 @@ impl PreflightKeyStream {
 
     /// Install `slot` as the current frame, locating its key region.
     /// A fault/corrupt/undecodable frame is an immediate `Err` — the caller
-    /// unwinds to the `ScanLease` drop, which discards the undrained trains.
+    /// unwinds to the scan lease's drop, which discards the undrained trains.
     fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), WorkerFault> {
         self.row = 0;
         self.count = 0;
@@ -98,7 +98,7 @@ impl PreflightKeyStream {
     async fn next_key(
         &mut self,
         frame_schema: &SchemaDescriptor,
-        reactor: &crate::runtime::reactor::Reactor,
+        scan: &ScanDispatch,
     ) -> Result<Option<PkBuf>, WorkerFault> {
         let pk_stride = frame_schema.pk_stride();
         loop {
@@ -111,7 +111,7 @@ impl PreflightKeyStream {
                 self.slot = None; // release the ring slot at the train's end
                 return Ok(None);
             }
-            let slot = reactor.await_scan_slot(self.req_id as u32).await;
+            let slot = scan.next_frame(self.reply).await;
             self.attach_frame(slot, frame_schema)?;
         }
     }
@@ -181,12 +181,11 @@ impl PreflightAccumulator {
 /// by two workers surfaces as two equal heads.
 ///
 /// Returns on the FIRST error and on the first duplicate without draining the
-/// rest — the caller's `ScanLease` drop discards the undrained trains at the
+/// rest — the caller's scan lease drop discards the undrained trains at the
 /// ring boundary, as it does for `drain_index_scan`.
 async fn merge_index_scan(
     slots: Vec<W2mSlot>,
     scan: &ScanDispatch,
-    reactor: &crate::runtime::reactor::Reactor,
     frame_schema: &SchemaDescriptor,
 ) -> Result<PreflightAccumulator, WorkerFault> {
     use std::cmp::Reverse;
@@ -197,14 +196,13 @@ async fn merge_index_scan(
 
     // Ordered by (span, reply index) — byte-lexicographic via `PkBuf: Ord` —
     // so equal spans pop adjacently whichever workers hold them. The tie-break
-    // is the REPLY index, which is also `streams`' index: `ScanDispatch` ids
-    // are reply-ordered, so a unicast answers on slot 0 whatever worker it was.
+    // is the REPLY index, which is also `streams`' index: a scan's lease ids
+    // are reply-ordered, so a unicast answers on id 0 whatever worker it was.
     let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(nw);
     for (i, slot) in slots.into_iter().enumerate() {
-        let (w, req_id) = scan.reply(i);
-        let mut s = PreflightKeyStream::new(w, req_id);
+        let mut s = PreflightKeyStream::new(scan.worker(i), i);
         s.attach_frame(slot, frame_schema)?;
-        if let Some(key) = s.next_key(frame_schema, reactor).await? {
+        if let Some(key) = s.next_key(frame_schema, scan).await? {
             heap.push(Reverse((key, i)));
         }
         streams.push(s);
@@ -215,7 +213,7 @@ async fn merge_index_scan(
         if !acc.offer(key) {
             break;
         } // first duplicate is conclusive
-        if let Some(next) = streams[i].next_key(frame_schema, reactor).await? {
+        if let Some(next) = streams[i].next_key(frame_schema, scan).await? {
             heap.push(Reverse((next, i)));
         }
     }
@@ -293,8 +291,8 @@ impl MasterDispatcher {
 
         // Fan out the pre-flight command (the packed column list rides in
         // seek_col_idx); each worker answers with its sorted-span
-        // continuation-frame train. `_lease` held to end of scope: when the
-        // merge returns early (error or duplicate verdict) the lease drop
+        // continuation-frame train. `scan` holds the lease to end of scope: when
+        // the merge returns early (error or duplicate verdict) the lease drop
         // discards the undrained trains at the ring boundary.
         let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
             // The worker's `UniquePreflight` arm resolves the owner's schema
@@ -311,7 +309,7 @@ impl MasterDispatcher {
         })
         .await?;
 
-        let merged = merge_index_scan(slots, &scan, reactor, &frame_schema).await?;
+        let merged = merge_index_scan(slots, &scan, &frame_schema).await?;
         if merged.duplicate {
             return Err(self.cat().unique_create_dup_err(owner_id, col_indices).into());
         }

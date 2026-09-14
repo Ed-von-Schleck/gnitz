@@ -457,11 +457,8 @@ async fn execute_probe_burst(
     .await?;
 
     for (i, scan) in dispatches.iter().enumerate() {
-        let slots = scan.await_slots(reactor).await;
-        drain_index_scan(slots, scan, reactor, "pipeline", checks[i].reply_schema(), |b, _| {
-            sink(i, b)
-        })
-        .await?;
+        let slots = scan.await_slots().await;
+        drain_index_scan(slots, scan, "pipeline", checks[i].reply_schema(), |b, _| sink(i, b)).await?;
     }
     Ok(())
 }
@@ -1164,7 +1161,7 @@ async fn txn_check_fk_restrict(
     }
 
     // A streaming fold: the first non-exempt holder aborts the drain, whose
-    // `ScanLease` drop discards every train still in flight.
+    // scan lease drop discards every train still in flight.
     let mut hspan = PkBuf::zeroed(0);
     execute_probe_burst(disp, reactor, &checks, |i, rows| {
         let plan = &plans[i];

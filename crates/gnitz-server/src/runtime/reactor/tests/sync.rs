@@ -1,6 +1,5 @@
 //! The single-threaded async primitives: `oneshot`, `chan`, `AsyncMutex`,
-//! `AsyncRwLock`, `join_all_unpin` and the cancellation shapes each must
-//! survive.
+//! `AsyncRwLock` and the cancellation shapes each must survive.
 
 use std::cell::Cell as StdCell;
 
@@ -355,20 +354,6 @@ fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
             assert!(lock.is_quiescent(), "mix {mix} of {len}: the lock did not end idle");
         }
     }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// join_all_unpin edge cases.
-// ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn join_all_unpin_empty_returns_empty_vec() {
-    let r = make_reactor();
-    let result = r.block_on(async { join_all_unpin(std::iter::empty::<std::future::Ready<i32>>()).await });
-    assert!(
-        result.is_empty(),
-        "join_all_unpin on empty iterator must return empty vec"
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────

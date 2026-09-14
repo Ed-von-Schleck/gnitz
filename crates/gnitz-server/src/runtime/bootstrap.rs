@@ -44,11 +44,9 @@ fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, 
     })
 }
 
-/// Master pre-fork system-table replay. Builds the system-table family map from
-/// the flushed LSNs, then ingests every committed DdlSync batch addressed
-/// to a system table — orphan COL_TAB rows from a crashed DDL are skipped
-/// because their zone never closed.
-fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut CatalogEngine) -> Result<(), String> {
+/// Master pre-fork replay of every committed DdlSync group. Returns the tail's
+/// highest committed zone LSN, of any kind.
+fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut CatalogEngine) -> Result<u64, String> {
     let family_lsns = catalog.registry().system_flushed_lsns();
     let tail = CommittedTail::open(log, epoch, SalMessageKind::DdlSync, &family_lsns)?;
 
@@ -76,7 +74,7 @@ fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut Catalog
     if replayed > 0 {
         gnitz_note!("SAL system table recovery: replayed {replayed} entries");
     }
-    Ok(())
+    Ok(tail.max_committed_lsn())
 }
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
@@ -444,10 +442,15 @@ fn run_worker_child(
     }
 }
 
-/// The master's half of recovery before any worker exists. Returns the sweep set
-/// the verdict below determines, which every worker inherits across the fork.
-fn master_pre_fork_recovery(catalog: &mut CatalogEngine, log: SalLog, walk_epoch: u32) -> Result<Vec<i64>, String> {
-    recover_system_tables_from_sal(log, walk_epoch, catalog)?;
+/// The master's half of recovery before any worker exists: the sweep set every
+/// worker inherits, and a zone-LSN seed above every store counter and every
+/// committed tail zone — taken before the fork detaches the user stores.
+fn master_pre_fork_recovery(
+    catalog: &mut CatalogEngine,
+    log: SalLog,
+    walk_epoch: u32,
+) -> Result<(Vec<i64>, u64), String> {
+    let tail_lsn = recover_system_tables_from_sal(log, walk_epoch, catalog)?;
 
     // Checked, and before the gc below: the replayed DDL lives only in master
     // memory until this makes it durable, so a swallowed failure lets the SAL
@@ -478,7 +481,8 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine, log: SalLog, walk_epoch
         .map_err(|e| format!("recovery-start generation bump failed: {e}"))?;
     inject_recovery_panic("genbump");
 
-    Ok(swept_base_tables(catalog))
+    let lsn_seed = catalog.registry().max_current_lsn().max(tail_lsn);
+    Ok((swept_base_tables(catalog), lsn_seed))
 }
 
 /// Fork one child per worker, each of which never returns. Yields the parent's
@@ -606,7 +610,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     // dropping it would run `CircuitState::drop`, which removes directories.
     let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
 
-    let swept_bases = master_pre_fork_recovery(catalog, ipc.sal_log(), ipc.walk_epoch)?;
+    let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog, ipc.sal_log(), ipc.walk_epoch)?;
 
     let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, placement.as_ref())?;
 
@@ -656,7 +660,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     };
     gnitz_note!("GnitzDB ready");
 
-    Ok(ServerExecutor::run(dispatcher, server_fd, tls_init))
+    Ok(ServerExecutor::run(dispatcher, server_fd, tls_init, lsn_seed))
 }
 
 #[cfg(test)]

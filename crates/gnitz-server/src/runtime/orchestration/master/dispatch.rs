@@ -4,6 +4,7 @@
 //! counter and worker reaping.
 
 use super::*;
+use crate::runtime::w2m::W2M_EXCHANGE_RING_ID;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_store::relation::Relation;
@@ -59,13 +60,12 @@ pub(crate) enum SeekReply {
 async fn merge_replies(
     slots: Vec<W2mSlot>,
     scan: &ScanDispatch,
-    reactor: &crate::runtime::reactor::Reactor,
     op: &str,
     expected: &SchemaDescriptor,
 ) -> Result<Option<Batch>, WorkerFault> {
     let mut acc: Option<Batch> = None;
     let mut merged_bytes = 0usize;
-    drain_index_scan(slots, scan, reactor, op, expected, |mb, frame_len| {
+    drain_index_scan(slots, scan, op, expected, |mb, frame_len| {
         // The merge goes back out as one frame, so it is bounded by what the
         // client will read (`FRAME_CAP`). Σ frame bytes ≥ that merged encode
         // size — every frame re-counts its header and the first one the schema
@@ -277,18 +277,22 @@ impl MasterDispatcher {
             // broadly.
             let mut progressed = false;
             for w in BitIter(pending_mask) {
-                let Some(decoded) = self.w2m.try_read(w) else {
+                let Some(slot) = self.w2m.try_read_slot(w) else {
                     continue;
                 };
                 progressed = true;
-                if decoded.control.flags & FLAG_EXCHANGE == 0 {
-                    if let Some(e) = worker_error(w, ctx, &decoded.control) {
+                if slot.internal_req_id != W2M_EXCHANGE_RING_ID {
+                    let ctrl = slot.control(w);
+                    drop(slot);
+                    if let Some(e) = worker_error(w, ctx, &ctrl) {
                         return Err(e.text);
                     }
                     pending_mask &= !(1u64 << w);
                     continue;
                 }
-                let Some(relay) = acc.process(w, decoded) else {
+                let frame = slot.decode(w);
+                drop(slot); // released before the relay is prepared and written
+                let Some(relay) = acc.process(w, frame) else {
                     continue; // round still incomplete
                 };
                 // A round just completed. If a prior round was stamped
@@ -732,7 +736,7 @@ impl MasterDispatcher {
                 expect_single_frame(&slot, worker, "seek")?;
                 Ok(SeekReply::Frame(slot))
             }
-            Fanout::Broadcast => merge_replies(slots, &scan, reactor, "seek", &schema)
+            Fanout::Broadcast => merge_replies(slots, &scan, "seek", &schema)
                 .await
                 .map(|merged| SeekReply::Merged(merged.map(Box::new))),
         }
@@ -777,7 +781,7 @@ impl MasterDispatcher {
             })
         })
         .await?;
-        merge_replies(slots, &scan, reactor, "seek_by_index", &expected).await
+        merge_replies(slots, &scan, "seek_by_index", &expected).await
     }
 
     /// Fan out a SCAN to the workers `unicast` names and forward every response
@@ -791,8 +795,8 @@ impl MasterDispatcher {
     /// the worker is the sole `ReadSpec`/OPK decoder.
     ///
     /// `forward_scan_slots` returns on the FIRST worker fault, decode error or
-    /// client disconnect, without draining the doomed trains: `_lease` drops on
-    /// return and `route_scan_slot` discards every undrained frame at the ring
+    /// client disconnect, without draining the doomed trains: the scan's lease
+    /// drops on return and the drain releases every undrained frame at the ring
     /// boundary, so a still-streaming worker cannot wedge in
     /// `W2mWriter::send_msg`. The fault frame can therefore reach a client that
     /// already read earlier data frames; its reply accumulator discards those.
@@ -838,7 +842,7 @@ impl MasterDispatcher {
             })
         })
         .await?;
-        let ok = forward_scan_slots(reactor, peer, slots, &scan).await?;
+        let ok = forward_scan_slots(peer, slots, &scan).await?;
         Ok((ok, sampled))
     }
 
@@ -882,7 +886,7 @@ impl MasterDispatcher {
     /// A failed emit **burns** its round rather than reusing it, since rounds
     /// must be strictly increasing. That gates nothing away: no rows exist at the
     /// burnt round, and the re-queued tid's next tick raises the map past it.
-    pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets<'_>) -> Result<(), WorkerFault> {
+    pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets) -> Result<(), WorkerFault> {
         let round = self.tick_round.get() + 1;
         self.tick_round.set(round);
         self.record_delta_round(tid, round);
@@ -1032,15 +1036,15 @@ impl MasterDispatcher {
         self.cat().drain_checkpoint_gated_deletions();
     }
 
-    /// Lay one push batch out as a SAL group inside `scope`, with a per-worker
-    /// request id. `recoverable` puts it inside the zone; a stream's rows ride
+    /// Lay one push batch out as a SAL group inside `scope`, worker `w` answering
+    /// on `base + w`. `recoverable` puts it inside the zone; a stream's rows ride
     /// outside. The committer commits the scope, signals and awaits the ACKs.
     pub(crate) fn write_commit_group(
         &self,
         scope: &SalScope,
         target_id: i64,
         batch: &Batch,
-        req_ids: &[u64],
+        base: u64,
         recoverable: bool,
     ) -> Result<(), WorkerFault> {
         let relation = self.wire_schema(target_id);
@@ -1048,15 +1052,15 @@ impl MasterDispatcher {
         // differs (full broadcast vs PK-partitioned). One `with_group` call site
         // keeps the atomic-zone framing, LSN, ACK accounting, and the committer's
         // single `fdatasync` shared between them.
-        let base = DirectGroup {
-            targets: GroupTargets::All(req_ids),
+        let group = DirectGroup {
+            targets: GroupTargets::All(base),
             ..DirectGroup::new(SalMessageKind::Push)
         };
         // A replicated relation broadcasts: the whole batch lands in every
         // worker's ingest + SAL slot, so each worker durably logs the full table
         // and enforces uniqueness against its identical full copy.
         with_commit_indices(batch, relation.descriptor(), self.num_workers(), |worker_indices| {
-            with_group(batch, worker_indices, &relation, base, |g| scope.write(g, recoverable))
+            with_group(batch, worker_indices, &relation, group, |g| scope.write(g, recoverable))
         })
     }
 
@@ -1073,7 +1077,7 @@ impl MasterDispatcher {
         &self,
         lsn: u64,
         kind: SalMessageKind,
-        targets: GroupTargets<'_>,
+        targets: GroupTargets,
     ) -> Result<(), WorkerFault> {
         self.note_flush_round(lsn, kind);
         self.write_group(&DirectGroup { lsn, targets, ..DirectGroup::new(kind) })

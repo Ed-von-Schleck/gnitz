@@ -130,9 +130,8 @@ impl TestLog {
         let base = self.cursor();
         let nw = self.writer.num_workers();
         let relation = ipc::WireSchema::encoded(tid as i64, schema);
-        let req_ids: Vec<u64> = (0..nw as u64).collect();
         let group = DirectGroup {
-            targets: GroupTargets::All(&req_ids),
+            targets: GroupTargets::All(0),
             lsn,
             ..DirectGroup::new(SalMessageKind::Push)
         };

@@ -31,6 +31,29 @@ def _row_sql(rows):
         for pk, val, s, n in rows)
 
 
+def test_a_commit_after_a_replayed_tail_survives_the_next_crash(own_server):
+    """Many single-row commits replayed at boot, then one more and a crash: that
+    commit's zone must sit above the watermark the replay persisted."""
+    own_server.start()
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.create_schema("dur")
+        conn.execute_sql(
+            "CREATE TABLE r (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name="dur")
+        for pk in range(16):
+            conn.execute_sql(f"INSERT INTO r VALUES ({pk}, {pk})", schema_name="dur")
+    want = {(pk, pk): 1 for pk in range(16)}
+
+    own_server.restart()
+    with gnitz.connect(own_server.sock_path) as conn:
+        assert bag(scanned(conn, "dur", "r"), "pk", "val") == want
+        conn.execute_sql("INSERT INTO r VALUES (100, 100)", schema_name="dur")
+
+    own_server.restart()
+    with gnitz.connect(own_server.sock_path) as conn:
+        assert bag(scanned(conn, "dur", "r"), "pk", "val") == want | {(100, 100): 1}
+
+
 def test_every_dml_verb_survives_two_crashes(own_server):
     """INSERT, UPDATE, DELETE and delete-then-reinsert, the last three applied
     repeatedly to one key, then two consecutive crashes with no clean shutdown

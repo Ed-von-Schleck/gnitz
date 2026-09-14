@@ -27,10 +27,9 @@
 use super::executor::{request_drain, request_quiesce, Shared};
 use super::guard_panic;
 use super::TxnFamily;
-use crate::runtime::master::{await_worker_acks, first_worker_error_opt};
-use crate::runtime::reactor::{chan, join_into, oneshot, select2, Either, ReplyFuture, ReplyLease};
+use crate::runtime::master::worker_error;
+use crate::runtime::reactor::{chan, oneshot, select2, Either, Lease};
 use crate::runtime::sal::{GroupTargets, SalMessageKind, SalScope};
-use crate::runtime::wire::DecodedWire;
 use gnitz_store::storage::Batch;
 use gnitz_wire::WireFault;
 use std::rc::Rc;
@@ -117,12 +116,6 @@ pub struct PendingPush {
 /// (write + ACK wait + reset; see `flush_round`), but released across the
 /// sequence's drain step so the tick loop can acquire it per tick.
 pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
-    // `commit_pushes`' ACK scratch, reused across every commit to avoid a
-    // per-commit Vec<ReplyFuture> + Vec<Option<DecodedWire>> pair. Sized for one
-    // group's ACKs; commit_pushes grows them on the first multi-group batch and
-    // reuses the capacity thereafter.
-    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(shared.disp().num_workers());
-    let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(shared.disp().num_workers());
     loop {
         // Block for the first request. `None` needs an arm but cannot arrive:
         // `Shared` owns the one sender and this task holds an `Rc<Shared>`.
@@ -145,7 +138,7 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
 
         let PendingBatch { pushes, txns, barriers } = batch;
         if !pushes.is_empty() || !txns.is_empty() {
-            commit_pushes(&shared, pushes, txns, &mut fut_slots, &mut ack_slots).await;
+            commit_pushes(&shared, pushes, txns).await;
         }
 
         for (_, b) in barriers {
@@ -251,13 +244,7 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
 /// tables first or that advance is discarded on a crash.
 async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) {
     let nw = shared.disp().num_workers();
-    // A round already costs a broadcast, an `nw`-way ACK wait, a system-table
-    // flush and a SAL reset, so it allocates its own scratch rather than
-    // threading `run`'s through three frames; `req_ids` below is allocated per
-    // round on the same grounds.
-    let req_ids = shared.reactor.alloc_replies(nw);
-    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
-    let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(nw);
+    let req_ids = shared.reactor.lease_acks(nw);
 
     // `ephemeral_gen` already discriminates the two rounds, so it names the one a
     // failure is reported against too.
@@ -270,13 +257,13 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) {
 
     {
         let disp = shared.disp();
-        if let Err(e) = disp.write_checkpoint_group(lsn, kind, GroupTargets::All(&req_ids)) {
+        if let Err(e) = disp.write_checkpoint_group(lsn, kind, GroupTargets::All(req_ids.id(0))) {
             gnitz_fatal_abort!("checkpoint {} round: flush group write failed: {}", round, e);
         }
         disp.signal_all();
     }
 
-    if let Err(e) = await_worker_acks(&shared.reactor, &req_ids, "checkpoint", &mut fut_slots, &mut ack_slots).await {
+    if let Err(e) = req_ids.acks(0..nw, |w, c| worker_error(w, "checkpoint", c)).await {
         gnitz_fatal_abort!("checkpoint {} round: worker ACK failed: {}", round, e);
     }
     // Both rounds finalize the same way: flush system tables, then reset the SAL.
@@ -414,7 +401,7 @@ struct GroupInfo {
     /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
     /// `tid`, so one flag per group is exact.
     recoverable: bool,
-    req_ids: ReplyLease,
+    req_ids: Lease,
     merged: Batch,
     write_err: Option<WireFault>,
 }
@@ -444,9 +431,8 @@ enum Outcome {
 
 impl CommitUnit {
     /// This unit's groups with no error against them: what the SAL admitted,
-    /// and past Phase C what every worker also took. The one spelling — the
-    /// reply futures, the ACK blocks, the LSN publish and the filter ingest all
-    /// walk it, and two of them disagreeing would misalign the ACK blocks.
+    /// and past Phase C what every worker also took. The one spelling: a group
+    /// awaited that no worker was sent would park forever.
     fn live(&self) -> impl Iterator<Item = &GroupInfo> {
         self.groups.iter().filter(|g| g.write_err.is_none())
     }
@@ -478,20 +464,14 @@ impl CommitUnit {
 /// lock, THEN awaits worker ACKs (Phase C) and the fsync CQE (Phase D). LSN
 /// assignment and `done.send` happen after worker ACKs; the unique-index filter
 /// update happens after fsync.
-async fn commit_pushes(
-    shared: &Rc<Shared>,
-    mut pushes: Vec<PendingPush>,
-    txns: Vec<PendingTxn>,
-    fut_slots: &mut Vec<ReplyFuture>,
-    ack_slots: &mut Vec<Option<DecodedWire>>,
-) {
+async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: Vec<PendingTxn>) {
     // Sort by tid so runs are homogeneous. Stable: arrival order within a run is
     // what makes intra-batch last-insert-wins mean last *inserted*.
     pushes.sort_by_key(|p| p.tid);
 
     let nw = shared.disp().num_workers();
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
-    let alloc_req_ids = || shared.reactor.alloc_replies(nw);
+    let alloc_req_ids = || shared.reactor.lease_acks(nw);
 
     // ------------------------------------------------------------------
     // Phase A (no lock): build merged batches + req_id allocations.
@@ -630,15 +610,9 @@ async fn commit_pushes(
         (zone_lsn, fsync_fut)
     };
 
-    // One block of `nw` reply futures per live group, in unit order, in the
-    // caller's scratch buffer.
-    fut_slots.clear();
-    for g in units.iter().flat_map(|u| u.live()) {
-        fut_slots.extend(g.req_ids.iter().map(|&id| shared.reactor.await_reply(id)));
-    }
-
     // ------------------------------------------------------------------
-    // Phase C (no lock): await push ACKs, fire tick.
+    // Phase C (no lock): await push ACKs, per live group in unit order, then
+    // fire tick. Replies for later groups wait in their routes meanwhile.
     // fsync is awaited separately in Phase D so DAG evaluation overlaps
     // with fdatasync (~5 ms gap eliminated). LSN publish is deferred to
     // after fsync so clients only see a durable LSN.
@@ -647,17 +621,10 @@ async fn commit_pushes(
     // uniqueness check nothing durable backs. It runs after Phase D's fsync.
     // ------------------------------------------------------------------
     {
-        join_into(fut_slots, ack_slots).await;
-
-        // `join_into` sizes `ack_slots` to `fut_slots.len()`, so it holds exactly
-        // `nw` entries per live group and `chunks_exact` has no remainder. The
-        // blocks stay aligned because both walks are `live`.
-        let mut acks = ack_slots.chunks_exact(nw);
         for unit in &mut units {
             let downgrade = matches!(unit.outcome, Outcome::Pushes(_));
             for g in unit.live_mut() {
-                let block = acks.next().expect("one ACK block per live group");
-                let Some(e) = first_worker_error_opt("commit", block) else {
+                let Err(e) = g.req_ids.acks(0..nw, |w, c| worker_error(w, "commit", c)).await else {
                     continue;
                 };
                 if downgrade {
@@ -675,11 +642,6 @@ async fn commit_pushes(
                 }
             }
         }
-        // Drop DecodedWire heap fields (data_batch, error_msg) before the
-        // committer parks waiting for the next request. Capacity stays
-        // resident so the next commit reuses it.
-        ack_slots.clear();
-
         // Bump tick counters and maybe fire the auto-tick BEFORE awaiting
         // the fsync CQE so DAG evaluation overlaps with fdatasync. We
         // bump on writes that succeeded at the worker level — the LSN publish
@@ -740,7 +702,7 @@ fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result
     guard_panic("commit_write", || {
         Ok(shared
             .disp()
-            .write_commit_group(scope, g.tid, &g.merged, &g.req_ids, g.recoverable)
+            .write_commit_group(scope, g.tid, &g.merged, g.req_ids.id(0), g.recoverable)
             .err())
     })?
     .map_or(Ok(()), Err)

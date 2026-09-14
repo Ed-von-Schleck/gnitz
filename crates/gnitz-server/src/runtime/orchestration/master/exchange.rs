@@ -1,4 +1,4 @@
-//! Exchange rounds: turning per-worker `FLAG_EXCHANGE` frames into the relays
+//! Exchange rounds: turning per-worker exchange frames into the relays
 //! the master writes back.
 //!
 //! A **round** is one `(view_id, source_id)` pair's frames from every worker —
@@ -24,10 +24,9 @@ use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{Batch, Layout};
 use gnitz_wire::{low_bits_mask, MAX_WORKERS};
 
-/// Per-view accumulator for `FLAG_EXCHANGE` replies, keyed by
-/// `(view_id, source_id)`.
+/// Per-view accumulator for exchange frames, keyed by `(view_id, source_id)`.
 ///
-/// A worker dying mid-round leaves its entries here and the tick's `join_all`
+/// A worker dying mid-round leaves its entries here and the tick's `acks`
 /// parked forever — survivable only because `watchdog` shuts the reactor down
 /// on any worker crash.
 pub struct ExchangeAccumulator {
@@ -83,7 +82,7 @@ impl ExchangeAccumulator {
         ExchangeAccumulator { rounds: FxHashMap::default(), nw }
     }
 
-    /// Accept one FLAG_EXCHANGE reply.  Returns `Some(PendingRelay)` once
+    /// Accept one exchange frame.  Returns `Some(PendingRelay)` once
     /// every worker has reported for the same `(view_id, source_id)`
     /// pair; `None` while the round is still accumulating.  Logs (and
     /// drops) an exchange wire missing its schema instead of producing a

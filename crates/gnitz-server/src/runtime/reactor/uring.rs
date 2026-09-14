@@ -1,8 +1,9 @@
 //! The reactor's thin io_uring wrapper: SQE preparation, submit and CQE drain.
 //!
-//! Every `prep_*` is pure. A SQE whose memory the kernel reads after `submit`
-//! returns is `unsafe` to queue, and that memory is kept alive by a park slot's
-//! `carry`.
+//! Every `prep_*` is pure. Memory the kernel reads after submit must be kept
+//! alive by the caller until the SQE's CQE.
+
+use std::time::Duration;
 
 use io_uring::{opcode, squeue, types, IoUring};
 
@@ -40,7 +41,7 @@ impl IoUringRing {
             let _ = self.ring.submit();
         }
         // SAFETY: every caller keeps the memory an SQE points at alive until
-        // its CQE is drained — see the park slots' `carry`.
+        // its CQE is drained — see the module doc.
         unsafe {
             self.ring.submission().push(&entry).expect("SQ full after flush");
         }
@@ -69,22 +70,9 @@ impl IoUringRing {
         );
     }
 
-    /// Submit a relative `Timeout` op against `ts`. One-shot: a single CQE
-    /// (`res = -ETIME` on natural expiry).
-    ///
+    /// One-shot `FUTEX_WAITV` over `nr` entries.
     /// # Safety
-    /// `ts` must live at this address until the CQE is drained.
-    pub(super) unsafe fn prep_timeout(&mut self, ts: &types::Timespec, user_data: u64) {
-        self.push(opcode::Timeout::new(ts).build().user_data(user_data));
-    }
-
-    /// Submit a `FUTEX_WAITV` op over `nr` pointer-stable `FutexWaitV` entries.
-    /// One-shot: a single CQE on wake or cancellation. Requires Linux 6.7+,
-    /// probed at `Reactor::new`.
-    ///
-    /// # Safety
-    /// The caller promises the array outlives the CQE and that each entry's
-    /// `uaddr` points to a live atomic u32 shared with the producer.
+    /// Each entry's `uaddr` must point at a live atomic shared with the producer.
     pub(super) unsafe fn prep_futex_waitv(&mut self, futexv: *const types::FutexWaitV, nr: u32, user_data: u64) {
         self.push(opcode::FutexWaitV::new(futexv, nr).build().user_data(user_data));
     }
@@ -100,7 +88,7 @@ impl IoUringRing {
     /// SQEs stay queued and go out with the next tick's submit — log and
     /// continue; `what` names the operation for the log line.
     pub(super) fn flush_sqes(&mut self, what: &str) {
-        if let Err(e) = self.submit_and_wait_timeout(0, 0) {
+        if let Err(e) = self.submit() {
             gnitz_error!(
                 "reactor: {} SQE flush failed (errno={}); SQE queued — will submit on next tick",
                 what,
@@ -109,46 +97,32 @@ impl IoUringRing {
         }
     }
 
-    /// Submit pending SQEs and optionally wait for completions.
-    ///
-    /// - `min_complete > 0, timeout_ms > 0`: block until ≥min_complete CQEs
-    ///   or timeout expires.
-    /// - `min_complete > 0, timeout_ms = -1`: block indefinitely until
-    ///   ≥min_complete CQEs arrive (no timeout bound).
-    /// - `min_complete = 0, timeout_ms = 0`: submit only, return immediately.
-    ///   When no SQEs are pending, this is a no-op (0 syscalls).
-    pub(super) fn submit_and_wait_timeout(&mut self, min_complete: u32, timeout_ms: i32) -> Result<i32, i32> {
-        let pending = self.ring.submission().len();
-
-        if min_complete == 0 && pending == 0 {
-            return Ok(0); // no-op fast path
+    /// Submit pending SQEs without waiting. No syscall when the SQ is empty.
+    pub(super) fn submit(&mut self) -> Result<i32, i32> {
+        if self.ring.submission().is_empty() {
+            return Ok(0);
         }
+        self.ring
+            .submit()
+            .map(|n| n as i32)
+            .map_err(|e| e.raw_os_error().unwrap_or(-1))
+    }
 
-        if min_complete == 0 || timeout_ms == 0 {
-            // Submit only, no wait
-            match self.ring.submit() {
-                Ok(n) => Ok(n as i32),
-                Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
+    /// Submit pending SQEs and wait for one CQE, for at most `timeout` when one
+    /// is given. An expired timeout or a signal returns `Ok(0)`.
+    pub(super) fn wait(&mut self, timeout: Option<Duration>) -> Result<i32, i32> {
+        let rc = match timeout {
+            None => self.ring.submitter().submit_and_wait(1),
+            Some(d) => {
+                let ts = types::Timespec::from(d);
+                let args = types::SubmitArgs::new().timespec(&ts);
+                self.ring.submitter().submit_with_args(1, &args)
             }
-        } else if timeout_ms < 0 {
-            // Block indefinitely until min_complete CQEs arrive
-            match self.ring.submitter().submit_and_wait(min_complete as usize) {
-                Ok(n) => Ok(n as i32),
-                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => Ok(0),
-                Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
-            }
-        } else {
-            // Submit + wait with timeout via EXT_ARG
-            let ts = types::Timespec::new()
-                .sec((timeout_ms / 1000) as u64)
-                .nsec(((timeout_ms % 1000) as u32) * 1_000_000);
-            let args = types::SubmitArgs::new().timespec(&ts);
-            match self.ring.submitter().submit_with_args(min_complete as usize, &args) {
-                Ok(n) => Ok(n as i32),
-                Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
-                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => Ok(0),
-                Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
-            }
+        };
+        match rc {
+            Ok(n) => Ok(n as i32),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => Ok(0),
+            Err(e) => Err(e.raw_os_error().unwrap_or(-1)),
         }
     }
 

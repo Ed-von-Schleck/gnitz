@@ -21,7 +21,7 @@ use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_store::storage::StoreError;
-use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, STATUS_OK};
+use gnitz_wire::{FLAG_CONTINUATION, STATUS_OK};
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
@@ -141,25 +141,18 @@ struct WorkerExchangeHandler {
 /// Bridges the DAG's `ExchangeCallback` requirement to `WorkerProcess` for a
 /// maintenance tick. Holds a mutable reference to the worker so `do_exchange`
 /// can re-enter the worker's handlers (`handle_push`, `handle_flush_all`)
-/// inline when those messages arrive mid-wait. `tick_request_id` is the id of
-/// the message that kicked off this DAG evaluation. Nothing routes on it: the
-/// master peels a FLAG_EXCHANGE frame off by flag, and keys its rounds on
-/// `target_id`/`seek_pk`. Carrying a live tick id is why that peel must happen
-/// before the id's awaiter is completed.
+/// inline when those messages arrive mid-wait.
 ///
 /// A tick issues no pad bit and reads no backfill decision — it has no field to
 /// record one in, which is what keeps the collective-termination protocol to
 /// the backfill path.
 struct TickExchangeCtx<'a> {
     worker: &'a mut WorkerProcess,
-    tick_request_id: u64,
 }
 
 impl ExchangeCallback for TickExchangeCtx<'_> {
     fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch {
-        let (batch, _) = self
-            .worker
-            .do_exchange_wait(view_id, batch, source_id, self.tick_request_id, false);
+        let (batch, _) = self.worker.do_exchange_wait(view_id, batch, source_id, false);
         batch
     }
 }
@@ -169,7 +162,6 @@ impl ExchangeCallback for TickExchangeCtx<'_> {
 /// master stamps back.
 struct BackfillExchangeCtx<'a> {
     worker: &'a mut WorkerProcess,
-    tick_request_id: u64,
     /// Whether this worker's source partition is already drained, so this
     /// chunk's rounds are empty pads. The master ANDs it across workers.
     pad: bool,
@@ -182,9 +174,7 @@ struct BackfillExchangeCtx<'a> {
 
 impl ExchangeCallback for BackfillExchangeCtx<'_> {
     fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch {
-        let (batch, decision) = self
-            .worker
-            .do_exchange_wait(view_id, batch, source_id, self.tick_request_id, self.pad);
+        let (batch, decision) = self.worker.do_exchange_wait(view_id, batch, source_id, self.pad);
         self.verdict = Some(self.worker.consume_backfill_decision(decision));
         batch
     }
@@ -576,7 +566,7 @@ impl WorkerProcess {
             SalMessageKind::Backfill => {
                 // `target_id` is the source table; `seek_pk` carries the view to
                 // drive. Stop-the-world (the DDL parks the reactor): no yield.
-                self.handle_backfill(target_id, seek_pk as i64, request_id)?;
+                self.handle_backfill(target_id, seek_pk as i64)?;
                 self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
@@ -606,7 +596,7 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Tick => {
-                self.handle_tick(target_id, lsn, request_id)?;
+                self.handle_tick(target_id, lsn)?;
                 self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
@@ -725,7 +715,7 @@ impl WorkerProcess {
     /// Drive one view-maintenance tick of `target_id`'s dependent closure.
     /// `round` is the tick round the master allocated for this group; every fed
     /// view's captured delta is stamped with it.
-    fn handle_tick(&mut self, target_id: i64, round: u64, request_id: u64) -> Result<(), String> {
+    fn handle_tick(&mut self, target_id: i64, round: u64) -> Result<(), String> {
         let delta = if let Some(d) = self.pending_deltas.remove(&target_id) {
             d
         } else {
@@ -735,7 +725,7 @@ impl WorkerProcess {
             let schema = self.cat().registry().relation_or_err(target_id)?.schema();
             Batch::empty_with_schema(&schema)
         };
-        self.evaluate_dag(target_id, delta, round, request_id);
+        self.evaluate_dag(target_id, delta, round);
         Ok(())
     }
 
@@ -781,7 +771,7 @@ impl WorkerProcess {
     /// unequal — so a worker that has drained its own keeps issuing EMPTY
     /// (pad) rounds to stay in lockstep, until the master signals stop. The stop
     /// decision is collective: each worker stamps a per-chunk pad bit onto every
-    /// FLAG_EXCHANGE it issues (`do_exchange_wait`), the master ANDs them and
+    /// exchange frame it issues (`do_exchange_wait`), the master ANDs them and
     /// stamps the verdict back onto each relay, and the worker records it into a
     /// single per-chunk slot read here.
     ///
@@ -794,7 +784,7 @@ impl WorkerProcess {
     /// step-4 rebuild next to resumed siblings) that a closure re-drive would
     /// double-count. A view backfill runs stop-the-world (the DDL parks the
     /// reactor), so it never yields to live traffic between chunks.
-    fn handle_backfill(&mut self, source_tid: i64, view_id: i64, request_id: u64) -> Result<(), String> {
+    fn handle_backfill(&mut self, source_tid: i64, view_id: i64) -> Result<(), String> {
         // Recovery step-4: the FIRST backfill command for an invalid view resets
         // its output store + operator scratch on THIS worker before any fill,
         // so the rebuild starts from an empty, well-formed store (the tick sweep
@@ -822,7 +812,7 @@ impl WorkerProcess {
             let drained = handle.drain_chunk(chunk_rows);
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-            let (produced, signal) = self.backfill_chunk(view_id, source_tid, chunk, request_id, pad);
+            let (produced, signal) = self.backfill_chunk(view_id, source_tid, chunk, pad);
             produced_any |= produced;
             // Stop on the master's collective verdict, or — with no barrier,
             // hence no verdict — on local drain exhaustion.
@@ -855,17 +845,11 @@ impl WorkerProcess {
         view_id: i64,
         source_id: i64,
         delta: Batch,
-        request_id: u64,
         pad: bool,
     ) -> (bool, Option<BackfillRound>) {
         let (dag, reg) = self.cat().dag_and_registry_mut();
         let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
-        let mut ctx = BackfillExchangeCtx {
-            worker: self,
-            tick_request_id: request_id,
-            pad,
-            verdict: None,
-        };
+        let mut ctx = BackfillExchangeCtx { worker: self, pad, verdict: None };
         let produced = unsafe { &mut *dag }.backfill_chunk(unsafe { &mut *reg }, view_id, source_id, delta, &mut ctx);
         let verdict = ctx.verdict;
         // Apply DDL_SYNC messages deferred during exchange waits (mirrors
@@ -895,8 +879,8 @@ impl WorkerProcess {
         // accepted and any pre-reset group parks via `next_sal_message`'s epoch
         // check. Deliberately NOT the Flush arm — no `handle_flush_all`, no
         // flush ACK; the master's consumption proof is the next round's
-        // FLAG_EXCHANGE report, which a flush ACK would be misread as a
-        // terminal ACK that retires the worker.
+        // exchange report, which a flush ACK would be misread as a terminal ACK
+        // that retires the worker.
         if decision == BACKFILL_DECISION_CHECKPOINT {
             self.sal_reader.rewind();
         }
@@ -1131,19 +1115,13 @@ impl WorkerProcess {
         self.cat().flush_base_round()
     }
 
-    /// Run multi-worker DAG evaluation with the exchange context.
-    /// `request_id` is the master's request id of the message that
-    /// triggered this evaluation (Tick / Push / Backfill);
-    /// echoed by `do_exchange_wait` so the master accumulator's wakers
-    /// stay routable. `tick_round` is the round that group carried, which stamps
-    /// every fed view's captured delta.
-    fn evaluate_dag(&mut self, source_id: i64, delta: Batch, tick_round: u64, request_id: u64) {
+    /// Run multi-worker DAG evaluation with the exchange context. `tick_round` is
+    /// the round the triggering group carried, which stamps every fed view's
+    /// captured delta.
+    fn evaluate_dag(&mut self, source_id: i64, delta: Batch, tick_round: u64) {
         let (dag, reg) = self.cat().dag_and_registry_mut();
         let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
-        let mut ctx = TickExchangeCtx {
-            worker: self,
-            tick_request_id: request_id,
-        };
+        let mut ctx = TickExchangeCtx { worker: self };
         let res = unsafe { &mut *dag }.evaluate_dag(unsafe { &mut *reg }, source_id, delta, tick_round, &mut ctx);
         // Apply DDL_SYNC messages deferred during exchange waits.
         self.dispatch_deferred();
