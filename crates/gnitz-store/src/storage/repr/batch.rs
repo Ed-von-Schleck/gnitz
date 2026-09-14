@@ -386,26 +386,18 @@ impl Batch {
         &self.schema
     }
 
-    /// Install a schema on this batch after verifying its column count
-    /// matches the batch's physical payload regions. Every code path that
-    /// wants to move a batch's schema after construction MUST go
-    /// through this helper: it turns a latent "batch shape != declared
-    /// shape" bug into a localized panic at the first assignment, instead
-    /// of a cryptic OOB slice panic several call-frames later.
+    /// Install a schema on this batch after verifying it implies the batch's
+    /// physical region strides. Every code path that wants to move a batch's
+    /// schema after construction MUST go through this helper: it turns a latent
+    /// "batch shape != declared shape" bug into a localized panic at the first
+    /// assignment, instead of a cryptic OOB slice panic several call-frames
+    /// later — or a shard whose regions its reader mis-sizes.
     #[inline]
     pub fn set_schema(&mut self, s: &SchemaDescriptor) {
-        // The batch carries one combined PK region (all PK columns
-        // concatenated) + one payload region per non-PK column. So the
-        // batch's payload-region count must equal the schema's non-PK
-        // column count regardless of single-vs-compound PK.
         debug_assert_eq!(
-            self.num_payload_cols(),
-            s.num_payload_cols(),
-            "Batch::set_schema: batch has {} payload cols, schema declares {} payload cols \
-             (pk_count={})",
-            self.num_payload_cols(),
-            s.num_payload_cols(),
-            s.pk_indices().len()
+            strides_from_schema(s).0,
+            self.strides,
+            "Batch::set_schema: strides disagree with the schema",
         );
         self.schema = *s;
     }
@@ -1324,8 +1316,7 @@ impl Batch {
     /// so the layout does too.
     ///
     /// `out_schema` must share this batch's PK stride and have at least as many
-    /// payload columns; the caller states the input schema because a `Batch`
-    /// carries only its region strides.
+    /// payload columns.
     pub fn widened_with_null_tail(&self, out_schema: &SchemaDescriptor) -> Self {
         let in_schema = &self.schema;
         debug_assert_eq!(out_schema.pk_stride(), in_schema.pk_stride());

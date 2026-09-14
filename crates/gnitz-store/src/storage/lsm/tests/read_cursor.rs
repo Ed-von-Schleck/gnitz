@@ -1109,7 +1109,7 @@ fn bounded_string_read_carries_only_its_own_rows() {
             }
             let cpath = std::ffi::CString::new(dir.path().join(format!("s{s}.db")).to_str().unwrap()).unwrap();
             bb.finish()
-                .write_as_shard(&cpath, &schema, super::super::shard_file::ShardWriteOpts::default())
+                .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
                 .unwrap();
             Rc::new(MappedShard::open(&cpath, &schema, false).unwrap())
         })
@@ -1154,8 +1154,11 @@ fn write_skeleton_shard(
         b.count += 1;
     }
     let cpath = std::ffi::CString::new(dir.join(name).to_str().unwrap()).unwrap();
-    b.write_as_shard(&cpath, &skel, super::super::shard_file::ShardWriteOpts::SKELETON)
-        .unwrap();
+    b.write_as_shard(
+        &cpath,
+        super::super::shard_file::ShardWriteOpts { skeleton: true, ..Default::default() },
+    )
+    .unwrap();
     // Opened under the *view* schema, which is how every reader sees it.
     MappedShard::open(&cpath, schema, false).unwrap()
 }
@@ -1232,7 +1235,7 @@ fn skeleton_flag_is_covered_by_the_digest_and_masked_before_the_bound() {
     let path = dir.path().join("h.db");
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     bb.finish()
-        .write_as_shard(&cpath, &schema, super::super::shard_file::ShardWriteOpts::default())
+        .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
         .unwrap();
     let base = std::fs::read(&path).unwrap();
 

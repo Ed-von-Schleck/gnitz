@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::ffi::CStr;
 
 use super::super::error::StorageError;
-use super::super::manifest::{self, ManifestEntryRaw, ManifestHeader, PreparedManifest};
+use super::super::manifest::{self, ManifestEntryRaw, ManifestHeader};
+use super::super::StagedFile;
 use super::{LevelGuard, ShardEntry, ShardIndex, MAX_LEVELS};
 use crate::schema::key::PkBuf;
 
@@ -132,7 +133,7 @@ impl ShardIndex {
         &self,
         manifest_path: &CStr,
         checkpoint_gen: u64,
-    ) -> Result<PreparedManifest, StorageError> {
+    ) -> Result<StagedFile, StorageError> {
         let entries = self.build_manifest_entries();
         let header = ManifestHeader {
             compact_seq: self.compact_seq,

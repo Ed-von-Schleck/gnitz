@@ -67,7 +67,7 @@ fn shard_merge_scan_bench() {
             let path = dir.path().join(format!("ms_{s}.db"));
             let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
             batch
-                .write_as_shard(&cpath, &schema, super::super::shard_file::ShardWriteOpts::default())
+                .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
                 .unwrap();
             Rc::new(MappedShard::open(&cpath, &schema, false).unwrap())
         })

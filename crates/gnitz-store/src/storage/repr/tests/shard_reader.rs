@@ -1,14 +1,13 @@
 use super::super::batch::{strides_from_schema, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::error::StorageError;
 use super::super::layout::*;
-use super::super::shard_file::{region_dir, ShardWriteOpts};
+use super::super::shard_file::{region_dir, write_i64_shard, ShardWriteOpts};
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
-use gnitz_wire::as_le_bytes;
 use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 
-/// Build a shard via write_shard_streaming (uses encoding detection).
+/// Build a shard through `write_as_shard` (uses encoding selection).
 fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
     let pks: Vec<u64> = rows.iter().map(|&(pk, _)| pk).collect();
     let weights: Vec<i64> = rows.iter().map(|_| 1i64).collect();
@@ -275,30 +274,11 @@ fn shard_wider_than_reader_schema_opens() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wide.db");
     let wide = schema_with_appended(type_code::I64);
-    let pk_bytes: Vec<u8> = (1u64..=3).flat_map(|p| p.to_be_bytes()).collect();
-    let wts: Vec<i64> = vec![1; 3];
-    let null_bm: Vec<u64> = vec![0; 3];
-    let col0: Vec<i64> = vec![10, 20, 30];
-    let col1: Vec<i64> = vec![11, 22, 33];
-    let blob: Vec<u8> = Vec::new();
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&wts),
-        as_le_bytes(&null_bm),
-        as_le_bytes(&col0),
-        as_le_bytes(&col1),
-        &blob,
-    ];
+    let rows: Vec<_> = (1u64..=3)
+        .map(|p| (p.to_be_bytes().to_vec(), 1, 0, vec![p as i64 * 10, p as i64 * 11]))
+        .collect();
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    super::super::shard_file::write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        3,
-        &regions,
-        &wide,
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
+    write_i64_shard(&cpath, &wide, &rows, &[], ShardWriteOpts::default());
 
     let narrow = make_schema_u64_i64();
     let shard = MappedShard::open(&cpath, &narrow, false).unwrap();
@@ -685,31 +665,14 @@ fn u128_pk_schema() -> SchemaDescriptor {
 
 fn build_test_shard_u128(dir: &std::path::Path, name: &str, pks: &[u128], vals: &[i64]) -> String {
     let path = dir.join(name);
-    let count = pks.len() as u32;
     // PK region holds OPK (order-preserving big-endian) bytes at rest.
-    let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_be_bytes()).collect();
-    let weights: Vec<i64> = vec![1; pks.len()];
-    let null_bm: Vec<u64> = vec![0; pks.len()];
-    let blob: Vec<u8> = Vec::new();
-
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&null_bm),
-        as_le_bytes(vals),
-        &blob,
-    ];
-
+    let rows: Vec<_> = pks
+        .iter()
+        .zip(vals)
+        .map(|(&p, &v)| (p.to_be_bytes().to_vec(), 1, 0, vec![v]))
+        .collect();
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    super::super::shard_file::write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        count,
-        &regions,
-        &u128_pk_schema(),
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
+    write_i64_shard(&cpath, &u128_pk_schema(), &rows, &[], ShardWriteOpts::default());
     path.to_str().unwrap().to_string()
 }
 
@@ -787,25 +750,10 @@ fn find_lower_bound_bytes_wide_pk_distinct() {
         opk3(1, 5, 9),
         opk3(2, 0, 0),
     ];
-    let count = pks.len() as u32;
-    let pk_bytes: Vec<u8> = pks.iter().flat_map(|r| r.iter().copied()).collect();
-    let weights: Vec<i64> = vec![1; count as usize];
-    let null_bm: Vec<u64> = vec![0; count as usize];
-    let empty: Vec<u8> = Vec::new();
-
-    // 4 regions: pk, weight, null_bmp, blob (num_payload_cols = 0).
-    let regions: Vec<&[u8]> = vec![&pk_bytes, as_le_bytes(&weights), as_le_bytes(&null_bm), &empty];
+    let rows: Vec<_> = pks.iter().map(|r| (r.to_vec(), 1, 0, vec![])).collect();
     let path = dir.path().join("wide_pk.db");
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    super::super::shard_file::write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        count,
-        &regions,
-        &schema,
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
+    write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
     let shard = MappedShard::open(&cpath, &schema, false).unwrap();
     assert_eq!(shard.pk_stride, 24);
     assert!(shard.pk.is_per_row(), "distinct PKs must keep the PK region per-row");
@@ -927,15 +875,14 @@ fn forged_for_payload_bad_size_rejected() {
     let d = dir_entry_off(REG_PAYLOAD_START);
     let sz = read_u64_le(&base, d + 8);
 
-    // (a) count == 0: patch the header row count to 0. The fixed regions'
-    // sizes go to 0 with it, or the exact-size check rejects the PK region
-    // (128 != 0) before the divisor guard this case names is reached.
+    // (a) count == 0: patch the header row count to 0. The Raw PK region's
+    // size goes to 0 with it, or the exact-size check rejects it (128 != 0)
+    // before the FoR `count == 0` rejection this case names is reached; the
+    // Constant weight and null entries keep their one 8-byte element.
     assert_eq!(
         open_patched_restamped(&path, &schema, &base, |data| {
             write_u64_le(data, OFF_ROW_COUNT, 0);
-            for r in [REG_PK, REG_WEIGHT, REG_NULL_BMP] {
-                write_u64_le(data, dir_entry_off(r) + 8, 0);
-            }
+            write_u64_le(data, dir_entry_off(REG_PK) + 8, 0);
         })
         .err(),
         Some(StorageError::InvalidShard),
@@ -1002,7 +949,6 @@ fn write_string_shard(dir: &std::path::Path, name: &str, rows: &[(u64, [u8; 16])
     batch
         .write_as_shard(
             &std::ffi::CString::new(path.as_str()).unwrap(),
-            &schema,
             ShardWriteOpts::default(),
         )
         .unwrap();
@@ -1329,17 +1275,9 @@ fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescr
     // All-PK (no payload column), so 4 regions rather than 5 — the arity the
     // reader derives from the schema and checks the prefix length against.
     let all_pk = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-    let pk_only: Vec<u8> = seq.iter().flat_map(|&p| p.to_be_bytes()).collect();
+    let pk_only: Vec<_> = seq.iter().map(|&p| (p.to_be_bytes().to_vec(), 1, 0, vec![])).collect();
     let cpath = std::ffi::CString::new(dir.join("sw_pkonly.db").to_str().unwrap()).unwrap();
-    super::super::shard_file::write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        n as u32,
-        &[&pk_only, as_le_bytes(&vec![1i64; n]), as_le_bytes(&vec![0u64; n]), &[]],
-        &all_pk,
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
+    write_i64_shard(&cpath, &all_pk, &pk_only, &[], ShardWriteOpts::default());
 
     vec![
         // Constant PK / Constant weight / Constant null / Constant payload.

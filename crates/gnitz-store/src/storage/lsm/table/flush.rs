@@ -144,7 +144,6 @@ impl Table {
         // Write failed: heap still owns `run`; no on-disk residue.
         run.write_as_shard(
             &full_c,
-            &self.shard_index.schema,
             // L0 spill/checkpoint shards stay plain (no FoR packing), and carry
             // a PK filter only where something point-probes this store.
             shard_file::ShardWriteOpts {
@@ -184,7 +183,7 @@ impl Table {
     /// registered by `flush_prepare`, the RAM tier already cleared, and the
     /// barrier sweep has fdatasync'd every unsynced file — so all that remains is
     /// the manifest rename. On a rename failure the `.tmp` is unlinked by
-    /// `PreparedManifest`'s Drop and the shard survives as an orphan (GC'd next
+    /// `StagedFile`'s Drop and the shard survives as an orphan (GC'd next
     /// open); every fd is released through its `OwnedFd` on every path.
     pub(in crate::storage) fn flush_commit(&mut self, work: FlushWork) -> Result<OwnedFd, StorageError> {
         work.manifest.commit()?;

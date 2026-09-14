@@ -157,27 +157,21 @@ pub(super) fn merge_and_route(
         // the payload loop, so under a zero-payload schema `write_to_batch` carves
         // no payload buffer and the scatter iterates zero payload columns while the
         // fused pass still writes PK and weight.
-        let (wschema, rows, blob_cap, opts) = match &folded {
+        let (wschema, rows, blob_cap) = match &folded {
             Some(rows) => (
                 skel_schema
                     .as_ref()
                     .expect("a skeleton guard derived a skeleton schema"),
                 rows.as_slice(),
                 0,
-                ShardWriteOpts {
-                    skip_pk_filter: dest.skip_pk_filter,
-                    ..ShardWriteOpts::SKELETON
-                },
             ),
-            None => (
-                schema,
-                bucket,
-                prorated_blob_cap(total_blob, nsurv, bucket.len()),
-                ShardWriteOpts {
-                    skip_pk_filter: dest.skip_pk_filter,
-                    ..ShardWriteOpts::COMPACTION
-                },
-            ),
+            None => (schema, bucket, prorated_blob_cap(total_blob, nsurv, bucket.len())),
+        };
+        // A zero-payload skeleton schema has no payload region to pack.
+        let opts = ShardWriteOpts {
+            skeleton: folded.is_some(),
+            skip_pk_filter: dest.skip_pk_filter,
+            ..ShardWriteOpts::COMPACTION
         };
         let mut batch = write_to_batch(wschema, rows.len(), blob_cap, |writer| {
             scatter_unified_sources(&unified, &cols, rows, writer);
@@ -188,7 +182,7 @@ pub(super) fn merge_and_route(
             // `ENCODING_CONSTANT` — 8 bytes for the whole file.
             batch.null_bmp_data_mut().fill(0);
         }
-        let written = super::cstr(path.as_str()).and_then(|cpath| batch.write_as_shard(&cpath, wschema, opts));
+        let written = super::cstr(path.as_str()).and_then(|cpath| batch.write_as_shard(&cpath, opts));
         if let Err(e) = written {
             // Roll back this call's shards so a compaction that cannot finalize
             // leaves the source tier intact.

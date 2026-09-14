@@ -111,6 +111,22 @@ pub(crate) fn two_value_set_bit(bitvec: &mut [u8], row: usize) {
     bitvec[row / 8] |= 1 << (row % 8);
 }
 
+/// A FoR region's image: an 8-byte frame reference ‖ each row's offset from it in
+/// its low `bw` bytes, tightly packed. Encoder, open-time check and decoder state
+/// the geometry only through these three.
+pub(crate) const FOR_HEADER: usize = 8;
+
+pub(crate) const fn for_image_len(count: usize, bw: usize) -> usize {
+    FOR_HEADER + count * bw
+}
+
+/// The offset width an image of `size` bytes holds for `count` rows, or `None`
+/// unless some `bw` in `1..elem_width` gives exactly that size.
+pub(crate) fn for_image_bw(size: usize, count: usize, elem_width: usize) -> Option<usize> {
+    let bw = size.checked_sub(FOR_HEADER)?.checked_div(count)?;
+    ((1..elem_width).contains(&bw) && size == for_image_len(count, bw)).then_some(bw)
+}
+
 /// Length of the descriptive prefix — header plus one directory entry per
 /// region — which is exactly the span [`desc_digest`] covers.
 pub(crate) const fn desc_len(num_regions: usize) -> usize {
@@ -130,11 +146,10 @@ pub(crate) fn desc_digest(basename: &[u8], data: &[u8], num_regions: usize) -> u
     gnitz_wire::digest_with_hole(basename, &data[..desc_len(num_regions)], OFF_DESC_CHECKSUM)
 }
 
-/// A shard's manifest identity: the last component of its path. The L0 spill
-/// writer names a shard by a dirfd-relative basename, compaction by an
-/// `AT_FDCWD` full path, and the reader always holds a full path — this is the
-/// one reduction all of them use, so the name the manifest records is the name
-/// the digest is seeded with.
+/// A shard's manifest identity: the last component of its path. Every writer and
+/// the reader hold a full path; the manifest identity and the digest seed are
+/// its last component, so the name the manifest records is the name the digest
+/// is seeded with.
 pub(crate) fn shard_basename(path: &[u8]) -> &[u8] {
     match path.iter().rposition(|&c| c == b'/') {
         Some(i) => &path[i + 1..],
@@ -149,5 +164,6 @@ pub(crate) const ENCODING_TWO_VALUE: u8 = 0x02;
 /// an 8-byte frame reference (the region min's bit pattern) followed by each
 /// row's `value − ref` truncated to the fewest whole bytes (`bw`) that hold the
 /// region's offset range. Legal only on payload column directory entries, only
-/// on compaction outputs.
+/// where the writer packs integers (`ShardWriteOpts::pack_ints`), only on a
+/// ≤8-byte integer column.
 pub(crate) const ENCODING_FOR: u8 = 0x03;

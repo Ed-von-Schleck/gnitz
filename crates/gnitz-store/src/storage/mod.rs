@@ -30,6 +30,12 @@ mod error;
 mod lsm;
 mod spill;
 
+use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::os::fd::AsRawFd;
+
+use gnitz_foundation::posix_io;
+
 // L2 representation lives under `repr/`. It has no facade of its own; the leaf
 // items are re-exported below and the submodules aliased here so the LSM siblings
 // keep their `super::<mod>` paths and the in-storage `with_payload_cmp!` /
@@ -112,11 +118,62 @@ pub(super) fn to_cstrings<S: AsRef<str>>(
     paths.into_iter().map(|p| cstr(p.as_ref())).collect()
 }
 
-/// Append the `.tmp` suffix to a CStr basename and return a new CString.
-pub(super) fn cstr_with_tmp_suffix(base: &std::ffi::CStr) -> Result<std::ffi::CString, error::StorageError> {
-    let b = base.to_bytes();
-    let mut v = Vec::with_capacity(b.len() + 4);
-    v.extend_from_slice(b);
-    v.extend_from_slice(b".tmp");
-    std::ffi::CString::new(v).map_err(|_| error::StorageError::InvalidPath)
+/// A file written as `<path>.tmp` and renamed onto `path` by [`commit`]. Dropped
+/// uncommitted — an error return, a panic, or an abandoned flush — it unlinks
+/// the `.tmp`, so a failed write leaves nothing behind.
+///
+/// [`commit`]: StagedFile::commit
+pub(super) struct StagedFile {
+    file: File,
+    tmp_path: CString,
+    final_path: CString,
+    committed: bool,
 }
+
+impl StagedFile {
+    pub(super) fn create(path: &CStr) -> Result<Self, error::StorageError> {
+        let tmp_path = cstr([path.to_bytes(), STAGING_SUFFIX.as_bytes()].concat())?;
+        let file = File::from(posix_io::open_owned(
+            &tmp_path,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+        )?);
+        Ok(StagedFile {
+            file,
+            tmp_path,
+            final_path: path.to_owned(),
+            committed: false,
+        })
+    }
+
+    pub(super) fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Raw because the flush barrier hands whole chunks of these to
+    /// `IORING_OP_FSYNC` at once.
+    pub(super) fn fd(&self) -> libc::c_int {
+        self.file.as_raw_fd()
+    }
+
+    pub(super) fn sync(&self) -> std::io::Result<()> {
+        self.file.sync_data()
+    }
+
+    pub(super) fn commit(mut self) -> Result<(), error::StorageError> {
+        posix_io::renameat(libc::AT_FDCWD, &self.tmp_path, libc::AT_FDCWD, &self.final_path)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            unsafe { libc::unlink(self.tmp_path.as_ptr()) };
+        }
+    }
+}
+
+/// The suffix [`StagedFile`] stages under — also how startup GC names a stray
+/// manifest `.tmp`.
+pub(super) const STAGING_SUFFIX: &str = ".tmp";

@@ -125,7 +125,6 @@ fn linked_child_shard_opens_under_its_linked_name() {
     make_batch(&schema, &rows)
         .write_as_shard(
             &cstr(format!("{source}/{name}")).unwrap(),
-            &schema,
             super::super::shard_file::ShardWriteOpts::default(),
         )
         .unwrap();

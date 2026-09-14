@@ -15,7 +15,6 @@ use std::rc::Rc;
 use super::batch::Batch;
 use super::columnar::{pk_group_end, with_payload_cmp, ColumnarSource};
 use super::error::StorageError;
-use super::manifest::PreparedManifest;
 use super::merge::RowComparator;
 use super::read_cursor::{self, ReadCursor};
 use super::run::{Run, StoredRow};
@@ -23,6 +22,7 @@ use super::run_set::RunSet;
 use super::shard_index::{ShardBudget, ShardIndex};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
+use super::StagedFile;
 use crate::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key, PkBuf};
 use crate::schema::SchemaDescriptor;
 
@@ -117,7 +117,7 @@ pub(in crate::storage) struct FlushWork {
     pub(in crate::storage) sync_paths: Vec<CString>,
     /// The staged manifest `.tmp`, its fd open from `prepare_file` until
     /// `flush_commit` consumes the work.
-    pub(in crate::storage) manifest: PreparedManifest,
+    pub(in crate::storage) manifest: StagedFile,
 }
 
 /// Index of the first candidate in `pool` (pool order) whose payload group nets
@@ -318,15 +318,13 @@ impl Table {
     ///
     /// The re-open runs first and mutates nothing, so a failure leaves the store
     /// entirely on the old schema, never half-widened where a NULL could
-    /// consolidate against a real `0`. Widening the resident tiers reads
-    /// the shard index's still-live schema as the runs' input, so it must
-    /// precede `install_reopened`, which publishes the new one.
+    /// consolidate against a real `0`.
     /// `cached_full_scan` was materialized under the old column set, so it is
     /// dropped either way.
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         let staged = self.shard_index.reopen_all(&schema)?;
-        self.memtable.widen_runs(&self.shard_index.schema, &schema);
-        self.ram_tier.widen_runs(&self.shard_index.schema, &schema);
+        self.memtable.widen_runs(&schema);
+        self.ram_tier.widen_runs(&schema);
         self.shard_index.install_reopened(staged, schema);
         self.cached_full_scan.set(None);
         Ok(())

@@ -3,7 +3,7 @@
 
 use super::super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::batch_pool::{acquire_arena, Fill};
-use super::super::layout::two_value_bit;
+use super::super::layout::{for_image_len, two_value_bit};
 use super::super::merge::{
     prorated_blob_cap, relocate_german_string_vec, should_relocate_blob, BlobCacheGuard, ColPtr, UnifiedSource,
 };
@@ -43,9 +43,10 @@ impl MappedShard {
         region
             .decoded
             .get_or_init(|| {
-                super::super::shard_file::decode_for_region(
-                    &self.data()[region.offset..region.offset + region.size],
+                super::decode_for_region(
+                    &self.data()[region.offset..region.offset + for_image_len(self.count, region.bw)],
                     self.count,
+                    region.bw,
                     region.elem_width,
                 )
             })

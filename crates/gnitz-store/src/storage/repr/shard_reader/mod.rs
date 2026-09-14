@@ -2,20 +2,21 @@
 //!
 //! Used by compaction (`compact`) and query-time reads (`read_cursor`).
 //! Split into the cold open/validation path ([`open`]) and the hot per-row
-//! accessors ([`access`]); the type definitions and the `mmap` RAII handle
-//! live here, so both sub-modules read the (otherwise private) fields directly.
+//! accessors ([`access`]); the type definitions, the `mmap` RAII handle and the
+//! FoR decoder live here, so both sub-modules read the (otherwise private)
+//! fields directly.
 //!
 //! `open` normalizes every fixed-width region to a [`RegionView`], so the
 //! accessors see one addressing form rather than a per-encoding match.
 
 use std::cell::OnceCell;
 
-use super::shard_file::DecodedRegion;
-
 mod access;
 mod open;
 
+use super::layout::FOR_HEADER;
 use gnitz_foundation::posix_io::Mmap;
+use gnitz_wire::read_u64_le;
 
 // ---------------------------------------------------------------------------
 // Region views — every fixed-width region as one (offset, stride) pair
@@ -72,7 +73,7 @@ static ZERO_CELL: [u8; 16] = [0; 16];
 /// is stable for the shard's lifetime, which the raw-pointer accessors rely on.
 pub(crate) struct PackedRegion {
     offset: usize,
-    size: usize,
+    bw: usize,
     elem_width: usize,
     decoded: OnceCell<DecodedRegion>,
 }
@@ -133,6 +134,73 @@ impl MappedShard {
     pub(crate) fn file_len(&self) -> u64 {
         self.mmap.as_slice().len() as u64
     }
+}
+
+/// A FoR region decoded back to its raw little-endian image. Backed by
+/// `Box<[u64]>` so the bytes are 8-aligned (payload accessors hand out
+/// naturally-aligned pointers) and the address is stable for the owner's
+/// lifetime.
+pub(crate) struct DecodedRegion {
+    words: Box<[u64]>,
+    byte_len: usize,
+}
+
+impl DecodedRegion {
+    fn zeroed(byte_len: usize) -> Self {
+        Self {
+            words: vec![0u64; byte_len.div_ceil(8)].into_boxed_slice(),
+            byte_len,
+        }
+    }
+
+    /// The decoded image as bytes — `byte_len` long, 8-aligned, stable address.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `words` is 8-aligned and holds >= `byte_len` bytes.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.byte_len) }
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `as_bytes`.
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.byte_len) }
+    }
+}
+
+/// Decode a FoR region image of `count` rows at offset width `bw` back to its
+/// `count · elem_width` little-endian raw form: for each row widen its `bw`
+/// bytes, `wrapping_add` the reference, and store the low `elem_width` bytes.
+/// Pure byte arithmetic over in-bounds slices — infallible once the reader's
+/// open-time checks hold.
+pub(crate) fn decode_for_region(image: &[u8], count: usize, bw: usize, elem_width: usize) -> DecodedRegion {
+    debug_assert!((1..8).contains(&bw), "open-time checks bound bw to 1..stride<=8");
+    let reference = read_u64_le(image, 0);
+    let mask = (1u64 << (8 * bw)) - 1;
+    // One masked 8-byte load per row; the few tail rows whose full-word load
+    // would overrun the image fall back to a byte gather.
+    let offset_at = |i: usize| -> u64 {
+        let base = FOR_HEADER + i * bw;
+        if base + 8 <= image.len() {
+            read_u64_le(image, base) & mask
+        } else {
+            image[base..base + bw]
+                .iter()
+                .rev()
+                .fold(0u64, |acc, &b| (acc << 8) | b as u64)
+        }
+    };
+    let mut out = DecodedRegion::zeroed(count * elem_width);
+    if elem_width == 8 {
+        // The dominant I64/U64 shape: one whole-word store per row.
+        for (i, w) in out.words.iter_mut().enumerate() {
+            *w = offset_at(i).wrapping_add(reference).to_le();
+        }
+    } else {
+        let bytes = out.as_bytes_mut();
+        for i in 0..count {
+            let v = offset_at(i).wrapping_add(reference);
+            bytes[i * elem_width..(i + 1) * elem_width].copy_from_slice(&v.to_le_bytes()[..elem_width]);
+        }
+    }
+    out
 }
 
 // MappedShard does not implement Drop — the owned `mmap: Mmap` field handles

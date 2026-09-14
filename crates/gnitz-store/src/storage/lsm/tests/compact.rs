@@ -325,7 +325,7 @@ fn write_3col_shard(path: &str, rows: &[(u64, i64, i64, i64)], schema: &SchemaDe
         batch.count += 1;
     }
     let cpath = std::ffi::CString::new(path).unwrap();
-    batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
+    batch.write_as_shard(&cpath, ShardWriteOpts::default()).unwrap();
 }
 
 /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
@@ -730,7 +730,7 @@ fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
         batch.count += 1;
     }
     let cpath = std::ffi::CString::new(path).unwrap();
-    batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
+    batch.write_as_shard(&cpath, ShardWriteOpts::default()).unwrap();
 }
 
 /// Read a compacted shard back to its rows, decoding strings to their
@@ -774,9 +774,7 @@ fn oracle_compact_row_at_a_time(input_files: &[&CStr], output_file: &CStr, schem
         let pk_bytes = shards[src].get_pk_bytes(row);
         batch.append_row_from_source_bytes(pk_bytes, w, &shards[src], row, blob_cache.get_mut());
     });
-    batch
-        .write_as_shard(output_file, schema, ShardWriteOpts::COMPACTION)
-        .unwrap();
+    batch.write_as_shard(output_file, ShardWriteOpts::COMPACTION).unwrap();
 }
 
 /// Compact `shard_rows` both ways (production and the oracle) and assert
@@ -898,9 +896,7 @@ fn oracle_merge_and_route_row_at_a_time(
             }
             let path = out_dir.join(format!("oracle_G{g}.db"));
             let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-            batches[g]
-                .write_as_shard(&cpath, schema, ShardWriteOpts::COMPACTION)
-                .unwrap();
+            batches[g].write_as_shard(&cpath, ShardWriteOpts::COMPACTION).unwrap();
             Some(path.to_str().unwrap().to_string())
         })
         .collect()
@@ -1078,7 +1074,7 @@ mod skeleton_tests {
         }
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         b.into_consolidated(schema)
-            .write_as_shard(&cpath, schema, ShardWriteOpts::default())
+            .write_as_shard(&cpath, ShardWriteOpts::default())
             .unwrap();
         cpath
     }

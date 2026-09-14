@@ -11,7 +11,7 @@
 //! single combined storage surface and re-exports the public items from these
 //! submodules. The repr (L2) siblings live under `storage/repr/`; this module
 //! aliases the repr submodules and the few storage-level helpers (`error`,
-//! `cstr`/`cstr_with_tmp_suffix`) so the LSM files keep their `super::<mod>`
+//! `cstr`, `StagedFile`) so the LSM files keep their `super::<mod>`
 //! paths unchanged after the move under `lsm/`. The `with_*` dispatch macros
 //! are not aliased here — they are reached through the aliased `columnar`.
 //!
@@ -42,4 +42,4 @@ use super::repr::{batch, bloom, columnar, heap, merge, scatter, shard_file, shar
 // Shard-format constants: only the LSM test modules assert against the image.
 #[cfg(test)]
 use super::repr::layout;
-use super::{cstr, cstr_with_tmp_suffix, error, to_cstrings};
+use super::{cstr, error, to_cstrings, StagedFile, STAGING_SUFFIX};

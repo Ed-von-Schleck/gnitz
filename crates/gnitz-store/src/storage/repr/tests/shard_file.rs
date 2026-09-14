@@ -2,8 +2,24 @@ use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_u64_i64, pk_only_schema};
-use gnitz_wire::as_le_bytes;
+use gnitz_wire::read_u64_le;
 use xorf::Filter;
+
+/// `(opk, weight, null_word, payload)` rows over a U64 PK.
+type Rows = Vec<(Vec<u8>, i64, u64, Vec<i64>)>;
+
+fn u64_rows(pks: &[u64], weights: &[i64], nulls: &[u64], cols: &[Vec<i64>]) -> Rows {
+    (0..pks.len())
+        .map(|i| {
+            (
+                pks[i].to_be_bytes().to_vec(),
+                weights[i],
+                nulls[i],
+                cols.iter().map(|c| c[i]).collect(),
+            )
+        })
+        .collect()
+}
 
 /// One shard, written and read back: header fields, every row through the
 /// reader, and a PK filter that contains each key.
@@ -12,32 +28,13 @@ fn write_open_roundtrip() {
     let pks: Vec<u64> = vec![100, 200, 300, 400, 500];
     let vals: Vec<i64> = vec![10, 20, 30, 40, 50];
     let n = pks.len();
-    let weights: Vec<i64> = vec![1; n];
-    let nulls: Vec<u64> = vec![0; n];
-    // PK region is OPK (big-endian) at rest; U64 OPK == BE.
-    let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let blob: Vec<u8> = vec![];
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("roundtrip.db");
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     let schema = make_schema_u64_i64();
-    write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        n as u32,
-        &regions,
-        &schema,
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
+    let rows = u64_rows(&pks, &vec![1; n], &vec![0; n], std::slice::from_ref(&vals));
+    write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
 
     let image = std::fs::read(&path).unwrap();
     assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), n as u64);
@@ -66,18 +63,15 @@ fn empty_shard() {
     let path = dir.path().join("empty.db");
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-    let regions: Vec<&[u8]> = vec![&[], &[], &[], &[]];
-
     // All-PK single-column schema (num_payload_cols = 0) → 4 regions.
     let schema = pk_only_schema(&[type_code::U64]);
-    write_shard_streaming(libc::AT_FDCWD, &cpath, 0, &regions, &schema, ShardWriteOpts::default()).unwrap();
+    write_i64_shard(&cpath, &schema, &[], &[], ShardWriteOpts::default());
 
     let shard = MappedShard::open(&cpath, &schema, true).unwrap();
     assert_eq!(shard.count, 0);
     assert!(!shard.has_shard_filter());
 }
 
-/// write_shard_streaming roundtrip — PK + weight + null_bmp + i64 value regions.
 /// No false negatives through the real write → `open` → probe path, at a
 /// key count where the construction picks a segment geometry the handful of
 /// rows the other shard tests write never reach. The in-module
@@ -99,23 +93,12 @@ fn no_false_negatives_through_write_open_probe() {
     // The PK region is sorted by (PK, payload) — the writer's contract.
     members.sort_unstable();
     members.dedup();
-    let n = members.len() as u32;
+    let n = members.len();
 
-    let weights: Vec<i64> = vec![1; members.len()];
-    let nulls: Vec<u64> = vec![0; members.len()];
     let vals: Vec<i64> = members.iter().map(|&p| p as i64).collect();
-    let pk_bytes: Vec<u8> = members.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let blob: Vec<u8> = vec![];
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-
     let schema = make_schema_u64_i64();
-    write_shard_streaming(libc::AT_FDCWD, &cpath, n, &regions, &schema, ShardWriteOpts::default()).unwrap();
+    let rows = u64_rows(&members, &vec![1; n], &vec![0; n], &[vals]);
+    write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
     let shard = MappedShard::open(&cpath, &schema, true).unwrap();
     assert!(shard.has_shard_filter());
 
@@ -138,10 +121,10 @@ fn no_false_negatives_through_write_open_probe() {
 #[test]
 fn encoding_selection_pins_all_roles() {
     let dir = tempfile::tempdir().unwrap();
-    let write_and_read = |schema: &SchemaDescriptor, n: u32, regions: &[&[u8]], name: &str| -> Vec<u8> {
+    let write_and_read = |schema: &SchemaDescriptor, rows: &Rows, blob: &[u8], name: &str| -> Vec<u8> {
         let path = dir.path().join(name);
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        write_shard_streaming(libc::AT_FDCWD, &cpath, n, regions, schema, ShardWriteOpts::default()).unwrap();
+        write_i64_shard(&cpath, schema, rows, blob, ShardWriteOpts::default());
         std::fs::read(&path).unwrap()
     };
 
@@ -156,21 +139,14 @@ fn encoding_selection_pins_all_roles() {
         &[0],
     );
     let n_a = 4usize;
-    let pk_a: Vec<u8> = vec![7u64; n_a].iter().flat_map(|p| p.to_be_bytes()).collect();
-    let w_a: Vec<i64> = vec![1; n_a];
-    let null_a: Vec<u64> = vec![0; n_a];
-    let const_col: Vec<i64> = vec![42; n_a];
-    let vary_col: Vec<i64> = (0..n_a as i64).collect();
     let blob_a: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
-    let regions_a: Vec<&[u8]> = vec![
-        &pk_a,
-        as_le_bytes(&w_a),
-        as_le_bytes(&null_a),
-        as_le_bytes(&const_col),
-        as_le_bytes(&vary_col),
-        &blob_a,
-    ];
-    let img_a = write_and_read(&schema_a, n_a as u32, &regions_a, "pin_a.db");
+    let rows_a = u64_rows(
+        &vec![7; n_a],
+        &vec![1; n_a],
+        &vec![0; n_a],
+        &[vec![42; n_a], (0..n_a as i64).collect()],
+    );
+    let img_a = write_and_read(&schema_a, &rows_a, &blob_a, "pin_a.db");
     assert_eq!(region_dir(&img_a, 0), (8, ENCODING_CONSTANT), "A pk constant");
     assert_eq!(region_dir(&img_a, 1), (8, ENCODING_CONSTANT), "A weight constant");
     assert_eq!(region_dir(&img_a, 2), (8, ENCODING_CONSTANT), "A null constant");
@@ -193,19 +169,13 @@ fn encoding_selection_pins_all_roles() {
         &[0],
     );
     let n_b = 4usize;
-    let pk_b: Vec<u8> = (1u64..=n_b as u64).flat_map(|p| p.to_be_bytes()).collect();
-    let w_b: Vec<i64> = vec![1, -1, 1, -1];
-    let null_b: Vec<u64> = vec![1, 0, 1, 0]; // col-0 null bit set on rows 0,2
-    let pay_b: Vec<i64> = vec![10, 20, 30, 40];
-    let blob_b: Vec<u8> = vec![];
-    let regions_b: Vec<&[u8]> = vec![
-        &pk_b,
-        as_le_bytes(&w_b),
-        as_le_bytes(&null_b),
-        as_le_bytes(&pay_b),
-        &blob_b,
-    ];
-    let img_b = write_and_read(&schema_b, n_b as u32, &regions_b, "pin_b.db");
+    let rows_b = u64_rows(
+        &(1u64..=n_b as u64).collect::<Vec<_>>(),
+        &[1, -1, 1, -1],
+        &[1, 0, 1, 0], // col-0 null bit set on rows 0,2
+        &[vec![10, 20, 30, 40]],
+    );
+    let img_b = write_and_read(&schema_b, &rows_b, &[], "pin_b.db");
     assert_eq!(region_dir(&img_b, 0), (n_b * 8, ENCODING_RAW), "B pk distinct → raw");
     assert_eq!(
         region_dir(&img_b, 1),
@@ -223,72 +193,13 @@ fn encoding_selection_pins_all_roles() {
         &[0],
     );
     let n_c = 3usize;
-    let pk_c: Vec<u8> = (1u64..=n_c as u64).flat_map(|p| p.to_be_bytes()).collect();
-    let w_c: Vec<i64> = vec![1, -1, 2];
-    let null_c: Vec<u64> = vec![0; n_c];
-    let pay_c: Vec<i64> = vec![5, 6, 7];
-    let blob_c: Vec<u8> = vec![];
-    let regions_c: Vec<&[u8]> = vec![
-        &pk_c,
-        as_le_bytes(&w_c),
-        as_le_bytes(&null_c),
-        as_le_bytes(&pay_c),
-        &blob_c,
-    ];
-    let img_c = write_and_read(&schema_c, n_c as u32, &regions_c, "pin_c.db");
+    let rows_c = u64_rows(&[1, 2, 3], &[1, -1, 2], &vec![0; n_c], &[vec![5, 6, 7]]);
+    let img_c = write_and_read(&schema_c, &rows_c, &[], "pin_c.db");
     assert_eq!(
         region_dir(&img_c, 1),
         (n_c * 8, ENCODING_RAW),
         "C weight ≥3 distinct → raw"
     );
-}
-
-/// `check_region_shape`, both arms. It runs ahead of every syscall, so a
-/// rejected write leaves neither the shard nor its staging file behind.
-#[test]
-fn regions_disagreeing_with_the_schema_fail_the_write_and_leave_no_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let n = 4u32;
-    let pk_bytes: Vec<u8> = (1u64..=4).flat_map(|p| p.to_be_bytes()).collect();
-    let weights: Vec<i64> = vec![1; 4];
-    let nulls: Vec<u64> = vec![0; 4];
-    let vals: Vec<i64> = vec![10, 20, 30, 40];
-    let blob: Vec<u8> = vec![];
-    let full: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-    // Three payload values where the schema's stride implies four, and a
-    // region list one short of the schema's arity.
-    let mut short_payload = full.clone();
-    short_payload[REG_PAYLOAD_START] = &as_le_bytes(&vals)[..24];
-
-    for (name, regions) in [
-        ("short payload region", &short_payload),
-        ("missing region", &full[..4].to_vec()),
-    ] {
-        let path = dir.path().join(format!("{name}.db"));
-        assert_eq!(
-            write_shard_streaming(
-                libc::AT_FDCWD,
-                &std::ffi::CString::new(path.to_str().unwrap()).unwrap(),
-                n,
-                regions,
-                &make_schema_u64_i64(),
-                ShardWriteOpts::default(),
-            ),
-            Err(StorageError::InvalidShard),
-            "{name}",
-        );
-        assert!(!path.exists(), "{name}: no shard file");
-        assert!(
-            !dir.path().join(format!("{name}.db.tmp")).exists(),
-            "{name}: no staging file either",
-        );
-    }
 }
 
 /// The filter builder walks the PK region in `stride`-wide chunks, so every
@@ -311,121 +222,115 @@ fn a_filter_built_from_a_pk_region_has_no_false_negatives_at_any_stride() {
 }
 
 mod for_codec_tests {
-    use super::super::{align64, decode_for_region, encode_for_region, for_encoded_size, for_params};
+    use super::super::super::shard_reader::decode_for_region;
+    use super::super::{for_image, for_image_bw, for_image_len, ALIGNMENT};
     use crate::test_rng::Rng;
+    use gnitz_wire::FixedInt;
 
-    /// Pack signed/unsigned values into a raw `stride`-byte-per-cell LE region,
-    /// exactly as the payload region would appear on the batch.
-    fn pack(vals: &[i128], stride: usize) -> Vec<u8> {
-        let mut b = Vec::with_capacity(vals.len() * stride);
+    /// Pack signed/unsigned values into a raw `fi.width()`-byte-per-cell LE
+    /// region, exactly as the payload region would appear on the batch.
+    fn pack(vals: &[i128], fi: FixedInt) -> Vec<u8> {
+        let width = fi.width();
+        let mut b = Vec::with_capacity(vals.len() * width);
         for &v in vals {
             let le = (v as i64 as u64).to_le_bytes();
-            b.extend_from_slice(&le[..stride]);
+            b.extend_from_slice(&le[..width]);
         }
         b
     }
 
-    /// Encode → assert size → decode → assert byte-exact reproduction of the
-    /// input region. Returns the chosen `bw` (None ⇒ region stays Raw).
-    fn roundtrip(vals: &[i128], stride: usize, signed: bool) -> Option<usize> {
-        let raw = pack(vals, stride);
+    /// Encode → recover `bw` from the image geometry → decode → assert
+    /// byte-exact reproduction of the input region. Returns the chosen `bw`
+    /// (None ⇒ region stays Raw).
+    fn roundtrip(vals: &[i128], fi: FixedInt) -> Option<usize> {
+        let raw = pack(vals, fi);
         let n = vals.len();
-        let image = encode_for_region(&raw, stride, signed, n)?;
-        // The width the writer chose, recovered exactly as `decode_for_region` does.
-        let bw = (image.len() - 8) / n;
-        assert_eq!(image.len(), for_encoded_size(n, bw), "emitted size == for_encoded_size");
-        assert!(bw >= 1 && bw < stride, "bw {bw} in [1, {stride})");
-        let decoded = decode_for_region(&image, n, stride);
+        let image = for_image(&raw, fi)?;
+        let bw = for_image_bw(image.len(), n, fi.width()).expect("the encoder's image has FoR geometry");
+        let decoded = decode_for_region(&image, n, bw, fi.width());
         let bytes = decoded.as_bytes();
         assert_eq!(bytes.as_ptr() as usize % 8, 0, "decoded buffer 8-aligned");
-        assert_eq!(bytes, &raw[..], "byte-exact roundtrip (bw={bw}, stride={stride})");
+        assert_eq!(bytes, &raw[..], "byte-exact roundtrip (bw={bw}, {fi:?})");
         Some(bw)
     }
 
     #[test]
     fn stride1_never_packs() {
         // U8/I8 (stride 1) can never pack: bw >= 1 == stride.
-        assert_eq!(roundtrip(&[0, 1, 2, 3, 200], 1, false), None);
-        assert_eq!(roundtrip(&[-5, 0, 5, 100], 1, true), None);
+        assert_eq!(roundtrip(&[0, 1, 2, 3, 200], FixedInt::U8), None);
+        assert_eq!(roundtrip(&[-5, 0, 5, 100], FixedInt::I8), None);
     }
 
     #[test]
     fn small_unsigned_bw1_bw2() {
         // Small values → bw 1.
         let small: Vec<i128> = (0..300).map(|i| (i % 200) as i128).collect();
-        assert_eq!(roundtrip(&small, 4, false), Some(1));
-        assert_eq!(roundtrip(&small, 8, false), Some(1));
+        assert_eq!(roundtrip(&small, FixedInt::U32), Some(1));
+        assert_eq!(roundtrip(&small, FixedInt::U64), Some(1));
         // Span needing 2 bytes.
         let mid: Vec<i128> = (0..300).map(|i| ((i * 211) % 60000) as i128).collect();
-        assert_eq!(roundtrip(&mid, 4, false), Some(2));
+        assert_eq!(roundtrip(&mid, FixedInt::U32), Some(2));
     }
 
     #[test]
     fn high_floor_unsigned_drops_bytes() {
         // A tight range far from zero frames on its min and drops the high bytes.
         let hi: Vec<i128> = (0..256).map(|i| 1_000_000 + (i % 50) as i128).collect();
-        assert_eq!(roundtrip(&hi, 4, false), Some(1));
+        assert_eq!(roundtrip(&hi, FixedInt::U32), Some(1));
         let hi64: Vec<i128> = (0..256).map(|i| 5_000_000_000i128 + (i % 40) as i128).collect();
         // Span < 256 → bw 1 even though the values need 5 bytes raw.
-        assert_eq!(roundtrip(&hi64, 8, false), Some(1));
+        assert_eq!(roundtrip(&hi64, FixedInt::U64), Some(1));
     }
 
     #[test]
     fn signed_negative_min_frames_on_min() {
         // Range spanning zero frames on the signed min, not on 0.
         let s: Vec<i128> = (0..256).map(|i| -100 + (i % 150) as i128).collect();
-        assert_eq!(roundtrip(&s, 4, true), Some(1));
-        assert_eq!(roundtrip(&s, 8, true), Some(1));
+        assert_eq!(roundtrip(&s, FixedInt::I32), Some(1));
+        assert_eq!(roundtrip(&s, FixedInt::I64), Some(1));
         // Larger signed span, still one frame.
         let s2: Vec<i128> = (0..500).map(|i| -30_000 + (i % 60000) as i128).collect();
-        assert_eq!(roundtrip(&s2, 4, true), Some(2));
+        assert_eq!(roundtrip(&s2, FixedInt::I32), Some(2));
     }
 
     #[test]
     fn all_equal_declines_for() {
-        // Constant is claimed before FoR; for_params/encode return None.
+        // Constant is claimed before FoR; the encoder itself declines too.
         let eq = vec![42i128; 100];
-        assert_eq!(for_params(&pack(&eq, 4), 4, false, 100), None);
-        assert_eq!(encode_for_region(&pack(&eq, 4), 4, false, 100), None);
+        assert_eq!(for_image(&pack(&eq, FixedInt::U32), FixedInt::U32), None);
     }
 
     #[test]
     fn extremes_fall_back_to_raw() {
         // MIN/MAX span needs the full stride → bw >= stride → Raw.
-        let ext_u: Vec<i128> = vec![0, u32::MAX as i128];
-        assert_eq!(roundtrip(&ext_u, 4, false), None);
-        let ext_s: Vec<i128> = vec![i32::MIN as i128, i32::MAX as i128];
-        assert_eq!(roundtrip(&ext_s, 4, true), None);
-        let ext_u64: Vec<i128> = vec![0, u64::MAX as i128];
-        assert_eq!(roundtrip(&ext_u64, 8, false), None);
-        let ext_i64: Vec<i128> = vec![i64::MIN as i128, i64::MAX as i128];
-        assert_eq!(roundtrip(&ext_i64, 8, true), None);
+        assert_eq!(roundtrip(&[0, u32::MAX as i128], FixedInt::U32), None);
+        assert_eq!(roundtrip(&[i32::MIN as i128, i32::MAX as i128], FixedInt::I32), None);
+        assert_eq!(roundtrip(&[0, u64::MAX as i128], FixedInt::U64), None);
+        assert_eq!(roundtrip(&[i64::MIN as i128, i64::MAX as i128], FixedInt::I64), None);
     }
 
     #[test]
     fn null_zero_cells_roundtrip_bit_exact() {
         // NULL cells carry a zeroed value that joins the region's [min, max].
         // Packing frames on 0 and the zeros must round-trip bit-exact.
-        let mut v: Vec<i128> = Vec::new();
-        for i in 0..200 {
-            v.push(if i % 3 == 0 { 0 } else { 1_000_000 + (i % 500) as i128 });
-        }
+        let v: Vec<i128> = (0..200)
+            .map(|i| if i % 3 == 0 { 0 } else { 1_000_000 + (i % 500) as i128 })
+            .collect();
         // min 0, max ~1_000_500 → 3-byte span.
-        assert_eq!(roundtrip(&v, 4, false), Some(3));
+        assert_eq!(roundtrip(&v, FixedInt::U32), Some(3));
         // Signed variant: NULL zeros among negative values → min is negative.
-        let mut vs: Vec<i128> = Vec::new();
-        for i in 0..200 {
-            vs.push(if i % 4 == 0 { 0 } else { -500_000 - (i % 300) as i128 });
-        }
-        assert_eq!(roundtrip(&vs, 4, true), Some(3));
+        let vs: Vec<i128> = (0..200)
+            .map(|i| if i % 4 == 0 { 0 } else { -500_000 - (i % 300) as i128 })
+            .collect();
+        assert_eq!(roundtrip(&vs, FixedInt::I32), Some(3));
     }
 
     #[test]
     fn seeded_random_every_eligible_type() {
+        use FixedInt::*;
         let mut rng = Rng::new(0x9E3779B97F4A7C15);
-        // (stride, signed, value mask) for every eligible fixed-int type code.
-        let cases: &[(usize, bool)] = &[(2, false), (2, true), (4, false), (4, true), (8, false), (8, true)];
-        for &(stride, signed) in cases {
+        for fi in [U16, I16, U32, I32, U64, I64] {
+            let signed = matches!(fi, I16 | I32 | I64);
             for &n in &[1usize, 1023, 1024, 10000] {
                 // Draw a random tight base and a random small span so most
                 // regions pack; a few will naturally decline.
@@ -439,12 +344,10 @@ mod for_codec_tests {
                             (base as i64).wrapping_add(off as i64) as i128
                         } else {
                             // Mask into the type width to stay in range.
-                            let masked = if stride == 2 {
-                                (base as u16 as u64).wrapping_add(off as u64) as u16 as u64
-                            } else if stride == 4 {
-                                (base as u32 as u64).wrapping_add(off as u64) as u32 as u64
-                            } else {
-                                base.wrapping_add(off as u64)
+                            let masked = match fi.width() {
+                                2 => (base as u16 as u64).wrapping_add(off as u64) as u16 as u64,
+                                4 => (base as u32 as u64).wrapping_add(off as u64) as u32 as u64,
+                                _ => base.wrapping_add(off as u64),
                             };
                             masked as i128
                         }
@@ -452,20 +355,20 @@ mod for_codec_tests {
                     .collect();
                 // Whatever the verdict, the roundtrip helper asserts byte-exact
                 // reproduction whenever it does pack; a None means Raw, also fine.
-                roundtrip(&vals, stride, signed);
+                roundtrip(&vals, fi);
             }
         }
     }
 
     #[test]
     fn aligned_footprint_tie_declines() {
-        // 10 U32 rows: raw 40 B, packed 8 + 10·2 = 28 B — both align64 to 64.
+        // 10 U32 rows: raw 40 B, packed 8 + 10·2 = 28 B — both align to 64.
         // No block dropped → decline (stay Raw) despite a raw-byte win.
         let vals: Vec<i128> = (0..10).map(|i| (i * 1000) as i128).collect();
-        assert_eq!(roundtrip(&vals, 4, false), None, "aligned footprints tie → Raw");
-        // 100 U32 rows with the same per-row span pack (align64 drops blocks).
+        assert_eq!(roundtrip(&vals, FixedInt::U32), None, "aligned footprints tie → Raw");
+        // 100 U32 rows with the same per-row span pack (alignment drops blocks).
         let many: Vec<i128> = (0..100).map(|i| (i % 60000) as i128).collect();
-        assert!(roundtrip(&many, 4, false).is_some(), "100 rows pack");
+        assert!(roundtrip(&many, FixedInt::U32).is_some(), "100 rows pack");
     }
 
     /// FoR decode-throughput + compression-ratio microbench. Run in release:
@@ -481,12 +384,12 @@ mod for_codec_tests {
         // range far from zero (the `_int_`/`_hist_`/`_reduce_` shape).
         let n = 1_000_000usize;
         let vals: Vec<i128> = (0..n).map(|i| 3_000_000_000i128 + (i % 4000) as i128).collect();
-        let raw = pack(&vals, 8);
-        let image = encode_for_region(&raw, 8, true, n).expect("region must pack");
-        let bw = (image.len() - 8) / n;
+        let raw = pack(&vals, FixedInt::I64);
+        let image = for_image(&raw, FixedInt::I64).expect("region must pack");
+        let bw = for_image_bw(image.len(), n, 8).expect("FoR geometry");
 
-        let raw_bytes = align64(n * 8);
-        let packed_bytes = align64(for_encoded_size(n, bw));
+        let raw_bytes = (n * 8).next_multiple_of(ALIGNMENT);
+        let packed_bytes = for_image_len(n, bw).next_multiple_of(ALIGNMENT);
         println!(
             "FoR ratio: {n} I64 rows, bw={bw}, raw(aligned)={raw_bytes}B packed(aligned)={packed_bytes}B \
              ({:.2}x)",
@@ -496,7 +399,7 @@ mod for_codec_tests {
         let iters = 200;
         let start = Instant::now();
         for _ in 0..iters {
-            let decoded = decode_for_region(black_box(&image), n, 8);
+            let decoded = decode_for_region(black_box(&image), n, bw, 8);
             black_box(&decoded);
         }
         let elapsed = start.elapsed();

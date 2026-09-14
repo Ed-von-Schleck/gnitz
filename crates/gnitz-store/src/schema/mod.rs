@@ -221,6 +221,13 @@ impl SchemaColumn {
     pub(crate) const fn is_signed(&self) -> bool {
         self.is_signed != 0
     }
+
+    /// This column's type as a ≤ 8-byte integer, or `None` for any other type —
+    /// the one rule the shard writer packs FoR by and the reader accepts it by.
+    #[inline]
+    pub(crate) fn fixed_int(&self) -> Option<gnitz_wire::FixedInt> {
+        gnitz_wire::FixedInt::from_type_code(gnitz_wire::TypeCode::from_validated_u8(self.type_code))
+    }
 }
 
 /// Pre-computed payload row-comparator strategy for a schema. Stored on

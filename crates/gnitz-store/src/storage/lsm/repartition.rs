@@ -311,7 +311,7 @@ impl TargetChild {
     /// consolidated, one guard key per shard. At L0 it would instead be an
     /// unbounded run the next spill folds in one go, permanently raising that
     /// store's guard target to the size of the whole child.
-    fn flush_shard(&mut self, schema: &SchemaDescriptor, table_id: u32, floor: u64) -> Result<(), StorageError> {
+    fn flush_shard(&mut self, table_id: u32, floor: u64) -> Result<(), StorageError> {
         if self.buffer.count == 0 {
             return Ok(());
         }
@@ -324,7 +324,6 @@ impl TargetChild {
         self.next_seq += 1;
         self.buffer.write_as_shard(
             &super::cstr(format!("{}/{name}", self.dir))?,
-            schema,
             ShardWriteOpts::COMPACTION,
         )?;
         self.entries
@@ -406,13 +405,13 @@ fn rewrite_targets(
             let slice = chunk.ascending_subset(idx);
             targets[w].buffer.append_batch(&slice, 0, slice.count);
             if targets[w].buffer.total_bytes() >= REWRITE_SHARD_BYTES {
-                targets[w].flush_shard(schema, table_id, floor)?;
+                targets[w].flush_shard(table_id, floor)?;
             }
         }
     }
     let mut ring = LazyRing::default();
     for t in targets.iter_mut() {
-        t.flush_shard(schema, table_id, floor)?;
+        t.flush_shard(table_id, floor)?;
         t.publish(&mut ring, seq)?;
     }
     Ok(())

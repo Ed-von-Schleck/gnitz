@@ -1,11 +1,9 @@
-use std::fs::File;
-use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 
 use super::error::StorageError;
+use super::{StagedFile, STAGING_SUFFIX};
 use crate::schema::key::PkBuf;
 use crate::schema::MAX_PK_BYTES;
-use gnitz_foundation::posix_io::{self, open_owned};
 use gnitz_wire::{read_u64_le, write_u64_le};
 
 // ---------------------------------------------------------------------------
@@ -260,85 +258,17 @@ pub(crate) fn read_file(
     read_bytes(path)?.map(|buf| parse(&buf)).transpose()
 }
 
-/// Open .tmp manifest at "<path>.tmp", serialize entries into it, and return
-/// the open fd plus owned path buffers. Does NOT fdatasync, close, or rename.
-/// On any internal write error closes the fd and unlinks the .tmp.
-pub(crate) struct PreparedManifest {
-    file: File,
-    tmp_path: std::ffi::CString,
-    final_path: std::ffi::CString,
-    /// Set true once the `.tmp` has been renamed into place (`commit`). Until
-    /// then, Drop unlinks the `.tmp` so a panic or early return between
-    /// `prepare_file` and the rename never leaks the temporary file. The
-    /// descriptor closes with the `File`.
-    committed: bool,
-}
-
-impl PreparedManifest {
-    /// The staged `.tmp`'s raw fd, open from `prepare_file` until the value
-    /// drops (after `commit`'s rename, or on the abandon path). Raw because the
-    /// flush barrier hands whole chunks of these to `IORING_OP_FSYNC` at once;
-    /// a blocking `sync_data` per file would undo that batching.
-    pub(crate) fn fd(&self) -> libc::c_int {
-        self.file.as_raw_fd()
-    }
-
-    /// Make the staged bytes durable. The one-directory-at-a-time counterpart
-    /// of the barrier's batched fsync.
-    pub(crate) fn sync(&self) -> std::io::Result<()> {
-        self.file.sync_data()
-    }
-
-    /// Rename the staged `.tmp` into place, consuming the staging value. The
-    /// sole owner of the rename + Drop-suppression transition: a failure leaves
-    /// `committed` unset, so Drop unlinks the `.tmp`.
-    pub(crate) fn commit(mut self) -> Result<(), StorageError> {
-        // `self` drops on the error path: Drop unlinks the .tmp.
-        posix_io::renameat(libc::AT_FDCWD, &self.tmp_path, libc::AT_FDCWD, &self.final_path)?;
-        self.committed = true; // renamed; suppress the .tmp unlink in Drop
-        Ok(())
-    }
-}
-
-impl Drop for PreparedManifest {
-    fn drop(&mut self) {
-        if !self.committed {
-            unsafe {
-                libc::unlink(self.tmp_path.as_ptr());
-            }
-        }
-    }
-}
-
+/// Serialize `entries` into a staged `<path>.tmp`. Does NOT fdatasync or rename.
 pub(crate) fn prepare_file(
     path: &std::ffi::CStr,
     entries: &[ManifestEntryRaw],
     header: ManifestHeader,
-) -> Result<PreparedManifest, StorageError> {
-    let count = entries.len();
-    let total = serialized_size(count);
-
-    let mut buf = vec![0u8; total];
+) -> Result<StagedFile, StorageError> {
+    let mut buf = vec![0u8; serialized_size(entries.len())];
     let written = serialize(&mut buf, entries, header)?;
-
-    let tmp_path = super::cstr_with_tmp_suffix(path)?;
-    let final_path = super::cstr(path.to_bytes())?;
-
-    let mut file = File::from(open_owned(&tmp_path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?);
-
-    if let Err(e) = file.write_all(&buf[..written]) {
-        unsafe {
-            libc::unlink(tmp_path.as_ptr());
-        }
-        return Err(e.into());
-    }
-
-    Ok(PreparedManifest {
-        file,
-        tmp_path,
-        final_path,
-        committed: false,
-    })
+    let staged = StagedFile::create(path)?;
+    staged.file().write_all_at(&buf[..written], 0)?;
+    Ok(staged)
 }
 
 /// Basename of a table's manifest inside its own directory. The one spelling —
@@ -352,7 +282,7 @@ pub(crate) fn path(dir: &str) -> String {
 
 /// The staging name `prepare_file` writes before renaming into `path(dir)`.
 pub(crate) fn tmp_path(dir: &str) -> String {
-    format!("{}.tmp", path(dir))
+    format!("{}{STAGING_SUFFIX}", path(dir))
 }
 
 /// A manifest's header without decoding its entries. `Ok(None)` when there is no

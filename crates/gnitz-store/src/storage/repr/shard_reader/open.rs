@@ -15,12 +15,13 @@
 use std::ffi::CStr;
 
 use super::super::batch::{
-    strides_from_schema, FIXED_REGION_BYTES, MAX_PAYLOAD_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+    FIXED_REGION_BYTES, MAX_PAYLOAD_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::shard_filter;
 use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion};
+use crate::schema::SchemaColumn;
 use gnitz_foundation::posix_io::{Advice, Mmap};
 use gnitz_wire::{read_i64_le, read_u64_le};
 
@@ -61,11 +62,6 @@ impl MappedShard {
         }
 
         let pk_stride = schema.pk_stride() as u8;
-        // Writer↔reader region-layout contract, shared with
-        // `write_shard_streaming`: `strides` holds each fixed-width region's
-        // per-element width. The file's own arity below drives the walk, so only
-        // the reader's strides are wanted here, not its region count.
-        let (strides, _) = strides_from_schema(schema);
 
         // The file's own payload-column count, bounded before any arithmetic on
         // it: `desc_len` is `HEADER_SIZE + n · DIR_ENTRY_SIZE` and overflows on a
@@ -130,50 +126,32 @@ impl MappedShard {
         let direct_region = |e: &DirEntry, elem_width: usize| -> Result<RegionView, StorageError> {
             let (stride, needed) = match e.encoding {
                 ENCODING_RAW => (elem_width, count * elem_width),
-                ENCODING_CONSTANT => (0, elem_width.min(count * elem_width)),
+                ENCODING_CONSTANT => (0, elem_width),
                 _ => return Err(StorageError::InvalidShard),
             };
-            // The writer rejects any region that is not exactly count*stride, so
-            // an inexact size here is corruption rather than a legal variant.
+            // The writer emits every region at exactly its encoding's size, so an
+            // inexact size here is corruption rather than a legal variant.
             if e.size != needed {
                 return Err(StorageError::InvalidShard);
             }
             Ok(RegionView { offset: e.offset, stride })
         };
         // Payload columns are the sole `ENCODING_FOR`-eligible role, and only for
-        // fixed-int types — the FoR codec widens whole integer cells, so a forged
-        // FoR byte on a STRING or float column would drive `decode_for_region`
-        // past its `bw < 8` contract. `elem_width` is the region's per-element
-        // width (which also bounds `bw` for a FoR region).
-        let build_payload_region =
-            |e: &DirEntry, elem_width: usize, type_code: u8| -> Result<PayloadRegion, StorageError> {
-                if e.encoding != ENCODING_FOR {
-                    return direct_region(e, elem_width).map(PayloadRegion::Direct);
-                }
-                if !gnitz_wire::is_fixed_int(type_code) {
-                    return Err(StorageError::InvalidShard);
-                }
-                // Decoder panic / OOB surface — these three checks make
-                // `decode_for_region` pure arithmetic over in-bounds slices:
-                // (1) count > 0 guards the divisor (the writer never emits an
-                // empty FoR region — n == 0 short-circuits to Raw of size 0);
-                // (2) size >= 8 guards the `size − 8` subtraction against a
-                // truncated entry; (3) an exact `size == 8 + count·bw` with
-                // `1 <= bw < elem_width` rejects trailing / short bytes.
-                if count == 0 || e.size < 8 {
-                    return Err(StorageError::InvalidShard);
-                }
-                let bw = (e.size - 8) / count;
-                if bw < 1 || bw >= elem_width || e.size != 8 + count * bw {
-                    return Err(StorageError::InvalidShard);
-                }
-                Ok(PayloadRegion::Packed(PackedRegion {
-                    offset: e.offset,
-                    size: e.size,
-                    elem_width,
-                    decoded: std::cell::OnceCell::new(),
-                }))
-            };
+        // the column types the writer packs: the codec widens whole integer
+        // cells, so a forged FoR byte on a STRING or float column is rejected.
+        let build_payload_region = |e: &DirEntry, col: &SchemaColumn| -> Result<PayloadRegion, StorageError> {
+            if e.encoding != ENCODING_FOR {
+                return direct_region(e, col.size() as usize).map(PayloadRegion::Direct);
+            }
+            let fi = col.fixed_int().ok_or(StorageError::InvalidShard)?;
+            let bw = for_image_bw(e.size, count, fi.width()).ok_or(StorageError::InvalidShard)?;
+            Ok(PayloadRegion::Packed(PackedRegion {
+                offset: e.offset,
+                bw,
+                elem_width: fi.width(),
+                decoded: std::cell::OnceCell::new(),
+            }))
+        };
         let build_weight_region = |e: &DirEntry| -> Result<WeightRegion, StorageError> {
             if e.encoding == ENCODING_TWO_VALUE {
                 if e.size != two_value_image_len(count) {
@@ -195,11 +173,10 @@ impl MappedShard {
         // `min` in both directions, and neither side is optional. A column the
         // *file* does not carry has no directory entry; a column the *schema*
         // does not describe cannot be built at all, since `build_payload_region`
-        // needs `elem_width` and `type_code` from the schema to validate a FoR
-        // region. The wider-file direction is reachable from a correct crash —
+        // needs the schema's column to validate a region. The wider-file direction is reachable from a correct crash —
         // a checkpoint publishes base manifests before making the catalog
         // durable — so it is narrowed, not rejected; rejecting it would make the
-        // database unbootable. Reusing the current schema's strides for the
+        // database unbootable. Reusing the current schema's columns for the
         // file's own columns is sound because no ALTER changes an existing
         // column's `type_code` or payload position.
         let schema_npc = schema.num_payload_cols();
@@ -213,12 +190,7 @@ impl MappedShard {
                 col_regions.push(PayloadRegion::Absent);
                 continue;
             }
-            let reg_idx = REG_PAYLOAD_START + pi;
-            col_regions.push(build_payload_region(
-                &entries[reg_idx],
-                strides[reg_idx] as usize,
-                col.type_code,
-            )?);
+            col_regions.push(build_payload_region(&entries[REG_PAYLOAD_START + pi], col)?);
         }
         // Old rows wrote `0` in an `Absent` column's null bit, which reads as
         // "non-null"; this forces them to `1`. The naive `(1 << schema_npc) - 1`

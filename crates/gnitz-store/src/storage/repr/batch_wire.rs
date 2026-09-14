@@ -1,22 +1,18 @@
-//! Wire / shard serialization for `Batch`.
+//! Wire serialization for `Batch`.
 //!
 //! Keeping the serialization cluster here rather than in `batch.rs` lets the
-//! pure in-memory repr name no wire or shard module: this is the only place that
-//! knows both the batch layout and the `wal` block / `shard_file` image formats.
+//! pure in-memory repr name no wire module: this is the only place that knows
+//! both the batch layout and the `wal` block format.
 //!
 //! These run per-flush / per-IPC, not per-row; the region-copy loops stay
 //! `#[inline]`-friendly and read every stride/offset off the `Batch` /
 //! `SchemaDescriptor` view — region math is never re-derived here.
 
-use std::ffi::CStr;
-
-use super::super::error::StorageError;
 use super::batch::{
     compute_offsets_into, copy_regions, strides_from_schema, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
 };
 use super::batch_pool::{acquire_arena, Fill};
 use super::merge::{BlobCacheGuard, DirectWriter, MemBatch};
-use super::shard_file;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
 
@@ -49,20 +45,6 @@ pub fn wire_block_size(schema: &SchemaDescriptor, count: usize, blob_size: usize
 }
 
 impl Batch {
-    /// Write this batch as a shard file directly to disk. `opts` carries the
-    /// durability / flags / FoR packing policy (see
-    /// [`shard_file::ShardWriteOpts`]).
-    pub(crate) fn write_as_shard(
-        &self,
-        path: &CStr,
-        schema: &SchemaDescriptor,
-        opts: shard_file::ShardWriteOpts,
-    ) -> Result<(), StorageError> {
-        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
-        let n = self.fill_regions(&mut regions);
-        shard_file::write_shard_streaming(libc::AT_FDCWD, path, self.count as u32, &regions[..n], schema, opts)
-    }
-
     // ── Wire serialization (used by the server's SAL and frame codecs) ─────
 
     /// WAL-block byte size for `count` rows of this batch's fixed regions plus a
@@ -201,7 +183,7 @@ impl Batch {
     /// Fill `out` with every fixed region followed by the blob heap, in
     /// canonical order. Returns the region count — the `&[&[u8]]` both the WAL
     /// framer and the shard writer take, built on the caller's stack.
-    fn fill_regions<'a>(&'a self, out: &mut [&'a [u8]; MAX_WIRE_REGIONS]) -> usize {
+    pub(super) fn fill_regions<'a>(&'a self, out: &mut [&'a [u8]; MAX_WIRE_REGIONS]) -> usize {
         let blob_idx = self.num_regions();
         for (i, region) in out[..blob_idx].iter_mut().enumerate() {
             *region = self.region_or_blob(i);
