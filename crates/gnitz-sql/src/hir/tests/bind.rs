@@ -293,3 +293,26 @@ fn a_distinct_aggregate_that_cannot_share_one_distinct_set_is_rejected() {
         }
     }
 }
+
+/// Aggregates of one reduce computing the same op over the same argument share
+/// one physical column: over a nullable `b`, SUM's companion, AVG's two columns
+/// and COUNT(b) are the one `Sum(b)` and the one `CountNonNull(b)`.
+#[test]
+fn aggregates_of_one_reduce_share_their_physical_columns() {
+    let rel = bound("SELECT SUM(b), AVG(b), COUNT(b) FROM t GROUP BY a").unwrap();
+    let RelExpr::Project { input, .. } = rel.as_ref() else {
+        panic!("no projection")
+    };
+    let RelExpr::Reduce { aggs, .. } = input.as_ref() else {
+        panic!("no reduce")
+    };
+    assert_eq!(aggs.len(), 3);
+    let mut distinct: Vec<&crate::hir::AggCol> = Vec::new();
+    for c in aggs.iter().flat_map(HirAgg::cols) {
+        if !distinct.iter().any(|d| d.col.id == c.col.id) {
+            distinct.push(c);
+        }
+    }
+    let ops: Vec<_> = distinct.iter().map(|c| c.op).collect();
+    assert_eq!(ops, [gnitz_wire::AggFunc::Sum, gnitz_wire::AggFunc::CountNonNull]);
+}

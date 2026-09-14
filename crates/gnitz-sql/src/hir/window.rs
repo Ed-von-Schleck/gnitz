@@ -443,7 +443,8 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             return Ok((ColType::of(TypeCode::I64), false));
         };
         let arg_def = arg.map(|e| ColumnDef::typed("_arg", e.infer_ty_with(&|r| self.type_of(r)), !self.never_null(e)));
-        let raw = crate::agg::agg_typing(agg, arg_def.as_ref())?.ops[0].1;
+        let (op, _) = crate::agg::agg_ops(agg, arg_def.as_ref())?;
+        let raw = crate::agg::agg_col_def(op, arg_def.as_ref(), false).ty();
         let nullable = match agg {
             AggFunc::Count => false,
             _ => arg_def.is_some_and(|d| d.is_nullable),
@@ -861,8 +862,8 @@ impl Aggs<'_> {
         if let Some(i) = self.list.iter().position(|a| a.func == func && a.arg == arg) {
             return Ok(i);
         }
-        self.list
-            .push(HirAgg::new(self.ids, func, arg, self.env, self.is_global)?);
+        let agg = HirAgg::new(self.ids, func, arg, self.env, self.is_global, &self.list)?;
+        self.list.push(agg);
         Ok(self.list.len() - 1)
     }
 
@@ -1060,9 +1061,8 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
             WinFunc::Agg(AggFunc::Avg) => {
                 let (sum, _, nullable) = r_aggs.value(AggFunc::Sum, v2(gs[0]))?;
                 let (cnt, _, _) = r_aggs.value(AggFunc::Sum, v2(gs[1]))?;
-                let scaled = BExpr::BinOp(Box::new(sum), BinOp::Mul, Box::new(BExpr::LitFloat(1.0)));
                 (
-                    BExpr::BinOp(Box::new(scaled), BinOp::Div, Box::new(cnt)),
+                    crate::agg::finalize_agg_bexpr(sum, Some(cnt), AggFunc::Avg),
                     ColType::of(TypeCode::F64),
                     nullable,
                 )

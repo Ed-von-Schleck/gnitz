@@ -32,6 +32,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr};
 use chain::{EmitPieces, ViewChain};
 use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode};
+use gnitz_wire::AggFunc as WireAggFunc;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -388,80 +389,85 @@ impl GetSource {
     }
 }
 
-/// One raw reduce output. `func`/`arg` are the **logical** aggregate (AVG is
-/// never decomposed here — physicalization expands it to `Sum`+`CountNonNull`).
-/// `out` is the raw value column; `companion` is the hidden `COUNT_NON_NULL`
-/// column present iff the aggregate's null-ness derives from it (AVG, nullable
-/// SUM). Both are synthetic staging columns of the reduce's physical output —
-/// referenced only by the finalize/HAVING expressions bind builds over them — so
-/// [`HirAgg::new`] mints their defs from the aggregate's typing rather than any
-/// caller authoring them.
+/// One physical reduce column: the op, the column it reads (`None` for COUNT(*)),
+/// and its output identity and def.
+#[derive(Clone)]
+pub(crate) struct AggCol {
+    pub op: WireAggFunc,
+    pub arg: Option<ColId>,
+    pub col: HirCol,
+}
+
+/// One aggregate over a reduce: the logical `func(arg)`, and the physical value
+/// and count columns ([`crate::agg::agg_ops`]) it may share with other aggregates.
 #[derive(Clone)]
 pub(crate) struct HirAgg {
     pub func: AggFunc,
     pub arg: Option<ColId>,
-    pub out: HirCol,
-    pub companion: Option<HirCol>,
+    pub out: AggCol,
+    pub companion: Option<AggCol>,
 }
 
 impl HirAgg {
-    /// Mint an aggregate's raw output column (and its `COUNT_NON_NULL` companion
-    /// when the shape carries one) from the typing `agg::agg_typing` decided.
-    /// The raw column's nullability is the shared `AggFunc::raw_output_nullable`,
-    /// so the planner and the engine's reduce output schema agree on what the
-    /// reduce can emit: declared NOT NULL, `null_gate` would leave it ungated.
+    /// Mint an aggregate's columns, reusing any identical column of `prior`, the
+    /// aggregates of the same reduce.
     pub(crate) fn new(
         ids: &ColIdGen,
         func: AggFunc,
         arg: Option<ColId>,
         env: &[HirCol],
         is_global: bool,
+        prior: &[HirAgg],
     ) -> Result<Self, GnitzSqlError> {
         let arg_def = arg.map(|id| &hircol_of(env, id).def);
-        let typing = crate::agg::agg_typing(func, arg_def)?;
-        let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
+        let (value, count) = crate::agg::agg_ops(func, arg_def)?;
+        let col = |op: WireAggFunc| {
+            // COUNT(*) reads no column, whatever argument the aggregate names.
+            let arg = arg.filter(|_| op != WireAggFunc::Count);
+            let def = crate::agg::agg_col_def(op, arg.and(arg_def), is_global);
+            match prior
+                .iter()
+                .flat_map(HirAgg::cols)
+                .find(|c| c.op == op && c.arg == arg && c.col.def == def)
+            {
+                Some(shared) => shared.clone(),
+                None => AggCol {
+                    op,
+                    arg,
+                    col: HirCol::new(ids.next(), def),
+                },
+            }
+        };
         Ok(HirAgg {
             func,
             arg,
-            // Hidden: a raw reduce-output column is addressed by `ColId`, never
-            // by name — the finalize composite is built for it, not looked up.
-            out: HirCol::new(
-                ids.next(),
-                ColumnDef::typed(
-                    "_agg",
-                    typing.ops[0].1,
-                    typing.ops[0].0.raw_output_nullable(arg_nullable, is_global),
-                )
-                .hidden(),
-            ),
-            // The companion is COUNT_NON_NULL, whose empty render is a concrete `0`.
-            companion: typing
-                .shape
-                .has_count_companion()
-                .then(|| HirCol::new(ids.next(), ColumnDef::new("_cnt", TypeCode::I64, false).hidden())),
+            out: col(value),
+            companion: count.map(col),
         })
+    }
+
+    /// Its physical columns: the value, then the count.
+    pub(crate) fn cols(&self) -> impl Iterator<Item = &AggCol> {
+        std::iter::once(&self.out).chain(&self.companion)
     }
 
     /// The finalize composite over this aggregate's raw reduce column(s) — the one
     /// home, shared with `hir::rewrite`'s scalar-subquery substitution and the
     /// grouped binder's SELECT / HAVING leaf.
     pub(crate) fn finalize(&self) -> HirExpr {
-        crate::agg::finalize_agg_bexpr(
-            HirRef::Col(self.out.id),
-            self.companion.as_ref().map(|c| HirRef::Col(c.id)),
-            self.func,
-        )
+        let col = |c: &AggCol| BExpr::ColRef(HirRef::Col(c.col.id));
+        crate::agg::finalize_agg_bexpr(col(&self.out), self.companion.as_ref().map(col), self.func)
     }
 
     /// The type this aggregate renders where a view reads it.
     pub(crate) fn view_type(&self) -> ColType {
-        crate::agg::agg_view_type(self.func, self.out.def.ty())
+        crate::agg::agg_view_type(self.func, self.out.col.def.ty())
     }
 
     /// A companion carries the null-ness (the finalize renders NULL by
     /// div-by-zero); otherwise the raw column's own.
     pub(crate) fn view_nullable(&self) -> bool {
-        self.companion.is_some() || self.out.def.is_nullable
+        self.companion.is_some() || self.out.col.def.is_nullable
     }
 
     /// This aggregate as a view-facing value column: what computes it, and the
@@ -947,15 +953,13 @@ impl RelExpr {
                 }
             },
             RelExpr::Reduce { input, group_cols, aggs } => {
-                // Group cols keep their source `HirCol`s (from the reduce's input);
-                // then each aggregate's raw value + companion columns. The physical
-                // cardinality COUNT has no logical column and is absent here.
+                // A hidden cardinality COUNT has no logical column and is absent here.
                 let in_cols = input.cols();
                 let mut cols: Vec<HirCol> = group_cols.iter().map(|id| hircol_of(&in_cols, *id).clone()).collect();
-                for a in aggs {
-                    cols.push(a.out.clone());
-                    if let Some(c) = &a.companion {
-                        cols.push(c.clone());
+                let n_group = cols.len();
+                for c in aggs.iter().flat_map(HirAgg::cols) {
+                    if !cols[n_group..].iter().any(|h| h.id == c.col.id) {
+                        cols.push(c.col.clone());
                     }
                 }
                 cols

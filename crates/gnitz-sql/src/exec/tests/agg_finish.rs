@@ -1,8 +1,9 @@
 use super::*;
-use crate::agg::{finalize_agg_bexpr, fold_partial_schema, push_agg_specs, AggSpec};
+use crate::agg::{agg_col_def, finalize_agg_bexpr};
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::test_support::col_def;
 use gnitz_core::{PkColumn, TypeCode};
+use gnitz_wire::AggDescriptor;
 
 /// A long body, spilled to the arena rather than inlined in its German cell.
 const LONG_M: &str = "a string past the inline prefix: m";
@@ -34,14 +35,25 @@ fn source_schema() -> Schema {
     }
 }
 
-fn spec(op: WireAggFunc, col: usize, tc: TypeCode) -> AggSpec {
-    AggSpec { op, col, out_type: tc.into() }
+fn spec(agg_op: WireAggFunc, col: usize, _: TypeCode) -> AggDescriptor {
+    AggDescriptor { agg_op, col_idx: col as u32 }
 }
 
-fn partial_schema(group: &[usize], specs: &[AggSpec]) -> Schema {
-    fold_partial_schema(&source_schema(), group, specs)
-        .expect("the SyntheticFold layout is a valid client schema")
-        .schema
+/// The SyntheticFold partial layout over `source`: the hidden key, the group
+/// columns, then each spec's raw column.
+fn partial_over(source: &Schema, group: &[usize], specs: &[AggDescriptor]) -> Schema {
+    let mut cols = vec![group_pk_def()];
+    cols.extend(group.iter().map(|&g| source.columns[g].clone()));
+    cols.extend(
+        specs
+            .iter()
+            .map(|d| agg_col_def(d.agg_op, Some(&source.columns[d.col_idx as usize]), group.is_empty())),
+    );
+    Schema::from_parts(cols, vec![0]).expect("the SyntheticFold layout is a valid client schema")
+}
+
+fn partial_schema(group: &[usize], specs: &[AggDescriptor]) -> Schema {
+    partial_over(&source_schema(), group, specs)
 }
 
 /// Every partial column passed through under a name of its own: an identity
@@ -60,11 +72,11 @@ fn passthrough_all(partial: &Schema) -> Vec<(BoundExpr, ColumnDef)> {
 
 fn finish_of(
     partial: &Schema,
-    specs: &[AggSpec],
+    specs: &[AggDescriptor],
     having: &[BoundExpr],
     finalize: Vec<(BoundExpr, ColumnDef)>,
 ) -> FoldFinish {
-    FoldFinish::new(partial.clone(), specs.iter().map(|s| s.op), having, finalize).unwrap()
+    FoldFinish::new(partial.clone(), specs.iter().map(|d| d.agg_op), having, finalize).unwrap()
 }
 
 /// A concatenated partial reply over `schema`: one weight-1 row per
@@ -341,7 +353,7 @@ fn a_projecting_finalize_runs_the_map() {
 }
 
 /// A global `AVG(u)` over a `BIGINT UNSIGNED` column, built the way the planner
-/// builds one: `push_agg_specs` splits it into `[Sum, CountNonNull]`, and the
+/// builds one: `agg_ops` splits it into `[Sum, CountNonNull]`, and the
 /// finalize item is the shared composite over the two partial columns — the
 /// *only* place the division happens on this path. Drives one worker partial
 /// `(sum bits, count)` through the whole finish and reads the AVG cell back.
@@ -350,16 +362,18 @@ fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
         columns: vec![col_def("pk", TypeCode::U64, false), col_def("u", TypeCode::U64, true)],
         pk_cols: vec![0],
     };
-    let mut specs = Vec::new();
-    push_agg_specs(AggFunc::Avg, Some(1), &src.columns, &mut specs).unwrap();
-    let partial = fold_partial_schema(&src, &[], &specs).unwrap().schema;
+    let specs = [
+        spec(WireAggFunc::Sum, 1, TypeCode::U64),
+        spec(WireAggFunc::CountNonNull, 1, TypeCode::I64),
+    ];
+    let partial = partial_over(&src, &[], &specs);
     // No group columns: the SUM lands at partial column 1, its companion at 2.
     let f = finish_of(
         &partial,
         &specs,
         &[],
         vec![(
-            finalize_agg_bexpr(1, Some(2), AggFunc::Avg),
+            finalize_agg_bexpr(BExpr::ColRef(1), Some(BExpr::ColRef(2)), AggFunc::Avg),
             col_def("a", TypeCode::F64, true),
         )],
     );

@@ -116,7 +116,7 @@ impl AggFunc {
     /// null-filled from emptiness — it is retracted instead.
     ///
     /// Read by `build_reduce_output_schema` and by the planner's
-    /// `agg_raw_nullable`; a NOT NULL declaration puts the row on a null-blind
+    /// `agg_col_def`; a NOT NULL declaration puts the row on a null-blind
     /// comparator that would rank a NULL cell as a real `0`.
     pub const fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
         !self.empty_renders_zero() && (src_nullable || ungrouped)
@@ -146,6 +146,11 @@ impl AggFunc {
 pub struct AggDescriptor {
     pub col_idx: u32,
     pub agg_op: AggFunc,
+}
+
+impl AggDescriptor {
+    /// COUNT(*), which reads no column: column 0 is a placeholder.
+    pub const COUNT_STAR: AggDescriptor = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
 }
 
 /// A compiled expression program and the payload slots it writes, as
@@ -269,26 +274,27 @@ impl ReduceOutKey {
         }
     }
 
-    /// The output layout this kind selects, up to the aggregate columns each side
-    /// types for itself: the key region ([`Self::key_region`]), then — the fold
-    /// arm only — the group columns its synthetic key does not spell.
-    pub fn output_layout(self, pk_cols: &[u32], group_cols: &[u32]) -> Vec<ReduceOutSlot> {
-        match self.key_region(pk_cols, group_cols) {
-            Some(keys) => keys.iter().map(|&c| ReduceOutSlot::Key(c)).collect(),
-            None => std::iter::once(ReduceOutSlot::SyntheticKey)
-                .chain(group_cols.iter().map(|&c| ReduceOutSlot::Carried(c)))
-                .collect(),
-        }
-    }
-
-    /// The input columns an output carries *behind* the key region when it keeps
-    /// the whole input row (`OpNode::TopN`): every column the PK region does not
-    /// already spell, in input schema order. The rule the planner's declared
-    /// schema and the engine's emitted batch must agree on, so it lives here
-    /// rather than once on each side.
-    pub fn carried_columns(self, pk_cols: &[u32], group_cols: &[u32], num_columns: u32) -> Vec<u32> {
-        let keys = self.key_region(pk_cols, group_cols).unwrap_or_default();
-        (0..num_columns).filter(|c| !keys.contains(c)).collect()
+    /// An output's layout ahead of its aggregates: the key region (or the synthetic
+    /// key), then each `row` column the key region does not spell.
+    pub fn output_layout(
+        self,
+        pk_cols: &[u32],
+        group_cols: &[u32],
+        row: impl IntoIterator<Item = u32>,
+    ) -> Vec<ReduceOutSlot> {
+        let keys = self.key_region(pk_cols, group_cols);
+        let lead: Vec<ReduceOutSlot> = match keys {
+            Some(k) => k.iter().map(|&c| ReduceOutSlot::Key(c)).collect(),
+            None => vec![ReduceOutSlot::SyntheticKey],
+        };
+        let spelled = keys.unwrap_or_default();
+        lead.into_iter()
+            .chain(
+                row.into_iter()
+                    .filter(|c| !spelled.contains(c))
+                    .map(ReduceOutSlot::Carried),
+            )
+            .collect()
     }
 }
 
@@ -300,8 +306,8 @@ pub enum ReduceOutSlot {
     SyntheticKey,
     /// Source column `col`, in the output's PK region.
     Key(u32),
-    /// Source column `col`, carried into the payload — the fold arm's group
-    /// columns, which its synthetic key does not spell.
+    /// Source column `col`, carried into the payload — a column of the output's
+    /// row the key region does not spell.
     Carried(u32),
 }
 

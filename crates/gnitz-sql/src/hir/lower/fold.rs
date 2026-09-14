@@ -4,14 +4,13 @@
 
 use super::super::physical::{self, Frame};
 use super::super::{as_col, split_filter, ColId, GetSource, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
-use super::{reduce_out_layout, resolve_reduce_specs, ReduceSpecs};
-use crate::agg::{fold_partial_schema, AggSpec};
+use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::codec::project_schema::read_reply_shape;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
 use crate::validate::reject_float_keys;
-use gnitz_core::{ColumnDef, Schema};
-use gnitz_wire::ComputeMap;
+use gnitz_core::{ColumnDef, ReduceOutKey, Schema};
+use gnitz_wire::{AggReadSpec, ComputeMap};
 use std::sync::Arc;
 
 /// Everything an ad-hoc grouped read needs, in layout terms: what the workers
@@ -19,14 +18,12 @@ use std::sync::Arc;
 /// `chain::EmitPieces` for the fold sink.
 pub(crate) struct FoldPieces {
     /// The reduce input: the pre-map's output schema when there is one, else the
-    /// source's. The schema `group_positions` and `agg_specs[].col` index, and
-    /// the one that names them (a pre-map column is a hidden `_preN`).
+    /// source's. The schema `agg`'s columns index, and the one that names them
+    /// (a pre-map column is a hidden `_preN`).
     pub(crate) reduce_schema: Arc<Schema>,
-    /// Group columns as **reduce-input** positions. Empty = a global aggregate.
-    pub(crate) group_positions: Vec<usize>,
-    /// The physical reduce specs, pre-companion — no cardinality COUNT: that is
-    /// a `should_emit` signal only a stateful reduce needs.
-    pub(crate) agg_specs: Vec<AggSpec>,
+    /// What the workers fold. It carries no cardinality COUNT: nothing stateless
+    /// gates on one.
+    pub(crate) agg: AggReadSpec,
     /// The SyntheticFold partial-reply layout
     /// (`[_group_pk | group cols | agg partials]`) the workers emit and every
     /// `BoundExpr` below is written against.
@@ -158,21 +155,26 @@ fn fold(
             )
         }
     };
-    let ReduceSpecs { group_positions, specs, agg_starts } =
-        resolve_reduce_specs(group_cols, aggs, &reduce_in.layout, &reduce_in.schema)?;
-    // The partial reply layout, which every expression below resolves against.
-    let partial = fold_partial_schema(&reduce_in.schema, &group_positions, &specs)?;
-    let out_layout = reduce_out_layout(&partial, group_cols, aggs, &agg_starts);
-    let having = physical::resolve_preds(having, &out_layout)?;
+    let ReduceSpecs { group, specs, cols } = resolve_reduce_specs(group_cols, aggs, &reduce_in.layout)?;
+    // The partial reply layout, which every expression below resolves against: the
+    // fixed `SyntheticFold` key, then every group column in written order.
+    let partial = keyed_frame(
+        &reduce_in,
+        ReduceOutKey::SyntheticFold,
+        &group,
+        group.iter().copied(),
+        cols,
+        "aggregate SELECT partial-reply layout",
+    )?;
+    let having = physical::resolve_preds(having, &partial.layout)?;
     let finalize = finalize
         .iter()
-        .map(|e| Ok((physical::resolve_refs(&e.expr, &out_layout)?, e.out.def.clone())))
+        .map(|e| Ok((physical::resolve_refs(&e.expr, &partial.layout)?, e.out.def.clone())))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     Ok(FoldPieces {
         reduce_schema: reduce_in.schema,
-        group_positions,
-        agg_specs: specs,
-        partial_schema: partial.schema,
+        agg: AggReadSpec { group_cols: group, aggs: specs },
+        partial_schema: Arc::unwrap_or_clone(partial.schema),
         pre: map,
         having,
         finalize,

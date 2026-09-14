@@ -485,7 +485,7 @@ fn build_uncorrelated_inner(
     ids: &ColIdGen,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let agg = subref.scalar_agg()?;
-    if matches!(agg.func, AggFunc::Avg) || agg.out.def.type_code.is_float() {
+    if matches!(agg.func, AggFunc::Avg) || agg.out.col.def.type_code.is_float() {
         return Err(GnitzSqlError::Unsupported(
             "an uncorrelated scalar aggregate compared to an outer column must be integer-typed \
              (AVG and a float SUM/MIN/MAX are rejected — the aggregate value is a join key)"
@@ -503,11 +503,14 @@ fn build_uncorrelated_inner(
     // MIN/MAX re-derive NULL on exhaustion, COUNT is never NULL) — so it keys directly
     // with no extra segment.
     let (right, key_id) = match &agg.companion {
-        None => (Rc::clone(&subref.rel), agg.out.id),
+        None => (Rc::clone(&subref.rel), agg.out.col.id),
         Some(_) => {
             // Hidden like every other synthetic slot: the finalized value exists
             // to be a join key, and no name reaches it.
-            let key = HirCol::new(ids.next(), ColumnDef::typed("_agg", agg.out.def.ty(), true).hidden());
+            let key = HirCol::new(
+                ids.next(),
+                ColumnDef::typed("_agg", agg.out.col.def.ty(), true).hidden(),
+            );
             let key_id = key.id;
             let proj = RelExpr::project(
                 Rc::clone(&subref.rel),
@@ -541,7 +544,7 @@ fn scalar_value(s: &SubqueryRef, null_filled: bool) -> Result<HirExpr, GnitzSqlE
         Ok(BExpr::Case {
             branches: vec![(
                 BExpr::NullTest {
-                    inner: Box::new(BExpr::ColRef(HirRef::Col(agg.out.id))),
+                    inner: Box::new(BExpr::ColRef(HirRef::Col(agg.out.col.id))),
                     want_null: false,
                 },
                 v,

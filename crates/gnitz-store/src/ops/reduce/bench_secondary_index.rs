@@ -68,7 +68,10 @@ fn build_input(schema: &SchemaDescriptor) -> Batch {
 /// reaches it — through the plan that owns the accumulators the bake reads.
 fn min_bake(schema: &SchemaDescriptor) -> AviBake {
     let group = [1u32];
-    let aggs = [AggDescriptor { col_idx: 2, agg_op: AggFunc::Min }];
+    let aggs = [
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
+        AggDescriptor::COUNT_STAR,
+    ];
     ReducePlan::from_wire(schema, &group, &aggs, false, false)
         .unwrap()
         .avi

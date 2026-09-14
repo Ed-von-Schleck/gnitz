@@ -387,19 +387,33 @@ fn top_n_rejects_a_zero_limit_and_too_many_keys() {
     assert!(decode(1, crate::MAX_ORDER_KEYS).is_ok());
 }
 
-/// The columns a whole-row output carries behind its key region: exactly the
-/// ones the key region does not already spell, in schema order. Both the
-/// planner's declared schema and the engine's emitted batch are built from this,
-/// so it is the rule they agree by rather than mirror.
 #[test]
-fn carried_columns_are_the_input_minus_the_key_region() {
+fn output_layout_is_the_key_region_then_the_unspelled_row() {
     use ReduceOutKey::*;
-    // The fold key spells no input column, so the whole input rides behind it —
+    use ReduceOutSlot::{Carried, Key, SyntheticKey};
+    // The fold key spells no input column, so the whole row rides behind it —
     // group columns included, since the synthetic key is not one of them.
-    assert_eq!(SyntheticFold.carried_columns(&[0], &[2], 4), vec![0, 1, 2, 3]);
-    assert_eq!(SyntheticFold.carried_columns(&[0], &[], 3), vec![0, 1, 2]);
+    assert_eq!(
+        SyntheticFold.output_layout(&[0], &[2], 0..4),
+        vec![SyntheticKey, Carried(0), Carried(1), Carried(2), Carried(3)]
+    );
+    assert_eq!(
+        SyntheticFold.output_layout(&[0], &[], 0..3),
+        vec![SyntheticKey, Carried(0), Carried(1), Carried(2)]
+    );
     // A natural key column is in the PK region, so it is not carried again.
-    assert_eq!(SingleNaturalCol.carried_columns(&[0], &[2], 4), vec![0, 1, 3]);
+    assert_eq!(
+        SingleNaturalCol.output_layout(&[0], &[2], 0..4),
+        vec![Key(2), Carried(0), Carried(1), Carried(3)]
+    );
     // A permuted PK keys on every PK column whatever order the group set lists.
-    assert_eq!(PkPermutation.carried_columns(&[0, 2], &[2, 0], 4), vec![1, 3]);
+    assert_eq!(
+        PkPermutation.output_layout(&[0, 2], &[2, 0], 0..4),
+        vec![Key(0), Key(2), Carried(1), Carried(3)]
+    );
+    // A fold's row is its group set, a repeated column carried once per occurrence.
+    assert_eq!(
+        SyntheticFold.output_layout(&[0], &[1, 1], [1, 1]),
+        vec![SyntheticKey, Carried(1), Carried(1)]
+    );
 }

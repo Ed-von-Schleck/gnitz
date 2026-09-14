@@ -33,7 +33,10 @@ fn avi_schema(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescrip
     make_bake(
         schema,
         group_by_cols,
-        &[AggDescriptor { col_idx: 0, agg_op: AggFunc::Min }],
+        &[
+            AggDescriptor { col_idx: 0, agg_op: AggFunc::Min },
+            AggDescriptor::COUNT_STAR,
+        ],
     )
     .schema
 }
@@ -129,8 +132,8 @@ fn make_bake(in_schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggD
 /// The single accumulator the plan bakes for `desc` — carrying the output
 /// column locator its emission and trace read-back go through.
 fn make_acc(in_schema: &SchemaDescriptor, group_cols: &[u32], desc: AggDescriptor) -> Accumulator {
-    let mut accs = make_plan(in_schema, group_cols, &[desc], false, false).acc_template;
-    accs.pop().unwrap()
+    let mut accs = make_plan(in_schema, group_cols, &[desc, AggDescriptor::COUNT_STAR], false, false).acc_template;
+    accs.swap_remove(0)
 }
 
 /// The AVI value image of an I64 aggregate value, spelled out rather than taken
@@ -244,7 +247,7 @@ fn grouped_reduce_two_column_digest_key() {
     // A two-column group set is not canonical ⇒ the XXH3 digest arm. Group
     // *order* is the digest's, so the assertion is per group, never positional.
     let in_schema = make_schema_u64_uuid_i64();
-    let aggs = [AggDescriptor { col_idx: 0, agg_op: AggFunc::Count }];
+    let aggs = [AggDescriptor::COUNT_STAR];
     let out_schema = out_schema_for(&in_schema, &[1u32, 2u32], &aggs);
     let mut to_ch = empty_trace(out_schema);
 
@@ -527,7 +530,7 @@ fn linear_sum_only_new_all_null_group_present() {
             col_idx: 2,
             agg_op: AggFunc::CountNonNull,
         },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
 
     // New group g=7 whose only row has val=NULL.
@@ -583,7 +586,7 @@ fn count_star_only_emptied_group_eliminated() {
         ],
         &[0],
     );
-    let aggs = [AggDescriptor { col_idx: 0, agg_op: AggFunc::Count }];
+    let aggs = [AggDescriptor::COUNT_STAR];
 
     let reduce = |delta: &Batch, to: &mut crate::storage::ReadCursor| {
         op_reduce(delta, to, &in_schema, &[1u32], &aggs, None, false, false)
@@ -686,7 +689,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     .unwrap();
 
     let aggs = [
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
         AggDescriptor {
             col_idx: 2,
@@ -1170,7 +1173,7 @@ fn test_reduce_count() {
     // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
     let delta = make_batch(&in_schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
-    let agg = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
+    let agg = AggDescriptor::COUNT_STAR;
 
     // GROUP BY pk → each row is its own group
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
@@ -1293,6 +1296,7 @@ fn test_reduce_min_f32() {
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -1306,7 +1310,16 @@ fn test_reduce_min_f32() {
     let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
 
     // GROUP BY pk → all 3 rows in same group
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
+    let out = op_reduce(
+        &delta,
+        &mut to_ch,
+        &in_schema,
+        &[0u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        None,
+        false,
+        false,
+    );
     assert_eq!(out.count, 1);
     // MIN should be -1.0 stored as f64 bits
     let bits = u64::from_le_bytes(out.col_data(0)[0..8].try_into().unwrap());
@@ -1321,14 +1334,23 @@ fn test_reduce_max_i16() {
     let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Max };
     // MIN/MAX select an existing row, so the output column keeps the I16 source
     // width — the read below is 2 bytes, not 8.
-    let out_schema = out_schema_for(&in_schema, &[0u32], std::slice::from_ref(&agg));
+    let out_schema = out_schema_for(&in_schema, &[0u32], &[agg, AggDescriptor::COUNT_STAR]);
     let mut to_ch = empty_trace(out_schema);
 
     // 3 rows with I16 values, all same PK, in (PK, payload) order so the
     // consolidated flag the helper stamps is honest.
     let delta = make_batch_typed(&in_schema, &[(1, 1, -100), (1, 1, 50), (1, 1, 200)]);
 
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
+    let out = op_reduce(
+        &delta,
+        &mut to_ch,
+        &in_schema,
+        &[0u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        None,
+        false,
+        false,
+    );
     assert_eq!(out.count, 1);
     let max_val = i16::from_le_bytes(out.col_data(0)[0..2].try_into().unwrap());
     assert_eq!(max_val, 200, "MAX of I16 {{-100, 200, 50}} should be 200");
@@ -1786,6 +1808,7 @@ fn test_reduce_min_pk_col_compound_pk() {
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0, 1],
     );
@@ -1804,7 +1827,7 @@ fn test_reduce_min_pk_col_compound_pk() {
         &mut to_ch,
         &in_schema,
         &[0u32, 1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         None,
         false,
         false,
@@ -1830,6 +1853,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -1841,7 +1865,16 @@ fn test_reduce_min_pk_col_single_pk_u64() {
     let delta = make_batch(&in_schema, &[(7, 1, 0), (42, 1, 0), (99, 1, 0)]);
 
     let agg = AggDescriptor { col_idx: 0, agg_op: AggFunc::Min };
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
+    let out = op_reduce(
+        &delta,
+        &mut to_ch,
+        &in_schema,
+        &[0u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        None,
+        false,
+        false,
+    );
     // GROUP BY pk → each row is its own group; MIN(pk) per group equals the row's pk.
     assert_eq!(out.count, 3);
     let mins: Vec<i64> = (0..out.count).map(|i| read_i64_le(out.col_data(0), i * 8)).collect();
@@ -2130,7 +2163,7 @@ fn make_batch_u64pk_i64grp_i64val(
 fn test_reduce_min_u64_high_bit_set() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
-    let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
+    let out_schema = out_schema_for(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR]);
 
     let mut to_ch = empty_trace(out_schema);
 
@@ -2142,7 +2175,16 @@ fn test_reduce_min_u64_high_bit_set() {
         &[(1, 1, 7, u64::MAX), (2, 1, 7, 10), (3, 1, 7, 1u64 << 63), (4, 1, 7, 1)],
     );
 
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &[agg], None, false, false);
+    let out = op_reduce(
+        &delta,
+        &mut to_ch,
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        None,
+        false,
+        false,
+    );
     assert_eq!(out.count, 1);
     let min_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
     assert_eq!(min_bits, 1u64, "MIN(u64) must use unsigned ordering");
@@ -2152,7 +2194,7 @@ fn test_reduce_min_u64_high_bit_set() {
 fn test_reduce_max_u64_high_bit_set() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Max };
-    let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
+    let out_schema = out_schema_for(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR]);
 
     let mut to_ch = empty_trace(out_schema);
 
@@ -2163,7 +2205,16 @@ fn test_reduce_max_u64_high_bit_set() {
         &[(1, 1, 7, u64::MAX), (2, 1, 7, 10), (3, 1, 7, 1u64 << 63), (4, 1, 7, 1)],
     );
 
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &[agg], None, false, false);
+    let out = op_reduce(
+        &delta,
+        &mut to_ch,
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        None,
+        false,
+        false,
+    );
     assert_eq!(out.count, 1);
     let max_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
     assert_eq!(max_bits, u64::MAX, "MAX(u64) must use unsigned ordering");
@@ -2173,20 +2224,20 @@ fn test_reduce_max_u64_high_bit_set() {
 fn test_reduce_min_u64_incremental() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
-    let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
+    let out_schema = out_schema_for(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR]);
 
     // Tick 1: one row with val=1u64<<60 → MIN = 1u64<<60.
     let mut to_ch = empty_trace(out_schema);
 
     let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 1u64 << 60)]);
 
-    let mut avi1 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1]);
+    let mut avi1 = Avi::new(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR], &[&delta1]);
     let out1 = op_reduce(
         &delta1,
         &mut to_ch,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi1.cursor()),
         false,
         false,
@@ -2204,14 +2255,19 @@ fn test_reduce_min_u64_incremental() {
     let mut to_ch2 = trace_cursor(out1, out_schema);
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, 1u64 << 63)]);
-    let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1, &delta2]);
+    let mut avi2 = Avi::new(
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        &[&delta1, &delta2],
+    );
 
     let out2 = op_reduce(
         &delta2,
         &mut to_ch2,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi2.cursor()),
         false,
         false,
@@ -2233,20 +2289,20 @@ fn test_reduce_min_u64_incremental() {
 fn test_reduce_max_u64_incremental() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Max };
-    let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
+    let out_schema = out_schema_for(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR]);
 
     // Tick 1: MAX over a single low value → MAX = 10.
     let mut to_ch = empty_trace(out_schema);
 
     let delta1 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 10)]);
 
-    let mut avi1 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1]);
+    let mut avi1 = Avi::new(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR], &[&delta1]);
     let out1 = op_reduce(
         &delta1,
         &mut to_ch,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi1.cursor()),
         false,
         false,
@@ -2260,14 +2316,19 @@ fn test_reduce_max_u64_incremental() {
     let mut to_ch2 = trace_cursor(out1, out_schema);
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, u64::MAX)]);
-    let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1, &delta2]);
+    let mut avi2 = Avi::new(
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        &[&delta1, &delta2],
+    );
 
     let out2 = op_reduce(
         &delta2,
         &mut to_ch2,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi2.cursor()),
         false,
         false,
@@ -2329,7 +2390,7 @@ fn test_reduce_min_max_i64_boundary() {
     // MAX = i64::MAX.
     let in_schema = u64pk_i64grp_i64val(false);
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
-    let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
+    let out_schema = out_schema_for(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR]);
 
     // MIN test.
     {
@@ -2340,7 +2401,16 @@ fn test_reduce_min_max_i64_boundary() {
             &[(1, 1, 7, i64::MIN), (2, 1, 7, -1), (3, 1, 7, 0), (4, 1, 7, i64::MAX)],
         );
 
-        let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &[agg], None, false, false);
+        let out = op_reduce(
+            &delta,
+            &mut to_ch,
+            &in_schema,
+            &[1u32],
+            &[agg, AggDescriptor::COUNT_STAR],
+            None,
+            false,
+            false,
+        );
         assert_eq!(out.count, 1);
         let min = read_i64_le(out.col_data(1), 0);
         assert_eq!(min, i64::MIN, "MIN(I64) signed ordering preserved");
@@ -2357,7 +2427,16 @@ fn test_reduce_min_max_i64_boundary() {
 
         let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Max };
 
-        let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &[agg], None, false, false);
+        let out = op_reduce(
+            &delta,
+            &mut to_ch,
+            &in_schema,
+            &[1u32],
+            &[agg, AggDescriptor::COUNT_STAR],
+            None,
+            false,
+            false,
+        );
         assert_eq!(out.count, 1);
         let max = read_i64_le(out.col_data(1), 0);
         assert_eq!(max, i64::MAX, "MAX(I64) signed ordering preserved");
@@ -2403,7 +2482,7 @@ fn make_batch_raw_pk<T: Copy>(
 fn sum_count_aggs(sum_col: u32) -> [AggDescriptor; 2] {
     [
         AggDescriptor { col_idx: sum_col, agg_op: AggFunc::Sum },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ]
 }
 
@@ -2637,7 +2716,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
     // walks past it to 20.
     let in_schema = make_schema_u64_i64();
     let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
-    let out_schema = out_schema_for(&in_schema, &[0u32], std::slice::from_ref(&agg));
+    let out_schema = out_schema_for(&in_schema, &[0u32], &[agg, AggDescriptor::COUNT_STAR]);
 
     // History: pk=1 with two payloads (val=10, val=20). The group IS the PK, so
     // both belong to group pk=1; MIN(10, 20) = 10.
@@ -2649,6 +2728,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
     prev.extend_weight(&1i64.to_le_bytes());
     prev.extend_null_bmp(&0u64.to_le_bytes());
     prev.extend_col(0, &10i64.to_le_bytes());
+    prev.extend_col(1, &2i64.to_le_bytes()); // count: both payloads
     prev.count += 1;
     prev.set_layout_unchecked(Layout::Consolidated);
     let mut to_ch = trace_cursor(prev, out_schema);
@@ -2658,13 +2738,18 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
 
     // The index carries the history plus this delta's retraction, as the
     // compiler's Integrate-before-Reduce order produces.
-    let mut avi = Avi::new(&in_schema, &[0u32], &[agg], &[&history, &delta]);
+    let mut avi = Avi::new(
+        &in_schema,
+        &[0u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        &[&history, &delta],
+    );
     let out = op_reduce(
         &delta,
         &mut to_ch,
         &in_schema,
         &[0u32], // GROUP BY PK col 0 → the PK region is the group key
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi.cursor()),
         false,
         false,
@@ -2719,6 +2804,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
             SchemaColumn::new(type_code::U32, 0),
             SchemaColumn::new(type_code::U32, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -2770,7 +2856,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
         &mut to_ch,
         &in_schema,
         &[1u32, 2u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -2819,6 +2905,7 @@ fn avi_retraction_returns_next_extremum() {
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::U32, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -2865,6 +2952,7 @@ fn avi_retraction_returns_next_extremum() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &1u32.to_le_bytes()); // a
         b.extend_col(1, &5i64.to_le_bytes()); // min
+        b.extend_col(2, &3i64.to_le_bytes()); // count: {5, 10, 20}
         b.count += 1;
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -2880,7 +2968,7 @@ fn avi_retraction_returns_next_extremum() {
         &mut to_ch,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -2930,6 +3018,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
                 SchemaColumn::new(type_code::U128, 0),
                 SchemaColumn::new(gtc, 0),
                 SchemaColumn::new(type_code::I64, 1),
+                SchemaColumn::new(type_code::I64, 0), // count
             ],
             &[0],
         );
@@ -2973,7 +3062,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             &mut to_ch,
             &in_schema,
             &[1u32],
-            &[agg],
+            &[agg, AggDescriptor::COUNT_STAR],
             Some(&mut avi_ch),
             false,
             false,
@@ -3014,6 +3103,7 @@ fn min_tie_retract_one_copy_keeps_min() {
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -3045,6 +3135,7 @@ fn min_tie_retract_one_copy_keeps_min() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &1i64.to_le_bytes());
         b.extend_col(1, &5i64.to_le_bytes());
+        b.extend_col(2, &3i64.to_le_bytes()); // count: the three history rows
         b.count += 1;
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -3062,13 +3153,18 @@ fn min_tie_retract_one_copy_keeps_min() {
 
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
-    let mut avi = Avi::new(&in_schema, &[1u32], &[agg], &[&ti_batch, &delta]);
+    let mut avi = Avi::new(
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        &[&ti_batch, &delta],
+    );
     let out = op_reduce(
         &delta,
         &mut to_ch,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi.cursor()),
         false,
         false,
@@ -3108,6 +3204,7 @@ fn min_ignores_null_values() {
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -3136,7 +3233,16 @@ fn min_ignores_null_values() {
 
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
-    let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &[agg], None, false, false);
+    let out = op_reduce(
+        &delta,
+        &mut to_ch,
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        None,
+        false,
+        false,
+    );
 
     assert_eq!(out.count, 1);
     let min = read_i64_le(out.col_data(1), 0);
@@ -3167,6 +3273,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
             SchemaColumn::new(type_code::U32, 0),
             SchemaColumn::new(type_code::U32, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -3217,6 +3324,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         b.extend_col(0, &3u32.to_le_bytes());
         b.extend_col(1, &4u32.to_le_bytes());
         b.extend_col(2, &5i64.to_le_bytes());
+        b.extend_col(3, &2i64.to_le_bytes()); // count: {5, 9}
         b.count += 1;
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -3232,7 +3340,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         &mut to_ch,
         &in_schema,
         &[1u32, 2u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -3283,6 +3391,7 @@ fn avi_wide_two_u64_groups_match_reference() {
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -3376,7 +3485,7 @@ fn avi_wide_two_u64_groups_match_reference() {
         &mut to_ch,
         &in_schema,
         &[1u32, 2u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -3415,6 +3524,7 @@ fn avi_wide_single_u128_group_distinct() {
         &[
             SchemaColumn::new(type_code::U128, 0), // PK = group value g
             SchemaColumn::new(type_code::I64, 1),  // MIN
+            SchemaColumn::new(type_code::I64, 0),  // count
         ],
         &[0],
     );
@@ -3468,7 +3578,7 @@ fn avi_wide_single_u128_group_distinct() {
         &mut to_ch,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -3510,6 +3620,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
             SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -3572,7 +3683,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
         &mut to_ch,
         &in_schema,
         &[1u32, 2u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -3617,6 +3728,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -3671,7 +3783,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
         &mut to_ch,
         &in_schema,
         &[1u32, 2u32, 3u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -3709,6 +3821,7 @@ fn avi_wide_retraction_returns_next_extremum() {
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -3764,6 +3877,7 @@ fn avi_wide_retraction_returns_next_extremum() {
         b.extend_col(0, &ga.to_le_bytes());
         b.extend_col(1, &gb.to_le_bytes());
         b.extend_col(2, &5i64.to_le_bytes());
+        b.extend_col(3, &3i64.to_le_bytes()); // count: {5, 9, 15}
         b.count += 1;
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -3779,7 +3893,7 @@ fn avi_wide_retraction_returns_next_extremum() {
         &mut to_ch,
         &in_schema,
         &[1u32, 2u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi_ch),
         false,
         false,
@@ -3834,7 +3948,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
         b.extend_col(schema.try_payload_idx(1).unwrap(), &0i64.to_le_bytes());
         b.count += 1;
     }
-    let desc = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
+    let desc = AggDescriptor::COUNT_STAR;
     let mut acc = make_acc(&schema, &[0], desc);
     let mb = b.as_mem_batch();
     acc.step_from_batch(&mb, 0, 1);
@@ -3866,7 +3980,7 @@ fn avi_read_extreme(
         col_idx,
         agg_op: if for_max { AggFunc::Max } else { AggFunc::Min },
     };
-    let bake = make_bake(in_schema, group_by, &[agg]);
+    let bake = make_bake(in_schema, group_by, &[agg, AggDescriptor::COUNT_STAR]);
 
     // Each avi_batch ingest is a separate AVI ingest; the cursor's
     // two-tier consolidation sums weights across ingests, so a retracted extreme
@@ -4083,7 +4197,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
 
     let mut to_ch = empty_trace(out_schema);
 
-    let agg = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
+    let agg = AggDescriptor::COUNT_STAR;
 
     let out = op_reduce(
         &delta,
@@ -4169,6 +4283,7 @@ fn run_nullable_grp_min_i64(
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 1), // nullable grp (carried through)
             SchemaColumn::new(type_code::I64, 1), // nullable min
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -4178,14 +4293,14 @@ fn run_nullable_grp_min_i64(
     // --- Tick 1: empty history, empty trace_out ---
     let delta1 = build_grp_val_delta(&in_schema, tick1_rows);
     let mut to_ch1 = empty_trace(out_schema);
-    let mut avi1 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1]);
+    let mut avi1 = Avi::new(&in_schema, &[1u32], &[agg, AggDescriptor::COUNT_STAR], &[&delta1]);
 
     let out1 = op_reduce(
         &delta1,
         &mut to_ch1,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi1.cursor()),
         false,
         false,
@@ -4200,14 +4315,19 @@ fn run_nullable_grp_min_i64(
     let delta2 = build_grp_val_delta(&in_schema, delta_rows);
 
     let mut to_ch2 = trace_cursor(to_batch, out_schema);
-    let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1, &delta2]);
+    let mut avi2 = Avi::new(
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        &[&delta1, &delta2],
+    );
 
     let out2 = op_reduce(
         &delta2,
         &mut to_ch2,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi2.cursor()),
         false,
         false,
@@ -4316,6 +4436,7 @@ fn min_multi_col_group_resolves_per_group() {
             SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -4351,13 +4472,13 @@ fn min_multi_col_group_resolves_per_group() {
     let delta1 = make_batch(&tick1_rows);
     let mut to_ch = empty_trace(out_schema);
 
-    let mut avi1 = Avi::new(&in_schema, &[1u32, 2u32], &[agg], &[&delta1]);
+    let mut avi1 = Avi::new(&in_schema, &[1u32, 2u32], &[agg, AggDescriptor::COUNT_STAR], &[&delta1]);
     let out1 = op_reduce(
         &delta1,
         &mut to_ch,
         &in_schema,
         &[1u32, 2u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi1.cursor()),
         false,
         false,
@@ -4374,14 +4495,19 @@ fn min_multi_col_group_resolves_per_group() {
     let delta2 = make_batch(&delta2_rows);
 
     let mut to_ch2 = trace_cursor(empty_out2, out_schema);
-    let mut avi2 = Avi::new(&in_schema, &[1u32, 2u32], &[agg], &[&history, &delta2]);
+    let mut avi2 = Avi::new(
+        &in_schema,
+        &[1u32, 2u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        &[&history, &delta2],
+    );
 
     let out2 = op_reduce(
         &delta2,
         &mut to_ch2,
         &in_schema,
         &[1u32, 2u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi2.cursor()),
         false,
         false,
@@ -4577,6 +4703,7 @@ fn test_reduce_max_blob_group_retraction() {
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::BLOB, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -4590,7 +4717,16 @@ fn test_reduce_max_blob_group_retraction() {
     let tick1: &[(u64, i64, &[u8], i64)] = &[(1, 1, blob_a, 10), (2, 1, blob_a, 30), (3, 1, blob_b, 20)];
     let delta1 = make_batch_blob_grp_i64(&in_schema, tick1);
     let mut to_ch1 = empty_trace(out_schema);
-    let out1 = op_reduce(&delta1, &mut to_ch1, &in_schema, &[1u32], &[agg], None, false, false);
+    let out1 = op_reduce(
+        &delta1,
+        &mut to_ch1,
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        None,
+        false,
+        false,
+    );
     assert_eq!(
         out1.count, 2,
         "two distinct blobs → two groups (must not merge on shared prefix)"
@@ -4611,13 +4747,18 @@ fn test_reduce_max_blob_group_retraction() {
     // Retraction: weight -1 on the val=30 blob_a row.
     let delta2 = make_batch_blob_grp_i64(&in_schema, &[(2, -1, blob_a, 30)]);
     let mut to_ch2 = trace_cursor(to_batch, out_schema);
-    let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&history, &delta2]);
+    let mut avi2 = Avi::new(
+        &in_schema,
+        &[1u32],
+        &[agg, AggDescriptor::COUNT_STAR],
+        &[&history, &delta2],
+    );
     let out2 = op_reduce(
         &delta2,
         &mut to_ch2,
         &in_schema,
         &[1u32],
-        &[agg],
+        &[agg, AggDescriptor::COUNT_STAR],
         Some(&mut avi2.cursor()),
         false,
         false,
@@ -4706,7 +4847,6 @@ fn g_delta(rows: &[(u64, i64, i64)]) -> Batch {
     make_batch(&u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), rows)
 }
 
-const G_COUNT: AggDescriptor = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
 const G_SUM: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum };
 const G_MIN: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
 
@@ -4758,11 +4898,17 @@ fn global_seed_over_empty_emits_one_ground_row() {
     let out_schema = out_schema_for(
         &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
         &[],
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
     );
     let mut to_ch = empty_trace(out_schema);
 
-    let raw = g_reduce(&g_delta(&[]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
+    let raw = g_reduce(
+        &g_delta(&[]),
+        &[],
+        &mut to_ch,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
 
     assert_eq!(raw.count, 1, "empty-source global aggregate must emit one ground row");
     assert_eq!(raw.get_weight(0), 1, "ground row weight +1");
@@ -4783,15 +4929,27 @@ fn global_seed_idempotent_across_two_empty_pads() {
     let out_schema = out_schema_for(
         &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
         &[],
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
     );
     let mut to_ch = empty_trace(out_schema);
-    let raw1 = g_reduce(&g_delta(&[]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
+    let raw1 = g_reduce(
+        &g_delta(&[]),
+        &[],
+        &mut to_ch,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
     assert_eq!(raw1.count, 1, "first pad seeds the ground");
 
     // Second pad: trace_out now holds the V₀ ground from the first pad.
     let mut to_ch2 = trace_cursor(raw1, out_schema);
-    let raw2 = g_reduce(&g_delta(&[]), &[], &mut to_ch2, &[G_SUM, G_COUNT], true);
+    let raw2 = g_reduce(
+        &g_delta(&[]),
+        &[],
+        &mut to_ch2,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
     assert_eq!(raw2.count, 0, "second pad must NOT re-seed (V₀ already in trace_out)");
 }
 
@@ -4802,14 +4960,14 @@ fn global_non_owner_empty_pad_emits_zero_rows() {
     let out_schema = out_schema_for(
         &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
         &[],
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
     );
     let mut to_ch = empty_trace(out_schema);
     let raw = g_reduce(
         &g_delta(&[]),
         &[],
         &mut to_ch,
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
         false, // not the V₀ owner
     );
     assert_eq!(raw.count, 0, "non-owner empty pad must emit a zero-row batch");
@@ -4821,14 +4979,14 @@ fn global_create_over_nonempty_emits_computed_no_ground() {
     let out_schema = out_schema_for(
         &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
         &[],
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
     );
     let mut to_ch = empty_trace(out_schema);
     let raw = g_reduce(
         &g_delta(&[(1, 1, 5), (2, 1, 10)]),
         &[],
         &mut to_ch,
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
         true,
     );
     assert_eq!(raw.count, 1, "one computed row, no ground");
@@ -4844,15 +5002,27 @@ fn global_emptied_by_delete_emits_ground() {
     let out_schema = out_schema_for(
         &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
         &[],
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
     );
     let mut to_ch = empty_trace(out_schema);
-    let raw1 = g_reduce(&g_delta(&[(1, 1, 5)]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
+    let raw1 = g_reduce(
+        &g_delta(&[(1, 1, 5)]),
+        &[],
+        &mut to_ch,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
     assert_eq!(read_i64_le(raw1.col_data(0), 0), 5, "SUM=5");
 
     // Retract the only row → cardinality 0.
     let mut to_ch2 = trace_cursor(raw1, out_schema);
-    let raw2 = g_reduce(&g_delta(&[(1, -1, 5)]), &[], &mut to_ch2, &[G_SUM, G_COUNT], true);
+    let raw2 = g_reduce(
+        &g_delta(&[(1, -1, 5)]),
+        &[],
+        &mut to_ch2,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
 
     // Retract old computed (-1) + emit ground (+1) = 2 rows; net view = ground.
     assert_eq!(raw2.count, 2, "retraction of old + ground insert");
@@ -4869,16 +5039,28 @@ fn global_ground_to_computed_on_first_insert() {
     let out_schema = out_schema_for(
         &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
         &[],
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
     );
     // Tick 1: seed the ground over an empty source.
     let mut to_ch = empty_trace(out_schema);
-    let ground = g_reduce(&g_delta(&[]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
+    let ground = g_reduce(
+        &g_delta(&[]),
+        &[],
+        &mut to_ch,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
     assert_eq!(ground.count, 1);
 
     // Tick 2: insert a row; trace_out holds the ground.
     let mut to_ch2 = trace_cursor(ground, out_schema);
-    let raw2 = g_reduce(&g_delta(&[(1, 1, 7)]), &[], &mut to_ch2, &[G_SUM, G_COUNT], true);
+    let raw2 = g_reduce(
+        &g_delta(&[(1, 1, 7)]),
+        &[],
+        &mut to_ch2,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
 
     // Retract ground (-1) + emit computed (+1) = 2 rows; net view = computed.
     assert_eq!(raw2.count, 2, "retract ground + emit computed");
@@ -4896,10 +5078,16 @@ fn global_value_change_emits_no_ground() {
     let out_schema = out_schema_for(
         &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
         &[],
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
     );
     let mut to_ch = empty_trace(out_schema);
-    let raw1 = g_reduce(&g_delta(&[(1, 1, 5)]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
+    let raw1 = g_reduce(
+        &g_delta(&[(1, 1, 5)]),
+        &[],
+        &mut to_ch,
+        &[G_SUM, AggDescriptor::COUNT_STAR],
+        true,
+    );
     assert_eq!(read_i64_le(raw1.col_data(0), 0), 5);
 
     // Change pk1's value 5 → 8 (retract old, insert new) — cardinality stays 1.
@@ -4908,7 +5096,7 @@ fn global_value_change_emits_no_ground() {
         &g_delta(&[(1, -1, 5), (1, 1, 8)]),
         &[],
         &mut to_ch2,
-        &[G_SUM, G_COUNT],
+        &[G_SUM, AggDescriptor::COUNT_STAR],
         true,
     );
     assert_eq!(raw2.count, 2, "retract old computed + emit new computed");
@@ -4925,7 +5113,7 @@ fn global_value_change_emits_no_ground() {
 #[test]
 fn global_mixed_count_min_emptied_emits_ground() {
     let out_schema = g_out_count_min();
-    let aggs = [G_COUNT, G_MIN];
+    let aggs = [AggDescriptor::COUNT_STAR, G_MIN];
 
     // Tick 1: insert one row into an empty index.
     let mut to_ch = empty_trace(out_schema);
@@ -4957,6 +5145,7 @@ fn global_lone_min_retract_to_next_best() {
         &[
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -4964,13 +5153,13 @@ fn global_lone_min_retract_to_next_best() {
     // Tick 1: insert val=5 and val=3 → MIN=3.
     let mut to_ch = empty_trace(out_schema);
     let d1 = g_delta(&[(1, 1, 5), (2, 1, 3)]);
-    let raw1 = g_reduce(&d1, &[&d1], &mut to_ch, &[G_MIN], true);
+    let raw1 = g_reduce(&d1, &[&d1], &mut to_ch, &[G_MIN, AggDescriptor::COUNT_STAR], true);
     assert_eq!(read_i64_le(raw1.col_data(0), 0), 3, "MIN=3");
 
     // Tick 2: retract the current min (val=3) → MIN advances to 5.
     let d2 = g_delta(&[(2, -1, 3)]);
     let mut to_ch2 = trace_cursor(raw1, out_schema);
-    let raw2 = g_reduce(&d2, &[&d1, &d2], &mut to_ch2, &[G_MIN], true);
+    let raw2 = g_reduce(&d2, &[&d1, &d2], &mut to_ch2, &[G_MIN, AggDescriptor::COUNT_STAR], true);
     let mb = raw2.as_mem_batch();
     let pos = (0..raw2.count).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
     assert_eq!(
@@ -4991,6 +5180,7 @@ fn global_lone_min_avi_empty_prefix() {
         &[
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0), // count
         ],
         &[0],
     );
@@ -5018,7 +5208,7 @@ fn global_lone_min_avi_empty_prefix() {
             to,
             &in_schema,
             &[], // empty group cols
-            &[G_MIN],
+            &[G_MIN, AggDescriptor::COUNT_STAR],
             Some(&mut avi_ch),
             true,
             true,
@@ -5037,9 +5227,10 @@ fn global_lone_min_avi_empty_prefix() {
         "AVI empty-prefix seek returns the GLOBAL min, not the delta's 50"
     );
 
-    // Tick 2: a retraction re-evaluates the group; the AVI post-state is 20.
+    // Tick 2: a retraction re-evaluates the group, which an insert keeps alive;
+    // the AVI post-state is 20.
     let mut to_ch2 = trace_cursor(raw1, out_schema);
-    let raw2 = g_min_avi(&g_delta(&[(2, -1, 10)]), &mut to_ch2, 20);
+    let raw2 = g_min_avi(&g_delta(&[(2, -1, 10), (3, 1, 30)]), &mut to_ch2, 20);
     let mb2 = raw2.as_mem_batch();
     let p2 = (0..raw2.count).find(|&i| mb2.get_weight(i) == 1).expect("a +1 row");
     assert_eq!(
@@ -5098,7 +5289,8 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
         col_idx: 1,
         agg_op: AggFunc::CountNonNull,
     };
-    let mut acc = make_acc(&in_schema, &[0], desc);
+    let plan = make_plan(&in_schema, &[0u32], &[desc, AggDescriptor::COUNT_STAR], false, false);
+    let mut accs = plan.acc_template.clone();
 
     // Two rows whose payload column (payload slot 0) is NULL.
     let mut batch = Batch::with_capacity(&u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), 2);
@@ -5112,22 +5304,21 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     batch.set_layout_unchecked(Layout::Consolidated);
     let mb = batch.as_mem_batch();
     for row in 0..batch.count {
-        acc.step_from_batch(&mb, row, mb.get_weight(row));
+        accs[0].step_from_batch(&mb, row, mb.get_weight(row));
     }
-    assert!(acc.is_untouched(), "all-NULL group leaves CountNonNull untouched");
+    assert!(accs[0].is_untouched(), "all-NULL group leaves CountNonNull untouched");
 
     // Emit the group row. Natural-PK grouping on the U64 PK col: output is
-    // [U64 pk, I64 count], no group-exemplar column.
+    // [U64 pk, I64 count_non_null, I64 count], no group-exemplar column.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
     );
     let mut output = Batch::with_capacity(&out_schema, 1);
-    let accs = vec![acc];
-    let plan = make_plan(&in_schema, &[0u32], std::slice::from_ref(&desc), false, false);
     emit_reduce_row(&mut output, (&mb, 0), mb.get_pk_bytes(0), &accs, &plan);
 
     assert_eq!(output.count, 1);
@@ -5161,7 +5352,7 @@ fn emit_global_ground_renders_count_family_zero_null_clear() {
         &[0],
     );
     let descs = [
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
         AggDescriptor {
             col_idx: 1,
             agg_op: AggFunc::CountNonNull,
@@ -5231,7 +5422,7 @@ fn combine_partials(rows: &[(i64, Option<i64>)]) -> Batch {
 // SumZero merges the partial counts; a trailing Count counts partial rows (the
 // existence gate `op_reduce` finds via the lone AggFunc::Count).
 const C_SUMZERO: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::SumZero };
-const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
+const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor::COUNT_STAR;
 
 /// The phase-3 combine `op_reduce` over hand-built partials (empty group cols →
 /// one global group at V₀, `global_ground = true`, `i_am_owner = true`).
@@ -5399,7 +5590,7 @@ fn reduce_multi_avi_foreign_group() {
     let aggs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
         AggDescriptor { col_idx: 3, agg_op: AggFunc::Max },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
 
     // pk=1 and pk=2 each span groups g=10 and g=20 (the foreign-group trigger).
@@ -5491,7 +5682,6 @@ fn cg3_delta(rows: &[(u64, i64, i32, i64, bool)]) -> Batch {
     b
 }
 const CG3_MIN: AggDescriptor = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
-const CG3_COUNT: AggDescriptor = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
 
 /// Helper: run one combined-index reduce tick over `cg3_src()` (MIN + COUNT).
 /// `avi_deltas` is the accumulated integral; `delta` is this tick's input.
@@ -5521,7 +5711,7 @@ fn cg3_tick(
 /// from the index, across an insert then a partial retraction.
 #[test]
 fn reduce_multi_avi_linear_companion() {
-    let aggs = [CG3_MIN, CG3_COUNT];
+    let aggs = [CG3_MIN, AggDescriptor::COUNT_STAR];
     let tmp = tempfile::tempdir().unwrap();
     let out_schema = cg3_out();
 
@@ -5557,7 +5747,7 @@ fn reduce_multi_avi_linear_companion() {
 /// cardinality gate reads to suppress the row).
 #[test]
 fn reduce_multi_avi_emptied_with_companion() {
-    let aggs = [CG3_MIN, CG3_COUNT];
+    let aggs = [CG3_MIN, AggDescriptor::COUNT_STAR];
     let tmp = tempfile::tempdir().unwrap();
     let out_schema = cg3_out();
 
@@ -5581,7 +5771,7 @@ fn reduce_multi_avi_emptied_with_companion() {
 /// column still exists (count > 0) and must emit `(g, NULL, count)`.
 #[test]
 fn reduce_multi_avi_all_null_emit() {
-    let aggs = [CG3_MIN, CG3_COUNT];
+    let aggs = [CG3_MIN, AggDescriptor::COUNT_STAR];
     let tmp = tempfile::tempdir().unwrap();
     let out_schema = cg3_out();
 
@@ -5607,7 +5797,7 @@ fn reduce_multi_avi_all_null_emit() {
 /// on the combined index.
 #[test]
 fn reduce_multi_avi_retract_to_all_null() {
-    let aggs = [CG3_MIN, CG3_COUNT];
+    let aggs = [CG3_MIN, AggDescriptor::COUNT_STAR];
     let tmp = tempfile::tempdir().unwrap();
     let out_schema = cg3_out();
 
@@ -5671,7 +5861,7 @@ fn reduce_multi_avi_same_col_min_max() {
     let aggs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Max },
-        CG3_COUNT,
+        AggDescriptor::COUNT_STAR,
     ];
     let delta = cg3_delta(&[(1, 1, 7, 5, false), (2, 1, 7, 8, false), (3, 1, 7, 1, false)]);
 
@@ -5725,7 +5915,7 @@ fn reduce_multi_avi_compound_group_key() {
     );
     let aggs = [
         AggDescriptor { col_idx: 3, agg_op: AggFunc::Min },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
     let delta = {
         let mut b = Batch::with_capacity(&in_schema, 4);
@@ -5770,8 +5960,8 @@ fn reduce_multi_avi_compound_group_key() {
 
 /// Global `MIN(a), SUM(b)` (no GROUP BY) served by the combined index, fully
 /// retracted: the emptied source emits the ground row (MIN=NULL, SUM=NULL,
-/// COUNT=0) — NOT a phantom SUM=0. Guards the `|| global_ground` disjunct of
-/// `cardinality_idx`.
+/// COUNT=0) — NOT a phantom SUM=0. Guards the global-ground arm that replaces a
+/// row the cardinality gate shed.
 #[test]
 fn reduce_multi_avi_global_emptied() {
     // [pk:U64, a:I64, b:I64]; global aggregate.
@@ -5796,7 +5986,7 @@ fn reduce_multi_avi_global_emptied() {
     let aggs = [
         AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
     let mk = |rows: &[(u64, i64, i64, i64)]| {
         let mut b = Batch::with_capacity(&in_schema, rows.len().max(1));
@@ -6306,7 +6496,7 @@ fn mm_aggs() -> [AggDescriptor; 3] {
     [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Max },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ]
 }
 
@@ -6611,7 +6801,7 @@ fn avi_skip_mixed_int_min_float_max() {
     let aggs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
         AggDescriptor { col_idx: 3, agg_op: AggFunc::Max },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
     let build = |rows: &[(u64, i64, i64, f64, i64)]| -> Batch {
         let g_pi = in_schema.try_payload_idx(1).unwrap();
@@ -6676,7 +6866,7 @@ fn check_float_minmax_against_oracle(val_tc: TypeCode, epochs_rows: &[Vec<(u64, 
     let aggs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Max },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
     let build = |rows: &[(u64, i64, f64, i64)]| -> Batch {
         let g_pi = in_schema.try_payload_idx(1).unwrap();
@@ -6786,7 +6976,7 @@ fn check_pk_source_max(b_signed: bool) {
     );
     let aggs = [
         AggDescriptor { col_idx: 1, agg_op: AggFunc::Max },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {
         let pad_pi = in_schema.try_payload_idx(2).unwrap();
@@ -6864,7 +7054,7 @@ fn avi_skip_global_aggregate() {
     let aggs = [
         AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
         AggDescriptor { col_idx: 1, agg_op: AggFunc::Max },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {
         let v_pi = in_schema.try_payload_idx(1).unwrap();
@@ -7117,6 +7307,17 @@ fn reduce_column_indices_out_of_range_are_rejected() {
     );
 }
 
+#[test]
+fn a_reduce_without_a_count_is_rejected() {
+    let schema = make_schema_u64_i64();
+    for agg_op in [AggFunc::Min, AggFunc::Sum] {
+        assert_eq!(
+            plan_rejection(&schema, &[0], &[AggDescriptor { agg_op, col_idx: 1 }]),
+            "reduce: a circuit reduce needs a COUNT(*)"
+        );
+    }
+}
+
 /// col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
 /// aggregate column, whose type is the only thing the two tests below vary.
 fn agg_over(tc: u8) -> SchemaDescriptor {
@@ -7146,7 +7347,7 @@ fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
 #[test]
 fn a_row_selecting_aggregate_takes_every_column_type() {
     for agg_op in [AggFunc::Count, AggFunc::Min, AggFunc::Max] {
-        let aggs = [AggDescriptor { agg_op, col_idx: 1 }];
+        let aggs = [AggDescriptor { agg_op, col_idx: 1 }, AggDescriptor::COUNT_STAR];
         for tc in [type_code::I64, type_code::U128, type_code::UUID, type_code::STRING] {
             assert!(
                 ReducePlan::from_wire(&agg_over(tc), &[0], &aggs, false, false).is_ok(),

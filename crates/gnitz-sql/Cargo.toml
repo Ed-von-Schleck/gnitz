@@ -11,6 +11,7 @@ sqlparser  = "0.62"
 gnitz-core = { path = "../gnitz-core" }
 gnitz-expr = { path = "../gnitz-expr" }
 gnitz-wire = { path = "../gnitz-wire" }
+rustc-hash.workspace = true
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }

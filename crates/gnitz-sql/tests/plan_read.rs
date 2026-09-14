@@ -285,7 +285,7 @@ fn explain_names_every_decision() {
                 "order/limit: no request (LIMIT 0)",
             ],
         ),
-        // Folds name the physical reduce (AVG is its SUM + COUNT_NON_NULL pair)
+        // Folds name the physical reduce (AVG is its SUM and a count)
         // and print no projection line.
         (
             "SELECT COUNT(*) FROM t WHERE id = 5",
@@ -303,7 +303,7 @@ fn explain_names_every_decision() {
                 "read table t",
                 "access: full scan",
                 "predicate: none",
-                "fold: group by (v): SUM(w), SUM(w), COUNT_NON_NULL(w)",
+                "fold: group by (v): SUM(w), COUNT(*)",
                 "order/limit: none",
             ],
         ),
@@ -884,7 +884,8 @@ fn an_order_by_key_binds_where_the_select_list_does() {
     // An aggregate named only in ORDER BY is collected into the reduce: the
     // partial reply carries its accumulator beside the group column.
     let plan = read(&cat, "SELECT g FROM t GROUP BY g ORDER BY COUNT(*)").unwrap();
-    assert_eq!(visible(plan.reply_schema()), ["g", "_agg"]);
+    let names: Vec<&str> = plan.reply_schema().columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["_group_pk", "g", "_agg"]);
     // A hidden ordering column is tied to its key by the key's position in the
     // whole ORDER BY, so a positional key ahead of an expression one does not
     // shift the tie: both spellings of one order plan the same output shape.

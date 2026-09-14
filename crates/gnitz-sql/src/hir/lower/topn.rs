@@ -3,42 +3,13 @@
 
 use super::super::{slot_of, slots_of, ColId, RelExpr, TopNKey};
 use super::spine::{open, Top};
-use super::CutMemo;
-use crate::agg::group_pk_def;
+use super::{keyed_frame, CutMemo};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
-use crate::hir::physical::Frame;
 use crate::validate::reject_float_keys;
-use gnitz_core::{CircuitBuilder, ReduceOutKey};
+use gnitz_core::CircuitBuilder;
 use gnitz_wire::OrderKey;
 use std::collections::HashSet;
-
-/// The top-N output over `frame` partitioned by `group`, from the same two
-/// `ReduceOutKey` rules the engine derives its schema from.
-fn top_n_output(frame: &Frame, out_key: ReduceOutKey, group: &[usize]) -> Frame {
-    let (schema, layout) = (&frame.schema, &frame.layout);
-    let group_u32: Vec<u32> = group.iter().map(|&c| c as u32).collect();
-    let mut cols = Vec::new();
-    let mut ids = Vec::new();
-    match out_key.key_region(&schema.pk_cols, &group_u32) {
-        None => {
-            cols.push(group_pk_def());
-            ids.push(ColId::NONE);
-        }
-        Some(keys) => {
-            for &c in keys {
-                cols.push(schema.columns[c as usize].clone());
-                ids.push(layout[c as usize]);
-            }
-        }
-    }
-    let pk = cols.len();
-    for c in out_key.carried_columns(&schema.pk_cols, &group_u32, schema.columns.len() as u32) {
-        cols.push(schema.columns[c as usize].clone());
-        ids.push(layout[c as usize]);
-    }
-    Frame::leading(ids, cols, pk)
-}
 
 /// Lower a `TopN` body to circuit pieces.
 pub(super) fn lower_topn(
@@ -57,12 +28,11 @@ pub(super) fn lower_topn(
     let (node, frame) = spine.emit(&mut cb, Top::Output, "ORDER BY … LIMIT input")?;
     let (in_schema, in_layout) = (&frame.schema, &frame.layout);
 
-    let group = slots_of(in_layout, partition)?;
-    reject_float_keys(group.iter().map(|&c| &in_schema.columns[c]), "PARTITION BY")?;
-    let out_key = in_schema.reduce_out_key(&group);
-    // `shard_group_cols` names the same set as the written partition, so every
-    // derivation below reads this one normalized list.
-    let group = crate::agg::shard_group_cols(out_key, in_schema, &group);
+    let written: Vec<u32> = slots_of(in_layout, partition)?.into_iter().map(|c| c as u32).collect();
+    // The normalized group names the same set as the written partition, so every
+    // derivation below reads this one list.
+    let (out_key, group) = in_schema.reduce_key(&written);
+    reject_float_keys(group.iter().map(|&c| &in_schema.columns[c as usize]), "PARTITION BY")?;
     // The keys as identities, so each phase resolves them against the layout it
     // actually reads. The input's own key breaks ties, so two rows equal on the
     // written keys order by identity, as `ROW_NUMBER` numbers them — and so the
@@ -94,7 +64,14 @@ pub(super) fn lower_topn(
     };
     let keys = wire_keys(in_layout)?;
 
-    let out = top_n_output(&frame, out_key, &group);
+    let out = keyed_frame(
+        &frame,
+        out_key,
+        &group,
+        0..frame.schema.columns.len() as u32,
+        Vec::new(),
+        "ORDER BY … LIMIT output",
+    )?;
 
     let node = if replicated {
         // Every worker holds the whole input: the local window is the window.

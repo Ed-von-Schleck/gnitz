@@ -34,7 +34,7 @@ pub(super) fn build_reduce_output_schema(
     out_key: ReduceOutKey,
 ) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
-    for slot in out_key.output_layout(input.pk_indices(), group_cols) {
+    for slot in out_key.output_layout(input.pk_indices(), group_cols, group_cols.iter().copied()) {
         match slot {
             gnitz_wire::ReduceOutSlot::SyntheticKey => b.push_pk(super::super::group_key::GROUP_PK_COL)?,
             gnitz_wire::ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize])?,
@@ -86,10 +86,9 @@ pub struct ReducePlan {
     /// probe-skip path (only meaningful with an AVI; a float MIN/MAX always
     /// probes, so an all-float extreme set never benefits).
     pub(super) track_nonlinear: bool,
-    /// Position of the NULL-blind COUNT carrying a group's net cardinality, when
-    /// the aggregate set has one; else `op_reduce` falls back to touched-ness.
-    /// A companion COUNT cannot be made mandatory: `AdhocFold` shares this plan,
-    /// never reads this field, and would have to ship a per-group I64 nobody reads.
+    /// Position of the NULL-blind COUNT carrying a group's net cardinality. A
+    /// circuit plan always has one ([`Self::from_wire`] refuses a plan without);
+    /// only `AdhocFold`'s plan has `None`, since the stateless fold never gates on it.
     pub(super) cardinality_idx: Option<u8>,
     /// The epoch's accumulator set in its empty-group state, cloned per use —
     /// so the per-aggregate `locate()` walk and the `(agg_op, type)` step
@@ -126,14 +125,20 @@ impl ReducePlan {
         // Ahead of `reduce_out_key`, which reads `columns[c]` raw.
         check_cols(input_schema, group_by_cols, agg_descs)?;
         let out_key = input_schema.reduce_out_key(group_by_cols);
-        Self::build(
+        let plan = Self::build(
             input_schema,
             group_by_cols,
             agg_descs,
             out_key,
             global_ground,
             i_am_owner,
-        )
+        )?;
+        // A stateful reduce gates group existence on the net row count; nothing
+        // else an accumulator holds can tell an emptied group from a live one.
+        if plan.cardinality_idx.is_none() {
+            return Err(OpBuildErr::shape("reduce: a circuit reduce needs a COUNT(*)"));
+        }
+        Ok(plan)
     }
 
     /// The ad-hoc `ReadSpec` fold's plan: `SyntheticFold`; a global fold emits its one row even

@@ -15,13 +15,13 @@ fn schema() -> Schema {
     }
 }
 
-fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<AggShape, GnitzSqlError> {
-    let mut specs = Vec::new();
-    push_agg_specs(func, arg_col, &schema().columns, &mut specs).map(|t| t.shape)
+fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<(), GnitzSqlError> {
+    let s = schema();
+    agg_ops(func, arg_col.map(|c| &s.columns[c])).map(|_| ())
 }
 
 #[test]
-fn push_agg_specs_rejects_unevaluatable_arg_types() {
+fn agg_ops_rejects_unevaluatable_arg_types() {
     for (func, ci) in [
         (AggFunc::Sum, 2), // SUM(blob)
         (AggFunc::Avg, 3), // AVG(uuid)
@@ -32,7 +32,7 @@ fn push_agg_specs_rejects_unevaluatable_arg_types() {
 }
 
 #[test]
-fn push_agg_specs_accepts_valid_arg_types() {
+fn agg_ops_accepts_valid_arg_types() {
     assert!(try_push(AggFunc::Sum, Some(1)).is_ok()); // SUM(i64)
     assert!(try_push(AggFunc::Avg, Some(1)).is_ok()); // AVG(i64)
     assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
@@ -43,6 +43,22 @@ fn push_agg_specs_accepts_valid_arg_types() {
     assert!(try_push(AggFunc::Min, Some(4)).is_ok()); // MIN(str)
     assert!(try_push(AggFunc::Max, Some(2)).is_ok()); // MAX(blob)
     assert!(try_push(AggFunc::Max, Some(3)).is_ok()); // MAX(uuid)
+}
+
+/// An aggregate's physical ops: a count over a NOT NULL argument counts rows,
+/// and a count companion rides exactly where null-ness needs one.
+#[test]
+fn agg_ops_shares_the_row_count_over_a_not_null_argument() {
+    use WireAggFunc as W;
+    let nullable = col_def("x", TypeCode::I64, true);
+    let not_null = col_def("y", TypeCode::I64, false);
+    let ops = |f, c| agg_ops(f, Some(c)).unwrap();
+    assert_eq!(ops(AggFunc::Count, &nullable), (W::CountNonNull, None));
+    assert_eq!(ops(AggFunc::Count, &not_null), (W::Count, None));
+    assert_eq!(ops(AggFunc::Avg, &not_null), (W::Sum, Some(W::Count)));
+    assert_eq!(ops(AggFunc::Avg, &nullable), (W::Sum, Some(W::CountNonNull)));
+    assert_eq!(ops(AggFunc::Sum, &nullable), (W::Sum, Some(W::CountNonNull)));
+    assert_eq!(ops(AggFunc::Sum, &not_null), (W::Sum, None));
 }
 
 /// SUM over a U64 source is typed U64 (bit pattern is the correct unsigned
@@ -62,7 +78,10 @@ fn agg_result_type_sum_preserves_u64() {
     };
     // The raw reduce value type; only AVG (untested here) diverges from it, and
     // `HirAgg::view_type` is what renders that.
-    let rt = |f, i: usize| agg_typing(f, Some(&s.columns[i])).unwrap().ops[0].1;
+    let rt = |f, i: usize| {
+        let c = Some(&s.columns[i]);
+        agg_col_def(agg_ops(f, c).unwrap().0, c, false).ty()
+    };
     assert_eq!(rt(AggFunc::Sum, 1), TypeCode::U64.into()); // SUM(u64) → U64
     assert_eq!(rt(AggFunc::Sum, 2), TypeCode::I64.into()); // SUM(u32) → I64
     assert_eq!(rt(AggFunc::Sum, 3), TypeCode::I64.into()); // SUM(i64) → I64
@@ -106,48 +125,5 @@ fn raw_output_nullable_matches_emit_semantics() {
         assert!(f.raw_output_nullable(true, false), "{f:?} grouped, nullable");
         assert!(f.raw_output_nullable(false, true), "{f:?} global, non-nullable");
         assert!(f.raw_output_nullable(true, true), "{f:?} global, nullable");
-    }
-}
-
-/// The planner's declared reduce width is the emitted reduce's, for every
-/// strategy `emit_reduce` picks — the two-phase combine's trailing existence
-/// gate included.
-#[test]
-fn the_declared_reduce_width_is_the_emitted_one() {
-    let mut s = schema();
-    s.columns.push(col_def("f", TypeCode::F64, true));
-    let specs_of = |aggs: &[(AggFunc, Option<usize>)]| {
-        let mut specs = Vec::new();
-        for &(func, arg) in aggs {
-            push_agg_specs(func, arg, &s.columns, &mut specs).unwrap();
-        }
-        specs
-    };
-    let linear = specs_of(&[(AggFunc::Count, None), (AggFunc::Sum, Some(1))]);
-    let float_sum = specs_of(&[(AggFunc::Sum, Some(5))]);
-    for (group, specs, replicated, two_phase, what) in [
-        (&[1usize][..], &linear, false, false, "grouped"),
-        (&[][..], &linear, false, true, "two-phase"),
-        (&[][..], &linear, true, false, "replicated"),
-        (&[][..], &float_sum, false, false, "float SUM funnel"),
-    ] {
-        let shape = ReduceShape::new(&s, group, specs, replicated);
-        assert_eq!(shape.two_phase(), two_phase, "{what}");
-        let layout = reduce_output_schema(&shape).unwrap();
-        let mut cb = gnitz_core::CircuitBuilder::new();
-        let input = cb.input_delta(1, None);
-        emit_reduce(&mut cb, input, &shape);
-        // The reduce wired to no consumer: the last one built.
-        let emitted = cb
-            .build()
-            .nodes
-            .values()
-            .filter_map(|op| match op {
-                gnitz_core::OpNode::Reduce { agg, .. } => Some(agg.len()),
-                _ => None,
-            })
-            .next_back()
-            .expect("a reduce is emitted");
-        assert_eq!(layout.agg_col_offset + emitted, layout.schema.columns.len(), "{what}");
     }
 }

@@ -2,7 +2,7 @@ use super::*;
 use crate::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::{BatchBuilder, Slot, StoreError};
-use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, IndexWalk, ReadSink};
+use gnitz_wire::{AggDescriptor, AggReadSpec, IndexWalk, ReadSink};
 
 // ── The executor — `scan_spec` over a registry built in-crate ────────
 //
@@ -263,7 +263,7 @@ fn a_fold_reply_schema_not_matching_its_partial_layout_is_rejected() {
             map: None,
             kind: SinkKind::Fold(AggReadSpec {
                 group_cols: vec![1],
-                aggs: vec![AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 }],
+                aggs: vec![AggDescriptor::COUNT_STAR],
             }),
         },
     };

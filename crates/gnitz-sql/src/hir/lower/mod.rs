@@ -7,7 +7,7 @@
 //! * input spine — `spine::open` / `Spine::emit`;
 //! * segment cut — [`cut_segment`], through one [`CutMemo`];
 //! * source collision — [`materialize`];
-//! * reduce derivation — [`resolve_reduce_specs`], [`reduce_out_layout`];
+//! * reduce derivation — [`resolve_reduce_specs`], [`keyed_frame`];
 //! * join keep — [`join_sides`];
 //! * addressing — `physical::Frame`, [`project_front`], [`project_tail`];
 //! * exchange topology — asserted in `ViewChain::push`.
@@ -26,74 +26,87 @@ use super::chain::{EmitPieces, ViewChain};
 use super::physical::{self, Frame};
 use super::{as_col, slots_of, split_filter, ColId, GetSource, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
-use crate::agg::{push_agg_specs, AggSpec, ReduceLayout};
+use crate::agg::group_pk_def;
 use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, RelDescriptor, Schema};
+use gnitz_core::{ColumnDef, ReduceOutKey, RelDescriptor, Schema};
+use gnitz_wire::{AggDescriptor, ReduceOutSlot};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// What a HIR `Reduce` becomes physically, before either lowering picks a sink:
-/// where its group columns and aggregate arguments sit in the reduce input, and
-/// the spec decomposition over them.
-///
-/// One home because the three are interlocked. `push_agg_specs` decides how many
-/// specs an aggregate materialises — an AVG emits two — `agg_starts` records
-/// where each aggregate's block begins, and every reduce-output column position
-/// downstream is `agg_col_offset + agg_starts[i]` (with a companion at `+ 1`).
-/// Two copies of this loop that disagreed would not fail: they would silently
-/// address the wrong aggregate column.
+/// its group columns as reduce-input positions, and one spec per distinct
+/// physical aggregate column beside the output column it produces.
 pub(crate) struct ReduceSpecs {
-    /// Each group column's slot in the reduce input, parallel to `group_cols`.
-    pub(crate) group_positions: Vec<usize>,
-    /// The physical specs, pre-companion — `ensure_cardinality_count` is the
-    /// circuit lowering's own addition and is not applied here.
-    pub(crate) specs: Vec<AggSpec>,
-    /// `specs` index at which aggregate `i` begins.
-    pub(crate) agg_starts: Vec<usize>,
+    /// Group columns as reduce-input positions, in GROUP BY order.
+    pub(crate) group: Vec<u32>,
+    pub(crate) specs: Vec<AggDescriptor>,
+    /// Each spec's output column, parallel to `specs`.
+    pub(crate) cols: Vec<(ColId, ColumnDef)>,
+}
+
+impl ReduceSpecs {
+    pub(crate) fn push(&mut self, spec: AggDescriptor, id: ColId, def: ColumnDef) {
+        self.specs.push(spec);
+        self.cols.push((id, def));
+    }
 }
 
 /// Resolve a `Reduce`'s group columns and aggregates against its input's layout
-/// and schema — the derivation `lower::reduce` and `lower::fold` share.
+/// — the derivation `lower::reduce` and `lower::fold` share. The output defs are
+/// `HirAgg`'s, the ones HAVING and finalize are typed against.
 pub(crate) fn resolve_reduce_specs(
     group_cols: &[ColId],
     aggs: &[HirAgg],
     layout: &[ColId],
-    schema: &Schema,
 ) -> Result<ReduceSpecs, GnitzSqlError> {
-    let group_positions = slots_of(layout, group_cols)?;
-    let mut specs: Vec<AggSpec> = Vec::new();
-    let mut agg_starts: Vec<usize> = Vec::with_capacity(aggs.len());
-    for a in aggs {
-        agg_starts.push(specs.len());
-        let arg_pos = a.arg.map(|id| super::slot_of(layout, id)).transpose()?;
-        push_agg_specs(a.func, arg_pos, &schema.columns, &mut specs)?;
+    let group = slots_of(layout, group_cols)?.into_iter().map(|c| c as u32).collect();
+    let mut r = ReduceSpecs {
+        group,
+        specs: Vec::new(),
+        cols: Vec::new(),
+    };
+    for c in aggs.iter().flat_map(HirAgg::cols) {
+        if r.cols.iter().any(|(id, _)| *id == c.col.id) {
+            continue; // shared with an earlier aggregate
+        }
+        // COUNT(*) reads no column; slot 0 is the placeholder.
+        let col_idx = c.arg.map(|id| super::slot_of(layout, id)).transpose()?.unwrap_or(0) as u32;
+        r.push(AggDescriptor { agg_op: c.op, col_idx }, c.col.id, c.col.def.clone());
     }
-    Ok(ReduceSpecs { group_positions, specs, agg_starts })
+    Ok(r)
 }
 
-/// The reduce output's `ColId` at each of `layout`'s slots; a slot with no logical
-/// identity (a synthetic key, an emission-only COUNT) stays [`ColId::NONE`].
-pub(crate) fn reduce_out_layout(
-    layout: &ReduceLayout,
-    group_cols: &[ColId],
-    aggs: &[HirAgg],
-    agg_starts: &[usize],
-) -> Vec<ColId> {
-    let mut out = vec![ColId::NONE; layout.schema.columns.len()];
-    for (&gid, &slot) in group_cols.iter().zip(&layout.group_slots) {
-        out[slot] = gid;
+/// A group-keyed operator's output frame over `input`: its `output_layout` slots,
+/// then `tail`.
+pub(crate) fn keyed_frame(
+    input: &Frame,
+    out_key: ReduceOutKey,
+    group: &[u32],
+    row: impl IntoIterator<Item = u32>,
+    tail: Vec<(ColId, ColumnDef)>,
+    what: &str,
+) -> Result<Frame, GnitzSqlError> {
+    let (mut layout, mut cols, mut npk) = (Vec::new(), Vec::new(), 0u32);
+    for slot in out_key.output_layout(&input.schema.pk_cols, group, row) {
+        let (id, def) = match slot {
+            ReduceOutSlot::SyntheticKey => (ColId::NONE, group_pk_def()),
+            ReduceOutSlot::Key(c) | ReduceOutSlot::Carried(c) => {
+                (input.layout[c as usize], input.schema.columns[c as usize].clone())
+            }
+        };
+        npk += u32::from(!matches!(slot, ReduceOutSlot::Carried(_)));
+        layout.push(id);
+        cols.push(def);
     }
-    for (a, &start) in aggs.iter().zip(agg_starts) {
-        let slot = layout.agg_col_offset + start;
-        out[slot] = a.out.id;
-        if let Some(c) = &a.companion {
-            out[slot + 1] = c.id;
-        }
-    }
-    out
+    let (ids, defs): (Vec<_>, Vec<_>) = tail.into_iter().unzip();
+    layout.extend(ids);
+    cols.extend(defs);
+    let schema =
+        Schema::from_parts(cols, (0..npk).collect()).map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))?;
+    Ok(Frame { layout, schema: Arc::new(schema) })
 }
 
 /// The downstream demand on a combine's output: the final projection and the
@@ -156,9 +169,9 @@ fn emit_projection(
     let k = input.pk_count();
     // A payload slot naming a key column is a second copy of a value the key
     // region already carries; only the expression map can write one.
-    let payload: Option<Vec<usize>> = items[k..]
+    let payload: Option<Vec<u32>> = items[k..]
         .iter()
-        .map(|i| i.passthrough_src().filter(|&c| !input.is_pk_col(c)))
+        .map(|i| i.passthrough_src().filter(|&c| !input.is_pk_col(c)).map(|c| c as u32))
         .collect();
     let Some(payload) = payload else {
         return Ok(cb.map_expr(node, payload_map(&items[k..], &out.columns[k..], input)?));

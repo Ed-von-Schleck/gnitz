@@ -547,7 +547,7 @@ fn test_reduce_groups_by_a_payload_column() {
     // companion every all-linear reduce carries.
     let agg_descs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
-        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor::COUNT_STAR,
     ];
     let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 

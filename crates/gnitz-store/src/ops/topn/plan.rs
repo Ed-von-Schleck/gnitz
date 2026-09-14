@@ -3,7 +3,7 @@
 
 use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaDescriptor};
 use crate::storage::MemBatch;
-use gnitz_wire::OrderKey;
+use gnitz_wire::{OrderKey, ReduceOutSlot};
 
 use super::super::group_key::{group_out_pk, GroupKeyCols, OutPk, GROUP_PK_COL};
 use super::index::TopNIndex;
@@ -23,9 +23,7 @@ pub struct TopNPlan {
     pub index: TopNIndex,
 }
 
-/// The top-N output schema and the input columns it carries as payload: the
-/// reduce key region for the group set, then [`ReduceOutKey::carried_columns`]
-/// — the shared rule the planner's declared schema is built from too. `None`
+/// The top-N output schema and the input columns it carries as payload. `None`
 /// when the columns would overflow the fixed schema array.
 fn build_topn_output_schema(
     input: &SchemaDescriptor,
@@ -33,17 +31,16 @@ fn build_topn_output_schema(
     group_cols: &[u32],
 ) -> Option<(SchemaDescriptor, Vec<u32>)> {
     let mut b = DerivedSchema::new();
-    match out_key.key_region(input.pk_indices(), group_cols) {
-        None => b.push_pk(GROUP_PK_COL)?,
-        Some(keys) => {
-            for &c in keys {
-                b.push_pk(input.columns[c as usize])?;
+    let mut carried = Vec::new();
+    for slot in out_key.output_layout(input.pk_indices(), group_cols, 0..input.num_columns() as u32) {
+        match slot {
+            ReduceOutSlot::SyntheticKey => b.push_pk(GROUP_PK_COL)?,
+            ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize])?,
+            ReduceOutSlot::Carried(c) => {
+                b.push(input.columns[c as usize])?;
+                carried.push(c);
             }
         }
-    }
-    let carried = out_key.carried_columns(input.pk_indices(), group_cols, input.num_columns() as u32);
-    for &c in &carried {
-        b.push(input.columns[c as usize])?;
     }
     Some((b.finish(), carried))
 }

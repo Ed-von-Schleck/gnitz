@@ -12,7 +12,7 @@ use super::JoinSide;
 use crate::error::GnitzSqlError;
 
 use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, RangeRel, ReindexRole, ReindexSlot, Schema, TypeCode};
-use gnitz_wire::AggFunc as WireAggFunc;
+use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc};
 
 /// A join's equality pairs resolved against both inputs: each side's key-column
 /// positions in its own layout, and the per-pair promoted type codes.
@@ -64,8 +64,8 @@ fn normalize_to_ab(
     right_n: usize,
 ) -> NodeId {
     // Term AB is already canonical behind its key region; term BA is swapped.
-    let proj_ab: Vec<usize> = (k..k + left_n + right_n).collect();
-    let proj_ba: Vec<usize> = ba_to_ab_cols(k, left_n, right_n).collect();
+    let proj_ab: Vec<u32> = (k..k + left_n + right_n).map(|c| c as u32).collect();
+    let proj_ba: Vec<u32> = ba_to_ab_cols(k, left_n, right_n).collect();
     let ab = cb.map(join_ab, &proj_ab);
     let ba = cb.map(join_ba, &proj_ba);
     cb.union(ab, ba)
@@ -75,8 +75,10 @@ fn normalize_to_ab(
 /// A join emits `[left_PK, left_payload…, right_payload…]`, so the BA term names
 /// B as its left. A caller spends the list as a `map` projection or as a reindex
 /// keep list; both index the same node.
-pub(super) fn ba_to_ab_cols(k: usize, left_n: usize, right_n: usize) -> impl Iterator<Item = usize> {
-    (k + right_n..k + right_n + left_n).chain(k..k + right_n)
+pub(super) fn ba_to_ab_cols(k: usize, left_n: usize, right_n: usize) -> impl Iterator<Item = u32> {
+    (k + right_n..k + right_n + left_n)
+        .chain(k..k + right_n)
+        .map(|c| c as u32)
 }
 
 /// One join side as a prologue gated and reindexed it.
@@ -290,8 +292,8 @@ pub(super) fn emit_range_null_fill_tail(
     // `[B, NULL-A]` and takes the same swap the BA join term does, so the branch
     // is full width `[pair-PK, A, B]` — the layout the post-union WHERE and the
     // final user projection both read.
-    let nf_full_projection: Vec<usize> = if preserved_is_left {
-        (pair_pk..pair_pk + p_n + o_n).collect()
+    let nf_full_projection: Vec<u32> = if preserved_is_left {
+        (pair_pk..pair_pk + p_n + o_n).map(|c| c as u32).collect()
     } else {
         ba_to_ab_cols(pair_pk, o_n, p_n).collect()
     };
@@ -374,7 +376,13 @@ impl RangePrologue<'_> {
         let mbh = cb.map_hash_row(self.sides[1].reindex, &[(0, None)], 0);
         // Local over the broadcast B, so every worker holds the same extremum. No
         // ground row: a `m = NULL` seed would break `A − 0 = A` over an empty B.
-        let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false); // [_group_pk:U128, m:Tc]
+        // The COUNT is the cardinality gate every reduce carries; the reindex
+        // below keeps no payload, so it goes no further.
+        let specs = [
+            AggDescriptor { agg_op: agg_func, col_idx: 1 },
+            AggDescriptor::COUNT_STAR,
+        ];
+        let red = cb.reduce_multi_local(mbh, &[], &specs, false); // [_group_pk:U128, m:Tc, count]
         let reindex_m = cb.map_reindex(red, &self_derived_key(&[1]), &[], ReindexRole::Auxiliary);
         let trace_m = cb.integrate_trace(reindex_m);
 
@@ -382,7 +390,7 @@ impl RangePrologue<'_> {
         let j_ma = cb.join_with_trace_range_node(reindex_m, trace_a, n_eq, self.op);
         // Range-join output = [_join_pk x k, delta payload, trace payload]. `m` has no
         // payload, so A sits at `k..k + left_n` in both terms.
-        let a_cols: Vec<usize> = (k..k + left_n).collect();
+        let a_cols: Vec<u32> = (k..k + left_n).map(|c| c as u32).collect();
         let m_am = cb.map(j_am, &a_cols);
         let m_ma = cb.map(j_ma, &a_cols);
         let matched_raw = cb.union(m_am, m_ma); // [_join_pk(PK), A]
@@ -533,7 +541,7 @@ pub(crate) fn emit_equi_null_fill(
             continue;
         }
         let p_all = terms.p_all(cb, preserved_is_left);
-        let proj_p = cb.map(inner_merged, &(p0..p0 + p_n).collect::<Vec<_>>()); // π_P(inner) = [_join_pk, P]
+        let proj_p = cb.map(inner_merged, &(p0..p0 + p_n).map(|c| c as u32).collect::<Vec<_>>()); // π_P(inner) = [_join_pk, P]
         let nu_p = cb.positive_diff(p_all, proj_p); // max(0, P − π_P(inner))
                                                     // A side that keeps nothing contributes no NULL region at all.
         let o_tcs = terms.side(!preserved_is_left).side.kept_type_codes();

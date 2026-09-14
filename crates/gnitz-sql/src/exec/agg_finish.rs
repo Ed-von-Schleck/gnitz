@@ -2,7 +2,7 @@
 //! FROM-less SELECT's constant row.
 //!
 //! The workers return one concatenated `ZSetBatch` of per-worker partial reduce
-//! rows in the SyntheticFold layout (`crate::agg::fold_partial_schema`):
+//! rows in the SyntheticFold layout the fold lowering declares:
 //! `[_group_pk U128 (hidden PK) | group cols | one partial per physical agg spec]`.
 //! [`FoldFinish::combine`] folds them into one row per group in place, by the
 //! partial-merge rule the view path's two-phase combine ships
@@ -16,16 +16,17 @@
 //! worker count.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use gnitz_core::{ColumnDef, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, Evaluator, SchemaFacts};
 use gnitz_wire::AggFunc as WireAggFunc;
+use rustc_hash::FxHashMap;
 
 use crate::agg::group_pk_def;
 use crate::codec::project_schema::{reply_program, ProjItem};
 use crate::error::GnitzSqlError;
+use crate::exec::batch::move_payload;
 use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::ir::BoundExpr;
 
@@ -44,7 +45,7 @@ pub(crate) struct FoldFinish {
     merge: Vec<Option<Ordering>>,
     pub(crate) having: Option<Evaluator>,
     finalize: Evaluator,
-    /// The finalize map's column moves as `(source slot, output slot)`: equal-width payload
+    /// The finalize map's column moves as `(output slot, source slot)`: equal-width payload
     /// copies only.
     copies: Vec<(usize, usize)>,
     /// The finalize map reproduces its input.
@@ -82,7 +83,7 @@ impl FoldFinish {
             .copies()
             .iter()
             .map(|&(loc, out, width)| match loc {
-                ColumnLocator::Payload { slot, size, .. } if size == width => Ok((slot as usize, out as usize)),
+                ColumnLocator::Payload { slot, size, .. } if size == width => Ok((out as usize, slot as usize)),
                 _ => Err(GnitzSqlError::Internal(
                     "a finalize item copies a key or a promoted column".into(),
                 )),
@@ -109,8 +110,9 @@ impl FoldFinish {
             .collect();
         let (group_locs, agg_locs) = locs.split_at(n_group);
         // `_group_pk` → the newest group's first row; `older[r]` the next-older first row with
-        // r's key. The key is a digest, so a hit is confirmed by value.
-        let mut newest: HashMap<u128, usize> = HashMap::with_capacity(partial.len());
+        // r's key. The key is a digest, so a hit is confirmed by value — and already
+        // hashed, so the map need not hash it again.
+        let mut newest: FxHashMap<u128, usize> = FxHashMap::with_capacity_and_hasher(partial.len(), Default::default());
         let mut older: Vec<usize> = Vec::with_capacity(partial.len());
         let mut keep: Vec<(usize, usize)> = Vec::new();
         for row in 0..partial.len() {
@@ -155,12 +157,11 @@ impl FoldFinish {
     fn map_batch(&self, src: ZSetBatch) -> ZSetBatch {
         let (ev, n) = (&self.finalize, src.len());
         let mut out = ZSetBatch::new(&self.out_schema);
-        // Shared arena contents, so a copied German cell keeps its offset.
-        out.blob = src.blob.clone();
         out.nulls = vec![0; n];
-        // `resolve_map` covers every output slot exactly once: by a copy or by an emit.
-        for &(from, to) in &self.copies {
-            out.payload[to].bytes = src.payload[from].bytes.clone();
+        let str_emits = !ev.str_emits().is_empty();
+        if str_emits {
+            // Appended to, so copied: a copied German cell keeps its offset into it.
+            out.blob = src.blob.clone();
         }
         for &(_, pi, stride) in ev.scalar_emits() {
             out.payload[pi as usize].bytes = vec![0; n * stride as usize];
@@ -198,8 +199,14 @@ impl FoldFinish {
                 });
             }
         }
-        out.pks = src.pks;
-        out.weights = src.weights;
+        // The evaluator is done with `src`; its parts move into the output.
+        let ZSetBatch { pks, weights, mut payload, blob, .. } = src;
+        move_payload(&mut out.payload, &mut payload, &self.copies);
+        if !str_emits {
+            out.blob = blob;
+        }
+        out.pks = pks;
+        out.weights = weights;
         out
     }
 }

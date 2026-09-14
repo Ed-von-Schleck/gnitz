@@ -163,7 +163,7 @@ fn scan_spec_sinks_bench() {
     let agg = AggReadSpec {
         group_cols: vec![1],
         aggs: vec![
-            AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 },
+            AggDescriptor::COUNT_STAR,
             AggDescriptor { agg_op: AggFunc::Sum, col_idx: 3 },
         ],
     };
@@ -201,7 +201,7 @@ fn scan_spec_sinks_bench() {
             map: None,
             kind: SinkKind::Fold(AggReadSpec {
                 group_cols: vec![4],
-                aggs: vec![AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 }],
+                aggs: vec![AggDescriptor::COUNT_STAR],
             }),
         },
     };

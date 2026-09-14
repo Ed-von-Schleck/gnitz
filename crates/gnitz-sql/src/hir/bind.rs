@@ -1090,7 +1090,7 @@ fn scalar_leaf(
     arg: Option<ColId>,
 ) -> Result<HirRef, GnitzSqlError> {
     let group_cols = scalar_group_cols(&ir.correlation, &ir.inner_cols)?;
-    let agg = HirAgg::new(ids, func, arg, &ir.inner_cols, group_cols.is_empty())?;
+    let agg = HirAgg::new(ids, func, arg, &ir.inner_cols, group_cols.is_empty(), &[])?;
     Ok(HirRef::Subquery(Box::new(SubqueryRef {
         kind: SubqueryKind::Scalar,
         rel: RelExpr::reduce(ir.rel, group_cols, vec![agg]),
@@ -1627,20 +1627,20 @@ fn bind_grouped_suffix(
         None if pre.extra.is_empty() => input,
         None => RelExpr::project(input, pre.items_for(&reads)),
     };
-    let aggs = calls
-        .iter()
-        .map(|c| HirAgg::new(ids, c.func, c.arg.ignoring_distinct(), &pre.env, is_global))
-        .collect::<Result<Vec<HirAgg>, _>>()?;
+    let mut aggs: Vec<HirAgg> = Vec::with_capacity(calls.len());
+    for c in &calls {
+        let agg = HirAgg::new(ids, c.func, c.arg.ignoring_distinct(), &pre.env, is_global, &aggs)?;
+        aggs.push(agg);
+    }
 
     let mut rel = RelExpr::reduce(input, group_cols.clone(), aggs.clone());
 
-    // The pre-map's columns, extended with each aggregate's raw value and
-    // companion: everything a `ColId` in an expression over the reduce output can
-    // resolve to when it is typed.
+    // Everything a `ColId` over the reduce output can resolve to.
     let PreMap { mut env, extra, .. } = pre;
-    for a in &aggs {
-        env.push(a.out.clone());
-        env.extend(a.companion.iter().cloned());
+    for c in aggs.iter().flat_map(HirAgg::cols) {
+        if !env.iter().any(|e| e.id == c.col.id) {
+            env.push(c.col.clone());
+        }
     }
     // One leaf per clause over the same grouped relation: only the wording of a
     // rejection differs, so only the clause does.

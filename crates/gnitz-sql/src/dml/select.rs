@@ -40,7 +40,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{AggDescriptor, AggReadSpec, ReadSink, SinkKind};
+use gnitz_wire::{ReadSink, SinkKind};
 use sqlparser::ast::{OrderBy, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
@@ -265,27 +265,20 @@ fn plan_fold(
     // Over this sink's output, which lacks the group columns a view's reduce carries:
     // `SELECT COUNT(*) AS kind FROM t GROUP BY kind` is refused as a view, accepted here.
     reject_duplicate_projection_names(&select.projection, pieces.finalize.iter().map(|(_, d)| d), ctx)?;
-    // `group_cols` / `col_idx` index the reduce input — the pre-map's output when
-    // the fold carries one.
-    let sink = ReadSink {
-        map: pieces.pre,
-        kind: SinkKind::Fold(AggReadSpec {
-            group_cols: pieces.group_positions.iter().map(|&c| c as u32).collect(),
-            aggs: pieces
-                .agg_specs
-                .iter()
-                .map(|s| AggDescriptor { agg_op: s.op, col_idx: s.col as u32 })
-                .collect(),
-        }),
-    };
     // Compiled here rather than at finish, so every rejection is pre-dispatch — and
     // the same one a view gives, the finalize being compiled as a view's map is.
     let finish = FoldFinish::new(
         pieces.partial_schema,
-        pieces.agg_specs.iter().map(|s| s.op),
+        pieces.agg.aggs.iter().map(|d| d.agg_op),
         &pieces.having,
         pieces.finalize,
     )?;
+    // `group_cols` / `col_idx` index the reduce input — the pre-map's output when
+    // the fold carries one.
+    let sink = ReadSink {
+        map: pieces.pre,
+        kind: SinkKind::Fold(pieces.agg),
+    };
     let order = wire_order(&keys, &finish.out_schema, &order_cols)?;
     let case = ReadCase::Fold {
         read: SpecRead { name, desc, access, sink },

@@ -172,9 +172,8 @@ impl CircuitBuilder {
     }
 
     /// Pure projection: keep only the listed payload columns, in order.
-    pub fn map(&mut self, input: NodeId, projection: &[usize]) -> NodeId {
-        let cols: Vec<u32> = projection.iter().map(|&c| c as u32).collect();
-        self.alloc_wired(OpNode::Map(MapKind::Projection(cols)), &[input])
+    pub fn map(&mut self, input: NodeId, projection: &[u32]) -> NodeId {
+        self.alloc_wired(OpNode::Map(MapKind::Projection(projection.to_vec())), &[input])
     }
 
     pub fn negate(&mut self, input: NodeId) -> NodeId {
@@ -236,14 +235,14 @@ impl CircuitBuilder {
     }
 
     /// Multi-aggregate reduce with automatic shard insertion (required for
-    /// multi-worker correctness). `agg_specs`: list of (agg func, col_idx).
-    /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
-    /// (empty `group_cols`); the grouped builder passes `group_cols.is_empty()`.
+    /// multi-worker correctness). `global_ground` is `true` only for the user's
+    /// ungrouped scalar aggregate (empty `group_cols`); the grouped builder passes
+    /// `group_cols.is_empty()`.
     pub fn reduce_multi(
         &mut self,
         input: NodeId,
-        group_cols: &[usize],
-        agg_specs: &[(AggFunc, usize)],
+        group_cols: &[u32],
+        agg_specs: &[AggDescriptor],
         global_ground: bool,
     ) -> NodeId {
         let sharded = self.shard(input, group_cols);
@@ -267,24 +266,19 @@ impl CircuitBuilder {
     /// The LEFT range-join threshold reduce (also empty group cols) likewise passes
     /// `false` so it never seeds a spurious `(m=NULL)` row.
     ///
-    /// `agg_specs` must not be empty (the engine rejects a spec-less REDUCE at
-    /// decode).
+    /// `agg_specs` must carry a `Count` (the engine rejects a count-less REDUCE
+    /// at load).
     pub fn reduce_multi_local(
         &mut self,
         input: NodeId,
-        group_cols: &[usize],
-        agg_specs: &[(AggFunc, usize)],
+        group_cols: &[u32],
+        agg_specs: &[AggDescriptor],
         global_ground: bool,
     ) -> NodeId {
-        let group: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
-        let specs: Vec<AggDescriptor> = agg_specs
-            .iter()
-            .map(|&(agg_op, col)| AggDescriptor { agg_op, col_idx: col as u32 })
-            .collect();
         self.alloc_wired(
             OpNode::Reduce {
-                group_cols: group,
-                agg: specs,
+                group_cols: group_cols.to_vec(),
+                agg: agg_specs.to_vec(),
                 global_ground,
             },
             &[input],
@@ -293,14 +287,7 @@ impl CircuitBuilder {
 
     /// Per-group top-N with automatic shard insertion: every group lands on one
     /// worker, whose index holds the group whole. See [`Self::top_n_local`].
-    pub fn top_n(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        order: &[OrderKey],
-        limit: u64,
-        offset: u64,
-    ) -> NodeId {
+    pub fn top_n(&mut self, input: NodeId, group_cols: &[u32], order: &[OrderKey], limit: u64, offset: u64) -> NodeId {
         let sharded = self.shard(input, group_cols);
         self.top_n_local(sharded, group_cols, order, limit, offset)
     }
@@ -316,15 +303,14 @@ impl CircuitBuilder {
     pub fn top_n_local(
         &mut self,
         input: NodeId,
-        group_cols: &[usize],
+        group_cols: &[u32],
         order: &[OrderKey],
         limit: u64,
         offset: u64,
     ) -> NodeId {
-        let group: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
         self.alloc_wired(
             OpNode::TopN {
-                group_cols: group,
+                group_cols: group_cols.to_vec(),
                 order: order.to_vec(),
                 limit,
                 offset,
@@ -334,9 +320,8 @@ impl CircuitBuilder {
     }
 
     /// Exchange shard: routes rows to workers by hashing the given columns.
-    pub fn shard(&mut self, input: NodeId, shard_cols: &[usize]) -> NodeId {
-        let cols: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
-        self.alloc_wired(OpNode::ExchangeShard { shard_cols: cols }, &[input])
+    pub fn shard(&mut self, input: NodeId, shard_cols: &[u32]) -> NodeId {
+        self.alloc_wired(OpNode::ExchangeShard { shard_cols: shard_cols.to_vec() }, &[input])
     }
 
     /// Intermediate trace integration (equijoin accumulator).

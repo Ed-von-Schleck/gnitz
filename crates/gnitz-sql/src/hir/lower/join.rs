@@ -74,7 +74,7 @@ pub(super) fn lower_join_view(
     // exchange routes.
     let node = match class.shape() {
         JoinShape::Equi => node,
-        _ => cb.shard(node, &(0..out.npk()).collect::<Vec<_>>()),
+        _ => cb.shard(node, &(0..out.npk() as u32).collect::<Vec<_>>()),
     };
     cb.sink(node);
     Ok(EmitPieces { circuit: cb.build(), out })
@@ -237,7 +237,7 @@ fn emit_cross(
         &(pa as u32..(pa + pl + pr) as u32).collect::<Vec<_>>(),
         ReindexRole::Auxiliary,
     );
-    let ba_keep: Vec<u32> = ba_to_ab_cols(pb, pl, pr).map(|c| c as u32).collect();
+    let ba_keep: Vec<u32> = ba_to_ab_cols(pb, pl, pr).collect();
     let ba = cb.map_reindex(
         join_ba,
         &self_derived_key(&pair_pk_slots(sides, pb + pr, pb)),

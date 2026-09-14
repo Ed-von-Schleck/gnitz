@@ -141,7 +141,7 @@ pub(super) fn lower_exists_view(
     // A range correlation re-keys onto the outer source PK and rides the range
     // output exchange; an equi one is keyed by `_join_pk` and needs none.
     let node = match class.range {
-        Some(_) => cb.shard(node, &(0..out.npk()).collect::<Vec<_>>()),
+        Some(_) => cb.shard(node, &(0..out.npk() as u32).collect::<Vec<_>>()),
         None => node,
     };
     cb.sink(node);
@@ -167,8 +167,11 @@ impl ExistsCore<'_> {
         let k = terms.k();
 
         // π_A(inner): project each term straight to [_join_pk × k, A].
-        let pa_ab = cb.map(terms.join_ab, &(k..k + a_n).collect::<Vec<_>>());
-        let pa_ba = cb.map(terms.join_ba, &(k + b_n..k + b_n + a_n).collect::<Vec<_>>());
+        let pa_ab = cb.map(terms.join_ab, &(k..k + a_n).map(|c| c as u32).collect::<Vec<_>>());
+        let pa_ba = cb.map(
+            terms.join_ba,
+            &(k + b_n..k + b_n + a_n).map(|c| c as u32).collect::<Vec<_>>(),
+        );
         let pi_a = cb.union(pa_ab, pa_ba);
 
         // A_all: the full (locally filtered, NULL keys included) outer input,

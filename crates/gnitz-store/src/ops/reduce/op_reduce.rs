@@ -188,10 +188,7 @@ pub fn op_reduce(
 
     let mut accs: Vec<Accumulator> = plan.acc_template.clone();
 
-    // A group exists iff its net cardinality (row weight) is positive; the unique
-    // AggFunc::Count accumulator carries that signal (baked by `ReducePlan::build`;
-    // `None` degrades a count-less reduce to the touched-ness test below).
-    let cardinality_idx: Option<usize> = plan.cardinality_idx.map(|i| i as usize);
+    let cardinality = plan.cardinality_idx.expect("from_wire refuses a count-less reduce") as usize;
 
     // The AVI seek prefix `group ‖ ordinal`, hoisted out of the group loop: each
     // group's pack fully overwrites the key's group span and each ordinal
@@ -292,24 +289,11 @@ pub fn op_reduce(
             }
         }
 
-        // A group exists iff its net cardinality is positive. The COUNT signal
-        // reads that directly and stays correct for an emptied group (the folded
-        // companion nets to 0) and for a new all-NULL group (positive count,
-        // untouched value accumulators). Without one, fall back to touched-ness.
-        let should_emit = match cardinality_idx {
-            Some(ci) => {
-                // Bag-positive reduce inputs ⇒ cardinality ≥ 0; fail loudly if a
-                // future operator ever violates that, since the gate is not
-                // sign-robust the way the touched-ness fallback is.
-                debug_assert!(
-                    accs[ci].count_value() >= 0,
-                    "reduce input must be bag-positive: negative group cardinality",
-                );
-                accs[ci].count_value() > 0
-            }
-            None => accs.iter().any(|a| !a.is_untouched()),
-        };
-        if should_emit {
+        debug_assert!(
+            accs[cardinality].count_value() >= 0,
+            "reduce input must be bag-positive: negative group cardinality",
+        );
+        if accs[cardinality].count_value() > 0 {
             emit_reduce_row(&mut raw_output, (&mb, group_start_idx), out_pk_bytes, &accs, plan);
         } else if global_ground {
             // The gate shed the computed row, but an ungrouped scalar aggregate

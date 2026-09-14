@@ -148,9 +148,8 @@ impl Accumulator {
     }
 
     /// True iff the accumulator was never stepped (`has_value` is false) — "no
-    /// row contributed," not "the value equals zero." `emit_agg_col` reads this to
-    /// pick the empty-render (NULL, or `0` per `empty_renders_zero`).
-    #[inline(always)]
+    /// row contributed," not "the value equals zero."
+    #[cfg(test)]
     pub(super) fn is_untouched(&self) -> bool {
         !self.has_value
     }

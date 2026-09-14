@@ -2,7 +2,7 @@ use crate::ast_util::{aliased_def, expand_wildcard_item, scalar_projection_item}
 use crate::bind::single_relation_col_idx;
 use crate::error::GnitzSqlError;
 use crate::validate::reject_duplicate_projection_names;
-use gnitz_core::{Schema, ZSetBatch};
+use gnitz_core::{PayloadColumn, Schema, ZSetBatch};
 use sqlparser::ast::SelectItem;
 
 /// A resolved projection: the output schema and, per output column, its source
@@ -178,20 +178,21 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, src_batch: ZSetBatc
         }
     }
 
-    // Payload regions: strictly payload→payload. `src_payload` is owned, so whole
-    // regions move rather than being copied cell by cell. A source slot projected
-    // more than once is cloned for every occurrence but its last, which still
-    // takes the move. The destination keeps the type `ZSetBatch::new` gave it.
-    for (pos, &(new_pi, old_pi)) in pi_mappings.iter().enumerate() {
-        let used_later = pi_mappings[pos + 1..].iter().any(|&(_, o)| o == old_pi);
-        new_batch.payload[new_pi].bytes = if used_later {
-            src_payload[old_pi].bytes.clone()
+    move_payload(&mut new_batch.payload, &mut src_payload, &pi_mappings);
+    (new_schema, new_batch)
+}
+
+/// Each `(to, from)` payload region of `src` into `dst`: moved, or cloned while a
+/// later pair still reads it. The destination keeps its own type.
+pub(crate) fn move_payload(dst: &mut [PayloadColumn], src: &mut [PayloadColumn], moves: &[(usize, usize)]) {
+    for (pos, &(to, from)) in moves.iter().enumerate() {
+        let read_again = moves[pos + 1..].iter().any(|&(_, f)| f == from);
+        dst[to].bytes = if read_again {
+            src[from].bytes.clone()
         } else {
-            std::mem::take(&mut src_payload[old_pi].bytes)
+            std::mem::take(&mut src[from].bytes)
         };
     }
-
-    (new_schema, new_batch)
 }
 
 #[cfg(test)]

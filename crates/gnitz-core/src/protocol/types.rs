@@ -279,15 +279,15 @@ impl Schema {
         self.columns[i].is_hidden && !self.is_pk_col(i)
     }
 
-    /// The output-key kind a reduce grouped by `cols` over this schema gets.
-    /// The engine derives the same answer off its own `SchemaDescriptor`
-    /// through [`ReduceOutKey::for_group_cols`], so nothing ships.
-    pub fn reduce_out_key(&self, cols: &[usize]) -> ReduceOutKey {
-        let group: Vec<u32> = cols.iter().map(|&c| c as u32).collect();
-        ReduceOutKey::for_group_cols(&self.pk_cols, &group, |c| {
+    /// The output-key kind a reduce or top-N grouped by `group` gets (the engine
+    /// derives the same), and `group` in output-key order: sharding by it lands
+    /// each output row on the worker owning its PK.
+    pub fn reduce_key(&self, group: &[u32]) -> (ReduceOutKey, Vec<u32>) {
+        let key = ReduceOutKey::for_group_cols(&self.pk_cols, group, |c| {
             let cd = &self.columns[c as usize];
             (cd.type_code as u8, cd.is_nullable)
-        })
+        });
+        (key, key.key_region(&self.pk_cols, group).unwrap_or(group).to_vec())
     }
 
     /// The single definition of "these parts form an admissible schema": the
