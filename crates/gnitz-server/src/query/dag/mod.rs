@@ -104,7 +104,7 @@ impl DagEngine {
     ) -> Result<(), String> {
         if self.has_dependents(registry, table_id) {
             return Err(format!(
-                "swap_schema: table {table_id} has dependent views;                  RESTRICT should have rejected the ALTER"
+                "swap_schema: table {table_id} has dependent views; RESTRICT should have rejected the ALTER"
             ));
         }
         registry.swap_schema(table_id, schema).map_err(String::from)

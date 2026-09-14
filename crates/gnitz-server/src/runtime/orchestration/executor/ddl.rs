@@ -117,17 +117,6 @@ pub(super) async fn hold_relay_for_ddl(shared: &Shared) {
     .await
 }
 
-/// Resolve `tid`'s system-family schema and decode a client wal-block slice
-/// against it — the master's OWN registered layout, so a client cannot dictate
-/// how its bytes are read. `SysFamily::from_id` rejects a bogus family tid.
-/// Used by the DDL_TXN bundle decode.
-///
-/// This is the sole client → family boundary, so it is where the
-/// [`SysFamily::client_writable`] allowlist belongs: `PUSH_TXN` rejects a tid
-/// below `FIRST_USER_TABLE_ID`, plain `PUSH` is refused because a
-/// `SystemCatalog` relation is no ingestion point, and `ddl_sync` carries
-/// master-broadcast rows. The engine's own sequence writes reach `submit`
-/// through `submit` and never cross this decoder.
 /// [`family_pk_partition`] over a bundle slot, empty where the bundle carries no
 /// block for that family.
 fn partition_of(families: &[Option<Batch>; SysFamily::COUNT], family: SysFamily) -> PkPartition {
@@ -137,6 +126,8 @@ fn partition_of(families: &[Option<Batch>; SysFamily::COUNT], family: SysFamily)
         .unwrap_or_default()
 }
 
+/// Decode a client wal-block slice against family `tid`'s own schema. The sole
+/// client → family boundary, so the [`SysFamily::client_writable`] allowlist is here.
 fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
     if !family.client_writable() {
@@ -361,9 +352,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
                 drained_sources = true;
             }
             cat.precheck_family(family, &fbatch)?;
-            applied_not_enqueued = Some((family, fbatch.clone()));
-            cat.apply_and_enqueue_family(family, fbatch)?;
-            applied_not_enqueued = None;
+            cat.apply_bundle_family(family, fbatch, &mut applied_not_enqueued)?;
         }
         // Compile every new view's circuit here, on the master, while the bundle
         // is still undoable. VIEW_TAB has been applied, so each view is registered
@@ -378,9 +367,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         Ok(())
     });
     if let Err(e) = &ingest_res {
-        // Before the close: `close_ddl_zone` also resets `ApplyMode::Compensating`
-        // back to `Live`, so a close first would strand the compensation outside
-        // the mode it needs.
         guard_panic("DDL-compensate", || {
             shared.cat_mut().compensate_stage_a(applied_not_enqueued.take())
         })
@@ -548,7 +534,12 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         // A sys_sequences advance is a pure system-table write (no evaluate_dag,
         // no rollback); a hook failure on a well-formed 2-row delta is an
         // invariant violation — abort rather than compensate.
-        if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
+        let applied = {
+            let cat = shared.cat_mut();
+            cat.precheck_family(SysFamily::Sequence, &delta)
+                .and_then(|()| cat.apply_and_enqueue_family(SysFamily::Sequence, delta))
+        };
+        if let Err(e) = applied {
             gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
         }
         shared.cat_mut().close_ddl_zone();

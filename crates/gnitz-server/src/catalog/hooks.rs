@@ -3,21 +3,22 @@ use super::*;
 use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
 use rustc_hash::FxHashMap;
 
+/// The columns of a base table that carry a derived FK index circuit: every FK
+/// column outside the PK — a PK column is already stored in the PK region.
+fn fk_circuit_cols<'a>(schema: &'a SchemaDescriptor, col_defs: &'a [ColumnDef]) -> impl Iterator<Item = usize> + 'a {
+    col_defs
+        .iter()
+        .enumerate()
+        .filter(move |&(ci, cd)| cd.fk_table_id != 0 && !schema.is_pk_col(ci))
+        .map(|(ci, _)| ci)
+}
+
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
     //
-    // Dispatch is a static per-system-table sequence, and the order of calls
-    // is the dependency order. The `apply_*` / `hook_*` split is described in
-    // the module doc.
-    //
-    // Cross-family ordering contract: a relation's COL_TAB rows must be readable
-    // from `sys_columns` STORAGE when its register hook runs, or the hook
-    // registers a relation whose schema build finds no columns. Live DDL applies
-    // a bundle in ascending `topo_priority`; boot replay opens every sys store
-    // first.
-    //
-    // A hook re-asserts a precheck guard only where the verdict cannot depend on
-    // application order and the hook already holds the guard's input.
+    // Call order is dependency order. A relation's COL_TAB rows must be in storage
+    // when its register hook runs: live DDL applies ascending `topo_priority`, and
+    // boot replay opens every sys store first.
     pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let reordered = Self::canonicalize_for_hooks(batch, family);
         let batch = reordered.as_ref().unwrap_or(batch);
@@ -26,13 +27,7 @@ impl CatalogEngine {
                 self.apply_schema_caches(batch);
                 self.hook_schema_dir(batch)?;
             }
-            SysFamily::Table => {
-                self.apply_entity_caches(family, batch);
-                self.hook_relation_register(family, batch)?;
-                self.relock_from_table_delta(batch);
-                self.hook_cascade_fk(batch)?;
-            }
-            SysFamily::View => {
+            SysFamily::Table | SysFamily::View => {
                 self.apply_entity_caches(family, batch);
                 self.hook_relation_register(family, batch)?;
             }
@@ -40,8 +35,8 @@ impl CatalogEngine {
                 self.apply_col_names_invalidate(batch);
                 self.apply_fk_edges_and_locks(batch);
                 // MUST be last — after `apply_col_names_invalidate` evicts the
-                // cached col defs — so the DROP NOT NULL descriptor rebuild reads
-                // the post-ALTER column defs.
+                // cached col defs — so the descriptor rebuild reads the
+                // post-ALTER column defs.
                 self.hook_column_alter(batch)?;
             }
             SysFamily::Index => {
@@ -59,13 +54,9 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// The view every handler sees: retractions before insertions. `None` when
-    /// `batch` already is, which is every forward producer — only
-    /// `compensate_stage_a`'s in-place negation reverses a pair.
-    ///
-    /// Batch-wide, not per-PK: `apply_entity_caches`' `-1` arm reads the outgoing
-    /// name from the cache, so an ALTER VIEW whose new vid's `+1` came first would
-    /// unmap the *new* view's qualified name.
+    /// `batch` with every retraction ahead of every insertion — batch-wide, since the
+    /// cache appliers read an outgoing name before its successor lands. `None` when
+    /// `batch` already is.
     fn canonicalize_for_hooks(batch: &Batch, family: SysFamily) -> Option<Batch> {
         // `false < true`, so "sorted by (weight > 0)" *is* "retractions first".
         if (0..batch.len()).is_sorted_by_key(|i| batch.get_weight(i) > 0) {
@@ -77,11 +68,8 @@ impl CatalogEngine {
         Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &idx, family.schema()))
     }
 
-    /// Fold a `sys_sequences` advance into the in-memory `user_sequences` map.
-    /// Fires via `submit` (live durable range advances and SAL replay at
-    /// recovery). Catalog sequences (`seq_id < FIRST_USER_TABLE_ID`) recover via
-    /// the object-id hooks instead, so they are skipped — the guard is defensive
-    /// since `advance_sequence` bypasses `submit` and never reaches here.
+    /// Fold a `sys_sequences` advance into `user_sequences`; `observe_user_sequence`
+    /// skips the catalog's own sequences.
     fn hook_sequence_register(&mut self, batch: &Batch) {
         for i in 0..batch.len() {
             if batch.get_weight(i) <= 0 {
@@ -119,7 +107,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Build a relation's store and enter it in the registry — the `+1` half of
+    /// Build a relation's store and enter it in the registry — the create half of
     /// [`hook_relation_register`](Self::hook_relation_register), over the values
     /// its per-family builder decoded.
     fn register_relation(&mut self, reg: RelationRegistration<'_>) -> Result<(), String> {
@@ -151,106 +139,72 @@ impl CatalogEngine {
             RelationSpec { id, kind, schema, directory, budgets },
             match self.ctx.mode() {
                 ApplyMode::Replay => OnRegister::BootReplay,
-                _ => OnRegister::Live,
+                ApplyMode::Live => OnRegister::Live,
             },
         )?;
-        raise_id_counter(&mut self.next_table_id, id);
-        Ok(())
-    }
-
-    /// Tear a relation out of the registry — the shared net-dead `-1` half of
-    /// the two register hooks. `cascade` retracts the dependent system rows the
-    /// relation owns (indices/columns for a table, circuit/columns for a
-    /// view) and runs before the unregister, while the entry is still resolvable.
-    ///
-    /// The version counters are purged AFTER the cascade: its own
-    /// `apply_index_caches` / `invalidate_col_names` bumps would otherwise
-    /// `or_insert` them straight back.
-    fn drop_relation(&mut self, id: i64, cascade: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
-        let Some(directory) = self.registry.relation(id).map(|e| e.directory().to_string()) else {
-            return Ok(());
-        };
-        cascade(self)?;
-        let CatalogEngine { registry, dag, .. } = self;
-        dag.unregister_table(registry, id);
-        self.pending_dir_deletions.push(directory);
-        self.caches.purge_schema_version(id);
-        Ok(())
-    }
-
-    /// The TABLE_TAB / VIEW_TAB register hook. One loop for both families: a
-    /// row's side effect is gated on its NET live state, not its own sign, so a
-    /// rename pair — net-live before and after — fires neither the `+1`
-    /// registration nor the `-1` teardown, in any row order and on every
-    /// application path. Only the per-row registration values and the teardown
-    /// cascade differ by family.
-    fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        for i in self.relation_row_order(family, batch) {
-            let weight = batch.get_weight(i);
-            let id = batch.get_pk(i) as i64;
-            // Storage is applied before hooks fire, so a rename pair reads
-            // net-live and a genuine drop reads net-dead — including at boot
-            // replay, where the pair has already folded to `+1`.
-            let net_live = self.sys_relation(family).has_pk(batch.get_pk_bytes(i));
-
-            if weight > 0 {
-                // System tables are registered by `CatalogEngine::open` before
-                // `replay_catalog` fires hooks, so their rows show up here with
-                // the DAG already populated; a rename pair's `+1` likewise
-                // finds the id already registered. Skip to avoid double-register.
-                // A `+1` whose net folds to dead (a create cancelled within its
-                // own bundle) registers nothing.
-                if !net_live || self.registry.has_id(id) {
-                    continue;
-                }
-                let reg = if family == SysFamily::Table {
-                    read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?
-                } else {
-                    self.view_registration(batch, i, id)?
-                };
-                self.register_relation(reg)?;
-                // Registration leaves a view EMPTY. Filling it is the server's:
-                // `backfill_views_in_dep_order` for a live CREATE,
-                // checkpoint resume, or the master's invalid-view rebuild at boot.
-                // Filling here would double-count against all three.
-            } else if !net_live {
-                // A genuine drop. A rename pair's `-1` is net-live, so this
-                // teardown is skipped and the registration survives untouched.
-                self.drop_relation(id, |s| s.cascade_relation_children(family, id))?;
+        // Derived, not stored: every process builds the same FK circuits from the same
+        // column records.
+        if kind.is_base_table() {
+            for ci in fk_circuit_cols(&schema, &col_defs) {
+                self.registry
+                    .add_index(id, ci as i64, &[ci as u32], false)
+                    .map_err(|e| format!("{} '{name}' (id={id}) FK index on column {ci}: {e}", kind.noun()))?;
             }
         }
+        raise_id_counter(&mut self.next_table_id, id);
+        self.recompute_needs_lock(id);
         Ok(())
     }
 
-    /// The rows of a relation delta in the order the register hook must process
-    /// them: retractions first, then the live rows in dependency order.
-    /// Registering a view reads its sources' stamped `Placement` and `depth`, and
-    /// nothing about the order the hook is handed — a wire bundle's row order, or
-    /// boot replay's walk of VIEW_TAB in PK order — puts a view after the views
-    /// it scans. Without this a view is replicated before a restart and
-    /// partitioned after.
-    /// A table's registration reads no other relation, so TABLE_TAB keeps row
-    /// order.
-    fn relation_row_order(&mut self, family: SysFamily, batch: &Batch) -> Vec<usize> {
-        let mut rows: Vec<usize> = (0..batch.len()).collect();
-        if family != SysFamily::View {
-            return rows;
+    /// Tear relation `id` out of the registry. Its owned system rows are retracted by
+    /// the rows that dropped it (see `apply_bundle_family`), never from here.
+    fn unregister_relation(&mut self, id: i64) {
+        let Some(dir) = self.registry.relation(id).map(|e| e.directory().to_string()) else {
+            return;
+        };
+        self.dag.unregister_table(&mut self.registry, id);
+        self.pending_dir_deletions.push(dir);
+        // Final: `apply_col_names_invalidate` bumps no unregistered owner.
+        self.caches.purge_schema_version(id);
+        self.recompute_needs_lock(id);
+    }
+
+    /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
+    /// create; a rename pair carries both and is neither.
+    fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+        let mut creates: Vec<i64> = Vec::new();
+        let mut row_of: FxHashMap<i64, usize> = FxHashMap::default();
+        for sig in pk_signatures(family, batch) {
+            match (sig.neg, sig.pos) {
+                (Some(_), None) => self.unregister_relation(sig.leading),
+                (None, Some(row)) => {
+                    creates.push(sig.leading);
+                    row_of.insert(sig.leading, row);
+                }
+                _ => {}
+            }
         }
-        // `canonicalize_for_hooks` already put the retractions first, so the live
-        // rows are the suffix from here.
-        let first_live = rows.partition_point(|&i| batch.get_weight(i) <= 0);
-        let ids: Vec<i64> = rows[first_live..].iter().map(|&i| batch.get_pk(i) as i64).collect();
-        let rank: FxHashMap<i64, usize> = self
-            .dag
-            .order_by_view_deps(&self.registry, &ids)
-            .into_iter()
-            .enumerate()
-            .map(|(r, vid)| (vid, r))
-            .collect();
-        // Stable, so a malformed batch's duplicate `+1`s on one id keep row
-        // order among themselves.
-        rows[first_live..].sort_by_key(|&i| rank[&(batch.get_pk(i) as i64)]);
-        rows
+        // Registering a view reads its sources' stamped placement, and neither a wire
+        // bundle nor boot replay's PK-order walk puts a view after the views it scans.
+        if family == SysFamily::View {
+            creates = self.dag.order_by_view_deps(&self.registry, &creates);
+        }
+        for id in creates {
+            // System tables are registered by `open` before replay reaches their rows.
+            if self.registry.has_id(id) {
+                continue;
+            }
+            let row = row_of[&id];
+            let reg = if family == SysFamily::Table {
+                read_table_tab_row(batch, row).map_err(|e| format!("{e} (tid={id})"))?
+            } else {
+                self.view_registration(batch, row, id)?
+            };
+            self.register_relation(reg)?;
+            // A view registers empty; the backfill, checkpoint resume or boot rebuild
+            // fills it.
+        }
+        Ok(())
     }
 
     /// The registration values for VIEW_TAB row `i`: placement folded out of the
@@ -278,7 +232,7 @@ impl CatalogEngine {
         let source_ids = self.dag.get_source_ids(&self.registry, vid);
         self.validate_view_options(vid, name, budgets, owner_view_id, &source_ids)?;
         // Stamping the fold is what makes placement transitive:
-        // `relation_row_order` registers this view after its sources, so a view
+        // `hook_relation_register` registers this view after its sources, so a view
         // over it reads the answer back off one value.
         let CatalogEngine { registry, dag, .. } = self;
         let placement = dag.view_placement(registry, vid, &source_ids, pk.as_slice().len());
@@ -293,109 +247,20 @@ impl CatalogEngine {
         })
     }
 
-    /// Retract the dependent system rows a dropped relation owns: its indices
-    /// (a table) or its circuit (a view), plus its column records either way.
-    ///
-    /// `precheck_family` rejects FK/view-dep-blocked drops before the `-1` row
-    /// reaches the WAL, so the cascade never has to ask whether the drop is
-    /// allowed.
-    ///
-    /// A dropped view also retracts the internal chain segments it owns — the
-    /// client neither names nor knows them, so this is their sole retractor.
-    /// Terminates because segments are flat: every one names the user view as
-    /// its owner, so a segment owns none.
-    ///
-    /// Under compensation ONLY the index cascade runs: the column, circuit and
-    /// segment rows are in compensation's own drained set, so cascading them too
-    /// would retract each twice → a net `-1` ghost. FK auto-indices are the dual
-    /// — `submit_local` never enqueues them, so this cascade is theirs too.
-    fn cascade_relation_children(&mut self, family: SysFamily, id: i64) -> Result<(), String> {
-        if family == SysFamily::Table {
-            self.cascade_retract_indices(id)?;
-        }
-        if self.ctx.in_rollback() {
-            return Ok(());
-        }
-        if family == SysFamily::View {
-            self.cascade_retract_band(SysFamily::CircuitNodes, id)?;
-            self.cascade_retract_segments(id)?;
-        }
-        self.cascade_retract_band(SysFamily::Column, id)
-    }
-
-    fn cascade_retract_segments(&mut self, owner_id: i64) -> Result<(), String> {
-        // Copied out: the submit below re-enters `apply_entity_caches`, which
-        // removes from this very list.
-        let Some(ids) = self.caches.segments_by_owner.get(&owner_id) else {
-            return Ok(());
-        };
-        let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
-        let batch = retract_pk_list(self.sys_relation(SysFamily::View), ids);
-        if !batch.is_empty() {
-            self.submit_cascade(SysFamily::View, batch)?;
-        }
-        Ok(())
-    }
-
-    fn cascade_retract_indices(&mut self, owner_id: i64) -> Result<(), String> {
-        // Copied out: the submit below re-enters `apply_index_caches`, which
-        // removes from this very list.
-        let Some(ids) = self.caches.indices_by_owner.get(&owner_id) else {
-            return Ok(());
-        };
-        let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
-        let batch = retract_pk_list(self.sys_relation(SysFamily::Index), ids);
-        if !batch.is_empty() {
-            self.submit_cascade(SysFamily::Index, batch)?;
-        }
-        Ok(())
-    }
-
-    /// Retract every row of pair-keyed `family` under `leading` — one owner's
-    /// column records, or one view's circuit nodes.
-    fn cascade_retract_band(&mut self, family: SysFamily, leading: i64) -> Result<(), String> {
-        let (start, end) = family.band(leading);
-        let batch = retract_key_range(self.sys_relation(family), start.pk_bytes(), end.pk_bytes());
-        if !batch.is_empty() {
-            self.submit_cascade(family, batch)?;
-        }
-        Ok(())
-    }
-
-    /// True if `col_idx` appends a *trailing* column to registered relation
-    /// `owner_id`. `precheck_column_append` admits exactly this shape and
-    /// `hook_column_alter` recognizes an append by the same test, so the worker
-    /// `ddl_sync` and SAL-replay paths — which bypass precheck entirely — act on
-    /// exactly what the master admitted.
-    pub(super) fn is_trailing_col_append(&self, owner_id: i64, col_idx: u64) -> bool {
-        self.registry
-            .relation(owner_id)
-            .is_some_and(|e| col_idx as usize == e.schema().num_columns())
-    }
-
-    /// Column-ALTER side effect: rebuild the owner's descriptor from the
-    /// (freshly invalidated) column defs and publish it into the store in place.
-    /// A `is_nullable 0→1` flip (DROP NOT NULL) moves the whole-schema payload
-    /// comparator `FixedIntNonnull → Generic`, and a trailing append (ADD COLUMN)
-    /// grows the region count; RENAME/DROP COLUMN reach the rebuild and no-op
-    /// there, since neither changes a descriptor field.
-    ///
-    /// The trigger is the batch's per-PK shape against the owner's
-    /// currently-registered arity, which is what makes it right for the
-    /// compensation path, where the pair arrives negated. Replay carries no
-    /// transition to react to, so it returns before the scan rather than through it.
+    /// Rebuild the descriptor of every registered base table a `+1` column row lands
+    /// on, and publish it if it changed. A CREATE's columns land before its owner
+    /// registers, so only an ALTER reaches the rebuild.
     fn hook_column_alter(&mut self, batch: &Batch) -> Result<(), String> {
         if self.ctx.mode() == ApplyMode::Replay {
             return Ok(());
         }
-        // `pk_signatures` skips `w == 0`, so "no `-1`" is "carries only `+1`s".
-        for sig in pk_signatures(SysFamily::Column, batch) {
-            // COL_TAB PK = `(owner_id, col_idx)`.
-            let (owner, col_idx) = (sig.leading, sig.pk as u64);
-            let is_append = sig.neg.is_none() && self.is_trailing_col_append(owner, col_idx);
-            if !(sig.is_pair() || is_append) {
-                continue;
-            }
+        let mut owners: Vec<i64> = batch
+            .live_rows()
+            .map(|i| SysFamily::Column.leading_id(batch.get_pk(i)))
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        for owner in owners {
             let Some(cur) = self
                 .registry
                 .relation(owner)
@@ -407,8 +272,6 @@ impl CatalogEngine {
             // Rebuild from the post-invalidate col defs. `cur.placement()` is
             // construction, not a workaround for `eq` ignoring it: without it the
             // rebuild is stamped KEYED_DEFAULT and loses CLUSTER BY / REPLICATED.
-            // Only an is_nullable 0→1 flip or a trailing append changes the
-            // descriptor; when it does, publish it into the store.
             let col_defs = self.read_column_defs(owner);
             let rebuilt =
                 build_schema_from_col_defs(RelationKind::BaseTable, &col_defs, cur.pk_indices(), cur.placement())
@@ -421,10 +284,9 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// The IDX_TAB register hook: a sign dispatch over the batch, mirroring
-    /// `hook_relation_register`. `apply_index_caches` has already populated the
-    /// name-indexed caches from `IDXTAB_PAY_NAME`, so neither half below reads
-    /// that string.
+    /// The IDX_TAB register hook: a sign dispatch over the batch.
+    /// `apply_index_caches` has already populated the name-indexed caches from
+    /// `IDXTAB_PAY_NAME`, so neither half below reads that string.
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as i64;
@@ -449,9 +311,8 @@ impl CatalogEngine {
     /// unique iff ANY index on the column list is unique — so replay reconstructs
     /// an identical result whatever order the index ids arrive in.
     fn register_index(&mut self, idx_id: i64, owner_id: i64, cols: &PkColList, is_unique: bool) -> Result<(), String> {
-        // Keep worker next_index_id in sync with master-assigned IDs so that
-        // create_fk_indices → allocate_index_id never collides with an explicit
-        // user index that was broadcast via IDX_TAB +1.
+        // Keep next_index_id past every applied id, so the counter never reissues a
+        // client-allocated id whose in-memory advance a crash lost.
         raise_id_counter(&mut self.next_index_id, idx_id);
 
         // Boot replay and worker ddl_sync reach this hook without
@@ -461,8 +322,10 @@ impl CatalogEngine {
         let entry = self.validate_index_registration(owner_id)?;
 
         if let Some(was_unique) = entry.index_on(cols.as_slice()).map(|ic| ic.is_unique()) {
+            // No second store: the index schema does not depend on `is_unique`,
+            // and the duplicate check is the master's pre-flight, already run.
             if is_unique && !was_unique {
-                self.promote_index_to_unique(owner_id, cols.as_slice());
+                self.registry.set_index_unique(owner_id, cols.as_slice(), true);
             }
             return Ok(());
         }
@@ -492,11 +355,11 @@ impl CatalogEngine {
             // copies). Workers and standalone backfill from their local base slice
             // — unless the store resumed from a checkpointed manifest, which
             // already holds those rows.
-            if !self.ctx.in_rollback() && !self.is_master && !resumed {
+            if !self.is_master && !resumed {
                 if let Err(e) = self.backfill_index(owner_id, cols.as_slice()) {
                     // The circuit was entered before the backfill so the
                     // projection could ingest through it; a failed CREATE INDEX
-                    // leaves no circuit.
+                    // leaves no circuit. `staged_dir` reclaims its directory.
                     self.registry.remove_index(owner_id, cols.as_slice());
                     return Err(e);
                 }
@@ -505,52 +368,25 @@ impl CatalogEngine {
         })
     }
 
-    /// Demote or destroy `owner_id`'s circuit on `cols` after a `-1` IDX_TAB row
-    /// — the `-1` half of [`Self::hook_index_register`]. The retraction is
-    /// already applied to sys_indices when hooks fire, so its net weight is 0 and
-    /// the scan below sees only what survives it.
+    /// Demote or destroy `owner_id`'s circuit on `cols` after a `-1` IDX_TAB row. It
+    /// survives while another index row or the owner's FK columns still cover `cols`.
     fn unregister_index(&mut self, owner_id: i64, cols: &[u32]) {
-        let mut remains: Option<bool> = None;
-        self.for_each_index_on_cols(owner_id, cols, |_row_id, is_uniq| {
-            *remains.get_or_insert(false) |= is_uniq;
-        });
-        if let Some(remains_unique) = remains {
-            // Another index (e.g. the FK auto-index) still covers this column
-            // list. Demote the circuit rather than destroying it.
-            self.registry.set_index_unique(owner_id, cols, remains_unique);
-            return;
+        let survivors = self.indices_on_cols(owner_id, cols);
+        let fk_circuit = match (cols, self.registry.relation(owner_id).map(|e| e.schema())) {
+            ([c], Some(schema)) => {
+                let col_defs = self.read_column_defs(owner_id);
+                let hit = fk_circuit_cols(&schema, &col_defs).any(|ci| ci == *c as usize);
+                hit
+            }
+            _ => false,
+        };
+        if survivors.is_empty() && !fk_circuit {
+            if let Some(dir) = self.registry.remove_index(owner_id, cols) {
+                self.pending_dir_deletions.push(dir);
+            }
+        } else {
+            self.registry
+                .set_index_unique(owner_id, cols, survivors.iter().any(|&(_, u)| u));
         }
-        // No index remains on the column list — drop the circuit. The directory
-        // path uses the *creating* index_id, not the dropped one: when a second
-        // index promoted an incumbent circuit, the real directory on disk carries
-        // the first registrant's id.
-        let creating = self
-            .registry
-            .relation(owner_id)
-            .and_then(|e| e.index_on(cols))
-            .map(SecondaryIndex::id)
-            .and_then(|id| self.registry.index_dir(owner_id, id));
-        if let Some(idx_dir) = creating {
-            self.registry.remove_index(owner_id, cols);
-            self.pending_dir_deletions.push(idx_dir);
-        }
-    }
-
-    fn hook_cascade_fk(&mut self, batch: &Batch) -> Result<(), String> {
-        // Live only. Replay and compensation both restore the persisted IDX_TAB
-        // rows themselves, so minting here would duplicate them under fresh ids.
-        // Gated before the fold, which is otherwise a pass over every table in the
-        // database on the boot full scan.
-        if self.ctx.mode() != ApplyMode::Live {
-            return Ok(());
-        }
-        // Paired tids excluded: an auto-index name embeds the *current* table
-        // name, so a rename's `+1` would mint a second one its by-name dedup
-        // cannot suppress. Read off the batch, because this hook also fires where
-        // no master-threaded set exists (worker `ddl_sync`, SAL-tail recovery).
-        for tid in family_pk_partition(SysFamily::Table, batch).creates {
-            self.create_fk_indices(tid)?;
-        }
-        Ok(())
     }
 }

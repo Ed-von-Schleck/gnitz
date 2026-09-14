@@ -301,8 +301,8 @@ fn relation_names_are_case_insensitive() {
     assert!(client.resolve_table_id(&sn, "foo").is_err());
 }
 
-/// `__fk_` is reserved nowhere: an internal FK index is flagged, not named, so
-/// every surface that mints a user name accepts the infix.
+/// `__fk_` is reserved nowhere: an FK index has no name at all, so every
+/// surface that mints a user name accepts the infix.
 #[test]
 fn the_fk_infix_is_reserved_nowhere() {
     let (_srv, mut client, sn) = boot(1);

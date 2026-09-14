@@ -137,8 +137,7 @@ fn test_index_registration_failure_no_broadcast_poisoning_internal() {
     // Clear broadcasts accumulated by table/column creation + ingest.
     let _ = engine.drain_pending_broadcasts();
 
-    // The id `create_index` is about to allocate; no FK column draws from the
-    // counter here.
+    // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_index_id;
     assert!(
         engine.create_index("public.t", &["val"], true).is_err(),
@@ -473,33 +472,31 @@ fn test_drop_table_cascades_fk_index() {
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
-    let fk_idx_name = make_fk_index_name(child_tid, 1);
     assert!(
-        engine.caches.index_by_name.contains_key(fk_idx_name.as_str()),
-        "FK index must be auto-created with the child table"
+        engine
+            .registry()
+            .relation(child_tid)
+            .is_some_and(|e| e.index_on(&[1]).is_some()),
+        "the FK column's circuit must be derived with the child table"
     );
 
-    // drop_index refuses to drop an internal index, so drop_table is the only
-    // valid path for this cleanup. Before the fix: the on_index_delta
-    // hook's internal-index guard blocked drop_table from cascading.
     engine.drop_table("public.child").unwrap();
-    assert!(
-        !engine.caches.index_by_name.contains_key(fk_idx_name.as_str()),
-        "FK index must be removed by drop_table cascade"
-    );
+    assert!(!engine.registry().has_id(child_tid));
 
-    // Reopen catalog — must succeed.
+    // Reopen catalog — must succeed, and no catalog index names the child.
     engine.close();
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine2.caches.index_by_name.contains_key(fk_idx_name.as_str()));
+    assert!(!engine2.registry().has_id(child_tid));
+    assert!(
+        !engine2.caches.indices_by_owner.contains_key(&child_tid)
+            && !engine2.caches.index_by_name.values().any(|&id| id == child_tid),
+        "no index row may exist for the dropped child"
+    );
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Regression: indices_by_owner cache drives cascade_retract_indices ──
-// drop_table must cascade-retract ALL owned indices. The cache is what names
-// them, so it must track every idx_id under the same owner — `retract_pk_list`
-// then emits one batch carrying a `-1` for each.
+// ── drop_table retracts every index the table owns ──
 
 #[test]
 fn test_drop_table_cascades_multiple_indices() {
@@ -713,8 +710,7 @@ fn test_failed_index_registration_rolls_back_cleanly_internal() {
     engine.registry_mut().flush(tid).unwrap();
 
     let idx_name = make_secondary_index_name("public", "t", "val");
-    // The id `create_index` is about to allocate; no FK column draws from the
-    // counter here.
+    // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_index_id;
 
     let result = engine.create_index("public.t", &["val"], true);
@@ -809,17 +805,19 @@ fn test_seek_by_index_orphan_entry_terminates() {
 
 #[test]
 fn drop_table_purges_the_schema_version_counter() {
-    // Regression for the post-cascade purge. Dropping a table must remove its
-    // schema_version entry. The drop cascade re-ingests COL_TAB retractions
-    // whose applier `or_insert`s the counter straight back, so a removal in
-    // apply_entity_caches (which fires *before* the cascade) is immediately
-    // undone — leaking memory for a tid that is never reused. The purge runs at
-    // the tail of the drop hook, after the cascade, so it must end up absent.
+    // Dropping a table must remove its schema_version entry, or it leaks for a
+    // tid that is never reused. The purge is `unregister_relation`'s.
     let (mut engine, tid, dir) = table_fixture(
         "drop_purges_versions",
         &[col_def("id", type_code::U64), col_def("val", type_code::I64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
+
+    // A column rename bumps the registered table's version, creating the entry.
+    let rename = col_alter_pair(tid, OWNER_KIND_TABLE, 1, &col_def("val", type_code::I64), |c| {
+        c.name = "val2".into()
+    });
+    engine.submit(SysFamily::Column, rename).unwrap();
 
     assert!(
         engine.caches.schema_version.contains_key(&tid),
@@ -830,7 +828,7 @@ fn drop_table_purges_the_schema_version_counter() {
 
     assert!(
         !engine.caches.schema_version.contains_key(&tid),
-        "schema_version must be purged post-cascade (the column retraction re-creates it)"
+        "schema_version must be purged by the drop"
     );
 
     engine.close();
@@ -870,25 +868,16 @@ fn test_create_unique_index_on_string_blob_rejected() {
 
 // ── UNIQUE+FK promotion / demotion (column-level unique constraint) ───────
 //
-// A column that is BOTH a foreign key and UNIQUE registers its FK auto-index
-// (non-unique) first; the later unique index must PROMOTE that incumbent
-// circuit, not be deduped away. DROP INDEX of the user unique index must DEMOTE
-// (the FK auto-index remains), not destroy the circuit.
+// A UNIQUE index on an FK column promotes the column's FK circuit; dropping it
+// demotes the circuit rather than destroying it.
 
 /// Uniqueness of the index circuit on `col`, or `None` if no circuit exists.
 fn circuit_unique(engine: &CatalogEngine, tid: i64, col: u32) -> Option<bool> {
-    let n = engine.registry().relation(tid).map_or(&[][..], Relation::indexes).len();
-    (0..n)
-        .filter_map(|i| {
-            engine
-                .registry()
-                .relation(tid)
-                .map_or(&[][..], Relation::indexes)
-                .get(i)
-                .map(|ic| (ic.cols(), ic.is_unique()))
-        })
-        .find(|(c, _)| c.as_slice() == [col])
-        .map(|(_, u)| u)
+    engine
+        .registry()
+        .relation(tid)
+        .and_then(|e| e.index_on(&[col]))
+        .map(SecondaryIndex::is_unique)
 }
 
 /// Count `idx_*` sub-directories under a table directory.
@@ -900,6 +889,48 @@ fn count_idx_dirs(tbl_dir: &str) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+/// Registered through `ddl_sync`, an FK column's circuit has no IDX_TAB row and
+/// outlives the UNIQUE index that promoted it.
+#[test]
+fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
+    let dir = temp_dir("fk_circuit_derived");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let parent_tid = engine
+        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
+        .unwrap();
+    let idx_rows_before = count_records(engine.sys_relation(SysFamily::Index).cursor());
+
+    let child_tid = engine.next_table_id;
+    let cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("refc", type_code::U64, parent_tid, 0),
+    ];
+    engine
+        .register_table(child_tid, PUBLIC_SCHEMA_ID, "child", &cols, &[0])
+        .unwrap();
+    let circuit_id = engine
+        .registry()
+        .relation(child_tid)
+        .and_then(|e| e.index_on(&[1]))
+        .map(SecondaryIndex::id);
+    assert_eq!(circuit_id, Some(1));
+    assert_eq!(
+        count_records(engine.sys_relation(SysFamily::Index).cursor()),
+        idx_rows_before
+    );
+
+    engine.create_index("public.child", &["refc"], true).unwrap();
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
+    engine
+        .drop_index(&make_secondary_index_name("public", "child", "refc"))
+        .unwrap();
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
+    assert!(engine.pending_dir_deletions.is_empty());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -997,8 +1028,7 @@ fn test_failed_create_index_leaves_no_directory_internal() {
     engine.registry_mut().flush(tid).unwrap();
 
     let tbl_dir = format!("{dir}/public/t_{tid}");
-    // The id `create_index` is about to allocate; no FK column draws from the
-    // counter here.
+    // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_index_id;
     assert!(engine.create_index("public.t", &["val"], true).is_err());
     assert_eq!(
@@ -2614,6 +2644,40 @@ fn test_seek_by_index_multi_value_regression() {
         .unwrap()
         .0;
     assert_eq!(result_triples(rr), vec![(1, 10, 1), (2, 20, 1)]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Compensating a DROP INDEX refills the restored circuit ───────────────
+
+#[test]
+fn compensated_drop_index_refills_the_restored_circuit() {
+    let (mut engine, tid, dir) = table_fixture(
+        "compensated_drop_index_refills",
+        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+    );
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(20u128, 1);
+    bb.put_u64(200);
+    bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
+
+    let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
+    let _ = engine.drain_pending_broadcasts();
+
+    let drop = retract_pk_list(engine.sys_relation(SysFamily::Index), vec![idx_id as u128]);
+    engine.precheck_family(SysFamily::Index, &drop).unwrap();
+    engine.apply_bundle_family(SysFamily::Index, drop, &mut None).unwrap();
+    assert!(engine.registry().relation(tid).unwrap().index_on(&[1]).is_none());
+
+    engine.compensate_stage_a(None).unwrap();
+
+    let found = engine.registry_mut().seek_by_index(tid, &[1], &[200u128]).unwrap().0;
+    let row = found.expect("the restored index must hold the flushed row");
+    assert_eq!(row.get_pk(0), 20);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

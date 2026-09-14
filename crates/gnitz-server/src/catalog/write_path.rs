@@ -1,65 +1,94 @@
-//! Catalog write-path spine — the ingest/apply pipeline every system-table
-//! mutation flows through: `submit` → `precheck_family` → `apply_local` →
-//! `fire_hooks`, plus the broadcast queue, the directory-deletion queues, and
-//! Stage-A (DDL rollback) compensation. The three steps it delegates live in
-//! their own modules: `precheck.rs`, `hooks.rs`, and `sys_tables.rs` /
-//! `apply_context.rs` for `SysFamily` / `ApplyContext`.
+//! Catalog write path: `precheck_family` → `apply_bundle_family` → `apply_local`
+//! → `fire_hooks`, the broadcast and directory-deletion queues, and Stage-A
+//! (DDL rollback) compensation.
 
 use rustc_hash::FxHashMap;
 use std::num::NonZeroU64;
 
 use super::*;
 
+/// Every id `map` lists under any of `owners`, widened to the key width
+/// `retract_pk_list` takes.
+fn owned_ids(map: &FxHashMap<i64, Vec<i64>>, owners: &[i64]) -> Vec<u128> {
+    owners
+        .iter()
+        .filter_map(|o| map.get(o))
+        .flatten()
+        .map(|&id| id as u128)
+        .collect()
+}
+
 impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
 
-    /// Apply one system-family delta and enqueue it for broadcast: precheck →
-    /// storage write → `fire_hooks` → enqueue. The batch is taken by value so the
-    /// applier moves it straight into `pending_broadcasts` (one storage clone, no
-    /// hooks clone); the cascades that drop columns/indices/circuit rows are the
-    /// applier's declared reaction to a retraction, fired from inside
-    /// `fire_hooks`, not the emitter's concern.
-    ///
-    /// Not the client boundary: a `DDL_TXN` spells the same two steps inline, as a
-    /// `precheck_family` + [`Self::apply_and_enqueue_family`] pair, so it can tell
-    /// a precheck rejection from a post-apply failure.
+    /// Precheck, apply and enqueue one system-family delta — the in-process test
+    /// spelling of one `DDL_TXN` family step.
+    #[cfg(test)]
     pub(crate) fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
-        if self.ctx.in_rollback() {
-            // During rollback all cascade writes must bypass pending_broadcasts
-            // so no compensating row is re-broadcast to workers.
-            return self.submit_local(family, batch);
-        }
         self.precheck_family(family, &batch)?;
-        self.apply_and_enqueue_family(family, batch)
+        self.apply_bundle_family(family, batch, &mut None)
     }
 
-    /// Apply locally without enqueuing a broadcast. ONLY for rows the workers
-    /// already produce themselves (FK indices auto-created from the same
-    /// `TABLE_TAB` delta), for rollback compensation, and for [`Self::ddl_sync`],
-    /// where the delta being applied IS the broadcast. Re-broadcasting these
-    /// would deliver phantom deltas.
-    ///
-    /// No LSN pin: local applies own no zone's durability. `None` is deliberate
-    /// even while a DDL zone is active — these rows are not in the SAL, so
-    /// pinning their family's `current_lsn` would advance the recovery dedup
-    /// watermark with no matching SAL group.
+    /// Apply without enqueueing and without an LSN pin: for [`Self::ddl_sync`],
+    /// whose delta is the broadcast, and compensation, whose rows never reach the SAL.
     pub(in crate::catalog) fn submit_local(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
         self.apply_local(family, &mut batch, None)
     }
 
-    /// [`Self::submit`] for a row the applier built itself: an owner-drop
-    /// cascade's `-1`, copied out of the very store the precheck would re-read.
-    /// Skips the precheck, because there is nothing left for it to check —
-    /// its CAS compares the copy against its own source, its guards exist to
-    /// police a *standalone* user DROP (the owner's drop already passed its own
-    /// FK/view-dep precheck), and its CREATE arms cannot fire on an all-negative
-    /// batch. Keeps `submit`'s rollback redirect: a compensating cascade must
-    /// still bypass the broadcast queue.
-    pub(super) fn submit_cascade(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
-        if self.ctx.in_rollback() {
-            return self.submit_local(family, batch);
+    /// Apply and enqueue one `DDL_TXN` family behind the retraction of every system
+    /// row its dropped relations own. `applied` holds the batch applied but not yet
+    /// enqueued, which `compensate_stage_a` must negate beyond the queue.
+    pub(crate) fn apply_bundle_family(
+        &mut self,
+        family: SysFamily,
+        batch: Batch,
+        applied: &mut Option<(SysFamily, Batch)>,
+    ) -> Result<(), String> {
+        for (family, batch) in self.behind_owned_retractions(family, batch) {
+            *applied = Some((family, batch.clone()));
+            self.apply_and_enqueue_family(family, batch)?;
+            *applied = None;
         }
-        self.apply_and_enqueue_family(family, batch)
+        Ok(())
+    }
+
+    /// `batch`, preceded by one retraction batch per family of the rows its dropped
+    /// relations own. The retractions copy live rows, so they need no precheck.
+    fn behind_owned_retractions(&self, family: SysFamily, mut batch: Batch) -> Vec<(SysFamily, Batch)> {
+        let mut owners = match family {
+            SysFamily::Table | SysFamily::View => family_pk_partition(family, &batch).drops,
+            _ => Vec::new(),
+        };
+        if owners.is_empty() {
+            return vec![(family, batch)];
+        }
+        if family == SysFamily::View {
+            // A view's segments drop in its own batch, unless the bundle already names them.
+            let segs: Vec<u128> = owned_ids(&self.caches.segments_by_owner, &owners)
+                .into_iter()
+                .filter(|&s| !owners.contains(&(s as i64)))
+                .collect();
+            owners.extend(segs.iter().map(|&s| s as i64));
+            let mut merged = retract_pk_list(self.sys_relation(SysFamily::View), segs);
+            merged.append_batch(&batch, 0, batch.len());
+            batch = merged;
+        }
+        owners.sort_unstable();
+        let owned = if family == SysFamily::Table {
+            let ids = owned_ids(&self.caches.indices_by_owner, &owners);
+            (
+                SysFamily::Index,
+                retract_pk_list(self.sys_relation(SysFamily::Index), ids),
+            )
+        } else {
+            let rel = self.sys_relation(SysFamily::CircuitNodes);
+            (
+                SysFamily::CircuitNodes,
+                retract_bands(rel, SysFamily::CircuitNodes, &owners),
+            )
+        };
+        let columns = retract_bands(self.sys_relation(SysFamily::Column), SysFamily::Column, &owners);
+        vec![owned, (SysFamily::Column, columns), (family, batch)]
     }
 
     /// Worker DDL sync: apply a master-broadcast system-table delta. Workers
@@ -114,18 +143,14 @@ impl CatalogEngine {
 
     // -- Broadcast / dir-deletion queues ------------------------------------
 
-    /// Apply one system-family delta to storage, fire its hooks, and enqueue it
-    /// for broadcast — the mutating half of [`Self::submit`], pinned
-    /// to the open DDL zone LSN. Takes the batch by value so it moves straight
-    /// into `pending_broadcasts` (one storage clone, no hooks clone). Enqueue
-    /// happens after hooks so nested cascade pushes land first and the executor
-    /// broadcasts children → parent; empty batches are dropped so worker-side
-    /// no-op cascades don't accumulate unread entries.
+    /// Apply one system-family delta pinned to the open DDL zone LSN, and enqueue
+    /// it for broadcast. An empty batch applies and queues nothing.
     pub(crate) fn apply_and_enqueue_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
-        self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
-        if !batch.is_empty() {
-            self.pending_broadcasts.push((family, batch));
+        if batch.is_empty() {
+            return Ok(());
         }
+        self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
+        self.pending_broadcasts.push((family, batch));
         Ok(())
     }
 
@@ -351,14 +376,10 @@ impl CatalogEngine {
 
         // Replay each with negated weight through the no-broadcast path.
         // fire_hooks still fires so caches, the registry, and pending_dir_deletions
-        // are updated. The rollback gate in `submit` ensures any cascade that
-        // calls back into `submit` also bypasses broadcasts.
-        let result = self.with_rollback_compensation(|s| -> Result<(), String> {
-            for (family, mut batch) in undo_create {
-                batch.map_weights(i64::wrapping_neg);
-                s.submit_local(family, batch)?;
-            }
-            Ok(())
+        // are updated.
+        let result = undo_create.into_iter().try_for_each(|(family, mut batch)| {
+            batch.map_weights(i64::wrapping_neg);
+            self.submit_local(family, batch)
         });
 
         // Everything the rollback queued is a creation that never committed.

@@ -332,3 +332,23 @@ def test_the_unique_index_an_fk_resolves_through_cannot_be_dropped(client, schem
     with pytest.raises(gnitz.GnitzError, match="(?i)integrity"):
         client.execute_sql("DROP INDEX p_code", schema_name=sn)
     client.execute_sql("DROP TABLE c; DROP INDEX p_code", schema_name=sn)
+
+
+@NEEDS_MULTI
+def test_restrict_survives_dropping_a_unique_index_on_the_fk_column(client, schema_name):
+    """Dropping a UNIQUE index on an FK column keeps the column's FK circuit on
+    every worker."""
+    sn = schema_name
+    client.execute_sql(
+        _PARENT + "; "
+        # Moves the index-id counters, which FK circuits must not depend on.
+        "CREATE INDEX parent_val ON parent(val); "
+        "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
+        " pid BIGINT NOT NULL UNIQUE REFERENCES parent(id))",
+        schema_name=sn)
+    insert(client, sn, "parent", [(1, 100)])
+    insert(client, sn, "child", [(10, 1)])
+    client.execute_sql(f"DROP INDEX {sn}__child__idx_pid", schema_name=sn)
+    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+        client.execute_sql("DELETE FROM parent WHERE id = 1", schema_name=sn)
+    client.execute_sql("DROP TABLE child; DROP TABLE parent", schema_name=sn)

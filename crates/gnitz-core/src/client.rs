@@ -926,9 +926,7 @@ impl GnitzClient {
                 owner_id: table_id,
                 source_col_idx: gnitz_wire::pack_pk_cols(col_indices),
                 name: &index_name,
-                // A client-authored index is never internal; the precheck
-                // rejects a `+1` that claims otherwise.
-                flags: gnitz_wire::IndexProps { is_unique, is_internal: false }.pack(),
+                flags: gnitz_wire::IndexProps { is_unique }.pack(),
             },
             1,
         );
@@ -1289,7 +1287,7 @@ impl GnitzClient {
                             owner_id: new_tid,
                             source_col_idx: gnitz_wire::pack_pk_cols(spec.col_indices),
                             name: &index_names[k],
-                            flags: gnitz_wire::IndexProps { is_unique: true, is_internal: false }.pack(),
+                            flags: gnitz_wire::IndexProps { is_unique: true }.pack(),
                         },
                         1,
                     );

@@ -29,17 +29,8 @@ pub(super) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 }
 
 impl CatalogEngine {
-    /// Emit the single retraction delta for `pk` in `family`: seek the live row,
-    /// copy it with weight −1, and submit it through the one applied-delta path.
-    /// The drop cascade is the applier's reaction to that −1 (fired from
-    /// `fire_hooks`), not the caller's concern. Reads through the immutable
-    /// `sys_relation` accessor; the `submit` move comes after.
-    /// `retract_pk_list` returns an empty batch when the PK is absent
-    /// or already retracted; emitters resolve the friendly "does not exist"
-    /// message from the caches before calling, so the `count == 0` arm only
-    /// fires on cache/storage divergence.
-    /// Only these fixture drop paths retract engine-side; production
-    /// retractions arrive as wire deltas.
+    /// Retract the live row at `pk` in `family` through `submit`, which expands the
+    /// drop cascade.
     pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
         let batch = retract_pk_list(self.sys_relation(family), vec![pk]);
         if batch.is_empty() {
@@ -169,11 +160,6 @@ impl CatalogEngine {
             .get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
 
-        // Retract only the TABLE_TAB row. Its -1 fires hook_relation_register,
-        // which cascades cascade_retract_indices + cascade_retract_columns. The
-        // cascade lives in the hook (not inline) so WAL replay and worker sync —
-        // which re-apply the -1 without calling drop_table — clean up
-        // identically.
         self.submit_retraction(SysFamily::Table, tid as u128)
     }
 
@@ -192,12 +178,6 @@ impl CatalogEngine {
         // cascade's the registry guard still resolves it.
         self.dag.invalidate(vid);
 
-        // Retract only the VIEW_TAB row. Its -1 fires hook_relation_register, which
-        // cascades cascade_retract_circuit + cascade_retract_columns and queues
-        // the view directory for deferred deletion (the executor removes it
-        // after the DDL zone is durable, so no delete races the WAL fdatasync).
-        // Keeping the cascade in the hook makes replay and worker sync clean up
-        // identically.
         self.submit_retraction(SysFamily::View, vid as u128)
     }
 
@@ -243,7 +223,7 @@ impl CatalogEngine {
             owner_id,
             packed_cols,
             &index_name,
-            gnitz_wire::IndexProps { is_unique, is_internal: false },
+            gnitz_wire::IndexProps { is_unique },
             1,
         );
         self.precheck_family(SysFamily::Index, &batch)?;
@@ -258,10 +238,10 @@ impl CatalogEngine {
                 owner_id,
                 packed_cols,
                 &index_name,
-                gnitz_wire::IndexProps { is_unique, is_internal: false },
+                gnitz_wire::IndexProps { is_unique },
                 -1,
             );
-            self.rollback_index_registration(undo, index_id).unwrap();
+            self.submit_local(SysFamily::Index, undo).unwrap();
             // The index directory is already gone: the hook staged it before
             // `Table::new`, and `with_staged_dir` reclaims a stage whose
             // closure failed. Nothing queued it here — the `-1` retraction

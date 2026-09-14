@@ -58,10 +58,7 @@ fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut Catalog
         let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
             continue;
         };
-        // `ddl_sync`, not `submit`: these rows are master-validated by
-        // definition, and re-running the precheck would false-reject a replayed DROP
-        // TABLE cascade. Hooks still fire, so an ALTER in the tail reaches the base
-        // before the pushes that depend on it.
+        // `ddl_sync`: master-validated rows that already carry a drop's children.
         catalog.ddl_sync(msg.target_id as i64, batch).map_err(|e| {
             format!(
                 "SAL system-table recovery apply failed (table_id={}, lsn={}): {e}",

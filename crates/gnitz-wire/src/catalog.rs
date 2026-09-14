@@ -850,29 +850,22 @@ const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 
 /// `IDX_TAB.flags` bit 0: the index enforces uniqueness.
 const INDEX_FLAG_UNIQUE: u64 = 1 << 0;
-/// `IDX_TAB.flags` bit 1: the index is engine-internal — created by the FK
-/// auto-index hook, not by any user statement, and undroppable through
-/// `DROP INDEX`.
-const INDEX_FLAG_INTERNAL: u64 = 1 << 1;
 
-/// The logical content of `IDX_TAB.flags`. A struct rather than two bools
-/// passed positionally, because a transposed call would silently make a user
-/// index undroppable.
+/// The logical content of `IDX_TAB.flags`.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
 pub struct IndexProps {
     pub is_unique: bool,
-    /// Engine-internal: the FK auto-index. **A client may never set this** — the
-    /// catalog precheck rejects a `+1` carrying it, because an index flagged
-    /// internal is one `DROP INDEX` refuses, so one frame would otherwise
-    /// permanently deny a name in the index namespace.
-    pub is_internal: bool,
 }
 
 impl IndexProps {
     /// Pack the persisted `IDX_TAB.flags` u64. Inverse of [`Self::from_flags`].
     #[inline]
     pub fn pack(self) -> u64 {
-        (if self.is_unique { INDEX_FLAG_UNIQUE } else { 0 }) | (if self.is_internal { INDEX_FLAG_INTERNAL } else { 0 })
+        if self.is_unique {
+            INDEX_FLAG_UNIQUE
+        } else {
+            0
+        }
     }
 
     /// Decode a persisted `IDX_TAB.flags` u64. Reserved bits are ignored, so a
@@ -881,7 +874,6 @@ impl IndexProps {
     pub fn from_flags(flags: u64) -> IndexProps {
         IndexProps {
             is_unique: flags & INDEX_FLAG_UNIQUE != 0,
-            is_internal: flags & INDEX_FLAG_INTERNAL != 0,
         }
     }
 }

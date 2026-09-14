@@ -1,7 +1,7 @@
 //! Secondary-index construction: the chunked base-table scan that projects into
-//! an index circuit's store, its two entry points (a fresh CREATE INDEX and the
-//! worker's boot rebuild), the UNIQUE promote, and FK auto-index creation. The
-//! store itself is the registry's — opened by `add_index`, rehomed by `rehome`.
+//! an index circuit's store, and its two entry points (a fresh CREATE INDEX and
+//! the worker's boot rebuild). The store itself is the registry's — opened by
+//! `add_index`, rehomed by `rehome`.
 
 use super::*;
 use gnitz_foundation::fault::Seam;
@@ -12,21 +12,6 @@ use gnitz_foundation::fault::Seam;
 static INDEX_BACKFILL_ERROR: Seam = Seam::new("GNITZ_INJECT_INDEX_BACKFILL_ERROR");
 
 impl CatalogEngine {
-    /// Locally retract an index registration whose +1 was applied but never
-    /// broadcast. `Err` means the rollback itself failed, leaving the +1 in
-    /// sys_indices while the client is handed an error — a permanently diverged
-    /// catalog, and the next boot's replay would open a missing index directory.
-    /// The caller that owns a watchdog fail-stops on it, matching
-    /// `compensate_stage_a`'s rollback.
-    pub(super) fn rollback_index_registration(&mut self, undo: Batch, index_id: i64) -> Result<(), String> {
-        self.submit_local(SysFamily::Index, undo).map_err(|undo_err| {
-            format!(
-                "catalog: index registration rollback failed (index_id={index_id}): {undo_err} \
-                 — catalog state permanently diverged"
-            )
-        })
-    }
-
     // -- Index backfill (scan source, project into index table) ------------
 
     /// Fill the circuit on `cols` of `owner_id` from the owner's local slice.
@@ -114,79 +99,6 @@ impl CatalogEngine {
                 }
                 ic.ingest_owned_batch(projected)
                     .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Fold uniqueness into the incumbent circuit on `col_idx` — an FK
-    /// auto-index or a prior non-unique index the per-column dedup kept. No
-    /// second store: the index schema does not depend on `is_unique`, and the
-    /// duplicate check is the master's pre-flight, already run.
-    pub(in crate::catalog) fn promote_index_to_unique(&mut self, owner_id: i64, col_indices: &[u32]) {
-        self.registry.set_index_unique(owner_id, col_indices, true);
-    }
-
-    // -- FK auto-index creation -------------------------------------------
-
-    pub(in crate::catalog) fn create_fk_indices(&mut self, table_id: i64) -> Result<(), String> {
-        // An unregistered owner has no columns to auto-index; checked before the
-        // COL_TAB read so the miss costs nothing. The registered schema is where
-        // the PK list lives: `register_relation` builds it from the same
-        // `TABLE_TAB.pk_col_idx` the row persisted.
-        let Some(owner_schema) = self.registry.relation(table_id).map(|e| e.schema()) else {
-            return Ok(());
-        };
-        let col_defs = self.read_column_defs(table_id);
-
-        for (col_idx, cd) in col_defs.iter().enumerate() {
-            if cd.fk_table_id == 0 {
-                continue;
-            }
-            // Skip every PK column: the PK region already stores them, so an
-            // FK whose column is part of the PK needs no separate auto-index.
-            if owner_schema.is_pk_col(col_idx) {
-                continue;
-            }
-            let index_name = make_fk_index_name(table_id, col_idx);
-            if self.caches.index_by_name.contains_key(&index_name) {
-                continue;
-            }
-
-            let index_id = self
-                .allocate_index_id()
-                .map_err(|e| format!("index id allocation failed: {e}"))?;
-
-            let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
-            gnitz_wire::sys_rows::write_idx_tab_row(
-                &mut bb,
-                &gnitz_wire::sys_rows::IdxTabRow {
-                    index_id: index_id as u64,
-                    owner_id: table_id as u64,
-                    source_col_idx: gnitz_wire::pack_pk_cols(&[col_idx as u32]),
-                    name: &index_name,
-                    // FK auto-indices are not unique. `submit_local` bypasses the
-                    // precheck, and is the only path allowed to set the internal bit.
-                    flags: gnitz_wire::IndexProps { is_unique: false, is_internal: true }.pack(),
-                },
-                1,
-            );
-            let batch = bb.finish();
-            // hook_cascade_fk fires on master and every worker, so each side
-            // creates its own FK indices locally; submit_local applies + fires
-            // hooks without a broadcast. submit would broadcast IDX_TAB before
-            // TABLE_TAB and duplicate the rows the worker already produced.
-            if let Err(e) = self.submit_local(SysFamily::Index, batch) {
-                // Reverse the storage write and any partial cache updates
-                // locally — nothing was broadcast — or the next boot's replay
-                // opens a missing index directory and crashes. Built from the
-                // LIVE row, as `build_seq_delta` is: the failure can precede the
-                // `+1` landing, and a `-1` matching nothing persists as a ghost.
-                let undo = retract_pk_list(self.sys_relation(SysFamily::Index), vec![index_id as u128]);
-                if !undo.is_empty() {
-                    self.rollback_index_registration(undo, index_id)?;
-                }
-                return Err(e);
             }
         }
         Ok(())

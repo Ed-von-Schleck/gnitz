@@ -43,7 +43,9 @@ pub(super) const SEQ_ID_CHECKPOINT_GEN: i64 = 4;
 pub(super) const SEQ_ID_TOPOLOGY: i64 = 5;
 
 pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
+/// Above every column index, so a catalog index's `idx_<id>` directory never
+/// collides with an FK circuit's, whose id is its column index.
+pub(super) const FIRST_USER_INDEX_ID: i64 = MAX_COLUMNS as i64;
 
 /// The durable relation-id tripwire in this crate's `i64` id width; the value and
 /// its rationale live on [`gnitz_wire::RELATION_ID_CEILING`].
@@ -268,11 +270,8 @@ impl PkSignature {
     }
 }
 
-/// One [`PkSignature`] per distinct PK, in first-appearance order. Zero-weight
-/// rows are skipped.
-///
-/// The map, not an adjacent-run scan: `canonicalize_for_hooks` sign-partitions
-/// the batch, so a pair's two rows are never adjacent.
+/// One [`PkSignature`] per distinct PK, in first-appearance order, over a batch in
+/// any row order. Zero-weight rows are skipped.
 pub(super) fn pk_signatures(family: SysFamily, batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
     let mut by_pk: FxHashMap<u128, usize> = FxHashMap::default();

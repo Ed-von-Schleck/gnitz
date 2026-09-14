@@ -1,11 +1,6 @@
-//! Catalog precheck — the master's trust boundary against a client that can push
-//! arbitrary system-table deltas. `submit` runs it, and the `DDL_TXN` handler
-//! runs it as its own step so a precheck rejection (which wrote nothing) stays
-//! distinguishable from a post-apply failure (which must be compensated).
-//!
-//! It is the *client* boundary: a path skips it exactly when its rows are not a
-//! client's. So this file holds the precheck arms *and* the registration guards
-//! `hooks.rs` re-runs for the paths that skip them.
+//! Catalog precheck — the master's trust boundary against client-pushed
+//! system-table deltas — and the registration guards `hooks.rs` re-runs for the
+//! paths whose rows are not a client's.
 
 use std::cmp::Ordering;
 
@@ -101,11 +96,8 @@ pub(super) fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) 
     .map_err(|rule| rule.to_string())
 }
 
-/// A zero-weight row is not a Z-set element: `pk_signatures` skips it, so it
-/// would reach the appliers carrying no contract at all. A row past ±1 is worse
-/// than useless — `retract_key_range` and `retract_pk_list` emit a hard `-1`
-/// after gating on the live weight, so anything above 1 is under-retracted by
-/// `w - 1` and leaves a permanent live ghost.
+/// A system row carries weight ±1: a zero weight carries no contract, and the
+/// engine's retractions emit a hard `-1`, which would leave `w - 1` of a heavier row.
 fn check_row_weights(family: SysFamily, batch: &Batch) -> Result<(), String> {
     for i in 0..batch.len() {
         let w = batch.get_weight(i);
@@ -223,20 +215,15 @@ fn check_col_ident(batch: &Batch, row: usize, owner_id: i64, expect_kind: i64) -
     Ok(())
 }
 
-/// A circuit `+1` may only name a view this same transaction creates. One under
-/// a foreign `view_id` either makes `has_dependents` of its `source_table`
-/// permanently true, blocking `DROP TABLE` forever, or injects nodes into a
-/// *running* view's circuit that `load_circuit` picks up at its next load.
-/// `create_view_chain` is the one legitimate producer and always targets fresh
-/// vids; every retraction goes through `submit_cascade`, which skips this as it
-/// skips the arms.
+/// A circuit `+1` may only name a view this same transaction creates: one under a
+/// foreign `view_id` would pin its source table's drop or rewrite a running circuit.
 fn check_circuit_view_ids(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
     // Sorted once: this runs per row of a client-supplied block bounded only by
     // the 64 MB frame.
     let mut created: Vec<i64> = new_view_ids.to_vec();
     created.sort_unstable();
     for i in batch.live_rows() {
-        let view_id = gnitz_wire::unpack_pair_pk(batch.get_pk(i)).0 as i64;
+        let view_id = SysFamily::CircuitNodes.leading_id(batch.get_pk(i));
         if created.binary_search(&view_id).is_err() {
             return Err(format!(
                 "circuit row names view {view_id}, which this transaction does not create"
@@ -534,7 +521,7 @@ impl CatalogEngine {
         // would silently shift every column past it rather than fail. (A
         // duplicate index is a duplicate COL_TAB PK, which the net bound already
         // rejects.)
-        if !self.is_trailing_col_append(owner_id, col_idx) {
+        if col_idx as usize != owner_schema.num_columns() {
             return Err(format!(
                 "cannot ADD COLUMN at index {col_idx} on table {owner_id}: \
                  columns must be appended at index {}",
@@ -666,10 +653,8 @@ impl CatalogEngine {
         Ok(entry)
     }
 
-    /// Validate a system-table write before any mutation (memtable or hooks) —
-    /// the read-only half of [`Self::submit`], and the `DDL_TXN` handler's own
-    /// first step, which is what lets it leave the rollback marker `None` on a
-    /// rejection and so reconstruct no ghost row.
+    /// Validate one family of a `DDL_TXN` before any of it is applied, so a
+    /// rejection needs no compensation.
     ///
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family must
     /// decide here whether it carries guards beyond the contract, rather than
@@ -704,12 +689,8 @@ impl CatalogEngine {
     }
 
     /// Every column record must name an owner this bundle creates or the registry
-    /// already holds, and agree with it on identity and kind. A row on a phantom
-    /// owner is **unretractable** — the only COL_TAB retractor is the owner's own
-    /// drop cascade, which returns early on an unregistered id — and
-    /// `apply_fk_edges_and_locks` builds a permanent `FkEdge` from its payload. The
-    /// kind clause matters on its own: that field alone decides a row declares an
-    /// FK, so a view's columns claiming `OWNER_KIND_TABLE` plant an unvalidated edge.
+    /// holds, of the kind its `owner_kind` claims: a phantom owner is never dropped,
+    /// so nothing would ever retract the row or the `FkEdge` it plants.
     fn check_column_owners(&self, cols: &Batch, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
         // The owners the bundle registers itself, by the kind its block implies.
         let mut created: FxHashMap<i64, i64> = FxHashMap::default();
@@ -721,8 +702,17 @@ impl CatalogEngine {
                 created.insert(b.get_pk(i) as i64, kind);
             }
         }
+        let mut altered: Option<i64> = None;
         for i in cols.live_rows() {
-            let owner_id = gnitz_wire::unpack_pair_pk(cols.get_pk(i)).0 as i64;
+            let owner_id = SysFamily::Column.leading_id(cols.get_pk(i));
+            // An ALTER must be its bundle's only change, on one owner: nothing can undo
+            // its descriptor swap, so the swap must be the bundle's last fallible step.
+            if self.registry.has_id(owner_id) {
+                if altered.is_some_and(|a| a != owner_id) || families.iter().flatten().count() > 1 {
+                    return Err("a column ALTER must be the only change in its DDL transaction".into());
+                }
+                altered = Some(owner_id);
+            }
             // What the catalog already says the owner is, else what this
             // transaction is making it.
             let owner_kind = self
@@ -904,17 +894,10 @@ impl CatalogEngine {
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         let noun = SysFamily::Index.row_noun();
         for i in batch.live_rows() {
-            let (owner_id, cols, props) =
+            let (owner_id, cols, _) =
                 read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
             let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
-            // Only `submit_local` — the FK auto-index, which bypasses this
-            // precheck — may set the internal bit: the drop guard below refuses
-            // to drop one, so a client could otherwise deny an index name
-            // permanently from one frame.
-            if props.is_internal {
-                return Err(format!("index '{index_name}' claims the engine-internal flag"));
-            }
             let entry = self.validate_index_registration(owner_id)?;
 
             // Bounds, per-column eligibility (STRING/BLOB/float), and
@@ -938,14 +921,10 @@ impl CatalogEngine {
         }
 
         for i in batch.retracted_rows() {
-            let (owner_id, cols, props) =
+            // The row, not `net_dead`: this needs `cols`, which a list of ids
+            // does not carry.
+            let (owner_id, cols, _) =
                 read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
-            // The row, not `net_dead`: this needs `is_internal` and `cols`, which
-            // a list of ids does not carry.
-            if props.is_internal {
-                // Dropping one silently disarms the FK RESTRICT seek it backs.
-                return Err("Integrity violation: cannot drop an internal FK index".into());
-            }
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.
@@ -969,12 +948,10 @@ impl CatalogEngine {
             }
             // Scan sys_indices (pre-drop: the rows being dropped are still
             // present) for another unique index on this column that survives.
-            let mut unique_remains = false;
-            self.for_each_index_on_cols(owner_id, &[src_col as u32], |row_id, is_uniq| {
-                if is_uniq && net_dead.binary_search(&row_id).is_err() {
-                    unique_remains = true;
-                }
-            });
+            let unique_remains = self
+                .indices_on_cols(owner_id, &[src_col as u32])
+                .iter()
+                .any(|&(id, u)| u && net_dead.binary_search(&id).is_err());
             if !unique_remains {
                 let (sn, tn) = self.qualified_name_or_unknown(owner_id);
                 return Err(format!(

@@ -278,42 +278,6 @@ fn a_three_family_create_table_bundle_still_commits() {
     assert_eq!(desc.indexes.len(), 1);
 }
 
-/// An index flagged engine-internal is one `DROP INDEX` refuses, so a client
-/// that could set the flag could deny a name in the index namespace permanently
-/// from one frame. Only `submit_local` — the FK auto-index, which bypasses the
-/// precheck — may set it.
-#[test]
-fn a_wire_supplied_internal_index_flag_is_refused() {
-    let srv = ServerHandle::start();
-    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    client.create_schema("infix").unwrap();
-    let cols = [
-        ColumnDef::new("id", TypeCode::U64, false),
-        ColumnDef::new("b", TypeCode::I64, false),
-    ];
-    let tid = client
-        .create_table("infix", "t", &cols, &[0], TableProps::default(), &[])
-        .unwrap();
-
-    let mut s = session(&srv);
-    let iid = s.alloc_index_id().unwrap();
-    let idx_s = sys_schema(IDX_TAB);
-    let mut b = ZSetBatch::new(idx_s);
-    write_idx_tab_row(
-        &mut BatchAppender::new(&mut b, idx_s),
-        &IdxTabRow {
-            index_id: iid,
-            owner_id: tid,
-            source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
-            name: "forged",
-            flags: gnitz_wire::IndexProps { is_unique: false, is_internal: true }.pack(),
-        },
-        1,
-    );
-    let err = format!("{:?}", s.push_ddl_txn(&[(IDX_TAB, b)]).unwrap_err());
-    assert!(err.contains("engine-internal"), "{err}");
-}
-
 /// A VIEW_TAB `+1` naming an `owner_view_id` no relation holds is refused: the
 /// drop cascade keys on that column, so a forged owner would point a cascade at
 /// nothing.

@@ -137,7 +137,7 @@ fn a_zero_weight_row_is_not_a_zset_element() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `retract_key_range` and `retract_pk_list` emit a hard `-1` after gating on
+/// `retract_bands` and `retract_pk_list` emit a hard `-1` after gating on
 /// the live weight, so a system row left above 1 is under-retracted by `w - 1`
 /// and leaves a permanent live ghost.
 #[test]

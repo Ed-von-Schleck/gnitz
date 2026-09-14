@@ -167,16 +167,8 @@ def test_every_ddl_kind_survives_a_crash(own_server):
 
 
 def test_an_acked_create_index_survives_a_crash(own_server):
-    """An FK auto-index is applied as an un-pinned local ingest that bumps
-    `sys_indices`' current_lsn once per non-PK FK column, while the CREATE TABLE
-    consumes a single zone LSN — so the IDX_TAB recovery watermark drifts ahead
-    of the zone allocator. A checkpoint persists the drifted counter, and a later
-    CREATE INDEX whose zone LSN sits at or below it is deduped away by recovery's
-    `msg.lsn <= flushed` check: the index vanishes despite the ACK.
-
-    Read through a seek rather than the catalog: the contract is that the
-    acknowledged index still serves, and a scan of IDX_TAB pins a column ordinal
-    any schema edit moves."""
+    """A CREATE INDEX acknowledged after a checkpoint of FK-heavy tables still
+    serves after a crash."""
     # A tiny threshold so the DDL broadcasts below make the first INSERT's
     # committer cycle run a checkpoint, persisting the drifted watermark.
     own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1024"})
@@ -185,8 +177,7 @@ def test_an_acked_create_index_survives_a_crash(own_server):
         conn.execute_sql(
             "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
             schema_name="idxcrash")
-        # Three children × four non-PK FK columns drift the watermark well past
-        # the zone allocator.
+        # Three children × four non-PK FK columns.
         for t in ("c1", "c2", "c3"):
             conn.execute_sql(
                 f"CREATE TABLE {t} (cid BIGINT NOT NULL PRIMARY KEY,"

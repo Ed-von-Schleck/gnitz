@@ -71,12 +71,20 @@ fn test_fk_drop_protections() {
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
-    // Cannot drop parent (referenced by child)
-    assert!(engine.drop_table("public.parent").is_err());
+    // The FK column carries a derived circuit, id = its column index.
+    let fk_circuit = |engine: &CatalogEngine| {
+        engine
+            .registry()
+            .relation(child_tid)
+            .and_then(|e| e.index_on(&[1]))
+            .map(SecondaryIndex::id)
+    };
+    assert_eq!(fk_circuit(&engine), Some(1));
 
-    // Cannot drop auto-generated FK index
-    let idx_name = make_fk_index_name(child_tid, 1);
-    assert!(engine.drop_index(&idx_name).is_err());
+    // Cannot drop parent (referenced by child), and the refusal leaves the
+    // child's circuit in place.
+    assert!(engine.drop_table("public.parent").is_err());
+    assert_eq!(fk_circuit(&engine), Some(1));
 
     // Drop child first, then parent succeeds
     engine.drop_table("public.child").unwrap();
@@ -312,12 +320,7 @@ fn test_fk_multiple_children_same_parent() {
 }
 
 // ── test_fk_auto_index_skips_non_leading_pk_column ───────────────────
-// The auto-index skip reads the owner's FULL PK column list: on a compound PK an
-// FK sitting at a non-leading PK position is already stored in the PK region and
-// must mint no auto-index, while an FK on a non-PK column of the same table
-// must still get one. A skip that consulted only the first PK column would mint
-// a redundant, undroppable index (`precheck_index_family` refuses to drop an
-// internal FK index).
+// Every PK column is skipped, not just the leading one.
 
 #[test]
 fn test_fk_auto_index_skips_non_leading_pk_column() {
@@ -333,19 +336,14 @@ fn test_fk_auto_index_skips_non_leading_pk_column() {
     let child_cols = vec![col_def("a", type_code::U64), fk_col("pid_fk"), fk_col("plain_fk")];
     let child_tid = engine.create_table("public.child", &child_cols, &[0, 1]).unwrap();
 
+    let child = engine.registry().relation(child_tid).unwrap();
     assert!(
-        !engine
-            .caches
-            .index_by_name
-            .contains_key(&make_fk_index_name(child_tid, 1)),
-        "an FK at a non-leading PK position is covered by the PK region — no auto-index",
+        child.index_on(&[1]).is_none(),
+        "an FK at a non-leading PK position is covered by the PK region — no circuit",
     );
     assert!(
-        engine
-            .caches
-            .index_by_name
-            .contains_key(&make_fk_index_name(child_tid, 2)),
-        "an FK on a non-PK column must still get its auto-index",
+        child.index_on(&[2]).is_some(),
+        "an FK on a non-PK column must still get its circuit",
     );
 
     engine.close();

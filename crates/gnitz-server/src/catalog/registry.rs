@@ -159,6 +159,7 @@ impl CatalogEngine {
         Ok(base)
     }
 
+    #[cfg(test)]
     pub(in crate::catalog) fn allocate_index_id(&mut self) -> Result<i64, String> {
         self.allocate_index_ids(1)
     }

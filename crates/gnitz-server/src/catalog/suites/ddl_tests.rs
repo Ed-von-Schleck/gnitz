@@ -514,9 +514,6 @@ fn test_hook_relation_register_rejects_malformed_pk() {
 
 // `TABLE_TAB.pk_col_idx` is reconstructed element-for-element into the
 // registered schema's PK list, for a single-column and for compound PKs.
-// That descriptor is the one source of a table's PK columns — `create_fk_indices`
-// reads it to skip auto-indexing a PK column — so a truncated or reordered
-// reconstruction would silently mint a redundant FK index.
 #[test]
 fn test_pk_list_round_trips_into_registered_schema() {
     let dir = temp_dir("pk_list_roundtrip");
@@ -626,11 +623,8 @@ fn test_drop_view_removes_directory() {
 }
 
 // ── test_drop_view_cascades_columns_and_circuit_rows ─────────────────
-// DROP VIEW retracts only the VIEW_TAB row; the cascade in hook_relation_register
-// must clean up BOTH the view's sys_columns rows and its circuit rows. The
-// circuit assertion is the regression guard for removing drop_view's manual
-// retraction — it proves the VIEW_TAB cascade (cascade_retract_circuit) still
-// clears the circuit rows on its own.
+// DROP VIEW retracts only the VIEW_TAB row; the expanded cascade must clear both
+// the view's column rows and its circuit rows.
 
 #[test]
 fn test_drop_view_cascades_columns_and_circuit_rows() {
@@ -706,17 +700,8 @@ fn ddl_emitters_use_no_raw_handle_capability() {
 }
 
 // ── drop_cascade_broadcasts_children_before_parents ──────────────────
-// fire_hooks enqueues a table retraction's cascade children (IDX/COL)
-// BEFORE the parent TABLE row: cascade_retract_indices / _columns call
-// `submit` from inside hook_relation_register, each pushing to
-// pending_broadcasts, and the top-level TABLE batch is pushed only after
-// fire_hooks returns (`submit`). The executor forwards the
-// queue in order, so workers see children → parent — the order in which a
-// drop's dependent rows can be safely applied.
-//
-// This pins ORDER, which end-state cache assertions cannot see: a reorder
-// that appends the parent first nets to the same in-process catalog state
-// yet ships an unsafe broadcast order to workers.
+// A table drop queues its children (IDX, COL) ahead of the TABLE row, the order
+// workers apply them in — which no end-state assertion can see.
 #[test]
 fn drop_cascade_broadcasts_children_before_parents() {
     let dir = temp_dir("drop_cascade_broadcast_order");
@@ -730,8 +715,8 @@ fn drop_cascade_broadcasts_children_before_parents() {
     // Clear the broadcasts accumulated by create_table + create_index.
     let _ = engine.drain_pending_broadcasts();
 
-    // Submit the table retraction; its -1 fires hook_relation_register, whose
-    // retract branch cascades the owned index (IDX) and columns (COL).
+    // Submit the table retraction; apply_bundle_family retracts the owned index
+    // (IDX) and columns (COL) ahead of it.
     engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
 
     // Collect the broadcast family-id sequence.
@@ -985,6 +970,107 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), "hidden_dup", 0);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── One TABLE_TAB batch drops several tables, one batch per family ───────────
+
+#[test]
+fn set_based_table_drop_queues_one_batch_per_family() {
+    let dir = temp_dir("set_based_table_drop");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let mut tids = Vec::new();
+    for name in ["a", "b", "c"] {
+        tids.push(engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap());
+        engine.create_index(&format!("public.{name}"), &["val"], false).unwrap();
+    }
+    let _ = engine.drain_pending_broadcasts();
+
+    let drop = retract_pk_list(
+        engine.sys_relation(SysFamily::Table),
+        tids.iter().map(|&t| t as u128).collect(),
+    );
+    engine.submit(SysFamily::Table, drop).unwrap();
+
+    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
+    assert_eq!(families, [SysFamily::Index, SysFamily::Column, SysFamily::Table]);
+    assert!(tids.iter().all(|&t| !engine.registry().has_id(t)));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── A view drop retracts the internal segments it owns ───────────────────────
+
+/// Register view `V` over a fresh base table, then segment `S` whose VIEW_TAB
+/// row names `V` as its owner. Returns `(V, S)`.
+fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
+    let base = engine
+        .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
+        .unwrap();
+    let cols = vec![col_def("id", type_code::U64)];
+    let register = |engine: &mut CatalogEngine, name: &str, owner: i64| {
+        let vid = engine.next_table_id;
+        write_identity_circuit(engine, vid, base, None);
+        engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+        let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+        push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
+        engine.submit(SysFamily::View, bb.finish()).unwrap();
+        vid
+    };
+    let v = register(engine, "v", 0);
+    let s = register(engine, "v__seg", v);
+    (v, s)
+}
+
+/// Live rows of pair-keyed `family` under `leading`.
+fn band_rows(engine: &CatalogEngine, family: SysFamily, leading: i64) -> usize {
+    let (start, end) = family.band(leading);
+    let (cursor, _) = engine
+        .sys_relation(family)
+        .range_cursor(start.pk_bytes(), Some(end.pk_bytes()));
+    count_records(cursor)
+}
+
+#[test]
+fn view_drop_retracts_its_segments() {
+    let dir = temp_dir("view_drop_segments");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let (v, s) = view_with_segment(&mut engine);
+    let _ = engine.drain_pending_broadcasts();
+
+    engine.submit_retraction(SysFamily::View, v as u128).unwrap();
+
+    let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
+    assert_eq!(families, [SysFamily::CircuitNodes, SysFamily::Column, SysFamily::View]);
+    for id in [v, s] {
+        assert!(!engine.registry().has_id(id));
+        assert_eq!(band_rows(&engine, SysFamily::CircuitNodes, id), 0);
+        assert_eq!(band_rows(&engine, SysFamily::Column, id), 0);
+    }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
+    let dir = temp_dir("view_drop_segment_once");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let (v, s) = view_with_segment(&mut engine);
+
+    let drop = retract_pk_list(engine.sys_relation(SysFamily::View), vec![v as u128, s as u128]);
+    engine.submit(SysFamily::View, drop).unwrap();
+
+    assert!(!engine.registry().has_id(v) && !engine.registry().has_id(s));
+    assert_eq!(
+        count_negative_records(engine.sys_relation(SysFamily::View).cursor()),
+        0,
+        "the segment must not be retracted twice"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

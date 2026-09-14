@@ -54,23 +54,17 @@ pub(in crate::catalog) struct CatalogCacheSet {
     pub(in crate::catalog) segments_by_owner: FxHashMap<i64, Vec<i64>>,
     pub(in crate::catalog) fk_by_child: FxHashMap<i64, Vec<FkEdge>>,
     pub(in crate::catalog) fk_by_parent: FxHashMap<i64, Vec<FkEdge>>,
-    /// Tables whose writes need the push lock, each with its materialized lock
-    /// set: the table itself plus all FK parents and children, sorted ascending
-    /// and deduped for deadlock-free acquisition. Recomputed by
-    /// `recompute_needs_lock` on every trigger (`relock_from_table_delta` /
-    /// `apply_fk_edges_and_locks`), so `fk_lock_set` is a plain borrow on the
-    /// push path.
+    /// Tables whose writes need the push lock, each with its lock set — itself plus
+    /// its FK parents and children, sorted and deduped. Maintained by `recompute_needs_lock`.
     pub(in crate::catalog) needs_lock: FxHashMap<i64, Vec<i64>>,
 }
 
-/// Append `id` to the Vec at `key` unless it is already there — the shared
-/// register shape of the owner-indexed caches, and idempotent because the SAL
-/// dedupe filter under-dedupes by design while [`remove_where`] drops only the
-/// first match, so a duplicate would be permanent.
-fn insert_owned<K: Eq + std::hash::Hash>(map: &mut FxHashMap<K, Vec<i64>>, key: K, id: i64) {
+/// Append `v` at `key` unless `same` matches an element already there — a
+/// re-applied row must not leave a duplicate [`remove_where`] cannot fully undo.
+fn insert_owned<K: Eq + std::hash::Hash, V>(map: &mut FxHashMap<K, Vec<V>>, key: K, v: V, same: impl Fn(&V) -> bool) {
     let owned = map.entry(key).or_default();
-    if !owned.contains(&id) {
-        owned.push(id);
+    if !owned.iter().any(same) {
+        owned.push(v);
     }
 }
 
@@ -112,10 +106,8 @@ impl CatalogCacheSet {
     }
 
     /// Drop the per-table schema version when a table/view is fully removed.
-    /// Call this at the tail of the drop hook — *after* the column cascade,
-    /// whose `invalidate_col_names` bump would otherwise `or_insert` the counter
-    /// straight back. Table ids are monotonic and never reused, so a counter
-    /// left behind here would become permanent dead memory.
+    /// Table ids are monotonic and never reused, so a counter left behind here
+    /// would become permanent dead memory.
     pub(in crate::catalog) fn purge_schema_version(&mut self, id: i64) {
         self.schema_version.remove(&id);
     }
@@ -182,32 +174,27 @@ impl CatalogEngine {
                     self.caches.entity_by_qname.remove(&qualified);
                 }
                 // Entity dropped: clear per-table cache entries without bumping
-                // the schema version (there is no new schema to advertise).
-                // `clear_col_cache_no_bump` is the only column-cache cleanup on
-                // the rollback path (`ctx.in_rollback()`) where
-                // `cascade_retract_columns` is skipped.
-                // The schema_version counter is NOT removed here: the column
-                // cascade fires AFTER this applier (it runs before
-                // hook_relation_register) and would `or_insert` it straight back.
-                // It is purged post-cascade by `purge_schema_version` at the
-                // tail of the drop hook.
+                // the schema version (there is no new schema to advertise). The
+                // counter is purged by `unregister_relation`.
                 self.caches.clear_col_cache_no_bump(tid);
                 self.caches.entity_by_id.remove(&tid);
             }
         }
     }
 
-    /// Drop the cached column defs of every owner the COL_TAB delta touches.
-    /// A batch typically carries one owner's columns in a run (the PK leads with
-    /// `owner_id`), so skipping a repeat collapses the run to one invalidation.
-    /// Correct for any row order.
+    /// Drop the cached column defs of every owner the COL_TAB delta touches, and bump
+    /// the schema version of the registered ones: only those have a schema a client cached.
     pub(in crate::catalog) fn apply_col_names_invalidate(&mut self, batch: &Batch) {
-        let mut last: Option<i64> = None;
-        for i in 0..batch.len() {
-            let owner_id = gnitz_wire::unpack_pair_pk(batch.get_pk(i)).0 as i64;
-            if last != Some(owner_id) {
-                self.caches.invalidate_col_names(owner_id);
-                last = Some(owner_id);
+        let mut owners: Vec<i64> = (0..batch.len())
+            .map(|i| SysFamily::Column.leading_id(batch.get_pk(i)))
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        for owner in owners {
+            if self.registry.has_id(owner) {
+                self.caches.invalidate_col_names(owner);
+            } else {
+                self.caches.clear_col_cache_no_bump(owner);
             }
         }
     }
@@ -224,7 +211,7 @@ impl CatalogEngine {
             return;
         }
         if weight > 0 {
-            insert_owned(&mut self.caches.segments_by_owner, owner, vid);
+            insert_owned(&mut self.caches.segments_by_owner, owner, vid, |&x| x == vid);
         } else {
             remove_where(&mut self.caches.segments_by_owner, owner, |&id| id == vid);
         }
@@ -241,7 +228,7 @@ impl CatalogEngine {
 
             if weight > 0 {
                 self.caches.index_by_name.insert(name, idx_id);
-                insert_owned(&mut self.caches.indices_by_owner, owner_id, idx_id);
+                insert_owned(&mut self.caches.indices_by_owner, owner_id, idx_id, |&x| x == idx_id);
             } else {
                 self.caches.index_by_name.remove(&name);
                 remove_where(&mut self.caches.indices_by_owner, owner_id, |&id| id == idx_id);
@@ -274,14 +261,8 @@ impl CatalogEngine {
             let same = |e: &FkEdge| e.child_tid == edge.child_tid && e.fk_col == edge.fk_col;
 
             if batch.get_weight(i) > 0 {
-                let by_child = caches.fk_by_child.entry(edge.child_tid).or_default();
-                if !by_child.iter().any(same) {
-                    by_child.push(edge);
-                }
-                let by_parent = caches.fk_by_parent.entry(edge.parent_tid).or_default();
-                if !by_parent.iter().any(same) {
-                    by_parent.push(edge);
-                }
+                insert_owned(&mut caches.fk_by_child, edge.child_tid, edge, same);
+                insert_owned(&mut caches.fk_by_parent, edge.parent_tid, edge, same);
             } else {
                 remove_where(&mut caches.fk_by_child, edge.child_tid, same);
                 remove_where(&mut caches.fk_by_parent, edge.parent_tid, same);
@@ -291,16 +272,6 @@ impl CatalogEngine {
             if registry.has_id(edge.parent_tid) {
                 tids.push(edge.parent_tid);
             }
-        }
-        self.relock_all(tids);
-    }
-
-    /// A TABLE_TAB delta relocks every relation it names: the lock rule reads
-    /// `the registry[tid].kind`, which the register/teardown hooks just changed.
-    pub(in crate::catalog) fn relock_from_table_delta(&mut self, batch: &Batch) {
-        let mut tids = Vec::with_capacity(batch.len());
-        for i in 0..batch.len() {
-            tids.push(batch.get_pk(i) as i64);
         }
         self.relock_all(tids);
     }

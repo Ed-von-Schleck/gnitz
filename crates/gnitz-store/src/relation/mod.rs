@@ -39,10 +39,8 @@ pub struct SecondaryIndex {
     /// single-column case. Dedup/lookup is exact ordered-list equality on
     /// `cols.as_slice()`; order is significant (it drives leading-prefix seeks).
     cols: PkColList,
-    /// The index_id of the IDX_TAB row that caused this store to be opened.
-    /// When a second index promotes an incumbent circuit (UNIQUE+FK case), no
-    /// new directory is created; this field identifies the actual on-disk path
-    /// so the retraction branch queues the correct directory for deletion.
+    /// The id this store's directory is named by — the creator's, even after a
+    /// second index promoted it.
     index_id: i64,
     /// Full-arity span-encode plan, precomputed at registration so the per-push
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
@@ -582,19 +580,17 @@ impl RelationRegistry {
         .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={idx_dir})"), e))
     }
 
-    pub fn remove_index(&mut self, id: i64, cols: &[u32]) {
-        if let Some(entry) = self.tables.get_mut(&id) {
-            // retain() drops non-matching entries, which drops their stores.
-            entry.indexes.retain(|ix| ix.cols.as_slice() != cols);
-        }
+    /// Remove `id`'s circuit on `cols`, dropping its store, and return the
+    /// circuit's directory as [`Self::index_dir`] spells it. `None` when no such
+    /// circuit is registered.
+    pub fn remove_index(&mut self, id: i64, cols: &[u32]) -> Option<String> {
+        let entry = self.tables.get_mut(&id)?;
+        let pos = entry.indexes.iter().position(|ix| ix.cols.as_slice() == cols)?;
+        let index_id = entry.indexes.remove(pos).index_id;
+        self.index_dir(id, index_id)
     }
 
-    /// Set the uniqueness flag of the index on `cols` in place (the index list
-    /// is deduped by column list, so at most one entry matches). Promotion
-    /// (`true`) folds a UNIQUE index into an existing non-unique one when both
-    /// target the same column list; demotion (`false`) is used by the DROP INDEX
-    /// retraction path when the UNIQUE index is dropped but another index (e.g.
-    /// an FK auto-index) still covers it.
+    /// Set the uniqueness flag of the one circuit on `cols` in place.
     pub fn set_index_unique(&mut self, id: i64, cols: &[u32], is_unique: bool) {
         if let Some(ix) = self.relation_mut(id).and_then(|e| e.index_on_mut(cols)) {
             ix.is_unique = is_unique;

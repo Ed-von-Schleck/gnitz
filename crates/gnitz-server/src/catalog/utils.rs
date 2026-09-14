@@ -1,13 +1,5 @@
 use super::*;
 
-/// The name an FK auto-index is created under. **Injective**, which the minting
-/// site's `index_by_name` skip needs to be exact — an interpolated name is not,
-/// and a collision there silently skips creating the second FK's index. The
-/// leading `_` keeps it unspellable at every user surface.
-pub(in crate::catalog) fn make_fk_index_name(table_id: i64, col_idx: usize) -> String {
-    format!("_fk_{table_id}_{col_idx}")
-}
-
 // ---------------------------------------------------------------------------
 // On-disk directory naming conventions
 //
@@ -56,19 +48,15 @@ pub(in crate::catalog) fn preflight_dir(base_dir: &str, schema_name: &str, vid: 
 // Copy/retract helpers
 // ---------------------------------------------------------------------------
 
-/// Emit a weight=−1 batch of every live row of `table` in the OPK key range
-/// `[start, end)` (`end` `None` = unbounded above). The band-bounded half of the
-/// catalog's retraction pair — one owner's column records, or one view's circuit
-/// rows; [`retract_pk_list`] is the key-list half. Both take
-/// their bounds through `schema::key`, so no call site re-derives the OPK layout.
-/// The output batch is in `rel`'s own schema — a caller cannot hand it one the
-/// rows it copies are not laid out in.
-pub(in crate::catalog) fn retract_key_range(rel: &Relation, start: &[u8], end: &[u8]) -> Batch {
-    let (mut cursor, _) = rel.range_cursor(start, Some(end));
-    // Sized off the positioned walk's own upper bound, so the appends never
-    // re-grow (each growth re-copies every live byte).
-    let mut batch = Batch::with_capacity(&rel.schema(), cursor.estimated_length());
-    cursor.for_each_positive(|c| c.copy_current_row_into(&mut batch, -1));
+/// Emit a weight −1 batch of every live row of pair-keyed `family` under each of
+/// `leadings` — owners' column records, or views' circuit rows.
+pub(in crate::catalog) fn retract_bands(rel: &Relation, family: SysFamily, leadings: &[i64]) -> Batch {
+    let mut batch = Batch::with_capacity(&rel.schema(), 0);
+    for &leading in leadings {
+        let (start, end) = family.band(leading);
+        let (mut cursor, _) = rel.range_cursor(start.pk_bytes(), Some(end.pk_bytes()));
+        cursor.for_each_positive(|c| c.copy_current_row_into(&mut batch, -1));
+    }
     batch
 }
 

@@ -109,9 +109,6 @@ impl RelClass {
     }
 }
 
-/// Bit 0 of an index entry's `flags` word.
-const INDEX_FLAG_UNIQUE: u64 = 1;
-
 /// Fixed header size: version + flags + the two counts.
 const HEADER_LEN: usize = 6;
 
@@ -173,7 +170,7 @@ impl RelDescriptorBlob {
         }
         for ix in &self.indexes {
             w.u64(crate::pack_pk_cols(ix.cols.as_slice()))
-                .u64(if ix.is_unique { INDEX_FLAG_UNIQUE } else { 0 });
+                .u64(crate::IndexProps { is_unique: ix.is_unique }.pack());
         }
         w.into_vec()
     }
@@ -239,7 +236,7 @@ impl RelDescriptorBlob {
             let entry_flags = r.u64()?;
             indexes.push(RelIndex {
                 cols,
-                is_unique: entry_flags & INDEX_FLAG_UNIQUE != 0,
+                is_unique: crate::IndexProps::from_flags(entry_flags).is_unique,
             });
         }
 

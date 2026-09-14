@@ -48,7 +48,7 @@ impl CatalogEngine {
         self.ctx.open_ddl_zone(lsn);
     }
 
-    /// Leave the DDL zone and reset the rollback flag. Must run on both the
+    /// Leave the DDL zone. Must run on both the
     /// success and the compensated-failure path: a zone left open stamps every
     /// later ingest with a stale LSN.
     pub(crate) fn close_ddl_zone(&mut self) {
@@ -164,22 +164,15 @@ impl CatalogEngine {
             .unwrap_or(&[])
     }
 
-    /// Visit every live `sys_indices` row whose owner and **exact column list**
-    /// match `(owner_id, cols)`, invoking `f(index_id, is_unique)` for each — the
-    /// shared probe behind the DROP INDEX FK guard and the circuit demotion in
-    /// `hook_index_register`.
-    ///
-    /// The cache names *which* ids to probe; storage stays authoritative for their
-    /// attributes, because both callers are correctness guards and a stale
-    /// `is_unique` would let a drop strip the last unique index off an FK target.
-    /// IDX_TAB's PK is the global `idx_id`, so there is no owner band to scan
-    /// instead.
-    pub(super) fn for_each_index_on_cols(&self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool)) {
+    /// `(index_id, is_unique)` of every live `sys_indices` row on exactly
+    /// `(owner_id, cols)`, read from storage rather than the caches.
+    pub(super) fn indices_on_cols(&self, owner_id: i64, cols: &[u32]) -> Vec<(i64, bool)> {
         let Some(ids) = self.caches.indices_by_owner.get(&owner_id) else {
-            return;
+            return Vec::new();
         };
         let schema = SysFamily::Index.schema();
         let rel = self.sys_relation(SysFamily::Index);
+        let mut out = Vec::new();
         for &idx_id in ids {
             let key = sys_opk(schema, idx_id as u128);
             let Some(sr) = rel.live_row_at(key.pk_bytes()).1 else {
@@ -192,9 +185,10 @@ impl CatalogEngine {
                 continue;
             };
             if row_owner == owner_id && row_cols.as_slice() == cols {
-                f(idx_id, props.is_unique);
+                out.push((idx_id, props.is_unique));
             }
         }
+        out
     }
 
     /// `(schema, table, columns)` names for `(table_id, col_indices)`, each

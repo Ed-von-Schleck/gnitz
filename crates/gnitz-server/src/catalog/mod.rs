@@ -12,9 +12,7 @@
 //!
 //! * `apply_*` — pure cache-delta appliers.
 //! * `hook_*` — side effects: directories, stores, DAG registrations, derived
-//!   state. Storage is applied before hooks fire, so these reconcile against the
-//!   row's *net* live state rather than its own sign; a rename pair is net-live
-//!   before and after, so it fires neither teardown nor re-registration.
+//!   state. They write no system rows.
 //!
 //! See `hooks.rs` for the cross-family ordering contract and where it is
 //! enforced.
@@ -83,8 +81,7 @@ pub(in crate::catalog) use registry::raise_id_counter;
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_store::storage::ChildAddr;
 pub(in crate::catalog) use utils::{
-    make_fk_index_name, pair_opk, preflight_dir, retract_key_range, retract_pk_list, schema_dir, sys_catalog_dir,
-    sys_family_dir, sys_opk,
+    pair_opk, preflight_dir, retract_bands, retract_pk_list, schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
 };
 // The relation rung's directory primitives; the catalog only consumes them.
 pub(in crate::catalog) use gnitz_store::relation::{
@@ -153,17 +150,8 @@ pub(crate) struct CatalogEngine {
 
     // --- Pending broadcasts (ordered innermost → outermost) ---
     //
-    // Every family the master applies is queued here for relay to the workers.
-    // A hook may recursively `submit` a cascade retraction (indices, columns,
-    // circuit graph); each nested call appends its (family, batch) AFTER its own
-    // hooks fire, so the queue ends up in dependency-safe order — children
-    // before parents. The executor drains it once per top-level DDL.
-    //
-    // A worker reaches the same enqueue through `ddl_sync` → cascade → `submit`,
-    // and never drains. It stays empty there only because the master broadcasts
-    // children before parents: by the time a worker applies the parent `-1`, its
-    // own cascade finds nothing live and produces an empty batch, which
-    // `apply_and_enqueue_family` drops.
+    // The master's applied bundle families, in apply order, for relay to the
+    // workers. `ddl_sync` never enqueues.
     pub(in crate::catalog) pending_broadcasts: Vec<(SysFamily, Batch)>,
 
     // --- Deferred physical directory deletions ---

@@ -702,8 +702,8 @@ pub(crate) fn execute_drop(
             _ => extract_object_name(obj_name, schema_name, "DROP")?,
         };
         // No user object can carry a leading `_`, so this keeps a synthesized hidden
-        // view and an engine-internal index undroppable by name — a clearer error
-        // than the engine's own refusal, which stays the backstop.
+        // view undroppable by name — a clearer error than the engine's own refusal,
+        // which stays the backstop.
         validate_user_name(&name)?;
         targets.push(name);
     }
@@ -843,8 +843,8 @@ pub(crate) fn create_index_core(
             let base = default_index_name(schema_name, req.table_name, &col_names);
             let existing = client.index_rows()?;
             // A prior *auto-named* index on this exact column set is the same index.
-            // An FK-backing or explicitly-named index on these columns carries a
-            // different name, so it never blocks a distinct auto-name.
+            // An explicitly-named index on these columns carries a different
+            // name, so it never blocks a distinct auto-name.
             if existing
                 .iter()
                 .any(|(_, name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())

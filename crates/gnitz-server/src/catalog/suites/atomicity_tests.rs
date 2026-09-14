@@ -244,7 +244,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
         nonexistent_owner,
         0,
         "bad_owner_idx",
-        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
+        gnitz_wire::IndexProps { is_unique: false },
         1,
     );
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
@@ -296,7 +296,7 @@ fn test_idx_tab_view_owner_rejected() {
         vid,
         pack_pk_cols(&[0]),
         "idx_on_view",
-        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
+        gnitz_wire::IndexProps { is_unique: false },
         1,
     );
     let err = engine
@@ -356,7 +356,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         tid,
         2,
         orig_name,
-        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
+        gnitz_wire::IndexProps { is_unique: false },
         1,
     );
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
@@ -456,30 +456,27 @@ fn test_create_index_backfill_fail_no_dir_leak_internal() {
 }
 
 // ---------------------------------------------------------------------------
-// Part 6 — next_index_id worker synchronization
+// Part 6 — next_index_id follows applied index ids
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_next_index_id_advances_on_index_register() {
-    // Pre-fix: hook_index_register(+1) never advances next_index_id.
-    // A subsequent allocate_index_id() call on the worker would return an ID
-    // that the master already assigned to an explicit user index, causing
-    // directory collisions.
+    // An applied IDX_TAB row raises next_index_id past its id, so a later
+    // allocation never reissues it.
     let dir = temp_dir("atomicity_idx_seq");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.seqsync", &cols, &[0]).unwrap();
 
-    // Register an index with an idx_id far ahead of the current counter,
-    // simulating a worker receiving a broadcast for a master-allocated ID.
+    // An index id far ahead of the local counter.
     let large_idx_id = engine.next_index_id + 500;
     let batch = idx_tab_batch(
         large_idx_id,
         tid,
         pack_pk_cols(&[1]),
         "public__seqsync__idx_val_sync",
-        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
+        gnitz_wire::IndexProps { is_unique: false },
         1,
     );
     engine.ingest_to_family(IDX_TAB_ID, &batch).unwrap();
@@ -951,5 +948,72 @@ fn zero_weight_catalog_row_rejected() {
     );
 
     engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── A compensated CREATE TABLE leaves nothing of the table behind ────────────
+// Its IDX_TAB family fails after COL_TAB and TABLE_TAB applied.
+
+#[test]
+fn compensated_create_table_leaves_no_trace() {
+    let dir = temp_dir("compensated_create_table");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let parent = engine
+        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
+        .unwrap();
+    let _ = engine.drain_pending_broadcasts();
+    let counts = |engine: &CatalogEngine| -> Vec<(usize, usize)> {
+        SysFamily::ALL
+            .iter()
+            .map(|&f| {
+                (
+                    count_records(engine.sys_relation(f).cursor()),
+                    count_negative_records(engine.sys_relation(f).cursor()),
+                )
+            })
+            .collect()
+    };
+    // Allocated first: an allocation advances `sys_sequences` for good.
+    let tid = engine.allocate_table_id().unwrap();
+    let idx_id = engine.allocate_index_id().unwrap();
+    let before = counts(&engine);
+
+    let cols = vec![
+        col_def("id", type_code::U64),
+        fk_def("pid", type_code::U64, parent, 0),
+        col_def("val", type_code::I64),
+    ];
+    let mut marker: Option<(SysFamily, Batch)> = None;
+    for (family, batch) in [
+        (
+            SysFamily::Column,
+            engine.build_col_batch(tid, OWNER_KIND_TABLE, &cols, 1),
+        ),
+        (SysFamily::Table, build_table_tab_row(tid, pack_pk_cols(&[0]), "child")),
+    ] {
+        engine.precheck_family(family, &batch).unwrap();
+        engine.apply_bundle_family(family, batch, &mut marker).unwrap();
+    }
+    assert!(engine.registry().relation(tid).unwrap().index_on(&[1]).is_some());
+
+    let blocker = ChildAddr::Index { id: idx_id }.dir(&relation_dir(&dir, "public", RelationKind::BaseTable, tid));
+    fs::write(&blocker, b"not a directory").unwrap();
+    let idx = idx_tab_batch(
+        idx_id,
+        tid,
+        pack_pk_cols(&[2]),
+        "public__child__idx_val",
+        gnitz_wire::IndexProps { is_unique: false },
+        1,
+    );
+    engine.precheck_family(SysFamily::Index, &idx).unwrap();
+    assert!(engine.apply_bundle_family(SysFamily::Index, idx, &mut marker).is_err());
+    engine.compensate_stage_a(marker.take()).unwrap();
+
+    assert!(!engine.caches.schema_version.contains_key(&tid));
+    assert!(!engine.registry().has_id(tid));
+    assert!(!engine.caches.indices_by_owner.contains_key(&tid));
+    assert_eq!(counts(&engine), before, "no system family may keep a row of the table");
+
     let _ = fs::remove_dir_all(&dir);
 }

@@ -435,10 +435,7 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
 }
 
 // ── The hook canonicalizer repairs a `+1`-first rewrite pair ────────────────
-// Every forward producer emits a rename pair `-1`-first; `compensate_stage_a`'s
-// in-place negation is what reverses one. The payload-keyed cache folds read the
-// *outgoing* name off `entity_by_id`, so an insert-first pair applied verbatim
-// would unmap the new name and leave the old one resolving.
+// A raw `DDL_TXN` block or a compensation can hand the hooks one.
 
 #[test]
 fn insert_first_rename_pair_lands_the_new_name() {
@@ -476,6 +473,54 @@ fn insert_first_rename_pair_lands_the_new_name() {
         "a rename queues no dir deletion"
     );
     assert_eq!(live_rows_for(&engine, tid), 1, "a rename leaves exactly one live row");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── A column ALTER is confined to its own bundle ─────────────────────────────
+
+#[test]
+fn a_column_alter_must_be_its_bundles_only_change() {
+    let (mut engine, tid, dir) = table_fixture(
+        "alter_confined_to_bundle",
+        &[col_def("id", type_code::U64), col_def("v", type_code::I64)],
+    );
+    let other = engine
+        .create_table(
+            "public.u",
+            &[col_def("id", type_code::U64), col_def("v", type_code::I64)],
+            &[0],
+        )
+        .unwrap();
+    let append = |owner: i64, bb: &mut BatchBuilder| {
+        push_col_tab_row(bb, owner, OWNER_KIND_TABLE, 2, &nullable_def("w", type_code::I64), 1);
+    };
+
+    // An append bundled with an index family.
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    append(tid, &mut bb);
+    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+    families[SysFamily::Column.index()] = Some(bb.finish());
+    families[SysFamily::Index.index()] = Some(idx_tab_batch(
+        engine.allocate_index_id().unwrap(),
+        tid,
+        pack_pk_cols(&[1]),
+        "public__t__idx_v",
+        gnitz_wire::IndexProps { is_unique: false },
+        1,
+    ));
+    let err = engine.precheck_bundle(&families, &[]).unwrap_err();
+    assert!(err.contains("only change"), "{err}");
+
+    // One column block altering two owners.
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    append(tid, &mut bb);
+    append(other, &mut bb);
+    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+    families[SysFamily::Column.index()] = Some(bb.finish());
+    let err = engine.precheck_bundle(&families, &[]).unwrap_err();
+    assert!(err.contains("only change"), "{err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
