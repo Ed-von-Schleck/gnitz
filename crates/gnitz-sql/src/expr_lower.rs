@@ -931,12 +931,29 @@ pub(crate) fn compile_bound_expr_to_program(
     Ok(eb.build(Some(reg))?)
 }
 
-/// Compile the AND of `conjuncts` as a filter program. A true-constant conjunct
-/// (the binder's fold of `IS NOT NULL` on a non-nullable column) tests nothing
-/// and is dropped wherever it sits; `None` is the statically-true verdict once
-/// nothing is left, on which the caller keeps every row rather than paying a
-/// per-row evaluation. A false constant keeps its program: it must still drop
-/// every row.
+/// An expression's truth when its `NOT` / `AND` / `OR` connectives settle it over
+/// integer literals: exact wherever it is read, since `true OR NULL` is true and
+/// `false AND NULL` is false.
+fn constant_truth(e: &BoundExpr) -> Option<bool> {
+    let settle = |l: &BoundExpr, r: &BoundExpr, absorbing: bool| match (constant_truth(l), constant_truth(r)) {
+        (Some(t), _) | (_, Some(t)) if t == absorbing => Some(absorbing),
+        (Some(_), Some(_)) => Some(!absorbing),
+        _ => None,
+    };
+    match e {
+        BoundExpr::LitInt(v) => Some(*v != 0),
+        BoundExpr::Not(inner) => constant_truth(inner).map(|t| !t),
+        BoundExpr::BinOp(l, BinOp::Or, r) => settle(l, r, true),
+        BoundExpr::BinOp(l, BinOp::And, r) => settle(l, r, false),
+        _ => None,
+    }
+}
+
+/// Compile the AND of `conjuncts` as a filter program. A constant-true conjunct
+/// tests nothing and is dropped wherever it sits; `None` is the
+/// statically-true verdict once nothing is left, on which the caller keeps every
+/// row rather than paying a per-row evaluation. A false constant keeps its
+/// program: it must still drop every row.
 pub(crate) fn compile_filter_program<'a>(
     conjuncts: impl IntoIterator<Item = &'a BoundExpr>,
     cols: &[ColumnDef],
@@ -945,7 +962,7 @@ pub(crate) fn compile_filter_program<'a>(
     let mut backend = OpcodeBackend { cols, eb: &mut eb };
     let mut acc: Option<Reg> = None;
     for e in conjuncts {
-        if matches!(e, BoundExpr::LitInt(v) if *v != 0) {
+        if constant_truth(e) == Some(true) {
             continue;
         }
         let (r, _) = backend.lower_num(e)?;

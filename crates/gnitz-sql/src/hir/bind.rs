@@ -894,10 +894,6 @@ fn bind_exists_sub(
         )?;
         nullable = hircol_of(outer_env, outer).def.is_nullable || hircol_of(&ir.inner_cols, inner).def.is_nullable;
         correlation.push(BExpr::bin(BExpr::ColRef(outer), BinOp::Eq, BExpr::ColRef(inner)));
-    } else if correlation.is_empty() {
-        return Err(GnitzSqlError::Unsupported(
-            "uncorrelated EXISTS (no conjunct pairing an outer and an inner column) is not supported".into(),
-        ));
     }
     let subref = SubqueryRef {
         id: cx.cx.ids.next(),

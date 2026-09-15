@@ -1,47 +1,31 @@
-//! The AST-free circuit primitives the join and EXISTS/IN lowering shells drive:
-//! the equi and range/band prologues, the term pair each emits, the pure-range
-//! threshold pipeline, the null-fill tails, and the synthetic-key column defs.
+//! The AST-free circuit primitives the one join shell drives: the equi and
+//! range/band prologues, the term pair each emits, the pure-range threshold
+//! pipeline, the null-fill tails, and the synthetic-key column defs.
 //!
 //! The axis against [`super::prims`] is granularity: `prims` builds one program or
 //! emits at most one node; every item here emits a multi-node DBSP construction.
 
-use super::super::{slot_of, EqPair, HirRange, JoinType};
-use super::prims::{multi_null_filter_prog, null_gate, rekey_on_source_pk, self_derived_key};
+use super::super::{slot_of, HirRange, JoinClass, JoinType};
+use super::prims::{null_gate, rekey_on_source_pk, self_derived_key};
 use super::JoinSide;
 use crate::error::GnitzSqlError;
 
 use gnitz_core::{Circuit, ColumnDef, NodeId, RangeRel, ReindexRole, ReindexSlot, Schema, TypeCode};
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc, JoinKind};
 
-/// A join's equality pairs resolved against both inputs: each side's key-column
-/// positions in its own layout, and the per-pair promoted type codes.
-struct EquiKeys {
-    left: Vec<usize>,
-    right: Vec<usize>,
-    tcs: Vec<TypeCode>,
-}
-
-/// Resolve a join's equality pairs to [`EquiKeys`] — the shared key prologue of
-/// every equi/range emit, join and EXISTS/IN alike.
-fn resolve_eq_cols(eq: &[EqPair], left: &JoinSide, right: &JoinSide) -> Result<EquiKeys, GnitzSqlError> {
-    Ok(EquiKeys {
-        left: eq
-            .iter()
-            .map(|p| slot_of(&left.frame.layout, p.left))
-            .collect::<Result<_, _>>()?,
-        right: eq
-            .iter()
-            .map(|p| slot_of(&right.frame.layout, p.right))
-            .collect::<Result<_, _>>()?,
-        tcs: eq.iter().map(|p| p.tc).collect(),
-    })
+/// One side's join key columns — the equality columns, then the range column — as
+/// positions in its own layout.
+fn join_key_slots(class: &JoinClass, side: &JoinSide, is_left: bool) -> Result<Vec<usize>, GnitzSqlError> {
+    class
+        .key_cols(is_left)
+        .map(|id| slot_of(&side.frame.layout, id))
+        .collect()
 }
 
 /// This side's reindex key: each slot's source column paired with the carried
 /// target type from `carried_reindex_tc` — `T_i` only where this side's own
 /// self-derived type disagrees with it, else `None`, so the engine stays the
-/// sole producer of the derived slot type. Shared by the equi, range/band and
-/// EXISTS/IN builders, which differ only in what `slot_tcs` spans.
+/// sole producer of the derived slot type.
 fn side_reindex_key(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {
     cols.iter()
         .zip(slot_tcs)
@@ -53,7 +37,7 @@ fn side_reindex_key(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]
 /// payload layout and union them. Term AB is already canonical
 /// (`[_join_pk × k, A, B]`); term BA is `[_join_pk × k, B, A]` and is reordered.
 /// Shared verbatim by the equi (`k = eq slots`) and range (`k = n_eq + 1`)
-/// builders, and by the band EXISTS/IN semi-join circuit.
+/// builders.
 fn normalize_to_ab(
     cb: &mut Circuit,
     join_ab: NodeId,
@@ -83,49 +67,68 @@ pub(super) fn ba_to_ab_cols(k: usize, left_n: usize, right_n: usize) -> impl Ite
 /// One join side as a prologue gated and reindexed it.
 pub(crate) struct EquiSide<'a> {
     side: &'a JoinSide,
-    /// `P_all`: this side's *unfiltered* input re-keyed onto the join key, built
-    /// for a preserved side only.
-    all: Option<NodeId>,
-    cols: Vec<usize>,
-    key_nullable: bool,
-    pub(crate) reindex: NodeId,
+    /// This side's rows with NULL keys kept, re-keyed ungated, for a side emitting
+    /// its unmatched rows; any other side's `reindex`, which nothing reads as `all`.
+    all: NodeId,
+    reindex: NodeId,
 }
 
 /// NULL-gate `input` over `cols` (SQL 3VL: a NULL key matches nothing) and
 /// reindex it onto its key — the one side of either prologue.
 ///
-/// A `preserved` side's `P_all` is built ahead of the gate's filter, so the
-/// filter is `input`'s last reader and moves the register rather than copying the
-/// whole delta every epoch.
+/// A `gate_after` side re-keys the ungated input once, as `all`, and gates that
+/// re-key over the nullable key columns its keep list carries, so its matched rows
+/// and `all` are byte-identical and cancel.
 fn gated_side<'a>(
     cb: &mut Circuit,
     side: &'a JoinSide,
     input: NodeId,
     cols: Vec<usize>,
     tcs: &[TypeCode],
-    preserved: bool,
+    gate_after: bool,
 ) -> Result<EquiSide<'a>, GnitzSqlError> {
     let columns = &side.frame.schema.columns;
     let key = side_reindex_key(&cols, columns, tcs);
-    let all = preserved.then(|| cb.map_reindex(input, &key, &side.keep, ReindexRole::ScatterKey));
-    let (gated, key_nullable) = null_gate(cb, input, &cols, columns)?;
-    let reindex = match all {
-        // Nothing gated: the reindex over `input` already is `P_all`.
-        Some(all) if !key_nullable => all,
-        _ => cb.map_reindex(gated, &key, &side.keep, ReindexRole::ScatterKey),
-    };
-    Ok(EquiSide { side, all, cols, key_nullable, reindex })
+    if !gate_after {
+        let gated = null_gate(cb, input, &cols, columns)?;
+        let reindex = cb.map_reindex(gated, &key, &side.keep, ReindexRole::ScatterKey);
+        return Ok(EquiSide { side, all: reindex, reindex });
+    }
+    let all = cb.map_reindex(input, &key, &side.keep, ReindexRole::ScatterKey);
+    let k = tcs.len();
+    let gate_cols: Vec<usize> = cols
+        .iter()
+        .filter(|&&c| columns[c].is_nullable)
+        .map(|&c| {
+            let at = side.keep.iter().position(|&kept| kept as usize == c);
+            k + at.expect("the keep rule keeps a nullable key column of a side emitting its unmatched rows")
+        })
+        .collect();
+    let coldefs: Vec<ColumnDef> = join_pk_coldefs(tcs)
+        .into_iter()
+        .chain(side.coldefs.iter().cloned())
+        .collect();
+    let reindex = null_gate(cb, all, &gate_cols, &coldefs)?;
+    Ok(EquiSide { side, all, reindex })
+}
+
+/// `all − π`, where `π` is `all`'s matched multiplicity keyed like it. Clamped at
+/// zero unless the other side is unique on the equality key, which bounds it by
+/// `all`.
+fn unmatched(cb: &mut Circuit, all: NodeId, pi: NodeId, other_unique: bool) -> NodeId {
+    match other_unique {
+        true => cb.difference(all, pi),
+        false => cb.positive_diff(all, pi),
+    }
 }
 
 /// What [`equi_prologue`] hands back: the two sides as it built them, the term
-/// pair over them, and the per-slot common types. The key arity, the output
-/// `_join_pk` defs and each side's kept width are accessors here rather than
-/// facts a caller restates.
+/// pair over them, and the per-slot common types.
 pub(crate) struct EquiTerms<'a> {
     sides: [EquiSide<'a>; 2],
     tcs: Vec<TypeCode>,
-    pub(crate) join_ab: NodeId,
-    pub(crate) join_ba: NodeId,
+    join_ab: NodeId,
+    join_ba: NodeId,
 }
 
 impl<'a> EquiTerms<'a> {
@@ -148,20 +151,28 @@ impl<'a> EquiTerms<'a> {
         )
     }
 
-    /// The view's output PK column defs.
-    pub(crate) fn out_pk_coldefs(&self) -> Vec<ColumnDef> {
-        join_pk_coldefs(&self.tcs)
-    }
-
     /// This side's kept-payload width in the merged `[_join_pk, kept-A, kept-B]`
     /// layout.
     pub(crate) fn kept_n(&self, is_left: bool) -> usize {
         self.side(is_left).side.n()
     }
 
-    /// `P_all` — that side's unfiltered input re-keyed onto the join key.
+    /// The type codes of that side's kept payload.
+    pub(crate) fn kept_type_codes(&self, is_left: bool) -> Vec<u8> {
+        self.side(is_left).side.kept_type_codes()
+    }
+
+    /// `P_all` — that side's input re-keyed onto the join key, NULL keys kept.
     pub(crate) fn p_all(&self, is_left: bool) -> NodeId {
-        self.side(is_left).all.expect("P_all is built for every preserved side")
+        self.side(is_left).all
+    }
+
+    /// `ν_P`: that side's rows no row of `inner` matches, keyed like `inner`.
+    pub(crate) fn nu(&self, cb: &mut Circuit, inner: NodeId, is_left: bool, other_unique: bool) -> NodeId {
+        let p0 = self.k() + if is_left { 0 } else { self.kept_n(true) };
+        let proj: Vec<u32> = (p0..p0 + self.kept_n(is_left)).map(|c| c as u32).collect();
+        let pi = cb.map(inner, &proj); // π_P(inner) = [_join_pk, P]
+        unmatched(cb, self.p_all(is_left), pi, other_unique)
     }
 
     fn side(&self, is_left: bool) -> &EquiSide<'a> {
@@ -170,21 +181,33 @@ impl<'a> EquiTerms<'a> {
 }
 
 /// Gate and reindex both sides on the eq pairs, then emit the symmetric 2-term
-/// join over them. `preserved` names the sides whose `P_all` a caller reads.
+/// join over them. `b_unique` says B is unique on the equality columns.
 pub(crate) fn equi_prologue<'a>(
     cb: &mut Circuit,
-    eq: &[EqPair],
+    class: &JoinClass,
     sides: &'a [JoinSide; 2],
     inputs: [NodeId; 2],
-    preserved: [bool; 2],
+    kind: JoinType,
+    b_unique: bool,
 ) -> Result<EquiTerms<'a>, GnitzSqlError> {
-    let EquiKeys { left, right, tcs } = resolve_eq_cols(eq, &sides[0], &sides[1])?;
-    let b = gated_side(cb, &sides[1], inputs[1], right, &tcs, preserved[1])?;
-    let a = gated_side(cb, &sides[0], inputs[0], left, &tcs, preserved[0])?;
+    let tcs: Vec<TypeCode> = class.eq.iter().map(|p| p.tc).collect();
+    let side = |cb: &mut Circuit, is_left: bool| {
+        let i = usize::from(!is_left);
+        let cols = join_key_slots(class, &sides[i], is_left)?;
+        gated_side(cb, &sides[i], inputs[i], cols, &tcs, kind.emits_unmatched(is_left))
+    };
+    let b = side(cb, false)?;
+    let a = side(cb, true)?;
+    // A decorrelated join asks only whether a key exists: B as a set weighs every
+    // match 1, so the joined A rows are the matched set at their own weight.
+    let b_delta = match kind.is_decorrelated() && !b_unique {
+        true => cb.distinct(b.reindex),
+        false => b.reindex,
+    };
     let trace_a = cb.integrate_trace(a.reindex);
-    let trace_b = cb.integrate_trace(b.reindex);
+    let trace_b = cb.integrate_trace(b_delta);
     let join_ab = cb.join(a.reindex, trace_b, JoinKind::Equi); // ΔA ⋈ z^{-1}(I(B))
-    let join_ba = cb.join(b.reindex, trace_a, JoinKind::Equi); // ΔB ⋈ z^{-1}(I(A))
+    let join_ba = cb.join(b_delta, trace_a, JoinKind::Equi); // ΔB ⋈ z^{-1}(I(A))
     Ok(EquiTerms { sides: [a, b], tcs, join_ab, join_ba })
 }
 
@@ -205,8 +228,7 @@ fn rekey_pk_coldefs<'a>(
 }
 
 /// The leading output PK columns of a range/band or cross join: A's then B's
-/// source PK, `_pair_pk_{slot}`-numbered across both sides. One home for both
-/// range emitters.
+/// source PK, `_pair_pk_{slot}`-numbered across both sides.
 pub(super) fn pair_pk_coldefs(left_schema: &Schema, right_schema: &Schema) -> Vec<ColumnDef> {
     rekey_pk_coldefs(
         left_schema
@@ -292,29 +314,29 @@ pub(super) fn emit_range_null_fill_tail(
     cb.map(nf_rekey, &nf_full_projection)
 }
 
-/// `(P_all, π_P(inner))`, the operands of a band `ν_P`, both keyed on P's source PK.
-/// `payload_off` locates P inside the pre-rekey `[key region × k, A, B]` payload.
-pub(crate) fn band_nu_operands(
-    cb: &mut Circuit,
-    merged: NodeId,
-    k: usize,
-    payload_off: usize,
-    side: &JoinSide,
-    raw: NodeId,
-) -> (NodeId, NodeId) {
-    let base = k + payload_off;
+/// Re-key `node`, which carries `side`'s kept payload from `base` with its pinned
+/// source PK at the front, onto that PK, keeping the payload. One home, so every
+/// operand re-keyed onto a side's source PK is byte-identical and cancels.
+fn rekey_payload_pk(cb: &mut Circuit, node: NodeId, base: usize, side: &JoinSide) -> NodeId {
     let pk: Vec<usize> = (base..base + side.pa()).collect();
     let keep: Vec<u32> = (base as u32..(base + side.n()) as u32).collect();
-    let pi = cb.map_reindex(merged, &self_derived_key(&pk), &keep, ReindexRole::Auxiliary);
-    let all = rekey_on_source_pk(cb, raw, side, ReindexRole::Auxiliary);
-    (all, pi)
+    cb.map_reindex(node, &self_derived_key(&pk), &keep, ReindexRole::Auxiliary)
 }
 
-/// What both range builders carry out of [`range_prologue`]: the two gated,
-/// reindexed sides, the per-slot common types, and the canonical (left-to-right)
-/// range relation — term BA's rel, term AB's being its converse.
+/// What [`range_prologue`] hands back. `op` is the canonical (left-to-right) range
+/// relation — term BA's rel, term AB's being its converse.
 pub(crate) struct RangePrologue<'a> {
-    pub(crate) sides: [EquiSide<'a>; 2],
+    sides: &'a [JoinSide; 2],
+    inputs: [NodeId; 2],
+    /// A's range-keyed delta; `None` for an EXISTS/IN over a pure range, which
+    /// reads only the threshold.
+    reindex_a: Option<NodeId>,
+    reindex_b: NodeId,
+    /// A's owned slice keyed on its source PK, NULL range keys included — built for
+    /// a pure range with a ν over A.
+    owned_a: Option<NodeId>,
+    int_a: NodeId,
+    trace_a: NodeId,
     all_tcs: Vec<TypeCode>,
     op: RangeRel,
 }
@@ -322,44 +344,43 @@ pub(crate) struct RangePrologue<'a> {
 impl RangePrologue<'_> {
     /// The key arity: the eq prefix plus the one range slot — the width of the
     /// key region every term leads with.
-    pub(crate) fn k(&self) -> usize {
+    fn k(&self) -> usize {
         self.all_tcs.len()
     }
 
     /// The eq-prefix width the range probe matches on before comparing.
-    pub(crate) fn n_eq(&self) -> usize {
+    fn n_eq(&self) -> usize {
         self.k() - 1
     }
 
-    /// The two range terms and their normalization onto `[key region, A, B]`, each
-    /// term's `(delta, trace, relation)` triple paired once. The traces are
-    /// parameters because the pure-range shape integrates the worker-filtered slice
-    /// rather than the reindex itself.
-    pub(crate) fn range_merged(
-        &self,
-        cb: &mut Circuit,
-        trace_a: NodeId,
-        trace_b: NodeId,
-        left_n: usize,
-        right_n: usize,
-    ) -> NodeId {
+    /// The two range terms and their normalization onto `[key region, A, B]`. A pure
+    /// range integrates B's worker-filtered slice: an unfiltered trace against the
+    /// broadcast A delta would emit each pair once per worker.
+    pub(crate) fn merged(&self, cb: &mut Circuit) -> NodeId {
         let n_eq = self.n_eq() as u8;
-        let (reindex_a, reindex_b) = (self.sides[0].reindex, self.sides[1].reindex);
+        let reindex_a = self.reindex_a.expect("the pair terms read A's range-keyed delta");
+        let int_b = match n_eq {
+            0 => cb.worker_filter(self.reindex_b),
+            _ => self.reindex_b,
+        };
+        let trace_b = cb.integrate_trace(int_b);
         let join_ab = cb.join(reindex_a, trace_b, JoinKind::Range { n_eq, rel: self.op.converse() });
-        let join_ba = cb.join(reindex_b, trace_a, JoinKind::Range { n_eq, rel: self.op });
+        let join_ba = cb.join(self.reindex_b, self.trace_a, JoinKind::Range { n_eq, rel: self.op });
+        let (left_n, right_n) = (self.sides[0].n(), self.sides[1].n());
         normalize_to_ab(cb, join_ab, join_ba, self.k(), left_n, right_n)
     }
 
-    /// The pure-range matched set: the rows of A matching the one-row threshold
-    /// `m = MAX/MIN(b.range)`, re-keyed onto `[a.pk…, A]`.
-    pub(crate) fn pure_range_matched(&self, cb: &mut Circuit, int_a: NodeId, trace_a: NodeId) -> NodeId {
-        let left = self.sides[0].side;
+    /// `(A_owned, matched)` for a pure range: A's owned slice and the rows of it
+    /// matching the one-row threshold `m = MAX/MIN(b.range)`, both keyed on
+    /// `[a.pk…, A]`, so `A_owned − matched` is the unmatched set.
+    pub(crate) fn threshold(&self, cb: &mut Circuit) -> (NodeId, NodeId) {
+        let left = &self.sides[0];
         let (k, n_eq, left_n) = (self.k(), self.n_eq() as u8, left.n());
         let want_max = matches!(self.op, RangeRel::Lt | RangeRel::Le);
         let agg_func = if want_max { WireAggFunc::Max } else { WireAggFunc::Min };
 
         // Decodes the OPK key into a native payload value, so MIN/MAX order values.
-        let mbh = cb.map_hash_row(self.sides[1].reindex, &[(0, None)], 0);
+        let mbh = cb.map_hash_row(self.reindex_b, &[(0, None)], 0);
         // Local over the broadcast B, so every worker holds the same extremum. No
         // ground row: a `m = NULL` seed would break `A − 0 = A` over an empty B.
         // The COUNT is the cardinality gate every reduce carries; the reindex
@@ -372,76 +393,119 @@ impl RangePrologue<'_> {
         let reindex_m = cb.map_reindex(red, &self_derived_key(&[1]), &[], ReindexRole::Auxiliary);
         let trace_m = cb.integrate_trace(reindex_m);
 
-        let j_am = cb.join(int_a, trace_m, JoinKind::Range { n_eq, rel: self.op.converse() });
-        let j_ma = cb.join(reindex_m, trace_a, JoinKind::Range { n_eq, rel: self.op });
+        let j_am = cb.join(self.int_a, trace_m, JoinKind::Range { n_eq, rel: self.op.converse() });
+        let j_ma = cb.join(reindex_m, self.trace_a, JoinKind::Range { n_eq, rel: self.op });
         // Range-join output = [_join_pk x k, delta payload, trace payload]. `m` has no
         // payload, so A sits at `k..k + left_n` in both terms.
         let a_cols: Vec<u32> = (k..k + left_n).map(|c| c as u32).collect();
         let m_am = cb.map(j_am, &a_cols);
         let m_ma = cb.map(j_ma, &a_cols);
         let matched_raw = cb.union(m_am, m_ma); // [_join_pk(PK), A]
-        rekey_pure_range_a(cb, matched_raw, left.pa(), left_n)
+        let owned = self.owned_a.expect("a pure range with a ν over A owns A first");
+        (owned, rekey_payload_pk(cb, matched_raw, 1, left))
     }
 
-    /// `A − matched`, plus the NULL-range-key rows no threshold can match; `raw` is
-    /// A's input.
-    pub(crate) fn pure_range_unmatched(
-        &self,
-        cb: &mut Circuit,
-        matched: NodeId,
-        int_a: NodeId,
-        raw: NodeId,
-    ) -> Result<NodeId, GnitzSqlError> {
-        let left = self.sides[0].side;
-        let a_pass = rekey_pure_range_a(cb, int_a, left.pa(), left.n());
-        let neg = cb.negate(matched);
-        let nf_match = cb.union(a_pass, neg);
-        if self.sides[0].key_nullable {
-            union_null_key_rows(cb, nf_match, raw, &self.sides[0].cols, left)
-        } else {
-            Ok(nf_match)
-        }
+    /// `(P_all, ν_P)` for a band: P's input and its rows no inner row matches, both
+    /// keyed on P's source PK, over the [`Self::merged`] output.
+    pub(crate) fn nu(&self, cb: &mut Circuit, merged: NodeId, is_left: bool, other_unique: bool) -> (NodeId, NodeId) {
+        let i = usize::from(!is_left);
+        let base = self.k() + if is_left { 0 } else { self.sides[0].n() };
+        let pi = rekey_payload_pk(cb, merged, base, &self.sides[i]);
+        let all = rekey_on_source_pk(cb, self.inputs[i], &self.sides[i], ReindexRole::Auxiliary);
+        (all, unmatched(cb, all, pi, other_unique))
+    }
+
+    /// The [`Self::merged`] output re-keyed onto the source-PK pair `_pair_pk`,
+    /// dropping the per-term key region: every consumer reads the payload alone,
+    /// and each PK column also rides at the front of its side's kept payload.
+    pub(crate) fn pair_keyed(&self, cb: &mut Circuit, merged: NodeId) -> NodeId {
+        let (k, pl, pr) = (self.k(), self.sides[0].n(), self.sides[1].n());
+        cb.map_reindex(
+            merged,
+            &self_derived_key(&pair_pk_slots(self.sides, k, k + pl)),
+            &(k as u32..(k + pl + pr) as u32).collect::<Vec<_>>(),
+            ReindexRole::Auxiliary,
+        )
     }
 }
 
-/// Gate and reindex both sides on `[eq slots…, range slot]`.
+/// Gate and reindex both sides on `[eq slots…, range slot]`, and integrate A.
+///
+/// A pure range with a ν over A integrates A's PK-owned slice, which is also the
+/// minuend of its unmatched set, NULL range keys included; an INNER one integrates
+/// this worker's slice of the broadcast A.
 pub(crate) fn range_prologue<'a>(
     cb: &mut Circuit,
+    class: &JoinClass,
     sides: &'a [JoinSide; 2],
     inputs: [NodeId; 2],
-    eq: &[EqPair],
-    range: &HirRange,
+    kind: JoinType,
 ) -> Result<RangePrologue<'a>, GnitzSqlError> {
-    let (left, right) = (&sides[0], &sides[1]);
-    let EquiKeys {
-        left: left_cols,
-        right: right_cols,
-        tcs: eq_tcs,
-    } = resolve_eq_cols(eq, left, right)?;
-    let left_cols: Vec<usize> = left_cols
-        .into_iter()
-        .chain(std::iter::once(slot_of(&left.frame.layout, range.left)?))
-        .collect();
-    let right_cols: Vec<usize> = right_cols
-        .into_iter()
-        .chain(std::iter::once(slot_of(&right.frame.layout, range.right)?))
-        .collect();
-    let all_tcs: Vec<TypeCode> = eq_tcs.into_iter().chain(std::iter::once(range.tc)).collect();
-    let a = gated_side(cb, left, inputs[0], left_cols, &all_tcs, false)?;
-    let b = gated_side(cb, right, inputs[1], right_cols, &all_tcs, false)?;
-    Ok(RangePrologue { sides: [a, b], all_tcs, op: range.op })
+    let range = class.range.expect("range_prologue receives a range class");
+    let all_tcs: Vec<TypeCode> = class.eq.iter().map(|p| p.tc).chain([range.tc]).collect();
+    let pure = class.eq.is_empty();
+    let reindex = |cb: &mut Circuit, is_left: bool| -> Result<NodeId, GnitzSqlError> {
+        let i = usize::from(!is_left);
+        let cols = join_key_slots(class, &sides[i], is_left)?;
+        Ok(gated_side(cb, &sides[i], inputs[i], cols, &all_tcs, false)?.reindex)
+    };
+    let reindex_a = match pure && kind.is_decorrelated() {
+        true => None,
+        false => Some(reindex(cb, true)?),
+    };
+    let (owned_a, int_a) = match reindex_a {
+        _ if pure && kind.has_nu(true) => {
+            let (owned, int_a) = own_a(cb, &sides[0], inputs[0], range, reindex_a.is_none())?;
+            (Some(owned), int_a)
+        }
+        Some(r) if pure => (None, cb.worker_filter(r)),
+        Some(r) => (None, r),
+        None => unreachable!("an EXISTS/IN over a pure range has a ν over A"),
+    };
+    let trace_a = cb.integrate_trace(int_a);
+    let reindex_b = reindex(cb, false)?;
+    Ok(RangePrologue {
+        sides,
+        inputs,
+        reindex_a,
+        reindex_b,
+        owned_a,
+        int_a,
+        trace_a,
+        all_tcs,
+        op: range.op,
+    })
 }
 
-/// The pure-range `[Tc PK, A_kept]` -> `[a.pk…, A_kept]` re-key. One home, so the
-/// matched set's `−a` and the passthrough's `+a` are byte-identical and cancel.
-fn rekey_pure_range_a(cb: &mut Circuit, node: NodeId, pa: usize, pl: usize) -> NodeId {
-    let keep: Vec<u32> = (1..1 + pl as u32).collect();
-    cb.map_reindex(
-        node,
-        &self_derived_key(&(1..1 + pa).collect::<Vec<_>>()),
-        &keep,
-        ReindexRole::Auxiliary,
-    )
+/// `(owned, int_a)`: A's rows re-keyed onto their source PK and kept on its owner,
+/// and that slice NULL-gated and re-keyed onto the range column. `scatter` makes
+/// the PK re-key A's scatter key.
+fn own_a(
+    cb: &mut Circuit,
+    side: &JoinSide,
+    input: NodeId,
+    range: HirRange,
+    scatter: bool,
+) -> Result<(NodeId, NodeId), GnitzSqlError> {
+    let role = match scatter {
+        true => ReindexRole::ScatterKey,
+        false => ReindexRole::Auxiliary,
+    };
+    let range_slot = slot_of(&side.frame.layout, range.left)?;
+    let owned = rekey_on_source_pk(cb, input, side, role);
+    let owned = cb.worker_filter(owned); // [a.pk, kept A]
+    let pa = side.pa();
+    let coldefs: Vec<ColumnDef> = src_pk_coldefs(&side.frame.schema)
+        .into_iter()
+        .chain(side.coldefs.iter().cloned())
+        .collect();
+    let at = side.keep.iter().position(|&c| c as usize == range_slot);
+    let cols = vec![pa + at.expect("the keep rule keeps a pure range's range column")];
+    let gated = null_gate(cb, owned, &cols, &coldefs)?;
+    let key = side_reindex_key(&cols, &coldefs, &[range.tc]);
+    let keep: Vec<u32> = (pa as u32..(pa + side.n()) as u32).collect();
+    let int_a = cb.map_reindex(gated, &key, &keep, ReindexRole::Auxiliary); // [range key, kept A]
+    Ok((owned, int_a))
 }
 
 /// The k synthetic `_join_pk` output PK columns of an equi join / equi EXISTS
@@ -465,86 +529,4 @@ pub(crate) fn join_pk_coldefs(target_tcs: &[TypeCode]) -> Vec<ColumnDef> {
             ColumnDef::new(name, t, false).hidden()
         })
         .collect()
-}
-
-/// Union the pure-range NULL-range-key rows into `nf_match` (`A − matched`):
-/// NULL-key rows never reach the integrated trace (3VL) and never match the
-/// threshold, so they get their own branch off the NULL-gate-unfiltered
-/// `source`, re-keyed to the preserved side's source PK and routed ONCE by a
-/// local `worker_filter` (no exchange) — broadcast would emit W× copies the
-/// output shard would sum. (The compiler makes the filter a keep-all identity
-/// for an all-replicated view, which runs correct-local over the full broadcast
-/// on every worker.) `source` is the caller's semantic preserved input (the raw
-/// input for the LEFT join; the locally pre-filtered outer for EXISTS).
-fn union_null_key_rows(
-    cb: &mut Circuit,
-    nf_match: NodeId,
-    source: NodeId,
-    cols: &[usize],
-    left: &JoinSide,
-) -> Result<NodeId, GnitzSqlError> {
-    let anull = cb.filter(
-        source,
-        multi_null_filter_prog(cols, &left.frame.schema.columns, true)?.to_blob_bytes(),
-    );
-    let anull_keyed = rekey_on_source_pk(cb, anull, left, ReindexRole::Auxiliary);
-    let anull_owned = cb.worker_filter(anull_keyed);
-    Ok(cb.union(nf_match, anull_owned))
-}
-
-/// `inner ∪ ν_A ∪ ν_B` — the equi outer join's null-fill, unioned onto the inner
-/// output for each preserved side; `inner_merged` unchanged for INNER.
-/// Semi/Anti/Mark never reach here: `preserves` is `false` for all three, and
-/// their own ν is composed in `exists.rs`.
-///
-/// Per preserved side P, `ν_P = positive_part(P_all − π_P(inner))`. `π_P(inner)`
-/// re-keys the inner output back to P's identity carrying the matched
-/// multiplicity `m = w_P·S`, and `P_all` re-keys the *unfiltered* P input with the
-/// same reindex program, so a matched row's `+w_P` and `−m` cancel before the
-/// clamp. Both operands sit on the `_join_pk` worker, so the difference is
-/// partition-local. Subtracting the raw multiplicity keeps it weight-exact for a
-/// bag-valued preserved side and absorbs the within-epoch and cross-epoch
-/// transients.
-///
-/// `inner_merged` feeds both `π_P` and these unions, so it rides the
-/// non-destructive second union operand throughout (`op_union` empties the first).
-pub(crate) fn emit_equi_null_fill(
-    cb: &mut Circuit,
-    inner_merged: NodeId,
-    kind: JoinType,
-    terms: &EquiTerms<'_>,
-) -> NodeId {
-    if kind == JoinType::Inner {
-        return inner_merged;
-    }
-    let k = terms.k();
-    let (pl, pr) = (terms.kept_n(true), terms.kept_n(false));
-    // Each preserved side P: `p0` locates its kept payload in the merged layout
-    // (`k` for A, `k + pl` for B) and the other side supplies the NULL region.
-    // Every branch is built before the first union, so each `π_P` reads
-    // `inner_merged` ahead of the union that could move it.
-    let branches: Vec<NodeId> = [(true, k, pl), (false, k + pl, pr)]
-        .into_iter()
-        .filter(|&(preserved_is_left, ..)| kind.preserves(preserved_is_left))
-        .map(|(preserved_is_left, p0, p_n)| {
-            let p_all = terms.p_all(preserved_is_left);
-            let proj_p = cb.map(inner_merged, &(p0..p0 + p_n).map(|c| c as u32).collect::<Vec<_>>()); // π_P(inner) = [_join_pk, P]
-            let nu_p = cb.positive_diff(p_all, proj_p); // max(0, P − π_P(inner))
-                                                        // A side that keeps nothing contributes no NULL region at all.
-            let o_tcs = terms.side(!preserved_is_left).side.kept_type_codes();
-            let ext = if o_tcs.is_empty() {
-                nu_p
-            } else {
-                cb.null_extend(nu_p, &o_tcs)
-            };
-            if preserved_is_left {
-                ext // [_join_pk, A, NULL-B] — canonical
-            } else {
-                cb.map(ext, &ba_to_ab_cols(k, pl, pr).collect::<Vec<_>>())
-            }
-        })
-        .collect();
-    branches
-        .into_iter()
-        .fold(inner_merged, |merged, branch| cb.union(branch, merged))
 }

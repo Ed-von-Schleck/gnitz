@@ -573,11 +573,17 @@ impl JoinType {
     /// Whether this side gets a **ν** — the unmatched set
     /// `positive_part(P_all − π_P(inner))`. Wider than [`Self::preserves`], which
     /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
-    /// neither side yet all three build a ν over their left side to decide match
-    /// existence. The reindex keep set protects exactly the ν operands, so it asks
-    /// this rather than `preserves`.
+    /// neither side yet all three decide per left row by match existence. The
+    /// reindex keep set protects exactly the ν operands, so it asks this rather
+    /// than `preserves`.
     pub(crate) fn has_nu(self, is_left: bool) -> bool {
         self.preserves(is_left) || (is_left && self.is_decorrelated())
+    }
+
+    /// Whether this side's unmatched rows are an output: a null-fill, an anti row,
+    /// or a mark-0 row. A Semi reads no complement.
+    pub(crate) fn emits_unmatched(self, is_left: bool) -> bool {
+        self.preserves(is_left) || (is_left && matches!(self, JoinType::Anti | JoinType::Mark(_)))
     }
 }
 
@@ -612,11 +618,60 @@ pub(crate) struct JoinClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinShape {
     Equi,
-    Range,
+    /// A range conjunct behind an equality prefix.
+    Band,
+    /// A range conjunct with no equality prefix.
+    PureRange,
     Cross,
 }
 
+/// The key a join step's output rows carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutKey {
+    /// The equi join key: each match is made once, on the worker its operands meet on.
+    JoinKey,
+    /// Both sides' source PKs, computed after the join, away from the worker owning it.
+    PairPk,
+    /// The outer side's source PK; `owned` when every row was kept on that PK's
+    /// owner before the join.
+    OuterPk { owned: bool },
+}
+
+impl OutKey {
+    /// Which sides pin their `pk_cols` to the front of the keep list.
+    pub(crate) fn pins(self) -> [bool; 2] {
+        match self {
+            OutKey::JoinKey => [false, false],
+            OutKey::PairPk => [true, true],
+            OutKey::OuterPk { .. } => [true, false],
+        }
+    }
+
+    /// Whether the output needs the `shard(0..npk)` exchange.
+    pub(crate) fn exchanged(self) -> bool {
+        matches!(self, OutKey::PairPk | OutKey::OuterPk { owned: false })
+    }
+}
+
 impl JoinClass {
+    /// The key a step of `kind` over these keys emits its rows under.
+    pub(crate) fn out_key(&self, kind: JoinType) -> OutKey {
+        match (self.shape(), kind.is_decorrelated()) {
+            (JoinShape::Equi, _) => OutKey::JoinKey,
+            (JoinShape::Band, true) => OutKey::OuterPk { owned: false },
+            (JoinShape::PureRange, true) => OutKey::OuterPk { owned: true },
+            (JoinShape::Band | JoinShape::PureRange | JoinShape::Cross, _) => OutKey::PairPk,
+        }
+    }
+
+    /// Whether `side`'s rows are unique on this join's equality columns, so a row of
+    /// the other side matches at most one of them.
+    pub(crate) fn side_unique(&self, side: &RelExpr, is_left: bool) -> bool {
+        side.unique_key().is_some_and(|key| {
+            key.iter()
+                .all(|c| self.eq.iter().any(|p| (if is_left { p.left } else { p.right }) == *c))
+        })
+    }
     /// The key columns this ON names on one side — what that side's reindex reads,
     /// and so what a cut input must keep however narrow the demand above it is.
     pub(crate) fn key_cols(&self, is_left: bool) -> impl Iterator<Item = ColId> + '_ {
@@ -629,7 +684,8 @@ impl JoinClass {
 
     pub(crate) fn shape(&self) -> JoinShape {
         match (self.range.is_some(), self.eq.is_empty()) {
-            (true, _) => JoinShape::Range,
+            (true, true) => JoinShape::PureRange,
+            (true, false) => JoinShape::Band,
             (false, true) => JoinShape::Cross,
             (false, false) => JoinShape::Equi,
         }
@@ -720,6 +776,9 @@ impl RelExpr {
     /// The output columns identifying a row uniquely, or `None` where rows have no
     /// unique key.
     pub(crate) fn row_key(&self) -> Option<Vec<ColId>> {
+        if let Some(mapped) = self.key_through(RelExpr::row_key) {
+            return mapped;
+        }
         match self {
             RelExpr::Get { source, schema, cols } => {
                 if source.is_stream() {
@@ -734,19 +793,8 @@ impl RelExpr {
                 }
                 Some(pk.iter().map(|&i| cols[i as usize].id).collect())
             }
-            RelExpr::Filter { input, .. } => input.row_key(),
-            RelExpr::Project { input, items } => input
-                .row_key()?
-                .iter()
-                .map(|k| items.iter().find(|it| as_col(&it.expr) == Some(*k)).map(|it| it.out.id))
-                .collect(),
-            RelExpr::Alias { input, cols } => {
-                let in_cols = input.cols();
-                input
-                    .row_key()?
-                    .iter()
-                    .map(|k| in_cols.iter().position(|c| c.id == *k).map(|p| cols[p].id))
-                    .collect()
+            RelExpr::Filter { .. } | RelExpr::Project { .. } | RelExpr::Alias { .. } => {
+                unreachable!("key_through maps a pass-through node")
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
@@ -767,6 +815,48 @@ impl RelExpr {
                 _ => None,
             },
         }
+    }
+
+    /// Columns no two live rows share a value of, where that is enforced rather than
+    /// inferred: a base table's PK and a reduce's group columns, through filters,
+    /// pass-through projections and aliases.
+    pub(crate) fn unique_key(&self) -> Option<Vec<ColId>> {
+        if let Some(mapped) = self.key_through(RelExpr::unique_key) {
+            return mapped;
+        }
+        match self {
+            RelExpr::Get {
+                source: GetSource::Catalog { desc },
+                schema,
+                cols,
+            } if desc.class == gnitz_core::RelClass::Table => {
+                Some(schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
+            }
+            RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
+            _ => None,
+        }
+    }
+
+    /// `key` of a pass-through node's input, renamed to this node's output ids —
+    /// `None` when `self` is not a filter, projection or alias.
+    fn key_through(&self, key: fn(&RelExpr) -> Option<Vec<ColId>>) -> Option<Option<Vec<ColId>>> {
+        Some(match self {
+            RelExpr::Filter { input, .. } => key(input),
+            RelExpr::Project { input, items } => key(input).and_then(|k| {
+                k.iter()
+                    .map(|k| items.iter().find(|it| as_col(&it.expr) == Some(*k)).map(|it| it.out.id))
+                    .collect()
+            }),
+            RelExpr::Alias { input, cols } => {
+                let in_cols = input.cols();
+                key(input).and_then(|k| {
+                    k.iter()
+                        .map(|k| in_cols.iter().position(|c| c.id == *k).map(|p| cols[p].id))
+                        .collect()
+                })
+            }
+            _ => return None,
+        })
     }
 
     /// A set operation. Pairs the two sides' output columns positionally,

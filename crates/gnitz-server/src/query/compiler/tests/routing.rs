@@ -109,8 +109,9 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // Compound PK (a, b) at columns 0, 1; column 2 is payload.
     let compound = pk_payload_schema(&[type_code::U64; 2]);
     let ext = sources([(7, compound)]);
+    let none = FxHashSet::default();
     let co = |cols: Vec<gnitz_wire::ReindexSlot>| {
-        compute_co_partitioned(&JoinShardMap::from_iter([(7i64, cols)]), &ext, &FxHashSet::default()).contains(&7)
+        compute_co_partitioned(&JoinShardMap::from_iter([(7i64, cols)]), &ext, &none, &none).contains(&7)
     };
     assert!(co(vec![(0, None), (1, None)]), "shard [pk0, pk1] equals pk_indices()");
     assert!(
@@ -130,10 +131,16 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     let base = make_schema_u64_i64;
     let replicated = base().with_placement(Placement::Replicated);
     let join_on_payload = JoinShardMap::from_iter([(7i64, vec![(1u32, None)]), (8i64, vec![(1u32, None)])]);
-    let both_skip = |ext: RelationRegistry, outside_joins: &[i64]| {
-        let co = compute_co_partitioned(&join_on_payload, &ext, &outside_joins.iter().copied().collect());
+    let skips = |ext: RelationRegistry, outside_joins: &[i64], set_fed: &[i64]| {
+        let co = compute_co_partitioned(
+            &join_on_payload,
+            &ext,
+            &outside_joins.iter().copied().collect(),
+            &set_fed.iter().copied().collect(),
+        );
         (co.contains(&7), co.contains(&8))
     };
+    let both_skip = |ext: RelationRegistry, outside_joins: &[i64]| skips(ext, outside_joins, &[]);
     assert_eq!(
         both_skip(sources([(7, base()), (8, base())]), &[]),
         (false, false),
@@ -163,6 +170,18 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
         (true, true),
         "replicated ⋈ replicated"
     );
+    // A partitioned side clamped to a set needs every row of a key on one worker,
+    // so it scatters by the key while its replicated partner still skips.
+    assert_eq!(
+        skips(sources([(7, replicated), (8, base())]), &[], &[8]),
+        (true, false),
+        "a partitioned set-fed side scatters beside a skipping replicated partner"
+    );
+    assert_eq!(
+        skips(sources([(7, replicated), (8, base())]), &[], &[7]),
+        (true, true),
+        "a replicated side clamps its whole copy on every worker, so it keeps its skip"
+    );
     // The write broadcast already put a replicated source's full trace on every
     // worker, so the promotion gate that blocks a partitioned source does not
     // apply to it.
@@ -171,6 +190,7 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
         compute_co_partitioned(
             &JoinShardMap::from_iter([(7i64, vec![(0u32, Some(TypeCode::I64))])]),
             &ext_r,
+            &FxHashSet::default(),
             &FxHashSet::default()
         )
         .contains(&7),
@@ -438,6 +458,53 @@ fn a_broadcast_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip(
     assert!(keyed_by_pk(JoinKind::Cross), "the cross join must relay anyway");
 }
 
+/// A source whose PK re-key only an owner filter reads needs its rows on that PK's
+/// owner and nowhere else, so under a broadcast join relay it routes by the PK and
+/// skips the relay where its distribution already places it there. The partner
+/// feeding the join directly still broadcasts.
+///
+///   ScanDelta(7) → Map(reindex pk) → WorkerFilter → IntegrateTrace ─┐
+///   ScanDelta(9) → Map(reindex [1]) ──────────────────────────────→ Join(range, n_eq 0)
+#[test]
+fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
+    let meta = |schema: SchemaDescriptor| {
+        let loaded = loaded_for_test(
+            [
+                (0, scan_delta(7)),
+                (1, scatter_reindex(&[0])),
+                (2, OpNode::WorkerFilter),
+                (3, OpNode::IntegrateTrace),
+                (4, scan_delta(9)),
+                (5, scatter_reindex(&[1])),
+                (6, OpNode::Join(pure_range(0))),
+                (7, OpNode::IntegrateSink),
+            ],
+            vec![
+                (0, 1, SLOT_IN),
+                (1, 2, SLOT_IN),
+                (2, 3, SLOT_IN),
+                (4, 5, SLOT_IN),
+                (5, 6, SLOT_IN),
+                (3, 6, SLOT_TRACE),
+                (6, 7, SLOT_IN),
+            ],
+        );
+        ViewMeta::derive(&loaded, &sources([(7, schema), (9, make_schema_u64_i64())])).unwrap()
+    };
+    let keyed = meta(make_schema_u64_i64());
+    assert_eq!(join_cols(keyed.relay_route(7)), Some(vec![0]), "routed by its PK");
+    assert!(!keyed.scatters(7), "already on its PK's owner");
+    assert!(matches!(keyed.relay_route(9), RelayRoute::Broadcast));
+    assert!(keyed.scatters(9));
+
+    let replicated = meta(make_schema_u64_i64().with_placement(Placement::Replicated));
+    assert_eq!(join_cols(replicated.relay_route(7)), Some(vec![0]));
+    assert!(
+        replicated.scatters(7),
+        "a replicated copy is relayed by key from one worker"
+    );
+}
+
 /// `repartitions` is the single bit `source_placement` reads before letting a
 /// view inherit its source's placement, so each of its two terms is asserted on a
 /// circuit carrying that term ALONE — a fixture carrying both would pass with
@@ -639,8 +706,7 @@ fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
 /// (`a.x = b.p AND a.x = b.q`) reindexes `[x, x]`, possibly with distinct
 /// per-slot promotion targets, and the scatter packer must mirror the trace-side
 /// `ReindexPacker` slot-for-slot. Across sibling Maps carrying an IDENTICAL
-/// sequence (the not-null / null-key branches of a nullable LEFT-join key) it
-/// collapses to one, which concatenating would double.
+/// sequence it collapses to one, which concatenating would double.
 #[test]
 fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
     let overlapping = loaded_for_test(
@@ -721,12 +787,12 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
     };
     assert_eq!(
         scatter_key_of_scan(&circuit(scatter_reindex(&[1, 2]), aux_rekey()), 0),
-        (vec![vec![(1, None), (2, None)]], false),
+        (vec![vec![(1, None), (2, None)]], false, false),
         "only the trace/probe-feeding reindex defines the scatter key"
     );
     assert_eq!(
         scatter_key_of_scan(&circuit(aux_rekey(), aux_rekey()), 0),
-        (vec![], true),
+        (vec![], true, true),
         "a scan reaching no ScatterKey map at all is orphaned"
     );
 }

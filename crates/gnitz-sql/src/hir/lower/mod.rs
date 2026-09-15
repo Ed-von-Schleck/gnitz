@@ -267,7 +267,7 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                     // A range/band join's null-fill threshold pipeline is not
                     // replayable per key; a cross join has no key at all, so a
                     // skeleton row names no trace group to replay.
-                    JoinShape::Range => "a range or band join",
+                    JoinShape::Band | JoinShape::PureRange => "a range or band join",
                     JoinShape::Cross => "a cross join",
                     // Eligible: plain inner equi-join.
                     JoinShape::Equi => return Ok(()),
@@ -301,9 +301,6 @@ fn lower_body(chain: &mut ViewChain, memo: &mut CutMemo, rel: &Rc<RelExpr>) -> R
         RelExpr::Project { input, items } => {
             let (fpreds, source) = split_filter(input);
             match source.as_ref() {
-                RelExpr::Join { kind, .. } if kind.is_decorrelated() => {
-                    exists::lower_exists_view(chain, memo, items, fpreds, source)
-                }
                 RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source),
                 RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source),
                 _ => spine::lower_linear(chain, memo, rel, items),
@@ -449,8 +446,7 @@ fn filter(
 }
 
 /// Resolve `preds` against `frame` and emit the filter. Shared by the emits that
-/// filter an already-emitted node: HAVING, and the WHERE over a join, an EXISTS
-/// branch or a mark branch.
+/// filter an already-emitted node: HAVING, and the WHERE over each join branch.
 pub(crate) fn emit_filter<'a>(
     cb: &mut gnitz_core::Circuit,
     node: gnitz_core::NodeId,
@@ -534,8 +530,8 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
         } else if let Some(p) = right_layout.iter().position(|c| *c == id) {
             keep[1][p] = true;
         }
-        // An id in neither layout is the mark column, which the mark branch
-        // substitutes by its `0/1` constant before resolving anything.
+        // An id in neither layout is the mark column, which the shell substitutes
+        // per branch by its `0/1` constant before resolving anything.
     };
     // Rules 1 + 2: the projection and the WHERE over the join.
     let mut referenced: HashSet<ColId> = HashSet::new();
@@ -543,12 +539,14 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
     for id in referenced {
         mark(&mut keep, id);
     }
-    // Rule 3: a side with a ν keeps each key column its ν key does not carry, so
-    // rows merging in ν match alike: an equi ν's key writes a NULL as 0, and a
-    // band ν is keyed by the source PK. A pure-range ν subtracts no match count.
-    let nu_lacks = |def: &ColumnDef| match class.shape() {
-        JoinShape::Equi => def.is_nullable,
-        JoinShape::Range => !class.eq.is_empty(),
+    // Rule 3: a side with a ν keeps each key column its ν cannot do without.
+    let keeps_key_col = |def: &ColumnDef, is_left: bool| match class.shape() {
+        // The gate after the re-key reads a nullable key column, and it keeps a
+        // NULL-keyed row apart from a 0-keyed one under the clamp.
+        JoinShape::Equi => def.is_nullable && kind.emits_unmatched(is_left),
+        // A band ν is keyed by the source PK, which a bag-valued side repeats; a
+        // pure range re-keys its owned A slice onto the range column.
+        JoinShape::Band | JoinShape::PureRange => true,
         JoinShape::Cross => false,
     };
     for (side, is_left, frame) in [(0, true, &left), (1, false, &right)] {
@@ -557,16 +555,13 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
         }
         for id in class.key_cols(is_left) {
             if let Some(pos) = frame.layout.iter().position(|c| *c == id) {
-                keep[side][pos] |= nu_lacks(&frame.schema.columns[pos]);
+                keep[side][pos] |= keeps_key_col(&frame.schema.columns[pos], is_left);
             }
         }
     }
-    // Rule 4: a shape that packs its output key out of the payload pins that
-    // side's `pk_cols` to the front of its keep list, which `one_side` prepends. A
-    // range-correlated EXISTS/IN reaches no null-fill tail, so only its outer PK.
-    let packs_source_pk = matches!(class.shape(), JoinShape::Range | JoinShape::Cross);
-    let outer_only = kind.is_decorrelated();
-    let pins = [packs_source_pk, packs_source_pk && !outer_only];
+    // Rule 4: a side whose source PK the output key packs out of the payload pins
+    // it to the front of its keep list, which `one_side` prepends.
+    let pins = class.out_key(kind).pins();
     // Rule 5, the fallback: a side with a ν needs an identity to subtract on, and
     // a pinned side already has one. A side without a ν keeps nothing — column 0
     // would split one trace element per key into one per row.

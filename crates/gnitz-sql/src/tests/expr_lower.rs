@@ -1390,6 +1390,25 @@ fn filter_program_drops_true_constant_conjuncts_in_any_position() {
     assert!(matches!(instrs(&[&f]).as_deref(), Some([L::LoadConst { val: 0 }])));
 }
 
+/// A conjunct its connectives settle true over literals is dropped; one they
+/// leave open or settle false keeps its program.
+#[test]
+fn filter_program_drops_conjuncts_settled_true() {
+    let schema = two_int_schema();
+    let p = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitInt(1));
+    let (t, f) = (BoundExpr::LitInt(1), BoundExpr::LitInt(0));
+    let or = |a: &BoundExpr, b: &BoundExpr| BoundExpr::bin(a.clone(), BinOp::Or, b.clone());
+    let and = |a: &BoundExpr, b: &BoundExpr| BoundExpr::bin(a.clone(), BinOp::And, b.clone());
+    let not = |a: &BoundExpr| BoundExpr::Not(Box::new(a.clone()));
+    let dropped = |e: &BoundExpr| compile_filter_program([e], &schema.columns).expect("lowers").is_none();
+    assert!(dropped(&or(&p, &t)));
+    assert!(dropped(&not(&and(&f, &p))));
+    assert!(dropped(&and(&t, &or(&t, &f))));
+    for kept in [or(&f, &p), and(&p, &t), not(&t), and(&p, &f), or(&f, &f)] {
+        assert!(!dropped(&kept));
+    }
+}
+
 /// Every conjunct is a boolean, a lone one included: a string column on its
 /// own draws the lowering's own message rather than reaching the resolver.
 #[test]

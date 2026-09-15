@@ -1,7 +1,7 @@
 //! What the HIR rejects, one home per rule, so no stage reaches into another for
 //! one and `hir::lower` depends only downward.
 
-use super::{HirExpr, JoinShape, JoinType, SubqueryKind, SubqueryRef};
+use super::{HirExpr, JoinClass, JoinShape, JoinType, SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_keys;
 use gnitz_core::{ColType, ColumnDef, TypeCode};
@@ -123,9 +123,9 @@ pub(crate) fn reject_pair_pk_overflow(surface: &str, pa: usize, pb: usize) -> Re
     Ok(())
 }
 
-/// The pure-range (`n_eq == 0`) outer-join restrictions. RIGHT/FULL is checked
+/// The pure-range (no equality prefix) restrictions. RIGHT/FULL is checked
 /// **first** so a FULL join reports the mirror-null-fill limitation rather than
-/// the narrower LEFT type rule.
+/// the narrower type rule.
 ///
 /// The broadcast range join scatters the inner output by the OTHER side's range
 /// key, so gathering it onto the preserved-key worker would need a second
@@ -133,10 +133,13 @@ pub(crate) fn reject_pair_pk_overflow(surface: &str, pa: usize, pb: usize) -> Re
 /// threshold. A RIGHT/FULL pure-range null-fill would need a full second
 /// threshold pipeline (a B-side `m_A = MAX/MIN(a.range)`), a standalone effort.
 ///
-/// LEFT: the inline threshold null-fill reduces the range column with MIN/MAX,
-/// then reindexes the result onto the range slot type — a pipeline carried end
-/// to end only at ≤8 bytes, see [`reject_pure_range_threshold_tc`].
-pub(crate) fn reject_pure_range_outer(kind: JoinType, range_tc: TypeCode) -> Result<(), GnitzSqlError> {
+/// LEFT and EXISTS/IN decide per left row from the threshold
+/// `m = MAX/MIN(b.range)`: an inline reduce whose one-row result is reindexed back
+/// onto the range slot and probed as OPK bytes — a chain carried only at ≤8 bytes.
+pub(crate) fn reject_pure_range(kind: JoinType, class: &JoinClass) -> Result<(), GnitzSqlError> {
+    let Some(range) = class.range.filter(|_| class.shape() == JoinShape::PureRange) else {
+        return Ok(());
+    };
     if kind.preserves_right() {
         return Err(GnitzSqlError::Unsupported(
             "pure-range RIGHT/FULL JOIN (a sole inequality range conjunct with no \
@@ -146,33 +149,25 @@ pub(crate) fn reject_pure_range_outer(kind: JoinType, range_tc: TypeCode) -> Res
                 .into(),
         ));
     }
-    if kind.preserves_left() {
-        reject_pure_range_threshold_tc(
-            range_tc,
+    if !kind.has_nu(true) || gnitz_wire::is_fixed_int(range.tc as u8) {
+        return Ok(());
+    }
+    let (surface, remedy) = match kind.is_decorrelated() {
+        true => (
+            "EXISTS/IN pure-range correlation",
+            "use a narrower range column or add an equality conjunct",
+        ),
+        false => (
             "pure-range LEFT JOIN",
             "use a narrower range column, INNER JOIN, or a band join",
-        )?;
-    }
-    Ok(())
-}
-
-/// The threshold null-fill's range-column type rule, shared by every pure-range
-/// (`n_eq == 0`) shape that builds one: `m = MAX/MIN(other.range)` is an inline
-/// reduce whose one-row result is reindexed back onto the range slot and probed
-/// as OPK bytes — a chain carried only at ≤8 bytes.
-pub(crate) fn reject_pure_range_threshold_tc(
-    range_tc: TypeCode,
-    surface: &str,
-    remedy: &str,
-) -> Result<(), GnitzSqlError> {
-    if !gnitz_wire::is_fixed_int(range_tc as u8) {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{surface} needs a ≤8-byte integer range column (got {range_tc:?}); its threshold \
-             null-fill reduces the range column with MIN/MAX and reindexes the result back onto \
-             the range slot, which is carried only at that width — {remedy}"
-        )));
-    }
-    Ok(())
+        ),
+    };
+    Err(GnitzSqlError::Unsupported(format!(
+        "{surface} needs a ≤8-byte integer range column (got {:?}); its threshold \
+         null-fill reduces the range column with MIN/MAX and reindexes the result back onto \
+         the range slot, which is carried only at that width — {remedy}",
+        range.tc
+    )))
 }
 
 /// Validate one equijoin key pair and return the pair's common reindex output

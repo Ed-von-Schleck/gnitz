@@ -184,6 +184,32 @@ def test_a_null_key_fills_once_beside_its_types_zero(client, schema_name, key_sq
     assert bag(scanned(client, sn, "ne"), "x") == {(5,): 1}
 
 
+def test_a_composite_key_with_one_nullable_column_fills_and_anti_joins_exactly(client, schema_name):
+    """A composite key pairing a NOT NULL column with a nullable one: a NULL in
+    the nullable column matches nothing, and its row fills or survives the anti
+    join once, beside a row whose nullable column is the zero and matches twice.
+    The two preserved rows project the same `x`, so only the retained nullable
+    key column keeps them apart."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, k BIGINT, x BIGINT NOT NULL); "
+        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, k BIGINT NOT NULL, "
+        "name BIGINT NOT NULL); "
+        "CREATE VIEW lj AS SELECT l.x, r.name FROM l LEFT JOIN r ON l.a = r.a AND l.k = r.k; "
+        "CREATE VIEW ne AS SELECT l.x FROM l "
+        "WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.a = l.a AND r.k = l.k); "
+        "INSERT INTO l VALUES (1, 1, NULL, 5), (2, 1, 0, 5), (3, 2, 0, 6); "
+        "INSERT INTO r VALUES (10, 1, 0, 100), (11, 1, 0, 200)", schema_name=sn)
+
+    assert bag(scanned(client, sn, "lj"), "x", "name") == {
+        (5, None): 1, (5, 100): 1, (5, 200): 1, (6, None): 1}
+    assert bag(scanned(client, sn, "ne"), "x") == {(5,): 1, (6,): 1}
+
+    client.execute_sql("DELETE FROM r", schema_name=sn)
+    assert bag(scanned(client, sn, "lj"), "x", "name") == {(5, None): 2, (6, None): 1}
+    assert bag(scanned(client, sn, "ne"), "x") == {(5,): 2, (6,): 1}
+
+
 def test_a_null_group_key_and_a_null_extremum_are_not_zero(client, schema_name):
     """A NULL group key must not merge with the 0 group — in the grouping, in
     each group's extremes, or in a HAVING null test. A NULL → 0 transition of a

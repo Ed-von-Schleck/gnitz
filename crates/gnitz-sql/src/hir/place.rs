@@ -3,8 +3,8 @@
 //! in a `Filter` above the join.
 
 use super::guards::{
-    reject_join_key_arity, reject_keyless_non_inner, reject_outer_with_residual, validate_join_key_pair,
-    validate_range_join_key_pair,
+    reject_join_key_arity, reject_keyless_non_inner, reject_outer_with_residual, reject_pure_range,
+    validate_join_key_pair, validate_range_join_key_pair,
 };
 use super::{cross_comparison, side, EqPair, HirCol, HirExpr, HirRange, JoinClass, JoinType, RelExpr, Side};
 use crate::error::GnitzSqlError;
@@ -30,6 +30,7 @@ impl RelExpr {
         let placed = place(&left, &right, kind, JoinClass::default(), on, Origin::On)?;
         reject_join_key_arity(placed.class.eq.len(), placed.class.range.is_some())?;
         reject_keyless_non_inner(kind, placed.class.shape())?;
+        reject_pure_range(kind, &placed.class)?;
         reject_outer_with_residual(kind, &placed.above)?;
         placed.build(&left, &right, kind)
     }

@@ -282,7 +282,7 @@ fn subquery_rules() {
             ("SELECT * FROM n WHERE k NOT IN (SELECT k FROM b)", "Unsupported", "NOT NULL"),
             ("SELECT * FROM a WHERE k NOT IN (SELECT k FROM n)", "Unsupported", "NOT NULL"),
             ("SELECT * FROM a WHERE (k, v) IN (SELECT k, w FROM b)", "Unsupported", "tuple"),
-            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)", "Unsupported", "uncorrelated EXISTS"),
+            ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)", "Unsupported", "needs at least one equijoin"),
             ("SELECT * FROM ty WHERE EXISTS (SELECT 1 FROM w WHERE w.big < ty.big)", "Unsupported", "8-byte integer range column"),
             ("SELECT k, COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) GROUP BY k", "Unsupported", "GROUP BY/aggregates"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)", "Unsupported", "single FROM table without JOINs"),

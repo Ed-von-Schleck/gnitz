@@ -108,6 +108,8 @@ const SHAPES: &[Row] = &[
     ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
     ("SELECT a.id AS aid, b.w FROM a RIGHT JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
     ("SELECT a.id AS aid, b.w FROM a FULL JOIN b ON a.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 2), (NullExtend, 2)]),
+    // A null-fill against a side unique on the key subtracts without a clamp.
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.id", 1, &[], &[(EquiJoin, 2), (NullExtend, 1)]),
     // A residual or WHERE is one filter; a nullable key is one filter per side.
     ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k AND a.v <> b.w", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
     ("SELECT a.id AS aid, b.w FROM a JOIN b ON a.k = b.k AND (a.v > 5 OR b.w < 3)", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
@@ -116,6 +118,8 @@ const SHAPES: &[Row] = &[
     ("SELECT a.id AS aid, n.v FROM a JOIN n ON a.k = n.k", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
     ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
     ("SELECT n.id AS nid, m.v FROM n LEFT JOIN m ON n.k = m.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 2)]),
+    // A composite key mixing a NOT NULL and a nullable column gates the nullable one.
+    ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k AND n.id = b.w", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
     // An ON conjunct over the null-supplying side filters that input.
     ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
     // A filtered derived-table input fuses into the join, cutting no segment.
@@ -146,18 +150,22 @@ const SHAPES: &[Row] = &[
     ("SELECT c.v AS cv, ty.id AS tid FROM c NATURAL JOIN ty", 1, &[&[0, 1, 2]], &[(CrossJoin, 2), (WorkerFilter, 2)]),
     ("SELECT x.id AS xa, y.id AS yb FROM a x, a y", 2, &[&[0, 1]], &[(CrossJoin, 2), (WorkerFilter, 2)]),
     ("SELECT a.id AS aid, b.id AS bid, u.id AS uid FROM a, b, u", 2, &[&[0, 1], &[0, 1, 2]], &[(CrossJoin, 4), (WorkerFilter, 4)]),
-    // Semi / anti / mark / IN: a join plus clamp arithmetic, no exchange, no distinct.
-    ("SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 2), (PositivePart, 1)]),
-    ("SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 2), (PositivePart, 1)]),
-    ("SELECT id FROM a WHERE k IN (SELECT k FROM b)", 1, &[], &[(EquiJoin, 2), (PositivePart, 1)]),
-    ("SELECT id, EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AS flag FROM a", 1, &[], &[(EquiJoin, 2), (PositivePart, 1)]),
+    // Semi / anti / mark / IN: a join against B's key set, no exchange.
+    ("SELECT a.v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
+    ("SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
+    ("SELECT id FROM a WHERE k IN (SELECT k FROM b)", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
+    ("SELECT id, EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AS flag FROM a", 1, &[], &[(EquiJoin, 2), (Distinct, 1)]),
+    // A B unique on the key already is a set.
+    ("SELECT id FROM a WHERE k IN (SELECT id FROM b)", 1, &[], &[(EquiJoin, 2)]),
     // Two marks: the lower one is cut, carrying its mark to the upper one, whose
-    // two branches each filter on the WHERE reading both.
-    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)", 2, &[], &[(EquiJoin, 4), (PositivePart, 2), (Filter, 2)]),
-    ("SELECT id FROM n WHERE EXISTS (SELECT 1 FROM m WHERE m.k = n.k)", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (Filter, 2)]),
+    // matched branch folds the WHERE reading both to true.
+    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)", 2, &[], &[(EquiJoin, 4), (Distinct, 2), (Filter, 1)]),
+    ("SELECT id FROM n WHERE EXISTS (SELECT 1 FROM m WHERE m.k = n.k)", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (Filter, 2)]),
+    ("SELECT id FROM n WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = n.k AND b.w = n.id)", 1, &[], &[(EquiJoin, 2), (Distinct, 1), (Filter, 1)]),
     ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w < a.v)", 1, &[&[0]], &[(RangeJoin, 2), (PositivePart, 1)]),
-    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[&[0]], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
-    ("SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[&[0]], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
+    // Pure range: A is owned before the join, so its output needs no exchange.
+    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
+    ("SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
     // Reduce: grouped shards on the group columns; a global aggregate funnels
     // through an empty-key exchange with a ground row, two-phase when linear;
     // a replicated source needs no exchange at all.
@@ -184,7 +192,7 @@ const SHAPES: &[Row] = &[
     ("SELECT g FROM t INTERSECT ALL SELECT g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
     // Segments: a non-trivial CTE and a subquery cut; a derived table over one
     // relation, a computed group key and a projection over a join do not.
-    ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1), (PositivePart, 1), (NullExtend, 1)]),
+    ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1), (NullExtend, 1)]),
     ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[&[], &[0, 1]], &[(RangeJoin, 2), (Reduce, 1), (GlobalGround, 1), (WorkerFilter, 2), (Filter, 1)]),
     ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
     ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 1, &[], &[(Filter, 1)]),

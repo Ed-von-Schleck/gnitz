@@ -680,17 +680,22 @@ impl Circuit {
         self.add(OpNode::Distinct, NodeInputs::Unary(input))
     }
 
-    /// The weight-exact Z-set difference `positive_part(minuend − subtrahend)` as
-    /// `negate` → `union` → [`OpNode::PositivePart`].
+    /// The Z-set difference `minuend − subtrahend` as `negate` → `union`.
     ///
     /// The operand order is a **cost** contract, not a correctness one: the engine
     /// takes a union's first operand in place where nothing reads it later, and
     /// clones it otherwise. `negate(subtrahend)` is freshly allocated and read
     /// nowhere else, so it earns the take; the `minuend` may be shared, where the
     /// swap would cost a clone every epoch.
-    pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
+    pub fn difference(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
         let neg = self.negate(subtrahend);
-        let diff = self.union(neg, minuend);
+        self.union(neg, minuend)
+    }
+
+    /// The weight-exact clamped difference `positive_part(minuend − subtrahend)`:
+    /// [`Self::difference`] → [`OpNode::PositivePart`].
+    pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
+        let diff = self.difference(minuend, subtrahend);
         self.add(OpNode::PositivePart, NodeInputs::Unary(diff))
     }
 

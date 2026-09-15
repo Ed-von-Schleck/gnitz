@@ -59,8 +59,10 @@ impl<'s> Joins<'s> {
         self.subs.iter().find(|s| s.id == id && !self.joined.contains(&id))
     }
 
-    fn join(&mut self, s: &SubqueryRef, kind: JoinType, on: Vec<HirExpr>) -> Result<(), GnitzSqlError> {
-        self.cur = RelExpr::join(Rc::clone(&self.cur), Rc::clone(&s.rel), kind, on)?;
+    /// Join `s` in as `kind` on its correlation.
+    fn join(&mut self, s: &SubqueryRef, kind: JoinType) -> Result<(), GnitzSqlError> {
+        reject_nullable_in(kind, s)?;
+        self.cur = RelExpr::join(Rc::clone(&self.cur), Rc::clone(&s.rel), kind, s.correlation.clone())?;
         self.joined.push(s.id);
         Ok(())
     }
@@ -74,15 +76,14 @@ impl<'s> Joins<'s> {
             .filter(|s| matches!(s.kind, SubqueryKind::Exists { .. }))
         {
             let kind = if negated { JoinType::Anti } else { JoinType::Semi };
-            reject_nullable_in(kind, s)?;
-            self.join(s, kind, s.correlation.clone())?;
+            self.join(s, kind)?;
             return Ok(true);
         }
         // An uncorrelated scalar joins where its conjunct stands; the conjunct
         // stays a filter, which placement keys when it can.
         for s in self.unjoined_reads(std::iter::once(pred)) {
             if matches!(s.kind, SubqueryKind::Scalar { .. }) && s.correlation.is_empty() {
-                self.join(s, JoinType::Inner, Vec::new())?;
+                self.join(s, JoinType::Inner)?;
             }
         }
         Ok(false)
@@ -107,9 +108,7 @@ impl<'s> Joins<'s> {
     fn join_read(&mut self, s: &SubqueryRef) -> Result<bool, GnitzSqlError> {
         match s.kind {
             SubqueryKind::Exists { .. } => {
-                let kind = JoinType::Mark(s.id);
-                reject_nullable_in(kind, s)?;
-                self.join(s, kind, s.correlation.clone())?;
+                self.join(s, JoinType::Mark(s.id))?;
                 Ok(false)
             }
             SubqueryKind::Scalar { count, .. } => {
@@ -117,7 +116,7 @@ impl<'s> Joins<'s> {
                     true => JoinType::Inner,
                     false => JoinType::Left,
                 };
-                self.join(s, kind, s.correlation.clone())?;
+                self.join(s, kind)?;
                 Ok(count && kind == JoinType::Left)
             }
         }

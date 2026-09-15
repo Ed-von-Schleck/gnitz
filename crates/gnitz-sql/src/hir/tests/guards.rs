@@ -82,7 +82,8 @@ fn only_an_inner_step_may_be_keyless() {
         JoinType::Mark(crate::hir::ColId::NONE),
     ] {
         assert!(reject_keyless_non_inner(kind, JoinShape::Cross).is_err(), "{kind:?}");
-        reject_keyless_non_inner(kind, JoinShape::Range).unwrap();
+        reject_keyless_non_inner(kind, JoinShape::Band).unwrap();
+        reject_keyless_non_inner(kind, JoinShape::PureRange).unwrap();
         reject_keyless_non_inner(kind, JoinShape::Equi).unwrap();
     }
 }

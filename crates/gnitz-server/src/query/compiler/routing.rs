@@ -94,6 +94,8 @@ impl ViewMeta {
         // key resolve to one sequence rather than tripping the pack-key gate below.
         let mut seqs: FxHashMap<i64, Vec<ReindexKey>> = FxHashMap::default();
         let mut outside_joins: FxHashSet<i64> = FxHashSet::default();
+        let mut set_fed: FxHashSet<i64> = FxHashSet::default();
+        let mut untrimmed: FxHashSet<i64> = FxHashSet::default();
         // `None` once a source is seen twice.
         let mut bounds: FxHashMap<i64, Option<gnitz_wire::IndexBound>> = FxHashMap::default();
         for (nid, op) in loaded.ops() {
@@ -106,12 +108,19 @@ impl ViewMeta {
                 }
                 Entry::Occupied(mut e) => *e.get_mut() = None,
             }
-            if !scan_feeds_only_joins(loaded, nid) {
+            let consumed = scan_consumption(loaded, nid);
+            if !consumed.only_joins {
                 outside_joins.insert(*source as i64);
             }
-            let (node_seqs, orphaned) = scatter_key_of_scan(loaded, nid);
+            if consumed.set_fed {
+                set_fed.insert(*source as i64);
+            }
+            let (node_seqs, orphaned, owner_trimmed) = scatter_key_of_scan(loaded, nid);
             if orphaned {
                 return Err("a source's reindex maps carry no route key, so its delta cannot be scattered".into());
+            }
+            if !owner_trimmed {
+                untrimmed.insert(*source as i64);
             }
             // Every live circuit holds one scan to one sequence, so a second means
             // a newly-constructible shape that wants a real plan, not a refusal.
@@ -142,12 +151,19 @@ impl ViewMeta {
         let shards: Vec<(NodeId, &[u32])> = loaded.exchange_shards().collect();
         let repartitions = !shards.is_empty() || join_relay.is_some();
         let join_relay = join_relay.unwrap_or(JoinRelay::WholeKey);
+        // Every scatter key of the source is read only by owner filters.
+        let owner_trimmed = |tid: &i64| !untrimmed.contains(tid);
         // A range or cross join's matches spread over the whole other side, so
         // no source distribution places them: nothing co-partitions, and every
-        // source relays.
+        // source relays — except an owner-trimmed one already on its PK's owner.
         let co_partitioned = match join_relay {
-            JoinRelay::WholeKey => compute_co_partitioned(&concatenated, registry, &outside_joins),
-            JoinRelay::EqPrefix { .. } | JoinRelay::Broadcast => FxHashSet::default(),
+            JoinRelay::WholeKey => compute_co_partitioned(&concatenated, registry, &outside_joins, &set_fed),
+            JoinRelay::EqPrefix { .. } => FxHashSet::default(),
+            JoinRelay::Broadcast => concatenated
+                .iter()
+                .filter(|&(tid, cols)| owner_trimmed(tid) && native_partition_is(registry, *tid, cols))
+                .map(|(&tid, _)| tid)
+                .collect(),
         };
 
         let skips_exchange = match shards[..] {
@@ -163,6 +179,10 @@ impl ViewMeta {
                 // `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or
                 // `pack(b)`, dropping every match silently.
                 let route = match <[_; 1]>::try_from(s) {
+                    // Routes each row to the worker its owner filter keeps it on.
+                    Ok([seq]) if join_relay == JoinRelay::Broadcast && owner_trimmed(&tid) => {
+                        join_route(seq, JoinRelay::WholeKey)
+                    }
                     Ok([seq]) => join_route(seq, join_relay),
                     Err(_) => RelayRoute::NoSingleKey,
                 };
@@ -245,53 +265,58 @@ fn shard_cols_match_dist_key(schema: &SchemaDescriptor, cols: &[u32]) -> bool {
     cols.len() == k && cols == &schema.pk_indices()[..k]
 }
 
+/// True iff `tid`'s rows already sit on the worker `key` routes them to: the key is
+/// exactly its distribution prefix, unpromoted.
+fn native_partition_is(registry: &RelationRegistry, tid: i64, key: &ReindexKey) -> bool {
+    // A carried target means the slot is wider than the source column, so
+    // native PK partitions do not align with the T-width trace key. Partner of
+    // `ScatterKey::new`'s own no-target gate: relaxing one alone would let a
+    // promoted side skip while its partner scatters at the wider `T`.
+    if key.iter().any(|(_, t)| t.is_some()) {
+        return false;
+    }
+    let cols: Vec<u32> = key.iter().map(|&(c, _)| c).collect();
+    registry
+        .relation(tid)
+        .map(Relation::schema)
+        .is_some_and(|schema| shard_cols_match_dist_key(&schema, &cols))
+}
+
 /// The sources whose delta may skip the join scatter. `outside_joins` holds the
-/// sources the circuit also consumes other than as a join operand.
+/// sources the circuit also consumes other than as a join operand; `set_fed` those
+/// it clamps to a set before a join reads them.
 fn compute_co_partitioned(
     join_shard_map: &JoinShardMap,
     registry: &RelationRegistry,
     outside_joins: &FxHashSet<i64>,
+    set_fed: &FxHashSet<i64>,
 ) -> FxHashSet<i64> {
-    // A replicated participant met only through join terms makes every
-    // participant skip: it has every row on every worker, so its partner stays in
-    // its own PK partitioning and `cogroup`s against the full local copy, and each
-    // match is made once, on the partner's worker. A replicated delta the circuit
-    // also uses directly — the preserved side under an outer or semi join's
-    // clamp, a union branch, a reduce input — would count once per worker, so it
-    // withdraws the skip: every source scatters, and the relay takes the
-    // replicated delta from one worker. Not folded into
+    // A replicated participant met only through join terms holds every row on
+    // every worker, so it joins its partner wherever the partner's rows are, and
+    // each match is made once, on the partner's worker. A replicated delta the
+    // circuit also uses directly would count once per worker, so it withdraws the
+    // skip. A partitioned source clamped to a set scatters by its key regardless:
+    // a clamp over one worker's slice of a key admits the key once per worker. Not folded into
     // `shard_cols_match_dist_key`, which must stay the pure prefix predicate for
     // the partner-less skip path.
-    let schema_of = |tid: i64| registry.relation(tid).map(Relation::schema);
-    let replicated = |tid: i64| schema_of(tid).is_some_and(|s| s.placement().is_replicated());
-    let skip_all = join_shard_map.keys().any(|&tid| replicated(tid))
+    let replicated = |tid: i64| {
+        registry
+            .relation(tid)
+            .is_some_and(|r| r.schema().placement().is_replicated())
+    };
+    let partner_local = join_shard_map.keys().any(|&tid| replicated(tid))
         && join_shard_map
             .keys()
             .all(|tid| !replicated(*tid) || !outside_joins.contains(tid));
-    let mut co_partitioned = FxHashSet::default();
-    for (&tid, cols) in join_shard_map {
-        let Some(ext_schema) = schema_of(tid) else {
-            continue;
-        };
-
-        if skip_all {
-            co_partitioned.insert(tid);
-            continue;
-        }
-
-        // A carried target means the slot is wider than the source column, so
-        // native PK partitions do not align with the T-width trace key. Partner of
-        // `ScatterKey::new`'s own no-target gate: relaxing one alone would let a
-        // promoted side skip while its partner scatters at the wider `T`.
-        if cols.iter().any(|(_, t)| t.is_some()) {
-            continue;
-        }
-        let col_indices: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
-        if shard_cols_match_dist_key(&ext_schema, &col_indices) {
-            co_partitioned.insert(tid);
-        }
-    }
-    co_partitioned
+    join_shard_map
+        .iter()
+        .filter(|&(&tid, cols)| {
+            registry.relation(tid).is_some()
+                && ((partner_local && (replicated(tid) || !set_fed.contains(&tid)))
+                    || native_partition_is(registry, tid, cols))
+        })
+        .map(|(&tid, _)| tid)
+        .collect()
 }
 
 /// True iff a pipeline keyed by `shard_cols` re-emits rows onto the worker that
@@ -348,18 +373,19 @@ type ReindexKey = Vec<gnitz_wire::ReindexSlot>;
 /// ([`gnitz_wire::ReindexRole`]); the engine could only guess it from graph
 /// shape. The second return says the walk found only `Auxiliary` ones — a
 /// planner call site that forgot its role, which `ViewMeta::derive` turns
-/// into a failed compile rather than silently-unscattered rows.
-fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: NodeId) -> (Vec<ReindexKey>, bool) {
+/// into a failed compile rather than silently-unscattered rows. The third says
+/// every `ScatterKey` map found is read by `WorkerFilter`s alone.
+fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: NodeId) -> (Vec<ReindexKey>, bool, bool) {
     // A node is reached when one of its inputs is and its operator propagates;
     // one forward pass suffices because every input names an earlier node.
     let mut reached = vec![false; loaded.len()];
     reached[scan_nid] = true;
-    // One entry per distinct key sequence — an identical one reached again (the
-    // null/not-null sibling Maps of a nullable LEFT-join key) is added once.
-    // Duplicate columns WITHIN a sequence are preserved, so the result mirrors the
-    // trace-side `ReindexPacker` slot-for-slot.
+    // One entry per distinct key sequence — an identical one reached again is
+    // added once. Duplicate columns WITHIN a sequence are preserved, so the result
+    // mirrors the trace-side `ReindexPacker` slot-for-slot.
     let mut seqs: Vec<ReindexKey> = Vec::new();
     let mut saw_auxiliary = false;
+    let mut owner_trimmed = true;
     for nid in scan_nid + 1..loaded.len() {
         if !loaded.inputs(nid).iter().any(|p| reached[p]) {
             continue;
@@ -368,7 +394,11 @@ fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: NodeId) -> (Vec<Reindex
             gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex { key, role, .. }) => {
                 if *role != gnitz_wire::ReindexRole::ScatterKey {
                     saw_auxiliary = true;
-                } else if !seqs.contains(key) {
+                    continue;
+                }
+                let mut readers = (nid + 1..loaded.len()).filter(|&r| loaded.inputs(r).iter().any(|p| p == nid));
+                owner_trimmed &= readers.all(|r| matches!(loaded.op(r), gnitz_wire::OpNode::WorkerFilter));
+                if !seqs.contains(key) {
                     seqs.push(key.clone());
                 }
             }
@@ -377,16 +407,24 @@ fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: NodeId) -> (Vec<Reindex
         }
     }
     let orphaned = seqs.is_empty() && saw_auxiliary;
-    (seqs, orphaned)
+    (seqs, orphaned, owner_trimmed)
 }
 
-/// True iff the rows the scan at `scan_nid` emits reach anything past a `Join`
-/// only as that join's operand — forward through `Filter`, `Map` and
-/// `IntegrateTrace` alone. Any other consumer (a `Union`, a clamp, a `Reduce`,
-/// the sink) uses the delta itself rather than a join term over it.
-fn scan_feeds_only_joins(loaded: &LoadedCircuit, scan_nid: NodeId) -> bool {
+/// How the rows one scan emits are consumed.
+struct ScanConsumption {
+    /// They reach nothing past a `Join` but as that join's operand.
+    only_joins: bool,
+    /// They cross a `Distinct` on the way to a join.
+    set_fed: bool,
+}
+
+/// Walk forward from the scan at `scan_nid` through `Filter`, `Map`,
+/// `IntegrateTrace` and `Distinct`, stopping at a `Join`; any other consumer uses
+/// the delta itself rather than a join term over it.
+fn scan_consumption(loaded: &LoadedCircuit, scan_nid: NodeId) -> ScanConsumption {
     let mut reached = vec![false; loaded.len()];
     reached[scan_nid] = true;
+    let mut consumed = ScanConsumption { only_joins: true, set_fed: false };
     for nid in scan_nid + 1..loaded.len() {
         if !loaded.inputs(nid).iter().any(|p| reached[p]) {
             continue;
@@ -396,10 +434,14 @@ fn scan_feeds_only_joins(loaded: &LoadedCircuit, scan_nid: NodeId) -> bool {
             gnitz_wire::OpNode::Filter(_) | gnitz_wire::OpNode::Map(_) | gnitz_wire::OpNode::IntegrateTrace => {
                 reached[nid] = true
             }
-            _ => return false,
+            gnitz_wire::OpNode::Distinct => {
+                reached[nid] = true;
+                consumed.set_fed = true;
+            }
+            _ => consumed.only_joins = false,
         }
     }
-    true
+    consumed
 }
 
 /// Walk back from the `ExchangeShard` at `enid` through nodes that keep rows on

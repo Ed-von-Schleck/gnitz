@@ -266,8 +266,9 @@ each is a linear combination of `{union, negate}` plus the weight-clamp primitiv
 (`distinct = clamp[-1,1]`, `positive_part = clamp[0,i64::MAX]`) over
 content-hashed leaves — EXCEPT DISTINCT = `positive_part(distinct(A) −
 distinct(B))`, INTERSECT DISTINCT = `distinct(A) − positive_part(distinct(A) −
-distinct(B))`. There is **no anti-join operator**: these and the outer-join
-null-fills are the only `positive_part` users.
+distinct(B))`. There is **no anti-join operator**: these, the outer-join
+null-fills over a non-unique side, and band EXISTS/IN are the only
+`positive_part` users.
 
 ### The integral (trace)
 

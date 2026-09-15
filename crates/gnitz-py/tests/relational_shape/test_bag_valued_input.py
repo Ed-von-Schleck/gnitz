@@ -32,19 +32,25 @@ _KINDS = {
     "cross": (f"{_ID} FROM uv CROSS JOIN b", "all", "product"),
     "semi": ("SELECT k, x FROM uv WHERE EXISTS (SELECT 1 FROM b WHERE b.k = uv.k)", "k", "semi"),
     "anti": ("SELECT k, x FROM uv WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = uv.k)", "k", "anti"),
+    # Onto b's PK, which matches a row at most once.
+    "left_pk": (f"{_ID} FROM uv LEFT JOIN b ON uv.k = b.id", "pk", "left"),
+    "semi_pk": ("SELECT k, x FROM uv WHERE EXISTS (SELECT 1 FROM b WHERE b.id = uv.k)", "pk", "semi"),
+    "anti_pk": ("SELECT k, x FROM uv WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.id = uv.k)", "pk", "anti"),
 }
 
 _MATCH = {
-    "k": lambda k, x, bk, y: k == bk,
-    "band": lambda k, x, bk, y: k == bk and x <= y,
-    "range": lambda k, x, bk, y: operator.lt(x, y),
-    "all": lambda k, x, bk, y: True,
+    "k": lambda k, x, bid, bk, y: k == bk,
+    "pk": lambda k, x, bid, bk, y: k == bid,
+    "band": lambda k, x, bid, bk, y: k == bk and x <= y,
+    "range": lambda k, x, bid, bk, y: operator.lt(x, y),
+    "all": lambda k, x, bid, bk, y: True,
 }
 
 
 def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client, schema_name):
     """Two matches, one, and none, for every kind over one weight-2 identity
-    that matches and one that never does."""
+    that matches and one that never does; a kind keyed on b's PK sees one match,
+    then none."""
     sn = schema_name
     client.execute_sql(
         "CREATE TABLE s1 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL); "
@@ -64,9 +70,9 @@ def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client, schema
     b = {}
     for sql, changes in [
         ("SELECT 1", {}),
-        ("INSERT INTO b VALUES (1, 5, 50)", {1: (5, 50)}),
-        ("INSERT INTO b VALUES (2, 5, 60)", {2: (5, 60)}),
-        ("DELETE FROM b", {1: None, 2: None}),
+        ("INSERT INTO b VALUES (5, 5, 50)", {5: (5, 50)}),
+        ("INSERT INTO b VALUES (6, 5, 60)", {6: (5, 60)}),
+        ("DELETE FROM b", {5: None, 6: None}),
     ]:
         client.execute_sql(sql, schema_name=sn)
         for pk, row in changes.items():
@@ -78,7 +84,7 @@ def test_each_join_kind_owes_a_weight_two_identity_its_own_weight(client, schema
         for name, (_, match, owes) in _KINDS.items():
             want = Counter()
             for (k, x), w in uv.items():
-                hits = [bid for bid, (bk, y) in b.items() if _MATCH[match](k, x, bk, y)]
+                hits = [bid for bid, (bk, y) in b.items() if _MATCH[match](k, x, bid, bk, y)]
                 if owes in ("product", "left"):
                     want.update({(k, x, bid): w for bid in hits})
                 if owes == "left" and not hits:
