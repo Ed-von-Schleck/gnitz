@@ -409,8 +409,8 @@ impl UniquePlan<'_> {
 async fn execute_probe_burst(
     disp: &MasterDispatcher,
     checks: &[PipelinedCheck],
-    mut sink: impl FnMut(usize, &MemBatch<'_>) -> Result<(), WorkerFault>,
-) -> Result<(), WorkerFault> {
+    mut sink: impl FnMut(usize, &MemBatch<'_>) -> Result<(), WireFault>,
+) -> Result<(), WireFault> {
     if checks.is_empty() {
         return Ok(());
     }
@@ -418,13 +418,16 @@ async fn execute_probe_burst(
     // holds a slice of the key list, a broadcast one because index entries are
     // partitioned independently of the probe key.
     let fanouts = vec![Fanout::Broadcast; checks.len()];
-    let (dispatches, _) = dispatch_scan_multi_fanout(disp, &fanouts, |i, targets, wire_flags, _| {
+    let (dispatches, _) = dispatch_scan_multi_fanout(disp, &fanouts, |i, targets, _| {
         let check = &checks[i];
         let g = DirectGroup {
             template: check.schema.frame(wire::WireMsg {
                 seek_col_idx: check.keyspace.seek_col_idx(),
                 seek_pk: check.mode_param as u128,
-                flags: gnitz_wire::wire_flags_set_probe_mode(wire_flags, check.mode),
+                flags: WireFlags {
+                    probe_mode: check.mode,
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
             targets,
@@ -466,7 +469,7 @@ impl MasterDispatcher {
     /// and F2 takes a third, because its probed values are the gathers' answer.
     /// Merging the probes does not merge the verdicts — those still run in the
     /// order below, which is the order violations are reported in.
-    pub async fn validate_txn_distributed(&self, families: &[TxnFamily]) -> Result<(), WorkerFault> {
+    pub async fn validate_txn_distributed(&self, families: &[TxnFamily]) -> Result<(), WireFault> {
         // No family whose write reads committed state ⇒ every rule below would
         // find nothing to check, so the bundle (an O(rows) fold) is not built.
         let cat = self.cat();
@@ -557,7 +560,7 @@ fn plan_pk_checks(
     disp: &MasterDispatcher,
     b: &TxnBundle<'_>,
     checks: &mut Vec<PipelinedCheck>,
-) -> Result<Vec<i64>, WorkerFault> {
+) -> Result<Vec<i64>, WireFault> {
     let mut probed: Vec<i64> = Vec::new();
     for t in &b.tables {
         let Some(fold) = t.fold.as_ref() else {
@@ -614,7 +617,7 @@ fn plan_pk_checks(
 /// each Error family checked against the running prefix fold, then committed
 /// state. The prefix accumulates over the per-family folds — distinct PKs, not
 /// rows.
-fn pk_verdict(disp: &MasterDispatcher, b: &TxnBundle<'_>) -> Result<(), WorkerFault> {
+fn pk_verdict(disp: &MasterDispatcher, b: &TxnBundle<'_>) -> Result<(), WireFault> {
     for t in &b.tables {
         let Some(fold) = t.fold.as_ref() else {
             continue;
@@ -659,7 +662,7 @@ fn plan_unique_checks<'a>(
     disp: &MasterDispatcher,
     b: &TxnBundle<'a>,
     checks: &mut Vec<PipelinedCheck>,
-) -> Result<Vec<UniquePlan<'a>>, WorkerFault> {
+) -> Result<Vec<UniquePlan<'a>>, WireFault> {
     let mut plans: Vec<UniquePlan<'a>> = Vec::new();
     for t in &b.tables {
         let tid = t.tid;
@@ -759,7 +762,7 @@ fn unique_verdict(
     b: &TxnBundle<'_>,
     plans: &[UniquePlan<'_>],
     results: &[FxHashSet<PkBuf>],
-) -> Result<(), WorkerFault> {
+) -> Result<(), WireFault> {
     let mut hspan = PkBuf::zeroed(0);
     for (plan, occupied) in plans.iter().zip(results) {
         for entry in occupied {
@@ -808,7 +811,7 @@ fn plan_fk_existence(
     b: &TxnBundle<'_>,
     constraints: &[FkEdge],
     checks: &mut Vec<PipelinedCheck>,
-) -> Result<Vec<FkProbePlan>, WorkerFault> {
+) -> Result<Vec<FkProbePlan>, WireFault> {
     let mut plans: Vec<FkProbePlan> = Vec::new();
     for &edge in constraints {
         let FkEdge {
@@ -875,7 +878,7 @@ fn fk_existence_verdict(
     checks: &[PipelinedCheck],
     results: &[FxHashSet<PkBuf>],
     deltas: &ParentDeltas,
-) -> Result<(), WorkerFault> {
+) -> Result<(), WireFault> {
     // A non-bundled parent has no delta (the degenerate plain-push case).
     let no_delta: ParentDelta = (FxHashMap::default(), FxHashSet::default());
     for ((plan, check), probed) in plans.iter().zip(checks).zip(results) {
@@ -906,7 +909,7 @@ async fn resolve_parent_deltas(
     b: &TxnBundle<'_>,
     constraints: &[FkEdge],
     children: &[FkEdge],
-) -> Result<ParentDeltas, WorkerFault> {
+) -> Result<ParentDeltas, WireFault> {
     let mut needed: Vec<(i64, usize)> = constraints
         .iter()
         .filter(|e| b.has(e.parent_tid))
@@ -1080,7 +1083,7 @@ async fn txn_check_fk_restrict(
     b: &TxnBundle<'_>,
     children: &[FkEdge],
     deltas: &ParentDeltas,
-) -> Result<(), WorkerFault> {
+) -> Result<(), WireFault> {
     let mut plans: Vec<RestrictPlan> = Vec::new();
     let mut checks: Vec<PipelinedCheck> = Vec::new();
     for &edge in children {

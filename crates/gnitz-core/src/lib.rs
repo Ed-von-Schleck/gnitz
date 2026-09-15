@@ -30,7 +30,7 @@ pub use client::{
     InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
-    Completions, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply, Session, SlotId,
+    Completions, IdRun, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply, Session, SlotId,
     MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
@@ -40,8 +40,7 @@ pub use gnitz_wire::{
 };
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape};
 pub use protocol::{
-    native_le_key, opk_key_cols, opk_key_packed, push_zero_cell, wire_flags_get_schema_version,
-    wire_flags_set_conflict_mode, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf,
-    PkColumn, ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch, FLAG_PUSH,
-    MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    native_le_key, opk_key_cols, opk_key_packed, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget,
+    PayloadColumn, PkBuf, PkColumn, ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode,
+    ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };

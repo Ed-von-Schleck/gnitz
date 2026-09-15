@@ -12,7 +12,7 @@ use gnitz_wire::{ReadBound, ReadSpec};
 fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
     // W = 4: the guard itself is worker-count independent, but four workers is
     // the shape in which the behaviour it prevents — four concatenated copies of
-    // `_tables`, each at STATUS_OK — would occur.
+    // `_tables`, each at `WireStatus::Ok` — would occur.
     let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
 
@@ -26,7 +26,7 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
         .scan_spec(TABLE_TAB, &spec, &reply_schema)
         .expect_err("a ReadSpec at a system tid must be rejected");
     let ClientError::ServerError(msg) = &err else {
-        panic!("expected a STATUS_ERROR reply, got {err:?}");
+        panic!("expected a WireStatus::Error reply, got {err:?}");
     };
     assert!(msg.contains("system catalog family"), "{msg}");
 

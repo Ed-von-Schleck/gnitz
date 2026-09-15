@@ -18,13 +18,7 @@ pub use error::ProtocolError;
 // defined once for both sides of the wire.
 pub use gnitz_wire::control::ControlHeader as Header;
 pub(crate) use gnitz_wire::WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE;
-pub use gnitz_wire::{
-    wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, WireConflictMode,
-    FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
-    FLAG_CONTINUATION, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, FLAG_PUSH, FLAG_PUSH_TXN, FLAG_RESOLVE,
-    FLAG_SCAN_MULTI, FLAG_SCAN_SPEC, FLAG_SEEK, MAX_COLUMNS, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND,
-    STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
-};
+pub use gnitz_wire::{ClientVerb, WireConflictMode, WireFlags, WireStatus, MAX_COLUMNS};
 #[cfg(any(test, feature = "integration"))]
 pub use message::parse_response;
 pub use message::{

@@ -191,11 +191,9 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     e.ingest_to_family(tid, &bb.finish()).unwrap();
     let want: Vec<(u128, i64, i64)> = (0..N).map(|i| (i, i as i64 * 10, 1)).collect();
 
-    // The point seek (FLAG_SEEK) and the point PK range (what `WHERE pk = k`
-    // compiles to) each find every key.
+    // The one-key set gather and the point PK range each find every key.
     for (id, val, _) in &want {
-        let hit = e.seek(tid, *id, &[]).unwrap().0;
-        assert_eq!(triples(&hit.expect("seek must find the row")), vec![(*id, *val, 1)]);
+        assert_eq!(run_pk_set(&mut e, tid, [*id]), vec![(*id, *val, 1)]);
         let point = RangeDescriptor::new(&[], Cut::Before(*id), Cut::After(*id));
         assert_eq!(
             run(&mut e, tid, &identity_spec(ReadBound::PkRange(point), vec![], 0)),
@@ -227,7 +225,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
 /// truth and the point PK range already walked it, so a seek or `pk IN (…)` that
 /// copies the first row alone silently answers a fraction of the key.
 ///
-/// A ghost member (net weight 0 across two ingests) is dropped by all four.
+/// A ghost member (net weight 0 across two ingests) is dropped by every one.
 #[test]
 fn keyed_reads_over_a_view_return_the_whole_pk_group() {
     let rows = [(7u64, 50i64, 1i64), (7, 100, 1), (7, 200, 1), (7, 300, 1), (9, 900, 1)];
@@ -251,19 +249,14 @@ fn keyed_reads_over_a_view_return_the_whole_pk_group() {
         want
     );
 
-    // The point seek (FLAG_SEEK).
-    let hit = e.seek(vid, 7, &[]).unwrap().0.expect("seek must find the group");
-    assert_eq!(triples(&hit), want);
-
     // The `pk IN (…)` set gather.
     assert_eq!(run_pk_set(&mut e, vid, [7]), want);
 
-    // A key the store does not name stays a miss on both.
-    assert!(e.seek(vid, 8, &[]).unwrap().0.is_none());
+    // A key the store does not name stays a miss.
     assert_eq!(run_pk_set(&mut e, vid, [8]), vec![]);
 }
 
-/// The two keyed readers gate each row on a positive weight. That gate must be
+/// The keyed reader gates each row on a positive weight. That gate must be
 /// applied **per row of the group**, not as a presence test for the key: a
 /// retracted member an uncompacted source still holds sorts at the group head
 /// (payloads order within a PK), and testing the key by its head alone answers
@@ -274,8 +267,6 @@ fn keyed_reads_skip_a_retracted_group_head_and_keep_the_live_rows() {
     let (mut e, vid) = weighted_fixture("ss_view_head_ghost", rows.into_iter());
     let want = vec![(5u128, 20i64, 1i64), (5, 30, 1)];
 
-    let hit = e.seek(vid, 5, &[]).unwrap().0.expect("seek must find the group");
-    assert_eq!(triples(&hit), want);
     assert_eq!(run_pk_set(&mut e, vid, [5]), want);
 }
 

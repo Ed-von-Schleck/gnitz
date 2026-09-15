@@ -82,19 +82,6 @@ impl RelationRegistry {
         ))
     }
 
-    /// Every live row of `pk`'s group — a view's synthetic key names one row per row its body
-    /// produced — or `None` for a miss.
-    pub fn seek(
-        &self,
-        id: i64,
-        pk: &[u8],
-        hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<Option<Batch>, StoreError> {
-        let entry = self.relation_or_err(id)?;
-        let gather = PkSetGather::open(pk.to_vec(), entry.schema(), |s, e| entry.cursor_in_range(s, e));
-        LiveSource::new(self, id, SourceCursor::PkSet(Box::new(gather)), hydrator).next_chunk(usize::MAX)
-    }
-
     /// The FK parent probe: every live row of `keys` (flat OPK images, strictly ascending) at
     /// weight 1, projected to the payload column `ref_col`.
     pub fn gather_bytes(&self, id: i64, keys: Vec<u8>, ref_col: u8) -> Result<Batch, StoreError> {

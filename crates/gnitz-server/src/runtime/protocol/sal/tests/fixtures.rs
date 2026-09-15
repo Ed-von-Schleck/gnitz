@@ -131,7 +131,7 @@ impl TestLog {
         let nw = self.writer.num_workers();
         let relation = ipc::WireSchema::encoded(tid as i64, schema);
         let group = DirectGroup {
-            targets: GroupTargets::All(0),
+            targets: GroupTargets::all(0),
             lsn,
             ..DirectGroup::new(SalMessageKind::Push)
         };

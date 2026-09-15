@@ -15,10 +15,11 @@
 //! would never build.
 
 use gnitz_core::protocol::{
-    encode_message_parts, hello_handshake, parse_response, ClientTransport, ColumnDef, Schema, TypeCode,
+    encode_message_parts, hello_handshake, parse_response, ClientTransport, ClientVerb, ColumnDef, Schema, TypeCode,
+    WireFlags,
 };
 use gnitz_core::TableProps;
-use gnitz_core::{BatchAppender, GnitzClient, ZSetBatch, FLAG_PUSH};
+use gnitz_core::{BatchAppender, GnitzClient, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
 /// Ship `batch` as a PUSH, bypassing the client-side `ZSetBatch::validate` that
@@ -26,7 +27,11 @@ use gnitz_test_harness::{unique_schema, ServerHandle};
 /// byte for byte the one `submit` would have built for a cold push. A scripted
 /// peer, so it needs no spine at all.
 fn hostile_push(t: &mut ClientTransport, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
-    let parts = encode_message_parts(tid, 0xB0BA, FLAG_PUSH, 0, &[], 0, Some((schema, batch)));
+    let flags = WireFlags {
+        verb: ClientVerb::Push,
+        ..Default::default()
+    };
+    let parts = encode_message_parts(tid, 0xB0BA, flags, 0, &[], 0, Some((schema, batch)));
     t.send_parts(parts, None).map_err(|e| e.to_string())?;
     let buf = t.recv_framed(None).map_err(|e| e.to_string())?;
     let (msg, _) = parse_response(&buf, None).map_err(|e| e.to_string())?;

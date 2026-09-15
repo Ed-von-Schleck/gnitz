@@ -17,16 +17,16 @@
 //! region[1] weight    i64 LE, always 1
 //! region[2] null      u64 LE, always 0 (no column is nullable)
 //! region[3] type_code u64 LE
-//! region[4] flags     u64 LE (`pack_col_meta_flags`)
+//! region[4] flags     u64 LE ([`ColMeta`])
 //! region[5] name      16-byte German-string cells
 //! region[6] blob      the German-string heap
 //! ```
 
 use crate::wal;
 use crate::{
-    blob_extent, col_meta_nullable, col_meta_pk_pos, encode_german_string, german_string_content, is_pk_eligible,
-    is_valid_type_code, payload_region_in, read_u64_le, wire_stride, write_u64_le, LEADING_COL_PK, MAX_COLUMNS,
-    MAX_PK_COLUMNS, META_SCHEMA_COLS, REG_NULL_BMP, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
+    blob_extent, encode_german_string, german_string_content, is_pk_eligible, is_valid_type_code, payload_region_in,
+    read_u64_le, wire_stride, write_u64_le, LEADING_COL_PK, MAX_COLUMNS, MAX_PK_COLUMNS, META_SCHEMA_COLS,
+    REG_NULL_BMP, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
 };
 
 const REG_TYPE_CODE: usize = payload_region_in(META_SCHEMA_COLS, "type_code");
@@ -56,10 +56,55 @@ const _: () = {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaBlockCol<'a> {
     pub type_code: u8,
-    /// The packed per-column meta word (`pack_col_meta_flags`): nullable,
-    /// hidden, serial, and the column's position within the PK tuple.
-    pub flags: u64,
+    pub meta: ColMeta,
     pub name: &'a [u8],
+}
+
+/// One column's meta word as the schema block carries it. A struct for the reason
+/// `TableProps` is one: three independent booleans a positional call would swap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColMeta {
+    pub nullable: bool,
+    /// A hidden key slot: a physical schema column (it holds a real PK/routing
+    /// value) that no presentation surface exposes. The PK region, routing, sort
+    /// and consolidation are all blind to it.
+    pub hidden: bool,
+    /// Values are assigned from a server-side sequence (SQL `SERIAL`).
+    pub serial: bool,
+    /// A DECIMAL column's scale; 0 for every other type.
+    pub scale: u8,
+    /// Position in the PK tuple, or `None` for a non-PK column. Compound-PK
+    /// schemas need it so the decoder rebuilds the declared PK order rather than
+    /// column-position order (`PRIMARY KEY (b, a)` decodes to `[b, a]`).
+    pub pk_pos: Option<u8>,
+}
+
+const NULLABLE: u64 = 1 << 0;
+const IS_PK: u64 = 1 << 1;
+const HIDDEN: u64 = 1 << 2;
+const SERIAL: u64 = 1 << 3;
+const PK_POS_SHIFT: u32 = 8;
+const SCALE_SHIFT: u32 = 16;
+const DEFINED_BITS: u64 = NULLABLE | IS_PK | HIDDEN | SERIAL | 0xFF << PK_POS_SHIFT | 0xFF << SCALE_SHIFT;
+
+impl ColMeta {
+    fn pack(self) -> u64 {
+        let pk = self.pk_pos.map_or(0, |p| IS_PK | (p as u64) << PK_POS_SHIFT);
+        pk | (self.scale as u64) << SCALE_SHIFT
+            | if self.nullable { NULLABLE } else { 0 }
+            | if self.hidden { HIDDEN } else { 0 }
+            | if self.serial { SERIAL } else { 0 }
+    }
+
+    fn from_flags(w: u64) -> ColMeta {
+        ColMeta {
+            nullable: w & NULLABLE != 0,
+            hidden: w & HIDDEN != 0,
+            serial: w & SERIAL != 0,
+            scale: (w >> SCALE_SHIFT) as u8,
+            pk_pos: (w & IS_PK != 0).then_some((w >> PK_POS_SHIFT) as u8),
+        }
+    }
 }
 
 /// Blob-heap bytes `name` spills: nothing while it fits inline in its cell.
@@ -137,7 +182,7 @@ fn encode_vec(tid: u32, cols: &[SchemaBlockCol], checksum: bool) -> Vec<u8> {
         pk[i * PK_STRIDE..(i + 1) * PK_STRIDE].copy_from_slice(&(i as u64).to_be_bytes());
         write_u64_le(weight, i * 8, 1);
         write_u64_le(type_code, i * 8, c.type_code as u64);
-        write_u64_le(flags, i * 8, c.flags);
+        write_u64_le(flags, i * 8, c.meta.pack());
         names[i * 16..(i + 1) * 16].copy_from_slice(&encode_german_string(c.name, &mut blob));
     }
 
@@ -270,6 +315,10 @@ impl<'a> SchemaBlock<'a> {
             }
             let tc = raw_tc as u8;
             let fl = read_u64_le(block, fl_off + i * 8);
+            if fl & !DEFINED_BITS != 0 {
+                return Err("schema: unknown column meta bits");
+            }
+            let meta = ColMeta::from_flags(fl);
 
             // A name cell whose heap extent overruns the blob is a decode error,
             // not an empty name: the name is the column's identity downstream.
@@ -279,11 +328,11 @@ impl<'a> SchemaBlock<'a> {
                 return Err("schema name blob arena out of bounds");
             }
 
-            if let Some(pos) = col_meta_pk_pos(fl) {
+            if let Some(pos) = meta.pk_pos {
                 // Rejected here rather than at each side's schema constructor,
                 // whose asserts would abort the process on a nullable/STRING/BLOB
                 // key.
-                if col_meta_nullable(fl) {
+                if meta.nullable {
                     return Err("PK column must be non-nullable");
                 }
                 if !is_pk_eligible(tc) {
@@ -340,7 +389,7 @@ impl<'a> SchemaBlock<'a> {
         let cell = &self.block[self.name_off + i * 16..self.name_off + (i + 1) * 16];
         SchemaBlockCol {
             type_code: read_u64_le(self.block, self.tc_off + i * 8) as u8,
-            flags: read_u64_le(self.block, self.fl_off + i * 8),
+            meta: ColMeta::from_flags(read_u64_le(self.block, self.fl_off + i * 8)),
             // `decode` bounded every long cell's heap extent, so this resolves
             // to the real content rather than the degraded-empty fallback.
             name: german_string_content(cell, self.blob),

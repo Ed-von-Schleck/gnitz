@@ -12,16 +12,14 @@ use crate::query::{DagEngine, ExchangeCallback};
 use crate::runtime::m2w::{self, Wake};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{
-    self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_SCAN_LAST,
-};
+use crate::runtime::wire::{self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_store::storage::StoreError;
-use gnitz_wire::{FLAG_CONTINUATION, STATUS_OK};
+use gnitz_wire::{WireFlags, WireStatus};
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
@@ -101,7 +99,6 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         // A read holding no cursor across calls has no stake in the exchange.
         SalMessageKind::Scan
         | SalMessageKind::ScanSpec
-        | SalMessageKind::Seek
         | SalMessageKind::HasPk
         | SalMessageKind::UniquePreflight
         | SalMessageKind::Backfill
@@ -272,9 +269,7 @@ struct ReplyRoute {
     target_id: u64,
     request_id: u64,
     client_id: u64,
-    /// Set on a group the master wrote as one of several: queue this reply
-    /// through `pending_streams` rather than emitting it inline, so ring order
-    /// equals the request order the master drains in.
+    /// Queue the reply behind earlier trains even when it fits one frame.
     fifo: bool,
 }
 
@@ -292,8 +287,9 @@ enum ReplySchema<'a> {
     /// caching theirs would poison the table's. Unchecksummed, so only for a
     /// reply the master consumes — its ring decode verifies none.
     OneOff(&'a SchemaDescriptor),
-    /// The ScanSpec reply schema the client shipped in `seek_pk_extra` and
-    /// decodes against: no block, and no descriptor needed here.
+    /// The reply schema the request shipped in `seek_pk_extra` and the reader
+    /// decodes against: no block, no descriptor needed here, and the request's
+    /// own schema version reported back.
     ClientAuthored,
 }
 
@@ -503,15 +499,14 @@ impl WorkerProcess {
         let seek_pk = decoded.control.seek_pk;
         let seek_col_idx = decoded.control.seek_col_idx;
         let client_id = decoded.control.client_id;
-        let ctrl_wire_flags = decoded.control.flags;
-        // On a scan this is the version the client holds; on a unicast seek the
-        // master stamps the same field with it too (see `fan_out_seek`'s template).
-        let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
+        let flags = decoded.control.flags;
+        // The version the reader holds: the one the master negotiated for it.
+        let client_version = flags.schema_version;
         let route = ReplyRoute {
             target_id: target_id as u64,
             request_id,
             client_id,
-            fifo: ctrl_wire_flags & gnitz_wire::FLAG_SCAN_FIFO_REPLY != 0,
+            fifo: flags.scan_fifo_reply,
         };
         // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Taken
         // (not cloned) — nothing reads the control block after this point.
@@ -572,11 +567,7 @@ impl WorkerProcess {
                         cols: self.cat().registry().index_cols(target_id, packed, "has_pk")?,
                     },
                 };
-                // A trust boundary: bits naming no mode are refused, never
-                // defaulted, exactly as the conflict mode is.
-                let mode = gnitz_wire::wire_flags_get_probe_mode(ctrl_wire_flags)
-                    .ok_or("has_pk: frame names no probe mode")?;
-                self.handle_has_pk(route, batch, lookup, mode, seek_pk as usize)
+                self.handle_has_pk(route, batch, lookup, flags.probe_mode, seek_pk as usize)
             }
 
             SalMessageKind::Push => {
@@ -595,32 +586,16 @@ impl WorkerProcess {
                 Ok(())
             }
 
-            SalMessageKind::Seek => {
-                // The full seek key arrives as the wire pair seek_pk (low ≤16
-                // native bytes) + seek_pk_extra (the 16..stride suffix, empty for
-                // narrow PKs). `seek` decodes it through `seek_opk_bytes`
-                // at every width — user and system tables alike, no width fork.
-                let (result, schema) = self.cat().seek(target_id, seek_pk, &seek_pk_extra)?;
-                // One frame, and a view key names its whole PK group — so this
-                // reply has no size bound of its own. `send_response` rejects one
-                // too large for the client rather than emitting it.
-                self.send_response(
-                    route,
-                    result.as_ref(),
-                    ReplySchema::Table(&schema),
-                    seek_pk,
-                    client_version,
-                )
-            }
-
             SalMessageKind::Scan => {
                 let (result, schema) = self.cat().scan(target_id)?;
                 self.send_shared_scan_response(route, result, ReplySchema::Table(&schema), client_version);
                 Ok(())
             }
 
-            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &seek_pk_extra),
-            SalMessageKind::DeltaRead => self.answer_delta_read(route, seek_col_idx, seek_pk as u64, &seek_pk_extra),
+            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &seek_pk_extra, client_version),
+            SalMessageKind::DeltaRead => {
+                self.answer_delta_read(route, seek_col_idx, seek_pk as u64, &seek_pk_extra, client_version)
+            }
 
             SalMessageKind::UniquePreflight => {
                 // CREATE UNIQUE INDEX global pre-flight: project this worker's
@@ -703,13 +678,18 @@ impl WorkerProcess {
     }
 
     /// Answer one `ReadSpec` read, streaming the keeper back without a schema block.
-    fn answer_scan_spec(&mut self, route: ReplyRoute, seek_pk_extra: &[u8]) -> Result<(), gnitz_wire::WireFault> {
+    fn answer_scan_spec(
+        &mut self,
+        route: ReplyRoute,
+        seek_pk_extra: &[u8],
+        client_version: u16,
+    ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
         let (spec, reply_block) = gnitz_wire::ReadSpec::decode(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
+        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, client_version);
         Ok(())
     }
 
@@ -720,12 +700,13 @@ impl WorkerProcess {
         after_tick: u64,
         cut_tick: u64,
         reply_block: &[u8],
+        client_version: u16,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
         let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
+        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, client_version);
         Ok(())
     }
 

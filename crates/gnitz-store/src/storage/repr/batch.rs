@@ -154,27 +154,6 @@ pub enum Layout {
     Consolidated,
 }
 
-impl Layout {
-    /// This claim as wire flag bits; [`Layout::from_wire_flags`] is its inverse.
-    pub fn to_wire_flags(self) -> u64 {
-        match self {
-            Layout::Raw => 0,
-            Layout::Consolidated => gnitz_wire::FLAG_BATCH_CONSOLIDATED,
-        }
-    }
-
-    /// Recover a claim from wire flag bits. The `Batch` constructor already
-    /// defaults `Raw`, so this is the value fed to `certify_layout` at the
-    /// decode boundary (which debug-verifies the data against the claim).
-    pub fn from_wire_flags(flags: u64) -> Layout {
-        if flags & gnitz_wire::FLAG_BATCH_CONSOLIDATED != 0 {
-            Layout::Consolidated
-        } else {
-            Layout::Raw
-        }
-    }
-}
-
 /// Owned columnar batch.  All fixed-stride column data lives in a single
 /// contiguous `data` buffer.  Blob data is separate (variable-length).
 ///

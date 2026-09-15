@@ -17,11 +17,8 @@ use crate::protocol::transport::{Next, CONNECT_TIMEOUT};
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
-    encode_control_frame, encode_ddl_txn, encode_push_txn, hello_handshake, parse_response_frame,
-    wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
-    FkTarget, Message, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_CONTINUATION, FLAG_PUSH, FLAG_RESOLVE,
-    FLAG_SCAN_SPEC, FLAG_SEEK, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, STATUS_SAL_FULL,
-    STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    encode_control_frame, encode_ddl_txn, encode_push_txn, hello_handshake, parse_response_frame, ClientTransport,
+    ClientVerb, FkTarget, Message, ProtocolError, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
 };
 use gnitz_wire::txn_frame;
 use gnitz_wire::{RelClass, RelDescriptorBlob};
@@ -105,37 +102,32 @@ fn new_client_id() -> u64 {
     (std::process::id() as u64) << 32 | seq
 }
 
-/// Classify a reply frame's status. Every status but `STATUS_OK` is an error,
-/// including one this build does not know: the worker→master leg carries
-/// whatever status a fault names, and falling through would render a refused
-/// read as "no rows".
+/// Classify a reply frame's status. Every status but `Ok` is an error; one this
+/// build does not know was already refused by the control-block decode.
 fn check_response(msg: &mut Message) -> Result<(), ClientError> {
     match msg.status {
-        STATUS_OK => Ok(()),
-        STATUS_SCHEMA_MISMATCH => Err(ClientError::SchemaMismatch),
-        STATUS_DELTA_EXPIRED => Err(ClientError::DeltaExpired),
+        WireStatus::Ok => Ok(()),
+        WireStatus::SchemaMismatch => Err(ClientError::SchemaMismatch),
+        WireStatus::DeltaExpired => Err(ClientError::DeltaExpired),
         // The frame's `target_id` is the relation the request named, so the id is
         // the whole of what there is to say.
-        STATUS_NOT_FOUND => Err(ClientError::NotFound {
+        WireStatus::NotFound => Err(ClientError::NotFound {
             noun: "relation",
             name: msg.target_id.to_string(),
         }),
-        STATUS_SAL_FULL => Err(ClientError::SalFull(msg.error_text.take().unwrap_or_default())),
+        WireStatus::SalFull => Err(ClientError::SalFull(msg.error_text.take().unwrap_or_default())),
         // Control-only frame: the fresh basis rides in `seek_pk`.
-        STATUS_TXN_CONFLICT => Err(ClientError::TxnConflict { fresh_basis: msg.seek_pk as u64 }),
+        WireStatus::TxnConflict => Err(ClientError::TxnConflict { fresh_basis: msg.seek_pk as u64 }),
         // Fall back to the default text on an empty string, not only on None:
-        // a STATUS_ERROR with Some("") would otherwise surface as a blank
+        // an `Error` with Some("") would otherwise surface as a blank
         // ServerError. This matters because the warm-push guard converts
         // silent corruption into a surfaced error, which must be legible.
-        STATUS_ERROR => Err(ClientError::ServerError(
+        WireStatus::Error => Err(ClientError::ServerError(
             msg.error_text
                 .take()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "unknown server error".into()),
         )),
-        other => Err(ClientError::ServerError(format!(
-            "server returned unrecognized status {other}"
-        ))),
     }
 }
 
@@ -200,13 +192,12 @@ pub enum Request<'a> {
     /// under it, and it completes as [`Reply::Scan`].
     Read {
         target_id: u64,
-        flags: u64,
-        seek_pk: u128,
-        seek_pk_extra: &'a [u8],
+        /// The SEEK key, already split by `gnitz_wire::control::split_ctrl_key`;
+        /// `None` for a SCAN.
+        seek: Option<(u128, &'a [u8])>,
     },
-    /// An id allocation: `flag` names the sequence, `count` the run length.
-    /// Completes as [`Reply::Id`].
-    Alloc { target_id: u64, flag: u64, count: u64 },
+    /// An id allocation. Completes as [`Reply::Id`].
+    Alloc(IdRun),
     /// An atomic DDL transaction: system-table batches, each named by its table
     /// id, under one durable SAL zone. Completes as [`Reply::Lsn`].
     DdlTxn(&'a [(u64, ZSetBatch)]),
@@ -251,12 +242,7 @@ pub enum Request<'a> {
 impl<'a> Request<'a> {
     /// A full-relation SCAN.
     pub fn scan(target_id: u64) -> Request<'static> {
-        Request::Read {
-            target_id,
-            flags: 0,
-            seek_pk: 0,
-            seek_pk_extra: &[],
-        }
+        Request::Read { target_id, seek: None }
     }
 
     /// A point SEEK by primary key, already split by
@@ -264,11 +250,22 @@ impl<'a> Request<'a> {
     pub fn seek(target_id: u64, seek_pk: u128, seek_pk_extra: &'a [u8]) -> Request<'a> {
         Request::Read {
             target_id,
-            flags: FLAG_SEEK,
-            seek_pk,
-            seek_pk_extra,
+            seek: Some((seek_pk, seek_pk_extra)),
         }
     }
+}
+
+/// A run of ids from one server-side sequence.
+#[derive(Clone, Copy, Debug)]
+pub enum IdRun {
+    Tables(u64),
+    Indexes(u64),
+    Schema,
+    /// The SERIAL sequence of `table_id`.
+    Serial {
+        table_id: u64,
+        count: u64,
+    },
 }
 
 /// What a slot's verb asked for. The spine resolves a reply against the request
@@ -556,15 +553,31 @@ impl Session {
         }
         let client_id = self.client_id;
         let (parts, kind) = match req {
-            Request::Read { target_id, flags, seek_pk, seek_pk_extra } => {
+            Request::Read { target_id, seek } => {
                 let hint = self.cached_hint(target_id);
-                let flags = wire_flags_set_schema_version(flags, hint.as_ref().map_or(0, |h| h.1));
+                let flags = WireFlags {
+                    verb: if seek.is_some() {
+                        ClientVerb::Seek
+                    } else {
+                        ClientVerb::Scan
+                    },
+                    schema_version: hint.as_ref().map_or(0, |h| h.1),
+                    ..Default::default()
+                };
+                let (seek_pk, seek_pk_extra) = seek.unwrap_or((0, &[]));
                 let parts = encode_control_frame(target_id, client_id, flags, seek_pk, 0, seek_pk_extra);
                 (parts, SlotKind::Read { tid: target_id, hint })
             }
-            Request::Alloc { target_id, flag, count } => {
+            Request::Alloc(run) => {
+                let (target_id, verb, count) = match run {
+                    IdRun::Tables(n) => (0, ClientVerb::AllocTableId, n),
+                    IdRun::Indexes(n) => (0, ClientVerb::AllocIndexId, n),
+                    IdRun::Schema => (0, ClientVerb::AllocSchemaId, 1),
+                    IdRun::Serial { table_id, count } => (table_id, ClientVerb::AllocSerialRange, count),
+                };
+                let flags = WireFlags { verb, ..Default::default() };
                 // The run length rides in `seek_col_idx`.
-                let parts = encode_control_frame(target_id, client_id, flag, 0, count, &[]);
+                let parts = encode_control_frame(target_id, client_id, flags, 0, count, &[]);
                 (parts, SlotKind::Alloc)
             }
             Request::DdlTxn(families) => {
@@ -593,10 +606,14 @@ impl Session {
                 // server checks the same things. Here so no driver has to
                 // remember to.
                 batch.validate(schema)?;
-                // FLAG_PUSH marks the frame as a push independent of data
+                // The push verb marks the frame as a push independent of data
                 // presence, so an empty batch (a legitimate empty Z-set delta)
                 // is ACKed as a no-op push instead of being mistaken for a scan.
-                let base_flags = wire_flags_set_conflict_mode(FLAG_PUSH, mode);
+                let base_flags = WireFlags {
+                    verb: ClientVerb::Push,
+                    conflict_mode: mode,
+                    ..Default::default()
+                };
                 // The warm path is gated on `types_match`, not the version
                 // alone: a version proves the catalog has not changed, not
                 // that the caller encoded under the same column types, and a
@@ -608,7 +625,7 @@ impl Session {
                 };
                 let parts = match warm_version {
                     Some(v) => {
-                        let flags = wire_flags_set_schema_version(base_flags, v);
+                        let flags = WireFlags { schema_version: v, ..base_flags };
                         encode_message_noschema_parts(target_id, client_id, flags, schema, batch)
                     }
                     None => encode_message_parts(target_id, client_id, base_flags, 0, &[], 0, Some((schema, batch))),
@@ -619,7 +636,11 @@ impl Session {
                 // The reply schema rides the request blob and stays with the slot
                 // as the decode hint.
                 let extra = spec.encode(reply_schema.block());
-                let parts = encode_control_frame(target_id, client_id, FLAG_SCAN_SPEC, 0, 0, &extra);
+                let flags = WireFlags {
+                    verb: ClientVerb::ScanSpec,
+                    ..Default::default()
+                };
+                let parts = encode_control_frame(target_id, client_id, flags, 0, 0, &extra);
                 (parts, SlotKind::ScanSpec { reply_schema: reply_schema.schema() })
             }
             Request::ScanMulti(tids) => {
@@ -746,11 +767,8 @@ impl Session {
         self.pending.clear();
     }
 
-    /// One reply frame for the head slot. Status is classified on every
-    /// frame before the continuation test: a `STATUS_ERROR` fault frame has
-    /// flags 0, structurally identical to a terminal frame, and a non-OK frame
-    /// ends the whole request — a `scan_multi` rejection after k trains sends
-    /// one error frame and nothing more.
+    /// One reply frame for the head slot. A non-OK frame ends the whole request, so
+    /// status is classified before the continuation test.
     ///
     /// Returns the delta-poll position this frame filled, if it filled one.
     fn feed(&mut self, buf: Vec<u8>, done: &mut Completions) -> Result<Option<(SlotId, PolledView)>, ClientError> {
@@ -824,7 +842,7 @@ impl Session {
         // asserted is its own and a by-name RESOLVE (requested id 0) reports as
         // the live one.
         if let Some(sch) = parsed.message.schema.as_ref() {
-            let version = wire_flags_get_schema_version(parsed.message.flags);
+            let version = parsed.message.flags.schema_version;
             if head.kind.absorbs_schema() {
                 schema_cache.put(parsed.message.target_id, (Arc::clone(sch), version));
             }
@@ -846,7 +864,7 @@ impl Session {
         }
 
         let terminal = parsed.message;
-        if terminal.flags & FLAG_CONTINUATION != 0 {
+        if terminal.flags.continuation {
             return Ok(None);
         }
 
@@ -900,7 +918,11 @@ impl Session {
             RelTarget::Name(q) => (0, q),
             RelTarget::Id(tid) => (tid, ""),
         };
-        encode_control_frame(target_id, self.client_id, FLAG_RESOLVE, 0, 0, qname.as_bytes())
+        let flags = WireFlags {
+            verb: ClientVerb::Resolve,
+            ..Default::default()
+        };
+        encode_control_frame(target_id, self.client_id, flags, 0, 0, qname.as_bytes())
     }
 
     /// The cached `(schema, version)` for `tid`. `get`, so a relation in use

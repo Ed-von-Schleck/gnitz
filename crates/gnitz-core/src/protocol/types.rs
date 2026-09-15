@@ -31,7 +31,7 @@ pub struct ColumnDef {
     pub fk: Option<FkTarget>,
     /// True for a Postgres-style SERIAL/BIGSERIAL/SMALLSERIAL primary key: an
     /// auto-assigned, client-stamped id the user may not supply. Round-trips
-    /// through the wire meta-schema (`META_FLAG_SERIAL`) and `COL_TAB`, so a
+    /// through the wire meta-schema (`ColMeta::serial`) and `COL_TAB`, so a
     /// connection that only resolved the relation can still distinguish it from
     /// a user-supplied non-null integer PK. The engine stores the marker but has
     /// no SERIAL awareness.
@@ -39,7 +39,7 @@ pub struct ColumnDef {
     /// True for a hidden key slot — a physical schema column carrying a real
     /// PK/routing value (a synthetic view key like `_join_pk`/`_group_pk`, or an
     /// unprojected passthrough source PK) that no presentation surface exposes.
-    /// Round-trips through the wire meta-schema (`META_FLAG_HIDDEN`) and
+    /// Round-trips through the wire meta-schema (`ColMeta::hidden`) and
     /// `COL_TAB`. Presentation layers (wildcard expansion, name resolution,
     /// duplicate-name checks, client rows) skip it; physical layout, routing,
     /// sort, and consolidation are unaffected. A base-table column becomes hidden

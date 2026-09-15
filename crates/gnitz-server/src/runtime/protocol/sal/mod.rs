@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::wire::{WireData, WireMsg};
 use gnitz_foundation::fault::Seam;
 use gnitz_wire::{align8, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
-use gnitz_wire::{WireFault, MAX_WORKERS, STATUS_SAL_FULL};
+use gnitz_wire::{WireFault, WireFlags, WireStatus, MAX_WORKERS};
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
 /// groups publishing and its sentinel. The tag (`"ddl"` / `"commit"`) picks
@@ -126,15 +126,27 @@ fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = u32> + '_ {
         .map(|c| u32::from_le_bytes(*c))
 }
 
-/// Which of a group's slots are written, and the request id each answers on.
+/// Which of a group's slots are written, the request id each answers on, and
+/// whether each reply must reach the ring in request order.
 #[derive(Clone, Copy)]
 pub(crate) enum GroupTargets {
     /// Broadcast on request id 0, which no lease holds: nothing answers.
     AllUnaddressed,
     /// Broadcast; slot `w` answers on `base + w`.
-    All(u64),
+    All { base: u64, in_request_order: bool },
     /// Only `worker`'s slot is written, and it answers on `req_id`.
-    One { worker: usize, req_id: u64 },
+    One {
+        worker: usize,
+        req_id: u64,
+        in_request_order: bool,
+    },
+}
+
+impl GroupTargets {
+    /// A broadcast whose replies need no ordering.
+    pub(crate) const fn all(base: u64) -> Self {
+        GroupTargets::All { base, in_request_order: false }
+    }
 }
 
 /// What a group's slots carry.
@@ -170,11 +182,9 @@ pub(crate) struct DirectGroup<'a> {
     /// The header's `lsn` field: a zone LSN, a tick round or a checkpoint
     /// generation by kind; `0` for every other command.
     pub(crate) lsn: u64,
-    /// Every slot's message but its `data` and `request_id`, which `msg` fills
-    /// from `data`/`targets` — set either of those here and the per-worker fill
-    /// overwrites it (debug-asserted in `msg`). `schema_block` is read from here
-    /// and dropped per slot, on the rule
-    /// [`SalMessageKind::schema_survives_a_rowless_slot`] states.
+    /// Every slot's message; `msg` fills in `data`, `request_id` and
+    /// `flags.scan_fifo_reply` per slot, and drops `schema_block` from a rowless one
+    /// unless [`SalMessageKind::schema_survives_a_rowless_slot`].
     pub(crate) template: WireMsg<'a>,
     pub(crate) data: GroupData<'a>,
     /// Slot `w`'s `seek_pk_extra` in place of the template's, when every worker
@@ -205,20 +215,27 @@ impl<'a> DirectGroup<'a> {
     #[inline]
     fn msg(&self, w: usize) -> WireMsg<'a> {
         debug_assert!(
-            matches!(self.template.data, WireData::Whole(None)) && self.template.request_id == 0,
-            "DirectGroup template must leave `data` and `request_id` to the per-worker fill"
+            matches!(self.template.data, WireData::Whole(None))
+                && self.template.request_id == 0
+                && !self.template.flags.scan_fifo_reply,
+            "DirectGroup template must leave `data`, `request_id` and the reply order to the per-worker fill"
         );
         let data = match self.data {
             GroupData::Same(d) => d,
             GroupData::PerWorker(d) => d[w],
         };
         let keeps_schema = data.row_count() > 0 || self.kind.schema_survives_a_rowless_slot();
+        let (request_id, in_request_order) = match self.targets {
+            GroupTargets::AllUnaddressed => (0, false),
+            GroupTargets::All { base, in_request_order } => (base + w as u64, in_request_order),
+            GroupTargets::One { req_id, in_request_order, .. } => (req_id, in_request_order),
+        };
         WireMsg {
             data,
-            request_id: match self.targets {
-                GroupTargets::AllUnaddressed => 0,
-                GroupTargets::All(base) => base + w as u64,
-                GroupTargets::One { req_id, .. } => req_id,
+            request_id,
+            flags: WireFlags {
+                scan_fifo_reply: in_request_order,
+                ..self.template.flags
             },
             schema_block: self.template.schema_block.filter(|_| keeps_schema),
             seek_pk_extra: self.extras.map_or(self.template.seek_pk_extra, |e| &e[w]),
@@ -319,14 +336,14 @@ pub(crate) enum SalFit {
 
 impl SalFit {
     /// The client-facing refusal for a group of `kind` that did not fit. Carries
-    /// [`STATUS_SAL_FULL`], which is what a caller matches to tell this refusal
+    /// [`WireStatus::SalFull`], which is what a caller matches to tell this refusal
     /// from a real failure; the transient/terminal distinction stays typed and is
     /// not spelled into the text. The write cursor is deliberately absent — this
     /// reaches clients verbatim — and goes to the operator log instead.
     fn refusal(self, kind: SalMessageKind) -> WireFault {
         debug_assert_ne!(self, SalFit::Fits, "a fitting group has no refusal");
         WireFault {
-            status: STATUS_SAL_FULL,
+            status: WireStatus::SalFull,
             text: format!("SAL full: {kind:?} group did not fit"),
         }
     }
@@ -390,16 +407,15 @@ gnitz_wire::wire_enum! {
         Push = 9,
         /// Drive one view-maintenance tick.
         Tick = 10,
-        Seek = 12,
         /// A parameterized bounded read (`ReadSpec`).
-        ScanSpec = 13,
+        ScanSpec = 11,
         /// One DELTA_POLL view: `seek_col_idx` = `after_tick`, `seek_pk` = the cut
         /// round, `seek_pk_extra` = the reply block.
-        DeltaRead = 14,
+        DeltaRead = 12,
         /// The zone-closing commit sentinel: a slotless group no worker acts on.
         /// All preceding groups at the same LSN belong to the zone; recovery
         /// applies them only when this reaches disk.
-        ZoneCommit = 15,
+        ZoneCommit = 13,
     }
 }
 
@@ -412,7 +428,7 @@ impl SalMessageKind {
         use SalMessageKind::*;
         match self {
             Push | HasPk => false,
-            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | Backfill | UniquePreflight | Tick | Seek
+            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | Backfill | UniquePreflight | Tick
             | ScanSpec | DeltaRead | ZoneCommit => true,
         }
     }
@@ -979,7 +995,7 @@ impl SalWriter {
         }
         debug_assert!(
             g.template.schema_block.is_some() || g.data.is_dataless(),
-            "data without a schema — `decode_wire` rejects FLAG_HAS_DATA without FLAG_HAS_SCHEMA",
+            "data without a schema — `decode_wire` rejects a data block without a schema block",
         );
 
         let mut sizes = [0u32; MAX_WORKERS];

@@ -73,7 +73,7 @@ fn ack_collection_errors_when_a_worker_is_dead() {
         let err = disp
             .exclusive_round(ctx, false, |_| Ok(()))
             .expect_err("a dead worker must fail ack collection");
-        assert!(err.contains("worker 0") && err.contains(ctx), "{err}");
+        assert!(err.text.contains("worker 0") && err.text.contains(ctx), "{err}");
     }
 }
 
@@ -84,14 +84,31 @@ fn an_exclusive_round_fails_on_a_worker_error_without_the_other_acks() {
     let (disp, writers) = test_dispatcher_with_writers(vec![0, 0]);
     let err = disp
         .exclusive_round("backfill relay", false, |targets| {
-            let GroupTargets::All(base) = targets else {
+            let GroupTargets::All { base, .. } = targets else {
                 unreachable!("an exclusive round broadcasts")
             };
-            writers[0].send_status(0, base, gnitz_wire::STATUS_ERROR, b"boom");
+            writers[0].send_status(0, base, gnitz_wire::WireStatus::Error, b"boom");
             Ok(())
         })
         .expect_err("a worker's error ACK must fail the round");
-    assert!(err.contains("worker 0") && err.contains("boom"), "{err}");
+    assert!(err.text.contains("worker 0") && err.text.contains("boom"), "{err}");
+}
+
+/// A refused write fails the round before any worker is signalled, and keeps its
+/// status: a full SAL reaches the caller as the retryable `SalFull`, not as a
+/// flattened error.
+#[test]
+fn an_exclusive_round_keeps_its_write_refusals_status() {
+    let (disp, _writers) = test_dispatcher_with_writers(vec![0]);
+    let err = disp
+        .exclusive_round("view tick drain", false, |_| {
+            Err(gnitz_wire::WireFault {
+                status: gnitz_wire::WireStatus::SalFull,
+                text: "SAL full".into(),
+            })
+        })
+        .expect_err("a refused write must fail the round");
+    assert_eq!(err.status, gnitz_wire::WireStatus::SalFull, "{err}");
 }
 
 /// The checkpoint finalizer flushes system tables before resetting the SAL. A

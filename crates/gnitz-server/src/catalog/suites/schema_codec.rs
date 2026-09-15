@@ -127,11 +127,7 @@ proptest! {
         prop_assert_eq!(schema_from_block(&wire).unwrap(), client);
     }
 
-    /// The two crates' adapters must emit the **same bytes** for the same
-    /// schema — the property that makes either side's block decodable by the
-    /// other for reasons stronger than "both round-trip", and the one thing
-    /// pinning `pack_col_meta_flags`' argument order across them. With each
-    /// side's own round-trip above, the two cross-codec directions follow.
+    /// Both crates' adapters emit the same bytes for the same schema.
     #[test]
     fn schema_block_bytes_agree_across_the_two_adapters(original in arb_schema(gnitz_wire::PK_LIST_MAX_COLS)) {
         use gnitz_core::protocol::codec::encode_schema_block;

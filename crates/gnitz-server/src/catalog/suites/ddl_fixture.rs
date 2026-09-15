@@ -3,7 +3,7 @@
 //!
 //! **Not** a production code path. Every real DDL statement (SQL planner,
 //! C-API, `gnitz-py`) is built client-side and pushed over the wire as a
-//! `FLAG_DDL_TXN` bundle of system-table deltas, which the executor applies
+//! `DDL_TXN` bundle of system-table deltas, which the executor applies
 //! through `submit`. These wrappers let a unit test reach the same appliers
 //! without a server.
 

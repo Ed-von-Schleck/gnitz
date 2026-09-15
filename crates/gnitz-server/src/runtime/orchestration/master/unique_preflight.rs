@@ -53,26 +53,21 @@ impl PreflightKeyStream {
     /// Install `slot` as the current frame, locating its key region.
     /// A fault/corrupt/undecodable frame is an immediate `Err` — the caller
     /// unwinds to the scan lease's drop, which discards the undrained trains.
-    fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), WorkerFault> {
+    fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), WireFault> {
         self.row = 0;
         self.count = 0;
         let (ctrl, has_more) = parse_train_header(&slot, self.w, OP_UNIQUE_PREFLIGHT)?;
         self.has_more = has_more;
-        let carries_block = ctrl.flags & FLAG_HAS_SCHEMA != 0;
         let bytes = slot.bytes();
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         // Continuation frames carry no schema and decode against `frame_schema`.
         let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(frame_schema), &mut offsets)
             .map_err(|e| scan_decode_err(self.w, OP_UNIQUE_PREFLIGHT, e))?;
-        // Guarded on `carries_block`, not on `zc.schema`: a continuation frame
-        // decoded against the hint reports `Some(frame_schema)` too. A
-        // disagreement is an engine bug — both sides build from the same inputs
+        // A disagreement is an engine bug — both sides build from the same inputs
         // — and refused, since the merge reads key bytes at this width.
-        if carries_block {
-            if let Some(s) = zc.schema.as_ref() {
-                wire::validate_schema_match(s, frame_schema)
-                    .map_err(|e| format!("worker {}: {OP_UNIQUE_PREFLIGHT}: {e}", self.w))?;
-            }
+        if let Some(s) = zc.schema.as_ref() {
+            wire::validate_schema_match(s, frame_schema)
+                .map_err(|e| format!("worker {}: {OP_UNIQUE_PREFLIGHT}: {e}", self.w))?;
         }
         if let Some(mb) = zc.data_batch.as_ref() {
             let pk = mb.pk();
@@ -99,7 +94,7 @@ impl PreflightKeyStream {
         &mut self,
         frame_schema: &SchemaDescriptor,
         scan: &ScanDispatch,
-    ) -> Result<Option<PkBuf>, WorkerFault> {
+    ) -> Result<Option<PkBuf>, WireFault> {
         let pk_stride = frame_schema.pk_stride();
         loop {
             if self.row < self.count {
@@ -187,7 +182,7 @@ async fn merge_index_scan(
     slots: Vec<W2mSlot>,
     scan: &ScanDispatch,
     frame_schema: &SchemaDescriptor,
-) -> Result<PreflightAccumulator, WorkerFault> {
+) -> Result<PreflightAccumulator, WireFault> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -249,7 +244,7 @@ impl MasterDispatcher {
         &self,
         owner_id: i64,
         col_indices: &[u32],
-    ) -> Result<UniqueFilter, WorkerFault> {
+    ) -> Result<UniqueFilter, WireFault> {
         let (idx_schema, packed) = {
             let cat = self.cat();
             let owner_schema = match cat.registry().relation(owner_id).map(Relation::schema) {

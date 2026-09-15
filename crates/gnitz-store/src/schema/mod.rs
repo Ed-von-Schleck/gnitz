@@ -599,11 +599,9 @@ impl SchemaDescriptor {
 
     /// The single **table-key router**: maps a row's full OPK PK bytes to its
     /// owning worker by hashing only the leading distribution prefix
-    /// (`key[..dist_stride()]`), so the slicing rule lives in one place. Its two
-    /// production callers are the write scatter (`storage/repr/scatter.rs`) and
-    /// the master's seek unicast (`master/dispatch.rs`); a constraint probe does
-    /// not appear, because those broadcast. `key` is the full PK, and for the
-    /// full-PK default this is byte-identical to hashing all of it.
+    /// (`key[..dist_stride()]`), so the slicing rule lives in one place. `key` is
+    /// the full PK, and for the full-PK default this is byte-identical to hashing
+    /// all of it.
     ///
     /// Not for **join-key** routing: the exchange relay scatters route an already
     /// reindexed `_join_pk` over a derived schema and call `worker_for_pk_bytes`
@@ -613,10 +611,8 @@ impl SchemaDescriptor {
         gnitz_wire::worker_for_pk_bytes(&key[..self.dist_stride()], num_workers)
     }
 
-    /// Where this relation's rows live — the one value the store shape
-    /// (`build_relation_store`), the write scatter (broadcast vs
-    /// partition-scatter), the read gather / seek unicast, and the join and
-    /// exchange analyzers all read, so they cannot disagree. Crate-visible so the
+    /// Where this relation's rows live — the one value every placement decision
+    /// reads, so no two can disagree. Crate-visible so the
     /// ALTER … DROP NOT NULL descriptor rebuild (`hook_column_alter`) can carry it
     /// across the swap: `SchemaDescriptor::eq` ignores it, so a rebuilt
     /// descriptor must be constructed with it again.
@@ -923,7 +919,7 @@ pub fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaD
     let sb = gnitz_wire::schema_block::SchemaBlock::decode(data, verify_checksum, MAX_PK_COLUMNS)?;
     let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (col, c) in cols[..sb.num_columns()].iter_mut().zip(sb.columns()) {
-        *col = SchemaColumn::new(c.type_code, gnitz_wire::col_meta_nullable(c.flags) as u8);
+        *col = SchemaColumn::new(c.type_code, c.meta.nullable as u8);
     }
     Ok(SchemaDescriptor::new(&cols[..sb.num_columns()], sb.pk_indices()))
 }

@@ -14,11 +14,11 @@ pub(crate) struct ColumnDef {
     pub(crate) fk_col_idx: u32,
     /// SERIAL marker (COL_TAB `is_serial`). Like `is_hidden` the engine never
     /// branches on it — it is echoed verbatim into reply schema blocks
-    /// (`META_FLAG_SERIAL`), which is what lets a client plan an INSERT into a
+    /// (`ColMeta::serial`), which is what lets a client plan an INSERT into a
     /// SERIAL table off a resolved schema instead of a COL_TAB scan.
     pub(crate) is_serial: bool,
     /// Hidden key slot (COL_TAB `is_hidden`). The engine never branches on it —
-    /// it is echoed verbatim into reply schema blocks (`META_FLAG_HIDDEN`) so
+    /// it is echoed verbatim into reply schema blocks (`ColMeta::hidden`) so
     /// clients can suppress the column in presentation.
     pub(crate) is_hidden: bool,
     /// A DECIMAL column's scale (COL_TAB `scale`), else 0. Echoed verbatim into

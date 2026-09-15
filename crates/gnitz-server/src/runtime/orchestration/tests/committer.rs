@@ -8,7 +8,7 @@ use super::*;
 use crate::runtime::reactor::Reactor;
 use crate::runtime::test_support::make_reactor;
 use crate::test_support::make_schema_u64_i64;
-use gnitz_wire::{WireConflictMode, STATUS_ERROR};
+use gnitz_wire::{WireConflictMode, WireStatus};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -21,7 +21,7 @@ fn poll_once<T>(rx: &mut oneshot::Receiver<T>) -> Poll<T> {
 
 fn fault(text: &str) -> WireFault {
     WireFault {
-        status: STATUS_ERROR,
+        status: WireStatus::Error,
         text: text.to_string(),
     }
 }

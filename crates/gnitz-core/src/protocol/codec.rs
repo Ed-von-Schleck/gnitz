@@ -5,16 +5,13 @@
 
 use super::error::ProtocolError;
 use super::types::{type_code_from_u64, ColType, ColumnDef, Schema};
-use gnitz_wire::schema_block::{SchemaBlock, SchemaBlockCol};
+use gnitz_wire::schema_block::{ColMeta, SchemaBlock, SchemaBlockCol};
+use gnitz_wire::PK_LIST_MAX_COLS;
 use std::sync::Arc;
-
-use gnitz_wire::{
-    col_meta_hidden, col_meta_nullable, col_meta_scale, col_meta_serial, pack_col_meta_flags, PK_LIST_MAX_COLS,
-};
 
 /// Encode the meta-schema WAL block for `schema` under table id `tid` — the
 /// exact bytes a schema-bearing push embeds. Shared by the plain-push encoder,
-/// the always-schema-bearing `FLAG_PUSH_TXN` per-family block, and the ScanSpec
+/// the always-schema-bearing `PUSH_TXN` per-family block, and the ScanSpec
 /// request's reply schema.
 ///
 /// `pub` for `gnitz-mirror`, which encodes a registered view's schema through
@@ -28,13 +25,13 @@ pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
             type_code: col.type_code as u8,
             // Position-in-PK-tuple is carried so compound `PRIMARY KEY (b, a)`
             // decodes back to the user-declared order.
-            flags: pack_col_meta_flags(
-                col.is_nullable,
-                col.is_hidden,
-                col.is_serial,
-                col.scale,
-                schema.pk_cols.iter().position(|&p| p as usize == ci).map(|p| p as u8),
-            ),
+            meta: ColMeta {
+                nullable: col.is_nullable,
+                hidden: col.is_hidden,
+                serial: col.is_serial,
+                scale: col.scale,
+                pk_pos: schema.pk_cols.iter().position(|&p| p as usize == ci).map(|p| p as u8),
+            },
             name: col.name.as_bytes(),
         })
         .collect();
@@ -84,13 +81,13 @@ pub fn schema_from_block(block: &[u8]) -> Result<Schema, ProtocolError> {
         // as the client's typed `TypeCode` rather than trusting a cast.
         let ty = ColType {
             tc: type_code_from_u64(c.type_code as u64)?,
-            scale: col_meta_scale(c.flags),
+            scale: c.meta.scale,
         };
-        let mut col = ColumnDef::typed(name, ty, col_meta_nullable(c.flags));
-        if col_meta_hidden(c.flags) {
+        let mut col = ColumnDef::typed(name, ty, c.meta.nullable);
+        if c.meta.hidden {
             col = col.hidden();
         }
-        if col_meta_serial(c.flags) {
+        if c.meta.serial {
             col = col.serial();
         }
         columns.push(col);

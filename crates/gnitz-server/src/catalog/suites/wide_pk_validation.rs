@@ -120,14 +120,10 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     engine.registry_mut().ingest(parent_tid, pb).unwrap();
     engine.registry_mut().flush(parent_tid).unwrap();
 
-    // The byte-keyed seek must resolve the committed parent row by full PK bytes.
-    let seen = engine.registry_mut().seek(parent_tid, &parent_pk, None).unwrap();
-    assert!(seen.is_some(), "seek must find the live wide-PK parent row");
-    assert_eq!(
-        read_u64_col(&seen.unwrap(), 0),
-        555,
-        "resolved the referenced email value"
-    );
+    // A point read resolves the committed parent row by full PK bytes.
+    let seen = pk_group(&mut engine, parent_tid, &parent_pk);
+    assert_eq!(seen.len(), 1, "the live wide-PK parent row");
+    assert_eq!(read_u64_col(&seen, 0), 555, "resolved the referenced email value");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -138,10 +134,10 @@ fn read_u64_col(batch: &Batch, payload_idx: usize) -> u64 {
     u64::from_le_bytes(d[0..8].try_into().unwrap())
 }
 
-// ── byte-keyed seek agreement with the wire-pair seek (narrow PK) ───────
+// ── native-key and byte-key point reads agree (narrow PK) ───────
 
 #[test]
-fn byte_seek_matches_wire_pair_seek_narrow() {
+fn native_and_byte_point_reads_agree_narrow() {
     let dir = temp_dir("seek_bytes_narrow");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -169,19 +165,16 @@ fn byte_seek_matches_wire_pair_seek_narrow() {
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.
     for key in [1u64, 2, 3, 99] {
-        // The registry's seek takes the at-rest OPK bytes; for an unsigned U64
-        // PK that is big-endian. The catalog's takes the native u128 and
-        // OPK-encodes.
-        let bytes = key.to_be_bytes();
-        let via_u128 = engine.seek(tid, key as u128, &[]).unwrap().0;
-        let via_bytes = engine.registry_mut().seek(tid, &bytes, None).unwrap();
-        assert_eq!(
-            via_u128.is_some(),
-            via_bytes.is_some(),
-            "seek presence diverged for key {key}",
-        );
-        if let (Some(a), Some(b)) = (&via_u128, &via_bytes) {
-            assert_eq!(read_u64_col(a, 0), read_u64_col(b, 0), "payload diverged for key {key}");
+        // The native key is LE; the at-rest OPK of an unsigned U64 PK is big-endian.
+        let via_u128 = pk_group_native(&mut engine, tid, key as u128);
+        let via_bytes = pk_group(&mut engine, tid, &key.to_be_bytes());
+        assert_eq!(via_u128.len(), via_bytes.len(), "presence diverged for key {key}");
+        if !via_u128.is_empty() {
+            assert_eq!(
+                read_u64_col(&via_u128, 0),
+                read_u64_col(&via_bytes, 0),
+                "payload diverged for key {key}"
+            );
         }
     }
 

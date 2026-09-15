@@ -6,11 +6,20 @@ fn probe_header() -> ControlHeader {
     ControlHeader {
         target_id: 0x1111_2222_3333_4444,
         client_id: 0x5555_6666_7777_8888,
-        flags: 0x9999_AAAA_BBBB_CCCC,
+        flags: WireFlags {
+            verb: crate::ClientVerb::ScanSpec,
+            conflict_mode: crate::WireConflictMode::Error,
+            schema_version: 0xBBCC,
+            has_schema: true,
+            continuation: true,
+            scan_last: true,
+            probe_mode: crate::WireProbeMode::AllHolders,
+            ..Default::default()
+        },
         seek_pk: (0xDDDD_EEEE_FFFF_0011u128 << 64) | 0x2233_4455_6677_8899u128,
         seek_col_idx: 0xAA_BB_CC_DD_EE_FF_00_11,
         request_id: 0x1234_5678_9ABC_DEF0,
-        status: 0xDEAD_BEEF,
+        status: WireStatus::NotFound,
     }
 }
 
@@ -104,7 +113,7 @@ fn peek_rejects_oob_error_msg_offset() {
         &mut buf,
         0,
         &ControlHeader {
-            status: 1,
+            status: WireStatus::Error,
             target_id: 1,
             client_id: 2,
             ..Default::default()
@@ -120,5 +129,21 @@ fn peek_rejects_oob_error_msg_offset() {
         Err("error_msg string offset out of bounds") => {}
         Err(other) => panic!("wrong error: {other}"),
         Ok(_) => panic!("OOB error_msg offset must be rejected"),
+    }
+}
+
+/// A status word naming no [`WireStatus`] is a decode error, not a code the
+/// reader has to branch past — including one whose low 32 bits would name one.
+#[test]
+fn peek_rejects_an_unknown_status() {
+    for raw in [7u64, u32::MAX as u64 + 1] {
+        let mut buf = vec![0u8; ctrl_block_size(0, 0)];
+        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), b"", b"", false);
+        crate::write_u64_le(&mut buf, OFF_STATUS, raw);
+        assert_eq!(
+            peek_control_block_ipc(&buf[..n]).err(),
+            Some("control block names no status"),
+            "status word {raw}"
+        );
     }
 }

@@ -21,21 +21,13 @@ pub(super) struct PendingScan {
     pub(super) next_row: usize,
 }
 
-/// The wire flags every frame of a train carries — the convention
-/// `train_has_more` reads back. FLAG_CONTINUATION is always set so the client's
-/// "stop on no FLAG_CONTINUATION" loop still terminates on the frame after the
-/// last one; FLAG_SCAN_LAST marks this worker's terminal frame.
-pub(super) fn train_flags(server_version: u16, is_last: bool) -> u64 {
-    let last = if is_last { FLAG_SCAN_LAST } else { 0 };
-    gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | last, server_version)
-}
-
 /// One frame of a worker reply, but for its payload.
 fn reply_frame<'a>(route: ReplyRoute, block: Option<&'a [u8]>, server_version: u16, last: bool) -> WireMsg<'a> {
     WireMsg {
         target_id: route.target_id,
         client_id: route.client_id,
-        flags: train_flags(server_version, last),
+        request_id: route.request_id,
+        flags: WireFlags::train_frame(server_version, last),
         schema_block: block,
         ..Default::default()
     }
@@ -81,7 +73,7 @@ impl PendingScan {
         w2m.send_msg(
             self.route.request_id,
             &WireMsg {
-                flags: train_flags(self.server_version, !has_more),
+                flags: WireFlags::train_frame(self.server_version, !has_more),
                 data: WireData::Whole(Some(&chunk)),
                 ..base
             },
@@ -95,13 +87,10 @@ impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
     pub(super) fn send_ack(&self, target_id: u64, request_id: u64) {
-        self.w2m_writer.send_status(target_id, request_id, STATUS_OK, &[]);
+        self.w2m_writer.send_status(target_id, request_id, WireStatus::Ok, &[]);
     }
 
-    /// One control-only failure frame carrying the fault's **own** status, so a
-    /// refusal a worker mints (`STATUS_DELTA_EXPIRED`) reaches the client as a
-    /// code rather than as a string. `target_id` `0`: the reactor routes a reply
-    /// by its ring slot, and `worker_error` reads status and text alone.
+    /// A control-only frame carrying the fault's own status.
     pub(super) fn send_fault(&self, fault: &gnitz_wire::WireFault, request_id: u64) {
         self.w2m_writer
             .send_status(0, request_id, fault.status, fault.text.as_bytes());
@@ -129,42 +118,8 @@ impl WorkerProcess {
             ReplySchema::Table(s) => self
                 .cat()
                 .negotiated_schema_block(tid_key, client_version, |_| Some(*s)),
-            ReplySchema::ClientAuthored => (None, 0),
+            ReplySchema::ClientAuthored => (None, client_version),
         }
-    }
-
-    /// Emit `result` as one frame carrying no train flags — the shape whose
-    /// consumer (`expect_single_frame`, for Seek) rejects a train rather than
-    /// drain one.
-    ///
-    /// So it cannot split: a seek's result is unbounded (a view key names its
-    /// whole PK group) and past [`FRAME_CAP`] no client can read the frame, so
-    /// this refuses instead of emitting it.
-    pub(super) fn send_response(
-        &mut self,
-        route: ReplyRoute,
-        result: Option<&Batch>,
-        schema: ReplySchema<'_>,
-        seek_pk: u128,
-        client_version: u16,
-    ) -> Result<(), gnitz_wire::WireFault> {
-        let (block, server_version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
-        let msg = WireMsg {
-            target_id: route.target_id,
-            client_id: route.client_id,
-            flags: gnitz_wire::wire_flags_set_schema_version(0, server_version),
-            seek_pk,
-            request_id: route.request_id,
-            data: WireData::Whole(result),
-            schema_block: block.as_deref().map(Vec::as_slice),
-            ..Default::default()
-        };
-        let sz = msg.size();
-        if sz > FRAME_CAP {
-            return Err(oversized_reply(sz));
-        }
-        self.w2m_writer.send_msg(route.request_id, &msg);
-        Ok(())
     }
 
     /// Reply with an **owned** `batch`: one frame when it fits, otherwise queued
@@ -172,10 +127,7 @@ impl WorkerProcess {
     /// like any other.
     ///
     /// The fit is tested by reference, so the single-frame case never reaches
-    /// `Rc::new`; [`Self::send_shared_scan_response`] is for a caller that
-    /// genuinely shares. `force_fifo` queues even a fitting reply, so this
-    /// request reaches the ring in request order — see
-    /// `dispatch_scan_multi_fanout`, which owns that flag.
+    /// `Rc::new`. A `route.fifo` reply is queued even when it fits.
     pub(super) fn send_scan_response(
         &mut self,
         route: ReplyRoute,
@@ -201,9 +153,6 @@ impl WorkerProcess {
 
     /// [`Self::send_scan_response`] for a batch already behind an `Rc` — a cached
     /// full-scan snapshot, or a `ReadSpec` reply that may be one.
-    ///
-    /// A `route` marked `fifo` queues even a fitting reply so this relation
-    /// reaches the ring in request order (the multi-scan FIFO contract).
     pub(super) fn send_shared_scan_response(
         &mut self,
         route: ReplyRoute,
@@ -373,7 +322,7 @@ pub(crate) fn send_unique_preflight_keys(
         // master's saved schema hint. The synthetic schema has no version.
         let msg = WireMsg {
             target_id,
-            flags: train_flags(0, is_last),
+            flags: WireFlags::train_frame(0, is_last),
             data: WireData::Whole(Some(&chunk)),
             schema_block: is_first.then_some(schema_block.as_slice()),
             ..Default::default()

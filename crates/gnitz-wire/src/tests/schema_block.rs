@@ -1,10 +1,10 @@
 use super::*;
-use crate::{pack_col_meta_flags, TypeCode, PK_LIST_MAX_COLS};
+use crate::{TypeCode, PK_LIST_MAX_COLS};
 
 fn col(tc: TypeCode, name: &str, pk_pos: Option<u8>, nullable: bool) -> SchemaBlockCol<'_> {
     SchemaBlockCol {
         type_code: tc as u8,
-        flags: pack_col_meta_flags(nullable, false, false, 0, pk_pos),
+        meta: ColMeta { nullable, pk_pos, ..Default::default() },
         name: name.as_bytes(),
     }
 }
@@ -80,7 +80,10 @@ fn pk_arity_is_bounded_by_the_caller_not_a_shared_cap() {
     let cols: Vec<SchemaBlockCol> = (0..MAX_PK_COLUMNS)
         .map(|i| SchemaBlockCol {
             type_code: TypeCode::U64 as u8,
-            flags: pack_col_meta_flags(false, false, false, 0, Some(i as u8)),
+            meta: ColMeta {
+                pk_pos: Some(i as u8),
+                ..Default::default()
+            },
             name: b"k",
         })
         .collect();
@@ -163,5 +166,27 @@ fn each_schema_guard_rejects_its_own_forgery() {
     ];
     for (want, forge) in cases {
         assert_eq!(decode_err(&forged(forge), MAX_PK_COLUMNS), want);
+    }
+}
+
+/// The per-column meta word both ends encode and decode: every field
+/// round-trips, and a non-PK column reports no position however the other bits
+/// are set.
+#[test]
+fn column_meta_roundtrip() {
+    for nullable in [false, true] {
+        for hidden in [false, true] {
+            for serial in [false, true] {
+                for pk_pos in [None, Some(0u8), Some(1), Some(3), Some(u8::MAX)] {
+                    // Scale 0 is every non-DECIMAL column, and `u8::MAX` fills
+                    // the field — so neither edge may bleed into a neighbour.
+                    for scale in [0u8, 7, u8::MAX] {
+                        let m = ColMeta { nullable, hidden, serial, scale, pk_pos };
+                        assert_eq!(m.pack() & !DEFINED_BITS, 0);
+                        assert_eq!(ColMeta::from_flags(m.pack()), m);
+                    }
+                }
+            }
+        }
     }
 }

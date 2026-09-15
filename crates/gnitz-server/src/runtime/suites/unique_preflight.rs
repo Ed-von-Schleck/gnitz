@@ -9,7 +9,7 @@
 
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::wire::{self, unique_preflight_wire_schema, FLAG_SCAN_LAST};
+use crate::runtime::wire::{self, unique_preflight_wire_schema};
 use crate::runtime::worker::{preflight_frame_overhead, preflight_keys_per_frame, send_unique_preflight_keys};
 use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
@@ -18,7 +18,7 @@ use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, KeyProducer, SpillSort};
 use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::type_code;
-use gnitz_wire::{FLAG_CONTINUATION, FLAG_HAS_SCHEMA};
+use gnitz_wire::WireStatus;
 
 // ---------------------------------------------------------------------------
 // Span helpers
@@ -103,24 +103,18 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             "ring prefix must carry the request id",
         );
         let ctrl = peek_control_block_ipc(slot.bytes()).expect("ctrl decodes");
-        assert_eq!(ctrl.status, 0);
-        assert_ne!(
-            ctrl.flags & FLAG_CONTINUATION,
-            0,
-            "every pre-flight frame carries FLAG_CONTINUATION",
-        );
-        let last = ctrl.flags & FLAG_SCAN_LAST != 0;
+        assert_eq!(ctrl.status, WireStatus::Ok);
+        assert!(ctrl.flags.continuation, "every pre-flight frame carries continuation");
+        let last = ctrl.flags.scan_last;
         if frames == 0 {
-            assert_ne!(
-                ctrl.flags & FLAG_HAS_SCHEMA,
-                0,
-                "first frame must carry the synthetic schema block",
+            assert!(
+                ctrl.flags.has_schema,
+                "first frame must carry the synthetic schema block"
             );
         } else {
-            assert_eq!(
-                ctrl.flags & FLAG_HAS_SCHEMA,
-                0,
-                "continuation frames must not re-send the schema",
+            assert!(
+                !ctrl.flags.has_schema,
+                "continuation frames must not re-send the schema"
             );
         }
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
@@ -150,7 +144,7 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
 }
 
 /// Multi-frame train: spans split across frames at `keys_per_frame`, the
-/// terminal frame tagged FLAG_SCAN_LAST, and every span — including extreme
+/// terminal frame tagged `scan_last`, and every span — including extreme
 /// u128s — round-trips through the wire to the exact byte span.
 #[test]
 fn preflight_train_multi_frame_key_roundtrip() {
@@ -221,9 +215,9 @@ fn preflight_train_empty_partition_single_terminal_frame() {
         );
         let slot = receiver.try_read_slot(0).expect("terminal frame");
         let ctrl = peek_control_block_ipc(slot.bytes()).expect("ctrl decodes");
-        assert_eq!(ctrl.status, 0);
-        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0, "single frame must be terminal");
-        assert_eq!(ctrl.flags & gnitz_wire::FLAG_HAS_DATA, 0, "no data on empty train");
+        assert_eq!(ctrl.status, WireStatus::Ok);
+        assert!(ctrl.flags.scan_last, "single frame must be terminal");
+        assert!(!ctrl.flags.has_data, "no data on empty train");
         drop(slot);
         assert!(receiver.try_read_slot(0).is_none());
     });

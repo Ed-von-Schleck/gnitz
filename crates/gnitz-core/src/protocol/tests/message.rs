@@ -1,14 +1,20 @@
 use super::*;
 use crate::protocol::types::{BatchAppender, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::decode_wal_block;
-use crate::protocol::wire_flags_set_schema_version;
-use crate::protocol::WireConflictMode;
-use crate::protocol::{ClientTransport, Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
+use crate::protocol::{ClientTransport, ClientVerb, Header, WireConflictMode};
+
+/// A plain push() request's flags.
+fn push() -> WireFlags {
+    WireFlags {
+        verb: ClientVerb::Push,
+        ..Default::default()
+    }
+}
 use crate::test_support::{make_transport_pair, payload_of};
 
-// ── FLAG_PUSH_TXN family assembly ──────────────────────────────────────
+// ── PUSH_TXN family assembly ──────────────────────────────────────
 
-/// A multi-family `FLAG_PUSH_TXN` frame (both modes, a repeated tid, a
+/// A multi-family `PUSH_TXN` frame (both modes, a repeated tid, a
 /// delete family): each family's schema block and data block must be built
 /// from *that* family's schema, batch and tid.
 #[test]
@@ -56,7 +62,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     assert_eq!(decoded.len(), expected.len());
     for (fam, (exp_tid, exp_mode, exp_rows)) in decoded.iter().zip(expected) {
         assert_eq!(fam.tid, exp_tid);
-        assert_eq!(WireConflictMode::from_wire(fam.mode), Some(exp_mode));
+        assert_eq!(fam.mode, exp_mode);
         // The schema block is this family's, keyed under this family's tid.
         assert_eq!(
             gnitz_wire::read_u32_le(fam.schema_block, gnitz_wire::WAL_OFF_TID),
@@ -75,10 +81,10 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
 #[test]
 fn test_message_control_schema_roundtrip() {
     let h = Header {
-        status: 0,
+        status: WireStatus::Ok,
         target_id: 0x1234_5678_9ABC_DEF0,
         client_id: 0xDEAD_BEEF_0000_0001,
-        flags: FLAG_PUSH | FLAG_HAS_SCHEMA,
+        flags: WireFlags { has_schema: true, ..push() },
         seek_pk: 42u128 | (99u128 << 64),
         seek_col_idx: 7,
         request_id: 0xCAFE_BABE_DEAD_F00D,
@@ -139,15 +145,15 @@ fn test_request_id_roundtrip_reserved_values() {
 
 // ── send/recv message roundtrips ────────────────────────────────────────
 
-/// Ship one cold PUSH frame, the shape `Session::roundtrip_push` builds.
+/// Ship one cold push() frame, the shape `Session::roundtrip_push` builds.
 fn send_push(t: &mut ClientTransport, schema: &Schema, batch: &ZSetBatch) {
-    let parts = encode_message_parts(0, 0, FLAG_PUSH, 0, &[], 0, Some((schema, batch)));
+    let parts = encode_message_parts(0, 0, push(), 0, &[], 0, Some((schema, batch)));
     t.send_parts(parts, None).unwrap();
 }
 
 #[test]
 fn test_message_roundtrip_empty() {
-    // Empty batch → FLAG_HAS_SCHEMA but not FLAG_HAS_DATA
+    // Empty batch → has_schema but not has_data
     let schema = Schema {
         columns: vec![
             ColumnDef::new("pk", TypeCode::U64, false),
@@ -297,7 +303,7 @@ fn german_vals(batch: &ZSetBatch, pi: usize) -> Vec<Option<String>> {
 fn test_message_no_schema_no_data() {
     // Control-only message (scan/alloc style)
     let (mut a, mut b) = make_transport_pair();
-    a.send_parts(encode_control_frame(0, 0, FLAG_PUSH, 0, 0, &[]), None)
+    a.send_parts(encode_control_frame(0, 0, push(), 0, 0, &[]), None)
         .unwrap();
     let (msg, data) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
     assert!(msg.schema.is_none());
@@ -310,7 +316,7 @@ fn test_message_recv_control_fields() {
     let seek_pk = 0xAAAA_BBBB_CCCC_DDDD_u128 | (0x1111_2222_3333_4444_u128 << 64);
     let (mut a, mut b) = make_transport_pair();
     a.send_parts(
-        encode_control_frame(0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001, FLAG_PUSH, seek_pk, 7, &[]),
+        encode_control_frame(0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001, push(), seek_pk, 7, &[]),
         None,
     )
     .unwrap();
@@ -321,16 +327,16 @@ fn test_message_recv_control_fields() {
 
 #[test]
 fn test_message_error_response() {
-    // STATUS_ERROR response: schema and data should be None; error_text populated
+    // `Error` response: schema and data should be None; error_text populated
     let (mut a, mut b) = make_transport_pair();
     let err_hdr = Header {
-        status: STATUS_ERROR,
+        status: WireStatus::Error,
         ..Header::default()
     };
     let encoded = encode_control_block(&err_hdr, "something broke", &[]);
     a.send_framed(&encoded, None).unwrap();
     let (msg, _) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
-    assert_eq!(msg.status, STATUS_ERROR);
+    assert_eq!(msg.status, WireStatus::Error);
     assert!(msg.error_text.is_some());
 }
 
@@ -339,7 +345,7 @@ fn test_message_error_response() {
 #[test]
 fn test_encode_parse_control_only() {
     let seek_pk = 42u128 | (99u128 << 64);
-    let payload = encode_message_parts(0xDEAD, 0xBEEF, FLAG_PUSH, seek_pk, &[], 7, None).to_vec();
+    let payload = encode_message_parts(0xDEAD, 0xBEEF, push(), seek_pk, &[], 7, None).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
     assert_eq!(msg.target_id, 0xDEAD);
     assert_eq!(msg.seek_pk, seek_pk);
@@ -369,7 +375,7 @@ fn test_encode_parse_with_data() {
         blob: vec![],
     };
 
-    let payload = encode_message_parts(42, 1, 0, 0, &[], 0, Some((&schema, &batch))).to_vec();
+    let payload = encode_message_parts(42, 1, WireFlags::default(), 0, &[], 0, Some((&schema, &batch))).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
     assert_eq!(msg.target_id, 42);
     assert!(msg.schema.is_some());
@@ -386,7 +392,7 @@ fn test_encode_parse_empty_batch() {
     };
     let empty = ZSetBatch::new(&schema);
 
-    let payload = encode_message_parts(10, 1, 0, 0, &[], 0, Some((&schema, &empty))).to_vec();
+    let payload = encode_message_parts(10, 1, WireFlags::default(), 0, &[], 0, Some((&schema, &empty))).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
     // Schema sent, but no data (empty batch)
     assert!(msg.schema.is_some());
@@ -401,7 +407,11 @@ fn test_encode_parse_empty_batch() {
 fn encode_message_wide_pk_seek_emits_extra() {
     let pk: Vec<u8> = (0..24u8).collect();
     let (lo, tail) = gnitz_wire::control::split_ctrl_key(&pk);
-    let payload = encode_message_parts(7, 1, FLAG_SEEK, lo, tail, 0, None).to_vec();
+    let seek = WireFlags {
+        verb: ClientVerb::Seek,
+        ..Default::default()
+    };
+    let payload = encode_message_parts(7, 1, seek, lo, tail, 0, None).to_vec();
 
     let ctrl = gnitz_wire::wal::block_slice_at(&payload, 0).unwrap();
     let (hdr, _err, extra) = decode_control_block(ctrl).unwrap();
@@ -409,10 +419,10 @@ fn encode_message_wide_pk_seek_emits_extra() {
     let (want_lo, want_extra) = (lo, tail);
     assert_eq!(hdr.seek_pk, want_lo);
     assert_eq!(extra, want_extra); // bytes 16..24
-    assert_eq!(hdr.flags & FLAG_SEEK, FLAG_SEEK);
+    assert_eq!(hdr.flags.verb, ClientVerb::Seek);
 }
 
-/// A hint-only frame (FLAG_HAS_DATA set, FLAG_HAS_SCHEMA clear, matching schema
+/// A hint-only frame (`has_data` set, `has_schema` clear, matching schema
 /// version) decodes its data under the hint but reports `schema == None`:
 /// `Message::schema` means "the block was physically in the frame", which is
 /// what the cache absorb keys on.
@@ -437,7 +447,7 @@ fn hint_only_frame_returns_data_schema_none() {
 
     let (mut a, mut b) = make_transport_pair();
     // Embed version=1 in flags; no schema block in the frame.
-    let flags = wire_flags_set_schema_version(0, 1);
+    let flags = WireFlags { schema_version: 1, ..Default::default() };
     let parts = encode_message_noschema_parts(42, 0, flags, &schema, &batch);
     a.send_parts(parts, None).unwrap();
 

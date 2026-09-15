@@ -1,12 +1,12 @@
 use crate::connection::{
-    Interest, MultiScanResult, PollSink, PolledView, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply,
-    ScanResult, Session, SlotId,
+    IdRun, Interest, MultiScanResult, PollSink, PolledView, RawBlock, RelDescriptor, RelTarget, Reply, Request,
+    ScanReply, ScanResult, Session, SlotId,
 };
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::protocol::{
     BatchAppender, ColumnDef, PkBuf, PkColumn, ProtocolError, ReplySchema, Schema, TypeCode, WireConflictMode,
-    ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
+    ZSetBatch,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -106,18 +106,6 @@ pub use gnitz_wire::RelIndex as IndexMeta;
 pub struct InlineUniqueIndex<'a> {
     pub col_indices: &'a [u32],
     pub name: &'a str,
-}
-
-/// A run of ids from one server-side sequence.
-enum IdRun {
-    Tables(u64),
-    Indexes(u64),
-    Schema,
-    /// The SERIAL sequence of `table_id`.
-    Serial {
-        table_id: u64,
-        count: u64,
-    },
 }
 
 /// A cached half-open range `[next, end)` of unissued SERIAL ids for one table,
@@ -347,7 +335,7 @@ pub struct GnitzClient {
     txn: Option<TxnBuffer>,
     /// The client's OCC basis: the running maximum over server-issued watermarks
     /// the connection has observed — seeded from the HELLO ACK at connect, then
-    /// advanced by every push / `txn_commit` ACK and every `STATUS_TXN_CONFLICT`
+    /// advanced by every push / `txn_commit` ACK and every `WireStatus::TxnConflict`
     /// fresh basis. Always `≤ published()` at receipt, so it is a sound
     /// (conservative) basis: underusing it costs at most a self-healing retry,
     /// never a false pass. Autocommit RMW statements read it as their basis;
@@ -527,14 +515,7 @@ impl GnitzClient {
 
     /// Allocate `run`, returning its first id.
     fn alloc(&mut self, run: IdRun) -> Result<u64, ClientError> {
-        let (target_id, flag, count) = match run {
-            IdRun::Tables(n) => (0, FLAG_ALLOCATE_TABLE_ID, n),
-            IdRun::Indexes(n) => (0, FLAG_ALLOCATE_INDEX_ID, n),
-            IdRun::Schema => (0, FLAG_ALLOCATE_SCHEMA_ID, 1),
-            IdRun::Serial { table_id, count } => (table_id, FLAG_ALLOCATE_SERIAL_RANGE, count),
-        };
-        self.round_trip(Request::Alloc { target_id, flag, count })
-            .map(Reply::into_id)
+        self.round_trip(Request::Alloc(run)).map(Reply::into_id)
     }
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
@@ -612,7 +593,7 @@ impl GnitzClient {
     }
 
     /// Autocommit read-modify-write commit: ship a one-family, one-precondition
-    /// `FLAG_PUSH_TXN` frame asserting `table_id` has not been written since
+    /// `PUSH_TXN` frame asserting `table_id` has not been written since
     /// `basis`. Returns the zone LSN on success; a `ClientError::TxnConflict`
     /// (whose `fresh_basis` the caller adopts and re-reads with) means the table
     /// was written since `basis`. Autocommit only — the SQL driver calls this
@@ -1069,7 +1050,7 @@ impl GnitzClient {
             .ok_or_else(|| ClientError::ServerError("no transaction open".into()))
     }
 
-    /// Commit the open transaction as one atomic `FLAG_PUSH_TXN` frame — all
+    /// Commit the open transaction as one atomic `PUSH_TXN` frame — all
     /// families land together under one durable zone LSN, or none do. Returns
     /// that LSN (0 for an empty transaction, which needs no wire roundtrip).
     /// Errors if no transaction is open.
@@ -1898,7 +1879,7 @@ struct BufferedFamily {
 /// INSERT — builds none of it.
 ///
 /// Owned by [`GnitzClient::txn`]; every client write path routes into it while
-/// it is open, and `txn_commit` ships it as one `FLAG_PUSH_TXN` frame. Dropping
+/// it is open, and `txn_commit` ships it as one `PUSH_TXN` frame. Dropping
 /// it is rollback — nothing was ever sent.
 #[derive(Default)]
 pub struct TxnBuffer {

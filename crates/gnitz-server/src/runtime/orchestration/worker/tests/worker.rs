@@ -24,7 +24,7 @@ fn pending_deltas_accumulate_per_relation() {
 }
 
 /// Stage 0 wire-protocol contract: every reply helper (`send_ack`,
-/// `send_response`, `send_fault`) must echo the inbound request_id back
+/// `send_scan_response`, `send_fault`) must echo the inbound request_id back
 /// on the W2M region so the master reactor can route it. We fake out the
 /// W2M writer with a real anonymous mmap, fire each helper with a
 /// distinct id, then read the messages back through `decode_wire` and
@@ -44,8 +44,13 @@ fn send_helpers_echo_the_request_id() {
     // Pass ReplySchema::ClientAuthored: it emits no block and so consults
     // no catalog, which this test does not have (null catalog pointer).
     // The id round-trip is the assertion of interest.
-    wp.send_response(route(8, req_resp, 0), None, ReplySchema::ClientAuthored, 0u128, 0)
-        .unwrap();
+    let schema = make_schema_u64_i64();
+    wp.send_scan_response(
+        route(8, req_resp, 0),
+        Batch::empty_with_schema(&schema),
+        ReplySchema::ClientAuthored,
+        0,
+    );
     wp.send_fault(&gnitz_wire::WireFault::from("boom"), req_err);
 
     let decoded_ids: Vec<u64> = walk_frames(region_ptr)
@@ -521,9 +526,9 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
 
         let data = consume_one(ptr);
         let ctrl = gnitz_wire::control::peek_control_block_ipc(&data).expect("peek_control_block");
-        assert_eq!(ctrl.status, STATUS_OK);
-        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
-        assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+        assert_eq!(ctrl.status, WireStatus::Ok);
+        assert!(ctrl.flags.scan_last);
+        assert!(ctrl.flags.continuation);
 
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(&data, ctrl, Some(&schema), &mut offsets)
@@ -565,9 +570,9 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
     let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
-    assert_eq!(ctrl.status, STATUS_OK);
-    assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
-    assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+    assert_eq!(ctrl.status, WireStatus::Ok);
+    assert!(ctrl.flags.scan_last);
+    assert!(ctrl.flags.continuation);
     let whole = ipc::WireMsg {
         data: ipc::WireData::Whole(Some(&batch)),
         ..Default::default()
@@ -596,7 +601,7 @@ fn walk_frames(ptr: *mut u8) -> Vec<(u32, Vec<u8>)> {
 /// A batch of `count` decodable all-zero rows — used to cross a wire-size
 /// limit without writing that many real bytes.
 /// Two queued trains drain strictly FIFO: every frame of train A
-/// (multi-chunk, terminal FLAG_SCAN_LAST) precedes train B's, and B's
+/// (multi-chunk, terminal `scan_last`) precedes train B's, and B's
 /// first chunk carries B's own schema block.
 #[test]
 fn pending_streams_drain_two_trains_fifo() {
@@ -664,12 +669,11 @@ fn pending_streams_drain_two_trains_fifo() {
         let mut rows = 0usize;
         for (i, (_, bytes)) in train.iter().enumerate() {
             let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).expect("ctrl");
-            assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+            assert!(ctrl.flags.continuation);
             let is_last = i == train.len() - 1;
             assert_eq!(
-                ctrl.flags & FLAG_SCAN_LAST != 0,
-                is_last,
-                "FLAG_SCAN_LAST only on the train's terminal chunk"
+                ctrl.flags.scan_last, is_last,
+                "scan_last only on the train's terminal chunk"
             );
             if i == 0 {
                 let decoded = ipc::decode_wire_ipc(bytes).expect("first chunk must decode standalone");
@@ -743,7 +747,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     );
     for (_, bytes) in &frames {
         let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).unwrap();
-        assert_eq!(ctrl.status, STATUS_OK, "an over-budget frame is not a fault");
+        assert_eq!(ctrl.status, WireStatus::Ok, "an over-budget frame is not a fault");
         assert!(bytes.len() > 512, "each frame is one row wider than the budget");
     }
 }
@@ -771,7 +775,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1, "the fault is the whole reply");
     let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
-    assert_eq!(ctrl.status, gnitz_wire::STATUS_ERROR);
+    assert_eq!(ctrl.status, gnitz_wire::WireStatus::Error);
     assert_eq!(ctrl.request_id, 5);
     let text = String::from_utf8_lossy(&ctrl.error_msg);
     assert!(
@@ -818,11 +822,11 @@ fn a_long_string_train_reassembles_with_its_weights() {
     for (i, (_, bytes)) in frames.iter().enumerate() {
         assert!(bytes.len() <= budget, "frame {i} is {} bytes of {budget}", bytes.len());
         let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).unwrap();
-        assert_eq!(ctrl.status, STATUS_OK);
+        assert_eq!(ctrl.status, WireStatus::Ok);
         assert_eq!(
-            ctrl.flags & FLAG_SCAN_LAST != 0,
+            ctrl.flags.scan_last,
             i == frames.len() - 1,
-            "FLAG_SCAN_LAST only on the terminal frame"
+            "scan_last only on the terminal frame"
         );
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(&schema), &mut offsets)

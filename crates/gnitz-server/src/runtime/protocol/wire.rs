@@ -5,7 +5,7 @@ use std::rc::Rc;
 use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
 use gnitz_store::storage::{Batch, Layout, MemBatch, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block_ipc, DecodedControl};
-use gnitz_wire::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
+use gnitz_wire::{WireFlags, WireStatus};
 
 /// The operative bound on **every** reply the server emits, forwarded or not,
 /// and the limit the HELLO ACK advertises (`Peer::send_hello_ack`). A worker
@@ -30,12 +30,6 @@ pub(crate) fn oversized_frame_message(sz: usize) -> String {
          one row wider than the cap cannot be returned at all"
     )
 }
-
-/// Set on the last (or only) scan chunk from a worker. `pub` in `gnitz_wire` so
-/// the bit is guarded against every other wire flag; narrowed to this crate
-/// here, because nothing outside the engine sets or reads it. It is forwarded to
-/// clients along with the rest of the frame's flags, and ignored there.
-pub(crate) use gnitz_wire::FLAG_SCAN_LAST;
 
 // ---------------------------------------------------------------------------
 // Chunked distributed-backfill coordination: the two overloads of `seek_col_idx`
@@ -174,26 +168,26 @@ impl<'a> WireData<'a> {
 /// encode it: both read the same value, so the byte count a caller reserves and
 /// the bytes the encoder writes cannot disagree.
 ///
-/// Every field defaults to zero/absent (`status` default 0 is `STATUS_OK`), so a
+/// Every field defaults to zero/absent (`status` defaults to `WireStatus::Ok`), so a
 /// caller names only what it sends:
 ///
 /// ```ignore
-/// let msg = ipc::WireMsg { request_id, status: STATUS_ERROR, error_msg: msg, ..Default::default() };
+/// let msg = ipc::WireMsg { request_id, status: WireStatus::Error, error_msg: msg, ..Default::default() };
 /// writer.send_msg(request_id, &msg);
 /// ```
 #[derive(Clone, Copy, Default)]
 pub struct WireMsg<'a> {
     pub target_id: u64,
     pub client_id: u64,
-    pub flags: u64,
+    pub flags: WireFlags,
     pub seek_pk: u128,
     pub seek_col_idx: u64,
     pub request_id: u64,
-    pub status: u32,
+    pub status: WireStatus,
     pub error_msg: &'a [u8],
     pub data: WireData<'a>,
     /// These bytes *are* the frame's schema block, and their length sizes it;
-    /// `None` emits none and leaves `FLAG_HAS_SCHEMA` clear. Usually from a
+    /// `None` emits none and leaves `has_schema` clear. Usually from a
     /// [`WireSchema`], which pairs them with the descriptor they encode.
     pub schema_block: Option<&'a [u8]>,
     pub seek_pk_extra: &'a [u8],
@@ -232,17 +226,15 @@ impl<'a> WireMsg<'a> {
     fn encode_impl(&self, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let has_data = self.has_data();
 
-        let mut wire_flags = self.flags;
-        if self.schema_block.is_some() {
-            wire_flags |= FLAG_HAS_SCHEMA;
-        }
-        if has_data {
-            wire_flags |= FLAG_HAS_DATA;
+        let wire_flags = WireFlags {
+            has_schema: self.schema_block.is_some(),
+            has_data,
             // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
             // (debug-verified) at its producer, so the shipped claim is
             // verified-by-construction.
-            wire_flags |= self.data.layout_batch().unwrap().layout().to_wire_flags();
-        }
+            batch_consolidated: has_data && self.data.layout_batch().unwrap().layout() == Layout::Consolidated,
+            ..self.flags
+        };
 
         let written = gnitz_wire::control::encode_ctrl_block(
             out,
@@ -328,10 +320,7 @@ pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_prom
 /// zero-copy ring decoder.
 pub struct DecodedWire<B = Batch> {
     pub control: DecodedControl,
-    /// The frame's own schema block, decoded — or, for a continuation frame
-    /// that carries data with no block, the hint its data was decoded against.
-    /// A data batch is therefore never present without the descriptor it was
-    /// read under.
+    /// The frame's own schema block, decoded; `None` when the frame carried none.
     pub schema: Option<SchemaDescriptor>,
     pub data_batch: Option<B>,
 }
@@ -348,7 +337,7 @@ pub(crate) use gnitz_wire::control::peek_control_block;
 /// control block's by the [`peek_control_block`] that produced `control`.
 ///
 /// The batch comes back `Raw`: unlike [`decode_wire`] this never installs the
-/// frame's `FLAG_BATCH_CONSOLIDATED` claim, which a client must not be trusted
+/// frame's `batch_consolidated` claim, which a client must not be trusted
 /// to make.
 pub fn decode_wire_with_ctrl(
     data: &[u8],
@@ -411,16 +400,20 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     })
 }
 
-/// Install an engine-authored frame's layout claim: its `FLAG_BATCH_CONSOLIDATED`
+/// Install an engine-authored frame's layout claim: its `batch_consolidated`
 /// bit is real, and skipping the re-fold is the point of sending it, so the batch
 /// is raised off `Raw`. `certify_layout`
 /// debug-verifies what it installs, which is why the client path
 /// (`decode_wire_with_ctrl`) never comes through here — a lying client frame
 /// must be answered with an error, not a debug-build abort.
 fn certify_engine_frame(decoded: &mut DecodedWire) {
-    let flags = decoded.control.flags;
+    let layout = if decoded.control.flags.batch_consolidated {
+        Layout::Consolidated
+    } else {
+        Layout::Raw
+    };
     if let Some(b) = decoded.data_batch.as_mut() {
-        b.certify_layout(Layout::from_wire_flags(flags));
+        b.certify_layout(layout);
     }
 }
 
@@ -439,35 +432,32 @@ fn decode_frame<'a, B>(
     verify: bool,
     decode: impl FnOnce(&'a [u8], &SchemaDescriptor) -> Result<B, &'static str>,
 ) -> Result<DecodedWire<B>, &'static str> {
-    let has_schema = control.flags & FLAG_HAS_SCHEMA != 0;
-    let has_data = control.flags & FLAG_HAS_DATA != 0;
+    let flags = control.flags;
     let mut off = control.block_size;
 
-    let block_schema = if has_schema {
+    let block_schema = if flags.has_schema {
         let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
         off += sblock.len();
         Some(decode_schema_block(sblock, verify)?)
     } else {
         None
     };
-    if !has_data {
+    if !flags.has_data {
         return Ok(DecodedWire {
             control,
             schema: block_schema,
             data_batch: None,
         });
     }
-    // `or_else`, not `or`: `Option::or` evaluates its argument, so the 360-byte
-    // hint copy would run per decoded frame and be discarded by every frame that
-    // carried its own schema block.
     let schema = block_schema
-        .or_else(|| hint.copied())
-        .ok_or("FLAG_HAS_DATA without FLAG_HAS_SCHEMA")?;
+        .as_ref()
+        .or(hint)
+        .ok_or("a data block without a schema block")?;
     let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
-    let data_batch = decode(dblock, &schema)?;
+    let data_batch = decode(dblock, schema)?;
     Ok(DecodedWire {
         control,
-        schema: Some(schema),
+        schema: block_schema,
         data_batch: Some(data_batch),
     })
 }

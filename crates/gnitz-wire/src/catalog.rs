@@ -166,7 +166,7 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     col("is_serial", TypeCode::U64, false),
     // is_hidden marker: 1 for a hidden key slot (synthetic view keys and
     // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
-    // META_FLAG_HIDDEN; the engine never branches on it.
+    // `ColMeta::hidden`; the engine never branches on it.
     col("is_hidden", TypeCode::U64, false),
     // A DECIMAL column's scale, else 0. Echoed into reply schema blocks' scale
     // bits; the engine never branches on it.
@@ -191,7 +191,7 @@ pub(crate) const IDX_TAB_COLS: &[WireSysCol] = &[
 /// per-message block describing a reply's columns — but it is a wire schema both
 /// ends exchange, so it belongs with them. Its codec is
 /// [`crate::schema_block`], which is what both ends actually run; the `flags`
-/// word is packed by [`crate::pack_col_meta_flags`].
+/// word is packed by [`crate::schema_block::ColMeta`].
 pub(crate) const META_SCHEMA_COLS: &[WireSysCol] = &[
     col("col_idx", TypeCode::U64, false),
     col("type_code", TypeCode::U64, false),

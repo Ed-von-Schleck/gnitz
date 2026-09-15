@@ -1,53 +1,57 @@
 use super::*;
 
-/// The per-column metadata word both ends of the schema block encode and
-/// decode: every field round-trips, and a non-PK column reports no position
-/// however the other bits are set.
+/// Every field at its extremes survives `unpack(pack())` — each alone, so a
+/// field bleeding into a neighbour's bits shows up as a wrong neighbour.
 #[test]
-fn col_meta_flags_roundtrip() {
-    for &nullable in &[false, true] {
-        for &hidden in &[false, true] {
-            for &serial in &[false, true] {
-                for pk_pos in [None, Some(0u8), Some(1), Some(3), Some(u8::MAX)] {
-                    // Scale 0 is every non-DECIMAL column, and `u8::MAX` fills
-                    // the field — so neither edge may bleed into a neighbour.
-                    for scale in [0u8, 7, u8::MAX] {
-                        let f = pack_col_meta_flags(nullable, hidden, serial, scale, pk_pos);
-                        assert_eq!(col_meta_nullable(f), nullable);
-                        assert_eq!(col_meta_hidden(f), hidden);
-                        assert_eq!(col_meta_serial(f), serial);
-                        assert_eq!(col_meta_scale(f), scale);
-                        assert_eq!(col_meta_pk_pos(f), pk_pos);
-                    }
-                }
-            }
-        }
+fn wire_flags_roundtrip() {
+    let base = WireFlags::default();
+    let mut cases = vec![base];
+    cases.extend(ClientVerb::ALL.iter().map(|&verb| WireFlags { verb, ..base }));
+    cases.extend(
+        WireConflictMode::ALL
+            .iter()
+            .map(|&conflict_mode| WireFlags { conflict_mode, ..base }),
+    );
+    cases.extend(
+        WireProbeMode::ALL
+            .iter()
+            .map(|&probe_mode| WireFlags { probe_mode, ..base }),
+    );
+    cases.extend([0, 1, u16::MAX].map(|schema_version| WireFlags { schema_version, ..base }));
+    cases.extend([
+        WireFlags { has_schema: true, ..base },
+        WireFlags { has_data: true, ..base },
+        WireFlags { continuation: true, ..base },
+        WireFlags { batch_consolidated: true, ..base },
+        WireFlags { scan_last: true, ..base },
+        WireFlags { scan_fifo_reply: true, ..base },
+    ]);
+    cases.push(WireFlags {
+        verb: ClientVerb::AllocIndexId,
+        conflict_mode: WireConflictMode::Error,
+        schema_version: u16::MAX,
+        has_schema: true,
+        has_data: true,
+        continuation: true,
+        batch_consolidated: true,
+        scan_last: true,
+        scan_fifo_reply: true,
+        probe_mode: WireProbeMode::Project,
+    });
+    for f in cases {
+        assert_eq!(WireFlags::unpack(f.pack()), Ok(f), "{f:?}");
     }
 }
 
-/// The conflict mode round-trips through its flag bits without disturbing them,
-/// and bits naming no mode decode to `None` rather than being coerced —
-/// coercing would turn a mode the server does not implement into a silent
-/// upsert on a client's push.
+/// A word naming a verb or mode this build does not define, or setting a bit
+/// outside the layout, is refused rather than coerced — coercing would turn a
+/// mode the server does not implement into a silent upsert on a client's push.
 #[test]
-fn conflict_mode_roundtrips_and_rejects_unknown() {
-    for &mode in WireConflictMode::ALL {
-        let flags = wire_flags_set_conflict_mode(FLAG_PUSH, mode);
-        assert_eq!(wire_flags_get_conflict_mode(flags), Some(mode));
-        assert_eq!(flags & FLAG_PUSH, FLAG_PUSH, "the mode must not disturb other bits");
-    }
-    for raw in 2u8..=u8::MAX {
-        assert_eq!(wire_flags_get_conflict_mode((raw as u64) << 16), None, "byte {raw}");
-    }
-}
-
-/// A frame setting two verb bits is refused, not resolved by branch order —
-/// otherwise a client reaches a verb it did not name.
-#[test]
-fn client_verb_rejects_two_verbs() {
-    assert!(ClientVerb::from_flags(FLAG_SEEK | FLAG_PUSH).is_err());
-    assert!(ClientVerb::from_flags(FLAG_DDL_TXN | FLAG_SCAN_MULTI).is_err());
-    assert!(ClientVerb::from_flags(FLAG_ALLOCATE_TABLE_ID | FLAG_ALLOCATE_INDEX_ID).is_err());
+fn wire_flags_reject_unknown() {
+    assert!(WireFlags::unpack(1 << 40).is_err());
+    assert!(WireFlags::unpack(1 << 63).is_err());
+    assert!(WireFlags::unpack(13).is_err());
+    assert!(WireFlags::unpack(2 << 8).is_err());
 }
 
 /// Only a push carries rows. A data block on any other verb — `Scan`
@@ -55,13 +59,18 @@ fn client_verb_rejects_two_verbs() {
 /// answered with a streamed table dump — is a malformed frame.
 #[test]
 fn client_verb_rejects_data_on_a_non_push_verb() {
-    assert_eq!(ClientVerb::from_flags(FLAG_HAS_DATA | FLAG_PUSH), Ok(ClientVerb::Push));
+    let with_data = |verb| WireFlags {
+        verb,
+        has_data: true,
+        ..Default::default()
+    };
+    assert_eq!(with_data(ClientVerb::Push).client_verb(), Ok(ClientVerb::Push));
     for &verb in ClientVerb::ALL {
         if verb == ClientVerb::Push {
             continue;
         }
         assert!(
-            ClientVerb::from_flags(verb.as_wire() | FLAG_HAS_DATA).is_err(),
+            with_data(verb).client_verb().is_err(),
             "{verb:?} must not accept a data block"
         );
     }

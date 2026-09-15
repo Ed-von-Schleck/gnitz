@@ -25,6 +25,29 @@ use gnitz_wire::{pack_pk_cols, type_code, PK_LIST_PACKED_FLAG};
 
 use std::fs;
 
+/// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
+fn pk_group(engine: &mut CatalogEngine, tid: i64, opk: &[u8]) -> std::rc::Rc<gnitz_store::storage::Batch> {
+    let schema = engine
+        .registry()
+        .relation(tid)
+        .map(gnitz_store::relation::Relation::schema)
+        .expect("a registered relation");
+    let keys = gnitz_wire::PkKeys::from_keys(schema.pk_stride(), [opk]);
+    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::PkSet(keys));
+    engine.scan_spec(tid, spec, &schema).expect("a point read")
+}
+
+/// [`pk_group`] by a narrow native key.
+fn pk_group_native(engine: &mut CatalogEngine, tid: i64, key: u128) -> std::rc::Rc<gnitz_store::storage::Batch> {
+    let schema = engine
+        .registry()
+        .relation(tid)
+        .map(gnitz_store::relation::Relation::schema)
+        .expect("a registered relation");
+    let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, key, &[]).expect("a narrow key");
+    pk_group(engine, tid, opk.pk_bytes())
+}
+
 use crate::test_support::{
     col_def, fk_def, idx_tab_batch, nullable_def, opk_pk, pk_payload_schema, push_col_tab_row, push_table_tab_row,
     push_view_tab_row, register_identity_view, scratch_dir, seek_by_index, seek_by_index_range, sum_weights,

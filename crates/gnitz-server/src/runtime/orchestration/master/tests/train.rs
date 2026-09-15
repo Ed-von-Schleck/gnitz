@@ -46,7 +46,7 @@ impl DrainFixture {
         std::mem::forget(Rc::clone(&receiver));
 
         let reactor = Rc::new(crate::runtime::test_support::make_reactor_over(Rc::clone(&receiver)));
-        let scan = ScanDispatch::alloc(&reactor, n_workers, Fanout::Broadcast);
+        let scan = ScanDispatch::alloc(&reactor, n_workers, Fanout::Broadcast, false);
         let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(partner);
         let peer = Peer::unix(std::os::fd::OwnedFd::from(peer_sock), Rc::clone(&reactor));
@@ -70,28 +70,35 @@ impl DrainFixture {
 }
 
 /// Encode one healthy reply frame onto a test ring; `flags` carries the train
-/// flags (0 = single-frame reply, the `send_response` shape).
+/// flags (`WireFlags::train_frame`).
 fn frame(
     writer: &crate::runtime::w2m::W2mWriter,
     req: u32,
-    flags: u64,
+    flags: WireFlags,
     schema: Option<&SchemaDescriptor>,
     batch: Option<&Batch>,
 ) {
-    send_frame(writer, req, flags, gnitz_wire::STATUS_OK, b"", schema, batch);
+    send_frame(writer, req, flags, WireStatus::Ok, b"", schema, batch);
 }
 
-/// The `send_error` shape: one `STATUS_ERROR` frame carrying a message and no
-/// train flags.
+/// A worker fault: an `Error` frame ending its train.
 fn fault_frame(writer: &crate::runtime::w2m::W2mWriter, req: u32, msg: &[u8]) {
-    send_frame(writer, req, 0, gnitz_wire::STATUS_ERROR, msg, None, None);
+    send_frame(
+        writer,
+        req,
+        WireFlags::train_frame(0, true),
+        WireStatus::Error,
+        msg,
+        None,
+        None,
+    );
 }
 
 fn send_frame(
     writer: &crate::runtime::w2m::W2mWriter,
     req: u32,
-    flags: u64,
-    status: u32,
+    flags: WireFlags,
+    status: WireStatus,
     error_msg: &[u8],
     schema: Option<&SchemaDescriptor>,
     batch: Option<&Batch>,
@@ -130,11 +137,8 @@ fn assert_frame_still_parked(scan: &ScanDispatch, i: usize) {
     );
 }
 
-/// A worker fault surfaces as an `Err` on the first poll, without draining the
-/// survivor's train. Worker 0's flags-0 error frame must read as terminal —
-/// keyed on `FLAG_SCAN_LAST` alone it would read as "more coming" and the poll
-/// would return `Pending`, which `poll_once` panics on — and worker 1's
-/// still-parked continuation proves the drain returned rather than deferring.
+/// A worker fault surfaces as an `Err` on the first poll, leaving the other
+/// worker's train undrained.
 #[test]
 fn drain_index_scan_errs_immediately_on_fault_frame() {
     let (fx, writers) = DrainFixture::new(2);
@@ -142,8 +146,8 @@ fn drain_index_scan_errs_immediately_on_fault_frame() {
     let w1_req = fx.req(1);
 
     fault_frame(&writers[0], w0_req, b"boom");
-    frame(&writers[1], w1_req, FLAG_CONTINUATION, None, None);
-    frame(&writers[1], w1_req, FLAG_CONTINUATION | FLAG_SCAN_LAST, None, None);
+    frame(&writers[1], w1_req, WireFlags::train_frame(0, false), None, None);
+    frame(&writers[1], w1_req, WireFlags::train_frame(0, true), None, None);
 
     let slots = fx.initial_slots();
 
@@ -159,11 +163,9 @@ fn drain_index_scan_errs_immediately_on_fault_frame() {
     assert_frame_still_parked(&fx.scan, 1);
 }
 
-/// Multi-frame trains from one worker merge with a single-frame (flag-free,
-/// length-1 train) reply from another: the sink sees every row, the
-/// continuation decodes against the schema hint saved from the first
-/// frame, and the flag-free frame terminates its train. Reading "no
-/// FLAG_SCAN_LAST ⇒ more" instead would hang this test at `Pending`.
+/// Multi-frame trains from one worker merge with a one-frame train from another:
+/// the sink sees every row, and the continuation decodes against the expected
+/// schema.
 #[test]
 fn drain_index_scan_merges_chunked_and_single_frame_trains() {
     let schema = two_col_schema();
@@ -176,21 +178,33 @@ fn drain_index_scan_merges_chunked_and_single_frame_trains() {
     let w1_req = fx.req(1);
 
     // Worker 0: chunked train — schema on the first frame only.
-    frame(&writers[0], w0_req, FLAG_CONTINUATION, Some(&schema), Some(&chunk_a));
     frame(
         &writers[0],
         w0_req,
-        FLAG_CONTINUATION | FLAG_SCAN_LAST,
+        WireFlags::train_frame(0, false),
+        Some(&schema),
+        Some(&chunk_a),
+    );
+    frame(
+        &writers[0],
+        w0_req,
+        WireFlags::train_frame(0, true),
         None,
         Some(&chunk_b),
     );
-    // Worker 1: single-frame reply, no train flags (send_response shape).
-    frame(&writers[1], w1_req, 0, Some(&schema), Some(&single));
+    // Worker 1: a one-frame train.
+    frame(
+        &writers[1],
+        w1_req,
+        WireFlags::train_frame(0, true),
+        Some(&schema),
+        Some(&single),
+    );
 
     let slots = fx.initial_slots();
 
     let mut rows: Vec<(u128, i64)> = Vec::new();
-    let result = poll_once(drain_index_scan(slots, &fx.scan, "seek", &schema, |mb, frame_len| {
+    let result = poll_once(drain_index_scan(slots, &fx.scan, "gather", &schema, |mb, frame_len| {
         assert!(frame_len > 0, "sink receives the raw frame byte length");
         for i in 0..mb.len() {
             rows.push((gnitz_wire::widen_pk_be(mb.get_pk_bytes(i)), mb.get_weight(i)));
@@ -216,7 +230,13 @@ fn drain_index_scan_rejects_first_frame_schema_mismatch() {
 
     let (fx, writers) = DrainFixture::new(1);
     let w0_req = fx.req(0);
-    frame(&writers[0], w0_req, 0, Some(&wire_schema), Some(&batch));
+    frame(
+        &writers[0],
+        w0_req,
+        WireFlags::train_frame(0, true),
+        Some(&wire_schema),
+        Some(&batch),
+    );
 
     let slots = fx.initial_slots();
 
@@ -241,19 +261,19 @@ fn drain_index_scan_sink_error_aborts_drain() {
 
     let (fx, writers) = DrainFixture::new(1);
     let w0_req = fx.req(0);
-    frame(&writers[0], w0_req, FLAG_CONTINUATION, Some(&schema), Some(&chunk));
     frame(
         &writers[0],
         w0_req,
-        FLAG_CONTINUATION | FLAG_SCAN_LAST,
-        None,
+        WireFlags::train_frame(0, false),
+        Some(&schema),
         Some(&chunk),
     );
+    frame(&writers[0], w0_req, WireFlags::train_frame(0, true), None, Some(&chunk));
 
     let slots = fx.initial_slots();
 
-    let result = poll_once(drain_index_scan(slots, &fx.scan, "seek", &schema, |_, _| {
-        Err("seek: result exceeds the reply cap".into())
+    let result = poll_once(drain_index_scan(slots, &fx.scan, "gather", &schema, |_, _| {
+        Err("gather: result exceeds the reply cap".into())
     }));
     let err = result.expect_err("sink error must abort the drain");
     assert!(err.text.contains("reply cap"), "sink error surfaces verbatim: {err}");
@@ -271,7 +291,7 @@ fn drain_index_scan_sink_error_aborts_drain() {
 fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
     let (fx, writers) = DrainFixture::new(1);
     let w0_req = fx.req(0);
-    frame(&writers[0], w0_req, FLAG_CONTINUATION | FLAG_SCAN_LAST, None, None);
+    frame(&writers[0], w0_req, WireFlags::train_frame(0, true), None, None);
 
     let mut slots = fx.initial_slots();
     let slot = slots.pop().expect("first frame");
@@ -298,9 +318,21 @@ fn forward_scan_slots_coalesces_single_frame_heads() {
 
     let (fx, writers) = DrainFixture::new(3);
     let reqs: Vec<u32> = (0..3).map(|i| fx.req(i)).collect();
-    frame(&writers[0], reqs[0], 0, Some(&schema), Some(&rows_a));
-    frame(&writers[1], reqs[1], 0, None, None);
-    frame(&writers[2], reqs[2], 0, Some(&schema), Some(&rows_c));
+    frame(
+        &writers[0],
+        reqs[0],
+        WireFlags::train_frame(0, true),
+        Some(&schema),
+        Some(&rows_a),
+    );
+    frame(&writers[1], reqs[1], WireFlags::train_frame(0, true), None, None);
+    frame(
+        &writers[2],
+        reqs[2],
+        WireFlags::train_frame(0, true),
+        Some(&schema),
+        Some(&rows_c),
+    );
 
     let slots = fx.initial_slots();
     let observable_bytes = slots[0].frame_bytes().len() + slots[2].frame_bytes().len();

@@ -9,7 +9,7 @@ use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::control::{peek_control_block, peek_control_block_ipc};
-use gnitz_wire::STATUS_OK;
+use gnitz_wire::WireStatus;
 use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_SIZE, WAL_OFF_TID};
 
 /// A checksummed schema WAL block for a 4-column schema.
@@ -128,7 +128,7 @@ fn single_bit_header_sweep_changes_nothing_observable() {
 /// `request_id`, `target_id`, `client_id`, `status`, the layout bits, the
 /// directory — is covered by one sweep over the checksummed span.
 ///
-/// `FLAG_HAS_DATA` is the costliest bit in that span: `decode_wire_body` routes
+/// `has_data` is the costliest bit in that span: `decode_wire_body` routes
 /// on it, so clearing it returns `Ok` with no batch and a committed push slot's
 /// rows vanish silently. Nothing but the checksum can catch that — `Ok` with no
 /// batch is the legitimate reading of every row-less slot, so the shape itself
@@ -170,7 +170,7 @@ fn the_control_blocks_size_field_is_exact() {
             &mut buf,
             0,
             &gnitz_wire::control::ControlHeader {
-                status: STATUS_OK,
+                status: WireStatus::Ok,
                 target_id: 7,
                 ..Default::default()
             },

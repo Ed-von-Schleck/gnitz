@@ -1,6 +1,6 @@
 //! Master SAL dispatcher: the `MasterDispatcher` core — SAL group/broadcast
 //! writes, worker signalling + ack collection, relay emit, the fan-out family
-//! (backfill / seek / scan / index), the checkpoint rounds, the tick-round
+//! (backfill / scan / index), the checkpoint rounds, the tick-round
 //! counter and worker reaping.
 
 use std::time::{Duration, Instant};
@@ -41,47 +41,6 @@ fn boot_nonce() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     nanos ^ ((std::process::id() as u64) << 32)
-}
-
-/// A seek's answer, in the shape its fan-out produced.
-pub(crate) enum SeekReply {
-    /// The one answering worker's reply frame, forwarded to the client verbatim.
-    Frame(W2mSlot),
-    /// Every worker's rows merged into one batch, or `None` when none matched.
-    Merged(Option<Box<Batch>>),
-}
-
-/// Merge every reply of a broadcast lookup into one batch, or `None` when no row
-/// matched. `op` names the verb in the errors.
-async fn merge_replies(
-    slots: Vec<W2mSlot>,
-    scan: &ScanDispatch,
-    op: &str,
-    expected: &SchemaDescriptor,
-) -> Result<Option<Batch>, WorkerFault> {
-    let mut acc: Option<Batch> = None;
-    let mut merged_bytes = 0usize;
-    drain_index_scan(slots, scan, op, expected, |mb, frame_len| {
-        // The merge goes back out as one frame, so it is bounded by what the
-        // client will read (`FRAME_CAP`). Σ frame bytes ≥ that merged encode
-        // size — every frame re-counts its header and the first one the schema
-        // block — so capping the sum never lets an unreadable reply through, and
-        // it bounds the master's merge heap on the way.
-        merged_bytes += frame_len;
-        if merged_bytes > crate::runtime::wire::FRAME_CAP {
-            return Err(format!(
-                "{op}: result exceeds the {} MiB reply cap",
-                crate::runtime::wire::FRAME_CAP >> 20
-            )
-            .into());
-        }
-        let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.len()));
-        a.append_mem_batch(mb);
-        Ok(())
-    })
-    .await?;
-    // The sink runs only for non-empty frames, so `Some` implies rows.
-    Ok(acc)
 }
 
 impl MasterDispatcher {
@@ -156,7 +115,7 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Write one SAL group and nothing else — no signal, no ack collection.
-    pub(crate) fn write_group(&self, g: &DirectGroup) -> Result<(), WorkerFault> {
+    pub(crate) fn write_group(&self, g: &DirectGroup) -> Result<(), WireFault> {
         self.sal.write(g)
     }
 
@@ -169,7 +128,7 @@ impl MasterDispatcher {
         batch: &Batch,
         relation: &wire::WireSchema,
         base: DirectGroup<'_>,
-    ) -> Result<(), WorkerFault> {
+    ) -> Result<(), WireFault> {
         // No reentrancy: the closure has no `.await`, so the SCATTER_INDICES
         // borrow is released before the next caller needs it.
         with_worker_indices(batch, relation.descriptor(), self.num_workers(), |worker_indices| {
@@ -235,7 +194,7 @@ impl MasterDispatcher {
         n: usize,
         ctx: &str,
         acc: &mut ExchangeAccumulator,
-    ) -> Result<Option<PendingRelay>, WorkerFault> {
+    ) -> Result<Option<PendingRelay>, WireFault> {
         let mut acks = std::pin::pin!(lease.acks(n, |w, c| worker_error(w, ctx, c)));
         loop {
             match select2(acks.as_mut(), self.reactor.next_exchange()).await {
@@ -264,7 +223,7 @@ impl MasterDispatcher {
         n: usize,
         ctx: &str,
         checkpoint_allowed: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), WireFault> {
         self.reactor.block_on_exclusive(async {
             let collect = async {
                 let mut acc = ExchangeAccumulator::new(self.num_workers());
@@ -274,7 +233,7 @@ impl MasterDispatcher {
                 // expect. A bare `checkpoint_reset`, never `checkpoint_post_ack`: a
                 // mid-backfill flush would orphan unconsumed backfill groups.
                 let mut pending_reset = false;
-                while let Some(relay) = self.next_relay(lease, n, ctx, &mut acc).await.map_err(|f| f.text)? {
+                while let Some(relay) = self.next_relay(lease, n, ctx, &mut acc).await? {
                     if std::mem::take(&mut pending_reset) {
                         self.sal.checkpoint_reset();
                     }
@@ -283,7 +242,14 @@ impl MasterDispatcher {
                     // CHECKPOINT verdict cannot rescue this round — it is written at the
                     // current cursor either way.
                     let all_pad = relay.all_pad;
-                    let prep = self.prepare_relay(relay)?;
+                    // Every worker is parked in exchange wait on this relay and
+                    // ACKs nothing until it lands, so a relay that cannot be
+                    // delivered is fatal.
+                    let prep = self.prepare_relay(relay).unwrap_or_else(|e| {
+                        gnitz_fatal_abort!(
+                            "{ctx}: prepare_relay failed; a lost relay wedges workers blocked in exchange wait: {e}"
+                        )
+                    });
                     let decision = if all_pad {
                         BACKFILL_DECISION_STOP
                     } else if checkpoint_allowed
@@ -294,9 +260,13 @@ impl MasterDispatcher {
                     } else {
                         BACKFILL_DECISION_CONTINUE
                     };
-                    self.emit_relay_with_decision(&prep, decision)?;
+                    if let Err(e) = self.emit_relay_with_decision(&prep, decision) {
+                        gnitz_fatal_abort!(
+                            "{ctx}: emit_relay failed; a lost relay wedges workers blocked in exchange wait: {e}"
+                        );
+                    }
                 }
-                Ok::<(), String>(())
+                Ok::<(), WireFault>(())
             };
             match select2(collect, self.round_failure(lease, n, ctx)).await {
                 Either::A(r) => r,
@@ -308,28 +278,29 @@ impl MasterDispatcher {
     /// Resolves once a worker has answered `lease` with an error or has died, probing
     /// every `WORKER_WATCH`. A worker failing before it joins a round leaves the others
     /// in their exchange wait, so an error must end the round without the other ACKs.
-    async fn round_failure(&self, lease: &Lease, n: usize, ctx: &str) -> String {
+    async fn round_failure(&self, lease: &Lease, n: usize, ctx: &str) -> WireFault {
         loop {
             self.reactor.timer(Instant::now() + WORKER_WATCH).await;
             if let Some(e) = lease.first_error(n, |w, c| worker_error(w, ctx, c)) {
-                return e.text;
+                return e;
             }
             if let Some(w) = self.check_workers() {
-                return format!("worker {w} exited during {ctx}");
+                return format!("worker {w} exited during {ctx}").into();
             }
         }
     }
 
     /// Write the group `write` builds on a fresh ACK lease, signal, collect exclusively.
+    /// A refused write fails before any worker is signalled, keeping its status.
     fn exclusive_round(
         &self,
         ctx: &str,
         checkpoint_allowed: bool,
-        write: impl FnOnce(GroupTargets) -> Result<(), WorkerFault>,
-    ) -> Result<(), String> {
+        write: impl FnOnce(GroupTargets) -> Result<(), WireFault>,
+    ) -> Result<(), WireFault> {
         let nw = self.num_workers();
         let lease = self.reactor.lease_acks(nw);
-        write(GroupTargets::All(lease.base())).map_err(|f| f.text)?;
+        write(GroupTargets::all(lease.base()))?;
         self.signal_all();
         self.collect_exclusive(&lease, nw, ctx, checkpoint_allowed)
     }
@@ -364,7 +335,7 @@ impl MasterDispatcher {
     ///
     /// Half a checkpoint on its own: it must be paired with `restamp_derived` in
     /// the same exclusive window.
-    fn reclaim_base(&self) -> Result<(), String> {
+    fn reclaim_base(&self) -> Result<(), WireFault> {
         self.cat().bump_checkpoint_generation()?;
         self.sync_round(0, SalMessageKind::Flush)
     }
@@ -381,7 +352,7 @@ impl MasterDispatcher {
     ///
     /// `pending` is the master's set of tables with un-ticked deltas — what the
     /// committer's `Drain` covers.
-    pub(crate) fn restamp_derived(&self, pending: &[i64]) -> Result<(), String> {
+    pub(crate) fn restamp_derived(&self, pending: &[i64]) -> Result<(), WireFault> {
         for &tid in pending {
             self.drain_tick_blocking(tid)?;
         }
@@ -391,7 +362,7 @@ impl MasterDispatcher {
     /// One exclusive round: emit the flush group, block for every worker's ACK,
     /// finalize. A `FlushEph` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_resume_generation`); the base round passes 0.
-    fn sync_round(&self, lsn: u64, kind: SalMessageKind) -> Result<(), String> {
+    fn sync_round(&self, lsn: u64, kind: SalMessageKind) -> Result<(), WireFault> {
         // `kind` already discriminates the two callers, so it names the phase a
         // dead worker is reported against too.
         let ctx = if kind == SalMessageKind::FlushEph {
@@ -570,11 +541,10 @@ impl MasterDispatcher {
     /// The caller must exclude every other SAL writer, by either of the two means
     /// this codebase has: a steady tick relay holds `sal_writer_excl` across the
     /// call, while an exclusive round polls no task, so none can reach the SAL.
-    pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
+    pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), WireFault> {
         self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| {
             self.write_group(g)
-        })
-        .map_err(|f| f.text)?;
+        })?;
         self.signal_all();
         Ok(())
     }
@@ -596,7 +566,7 @@ impl MasterDispatcher {
     /// view and index invalid until an ephemeral round re-stamps them — so a
     /// caller must run `restamp_derived` before its window closes whenever
     /// [`Self::derived_needs_restamp`] answers true afterwards.
-    fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
+    fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), WireFault> {
         // A backfill round cannot reclaim mid-flight — the reset reaches the
         // workers stamped on the *previous* round's relay — so round one gets
         // whatever the cursor leaves, and reclaiming first is the only lever.
@@ -635,13 +605,15 @@ impl MasterDispatcher {
     /// barrier and `fan_out_backfill` accommodates that — no relay arrives, so
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.
-    pub(crate) fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), String> {
+    pub(crate) fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), WireFault> {
         let (dag, registry) = self.cat().dag_and_registry_mut();
         for vid in dag.order_by_view_deps(registry, view_ids) {
             let sources = dag.get_source_ids(registry, vid);
             for src in sources {
-                self.fan_out_backfill(vid, src)
-                    .map_err(|e| format!("view={vid} source={src}: {e}"))?;
+                self.fan_out_backfill(vid, src).map_err(|e| WireFault {
+                    status: e.status,
+                    text: format!("view={vid} source={src}: {e}"),
+                })?;
             }
         }
         Ok(())
@@ -658,78 +630,13 @@ impl MasterDispatcher {
     /// Writes under no SAL mutex, so `fn` rather than `async fn` is what keeps its
     /// group out of `dispatch_scan_multi_fanout`'s sampled round: making it `async`
     /// lets the reactor interleave it and breaks that read-freshness contract.
-    pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
+    pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), WireFault> {
         self.exclusive_round("view tick drain", false, |t| self.write_tick_group(source_id, t))
     }
 
-    /// Point lookup of `pk`. A key-routed relation's rows sit on the worker the
-    /// key hashes to, and a replicated one's on every worker, so one worker's
-    /// single reply frame is handed back verbatim. A `Local` relation's rows sit on
-    /// whichever worker produced them — a view key's group spans workers — so every
-    /// worker is asked and their replies are merged.
-    pub(crate) async fn fan_out_seek(
-        &self,
-        target_id: i64,
-        pk: u128,
-        seek_pk_extra: &[u8],
-        client_version: u16,
-    ) -> Result<SeekReply, WorkerFault> {
-        let num_workers = self.num_workers();
-        let schema = self.schema_desc_for(target_id);
-        // Decode the wire pair to the OPK bytes (width-universal), then route off
-        // the distribution prefix via the shared `worker_for_pk`. A Seek
-        // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
-        // of a key-routed relation pins exactly one worker. Hashing the native
-        // value instead of the OPK bytes would misroute signed and compound PKs.
-        let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
-            .map_err(|e| format!("seek: table {target_id}: {e}"))?;
-        let fanout = match schema.placement().is_key_routed() {
-            true => Fanout::One(schema.worker_for_pk(opk.pk_bytes(), num_workers)),
-            false => read_fanout(self, target_id),
-        };
-        let (mut slots, scan) = dispatch_scan_fanout(self, fanout, |targets| {
-            self.write_group(&DirectGroup {
-                template: wire::WireMsg {
-                    target_id: target_id as u64,
-                    // A unicast reply goes to the client verbatim, so it carries
-                    // the version the client already HAS and the worker omits the
-                    // block on a hit — where `handle_scan` stamps the one the
-                    // client *will* have, its prelim frame having just sent it. A
-                    // merge is re-encoded here, and negotiates on the way out.
-                    flags: match fanout {
-                        Fanout::One(_) => gnitz_wire::wire_flags_set_schema_version(0, client_version),
-                        Fanout::Broadcast => 0,
-                    },
-                    seek_pk: pk,
-                    seek_pk_extra,
-                    ..Default::default()
-                },
-                targets,
-                ..DirectGroup::new(SalMessageKind::Seek)
-            })
-        })
-        .await?;
-        match fanout {
-            Fanout::One(worker) => {
-                let slot = slots.pop().expect("unicast fan-out returns one slot");
-                // A point seek's reply must fit one frame; a train would be
-                // forwarded truncated, so reject it rather than silently drop the
-                // remainder.
-                expect_single_frame(&slot, worker, "seek")?;
-                Ok(SeekReply::Frame(slot))
-            }
-            Fanout::Broadcast => merge_replies(slots, &scan, "seek", &schema)
-                .await
-                .map(|merged| SeekReply::Merged(merged.map(Box::new))),
-        }
-    }
-
-    /// Fan out a SCAN to the workers `unicast` names and forward every response
+    /// Fan out a scan-shaped read to the workers `fanout` names and forward every response
     /// frame straight to the client, continuation chunks included. `Ok(false)` on
     /// a mid-stream client disconnect.
-    ///
-    /// A plain scan negotiates its schema block through `wire_flags`; a `ReadSpec`
-    /// read carries its request blob in `seek_pk_extra`, or one per worker in `extras`.
     ///
     /// `forward_scan_slots` returns on the FIRST worker fault, decode error or
     /// client disconnect, without draining the doomed trains: the scan's lease
@@ -737,27 +644,17 @@ impl MasterDispatcher {
     /// boundary, so a still-streaming worker cannot wedge in
     /// `W2mWriter::send_msg`. The fault frame can therefore reach a client that
     /// already read earlier data frames; its reply accumulator discards those.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fan_out_scan(
         &self,
-        unicast: Fanout,
-        target_id: i64,
-        client_id: u64,
+        fanout: Fanout,
         peer: &Peer,
         kind: SalMessageKind,
-        wire_flags: u64,
-        seek_pk_extra: &[u8],
+        template: wire::WireMsg<'_>,
         extras: Option<&[Vec<u8>]>,
-    ) -> Result<bool, WorkerFault> {
-        let (slots, scan) = dispatch_scan_fanout(self, unicast, |targets| {
+    ) -> Result<bool, WireFault> {
+        let (slots, scan) = dispatch_scan_fanout(self, fanout, |targets| {
             self.write_group(&DirectGroup {
-                template: wire::WireMsg {
-                    target_id: target_id as u64,
-                    client_id,
-                    flags: wire_flags,
-                    seek_pk_extra,
-                    ..Default::default()
-                },
+                template,
                 extras,
                 targets,
                 ..DirectGroup::new(kind)
@@ -770,7 +667,7 @@ impl MasterDispatcher {
     /// Broadcast a DDL batch to every worker inside `scope`'s zone — one LSN
     /// across a DDL's broadcasts, so recovery groups them atomically. Publishes
     /// nothing and signals nobody; both are the scope's commit and the caller's.
-    pub(crate) fn broadcast_ddl(&self, scope: &SalScope, target_id: i64, batch: &Batch) -> Result<(), WorkerFault> {
+    pub(crate) fn broadcast_ddl(&self, scope: &SalScope, target_id: i64, batch: &Batch) -> Result<(), WireFault> {
         let relation = self.wire_schema(target_id);
         scope.write(
             &DirectGroup {
@@ -807,7 +704,7 @@ impl MasterDispatcher {
     /// A failed emit **burns** its round rather than reusing it, since rounds
     /// must be strictly increasing. That gates nothing away: no rows exist at the
     /// burnt round, and the re-queued tid's next tick raises the map past it.
-    pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets) -> Result<(), WorkerFault> {
+    pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets) -> Result<(), WireFault> {
         let round = self.tick_round.get() + 1;
         self.tick_round.set(round);
         self.record_delta_round(tid, round);
@@ -957,14 +854,14 @@ impl MasterDispatcher {
         batch: &Batch,
         base: u64,
         recoverable: bool,
-    ) -> Result<(), WorkerFault> {
+    ) -> Result<(), WireFault> {
         let relation = self.wire_schema(target_id);
         // Identical scatter for both routings; only the per-worker index fill
         // differs (full broadcast vs PK-partitioned). One `with_group` call site
         // keeps the atomic-zone framing, LSN, ACK accounting, and the committer's
         // single `fdatasync` shared between them.
         let group = DirectGroup {
-            targets: GroupTargets::All(base),
+            targets: GroupTargets::all(base),
             ..DirectGroup::new(SalMessageKind::Push)
         };
         // A replicated relation broadcasts: the whole batch lands in every
@@ -989,7 +886,7 @@ impl MasterDispatcher {
         lsn: u64,
         kind: SalMessageKind,
         targets: GroupTargets,
-    ) -> Result<(), WorkerFault> {
+    ) -> Result<(), WireFault> {
         self.note_flush_round(lsn, kind);
         self.write_group(&DirectGroup { lsn, targets, ..DirectGroup::new(kind) })
     }
@@ -1008,7 +905,7 @@ impl MasterDispatcher {
     /// flush fails: the SAL entries about to be discarded are that data's only
     /// durable copy, so resetting on a swallowed failure destroys it. The caller
     /// leaves the SAL intact and either retries on a later checkpoint or aborts.
-    pub(crate) fn checkpoint_post_ack(&self) -> Result<(), String> {
+    pub(crate) fn checkpoint_post_ack(&self) -> Result<(), WireFault> {
         let cat = self.cat();
         cat.flush_all_system_tables()?;
         // Every worker ACKed the FLUSH, so each has applied every DdlSync written
@@ -1024,7 +921,7 @@ impl MasterDispatcher {
     /// recovery already drained everything and no pushes are admitted yet (the
     /// socket is not open), so `pending_deltas` is empty. Freshly backfilled
     /// views are durably checkpointed before the socket opens.
-    pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), String> {
+    pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), WireFault> {
         // The topology row's durability rides the gen bump's system-table flush
         // (both are `_sequences` rows), so a manifest stamped at a generation
         // implies the topology row for that layout is durable.

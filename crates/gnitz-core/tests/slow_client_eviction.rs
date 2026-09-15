@@ -53,7 +53,15 @@ fn slow_scan_client_is_evicted_after_deadline() {
     // against a non-draining peer.
     set_sockopt_int(slow.as_raw_fd(), libc::SO_RCVBUF, 4096);
     hello_handshake(&mut slow, None).expect("hello");
-    let scan = encode_message_parts(table_id, 0xB0BA, 0, 0, &[], 0, None);
+    let scan = encode_message_parts(
+        table_id,
+        0xB0BA,
+        gnitz_core::protocol::WireFlags::default(),
+        0,
+        &[],
+        0,
+        None,
+    );
     slow.send_parts(scan, None).expect("send scan");
 
     let evicted = peer_hung_up_within(slow.as_raw_fd(), 8000);

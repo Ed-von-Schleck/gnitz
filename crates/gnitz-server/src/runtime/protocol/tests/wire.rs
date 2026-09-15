@@ -8,7 +8,7 @@ use gnitz_store::storage::{Batch, BatchBuilder, Layout, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block_ipc, CTRL_BLOCK_SIZE_NO_BLOB};
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
-use gnitz_wire::{FLAG_CONTINUATION, STATUS_ERROR, STATUS_OK};
+use gnitz_wire::{ClientVerb, WireFlags, WireStatus};
 
 /// The anonymous schema block a frame for `sd` under `target_id` carries — what
 /// every producer in the tree hands `WireMsg::schema_block`.
@@ -217,7 +217,7 @@ fn encode_writes_exactly_the_predicted_size() {
             ..Default::default()
         },
         WireMsg {
-            status: STATUS_ERROR,
+            status: WireStatus::Error,
             error_msg: b"something went wrong",
             ..Default::default()
         },
@@ -252,7 +252,7 @@ fn decode_wire_round_trips_an_error_msg_inline_and_spilled() {
             target_id: 7,
             client_id: 3,
             request_id: 0xABCD,
-            status: STATUS_ERROR,
+            status: WireStatus::Error,
             error_msg,
             ..Default::default()
         }
@@ -261,7 +261,7 @@ fn decode_wire_round_trips_an_error_msg_inline_and_spilled() {
         assert_eq!(decoded.control.target_id, 7);
         assert_eq!(decoded.control.client_id, 3);
         assert_eq!(decoded.control.request_id, 0xABCD);
-        assert_eq!(decoded.control.status, STATUS_ERROR);
+        assert_eq!(decoded.control.status, WireStatus::Error);
         assert_eq!(decoded.control.error_msg, error_msg);
     }
 }
@@ -271,10 +271,16 @@ fn decode_wire_round_trips_an_error_msg_inline_and_spilled() {
 /// `request_id` is at `u64::MAX`, the widest value the reply-routing key takes.
 #[test]
 fn decode_wire_round_trips_every_control_field() {
+    let flags = WireFlags {
+        verb: ClientVerb::ScanSpec,
+        schema_version: 0xCAFE,
+        continuation: true,
+        ..Default::default()
+    };
     let wire = WireMsg {
         target_id: 0xDEAD,
         client_id: 0xBEEF,
-        flags: 0xCAFE,
+        flags,
         seek_pk: 0x1111u128 | (0x2222u128 << 64),
         seek_col_idx: 0x3333,
         request_id: u64::MAX,
@@ -284,12 +290,16 @@ fn decode_wire_round_trips_every_control_field() {
     let decoded = decode_wire(&wire).unwrap();
     assert_eq!(decoded.control.target_id, 0xDEAD);
     assert_eq!(decoded.control.client_id, 0xBEEF);
-    assert_eq!(decoded.control.flags & 0xFFFF, 0xCAFE);
+    assert_eq!(decoded.control.flags, flags);
     assert_eq!(decoded.control.seek_pk, 0x1111u128 | (0x2222u128 << 64));
     assert_eq!(decoded.control.seek_col_idx, 0x3333);
     assert_eq!(decoded.control.request_id, u64::MAX);
     assert!(decoded.control.error_msg.is_empty(), "no message means no message");
-    assert_eq!(decoded.control.status, STATUS_OK, "a frame that says nothing says OK");
+    assert_eq!(
+        decoded.control.status,
+        WireStatus::Ok,
+        "a frame that says nothing says OK"
+    );
     assert!(decoded.schema.is_none());
     assert!(decoded.data_batch.is_none());
 }
@@ -336,17 +346,17 @@ fn encode_chunk_roundtrip() {
     }
 }
 
-/// A continuation frame (FLAG_HAS_DATA, no FLAG_HAS_SCHEMA) decodes against a
+/// A continuation frame (`has_data`, no `has_schema`) decodes against a
 /// schema hint, and not without one.
 #[test]
 fn continuation_frame_decoded_with_schema_hint() {
     let sd = simple_schema();
     let batch = make_blobless_batch(4);
 
-    // Encode a continuation frame: no schema, FLAG_CONTINUATION set.
+    // Encode a continuation frame: no schema, `continuation` set.
     let msg = WireMsg {
         target_id: 1,
-        flags: FLAG_CONTINUATION,
+        flags: WireFlags { continuation: true, ..Default::default() },
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     };
@@ -387,7 +397,7 @@ fn schemaless_command_slot_is_a_bare_control_block() {
     assert_eq!(buf.len(), CTRL_BLOCK_SIZE_NO_BLOB);
 }
 
-/// The shared decoder applies the header's `FLAG_BATCH_CONSOLIDATED` bit onto
+/// The shared decoder applies the header's `batch_consolidated` bit onto
 /// the decoded batch. Encode a frame whose data batch is flagged consolidated
 /// (the encoder mirrors the batch's own claim into the header), decode it, and
 /// confirm the claim arrives — read as the tag, since the one-row batch would
@@ -408,11 +418,7 @@ fn decode_applies_batch_flags() {
 
     let decoded = decode_wire(&wire).expect("decode");
     let b = decoded.data_batch.as_ref().expect("data batch present");
-    assert_eq!(
-        b.layout(),
-        Layout::Consolidated,
-        "decoder applies FLAG_BATCH_CONSOLIDATED"
-    );
+    assert_eq!(b.layout(), Layout::Consolidated, "decoder applies batch_consolidated");
 }
 
 fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {

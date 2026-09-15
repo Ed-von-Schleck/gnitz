@@ -99,12 +99,12 @@ fn test_recv_framed_enforces_negotiated_limit() {
 
 #[test]
 fn test_pre_handshake_ceiling_admits_status_error_and_refuses_above() {
-    // The worst-case pre-ACK reject frame is a STATUS_ERROR control block with
+    // The worst-case pre-ACK reject frame is a `WireStatus::Error` control block with
     // a version text; it must pass the 4 KiB bound, and 4 KiB + 1 must not.
     let (fd_b, a) = make_socketpair();
     let mut b = ClientTransport::from_unix_fd(fd_b);
     let hdr = gnitz_wire::control::ControlHeader {
-        status: gnitz_wire::STATUS_ERROR,
+        status: gnitz_wire::WireStatus::Error,
         ..Default::default()
     };
     let err =

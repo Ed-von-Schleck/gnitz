@@ -15,7 +15,7 @@
 //!   col  6: seek_col_idx  U64
 //!   col  7: request_id    U64    -- the master's per-request identity
 //!   col  8: error_msg     STRING (nullable)
-//!   col  9: seek_pk_extra BLOB   (nullable) -- PK region bytes 16.. for a wide PK
+//!   col  9: seek_pk_extra BLOB   (nullable)
 //!
 //! Reserved request_id values:
 //!   0          -- untagged: a broadcast whose replies no one awaits
@@ -25,9 +25,10 @@
 use crate::catalog::col;
 use crate::wal::IPC_CONTROL_TID;
 use crate::{
-    checksum, encode_german_string_cell, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol,
-    REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
-    WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+    checksum, encode_german_string_cell, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireFlags,
+    WireStatus, WireSysCol, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
+    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE,
+    WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 const CONTROL_COLS: &[WireSysCol] = &[
@@ -244,10 +245,10 @@ pub fn encode_ctrl_block(
     let total = ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let buf = &mut out[offset..offset + total];
     buf[..CTRL_BLOCK_SIZE_NO_BLOB].copy_from_slice(&CTRL_BLOCK_TEMPLATE);
-    crate::write_u64_le(buf, OFF_STATUS, hdr.status as u64);
+    crate::write_u64_le(buf, OFF_STATUS, hdr.status.as_wire() as u64);
     crate::write_u64_le(buf, OFF_CLIENT_ID, hdr.client_id);
     crate::write_u64_le(buf, OFF_TARGET_ID, hdr.target_id);
-    crate::write_u64_le(buf, OFF_FLAGS, hdr.flags);
+    crate::write_u64_le(buf, OFF_FLAGS, hdr.flags.pack());
     crate::write_u128_le(buf, OFF_SEEK_PK, hdr.seek_pk);
     crate::write_u64_le(buf, OFF_SEEK_COL_IDX, hdr.seek_col_idx);
     crate::write_u64_le(buf, OFF_REQUEST_ID, hdr.request_id);
@@ -294,10 +295,10 @@ pub fn encode_ctrl_block(
 /// cleanly and misroute the frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlHeader {
-    pub status: u32,
+    pub status: WireStatus,
     pub target_id: u64,
     pub client_id: u64,
-    pub flags: u64,
+    pub flags: WireFlags,
     pub seek_pk: u128,
     pub seek_col_idx: u64,
     /// The master's per-request identity. Clients send 0; the master sets a
@@ -310,16 +311,15 @@ pub struct ControlHeader {
 /// Decoded control fields from a wire message.
 #[derive(Default)]
 pub struct DecodedControl {
-    pub status: u32,
+    pub status: WireStatus,
     pub client_id: u64,
     pub target_id: u64,
-    pub flags: u64,
+    pub flags: WireFlags,
     pub seek_pk: u128,
     pub seek_col_idx: u64,
     pub request_id: u64,
     pub error_msg: Vec<u8>,
-    /// PK region bytes `16..` for a wide PK; empty for `pk_stride <= 16`.
-    /// Read by the worker SEEK dispatch to reconstruct the full wide-PK key.
+    /// The arbitrary-length BLOB cell; the verb gives it its meaning.
     pub seek_pk_extra: Vec<u8>,
     /// Total byte length of this control WAL block (read from the WAL size
     /// field at offset WAL_OFF_SIZE). Callers that need to advance past the
@@ -401,10 +401,13 @@ fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<Decoded
     // `block_size <= data.len()` and every fixed region lies within
     // `CTRL_BLOCK_SIZE_NO_BLOB <= block_size`, so each read below is in bounds.
     let null_bmp = read_u64_le(data, OFF_NULL_BMP);
-    let status = read_u64_le(data, OFF_STATUS) as u32;
+    let status = u32::try_from(read_u64_le(data, OFF_STATUS))
+        .ok()
+        .and_then(WireStatus::from_wire)
+        .ok_or("control block names no status")?;
     let client_id = read_u64_le(data, OFF_CLIENT_ID);
     let target_id = read_u64_le(data, OFF_TARGET_ID);
-    let flags = read_u64_le(data, OFF_FLAGS);
+    let flags = WireFlags::unpack(read_u64_le(data, OFF_FLAGS))?;
     let seek_pk = crate::read_u128_le(data, OFF_SEEK_PK);
     let seek_col_idx = read_u64_le(data, OFF_SEEK_COL_IDX);
     let request_id = read_u64_le(data, OFF_REQUEST_ID);

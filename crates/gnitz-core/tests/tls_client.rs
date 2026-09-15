@@ -15,8 +15,8 @@ use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use gnitz_core::protocol::{
-    encode_message_parts, hello_handshake, parse_response, set_sockopt_int, ClientTransport, FLAG_CONTINUATION,
-    STATUS_ERROR,
+    encode_message_parts, hello_handshake, parse_response, set_sockopt_int, ClientTransport, ClientVerb, WireFlags,
+    WireStatus,
 };
 
 /// One control-only frame, blocking until it is on the wire.
@@ -24,15 +24,12 @@ fn send_control(
     t: &mut ClientTransport,
     target_id: u64,
     client_id: u64,
-    flags: u64,
+    flags: WireFlags,
 ) -> Result<(), gnitz_core::ProtocolError> {
     t.send_parts(encode_message_parts(target_id, client_id, flags, 0, &[], 0, None), None)
 }
 use gnitz_core::TableProps;
-use gnitz_core::{
-    wire_flags_set_conflict_mode, ColumnDef, GnitzClient, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch,
-    FLAG_PUSH,
-};
+use gnitz_core::{ColumnDef, GnitzClient, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
 /// `(client, schema_name, table_id, schema)` for a fresh `(pk BIGINT, a
@@ -59,7 +56,7 @@ fn send_push(
     t: &mut ClientTransport,
     tid: u64,
     client_id: u64,
-    flags: u64,
+    flags: WireFlags,
     schema: &Schema,
     batch: &ZSetBatch,
 ) -> Result<(), gnitz_core::protocol::ProtocolError> {
@@ -268,11 +265,11 @@ fn wire_version_mismatch_hello_gets_status_error() {
     t.send_framed(&payload, None).unwrap();
     let buf = t.recv_framed(None).unwrap();
     let (msg, _) = parse_response(&buf, None).unwrap();
-    assert_eq!(msg.status, STATUS_ERROR);
+    assert_eq!(msg.status, WireStatus::Error);
     let text = msg.error_text.unwrap_or_default();
     assert!(
         text.contains("version"),
-        "STATUS_ERROR must name the version mismatch, got: {text}"
+        "a WireStatus::Error must name the version mismatch, got: {text}"
     );
     // Clean close follows the error frame.
     assert!(t.recv_framed(None).is_err());
@@ -323,20 +320,24 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         // response. The server's ACK sends stall against our unread socket
         // while we are still mid-send-batch — liveness requires the
         // server's always-reading pump.
-        let push_flags = wire_flags_set_conflict_mode(FLAG_PUSH, WireConflictMode::Update);
+        let push_flags = WireFlags {
+            verb: ClientVerb::Push,
+            conflict_mode: WireConflictMode::Update,
+            ..Default::default()
+        };
         let n_pushes = 30usize;
         for i in 0..n_pushes {
             let batch = make_batch(&schema, (i * 25_000) as u64, 25_000);
             send_push(&mut t, tid, 0xF00D, push_flags, &schema, &batch).unwrap();
         }
         // The scan whose response (~18 MB) exceeds the shrunken buffers.
-        send_control(&mut t, tid, 0xF00D, 0).unwrap();
+        send_control(&mut t, tid, 0xF00D, WireFlags::default()).unwrap();
 
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
             let buf = t.recv_framed(None).unwrap();
             let (ack, _) = parse_response(&buf, None).unwrap();
-            assert_eq!(ack.status, 0, "push ACK must be OK");
+            assert_eq!(ack.status, WireStatus::Ok, "push ACK must be OK");
         }
         let mut rows = 0usize;
         let mut schema_seen: Option<(std::sync::Arc<Schema>, u16)> = None;
@@ -344,15 +345,15 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
             let buf = t.recv_framed(None).unwrap();
             let hint = schema_seen.as_ref().map(|(s, v)| (s.as_ref(), *v));
             let (msg, data) = parse_response(&buf, hint).unwrap();
-            assert_eq!(msg.status, 0, "scan frame must be OK");
+            assert_eq!(msg.status, WireStatus::Ok, "scan frame must be OK");
             let flags = msg.flags;
             if let Some(s) = msg.schema {
-                schema_seen = Some((s, gnitz_core::wire_flags_get_schema_version(flags)));
+                schema_seen = Some((s, flags.schema_version));
             }
             if let Some(b) = data {
                 rows += b.len();
             }
-            if flags & FLAG_CONTINUATION == 0 {
+            if !flags.continuation {
                 break;
             }
         }
@@ -396,14 +397,18 @@ fn inbound_cap_breach_closes_stalled_connection() {
         hello_handshake(&mut t, None).unwrap();
         // Ask for the scan, then never read: the train stalls, pinning
         // connection_loop in its guarded send.
-        send_control(&mut t, tid, 0xB0BA, 0).unwrap();
+        send_control(&mut t, tid, 0xB0BA, WireFlags::default()).unwrap();
 
         // Pipeline ~80 MB of pushes; the pump queues them until the 64 MiB
         // cap trips and the recv side tears the connection down. The rows
         // duplicate block 0 exactly (idempotent upserts), so however many
         // queued frames the draining connection_loop applies before hitting
         // the closed queue, the table's net content is unchanged.
-        let push_flags = wire_flags_set_conflict_mode(FLAG_PUSH, WireConflictMode::Update);
+        let push_flags = WireFlags {
+            verb: ClientVerb::Push,
+            conflict_mode: WireConflictMode::Update,
+            ..Default::default()
+        };
         let batch = make_batch(&schema, 0, 25_000); // ~1 MB/frame
         let mut sent = 0usize;
         for _ in 0..140 {
@@ -450,7 +455,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         let mut t = ClientTransport::connect(&target, None).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t, None).unwrap();
-        send_control(&mut t, tid, 0xB0BA, 0).unwrap();
+        send_control(&mut t, tid, 0xB0BA, WireFlags::default()).unwrap();
         // Never read. Allow a few deadlines of slack.
         assert!(
             eviction_observed_within(&mut t, 8_000),

@@ -355,8 +355,12 @@ fn a_skeleton_store_hydrates_chunk_by_chunk() {
 
     assert_eq!(rows_of(&r.scan(TID, Some(&mut h)).unwrap()), ingested(|_| true));
     for k in [2u64, 101] {
-        let hit = r.seek(TID, &k.to_be_bytes(), Some(&mut h)).unwrap();
-        assert_eq!(rows_of(&hit.expect("a present key")), ingested(|i| i == k));
+        let spec = ReadSpec {
+            bound: pk_set(&[k]),
+            ..rows_spec(Vec::new(), 0)
+        };
+        let hit = r.scan_spec(TID, spec, &schema, Some(&mut h)).unwrap();
+        assert_eq!(rows_of(&hit), ingested(|i| i == k));
     }
 
     h.calls.clear();

@@ -79,19 +79,9 @@ def test_a_base_table_seek_stays_one_row(client, schema_name, replicated):
     assert list(client.seek(tid, pk=NFACTS + 7)) == []
 
 
-def test_an_oversized_group_errors_and_the_connection_survives(client, schema_name):
-    """A seek reply leaves the worker as one frame, and a view key's group has no
-    size bound — so a group past the 64 MiB frame the client accepts is rejected
-    rather than emitted. The reply is a plain error: the connection stays usable.
-
-    A seek is the one reply verb that never chunks — its consumer forwards the
-    single frame verbatim — so the cap binds it whatever the schema; the TEXT
-    payload also puts a string heap in that frame. The limit is a compiled-in
-    constant, not a debug-only seam, so this holds in a release build as well —
-    which also means the test must genuinely move ~68 MiB. Wide rows keep that
-    cheap: the push path is per-row bound well below 16 KiB/row, so few-and-wide
-    costs about half of many-and-narrow.
-    """
+def test_a_group_past_one_frame_is_returned_whole(client, schema_name):
+    """A view key whose group exceeds one 64 MiB frame is returned whole, and the
+    connection answers the next statement."""
     sn = schema_name
     rows_per_push, npush, width = 272, 16, 16384
     client.execute_sql(
@@ -117,11 +107,7 @@ def test_an_oversized_group_errors_and_the_connection_survives(client, schema_na
             {"id": fid, "k": 1, "s": f"{fid:08d}" + "x" * (width - 8)} for fid in fids))
 
     vid = client.resolve_table(sn, "jv")[0]
-    with pytest.raises(Exception) as excinfo:
-        list(client.seek(vid, pk=1))
-    msg = str(excinfo.value)
-    assert "67108864" in msg, f"the error must name the limit: {msg}"
-    assert "seek" in msg, msg
+    assert len(list(client.seek(vid, pk=1))) == rows_per_push * npush
 
     # The connection is intact: the next statement answers normally.
     assert bag(scanned(client, sn, "dim")) == {(1, 1): 1}

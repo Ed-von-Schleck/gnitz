@@ -19,22 +19,6 @@ impl CatalogEngine {
         Ok((registry.scan(table_id, Some(dag))?, schema))
     }
 
-    /// Point lookup by the wire seek pair, hydrating: the pair decoded to OPK
-    /// bytes, then [`RelationRegistry::seek`]. The schema comes back with
-    /// a miss too — its STATUS_OK reply block needs it.
-    pub(crate) fn seek(
-        &mut self,
-        table_id: i64,
-        seek_pk: u128,
-        seek_pk_extra: &[u8],
-    ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
-        let schema = self.registry.relation_or_err(table_id)?.schema();
-        let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, seek_pk, seek_pk_extra)
-            .map_err(|e| format!("seek: table {table_id}: {e}"))?;
-        let (dag, registry) = self.dag_and_registry_mut();
-        Ok((registry.seek(table_id, opk.pk_bytes(), Some(dag))?, schema))
-    }
-
     /// [`RelationRegistry::scan_spec`], hydrating.
     pub(crate) fn scan_spec(
         &mut self,
@@ -50,7 +34,7 @@ impl CatalogEngine {
 
     /// [`RelationRegistry::delta_read`]. The one site where a delta read's store
     /// error becomes a wire fault: an expired cursor keeps its own status,
-    /// everything else is `STATUS_ERROR`.
+    /// everything else is `WireStatus::Error`.
     pub(crate) fn delta_read(
         &self,
         target_id: i64,
@@ -62,7 +46,7 @@ impl CatalogEngine {
             .delta_read(target_id, after_tick, cut_tick, reply_schema)
             .map_err(|e| match e {
                 StoreError::DeltaExpired(text) => WireFault {
-                    status: gnitz_wire::STATUS_DELTA_EXPIRED,
+                    status: gnitz_wire::WireStatus::DeltaExpired,
                     text,
                 },
                 other => WireFault::from(other.to_string()),

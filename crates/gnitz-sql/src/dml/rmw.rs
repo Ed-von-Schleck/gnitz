@@ -5,7 +5,7 @@
 //! Each such statement resolves its target rows client-side, computes new rows
 //! client-side, then writes. This driver wraps that read+build so that:
 //!
-//! - **Autocommit** ships a one-family, one-precondition `FLAG_PUSH_TXN` frame
+//! - **Autocommit** ships a one-family, one-precondition `PUSH_TXN` frame
 //!   (`GnitzClient::commit_rmw`) asserting the table has not been written since
 //!   the basis. On a `TxnConflict` it adopts the server's fresh basis and re-runs
 //!   the build from scratch (re-reading fresh state — re-shipping the stale batch

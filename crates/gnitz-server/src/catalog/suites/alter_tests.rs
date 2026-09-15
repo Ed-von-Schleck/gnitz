@@ -129,7 +129,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         "renamed relation must resolve after reopen"
     );
     assert!(
-        engine.seek(tid, 7u128, &[]).unwrap().0.is_some(),
+        !pk_group_native(&mut engine, tid, 7).is_empty(),
         "flushed row must resolve after rename + reopen (id-only dir was untouched)"
     );
 

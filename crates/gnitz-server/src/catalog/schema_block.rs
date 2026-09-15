@@ -11,11 +11,11 @@
 
 use super::{CatalogEngine, ColumnDef, SchemaWireEntry};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_wire::schema_block::SchemaBlockCol;
+use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
 use std::rc::Rc;
 
 /// One [`SchemaBlockCol`] per column: the physical shape from `schema`, and the
-/// per-column catalog facts (name, `META_FLAG_HIDDEN`, `META_FLAG_SERIAL`, the
+/// per-column catalog facts (name, `ColMeta::hidden`, `ColMeta::serial`, the
 /// DECIMAL scale) from
 /// `defs`.
 ///
@@ -35,17 +35,17 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
                 // determines decode order — column order ≠ PK order in general
                 // (e.g. `PRIMARY KEY (b, a)`). Carrying the position lets the
                 // decoder rebuild `pk_indices` exactly as the user wrote them.
-                flags: gnitz_wire::pack_col_meta_flags(
-                    col.nullable != 0,
-                    def.is_some_and(|d| d.is_hidden),
-                    def.is_some_and(|d| d.is_serial),
-                    def.map_or(0, |d| d.scale),
-                    schema
+                meta: ColMeta {
+                    nullable: col.nullable != 0,
+                    hidden: def.is_some_and(|d| d.is_hidden),
+                    serial: def.is_some_and(|d| d.is_serial),
+                    scale: def.map_or(0, |d| d.scale),
+                    pk_pos: schema
                         .pk_indices()
                         .iter()
                         .position(|&p| p as usize == ci)
                         .map(|p| p as u8),
-                ),
+                },
                 name: def.map_or(&b""[..], |d| d.name.as_bytes()),
             }
         })
@@ -128,7 +128,8 @@ impl CatalogEngine {
         descriptor: impl FnOnce(&Self) -> Option<SchemaDescriptor>,
     ) -> (Option<Rc<Vec<u8>>>, u16) {
         let server_version = self.get_schema_version(tid);
-        if !gnitz_wire::wire_should_include_schema(client_version, server_version) {
+        // Server versions start at 1 and wrap back to 1, so a client's 0 never matches.
+        if client_version == server_version {
             return (None, server_version);
         }
         let block = descriptor(self).map(|s| self.schema_wire_entry(tid, &s).block);

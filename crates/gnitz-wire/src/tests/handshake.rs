@@ -41,7 +41,7 @@ fn ack_frame_layout_and_decode() {
 }
 
 /// Before the handshake completes a reader has three frames to tell apart and
-/// only the length prefix to do it with: HELLO, ACK, and the one `STATUS_ERROR`
+/// only the length prefix to do it with: HELLO, ACK, and the one `WireStatus::Error`
 /// control block this path emits. That holds only while both handshake payloads
 /// are smaller than the smallest control block, and while the error block fits
 /// the pre-handshake ceiling — otherwise a rejected HELLO reads as a truncated

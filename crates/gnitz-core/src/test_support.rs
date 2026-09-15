@@ -40,7 +40,7 @@ pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
 /// A control-only reply frame carrying `lsn` in `seek_pk` — the terminal a
 /// scripted peer answers an uncorrelated request with.
 pub(crate) fn reply_ctrl(tid: u64, lsn: u128) -> Vec<u8> {
-    crate::protocol::encode_control_frame(tid, 0, 0, lsn, 0, &[]).ctrl
+    crate::protocol::encode_control_frame(tid, 0, crate::protocol::WireFlags::default(), lsn, 0, &[]).ctrl
 }
 
 /// `[u32 LE len][payload]`, what a peer writes.

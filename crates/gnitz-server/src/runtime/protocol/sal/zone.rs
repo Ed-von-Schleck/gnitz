@@ -3,7 +3,7 @@
 //! A zone's byte span runs from its zone-start group to the
 //! [`SalMessageKind::ZoneCommit`] sentinel `SalScope::commit` closes it with,
 //! and its groups apply all-or-nothing. A whole CREATE is one zone — its N
-//! families ride one `FLAG_DDL_TXN` bundle under a single zone LSN — so all of
+//! families ride one `DDL_TXN` bundle under a single zone LSN — so all of
 //! COL_TAB and TABLE_TAB replay, or none of it.
 //!
 //! Recovery reads it in two passes over the same walk, both behind

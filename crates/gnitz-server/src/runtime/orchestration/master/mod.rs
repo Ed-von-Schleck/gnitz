@@ -24,14 +24,14 @@ use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessa
 use crate::runtime::w2m::W2mSlot;
 use crate::runtime::wire::{
     self, unique_preflight_wire_schema, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
-    BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
+    BACKFILL_DECISION_STOP,
 };
 use exchange::PendingRelay;
 use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, ScatterSpec};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::peek_control_block_ipc;
-use gnitz_wire::{WireConflictMode, FLAG_CONTINUATION, FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
+use gnitz_wire::{WireConflictMode, WireFault, WireFlags, WireStatus};
 use scatter::{with_commit_indices, with_group, with_worker_indices};
 
 // ---------------------------------------------------------------------------
@@ -165,30 +165,19 @@ mod unique_filter;
 mod unique_preflight;
 
 use super::TxnFamily;
-pub(crate) use dispatch::{SeekReply, WORKER_WATCH};
-use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
+pub(crate) use dispatch::WORKER_WATCH;
+use train::{drain_index_scan, forward_scan_slots, parse_train_header, scan_decode_err};
 pub(crate) use unique_filter::UniqueFilter;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A worker's failure reply, carried to the client as the pair the frame gave —
-/// a worker may mint its own typed status (`STATUS_DELTA_EXPIRED`) and the
-/// client reacts to the code rather than to the text.
-///
-/// The type is `gnitz-wire`'s, not this module's: the engine's `scan_spec`
-/// mints exactly this pair, the worker splits it onto the wire, and
-/// [`worker_error`] reassembles it here, so all three name one definition.
-pub(crate) use gnitz_wire::WireFault as WorkerFault;
-
-/// Render worker `w`'s reply as a fault, or `None` when it succeeded. The one
-/// place the fault contract of a worker reply is read: `status != 0` means the
-/// worker failed, `error_msg` holds its (UTF-8) text, and both halves travel on.
-pub(crate) fn worker_error(w: usize, op: &str, ctrl: &gnitz_wire::control::DecodedControl) -> Option<WorkerFault> {
-    (ctrl.status != 0).then(|| {
+/// Worker `w`'s reply as a fault, keeping its status, or `None` when it succeeded.
+pub(crate) fn worker_error(w: usize, op: &str, ctrl: &gnitz_wire::control::DecodedControl) -> Option<WireFault> {
+    (ctrl.status != WireStatus::Ok).then(|| {
         let msg = String::from_utf8_lossy(&ctrl.error_msg);
-        WorkerFault {
+        WireFault {
             status: ctrl.status,
             text: format!("worker {w}: {op}: {msg}"),
         }
@@ -257,28 +246,30 @@ pub(crate) struct ScanDispatch {
     lease: Lease,
     /// The one worker a unicast wrote to; `None` when reply `i` is worker `i`'s.
     worker: Option<usize>,
+    in_request_order: bool,
 }
 
 impl ScanDispatch {
     /// Lease this fan-out's request ids, before any await.
-    fn alloc(reactor: &crate::runtime::reactor::Reactor, nw: usize, fanout: Fanout) -> ScanDispatch {
-        match fanout {
-            Fanout::Broadcast => ScanDispatch {
-                lease: reactor.lease_train(nw),
-                worker: None,
-            },
-            Fanout::One(w) => ScanDispatch {
-                lease: reactor.lease_train(1),
-                worker: Some(w),
-            },
-        }
+    fn alloc(
+        reactor: &crate::runtime::reactor::Reactor,
+        nw: usize,
+        fanout: Fanout,
+        in_request_order: bool,
+    ) -> ScanDispatch {
+        let (lease, worker) = match fanout {
+            Fanout::Broadcast => (reactor.lease_train(nw), None),
+            Fanout::One(w) => (reactor.lease_train(1), Some(w)),
+        };
+        ScanDispatch { lease, worker, in_request_order }
     }
 
     /// The slots this scan's group writes, and the id each answers on.
     pub(crate) fn targets(&self) -> GroupTargets {
+        let (base, in_request_order) = (self.lease.base(), self.in_request_order);
         match self.worker {
-            None => GroupTargets::All(self.lease.base()),
-            Some(worker) => GroupTargets::One { worker, req_id: self.lease.base() },
+            None => GroupTargets::All { base, in_request_order },
+            Some(worker) => GroupTargets::One { worker, req_id: base, in_request_order },
         }
     }
 
@@ -303,16 +294,16 @@ impl ScanDispatch {
     /// under one SAL cut. `Ok(false)` on client disconnect.
     ///
     /// Draining relation `i` fully before relation `i+1` is the FIFO invariant's
-    /// supported usage: under `FLAG_SCAN_FIFO_REPLY` each worker streams the
+    /// supported usage: under `scan_fifo_reply` each worker streams the
     /// relations in request order, so relation `i`'s frames sit at the front of
     /// every ring with a live consumer.
-    pub(crate) async fn await_and_forward(&self, peer: &Peer) -> Result<bool, WorkerFault> {
+    pub(crate) async fn await_and_forward(&self, peer: &Peer) -> Result<bool, WireFault> {
         let slots = self.await_slots().await;
         forward_scan_slots(peer, slots, self).await
     }
 }
 
-/// Fan a scan/seek group out to the workers under `submit` and await their
+/// Fan a scan-shaped group out to the workers under `submit` and await their
 /// raw `W2mSlot` replies, returned so the caller can forward or merge them
 /// without an intermediate decode/copy.
 ///
@@ -329,11 +320,11 @@ pub(crate) async fn dispatch_scan_fanout<F>(
     disp: &MasterDispatcher,
     unicast: Fanout,
     submit: F,
-) -> Result<(Vec<W2mSlot>, ScanDispatch), WorkerFault>
+) -> Result<(Vec<W2mSlot>, ScanDispatch), WireFault>
 where
-    F: FnOnce(GroupTargets) -> Result<(), WorkerFault>,
+    F: FnOnce(GroupTargets) -> Result<(), WireFault>,
 {
-    let scan = ScanDispatch::alloc(disp.reactor(), disp.num_workers(), unicast);
+    let scan = ScanDispatch::alloc(disp.reactor(), disp.num_workers(), unicast, false);
 
     {
         let _guard = disp.sal_excl().lock().await;
@@ -344,48 +335,28 @@ where
     Ok((slots, scan))
 }
 
-/// One SAL cut across N scan-shaped requests: write all N groups back-to-back
-/// under a single `sal_writer_excl` hold, then return each one's dispatch
-/// handle. The read-side sibling of `commit_pushes`'s "N groups under one hold"
-/// — the mutual exclusion forces the one cut, so every worker snapshots all N
-/// at the same SAL position.
-///
-/// Deliberately NOT a loop over `dispatch_scan_fanout`: that re-locks per call,
-/// which would destroy the cut.
-///
-/// `submit` writes request `i`'s group to `targets`, and MUST carry the `flags`
-/// word it is handed: at N > 1 that is `FLAG_SCAN_FIFO_REPLY`, without which
-/// ring order can differ from request order and the drain deadlocks (see the
-/// worker's `pending_streams`). At N = 1 there is nothing to misorder, so the
-/// flag is not stamped and a fitting reply keeps the inline path.
-///
-/// The **round** the groups are cut at is sampled under the hold and handed to
-/// `submit` to stamp, then returned — so a terminal built from it names the cut
-/// the workers actually read, and no caller has to smuggle it out of the
-/// closure. An empty `fanouts` takes no hold and signals no worker.
+/// One SAL cut across N scan-shaped requests: every group written under one
+/// `sal_writer_excl` hold. `submit` stamps the tick round the cut is at, which is
+/// also returned. At N > 1 each worker replies in request order.
 pub(crate) async fn dispatch_scan_multi_fanout<F>(
     disp: &MasterDispatcher,
     fanouts: &[Fanout],
     mut submit: F,
-) -> Result<(Vec<ScanDispatch>, u64), WorkerFault>
+) -> Result<(Vec<ScanDispatch>, u64), WireFault>
 where
-    F: FnMut(usize, GroupTargets, u64, u64) -> Result<(), WorkerFault>,
+    F: FnMut(usize, GroupTargets, u64) -> Result<(), WireFault>,
 {
     if fanouts.is_empty() {
         return Ok((Vec::new(), 0));
     }
     let nw = disp.num_workers();
+    let in_request_order = fanouts.len() > 1;
     // Lease every request's ids BEFORE the lock (no await between here and the
     // write).
     let dispatches: Vec<ScanDispatch> = fanouts
         .iter()
-        .map(|&unicast| ScanDispatch::alloc(disp.reactor(), nw, unicast))
+        .map(|&unicast| ScanDispatch::alloc(disp.reactor(), nw, unicast, in_request_order))
         .collect();
-    let fifo = if fanouts.len() > 1 {
-        gnitz_wire::FLAG_SCAN_FIFO_REPLY
-    } else {
-        0
-    };
 
     // One hold: write every group at a consecutive `write_cursor` position, then
     // signal. The reactor is single-threaded and each write has no `.await`, so
@@ -395,7 +366,7 @@ where
         let _guard = disp.sal_excl().lock().await;
         let round = disp.last_tick_round();
         for (i, d) in dispatches.iter().enumerate() {
-            submit(i, d.targets(), fifo, round)?;
+            submit(i, d.targets(), round)?;
         }
         disp.signal_reached(fanouts.iter().copied());
         round

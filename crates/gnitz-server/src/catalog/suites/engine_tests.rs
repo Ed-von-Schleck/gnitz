@@ -362,47 +362,35 @@ fn test_ingest_scan_seek_family() {
     let scan_batch = engine.scan(tid).unwrap().0;
     assert_eq!(scan_batch.len(), 3);
 
-    // Seek existing
-    let found = engine.seek(tid, 2u128, &[]).unwrap().0;
-    assert!(found.is_some());
-    let row = found.unwrap();
+    // Point read, present
+    let row = pk_group_native(&mut engine, tid, 2);
     assert_eq!(row.len(), 1);
     assert_eq!(row.get_pk(0), 2);
 
-    // Seek missing
-    let not_found = engine.seek(tid, 99u128, &[]).unwrap().0;
-    assert!(not_found.is_none());
+    // Point read, missing
+    assert!(pk_group_native(&mut engine, tid, 99).is_empty());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── seek resolves a system-table row (post-collapse) ───────────
+// ── a point read resolves a system-table row ───────────
 
-/// After the FLAG_SEEK collapse there is no system-table fast path: a
-/// `table_id < FIRST_USER_TABLE_ID` seek flows through the same
-/// `seek → seek_opk_bytes → RelationRegistry::seek` chain as user tables,
-/// resolving its schema through the registry entry. `create_table` writes a TABLE_TAB
-/// row keyed by the new table-id — a single narrow U64 PK, stride 8 — so seeking
-/// TABLE_TAB by that id drives the empty-`extra` narrow path end to end.
+/// A system family answers a point read like any relation: `create_table` writes a
+/// TABLE_TAB row keyed by the new table id.
 #[test]
-fn seek_family_resolves_system_table_row() {
+fn point_read_resolves_system_table_row() {
     let dir = temp_dir("catalog_seek_system_table");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    // System-table point seek (narrow stride 8, empty extra).
-    let found = engine.seek(TABLE_TAB_ID, tid as u128, &[]).unwrap().0;
-    assert!(
-        found.is_some(),
-        "seek must resolve the TABLE_TAB row for the created table",
+    assert_eq!(
+        pk_group_native(&mut engine, TABLE_TAB_ID, tid as u128).len(),
+        1,
+        "the TABLE_TAB row of the created table"
     );
-    assert_eq!(found.unwrap().len(), 1);
-
-    // A missing system-table key returns None — not an error, not a panic.
-    let missing = engine.seek(TABLE_TAB_ID, 9_999_999u128, &[]).unwrap().0;
-    assert!(missing.is_none(), "absent system-table key seeks to None");
+    assert!(pk_group_native(&mut engine, TABLE_TAB_ID, 9_999_999).is_empty());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -793,15 +781,10 @@ fn test_circuit_table_surface_introspectable() {
     let scan = engine.scan(CIRCUIT_NODES_TAB_ID).unwrap().0;
     assert_eq!(scan.len(), 1, "scan must expose CircuitNodes rows");
 
-    // Compound PK: seek by the 16-byte at-rest `(view_id, node_id)` OPK region.
+    // Compound PK: a point read by the 16-byte at-rest `(view_id, node_id)` OPK region.
     let pk_bytes = opk_pk(SysFamily::CircuitNodes.schema(), &[7, 0]);
-    let found = engine
-        .registry_mut()
-        .seek(CIRCUIT_NODES_TAB_ID, &pk_bytes, None)
-        .unwrap();
-    assert!(found.is_some(), "seek must find CircuitNodes row by PK");
-    let found = found.unwrap();
-    assert_eq!(found.len(), 1, "seek must return exactly one row");
+    let found = pk_group(&mut engine, CIRCUIT_NODES_TAB_ID, &pk_bytes);
+    assert_eq!(found.len(), 1, "the CircuitNodes row by PK");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

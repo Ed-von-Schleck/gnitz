@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
-use gnitz_wire::{STATUS_ERROR, STATUS_OK};
+use gnitz_wire::WireStatus;
 
 /// A lease routes `n` consecutive ids for exactly its own life, and the next
 /// lease starts past them.
@@ -34,7 +34,7 @@ fn a_lease_routes_consecutive_ids_until_dropped() {
 fn an_ack_landing_before_its_awaiter_is_kept() {
     let (r, writers) = reactor_with_rings(1);
     let lease = r.lease_acks(1);
-    writers[0].send_status(0, lease.id(0), STATUS_OK, &[]);
+    writers[0].send_status(0, lease.id(0), WireStatus::Ok, &[]);
     r.drain_all_w2m();
 
     assert!(
@@ -50,20 +50,20 @@ fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
     let (r, writers) = reactor_with_rings(2);
     let lease = r.lease_acks(2);
     let mut fut = std::pin::pin!(lease.acks(2, |w, c| {
-        (c.status != 0).then(|| (w, String::from_utf8_lossy(&c.error_msg).into_owned()))
+        (c.status != WireStatus::Ok).then(|| (w, String::from_utf8_lossy(&c.error_msg).into_owned()))
     }));
     let waker = make_waker(0);
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
 
-    writers[1].send_status(0, lease.id(0), STATUS_ERROR, b"boom");
+    writers[1].send_status(0, lease.id(0), WireStatus::Error, b"boom");
     r.drain_all_w2m();
     assert!(
         fut.as_mut().poll(&mut cx).is_pending(),
         "one of two ACKs must not resolve"
     );
 
-    writers[0].send_status(0, lease.id(1), STATUS_OK, &[]);
+    writers[0].send_status(0, lease.id(1), WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert!(
         r.inner.run_queue.borrow().is_queued(0),
@@ -80,7 +80,7 @@ fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
 #[test]
 fn an_unrouted_frame_is_released_undecoded() {
     let (r, writers) = reactor_with_rings(1);
-    writers[0].send_status(0, 77, STATUS_OK, &[]);
+    writers[0].send_status(0, 77, WireStatus::Ok, &[]);
     let before = r.inner.w2m.release_cursor(0);
     r.drain_all_w2m();
     assert!(r.inner.w2m.release_cursor(0) > before, "the slot is released");
@@ -130,14 +130,14 @@ fn acks_parks_only_on_the_first_unanswered_id() {
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert_eq!((parked(0), parked(1), parked(2)), (true, false, false));
 
-    writers[0].send_status(0, lease.id(1), STATUS_OK, &[]);
+    writers[0].send_status(0, lease.id(1), WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert!(
         !r.inner.run_queue.borrow().is_queued(7),
         "an ACK behind the first gap wakes nothing"
     );
 
-    writers[0].send_status(0, lease.id(0), STATUS_OK, &[]);
+    writers[0].send_status(0, lease.id(0), WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert!(
         r.inner.run_queue.borrow().is_queued(7),
@@ -146,7 +146,7 @@ fn acks_parks_only_on_the_first_unanswered_id() {
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(parked(2), "the park moves past every answered id");
 
-    writers[0].send_status(0, lease.id(2), STATUS_OK, &[]);
+    writers[0].send_status(0, lease.id(2), WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
 }
@@ -211,7 +211,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
         let d = Rc::clone(&done);
         r.spawn(async move {
             // Published during the poll, after this tick's own drain.
-            writer.send_status(0, id, STATUS_OK, &[]);
+            writer.send_status(0, id, WireStatus::Ok, &[]);
             lease.acks(1, |_, _| None::<()>).await.expect("an OK ACK");
             d.set(true);
         });
@@ -288,7 +288,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
         // drain-refresh-arm race pressure.
         let writer = W2mWriter::new(ptr);
         for req_id in 1..=N_MESSAGES {
-            writer.send_status(0, req_id, STATUS_OK, &[]);
+            writer.send_status(0, req_id, WireStatus::Ok, &[]);
         }
         unsafe { libc::_exit(0) };
     }
@@ -341,7 +341,7 @@ fn arm_waitv_refuses_while_data_is_unread() {
 
     let region = unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) };
     let ptr = region.ptr();
-    W2mWriter::new(ptr).send_status(0, 1u64, STATUS_OK, &[]);
+    W2mWriter::new(ptr).send_status(0, 1u64, WireStatus::Ok, &[]);
 
     let receiver = W2mReceiver::new(vec![ptr]);
     let mut out = [FutexWaitV::new(); 1];

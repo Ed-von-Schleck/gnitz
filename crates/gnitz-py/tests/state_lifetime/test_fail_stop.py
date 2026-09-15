@@ -10,7 +10,7 @@ what the crash tests here read back.
 
 The last test is the same rule where there is no SAL to protect: a view tick that
 fails to emit must surface as an error on the read that waited for it, rather
-than as a STATUS_OK over a view that silently stopped advancing.
+than as an OK reply over a view that silently stopped advancing.
 """
 
 import os
@@ -103,7 +103,7 @@ def test_a_failed_tick_reports_and_requeues(tick_emit_fault_server):
     `drain_tick_rows_into` empties `tick_tids` BEFORE the tick runs, so a tick
     that fails to emit used to strand its tids: no later Auto re-queued them, only
     a fresh push to that exact tid did, and the drain the reader was waiting on
-    signalled success anyway — so the read returned STATUS_OK over a stale view,
+    signalled success anyway — so the read returned OK over a stale view,
     permanently. The emit failure needs a seam; a real one takes a full SAL.
 
     The read that waited on the failed tick must error rather than serve the

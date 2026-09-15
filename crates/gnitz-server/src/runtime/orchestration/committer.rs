@@ -252,7 +252,7 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) {
 
     {
         let disp = shared.disp();
-        if let Err(e) = disp.write_checkpoint_group(lsn, kind, GroupTargets::All(req_ids.base())) {
+        if let Err(e) = disp.write_checkpoint_group(lsn, kind, GroupTargets::all(req_ids.base())) {
             gnitz_fatal_abort!("checkpoint {} round: flush group write failed: {}", round, e);
         }
         disp.signal_all();
@@ -508,7 +508,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
                 for pb in &tail {
                     m.append_batch(pb, 0, pb.len());
                 }
-                Ok(m)
+                Ok::<_, String>(m)
             }) {
                 Ok(m) => m,
                 Err(panic_msg) => {
@@ -660,7 +660,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     for g in units.iter().flat_map(|u| u.live()) {
         if let Err(e) = guard_panic("unique_filter_ingest", || {
             shared.disp().unique_filter_ingest_batch(g.tid, &g.merged);
-            Ok(())
+            Ok::<_, String>(())
         }) {
             shared.disp().unique_filter_invalidate_table(g.tid);
             gnitz_warn!("{}", e);
@@ -676,17 +676,13 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
 }
 
 /// Lay one group out in `scope`, inside its zone when the group is
-/// `recoverable`. `guard_panic` covers the encode of a client-supplied batch;
-/// the SAL's own refusal rides the `Ok` side, where it keeps its
-/// `STATUS_SAL_FULL` instead of flattening to the guard's `String`.
+/// `recoverable`. `guard_panic` covers the encode of a client-supplied batch.
 fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result<(), WireFault> {
     guard_panic("commit_write", || {
-        Ok(shared
+        shared
             .disp()
             .write_commit_group(scope, g.tid, &g.merged, g.req_ids.base(), g.recoverable)
-            .err())
-    })?
-    .map_or(Ok(()), Err)
+    })
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use super::fixtures::make_ring;
 use super::*;
 use crate::runtime::test_support::{assert_child_exited_ok, SharedRegion};
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
-use gnitz_wire::STATUS_OK;
+use gnitz_wire::WireStatus;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -379,7 +379,7 @@ fn a_retired_slot_unparks_the_writer() {
         // This second publish cannot fit; it blocks until a slot retires.
         let region_addr = ptr as usize;
         let handle = std::thread::spawn(move || {
-            W2mWriter::new(region_addr as *mut u8).send_status(0, 1, STATUS_OK, &[]);
+            W2mWriter::new(region_addr as *mut u8).send_status(0, 1, WireStatus::Ok, &[]);
             let _ = done_tx.send(());
         });
 
@@ -462,7 +462,7 @@ fn w2m_publish_drain_bench() {
             if hdr.master_park.flags.load(Ordering::Relaxed) & FLAG_MASTER_WAITV != 0 {
                 woke_master += 1;
             }
-            writer.send_status(0, req, gnitz_wire::STATUS_OK, &[]);
+            writer.send_status(0, req, gnitz_wire::WireStatus::Ok, &[]);
         }
         unsafe {
             cptr.write(woke_master);
@@ -524,7 +524,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
     let writer_thread = std::thread::spawn(move || {
         let writer = W2mWriter::new(region_addr as *mut u8);
         for req_id in 1..=n {
-            writer.send_status(0, req_id, STATUS_OK, &pad_w);
+            writer.send_status(0, req_id, WireStatus::Ok, &pad_w);
         }
         done_w.store(true, Ordering::Release);
     });
@@ -597,7 +597,7 @@ fn w2m_control_only_reply_has_no_backing() {
     let ptr = region.ptr();
 
     let writer = W2mWriter::new(ptr);
-    writer.send_status(0, 42, STATUS_OK, b"");
+    writer.send_status(0, 42, WireStatus::Ok, b"");
 
     let receiver = W2mReceiver::new(vec![ptr]);
     let slot = receiver.try_read_slot(0).expect("an ACK");

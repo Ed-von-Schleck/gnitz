@@ -12,7 +12,7 @@ use super::*;
 use crate::connection::{Request, Session};
 use crate::protocol::message::{encode_control_block, encode_message_parts};
 use crate::protocol::transport::poll_fd;
-use crate::protocol::{decode_control_block, ColumnDef, Header, TypeCode, STATUS_ERROR, STATUS_NOT_FOUND};
+use crate::protocol::{decode_control_block, ColumnDef, Header, TypeCode, WireStatus};
 use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send};
 use gnitz_wire::RelDescriptorBlob;
 use std::collections::HashMap;
@@ -190,7 +190,7 @@ impl Peer {
         self.send(&encode_control_block(&h, "", &[]));
     }
 
-    fn reply_status(&self, target_id: u64, status: u32, text: &str) {
+    fn reply_status(&self, target_id: u64, status: WireStatus, text: &str) {
         let h = Header { status, target_id, ..Header::default() };
         self.send(&encode_control_block(&h, text, &[]));
     }
@@ -210,7 +210,15 @@ impl Peer {
             ..Default::default()
         };
         let empty = ZSetBatch::new(&schema);
-        let parts = encode_message_parts(tid, 0, 0, 0, &blob.encode(), 0, Some((&schema, &empty)));
+        let parts = encode_message_parts(
+            tid,
+            0,
+            crate::protocol::WireFlags::default(),
+            0,
+            &blob.encode(),
+            0,
+            Some((&schema, &empty)),
+        );
         self.send(&parts.to_vec());
     }
 }
@@ -325,7 +333,7 @@ fn one_poll_writes_one_request_naming_every_view() {
 /// doomed round trip.
 #[test]
 fn only_a_vanished_relation_pays_a_probe() {
-    for (status, expected) in [(STATUS_NOT_FOUND, true), (STATUS_ERROR, false)] {
+    for (status, expected) in [(WireStatus::NotFound, true), (WireStatus::Error, false)] {
         let (mut client, peer, _log) = fixture(&[(7, "v", 4)]);
         let h = std::thread::spawn(move || {
             assert_eq!(peer.expect_poll("the poll"), vec![7]);
@@ -344,15 +352,15 @@ fn only_a_vanished_relation_pays_a_probe() {
         assert_eq!(
             h.join().unwrap(),
             expected,
-            "status {status} probed the wrong number of times"
+            "status {status:?} probed the wrong number of times"
         );
         assert!(
             matches!(report.as_slice(), [o] if o.view_id == 7 && matches!(o.result, PollResult::Failed(_))),
-            "status {status}: got {report:?}",
+            "status {status:?}: got {report:?}",
         );
         assert!(
             client.mirrors(7),
-            "status {status}: a failed poll leaves the copy answering its last round",
+            "status {status:?}: a failed poll leaves the copy answering its last round",
         );
     }
 }
@@ -428,7 +436,7 @@ fn no_recovery_runs_before_every_ingest_has() {
         let ids = peer.expect_poll("the poll");
         peer.quiet("both views ride one request");
         // The first position's view is the one that vanished.
-        peer.reply_status(ids[0], STATUS_NOT_FOUND, "gone");
+        peer.reply_status(ids[0], WireStatus::NotFound, "gone");
         peer.reply_watermark(ids[1], TAG, 11);
         // Phase 2: the probe, the re-resolve it feeds, and the bootstrap.
         peer.expect_request("the probe");

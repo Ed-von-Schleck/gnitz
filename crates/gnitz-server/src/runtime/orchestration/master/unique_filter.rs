@@ -238,7 +238,7 @@ impl MasterDispatcher {
 /// of the committed table, feeding each worker's reply frames straight into
 /// the filters. Nothing is concatenated master-side: on a table of tens of
 /// millions of rows a merged `Batch` would peak at the whole scan size.
-pub(super) async fn ensure_unique_filters_warm(disp: &MasterDispatcher, table_id: i64) -> Result<(), WorkerFault> {
+pub(super) async fn ensure_unique_filters_warm(disp: &MasterDispatcher, table_id: i64) -> Result<(), WireFault> {
     let (missing, mut guard): (Vec<UniqueIndexDesc>, WarmupGuard) = {
         let mut filters = disp.unique_filters.borrow_mut();
         // Tested before it is built: the steady state is that every filter is

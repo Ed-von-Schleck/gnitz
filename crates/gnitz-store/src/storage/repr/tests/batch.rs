@@ -590,15 +590,6 @@ fn empty_batch_drop_is_noop() {
     assert_eq!(acquire_buf().capacity(), 0, "empty batch should not pollute pool");
 }
 
-/// The wire bit is a bijection over the claim: every variant survives
-/// encode→decode.
-#[test]
-fn layout_wire_flags_round_trip() {
-    for l in [Layout::Raw, Layout::Consolidated] {
-        assert_eq!(Layout::from_wire_flags(l.to_wire_flags()), l, "{l:?}");
-    }
-}
-
 // A long string (len > 12) whose blob offset lands past the empty arena reads
 // back empty, not aborts. Reachable only via corrupt wire input, so no row
 // appender can build it — hence the region-by-region write.

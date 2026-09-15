@@ -1,6 +1,6 @@
 use super::*;
 use gnitz_wire::control::DecodedControl;
-use gnitz_wire::{FLAG_CONTINUATION, FLAG_SCAN_LAST};
+use gnitz_wire::WireFlags;
 
 /// The one-U64-PK, zero-payload fixture every batch here is built over.
 fn u64_pk_only() -> SchemaDescriptor {
@@ -15,7 +15,7 @@ fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> Deco
     DecodedWire {
         control: DecodedControl {
             target_id: view_id as u64,
-            flags: FLAG_CONTINUATION | FLAG_SCAN_LAST,
+            flags: WireFlags::train_frame(0, true),
             seek_pk: source_id as u128,
             seek_col_idx: if pad { BACKFILL_PAD_BIT } else { 0 },
             ..Default::default()
@@ -44,7 +44,10 @@ fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> Decoded
     DecodedWire {
         control: DecodedControl {
             target_id: view_id as u64,
-            flags: FLAG_CONTINUATION | gnitz_wire::FLAG_BATCH_CONSOLIDATED | if last { FLAG_SCAN_LAST } else { 0 },
+            flags: WireFlags {
+                batch_consolidated: true,
+                ..WireFlags::train_frame(0, last)
+            },
             seek_pk: source_id as u128,
             ..Default::default()
         },
@@ -151,7 +154,7 @@ fn a_workers_train_completes_only_on_its_terminal_frame() {
 fn one_unconsolidated_frame_clears_the_slots_claim() {
     let mut acc = ExchangeAccumulator::new(1);
     let mut raw = make_frame(7, 3, &[1], false);
-    raw.control.flags &= !gnitz_wire::FLAG_BATCH_CONSOLIDATED;
+    raw.control.flags.batch_consolidated = false;
     raw.data_batch = Some({
         let mut b = chunk(&[1]);
         b.certify_layout(Layout::Raw);

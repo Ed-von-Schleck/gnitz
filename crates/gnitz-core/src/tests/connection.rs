@@ -1,6 +1,6 @@
 use super::*;
 
-/// Every non-OK status maps to its own error, and a `STATUS_ERROR` whose text
+/// Every non-OK status maps to its own error, and an `Error` whose text
 /// is absent or blank falls back to the default rather than surfacing a blank
 /// one — the warm-push guard's rejection must stay legible.
 ///
@@ -12,12 +12,12 @@ fn check_response_classifies_every_status() {
     use crate::protocol::message::{encode_control_block, parse_response_frame};
     use crate::protocol::Header;
 
-    let classify = |status: u32, text: &str| {
+    let classify = |status: WireStatus, text: &str| {
         let hdr = Header {
             status,
             target_id: 0,
             client_id: 0,
-            flags: 0,
+            flags: WireFlags::default(),
             seek_pk: 77,
             seek_col_idx: 0,
             request_id: 0,
@@ -30,17 +30,19 @@ fn check_response_classifies_every_status() {
     };
     let err = |status, text: &str| classify(status, text).expect_err("a non-OK status is an error");
 
-    assert!(matches!(err(STATUS_SCHEMA_MISMATCH, ""), ClientError::SchemaMismatch));
-    assert!(matches!(err(STATUS_DELTA_EXPIRED, ""), ClientError::DeltaExpired));
     assert!(matches!(
-        err(STATUS_TXN_CONFLICT, ""),
+        err(WireStatus::SchemaMismatch, ""),
+        ClientError::SchemaMismatch
+    ));
+    assert!(matches!(err(WireStatus::DeltaExpired, ""), ClientError::DeltaExpired));
+    assert!(matches!(
+        err(WireStatus::TxnConflict, ""),
         ClientError::TxnConflict { fresh_basis: 77 }
     ));
-    assert!(matches!(err(999, ""), ClientError::ServerError(m) if m.contains("unrecognized status 999")));
 
-    // The server formats real text for STATUS_SAL_FULL, and it must survive the
-    // decode: gating the text on STATUS_ERROR made `SalFull`'s payload dead.
-    let sal = err(STATUS_SAL_FULL, "SAL full: Push group did not fit");
+    // The server formats real text for `SalFull`, and it must survive the
+    // decode: gating the text on `Error` made `SalFull`'s payload dead.
+    let sal = err(WireStatus::SalFull, "SAL full: Push group did not fit");
     assert!(
         matches!(&sal, ClientError::SalFull(m) if m == "SAL full: Push group did not fit"),
         "{sal:?}"
@@ -48,11 +50,11 @@ fn check_response_classifies_every_status() {
 
     for (text, want) in [("", "unknown server error"), ("real error", "real error")] {
         assert!(
-            matches!(err(STATUS_ERROR, text), ClientError::ServerError(m) if m == want),
+            matches!(err(WireStatus::Error, text), ClientError::ServerError(m) if m == want),
             "{text:?}"
         );
     }
-    assert!(classify(STATUS_OK, "").is_ok());
+    assert!(classify(WireStatus::Ok, "").is_ok());
 }
 
 mod spine_tests {
@@ -139,25 +141,27 @@ mod spine_tests {
     }
 
     /// A reply frame carrying its schema block at `version`, data, and `lsn` in
-    /// `seek_pk`; `cont` sets `FLAG_CONTINUATION`.
+    /// `seek_pk`; `cont` sets `continuation`.
     fn reply_cold(tid: u64, version: u16, schema: &Schema, batch: &ZSetBatch, lsn: u128, cont: bool) -> Vec<u8> {
-        let mut flags = wire_flags_set_schema_version(0, version);
-        if cont {
-            flags |= FLAG_CONTINUATION;
-        }
+        let flags = WireFlags {
+            schema_version: version,
+            continuation: cont,
+            ..Default::default()
+        };
         encode_message_parts(tid, 0, flags, lsn, &[], 0, Some((schema, batch))).to_vec()
     }
 
     /// A hint-only reply frame: data, no schema block, `version` in the flags.
     fn reply_warm(tid: u64, version: u16, schema: &Schema, batch: &ZSetBatch, cont: bool) -> Vec<u8> {
-        let mut flags = wire_flags_set_schema_version(0, version);
-        if cont {
-            flags |= FLAG_CONTINUATION;
-        }
+        let flags = WireFlags {
+            schema_version: version,
+            continuation: cont,
+            ..Default::default()
+        };
         encode_message_noschema_parts(tid, 0, flags, schema, batch).to_vec()
     }
 
-    fn reply_status(status: u32, text: &str, seek_pk: u128) -> Vec<u8> {
+    fn reply_status(status: WireStatus, text: &str, seek_pk: u128) -> Vec<u8> {
         encode_control_block(&Header { status, seek_pk, ..Header::default() }, text, &[])
     }
 
@@ -303,7 +307,7 @@ mod spine_tests {
         peer.drain_request();
         peer.send(&reply_cold(1, 1, &sa, &batch_a(&[1]), 0, false));
         // The second train is replaced by one error frame and nothing follows.
-        peer.send(&reply_status(STATUS_ERROR, "relation 2 vanished", 0));
+        peer.send(&reply_status(WireStatus::Error, "relation 2 vanished", 0));
         let r = drive(&mut s, slot);
         assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m == "relation 2 vanished"));
         assert_eq!(s.interest(), Interest::NONE, "nothing left pending");
@@ -350,7 +354,7 @@ mod spine_tests {
         let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
         s.step(Interest::WRITE).unwrap();
         peer.drain_request();
-        peer.send(&reply_status(STATUS_TXN_CONFLICT, "", 77));
+        peer.send(&reply_status(WireStatus::TxnConflict, "", 77));
         let r = drive(&mut s, slot);
         assert!(
             matches!(r, Err(ClientError::TxnConflict { fresh_basis: 77 })),
@@ -564,7 +568,7 @@ mod spine_tests {
         // The server rejects the warm push; the blocking verb retries it cold.
         let h = std::thread::spawn(move || {
             peer.drain_request();
-            peer.send(&reply_status(STATUS_SCHEMA_MISMATCH, "", 0));
+            peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
             peer.drain_request();
             peer.send(&reply_ctrl(4, 555));
             peer
@@ -602,7 +606,7 @@ mod spine_tests {
         assert_eq!(peer.drain_request().len(), warm_len, "both encoded at the stale stamp");
 
         // The first mismatch fails its own slot and evicts the entry.
-        peer.send(&reply_status(STATUS_SCHEMA_MISMATCH, "", 0));
+        peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
         let mut done = s.step(Interest::READ).unwrap();
         assert_eq!(done.len(), 1);
         let (id, r) = done.pop().unwrap();
@@ -622,7 +626,7 @@ mod spine_tests {
         );
 
         // The second stale push fails too — every push encoded at the stale stamp does.
-        peer.send(&reply_status(STATUS_SCHEMA_MISMATCH, "", 0));
+        peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
         let mut done = s.step(Interest::READ).unwrap();
         assert_eq!(done.len(), 1);
         let (id, r) = done.pop().unwrap();

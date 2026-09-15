@@ -30,7 +30,7 @@ use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::Relation;
 use gnitz_store::storage::Batch;
-use gnitz_wire::{PkColList, WireFault, STATUS_OK};
+use gnitz_wire::{PkColList, WireFault};
 
 /// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
 pub(super) static RELAY_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_RELAY_HOLD_FOR_DDL");
@@ -145,7 +145,6 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
                 ipc::WireMsg {
                     client_id,
                     seek_pk: zone_lsn as u128,
-                    status: STATUS_OK,
                     ..Default::default()
                 },
             );
@@ -155,7 +154,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
             }
         }
         // `validate_unique_index_create`'s refusal keeps its own status; every
-        // other failure in the body is the untyped `STATUS_ERROR` it already was.
+        // other failure in the body is the untyped `WireStatus::Error` it already was.
         Err(f) => send_fault(peer, 0, client_id, &f),
     }
 }
@@ -342,7 +341,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         for &vid in &new_view_ids {
             cat.preflight_view_compile(vid)?;
         }
-        Ok(())
+        Ok::<_, WireFault>(())
     });
     if let Err(e) = &ingest_res {
         guard_panic("DDL-compensate", || shared.cat_mut().compensate_stage_a()).unwrap_or_else(|ce| {
@@ -430,9 +429,9 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> impl Fu
         // The wire carries the family as its tid; this is the one place the
         // typed family narrows.
         for (family, bat) in &drained {
-            disp.broadcast_ddl(&scope, family.id(), bat).map_err(|f| f.text)?;
+            disp.broadcast_ddl(&scope, family.id(), bat)?;
         }
-        Ok(())
+        Ok::<_, WireFault>(())
     });
     if let Err(e) = emitted {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);

@@ -17,7 +17,7 @@ pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
 /// Payload ceiling the client applies to a frame arriving **before** the HELLO
 /// ACK, when the peer has proved nothing yet: without it, four header bytes from
 /// an unauthenticated peer would size a 256 MB allocation. Both frames legal
-/// there — the ACK and a `STATUS_ERROR` control block — fit it. The server
+/// there — the ACK and a `WireStatus::Error` control block — fit it. The server
 /// bounds its own pre-handshake frame the same way (`HELLO_PAYLOAD_LEN`).
 pub const MAX_FRAME_PAYLOAD_PRE_HANDSHAKE: usize = 4 * 1024;
 
@@ -36,7 +36,7 @@ pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
 // Both payloads carry the standard 4-byte LE u32 length prefix, and that prefix
 // alone discriminates them from a control block, which is far larger; the magic
 // stays as defence-in-depth. The ACK carries no status — it *is* the success
-// reply, and a version/auth failure is a STATUS_ERROR control block instead.
+// reply, and a version/auth failure is a `WireStatus::Error` control block instead.
 // The `*_OFF_*` constants below ARE the field layout: encoder and decoder both
 // address through them, so neither can drift from the other.
 // ---------------------------------------------------------------------------

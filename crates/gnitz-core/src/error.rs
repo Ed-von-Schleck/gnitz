@@ -6,7 +6,7 @@ use std::fmt;
 pub enum ClientError {
     Protocol(ProtocolError), // wire / IO / decode failure
     /// Anything that fails with a message rather than a classified outcome: a
-    /// `STATUS_ERROR` the server returned, or a client-side validation the
+    /// `WireStatus::Error` the server returned, or a client-side validation the
     /// request never got past.
     ServerError(String),
     /// The session is closed and accepts no further work: a driver aborted it
@@ -24,8 +24,8 @@ pub enum ClientError {
         noun: &'static str,
         name: String,
     },
-    SchemaMismatch, // STATUS_SCHEMA_MISMATCH: server rejected schema-less PUSH
-    /// STATUS_TXN_CONFLICT: a user-table TXN failed its OCC precondition — a table
+    SchemaMismatch, // WireStatus::SchemaMismatch: server rejected schema-less PUSH
+    /// WireStatus::TxnConflict: a user-table TXN failed its OCC precondition — a table
     /// it read was written since its basis. `fresh_basis` is the server's current
     /// watermark, which the autocommit RMW retry adopts before re-reading. The
     /// human-facing message is synthesized by the SQL/Python layer (it holds the
@@ -34,7 +34,7 @@ pub enum ClientError {
         fresh_basis: u64,
     },
     /// A delta cursor that cannot be polled from. It named rounds a worker's
-    /// retention sweep has already dropped (`STATUS_DELTA_EXPIRED`); or it
+    /// retention sweep has already dropped (`WireStatus::DeltaExpired`); or it
     /// belongs to a different boot or a different relation, which `delta_poll`
     /// detects by comparing the tag the reply carries against the one the cursor
     /// holds; or it is the zero cursor, which names no copy to continue.
@@ -43,7 +43,7 @@ pub enum ClientError {
     /// local copy and bootstrap. Splitting it would make every caller catch
     /// several errors to take one branch.
     DeltaExpired,
-    /// `STATUS_SAL_FULL`: the server's shared log had no room for the group this
+    /// `WireStatus::SalFull`: the server's shared log had no room for the group this
     /// request needed to write. Its own variant because it is the one server
     /// error that clears itself — a reclaim frees the whole log within a tick —
     /// so a caller retries it where every other error must surface.

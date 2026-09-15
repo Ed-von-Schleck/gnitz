@@ -2,7 +2,7 @@
 
 `scan_many([A, B, ...])` snapshots every relation at ONE server-side SAL cut and
 streams the N reply trains in request order. The headline guarantee: an atomic
-multi-table transaction (FLAG_PUSH_TXN) is either visible in every relation's
+multi-table transaction (PUSH_TXN) is either visible in every relation's
 result or in none — never torn across the set. This is the read-side completion
 of the atomic multi-table write story.
 
@@ -229,7 +229,7 @@ def test_a_chunked_train_does_not_let_its_siblings_jump_it(reply_frame_budget_se
     """With a 16 KiB reply budget, `big` chunks into a multi-frame train per
     worker while the tiny siblings are one frame each. `scan_many([big, s...])`
     must stream in request order without wedging — the shape that deadlocks
-    without FLAG_SCAN_FIFO_REPLY, where the immediate-emit fast path would jump
+    without the `scan_fifo_reply` flag, where the immediate-emit fast path would jump
     the tiny relations ahead of big's queued chunks. Both orderings, plus a
     heap-bearing (TEXT) sibling whose own train chunks, must complete and be
     correct.

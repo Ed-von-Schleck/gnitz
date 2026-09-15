@@ -701,7 +701,7 @@ pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Resul
         return Ok(ack.published_lsn);
     }
 
-    // Not an ACK — the server sent a STATUS_ERROR control block. The frame is
+    // Not an ACK — the server sent a `WireStatus::Error` control block. The frame is
     // well-formed, so its error is the peer's refusal, not a decode failure.
     let msg = super::message::parse_response_frame(&buf, None)?.message;
     let err = msg.error_text.unwrap_or_else(|| "HELLO rejected".into());

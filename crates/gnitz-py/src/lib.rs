@@ -30,13 +30,13 @@ pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 // Every class below subclasses GnitzError, so `except GnitzError` catches them
 // all while a caller that branches on one can name it instead of matching prose.
 
-// STATUS_TXN_CONFLICT: a table the transaction read was written concurrently.
+// WireStatus::TxnConflict: a table the transaction read was written concurrently.
 // Retryable.
 pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
-// STATUS_DELTA_EXPIRED: the cursor's rounds are gone, or it names another boot
+// WireStatus::DeltaExpired: the cursor's rounds are gone, or it names another boot
 // or relation. Recovery is to bootstrap again.
 pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzError);
-// STATUS_SAL_FULL: the one server error that clears itself, so retryable.
+// WireStatus::SalFull: the one server error that clears itself, so retryable.
 pyo3::create_exception!(_native, GnitzSalFullError, GnitzError);
 // A mirror store refuses every further call that touches a copy. Recovery is
 // `close_mirror()`, and nothing else.

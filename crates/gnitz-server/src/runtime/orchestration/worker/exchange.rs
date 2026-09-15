@@ -101,16 +101,12 @@ impl WorkerProcess {
     }
 }
 
-/// One frame of a worker's exchange train, but for its payload. The schema block
-/// is not optional: the master decodes a ring slot with no hint, and rejects
-/// `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA` by aborting. `last` gates the
-/// round's bookkeeping, so a partial train cannot complete a round.
+/// One frame of a worker's exchange train, but for its payload. Every frame
+/// carries the schema block: the master decodes a ring slot with no hint.
 fn exchange_frame<'a>(view_id: i64, source_id: i64, schema_block: &'a [u8], last: bool, pad: bool) -> ipc::WireMsg<'a> {
     ipc::WireMsg {
         target_id: view_id as u64,
-        // An exchange carries no schema version, so its train flags are the bare
-        // convention `train_has_more` reads back.
-        flags: super::reply::train_flags(0, last),
+        flags: WireFlags::train_frame(0, last),
         seek_pk: source_id as u128,
         // The backfill pad bit the master ANDs across workers. A pad round is
         // empty, hence a single terminal frame, so it still rides the frame that

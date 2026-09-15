@@ -3,7 +3,7 @@ use super::error::ProtocolError;
 use super::types::{Schema, ZSetBatch};
 use super::wal_block::encode_wal_block;
 use super::WAL_BLOCK_HEADER_SIZE;
-use super::{wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK};
+use super::{Header, WireConflictMode, WireFlags, WireStatus};
 use gnitz_wire::txn_frame::WalBlock;
 
 /// One batch's region list, held for as long as the frame encoder needs it. A
@@ -35,16 +35,16 @@ impl<'a> Regioned<'a> {
 
 #[derive(Debug, Default)]
 pub struct Message {
-    pub status: u32,
+    pub status: WireStatus,
     pub target_id: u64,
-    pub flags: u64,
+    pub flags: WireFlags,
     pub seek_pk: u128,
     /// The schema, `Some` iff a schema block was physically in the frame (an
     /// `Arc` so a cache absorb is a refcount bump, not a deep copy). On a
     /// hint-only continuation frame it is `None` — the caller supplied the
     /// schema out of band.
     pub schema: Option<std::sync::Arc<Schema>>,
-    pub error_text: Option<String>, // Some(_) when status == STATUS_ERROR
+    pub error_text: Option<String>, // Some(_) when the server sent text
     /// The control block's arbitrary-length BLOB cell. On a RESOLVE reply it
     /// carries the relation-descriptor blob (`gnitz_wire::RelDescriptorBlob`);
     /// every other reply leaves it empty.
@@ -128,8 +128,8 @@ impl MessageParts {
 }
 
 /// The one frame encoder: control block + optional schema block + optional data
-/// block, without the 4-byte frame header. `FLAG_HAS_SCHEMA` / `FLAG_HAS_DATA`
-/// are derived here, so no caller sets them.
+/// block, without the 4-byte frame header. `has_schema` / `has_data` are
+/// derived here, so no caller sets them.
 ///
 /// `seek_pk` / `seek_col_idx` address a SEEK; `seek_pk_extra` is the control
 /// block's arbitrary-length BLOB cell. `schema_block` is what rides in the
@@ -139,7 +139,7 @@ impl MessageParts {
 fn encode_parts(
     target_id: u64,
     client_id: u64,
-    flags: u64,
+    flags: WireFlags,
     seek_pk: u128,
     seek_col_idx: u64,
     seek_pk_extra: &[u8],
@@ -147,18 +147,15 @@ fn encode_parts(
     data: Option<(&Schema, &ZSetBatch)>,
 ) -> MessageParts {
     let data = data.filter(|(_, b)| !b.is_empty());
-    let mut flags_out = flags;
-    if !schema_block.is_empty() {
-        flags_out |= FLAG_HAS_SCHEMA;
-    }
-    if data.is_some() {
-        flags_out |= FLAG_HAS_DATA;
-    }
     let ctrl_hdr = Header {
-        status: STATUS_OK,
+        status: WireStatus::Ok,
         target_id,
         client_id,
-        flags: flags_out,
+        flags: WireFlags {
+            has_schema: !schema_block.is_empty(),
+            has_data: data.is_some(),
+            ..flags
+        },
         seek_pk,
         seek_col_idx,
         request_id: 0,
@@ -174,7 +171,7 @@ fn encode_parts(
 /// `ClientTransport::send_parts`, or hand them to the outbound queue, for
 /// framing.
 ///
-/// `seek_pk` / `seek_pk_extra` carry the seek key for `FLAG_SEEK` frames,
+/// `seek_pk` / `seek_pk_extra` carry the seek key for a `ClientVerb::Seek` frame,
 /// already in the wire's two-field form
 /// (`gnitz_wire::control::split_ctrl_key`); a non-seek frame passes `(0, &[])`.
 ///
@@ -184,7 +181,7 @@ fn encode_parts(
 pub fn encode_message_parts(
     target_id: u64,
     client_id: u64,
-    flags: u64,
+    flags: WireFlags,
     seek_pk: u128,
     seek_pk_extra: &[u8],
     seek_col_idx: u64,
@@ -202,15 +199,12 @@ pub fn encode_message_parts(
     )
 }
 
-/// Like [`encode_message_parts`] but omits the schema block from the frame.
-/// The data block is still encoded using `data_schema`; the server
-/// reconstructs the schema from its catalog (guided by the schema version in
-/// `flags`). Used by warm-cache PUSH paths where the server already knows
-/// the schema (version embedded in `flags` bits 24-39).
+/// [`encode_message_parts`] without the schema block: the server decodes the data
+/// against its catalog schema at `flags.schema_version`.
 pub fn encode_message_noschema_parts(
     target_id: u64,
     client_id: u64,
-    flags: u64,
+    flags: WireFlags,
     data_schema: &Schema,
     data_batch: &ZSetBatch,
 ) -> MessageParts {
@@ -226,7 +220,7 @@ pub fn encode_message_noschema_parts(
     )
 }
 
-/// Encode an atomic user-table push transaction frame (`FLAG_PUSH_TXN`) into
+/// Encode an atomic user-table push transaction frame (`ClientVerb::PushTxn`) into
 /// wire bytes (without the 4-byte frame header). Adapts the client's
 /// `(&Schema, &ZSetBatch)` families to the pre-encoded blocks the shared
 /// `gnitz_wire::txn_frame` codec bundles — the frame layout itself lives there,
@@ -239,21 +233,22 @@ pub fn encode_push_txn(
     // Every family's regions are live at once: the frame is sized from all of
     // them and then each batch is framed straight into it, so a batch is copied
     // once instead of once into a per-family block and again into the frame.
-    let parts: Vec<(u8, Vec<u8>, Regioned<'_>)> = families
+    let parts: Vec<(WireConflictMode, Vec<u8>, Regioned<'_>)> = families
         .iter()
         .map(|(tid, schema, batch, mode)| {
             (
-                mode.as_wire(),
+                *mode,
                 encode_schema_block(schema, *tid as u32),
                 Regioned::new(*tid, batch, super::regions::regions(batch)),
             )
         })
         .collect();
-    let refs: Vec<(u8, &[u8], WalBlock<'_>)> = parts.iter().map(|(m, sb, r)| (*m, &sb[..], r.wal())).collect();
+    let refs: Vec<(WireConflictMode, &[u8], WalBlock<'_>)> =
+        parts.iter().map(|(m, sb, r)| (*m, &sb[..], r.wal())).collect();
     gnitz_wire::txn_frame::encode_push_txn(client_id, &refs, preconditions)
 }
 
-/// Encode an atomic DDL transaction frame (`FLAG_DDL_TXN`) into wire bytes
+/// Encode an atomic DDL transaction frame (`ClientVerb::DdlTxn`) into wire bytes
 /// (without the 4-byte frame header). Every system-table write — a `CREATE`'s N
 /// family batches, a `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single batch — is
 /// carried by one such frame so the server ingests the whole bundle under one
@@ -277,7 +272,7 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> 
 pub(crate) fn encode_control_frame(
     target_id: u64,
     client_id: u64,
-    flags: u64,
+    flags: WireFlags,
     seek_pk: u128,
     seek_col_idx: u64,
     seek_pk_extra: &[u8],
@@ -355,25 +350,23 @@ pub(crate) fn parse_response_frame(buf: &[u8], cached_version: Option<u16>) -> R
     let (ctrl_header, error_msg, seek_pk_extra) = decode_control_block(ctrl)?;
 
     let flags = ctrl_header.flags;
-    let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
-    let has_data = (flags & FLAG_HAS_DATA) != 0;
 
     let mut off = ctrl_size;
     let mut wire_schema: Option<Schema> = None;
 
-    if has_schema {
+    if flags.has_schema {
         let block = gnitz_wire::wal::block_slice_at(buf, off)?;
         off += block.len();
         wire_schema = Some(schema_from_block(block)?);
-    } else if has_data {
+    } else if flags.has_data {
         // A hint-only frame: the caller decodes it against the schema it already
         // holds, so all this leg checks is that the stamp still matches.
         let Some(cached) = cached_version else {
             return Err(ProtocolError::DecodeError(
-                "FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema".into(),
+                "a data block without a schema block and no cached schema".into(),
             ));
         };
-        let server_version = wire_flags_get_schema_version(flags);
+        let server_version = flags.schema_version;
         if server_version != cached {
             return Err(ProtocolError::DecodeError(format!(
                 "schema version mismatch: cached={cached} server={server_version}"
@@ -381,7 +374,7 @@ pub(crate) fn parse_response_frame(buf: &[u8], cached_version: Option<u16>) -> R
         }
     }
 
-    let data_block = if has_data {
+    let data_block = if flags.has_data {
         let block = gnitz_wire::wal::block_slice_at(buf, off)?;
         Some(off..off + block.len())
     } else {
@@ -390,7 +383,7 @@ pub(crate) fn parse_response_frame(buf: &[u8], cached_version: Option<u16>) -> R
 
     // Every non-OK status the server emits rides a control-only frame, so both
     // blocks are already absent and there is nothing to suppress. Keyed on the
-    // text being present rather than on `STATUS_ERROR`: STATUS_SAL_FULL carries
+    // text being present rather than on `WireStatus::Error`: `SalFull` carries
     // server-formatted text too, and gating on one status dropped it.
     let error_text = (!error_msg.is_empty()).then_some(error_msg);
 
