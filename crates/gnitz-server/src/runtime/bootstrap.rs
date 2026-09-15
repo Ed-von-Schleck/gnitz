@@ -147,6 +147,7 @@ fn recover_from_sal(
     // previously-used epoch, so every group a walk sees carries the same width.
     let mut replayed: u32 = 0;
     let mut resliced_from: Option<u32> = None;
+    let mut rows: Vec<Vec<u32>> = Vec::new();
     for msg in tail.groups() {
         let tid = msg.target_id as i64;
         // The catalog's schema, not the wire's: only the catalog stamps the
@@ -177,13 +178,11 @@ fn recover_from_sal(
                 batch = batch.widened_with_null_tail(&schema);
             }
             let owned = if reslice {
-                // Re-cut with the write path's own router, so what survives is exactly
-                // what the master would have written to this rank's slot: same
-                // distribution-prefix hash, same key→worker map.
-                let mb = batch.as_mem_batch();
-                crate::runtime::master::scatter::with_worker_indices(&batch, &schema, slot.of as usize, |wi| {
-                    Batch::from_indexed_rows(&mb, &wi[slot.rank as usize], &schema)
-                })
+                // The write path's own router, so what survives is exactly what the master
+                // would have written to this rank's slot.
+                let slots = gnitz_store::ops::reset_slots(&mut rows, slot.of as usize);
+                gnitz_store::storage::route_rows_by_pk(&batch.as_mem_batch(), &schema, slots);
+                batch.ascending_subset(&slots[slot.rank as usize])
             } else {
                 batch
             };
@@ -511,7 +510,7 @@ fn master_post_fork_recovery(
         BOOT_READY_REQUEST_ID,
         "the ready ACKs name the reactor's first lease"
     );
-    disp.collect_exclusive(&ready, 1, "recovery sync", false)
+    disp.collect_exclusive(&ready, "recovery sync", false)
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
     drop(ready);
 

@@ -3,9 +3,13 @@
 //! query, seed, and invalidate the per-`(table, col_indices)` filters (the
 //! preflight seed path shares the types).
 
+use rustc_hash::FxHashSet;
+
+use super::train::drain_index_scan;
 use super::*;
 use gnitz_store::relation::Relation;
-use gnitz_store::schema::key::probe_key;
+use gnitz_store::schema::key::{probe_key, PkBuf};
+use gnitz_store::schema::IndexKeySpec;
 
 // For each `(table_id, col_indices)` we keep a set of the OPK spans known to
 // exist in that unique index. The U-SEC rule (`plan_unique_checks`)
@@ -69,7 +73,7 @@ impl UniqueFilter {
     }
 
     /// True once the filter has exceeded `cap` and disabled itself.
-    pub(crate) fn capped(&self) -> bool {
+    pub(super) fn capped(&self) -> bool {
         self.values.is_none()
     }
 
@@ -89,7 +93,7 @@ impl UniqueFilter {
     /// owes. A fingerprint collision, and every span once the filter caps,
     /// reports true: one spurious broadcast, exactly what a true hit costs.
     /// There is no false negative, so a present span is never proven absent.
-    pub(crate) fn may_contain(&self, span: &[u8]) -> bool {
+    pub(super) fn may_contain(&self, span: &[u8]) -> bool {
         self.values
             .as_ref()
             .is_none_or(|values| values.contains(&probe_key(span)))
@@ -271,26 +275,20 @@ impl MasterDispatcher {
         };
         let schema = self.schema_desc_for(table_id);
         // The reader holds the table's current schema, so no worker ships a block.
-        let (_, schema_version) = self.cat().negotiated_schema_block(table_id, 0, |_| None);
+        let schema_version = self.cat().get_schema_version(table_id);
 
-        let route = self.read_route(table_id, None);
-        let leases = self
-            .scan_cut(1, |cut| {
-                cut.push(route.set, |excl, targets| {
-                    excl.write(&DirectGroup {
-                        template: wire::WireMsg {
-                            target_id: table_id as u64,
-                            flags: WireFlags { schema_version, ..Default::default() },
-                            ..Default::default()
-                        },
-                        targets,
-                        ..DirectGroup::new(SalMessageKind::Scan)
-                    })
-                })
+        let lease = self
+            .scan(DirectGroup {
+                template: wire::WireMsg {
+                    target_id: table_id as u64,
+                    flags: WireFlags { schema_version, ..Default::default() },
+                    ..Default::default()
+                },
+                ..DirectGroup::new(SalMessageKind::Scan)
             })
             .await?;
 
-        drain_index_scan(&leases[0], "scan", &schema, |mb| {
+        drain_index_scan(&lease, "scan", &schema, |mb| {
             let mut filters = self.unique_filters.borrow_mut();
             for d in &guard.missing {
                 if let Some(filter) = filters.get_mut(&(table_id, d.cols)) {

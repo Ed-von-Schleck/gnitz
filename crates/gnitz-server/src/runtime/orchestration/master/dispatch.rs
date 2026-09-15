@@ -4,11 +4,18 @@
 
 use std::time::{Duration, Instant};
 
-use super::exchange::ExchangeAccumulator;
+use super::exchange::{ExchangeAccumulator, PendingRelay};
+use super::scatter::{with_commit_indices, with_group};
 use super::*;
+use crate::query::RelayRoute;
+use crate::runtime::orchestration::guard_panic;
+use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{select2, Either};
+use crate::runtime::sal::{SalFit, SalScope};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
+use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, ScatterSpec};
+use gnitz_store::relation::Relation;
 
 /// One round of a checkpoint.
 #[derive(Clone, Copy)]
@@ -53,20 +60,13 @@ pub(crate) const WORKER_WATCH: Duration = Duration::from_millis(100);
 static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW");
 
 /// A `u64` from the OS entropy pool for [`MasterDispatcher::delta_cursor_tag`],
-/// whose doc states what the tag is for. From the OS rather than from a seeded
-/// generator because two back-to-back boots must not collide. A short read or an
-/// unavailable pool falls back to the boot's wall clock and pid, which is weaker
-/// but still distinguishes two boots of one machine.
+/// so two back-to-back boots cannot collide.
 fn boot_nonce() -> u64 {
     let mut bytes = [0u8; 8];
-    let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-    if n == bytes.len() as isize {
-        return u64::from_ne_bytes(bytes);
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    nanos ^ ((std::process::id() as u64) << 32)
+    let n = retry_eintr(|| unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) } as libc::c_int)
+        .expect("getrandom");
+    assert_eq!(n as usize, bytes.len(), "getrandom returns up to 256 bytes whole");
+    u64::from_ne_bytes(bytes)
 }
 
 impl MasterDispatcher {
@@ -100,8 +100,9 @@ impl MasterDispatcher {
     /// The catalog behind the raw pointer the dispatcher was constructed with.
     /// The pointer is dereferenced here and nowhere else on the master side —
     /// every other master-side name for the catalog is a wrapper around this
-    /// accessor, not a second owner of the pointer. Sound because the master
-    /// reactor is single-threaded and the catalog outlives the dispatcher.
+    /// accessor, not a second owner of the pointer. The catalog outlives the
+    /// dispatcher. No reference this returns may be alive across another `cat()`
+    /// call, in an argument list or in a callee.
     #[allow(clippy::mut_from_ref)]
     pub(crate) fn cat(&self) -> &mut CatalogEngine {
         unsafe { &mut *self.catalog }
@@ -117,7 +118,8 @@ impl MasterDispatcher {
     /// the table, so the SAL write paths (commit/tick/broadcast) pay neither a
     /// block encode nor a per-column walk per group.
     fn wire_schema(&self, target_id: i64) -> wire::WireSchema {
-        wire::WireSchema::from_catalog(self.cat(), target_id, self.schema_desc_for(target_id))
+        let descriptor = self.schema_desc_for(target_id);
+        wire::WireSchema::from_catalog(self.cat(), target_id, descriptor)
     }
 
     // -----------------------------------------------------------------------
@@ -133,7 +135,7 @@ impl MasterDispatcher {
         self.sal.num_workers()
     }
 
-    /// The next exchange round `lease`'s first `n` ids wait on, or `None` once all have
+    /// The next exchange round `lease`'s ids wait on, or `None` once all have
     /// answered. A worker ACKs a tick or backfill only after its relays are written, so
     /// `None` leaves no partial round in `acc`.
     ///
@@ -142,11 +144,10 @@ impl MasterDispatcher {
     pub(crate) async fn next_relay(
         &self,
         lease: &Lease,
-        n: usize,
         ctx: &str,
         acc: &mut ExchangeAccumulator,
     ) -> Result<Option<PendingRelay>, WireFault> {
-        let mut acks = std::pin::pin!(lease.acks(n, |w, c| worker_error(w, ctx, c)));
+        let mut acks = std::pin::pin!(lease.acks(ctx));
         loop {
             match select2(acks.as_mut(), self.reactor.next_exchange()).await {
                 Either::A(r) => return r.map(|()| None),
@@ -159,7 +160,7 @@ impl MasterDispatcher {
         }
     }
 
-    /// Block until `lease`'s first `n` ids have answered, relaying each round inline;
+    /// Block until `lease`'s ids have answered, relaying each round inline;
     /// nothing else on the reactor runs. Fails on a worker's error ACK or death.
     ///
     /// `checkpoint_allowed`: a backfill may stamp CHECKPOINT to reclaim SAL
@@ -171,7 +172,6 @@ impl MasterDispatcher {
     pub(crate) fn collect_exclusive(
         &self,
         lease: &Lease,
-        n: usize,
         ctx: &str,
         checkpoint_allowed: bool,
     ) -> Result<(), WireFault> {
@@ -184,7 +184,7 @@ impl MasterDispatcher {
                 // expect. A bare `checkpoint_reset`, never `checkpoint_post_ack`: a
                 // mid-backfill flush would orphan unconsumed backfill groups.
                 let mut pending_reset = false;
-                while let Some(relay) = self.next_relay(lease, n, ctx, &mut acc).await? {
+                while let Some(relay) = self.next_relay(lease, ctx, &mut acc).await? {
                     let mut excl = self.sal.lock_exclusive();
                     if std::mem::take(&mut pending_reset) {
                         excl.checkpoint_reset();
@@ -198,7 +198,8 @@ impl MasterDispatcher {
                     let decision = if all_pad {
                         BackfillDecision::Stop
                     } else if checkpoint_allowed
-                        && (self.sal.fit_relay(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
+                        && (prep.with_group(BackfillDecision::Continue, |g| self.sal.fit_relay(g)) != SalFit::Fits
+                            || BACKFILL_RELAY_SPACE_LOW.armed())
                     {
                         pending_reset = true;
                         BackfillDecision::Checkpoint
@@ -209,7 +210,7 @@ impl MasterDispatcher {
                 }
                 Ok::<(), WireFault>(())
             };
-            match select2(collect, self.round_failure(lease, n, ctx)).await {
+            match select2(collect, self.round_failure(lease, ctx)).await {
                 Either::A(r) => r,
                 Either::B(e) => Err(e),
             }
@@ -219,10 +220,10 @@ impl MasterDispatcher {
     /// Resolves once a worker has answered `lease` with an error or has died, probing
     /// every `WORKER_WATCH`. A worker failing before it joins a round leaves the others
     /// in their exchange wait, so an error must end the round without the other ACKs.
-    async fn round_failure(&self, lease: &Lease, n: usize, ctx: &str) -> WireFault {
+    async fn round_failure(&self, lease: &Lease, ctx: &str) -> WireFault {
         loop {
             self.reactor.timer(Instant::now() + WORKER_WATCH).await;
-            if let Some(e) = lease.first_error(n, |w, c| worker_error(w, ctx, c)) {
+            if let Some(e) = lease.first_error(ctx) {
                 return e;
             }
             if let Some(w) = self.check_workers() {
@@ -241,7 +242,7 @@ impl MasterDispatcher {
     ) -> Result<(), WireFault> {
         let lease = self.reactor.lease_acks(1, WorkerSet::ALL);
         write(&self.sal.lock_exclusive(), GroupTargets::all(lease.id(0)))?;
-        self.collect_exclusive(&lease, 1, ctx, checkpoint_allowed)
+        self.collect_exclusive(&lease, ctx, checkpoint_allowed)
     }
 
     // -----------------------------------------------------------------------
@@ -318,12 +319,7 @@ impl MasterDispatcher {
         })?;
         // `excl` is held through the ACKs, so its drop would wake too late.
         excl.wake();
-        match select2(
-            lease.acks(1, |w, c| worker_error(w, ctx, c)),
-            self.round_failure(&lease, 1, ctx),
-        )
-        .await
-        {
+        match select2(lease.acks(ctx), self.round_failure(&lease, ctx)).await {
             Either::A(r) => r?,
             Either::B(e) => return Err(e),
         }
@@ -360,36 +356,6 @@ impl MasterDispatcher {
     // Exchange relay
     // -----------------------------------------------------------------------
 
-    /// Build the SAL group an exchange relay writes and hand it to `f`: sizing and
-    /// emission both go through here, so the bytes checked are the bytes written.
-    /// `arg0` echoes `source_id`, so a join's wait cannot take another source's relay.
-    fn with_relay_group<R>(
-        &self,
-        view: &wire::WireSchema,
-        source_id: i64,
-        dest: &RelayDest,
-        decision: BackfillDecision,
-        f: impl FnOnce(&DirectGroup) -> R,
-    ) -> R {
-        let template = view.frame(wire::WireMsg {
-            arg0: source_id as u64,
-            flags: WireFlags { backfill: decision, ..Default::default() },
-            ..Default::default()
-        });
-        let group = |data| DirectGroup {
-            template,
-            data,
-            ..DirectGroup::new(SalMessageKind::ExchangeRelay)
-        };
-        match dest {
-            RelayDest::Broadcast(b) => f(&group(GroupData::Same(wire::WireData::Whole(b)))),
-            RelayDest::PerWorker(batches) => {
-                let slots: Vec<wire::WireData> = batches.iter().map(wire::WireData::Whole).collect();
-                f(&group(GroupData::PerWorker(&slots)))
-            }
-        }
-    }
-
     /// Scatter a completed round into the group [`Self::emit_relay`] writes.
     /// Aborts on failure, naming `ctx`: every worker is parked on this relay.
     pub(crate) fn prepare_relay(&self, relay: PendingRelay, ctx: &str) -> RelayPrepared {
@@ -423,7 +389,6 @@ impl MasterDispatcher {
             } else {
                 op_repartition_batches(&sources, spec, &schema, num_workers)
             }
-            .map(RelayDest::PerWorker)
         };
 
         let (dag, registry) = cat.dag_and_registry_mut();
@@ -441,7 +406,7 @@ impl MasterDispatcher {
                      scatter key co-partitions it"
                 ))
             }
-            RelayRoute::Broadcast => Ok(RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema)))),
+            RelayRoute::Broadcast => Ok(vec![op_relay_broadcast(&sources, &schema)]),
             RelayRoute::GroupKey(cols) => scatter(ScatterSpec::GroupKey(cols)),
             RelayRoute::JoinKey(slots) => scatter(ScatterSpec::JoinKey(slots)),
         };
@@ -449,28 +414,19 @@ impl MasterDispatcher {
         // and the bound it missed.
         let dest = dest.map_err(|e| format!("view {view_id}: source {source_id} relay key: {e}"))?;
 
-        // Encoded once and carried forward: `emit_relay` runs the same group
-        // again — twice more when a reclaim barrier forces a retry — and every
-        // pass would otherwise rebuild these identical bytes.
-        let view = wire::WireSchema::encoded(view_id, schema);
-
-        // Size the group here, before the SAL is taken: the batches are in hand,
-        // so the fit check under the hold is a comparison rather than a sizing
-        // pass.
-        let footprint = self.with_relay_group(&view, source_id, &dest, BackfillDecision::Continue, |g| {
-            self.sal.footprint(g)
-        });
-
-        Ok(RelayPrepared { view, source_id, dest, footprint })
+        Ok(RelayPrepared {
+            view: wire::WireSchema::encoded(view_id, schema),
+            source_id,
+            dest,
+        })
     }
 
     /// Write a prepared relay stamped with `decision`. Aborts on failure, as
     /// [`Self::prepare_relay`] does.
     pub(crate) fn emit_relay(&self, excl: &SalExcl<'_>, prep: &RelayPrepared, decision: BackfillDecision) {
-        guard_panic("emit_relay", || {
-            self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| excl.write(g))
+        guard_panic("emit_relay", || prep.with_group(decision, |g| excl.write(g))).unwrap_or_else(|e| {
+            gnitz_fatal_abort!("emit_relay: {e}; a lost relay wedges workers blocked in exchange wait")
         })
-        .unwrap_or_else(|e| gnitz_fatal_abort!("emit_relay: {e}; a lost relay wedges workers blocked in exchange wait"))
     }
 
     // -----------------------------------------------------------------------
@@ -529,12 +485,14 @@ impl MasterDispatcher {
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.
     pub(crate) fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), WireFault> {
-        let (dag, registry) = self.cat().dag_and_registry_mut();
         let mut ordered = view_ids.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
         for vid in ordered {
-            let sources = dag.get_source_ids(registry, vid);
+            let sources = {
+                let (dag, registry) = self.cat().dag_and_registry_mut();
+                dag.get_source_ids(registry, vid)
+            };
             for src in sources {
                 self.fan_out_backfill(vid, src).map_err(|e| WireFault {
                     status: e.status,
@@ -553,28 +511,19 @@ impl MasterDispatcher {
         })
     }
 
-    /// Send a scan-shaped read to `route` and forward the replies to `peer`;
+    /// Send a scan-shaped read of `kind` and forward the replies to `peer`;
     /// `Ok(false)` on a client disconnect.
     pub(crate) async fn fan_out_scan(
         &self,
-        route: ReadRoute,
         peer: &Peer,
         kind: SalMessageKind,
         template: wire::WireMsg<'_>,
     ) -> Result<bool, WireFault> {
-        let leases = self
-            .scan_cut(1, |cut| {
-                cut.push(route.set, |excl, targets| {
-                    excl.write(&DirectGroup {
-                        template,
-                        extras: route.per_worker.as_deref(),
-                        targets,
-                        ..DirectGroup::new(kind)
-                    })
-                })
-            })
-            .await?;
-        forward_scan(peer, &leases[0]).await
+        forward_scan(
+            peer,
+            &self.scan(DirectGroup { template, ..DirectGroup::new(kind) }).await?,
+        )
+        .await
     }
 
     /// Broadcast a DDL batch to every worker inside `scope`'s zone — one LSN
@@ -741,10 +690,6 @@ impl MasterDispatcher {
         recoverable: bool,
     ) -> Result<(), WireFault> {
         let relation = self.wire_schema(target_id);
-        // Identical scatter for both routings; only the per-worker index fill
-        // differs (full broadcast vs PK-partitioned). One `with_group` call site
-        // keeps the atomic-zone framing, LSN, ACK accounting, and the committer's
-        // single `fdatasync` shared between them.
         let group = DirectGroup {
             targets: GroupTargets::all(request_id),
             ..DirectGroup::new(SalMessageKind::Push)

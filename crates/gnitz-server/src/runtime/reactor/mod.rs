@@ -35,7 +35,7 @@ mod wake_queue;
 
 pub(crate) use conn::{shutdown, SendBody};
 
-pub(crate) use futures::Lease;
+pub(crate) use futures::{worker_error, Lease};
 use futures::{OpFuture, Route, RouteKey, TimerFuture};
 use park::ParkMap;
 use runloop::{RunQueue, REACTOR_RUN_QUEUE};

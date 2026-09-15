@@ -602,9 +602,9 @@ impl WorkerProcess {
     // ── Request handlers ───────────────────────────────────────────────
 
     fn handle_push(&mut self, target_id: i64, batch: Batch) -> Result<(), String> {
-        // Master pre-partitions Push rows in `scatter::with_group`,
-        // so every slot already contains only this worker's rows. A second
-        // partition-hash filter here would be pure overhead.
+        // The master's `with_commit_indices` sends a keyed table's worker exactly
+        // the rows `route_rows_by_pk` assigns it, and a replicated table's worker
+        // the whole batch, so the slot is what this worker ingests.
         if batch.is_empty() {
             return Ok(());
         }

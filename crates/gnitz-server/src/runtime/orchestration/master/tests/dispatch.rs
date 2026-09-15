@@ -207,7 +207,7 @@ fn read_route_reaches_the_owners_a_bound_names() {
 
     let replicated = keyed.with_placement(Placement::Replicated);
     for blob in [None, Some(set_blob(&[1, 2, 3]))] {
-        let r = route_read(Some(replicated), blob.as_deref(), NW);
+        let r = route_read(&replicated, blob.as_deref(), NW);
         assert_eq!((r.set, r.per_worker.is_none()), (WorkerSet::one(0), true), "replicated");
     }
 
@@ -218,18 +218,18 @@ fn read_route_reaches_the_owners_a_bound_names() {
     )))
     .encode(&block);
     assert_eq!(
-        route_read(Some(keyed), Some(&point), NW).set,
+        route_read(&keyed, Some(&point), NW).set,
         WorkerSet::one(owner(42)),
         "confined range"
     );
 
     assert_eq!(
-        route_read(Some(keyed), Some(&set_blob(&[42])), NW).set,
+        route_read(&keyed, Some(&set_blob(&[42])), NW).set,
         WorkerSet::one(owner(42)),
         "one owner"
     );
     assert_eq!(
-        route_read(Some(keyed), Some(&set_blob(&[])), NW).set,
+        route_read(&keyed, Some(&set_blob(&[])), NW).set,
         WorkerSet::one(0),
         "empty set"
     );
@@ -239,7 +239,7 @@ fn read_route_reaches_the_owners_a_bound_names() {
         .map(|k| (0, k))
         .find(|&(_, k)| owner(k) != owner(0))
         .expect("keys spread");
-    let spread = route_read(Some(keyed), Some(&set_blob(&[a, b])), NW);
+    let spread = route_read(&keyed, Some(&set_blob(&[a, b])), NW);
     assert_eq!(spread.set, WorkerSet::one(owner(a)).with(owner(b)));
     let per_worker = spread.per_worker.expect("a spread set splits");
     assert_eq!(per_worker.len(), NW);
@@ -256,19 +256,14 @@ fn read_route_reaches_the_owners_a_bound_names() {
 
     let local = keyed.with_placement(Placement::Local);
     assert_eq!(
-        route_read(Some(local), Some(&set_blob(&[a, b])), NW).set,
+        route_read(&local, Some(&set_blob(&[a, b])), NW).set,
         WorkerSet::ALL,
         "Local"
     );
     let wide = crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U128]);
     assert_eq!(
-        route_read(Some(wide), Some(&set_blob(&[a, b])), NW).set,
+        route_read(&wide, Some(&set_blob(&[a, b])), NW).set,
         WorkerSet::ALL,
         "a foreign stride"
-    );
-    assert_eq!(
-        route_read(None, None, NW).set,
-        WorkerSet::ALL,
-        "an unregistered relation"
     );
 }

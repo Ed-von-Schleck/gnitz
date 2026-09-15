@@ -1,6 +1,7 @@
 use super::super::fixtures::{make_row_batch, two_col_schema};
 use super::*;
 use crate::runtime::test_support::try_poll_once;
+use gnitz_wire::WireStatus;
 
 // Synthetic-train pattern: anonymous-mmap W2M rings (no fork), frames
 // pre-written via W2mWriter, the drain driven by a single manual poll with
@@ -287,7 +288,7 @@ fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
     fx.route();
 
     let before = fx.receiver.release_cursor(0);
-    let drained = poll_once(drain_scan_train(&fx.peer, &fx.lease, 0)).expect("healthy train");
+    let drained = poll_once(forward_scan(&fx.peer, &fx.lease)).expect("healthy train");
     assert!(drained, "the train drained without a client disconnect");
     assert!(
         fx.receiver.release_cursor(0) > before,

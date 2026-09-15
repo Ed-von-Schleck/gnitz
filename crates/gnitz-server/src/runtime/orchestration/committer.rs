@@ -27,7 +27,6 @@
 use super::executor::{request_drain, request_quiesce, Shared};
 use super::guard_panic;
 use super::TxnFamily;
-use crate::runtime::master::worker_error;
 use crate::runtime::master::FlushRound;
 use crate::runtime::reactor::{chan, oneshot, select2, Either, Lease};
 use crate::runtime::sal::{SalScope, WorkerSet};
@@ -553,7 +552,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         for unit in &mut units {
             let downgrade = matches!(unit.outcome, Outcome::Pushes(_));
             for g in unit.live_mut() {
-                let Err(e) = g.req_ids.acks(1, |w, c| worker_error(w, "commit", c)).await else {
+                let Err(e) = g.req_ids.acks("commit").await else {
                     continue;
                 };
                 if downgrade {

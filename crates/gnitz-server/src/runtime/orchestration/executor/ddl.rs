@@ -313,16 +313,18 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
     let view_prio = SysFamily::View.topo_priority();
     let mut drained_sources = false;
     let ingest_res = guard_panic("DDL", || {
-        let cat = shared.cat_mut();
         for (family, fbatch) in ordered {
             if view_create && !drained_sources && family.topo_priority() >= view_prio {
-                let (dag, reg) = cat.dag_and_registry_mut();
-                for src in dag.base_tables_reachable_from(reg, new_view_ids.clone()) {
+                let sources = {
+                    let (dag, reg) = shared.cat_mut().dag_and_registry_mut();
+                    dag.base_tables_reachable_from(reg, new_view_ids.clone())
+                };
+                for src in sources {
                     shared.disp().drain_tick_blocking(src)?;
                 }
                 drained_sources = true;
             }
-            cat.submit(family, fbatch)?;
+            shared.cat_mut().submit(family, fbatch)?;
         }
         // Compile every new view's circuit here, on the master, while the bundle
         // is still undoable. VIEW_TAB has been applied, so each view is registered
@@ -332,7 +334,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
         // after the DDL is durable, where it can be nothing but a log line and a
         // view that returns no rows forever.
         for &vid in &new_view_ids {
-            cat.preflight_view_compile(vid)?;
+            shared.cat_mut().preflight_view_compile(vid)?;
         }
         Ok::<_, WireFault>(())
     });

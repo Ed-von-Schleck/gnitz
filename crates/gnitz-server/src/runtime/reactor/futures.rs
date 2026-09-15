@@ -1,10 +1,24 @@
 //! Reactor futures: W2M routes and their [`Lease`], and the futures woken by a
 //! CQE, a routed frame or a passed deadline.
 
+use std::ops::Range;
+
 use gnitz_wire::control::DecodedControl;
+use gnitz_wire::{WireFault, WireStatus};
 
 use super::*;
 use crate::runtime::sal::WorkerSet;
+
+/// Worker `w`'s reply as a fault, keeping its status, or `None` when it succeeded.
+pub(crate) fn worker_error(w: usize, op: &str, ctrl: &DecodedControl) -> Option<WireFault> {
+    (ctrl.hdr.status != WireStatus::Ok).then(|| {
+        let msg = String::from_utf8_lossy(&ctrl.blob);
+        WireFault {
+            status: ctrl.hdr.status,
+            text: format!("worker {w}: {op}: {msg}"),
+        }
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Routes + Lease
@@ -64,22 +78,18 @@ impl Lease {
         (self.base..self.base + n as u32).flat_map(move |id| self.workers().map(move |w| (id, w as u32)))
     }
 
-    /// Once every worker has ACKed each of the first `n` ids, `check` each in
-    /// id-then-worker order, returning the first `Some` as `Err`.
-    pub(crate) async fn acks<E>(
-        &self,
-        n: usize,
-        mut check: impl FnMut(usize, &DecodedControl) -> Option<E>,
-    ) -> Result<(), E> {
-        debug_assert!(n <= self.len as usize);
-        let keys: Vec<RouteKey> = self.keys(n).collect();
-        // Every key below `next` is answered; only `next`'s route holds a waker.
-        let mut next = 0;
+    /// Once every worker has ACKed each of the lease's ids, the first failed ACK
+    /// in id-then-worker order as `Err`, its text naming `ctx`.
+    pub(crate) async fn acks(&self, ctx: &str) -> Result<(), WireFault> {
+        // Every key before the peeked one is answered; only its route holds a waker.
+        let mut pending = self.keys(self.len as usize).peekable();
         std::future::poll_fn(|cx| {
             let mut routes = self.inner.routes.borrow_mut();
-            while let Some(key) = keys.get(next) {
+            while let Some(key) = pending.peek() {
                 match routes.get_mut(key).expect("a leased id is routed") {
-                    Route::Ack { ack: Some(_), .. } => next += 1,
+                    Route::Ack { ack: Some(_), .. } => {
+                        pending.next();
+                    }
                     Route::Ack { ack: None, waker } => {
                         park_waker(waker, cx.waker());
                         return Poll::Pending;
@@ -88,24 +98,43 @@ impl Lease {
                 }
             }
             drop(routes);
-            Poll::Ready(self.first_error(n, &mut check).map_or(Ok(()), Err))
+            Poll::Ready(self.first_error(ctx).map_or(Ok(()), Err))
         })
         .await
     }
 
-    /// The first failed ACK among the first `n` ids that have arrived, in
-    /// id-then-worker order.
-    pub(crate) fn first_error<E>(
-        &self,
-        n: usize,
-        mut check: impl FnMut(usize, &DecodedControl) -> Option<E>,
-    ) -> Option<E> {
+    /// The first failed ACK among the lease's ids that have arrived, in
+    /// id-then-worker order, its text naming `ctx`.
+    pub(crate) fn first_error(&self, ctx: &str) -> Option<WireFault> {
         let routes = self.inner.routes.borrow();
         // By reference: the verdict stays in the route until the lease drops.
-        self.keys(n).find_map(|key| match routes.get(&key) {
-            Some(Route::Ack { ack: Some(ctrl), .. }) => check(key.1 as usize, ctrl),
+        self.keys(self.len as usize).find_map(|key| match routes.get(&key) {
+            Some(Route::Ack { ack: Some(ctrl), .. }) => worker_error(key.1 as usize, ctx, ctrl),
             _ => None,
         })
+    }
+
+    /// Release every id past the first `n`.
+    pub(crate) fn truncate(&mut self, n: usize) {
+        debug_assert!(n <= self.len as usize);
+        self.release(self.base + n as u32..self.base + self.len);
+        self.len = n as u32;
+    }
+
+    /// Remove `ids`' routes, then wake the `trains_idle` awaiter.
+    fn release(&self, ids: Range<u32>) {
+        {
+            let mut routes = self.inner.routes.borrow_mut();
+            for id in ids {
+                for w in self.workers() {
+                    routes.remove(&(id, w as u32));
+                }
+            }
+        }
+        // Every lease, not only a train: the waiter re-checks the routes itself.
+        if let Some(w) = self.inner.trains_idle.take() {
+            w.wake();
+        }
     }
 
     /// Worker `w`'s next frame on the lease's first id.
@@ -117,16 +146,7 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        {
-            let mut routes = self.inner.routes.borrow_mut();
-            for key in self.keys(self.len as usize) {
-                routes.remove(&key);
-            }
-        }
-        // Every lease, not only a train: the waiter re-checks the routes itself.
-        if let Some(w) = self.inner.trains_idle.take() {
-            w.wake();
-        }
+        self.release(self.base..self.base + self.len);
     }
 }
 

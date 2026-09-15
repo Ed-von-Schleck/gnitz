@@ -809,6 +809,62 @@ fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
     });
 }
 
+/// A replicated push lays out one payload every worker is sent — a whole batch
+/// for a German-string schema, which cannot scatter in one copy — and every
+/// worker's slot decodes to the batch's live rows, a weight-0 row dropped.
+#[test]
+fn a_replicated_push_sends_every_worker_the_live_rows() {
+    use crate::runtime::wire::{decode_sal_slot, WireData};
+    use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::storage::BatchBuilder;
+    use gnitz_wire::type_code;
+
+    let nw = 4;
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    )
+    .with_placement(Placement::Replicated);
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, weight, s) in [
+        (1, 1, "a string past the inline prefix"),
+        (2, 0, "dropped"),
+        (3, 2, "c"),
+    ] {
+        bb.begin_row(pk, weight);
+        bb.put_string(s);
+        bb.end_row();
+    }
+    let batch = bb.finish();
+
+    let log = TestLog::new(1 << 20, nw, 1);
+    log.push_group(5, 16, schema, &batch, |g| {
+        assert!(
+            matches!(g.data, GroupData::Same(WireData::Whole(_))),
+            "a replicated string push sends every worker one whole batch"
+        );
+        log.writer.write(g)
+    });
+
+    let msg = group_at(log.log(), 0);
+    let mut slots = 0;
+    for (w, bytes) in msg.slots_written() {
+        slots += 1;
+        let rows = decode_sal_slot(bytes)
+            .expect("every written slot decodes")
+            .data_batch
+            .expect("every slot carries rows");
+        let got: Vec<(u128, i64)> = (0..rows.len())
+            .map(|i| (gnitz_wire::widen_pk_be(rows.get_pk_bytes(i)), rows.get_weight(i)))
+            .collect();
+        assert_eq!(got, vec![(1, 1), (3, 2)], "worker {w} holds exactly the live rows");
+    }
+    assert_eq!(slots, nw, "every worker is sent the batch");
+}
+
 /// A `Push` slot the scatter gave no rows carries a control block and nothing
 /// else: the schema block would describe data the slot does not hold, and every
 /// consumer reaches its own no-op before asking for one. An `ExchangeRelay`'s

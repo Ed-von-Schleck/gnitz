@@ -230,6 +230,15 @@ impl<'a> GroupData<'a> {
     /// A control-only group: every slot is a bare control block.
     pub(crate) const NONE: Self = Self::Same(WireData::None);
 
+    /// Worker `w`'s payload `slots[w]`, or — for a single slot — the one
+    /// payload every worker is sent.
+    pub(crate) fn of(slots: &'a [WireData<'a>]) -> Self {
+        match slots {
+            [one] => GroupData::Same(*one),
+            each => GroupData::PerWorker(each),
+        }
+    }
+
     /// True when no slot carries a row — the one shape allowed to omit a schema.
     fn is_dataless(&self) -> bool {
         match *self {
@@ -490,6 +499,11 @@ impl SalMessageKind {
             Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | Backfill | UniquePreflight | Tick
             | ScanSpec | DeltaRead | ZoneCommit => true,
         }
+    }
+
+    /// Whether the template's blob is a `ReadSpec` whose bound routes the read.
+    pub(crate) const fn carries_read_bound(self) -> bool {
+        matches!(self, SalMessageKind::ScanSpec)
     }
 }
 
@@ -921,10 +935,14 @@ impl SalWriter {
         }
     }
 
-    /// Whether a relay of `need` bytes may be written, refusing also while less
-    /// than the reclaim margin is free, so a reclaim lands on a writer with room
-    /// to spare.
-    pub(crate) fn fit_relay(&self, need: usize) -> SalFit {
+    /// Whether relay group `g` may be written, refusing also while less than the
+    /// reclaim margin is free, so a reclaim lands on a writer with room to spare.
+    pub(crate) fn fit_relay(&self, g: &DirectGroup) -> SalFit {
+        self.fit_relay_bytes(self.footprint(g))
+    }
+
+    /// [`Self::fit_relay`] for a relay of `need` bytes.
+    fn fit_relay_bytes(&self, need: usize) -> SalFit {
         self.fit_within(
             effective_max(SalMessageKind::ExchangeRelay, self.mmap_size),
             need.max(self.reclaim_margin()),
@@ -940,7 +958,7 @@ impl SalWriter {
     /// Less than the reclaim margin is free, so a relay-sized group would be
     /// refused.
     pub(crate) fn below_reclaim_margin(&self) -> bool {
-        self.fit_relay(0) != SalFit::Fits
+        self.fit_relay_bytes(0) != SalFit::Fits
     }
 
     /// The margin below which the SAL is "running low": one eighth of the
@@ -1135,7 +1153,7 @@ impl SalWriter {
     /// The exact number of SAL bytes [`Self::write`] will consume for `g`.
     /// Neither the sentinel nor the checkpoint band is included; both are held
     /// back by the fit check.
-    pub(crate) fn footprint(&self, g: &DirectGroup) -> usize {
+    fn footprint(&self, g: &DirectGroup) -> usize {
         let nw = self.num_workers;
         let mut sizes = [0u32; MAX_WORKERS];
         g.slot_sizes_into(&mut sizes[..nw]);

@@ -8,8 +8,14 @@
 
 use super::*;
 
+use super::train::Train;
 use super::unique_filter::UNIQUE_FILTER_CAP;
+use crate::runtime::w2m::W2mSlot;
 use gnitz_store::relation::Relation;
+use gnitz_store::schema::key::PkBuf;
+use gnitz_store::schema::make_index_schema;
+use gnitz_store::storage::MAX_BATCH_REGIONS;
+use gnitz_wire::control::DecodedControl;
 
 /// The `what` every unique pre-flight frame error is prefixed with.
 const OP_UNIQUE_PREFLIGHT: &str = "unique pre-flight";
@@ -18,9 +24,9 @@ const OP_UNIQUE_PREFLIGHT: &str = "unique pre-flight";
 ///
 /// The frame's key region is an offset into the pinned ring slot rather than a
 /// borrowed view, so there is no self-reference and no drop-order contract.
-struct PreflightKeyStream {
-    /// The worker whose train this reads.
-    worker: usize,
+struct PreflightKeyStream<'l> {
+    /// The worker's train this reads.
+    train: Train<'l>,
     /// The frame currently being read; pins its ring bytes until replaced.
     slot: Option<W2mSlot>,
     /// Byte offset of the frame's PK region into the slot, and its key count;
@@ -30,32 +36,32 @@ struct PreflightKeyStream {
     count: usize,
     /// Cursor into the current frame's keys.
     row: usize,
-    /// A frame is still owed: no frame attached yet, or the current one's
-    /// `scan_last` is clear.
-    has_more: bool,
 }
 
-impl PreflightKeyStream {
-    fn new(worker: usize) -> Self {
+impl<'l> PreflightKeyStream<'l> {
+    fn new(train: Train<'l>) -> Self {
         PreflightKeyStream {
-            worker,
+            train,
             slot: None,
             pk_off: 0,
             count: 0,
             row: 0,
-            has_more: true,
         }
     }
 
     /// Install `slot` as the current frame, locating its key region.
-    /// A fault/corrupt/undecodable frame is an immediate `Err` — the caller
-    /// unwinds to the scan lease's drop, which discards the undrained trains.
-    fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), WireFault> {
+    /// An undecodable frame is an immediate `Err` — the caller unwinds to the
+    /// scan lease's drop, which discards the undrained trains.
+    fn attach_frame(
+        &mut self,
+        slot: W2mSlot,
+        ctrl: &DecodedControl,
+        frame_schema: &SchemaDescriptor,
+    ) -> Result<(), WireFault> {
         self.row = 0;
         self.count = 0;
-        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let (has_more, batch) = decode_train_slot(&slot, OP_UNIQUE_PREFLIGHT, frame_schema, &mut offsets)?;
-        self.has_more = has_more;
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        let batch = self.train.rows(&slot, ctrl, frame_schema, &mut offsets)?;
         let bytes = slot.bytes();
         if let Some(mb) = batch {
             let pk = mb.pk();
@@ -77,7 +83,7 @@ impl PreflightKeyStream {
 
     /// Yield this worker's next span, pulling continuation frames on demand.
     /// Returns `Ok(None)` once the train is terminal.
-    async fn next_key(&mut self, frame_schema: &SchemaDescriptor, scan: &Lease) -> Result<Option<PkBuf>, WireFault> {
+    async fn next_key(&mut self, frame_schema: &SchemaDescriptor) -> Result<Option<PkBuf>, WireFault> {
         let pk_stride = frame_schema.pk_stride();
         loop {
             if self.row < self.count {
@@ -85,12 +91,11 @@ impl PreflightKeyStream {
                 self.row += 1;
                 return Ok(Some(key));
             }
-            if !self.has_more {
+            let Some((slot, ctrl)) = self.train.next().await? else {
                 self.slot = None; // release the ring slot at the train's end
                 return Ok(None);
-            }
-            let slot = scan.next_frame(self.worker).await;
-            self.attach_frame(slot, frame_schema)?;
+            };
+            self.attach_frame(slot, &ctrl, frame_schema)?;
         }
     }
 }
@@ -99,9 +104,9 @@ impl PreflightKeyStream {
 /// seed collection, fed keys in globally-sorted merge order. Split from the
 /// frame-pulling loop so the verdict and the all-or-nothing seed rule are
 /// directly testable with a small cap.
-pub(crate) struct PreflightAccumulator {
+pub(super) struct PreflightAccumulator {
     prev: Option<PkBuf>,
-    pub(crate) duplicate: bool,
+    pub(super) duplicate: bool,
     /// The filter this pre-flight will publish. `insert` owns the cap
     /// discipline: on overflow it drops the set whole and disables itself, so
     /// the seed is never truncated — a truncated seed would publish a warm but
@@ -165,14 +170,17 @@ async fn merge_index_scan(scan: &Lease, frame_schema: &SchemaDescriptor) -> Resu
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    let mut streams: Vec<PreflightKeyStream> = scan.workers().map(PreflightKeyStream::new).collect();
+    let mut streams: Vec<PreflightKeyStream> = scan
+        .workers()
+        .map(|w| PreflightKeyStream::new(Train::new(scan, w, OP_UNIQUE_PREFLIGHT)))
+        .collect();
 
     // Ordered by (span, stream index) — byte-lexicographic via `PkBuf: Ord` —
     // so equal spans pop adjacently whichever workers hold them. The tie-break
     // is the stream's position in `streams`.
     let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(streams.len());
     for (i, s) in streams.iter_mut().enumerate() {
-        if let Some(key) = s.next_key(frame_schema, scan).await? {
+        if let Some(key) = s.next_key(frame_schema).await? {
             heap.push(Reverse((key, i)));
         }
     }
@@ -182,7 +190,7 @@ async fn merge_index_scan(scan: &Lease, frame_schema: &SchemaDescriptor) -> Resu
         if !acc.offer(key) {
             break;
         } // first duplicate is conclusive
-        if let Some(next) = streams[i].next_key(frame_schema, scan).await? {
+        if let Some(next) = streams[i].next_key(frame_schema).await? {
             heap.push(Reverse((next, i)));
         }
     }
@@ -241,41 +249,35 @@ impl MasterDispatcher {
             // build, so the frame schema agrees by construction. `packed` is
             // the column list the worker resolves the seek by.
             (
-                gnitz_store::schema::make_index_schema(col_indices, &owner_schema)?,
+                make_index_schema(col_indices, &owner_schema)?,
                 gnitz_wire::pack_pk_cols(col_indices),
             )
         };
-        let frame_schema = unique_preflight_wire_schema(&idx_schema, col_indices.len());
+        let frame_schema = wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
-        // Single-source a REPLICATED owner: under a fan-out each distinct value
-        // would arrive `nw` times and pop adjacently in the merge —
-        // `PreflightAccumulator::offer` reads that as a duplicate and fails the
+        // The read routes a REPLICATED owner to one worker: under a fan-out each
+        // distinct value would arrive `nw` times and pop adjacently in the merge
+        // — `PreflightAccumulator::offer` reads that as a duplicate and fails the
         // CREATE on a genuinely unique table. The count-agnostic merge still
         // catches real within-copy duplicates via the same adjacent-equal
         // check, and the seed reflects true cardinality. Hashed owners keep the
         // full fan-out (genuine cross-partition duplicates surface as equal
         // spans from different workers).
-        let route = self.read_route(owner_id, None);
-
-        let leases = self
-            .scan_cut(1, |cut| {
-                cut.push(route.set, |excl, targets| {
-                    // The worker's `UniquePreflight` arm resolves the owner's
-                    // schema from its own catalog.
-                    excl.write(&DirectGroup {
-                        template: wire::WireMsg {
-                            target_id: owner_id as u64,
-                            arg1: packed,
-                            ..Default::default()
-                        },
-                        targets,
-                        ..DirectGroup::new(SalMessageKind::UniquePreflight)
-                    })
-                })
+        //
+        // The worker's `UniquePreflight` arm resolves the owner's schema from its
+        // own catalog.
+        let lease = self
+            .scan(DirectGroup {
+                template: wire::WireMsg {
+                    target_id: owner_id as u64,
+                    arg1: packed,
+                    ..Default::default()
+                },
+                ..DirectGroup::new(SalMessageKind::UniquePreflight)
             })
             .await?;
 
-        let merged = merge_index_scan(&leases[0], &frame_schema).await?;
+        let merged = merge_index_scan(&lease, &frame_schema).await?;
         if merged.duplicate {
             return Err(self.cat().unique_create_dup_err(owner_id, col_indices).into());
         }

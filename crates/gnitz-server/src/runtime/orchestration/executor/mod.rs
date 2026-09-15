@@ -761,7 +761,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
         return Ok(());
     }
 
-    let req_ids = shared.disp().reactor().lease_acks(tids.len(), WorkerSet::ALL);
+    let mut req_ids = shared.disp().reactor().lease_acks(tids.len(), WorkerSet::ALL);
 
     let _cat_read = shared.catalog_rwlock.read().await;
     let excl = shared.disp().sal().lock().await;
@@ -787,6 +787,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
     drop(_cat_read);
 
     let n = emitted.get();
+    req_ids.truncate(n);
     // The un-emitted tids never reached a worker, so they still need ticking. An
     // emitted tid is already being ticked by the workers (its group is
     // published), and `handle_tick` has taken its delta, so re-queueing it would
@@ -794,7 +795,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
     shared.requeue_tick_tids(&tids[n..]);
 
     let worker_err = loop {
-        match shared.disp().next_relay(&req_ids, n, "tick", acc).await {
+        match shared.disp().next_relay(&req_ids, "tick", acc).await {
             Ok(Some(relay)) => relay_steady(shared, relay).await,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
@@ -836,7 +837,7 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
         {
             let disp = shared.disp();
             let excl = disp.sal().lock().await;
-            let mut fit = disp.sal().fit_relay(prep.footprint);
+            let mut fit = prep.with_group(BackfillDecision::Continue, |g| disp.sal().fit_relay(g));
             if inject_low {
                 inject_low = false;
                 fit = SalFit::Transient;
@@ -1183,13 +1184,12 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
         return;
     }
 
-    let (sal_kind, route, blob) = match seek {
+    let (sal_kind, blob) = match seek {
         Some((spec, schema)) => {
             let block = shared.cat_mut().schema_wire_entry(target_id, &schema).block;
-            let blob = spec.encode(&block);
-            (SalMessageKind::ScanSpec, disp.read_route(target_id, Some(&blob)), blob)
+            (SalMessageKind::ScanSpec, spec.encode(&block))
         }
-        None => (SalMessageKind::Scan, disp.read_route(target_id, None), Vec::new()),
+        None => (SalMessageKind::Scan, Vec::new()),
     };
 
     let (server_version, prelim) = schema_block_for_reply(shared, target_id, client_version);
@@ -1206,7 +1206,7 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
         blob: &blob,
         ..Default::default()
     };
-    let result = disp.fan_out_scan(route, peer, sal_kind, template).await;
+    let result = disp.fan_out_scan(peer, sal_kind, template).await;
     finish_scan_fanout(peer, target_id, lsn, result).await;
 }
 
@@ -1733,7 +1733,6 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob
         return;
     };
     let lsn = shared.last_tick_lsn.get();
-    let route = shared.disp().read_route(target_id, Some(blob));
     let template = ipc::WireMsg {
         target_id: target_id as u64,
         blob,
@@ -1741,7 +1740,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob
     };
     let result = shared
         .disp()
-        .fan_out_scan(route, peer, SalMessageKind::ScanSpec, template)
+        .fan_out_scan(peer, SalMessageKind::ScanSpec, template)
         .await;
     finish_scan_fanout(peer, target_id, lsn, result).await;
 }
@@ -1819,18 +1818,15 @@ async fn delta_poll_body(
             disp.scan_cut(moved.len(), |cut| {
                 round = disp.last_tick_round();
                 for item in &moved {
-                    cut.push(disp.read_route(item.view_id as i64, None).set, |excl, targets| {
-                        excl.write(&DirectGroup {
-                            template: ipc::WireMsg {
-                                target_id: item.view_id,
-                                arg0: round,
-                                arg1: item.after_tick,
-                                blob: item.reply_block,
-                                ..Default::default()
-                            },
-                            targets,
-                            ..DirectGroup::new(SalMessageKind::DeltaRead)
-                        })
+                    cut.read(DirectGroup {
+                        template: ipc::WireMsg {
+                            target_id: item.view_id,
+                            arg0: round,
+                            arg1: item.after_tick,
+                            blob: item.reply_block,
+                            ..Default::default()
+                        },
+                        ..DirectGroup::new(SalMessageKind::DeltaRead)
                     })?;
                 }
                 Ok(())
@@ -1963,19 +1959,16 @@ async fn scan_multi_body(
         let dispatches = disp
             .scan_cut(plans.len(), |cut| {
                 for plan in &plans {
-                    cut.push(disp.read_route(plan.tid, None).set, |excl, targets| {
-                        excl.write(&DirectGroup {
-                            template: ipc::WireMsg {
-                                target_id: plan.tid as u64,
-                                flags: WireFlags {
-                                    schema_version: plan.server_version,
-                                    ..Default::default()
-                                },
+                    cut.read(DirectGroup {
+                        template: ipc::WireMsg {
+                            target_id: plan.tid as u64,
+                            flags: WireFlags {
+                                schema_version: plan.server_version,
                                 ..Default::default()
                             },
-                            targets,
-                            ..DirectGroup::new(SalMessageKind::Scan)
-                        })
+                            ..Default::default()
+                        },
+                        ..DirectGroup::new(SalMessageKind::Scan)
                     })?;
                 }
                 Ok(())

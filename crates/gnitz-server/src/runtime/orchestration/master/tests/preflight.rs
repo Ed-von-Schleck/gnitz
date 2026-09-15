@@ -123,11 +123,9 @@ fn rows_of_names_every_row_a_key_prefixes() {
     let keys = [key(1, 0), key(3, 1), key(3, 1), key(3, 9), key(7, 0)];
     let check = PipelinedCheck {
         keyspace: Keyspace::OwnPk,
-        mode: gnitz_wire::WireProbeMode::Exists,
-        mode_param: 0,
+        probe: Probe::Exists,
         batch: build_check_batch_pk_bytes(&schema, keys.iter().map(|k| &k[..])),
         schema: wire::WireSchema::encoded(1, schema),
-        reply: None,
     };
     assert_eq!(check.rows_of(&key(3, 1)), 1..3, "a duplicate key");
     assert_eq!(check.rows_of(&key(3, 2)), 3..3, "an absent key");

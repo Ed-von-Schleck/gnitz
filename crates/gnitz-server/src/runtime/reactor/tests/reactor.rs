@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
-use gnitz_wire::WireStatus;
+use gnitz_wire::{WireFault, WireStatus};
 
 /// A lease routes `n` consecutive ids, each for every worker of its set, for
 /// exactly its own life, and the next lease starts past them.
@@ -40,11 +40,11 @@ fn a_lease_routes_consecutive_ids_until_dropped() {
 fn an_ack_landing_before_its_awaiter_is_kept() {
     let (r, writers) = reactor_with_rings(1);
     let lease = r.lease_acks(1, WorkerSet::ALL);
-    writers[0].send_status(0, lease.id(0), WireStatus::Ok, &[]);
+    writers[0].send_status(0, lease.id(0), WireStatus::Error, &[]);
     r.drain_all_w2m();
 
     assert!(
-        matches!(try_poll_once(lease.acks(1, |_, _| Some(()))), Some(Err(()))),
+        matches!(try_poll_once(lease.acks("test")), Some(Err(_))),
         "an ACK drained before its awaiter must be there on the first poll"
     );
 }
@@ -55,9 +55,7 @@ fn an_ack_landing_before_its_awaiter_is_kept() {
 fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
     let (r, writers) = reactor_with_rings(2);
     let lease = r.lease_acks(1, WorkerSet::ALL);
-    let mut fut = std::pin::pin!(lease.acks(1, |w, c| {
-        (c.hdr.status != WireStatus::Ok).then(|| (w, String::from_utf8_lossy(&c.blob).into_owned()))
-    }));
+    let mut fut = std::pin::pin!(lease.acks("test"));
     let waker = make_waker(0);
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
@@ -76,7 +74,10 @@ fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
         "the last ACK wakes the awaiter"
     );
     match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(Err((w, msg))) => assert_eq!((w, msg.as_str()), (1, "boom")),
+        Poll::Ready(Err(e)) => {
+            assert!(e.text.contains("worker 1"), "the fault names its ring: {e}");
+            assert!(e.text.contains("boom"), "the fault carries the worker message: {e}");
+        }
         _ => panic!("the fault must resolve the wait, named after its ring"),
     }
 }
@@ -99,7 +100,7 @@ fn an_unrouted_frame_is_released_undecoded() {
 fn exchange_frames_queue_by_ring_id_tagged_with_their_worker() {
     let (r, writers) = reactor_with_rings(2);
     let lease = r.lease_acks(1, WorkerSet::ALL);
-    let mut acks = std::pin::pin!(lease.acks(1, |_, _| None::<()>));
+    let mut acks = std::pin::pin!(lease.acks("test"));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(acks.as_mut().poll(&mut cx).is_pending());
 
@@ -125,7 +126,7 @@ fn exchange_frames_queue_by_ring_id_tagged_with_their_worker() {
 fn acks_parks_only_on_the_first_unanswered_id() {
     let (r, writers) = reactor_with_rings(1);
     let lease = r.lease_acks(3, WorkerSet::ALL);
-    let mut fut = std::pin::pin!(lease.acks(3, |_, _| None::<()>));
+    let mut fut = std::pin::pin!(lease.acks("test"));
     let waker = make_waker(7);
     let mut cx = Context::from_waker(&waker);
     let parked = |i: usize| match &r.inner.routes.borrow()[&(lease.id(i), 0)] {
@@ -222,7 +223,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
         r.spawn(async move {
             // Published during the poll, after this tick's own drain.
             writer.send_status(0, id, WireStatus::Ok, &[]);
-            lease.acks(1, |_, _| None::<()>).await.expect("an OK ACK");
+            lease.acks("test").await.expect("an OK ACK");
             d.set(true);
         });
         r.tick(true);
@@ -306,38 +307,38 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     let reactor = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
     // A fresh reactor's first lease is 1..=N, which is what the child publishes.
     let lease = Rc::new(reactor.lease_acks(N_MESSAGES as usize, WorkerSet::ALL));
-    let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+    let outcome: Rc<RefCell<Option<Result<(), WireFault>>>> = Rc::new(RefCell::new(None));
     // A oneshot rather than a polling watcher: a watcher that yields re-arms
     // its own waker every poll, so the run queue never empties and the
     // `FUTEX_WAITV` arm this test exists to stress never happens.
     let (done_tx, done_rx) = oneshot::channel::<()>();
     {
-        let (lease, received) = (Rc::clone(&lease), Rc::clone(&received));
+        let (lease, outcome) = (Rc::clone(&lease), Rc::clone(&outcome));
         reactor.spawn(async move {
-            let mut got = Vec::new();
-            let _ = lease
-                .acks(N_MESSAGES as usize, |_, c| {
-                    got.push(c.hdr.target_id);
-                    None::<()>
-                })
-                .await;
-            *received.borrow_mut() = got;
+            *outcome.borrow_mut() = Some(lease.acks("stress").await);
             done_tx.send(());
         });
     }
 
     let timeout = reactor.timer(Instant::now() + TIMEOUT);
-    let outcome = reactor.block_on(select2(done_rx, timeout));
-    if let Either::B(()) = outcome {
+    if let Either::B(()) = reactor.block_on(select2(done_rx, timeout)) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!("reactor stalled after {TIMEOUT:?} — lost-wake symptom");
     }
 
-    assert_eq!(
-        *received.borrow(),
-        (1..=N_MESSAGES).collect::<Vec<u64>>(),
-        "every published req_id must round-trip"
-    );
+    assert!(matches!(*outcome.borrow(), Some(Ok(()))), "every ACK is OK");
+    // Each id's stored ACK is the one the child published for it.
+    let routes = reactor.inner.routes.borrow();
+    for i in 0..N_MESSAGES as usize {
+        let id = lease.id(i);
+        match &routes[&(id, 0)] {
+            Route::Ack { ack: Some(ctrl), .. } => {
+                assert_eq!(ctrl.hdr.target_id, id as u64, "every published req_id must round-trip")
+            }
+            _ => panic!("id {id} has no stored ACK"),
+        }
+    }
+    drop(routes);
 
     unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
 }
