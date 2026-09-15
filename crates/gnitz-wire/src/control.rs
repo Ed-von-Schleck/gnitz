@@ -22,13 +22,15 @@
 //!   u64::MAX   -- unused; master->worker only, a reply's ring prefix being 32-bit
 //!   other      -- master-allocated, monotonic per request
 
+use std::ops::Range;
+
 use crate::catalog::col;
+use crate::german_string::german_spill_len;
 use crate::wal::IPC_CONTROL_TID;
 use crate::{
-    checksum, encode_german_string_cell, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireFlags,
-    WireStatus, WireSysCol, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
-    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE,
-    WAL_OFF_TID, WAL_OFF_VERSION,
+    checksum, encode_german_string_cell, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WalError,
+    WireFlags, WireStatus, WireSysCol, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, WAL_FORMAT_VERSION,
+    WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 const CONTROL_COLS: &[WireSysCol] = &[
@@ -135,16 +137,6 @@ const OFF_REQUEST_ID: usize = ctrl_region_offset(REG_REQUEST_ID);
 const OFF_ERROR_MSG: usize = ctrl_region_offset(REG_ERROR_MSG);
 const OFF_SEEK_PK_EXTRA: usize = ctrl_region_offset(REG_SEEK_PK_EXTRA);
 
-/// Blob bytes a German string of length `len` spills into the shared blob
-/// region: 0 when it fits the 12-byte inline form, its full length otherwise.
-pub(crate) const fn german_spill_len(len: usize) -> usize {
-    if len > SHORT_STRING_THRESHOLD {
-        len
-    } else {
-        0
-    }
-}
-
 /// Total encoded size of a control block carrying an `error_msg` /
 /// `seek_pk_extra` of the given byte lengths. The blob region is the last
 /// region and every fixed region is 8-aligned, so the size is the no-blob
@@ -229,10 +221,7 @@ const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
 /// Otherwise additionally write the German-string structs, clear the
 /// corresponding null bits, and append the blob spill.
 ///
-/// `checksum` stamps the header's checksum field over the encoded body, as
-/// `wal::encode` and `schema_block::encode` do for the blocks beside this
-/// one: `true` for what [`peek_control_block`] reads back, `false` for
-/// [`peek_control_block_ipc`].
+/// `checksum` stamps the body checksum [`peek_control_block`] verifies.
 #[inline]
 pub fn encode_ctrl_block(
     out: &mut [u8],
@@ -343,21 +332,8 @@ const DIR_FIXED_END: usize = crate::wal::dir_entry_offset(REG_BLOB) + 4;
 /// template is rejected rather than followed: honouring one would let a peer
 /// point a scalar field at the blob heap.
 ///
-/// Verifies the block's checksum, like the schema and data blocks beside it —
-/// use this on frames that crossed a durability or trust boundary (SAL replay,
-/// client ingress). For frames written by `encode_ipc`, which leaves the
-/// checksum zero, use [`peek_control_block_ipc`].
-pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
-    peek_control_block_impl(data, true)
-}
-
-/// [`peek_control_block`] without checksum verification, for the intra-process
-/// frames `encode_ipc` writes: the W2M ring and client egress.
-pub fn peek_control_block_ipc(data: &[u8]) -> Result<DecodedControl, &'static str> {
-    peek_control_block_impl(data, false)
-}
-
-fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<DecodedControl, &'static str> {
+/// `verify_checksum`: only a zoned SAL slot carries one.
+pub fn peek_control_block(data: &[u8], verify_checksum: bool) -> Result<DecodedControl, &'static str> {
     let dir_end = crate::wal::body_start(NUM_REGIONS);
     if data.len() < dir_end {
         return Err("control block too small");
@@ -448,6 +424,29 @@ fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<Decoded
         seek_pk_extra,
         block_size,
     })
+}
+
+/// Where the blocks after `ctrl` sit in `frame`: the schema block, then the data
+/// block, each present exactly when its flag is set.
+pub struct FrameBlocks {
+    pub schema: Option<Range<usize>>,
+    pub data: Option<Range<usize>>,
+}
+
+/// Locate the blocks after the control block `ctrl` was peeked from.
+pub fn frame_blocks(frame: &[u8], ctrl: &DecodedControl) -> Result<FrameBlocks, WalError> {
+    let mut off = ctrl.block_size;
+    let mut next = |present: bool| -> Result<Option<Range<usize>>, WalError> {
+        if !present {
+            return Ok(None);
+        }
+        let len = crate::wal::block_slice_at(frame, off)?.len();
+        let r = off..off + len;
+        off += len;
+        Ok(Some(r))
+    };
+    let schema = next(ctrl.flags.has_schema)?;
+    Ok(FrameBlocks { schema, data: next(ctrl.flags.has_data)? })
 }
 
 impl DecodedControl {

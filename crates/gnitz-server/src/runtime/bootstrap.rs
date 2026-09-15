@@ -37,7 +37,7 @@ use gnitz_store::storage::{Batch, Slot};
 /// pass 1 demoted the last zone if it was torn, so a block that fails here has a
 /// durable committed zone behind it, and skipping it would lose an ACKed write.
 fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, String> {
-    ipc::decode_wire(data).map_err(|e| {
+    ipc::decode_sal_slot(data, true).map_err(|e| {
         format!(
             "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
             msg.base, msg.lsn, msg.target_id

@@ -105,7 +105,7 @@ pub(crate) fn with_group<R>(
     f: impl FnOnce(&DirectGroup) -> R,
 ) -> R {
     debug_assert!(
-        matches!(base.data, GroupData::Same(WireData::Whole(None))),
+        matches!(base.data, GroupData::Same(WireData::None)),
         "with_group replaces `data` with the per-worker slices; setting it on `base` is dead"
     );
     let schema = relation.descriptor();
@@ -129,10 +129,10 @@ pub(crate) fn with_group<R>(
     let worker_data: Vec<WireData> = if sub_batches.is_empty() {
         worker_indices
             .iter()
-            .map(|indices| WireData::Scattered { batch, indices, schema })
+            .map(|indices| WireData::Scattered { batch, indices })
             .collect()
     } else {
-        sub_batches.iter().map(|b| WireData::Whole(Some(b))).collect()
+        sub_batches.iter().map(WireData::Whole).collect()
     };
 
     f(&DirectGroup {

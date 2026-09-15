@@ -104,9 +104,8 @@ fn prologue(client_id: u64, verb: ClientVerb, count: usize, body_hint: usize) ->
     };
     let ctrl_len = ctrl_block_size(0, 0);
     let mut w = Writer::with_capacity(ctrl_len + 4 + body_hint);
-    // Written into the frame, not into a scratch `Vec` and copied in. A client
-    // request frame carries a body checksum, as its WAL blocks do.
-    encode_ctrl_block(w.reserve(ctrl_len), 0, &hdr, &[], &[], true);
+    // Written into the frame, not into a scratch `Vec` and copied in.
+    encode_ctrl_block(w.reserve(ctrl_len), 0, &hdr, &[], &[], false);
     w.u32(count as u32);
     w
 }
@@ -132,9 +131,8 @@ impl WalBlock<'_> {
     }
 
     /// Frame this block into `dst`, which must be exactly [`Self::size`] bytes.
-    /// `checksum = true`: client frames always carry a body checksum.
     fn write(&self, dst: &mut [u8]) {
-        crate::wal::encode(dst, 0, self.table_id, self.entry_count, self.regions, true)
+        crate::wal::encode(dst, 0, self.table_id, self.entry_count, self.regions, false)
             .expect("WAL encode: the frame reserved block_size_of bytes");
     }
 }
@@ -248,8 +246,8 @@ pub fn encode_delta_poll(client_id: u64, views: &[DeltaPollItem<'_>]) -> Vec<u8>
 /// so every caller may `Vec::with_capacity(count)` directly and a hostile count
 /// cannot force a giant pre-allocation on an ingress-capped frame.
 ///
-/// The control block is validated (version, region count, checksum) but not
-/// returned — a caller that needs the routing header already peeked it.
+/// The control block is validated (version, region count) but not returned — a
+/// caller that needs the routing header already peeked it.
 ///
 /// `max_items` is the format's own ceiling on the count, or `usize::MAX` where
 /// only the frame bounds it.
@@ -259,9 +257,9 @@ fn decode_prologue(
     min_item_bytes: usize,
     max_items: usize,
 ) -> Result<(usize, usize), String> {
-    let ctrl = wal::block_slice_at(data, 0).map_err(|e| format!("{ctx}: control block: {e}"))?;
-    peek_control_block(ctrl).map_err(|e| format!("{ctx}: {e}"))?;
-    let off = ctrl.len();
+    let off = peek_control_block(data, false)
+        .map_err(|e| format!("{ctx}: {e}"))?
+        .block_size;
     if off + 4 > data.len() {
         return Err(format!("{ctx}: item count truncated"));
     }
@@ -279,16 +277,6 @@ fn decode_prologue(
     Ok((count, off))
 }
 
-/// Walk to the block at `off`, verifying its body checksum — here at the frame
-/// walk, not in the caller's later decode, which runs under the server's catalog
-/// lock. Every block a client frame carries is written checksummed
-/// ([`WalBlock::write`]).
-fn checked_block_at<'a>(data: &'a [u8], off: usize, ctx: &str, what: &str) -> Result<&'a [u8], String> {
-    let block = wal::block_slice_at(data, off).map_err(|e| format!("{ctx}: {what}: {e}"))?;
-    wal::verify_body_checksum(block).map_err(|e| format!("{ctx}: {what}: {e}"))?;
-    Ok(block)
-}
-
 /// Decode a `DDL_TXN` frame into its per-family `(table_id, wal-block
 /// slice)` list, in send order. Walks the concatenated blocks by header alone —
 /// `table_id` at `WAL_OFF_TID`, total size at `WAL_OFF_SIZE` — so the caller
@@ -299,7 +287,7 @@ pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(u32, &[u8])>, String> {
     let (count, mut off) = decode_prologue(data, CTX, WAL_HEADER_SIZE, usize::MAX)?;
     let mut families = Vec::with_capacity(count);
     for _ in 0..count {
-        let block = checked_block_at(data, off, CTX, "family block")?;
+        let block = wal::block_slice_at(data, off).map_err(|e| format!("{CTX}: family block: {e}"))?;
         families.push((read_u32_le(block, WAL_OFF_TID), block));
         off += block.len();
     }
@@ -341,9 +329,9 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, String> {
         let mode =
             WireConflictMode::from_wire(data[off]).ok_or_else(|| format!("{CTX}: unknown family conflict mode"))?;
         off += 1;
-        let schema_block = checked_block_at(data, off, CTX, "schema block")?;
+        let schema_block = wal::block_slice_at(data, off).map_err(|e| format!("{CTX}: schema block: {e}"))?;
         off += schema_block.len();
-        let wal_block = checked_block_at(data, off, CTX, "data block")?;
+        let wal_block = wal::block_slice_at(data, off).map_err(|e| format!("{CTX}: data block: {e}"))?;
         off += wal_block.len();
         families.push(TxnFamily {
             tid: read_u32_le(wal_block, WAL_OFF_TID),

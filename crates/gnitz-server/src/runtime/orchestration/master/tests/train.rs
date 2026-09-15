@@ -104,14 +104,14 @@ fn send_frame(
     batch: Option<&Batch>,
 ) {
     use crate::runtime::wire::{self as ipc};
-    let block = schema.map(|s| crate::catalog::encode_schema_block_ipc(s, 1));
+    let block = schema.map(|s| crate::catalog::encode_schema_block(s, 1));
     let msg = ipc::WireMsg {
         target_id: 1,
         flags,
         status,
         error_msg,
         schema_block: block.as_deref(),
-        data: ipc::WireData::Whole(batch),
+        data: batch.map_or(ipc::WireData::None, ipc::WireData::Whole),
         ..Default::default()
     };
     writer.send_msg(req as u64, &msg);

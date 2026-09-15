@@ -33,7 +33,7 @@ struct PreflightKeyStream {
     count: usize,
     /// Cursor into the current frame's keys.
     row: usize,
-    /// Current frame is non-terminal, per `train_has_more`.
+    /// Current frame is non-terminal: its `scan_last` is clear.
     has_more: bool,
 }
 
@@ -56,27 +56,17 @@ impl PreflightKeyStream {
     fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), WireFault> {
         self.row = 0;
         self.count = 0;
-        let (ctrl, has_more) = parse_train_header(&slot, self.w, OP_UNIQUE_PREFLIGHT)?;
+        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
+        let (has_more, batch) = decode_train_slot(&slot, self.w, OP_UNIQUE_PREFLIGHT, frame_schema, &mut offsets)?;
         self.has_more = has_more;
         let bytes = slot.bytes();
-        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        // Continuation frames carry no schema and decode against `frame_schema`.
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(frame_schema), &mut offsets)
-            .map_err(|e| scan_decode_err(self.w, OP_UNIQUE_PREFLIGHT, e))?;
-        // A disagreement is an engine bug — both sides build from the same inputs
-        // — and refused, since the merge reads key bytes at this width.
-        if let Some(s) = zc.schema.as_ref() {
-            wire::validate_schema_match(s, frame_schema)
-                .map_err(|e| format!("worker {}: {OP_UNIQUE_PREFLIGHT}: {e}", self.w))?;
-        }
-        if let Some(mb) = zc.data_batch.as_ref() {
+        if let Some(mb) = batch {
             let pk = mb.pk();
             // `pk` points inside `bytes`, which `slot` owns for as long as it is
             // held; record where, then let the view go.
             self.pk_off = pk.as_ptr() as usize - bytes.as_ptr() as usize;
             self.count = mb.len();
         }
-        drop(zc); // borrows `bytes`
         self.slot = Some(slot);
         Ok(())
     }

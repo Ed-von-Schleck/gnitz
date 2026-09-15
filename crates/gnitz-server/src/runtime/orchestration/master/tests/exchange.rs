@@ -9,15 +9,17 @@ fn u64_pk_only() -> SchemaDescriptor {
 
 /// One worker's TERMINAL exchange frame — the whole report when the partition
 /// fits one frame. Only the first worker of a round carries a schema here; `pad`
-/// is the backfill pad bit (steady-state exchanges leave `seek_col_idx` at 0,
-/// which reads as not padded).
+/// is the backfill pad bit (steady-state exchanges leave `flags.backfill_pad`
+/// clear).
 fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> DecodedWire {
     DecodedWire {
         control: DecodedControl {
             target_id: view_id as u64,
-            flags: WireFlags::train_frame(0, true),
+            flags: WireFlags {
+                backfill_pad: pad,
+                ..WireFlags::train_frame(0, true)
+            },
             seek_pk: source_id as u128,
-            seek_col_idx: if pad { BACKFILL_PAD_BIT } else { 0 },
             ..Default::default()
         },
         schema: with_schema.then(u64_pk_only),

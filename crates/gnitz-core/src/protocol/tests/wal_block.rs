@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::test_support::payload_of;
-use gnitz_wire::{WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_VERSION};
+use gnitz_wire::WAL_OFF_VERSION;
 
 /// Return the `(offset, size)` of a region from a block's directory.
 fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
@@ -125,7 +125,7 @@ fn test_encode_decode_fixed() {
     };
 
     let encoded = encode_wal_block(42, &batch);
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
 
     assert_eq!(tid, 42);
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
@@ -162,7 +162,7 @@ fn test_encode_decode_strings() {
     };
 
     let encoded = encode_wal_block(0, &batch);
-    let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, _) = decode_wal_block(&encoded, &schema).unwrap();
 
     assert_eq!(decoded.nulls, nulls);
     assert_eq!(german_vals(&decoded, 0), vals);
@@ -183,7 +183,7 @@ fn test_encode_decode_u128() {
     };
 
     let encoded = encode_wal_block(1, &batch);
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 1);
     assert_eq!(wide_vals(&decoded.payload[0].bytes), vals);
 }
@@ -235,7 +235,7 @@ fn test_encode_decode_i128_signed_roundtrip() {
     };
 
     let encoded = encode_wal_block(3, &batch);
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 3);
 
     // Each signed value survives — reinterpret the recovered bits as i128.
@@ -263,26 +263,9 @@ fn test_encode_decode_empty() {
         blob: vec![],
     };
     let encoded = encode_wal_block(7, &empty);
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 7);
     assert_eq!(decoded.len(), 0);
-}
-
-#[test]
-fn test_bad_checksum() {
-    let schema = u64_schema();
-    let batch = ZSetBatch {
-        pks: PkColumn::from_natives(&schema, [1]),
-        weights: vec![1],
-        nulls: vec![0],
-        payload: payload_of(&schema, vec![8u64.to_le_bytes().to_vec()]),
-        blob: vec![],
-    };
-    let mut encoded = encode_wal_block(0, &batch);
-    // Flip a byte in the body (after header)
-    encoded[WAL_BLOCK_HEADER_SIZE] ^= 0xFF;
-    let res = decode_wal_block_verified(&encoded, &schema);
-    assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("checksum")));
 }
 
 #[test]
@@ -298,8 +281,7 @@ fn test_bad_version() {
     let mut encoded = encode_wal_block(0, &batch);
     // Set format_version = 1.
     encoded[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
-    // Note: checksum covers only the body, so changing header bytes does NOT invalidate it
-    let res = decode_wal_block_verified(&encoded, &schema);
+    let res = decode_wal_block(&encoded, &schema);
     assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("version")));
 }
 
@@ -327,7 +309,7 @@ fn pk_stride_wal_roundtrip_u64() {
     let expected_first = 1u64.to_be_bytes();
     assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
 
-    let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, _) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
 }
 
@@ -348,7 +330,7 @@ fn pk_stride_wal_roundtrip_u128() {
     let (_, pk_sz) = get_region_offset_size(&encoded, 0);
     assert_eq!(pk_sz, n * 16, "U128 PK region must be 16B/row");
 
-    let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, _) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
 }
 
@@ -366,7 +348,7 @@ fn wal_retraction_u64() {
         blob: vec![],
     };
     let encoded = encode_wal_block(5, &batch);
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 5);
     assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
     assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
@@ -384,7 +366,7 @@ fn test_batch_appender_round_trip_u64_pk() {
         a.add_row((u32::MAX as u128) + 1, -1).i64_val(300);
     }
     let encoded = encode_wal_block(7, &batch);
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 7);
     assert_eq!(decoded.pks.len(), 3);
     assert_eq!(decoded.pks.get(&schema, 0), 1u128);
@@ -405,7 +387,7 @@ fn test_batch_appender_round_trip_u128_pk() {
         }
     }
     let encoded = encode_wal_block(9, &batch);
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 9);
     assert_eq!(decoded.pks.len(), pks.len());
     for (i, &expected) in pks.iter().enumerate() {
@@ -480,7 +462,7 @@ fn pk_stride_wal_roundtrip_bytes_24() {
     let (_, pk_sz) = get_region_offset_size(&encoded, 0);
     assert_eq!(pk_sz, n * 24, "wide PK region must be 24B/row");
 
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 77);
     assert_eq!(decoded.weights, weights);
     assert_eq!(decoded.nulls, nulls);
@@ -544,7 +526,7 @@ fn pk_stride_wal_roundtrip_bytes_64() {
     let (_, pk_sz) = get_region_offset_size(&encoded, 0);
     assert_eq!(pk_sz, n * 64, "wide PK region must be 64B/row");
 
-    let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, tid) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(tid, 3);
     assert_eq!(decoded.pks.stride(), 64);
     assert_eq!(decoded.pks.region(), pk_region);

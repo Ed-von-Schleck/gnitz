@@ -1,11 +1,11 @@
 use crate::catalog::encode_schema_block;
 use crate::runtime::wire::{
-    decode_wire, decode_wire_ipc, decode_wire_ipc_zero_copy_with_ctrl, validate_schema_match, WireData, WireMsg,
+    decode_sal_slot, decode_train_frame, decode_wire_ipc, validate_schema_match, WireData, WireMsg,
 };
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, MAX_BATCH_REGIONS};
-use gnitz_wire::control::{peek_control_block_ipc, CTRL_BLOCK_SIZE_NO_BLOB};
+use gnitz_wire::control::{peek_control_block, CTRL_BLOCK_SIZE_NO_BLOB};
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
 use gnitz_wire::{ClientVerb, WireFlags, WireStatus};
@@ -55,7 +55,7 @@ fn encode_decode_roundtrip_with_schema() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, true).unwrap();
     assert!(decoded.schema.is_some());
     let s = decoded.schema.unwrap();
     assert_eq!(s.num_columns(), 2);
@@ -73,11 +73,11 @@ fn encode_decode_roundtrip_with_data() {
     let wire = WireMsg {
         target_id: 5,
         schema_block: Some(&blk),
-        data: WireData::Whole(Some(&batch)),
+        data: WireData::Whole(&batch),
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, true).unwrap();
     assert!(decoded.schema.is_some());
     assert!(decoded.data_batch.is_some());
     let db = decoded.data_batch.as_ref().unwrap();
@@ -107,7 +107,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
         let block = crate::catalog::encode_schema_block(&original, 0);
-        let decoded = decode_schema_block(&block, true).unwrap();
+        let decoded = decode_schema_block(&block, false).unwrap();
         assert!(
             original == decoded,
             "pk_indices {pk_indices:?} did not survive wire round-trip",
@@ -136,11 +136,11 @@ fn encode_decode_string_column() {
     let wire = WireMsg {
         target_id: 10,
         schema_block: Some(&blk),
-        data: WireData::Whole(Some(&batch)),
+        data: WireData::Whole(&batch),
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, true).unwrap();
     let db = decoded.data_batch.as_ref().unwrap();
     assert_eq!(db.len(), 2);
 
@@ -170,7 +170,7 @@ fn every_frame_shape() -> Vec<Vec<u8>> {
         WireMsg {
             target_id: 1,
             schema_block: Some(&blk),
-            data: WireData::Whole(Some(&batch)),
+            data: WireData::Whole(&batch),
             ..Default::default()
         }
         .encode_to_vec(),
@@ -186,7 +186,7 @@ fn every_truncation_of_a_frame_is_rejected() {
     for (shape, wire) in every_frame_shape().iter().enumerate() {
         for cut in 1..wire.len() {
             assert!(
-                decode_wire(&wire[..cut]).is_err(),
+                decode_sal_slot(&wire[..cut], true).is_err(),
                 "shape {shape}: prefix of {cut}/{} bytes must not decode",
                 wire.len()
             );
@@ -213,7 +213,7 @@ fn encode_writes_exactly_the_predicted_size() {
         },
         WireMsg {
             schema_block: Some(&blk),
-            data: WireData::Whole(Some(&batch)),
+            data: WireData::Whole(&batch),
             ..Default::default()
         },
         WireMsg {
@@ -223,19 +223,19 @@ fn encode_writes_exactly_the_predicted_size() {
         },
         WireMsg {
             schema_block: Some(&blk),
-            data: WireData::Whole(Some(&empty)),
+            data: WireData::Whole(&empty),
             ..Default::default()
         },
         WireMsg {
             schema_block: Some(&blk),
-            data: WireData::Whole(Some(&few)),
+            data: WireData::Whole(&few),
             ..Default::default()
         },
     ];
     for (i, msg) in msgs.iter().enumerate() {
         let sz = msg.size();
         let mut buf = vec![0u8; sz];
-        assert_eq!(msg.encode(&mut buf, 0), sz, "shape {i}: encode wrote != size()");
+        assert_eq!(msg.encode(&mut buf, 0, true), sz, "shape {i}: encode wrote != size()");
     }
 }
 
@@ -257,7 +257,7 @@ fn decode_wire_round_trips_an_error_msg_inline_and_spilled() {
             ..Default::default()
         }
         .encode_to_vec();
-        let decoded = decode_wire(&wire).unwrap();
+        let decoded = decode_sal_slot(&wire, true).unwrap();
         assert_eq!(decoded.control.target_id, 7);
         assert_eq!(decoded.control.client_id, 3);
         assert_eq!(decoded.control.request_id, 0xABCD);
@@ -266,7 +266,7 @@ fn decode_wire_round_trips_an_error_msg_inline_and_spilled() {
     }
 }
 
-/// Every control field round-trips through `decode_wire`, each at a distinct
+/// Every control field round-trips through `decode_sal_slot`, each at a distinct
 /// value so a transposed pair fails rather than reading back unchanged.
 /// `request_id` is at `u64::MAX`, the widest value the reply-routing key takes.
 #[test]
@@ -287,7 +287,7 @@ fn decode_wire_round_trips_every_control_field() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
+    let decoded = decode_sal_slot(&wire, true).unwrap();
     assert_eq!(decoded.control.target_id, 0xDEAD);
     assert_eq!(decoded.control.client_id, 0xBEEF);
     assert_eq!(decoded.control.flags, flags);
@@ -322,12 +322,12 @@ fn encode_chunk_roundtrip() {
     let msg = WireMsg {
         target_id: 1,
         schema_block: Some(&blk),
-        data: WireData::Whole(Some(&chunk)),
+        data: WireData::Whole(&chunk),
         ..Default::default()
     };
     let sz = msg.size();
     let mut buf = vec![0u8; sz];
-    assert_eq!(msg.encode_ipc(&mut buf, 0), sz);
+    assert_eq!(msg.encode(&mut buf, 0, false), sz);
 
     // Every region must be sliced by the same range: PK, weight and payload are
     // distinct per row, so a range applied to one region and not another shows up.
@@ -357,11 +357,11 @@ fn continuation_frame_decoded_with_schema_hint() {
     let msg = WireMsg {
         target_id: 1,
         flags: WireFlags { continuation: true, ..Default::default() },
-        data: WireData::Whole(Some(&batch)),
+        data: WireData::Whole(&batch),
         ..Default::default()
     };
     let mut buf = vec![0u8; msg.size()];
-    msg.encode_ipc(&mut buf, 0);
+    msg.encode(&mut buf, 0, false);
 
     // decode_wire_ipc must fail (no schema in frame, no hint).
     assert!(
@@ -370,11 +370,10 @@ fn continuation_frame_decoded_with_schema_hint() {
     );
 
     // With a hint it decodes, every region sliced by the same rows.
-    let ctrl = peek_control_block_ipc(&buf).expect("control block");
+    let ctrl = peek_control_block(&buf, false).expect("control block");
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let decoded =
-        decode_wire_ipc_zero_copy_with_ctrl(&buf, ctrl, Some(&sd), &mut offsets).expect("decode with schema hint");
-    let b = decoded.data_batch.as_ref().expect("data_batch");
+    let decoded = decode_train_frame(&buf, &ctrl, &sd, &mut offsets).expect("decode with schema hint");
+    let b = decoded.as_ref().expect("data_batch");
     assert_eq!(b.len(), 4);
     for i in 0..4usize {
         assert_eq!(gnitz_wire::widen_pk_be(b.get_pk_bytes(i)), i as u128);
@@ -411,12 +410,12 @@ fn decode_applies_batch_flags() {
     let wire = WireMsg {
         target_id: 7,
         schema_block: Some(&blk),
-        data: WireData::Whole(Some(&batch)),
+        data: WireData::Whole(&batch),
         ..Default::default()
     }
     .encode_to_vec();
 
-    let decoded = decode_wire(&wire).expect("decode");
+    let decoded = decode_sal_slot(&wire, true).expect("decode");
     let b = decoded.data_batch.as_ref().expect("data batch present");
     assert_eq!(b.layout(), Layout::Consolidated, "decoder applies batch_consolidated");
 }
@@ -503,18 +502,18 @@ fn scattered_roundtrips_over_a_padded_schema() {
         let msg = WireMsg {
             target_id: 3,
             schema_block: Some(&blk),
-            data: WireData::Scattered {
-                batch: &batch,
-                indices: &indices,
-                schema: &sd,
-            },
+            data: WireData::Scattered { batch: &batch, indices: &indices },
             ..Default::default()
         };
         let sz = msg.size();
         let mut buf = vec![0u8; sz];
-        assert_eq!(msg.encode(&mut buf, 0), sz, "{count} rows: size must size its encode");
+        assert_eq!(
+            msg.encode(&mut buf, 0, true),
+            sz,
+            "{count} rows: size must size its encode"
+        );
 
-        let decoded = decode_wire(&buf).expect("a scattered block decodes");
+        let decoded = decode_sal_slot(&buf, true).expect("a scattered block decodes");
         let got = decoded.data_batch.expect("it carries rows");
         assert_eq!(got.len(), count);
         for (j, &src) in indices.iter().enumerate() {

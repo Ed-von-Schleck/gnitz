@@ -14,7 +14,7 @@ fn absence_is_the_empty_blob() {
     assert_eq!(RelDescriptorBlob::decode(&[], 0), Ok(None));
     let present = RelDescriptorBlob::default().encode();
     assert_eq!(present.len(), HEADER_LEN);
-    assert_eq!(crate::control::german_spill_len(present.len()), 0);
+    assert_eq!(crate::german_string::german_spill_len(present.len()), 0);
 }
 
 /// The feed bit round-trips on a plain view and is refused on every other

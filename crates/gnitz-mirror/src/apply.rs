@@ -23,13 +23,6 @@ impl Mirror {
     /// Decode each block under the schema `shape` names — the copy's own, or the
     /// delta-store shape derived from it — and ingest it. Returns the bytes
     /// applied.
-    ///
-    /// Two engine entries here have a near twin that is silently wrong for a
-    /// socket frame, so each is named for what it keeps: the **public** decode
-    /// keeps the long-string extent check the ring-internal one drops, and the
-    /// `Layout::Raw` it returns keeps the ingest's sort-and-fold, where a
-    /// sender's `Consolidated` claim would fold weights onto the wrong element
-    /// past a sortedness check that is debug-only.
     pub(crate) fn ingest_blocks(
         &mut self,
         table_id: u64,
@@ -57,7 +50,7 @@ impl Mirror {
         for raw in blocks {
             let block = raw.block();
             applied += block.len();
-            let (batch, _) = Batch::decode_from_wal_block(block, &in_desc, false)
+            let batch = Batch::decode_foreign_wal_block(block, &in_desc)
                 .map_err(|e| self.poison(format!("decoding a delta for {table_id} failed: {e}")))?;
             let batch = match shape {
                 Shape::Plain => batch,

@@ -33,9 +33,9 @@ fn encode_roundtrip_all_paths() {
     for &checksum in &[false, true] {
         let peek = |b: &[u8]| {
             if checksum {
-                peek_control_block(b)
+                peek_control_block(b, true)
             } else {
-                peek_control_block_ipc(b)
+                peek_control_block(b, false)
             }
         };
         let hdr = probe_header();
@@ -93,7 +93,7 @@ fn peek_rejects_a_directory_that_disagrees_with_the_template() {
     );
     crate::wal::stamp_checksum(&mut forged, n);
     assert_eq!(
-        peek_control_block(&forged).err(),
+        peek_control_block(&forged, true).err(),
         Some("control block directory is not the canonical layout")
     );
 
@@ -101,7 +101,7 @@ fn peek_rejects_a_directory_that_disagrees_with_the_template() {
     let long = b"an error message well past the twelve-byte inline threshold";
     let mut ok = vec![0u8; ctrl_block_size(long.len(), 0)];
     let n = encode_ctrl_block(&mut ok, 0, &probe_header(), long, b"", false);
-    assert_eq!(peek_control_block_ipc(&ok[..n]).unwrap().error_msg, long);
+    assert_eq!(peek_control_block(&ok[..n], false).unwrap().error_msg, long);
 }
 
 /// A corrupted long-string blob offset must surface an error, not panic.
@@ -125,7 +125,7 @@ fn peek_rejects_oob_error_msg_offset() {
     buf.truncate(n);
     let (err_off, _) = crate::wal::dir_entry(&buf, REG_ERROR_MSG);
     buf[err_off + 8..err_off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
-    match peek_control_block_ipc(&buf) {
+    match peek_control_block(&buf, false) {
         Err("error_msg string offset out of bounds") => {}
         Err(other) => panic!("wrong error: {other}"),
         Ok(_) => panic!("OOB error_msg offset must be rejected"),
@@ -141,7 +141,7 @@ fn peek_rejects_an_unknown_status() {
         let n = encode_ctrl_block(&mut buf, 0, &probe_header(), b"", b"", false);
         crate::write_u64_le(&mut buf, OFF_STATUS, raw);
         assert_eq!(
-            peek_control_block_ipc(&buf[..n]).err(),
+            peek_control_block(&buf[..n], false).err(),
             Some("control block names no status"),
             "status word {raw}"
         );

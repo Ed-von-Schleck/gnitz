@@ -91,7 +91,8 @@ fn test_message_control_schema_roundtrip() {
     };
 
     let encoded = encode_control_block(&h, "test error", &[]);
-    let (decoded, err, _) = decode_control_block(&encoded).unwrap();
+    let ctrl = peek_control_block(&encoded, false).unwrap();
+    let decoded = ctrl.header();
 
     assert_eq!(decoded.status, h.status);
     assert_eq!(decoded.target_id, h.target_id);
@@ -100,15 +101,14 @@ fn test_message_control_schema_roundtrip() {
     assert_eq!(decoded.seek_pk, h.seek_pk);
     assert_eq!(decoded.seek_col_idx, h.seek_col_idx);
     assert_eq!(decoded.request_id, h.request_id);
-    assert_eq!(err, "test error");
+    assert_eq!(ctrl.error_msg, b"test error");
 }
 
 #[test]
 fn test_message_control_null_error_msg() {
     let h = Header::default();
     let encoded = encode_control_block(&h, "", &[]);
-    let (_, err, _) = decode_control_block(&encoded).unwrap();
-    assert_eq!(err, "");
+    assert!(peek_control_block(&encoded, false).unwrap().error_msg.is_empty());
 }
 
 /// Round-trips a wide `seek_pk_extra` (32 bytes) through encode + decode
@@ -119,14 +119,13 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     let h = Header::default();
     let extra: Vec<u8> = (0..32u8).collect();
     let encoded = encode_control_block(&h, "", &extra);
-    let (_, err, decoded_extra) = decode_control_block(&encoded).unwrap();
-    assert_eq!(err, "");
-    assert_eq!(decoded_extra, extra);
+    let ctrl = peek_control_block(&encoded, false).unwrap();
+    assert!(ctrl.error_msg.is_empty());
+    assert_eq!(ctrl.seek_pk_extra, extra);
 
     // Empty seek_pk_extra → identical to today's frame (null bit set).
     let encoded2 = encode_control_block(&h, "", &[]);
-    let (_, _, decoded_extra2) = decode_control_block(&encoded2).unwrap();
-    assert!(decoded_extra2.is_empty());
+    assert!(peek_control_block(&encoded2, false).unwrap().seek_pk_extra.is_empty());
 }
 
 /// `request_id` round-trips for the reserved sentinel values: 0 (untagged),
@@ -138,8 +137,7 @@ fn test_request_id_roundtrip_reserved_values() {
     for &req_id in &[0u64, u64::MAX, 0x1234_5678_DEAD_BEEFu64] {
         let h = Header { request_id: req_id, ..Header::default() };
         let encoded = encode_control_block(&h, "", &[]);
-        let (decoded, _, _) = decode_control_block(&encoded).unwrap();
-        assert_eq!(decoded.request_id, req_id);
+        assert_eq!(peek_control_block(&encoded, false).unwrap().request_id, req_id);
     }
 }
 
@@ -413,13 +411,12 @@ fn encode_message_wide_pk_seek_emits_extra() {
     };
     let payload = encode_message_parts(7, 1, seek, lo, tail, 0, None).to_vec();
 
-    let ctrl = gnitz_wire::wal::block_slice_at(&payload, 0).unwrap();
-    let (hdr, _err, extra) = decode_control_block(ctrl).unwrap();
+    let ctrl = peek_control_block(&payload, false).unwrap();
 
     let (want_lo, want_extra) = (lo, tail);
-    assert_eq!(hdr.seek_pk, want_lo);
-    assert_eq!(extra, want_extra); // bytes 16..24
-    assert_eq!(hdr.flags.verb, ClientVerb::Seek);
+    assert_eq!(ctrl.seek_pk, want_lo);
+    assert_eq!(ctrl.seek_pk_extra, want_extra); // bytes 16..24
+    assert_eq!(ctrl.flags.verb, ClientVerb::Seek);
 }
 
 /// A hint-only frame (`has_data` set, `has_schema` clear, matching schema

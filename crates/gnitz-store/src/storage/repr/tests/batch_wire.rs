@@ -8,6 +8,34 @@ fn encoded_block(schema: &SchemaDescriptor) -> Vec<u8> {
     make_batch_raw(schema, &[(42, 1, 7)]).encode_to_wire_vec(1, false)
 }
 
+/// The foreign decode refuses a non-canonical string cell the engine's own decode admits.
+#[test]
+fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
+    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string};
+    let schema = make_schema_pk_u64_payload_string();
+    let long: &[u8] = b"a string long enough to spill";
+    let clean = make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]).encode_to_wire_vec(1, false);
+    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+
+    let (cells, _) = gnitz_wire::wal::dir_entry(&clean, REG_PAYLOAD_START);
+    let forgeries: [fn(&mut [u8]); 2] = [
+        // Row 0 is "short" (5 bytes): its suffix padding starts at byte 9.
+        |cell| cell[15] = 0xAA,
+        // Row 1 is long: point its heap offset past the blob.
+        |cell| gnitz_wire::write_u64_le(cell, 8, 1 << 20),
+    ];
+    for (row, forge) in forgeries.into_iter().enumerate() {
+        let mut buf = clean.clone();
+        forge(&mut buf[cells + row * 16..cells + (row + 1) * 16]);
+        assert!(Batch::decode_from_wal_block(&buf, &schema, false).is_ok(), "row {row}");
+        assert_eq!(
+            Batch::decode_foreign_wal_block(&buf, &schema).err(),
+            Some("data WAL German string is not in canonical form"),
+            "row {row}"
+        );
+    }
+}
+
 /// A fixed region whose directory size disagrees with what the schema implies
 /// for the row count is refused, rather than decoded against a mis-sized region.
 #[test]

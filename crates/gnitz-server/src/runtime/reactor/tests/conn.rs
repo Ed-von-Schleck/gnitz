@@ -7,9 +7,8 @@ use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
-use crate::runtime::orchestration::peer::Peer;
+use crate::runtime::orchestration::peer::{Peer, COALESCE_MAX_BYTES};
 use crate::runtime::test_support::try_poll_once;
-use crate::runtime::wire::COALESCE_MAX_BYTES;
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
 /// One whole-payload client send, with nothing racing it.

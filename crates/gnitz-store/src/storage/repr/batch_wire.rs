@@ -16,32 +16,25 @@ use super::merge::{BlobCacheGuard, DirectWriter, MemBatch};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
 
-/// Region byte sizes of the WAL wire block for `count` rows of `schema` into
-/// `out` — canonical order (pk, weight, null_bmp, payload…, blob), returning the
-/// region count. The schema-level face of the writer↔reader region contract
-/// (`strides_from_schema`), for a caller holding no `Batch`. Out-parameter like
-/// `compute_offsets_into`: 276 bytes, so a return costs two memcpys per call.
-pub(crate) fn wire_region_sizes_into(
-    schema: &SchemaDescriptor,
-    count: usize,
-    blob_size: usize,
-    out: &mut [u32; MAX_WIRE_REGIONS],
-) -> usize {
-    let (strides, nr) = strides_from_schema(schema);
-    let nr = nr as usize;
-    for (size, &stride) in out[..nr].iter_mut().zip(&strides[..nr]) {
+/// Region byte sizes of a WAL block for `count` rows over `strides`, the
+/// `blob_len` heap last; returns the region count. An out-parameter: the array
+/// is 276 bytes.
+fn region_sizes_into(strides: &[u8], count: usize, blob_len: usize, out: &mut [u32; MAX_WIRE_REGIONS]) -> usize {
+    let nr = strides.len();
+    for (size, &stride) in out[..nr].iter_mut().zip(strides) {
         *size = (count * stride as usize) as u32;
     }
-    out[nr] = blob_size as u32;
+    out[nr] = blob_len as u32;
     nr + 1
 }
 
 /// Total WAL-block byte size for `count` rows of `schema` carrying `blob_size`
-/// heap bytes — `wire_region_sizes_into` fed through the shared block framer.
+/// heap bytes — `region_sizes_into` fed through the shared block framer.
 pub fn wire_block_size(schema: &SchemaDescriptor, count: usize, blob_size: usize) -> usize {
+    let (strides, nr) = strides_from_schema(schema);
     let mut sizes = [0u32; MAX_WIRE_REGIONS];
-    let nr = wire_region_sizes_into(schema, count, blob_size, &mut sizes);
-    wal::block_size(&sizes[..nr])
+    let n = region_sizes_into(&strides[..nr as usize], count, blob_size, &mut sizes);
+    wal::block_size(&sizes[..n])
 }
 
 impl Batch {
@@ -51,13 +44,9 @@ impl Batch {
     /// `blob_len`-byte heap — the sizing half of the region convention, and the
     /// one both size accessors below read.
     fn wire_size_of(&self, count: usize, blob_len: usize) -> usize {
-        let blob_idx = self.num_regions();
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
-        for (i, size) in sizes[..blob_idx].iter_mut().enumerate() {
-            *size = (count * self.region_stride(i) as usize) as u32;
-        }
-        sizes[blob_idx] = blob_len as u32;
-        wal::block_size(&sizes[..blob_idx + 1])
+        let n = region_sizes_into(self.strides(), count, blob_len, &mut sizes);
+        wal::block_size(&sizes[..n])
     }
 
     /// Byte count of the WAL-block encoding for this batch.
@@ -68,7 +57,7 @@ impl Batch {
     /// Byte count of the WAL-block encoding for `count` rows from this batch,
     /// with an empty heap. Monotone non-decreasing in `count`, which is what lets
     /// [`Self::rows_within`] search it.
-    fn wire_byte_size_range(&self, count: usize) -> usize {
+    pub fn wire_byte_size_range(&self, count: usize) -> usize {
         self.wire_size_of(count, 0)
     }
 
@@ -212,29 +201,24 @@ impl Batch {
         out
     }
 
-    /// Encode the rows `indices` selects, in that order, as one WAL block at
-    /// `out[offset..]`. Returns bytes written. Unlike its two siblings this one
-    /// reads its region strides from `schema` rather than from the batch, so a
-    /// caller must size the destination with [`wire_block_size`] over the same
-    /// schema — those two are the writer↔reader region contract's two faces.
-    ///
-    /// Only valid for a schema with no German-string column, so the row scatter
-    /// writes no heap bytes. Padded strides are fine: the destination is sized
-    /// by `wire_block_size` and carved by `compute_offsets_into`, and both walk the
-    /// same `align8` region layout.
+    /// Encode the rows `indices` selects, in order, as one WAL block of
+    /// `wire_byte_size_range(indices.len())` bytes at `out[offset..]`.
     pub fn encode_scattered_to_wire(
         &self,
         indices: &[u32],
-        schema: &SchemaDescriptor,
         table_id: u32,
         out: &mut [u8],
         offset: usize,
         checksum: bool,
     ) -> usize {
+        debug_assert!(
+            !self.schema().has_german_string(),
+            "a row scatter writes no heap bytes, so it cannot carry a string column"
+        );
         let count = indices.len();
         // Region sizes in canonical order: pk, weight, null_bmp, payload…, blob(0).
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
-        let nr = wire_region_sizes_into(schema, count, 0, &mut sizes);
+        let nr = region_sizes_into(self.strides(), count, 0, &mut sizes);
         let total_size = wal::block_size(&sizes[..nr]);
         let block = &mut out[offset..offset + total_size];
 
@@ -246,7 +230,7 @@ impl Batch {
         // No German-string columns here; `DirectWriter` still
         // wants a blob arena, so hand it a 0-cap stack local it must not grow.
         let mut empty_blob: Vec<u8> = Vec::new();
-        let mut writer = DirectWriter::over_arena(rest, schema, count, &mut empty_blob);
+        let mut writer = DirectWriter::over_arena(rest, self.schema(), count, &mut empty_blob);
         super::scatter::scatter_copy(&self.as_mem_batch(), indices, &mut writer);
         debug_assert!(
             empty_blob.is_empty(),
@@ -259,22 +243,8 @@ impl Batch {
         total_size
     }
 
-    /// Decode a WAL block from `data` using `schema` into an owned `Batch`.
-    /// Returns (Batch, bytes_consumed). Does not set sorted/consolidated —
-    /// caller derives those from wire header flags. One parse
-    /// (`decode_mem_batch_from_wal_block`) + one bulk copy per region.
-    /// Set `verify_checksum = false` for trusted IPC paths (W2M ring).
-    ///
-    /// The destination is always fresh, so the block's blob heap is copied
-    /// wholesale and the 16-byte German-string structs bulk-copy verbatim with
-    /// the payload regions — their heap offsets are absolute from blob start
-    /// and stay valid at base 0. No per-row string relocation. The relocation
-    /// also canonicalized hostile long-string structs, so the passthrough
-    /// validates every long string's heap extent first and rejects the frame
-    /// (like the region-size validations) instead of persisting corrupt
-    /// structs. Exchange ingest deliberately does NOT use this decode: its
-    /// frames can carry full unfiltered blobs from filter/map blob sharing,
-    /// and `append_mem_batch`'s relocation is the compaction point there.
+    /// Decode a WAL block the engine wrote into an owned `Raw` batch; returns it
+    /// and the bytes consumed. String cells are copied verbatim with their heap.
     pub fn decode_from_wal_block(
         data: &[u8],
         schema: &SchemaDescriptor,
@@ -287,7 +257,6 @@ impl Batch {
         if mb.count == 0 {
             return Ok((Batch::empty_with_schema(schema), bytes_consumed));
         }
-        validate_string_heap_extents(&mb, schema)?;
 
         let (strides, nr) = strides_from_schema(schema);
         let nr_usize = nr as usize;
@@ -321,49 +290,40 @@ impl Batch {
         let batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, mb.count, *schema) };
         Ok((batch, bytes_consumed))
     }
-}
 
-/// Trust-boundary guard for the blob-passthrough decode: every German-string
-/// cell must be in canonical form (`german_string_cell_ok`) against the block's
-/// blob heap. The passthrough copies the 16-byte structs verbatim, where the
-/// per-row relocation it replaced used to canonicalize them, so this is the one
-/// place a hostile client push is stopped from persisting a cell that
-/// `german_string_content` and `compare_german_strings` would read differently
-/// — an overrunning heap extent, or a padding/prefix skew that splits one Z-set
-/// element's weight across two rows consolidation will never merge. Null cells
-/// are zeroed (length 0 → canonical short) and pass trivially.
-fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) -> Result<(), &'static str> {
-    if !schema.has_german_string() {
-        return Ok(());
+    /// [`Self::decode_from_wal_block`] for a block a peer wrote, refusing a
+    /// German-string cell not in canonical form: a heap extent past the blob, or
+    /// padding that would split one element's weight across two rows.
+    pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
+        let (batch, _) = Self::decode_from_wal_block(data, schema, false)?;
+        batch.validate_string_heap_extents()?;
+        Ok(batch)
     }
-    for (pi, col) in schema.payload_columns() {
-        if !gnitz_wire::is_german_string(col.type_code) {
-            continue;
+
+    fn validate_string_heap_extents(&self) -> Result<(), &'static str> {
+        let schema = self.schema();
+        if !schema.has_german_string() {
+            return Ok(());
         }
-        for row in 0..mb.count {
-            let cell = mb.get_col_ptr(row, pi, 16);
-            if !gnitz_wire::german_string_cell_ok(cell, mb.blob) {
-                return Err("data WAL German string is not in canonical form");
+        let mb = self.as_mem_batch();
+        for (pi, col) in schema.payload_columns() {
+            if !gnitz_wire::is_german_string(col.type_code) {
+                continue;
+            }
+            for row in 0..mb.count {
+                let cell = mb.get_col_ptr(row, pi, 16);
+                if !gnitz_wire::german_string_cell_ok(cell, mb.blob) {
+                    return Err("data WAL German string is not in canonical form");
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
-/// Decode a WAL data block into a `MemBatch<'a>` borrowing `data`, with the
-/// block's region offsets written into the caller's `offsets` (which the view
-/// then borrows). No allocation; the caller keeps both live. Checksum
-/// verification is skipped (IPC trusted path).
-///
-/// **Contract — this decode skips `validate_string_heap_extents`.** It is for
-/// the W2M ring only: worker-written shared memory, unreachable from a client
-/// (every client frame lands in `Batch::decode_from_wal_block`, which does
-/// validate). A caller must therefore either relocate every German-string cell
-/// on the way in (`Batch::append_mem_batch*`, which canonicalizes) or use a
-/// schema with no STRING/BLOB payload column — index-record and preflight
-/// schemas qualify, since `gnitz_wire::index_key_type` rejects both. Sites that
-/// read only the PK region are trivially fine: a PK column can never be a
-/// German string (`is_pk_eligible`).
+/// Decode a WAL data block into a `MemBatch` borrowing `data` and `offsets`.
+/// String cells are not canonicalized: relocate them on the way in
+/// (`Batch::append_mem_batch*`) or read no string column.
 pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,

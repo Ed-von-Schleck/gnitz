@@ -5,6 +5,16 @@ use crate::{read_u32_le, read_u64_le};
 /// Threshold for inline German String storage (bytes).
 pub const SHORT_STRING_THRESHOLD: usize = 12;
 
+/// Blob bytes a German string of length `len` spills into the shared blob
+/// region: 0 when it fits the 12-byte inline form, its full length otherwise.
+pub(crate) const fn german_spill_len(len: usize) -> usize {
+    if len > SHORT_STRING_THRESHOLD {
+        len
+    } else {
+        0
+    }
+}
+
 /// Encode a byte slice as a 16-byte German String struct destined for a heap
 /// whose current end is `heap_off`, returning the cell and the bytes it spills
 /// there — empty while the value fits inline. Returning the spill rather than

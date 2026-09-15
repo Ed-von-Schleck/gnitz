@@ -8,7 +8,7 @@
 //!
 //! A worker publishes its partition as a `FRAME_CAP`-bounded train (see
 //! `worker/exchange.rs`), so a slot accumulates over several frames and only the
-//! terminal one — [`train_has_more`], the engine's one train-end rule — reports
+//! terminal one — flagged `scan_last`, the engine's one train-end rule — reports
 //! the worker.
 //!
 //! Rounds are orchestration policy, which is why this sits here rather than in
@@ -16,8 +16,7 @@
 
 use rustc_hash::FxHashMap;
 
-use super::train::train_has_more;
-use crate::runtime::wire::{DecodedWire, BACKFILL_PAD_BIT};
+use crate::runtime::wire::DecodedWire;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{Batch, Layout};
 use gnitz_wire::{low_bits_mask, MAX_WORKERS};
@@ -47,11 +46,7 @@ struct ExchangeRound {
     /// complete the round while another worker's slot is still empty.
     reported: u64,
     schema: Option<SchemaDescriptor>,
-    /// AND of every worker's per-chunk backfill pad bit (`seek_col_idx &
-    /// BACKFILL_PAD_BIT`). Starts `true`; a single non-pad worker clears it.
-    /// True once the round completes ⇒ every worker is exhausted and this is the
-    /// final (all-pad) round. Always `false` for steady-state exchanges (their
-    /// `seek_col_idx` is 0); the steady-state relay path ignores it.
+    /// AND of the workers' `flags.backfill_pad`: true on a backfill's final round.
     all_pad: bool,
 }
 
@@ -113,12 +108,12 @@ impl ExchangeAccumulator {
         }
         // Bookkeeping rides the terminal frame alone, so a partial train cannot
         // complete the round.
-        if train_has_more(decoded.control.flags) {
+        if !decoded.control.flags.scan_last {
             return None;
         }
-        // AND this worker's per-chunk backfill pad bit. 0 for steady-state
+        // AND this worker's per-chunk backfill pad bit. Clear for steady-state
         // exchanges, which clears all_pad harmlessly (the relay path ignores it).
-        round.all_pad &= (decoded.control.seek_col_idx & BACKFILL_PAD_BIT) != 0;
+        round.all_pad &= decoded.control.flags.backfill_pad;
         round.reported |= 1 << w;
 
         if round.reported != low_bits_mask(nw) {

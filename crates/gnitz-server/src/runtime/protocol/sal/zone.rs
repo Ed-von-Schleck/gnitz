@@ -249,7 +249,7 @@ impl<'a> CommittedTail<'a> {
                 continue;
             }
             for (w, bytes) in msg.slots_written() {
-                if let Err(e) = ipc::decode_wire(bytes) {
+                if let Err(e) = ipc::decode_sal_slot(bytes, true) {
                     gnitz_warn!(
                         "SAL replay: last committed zone lsn={} is torn (offset={} slot={w} \
                          target={}: {e}); skipping it whole",

@@ -12,13 +12,14 @@ use crate::query::{DagEngine, ExchangeCallback};
 use crate::runtime::m2w::{self, Wake};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
+use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_store::storage::StoreError;
+use gnitz_wire::BackfillDecision;
 use gnitz_wire::{WireFlags, WireStatus};
 
 // ---------------------------------------------------------------------------
@@ -47,17 +48,6 @@ struct Request {
     /// that produced its delta rather than whatever a counter has reached.
     lsn: u64,
     wire: ipc::DecodedWire,
-}
-
-/// Per-chunk collective decision the master stamps onto a distributed-backfill
-/// relay (in `seek_col_idx`), folded into [`BackfillExchangeCtx::verdict`] and
-/// read once per chunk by `handle_backfill`. `BACKFILL_DECISION_CHECKPOINT` is
-/// folded into `Continue` after its inline SAL re-epoch is applied (see
-/// `consume_backfill_decision`), so only the loop verdict survives.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BackfillRound {
-    Stop,
-    Continue,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +102,7 @@ fn in_eval(kind: SalMessageKind) -> InEval {
 /// collective backfill decision the master stamped onto it.
 struct RelayHit {
     batch: Batch,
-    decision: u64,
+    decision: BackfillDecision,
 }
 
 struct WorkerExchangeHandler {
@@ -125,13 +115,13 @@ struct WorkerExchangeHandler {
     /// Both queues drain in insertion order, which is SAL order.
     deferred_replay: Vec<Request>,
     /// ExchangeRelay messages whose `(view_id, source_id)` does not match the
-    /// active wait, with the backfill decision (`seek_col_idx`) that rode them.
+    /// active wait, with the backfill decision (`flags.backfill`) that rode them.
     /// Keyed by the pair, not the view: a relay for one source of a join view
     /// must not satisfy a wait for another, which would drive the DAG with the
     /// wrong sharding columns. Nothing in production parks one — a worker has a
     /// single outstanding exchange report — so this only catches a mismatch if
     /// that stops holding.
-    pending_relays: HashMap<(i64, i64), (Batch, u64)>,
+    pending_relays: HashMap<(i64, i64), (Batch, BackfillDecision)>,
 }
 
 /// Bridges the DAG's `ExchangeCallback` requirement to `WorkerProcess` for a
@@ -165,13 +155,18 @@ struct BackfillExchangeCtx<'a> {
     /// exchange — a view with no barrier, which `handle_backfill` terminates on
     /// local drain exhaustion instead. Every round of a chunk yields the same
     /// verdict, so writing it per round is a restatement, not a race.
-    verdict: Option<BackfillRound>,
+    verdict: Option<BackfillDecision>,
 }
 
 impl ExchangeCallback for BackfillExchangeCtx<'_> {
     fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch {
         let (batch, decision) = self.worker.do_exchange_wait(view_id, batch, source_id, self.pad);
-        self.verdict = Some(self.worker.consume_backfill_decision(decision));
+        // The master writes the next round at cursor 0 of a new epoch. Not the
+        // flush path: its ACK would read as this worker's terminal ACK.
+        if decision == BackfillDecision::Checkpoint {
+            self.worker.sal_reader.rewind();
+        }
+        self.verdict = Some(decision);
         batch
     }
 }
@@ -284,8 +279,7 @@ enum ReplySchema<'a> {
     /// A projected or synthetic schema — every `HasPk` reply, whose shape is
     /// the probe's, not the table's. Built fresh per reply and never cached:
     /// the table's block would decode these rows at the wrong stride, and
-    /// caching theirs would poison the table's. Unchecksummed, so only for a
-    /// reply the master consumes — its ring decode verifies none.
+    /// caching theirs would poison the table's.
     OneOff(&'a SchemaDescriptor),
     /// The reply schema the request shipped in `seek_pk_extra` and the reader
     /// decodes against: no block, no descriptor needed here, and the request's
@@ -412,7 +406,7 @@ impl WorkerProcess {
     /// point: both dispatchers and every parked request come through here.
     fn decode_request(&mut self, msg: &SalMessage, wire: &'static [u8]) -> Request {
         // Fail-stop: a dropped group diverges this worker from the master.
-        match ipc::decode_wire(wire) {
+        match ipc::decode_sal_slot(wire, false) {
             Ok(w) => Request { kind: msg.kind, lsn: msg.lsn, wire: w },
             Err(e) => self.fatal_shutdown(&format!(
                 "failed to decode {:?} for tid={}: {e}",
@@ -456,9 +450,9 @@ impl WorkerProcess {
         let ipc::DecodedWire { control, schema, data_batch } = req.wire;
         let target_id = control.target_id as i64;
         // source_id is echoed back via seek_pk; the backfill round decision rides
-        // in seek_col_idx.
+        // in flags.backfill.
         let key = (target_id, control.seek_pk as i64);
-        let decision = control.seek_col_idx;
+        let decision = control.flags.backfill;
         // Header-only relay: the master stamps a schema block onto every slot of
         // a relay group, so an empty batch built from the relayed schema is the
         // correct payload. A schema-less relay would leave no way to build it
@@ -686,7 +680,7 @@ impl WorkerProcess {
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
         let (spec, reply_block) = gnitz_wire::ReadSpec::decode(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
-        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
+        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, false)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
         self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, client_version);
@@ -703,7 +697,7 @@ impl WorkerProcess {
         client_version: u16,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
-        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
+        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, false)
             .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
         let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
         self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, client_version);
@@ -768,7 +762,7 @@ impl WorkerProcess {
             produced_any |= produced;
             // Stop on the master's collective verdict, or — with no barrier,
             // hence no verdict — on local drain exhaustion.
-            if signal == Some(BackfillRound::Stop) || (signal.is_none() && pad) {
+            if signal == Some(BackfillDecision::Stop) || (signal.is_none() && pad) {
                 break;
             }
         }
@@ -798,7 +792,7 @@ impl WorkerProcess {
         source_id: i64,
         delta: Batch,
         pad: bool,
-    ) -> (bool, Option<BackfillRound>) {
+    ) -> (bool, Option<BackfillDecision>) {
         let (dag, reg) = self.cat().dag_and_registry_mut();
         let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
         let mut ctx = BackfillExchangeCtx { worker: self, pad, verdict: None };
@@ -816,30 +810,6 @@ impl WorkerProcess {
                 source_id,
                 e,
             ),
-        }
-    }
-
-    /// Act on the backfill decision a master stamped onto a relay's
-    /// `seek_col_idx`, the moment that relay is consumed for its matching wait,
-    /// and reduce it to the loop verdict. Reached only from
-    /// [`BackfillExchangeCtx`], so a steady-state tick's (always CONTINUE == 0)
-    /// decision needs no guard — there is nothing to reach it.
-    fn consume_backfill_decision(&mut self, decision: u64) -> BackfillRound {
-        // CHECKPOINT is a CONTINUE that also applies the relay-driven half of a
-        // SAL checkpoint inline: advance the read epoch so post-reset groups (the
-        // master writes them at `write_cursor == 0` in the bumped epoch) are
-        // accepted and any pre-reset group parks via `next_sal_message`'s epoch
-        // check. Deliberately NOT the Flush arm — no `handle_flush_all`, no
-        // flush ACK; the master's consumption proof is the next round's
-        // exchange report, which a flush ACK would be misread as a terminal ACK
-        // that retires the worker.
-        if decision == BACKFILL_DECISION_CHECKPOINT {
-            self.sal_reader.rewind();
-        }
-        if decision == BACKFILL_DECISION_STOP {
-            BackfillRound::Stop
-        } else {
-            BackfillRound::Continue
         }
     }
 

@@ -22,16 +22,13 @@ use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, Lease, Reactor};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalScope, SalWriter};
 use crate::runtime::w2m::W2mSlot;
-use crate::runtime::wire::{
-    self, unique_preflight_wire_schema, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
-    BACKFILL_DECISION_STOP,
-};
+use crate::runtime::wire::{self, unique_preflight_wire_schema};
 use exchange::PendingRelay;
 use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, ScatterSpec};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::storage::Batch;
-use gnitz_wire::control::peek_control_block_ipc;
-use gnitz_wire::{WireConflictMode, WireFault, WireFlags, WireStatus};
+use gnitz_wire::control::peek_control_block;
+use gnitz_wire::{BackfillDecision, WireConflictMode, WireFault, WireFlags, WireStatus};
 use scatter::{with_commit_indices, with_group, with_worker_indices};
 
 // ---------------------------------------------------------------------------
@@ -166,7 +163,7 @@ mod unique_preflight;
 
 use super::TxnFamily;
 pub(crate) use dispatch::WORKER_WATCH;
-use train::{drain_index_scan, forward_scan_slots, parse_train_header, scan_decode_err};
+use train::{decode_train_slot, drain_index_scan, forward_scan_slots};
 pub(crate) use unique_filter::UniqueFilter;
 
 // ---------------------------------------------------------------------------

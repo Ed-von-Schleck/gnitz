@@ -115,7 +115,7 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
 
     for i in 0..N {
         let f = try_poll_once(lease.next_frame(0)).expect("a routed frame resolves on the first poll");
-        let rid = gnitz_wire::control::peek_control_block_ipc(f.bytes())
+        let rid = gnitz_wire::control::peek_control_block(f.bytes(), false)
             .unwrap()
             .request_id;
         assert_eq!(rid, 100 + i as u64, "frame {i} delivered in arrival order");

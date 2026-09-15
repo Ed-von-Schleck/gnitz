@@ -27,7 +27,7 @@ fn pending_deltas_accumulate_per_relation() {
 /// `send_scan_response`, `send_fault`) must echo the inbound request_id back
 /// on the W2M region so the master reactor can route it. We fake out the
 /// W2M writer with a real anonymous mmap, fire each helper with a
-/// distinct id, then read the messages back through `decode_wire` and
+/// distinct id, then read the messages back through `decode_wire_ipc` and
 /// assert the ids round-trip.
 #[test]
 fn send_helpers_echo_the_request_id() {
@@ -194,7 +194,7 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
 /// fail-stops on a frame that does not decode.
 fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
     // No data batch — a header-only relay. `seek_pk` echoes the source_id the
-    // waiter matches on; `seek_col_idx` 0 is BACKFILL_DECISION_CONTINUE.
+    // waiter matches on; the default `flags.backfill` is `Continue`.
     let block = crate::catalog::encode_schema_block(schema, target_id as u32);
     let msg = ipc::WireMsg {
         target_id,
@@ -212,7 +212,7 @@ fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -
     let msg = ipc::WireMsg {
         target_id,
         schema_block: Some(&block),
-        data: ipc::WireData::Whole(Some(batch)),
+        data: ipc::WireData::Whole(batch),
         ..Default::default()
     };
     Box::leak(msg.encode_to_vec().into_boxed_slice())
@@ -438,7 +438,7 @@ fn consume_one(ptr: *mut u8) -> Vec<u8> {
 /// schema block — the budget that fits exactly that many rows.
 fn frame_size(schema: SchemaDescriptor, count: usize, prebuilt: Option<&[u8]>) -> usize {
     ipc::WireMsg {
-        data: ipc::WireData::Whole(Some(&make_n_row_batch(schema, count))),
+        data: ipc::WireData::Whole(&make_n_row_batch(schema, count)),
         schema_block: prebuilt,
         ..Default::default()
     }
@@ -525,15 +525,14 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         assert!(wp.pending_streams.is_empty(), "the queue ends empty either way");
 
         let data = consume_one(ptr);
-        let ctrl = gnitz_wire::control::peek_control_block_ipc(&data).expect("peek_control_block");
+        let ctrl = gnitz_wire::control::peek_control_block(&data, false).expect("peek_control_block");
         assert_eq!(ctrl.status, WireStatus::Ok);
         assert!(ctrl.flags.scan_last);
         assert!(ctrl.flags.continuation);
 
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(&data, ctrl, Some(&schema), &mut offsets)
-            .expect("decode with schema hint");
-        let b = decoded.data_batch.as_ref().expect("data block");
+        let decoded = ipc::decode_train_frame(&data, &ctrl, &schema, &mut offsets).expect("decode with schema hint");
+        let b = decoded.as_ref().expect("data block");
         assert_eq!(b.len(), 5);
         for i in 0..5usize {
             assert_eq!(mem_pk(b, i), i as u128);
@@ -569,12 +568,12 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     assert!(wp.pending_streams.is_empty(), "one frame drains the train");
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
-    let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
+    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1, false).unwrap();
     assert_eq!(ctrl.status, WireStatus::Ok);
     assert!(ctrl.flags.scan_last);
     assert!(ctrl.flags.continuation);
     let whole = ipc::WireMsg {
-        data: ipc::WireData::Whole(Some(&batch)),
+        data: ipc::WireData::Whole(&batch),
         ..Default::default()
     }
     .size();
@@ -668,7 +667,7 @@ fn pending_streams_drain_two_trains_fifo() {
         let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
         let mut rows = 0usize;
         for (i, (_, bytes)) in train.iter().enumerate() {
-            let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).expect("ctrl");
+            let ctrl = gnitz_wire::control::peek_control_block(bytes, false).expect("ctrl");
             assert!(ctrl.flags.continuation);
             let is_last = i == train.len() - 1;
             assert_eq!(
@@ -686,9 +685,9 @@ fn pending_streams_drain_two_trains_fifo() {
                     "a continuation carries no schema block, so it cannot decode standalone"
                 );
                 let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-                let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(schema), &mut offsets)
+                let decoded = ipc::decode_train_frame(bytes, &ctrl, schema, &mut offsets)
                     .expect("continuation decodes against the schema hint");
-                rows += decoded.data_batch.map(|b| b.len()).unwrap_or(0);
+                rows += decoded.map(|b| b.len()).unwrap_or(0);
             }
         }
         assert_eq!(rows, total_rows, "the train's chunks cover all rows exactly once");
@@ -746,7 +745,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
         "one row per frame, since one row alone busts the budget"
     );
     for (_, bytes) in &frames {
-        let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).unwrap();
+        let ctrl = gnitz_wire::control::peek_control_block(bytes, false).unwrap();
         assert_eq!(ctrl.status, WireStatus::Ok, "an over-budget frame is not a fault");
         assert!(bytes.len() > 512, "each frame is one row wider than the budget");
     }
@@ -774,7 +773,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     assert!(wp.pending_streams.is_empty(), "the faulting train pops");
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1, "the fault is the whole reply");
-    let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
+    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1, false).unwrap();
     assert_eq!(ctrl.status, gnitz_wire::WireStatus::Error);
     assert_eq!(ctrl.request_id, 5);
     let text = String::from_utf8_lossy(&ctrl.error_msg);
@@ -821,7 +820,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
     let mut got: Vec<(u128, i64, String)> = Vec::new();
     for (i, (_, bytes)) in frames.iter().enumerate() {
         assert!(bytes.len() <= budget, "frame {i} is {} bytes of {budget}", bytes.len());
-        let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).unwrap();
+        let ctrl = gnitz_wire::control::peek_control_block(bytes, false).unwrap();
         assert_eq!(ctrl.status, WireStatus::Ok);
         assert_eq!(
             ctrl.flags.scan_last,
@@ -829,9 +828,9 @@ fn a_long_string_train_reassembles_with_its_weights() {
             "scan_last only on the terminal frame"
         );
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(&schema), &mut offsets)
+        let decoded = ipc::decode_train_frame(bytes, &ctrl, &schema, &mut offsets)
             .expect("every frame decodes against the client's own schema");
-        let b = decoded.data_batch.as_ref().expect("data block");
+        let b = decoded.as_ref().expect("data block");
         for r in 0..b.len() {
             got.push((
                 mem_pk(b, r),
@@ -887,7 +886,7 @@ fn a_projected_reply_carries_a_one_off_block() {
     let big = Batch::zeroed(&projected, rows);
     wp.send_scan_response(route(tid as u64, 6, 0), big, ReplySchema::OneOff(&projected), 0);
     assert_eq!(wp.pending_streams.len(), 1);
-    let expected_block = crate::catalog::encode_schema_block_ipc(&projected, tid as u32);
+    let expected_block = crate::catalog::encode_schema_block(&projected, tid as u32);
     let ps = wp.pending_streams.front().unwrap();
     assert_eq!(ps.next_row, 0);
     assert_eq!(

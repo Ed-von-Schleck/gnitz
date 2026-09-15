@@ -876,7 +876,7 @@ fn null_sets_the_bitmap_bit() {
 
 #[test]
 fn a_null_cell_round_trips_as_null() {
-    use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
+    use crate::protocol::wal_block::{decode_wal_block, encode_wal_block};
     let schema = nullable_str_blob_schema();
     let mut batch = ZSetBatch::new(&schema);
     {
@@ -885,7 +885,7 @@ fn a_null_cell_round_trips_as_null() {
         a.add_row(42, 1).null().null();
     }
     let encoded = encode_wal_block(1, &batch);
-    let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
+    let (decoded, _) = decode_wal_block(&encoded, &schema).unwrap();
     assert_eq!(decoded.nulls[0], batch.nulls[0], "null bitmap round-trips");
     // The read side gates on the bitmap; the cells themselves are zeroed.
     assert_eq!(decoded.payload[0].bytes, [0u8; 16], "String NULL cell is zeroed");

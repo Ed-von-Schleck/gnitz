@@ -2,8 +2,8 @@ use super::codec::{encode_schema_block, schema_from_block};
 use super::error::ProtocolError;
 use super::types::{Schema, ZSetBatch};
 use super::wal_block::encode_wal_block;
-use super::WAL_BLOCK_HEADER_SIZE;
 use super::{Header, WireConflictMode, WireFlags, WireStatus};
+use gnitz_wire::control::{frame_blocks, peek_control_block};
 use gnitz_wire::txn_frame::WalBlock;
 
 /// One batch's region list, held for as long as the frame encoder needs it. A
@@ -55,9 +55,8 @@ pub struct Message {
 //
 // The control-block wire codec (layout, template encoder, directory-driven
 // decoder) lives in `gnitz_wire::control` — the one implementation both the
-// client and the engine run. The wrappers here adapt it to the client types:
-// `Header` in/out, UTF-8 validated error text, and the checksum stamp every
-// client TCP frame carries.
+// client and the engine run. The wrapper here adapts it to the client types:
+// `Header` in, and a block of its own out.
 
 /// Encode a `Header` + optional error message + optional wide-PK extra bytes
 /// into a control WAL block. When `error_msg` is empty the error_msg column
@@ -65,20 +64,8 @@ pub struct Message {
 pub(crate) fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Vec<u8> {
     let total = gnitz_wire::control::ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let mut buf = vec![0u8; total];
-    // Client frames carry a body checksum, matching `encode_wal_block`.
-    gnitz_wire::control::encode_ctrl_block(&mut buf, 0, header, error_msg.as_bytes(), seek_pk_extra, true);
+    gnitz_wire::control::encode_ctrl_block(&mut buf, 0, header, error_msg.as_bytes(), seek_pk_extra, false);
     buf
-}
-
-/// Decode a control WAL block, returning `(Header, error_msg, seek_pk_extra)`.
-/// `error_msg` is empty when the null bit for error_msg is set;
-/// `seek_pk_extra` is empty when the null bit for seek_pk_extra is set.
-pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), ProtocolError> {
-    let dc = gnitz_wire::control::peek_control_block_ipc(data).map_err(|e| ProtocolError::DecodeError(e.into()))?;
-    let header = dc.header();
-    let error_msg =
-        String::from_utf8(dc.error_msg).map_err(|e| ProtocolError::DecodeError(format!("utf8 in error_msg: {e}")))?;
-    Ok((header, error_msg, dc.seek_pk_extra))
 }
 
 /// An encoded wire message as its constituent WAL blocks — control, optional
@@ -341,24 +328,14 @@ impl ParsedFrame {
 /// delivered — reaches them through the same validation the decoding entry
 /// runs, rather than a second copy of it that could drift on what it checked.
 pub(crate) fn parse_response_frame(buf: &[u8], cached_version: Option<u16>) -> Result<ParsedFrame, ProtocolError> {
-    if buf.len() < WAL_BLOCK_HEADER_SIZE {
-        return Err(ProtocolError::DecodeError("message too small".into()));
-    }
+    let ctrl = peek_control_block(buf, false).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    let blocks = frame_blocks(buf, &ctrl)?;
 
-    let ctrl = gnitz_wire::wal::block_slice_at(buf, 0)?;
-    let ctrl_size = ctrl.len();
-    let (ctrl_header, error_msg, seek_pk_extra) = decode_control_block(ctrl)?;
-
-    let flags = ctrl_header.flags;
-
-    let mut off = ctrl_size;
-    let mut wire_schema: Option<Schema> = None;
-
-    if flags.has_schema {
-        let block = gnitz_wire::wal::block_slice_at(buf, off)?;
-        off += block.len();
-        wire_schema = Some(schema_from_block(block)?);
-    } else if flags.has_data {
+    let wire_schema = match &blocks.schema {
+        Some(r) => Some(schema_from_block(&buf[r.clone()])?),
+        None => None,
+    };
+    if blocks.schema.is_none() && blocks.data.is_some() {
         // A hint-only frame: the caller decodes it against the schema it already
         // holds, so all this leg checks is that the stamp still matches.
         let Some(cached) = cached_version else {
@@ -366,7 +343,7 @@ pub(crate) fn parse_response_frame(buf: &[u8], cached_version: Option<u16>) -> R
                 "a data block without a schema block and no cached schema".into(),
             ));
         };
-        let server_version = flags.schema_version;
+        let server_version = ctrl.flags.schema_version;
         if server_version != cached {
             return Err(ProtocolError::DecodeError(format!(
                 "schema version mismatch: cached={cached} server={server_version}"
@@ -374,30 +351,25 @@ pub(crate) fn parse_response_frame(buf: &[u8], cached_version: Option<u16>) -> R
         }
     }
 
-    let data_block = if flags.has_data {
-        let block = gnitz_wire::wal::block_slice_at(buf, off)?;
-        Some(off..off + block.len())
-    } else {
-        None
-    };
-
     // Every non-OK status the server emits rides a control-only frame, so both
     // blocks are already absent and there is nothing to suppress. Keyed on the
     // text being present rather than on `WireStatus::Error`: `SalFull` carries
     // server-formatted text too, and gating on one status dropped it.
+    let error_msg =
+        String::from_utf8(ctrl.error_msg).map_err(|e| ProtocolError::DecodeError(format!("utf8 in error_msg: {e}")))?;
     let error_text = (!error_msg.is_empty()).then_some(error_msg);
 
     Ok(ParsedFrame {
         message: Message {
-            status: ctrl_header.status,
-            target_id: ctrl_header.target_id,
-            flags: ctrl_header.flags,
-            seek_pk: ctrl_header.seek_pk,
+            status: ctrl.status,
+            target_id: ctrl.target_id,
+            flags: ctrl.flags,
+            seek_pk: ctrl.seek_pk,
             schema: wire_schema.map(std::sync::Arc::new),
             error_text,
-            seek_pk_extra,
+            seek_pk_extra: ctrl.seek_pk_extra,
         },
-        data_block,
+        data_block: blocks.data,
     })
 }
 

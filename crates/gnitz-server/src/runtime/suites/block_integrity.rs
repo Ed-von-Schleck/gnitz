@@ -7,12 +7,12 @@ use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::schema::decode_schema_block;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
+use gnitz_wire::control::peek_control_block;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
-use gnitz_wire::control::{peek_control_block, peek_control_block_ipc};
 use gnitz_wire::WireStatus;
 use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_SIZE, WAL_OFF_TID};
 
-/// A checksummed schema WAL block for a 4-column schema.
+/// A schema WAL block for a 4-column schema.
 fn schema_block_4col() -> Vec<u8> {
     use gnitz_store::schema::SchemaColumn;
     use gnitz_wire::type_code;
@@ -39,7 +39,7 @@ fn schema_block_4col() -> Vec<u8> {
 fn schema_block_count_forgeries_are_rejected() {
     let clean = schema_block_4col();
     assert_eq!(
-        decode_schema_block(&clean, true)
+        decode_schema_block(&clean, false)
             .expect("clean schema block")
             .num_columns(),
         4
@@ -48,7 +48,7 @@ fn schema_block_count_forgeries_are_rejected() {
         let mut buf = clean.clone();
         gnitz_wire::write_u32_le(&mut buf, WAL_OFF_COUNT, forged_count);
         assert_eq!(
-            decode_schema_block(&buf, true).err(),
+            decode_schema_block(&buf, false).err(),
             Some("schema block region size mismatch"),
             "schema COUNT 4 -> {forged_count} must be rejected"
         );
@@ -98,12 +98,12 @@ fn single_bit_header_sweep_changes_nothing_observable() {
     );
 
     let mut buf = schema_block_4col();
-    let reference = decode_schema_block(&buf, true).expect("clean");
+    let reference = decode_schema_block(&buf, false).expect("clean");
     sweep_bit_flips(&mut buf, 0..WAL_HEADER_SIZE, |byte, bit, buf| {
         if (WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8).contains(&byte) {
             return;
         }
-        let Ok(decoded) = decode_schema_block(buf, true) else {
+        let Ok(decoded) = decode_schema_block(buf, false) else {
             return;
         };
         assert_eq!(
@@ -144,13 +144,13 @@ fn every_single_bit_flip_in_the_control_block_body_is_rejected() {
         target_id: 7,
         request_id: 0x1234_5678_9ABC_DEF0,
         schema_block: Some(&block),
-        data: WireData::Whole(Some(&batch)),
+        data: WireData::Whole(&batch),
         ..Default::default()
     }
     .encode_to_vec();
     sweep_bit_flips(&mut buf, WAL_HEADER_SIZE..CTRL_BLOCK_SIZE_NO_BLOB, |byte, bit, buf| {
         assert!(
-            crate::runtime::wire::decode_wire(buf).is_err(),
+            crate::runtime::wire::decode_sal_slot(buf, true).is_err(),
             "control-block byte {byte} bit {bit} must be rejected"
         );
     });
@@ -179,7 +179,10 @@ fn the_control_blocks_size_field_is_exact() {
             true,
         );
         buf.truncate(n);
-        assert_eq!(peek_control_block(&buf).expect("clean control block").block_size, n);
+        assert_eq!(
+            peek_control_block(&buf, true).expect("clean control block").block_size,
+            n
+        );
         assert!(
             n > CTRL_BLOCK_SIZE_NO_BLOB || error_msg.is_empty(),
             "the spill fixture must actually spill"
@@ -189,7 +192,7 @@ fn the_control_blocks_size_field_is_exact() {
             let mut forged = buf.clone();
             gnitz_wire::write_u32_le(&mut forged, WAL_OFF_SIZE, (n as i64 + delta) as u32);
             assert_eq!(
-                peek_control_block_ipc(&forged).err(),
+                peek_control_block(&forged, false).err(),
                 Some("control block size disagrees with its blob region"),
                 "SIZE {n} {delta:+} must be rejected on the blob relation, not framed through"
             );
@@ -197,9 +200,9 @@ fn the_control_blocks_size_field_is_exact() {
     }
 }
 
-/// The push fast path (`scatter::with_group`) stamps the control-block checksum
-/// too — the SAL's highest-volume writer, and the one every other fixture here
-/// misses.
+/// A zoned push slot laid out by the fast path (`scatter::with_group`) carries
+/// the control-block checksum — the SAL's highest-volume writer, and the one
+/// every other fixture here misses.
 #[test]
 fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     use crate::runtime::sal::fixtures::{group_at, TestLog};
@@ -207,17 +210,19 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     let sal = TestLog::new(1 << 20, 2, 1);
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    sal.push_group(5, 16, schema, &batch, |g| sal.writer.write(g));
+    let scope = sal.writer.begin(5, "test");
+    sal.push_group(5, 16, schema, &batch, |g| scope.write(g, true));
+    scope.commit().expect("sentinel fits");
 
     let msg = group_at(sal.log(), 0);
     let slot = msg.slot(0).expect("slot 0 carries bytes");
-    crate::runtime::wire::decode_wire(slot).expect("the fast path's slot must verify");
+    crate::runtime::wire::decode_sal_slot(slot, true).expect("the fast path's slot must verify");
 
     // A flipped control byte in that slot fails the same checksum.
     let mut forged = slot.to_vec();
     forged[WAL_HEADER_SIZE] ^= 1;
     assert!(
-        crate::runtime::wire::decode_wire(&forged).is_err(),
+        crate::runtime::wire::decode_sal_slot(&forged, true).is_err(),
         "the fast path must stamp a control-block checksum, or nothing verifies it"
     );
 }

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
 use gnitz_store::storage::{Batch, Layout, MemBatch, MAX_BATCH_REGIONS};
-use gnitz_wire::control::{peek_control_block_ipc, DecodedControl};
+use gnitz_wire::control::{frame_blocks, peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
 /// The operative bound on **every** reply the server emits, forwarded or not,
@@ -17,46 +17,13 @@ use gnitz_wire::{WireFlags, WireStatus};
 /// The server's *ingress* limit is the wire constant itself.
 pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
 
-/// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
-/// replies): the copy paid to save per-frame sends. `fanout_coalesced_egress_bench`
-/// measures the trade.
-pub(crate) const COALESCE_MAX_BYTES: usize = 32 * 1024;
-
-/// The one text for a reply that cannot be framed, shared by the two producers
-/// that check [`FRAME_CAP`].
+/// The one text for a reply that cannot be framed within [`FRAME_CAP`].
 pub(crate) fn oversized_frame_message(sz: usize) -> String {
     format!(
         "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; \
          one row wider than the cap cannot be returned at all"
     )
 }
-
-// ---------------------------------------------------------------------------
-// Chunked distributed-backfill coordination: the two overloads of `seek_col_idx`
-// ---------------------------------------------------------------------------
-//
-// A distributed CREATE-VIEW backfill runs one exchange round per source chunk,
-// and every worker must run the SAME number of rounds (short partitions pad),
-// so termination and SAL reclamation are decided collectively by the master and
-// stamped back on each relay. Both legs overload the otherwise-unused
-// `seek_col_idx`, whose `0` reads as "no backfill coordination" — which is what
-// a steady-state exchange already sends.
-
-/// Up-leg (worker→master, on an exchange frame): the per-chunk PAD bit. Set when
-/// this worker's `drain_chunk` returned `None` — its partition is exhausted and
-/// the chunk it is participating in is an empty pad. The master ANDs this bit
-/// across all workers for a round; an all-pad round is the final round.
-pub const BACKFILL_PAD_BIT: u64 = 1;
-
-/// Down-leg (master→worker, on `ExchangeRelay`): the collective decision the
-/// master stamps onto a round's relay after ANDing the round's pad bits and
-/// checking SAL space. `CONTINUE` keeps the loop going; `STOP` ends every
-/// worker's loop on the same (all-pad) round; `CHECKPOINT` is a continue that
-/// also tells the worker to advance its SAL read epoch + reset its read cursor
-/// inline (the master reclaims the SAL write side at the next round barrier).
-pub const BACKFILL_DECISION_CONTINUE: u64 = 0;
-pub const BACKFILL_DECISION_STOP: u64 = 1;
-pub const BACKFILL_DECISION_CHECKPOINT: u64 = 2;
 
 /// A relation's wire identity: the target id, the schema, and the encoded block
 /// describing that schema — one value, because the scatter writer needs all
@@ -115,51 +82,42 @@ impl WireSchema {
 
 /// The data payload of one wire message: which rows of a batch it carries, and
 /// how they are gathered — the only axis on which the encode shapes differ.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub enum WireData<'a> {
-    Whole(Option<&'a Batch>),
+    #[default]
+    None,
+    Whole(&'a Batch),
     /// The rows `indices` selects, in that order, encoded straight into the
     /// destination — no per-worker sub-`Batch` in between. Valid only for a
     /// schema with no German-string column.
-    ///
-    /// The descriptor rides here because both halves read region strides off
-    /// it — `wire_block_size` sizes the block, `encode_scattered_to_wire` carves
-    /// it — and a frame's schema block is bytes, not strides.
     Scattered {
         batch: &'a Batch,
         indices: &'a [u32],
-        schema: &'a SchemaDescriptor,
     },
-}
-
-impl Default for WireData<'_> {
-    fn default() -> Self {
-        WireData::Whole(None)
-    }
 }
 
 impl<'a> WireData<'a> {
     /// Rows this payload carries; `0` means the slot or frame is dataless.
     pub(crate) fn row_count(&self) -> usize {
         match *self {
-            WireData::Whole(b) => b.map(|b| b.len()).unwrap_or(0),
+            WireData::None => 0,
+            WireData::Whole(b) => b.len(),
             WireData::Scattered { indices, .. } => indices.len(),
         }
     }
 
-    fn layout_batch(&self) -> Option<&'a Batch> {
+    fn batch(&self) -> Option<&'a Batch> {
         match *self {
-            WireData::Whole(b) => b,
-            WireData::Scattered { batch, .. } => Some(batch),
+            WireData::None => None,
+            WireData::Whole(b) | WireData::Scattered { batch: b, .. } => Some(b),
         }
     }
 
     fn wire_byte_size(&self) -> usize {
         match *self {
-            WireData::Whole(b) => b.map(|b| b.wire_byte_size()).unwrap_or(0),
-            WireData::Scattered { indices, schema, .. } => {
-                gnitz_store::storage::wire_block_size(schema, indices.len(), 0)
-            }
+            WireData::None => 0,
+            WireData::Whole(b) => b.wire_byte_size(),
+            WireData::Scattered { batch, indices } => batch.wire_byte_size_range(indices.len()),
         }
     }
 }
@@ -210,20 +168,10 @@ impl<'a> WireMsg<'a> {
         total
     }
 
-    /// Encode into `out[offset..]` with WAL block checksums, for the durable and
-    /// cross-process paths (WAL, SAL). Returns bytes written; panics if `out` is
-    /// too small for [`size`](WireMsg::size).
-    pub fn encode(&self, out: &mut [u8], offset: usize) -> usize {
-        self.encode_impl(out, offset, true)
-    }
-
-    /// Encode without checksums, for the frames whose reader verifies none: the
-    /// W2M ring (`decode_wire_ipc`) and client egress (`peek_control_block_ipc`).
-    pub fn encode_ipc(&self, out: &mut [u8], offset: usize) -> usize {
-        self.encode_impl(out, offset, false)
-    }
-
-    fn encode_impl(&self, out: &mut [u8], offset: usize, checksum: bool) -> usize {
+    /// Encode into `out[offset..]`, returning bytes written; panics if `out` is
+    /// shorter than [`size`](WireMsg::size). `checksum`: only a zoned SAL slot
+    /// carries them.
+    pub fn encode(&self, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let has_data = self.has_data();
 
         let wire_flags = WireFlags {
@@ -232,7 +180,7 @@ impl<'a> WireMsg<'a> {
             // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
             // (debug-verified) at its producer, so the shipped claim is
             // verified-by-construction.
-            batch_consolidated: has_data && self.data.layout_batch().unwrap().layout() == Layout::Consolidated,
+            batch_consolidated: has_data && self.data.batch().is_some_and(|b| b.layout() == Layout::Consolidated),
             ..self.flags
         };
 
@@ -257,14 +205,20 @@ impl<'a> WireMsg<'a> {
         if let Some(block) = self.schema_block {
             let end = pos + block.len();
             out[pos..end].copy_from_slice(block);
+            // The block is shared, so it is encoded without one.
+            if checksum {
+                gnitz_wire::wal::stamp_checksum(&mut out[pos..end], block.len());
+            }
             pos = end;
         }
 
         if has_data {
+            let tid = self.target_id as u32;
             pos += match self.data {
-                WireData::Whole(b) => b.unwrap().encode_to_wire(self.target_id as u32, out, pos, checksum),
-                WireData::Scattered { batch, indices, schema } => {
-                    batch.encode_scattered_to_wire(indices, schema, self.target_id as u32, out, pos, checksum)
+                WireData::None => unreachable!("has_data implies a batch"),
+                WireData::Whole(b) => b.encode_to_wire(tid, out, pos, checksum),
+                WireData::Scattered { batch, indices } => {
+                    batch.encode_scattered_to_wire(indices, tid, out, pos, checksum)
                 }
             };
         }
@@ -315,96 +269,74 @@ pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_prom
     SchemaDescriptor::new(cols, &pks)
 }
 
-/// Full decoded wire message. `B` is the data batch's form: an owned [`Batch`]
-/// — the default — or a [`MemBatch`] borrowing the frame bytes, from the
-/// zero-copy ring decoder.
-pub struct DecodedWire<B = Batch> {
+/// Full decoded wire message.
+pub struct DecodedWire {
     pub control: DecodedControl,
     /// The frame's own schema block, decoded; `None` when the frame carried none.
     pub schema: Option<SchemaDescriptor>,
-    pub data_batch: Option<B>,
+    pub data_batch: Option<Batch>,
 }
 
-/// Checksum-verified control-block parse, for a frame that crossed a trust or
-/// durability boundary. It bounds every read by the block's own size field, so
-/// the routing fields and the decode that follows read one directory — a
-/// malicious client cannot forge one that points the auth check at one offset
-/// and the decoder at another.
-pub(crate) use gnitz_wire::control::peek_control_block;
-
-/// Client-boundary decode with a pre-parsed control block (the `handle_message`
-/// single-parse path). Full checksum verification on all three blocks — the
-/// control block's by the [`peek_control_block`] that produced `control`.
-///
-/// The batch comes back `Raw`: unlike [`decode_wire`] this never installs the
-/// frame's `batch_consolidated` claim, which a client must not be trusted
-/// to make.
-pub fn decode_wire_with_ctrl(
+/// Decode a client frame. The batch stays `Raw`: a client's layout claim is not trusted.
+pub fn decode_client_frame(
     data: &[u8],
     control: DecodedControl,
     hint: Option<&SchemaDescriptor>,
 ) -> Result<DecodedWire, &'static str> {
-    decode_frame(data, control, hint, true, |block, schema| {
-        Batch::decode_from_wal_block(block, schema, true).map(|(b, _)| b)
-    })
+    let (schema, data_batch) = decode_frame(data, &control, hint, false, Batch::decode_foreign_wal_block)?;
+    Ok(DecodedWire { control, schema, data_batch })
 }
 
-/// Decode a full checksum-verified wire message from raw bytes: the SAL, the
-/// boot replay and the worker's own SAL consumption all read frames this way.
-pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    let control = peek_control_block(data)?;
-    let mut decoded = decode_wire_with_ctrl(data, control, None)?;
+/// Decode one SAL slot; `verify`: only a zoned slot carries checksums.
+pub fn decode_sal_slot(data: &[u8], verify: bool) -> Result<DecodedWire, &'static str> {
+    let control = peek_control_block(data, verify)?;
+    let (schema, data_batch) = decode_frame(data, &control, None, verify, |b, s| {
+        Batch::decode_from_wal_block(b, s, verify).map(|(b, _)| b)
+    })?;
+    let mut decoded = DecodedWire { control, schema, data_batch };
     certify_engine_frame(&mut decoded);
     Ok(decoded)
 }
 
-/// Decode one W2M ring frame into an owned `DecodedWire`. No checksum
-/// verification — the ring is a trusted intra-process mapping, unlike the SAL —
-/// and a control-only frame decodes fine (`data_batch: None`).
-///
-/// Built through the zero-copy decode, so `append_mem_batch` **relocates** the
-/// blob heap where `Batch::decode_from_wal_block` would copy it verbatim. That
-/// is the compaction point for an exchange frame's full unfiltered heap, and a
-/// cost (one cell rewrite per string cell, against one bulk `memcpy`) for a
-/// frame with no dead heap. One policy for the ring, not the cheaper of the two
-/// per frame.
+/// Decode one W2M ring frame into an owned `DecodedWire`. The append relocates
+/// the blob heap: an exchange frame can carry a whole unfiltered heap, and this
+/// is where it is compacted.
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    let control = peek_control_block_ipc(data)?;
-    let mut decoded = decode_frame(data, control, None, false, |block, schema| {
+    let control = peek_control_block(data, false)?;
+    let (schema, data_batch) = decode_frame(data, &control, None, false, |block, schema| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
         let mut owned = Batch::with_capacity(schema, mb.len());
         owned.append_mem_batch(&mb);
         Ok(owned)
     })?;
+    let mut decoded = DecodedWire { control, schema, data_batch };
     certify_engine_frame(&mut decoded);
     Ok(decoded)
 }
 
-/// Decode a W2M ring frame without copying data: the data block comes back as
-/// a [`MemBatch`] borrowing `data`, so the caller keeps `data` live (holds the
-/// `W2mSlot`) while reading it, and lends the region-offset array the view
-/// borrows (see [`MemBatch::offsets`]).
-///
-/// Takes a pre-parsed `control` block (from `peek_control_block_ipc`) so the
-/// train readers can inspect the header before choosing a decode path without
-/// a second parse. `hint` is what a continuation frame decodes against.
-pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
+/// One frame of a worker train, borrowed from `data`. A frame carrying its own
+/// schema block must carry `expected`.
+pub(crate) fn decode_train_frame<'a>(
     data: &'a [u8],
-    control: DecodedControl,
-    hint: Option<&SchemaDescriptor>,
+    control: &DecodedControl,
+    expected: &SchemaDescriptor,
     offsets: &'a mut [usize; MAX_BATCH_REGIONS],
-) -> Result<DecodedWire<MemBatch<'a>>, &'static str> {
-    decode_frame(data, control, hint, false, move |block, schema| {
+) -> Result<Option<MemBatch<'a>>, String> {
+    let (block_schema, batch) = decode_frame(data, control, Some(expected), false, move |block, schema| {
         gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, offsets)
-    })
+    })?;
+    if let Some(s) = &block_schema {
+        validate_schema_match(s, expected)?;
+    }
+    Ok(batch)
 }
 
 /// Install an engine-authored frame's layout claim: its `batch_consolidated`
 /// bit is real, and skipping the re-fold is the point of sending it, so the batch
 /// is raised off `Raw`. `certify_layout`
 /// debug-verifies what it installs, which is why the client path
-/// (`decode_wire_with_ctrl`) never comes through here — a lying client frame
+/// (`decode_client_frame`) never comes through here — a lying client frame
 /// must be answered with an error, not a debug-build abort.
 fn certify_engine_frame(decoded: &mut DecodedWire) {
     let layout = if decoded.control.flags.batch_consolidated {
@@ -417,49 +349,29 @@ fn certify_engine_frame(decoded: &mut DecodedWire) {
     }
 }
 
-/// The one frame walk behind every decoder: locate the schema and data blocks
-/// after the control block, resolve the descriptor the data is read against,
-/// and decode the data block through `decode` — which is the only thing the
-/// owned and the zero-copy decoders do differently.
-///
-/// A frame that carries a schema block decodes against that block. A
-/// continuation frame — data with no block of its own — decodes against `hint`,
-/// and without one there is nothing to do but reject it.
+/// A frame's own schema, and its data decoded through `decode` against that
+/// schema or else `hint`.
 fn decode_frame<'a, B>(
     data: &'a [u8],
-    control: DecodedControl,
+    control: &DecodedControl,
     hint: Option<&SchemaDescriptor>,
     verify: bool,
     decode: impl FnOnce(&'a [u8], &SchemaDescriptor) -> Result<B, &'static str>,
-) -> Result<DecodedWire<B>, &'static str> {
-    let flags = control.flags;
-    let mut off = control.block_size;
-
-    let block_schema = if flags.has_schema {
-        let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        off += sblock.len();
-        Some(decode_schema_block(sblock, verify)?)
-    } else {
-        None
+) -> Result<(Option<SchemaDescriptor>, Option<B>), &'static str> {
+    let blocks = frame_blocks(data, control)?;
+    let block_schema = match blocks.schema {
+        Some(r) => Some(decode_schema_block(&data[r], verify)?),
+        None => None,
     };
-    if !flags.has_data {
-        return Ok(DecodedWire {
-            control,
-            schema: block_schema,
-            data_batch: None,
-        });
-    }
+    let Some(r) = blocks.data else {
+        return Ok((block_schema, None));
+    };
     let schema = block_schema
         .as_ref()
         .or(hint)
         .ok_or("a data block without a schema block")?;
-    let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
-    let data_batch = decode(dblock, schema)?;
-    Ok(DecodedWire {
-        control,
-        schema: block_schema,
-        data_batch: Some(data_batch),
-    })
+    let batch = decode(&data[r], schema)?;
+    Ok((block_schema, Some(batch)))
 }
 
 #[cfg(test)]

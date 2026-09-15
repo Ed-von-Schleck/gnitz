@@ -251,14 +251,14 @@ impl MasterDispatcher {
                         )
                     });
                     let decision = if all_pad {
-                        BACKFILL_DECISION_STOP
+                        BackfillDecision::Stop
                     } else if checkpoint_allowed
                         && (self.relay_fit(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
                     {
                         pending_reset = true;
-                        BACKFILL_DECISION_CHECKPOINT
+                        BackfillDecision::Checkpoint
                     } else {
-                        BACKFILL_DECISION_CONTINUE
+                        BackfillDecision::Continue
                     };
                     if let Err(e) = self.emit_relay_with_decision(&prep, decision) {
                         gnitz_fatal_abort!(
@@ -411,25 +411,20 @@ impl MasterDispatcher {
         self.sal.fit_relay(need)
     }
 
-    /// Build the SAL group an exchange relay writes and hand it to `f`. Sizing
-    /// and emission both go through here, so the bytes checked are the bytes
-    /// written; `WireMsg::size` does not read `decision`.
-    ///
-    /// `seek_pk` echoes `source_id` back so the worker's `do_exchange_wait` can
-    /// match on (view_id, source_id). Without it, a multi-source view (join over
-    /// 2+ tables) can deliver the wrong source's relay to a waiting exchange and
-    /// the worker demuxes against the wrong sharding columns.
+    /// Build the SAL group an exchange relay writes and hand it to `f`: sizing and
+    /// emission both go through here, so the bytes checked are the bytes written.
+    /// `seek_pk` echoes `source_id`, so a join's wait cannot take another source's relay.
     fn with_relay_group<R>(
         &self,
         view: &wire::WireSchema,
         source_id: i64,
         dest: &RelayDest,
-        decision: u64,
+        decision: BackfillDecision,
         f: impl FnOnce(&DirectGroup) -> R,
     ) -> R {
         let template = view.frame(wire::WireMsg {
             seek_pk: source_id as u128,
-            seek_col_idx: decision,
+            flags: WireFlags { backfill: decision, ..Default::default() },
             ..Default::default()
         });
         let group = |data| DirectGroup {
@@ -438,9 +433,9 @@ impl MasterDispatcher {
             ..DirectGroup::new(SalMessageKind::ExchangeRelay)
         };
         match dest {
-            RelayDest::Broadcast(b) => f(&group(GroupData::Same(wire::WireData::Whole(Some(&**b))))),
+            RelayDest::Broadcast(b) => f(&group(GroupData::Same(wire::WireData::Whole(b)))),
             RelayDest::PerWorker(batches) => {
-                let slots: Vec<wire::WireData> = batches.iter().map(|b| wire::WireData::Whole(Some(b))).collect();
+                let slots: Vec<wire::WireData> = batches.iter().map(wire::WireData::Whole).collect();
                 f(&group(GroupData::PerWorker(&slots)))
             }
         }
@@ -527,21 +522,21 @@ impl MasterDispatcher {
         // Size the group here, outside `sal_writer_excl`: the batches are in
         // hand, so the fit check under the lock is a comparison rather than a
         // sizing pass.
-        let footprint = self.with_relay_group(&view, source_id, &dest, BACKFILL_DECISION_CONTINUE, |g| {
+        let footprint = self.with_relay_group(&view, source_id, &dest, BackfillDecision::Continue, |g| {
             self.sal.footprint(g)
         });
 
         Ok(RelayPrepared { view, source_id, dest, footprint })
     }
 
-    /// Synchronous second half of a relay: writes the ExchangeRelay group to
-    /// SAL and signals workers, stamping the round `decision` (a
-    /// `BACKFILL_DECISION_*`) onto the relay's `seek_col_idx`. No awaits inside.
-    ///
-    /// The caller must exclude every other SAL writer, by either of the two means
-    /// this codebase has: a steady tick relay holds `sal_writer_excl` across the
-    /// call, while an exclusive round polls no task, so none can reach the SAL.
-    pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), WireFault> {
+    /// Write a prepared relay stamped with the round's `decision`, and signal the
+    /// workers. The caller excludes every other SAL writer: a steady tick relay
+    /// holds `sal_writer_excl`, an exclusive round polls no task.
+    pub(crate) fn emit_relay_with_decision(
+        &self,
+        prep: &RelayPrepared,
+        decision: BackfillDecision,
+    ) -> Result<(), WireFault> {
         self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| {
             self.write_group(g)
         })?;
@@ -672,7 +667,7 @@ impl MasterDispatcher {
         scope.write(
             &DirectGroup {
                 template: relation.frame(wire::WireMsg::default()),
-                data: GroupData::Same(wire::WireData::Whole(Some(batch))),
+                data: GroupData::Same(wire::WireData::Whole(batch)),
                 ..DirectGroup::new(SalMessageKind::DdlSync)
             },
             true,

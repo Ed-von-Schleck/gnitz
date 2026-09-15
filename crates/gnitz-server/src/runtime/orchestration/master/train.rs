@@ -1,32 +1,42 @@
 //! Worker reply trains: the frames a worker answers one scan-shaped request with,
-//! ending at the one [`train_has_more`] reports terminal.
+//! ending at the one flagged `scan_last`.
 
 use super::*;
 
 /// A decode failure on one frame of a reply train, named after the verb `what`.
-pub(super) fn scan_decode_err(w: usize, what: &str, e: &'static str) -> WireFault {
+fn scan_decode_err(w: usize, what: &str, e: &str) -> WireFault {
     format!("{what}: worker {w}: decode error: {e}").into()
 }
 
 /// One frame header of worker `w`'s train and whether more frames follow, or `Err`
 /// (prefixed with `what`) on a fault frame or a corrupt header. Dropping the
 /// caller's scan lease discards the rest of the train.
-pub(super) fn parse_train_header(
+fn parse_train_header(
     slot: &W2mSlot,
     w: usize,
     what: &str,
 ) -> Result<(gnitz_wire::control::DecodedControl, bool), WireFault> {
-    let ctrl = peek_control_block_ipc(slot.bytes()).map_err(|e| scan_decode_err(w, what, e))?;
+    let ctrl = peek_control_block(slot.bytes(), false).map_err(|e| scan_decode_err(w, what, e))?;
     if let Some(e) = super::worker_error(w, what, &ctrl) {
         return Err(e);
     }
-    let has_more = train_has_more(ctrl.flags);
+    let has_more = !ctrl.flags.scan_last;
     Ok((ctrl, has_more))
 }
 
-/// Whether more frames of a worker train follow the one carrying `flags`.
-pub(crate) fn train_has_more(flags: WireFlags) -> bool {
-    !flags.scan_last
+/// Worker `w`'s train frame in `slot`: whether more frames follow, and its rows
+/// decoded against `expected`.
+pub(super) fn decode_train_slot<'a>(
+    slot: &'a W2mSlot,
+    w: usize,
+    what: &str,
+    expected: &SchemaDescriptor,
+    offsets: &'a mut [usize; gnitz_store::storage::MAX_BATCH_REGIONS],
+) -> Result<(bool, Option<gnitz_store::storage::MemBatch<'a>>), WireFault> {
+    let (ctrl, has_more) = parse_train_header(slot, w, what)?;
+    let batch =
+        wire::decode_train_frame(slot.bytes(), &ctrl, expected, offsets).map_err(|e| scan_decode_err(w, what, &e))?;
+    Ok((has_more, batch))
 }
 
 /// Drain every worker's train in worker order, handing `on_batch` each non-empty
@@ -42,21 +52,12 @@ pub(super) async fn drain_index_scan(
     for (i, mut slot) in slots.into_iter().enumerate() {
         let w = scan.worker(i);
         loop {
-            let (ctrl, has_more) = parse_train_header(&slot, w, what)?;
             let frame_len = slot.bytes().len();
             let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, Some(expected), &mut offsets)
-                .map_err(|e| scan_decode_err(w, what, e))?;
-            if let Some(s) = zc.schema.as_ref() {
-                wire::validate_schema_match(s, expected)
-                    .map_err(|e| WireFault::from(format!("worker {w}: {what}: {e}")))?;
+            let (has_more, batch) = decode_train_slot(&slot, w, what, expected, &mut offsets)?;
+            if let Some(mb) = batch.filter(|mb| !mb.is_empty()) {
+                on_batch(&mb, frame_len)?;
             }
-            if let Some(ref mb) = zc.data_batch {
-                if !mb.is_empty() {
-                    on_batch(mb, frame_len)?;
-                }
-            }
-            drop(zc); // borrows slot
             drop(slot);
             if !has_more {
                 break;

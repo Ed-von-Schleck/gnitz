@@ -52,29 +52,15 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
         .collect()
 }
 
-/// Encode a schema descriptor into a standalone checksummed WAL wire block
-/// carrying only the physical column shape — no names, no catalog flags. This
-/// is what SAL entries and one-off reply blocks ship: nothing engine-side reads
-/// a name, and the client decodes such a block against a schema it already
-/// holds.
+/// Encode `schema`'s physical column shape, without the names and catalog flags
+/// nothing engine-side reads.
 pub(crate) fn encode_schema_block(schema: &SchemaDescriptor, tid: u32) -> Vec<u8> {
     gnitz_wire::schema_block::encode(tid, &schema_block_cols(schema, None))
 }
 
-/// [`encode_schema_block`] without the body checksum, for the intra-process
-/// frames `decode_wire_ipc` reads back — it verifies nothing, so the XXH3 would
-/// be computed and never read. Naming the two paths apart rather than passing a
-/// flag matches `encode`/`encode_ipc` and `peek_control_block`/`_ipc`, and keeps
-/// the wrong one off the SAL, where an unchecksummed block fails to decode.
-pub(crate) fn encode_schema_block_ipc(schema: &SchemaDescriptor, tid: u32) -> Vec<u8> {
-    gnitz_wire::schema_block::encode_ipc(tid, &schema_block_cols(schema, None))
-}
-
 /// [`encode_schema_block`] plus the per-column catalog facts the descriptor
 /// does not carry — name, `is_hidden`, `is_serial`. The block a *client*
-/// decodes into a `Schema`, so it is the one that must be named. Always
-/// checksummed: a named block only ever leaves through the SAL or a client
-/// reply.
+/// decodes into a `Schema`, so it is the one that must be named.
 pub(in crate::catalog) fn encode_named_schema_block(
     schema: &SchemaDescriptor,
     defs: &[ColumnDef],

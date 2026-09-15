@@ -558,10 +558,10 @@ fn footprint_equals_emitted_bytes() {
 
     // Slot 2 stays empty: the relay passes a dataless slot for a zero-row worker.
     let worker_data = [
-        WireData::Whole(Some(&batch)),
-        WireData::Whole(Some(&batch)),
-        WireData::Whole(None),
-        WireData::Whole(Some(&batch)),
+        WireData::Whole(&batch),
+        WireData::Whole(&batch),
+        WireData::None,
+        WireData::Whole(&batch),
     ];
     let group = DirectGroup {
         template: WireMsg {
@@ -589,7 +589,7 @@ fn footprint_equals_emitted_bytes() {
 /// sized to that blob rather than to the template's.
 #[test]
 fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
-    use crate::runtime::wire::{decode_wire, WireMsg};
+    use crate::runtime::wire::{decode_sal_slot, WireMsg};
 
     let nw = 3;
     let log = TestLog::new(1 << 20, nw, 1);
@@ -612,7 +612,7 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
     let msg = group_at(log.log(), before);
     for (w, extra) in extras.iter().enumerate() {
         let slot = msg.slot(w as u32).expect("every worker is written");
-        let decoded = decode_wire(slot).expect("a slot decodes");
+        let decoded = decode_sal_slot(slot, false).expect("a slot decodes");
         assert_eq!(decoded.control.seek_pk_extra, *extra, "worker {w}");
     }
     let sizes: Vec<usize> = (0..nw as u32).map(|w| msg.slot(w).unwrap().len()).collect();
@@ -620,6 +620,35 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
         sizes[1] < sizes[0] && sizes[0] < sizes[2],
         "each slot sized to its blob: {sizes:?}"
     );
+}
+
+/// In one scope, only the zoned group's slot carries checksums.
+#[test]
+fn only_a_zoned_slot_carries_checksums() {
+    use crate::runtime::wire::decode_sal_slot;
+    use crate::test_support::{make_batch, make_schema_u64_i64};
+
+    let log = TestLog::new(1 << 20, 1, 1);
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+
+    let scope = log.writer.begin(5, "test");
+    let zoned = log.push_group(5, 16, schema, &batch, |g| scope.write(g, true));
+    let unzoned = log.push_group(5, 16, schema, &batch, |g| scope.write(g, false));
+    scope.commit().expect("sentinel fits");
+
+    let zoned_msg = group_at(log.log(), zoned);
+    let zoned_slot = zoned_msg.slot(0).expect("slot 0 is written");
+    decode_sal_slot(zoned_slot, true).expect("a zoned slot verifies");
+
+    let unzoned_msg = group_at(log.log(), unzoned);
+    let unzoned_slot = unzoned_msg.slot(0).expect("slot 0 is written");
+    assert!(
+        decode_sal_slot(unzoned_slot, true).is_err(),
+        "an unzoned slot carries no checksum to verify"
+    );
+    let decoded = decode_sal_slot(unzoned_slot, false).expect("an unzoned slot decodes unverified");
+    assert_eq!(decoded.data_batch.map(|b| b.len()), Some(2));
 }
 
 /// A schema with no German-string column takes the one-copy scatter, whatever
@@ -662,7 +691,7 @@ fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
 /// empty slot keeps its block — there the schema *is* the payload.
 #[test]
 fn a_rowless_push_slot_carries_no_schema_block() {
-    use crate::runtime::wire::{decode_wire, WireData, WireMsg};
+    use crate::runtime::wire::{decode_sal_slot, WireData, WireMsg};
     use crate::test_support::{make_batch, make_schema_u64_i64};
 
     let nw = 4;
@@ -676,7 +705,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
     let msg = group_at(log.log(), 0);
     let mut with_rows = 0;
     for (w, bytes) in msg.slots_written() {
-        let decoded = decode_wire(bytes).expect("every written slot decodes");
+        let decoded = decode_sal_slot(bytes, false).expect("every written slot decodes");
         match decoded.data_batch {
             Some(b) => {
                 with_rows += 1;
@@ -693,12 +722,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
 
     // The relay's own empty slot is the counter-case, on the same writer.
     let block = crate::catalog::encode_schema_block(&schema, 16);
-    let worker_data = [
-        WireData::Whole(None),
-        WireData::Whole(None),
-        WireData::Whole(None),
-        WireData::Whole(None),
-    ];
+    let worker_data = [WireData::None, WireData::None, WireData::None, WireData::None];
     let base = log.cursor();
     log.writer
         .write(&DirectGroup {
@@ -713,7 +737,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
         .expect("group fits");
     let relay = group_at(log.log(), base);
     for (w, bytes) in relay.slots_written() {
-        let decoded = decode_wire(bytes).expect("every written slot decodes");
+        let decoded = decode_sal_slot(bytes, false).expect("every written slot decodes");
         assert!(
             decoded.schema.is_some(),
             "relay slot {w} builds its empty batch from the block"

@@ -11,7 +11,7 @@ fn col(tc: TypeCode, name: &str, pk_pos: Option<u8>, nullable: bool) -> SchemaBl
 
 /// The decode error `block` yields, without needing `SchemaBlock: Debug`.
 fn decode_err(block: &[u8], max_pk: usize) -> &'static str {
-    SchemaBlock::decode(block, true, max_pk)
+    SchemaBlock::decode(block, false, max_pk)
         .err()
         .expect("expected a rejection")
 }
@@ -32,7 +32,7 @@ fn roundtrips_shape_names_and_pk_order() {
         col(TypeCode::String, "payload_name_over_twelve", None, true),
     ];
     let block = encode(42, &cols);
-    let sb = SchemaBlock::decode(&block, true, MAX_PK_COLUMNS).unwrap();
+    let sb = SchemaBlock::decode(&block, false, MAX_PK_COLUMNS).unwrap();
     assert_eq!(sb.num_columns(), 3);
     assert_eq!(sb.columns().collect::<Vec<_>>(), cols.to_vec());
     // Declared order `(a, b)`, not column order `(b, a)`.
@@ -40,9 +40,7 @@ fn roundtrips_shape_names_and_pk_order() {
 }
 
 /// A header claiming more regions than the buffer can hold must be rejected
-/// before any `dir_entry` indexes past the end. `num_regions` lives in the
-/// header, *outside* the checksummed body, so a forged value still passes
-/// the checksum and reaches the directory guard.
+/// before any `dir_entry` indexes past the end.
 #[test]
 fn rejects_a_directory_that_overflows_the_buffer() {
     let mut block = simple();
@@ -89,7 +87,7 @@ fn pk_arity_is_bounded_by_the_caller_not_a_shared_cap() {
         .collect();
     let block = encode(1, &cols);
     assert_eq!(
-        SchemaBlock::decode(&block, true, MAX_PK_COLUMNS)
+        SchemaBlock::decode(&block, false, MAX_PK_COLUMNS)
             .unwrap()
             .pk_indices()
             .len(),
@@ -121,22 +119,17 @@ fn rejects_a_block_with_no_pk_column() {
 /// One forgery: a mutation of a parsed block, given its region offsets.
 type Forge = fn(&mut [u8], &[u64]);
 
-/// [`simple`] with `mutate` applied against its parsed region offsets, then
-/// re-checksummed — every forgery in the table below lands inside the body
-/// `stamp_checksum` covers, so an un-stamped block would be rejected for its
-/// checksum instead of for the guard under test.
+/// [`simple`] with `mutate` applied against its parsed region offsets.
 fn forged(mutate: Forge) -> Vec<u8> {
     let mut block = simple();
     let mut offs = [0u64; wal::MAX_WIRE_REGIONS];
     let mut sizes = [0u32; wal::MAX_WIRE_REGIONS];
     wal::validate_and_parse(&block, &mut offs, &mut sizes, false).unwrap();
     mutate(&mut block, &offs);
-    let n = block.len();
-    wal::stamp_checksum(&mut block, n);
     block
 }
 
-/// Every guard that reads the checksummed body, against the forgery that trips
+/// Every guard that reads the block body, against the forgery that trips
 /// it. The message is what separates them: a merged table asserting only "an
 /// error" would pass on the wrong guard.
 #[test]

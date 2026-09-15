@@ -74,7 +74,7 @@ impl PendingScan {
             self.route.request_id,
             &WireMsg {
                 flags: WireFlags::train_frame(self.server_version, !has_more),
-                data: WireData::Whole(Some(&chunk)),
+                data: WireData::Whole(&chunk),
                 ..base
             },
         );
@@ -109,10 +109,7 @@ impl WorkerProcess {
             // Version 0: the table's version does not describe a projected
             // schema, and reporting it would let the suppression below drop a
             // block the reader still needs. At 0 nothing is ever suppressed.
-            ReplySchema::OneOff(s) => (
-                Some(Rc::new(crate::catalog::encode_schema_block_ipc(s, tid_key as u32))),
-                0,
-            ),
+            ReplySchema::OneOff(s) => (Some(Rc::new(crate::catalog::encode_schema_block(s, tid_key as u32))), 0),
             // The dispatch arm already resolved the descriptor, so the
             // negotiation never has to look one up and cannot miss.
             ReplySchema::Table(s) => self
@@ -229,7 +226,7 @@ fn emit_whole_if_fits(
     budget: usize,
 ) -> bool {
     let msg = WireMsg {
-        data: WireData::Whole(Some(batch)),
+        data: WireData::Whole(batch),
         ..reply_frame(route, block, server_version, true)
     };
     // A row-less train has no data block to shrink, so it goes at any budget.
@@ -292,9 +289,7 @@ pub(crate) fn send_unique_preflight_keys(
     budget: usize,
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {
-    // The master's merge decodes every reply block through `decode_wire_ipc`,
-    // which verifies no checksum.
-    let schema_block = crate::catalog::encode_schema_block_ipc(frame_schema, target_id as u32);
+    let schema_block = crate::catalog::encode_schema_block(frame_schema, target_id as u32);
     // Measured off the block this train actually ships, so what is charged and
     // what is emitted cannot drift; the assertion in the loop is what says so.
     let keys_per_frame = preflight_keys_per_frame(
@@ -323,7 +318,7 @@ pub(crate) fn send_unique_preflight_keys(
         let msg = WireMsg {
             target_id,
             flags: WireFlags::train_frame(0, is_last),
-            data: WireData::Whole(Some(&chunk)),
+            data: WireData::Whole(&chunk),
             schema_block: is_first.then_some(schema_block.as_slice()),
             ..Default::default()
         };

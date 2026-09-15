@@ -41,7 +41,7 @@ use io_uring::types::FutexWaitV;
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg, FRAME_CAP};
 use gnitz_foundation::posix_io;
 use gnitz_wire::align8;
-use gnitz_wire::control::{peek_control_block_ipc, DecodedControl};
+use gnitz_wire::control::{peek_control_block, DecodedControl};
 
 /// The ring id every worker exchange frame rides. The master's request-id
 /// counter never hands it out, so a ring prefix alone tells an exchange frame
@@ -696,8 +696,7 @@ impl W2mWriter {
 
     /// Encode `msg` into one ring slot, parking on `release_cursor` while the
     /// ring is full. `ring_req` narrows to the slot's 32-bit prefix, which is
-    /// what the master routes the reply by. `encode_ipc` writes no checksum:
-    /// the ring is a trusted mapping, unlike the SAL.
+    /// what the master routes the reply by.
     pub fn send_msg(&self, ring_req: u64, msg: &WireMsg<'_>) {
         let (sz, req) = (msg.size(), ring_req as u32);
         // SAFETY: a worker process is the sole producer on its own ring.
@@ -707,7 +706,7 @@ impl W2mWriter {
                 Some(r) => r,
                 None => park_for_room(&wc, sz, req),
             };
-            msg.encode_ipc(reservation.slot(), 0);
+            msg.encode(reservation.slot(), 0, false);
             commit(&mut wc, reservation);
             self.cursor.set(wc);
         }
@@ -815,7 +814,7 @@ impl W2mSlot {
     /// The slot's control block alone, aborting on failure as `decode` does — for
     /// an ACK, whose only content is its status and error text.
     pub(crate) fn control(&self, worker: usize) -> DecodedControl {
-        match peek_control_block_ipc(self.bytes()) {
+        match peek_control_block(self.bytes(), false) {
             Ok(ctrl) => ctrl,
             Err(e) => gnitz_fatal_abort!(
                 "w2m: worker={} slot control decode failed: {} — ring corrupt",

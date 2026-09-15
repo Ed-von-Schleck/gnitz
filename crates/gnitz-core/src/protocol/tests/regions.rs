@@ -1,6 +1,6 @@
 use super::*;
 use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
-use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
+use crate::protocol::wal_block::{decode_wal_block, encode_wal_block};
 use crate::test_support::payload_of;
 use gnitz_expr::{
     BatchView, CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, SchemaFacts,
@@ -330,7 +330,7 @@ fn fixture_round_trips_through_encode_and_decode() {
         (fixture_b_schema(), fixture_b_batch(), 5u32),
     ] {
         let encoded = encode_wal_block(tid, &batch);
-        let (decoded, got_tid) = decode_wal_block_verified(&encoded, &schema).expect("block decodes");
+        let (decoded, got_tid) = decode_wal_block(&encoded, &schema).expect("block decodes");
         assert_eq!(got_tid, tid);
         assert_eq!(decoded, batch, "batch must survive encode -> decode");
     }

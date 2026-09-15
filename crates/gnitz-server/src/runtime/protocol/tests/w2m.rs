@@ -135,7 +135,7 @@ fn a_published_message_round_trips_in_place() {
         assert_eq!(
             data.as_ptr(),
             ptr.add(W2M_HEADER_SIZE + RING_PREFIX_BYTES as usize) as *const u8,
-            "the payload must be mmap-resident — decode_wire reads it in place"
+            "the payload must be mmap-resident — decode_train_frame reads it in place"
         );
         assert_eq!(recv.read_cursor(0), new_wc);
         assert!(consume_one(&recv).is_none(), "ring must now read empty");

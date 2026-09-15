@@ -1523,8 +1523,7 @@ impl Batch {
     ///
     /// A *wire-borrowed* `MemBatch` carries `blob_id == 0` while every `Batch`
     /// mints one from 1 up, so a wire source always answers `false` — which is
-    /// what makes relocation the canonicalizing gate for W2M frames, the one
-    /// German-string ingress that skips `validate_string_heap_extents`.
+    /// what makes relocation the canonicalizing gate for a borrowed wire frame.
     #[inline]
     pub(crate) fn shares_blob_with(&self, src: &MemBatch<'_>) -> bool {
         debug_assert!(
@@ -1569,11 +1568,9 @@ impl Batch {
         }
     }
 
-    /// Per-row byte stride of a fixed/payload region. Used by the range-wire
-    /// encoders in `batch_wire`, which size regions for an arbitrary row count
-    /// rather than `self.count` (so `region_size` does not fit).
-    pub(super) fn region_stride(&self, idx: usize) -> u8 {
-        self.strides[idx]
+    /// Per-row byte stride of every fixed region, in region order.
+    pub(super) fn strides(&self) -> &[u8] {
+        &self.strides[..self.num_regions()]
     }
 
     /// Append `source[row]` under a raw-OPK-bytes key, with blob deduplication.

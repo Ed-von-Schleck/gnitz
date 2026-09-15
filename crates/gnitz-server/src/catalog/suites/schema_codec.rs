@@ -112,7 +112,7 @@ proptest! {
     fn schema_roundtrip_catalog_codec(original in arb_schema(MAX_PK_COLUMNS)) {
         let original = &original;
         let wire = encode_named_schema_block(original, &named_col_defs(&synthetic_names(original)), 0);
-        let decoded = decode_schema_block(&wire, true)
+        let decoded = decode_schema_block(&wire, false)
             .expect("decode must succeed for any valid schema");
         assert_descriptor_eq(original, &decoded)?;
     }

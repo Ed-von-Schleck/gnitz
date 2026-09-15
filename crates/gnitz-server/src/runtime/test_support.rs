@@ -9,7 +9,7 @@ impl crate::runtime::wire::WireMsg<'_> {
     /// Encode into a fresh `Vec` sized by `WireMsg::size`.
     pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
         let mut buf = vec![0u8; self.size()];
-        self.encode(&mut buf, 0);
+        self.encode(&mut buf, 0, true);
         buf
     }
 }

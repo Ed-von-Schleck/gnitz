@@ -17,15 +17,13 @@ pub use error::ProtocolError;
 // `gnitz_wire`'s `ControlHeader`: the control block's seven routing scalars,
 // defined once for both sides of the wire.
 pub use gnitz_wire::control::ControlHeader as Header;
-pub(crate) use gnitz_wire::WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE;
 pub use gnitz_wire::{ClientVerb, WireConflictMode, WireFlags, WireStatus, MAX_COLUMNS};
 #[cfg(any(test, feature = "integration"))]
 pub use message::parse_response;
-pub use message::{
-    decode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn,
-    Message, MessageParts,
-};
 pub(crate) use message::{encode_control_frame, parse_response_frame};
+pub use message::{
+    encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn, Message, MessageParts,
+};
 // Only the `integration` suite drives a raw transport from outside; a shipped
 // build keeps it crate-private. The cfgs are complementary because two `use`
 // statements binding one name is `E0252` whatever their visibility.

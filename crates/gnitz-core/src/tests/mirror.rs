@@ -12,8 +12,9 @@ use super::*;
 use crate::connection::{Request, Session};
 use crate::protocol::message::{encode_control_block, encode_message_parts};
 use crate::protocol::transport::poll_fd;
-use crate::protocol::{decode_control_block, ColumnDef, Header, TypeCode, WireStatus};
+use crate::protocol::{ColumnDef, Header, TypeCode, WireStatus};
 use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send};
+use gnitz_wire::control::peek_control_block;
 use gnitz_wire::RelDescriptorBlob;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -161,7 +162,7 @@ impl Peer {
     fn expect_request(&self, what: &str) -> u64 {
         assert!(self.waits(PATIENCE), "{what}: the request never arrived");
         let frame = raw_read_frame(&self.0);
-        decode_control_block(&frame).expect("a control block").0.target_id
+        peek_control_block(&frame, false).expect("a control block").target_id
     }
 
     /// The view ids one DELTA_POLL frame names, in request order.

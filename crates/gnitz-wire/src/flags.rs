@@ -69,9 +69,13 @@ pub struct WireFlags {
     pub scan_fifo_reply: bool,
     /// Bits 38-39: what a `HasPk` probe answers a matched key with.
     pub probe_mode: WireProbeMode,
+    /// Bits 40-41: an ExchangeRelay's round verdict.
+    pub backfill: BackfillDecision,
+    /// Bit 42: this worker's source partition is exhausted; its exchange is an empty pad.
+    pub backfill_pad: bool,
 }
 
-const RESERVED_BITS: u64 = !crate::low_bits_mask(40);
+const RESERVED_BITS: u64 = !crate::low_bits_mask(43);
 
 impl WireFlags {
     /// A frame of a worker train: `continuation` always, since the master's terminal
@@ -88,6 +92,8 @@ impl WireFlags {
             scan_last: last,
             scan_fifo_reply: false,
             probe_mode: WireProbeMode::Exists,
+            backfill: BackfillDecision::Continue,
+            backfill_pad: false,
         }
     }
 
@@ -102,6 +108,8 @@ impl WireFlags {
             | (self.scan_last as u64) << 36
             | (self.scan_fifo_reply as u64) << 37
             | (self.probe_mode as u64) << 38
+            | (self.backfill as u64) << 40
+            | (self.backfill_pad as u64) << 42
     }
 
     /// Rejects a word naming a verb or mode this build does not define, or setting a
@@ -122,6 +130,8 @@ impl WireFlags {
             scan_last: bit(36),
             scan_fifo_reply: bit(37),
             probe_mode: WireProbeMode::from_wire(((w >> 38) & 3) as u8).ok_or("flags: unknown probe mode")?,
+            backfill: BackfillDecision::from_wire(((w >> 40) & 3) as u8).ok_or("flags: unknown backfill decision")?,
+            backfill_pad: bit(42),
         })
     }
 
@@ -176,6 +186,19 @@ wire_enum! {
         /// Answer each matched key with that key plus ONE of the stored row's
         /// columns, named by `seek_pk`. PK store only.
         Project = 3,
+    }
+}
+
+wire_enum! {
+    /// A distributed backfill round's verdict, stamped on every relay of the round.
+    /// `Checkpoint` continues and has each worker rewind its SAL reader inline;
+    /// `Stop` ends every worker's loop on the same all-pad round.
+    #[derive(Default)]
+    pub enum BackfillDecision: u8 {
+        #[default]
+        Continue = 0,
+        Stop = 1,
+        Checkpoint = 2,
     }
 }
 

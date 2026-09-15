@@ -160,7 +160,7 @@ pub(crate) enum GroupData<'a> {
 
 impl<'a> GroupData<'a> {
     /// A control-only group: every slot is a bare control block.
-    pub(crate) const NONE: Self = Self::Same(WireData::Whole(None));
+    pub(crate) const NONE: Self = Self::Same(WireData::None);
 
     /// True when no slot carries a row — the one shape allowed to omit a schema.
     fn is_dataless(&self) -> bool {
@@ -215,7 +215,7 @@ impl<'a> DirectGroup<'a> {
     #[inline]
     fn msg(&self, w: usize) -> WireMsg<'a> {
         debug_assert!(
-            matches!(self.template.data, WireData::Whole(None))
+            matches!(self.template.data, WireData::None)
                 && self.template.request_id == 0
                 && !self.template.flags.scan_fifo_reply,
             "DirectGroup template must leave `data`, `request_id` and the reply order to the per-worker fill"
@@ -981,21 +981,23 @@ impl SalWriter {
     /// Encode a group's per-worker wire messages directly into the SAL mmap and
     /// publish it. Does NOT sync/signal.
     pub(crate) fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
-        let (base, word) = self.lay_out(g, g.lsn, false)?;
+        let (base, word) = self.lay_out(g, g.lsn, false, false)?;
         self.publish(base, word);
         Ok(())
     }
 
     /// Lay `g` out at the write cursor, unpublished, stamped with `lsn` and
-    /// `zone_start`. The one encode path, for both writers above.
-    fn lay_out(&self, g: &DirectGroup, lsn: u64, zone_start: bool) -> Result<(usize, u64), WireFault> {
+    /// `zone_start`. The one encode path, for both writers above. A `zoned` group
+    /// is what recovery replays, so only its slots carry checksums.
+    fn lay_out(&self, g: &DirectGroup, lsn: u64, zoned: bool, zone_start: bool) -> Result<(usize, u64), WireFault> {
+        debug_assert!(zoned || !zone_start, "a zone starts only at a zoned group");
         let nw = self.num_workers;
         if let GroupData::PerWorker(d) = g.data {
             assert_eq!(d.len(), nw, "worker_data.len()={} != num_workers={}", d.len(), nw);
         }
         debug_assert!(
             g.template.schema_block.is_some() || g.data.is_dataless(),
-            "data without a schema — `decode_wire` rejects a data block without a schema block",
+            "data without a schema — `decode_sal_slot` rejects a data block without a schema block",
         );
 
         let mut sizes = [0u32; MAX_WORKERS];
@@ -1007,7 +1009,7 @@ impl SalWriter {
             zone_start,
             &sizes[..nw],
             |w, slot| {
-                let written = g.msg(w).encode(slot, 0);
+                let written = g.msg(w).encode(slot, 0, zoned);
                 debug_assert_eq!(written, slot.len());
             },
         )
@@ -1088,8 +1090,8 @@ impl SalScope<'_> {
             g.lsn == 0 || g.lsn == self.lsn,
             "a group written in a scope carries the scope's LSN or none"
         );
-        let zone_start = zoned && !self.zone_open.get();
-        self.writer.lay_out(g, self.lsn, zone_start)?;
+        self.writer
+            .lay_out(g, self.lsn, zoned, zoned && !self.zone_open.get())?;
         if zoned {
             self.zone_open.set(true);
         }

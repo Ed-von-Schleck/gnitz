@@ -439,7 +439,7 @@ async fn execute_probe_burst(
             disp.write_scatter_group(&check.batch, &check.schema, g)
         } else {
             disp.write_group(&DirectGroup {
-                data: GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
+                data: GroupData::Same(wire::WireData::Whole(&check.batch)),
                 ..g
             })
         }

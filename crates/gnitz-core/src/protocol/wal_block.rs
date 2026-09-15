@@ -48,10 +48,9 @@ fn read_64bit_region_into<T: Copy>(
 pub(crate) fn encode_wal_block(table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let regions = super::regions::regions(batch);
     // Size the output to exactly one block, then frame in place, so encode never
-    // returns BufferTooSmall. checksum = true: client frames always carry a body
-    // checksum.
+    // returns BufferTooSmall.
     let mut out = vec![0u8; gnitz_wire::wal::block_size_of(&regions)];
-    gnitz_wire::wal::encode(&mut out, 0, table_id, batch.len() as u32, &regions, true)
+    gnitz_wire::wal::encode(&mut out, 0, table_id, batch.len() as u32, &regions, false)
         .expect("WAL encode: pre-sized buffer");
     out
 }
@@ -59,13 +58,10 @@ pub(crate) fn encode_wal_block(table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
 /// Decode a WAL block from `data`, expecting columns described by `schema`.
 /// Returns `(ZSetBatch, table_id)`.
 ///
-/// Skips checksum verification — the production form: every client decode
-/// runs over a trusted stream (OS-delivered Unix socket bytes or a TLS
-/// record layer) where transport integrity is already guaranteed. Use
-/// [`decode_wal_block_verified`] where the checksum itself is under test.
+/// Verifies no checksum: both client transports are integrity-protected.
 pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
     let mut sink = ZSetBatch::new(schema);
-    let table_id = decode_wal_block_impl(data, schema, false, &mut sink)?;
+    let table_id = decode_wal_block_impl(data, schema, &mut sink)?;
     Ok((sink, table_id))
 }
 
@@ -78,18 +74,7 @@ pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32)
 /// closes the session on a `step` error, and `Session::close` resets the
 /// accumulator, so no torn batch is read back.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
-    decode_wal_block_impl(data, schema, false, sink).map(|_| ())
-}
-
-/// Like [`decode_wal_block`] but verifies the block's XXH3 body checksum.
-/// The crate's round-trip tests are its only callers — the only coverage that
-/// client-encoded checksums are correct; production decodes run over a trusted
-/// stream and go through [`decode_wal_block`].
-#[cfg(test)]
-pub(crate) fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
-    let mut sink = ZSetBatch::new(schema);
-    let table_id = decode_wal_block_impl(data, schema, true, &mut sink)?;
-    Ok((sink, table_id))
+    decode_wal_block_impl(data, schema, sink).map(|_| ())
 }
 
 /// `sink` is a well-formed batch of `schema`, and so can be appended to.
@@ -99,18 +84,13 @@ fn sink_matches(sink: &ZSetBatch, schema: &Schema) -> Result<(), ProtocolError> 
     sink.check_columns().map_err(sink_err)
 }
 
-fn decode_wal_block_impl(
-    data: &[u8],
-    schema: &Schema,
-    verify_checksum: bool,
-    sink: &mut ZSetBatch,
-) -> Result<u32, ProtocolError> {
-    // Shared framer validates format: version, `total_size` in-bounds, body
-    // checksum, region count ≤ cap, and every region's [off, off+sz) extent
-    // within the block. On success each region slices unchecked.
+fn decode_wal_block_impl(data: &[u8], schema: &Schema, sink: &mut ZSetBatch) -> Result<u32, ProtocolError> {
+    // Shared framer validates format: version, `total_size` in-bounds, region
+    // count ≤ cap, and every region's [off, off+sz) extent within the block. On
+    // success each region slices unchecked.
     let mut region_offsets = [0u64; gnitz_wire::MAX_WIRE_REGIONS];
     let mut region_sizes = [0u32; gnitz_wire::MAX_WIRE_REGIONS];
-    let header = gnitz_wire::wal::validate_and_parse(data, &mut region_offsets, &mut region_sizes, verify_checksum)?;
+    let header = gnitz_wire::wal::validate_and_parse(data, &mut region_offsets, &mut region_sizes, false)?;
     let num_regions = header.num_regions as usize;
     let mut regions: [&[u8]; gnitz_wire::MAX_WIRE_REGIONS] = [&[]; gnitz_wire::MAX_WIRE_REGIONS];
     for (r, region) in regions[..num_regions].iter_mut().enumerate() {

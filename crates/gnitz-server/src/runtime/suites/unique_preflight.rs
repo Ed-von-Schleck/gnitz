@@ -16,7 +16,7 @@ use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, KeyProducer, SpillSort};
-use gnitz_wire::control::peek_control_block_ipc;
+use gnitz_wire::control::peek_control_block;
 use gnitz_wire::type_code;
 use gnitz_wire::WireStatus;
 
@@ -50,7 +50,7 @@ fn u128_frame_schema() -> SchemaDescriptor {
 /// `n` rows' worth of data. Written through the production accounting, so a
 /// test cannot pin a per-frame key count the emitter would not itself choose.
 fn budget_for(frame_schema: &SchemaDescriptor, target_id: u64, n: usize) -> usize {
-    let block = crate::catalog::encode_schema_block_ipc(frame_schema, target_id as u32);
+    let block = crate::catalog::encode_schema_block(frame_schema, target_id as u32);
     preflight_frame_overhead(frame_schema, &block) + n * per_key(frame_schema)
 }
 
@@ -91,10 +91,9 @@ fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
 /// Drain every frame of one pre-flight train from the ring, asserting the
 /// flag/schema discipline the master's merge relies on, and return the spans
 /// decoded the way the merge decodes them: the whole PK region of each row
-/// (`get_pk_bytes` → `PkBuf`), continuations against the saved schema hint.
-fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
+/// (`get_pk_bytes` → `PkBuf`), every frame against `frame_schema`.
+fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected_req_id: u64) -> Vec<PkBuf> {
     let mut keys = Vec::new();
-    let mut saved_schema: Option<SchemaDescriptor> = None;
     let mut frames = 0usize;
     loop {
         let slot = receiver.try_read_slot(0).expect("frame missing from train");
@@ -102,7 +101,7 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             slot.internal_req_id, expected_req_id as u32,
             "ring prefix must carry the request id",
         );
-        let ctrl = peek_control_block_ipc(slot.bytes()).expect("ctrl decodes");
+        let ctrl = peek_control_block(slot.bytes(), false).expect("ctrl decodes");
         assert_eq!(ctrl.status, WireStatus::Ok);
         assert!(ctrl.flags.continuation, "every pre-flight frame carries continuation");
         let last = ctrl.flags.scan_last;
@@ -118,23 +117,13 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             );
         }
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, saved_schema.as_ref(), &mut offsets)
-            .expect("frame decodes");
-        if saved_schema.is_none() {
-            let s = zc.schema.expect("first frame schema");
-            // The reply schema's PK region IS the OPK leading-key span; every
-            // column is in the PK, no payload columns.
-            assert!(s.num_columns() >= 1);
-            assert_eq!(s.pk_indices().len(), s.num_columns());
-            saved_schema = Some(s);
-        }
-        if let Some(ref mb) = zc.data_batch {
+        let batch = wire::decode_train_frame(slot.bytes(), &ctrl, frame_schema, &mut offsets).expect("frame decodes");
+        if let Some(mb) = batch {
             for i in 0..mb.len() {
                 keys.push(PkBuf::from_bytes(mb.get_pk_bytes(i)));
             }
         }
         frames += 1;
-        drop(zc);
         drop(slot);
         if last {
             break;
@@ -172,7 +161,7 @@ fn preflight_train_multi_frame_key_roundtrip() {
             budget_for(&frame_schema, 77, 4),
             &mut producer_of(&keys),
         );
-        let got = drain_train(receiver, 9001);
+        let got = drain_train(receiver, &frame_schema, 9001);
         assert_eq!(got, keys);
         assert!(receiver.try_read_slot(0).is_none(), "no frames after terminal");
     });
@@ -193,7 +182,7 @@ fn preflight_train_exact_frame_boundary() {
             budget_for(&frame_schema, 77, 4),
             &mut producer_of(&keys),
         );
-        let got = drain_train(receiver, 42);
+        let got = drain_train(receiver, &frame_schema, 42);
         assert_eq!(got, keys);
         assert!(receiver.try_read_slot(0).is_none());
     });
@@ -214,7 +203,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
             &mut producer_of(&[]),
         );
         let slot = receiver.try_read_slot(0).expect("terminal frame");
-        let ctrl = peek_control_block_ipc(slot.bytes()).expect("ctrl decodes");
+        let ctrl = peek_control_block(slot.bytes(), false).expect("ctrl decodes");
         assert_eq!(ctrl.status, WireStatus::Ok);
         assert!(ctrl.flags.scan_last, "single frame must be terminal");
         assert!(!ctrl.flags.has_data, "no data on empty train");
@@ -235,7 +224,7 @@ fn preflight_frames_are_cut_by_the_byte_budget() {
     let frame_schema = u128_frame_schema();
     // 16 B span + 8 B weight + 8 B null word per key.
     assert_eq!(per_key(&frame_schema), 32);
-    let block = crate::catalog::encode_schema_block_ipc(&frame_schema, 77);
+    let block = crate::catalog::encode_schema_block(&frame_schema, 77);
     let overhead = preflight_frame_overhead(&frame_schema, &block);
     let budget = overhead + 8 * 32;
     assert_eq!(
@@ -247,7 +236,7 @@ fn preflight_frames_are_cut_by_the_byte_budget() {
     let keys: Vec<PkBuf> = (0..24u128).map(span_u128).collect();
     with_test_ring(|writer, receiver| {
         send_unique_preflight_keys(writer, 77, &frame_schema, 11, budget, &mut producer_of(&keys));
-        let got = drain_train(receiver, 11);
+        let got = drain_train(receiver, &frame_schema, 11);
         assert_eq!(got, keys, "the clamped train still carries every span in order");
     });
 }
@@ -259,7 +248,7 @@ fn preflight_frames_are_cut_by_the_byte_budget() {
 #[test]
 fn preflight_keys_per_frame_charges_the_frame_overhead() {
     let frame_schema = u128_frame_schema();
-    let block = crate::catalog::encode_schema_block_ipc(&frame_schema, 77);
+    let block = crate::catalog::encode_schema_block(&frame_schema, 77);
     let overhead = preflight_frame_overhead(&frame_schema, &block);
     assert!(overhead > 0, "a frame's control and schema blocks cost bytes");
     assert_eq!(preflight_keys_per_frame(&frame_schema, 8 * 32, overhead), 1);
@@ -293,7 +282,7 @@ fn preflight_train_composite_wide_span_roundtrip() {
             budget_for(&frame_schema, 5, 2),
             &mut producer_of(&keys),
         );
-        let got = drain_train(receiver, 3);
+        let got = drain_train(receiver, &frame_schema, 3);
         assert_eq!(got, keys);
         assert_eq!(got[0].pk_bytes().len(), 16, "composite span is the full 16 bytes");
     });
@@ -384,7 +373,7 @@ fn preflight_signed_payload_projection_roundtrip() {
             budget_for(&frame_schema, 5, 3),
             &mut producer_of(&keys),
         );
-        let got = drain_train(receiver, 11);
+        let got = drain_train(receiver, &frame_schema, 11);
         assert_eq!(got, keys);
         // The duplicate pair is adjacent in the sorted stream — exactly what the
         // master's prev == popped check rejects.

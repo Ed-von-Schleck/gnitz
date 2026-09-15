@@ -22,6 +22,7 @@
 //! region[6] blob      the German-string heap
 //! ```
 
+use crate::german_string::german_spill_len;
 use crate::wal;
 use crate::{
     blob_extent, encode_german_string, german_string_content, is_pk_eligible, is_valid_type_code, payload_region_in,
@@ -107,15 +108,6 @@ impl ColMeta {
     }
 }
 
-/// Blob-heap bytes `name` spills: nothing while it fits inline in its cell.
-fn blob_bytes(name: &[u8]) -> usize {
-    if name.len() <= SHORT_STRING_THRESHOLD {
-        0
-    } else {
-        name.len()
-    }
-}
-
 /// Per-row bytes of each region, indexed by region: the `col_idx` key, weight,
 /// null word, type_code, flags, the 16-byte German-string name cell, and the
 /// blob heap (which is not per-row). Encode sizing, the scratch-buffer split and
@@ -153,18 +145,15 @@ fn block_len(n: usize, blob: usize) -> usize {
     wal::block_size(&sizes)
 }
 
-/// Encoded size of the block for `cols` — the size [`encode_vec`] reserves, so
+/// Encoded size of the block for `cols` — the size [`encode`] reserves, so
 /// the reservation and the write read one rule.
 fn encoded_len(cols: &[SchemaBlockCol]) -> usize {
-    block_len(cols.len(), cols.iter().map(|c| blob_bytes(c.name)).sum())
+    block_len(cols.len(), cols.iter().map(|c| german_spill_len(c.name.len())).sum())
 }
 
-/// [`encode`] and [`encode_ipc`]'s shared body: the block for `cols`, framed
-/// into a `Vec` sized by [`encoded_len`].
-///
-/// Every frame that carries a schema block copies these bytes in — one encode
-/// per relation, one memcpy per slot — so there is no in-place form.
-fn encode_vec(tid: u32, cols: &[SchemaBlockCol], checksum: bool) -> Vec<u8> {
+/// The block for `cols`, without a checksum: a frame that carries one stamps its
+/// own copy.
+pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
     let n = cols.len();
     // One scratch buffer carved into the six fixed-stride regions, so a block
     // whose names all fit inline (the anonymous case, and most named ones)
@@ -189,20 +178,8 @@ fn encode_vec(tid: u32, cols: &[SchemaBlockCol], checksum: bool) -> Vec<u8> {
     // `null` stays all-zero: no meta-schema column is nullable.
     let regions: [&[u8]; SCHEMA_BLOCK_REGIONS] = [pk, weight, null, type_code, flags, names, &blob];
     let mut out = vec![0u8; encoded_len(cols)];
-    wal::encode(&mut out, 0, tid, n as u32, &regions, checksum).expect("schema block buffer too small");
+    wal::encode(&mut out, 0, tid, n as u32, &regions, false).expect("schema block buffer too small");
     out
-}
-
-/// The block for `cols`, checksummed — for one crossing a durability or trust
-/// boundary.
-pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
-    encode_vec(tid, cols, true)
-}
-
-/// [`encode`] without the body checksum, for the intra-process frames whose
-/// reader verifies none.
-pub fn encode_ipc(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
-    encode_vec(tid, cols, false)
 }
 
 /// A validated meta-schema block, borrowing the bytes it was decoded from.

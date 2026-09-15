@@ -38,12 +38,13 @@ use crate::runtime::master::{
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, Reactor, ReadGuard, WriteGuard};
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
-use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION_CONTINUE};
+use crate::runtime::wire::{self as ipc, validate_schema_match};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::key::seek_opk_bytes;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_wire::txn_frame::{validate_item_ids, DeltaPollItem};
+use gnitz_wire::BackfillDecision;
 use gnitz_wire::{PkKeys, ReadBound, ReadSpec, WireFault, WireFlags, WireStatus};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
@@ -834,7 +835,7 @@ async fn run_tick(
 // ---------------------------------------------------------------------------
 
 /// Write one completed steady-state exchange round back as an ExchangeRelay
-/// group. A tick round never pads, so its verdict is `BACKFILL_DECISION_CONTINUE`.
+/// group. A tick round never pads, so its `flags.backfill` verdict is `Continue`.
 ///
 /// A lost relay wedges workers blocked in `do_exchange_wait` forever
 /// (they ACK neither tick nor relay and the master stays alive), so both
@@ -885,7 +886,7 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
                     if let Err(e) = guard_panic("emit_relay", || {
                         shared
                             .disp()
-                            .emit_relay_with_decision(&prep, BACKFILL_DECISION_CONTINUE)
+                            .emit_relay_with_decision(&prep, BackfillDecision::Continue)
                     }) {
                         gnitz_fatal_abort!(
                             "emit_relay failed; a lost relay wedges workers \
@@ -922,7 +923,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // decision and the push decode all read this same parse, so a malicious
     // client cannot forge a directory that points one at one region and another
     // at another.
-    let ctrl = match ipc::peek_control_block(data) {
+    let ctrl = match gnitz_wire::control::peek_control_block(data, false) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("decode error: {e}");
@@ -1119,7 +1120,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
 
     let mode = flags.conflict_mode;
 
-    // Not at the decode boundary: `reject_not_null_bits` runs there without a
+    // Not at the decode boundary: `validate_client_batch` runs there without a
     // relation kind, and must keep admitting a base table's retractions.
     if kind == RelationKind::Stream {
         if let Some(e) = stream_push_error(target_id, &batch, mode) {
@@ -1362,7 +1363,6 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         // The schema block is always present; validate it against the catalog
         // per family (a concurrent DDL between buffer time and commit surfaces as
         // a clean error the application re-runs).
-        // `false`: the frame walk already verified this block's checksum.
         let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block, false)
             .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
         let catalog_schema = validate_client_schema(shared, tid, &wire_schema)?;
@@ -1442,51 +1442,30 @@ fn validate_client_schema(shared: &Shared, tid: i64, client: &SchemaDescriptor) 
     Ok(expected)
 }
 
-/// Decode a CLIENT-supplied frame. `decode_wire_with_ctrl` is the client-trust
-/// entry: it leaves the batch `Raw`, dropping any `batch_consolidated` claim
-/// ("already consolidated, skip the work"), which a client must never be trusted
-/// to make; downstream consolidation (the catalog DDL ingest and the commit path)
-/// establishes those invariants. Every
-/// client-boundary decode goes through this or its sibling
-/// `decode_client_batch`.
+/// Decode and validate a client frame.
 fn decode_client_wire(
     data: &[u8],
     ctrl: gnitz_wire::control::DecodedControl,
     hint: Option<&SchemaDescriptor>,
 ) -> Result<ipc::DecodedWire, &'static str> {
-    let decoded = ipc::decode_wire_with_ctrl(data, ctrl, hint)?;
+    let decoded = ipc::decode_client_frame(data, ctrl, hint)?;
     if let Some(b) = decoded.data_batch.as_ref() {
-        reject_not_null_bits(b, b.schema())?;
+        validate_client_batch(b)?;
     }
     Ok(decoded)
 }
 
-/// A raw WAL-block family batch inside a client `DDL_TXN` or `PUSH_TXN`
-/// bundle. `decode_from_wal_block` builds every batch `Raw`, so like
-/// `decode_client_wire` this carries no client layout claim.
-///
-/// `verify_checksum = false`: `txn_frame`'s `checked_block_at` already verified
-/// it, off the catalog lock this decode runs under.
+/// Decode and validate one family block of a client `DDL_TXN` or `PUSH_TXN`.
 fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'static str> {
-    let (b, _) = Batch::decode_from_wal_block(slice, schema, false)?;
-    reject_not_null_bits(&b, schema)?;
+    let b = Batch::decode_foreign_wal_block(slice, schema)?;
+    validate_client_batch(&b)?;
     Ok(b)
 }
 
-/// A client-supplied batch must not set a null bit on a payload column the
-/// schema declares NOT NULL. `is_null` and `cmp_group_cols` read such a
-/// bit as a live NULL, while the evaluator's `nullable_slots`, a projection's
-/// `NullPerm` and the `FixedIntNonnull` row comparator believe the schema
-/// instead — a split that can turn a rejected UNIQUE duplicate into a committed,
-/// durable row. Rejecting the bit here is what lets the rest of the engine pick
-/// either camp freely.
-///
-/// Here rather than in `Batch::decode_from_wal_block`: this is a statement about
-/// a CLIENT, and that decode also serves the worker's SAL consumption, the
-/// master's W2M read and boot replay, where a rejection aborts the process
-/// instead of answering the caller.
-fn reject_not_null_bits(b: &Batch, schema: &SchemaDescriptor) -> Result<(), &'static str> {
-    let not_null = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
+/// Refuses a null bit on a NOT NULL column, which the null-aware readers and the
+/// schema-trusting ones would read differently.
+fn validate_client_batch(b: &Batch) -> Result<(), &'static str> {
+    let not_null = gnitz_expr::SchemaFacts::not_null_payload_slots(b.schema());
     if not_null == 0 {
         return Ok(());
     }
@@ -2191,7 +2170,7 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     let base = out.len();
     let total = base + PFX + sz;
     out.reserve(PFX + sz);
-    // SAFETY: `encode_ipc` writes every byte of the payload and the frame length
+    // SAFETY: `encode` writes every byte of the payload and the frame length
     // prefix is written immediately below. wal::encode zeros inter-region padding
     // (Step 1), so no byte is left uninitialised regardless of column type.
     #[allow(clippy::uninit_vec)]
@@ -2199,7 +2178,7 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
         out.set_len(total);
     }
     out[base..base + PFX].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = msg.encode_ipc(&mut out[base + PFX..total], 0);
+    let written = msg.encode(&mut out[base + PFX..total], 0, false);
     debug_assert_eq!(written, sz);
     out.truncate(base + PFX + written);
 }
@@ -2251,7 +2230,7 @@ fn send_ok_response(
                 ..Default::default()
             },
             seek_pk,
-            data: ipc::WireData::Whole(result),
+            data: result.map_or(ipc::WireData::None, ipc::WireData::Whole),
             schema_block: schema_arg,
             ..Default::default()
         },

@@ -194,9 +194,8 @@ pub struct WalBlockHeader {
 /// `&[u8]` slices make the length structural, so there is no separate size
 /// array to keep in sync and no null-pointer sentinel.
 ///
-/// Set `checksum_body = false` for trusted IPC paths (W2M ring) to skip the
-/// XXH3 computation. Always use `true` for durable WAL writes and network
-/// responses.
+/// `checksum_body = true` stamps the XXH3 body checksum, which only SAL recovery
+/// verifies; every other frame skips the computation.
 pub fn encode(
     out_buf: &mut [u8],
     out_offset: usize,
@@ -259,11 +258,8 @@ pub fn block_slice_at(data: &[u8], off: usize) -> Result<&[u8], WalError> {
     Ok(&data[off..off + size])
 }
 
-/// Verify a framed block's XXH3 body checksum on its own — the standalone form of
-/// the check [`validate_and_parse`] folds into a full parse, for a framed decoder
-/// that walks a run of blocks by header alone. A header-only block carries no
-/// checksum and passes.
-pub fn verify_body_checksum(block: &[u8]) -> Result<(), WalError> {
+/// A framed block's XXH3 body checksum; a header-only block carries none.
+fn verify_body_checksum(block: &[u8]) -> Result<(), WalError> {
     if block.len() < WAL_HEADER_SIZE {
         return Err(WalError::Truncated);
     }
@@ -290,8 +286,8 @@ pub fn verify_body_checksum(block: &[u8]) -> Result<(), WalError> {
 /// A block whose region count exceeds `MAX_WIRE_REGIONS` (or the out slices)
 /// is rejected as `InvalidShard` — no well-formed producer emits one.
 ///
-/// Set `verify_checksum = false` for trusted IPC paths (W2M ring) to skip the
-/// XXH3 verification.  Always use `true` for WAL recovery and network decoding.
+/// `verify_checksum = true` verifies the XXH3 body checksum, for SAL recovery,
+/// the one reader of blocks written with one; every other decode passes `false`.
 pub fn validate_and_parse(
     block: &[u8],
     out_region_offsets: &mut [u64],
@@ -312,12 +308,8 @@ pub fn validate_and_parse(
         return Err(WalError::Truncated);
     }
 
-    if verify_checksum && total_size > WAL_HEADER_SIZE {
-        let expected_cs = read_u64_le(block, WAL_OFF_CHECKSUM);
-        let actual_cs = checksum(&block[WAL_HEADER_SIZE..total_size]);
-        if actual_cs != expected_cs {
-            return Err(WalError::ChecksumMismatch);
-        }
+    if verify_checksum {
+        verify_body_checksum(block)?;
     }
 
     let header = WalBlockHeader {

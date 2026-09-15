@@ -25,6 +25,11 @@ fn wire_flags_roundtrip() {
         WireFlags { batch_consolidated: true, ..base },
         WireFlags { scan_last: true, ..base },
         WireFlags { scan_fifo_reply: true, ..base },
+        WireFlags {
+            backfill: BackfillDecision::Checkpoint,
+            ..base
+        },
+        WireFlags { backfill_pad: true, ..base },
     ]);
     cases.push(WireFlags {
         verb: ClientVerb::AllocIndexId,
@@ -37,6 +42,8 @@ fn wire_flags_roundtrip() {
         scan_last: true,
         scan_fifo_reply: true,
         probe_mode: WireProbeMode::Project,
+        backfill: BackfillDecision::Checkpoint,
+        backfill_pad: true,
     });
     for f in cases {
         assert_eq!(WireFlags::unpack(f.pack()), Ok(f), "{f:?}");
@@ -48,7 +55,8 @@ fn wire_flags_roundtrip() {
 /// mode the server does not implement into a silent upsert on a client's push.
 #[test]
 fn wire_flags_reject_unknown() {
-    assert!(WireFlags::unpack(1 << 40).is_err());
+    assert!(WireFlags::unpack(1 << 43).is_err());
+    assert!(WireFlags::unpack(3 << 40).is_err());
     assert!(WireFlags::unpack(1 << 63).is_err());
     assert!(WireFlags::unpack(13).is_err());
     assert!(WireFlags::unpack(2 << 8).is_err());

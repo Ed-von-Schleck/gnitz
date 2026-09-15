@@ -21,9 +21,14 @@ impl WorkerProcess {
     /// dispatched per [`in_eval`]; a relay for another `(view_id, source_id)`
     /// parks in `pending_relays`.
     ///
-    /// `pad` is this chunk's backfill pad bit; a steady-state tick passes
-    /// `false` and ignores the (then always CONTINUE == 0) decision.
-    pub(super) fn do_exchange_wait(&mut self, view_id: i64, batch: &Batch, source_id: i64, pad: bool) -> (Batch, u64) {
+    /// `pad` marks this worker's partition exhausted; a steady tick passes `false`.
+    pub(super) fn do_exchange_wait(
+        &mut self,
+        view_id: i64,
+        batch: &Batch,
+        source_id: i64,
+        pad: bool,
+    ) -> (Batch, BackfillDecision) {
         self.publish_exchange(view_id, batch, source_id, pad);
 
         let want_key = (view_id, source_id);
@@ -56,14 +61,14 @@ impl WorkerProcess {
     /// [`ipc::FRAME_CAP`] — the bound every other producer already holds itself
     /// to. What a frame carries is [`exchange_frame`]'s; this only cuts rows.
     fn publish_exchange(&self, view_id: i64, batch: &Batch, source_id: i64, pad: bool) {
-        let block = crate::catalog::encode_schema_block_ipc(batch.schema(), view_id as u32);
+        let block = crate::catalog::encode_schema_block(batch.schema(), view_id as u32);
         let frame = |last| exchange_frame(view_id, source_id, &block, last, pad);
 
         // Whole and unsplit off the source batch — no sub-batch, no per-row
         // German-string walk — which is the path a real payload takes: a
         // 65,536-row chunk at 100 B/row is 6.5 MB against a 64 MiB frame.
         let whole = ipc::WireMsg {
-            data: ipc::WireData::Whole(Some(batch)),
+            data: ipc::WireData::Whole(batch),
             ..frame(true)
         };
         if whole.size() <= ipc::FRAME_CAP {
@@ -93,7 +98,7 @@ impl WorkerProcess {
             self.w2m_writer.send_msg(
                 W2M_EXCHANGE_RING_ID as u64,
                 &ipc::WireMsg {
-                    data: ipc::WireData::Whole(Some(&chunk)),
+                    data: ipc::WireData::Whole(&chunk),
                     ..frame(next_row == batch.len())
                 },
             );
@@ -106,12 +111,14 @@ impl WorkerProcess {
 fn exchange_frame<'a>(view_id: i64, source_id: i64, schema_block: &'a [u8], last: bool, pad: bool) -> ipc::WireMsg<'a> {
     ipc::WireMsg {
         target_id: view_id as u64,
-        flags: WireFlags::train_frame(0, last),
-        seek_pk: source_id as u128,
         // The backfill pad bit the master ANDs across workers. A pad round is
         // empty, hence a single terminal frame, so it still rides the frame that
         // counts.
-        seek_col_idx: if last && pad { BACKFILL_PAD_BIT } else { 0 },
+        flags: WireFlags {
+            backfill_pad: last && pad,
+            ..WireFlags::train_frame(0, last)
+        },
+        seek_pk: source_id as u128,
         schema_block: Some(schema_block),
         ..Default::default()
     }

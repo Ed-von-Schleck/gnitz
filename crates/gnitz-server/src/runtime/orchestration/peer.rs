@@ -7,8 +7,12 @@ use std::rc::Rc;
 
 use crate::runtime::reactor::{ClientConn, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
-use crate::runtime::wire::COALESCE_MAX_BYTES;
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
+
+/// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
+/// replies): the copy paid to save per-frame sends. `fanout_coalesced_egress_bench`
+/// measures the trade.
+pub(crate) const COALESCE_MAX_BYTES: usize = 32 * 1024;
 
 /// Transport-neutral handle to one client connection. Owned by the
 /// connection task; handlers borrow it to send replies.

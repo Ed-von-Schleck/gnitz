@@ -61,7 +61,7 @@ pub(crate) use types::{ColumnDef, FkEdge};
 // The reply path's schema-wire-block encoders. The `SchemaWireEntry` they fill
 // is named only inside the catalog — the reply path takes one by value from
 // `schema_wire_entry` and reads its fields — so it is re-exported below.
-pub(crate) use schema_block::{encode_schema_block, encode_schema_block_ipc};
+pub(crate) use schema_block::encode_schema_block;
 
 // Import everything from sys_tables for internal use.
 use precheck::{check_col_defs, validate_pk_against_cols};

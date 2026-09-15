@@ -20,7 +20,7 @@ fn wal_block(tid: u32) -> WalBlock<'static> {
 /// *schema* block (which the frame carries pre-encoded) is built from.
 fn block(tid: u32) -> Vec<u8> {
     let mut buf = vec![0u8; 4096];
-    let n = wal::encode(&mut buf, 0, tid, 1, &[REGION], true).unwrap();
+    let n = wal::encode(&mut buf, 0, tid, 1, &[REGION], false).unwrap();
     buf.truncate(n);
     buf
 }
@@ -40,7 +40,7 @@ fn the_shared_prologue_carries_only_the_routing_flag() {
     ];
     for (frame, verb) in frames {
         let ctrl = wal::block_slice_at(&frame, 0).unwrap();
-        let c = peek_control_block(ctrl).unwrap();
+        let c = peek_control_block(ctrl, false).unwrap();
         assert_eq!(
             c.flags,
             WireFlags { verb, ..Default::default() },

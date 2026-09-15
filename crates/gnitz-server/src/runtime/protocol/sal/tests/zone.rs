@@ -532,7 +532,10 @@ fn a_row_less_slot_is_not_a_damaged_one() {
     let row_less = (0..NW as u32)
         .filter(|&w| {
             let slot = msg.slot(w).expect("every slot is written");
-            ipc::decode_wire(slot).expect("slot decodes").data_batch.is_none()
+            ipc::decode_sal_slot(slot, true)
+                .expect("slot decodes")
+                .data_batch
+                .is_none()
         })
         .count();
     assert!(row_less > 0, "the fixture must leave at least one slot row-less");
