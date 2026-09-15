@@ -15,7 +15,7 @@ pub struct WireSysCol {
 }
 
 /// Terse `WireSysCol` constructor so the column tables read as one line per
-/// column. `pub(crate)` — internal to the wire crate (also used by `control.rs`);
+/// column. `pub(crate)` — internal to the wire crate;
 /// not part of the public surface. `const` so it is callable in the `pub const`
 /// table initializers (visibility does not affect const-eval).
 pub(crate) const fn col(name: &'static str, type_code: TypeCode, nullable: bool) -> WireSysCol {
@@ -628,24 +628,24 @@ const _: () = assert!(
     "a schema column index no longer fits the packed 7-bit field"
 );
 
-/// Bit 63: the tag whose absence [`unpack_pk_cols`] refuses. A `seek_col_idx`
-/// means different things per message kind, so the decode insists on a tag
-/// rather than reading a shape.
+/// Bit 63: the tag whose absence [`unpack_pk_cols`] refuses. An `arg1` means
+/// different things per message kind, so the decode insists on a tag rather than
+/// reading a shape.
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
-/// The `seek_col_idx` value naming the relation's own PK store — see
+/// The `arg1` value naming the relation's own PK store — see
 /// [`probe_key_columns`].
 pub const PROBE_KEYSPACE_PK: u64 = 0;
 
-/// The keyspace a `HasPk` group's `seek_col_idx` names: `None` for the
+/// The keyspace a `HasPk` group's `arg1` names: `None` for the
 /// relation's own PK store, `Some(packed column list)` for a secondary index.
 ///
 /// [`pack_pk_cols`] lays a count of `1..=PK_LIST_MAX_COLS` in the low bits, so a
 /// real column list is never [`PROBE_KEYSPACE_PK`]. Both ends of that hop decode
 /// through here, so the sentinel has one spelling.
 #[inline]
-pub fn probe_key_columns(seek_col_idx: u64) -> Option<u64> {
-    (seek_col_idx != PROBE_KEYSPACE_PK).then_some(seek_col_idx)
+pub fn probe_key_columns(arg1: u64) -> Option<u64> {
+    (arg1 != PROBE_KEYSPACE_PK).then_some(arg1)
 }
 
 /// A PK column list, `1..=PK_LIST_MAX_COLS` entries, inline. Constructing one is

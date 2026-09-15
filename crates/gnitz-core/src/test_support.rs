@@ -37,10 +37,15 @@ pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
     (established(a), established(b))
 }
 
-/// A control-only reply frame carrying `lsn` in `seek_pk` — the terminal a
+/// A control-only reply frame carrying `lsn` in `arg0` — the terminal a
 /// scripted peer answers an uncorrelated request with.
-pub(crate) fn reply_ctrl(tid: u64, lsn: u128) -> Vec<u8> {
-    crate::protocol::encode_control_frame(tid, 0, crate::protocol::WireFlags::default(), lsn, 0, &[]).ctrl
+pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
+    let hdr = gnitz_wire::control::ControlHeader {
+        target_id: tid,
+        arg0: lsn,
+        ..Default::default()
+    };
+    crate::protocol::encode_frame(hdr, &[], None, None).ctrl
 }
 
 /// `[u32 LE len][payload]`, what a peer writes.

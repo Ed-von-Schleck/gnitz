@@ -708,10 +708,9 @@ fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>) -> PyR
     Ok(())
 }
 
-/// Split a Python seek key into the control block's `(seek_pk, seek_pk_extra)`
-/// pair. `bytes` is packed native-LE columns; anything else is one scalar
-/// ([`py_scalar_key`]).
-pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<(u128, Vec<u8>)> {
+/// A Python seek key as the wire key. `bytes` is packed native-LE columns;
+/// anything else is one scalar ([`py_scalar_key`]).
+pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     // bytes first: `py_scalar_key` falls through to `getattr("int")`, which a
     // bytes key would walk before failing.
     if let Ok(bytes) = pk.cast::<pyo3::types::PyBytes>() {
@@ -723,10 +722,9 @@ pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<(u128, Vec<u8>)>
                 b.len(),
             )));
         }
-        let (low, extra) = gnitz_wire::control::split_ctrl_key(b);
-        return Ok((low, extra.to_vec()));
+        return Ok(b.to_vec());
     }
-    Ok((py_scalar_key(pk)?, Vec::new()))
+    Ok(py_scalar_key(pk)?.to_le_bytes().to_vec())
 }
 
 /// One scalar key value as the 16-byte native word the wire carries, of which

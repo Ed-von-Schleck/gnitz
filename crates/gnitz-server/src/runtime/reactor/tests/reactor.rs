@@ -8,22 +8,28 @@ use super::*;
 use crate::runtime::test_support::try_poll_once;
 use gnitz_wire::WireStatus;
 
-/// A lease routes `n` consecutive ids for exactly its own life, and the next
-/// lease starts past them.
+/// A lease routes `n` consecutive ids, each for every worker of its set, for
+/// exactly its own life, and the next lease starts past them.
 #[test]
 fn a_lease_routes_consecutive_ids_until_dropped() {
-    let r = make_reactor();
-    let acks = r.lease_acks(4);
-    let ids: Vec<u64> = (0..4).map(|i| acks.id(i)).collect();
+    let (r, _writers) = reactor_with_rings(3);
+    let acks = r.lease_acks(4, WorkerSet::ALL);
+    let ids: Vec<u32> = (0..4).map(|i| acks.id(i)).collect();
     assert!(ids.windows(2).all(|p| p[1] == p[0] + 1), "consecutive: {ids:?}");
-    assert!(ids.iter().all(|&id| r.inner.routes.borrow().contains_key(&(id as u32))));
+    for &id in &ids {
+        for w in 0..3 {
+            assert!(r.inner.routes.borrow().contains_key(&(id, w)), "id {id} worker {w}");
+        }
+    }
 
-    let train = r.lease_train(2);
+    let train = r.lease_train(WorkerSet::one(1));
     assert_eq!(train.id(0), ids[3] + 1, "the next lease starts past the last");
-    assert_eq!(r.inner.routes.borrow().len(), 6);
+    assert_eq!(train.workers().collect::<Vec<_>>(), vec![1]);
+    assert!(r.inner.routes.borrow().contains_key(&(train.id(0), 1)));
+    assert_eq!(r.inner.routes.borrow().len(), 13, "only the set's workers are routed");
 
     drop(acks);
-    assert_eq!(r.inner.routes.borrow().len(), 2, "dropping a lease removes its routes");
+    assert_eq!(r.inner.routes.borrow().len(), 1, "dropping a lease removes its routes");
     drop(train);
     assert!(r.inner.routes.borrow().is_empty());
 }
@@ -33,7 +39,7 @@ fn a_lease_routes_consecutive_ids_until_dropped() {
 #[test]
 fn an_ack_landing_before_its_awaiter_is_kept() {
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_acks(1);
+    let lease = r.lease_acks(1, WorkerSet::ALL);
     writers[0].send_status(0, lease.id(0), WireStatus::Ok, &[]);
     r.drain_all_w2m();
 
@@ -43,14 +49,14 @@ fn an_ack_landing_before_its_awaiter_is_kept() {
     );
 }
 
-/// `acks` parks until every id has answered, then reports the fault by the ring
-/// it arrived on: ring 1 answering the lease's first id is worker 1.
+/// `acks` parks until every worker has answered, then reports the fault by the
+/// ring it arrived on.
 #[test]
 fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
     let (r, writers) = reactor_with_rings(2);
-    let lease = r.lease_acks(2);
-    let mut fut = std::pin::pin!(lease.acks(2, |w, c| {
-        (c.status != WireStatus::Ok).then(|| (w, String::from_utf8_lossy(&c.error_msg).into_owned()))
+    let lease = r.lease_acks(1, WorkerSet::ALL);
+    let mut fut = std::pin::pin!(lease.acks(1, |w, c| {
+        (c.hdr.status != WireStatus::Ok).then(|| (w, String::from_utf8_lossy(&c.blob).into_owned()))
     }));
     let waker = make_waker(0);
     let mut cx = Context::from_waker(&waker);
@@ -63,7 +69,7 @@ fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
         "one of two ACKs must not resolve"
     );
 
-    writers[0].send_status(0, lease.id(1), WireStatus::Ok, &[]);
+    writers[0].send_status(0, lease.id(0), WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert!(
         r.inner.run_queue.borrow().is_queued(0),
@@ -92,14 +98,14 @@ fn an_unrouted_frame_is_released_undecoded() {
 #[test]
 fn exchange_frames_queue_by_ring_id_tagged_with_their_worker() {
     let (r, writers) = reactor_with_rings(2);
-    let lease = r.lease_acks(2);
-    let mut acks = std::pin::pin!(lease.acks(2, |_, _| None::<()>));
+    let lease = r.lease_acks(1, WorkerSet::ALL);
+    let mut acks = std::pin::pin!(lease.acks(1, |_, _| None::<()>));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(acks.as_mut().poll(&mut cx).is_pending());
 
     let msg = crate::runtime::wire::WireMsg { target_id: 99, ..Default::default() };
     for w in writers.iter().rev() {
-        w.send_msg(W2M_EXCHANGE_RING_ID as u64, &msg);
+        w.send_msg(W2M_EXCHANGE_RING_ID, &msg);
     }
     r.drain_all_w2m();
 
@@ -108,7 +114,7 @@ fn exchange_frames_queue_by_ring_id_tagged_with_their_worker() {
     let (w1, f1) = q.pop().expect("worker 1's exchange frame must be queued");
     drop(q);
     assert_eq!((w0, w1), (0, 1), "each frame carries the worker that sent it");
-    assert_eq!((f0.control.target_id, f1.control.target_id), (99, 99));
+    assert_eq!((f0.control.hdr.target_id, f1.control.hdr.target_id), (99, 99));
     assert!(acks.as_mut().poll(&mut cx).is_pending(), "no ACK was delivered");
 }
 
@@ -118,11 +124,11 @@ fn exchange_frames_queue_by_ring_id_tagged_with_their_worker() {
 #[test]
 fn acks_parks_only_on_the_first_unanswered_id() {
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_acks(3);
+    let lease = r.lease_acks(3, WorkerSet::ALL);
     let mut fut = std::pin::pin!(lease.acks(3, |_, _| None::<()>));
     let waker = make_waker(7);
     let mut cx = Context::from_waker(&waker);
-    let parked = |i: usize| match &r.inner.routes.borrow()[&(lease.id(i) as u32)] {
+    let parked = |i: usize| match &r.inner.routes.borrow()[&(lease.id(i), 0)] {
         Route::Ack { waker, .. } => waker.is_some(),
         Route::Train(_) => unreachable!(),
     };
@@ -155,8 +161,12 @@ fn acks_parks_only_on_the_first_unanswered_id() {
 /// one — and every lease drop wakes it to look again.
 #[test]
 fn trains_idle_waits_for_the_last_train_lease() {
-    let r = make_reactor();
-    let (first, second, acks) = (r.lease_train(1), r.lease_train(2), r.lease_acks(1));
+    let (r, _writers) = reactor_with_rings(1);
+    let (first, second, acks) = (
+        r.lease_train(WorkerSet::ALL),
+        r.lease_train(WorkerSet::ALL),
+        r.lease_acks(1, WorkerSet::ALL),
+    );
     let mut idle = std::pin::pin!(r.trains_idle());
     let waker = make_waker(9);
     let mut cx = Context::from_waker(&waker);
@@ -177,12 +187,12 @@ fn trains_idle_waits_for_the_last_train_lease() {
 /// never takes an id a live lease still routes.
 #[test]
 fn lease_ids_wrap_below_the_exchange_id_and_skip_live_ids() {
-    let r = make_reactor();
+    let (r, _writers) = reactor_with_rings(1);
     r.inner.next_request_id.set(u32::MAX - 2);
-    let top = r.lease_acks(2);
-    assert_eq!((top.id(0), top.id(1)), (u32::MAX as u64 - 2, u32::MAX as u64 - 1));
+    let top = r.lease_acks(2, WorkerSet::ALL);
+    assert_eq!((top.id(0), top.id(1)), (u32::MAX - 2, u32::MAX - 1));
 
-    let wrapped = r.lease_acks(2);
+    let wrapped = r.lease_acks(2, WorkerSet::ALL);
     assert_eq!(
         (wrapped.id(0), wrapped.id(1)),
         (1, 2),
@@ -190,12 +200,12 @@ fn lease_ids_wrap_below_the_exchange_id_and_skip_live_ids() {
     );
 
     r.inner.next_request_id.set(2);
-    let skipped = r.lease_train(2);
-    assert_eq!((skipped.id(0), skipped.id(1)), (3, 4), "a live lease's ids are skipped");
+    let skipped = r.lease_train(WorkerSet::ALL);
+    assert_eq!(skipped.id(0), 3, "a live lease's ids are skipped");
 
     r.inner.next_request_id.set(u32::MAX - 1);
-    let straddling = r.lease_acks(3);
-    assert_eq!(straddling.id(0), 5, "a lease that would reach the exchange id wraps");
+    let straddling = r.lease_acks(3, WorkerSet::ALL);
+    assert_eq!(straddling.id(0), 4, "a lease that would reach the exchange id wraps");
 }
 
 /// The drain the arm runs first can route a frame that wakes a task; that tick
@@ -205,7 +215,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
     within(Duration::from_secs(30), || {
         let (r, mut writers) = reactor_with_rings(1);
         let writer = writers.pop().expect("one ring");
-        let lease = r.lease_acks(1);
+        let lease = r.lease_acks(1, WorkerSet::ALL);
         let id = lease.id(0);
         let done = Rc::new(Cell::new(false));
         let d = Rc::clone(&done);
@@ -288,14 +298,14 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
         // drain-refresh-arm race pressure.
         let writer = W2mWriter::new(ptr);
         for req_id in 1..=N_MESSAGES {
-            writer.send_status(0, req_id, WireStatus::Ok, &[]);
+            writer.send_status(req_id, req_id as u32, WireStatus::Ok, &[]);
         }
         unsafe { libc::_exit(0) };
     }
 
     let reactor = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
     // A fresh reactor's first lease is 1..=N, which is what the child publishes.
-    let lease = Rc::new(reactor.lease_acks(N_MESSAGES as usize));
+    let lease = Rc::new(reactor.lease_acks(N_MESSAGES as usize, WorkerSet::ALL));
     let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
     // A oneshot rather than a polling watcher: a watcher that yields re-arms
     // its own waker every poll, so the run queue never empties and the
@@ -307,7 +317,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
             let mut got = Vec::new();
             let _ = lease
                 .acks(N_MESSAGES as usize, |_, c| {
-                    got.push(c.request_id);
+                    got.push(c.hdr.target_id);
                     None::<()>
                 })
                 .await;
@@ -341,7 +351,7 @@ fn arm_waitv_refuses_while_data_is_unread() {
 
     let region = unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) };
     let ptr = region.ptr();
-    W2mWriter::new(ptr).send_status(0, 1u64, WireStatus::Ok, &[]);
+    W2mWriter::new(ptr).send_status(0, 1, WireStatus::Ok, &[]);
 
     let receiver = W2mReceiver::new(vec![ptr]);
     let mut out = [FutexWaitV::new(); 1];

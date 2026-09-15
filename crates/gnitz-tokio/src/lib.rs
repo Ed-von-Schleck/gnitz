@@ -140,11 +140,10 @@ impl AsyncClient {
             .map(|r| r.into_scan())
     }
 
-    /// A point SEEK by primary key, already split by
-    /// `gnitz_wire::control::split_ctrl_key`.
-    pub async fn seek(&self, tid: u64, pk: u128, pk_extra: &[u8]) -> Result<ScanReply, ClientError> {
-        let pk_extra = pk_extra.to_vec();
-        self.call(move |s| s.submit(Request::seek(tid, pk, &pk_extra)))
+    /// A point SEEK by primary key: `key` is the packed native-LE PK columns.
+    pub async fn seek(&self, tid: u64, key: &[u8]) -> Result<ScanReply, ClientError> {
+        let key = key.to_vec();
+        self.call(move |s| s.submit(Request::seek(tid, &key)))
             .await
             .map(|r| r.into_scan())
     }

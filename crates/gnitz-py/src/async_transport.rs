@@ -250,8 +250,8 @@ impl PyAsyncTransport {
     }
 
     fn seek(&mut self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let (low, extra) = pk_key_from_py(&pk)?;
-        self.submit(py, gnitz_core::Request::seek(target_id, low, &extra))
+        let key = pk_key_from_py(&pk)?;
+        self.submit(py, gnitz_core::Request::seek(target_id, &key))
     }
 
     /// One pyo3 crossing per readable event. It flushes as well as reads, so a
@@ -264,11 +264,6 @@ impl PyAsyncTransport {
     /// The writer callback: `step(WRITE)`.
     fn on_writable(&mut self, py: Python<'_>) -> PyResult<()> {
         self.drive(py, gnitz_core::Interest::WRITE)
-    }
-
-    #[getter]
-    fn client_id(&self) -> u64 {
-        self.session.client_id
     }
 
     fn close(&mut self, py: Python<'_>) {

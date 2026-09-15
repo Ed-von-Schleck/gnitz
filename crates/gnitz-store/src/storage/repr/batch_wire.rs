@@ -200,14 +200,7 @@ impl Batch {
 
     /// Encode the rows `indices` selects, in order, as one WAL block of
     /// `wire_byte_size_range(indices.len())` bytes at `out[offset..]`.
-    pub fn encode_scattered_to_wire(
-        &self,
-        indices: &[u32],
-        table_id: u32,
-        out: &mut [u8],
-        offset: usize,
-        checksum: bool,
-    ) -> usize {
+    pub fn encode_scattered_to_wire(&self, indices: &[u32], table_id: u32, out: &mut [u8], offset: usize) -> usize {
         debug_assert!(
             !self.schema().has_german_string(),
             "a row scatter writes no heap bytes, so it cannot carry a string column"
@@ -233,10 +226,6 @@ impl Batch {
             empty_blob.is_empty(),
             "a schema with no German string scatters no blob bytes"
         );
-
-        if checksum {
-            wal::stamp_checksum(block, total_size);
-        }
         total_size
     }
 

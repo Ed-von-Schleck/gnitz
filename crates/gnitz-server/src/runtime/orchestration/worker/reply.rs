@@ -25,8 +25,6 @@ pub(super) struct PendingScan {
 fn reply_frame<'a>(route: ReplyRoute, block: Option<&'a [u8]>, server_version: u16, last: bool) -> WireMsg<'a> {
     WireMsg {
         target_id: route.target_id,
-        client_id: route.client_id,
-        request_id: route.request_id,
         flags: WireFlags::train_frame(server_version, last),
         schema_block: block,
         ..Default::default()
@@ -86,12 +84,12 @@ impl PendingScan {
 impl WorkerProcess {
     // ── W2M response helpers ───────────────────────────────────────────
 
-    pub(super) fn send_ack(&self, target_id: u64, request_id: u64) {
+    pub(super) fn send_ack(&self, target_id: u64, request_id: u32) {
         self.w2m_writer.send_status(target_id, request_id, WireStatus::Ok, &[]);
     }
 
     /// A control-only frame carrying the fault's own status.
-    pub(super) fn send_fault(&self, fault: &gnitz_wire::WireFault, request_id: u64) {
+    pub(super) fn send_fault(&self, fault: &gnitz_wire::WireFault, request_id: u32) {
         self.w2m_writer
             .send_status(0, request_id, fault.status, fault.text.as_bytes());
     }
@@ -240,7 +238,7 @@ fn oversized_reply(sz: usize) -> gnitz_wire::WireFault {
 }
 
 /// What one pre-flight frame spends on everything that is not a key: the control
-/// block and the data block's header at zero rows. Charged against the budget
+/// header and the data block's header at zero rows. Charged against the budget
 /// before it is divided into keys, or the frame runs over.
 pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor) -> usize {
     let framing = reply_frame(ReplyRoute::default(), None, 0, true).size();
@@ -280,7 +278,7 @@ pub(crate) fn send_unique_preflight_keys(
     w2m_writer: &W2mWriter,
     target_id: u64,
     frame_schema: &SchemaDescriptor,
-    request_id: u64,
+    request_id: u32,
     budget: usize,
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {

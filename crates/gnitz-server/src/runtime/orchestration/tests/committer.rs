@@ -143,7 +143,7 @@ fn group_of(reactor: &Reactor, tid: i64, write_err: Option<WireFault>) -> GroupI
     GroupInfo {
         tid,
         recoverable: true,
-        req_ids: reactor.lease_acks(1),
+        req_ids: reactor.lease_acks(1, crate::runtime::sal::WorkerSet::ALL),
         merged: Batch::empty_with_schema(&make_schema_u64_i64()),
         write_err,
     }

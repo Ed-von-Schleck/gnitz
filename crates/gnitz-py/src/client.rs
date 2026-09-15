@@ -303,8 +303,8 @@ impl PyGnitzClient {
     /// `pk` may be a scalar (single-PK tables) or `bytes` (compound or
     /// wide-byte PKs).
     pub fn seek(&mut self, py: Python<'_>, table_id: u64, pk: Bound<'_, PyAny>) -> PyResult<Py<PyScanResult>> {
-        let (low, extra) = pk_key_from_py(&pk)?;
-        let reply = self.call(py, move |c| c.seek(table_id, low, &extra))?;
+        let key = pk_key_from_py(&pk)?;
+        let reply = self.call(py, move |c| c.seek(table_id, &key))?;
         scan_result(py, reply)
     }
 

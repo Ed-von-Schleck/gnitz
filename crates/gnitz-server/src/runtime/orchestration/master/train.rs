@@ -12,11 +12,11 @@ fn scan_decode_err(slot: &W2mSlot, what: &str, e: &str) -> WireFault {
 /// (prefixed with `what`) on a fault frame or a corrupt header. Dropping the
 /// caller's scan lease discards the rest of the train.
 fn parse_train_header(slot: &W2mSlot, what: &str) -> Result<(gnitz_wire::control::DecodedControl, bool), WireFault> {
-    let ctrl = peek_control_block(slot.bytes(), false).map_err(|e| scan_decode_err(slot, what, e))?;
+    let ctrl = peek_control_block(slot.bytes()).map_err(|e| scan_decode_err(slot, what, e))?;
     if let Some(e) = super::worker_error(slot.worker as usize, what, &ctrl) {
         return Err(e);
     }
-    let has_more = !ctrl.flags.scan_last;
+    let has_more = !ctrl.hdr.flags.scan_last;
     Ok((ctrl, has_more))
 }
 
@@ -43,9 +43,9 @@ pub(super) async fn drain_index_scan(
     expected: &SchemaDescriptor,
     mut on_batch: impl FnMut(&gnitz_store::storage::MemBatch<'_>) -> Result<(), WireFault>,
 ) -> Result<(), WireFault> {
-    for i in 0..lease.len() {
+    for w in lease.workers() {
         loop {
-            let slot = lease.next_frame(i).await;
+            let slot = lease.next_frame(w).await;
             let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
             let (has_more, batch) = decode_train_slot(&slot, what, expected, &mut offsets)?;
             if let Some(mb) = batch.filter(|mb| !mb.is_empty()) {
@@ -62,21 +62,21 @@ pub(super) async fn drain_index_scan(
 /// Forward every reply train of `lease` to `peer` in reply order. `Ok(false)` on
 /// client disconnect; `Err` on the first worker fault, leaving the rest undrained.
 pub(crate) async fn forward_scan(peer: &Peer, lease: &Lease) -> Result<bool, WireFault> {
-    for i in 0..lease.len() {
-        if !drain_scan_train(peer, lease, i).await? {
+    for w in lease.workers() {
+        if !drain_scan_train(peer, lease, w).await? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Forward reply `i`'s train to `peer`, skipping frames that carry nothing the
+/// Forward worker `w`'s train to `peer`, skipping frames that carry nothing the
 /// client reads. `Ok(false)` if the client is gone.
-async fn drain_scan_train(peer: &Peer, lease: &Lease, i: usize) -> Result<bool, WireFault> {
+async fn drain_scan_train(peer: &Peer, lease: &Lease, w: usize) -> Result<bool, WireFault> {
     loop {
-        let slot = lease.next_frame(i).await;
+        let slot = lease.next_frame(w).await;
         let (ctrl, has_more) = parse_train_header(&slot, "scan")?;
-        if !ctrl.flags.has_data && !ctrl.flags.has_schema {
+        if !ctrl.hdr.flags.has_data && !ctrl.hdr.flags.has_schema {
             drop(slot);
         } else if peer.send(slot).await < 0 {
             return Ok(false);

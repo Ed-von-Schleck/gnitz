@@ -1,8 +1,8 @@
 //! Order-preserving primary-key (OPK) primitives.
 //!
 //! These pure layout/key operations sit *below* both `schema` and `storage`:
-//! they encode a PK region — a whole one, a seek key reassembled from its wire
-//! pair, or an index's leading-column span — to its order-preserving big-endian
+//! they encode a PK region — a whole one, a wire seek key, or an index's
+//! leading-column span — to its order-preserving big-endian
 //! image, compare two such images with a raw `memcmp`, pack a narrow region
 //! into a sort key, carry a width-tagged PK byte buffer, and derive the
 //! half-open key range a `RangeDescriptor`'s cut pair denotes — and compose the
@@ -98,8 +98,7 @@ pub(crate) fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) ->
 /// wide [`PkBuf`]. `native_le` must hold at least `pk_stride` bytes (in pk-list
 /// column order); any trailing bytes are ignored. This is the single native→OPK
 /// encoder for **every** PK width — a caller holding a narrow value passes
-/// `&value.to_le_bytes()`; the seek path passes the reassembled wire image via
-/// [`seek_opk_bytes`].
+/// `&value.to_le_bytes()`; the seek path goes through [`seek_opk_bytes`].
 ///
 /// The schema-typed face of [`gnitz_wire::encode_pk_tuple`], fed
 /// `schema.pk_columns()`, so a non-identity `pk_indices` (e.g. `[1, 0]`) encodes
@@ -137,16 +136,14 @@ pub fn opk_key_cols(schema: &SchemaDescriptor, natives: &[u128]) -> PkBuf {
     )
 }
 
-/// [`gnitz_wire::control::join_ctrl_key`] then [`opk_key`]: a wire seek key (native
-/// LE column bytes) as the OPK a PK region holds.
-pub fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Result<PkBuf, String> {
+/// A wire seek key (packed native-LE PK columns) as the OPK a PK region holds. Only
+/// the PK's own stride is read, so a scalar key may arrive as a 16-byte word.
+pub fn seek_opk_bytes(schema: &SchemaDescriptor, key: &[u8]) -> Result<PkBuf, String> {
     let stride = schema.pk_stride();
-    if stride > MAX_PK_BYTES {
-        return Err(format!("PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
-    }
-    let mut le = [0u8; MAX_PK_BYTES];
-    gnitz_wire::control::join_ctrl_key(low, extra, &mut le[..stride])?;
-    Ok(opk_key(schema, &le[..stride]))
+    let key = key
+        .get(..stride)
+        .ok_or_else(|| format!("key of {} bytes is shorter than the {stride}-byte PK", key.len()))?;
+    Ok(opk_key(schema, key))
 }
 
 // ---------------------------------------------------------------------------

@@ -51,11 +51,8 @@ use gnitz_wire::control::{peek_control_block, DecodedControl};
 /// from a reply before anything decodes it.
 pub(crate) const W2M_EXCHANGE_RING_ID: u32 = u32::MAX;
 
-/// The request id worker `w`'s boot verdict answers on: an id of the reactor's
-/// first lease, which starts at 1.
-pub(crate) const fn boot_ready_request_id(w: usize) -> u64 {
-    1 + w as u64
-}
+/// The request id every worker's boot verdict answers on.
+pub(crate) const BOOT_READY_REQUEST_ID: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -747,31 +744,30 @@ impl W2mWriter {
     /// Send a bare control frame: a status and optional error text, no schema
     /// and no rows. Every ACK and error reply on the ring has this shape, and it
     /// ends whatever train it answers.
-    pub fn send_status(&self, target_id: u64, request_id: u64, status: gnitz_wire::WireStatus, error_msg: &[u8]) {
+    pub fn send_status(&self, target_id: u64, request_id: u32, status: gnitz_wire::WireStatus, text: &[u8]) {
         let msg = WireMsg {
             target_id,
-            request_id,
             flags: gnitz_wire::WireFlags::train_frame(0, true),
             status,
-            error_msg,
+            blob: text,
             ..Default::default()
         };
         self.send_msg(request_id, &msg);
     }
 
     /// Encode `msg` into one ring slot, parking on `release_cursor` while the
-    /// ring is full. `ring_req` narrows to the slot's 32-bit prefix, which is
-    /// what the master routes the reply by.
-    pub fn send_msg(&self, ring_req: u64, msg: &WireMsg<'_>) {
-        let (sz, req) = (msg.size(), ring_req as u32);
+    /// ring is full. `ring_req` is the slot's prefix, which is what the master
+    /// routes the reply by.
+    pub fn send_msg(&self, ring_req: u32, msg: &WireMsg<'_>) {
+        let sz = msg.size();
         // SAFETY: a worker process is the sole producer on its own ring.
         unsafe {
             let mut wc = self.cursor.get();
-            let mut reservation = match try_reserve(&wc, sz, req) {
+            let mut reservation = match try_reserve(&wc, sz, ring_req) {
                 Some(r) => r,
-                None => park_for_room(&wc, sz, req),
+                None => park_for_room(&wc, sz, ring_req),
             };
-            msg.encode(reservation.slot(), 0, false);
+            msg.encode(reservation.slot());
             commit(&mut wc, reservation);
             self.cursor.set(wc);
         }
@@ -878,10 +874,10 @@ impl W2mSlot {
         }
     }
 
-    /// The slot's control block alone, aborting on failure as `decode` does — for
+    /// The slot's control header alone, aborting on failure as `decode` does — for
     /// an ACK, whose only content is its status and error text.
     pub(crate) fn control(&self) -> DecodedControl {
-        match peek_control_block(self.bytes(), false) {
+        match peek_control_block(self.bytes()) {
             Ok(ctrl) => ctrl,
             Err(e) => gnitz_fatal_abort!(
                 "w2m: worker={} slot control decode failed: {} — ring corrupt",

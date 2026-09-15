@@ -59,26 +59,26 @@ fn the_whole_prefix_word_is_neutralised() {
     });
 }
 
-/// Presence is the whole prefix word, not its `payload_size` half. A commit
-/// sentinel's payload is one set bit, so a low-half-only test would let a
-/// single flip stop the walk before that transaction's sentinel.
+/// Presence is the whole prefix word, not its `payload_size` half: a small
+/// `payload_size` is zeroable by a bit flip, so a low-half-only test would let
+/// one flip stop the walk before that transaction's sentinel.
 #[test]
 fn a_sentinels_prefix_is_not_single_bit_zeroable() {
     let mut log = TestLog::new(SIZE, 1, 1);
     let bases = log.zone(7, &[11]);
     let sentinel = *bases.last().unwrap();
     log.group(33, 0, SalMessageKind::Tick, false);
-    // A 4-slot empty group, whose payload is 64 — also one bit.
-    let empty4 = log
-        .try_write(44, 0, SalMessageKind::Tick, false, &[&[], &[], &[], &[]])
+    // A 2-slot empty group, whose payload is 64, a single set bit.
+    let empty2 = log
+        .try_write(44, 0, SalMessageKind::Tick, false, &[&[], &[]])
         .expect("group fits");
 
     let view = log.log();
     let clean = walk(view);
-    assert_eq!(clean.0.len(), 4, "zone group, sentinel, tick, 4-slot empty group");
+    assert_eq!(clean.0.len(), 4, "zone group, sentinel, tick, 2-slot empty group");
     assert_eq!(committed(view).unwrap(), vec![7]);
 
-    for &base in &[sentinel, empty4] {
+    for &base in &[sentinel, empty2] {
         sweep_bit_flips(log.prefix_bytes(base), 0..PREFIX_BYTES, |byte, bit, _| {
             assert_eq!(walk(view), clean, "prefix {base}+{byte} bit {bit} changed the walk");
             assert_eq!(
@@ -500,12 +500,11 @@ impl TestLog {
         unsafe { std::slice::from_raw_parts_mut(self.ptr().add(base as usize), PREFIX_BYTES) }
     }
 
-    /// Corrupt one byte of slot `w` of the group at `base`, past the control
-    /// block's own header so the block checksum is what catches it.
+    /// Corrupt one byte of slot `w` of the group at `base`.
     fn damage_slot(&self, base: u64, w: u32) {
         let slot = group_at(self.log(), base).slot(w).expect("slot carries bytes");
         let off = (slot.as_ptr() as usize) - (self.ptr() as usize);
-        unsafe { *self.ptr().add(off + gnitz_wire::WAL_HEADER_SIZE) ^= 0xFF };
+        unsafe { *self.ptr().add(off + slot.len() / 2) ^= 0xFF };
     }
 
     /// The highest slot of the group at `base` that carries rows.
@@ -532,10 +531,8 @@ fn a_row_less_slot_is_not_a_damaged_one() {
     let row_less = (0..NW as u32)
         .filter(|&w| {
             let slot = msg.slot(w).expect("every slot is written");
-            ipc::decode_sal_slot(slot, true)
-                .expect("slot decodes")
-                .data_batch
-                .is_none()
+            assert!(msg.slot_intact(w, slot), "slot {w} verifies");
+            ipc::decode_sal_slot(slot).expect("slot decodes").data_batch.is_none()
         })
         .count();
     assert!(row_less > 0, "the fixture must leave at least one slot row-less");

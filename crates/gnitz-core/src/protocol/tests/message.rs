@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::types::{BatchAppender, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::decode_wal_block;
-use crate::protocol::{ClientTransport, ClientVerb, Header, WireConflictMode};
+use crate::protocol::{ClientTransport, ClientVerb, WireConflictMode};
 
 /// A plain push() request's flags.
 fn push() -> WireFlags {
@@ -47,13 +47,13 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
         (17, &schema, &b1, WireConflictMode::Error),
         (16, &schema, &b2, WireConflictMode::Update),
     ];
-    let payload = encode_push_txn(0xABCD, &families, &[(16, 42), (17, 42)]);
+    let payload = encode_push_txn(&families, &[(16, 42), (17, 42)]);
 
-    // The frame layout — count, mode byte, precondition section — is
-    // `gnitz_wire::txn_frame`'s and is tested there; what this pins is the
-    // adapter above it: each family's two blocks are built from *that*
-    // family's schema, batch and tid, in that order.
-    let decoded = gnitz_wire::txn_frame::decode_push_txn(&payload).unwrap().0;
+    // The frame layout is `gnitz_wire::txn_frame`'s and is tested there; what
+    // this pins is the adapter above it: each family's two blocks are built from
+    // *that* family's schema, batch and tid, in that order.
+    let ctrl = peek_control_block(&payload).unwrap();
+    let decoded = gnitz_wire::txn_frame::decode_push_txn(&payload, &ctrl).unwrap().0;
     let expected = [
         (16u32, WireConflictMode::Update, 2usize),
         (17, WireConflictMode::Error, 1),
@@ -76,76 +76,20 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     }
 }
 
-// ── control block roundtrip ─────────────────────────────────────────────
+// ── send/recv message roundtrips ────────────────────────────────────────
 
-#[test]
-fn test_message_control_schema_roundtrip() {
-    let h = Header {
-        status: WireStatus::Ok,
-        target_id: 0x1234_5678_9ABC_DEF0,
-        client_id: 0xDEAD_BEEF_0000_0001,
-        flags: WireFlags { has_schema: true, ..push() },
-        seek_pk: 42u128 | (99u128 << 64),
-        seek_col_idx: 7,
-        request_id: 0xCAFE_BABE_DEAD_F00D,
-    };
-
-    let encoded = encode_control_block(&h, "test error", &[]);
-    let ctrl = peek_control_block(&encoded, false).unwrap();
-    let decoded = ctrl.header();
-
-    assert_eq!(decoded.status, h.status);
-    assert_eq!(decoded.target_id, h.target_id);
-    assert_eq!(decoded.client_id, h.client_id);
-    assert_eq!(decoded.flags, h.flags);
-    assert_eq!(decoded.seek_pk, h.seek_pk);
-    assert_eq!(decoded.seek_col_idx, h.seek_col_idx);
-    assert_eq!(decoded.request_id, h.request_id);
-    assert_eq!(ctrl.error_msg, b"test error");
-}
-
-#[test]
-fn test_message_control_null_error_msg() {
-    let h = Header::default();
-    let encoded = encode_control_block(&h, "", &[]);
-    assert!(peek_control_block(&encoded, false).unwrap().error_msg.is_empty());
-}
-
-/// Round-trips a wide `seek_pk_extra` (32 bytes) through encode + decode
-/// and back. Mirrors the server-side `ctrl_block_seek_pk_extra_roundtrip`
-/// test in `runtime/suites/wire.rs`.
-#[test]
-fn ctrl_block_seek_pk_extra_roundtrip() {
-    let h = Header::default();
-    let extra: Vec<u8> = (0..32u8).collect();
-    let encoded = encode_control_block(&h, "", &extra);
-    let ctrl = peek_control_block(&encoded, false).unwrap();
-    assert!(ctrl.error_msg.is_empty());
-    assert_eq!(ctrl.seek_pk_extra, extra);
-
-    // Empty seek_pk_extra → identical to today's frame (null bit set).
-    let encoded2 = encode_control_block(&h, "", &[]);
-    assert!(peek_control_block(&encoded2, false).unwrap().seek_pk_extra.is_empty());
-}
-
-/// `request_id` round-trips for the reserved sentinel values: 0 (untagged),
-/// u64::MAX (broadcast), and an arbitrary mid-range value. Catches both
-/// sign-extension bugs and the new-column-index drift between client and
-/// server.
-#[test]
-fn test_request_id_roundtrip_reserved_values() {
-    for &req_id in &[0u64, u64::MAX, 0x1234_5678_DEAD_BEEFu64] {
-        let h = Header { request_id: req_id, ..Header::default() };
-        let encoded = encode_control_block(&h, "", &[]);
-        assert_eq!(peek_control_block(&encoded, false).unwrap().request_id, req_id);
+fn header(target_id: u64, flags: WireFlags, arg0: u64) -> ControlHeader {
+    ControlHeader {
+        target_id,
+        flags,
+        arg0,
+        ..Default::default()
     }
 }
 
-// ── send/recv message roundtrips ────────────────────────────────────────
-
-/// Ship one cold push() frame, the shape `Session::roundtrip_push` builds.
+/// Ship one cold push() frame, the shape `Session::submit` builds.
 fn send_push(t: &mut ClientTransport, schema: &Schema, batch: &ZSetBatch) {
-    let parts = encode_message_parts(0, 0, push(), 0, &[], 0, Some((schema, batch)));
+    let parts = encode_frame(header(0, push(), 0), &[], Some(schema), Some(batch));
     t.send_parts(parts, None).unwrap();
 }
 
@@ -301,52 +245,52 @@ fn german_vals(batch: &ZSetBatch, pi: usize) -> Vec<Option<String>> {
 fn test_message_no_schema_no_data() {
     // Control-only message (scan/alloc style)
     let (mut a, mut b) = make_transport_pair();
-    a.send_parts(encode_control_frame(0, 0, push(), 0, 0, &[]), None)
+    a.send_parts(encode_frame(header(0, push(), 0), &[], None, None), None)
         .unwrap();
     let (msg, data) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
     assert!(msg.schema.is_none());
     assert!(data.is_none());
 }
 
-/// The control scalars a reply is read for must survive the socket.
+/// The control scalars and blob a reply is read for must survive the socket.
 #[test]
 fn test_message_recv_control_fields() {
-    let seek_pk = 0xAAAA_BBBB_CCCC_DDDD_u128 | (0x1111_2222_3333_4444_u128 << 64);
     let (mut a, mut b) = make_transport_pair();
-    a.send_parts(
-        encode_control_frame(0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001, push(), seek_pk, 7, &[]),
-        None,
-    )
-    .unwrap();
+    let hdr = ControlHeader {
+        arg1: 7,
+        ..header(0xDEAD_BEEF_1234_5678, push(), 0xAAAA_BBBB_CCCC_DDDD)
+    };
+    a.send_parts(encode_frame(hdr, b"a blob", None, None), None).unwrap();
     let (msg, _) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
-    assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
-    assert_eq!(msg.seek_pk, seek_pk);
+    assert_eq!(msg.hdr, hdr);
+    assert_eq!(msg.blob, b"a blob");
+    assert!(msg.error_text.is_none());
 }
 
+/// Under a non-`Ok` status the blob is the error text, and nothing else.
 #[test]
 fn test_message_error_response() {
-    // `Error` response: schema and data should be None; error_text populated
     let (mut a, mut b) = make_transport_pair();
-    let err_hdr = Header {
+    let err_hdr = ControlHeader {
         status: WireStatus::Error,
-        ..Header::default()
+        ..Default::default()
     };
-    let encoded = encode_control_block(&err_hdr, "something broke", &[]);
-    a.send_framed(&encoded, None).unwrap();
+    a.send_parts(encode_frame(err_hdr, b"something broke", None, None), None)
+        .unwrap();
     let (msg, _) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
-    assert_eq!(msg.status, WireStatus::Error);
-    assert!(msg.error_text.is_some());
+    assert_eq!(msg.hdr.status, WireStatus::Error);
+    assert_eq!(msg.error_text.as_deref(), Some("something broke"));
+    assert!(msg.blob.is_empty());
 }
 
-// ── encode_message_parts + parse_response roundtrips (no sockets) ────
+// ── encode_frame + parse_response roundtrips (no sockets) ────
 
 #[test]
 fn test_encode_parse_control_only() {
-    let seek_pk = 42u128 | (99u128 << 64);
-    let payload = encode_message_parts(0xDEAD, 0xBEEF, push(), seek_pk, &[], 7, None).to_vec();
+    let payload = encode_frame(header(0xDEAD, push(), 42), &[], None, None).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
-    assert_eq!(msg.target_id, 0xDEAD);
-    assert_eq!(msg.seek_pk, seek_pk);
+    assert_eq!(msg.hdr.target_id, 0xDEAD);
+    assert_eq!(msg.hdr.arg0, 42);
     assert!(msg.schema.is_none());
     assert!(data.is_none());
 }
@@ -373,9 +317,9 @@ fn test_encode_parse_with_data() {
         blob: vec![],
     };
 
-    let payload = encode_message_parts(42, 1, WireFlags::default(), 0, &[], 0, Some((&schema, &batch))).to_vec();
+    let payload = encode_frame(header(42, WireFlags::default(), 0), &[], Some(&schema), Some(&batch)).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
-    assert_eq!(msg.target_id, 42);
+    assert_eq!(msg.hdr.target_id, 42);
     assert!(msg.schema.is_some());
     let data = data.unwrap();
     assert_eq!(data.pks.to_vec_u128(&schema), vec![1u128, 2u128, 3u128]);
@@ -390,33 +334,11 @@ fn test_encode_parse_empty_batch() {
     };
     let empty = ZSetBatch::new(&schema);
 
-    let payload = encode_message_parts(10, 1, WireFlags::default(), 0, &[], 0, Some((&schema, &empty))).to_vec();
+    let payload = encode_frame(header(10, WireFlags::default(), 0), &[], Some(&schema), Some(&empty)).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
     // Schema sent, but no data (empty batch)
     assert!(msg.schema.is_some());
     assert!(data.is_none());
-}
-
-/// A wide (stride 24) PK seek must split inside `encode_message_parts`: low
-/// 16 bytes land in `seek_pk`, bytes 16..24 in `seek_pk_extra`.
-/// `parse_response` only surfaces the low-16 `seek_pk`, so decode the
-/// control block directly to inspect the extra region.
-#[test]
-fn encode_message_wide_pk_seek_emits_extra() {
-    let pk: Vec<u8> = (0..24u8).collect();
-    let (lo, tail) = gnitz_wire::control::split_ctrl_key(&pk);
-    let seek = WireFlags {
-        verb: ClientVerb::Seek,
-        ..Default::default()
-    };
-    let payload = encode_message_parts(7, 1, seek, lo, tail, 0, None).to_vec();
-
-    let ctrl = peek_control_block(&payload, false).unwrap();
-
-    let (want_lo, want_extra) = (lo, tail);
-    assert_eq!(ctrl.seek_pk, want_lo);
-    assert_eq!(ctrl.seek_pk_extra, want_extra); // bytes 16..24
-    assert_eq!(ctrl.flags.verb, ClientVerb::Seek);
 }
 
 /// A hint-only frame (`has_data` set, `has_schema` clear, matching schema
@@ -445,7 +367,7 @@ fn hint_only_frame_returns_data_schema_none() {
     let (mut a, mut b) = make_transport_pair();
     // Embed version=1 in flags; no schema block in the frame.
     let flags = WireFlags { schema_version: 1, ..Default::default() };
-    let parts = encode_message_noschema_parts(42, 0, flags, &schema, &batch);
+    let parts = encode_frame(header(42, flags, 0), &[], None, Some(&batch));
     a.send_parts(parts, None).unwrap();
 
     // Parse with a matching hint (same schema, version 1).

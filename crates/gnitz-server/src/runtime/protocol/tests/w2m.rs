@@ -1,7 +1,7 @@
 use super::fixtures::make_ring;
 use super::*;
 use crate::runtime::test_support::{assert_child_exited_ok, SharedRegion};
-use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::WireStatus;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -369,9 +369,9 @@ fn a_retired_slot_unparks_the_writer() {
     unsafe {
         // Ring holds exactly 1 status frame, which is what the parked writer
         // below publishes — so the two must be sized the same.
-        let region = make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 1, 8);
+        let region = make_ring(CTRL_HEADER_SIZE, 1, 8);
         let ptr = region.ptr();
-        publish(ptr, CTRL_BLOCK_SIZE_NO_BLOB, 0, |s| s[0] = 1).expect("ring should have room for the first message");
+        publish(ptr, CTRL_HEADER_SIZE, 0, |s| s[0] = 1).expect("ring should have room for the first message");
 
         let receiver = W2mReceiver::new(vec![ptr]);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -443,7 +443,7 @@ fn w2m_publish_drain_bench() {
     const N: u64 = 200_000;
     const RING_FRAMES: usize = 64;
 
-    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, RING_FRAMES, 8) };
+    let region = unsafe { make_ring(CTRL_HEADER_SIZE, RING_FRAMES, 8) };
     let ptr = region.ptr();
     // Two u64s the child fills before `_exit`: publishes that found a master
     // park armed, and the child's own elapsed nanos.
@@ -462,7 +462,7 @@ fn w2m_publish_drain_bench() {
             if hdr.master_park.flags.load(Ordering::Relaxed) & FLAG_MASTER_WAITV != 0 {
                 woke_master += 1;
             }
-            writer.send_status(0, req, gnitz_wire::WireStatus::Ok, &[]);
+            writer.send_status(0, req as u32, gnitz_wire::WireStatus::Ok, &[]);
         }
         unsafe {
             cptr.write(woke_master);
@@ -514,7 +514,7 @@ fn w2m_publish_drain_bench() {
 /// order, with its payload intact. The ring holds only `ring_frames` of them,
 /// so the run wraps it many times over.
 fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pad: &[u8]) {
-    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB + pad.len(), ring_frames, 8) };
+    let region = unsafe { make_ring(CTRL_HEADER_SIZE + pad.len(), ring_frames, 8) };
     let ptr = region.ptr();
 
     let region_addr = ptr as usize;
@@ -524,7 +524,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
     let writer_thread = std::thread::spawn(move || {
         let writer = W2mWriter::new(region_addr as *mut u8);
         for req_id in 1..=n {
-            writer.send_status(0, req_id, WireStatus::Ok, &pad_w);
+            writer.send_status(0, req_id as u32, WireStatus::Ok, &pad_w);
         }
         done_w.store(true, Ordering::Release);
     });
@@ -538,14 +538,14 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
             // everything the writer published was already consumed. Reading it
             // after would blame a frame the writer had not published yet.
             let writer_done = done.load(Ordering::Acquire);
-            match receiver.try_read_slot(0).map(|s| s.decode()) {
-                Some(decoded) => {
+            match receiver.try_read_slot(0).map(|s| (s.internal_req_id, s.decode())) {
+                Some((id, decoded)) => {
                     assert_eq!(
-                        decoded.control.request_id, next_expected,
+                        id as u64, next_expected,
                         "{case}: frames arrived out of order at req_id={next_expected}"
                     );
                     assert_eq!(
-                        decoded.control.error_msg, pad,
+                        decoded.control.blob, pad,
                         "{case}: payload corrupted at req_id={next_expected}"
                     );
                     next_expected += 1;
@@ -593,7 +593,7 @@ fn w2m_concurrent_large_frames_arrive_in_order() {
 
 #[test]
 fn w2m_control_only_reply_has_no_backing() {
-    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let region = unsafe { make_ring(CTRL_HEADER_SIZE, 2, 8) };
     let ptr = region.ptr();
 
     let writer = W2mWriter::new(ptr);
@@ -601,7 +601,7 @@ fn w2m_control_only_reply_has_no_backing() {
 
     let receiver = W2mReceiver::new(vec![ptr]);
     let slot = receiver.try_read_slot(0).expect("an ACK");
-    assert_eq!(slot.control().request_id, 42);
+    assert_eq!(slot.internal_req_id, 42);
     assert!(
         slot.decode().data_batch.is_none(),
         "control-only ACK must have no data_batch"
@@ -612,12 +612,7 @@ fn w2m_control_only_reply_has_no_backing() {
 /// its worker.
 #[test]
 fn a_slot_names_the_worker_whose_ring_it_was_read_from() {
-    let (a, b) = unsafe {
-        (
-            make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8),
-            make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8),
-        )
-    };
+    let (a, b) = unsafe { (make_ring(CTRL_HEADER_SIZE, 2, 8), make_ring(CTRL_HEADER_SIZE, 2, 8)) };
     W2mWriter::new(b.ptr()).send_status(0, 7, WireStatus::Ok, b"");
     let receiver = W2mReceiver::new(vec![a.ptr(), b.ptr()]);
     assert!(receiver.try_read_slot(0).is_none());
@@ -628,7 +623,7 @@ fn a_slot_names_the_worker_whose_ring_it_was_read_from() {
 /// sleeping, and leaves the flag clear.
 #[test]
 fn a_sal_park_returns_at_once_when_its_retest_finds_a_group() {
-    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let region = unsafe { make_ring(CTRL_HEADER_SIZE, 2, 8) };
     let writer = W2mWriter::new(region.ptr());
     let mut armed_when_tested = false;
     writer.sal_park().park(|| {
@@ -644,7 +639,7 @@ fn a_sal_park_returns_at_once_when_its_retest_finds_a_group() {
 /// A worker parked on an empty SAL wakes on another process's `SalWake`.
 #[test]
 fn a_parked_worker_wakes_on_a_forked_masters_sal_wake() {
-    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let region = unsafe { make_ring(CTRL_HEADER_SIZE, 2, 8) };
     let ptr = region.ptr();
     let seq = || unsafe { super::fixtures::sal_wake_seq(ptr) };
     let pid = unsafe { libc::fork() };

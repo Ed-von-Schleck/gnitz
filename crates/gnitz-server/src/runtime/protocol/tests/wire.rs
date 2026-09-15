@@ -5,7 +5,7 @@ use crate::runtime::wire::{
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, MAX_BATCH_REGIONS};
-use gnitz_wire::control::{peek_control_block, CTRL_BLOCK_SIZE_NO_BLOB};
+use gnitz_wire::control::{peek_control_block, CTRL_HEADER_SIZE};
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
 use gnitz_wire::{ClientVerb, WireFlags, WireStatus};
@@ -55,7 +55,7 @@ fn encode_decode_roundtrip_with_schema() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire, true).unwrap();
+    let decoded = decode_sal_slot(&wire).unwrap();
     assert!(decoded.schema.is_some());
     let s = decoded.schema.unwrap();
     assert_eq!(s.num_columns(), 2);
@@ -77,7 +77,7 @@ fn encode_decode_roundtrip_with_data() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire, true).unwrap();
+    let decoded = decode_sal_slot(&wire).unwrap();
     assert!(decoded.schema.is_some());
     assert!(decoded.data_batch.is_some());
     let db = decoded.data_batch.as_ref().unwrap();
@@ -107,7 +107,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
         let block = crate::catalog::encode_schema_block(&original, 0);
-        let decoded = decode_schema_block(&block, false).unwrap();
+        let decoded = decode_schema_block(&block).unwrap();
         assert!(
             original == decoded,
             "pk_indices {pk_indices:?} did not survive wire round-trip",
@@ -140,7 +140,7 @@ fn encode_decode_string_column() {
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire, true).unwrap();
+    let decoded = decode_sal_slot(&wire).unwrap();
     let db = decoded.data_batch.as_ref().unwrap();
     assert_eq!(db.len(), 2);
 
@@ -186,7 +186,7 @@ fn every_truncation_of_a_frame_is_rejected() {
     for (shape, wire) in every_frame_shape().iter().enumerate() {
         for cut in 1..wire.len() {
             assert!(
-                decode_sal_slot(&wire[..cut], true).is_err(),
+                decode_sal_slot(&wire[..cut]).is_err(),
                 "shape {shape}: prefix of {cut}/{} bytes must not decode",
                 wire.len()
             );
@@ -218,7 +218,7 @@ fn encode_writes_exactly_the_predicted_size() {
         },
         WireMsg {
             status: WireStatus::Error,
-            error_msg: b"something went wrong",
+            blob: b"something went wrong",
             ..Default::default()
         },
         WireMsg {
@@ -235,40 +235,34 @@ fn encode_writes_exactly_the_predicted_size() {
     for (i, msg) in msgs.iter().enumerate() {
         let sz = msg.size();
         let mut buf = vec![0u8; sz];
-        assert_eq!(msg.encode(&mut buf, 0, true), sz, "shape {i}: encode wrote != size()");
+        assert_eq!(msg.encode(&mut buf), sz, "shape {i}: encode wrote != size()");
     }
 }
 
-/// An `error_msg` on either side of the 12-byte German-string threshold: the
-/// short one stays inline in the control block, the long one spills to the blob
-/// region and is read back through the directory.
+/// Error text round-trips as the blob of a non-`Ok` frame.
 #[test]
-fn decode_wire_round_trips_an_error_msg_inline_and_spilled() {
-    for error_msg in [
-        b"boom".as_slice(),
+fn decode_wire_round_trips_error_text() {
+    for text in [
+        b"".as_slice(),
+        b"boom",
         b"this error message is definitely longer than twelve bytes",
     ] {
         let wire = WireMsg {
             target_id: 7,
-            client_id: 3,
-            request_id: 0xABCD,
             status: WireStatus::Error,
-            error_msg,
+            blob: text,
             ..Default::default()
         }
         .encode_to_vec();
-        let decoded = decode_sal_slot(&wire, true).unwrap();
-        assert_eq!(decoded.control.target_id, 7);
-        assert_eq!(decoded.control.client_id, 3);
-        assert_eq!(decoded.control.request_id, 0xABCD);
-        assert_eq!(decoded.control.status, WireStatus::Error);
-        assert_eq!(decoded.control.error_msg, error_msg);
+        let decoded = decode_sal_slot(&wire).unwrap();
+        assert_eq!(decoded.control.hdr.target_id, 7);
+        assert_eq!(decoded.control.hdr.status, WireStatus::Error);
+        assert_eq!(decoded.control.blob, text);
     }
 }
 
 /// Every control field round-trips through `decode_sal_slot`, each at a distinct
 /// value so a transposed pair fails rather than reading back unchanged.
-/// `request_id` is at `u64::MAX`, the widest value the reply-routing key takes.
 #[test]
 fn decode_wire_round_trips_every_control_field() {
     let flags = WireFlags {
@@ -279,24 +273,20 @@ fn decode_wire_round_trips_every_control_field() {
     };
     let wire = WireMsg {
         target_id: 0xDEAD,
-        client_id: 0xBEEF,
         flags,
-        seek_pk: 0x1111u128 | (0x2222u128 << 64),
-        seek_col_idx: 0x3333,
-        request_id: u64::MAX,
+        arg0: 0x1111_2222_3333_4444,
+        arg1: 0x5555,
         ..Default::default()
     }
     .encode_to_vec();
-    let decoded = decode_sal_slot(&wire, true).unwrap();
-    assert_eq!(decoded.control.target_id, 0xDEAD);
-    assert_eq!(decoded.control.client_id, 0xBEEF);
-    assert_eq!(decoded.control.flags, flags);
-    assert_eq!(decoded.control.seek_pk, 0x1111u128 | (0x2222u128 << 64));
-    assert_eq!(decoded.control.seek_col_idx, 0x3333);
-    assert_eq!(decoded.control.request_id, u64::MAX);
-    assert!(decoded.control.error_msg.is_empty(), "no message means no message");
+    let decoded = decode_sal_slot(&wire).unwrap();
+    assert_eq!(decoded.control.hdr.target_id, 0xDEAD);
+    assert_eq!(decoded.control.hdr.flags, flags);
+    assert_eq!(decoded.control.hdr.arg0, 0x1111_2222_3333_4444);
+    assert_eq!(decoded.control.hdr.arg1, 0x5555);
+    assert!(decoded.control.blob.is_empty(), "no blob means no blob");
     assert_eq!(
-        decoded.control.status,
+        decoded.control.hdr.status,
         WireStatus::Ok,
         "a frame that says nothing says OK"
     );
@@ -327,7 +317,7 @@ fn encode_chunk_roundtrip() {
     };
     let sz = msg.size();
     let mut buf = vec![0u8; sz];
-    assert_eq!(msg.encode(&mut buf, 0, false), sz);
+    assert_eq!(msg.encode(&mut buf), sz);
 
     // Every region must be sliced by the same range: PK, weight and payload are
     // distinct per row, so a range applied to one region and not another shows up.
@@ -361,7 +351,7 @@ fn continuation_frame_decoded_with_schema_hint() {
         ..Default::default()
     };
     let mut buf = vec![0u8; msg.size()];
-    msg.encode(&mut buf, 0, false);
+    msg.encode(&mut buf);
 
     // decode_wire_ipc must fail (no schema in frame, no hint).
     assert!(
@@ -370,7 +360,7 @@ fn continuation_frame_decoded_with_schema_hint() {
     );
 
     // With a hint it decodes, every region sliced by the same rows.
-    let ctrl = peek_control_block(&buf, false).expect("control block");
+    let ctrl = peek_control_block(&buf).expect("control header");
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
     let decoded = decode_train_frame(&buf, &ctrl, &sd, &mut offsets).expect("decode with schema hint");
     let b = decoded.as_ref().expect("data_batch");
@@ -385,15 +375,10 @@ fn continuation_frame_decoded_with_schema_hint() {
 fn schemaless_command_slot_is_a_bare_control_block() {
     // Every command verb's SAL slot is written with no schema block and no data,
     // and `CHECKPOINT_RESERVE` is sized from that. Both the size prediction and
-    // the encode must agree it is exactly one control block.
-    assert_eq!(WireMsg::default().size(), CTRL_BLOCK_SIZE_NO_BLOB);
-    let buf = WireMsg {
-        target_id: 7,
-        request_id: 42,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    assert_eq!(buf.len(), CTRL_BLOCK_SIZE_NO_BLOB);
+    // the encode must agree it is exactly one control header.
+    assert_eq!(WireMsg::default().size(), CTRL_HEADER_SIZE);
+    let buf = WireMsg { target_id: 7, ..Default::default() }.encode_to_vec();
+    assert_eq!(buf.len(), CTRL_HEADER_SIZE);
 }
 
 /// The shared decoder applies the header's `batch_consolidated` bit onto
@@ -415,7 +400,7 @@ fn decode_applies_batch_flags() {
     }
     .encode_to_vec();
 
-    let decoded = decode_sal_slot(&wire, true).expect("decode");
+    let decoded = decode_sal_slot(&wire).expect("decode");
     let b = decoded.data_batch.as_ref().expect("data batch present");
     assert_eq!(b.layout(), Layout::Consolidated, "decoder applies batch_consolidated");
 }
@@ -507,13 +492,9 @@ fn scattered_roundtrips_over_a_padded_schema() {
         };
         let sz = msg.size();
         let mut buf = vec![0u8; sz];
-        assert_eq!(
-            msg.encode(&mut buf, 0, true),
-            sz,
-            "{count} rows: size must size its encode"
-        );
+        assert_eq!(msg.encode(&mut buf), sz, "{count} rows: size must size its encode");
 
-        let decoded = decode_sal_slot(&buf, true).expect("a scattered block decodes");
+        let decoded = decode_sal_slot(&buf).expect("a scattered block decodes");
         let got = decoded.data_batch.expect("it carries rows");
         assert_eq!(got.len(), count);
         for (j, &src) in indices.iter().enumerate() {

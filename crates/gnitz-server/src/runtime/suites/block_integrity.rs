@@ -1,16 +1,12 @@
-//! The descriptive bytes of a WAL block: its 32-byte header (outside the block's
-//! own checksum, so only the exact region-size relations constrain it) and the
-//! control block, whose own checksum this file exercises.
+//! The descriptive bytes of a WAL block — its 32-byte header, outside the block's
+//! own checksum, so only the exact region-size relations constrain it — and the
+//! per-slot checksum a zoned SAL group's directory carries.
 
-use crate::runtime::wire::{WireData, WireMsg};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::schema::decode_schema_block;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
-use gnitz_wire::control::peek_control_block;
-use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
-use gnitz_wire::WireStatus;
-use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_SIZE, WAL_OFF_TID};
+use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_TID};
 
 /// A schema WAL block for a 4-column schema.
 fn schema_block_4col() -> Vec<u8> {
@@ -39,16 +35,14 @@ fn schema_block_4col() -> Vec<u8> {
 fn schema_block_count_forgeries_are_rejected() {
     let clean = schema_block_4col();
     assert_eq!(
-        decode_schema_block(&clean, false)
-            .expect("clean schema block")
-            .num_columns(),
+        decode_schema_block(&clean).expect("clean schema block").num_columns(),
         4
     );
     for forged_count in [3u32, 2, 1] {
         let mut buf = clean.clone();
         gnitz_wire::write_u32_le(&mut buf, WAL_OFF_COUNT, forged_count);
         assert_eq!(
-            decode_schema_block(&buf, false).err(),
+            decode_schema_block(&buf).err(),
             Some("schema block region size mismatch"),
             "schema COUNT 4 -> {forged_count} must be rejected"
         );
@@ -98,12 +92,12 @@ fn single_bit_header_sweep_changes_nothing_observable() {
     );
 
     let mut buf = schema_block_4col();
-    let reference = decode_schema_block(&buf, false).expect("clean");
+    let reference = decode_schema_block(&buf).expect("clean");
     sweep_bit_flips(&mut buf, 0..WAL_HEADER_SIZE, |byte, bit, buf| {
         if (WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8).contains(&byte) {
             return;
         }
-        let Ok(decoded) = decode_schema_block(buf, false) else {
+        let Ok(decoded) = decode_schema_block(buf) else {
             return;
         };
         assert_eq!(
@@ -121,90 +115,16 @@ fn single_bit_header_sweep_changes_nothing_observable() {
 }
 
 // ---------------------------------------------------------------------------
-// The control block
+// The SAL slot checksum
 // ---------------------------------------------------------------------------
 
-/// Every descriptive byte of the control block — `seek_pk`, `seek_col_idx`,
-/// `request_id`, `target_id`, `client_id`, `status`, the layout bits, the
-/// directory — is covered by one sweep over the checksummed span.
-///
-/// `has_data` is the costliest bit in that span: `decode_wire_body` routes
-/// on it, so clearing it returns `Ok` with no batch and a committed push slot's
-/// rows vanish silently. Nothing but the checksum can catch that — `Ok` with no
-/// batch is the legitimate reading of every row-less slot, so the shape itself
-/// cannot be made fatal.
+/// Every bit of a slot of a zoned push group — laid out by the fast path
+/// (`scatter::with_group`), the SAL's highest-volume writer — is covered by that
+/// slot's directory checksum, and by no other slot's. Clearing `has_data` is the
+/// costliest flip in that span: the decode reads `Ok` with no batch, so a
+/// committed push slot's rows would vanish silently.
 #[test]
-fn every_single_bit_flip_in_the_control_block_body_is_rejected() {
-    // A full checksummed frame — control + schema + data — as
-    // `SalWriter::write` writes one into a SAL slot.
-    let schema = make_schema_u64_i64();
-    let batch = make_batch(&schema, &[(1, 1, 10)]);
-    let block = crate::catalog::encode_schema_block(&schema, 7);
-    let mut buf = WireMsg {
-        target_id: 7,
-        request_id: 0x1234_5678_9ABC_DEF0,
-        schema_block: Some(&block),
-        data: WireData::Whole(&batch),
-        ..Default::default()
-    }
-    .encode_to_vec();
-    sweep_bit_flips(&mut buf, WAL_HEADER_SIZE..CTRL_BLOCK_SIZE_NO_BLOB, |byte, bit, buf| {
-        assert!(
-            crate::runtime::wire::decode_sal_slot(buf, true).is_err(),
-            "control-block byte {byte} bit {bit} must be rejected"
-        );
-    });
-}
-
-/// `SIZE` frames the rest of the slot and sits outside the block's own checksum,
-/// so only the exact `CTRL_BLOCK_SIZE_NO_BLOB + blob_len` relation constrains it.
-/// Both blob shapes, so a relation written as a constant would still fail.
-#[test]
-fn the_control_blocks_size_field_is_exact() {
-    for error_msg in [
-        b"".as_slice(),
-        b"an error message well past the twelve-byte inline threshold",
-    ] {
-        let mut buf = vec![0u8; 1024];
-        let n = gnitz_wire::control::encode_ctrl_block(
-            &mut buf,
-            0,
-            &gnitz_wire::control::ControlHeader {
-                status: WireStatus::Ok,
-                target_id: 7,
-                ..Default::default()
-            },
-            error_msg,
-            &[],
-            true,
-        );
-        buf.truncate(n);
-        assert_eq!(
-            peek_control_block(&buf, true).expect("clean control block").block_size,
-            n
-        );
-        assert!(
-            n > CTRL_BLOCK_SIZE_NO_BLOB || error_msg.is_empty(),
-            "the spill fixture must actually spill"
-        );
-
-        for delta in [-1i64, 1] {
-            let mut forged = buf.clone();
-            gnitz_wire::write_u32_le(&mut forged, WAL_OFF_SIZE, (n as i64 + delta) as u32);
-            assert_eq!(
-                peek_control_block(&forged, false).err(),
-                Some("control block size disagrees with its blob region"),
-                "SIZE {n} {delta:+} must be rejected on the blob relation, not framed through"
-            );
-        }
-    }
-}
-
-/// A zoned push slot laid out by the fast path (`scatter::with_group`) carries
-/// the control-block checksum — the SAL's highest-volume writer, and the one
-/// every other fixture here misses.
-#[test]
-fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
+fn every_bit_of_a_zoned_slot_is_covered_by_its_own_checksum() {
     use crate::runtime::sal::fixtures::{group_at, TestLog};
 
     let sal = TestLog::new(1 << 20, 2, 1);
@@ -214,16 +134,45 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     let scope = excl.begin(5, "test");
     sal.push_group(5, 16, schema, &batch, |g| scope.write(g, true));
     scope.commit().expect("sentinel fits");
+    drop(excl);
 
     let msg = group_at(sal.log(), 0);
-    let slot = msg.slot(0).expect("slot 0 carries bytes");
-    crate::runtime::wire::decode_sal_slot(slot, true).expect("the fast path's slot must verify");
+    let slots: Vec<(u32, Vec<u8>)> = msg.slots_written().map(|(w, b)| (w, b.to_vec())).collect();
+    assert_eq!(slots.len(), 2, "both slots are written");
+    for (w, bytes) in &slots {
+        assert!(msg.slot_intact(*w, bytes), "clean slot {w} verifies");
+    }
 
-    // A flipped control byte in that slot fails the same checksum.
-    let mut forged = slot.to_vec();
-    forged[WAL_HEADER_SIZE] ^= 1;
-    assert!(
-        crate::runtime::wire::decode_sal_slot(&forged, true).is_err(),
-        "the fast path must stamp a control-block checksum, or nothing verifies it"
-    );
+    let (victim, clean) = &slots[0];
+    let mut buf = clean.clone();
+    sweep_bit_flips(&mut buf, 0..clean.len(), |byte, bit, buf| {
+        assert!(
+            !msg.slot_intact(*victim, buf),
+            "slot {victim} byte {byte} bit {bit} must fail its checksum"
+        );
+        for (w, bytes) in &slots[1..] {
+            assert!(
+                msg.slot_intact(*w, bytes),
+                "slot {w} is untouched by slot {victim}'s damage"
+            );
+        }
+    });
+}
+
+/// An unzoned group's directory entries hold checksum 0: nothing replays it, so
+/// nothing is spent hashing it.
+#[test]
+fn an_unzoned_groups_entries_hold_checksum_0() {
+    use crate::runtime::sal::fixtures::{group_at, TestLog};
+
+    let sal = TestLog::new(1 << 20, 2, 1);
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+    sal.push_group(5, 16, schema, &batch, |g| sal.writer.lock_exclusive().write(g));
+
+    let msg = group_at(sal.log(), 0);
+    let entry = msg.dir.len() / msg.slots() as usize;
+    for w in 0..msg.slots() as usize {
+        assert_eq!(gnitz_wire::read_u64_le(msg.dir, w * entry + 4), 0, "slot {w}");
+    }
 }

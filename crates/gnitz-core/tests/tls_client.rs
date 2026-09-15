@@ -15,18 +15,14 @@ use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use gnitz_core::protocol::{
-    encode_message_parts, hello_handshake, parse_response, set_sockopt_int, ClientTransport, ClientVerb, WireFlags,
-    WireStatus,
+    encode_frame, hello_handshake, parse_response, set_sockopt_int, ClientTransport, ClientVerb, WireFlags, WireStatus,
 };
+use gnitz_wire::control::ControlHeader;
 
 /// One control-only frame, blocking until it is on the wire.
-fn send_control(
-    t: &mut ClientTransport,
-    target_id: u64,
-    client_id: u64,
-    flags: WireFlags,
-) -> Result<(), gnitz_core::ProtocolError> {
-    t.send_parts(encode_message_parts(target_id, client_id, flags, 0, &[], 0, None), None)
+fn send_control(t: &mut ClientTransport, target_id: u64, flags: WireFlags) -> Result<(), gnitz_core::ProtocolError> {
+    let hdr = ControlHeader { flags, target_id, ..Default::default() };
+    t.send_parts(encode_frame(hdr, &[], None, None), None)
 }
 use gnitz_core::TableProps;
 use gnitz_core::{ColumnDef, GnitzClient, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch};
@@ -55,12 +51,16 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<
 fn send_push(
     t: &mut ClientTransport,
     tid: u64,
-    client_id: u64,
     flags: WireFlags,
     schema: &Schema,
     batch: &ZSetBatch,
 ) -> Result<(), gnitz_core::protocol::ProtocolError> {
-    let parts = encode_message_parts(tid, client_id, flags, 0, &[], 0, Some((schema, batch)));
+    let hdr = ControlHeader {
+        flags,
+        target_id: tid,
+        ..Default::default()
+    };
+    let parts = encode_frame(hdr, &[], Some(schema), Some(batch));
     t.send_parts(parts, None)
 }
 
@@ -213,7 +213,7 @@ fn push_scan_roundtrip_over_tls() {
     assert_eq!(batch.len(), 999, "1000 inserts − 1 retraction");
     assert!(batch.weights.iter().all(|&w| w == 1), "all net weights must be +1");
     // Spot-check payload integrity via a seek.
-    let row = client.seek(tid, 123, &[]).unwrap().batch;
+    let row = client.seek(tid, &123u64.to_le_bytes()).unwrap().batch;
     assert_eq!(row.len(), 1, "seek must find pk=123");
     {
         let bytes = &row.payload[0].bytes;
@@ -265,7 +265,7 @@ fn wire_version_mismatch_hello_gets_status_error() {
     t.send_framed(&payload, None).unwrap();
     let buf = t.recv_framed(None).unwrap();
     let (msg, _) = parse_response(&buf, None).unwrap();
-    assert_eq!(msg.status, WireStatus::Error);
+    assert_eq!(msg.hdr.status, WireStatus::Error);
     let text = msg.error_text.unwrap_or_default();
     assert!(
         text.contains("version"),
@@ -328,16 +328,16 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         let n_pushes = 30usize;
         for i in 0..n_pushes {
             let batch = make_batch(&schema, (i * 25_000) as u64, 25_000);
-            send_push(&mut t, tid, 0xF00D, push_flags, &schema, &batch).unwrap();
+            send_push(&mut t, tid, push_flags, &schema, &batch).unwrap();
         }
         // The scan whose response (~18 MB) exceeds the shrunken buffers.
-        send_control(&mut t, tid, 0xF00D, WireFlags::default()).unwrap();
+        send_control(&mut t, tid, WireFlags::default()).unwrap();
 
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
             let buf = t.recv_framed(None).unwrap();
             let (ack, _) = parse_response(&buf, None).unwrap();
-            assert_eq!(ack.status, WireStatus::Ok, "push ACK must be OK");
+            assert_eq!(ack.hdr.status, WireStatus::Ok, "push ACK must be OK");
         }
         let mut rows = 0usize;
         let mut schema_seen: Option<(std::sync::Arc<Schema>, u16)> = None;
@@ -345,8 +345,8 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
             let buf = t.recv_framed(None).unwrap();
             let hint = schema_seen.as_ref().map(|(s, v)| (s.as_ref(), *v));
             let (msg, data) = parse_response(&buf, hint).unwrap();
-            assert_eq!(msg.status, WireStatus::Ok, "scan frame must be OK");
-            let flags = msg.flags;
+            assert_eq!(msg.hdr.status, WireStatus::Ok, "scan frame must be OK");
+            let flags = msg.hdr.flags;
             if let Some(s) = msg.schema {
                 schema_seen = Some((s, flags.schema_version));
             }
@@ -397,7 +397,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         hello_handshake(&mut t, None).unwrap();
         // Ask for the scan, then never read: the train stalls, pinning
         // connection_loop in its guarded send.
-        send_control(&mut t, tid, 0xB0BA, WireFlags::default()).unwrap();
+        send_control(&mut t, tid, WireFlags::default()).unwrap();
 
         // Pipeline ~80 MB of pushes; the pump queues them until the 64 MiB
         // cap trips and the recv side tears the connection down. The rows
@@ -412,7 +412,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         let batch = make_batch(&schema, 0, 25_000); // ~1 MB/frame
         let mut sent = 0usize;
         for _ in 0..140 {
-            if send_push(&mut t, tid, 0xB0BA, push_flags, &schema, &batch).is_err() {
+            if send_push(&mut t, tid, push_flags, &schema, &batch).is_err() {
                 break; // server already shut us down mid-burst — success path
             }
             sent += 1;
@@ -455,7 +455,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         let mut t = ClientTransport::connect(&target, None).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t, None).unwrap();
-        send_control(&mut t, tid, 0xB0BA, WireFlags::default()).unwrap();
+        send_control(&mut t, tid, WireFlags::default()).unwrap();
         // Never read. Allow a few deadlines of slack.
         assert!(
             eviction_observed_within(&mut t, 8_000),

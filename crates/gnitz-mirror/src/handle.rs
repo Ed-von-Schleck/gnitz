@@ -145,7 +145,7 @@ impl Mirror {
     /// it. Together with [`Self::retract`] the only writer of either map, which
     /// is what keeps their key sets equal without either consulting the other.
     pub(crate) fn enter(&mut self, tid: u64, rec: MirrorRecord) -> Result<(), MirrorError> {
-        let schema = gnitz_store::schema::decode_schema_block(&rec.block, false)
+        let schema = gnitz_store::schema::decode_schema_block(&rec.block)
             .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))?;
         self.registry
             .register(

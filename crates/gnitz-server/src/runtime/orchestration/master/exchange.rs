@@ -79,8 +79,8 @@ impl ExchangeAccumulator {
     /// drops) an exchange wire missing its schema instead of producing a
     /// malformed relay.
     pub fn process(&mut self, w: usize, decoded: DecodedWire) -> Option<PendingRelay> {
-        let vid = decoded.control.target_id as i64;
-        let source_id = decoded.control.seek_pk as i64;
+        let vid = decoded.control.hdr.target_id as i64;
+        let source_id = decoded.control.hdr.arg0 as i64;
         let key = (vid, source_id);
         let nw = self.nw;
 
@@ -108,12 +108,12 @@ impl ExchangeAccumulator {
         }
         // Bookkeeping rides the terminal frame alone, so a partial train cannot
         // complete the round.
-        if !decoded.control.flags.scan_last {
+        if !decoded.control.hdr.flags.scan_last {
             return None;
         }
         // AND this worker's per-chunk backfill pad bit. Clear for steady-state
         // exchanges, which clears all_pad harmlessly (the relay path ignores it).
-        round.all_pad &= decoded.control.flags.backfill_pad;
+        round.all_pad &= decoded.control.hdr.flags.backfill_pad;
         round.reported = round.reported.with(w);
 
         if round.reported != WorkerSet::ALL.within(nw) {

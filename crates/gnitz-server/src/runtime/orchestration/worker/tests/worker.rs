@@ -23,40 +23,32 @@ fn pending_deltas_accumulate_per_relation() {
     assert_eq!(pending[&200].len(), 1, "a different table gets its own entry");
 }
 
-/// Stage 0 wire-protocol contract: every reply helper (`send_ack`,
-/// `send_scan_response`, `send_fault`) must echo the inbound request_id back
-/// on the W2M region so the master reactor can route it. We fake out the
-/// W2M writer with a real anonymous mmap, fire each helper with a
-/// distinct id, then read the messages back through `decode_wire_ipc` and
-/// assert the ids round-trip.
+/// Every reply helper (`send_ack`, `send_scan_response`, `send_fault`) publishes
+/// on the ring prefix of the request id it was handed.
 #[test]
-fn send_helpers_echo_the_request_id() {
-    use crate::runtime::wire as ipc;
+fn send_helpers_publish_on_the_request_id() {
     let (region, w2m_writer) = ring_and_writer();
     let region_ptr = region.ptr();
 
     let mut wp = make_test_worker(std::ptr::null_mut(), w2m_writer);
 
-    let req_ack: u64 = 42;
-    let req_resp: u64 = 0xCAFE_BABE_DEAD_BEEF;
-    let req_err: u64 = u64::MAX;
+    let req_ack: u32 = 42;
+    let req_resp: u32 = 0xCAFE_BABE;
+    let req_err: u32 = 0x7FFF_FFFE;
     wp.send_ack(7, req_ack);
     // Pass ReplySchema::ReaderHeld: it emits no block and so consults
     // no catalog, which this test does not have (null catalog pointer).
     // The id round-trip is the assertion of interest.
     let schema = make_schema_u64_i64();
     wp.send_scan_response(
-        route(8, req_resp, 0),
+        route(8, req_resp),
         Batch::empty_with_schema(&schema),
         ReplySchema::ReaderHeld,
         0,
     );
     wp.send_fault(&gnitz_wire::WireFault::from("boom"), req_err);
 
-    let decoded_ids: Vec<u64> = walk_frames(region_ptr)
-        .iter()
-        .map(|(_, frame)| ipc::decode_wire_ipc(frame).expect("decode_wire_ipc").control.request_id)
-        .collect();
+    let decoded_ids: Vec<u32> = walk_frames(region_ptr).iter().map(|(id, _)| *id).collect();
     assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
 }
 
@@ -75,20 +67,15 @@ fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerPro
 
 /// The reply route every helper below takes, in the order `dispatch_inner`
 /// resolves it. Inline-emitting; [`fifo_route`] is the queued twin.
-fn route(target_id: u64, request_id: u64, client_id: u64) -> ReplyRoute {
-    ReplyRoute {
-        target_id,
-        request_id,
-        client_id,
-        fifo: false,
-    }
+fn route(target_id: u64, request_id: u32) -> ReplyRoute {
+    ReplyRoute { target_id, request_id, fifo: false }
 }
 
 /// [`route`] for a group the master wrote as one of several.
-fn fifo_route(target_id: u64, request_id: u64, client_id: u64) -> ReplyRoute {
+fn fifo_route(target_id: u64, request_id: u32) -> ReplyRoute {
     ReplyRoute {
         fifo: true,
-        ..route(target_id, request_id, client_id)
+        ..route(target_id, request_id)
     }
 }
 
@@ -101,6 +88,8 @@ fn sal_msg(kind: SalMessageKind, target_id: u32, lsn: u64) -> SalMessage {
         kind,
         zone_start: false,
         target_id,
+        request_id: 0,
+        in_request_order: false,
         base: 0,
         payload: &[],
         dir: &[],
@@ -142,14 +131,14 @@ fn tick_defers_inside_exchange() {
     assert_eq!(wp.exchange.deferred_replay.len(), 1);
     let parked = &wp.exchange.deferred_replay[0];
     assert_eq!(
-        (parked.kind, parked.wire.control.target_id, parked.lsn),
+        (parked.kind, parked.wire.control.hdr.target_id, parked.lsn),
         (SalMessageKind::Tick, 999, 7),
         "the Tick's target and its round must both be carried into the replay queue"
     );
 }
 
 /// A **delta** read inside an exchange wait must defer, carrying the whole
-/// request — `seek_pk` above all, which is where the master put the
+/// request — `arg0` above all, which is where the master put the
 /// interval's upper cut. A replayed read that lost it would cut at `T = 0`,
 /// return nothing, and still be answered with a terminal frame reporting the
 /// real `T`: the client would advance its cursor over rounds it never
@@ -160,10 +149,9 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
     let frame = Box::leak(
         ipc::WireMsg {
             target_id: 77,
-            client_id: 0xC1,
-            seek_pk: 4242,
-            seek_col_idx: 31,
-            seek_pk_extra: &[9, 8, 7],
+            arg0: 4242,
+            arg1: 31,
+            blob: &[9, 8, 7],
             ..Default::default()
         }
         .encode_to_vec()
@@ -181,24 +169,21 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
     let read = &wp.exchange.deferred_replay[1];
     assert_eq!(read.kind, SalMessageKind::DeltaRead);
     let ctrl = &read.wire.control;
-    assert_eq!(
-        (ctrl.target_id, ctrl.client_id, ctrl.seek_pk, ctrl.seek_col_idx),
-        (77, 0xC1, 4242, 31)
-    );
-    assert_eq!(ctrl.seek_pk_extra.as_slice(), &[9, 8, 7]);
+    assert_eq!((ctrl.hdr.target_id, ctrl.hdr.arg0, ctrl.hdr.arg1), (77, 4242, 31));
+    assert_eq!(ctrl.blob.as_slice(), &[9, 8, 7]);
 }
 
 /// Encode a header-only ExchangeRelay wire frame (schema, no data batch)
-/// whose control block echoes `source_id` via `seek_pk`, as the master's
+/// whose control header echoes `source_id` in `arg0`, as the master's
 /// `emit_relay` does. Leaked to `'static` for `dispatch`, which
 /// fail-stops on a frame that does not decode.
-fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
-    // No data batch — a header-only relay. `seek_pk` echoes the source_id the
+fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor) -> &'static [u8] {
+    // No data batch — a header-only relay. `arg0` echoes the source_id the
     // waiter matches on; the default `flags.backfill` is `Continue`.
     let block = crate::catalog::encode_schema_block(schema, target_id as u32);
     let msg = ipc::WireMsg {
         target_id,
-        seek_pk: source_id,
+        arg0: source_id,
         schema_block: Some(&block),
         ..Default::default()
     };
@@ -279,7 +264,7 @@ fn ddl_sync_defers_inside_exchange() {
         1,
         "DdlSync must stage its batch, not apply it"
     );
-    assert_eq!(wp.exchange.deferred[0].wire.control.target_id, 42);
+    assert_eq!(wp.exchange.deferred[0].wire.control.hdr.target_id, 42);
     assert!(
         wp.exchange.deferred_replay.is_empty(),
         "DdlSync must not touch the post-ACK replay queue"
@@ -466,7 +451,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         wp.reply_frame_budget = budget;
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch),
-            route: route(1, 5, 0),
+            route: route(1, 5),
             prebuilt_schema: Some(block),
             server_version: 0,
             next_row: 0,
@@ -510,11 +495,7 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-        let r = if force_fifo {
-            fifo_route(1, 3, 0)
-        } else {
-            route(1, 3, 0)
-        };
+        let r = if force_fifo { fifo_route(1, 3) } else { route(1, 3) };
         wp.send_shared_scan_response(r, Rc::new(make_n_row_batch(schema, 5)), ReplySchema::ReaderHeld, 0);
 
         if force_fifo {
@@ -525,10 +506,10 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         assert!(wp.pending_streams.is_empty(), "the queue ends empty either way");
 
         let data = consume_one(ptr);
-        let ctrl = gnitz_wire::control::peek_control_block(&data, false).expect("peek_control_block");
-        assert_eq!(ctrl.status, WireStatus::Ok);
-        assert!(ctrl.flags.scan_last);
-        assert!(ctrl.flags.continuation);
+        let ctrl = gnitz_wire::control::peek_control_block(&data).expect("peek_control_block");
+        assert_eq!(ctrl.hdr.status, WireStatus::Ok);
+        assert!(ctrl.hdr.flags.scan_last);
+        assert!(ctrl.hdr.flags.continuation);
 
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         let decoded = ipc::decode_train_frame(&data, &ctrl, &schema, &mut offsets).expect("decode with schema hint");
@@ -560,7 +541,7 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_shared_scan_response(fifo_route(1, 5, 0), Rc::clone(&batch), ReplySchema::ReaderHeld, 0);
+    wp.send_shared_scan_response(fifo_route(1, 5), Rc::clone(&batch), ReplySchema::ReaderHeld, 0);
     assert_eq!(wp.pending_streams.len(), 1, "force_fifo queues even a fitting reply");
     assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
@@ -568,10 +549,10 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     assert!(wp.pending_streams.is_empty(), "one frame drains the train");
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
-    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1, false).unwrap();
-    assert_eq!(ctrl.status, WireStatus::Ok);
-    assert!(ctrl.flags.scan_last);
-    assert!(ctrl.flags.continuation);
+    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
+    assert_eq!(ctrl.hdr.status, WireStatus::Ok);
+    assert!(ctrl.hdr.flags.scan_last);
+    assert!(ctrl.hdr.flags.continuation);
     let whole = ipc::WireMsg {
         data: ipc::WireData::Whole(&batch),
         ..Default::default()
@@ -628,14 +609,14 @@ fn pending_streams_drain_two_trains_fifo() {
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_a),
-        route: route(1, 11, 0),
+        route: route(1, 11),
         prebuilt_schema: Some(block_a),
         server_version: 0,
         next_row: 0,
     });
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_b),
-        route: route(2, 22, 0),
+        route: route(2, 22),
         prebuilt_schema: Some(block_b),
         server_version: 0,
         next_row: 0,
@@ -667,11 +648,11 @@ fn pending_streams_drain_two_trains_fifo() {
         let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
         let mut rows = 0usize;
         for (i, (_, bytes)) in train.iter().enumerate() {
-            let ctrl = gnitz_wire::control::peek_control_block(bytes, false).expect("ctrl");
-            assert!(ctrl.flags.continuation);
+            let ctrl = gnitz_wire::control::peek_control_block(bytes).expect("ctrl");
+            assert!(ctrl.hdr.flags.continuation);
             let is_last = i == train.len() - 1;
             assert_eq!(
-                ctrl.flags.scan_last, is_last,
+                ctrl.hdr.flags.scan_last, is_last,
                 "scan_last only on the train's terminal chunk"
             );
             if i == 0 {
@@ -705,12 +686,11 @@ fn an_oversized_reply_enqueues_a_train() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(3, 5, 9), batch, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(3, 5), batch, ReplySchema::ReaderHeld, 0);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
     assert_eq!(ps.next_row, 0);
     assert_eq!(ps.route.request_id, 5);
-    assert_eq!(ps.route.client_id, 9);
     assert!(
         walk_frames(ptr).is_empty(),
         "the train's first chunk is emitted by drain_sal, not at enqueue time"
@@ -730,7 +710,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = 512;
-    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(1, 5), batch, ReplySchema::ReaderHeld, 0);
 
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
@@ -745,8 +725,8 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
         "one row per frame, since one row alone busts the budget"
     );
     for (_, bytes) in &frames {
-        let ctrl = gnitz_wire::control::peek_control_block(bytes, false).unwrap();
-        assert_eq!(ctrl.status, WireStatus::Ok, "an over-budget frame is not a fault");
+        let ctrl = gnitz_wire::control::peek_control_block(bytes).unwrap();
+        assert_eq!(ctrl.hdr.status, WireStatus::Ok, "an over-budget frame is not a fault");
         assert!(bytes.len() > 512, "each frame is one row wider than the budget");
     }
 }
@@ -762,7 +742,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(1, 5), batch, ReplySchema::ReaderHeld, 0);
     assert_eq!(
         wp.pending_streams.len(),
         1,
@@ -773,10 +753,10 @@ fn a_row_wider_than_the_frame_cap_faults() {
     assert!(wp.pending_streams.is_empty(), "the faulting train pops");
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1, "the fault is the whole reply");
-    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1, false).unwrap();
-    assert_eq!(ctrl.status, gnitz_wire::WireStatus::Error);
-    assert_eq!(ctrl.request_id, 5);
-    let text = String::from_utf8_lossy(&ctrl.error_msg);
+    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
+    assert_eq!(ctrl.hdr.status, gnitz_wire::WireStatus::Error);
+    assert_eq!(frames[0].0, 5);
+    let text = String::from_utf8_lossy(&ctrl.blob);
     assert!(
         text.contains("exceeds the maximum frame payload"),
         "the fault names the cap: {text}"
@@ -804,7 +784,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = budget;
-    wp.send_scan_response(route(1, 5, 0), source, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(1, 5), source, ReplySchema::ReaderHeld, 0);
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
         wp.emit_pending_scan_chunk();
@@ -820,10 +800,10 @@ fn a_long_string_train_reassembles_with_its_weights() {
     let mut got: Vec<(u128, i64, String)> = Vec::new();
     for (i, (_, bytes)) in frames.iter().enumerate() {
         assert!(bytes.len() <= budget, "frame {i} is {} bytes of {budget}", bytes.len());
-        let ctrl = gnitz_wire::control::peek_control_block(bytes, false).unwrap();
-        assert_eq!(ctrl.status, WireStatus::Ok);
+        let ctrl = gnitz_wire::control::peek_control_block(bytes).unwrap();
+        assert_eq!(ctrl.hdr.status, WireStatus::Ok);
         assert_eq!(
-            ctrl.flags.scan_last,
+            ctrl.hdr.flags.scan_last,
             i == frames.len() - 1,
             "scan_last only on the terminal frame"
         );
@@ -866,16 +846,16 @@ fn a_reader_held_reply_carries_no_block_at_version_0() {
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 
     let small = Batch::zeroed(&projected, 2);
-    wp.send_scan_response(route(tid as u64, 5, 0), small, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(tid as u64, 5), small, ReplySchema::ReaderHeld, 0);
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
-    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1, false).unwrap();
-    assert!(!ctrl.flags.has_schema, "a fitting reply ships no block");
-    assert_eq!(ctrl.flags.schema_version, 0);
+    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
+    assert!(!ctrl.hdr.flags.has_schema, "a fitting reply ships no block");
+    assert_eq!(ctrl.hdr.flags.schema_version, 0);
 
     let rows = (ipc::FRAME_CAP / 32) + 4096;
     let big = Batch::zeroed(&projected, rows);
-    wp.send_scan_response(route(tid as u64, 6, 0), big, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(tid as u64, 6), big, ReplySchema::ReaderHeld, 0);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
     assert!(ps.prebuilt_schema.is_none(), "a queued train ships no block");

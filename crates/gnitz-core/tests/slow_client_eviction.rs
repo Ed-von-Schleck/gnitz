@@ -7,7 +7,7 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::protocol::{encode_message_parts, hello_handshake, set_sockopt_int, ClientTransport};
+use gnitz_core::protocol::{encode_frame, hello_handshake, set_sockopt_int, ClientTransport};
 use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TableProps, TypeCode, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
@@ -53,15 +53,11 @@ fn slow_scan_client_is_evicted_after_deadline() {
     // against a non-draining peer.
     set_sockopt_int(slow.as_raw_fd(), libc::SO_RCVBUF, 4096);
     hello_handshake(&mut slow, None).expect("hello");
-    let scan = encode_message_parts(
-        table_id,
-        0xB0BA,
-        gnitz_core::protocol::WireFlags::default(),
-        0,
-        &[],
-        0,
-        None,
-    );
+    let hdr = gnitz_wire::control::ControlHeader {
+        target_id: table_id,
+        ..Default::default()
+    };
+    let scan = encode_frame(hdr, &[], None, None);
     slow.send_parts(scan, None).expect("send scan");
 
     let evicted = peer_hung_up_within(slow.as_raw_fd(), 8000);

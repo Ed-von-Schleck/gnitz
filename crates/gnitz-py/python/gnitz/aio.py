@@ -106,11 +106,6 @@ class AsyncConnection:
 
     # -- lifecycle ---------------------------------------------------------
 
-    @property
-    def client_id(self):
-        """The server-assigned id of this connection."""
-        return self._transport.client_id
-
     def __await__(self):
         # `connect()` serves both `await connect(p)` and `async with
         # connect(p)`, so it returns the connection rather than a coroutine;

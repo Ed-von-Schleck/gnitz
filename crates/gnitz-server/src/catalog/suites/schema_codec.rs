@@ -112,7 +112,7 @@ proptest! {
     fn schema_roundtrip_catalog_codec(original in arb_schema(MAX_PK_COLUMNS)) {
         let original = &original;
         let wire = encode_named_schema_block(original, &named_col_defs(&synthetic_names(original)), 0);
-        let decoded = decode_schema_block(&wire, false)
+        let decoded = decode_schema_block(&wire)
             .expect("decode must succeed for any valid schema");
         assert_descriptor_eq(original, &decoded)?;
     }
@@ -204,8 +204,9 @@ fn ddl_txn_roundtrip_client_to_server() {
     // families, whose two scalar forms differ (the engine reads the widened key
     // high-half-first, the client low-half-first) over identical wire bytes.
     let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
-        let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families);
-        let decoded = decode_ddl_txn(&payload).expect("decode_ddl_txn");
+        let payload = gnitz_core::protocol::encode_ddl_txn(families);
+        let ctrl = gnitz_wire::control::peek_control_block(&payload).expect("control header");
+        let decoded = decode_ddl_txn(&payload, &ctrl).expect("decode_ddl_txn");
         assert_eq!(decoded.len(), families.len(), "family count");
         for (fi, ((exp_tid, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
             assert_eq!(*got_tid, *exp_tid as u32, "family {fi} tid/order");

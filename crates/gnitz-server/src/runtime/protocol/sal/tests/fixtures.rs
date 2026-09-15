@@ -122,7 +122,7 @@ impl TestLog {
     ) -> Result<(usize, u64), SalFit> {
         let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
         self.writer
-            .write_slots(target, lsn, kind, zone_start, &sizes, |w, slot| {
+            .write_slots(target, lsn, kind, zone_start, 0, false, true, &sizes, |w, slot| {
                 slot.copy_from_slice(payloads[w])
             })
     }

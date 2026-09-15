@@ -9,20 +9,11 @@ use super::*;
 /// and a hand-built one can express a state the decoder never produces.
 #[test]
 fn check_response_classifies_every_status() {
-    use crate::protocol::message::{encode_control_block, parse_response_frame};
-    use crate::protocol::Header;
+    use crate::protocol::message::{encode_frame, parse_response_frame};
 
     let classify = |status: WireStatus, text: &str| {
-        let hdr = Header {
-            status,
-            target_id: 0,
-            client_id: 0,
-            flags: WireFlags::default(),
-            seek_pk: 77,
-            seek_col_idx: 0,
-            request_id: 0,
-        };
-        let frame = encode_control_block(&hdr, text, &[]);
+        let hdr = ControlHeader { status, arg0: 77, ..Default::default() };
+        let frame = encode_frame(hdr, text.as_bytes(), None, None).ctrl;
         let mut msg = parse_response_frame(&frame, None)
             .expect("a control frame parses")
             .message;
@@ -63,9 +54,9 @@ mod spine_tests {
 
     use crate::connection::*;
     use crate::protocol::codec::encode_schema_block;
-    use crate::protocol::message::{encode_control_block, encode_message_noschema_parts};
+    use crate::protocol::message::encode_frame;
     use crate::protocol::transport::poll_fd;
-    use crate::protocol::{BatchAppender, ColumnDef, Header, TypeCode};
+    use crate::protocol::{BatchAppender, ColumnDef, TypeCode};
     use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
     use crate::GnitzClient;
 
@@ -140,29 +131,33 @@ mod spine_tests {
         b
     }
 
-    /// A reply frame carrying its schema block at `version`, data, and `lsn` in
-    /// `seek_pk`; `cont` sets `continuation`.
-    fn reply_cold(tid: u64, version: u16, schema: &Schema, batch: &ZSetBatch, lsn: u128, cont: bool) -> Vec<u8> {
-        let flags = WireFlags {
-            schema_version: version,
-            continuation: cont,
+    fn reply_header(tid: u64, version: u16, lsn: u64, cont: bool) -> ControlHeader {
+        ControlHeader {
+            target_id: tid,
+            flags: WireFlags {
+                schema_version: version,
+                continuation: cont,
+                ..Default::default()
+            },
+            arg0: lsn,
             ..Default::default()
-        };
-        encode_message_parts(tid, 0, flags, lsn, &[], 0, Some((schema, batch))).to_vec()
+        }
+    }
+
+    /// A reply frame carrying its schema block at `version`, data, and `lsn` in
+    /// `arg0`; `cont` sets `continuation`.
+    fn reply_cold(tid: u64, version: u16, schema: &Schema, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
+        encode_frame(reply_header(tid, version, lsn, cont), &[], Some(schema), Some(batch)).to_vec()
     }
 
     /// A hint-only reply frame: data, no schema block, `version` in the flags.
-    fn reply_warm(tid: u64, version: u16, schema: &Schema, batch: &ZSetBatch, cont: bool) -> Vec<u8> {
-        let flags = WireFlags {
-            schema_version: version,
-            continuation: cont,
-            ..Default::default()
-        };
-        encode_message_noschema_parts(tid, 0, flags, schema, batch).to_vec()
+    fn reply_warm(tid: u64, version: u16, batch: &ZSetBatch, cont: bool) -> Vec<u8> {
+        encode_frame(reply_header(tid, version, 0, cont), &[], None, Some(batch)).to_vec()
     }
 
-    fn reply_status(status: WireStatus, text: &str, seek_pk: u128) -> Vec<u8> {
-        encode_control_block(&Header { status, seek_pk, ..Header::default() }, text, &[])
+    fn reply_status(status: WireStatus, text: &str, arg0: u64) -> Vec<u8> {
+        let hdr = ControlHeader { status, arg0, ..Default::default() };
+        encode_frame(hdr, text.as_bytes(), None, None).ctrl
     }
 
     /// A cache entry for `tid` at `version`, warmed by one cold-answered scan —
@@ -210,9 +205,9 @@ mod spine_tests {
         // Three frames, one per step: nothing completes until the terminal.
         peer.send(&reply_cold(7, 3, &schema, &batch_a(&[1, 2]), 0, true));
         assert!(s.step(Interest::READ).unwrap().is_empty());
-        peer.send(&reply_warm(7, 3, &schema, &batch_a(&[3]), true));
+        peer.send(&reply_warm(7, 3, &batch_a(&[3]), true));
         assert!(s.step(Interest::READ).unwrap().is_empty());
-        peer.send(&reply_warm(7, 3, &schema, &batch_a(&[4, 5]), false));
+        peer.send(&reply_warm(7, 3, &batch_a(&[4, 5]), false));
         let mut done = s.step(Interest::READ).unwrap();
         assert_eq!(done.len(), 1);
         let (id, reply) = done.pop().unwrap();
@@ -239,10 +234,10 @@ mod spine_tests {
         let slot = s.submit(Request::ScanMulti(&[1, 2])).unwrap();
         s.step(Interest::WRITE).unwrap();
         peer.drain_request();
-        peer.send(&reply_warm(1, 1, &sa, &batch_a(&[10, 11]), false));
+        peer.send(&reply_warm(1, 1, &batch_a(&[10, 11]), false));
         assert!(s.step(Interest::READ).unwrap().is_empty(), "one of two trains");
-        peer.send(&reply_warm(2, 1, &sb, &batch_b(&[20]), true));
-        peer.send(&reply_warm(2, 1, &sb, &batch_b(&[21]), false));
+        peer.send(&reply_warm(2, 1, &batch_b(&[20]), true));
+        peer.send(&reply_warm(2, 1, &batch_b(&[21]), false));
         let Reply::Multi(replies) = drive(&mut s, slot).unwrap() else {
             panic!("multi")
         };
@@ -290,7 +285,7 @@ mod spine_tests {
         for &k in &others {
             peer.send(&reply_cold(k, 1, &sa, &empty, 0, false));
         }
-        peer.send(&reply_warm(t, 7, &sa, &batch_a(&[5, 6]), false));
+        peer.send(&reply_warm(t, 7, &batch_a(&[5, 6]), false));
         let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
             panic!("scan")
         };
@@ -349,7 +344,7 @@ mod spine_tests {
     fn a_status_frame_completes_its_slot_and_leaves_the_connection_usable() {
         // `check_response` owns the status → error table; what the spine adds is
         // that a status frame completes its slot rather than erroring `step`,
-        // and carries the frame's `seek_pk` into the error it hands back.
+        // and carries the frame's `arg0` into the error it hands back.
         let (mut s, peer) = pair();
         let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
         s.step(Interest::WRITE).unwrap();
@@ -541,13 +536,12 @@ mod spine_tests {
         let sa = schema_a();
         let reply_schema = crate::protocol::ReplySchema::new(std::sync::Arc::new(sa.clone()), 9);
         let block_len = encode_schema_block(&sa, 9).len();
-        let peer_schema = sa.clone();
         let h = std::thread::spawn(move || {
             let req = peer.drain_request();
             assert!(req.len() >= block_len, "the reply schema rides the request");
             // Two hint-only frames: the server sends no schema block for a delta read.
-            peer.send(&reply_warm(9, 0, &peer_schema, &batch_a(&[1, 2]), true));
-            peer.send(&reply_warm(9, 0, &peer_schema, &batch_a(&[3]), false));
+            peer.send(&reply_warm(9, 0, &batch_a(&[1, 2]), true));
+            peer.send(&reply_warm(9, 0, &batch_a(&[3]), false));
             peer
         });
         let (blocks, _cursor) = c.delta_read_raw(9, 4, &reply_schema).unwrap();

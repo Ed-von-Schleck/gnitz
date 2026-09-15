@@ -65,7 +65,7 @@ impl WorkerProcess {
             ..frame(true)
         };
         if whole.size() <= ipc::FRAME_CAP {
-            self.w2m_writer.send_msg(W2M_EXCHANGE_RING_ID as u64, &whole);
+            self.w2m_writer.send_msg(W2M_EXCHANGE_RING_ID, &whole);
             return;
         }
 
@@ -89,7 +89,7 @@ impl WorkerProcess {
             }
             next_row += chunk.len();
             self.w2m_writer.send_msg(
-                W2M_EXCHANGE_RING_ID as u64,
+                W2M_EXCHANGE_RING_ID,
                 &ipc::WireMsg {
                     data: ipc::WireData::Whole(&chunk),
                     ..frame(next_row == batch.len())
@@ -111,7 +111,7 @@ fn exchange_frame<'a>(view_id: i64, source_id: i64, schema_block: &'a [u8], last
             backfill_pad: last && pad,
             ..WireFlags::train_frame(0, last)
         },
-        seek_pk: source_id as u128,
+        arg0: source_id as u64,
         schema_block: Some(schema_block),
         ..Default::default()
     }

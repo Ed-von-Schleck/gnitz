@@ -103,10 +103,10 @@ fn fsync_submit_flushes_sqe_before_returning() {
 fn a_train_route_queues_past_worker_count_in_arrival_order() {
     const N: usize = 100; // > MAX_WORKERS
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_train(1);
+    let lease = r.lease_train(WorkerSet::ALL);
     for i in 0..N {
         let msg = crate::runtime::wire::WireMsg {
-            request_id: 100 + i as u64,
+            target_id: 100 + i as u64,
             ..Default::default()
         };
         writers[0].send_msg(lease.id(0), &msg);
@@ -115,10 +115,11 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
 
     for i in 0..N {
         let f = try_poll_once(lease.next_frame(0)).expect("a routed frame resolves on the first poll");
-        let rid = gnitz_wire::control::peek_control_block(f.bytes(), false)
+        let tag = gnitz_wire::control::peek_control_block(f.bytes())
             .unwrap()
-            .request_id;
-        assert_eq!(rid, 100 + i as u64, "frame {i} delivered in arrival order");
+            .hdr
+            .target_id;
+        assert_eq!(tag, 100 + i as u64, "frame {i} delivered in arrival order");
     }
     assert!(try_poll_once(lease.next_frame(0)).is_none(), "the queue is drained");
 }
@@ -128,7 +129,7 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
 #[test]
 fn a_dropped_lease_releases_held_and_late_frames() {
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_train(1);
+    let lease = r.lease_train(WorkerSet::ALL);
     let id = lease.id(0);
     writers[0].send_msg(id, &Default::default());
     r.drain_all_w2m();
@@ -160,7 +161,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     let ptr = region.ptr();
 
     let r = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
-    let lease = r.lease_train(1);
+    let lease = r.lease_train(WorkerSet::ALL);
     let id = lease.id(0);
     let writer = W2mWriter::new(ptr);
 
@@ -173,7 +174,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     });
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    let queued = |r: &Reactor| match &r.inner.routes.borrow()[&(id as u32)] {
+    let queued = |r: &Reactor| match &r.inner.routes.borrow()[&(id, 0)] {
         Route::Train(q) => q.len(),
         Route::Ack { .. } => unreachable!(),
     };

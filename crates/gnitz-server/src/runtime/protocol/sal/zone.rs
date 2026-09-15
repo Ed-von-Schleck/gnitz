@@ -249,7 +249,12 @@ impl<'a> CommittedTail<'a> {
                 continue;
             }
             for (w, bytes) in msg.slots_written() {
-                if let Err(e) = ipc::decode_sal_slot(bytes, true) {
+                let verdict = if msg.slot_intact(w, bytes) {
+                    ipc::decode_sal_slot(bytes).map(drop)
+                } else {
+                    Err("slot checksum mismatch")
+                };
+                if let Err(e) = verdict {
                     gnitz_warn!(
                         "SAL replay: last committed zone lsn={} is torn (offset={} slot={w} \
                          target={}: {e}); skipping it whole",

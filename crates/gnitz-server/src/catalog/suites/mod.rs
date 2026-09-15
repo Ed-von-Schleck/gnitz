@@ -44,7 +44,7 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: i64, key: u128) -> std::rc::
         .relation(tid)
         .map(gnitz_store::relation::Relation::schema)
         .expect("a registered relation");
-    let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, key, &[]).expect("a narrow key");
+    let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, &key.to_le_bytes()).expect("a narrow key");
     pk_group(engine, tid, opk.pk_bytes())
 }
 

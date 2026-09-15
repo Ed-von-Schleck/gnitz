@@ -615,7 +615,7 @@ impl GnitzClient {
 
     /// Advance every view in `views`, one request per `DELTA_POLL_MAX_VIEWS`,
     /// ingesting each view's blocks as that view's terminal arrives — so a poll
-    /// over M views holds one train, not M. The watermark comes back
+    /// over M views holds one train, not M. The cursor comes back
     /// unvalidated; the tag rule is [`MirrorState::advance_from`]'s.
     ///
     /// A view that fails gets **that view's** own entry. Only a caller error (a
@@ -674,8 +674,7 @@ impl GnitzClient {
                     let i = range.start;
                     range.start += 1;
                     let (tid, prev, _) = views[i];
-                    let fetched = result.map(|(blocks, w)| (blocks, DeltaCursor::from_watermark(w)));
-                    applied.push((tid, mirror.advance_from(tid, prev, fetched)));
+                    applied.push((tid, mirror.advance_from(tid, prev, result)));
                 };
                 session.step_polling(ready, Some(&mut sink))
             };

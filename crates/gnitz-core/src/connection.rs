@@ -7,19 +7,20 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::client::DeltaCursor;
 use crate::error::ClientError;
-use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
+use crate::protocol::message::MessageParts;
 use crate::protocol::transport::{Next, CONNECT_TIMEOUT};
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
-    encode_control_frame, encode_ddl_txn, encode_push_txn, hello_handshake, parse_response_frame, ClientTransport,
-    ClientVerb, FkTarget, Message, ProtocolError, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
+    encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, parse_response_frame, ClientTransport, ClientVerb,
+    FkTarget, Message, ProtocolError, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
 };
+use gnitz_wire::control::ControlHeader;
 use gnitz_wire::txn_frame;
 use gnitz_wire::{RelClass, RelDescriptorBlob};
 use lru::LruCache;
@@ -90,22 +91,10 @@ impl RawBlock {
 /// multi-table commit is never torn across the result set.
 pub type MultiScanResult = Result<Vec<ScanReply>, ClientError>;
 
-/// Generate a session-unique client ID.
-///
-/// Combines PID (top 32 bits) with a per-process monotonic sequence (bottom 32 bits).
-/// The sequence is a wrapping `AtomicU32`, so ids are unique across the first
-/// 2^32 connections a process opens and repeat only after it wraps; the PID half
-/// makes cross-process collisions practically impossible even with PID reuse.
-fn new_client_id() -> u64 {
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
-    (std::process::id() as u64) << 32 | seq
-}
-
 /// Classify a reply frame's status. Every status but `Ok` is an error; one this
-/// build does not know was already refused by the control-block decode.
+/// build does not know was already refused by the control-header decode.
 fn check_response(msg: &mut Message) -> Result<(), ClientError> {
-    match msg.status {
+    match msg.hdr.status {
         WireStatus::Ok => Ok(()),
         WireStatus::SchemaMismatch => Err(ClientError::SchemaMismatch),
         WireStatus::DeltaExpired => Err(ClientError::DeltaExpired),
@@ -113,11 +102,10 @@ fn check_response(msg: &mut Message) -> Result<(), ClientError> {
         // the whole of what there is to say.
         WireStatus::NotFound => Err(ClientError::NotFound {
             noun: "relation",
-            name: msg.target_id.to_string(),
+            name: msg.hdr.target_id.to_string(),
         }),
         WireStatus::SalFull => Err(ClientError::SalFull(msg.error_text.take().unwrap_or_default())),
-        // Control-only frame: the fresh basis rides in `seek_pk`.
-        WireStatus::TxnConflict => Err(ClientError::TxnConflict { fresh_basis: msg.seek_pk as u64 }),
+        WireStatus::TxnConflict => Err(ClientError::TxnConflict { fresh_basis: msg.hdr.arg0 }),
         // Fall back to the default text on an empty string, not only on None:
         // an `Error` with Some("") would otherwise surface as a blank
         // ServerError. This matters because the warm-push guard converts
@@ -192,9 +180,8 @@ pub enum Request<'a> {
     /// under it, and it completes as [`Reply::Scan`].
     Read {
         target_id: u64,
-        /// The SEEK key, already split by `gnitz_wire::control::split_ctrl_key`;
-        /// `None` for a SCAN.
-        seek: Option<(u128, &'a [u8])>,
+        /// The SEEK key, packed native-LE PK columns; `None` for a SCAN.
+        seek: Option<&'a [u8]>,
     },
     /// An id allocation. Completes as [`Reply::Id`].
     Alloc(IdRun),
@@ -245,13 +232,9 @@ impl<'a> Request<'a> {
         Request::Read { target_id, seek: None }
     }
 
-    /// A point SEEK by primary key, already split by
-    /// `gnitz_wire::control::split_ctrl_key`.
-    pub fn seek(target_id: u64, seek_pk: u128, seek_pk_extra: &'a [u8]) -> Request<'a> {
-        Request::Read {
-            target_id,
-            seek: Some((seek_pk, seek_pk_extra)),
-        }
+    /// A point SEEK by primary key: `key` is the packed native-LE PK columns.
+    pub fn seek(target_id: u64, key: &'a [u8]) -> Request<'a> {
+        Request::Read { target_id, seek: Some(key) }
     }
 }
 
@@ -454,7 +437,7 @@ struct Accumulator {
 /// views holds one train, not M. Positions are filled in request order, and a
 /// terminal naming another view is refused, so the slot's next unanswered
 /// position is the one this belongs to.
-pub(crate) type PolledView = Result<(Vec<RawBlock>, u128), ClientError>;
+pub(crate) type PolledView = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 
 /// The listener a delta poll's results go to, addressed by the slot that asked
 /// — so a train left behind by an abandoned poll is recognised rather than
@@ -462,7 +445,7 @@ pub(crate) type PolledView = Result<(Vec<RawBlock>, u128), ClientError>;
 pub(crate) type PollSink<'a> = dyn FnMut(SlotId, PolledView) + 'a;
 
 /// A protocol session: the transport plus all per-connection protocol state
-/// (client id, the schema LRU, the pending queue and reply accumulator, and
+/// (the schema LRU, the pending queue and reply accumulator, and
 /// the warm/cold packing, continuation reassembly, cache absorption, and
 /// status→error policy that read/write them). Exactly one owner of that
 /// state — the sync [`crate::GnitzClient`] holds one, and so does each async
@@ -470,7 +453,6 @@ pub(crate) type PollSink<'a> = dyn FnMut(SlotId, PolledView) + 'a;
 /// a parameter and no cache lock is shared across threads.
 pub struct Session {
     transport: ClientTransport,
-    pub client_id: u64,
     schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
     pending: VecDeque<Slot>,
     next_slot: u64,
@@ -496,7 +478,6 @@ impl Session {
     fn over(transport: ClientTransport) -> Self {
         Session {
             transport,
-            client_id: new_client_id(),
             schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
             pending: VecDeque::new(),
             next_slot: 1,
@@ -551,7 +532,6 @@ impl Session {
                 format!("connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap")
             }));
         }
-        let client_id = self.client_id;
         let (parts, kind) = match req {
             Request::Read { target_id, seek } => {
                 let hint = self.cached_hint(target_id);
@@ -564,8 +544,8 @@ impl Session {
                     schema_version: hint.as_ref().map_or(0, |h| h.1),
                     ..Default::default()
                 };
-                let (seek_pk, seek_pk_extra) = seek.unwrap_or((0, &[]));
-                let parts = encode_control_frame(target_id, client_id, flags, seek_pk, 0, seek_pk_extra);
+                let hdr = ControlHeader { flags, target_id, ..Default::default() };
+                let parts = encode_frame(hdr, seek.unwrap_or(&[]), None, None);
                 (parts, SlotKind::Read { tid: target_id, hint })
             }
             Request::Alloc(run) => {
@@ -575,26 +555,26 @@ impl Session {
                     IdRun::Schema => (0, ClientVerb::AllocSchemaId, 1),
                     IdRun::Serial { table_id, count } => (table_id, ClientVerb::AllocSerialRange, count),
                 };
-                let flags = WireFlags { verb, ..Default::default() };
-                // The run length rides in `seek_col_idx`.
-                let parts = encode_control_frame(target_id, client_id, flags, 0, count, &[]);
-                (parts, SlotKind::Alloc)
+                let hdr = ControlHeader {
+                    flags: WireFlags { verb, ..Default::default() },
+                    target_id,
+                    arg1: count,
+                    ..Default::default()
+                };
+                (encode_frame(hdr, &[], None, None), SlotKind::Alloc)
             }
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
                     batch.validate(crate::types::sys_schema(*tid))?;
                 }
-                (
-                    MessageParts::single(encode_ddl_txn(client_id, families)),
-                    SlotKind::Commit,
-                )
+                (MessageParts::single(encode_ddl_txn(families)), SlotKind::Commit)
             }
             Request::PushTxn { families, preconditions } => {
                 for (_, schema, batch, _) in families {
                     batch.validate(schema)?;
                 }
                 (
-                    MessageParts::single(encode_push_txn(client_id, families, preconditions)),
+                    MessageParts::single(encode_push_txn(families, preconditions)),
                     SlotKind::Commit,
                 )
             }
@@ -626,21 +606,33 @@ impl Session {
                 let parts = match warm_version {
                     Some(v) => {
                         let flags = WireFlags { schema_version: v, ..base_flags };
-                        encode_message_noschema_parts(target_id, client_id, flags, schema, batch)
+                        let hdr = ControlHeader { flags, target_id, ..Default::default() };
+                        encode_frame(hdr, &[], None, Some(batch))
                     }
-                    None => encode_message_parts(target_id, client_id, base_flags, 0, &[], 0, Some((schema, batch))),
+                    None => {
+                        let hdr = ControlHeader {
+                            flags: base_flags,
+                            target_id,
+                            ..Default::default()
+                        };
+                        encode_frame(hdr, &[], Some(schema), Some(batch))
+                    }
                 };
                 (parts, SlotKind::Push { tid: target_id })
             }
             Request::ScanSpec { target_id, spec, reply_schema } => {
                 // The reply schema rides the request blob and stays with the slot
                 // as the decode hint.
-                let extra = spec.encode(reply_schema.block());
-                let flags = WireFlags {
-                    verb: ClientVerb::ScanSpec,
+                let blob = spec.encode(reply_schema.block());
+                let hdr = ControlHeader {
+                    flags: WireFlags {
+                        verb: ClientVerb::ScanSpec,
+                        ..Default::default()
+                    },
+                    target_id,
                     ..Default::default()
                 };
-                let parts = encode_control_frame(target_id, client_id, flags, 0, 0, &extra);
+                let parts = encode_frame(hdr, &blob, None, None);
                 (parts, SlotKind::ScanSpec { reply_schema: reply_schema.schema() })
             }
             Request::ScanMulti(tids) => {
@@ -664,7 +656,7 @@ impl Session {
     /// [`Self::step_polling`] drain — without which they are dropped, hence no [`Request`].
     pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem<'_>]) -> Result<SlotId, ClientError> {
         txn_frame::validate_item_ids("DELTA_POLL", views, |v| v.view_id)?;
-        let parts = MessageParts::single(txn_frame::encode_delta_poll(self.client_id, views));
+        let parts = MessageParts::single(txn_frame::encode_delta_poll(views));
         self.enqueue_slot(
             parts,
             SlotKind::DeltaPoll {
@@ -815,9 +807,9 @@ impl Session {
             // A DELTA_POLL failure that names a view ends that view's position
             // alone; only one naming no relation fails the request.
             if let Some((view, positions)) = poll {
-                if parsed.message.target_id != 0 {
-                    if parsed.message.target_id != view {
-                        return Err(out_of_order(view, parsed.message.target_id));
+                if parsed.message.hdr.target_id != 0 {
+                    if parsed.message.hdr.target_id != view {
+                        return Err(out_of_order(view, parsed.message.hdr.target_id));
                     }
                     return Ok(Some(fill_poll_position(pending, accum, done, positions, Err(e))));
                 }
@@ -834,17 +826,17 @@ impl Session {
             // Replies arrive in request order and the hint is keyed by
             // `target_id`, so an out-of-order frame would decode under the
             // wrong schema silently; make it loud, before any absorb.
-            if parsed.message.target_id != tid {
-                return Err(out_of_order(tid, parsed.message.target_id));
+            if parsed.message.hdr.target_id != tid {
+                return Err(out_of_order(tid, parsed.message.hdr.target_id));
             }
         }
         // Keyed on the tid the *frame* carries, which a correlated slot just
         // asserted is its own and a by-name RESOLVE (requested id 0) reports as
         // the live one.
         if let Some(sch) = parsed.message.schema.as_ref() {
-            let version = parsed.message.flags.schema_version;
+            let version = parsed.message.hdr.flags.schema_version;
             if head.kind.absorbs_schema() {
-                schema_cache.put(parsed.message.target_id, (Arc::clone(sch), version));
+                schema_cache.put(parsed.message.hdr.target_id, (Arc::clone(sch), version));
             }
             accum.schema = Some((Arc::clone(sch), version));
         }
@@ -864,7 +856,7 @@ impl Session {
         }
 
         let terminal = parsed.message;
-        if terminal.flags.continuation {
+        if terminal.hdr.flags.continuation {
             return Ok(None);
         }
 
@@ -874,7 +866,11 @@ impl Session {
         let data = accum.data.take();
         if let Some((_, positions)) = poll {
             let blocks = std::mem::take(&mut accum.blocks);
-            let filled = Ok((blocks, terminal.seek_pk));
+            let cursor = DeltaCursor {
+                tag: terminal.hdr.arg1,
+                tick: terminal.hdr.arg0,
+            };
+            let filled = Ok((blocks, cursor));
             return Ok(Some(fill_poll_position(pending, accum, done, positions, filled)));
         }
         let scan_reply = |schema: Option<Arc<Schema>>, data: Option<ZSetBatch>, terminal: &Message| {
@@ -882,15 +878,15 @@ impl Session {
             Ok::<_, ClientError>(ScanReply {
                 batch: data.unwrap_or_else(|| ZSetBatch::new(&schema)),
                 schema,
-                lsn: Some(terminal.seek_pk as u64),
+                lsn: Some(terminal.hdr.arg0),
             })
         };
         let reply = match &head.kind {
             SlotKind::Read { .. } => Ok(Reply::Scan(scan_reply(schema, data, &terminal)?)),
-            SlotKind::Push { .. } => Ok(Reply::Lsn(terminal.seek_pk as u64)),
+            SlotKind::Push { .. } => Ok(Reply::Lsn(terminal.hdr.arg0)),
             SlotKind::Resolve => resolve_descriptor(terminal, schema).map(Reply::Resolve),
-            SlotKind::Alloc => Ok(Reply::Id(terminal.target_id)),
-            SlotKind::Commit => Ok(Reply::Lsn(terminal.seek_pk as u64)),
+            SlotKind::Alloc => Ok(Reply::Id(terminal.hdr.target_id)),
+            SlotKind::Commit => Ok(Reply::Lsn(terminal.hdr.arg0)),
             SlotKind::ScanSpec { reply_schema } => {
                 Ok(Reply::Rows(data.unwrap_or_else(|| ZSetBatch::new(reply_schema))))
             }
@@ -910,19 +906,21 @@ impl Session {
     }
 
     /// The RESOLVE request frame for `target`. The one place the wire's "name
-    /// wins, else id" encoding is spelled: the name rides an explicit extra
-    /// blob rather than the seek-key channel, whose split would leave the first
-    /// 16 bytes in a `u128` field the server reads as a key.
+    /// wins, else id" encoding is spelled: the name rides the blob.
     fn resolve_request(&self, target: RelTarget<'_>) -> MessageParts {
         let (target_id, qname) = match target {
             RelTarget::Name(q) => (0, q),
             RelTarget::Id(tid) => (tid, ""),
         };
-        let flags = WireFlags {
-            verb: ClientVerb::Resolve,
+        let hdr = ControlHeader {
+            flags: WireFlags {
+                verb: ClientVerb::Resolve,
+                ..Default::default()
+            },
+            target_id,
             ..Default::default()
         };
-        encode_control_frame(target_id, self.client_id, flags, 0, 0, qname.as_bytes())
+        encode_frame(hdr, qname.as_bytes(), None, None)
     }
 
     /// The cached `(schema, version)` for `tid`. `get`, so a relation in use
@@ -938,7 +936,7 @@ impl Session {
             .iter()
             .map(|(tid, h)| (*tid, h.as_ref().map_or(0, |h| h.1)))
             .collect();
-        txn_frame::encode_scan_multi(self.client_id, &relations)
+        txn_frame::encode_scan_multi(&relations)
     }
 }
 
@@ -995,7 +993,7 @@ fn complete_head(
 /// `decode` bounded every `col_idx` against this schema's column count.
 fn resolve_descriptor(msg: Message, schema: Option<Arc<Schema>>) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
     let ncols = schema.as_ref().map_or(0, |s| s.columns.len());
-    let Some(desc) = RelDescriptorBlob::decode(&msg.seek_pk_extra, ncols)? else {
+    let Some(desc) = RelDescriptorBlob::decode(&msg.blob, ncols)? else {
         return Ok(None);
     };
     let mut schema =
@@ -1007,7 +1005,7 @@ fn resolve_descriptor(msg: Message, schema: Option<Arc<Schema>>) -> Result<Optio
         }
     }
     Ok(Some(Arc::new(RelDescriptor {
-        tid: msg.target_id,
+        tid: msg.hdr.target_id,
         class: desc.class,
         replicated: desc.replicated,
         delta: desc.delta,

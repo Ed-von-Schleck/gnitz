@@ -114,17 +114,17 @@ pub(crate) use unique_filter::UniqueFilter;
 
 /// Worker `w`'s reply as a fault, keeping its status, or `None` when it succeeded.
 pub(crate) fn worker_error(w: usize, op: &str, ctrl: &gnitz_wire::control::DecodedControl) -> Option<WireFault> {
-    (ctrl.status != WireStatus::Ok).then(|| {
-        let msg = String::from_utf8_lossy(&ctrl.error_msg);
+    (ctrl.hdr.status != WireStatus::Ok).then(|| {
+        let msg = String::from_utf8_lossy(&ctrl.blob);
         WireFault {
-            status: ctrl.status,
+            status: ctrl.hdr.status,
             text: format!("worker {w}: {op}: {msg}"),
         }
     })
 }
 
 /// Which workers answer a read, and what each is sent: `per_worker[w]` replaces
-/// the template's `seek_pk_extra` for worker `w` when present.
+/// the template's blob for worker `w` when present.
 pub(crate) struct ReadRoute {
     pub(crate) set: WorkerSet,
     pub(crate) per_worker: Option<Vec<Vec<u8>>>,
@@ -176,7 +176,7 @@ pub(crate) struct ScanCut<'d> {
 }
 
 impl<'d> ScanCut<'d> {
-    /// Lease reply ids for `set`, then write the group `write` builds on them.
+    /// Lease a reply id for `set`, then write the group `write` builds on it.
     pub(crate) fn push(
         &mut self,
         set: WorkerSet,
@@ -184,12 +184,12 @@ impl<'d> ScanCut<'d> {
     ) -> Result<(), WireFault> {
         let set = set.within(self.nw);
         debug_assert!(set.len() > 0, "every read owes at least one reply");
-        let lease = self.reactor.lease_train(set.len());
+        let lease = self.reactor.lease_train(set);
         write(
             &self.excl,
             GroupTargets::Leased {
                 set,
-                base: lease.base(),
+                request_id: lease.id(0),
                 in_request_order: self.in_request_order,
             },
         )?;

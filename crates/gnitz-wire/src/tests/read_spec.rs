@@ -181,15 +181,6 @@ fn a_wide_pk_set_at_its_cap_fits_the_spec_ceiling() {
     assert_eq!(ReadSpec::decode(&bytes), Ok((spec, &block[..])));
 }
 
-/// The watermark's two halves survive the round trip independently — the
-/// server packs it, the client unpacks it, and nothing else binds them.
-#[test]
-fn delta_watermark_roundtrips_both_halves() {
-    for &(tag, tick) in &[(0u64, 0u64), (1, 2), (u64::MAX, 0), (0, u64::MAX), (u64::MAX, u64::MAX)] {
-        assert_eq!(unpack_delta_watermark(pack_delta_watermark(tag, tick)), (tag, tick));
-    }
-}
-
 /// Empty reply block, no bound, empty predicate, absent map and the fold tag of
 /// a hand-built fold-sink blob.
 fn fold_header() -> Vec<u8> {

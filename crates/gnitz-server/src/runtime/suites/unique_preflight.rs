@@ -99,12 +99,15 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
             slot.internal_req_id, expected_req_id as u32,
             "ring prefix must carry the request id",
         );
-        let ctrl = peek_control_block(slot.bytes(), false).expect("ctrl decodes");
-        assert_eq!(ctrl.status, WireStatus::Ok);
-        assert!(ctrl.flags.continuation, "every pre-flight frame carries continuation");
-        let last = ctrl.flags.scan_last;
+        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        assert_eq!(ctrl.hdr.status, WireStatus::Ok);
         assert!(
-            !ctrl.flags.has_schema,
+            ctrl.hdr.flags.continuation,
+            "every pre-flight frame carries continuation"
+        );
+        let last = ctrl.hdr.flags.scan_last;
+        assert!(
+            !ctrl.hdr.flags.has_schema,
             "no pre-flight frame carries a schema block: the master builds it"
         );
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
@@ -193,10 +196,10 @@ fn preflight_train_empty_partition_single_terminal_frame() {
             &mut producer_of(&[]),
         );
         let slot = receiver.try_read_slot(0).expect("terminal frame");
-        let ctrl = peek_control_block(slot.bytes(), false).expect("ctrl decodes");
-        assert_eq!(ctrl.status, WireStatus::Ok);
-        assert!(ctrl.flags.scan_last, "single frame must be terminal");
-        assert!(!ctrl.flags.has_data, "no data on empty train");
+        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        assert_eq!(ctrl.hdr.status, WireStatus::Ok);
+        assert!(ctrl.hdr.flags.scan_last, "single frame must be terminal");
+        assert!(!ctrl.hdr.flags.has_data, "no data on empty train");
         drop(slot);
         assert!(receiver.try_read_slot(0).is_none());
     });
@@ -230,16 +233,16 @@ fn preflight_frames_are_cut_by_the_byte_budget() {
     });
 }
 
-/// The frame overhead must be charged, not assumed away: a budget of exactly
-/// eight keys' rows leaves room for none once the control and data block
-/// headers are counted, so the clamp floors at one key rather than emitting an
-/// over-budget frame.
+/// The frame overhead must be charged, not assumed away: eight keys' rows fit
+/// only beside it, and a budget the overhead alone fills leaves room for no key,
+/// so the clamp floors at one rather than emitting an over-budget frame.
 #[test]
 fn preflight_keys_per_frame_charges_the_frame_overhead() {
     let frame_schema = u128_frame_schema();
     let overhead = preflight_frame_overhead(&frame_schema);
     assert!(overhead > 0, "a frame's control and data block headers cost bytes");
-    assert_eq!(preflight_keys_per_frame(&frame_schema, 8 * 32, overhead), 1);
+    assert!(preflight_keys_per_frame(&frame_schema, 8 * 32, overhead) < 8);
+    assert_eq!(preflight_keys_per_frame(&frame_schema, overhead, overhead), 1);
 }
 
 /// A composite two-column span round-trips through the wire frame: the reply

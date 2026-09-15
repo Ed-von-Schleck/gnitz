@@ -15,8 +15,7 @@
 //! would never build.
 
 use gnitz_core::protocol::{
-    encode_message_parts, hello_handshake, parse_response, ClientTransport, ClientVerb, ColumnDef, Schema, TypeCode,
-    WireFlags,
+    encode_frame, hello_handshake, parse_response, ClientTransport, ClientVerb, ColumnDef, Schema, TypeCode, WireFlags,
 };
 use gnitz_core::TableProps;
 use gnitz_core::{BatchAppender, GnitzClient, ZSetBatch};
@@ -31,13 +30,18 @@ fn hostile_push(t: &mut ClientTransport, tid: u64, schema: &Schema, batch: &ZSet
         verb: ClientVerb::Push,
         ..Default::default()
     };
-    let parts = encode_message_parts(tid, 0xB0BA, flags, 0, &[], 0, Some((schema, batch)));
+    let hdr = gnitz_wire::control::ControlHeader {
+        flags,
+        target_id: tid,
+        ..Default::default()
+    };
+    let parts = encode_frame(hdr, &[], Some(schema), Some(batch));
     t.send_parts(parts, None).map_err(|e| e.to_string())?;
     let buf = t.recv_framed(None).map_err(|e| e.to_string())?;
     let (msg, _) = parse_response(&buf, None).map_err(|e| e.to_string())?;
     match msg.error_text {
         Some(text) => Err(text),
-        None => Ok(msg.seek_pk as u64),
+        None => Ok(msg.hdr.arg0),
     }
 }
 

@@ -10,11 +10,12 @@
 
 use super::*;
 use crate::connection::{Request, Session};
-use crate::protocol::message::{encode_control_block, encode_message_parts};
+use crate::protocol::message::encode_frame;
 use crate::protocol::transport::poll_fd;
-use crate::protocol::{ColumnDef, Header, TypeCode, WireStatus};
+use crate::protocol::{ColumnDef, TypeCode, WireStatus};
 use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send};
 use gnitz_wire::control::peek_control_block;
+use gnitz_wire::control::ControlHeader;
 use gnitz_wire::RelDescriptorBlob;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -162,14 +163,15 @@ impl Peer {
     fn expect_request(&self, what: &str) -> u64 {
         assert!(self.waits(PATIENCE), "{what}: the request never arrived");
         let frame = raw_read_frame(&self.0);
-        peek_control_block(&frame, false).expect("a control block").target_id
+        peek_control_block(&frame).expect("a control header").hdr.target_id
     }
 
     /// The view ids one DELTA_POLL frame names, in request order.
     fn expect_poll(&self, what: &str) -> Vec<u64> {
         assert!(self.waits(PATIENCE), "{what}: the poll never arrived");
         let frame = raw_read_frame(&self.0);
-        gnitz_wire::txn_frame::decode_delta_poll(&frame)
+        let ctrl = peek_control_block(&frame).expect("a control header");
+        gnitz_wire::txn_frame::decode_delta_poll(&frame, &ctrl)
             .expect("a delta poll")
             .into_iter()
             .map(|v| v.view_id)
@@ -181,24 +183,25 @@ impl Peer {
     }
 
     /// One view's answer inside a poll: a control-only terminal frame naming the
-    /// view and carrying the watermark `(tag, tick)`.
+    /// view and carrying the cursor `(tag, tick)`.
     fn reply_watermark(&self, target_id: u64, tag: u64, tick: u64) {
-        let h = Header {
+        let h = ControlHeader {
             target_id,
-            seek_pk: gnitz_wire::pack_delta_watermark(tag, tick),
-            ..Header::default()
+            arg0: tick,
+            arg1: tag,
+            ..Default::default()
         };
-        self.send(&encode_control_block(&h, "", &[]));
+        self.send(&encode_frame(h, &[], None, None).ctrl);
     }
 
     fn reply_status(&self, target_id: u64, status: WireStatus, text: &str) {
-        let h = Header { status, target_id, ..Header::default() };
-        self.send(&encode_control_block(&h, text, &[]));
+        let h = ControlHeader { status, target_id, ..Default::default() };
+        self.send(&encode_frame(h, text.as_bytes(), None, None).ctrl);
     }
 
     /// A RESOLVE answering "no such relation": an empty descriptor blob.
     fn reply_absent(&self) {
-        self.send(&encode_control_block(&Header::default(), "", &[]));
+        self.send(&encode_frame(ControlHeader::default(), &[], None, None).ctrl);
     }
 
     /// A RESOLVE answering with `tid`: the schema block plus a view descriptor
@@ -211,15 +214,8 @@ impl Peer {
             ..Default::default()
         };
         let empty = ZSetBatch::new(&schema);
-        let parts = encode_message_parts(
-            tid,
-            0,
-            crate::protocol::WireFlags::default(),
-            0,
-            &blob.encode(),
-            0,
-            Some((&schema, &empty)),
-        );
+        let hdr = ControlHeader { target_id: tid, ..Default::default() };
+        let parts = encode_frame(hdr, &blob.encode(), Some(&schema), Some(&empty));
         self.send(&parts.to_vec());
     }
 }

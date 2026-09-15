@@ -19,9 +19,9 @@ use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
+use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter, WorkerSet};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
-use crate::runtime::w2m::{self, boot_ready_request_id, SalWake, W2mReceiver, W2mWriter};
+use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
 use gnitz_store::relation::Relation;
@@ -35,13 +35,17 @@ use gnitz_store::storage::{Batch, Slot};
 /// Decode one committed group slot, failing the boot rather than skipping it:
 /// pass 1 demoted the last zone if it was torn, so a block that fails here has a
 /// durable committed zone behind it, and skipping it would lose an ACKed write.
-fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, String> {
-    ipc::decode_sal_slot(data, true).map_err(|e| {
+fn decode_group_slot(msg: &SalMessage, w: u32, data: &[u8]) -> Result<ipc::DecodedWire, String> {
+    let corrupt = |e: &str| {
         format!(
             "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
             msg.base, msg.lsn, msg.target_id
         )
-    })
+    };
+    if !msg.slot_intact(w, data) {
+        return Err(corrupt("slot checksum mismatch"));
+    }
+    ipc::decode_sal_slot(data).map_err(corrupt)
 }
 
 /// Master pre-fork replay of every committed DdlSync group. Returns the tail's
@@ -54,7 +58,7 @@ fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut Catalog
     for msg in tail.groups() {
         // A system family broadcasts, so slot 0 carries the whole batch.
         let Some(data) = msg.slot(0) else { continue };
-        let decoded = decode_group_slot(&msg, data)?;
+        let decoded = decode_group_slot(&msg, 0, data)?;
         let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
             continue;
         };
@@ -161,8 +165,8 @@ fn recover_from_sal(
             resliced_from = Some(msg.slots());
         }
         let mut applied = false;
-        for (_, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
-            let decoded = decode_group_slot(&msg, data)?;
+        for (w, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
+            let decoded = decode_group_slot(&msg, w, data)?;
             let Some(mut batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
                 continue;
             };
@@ -397,7 +401,7 @@ fn run_worker_child(
             // The master reads this frame off the shared ring, which outlives the
             // process that wrote it.
             gnitz_error!("{e}");
-            w2m_writer.send_status(0, boot_ready_request_id(w), gnitz_wire::WireStatus::Error, e.as_bytes());
+            w2m_writer.send_status(0, BOOT_READY_REQUEST_ID, gnitz_wire::WireStatus::Error, e.as_bytes());
             unsafe { libc::_exit(1) };
         }
     };
@@ -406,7 +410,7 @@ fn run_worker_child(
 
     let sal_reader = SalReader::new(ipc.sal_log(), slot.rank, ipc.walk_epoch);
     let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer, pending_deltas);
-    let rc = worker.run(boot_ready_request_id(w));
+    let rc = worker.run(BOOT_READY_REQUEST_ID);
 
     unsafe {
         libc::_exit(rc);
@@ -500,15 +504,14 @@ fn master_post_fork_recovery(
     disp.cat().registry_mut().detach();
 
     // Wait for all workers to complete recovery and signal readiness.
-    let nw = disp.num_workers();
     // Before any drain: a drain drops frames no lease routes.
-    let ready = disp.reactor().lease_acks(nw);
+    let ready = disp.reactor().lease_acks(1, WorkerSet::ALL);
     assert_eq!(
-        ready.base(),
-        boot_ready_request_id(0),
+        ready.id(0),
+        BOOT_READY_REQUEST_ID,
         "the ready ACKs name the reactor's first lease"
     );
-    disp.collect_exclusive(&ready, nw, "recovery sync", false)
+    disp.collect_exclusive(&ready, 1, "recovery sync", false)
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
     drop(ready);
 

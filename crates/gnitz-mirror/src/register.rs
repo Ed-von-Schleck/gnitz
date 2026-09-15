@@ -70,6 +70,6 @@ impl Mirror {
 /// so neither end is a second spelling of the block's rules.
 pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorError> {
     let block = gnitz_core::protocol::codec::encode_schema_block(schema, 0);
-    gnitz_store::schema::decode_schema_block(&block, false)
+    gnitz_store::schema::decode_schema_block(&block)
         .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))
 }

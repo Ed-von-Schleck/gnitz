@@ -30,7 +30,7 @@ use super::TxnFamily;
 use crate::runtime::master::worker_error;
 use crate::runtime::master::FlushRound;
 use crate::runtime::reactor::{chan, oneshot, select2, Either, Lease};
-use crate::runtime::sal::SalScope;
+use crate::runtime::sal::{SalScope, WorkerSet};
 use gnitz_store::storage::Batch;
 use gnitz_wire::WireFault;
 use std::rc::Rc;
@@ -402,9 +402,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // what makes intra-batch last-insert-wins mean last *inserted*.
     pushes.sort_by_key(|p| p.tid);
 
-    let nw = shared.disp().num_workers();
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
-    let alloc_req_ids = || shared.disp().reactor().lease_acks(nw);
+    let alloc_req_ids = || shared.disp().reactor().lease_acks(1, WorkerSet::ALL);
 
     // ------------------------------------------------------------------
     // Phase A (no lock): build merged batches + req_id allocations.
@@ -554,7 +553,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         for unit in &mut units {
             let downgrade = matches!(unit.outcome, Outcome::Pushes(_));
             for g in unit.live_mut() {
-                let Err(e) = g.req_ids.acks(nw, |w, c| worker_error(w, "commit", c)).await else {
+                let Err(e) = g.req_ids.acks(1, |w, c| worker_error(w, "commit", c)).await else {
                     continue;
                 };
                 if downgrade {
@@ -630,7 +629,7 @@ fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result
     guard_panic("commit_write", || {
         shared
             .disp()
-            .write_commit_group(scope, g.tid, &g.merged, g.req_ids.base(), g.recoverable)
+            .write_commit_group(scope, g.tid, &g.merged, g.req_ids.id(0), g.recoverable)
     })
 }
 

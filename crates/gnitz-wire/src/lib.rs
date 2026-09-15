@@ -173,11 +173,6 @@ pub fn read_u64_le(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
 
-#[inline]
-pub(crate) fn read_u128_le(buf: &[u8], off: usize) -> u128 {
-    u128::from_le_bytes(buf[off..off + 16].try_into().unwrap())
-}
-
 #[inline(always)]
 pub fn read_i64_le(buf: &[u8], off: usize) -> i64 {
     i64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
@@ -329,11 +324,6 @@ pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 #[inline(always)]
 pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
-
-#[inline]
-pub(crate) fn write_u128_le(buf: &mut [u8], off: usize, val: u128) {
-    buf[off..off + 16].copy_from_slice(&val.to_le_bytes());
 }
 
 #[cfg(test)]

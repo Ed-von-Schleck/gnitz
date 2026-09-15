@@ -19,8 +19,8 @@ const OP_UNIQUE_PREFLIGHT: &str = "unique pre-flight";
 /// The frame's key region is an offset into the pinned ring slot rather than a
 /// borrowed view, so there is no self-reference and no drop-order contract.
 struct PreflightKeyStream {
-    /// Reply index into the scan, for frame pulls.
-    reply: usize,
+    /// The worker whose train this reads.
+    worker: usize,
     /// The frame currently being read; pins its ring bytes until replaced.
     slot: Option<W2mSlot>,
     /// Byte offset of the frame's PK region into the slot, and its key count;
@@ -36,9 +36,9 @@ struct PreflightKeyStream {
 }
 
 impl PreflightKeyStream {
-    fn new(reply: usize) -> Self {
+    fn new(worker: usize) -> Self {
         PreflightKeyStream {
-            reply,
+            worker,
             slot: None,
             pk_off: 0,
             count: 0,
@@ -89,7 +89,7 @@ impl PreflightKeyStream {
                 self.slot = None; // release the ring slot at the train's end
                 return Ok(None);
             }
-            let slot = scan.next_frame(self.reply).await;
+            let slot = scan.next_frame(self.worker).await;
             self.attach_frame(slot, frame_schema)?;
         }
     }
@@ -165,19 +165,16 @@ async fn merge_index_scan(scan: &Lease, frame_schema: &SchemaDescriptor) -> Resu
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    let n = scan.len();
-    let mut streams: Vec<PreflightKeyStream> = Vec::with_capacity(n);
+    let mut streams: Vec<PreflightKeyStream> = scan.workers().map(PreflightKeyStream::new).collect();
 
-    // Ordered by (span, reply index) — byte-lexicographic via `PkBuf: Ord` —
+    // Ordered by (span, stream index) — byte-lexicographic via `PkBuf: Ord` —
     // so equal spans pop adjacently whichever workers hold them. The tie-break
-    // is the REPLY index, which is also `streams`' index.
-    let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(n);
-    for i in 0..n {
-        let mut s = PreflightKeyStream::new(i);
+    // is the stream's position in `streams`.
+    let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(streams.len());
+    for (i, s) in streams.iter_mut().enumerate() {
         if let Some(key) = s.next_key(frame_schema, scan).await? {
             heap.push(Reverse((key, i)));
         }
-        streams.push(s);
     }
 
     let mut acc = PreflightAccumulator::new(UNIQUE_FILTER_CAP);
@@ -268,7 +265,7 @@ impl MasterDispatcher {
                     excl.write(&DirectGroup {
                         template: wire::WireMsg {
                             target_id: owner_id as u64,
-                            seek_col_idx: packed,
+                            arg1: packed,
                             ..Default::default()
                         },
                         targets,

@@ -38,12 +38,8 @@ fn read_available(fd: &OwnedFd, cap: usize) -> Vec<u8> {
 /// slot. The ring is leaked, so the slot outlives any test scope.
 fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
     let ptr = unsafe { crate::runtime::w2m::fixtures::test_ring(256 * 1024) }.leak();
-    let error_msg = vec![0x42u8; pad];
-    let msg = crate::runtime::wire::WireMsg {
-        request_id: 100,
-        error_msg: &error_msg,
-        ..Default::default()
-    };
+    let text = vec![0x42u8; pad];
+    let msg = crate::runtime::wire::WireMsg { blob: &text, ..Default::default() };
     crate::runtime::w2m::W2mWriter::new(ptr).send_msg(1, &msg);
     let receiver = W2mReceiver::new(vec![ptr]);
     let slot = receiver.try_read_slot(0).expect("a frame");

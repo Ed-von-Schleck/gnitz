@@ -31,6 +31,7 @@ use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::Relation;
 use gnitz_store::storage::Batch;
+use gnitz_wire::control::DecodedControl;
 use gnitz_wire::{PkColList, WireFault};
 
 /// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
@@ -126,7 +127,7 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
 /// write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's single
 /// family — flows here, so there is one system-write code path end to end.
 ///
-/// The ACK is a header-only frame carrying the zone LSN in `seek_pk`, sent after
+/// The ACK is a header-only frame carrying the zone LSN in `arg0`, sent after
 /// [`ddl_txn_body`] returns — outside the catalog write guard, so a client stalled
 /// on its `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot block every other reader
 /// for the length of the window. Sound outside the tick gate too: the quiesce
@@ -135,18 +136,11 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
 ///
 /// No schema block: a `DDL_TXN` names no relation (its reply target is `0`), so
 /// one could only describe a relation that does not exist.
-pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
+pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
     let t_ddl_start = Instant::now();
-    match ddl_txn_body(shared, data).await {
+    match ddl_txn_body(shared, ctrl, data).await {
         Ok((zone_lsn, family_count)) => {
-            send_msg(
-                peer,
-                ipc::WireMsg {
-                    client_id,
-                    seek_pk: zone_lsn as u128,
-                    ..Default::default()
-                },
-            );
+            send_msg(peer, ipc::WireMsg { arg0: zone_lsn, ..Default::default() });
             let total = t_ddl_start.elapsed();
             if total > Duration::from_millis(20) {
                 gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
@@ -154,7 +148,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
         }
         // `validate_unique_index_create`'s refusal keeps its own status; every
         // other failure in the body is the untyped `WireStatus::Error` it already was.
-        Err(f) => send_fault(peer, 0, client_id, &f),
+        Err(f) => send_fault(peer, 0, &f),
     }
 }
 
@@ -169,10 +163,10 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
 /// SCHEMA bundle pass the empty-schema guard. On any failure the applied families
 /// are negated in master memory before broadcast, so neither a crash nor a
 /// precheck failure can strand an orphan row.
-async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), WireFault> {
+async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -> Result<(u64, usize), WireFault> {
     // Decode the bundle and materialise each family's wal-block slice into an
     // owned Batch up front (before any lock) — see `decode_sys_family`.
-    let raw_families = gnitz_wire::txn_frame::decode_ddl_txn(data).map_err(|e| format!("decode error: {e}"))?;
+    let raw_families = gnitz_wire::txn_frame::decode_ddl_txn(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
     if raw_families.is_empty() {
         return Err("DDL_TXN: empty family bundle".into());
     }

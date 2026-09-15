@@ -47,7 +47,7 @@ pub const WAL_HEADER_SIZE: usize = 32;
 /// this module's digest pin enforces. A SAL frame carries its own schema block
 /// and replay decodes against that, so nothing but this word rejects a stale
 /// frame, or an old client's catalog writes.
-pub const WAL_FORMAT_VERSION: u32 = 18;
+pub const WAL_FORMAT_VERSION: u32 = 19;
 
 pub const WAL_OFF_TID: usize = 0;
 pub const WAL_OFF_COUNT: usize = 4;
@@ -55,8 +55,6 @@ pub const WAL_OFF_SIZE: usize = 8;
 pub const WAL_OFF_VERSION: usize = 12;
 pub const WAL_OFF_CHECKSUM: usize = 16;
 pub const WAL_OFF_NUM_REGIONS: usize = 24;
-
-pub(crate) const IPC_CONTROL_TID: u32 = 0xFFFF_FFFF;
 
 /// Maximum region count a block directory may name, including the trailing blob
 /// region. A legitimate schema has ≤ 65 columns (1 PK), so ≤ 68 regions

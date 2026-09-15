@@ -1,4 +1,4 @@
-//! The control block's `flags` word, the request verbs and modes it carries, and
+//! The control header's `flags` word, the request verbs and modes it carries, and
 //! the reply status codes.
 
 // ---------------------------------------------------------------------------
@@ -14,7 +14,8 @@ wire_enum! {
         Scan = 0,
         /// A data push. An empty batch is still a push, ACKed at LSN 0.
         Push = 1,
-        /// Every row of one PK group, the key in `seek_pk` / `seek_pk_extra`.
+        /// Every row of one PK group, the key (packed native-LE PK columns) in the
+        /// blob.
         Seek = 2,
         /// A parameterized bounded read (`ReadSpec`).
         ScanSpec = 3,
@@ -22,18 +23,22 @@ wire_enum! {
         /// own cursor and client-authored reply schema.
         DeltaPoll = 4,
         /// A relation's schema block and `RelDescriptorBlob`, named by the qualified
-        /// name in the BLOB cell (`target_id = 0`) or by `target_id`.
+        /// name in the blob (`target_id = 0`) or by `target_id`.
         Resolve = 5,
         /// System-table batches committed as one SAL zone.
         DdlTxn = 6,
-        /// User-table batches and their OCC preconditions, committed as one SAL zone.
+        /// User-table batches and their OCC preconditions, committed as one SAL
+        /// zone; `arg1` is the precondition count.
         PushTxn = 7,
         /// N relations read at one SAL cut.
         ScanMulti = 8,
-        /// `seek_col_idx` SERIAL ids of table `target_id`.
+        /// `arg1` SERIAL ids of table `target_id`; the reply's `target_id` is the
+        /// run's base.
         AllocSerialRange = 9,
+        /// `arg1` table ids; the reply's `target_id` is the run's base.
         AllocTableId = 10,
         AllocSchemaId = 11,
+        /// `arg1` index ids; the reply's `target_id` is the run's base.
         AllocIndexId = 12,
     }
 }
@@ -42,7 +47,7 @@ wire_enum! {
 // The flags word
 // ---------------------------------------------------------------------------
 
-/// The control block's `flags` word. `pack`/`unpack` are the only code that knows
+/// The control header's `flags` word. `pack`/`unpack` are the only code that knows
 /// the bit layout, so no two fields can overlap and no consumer re-derives one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireFlags {
@@ -64,18 +69,15 @@ pub struct WireFlags {
     pub batch_consolidated: bool,
     /// Bit 36: a worker's last frame of a train.
     pub scan_last: bool,
-    /// Bit 37: queue the reply behind the worker's earlier trains, so ring order is
-    /// request order.
-    pub scan_fifo_reply: bool,
-    /// Bits 38-39: what a `HasPk` probe answers a matched key with.
+    /// Bits 37-38: what a `HasPk` probe answers a matched key with.
     pub probe_mode: WireProbeMode,
-    /// Bits 40-41: an ExchangeRelay's round verdict.
+    /// Bits 39-40: an ExchangeRelay's round verdict.
     pub backfill: BackfillDecision,
-    /// Bit 42: this worker's source partition is exhausted; its exchange is an empty pad.
+    /// Bit 41: this worker's source partition is exhausted; its exchange is an empty pad.
     pub backfill_pad: bool,
 }
 
-const RESERVED_BITS: u64 = !crate::low_bits_mask(43);
+const RESERVED_BITS: u64 = !crate::low_bits_mask(42);
 
 impl WireFlags {
     /// A frame of a worker train: `continuation` always, since the master's terminal
@@ -90,7 +92,6 @@ impl WireFlags {
             continuation: true,
             batch_consolidated: false,
             scan_last: last,
-            scan_fifo_reply: false,
             probe_mode: WireProbeMode::Exists,
             backfill: BackfillDecision::Continue,
             backfill_pad: false,
@@ -106,10 +107,9 @@ impl WireFlags {
             | (self.continuation as u64) << 34
             | (self.batch_consolidated as u64) << 35
             | (self.scan_last as u64) << 36
-            | (self.scan_fifo_reply as u64) << 37
-            | (self.probe_mode as u64) << 38
-            | (self.backfill as u64) << 40
-            | (self.backfill_pad as u64) << 42
+            | (self.probe_mode as u64) << 37
+            | (self.backfill as u64) << 39
+            | (self.backfill_pad as u64) << 41
     }
 
     /// Rejects a word naming a verb or mode this build does not define, or setting a
@@ -128,10 +128,9 @@ impl WireFlags {
             continuation: bit(34),
             batch_consolidated: bit(35),
             scan_last: bit(36),
-            scan_fifo_reply: bit(37),
-            probe_mode: WireProbeMode::from_wire(((w >> 38) & 3) as u8).ok_or("flags: unknown probe mode")?,
-            backfill: BackfillDecision::from_wire(((w >> 40) & 3) as u8).ok_or("flags: unknown backfill decision")?,
-            backfill_pad: bit(42),
+            probe_mode: WireProbeMode::from_wire(((w >> 37) & 3) as u8).ok_or("flags: unknown probe mode")?,
+            backfill: BackfillDecision::from_wire(((w >> 39) & 3) as u8).ok_or("flags: unknown backfill decision")?,
+            backfill_pad: bit(41),
         })
     }
 
@@ -169,8 +168,7 @@ wire_enum! {
 
 wire_enum! {
     /// What a `HasPk` probe answers each matched key with, carried in
-    /// [`WireFlags::probe_mode`] so `seek_col_idx` stays one thing: the keyspace
-    /// to probe.
+    /// [`WireFlags::probe_mode`].
     #[derive(Default)]
     pub enum WireProbeMode: u8 {
         /// Echo the probe key back; the caller asked only whether it is
@@ -181,10 +179,10 @@ wire_enum! {
         /// the caller learns which committed row holds the span. Index only.
         FirstHolder = 1,
         /// [`Self::FirstHolder`] for EVERY committed holder of the span, capped
-        /// per value at the count in `seek_pk`. Index only.
+        /// per value at the count in `arg0`. Index only.
         AllHolders = 2,
         /// Answer each matched key with that key plus ONE of the stored row's
-        /// columns, named by `seek_pk`. PK store only.
+        /// columns, named by `arg0`. PK store only.
         Project = 3,
     }
 }
@@ -222,7 +220,8 @@ impl std::str::FromStr for WireConflictMode {
 // ---------------------------------------------------------------------------
 
 wire_enum! {
-    /// A control block's `status` word.
+    /// A control header's `status` word. Under any status but `Ok`, the frame's
+    /// blob is the error text.
     #[derive(Default)]
     pub enum WireStatus: u32 {
         #[default]
@@ -230,7 +229,7 @@ wire_enum! {
         Error = 1,
         /// A warm push's schema version is stale: evict the cached schema, push cold.
         SchemaMismatch = 2,
-        /// An OCC precondition failed; `seek_pk` carries the fresh basis. Nothing
+        /// An OCC precondition failed; `arg0` carries the fresh basis. Nothing
         /// was written, so it is retryable.
         TxnConflict = 3,
         /// A delta cursor below a worker's retention floor: re-read at `after_tick = 0`.
@@ -243,7 +242,7 @@ wire_enum! {
     }
 }
 
-/// A control block's `(status, error_msg)` pair. A plain message converts in as
+/// A control header's `(status, blob text)` pair. A plain message converts in as
 /// [`WireStatus::Error`]; nothing converts back, so dropping a status is always
 /// a visible `.text`.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,4 +1,6 @@
 use super::*;
+use crate::control::peek_control_block;
+use crate::WireStatus;
 
 fn item(view_id: u64, after_tick: u64, reply_block: &[u8]) -> DeltaPollItem<'_> {
     DeltaPollItem { view_id, after_tick, reply_block }
@@ -25,42 +27,50 @@ fn block(tid: u32) -> Vec<u8> {
     buf
 }
 
-/// Every frame's control block carries only its verb and the client id.
+fn peeked<'a, T>(
+    frame: &'a [u8],
+    decode: impl Fn(&'a [u8], &DecodedControl) -> Result<T, String>,
+) -> Result<T, String> {
+    let ctrl = peek_control_block(frame).map_err(str::to_string)?;
+    decode(frame, &ctrl)
+}
+
+/// Every frame's control header carries only its verb, and a push's
+/// precondition count in `arg1`.
 #[test]
 fn the_shared_prologue_carries_only_the_routing_flag() {
     let d = block(16);
     let frames = [
-        (encode_ddl_txn(0xABCD, &[wal_block(16)]), ClientVerb::DdlTxn),
+        (encode_ddl_txn(&[wal_block(16)]), ClientVerb::DdlTxn, 0),
         (
-            encode_push_txn(0xABCD, &[(WireConflictMode::Update, &d, wal_block(16))], &[]),
+            encode_push_txn(&[(WireConflictMode::Update, &d, wal_block(16))], &[(16, 1), (17, 2)]),
             ClientVerb::PushTxn,
+            2,
         ),
-        (encode_scan_multi(0xABCD, &[(7, 0)]), ClientVerb::ScanMulti),
-        (encode_delta_poll(0xABCD, &[item(7, 3, &[2])]), ClientVerb::DeltaPoll),
+        (encode_scan_multi(&[(7, 0)]), ClientVerb::ScanMulti, 0),
+        (encode_delta_poll(&[item(7, 3, &[2])]), ClientVerb::DeltaPoll, 0),
     ];
-    for (frame, verb) in frames {
-        let ctrl = wal::block_slice_at(&frame, 0).unwrap();
-        let c = peek_control_block(ctrl, false).unwrap();
+    for (frame, verb, arg1) in frames {
+        let c = peek_control_block(&frame).unwrap();
         assert_eq!(
-            c.flags,
+            c.hdr.flags,
             WireFlags { verb, ..Default::default() },
             "only the verb is set"
         );
-        assert_eq!(c.target_id, 0);
-        assert_eq!(c.client_id, 0xABCD);
-        assert_eq!(c.seek_pk, 0);
-        assert_eq!(c.seek_col_idx, 0);
-        assert_eq!(c.status, WireStatus::Ok);
-        // The item count starts immediately after the control block.
-        assert_eq!(ctrl.len(), ctrl_block_size(0, 0));
+        assert_eq!(c.hdr.target_id, 0);
+        assert_eq!(c.hdr.arg0, 0);
+        assert_eq!(c.hdr.arg1, arg1);
+        assert_eq!(c.hdr.status, WireStatus::Ok);
+        assert!(c.blob.is_empty());
+        assert_eq!(c.block_size, CTRL_HEADER_SIZE);
     }
 }
 
 #[test]
 fn ddl_txn_roundtrips_every_family_in_order() {
     let (a, b) = (block(4), block(2));
-    let frame = encode_ddl_txn(0xABCD, &[wal_block(4), wal_block(2)]);
-    let got = decode_ddl_txn(&frame).unwrap();
+    let frame = encode_ddl_txn(&[wal_block(4), wal_block(2)]);
+    let got = peeked(&frame, decode_ddl_txn).unwrap();
     assert_eq!(got.len(), 2);
     assert_eq!(got[0], (4, &a[..]));
     assert_eq!(got[1], (2, &b[..]));
@@ -71,14 +81,13 @@ fn push_txn_roundtrips_families_modes_and_preconditions() {
     let (s0, d0, s1) = (block(16), block(16), block(17));
     let pre = [(16u64, 42u64), (17, 43)];
     let frame = encode_push_txn(
-        1,
         &[
             (WireConflictMode::Error, &s0, wal_block(16)),
             (WireConflictMode::Update, &s1, wal_block(17)),
         ],
         &pre,
     );
-    let (fams, got_pre) = decode_push_txn(&frame).unwrap();
+    let (fams, got_pre) = peeked(&frame, decode_push_txn).unwrap();
     assert_eq!(fams.len(), 2);
     assert_eq!((fams[0].tid, fams[0].mode), (16, WireConflictMode::Error));
     assert_eq!((fams[1].tid, fams[1].mode), (17, WireConflictMode::Update));
@@ -88,23 +97,19 @@ fn push_txn_roundtrips_families_modes_and_preconditions() {
 }
 
 #[test]
-fn push_txn_with_no_preconditions_still_encodes_the_section() {
+fn push_txn_with_no_preconditions_carries_no_section() {
     let s = block(16);
-    let frame = encode_push_txn(1, &[(WireConflictMode::Update, &s, wal_block(16))], &[]);
-    let (fams, pre) = decode_push_txn(&frame).unwrap();
+    let frame = encode_push_txn(&[(WireConflictMode::Update, &s, wal_block(16))], &[]);
+    let (fams, pre) = peeked(&frame, decode_push_txn).unwrap();
     assert_eq!(fams.len(), 1);
     assert!(pre.is_empty());
-    // The zero count is four bytes past the last family, not an omission.
-    assert_eq!(
-        frame.len(),
-        ctrl_block_size(0, 0) + 4 + 1 + s.len() + wal_block(16).size() + 4
-    );
+    assert_eq!(frame.len(), CTRL_HEADER_SIZE + 1 + s.len() + wal_block(16).size());
 }
 
 #[test]
 fn scan_multi_roundtrips_order_and_versions() {
     let rels = [(7u64, 0u16), (8, 3), (9, u16::MAX)];
-    assert_eq!(decode_scan_multi(&encode_scan_multi(1, &rels)).unwrap(), rels);
+    assert_eq!(peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap(), rels);
 }
 
 /// A view's cursor and reply block round-trip at any length, in order.
@@ -115,8 +120,8 @@ fn delta_poll_roundtrips_every_view_in_order() {
         .map(|i| item(i as u64 + 1, [0, 42, u64::MAX][i], &blocks[i]))
         .collect();
 
-    let frame = encode_delta_poll(1, &views);
-    assert_eq!(decode_delta_poll(&frame).unwrap(), views);
+    let frame = encode_delta_poll(&views);
+    assert_eq!(peeked(&frame, decode_delta_poll).unwrap(), views);
 }
 
 /// The item rules both multi-item frames share, and the accepted lists that
@@ -140,70 +145,67 @@ fn a_multi_item_id_list_is_validated() {
 }
 
 /// A frame at its format's cap round-trips, and one past it is refused by the
-/// decoder — the one place that sees a count before it is trusted with an
-/// allocation, so the cap is enforced there and nowhere else.
+/// decoder.
 #[test]
 fn a_frame_past_its_cap_is_refused_by_the_decoder() {
     let views: Vec<DeltaPollItem> = (1..=DELTA_POLL_MAX_VIEWS as u64).map(|id| item(id, 5, b"b")).collect();
     assert_eq!(
-        decode_delta_poll(&encode_delta_poll(1, &views)).unwrap().len(),
+        peeked(&encode_delta_poll(&views), decode_delta_poll).unwrap().len(),
         views.len()
     );
     let mut over = views.clone();
     over.push(item(u64::MAX, 5, b"b"));
-    let err = decode_delta_poll(&encode_delta_poll(1, &over)).expect_err("past the cap");
+    let err = peeked(&encode_delta_poll(&over), decode_delta_poll).expect_err("past the cap");
     assert!(err.contains("too many items"), "{err:?}");
 
     let rels: Vec<(u64, u16)> = (1..=SCAN_MULTI_MAX_RELATIONS as u64).map(|id| (id, 0)).collect();
     assert_eq!(
-        decode_scan_multi(&encode_scan_multi(1, &rels)).unwrap().len(),
+        peeked(&encode_scan_multi(&rels), decode_scan_multi).unwrap().len(),
         rels.len()
     );
     let mut over = rels.clone();
     over.push((u64::MAX, 0));
-    let err = decode_scan_multi(&encode_scan_multi(1, &over)).expect_err("past the cap");
+    let err = peeked(&encode_scan_multi(&over), decode_scan_multi).expect_err("past the cap");
     assert!(err.contains("too many items"), "{err:?}");
 }
 
-/// Every frame must reject a truncation at any offset rather than panic or
-/// silently return a short list.
+/// Every frame must reject a truncation inside an item rather than panic or
+/// silently return a short list. A cut exactly on an item boundary is a shorter
+/// well-formed frame, since items run to the frame's end.
 #[test]
-fn a_truncation_anywhere_is_a_decode_error() {
+fn a_truncation_inside_an_item_is_a_decode_error() {
+    fn check<'a, T>(
+        name: &str,
+        frame: &'a [u8],
+        boundaries: &[usize],
+        decode: impl Fn(&'a [u8], &DecodedControl) -> Result<T, String> + Copy,
+    ) {
+        for cut in 1..frame.len() {
+            if !boundaries.contains(&cut) {
+                assert!(peeked(&frame[..cut], decode).is_err(), "{name} cut at {cut}");
+            }
+        }
+    }
+    let h = CTRL_HEADER_SIZE;
     let s = block(16);
-    let push = encode_push_txn(1, &[(WireConflictMode::Update, &s, wal_block(16))], &[(16, 1)]);
-    let ddl = encode_ddl_txn(1, &[wal_block(16)]);
-    let scan = encode_scan_multi(1, &[(7, 0), (8, 1)]);
-    for cut in 1..push.len() {
-        assert!(decode_push_txn(&push[..cut]).is_err(), "PUSH_TXN cut at {cut}");
-    }
-    for cut in 1..ddl.len() {
-        assert!(decode_ddl_txn(&ddl[..cut]).is_err(), "DDL_TXN cut at {cut}");
-    }
-    for cut in 1..scan.len() {
-        assert!(decode_scan_multi(&scan[..cut]).is_err(), "SCAN_MULTI cut at {cut}");
-    }
-    let poll = encode_delta_poll(1, &[item(7, 3, &[4]), item(8, 5, &[6, 7])]);
-    for cut in 1..poll.len() {
-        assert!(decode_delta_poll(&poll[..cut]).is_err(), "DELTA_POLL cut at {cut}");
-    }
+    let push = encode_push_txn(&[(WireConflictMode::Update, &s, wal_block(16))], &[(16, 1)]);
+    check("PUSH_TXN", &push, &[h + PRECONDITION_BYTES], decode_push_txn);
+    let ddl = encode_ddl_txn(&[wal_block(16)]);
+    check("DDL_TXN", &ddl, &[h], decode_ddl_txn);
+    let scan = encode_scan_multi(&[(7, 0), (8, 1)]);
+    check("SCAN_MULTI", &scan, &[h, h + RELATION_BYTES], decode_scan_multi);
+    let poll = encode_delta_poll(&[item(7, 3, &[4]), item(8, 5, &[6, 7])]);
+    check("DELTA_POLL", &poll, &[h, h + 21], decode_delta_poll);
 }
 
-/// A count far past what the frame can hold must be rejected, never used to
+/// A precondition count past what the frame can hold is rejected, never used to
 /// size an allocation.
 #[test]
-fn a_hostile_item_count_does_not_drive_the_allocation() {
-    let mut scan = encode_scan_multi(1, &[(7, 0)]);
-    let count_off = ctrl_block_size(0, 0);
-    scan[count_off..count_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(decode_scan_multi(&scan).is_err());
-
-    let mut poll = encode_delta_poll(1, &[item(7, 1, &[2])]);
-    poll[count_off..count_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(decode_delta_poll(&poll).is_err());
-
+fn a_hostile_precondition_count_does_not_drive_the_allocation() {
     let s = block(16);
-    let mut push = encode_push_txn(1, &[(WireConflictMode::Update, &s, wal_block(16))], &[]);
-    let pre_off = push.len() - 4;
-    push[pre_off..].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(decode_push_txn(&push).is_err());
+    let frame = encode_push_txn(&[(WireConflictMode::Update, &s, wal_block(16))], &[]);
+    let mut ctrl = peek_control_block(&frame).unwrap();
+    ctrl.hdr.arg1 = u64::MAX;
+    let err = decode_push_txn(&frame, &ctrl).err().expect("a hostile count");
+    assert!(err.contains("precondition section truncated"), "{err:?}");
 }

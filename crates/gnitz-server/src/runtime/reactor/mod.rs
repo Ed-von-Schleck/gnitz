@@ -18,6 +18,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot, W2M_EXCHANGE_RING_ID};
 use crate::runtime::wire::DecodedWire;
 
@@ -35,7 +36,7 @@ mod wake_queue;
 pub(crate) use conn::{shutdown, SendBody};
 
 pub(crate) use futures::Lease;
-use futures::{OpFuture, Route, TimerFuture};
+use futures::{OpFuture, Route, RouteKey, TimerFuture};
 use park::ParkMap;
 use runloop::{RunQueue, REACTOR_RUN_QUEUE};
 use wake_queue::WakeQueue;
@@ -144,9 +145,9 @@ struct ReactorShared {
     /// poll schedule for the next tick instead of re-entering this one. Kept
     /// here (rather than rebuilt per tick) to reuse the one allocation.
     tick_scratch: Cell<Vec<usize>>,
-    /// Every leased W2M request id and where its frames go. An entry lives
-    /// exactly as long as the [`Lease`] that created it.
-    routes: RefCell<FxHashMap<u32, Route>>,
+    /// Every leased `(request id, worker)` and where its frames go. An entry
+    /// lives exactly as long as the [`Lease`] that created it.
+    routes: RefCell<FxHashMap<RouteKey, Route>>,
     /// The one [`Reactor::trains_idle`] awaiter, woken by every lease drop.
     trains_idle: Cell<Option<Waker>>,
     /// The next request id a lease starts from. Never 0 (`Unaddressed`) and
@@ -246,19 +247,21 @@ impl Reactor {
         self.inner.shutdown.set(true);
     }
 
-    /// `n` consecutive request ids, each answered by one ACK. See [`Lease`].
-    pub(crate) fn lease_acks(&self, n: usize) -> Lease {
-        self.lease(n, || Route::Ack { ack: None, waker: None })
+    /// `n` consecutive request ids, each answered by one ACK from every worker in
+    /// `set`. See [`Lease`].
+    pub(crate) fn lease_acks(&self, n: usize, set: WorkerSet) -> Lease {
+        self.lease(n, set, || Route::Ack { ack: None, waker: None })
     }
 
-    /// `n` consecutive request ids, each answered by a train of frames. See
-    /// [`Lease`].
-    pub(crate) fn lease_train(&self, n: usize) -> Lease {
-        self.lease(n, || Route::Train(WakeQueue::default()))
+    /// One request id, answered by a train of frames from every worker in `set`.
+    /// See [`Lease`].
+    pub(crate) fn lease_train(&self, set: WorkerSet) -> Lease {
+        self.lease(1, set, || Route::Train(WakeQueue::default()))
     }
 
-    fn lease(&self, n: usize, route: fn() -> Route) -> Lease {
+    fn lease(&self, n: usize, set: WorkerSet, route: fn() -> Route) -> Lease {
         let n = n as u32;
+        let workers = set.within(self.inner.w2m.num_workers());
         let mut routes = self.inner.routes.borrow_mut();
         let mut base = self.inner.next_request_id.get();
         loop {
@@ -268,16 +271,19 @@ impl Reactor {
             if base == 0 || base.checked_add(n).is_none() {
                 base = 1;
             }
-            // Never re-lease an id a live lease still routes: after a wrap a long-held
-            // scan would otherwise have its route overwritten.
-            match (base..base + n).find(|id| routes.contains_key(id)) {
+            // Never re-lease a route a live lease still holds: after a wrap a
+            // long-held scan would otherwise have its route overwritten.
+            let taken = (base..base + n).find(|&id| workers.iter().any(|w| routes.contains_key(&(id, w as u32))));
+            match taken {
                 Some(taken) => base = taken + 1,
                 None => break,
             }
         }
-        routes.extend((base..base + n).map(|id| (id, route())));
+        for id in base..base + n {
+            routes.extend(workers.iter().map(|w| ((id, w as u32), route())));
+        }
         self.inner.next_request_id.set(base + n);
-        Lease::new(Rc::clone(&self.inner), base, n)
+        Lease::new(Rc::clone(&self.inner), base, n, set)
     }
 
     /// Resolves once no train lease is live. One awaiter at a time.
@@ -324,7 +330,7 @@ impl Reactor {
                     self.inner.exchanges.borrow_mut().push((w, frame));
                     continue;
                 }
-                match self.inner.routes.borrow_mut().get_mut(&id) {
+                match self.inner.routes.borrow_mut().get_mut(&(id, w as u32)) {
                     // No live lease: the request or scan was abandoned. Dropping the
                     // slot undecoded releases its ring space.
                     None => {}
@@ -332,7 +338,7 @@ impl Reactor {
                     Some(Route::Ack { ack, waker }) => {
                         // A worker answers each request id once.
                         debug_assert!(ack.is_none(), "worker {w} answered request id {id} twice");
-                        *ack = Some((w, slot.control()));
+                        *ack = Some(slot.control());
                         drop(slot);
                         if let Some(waker) = waker.take() {
                             waker.wake();

@@ -108,7 +108,8 @@ fn test_pre_handshake_ceiling_admits_status_error_and_refuses_above() {
         ..Default::default()
     };
     let err =
-        super::super::message::encode_control_block(&hdr, "unsupported wire version: peer=65535, server=65535", &[]);
+        super::super::message::encode_frame(hdr, b"unsupported wire version: peer=65535, server=65535", None, None)
+            .ctrl;
     assert!(err.len() <= gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
     raw_send(&a, &framed(&err));
     assert_eq!(b.recv_framed(None).unwrap(), err);

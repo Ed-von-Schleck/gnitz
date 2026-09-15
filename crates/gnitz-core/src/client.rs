@@ -146,13 +146,6 @@ pub struct DeltaCursor {
 }
 
 impl DeltaCursor {
-    /// Split a terminal frame's watermark word: tag in the high half, round in
-    /// the low half.
-    pub(crate) fn from_watermark(w: u128) -> Self {
-        let (tag, tick) = gnitz_wire::unpack_delta_watermark(w);
-        DeltaCursor { tag, tick }
-    }
-
     /// The tick a poll from this cursor reads after.
     ///
     /// Tick `0` is **refused**: it names no copy to protect and no tag to match,
@@ -816,9 +809,9 @@ impl GnitzClient {
         Ok((data, cursor))
     }
 
-    /// [`Self::delta_read`] keeping the reply's raw blocks. The watermark comes
-    /// back as a cursor and is **not** checked against a previous one — the tag
-    /// rule belongs to the caller that holds it.
+    /// [`Self::delta_read`] keeping the reply's raw blocks. The cursor comes back
+    /// **unchecked** against a previous one — the tag rule belongs to the caller
+    /// that holds it.
     pub(crate) fn delta_read_raw(
         &mut self,
         view_id: u64,
@@ -840,8 +833,7 @@ impl GnitzClient {
         // A per-view fault fills the position and completes the slot `Ok`; a
         // frame-level rejection completes it `Err` with no position filled.
         self.await_slot(slot, Some(&mut sink))?;
-        let (blocks, watermark) = got.expect("a one-view poll completes by filling its position")?;
-        Ok((blocks, DeltaCursor::from_watermark(watermark)))
+        got.expect("a one-view poll completes by filling its position")
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
@@ -851,12 +843,11 @@ impl GnitzClient {
         self.round_trip(Request::ScanMulti(table_ids)).map(Reply::into_multi)
     }
 
-    /// A point SEEK by primary key, in the wire's **native** key space, split by
-    /// `gnitz_wire::control::split_ctrl_key`. The engine OPK-encodes it against
-    /// the relation's schema, so no caller here needs one.
-    pub fn seek(&mut self, table_id: u64, pk: u128, pk_extra: &[u8]) -> ScanResult {
-        self.round_trip(Request::seek(table_id, pk, pk_extra))
-            .map(Reply::into_scan)
+    /// A point SEEK by primary key: `key` is the packed PK columns in the wire's
+    /// **native** little-endian key space. The engine OPK-encodes it against the
+    /// relation's schema, so no caller here needs one.
+    pub fn seek(&mut self, table_id: u64, key: &[u8]) -> ScanResult {
+        self.round_trip(Request::seek(table_id, key)).map(Reply::into_scan)
     }
 
     /// The statement's descriptor for `tid` — the by-id twin of [`Self::resolve`].
@@ -1781,9 +1772,7 @@ impl GnitzClient {
         key: u128,
         missing: impl FnOnce() -> ClientError,
     ) -> Result<(ZSetBatch, usize), ClientError> {
-        // Every system key fits the narrow word, packed native, so the whole key
-        // rides the control block and the extra blob is empty.
-        let reply = checked_sys_rows(family, self.seek(family, key, &[])?)?;
+        let reply = checked_sys_rows(family, self.seek(family, &key.to_le_bytes())?)?;
         let i = reply.live_row_with_pk(sys_schema(family), key).ok_or_else(missing)?;
         Ok((reply, i))
     }

@@ -134,25 +134,22 @@ impl<'a> WireData<'a> {
 /// caller names only what it sends:
 ///
 /// ```ignore
-/// let msg = ipc::WireMsg { request_id, status: WireStatus::Error, error_msg: msg, ..Default::default() };
+/// let msg = ipc::WireMsg { status: WireStatus::Error, blob: text, ..Default::default() };
 /// writer.send_msg(request_id, &msg);
 /// ```
 #[derive(Clone, Copy, Default)]
 pub struct WireMsg<'a> {
     pub target_id: u64,
-    pub client_id: u64,
     pub flags: WireFlags,
-    pub seek_pk: u128,
-    pub seek_col_idx: u64,
-    pub request_id: u64,
+    pub arg0: u64,
+    pub arg1: u64,
     pub status: WireStatus,
-    pub error_msg: &'a [u8],
     pub data: WireData<'a>,
     /// These bytes *are* the frame's schema block, and their length sizes it;
     /// `None` emits none and leaves `has_schema` clear. Usually from a
     /// [`WireSchema`], which pairs them with the descriptor they encode.
     pub schema_block: Option<&'a [u8]>,
-    pub seek_pk_extra: &'a [u8],
+    pub blob: &'a [u8],
 }
 
 impl<'a> WireMsg<'a> {
@@ -162,7 +159,7 @@ impl<'a> WireMsg<'a> {
 
     /// Total encoded size, without allocating.
     pub fn size(&self) -> usize {
-        let mut total = gnitz_wire::control::ctrl_block_size(self.error_msg.len(), self.seek_pk_extra.len());
+        let mut total = gnitz_wire::control::ctrl_block_size(self.blob.len());
         if let Some(block) = self.schema_block {
             total += block.len();
         }
@@ -172,10 +169,9 @@ impl<'a> WireMsg<'a> {
         total
     }
 
-    /// Encode into `out[offset..]`, returning bytes written; panics if `out` is
-    /// shorter than [`size`](WireMsg::size). `checksum`: only a zoned SAL slot
-    /// carries them.
-    pub fn encode(&self, out: &mut [u8], offset: usize, checksum: bool) -> usize {
+    /// Encode into the front of `out`, returning bytes written; panics if `out` is
+    /// shorter than [`size`](WireMsg::size).
+    pub fn encode(&self, out: &mut [u8]) -> usize {
         let has_data = self.has_data();
 
         let wire_flags = WireFlags {
@@ -188,31 +184,21 @@ impl<'a> WireMsg<'a> {
             ..self.flags
         };
 
-        let written = gnitz_wire::control::encode_ctrl_block(
+        let mut pos = gnitz_wire::control::encode_ctrl_block(
             out,
-            offset,
             &gnitz_wire::control::ControlHeader {
                 status: self.status,
                 target_id: self.target_id,
-                client_id: self.client_id,
                 flags: wire_flags,
-                seek_pk: self.seek_pk,
-                seek_col_idx: self.seek_col_idx,
-                request_id: self.request_id,
+                arg0: self.arg0,
+                arg1: self.arg1,
             },
-            self.error_msg,
-            self.seek_pk_extra,
-            checksum,
+            self.blob,
         );
-        let mut pos = offset + written;
 
         if let Some(block) = self.schema_block {
             let end = pos + block.len();
             out[pos..end].copy_from_slice(block);
-            // The block is shared, so it is encoded without one.
-            if checksum {
-                gnitz_wire::wal::stamp_checksum(&mut out[pos..end], block.len());
-            }
             pos = end;
         }
 
@@ -220,14 +206,12 @@ impl<'a> WireMsg<'a> {
             let tid = self.target_id as u32;
             pos += match self.data {
                 WireData::None => unreachable!("has_data implies a batch"),
-                WireData::Whole(b) => b.encode_to_wire(tid, out, pos, checksum),
-                WireData::Scattered { batch, indices } => {
-                    batch.encode_scattered_to_wire(indices, tid, out, pos, checksum)
-                }
+                WireData::Whole(b) => b.encode_to_wire(tid, out, pos, false),
+                WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, tid, out, pos),
             };
         }
 
-        pos - offset
+        pos
     }
 }
 
@@ -287,15 +271,15 @@ pub fn decode_client_frame(
     control: DecodedControl,
     hint: Option<&SchemaDescriptor>,
 ) -> Result<DecodedWire, &'static str> {
-    let (schema, data_batch) = decode_frame(data, &control, hint, false, Batch::decode_foreign_wal_block)?;
+    let (schema, data_batch) = decode_frame(data, &control, hint, Batch::decode_foreign_wal_block)?;
     Ok(DecodedWire { control, schema, data_batch })
 }
 
-/// Decode one SAL slot; `verify`: only a zoned slot carries checksums.
-pub fn decode_sal_slot(data: &[u8], verify: bool) -> Result<DecodedWire, &'static str> {
-    let control = peek_control_block(data, verify)?;
-    let (schema, data_batch) = decode_frame(data, &control, None, verify, |b, s| {
-        Batch::decode_from_wal_block(b, s, verify).map(|(b, _)| b)
+/// Decode one SAL slot.
+pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, &'static str> {
+    let control = peek_control_block(data)?;
+    let (schema, data_batch) = decode_frame(data, &control, None, |b, s| {
+        Batch::decode_from_wal_block(b, s, false).map(|(b, _)| b)
     })?;
     let mut decoded = DecodedWire { control, schema, data_batch };
     certify_engine_frame(&mut decoded);
@@ -306,8 +290,8 @@ pub fn decode_sal_slot(data: &[u8], verify: bool) -> Result<DecodedWire, &'stati
 /// the blob heap: an exchange frame can carry a whole unfiltered heap, and this
 /// is where it is compacted.
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    let control = peek_control_block(data, false)?;
-    let (schema, data_batch) = decode_frame(data, &control, None, false, |block, schema| {
+    let control = peek_control_block(data)?;
+    let (schema, data_batch) = decode_frame(data, &control, None, |block, schema| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
         let mut owned = Batch::with_capacity(schema, mb.len());
@@ -327,7 +311,7 @@ pub(crate) fn decode_train_frame<'a>(
     expected: &SchemaDescriptor,
     offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<Option<MemBatch<'a>>, String> {
-    let (block_schema, batch) = decode_frame(data, control, Some(expected), false, move |block, schema| {
+    let (block_schema, batch) = decode_frame(data, control, Some(expected), move |block, schema| {
         gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, offsets)
     })?;
     if let Some(s) = &block_schema {
@@ -343,7 +327,7 @@ pub(crate) fn decode_train_frame<'a>(
 /// (`decode_client_frame`) never comes through here — a lying client frame
 /// must be answered with an error, not a debug-build abort.
 fn certify_engine_frame(decoded: &mut DecodedWire) {
-    let layout = if decoded.control.flags.batch_consolidated {
+    let layout = if decoded.control.hdr.flags.batch_consolidated {
         Layout::Consolidated
     } else {
         Layout::Raw
@@ -359,12 +343,11 @@ fn decode_frame<'a, B>(
     data: &'a [u8],
     control: &DecodedControl,
     hint: Option<&SchemaDescriptor>,
-    verify: bool,
     decode: impl FnOnce(&'a [u8], &SchemaDescriptor) -> Result<B, &'static str>,
 ) -> Result<(Option<SchemaDescriptor>, Option<B>), &'static str> {
     let blocks = frame_blocks(data, control)?;
     let block_schema = match blocks.schema {
-        Some(r) => Some(decode_schema_block(&data[r], verify)?),
+        Some(r) => Some(decode_schema_block(&data[r])?),
         None => None,
     };
     let Some(r) = blocks.data else {

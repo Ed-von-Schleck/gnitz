@@ -185,12 +185,11 @@ async def test_connection_loss_resolves_every_queued_request(disposable_server):
 @pytest.mark.asyncio
 async def test_connect_shapes_close_and_refuse(server):
     """`connect()` returns the connection itself, so `await` and `async with`
-    both yield it. Two are independent connections with server-assigned ids of
-    their own. Close is idempotent, and every later verb raises rather than
-    hanging on a future nobody will resolve."""
+    both yield it. Two are independent connections. Close is idempotent, and
+    every later verb raises rather than hanging on a future nobody will
+    resolve."""
     conn = await aio.connect(server)
     async with aio.connect(server) as other:
-        assert conn.client_id != other.client_id
         assert len(await conn.scan(gnitz.SCHEMA_TAB)) == len(await other.scan(gnitz.SCHEMA_TAB)) > 0
 
     await conn.aclose()

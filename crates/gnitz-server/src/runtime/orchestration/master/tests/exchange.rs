@@ -1,10 +1,24 @@
 use super::*;
-use gnitz_wire::control::DecodedControl;
+use gnitz_wire::control::{ControlHeader, DecodedControl};
 use gnitz_wire::WireFlags;
 
 /// The one-U64-PK, zero-payload fixture every batch here is built over.
 fn u64_pk_only() -> SchemaDescriptor {
     crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U64])
+}
+
+/// An exchange frame's control header, as a worker stamps it.
+fn control(view_id: i64, source_id: i64, flags: WireFlags) -> DecodedControl {
+    DecodedControl {
+        hdr: ControlHeader {
+            target_id: view_id as u64,
+            flags,
+            arg0: source_id as u64,
+            ..Default::default()
+        },
+        blob: Vec::new(),
+        block_size: 0,
+    }
 }
 
 /// One worker's TERMINAL exchange frame — the whole report when the partition
@@ -13,15 +27,14 @@ fn u64_pk_only() -> SchemaDescriptor {
 /// clear).
 fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> DecodedWire {
     DecodedWire {
-        control: DecodedControl {
-            target_id: view_id as u64,
-            flags: WireFlags {
+        control: control(
+            view_id,
+            source_id,
+            WireFlags {
                 backfill_pad: pad,
                 ..WireFlags::train_frame(0, true)
             },
-            seek_pk: source_id as u128,
-            ..Default::default()
-        },
+        ),
         schema: with_schema.then(u64_pk_only),
         data_batch: None,
     }
@@ -44,15 +57,14 @@ fn chunk(keys: &[u64]) -> Batch {
 /// only the terminal one carries the round's bookkeeping.
 fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> DecodedWire {
     DecodedWire {
-        control: DecodedControl {
-            target_id: view_id as u64,
-            flags: WireFlags {
+        control: control(
+            view_id,
+            source_id,
+            WireFlags {
                 batch_consolidated: true,
                 ..WireFlags::train_frame(0, last)
             },
-            seek_pk: source_id as u128,
-            ..Default::default()
-        },
+        ),
         schema: Some(u64_pk_only()),
         data_batch: Some(chunk(keys)),
     }
@@ -156,7 +168,7 @@ fn a_workers_train_completes_only_on_its_terminal_frame() {
 fn one_unconsolidated_frame_clears_the_slots_claim() {
     let mut acc = ExchangeAccumulator::new(1);
     let mut raw = make_frame(7, 3, &[1], false);
-    raw.control.flags.batch_consolidated = false;
+    raw.control.hdr.flags.batch_consolidated = false;
     raw.data_batch = Some({
         let mut b = chunk(&[1]);
         b.certify_layout(Layout::Raw);

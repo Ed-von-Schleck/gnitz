@@ -189,16 +189,6 @@ pub struct ReadSpec {
     pub sink: ReadSink,
 }
 
-/// A delta reply's terminal watermark in `seek_pk`: cursor tag high, tick round low.
-pub fn pack_delta_watermark(tag: u64, tick: u64) -> u128 {
-    ((tag as u128) << 64) | tick as u128
-}
-
-/// The inverse of [`pack_delta_watermark`]: `(tag, tick)`.
-pub fn unpack_delta_watermark(watermark: u128) -> (u64, u64) {
-    ((watermark >> 64) as u64, watermark as u64)
-}
-
 impl ReadSpec {
     /// Every row `bound` walks, unfiltered and unmapped.
     pub fn all_rows(bound: ReadBound) -> Self {

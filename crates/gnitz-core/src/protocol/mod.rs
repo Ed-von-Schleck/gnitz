@@ -13,17 +13,12 @@ pub mod wal_block;
 pub use codec::ReplySchema;
 pub use error::ProtocolError;
 // The wire protocol's own vocabulary, re-exported at the module root so the
-// client's protocol code has one import path for it. `Header` is
-// `gnitz_wire`'s `ControlHeader`: the control block's seven routing scalars,
-// defined once for both sides of the wire.
-pub use gnitz_wire::control::ControlHeader as Header;
+// client's protocol code has one import path for it.
 pub use gnitz_wire::{ClientVerb, WireConflictMode, WireFlags, WireStatus, MAX_COLUMNS};
 #[cfg(any(test, feature = "integration"))]
 pub use message::parse_response;
-pub(crate) use message::{encode_control_frame, parse_response_frame};
-pub use message::{
-    encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn, Message, MessageParts,
-};
+pub(crate) use message::parse_response_frame;
+pub use message::{encode_ddl_txn, encode_frame, encode_push_txn, Message, MessageParts};
 // Only the `integration` suite drives a raw transport from outside; a shipped
 // build keeps it crate-private. The cfgs are complementary because two `use`
 // statements binding one name is `E0252` whatever their visibility.

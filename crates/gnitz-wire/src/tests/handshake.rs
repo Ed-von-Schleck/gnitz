@@ -48,9 +48,9 @@ fn ack_frame_layout_and_decode() {
 /// frame instead of as its error.
 #[test]
 fn the_length_prefix_discriminates_the_pre_handshake_frames() {
-    let smallest_ctrl = crate::control::CTRL_BLOCK_SIZE_NO_BLOB;
+    let smallest_ctrl = crate::control::CTRL_HEADER_SIZE;
     assert_ne!(HELLO_PAYLOAD_LEN, HELLO_ACK_PAYLOAD_LEN);
     assert!((HELLO_PAYLOAD_LEN as usize) < smallest_ctrl);
     assert!((HELLO_ACK_PAYLOAD_LEN as usize) < smallest_ctrl);
-    assert!(crate::control::ctrl_block_size(128, 0) < MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
+    assert!(crate::control::ctrl_block_size(128) < MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
 }

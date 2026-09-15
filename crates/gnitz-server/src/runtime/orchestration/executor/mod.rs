@@ -36,12 +36,13 @@ use crate::runtime::master::{
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
-use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
+use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind, WorkerSet};
 use crate::runtime::wire::{self as ipc, validate_schema_match};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::key::seek_opk_bytes;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
+use gnitz_wire::control::DecodedControl;
 use gnitz_wire::txn_frame::{validate_item_ids, DeltaPollItem};
 use gnitz_wire::BackfillDecision;
 use gnitz_wire::{PkKeys, ReadBound, ReadSpec, WireFault, WireFlags, WireStatus};
@@ -569,7 +570,7 @@ async fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> H
             "unsupported wire version: peer={}, server={}",
             hello.version, server_version,
         );
-        send_error(peer, 0, 0, msg.as_bytes());
+        send_error(peer, 0, msg.as_bytes());
         return HelloOutcome::Reject;
     }
 
@@ -731,7 +732,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
         // Run the tick. Errors are reported in logs AND handed to every Drain
         // trigger's `done`: the waiting reader's view is stale, so reporting
         // success would serve stale rows under `WireStatus::Ok`.
-        let tick_result = run_tick(&shared, &tids_scratch, nw, &mut acc).await;
+        let tick_result = run_tick(&shared, &tids_scratch, &mut acc).await;
         if let Err(e) = &tick_result {
             gnitz_warn!("tick error: {}", e);
         }
@@ -743,12 +744,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
 
 /// Emit Tick groups for every `tid` and await the per-worker ACKs, relaying each
 /// exchange round the tick opens as it completes.
-async fn run_tick(
-    shared: &Rc<Shared>,
-    tids: &[i64],
-    nw: usize,
-    acc: &mut ExchangeAccumulator,
-) -> Result<(), WireFault> {
+async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulator) -> Result<(), WireFault> {
     // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
@@ -765,7 +761,7 @@ async fn run_tick(
         return Ok(());
     }
 
-    let req_ids = shared.disp().reactor().lease_acks(tids.len() * nw);
+    let req_ids = shared.disp().reactor().lease_acks(tids.len(), WorkerSet::ALL);
 
     let _cat_read = shared.catalog_rwlock.read().await;
     let excl = shared.disp().sal().lock().await;
@@ -780,7 +776,7 @@ async fn run_tick(
             if TICK_EMIT_ERROR.take_once() {
                 return Err(format!("injected tick emit error (tid={tid})").into());
             }
-            disp.write_tick_group(&excl, tid, GroupTargets::all(req_ids.id(i * nw)))?;
+            disp.write_tick_group(&excl, tid, GroupTargets::all(req_ids.id(i)))?;
             emitted.set(i + 1);
         }
         Ok(())
@@ -798,7 +794,7 @@ async fn run_tick(
     shared.requeue_tick_tids(&tids[n..]);
 
     let worker_err = loop {
-        match shared.disp().next_relay(&req_ids, n * nw, "tick", acc).await {
+        match shared.disp().next_relay(&req_ids, n, "tick", acc).await {
             Ok(Some(relay)) => relay_steady(shared, relay).await,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
@@ -880,65 +876,60 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
 // ---------------------------------------------------------------------------
 
 async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
-    // ONE control-block parse for the whole request: routing, the schema-hint
-    // decision and the push decode all read this same parse, so a malicious
-    // client cannot forge a directory that points one at one region and another
-    // at another.
-    let ctrl = match gnitz_wire::control::peek_control_block(data, false) {
+    // ONE control-header parse for the whole request: routing, the schema-hint
+    // decision and the push decode all read this same parse.
+    let ctrl = match gnitz_wire::control::peek_control_block(data) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("decode error: {e}");
-            send_error(peer, 0, 0, msg.as_bytes());
+            send_error(peer, 0, msg.as_bytes());
             return;
         }
     };
-    let client_id = ctrl.client_id;
-    let target_id = ctrl.target_id as i64;
+    let target_id = ctrl.hdr.target_id as i64;
 
-    let verb = match ctrl.flags.client_verb() {
+    let verb = match ctrl.hdr.flags.client_verb() {
         Ok(v) => v,
         Err(e) => {
-            send_error(peer, target_id, client_id, e.as_bytes());
+            send_error(peer, target_id, e.as_bytes());
             return;
         }
     };
 
     match verb {
         // The bundle frames name no single relation in `target_id`: each carries
-        // its items after the control block and decodes its own body from `data`.
-        ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, client_id, data).await,
-        ClientVerb::PushTxn => handle_push_txn(shared, peer, client_id, data).await,
-        ClientVerb::ScanMulti => handle_scan_multi(shared, peer, client_id, data).await,
-        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, client_id, data).await,
+        // its items after the control header and decodes its own body from `data`.
+        ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &ctrl, data).await,
+        ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, data).await,
+        ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &ctrl, data).await,
+        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &ctrl, data).await,
 
-        // `target_id` is the sequence key (= the owning table's id); the range
-        // `count` rides in `seek_col_idx`.
+        // `target_id` is the sequence key (= the owning table's id).
         ClientVerb::AllocSerialRange => {
-            let count = ctrl.seek_col_idx.max(1) as i64;
+            let count = ctrl.hdr.arg1.max(1) as i64;
             match commit_serial_range_durable(shared, target_id, count).await {
-                Ok(base) => send_control_only(peer, base, client_id, WireStatus::Ok),
-                Err(e) => send_error(peer, target_id, client_id, e.as_bytes()),
+                Ok(base) => send_control_only(peer, base, WireStatus::Ok),
+                Err(e) => send_error(peer, target_id, e.as_bytes()),
             }
         }
 
         // An id allocation names no relation, so `target_id` is not read — and a
         // frame that sets one is still allocated, rather than falling through to
-        // a scan of that id. The run length rides in `seek_col_idx`, exactly as
-        // `AllocSerialRange`'s does; the reply is the run's base.
+        // a scan of that id.
         ClientVerb::AllocTableId => {
-            let alloc = shared.cat_mut().allocate_table_ids(ctrl.seek_col_idx);
-            reply_allocation(peer, client_id, alloc).await
+            let alloc = shared.cat_mut().allocate_table_ids(ctrl.hdr.arg1);
+            reply_allocation(peer, alloc).await
         }
         ClientVerb::AllocSchemaId => {
             let alloc = shared.cat_mut().allocate_schema_id();
-            reply_allocation(peer, client_id, alloc).await
+            reply_allocation(peer, alloc).await
         }
         ClientVerb::AllocIndexId => {
-            let alloc = shared.cat_mut().allocate_index_ids(ctrl.seek_col_idx);
-            reply_allocation(peer, client_id, alloc).await
+            let alloc = shared.cat_mut().allocate_index_ids(ctrl.hdr.arg1);
+            reply_allocation(peer, alloc).await
         }
 
-        ClientVerb::ScanSpec => handle_scan_spec(shared, peer, client_id, target_id, &ctrl.seek_pk_extra).await,
+        ClientVerb::ScanSpec => handle_scan_spec(shared, peer, target_id, &ctrl.blob).await,
 
         // A plain read guard, not `read_lock`: a resolve answers catalog shape,
         // and a view tick moves a view's rows, never its shape — so the tick
@@ -947,11 +938,11 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         ClientVerb::Resolve => {
             let reply = {
                 let _g = shared.catalog_rwlock.read().await;
-                build_resolve_reply(shared, client_id, target_id, &ctrl.seek_pk_extra)
+                build_resolve_reply(shared, target_id, &ctrl.blob)
             };
             match reply {
                 Ok(buf) => peer.send_or_close(buf).await,
-                Err(msg) => send_error(peer, target_id, client_id, msg.as_bytes()),
+                Err(msg) => send_error(peer, target_id, msg.as_bytes()),
             }
         }
 
@@ -963,12 +954,12 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
 /// Reply to an id allocation. The new id rides back as the reply's *target* id —
 /// that id is the whole answer, so the frame carries no schema and no data.
-async fn reply_allocation<E: std::fmt::Display>(peer: &Peer, client_id: u64, alloc: Result<i64, E>) {
+async fn reply_allocation<E: std::fmt::Display>(peer: &Peer, alloc: Result<i64, E>) {
     match alloc {
-        Ok(new_id) => send_control_only(peer, new_id, client_id, WireStatus::Ok),
+        Ok(new_id) => send_control_only(peer, new_id, WireStatus::Ok),
         Err(e) => {
             let msg = format!("id allocation failed: {e}");
-            send_error(peer, 0, client_id, msg.as_bytes());
+            send_error(peer, 0, msg.as_bytes());
         }
     }
 }
@@ -994,11 +985,11 @@ fn decode_push_frame(
     data: &[u8],
     ctrl: gnitz_wire::control::DecodedControl,
 ) -> Result<ipc::DecodedWire, PushReject> {
-    let target_id = ctrl.target_id as i64;
-    let client_version = ctrl.flags.schema_version;
+    let target_id = ctrl.hdr.target_id as i64;
+    let client_version = ctrl.hdr.flags.schema_version;
 
     // A cold frame ships its own schema block and needs no hint.
-    let catalog_schema = if ctrl.flags.has_data && !ctrl.flags.has_schema {
+    let catalog_schema = if ctrl.hdr.flags.has_data && !ctrl.hdr.flags.has_schema {
         if client_version == 0 {
             return Err(PushReject::Error("a data block without a schema block".to_string()));
         }
@@ -1028,9 +1019,8 @@ fn decode_push_frame(
 /// that happens to produce an empty batch (a `delete` with an empty pk list)
 /// fails the way a non-empty one would instead of being masked by a no-op ACK.
 async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_wire::control::DecodedControl) {
-    let client_id = ctrl.client_id;
-    let target_id = ctrl.target_id as i64;
-    let flags = ctrl.flags;
+    let target_id = ctrl.hdr.target_id as i64;
+    let flags = ctrl.hdr.flags;
     let client_version = flags.schema_version;
 
     // Decoding happens before the lock below, and cannot suspend: see
@@ -1038,11 +1028,11 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     let decoded = match decode_push_frame(shared, data, ctrl) {
         Ok(d) => d,
         Err(PushReject::SchemaMismatch) => {
-            send_control_only(peer, target_id, client_id, WireStatus::SchemaMismatch);
+            send_control_only(peer, target_id, WireStatus::SchemaMismatch);
             return;
         }
         Err(PushReject::Error(msg)) => {
-            send_error(peer, target_id, client_id, msg.as_bytes());
+            send_error(peer, target_id, msg.as_bytes());
             return;
         }
     };
@@ -1050,7 +1040,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         hold_push_for_ddl(shared, target_id).await;
     }
     let _cat = shared.catalog_rwlock.read().await;
-    let Some(kind) = target_kind_or_reject(shared, peer, client_id, target_id, Access::Write).await else {
+    let Some(kind) = target_kind_or_reject(shared, peer, target_id, Access::Write).await else {
         return;
     };
 
@@ -1060,7 +1050,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         Some(b) if !b.is_empty() => b,
         _ => {
             drop(_cat);
-            send_ok_response(shared, peer, target_id, None, client_id, 0, client_version);
+            send_ok_response(shared, peer, target_id, None, 0, client_version);
             return;
         }
     };
@@ -1072,9 +1062,9 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         // a warm one is told to evict its cache entry and retry cold, where
         // that wording is reachable.
         if flags.has_schema {
-            send_error(peer, target_id, client_id, e.as_bytes());
+            send_error(peer, target_id, e.as_bytes());
         } else {
-            send_control_only(peer, target_id, client_id, WireStatus::SchemaMismatch);
+            send_control_only(peer, target_id, WireStatus::SchemaMismatch);
         }
         return;
     }
@@ -1085,7 +1075,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     // relation kind, and must keep admitting a base table's retractions.
     if kind == RelationKind::Stream {
         if let Some(e) = stream_push_error(target_id, &batch, mode) {
-            send_error(peer, target_id, client_id, e.as_bytes());
+            send_error(peer, target_id, e.as_bytes());
             return;
         }
     }
@@ -1113,7 +1103,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         .validate_txn_distributed(std::slice::from_ref(&family))
         .await
     {
-        send_fault(peer, target_id, client_id, &e);
+        send_fault(peer, target_id, &e);
         return;
     }
     let TxnFamily { batch, .. } = family;
@@ -1130,7 +1120,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         done: tx,
     }));
     if let Err(e) = queued {
-        send_error(peer, target_id, client_id, e.as_bytes());
+        send_error(peer, target_id, e.as_bytes());
         return;
     }
     match rx.await {
@@ -1152,27 +1142,18 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
             // batch happened to open a zone, so a stream push the committer
             // coalesced with a base-table push still answers `0`.
             let reply_lsn = if is_stream { 0 } else { zone_lsn };
-            send_ok_response(
-                shared,
-                peer,
-                target_id,
-                None,
-                client_id,
-                reply_lsn as u128,
-                client_version,
-            );
+            send_ok_response(shared, peer, target_id, None, reply_lsn, client_version);
         }
-        Err(fault) => send_fault(peer, target_id, client_id, &fault),
+        Err(fault) => send_fault(peer, target_id, &fault),
     }
 }
 
 /// SCAN or SEEK of one relation: a catalog family is served master-locally,
 /// anything else fans out — a seek as a one-key `ScanSpec`.
 async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control::DecodedControl, verb: ClientVerb) {
-    let client_id = ctrl.client_id;
-    let target_id = ctrl.target_id as i64;
-    let client_version = ctrl.flags.schema_version;
-    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, Access::Read).await else {
+    let target_id = ctrl.hdr.target_id as i64;
+    let client_version = ctrl.hdr.flags.schema_version;
+    let Some((_g, kind)) = read_lock(shared, peer, target_id, Access::Read).await else {
         return;
     };
     let lsn = shared.last_tick_lsn.get();
@@ -1180,16 +1161,9 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
     let seek = match verb {
         ClientVerb::Seek => {
             let schema = disp.schema_desc_for(target_id);
-            let opk = match seek_opk_bytes(&schema, ctrl.seek_pk, &ctrl.seek_pk_extra) {
+            let opk = match seek_opk_bytes(&schema, &ctrl.blob) {
                 Ok(k) => k,
-                Err(e) => {
-                    return send_error(
-                        peer,
-                        target_id,
-                        client_id,
-                        format!("seek: table {target_id}: {e}").as_bytes(),
-                    )
-                }
+                Err(e) => return send_error(peer, target_id, format!("seek: table {target_id}: {e}").as_bytes()),
             };
             let keys = PkKeys::from_keys(schema.pk_stride(), [opk.pk_bytes()]);
             Some((ReadSpec::all_rows(ReadBound::PkSet(keys)), schema))
@@ -1199,20 +1173,12 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
 
     if kind == RelationKind::SystemCatalog {
         let Some((spec, schema)) = seek else {
-            scan_system_family(shared, peer, client_id, target_id, client_version).await;
+            scan_system_family(shared, peer, target_id, client_version).await;
             return;
         };
         match guard_panic("seek", || shared.cat_mut().scan_spec(target_id, spec, &schema)) {
-            Ok(rows) => send_ok_response(
-                shared,
-                peer,
-                target_id,
-                Some(&rows),
-                client_id,
-                lsn as u128,
-                client_version,
-            ),
-            Err(f) => send_fault(peer, target_id, client_id, &f),
+            Ok(rows) => send_ok_response(shared, peer, target_id, Some(&rows), lsn, client_version),
+            Err(f) => send_fault(peer, target_id, &f),
         }
         return;
     }
@@ -1228,30 +1194,26 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
 
     let (server_version, prelim) = schema_block_for_reply(shared, target_id, client_version);
     if let Some(block) = prelim {
-        send_msg(
-            peer,
-            prelim_schema_msg(target_id, client_id, server_version, block.as_slice()),
-        );
+        send_msg(peer, prelim_schema_msg(target_id, server_version, block.as_slice()));
     }
 
     let template = ipc::WireMsg {
         target_id: target_id as u64,
-        client_id,
         flags: WireFlags {
             schema_version: server_version,
             ..Default::default()
         },
-        seek_pk_extra: &blob,
+        blob: &blob,
         ..Default::default()
     };
     let result = disp.fan_out_scan(route, peer, sal_kind, template).await;
-    finish_scan_fanout(peer, target_id, client_id, lsn as u128, result).await;
+    finish_scan_fanout(peer, target_id, lsn, result).await;
 }
 
 /// The two success shapes of `push_txn_body`. `Committed` carries the durable
 /// zone LSN; `Conflict` carries a fresh basis (`published()`) the client adopts
-/// for its retry. `push_txn_body` cannot send the reply itself (`peer` /
-/// `client_id` are not in its scope), so it returns the outcome and
+/// for its retry. `push_txn_body` cannot send the reply itself (`peer` is not in
+/// its scope), so it returns the outcome and
 /// `handle_push_txn` renders it.
 enum PushTxnOutcome {
     Committed(u64),
@@ -1266,36 +1228,27 @@ enum PushTxnOutcome {
 /// late drain check; both locks are held through the committer ACK. Every
 /// rejection is pre-SAL, so an `Err` reply — and a `Conflict` outcome — mean
 /// "nothing committed".
-async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
-    match push_txn_body(shared, data).await {
+async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
+    match push_txn_body(shared, ctrl, data).await {
         Ok(outcome) => {
-            let (pk, status) = match outcome {
-                // Standard single-frame ACK, seek_pk = zone LSN (uncorrelated,
-                // as push_ddl_txn's reply is).
+            let (arg0, status) = match outcome {
+                // Standard single-frame ACK (uncorrelated, as the DDL_TXN reply is).
                 PushTxnOutcome::Committed(lsn) => (lsn, WireStatus::Ok),
                 PushTxnOutcome::Conflict(fresh_basis) => (fresh_basis, WireStatus::TxnConflict),
             };
-            send_msg(
-                peer,
-                ipc::WireMsg {
-                    client_id,
-                    seek_pk: pk as u128,
-                    status,
-                    ..Default::default()
-                },
-            );
+            send_msg(peer, ipc::WireMsg { arg0, status, ..Default::default() });
         }
-        Err(fault) => send_fault(peer, 0, client_id, &fault),
+        Err(fault) => send_fault(peer, 0, &fault),
     }
 }
 
 /// The body of `handle_push_txn`. Returns `Committed(zone_lsn)` on a durable
 /// commit or `Conflict(fresh_basis)` when the OCC precondition check fails.
-async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcome, WireFault> {
+async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -> Result<PushTxnOutcome, WireFault> {
     // 1. Decode + frame-local shape rules (no catalog access). The frame carries
     //    the families and the OCC preconditions (each `(tid, basis)`).
     let (raw, preconditions) =
-        gnitz_wire::txn_frame::decode_push_txn(data).map_err(|e| format!("decode error: {e}"))?;
+        gnitz_wire::txn_frame::decode_push_txn(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
     if raw.is_empty() {
         return Err("TXN: empty family bundle".into());
     }
@@ -1321,7 +1274,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         // The schema block is always present; validate it against the catalog
         // per family (a concurrent DDL between buffer time and commit surfaces as
         // a clean error the application re-runs).
-        let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block, false)
+        let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block)
             .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
         let catalog_schema = validate_client_schema(shared, tid, &wire_schema)?;
         let batch = decode_client_batch(fam.wal_block, &catalog_schema)
@@ -1492,17 +1445,11 @@ fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<Relati
 
 /// [`target_kind`] with the frame reply path. `None` means the error reply was sent
 /// and the caller must return. The caller holds the catalog read lock.
-async fn target_kind_or_reject(
-    shared: &Shared,
-    peer: &Peer,
-    client_id: u64,
-    target_id: i64,
-    access: Access,
-) -> Option<RelationKind> {
+async fn target_kind_or_reject(shared: &Shared, peer: &Peer, target_id: i64, access: Access) -> Option<RelationKind> {
     match target_kind(shared, target_id, access) {
         Ok(kind) => Some(kind),
         Err(f) => {
-            send_fault(peer, target_id, client_id, &f);
+            send_fault(peer, target_id, &f);
             None
         }
     }
@@ -1559,18 +1506,13 @@ fn resolve_request_target(
 /// carrying what the block cannot (kind, placement, foreign keys, secondary
 /// indexes). Served entirely from the typed caches the master already
 /// maintains; it writes no SAL group and wakes no worker.
-fn build_resolve_reply(
-    shared: &Rc<Shared>,
-    client_id: u64,
-    target_id: i64,
-    name_blob: &[u8],
-) -> Result<PooledSendBuf, String> {
+fn build_resolve_reply(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) -> Result<PooledSendBuf, String> {
     let Some((tid, kind, class)) = resolve_request_target(shared, target_id, name_blob)? else {
         // Relation absent is a successful answer, not an error: the client owes a
         // different wording per entry point ("Table …", "Table or view …",
         // `Ok(None)`), so it renders it itself. An empty descriptor blob says so,
         // and `target_id = 0` names no relation.
-        return Ok(encode_response_buffer(ipc::WireMsg { client_id, ..Default::default() }));
+        return Ok(encode_response_buffer(ipc::WireMsg::default()));
     };
 
     // Only an ingestion point reports its placement. A view and a system family are
@@ -1641,13 +1583,12 @@ fn build_resolve_reply(
     let (schema_block, server_version) = (entry.block, entry.version);
     Ok(encode_response_buffer(ipc::WireMsg {
         target_id: tid as u64,
-        client_id,
         flags: WireFlags {
             schema_version: server_version,
             ..Default::default()
         },
         schema_block: Some(schema_block.as_slice()),
-        seek_pk_extra: &blob,
+        blob: &blob,
         ..Default::default()
     }))
 }
@@ -1707,12 +1648,11 @@ async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadG
 async fn read_lock(
     shared: &Rc<Shared>,
     peer: &Peer,
-    client_id: u64,
     target_id: i64,
     access: Access,
 ) -> Option<(ReadGuard, RelationKind)> {
     let g = shared.catalog_rwlock.read().await;
-    let kind = target_kind_or_reject(shared, peer, client_id, target_id, access).await?;
+    let kind = target_kind_or_reject(shared, peer, target_id, access).await?;
     if read_is_fresh(shared, target_id) {
         return Some((g, kind));
     }
@@ -1721,11 +1661,11 @@ async fn read_lock(
     let g = match drain_and_relock(shared, g).await {
         Ok(g) => g,
         Err(f) => {
-            send_fault(peer, target_id, client_id, &f);
+            send_fault(peer, target_id, &f);
             return None;
         }
     };
-    let kind = target_kind_or_reject(shared, peer, client_id, target_id, access).await?;
+    let kind = target_kind_or_reject(shared, peer, target_id, access).await?;
     Some((g, kind))
 }
 
@@ -1748,69 +1688,62 @@ fn schema_block_for_reply(shared: &Rc<Shared>, tid: i64, client_version: u16) ->
 /// The preliminary schema-only frame — carrying `continuation`, the
 /// `server_version`, and the captured wire block — that precedes a scan's data
 /// frames on a schema-cache miss, in place of one schema block per worker.
-fn prelim_schema_msg(tid: i64, client_id: u64, server_version: u16, block: &[u8]) -> ipc::WireMsg<'_> {
+fn prelim_schema_msg(tid: i64, server_version: u16, block: &[u8]) -> ipc::WireMsg<'_> {
     ipc::WireMsg {
         target_id: tid as u64,
-        client_id,
         flags: WireFlags::train_frame(server_version, false),
         schema_block: Some(block),
         ..Default::default()
     }
 }
 
-/// A reply train's terminal frame. `seek_pk` is the read's watermark: the
-/// last-committed LSN, or a DELTA_POLL position's packed `(cursor tag, T)`.
-fn terminal_scan_msg(target_id: i64, client_id: u64, seek_pk: u128) -> ipc::WireMsg<'static> {
+/// A reply train's terminal frame. `arg0` is the read's watermark: the
+/// last-committed LSN, or a DELTA_POLL position's tick round, whose cursor tag
+/// rides `arg1`; `arg1` is `0` for every other read.
+fn terminal_scan_msg(target_id: i64, arg0: u64, arg1: u64) -> ipc::WireMsg<'static> {
     ipc::WireMsg {
         target_id: target_id as u64,
-        client_id,
-        seek_pk,
+        arg0,
+        arg1,
         ..Default::default()
     }
 }
 
 /// Finish one scan-shaped fan-out: `Ok(true)` → the terminal frame (stamped
-/// with the pre-dispatch `seek_pk`), `Ok(false)` → the forward already failed
+/// with the pre-dispatch `lsn`), `Ok(false)` → the forward already failed
 /// (close the peer), `Err` → a fault frame carrying the worker's own status.
 /// Shared by the plain read and the ScanSpec handler.
-async fn finish_scan_fanout(
-    peer: &Peer,
-    target_id: i64,
-    client_id: u64,
-    seek_pk: u128,
-    result: Result<bool, WireFault>,
-) {
+async fn finish_scan_fanout(peer: &Peer, target_id: i64, lsn: u64, result: Result<bool, WireFault>) {
     match result {
         // Corked, not sent: the terminal joins whatever the forward corked.
         Ok(true) => {
-            send_msg(peer, terminal_scan_msg(target_id, client_id, seek_pk));
+            send_msg(peer, terminal_scan_msg(target_id, lsn, 0));
         }
         Ok(false) => peer.close(),
-        Err(f) => send_fault(peer, target_id, client_id, &f),
+        Err(f) => send_fault(peer, target_id, &f),
     }
 }
 
 /// SCAN_SPEC: the scan pipeline under a client-authored reply schema, so no schema
 /// block goes back, routed by the request's bound.
-async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
+async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob: &[u8]) {
     // `UserRead`: a `ReadSpec` has only a fan-out realization, which a catalog
     // family has no form of.
-    let Some((_g, _kind)) = read_lock(shared, peer, client_id, target_id, Access::UserRead).await else {
+    let Some((_g, _kind)) = read_lock(shared, peer, target_id, Access::UserRead).await else {
         return;
     };
-    let lsn = shared.last_tick_lsn.get() as u128;
-    let route = shared.disp().read_route(target_id, Some(seek_pk_extra));
+    let lsn = shared.last_tick_lsn.get();
+    let route = shared.disp().read_route(target_id, Some(blob));
     let template = ipc::WireMsg {
         target_id: target_id as u64,
-        client_id,
-        seek_pk_extra,
+        blob,
         ..Default::default()
     };
     let result = shared
         .disp()
         .fan_out_scan(route, peer, SalMessageKind::ScanSpec, template)
         .await;
-    finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
+    finish_scan_fanout(peer, target_id, lsn, result).await;
 }
 
 /// DELTA_POLL: advance N mirrored views in one request, one catalog lock and —
@@ -1821,14 +1754,14 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
 ///
 /// Never drains pending ticks: a delta read reports what has happened, and a
 /// round not yet ticked is one the next poll carries.
-async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
-    match delta_poll_body(shared, peer, client_id, data).await {
+async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
+    match delta_poll_body(shared, peer, ctrl, data).await {
         // Every view's train and terminal is already out.
         Ok(true) => {}
         // Client disconnected mid-stream: leases dropped in the body.
         Ok(false) => peer.close(),
         // A frame-shape rejection, before any group was written.
-        Err(f) => send_fault(peer, 0, client_id, &f),
+        Err(f) => send_fault(peer, 0, &f),
     }
 }
 
@@ -1846,8 +1779,13 @@ enum PollPosition {
 /// terminal have been sent; `Ok(false)` on client disconnect; `Err` on a
 /// frame-shape rejection. A per-view failure is not an `Err` — it goes out as
 /// that view's own fault frame and the rest of the poll continues.
-async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, WireFault> {
-    let views = gnitz_wire::txn_frame::decode_delta_poll(data).map_err(|e| format!("decode error: {e}"))?;
+async fn delta_poll_body(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    ctrl: &DecodedControl,
+    data: &[u8],
+) -> Result<bool, WireFault> {
+    let views = gnitz_wire::txn_frame::decode_delta_poll(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
     validate_item_ids("DELTA_POLL", &views, |v| v.view_id)?;
 
     // ── Phase 1: classify under the catalog lock, dispatch one cut ─────────
@@ -1885,10 +1823,9 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
                         excl.write(&DirectGroup {
                             template: ipc::WireMsg {
                                 target_id: item.view_id,
-                                client_id,
-                                seek_pk: round as u128,
-                                seek_col_idx: item.after_tick,
-                                seek_pk_extra: item.reply_block,
+                                arg0: round,
+                                arg1: item.after_tick,
+                                blob: item.reply_block,
                                 ..Default::default()
                             },
                             targets,
@@ -1907,19 +1844,19 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     let disp = shared.disp();
     let mut dispatches = dispatches.into_iter();
     for (tid, position) in positions {
-        let watermark = |round| delta_terminal_seek_pk(disp, tid, round);
+        let terminal = |round| terminal_scan_msg(tid, round, disp.delta_cursor_tag(tid));
         match position {
-            PollPosition::Fault(fault) => send_fault(peer, tid, client_id, &fault),
-            PollPosition::UpToDate => send_msg(peer, terminal_scan_msg(tid, client_id, watermark(up_to_date_round))),
+            PollPosition::Fault(fault) => send_fault(peer, tid, &fault),
+            PollPosition::UpToDate => send_msg(peer, terminal(up_to_date_round)),
             // Taken in step with the `Moved`s that were pushed. A dispatch left
             // undrained — an earlier return dropped it — discards the rest of
             // its train at the ring boundary.
             PollPosition::Moved => {
                 let lease = dispatches.next().expect("one dispatch per moved view");
                 match forward_scan(peer, &lease).await {
-                    Ok(true) => send_msg(peer, terminal_scan_msg(tid, client_id, watermark(dispatch_round))),
+                    Ok(true) => send_msg(peer, terminal(dispatch_round)),
                     Ok(false) => return Ok(false),
-                    Err(fault) => send_fault(peer, tid, client_id, &fault),
+                    Err(fault) => send_fault(peer, tid, &fault),
                 }
             }
         }
@@ -1948,13 +1885,6 @@ fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
         && after_tick >= shared.disp().last_delta_round(target_id)
 }
 
-/// A delta reply's terminal `seek_pk`: the cursor tag in the high half, `T` in
-/// the low half. `MasterDispatcher::delta_cursor_tag` states why one field
-/// answers both questions.
-fn delta_terminal_seek_pk(disp: &MasterDispatcher, target_id: i64, round: u64) -> u128 {
-    gnitz_wire::pack_delta_watermark(disp.delta_cursor_tag(target_id), round)
-}
-
 /// One relation's Phase-1 capture for `scan_multi_body`: exactly what
 /// [`schema_block_for_reply`] answered, carried to the deferred Phase-2 emit.
 struct ScanMultiRelPlan {
@@ -1971,8 +1901,8 @@ struct ScanMultiRelPlan {
 /// request order. The read-side completion of the atomic multi-table write
 /// story: an atomic commit is either wholly before the cut (visible in every
 /// train) or wholly after (visible in none), never torn across the result set.
-async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
-    match scan_multi_body(shared, peer, client_id, data).await {
+async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
+    match scan_multi_body(shared, peer, ctrl, data).await {
         // Phase 2 already streamed every train and terminal.
         Ok(true) => {}
         // Client disconnected mid-stream: leases dropped in the body, close the peer.
@@ -1980,7 +1910,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, dat
         // Shape/tid rejection (before any group is written) or a worker fault
         // mid-stream (leases already dropped in the body): one error frame. The
         // client discards any partial results it read.
-        Err(f) => send_fault(peer, 0, client_id, &f),
+        Err(f) => send_fault(peer, 0, &f),
     }
 }
 
@@ -1989,11 +1919,16 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, dat
 /// shape/tid rejection or a mid-stream worker fault. Every scan's lease lives in
 /// the `dispatches` vec and drops on return, so any error/disconnect return
 /// removes every route and discards undrained frames at the ring boundary.
-async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, WireFault> {
+async fn scan_multi_body(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    ctrl: &DecodedControl,
+    data: &[u8],
+) -> Result<bool, WireFault> {
     // ── Phase 0: decode + frame-local shape rules ──────────────────────────
     // The authoritative run of the shared shape validator — a client may skip
     // its own. tid legality is Phase 1's, under the catalog lock.
-    let relations = gnitz_wire::txn_frame::decode_scan_multi(data).map_err(|e| format!("decode error: {e}"))?;
+    let relations = gnitz_wire::txn_frame::decode_scan_multi(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
     validate_item_ids("SCAN_MULTI", &relations, |r| r.0)?;
 
     // Drain once if any target is a stale view — the same test `read_lock` runs
@@ -2032,7 +1967,6 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
                         excl.write(&DirectGroup {
                             template: ipc::WireMsg {
                                 target_id: plan.tid as u64,
-                                client_id,
                                 flags: WireFlags {
                                     schema_version: plan.server_version,
                                     ..Default::default()
@@ -2057,10 +1991,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     for (plan, d) in plans.iter().zip(&dispatches) {
         // Preliminary schema-only frame first, when captured in Phase 1.
         if let Some(block) = plan.block.as_ref() {
-            send_msg(
-                peer,
-                prelim_schema_msg(plan.tid, client_id, plan.server_version, block.as_slice()),
-            );
+            send_msg(peer, prelim_schema_msg(plan.tid, plan.server_version, block.as_slice()));
         }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
@@ -2070,7 +2001,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             Err(f) => return Err(f),
         }
         // Terminal frame for this relation (tid + the shared LSN).
-        send_msg(peer, terminal_scan_msg(plan.tid, client_id, lsn as u128));
+        send_msg(peer, terminal_scan_msg(plan.tid, lsn, 0));
         // This relation's reply is complete: carry no more than the budget into
         // the next, and learn here rather than at the end if the client is gone.
         if peer.flush_if_full().await < 0 {
@@ -2086,7 +2017,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
 /// Takes NO lock: the caller holds the catalog read guard, and `read_ok` is
 /// `!has_writer && writers_waiting == 0`, so a nested read parks forever the
 /// moment a DDL writer queues.
-async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
+async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, target_id: i64, client_version: u16) {
     match guard_panic("scan", || shared.cat_mut().scan(target_id)) {
         Ok((b, _)) => {
             let batch_ref = if !b.is_empty() { Some(b) } else { None };
@@ -2095,12 +2026,11 @@ async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
                 peer,
                 target_id,
                 batch_ref.as_deref(),
-                client_id,
-                shared.last_tick_lsn.get() as u128,
+                shared.last_tick_lsn.get(),
                 client_version,
             );
         }
-        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()),
+        Err(e) => send_error(peer, target_id, e.as_bytes()),
     }
 }
 
@@ -2134,7 +2064,7 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
         out.set_len(total);
     }
     out[base..base + PFX].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = msg.encode(&mut out[base + PFX..total], 0, false);
+    let written = msg.encode(&mut out[base + PFX..total]);
     debug_assert_eq!(written, sz);
     out.truncate(base + PFX + written);
 }
@@ -2154,9 +2084,8 @@ fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
         let text = ipc::oversized_frame_message(sz);
         let fallback = ipc::WireMsg {
             target_id: msg.target_id,
-            client_id: msg.client_id,
             status: WireStatus::Error,
-            error_msg: text.as_bytes(),
+            blob: text.as_bytes(),
             ..Default::default()
         };
         peer.cork_with(|out| encode_response_into(out, fallback));
@@ -2170,8 +2099,7 @@ fn send_ok_response(
     peer: &Peer,
     target_id: i64,
     result: Option<&Batch>,
-    client_id: u64,
-    seek_pk: u128,
+    arg0: u64,
     client_version: u16,
 ) {
     let (server_version, schema_block) = schema_block_for_reply(shared, target_id, client_version);
@@ -2180,12 +2108,11 @@ fn send_ok_response(
         peer,
         ipc::WireMsg {
             target_id: target_id as u64,
-            client_id,
             flags: WireFlags {
                 schema_version: server_version,
                 ..Default::default()
             },
-            seek_pk,
+            arg0,
             data: result.map_or(ipc::WireData::None, ipc::WireData::Whole),
             schema_block: schema_arg,
             ..Default::default()
@@ -2198,35 +2125,34 @@ fn send_ok_response(
 /// schema-mismatch and no-index statuses, and an id allocation, whose answer *is*
 /// the target id. Not every header-only frame goes out through here:
 /// `terminal_scan_msg` and the DDL/TXN ACKs build their own, because each
-/// carries a meaning in `seek_pk` this wrapper has no parameter for.
-fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: WireStatus) {
-    send_status_frame(peer, target_id, client_id, status, &[])
+/// carries a meaning in `arg0` this wrapper has no parameter for.
+fn send_control_only(peer: &Peer, target_id: i64, status: WireStatus) {
+    send_status_frame(peer, target_id, status, &[])
 }
 
 /// One control-only reply frame carrying `status` verbatim. No schema block: the
 /// client ignores both it and the schema version on a failure, so `flags` stays at
 /// its default and the cache lookup is skipped.
-fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: WireStatus, error_msg: &[u8]) {
+fn send_status_frame(peer: &Peer, target_id: i64, status: WireStatus, text: &[u8]) {
     send_msg(
         peer,
         ipc::WireMsg {
             target_id: target_id as u64,
-            client_id,
             status,
-            error_msg,
+            blob: text,
             ..Default::default()
         },
     )
 }
 
 /// A failure carrying its own status, master-minted or forwarded from a worker.
-fn send_fault(peer: &Peer, target_id: i64, client_id: u64, fault: &WireFault) {
-    send_status_frame(peer, target_id, client_id, fault.status, fault.text.as_bytes())
+fn send_fault(peer: &Peer, target_id: i64, fault: &WireFault) {
+    send_status_frame(peer, target_id, fault.status, fault.text.as_bytes())
 }
 
 /// A rejection that carries no status of its own, and so is `WireStatus::Error`.
-fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8]) {
-    send_status_frame(peer, target_id, client_id, WireStatus::Error, error_msg)
+fn send_error(peer: &Peer, target_id: i64, text: &[u8]) {
+    send_status_frame(peer, target_id, WireStatus::Error, text)
 }
 
 /// Why a stream cannot accept this push, or `None` if it can. Both rules restate

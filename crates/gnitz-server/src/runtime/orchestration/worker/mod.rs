@@ -46,6 +46,10 @@ struct Request {
     /// generation. Travels with the message, so a replayed tick stamps the round
     /// that produced its delta rather than whatever a counter has reached.
     lsn: u64,
+    /// The group's request id, which every reply answers on.
+    request_id: u32,
+    /// Whether each reply must reach the ring in request order.
+    fifo: bool,
     wire: ipc::DecodedWire,
 }
 
@@ -250,15 +254,14 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
     }
 }
 
-/// Where one reply goes and how: the relation it names, the two ids the master
-/// reactor routes it by, and whether it must reach the ring in request order.
-/// `dispatch_inner` resolves them together, so no reply helper takes them apart
-/// — and no arm can forget the ordering directive its group carried.
+/// Where one reply goes and how: the relation it names, the request id the
+/// master reactor routes it by, and whether it must reach the ring in request
+/// order. `dispatch_inner` resolves them together, so no reply helper takes them
+/// apart — and no arm can forget the ordering directive its group carried.
 #[derive(Clone, Copy, Default)]
 struct ReplyRoute {
     target_id: u64,
-    request_id: u64,
-    client_id: u64,
+    request_id: u32,
     /// Queue the reply behind earlier trains even when it fits one frame.
     fifo: bool,
 }
@@ -314,7 +317,7 @@ impl WorkerProcess {
     /// Never returns normally. A boot that failed does not reach here at all:
     /// the fork child reports it on the W2M ring and exits. The ready ACK answers
     /// `ready_request_id`, which the master leases before it collects.
-    pub fn run(&mut self, ready_request_id: u64) -> i32 {
+    pub fn run(&mut self, ready_request_id: u32) -> i32 {
         self.send_ack(0, ready_request_id);
 
         loop {
@@ -386,8 +389,14 @@ impl WorkerProcess {
     /// point: both dispatchers and every parked request come through here.
     fn decode_request(&mut self, msg: &SalMessage, wire: &'static [u8]) -> Request {
         // Fail-stop: a dropped group diverges this worker from the master.
-        match ipc::decode_sal_slot(wire, false) {
-            Ok(w) => Request { kind: msg.kind, lsn: msg.lsn, wire: w },
+        match ipc::decode_sal_slot(wire) {
+            Ok(w) => Request {
+                kind: msg.kind,
+                lsn: msg.lsn,
+                request_id: msg.request_id,
+                fifo: msg.in_request_order,
+                wire: w,
+            },
             Err(e) => self.fatal_shutdown(&format!(
                 "failed to decode {:?} for tid={}: {e}",
                 msg.kind, msg.target_id
@@ -428,11 +437,9 @@ impl WorkerProcess {
     /// pair, or park it in `pending_relays` for a later one.
     fn take_or_park_relay(&mut self, relay_wait: (i64, i64), req: Request) -> Option<RelayHit> {
         let ipc::DecodedWire { control, schema, data_batch } = req.wire;
-        let target_id = control.target_id as i64;
-        // source_id is echoed back via seek_pk; the backfill round decision rides
-        // in flags.backfill.
-        let key = (target_id, control.seek_pk as i64);
-        let decision = control.flags.backfill;
+        let target_id = control.hdr.target_id as i64;
+        let key = (target_id, control.hdr.arg0 as i64);
+        let decision = control.hdr.flags.backfill;
         // Header-only relay: the master stamps a schema block onto every slot of
         // a relay group, so an empty batch built from the relayed schema is the
         // correct payload. A schema-less relay would leave no way to build it
@@ -453,7 +460,7 @@ impl WorkerProcess {
     /// place a worker's reply status is chosen, and the one fatal path a failed
     /// DDL takes.
     fn handle_request(&mut self, req: Request) {
-        let (kind, request_id, target_id) = (req.kind, req.wire.control.request_id, req.wire.control.target_id);
+        let (kind, request_id, target_id) = (req.kind, req.request_id, req.wire.control.hdr.target_id);
         if let Err(fault) = self.dispatch_inner(req) {
             self.send_fault(&fault, request_id);
             if kind == SalMessageKind::DdlSync {
@@ -467,24 +474,23 @@ impl WorkerProcess {
     }
 
     fn dispatch_inner(&mut self, req: Request) -> Result<(), gnitz_wire::WireFault> {
-        let Request { kind, lsn, wire: mut decoded } = req;
-        let target_id = decoded.control.target_id as i64;
-        let request_id = decoded.control.request_id;
-        let seek_pk = decoded.control.seek_pk;
-        let seek_col_idx = decoded.control.seek_col_idx;
-        let client_id = decoded.control.client_id;
-        let flags = decoded.control.flags;
-        // The version the reader holds: the one the master negotiated for it.
-        let client_version = flags.schema_version;
-        let route = ReplyRoute {
-            target_id: target_id as u64,
+        let Request {
+            kind,
+            lsn,
             request_id,
-            client_id,
-            fifo: flags.scan_fifo_reply,
+            fifo,
+            wire: mut decoded,
+        } = req;
+        let hdr = decoded.control.hdr;
+        let target_id = hdr.target_id as i64;
+        // The version the reader holds: the one the master negotiated for it.
+        let client_version = hdr.flags.schema_version;
+        let route = ReplyRoute {
+            target_id: hdr.target_id,
+            request_id,
+            fifo,
         };
-        // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Taken
-        // (not cloned) — nothing reads the control block after this point.
-        let seek_pk_extra: Vec<u8> = std::mem::take(&mut decoded.control.seek_pk_extra);
+        let blob: Vec<u8> = std::mem::take(&mut decoded.control.blob);
         let batch = decoded.data_batch;
 
         match kind {
@@ -527,9 +533,8 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Backfill => {
-                // `target_id` is the source table; `seek_pk` carries the view to
-                // drive. Stop-the-world (the DDL parks the reactor): no yield.
-                self.handle_backfill(target_id, seek_pk as i64)?;
+                // Stop-the-world (the DDL parks the reactor): no yield.
+                self.handle_backfill(target_id, hdr.arg0 as i64)?;
                 self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
@@ -538,13 +543,13 @@ impl WorkerProcess {
                 let Some(batch) = batch else {
                     return Err("has_pk: a probe carries its keys".into());
                 };
-                let lookup = match gnitz_wire::probe_key_columns(seek_col_idx) {
+                let lookup = match gnitz_wire::probe_key_columns(hdr.arg1) {
                     None => HasPkLookup::PrimaryKey,
                     Some(packed) => HasPkLookup::SecondaryIndex {
                         cols: self.cat().registry().index_cols(target_id, packed, "has_pk")?,
                     },
                 };
-                self.handle_has_pk(route, batch, lookup, flags.probe_mode, seek_pk as usize)
+                self.handle_has_pk(route, batch, lookup, hdr.flags.probe_mode, hdr.arg0 as usize)
             }
 
             SalMessageKind::Push => {
@@ -569,22 +574,19 @@ impl WorkerProcess {
                 Ok(())
             }
 
-            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &seek_pk_extra, client_version),
-            SalMessageKind::DeltaRead => {
-                self.answer_delta_read(route, seek_col_idx, seek_pk as u64, &seek_pk_extra, client_version)
-            }
+            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &blob, client_version),
+            SalMessageKind::DeltaRead => self.answer_delta_read(route, hdr.arg1, hdr.arg0, &blob, client_version),
 
             SalMessageKind::UniquePreflight => {
                 // CREATE UNIQUE INDEX global pre-flight: project this worker's
-                // committed partition of `target_id` to OPK leading-key spans for
-                // the column list in `seek_col_idx` (packed via pack_pk_cols),
+                // committed partition of `target_id` to OPK leading-key spans,
                 // sort them, and stream the sorted spans back for the master's
                 // k-way merge. An error here surfaces as the terminal fault frame
                 // the master's merge expects (send_fault in handle_request).
                 let cols = self
                     .cat()
                     .registry()
-                    .index_cols(target_id, seek_col_idx, "unique pre-flight")?;
+                    .index_cols(target_id, hdr.arg1, "unique pre-flight")?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
             }
@@ -658,12 +660,12 @@ impl WorkerProcess {
     fn answer_scan_spec(
         &mut self,
         route: ReplyRoute,
-        seek_pk_extra: &[u8],
+        blob: &[u8],
         client_version: u16,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
-        let (spec, reply_block) = gnitz_wire::ReadSpec::decode(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
-        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, false)
+        let (spec, reply_block) = gnitz_wire::ReadSpec::decode(blob).map_err(|e| format!("scan_spec: {e}"))?;
+        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
         self.send_shared_scan_response(route, keeper, ReplySchema::ReaderHeld, client_version);
@@ -680,7 +682,7 @@ impl WorkerProcess {
         client_version: u16,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
-        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, false)
+        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
             .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
         let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
         self.send_shared_scan_response(route, keeper, ReplySchema::ReaderHeld, client_version);
@@ -817,7 +819,7 @@ impl WorkerProcess {
     /// the master sends this command inside the DDL critical section
     /// (committer barrier drained, catalog write lock held), before the
     /// IDX_TAB +1 broadcast, so no concurrent INSERT can interleave.
-    fn handle_unique_preflight(&mut self, owner_id: i64, col_indices: &[u32], request_id: u64) -> Result<(), String> {
+    fn handle_unique_preflight(&mut self, owner_id: i64, col_indices: &[u32], request_id: u32) -> Result<(), String> {
         if UNIQUE_PREFLIGHT_ERROR.armed() {
             return Err("injected unique pre-flight fault".to_string());
         }
@@ -894,8 +896,8 @@ impl WorkerProcess {
         let target_id = route.target_id as i64;
         let n = batch.len();
         if let gnitz_wire::WireProbeMode::Project = mode {
-            // `seek_col_idx` is the PK sentinel here, so the column to project
-            // rides the per-mode parameter word instead.
+            // `arg1` is the PK sentinel here, so the column to project rides the
+            // per-mode parameter word instead.
             if !matches!(lookup, HasPkLookup::PrimaryKey) {
                 return Err("has_pk: a projecting probe reads the table's own PK store".into());
             }

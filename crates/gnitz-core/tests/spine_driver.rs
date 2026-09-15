@@ -132,7 +132,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     assert_eq!(s.interest(), Interest::NONE);
     // The blocking client and the driver agree on the table.
     assert_eq!(blocking.scan(tid).unwrap().batch.len(), n * per);
-    assert_eq!(blocking.seek(tid, 7, &[]).unwrap().batch.len(), 1);
+    assert_eq!(blocking.seek(tid, &7u64.to_le_bytes()).unwrap().batch.len(), 1);
 }
 
 #[test]

@@ -239,10 +239,9 @@ impl MasterDispatcher {
         checkpoint_allowed: bool,
         write: impl FnOnce(&SalExcl<'_>, GroupTargets) -> Result<(), WireFault>,
     ) -> Result<(), WireFault> {
-        let nw = self.num_workers();
-        let lease = self.reactor.lease_acks(nw);
-        write(&self.sal.lock_exclusive(), GroupTargets::all(lease.base()))?;
-        self.collect_exclusive(&lease, nw, ctx, checkpoint_allowed)
+        let lease = self.reactor.lease_acks(1, WorkerSet::ALL);
+        write(&self.sal.lock_exclusive(), GroupTargets::all(lease.id(0)))?;
+        self.collect_exclusive(&lease, 1, ctx, checkpoint_allowed)
     }
 
     // -----------------------------------------------------------------------
@@ -310,19 +309,18 @@ impl MasterDispatcher {
     /// Write `round`'s flush group, wait for every worker's ACK, finalize.
     pub(crate) async fn checkpoint_round(&self, excl: &mut SalExcl<'_>, round: FlushRound) -> Result<(), WireFault> {
         let ctx = round.phase();
-        let nw = self.num_workers();
-        let lease = self.reactor.lease_acks(nw);
+        let lease = self.reactor.lease_acks(1, WorkerSet::ALL);
         self.note_flush_round(round);
         excl.write(&DirectGroup {
             lsn: round.lsn(),
-            targets: GroupTargets::all(lease.base()),
+            targets: GroupTargets::all(lease.id(0)),
             ..DirectGroup::new(round.kind())
         })?;
         // `excl` is held through the ACKs, so its drop would wake too late.
         excl.wake();
         match select2(
-            lease.acks(nw, |w, c| worker_error(w, ctx, c)),
-            self.round_failure(&lease, nw, ctx),
+            lease.acks(1, |w, c| worker_error(w, ctx, c)),
+            self.round_failure(&lease, 1, ctx),
         )
         .await
         {
@@ -364,7 +362,7 @@ impl MasterDispatcher {
 
     /// Build the SAL group an exchange relay writes and hand it to `f`: sizing and
     /// emission both go through here, so the bytes checked are the bytes written.
-    /// `seek_pk` echoes `source_id`, so a join's wait cannot take another source's relay.
+    /// `arg0` echoes `source_id`, so a join's wait cannot take another source's relay.
     fn with_relay_group<R>(
         &self,
         view: &wire::WireSchema,
@@ -374,7 +372,7 @@ impl MasterDispatcher {
         f: impl FnOnce(&DirectGroup) -> R,
     ) -> R {
         let template = view.frame(wire::WireMsg {
-            seek_pk: source_id as u128,
+            arg0: source_id as u64,
             flags: WireFlags { backfill: decision, ..Default::default() },
             ..Default::default()
         });
@@ -479,8 +477,7 @@ impl MasterDispatcher {
     // Fan-out operations
     // -----------------------------------------------------------------------
 
-    /// Distributed backfill of ONE view from `source_id`; `view_id` rides to
-    /// the worker in the frame's `seek_pk`. Always view-scoped — the source may
+    /// Distributed backfill of ONE view from `source_id`. Always view-scoped — the source may
     /// already have populated dependents (live CREATE VIEW; recovery step-4
     /// rebuild next to resumed siblings) that a closure re-drive would
     /// double-count.
@@ -505,7 +502,7 @@ impl MasterDispatcher {
         // stamps `Batch.schema` on the worker side.
         let source = wire::WireSchema::encoded(source_id, self.schema_desc_for(source_id));
         let template = source.frame(wire::WireMsg {
-            seek_pk: view_id as u128,
+            arg0: view_id as u64,
             ..Default::default()
         });
         self.exclusive_round("backfill relay", true, |excl, t| {
@@ -731,15 +728,16 @@ impl MasterDispatcher {
         }
     }
 
-    /// Lay one push batch out as a SAL group inside `scope`, worker `w` answering
-    /// on `base + w`. `recoverable` puts it inside the zone; a stream's rows ride
-    /// outside. The committer commits the scope and awaits the ACKs.
+    /// Lay one push batch out as a SAL group inside `scope`, every worker
+    /// answering on `request_id`. `recoverable` puts it inside the zone; a
+    /// stream's rows ride outside. The committer commits the scope and awaits the
+    /// ACKs.
     pub(crate) fn write_commit_group(
         &self,
         scope: &SalScope,
         target_id: i64,
         batch: &Batch,
-        base: u64,
+        request_id: u32,
         recoverable: bool,
     ) -> Result<(), WireFault> {
         let relation = self.wire_schema(target_id);
@@ -748,7 +746,7 @@ impl MasterDispatcher {
         // keeps the atomic-zone framing, LSN, ACK accounting, and the committer's
         // single `fdatasync` shared between them.
         let group = DirectGroup {
-            targets: GroupTargets::all(base),
+            targets: GroupTargets::all(request_id),
             ..DirectGroup::new(SalMessageKind::Push)
         };
         // A replicated relation broadcasts: the whole batch lands in every

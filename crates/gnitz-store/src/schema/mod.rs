@@ -477,7 +477,7 @@ impl SchemaDescriptor {
             k += 1;
         }
         assert!(stride_acc <= u8::MAX as u16, "new: pk_stride exceeds u8 width",);
-        // `seek_opk_bytes` and other wide-path routines allocate
+        // Wide-path routines allocate
         // `[0u8; MAX_PK_BYTES]` and index up to `stride`; a stride in
         // (MAX_PK_BYTES, 255] would construct here but panic at runtime.
         assert!(
@@ -914,8 +914,8 @@ pub fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Resu
 /// the engine's own type; column names are carried but nothing engine-side reads
 /// one. The arity bound is `MAX_PK_COLUMNS`, the engine's own limit, deliberately
 /// wider than the client's `PK_LIST_MAX_COLS`.
-pub fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
-    let sb = gnitz_wire::schema_block::SchemaBlock::decode(data, verify_checksum, MAX_PK_COLUMNS)?;
+pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
+    let sb = gnitz_wire::schema_block::SchemaBlock::decode(data, false, MAX_PK_COLUMNS)?;
     let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (col, c) in cols[..sb.num_columns()].iter_mut().zip(sb.columns()) {
         *col = SchemaColumn::new(c.type_code, c.meta.nullable as u8);

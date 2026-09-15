@@ -1,6 +1,6 @@
 //! The relation-descriptor blob: everything a statement needs to know about one
-//! relation beyond its column layout, carried in a RESOLVE reply's control-block
-//! `seek_pk_extra` slot alongside the schema block.
+//! relation beyond its column layout, carried in a RESOLVE reply's control-header
+//! blob alongside the schema block.
 //!
 //! The split from the schema block is by cost, not by category: that block is
 //! built once per table, cached, and re-sent on every cold scan, seek, push and

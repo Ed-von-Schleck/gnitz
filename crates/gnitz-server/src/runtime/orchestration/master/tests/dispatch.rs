@@ -84,10 +84,10 @@ fn an_exclusive_round_fails_on_a_worker_error_without_the_other_acks() {
     let (disp, writers) = test_dispatcher_with_writers(vec![0, 0]);
     let err = disp
         .exclusive_round("backfill relay", false, |_, targets| {
-            let GroupTargets::Leased { base, .. } = targets else {
+            let GroupTargets::Leased { request_id, .. } = targets else {
                 unreachable!("an exclusive round broadcasts")
             };
-            writers[0].send_status(0, base, gnitz_wire::WireStatus::Error, b"boom");
+            writers[0].send_status(0, request_id, gnitz_wire::WireStatus::Error, b"boom");
             Ok(())
         })
         .expect_err("a worker's error ACK must fail the round");

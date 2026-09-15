@@ -136,7 +136,10 @@ fn cloned_handles_across_tasks_each_get_their_own_result() {
 
     // Every read verb, and a seek whose row is its own.
     assert_eq!(rt.block_on(client.scan(tid)).unwrap().batch.len(), n * 10);
-    assert_eq!(rt.block_on(client.seek(tid, 7, &[])).unwrap().batch.len(), 1);
+    assert_eq!(
+        rt.block_on(client.seek(tid, &7u64.to_le_bytes())).unwrap().batch.len(),
+        1
+    );
     let many = rt.block_on(client.scan_many(&[tid, tid])).unwrap_err();
     assert!(
         matches!(many, gnitz_core::ClientError::ServerError(_)),

@@ -2,14 +2,14 @@ use super::fixtures::{group_and_next, group_at, TestLog};
 use super::{
     effective_max, group_digest, group_header_size, group_total_size, pack_prefix, DirectGroup, EpochGate, GroupData,
     GroupTargets, SalMessageKind, SalReader, SalStep, WorkerSet, CHECKPOINT_RESERVE, MIN_SAL_BYTES, OFF_DIGEST,
-    OFF_KIND, OFF_ZONE_START, PREFIX_BYTES, SENTINEL_SIZE,
+    OFF_IN_REQUEST_ORDER, OFF_KIND, OFF_ZONE_START, PREFIX_BYTES, SENTINEL_SIZE,
 };
 use crate::runtime::test_support::{assert_child_exited_ok, try_poll_once};
 use crate::runtime::w2m::fixtures::sal_wake_seq;
 use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
 use crate::test_support::{make_batch_raw, sweep_bit_flips};
 use gnitz_wire::align8;
-use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::MAX_WORKERS;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -130,7 +130,7 @@ fn a_group_wider_than_max_workers_is_a_logic_fault() {
 fn worst_case_terminal_group() -> usize {
     group_total_size(
         group_header_size(MAX_WORKERS),
-        std::iter::repeat_n(CTRL_BLOCK_SIZE_NO_BLOB as u32, MAX_WORKERS),
+        std::iter::repeat_n(CTRL_HEADER_SIZE as u32, MAX_WORKERS),
     )
 }
 
@@ -199,7 +199,7 @@ fn terminal_and_sentinel_fit_where_an_ordinary_group_does_not() {
     log.sentinel(0);
 
     log.seek(cursor, 1);
-    let flush_slots = vec![&[0u8; CTRL_BLOCK_SIZE_NO_BLOB][..]; MAX_WORKERS];
+    let flush_slots = vec![&[0u8; CTRL_HEADER_SIZE][..]; MAX_WORKERS];
     log.try_write(0, 0, SalMessageKind::Flush, false, &flush_slots)
         .expect("a MAX_WORKERS checkpoint round must still fit");
 }
@@ -312,7 +312,7 @@ fn sal_cross_process_checkpoint() {
             };
             // Round 2 is written at cursor 0 of the next epoch.
             reader.rewind();
-            writer.send_status(slot[0] as u64, msg.lsn, gnitz_wire::WireStatus::Ok, b"");
+            writer.send_status(slot[0] as u64, msg.lsn as u32, gnitz_wire::WireStatus::Ok, b"");
         }
         unsafe { libc::_exit(0) };
     }
@@ -323,8 +323,7 @@ fn sal_cross_process_checkpoint() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if let Some(slot) = receiver.try_read_slot(0) {
-                let ctrl = slot.control();
-                return (ctrl.request_id, ctrl.target_id);
+                return (slot.internal_req_id, slot.control().hdr.target_id);
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -345,37 +344,31 @@ fn sal_cross_process_checkpoint() {
     unsafe { assert_child_exited_ok(pid) };
 }
 
-/// Membership, rank and the launched-worker bound, at a small worker count and
-/// at the full word.
+/// Membership and the launched-worker bound, at a small worker count and at the
+/// full word.
 #[test]
-fn a_worker_set_ranks_its_members_and_bounds_to_the_launched_workers() {
+fn a_worker_set_bounds_to_the_launched_workers() {
     let s = WorkerSet::one(1).with(3).with(6);
     assert_eq!(s.len(), 3);
-    assert_eq!((s.rank(1), s.rank(3), s.rank(6)), (0, 1, 2));
     assert!(s.contains(3) && !s.contains(2));
     assert_eq!(s.within(4), WorkerSet::one(1).with(3));
     assert_eq!(s.iter().collect::<Vec<_>>(), vec![1, 3, 6]);
 
     assert_eq!(WorkerSet::ALL.within(4).len(), 4);
-    assert_eq!(WorkerSet::ALL.rank(3), 3, "rank is the worker itself over every worker");
     assert_eq!(WorkerSet::ALL.within(MAX_WORKERS), WorkerSet::ALL);
     assert_eq!(WorkerSet::ALL.within(MAX_WORKERS).len(), MAX_WORKERS);
-    assert_eq!(WorkerSet::ALL.rank(MAX_WORKERS - 1), MAX_WORKERS as u64 - 1);
-    assert_eq!(WorkerSet::one(MAX_WORKERS - 1).rank(MAX_WORKERS - 1), 0);
     assert_eq!(WorkerSet::EMPTY.len(), 0);
 }
 
-/// A group leased to 2 of 4 workers writes only those slots, answering on
-/// consecutive ids in worker order, and is sized for exactly those slots.
+/// A group leased to 2 of 4 workers writes only those slots, both answering on
+/// the one request id, and is sized for exactly those slots.
 #[test]
-fn a_leased_group_writes_only_its_set_on_consecutive_ids() {
-    use crate::runtime::wire::decode_sal_slot;
-
+fn a_leased_group_writes_only_its_set_on_one_id() {
     let log = TestLog::new(1 << 20, 4, 1);
     let group = DirectGroup {
         targets: GroupTargets::Leased {
             set: WorkerSet::one(1).with(3),
-            base: 40,
+            request_id: 40,
             in_request_order: true,
         },
         ..DirectGroup::new(SalMessageKind::Scan)
@@ -384,16 +377,19 @@ fn a_leased_group_writes_only_its_set_on_consecutive_ids() {
     let before = log.cursor();
     log.writer.write(&group).expect("group fits");
     assert_eq!((log.cursor() - before) as usize, predicted);
+    log.writer
+        .write(&DirectGroup::new(SalMessageKind::Scan))
+        .expect("group fits");
 
-    let msg = group_at(log.log(), before);
-    let written: Vec<(u32, u64, bool)> = msg
-        .slots_written()
-        .map(|(w, bytes)| {
-            let c = decode_sal_slot(bytes, false).expect("a slot decodes").control;
-            (w, c.request_id, c.flags.scan_fifo_reply)
-        })
-        .collect();
-    assert_eq!(written, vec![(1, 40, true), (3, 41, true)]);
+    for w in 0..4u32 {
+        let reader = SalReader::new(log.log(), w, 0);
+        let mut read = std::iter::from_fn(|| reader.next().map(|(m, _)| (m.request_id, m.in_request_order)));
+        if w == 1 || w == 3 {
+            assert_eq!(read.next(), Some((40, true)), "worker {w} reads the leased group");
+        }
+        assert_eq!(read.next(), Some((0, false)), "worker {w} reads the unaddressed group");
+        assert_eq!(read.next(), None, "worker {w}");
+    }
 }
 
 /// Dropping a `SalExcl` wakes each worker a group written under it reached —
@@ -403,7 +399,11 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     let log = TestLog::new(1 << 20, 4, 1);
     let seqs = || (0..4).map(|w| unsafe { sal_wake_seq(log.ring(w)) }).collect::<Vec<_>>();
     let leased = |set| DirectGroup {
-        targets: GroupTargets::Leased { set, base: 1, in_request_order: false },
+        targets: GroupTargets::Leased {
+            set,
+            request_id: 1,
+            in_request_order: false,
+        },
         ..DirectGroup::new(SalMessageKind::Scan)
     };
 
@@ -690,8 +690,8 @@ fn footprint_equals_emitted_bytes() {
     let group = DirectGroup {
         template: WireMsg {
             target_id: 16,
-            seek_pk: 7,
-            seek_col_idx: 1,
+            arg0: 7,
+            arg1: 1,
             schema_block: Some(&block),
             ..Default::default()
         },
@@ -709,7 +709,7 @@ fn footprint_equals_emitted_bytes() {
     );
 }
 
-/// A group carrying per-worker extras writes each slot its own `seek_pk_extra`,
+/// A group carrying per-worker extras writes each slot its own blob,
 /// sized to that blob rather than to the template's.
 #[test]
 fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
@@ -721,7 +721,7 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
     let group = DirectGroup {
         template: WireMsg {
             target_id: 16,
-            seek_pk_extra: &[9; 7],
+            blob: &[9; 7],
             ..Default::default()
         },
         extras: Some(&extras),
@@ -736,8 +736,8 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
     let msg = group_at(log.log(), before);
     for (w, extra) in extras.iter().enumerate() {
         let slot = msg.slot(w as u32).expect("every worker is written");
-        let decoded = decode_sal_slot(slot, false).expect("a slot decodes");
-        assert_eq!(decoded.control.seek_pk_extra, *extra, "worker {w}");
+        let decoded = decode_sal_slot(slot).expect("a slot decodes");
+        assert_eq!(decoded.control.blob, *extra, "worker {w}");
     }
     let sizes: Vec<usize> = (0..nw as u32).map(|w| msg.slot(w).unwrap().len()).collect();
     assert!(
@@ -746,9 +746,9 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
     );
 }
 
-/// In one scope, only the zoned group's slot carries checksums.
+/// In one scope, only the zoned group's slot carries a checksum.
 #[test]
-fn only_a_zoned_slot_carries_checksums() {
+fn only_a_zoned_slot_carries_a_checksum() {
     use crate::runtime::wire::decode_sal_slot;
     use crate::test_support::{make_batch, make_schema_u64_i64};
 
@@ -763,15 +763,15 @@ fn only_a_zoned_slot_carries_checksums() {
 
     let zoned_msg = group_at(log.log(), zoned);
     let zoned_slot = zoned_msg.slot(0).expect("slot 0 is written");
-    decode_sal_slot(zoned_slot, true).expect("a zoned slot verifies");
+    assert!(zoned_msg.slot_intact(0, zoned_slot), "a zoned slot verifies");
 
     let unzoned_msg = group_at(log.log(), unzoned);
     let unzoned_slot = unzoned_msg.slot(0).expect("slot 0 is written");
     assert!(
-        decode_sal_slot(unzoned_slot, true).is_err(),
+        !unzoned_msg.slot_intact(0, unzoned_slot),
         "an unzoned slot carries no checksum to verify"
     );
-    let decoded = decode_sal_slot(unzoned_slot, false).expect("an unzoned slot decodes unverified");
+    let decoded = decode_sal_slot(unzoned_slot).expect("an unzoned slot decodes");
     assert_eq!(decoded.data_batch.map(|b| b.len()), Some(2));
 }
 
@@ -829,7 +829,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
     let msg = group_at(log.log(), 0);
     let mut with_rows = 0;
     for (w, bytes) in msg.slots_written() {
-        let decoded = decode_sal_slot(bytes, false).expect("every written slot decodes");
+        let decoded = decode_sal_slot(bytes).expect("every written slot decodes");
         match decoded.data_batch {
             Some(b) => {
                 with_rows += 1;
@@ -861,7 +861,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
         .expect("group fits");
     let relay = group_at(log.log(), base);
     for (w, bytes) in relay.slots_written() {
-        let decoded = decode_sal_slot(bytes, false).expect("every written slot decodes");
+        let decoded = decode_sal_slot(bytes).expect("every written slot decodes");
         assert!(
             decoded.schema.is_some(),
             "relay slot {w} builds its empty batch from the block"
@@ -1044,6 +1044,15 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
     assert!(
         matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
         "a zone-start byte outside {{0, 1}} must read as corruption"
+    );
+
+    restamp_header(&log, |hdr| {
+        hdr[OFF_ZONE_START] = 0;
+        hdr[OFF_IN_REQUEST_ORDER] = 2;
+    });
+    assert!(
+        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+        "a request-order byte outside {{0, 1}} must read as corruption"
     );
 }
 

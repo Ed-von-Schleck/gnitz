@@ -55,7 +55,7 @@ fn a_crafted_pk_col_count_is_rejected_at_unpack() {
 }
 
 /// A flag-clear word names no column list, whatever its other bits say. `0` is
-/// the one a `seek_col_idx` carries when it means the relation's own PK store,
+/// the one an `arg1` carries when it means the relation's own PK store,
 /// and a non-zero one would otherwise read as "the index on column 7".
 #[test]
 fn a_flag_clear_word_is_refused() {

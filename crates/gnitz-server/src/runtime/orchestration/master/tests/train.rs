@@ -43,7 +43,7 @@ impl DrainFixture {
         std::mem::forget(Rc::clone(&receiver));
 
         let reactor = Rc::new(crate::runtime::test_support::make_reactor_over(Rc::clone(&receiver)));
-        let lease = reactor.lease_train(n_workers);
+        let lease = reactor.lease_train(crate::runtime::sal::WorkerSet::ALL);
         let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(partner);
         let peer = Peer::unix(std::os::fd::OwnedFd::from(peer_sock), Rc::clone(&reactor));
@@ -56,9 +56,9 @@ impl DrainFixture {
         self.reactor.route_w2m_for_test();
     }
 
-    /// Reply `i`'s request id, as the reactor keys it.
-    fn req(&self, i: usize) -> u32 {
-        self.lease.id(i) as u32
+    /// The request id every worker's train answers on.
+    fn req(&self) -> u32 {
+        self.lease.id(0)
     }
 }
 
@@ -93,7 +93,7 @@ fn send_frame(
     req: u32,
     flags: WireFlags,
     status: WireStatus,
-    error_msg: &[u8],
+    text: &[u8],
     schema: Option<&SchemaDescriptor>,
     batch: Option<&Batch>,
 ) -> usize {
@@ -103,12 +103,12 @@ fn send_frame(
         target_id: 1,
         flags,
         status,
-        error_msg,
+        blob: text,
         schema_block: block.as_deref(),
         data: batch.map_or(ipc::WireData::None, ipc::WireData::Whole),
         ..Default::default()
     };
-    writer.send_msg(req as u64, &msg);
+    writer.send_msg(req, &msg);
     msg.size() + gnitz_wire::FRAME_LEN_PREFIX_BYTES
 }
 
@@ -122,7 +122,7 @@ fn poll_once<T>(fut: impl std::future::Future<Output = T>) -> T {
     })
 }
 
-/// A frame must still be routed for reply `i` — the drain returned without
+/// A frame must still be routed for worker `i` — the drain returned without
 /// consuming it. Consumes the frame itself, so it is a terminal check.
 fn assert_frame_still_parked(lease: &Lease, i: usize) {
     assert!(
@@ -137,8 +137,8 @@ fn assert_frame_still_parked(lease: &Lease, i: usize) {
 #[test]
 fn drain_index_scan_errs_immediately_on_fault_frame() {
     let (fx, writers) = DrainFixture::new(2);
-    let w0_req = fx.req(0);
-    let w1_req = fx.req(1);
+    let w0_req = fx.req();
+    let w1_req = fx.req();
 
     fault_frame(&writers[0], w0_req, b"boom");
     frame(&writers[1], w1_req, WireFlags::train_frame(0, false), None, None);
@@ -167,8 +167,8 @@ fn drain_index_scan_merges_chunked_and_single_frame_trains() {
     let single = make_row_batch(schema, &[(4, 1, Some(40)), (5, -1, Some(50))]);
 
     let (fx, writers) = DrainFixture::new(2);
-    let w0_req = fx.req(0);
-    let w1_req = fx.req(1);
+    let w0_req = fx.req();
+    let w1_req = fx.req();
 
     // Worker 0: chunked train — schema on the first frame only.
     frame(
@@ -221,7 +221,7 @@ fn drain_index_scan_rejects_first_frame_schema_mismatch() {
     let batch = make_row_batch(wire_schema, &[(1, 1, Some(10))]);
 
     let (fx, writers) = DrainFixture::new(1);
-    let w0_req = fx.req(0);
+    let w0_req = fx.req();
     frame(
         &writers[0],
         w0_req,
@@ -251,7 +251,7 @@ fn drain_index_scan_sink_error_aborts_drain() {
     let chunk = make_row_batch(schema, &[(1, 1, Some(10))]);
 
     let (fx, writers) = DrainFixture::new(1);
-    let w0_req = fx.req(0);
+    let w0_req = fx.req();
     frame(
         &writers[0],
         w0_req,
@@ -281,7 +281,7 @@ fn drain_index_scan_sink_error_aborts_drain() {
 #[test]
 fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
     let (fx, writers) = DrainFixture::new(1);
-    let w0_req = fx.req(0);
+    let w0_req = fx.req();
     frame(&writers[0], w0_req, WireFlags::train_frame(0, true), None, None);
 
     fx.route();
@@ -307,7 +307,7 @@ fn forward_scan_coalesces_single_frame_heads() {
     let rows_c = make_row_batch(schema, &[(2, 1, Some(20))]);
 
     let (fx, writers) = DrainFixture::new(3);
-    let reqs: Vec<u32> = (0..3).map(|i| fx.req(i)).collect();
+    let reqs: Vec<u32> = (0..3).map(|_| fx.req()).collect();
     let observable_bytes = frame(
         &writers[0],
         reqs[0],

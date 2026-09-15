@@ -333,9 +333,7 @@ mod opk_proptest {
 
 #[test]
 fn seek_opk_bytes_narrow_matches_opk_key() {
-    // For every narrow stride (≤ 16) the wire pair degenerates to `(low, &[])`,
-    // so `seek_opk_bytes` must be byte-identical to a direct `opk_key` of the
-    // native value — both buffer and stride.
+    // A 16-byte word against a narrower stride reads only the stride.
     let cases = [
         pk_only_schema(&[type_code::U8]),  // stride 1
         pk_only_schema(&[type_code::U32]), // stride 4
@@ -351,73 +349,49 @@ fn seek_opk_bytes_narrow_matches_opk_key() {
             &[1, 0],
         ),
     ];
-    // Values spanning zero, small, mixed, and a sign-bit-set word (negative
-    // for the I64 case) so the sign-flip and byte order are exercised. Both
-    // encoders truncate to `stride`, so an over-wide value is a valid probe.
     for s in cases {
         for v in [0u128, 1, 0x0123_4567_89AB_CDEF, 0x8000_0000_0000_0000, u64::MAX as u128] {
             let want = opk_key(&s, &v.to_le_bytes());
-            let got = seek_opk_bytes(&s, v, &[]).expect("narrow seek encodes");
+            let got = seek_opk_bytes(&s, &v.to_le_bytes()).expect("narrow seek encodes");
             assert_eq!(got, want, "narrow seek must match opk_key for {s:?} v={v:#x}");
         }
     }
 }
 
 #[test]
-fn seek_opk_bytes_wide_reproduces_hand_built_opk() {
-    // (U64, U64, U64) = stride 24, wide. The wire pair carries the first 16
-    // native bytes in `low` and the trailing U64 in `extra`, exactly as
-    // `split_ctrl_key` cuts them. All-unsigned ⇒ OPK is each column's
-    // big-endian image, so the expected key is built by hand.
+fn seek_opk_bytes_wide_keys_roundtrip() {
+    // All-unsigned, so the OPK is each column's big-endian image.
     let s = pk_only_schema(&[type_code::U64; 3]);
-    assert_eq!(s.pk_stride(), 24);
-    let (a, b, c): (u64, u64, u64) = (0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 0x0102_0304_0506_0708);
-    // Native LE image = [a_LE, b_LE, c_LE]; the pair's `low` is the first 16
-    // bytes (a in the low half, b in the high half), `extra` is c's 8 bytes.
-    let low = (a as u128) | ((b as u128) << 64);
-    let opk = seek_opk_bytes(&s, low, &c.to_le_bytes()).expect("wide seek encodes");
-    assert_eq!(opk.width(), 24);
-    let want: Vec<u8> = a
-        .to_be_bytes()
-        .into_iter()
-        .chain(b.to_be_bytes())
-        .chain(c.to_be_bytes())
-        .collect();
+    let cols: [u64; 3] = [0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 0x0102_0304_0506_0708];
+    let key: Vec<u8> = cols.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let opk = seek_opk_bytes(&s, &key).expect("24-byte key encodes");
+    let want: Vec<u8> = cols.iter().flat_map(|v| v.to_be_bytes()).collect();
     assert_eq!(opk.pk_bytes(), want.as_slice());
-}
 
-#[test]
-fn seek_opk_bytes_missing_extra_errs_not_panics() {
-    // A wide stride needs `stride - 16` extra bytes; too few must return Err,
-    // never panic — the runtime guard the two dispatch sites rely on.
-    let s = pk_only_schema(&[type_code::U64; 3]);
-    assert!(seek_opk_bytes(&s, 0, &[]).is_err(), "stride 24 with no extra must Err");
-    assert!(seek_opk_bytes(&s, 0, &[0u8; 7]).is_err(), "7 < 8 extra bytes must Err");
-    assert!(
-        seek_opk_bytes(&s, 0, &[0u8; 8]).is_ok(),
-        "exactly 8 extra bytes is enough"
-    );
-}
-
-#[test]
-fn seek_opk_bytes_four_u128_ceiling() {
-    // The widest SQL-reachable PK is 4 columns (PK_LIST_MAX_COLS); 4×U128 =
-    // stride 64 exercises the `le[16..16 + needed]` copy at its ceiling
-    // (`needed == 48`). All-unsigned ⇒ OPK is each column's BE image.
-    // Column 0 rides in `low`; columns 1..4 (48 bytes) in `extra`.
     let s = pk_only_schema(&[type_code::U128; 4]);
-    assert_eq!(s.pk_stride(), 64);
-    let vals: [u128; 4] = [
+    let cols: [u128; 4] = [
         0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
         0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
         0x2122_2324_2526_2728_292A_2B2C_2D2E_2F30,
         0x3132_3334_3536_3738_393A_3B3C_3D3E_3F40,
     ];
-    let extra: Vec<u8> = vals[1..].iter().flat_map(|v| v.to_le_bytes()).collect();
-    let opk = seek_opk_bytes(&s, vals[0], &extra).expect("4×U128 encodes");
-    assert_eq!(opk.width(), 64);
-    let want: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
+    let key: Vec<u8> = cols.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let opk = seek_opk_bytes(&s, &key).expect("64-byte key encodes");
+    let want: Vec<u8> = cols.iter().flat_map(|v| v.to_be_bytes()).collect();
     assert_eq!(opk.pk_bytes(), want.as_slice());
+}
+
+#[test]
+fn seek_opk_bytes_short_key_errs() {
+    for (tc, stride) in [
+        (type_code::U8, 1),
+        (type_code::U32, 4),
+        (type_code::U64, 8),
+        (type_code::U128, 16),
+    ] {
+        let s = pk_only_schema(&[tc]);
+        assert!(seek_opk_bytes(&s, &vec![0u8; stride - 1]).is_err(), "stride {stride}");
+    }
 }
 
 #[test]

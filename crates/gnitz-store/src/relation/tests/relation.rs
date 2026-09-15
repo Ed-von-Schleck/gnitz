@@ -66,17 +66,17 @@ fn test_add_remove_index_circuit() {
     registry.close();
 }
 
-/// `UniquePreflight` hands `index_cols` its `seek_col_idx` raw, where `HasPk` would
+/// `UniquePreflight` hands `index_cols` its `arg1` raw, where `HasPk` would
 /// have read `0` through `probe_key_columns` as the relation's own PK store.
 /// Neither `0` nor a garbage non-zero word names a column list.
 #[test]
-fn a_flag_clear_seek_col_idx_names_no_index() {
+fn a_flag_clear_arg1_names_no_index() {
     let mut registry = solo_registry();
     let schema = SchemaDescriptor::new(
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
         &[0],
     );
-    let owner_dir = relation_test_dir("seek_col_idx_zero_owner");
+    let owner_dir = relation_test_dir("arg1_zero_owner");
     register_entry(&mut registry, 50, schema, RelationKind::BaseTable, owner_dir);
     registry.add_index(50, 999, &[2], false).unwrap();
 

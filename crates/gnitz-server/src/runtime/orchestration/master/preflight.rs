@@ -36,9 +36,8 @@ impl Keyspace {
         Keyspace::Index(gnitz_wire::pack_pk_cols(cols))
     }
 
-    /// The worker's `seek_col_idx`, which `gnitz_wire::probe_key_columns`
-    /// reads back.
-    fn seek_col_idx(&self) -> u64 {
+    /// The worker's `arg1`, which `gnitz_wire::probe_key_columns` reads back.
+    fn arg1(&self) -> u64 {
         match self {
             Keyspace::OwnPk => gnitz_wire::PROBE_KEYSPACE_PK,
             Keyspace::Index(packed) => *packed,
@@ -56,8 +55,8 @@ impl Keyspace {
 struct PipelinedCheck {
     keyspace: Keyspace,
     mode: gnitz_wire::WireProbeMode,
-    /// The parameter the modes that take one ride in, travelling in `seek_pk`:
-    /// `AllHolders`' per-value holder cap, or `Project`'s column index. They are
+    /// The parameter the modes that take one ride in: `AllHolders`' per-value
+    /// holder cap, or `Project`'s column index. They are
     /// mutually exclusive; `0` for the modes that take none.
     mode_param: u64,
     batch: Batch,
@@ -411,8 +410,8 @@ async fn execute_probe_burst(
         .scan_cut(checks.len(), |cut| {
             for check in checks {
                 let template = check.schema.frame(wire::WireMsg {
-                    seek_col_idx: check.keyspace.seek_col_idx(),
-                    seek_pk: check.mode_param as u128,
+                    arg1: check.keyspace.arg1(),
+                    arg0: check.mode_param,
                     flags: WireFlags {
                         probe_mode: check.mode,
                         ..Default::default()
