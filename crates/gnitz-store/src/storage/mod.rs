@@ -96,6 +96,7 @@ pub use lsm::child_dir::{ChildAddr, Slot};
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub use lsm::index_gather::SourceCursor;
 pub(crate) use lsm::read_cursor::empty as empty_cursor;
+pub(crate) use lsm::read_cursor::SkeletonKeys;
 pub use lsm::read_cursor::{PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
 pub use lsm::run::StoredRow;

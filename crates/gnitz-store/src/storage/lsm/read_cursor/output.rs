@@ -10,10 +10,11 @@ use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
 use super::super::columnar::with_payload_cmp;
+use super::super::columnar::ColumnarSource;
 use super::super::merge::{prorated_blob_cap, RowComparator};
 use super::super::run::Run;
 use super::super::scatter::scatter_unified_sources;
-use super::ReadCursor;
+use super::{ReadCursor, SkeletonKeys};
 use gnitz_expr::RowSource;
 
 impl ReadCursor {
@@ -40,7 +41,7 @@ impl ReadCursor {
         // A skeleton row's payload columns do not exist on disk; the appender
         // would copy `ZERO_CELL` for each and relocate a zero-length blob for
         // each German string, producing a row that is not the view's. Its key
-        // has to be hydrated instead (`materialize_hydrated`).
+        // has to be hydrated instead.
         debug_assert!(
             !self.current_is_skeleton(),
             "copy_current_row_into on a skeleton row: hydrate the key instead",
@@ -60,12 +61,21 @@ impl ReadCursor {
     /// fully-folded merge group — so a DDL backfill or uniqueness scan loops on
     /// this instead of `materialize` and keeps peak memory O(chunk).
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        // Load-bearing: without it a zero-row drain would copy nothing, return an
-        // empty batch and still advance, consuming a row.
+        let mut skeletons = SkeletonKeys::default();
+        let chunk = self.drain_live_chunk(max_rows, &mut skeletons);
+        skeletons.assert_none();
+        chunk
+    }
+
+    /// [`Self::drain_chunk`], with each skeleton row's key pushed to `skeletons` instead of
+    /// copied. A chunk of skeleton rows alone is `Some` and empty.
+    pub(crate) fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
+        // Without it a zero-row drain would copy nothing, return an empty batch and
+        // still advance, consuming a row.
         if max_rows == 0 || !self.valid {
             return None;
         }
-        if let Some(batch) = self.drain_single_source(max_rows) {
+        if let Some(batch) = self.drain_single_source(max_rows, skeletons) {
             return Some(batch);
         }
         // Read before the drain, which shrinks `estimated_length`. The proration's
@@ -78,7 +88,20 @@ impl ReadCursor {
 
         let mut order = std::mem::take(&mut self.merge_order);
         self.drain_sorted_into(max_rows, rows_ahead, &mut order);
-        let drained = (!order.is_empty()).then(|| {
+        if self.any_skeleton {
+            // Under coarsening a skeleton PK is one merge group, hence one entry.
+            let sources = &self.sources;
+            order.retain(|&(e, r, w)| {
+                let src = &sources[e as usize];
+                if src.is_skeleton() {
+                    skeletons.push(src.get_pk_bytes(r as usize), w);
+                }
+                !src.is_skeleton()
+            });
+        }
+        let drained = if order.is_empty() {
+            Batch::empty_with_schema(&self.schema)
+        } else {
             let mut cols = Vec::with_capacity(self.sources.len() * self.schema.num_payload_cols());
             let unified: Vec<_> = self
                 .sources
@@ -92,9 +115,9 @@ impl ReadCursor {
             // weights; `write_to_batch` returns `Raw`, so certify `Consolidated`.
             batch.certify_layout(Layout::Consolidated);
             batch
-        });
+        };
         self.merge_order = order;
-        drained
+        Some(drained)
     }
 
     /// Materialize all non-zero-weight rows in merge order into an owned
@@ -127,8 +150,9 @@ impl ReadCursor {
     ///
     /// Keys on the drive mode, not on `sources.len() == 1`: every other source's
     /// window is empty, which is the precondition this bulk copy actually needs.
-    /// Never empty — `max_rows >= 1` and the committed row is still undrained.
-    pub(super) fn drain_single_source(&mut self, max_rows: usize) -> Option<Batch> {
+    /// Never empty unless the source is a skeleton run, whose windowed rows go to
+    /// `skeletons` — `max_rows >= 1` and the committed row is still undrained.
+    pub(super) fn drain_single_source(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
         let i = self.mode?;
         // The undrained window starts at the committed row: the advance that
         // emitted it already stepped `position` past it.
@@ -137,9 +161,17 @@ impl ReadCursor {
         let row_count = remaining.min(max_rows);
         let schema = &self.schema;
 
-        // A verbatim slice copy — neither sorts nor consolidates — so it carries
-        // whatever the backing can claim.
-        let batch = self.sources[i].slice_to_owned_batch(start, row_count, schema);
+        let src = &self.sources[i];
+        let batch = if src.is_skeleton() {
+            for r in start..start + row_count {
+                skeletons.push(src.get_pk_bytes(r), src.get_weight(r));
+            }
+            Batch::empty_with_schema(schema)
+        } else {
+            // A verbatim slice copy — neither sorts nor consolidates — so it carries
+            // whatever the backing can claim.
+            src.slice_to_owned_batch(start, row_count, schema)
+        };
 
         // Advance position past the drained rows
         self.states[i].position = start + row_count;

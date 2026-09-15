@@ -1024,18 +1024,21 @@ fn ascending_key_sweep_matches_per_key_fresh_seeks() {
     // past the maximum.
     let keys: &[u128] = &[5, 10, 15, 20, 30, 40, 50, 70, 90, 95];
 
-    let mut got = Batch::with_capacity(&schema, 8);
-    let mut sweep = create_read_cursor(&sources, &[], schema);
-    for &k in keys {
-        let key = k.to_be_bytes();
-        if sweep.seek_pk_group_ascending(&key) {
-            sweep.copy_positioned_pk_group_into(&key, &mut got);
-        }
-    }
+    let flat: Vec<u8> = keys.iter().flat_map(|k| k.to_be_bytes()).collect();
+    let got = PkSetGather::open(flat, schema, |_, _| create_read_cursor(&sources, &[], schema))
+        .next_chunk(usize::MAX)
+        .expect("the list names present keys");
 
     let mut want = Batch::with_capacity(&schema, 8);
     for &k in keys {
-        create_read_cursor(&sources, &[], schema).copy_live_pk_group_into(&k.to_be_bytes(), &mut want);
+        let key = k.to_be_bytes();
+        let mut fresh = create_read_cursor(&sources, &[], schema);
+        fresh.seek_bytes(&key);
+        fresh.for_each_pk_group_row(&key, |c| {
+            if c.current_weight > 0 {
+                c.copy_current_row_into(&mut want, c.current_weight);
+            }
+        });
     }
 
     let rows = |b: &Batch| -> Vec<(u128, i64, i64)> {

@@ -970,16 +970,15 @@ impl WorkerProcess {
                 return Err("has_pk: a projecting probe reads the table's own PK store".into());
             }
             let ref_col = mode_param as u8;
-            let (result, schema) = match batch.as_ref() {
-                Some(b) => {
-                    let keys = (0..b.len()).map(|i| b.get_pk_bytes(i));
-                    self.cat().registry_mut().gather_bytes(target_id, keys, ref_col)?
+            let mut keys = Vec::new();
+            if let Some(b) = &batch {
+                keys.reserve(b.len() * b.schema().pk_stride());
+                for i in 0..b.len() {
+                    keys.extend_from_slice(b.get_pk_bytes(i));
                 }
-                None => self
-                    .cat()
-                    .registry_mut()
-                    .gather_bytes(target_id, std::iter::empty(), ref_col)?,
-            };
+            }
+            let result = self.cat().registry().gather_bytes(target_id, keys, ref_col)?;
+            let schema = *result.schema();
             // The projected reply schema is synthetic — never the table's
             // cached block.
             self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);

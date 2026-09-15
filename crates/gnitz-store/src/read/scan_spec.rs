@@ -1,17 +1,18 @@
 //! The worker half of an ad-hoc `ReadSpec` read, over this worker's slice: open
-//! the bound, filter, map, then forward rows or fold them. Hydrating a
-//! capacity-bounded view runs after every check.
+//! the bound, filter, map, then forward rows or fold them. A capacity-bounded
+//! view's rows hydrate chunk by chunk as the sink drains them.
 
 use gnitz_wire::{Cut, OrderKey, RangeDescriptor, ReadBound, ReadSpec, SinkKind};
 
 use std::rc::Rc;
 
+use super::store_io::LiveSource;
 use super::SkeletonHydrator;
 use crate::expr::MapPlan;
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, PkSetGather, ReadCursor, SourceCursor, StoreError};
+use crate::storage::{Batch, SourceCursor, StoreError};
 use gnitz_expr::{cmp_order_keys, push_identity_tiebreak, Evaluator, LogicalProgram, OrderLocator};
 
 /// The sink a request resolved to, ahead of any walk.
@@ -35,19 +36,19 @@ impl RelationRegistry {
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Rc<Batch>, StoreError> {
         let ReadSpec { bound, predicate, sink } = spec;
+        let src_schema = self.relation_or_err(target_id)?.schema();
         // Nothing bounded, filtered, mapped or cut (a worker orders only under a cut): the
         // relation whole, off the store's cached snapshot.
         if let (ReadBound::None, true, None, SinkKind::Rows { order, limit_k: 0 }) =
             (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
-            let schema = self.relation_or_err(target_id)?.schema();
-            resolve_order_locs(order, &schema)?;
-            if !reply_schema.same_physical_layout(&schema) {
+            resolve_order_locs(order, &src_schema)?;
+            if !reply_schema.same_physical_layout(&src_schema) {
                 return Err(layout_mismatch());
             }
-            return Ok(self.scan(target_id, hydrator)?.0);
+            return self.scan(target_id, hydrator);
         }
-        let (source, src_schema) = self.open_bound(target_id, bound)?;
+        let source = self.open_bound(target_id, bound)?;
         let predicate = (!predicate.is_empty())
             .then(|| compile_predicate(&predicate, &src_schema))
             .transpose()?;
@@ -72,51 +73,19 @@ impl RelationRegistry {
         if !reply_schema.same_physical_layout(produced) {
             return Err(layout_mismatch());
         }
-        let source = self.hydrated(target_id, source, hydrator)?;
-        let mut rows = Survivors { source, predicate, ranges: Vec::new() };
+        let mut rows = Survivors {
+            source: LiveSource::new(self, target_id, source, hydrator),
+            predicate,
+            ranges: Vec::new(),
+        };
         let chunk_rows = self.config.scan_chunk_rows;
         Ok(Rc::new(match sink {
             Sink::Fold(fold) => run_fold_sink(&mut rows, chunk_rows, map.as_ref(), *fold)?,
             Sink::Rows { order, window } if !order.is_empty() && window > 0 => {
-                topk_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, &order, window)
+                topk_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, &order, window)?
             }
-            Sink::Rows { window, .. } => stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window),
+            Sink::Rows { window, .. } => stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window)?,
         }))
-    }
-
-    /// Open `bound`'s source cursor, without walking it, and the schema its rows
-    /// arrive in.
-    fn open_bound(&self, id: i64, bound: ReadBound) -> Result<(SourceCursor, SchemaDescriptor), StoreError> {
-        let entry = self.relation_or_err(id)?;
-        let full = |c: ReadCursor| SourceCursor::Full(Box::new(c));
-        Ok(match bound {
-            ReadBound::None => (full(entry.cursor()), entry.schema()),
-            ReadBound::PkRange(desc) => {
-                let schema = entry.schema();
-                let c = entry.store().pk_range_cursor(&desc).map_err(StoreError::rejected)?;
-                (full(c), schema)
-            }
-            ReadBound::PkSet(keys) => {
-                let schema = entry.schema();
-                if keys.stride() != schema.pk_stride() {
-                    return Err(StoreError::rejected(format!(
-                        "scan_spec: PkSet key stride {} != pk_stride {} (table {id})",
-                        keys.stride(),
-                        schema.pk_stride()
-                    )));
-                }
-                // A key this worker holds no row for copies nothing.
-                let gather = PkSetGather::open(keys.into_bytes(), schema, |s, e| entry.cursor_in_range(s, e));
-                (SourceCursor::PkSet(Box::new(gather)), schema)
-            }
-            ReadBound::IndexRange { bound, walk } => {
-                let cols = self.bound_cols_against(id, bound.idx_cols, "scan_spec")?;
-                (
-                    self.open_index_source(id, cols.as_slice(), &bound.desc, walk)?,
-                    entry.schema(),
-                )
-            }
-        })
     }
 
     /// Every delta `id`'s feed recorded in rounds `(after_tick, cut_tick]`, in the
@@ -161,7 +130,7 @@ impl RelationRegistry {
         let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
         let cursor = feed.pk_range_cursor(&desc).map_err(StoreError::rejected)?;
         let mut rows = Survivors {
-            source: SourceCursor::Full(Box::new(cursor)),
+            source: LiveSource::new(self, id, SourceCursor::Full(Box::new(cursor)), None),
             predicate: None,
             ranges: Vec::new(),
         };
@@ -171,32 +140,7 @@ impl RelationRegistry {
             None,
             &schema,
             0,
-        )))
-    }
-
-    /// `source` unchanged unless the runs it opened hold a skeleton row, else
-    /// hydrated and materialized whole.
-    fn hydrated(
-        &self,
-        id: i64,
-        source: SourceCursor,
-        hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<SourceCursor, StoreError> {
-        let (cursor, keys) = match source {
-            SourceCursor::Full(c) if c.any_skeleton() => (*c, None),
-            SourceCursor::PkSet(g) if g.any_skeleton() => {
-                let (c, k) = g.into_parts();
-                (c, Some(k))
-            }
-            // An index owner is a base table, which never holds a skeleton row.
-            other => return Ok(other),
-        };
-        let schema = cursor.schema;
-        let rows = self.materialize_hydrated(id, cursor, keys.as_deref(), hydrator)?;
-        Ok(SourceCursor::Full(Box::new(ReadCursor::over_batches(
-            &[Rc::new(rows)],
-            schema,
-        ))))
+        )?))
     }
 }
 
@@ -218,21 +162,26 @@ fn saturated_window(limit_k: u64) -> i64 {
     limit_k.min(i64::MAX as u64) as i64
 }
 
+/// A source chunk and its surviving row ranges.
+type SurvivorChunk<'r> = (Batch, &'r mut Vec<(usize, usize)>);
+
 /// The rows surviving the bound and the predicate, one source chunk at a time —
 /// the one input every sink reads.
-struct Survivors {
-    source: SourceCursor,
+struct Survivors<'a, 'h> {
+    source: LiveSource<'a, 'h>,
     predicate: Option<Evaluator>,
     /// The current chunk's surviving row ranges; scratch reused across chunks.
     ranges: Vec<(usize, usize)>,
 }
 
-impl Survivors {
+impl Survivors<'_, '_> {
     /// The next non-empty source chunk and its surviving row ranges — the whole
     /// chunk when there is no predicate — or `None` once the source is exhausted.
-    fn next(&mut self, max_rows: usize) -> Option<(Batch, &mut Vec<(usize, usize)>)> {
+    fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, StoreError> {
         let chunk = loop {
-            let chunk = self.source.drain_chunk(max_rows)?;
+            let Some(chunk) = self.source.next_chunk(max_rows)? else {
+                return Ok(None);
+            };
             if chunk.count > 0 {
                 break chunk;
             }
@@ -244,7 +193,7 @@ impl Survivors {
                 self.ranges.push((0, chunk.count));
             }
         }
-        Some((chunk, &mut self.ranges))
+        Ok(Some((chunk, &mut self.ranges)))
     }
 }
 
@@ -258,7 +207,7 @@ fn run_fold_sink(
 ) -> Result<Batch, StoreError> {
     // One mapped batch for the whole scan: `clear` keeps its buffers.
     let mut map = map.map(|p| (p, Batch::empty_with_schema(p.out_schema())));
-    while let Some((chunk, ranges)) = rows.next(chunk_rows) {
+    while let Some((chunk, ranges)) = rows.next(chunk_rows)? {
         match &mut map {
             Some((plan, dst)) => {
                 dst.clear();
@@ -292,7 +241,7 @@ fn stream_rows(
     map: Option<&MapPlan>,
     keeper_schema: &SchemaDescriptor,
     window: i64,
-) -> Batch {
+) -> Result<Batch, StoreError> {
     let early_stop = window > 0;
     // `window`-sized chunks make the early stop O(window) rather than O(chunk),
     // but only while every drained row survives: with a predicate a tiny chunk
@@ -305,17 +254,25 @@ fn stream_rows(
     let mut keeper = Batch::empty_with_schema(keeper_schema);
     let mut summed: i64 = 0;
 
-    while let Some((chunk, ranges)) = rows.next(drain_rows) {
+    while let Some((chunk, ranges)) = rows.next(drain_rows)? {
         if early_stop {
-            // Weighed off the source — the same weights that land in the keeper,
-            // read from a contiguous region rather than row-by-row off the
-            // destination.
-            for (i, &(s, e)) in ranges.iter().enumerate() {
-                summed += chunk.sum_weights(s, e);
-                if summed >= window {
-                    ranges.truncate(i + 1);
-                    break;
+            // Cut at the row whose weight reaches the window: a range, or a hydrated group, can
+            // run far past it.
+            for i in 0..ranges.len() {
+                let (s, e) = ranges[i];
+                let range_sum = chunk.sum_weights(s, e);
+                if summed + range_sum < window {
+                    summed += range_sum;
+                    continue;
                 }
+                let mut end = s;
+                while summed < window && end < e {
+                    summed += chunk.get_weight(end);
+                    end += 1;
+                }
+                ranges[i].1 = end;
+                ranges.truncate(i + 1);
+                break;
             }
         }
         append_survivors(map, &chunk, &mut keeper, ranges);
@@ -323,7 +280,7 @@ fn stream_rows(
             break;
         }
     }
-    keeper
+    Ok(keeper)
 }
 
 /// The rows sink with an ORDER BY and a `window > 0`: append every survivor and
@@ -335,7 +292,7 @@ fn topk_rows(
     keeper_schema: &SchemaDescriptor,
     order: &[OrderLocator],
     window: i64,
-) -> Batch {
+) -> Result<Batch, StoreError> {
     // Mid-scan the keeper is still growing, so a trim at `window` would re-sort
     // after every chunk to shed rows the next chunk replaces. Saturating: an
     // unbounded `limit_k` leaves this unfireable rather than overflowing.
@@ -344,7 +301,7 @@ fn topk_rows(
     // Summed survivor weight of what the keeper currently holds.
     let mut summed: i64 = 0;
 
-    while let Some((chunk, ranges)) = rows.next(chunk_rows) {
+    while let Some((chunk, ranges)) = rows.next(chunk_rows)? {
         // Weighed off the source — the same weights that land in the keeper,
         // read from a contiguous region rather than row-by-row off the
         // destination.
@@ -360,7 +317,7 @@ fn topk_rows(
     if summed > window {
         (keeper, _) = topk_keep(keeper, order, window);
     }
-    keeper
+    Ok(keeper)
 }
 
 /// The comparator-smallest rows of `keeper` whose summed weight covers `window`,

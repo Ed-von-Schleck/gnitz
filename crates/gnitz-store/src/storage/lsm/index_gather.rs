@@ -11,8 +11,8 @@
 //! the invariant ever broke, a skewed entry would yield a visibly wrong row
 //! rather than being silently dropped.
 
-use super::batch::{Batch, Layout};
-use super::read_cursor::{PkSetGather, ReadCursor};
+use super::batch::Batch;
+use super::read_cursor::{PkSetGather, ReadCursor, SkeletonKeys};
 use crate::schema::IndexKeySpec;
 use crate::storage::spill::sort_indices;
 
@@ -32,7 +32,10 @@ use crate::storage::spill::sort_indices;
 // `SourceCursor::Bounded`'s field type, nameable only in this crate.
 pub struct BoundedIndexCursor {
     idx: ReadCursor,
-    src: ReadCursor,
+    /// The base cursor, walked once per chunk over that chunk's sorted PKs.
+    src: PkSetGather,
+    /// The key buffer passed back and forth with `src`, so a chunk allocates none.
+    spare: Vec<u8>,
     /// The chunk's collected source-PK OPK images, flat at `src`'s `pk_stride` —
     /// what `spec.split_entry` leaves. Flat bytes, not `Vec<PkBuf>`: a chunk runs
     /// to the DDL scan chunk size and is unbounded on the ungated drain, the
@@ -51,7 +54,8 @@ impl BoundedIndexCursor {
         let stride = src.schema.pk_stride();
         BoundedIndexCursor {
             idx,
-            src,
+            src: PkSetGather::over(src),
+            spare: Vec::new(),
             pks: Vec::with_capacity(pk_capacity * stride),
             order: Vec::with_capacity(pk_capacity),
             spec,
@@ -62,11 +66,11 @@ impl BoundedIndexCursor {
     /// A returned batch may be EMPTY (in-range index entries whose base rows are
     /// absent/retracted) — `None` strictly means "no further chunk exists".
     ///
-    /// No re-seek between chunks: chunk N+1's first PK may sort below chunk N's
-    /// last, and `advance_to` is backward-capable via a binary search, so a chunk
-    /// boundary costs O(log N) on the first probe — not a rescan.
+    /// No re-open between chunks: chunk N+1's first PK may sort below chunk N's
+    /// last, and reloading the gather ends its sweep, so that key repositions by a
+    /// binary search per run — O(log N) on the first probe, not a rescan.
     pub(crate) fn drain_chunk(&mut self, n: usize) -> Option<Batch> {
-        let stride = self.src.schema.pk_stride();
+        let stride = self.src.schema().pk_stride();
         self.pks.clear();
         let mut collected = 0;
         // `new` clamped the cursor at `end`, so exhaustion IS the range bound.
@@ -92,28 +96,25 @@ impl BoundedIndexCursor {
         // entries' source-PK OPK suffixes, whose memcmp order IS base storage
         // order, so a byte sort is the seek order.
         sort_indices(&self.pks, stride, &mut self.order);
-        // One live payload per PK (an index owner is always a base table), so the
-        // collected count sizes the result exactly.
-        let mut batch = Batch::with_capacity(&self.src.schema, collected);
-        // Skipping a record equal to its predecessor IS the dedup, so each PK
-        // group is copied once, at its net `current_weight` (never a hardcoded 1,
-        // so Z-Set multiplicity survives).
+        // Skipping a record equal to its predecessor IS the dedup, so the gather's
+        // list is strictly ascending and each PK group is copied once.
+        let mut keys = std::mem::take(&mut self.spare);
+        keys.clear();
         let mut prev: &[u8] = &[];
         for &i in &self.order {
-            let at = i as usize * stride;
-            let pk = &self.pks[at..at + stride];
-            if pk == prev {
-                continue;
+            let pk = &self.pks[i as usize * stride..(i as usize + 1) * stride];
+            if pk != prev {
+                keys.extend_from_slice(pk);
+                prev = pk;
             }
-            prev = pk;
-            self.src.copy_live_pk_group_into(pk, &mut batch);
         }
-        // Consolidated by construction: the group walk emits (PK, payload) order
-        // at sub-group granularity over strictly-ascending PKs, at nonzero net
-        // weights. Certifying it spares the ingest tail an O(chunk log chunk)
-        // re-sort, as the full-scan drain path does.
-        batch.certify_layout(Layout::Consolidated);
-        Some(batch)
+        self.spare = self.src.reload(keys);
+        // A window whose base rows all resolved away is an empty chunk, not the end.
+        Some(
+            self.src
+                .next_chunk(usize::MAX)
+                .unwrap_or_else(|| Batch::empty_with_schema(self.src.schema())),
+        )
     }
 }
 
@@ -135,10 +136,19 @@ impl SourceCursor {
     /// before each key and then drains that key's whole group, so it can
     /// overshoot to `max_rows - 1 + |largest group|`. Callers read `chunk.len()`.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+        let mut skeletons = SkeletonKeys::default();
+        let chunk = self.drain_live_chunk(max_rows, &mut skeletons);
+        skeletons.assert_none();
+        chunk
+    }
+
+    /// [`Self::drain_chunk`] with skeleton rows split out; see [`ReadCursor::drain_live_chunk`].
+    pub(crate) fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
         match self {
-            SourceCursor::Full(c) => c.drain_chunk(max_rows),
+            SourceCursor::Full(c) => c.drain_live_chunk(max_rows, skeletons),
+            // An index owner is a base table, which holds no skeleton row.
             SourceCursor::Bounded(c) => c.drain_chunk(max_rows),
-            SourceCursor::PkSet(g) => g.next_chunk(max_rows),
+            SourceCursor::PkSet(g) => g.next_live_chunk(max_rows, skeletons),
         }
     }
 }

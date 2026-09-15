@@ -165,8 +165,9 @@ impl RangeDescriptor {
     /// `n_eq` must match `buf.len()`, `n_eq` must leave a slot for the range
     /// column, and no unknown flag bits may be set — a malformed frame is
     /// rejected, never mis-decoded or allowed to index out of bounds. (The
-    /// arity check against the actual column list stays with the engine
-    /// method, which holds the list.)
+    /// arity check against a column list lives with whichever holder carries
+    /// the list: [`read_index_bound`] for an [`IndexBound`], the engine for a
+    /// PK range.)
     pub(crate) fn decode(buf: &[u8]) -> Result<Self, String> {
         let mut r = Reader::new(buf, "range descriptor");
         let n_eq = r.u8()? as usize;
@@ -250,10 +251,15 @@ pub(crate) fn read_index_bound(r: &mut Reader) -> Result<IndexBound, String> {
     let packed = r.u64()?;
     let idx_cols = crate::unpack_pk_cols(packed)
         .map_err(|e| format!("index bound: {}", e.for_role(crate::PkListRole::ColumnList)))?;
-    Ok(IndexBound {
-        idx_cols,
-        desc: read_range_descriptor(r)?,
-    })
+    let desc = read_range_descriptor(r)?;
+    if desc.eq_vals().len() >= idx_cols.as_slice().len() {
+        return Err(format!(
+            "index bound: {} equality values leave no range column within its {} index columns",
+            desc.eq_vals().len(),
+            idx_cols.as_slice().len()
+        ));
+    }
+    Ok(IndexBound { idx_cols, desc })
 }
 
 #[cfg(test)]

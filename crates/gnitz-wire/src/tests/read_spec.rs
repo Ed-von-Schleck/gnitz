@@ -109,6 +109,28 @@ fn roundtrips_every_bound_against_every_sink() {
     }
 }
 
+/// An index bound's equality prefix must leave its range column inside the index's
+/// own column list, so a prefix covering every column is refused at decode.
+#[test]
+fn an_index_bound_pinning_every_column_is_refused_at_decode() {
+    let spec = |eq: &[u128]| {
+        ReadSpec::all_rows(ReadBound::IndexRange {
+            bound: IndexBound {
+                idx_cols: crate::PkColList::from_slice(&[1, 2]),
+                desc: RangeDescriptor::new(eq, Before(1), After(9)),
+            },
+            walk: IndexWalk::Optional,
+        })
+    };
+    let block = block();
+    let Err(err) = ReadSpec::decode(&spec(&[7, 8]).encode(&block)) else {
+        panic!("an equality prefix over every index column must be refused");
+    };
+    assert!(err.contains("leave no range column"), "{err}");
+    let ok = spec(&[7]);
+    assert_eq!(ReadSpec::decode(&ok.encode(&block)), Ok((ok.clone(), &block[..])));
+}
+
 /// `from_keys` is the one sort: duplicates collapse and the list comes out
 /// ascending whatever order it went in, and `per_request` splits it into
 /// consecutive lists that concatenate back to it.

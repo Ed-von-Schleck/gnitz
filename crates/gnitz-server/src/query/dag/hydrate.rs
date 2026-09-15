@@ -22,8 +22,8 @@ use gnitz_store::relation::Relation;
 use gnitz_store::storage::{PkSetGather, StoreError};
 
 /// Recompute the output rows of the capacity-bounded view `view_id` for `keys`
-/// — the flat concatenation of the OPK images, ascending — whose per-key coarse
-/// weights are `coarse`. One consolidated batch in the view's own schema.
+/// — the flat concatenation of the OPK images, ascending. One consolidated batch
+/// in the view's own schema.
 ///
 /// `keys` is taken by value because the gather below owns its key list; the
 /// caller built the buffer for this call and has no further use for it.
@@ -32,13 +32,7 @@ use gnitz_store::storage::{PkSetGather, StoreError};
 /// cogroup accepts multi-key deltas, so the chunking costs nothing but peak
 /// memory.
 impl SkeletonHydrator for DagEngine {
-    fn hydrate_keys(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        keys: Vec<u8>,
-        coarse: &[i64],
-    ) -> Result<Batch, StoreError> {
+    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: i64, keys: Vec<u8>) -> Result<Batch, StoreError> {
         let Some(view_schema) = registry.relation(view_id).map(Relation::schema) else {
             return Err(StoreError::rejected(format!(
                 "hydrate: view {view_id} is not a registered relation"
@@ -58,9 +52,6 @@ impl SkeletonHydrator for DagEngine {
         let hydration = *hydration;
 
         let mut out = Batch::empty_with_schema(&view_schema);
-        if keys.is_empty() {
-            return Ok(out);
-        }
 
         // The seed cursor and the register the replay feeds it to. A linear body
         // seeds the source relation's store at the program's start; a join seeds
@@ -106,60 +97,7 @@ impl SkeletonHydrator for DagEngine {
 
         // Drops the seed cursor's merge tree before the consolidate below
         // allocates a second full arena.
-        let (_, keys) = gather.into_parts();
-        let out = out.into_consolidated(&view_schema);
-        debug_assert_hydration_matches(&out, &keys, coarse);
-        Ok(out)
+        drop(gather);
+        Ok(out.into_consolidated(&view_schema))
     }
-}
-
-/// Tripwire: the replay's per-PK weight sum must equal the coarse weight the
-/// skeleton row carried, by linearity of the PK projection.
-///
-/// One co-walk, not a scan per key: `keys` is ascending by construction and
-/// `into_consolidated` sorted `out` by (PK, payload), so the two run in step.
-/// That also catches a PK `out` holds rows for that `keys` never named, which a
-/// per-key lookup cannot see.
-///
-/// The `cfg!` return is what a `#[cfg(debug_assertions)]` on the function would
-/// not give: the assertions vanish in release either way, but the co-walk itself
-/// is O(rows) and would otherwise still run.
-fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
-    if !cfg!(debug_assertions) {
-        return;
-    }
-    use gnitz_store::schema::key::compare_pk_bytes;
-    let stride = keys.len() / coarse.len();
-    let mut ki = 0;
-    let mut i = 0;
-    while i < out.len() {
-        let pk = out.get_pk_bytes(i);
-        // Every skeleton key carries a strictly positive coarse weight, so a key
-        // the replay produced nothing for is a bug — as is a key it produced rows
-        // for that no skeleton row named.
-        while ki < coarse.len() && compare_pk_bytes(&keys[ki * stride..(ki + 1) * stride], pk).is_lt() {
-            debug_assert!(false, "hydration produced no rows for skeleton key {ki}");
-            ki += 1;
-        }
-        debug_assert!(
-            ki < coarse.len() && keys[ki * stride..(ki + 1) * stride] == *pk,
-            "hydration produced rows for a PK no skeleton row named",
-        );
-        let mut sum = 0i64;
-        while i < out.len() && out.get_pk_bytes(i) == pk {
-            sum += out.get_weight(i);
-            i += 1;
-        }
-        debug_assert_eq!(
-            sum,
-            coarse.get(ki).copied().unwrap_or(0),
-            "hydration weight mismatch for key {pk:?}",
-        );
-        ki += 1;
-    }
-    debug_assert_eq!(
-        ki,
-        coarse.len(),
-        "hydration produced no rows for a trailing skeleton key"
-    );
 }

@@ -124,7 +124,7 @@ fn a_maximal_limit_k_neither_overflows_nor_trims() {
 #[test]
 fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
     let mut r = rows_fixture("whole_relation", 4, 1);
-    let (snapshot, _) = r.scan(TID, None).unwrap();
+    let snapshot = r.scan(TID, None).unwrap();
     for spec in [rows_spec(Vec::new(), 0), rows_spec(val_desc(), 0)] {
         assert!(Rc::ptr_eq(&run(&mut r, &spec).unwrap(), &snapshot));
     }
@@ -179,6 +179,28 @@ fn an_out_of_range_index_column_is_rejected_even_when_inexact() {
         panic!("an out-of-range index column must be rejected");
     };
     assert!(err.to_string().contains("invalid column list"), "{err}");
+}
+
+/// An `Optional` walk may trade a declined index for a full scan, but a malformed
+/// range is not a decline: it names no range column, so it is refused.
+#[test]
+fn a_malformed_range_on_an_optional_index_walk_is_rejected() {
+    let mut r = rows_fixture("index_malformed", 4, 1);
+    r.add_index(TID, TID + 1, &[1], false).unwrap();
+    let spec = ReadSpec {
+        bound: ReadBound::IndexRange {
+            bound: gnitz_wire::IndexBound {
+                idx_cols: gnitz_wire::PkColList::from_slice(&[1]),
+                desc: RangeDescriptor::new(&[3], Cut::Before(0), Cut::After(9)),
+            },
+            walk: IndexWalk::Optional,
+        },
+        ..rows_spec(Vec::new(), 0)
+    };
+    let Err(err) = run(&mut r, &spec) else {
+        panic!("a range with no range column must be refused, not scanned");
+    };
+    assert!(err.to_string().contains("has no range column"), "{err}");
 }
 
 /// A bounded view whose sweep has dehydrated everything on disk, plus fresh rows
@@ -249,6 +271,131 @@ fn a_bound_that_prunes_every_skeleton_shard_streams() {
         panic!("a range over the dehydrated band must reach the hydrator");
     };
     assert!(err.to_string().contains("skeleton rows"), "{err}");
+}
+
+/// [`dehydrated_fixture`] over keys `0..5` on disk and `100..105` in RAM, plus a
+/// second row `(2, val = 7)` under skeleton key 2, read two merge groups a chunk.
+fn skeleton_fixture(name: &str) -> RelationRegistry {
+    let mut registry = dehydrated_fixture(name, 0..5, 100..105);
+    let mut bb = BatchBuilder::new(id_val_schema());
+    bb.begin_row(2, 1);
+    bb.put_u64(7);
+    bb.end_row();
+    registry.ingest(TID, bb.finish()).unwrap();
+    registry.set_scan_chunk_rows(2);
+    registry
+}
+
+/// The `(id, val, weight)` rows [`skeleton_fixture`] ingested whose id `keep` admits,
+/// sorted.
+fn ingested(keep: impl Fn(u64) -> bool) -> Vec<(u128, i64, i64)> {
+    let mut rows: Vec<_> = (0..5)
+        .chain(100..105)
+        .filter(|&k| keep(k))
+        .map(|k| (k as u128, k as i64, 1))
+        .collect();
+    if keep(2) {
+        rows.push((2, 7, 1));
+    }
+    rows.sort();
+    rows
+}
+
+/// A reply's `(id, val, weight)` rows, sorted.
+fn rows_of(b: &Batch) -> Vec<(u128, i64, i64)> {
+    let mut rows: Vec<_> = (0..b.count)
+        .map(|i| {
+            let val = i64::from_le_bytes(b.get_col_ptr(i, 0, 8).try_into().unwrap());
+            (b.get_pk(i), val, b.get_weight(i))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Recomputes each skeleton key `k` as `(k, val = k)`, plus [`skeleton_fixture`]'s
+/// `(2, 7)` for key 2, and records each call's key list.
+#[derive(Default)]
+struct Recompute {
+    calls: Vec<Vec<u64>>,
+}
+
+impl SkeletonHydrator for Recompute {
+    fn hydrate_keys(&mut self, _: &RelationRegistry, _: i64, keys: Vec<u8>) -> Result<Batch, StoreError> {
+        let schema = id_val_schema();
+        let ks: Vec<u64> = keys
+            .chunks_exact(schema.pk_stride())
+            .map(|k| u64::from_be_bytes(k.try_into().unwrap()))
+            .collect();
+        let mut bb = BatchBuilder::new(schema);
+        for &k in &ks {
+            for val in std::iter::once(k).chain((k == 2).then_some(7)) {
+                bb.begin_row(k as u128, 1);
+                bb.put_u64(val);
+                bb.end_row();
+            }
+        }
+        self.calls.push(ks);
+        Ok(bb.finish().into_consolidated(&schema))
+    }
+}
+
+fn pk_set(ids: &[u64]) -> ReadBound {
+    let keys: Vec<[u8; 8]> = ids.iter().map(|k| k.to_be_bytes()).collect();
+    ReadBound::PkSet(gnitz_wire::PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))
+}
+
+/// Every read verb over a skeleton store answers exactly the ingested rows, and a
+/// chunked walk hydrates once per chunk, only the skeleton keys that chunk met.
+#[test]
+fn a_skeleton_store_hydrates_chunk_by_chunk() {
+    let r = skeleton_fixture("skeleton_chunks");
+    let schema = id_val_schema();
+    let mut h = Recompute::default();
+
+    assert_eq!(rows_of(&r.scan(TID, Some(&mut h)).unwrap()), ingested(|_| true));
+    for k in [2u64, 101] {
+        let hit = r.seek(TID, &k.to_be_bytes(), Some(&mut h)).unwrap();
+        assert_eq!(rows_of(&hit.expect("a present key")), ingested(|i| i == k));
+    }
+
+    h.calls.clear();
+    let got = r.scan_spec(TID, pk_range(0, 104), &schema, Some(&mut h)).unwrap();
+    assert_eq!(rows_of(&got), ingested(|i| i <= 104));
+    assert_eq!(
+        h.calls,
+        vec![vec![0, 1], vec![2, 3], vec![4]],
+        "one hydration per chunk"
+    );
+
+    let spec = ReadSpec {
+        bound: pk_set(&[1, 4, 102]),
+        ..rows_spec(Vec::new(), 0)
+    };
+    let got = r.scan_spec(TID, spec, &schema, Some(&mut h)).unwrap();
+    assert_eq!(rows_of(&got), ingested(|i| [1, 4, 102].contains(&i)));
+}
+
+/// A LIMIT cuts at the row, not at the hydrated group: key 2 hydrates to two rows,
+/// and `LIMIT 1` ships one.
+#[test]
+fn a_limit_stops_at_the_row_inside_a_hydrated_group() {
+    let r = skeleton_fixture("skeleton_limit");
+    let mut h = Recompute::default();
+    let spec = ReadSpec {
+        bound: pk_set(&[2]),
+        ..rows_spec(Vec::new(), 1)
+    };
+    let got = r.scan_spec(TID, spec, &id_val_schema(), Some(&mut h)).unwrap();
+    assert_eq!(got.count, 1);
+}
+
+/// A raw drain has no hydrator to hand a skeleton row to, so meeting one is a bug.
+#[test]
+#[should_panic(expected = "a raw drain met a skeleton row")]
+fn a_raw_drain_over_a_skeleton_run_panics() {
+    let r = dehydrated_fixture("skeleton_raw_drain", 0..5, 100..105);
+    r.relation_or_err(TID).unwrap().cursor().drain_chunk(usize::MAX);
 }
 
 /// A fold reply schema off the partial layout the fold derives — missing, then

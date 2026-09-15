@@ -29,11 +29,5 @@ use crate::storage::{Batch, StoreError};
 /// one implementor is `DagEngine`, which is the registry's *sibling* and holds no
 /// reference to it.
 pub trait SkeletonHydrator {
-    fn hydrate_keys(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        keys: Vec<u8>,
-        coarse: &[i64],
-    ) -> Result<Batch, StoreError>;
+    fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: i64, keys: Vec<u8>) -> Result<Batch, StoreError>;
 }

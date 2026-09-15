@@ -5,7 +5,7 @@
 
 use super::*;
 use gnitz_store::storage::SourceCursor;
-use gnitz_wire::IndexWalk;
+use gnitz_wire::{IndexWalk, ReadBound};
 use gnitz_wire::{ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
@@ -14,8 +14,9 @@ impl CatalogEngine {
     /// [`RelationRegistry::scan`] with this engine's own circuit layer as
     /// the hydrator.
     pub(crate) fn scan(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
+        let schema = self.registry.relation_or_err(table_id)?.schema();
         let (dag, registry) = self.dag_and_registry_mut();
-        registry.scan(table_id, Some(dag)).map_err(String::from)
+        Ok((registry.scan(table_id, Some(dag))?, schema))
     }
 
     /// Point lookup by the wire seek pair, hydrating: the pair decoded to OPK
@@ -132,8 +133,8 @@ impl CatalogEngine {
     }
 
     /// The cursor driving `source` through `view_id`'s circuit: index-bounded when
-    /// the circuit carries a bound for `source` and `open_index_source` takes it,
-    /// else a full scan. The circuit's `Filter` is authoritative either way.
+    /// the circuit carries a bound for `source` and `open_bound` takes it, else a
+    /// full scan. The circuit's `Filter` is authoritative either way.
     pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Result<SourceCursor, String> {
         // A store-less handle reads empty rather than erroring: correct for a
         // stream, a wrong answer for a process whose store is elsewhere. Hard, not
@@ -143,12 +144,12 @@ impl CatalogEngine {
             "source cursor in a process owning no base store (view {view_id}, source {source})",
         );
         let CatalogEngine { registry, dag, .. } = self;
-        let bound = dag.source_scan_bound(registry, view_id, source);
-        let Some(bound) = bound else {
-            return Ok(SourceCursor::Full(Box::new(registry.relation_or_err(source)?.cursor())));
-        };
-        registry
-            .open_index_source(source, bound.idx_cols.as_slice(), &bound.desc, IndexWalk::Optional)
-            .map_err(String::from)
+        let bound = dag
+            .source_scan_bound(registry, view_id, source)
+            .map_or(ReadBound::None, |bound| ReadBound::IndexRange {
+                bound,
+                walk: IndexWalk::Optional,
+            });
+        registry.open_bound(source, bound).map_err(String::from)
     }
 }

@@ -5,8 +5,10 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
+#[cfg(test)]
 use std::rc::Rc;
 
+#[cfg(test)]
 use super::batch::Batch;
 use super::columnar::with_payload_cmp;
 use super::columnar::ColumnarSource;
@@ -24,6 +26,32 @@ mod output;
 use super::run::Run;
 pub use gather::PkSetGather;
 use gnitz_expr::RowSource;
+
+/// The skeleton rows a split drain set aside instead of copying: their OPK keys, flat
+/// and ascending, and — in debug builds — each one's coarse weight.
+#[derive(Default)]
+pub(crate) struct SkeletonKeys {
+    pub(crate) keys: Vec<u8>,
+    pub(crate) coarse: Vec<i64>,
+}
+
+impl SkeletonKeys {
+    fn push(&mut self, pk: &[u8], weight: i64) {
+        self.keys.extend_from_slice(pk);
+        if cfg!(debug_assertions) {
+            self.coarse.push(weight);
+        }
+    }
+
+    /// The raw drains' guard: the bulk scatter reads every payload column, and a
+    /// skeleton run has none.
+    pub(crate) fn assert_none(&self) {
+        assert!(
+            self.keys.is_empty(),
+            "a raw drain met a skeleton row: hydrate its keys instead"
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ReadCursor
@@ -85,6 +113,7 @@ impl ReadCursor {
     ///
     /// The one open whose runs did not come through `RunSet::push`, so each batch
     /// is folded to whatever granularity its caller built it at.
+    #[cfg(test)]
     pub(crate) fn over_batches(batches: &[Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
         from_runs(batches.iter().map(|b| Run::Mem(Rc::clone(b))), schema, batches.len())
     }
@@ -500,34 +529,6 @@ impl ReadCursor {
             f(&*self);
             self.advance_with(row_cmp);
         }
-    }
-
-    /// Seek to `key`'s PK group in **any** probe order and append its live rows to
-    /// `out`; an absent key appends nothing. The keyed-read primitive for a store
-    /// whose PK can repeat — a view output store runs no `enforce_unique_pk`, so
-    /// its synthetic key names one row per row the join produced. An ascending
-    /// sweep uses [`Self::seek_pk_group_ascending`] and the copy below instead.
-    pub(crate) fn copy_live_pk_group_into(&mut self, key: &[u8], out: &mut Batch) {
-        // Skipped at `Equal` because a walk leaves the cursor on the group's first
-        // unconsumed row, where `advance_to` is not idempotent (see its own note).
-        if !self.valid || self.current_pk_cmp_bytes(key) != Ordering::Equal {
-            self.advance_to(key);
-        }
-        self.copy_positioned_pk_group_into(key, out);
-    }
-
-    /// Copy every live row of the group the cursor already stands on for `key`; a
-    /// cursor standing elsewhere copies nothing. Positioning is the caller's.
-    ///
-    /// The weight gate is per row, not a presence test: a retracted member an
-    /// uncompacted source still holds can head the group by payload order, and
-    /// rejecting the key on it would drop the live rows behind it.
-    fn copy_positioned_pk_group_into(&mut self, key: &[u8], out: &mut Batch) {
-        self.for_each_pk_group_row(key, |c| {
-            if c.current_weight > 0 {
-                c.copy_current_row_into(out, c.current_weight);
-            }
-        });
     }
 
     /// Storage-order comparison of the current row's PK against an OPK `key`.

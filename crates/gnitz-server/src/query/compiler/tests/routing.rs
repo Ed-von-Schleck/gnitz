@@ -799,7 +799,7 @@ fn the_shard_walk_bails_at_a_fan_in() {
 fn a_source_scanned_once_keeps_its_backfill_bound() {
     let bound = |col: u32| gnitz_wire::IndexBound {
         idx_cols: gnitz_wire::PkColList::from_slice(&[col]),
-        desc: gnitz_wire::RangeDescriptor::new(&[5], gnitz_wire::Cut::Before(0), gnitz_wire::Cut::After(0)),
+        desc: gnitz_wire::RangeDescriptor::new(&[], gnitz_wire::Cut::Before(0), gnitz_wire::Cut::After(0)),
     };
     let scan = |source: u64, b: Option<gnitz_wire::IndexBound>| OpNode::ScanDelta { source, bound: b };
     let bounds_of = |a: OpNode, b: OpNode| {

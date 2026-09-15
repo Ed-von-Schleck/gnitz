@@ -45,22 +45,16 @@ impl CatalogEngine {
     /// live row contributes nothing.
     pub(in crate::catalog) fn retract_pk_list(&self, family: SysFamily, mut ids: Vec<u128>) -> Batch {
         let rel = self.sys_relation(family);
-        let schema = &rel.schema();
+        let schema = rel.schema();
         ids.sort_unstable();
         ids.dedup();
-        let mut batch = Batch::with_capacity(schema, ids.len());
-        let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
-            return batch;
-        };
-        let (lo, hi) = (sys_opk(schema, first), sys_opk(schema, last));
-        let mut cursor = rel.cursor_in_range(lo.pk_bytes(), Some(hi.pk_bytes()));
-        for pk in ids {
-            let key = sys_opk(schema, pk);
-            // The weight gate rejects a tombstone an uncompacted source still holds.
-            if cursor.seek_pk_group_ascending(key.pk_bytes()) && cursor.current_weight > 0 {
-                cursor.copy_current_row_into(&mut batch, -1);
-            }
+        let mut keys = Vec::with_capacity(ids.len() * schema.pk_stride());
+        for &id in &ids {
+            keys.extend_from_slice(sys_opk(&schema, id).pk_bytes());
         }
+        let mut batch = Batch::with_capacity(&schema, ids.len());
+        gnitz_store::storage::PkSetGather::open(keys, schema, |s, e| rel.cursor_in_range(s, e))
+            .for_each_live_row(usize::MAX, |c| c.copy_current_row_into(&mut batch, -1));
         batch
     }
 }
