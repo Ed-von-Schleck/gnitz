@@ -156,7 +156,7 @@ pub(crate) fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>
 /// The cheapest node producing `items` over `input`, whose key region the engine
 /// carries verbatim: the input itself, a copy list, or the payload expression map.
 fn emit_projection(
-    cb: &mut gnitz_core::CircuitBuilder,
+    cb: &mut gnitz_core::Circuit,
     node: gnitz_core::NodeId,
     items: &[ProjItem],
     out: &Schema,
@@ -180,7 +180,7 @@ fn emit_projection(
 /// `items` over `input` with `input`'s PK pinned to the front — the linear
 /// projection.
 pub(crate) fn project_front(
-    cb: &mut gnitz_core::CircuitBuilder,
+    cb: &mut gnitz_core::Circuit,
     node: gnitz_core::NodeId,
     items: &[ProjEntry],
     input: &Frame,
@@ -194,7 +194,7 @@ pub(crate) fn project_front(
 /// a key-region column through renames that slot in place (a reduce's natural
 /// group key); anything else lands in the payload.
 pub(crate) fn project_tail(
-    cb: &mut gnitz_core::CircuitBuilder,
+    cb: &mut gnitz_core::Circuit,
     node: gnitz_core::NodeId,
     items: &[ProjEntry],
     frame: &Frame,
@@ -437,13 +437,13 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
 /// Compile `preds` over `schema` and emit their AND — passing `node` through
 /// untouched when nothing is left to test.
 fn filter(
-    cb: &mut gnitz_core::CircuitBuilder,
+    cb: &mut gnitz_core::Circuit,
     node: gnitz_core::NodeId,
     preds: &[BoundExpr],
     schema: &Schema,
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
     match crate::expr_lower::compile_filter_program(preds, &schema.columns)? {
-        Some(prog) => Ok(cb.filter(node, prog)),
+        Some(prog) => Ok(cb.filter(node, prog.to_blob_bytes())),
         None => Ok(node),
     }
 }
@@ -452,7 +452,7 @@ fn filter(
 /// filter an already-emitted node: HAVING, and the WHERE over a join, an EXISTS
 /// branch or a mark branch.
 pub(crate) fn emit_filter<'a>(
-    cb: &mut gnitz_core::CircuitBuilder,
+    cb: &mut gnitz_core::Circuit,
     node: gnitz_core::NodeId,
     preds: impl IntoIterator<Item = &'a HirExpr>,
     frame: &Frame,
@@ -465,7 +465,7 @@ pub(crate) fn emit_filter<'a>(
 pub(crate) fn emit_join_inputs(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
-    cb: &mut gnitz_core::CircuitBuilder,
+    cb: &mut gnitz_core::Circuit,
     down: Demand<'_>,
     [left, right]: [&Rc<RelExpr>; 2],
     kind: JoinType,

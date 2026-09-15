@@ -122,6 +122,11 @@ impl ReducePlan {
         global_ground: bool,
         i_am_owner: bool,
     ) -> Result<Self, OpBuildErr> {
+        // `emit_global_ground` writes its aggregate columns at payload index 0, so
+        // a ground row over a group set would overwrite the exemplar slots.
+        if global_ground && !group_by_cols.is_empty() {
+            return Err(OpBuildErr::shape("reduce: global-ground over a non-empty group set"));
+        }
         // Ahead of `reduce_out_key`, which reads `columns[c]` raw.
         check_cols(input_schema, group_by_cols, agg_descs)?;
         let out_key = input_schema.reduce_out_key(group_by_cols);
@@ -166,10 +171,6 @@ impl ReducePlan {
         global_ground: bool,
         i_am_owner: bool,
     ) -> Result<Self, OpBuildErr> {
-        debug_assert!(
-            !global_ground || group_by_cols.is_empty(),
-            "a ground-seeding reduce groups on nothing"
-        );
         let output_schema = build_reduce_output_schema(input_schema, group_by_cols, agg_descs, out_key)
             .ok_or_else(|| OpBuildErr::shape("reduce: output exceeds MAX_COLUMNS"))?;
 

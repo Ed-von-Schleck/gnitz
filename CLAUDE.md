@@ -354,9 +354,9 @@ alone, and `gnitz-server` is a binary nothing can link.
 | Crate | Role | Depends on |
 |-------|------|------------|
 | `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and POSIX file-I/O — independent leaves every other crate may name | — |
-| `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests | — |
+| `gnitz-wire` | Wire-protocol constants + codecs and the circuit graph — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests | — |
 | `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
-| `gnitz-core` | Client core: connection, protocol, the logical type / expression / circuit model, and the mirror state machine | `wire`, `expr` |
+| `gnitz-core` | Client core: connection, protocol, the logical type / expression model, and the mirror state machine | `wire`, `expr` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle | `core` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
@@ -403,7 +403,9 @@ table**: they are separate crates, so a `storage`-layer `use
 gnitz_expr::RowSource` is not an up-edge into the engine's own `expr` module.
 Read `expr` in the ladder above as the engine-local expression layer only.
 
-A relation is stored as one `Table` per worker. Test scaffolding lives in
+A relation is stored as one `Table` per worker. A relation's id exceeds the id of
+every relation it scans (refused at DDL precheck), so ascending id order is
+dependency order. Test scaffolding lives in
 `test_support` / `test_rng` and per-module `tests/`. Each of the two crates has
 its own `test_support`. `gnitz-store` splits its by reach: `shared` is compiled
 again elsewhere — as the whole of `gnitz-store-testkit`, and inside

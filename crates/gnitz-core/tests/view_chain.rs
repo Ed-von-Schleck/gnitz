@@ -1,17 +1,18 @@
 #![cfg(feature = "integration")]
 
-//! The raw `create_view_chain` contract: a bundle is one atomic zone, its row
-//! order is meaningless (the engine re-derives dependency order for the
-//! backfill), its last element is the user-named view, and the internal
-//! segments name that view as their owner — which is what the drop cascade
-//! keys on and a rename leaves alone.
+//! The raw `create_view_chain` contract: a bundle is one atomic zone, an element
+//! reads only elements before it, its last element is the user-named view, and
+//! the internal segments name that view as their owner — which is what the drop
+//! cascade keys on and a rename leaves alone.
 //!
 //! Every segment here is a shard-free identity view, `input_delta → sink`.
 //! Nothing about that shape orders a backfill: it runs no exchange, so no
 //! cross-worker barrier can hold a consumer back — correct output rests
 //! entirely on the driver visiting a producer before its consumer.
 
-use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ZSetBatch};
+use gnitz_core::{
+    BatchAppender, Circuit, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ZSetBatch,
+};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
 const BASE_ROWS: [(i64, i64); 3] = [(1, 10), (2, 20), (3, 30)];
@@ -36,14 +37,13 @@ fn make_base(client: &mut GnitzClient, sn: &str) -> (u64, Vec<ColumnDef>) {
     (tid, cols)
 }
 
-/// One identity segment at chain-local slot `seg` reading `source_id`.
-fn segment(seg: u32, source_id: u64, cols: &[ColumnDef]) -> PlannedView {
-    let mut cb = gnitz_core::CircuitBuilder::new();
-    let inp = cb.input_delta(source_id, None);
-    cb.sink(inp);
+/// One identity segment reading `source_id`.
+fn segment(source_id: u64, cols: &[ColumnDef]) -> PlannedView {
+    let mut circuit = gnitz_core::Circuit::default();
+    let inp = circuit.input_delta(source_id, None);
+    circuit.sink(inp);
     PlannedView {
-        seg,
-        circuit: cb.build(),
+        circuit,
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
         capacity_bytes: None,
@@ -51,15 +51,23 @@ fn segment(seg: u32, source_id: u64, cols: &[ColumnDef]) -> PlannedView {
     }
 }
 
-/// A three-element bundle `[g, h, f]` whose two segments are in reverse
-/// dependency order: `g` (slot 1) reads `h` (slot 2) reads base, and `f` (slot
-/// 0, the user-named view) reads `g`.
-fn misordered_chain(base_tid: u64, cols: &[ColumnDef]) -> Vec<PlannedView> {
+/// A three-element bundle `[h, g, f]` in dependency order: `h` reads base, `g`
+/// reads `h`, and `f` (the user-named view) reads `g`.
+fn chain(base_tid: u64, cols: &[ColumnDef]) -> Vec<PlannedView> {
     vec![
-        segment(1, gnitz_core::segment_id(2), cols),
-        segment(2, base_tid, cols),
-        segment(0, gnitz_core::segment_id(1), cols),
+        segment(base_tid, cols),
+        segment(gnitz_core::segment_id(0), cols),
+        segment(gnitz_core::segment_id(1), cols),
     ]
+}
+
+/// The vids of every live VIEW_TAB row.
+fn live_view_vids(client: &mut GnitzClient) -> Vec<u64> {
+    let b = client.scan(gnitz_wire::VIEW_TAB).unwrap().batch;
+    (0..b.len())
+        .filter(|&i| b.weights[i] > 0)
+        .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
+        .collect()
 }
 
 /// The vids of every live VIEW_TAB row naming `owner_vid` as its owner.
@@ -93,7 +101,7 @@ fn base_at_weight_one() -> Vec<(i64, i64, i64)> {
 }
 
 #[test]
-fn a_misordered_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
+fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("chain");
@@ -101,7 +109,7 @@ fn a_misordered_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let (base_tid, cols) = make_base(&mut client, &sn);
 
     let vids = client
-        .create_view_chain(&sn, "f", misordered_chain(base_tid, &cols), false)
+        .create_view_chain(&sn, "f", chain(base_tid, &cols), false)
         .unwrap();
     let owner = *vids.last().unwrap();
     assert_eq!(
@@ -117,7 +125,7 @@ fn a_misordered_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
         "both segments name the user view as owner"
     );
 
-    // Every element holds the base's rows at weight 1, whatever its row order.
+    // Every element holds the base's rows at weight 1.
     for &vid in &vids {
         assert_eq!(weighted_rows(&mut client, vid), base_at_weight_one(), "view {vid}");
     }
@@ -149,29 +157,64 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     // A committed view whose name the bundle's user-named view reuses.
     let taken = *client
-        .create_view_chain(&sn, "taken", vec![segment(0, base_tid, &cols)], false)
+        .create_view_chain(&sn, "taken", vec![segment(base_tid, &cols)], false)
         .unwrap()
         .last()
         .unwrap();
 
     let err = client
-        .create_view_chain(&sn, "taken", misordered_chain(base_tid, &cols), false)
+        .create_view_chain(&sn, "taken", chain(base_tid, &cols), false)
         .unwrap_err()
         .to_string();
     assert!(err.contains("already exists"), "got: {err}");
     // Nothing of the refused bundle committed: the only live views are `taken`
     // and no segment names it — or anything — as owner.
     assert!(segment_vids_of(&mut client, taken).is_empty());
-    let b = client.scan(gnitz_wire::VIEW_TAB).unwrap().batch;
-    let live: Vec<u64> = (0..b.len())
-        .filter(|&i| b.weights[i] > 0)
-        .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
-        .collect();
-    assert_eq!(live, vec![taken]);
+    assert_eq!(live_view_vids(&mut client), vec![taken]);
     assert_eq!(weighted_rows(&mut client, taken), base_at_weight_one());
 
+    // An element naming a later element scans a relation no older than itself.
+    let forward = vec![
+        segment(gnitz_core::segment_id(1), &cols),
+        segment(base_tid, &cols),
+        segment(gnitz_core::segment_id(0), &cols),
+    ];
+    let err = client
+        .create_view_chain(&sn, "fwd", forward, false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not older"), "got: {err}");
+    assert_eq!(
+        live_view_vids(&mut client),
+        vec![taken],
+        "a forward reference commits nothing"
+    );
+
+    // A node list past the column cap encodes, and the engine refuses it at load.
+    let mut wide = Circuit::default();
+    let scan = wide.input_delta(base_tid, None);
+    let proj = wide.map(scan, &vec![0; gnitz_core::MAX_COLUMNS + 1]);
+    wide.sink(proj);
+    let planned = vec![PlannedView {
+        circuit: wide,
+        ..segment(base_tid, &cols)
+    }];
+    let err = client
+        .create_view_chain(&sn, "wide", planned, false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("exceeds cap {}", gnitz_core::MAX_COLUMNS)),
+        "got: {err}"
+    );
+    assert_eq!(
+        live_view_vids(&mut client),
+        vec![taken],
+        "an over-wide circuit commits nothing"
+    );
+
     let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
-    let planned: Vec<PlannedView> = (0..over).map(|_| segment(0, base_tid, &cols)).collect();
+    let planned: Vec<PlannedView> = (0..over).map(|_| segment(base_tid, &cols)).collect();
     let err = client
         .create_view_chain(&sn, "x", planned, false)
         .unwrap_err()

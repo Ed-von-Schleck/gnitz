@@ -1,4 +1,4 @@
-//! The view-body HIR: one IR between the sqlparser AST and the `CircuitBuilder`
+//! The view-body HIR: one IR between the sqlparser AST and the `Circuit`
 //! call sequence, compiled by `bind → lower`; bind places each predicate
 //! (`place.rs`) and joins in each subquery (`decorrelate.rs`) as it builds.
 //!

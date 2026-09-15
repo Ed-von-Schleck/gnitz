@@ -653,27 +653,47 @@ fn test_dep_map_is_the_scan_delta_nodes() {
     let dir = temp_dir("dep_map_scan_delta");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    write_circuit_chain(
-        &mut engine,
-        7,
-        &[
-            (gnitz_wire::Opcode::ScanDelta, Some(100), None),
-            (gnitz_wire::Opcode::ScanDelta, Some(200), None),
-            (gnitz_wire::Opcode::ScanDelta, Some(100), None),
-            (gnitz_wire::Opcode::ScanDelta, Some(0), None),
-            (gnitz_wire::Opcode::IntegrateSink, Some(300), None),
-        ],
-    );
+    // Raw rows, not a `Circuit`: a sink carrying a `source_table` and a zero
+    // source id are shapes no circuit encodes to.
+    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
+    for (node_id, (opcode, source)) in [
+        (gnitz_wire::Opcode::ScanDelta, 100),
+        (gnitz_wire::Opcode::ScanDelta, 200),
+        (gnitz_wire::Opcode::ScanDelta, 100),
+        (gnitz_wire::Opcode::ScanDelta, 0),
+        (gnitz_wire::Opcode::IntegrateSink, 300),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        gnitz_wire::sys_rows::write_circuit_node_row(
+            &mut bb,
+            &gnitz_wire::sys_rows::CircuitNodeRow {
+                view_id: 400,
+                node_id: node_id as u64,
+                opcode: opcode.as_wire(),
+                source_table: Some(source),
+                inputs: [None; 2],
+                params: None,
+            },
+            1,
+        );
+    }
+    engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
 
     let dep_map = engine.dag.get_dep_map(&engine.registry).clone();
-    assert_eq!(dep_map.get(&100), Some(&vec![7]), "the repeated source yields one edge");
-    assert_eq!(dep_map.get(&200), Some(&vec![7]), "table 200 must feed view 7");
+    assert_eq!(
+        dep_map.get(&100),
+        Some(&vec![400]),
+        "the repeated source yields one edge"
+    );
+    assert_eq!(dep_map.get(&200), Some(&vec![400]), "table 200 must feed view 400");
     assert_eq!(dep_map.get(&300), None, "a non-ScanDelta node contributes no edge");
     assert_eq!(dep_map.get(&0), None, "a non-positive source id contributes no edge");
 
-    let mut sources = engine.dag.get_source_ids(&engine.registry, 7);
+    let mut sources = engine.dag.get_source_ids(&engine.registry, 400);
     sources.sort_unstable();
-    assert_eq!(sources, vec![100, 200], "both ScanDelta sources of view 7");
+    assert_eq!(sources, vec![100, 200], "both ScanDelta sources of view 400");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -686,18 +706,14 @@ fn test_dep_map_view_on_view_chain() {
     let dir = temp_dir("dep_map_view_chain");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    write_identity_circuit(&mut engine, 7, 100, None);
-    write_identity_circuit(&mut engine, 8, 7, None);
+    write_identity_circuit(&mut engine, 107, 100, None);
+    write_identity_circuit(&mut engine, 108, 107, None);
 
     let dep_map = engine.dag.get_dep_map(&engine.registry).clone();
-    assert_eq!(dep_map.get(&100), Some(&vec![7]), "base 100 feeds view 7");
-    assert_eq!(dep_map.get(&7), Some(&vec![8]), "view 7 feeds view 8");
-    assert_eq!(engine.dag.get_source_ids(&engine.registry, 7), vec![100]);
-    assert_eq!(engine.dag.get_source_ids(&engine.registry, 8), vec![7]);
-    // The dependency order every cascade walks — `hook_relation_register`'s
-    // registration order and `compute_invalid_views`' invalidity propagation.
-    assert_eq!(engine.dag.order_by_view_deps(&engine.registry, &[8, 7]), vec![7, 8]);
-    assert_eq!(engine.dag.order_by_view_deps(&engine.registry, &[8, 7, 8]), vec![7, 8]);
+    assert_eq!(dep_map.get(&100), Some(&vec![107]), "base 100 feeds view 107");
+    assert_eq!(dep_map.get(&107), Some(&vec![108]), "view 107 feeds view 108");
+    assert_eq!(engine.dag.get_source_ids(&engine.registry, 107), vec![100]);
+    assert_eq!(engine.dag.get_source_ids(&engine.registry, 108), vec![107]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -772,9 +788,11 @@ fn test_circuit_table_surface_introspectable() {
     let dir = temp_dir("circuit_surface");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    // Inject a row directly into CIRCUIT_NODES so the store is non-empty: view 7,
+    // Inject a row directly into CIRCUIT_NODES so the store is non-empty: view 107,
     // with a single node, through the shared row codec.
-    write_circuit_chain(&mut engine, 7, &[(gnitz_wire::Opcode::ScanDelta, Some(100), None)]);
+    let mut circuit = gnitz_wire::Circuit::default();
+    circuit.input_delta(100, None);
+    write_circuit(&mut engine, 107, circuit);
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
@@ -782,7 +800,7 @@ fn test_circuit_table_surface_introspectable() {
     assert_eq!(scan.len(), 1, "scan must expose CircuitNodes rows");
 
     // Compound PK: a point read by the 16-byte at-rest `(view_id, node_id)` OPK region.
-    let pk_bytes = opk_pk(SysFamily::CircuitNodes.schema(), &[7, 0]);
+    let pk_bytes = opk_pk(SysFamily::CircuitNodes.schema(), &[107, 0]);
     let found = pk_group(&mut engine, CIRCUIT_NODES_TAB_ID, &pk_bytes);
     assert_eq!(found.len(), 1, "the CircuitNodes row by PK");
 

@@ -113,7 +113,7 @@ pub enum ExprValidateErr {
 /// printed is the one [`LogicalProgram::from_wire`] enforces. The three variants
 /// an API mistake can raise get sentences — a large SQL predicate or computed
 /// projection, and a `LogicalProgram` a client hand-built through
-/// [`crate::ExprBuilder`] and `gnitz_core::CircuitBuilder`. The rest are
+/// [`crate::ExprBuilder`] and `gnitz_wire::Circuit`. The rest are
 /// internal-shape violations with no user action, rendered as `Debug`.
 impl fmt::Display for ExprValidateErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

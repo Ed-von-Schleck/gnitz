@@ -9,7 +9,7 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical::Frame;
 use crate::validate::reject_float_keys;
-use gnitz_core::{CircuitBuilder, ColumnDef, ReindexSlot, TypeCode};
+use gnitz_core::{Circuit, ColumnDef, ReindexSlot, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -39,7 +39,7 @@ pub(super) fn lower_setop(
     // UNION / UNION ALL are linear merges the dag drives by cloning one epoch's
     // delta to both sides; every other operator needs two distinct sources.
     let sides = open_pair(chain, memo, [left, right], [&live_l, &live_r], *op != SetOpKind::Union)?;
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     let mut hashed = Vec::with_capacity(2);
     for (i, side) in sides.into_iter().enumerate() {
         let (node, frame) = side.emit(&mut cb, Top::Slots, "set operation input")?;
@@ -76,7 +76,7 @@ pub(super) fn lower_setop(
     };
     cb.sink(out_node);
     Ok(EmitPieces {
-        circuit: cb.build(),
+        circuit: cb,
         out: hashed_out("_set_pk", out.iter().map(|c| &c.out)),
     })
 }
@@ -93,14 +93,14 @@ pub(super) fn lower_distinct(
     reject_float_keys(side_cols.iter().map(|c| &c.def), "SELECT DISTINCT")?;
     let ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
     let spine = open(chain, memo, input, &ids.iter().copied().collect())?;
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     let (node, frame) = spine.emit(&mut cb, Top::Slots, "SELECT DISTINCT input")?;
     let slots = slots_of(&frame.layout, &ids)?;
     let sharded = hash_shard_side(&mut cb, node, &self_derived_key(&slots), 0);
     let distinct_node = cb.distinct(sharded);
     cb.sink(distinct_node);
     Ok(EmitPieces {
-        circuit: cb.build(),
+        circuit: cb,
         out: hashed_out("_distinct_pk", side_cols.iter()),
     })
 }
@@ -122,7 +122,7 @@ fn hashed_out<'a>(pk_name: &str, cols: impl Iterator<Item = &'a HirCol>) -> Fram
 /// carrying a promotion target into the promoted layout so both set-op sides
 /// share one physical representation — then shard by that PK.
 fn hash_shard_side(
-    cb: &mut CircuitBuilder,
+    cb: &mut Circuit,
     filtered: gnitz_core::NodeId,
     cols: &[ReindexSlot],
     branch_id: u8,
@@ -145,7 +145,7 @@ fn hash_shard_side(
 /// form clamps each side to {0,1} via `distinct` so the arithmetic is set-valued;
 /// `all` keeps the raw per-row bag counts.
 fn set_op_leaves(
-    cb: &mut CircuitBuilder,
+    cb: &mut Circuit,
     all: bool,
     left: gnitz_core::NodeId,
     right: gnitz_core::NodeId,

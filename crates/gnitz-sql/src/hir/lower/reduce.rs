@@ -8,7 +8,7 @@ use crate::agg::agg_col_def;
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::validate::reject_duplicate_column_names;
-use gnitz_core::CircuitBuilder;
+use gnitz_core::Circuit;
 use gnitz_wire::{AggDescriptor, AggFunc as WireAggFunc};
 use std::collections::HashSet;
 
@@ -29,9 +29,10 @@ pub(super) fn lower_reduce(
     let mut live: HashSet<ColId> = group_cols.iter().copied().collect();
     live.extend(aggs.iter().filter_map(|a| a.arg));
     let spine = open(chain, memo, input, &live)?;
-    // A chain-minted segment carries no descriptor, and is never replicated anyway.
+    // A chain-minted segment carries no descriptor, so it plans as partitioned; the
+    // engine elides the exchange of a view whose sources are all replicated.
     let replicated = spine.replicated();
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     // The spine's output is what the reduce groups and aggregates over, so the
     // group/argument positions, the strategy and the reduce-output layout all
     // resolve against it.
@@ -89,5 +90,5 @@ pub(super) fn lower_reduce(
     let (node, out) = project_tail(&mut cb, filtered, items, &having_frame)?;
     reject_duplicate_column_names(out.schema.columns.iter(), "GROUP BY view")?;
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb.build(), out })
+    Ok(EmitPieces { circuit: cb, out })
 }

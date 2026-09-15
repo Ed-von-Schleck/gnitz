@@ -11,7 +11,7 @@ use super::{
 use crate::access::ranked_index_bounds;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{CircuitBuilder, NodeId, RelDescriptor, Schema};
+use gnitz_core::{Circuit, NodeId, RelDescriptor, Schema};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -132,7 +132,7 @@ impl Spine<'_> {
     /// Emit the levels into `cb`. A rename-only projection relabels the frame
     /// instead of emitting a node, except the outermost one under `Top::Output`;
     /// `what` names an emitted projection whose schema is inadmissible.
-    pub(crate) fn emit(self, cb: &mut CircuitBuilder, top: Top, what: &str) -> Result<(NodeId, Frame), GnitzSqlError> {
+    pub(crate) fn emit(self, cb: &mut Circuit, top: Top, what: &str) -> Result<(NodeId, Frame), GnitzSqlError> {
         let Spine { seg, levels } = self;
         let SegInput { tid, mut frame, desc } = seg;
         let output_at = match top {
@@ -181,7 +181,7 @@ impl Spine<'_> {
 /// `tid`'s delta node, bounded by what `leading` gives a catalog source, then one
 /// filter per leading WHERE.
 fn source(
-    cb: &mut CircuitBuilder,
+    cb: &mut Circuit,
     tid: u64,
     desc: &Option<Arc<RelDescriptor>>,
     frame: &Frame,
@@ -235,8 +235,8 @@ pub(super) fn lower_linear(
 ) -> Result<EmitPieces, GnitzSqlError> {
     let live = items.iter().map(|it| it.out.id).collect();
     let spine = open(chain, memo, rel, &live)?;
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     let (node, out) = spine.emit(&mut cb, Top::Output, "view output")?;
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb.build(), out })
+    Ok(EmitPieces { circuit: cb, out })
 }

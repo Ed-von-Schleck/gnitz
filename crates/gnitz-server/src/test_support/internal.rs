@@ -7,11 +7,11 @@
 use crate::catalog::{CatalogEngine, ColumnDef, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
-    write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row,
-    CircuitNodeRow, ColTabRow, IdxTabRow, TableTabRow, ViewTabRow,
+    write_circuit_rows, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row, ColTabRow,
+    IdxTabRow, TableTabRow, ViewTabRow,
 };
 use gnitz_wire::type_code;
-use gnitz_wire::Opcode;
+use gnitz_wire::{Circuit, IndexBound};
 
 // ── Catalog ColumnDef fixtures ────────────────────────────────────────────
 //
@@ -71,43 +71,20 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
 // Circuit + view fixtures
 // ---------------------------------------------------------------------------
 
-/// One circuit node for [`write_circuit_chain`]: opcode, source table, and the
-/// optional parameter blob.
-type CircuitNode<'a> = (Opcode, Option<i64>, Option<&'a [u8]>);
-
-/// Write `vid`'s circuit through the applied-delta path: one node per entry of
-/// `nodes`, chained `i → i+1` on the first input slot.
-pub fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[CircuitNode<'_>]) {
+/// Write `vid`'s circuit through the applied-delta path, through the row writer
+/// the client commits with.
+pub fn write_circuit(engine: &mut CatalogEngine, vid: i64, circuit: Circuit) {
     let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-    for (i, &(opcode, source, params)) in nodes.iter().enumerate() {
-        write_circuit_node_row(
-            &mut bb,
-            &CircuitNodeRow {
-                view_id: vid as u64,
-                node_id: i as u64,
-                opcode: opcode.as_wire(),
-                source_table: source.map(|t| t as u64),
-                inputs: [i.checked_sub(1).map(|p| p as u64), None],
-                params,
-            },
-            1,
-        );
-    }
+    write_circuit_rows(&mut bb, vid as u64, circuit);
     engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
 }
 
-/// The minimal identity circuit `ScanDelta(source) → Integrate`. `scan_params`
-/// is the scan node's optional parameter blob — a bounded-scan fixture ships its
-/// index column list and `RangeDescriptor` there.
-pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, scan_params: Option<&[u8]>) {
-    write_circuit_chain(
-        engine,
-        vid,
-        &[
-            (Opcode::ScanDelta, Some(source_tid), scan_params),
-            (Opcode::IntegrateSink, None, None),
-        ],
-    );
+/// The minimal identity circuit `ScanDelta(source, bound) → Integrate`.
+pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, bound: Option<IndexBound>) {
+    let mut circuit = Circuit::default();
+    let scan = circuit.input_delta(source_tid as u64, bound);
+    circuit.sink(scan);
+    write_circuit(engine, vid, circuit);
 }
 
 // ── Positional row builders ──────────────────────────────────────────────

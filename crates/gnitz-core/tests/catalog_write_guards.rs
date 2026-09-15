@@ -388,16 +388,15 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
         .unwrap();
     let first = client.create_view("mixed", "v", tid, &cols).unwrap();
 
-    let mut cb = gnitz_core::CircuitBuilder::new();
-    let scan = cb.input_delta(tid, None);
-    cb.sink(scan);
+    let mut circuit = gnitz_core::Circuit::default();
+    let scan = circuit.input_delta(tid, None);
+    circuit.sink(scan);
     let vids = client
         .create_view_chain(
             "mixed",
             "v",
             vec![gnitz_core::PlannedView {
-                seg: 0,
-                circuit: cb.build(),
+                circuit,
                 output_columns: cols.to_vec(),
                 pk_cols: vec![0],
                 capacity_bytes: None,
@@ -489,6 +488,55 @@ fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
 
     // The table it named is still droppable, which is the whole point.
     client.drop_table("phantomview", &["t"], false).unwrap();
+}
+
+/// A view whose circuit scans itself would make its own backfill and tick order
+/// undefined; ascending id order is dependency order only while every scan edge
+/// names an older relation, so the engine refuses the bundle before applying it.
+#[test]
+fn a_view_scanning_itself_is_refused() {
+    let srv = ServerHandle::start();
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let mut s = session(&srv);
+    let sid = s.alloc_schema_id().unwrap();
+    s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "selfscan"))]).unwrap();
+
+    let vid = s.alloc_table_id().unwrap();
+    let mut circuit = gnitz_core::Circuit::default();
+    let scan = circuit.input_delta(vid, None);
+    circuit.sink(scan);
+    let nodes = sys_schema(gnitz_wire::CIRCUIT_NODES_TAB);
+    let mut nb = ZSetBatch::new(nodes);
+    gnitz_wire::sys_rows::write_circuit_rows(&mut BatchAppender::new(&mut nb, nodes), vid, circuit);
+    let view_s = sys_schema(gnitz_wire::VIEW_TAB);
+    let mut vb = ZSetBatch::new(view_s);
+    gnitz_wire::sys_rows::write_view_tab_row(
+        &mut BatchAppender::new(&mut vb, view_s),
+        &gnitz_wire::sys_rows::ViewTabRow {
+            view_id: vid,
+            schema_id: sid,
+            name: "v",
+            pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
+            capacity_bytes: 0,
+            delta_bytes: 0,
+            owner_view_id: 0,
+        },
+        1,
+    );
+    let err = format!(
+        "{:?}",
+        s.push_ddl_txn(&[
+            (COL_TAB, two_columns_as(vid, gnitz_wire::OWNER_KIND_VIEW)),
+            (gnitz_wire::CIRCUIT_NODES_TAB, nb),
+            (gnitz_wire::VIEW_TAB, vb),
+        ])
+        .unwrap_err()
+    );
+    assert!(err.contains("not older"), "{err}");
+
+    // The refusal wrote nothing and the server still answers.
+    assert!(client.resolve("selfscan", "v").unwrap().is_none());
+    a_table(&mut client, "selfscan_after");
 }
 
 /// Two `+1` rows under one schema name both pass the cache check and both apply:

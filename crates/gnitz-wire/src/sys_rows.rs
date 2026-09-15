@@ -211,6 +211,25 @@ pub fn write_circuit_node_row(sink: &mut impl SysRowSink, r: &CircuitNodeRow, we
     sink.end_row();
 }
 
+/// Write every node of `view_id`'s circuit at `+1`, each keyed by its index.
+pub fn write_circuit_rows(sink: &mut impl SysRowSink, view_id: u64, circuit: crate::Circuit) {
+    for (node_id, node) in circuit.nodes().iter().enumerate() {
+        let (opcode, source_table, params) = crate::encode_op_node(node.op.clone());
+        write_circuit_node_row(
+            sink,
+            &CircuitNodeRow {
+                view_id,
+                node_id: node_id as u64,
+                opcode: opcode.as_wire(),
+                source_table,
+                inputs: node.inputs.to_slots(),
+                params: params.as_deref(),
+            },
+            1,
+        );
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/sys_rows.rs"]
 mod tests;

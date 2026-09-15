@@ -241,7 +241,7 @@ pub fn output_shape(chain: &PlannedChain) -> Vec<(String, bool, bool)> {
 
 /// How many of `circuit`'s nodes satisfy `pred`.
 pub fn count(circuit: &Circuit, pred: impl Fn(&OpNode) -> bool) -> usize {
-    circuit.nodes.values().filter(|op| pred(op)).count()
+    circuit.nodes().iter().filter(|n| pred(&n.op)).count()
 }
 
 /// Plan `sql` the way `dispatch` does: run the pass, resolve each name it

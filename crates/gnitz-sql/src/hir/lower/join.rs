@@ -13,7 +13,8 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical::Frame;
 
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole};
+use gnitz_core::{Circuit, ColumnDef, NodeId, ReindexRole};
+use gnitz_wire::JoinKind;
 
 /// Lower a `Project(Filter?(Join))` tree's join to circuit pieces, whose output
 /// leads with the `k` hidden `_join_pk` / `_pair_pk` slots, then the projected
@@ -30,7 +31,7 @@ pub(super) fn lower_join_view(
     };
     let down = Demand { items, where_preds };
 
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     let ([a, b], sides) = emit_join_inputs(chain, memo, &mut cb, down, [left, right], *kind, class)?;
 
     let (node, frame) = match class.shape() {
@@ -47,20 +48,26 @@ pub(super) fn lower_join_view(
         _ => cb.shard(node, &(0..out.npk() as u32).collect::<Vec<_>>()),
     };
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb.build(), out })
+    Ok(EmitPieces { circuit: cb, out })
 }
 
 // ── Equi emission ───────────────────────────────────────────────────────────────
 
 fn emit_equi(
-    cb: &mut CircuitBuilder,
+    cb: &mut Circuit,
     inputs: [NodeId; 2],
     down: Demand<'_>,
     class: &JoinClass,
     kind: JoinType,
     sides: &[JoinSide; 2],
 ) -> Result<(NodeId, Frame), GnitzSqlError> {
-    let terms = equi_prologue(cb, &class.eq, sides, inputs)?;
+    let terms = equi_prologue(
+        cb,
+        &class.eq,
+        sides,
+        inputs,
+        [kind.preserves(true), kind.preserves(false)],
+    )?;
     let inner_merged = terms.merged(cb);
     let merged = emit_equi_null_fill(cb, inner_merged, kind, &terms);
 
@@ -78,7 +85,7 @@ fn emit_equi(
 // ── Range / band emission ───────────────────────────────────────────────────────
 
 fn emit_range(
-    cb: &mut CircuitBuilder,
+    cb: &mut Circuit,
     [input_a, input_b]: [NodeId; 2],
     down: Demand<'_>,
     class: &JoinClass,
@@ -161,7 +168,7 @@ fn emit_range(
 /// source PK, which takes no part in the match — it only partitions the trace the
 /// broadcast delta is paired against.
 fn emit_cross(
-    cb: &mut CircuitBuilder,
+    cb: &mut Circuit,
     [input_a, input_b]: [NodeId; 2],
     down: Demand<'_>,
     sides: &[JoinSide; 2],
@@ -178,8 +185,8 @@ fn emit_cross(
     let int_b = cb.worker_filter(reindex_b);
     let trace_a = cb.integrate_trace(int_a);
     let trace_b = cb.integrate_trace(int_b);
-    let join_ab = cb.join_with_trace_cross_node(reindex_a, trace_b); // [a.pk × pa, A, B]
-    let join_ba = cb.join_with_trace_cross_node(reindex_b, trace_a); // [b.pk × pb, B, A]
+    let join_ab = cb.join(reindex_a, trace_b, JoinKind::Cross); // [a.pk × pa, A, B]
+    let join_ba = cb.join(reindex_b, trace_a, JoinKind::Cross); // [b.pk × pb, B, A]
 
     // Re-key both terms onto the pair-PK: their key regions are two different
     // source keys, and a union needs one schema. `keep` is the reindex's OUTPUT

@@ -3,19 +3,6 @@ use crate::query::compiler::fixtures::*;
 use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
 use gnitz_store::storage::Slot;
 use gnitz_wire::OpNode;
-use std::collections::HashMap;
-
-#[test]
-fn a_cyclic_circuit_is_rejected() {
-    let nodes = HashMap::from([(0, OpNode::Negate), (1, OpNode::Negate)]);
-    assert_eq!(
-        rejection(load::topo_sorted(
-            nodes.into_iter().collect(),
-            wire_slots(&[(0, 1, SLOT_IN), (1, 0, SLOT_IN)])
-        )),
-        "circuit graph has a cycle"
-    );
-}
 
 // ── load_circuit against the real system tables ─────────────────────────
 
@@ -121,14 +108,13 @@ impl CircuitTables {
 }
 
 /// Every malformed-row shape must abort the WHOLE load and say which check
-/// fired: skipping a row would leave an input dangling and silently corrupt the
-/// topological order.
+/// fired: skipping a row would leave an input dangling.
 #[test]
 fn a_malformed_row_aborts_the_load_and_names_the_check() {
     // An opcode `decode_op_node` rejects. Its own reason is what surfaces —
     // interpolated value and all — not a bare "failed to decode".
     let mut c = CircuitTables::new();
-    c.put_nodes(|bb| CircuitTables::raw_row(bb, CircuitTables::VIEW_ID, 1, 9999, None, None, None));
+    c.put_nodes(|bb| CircuitTables::raw_row(bb, CircuitTables::VIEW_ID, 0, 9999, None, None, None));
     assert_eq!(
         rejection(c.load()),
         "unknown opcode 9999",
@@ -142,7 +128,27 @@ fn a_malformed_row_aborts_the_load_and_names_the_check() {
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, scan_delta(99), None);
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, OpNode::IntegrateSink, Some(7));
     });
-    assert_eq!(rejection(c.load()), "a node's input is not a node of the circuit");
+    assert_eq!(rejection(c.load()), "a node's input is not an earlier node");
+
+    // A gap in the ids: node 1 is missing, so node 2's index would not be its id.
+    let mut c = CircuitTables::new();
+    c.put_nodes(|bb| {
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, scan_delta(99), None);
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 2, OpNode::IntegrateSink, Some(0));
+    });
+    assert_eq!(rejection(c.load()), "circuit node ids are not dense from 0");
+}
+
+/// A cycle cannot be written as rows the load accepts: its first node would have
+/// to read a later one.
+#[test]
+fn a_node_reading_a_later_node_is_rejected() {
+    let mut c = CircuitTables::new();
+    c.put_nodes(|bb| {
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, OpNode::Negate, Some(1));
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, OpNode::Negate, Some(0));
+    });
+    assert_eq!(rejection(c.load()), "a node's input is not an earlier node");
 }
 
 /// The load is filtered to one view's rows by the `view_id` OPK prefix, and a
@@ -161,9 +167,9 @@ fn the_load_takes_one_views_rows_and_keeps_a_damaged_program_present() {
         CircuitTables::raw_row(bb, CircuitTables::VIEW_ID + 1, 2, 9999, None, None, None);
     });
     let loaded = c.load().expect("a damaged program is not a load failure");
-    assert_eq!(loaded.nodes.len(), 2, "only this view's nodes are loaded");
+    assert_eq!(loaded.len(), 2, "only this view's nodes are loaded");
     assert!(
-        matches!(loaded.nodes.get(&1), Some(OpNode::Filter(b)) if b == &[0xff]),
+        matches!(loaded.op(1), OpNode::Filter(b) if b == &[0xff]),
         "an undecodable program must stay present, not collapse to a pass-all filter"
     );
 }
@@ -179,28 +185,31 @@ fn a_load_from_unopened_system_tables_fails() {
     );
 }
 
-/// Slot 1 is filled solely by a binary join, but the circuit family carries no
-/// catalog precheck, so a forged bundle can fill it anywhere — handing a reduce a
-/// delta register with no `Integrate` behind it, and aborting a worker on the
-/// null cursor. This one load-time check stands in for the arity test each
-/// operand read would otherwise carry.
+/// Slot 1 is filled solely by a binary join, but a forged bundle can fill it
+/// anywhere — handing a reduce a delta register with no `Integrate` behind it,
+/// and aborting a worker on the null cursor. `Circuit::push`, which every loaded
+/// node passes through, stands in for the arity test each operand read would
+/// otherwise carry.
 #[test]
-fn arity_violations_fail_at_load() {
-    let load = |dst: OpNode, edges: &[(i32, i32, usize)]| {
-        let nodes = HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, dst)]);
-        load::topo_sorted(nodes.into_iter().collect(), wire_slots(edges))
+fn arity_violations_are_refused() {
+    use gnitz_wire::NodeInputs;
+    let push = |dst: OpNode, inputs: NodeInputs| {
+        let mut c = gnitz_wire::Circuit::default();
+        c.push(scan_delta(10), NodeInputs::Source).unwrap();
+        c.push(scan_delta(11), NodeInputs::Source).unwrap();
+        c.push(dst, inputs)
     };
-    let rejected = |r: Result<LoadedCircuit, String>, what: &str| {
+    let rejected = |r: Result<NodeId, String>, what: &str| {
         assert_eq!(
             rejection(r),
             "node's inputs do not match its operator's arity",
-            "{what} must fail at load",
+            "{what} must be refused",
         );
     };
-    assert!(load(OpNode::Negate, &[(0, 2, SLOT_IN)]).is_ok(), "control");
+    assert_eq!(push(OpNode::Negate, NodeInputs::Unary(0)), Ok(2), "control");
 
     rejected(
-        load(
+        push(
             OpNode::Reduce {
                 group_cols: vec![0],
                 agg: vec![gnitz_wire::AggDescriptor {
@@ -209,15 +218,15 @@ fn arity_violations_fail_at_load() {
                 }],
                 global_ground: false,
             },
-            &[(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)],
+            NodeInputs::Binary { a: 0, b: 1 },
         ),
         "a forged Reduce trace input",
     );
     rejected(
-        load(OpNode::ExchangeShard { shard_cols: vec![0] }, &[]),
+        push(OpNode::ExchangeShard { shard_cols: vec![0] }, NodeInputs::Source),
         "an input-less ExchangeShard",
     );
-    rejected(load(OpNode::Union, &[(0, 2, SLOT_IN)]), "a Union wired on one slot");
+    rejected(push(OpNode::Union, NodeInputs::Unary(0)), "a Union wired on one slot");
 }
 
 /// The node cap is what keeps every downstream `u16` id — registers, tables —
@@ -225,23 +234,21 @@ fn arity_violations_fail_at_load() {
 /// constructor every plan passes through rather than at each plan build.
 #[test]
 fn a_circuit_over_the_node_limit_is_rejected() {
-    let n = MAX_CIRCUIT_NODES as i32 + 1;
-    let mut nodes = HashMap::from([(0, scan_delta(10))]);
-    let mut edges = Vec::new();
-    for nid in 1..n {
-        nodes.insert(nid, OpNode::Negate);
-        edges.push((nid - 1, nid, SLOT_IN));
-    }
+    use gnitz_wire::NodeInputs;
+    let chain = |n: usize| {
+        let mut c = gnitz_wire::Circuit::default();
+        c.push(scan_delta(10), NodeInputs::Source).unwrap();
+        for nid in 1..n {
+            c.push(OpNode::Negate, NodeInputs::Unary(nid - 1)).unwrap();
+        }
+        LoadedCircuit::new(c)
+    };
     assert_eq!(
-        load::topo_sorted(nodes.clone().into_iter().collect(), wire_slots(&edges))
-            .map(|_| "a circuit")
-            .expect_err("over the limit"),
+        rejection(chain(MAX_CIRCUIT_NODES + 1)),
         "circuit exceeds the node limit"
     );
-    nodes.remove(&(n - 1));
-    edges.pop();
     assert!(
-        load::topo_sorted(nodes.into_iter().collect(), wire_slots(&edges)).is_ok(),
+        chain(MAX_CIRCUIT_NODES).is_ok(),
         "exactly MAX_CIRCUIT_NODES is accepted"
     );
 }

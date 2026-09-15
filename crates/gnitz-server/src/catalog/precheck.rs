@@ -11,8 +11,9 @@ use gnitz_store::schema::make_index_schema;
 use gnitz_store::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
-    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_OWNER_KIND,
-    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
+    CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_SOURCE_TABLE, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN,
+    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE,
+    IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
 };
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
@@ -217,7 +218,12 @@ fn check_col_ident(batch: &Batch, row: usize, owner_id: i64, expect_kind: i64) -
 
 /// A circuit `+1` may only name a view this same transaction creates: one under a
 /// foreign `view_id` would pin its source table's drop or rewrite a running circuit.
-fn check_circuit_view_ids(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
+///
+/// A `ScanDelta` row must scan a relation older than its view. Ids are drawn from
+/// one ascending counter and a source exists before its view, so every legitimate
+/// bundle passes — and ascending id order stays a dependency order, which the tick
+/// scheduler, the backfill and view registration sort by.
+fn check_circuit_rows(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
     // Sorted once: this runs per row of a client-supplied block bounded only by
     // the 64 MB frame.
     let mut created: Vec<i64> = new_view_ids.to_vec();
@@ -228,6 +234,14 @@ fn check_circuit_view_ids(batch: &Batch, new_view_ids: &[i64]) -> Result<(), Str
             return Err(format!(
                 "circuit row names view {view_id}, which this transaction does not create"
             ));
+        }
+        if payload_u64(batch, i, CIRCNODES_PAY_OPCODE) == gnitz_wire::Opcode::ScanDelta.as_wire() {
+            let source = payload_u64(batch, i, CIRCNODES_PAY_SOURCE_TABLE);
+            if source >= view_id as u64 {
+                return Err(format!(
+                    "circuit row of view {view_id} scans relation {source}, which is not older than it"
+                ));
+            }
         }
     }
     Ok(())
@@ -710,7 +724,7 @@ impl CatalogEngine {
             self.check_column_owners(cols, families)?;
         }
         if let Some(b) = families[SysFamily::CircuitNodes.index()].as_ref() {
-            check_circuit_view_ids(b, new_view_ids)?;
+            check_circuit_rows(b, new_view_ids)?;
         }
         Ok(())
     }

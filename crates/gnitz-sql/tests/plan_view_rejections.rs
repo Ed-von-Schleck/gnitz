@@ -115,26 +115,6 @@ fn join_key_rules() {
     let over_cap = format!("SELECT * FROM wide_a JOIN wide_b ON {}", on.join(" AND "));
     let at_cap = format!("SELECT * FROM wide_a JOIN wide_b ON {}", on[..n - 1].join(" AND "));
     view(&cat, &at_cap);
-    // A narrow output over a wide intermediate: every column of both sides is read,
-    // but by fewer items than columns — so the join's own projection outgrows the
-    // cap while the registered view does not.
-    let names: Vec<String> = ["id".to_string(), "fk".to_string()]
-        .into_iter()
-        .chain((0..31).map(|n| format!("c{n}")))
-        .collect();
-    let mut items: Vec<String> = names
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("wl.{c} AS l{i}"))
-        .collect();
-    items.extend(names[..27].iter().enumerate().map(|(i, c)| format!("wr.{c} AS r{i}")));
-    items.extend(
-        names[27..]
-            .chunks(2)
-            .enumerate()
-            .map(|(i, p)| format!("wr.{} + wr.{} AS x{i}", p[0], p[1])),
-    );
-    let wide_middle = format!("SELECT {} FROM wl JOIN wr ON wl.fk = wr.fk", items.join(", "));
     rejects(
         &cat,
         &[
@@ -195,7 +175,6 @@ fn join_key_rules() {
                 "Unsupported",
                 "MAX_COLUMNS",
             ),
-            (&wide_middle, "Unsupported", "a view circuit projection has 66 columns"),
             (
                 "SELECT a.v AS x, b.w AS x FROM a JOIN b ON a.k = b.k",
                 "Plan",

@@ -11,12 +11,12 @@ use crate::protocol::{
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::circuit::Circuit;
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::DeltaPollItem;
+use gnitz_wire::Circuit;
 use gnitz_wire::{
     RelClass, TableProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COL_TAB,
     IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, OWNER_KIND_TABLE,
@@ -214,14 +214,17 @@ pub fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
     Ok(Schema { columns, pk_cols })
 }
 
+/// The symbolic id naming element `j` of a view bundle from a later element's
+/// `ScanDelta`. Symbolic ids start at [`gnitz_wire::RELATION_ID_CEILING`], which
+/// no durable relation id reaches, so `create_view_chain` tells them apart from
+/// real relation ids and substitutes the id it allocated — a bundle reaches no
+/// server while it is built.
+pub fn segment_id(j: u64) -> u64 {
+    gnitz_wire::RELATION_ID_CEILING + j
+}
+
 /// One view in a [`GnitzClient::create_view_chain`] bundle.
 pub struct PlannedView {
-    /// This view's slot within the bundle, distinct among its siblings. A
-    /// downstream `ScanDelta` names its upstream by
-    /// [`segment_id`](crate::segment_id) of that slot, which
-    /// `create_view_chain` substitutes for the id it allocated — so a bundle
-    /// reaches no server while it is built.
-    pub seg: u32,
     pub circuit: Circuit,
     pub output_columns: Vec<ColumnDef>,
     pub pk_cols: Vec<u32>,
@@ -1343,20 +1346,18 @@ impl GnitzClient {
     ) -> Result<u64, ClientError> {
         // A minimal SCAN_DELTA → INTEGRATE_SINK circuit, built through the typed
         // builder so the row materialisation matches the stored layout exactly.
-        let mut cb = crate::circuit::CircuitBuilder::new();
-        let scan = cb.input_delta(source_table_id, None);
-        cb.sink(scan);
+        let mut circuit = Circuit::default();
+        let scan = circuit.input_delta(source_table_id, None);
+        circuit.sink(scan);
 
         let vids = self.create_view_chain(
             schema_name,
             view_name,
             vec![PlannedView {
-                seg: 0,
-                circuit: cb.build(),
+                circuit,
                 output_columns: output_columns.to_vec(),
                 // Minimal SCAN→SINK passthrough: single output PK at slot 0.
                 pk_cols: vec![0],
-                // The circuit-builder API has no options surface at all.
                 capacity_bytes: None,
                 delta_bytes: None,
             }],
@@ -1382,6 +1383,8 @@ impl GnitzClient {
     ///
     /// **`views.last()` is the user-named view and takes `view_name`**; every
     /// earlier element is an internal segment it owns — see [`segment_name`].
+    /// [`segment_id`]`(j)` inside `views[k]` names `views[j]`, which the engine
+    /// requires to precede it.
     ///
     /// `replace` supersedes the view already holding this name: `false` leaves a
     /// name collision to the engine, `true` makes a missing view an error. Its
@@ -1431,17 +1434,12 @@ impl GnitzClient {
 
         // The whole bundle is assigned in one allocation before any substitution
         // runs, because a downstream segment's `ScanDelta` names an upstream
-        // segment by its chain-local slot.
+        // segment by its position.
         let base = self.alloc(IdRun::Tables(views.len() as u64))?;
         let vids: Vec<u64> = (0..views.len() as u64).map(|k| base + k).collect();
         // The user-named view is the bundle's last element, and every segment
         // names it as owner.
         let owner_vid = *vids.last().expect("a non-empty bundle");
-        let seg_ids: HashMap<u64, u64> = views
-            .iter()
-            .zip(vids.iter().copied())
-            .map(|(pv, vid)| (crate::segment_id(pv.seg as u64), vid))
-            .collect();
 
         // One batch per family, spanning all views. COL_TAB and VIEW_TAB are
         // always non-empty; the circuit family is included only if some view
@@ -1466,9 +1464,15 @@ impl GnitzClient {
 
             let last = views.len() - 1;
             for (k, (mut pv, vid)) in views.into_iter().zip(vids.iter().copied()).enumerate() {
-                // 0.5. Substitute the bundle's symbolic ids. Unconditional, so no
-                // path reaches a catalog write without the surviving-tag check.
-                pv.circuit.resolve_seg_ids(&seg_ids)?;
+                // 0.5. Substitute the bundle's symbolic ids. `base` is below the
+                // ceiling, so this cannot overflow; a forward or out-of-range tag
+                // becomes an id no lower than the view's own, which the engine
+                // refuses.
+                for src in pv.circuit.sources_mut() {
+                    if *src >= gnitz_wire::RELATION_ID_CEILING {
+                        *src = base + (*src - gnitz_wire::RELATION_ID_CEILING);
+                    }
+                }
                 let (name, owner_view_id) = if k == last {
                     (view_name.clone(), 0)
                 } else {
@@ -1479,7 +1483,7 @@ impl GnitzClient {
                 append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns);
 
                 // 2. Circuit node rows.
-                append_circuit_rows(&mut nodes_a, vid, pv.circuit);
+                gnitz_wire::sys_rows::write_circuit_rows(&mut nodes_a, vid, pv.circuit);
 
                 // 3. View row — the VIEW_TAB register hook triggers server-side
                 // compilation. Encode the view PK with the shared wire packer so the
@@ -1501,8 +1505,7 @@ impl GnitzClient {
         }
 
         // One families entry per tid (mandatory: the engine's derived lists read
-        // only the first block per family), in dependency order — the server
-        // re-sorts by topo priority anyway.
+        // only the first block per family).
         let mut families: Vec<(u64, ZSetBatch)> = Vec::new();
         families.push((COL_TAB, col_batch));
         if !nodes_batch.is_empty() {
@@ -1996,29 +1999,6 @@ fn checked_sys_rows(family: u64, reply: ScanReply) -> Result<ZSetBatch, ClientEr
 fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, owner_kind: u64, columns: &[ColumnDef]) {
     for (i, cd) in columns.iter().enumerate() {
         gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, owner_kind, i), 1);
-    }
-}
-
-/// Append a circuit's node rows to the `CircuitNodes` batch appender under `vid`
-/// (the compound `(view_id, node_id)` PK prefix). The single home for the
-/// circuit family's wire layout, used by CREATE VIEW (`create_view_chain`).
-fn append_circuit_rows(nodes_a: &mut BatchAppender<'_>, vid: u64, circuit: crate::circuit::Circuit) {
-    use gnitz_wire::sys_rows::{write_circuit_node_row, CircuitNodeRow};
-    for (node_id, op) in circuit.nodes {
-        let inputs = circuit.inputs.get(&node_id).copied().unwrap_or([None; 2]);
-        let (opcode, source_table, params) = gnitz_wire::encode_op_node(op);
-        write_circuit_node_row(
-            nodes_a,
-            &CircuitNodeRow {
-                view_id: vid,
-                node_id,
-                opcode: opcode.as_wire(),
-                source_table,
-                inputs,
-                params: params.as_deref(),
-            },
-            1,
-        );
     }
 }
 

@@ -236,16 +236,15 @@ fn one_writev_per_burst() {
 /// planner, so the circuit is a `ScanDelta` into the sink the compiler takes as
 /// the plan's output register.
 fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
-    let mut b = gnitz_core::CircuitBuilder::new();
-    let src = b.input_delta(tid, None);
-    b.sink(src);
+    let mut circuit = gnitz_core::Circuit::default();
+    let src = circuit.input_delta(tid, None);
+    circuit.sink(src);
     let vids = client
         .create_view_chain(
             sn,
             "v",
             vec![gnitz_core::PlannedView {
-                seg: 0,
-                circuit: b.build(),
+                circuit,
                 output_columns: cols(),
                 pk_cols: vec![0],
                 capacity_bytes: None,

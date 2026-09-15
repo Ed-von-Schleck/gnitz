@@ -438,17 +438,16 @@ pub enum OpNode {
     PositivePart,
     Reduce {
         group_cols: Vec<u32>,
-        /// Aggregate specs `(func, source column)`. Never empty: a spec-less
-        /// REDUCE is rejected at decode (every producer ships at least one —
-        /// the SQL planner injects a companion COUNT for group-only reduces).
+        /// Aggregate specs `(func, source column)`. Carries a `Count`;
+        /// `ReducePlan::from_wire` refuses a list without one.
         agg: Vec<AggDescriptor>,
         /// True only for the user's ungrouped (global) scalar aggregate — the
         /// reduce that must emit exactly one row over an empty/fully-retracted
         /// source (COUNT(*)=0, SUM/MIN/MAX/AVG=NULL). A **SQL-intent
-        /// discriminator**, not a Z-set property: the LEFT range-join's threshold
-        /// reduce (`reduce_multi_local`) also has empty group cols but must NOT
-        /// seed a ground row, so the flag cannot be derived from
-        /// `group_cols.is_empty()` and travels explicitly from the planner.
+        /// discriminator**, not a Z-set property: the flag is false for any
+        /// group-less reduce that is not the user's scalar aggregate, so it
+        /// cannot be derived from `group_cols.is_empty()` and travels explicitly
+        /// from the planner.
         global_ground: bool,
     },
     Join(JoinKind),
@@ -473,7 +472,7 @@ pub enum OpNode {
     /// elements), each at the weight of the slots it fills. The output is keyed
     /// like a `Reduce` over the same group set ([`ReduceOutKey`]) and carries
     /// every input column behind that key. `order` columns index the input
-    /// schema. `limit` is never `0`.
+    /// schema. `TopNPlan::from_wire` refuses a `limit` of `0`.
     TopN {
         group_cols: Vec<u32>,
         order: Vec<crate::OrderKey>,
@@ -509,6 +508,292 @@ impl OpNode {
 }
 
 // ---------------------------------------------------------------------------
+// The circuit graph
+// ---------------------------------------------------------------------------
+
+pub type NodeId = usize;
+
+/// A node's producers, in the shape its operator's arity allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeInputs {
+    /// A `ScanDelta`: fed by the source drive, not by a producer.
+    Source,
+    Unary(NodeId),
+    /// `a` is slot 0 — a join's delta side, a union's left operand; `b` is slot
+    /// 1, the trace / right operand.
+    Binary {
+        a: NodeId,
+        b: NodeId,
+    },
+}
+
+impl NodeInputs {
+    /// The input slots of one `CircuitNodes` row. A filled slot 1 behind an empty
+    /// slot 0 is no shape an operator is wired on.
+    pub fn from_slots(slots: [Option<u64>; 2]) -> Result<NodeInputs, String> {
+        let id = |raw: u64| usize::try_from(raw).map_err(|_| EARLIER_NODE.to_string());
+        Ok(match slots {
+            [None, None] => NodeInputs::Source,
+            [Some(src), None] => NodeInputs::Unary(id(src)?),
+            [Some(a), Some(b)] => NodeInputs::Binary { a: id(a)?, b: id(b)? },
+            [None, Some(_)] => return Err(ARITY_MISMATCH.to_string()),
+        })
+    }
+
+    /// [`Self::from_slots`]'s inverse.
+    pub fn to_slots(self) -> [Option<u64>; 2] {
+        match self {
+            NodeInputs::Source => [None, None],
+            NodeInputs::Unary(src) => [Some(src as u64), None],
+            NodeInputs::Binary { a, b } => [Some(a as u64), Some(b as u64)],
+        }
+    }
+
+    /// The producer of a unary operator's operand.
+    pub fn unary(&self) -> NodeId {
+        match self {
+            NodeInputs::Unary(src) => *src,
+            _ => unreachable!("a unary operator fills exactly its one input slot"),
+        }
+    }
+
+    /// The producers of a binary operator's two operands, in port order.
+    pub fn binary(&self) -> (NodeId, NodeId) {
+        match self {
+            NodeInputs::Binary { a, b } => (*a, *b),
+            _ => unreachable!("a binary operator is wired on both ports"),
+        }
+    }
+
+    /// Every producer, for the walks that do not care about the operator.
+    pub fn iter(&self) -> impl Iterator<Item = NodeId> {
+        match *self {
+            NodeInputs::Source => [None, None],
+            NodeInputs::Unary(src) => [Some(src), None],
+            NodeInputs::Binary { a, b } => [Some(a), Some(b)],
+        }
+        .into_iter()
+        .flatten()
+    }
+}
+
+const ARITY_MISMATCH: &str = "node's inputs do not match its operator's arity";
+const EARLIER_NODE: &str = "a node's input is not an earlier node";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    pub op: OpNode,
+    pub inputs: NodeInputs,
+}
+
+/// A node's id is its index and every input names an earlier node: [`Self::push`]
+/// is the only constructor, so index order is a topological order and a cycle
+/// cannot be expressed. The engine emits instructions in this order, so the
+/// order builder methods are called in is the order the VM runs — a register
+/// read after the reader that could have moved it costs a copy per epoch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Circuit {
+    nodes: Vec<Node>,
+}
+
+impl Circuit {
+    pub fn nodes(&self) -> &[Node] {
+        &self.nodes
+    }
+
+    /// Append `op` wired on `inputs`, refusing an input count other than the
+    /// operator's [`OpNode::arity`] and an input that is not an earlier node.
+    pub fn push(&mut self, op: OpNode, inputs: NodeInputs) -> Result<NodeId, String> {
+        if op.arity() != inputs.iter().count() {
+            return Err(ARITY_MISMATCH.into());
+        }
+        if inputs.iter().any(|p| p >= self.nodes.len()) {
+            return Err(EARLIER_NODE.into());
+        }
+        self.nodes.push(Node { op, inputs });
+        Ok(self.nodes.len() - 1)
+    }
+
+    /// Every `ScanDelta` source, for the client's segment substitution.
+    pub fn sources_mut(&mut self) -> impl Iterator<Item = &mut u64> {
+        self.nodes.iter_mut().filter_map(|n| match &mut n.op {
+            OpNode::ScanDelta { source, .. } => Some(source),
+            _ => None,
+        })
+    }
+
+    fn add(&mut self, op: OpNode, inputs: NodeInputs) -> NodeId {
+        self.push(op, inputs)
+            .expect("a builder wires each operator on its arity to earlier nodes")
+    }
+
+    /// A source's delta input. `bound` narrows only the source's backfill scan,
+    /// never the rows the view holds, so the caller still emits the full `Filter`.
+    pub fn input_delta(&mut self, source: u64, bound: Option<crate::IndexBound>) -> NodeId {
+        self.add(OpNode::ScanDelta { source, bound }, NodeInputs::Source)
+    }
+
+    /// [`OpNode::Filter`] over an encoded predicate program.
+    pub fn filter(&mut self, input: NodeId, program: Vec<u8>) -> NodeId {
+        self.add(OpNode::Filter(program), NodeInputs::Unary(input))
+    }
+
+    /// [`MapKind::Compute`].
+    pub fn map_expr(&mut self, input: NodeId, map: ComputeMap) -> NodeId {
+        self.add(OpNode::Map(MapKind::Compute(map)), NodeInputs::Unary(input))
+    }
+
+    /// [`MapKind::Reindex`].
+    pub fn map_reindex(&mut self, input: NodeId, key: &[ReindexSlot], keep: &[u32], role: ReindexRole) -> NodeId {
+        assert!(!key.is_empty(), "a reindex map must name its key columns");
+        let op = OpNode::Map(MapKind::Reindex {
+            keep: keep.to_vec(),
+            key: key.to_vec(),
+            role,
+        });
+        self.add(op, NodeInputs::Unary(input))
+    }
+
+    /// [`MapKind::HashRow`].
+    pub fn map_hash_row(&mut self, input: NodeId, cols: &[ReindexSlot], branch_id: u8) -> NodeId {
+        let op = OpNode::Map(MapKind::HashRow { cols: cols.to_vec(), branch_id });
+        self.add(op, NodeInputs::Unary(input))
+    }
+
+    /// [`MapKind::Projection`].
+    pub fn map(&mut self, input: NodeId, projection: &[u32]) -> NodeId {
+        self.add(
+            OpNode::Map(MapKind::Projection(projection.to_vec())),
+            NodeInputs::Unary(input),
+        )
+    }
+
+    pub fn negate(&mut self, input: NodeId) -> NodeId {
+        self.add(OpNode::Negate, NodeInputs::Unary(input))
+    }
+
+    pub fn union(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        self.add(OpNode::Union, NodeInputs::Binary { a, b })
+    }
+
+    pub fn distinct(&mut self, input: NodeId) -> NodeId {
+        self.add(OpNode::Distinct, NodeInputs::Unary(input))
+    }
+
+    /// The weight-exact Z-set difference `positive_part(minuend − subtrahend)` as
+    /// `negate` → `union` → [`OpNode::PositivePart`].
+    ///
+    /// The operand order is a **cost** contract, not a correctness one: the engine
+    /// takes a union's first operand in place where nothing reads it later, and
+    /// clones it otherwise. `negate(subtrahend)` is freshly allocated and read
+    /// nowhere else, so it earns the take; the `minuend` may be shared, where the
+    /// swap would cost a clone every epoch.
+    pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
+        let neg = self.negate(subtrahend);
+        let diff = self.union(neg, minuend);
+        self.add(OpNode::PositivePart, NodeInputs::Unary(diff))
+    }
+
+    /// [`OpNode::Join`]: `delta` probes the integral `trace`.
+    pub fn join(&mut self, delta: NodeId, trace: NodeId, kind: JoinKind) -> NodeId {
+        self.add(OpNode::Join(kind), NodeInputs::Binary { a: delta, b: trace })
+    }
+
+    /// [`OpNode::WorkerFilter`].
+    pub fn worker_filter(&mut self, input: NodeId) -> NodeId {
+        self.add(OpNode::WorkerFilter, NodeInputs::Unary(input))
+    }
+
+    /// [`OpNode::Reduce`] behind an [`OpNode::ExchangeShard`] on its group columns.
+    pub fn reduce_multi(
+        &mut self,
+        input: NodeId,
+        group_cols: &[u32],
+        agg_specs: &[AggDescriptor],
+        global_ground: bool,
+    ) -> NodeId {
+        let sharded = self.shard(input, group_cols);
+        self.reduce_multi_local(sharded, group_cols, agg_specs, global_ground)
+    }
+
+    /// [`OpNode::Reduce`] with **no upstream exchange**: it aggregates `input` as
+    /// each worker holds it. Over a replicated input every worker computes the
+    /// whole aggregate; over a partitioned one each folds a per-worker partial for
+    /// a downstream [`Self::reduce_multi`] to combine, and must pass
+    /// `global_ground = false` so a worker with no rows contributes no partial.
+    pub fn reduce_multi_local(
+        &mut self,
+        input: NodeId,
+        group_cols: &[u32],
+        agg_specs: &[AggDescriptor],
+        global_ground: bool,
+    ) -> NodeId {
+        let op = OpNode::Reduce {
+            group_cols: group_cols.to_vec(),
+            agg: agg_specs.to_vec(),
+            global_ground,
+        };
+        self.add(op, NodeInputs::Unary(input))
+    }
+
+    /// [`OpNode::TopN`] behind an [`OpNode::ExchangeShard`] on its group columns.
+    pub fn top_n(
+        &mut self,
+        input: NodeId,
+        group_cols: &[u32],
+        order: &[crate::OrderKey],
+        limit: u64,
+        offset: u64,
+    ) -> NodeId {
+        let sharded = self.shard(input, group_cols);
+        self.top_n_local(sharded, group_cols, order, limit, offset)
+    }
+
+    /// [`OpNode::TopN`] with **no upstream exchange**: the window of each group as
+    /// this worker holds it. Correct over a replicated input, and the local phase
+    /// of the two-phase global top-N — exact because the global window's slots lie
+    /// inside the union of every worker's local `limit + offset` slots.
+    pub fn top_n_local(
+        &mut self,
+        input: NodeId,
+        group_cols: &[u32],
+        order: &[crate::OrderKey],
+        limit: u64,
+        offset: u64,
+    ) -> NodeId {
+        let op = OpNode::TopN {
+            group_cols: group_cols.to_vec(),
+            order: order.to_vec(),
+            limit,
+            offset,
+        };
+        self.add(op, NodeInputs::Unary(input))
+    }
+
+    /// [`OpNode::ExchangeShard`].
+    pub fn shard(&mut self, input: NodeId, shard_cols: &[u32]) -> NodeId {
+        let op = OpNode::ExchangeShard { shard_cols: shard_cols.to_vec() };
+        self.add(op, NodeInputs::Unary(input))
+    }
+
+    /// [`OpNode::IntegrateTrace`].
+    pub fn integrate_trace(&mut self, input: NodeId) -> NodeId {
+        self.add(OpNode::IntegrateTrace, NodeInputs::Unary(input))
+    }
+
+    /// [`OpNode::NullExtend`].
+    pub fn null_extend(&mut self, input: NodeId, type_codes: &[u8]) -> NodeId {
+        let op = OpNode::NullExtend { type_codes: type_codes.to_vec() };
+        self.add(op, NodeInputs::Unary(input))
+    }
+
+    /// [`OpNode::IntegrateSink`].
+    pub fn sink(&mut self, input: NodeId) -> NodeId {
+        self.add(OpNode::IntegrateSink, NodeInputs::Unary(input))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The `params` codec
 // ---------------------------------------------------------------------------
 //
@@ -520,17 +805,12 @@ impl OpNode {
 
 const PARAMS_CTX: &str = "circuit params";
 
-/// Write a counted list's length. Asserted, not rejected: the encode side is the
-/// trusted producer (`read_count` rejects), and `len() as u16` would truncate a
-/// longer list into a valid shorter one. Producers check their own lists — an
-/// output schema does not bound an intermediate node.
-fn write_count(w: &mut Writer, n: usize, what: &str) {
-    assert!(
-        n <= crate::MAX_COLUMNS,
-        "{what}: {n} entries exceeds the {}-column cap",
-        crate::MAX_COLUMNS
-    );
-    w.u16(n as u16);
+/// Write a counted list's length. A count past `u16::MAX` saturates rather than
+/// truncating into a valid shorter list, so every over-long list encodes a count
+/// [`read_count`] (≤ [`crate::MAX_COLUMNS`]) or [`read_order_keys`]
+/// (≤ [`crate::MAX_ORDER_KEYS`]) refuses before reading the body.
+fn write_count(w: &mut Writer, n: usize) {
+    w.u16(u16::try_from(n).unwrap_or(u16::MAX));
 }
 
 /// Read a counted list's length, bounded before anything sizes a `Vec` off it.
@@ -545,7 +825,7 @@ fn read_count(r: &mut Reader, what: &str) -> Result<usize, String> {
 }
 
 pub(crate) fn write_cols(w: &mut Writer, cols: &[u32]) {
-    write_count(w, cols.len(), "column list");
+    write_count(w, cols.len());
     for &c in cols {
         w.u32(c);
     }
@@ -578,7 +858,7 @@ fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
 }
 
 fn write_cols_with_tcs(w: &mut Writer, slots: &[ReindexSlot]) {
-    write_count(w, slots.len(), "slot list");
+    write_count(w, slots.len());
     for &(col, tc) in slots {
         w.u32(col).u8(tc.map_or(0, |t| t as u8));
     }
@@ -617,7 +897,7 @@ fn read_order_key(r: &mut Reader) -> Result<crate::OrderKey, String> {
 /// A counted order-key list, shared by the rows sink and a circuit's `TopN`
 /// node, so the two cannot drift.
 pub(crate) fn write_order_keys(w: &mut Writer, keys: &[crate::OrderKey]) {
-    write_count(w, keys.len(), "order keys");
+    write_count(w, keys.len());
     for k in keys {
         write_order_key(w, k);
     }
@@ -632,7 +912,7 @@ pub(crate) fn read_order_keys(r: &mut Reader) -> Result<Vec<crate::OrderKey>, St
 }
 
 pub(crate) fn write_aggs(w: &mut Writer, aggs: &[AggDescriptor]) {
-    write_count(w, aggs.len(), "aggregate list");
+    write_count(w, aggs.len());
     for d in aggs {
         w.u8(d.agg_op.as_wire()).u32(d.col_idx);
     }
@@ -653,7 +933,7 @@ pub(crate) fn read_aggs(r: &mut Reader) -> Result<Vec<AggDescriptor>, String> {
 /// `&ComputeMap` because the `ReadSpec` fold spells "no pre-map" as an empty
 /// program and holds no struct to borrow.
 pub(crate) fn write_compute_map(w: &mut Writer, out_cols: &[(u8, bool)], program: &[u8]) {
-    write_count(w, out_cols.len(), "compute map");
+    write_count(w, out_cols.len());
     for &(tc, nullable) in out_cols {
         w.u8(tc).u8(nullable as u8);
     }
@@ -737,7 +1017,7 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             (Opcode::ExchangeShard, None, Some(w.into_vec()))
         }
         OpNode::NullExtend { type_codes } => {
-            write_count(&mut w, type_codes.len(), "NULL_EXTEND");
+            write_count(&mut w, type_codes.len());
             for tc in type_codes {
                 w.u8(tc);
             }
@@ -782,14 +1062,6 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             if key.is_empty() {
                 return Err("MAP_REINDEX names no key columns".to_string());
             }
-            // The decode-time screen, which has no schema: `ReindexPacker::new`
-            // holds the target to its source column's promotion domain, which is
-            // stricter and subsumes this.
-            for (_, tc) in key.iter().filter_map(|&(c, tc)| tc.map(|t| (c, t))) {
-                if !crate::is_pk_eligible(tc as u8) {
-                    return Err(format!("MAP_REINDEX target type code {} is not PK-eligible", tc as u8));
-                }
-            }
             OpNode::Map(MapKind::Reindex { keep: read_cols(&mut r)?, key, role })
         }
         Opcode::MapHashRow => {
@@ -812,16 +1084,6 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             let global_ground = r.u8()? != 0;
             let group_cols = read_cols(&mut r)?;
             let agg = read_aggs(&mut r)?;
-            if agg.is_empty() {
-                return Err("REDUCE node carries no aggregate spec".to_string());
-            }
-            // `emit_global_ground` writes its aggregate columns at payload index
-            // 0, so a ground row over a group set overwrites the exemplar slots.
-            // A cross-check, not a derivation: the implication runs one way (a
-            // threshold reduce is group-less with `global_ground = false`).
-            if global_ground && !group_cols.is_empty() {
-                return Err("REDUCE is global-ground over a non-empty group set".to_string());
-            }
             OpNode::Reduce { group_cols, agg, global_ground }
         }
         Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
@@ -852,9 +1114,6 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
         Opcode::TopN => {
             let limit = r.u64()?;
             let offset = r.u64()?;
-            if limit == 0 {
-                return Err("TOP_N carries a zero limit".to_string());
-            }
             let group_cols = read_cols(&mut r)?;
             let order = read_order_keys(&mut r)?;
             OpNode::TopN { group_cols, order, limit, offset }

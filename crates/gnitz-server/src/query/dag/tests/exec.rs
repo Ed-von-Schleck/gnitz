@@ -63,22 +63,22 @@ fn live_weight(engine: &CatalogEngine, tid: i64) -> i64 {
 // ── The schedule ────────────────────────────────────────────────────────────
 
 /// The schedule names one step per dependency edge out of the source's forward
-/// closure, ordered by depth — so a producer always precedes the steps it feeds,
-/// and a tick of an intermediate view runs only what that view reaches.
+/// closure, ordered by view id — so a producer always precedes the steps it
+/// feeds, and a tick of an intermediate view runs only what that view reaches.
 #[test]
-fn the_schedule_names_every_edge_of_the_closure_in_depth_order() {
+fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     let (mut engine, base, a, b, deep) = engine_with_fanout("schedule");
-    let step = |depth, view, producer| Step { depth, view, producer };
+    let step = |view, producer| Step { view, producer };
 
     let (dag, registry) = engine.dag_and_registry_mut();
     assert_eq!(
         dag.tick_schedule(registry, base),
-        vec![step(1, a, base), step(1, b, base), step(2, deep, a)],
-        "every edge of the closure, shallowest first",
+        vec![step(a, base), step(b, base), step(deep, a)],
+        "every edge of the closure, producers first",
     );
     assert_eq!(
         dag.tick_schedule(registry, a),
-        vec![step(2, deep, a)],
+        vec![step(deep, a)],
         "a tick of an intermediate view runs only what it reaches",
     );
     assert!(

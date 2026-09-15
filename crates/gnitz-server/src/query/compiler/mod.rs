@@ -5,16 +5,14 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use std::collections::VecDeque;
-
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::query::vm::{DeltaReg, ProgramBuilder, RegisterMeta, TraceReg, VmHandle};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::expr::MapPlan;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
 use gnitz_store::schema::{OpBuildErr, SchemaDescriptor};
-use gnitz_wire::AggDescriptor;
+use gnitz_wire::{AggDescriptor, NodeId, NodeInputs};
 
 mod emit;
 mod hydration;
@@ -44,112 +42,68 @@ pub(in crate::query) const MAX_CIRCUIT_NODES: usize = 16_384;
 // Data structures
 // ---------------------------------------------------------------------------
 
-/// Typed circuit graph with OpNode payloads. Only `load::topo_sorted` builds
-/// one, so `ordered` and the adjacency maps are populated for every value that
-/// exists — no caller has to state a sortedness precondition.
+/// A loaded circuit: the client's graph, whose index order is a topological
+/// order because every input names an earlier node.
 ///
 /// Opaque outside this module: everything the rest of the engine wants from a
 /// circuit is derived once into [`ViewMeta`], so nothing else can read a
 /// second answer out of the graph.
-pub(super) struct LoadedCircuit {
-    nodes: FxHashMap<i32, gnitz_wire::OpNode>,
-    ordered: Vec<i32>,
-    outgoing: FxHashMap<i32, Vec<i32>>,
-    inputs: FxHashMap<i32, NodeInputs>,
-}
+pub(super) struct LoadedCircuit(gnitz_wire::Circuit);
 
 impl LoadedCircuit {
-    /// `nid`'s operator. Total over `ordered`: `topo_sorted` builds `ordered`
-    /// out of `nodes`' own keys.
-    fn op(&self, nid: i32) -> &gnitz_wire::OpNode {
-        self.nodes.get(&nid).expect("topo_sorted builds one entry per node")
+    /// The only constructor, so the one place the node cap has to hold.
+    fn new(circuit: gnitz_wire::Circuit) -> Result<Self, String> {
+        if circuit.nodes().len() > MAX_CIRCUIT_NODES {
+            return Err("circuit exceeds the node limit".into());
+        }
+        Ok(LoadedCircuit(circuit))
     }
 
-    /// Every operator, in topological order — the circuit's only iteration. A
-    /// walk over `nodes` would answer by the hasher's order, which differs
-    /// between the master and each worker, so which of several matches wins
-    /// would too.
-    fn ops(&self) -> impl Iterator<Item = (i32, &gnitz_wire::OpNode)> {
-        self.ordered.iter().map(|&nid| (nid, self.op(nid)))
+    fn len(&self) -> usize {
+        self.0.nodes().len()
     }
 
-    /// `nid`'s inputs. Total over `nodes`: `topo_sorted` builds one per node.
-    fn inputs(&self, nid: i32) -> &NodeInputs {
-        self.inputs.get(&nid).expect("topo_sorted builds one entry per node")
+    fn op(&self, nid: NodeId) -> &gnitz_wire::OpNode {
+        &self.0.nodes()[nid].op
+    }
+
+    fn inputs(&self, nid: NodeId) -> &NodeInputs {
+        &self.0.nodes()[nid].inputs
+    }
+
+    /// Every operator, in topological order — identical on the master and on
+    /// every worker, so which of several matches a walk takes is too.
+    fn ops(&self) -> impl Iterator<Item = (NodeId, &gnitz_wire::OpNode)> {
+        self.0.nodes().iter().map(|n| &n.op).enumerate()
     }
 
     /// Every `ExchangeShard` and its key, in topological order — so the last is
     /// the sink-nearest, the one whose key the view's output carries.
-    fn exchange_shards(&self) -> impl Iterator<Item = (i32, &[u32])> {
+    fn exchange_shards(&self) -> impl Iterator<Item = (NodeId, &[u32])> {
         self.ops().filter_map(|(nid, op)| match op {
             gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.as_slice())),
             _ => None,
         })
     }
 
-    /// `ordered`, restricted to `keep`. Every node list a plan is built over is
-    /// produced this way, so a plan always sees the circuit's own topological
-    /// order rather than whatever order the caller's set iterates in.
-    fn ordered_where(&self, keep: impl Fn(i32) -> bool) -> Vec<i32> {
-        self.ordered.iter().copied().filter(|&n| keep(n)).collect()
+    /// The node ids restricted to `keep`, in topological order. Every node list a
+    /// plan is built over is produced this way.
+    fn ordered_where(&self, keep: impl Fn(NodeId) -> bool) -> Vec<NodeId> {
+        (0..self.len()).filter(|&n| keep(n)).collect()
     }
 
-    /// Every node reachable backwards from `start` (inclusive) — the
-    /// sub-pipeline that produces its value.
-    fn ancestors_inclusive(&self, start: i32) -> FxHashSet<i32> {
-        let mut set = FxHashSet::default();
-        let mut queue = VecDeque::from([start]);
-        while let Some(cur) = queue.pop_front() {
-            if set.insert(cur) {
-                queue.extend(self.inputs(cur).iter());
+    /// Backward pass: `start` and every node it reads, directly or transitively.
+    fn ancestors_inclusive(&self, start: NodeId) -> Vec<bool> {
+        let mut reached = vec![false; self.len()];
+        reached[start] = true;
+        for n in (0..=start).rev() {
+            if reached[n] {
+                for p in self.inputs(n).iter() {
+                    reached[p] = true;
+                }
             }
         }
-        set
-    }
-}
-
-/// A node's inputs in the shape its operator's arity allows. `topo_sorted`
-/// settles the arity against `OpNode::arity()` before building one, so a reader
-/// destructures instead of re-checking — and a `Filter` wired only on its trace
-/// slot is unrepresentable rather than merely rejected downstream.
-pub(super) enum NodeInputs {
-    /// A `ScanDelta`: fed by the source drive, not by a producer.
-    Source,
-    Unary(i32),
-    /// `a` is slot 0 — a join's delta side, a union's left operand; `b` is slot
-    /// 1, the trace / right operand.
-    Binary {
-        a: i32,
-        b: i32,
-    },
-}
-
-impl NodeInputs {
-    /// The producer of a unary operator's operand.
-    fn unary(&self) -> i32 {
-        match self {
-            NodeInputs::Unary(src) => *src,
-            _ => unreachable!("a unary operator fills exactly its one input slot"),
-        }
-    }
-
-    /// The producers of a binary operator's two operands, in port order.
-    fn binary(&self) -> (i32, i32) {
-        match self {
-            NodeInputs::Binary { a, b } => (*a, *b),
-            _ => unreachable!("a binary operator is wired on both ports"),
-        }
-    }
-
-    /// Every producer, for the walks that do not care about the operator.
-    fn iter(&self) -> impl Iterator<Item = i32> {
-        match *self {
-            NodeInputs::Source => [None, None],
-            NodeInputs::Unary(src) => [Some(src), None],
-            NodeInputs::Binary { a, b } => [Some(a), Some(b)],
-        }
-        .into_iter()
-        .flatten()
+        reached
     }
 }
 
@@ -160,9 +114,9 @@ impl NodeInputs {
 /// One side of a [`Carve`]: an `ExchangeShard`, its key, and the nodes computing
 /// its input — the shard's ancestors — in topological order.
 struct CarvedSide<'a> {
-    shard: i32,
+    shard: NodeId,
     cols: &'a [u32],
-    nodes: Vec<i32>,
+    nodes: Vec<NodeId>,
 }
 
 /// The circuit split at its exchanges: one side per `ExchangeShard`, and the
@@ -170,12 +124,12 @@ struct CarvedSide<'a> {
 /// exchange-free circuit `post` is the whole circuit.
 struct Carve<'a> {
     sides: Vec<CarvedSide<'a>>,
-    post: Vec<i32>,
+    post: Vec<NodeId>,
 }
 
 impl LoadedCircuit {
     fn carve(&self) -> Result<Carve<'_>, String> {
-        let shards: Vec<(i32, &[u32])> = self.exchange_shards().collect();
+        let shards: Vec<(NodeId, &[u32])> = self.exchange_shards().collect();
         // No planner path emits more: set-ops are binary, GROUP BY/DISTINCT unary.
         if shards.len() > 2 {
             return Err("more than two exchange nodes".into());
@@ -186,19 +140,22 @@ impl LoadedCircuit {
                 return Err("exchange sides shard on different keys".into());
             }
         }
-        let mut claimed: FxHashSet<i32> = FxHashSet::default();
+        let mut claimed = vec![false; self.len()];
         let mut sides = Vec::with_capacity(shards.len());
         for (shard, cols) in shards {
             let ancestors = self.ancestors_inclusive(shard);
             // A node in two sides — a shared ancestor, or a shard upstream of
             // another shard — would open one scratch child twice.
-            if !ancestors.iter().all(|&n| claimed.insert(n)) {
+            if ancestors.iter().zip(&claimed).any(|(&a, &c)| a && c) {
                 return Err("exchange sides share a node".into());
             }
-            let nodes = self.ordered_where(|n| n != shard && ancestors.contains(&n));
+            for (c, &a) in claimed.iter_mut().zip(&ancestors) {
+                *c |= a;
+            }
+            let nodes = self.ordered_where(|n| n != shard && ancestors[n]);
             sides.push(CarvedSide { shard, cols, nodes });
         }
-        let post = self.ordered_where(|n| !claimed.contains(&n));
+        let post = self.ordered_where(|n| !claimed[n]);
         // A delta is routed to the side scanning its source, so a post-phase scan
         // would receive nothing.
         let post_scans = post
@@ -211,7 +168,7 @@ impl LoadedCircuit {
     }
 
     /// The circuit's one `IntegrateSink`.
-    fn sink(&self) -> Result<i32, String> {
+    fn sink(&self) -> Result<NodeId, String> {
         let mut sinks = self
             .ops()
             .filter(|(_, op)| matches!(op, gnitz_wire::OpNode::IntegrateSink))
@@ -352,7 +309,9 @@ pub(super) fn compile_view(
         .map(|(plan, c)| {
             Ok(Side {
                 plan,
-                seed_reg: post_regs[&c.shard].delta()?,
+                seed_reg: post_regs[c.shard]
+                    .ok_or("an exchange side seeds no register of the post phase")?
+                    .delta()?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

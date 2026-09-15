@@ -21,29 +21,20 @@ fn over_cap_pred_blob() -> Vec<u8> {
     gnitz_wire::encode_expr_blob(n - 1, code, std::iter::empty(), &[] as &[&[u8]])
 }
 
-/// `ScanDelta(base_tid) → IntegrateTrace → Filter(pred) → Integrate` for `vid`.
-/// The filter blob is what decides whether the view compiles.
+/// `ScanDelta(base_tid) → Filter(pred) → Distinct → Integrate` for `vid`. The
+/// filter blob is what decides whether the view compiles.
 ///
-/// The trace node sits *ahead* of the filter deliberately: it is what makes the
-/// compile home a scratch child under the compile directory, so the residue
-/// assertions below have something to catch on the accepting path *and* on the
-/// rejecting one. With the filter first, a rejection would return before any
-/// directory existed and "nothing left behind" would hold vacuously.
+/// The `Distinct` is what makes the compile home a scratch child (its clamp
+/// history) under the compile directory, so the residue assertions below have
+/// something to catch on the accepting path, and the I/O rejection something to
+/// fail on.
 fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, pred: &[u8]) {
-    let (_, _, filter_params) = gnitz_wire::encode_op_node(gnitz_wire::OpNode::Filter(pred.to_vec()));
-    write_circuit_chain(
-        engine,
-        vid,
-        &[
-            (gnitz_wire::Opcode::ScanDelta, Some(base_tid), None),
-            (gnitz_wire::Opcode::Filter, None, filter_params.as_deref()),
-            // `SELECT DISTINCT … WHERE …`. The `Distinct` is what makes the
-            // compile create a scratch child, which the I/O rejection below
-            // needs something to fail on.
-            (gnitz_wire::Opcode::Distinct, None, None),
-            (gnitz_wire::Opcode::IntegrateSink, None, None),
-        ],
-    );
+    let mut circuit = gnitz_wire::Circuit::default();
+    let scan = circuit.input_delta(base_tid as u64, None);
+    let filter = circuit.filter(scan, pred.to_vec());
+    let distinct = circuit.distinct(filter);
+    circuit.sink(distinct);
+    write_circuit(engine, vid, circuit);
 }
 
 /// Register `vid` as a view over `base_tid` whose filter is `pred`, exactly as

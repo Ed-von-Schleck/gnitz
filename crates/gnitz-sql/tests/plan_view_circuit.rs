@@ -87,7 +87,7 @@ fn exchanges(chain: &PlannedChain) -> Vec<Vec<u32>> {
     let mut out: Vec<Vec<u32>> = chain
         .views
         .iter()
-        .flat_map(|pv| pv.circuit.nodes.values())
+        .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
         .filter_map(|op| match op {
             OpNode::ExchangeShard { shard_cols } => Some(shard_cols.clone()),
             _ => None,
@@ -268,7 +268,7 @@ fn union_all_tags_its_branches() {
         let mut branches: Vec<u8> = chain
             .views
             .iter()
-            .flat_map(|pv| pv.circuit.nodes.values())
+            .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
             .filter_map(|op| match op {
                 OpNode::Map(MapKind::HashRow { branch_id, .. }) => Some(*branch_id),
                 _ => None,
@@ -330,7 +330,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
         let bounds: Vec<Vec<u32>> = chain
             .views
             .iter()
-            .flat_map(|pv| pv.circuit.nodes.values())
+            .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
             .filter_map(|op| match op {
                 OpNode::ScanDelta { bound: Some(b), .. } => Some(b.idx_cols.as_slice().to_vec()),
                 _ => None,
@@ -362,7 +362,7 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
     let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = chain
         .views
         .iter()
-        .flat_map(|pv| pv.circuit.nodes.values())
+        .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
         .filter_map(|op| match op {
             OpNode::Reduce { group_cols, agg, global_ground, .. } => Some((
                 group_cols.as_slice().to_vec(),

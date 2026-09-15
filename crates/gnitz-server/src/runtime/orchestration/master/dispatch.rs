@@ -521,9 +521,9 @@ impl MasterDispatcher {
     /// sources. The one driver that populates a view — a live CREATE VIEW bundle
     /// and the boot rebuild of generation-invalid views both run this.
     ///
-    /// `order_by_view_deps` is the one owner of that ordering — a source view
-    /// precedes every dependent that scans it, so an upstream hidden segment is
-    /// filled before a downstream view reads it.
+    /// Ids ascend along every scan edge, so id order puts a source view before
+    /// every dependent that scans it, and an upstream hidden segment is filled
+    /// before a downstream view reads it.
     ///
     /// A multi-source equi-join iterates every source: the first fills its trace
     /// (joining against the still-empty other trace emits nothing), and the rest
@@ -533,7 +533,10 @@ impl MasterDispatcher {
     /// serves every shape.
     pub(crate) fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), WireFault> {
         let (dag, registry) = self.cat().dag_and_registry_mut();
-        for vid in dag.order_by_view_deps(registry, view_ids) {
+        let mut ordered = view_ids.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+        for vid in ordered {
             let sources = dag.get_source_ids(registry, vid);
             for src in sources {
                 self.fan_out_backfill(vid, src).map_err(|e| WireFault {

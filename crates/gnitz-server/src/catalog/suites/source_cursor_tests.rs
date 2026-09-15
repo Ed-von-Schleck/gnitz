@@ -10,14 +10,6 @@ use gnitz_wire::{Cut, IndexBound, PkColList, RangeDescriptor};
 
 const NBASE: u64 = 200;
 
-/// `ScanDelta(base, bound?) → Integrate` for `vid`: the shared identity-circuit
-/// writer over the scan node's `params` blob, built by the same encoder the
-/// planner ships through.
-fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, bound: Option<IndexBound>) {
-    let (_, _, params) = gnitz_wire::encode_op_node(gnitz_wire::OpNode::ScanDelta { source: base_tid as u64, bound });
-    write_identity_circuit(engine, vid, base_tid, params.as_deref());
-}
-
 /// A `(id U64 PK | val I64)` base of `NBASE` rows with `val = val_of(id)`,
 /// indexed on `val`, plus a registered identity view carrying `bound`. Returns
 /// `(engine, base tid, view id)`.
@@ -38,7 +30,7 @@ fn fixture_with(name: &str, bound: Option<IndexBound>, val_of: impl Fn(u64) -> u
     engine.create_index("public.base", &["val"], false).unwrap();
 
     let vid = engine.allocate_table_id().unwrap();
-    write_bounded_identity_circuit(&mut engine, vid, tid, bound);
+    write_identity_circuit(&mut engine, vid, tid, bound);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     let batch = build_view_tab_row(vid, "v_base");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();

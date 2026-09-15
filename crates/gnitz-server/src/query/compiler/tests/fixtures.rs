@@ -7,34 +7,40 @@ use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig,
 use gnitz_store::storage::Slot;
 
 // Input slots reach the compiler only in hand-written fixtures; every production
-// read of an operand goes through [`NodeInputs`]. Slot 0 is a unary operator's
+// read of an operand goes through `NodeInputs`. Slot 0 is a unary operator's
 // input and a binary one's delta/left operand, slot 1 the trace/right operand.
 pub(in crate::query) const SLOT_IN: usize = 0;
 pub(in crate::query) const SLOT_TRACE: usize = 1;
 
-/// Fixture wiring: `(producer, consumer, slot)` triples into the per-node input
-/// slots `load_circuit` reads out of a node row's `input_0`/`input_1` columns.
-pub(in crate::query) fn wire_slots(edges: &[(i32, i32, usize)]) -> FxHashMap<i32, [Option<i32>; 2]> {
-    let mut by_node: FxHashMap<i32, [Option<i32>; 2]> = FxHashMap::default();
-    for &(src, dst, slot) in edges {
-        by_node.entry(dst).or_default()[slot] = Some(src);
-    }
-    by_node
-}
-
-/// Build a `LoadedCircuit` from raw nodes/edges: the struct's fields are
-/// private to `compiler`, so a test outside it cannot construct one.
+/// Build a `LoadedCircuit` from raw nodes and `(producer, consumer, slot)` edges,
+/// pushing the nodes in id order from 0 — so a fixture holds to the same
+/// every-input-names-an-earlier-node rule a loaded circuit does.
 pub(in crate::query) fn loaded_for_test(
-    nodes: impl IntoIterator<Item = (i32, gnitz_wire::OpNode)>,
-    edges: Vec<(i32, i32, usize)>,
+    nodes: impl IntoIterator<Item = (NodeId, gnitz_wire::OpNode)>,
+    edges: Vec<(NodeId, NodeId, usize)>,
 ) -> LoadedCircuit {
-    load::topo_sorted(nodes.into_iter().collect(), wire_slots(&edges)).expect("test circuit must be a well-formed DAG")
+    let mut nodes: Vec<(NodeId, gnitz_wire::OpNode)> = nodes.into_iter().collect();
+    nodes.sort_unstable_by_key(|&(nid, _)| nid);
+    let mut circuit = gnitz_wire::Circuit::default();
+    for (nid, op) in nodes {
+        let mut slots = [None; 2];
+        for &(src, _, slot) in edges.iter().filter(|&&(_, dst, _)| dst == nid) {
+            slots[slot] = Some(src as u64);
+        }
+        let pushed = NodeInputs::from_slots(slots).and_then(|inputs| circuit.push(op, inputs));
+        assert_eq!(
+            pushed,
+            Ok(nid),
+            "test circuit node {nid} must be dense and read earlier nodes"
+        );
+    }
+    LoadedCircuit::new(circuit).expect("test circuit within the node limit")
 }
 
 /// The sub-pipeline producing `out`'s value, in topological order.
-pub(in crate::query) fn subgraph_ordered(loaded: &LoadedCircuit, out: i32) -> Vec<i32> {
+pub(in crate::query) fn subgraph_ordered(loaded: &LoadedCircuit, out: NodeId) -> Vec<NodeId> {
     let set = loaded.ancestors_inclusive(out);
-    loaded.ordered_where(|n| set.contains(&n))
+    loaded.ordered_where(|n| set[n])
 }
 
 /// An unbounded delta scan — every fixture circuit's source shape.

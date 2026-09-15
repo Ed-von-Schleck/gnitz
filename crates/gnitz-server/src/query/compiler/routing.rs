@@ -4,6 +4,7 @@
 
 use super::*;
 use gnitz_store::schema::Placement;
+use rustc_hash::FxHashSet;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
@@ -137,8 +138,8 @@ impl ViewMeta {
             .iter()
             .map(|(&tid, s)| (tid, s.iter().flatten().copied().collect()))
             .collect();
-        let join_relay = circuit_join_relay(loaded);
-        let shards: Vec<(i32, &[u32])> = loaded.exchange_shards().collect();
+        let join_relay = circuit_join_relay(loaded)?;
+        let shards: Vec<(NodeId, &[u32])> = loaded.exchange_shards().collect();
         let repartitions = !shards.is_empty() || join_relay.is_some();
         let join_relay = join_relay.unwrap_or(JoinRelay::WholeKey);
         // A range or cross join's matches spread over the whole other side, so
@@ -309,7 +310,12 @@ fn output_route_returns_to_the_input_partition(shard_cols: &[u32], schema: &Sche
 /// True iff the view's output `ExchangeShard` at `enid` is a no-op: its scan's
 /// distribution prefix is exactly the shard key, and the output routes back to
 /// that same partition.
-fn skips_output_exchange(loaded: &LoadedCircuit, enid: i32, shard_cols: &[u32], registry: &RelationRegistry) -> bool {
+fn skips_output_exchange(
+    loaded: &LoadedCircuit,
+    enid: NodeId,
+    shard_cols: &[u32],
+    registry: &RelationRegistry,
+) -> bool {
     let Some((tid, mapped)) = scan_through_row_local(loaded, enid) else {
         return false;
     };
@@ -343,38 +349,31 @@ type ReindexKey = Vec<gnitz_wire::ReindexSlot>;
 /// shape. The second return says the walk found only `Auxiliary` ones — a
 /// planner call site that forgot its role, which `ViewMeta::derive` turns
 /// into a failed compile rather than silently-unscattered rows.
-fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<ReindexKey>, bool) {
-    let mut queue = VecDeque::from([scan_nid]);
-    // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
-    // edge paths reaching the same Filter) would re-push and re-expand nodes.
-    let mut visited = FxHashSet::default();
+fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: NodeId) -> (Vec<ReindexKey>, bool) {
+    // A node is reached when one of its inputs is and its operator propagates;
+    // one forward pass suffices because every input names an earlier node.
+    let mut reached = vec![false; loaded.len()];
+    reached[scan_nid] = true;
     // One entry per distinct key sequence — an identical one reached again (the
     // null/not-null sibling Maps of a nullable LEFT-join key) is added once.
     // Duplicate columns WITHIN a sequence are preserved, so the result mirrors the
     // trace-side `ReindexPacker` slot-for-slot.
     let mut seqs: Vec<ReindexKey> = Vec::new();
     let mut saw_auxiliary = false;
-    while let Some(cur) = queue.pop_front() {
-        if !visited.insert(cur) {
+    for nid in scan_nid + 1..loaded.len() {
+        if !loaded.inputs(nid).iter().any(|p| reached[p]) {
             continue;
         }
-        let Some(outs) = loaded.outgoing.get(&cur) else {
-            continue;
-        };
-        for &dst in outs {
-            match loaded.op(dst) {
-                gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex { key, role, .. }) => {
-                    if *role != gnitz_wire::ReindexRole::ScatterKey {
-                        saw_auxiliary = true;
-                        continue;
-                    }
-                    if !seqs.contains(key) {
-                        seqs.push(key.clone());
-                    }
+        match loaded.op(nid) {
+            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex { key, role, .. }) => {
+                if *role != gnitz_wire::ReindexRole::ScatterKey {
+                    saw_auxiliary = true;
+                } else if !seqs.contains(key) {
+                    seqs.push(key.clone());
                 }
-                gnitz_wire::OpNode::Filter(_) => queue.push_back(dst),
-                _ => {}
             }
+            gnitz_wire::OpNode::Filter(_) => reached[nid] = true,
+            _ => {}
         }
     }
     let orphaned = seqs.is_empty() && saw_auxiliary;
@@ -385,21 +384,19 @@ fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<ReindexKey
 /// only as that join's operand — forward through `Filter`, `Map` and
 /// `IntegrateTrace` alone. Any other consumer (a `Union`, a clamp, a `Reduce`,
 /// the sink) uses the delta itself rather than a join term over it.
-fn scan_feeds_only_joins(loaded: &LoadedCircuit, scan_nid: i32) -> bool {
-    let mut queue = VecDeque::from([scan_nid]);
-    let mut visited = FxHashSet::default();
-    while let Some(cur) = queue.pop_front() {
-        if !visited.insert(cur) {
+fn scan_feeds_only_joins(loaded: &LoadedCircuit, scan_nid: NodeId) -> bool {
+    let mut reached = vec![false; loaded.len()];
+    reached[scan_nid] = true;
+    for nid in scan_nid + 1..loaded.len() {
+        if !loaded.inputs(nid).iter().any(|p| reached[p]) {
             continue;
         }
-        for &dst in loaded.outgoing.get(&cur).into_iter().flatten() {
-            match loaded.op(dst) {
-                gnitz_wire::OpNode::Join(_) => {}
-                gnitz_wire::OpNode::Filter(_) | gnitz_wire::OpNode::Map(_) | gnitz_wire::OpNode::IntegrateTrace => {
-                    queue.push_back(dst)
-                }
-                _ => return false,
+        match loaded.op(nid) {
+            gnitz_wire::OpNode::Join(_) => {}
+            gnitz_wire::OpNode::Filter(_) | gnitz_wire::OpNode::Map(_) | gnitz_wire::OpNode::IntegrateTrace => {
+                reached[nid] = true
             }
+            _ => return false,
         }
     }
     true
@@ -407,8 +404,8 @@ fn scan_feeds_only_joins(loaded: &LoadedCircuit, scan_nid: i32) -> bool {
 
 /// Walk back from the `ExchangeShard` at `enid` through nodes that keep rows on
 /// their worker and the PK region verbatim, to its `ScanDelta`: `(table id, whether
-/// a map was crossed)`. `topo_sorted` rejects a cycle, so no visited guard.
-fn scan_through_row_local(loaded: &LoadedCircuit, enid: i32) -> Option<(i64, bool)> {
+/// a map was crossed)`. Every input names an earlier node, so no visited guard.
+fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(i64, bool)> {
     let (mut cur, mut mapped) = (enid, false);
     loop {
         // Bail on a fan-in: a multi-input node (Union, set op) draws from more
@@ -447,19 +444,25 @@ enum JoinRelay {
     Broadcast,
 }
 
-/// The join relay a circuit's `Join` node calls for, read off the first one —
-/// both bilinear terms carry the same kind, so which one the walk reaches is
-/// not observable. `None` for a circuit without a join.
-fn circuit_join_relay(loaded: &LoadedCircuit) -> Option<JoinRelay> {
+/// The join relay a circuit's `Join` nodes call for, `None` for a circuit
+/// without a join. `Err` when two joins call for different relays: the view's
+/// sources are routed by one.
+fn circuit_join_relay(loaded: &LoadedCircuit) -> Result<Option<JoinRelay>, String> {
     use gnitz_wire::{JoinKind, OpNode};
-    loaded.ops().find_map(|(_, op)| match op {
-        OpNode::Join(kind) => Some(match kind {
+    let mut relay = None;
+    for (_, op) in loaded.ops() {
+        let OpNode::Join(kind) = op else { continue };
+        let this = match kind {
             JoinKind::Equi => JoinRelay::WholeKey,
             JoinKind::Range { n_eq: 0, .. } | JoinKind::Cross => JoinRelay::Broadcast,
             JoinKind::Range { n_eq, .. } => JoinRelay::EqPrefix { n_eq: *n_eq },
-        }),
-        _ => None,
-    })
+        };
+        if relay.is_some_and(|r| r != this) {
+            return Err("circuit joins need different relays".into());
+        }
+        relay = Some(this);
+    }
+    Ok(relay)
 }
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ use gnitz_wire::{type_code, OpNode};
 // ── carve: the exchange shape, decided on the graph ─────────────────────
 
 /// The guard `carve` rejected the circuit `nodes`/`edges` with.
-fn carve_rejection(nodes: Vec<(i32, OpNode)>, edges: Vec<(i32, i32, usize)>) -> String {
+fn carve_rejection(nodes: Vec<(NodeId, OpNode)>, edges: Vec<(NodeId, NodeId, usize)>) -> String {
     rejection(loaded_for_test(nodes, edges).carve().map(drop))
 }
 
@@ -95,7 +95,7 @@ fn exchange_sides_sharing_an_ancestor_are_rejected() {
 
 /// A shard upstream of another lies in both ancestor sets, so it never reaches
 /// a plan's node list — where emitting it would abort a worker. No planner path
-/// emits the shape; a circuit hand-built through `CircuitBuilder` can.
+/// emits the shape; a circuit hand-built through `Circuit` can.
 #[test]
 fn a_chained_exchange_is_rejected() {
     assert_eq!(
@@ -158,7 +158,7 @@ fn the_carve_splits_sides_from_the_post_phase() {
         ],
     );
     let carve = loaded.carve().expect("a well-formed set-op");
-    let mut sides: Vec<(i32, Vec<i32>)> = carve.sides.iter().map(|s| (s.shard, s.nodes.clone())).collect();
+    let mut sides: Vec<(NodeId, Vec<NodeId>)> = carve.sides.iter().map(|s| (s.shard, s.nodes.clone())).collect();
     sides.sort();
     assert_eq!(sides, vec![(3, vec![0, 2]), (4, vec![1])]);
     assert_eq!(carve.post, vec![5, 6, 7]);

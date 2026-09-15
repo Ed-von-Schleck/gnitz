@@ -58,7 +58,7 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
     //    identity the emitter elides on one branch, a real permutation on the
     //    other — both are in the circuit either way).
     let (branch_a, branch_b) = loaded.inputs(union).binary();
-    let join_of = |mut nid: i32| -> Result<i32, String> {
+    let join_of = |mut nid: NodeId| -> Result<NodeId, String> {
         if matches!(loaded.op(nid), OpNode::Map(_)) {
             nid = loaded.inputs(nid).unary();
         }
@@ -66,7 +66,7 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
             .then_some(nid)
             .ok_or_else(|| "bounded view: union input is not an inner delta/trace join".to_string())
     };
-    let trace_of = |j: i32| -> Option<i32> {
+    let trace_of = |j: NodeId| -> Option<NodeId> {
         let t = loaded.inputs(j).binary().1;
         matches!(loaded.op(t), OpNode::IntegrateTrace).then_some(t)
     };
@@ -94,8 +94,8 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
 /// delta and trace nodes of the join branch a replay seeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HydrationNodes {
-    Relation { nid: i32, source: i64 },
-    Join { d_a: i32, t_a: i32 },
+    Relation { nid: NodeId, source: i64 },
+    Join { d_a: NodeId, t_a: NodeId },
 }
 
 /// Resolve those nodes against the plan the emitter just produced.
@@ -107,14 +107,10 @@ enum HydrationNodes {
 pub(super) fn derive_hydration(
     loaded: &LoadedCircuit,
     plan: &SubPlan,
-    out_reg_of: &FxHashMap<i32, OutReg>,
+    out_reg_of: &[Option<OutReg>],
 ) -> Result<Hydration, String> {
-    let reg_of = |nid: i32| {
-        out_reg_of
-            .get(&nid)
-            .copied()
-            .ok_or_else(|| "bounded view: a hydration node is not in the plan".to_string())
-    };
+    let reg_of =
+        |nid: NodeId| out_reg_of[nid].ok_or_else(|| "bounded view: a hydration node is not in the plan".to_string());
 
     let hydration = match hydration_nodes(loaded)? {
         HydrationNodes::Relation { nid, source } => Hydration {

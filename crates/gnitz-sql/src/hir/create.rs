@@ -14,7 +14,7 @@ use crate::validate::{
     kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, validate_user_name, QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass};
+use gnitz_core::{CatalogSnapshot, GnitzClient, OpNode, PlannedView, RelClass};
 use sqlparser::ast::{CreateTableOptions, Ident, ObjectName, Query, Statement, Value, ValueWithSpan};
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
@@ -291,11 +291,12 @@ fn reject_self_reference(
     view_name: &str,
     what: &str,
 ) -> Result<(), GnitzSqlError> {
-    if chain
-        .segments
-        .iter()
-        .any(|s| s.circuit.dependencies().contains(&old_vid))
-    {
+    if chain.segments.iter().any(|s| {
+        s.circuit
+            .nodes()
+            .iter()
+            .any(|n| matches!(n.op, OpNode::ScanDelta { source, .. } if source == old_vid))
+    }) {
         return Err(GnitzSqlError::Unsupported(format!(
             "{what} '{schema_name}.{view_name}' AS a query referencing the view itself is not supported"
         )));

@@ -806,11 +806,11 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     // A partitioned base table, for the negative direction.
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
 
-    // Consumer ids allocated BEFORE their producers, on both chains.
-    let r_consumer = engine.allocate_table_id().unwrap();
+    // Ids ascend along scan edges, as the DDL precheck requires.
     let r_producer = engine.allocate_table_id().unwrap();
-    let p_consumer = engine.allocate_table_id().unwrap();
+    let r_consumer = engine.allocate_table_id().unwrap();
     let p_producer = engine.allocate_table_id().unwrap();
+    let p_consumer = engine.allocate_table_id().unwrap();
 
     for (vid, src) in [
         (r_producer, rt),
@@ -834,22 +834,17 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     }
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
 
-    // (replicated, depth) for a registered relation.
-    let stamp = |e: &mut CatalogEngine, id: i64| {
-        let CatalogEngine { registry, dag, .. } = e;
-        let t = registry.relation_or_err(id).expect("registered");
-        (t.is_replicated(), dag.depth_of(registry, id))
-    };
+    // Whether a registered relation is stamped replicated.
+    let stamp = |e: &mut CatalogEngine, id: i64| e.registry.relation_or_err(id).expect("registered").is_replicated();
     let assert_stamps = |e: &mut CatalogEngine, when: &str| {
-        assert!(stamp(e, rt).0, "replicated base table ({when})");
-        assert_eq!(stamp(e, r_producer), (true, 1), "view over a replicated table ({when})");
-        assert_eq!(
+        assert!(stamp(e, rt), "replicated base table ({when})");
+        assert!(stamp(e, r_producer), "view over a replicated table ({when})");
+        assert!(
             stamp(e, r_consumer),
-            (true, 2),
-            "view over a replicated VIEW — the bit and the depth must both climb ({when})"
+            "view over a replicated VIEW — the bit must climb ({when})"
         );
-        assert_eq!(stamp(e, p_producer), (false, 1), "view over a table ({when})");
-        assert_eq!(stamp(e, p_consumer), (false, 2), "view over a view ({when})");
+        assert!(!stamp(e, p_producer), "view over a table ({when})");
+        assert!(!stamp(e, p_consumer), "view over a view ({when})");
     };
     assert_stamps(&mut engine, "live CREATE");
 

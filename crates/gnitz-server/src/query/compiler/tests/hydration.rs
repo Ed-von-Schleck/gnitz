@@ -15,7 +15,7 @@ use std::collections::HashMap;
 ///                         └─────────────┴────────┴→ 7 J_ba (delta=3, trace=4)
 ///   6 → 8 map → 10 union ← 9 map ← 7;  10 → 11 filter → 12 map → 13 sink
 /// ```
-fn equi_join(mutate: impl FnOnce(&mut HashMap<i32, OpNode>, &mut Vec<(i32, i32, usize)>)) -> LoadedCircuit {
+fn equi_join(mutate: impl FnOnce(&mut HashMap<NodeId, OpNode>, &mut Vec<(NodeId, NodeId, usize)>)) -> LoadedCircuit {
     let m = || OpNode::Map(MapKind::Projection(vec![0]));
     let mut nodes = HashMap::from([
         (0, scan_delta(100)),

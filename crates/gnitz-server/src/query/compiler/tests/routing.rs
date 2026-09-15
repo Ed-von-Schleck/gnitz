@@ -191,13 +191,13 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
             (2, scan_delta(8)),
             (3, scatter_reindex(&[1])),
             (4, OpNode::Join(JoinKind::Equi)),
-            (5, OpNode::IntegrateSink),
         ];
         let mut edges = vec![(0, 1, SLOT_IN), (2, 3, SLOT_IN), (1, 4, SLOT_IN), (3, 4, SLOT_TRACE)];
         if also_union {
-            nodes.push((6, OpNode::Union));
-            edges.extend([(1, 6, SLOT_IN), (4, 6, SLOT_TRACE), (6, 5, SLOT_IN)]);
+            nodes.extend([(5, OpNode::Union), (6, OpNode::IntegrateSink)]);
+            edges.extend([(1, 5, SLOT_IN), (4, 5, SLOT_TRACE), (5, 6, SLOT_IN)]);
         } else {
+            nodes.push((5, OpNode::IntegrateSink));
             edges.push((4, 5, SLOT_IN));
         }
         let ext = sources([
@@ -263,16 +263,16 @@ fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
             (0, scan_delta(10)),
             (1, scan_delta(20)),
             (2, scatter_reindex(&[2])),
-            (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
-            (4, gnitz_wire::OpNode::IntegrateSink),
-            (5, gnitz_wire::OpNode::IntegrateTrace),
+            (3, gnitz_wire::OpNode::IntegrateTrace),
+            (4, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
+            (5, gnitz_wire::OpNode::IntegrateSink),
         ],
         vec![
             (0, 2, SLOT_IN),
-            (1, 5, SLOT_IN), // ScanDelta(20) → IntegrateTrace, no reindex
-            (5, 3, SLOT_TRACE),
-            (2, 3, SLOT_IN),
-            (3, 4, SLOT_IN),
+            (1, 3, SLOT_IN), // ScanDelta(20) → IntegrateTrace, no reindex
+            (3, 4, SLOT_TRACE),
+            (2, 4, SLOT_IN),
+            (4, 5, SLOT_IN),
         ],
     );
     let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
@@ -323,7 +323,7 @@ fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
 /// [`join_meta`] against a host that knows the sources' schemas, so
 /// co-partitioning is decidable.
 fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: RelationRegistry) -> ViewMeta {
-    let nodes: HashMap<i32, OpNode> = HashMap::from([
+    let nodes: HashMap<NodeId, OpNode> = HashMap::from([
         (0, scan_delta(7)),
         (1, scatter_reindex(key_cols)),
         (2, scan_delta(9)),
@@ -511,7 +511,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
         ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN), (3, 4, SLOT_IN)],
     );
-    assert_eq!(circuit_join_relay(&loaded), None);
+    assert_eq!(circuit_join_relay(&loaded), Ok(None));
 
     let joined = |kind: gnitz_wire::JoinKind| {
         loaded_for_test(
@@ -532,8 +532,53 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
         (range(0), JoinRelay::Broadcast),
         (gnitz_wire::JoinKind::Cross, JoinRelay::Broadcast),
     ] {
-        assert_eq!(circuit_join_relay(&joined(kind)), Some(want), "{kind:?}");
+        assert_eq!(circuit_join_relay(&joined(kind)), Ok(Some(want)), "{kind:?}");
     }
+}
+
+/// A view's sources are routed by one relay, so two joins calling for different
+/// relays are refused rather than routed by whichever the walk reaches first.
+#[test]
+fn joins_calling_for_different_relays_are_rejected() {
+    let two_joins = |second: gnitz_wire::JoinKind| {
+        loaded_for_test(
+            [
+                (0, scan_delta(7)),
+                (1, scan_delta(9)),
+                (2, OpNode::IntegrateTrace),
+                (3, OpNode::IntegrateTrace),
+                (4, OpNode::Join(gnitz_wire::JoinKind::Equi)),
+                (5, OpNode::Join(second)),
+                (6, OpNode::Union),
+                (7, OpNode::IntegrateSink),
+            ],
+            vec![
+                (0, 2, SLOT_IN),
+                (1, 3, SLOT_IN),
+                (0, 4, SLOT_IN),
+                (3, 4, SLOT_TRACE),
+                (1, 5, SLOT_IN),
+                (2, 5, SLOT_TRACE),
+                (4, 6, SLOT_IN),
+                (5, 6, SLOT_TRACE),
+                (6, 7, SLOT_IN),
+            ],
+        )
+    };
+    assert_eq!(
+        circuit_join_relay(&two_joins(gnitz_wire::JoinKind::Equi)),
+        Ok(Some(JoinRelay::WholeKey)),
+        "both terms of one join carry the same kind"
+    );
+    assert_eq!(
+        rejection(circuit_join_relay(&two_joins(gnitz_wire::JoinKind::Cross))),
+        "circuit joins need different relays"
+    );
+    assert_eq!(
+        rejection(ViewMeta::derive(&two_joins(gnitz_wire::JoinKind::Cross), &sources([])).map(drop)),
+        "circuit joins need different relays",
+        "the compile is refused"
+    );
 }
 
 // ── scatter_key_of_scan: the forward (scan → reindex Map) walk ──────────
@@ -654,20 +699,20 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
             [
                 (0, scan_delta(10)),
                 (1, join_reindex),
+                (2, OpNode::IntegrateTrace),
                 (
-                    2,
+                    3,
                     OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 1, rel: gnitz_wire::RangeRel::Le }),
                 ),
-                (3, OpNode::IntegrateTrace),
                 (4, aux_rekey),
                 (5, OpNode::Map(MapKind::Projection(vec![]))),
                 (6, OpNode::Distinct),
             ],
             vec![
                 (0, 1, SLOT_IN),
-                (1, 2, SLOT_IN),
-                (1, 3, SLOT_IN), // join reindex → its own integral
-                (3, 2, SLOT_TRACE),
+                (1, 3, SLOT_IN),
+                (1, 2, SLOT_IN), // join reindex → its own integral
+                (2, 3, SLOT_TRACE),
                 (0, 4, SLOT_IN),
                 (4, 5, SLOT_IN),
                 (5, 6, SLOT_IN), // aux a.pk re-key → proj → distinct
@@ -714,13 +759,13 @@ fn a_non_reindex_map_contributes_no_scatter_key() {
 #[test]
 fn the_shard_walk_crosses_row_local_nodes_and_nothing_else() {
     let chain = |mids: Vec<OpNode>| {
-        let shard = mids.len() as i32 + 1;
+        let shard = mids.len() + 1;
         let mut nodes = HashMap::from([
             (0, scan_delta(7)),
             (shard, OpNode::ExchangeShard { shard_cols: vec![0] }),
         ]);
         for (i, op) in mids.into_iter().enumerate() {
-            nodes.insert(i as i32 + 1, op);
+            nodes.insert(i + 1, op);
         }
         let edges = (0..shard).map(|i| (i, i + 1, SLOT_IN)).collect();
         scan_through_row_local(&loaded_for_test(nodes, edges), shard)
@@ -771,7 +816,7 @@ fn the_shard_walk_crosses_row_local_nodes_and_nothing_else() {
 #[test]
 fn the_shard_walk_bails_at_a_fan_in() {
     let union_then = |tail: Vec<OpNode>| {
-        let shard = tail.len() as i32 + 3;
+        let shard = tail.len() + 3;
         let mut nodes = HashMap::from([
             (0, scan_delta(7)),
             (1, scan_delta(8)),
@@ -779,7 +824,7 @@ fn the_shard_walk_bails_at_a_fan_in() {
             (shard, OpNode::ExchangeShard { shard_cols: vec![0] }),
         ]);
         for (i, op) in tail.into_iter().enumerate() {
-            nodes.insert(i as i32 + 3, op);
+            nodes.insert(i + 3, op);
         }
         let mut edges = vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)];
         edges.extend((2..shard).map(|i| (i, i + 1, SLOT_IN)));

@@ -27,7 +27,7 @@ pub(super) struct EmitCtx<'a> {
     pub(in crate::query) placement: gnitz_store::schema::Placement,
     pub(in crate::query) site: super::ViewSite<'a>,
     pub(in crate::query) builder: ProgramBuilder,
-    pub(in crate::query) out_reg_of: FxHashMap<i32, OutReg>,
+    pub(in crate::query) out_reg_of: Vec<Option<OutReg>>,
     pub(in crate::query) reg_meta: Vec<RegisterMeta>,
     pub(in crate::query) source_reg_map: FxHashMap<i64, DeltaReg>,
 }
@@ -83,29 +83,26 @@ impl EmitCtx<'_> {
         Ok(id)
     }
 
-    /// The register `src` produced. The one rejection left after `topo_sorted`
-    /// held every edge set to `OpNode::arity()`: a plan covers a *slice* of the
-    /// circuit, so a producer outside this side has no register at all.
-    fn reg_of(&self, src: i32) -> Result<OutReg, String> {
-        self.out_reg_of
-            .get(&src)
-            .copied()
-            .ok_or_else(|| "operand is produced outside this plan".to_string())
+    /// The register `src` produced. The one rejection left after the load held
+    /// every node to `OpNode::arity()`: a plan covers a *slice* of the circuit, so
+    /// a producer outside this side has no register at all.
+    fn reg_of(&self, src: NodeId) -> Result<OutReg, String> {
+        self.out_reg_of[src].ok_or_else(|| "operand is produced outside this plan".to_string())
     }
 
     /// The delta feeding a unary operator.
-    fn unary_delta_in(&self, nid: i32) -> Result<DeltaReg, String> {
+    fn unary_delta_in(&self, nid: NodeId) -> Result<DeltaReg, String> {
         self.reg_of(self.loaded.inputs(nid).unary())?.delta()
     }
 
     /// The two deltas feeding a binary operator, in port order.
-    fn binary_delta_in(&self, nid: i32) -> Result<(DeltaReg, DeltaReg), String> {
+    fn binary_delta_in(&self, nid: NodeId) -> Result<(DeltaReg, DeltaReg), String> {
         let (a, b) = self.loaded.inputs(nid).binary();
         Ok((self.reg_of(a)?.delta()?, self.reg_of(b)?.delta()?))
     }
 
     /// A join's `(delta, trace)` operands.
-    fn join_in(&self, nid: i32) -> Result<(DeltaReg, TraceReg), String> {
+    fn join_in(&self, nid: NodeId) -> Result<(DeltaReg, TraceReg), String> {
         let (d, t) = self.loaded.inputs(nid).binary();
         Ok((self.reg_of(d)?.delta()?, self.reg_of(t)?.trace()?))
     }
@@ -120,7 +117,7 @@ impl EmitCtx<'_> {
     fn mint_reg(&self) -> u16 {
         assert!(
             self.reg_meta.len() < u16::MAX as usize,
-            "register count exceeds u16::MAX; `topo_sorted` caps a circuit at {} nodes",
+            "register count exceeds u16::MAX; `LoadedCircuit::new` caps a circuit at {} nodes",
             super::MAX_CIRCUIT_NODES,
         );
         self.reg_meta.len() as u16
@@ -143,7 +140,7 @@ impl EmitCtx<'_> {
 /// aliases it (an identity `Map`, a `WorkerFilter` this worker cannot narrow,
 /// the sink). Returning it is what keeps a register from being reserved for a
 /// node that never writes one.
-pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) -> Result<OutReg, String> {
+pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode) -> Result<OutReg, String> {
     match op {
         // `bound` is a backfill-scan hint consumed by the source drive, not by the
         // VM: emission is identical bounded or not.
@@ -300,7 +297,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
 
 /// `distinct` and `positive_part` differ in nothing but their preset, which the
 /// caller's own match arm supplies.
-fn emit_clamp(ctx: &mut EmitCtx, nid: i32, preset: ClampPreset) -> Result<OutReg, String> {
+fn emit_clamp(ctx: &mut EmitCtx, nid: NodeId, preset: ClampPreset) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let schema = ctx.reg_schema(in_reg);
     let hist_reg = ctx.push_trace_reg(&format!("_hist_{}_{nid}", ctx.site.id), schema)?;
@@ -317,7 +314,7 @@ fn emit_clamp(ctx: &mut EmitCtx, nid: i32, preset: ClampPreset) -> Result<OutReg
 /// Every `MapKind`'s output schema, program and PK source are one fact, derived
 /// by [`MapPlan::from_wire`]; this arm resolves the operand, asks for the plan,
 /// and either elides it or allocates a register for it.
-fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<OutReg, String> {
+fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let plan = MapPlan::from_wire(&ctx.reg_schema(in_reg), mk)?;
     // A MAP that reproduces its input row verbatim emits nothing; the node's
@@ -338,7 +335,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<Out
 
 fn emit_reduce(
     ctx: &mut EmitCtx,
-    nid: i32,
+    nid: NodeId,
     group_cols: &[u32],
     agg: &[AggDescriptor],
     global_ground: bool,
@@ -347,13 +344,11 @@ fn emit_reduce(
     let in_reg_id = ctx.unary_delta_in(nid)?;
     let in_reg_schema = ctx.reg_schema(in_reg_id);
 
-    debug_assert!(!agg.is_empty(), "decode_op_node rejects a spec-less REDUCE");
-
     // A worker owns the global-aggregate ground row when it holds the whole
     // input: the view is replicated (correct-local everywhere, read
     // single-sourced from worker 0), or nothing shards into this reduce, or it is
     // the one worker a sharded funnel routes V₀ to. That a *grouped* reduce never
-    // seeds one is `decode_op_node`'s: it rejects `global_ground` over a
+    // seeds one is `ReducePlan::from_wire`'s: it rejects `global_ground` over a
     // non-empty group set.
     //
     // V₀'s route and its owner both derive from the empty group key, so a shard
@@ -409,28 +404,28 @@ fn emit_reduce(
 /// its batch schema; their registers are in the returned map.
 pub(super) fn build_plan(
     loaded: &LoadedCircuit,
-    ordered: &[i32],
+    ordered: &[NodeId],
     site: super::ViewSite<'_>,
     placement: gnitz_store::schema::Placement,
-    seeds: &[(i32, SchemaDescriptor)],
-    out: i32,
-) -> Result<(SubPlan, FxHashMap<i32, OutReg>), String> {
+    seeds: &[(NodeId, SchemaDescriptor)],
+    out: NodeId,
+) -> Result<(SubPlan, Vec<Option<OutReg>>), String> {
     let mut ctx = EmitCtx {
         loaded,
         placement,
         site,
         builder: ProgramBuilder::new(),
-        out_reg_of: FxHashMap::default(),
+        out_reg_of: vec![None; loaded.len()],
         reg_meta: Vec::new(),
         source_reg_map: FxHashMap::default(),
     };
     for &(ex_nid, schema) in seeds {
         let reg = ctx.push_delta_reg(schema);
-        ctx.out_reg_of.insert(ex_nid, OutReg::Delta(reg));
+        ctx.out_reg_of[ex_nid] = Some(OutReg::Delta(reg));
     }
     for &nid in ordered {
         let reg = emit_node(&mut ctx, nid, loaded.op(nid))?;
-        ctx.out_reg_of.insert(nid, reg);
+        ctx.out_reg_of[nid] = Some(reg);
     }
     let out_reg = ctx.reg_of(out)?.delta()?;
     let EmitCtx {

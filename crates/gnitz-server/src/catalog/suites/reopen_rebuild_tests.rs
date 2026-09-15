@@ -359,15 +359,11 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
     let (tid, cols) = seed_base(&mut engine, "public.vbase");
 
     let vid = engine.allocate_table_id().unwrap();
-    write_circuit_chain(
-        &mut engine,
-        vid,
-        &[
-            (gnitz_wire::Opcode::ScanDelta, Some(tid), None),
-            (gnitz_wire::Opcode::Distinct, None, None),
-            (gnitz_wire::Opcode::IntegrateSink, None, None),
-        ],
-    );
+    let mut circuit = gnitz_wire::Circuit::default();
+    let scan = circuit.input_delta(tid as u64, None);
+    let distinct = circuit.distinct(scan);
+    circuit.sink(distinct);
+    write_circuit(&mut engine, vid, circuit);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     engine
         .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced"))

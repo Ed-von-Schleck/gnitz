@@ -7,7 +7,7 @@ use super::{keyed_frame, CutMemo};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::validate::reject_float_keys;
-use gnitz_core::CircuitBuilder;
+use gnitz_core::Circuit;
 use gnitz_wire::OrderKey;
 use std::collections::HashSet;
 
@@ -24,7 +24,7 @@ pub(super) fn lower_topn(
     let live: HashSet<ColId> = input.cols().iter().map(|c| c.id).collect();
     let spine = open(chain, memo, input, &live)?;
     let replicated = spine.replicated();
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     let (node, frame) = spine.emit(&mut cb, Top::Output, "ORDER BY … LIMIT input")?;
     let (in_schema, in_layout) = (&frame.schema, &frame.layout);
 
@@ -92,5 +92,5 @@ pub(super) fn lower_topn(
         cb.top_n(node, &group, &keys, *limit, *offset)
     };
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb.build(), out })
+    Ok(EmitPieces { circuit: cb, out })
 }

@@ -7304,6 +7304,25 @@ fn a_reduce_without_a_count_is_rejected() {
     }
 }
 
+/// The ground row is written at payload index 0, so a group set would leave its
+/// exemplar slots short: a ground-seeding reduce groups on nothing.
+#[test]
+fn a_global_ground_over_a_group_set_is_rejected() {
+    let schema = agg_over(type_code::I64);
+    let aggs = [AggDescriptor::COUNT_STAR];
+    assert!(
+        ReducePlan::from_wire(&schema, &[], &aggs, true, true).is_ok(),
+        "group-less ground"
+    );
+    assert_eq!(
+        ReducePlan::from_wire(&schema, &[0], &aggs, true, true)
+            .map(drop)
+            .unwrap_err()
+            .to_string(),
+        "reduce: global-ground over a non-empty group set"
+    );
+}
+
 /// col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
 /// aggregate column, whose type is the only thing the two tests below vary.
 fn agg_over(tc: u8) -> SchemaDescriptor {
@@ -7312,7 +7331,7 @@ fn agg_over(tc: u8) -> SchemaDescriptor {
 
 /// A summing aggregate adds its argument in a scalar register (`ScalarKind`) —
 /// the ≤8-byte int/float set — so a wide column has no accumulator for it.
-/// Covers the low-level `CircuitBuilder` path that bypasses the SQL binder.
+/// Covers the path a hand-built circuit reaches, bypassing the SQL binder.
 #[test]
 fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
     for agg_op in [AggFunc::Sum, AggFunc::SumZero] {

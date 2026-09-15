@@ -26,7 +26,7 @@ impl MidCircuit {
         }
     }
 
-    fn build(&self, mid: gnitz_wire::OpNode) -> Result<(SubPlan, FxHashMap<i32, OutReg>), String> {
+    fn build(&self, mid: gnitz_wire::OpNode) -> Result<(SubPlan, Vec<Option<OutReg>>), String> {
         let loaded = loaded_for_test(
             [(0, scan_delta(10)), (1, mid), (2, gnitz_wire::OpNode::IntegrateSink)],
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
@@ -109,7 +109,7 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
         ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
-    let plan = |ordered: &[i32]| {
+    let plan = |ordered: &[NodeId]| {
         build_plan(
             &loaded,
             ordered,
@@ -123,14 +123,17 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
     let (carved, out_reg_of) = plan(&subgraph_ordered(&loaded, 1)).expect("the carve production performs");
     assert_eq!(
         carved.vm.program.out_reg,
-        out_reg_of[&1].delta().expect("node 1 is a delta"),
+        out_reg_of[1]
+            .expect("node 1 is in the plan")
+            .delta()
+            .expect("node 1 is a delta"),
         "a subgraph outputs the register of the node it names"
     );
     assert_eq!(rejection(plan(&[0])), "operand is produced outside this plan");
 }
 
 /// A trace register routed into a delta port reads permanent emptiness — a
-/// silently empty view. `topo_sorted` settles port *arity* and nothing else, so
+/// silently empty view. The load settles port *arity* and nothing else, so
 /// this rejection is all that stands between a hand-built circuit and that.
 #[test]
 fn a_trace_register_reaching_a_delta_port_is_rejected() {
@@ -138,7 +141,7 @@ fn a_trace_register_reaching_a_delta_port_is_rejected() {
     let one = make_schema_u64_i64();
     // `ScanDelta(10) → IntegrateTrace → consumer`, planned as a subgraph ending
     // at the consumer. The consumer is the only thing that varies.
-    let plan = |consumer: gnitz_wire::OpNode, edges: Vec<(i32, i32, usize)>| {
+    let plan = |consumer: gnitz_wire::OpNode, edges: Vec<(NodeId, NodeId, usize)>| {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(10)),
@@ -149,7 +152,7 @@ fn a_trace_register_reaching_a_delta_port_is_rejected() {
         );
         build_plan(
             &loaded,
-            &loaded.ordered,
+            &loaded.ordered_where(|_| true),
             home(dir.path().to_str().unwrap(), 1, [(10, one)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
             &[],
@@ -185,7 +188,7 @@ fn a_plan_whose_output_is_an_integral_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let result = build_plan(
         &loaded,
-        &loaded.ordered,
+        &loaded.ordered_where(|_| true),
         home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
         &[],
@@ -367,7 +370,7 @@ fn plan_two_source_join(
 }
 
 /// A trace port fed by a node that is not an integral is rejected at compile
-/// time: `topo_sorted` checks a `Join`'s port arity, not its producer's kind,
+/// time: the load checks a `Join`'s port arity, not its producer's kind,
 /// and such a register would reach the dispatch with no cursor. The ONLY
 /// difference between the two builds is which node feeds `SLOT_TRACE`.
 #[test]
@@ -376,7 +379,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
     let two_col = make_schema_u64_i64();
     // Node 2 is the integral of scan 11; node 1 is that scan's own register,
     // which carries a delta and no table.
-    let plan = |trace_src: i32| {
+    let plan = |trace_src: NodeId| {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(10)),
@@ -388,7 +391,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
         );
         build_plan(
             &loaded,
-            &loaded.ordered,
+            &loaded.ordered_where(|_| true),
             home(dir.path().to_str().unwrap(), 1, [(10, two_col), (11, two_col)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
             &[],
@@ -409,21 +412,21 @@ fn a_wide_pk_join_compiles() {
         [
             (0, scan_delta(10)),
             (1, scan_delta(20)),
-            (2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
-            (3, gnitz_wire::OpNode::IntegrateSink),
-            (4, gnitz_wire::OpNode::IntegrateTrace),
+            (2, gnitz_wire::OpNode::IntegrateTrace),
+            (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
+            (4, gnitz_wire::OpNode::IntegrateSink),
         ],
-        vec![(0, 2, SLOT_IN), (1, 4, SLOT_IN), (4, 2, SLOT_TRACE), (2, 3, SLOT_IN)],
+        vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
     );
     // The plan owns scratch dirs under `dir`, so it must drop first: build it
     // inside the assert rather than binding it past `dir`'s scope.
     assert!(build_plan(
         &loaded,
-        &subgraph_ordered(&loaded, 2),
+        &subgraph_ordered(&loaded, 3),
         home(dir.path().to_str().unwrap(), 1, [(10, schema), (20, schema)]).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
         &[],
-        2
+        3
     )
     .is_ok());
 }
@@ -528,14 +531,14 @@ fn consume_flags(plan: &SubPlan) -> Vec<(&'static str, bool)> {
 
 /// The INTERSECT/EXCEPT fan-out shape: ScanDelta(10)'s register fans into both
 /// a destructive `Distinct` and a non-destructive `Negate` co-reader (standing
-/// in for integrate_trace). Kahn's ascending tie-break schedules the lower id
-/// first, so the ids decide which consumer runs first. (The reader is a
+/// in for integrate_trace). Instructions are emitted in node-id order, so the ids
+/// decide which consumer runs first. (The reader is a
 /// `Negate`, not a `Filter(None)`: a predicate-less Filter is elided by register
 /// aliasing and would no longer read the register at runtime.)
 #[test]
 fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let flags = |distinct_id: i32, reader_id: i32| {
+    let flags = |distinct_id: NodeId, reader_id: NodeId| {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(10)),
@@ -546,7 +549,7 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
         );
         let plan = build_plan(
             &loaded,
-            &loaded.ordered,
+            &loaded.ordered_where(|_| true),
             home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
             &[],
@@ -576,11 +579,11 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
 #[test]
 fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
     let two_col = make_schema_u64_i64();
-    let flags = |nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, usize)>, out: i32| {
+    let flags = |nodes: HashMap<NodeId, gnitz_wire::OpNode>, edges: Vec<(NodeId, NodeId, usize)>, out: NodeId| {
         let loaded = loaded_for_test(nodes, edges);
         let plan = build_plan(
             &loaded,
-            &loaded.ordered,
+            &loaded.ordered_where(|_| true),
             bare_home(1, [(10, two_col), (11, two_col)]).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
             &[],

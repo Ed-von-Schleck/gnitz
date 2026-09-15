@@ -6,12 +6,11 @@ use crate::query::compiler::{Side, Sides};
 use gnitz_store::relation::Relation;
 use gnitz_store::storage::StorageError;
 
-/// One edge of a tick's schedule: `producer`'s output feeds `view`, and `depth`
-/// is `view`'s depth in the dependency map. Field order is the sort order, so
-/// sorting a schedule puts every producer before the steps it feeds.
+/// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
+/// is the sort order, and sorting puts a view after every view it reads, because
+/// ids ascend along scan edges.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Step {
-    depth: i32,
     view: i64,
     producer: i64,
 }
@@ -198,11 +197,7 @@ impl DagEngine {
                 // The dep map is built from `CircuitNodes`, which can still name a
                 // relation the registry no longer holds.
                 if registry.has_id(view) {
-                    schedule.push(Step {
-                        depth: self.dep.depth_of(view),
-                        view,
-                        producer,
-                    });
+                    schedule.push(Step { view, producer });
                 }
             }
         }

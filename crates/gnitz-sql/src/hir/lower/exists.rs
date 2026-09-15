@@ -10,7 +10,7 @@ use crate::hir::guards::reject_pure_range_threshold_tc;
 use crate::hir::physical::Frame;
 use crate::hir::JoinType;
 use crate::ir::BExpr;
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId};
+use gnitz_core::{Circuit, ColumnDef, NodeId};
 
 /// What an EXISTS/IN circuit hands its tail: one branch for semi/anti, two for a
 /// mark join. The kind decides which, so the tail reads the shape off the type
@@ -33,7 +33,7 @@ enum ExistsBranches {
 /// ```text
 /// Anti = ν            Semi = A − ν            Mark = (A − ν, ν)
 /// ```
-fn exists_branches(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, kind: JoinType) -> ExistsBranches {
+fn exists_branches(cb: &mut Circuit, a_all: NodeId, pi_a: NodeId, kind: JoinType) -> ExistsBranches {
     let nu = cb.positive_diff(a_all, pi_a); // ν, keyed like a_all
     if kind == JoinType::Anti {
         return ExistsBranches::SemiAnti(nu);
@@ -59,7 +59,7 @@ pub(super) fn lower_exists_view(
         unreachable!("lower_exists_view receives a Join");
     };
     let down = Demand { items, where_preds };
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     let ([a, b], sides) = emit_join_inputs(chain, memo, &mut cb, down, [left, right], *kind, class)?;
 
     // A pure-range correlation (no equality prefix) decides existence from a
@@ -99,7 +99,7 @@ pub(super) fn lower_exists_view(
         None => node,
     };
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb.build(), out })
+    Ok(EmitPieces { circuit: cb, out })
 }
 
 /// What the equi and range EXISTS/IN cores both read: the sides, their emitted
@@ -114,10 +114,10 @@ struct ExistsCore<'a> {
 
 impl ExistsCore<'_> {
     /// Equi correlation, keyed by `_join_pk`: `(branches, _join_pk cols)`.
-    fn equi(&self, cb: &mut CircuitBuilder) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
+    fn equi(&self, cb: &mut Circuit) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
         let ExistsCore { sides, a, b, class, kind } = *self;
         let (a_n, b_n) = (sides[0].n(), sides[1].n());
-        let terms = equi_prologue(cb, &class.eq, sides, [a, b])?;
+        let terms = equi_prologue(cb, &class.eq, sides, [a, b], [true, false])?;
         let k = terms.k();
 
         // π_A(inner): project each term straight to [_join_pk × k, A].
@@ -130,18 +130,14 @@ impl ExistsCore<'_> {
 
         // A_all: the full (filtered by its own placed WHERE, NULL keys included)
         // outer input, re-keyed.
-        let a_all = terms.p_all(cb, true);
+        let a_all = terms.p_all(true);
         Ok((exists_branches(cb, a_all, pi_a, kind), terms.out_pk_coldefs()))
     }
 
     /// Range correlation — band (`n_eq ≥ 1`) or pure range (`n_eq == 0`). Both re-key
     /// onto the outer source PK and ride the range output exchange. Returns
     /// `(branches, _src_pk cols)`.
-    fn range(
-        &self,
-        cb: &mut CircuitBuilder,
-        range: &HirRange,
-    ) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
+    fn range(&self, cb: &mut Circuit, range: &HirRange) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
         let ExistsCore { sides, a, b, class, kind } = *self;
         let left = &sides[0];
         let a_n = left.n();
@@ -195,7 +191,7 @@ struct MarkBranch<'a> {
 impl MarkBranch<'_> {
     /// One branch with the mark column fixed to `mark_val`. The output frame is the
     /// same for both branches.
-    fn emit(&self, cb: &mut CircuitBuilder, node: NodeId, mark_val: i64) -> Result<(NodeId, Frame), GnitzSqlError> {
+    fn emit(&self, cb: &mut Circuit, node: NodeId, mark_val: i64) -> Result<(NodeId, Frame), GnitzSqlError> {
         let subst = |e: &HirExpr| subst_mark_lit(e, self.mark_id, mark_val);
         let preds: Vec<HirExpr> = self.where_preds.iter().map(subst).collect();
         let items: Vec<ProjEntry> = self

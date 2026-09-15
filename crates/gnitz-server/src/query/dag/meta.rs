@@ -19,8 +19,6 @@ pub(super) struct DepMap {
     /// pushed into it, so a present entry is never empty.
     pub(in crate::query) forward: FxHashMap<i64, Vec<i64>>,
     pub(in crate::query) reverse: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
-    /// view_id → longest scan chain beneath it; a relation with no scan edge is 0.
-    depth: FxHashMap<i64, i32>,
     pub(in crate::query) valid: bool,
 }
 
@@ -32,7 +30,7 @@ impl DepMap {
         self.valid = false;
     }
 
-    /// Rebuild both maps and the depth fold from the CircuitNodes system table if
+    /// Rebuild both maps from the CircuitNodes system table if
     /// stale and return the forward (source → views) map. An edge is one
     /// `ScanDelta` node, read through the same reader that builds the circuit,
     /// so the graph the scheduler walks names the sources the circuit actually
@@ -57,35 +55,8 @@ impl DepMap {
                 self.reverse.entry(v_id).or_default().push(dep_tid);
             }
         });
-        self.depth.clear();
-        for &v in self.reverse.keys() {
-            Self::fold_depth(&self.reverse, &mut self.depth, v);
-        }
         self.valid = true;
         &self.forward
-    }
-
-    /// `id`'s longest scan chain, 0 for a relation with no scan edge. Read after
-    /// `get_or_rebuild`.
-    pub(super) fn depth_of(&self, id: i64) -> i32 {
-        self.depth.get(&id).copied().unwrap_or(0)
-    }
-
-    /// `id`'s depth: one more than the deepest source it scans, memoized so a
-    /// chain is walked once. A pure function of the edges, so the order views
-    /// were registered in cannot change it.
-    fn fold_depth(reverse: &FxHashMap<i64, Vec<i64>>, memo: &mut FxHashMap<i64, i32>, id: i64) -> i32 {
-        if let Some(&d) = memo.get(&id) {
-            return d;
-        }
-        let d = reverse.get(&id).map_or(0, |srcs| {
-            srcs.iter()
-                .map(|&s| Self::fold_depth(reverse, memo, s) + 1)
-                .max()
-                .unwrap_or(0)
-        });
-        memo.insert(id, d);
-        d
     }
 
     /// Transitive closure of `seeds` over one half of the map, seeds excluded.
@@ -152,20 +123,6 @@ impl DagEngine {
         self.get_dep_map(registry).contains_key(&id)
     }
 
-    /// The distinct ids of `view_ids`, sources before dependents: by dep-map depth,
-    /// which exceeds every source's, then by id.
-    pub(crate) fn order_by_view_deps(&mut self, registry: &RelationRegistry, view_ids: &[i64]) -> Vec<i64> {
-        if view_ids.len() <= 1 {
-            return view_ids.to_vec();
-        }
-        self.get_dep_map(registry);
-        let dep = &self.dep;
-        let mut ids = view_ids.to_vec();
-        ids.sort_unstable_by_key(|&v| (dep.depth_of(v), v));
-        ids.dedup();
-        ids
-    }
-
     /// Transitive base-table sources of `seeds` (views), deduplicated and
     /// sorted: walk each seed's source chain — recursing through view sources —
     /// down to the base tables. The live CREATE-VIEW drain ticks exactly these
@@ -192,15 +149,6 @@ impl DagEngine {
             .collect();
         bases.sort_unstable();
         bases
-    }
-
-    /// How far above the bases `id` sits: the longest scan chain beneath it,
-    /// off the dependency map — rebuilt first if stale. A test probe: the
-    /// scheduler reads the map directly.
-    #[cfg(test)]
-    pub(crate) fn depth_of(&mut self, registry: &RelationRegistry, id: i64) -> i32 {
-        self.get_dep_map(registry);
-        self.dep.depth_of(id)
     }
 
     /// Where a view's rows live — the value `Relation` stamps — folded from

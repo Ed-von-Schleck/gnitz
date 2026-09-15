@@ -26,7 +26,7 @@ fn null_gate_is_a_no_op_on_a_non_nullable_key() {
         ColumnDef::new("k", TypeCode::U64, false),
         ColumnDef::new("n", TypeCode::U64, true),
     ];
-    let mut cb = CircuitBuilder::new();
+    let mut cb = Circuit::default();
     let inp = cb.input_delta(1, None);
     let (node, nullable) = null_gate(&mut cb, inp, &[0], &cols).unwrap();
     assert!(!nullable, "a NOT NULL key is not nullable");

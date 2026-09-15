@@ -8,7 +8,7 @@ use super::JoinSide;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr_to_program;
 use crate::ir::{BinOp, BoundExpr};
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole, ReindexSlot};
+use gnitz_core::{Circuit, ColumnDef, NodeId, ReindexRole, ReindexSlot};
 
 /// Multi-column NULL predicate for a Filter over a composite equijoin key,
 /// reusing the WHERE-clause bound-expr → program path so each column index
@@ -54,14 +54,14 @@ pub(crate) fn multi_null_filter_prog(
 /// derivations cannot drift (a drift would be a silent weight bug in the
 /// null-fill).
 pub(crate) fn null_gate(
-    cb: &mut CircuitBuilder,
+    cb: &mut Circuit,
     node: NodeId,
     cols: &[usize],
     coldefs: &[ColumnDef],
 ) -> Result<(NodeId, bool), GnitzSqlError> {
     let nullable = cols.iter().any(|&c| coldefs[c].is_nullable);
     let gated = if nullable {
-        cb.filter(node, multi_null_filter_prog(cols, coldefs, false)?)
+        cb.filter(node, multi_null_filter_prog(cols, coldefs, false)?.to_blob_bytes())
     } else {
         node
     };
@@ -75,7 +75,7 @@ pub(crate) fn self_derived_key(cols: &[usize]) -> Vec<ReindexSlot> {
 
 /// Re-key `node`, which carries `side`'s source rows, onto that source's PK. A trace
 /// key is `ScatterKey`; an internal operand `Auxiliary`.
-pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, side: &JoinSide, role: ReindexRole) -> NodeId {
+pub(crate) fn rekey_on_source_pk(cb: &mut Circuit, node: NodeId, side: &JoinSide, role: ReindexRole) -> NodeId {
     let key: Vec<ReindexSlot> = side.frame.schema.pk_cols.iter().map(|&c| (c, None)).collect();
     cb.map_reindex(node, &key, &side.keep, role)
 }

@@ -1010,7 +1010,7 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
                 let single = chain(gnitz_sql::plan_view(&stmt, &known, SN).unwrap());
                 assert_eq!(looped.views.len(), single.views.len(), "`{sql}`");
                 for (a, b) in looped.views.iter().zip(&single.views) {
-                    assert_eq!((a.seg, &a.circuit), (b.seg, &b.circuit), "`{sql}`");
+                    assert_eq!(a.circuit, b.circuit, "`{sql}`");
                 }
             }
             _ => {

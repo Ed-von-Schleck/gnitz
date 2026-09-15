@@ -172,11 +172,9 @@ fn decode_rejects_an_unknown_opcode() {
     assert!(decode_op_node(9999, None, None).unwrap_err().contains("unknown opcode"));
 }
 
-/// A reindex key's promoted target is rejected here when it is not PK-eligible —
-/// the screen a decode with no schema can make. `MAP_HASH_ROW` has no such gate
-/// (`MapPlan::from_wire` types the output column at the target, so
-/// `check_copy_types` is stricter), so its out-of-domain target decodes; an
-/// undecodable byte is refused on both.
+/// Which promotion targets a key slot admits is the plan builders' rule, which
+/// hold the source schema: an out-of-domain target decodes. An undecodable byte
+/// is refused on both, not decoded to "no target".
 #[test]
 fn decode_rejects_an_out_of_domain_reindex_target() {
     let reindex = |tc: u8| {
@@ -188,14 +186,6 @@ fn decode_rejects_an_out_of_domain_reindex_target() {
         w.extend(0u16.to_le_bytes()); // no kept columns
         w
     };
-    let err = decode_op_node(
-        Opcode::MapReindex.as_wire(),
-        None,
-        Some(&reindex(crate::type_code::F64)),
-    )
-    .unwrap_err();
-    assert!(err.contains("not PK-eligible"), "got: {err}");
-
     let hash_row = |tc: u8| {
         let mut w = vec![0u8]; // branch id
         w.extend(1u16.to_le_bytes());
@@ -229,25 +219,6 @@ fn decode_rejects_invalid_null_extend_type_code() {
     params.push(200);
     let err = decode_op_node(Opcode::NullExtend.as_wire(), None, Some(&params)).unwrap_err();
     assert!(err.contains("invalid column type code"), "got: {err}");
-}
-
-/// The ground row is written at payload index 0, so a group set would leave
-/// its exemplar slots short — the cross-check belongs where the two fields
-/// arrive, which is here rather than in each consumer. A spec-less REDUCE is
-/// refused at the same boundary: every producer ships at least one.
-#[test]
-fn reduce_rejects_a_ground_group_set_and_an_empty_agg_list() {
-    let reduce = |global_ground, group_cols: Vec<u32>, agg: Vec<AggDescriptor>| {
-        let (_, _, params) = encode_op_node(OpNode::Reduce { group_cols, agg, global_ground });
-        decode_op_node(Opcode::Reduce.as_wire(), None, params.as_deref())
-    };
-    let count = || vec![agg(AggFunc::Count, 0)];
-    assert!(reduce(true, vec![], count()).is_ok(), "group-less ground is valid");
-    assert!(reduce(false, vec![3], count()).is_ok(), "a grouped reduce is valid");
-    assert!(reduce(true, vec![3], count()).unwrap_err().contains("global-ground"));
-    assert!(reduce(false, vec![3], vec![])
-        .unwrap_err()
-        .contains("no aggregate spec"));
 }
 
 /// A `MAP_REINDEX` whose role cannot be read decides nothing about routing, so
@@ -362,10 +333,10 @@ fn for_group_cols_picks_the_output_key() {
     }
 }
 
-/// A top-N that selects nothing, or orders by more keys than a read may, is a
-/// forged circuit — the planner never emits either.
+/// A top-N ordering by more keys than a read may is refused at decode. A zero
+/// limit frames fine: refusing it is `TopNPlan::from_wire`'s.
 #[test]
-fn top_n_rejects_a_zero_limit_and_too_many_keys() {
+fn top_n_rejects_too_many_keys() {
     let decode = |limit, n_keys| {
         let order = (0..n_keys)
             .map(|i| crate::OrderKey {
@@ -382,7 +353,7 @@ fn top_n_rejects_a_zero_limit_and_too_many_keys() {
         });
         decode_op_node(Opcode::TopN.as_wire(), None, params.as_deref())
     };
-    assert!(decode(0, 1).unwrap_err().contains("zero limit"));
+    assert!(decode(0, 1).is_ok());
     assert!(decode(1, crate::MAX_ORDER_KEYS + 1).unwrap_err().contains("order keys"));
     assert!(decode(1, crate::MAX_ORDER_KEYS).is_ok());
 }
@@ -427,4 +398,58 @@ fn range_rel_converse_is_an_involution() {
     }
     assert_eq!(RangeRel::Lt.converse(), RangeRel::Gt);
     assert_eq!(RangeRel::Le.converse(), RangeRel::Ge);
+}
+
+/// A list longer than the column cap encodes — the encoder is infallible — and
+/// the decode refuses it by its count before reading the body.
+#[test]
+fn an_over_wide_list_encodes_and_is_refused_at_decode() {
+    let wide: Vec<u32> = (0..crate::MAX_COLUMNS as u32 + 1).collect();
+    let err = roundtrip(OpNode::Map(MapKind::Projection(wide))).unwrap_err();
+    assert!(
+        err.contains(&format!("exceeds cap {}", crate::MAX_COLUMNS)),
+        "got: {err}"
+    );
+}
+
+/// `push` is the graph's only constructor: an input count off the operator's
+/// arity, or an input naming a node not yet pushed, is refused.
+#[test]
+fn push_refuses_an_arity_mismatch_and_a_forward_input() {
+    let mut c = Circuit::default();
+    let scan = c
+        .push(OpNode::ScanDelta { source: 7, bound: None }, NodeInputs::Source)
+        .unwrap();
+    assert_eq!(scan, 0);
+    assert_eq!(
+        c.push(OpNode::Union, NodeInputs::Unary(scan)).unwrap_err(),
+        "node's inputs do not match its operator's arity"
+    );
+    assert_eq!(
+        c.push(OpNode::Negate, NodeInputs::Unary(1)).unwrap_err(),
+        "a node's input is not an earlier node"
+    );
+    assert_eq!(
+        c.push(OpNode::Negate, NodeInputs::Unary(scan)),
+        Ok(1),
+        "an input naming an earlier node is accepted"
+    );
+    assert_eq!(c.nodes().len(), 2, "a refused push appends nothing");
+}
+
+/// A row's slots round-trip through `NodeInputs`, and a slot 1 filled behind an
+/// empty slot 0 is no operator's wiring.
+#[test]
+fn from_slots_is_to_slots_inverse_and_refuses_a_trailing_slot() {
+    for inputs in [
+        NodeInputs::Source,
+        NodeInputs::Unary(3),
+        NodeInputs::Binary { a: 1, b: 2 },
+    ] {
+        assert_eq!(NodeInputs::from_slots(inputs.to_slots()), Ok(inputs));
+    }
+    assert_eq!(
+        NodeInputs::from_slots([None, Some(0)]).unwrap_err(),
+        "node's inputs do not match its operator's arity"
+    );
 }

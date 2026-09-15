@@ -156,11 +156,11 @@ impl CatalogEngine {
                 _ => {}
             }
         }
-        // Registering a view reads its sources' stamped placement, and neither a wire
-        // bundle nor boot replay's PK-order walk puts a view after the views it scans.
-        if family == SysFamily::View {
-            creates = self.dag.order_by_view_deps(&self.registry, &creates);
-        }
+        // Registering a view reads its sources' stamped placement, and ids ascend
+        // along every scan edge, so id order registers a view after the views it
+        // scans.
+        creates.sort_unstable();
+        creates.dedup();
         for id in creates {
             // System tables are registered by `open` before replay reaches their rows.
             if self.registry.has_id(id) {

@@ -8,7 +8,6 @@
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
 
-pub mod circuit;
 pub mod client;
 pub mod connection;
 pub mod error;
@@ -22,18 +21,16 @@ pub mod types;
 // module is `pub`, so anything omitted here is still reachable by its own path —
 // this list carries no meaning beyond "spelled often enough to be worth
 // shortening".
-pub use circuit::{
-    agg_output_type, segment_id, Circuit, CircuitBuilder, MapKind, NodeId, OpNode, RangeRel, ReindexRole,
-};
 pub use client::{
-    delta_reply_schema, qualified_name, retraction_batch, CatalogSnapshot, DeltaCursor, GnitzClient, IndexMeta,
-    InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
+    delta_reply_schema, qualified_name, retraction_batch, segment_id, CatalogSnapshot, DeltaCursor, GnitzClient,
+    IndexMeta, InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
     Completions, IdRun, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply, Session, SlotId,
     MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
+pub use gnitz_wire::{agg_output_type, Circuit, MapKind, Node, NodeId, NodeInputs, OpNode, RangeRel, ReindexRole};
 pub use gnitz_wire::{
     validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, ReindexSlot, RelClass, TableProps,
     FIRST_USER_TABLE_ID, TABLE_TAB,
