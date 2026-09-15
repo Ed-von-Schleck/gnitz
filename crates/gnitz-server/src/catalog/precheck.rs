@@ -438,23 +438,47 @@ impl CatalogEngine {
                 (Some(nj), Some(pj)) => {
                     // `check_col_narrowings` bounded these booleans to `{0, 1}`.
                     let (old, new) = (read_col_tab_row(batch, nj), read_col_tab_row(batch, pj));
-                    // Direction: is_hidden / is_nullable only false→true.
-                    if new.is_hidden != old.is_hidden && !new.is_hidden {
-                        return Err("a column-ALTER may only set is_hidden 0→1 (DROP COLUMN)".into());
+                    // A dropped column is gone from every surface: nothing may
+                    // rename, re-show or re-null it.
+                    if old.is_hidden {
+                        return Err(format!("cannot ALTER dropped column {col_idx} of table {owner_id}"));
                     }
                     if new.is_nullable != old.is_nullable && !new.is_nullable {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
-                    let is_drop = (new.is_hidden && !old.is_hidden) || (new.is_nullable && !old.is_nullable);
+                    let (hides, unnulls) = (new.is_hidden, new.is_nullable != old.is_nullable);
                     let prospective = self.col_defs_with(owner_id, col_idx, new);
                     check_col_defs(RelationKind::BaseTable, &prospective)
                         .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
-                    if is_drop {
-                        if owner_schema.is_pk_col(col_idx as usize) {
-                            return Err("cannot DROP COLUMN / DROP NOT NULL on a primary-key column".into());
-                        }
-                        self.reject_if_dependent_views(owner_id, "DROP COLUMN / DROP NOT NULL")?;
+                    let op = match (hides, unnulls) {
+                        (true, _) => "DROP COLUMN",
+                        (false, true) => "DROP NOT NULL",
+                        // A rename: legal on a PK column and under dependent
+                        // views, which bind columns by ordinal.
+                        (false, false) => continue,
+                    };
+                    let name = &old.name;
+                    if owner_schema.is_pk_col(col_idx as usize) {
+                        return Err(format!("cannot {op} '{name}': it is a primary-key column"));
                     }
+                    if hides {
+                        // Before the index test: an FK column also carries its FK index.
+                        if old.fk_table_id != 0 {
+                            return Err(format!("cannot DROP COLUMN '{name}': it carries a foreign key"));
+                        }
+                        let indexed = self.registry.relation(owner_id).is_some_and(|e| {
+                            e.indexes()
+                                .iter()
+                                .any(|ix| ix.cols().as_slice().contains(&(col_idx as u32)))
+                        });
+                        if indexed {
+                            return Err(format!(
+                                "cannot DROP COLUMN '{name}': it is covered by a secondary index; \
+                                 drop the index first"
+                            ));
+                        }
+                    }
+                    self.reject_if_dependent_views(owner_id, op)?;
                 }
                 (None, Some(pj)) => self.precheck_column_append(batch, pj, owner_id, col_idx, &owner_schema)?,
                 // The contract rejects a PK carrying neither sign, so this is
@@ -515,7 +539,6 @@ impl CatalogEngine {
         col_idx: u64,
         owner_schema: &SchemaDescriptor,
     ) -> Result<(), String> {
-        self.reject_if_dependent_views(owner_id, "ADD COLUMN")?;
         // The append must be *trailing*, and this is the only check that makes
         // it so: the rebuild path maps the owner's defs positionally, so a gap
         // would silently shift every column past it rather than fail. (A
@@ -542,7 +565,10 @@ impl CatalogEngine {
         if appended.is_serial || appended.is_hidden || appended.fk_table_id != 0 {
             return Err("ADD COLUMN must not append a SERIAL, hidden, or foreign-key column".into());
         }
-        check_col_ident(batch, pj, owner_id, OWNER_KIND_TABLE)
+        check_col_ident(batch, pj, owner_id, OWNER_KIND_TABLE)?;
+        // Last, as in the rewrite-pair arm: a malformed append is reported as
+        // malformed whatever depends on the table.
+        self.reject_if_dependent_views(owner_id, "ADD COLUMN")
     }
 
     /// A `+1` VIEW_TAB row's `owner_view_id` must name `0` (a user view), a view
@@ -839,6 +865,18 @@ impl CatalogEngine {
                         ));
                     }
                 }
+                // INSERT writes a SERIAL column's draw into the PK region, so it
+                // must be the table's lone PK column.
+                let mut serials = col_defs.iter().enumerate().filter(|(_, cd)| cd.is_serial);
+                if let Some((ci, cd)) = serials.next() {
+                    if serials.next().is_some() || pk.as_slice() != [ci as u32] {
+                        return Err(format!(
+                            "table '{name}' (id={id}): SERIAL column '{}' must be the table's only SERIAL \
+                             column and its single-column primary key",
+                            cd.name
+                        ));
+                    }
+                }
                 // `validate_pk_against_cols` above proved the PK list non-empty
                 // and in range, which is what makes the self-reference type
                 // lookup inside sound.
@@ -910,6 +948,14 @@ impl CatalogEngine {
                     self.qualified_name_or_unknown(owner_id).1
                 )
             })?;
+            let defs = self.read_column_defs(owner_id);
+            if let Some(&c) = cols
+                .as_slice()
+                .iter()
+                .find(|&&c| defs.get(c as usize).is_some_and(|d| d.is_hidden))
+            {
+                return Err(format!("Index: column {c} of table {owner_id} is dropped"));
+            }
 
             // Only live indices are mapped, and a `+1` on one already failed the
             // net bound — so any hit is a different index.

@@ -1129,15 +1129,14 @@ pub(crate) fn reject_unhonored_table_constraints(
 /// Reject every `ALTER TABLE` envelope clause gnitz does not honor: `ONLY`
 /// (silently scopes out partition children), a Hive `SET LOCATION`, `ON CLUSTER`,
 /// and a non-`None` `table_type` (Iceberg/Dynamic — a different storage engine).
-/// The single operation — this guard enforces exactly one per statement — is
-/// dispatched in `ddl::alter`. Exhaustive destructure (no `..`): a future
-/// sqlparser field stops the build until it is classified.
+/// The operation is dispatched in `ddl::alter`. Exhaustive destructure (no `..`):
+/// a future sqlparser field stops the build until it is classified.
 pub(crate) fn reject_unhonored_alter_table_clauses(alter: &sqlparser::ast::AlterTable) -> Result<(), GnitzSqlError> {
     const CTX: &str = "ALTER TABLE";
     let sqlparser::ast::AlterTable {
-        // Consumed by the dispatcher, one per statement.
+        // Consumed by the dispatcher.
         name: _,
-        operations,
+        operations: _,
         if_exists: _,
         // Inert: the statement-terminator token.
         end_token: _,
@@ -1147,7 +1146,6 @@ pub(crate) fn reject_unhonored_alter_table_clauses(alter: &sqlparser::ast::Alter
         on_cluster,
         table_type,
     } = alter;
-    reject_if(operations.len() != 1, CTX, "more than one operation per statement")?;
     reject_if(*only, CTX, "ONLY")?;
     reject_if(location.is_some(), CTX, "SET LOCATION")?;
     reject_if(on_cluster.is_some(), CTX, "ON CLUSTER")?;

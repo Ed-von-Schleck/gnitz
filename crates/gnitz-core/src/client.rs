@@ -18,9 +18,9 @@ use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::{
-    RelClass, TableProps, CIRCUIT_NODES_TAB, COL_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS, IDX_TAB,
-    OWNER_KIND_TABLE, OWNER_KIND_VIEW, RELTAB_COL_NAME, RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB,
-    TABLE_TAB, VIEW_TAB,
+    RelClass, TableProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COL_TAB,
+    IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, OWNER_KIND_TABLE,
+    OWNER_KIND_VIEW, RELTAB_COL_NAME, RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -59,17 +59,6 @@ fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
         noun,
         name: qualified_name(schema_name, name),
     }
-}
-
-/// The row of `idx_batch` holding the live index named `name` (already canonical).
-/// Takes the scanned batch rather than owning the scan, so N names cost one scan.
-fn index_retraction(idx_batch: &ZSetBatch, name: &str) -> Result<Option<usize>, ClientError> {
-    for i in idx_batch.live_rows() {
-        if col_str(idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)? == name {
-            return Ok(Some(i));
-        }
-    }
-    Ok(None)
 }
 
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
@@ -133,21 +122,6 @@ pub const MAX_CHAIN_SEGMENTS: usize = 64;
 /// `owner_view_id` column, not the name.
 fn segment_name(vid: u64) -> String {
     format!("_seg{vid}")
-}
-
-/// Reject a COL_TAB write against anything but a user base table. The engine's
-/// own kind check is unreachable for these verbs: `alter_col_pair` stamps
-/// `OWNER_KIND_TABLE`, so a view target fails the retraction CAS first, as a
-/// false "catalog changed concurrently".
-fn reject_non_base_table(desc: &RelDescriptor, op: &str) -> Result<(), ClientError> {
-    if desc.class != RelClass::Table {
-        return Err(ClientError::ServerError(format!(
-            "relation {} is a {}; {op} requires a base table",
-            desc.tid,
-            desc.class.noun()
-        )));
-    }
-    Ok(())
 }
 
 /// A subscriber's whole state: one word, held on the client.
@@ -957,18 +931,47 @@ impl GnitzClient {
 
     /// Drop indexes by name as **one** DDL zone: the whole set retires or none of
     /// it does, and a name repeated in `index_names` retires once.
+    pub fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_index_rows(index_names, "index", if_exists, |_, _| true)
+    }
+
+    /// `ALTER TABLE … DROP CONSTRAINT`: the UNIQUE index `name` of table `tid`.
+    /// The `-1` is the stored row, so the engine's CAS re-proves owner and
+    /// uniqueness against the live row.
+    pub fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
+        let s = sys_schema(IDX_TAB);
+        self.drop_index_rows(&[name], "constraint", if_exists, |b, i| {
+            col_u64(b, s, IDXTAB_COL_OWNER_ID, i) == tid
+                && gnitz_wire::IndexProps::from_flags(col_u64(b, s, IDXTAB_COL_FLAGS, i)).is_unique
+        })
+    }
+
+    /// Retract the live IDX_TAB rows named in `names` that pass `matches`.
     ///
     /// `if_exists` is answered at this verb's own not-found path, never by a
     /// pre-check: a pre-check leaves a window a concurrent DROP can land in and
     /// resurface the "not found" it must suppress.
-    pub fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+    fn drop_index_rows(
+        &mut self,
+        names: &[&str],
+        noun: &'static str,
+        if_exists: bool,
+        matches: impl Fn(&ZSetBatch, usize) -> bool,
+    ) -> Result<(), ClientError> {
         let scanned = checked_sys_rows(IDX_TAB, self.scan(IDX_TAB)?)?;
         let idx_schema = sys_schema(IDX_TAB);
         let mut batch = ZSetBatch::new(idx_schema);
-        let mut retired: Vec<usize> = Vec::with_capacity(index_names.len());
-        for name in index_names {
+        let mut retired: Vec<usize> = Vec::with_capacity(names.len());
+        for name in names {
             let name = gnitz_wire::canonical_identifier(name)?;
-            match index_retraction(&scanned, &name)? {
+            let mut hit = None;
+            for i in scanned.live_rows() {
+                if col_str(&scanned, idx_schema, IDXTAB_COL_NAME, i)? == name && matches(&scanned, i) {
+                    hit = Some(i);
+                    break;
+                }
+            }
+            match hit {
                 Some(i) => {
                     // A repeated name retires once: the row is already in the batch.
                     if !retired.contains(&i) {
@@ -977,7 +980,7 @@ impl GnitzClient {
                     }
                 }
                 None if if_exists => {}
-                None => return Err(ClientError::NotFound { noun: "index", name }),
+                None => return Err(ClientError::NotFound { noun, name }),
             }
         }
         // Every name skipped: no zone, so no barrier and no fdatasync.
@@ -1582,15 +1585,11 @@ impl GnitzClient {
         schema_name: &str,
         name: &str,
     ) -> Result<Option<(ZSetBatch, usize)>, ClientError> {
-        let missing = || not_found(noun, schema_name, name);
         let Some(desc) = self.resolve(schema_name, name)? else {
             return Ok(None);
         };
-        let scanned = self.seek_sys_row(family, desc.tid)?;
-        let i = scanned
-            .live_row_with_pk(sys_schema(family), desc.tid)
-            .ok_or_else(missing)?;
-        Ok(Some((scanned, i)))
+        self.seek_sys_row(family, desc.tid as u128, || not_found(noun, schema_name, name))
+            .map(Some)
     }
 
     /// Rename a table or view: a `(-1, +1)` rewrite pair on TABLE_TAB / VIEW_TAB,
@@ -1612,17 +1611,11 @@ impl GnitzClient {
         // than on `(schema_id, name)`, which would need a SCHEMA_TAB probe first.
         let desc = self.resolve(&schema_name, &current_name)?.ok_or_else(missing)?;
 
-        // One arm for both families: the pair is a verbatim copy of the live row
-        // with only `name` patched.
         let family = if desc.class.is_view() { VIEW_TAB } else { TABLE_TAB };
-        let s = sys_schema(family);
-        let scanned = self.seek_sys_row(family, desc.tid)?;
-        let i = scanned.live_row_with_pk(s, desc.tid).ok_or_else(missing)?;
-        let mut b = ZSetBatch::new(s);
-        b.copy_row_at(&scanned, i, -1);
-        b.copy_row_at(&scanned, i, 1);
-        b.set_string_cell(1, s.payload_idx(RELTAB_COL_NAME), &new_name);
-        self.push_ddl_txn(&[(family, b)])?;
+        let name_pi = sys_schema(family).payload_idx(RELTAB_COL_NAME);
+        self.rewrite_sys_row(family, desc.tid as u128, missing, |b, row| {
+            b.set_string_cell(row, name_pi, &new_name)
+        })?;
         if desc.class.is_view() {
             // The id, the layout and the rows are unchanged, so the copy is
             // renamed rather than destroyed. Both probes resolve before either
@@ -1647,31 +1640,14 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Rename a column: a `(-1, +1)` COL_TAB rewrite pair, same packed column id,
-    /// the live column's exact payload at `-1` and only the `name` changed at
-    /// `+1`. The `-1` reproduces the STORED name, which is what the engine's
-    /// retraction CAS compares it against.
-    ///
-    /// Takes a resolved `(tid, col_idx)` like its three ALTER siblings; the check
-    /// stays here rather than in `alter_col_pair`, which resolves `tid` anyway.
     pub fn alter_rename_column(&mut self, tid: u64, col_idx: usize, new_col: &str) -> Result<(), ClientError> {
-        let desc = self.describe_by_id(tid)?;
-        if desc.schema.visible_column_named(new_col).is_some_and(|i| i != col_idx) {
-            return Err(ClientError::ServerError(format!(
-                "column '{new_col}' already exists on table {tid}"
-            )));
-        }
-        self.alter_col_pair(tid, col_idx, |cd| cd.name = new_col.to_string())
+        self.alter_col_pair(tid, col_idx, |b, row| b.set_string_cell(row, COLTAB_PAY_NAME, new_col))
     }
 
-    /// `ALTER TABLE … DROP COLUMN` (logical): a `(-1, +1)` COL_TAB rewrite pair on
-    /// the same packed column id — the live row's exact payload at `-1`, only
-    /// `is_hidden` flipped to true at `+1`. The column stays physically present
-    /// (`is_nullable`, `type_code`, position untouched), so the base table keeps
-    /// its comparator. One atomic `push_ddl_txn`; the engine precheck arm validates
-    /// the drop shape and the dependent-view RESTRICT.
+    /// `ALTER TABLE … DROP COLUMN`: the column stays physically present, so the
+    /// table keeps its layout and comparator.
     pub fn alter_drop_column(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
-        self.alter_col_pair(tid, col_idx, |cd| cd.is_hidden = true)
+        self.alter_col_pair(tid, col_idx, |b, row| b.set_u64_cell(row, COLTAB_PAY_IS_HIDDEN, 1))
     }
 
     /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: a `(-1, +1)` COL_TAB rewrite
@@ -1680,31 +1656,13 @@ impl GnitzClient {
     /// permits a null bit there and the engine swaps the table comparator
     /// `FixedIntNonnull → Generic` (if the table was all-non-null-fixed-int).
     pub fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
-        self.alter_col_pair(tid, col_idx, |cd| cd.is_nullable = true)
+        self.alter_col_pair(tid, col_idx, |b, row| b.set_u64_cell(row, COLTAB_PAY_IS_NULLABLE, 1))
     }
 
-    /// `ALTER TABLE … ADD COLUMN`: a single COL_TAB `+1` row appending `def` at
-    /// `col_idx = <current physical column count>` — the physical layout, which
-    /// **includes** columns hidden by a previous DROP COLUMN. Existing rows read
-    /// the new column as NULL, so it must be nullable; the engine precheck
-    /// enforces that along with the trailing position, the dependent-view
-    /// RESTRICT and the `MAX_COLUMNS` bound.
-    ///
-    /// Deliberately not through [`Self::alter_col_pair`], whose whole job is
-    /// reproducing a live row at `-1`; an append has no live row.
-    ///
-    /// The visible-name check is local, and here rather than in the SQL layer
-    /// because `gnitz-core` is also the non-SQL entry point.
+    /// `ALTER TABLE … ADD COLUMN`: `def` appended after every physical column,
+    /// dropped ones included.
     pub fn alter_add_column(&mut self, tid: u64, def: &ColumnDef) -> Result<(), ClientError> {
-        let desc = self.describe_by_id(tid)?;
-        reject_non_base_table(&desc, "ADD COLUMN")?;
-        if desc.schema.visible_column_named(&def.name).is_some() {
-            return Err(ClientError::ServerError(format!(
-                "column '{}' already exists on table {tid}",
-                def.name
-            )));
-        }
-        let col_idx = desc.schema.num_columns();
+        let col_idx = self.describe_by_id(tid)?.schema.num_columns();
 
         let col_s = sys_schema(COL_TAB);
         let mut cb = ZSetBatch::new(col_s);
@@ -1716,44 +1674,36 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Build and push a COL_TAB `(-1, +1)` rewrite pair for column `col_idx` of
-    /// base table `tid`: the live row goes in verbatim at `-1` and the same row
-    /// with `flip` applied at `+1`. The single client-side pipeline behind
-    /// RENAME COLUMN, DROP COLUMN, and DROP NOT NULL.
-    ///
-    /// The `-1` must be byte-equal to the stored row or the engine's CAS rejects
-    /// the batch, which is why the columns come from this statement's own
-    /// resolve of `tid` rather than from a caller-supplied `Schema`. That is
-    /// fail-safe either way: the `-1`'s PK is `(tid, col_idx)`, so a wrong
-    /// payload can only be rejected, never retract a different row.
+    /// [`Self::rewrite_sys_row`] on column `col_idx` of relation `tid`.
     fn alter_col_pair(
         &mut self,
         tid: u64,
         col_idx: usize,
-        flip: impl FnOnce(&mut ColumnDef),
+        patch: impl FnOnce(&mut ZSetBatch, usize),
     ) -> Result<(), ClientError> {
-        let desc = self.describe_by_id(tid)?;
-        reject_non_base_table(&desc, "ALTER COLUMN")?;
-        let cd = desc
-            .schema
-            .columns
-            .get(col_idx)
-            .filter(|c| !c.is_hidden)
-            .ok_or_else(|| ClientError::ServerError(format!("column index {col_idx} not found on table {tid}")))?;
-        let mut new_cd = cd.clone();
-        flip(&mut new_cd);
+        self.rewrite_sys_row(
+            COL_TAB,
+            tid as u128 | (col_idx as u128) << 64,
+            || ClientError::ServerError(format!("column index {col_idx} not found on table {tid}")),
+            patch,
+        )
+    }
 
-        let col_s = sys_schema(COL_TAB);
-        let mut cb = ZSetBatch::new(col_s);
-        {
-            let mut a = BatchAppender::new(&mut cb, col_s);
-            let old_row = cd.col_tab_row(tid, OWNER_KIND_TABLE, col_idx);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &old_row, -1);
-            let new_row = new_cd.col_tab_row(tid, OWNER_KIND_TABLE, col_idx);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &new_row, 1);
-        }
-        self.push_ddl_txn(&[(COL_TAB, cb)])?;
-        Ok(())
+    /// Push a `(-1, +1)` rewrite pair on the live `family` row keyed `key`: the
+    /// stored row at `-1`, and a copy of it at `+1` that `patch` edits in place.
+    fn rewrite_sys_row(
+        &mut self,
+        family: u64,
+        key: u128,
+        missing: impl FnOnce() -> ClientError,
+        patch: impl FnOnce(&mut ZSetBatch, usize),
+    ) -> Result<(), ClientError> {
+        let (scanned, i) = self.seek_sys_row(family, key, missing)?;
+        let mut b = ZSetBatch::new(sys_schema(family));
+        b.copy_row_at(&scanned, i, -1);
+        b.copy_row_at(&scanned, i, 1);
+        patch(&mut b, 1);
+        self.push_ddl_txn(&[(family, b)])
     }
 
     /// Resolve `table_name` under `schema_name` to its id and schema. Anything that
@@ -1819,15 +1769,20 @@ impl GnitzClient {
         })
     }
 
-    /// The live system-catalog row with PK `id`, as the one-row batch it came back
-    /// in — one master-local SEEK, not a transfer of the whole family. The batch
-    /// rather than a decoded row, because a caller reads the row back out of it to
-    /// write the matching `-1`.
-    fn seek_sys_row(&mut self, family: u64, id: u64) -> Result<ZSetBatch, ClientError> {
-        // Every system family is keyed by a lone integer id, so the whole key
-        // rides the control block's narrow word and the extra blob is empty.
-        let reply = self.seek(family, id as u128, &[])?;
-        checked_sys_rows(family, reply)
+    /// The live system-catalog row with PK `key`, by one master-local SEEK: the
+    /// reply batch and the row's index in it, for a caller to copy the stored row
+    /// out of. No live row is `missing()`.
+    fn seek_sys_row(
+        &mut self,
+        family: u64,
+        key: u128,
+        missing: impl FnOnce() -> ClientError,
+    ) -> Result<(ZSetBatch, usize), ClientError> {
+        // Every system key fits the narrow word, packed native, so the whole key
+        // rides the control block and the extra blob is empty.
+        let reply = checked_sys_rows(family, self.seek(family, key, &[])?)?;
+        let i = reply.live_row_with_pk(sys_schema(family), key).ok_or_else(missing)?;
+        Ok((reply, i))
     }
 }
 

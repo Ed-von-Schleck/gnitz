@@ -117,7 +117,8 @@ fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape,
         slot_of[ci] = Some(k);
     }
     // The written list never names the SERIAL column, so its index still comes
-    // from a scan. A SERIAL column is never hidden: DROP COLUMN refuses one.
+    // from a scan. A SERIAL column is never hidden: it is the table's lone PK,
+    // which the engine refuses to hide.
     let serial_ci = schema.columns.iter().position(|c| c.is_serial);
     Ok(RowShape {
         slot_of,

@@ -295,6 +295,8 @@ pub const CIRCNODES_PAY_PARAMS: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "par
 
 pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");
 pub const IDXTAB_COL_NAME: usize = col_index_in(IDX_TAB_COLS, "name");
+pub const IDXTAB_COL_OWNER_ID: usize = col_index_in(IDX_TAB_COLS, "owner_id");
+pub const IDXTAB_COL_FLAGS: usize = col_index_in(IDX_TAB_COLS, "flags");
 pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in_fam(IDX_TAB, "owner_id");
 pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in_fam(IDX_TAB, "source_col_idx");
 pub const IDXTAB_PAY_NAME: usize = pay_index_in_fam(IDX_TAB, "name");

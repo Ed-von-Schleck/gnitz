@@ -42,6 +42,14 @@ pub(crate) fn find_unique_column<'a>(
     Ok(found)
 }
 
+/// [`find_unique_column`] for a name that must resolve.
+pub(crate) fn require_column<'a>(
+    columns: impl IntoIterator<Item = &'a ColumnDef>,
+    col_name: &str,
+) -> Result<usize, GnitzSqlError> {
+    find_unique_column(columns, col_name)?.ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found")))
+}
+
 /// The output column `e` names, if it names one. Matched by name alone: an
 /// output column carries no qualifier to check against.
 pub(crate) fn output_column<'a>(

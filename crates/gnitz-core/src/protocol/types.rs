@@ -253,16 +253,6 @@ impl Schema {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
-    /// Physical index of the visible column named `name` (ASCII-case-insensitive),
-    /// or `None`. Hidden (DROP COLUMN'd) slots never match: their names are
-    /// excluded from resolution, so a new column may reuse one.
-    #[inline]
-    pub fn visible_column_named(&self, name: &str) -> Option<usize> {
-        self.visible_columns()
-            .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
-            .map(|(i, _)| i)
-    }
-
     /// True iff any **non-PK** column is hidden. A view's synthetic hidden keys
     /// are PK columns, so they never count.
     #[inline]
@@ -710,6 +700,11 @@ impl ZSetBatch {
         self.payload[pi].bytes[row * 16..(row + 1) * 16].copy_from_slice(&cell);
     }
 
+    /// Overwrite the 8-byte fixed-width cell at `(row, pi)` with `v`, little-endian.
+    pub fn set_u64_cell(&mut self, row: usize, pi: usize, v: u64) {
+        self.payload[pi].bytes[row * 8..(row + 1) * 8].copy_from_slice(&v.to_le_bytes());
+    }
+
     /// An empty batch with every growth stream sized for `n` rows: the PK
     /// buffer, the weights, the null words and each payload column. The form to
     /// use whenever the row count is known before the build loop — otherwise a
@@ -746,10 +741,9 @@ impl ZSetBatch {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 
-    /// The index of the live row whose PK is `pk`, for a batch keyed by a single
-    /// integer column (the catalog tables). `None` = no such live row.
-    pub fn live_row_with_pk(&self, schema: &Schema, pk: u64) -> Option<usize> {
-        self.live_rows().find(|&i| self.pks.get(schema, i) as u64 == pk)
+    /// The live row whose PK, packed as [`PkColumn::get`] returns it, is `pk`.
+    pub fn live_row_with_pk(&self, schema: &Schema, pk: u128) -> Option<usize> {
+        self.live_rows().find(|&i| self.pks.get(schema, i) == pk)
     }
 
     /// Append all rows of `other`, consuming it: each region concatenates, and

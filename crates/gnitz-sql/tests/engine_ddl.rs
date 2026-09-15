@@ -527,6 +527,8 @@ fn alter_rejection_matrix() {
     exec(&mut client, &sn, "CREATE VIEW base AS SELECT id, c FROM t");
     exec(&mut client, &sn, "CREATE VIEW dep AS SELECT id, c FROM base");
     exec(&mut client, &sn, "CREATE INDEX ix ON t (c)");
+    exec(&mut client, &sn, "CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT)");
+    exec(&mut client, &sn, "CREATE UNIQUE INDEX uq ON u (v)");
     exec(
         &mut client,
         &sn,
@@ -580,8 +582,8 @@ fn alter_rejection_matrix() {
             "Unsupported",
             "FIRST/AFTER",
         ),
-        ("ALTER TABLE t ADD COLUMN a BIGINT", "Exec", "already exists"),
-        ("ALTER TABLE t ADD COLUMN id BIGINT", "Exec", "already exists"),
+        ("ALTER TABLE t ADD COLUMN a BIGINT", "Exec", "duplicate column name"),
+        ("ALTER TABLE t ADD COLUMN id BIGINT", "Exec", "duplicate column name"),
         ("ALTER TABLE st ADD COLUMN x BIGINT", "Unsupported", "is a stream"),
         (
             "ALTER TABLE st ADD CONSTRAINT su UNIQUE (v)",
@@ -590,8 +592,14 @@ fn alter_rejection_matrix() {
         ),
         ("ALTER TABLE t RENAME TO otherschema.t2", "Unsupported", "cross-schema"),
         ("ALTER TABLE nope RENAME TO x", "Bind", "does not exist"),
-        ("ALTER TABLE t RENAME COLUMN a TO b", "Exec", "already exists"),
-        ("ALTER TABLE t RENAME COLUMN nope TO z", "Bind", "does not exist"),
+        // The new name is checked before the IF EXISTS no-op.
+        (
+            "ALTER TABLE IF EXISTS nope RENAME TO _x",
+            "Plan",
+            "cannot start with '_'",
+        ),
+        ("ALTER TABLE t RENAME COLUMN a TO b", "Exec", "duplicate column name"),
+        ("ALTER TABLE t RENAME COLUMN nope TO z", "Bind", "not found"),
         ("ALTER TABLE vw RENAME COLUMN b TO w", "Unsupported", "base table"),
         (
             "ALTER TABLE t ADD CONSTRAINT cq UNIQUE (b) NOT VALID",
@@ -600,6 +608,10 @@ fn alter_rejection_matrix() {
         ),
         ("ALTER TABLE t ADD CONSTRAINT cq CHECK (b > 0)", "Unsupported", "UNIQUE"),
         ("ALTER TABLE t DROP CONSTRAINT nope", "Exec", "not found"),
+        ("ALTER TABLE t DROP CONSTRAINT ix CASCADE", "Unsupported", "CASCADE"),
+        // DROP CONSTRAINT drops a UNIQUE index of its own table only.
+        ("ALTER TABLE t DROP CONSTRAINT ix", "Exec", "constraint 'ix' not found"),
+        ("ALTER TABLE t DROP CONSTRAINT uq", "Exec", "not found"),
         ("ALTER VIEW vw AS SELECT id, b FROM vw", "Unsupported", "itself"),
         ("ALTER VIEW t AS SELECT id FROM t", "Unsupported", "is a table"),
         (
@@ -630,15 +642,11 @@ fn alter_rejection_matrix() {
             "more than one operation",
         ),
         ("ALTER TABLE ONLY t RENAME TO t2", "Unsupported", "ONLY"),
-        ("ALTER TABLE t DROP COLUMN id", "Unsupported", "primary key"),
+        ("ALTER TABLE t DROP COLUMN id", "Exec", "primary-key"),
         ("ALTER TABLE t DROP COLUMN a, b", "Parse", "Expected"),
         ("ALTER TABLE t DROP COLUMN b CASCADE", "Unsupported", "CASCADE"),
-        ("ALTER TABLE t DROP COLUMN c", "Unsupported", "secondary index"),
-        (
-            "ALTER TABLE t ALTER COLUMN id DROP NOT NULL",
-            "Unsupported",
-            "primary-key",
-        ),
+        ("ALTER TABLE t DROP COLUMN c", "Exec", "secondary index"),
+        ("ALTER TABLE t ALTER COLUMN id DROP NOT NULL", "Exec", "primary-key"),
         // A dependent view blocks a column drop and a nullability change of any
         // column: its traces hold rows under the old comparator.
         ("ALTER TABLE t DROP COLUMN b", "Exec", "dependent view"),
@@ -647,6 +655,8 @@ fn alter_rejection_matrix() {
     ] {
         assert_rejects_variant(&mut client, &sn, sql, variant, needle);
     }
+    // Only if the misdirected constraint drop left `uq` standing.
+    exec(&mut client, &sn, "DROP INDEX uq");
 }
 
 // ── DROP ─────────────────────────────────────────────────────────────────────

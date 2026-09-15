@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use super::resolve::find_unique_column;
+use super::resolve::require_column;
 use crate::ast_util::{
     bind_constant, bind_literal, classify_agg_call, col_ref_parts, function_positional_args, single_fn_name,
     temporal_constant, Constant,
@@ -874,7 +874,7 @@ pub(crate) fn single_relation_col_idx<'a>(
     let (qual, name) =
         col_ref_parts(e).ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
     reject_foreign_qualifier(qual, name, alias)?;
-    find_unique_column(cols, name)?.ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
+    require_column(cols, name)
 }
 
 /// The qualifier half of [`single_relation_col_idx`], for a resolver that carries

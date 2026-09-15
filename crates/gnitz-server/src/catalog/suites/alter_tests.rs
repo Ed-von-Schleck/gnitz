@@ -394,8 +394,8 @@ fn column_rename_on_non_base_owner_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The two guards that stay inside `is_drop`: a rename is legal on a PK column
-/// and on a table with dependent views (views bind columns by ordinal).
+/// The two guards a rename skips: a rename is legal on a PK column and on a
+/// table with dependent views (views bind columns by ordinal).
 #[test]
 fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
     let dir = temp_dir("alter_col_rename_ok");
@@ -424,6 +424,163 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
             )
             .expect("renaming a column with dependent views is legal");
     }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── The column-ALTER arm owns every drop guard ──────────────────────────────
+
+fn hide(c: &mut ColumnDef) {
+    c.is_hidden = true;
+}
+
+fn unnull(c: &mut ColumnDef) {
+    c.is_nullable = true;
+}
+
+/// A column an FK binds cannot be hidden.
+#[test]
+fn hiding_a_foreign_key_column_rejected() {
+    let dir = temp_dir("alter_hide_fk");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let ptid = engine
+        .create_table("public.p", &[col_def("id", type_code::U64)], &[0])
+        .unwrap();
+    let cols = vec![col_def("id", type_code::U64), fk_def("r", type_code::U64, ptid, 0)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+
+    let err = engine
+        .precheck_family(
+            SysFamily::Column,
+            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], hide),
+        )
+        .unwrap_err();
+    assert!(err.contains("carries a foreign key"), "{err}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
+    let cols = vec![col_def("id", type_code::U64), col_def("c", type_code::U64)];
+    let (mut engine, tid, dir) = table_fixture("alter_hide_indexed", &cols);
+    engine.create_index("public.t", &["c"], false).unwrap();
+
+    let err = engine
+        .precheck_family(
+            SysFamily::Column,
+            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], hide),
+        )
+        .unwrap_err();
+    assert!(err.contains("secondary index"), "{err}");
+    engine
+        .precheck_family(
+            SysFamily::Column,
+            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], unnull),
+        )
+        .expect("DROP NOT NULL on an indexed column is legal");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hiding_or_unnulling_a_pk_column_rejected() {
+    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+    let (mut engine, tid, dir) = table_fixture("alter_pk_col", &cols);
+
+    for mutate in [hide as fn(&mut ColumnDef), unnull] {
+        let err = engine
+            .precheck_family(
+                SysFamily::Column,
+                &col_alter_pair(tid, OWNER_KIND_TABLE, 0, &cols[0], mutate),
+            )
+            .unwrap_err();
+        assert!(err.contains("primary-key"), "{err}");
+    }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// INSERT writes a SERIAL draw into the PK region, so the engine holds a SERIAL
+/// column to being the table's lone PK column.
+#[test]
+fn a_serial_column_must_be_the_lone_pk() {
+    let dir = temp_dir("alter_serial_pk");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let serial = |name: &str| ColumnDef {
+        is_serial: true,
+        ..col_def(name, type_code::I64)
+    };
+
+    for (i, (cols, pk)) in [
+        (vec![col_def("id", type_code::U64), serial("s")], vec![0u32]),
+        (vec![serial("a"), col_def("b", type_code::U64)], vec![0, 1]),
+        (vec![serial("id"), serial("s")], vec![0]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let err = engine.create_table(&format!("public.bad{i}"), &cols, &pk).unwrap_err();
+        assert!(err.contains("must be the table's only SERIAL column"), "{err}");
+    }
+    engine
+        .create_table("public.ok", &[serial("id"), col_def("v", type_code::U64)], &[0])
+        .expect("a lone SERIAL PK is legal");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A malformed ADD COLUMN is reported as malformed even when the table has a
+/// dependent view.
+#[test]
+fn a_duplicate_add_column_is_named_before_dependent_views() {
+    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+    let (mut engine, tid, dir) = table_fixture("alter_add_dup_dep", &cols);
+    register_identity_view(&mut engine, tid, "vw", &cols);
+
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 2, &nullable_def("v", type_code::U64), 1);
+    let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
+    assert!(err.contains("duplicate column name"), "{err}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Once hidden, a column is gone from every surface: neither a rename nor a new
+/// index may name it.
+#[test]
+fn a_dropped_column_cannot_be_renamed_or_indexed() {
+    let cols = vec![col_def("id", type_code::U64), col_def("a", type_code::U64)];
+    let (mut engine, tid, dir) = table_fixture("alter_dropped_col", &cols);
+    engine
+        .ingest_to_family(COL_TAB_ID, &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], hide))
+        .unwrap();
+    let hidden = ColumnDef { is_hidden: true, ..cols[1].clone() };
+
+    let err = engine
+        .precheck_family(
+            SysFamily::Column,
+            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &hidden, rename_to("z")),
+        )
+        .unwrap_err();
+    assert!(err.contains("dropped"), "rename: {err}");
+
+    let idx = idx_tab_batch(
+        engine.allocate_index_id().unwrap(),
+        tid,
+        pack_pk_cols(&[1]),
+        "public__t__idx_a",
+        gnitz_wire::IndexProps { is_unique: false },
+        1,
+    );
+    let err = engine.precheck_family(SysFamily::Index, &idx).unwrap_err();
+    assert!(err.contains("dropped"), "index: {err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

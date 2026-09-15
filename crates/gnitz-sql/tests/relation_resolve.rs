@@ -263,9 +263,8 @@ fn a_read_costs_two_requests() {
     }
 }
 
-/// A statement that resolves the same relation from two places pays once. `ALTER
-/// TABLE … DROP COLUMN` is the case: it goes through the kind probe and then the
-/// schema-bearing probe.
+/// A relation is resolved once per statement, on the success path and on the
+/// error ladder alike.
 #[test]
 fn one_statement_resolves_a_relation_once() {
     let (_srv, mut client, sn) = boot(1);
@@ -277,8 +276,8 @@ fn one_statement_resolves_a_relation_once() {
 
     assert_eq!(
         requests_for_sql(&mut client, &sn, "ALTER TABLE t DROP COLUMN a"),
-        2,
-        "DROP COLUMN resolves once and pushes once"
+        3,
+        "DROP COLUMN resolves once, seeks the stored row once, pushes once"
     );
 
     // An absent INSERT target runs the two-probe error ladder — still one resolve.
@@ -414,13 +413,10 @@ fn a_recreated_schema_resolves_its_new_members() {
     assert_eq!(schema.columns.len(), 2);
 }
 
-/// `alter_rename_column` against a view name must raise the "requires a base
-/// table" error rather than write an `OWNER_KIND_TABLE` row against a stored
-/// view row and fail as a CAS conflict — which is what the engine answers if
-/// the row reaches it, since the retraction CAS differs on `owner_kind` before
-/// the readable kind check runs.
+/// A view's own column row is what gets retracted, so the engine answers with
+/// its owner-kind rule rather than a CAS conflict.
 #[test]
-fn alter_rename_column_rejects_a_view_at_the_gateway() {
+fn alter_rename_column_on_a_view_is_refused_by_the_engine() {
     let (_srv, mut client, sn) = boot(1);
     exec(&mut client, &sn, T_ID_V);
     exec(&mut client, &sn, "CREATE VIEW vw AS SELECT id, v FROM t");
@@ -430,5 +426,5 @@ fn alter_rename_column_rejects_a_view_at_the_gateway() {
         .alter_rename_column(vid, 1, "w")
         .expect_err("a view is not a base table")
         .to_string();
-    assert!(err.contains("requires a base table"), "got: {err}");
+    assert!(err.contains("not a user base table"), "got: {err}");
 }
