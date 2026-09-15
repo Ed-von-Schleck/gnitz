@@ -9,15 +9,13 @@
 
 use std::sync::Arc;
 
-use crate::access::{
-    pk_point_tuple, ranked_index_bounds, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
-};
+use crate::access::{candidates, residual, Candidate};
 use crate::codec::project_schema::{read_reply_shape, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use crate::tail::{order_exprs, parse_order_by, wire_keys};
-use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
+use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, Schema, ZSetBatch};
 use gnitz_wire::{IndexWalk, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, SelectItem};
 
@@ -120,36 +118,21 @@ impl<'e> AccessPlan<'e> {
         }
     }
 
-    /// What a DML verb must do about the transaction's own buffered rows, which
-    /// no server-side walk ever saw: the keys to restrict them to, and the
-    /// conjuncts to re-impose on them.
-    ///
-    /// The two travel together because they are one decision. A bound naming an
-    /// **exact key set** — a `PkSet` gather, or a `PkRange` pinning *every* PK
-    /// column — restricts the candidates itself, which supplies the PK conjunct
-    /// its walk consumed, so the residual completes the WHERE and nothing the
-    /// access recognizers consume (a wide PK literal, a U128 equality) reaches the
-    /// expression VM. Any looser bound — a PK *prefix* point names a key group,
-    /// not a key — restricts nothing, so the FULL WHERE applies.
-    pub(crate) fn buffered_scope(&self, schema: &Schema) -> (BufferedKeys<'_>, &[&'e BoundExpr]) {
-        let keys = match &self.access.bound {
-            ReadBound::PkSet(keys) => BufferedKeys::Keys(keys),
-            ReadBound::PkRange(desc) => pk_point_tuple(desc, schema).map_or(BufferedKeys::All, BufferedKeys::Point),
-            _ => BufferedKeys::All,
-        };
-        match keys {
-            BufferedKeys::All => (keys, &self.all),
-            _ => (keys, &self.residual),
+    /// The keys a DML verb restricts the transaction's buffered rows to, and the
+    /// conjuncts it re-imposes on them: a `PkSet`'s keys stand in for the conjuncts
+    /// it consumed, and any other bound restricts nothing and re-imposes the WHERE.
+    pub(crate) fn buffered_scope(&self) -> (BufferedKeys<'_>, &[&'e BoundExpr]) {
+        match &self.access.bound {
+            ReadBound::PkSet(keys) => (BufferedKeys::Keys(keys), &self.residual),
+            _ => (BufferedKeys::All, &self.all),
         }
     }
 }
 
 /// The PKs a plan restricts the transaction's buffered rows to.
 pub(crate) enum BufferedKeys<'a> {
-    /// A `PkSet` gather's keys.
+    /// A `PkSet`'s keys.
     Keys(&'a PkKeys),
-    /// A `PkRange` pinning every PK column.
-    Point(PkBuf),
     /// Every PK the transaction touched.
     All,
 }
@@ -168,22 +151,9 @@ pub(crate) fn bind_where(
     }
 }
 
-/// Bind-once WHERE → the access plan that serves it. The one way any statement
-/// turns a bound WHERE into an access path.
-///
-/// The predicate is: empty for `PkSet` (the gather is exact); the extractor's
-/// residual for `PkRange` (a byte-exact walk at any PK width — consumed
-/// conjuncts are applied exactly and stripped); the whole bound WHERE for
-/// `None`; and for an `IndexRange` whichever form [`index_plan`] takes. A PK
-/// bound that pins no PK column yields to a point covering every column of a
-/// UNIQUE index, which admits at most one row. A WHERE the expression VM cannot
-/// compile is an `Unsupported`, propagated.
-///
-/// `indexes` is the relation's declared secondary-index list, which the caller
-/// already holds: the pure path reads it off the statement's resolved descriptor,
-/// the write verbs off the one `resolve_base_table` returned.
-///
-/// The caller owns the bound WHERE, because the plan borrows its conjuncts.
+/// Bind-once WHERE → the access plan that serves it: the first of [`candidates`]
+/// whose predicate compiles, else an unbounded scan under the whole WHERE.
+/// `indexes` is the relation's declared secondary-index list.
 pub(crate) fn bound_and_predicate<'e>(
     schema: &Schema,
     conjuncts: &'e [BoundExpr],
@@ -191,89 +161,45 @@ pub(crate) fn bound_and_predicate<'e>(
     indexes: &[IndexMeta],
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
     let all: Vec<&'e BoundExpr> = conjuncts.iter().collect();
-
-    // `pk IN (…)` → an exact gather of those keys, with the remaining conjuncts as
-    // the predicate.
-    let gather = try_extract_pk_in(conjuncts, schema)
-        .filter(|(keys, _)| budget == ReadBudget::MayChunk || keys.fits_one_request());
-    if let Some((keys, residual)) = gather {
-        return AccessPlan::new(ReadBound::PkSet(keys), &all, residual, schema);
-    }
-
-    // The whole WHERE compiled once for the ladder below (never for the `PkSet`
-    // rung above, whose residual is narrower): `Ok` is the predicate every rung
-    // keeping it ships, `Err` the verdict that makes an index rung strip instead.
-    let whole = compile_wire_conjuncts(all.iter().copied(), &schema.columns);
-
-    // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE
-    // minus every conjunct the walk applies exactly) is the predicate. Exactness at
-    // any PK width is what serves a wide (U128) PK range without the predicate VM.
-    // It yields only when the descriptor pins no PK column and a point covering
-    // every column of a UNIQUE index is available: that admits one row where an
-    // unpinned PK range admits the table.
-    if let Some((desc, residual)) = try_extract_pk_range(conjuncts, schema) {
-        // A descriptor pinning nothing is the only one worth giving up: the ladder
-        // bets that a pinned leading PK column shares the distribution prefix and
-        // unicasts, which holds only under a `CLUSTER BY` shorter than the PK.
-        if desc.pins_none() {
-            // The index arm re-imposes more of the WHERE than the PK arm's
-            // residual, so a conjunct the VM refuses (a wide literal, a U128
-            // column) can sink it; keep the PK walk rather than fail the query.
-            if let Some(c) = ranked_index_bounds(conjuncts, schema, indexes)
-                .into_iter()
-                .next()
-                .filter(|c| c.is_unique_point())
-            {
-                if let Some(p) = if_supported(index_plan(c, &all, whole.as_deref().ok(), schema))? {
-                    return Ok(p);
+    // Compiled on first need: `Ok` is the predicate an index walk keeps (walk
+    // Optional); `Err` makes the walk strip its own conjuncts (walk Required).
+    let compile_all = || compile_wire_conjuncts(all.iter().copied(), &schema.columns);
+    let mut whole: Option<Result<Vec<u8>, GnitzSqlError>> = None;
+    for Candidate { bound, consumed } in candidates(conjuncts, schema, indexes) {
+        let plan = match bound {
+            ReadBound::PkSet(keys) if budget == ReadBudget::OneRequest && !keys.fits_one_request() => continue,
+            ReadBound::IndexRange { bound, .. } => match whole.get_or_insert_with(compile_all) {
+                Ok(p) => Ok(AccessPlan::whole(
+                    ReadBound::IndexRange { bound, walk: IndexWalk::Optional },
+                    &all,
+                    p.clone(),
+                )),
+                Err(_) => {
+                    let walk = ReadBound::IndexRange { bound, walk: IndexWalk::Required };
+                    AccessPlan::new(walk, &all, residual(conjuncts, &consumed), schema)
                 }
-            }
-        }
-        return AccessPlan::new(ReadBound::PkRange(desc), &all, residual, schema);
-    }
-
-    // Most-constrained first, and the first whose plan compiles wins: the tightest
-    // bound is not servable if its leftover conjunct has no compiled form, where a
-    // looser candidate consumes that same conjunct byte-exactly.
-    for c in ranked_index_bounds(conjuncts, schema, indexes) {
-        if let Some(p) = if_supported(index_plan(c, &all, whole.as_deref().ok(), schema))? {
+            },
+            bound => AccessPlan::new(bound, &all, residual(conjuncts, &consumed), schema),
+        };
+        if let Some(p) = if_supported(plan)? {
             return Ok(p);
         }
     }
-
-    Ok(AccessPlan::whole(ReadBound::None, &all, whole?))
+    Ok(AccessPlan::whole(
+        ReadBound::None,
+        &all,
+        whole.unwrap_or_else(compile_all)?,
+    ))
 }
 
-/// `Ok(None)` for the one error a ladder rung may be abandoned on — `Unsupported`
-/// means "this rung cannot express the WHERE", so the next rung gets its turn.
+/// `Ok(None)` for the one error a candidate may be abandoned on — `Unsupported`
+/// means "this candidate cannot express the WHERE", so the next one gets its turn.
 /// Every other error is fatal.
 fn if_supported<T>(r: Result<T, GnitzSqlError>) -> Result<Option<T>, GnitzSqlError> {
     match r {
         Ok(v) => Ok(Some(v)),
         Err(GnitzSqlError::Unsupported(_)) => Ok(None),
         Err(e) => Err(e),
-    }
-}
-
-/// An index candidate → its plan. The whole WHERE (`whole`, when it compiles)
-/// stays the predicate, leaving the walk `Optional`; otherwise the walk's own
-/// conjuncts are stripped and it is `Required`.
-fn index_plan<'e>(
-    c: IndexRangeCandidate<'e>,
-    all: &[&'e BoundExpr],
-    whole: Option<&[u8]>,
-    schema: &Schema,
-) -> Result<AccessPlan<'e>, GnitzSqlError> {
-    let bound = ReadBound::IndexRange {
-        bound: c.bound(),
-        walk: match whole {
-            Some(_) => IndexWalk::Optional,
-            None => IndexWalk::Required,
-        },
-    };
-    match whole {
-        Some(predicate) => Ok(AccessPlan::whole(bound, all, predicate.to_vec())),
-        None => AccessPlan::new(bound, all, c.residual, schema),
     }
 }
 

@@ -27,10 +27,13 @@ fn sample(op: Opcode) -> OpNode {
         // whole backing array, so a reordered list fails the round-trip.
         Opcode::ScanDelta => OpNode::ScanDelta {
             source: 42,
-            bound: Some(crate::IndexBound {
-                idx_cols: crate::PkColList::from_slice(&[9, 3, 5]),
-                desc: crate::RangeDescriptor::new(&[7, 11], crate::Cut::After(4), crate::Cut::Before(90)),
-            }),
+            bound: crate::ReadBound::IndexRange {
+                bound: crate::IndexBound {
+                    idx_cols: crate::PkColList::from_slice(&[9, 3, 5]),
+                    desc: crate::RangeDescriptor::new(&[7, 11], crate::Cut::After(4), crate::Cut::Before(90)),
+                },
+                walk: crate::IndexWalk::Optional,
+            },
         },
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: vec![0, 2] },
         Opcode::NullExtend => OpNode::NullExtend {
@@ -82,7 +85,7 @@ fn every_op_node_variant_roundtrips() {
     // The shapes an opcode's own sample cannot also be: an absent parameter cell,
     // and the empty lists each counted layout allows.
     nodes.extend([
-        OpNode::ScanDelta { source: 7, bound: None },
+        OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
         OpNode::Map(MapKind::Projection(vec![])),
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
         OpNode::Map(MapKind::HashRow { cols: vec![(3, None)], branch_id: 1 }),
@@ -249,12 +252,33 @@ fn a_map_reindex_whose_role_or_key_is_unusable_is_rejected() {
 /// must stay distinguishable, so the common shape costs nothing.
 #[test]
 fn unbounded_scan_delta_encodes_identically() {
-    let fields = encode_op_node(OpNode::ScanDelta { source: 7, bound: None });
+    let fields = encode_op_node(OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None });
     assert_eq!(fields, (Opcode::ScanDelta, Some(7), None));
     assert_eq!(
         decode_op_node(Opcode::ScanDelta.as_wire(), Some(7), None).unwrap(),
-        OpNode::ScanDelta { source: 7, bound: None }
+        OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None }
     );
+}
+
+/// Every kind of read bound survives as a backfill hint, the walk byte included.
+#[test]
+fn every_scan_bound_kind_roundtrips() {
+    let desc = crate::RangeDescriptor::new(&[3], crate::Cut::Before(1), crate::Cut::After(9));
+    let keys = crate::PkKeys::from_keys(8, [&7u64.to_be_bytes()[..], &2u64.to_be_bytes()[..]]);
+    for bound in [
+        crate::ReadBound::PkRange(desc),
+        crate::ReadBound::PkSet(keys),
+        crate::ReadBound::IndexRange {
+            bound: crate::IndexBound {
+                idx_cols: crate::PkColList::from_slice(&[2, 1]),
+                desc,
+            },
+            walk: crate::IndexWalk::Required,
+        },
+    ] {
+        let node = OpNode::ScanDelta { source: 7, bound };
+        assert_eq!(roundtrip(node.clone()).unwrap(), node);
+    }
 }
 
 /// A malformed backfill hint is catalog corruption, and every other opcode in
@@ -268,26 +292,58 @@ fn a_malformed_scan_bound_is_rejected() {
         &crate::RangeDescriptor::new(&[1], crate::Cut::Before(0), crate::Cut::After(9)),
     );
     let desc = w.into_vec();
-    let with_word = |word: u64, tail: &[u8]| {
-        let mut p = word.to_le_bytes().to_vec();
+    // An `IndexRange` cell: tag, column word, `tail`, then an Optional walk byte.
+    let index_range = |word: u64, tail: &[u8]| {
+        let mut p = vec![2u8];
+        p.extend_from_slice(&word.to_le_bytes());
         p.extend_from_slice(tail);
+        p.push(0);
         p
     };
+    // A `PkSet` cell: tag, stride, count, then the key bytes.
+    let pk_set = |stride: u8, count: u32, keys: &[u8]| {
+        let mut p = vec![3u8, stride];
+        p.extend_from_slice(&count.to_le_bytes());
+        p.extend_from_slice(keys);
+        p
+    };
+    let over_arity = {
+        let n_eq = crate::catalog::PK_LIST_MAX_COLS;
+        let mut p = vec![1u8, n_eq as u8, 0];
+        p.resize(1 + 2 + 16 * (n_eq + 2), 0);
+        p
+    };
+    let mut trailing = pk_set(1, 1, &[5]);
+    trailing.push(0);
+    let cap = crate::PkKeys::max_per_request(8) as u32;
     let cases: &[(&str, Vec<u8>)] = &[
+        ("unknown bound tag", vec![9]),
         // A column-list word whose count is past the arity cap — `as_slice` would
         // silently truncate it and `from_slice` would panic.
-        ("over-long list", with_word(crate::PK_LIST_PACKED_FLAG | 7, &desc)),
+        ("over-long list", index_range(crate::PK_LIST_PACKED_FLAG | 7, &desc)),
         // A word carrying no packed-list flag at all.
-        ("untagged word", with_word(1, &desc)),
+        ("untagged word", index_range(1, &desc)),
         // A bounded node whose descriptor never arrived.
-        ("missing descriptor", with_word(crate::pack_pk_cols(&[1]), &[])),
+        ("missing descriptor", {
+            let mut p = vec![2u8];
+            p.extend_from_slice(&crate::pack_pk_cols(&[1]).to_le_bytes());
+            p
+        }),
         // A descriptor that fails `RangeDescriptor::decode`'s validation.
         (
             "undecodable descriptor",
-            with_word(crate::pack_pk_cols(&[1]), &[0xff, 0xff, 0xff]),
+            index_range(crate::pack_pk_cols(&[1]), &[0xff, 0xff, 0xff]),
         ),
+        ("zero stride", pk_set(0, 0, &[])),
+        ("over-wide stride", pk_set(crate::MAX_PK_BYTES as u8 + 1, 0, &[])),
+        ("count over the cap", pk_set(8, cap + 1, &[])),
+        ("unsorted keys", pk_set(1, 2, &[5, 4])),
+        ("pk range past the arity cap", over_arity),
+        ("trailing bytes", trailing),
         // Nothing at all: a present but empty cell is damaged, not absent.
         ("empty cell", Vec::new()),
+        // "No bound" is spelled by the absent cell alone.
+        ("a cell spelling no bound", vec![0]),
     ];
     for (what, params) in cases {
         assert!(
@@ -418,7 +474,10 @@ fn an_over_wide_list_encodes_and_is_refused_at_decode() {
 fn push_refuses_an_arity_mismatch_and_a_forward_input() {
     let mut c = Circuit::default();
     let scan = c
-        .push(OpNode::ScanDelta { source: 7, bound: None }, NodeInputs::Source)
+        .push(
+            OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
+            NodeInputs::Source,
+        )
         .unwrap();
     assert_eq!(scan, 0);
     assert_eq!(

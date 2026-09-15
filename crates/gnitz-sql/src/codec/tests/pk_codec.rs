@@ -42,7 +42,7 @@ fn test_uuid_pk_string_literal_accepted() {
     // UUID PK has stride 16; decoding the key recovers the parsed u128.
     assert_eq!(
         pk,
-        gnitz_core::opk_key_packed(&schema, 0x550e8400_e29b_41d4_a716_446655440000_u128)
+        gnitz_core::opk_key_cols(&schema, [0x550e8400_e29b_41d4_a716_446655440000_u128])
     );
 }
 
@@ -106,7 +106,7 @@ fn negative_zero_is_accepted_by_an_unsigned_wide_pk() {
         let schema = pk_schema(tc);
         let row = vec![neg_num_expr("0"), num_expr("0")];
         let pk = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("{tc:?}: {e}"));
-        assert_eq!(pk, gnitz_core::opk_key_packed(&schema, 0), "{tc:?}");
+        assert_eq!(pk, gnitz_core::opk_key_cols(&schema, [0]), "{tc:?}");
     }
 }
 

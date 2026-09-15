@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_ident, Constant, FromShape};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
-use crate::codec::pk_codec::pack_pk_value;
+use crate::codec::pk_codec::pack_num;
 use crate::dml::overlay::resolve_where_matches;
 use crate::dml::plan::{bind_where, bound_and_predicate, rows_sink, ReadBudget};
 use crate::dml::rmw::commit_rmw_or_buffer;
@@ -319,7 +319,7 @@ pub(crate) fn apply_set(
                         for (w, v) in nulls.iter_mut().zip(vals) {
                             set_null(w, pi, v.is_none(), def)?;
                             let v = v.map_or(0, |x| if unsigned { i128::from(x as u64) } else { i128::from(x) });
-                            let packed = pack_pk_value(tc, v)
+                            let packed = pack_num(tc, NumLit::of_i128(v))
                                 .ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {v}")))?;
                             payload[pi]
                                 .bytes

@@ -223,8 +223,7 @@ pub(crate) fn write_range_descriptor(w: &mut Writer, d: &RangeDescriptor) {
 }
 
 /// A bounded walk over a secondary index: the index's declared column list, and
-/// the half-open range over its leading columns. One type for both wire paths —
-/// a `ScanDelta`'s backfill hint and a `ReadSpec`'s `IndexRange` bound.
+/// the half-open range over its leading columns.
 ///
 /// `idx_cols` is unpacked at decode, so an untagged word or a crafted count is
 /// refused here; admitting the columns against a schema stays with the engine.

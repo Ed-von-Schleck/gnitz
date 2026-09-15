@@ -636,7 +636,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     // Register a view (column and circuit records precede the VIEW_TAB row).
     let vid = engine.next_table_id;
     let view_cols = vec![col_def("id", type_code::U64)];
-    write_identity_circuit(&mut engine, vid, base_tid, None);
+    write_identity_circuit(&mut engine, vid, base_tid, gnitz_wire::ReadBound::None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "depview");
@@ -818,7 +818,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
         (p_producer, pt),
         (p_consumer, p_producer),
     ] {
-        write_identity_circuit(&mut engine, vid, src, None);
+        write_identity_circuit(&mut engine, vid, src, gnitz_wire::ReadBound::None);
         engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     }
 
@@ -997,7 +997,7 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
     let cols = vec![col_def("id", type_code::U64)];
     let register = |engine: &mut CatalogEngine, name: &str, owner: i64| {
         let vid = engine.next_table_id;
-        write_identity_circuit(engine, vid, base, None);
+        write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
         engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
         let mut bb = BatchBuilder::new(*SysFamily::View.schema());
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);

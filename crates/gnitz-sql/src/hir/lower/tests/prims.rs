@@ -24,7 +24,7 @@ fn null_gate_is_a_no_op_on_a_non_nullable_key() {
         ColumnDef::new("n", TypeCode::U64, true),
     ];
     let mut cb = Circuit::default();
-    let inp = cb.input_delta(1, None);
+    let inp = cb.input_delta(1, gnitz_wire::ReadBound::None);
     let node = null_gate(&mut cb, inp, &[0], &cols).unwrap();
     assert_eq!(node, inp, "a NOT NULL key emits no filter node");
     let node = null_gate(&mut cb, inp, &[0, 1], &cols).unwrap();

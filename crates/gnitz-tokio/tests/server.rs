@@ -240,7 +240,7 @@ fn one_writev_per_burst() {
 /// the plan's output register.
 fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
     let mut circuit = gnitz_core::Circuit::default();
-    let src = circuit.input_delta(tid, None);
+    let src = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
     circuit.sink(src);
     let vids = client
         .create_view_chain(

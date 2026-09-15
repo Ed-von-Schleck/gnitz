@@ -540,7 +540,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
         .create_table("owner.t", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
     let vid = engine.allocate_table_id().unwrap();
-    write_identity_circuit(&mut engine, vid, tid, None);
+    write_identity_circuit(&mut engine, vid, tid, gnitz_wire::ReadBound::None);
     assert_eq!(
         engine.dag.get_dep_map(&engine.registry).get(&tid),
         Some(&vec![vid]),

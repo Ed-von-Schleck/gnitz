@@ -359,10 +359,9 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             let le = BExpr::bin(subject, BinOp::Le, bind_structural(high, leaf)?);
             Ok(maybe_negate(BExpr::bin(ge, BinOp::And, le), *negated))
         }
-        // `e IN (l)` IS `e = l` — the same structural desugar as BETWEEN above, and
-        // what makes the equality visible to the `access` recognizers, which all gate
-        // on `BinOp(_, Eq, _)`. Two or more items keep the faithful `InList` node for
-        // lowering to shape. `NOT IN` wraps whichever node the arity picked. Item
+        // `e IN (l)` IS `e = l` — the same structural desugar as BETWEEN above. Two or
+        // more items keep the faithful `InList` node for lowering to shape. `NOT IN`
+        // wraps whichever node the arity picked. Item
         // binding is eager, so a NULL/string/non-literal item errors in its written
         // position.
         Expr::InList { expr: e, list, negated } => {

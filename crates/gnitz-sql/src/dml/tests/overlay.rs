@@ -47,7 +47,7 @@ fn is_deleted(net: &Net, pk: u128) -> bool {
 
 /// The identity key for `pk` under [`two_col`]'s single U64 PK.
 fn key(pk: u128) -> PkBuf {
-    gnitz_core::opk_key_packed(&two_col(TypeCode::I64), pk)
+    gnitz_core::opk_key_cols(&two_col(TypeCode::I64), [pk])
 }
 
 fn rows_of(b: &ZSetBatch) -> Vec<(u128, i64)> {

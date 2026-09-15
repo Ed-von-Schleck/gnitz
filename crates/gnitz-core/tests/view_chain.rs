@@ -40,7 +40,7 @@ fn make_base(client: &mut GnitzClient, sn: &str) -> (u64, Vec<ColumnDef>) {
 /// One identity segment reading `source_id`.
 fn segment(source_id: u64, cols: &[ColumnDef]) -> PlannedView {
     let mut circuit = gnitz_core::Circuit::default();
-    let inp = circuit.input_delta(source_id, None);
+    let inp = circuit.input_delta(source_id, gnitz_wire::ReadBound::None);
     circuit.sink(inp);
     PlannedView {
         circuit,
@@ -192,7 +192,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     // A node list past the column cap encodes, and the engine refuses it at load.
     let mut wide = Circuit::default();
-    let scan = wide.input_delta(base_tid, None);
+    let scan = wide.input_delta(base_tid, gnitz_wire::ReadBound::None);
     let proj = wide.map(scan, &vec![0; gnitz_core::MAX_COLUMNS + 1]);
     wide.sink(proj);
     let planned = vec![PlannedView {

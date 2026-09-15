@@ -8,10 +8,11 @@ use super::{
     collect_live_cols, cut_segment, filter, lowered_whole, materialize, project_front, resolve_in_place, CutMemo,
     SegInput,
 };
-use crate::access::ranked_index_bounds;
+use crate::access::candidates;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{Circuit, NodeId, RelDescriptor, Schema};
+use gnitz_wire::ReadBound;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -187,13 +188,22 @@ fn source(
     frame: &Frame,
     leading: Vec<Vec<BoundExpr>>,
 ) -> Result<NodeId, GnitzSqlError> {
-    // The head candidate outright: this path compiles no residual.
-    let conjuncts = leading.concat();
-    let bound = desc.as_ref().and_then(|d| {
-        ranked_index_bounds(&conjuncts, &frame.schema, &d.indexes)
+    // This path compiles no residual.
+    let bound = desc.as_ref().map_or(ReadBound::None, |d| {
+        let conjuncts = leading.concat();
+        candidates(&conjuncts, &frame.schema, &d.indexes)
             .into_iter()
-            .next()
-            .map(|c| c.bound())
+            .map(|c| c.bound)
+            // The cell decodes under the per-request key cap.
+            .filter(|b| !matches!(b, ReadBound::PkSet(keys) if !keys.fits_one_request()))
+            // A backfill never routes, and the engine may trade an index walk for the
+            // full scan, which it cannot do for a PK range.
+            .min_by_key(|b| match b {
+                ReadBound::PkSet(_) => 0,
+                ReadBound::IndexRange { .. } => 1,
+                _ => 2,
+            })
+            .unwrap_or(ReadBound::None)
     });
     let mut node = cb.input_delta(tid, bound);
     for preds in &leading {

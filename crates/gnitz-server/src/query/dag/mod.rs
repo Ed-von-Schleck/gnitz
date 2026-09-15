@@ -169,14 +169,17 @@ impl DagEngine {
         Ok(true)
     }
 
-    /// The backfill-scan bound for `source` under `view_id`, if its circuit carries one.
+    /// The backfill-scan bound for `source` under `view_id`: `ReadBound::None` unless
+    /// its circuit carries one.
     pub(crate) fn source_scan_bound(
         &mut self,
         registry: &RelationRegistry,
         view_id: i64,
         source: i64,
-    ) -> Option<gnitz_wire::IndexBound> {
-        self.view_meta(registry, view_id)?.source_bounds.get(&source).copied()
+    ) -> gnitz_wire::ReadBound {
+        self.view_meta(registry, view_id)
+            .and_then(|m| m.source_bounds.get(&source).cloned())
+            .unwrap_or(gnitz_wire::ReadBound::None)
     }
 
     /// Read `view_id`'s circuit out of the system tables and compile it, homing

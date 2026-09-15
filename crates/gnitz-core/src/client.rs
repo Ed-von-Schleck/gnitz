@@ -1338,7 +1338,7 @@ impl GnitzClient {
         // A minimal SCAN_DELTA → INTEGRATE_SINK circuit, built through the typed
         // builder so the row materialisation matches the stored layout exactly.
         let mut circuit = Circuit::default();
-        let scan = circuit.input_delta(source_table_id, None);
+        let scan = circuit.input_delta(source_table_id, gnitz_wire::ReadBound::None);
         circuit.sink(scan);
 
         let vids = self.create_view_chain(

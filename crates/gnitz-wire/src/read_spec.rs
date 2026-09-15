@@ -174,7 +174,8 @@ pub enum ReadBound {
     /// Secondary-index range walk. An index holds no row with a NULL in any
     /// indexed column, so neither does the walk.
     IndexRange { bound: IndexBound, walk: IndexWalk },
-    /// `pk IN (…)`: the listed keys, at any PK arity.
+    /// An exact key set, at any PK arity — a `pk IN (…)` gather or one fully
+    /// pinned key.
     PkSet(PkKeys),
 }
 
@@ -210,29 +211,7 @@ impl ReadSpec {
         let mut w = Writer::with_capacity(64 + reply_block.len() + self.predicate.len() + keys + map);
         w.bytes32(reply_block);
 
-        match &self.bound {
-            ReadBound::None => {
-                w.u8(BOUND_NONE);
-            }
-            ReadBound::PkRange(desc) => {
-                w.u8(BOUND_PK_RANGE);
-                write_range_descriptor(&mut w, desc);
-            }
-            ReadBound::IndexRange { bound, walk } => {
-                w.u8(BOUND_INDEX_RANGE);
-                write_index_bound(&mut w, bound);
-                w.u8(match walk {
-                    IndexWalk::Optional => 0,
-                    IndexWalk::Required => 1,
-                });
-            }
-            ReadBound::PkSet(keys) => {
-                w.u8(BOUND_PK_SET)
-                    .u8(keys.stride)
-                    .u32(keys.len() as u32)
-                    .raw(keys.as_bytes());
-            }
-        }
+        write_read_bound(&mut w, &self.bound);
 
         w.bytes32(&self.predicate);
 
@@ -272,40 +251,7 @@ impl ReadSpec {
             ));
         }
 
-        let bound = match r.u8()? {
-            BOUND_NONE => ReadBound::None,
-            BOUND_PK_RANGE => ReadBound::PkRange(read_range_descriptor(&mut r)?),
-            BOUND_INDEX_RANGE => {
-                let bound = read_index_bound(&mut r).map_err(|e| format!("read_spec: {e}"))?;
-                let walk = match r.u8()? {
-                    0 => IndexWalk::Optional,
-                    1 => IndexWalk::Required,
-                    other => return Err(format!("read_spec: IndexRange walk byte {other} is not 0 or 1")),
-                };
-                ReadBound::IndexRange { bound, walk }
-            }
-            BOUND_PK_SET => {
-                let stride = r.u8()? as usize;
-                if !(1..=MAX_PK_BYTES).contains(&stride) {
-                    return Err(format!("read_spec: PkSet stride {stride} outside 1..={MAX_PK_BYTES}"));
-                }
-                let count = r.u32()? as usize;
-                let cap = PkKeys::max_per_request(stride);
-                if count > cap {
-                    return Err(format!("read_spec: PkSet count {count} exceeds cap {cap}"));
-                }
-                let bytes = r.take(count * stride)?;
-                if bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b) {
-                    ReadBound::PkSet(PkKeys {
-                        stride: stride as u8,
-                        bytes: bytes.to_vec(),
-                    })
-                } else {
-                    return Err("read_spec: PkSet keys are not strictly ascending".to_string());
-                }
-            }
-            other => return Err(format!("read_spec: unknown bound kind {other}")),
-        };
+        let bound = read_read_bound(&mut r)?;
 
         let predicate = r.bytes32()?.to_vec();
 
@@ -342,6 +288,72 @@ impl ReadSpec {
             block,
         ))
     }
+}
+
+/// Splice a [`ReadBound`] into a larger blob: its kind tag, then that kind's
+/// layout. [`peek_bound`] reads the same layout.
+pub(crate) fn write_read_bound(w: &mut Writer, b: &ReadBound) {
+    match b {
+        ReadBound::None => {
+            w.u8(BOUND_NONE);
+        }
+        ReadBound::PkRange(desc) => {
+            w.u8(BOUND_PK_RANGE);
+            write_range_descriptor(w, desc);
+        }
+        ReadBound::IndexRange { bound, walk } => {
+            w.u8(BOUND_INDEX_RANGE);
+            write_index_bound(w, bound);
+            w.u8(match walk {
+                IndexWalk::Optional => 0,
+                IndexWalk::Required => 1,
+            });
+        }
+        ReadBound::PkSet(keys) => {
+            w.u8(BOUND_PK_SET)
+                .u8(keys.stride)
+                .u32(keys.len() as u32)
+                .raw(keys.as_bytes());
+        }
+    }
+}
+
+/// Read a [`ReadBound`] at the trust boundary — the reader dual of
+/// [`write_read_bound`]. A malformed bound is an `Err`.
+pub(crate) fn read_read_bound(r: &mut Reader) -> Result<ReadBound, String> {
+    Ok(match r.u8()? {
+        BOUND_NONE => ReadBound::None,
+        BOUND_PK_RANGE => ReadBound::PkRange(read_range_descriptor(r)?),
+        BOUND_INDEX_RANGE => {
+            let bound = read_index_bound(r).map_err(|e| format!("read_spec: {e}"))?;
+            let walk = match r.u8()? {
+                0 => IndexWalk::Optional,
+                1 => IndexWalk::Required,
+                other => return Err(format!("read_spec: IndexRange walk byte {other} is not 0 or 1")),
+            };
+            ReadBound::IndexRange { bound, walk }
+        }
+        BOUND_PK_SET => {
+            let stride = r.u8()? as usize;
+            if !(1..=MAX_PK_BYTES).contains(&stride) {
+                return Err(format!("read_spec: PkSet stride {stride} outside 1..={MAX_PK_BYTES}"));
+            }
+            let count = r.u32()? as usize;
+            let cap = PkKeys::max_per_request(stride);
+            if count > cap {
+                return Err(format!("read_spec: PkSet count {count} exceeds cap {cap}"));
+            }
+            let bytes = r.take(count * stride)?;
+            if !bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b) {
+                return Err("read_spec: PkSet keys are not strictly ascending".to_string());
+            }
+            ReadBound::PkSet(PkKeys {
+                stride: stride as u8,
+                bytes: bytes.to_vec(),
+            })
+        }
+        other => return Err(format!("read_spec: unknown bound kind {other}")),
+    })
 }
 
 /// The bound of an encoded request that routing reads, without decoding the

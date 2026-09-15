@@ -14,10 +14,9 @@ fn plan_of<'e>(
 
 /// How many keys `plan` restricts the transaction's buffered rows to; `None`
 /// when it restricts nothing.
-fn pinned_keys(plan: &AccessPlan<'_>, schema: &Schema) -> Option<usize> {
-    match plan.buffered_scope(schema).0 {
+fn pinned_keys(plan: &AccessPlan<'_>) -> Option<usize> {
+    match plan.buffered_scope().0 {
         BufferedKeys::Keys(keys) => Some(keys.len()),
-        BufferedKeys::Point(_) => Some(1),
         BufferedKeys::All => None,
     }
 }
@@ -45,14 +44,14 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         (None, "None", 0, 0),
         // A `pk IN (…)` gather, and the point a one-key list folds to at bind.
         (Some("id IN (7, 9)"), "PkSet", 0, 2),
-        (Some("id IN (7)"), "PkRange", 0, 1),
-        (Some("id = 7"), "PkRange", 0, 1),
+        (Some("id IN (7)"), "PkSet", 0, 1),
+        (Some("id = 7"), "PkSet", 0, 1),
         // `NOT IN` binds to `Not(…)`, which no PK recognizer matches.
         (Some("id NOT IN (7, 9)"), "None", 1, 0),
         // A companion conjunct rides the residual of a key-pinning bound: the
         // key restriction supplies the consumed PK conjunct, the residual the rest.
         (Some("id IN (7, 9) AND v > 5"), "PkSet", 1, 2),
-        (Some("id = 7 AND v > 5"), "PkRange", 1, 1),
+        (Some("id = 7 AND v > 5"), "PkSet", 1, 1),
         // No PK conjunct: the index rung, then the unbounded scan. An
         // arithmetic WHERE has no `col OP literal` conjunct at all.
         (Some("v = 7"), "IndexRange", 1, 0),
@@ -67,11 +66,7 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         let label = sql.unwrap_or("<no WHERE>");
         assert_eq!(shape(&plan.access.bound), want_shape, "{label}");
         assert_eq!(plan.residual.len(), want_residual, "{label}: residual");
-        assert_eq!(
-            pinned_keys(&plan, &schema).unwrap_or(0),
-            want_keys,
-            "{label}: pinned keys"
-        );
+        assert_eq!(pinned_keys(&plan).unwrap_or(0), want_keys, "{label}: pinned keys");
         assert_eq!(
             plan.access.predicate.is_empty(),
             want_residual == 0,
@@ -98,7 +93,7 @@ fn an_over_cap_pk_in_list_needs_a_chunking_budget() {
         "None",
         "{n} keys past the one-request cap"
     );
-    assert!(pinned_keys(&declined, &schema).is_none());
+    assert!(pinned_keys(&declined).is_none());
     assert!(
         !declined.access.predicate.is_empty(),
         "the list ships as a predicate instead"
@@ -106,7 +101,7 @@ fn an_over_cap_pk_in_list_needs_a_chunking_budget() {
 
     let gathered = plan_of(&where_expr, &schema, &[], ReadBudget::MayChunk);
     assert_eq!(shape(&gathered.access.bound), "PkSet");
-    assert_eq!(pinned_keys(&gathered, &schema), Some(n));
+    assert_eq!(pinned_keys(&gathered), Some(n));
 }
 
 /// When a PK bound yields to a unique index point, and when it keeps the PK
@@ -136,7 +131,7 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
         // No index point to build at all.
         ("id > 5 AND v > 1", uniq, "PkRange", "no point available"),
         // A pinned PK point already admits one row.
-        ("id = 7 AND v = 42", uniq, "PkRange", "a PK point is never given up"),
+        ("id = 7 AND v = 42", uniq, "PkSet", "a PK point is never given up"),
     ] {
         let where_expr = bind_where(sql, &schema);
         let plan = plan_of(&where_expr, &schema, idx, ReadBudget::OneRequest);
@@ -202,6 +197,23 @@ fn an_index_walk_is_exact_only_when_the_predicate_cannot_carry_its_conjunct() {
     }
 }
 
+/// A candidate whose residual the expression VM refuses falls through to the next:
+/// the PK walk keeps `val = 7` on a U128 column residual, where the index walk
+/// strips it and keeps only the PK conjunct.
+#[test]
+fn an_uncompilable_pk_residual_falls_through_to_the_index() {
+    let schema = two_col(TypeCode::U128);
+    for sql in ["pk > 5 AND val = 7", "pk IN (1, 2) AND val = 7"] {
+        let where_expr = bind_where(sql, &schema);
+        let plan = plan_of(&where_expr, &schema, &[(&[1], false)], ReadBudget::OneRequest);
+        let ReadBound::IndexRange { walk, .. } = plan.access.bound else {
+            panic!("{sql}: expected an index bound, got {}", shape(&plan.access.bound));
+        };
+        assert_eq!(walk, IndexWalk::Required, "{sql}");
+        assert_eq!(plan.residual.len(), 1, "{sql}: the PK conjunct stays residual");
+    }
+}
+
 /// A PK bound pinning no PK column yields to a point covering every column of
 /// a UNIQUE index — one row, where the unpinned range admits the table.
 #[test]
@@ -210,10 +222,7 @@ fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
     let where_expr = bind_where("pk > 0 AND val = 42", &schema);
     let plan = plan_of(&where_expr, &schema, &[(&[1], true)], ReadBudget::OneRequest);
     assert_eq!(shape(&plan.access.bound), "IndexRange");
-    assert!(
-        pinned_keys(&plan, &schema).is_none(),
-        "an index bound never pins a PK key"
-    );
+    assert!(pinned_keys(&plan).is_none(), "an index bound never pins a PK key");
 }
 
 /// `rows_sink` over `sql` against `schema`, read as relation `t`.

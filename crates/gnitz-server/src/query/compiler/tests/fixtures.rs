@@ -45,7 +45,10 @@ pub(in crate::query) fn subgraph_ordered(loaded: &LoadedCircuit, out: NodeId) ->
 
 /// An unbounded delta scan — every fixture circuit's source shape.
 pub(in crate::query) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
-    gnitz_wire::OpNode::ScanDelta { source, bound: None }
+    gnitz_wire::OpNode::ScanDelta {
+        source,
+        bound: gnitz_wire::ReadBound::None,
+    }
 }
 
 /// A `ScatterKey` reindex on `cols` — the routing walks' only variable. The

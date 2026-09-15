@@ -27,8 +27,7 @@ pub use transport::{hello_handshake, set_sockopt_int, ClientTransport};
 #[cfg(not(any(test, feature = "integration")))]
 pub(crate) use transport::{hello_handshake, ClientTransport};
 pub use types::{
-    native_le_key, opk_key_cols, opk_key_packed, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget,
-    PayloadColumn, PkBuf, PkColumn, ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES,
-    PK_LIST_MAX_COLS,
+    native_le_key, opk_key_cols, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn,
+    PkBuf, PkColumn, ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
 pub use wal_block::{decode_regions_into, decode_wal_block};

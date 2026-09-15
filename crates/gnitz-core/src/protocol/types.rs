@@ -389,7 +389,7 @@ impl gnitz_expr::SchemaFacts for Schema {
 /// One row's PK as OPK bytes, from the PK columns' native values in PK-list
 /// order — the one native→OPK column walk on the client, and the same bytes a
 /// [`PkColumn`] row holds. Crossing into the wire's *native* key space is named:
-/// this and [`opk_key_packed`] in, [`native_le_key`] out.
+/// this in, [`native_le_key`] out.
 pub fn opk_key_cols(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> PkBuf {
     let key = gnitz_wire::encode_pk_natives(schema.pk_col_codes().map(|(_, tc)| (tc, tc)), natives);
     debug_assert_eq!(key.width(), schema.pk_stride(), "opk_key_cols: one value per PK column");
@@ -402,17 +402,9 @@ pub fn opk_key_native_bytes(schema: &Schema, native_le: &[u8]) -> PkBuf {
     gnitz_wire::encode_pk_tuple(schema.pk_col_codes(), native_le)
 }
 
-/// [`opk_key_native_bytes`] from a u128 whose low `pk_stride` bytes carry the PK
-/// columns' native images — a parsed PK literal.
-pub fn opk_key_packed(schema: &Schema, v: u128) -> PkBuf {
-    let stride = schema.pk_stride();
-    debug_assert!(stride <= 16);
-    opk_key_native_bytes(schema, &v.to_le_bytes()[..stride])
-}
-
 /// `key`, one row of OPK bytes, in the wire's native key space: its columns
 /// decoded back to their native little-endian images, at the same offsets. The
-/// inverse of [`opk_key_packed`]; valid bytes are `0..key.len()`.
+/// inverse of [`opk_key_cols`]; valid bytes are `0..key.len()`.
 pub fn native_le_key(schema: &Schema, key: &[u8]) -> [u8; MAX_PK_BYTES] {
     let mut buf = [0u8; MAX_PK_BYTES];
     let mut off = 0;

@@ -4,6 +4,7 @@
 
 use super::*;
 use gnitz_store::schema::Placement;
+use gnitz_wire::ReadBound;
 use rustc_hash::FxHashSet;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
@@ -57,9 +58,9 @@ pub(crate) struct ViewMeta {
     /// output `ExchangeShard`, or a `Join`, whose inputs the runtime join-shard
     /// scatter repartitions without an `ExchangeShard` node.
     pub(in crate::query) repartitions: bool,
-    /// source table id → the index bound its backfill scan narrows by. None for a
+    /// source table id → the bound its backfill scan narrows by. Absent for a
     /// source scanned twice, whose one backfill cursor feeds both scans.
-    pub(in crate::query) source_bounds: FxHashMap<i64, gnitz_wire::IndexBound>,
+    pub(in crate::query) source_bounds: FxHashMap<i64, ReadBound>,
 }
 
 impl ViewMeta {
@@ -96,17 +97,17 @@ impl ViewMeta {
         let mut outside_joins: FxHashSet<i64> = FxHashSet::default();
         let mut set_fed: FxHashSet<i64> = FxHashSet::default();
         let mut untrimmed: FxHashSet<i64> = FxHashSet::default();
-        // `None` once a source is seen twice.
-        let mut bounds: FxHashMap<i64, Option<gnitz_wire::IndexBound>> = FxHashMap::default();
+        // `ReadBound::None` once a source is seen twice.
+        let mut bounds: FxHashMap<i64, ReadBound> = FxHashMap::default();
         for (nid, op) in loaded.ops() {
             let gnitz_wire::OpNode::ScanDelta { source, bound } = op else {
                 continue;
             };
             match bounds.entry(*source as i64) {
                 Entry::Vacant(e) => {
-                    e.insert(*bound);
+                    e.insert(bound.clone());
                 }
-                Entry::Occupied(mut e) => *e.get_mut() = None,
+                Entry::Occupied(mut e) => *e.get_mut() = ReadBound::None,
             }
             let consumed = scan_consumption(loaded, nid);
             if !consumed.only_joins {
@@ -137,7 +138,7 @@ impl ViewMeta {
             }
         }
         seqs.retain(|_, s| !s.is_empty());
-        let source_bounds = bounds.into_iter().filter_map(|(s, b)| Some((s, b?))).collect();
+        let source_bounds = bounds.into_iter().filter(|(_, b)| *b != ReadBound::None).collect();
 
         // The co-partition prefix test wants the sequences CONCATENATED, and wants
         // a conservative refusal when a source carries more than one key: the

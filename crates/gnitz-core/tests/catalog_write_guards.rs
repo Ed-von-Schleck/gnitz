@@ -389,7 +389,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
     let first = client.create_view("mixed", "v", tid, &cols).unwrap();
 
     let mut circuit = gnitz_core::Circuit::default();
-    let scan = circuit.input_delta(tid, None);
+    let scan = circuit.input_delta(tid, gnitz_wire::ReadBound::None);
     circuit.sink(scan);
     let vids = client
         .create_view_chain(
@@ -503,7 +503,7 @@ fn a_view_scanning_itself_is_refused() {
 
     let vid = s.alloc_table_id().unwrap();
     let mut circuit = gnitz_core::Circuit::default();
-    let scan = circuit.input_delta(vid, None);
+    let scan = circuit.input_delta(vid, gnitz_wire::ReadBound::None);
     circuit.sink(scan);
     let nodes = sys_schema(gnitz_wire::CIRCUIT_NODES_TAB);
     let mut nb = ZSetBatch::new(nodes);

@@ -21,25 +21,6 @@ pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
     gnitz_wire::parse_uuid(s).ok_or_else(|| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
 }
 
-/// Pack a literal value into its packed-u128 PK form: the low `wire_stride`
-/// bytes carry the column's native LE encoding (`FixedInt::pack` — e.g. `-1_i8`
-/// → `0xFF`), the rest stay zero. An out-of-type-range value declines (`None`)
-/// instead of wrapping: `x = 3000000000` on an I32 column must not seek
-/// `-1294967296`.
-pub(crate) fn pack_pk_value(tc: TypeCode, v: i128) -> Option<u128> {
-    match tc {
-        TypeCode::U128 | TypeCode::UUID => (v >= 0).then_some(v as u128),
-        // I128 (the internal join-key promotion type) is two's complement at 16
-        // bytes, exactly `as u128`.
-        TypeCode::I128 => Some(v as u128),
-        _ => {
-            let fi = FixedInt::from_type_code(tc)?;
-            let (min, max) = fi.range();
-            (min <= v && v <= max).then(|| fi.pack(v))
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The bound-literal seam
 // ---------------------------------------------------------------------------
@@ -52,13 +33,19 @@ pub(crate) fn bound_num_literal(e: &BoundExpr) -> Option<NumLit> {
     }
 }
 
-/// Pack a numeric literal as a seek/range key for column type `tc`, byte-exactly
-/// (an out-of-type-range literal declines, never wraps). U128/UUID take the full
-/// unsigned range, which no `i128` spells.
+/// A numeric literal as the packed key of a column of type `tc`; `None` when the
+/// type does not hold it, never a wrapped value.
 pub(crate) fn pack_num(tc: TypeCode, lit: NumLit) -> Option<u128> {
     match tc {
         TypeCode::U128 | TypeCode::UUID => (!lit.is_negative()).then_some(lit.mag),
-        _ => pack_pk_value(tc, lit.to_i128()?),
+        // I128 (the internal join-key promotion type) is two's complement at 16 bytes.
+        TypeCode::I128 => Some(lit.to_i128()? as u128),
+        _ => {
+            let fi = FixedInt::from_type_code(tc)?;
+            let v = lit.to_i128()?;
+            let (min, max) = fi.range();
+            (min <= v && v <= max).then(|| fi.pack(v))
+        }
     }
 }
 
@@ -113,7 +100,8 @@ pub(crate) fn bound_key_literal(lit: BoundLit<'_>, tc: TypeCode) -> Result<u128,
         BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).map_err(|_| KeyLitError::NotOfType),
         BoundLit::Str(s) if tc.is_temporal() => {
             let v = crate::types::temporal_literal(tc, s).map_err(|_| KeyLitError::NotOfType)?;
-            Ok(pack_pk_value(tc, v as i128).expect("temporal_literal's value always fits tc's storage width"))
+            Ok(pack_num(tc, NumLit::of_i128(v as i128))
+                .expect("temporal_literal's value always fits tc's storage width"))
         }
         BoundLit::Str(_) => Err(KeyLitError::NotNumeric),
         BoundLit::Num(n) => pack_num(tc, n).ok_or_else(|| {

@@ -64,7 +64,7 @@ pub(crate) fn resolve_where_matches(
     reply_schema: &Arc<Schema>,
 ) -> Result<(ZSetBatch, ZSetBatch), GnitzSqlError> {
     let committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
-    let (keys, preds) = plan.buffered_scope(schema);
+    let (keys, preds) = plan.buffered_scope();
     let net = buffered_net(client, tid, keys);
     if net.is_empty() {
         return Ok((committed, ZSetBatch::new(schema)));
@@ -127,11 +127,6 @@ pub(crate) fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, keys: Buff
         BufferedKeys::Keys(keys) => keys
             .iter()
             .filter_map(|k| buf.last_op(k).map(|(b, r)| (PkBuf::from_bytes(k), op_of(b, r))))
-            .collect(),
-        BufferedKeys::Point(pk) => buf
-            .last_op(pk.pk_bytes())
-            .map(|(b, r)| (pk, op_of(b, r)))
-            .into_iter()
             .collect(),
         BufferedKeys::All => buf.last_ops().map(|(pk, b, r)| (pk, op_of(b, r))).collect(),
     }

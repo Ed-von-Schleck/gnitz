@@ -11,7 +11,7 @@ use gnitz_wire::sys_rows::{
     IdxTabRow, TableTabRow, ViewTabRow,
 };
 use gnitz_wire::type_code;
-use gnitz_wire::{Circuit, IndexBound};
+use gnitz_wire::Circuit;
 
 // ── Catalog ColumnDef fixtures ────────────────────────────────────────────
 //
@@ -80,7 +80,7 @@ pub fn write_circuit(engine: &mut CatalogEngine, vid: i64, circuit: Circuit) {
 }
 
 /// The minimal identity circuit `ScanDelta(source, bound) → Integrate`.
-pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, bound: Option<IndexBound>) {
+pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, bound: gnitz_wire::ReadBound) {
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source_tid as u64, bound);
     circuit.sink(scan);
@@ -209,7 +209,7 @@ pub fn try_register_identity_view(
     delta_bytes: u64,
 ) -> Result<i64, String> {
     let vid = engine.allocate_table_id().unwrap();
-    write_identity_circuit(engine, vid, source_tid, None);
+    write_identity_circuit(engine, vid, source_tid, gnitz_wire::ReadBound::None);
     engine
         .write_column_records(vid, gnitz_wire::OWNER_KIND_VIEW as i64, cols)
         .unwrap();

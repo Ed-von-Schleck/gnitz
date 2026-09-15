@@ -706,8 +706,8 @@ fn test_dep_map_view_on_view_chain() {
     let dir = temp_dir("dep_map_view_chain");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    write_identity_circuit(&mut engine, 107, 100, None);
-    write_identity_circuit(&mut engine, 108, 107, None);
+    write_identity_circuit(&mut engine, 107, 100, gnitz_wire::ReadBound::None);
+    write_identity_circuit(&mut engine, 108, 107, gnitz_wire::ReadBound::None);
 
     let dep_map = engine.dag.get_dep_map(&engine.registry).clone();
     assert_eq!(dep_map.get(&100), Some(&vec![107]), "base 100 feeds view 107");
@@ -735,7 +735,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
 
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
     let v2 = engine.allocate_table_id().unwrap();
-    write_identity_circuit(&mut engine, v2, tid, None);
+    write_identity_circuit(&mut engine, v2, tid, gnitz_wire::ReadBound::None);
     engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, v1, "v1", 0, 0, 0);
@@ -791,7 +791,7 @@ fn test_circuit_table_surface_introspectable() {
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty: view 107,
     // with a single node, through the shared row codec.
     let mut circuit = gnitz_wire::Circuit::default();
-    circuit.input_delta(100, None);
+    circuit.input_delta(100, gnitz_wire::ReadBound::None);
     write_circuit(&mut engine, 107, circuit);
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`

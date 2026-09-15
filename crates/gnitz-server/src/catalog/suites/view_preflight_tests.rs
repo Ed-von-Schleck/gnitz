@@ -30,7 +30,7 @@ fn over_cap_pred_blob() -> Vec<u8> {
 /// fail on.
 fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, pred: &[u8]) {
     let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(base_tid as u64, None);
+    let scan = circuit.input_delta(base_tid as u64, gnitz_wire::ReadBound::None);
     let filter = circuit.filter(scan, pred.to_vec());
     let distinct = circuit.distinct(filter);
     circuit.sink(distinct);

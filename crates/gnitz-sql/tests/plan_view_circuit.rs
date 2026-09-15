@@ -8,7 +8,7 @@
 
 use gnitz_core::{CatalogSnapshot, OpNode, TypeCode};
 use gnitz_sql::PlannedChain;
-use gnitz_wire::{JoinKind, MapKind};
+use gnitz_wire::{JoinKind, MapKind, ReadBound};
 
 mod pure;
 use pure::*;
@@ -307,44 +307,52 @@ fn indexed(indexes: &[&[u32]]) -> CatalogSnapshot {
     ])
 }
 
-/// The backfill-scan bound a body's `ScanDelta` carries: the index columns it
-/// ranges over, or none. A bound narrows only the initial scan; the filter
-/// stays, so a body that cannot bound still computes the same view.
+/// The backfill-scan bound each `ScanDelta` of a body carries. A bound narrows only
+/// the initial scan; the filter stays, so a body that cannot bound computes the
+/// same view.
 #[test]
 fn indexed_predicates_bound_the_backfill_scan() {
     let on_ind = indexed(&[&[2]]);
     let on_ind_other = indexed(&[&[2, 3]]);
     let unindexed = indexed(&[]);
     #[rustfmt::skip]
-    let rows: &[(&CatalogSnapshot, &str, &[&[u32]])] = &[
-        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &[&[2]]),
-        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind BETWEEN 5 AND 9 GROUP BY g", &[&[2]]),
-        (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", &[&[2, 3]]),
-        (&on_ind, "SELECT g, other FROM t WHERE ind = 5", &[&[2]]),
-        (&on_ind, "WITH c AS (SELECT * FROM t) SELECT g, COUNT(*) AS n FROM c WHERE ind = 5 GROUP BY g", &[&[2]]),
-        (&on_ind, "SELECT g, COUNT(*) AS n FROM (SELECT * FROM t) d WHERE ind = 5 GROUP BY g", &[&[2]]),
+    let rows: &[(&CatalogSnapshot, &str, &[&str])] = &[
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &["[2]"]),
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE ind BETWEEN 5 AND 9 GROUP BY g", &["[2]"]),
+        (&on_ind_other, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 AND other > 10 GROUP BY g", &["[2, 3]"]),
+        (&on_ind, "SELECT g, other FROM t WHERE ind = 5", &["[2]"]),
+        (&on_ind, "WITH c AS (SELECT * FROM t) SELECT g, COUNT(*) AS n FROM c WHERE ind = 5 GROUP BY g", &["[2]"]),
+        (&on_ind, "SELECT g, COUNT(*) AS n FROM (SELECT * FROM t) d WHERE ind = 5 GROUP BY g", &["[2]"]),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE other = 5 GROUP BY g", &[]),
-        (&on_ind, "SELECT DISTINCT g FROM t WHERE ind = 5", &[&[2]]),
-        (&on_ind, "SELECT g FROM t WHERE ind = 5 EXCEPT SELECT val FROM u", &[&[2]]),
+        (&on_ind, "SELECT DISTINCT g FROM t WHERE ind = 5", &["[2]"]),
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 EXCEPT SELECT val FROM u", &["[2]"]),
         // Each scan carries its bound; the engine drops a twice-scanned source's.
-        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", &[&[2], &[2]]),
-        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk = 5 GROUP BY g", &[]),
+        (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", &["[2]", "[2]"]),
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk = 5 GROUP BY g", &["pk set 1"]),
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk BETWEEN 1 AND 9 GROUP BY g", &["pk range"]),
+        // An index keeps the backfill over a PK range.
+        (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk > 3 AND ind = 5 GROUP BY g", &["[2]"]),
         // A WHERE placed into a join input bounds that input's scan.
-        (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", &[&[2]]),
+        (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", &["[2]"]),
         (&unindexed, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &[]),
     ];
     for &(cat, body, want) in rows {
         let chain = view(cat, body);
-        let bounds: Vec<Vec<u32>> = chain
+        let bounds: Vec<String> = chain
             .views
             .iter()
             .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
             .filter_map(|op| match op {
-                OpNode::ScanDelta { bound: Some(b), .. } => Some(b.idx_cols.as_slice().to_vec()),
+                OpNode::ScanDelta { bound, .. } => match bound {
+                    ReadBound::None => None,
+                    ReadBound::PkRange(_) => Some("pk range".to_string()),
+                    ReadBound::PkSet(keys) => Some(format!("pk set {}", keys.len())),
+                    ReadBound::IndexRange { bound, .. } => Some(format!("{:?}", bound.idx_cols.as_slice())),
+                },
                 _ => None,
             })
             .collect();
-        let want: Vec<Vec<u32>> = want.iter().map(|w| w.to_vec()).collect();
+        let want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
         assert_eq!(bounds, want, "`{body}`");
     }
 }

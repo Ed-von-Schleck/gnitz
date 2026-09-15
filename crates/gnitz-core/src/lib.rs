@@ -37,7 +37,7 @@ pub use gnitz_wire::{
 };
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape};
 pub use protocol::{
-    native_le_key, opk_key_cols, opk_key_packed, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget,
-    PayloadColumn, PkBuf, PkColumn, ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode,
-    ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    native_le_key, opk_key_cols, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn,
+    PkBuf, PkColumn, ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch,
+    MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };

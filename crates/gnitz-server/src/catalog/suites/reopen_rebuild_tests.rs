@@ -360,7 +360,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
 
     let vid = engine.allocate_table_id().unwrap();
     let mut circuit = gnitz_wire::Circuit::default();
-    let scan = circuit.input_delta(tid as u64, None);
+    let scan = circuit.input_delta(tid as u64, gnitz_wire::ReadBound::None);
     let distinct = circuit.distinct(scan);
     circuit.sink(distinct);
     write_circuit(&mut engine, vid, circuit);

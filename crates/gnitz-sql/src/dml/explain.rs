@@ -5,7 +5,6 @@
 //!
 //! It reaches nothing: describing a query is as server-free as compiling one.
 
-use crate::access::pk_point_tuple;
 use crate::dml::plan::Access;
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
@@ -108,16 +107,12 @@ fn read_line(read: &SpecRead) -> String {
     }
 }
 
-/// The walk the bound names. A `PkRange` is a point lookup exactly when it pins
-/// every PK column — the same [`pk_point_tuple`] test `AccessPlan::buffered_scope`
-/// uses to decide a bound names a key rather than a key group.
+/// The walk the bound names; a one-key `PkSet` is a point lookup.
 fn access_line(access: &Access, schema: &Schema) -> String {
     match access.bound() {
         ReadBound::None => "full scan".to_string(),
-        ReadBound::PkRange(desc) => match pk_point_tuple(desc, schema) {
-            Some(_) => "pk point lookup".to_string(),
-            None => "pk range walk".to_string(),
-        },
+        ReadBound::PkRange(_) => "pk range walk".to_string(),
+        ReadBound::PkSet(keys) if keys.len() == 1 => "pk point lookup".to_string(),
         // The keys ship deduplicated, so this is the distinct key count.
         ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
         ReadBound::IndexRange { bound, walk } => {

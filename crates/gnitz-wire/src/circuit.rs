@@ -413,15 +413,12 @@ pub enum MapKind {
 pub enum OpNode {
     /// Delta input for `source`.
     ///
-    /// `bound` is a **backfill-scan hint only**: steady-state deltas never open
-    /// the source cursor. It narrows the initial full-source scan, leaves the
-    /// downstream `Filter` and so the view unchanged, and the engine may ignore
-    /// it (`IndexWalk::Optional`). It travels because the engine cannot derive
-    /// it — the planner reads the predicate's `BoundExpr` conjuncts, which the
-    /// compiled program does not carry.
+    /// `bound` narrows only the backfill scan: the downstream `Filter` stays
+    /// authoritative, and the engine opens an index walk `Optional` whatever the
+    /// cell says.
     ScanDelta {
         source: u64,
-        bound: Option<crate::IndexBound>,
+        bound: crate::ReadBound,
     },
     /// Expression predicate blob. "No `WHERE`" is spelled by emitting no node at
     /// all, so no absent cell can decode to a silent `WHERE TRUE`.
@@ -629,7 +626,7 @@ impl Circuit {
 
     /// A source's delta input. `bound` narrows only the source's backfill scan,
     /// never the rows the view holds, so the caller still emits the full `Filter`.
-    pub fn input_delta(&mut self, source: u64, bound: Option<crate::IndexBound>) -> NodeId {
+    pub fn input_delta(&mut self, source: u64, bound: crate::ReadBound) -> NodeId {
         self.add(OpNode::ScanDelta { source, bound }, NodeInputs::Source)
     }
 
@@ -971,9 +968,9 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
     match op {
         // An unbounded `ScanDelta` carries no params at all: the common shape
         // costs nothing, and "absent" and "empty" stay distinguishable.
-        OpNode::ScanDelta { source, bound: None } => (Opcode::ScanDelta, Some(source), None),
-        OpNode::ScanDelta { source, bound: Some(b) } => {
-            crate::range::write_index_bound(&mut w, &b);
+        OpNode::ScanDelta { source, bound: crate::ReadBound::None } => (Opcode::ScanDelta, Some(source), None),
+        OpNode::ScanDelta { source, bound } => {
+            crate::read_spec::write_read_bound(&mut w, &bound);
             (Opcode::ScanDelta, Some(source), Some(w.into_vec()))
         }
         OpNode::Filter(program) => {
@@ -1052,7 +1049,15 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
     let node = match op {
         Opcode::ScanDelta => OpNode::ScanDelta {
             source: src_tab.ok_or_else(|| "SCAN_DELTA missing source_table".to_string())?,
-            bound: params.map(|_| crate::range::read_index_bound(&mut r)).transpose()?,
+            bound: match params {
+                None => crate::ReadBound::None,
+                Some(_) => match crate::read_spec::read_read_bound(&mut r)? {
+                    crate::ReadBound::None => {
+                        return Err("a ScanDelta with no bound carries no params cell".to_string());
+                    }
+                    bound => bound,
+                },
+            },
         },
         Opcode::Filter => OpNode::Filter(r.bytes32()?.to_vec()),
         Opcode::MapProj => OpNode::Map(MapKind::Projection(read_cols(&mut r)?)),
