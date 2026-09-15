@@ -54,10 +54,6 @@ impl<T> WakeQueue<T> {
         self.queue.pop_front()
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.queue.len()

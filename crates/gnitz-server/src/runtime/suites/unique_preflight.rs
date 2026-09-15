@@ -46,12 +46,11 @@ fn u128_frame_schema() -> SchemaDescriptor {
 }
 
 /// A reply budget that admits exactly `n` keys per pre-flight frame: the
-/// frame's own overhead — control block, schema block, empty data block — plus
-/// `n` rows' worth of data. Written through the production accounting, so a
-/// test cannot pin a per-frame key count the emitter would not itself choose.
-fn budget_for(frame_schema: &SchemaDescriptor, target_id: u64, n: usize) -> usize {
-    let block = crate::catalog::encode_schema_block(frame_schema, target_id as u32);
-    preflight_frame_overhead(frame_schema, &block) + n * per_key(frame_schema)
+/// frame's own overhead — control block, empty data block — plus `n` rows'
+/// worth of data. Written through the production accounting, so a test cannot
+/// pin a per-frame key count the emitter would not itself choose.
+fn budget_for(frame_schema: &SchemaDescriptor, n: usize) -> usize {
+    preflight_frame_overhead(frame_schema) + n * per_key(frame_schema)
 }
 
 /// The data block's growth for one key — what `preflight_keys_per_frame`
@@ -94,7 +93,6 @@ fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
 /// (`get_pk_bytes` → `PkBuf`), every frame against `frame_schema`.
 fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected_req_id: u64) -> Vec<PkBuf> {
     let mut keys = Vec::new();
-    let mut frames = 0usize;
     loop {
         let slot = receiver.try_read_slot(0).expect("frame missing from train");
         assert_eq!(
@@ -105,17 +103,10 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
         assert_eq!(ctrl.status, WireStatus::Ok);
         assert!(ctrl.flags.continuation, "every pre-flight frame carries continuation");
         let last = ctrl.flags.scan_last;
-        if frames == 0 {
-            assert!(
-                ctrl.flags.has_schema,
-                "first frame must carry the synthetic schema block"
-            );
-        } else {
-            assert!(
-                !ctrl.flags.has_schema,
-                "continuation frames must not re-send the schema"
-            );
-        }
+        assert!(
+            !ctrl.flags.has_schema,
+            "no pre-flight frame carries a schema block: the master builds it"
+        );
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         let batch = wire::decode_train_frame(slot.bytes(), &ctrl, frame_schema, &mut offsets).expect("frame decodes");
         if let Some(mb) = batch {
@@ -123,7 +114,6 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
                 keys.push(PkBuf::from_bytes(mb.get_pk_bytes(i)));
             }
         }
-        frames += 1;
         drop(slot);
         if last {
             break;
@@ -158,7 +148,7 @@ fn preflight_train_multi_frame_key_roundtrip() {
             77,
             &frame_schema,
             9001,
-            budget_for(&frame_schema, 77, 4),
+            budget_for(&frame_schema, 4),
             &mut producer_of(&keys),
         );
         let got = drain_train(receiver, &frame_schema, 9001);
@@ -179,7 +169,7 @@ fn preflight_train_exact_frame_boundary() {
             77,
             &frame_schema,
             42,
-            budget_for(&frame_schema, 77, 4),
+            budget_for(&frame_schema, 4),
             &mut producer_of(&keys),
         );
         let got = drain_train(receiver, &frame_schema, 42);
@@ -199,7 +189,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
             77,
             &frame_schema,
             7,
-            budget_for(&frame_schema, 77, 4),
+            budget_for(&frame_schema, 4),
             &mut producer_of(&[]),
         );
         let slot = receiver.try_read_slot(0).expect("terminal frame");
@@ -224,8 +214,7 @@ fn preflight_frames_are_cut_by_the_byte_budget() {
     let frame_schema = u128_frame_schema();
     // 16 B span + 8 B weight + 8 B null word per key.
     assert_eq!(per_key(&frame_schema), 32);
-    let block = crate::catalog::encode_schema_block(&frame_schema, 77);
-    let overhead = preflight_frame_overhead(&frame_schema, &block);
+    let overhead = preflight_frame_overhead(&frame_schema);
     let budget = overhead + 8 * 32;
     assert_eq!(
         preflight_keys_per_frame(&frame_schema, budget, overhead),
@@ -242,15 +231,14 @@ fn preflight_frames_are_cut_by_the_byte_budget() {
 }
 
 /// The frame overhead must be charged, not assumed away: a budget of exactly
-/// eight keys' rows leaves room for none once the control and schema blocks are
-/// counted, so the clamp floors at one key rather than emitting an over-budget
-/// frame.
+/// eight keys' rows leaves room for none once the control and data block
+/// headers are counted, so the clamp floors at one key rather than emitting an
+/// over-budget frame.
 #[test]
 fn preflight_keys_per_frame_charges_the_frame_overhead() {
     let frame_schema = u128_frame_schema();
-    let block = crate::catalog::encode_schema_block(&frame_schema, 77);
-    let overhead = preflight_frame_overhead(&frame_schema, &block);
-    assert!(overhead > 0, "a frame's control and schema blocks cost bytes");
+    let overhead = preflight_frame_overhead(&frame_schema);
+    assert!(overhead > 0, "a frame's control and data block headers cost bytes");
     assert_eq!(preflight_keys_per_frame(&frame_schema, 8 * 32, overhead), 1);
 }
 
@@ -279,7 +267,7 @@ fn preflight_train_composite_wide_span_roundtrip() {
             5,
             &frame_schema,
             3,
-            budget_for(&frame_schema, 5, 2),
+            budget_for(&frame_schema, 2),
             &mut producer_of(&keys),
         );
         let got = drain_train(receiver, &frame_schema, 3);
@@ -370,7 +358,7 @@ fn preflight_signed_payload_projection_roundtrip() {
             5,
             &frame_schema,
             11,
-            budget_for(&frame_schema, 5, 3),
+            budget_for(&frame_schema, 3),
             &mut producer_of(&keys),
         );
         let got = drain_train(receiver, &frame_schema, 11);

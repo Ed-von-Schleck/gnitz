@@ -34,9 +34,12 @@ impl RelayKey {
 /// the elide verdict bound once so a round takes only its batch and key.
 struct Relay<'a> {
     exchange: &'a mut dyn ExchangeCallback,
+    registry: &'a RelationRegistry,
     view_id: i64,
     /// This view's shuffle is a proven no-op, so a round hands its batch back.
     elide: bool,
+    /// This process is worker 0.
+    rank_zero: bool,
 }
 
 impl Relay<'_> {
@@ -45,8 +48,22 @@ impl Relay<'_> {
     fn round(&mut self, batch: Batch, key: RelayKey) -> Batch {
         match self.elide {
             true => batch,
-            false => self.exchange.do_exchange(self.view_id, &batch, key.0),
+            false => self.send(&batch, key.0),
         }
+    }
+
+    /// A replicated source's delta is identical on every worker: only worker 0 sends it.
+    fn send(&mut self, batch: &Batch, src_id: i64) -> Batch {
+        let single_sourced =
+            !self.rank_zero && src_id > 0 && self.registry.relation(src_id).is_some_and(Relation::is_replicated);
+        let empty;
+        let batch = if single_sourced {
+            empty = Batch::empty_with_schema(batch.schema());
+            &empty
+        } else {
+            batch
+        };
+        self.exchange.do_exchange(self.view_id, batch, src_id)
     }
 }
 
@@ -77,17 +94,23 @@ impl DagEngine {
                 format!("view {view_id}: circuit unreadable or unroutable; its delta has no scatter key")
             })?),
         };
-        let input = match meta.as_ref().is_some_and(|m| m.scatters(src_id)) {
-            true => exchange.do_exchange(view_id, &input, src_id),
-            false => input,
-        };
-        let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted it");
         let elide = match meta.as_ref() {
             // A replicated view holds every source in full: nothing to repartition.
             None => true,
             Some(m) => m.skips_exchange,
         };
-        let mut relay = Relay { exchange, view_id, elide };
+        let mut relay = Relay {
+            exchange,
+            registry,
+            view_id,
+            elide,
+            rank_zero: registry.slot().rank == 0,
+        };
+        let input = match meta.as_ref().is_some_and(|m| m.scatters(src_id)) {
+            true => relay.send(&input, src_id),
+            false => input,
+        };
+        let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted it");
         Self::run_plan(&mut plan.sides, &mut plan.post, input, src_id, &mut relay).map_err(|e| e.to_string())
     }
 

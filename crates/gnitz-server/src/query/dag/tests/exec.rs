@@ -198,3 +198,59 @@ fn backfill_chunk_runs_only_the_named_view() {
         .backfill_chunk(registry, 999_999, base, empty, &mut NoExchange)
         .unwrap());
 }
+
+// ── The relay's single-sourcing ─────────────────────────────────────────────
+
+/// Records the row count of every batch a relay sends.
+struct Recorder(Vec<usize>);
+
+impl ExchangeCallback for Recorder {
+    fn do_exchange(&mut self, _view_id: i64, batch: &Batch, _source_id: i64) -> Batch {
+        self.0.push(batch.len());
+        batch.clone_batch()
+    }
+}
+
+/// Every other rank still takes part in the round, with an empty batch.
+#[test]
+fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
+    let cols = view_cols();
+    for rank in [0u32, 1] {
+        let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2).unwrap();
+        let replicated = engine.allocate_table_id().unwrap();
+        engine
+            .write_column_records(replicated, gnitz_wire::OWNER_KIND_TABLE as i64, &cols)
+            .unwrap();
+        let mut bb = gnitz_store::storage::BatchBuilder::new(*crate::catalog::SysFamily::Table.schema());
+        let flags = gnitz_wire::TableProps { replicated: true, ..Default::default() }.pack();
+        crate::test_support::push_table_tab_row(
+            &mut bb,
+            replicated,
+            crate::catalog::PUBLIC_SCHEMA_ID,
+            "rt",
+            gnitz_wire::pack_pk_cols(&[0]),
+            flags,
+            1,
+        );
+        engine.submit(crate::catalog::SysFamily::Table, bb.finish()).unwrap();
+        let keyed = engine.create_table("public.kt", &cols, &[0]).unwrap();
+        engine.become_worker(gnitz_store::storage::Slot::new(rank, 2)).unwrap();
+
+        let delta = delta_for(&engine, replicated, &[(1, 1, 10), (2, 1, 20)]);
+        let registry = engine.registry();
+        let mut sent = Recorder(Vec::new());
+        let mut relay = Relay {
+            exchange: &mut sent,
+            registry,
+            view_id: 99,
+            elide: false,
+            rank_zero: registry.slot().rank == 0,
+        };
+        relay.send(&delta, replicated);
+        relay.send(&delta, keyed);
+        relay.round(delta.clone_batch(), RelayKey::OWN_SHARD);
+
+        let replicated_rows = if rank == 0 { 2 } else { 0 };
+        assert_eq!(sent.0, vec![replicated_rows, 2, 2], "rank {rank}");
+    }
+}

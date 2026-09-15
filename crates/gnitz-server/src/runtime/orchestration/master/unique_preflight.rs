@@ -19,9 +19,6 @@ const OP_UNIQUE_PREFLIGHT: &str = "unique pre-flight";
 /// The frame's key region is an offset into the pinned ring slot rather than a
 /// borrowed view, so there is no self-reference and no drop-order contract.
 struct PreflightKeyStream {
-    /// Worker index, for error attribution only — the merge addresses streams
-    /// by reply position.
-    w: usize,
     /// Reply index into the scan, for frame pulls.
     reply: usize,
     /// The frame currently being read; pins its ring bytes until replaced.
@@ -33,20 +30,20 @@ struct PreflightKeyStream {
     count: usize,
     /// Cursor into the current frame's keys.
     row: usize,
-    /// Current frame is non-terminal: its `scan_last` is clear.
+    /// A frame is still owed: no frame attached yet, or the current one's
+    /// `scan_last` is clear.
     has_more: bool,
 }
 
 impl PreflightKeyStream {
-    fn new(w: usize, reply: usize) -> Self {
+    fn new(reply: usize) -> Self {
         PreflightKeyStream {
-            w,
             reply,
             slot: None,
             pk_off: 0,
             count: 0,
             row: 0,
-            has_more: false,
+            has_more: true,
         }
     }
 
@@ -57,7 +54,7 @@ impl PreflightKeyStream {
         self.row = 0;
         self.count = 0;
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let (has_more, batch) = decode_train_slot(&slot, self.w, OP_UNIQUE_PREFLIGHT, frame_schema, &mut offsets)?;
+        let (has_more, batch) = decode_train_slot(&slot, OP_UNIQUE_PREFLIGHT, frame_schema, &mut offsets)?;
         self.has_more = has_more;
         let bytes = slot.bytes();
         if let Some(mb) = batch {
@@ -80,11 +77,7 @@ impl PreflightKeyStream {
 
     /// Yield this worker's next span, pulling continuation frames on demand.
     /// Returns `Ok(None)` once the train is terminal.
-    async fn next_key(
-        &mut self,
-        frame_schema: &SchemaDescriptor,
-        scan: &ScanDispatch,
-    ) -> Result<Option<PkBuf>, WireFault> {
+    async fn next_key(&mut self, frame_schema: &SchemaDescriptor, scan: &Lease) -> Result<Option<PkBuf>, WireFault> {
         let pk_stride = frame_schema.pk_stride();
         loop {
             if self.row < self.count {
@@ -168,25 +161,19 @@ impl PreflightAccumulator {
 /// Returns on the FIRST error and on the first duplicate without draining the
 /// rest — the caller's scan lease drop discards the undrained trains at the
 /// ring boundary, as it does for `drain_index_scan`.
-async fn merge_index_scan(
-    slots: Vec<W2mSlot>,
-    scan: &ScanDispatch,
-    frame_schema: &SchemaDescriptor,
-) -> Result<PreflightAccumulator, WireFault> {
+async fn merge_index_scan(scan: &Lease, frame_schema: &SchemaDescriptor) -> Result<PreflightAccumulator, WireFault> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    let nw = slots.len();
-    let mut streams: Vec<PreflightKeyStream> = Vec::with_capacity(nw);
+    let n = scan.len();
+    let mut streams: Vec<PreflightKeyStream> = Vec::with_capacity(n);
 
     // Ordered by (span, reply index) — byte-lexicographic via `PkBuf: Ord` —
     // so equal spans pop adjacently whichever workers hold them. The tie-break
-    // is the REPLY index, which is also `streams`' index: a scan's lease ids
-    // are reply-ordered, so a unicast answers on id 0 whatever worker it was.
-    let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(nw);
-    for (i, slot) in slots.into_iter().enumerate() {
-        let mut s = PreflightKeyStream::new(scan.worker(i), i);
-        s.attach_frame(slot, frame_schema)?;
+    // is the REPLY index, which is also `streams`' index.
+    let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(n);
+    for i in 0..n {
+        let mut s = PreflightKeyStream::new(i);
         if let Some(key) = s.next_key(frame_schema, scan).await? {
             heap.push(Reverse((key, i)));
         }
@@ -271,29 +258,27 @@ impl MasterDispatcher {
         // check, and the seed reflects true cardinality. Hashed owners keep the
         // full fan-out (genuine cross-partition duplicates surface as equal
         // spans from different workers).
-        let unicast = read_fanout(self, owner_id);
+        let route = self.read_route(owner_id, None);
 
-        // Fan out the pre-flight command (the packed column list rides in
-        // seek_col_idx); each worker answers with its sorted-span
-        // continuation-frame train. `scan` holds the lease to end of scope: when
-        // the merge returns early (error or duplicate verdict) the lease drop
-        // discards the undrained trains at the ring boundary.
-        let (slots, scan) = dispatch_scan_fanout(self, unicast, |targets| {
-            // The worker's `UniquePreflight` arm resolves the owner's schema
-            // from its own catalog.
-            self.write_group(&DirectGroup {
-                template: wire::WireMsg {
-                    target_id: owner_id as u64,
-                    seek_col_idx: packed,
-                    ..Default::default()
-                },
-                targets,
-                ..DirectGroup::new(SalMessageKind::UniquePreflight)
+        let leases = self
+            .scan_cut(1, |cut| {
+                cut.push(route.set, |excl, targets| {
+                    // The worker's `UniquePreflight` arm resolves the owner's
+                    // schema from its own catalog.
+                    excl.write(&DirectGroup {
+                        template: wire::WireMsg {
+                            target_id: owner_id as u64,
+                            seek_col_idx: packed,
+                            ..Default::default()
+                        },
+                        targets,
+                        ..DirectGroup::new(SalMessageKind::UniquePreflight)
+                    })
+                })
             })
-        })
-        .await?;
+            .await?;
 
-        let merged = merge_index_scan(slots, &scan, &frame_schema).await?;
+        let merged = merge_index_scan(&leases[0], &frame_schema).await?;
         if merged.duplicate {
             return Err(self.cat().unique_create_dup_err(owner_id, col_indices).into());
         }

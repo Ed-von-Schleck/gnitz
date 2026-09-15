@@ -189,7 +189,7 @@ impl Table {
         // The files the sweep list named were fdatasync'd by the barrier and are
         // now referenced by the renamed manifest; clear so the next barrier does
         // not re-sync already-durable files. No concurrent writer: single-threaded
-        // worker, barrier holds sal_writer_excl.
+        // worker, and the master's checkpoint round holds its SAL writer.
         self.shard_index.clear_unsynced();
         super::open_table_dirfd(&self.shard_index.output_dir)
     }

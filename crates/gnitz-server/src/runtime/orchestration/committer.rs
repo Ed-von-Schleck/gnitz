@@ -28,8 +28,9 @@ use super::executor::{request_drain, request_quiesce, Shared};
 use super::guard_panic;
 use super::TxnFamily;
 use crate::runtime::master::worker_error;
+use crate::runtime::master::FlushRound;
 use crate::runtime::reactor::{chan, oneshot, select2, Either, Lease};
-use crate::runtime::sal::{GroupTargets, SalMessageKind, SalScope};
+use crate::runtime::sal::SalScope;
 use gnitz_store::storage::Batch;
 use gnitz_wire::WireFault;
 use std::rc::Rc;
@@ -107,11 +108,6 @@ pub struct PendingPush {
 
 /// The committer task loop. Returns when the reactor shutdown drops this task.
 ///
-/// For normal commit groups `sal_writer_excl` is held only for the
-/// synchronous SAL write + signal + fsync-SQE-submit triple, then
-/// released before awaiting ACKs or the fsync CQE, so tick/relay tasks
-/// can make progress during the wait.
-///
 /// For checkpoint flush rounds the lock is held across the ENTIRE round
 /// (write + ACK wait + reset; see `flush_round`), but released across the
 /// sequence's drain step so the tick loop can acquire it per tick.
@@ -159,8 +155,8 @@ fn checkpoint_warranted(shared: &Shared, batch: &PendingBatch) -> bool {
         .barriers
         .iter()
         .any(|(k, _)| matches!(k, BarrierKind::Shutdown | BarrierKind::Reclaim { forced: true }));
-    let disp = shared.disp();
-    forced || disp.sal_needs_checkpoint() || disp.sal_space_low()
+    let sal = shared.disp().sal();
+    forced || sal.needs_checkpoint() || sal.below_reclaim_margin()
 }
 
 /// One committer batch: the single pushes to group-commit, the atomic
@@ -214,57 +210,14 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     b
 }
 
-/// Emit one broadcast flush group and reset the SAL, holding `sal_writer_excl`
-/// for the ENTIRE window (write + ACK wait + reset).
-///
-/// Releasing the lock before the await would let concurrent tick/relay/DDL/
-/// fan-out tasks write SAL groups with the old epoch. Workers bump
-/// `expected_epoch` when they process a flush, so those groups would be silently
-/// skipped, and the reset then orphans them permanently while their writers wait
-/// for ACKs that never arrive.
-///
-/// Every step aborts on failure rather than reporting one: a failed round leaves
-/// the workers re-epoched and the SAL un-reset, so the cluster is epoch-desynced
-/// and nothing in-process can put it back. Aborting makes restart replay the
-/// un-reset SAL and re-derive views from the durable base tables.
-///
-/// `ephemeral_gen: None` — base/reclaim round: `Flush` (lsn 0, unused).
-/// `Some(gen)` — ephemeral round: `FlushEph` carrying the generation in
-/// the group header's `lsn` field (workers latch it via `set_resume_generation`
-/// to stamp view manifests).
-/// Both rounds finalize identically via `checkpoint_post_ack` (system-table
-/// flush + gated-deletion drain + reset): a `commit_serial_range_durable`
-/// advance can land in the `sys_sequences` MemTable during the drain window
-/// after the base round's reset, so the ephemeral reset must flush the system
-/// tables first or that advance is discarded on a crash.
-async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) {
-    let nw = shared.disp().num_workers();
-    let req_ids = shared.reactor.lease_acks(nw);
-
-    // `ephemeral_gen` already discriminates the two rounds, so it names the one a
-    // failure is reported against too.
-    let (lsn, kind, round) = match ephemeral_gen {
-        Some(gen) => (gen, SalMessageKind::FlushEph, "ephemeral"),
-        None => (0, SalMessageKind::Flush, "base"),
-    };
-
-    let _sal_excl = shared.disp().sal_excl().lock().await;
-
-    {
-        let disp = shared.disp();
-        if let Err(e) = disp.write_checkpoint_group(lsn, kind, GroupTargets::all(req_ids.base())) {
-            gnitz_fatal_abort!("checkpoint {} round: flush group write failed: {}", round, e);
-        }
-        disp.signal_all();
-    }
-
-    if let Err(e) = req_ids.acks(nw, |w, c| worker_error(w, "checkpoint", c)).await {
-        gnitz_fatal_abort!("checkpoint {} round: worker ACK failed: {}", round, e);
-    }
-    // Both rounds finalize the same way: flush system tables, then reset the SAL.
-    if let Err(e) = shared.disp().checkpoint_post_ack() {
-        gnitz_fatal_abort!("checkpoint {} round: post-ACK finalize failed: {}", round, e);
-    }
+/// One checkpoint round. Aborts on failure: the workers are re-epoched against an
+/// un-reset SAL, which only a restart's replay repairs.
+async fn flush_round(shared: &Rc<Shared>, round: FlushRound) {
+    let disp = shared.disp();
+    let mut excl = disp.sal().lock().await;
+    disp.checkpoint_round(&mut excl, round)
+        .await
+        .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 }
 
 /// The full steady-state checkpoint sequence: gen bump → base round → drain →
@@ -277,8 +230,7 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) {
 /// against the parked tick loop (see `TickGate`).
 ///
 /// `MasterDispatcher::reclaim_base` states the exclusivity every SAL checkpoint
-/// driver must own. The rounds hold `sal_writer_excl` (see `flush_round`); the
-/// step-2 drain does not, because the tick task re-acquires it per tick.
+/// driver must own.
 async fn run_checkpoint_sequence(
     rx: &mut chan::Receiver<CommitRequest>,
     shared: &Rc<Shared>,
@@ -295,7 +247,7 @@ async fn run_checkpoint_sequence(
 
     // Step 1: base round. A failure inside it is unrecoverable in-process and
     // aborts there; see `flush_round`.
-    flush_round(shared, None).await;
+    flush_round(shared, FlushRound::Base).await;
 
     // Release the reclaim barriers now: step 1's reset already reclaimed space, and
     // a tick waiting on one must finish before the tick loop can take the drain
@@ -331,7 +283,7 @@ async fn run_checkpoint_sequence(
 
     // Step 3 — EPHEMERAL ROUND. Stamp the step-0 generation (no re-bump happens
     // mid-drain, so no re-read is needed).
-    flush_round(shared, Some(gen)).await;
+    flush_round(shared, FlushRound::Ephemeral { generation: gen }).await;
 }
 
 /// Await `target_rx` (a Drain `done` or a Quiesce ack) while keeping the
@@ -363,8 +315,8 @@ async fn await_servicing<T>(
                 // asks for space, not for a checkpoint — because step 1 already
                 // reset the SAL and the watchdog fires these on a timer, so an
                 // ungated round would cost a full broadcast for nothing.
-                if forced || shared.disp().sal_space_low() {
-                    flush_round(shared, None).await;
+                if forced || shared.disp().sal().below_reclaim_margin() {
+                    flush_round(shared, FlushRound::Base).await;
                 }
                 done.send(());
             }
@@ -440,9 +392,9 @@ impl CommitUnit {
     }
 }
 
-/// Commit one batch of pushes. Emits every group's SAL writes under
-/// `sal_writer_excl` (alongside the signal + fsync SQE submit), releases the
-/// lock, THEN awaits worker ACKs (Phase C) and the fsync CQE (Phase D). LSN
+/// Commit one batch of pushes. Emits every group's SAL writes and submits the
+/// fsync SQE under one SAL hold, THEN awaits worker ACKs (Phase C) and the fsync
+/// CQE (Phase D). LSN
 /// assignment and `done.send` happen after worker ACKs; the unique-index filter
 /// update happens after fsync.
 async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: Vec<PendingTxn>) {
@@ -452,7 +404,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
 
     let nw = shared.disp().num_workers();
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
-    let alloc_req_ids = || shared.reactor.lease_acks(nw);
+    let alloc_req_ids = || shared.disp().reactor().lease_acks(nw);
 
     // ------------------------------------------------------------------
     // Phase A (no lock): build merged batches + req_id allocations.
@@ -537,9 +489,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     }
 
     // ------------------------------------------------------------------
-    // Phase B (under lock): emit SAL groups, signal, submit fsync SQE.
-    // Lock dropped immediately after; ACKs and fsync CQE are awaited
-    // outside so tick/relay/DDL tasks can make progress.
+    // Phase B (under the SAL writer): emit SAL groups, submit fsync SQE.
     //
     // All groups in this batch share one zone_lsn. A batch with a recoverable group
     // opens a zone and closes it with the commit sentinel after all groups, which
@@ -548,7 +498,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // LSNs. A batch of nothing but stream groups writes no zone at all.
     // ------------------------------------------------------------------
     let (zone_lsn, fsync_fut) = {
-        let _sal_excl = shared.disp().sal_excl().lock().await;
+        let disp = shared.disp();
+        let mut excl = disp.sal().lock().await;
 
         // Floor 0: a user-table push pins no system-family counter.
         let zone_lsn = shared.lsn_alloc.reserve(0);
@@ -557,7 +508,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         // transaction that runs out of SAL space part-way can take its earlier
         // families back. Every write, the sentinel and the fsync submit are in
         // this one synchronous block, so no reader ever observes the gap.
-        let scope = shared.disp().begin(zone_lsn, "commit");
+        let scope = excl.begin(zone_lsn, "commit");
 
         // Emit every unit into the zone, in unit order (transactions first). The
         // scope opens the zone on the first recoverable group it admits.
@@ -583,11 +534,9 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         let closed = scope
             .commit()
             .unwrap_or_else(|e| gnitz_fatal_abort!("commit zone failed, durability lost: {}", e.text));
-        // The wake goes out whatever was written; Phase C awaits the ACKs.
-        shared.disp().signal_all();
         // A stream-only batch — or one every group of which was refused — opened
         // no zone: nothing to sync.
-        let fsync_fut = closed.then(|| shared.reactor.fsync(shared.disp().sal_fd()));
+        let fsync_fut = closed.then(|| disp.reactor().fsync(disp.sal().sal_fd()));
         (zone_lsn, fsync_fut)
     };
 

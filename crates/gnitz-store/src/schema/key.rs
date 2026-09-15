@@ -697,19 +697,6 @@ impl SchemaDescriptor {
         range_shares_prefix(&start, end.as_ref(), self.dist_stride())
             .then(|| self.worker_for_pk(start.pk_bytes(), num_workers))
     }
-
-    /// OPK `keys` split by owning worker, each slot in list order. `None` unless
-    /// this placement routes by key and `stride` is its PK stride.
-    pub fn keys_by_owner(&self, stride: usize, keys: &[u8], num_workers: usize) -> Option<Vec<Vec<u8>>> {
-        if !self.placement().is_key_routed() || stride != self.pk_stride() {
-            return None;
-        }
-        let mut by_owner = vec![Vec::new(); num_workers];
-        for key in keys.chunks_exact(stride) {
-            by_owner[self.worker_for_pk(key, num_workers)].extend_from_slice(key);
-        }
-        Some(by_owner)
-    }
 }
 
 // ---------------------------------------------------------------------------

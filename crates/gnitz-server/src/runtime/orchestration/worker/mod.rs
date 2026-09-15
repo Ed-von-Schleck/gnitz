@@ -9,7 +9,6 @@ use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::query::{DagEngine, ExchangeCallback};
-use crate::runtime::m2w::{self, Wake};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
@@ -79,9 +78,9 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         SalMessageKind::DeltaRead => InEval::DeferPostAck,
         // An inline catalog mutation races the in-flight evaluation.
         SalMessageKind::DdlSync => InEval::DeferPreAck,
-        // Deferring deadlocks: `flush_round` holds `sal_writer_excl` across the
-        // ACK wait, and the tick's relay needs it to write the relay this worker
-        // is parked on — so a flush that waits for the relay waits forever.
+        // Deferring deadlocks: `flush_round` holds a `SalExcl` across the ACK
+        // wait, and the tick's relay needs one to write the relay this worker is
+        // parked on — so a flush that waits for the relay waits forever.
         SalMessageKind::Flush | SalMessageKind::FlushEph => InEval::Inline,
         // Correct to defer (`commit_pushes` drops its lock before the ACK wait),
         // but it would park the ingest ACK behind an exchange round-trip.
@@ -176,13 +175,9 @@ impl ExchangeCallback for BackfillExchangeCtx<'_> {
 // ---------------------------------------------------------------------------
 
 pub struct WorkerProcess {
-    master_pid: i32,
     catalog: *mut CatalogEngine,
     sal_reader: SalReader,
     w2m_writer: W2mWriter,
-    /// The eventfd the master signals to end this worker's park; `-1` in unit
-    /// tests, which never park.
-    m2w_efd: i32,
     exchange: WorkerExchangeHandler,
     pending_deltas: HashMap<i64, Batch>,
     /// FIFO queue of in-progress chunked reply trains. Two clients can run two
@@ -198,7 +193,7 @@ pub struct WorkerProcess {
     /// `release_cursor` (released in ring order, `w2m.rs`) could then never
     /// pass them, the ring fills, the worker blocks in `W2mWriter::send_msg`, and the
     /// cluster deadlocks. FIFO is deadlock-free: every fan-out writes its
-    /// group to all workers under `sal_writer_excl`, so all worker queues
+    /// group under a `SalExcl`, so all worker queues
     /// share one global request order; each master task drains workers in
     /// ascending index order; the earliest-ordered awaited train always has
     /// its frames at the front of some worker's queue with a live consumer.
@@ -276,24 +271,15 @@ enum ReplySchema<'a> {
     /// The target's own schema: the reply serves and populates the table's
     /// cached block, and negotiates its version against the client's.
     Table(&'a SchemaDescriptor),
-    /// A projected or synthetic schema — every `HasPk` reply, whose shape is
-    /// the probe's, not the table's. Built fresh per reply and never cached:
-    /// the table's block would decode these rows at the wrong stride, and
-    /// caching theirs would poison the table's.
-    OneOff(&'a SchemaDescriptor),
-    /// The reply schema the request shipped in `seek_pk_extra` and the reader
-    /// decodes against: no block, no descriptor needed here, and the request's
-    /// own schema version reported back.
-    ClientAuthored,
+    /// A schema the reader already holds: no block, the request's version back.
+    ReaderHeld,
 }
 
 impl WorkerProcess {
     pub fn new(
-        master_pid: i32,
         catalog: *mut CatalogEngine,
         sal_reader: SalReader,
         w2m_writer: W2mWriter,
-        m2w_efd: i32,
         // Effective base-table deltas buffered during SAL replay (the
         // un-checkpointed tail of every base feeding ≥1 view). The master's
         // post-reset recovery tick sweep drains these into the views via
@@ -304,11 +290,9 @@ impl WorkerProcess {
         // catalog work — see `server_main`, not here: boot-compiled plans
         // would otherwise carry rank 0 / num_workers 1.
         WorkerProcess {
-            master_pid,
             catalog,
             sal_reader,
             w2m_writer,
-            m2w_efd,
             exchange: WorkerExchangeHandler {
                 deferred: Vec::new(),
                 deferred_replay: Vec::new(),
@@ -338,11 +322,7 @@ impl WorkerProcess {
             // queued state drives the next drain_sal to emit the next chunk
             // immediately.
             if self.pending_streams.is_empty() {
-                match m2w::eventfd_wait(self.m2w_efd, 1000) {
-                    Wake::Signalled => {}
-                    Wake::Idle if self.master_is_gone() => self.shutdown(),
-                    Wake::Idle | Wake::Failed => continue,
-                }
+                self.w2m_writer.sal_park().park(|| self.sal_reader.is_empty());
             }
 
             self.drain_sal();
@@ -555,6 +535,9 @@ impl WorkerProcess {
             }
 
             SalMessageKind::HasPk => {
+                let Some(batch) = batch else {
+                    return Err("has_pk: a probe carries its keys".into());
+                };
                 let lookup = match gnitz_wire::probe_key_columns(seek_col_idx) {
                     None => HasPkLookup::PrimaryKey,
                     Some(packed) => HasPkLookup::SecondaryIndex {
@@ -683,7 +666,7 @@ impl WorkerProcess {
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, false)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, client_version);
+        self.send_shared_scan_response(route, keeper, ReplySchema::ReaderHeld, client_version);
         Ok(())
     }
 
@@ -700,7 +683,7 @@ impl WorkerProcess {
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, false)
             .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
         let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, ReplySchema::ClientAuthored, client_version);
+        self.send_shared_scan_response(route, keeper, ReplySchema::ReaderHeld, client_version);
         Ok(())
     }
 
@@ -900,20 +883,16 @@ impl WorkerProcess {
 
     /// Answer one HasPk probe over the keys that exist committed on this
     /// worker; `mode` decides what a match is answered with.
-    ///
-    /// The request is key-only whichever keyspace it names, and the reply
-    /// carries the PROBE's schema as a one-off block — never the table's, which
-    /// `schema_wire_entry` would serve from cache at the wrong strides.
     fn handle_has_pk(
         &mut self,
         route: ReplyRoute,
-        batch: Option<Batch>,
+        batch: Batch,
         lookup: HasPkLookup,
         mode: gnitz_wire::WireProbeMode,
         mode_param: usize,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
-        let n = batch.as_ref().map_or(0, |b| b.len());
+        let n = batch.len();
         if let gnitz_wire::WireProbeMode::Project = mode {
             // `seek_col_idx` is the PK sentinel here, so the column to project
             // rides the per-mode parameter word instead.
@@ -921,34 +900,28 @@ impl WorkerProcess {
                 return Err("has_pk: a projecting probe reads the table's own PK store".into());
             }
             let ref_col = mode_param as u8;
-            let mut keys = Vec::new();
-            if let Some(b) = &batch {
-                keys.reserve(b.len() * b.schema().pk_stride());
-                for i in 0..b.len() {
-                    keys.extend_from_slice(b.get_pk_bytes(i));
-                }
+            let mut keys = Vec::with_capacity(n * batch.schema().pk_stride());
+            for i in 0..n {
+                keys.extend_from_slice(batch.get_pk_bytes(i));
             }
             let result = self.cat().registry().gather_bytes(target_id, keys, ref_col)?;
-            let schema = *result.schema();
-            // The projected reply schema is synthetic — never the table's
-            // cached block.
-            self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);
+            self.send_scan_response(route, result, ReplySchema::ReaderHeld, 0);
             return Ok(());
         }
         match lookup {
             HasPkLookup::SecondaryIndex { cols } => {
-                let (result, schema) = {
+                let result = {
                     // One resolution of `(target_id, cols)`: the circuit carries
-                    // the index table, its schema and the span width.
+                    // the index table and the span width.
                     let ic = self
                         .cat()
                         .registry()
                         .relation(target_id)
                         .and_then(|r| r.index_on(cols.as_slice()))
                         .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
-                    // The check target is the unique INDEX table, whose schema is
+                    // The probe's schema is the INDEX table's,
                     // `(indexed_col, src_pk…)` — NOT the owner table's schema.
-                    let schema = batch.as_ref().map_or(ic.schema(), |b| *b.schema());
+                    let schema = *batch.schema();
                     // Index layout: PK = (indexed-key span, src_pk_cols). Any
                     // positive-weight match means the value is already in the
                     // index. `open_cursor` keeps a compaction Io/InvalidShard
@@ -963,60 +936,43 @@ impl WorkerProcess {
                     // expected hit count on a fresh-key insert is zero, and
                     // `with_capacity` bypasses the batch arena above 2 MiB.
                     let mut result = Batch::empty_with_schema(&schema);
-                    if let Some(b) = batch.as_ref() {
-                        for i in 0..n {
-                            let pkb = b.get_pk_bytes(i);
-                            let prefix = &pkb[..idx_key_size];
-                            // `[span ‖ holder PK]` verbatim: `IndexKeySpec::write_entry`
-                            // wrote the source PK at `idx_key_size`, so the caller
-                            // splits it back out without decoding anything.
-                            if let gnitz_wire::WireProbeMode::AllHolders = mode {
-                                // Capped, so one value's holder list cannot
-                                // outgrow the write that asked about it. `0`
-                                // would answer "no holders" for an occupied
-                                // span, so it floors at one.
-                                cursor.for_each_positive_with_prefix_capped(prefix, mode_param.max(1), |c| {
-                                    result.push_key_row(c.current_pk_bytes(), 1);
-                                });
-                                continue;
-                            }
-                            if !cursor.seek_first_positive_with_prefix(prefix) {
-                                continue;
-                            }
-                            let holder = matches!(mode, gnitz_wire::WireProbeMode::FirstHolder);
-                            result.push_key_row(if holder { cursor.current_pk_bytes() } else { pkb }, 1);
+                    for i in 0..n {
+                        let pkb = batch.get_pk_bytes(i);
+                        let prefix = &pkb[..idx_key_size];
+                        // `[span ‖ holder PK]` verbatim: `IndexKeySpec::write_entry`
+                        // wrote the source PK at `idx_key_size`, so the caller
+                        // splits it back out without decoding anything.
+                        if let gnitz_wire::WireProbeMode::AllHolders = mode {
+                            // Capped by the asking write's size; at least one,
+                            // or an occupied span would answer "no holders".
+                            cursor.for_each_positive_with_prefix_capped(prefix, mode_param.max(1), |c| {
+                                result.push_key_row(c.current_pk_bytes(), 1);
+                            });
+                            continue;
                         }
+                        if !cursor.seek_first_positive_with_prefix(prefix) {
+                            continue;
+                        }
+                        let holder = matches!(mode, gnitz_wire::WireProbeMode::FirstHolder);
+                        result.push_key_row(if holder { cursor.current_pk_bytes() } else { pkb }, 1);
                     }
-                    (result, schema)
+                    result
                 };
-                // The index schema is not table `target_id`'s own — one-off block.
-                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);
+                self.send_scan_response(route, result, ReplySchema::ReaderHeld, 0);
                 Ok(())
             }
             HasPkLookup::PrimaryKey => {
-                // Off the probe batch, as the index arm does; a worker with an
-                // empty sublist still replies, and derives the same key-only
-                // image from its own catalog schema.
-                let schema = match batch.as_ref() {
-                    Some(b) => *b.schema(),
-                    None => {
-                        let table = self.cat().registry().relation_or_err(target_id)?.schema();
-                        gnitz_store::schema::project_schema(&table, &[]).expect("a PK-only projection fits MAX_COLUMNS")
-                    }
-                };
                 let relation = self.cat().registry().relation(target_id);
                 // Grown on demand — see the index arm above.
-                let mut result = Batch::empty_with_schema(&schema);
-                if let Some(b) = batch.as_ref() {
-                    for i in 0..n {
-                        let pkb = b.get_pk_bytes(i);
-                        // `false` where this process holds no store.
-                        if relation.is_some_and(|r| r.has_pk(pkb)) {
-                            result.push_key_row(pkb, 1);
-                        }
+                let mut result = Batch::empty_with_schema(batch.schema());
+                for i in 0..n {
+                    let pkb = batch.get_pk_bytes(i);
+                    // `false` where this process holds no store.
+                    if relation.is_some_and(|r| r.has_pk(pkb)) {
+                        result.push_key_row(pkb, 1);
                     }
                 }
-                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);
+                self.send_scan_response(route, result, ReplySchema::ReaderHeld, 0);
                 Ok(())
             }
         }
@@ -1058,13 +1014,6 @@ impl WorkerProcess {
                 e,
             );
         }
-    }
-
-    /// Whether the master process has exited (killed, or `gnitz_fatal_abort`).
-    /// The fallback to `PR_SET_PDEATHSIG`; `master_pid == 0` in unit tests, which
-    /// have no master to outlive.
-    fn master_is_gone(&self) -> bool {
-        self.master_pid != 0 && unsafe { libc::getppid() } != self.master_pid
     }
 
     /// Publish and exit. The publish is not optional — a mid-backfill

@@ -31,12 +31,11 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    dispatch_scan_multi_fanout,
     exchange::{ExchangeAccumulator, PendingRelay},
-    read_fanout, spec_route, Fanout, MasterDispatcher, WORKER_WATCH,
+    forward_scan, MasterDispatcher, WORKER_WATCH,
 };
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, Reactor, ReadGuard, WriteGuard};
+use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match};
 use gnitz_store::relation::{Relation, RelationKind};
@@ -77,7 +76,11 @@ async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() ->
         if ready() {
             return;
         }
-        shared.reactor.timer(Instant::now() + Duration::from_millis(1)).await;
+        shared
+            .disp()
+            .reactor()
+            .timer(Instant::now() + Duration::from_millis(1))
+            .await;
     }
     gnitz_warn!("{}: seam armed but the event never arrived; releasing", what);
 }
@@ -153,7 +156,6 @@ async fn await_barrier(shared: &Shared, kind: BarrierKind) {
 
 /// Shared executor state held by every task.
 pub struct Shared {
-    pub reactor: Rc<Reactor>,
     dispatcher: Rc<MasterDispatcher>,
     committer_tx: chan::Sender<CommitRequest>,
     catalog_rwlock: AsyncRwLock,
@@ -166,9 +168,7 @@ pub struct Shared {
     pub(super) lsn_alloc: ZoneLsnAllocator,
     last_tick_lsn: Cell<u64>,
     /// Tables with a pending delta, each with the row count feeding the tick
-    /// threshold. `run_tick` writes one `Tick` group per tid inside one
-    /// `sal_writer_excl` window before awaiting any ACK, so the order the map
-    /// yields them in only changes the order the workers see the groups in.
+    /// threshold.
     tick_rows: RefCell<FxHashMap<i64, usize>>,
     /// Per-table write serialization. A push whose validation reads committed
     /// state (`push_reads_committed_state`) and every transaction take the write
@@ -380,7 +380,6 @@ impl ServerExecutor {
         let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
         let shared = Rc::new(Shared {
-            reactor: Rc::clone(&reactor),
             dispatcher,
             committer_tx,
             catalog_rwlock: AsyncRwLock::default(),
@@ -431,7 +430,7 @@ struct AcceptCtx {
 
 async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
     loop {
-        let (raw_fd, listener) = shared.reactor.accept().await;
+        let (raw_fd, listener) = shared.disp().reactor().accept().await;
         if raw_fd < 0 {
             continue;
         }
@@ -439,12 +438,12 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
         // `continue` below closes it by dropping this.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
         if listener == ctx.unix_fd {
-            let peer = Peer::unix(fd, Rc::clone(&shared.reactor));
+            let peer = Peer::unix(fd, Rc::clone(shared.disp().reactor()));
             let s = Rc::clone(&shared);
             // No pre-auth deadline: access here is gated by the socket path's
             // filesystem permissions, and whoever can open it already has full
             // DDL/DML authority, so squatting gains nothing.
-            shared.reactor.spawn(connection_loop(peer, s, None));
+            shared.disp().reactor().spawn(connection_loop(peer, s, None));
             continue;
         }
         let Some(tl) = ctx.tls.as_ref().filter(|tl| listener == tl.fd()) else {
@@ -457,7 +456,12 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
             gnitz_warn!("tls: connection cap {} reached; closing fd={raw_fd}", tl.max_conns);
             continue;
         };
-        let conn = match TlsShared::start(Rc::clone(&shared.reactor), fd, std::sync::Arc::clone(&tl.cfg), guard) {
+        let conn = match TlsShared::start(
+            Rc::clone(shared.disp().reactor()),
+            fd,
+            std::sync::Arc::clone(&tl.cfg),
+            guard,
+        ) {
             Ok(conn) => conn,
             Err(e) => {
                 // `fd` and `guard` were moved into `start`; on the error path they
@@ -472,7 +476,7 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
         // accept, else the connection is torn down (covers a stalled handshake
         // and a completed-handshake-no-HELLO squat alike).
         let deadline = Instant::now() + tls_hello_timeout();
-        shared.reactor.spawn(connection_loop(peer, s, Some(deadline)));
+        shared.disp().reactor().spawn(connection_loop(peer, s, Some(deadline)));
     }
 }
 
@@ -515,7 +519,7 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
     // No HELLO in time (`Either::B`) → `None`. `select2` drops the losing timer,
     // which removes its deadline, so the happy path leaves no timer behind.
     let first = match first_frame_deadline {
-        Some(deadline) => match select2(peer.recv(), shared.reactor.timer(deadline)).await {
+        Some(deadline) => match select2(peer.recv(), shared.disp().reactor().timer(deadline)).await {
             Either::A(opt) => opt,
             Either::B(()) => None,
         },
@@ -619,7 +623,7 @@ fn install_shutdown_signal_handlers() {
 /// timer poll is the established pattern.
 async fn watchdog(shared: Rc<Shared>) {
     loop {
-        shared.reactor.timer(Instant::now() + WORKER_WATCH).await;
+        shared.disp().reactor().timer(Instant::now() + WORKER_WATCH).await;
 
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             // Let a quiescing DDL finish first. Its tick loop is parked, so the
@@ -645,8 +649,8 @@ async fn watchdog(shared: Rc<Shared>) {
 
             // 3. Workers flush + _exit, then stop the reactor. The reactor/W2M
             //    receiver stays live throughout, so no `w2m()` handle dangles.
-            shared.disp().shutdown_workers();
-            shared.reactor.request_shutdown();
+            shared.disp().shutdown_workers().await;
+            shared.disp().reactor().request_shutdown();
             return;
         }
 
@@ -654,21 +658,14 @@ async fn watchdog(shared: Rc<Shared>) {
             let base_dir = shared.cat().base_dir().to_string();
             gnitz_error!("Worker {crashed} crashed (log: {base_dir}/worker_{crashed}.log), shutting down");
             shared.worker_crashed.set(true);
-            shared.disp().shutdown_workers();
-            shared.reactor.request_shutdown();
+            shared.disp().shutdown_workers().await;
+            shared.disp().reactor().request_shutdown();
             return;
         }
 
-        // The only reclaim trigger on a workload with no writes: every read verb
-        // writes a SAL command group and nothing on a read path rewinds the
-        // cursor. Deliberately not awaited — this loop is the sole worker-crash
-        // detector and `flush_round`'s reply futures have no timeout, so awaiting
-        // would let a worker dying mid-checkpoint hang the node silently instead
-        // of aborting within one tick. The next tick re-checks and re-sends.
-        // On a write workload it is inert: the committer already checkpoints at
-        // 3/4 on every push, well before this 7/8 line. Skipped inside a DDL
-        // window, where the committer refuses every checkpoint anyway.
-        if shared.ddl_window.get() == 0 && shared.disp().sal_space_low() {
+        // The only reclaim trigger on a workload with no writes, whose reads
+        // still write SAL groups. Not awaited: the next tick re-sends.
+        if shared.ddl_window.get() == 0 && shared.disp().sal().below_reclaim_margin() {
             let (done_tx, done_rx) = oneshot::channel();
             shared.committer_tx.send(CommitRequest::Barrier {
                 kind: BarrierKind::Reclaim { forced: false },
@@ -746,12 +743,6 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
 
 /// Emit Tick groups for every `tid` and await the per-worker ACKs, relaying each
 /// exchange round the tick opens as it completes.
-///
-/// The emit-and-await lock shape: the ACK lease taken before any lock,
-/// `catalog_rwlock.read()` (so DDL cannot mutate schemas mid-emission) +
-/// `sal_writer_excl` covering only the contiguous emission window, one
-/// `signal_all` inside it, both released before awaiting so other reactor work
-/// proceeds concurrently with worker DAG eval.
 async fn run_tick(
     shared: &Rc<Shared>,
     tids: &[i64],
@@ -774,10 +765,10 @@ async fn run_tick(
         return Ok(());
     }
 
-    let req_ids = shared.reactor.lease_acks(tids.len() * nw);
+    let req_ids = shared.disp().reactor().lease_acks(tids.len() * nw);
 
     let _cat_read = shared.catalog_rwlock.read().await;
-    let _sal_excl = shared.disp().sal_excl().lock().await;
+    let excl = shared.disp().sal().lock().await;
 
     // Written by the closure as it goes, so the re-queue and reply-await below
     // are also correct on `guard_panic`'s panic arm, which discards the closure's
@@ -785,28 +776,18 @@ async fn run_tick(
     let emitted = Cell::new(0usize);
     let emit = guard_panic("tick", || {
         let disp = shared.disp();
-        let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
             if TICK_EMIT_ERROR.take_once() {
-                result = Err(format!("injected tick emit error (tid={tid})").into());
-                break;
+                return Err(format!("injected tick emit error (tid={tid})").into());
             }
-            if let Err(e) = disp.write_tick_group(tid, GroupTargets::all(req_ids.id(i * nw))) {
-                result = Err(e);
-                break;
-            }
+            disp.write_tick_group(&excl, tid, GroupTargets::all(req_ids.id(i * nw)))?;
             emitted.set(i + 1);
         }
-        // Whatever was written is already published, so the workers consume it on
-        // the next signal or their SAL wait timeout regardless. Signal it and
-        // await its replies rather than returning while its evaluation is in
-        // flight.
-        if emitted.get() > 0 {
-            disp.signal_all();
-        }
-        result
+        Ok(())
     });
-    drop(_sal_excl);
+    // Whatever was written is published: the drop wakes its workers, and its
+    // replies are awaited below rather than left in flight.
+    drop(excl);
     drop(_cat_read);
 
     let n = emitted.get();
@@ -837,31 +818,19 @@ async fn run_tick(
 /// Write one completed steady-state exchange round back as an ExchangeRelay
 /// group. A tick round never pads, so its `flags.backfill` verdict is `Continue`.
 ///
-/// A lost relay wedges workers blocked in `do_exchange_wait` forever
-/// (they ACK neither tick nor relay and the master stays alive), so both
-/// failure modes — an `emit_relay_with_decision` error and no space after a reclaim
-/// checkpoint — `gnitz_fatal_abort!` rather than warn-and-drop: a loud,
-/// recoverable crash (workers self-exit via `getppid()`, operator
-/// restarts) beats a silent permanent cluster wedge.
+/// A lost relay wedges every worker in exchange wait, so every failure aborts.
 async fn relay_steady(shared: &Shared, relay: PendingRelay) {
     if RELAY_HOLD_FOR_DDL.take_once() {
         hold_relay_for_ddl(shared).await;
     }
 
-    // Phase 1: CPU work + catalog read only — no SAL mutex.
+    // Phase 1: CPU work + catalog read only — no SAL hold.
     let prep = {
         let _cat = shared.catalog_rwlock.read().await;
-        match guard_panic("prepare_relay", || shared.disp().prepare_relay(relay)) {
-            Ok(p) => p,
-            Err(e) => gnitz_fatal_abort!("prepare_relay failed: {}", e),
-        }
+        shared.disp().prepare_relay(relay, "steady relay")
     };
 
-    // Phase 2: emit under the SAL mutex. The space check shares the
-    // lock with the write, so no other SAL writer can consume the
-    // margin in between. The barrier await MUST happen with the lock
-    // dropped: the committer's checkpoint takes sal_writer_excl, so
-    // holding it across the barrier deadlocks master-side.
+    // Phase 2: fit and emit under one SAL hold.
     let mut reclaimed = false;
     // Spent here, not inside the retry: a genuinely low first iteration must
     // not leave the latch to fire after the reclaim, where `reclaimed` turns
@@ -869,8 +838,9 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
     let mut inject_low = RELAY_SPACE_LOW.take_once();
     loop {
         {
-            let _sal = shared.disp().sal_excl().lock().await;
-            let mut fit = shared.disp().relay_fit(prep.footprint);
+            let disp = shared.disp();
+            let excl = disp.sal().lock().await;
+            let mut fit = disp.sal().fit_relay(prep.footprint);
             if inject_low {
                 inject_low = false;
                 fit = SalFit::Transient;
@@ -883,17 +853,7 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
                     gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it")
                 }
                 SalFit::Fits => {
-                    if let Err(e) = guard_panic("emit_relay", || {
-                        shared
-                            .disp()
-                            .emit_relay_with_decision(&prep, BackfillDecision::Continue)
-                    }) {
-                        gnitz_fatal_abort!(
-                            "emit_relay failed; a lost relay wedges workers \
-                             blocked in exchange wait: {}",
-                            e
-                        );
-                    }
+                    disp.emit_relay(&excl, &prep, BackfillDecision::Continue);
                     break;
                 }
                 SalFit::Transient if reclaimed => {
@@ -906,6 +866,7 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
                 SalFit::Transient => {}
             }
         }
+        // With the hold dropped: the checkpoint this waits for takes the writer.
         gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
         // `forced`: this relay's own byte count says it does not fit, which
         // the committer's ambient space test cannot see.
@@ -1256,14 +1217,13 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
         return;
     }
 
-    let (sal_kind, fanout, blob, extras) = match seek {
+    let (sal_kind, route, blob) = match seek {
         Some((spec, schema)) => {
             let block = shared.cat_mut().schema_wire_entry(target_id, &schema).block;
             let blob = spec.encode(&block);
-            let route = spec_route(disp, target_id, &blob);
-            (SalMessageKind::ScanSpec, route.fanout, blob, route.per_worker)
+            (SalMessageKind::ScanSpec, disp.read_route(target_id, Some(&blob)), blob)
         }
-        None => (SalMessageKind::Scan, read_fanout(disp, target_id), Vec::new(), None),
+        None => (SalMessageKind::Scan, disp.read_route(target_id, None), Vec::new()),
     };
 
     let (server_version, prelim) = schema_block_for_reply(shared, target_id, client_version);
@@ -1284,9 +1244,7 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
         seek_pk_extra: &blob,
         ..Default::default()
     };
-    let result = disp
-        .fan_out_scan(fanout, peer, sal_kind, template, extras.as_deref())
-        .await;
+    let result = disp.fan_out_scan(route, peer, sal_kind, template).await;
     finish_scan_fanout(peer, target_id, client_id, lsn as u128, result).await;
 }
 
@@ -1823,8 +1781,7 @@ async fn finish_scan_fanout(
     result: Result<bool, WireFault>,
 ) {
     match result {
-        // Corked, not sent: `forward_scan_slots` corked the heads it coalesced
-        // and nothing parked in between, so the whole reply leaves as one send.
+        // Corked, not sent: the terminal joins whatever the forward corked.
         Ok(true) => {
             send_msg(peer, terminal_scan_msg(target_id, client_id, seek_pk));
         }
@@ -1842,7 +1799,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
         return;
     };
     let lsn = shared.last_tick_lsn.get() as u128;
-    let route = spec_route(shared.disp(), target_id, seek_pk_extra);
+    let route = shared.disp().read_route(target_id, Some(seek_pk_extra));
     let template = ipc::WireMsg {
         target_id: target_id as u64,
         client_id,
@@ -1851,13 +1808,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     };
     let result = shared
         .disp()
-        .fan_out_scan(
-            route.fanout,
-            peer,
-            SalMessageKind::ScanSpec,
-            template,
-            route.per_worker.as_deref(),
-        )
+        .fan_out_scan(route, peer, SalMessageKind::ScanSpec, template)
         .await;
     finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
 }
@@ -1903,46 +1854,53 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     // No await between a view's gate test and the round its terminal reports, so
     // no tick can land in between. The guard is scoped to this phase: phase 2
     // reads no catalog state, and holding it across the drain would block DDL.
-    //
-    // A poll with nothing to fetch dispatches nothing, so it takes no SAL hold
-    // and signals no worker — the steady state of a subscription.
+    // A poll with nothing to fetch takes no SAL hold.
     let (positions, dispatches, up_to_date_round, dispatch_round) = {
         let _g = shared.catalog_rwlock.read().await;
         let disp = shared.disp();
         let up_to_date_round = disp.last_tick_round();
         let mut positions = Vec::with_capacity(views.len());
-        let mut moved: Vec<(DeltaPollItem, Fanout)> = Vec::with_capacity(views.len());
+        let mut moved: Vec<DeltaPollItem> = Vec::with_capacity(views.len());
         for &item in &views {
             let tid = item.view_id as i64;
             let position = match target_kind(shared, tid, Access::UserRead) {
                 Err(f) => PollPosition::Fault(f),
                 Ok(_) if delta_up_to_date(shared, tid, item.after_tick) => PollPosition::UpToDate,
                 Ok(_) => {
-                    moved.push((item, read_fanout(disp, tid)));
+                    moved.push(item);
                     PollPosition::Moved
                 }
             };
             positions.push((tid, position));
         }
 
-        let fanouts: Vec<Fanout> = moved.iter().map(|&(_, f)| f).collect();
-        let (dispatches, dispatch_round) = dispatch_scan_multi_fanout(disp, &fanouts, |i, targets, round| {
-            let (item, _) = moved[i];
-            disp.write_group(&DirectGroup {
-                template: ipc::WireMsg {
-                    target_id: item.view_id,
-                    client_id,
-                    seek_pk: round as u128,
-                    seek_col_idx: item.after_tick,
-                    seek_pk_extra: item.reply_block,
-                    ..Default::default()
-                },
-                targets,
-                ..DirectGroup::new(SalMessageKind::DeltaRead)
+        let mut round = 0;
+        let dispatches = if moved.is_empty() {
+            Vec::new()
+        } else {
+            disp.scan_cut(moved.len(), |cut| {
+                round = disp.last_tick_round();
+                for item in &moved {
+                    cut.push(disp.read_route(item.view_id as i64, None).set, |excl, targets| {
+                        excl.write(&DirectGroup {
+                            template: ipc::WireMsg {
+                                target_id: item.view_id,
+                                client_id,
+                                seek_pk: round as u128,
+                                seek_col_idx: item.after_tick,
+                                seek_pk_extra: item.reply_block,
+                                ..Default::default()
+                            },
+                            targets,
+                            ..DirectGroup::new(SalMessageKind::DeltaRead)
+                        })
+                    })?;
+                }
+                Ok(())
             })
-        })
-        .await?;
-        (positions, dispatches, up_to_date_round, dispatch_round)
+            .await?
+        };
+        (positions, dispatches, up_to_date_round, round)
     };
 
     // ── Phase 2: one terminal per view, in request order ───────────────────
@@ -1957,8 +1915,8 @@ async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             // undrained — an earlier return dropped it — discards the rest of
             // its train at the ring boundary.
             PollPosition::Moved => {
-                let d = dispatches.next().expect("one dispatch per moved view");
-                match d.await_and_forward(peer).await {
+                let lease = dispatches.next().expect("one dispatch per moved view");
+                match forward_scan(peer, &lease).await {
                     Ok(true) => send_msg(peer, terminal_scan_msg(tid, client_id, watermark(dispatch_round))),
                     Ok(false) => return Ok(false),
                     Err(fault) => send_fault(peer, tid, client_id, &fault),
@@ -2050,16 +2008,10 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     let lsn = shared.last_tick_lsn.get();
 
     // ── Phase 1: catalog lock — resolve shapes + schemas, dispatch one cut ──
-    // Resolve every relation from the same catalog snapshot (so all N are
-    // consistent with the cut even if a DDL commits during the later drain),
-    // then write all N groups under one `sal_writer_excl` hold. The
-    // catalog-read ⊃ `sal_writer_excl` order matches every other SAL writer, so
-    // no lock inversion. The guard is the one `drain_and_relock` handed back, so
-    // a DDL during the drain is caught by the per-tid resolution below.
+    // One catalog snapshot for every relation, one SAL cut for every group.
     let (dispatches, plans) = {
         let _cat = cat;
         let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
-        let mut fanout: Vec<Fanout> = Vec::with_capacity(relations.len());
         for &(tid_u, client_ver) in &relations {
             let tid = tid_u as i64;
             // Base tables AND views are legal; `UserRead` refuses a catalog
@@ -2067,30 +2019,34 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             // master-locally.
             // Status dropped for the reason `push_txn_body`'s is.
             target_kind(shared, tid, Access::UserRead).map_err(|f| f.text)?;
-            fanout.push(read_fanout(shared.disp(), tid));
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
             let (server_version, block) = schema_block_for_reply(shared, tid, client_ver);
             plans.push(ScanMultiRelPlan { tid, server_version, block });
         }
         let disp = shared.disp();
-        let (dispatches, _) = dispatch_scan_multi_fanout(disp, &fanout, |i, targets, _| {
-            let plan = &plans[i];
-            disp.write_group(&DirectGroup {
-                template: ipc::WireMsg {
-                    target_id: plan.tid as u64,
-                    client_id,
-                    flags: WireFlags {
-                        schema_version: plan.server_version,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                targets,
-                ..DirectGroup::new(SalMessageKind::Scan)
+        let dispatches = disp
+            .scan_cut(plans.len(), |cut| {
+                for plan in &plans {
+                    cut.push(disp.read_route(plan.tid, None).set, |excl, targets| {
+                        excl.write(&DirectGroup {
+                            template: ipc::WireMsg {
+                                target_id: plan.tid as u64,
+                                client_id,
+                                flags: WireFlags {
+                                    schema_version: plan.server_version,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            targets,
+                            ..DirectGroup::new(SalMessageKind::Scan)
+                        })
+                    })?;
+                }
+                Ok(())
             })
-        })
-        .await?;
+            .await?;
         // Release the catalog read lock here: Phase 2 touches no catalog state
         // (the snapshot is worker-frozen and the schemas are captured), so
         // holding it across the whole bulk read would needlessly block DDL.
@@ -2108,7 +2064,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
-        match d.await_and_forward(peer).await {
+        match forward_scan(peer, d).await {
             Ok(true) => {}
             Ok(false) => return Ok(false),
             Err(f) => return Err(f),

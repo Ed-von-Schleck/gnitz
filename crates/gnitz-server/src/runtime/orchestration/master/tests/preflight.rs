@@ -11,7 +11,7 @@ fn build_check_batch_promotes_the_key_image_into_the_leading_column() {
     ];
     let idx = SchemaDescriptor::new(&cols, &[0, 1]);
 
-    let batch = build_check_batch(&idx, &[0x7FFF_FFFFu128], type_code::I32);
+    let batch = build_check_batch(&idx, &mut [0x7FFF_FFFFu128], type_code::I32);
 
     assert_eq!(batch.len(), 1);
     let mut expected = [0u8; 8];
@@ -40,7 +40,7 @@ fn probe_schema_keeps_the_key_and_drops_every_payload_column() {
     assert_eq!(pk_only.pk_stride(), schema.pk_stride());
     assert_eq!(pk_only.pk_indices(), &[0]);
 
-    let batch = build_check_batch(&pk_only, &[42u128], type_code::U64);
+    let batch = build_check_batch(&pk_only, &mut [42u128], type_code::U64);
     assert_eq!(batch.len(), 1);
     let mut expected = [0u8; 8];
     gnitz_wire::encode_pk_column(&42u64.to_le_bytes(), type_code::U64, &mut expected);
@@ -114,4 +114,24 @@ fn check_batch_build_bench() {
     }
     let per_row = t.elapsed().as_nanos() as f64 / (ROUNDS * ROWS) as f64;
     println!("check_batch_build: {ROWS} rows x {ROUNDS} rounds, {per_row:.2} ns/row");
+}
+
+#[test]
+fn rows_of_names_every_row_a_key_prefixes() {
+    let schema = crate::test_support::pk_only_schema(&[type_code::U64, type_code::U64]);
+    let key = |a: u64, b: u64| [a.to_be_bytes(), b.to_be_bytes()].concat();
+    let keys = [key(1, 0), key(3, 1), key(3, 1), key(3, 9), key(7, 0)];
+    let check = PipelinedCheck {
+        keyspace: Keyspace::OwnPk,
+        mode: gnitz_wire::WireProbeMode::Exists,
+        mode_param: 0,
+        batch: build_check_batch_pk_bytes(&schema, keys.iter().map(|k| &k[..])),
+        schema: wire::WireSchema::encoded(1, schema),
+        reply: None,
+    };
+    assert_eq!(check.rows_of(&key(3, 1)), 1..3, "a duplicate key");
+    assert_eq!(check.rows_of(&key(3, 2)), 3..3, "an absent key");
+    assert_eq!(check.rows_of(&key(9, 0)), 5..5, "an absent key past the last row");
+    assert_eq!(check.rows_of(&3u64.to_be_bytes()), 1..4, "a span prefix");
+    assert_eq!(check.rows_of(&0u64.to_be_bytes()), 0..0, "a span below every row");
 }

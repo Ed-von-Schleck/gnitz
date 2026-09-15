@@ -16,13 +16,12 @@ use gnitz_foundation::posix_io;
 
 use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
-use crate::runtime::m2w;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
-use crate::runtime::w2m::{self, boot_ready_request_id, W2mReceiver, W2mWriter};
+use crate::runtime::w2m::{self, boot_ready_request_id, SalWake, W2mReceiver, W2mWriter};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
 use gnitz_store::relation::Relation;
@@ -286,7 +285,6 @@ struct SharedIpc {
     /// it costs a full-ring sweep, and every reader must anchor on one answer.
     walk_epoch: u32,
     w2m_ptrs: Vec<*mut u8>,
-    m2w_efds: Vec<i32>,
 }
 
 impl SharedIpc {
@@ -298,7 +296,7 @@ impl SharedIpc {
     }
 }
 
-/// Open and map the SAL, one W2M ring per worker, and the M2W eventfds.
+/// Open and map the SAL, and one W2M ring per worker.
 fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     // A fresh SAL file reads all-zero through O_CREAT + fallocate, which is
     // exactly the empty-SAL state recovery expects.
@@ -323,16 +321,9 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     // SAFETY: the mapping above is `sal_len` bytes and outlives the process.
     let walk_epoch = unsafe { SalLog::new(sal_ptr, sal_len) }.walk_epoch();
 
-    let mut w2m_ptrs: Vec<*mut u8> = Vec::with_capacity(nw);
-    let mut m2w_efds: Vec<i32> = Vec::with_capacity(nw);
-    for w in 0..nw {
-        let wptr = w2m::create_region().map_err(|e| format!("failed to map W2M region for W{w}: {e}"))?;
-        w2m_ptrs.push(wptr);
-
-        // M2W eventfd (master→worker signaling; W2M wakes via futex).
-        let efd = m2w::eventfd_create().map_err(|e| format!("failed to create the M2W eventfd for W{w}: {e}"))?;
-        m2w_efds.push(efd);
-    }
+    let w2m_ptrs = (0..nw)
+        .map(|w| w2m::create_region().map_err(|e| format!("failed to map W2M region for W{w}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(SharedIpc {
         sal_fd,
@@ -340,7 +331,6 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
         sal_len,
         walk_epoch,
         w2m_ptrs,
-        m2w_efds,
     })
 }
 
@@ -358,9 +348,8 @@ fn run_worker_child(
 ) -> ! {
     let w = slot.rank as usize;
 
-    // Die immediately if the master exits for any reason. The `getppid` probe a
-    // worker runs after a timed-out eventfd park is a belt-and-suspenders
-    // fallback; this closes the ~30s polling gap.
+    // Die immediately if the master exits for any reason: a worker parks on the
+    // SAL with no timeout, so this is its only notice.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
     // Re-check: parent may have died in the fork→prctl window.
     if unsafe { libc::getppid() } != master_pid {
@@ -399,15 +388,6 @@ fn run_worker_child(
         p.pin_worker(w);
     }
 
-    // Close M2W eventfds of OTHER workers (W2M uses futex, no fd).
-    for (j, &efd) in ipc.m2w_efds.iter().enumerate() {
-        if j != w {
-            unsafe {
-                libc::close(efd);
-            }
-        }
-    }
-
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
     let catalog_ptr: *mut CatalogEngine = catalog;
 
@@ -425,14 +405,7 @@ fn run_worker_child(
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
     let sal_reader = SalReader::new(ipc.sal_log(), slot.rank, ipc.walk_epoch);
-    let mut worker = WorkerProcess::new(
-        master_pid,
-        catalog_ptr,
-        sal_reader,
-        w2m_writer,
-        ipc.m2w_efds[w],
-        pending_deltas,
-    );
+    let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer, pending_deltas);
     let rc = worker.run(boot_ready_request_id(w));
 
     unsafe {
@@ -541,7 +514,7 @@ fn master_post_fork_recovery(
 
     // Reset the SAL for fresh use, now that every worker has recovered, above the
     // same `walk_epoch` the workers were launched with.
-    disp.boot_rewind_sal(walk_epoch);
+    disp.sal().lock_exclusive().boot_rewind(walk_epoch);
 
     inject_recovery_panic("reset");
 
@@ -609,9 +582,6 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
 
     let ipc = acquire_shared_ipc(data_dir, nw)?;
     gnitz_debug!("SAL fd={}", ipc.sal_fd);
-    for w in 0..nw {
-        gnitz_debug!("W{} m2w_efd={}", w, ipc.m2w_efds[w]);
-    }
 
     // Leaked: it outlives every borrow the dispatcher and reactor hold, and
     // dropping it would run `CircuitState::drop`, which removes directories.
@@ -628,12 +598,13 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
         sal_len,
         walk_epoch,
         w2m_ptrs,
-        m2w_efds,
     } = ipc;
 
     // `recovery_start_generation_bump` has already run, so this is the floor
     // every base round must publish past.
     let boot_generation = catalog.durable_generation();
+    // SAFETY: every ring was initialized by `create_region` and is never unmapped.
+    let wakes = w2m_ptrs.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
     // 256 SQEs sets submit batching, not depth: a full SQ is flushed.
     let reactor = Rc::new(
         Reactor::new(256, Limits::from_env(), Rc::new(W2mReceiver::new(w2m_ptrs)))
@@ -643,9 +614,8 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
         worker_pids,
         catalog,
         boot_generation,
-        SalWriter::new(sal_ptr, sal_fd, sal_len, nw),
+        SalWriter::new(sal_ptr, sal_fd, sal_len, nw, wakes),
         reactor,
-        m2w_efds,
     ));
 
     master_post_fork_recovery(&dispatcher, walk_epoch, num_workers, &swept_bases)?;

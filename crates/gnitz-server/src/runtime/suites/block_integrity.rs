@@ -210,7 +210,8 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     let sal = TestLog::new(1 << 20, 2, 1);
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    let scope = sal.writer.begin(5, "test");
+    let mut excl = sal.writer.lock_exclusive();
+    let scope = excl.begin(5, "test");
     sal.push_group(5, 16, schema, &batch, |g| scope.write(g, true));
     scope.commit().expect("sentinel fits");
 

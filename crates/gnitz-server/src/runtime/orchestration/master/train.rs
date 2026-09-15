@@ -4,104 +4,78 @@
 use super::*;
 
 /// A decode failure on one frame of a reply train, named after the verb `what`.
-fn scan_decode_err(w: usize, what: &str, e: &str) -> WireFault {
-    format!("{what}: worker {w}: decode error: {e}").into()
+fn scan_decode_err(slot: &W2mSlot, what: &str, e: &str) -> WireFault {
+    format!("{what}: worker {}: decode error: {e}", slot.worker).into()
 }
 
-/// One frame header of worker `w`'s train and whether more frames follow, or `Err`
+/// One frame header of a train and whether more frames follow, or `Err`
 /// (prefixed with `what`) on a fault frame or a corrupt header. Dropping the
 /// caller's scan lease discards the rest of the train.
-fn parse_train_header(
-    slot: &W2mSlot,
-    w: usize,
-    what: &str,
-) -> Result<(gnitz_wire::control::DecodedControl, bool), WireFault> {
-    let ctrl = peek_control_block(slot.bytes(), false).map_err(|e| scan_decode_err(w, what, e))?;
-    if let Some(e) = super::worker_error(w, what, &ctrl) {
+fn parse_train_header(slot: &W2mSlot, what: &str) -> Result<(gnitz_wire::control::DecodedControl, bool), WireFault> {
+    let ctrl = peek_control_block(slot.bytes(), false).map_err(|e| scan_decode_err(slot, what, e))?;
+    if let Some(e) = super::worker_error(slot.worker as usize, what, &ctrl) {
         return Err(e);
     }
     let has_more = !ctrl.flags.scan_last;
     Ok((ctrl, has_more))
 }
 
-/// Worker `w`'s train frame in `slot`: whether more frames follow, and its rows
-/// decoded against `expected`.
+/// The train frame in `slot`: whether more frames follow, and its rows decoded
+/// against `expected`.
 pub(super) fn decode_train_slot<'a>(
     slot: &'a W2mSlot,
-    w: usize,
     what: &str,
     expected: &SchemaDescriptor,
     offsets: &'a mut [usize; gnitz_store::storage::MAX_BATCH_REGIONS],
 ) -> Result<(bool, Option<gnitz_store::storage::MemBatch<'a>>), WireFault> {
-    let (ctrl, has_more) = parse_train_header(slot, w, what)?;
-    let batch =
-        wire::decode_train_frame(slot.bytes(), &ctrl, expected, offsets).map_err(|e| scan_decode_err(w, what, &e))?;
+    let (ctrl, has_more) = parse_train_header(slot, what)?;
+    let batch = wire::decode_train_frame(slot.bytes(), &ctrl, expected, offsets)
+        .map_err(|e| scan_decode_err(slot, what, &e))?;
     Ok((has_more, batch))
 }
 
-/// Drain every worker's train in worker order, handing `on_batch` each non-empty
-/// frame's rows and byte length. A block-less frame decodes against `expected`;
-/// a frame whose own block disagrees with it — a worker lagging a DDL — is an error.
+/// Drain every reply train of `lease` in reply order, handing `on_batch` each
+/// non-empty frame's rows. A block-less frame decodes against `expected`; a frame
+/// whose own block disagrees with it — a worker lagging a DDL — is an error.
 pub(super) async fn drain_index_scan(
-    slots: Vec<W2mSlot>,
-    scan: &ScanDispatch,
+    lease: &Lease,
     what: &str,
     expected: &SchemaDescriptor,
-    mut on_batch: impl FnMut(&gnitz_store::storage::MemBatch<'_>, usize) -> Result<(), WireFault>,
+    mut on_batch: impl FnMut(&gnitz_store::storage::MemBatch<'_>) -> Result<(), WireFault>,
 ) -> Result<(), WireFault> {
-    for (i, mut slot) in slots.into_iter().enumerate() {
-        let w = scan.worker(i);
+    for i in 0..lease.len() {
         loop {
-            let frame_len = slot.bytes().len();
+            let slot = lease.next_frame(i).await;
             let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-            let (has_more, batch) = decode_train_slot(&slot, w, what, expected, &mut offsets)?;
+            let (has_more, batch) = decode_train_slot(&slot, what, expected, &mut offsets)?;
             if let Some(mb) = batch.filter(|mb| !mb.is_empty()) {
-                on_batch(&mb, frame_len)?;
+                on_batch(&mb)?;
             }
-            drop(slot);
             if !has_more {
                 break;
             }
-            slot = scan.next_frame(i).await;
         }
     }
     Ok(())
 }
 
-/// Forward each already-awaited worker scan train to the client in reply order.
-/// `Ok(false)` on client disconnect, `Err` on a worker fault / malformed train.
-/// Whether a frame is corked beside its neighbours or sent alone is
-/// `Peer::send`'s decision, so a run of small single-frame replies leaves in one
-/// egress operation.
-pub(super) async fn forward_scan_slots(
-    peer: &Peer,
-    slots: Vec<W2mSlot>,
-    scan: &ScanDispatch,
-) -> Result<bool, WireFault> {
-    for (i, slot) in slots.into_iter().enumerate() {
-        if !drain_scan_train(peer, scan, i, slot).await? {
+/// Forward every reply train of `lease` to `peer` in reply order. `Ok(false)` on
+/// client disconnect; `Err` on the first worker fault, leaving the rest undrained.
+pub(crate) async fn forward_scan(peer: &Peer, lease: &Lease) -> Result<bool, WireFault> {
+    for i in 0..lease.len() {
+        if !drain_scan_train(peer, lease, i).await? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// Forward reply `i`'s train to the client: send each frame to `peer` (dropping
-/// it before awaiting the next, per the W2M ring contract) and loop until the
-/// header reports no more frames. `slot` is the first, already-awaited frame.
-/// `Ok(false)` if the client disconnects mid-stream, `Err` on a malformed train
-/// header.
-///
-/// A frame carrying neither rows nor a schema block is dropped, releasing its ring
-/// slot at once; the client's train end is the master's terminal frame.
-///
-/// A send carries the eviction deadline: a client that stops draining a
-/// zero-copy slot is evicted, rc goes negative, and the caller drops the scan's
-/// lease, discarding the rest of the train and advancing release_cursor so the
-/// worker unblocks.
-async fn drain_scan_train(peer: &Peer, scan: &ScanDispatch, i: usize, mut slot: W2mSlot) -> Result<bool, WireFault> {
+/// Forward reply `i`'s train to `peer`, skipping frames that carry nothing the
+/// client reads. `Ok(false)` if the client is gone.
+async fn drain_scan_train(peer: &Peer, lease: &Lease, i: usize) -> Result<bool, WireFault> {
     loop {
-        let (ctrl, has_more) = parse_train_header(&slot, scan.worker(i), "scan")?;
+        let slot = lease.next_frame(i).await;
+        let (ctrl, has_more) = parse_train_header(&slot, "scan")?;
         if !ctrl.flags.has_data && !ctrl.flags.has_schema {
             drop(slot);
         } else if peer.send(slot).await < 0 {
@@ -110,7 +84,6 @@ async fn drain_scan_train(peer: &Peer, scan: &ScanDispatch, i: usize, mut slot: 
         if !has_more {
             break;
         }
-        slot = scan.next_frame(i).await;
     }
     Ok(true)
 }

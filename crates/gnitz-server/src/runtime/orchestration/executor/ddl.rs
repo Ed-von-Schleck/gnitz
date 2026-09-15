@@ -26,6 +26,7 @@ use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
+use crate::runtime::sal::SalExcl;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::Relation;
@@ -47,9 +48,7 @@ static DDL_QUIESCE_PENDING: AtomicU64 = AtomicU64::new(0);
 /// window ends on every exit path of `handle_ddl_txn`.
 ///
 /// While the depth is non-zero no checkpoint round may run: its drain would
-/// never complete against a parked tick loop, and the committer's rounds would
-/// hold `sal_writer_excl` while the DDL's exclusive rounds, which poll no task,
-/// write under none.
+/// never complete against a parked tick loop.
 struct TickGate {
     /// See [`TickPark`]: dropping it releases the tick loop.
     _release: TickPark,
@@ -132,7 +131,7 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
 /// on its `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot block every other reader
 /// for the length of the window. Sound outside the tick gate too: the quiesce
 /// exists to keep a worker from being mid-epoch at *broadcast* time, and the body
-/// returns only after the broadcast, its `signal_all` and the fsync.
+/// returns only after the broadcast, its wake and the fsync.
 ///
 /// No schema block: a `DDL_TXN` names no relation (its reply target is `0`), so
 /// one could only describe a relation that does not exist.
@@ -250,7 +249,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // start under the write lock. A live train's client egress (each send bounded by
     // `client_send_timeout`) holds this DDL, and every reader behind it, until it ends.
     if view_create || shared.disp().derived_needs_restamp() {
-        shared.reactor.trains_idle().await;
+        shared.disp().reactor().trains_idle().await;
     }
 
     // Pre-flight global uniqueness for every unique secondary index in this
@@ -355,10 +354,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // zone_lsn, close the zone with the commit sentinel, then fsync. A failure
     // here is unrecoverable — workers already applied the DdlSync groups in
     // real time — so abort.
-    let fsync_fut = {
-        let _sal_excl = shared.disp().sal_excl().lock().await;
-        emit_zone_to_sal(shared, "DDL", zone_lsn)
-    };
+    let fsync_fut = emit_zone_to_sal(shared, &mut shared.disp().sal().lock().await, "DDL", zone_lsn);
     publish_after_fsync(&shared.lsn_alloc, "DDL", zone_lsn, fsync_fut).await;
 
     // Invalidate unique-filter state for durably-dropped tables/indices so a
@@ -414,17 +410,19 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
 /// write each under `zone_lsn`, close with the commit sentinel, and submit the
 /// fdatasync SQE. Draining here rather than at each caller is what stops a queued
 /// broadcast riding the *next* zone's LSN.
-///
-/// Caller holds `sal_writer_excl`, so reservation order == SAL write order. Every
-/// failure aborts: this runs after the in-memory catalog mutation, so a partial
-/// emit diverges master and worker permanently.
-fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> impl Future<Output = i32> {
+/// Aborts on failure: the catalog is already mutated in memory.
+fn emit_zone_to_sal(
+    shared: &Shared,
+    excl: &mut SalExcl<'_>,
+    op: &'static str,
+    zone_lsn: u64,
+) -> impl Future<Output = i32> {
     let disp = shared.disp();
     let drained = shared.cat_mut().drain_pending_broadcasts();
     // Nothing inside the scope is visible until it commits, so a refused group
     // leaves no half-written zone behind. The block is synchronous throughout,
     // which is what the scope requires.
-    let scope = disp.begin(zone_lsn, "ddl");
+    let scope = excl.begin(zone_lsn, "ddl");
     let emitted = guard_panic(op, || {
         // The wire carries the family as its tid; this is the one place the
         // typed family narrows.
@@ -442,8 +440,7 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> impl Fu
     if let Err(e) = scope.commit() {
         gnitz_fatal_abort!("{} commit sentinel was refused, so its zone never published: {}", op, e);
     }
-    disp.signal_all();
-    shared.reactor.fsync(shared.disp().sal_fd())
+    disp.reactor().fsync(disp.sal().sal_fd())
 }
 
 /// Await `fsync`, then publish `zone`. Paired for the same reason
@@ -491,7 +488,7 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
             return Err(format!("sequence {seq_id} is not a base table"));
         }
 
-        let _sal_excl = shared.disp().sal_excl().lock().await;
+        let mut excl = shared.disp().sal().lock().await;
 
         let (base, delta, zone_floor) = shared.cat_mut().reserve_user_sequence(seq_id, count);
         let zone_lsn = shared.lsn_alloc.reserve(zone_floor);
@@ -504,10 +501,11 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         }
         shared.cat_mut().pin_queued_to_zone(zone_lsn);
 
-        // SAL emission under the still-held sal_writer_excl; the fdatasync SQE is
+        // SAL emission under the still-held `SalExcl`; the fdatasync SQE is
         // submitted synchronously. Both guards drop as this block ends, before
         // the await below.
-        (base, zone_lsn, emit_zone_to_sal(shared, "serial-range", zone_lsn))
+        let fsync_fut = emit_zone_to_sal(shared, &mut excl, "serial-range", zone_lsn);
+        (base, zone_lsn, fsync_fut)
     };
 
     publish_after_fsync(&shared.lsn_alloc, "serial range", zone_lsn, fsync_fut).await;

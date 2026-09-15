@@ -24,6 +24,9 @@
 //! and is the only way to reach either, so the read-modify-writes the protocol
 //! needs cannot be written any other way.
 //!
+//! `sal_park` is the reverse channel's: the worker sleeps on it for a SAL group,
+//! and the master's [`SalWake`] ends the sleep.
+//!
 //! Who *clears* a flag differs by direction, and that asymmetry is load-bearing.
 //! [`wake_master`] takes the gate, so the publishes that follow until the master
 //! re-arms skip the syscall: a master parks only when the ring reads empty, so
@@ -134,6 +137,9 @@ const FLAG_WRITER_PARKED: u32 = 1 << 0;
 /// Set by the reactor while its `FUTEX_WAITV` SQE is armed on `write_cursor` —
 /// the master's one park, and the worker's publish gate, taken by [`wake_master`].
 const FLAG_MASTER_WAITV: u32 = 1 << 1;
+/// Set by the worker while parked on `sal_park` for a SAL group; set and
+/// cleared by the worker only.
+const FLAG_SAL_PARKED: u32 = 1 << 2;
 
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, one cache line per writer)
@@ -198,6 +204,8 @@ impl ParkWord {
 ///   64   writer_park.cursor   release_cursor: the reusable-bytes boundary
 ///   72   writer_park.flags    FLAG_WRITER_PARKED, cleared by the worker
 ///   80   capacity             immutable after init_region
+///   88   sal_park.cursor      a wake sequence, written by the master's SalWake
+///   96   sal_park.flags       FLAG_SAL_PARKED, set and cleared by the worker
 /// ```
 #[repr(C, align(64))]
 struct W2mRingHeader {
@@ -206,7 +214,8 @@ struct W2mRingHeader {
 
     writer_park: ParkWord,
     capacity: AtomicU64,
-    _pad_consumer: [u8; 40],
+    sal_park: ParkWord,
+    _pad_consumer: [u8; 24],
 }
 
 const _: () = assert!(std::mem::size_of::<W2mRingHeader>() == W2M_HEADER_SIZE);
@@ -218,6 +227,8 @@ const _: () = assert!(std::mem::offset_of!(W2mRingHeader, master_park.flags) == 
 const _: () = assert!(std::mem::offset_of!(W2mRingHeader, writer_park.cursor) == 64);
 const _: () = assert!(std::mem::offset_of!(W2mRingHeader, writer_park.flags) == 72);
 const _: () = assert!(std::mem::offset_of!(W2mRingHeader, capacity) == 80);
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, sal_park.cursor) == 88);
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, sal_park.flags) == 96);
 
 impl W2mRingHeader {
     /// Reinterpret the start of a W2M mmap region as its header. The mapping is
@@ -487,6 +498,53 @@ fn wake_master(park: &ParkWord, flags: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// The SAL park: master→worker, on the worker's own ring
+// ---------------------------------------------------------------------------
+
+/// The master's wake for one worker parked on the SAL.
+pub(crate) struct SalWake {
+    park: &'static ParkWord,
+}
+
+impl SalWake {
+    /// # Safety
+    /// `ring` is a live W2M region initialized by `init_region`.
+    pub(crate) unsafe fn new(ring: *mut u8) -> Self {
+        SalWake {
+            park: &W2mRingHeader::from_raw(ring).sal_park,
+        }
+    }
+
+    /// The master is the word's only writer; +1 always moves its low 32 bits.
+    pub(crate) fn wake(&self) {
+        let seq = self.park.cursor.load(Ordering::Relaxed) + 1;
+        if self.park.publish(seq) & FLAG_SAL_PARKED != 0 {
+            futex_wake_u32(futex_word(&self.park.cursor), 1, "SalWake::wake");
+        }
+    }
+}
+
+/// A worker's park on the SAL, ended by the master's [`SalWake`].
+pub(crate) struct SalPark {
+    park: &'static ParkWord,
+}
+
+impl SalPark {
+    /// Sleep until the master's next wake, unless `still_empty` says otherwise.
+    /// No timeout: `PR_SET_PDEATHSIG` kills the worker when the master dies.
+    pub(crate) fn park(&self, still_empty: impl FnOnce() -> bool) {
+        let snap = self.park.arm(FLAG_SAL_PARKED);
+        if still_empty() {
+            let entry = futex_waitv_entry(futex_word(&self.park.cursor), snap as u32);
+            if let Parked::Failed(errno) = futex_waitv_u32(&[entry], -1) {
+                futex_failed("SalPark::park", errno);
+            }
+        }
+        self.park.disarm(FLAG_SAL_PARKED);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // init / reserve / commit
 // ---------------------------------------------------------------------------
 
@@ -679,6 +737,13 @@ impl W2mWriter {
         }
     }
 
+    /// This ring's SAL park.
+    pub(crate) fn sal_park(&self) -> SalPark {
+        SalPark {
+            park: &self.cursor.get().header().sal_park,
+        }
+    }
+
     /// Send a bare control frame: a status and optional error text, no schema
     /// and no rows. Every ACK and error reply on the ring has this shape, and it
     /// ends whatever train it answers.
@@ -785,6 +850,8 @@ pub struct W2mSlot {
     /// `try_reserve`. Used by the master to route scan responses without
     /// decoding the wire frame.
     pub(crate) internal_req_id: u32,
+    /// The worker whose ring this slot was read from.
+    pub(crate) worker: u32,
     /// The ring's `InFlightState`, which lives inside a `Box<[WorkerRing]>` that
     /// has no `push`, so its address is stable for the receiver's life. The
     /// `W2mReceiver` must outlive every slot; `ReactorShared::w2m` names what
@@ -803,22 +870,22 @@ impl W2mSlot {
     }
 
     /// Decode the slot's frame, aborting on failure: the ring is a trusted
-    /// mapping, so a malformed slot is corruption. `worker` names the ring.
-    pub(crate) fn decode(&self, worker: usize) -> DecodedWire {
+    /// mapping, so a malformed slot is corruption.
+    pub(crate) fn decode(&self) -> DecodedWire {
         match decode_wire_ipc(self.bytes()) {
             Ok(decoded) => decoded,
-            Err(e) => gnitz_fatal_abort!("w2m: worker={} slot decode failed: {:?} — ring corrupt", worker, e),
+            Err(e) => gnitz_fatal_abort!("w2m: worker={} slot decode failed: {:?} — ring corrupt", self.worker, e),
         }
     }
 
     /// The slot's control block alone, aborting on failure as `decode` does — for
     /// an ACK, whose only content is its status and error text.
-    pub(crate) fn control(&self, worker: usize) -> DecodedControl {
+    pub(crate) fn control(&self) -> DecodedControl {
         match peek_control_block(self.bytes(), false) {
             Ok(ctrl) => ctrl,
             Err(e) => gnitz_fatal_abort!(
                 "w2m: worker={} slot control decode failed: {} — ring corrupt",
-                worker,
+                self.worker,
                 e
             ),
         }
@@ -863,7 +930,7 @@ impl WorkerRing {
     /// # Safety
     /// The master must be the sole consumer on this ring.
     #[inline]
-    unsafe fn take_next(&self) -> Option<W2mSlot> {
+    unsafe fn take_next(&self, worker: u32) -> Option<W2mSlot> {
         let state = self.in_flight.get();
         let st = &mut *state;
         let base: *const u8 = st.read.base;
@@ -907,7 +974,13 @@ impl WorkerRing {
 
         let push_idx = st.front_idx + st.queue.len() as u64;
         st.queue.push_back((st.read.virt, false));
-        Some(W2mSlot { frame, push_idx, internal_req_id, state })
+        Some(W2mSlot {
+            frame,
+            push_idx,
+            internal_req_id,
+            worker,
+            state,
+        })
     }
 }
 
@@ -940,7 +1013,7 @@ impl W2mReceiver {
     /// the writer the bytes are reusable.
     pub fn try_read_slot(&self, worker: usize) -> Option<W2mSlot> {
         // SAFETY: the master thread is the sole consumer of every ring.
-        unsafe { self.rings[worker].take_next() }
+        unsafe { self.rings[worker].take_next(worker as u32) }
     }
 
     /// Arm the reactor's `FUTEX_WAITV` park on every ring, filling `out` with the

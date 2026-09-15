@@ -55,6 +55,11 @@ impl Lease {
         self.base as u64
     }
 
+    /// How many request ids the lease holds.
+    pub(crate) fn len(&self) -> usize {
+        self.len as usize
+    }
+
     fn ids(&self) -> Range<u32> {
         self.base..self.base + self.len
     }
@@ -100,32 +105,6 @@ impl Lease {
             Some(Route::Ack { ack: Some((w, ctrl)), .. }) => check(*w, ctrl),
             _ => None,
         })
-    }
-
-    /// The first frame of every id, in id order.
-    pub(crate) async fn first_frames(&self) -> Vec<W2mSlot> {
-        std::future::poll_fn(|cx| {
-            let mut routes = self.inner.routes.borrow_mut();
-            // Park on every empty queue before popping any: a frame popped before
-            // another queue is found empty would be lost with this poll.
-            let mut pending = false;
-            for id in self.ids() {
-                let q = train(&mut routes, id);
-                if q.is_empty() {
-                    q.park(cx);
-                    pending = true;
-                }
-            }
-            if pending {
-                return Poll::Pending;
-            }
-            Poll::Ready(
-                self.ids()
-                    .map(|id| train(&mut routes, id).pop().expect("every queue checked non-empty"))
-                    .collect(),
-            )
-        })
-        .await
     }
 
     /// The next frame on id `i`.

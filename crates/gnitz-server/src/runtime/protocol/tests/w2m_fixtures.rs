@@ -24,3 +24,11 @@ pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> Shar
     let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * slot_stride(msg_sz) + slack;
     test_ring(capacity as usize)
 }
+
+/// The wake sequence the master's `SalWake` has published on `ring`.
+///
+/// # Safety
+/// As [`test_ring`]: `ring` is a live, initialized region.
+pub(crate) unsafe fn sal_wake_seq(ring: *mut u8) -> u64 {
+    W2mRingHeader::from_raw(ring).sal_park.cursor.load(Ordering::Acquire)
+}

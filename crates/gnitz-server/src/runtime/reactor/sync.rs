@@ -125,6 +125,11 @@ impl AsyncMutex {
     pub fn lock(&self) -> WriteFuture {
         self.0.write()
     }
+
+    /// The guard, iff nothing holds the lock now.
+    pub fn try_lock(&self) -> Option<WriteGuard> {
+        self.0.try_write()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +181,17 @@ impl AsyncRwLock {
 
     pub fn write(&self) -> WriteFuture {
         WriteFuture { lock: self.clone(), parked: false }
+    }
+
+    /// The write guard iff [`RwLockInner::write_ok`]: nobody holds the lock in
+    /// either mode. A parked writer does not refuse it.
+    pub fn try_write(&self) -> Option<WriteGuard> {
+        let mut s = self.0.borrow_mut();
+        if !s.write_ok() {
+            return None;
+        }
+        s.has_writer = true;
+        Some(WriteGuard { lock: self.clone() })
     }
 
     /// Wake every future the current state now admits — writers first, readers

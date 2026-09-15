@@ -8,7 +8,7 @@ use gnitz_store::relation::Relation;
 use gnitz_store::schema::key::probe_key;
 
 // For each `(table_id, col_indices)` we keep a set of the OPK spans known to
-// exist in that unique index. The U-SEC rule (`txn_check_unique_indices`)
+// exist in that unique index. The U-SEC rule (`plan_unique_checks`)
 // consults it before building a broadcast: if every new span is definitely
 // absent, that index's broadcast is skipped entirely.
 //
@@ -107,17 +107,17 @@ impl UniqueFilter {
 pub(super) struct WarmupGuard<'d> {
     pub(super) disp: &'d MasterDispatcher,
     pub(super) table_id: i64,
-    /// The column list per cold filter — the `unique_filters` map key, so the
-    /// drop handler removes exactly the entries this warmup created.
-    pub(super) keys: Vec<PkColList>,
+    /// The cold filters this warmup created, by the `unique_filters` map key, so
+    /// the drop handler removes exactly those.
+    pub(super) missing: Vec<UniqueIndexDesc>,
     pub(super) disarmed: bool,
 }
 
 impl Drop for WarmupGuard<'_> {
     fn drop(&mut self) {
         if !self.disarmed {
-            for &cols in &self.keys {
-                self.disp.unique_filter_remove(self.table_id, cols);
+            for d in &self.missing {
+                self.disp.unique_filter_remove(self.table_id, d.cols);
             }
         }
     }
@@ -191,14 +191,17 @@ impl MasterDispatcher {
     /// yet warm (warmup will pick them up), and for non-unique circuits. Walks
     /// the circuit list in place: this runs per live group per commit.
     pub(crate) fn unique_filter_ingest_batch(&self, table_id: i64, batch: &Batch) {
-        let registry = self.cat().registry();
-        if !registry.relation(table_id).is_some_and(Relation::has_unique_index) {
+        let Some(relation) = self
+            .cat()
+            .registry()
+            .relation(table_id)
+            .filter(|r| r.has_unique_index())
+        else {
             return;
-        }
-        let circuits = registry.relation(table_id).map_or(&[][..], Relation::indexes);
+        };
         let mb = batch.as_mem_batch();
         let mut filters = self.unique_filters.borrow_mut();
-        for ic in circuits.iter().filter(|ic| ic.is_unique()) {
+        for ic in relation.indexes().iter().filter(|ic| ic.is_unique()) {
             let Some(filter) = filters.get_mut(&(table_id, ic.cols())) else {
                 continue; // not warm — warmup will pick this up
             };
@@ -232,96 +235,83 @@ impl MasterDispatcher {
         filter.warm = true; // pre-flight scanned every worker under the write lock
         self.unique_filters.borrow_mut().insert((table_id, cols), filter);
     }
-}
 
-/// Populate every not-yet-warm unique filter on `table_id` from a full scan
-/// of the committed table, feeding each worker's reply frames straight into
-/// the filters. Nothing is concatenated master-side: on a table of tens of
-/// millions of rows a merged `Batch` would peak at the whole scan size.
-pub(super) async fn ensure_unique_filters_warm(disp: &MasterDispatcher, table_id: i64) -> Result<(), WireFault> {
-    let (missing, mut guard): (Vec<UniqueIndexDesc>, WarmupGuard) = {
-        let mut filters = disp.unique_filters.borrow_mut();
-        // Tested before it is built: the steady state is that every filter is
-        // already warm, and that answer costs no allocation.
-        let cold = |ic: &gnitz_store::relation::SecondaryIndex| {
-            ic.is_unique() && !filters.contains_key(&(table_id, ic.cols()))
+    /// Warm every cold unique filter on `table_id` from a scan of the table, one
+    /// reply frame at a time.
+    pub(super) async fn ensure_unique_filters_warm(&self, table_id: i64) -> Result<(), WireFault> {
+        let mut guard = {
+            let mut filters = self.unique_filters.borrow_mut();
+            // Tested before it is built: the steady state is that every filter is
+            // already warm, and that answer costs no allocation.
+            let cold = |ic: &gnitz_store::relation::SecondaryIndex| {
+                ic.is_unique() && !filters.contains_key(&(table_id, ic.cols()))
+            };
+            let circuits = self
+                .cat()
+                .registry()
+                .relation(table_id)
+                .map_or(&[][..], Relation::indexes);
+            if !circuits.iter().any(&cold) {
+                return Ok(());
+            }
+            let missing: Vec<UniqueIndexDesc> = circuits
+                .iter()
+                .filter(|ic| cold(ic))
+                .map(|ic| UniqueIndexDesc { cols: ic.cols(), spec: ic.key_spec() })
+                .collect();
+            for d in &missing {
+                filters.insert((table_id, d.cols), UniqueFilter::new());
+            }
+            WarmupGuard {
+                disp: self,
+                table_id,
+                missing,
+                disarmed: false,
+            }
         };
-        let circuits = disp
-            .cat()
-            .registry()
-            .relation(table_id)
-            .map_or(&[][..], Relation::indexes);
-        if !circuits.iter().any(&cold) {
-            return Ok(());
-        }
-        let missing: Vec<UniqueIndexDesc> = circuits
-            .iter()
-            .filter(|ic| cold(ic))
-            .map(|ic| UniqueIndexDesc { cols: ic.cols(), spec: ic.key_spec() })
-            .collect();
-        for d in &missing {
-            filters.insert((table_id, d.cols), UniqueFilter::new());
-        }
-        let guard = WarmupGuard {
-            disp,
-            table_id,
-            keys: missing.iter().map(|d| d.cols).collect(),
-            disarmed: false,
-        };
-        (missing, guard)
-    };
-    let schema = disp.schema_desc_for(table_id);
+        let schema = self.schema_desc_for(table_id);
+        // The reader holds the table's current schema, so no worker ships a block.
+        let (_, schema_version) = self.cat().negotiated_schema_block(table_id, 0, |_| None);
 
-    // Cost only, not correctness: the filter is a set, so a fan-out's `nw`
-    // copies of every row dedup away — but the extra `nw - 1` full-table
-    // scans are pure waste.
-    let unicast = read_fanout(disp, table_id);
+        let route = self.read_route(table_id, None);
+        let leases = self
+            .scan_cut(1, |cut| {
+                cut.push(route.set, |excl, targets| {
+                    excl.write(&DirectGroup {
+                        template: wire::WireMsg {
+                            target_id: table_id as u64,
+                            flags: WireFlags { schema_version, ..Default::default() },
+                            ..Default::default()
+                        },
+                        targets,
+                        ..DirectGroup::new(SalMessageKind::Scan)
+                    })
+                })
+            })
+            .await?;
 
-    // `scan` holds the lease across the full continuation drain below; its workers
-    // stream multi-frame trains, and on an early error return (or a
-    // mid-scan cancellation) the lease drop discards every undrained
-    // frame at the ring boundary.
-    let (slots, scan) = dispatch_scan_fanout(disp, unicast, |targets| {
-        disp.write_group(&DirectGroup {
-            template: wire::WireMsg {
-                target_id: table_id as u64,
-                ..Default::default()
-            },
-            targets,
-            ..DirectGroup::new(SalMessageKind::Scan)
+        drain_index_scan(&leases[0], "scan", &schema, |mb| {
+            let mut filters = self.unique_filters.borrow_mut();
+            for d in &guard.missing {
+                if let Some(filter) = filters.get_mut(&(table_id, d.cols)) {
+                    extract_into_filter(filter, mb, &d.spec);
+                }
+            }
+            Ok(())
         })
-    })
-    .await?;
+        .await?;
 
-    // Drain every worker's continuation-frame train into the cold filters.
-    // `drain_index_scan` owns the early-return error contract (the lease
-    // drop above discards any undrained frames at the ring boundary), the
-    // schema guard against DDL-lagged worker replies, the zero-copy
-    // `MemBatch` lifetime, and the continuation-schema-hint handling.
-    // On failure (worker crash mid-scan or cancellation) the guard is left
-    // armed, so its Drop removes the cold entries and the next validation
-    // retries warmup from scratch.
-    drain_index_scan(slots, &scan, "scan", &schema, |mb, _| {
-        let mut filters = disp.unique_filters.borrow_mut();
-        for d in &missing {
-            if let Some(filter) = filters.get_mut(&(table_id, d.cols)) {
-                extract_into_filter(filter, mb, &d.spec);
+        // Fully populated → mark warm so the broadcast-skip shortcut may trust
+        // them, and disarm the guard so its Drop leaves them in place.
+        let mut filters = self.unique_filters.borrow_mut();
+        for d in &guard.missing {
+            if let Some(f) = filters.get_mut(&(table_id, d.cols)) {
+                f.warm = true;
             }
         }
+        guard.disarmed = true;
         Ok(())
-    })
-    .await?;
-
-    // Fully populated → mark warm so the broadcast-skip shortcut may trust
-    // them, and disarm the guard so its Drop leaves them in place.
-    let mut filters = disp.unique_filters.borrow_mut();
-    for d in &missing {
-        if let Some(f) = filters.get_mut(&(table_id, d.cols)) {
-            f.warm = true;
-        }
     }
-    guard.disarmed = true;
-    Ok(())
 }
 
 #[cfg(test)]

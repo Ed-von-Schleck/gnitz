@@ -106,16 +106,12 @@ impl WorkerProcess {
         client_version: u16,
     ) -> (Option<Rc<Vec<u8>>>, u16) {
         match schema {
-            // Version 0: the table's version does not describe a projected
-            // schema, and reporting it would let the suppression below drop a
-            // block the reader still needs. At 0 nothing is ever suppressed.
-            ReplySchema::OneOff(s) => (Some(Rc::new(crate::catalog::encode_schema_block(s, tid_key as u32))), 0),
             // The dispatch arm already resolved the descriptor, so the
             // negotiation never has to look one up and cannot miss.
             ReplySchema::Table(s) => self
                 .cat()
                 .negotiated_schema_block(tid_key, client_version, |_| Some(*s)),
-            ReplySchema::ClientAuthored => (None, client_version),
+            ReplySchema::ReaderHeld => (None, client_version),
         }
     }
 
@@ -244,11 +240,10 @@ fn oversized_reply(sz: usize) -> gnitz_wire::WireFault {
 }
 
 /// What one pre-flight frame spends on everything that is not a key: the control
-/// block, the schema block, and the data block's header at zero rows. Charged
-/// against the budget before it is divided into keys, or the frame runs a
-/// kilobyte or two over. The first frame is the widest, so it bounds them all.
-pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor, schema_block: &[u8]) -> usize {
-    let framing = reply_frame(ReplyRoute::default(), Some(schema_block), 0, true).size();
+/// block and the data block's header at zero rows. Charged against the budget
+/// before it is divided into keys, or the frame runs over.
+pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor) -> usize {
+    let framing = reply_frame(ReplyRoute::default(), None, 0, true).size();
     framing + gnitz_store::storage::wire_block_size(frame_schema, 0, 0)
 }
 
@@ -270,8 +265,8 @@ pub(crate) fn preflight_keys_per_frame(frame_schema: &SchemaDescriptor, budget: 
 
 /// Stream the sorted OPK leading-key spans `keys` lends to the master as a train
 /// over `frame_schema` (`unique_preflight_wire_schema`, whose PK region is
-/// exactly one span). An empty producer emits one empty terminal frame so the
-/// master's drain still sees the train end.
+/// exactly one span), with no schema block. An empty producer emits one empty terminal
+/// frame so the master's drain still sees the train end.
 ///
 /// Deliberately NOT `send_scan_response`: that path materializes the reply as
 /// one `Batch`, which is what `keys` exists to avoid — this refills one chunk
@@ -289,19 +284,13 @@ pub(crate) fn send_unique_preflight_keys(
     budget: usize,
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {
-    let schema_block = crate::catalog::encode_schema_block(frame_schema, target_id as u32);
-    // Measured off the block this train actually ships, so what is charged and
-    // what is emitted cannot drift; the assertion in the loop is what says so.
-    let keys_per_frame = preflight_keys_per_frame(
-        frame_schema,
-        budget,
-        preflight_frame_overhead(frame_schema, &schema_block),
-    );
+    // The assertion in the loop is what says the charged overhead and the
+    // emitted frame agree.
+    let keys_per_frame = preflight_keys_per_frame(frame_schema, budget, preflight_frame_overhead(frame_schema));
 
     // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
     // front to exactly one frame's fill.
     let mut chunk = Batch::with_capacity(frame_schema, keys.remaining().min(keys_per_frame));
-    let mut is_first = true;
     loop {
         chunk.clear();
         let n = keys.remaining().min(keys_per_frame);
@@ -313,13 +302,11 @@ pub(crate) fn send_unique_preflight_keys(
             chunk.push_key_row(k, 1);
         }
         let is_last = keys.remaining() == 0;
-        // Schema block only on the first frame; continuations decode against the
-        // master's saved schema hint. The synthetic schema has no version.
+        // The synthetic schema has no version.
         let msg = WireMsg {
             target_id,
             flags: WireFlags::train_frame(0, is_last),
             data: WireData::Whole(&chunk),
-            schema_block: is_first.then_some(schema_block.as_slice()),
             ..Default::default()
         };
         // Over `budget` only at the one-key floor, where there is nothing left
@@ -330,7 +317,6 @@ pub(crate) fn send_unique_preflight_keys(
             msg.size().saturating_sub(budget),
         );
         w2m_writer.send_msg(request_id, &msg);
-        is_first = false;
         if is_last {
             break;
         }

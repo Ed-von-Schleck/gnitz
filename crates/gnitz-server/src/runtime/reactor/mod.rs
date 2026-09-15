@@ -149,7 +149,7 @@ struct ReactorShared {
     routes: RefCell<FxHashMap<u32, Route>>,
     /// The one [`Reactor::trains_idle`] awaiter, woken by every lease drop.
     trains_idle: Cell<Option<Waker>>,
-    /// The next request id a lease starts from. Never 0 (`AllUnaddressed`) and
+    /// The next request id a lease starts from. Never 0 (`Unaddressed`) and
     /// never [`W2M_EXCHANGE_RING_ID`]; see [`Reactor::lease`].
     next_request_id: Cell<u32>,
     /// In-flight one-shot ops, each holding what the kernel may still read until
@@ -262,7 +262,7 @@ impl Reactor {
         let mut routes = self.inner.routes.borrow_mut();
         let mut base = self.inner.next_request_id.get();
         loop {
-            // 0 is `GroupTargets::AllUnaddressed`'s id. The ids are `base..base + n`,
+            // 0 is `GroupTargets::Unaddressed`'s id. The ids are `base..base + n`,
             // exclusive, and `base + n` fits a `u32`, so `u32::MAX` — the exchange id —
             // is never handed out.
             if base == 0 || base.checked_add(n).is_none() {
@@ -319,7 +319,7 @@ impl Reactor {
                 routed = true;
                 let id = slot.internal_req_id;
                 if id == W2M_EXCHANGE_RING_ID {
-                    let frame = slot.decode(w);
+                    let frame = slot.decode();
                     drop(slot); // free the ring space before the round driver runs
                     self.inner.exchanges.borrow_mut().push((w, frame));
                     continue;
@@ -332,7 +332,7 @@ impl Reactor {
                     Some(Route::Ack { ack, waker }) => {
                         // A worker answers each request id once.
                         debug_assert!(ack.is_none(), "worker {w} answered request id {id} twice");
-                        *ack = Some((w, slot.control(w)));
+                        *ack = Some((w, slot.control()));
                         drop(slot);
                         if let Some(waker) = waker.take() {
                             waker.wake();

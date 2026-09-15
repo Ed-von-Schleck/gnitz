@@ -41,14 +41,7 @@ impl WorkerProcess {
         }
 
         loop {
-            // `_exit`, not `self.shutdown()`: the DAG evaluation up the stack
-            // holds a live `&mut` to the engine that its flush would alias.
-            // Nothing is lost — the master's death aborts the cluster, and
-            // recovery replays the SAL tail.
-            if m2w::eventfd_wait(self.m2w_efd, 30_000) == Wake::Idle && self.master_is_gone() {
-                unsafe { libc::_exit(0) }
-            }
-
+            self.w2m_writer.sal_park().park(|| self.sal_reader.is_empty());
             while let Some((msg, wire)) = self.next_sal_message() {
                 if let Some(hit) = self.dispatch_in_eval(want_key, &msg, wire) {
                     return (hit.batch, hit.decision);

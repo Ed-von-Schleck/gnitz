@@ -100,7 +100,7 @@ impl CatalogEngine {
     // -- Broadcast queue, zone pin, directory sweep -----------------------------
 
     /// Pin every queued family to `zone_lsn`. Called before anything awaits: a
-    /// checkpoint round holding `sal_excl` can flush the system tables before the
+    /// checkpoint round holding a `SalExcl` can flush the system tables before the
     /// zone is emitted.
     pub(crate) fn pin_queued_to_zone(&mut self, zone_lsn: u64) {
         for (family, _) in &self.pending_broadcasts {

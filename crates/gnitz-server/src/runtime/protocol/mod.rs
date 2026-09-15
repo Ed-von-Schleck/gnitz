@@ -1,6 +1,6 @@
-//! L7 protocol — the IPC wire format, the shared append-only log (SAL), the
-//! lock-free worker→master ring (`w2m`) and the master→worker wake channel
-//! (`m2w`).
+//! L7 protocol — the IPC wire format, the shared append-only log (SAL) and the
+//! lock-free worker→master ring (`w2m`), which also carries the worker's park on
+//! the SAL.
 //!
 //! A layer grouping, not a namespace callers name: `runtime/mod.rs` aliases these
 //! submodules, and `crate::runtime::<mod>` is how the whole subsystem reaches
@@ -10,7 +10,6 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-pub(super) mod m2w;
 pub(super) mod sal;
 pub(super) mod w2m;
 pub(super) mod wire;

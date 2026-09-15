@@ -1,6 +1,6 @@
-use super::super::fixtures::{test_dispatcher, test_dispatcher_with_efds, test_dispatcher_with_writers};
+use super::super::fixtures::{test_dispatcher, test_dispatcher_with_writers};
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
-use crate::runtime::sal::GroupTargets;
+use crate::runtime::sal::{GroupTargets, WorkerSet};
 use gnitz_foundation::posix_io::retry_eintr;
 
 /// Fork a child that exits immediately and block until it is a zombie *without*
@@ -52,7 +52,7 @@ fn check_workers_keeps_reporting_a_dead_worker() {
     assert_eq!(disp.check_workers(), Some(1), "and still reported once reaped");
     assert_eq!(disp.check_workers(), Some(1), "on every probe");
     assert_eq!(
-        *disp.worker_pids.borrow(),
+        disp.worker_pids,
         vec![live, zombie, reaped],
         "a probe leaves the pid set unchanged"
     );
@@ -71,7 +71,7 @@ fn ack_collection_errors_when_a_worker_is_dead() {
     for ctx in ["checkpoint base round", "backfill relay"] {
         let disp = test_dispatcher(vec![spawn_and_reap_dead()], std::ptr::null_mut());
         let err = disp
-            .exclusive_round(ctx, false, |_| Ok(()))
+            .exclusive_round(ctx, false, |_, _| Ok(()))
             .expect_err("a dead worker must fail ack collection");
         assert!(err.text.contains("worker 0") && err.text.contains(ctx), "{err}");
     }
@@ -83,8 +83,8 @@ fn ack_collection_errors_when_a_worker_is_dead() {
 fn an_exclusive_round_fails_on_a_worker_error_without_the_other_acks() {
     let (disp, writers) = test_dispatcher_with_writers(vec![0, 0]);
     let err = disp
-        .exclusive_round("backfill relay", false, |targets| {
-            let GroupTargets::All { base, .. } = targets else {
+        .exclusive_round("backfill relay", false, |_, targets| {
+            let GroupTargets::Leased { base, .. } = targets else {
                 unreachable!("an exclusive round broadcasts")
             };
             writers[0].send_status(0, base, gnitz_wire::WireStatus::Error, b"boom");
@@ -101,7 +101,7 @@ fn an_exclusive_round_fails_on_a_worker_error_without_the_other_acks() {
 fn an_exclusive_round_keeps_its_write_refusals_status() {
     let (disp, _writers) = test_dispatcher_with_writers(vec![0]);
     let err = disp
-        .exclusive_round("view tick drain", false, |_| {
+        .exclusive_round("view tick drain", false, |_, _| {
             Err(gnitz_wire::WireFault {
                 status: gnitz_wire::WireStatus::SalFull,
                 text: "SAL full".into(),
@@ -128,7 +128,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         engine.submit(SysFamily::Sequence, delta).unwrap();
 
         let disp = test_dispatcher(Vec::new(), &mut engine);
-        disp.checkpoint_post_ack().unwrap();
+        disp.checkpoint_post_ack(&mut disp.sal().lock_exclusive()).unwrap();
         drop(disp);
 
         // Crash semantics: no `engine.close()`, and no Drop impl — only what the
@@ -157,7 +157,7 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     let disp = test_dispatcher(Vec::new(), &mut engine);
     // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
     // before any group is written — what `server_main` does after worker ACKs.
-    disp.boot_rewind_sal(0);
+    disp.sal().lock_exclusive().boot_rewind(0);
 
     let gen = disp.cat().durable_generation();
     disp.reclaim_base().unwrap();
@@ -189,42 +189,86 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     engine.close();
 }
 
-/// `signal_reached` wakes exactly the workers a poll's fan-outs reached.
-///
-/// A group written to one worker costs one eventfd write, not W — the whole
-/// point of taking the fan-out list rather than broadcasting. Counted off real
-/// eventfds, so the assertion is on the syscall the master actually makes.
 #[test]
-fn signal_reached_wakes_only_the_workers_a_fanout_reached() {
-    use crate::runtime::m2w::{eventfd_create, eventfd_wait, Wake};
-    use crate::runtime::orchestration::master::Fanout;
+fn read_route_reaches_the_owners_a_bound_names() {
+    use super::super::route_read;
+    use gnitz_store::schema::Placement;
+    use gnitz_wire::{Cut, PkKeys, RangeDescriptor, ReadBound, ReadSpec};
 
     const NW: usize = 4;
-    let efds: Vec<i32> = (0..NW).map(|_| eventfd_create().expect("eventfd")).collect();
-    let disp = test_dispatcher_with_efds(vec![std::process::id() as i32; NW], efds.clone());
-
-    // Drains each counter, so a worker that was signalled reports `Signalled`
-    // exactly once and every other reports `Idle`.
-    let woken = |disp: &super::super::MasterDispatcher, fanouts: Vec<Fanout>| -> Vec<usize> {
-        disp.signal_reached(fanouts);
-        (0..NW)
-            .filter(|&w| eventfd_wait(efds[w], 0) == Wake::Signalled)
-            .collect()
+    let keyed = crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U64]);
+    let block = crate::catalog::encode_schema_block(&keyed, 1);
+    let key = |k: u64| k.to_be_bytes();
+    let set_blob = |keys: &[u64]| {
+        let keys: Vec<[u8; 8]> = keys.iter().map(|&k| key(k)).collect();
+        ReadSpec::all_rows(ReadBound::PkSet(PkKeys::from_keys(8, keys.iter().map(|k| &k[..])))).encode(&block)
     };
+    let owner = |k: u64| keyed.worker_for_pk(&key(k), NW);
+
+    let replicated = keyed.with_placement(Placement::Replicated);
+    for blob in [None, Some(set_blob(&[1, 2, 3]))] {
+        let r = route_read(Some(replicated), blob.as_deref(), NW);
+        assert_eq!((r.set, r.per_worker.is_none()), (WorkerSet::one(0), true), "replicated");
+    }
+
+    let point = ReadSpec::all_rows(ReadBound::PkRange(RangeDescriptor::new(
+        &[],
+        Cut::Before(42),
+        Cut::After(42),
+    )))
+    .encode(&block);
+    assert_eq!(
+        route_read(Some(keyed), Some(&point), NW).set,
+        WorkerSet::one(owner(42)),
+        "confined range"
+    );
 
     assert_eq!(
-        woken(&disp, vec![]),
-        Vec::<usize>::new(),
-        "nothing dispatched, nothing woken"
+        route_read(Some(keyed), Some(&set_blob(&[42])), NW).set,
+        WorkerSet::one(owner(42)),
+        "one owner"
     );
-    assert_eq!(woken(&disp, vec![Fanout::One(2)]), vec![2]);
-    assert_eq!(woken(&disp, vec![Fanout::One(3), Fanout::One(1)]), vec![1, 3]);
-    // A worker reached twice is still one wake, and a broadcast stops at the
-    // launched worker count rather than at the width of the mask word.
-    assert_eq!(woken(&disp, vec![Fanout::One(1), Fanout::One(1)]), vec![1]);
-    assert_eq!(woken(&disp, vec![Fanout::One(0), Fanout::Broadcast]), vec![0, 1, 2, 3]);
+    assert_eq!(
+        route_read(Some(keyed), Some(&set_blob(&[])), NW).set,
+        WorkerSet::one(0),
+        "empty set"
+    );
 
-    for fd in efds {
-        unsafe { libc::close(fd) };
+    // Two keys on two distinct owners: each is sent its own key and no other.
+    let (a, b) = (1..)
+        .map(|k| (0, k))
+        .find(|&(_, k)| owner(k) != owner(0))
+        .expect("keys spread");
+    let spread = route_read(Some(keyed), Some(&set_blob(&[a, b])), NW);
+    assert_eq!(spread.set, WorkerSet::one(owner(a)).with(owner(b)));
+    let per_worker = spread.per_worker.expect("a spread set splits");
+    assert_eq!(per_worker.len(), NW);
+    for (w, got) in per_worker.iter().enumerate() {
+        let want = if w == owner(a) {
+            set_blob(&[a])
+        } else if w == owner(b) {
+            set_blob(&[b])
+        } else {
+            Vec::new()
+        };
+        assert_eq!(*got, want, "worker {w} is sent exactly its own keys");
     }
+
+    let local = keyed.with_placement(Placement::Local);
+    assert_eq!(
+        route_read(Some(local), Some(&set_blob(&[a, b])), NW).set,
+        WorkerSet::ALL,
+        "Local"
+    );
+    let wide = crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U128]);
+    assert_eq!(
+        route_read(Some(wide), Some(&set_blob(&[a, b])), NW).set,
+        WorkerSet::ALL,
+        "a foreign stride"
+    );
+    assert_eq!(
+        route_read(None, None, NW).set,
+        WorkerSet::ALL,
+        "an unregistered relation"
+    );
 }

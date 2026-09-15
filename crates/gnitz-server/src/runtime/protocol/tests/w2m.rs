@@ -538,7 +538,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
             // everything the writer published was already consumed. Reading it
             // after would blame a frame the writer had not published yet.
             let writer_done = done.load(Ordering::Acquire);
-            match receiver.try_read_slot(0).map(|s| s.decode(0)) {
+            match receiver.try_read_slot(0).map(|s| s.decode()) {
                 Some(decoded) => {
                     assert_eq!(
                         decoded.control.request_id, next_expected,
@@ -570,7 +570,7 @@ fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pa
     // finishes rather than unwinding straight into `join`.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(drain));
     while !done.load(Ordering::Acquire) {
-        while receiver.try_read_slot(0).map(|s| s.decode(0)).is_some() {}
+        while receiver.try_read_slot(0).map(|s| s.decode()).is_some() {}
         std::thread::yield_now();
     }
     writer_thread.join().expect("writer thread");
@@ -601,9 +601,62 @@ fn w2m_control_only_reply_has_no_backing() {
 
     let receiver = W2mReceiver::new(vec![ptr]);
     let slot = receiver.try_read_slot(0).expect("an ACK");
-    assert_eq!(slot.control(0).request_id, 42);
+    assert_eq!(slot.control().request_id, 42);
     assert!(
-        slot.decode(0).data_batch.is_none(),
+        slot.decode().data_batch.is_none(),
         "control-only ACK must have no data_batch"
     );
+}
+
+/// A slot names the ring it was read from, which is what attributes a reply to
+/// its worker.
+#[test]
+fn a_slot_names_the_worker_whose_ring_it_was_read_from() {
+    let (a, b) = unsafe {
+        (
+            make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8),
+            make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8),
+        )
+    };
+    W2mWriter::new(b.ptr()).send_status(0, 7, WireStatus::Ok, b"");
+    let receiver = W2mReceiver::new(vec![a.ptr(), b.ptr()]);
+    assert!(receiver.try_read_slot(0).is_none());
+    assert_eq!(receiver.try_read_slot(1).expect("worker 1's frame").worker, 1);
+}
+
+/// A park whose re-test behind the armed flag finds a group returns without
+/// sleeping, and leaves the flag clear.
+#[test]
+fn a_sal_park_returns_at_once_when_its_retest_finds_a_group() {
+    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let writer = W2mWriter::new(region.ptr());
+    let mut armed_when_tested = false;
+    writer.sal_park().park(|| {
+        let hdr = unsafe { W2mRingHeader::from_raw(region.ptr()) };
+        armed_when_tested = hdr.sal_park.flags.load(Ordering::Acquire) & FLAG_SAL_PARKED != 0;
+        false
+    });
+    assert!(armed_when_tested, "the re-test runs behind the armed flag");
+    let hdr = unsafe { W2mRingHeader::from_raw(region.ptr()) };
+    assert_eq!(hdr.sal_park.flags.load(Ordering::Acquire), 0, "and the park disarms");
+}
+
+/// A worker parked on an empty SAL wakes on another process's `SalWake`.
+#[test]
+fn a_parked_worker_wakes_on_a_forked_masters_sal_wake() {
+    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let ptr = region.ptr();
+    let seq = || unsafe { super::fixtures::sal_wake_seq(ptr) };
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        std::thread::sleep(Duration::from_millis(50));
+        unsafe { SalWake::new(ptr) }.wake();
+        unsafe { libc::_exit(0) };
+    }
+    // "Empty" until the wake publishes: the condition a worker re-tests is the
+    // SAL's, and here the sequence stands in for it.
+    W2mWriter::new(ptr).sal_park().park(|| seq() == 0);
+    assert_eq!(seq(), 1, "the park ended on the wake");
+    unsafe { assert_child_exited_ok(pid) };
 }

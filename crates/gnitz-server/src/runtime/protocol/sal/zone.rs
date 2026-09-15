@@ -231,7 +231,7 @@ impl<'a> CommittedTail<'a> {
     /// pass 1. Sound because this runs only for a committed zone, whose span is
     /// by definition undamaged and so walks with no resync — and because zone
     /// LSNs are unique within a tail (`lsn_alloc.reserve` is monotone under
-    /// `sal_writer_excl`), so the span this finds is the zone's own.
+    /// a `SalExcl`), so the span this finds is the zone's own.
     ///
     /// "Decodes" is not "carries rows": a push whose rows all land on one worker
     /// leaves the other slots a control block alone — no schema and no data

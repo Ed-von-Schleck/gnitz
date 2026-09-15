@@ -8,7 +8,7 @@ use std::cell::Cell;
 /// may lead `published` (the durability watermark) while a zone's fdatasync is
 /// in flight; `published` never overtakes `reserved`. Every durable allocator
 /// reserves its zone LSN via [`reserve`](Self::reserve) — under
-/// `sal_writer_excl` (committer, SERIAL) or the catalog write lock with the
+/// a `SalExcl` (committer, SERIAL) or the catalog write lock with the
 /// committer quiesced (DDL), so reservation order == SAL write order — and
 /// publishes via [`publish`](Self::publish) only after its fsync completes, so
 /// readers never see an LSN whose data is not yet on disk.

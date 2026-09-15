@@ -1,11 +1,12 @@
 use super::fixtures::{group_and_next, group_at, TestLog};
 use super::{
     effective_max, group_digest, group_header_size, group_total_size, pack_prefix, DirectGroup, EpochGate, GroupData,
-    SalMessageKind, SalStep, CHECKPOINT_RESERVE, MIN_SAL_BYTES, OFF_DIGEST, OFF_KIND, OFF_ZONE_START, PREFIX_BYTES,
-    SENTINEL_SIZE,
+    GroupTargets, SalMessageKind, SalReader, SalStep, WorkerSet, CHECKPOINT_RESERVE, MIN_SAL_BYTES, OFF_DIGEST,
+    OFF_KIND, OFF_ZONE_START, PREFIX_BYTES, SENTINEL_SIZE,
 };
-use crate::runtime::m2w::{self, Wake};
-use crate::runtime::test_support::assert_child_exited_ok;
+use crate::runtime::test_support::{assert_child_exited_ok, try_poll_once};
+use crate::runtime::w2m::fixtures::sal_wake_seq;
+use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
 use crate::test_support::{make_batch_raw, sweep_bit_flips};
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
@@ -160,11 +161,8 @@ fn effective_max_reserves_by_kind() {
 
 #[test]
 fn checkpoint_reserve_holds_two_terminal_groups() {
-    // Two, not one: the watchdog's crash arm broadcasts a shutdown without the
-    // SAL mutex exactly while a committer flush round is parked awaiting the dead
-    // worker's ACK, so both can land in the reserve band. Derived from the
-    // constants so a wider control block or MAX_WORKERS trips here rather than in
-    // production.
+    // Derived from the constants so a wider control block or MAX_WORKERS trips
+    // here rather than in production.
     let terminal = worst_case_terminal_group();
     assert!(
         CHECKPOINT_RESERVE >= 2 * terminal + SENTINEL_SIZE,
@@ -290,12 +288,12 @@ fn zone_two_groups_one_sentinel() {
     }
 }
 
+/// A worker process parks on the SAL across a checkpoint rewind, and reports each
+/// group it wakes to back over its ring.
 #[test]
 fn sal_cross_process_checkpoint() {
     let log = TestLog::new(1 << 20, 1, 1);
-    let efd = m2w::eventfd_create().unwrap();
-    let efd2 = m2w::eventfd_create().unwrap();
-    assert!(efd >= 0 && efd2 >= 0);
+    let ring = log.ring(0);
 
     // Both payloads exist before the fork, so the child allocates nothing.
     let buf = vec![0xAAu8; 64];
@@ -303,39 +301,165 @@ fn sal_cross_process_checkpoint() {
 
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        log.try_write(0, 10, SalMessageKind::Scan, false, &[&buf])
-            .expect("group fits");
-        m2w::eventfd_signal(efd);
-
-        // Wait for the parent to finish reading round 1 before zeroing the
-        // region under it.
-        if m2w::eventfd_wait(efd2, 5000) != Wake::Signalled {
-            unsafe { libc::_exit(1) };
+        let reader = SalReader::new(log.log(), 0, 0);
+        let writer = W2mWriter::new(ring);
+        for _ in 0..2 {
+            let (msg, slot) = loop {
+                writer.sal_park().park(|| reader.is_empty());
+                if let Some(got) = reader.next() {
+                    break got;
+                }
+            };
+            // Round 2 is written at cursor 0 of the next epoch.
+            reader.rewind();
+            writer.send_status(slot[0] as u64, msg.lsn, gnitz_wire::WireStatus::Ok, b"");
         }
-
-        unsafe { std::ptr::write_bytes(log.ptr(), 0, log.size) };
-        log.seek(0, 2);
-        log.try_write(0, 20, SalMessageKind::Scan, false, &[&buf2])
-            .expect("group fits");
-        m2w::eventfd_signal(efd);
         unsafe { libc::_exit(0) };
     }
 
-    assert_eq!(m2w::eventfd_wait(efd, 5000), Wake::Signalled, "round 1 never signalled");
-    let round1 = group_and_next(log.log(), 0, 1).0;
-    assert_eq!(round1.lsn, 10);
-    assert_eq!(round1.target_id, 0);
-    assert_eq!(round1.slot(0).expect("data slot"), buf.as_slice());
-    m2w::eventfd_signal(efd2);
+    let wake = unsafe { SalWake::new(ring) };
+    let receiver = W2mReceiver::new(vec![ring]);
+    let report = || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(slot) = receiver.try_read_slot(0) {
+                let ctrl = slot.control();
+                return (ctrl.request_id, ctrl.target_id);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the worker never reported");
+    };
 
-    assert_eq!(m2w::eventfd_wait(efd, 5000), Wake::Signalled, "round 2 never signalled");
-    assert_eq!(group_and_next(log.log(), 0, 2).0.lsn, 20);
+    log.try_write(0, 10, SalMessageKind::Scan, false, &[&buf])
+        .expect("group fits");
+    wake.wake();
+    assert_eq!(report(), (10, 0xAA), "round 1");
+
+    log.seek(0, 2);
+    log.try_write(0, 20, SalMessageKind::Scan, false, &[&buf2])
+        .expect("group fits");
+    wake.wake();
+    assert_eq!(report(), (20, 0xBB), "round 2");
 
     unsafe { assert_child_exited_ok(pid) };
-    unsafe {
-        libc::close(efd);
-        libc::close(efd2);
+}
+
+/// Membership, rank and the launched-worker bound, at a small worker count and
+/// at the full word.
+#[test]
+fn a_worker_set_ranks_its_members_and_bounds_to_the_launched_workers() {
+    let s = WorkerSet::one(1).with(3).with(6);
+    assert_eq!(s.len(), 3);
+    assert_eq!((s.rank(1), s.rank(3), s.rank(6)), (0, 1, 2));
+    assert!(s.contains(3) && !s.contains(2));
+    assert_eq!(s.within(4), WorkerSet::one(1).with(3));
+    assert_eq!(s.iter().collect::<Vec<_>>(), vec![1, 3, 6]);
+
+    assert_eq!(WorkerSet::ALL.within(4).len(), 4);
+    assert_eq!(WorkerSet::ALL.rank(3), 3, "rank is the worker itself over every worker");
+    assert_eq!(WorkerSet::ALL.within(MAX_WORKERS), WorkerSet::ALL);
+    assert_eq!(WorkerSet::ALL.within(MAX_WORKERS).len(), MAX_WORKERS);
+    assert_eq!(WorkerSet::ALL.rank(MAX_WORKERS - 1), MAX_WORKERS as u64 - 1);
+    assert_eq!(WorkerSet::one(MAX_WORKERS - 1).rank(MAX_WORKERS - 1), 0);
+    assert_eq!(WorkerSet::EMPTY.len(), 0);
+}
+
+/// A group leased to 2 of 4 workers writes only those slots, answering on
+/// consecutive ids in worker order, and is sized for exactly those slots.
+#[test]
+fn a_leased_group_writes_only_its_set_on_consecutive_ids() {
+    use crate::runtime::wire::decode_sal_slot;
+
+    let log = TestLog::new(1 << 20, 4, 1);
+    let group = DirectGroup {
+        targets: GroupTargets::Leased {
+            set: WorkerSet::one(1).with(3),
+            base: 40,
+            in_request_order: true,
+        },
+        ..DirectGroup::new(SalMessageKind::Scan)
+    };
+    let predicted = log.writer.footprint(&group);
+    let before = log.cursor();
+    log.writer.write(&group).expect("group fits");
+    assert_eq!((log.cursor() - before) as usize, predicted);
+
+    let msg = group_at(log.log(), before);
+    let written: Vec<(u32, u64, bool)> = msg
+        .slots_written()
+        .map(|(w, bytes)| {
+            let c = decode_sal_slot(bytes, false).expect("a slot decodes").control;
+            (w, c.request_id, c.flags.scan_fifo_reply)
+        })
+        .collect();
+    assert_eq!(written, vec![(1, 40, true), (3, 41, true)]);
+}
+
+/// Dropping a `SalExcl` wakes each worker a group written under it reached —
+/// once, however many groups reached it — and no other.
+#[test]
+fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
+    let log = TestLog::new(1 << 20, 4, 1);
+    let seqs = || (0..4).map(|w| unsafe { sal_wake_seq(log.ring(w)) }).collect::<Vec<_>>();
+    let leased = |set| DirectGroup {
+        targets: GroupTargets::Leased { set, base: 1, in_request_order: false },
+        ..DirectGroup::new(SalMessageKind::Scan)
+    };
+
+    drop(log.writer.lock_exclusive());
+    assert_eq!(seqs(), [0, 0, 0, 0], "nothing written, nothing woken");
+
+    {
+        let excl = log.writer.lock_exclusive();
+        excl.write(&leased(WorkerSet::one(2))).expect("group fits");
+        excl.write(&leased(WorkerSet::one(2).with(0))).expect("group fits");
+        assert_eq!(seqs(), [0, 0, 0, 0], "no wake before the drop");
     }
+    assert_eq!(seqs(), [1, 0, 1, 0], "a worker reached twice is woken once");
+
+    {
+        let excl = log.writer.lock_exclusive();
+        excl.write(&DirectGroup::new(SalMessageKind::Shutdown))
+            .expect("group fits");
+    }
+    assert_eq!(
+        seqs(),
+        [2, 1, 2, 1],
+        "an unaddressed group reaches every launched worker"
+    );
+}
+
+#[test]
+#[should_panic(expected = "task holding the writer")]
+fn lock_exclusive_panics_while_a_task_holds_the_writer() {
+    let log = TestLog::new(1 << 20, 1, 1);
+    let _held = try_poll_once(log.writer.lock()).expect("an uncontended writer is taken at once");
+    let _ = log.writer.lock_exclusive();
+}
+
+#[test]
+fn a_reader_is_empty_only_while_no_group_is_readable_at_its_cursor() {
+    let log = TestLog::new(1 << 20, 2, 1);
+    let reader = SalReader::new(log.log(), 0, 0);
+    assert!(reader.is_empty(), "an unwritten log");
+
+    log.write(0, 0, SalMessageKind::Scan, &[&[], &[0u8; 32]]);
+    assert!(!reader.is_empty(), "another worker's unicast");
+    assert!(reader.next().is_none(), "holds nothing for worker 0");
+    assert!(reader.is_empty(), "and the cursor is past it");
+
+    log.write(0, 0, SalMessageKind::Scan, &[&[0u8; 32], &[]]);
+    assert!(!reader.is_empty());
+    assert!(reader.next().is_some());
+    assert!(reader.is_empty());
+
+    let leftover = TestLog::new(1 << 20, 1, 1);
+    leftover.write(0, 0, SalMessageKind::Scan, &[&[0u8; 32]]);
+    assert!(
+        SalReader::new(leftover.log(), 0, 1).is_empty(),
+        "an older epoch's group at the cursor"
+    );
 }
 
 /// The live drain's epoch gate reads the group's `(epoch << 32 | payload_size)`

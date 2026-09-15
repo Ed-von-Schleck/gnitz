@@ -6,8 +6,8 @@ apply it to a view, or inside a fan-out read's ACK wait. These tests pin the
 threshold low enough that checkpoints fire repeatedly during ordinary activity,
 then assert the two things a checkpoint must not do: strand a buffered view delta
 (the view stays permanently diverged until a restart rebuilds it) and wedge a
-concurrent operation (a fan-out that wrote its SAL group without holding
-`sal_writer_excl` used the old epoch, was skipped by every worker, and hung).
+concurrent operation (a fan-out that wrote its SAL group without holding the SAL
+writer used the old epoch, was skipped by every worker, and hung).
 
 Hang detection is `thread.join` against the shared ceilings in `_serverproc`,
 which are deadlock detectors rather than performance budgets.
@@ -125,7 +125,7 @@ def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(checkpoint_ser
 @pytest.mark.parametrize("probe", ["seek", "scan"])
 def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, checkpoint_server):
     """SEEK (single_worker_async) and SCAN (dispatch_fanout) each write their own
-    SAL group. Writing it without holding `sal_writer_excl` lets a request that
+    SAL group. Writing it without holding the SAL writer lets a request that
     arrives in the Flush ACK-wait window use the old epoch, which every worker
     skips — and the read never returns."""
     with gnitz.connect(checkpoint_server) as pusher, \

@@ -16,9 +16,11 @@ pub(crate) mod zone;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::runtime::reactor::{AsyncMutex, WriteGuard};
+use crate::runtime::w2m::SalWake;
 use crate::runtime::wire::{WireData, WireMsg};
 use gnitz_foundation::fault::Seam;
-use gnitz_wire::{align8, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
+use gnitz_wire::{align8, low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
 use gnitz_wire::{WireFault, WireFlags, WireStatus, MAX_WORKERS};
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
@@ -126,26 +128,76 @@ fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = u32> + '_ {
         .map(|c| u32::from_le_bytes(*c))
 }
 
+/// A subset of the workers. `ALL` is unbounded; every other set holds only
+/// launched workers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WorkerSet(u64);
+
+const _: () = assert!(MAX_WORKERS <= u64::BITS as usize);
+
+impl WorkerSet {
+    pub(crate) const EMPTY: Self = WorkerSet(0);
+    pub(crate) const ALL: Self = WorkerSet(u64::MAX);
+
+    pub(crate) const fn one(w: usize) -> Self {
+        WorkerSet(1 << w)
+    }
+
+    pub(crate) const fn with(self, w: usize) -> Self {
+        WorkerSet(self.0 | 1 << w)
+    }
+
+    pub(crate) const fn within(self, nw: usize) -> Self {
+        WorkerSet(self.0 & low_bits_mask(nw))
+    }
+
+    pub(crate) const fn contains(self, w: usize) -> bool {
+        self.0 >> w & 1 == 1
+    }
+
+    pub(crate) const fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    /// Worker `w`'s position among the members.
+    pub(crate) const fn rank(self, w: usize) -> u64 {
+        (self.0 & low_bits_mask(w)).count_ones() as u64
+    }
+
+    pub(crate) fn iter(self) -> BitIter {
+        BitIter(self.0)
+    }
+}
+
 /// Which of a group's slots are written, the request id each answers on, and
 /// whether each reply must reach the ring in request order.
 #[derive(Clone, Copy)]
 pub(crate) enum GroupTargets {
-    /// Broadcast on request id 0, which no lease holds: nothing answers.
-    AllUnaddressed,
-    /// Broadcast; slot `w` answers on `base + w`.
-    All { base: u64, in_request_order: bool },
-    /// Only `worker`'s slot is written, and it answers on `req_id`.
-    One {
-        worker: usize,
-        req_id: u64,
+    /// Every slot, on request id 0: nothing answers.
+    Unaddressed,
+    /// `set`'s slots; worker `w` answers on `base + set.rank(w)`.
+    Leased {
+        set: WorkerSet,
+        base: u64,
         in_request_order: bool,
     },
 }
 
 impl GroupTargets {
-    /// A broadcast whose replies need no ordering.
+    /// Every worker, replies in no required order.
     pub(crate) const fn all(base: u64) -> Self {
-        GroupTargets::All { base, in_request_order: false }
+        Self::Leased {
+            set: WorkerSet::ALL,
+            base,
+            in_request_order: false,
+        }
+    }
+
+    fn set(&self) -> WorkerSet {
+        match *self {
+            Self::Unaddressed => WorkerSet::ALL,
+            Self::Leased { set, .. } => set,
+        }
     }
 }
 
@@ -203,7 +255,7 @@ impl<'a> DirectGroup<'a> {
             template: WireMsg::default(),
             data: GroupData::NONE,
             extras: None,
-            targets: GroupTargets::AllUnaddressed,
+            targets: GroupTargets::Unaddressed,
         }
     }
 
@@ -226,9 +278,8 @@ impl<'a> DirectGroup<'a> {
         };
         let keeps_schema = data.row_count() > 0 || self.kind.schema_survives_a_rowless_slot();
         let (request_id, in_request_order) = match self.targets {
-            GroupTargets::AllUnaddressed => (0, false),
-            GroupTargets::All { base, in_request_order } => (base + w as u64, in_request_order),
-            GroupTargets::One { req_id, in_request_order, .. } => (req_id, in_request_order),
+            GroupTargets::Unaddressed => (0, false),
+            GroupTargets::Leased { set, base, in_request_order } => (base + set.rank(w), in_request_order),
         };
         WireMsg {
             data,
@@ -252,8 +303,9 @@ impl<'a> DirectGroup<'a> {
     /// empty slot as "not for this worker". The assert below is where that would
     /// break.
     fn slot_sizes_into(&self, out: &mut [u32]) {
+        let set = self.targets.set();
         for (w, size) in out.iter_mut().enumerate() {
-            if matches!(self.targets, GroupTargets::One { worker, .. } if w != worker) {
+            if !set.contains(w) {
                 *size = 0;
                 continue;
             }
@@ -423,7 +475,7 @@ impl SalMessageKind {
     /// Whether a slot of this kind still needs the group's schema block when it
     /// carries no rows — the *handler's* behaviour on an empty slot decides, so
     /// this is per-kind and not per-writer: an `ExchangeRelay` builds its batch
-    /// from the block alone, a `Push` reaches a no-op, a `HasPk` derives its own.
+    /// from the block alone, a `Push` reaches a no-op, a `HasPk` never has one.
     fn schema_survives_a_rowless_slot(self) -> bool {
         use SalMessageKind::*;
         match self {
@@ -767,10 +819,6 @@ pub(crate) struct SalWriter {
     mmap_size: usize,
     write_cursor: Cell<u64>,
     epoch: Cell<u32>,
-    /// True while a [`Self::begin`] scope is open: two overlapping scopes would
-    /// each roll the shared write cursor back under the other, and a
-    /// [`Self::rewind`] inside one would lose its groups.
-    scope_open: Cell<bool>,
     checkpoint_threshold: u64,
     /// A group was refused as [`SalFit::Transient`] since the last reset: a
     /// checkpoint would admit it, so one is warranted whatever the write cursor
@@ -780,12 +828,19 @@ pub(crate) struct SalWriter {
     /// and every slot offset are all this. It is the log's framing, so it is the
     /// log writer's own field — never read off some other per-worker resource.
     num_workers: usize,
+    /// Taken by every [`SalExcl`].
+    excl: AsyncMutex,
+    /// One wake per worker, in worker order.
+    wakes: Vec<SalWake>,
+    /// The workers groups written since the last [`SalExcl::wake`] reached.
+    reached: Cell<u64>,
 }
 
 impl SalWriter {
     /// Starts at epoch 0, which [`Self::write_slots`] refuses: nothing can be
-    /// written before the boot [`Self::rewind`] sets the live epoch.
-    pub(crate) fn new(ptr: *mut u8, fd: i32, mmap_size: usize, num_workers: usize) -> Self {
+    /// written before the boot [`SalExcl::boot_rewind`] sets the live epoch.
+    pub(crate) fn new(ptr: *mut u8, fd: i32, mmap_size: usize, num_workers: usize, wakes: Vec<SalWake>) -> Self {
+        assert_eq!(wakes.len(), num_workers, "one SAL wake per worker");
         let checkpoint_threshold =
             gnitz_foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (mmap_size as u64 * 3) >> 2);
         SalWriter {
@@ -794,10 +849,31 @@ impl SalWriter {
             mmap_size,
             write_cursor: Cell::new(0),
             epoch: Cell::new(0),
-            scope_open: Cell::new(false),
             checkpoint_threshold,
             refused_transient: Cell::new(false),
             num_workers,
+            excl: AsyncMutex::default(),
+            wakes,
+            reached: Cell::new(0),
+        }
+    }
+
+    /// Sole write access, once no other task holds it.
+    pub(crate) async fn lock(&self) -> SalExcl<'_> {
+        SalExcl {
+            writer: self,
+            _guard: self.excl.lock().await,
+        }
+    }
+
+    /// For a caller that polls no other task: panics if a task holds the writer.
+    pub(crate) fn lock_exclusive(&self) -> SalExcl<'_> {
+        SalExcl {
+            writer: self,
+            _guard: self
+                .excl
+                .try_lock()
+                .expect("an exclusive SAL write found a task holding the writer"),
         }
     }
 
@@ -963,11 +1039,8 @@ impl SalWriter {
 
     /// Open a publication scope at `lsn`: groups laid out in it are invisible
     /// until [`SalScope::commit`], and an uncommitted drop discards the span.
-    /// `tag` names the scope for [`ZONE_PANIC`]. Hold `sal_writer_excl` and do
-    /// not suspend inside it.
-    pub(crate) fn begin(&self, lsn: u64, tag: &'static str) -> SalScope<'_> {
-        debug_assert!(!self.scope_open.get(), "a SAL scope is already open");
-        self.scope_open.set(true);
+    /// `tag` names the scope for [`ZONE_PANIC`].
+    fn begin(&self, lsn: u64, tag: &'static str) -> SalScope<'_> {
         SalScope {
             writer: self,
             from: self.write_cursor.get(),
@@ -979,8 +1052,8 @@ impl SalWriter {
     }
 
     /// Encode a group's per-worker wire messages directly into the SAL mmap and
-    /// publish it. Does NOT sync/signal.
-    pub(crate) fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
+    /// publish it.
+    fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
         let (base, word) = self.lay_out(g, g.lsn, false, false)?;
         self.publish(base, word);
         Ok(())
@@ -1002,18 +1075,21 @@ impl SalWriter {
 
         let mut sizes = [0u32; MAX_WORKERS];
         g.slot_sizes_into(&mut sizes[..nw]);
-        self.write_slots(
-            g.template.target_id as u32,
-            lsn,
-            g.kind,
-            zone_start,
-            &sizes[..nw],
-            |w, slot| {
-                let written = g.msg(w).encode(slot, 0, zoned);
-                debug_assert_eq!(written, slot.len());
-            },
-        )
-        .map_err(|fit| fit.refusal(g.kind))
+        let laid_out = self
+            .write_slots(
+                g.template.target_id as u32,
+                lsn,
+                g.kind,
+                zone_start,
+                &sizes[..nw],
+                |w, slot| {
+                    let written = g.msg(w).encode(slot, 0, zoned);
+                    debug_assert_eq!(written, slot.len());
+                },
+            )
+            .map_err(|fit| fit.refusal(g.kind))?;
+        self.reached.set(self.reached.get() | g.targets.set().0);
+        Ok(laid_out)
     }
 
     /// The exact number of SAL bytes [`Self::write`] will consume for `g`.
@@ -1038,7 +1114,6 @@ impl SalWriter {
     /// 0 see nothing until this epoch writes.
     fn rewind(&self, epoch: u32) {
         debug_assert!(epoch >= 1, "the first live SAL epoch is 1");
-        debug_assert!(!self.scope_open.get(), "a rewind inside an open scope loses its groups");
         self.write_cursor.set(0);
         self.epoch.set(epoch);
         self.refused_transient.set(false);
@@ -1046,13 +1121,13 @@ impl SalWriter {
     }
 
     /// Rewind into the next epoch — the checkpoint's reclaim.
-    pub(crate) fn checkpoint_reset(&self) {
+    fn checkpoint_reset(&self) {
         self.rewind(next_epoch(self.epoch.get()));
     }
 
     /// The boot rewind, above the recovered `walk_epoch` — the same epoch
     /// [`SalReader::new`] derives for every worker from that same value.
-    pub(crate) fn boot_rewind(&self, walk_epoch: u32) {
+    fn boot_rewind(&self, walk_epoch: u32) {
         self.rewind(next_epoch(walk_epoch));
     }
 
@@ -1062,6 +1137,50 @@ impl SalWriter {
 
     pub(crate) fn sal_fd(&self) -> i32 {
         self.fd
+    }
+}
+
+/// Sole write access. Dropping it wakes each worker a group written under it
+/// reached. Held across no await except a checkpoint round's ACKs.
+pub(crate) struct SalExcl<'a> {
+    writer: &'a SalWriter,
+    _guard: WriteGuard,
+}
+
+impl SalExcl<'_> {
+    /// Write and publish one group.
+    pub(crate) fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
+        self.writer.write(g)
+    }
+
+    /// See [`SalWriter::begin`]. `&mut`, so no scope overlaps another or a rewind.
+    pub(crate) fn begin(&mut self, lsn: u64, tag: &'static str) -> SalScope<'_> {
+        self.writer.begin(lsn, tag)
+    }
+
+    /// Rewind into the next epoch — the checkpoint's reclaim.
+    pub(crate) fn checkpoint_reset(&mut self) {
+        self.writer.checkpoint_reset();
+    }
+
+    /// The boot rewind, above the recovered `walk_epoch`.
+    pub(crate) fn boot_rewind(&mut self, walk_epoch: u32) {
+        self.writer.boot_rewind(walk_epoch);
+    }
+
+    /// Wake every worker a group written since the last wake reached.
+    pub(crate) fn wake(&self) {
+        let w = self.writer;
+        let reached = WorkerSet(w.reached.replace(0)).within(w.wakes.len());
+        for worker in reached.iter() {
+            w.wakes[worker].wake();
+        }
+    }
+}
+
+impl Drop for SalExcl<'_> {
+    fn drop(&mut self) {
+        self.wake()
     }
 }
 
@@ -1147,7 +1266,6 @@ impl Drop for SalScope<'_> {
     /// An uncommitted scope publishes nothing: the write cursor goes back to
     /// where it opened and the bytes stay for the next group to overwrite.
     fn drop(&mut self) {
-        self.writer.scope_open.set(false);
         if !self.committed.get() {
             self.writer.write_cursor.set(self.from);
         }
@@ -1201,6 +1319,15 @@ impl SalReader {
                 SalStep::Absent => return None,
             }
         }
+    }
+
+    /// No group is readable at the cursor.
+    pub(crate) fn is_empty(&self) -> bool {
+        matches!(
+            self.log
+                .read_at(self.read_cursor.get(), EpochGate::Live(self.expected_epoch.get())),
+            SalStep::Absent
+        )
     }
 
     /// Rewind to the start of the next epoch, mirroring the writer's

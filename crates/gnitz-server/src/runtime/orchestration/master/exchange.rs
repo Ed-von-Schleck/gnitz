@@ -16,10 +16,11 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::runtime::sal::WorkerSet;
 use crate::runtime::wire::DecodedWire;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{Batch, Layout};
-use gnitz_wire::{low_bits_mask, MAX_WORKERS};
+use gnitz_wire::MAX_WORKERS;
 
 /// Per-view accumulator for exchange frames, keyed by `(view_id, source_id)`.
 ///
@@ -41,10 +42,10 @@ struct ExchangeRound {
     /// multi-frame slot would otherwise lose its source's claim and drop the
     /// round onto the re-sorting `op_repartition_batches`.
     consolidated: Vec<bool>,
-    /// Bit `w` set once worker `w` has reported. A bitmask rather than a
-    /// counter (`nw <= MAX_WORKERS == 64`) so a worker reporting twice cannot
-    /// complete the round while another worker's slot is still empty.
-    reported: u64,
+    /// The workers that have reported. A set rather than a counter, so a worker
+    /// reporting twice cannot complete the round while another worker's slot is
+    /// still empty.
+    reported: WorkerSet,
     schema: Option<SchemaDescriptor>,
     /// AND of the workers' `flags.backfill_pad`: true on a backfill's final round.
     all_pad: bool,
@@ -52,8 +53,7 @@ struct ExchangeRound {
 
 /// One completed exchange ready for relay. The relay driver owns this: it builds
 /// the group under the catalog read lock (`prepare_relay`), then emits it under
-/// `sal_writer_excl` (`emit_relay_with_decision`) — two separate holds, never
-/// one.
+/// a `SalExcl` (`emit_relay`) — two separate holds, never one.
 pub struct PendingRelay {
     pub view_id: i64,
     pub payloads: Vec<Option<Batch>>,
@@ -87,7 +87,7 @@ impl ExchangeAccumulator {
         let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
             payloads: (0..nw).map(|_| None).collect(),
             consolidated: vec![true; nw],
-            reported: 0,
+            reported: WorkerSet::EMPTY,
             schema: None,
             all_pad: true,
         });
@@ -114,9 +114,9 @@ impl ExchangeAccumulator {
         // AND this worker's per-chunk backfill pad bit. Clear for steady-state
         // exchanges, which clears all_pad harmlessly (the relay path ignores it).
         round.all_pad &= decoded.control.flags.backfill_pad;
-        round.reported |= 1 << w;
+        round.reported = round.reported.with(w);
 
-        if round.reported != low_bits_mask(nw) {
+        if round.reported != WorkerSet::ALL.within(nw) {
             return None;
         }
         let mut round = self.rounds.remove(&key).unwrap();

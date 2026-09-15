@@ -123,31 +123,6 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
     assert!(try_poll_once(lease.next_frame(0)).is_none(), "the queue is drained");
 }
 
-/// `first_frames` hands out nothing until every id has a frame, so no frame is
-/// taken by a poll that then parks.
-#[test]
-fn first_frames_waits_for_every_id_before_taking_any() {
-    let (r, writers) = reactor_with_rings(2);
-    let lease = r.lease_train(2);
-    let mut fut = std::pin::pin!(lease.first_frames());
-    let mut cx = Context::from_waker(Waker::noop());
-
-    writers[0].send_msg(lease.id(0), &Default::default());
-    r.drain_all_w2m();
-    assert!(fut.as_mut().poll(&mut cx).is_pending());
-    assert!(
-        matches!(&r.inner.routes.borrow()[&(lease.id(0) as u32)], Route::Train(q) if q.len() == 1),
-        "the pending poll left id 0's frame queued"
-    );
-
-    writers[1].send_msg(lease.id(1), &Default::default());
-    r.drain_all_w2m();
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(slots) => assert_eq!(slots.len(), 2),
-        Poll::Pending => panic!("both ids have a frame"),
-    }
-}
-
 /// Dropping a train lease releases the frames it still holds, and a frame for
 /// its id arriving afterwards is released at the ring.
 #[test]

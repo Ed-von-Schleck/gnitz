@@ -8,9 +8,10 @@
 //! `unique_preflight.rs`, which shares nothing with this file but the
 //! `UniqueFilter` it seeds.
 
+use std::ops::Range;
+
 use super::*;
 
-use super::unique_filter::ensure_unique_filters_warm;
 use crate::catalog::FkEdge;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_store::relation::Relation;
@@ -43,10 +44,6 @@ impl Keyspace {
             Keyspace::Index(packed) => *packed,
         }
     }
-
-    fn scatters(&self) -> bool {
-        matches!(self, Keyspace::OwnPk)
-    }
 }
 
 /// A single distributed has-pk check queued for pipelined execution (always
@@ -75,6 +72,23 @@ impl PipelinedCheck {
     fn reply_schema(&self) -> &SchemaDescriptor {
         self.reply.as_ref().unwrap_or_else(|| self.schema.descriptor())
     }
+
+    /// The batch rows whose probe key starts with `key`. The batch must be
+    /// PK-sorted, as every check whose replies are mapped back to rows is.
+    fn rows_of(&self, key: &[u8]) -> Range<usize> {
+        let n = self.batch.len();
+        let at = |j: usize| &self.batch.get_pk_bytes(j)[..key.len()];
+        let (mut lo, mut hi) = (0, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if at(mid) < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo..lo + (lo..n).take_while(|&j| at(j) == key).count()
+    }
 }
 
 /// The PK-only image of `schema`, at the source relation's placement. A probe
@@ -87,14 +101,16 @@ fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
         .with_placement(schema.placement())
 }
 
-/// A check batch whose rows carry `keys` — images at type `ref_tc` — in the leading
-/// key column of `schema`'s PK, the rest of each key zero.
-fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128], ref_tc: u8) -> Batch {
+/// A PK-sorted check batch whose row `j` carries `keys[j]` — an image at type
+/// `ref_tc` — in the leading key column of `schema`'s PK, the rest of each key
+/// zero. Sorts `keys` first: an image orders as its OPK bytes do.
+fn build_check_batch(schema: &SchemaDescriptor, keys: &mut [u128], ref_tc: u8) -> Batch {
+    keys.sort_unstable();
     let key_tc = schema.columns[schema.pk_indices()[0] as usize].type_code;
     let (ref_w, key_w) = (gnitz_wire::wire_stride(ref_tc), gnitz_wire::wire_stride(key_tc));
     let mut key = [0u8; gnitz_wire::MAX_PK_BYTES];
     let mut batch = Batch::with_capacity(schema, keys.len());
-    for &k in keys {
+    for &k in keys.iter() {
         gnitz_wire::store_opk_image(k, ref_tc, ref_w, key_tc, &mut key[..key_w]);
         batch.push_key_row(&key[..schema.pk_stride()], 1);
     }
@@ -349,63 +365,39 @@ impl<'a> TxnBundle<'a> {
             .expect("a folded table")
             .merged
     }
+
+    /// Whether the bundle retires `holder`'s claim on `span` in `tid`'s index
+    /// `spec`: its surviving state is deleted, or holds a NULL or another span
+    /// there. A holder the bundle does not touch keeps its claim.
+    fn retires(&self, tid: i64, spec: &IndexKeySpec, holder: &[u8], span: &[u8], buf: &mut PkBuf) -> bool {
+        match self.overlay(tid).get(holder).map(|e| e.last) {
+            None => false,
+            Some(FoldOp::Deleted) => true,
+            Some(FoldOp::Inserted(f, r)) => !spec.key_bytes(self.mem(f), r as usize, buf) || buf.pk_bytes() != span,
+        }
+    }
 }
 
-/// One planned FK existence probe: a committed-occupancy check for `values`.
-/// Which side of `edge` is probed is fixed by the rule, not stored.
-///
-/// The encoded key images are not kept: `build_check_batch` wrote row `j` from
-/// `values[j]` and the batch outlives the verdict, so `batch.get_pk_bytes(j)`
-/// IS the image the reply echoes. Both routes filter their own index lists,
-/// never the master's batch, so the correspondence holds on either.
+/// One planned FK existence probe: a committed-occupancy check for `values`,
+/// sorted, so check batch row `j` carries `values[j]`. Which side of `edge` is
+/// probed is fixed by the rule, not stored.
 struct FkProbePlan {
     edge: FkEdge,
     values: Vec<u128>,
 }
 
 /// One planned unique-secondary-index check: the circuit's columns, the key
-/// encoder that splits a reply entry into `[span ‖ holder]`, and the
-/// `(span, surviving claimant PK)` pairs to verify the reply against.
-///
-/// The pairs are columnar — a flat span arena at `stride` plus a claimant
-/// vector — with `order` naming them in span order, which is also the order the
-/// check batch ships, so a reply is a binary search over `order`.
+/// encoder that splits a reply entry into `[span ‖ holder]`, and each check
+/// batch row's surviving claimant PK, in row order.
 struct UniquePlan<'a> {
     tid: i64,
     col_indices: PkColList,
     spec: IndexKeySpec,
-    stride: usize,
-    spans: Vec<u8>,
     holders: Vec<&'a [u8]>,
-    order: Vec<u32>,
 }
 
-impl UniquePlan<'_> {
-    /// Entry `i`'s probe key: the leading-key span zero-padded to the index's
-    /// full PK stride, which is what the check batch ships.
-    fn probe_key(&self, i: u32) -> &[u8] {
-        &self.spans[i as usize * self.stride..(i as usize + 1) * self.stride]
-    }
-
-    /// Entry `i`'s leading-key span alone — what a reply entry splits back to,
-    /// and what the unique filter is keyed on.
-    fn span(&self, i: u32) -> &[u8] {
-        &self.probe_key(i)[..self.spec.key_size()]
-    }
-}
-
-/// Fire every check in `checks` as ONE SAL cut and drain the replies, handing
-/// each frame's rows to `sink` as `(check index, rows)`. One write can need a
-/// check per table, per unique index and per FK edge; issuing them one at a
-/// time would cost that many round trips.
-///
-/// **Replies are trains, not single frames.** Two probe shapes are unbounded by
-/// the write that issued them: a unique-index probe whose promoted
-/// `[span ‖ holder]` entries are wider than the source rows, and a
-/// holder-listing one, whose row count is a property of committed state.
-///
-/// Draining check `i` fully before `i+1` is what `dispatch_scan_multi_fanout`'s
-/// FIFO flag is for.
+/// Fire every check in `checks` as one SAL cut, handing each reply frame's rows
+/// to `sink` as `(check index, rows)`.
 async fn execute_probe_burst(
     disp: &MasterDispatcher,
     checks: &[PipelinedCheck],
@@ -414,41 +406,53 @@ async fn execute_probe_burst(
     if checks.is_empty() {
         return Ok(());
     }
-    // Every probe reaches every worker: a scattered one because each worker
-    // holds a slice of the key list, a broadcast one because index entries are
-    // partitioned independently of the probe key.
-    let fanouts = vec![Fanout::Broadcast; checks.len()];
-    let (dispatches, _) = dispatch_scan_multi_fanout(disp, &fanouts, |i, targets, _| {
-        let check = &checks[i];
-        let g = DirectGroup {
-            template: check.schema.frame(wire::WireMsg {
-                seek_col_idx: check.keyspace.seek_col_idx(),
-                seek_pk: check.mode_param as u128,
-                flags: WireFlags {
-                    probe_mode: check.mode,
+    let nw = disp.num_workers();
+    let leases = disp
+        .scan_cut(checks.len(), |cut| {
+            for check in checks {
+                let template = check.schema.frame(wire::WireMsg {
+                    seek_col_idx: check.keyspace.seek_col_idx(),
+                    seek_pk: check.mode_param as u128,
+                    flags: WireFlags {
+                        probe_mode: check.mode,
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }),
-            targets,
-            ..DirectGroup::new(SalMessageKind::HasPk)
-        };
-        // The scatter branch carries no `data`: `with_group` replaces it with
-        // the per-worker slices, and hands a group carrying one back.
-        if check.keyspace.scatters() {
-            disp.write_scatter_group(&check.batch, &check.schema, g)
-        } else {
-            disp.write_group(&DirectGroup {
-                data: GroupData::Same(wire::WireData::Whole(&check.batch)),
-                ..g
-            })
-        }
-    })
-    .await?;
+                });
+                let group = |targets| DirectGroup {
+                    template,
+                    targets,
+                    ..DirectGroup::new(SalMessageKind::HasPk)
+                };
+                match check.keyspace {
+                    // Each worker is sent the keys it holds; one holding none is
+                    // not sent the probe.
+                    Keyspace::OwnPk => with_worker_indices(&check.batch, check.schema.descriptor(), nw, |idx| {
+                        let holders = idx
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, rows)| !rows.is_empty())
+                            .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w));
+                        cut.push(holders, |excl, t| {
+                            with_group(&check.batch, idx, &check.schema, group(t), |g| excl.write(g))
+                        })
+                    })?,
+                    // Index entries are partitioned independently of the probe
+                    // key, so every worker holding the relation is probed.
+                    Keyspace::Index(_) => cut.push(disp.read_route(check.schema.tid(), None).set, |excl, t| {
+                        excl.write(&DirectGroup {
+                            data: GroupData::Same(wire::WireData::Whole(&check.batch)),
+                            ..group(t)
+                        })
+                    })?,
+                }
+            }
+            Ok(())
+        })
+        .await?;
 
-    for (i, scan) in dispatches.iter().enumerate() {
-        let slots = scan.await_slots().await;
-        drain_index_scan(slots, scan, "pipeline", checks[i].reply_schema(), |b, _| sink(i, b)).await?;
+    for (i, lease) in leases.iter().enumerate() {
+        drain_index_scan(lease, "pipeline", checks[i].reply_schema(), |b| sink(i, b)).await?;
     }
     Ok(())
 }
@@ -491,7 +495,7 @@ impl MasterDispatcher {
                 .is_some_and(Relation::has_unique_index)
                 && b.surviving(t.tid).next().is_some()
             {
-                ensure_unique_filters_warm(self, t.tid).await?;
+                self.ensure_unique_filters_warm(t.tid).await?;
             }
         }
 
@@ -514,22 +518,35 @@ impl MasterDispatcher {
         let n_uniq = checks.len();
         let f1_plans = plan_fk_existence(self, &b, &constraints, &mut checks)?;
 
-        // U-PK's answer lands on the fold; U-SEC's and F1's are found sets.
-        let mut found: Vec<FxHashSet<PkBuf>> = (0..checks.len()).map(|_| FxHashSet::default()).collect();
+        // U-PK's answer lands on the fold, F1's on a hit per check row. U-SEC's
+        // first violation is held until its turn in the verdict order.
+        let mut hits: Vec<Vec<bool>> = checks[n_uniq..].iter().map(|c| vec![false; c.batch.len()]).collect();
+        let mut unique_violation: Option<WireFault> = None;
+        let mut hspan = PkBuf::zeroed(0);
         execute_probe_burst(self, &checks, |i, rows| {
+            let answered = (0..rows.len()).filter(|&j| rows.get_weight(j) == 1);
             if i < n_pk {
                 let merged = b.fold_mut(pk_tids[i]);
-                for j in 0..rows.len() {
-                    if rows.get_weight(j) == 1 {
-                        if let Some(e) = merged.get_mut(rows.get_pk_bytes(j)) {
-                            e.committed = true;
-                        }
+                for j in answered {
+                    if let Some(e) = merged.get_mut(rows.get_pk_bytes(j)) {
+                        e.committed = true;
+                    }
+                }
+            } else if i < n_uniq {
+                let plan = &uniq_plans[i - n_pk];
+                for j in answered {
+                    if unique_violation.is_none()
+                        && unique_entry_violates(&b, plan, &checks[i], rows.get_pk_bytes(j), &mut hspan)
+                    {
+                        let cols = plan.col_indices.as_slice();
+                        unique_violation = Some(self.cat().unique_violation_err(plan.tid, cols, false).into());
                     }
                 }
             } else {
-                for j in 0..rows.len() {
-                    if rows.get_weight(j) == 1 {
-                        found[i].insert(PkBuf::from_bytes(rows.get_pk_bytes(j)));
+                let hit = &mut hits[i - n_uniq];
+                for j in answered {
+                    for r in checks[i].rows_of(rows.get_pk_bytes(j)) {
+                        hit[r] = true;
                     }
                 }
             }
@@ -542,8 +559,10 @@ impl MasterDispatcher {
         // ── Burst 2: the parent gathers, keyed by U-PK's answer ──────────
         let deltas = resolve_parent_deltas(self, &b, &constraints, &children).await?;
 
-        unique_verdict(self, &b, &uniq_plans, &found[n_pk..n_uniq])?;
-        fk_existence_verdict(self, &f1_plans, &checks[n_uniq..], &found[n_uniq..], &deltas)?;
+        if let Some(e) = unique_violation {
+            return Err(e);
+        }
+        fk_existence_verdict(self, &f1_plans, &hits, &deltas)?;
 
         // ── Burst 3: F2, keyed by the deltas ─────────────────────────────
         txn_check_fk_restrict(self, &b, &children, &deltas).await
@@ -589,6 +608,12 @@ fn plan_pk_checks(
         // alone only a net-positive key can collide.
         let keys: Vec<&[u8]> = if fk_parent {
             fold.merged.keys().copied().collect()
+        } else if let [n] = error_families[..] {
+            fold.families[n]
+                .iter()
+                .filter(|(_, f)| f.net > 0)
+                .map(|(pk, _)| *pk)
+                .collect()
         } else {
             let mut candidate: FxHashSet<&[u8]> = FxHashSet::default();
             for &n in &error_families {
@@ -743,64 +768,28 @@ fn plan_unique_checks<'a>(
                 tid,
                 col_indices,
                 spec,
-                stride,
-                spans,
-                holders,
-                order,
+                holders: order.iter().map(|&x| holders[x as usize]).collect(),
             });
         }
     }
     Ok(plans)
 }
 
-/// Rule U-SEC, verdict half. Each reply entry is an occupied span plus the
-/// committed row holding it, `[span ‖ holder PK]`, split apart by index layout
-/// alone. A span held on two workers contributes two entries, each verified on
-/// its own; the `FxHashSet` collapses a replicated owner's `W` identical ones.
-fn unique_verdict(
-    disp: &MasterDispatcher,
+/// Rule U-SEC, verdict half: whether reply entry `[span ‖ holder PK]` names a
+/// committed holder, other than the span's claimant, that the bundle keeps.
+fn unique_entry_violates(
     b: &TxnBundle<'_>,
-    plans: &[UniquePlan<'_>],
-    results: &[FxHashSet<PkBuf>],
-) -> Result<(), WireFault> {
-    let mut hspan = PkBuf::zeroed(0);
-    for (plan, occupied) in plans.iter().zip(results) {
-        for entry in occupied {
-            let (span, holder) = plan.spec.split_entry(entry.pk_bytes());
-            // Every entry answers a span this plan probed, so the claimer is
-            // always present.
-            let Ok(i) = plan
-                .order
-                .binary_search_by(|&x| gnitz_store::schema::key::compare_pk_bytes(plan.span(x), span))
-            else {
-                continue;
-            };
-            let claimer = plan.holders[plan.order[i] as usize];
-            // The holder IS the surviving row claiming the span — nothing to
-            // vacate.
-            if holder == claimer {
-                continue;
-            }
-            // Otherwise the bundle must retire it: the holder's surviving state
-            // is absent, or it no longer holds this span.
-            let retired = match b.overlay(plan.tid).get(holder) {
-                None => false,
-                Some(e) => match e.last {
-                    FoldOp::Deleted => true,
-                    FoldOp::Inserted(hf, hr) => {
-                        !plan.spec.key_bytes(b.mem(hf), hr as usize, &mut hspan) || hspan.pk_bytes() != span
-                    }
-                },
-            };
-            if !retired {
-                return Err(disp
-                    .cat()
-                    .unique_violation_err(plan.tid, plan.col_indices.as_slice(), false)
-                    .into());
-            }
-        }
-    }
-    Ok(())
+    plan: &UniquePlan<'_>,
+    check: &PipelinedCheck,
+    entry: &[u8],
+    buf: &mut PkBuf,
+) -> bool {
+    let (span, holder) = plan.spec.split_entry(entry);
+    // Every entry answers a span this plan probed, and each span is probed once.
+    let Some(j) = check.rows_of(span).next() else {
+        return false;
+    };
+    holder != plan.holders[j] && !b.retires(plan.tid, &plan.spec, holder, span, buf)
 }
 
 /// Rule F1, planning half: one committed-occupancy probe per FK constraint
@@ -860,7 +849,7 @@ fn plan_fk_existence(
             keyspace,
             mode: gnitz_wire::WireProbeMode::Exists,
             mode_param: 0,
-            batch: build_check_batch(&key_schema, &values, ref_tc),
+            batch: build_check_batch(&key_schema, &mut values, ref_tc),
             schema: wire::WireSchema::encoded(parent_tid, key_schema),
             reply: None,
         });
@@ -870,21 +859,19 @@ fn plan_fk_existence(
 }
 
 /// Rule F1, verdict half: every surviving row's FK value must reference a row
-/// that exists after the transaction — present in committed state and not
-/// retired by the bundle, or added by it.
+/// that exists after the transaction. `hits[k][j]`: plan `k`'s `values[j]` is
+/// committed.
 fn fk_existence_verdict(
     disp: &MasterDispatcher,
     plans: &[FkProbePlan],
-    checks: &[PipelinedCheck],
-    results: &[FxHashSet<PkBuf>],
+    hits: &[Vec<bool>],
     deltas: &ParentDeltas,
 ) -> Result<(), WireFault> {
     // A non-bundled parent has no delta (the degenerate plain-push case).
     let no_delta: ParentDelta = (FxHashMap::default(), FxHashSet::default());
-    for ((plan, check), probed) in plans.iter().zip(checks).zip(results) {
+    for (plan, hit) in plans.iter().zip(hits) {
         let (retired, added) = deltas.get(&delta_key(&plan.edge)).unwrap_or(&no_delta);
-        for (j, v) in plan.values.iter().enumerate() {
-            let in_committed = probed.contains(check.batch.get_pk_bytes(j));
+        for (v, &in_committed) in plan.values.iter().zip(hit) {
             if (in_committed && !retired.contains_key(v)) || added.contains(v) {
                 continue;
             }
@@ -968,14 +955,17 @@ async fn resolve_parent_deltas(
         })
         .collect();
 
-    // `pk → key image`, absent when the committed row is absent or holds NULL
-    // there — a NULL referenced value is unindexed either way.
-    let mut gathered: Vec<FxHashMap<PkBuf, u128>> = (0..checks.len()).map(|_| FxHashMap::default()).collect();
+    // Per check row, its key image; `None` when the committed row is absent or
+    // holds NULL there — a NULL referenced value is unindexed either way.
+    let mut gathered: Vec<Vec<Option<u128>>> = checks.iter().map(|c| vec![None; c.batch.len()]).collect();
     execute_probe_burst(disp, &checks, |i, rows| {
         let loc = locators[i];
         for j in 0..rows.len() {
             if !loc.is_null(rows, j) {
-                gathered[i].insert(PkBuf::from_bytes(rows.get_pk_bytes(j)), loc.opk_image(rows, j));
+                let image = loc.opk_image(rows, j);
+                for r in checks[i].rows_of(rows.get_pk_bytes(j)) {
+                    gathered[i][r] = Some(image);
+                }
             }
         }
         Ok(())
@@ -984,44 +974,36 @@ async fn resolve_parent_deltas(
 
     let mut deltas = ParentDeltas::default();
     for (&(ptid, pcol), ci) in needed.iter().zip(check_of) {
-        deltas.insert(
-            (ptid, pcol),
-            parent_retired_added(b, ptid, pcol, ci.map(|c| &gathered[c])),
-        );
+        let delta = match (ci, b.schema(ptid).locate(pcol)) {
+            (Some(c), _) => {
+                parent_retired_added(b, ptid, pcol, |pk| checks[c].rows_of(pk).find_map(|r| gathered[c][r]))
+            }
+            (None, ColumnLocator::Pk { byte_off, size, .. }) => {
+                let (off, size) = (byte_off as usize, size as usize);
+                parent_retired_added(b, ptid, pcol, |pk| Some(gnitz_wire::widen_pk_be(&pk[off..off + size])))
+            }
+            // No touched PK exists committed, so none has an old value.
+            (None, _) => parent_retired_added(b, ptid, pcol, |_| None),
+        };
+        deltas.insert((ptid, pcol), delta);
     }
     Ok(deltas)
 }
 
 /// One parent column's `(retired, added)` sets: `added` are the surviving rows'
-/// non-NULL values; `retired` are the old committed values of touched PKs whose
-/// surviving state is absent or holds something else. Old values come from the
-/// packed PK, or from `gathered` for a non-PK column.
-///
-/// Only a PK that exists committed has an old value to retire, so U-PK's
-/// `committed` flag bounds the walk — a pure INSERT empties it.
+/// non-NULL values; `retired` are the `old_value`s of touched committed PKs that
+/// their surviving state no longer holds.
 fn parent_retired_added(
     b: &TxnBundle<'_>,
     parent_tid: i64,
     ref_col: usize,
-    gathered: Option<&FxHashMap<PkBuf, u128>>,
+    old_value: impl Fn(&[u8]) -> Option<u128>,
 ) -> ParentDelta {
-    let parent_schema = b.schema(parent_tid);
-    let loc = parent_schema.locate(ref_col);
-
-    // Old committed value per touched PK (non-NULL only).
-    let mut old_of: FxHashMap<&[u8], u128> = FxHashMap::default();
-    if let ColumnLocator::Pk { byte_off, size, .. } = loc {
-        let (off, size) = (byte_off as usize, size as usize);
-        for p in b.touched_committed(parent_tid) {
-            old_of.insert(p, gnitz_wire::widen_pk_be(&p[off..off + size]));
-        }
-    } else if let Some(g) = gathered {
-        for p in b.touched_committed(parent_tid) {
-            if let Some(&v) = g.get(p) {
-                old_of.insert(p, v);
-            }
-        }
-    }
+    let loc = b.schema(parent_tid).locate(ref_col);
+    let old_of: FxHashMap<&[u8], u128> = b
+        .touched_committed(parent_tid)
+        .filter_map(|p| Some((p, old_value(p)?)))
+        .collect();
 
     let mut added: FxHashSet<u128> = FxHashSet::default();
     let mut retired: FxHashMap<u128, RetireVerb> = FxHashMap::default();
@@ -1056,9 +1038,9 @@ struct RestrictPlan {
     /// Splits a reply entry into `[span ‖ holder PK]`, and re-encodes a
     /// surviving holder's own span for the exemption test.
     spec: IndexKeySpec,
-    /// Probed span → the referenced value's key image it encodes, paired while the
-    /// probe batch is built: a reply names a span, the rejection names a value.
-    values: FxHashMap<PkBuf, u128>,
+    /// The probed referenced values' key images, sorted: check batch row `j`
+    /// encodes `values[j]`. A reply names a span, the rejection names a value.
+    values: Vec<u128>,
     /// The bundle touches this child, so a committed holder it retires is
     /// exempt; for an unbundled child the first committed holder is fatal.
     bundled: bool,
@@ -1094,7 +1076,7 @@ async fn txn_check_fk_restrict(
             parent_col,
         } = edge;
         let (retired, added) = &deltas[&delta_key(&edge)];
-        let v_check: Vec<u128> = retired.keys().copied().filter(|v| !added.contains(v)).collect();
+        let mut v_check: Vec<u128> = retired.keys().copied().filter(|v| !added.contains(v)).collect();
         if v_check.is_empty() {
             continue;
         }
@@ -1108,12 +1090,7 @@ async fn txn_check_fk_restrict(
         // `v` is a key image, not a native value, so the batch is built by
         // `build_check_batch`.
         let ref_tc = b.schema(parent_tid).columns[parent_col].type_code;
-        let batch = build_check_batch(&idx_schema, &v_check, ref_tc);
-        let key_size = spec.key_size();
-        let mut values: FxHashMap<PkBuf, u128> = FxHashMap::default();
-        for (j, &v) in v_check.iter().enumerate() {
-            values.insert(PkBuf::from_bytes(&batch.get_pk_bytes(j)[..key_size]), v);
-        }
+        let batch = build_check_batch(&idx_schema, &mut v_check, ref_tc);
         // A value with no committed holder contributes no reply rows in either
         // mode, so both ride the same burst.
         let bundled = b.has(child_tid);
@@ -1135,7 +1112,7 @@ async fn txn_check_fk_restrict(
             schema: wire::WireSchema::encoded(child_tid, idx_schema),
             reply: None,
         });
-        plans.push(RestrictPlan { edge, spec, values, bundled });
+        plans.push(RestrictPlan { edge, spec, values: v_check, bundled });
     }
 
     // A streaming fold: the first non-exempt holder aborts the drain, whose
@@ -1149,22 +1126,13 @@ async fn txn_check_fk_restrict(
                 continue;
             }
             let (span, holder) = plan.spec.split_entry(rows.get_pk_bytes(j));
-            let Some(&v) = plan.values.get(span) else {
+            let Some(r) = checks[i].rows_of(span).next() else {
                 continue;
             };
+            let v = plan.values[r];
             // U-SEC's predicate, on the same bytes: does the bundle's
             // surviving version of this holder still carry this key?
-            let exempt = plan.bundled
-                && match b.overlay(plan.edge.child_tid).get(holder) {
-                    None => false, // untouched committed child still references v
-                    Some(e) => match e.last {
-                        FoldOp::Deleted => true,
-                        FoldOp::Inserted(cf, cr) => {
-                            !plan.spec.key_bytes(b.mem(cf), cr as usize, &mut hspan) || hspan.pk_bytes() != span
-                        }
-                    },
-                };
-            if exempt {
+            if plan.bundled && b.retires(plan.edge.child_tid, &plan.spec, holder, span, &mut hspan) {
                 continue;
             }
             let verb = restrict_verb(retired, v);

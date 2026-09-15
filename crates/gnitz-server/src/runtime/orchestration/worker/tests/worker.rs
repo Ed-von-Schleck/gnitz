@@ -41,14 +41,14 @@ fn send_helpers_echo_the_request_id() {
     let req_resp: u64 = 0xCAFE_BABE_DEAD_BEEF;
     let req_err: u64 = u64::MAX;
     wp.send_ack(7, req_ack);
-    // Pass ReplySchema::ClientAuthored: it emits no block and so consults
+    // Pass ReplySchema::ReaderHeld: it emits no block and so consults
     // no catalog, which this test does not have (null catalog pointer).
     // The id round-trip is the assertion of interest.
     let schema = make_schema_u64_i64();
     wp.send_scan_response(
         route(8, req_resp, 0),
         Batch::empty_with_schema(&schema),
-        ReplySchema::ClientAuthored,
+        ReplySchema::ReaderHeld,
         0,
     );
     wp.send_fault(&gnitz_wire::WireFault::from("boom"), req_err);
@@ -68,7 +68,7 @@ fn send_helpers_echo_the_request_id() {
 /// budget is pinned rather than read from the environment, so a shell that
 /// exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these frames.
 fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
-    let mut wp = WorkerProcess::new(0, catalog, unsafe { std::mem::zeroed() }, writer, -1, HashMap::new());
+    let mut wp = WorkerProcess::new(catalog, unsafe { std::mem::zeroed() }, writer, HashMap::new());
     wp.reply_frame_budget = ipc::FRAME_CAP;
     wp
 }
@@ -190,7 +190,7 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
 
 /// Encode a header-only ExchangeRelay wire frame (schema, no data batch)
 /// whose control block echoes `source_id` via `seek_pk`, as the master's
-/// `emit_relay_with_decision` does. Leaked to `'static` for `dispatch`, which
+/// `emit_relay` does. Leaked to `'static` for `dispatch`, which
 /// fail-stops on a frame that does not decode.
 fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
     // No data batch — a header-only relay. `seek_pk` echoes the source_id the
@@ -288,7 +288,7 @@ fn ddl_sync_defers_inside_exchange() {
 
 /// `Flush` and `Push` run INLINE inside an exchange wait — neither queue may
 /// grow, and both must ACK from inside the wait. Flush is the deadlock cell: it
-/// would never ACK, so `flush_round` would hold `sal_writer_excl` forever and
+/// would never ACK, so `flush_round` would hold its `SalExcl` forever and
 /// the tick's relay could never be written for the exchange this worker is
 /// parked on.
 #[test]
@@ -515,7 +515,7 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         } else {
             route(1, 3, 0)
         };
-        wp.send_shared_scan_response(r, Rc::new(make_n_row_batch(schema, 5)), ReplySchema::ClientAuthored, 0);
+        wp.send_shared_scan_response(r, Rc::new(make_n_row_batch(schema, 5)), ReplySchema::ReaderHeld, 0);
 
         if force_fifo {
             assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
@@ -560,7 +560,7 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_shared_scan_response(fifo_route(1, 5, 0), Rc::clone(&batch), ReplySchema::ClientAuthored, 0);
+    wp.send_shared_scan_response(fifo_route(1, 5, 0), Rc::clone(&batch), ReplySchema::ReaderHeld, 0);
     assert_eq!(wp.pending_streams.len(), 1, "force_fifo queues even a fitting reply");
     assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
@@ -705,7 +705,7 @@ fn an_oversized_reply_enqueues_a_train() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(3, 5, 9), batch, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(3, 5, 9), batch, ReplySchema::ReaderHeld, 0);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
     assert_eq!(ps.next_row, 0);
@@ -730,7 +730,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = 512;
-    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ReaderHeld, 0);
 
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
@@ -762,7 +762,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ReaderHeld, 0);
     assert_eq!(
         wp.pending_streams.len(),
         1,
@@ -804,7 +804,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = budget;
-    wp.send_scan_response(route(1, 5, 0), source, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(1, 5, 0), source, ReplySchema::ReaderHeld, 0);
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
         wp.emit_pending_scan_chunk();
@@ -843,15 +843,11 @@ fn a_long_string_train_reassembles_with_its_weights() {
     assert_eq!(got, want, "the train reassembles to the source, weights included");
 }
 
-/// A projected (gather) reply schema must ride a ONE-OFF wire block: the
-/// table-keyed cache must neither serve it (the master would decode
-/// projected rows with the base table's stride) nor store it (a later
-/// table reply would be decoded with the projected stride). The block is
-/// unchecksummed — every consumer of a one-off reply decodes through the ring,
-/// which verifies none.
+/// A projected schema cached under the table's id would decode a later table
+/// reply at the wrong stride.
 #[test]
-fn a_projected_reply_carries_a_one_off_block() {
-    let dir = crate::test_support::scratch_dir("worker", "projected_one_off");
+fn a_reader_held_reply_carries_no_block_at_version_0() {
+    let dir = crate::test_support::scratch_dir("worker", "reader_held_reply");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
         col_def("id", type_code::U64),
@@ -864,41 +860,30 @@ fn a_projected_reply_carries_a_one_off_block() {
         .unwrap();
     let table_schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     let projected = gnitz_store::schema::project_schema(&table_schema, &[1]).unwrap();
-    assert_ne!(projected.num_columns(), table_schema.num_columns());
 
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 
-    // Fitting projected reply: one frame carrying the projected schema.
     let small = Batch::zeroed(&projected, 2);
-    wp.send_scan_response(route(tid as u64, 5, 0), small, ReplySchema::OneOff(&projected), 0);
+    wp.send_scan_response(route(tid as u64, 5, 0), small, ReplySchema::ReaderHeld, 0);
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
-    let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("decode projected reply");
-    assert_eq!(
-        decoded.schema.expect("schema block present").num_columns(),
-        projected.num_columns()
-    );
+    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1, false).unwrap();
+    assert!(!ctrl.flags.has_schema, "a fitting reply ships no block");
+    assert_eq!(ctrl.flags.schema_version, 0);
 
-    // Oversized projected reply: the queued train holds the one-off block.
     let rows = (ipc::FRAME_CAP / 32) + 4096;
     let big = Batch::zeroed(&projected, rows);
-    wp.send_scan_response(route(tid as u64, 6, 0), big, ReplySchema::OneOff(&projected), 0);
+    wp.send_scan_response(route(tid as u64, 6, 0), big, ReplySchema::ReaderHeld, 0);
     assert_eq!(wp.pending_streams.len(), 1);
-    let expected_block = crate::catalog::encode_schema_block(&projected, tid as u32);
     let ps = wp.pending_streams.front().unwrap();
-    assert_eq!(ps.next_row, 0);
-    assert_eq!(
-        ps.prebuilt_schema.as_deref().map(Vec::as_slice),
-        Some(expected_block.as_slice()),
-        "the train's schema block is the one-off projected block",
-    );
+    assert!(ps.prebuilt_schema.is_none(), "a queued train ships no block");
+    assert_eq!(ps.server_version, 0);
 
-    // Both paths left the table's cached wire block untouched.
     assert!(
         engine.get_cached_schema_wire_block(tid).is_none(),
-        "a projected reply must never populate the table's schema-block cache"
+        "a reader-held reply must never populate the table's schema-block cache"
     );
 
     engine.close();
