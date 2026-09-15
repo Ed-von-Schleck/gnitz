@@ -654,20 +654,21 @@ impl CatalogEngine {
     }
 
     /// Validate one family of a `DDL_TXN` before any of it is applied, so a
-    /// rejection needs no compensation.
+    /// rejection needs no compensation. Returns the sorted ids the delta drops.
     ///
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family must
     /// decide here whether it carries guards beyond the contract, rather than
     /// falling into a silent `_` arm.
-    pub(crate) fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+    pub(in crate::catalog) fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<Vec<i64>, String> {
         let (sigs, net_dead) = self.check_family_contract(family, batch)?;
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch, &net_dead),
-            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &net_dead),
+            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &sigs, &net_dead),
             SysFamily::Column => self.precheck_column_family(batch, &sigs),
             SysFamily::Index => self.precheck_index_family(batch, &net_dead),
             SysFamily::Sequence | SysFamily::CircuitNodes => Ok(()),
-        }
+        }?;
+        Ok(net_dead)
     }
 
     /// The cross-family rules of one `DDL_TXN` bundle: what no family's own arm
@@ -737,28 +738,19 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// SCHEMA_TAB: a CREATE must not collide with a live schema name — nor with
-    /// one this same batch already claims — and a DROP must find the schema
-    /// empty. The empty-schema guard runs before any WAL write, so a rejected
-    /// non-empty drop queues no dir deletion and retracts no rows, converting a
-    /// silent member-orphan into a loud error; a DROP SCHEMA bundle's members are
-    /// retracted by earlier families, so its count is 0 by the time it runs.
-    ///
-    /// Schema ids share an i64 space with relation ids, so a schema drop must NOT
-    /// be probed against the relation-keyed dep map — the member count is the
-    /// whole guard.
+    /// SCHEMA_TAB: a CREATE must not collide with a live schema name — nor with one
+    /// this batch already claims — and a DROP must find the schema empty. Schema ids
+    /// share an i64 space with relation ids, so the member count, not the
+    /// relation-keyed dep map, is the whole drop guard.
     fn precheck_schema_family(&mut self, batch: &Batch, net_dead: &[i64]) -> Result<(), String> {
         // Two `+1` rows under one name both pass the cache check below and both
         // apply: `schema_by_name` keeps the second, leaving the first id live and
-        // unreachable, and dropping the reachable one deletes the orphan's
-        // directory (the deletion is queued by name).
+        // unreachable.
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         for i in batch.live_rows() {
             let name = payload_string(batch, i, SCHEMATAB_PAY_NAME);
-            // The full identifier rule, leading-`_` included: a schema name is
-            // the one the engine interpolates into a filesystem path
-            // (`hook_schema_dir` → `create_dir_all`, and `remove_dir_all` on
-            // the `-1` arm). Nothing synthesizes one, so no carve-out.
+            // The full identifier rule, leading-`_` included. Nothing synthesizes
+            // a schema name, so the reserved `_` prefix applies with no carve-out.
             validate_user_identifier(&name)?;
             reject_non_canonical(&name, "schema")?;
             if self.has_schema(&name) {
@@ -784,14 +776,23 @@ impl CatalogEngine {
     /// The drop guards key on `net_dead` — the PKs whose bundle net is dead — not
     /// raw `weight < 0`, so a rename pair's net-live `-1` is never rejected as
     /// "referenced by FK" / "View dependency".
-    fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch, net_dead: &[i64]) -> Result<(), String> {
+    fn precheck_relation_family(
+        &mut self,
+        family: SysFamily,
+        batch: &Batch,
+        sigs: &[PkSignature],
+        net_dead: &[i64],
+    ) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         // Sorted for `validate_view_owner`'s probe, which runs per `+1` row.
         let mut view_creates: Vec<i64> = if is_table {
             Vec::new()
         } else {
-            family_pk_partition(family, batch).creates
+            sigs.iter()
+                .filter(|s| s.pos.is_some() && s.neg.is_none())
+                .map(|s| s.leading)
+                .collect()
         };
         view_creates.sort_unstable();
 

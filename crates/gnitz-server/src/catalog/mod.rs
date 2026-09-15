@@ -25,7 +25,6 @@
 //! of this module: they reach this subsystem's surface, not any one module's
 //! private items.
 
-mod apply_context;
 mod bootstrap;
 mod cache;
 mod hooks;
@@ -72,7 +71,6 @@ use sys_tables::*;
 // ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
 //    the submodules through their `use super::*` glob, so they stay re-exported
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
-pub(in crate::catalog) use apply_context::{ApplyContext, ApplyMode};
 pub(in crate::catalog) use cache::{CatalogCacheSet, SchemaWireEntry};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use registry::raise_id_counter;
@@ -80,19 +78,17 @@ pub(in crate::catalog) use registry::raise_id_counter;
 // catalog only consumes them.
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_store::storage::ChildAddr;
-pub(in crate::catalog) use utils::{
-    pair_opk, preflight_dir, retract_bands, retract_pk_list, schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
-};
+pub(in crate::catalog) use utils::{pair_opk, preflight_dir, sys_opk};
 // The relation rung's directory primitives; the catalog only consumes them.
 pub(in crate::catalog) use gnitz_store::relation::{
-    ensure_dir, lock_data_dir, relation_dir, staged_dir, DIR_LOCK_RETRY_FOR,
+    lock_data_dir, relation_dir, relations_dir, staged_dir, DIR_LOCK_RETRY_FOR,
 };
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
 pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;
 // The generic payload-cell readers every system-row decoder in this subsystem
 // reads a cell through, whatever the row's source.
-pub(in crate::catalog) use gnitz_store::storage::{payload_str, payload_string, payload_u64};
+pub(in crate::catalog) use gnitz_store::storage::{payload_string, payload_u64};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine
@@ -148,33 +144,8 @@ pub(crate) struct CatalogEngine {
     /// a clean same-topology restart (every view resumes).
     pub(in crate::catalog) invalid_views: rustc_hash::FxHashSet<i64>,
 
-    // --- Pending broadcasts (ordered innermost → outermost) ---
-    //
-    // The master's applied bundle families, in apply order, for relay to the
-    // workers. `ddl_sync` never enqueues.
+    /// The master's applied families in apply order, each queued before its ingest:
+    /// the zone's broadcast and the undo log `compensate_stage_a` replays.
+    /// `ddl_sync` never enqueues.
     pub(in crate::catalog) pending_broadcasts: Vec<(SysFamily, Batch)>,
-
-    // --- Deferred physical directory deletions ---
-    //
-    // A table/view/index drop hook queues the entity's on-disk directory here
-    // instead of deleting it synchronously. `fire_hooks` runs during DAG
-    // evaluation, which overlaps the WAL fdatasync; a synchronous delete would
-    // open a window where the directory is gone but the DROP is not yet durably
-    // committed (a crash there leaves the catalog showing the entity as still
-    // existing while its files are permanently absent). The executor drains
-    // this only after the DDL zone's fdatasync confirms durability — the
-    // catalog analog of `ShardIndex::pending_deletions`.
-    pub(in crate::catalog) pending_dir_deletions: Vec<String>,
-
-    /// Directories that are durably dropped but must NOT be physically removed
-    /// yet: worker processes share this on-disk tree and may still be applying
-    /// the CREATE of the same entity (a `DdlSync` group is fire-and-forget and
-    /// applied in-order, slower than the master's own removal). Removal is
-    /// deferred to the next checkpoint, whose per-worker ACK barrier proves
-    /// every worker has consumed past this DROP — hence finished the CREATE.
-    pub(in crate::catalog) checkpoint_gated_deletions: Vec<String>,
-
-    // The applier's current execution context: the apply mode and the DDL-zone
-    // LSN. See `ApplyContext`.
-    pub(in crate::catalog) ctx: ApplyContext,
 }

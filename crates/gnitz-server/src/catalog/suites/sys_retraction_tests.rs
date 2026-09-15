@@ -1,9 +1,7 @@
 //! The per-PK CAS + net retraction contract on the IDX_TAB and SCHEMA_TAB
-//! families, whose drop consumers act on the batch payload (`apply_index_caches`
-//! unmaps `index_by_name` by the payload name, `hook_schema_dir` builds its
-//! `remove_dir_all` path from it). Two shapes reach them without the contract: a
-//! stale `-1` whose row is already gone (`net = -1`) and a `-1` naming a
-//! different live row (`net = 0`).
+//! families, whose drop consumers unmap a cached name read off the batch payload.
+//! Two shapes reach them without the contract: a stale `-1` whose row is already
+//! gone (`net = -1`) and a `-1` naming a different live row (`net = 0`).
 //!
 //! The relation families' equivalents are in `alter_tests`; the legitimate DROP
 //! paths these guards must not break are in `index_tests` / `fk_tests` /
@@ -68,7 +66,7 @@ fn idx_row_batch(idx_id: i64, weight: i64, row: &IdxRow) -> Batch {
 fn stale_schema_retraction_spares_the_live_schemas_directory() {
     // A resolved `s` to its id; B dropped and recreated `s`; A's `-1` for the
     // dead id then lands carrying the name `s` — now the live schema's. Without
-    // the net check the deletion queue takes `<dir>/s`.
+    // the net check the live schema's name is unmapped.
     let dir = temp_dir("sysretract_stale_schema");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
@@ -76,12 +74,11 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
     engine.create_schema("s").unwrap();
     let old_sid = engine.schema_id("s").expect("the schema exists");
     engine.drop_schema("s").unwrap();
-    engine.defer_pending_dir_deletions(); // the DROP-success path
     engine.create_schema("s").unwrap();
     let new_sid = engine.schema_id("s").expect("the schema exists");
     assert_ne!(old_sid, new_sid, "the recreate must allocate a fresh id");
     let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
-    let tbl_dir = format!("{dir}/s/t_{tid}");
+    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     assert!(Path::new(&tbl_dir).exists());
 
     let err = engine
@@ -92,15 +89,11 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
         "a `-1` for a schema id that is already gone must be rejected: {err}"
     );
 
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "a rejected drop must queue no directory deletion"
-    );
-    engine.drain_pending_dir_deletions();
-    engine.drain_checkpoint_gated_deletions();
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
     assert!(
         Path::new(&tbl_dir).exists(),
-        "the live schema's table directory must survive both drains"
+        "the live schema's table directory must survive the sweep"
     );
     assert_eq!(engine.get_by_name("s", "t"), Some(tid));
 
@@ -120,7 +113,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
     engine.create_schema("b").unwrap();
     let sid_a = engine.schema_id("a").expect("the schema exists");
     let tid = engine.create_table("b.t", &cols, &[0]).unwrap();
-    let b_dir = format!("{dir}/b");
+    let b_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
 
     let err = engine
         .ingest_to_family(SCHEMA_TAB_ID, &schema_tab_batch(sid_a, -1, "b"))
@@ -132,12 +125,9 @@ fn schema_retraction_under_another_schemas_name_rejected() {
 
     assert!(engine.has_schema("a") && engine.has_schema("b"));
     assert_eq!(engine.get_by_name("b", "t"), Some(tid));
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "b's directory must never be queued for deletion"
-    );
-    engine.drain_pending_dir_deletions();
-    assert!(Path::new(&b_dir).exists());
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
+    assert!(Path::new(&b_dir).exists(), "b.t's directory must survive the sweep");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

@@ -161,9 +161,9 @@ def test_a_view_created_under_traffic_holds_every_row(client, schema_name, serve
 
 
 def test_a_drop_does_not_race_a_worker_still_creating_the_table(seamed_server):
-    """The master defers a dropped table's directory removal to the next
-    checkpoint, so a worker still inside that table's CREATE finishes against a
-    directory that exists instead of aborting on ENOENT.
+    """The master sweeps a dropped table's directory only behind a checkpoint's
+    worker-ACK barrier, so a worker still inside that table's CREATE finishes
+    against a directory that exists instead of aborting on ENOENT.
 
     `GNITZ_INJECT_TABLE_CREATE_DELAY_MS` makes every worker sleep between creating
     the table directory and its partition subdirectories, and a DDL's ACK waits on

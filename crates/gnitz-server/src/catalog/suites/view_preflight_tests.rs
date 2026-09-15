@@ -60,10 +60,10 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
     vid
 }
 
-/// Names of the entries directly under `public`'s schema directory — where the
-/// pre-flight's throwaway root lives.
-fn schema_entries(dir: &str) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(format!("{dir}/public"))
+/// Names of the entries directly under the relation root — where the pre-flight's
+/// throwaway root lives.
+fn relation_root_entries(dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(relations_dir(dir))
         .unwrap()
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
@@ -87,7 +87,7 @@ fn test_preflight_compile_verdict_and_no_residue() {
     let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
-    let before = schema_entries(&dir);
+    let before = relation_root_entries(&dir);
 
     // A compilable circuit: a well-formed predicate over the base's own columns.
     let ok_vid = register_filtered_view(&mut engine, base_tid, "vok", &pred_lt_blob(1, 100));
@@ -102,7 +102,7 @@ fn test_preflight_compile_verdict_and_no_residue() {
     // below would hold vacuously. It also covers the I/O rejection case — a
     // child table that cannot be created fails the compile instead of yielding a
     // view that never persists its differential state.
-    let root = format!("{dir}/public/_preflight_{ok_vid}");
+    let root = preflight_dir(&dir, ok_vid);
     fs::write(&root, b"").unwrap();
     let io_msg = engine
         .preflight_view_compile(ok_vid)
@@ -129,7 +129,7 @@ fn test_preflight_compile_verdict_and_no_residue() {
 
     // Neither compile left a `_preflight_*` root; the only new entries are the
     // two views' own directories, created by the register hook.
-    let after = schema_entries(&dir);
+    let after = relation_root_entries(&dir);
     let new: Vec<&String> = after.iter().filter(|n| !before.contains(n)).collect();
     assert!(
         new.iter().all(|n| !n.starts_with("_preflight")),
@@ -186,13 +186,8 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Rolling back a replacing bundle has to undo each PK by what the bundle did to
-/// *that* PK: the one VIEW_TAB batch registers the new chain and retires the
-/// incumbent, so the rollback tears one down and restores the other — opposite
-/// family orders, and opposite verdicts on the two directories. Getting it wrong
-/// is not a cosmetic loss: removing every queued directory would take the
-/// restored view's live data with it, and unregistering the incumbent's rows
-/// before its columns are back would fail the rollback and abort the node.
+/// One VIEW_TAB batch registers the replacement and retires the incumbent; its
+/// rollback must restore the incumbent and retire the replacement.
 #[test]
 fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let dir = temp_dir("preflight_rollback");
@@ -207,8 +202,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         .directory()
         .to_string();
 
-    // The handler discards stale queue entries before the bundle it is about to
-    // apply; the setup above is not part of that bundle.
+    // The setup is not part of the bundle being compensated.
     let _ = engine.drain_pending_broadcasts();
 
     // The replacing bundle: the new chain's own rows, then one VIEW_TAB batch
@@ -231,7 +225,8 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
 
     // The pre-flight rejects the replacement's circuit — the bundle fails after
     // VIEW_TAB was applied, exactly where the handler compensates.
-    engine.compensate_stage_a(None).unwrap();
+    engine.compensate_stage_a().unwrap();
+    engine.reclaim_orphan_dirs();
 
     assert!(
         engine.registry().has_id(old_vid),
@@ -247,7 +242,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     );
     assert!(
         !std::path::Path::new(&new_dir).exists(),
-        "the replacement's directory must be removed: {new_dir}"
+        "the sweep must reclaim the replacement's directory: {new_dir}"
     );
 
     engine.close();

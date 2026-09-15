@@ -300,7 +300,6 @@ fn test_nonempty_schema_drop_rejected() {
         .unwrap();
     let sid = engine.schema_id("s").expect("the schema exists");
     assert!(!engine.schema_is_empty("s"), "precondition: schema has a member");
-    assert!(engine.pending_dir_deletions.is_empty(), "precondition: no dir queued");
 
     // A direct SCHEMA_TAB -1 (bypassing any cascade) is rejected by the guard.
     let err = engine.submit_retraction(SysFamily::Schema, sid as u128).unwrap_err();
@@ -309,17 +308,12 @@ fn test_nonempty_schema_drop_rejected() {
         "expected a non-empty-schema rejection, got: {err}"
     );
 
-    // Nothing was orphaned: the schema, its member, and the caches all survive,
-    // and the rejected drop (running before any write) queued no dir deletion.
+    // Nothing was orphaned: the schema, its member, and the caches all survive.
     assert!(engine.has_schema("s"), "schema must survive a rejected drop");
     assert_eq!(
         engine.get_by_name("s", "t"),
         Some(tid),
         "member row + caches must survive a rejected drop"
-    );
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "a rejected non-empty drop must queue no directory deletion"
     );
 
     // Emptying the schema first lets the same drop succeed (guard now passes).
@@ -604,15 +598,15 @@ fn test_drop_view_removes_directory() {
         "view dir should exist after create: {view_dir}"
     );
 
-    // Drop removes catalog metadata and queues the physical directory into
-    // pending_dir_deletions (deferred so the rmdir can't race the WAL fsync).
-    // In production the DDL executor drains the queue once the zone is durable;
-    // drive that step directly here.
+    // Drop removes catalog metadata and leaves the physical directory to the
+    // orphan sweep, which production runs once every worker has applied the
+    // drop; drive both steps directly here.
     engine.drop_view("public.myview").unwrap();
-    engine.drain_pending_dir_deletions();
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
     assert!(
         !std::path::Path::new(&view_dir).exists(),
-        "view dir must be deleted on drop: {view_dir}"
+        "view dir must be deleted by the sweep after the drop: {view_dir}"
     );
 
     // No double-drop: the view is gone from the catalog.
@@ -659,7 +653,6 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 
     // Drop the view: the VIEW_TAB -1 cascade must retract both families.
     engine.drop_view("public.depview").unwrap();
-    engine.drain_pending_dir_deletions();
 
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Column).cursor()),
@@ -678,7 +671,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 
 // ── ddl_emitters_use_no_raw_handle_capability ────────────────────────
 // Capability guard: a DDL emitter mutates catalog state only by submitting a
-// delta (submit / submit_local / submit_retraction). It may READ a family's
+// delta (submit / submit_retraction). It may READ a family's
 // store — `submit_retraction` copies the live row it is about to negate — but it
 // must never write one directly, which would skip the precheck, the hooks and
 // the broadcast queue in one line. Pinned as source text because no runtime
@@ -691,7 +684,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 #[test]
 fn ddl_emitters_use_no_raw_handle_capability() {
     let src = include_str!("ddl_fixture.rs");
-    for forbidden in ["ingest_owned_batch", "ingest_borrowed", "apply_local"] {
+    for forbidden in ["ingest_owned_batch", "ingest_borrowed", "apply_family"] {
         assert!(
             !src.contains(forbidden),
             "a DDL emitter must not call {forbidden} — emit a delta via submit instead"
@@ -699,11 +692,10 @@ fn ddl_emitters_use_no_raw_handle_capability() {
     }
 }
 
-// ── drop_cascade_broadcasts_children_before_parents ──────────────────
-// A table drop queues its children (IDX, COL) ahead of the TABLE row, the order
-// workers apply them in — which no end-state assertion can see.
+// ── drop_cascade_broadcasts_index_owner_columns_in_order ─────────────
+// Workers apply the queue in this order, which no end-state assertion can see.
 #[test]
-fn drop_cascade_broadcasts_children_before_parents() {
+fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     let dir = temp_dir("drop_cascade_broadcast_order");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -715,8 +707,8 @@ fn drop_cascade_broadcasts_children_before_parents() {
     // Clear the broadcasts accumulated by create_table + create_index.
     let _ = engine.drain_pending_broadcasts();
 
-    // Submit the table retraction; apply_bundle_family retracts the owned index
-    // (IDX) and columns (COL) ahead of it.
+    // Submit the table retraction; `submit` retracts the owned index (IDX) ahead
+    // of it and the columns (COL) behind it.
     engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
 
     // Collect the broadcast family-id sequence.
@@ -727,14 +719,13 @@ fn drop_cascade_broadcasts_children_before_parents() {
     let col_pos = pos(COL_TAB_ID).unwrap_or_else(|| panic!("COL_TAB retraction must be broadcast; seq={tids:?}"));
     let tab_pos = pos(TABLE_TAB_ID).unwrap_or_else(|| panic!("TABLE_TAB retraction must be broadcast; seq={tids:?}"));
 
-    // Children strictly precede the parent table row.
     assert!(
         idx_pos < tab_pos,
         "secondary-index retraction must broadcast before its owner table: seq={tids:?}"
     );
     assert!(
-        col_pos < tab_pos,
-        "column retraction must broadcast before its owner table: seq={tids:?}"
+        tab_pos < col_pos,
+        "column retraction must broadcast after its owner table: seq={tids:?}"
     );
 
     engine.close();
@@ -989,14 +980,11 @@ fn set_based_table_drop_queues_one_batch_per_family() {
     }
     let _ = engine.drain_pending_broadcasts();
 
-    let drop = retract_pk_list(
-        engine.sys_relation(SysFamily::Table),
-        tids.iter().map(|&t| t as u128).collect(),
-    );
+    let drop = engine.retract_pk_list(SysFamily::Table, tids.iter().map(|&t| t as u128).collect());
     engine.submit(SysFamily::Table, drop).unwrap();
 
     let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
-    assert_eq!(families, [SysFamily::Index, SysFamily::Column, SysFamily::Table]);
+    assert_eq!(families, [SysFamily::Index, SysFamily::Table, SysFamily::Column]);
     assert!(tids.iter().all(|&t| !engine.registry().has_id(t)));
 
     engine.close();
@@ -1045,7 +1033,7 @@ fn view_drop_retracts_its_segments() {
     engine.submit_retraction(SysFamily::View, v as u128).unwrap();
 
     let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
-    assert_eq!(families, [SysFamily::CircuitNodes, SysFamily::Column, SysFamily::View]);
+    assert_eq!(families, [SysFamily::View, SysFamily::CircuitNodes, SysFamily::Column]);
     for id in [v, s] {
         assert!(!engine.registry().has_id(id));
         assert_eq!(band_rows(&engine, SysFamily::CircuitNodes, id), 0);
@@ -1062,7 +1050,7 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let (v, s) = view_with_segment(&mut engine);
 
-    let drop = retract_pk_list(engine.sys_relation(SysFamily::View), vec![v as u128, s as u128]);
+    let drop = engine.retract_pk_list(SysFamily::View, vec![v as u128, s as u128]);
     engine.submit(SysFamily::View, drop).unwrap();
 
     assert!(!engine.registry().has_id(v) && !engine.registry().has_id(s));

@@ -60,7 +60,7 @@ fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut Catalog
             continue;
         };
         // `ddl_sync`: master-validated rows that already carry a drop's children.
-        catalog.ddl_sync(msg.target_id as i64, batch).map_err(|e| {
+        catalog.ddl_sync(msg.target_id as i64, msg.lsn, batch).map_err(|e| {
             format!(
                 "SAL system-table recovery apply failed (table_id={}, lsn={}): {e}",
                 msg.target_id, msg.lsn
@@ -458,10 +458,10 @@ fn master_pre_fork_recovery(
         return Err("injected system table flush fault".to_string());
     }
 
-    // Reclaim directories whose DROP committed but whose deferred deletion was
-    // lost to a crash. After both replays, so a committed-but-unflushed CREATE is
-    // not mistaken for an orphan.
-    catalog.gc_orphan_directories();
+    // Reclaim every directory a committed DROP left behind. After both replays,
+    // so a committed-but-unflushed CREATE is not mistaken for an orphan, and
+    // before the fork, so no worker is applying a DdlSync the master emitted.
+    catalog.reclaim_orphan_dirs();
 
     // Drop the child directories this boot's worker count no longer owns, before
     // each worker's `rehome` opens what is left.

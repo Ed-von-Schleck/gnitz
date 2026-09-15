@@ -24,13 +24,6 @@ pub(crate) fn engine(e: StoreError) -> MirrorError {
     MirrorError::Engine(e.to_string())
 }
 
-/// `<base_dir>/_copies` — the root every mirrored relation's directory sits
-/// under, so `<base_dir>` itself holds exactly three entries this crate wrote:
-/// `LOCK`, `mirror_state` and this. That is what lets [`Mirror::open`]'s sweep
-/// enumerate a directory the mirror provably created, where the server's boot
-/// sweep refuses to enumerate an arbitrary host-chosen root.
-const COPIES_DIRNAME: &str = "_copies";
-
 /// `GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR`: fail the next checkpoint once, before
 /// anything durable moved; the after-flush shape is the torn-checkpoint test's.
 /// Debug-only. It is the only way to reach [`Mirror::checkpoint`]'s
@@ -144,13 +137,11 @@ impl Mirror {
         // Before anything is entered that is every directory: the generation
         // counter restarts at 0 after a lost `mirror_state`, so a stale manifest
         // would become resumable again.
-        mirror
-            .registry
-            .reclaim_orphan_relation_dirs([format!("{base_dir}/{COPIES_DIRNAME}")]);
+        mirror.registry.reclaim_orphan_relation_dirs(base_dir);
         Ok(mirror)
     }
 
-    /// Enter one relation: open its copy under `<base_dir>/_copies` and record
+    /// Enter one relation: open its copy under `<base_dir>/_relations` and record
     /// it. Together with [`Self::retract`] the only writer of either map, which
     /// is what keeps their key sets equal without either consulting the other.
     pub(crate) fn enter(&mut self, tid: u64, rec: MirrorRecord) -> Result<(), MirrorError> {
@@ -165,7 +156,7 @@ impl Mirror {
                     // mirror runs.
                     kind: RelationKind::View,
                     schema,
-                    directory: relation_dir(&self.base_dir, COPIES_DIRNAME, RelationKind::View, tid as i64),
+                    directory: relation_dir(&self.base_dir, RelationKind::View, tid as i64),
                     // No skeleton row is ever written, so nothing can ask this
                     // store to hydrate; and the store maintains no feed of its own.
                     budgets: ViewBudgets::default(),

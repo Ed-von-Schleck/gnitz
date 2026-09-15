@@ -541,12 +541,7 @@ impl WorkerProcess {
             SalMessageKind::DdlSync => {
                 if let Some(batch) = batch {
                     if !batch.is_empty() {
-                        self.cat().ddl_sync(target_id, batch)?;
-                        // Drop hooks queue the entity's directory, but the master
-                        // (which shares this on-disk tree) physically removes it
-                        // after the DDL zone is durable. Discard the worker's
-                        // redundant queue so it cannot grow unbounded.
-                        self.cat().discard_pending_dir_deletions();
+                        self.cat().ddl_sync(target_id, lsn, batch)?;
                         // A DROP retracts the table/view's catalog row, so its id is
                         // no longer live. If a push landed between its last tick and
                         // the drop, its pending_deltas entry would never tick again

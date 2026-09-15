@@ -388,7 +388,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
 // ---------------------------------------------------------------------------
 
 /// `Table::new` creates the index directory before the hook can fail, so a
-/// failed registration would orphan it — but `with_staged_dir` reclaims a stage
+/// failed registration would orphan it — but `staged_dir` reclaims a stage
 /// whose closure failed, with no drain from the caller.
 #[test]
 fn test_create_index_backfill_fail_no_dir_leak() {
@@ -421,17 +421,13 @@ fn test_create_index_backfill_fail_no_dir_leak_internal() {
 
     // Capture the expected index directory before create_index allocates the id.
     let expected_idx_id = engine.next_index_id;
-    let owner_dir = format!("{dir}/public/leaktest_{tid}");
+    let owner_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     let idx_dir = format!("{owner_dir}/idx_{expected_idx_id}");
 
     let result = engine.create_index("public.leaktest", &["val"], true);
     assert!(result.is_err(), "the injected backfill fault must fail the create");
 
-    // Reclaimed by the failing stage itself, with no drain from the caller.
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "a failed stage must leave nothing queued"
-    );
+    // Reclaimed by the failing stage itself, with no sweep from the caller.
     assert!(
         !std::path::Path::new(&idx_dir).exists(),
         "index directory must not leak after failed backfill: {idx_dir}"
@@ -580,13 +576,8 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 }
 
 // ---------------------------------------------------------------------------
-// DDL_TXN bundle rollback — the ghost regression and the hook-failure path
-//
-// These drive the generalized handler shape directly: precheck_family +
-// apply_and_enqueue_family per family, with the between-precheck-and-apply
-// marker, then compensate_stage_a — exactly as `handle_ddl_txn` does. The
-// existing tests above stop at `ingest_to_family` and never reach
-// compensate_stage_a, so the ghost -1 was untested.
+// DDL_TXN bundle rollback: `submit` per family, then `compensate_stage_a`, as
+// `handle_ddl_txn` does.
 // ---------------------------------------------------------------------------
 
 /// The durable relation-id ceiling is enforced at `precheck_family` — the point
@@ -635,9 +626,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
 }
 
 /// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB fails **precheck**
-/// (duplicate name) must leave neither an orphan COL_TAB nor a ghost `-1`
-/// TABLE_TAB. The marker stays `None` (precheck failed before apply), so
-/// compensation reconstructs nothing and only negates the drained COL_TAB.
+/// (duplicate name) must leave neither an orphan COL_TAB nor a ghost `-1` TABLE_TAB.
 #[test]
 fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let dir = temp_dir("ddl_txn_precheck_ghost");
@@ -648,25 +637,22 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
-    // Discard any queue entries the setup left behind, exactly as `handle_ddl_txn`
-    // does before ingesting a new bundle — so compensation drains only this
-    // bundle's families.
+    // The setup is not part of the bundle being compensated.
     let _ = engine.drain_pending_broadcasts();
 
     let new_tid = engine.allocate_table_id().unwrap();
-    // Ascending topo: COL_TAB(1) applied + enqueued first.
+    // Ascending topo: COL_TAB(1) applied first.
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
-    engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
-    engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
+    engine.submit(SysFamily::Column, col_batch).unwrap();
 
-    // TABLE_TAB(6): precheck fails (duplicate name), so the handler's loop never
-    // applies it and its marker stays None. Compensation reconstructs nothing.
+    // TABLE_TAB(6): precheck fails (duplicate name), so nothing of it is queued
+    // or applied.
     let table_batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
     assert!(
-        engine.precheck_family(SysFamily::Table, &table_batch).is_err(),
+        engine.submit(SysFamily::Table, table_batch).is_err(),
         "duplicate-name TABLE_TAB must fail precheck"
     );
-    engine.compensate_stage_a(None).unwrap();
+    engine.compensate_stage_a().unwrap();
 
     // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
     assert_eq!(
@@ -687,16 +673,11 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB passes precheck but
-/// fails **inside** apply_and_enqueue (a register-hook error) must reconstruct
-/// and negate the applied-not-enqueued TABLE_TAB row (net-zero sys_tables) and
-/// negate the drained COL_TAB exactly once (no double-retraction ghost).
-///
-/// The trigger is the class of failure that survives the precheck, which reads
-/// no path: an IO error opening the relation's store — here a plain file where
-/// its directory must go, which `ensure_dir` refuses.
+/// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB passes precheck but fails
+/// in its register hook — a plain file where the relation's directory must go —
+/// must net both families to zero.
 #[test]
-fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
+fn ddl_txn_hook_failure_is_compensated() {
     let dir = temp_dir("ddl_txn_hook_rollback");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -706,25 +687,20 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
 
     let new_tid = engine.allocate_table_id().unwrap();
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
-    engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
-    engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
+    engine.submit(SysFamily::Column, col_batch).unwrap();
 
-    let blocker = relation_dir(&dir, "public", RelationKind::BaseTable, new_tid);
-    fs::create_dir_all(schema_dir(&dir, "public")).unwrap();
+    let blocker = relation_dir(&dir, RelationKind::BaseTable, new_tid);
     fs::write(&blocker, b"not a directory").unwrap();
 
     let table_batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "hooktbl");
     engine
         .precheck_family(SysFamily::Table, &table_batch)
         .expect("the precheck reads no path, so the blocker is invisible to it");
-    // Marker set BEFORE apply; apply fails in the hook, so it stays Some.
-    let mut marker: Option<(SysFamily, Batch)> = Some((SysFamily::Table, table_batch.clone()));
-    let applied = engine.apply_and_enqueue_family(SysFamily::Table, table_batch);
     assert!(
-        applied.is_err(),
+        engine.submit(SysFamily::Table, table_batch).is_err(),
         "register_relation must fail when the relation directory cannot be made"
     );
-    engine.compensate_stage_a(marker.take()).unwrap();
+    engine.compensate_stage_a().unwrap();
 
     assert!(
         std::path::Path::new(&blocker).is_file(),
@@ -734,12 +710,12 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Table).cursor()),
         tables_before,
-        "applied-not-enqueued TABLE_TAB row must net to zero"
+        "the failed TABLE_TAB row must net to zero"
     );
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Column).cursor()),
         cols_before,
-        "drained COL_TAB rows must net to zero (negated exactly once)"
+        "COL_TAB rows must net to zero (negated exactly once)"
     );
     assert!(
         !engine.registry().has_id(new_tid),
@@ -870,18 +846,17 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     engine.drain_pending_broadcasts();
 
     // The failed bundle's DROP: applied and enqueued, so compensation drains it.
-    let drop_batch = retract_pk_list(engine.sys_relation(SysFamily::Table), vec![tid as u128]);
+    let drop_batch = engine.retract_pk_list(SysFamily::Table, vec![tid as u128]);
     assert_eq!(
         drop_batch.len(),
         1,
         "the fixture table must have one live TABLE_TAB row"
     );
-    engine.precheck_family(SysFamily::Table, &drop_batch).unwrap();
-    engine.apply_and_enqueue_family(SysFamily::Table, drop_batch).unwrap();
+    engine.submit(SysFamily::Table, drop_batch).unwrap();
     assert!(!engine.registry().has_id(tid), "the drop must unregister the table");
     assert!(
         std::path::Path::new(&reldir).is_dir(),
-        "a drop only queues the directory, it does not remove it"
+        "a drop leaves the directory to the sweep"
     );
 
     // Make the restoring `build_relation_store` fail: a plain file where the
@@ -895,7 +870,7 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     fs::remove_dir_all(&child).unwrap();
     fs::write(&child, b"not a directory").unwrap();
 
-    let err = engine.compensate_stage_a(None).unwrap_err();
+    let err = engine.compensate_stage_a().unwrap_err();
     assert!(
         err.contains("Stage-A DDL compensation failed"),
         "unexpected error: {err}"
@@ -942,10 +917,6 @@ fn zero_weight_catalog_row_rejected() {
         engine.caches.schema_by_name.contains_key("public"),
         "the live schema must still resolve by name"
     );
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "a rejected row must queue no directory for deletion"
-    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -983,7 +954,6 @@ fn compensated_create_table_leaves_no_trace() {
         fk_def("pid", type_code::U64, parent, 0),
         col_def("val", type_code::I64),
     ];
-    let mut marker: Option<(SysFamily, Batch)> = None;
     for (family, batch) in [
         (
             SysFamily::Column,
@@ -991,12 +961,12 @@ fn compensated_create_table_leaves_no_trace() {
         ),
         (SysFamily::Table, build_table_tab_row(tid, pack_pk_cols(&[0]), "child")),
     ] {
-        engine.precheck_family(family, &batch).unwrap();
-        engine.apply_bundle_family(family, batch, &mut marker).unwrap();
+        engine.submit(family, batch).unwrap();
     }
     assert!(engine.registry().relation(tid).unwrap().index_on(&[1]).is_some());
 
-    let blocker = ChildAddr::Index { id: idx_id }.dir(&relation_dir(&dir, "public", RelationKind::BaseTable, tid));
+    let reldir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let blocker = ChildAddr::Index { id: idx_id }.dir(&reldir);
     fs::write(&blocker, b"not a directory").unwrap();
     let idx = idx_tab_batch(
         idx_id,
@@ -1006,14 +976,18 @@ fn compensated_create_table_leaves_no_trace() {
         gnitz_wire::IndexProps { is_unique: false },
         1,
     );
-    engine.precheck_family(SysFamily::Index, &idx).unwrap();
-    assert!(engine.apply_bundle_family(SysFamily::Index, idx, &mut marker).is_err());
-    engine.compensate_stage_a(marker.take()).unwrap();
+    assert!(engine.submit(SysFamily::Index, idx).is_err());
+    engine.compensate_stage_a().unwrap();
 
     assert!(!engine.caches.schema_version.contains_key(&tid));
     assert!(!engine.registry().has_id(tid));
     assert!(!engine.caches.indices_by_owner.contains_key(&tid));
     assert_eq!(counts(&engine), before, "no system family may keep a row of the table");
+    engine.reclaim_orphan_dirs();
+    assert!(
+        !std::path::Path::new(&reldir).exists(),
+        "the sweep must reclaim the uncreated table's directory"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

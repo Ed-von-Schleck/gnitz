@@ -103,8 +103,8 @@ impl RelationRegistry {
         }
 
         // Widen the window where the table dir exists but its child subdir does
-        // not, so a concurrent master remove_dir_all (DROP) deterministically
-        // races this create. User tables only.
+        // not, so a DROP of the table deterministically races this create. User
+        // tables only.
         if kind.is_base_table() {
             if let Some(ms) = TABLE_CREATE_DELAY.count() {
                 std::thread::sleep(std::time::Duration::from_millis(ms));

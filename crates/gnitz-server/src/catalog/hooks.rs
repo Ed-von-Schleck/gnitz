@@ -1,6 +1,6 @@
 use super::*;
 
-use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
+use gnitz_wire::SEQTAB_PAY_VALUE;
 use rustc_hash::FxHashMap;
 
 /// The columns of a base table that carry a derived FK index circuit: every FK
@@ -19,17 +19,19 @@ impl CatalogEngine {
     // Call order is dependency order. A relation's COL_TAB rows must be in storage
     // when its register hook runs: live DDL applies ascending `topo_priority`, and
     // boot replay opens every sys store first.
-    pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+    pub(in crate::catalog) fn fire_hooks(
+        &mut self,
+        family: SysFamily,
+        batch: &Batch,
+        on: OnRegister,
+    ) -> Result<(), String> {
         let reordered = Self::canonicalize_for_hooks(batch, family);
         let batch = reordered.as_ref().unwrap_or(batch);
         match family {
-            SysFamily::Schema => {
-                self.apply_schema_caches(batch);
-                self.hook_schema_dir(batch)?;
-            }
+            SysFamily::Schema => self.apply_schema_caches(batch),
             SysFamily::Table | SysFamily::View => {
                 self.apply_entity_caches(family, batch);
-                self.hook_relation_register(family, batch)?;
+                self.hook_relation_register(family, batch, on)?;
             }
             SysFamily::Column => {
                 self.apply_col_names_invalidate(batch);
@@ -37,7 +39,7 @@ impl CatalogEngine {
                 // MUST be last — after `apply_col_names_invalidate` evicts the
                 // cached col defs — so the descriptor rebuild reads the
                 // post-ALTER column defs.
-                self.hook_column_alter(batch)?;
+                self.hook_column_alter(batch, on)?;
             }
             SysFamily::Index => {
                 self.apply_index_caches(batch);
@@ -83,46 +85,21 @@ impl CatalogEngine {
 
     // -- Hook handlers ---------------------------------------------------------
 
-    fn hook_schema_dir(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.len() {
-            let weight = batch.get_weight(i);
-            let path = schema_dir(&self.base_dir, payload_str(batch, i, SCHEMATAB_PAY_NAME));
-            if weight > 0 {
-                // A prior DROP SCHEMA may have queued this exact (name-based)
-                // path for checkpoint-gated removal; recreating it now must
-                // cancel that, or the gating checkpoint would wipe the new
-                // schema and its tables.
-                self.cancel_gated_deletion(&path);
-                // `staged_dir` fsyncs `base_dir` — where the new entry lives —
-                // only when this call is what created the directory, so boot
-                // replay of an existing schema syncs nothing.
-                staged_dir(&path, || ensure_dir(&path))?;
-            } else {
-                // Drained only on the master live-DDL path, where
-                // `precheck_schema_family`'s CAS has proved this payload name is
-                // the retracted schema's own.
-                self.pending_dir_deletions.push(path);
-            }
-        }
-        Ok(())
-    }
-
     /// Build a relation's store and enter it in the registry — the create half of
     /// [`hook_relation_register`](Self::hook_relation_register), over the values
     /// its per-family builder decoded.
-    fn register_relation(&mut self, reg: RelationRegistration<'_>) -> Result<(), String> {
+    fn register_relation(&mut self, reg: RelationRegistration<'_>, on: OnRegister) -> Result<(), String> {
         let RelationRegistration {
             kind,
             id,
-            schema_id,
+            schema_id: _,
             name,
             pk,
             placement,
             budgets,
         } = reg;
         let col_defs = self.read_column_defs(id);
-        let schema_name = self.caches.schema_by_id.get(&schema_id).cloned().unwrap_or_default();
-        let directory = relation_dir(&self.base_dir, &schema_name, kind, id);
+        let directory = relation_dir(&self.base_dir, kind, id);
         let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
             .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
         gnitz_debug!(
@@ -135,13 +112,8 @@ impl CatalogEngine {
         );
         // `register` owns the boot relayout, the staged-directory reclaim and the
         // parent fsync.
-        self.registry.register(
-            RelationSpec { id, kind, schema, directory, budgets },
-            match self.ctx.mode() {
-                ApplyMode::Replay => OnRegister::BootReplay,
-                ApplyMode::Live => OnRegister::Live,
-            },
-        )?;
+        self.registry
+            .register(RelationSpec { id, kind, schema, directory, budgets }, on)?;
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
         if kind.is_base_table() {
@@ -157,13 +129,13 @@ impl CatalogEngine {
     }
 
     /// Tear relation `id` out of the registry. Its owned system rows are retracted by
-    /// the rows that dropped it (see `apply_bundle_family`), never from here.
+    /// the rows that dropped it (see `submit`), never from here; its directory is
+    /// left to the orphan sweep.
     fn unregister_relation(&mut self, id: i64) {
-        let Some(dir) = self.registry.relation(id).map(|e| e.directory().to_string()) else {
+        if !self.registry.has_id(id) {
             return;
-        };
+        }
         self.dag.unregister_table(&mut self.registry, id);
-        self.pending_dir_deletions.push(dir);
         // Final: `apply_col_names_invalidate` bumps no unregistered owner.
         self.caches.purge_schema_version(id);
         self.recompute_needs_lock(id);
@@ -171,7 +143,7 @@ impl CatalogEngine {
 
     /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
     /// create; a rename pair carries both and is neither.
-    fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+    fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch, on: OnRegister) -> Result<(), String> {
         let mut creates: Vec<i64> = Vec::new();
         let mut row_of: FxHashMap<i64, usize> = FxHashMap::default();
         for sig in pk_signatures(family, batch) {
@@ -200,7 +172,7 @@ impl CatalogEngine {
             } else {
                 self.view_registration(batch, row, id)?
             };
-            self.register_relation(reg)?;
+            self.register_relation(reg, on)?;
             // A view registers empty; the backfill, checkpoint resume or boot rebuild
             // fills it.
         }
@@ -250,8 +222,8 @@ impl CatalogEngine {
     /// Rebuild the descriptor of every registered base table a `+1` column row lands
     /// on, and publish it if it changed. A CREATE's columns land before its owner
     /// registers, so only an ALTER reaches the rebuild.
-    fn hook_column_alter(&mut self, batch: &Batch) -> Result<(), String> {
-        if self.ctx.mode() == ApplyMode::Replay {
+    fn hook_column_alter(&mut self, batch: &Batch, on: OnRegister) -> Result<(), String> {
+        if on == OnRegister::BootReplay {
             return Ok(());
         }
         let mut owners: Vec<i64> = batch
@@ -336,13 +308,8 @@ impl CatalogEngine {
             .expect("the owner resolved above");
         let cols = *cols;
 
-        // A failed CREATE INDEX must leave nothing on disk: the stage removes
-        // `idx_dir` recursively, child subdirs included. The stage is a local,
-        // not an entry in `pending_dir_deletions`, so that queue keeps one
-        // meaning — directories of *dropped* entities, which a rollback must
-        // therefore keep. `add_index` bounds-checks and promotes every column
-        // (defence in depth at the catalog trust boundary; a crafted wire row
-        // could name an out-of-range or ineligible column).
+        // `add_index` bounds-checks every column: a crafted wire row could name an
+        // out-of-range or ineligible one.
         staged_dir(&idx_dir, || {
             self.registry.add_index(owner_id, idx_id, cols.as_slice(), is_unique)?;
             let resumed = self
@@ -381,9 +348,7 @@ impl CatalogEngine {
             _ => false,
         };
         if survivors.is_empty() && !fk_circuit {
-            if let Some(dir) = self.registry.remove_index(owner_id, cols) {
-                self.pending_dir_deletions.push(dir);
-            }
+            self.registry.remove_index(owner_id, cols);
         } else {
             self.registry
                 .set_index_unique(owner_id, cols, survivors.iter().any(|&(_, u)| u));

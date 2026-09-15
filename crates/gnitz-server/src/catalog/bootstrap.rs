@@ -35,8 +35,6 @@ impl CatalogEngine {
         // shard names and corrupt it silently.
         let dir_lock = lock_data_dir(base_dir, DIR_LOCK_RETRY_FOR)?;
 
-        ensure_dir(&sys_catalog_dir(base_dir))?;
-
         // Every store this process opens — the system tables here, every
         // relation and index through the registry, every view's operator scratch
         // through the compiler — is tuned by this one value, read from the
@@ -62,9 +60,6 @@ impl CatalogEngine {
             durable_generation: 0,
             invalid_views: rustc_hash::FxHashSet::default(),
             pending_broadcasts: Vec::new(),
-            pending_dir_deletions: Vec::new(),
-            checkpoint_gated_deletions: Vec::new(),
-            ctx: ApplyContext::new(),
         };
 
         // Ahead of every path below, all of which reach a store through
@@ -77,7 +72,7 @@ impl CatalogEngine {
                         id: family.id(),
                         kind: RelationKind::SystemCatalog,
                         schema: *family.schema(),
-                        directory: sys_family_dir(base_dir, family.name()),
+                        directory: relation_dir(base_dir, RelationKind::SystemCatalog, family.id()),
                         budgets: ViewBudgets::default(),
                     },
                     OnRegister::Live,
@@ -108,9 +103,6 @@ impl CatalogEngine {
 
         // Phase 2: Replay catalog through hooks
         engine.replay_catalog()?;
-
-        // Boot shard replay done: enter the live phase (see `ApplyContext`).
-        engine.ctx.go_live();
 
         Ok(engine)
     }
@@ -239,7 +231,7 @@ impl CatalogEngine {
     fn replay_system_table(&mut self, family: SysFamily) -> Result<(), String> {
         let arc = self.sys_relation(family).full_scan();
         if !arc.is_empty() {
-            self.fire_hooks(family, &arc)?;
+            self.fire_hooks(family, &arc, OnRegister::BootReplay)?;
         }
         Ok(())
     }

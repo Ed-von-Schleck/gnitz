@@ -318,7 +318,7 @@ impl CatalogEngine {
     /// (returns it for the durable commit).
     fn build_seq_delta(&self, seq_id: i64, new_val: i64) -> Batch {
         let schema = SysFamily::Sequence.schema();
-        let mut batch = retract_pk_list(self.sys_relation(SysFamily::Sequence), vec![seq_id as u128]);
+        let mut batch = self.retract_pk_list(SysFamily::Sequence, vec![seq_id as u128]);
         let mut bb = BatchBuilder::new(*schema);
         bb.begin_row(seq_id as u128, 1);
         bb.put_u64(new_val as u64);

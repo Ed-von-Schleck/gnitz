@@ -207,6 +207,14 @@ impl RelationRegistry {
             .map(|(&tid, entry)| (tid, entry.kind(), entry.current_lsn()))
     }
 
+    /// Raise `id`'s store LSN counter to at least `lsn`; a no-op for an unregistered
+    /// id or a detached store.
+    pub fn pin_lsn(&mut self, id: i64, lsn: u64) {
+        if let Some(entry) = self.tables.get_mut(&id) {
+            entry.store.pin_lsn(lsn);
+        }
+    }
+
     /// The system families' `table id → max flushed LSN`: the dedup filter for the
     /// master's pre-fork SAL walk. Selected by the kind the iterator already
     /// yields, not by an id band — every system family is registered

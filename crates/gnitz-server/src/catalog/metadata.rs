@@ -40,21 +40,6 @@ impl CatalogEngine {
         (&mut self.dag, &mut self.registry)
     }
 
-    /// Enter the DDL zone at `lsn`: every store LSN written until
-    /// [`Self::close_ddl_zone`] is stamped with it, so one crash-recovery unit
-    /// covers the whole DDL. Nesting is not supported — a second open before the
-    /// close overwrites the first.
-    pub(crate) fn open_ddl_zone(&mut self, lsn: std::num::NonZeroU64) {
-        self.ctx.open_ddl_zone(lsn);
-    }
-
-    /// Leave the DDL zone. Must run on both the
-    /// success and the compensated-failure path: a zone left open stamps every
-    /// later ingest with a stale LSN.
-    pub(crate) fn close_ddl_zone(&mut self) {
-        self.ctx.close_ddl_zone();
-    }
-
     /// The checkpoint generation durably recorded in `SEQ_ID_CHECKPOINT_GEN`.
     pub(crate) fn durable_generation(&self) -> u64 {
         self.durable_generation

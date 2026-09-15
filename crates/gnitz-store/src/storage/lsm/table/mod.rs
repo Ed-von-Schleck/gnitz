@@ -385,8 +385,8 @@ impl Table {
     /// only ever moves forward. Idempotent SAL re-replay legitimately presents
     /// an older zone LSN (the dedupe filter under-dedupes by design), and
     /// regressing the counter would let a later spill reuse a live shard name.
-    pub(crate) fn pin_lsn(&mut self, lsn: std::num::NonZeroU64) {
-        self.current_lsn = self.current_lsn.max(lsn.get());
+    pub(crate) fn pin_lsn(&mut self, lsn: u64) {
+        self.current_lsn = self.current_lsn.max(lsn);
     }
 
     // ------------------------------------------------------------------

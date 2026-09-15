@@ -1,7 +1,7 @@
 //! The catalog-zone write path: one protocol, two entry points.
 //! [`handle_ddl_txn`] ingests a client bundle of system-table families;
 //! [`commit_serial_range_durable`] advances one sequence. Both reserve a zone
-//! LSN, mutate the catalog under it, [`emit_zone_to_sal`] and
+//! LSN, mutate the catalog, pin the families it wrote, [`emit_zone_to_sal`] and
 //! [`publish_after_fsync`].
 //!
 //! A DDL bundle additionally runs inside a `TickGate`. The serial path needs none
@@ -13,7 +13,6 @@
 //! beside the code they perturb.
 
 use std::future::Future;
-use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -82,19 +81,6 @@ impl Drop for TickGate {
     fn drop(&mut self) {
         let depth = &self.shared.ddl_window;
         depth.set(depth.get() - 1);
-    }
-}
-
-/// The DDL window's own accessor on [`Shared`].
-impl Shared {
-    /// Reserve this catalog zone's LSN above `floor` and pin every system-table
-    /// write to it. Reserve-then-open is one step so the `NonZeroU64` narrowing —
-    /// `open_ddl_zone`'s guard against a `0` sentinel — has one site.
-    fn open_zone(&self, floor: u64) -> u64 {
-        let zone_lsn = self.lsn_alloc.reserve(floor);
-        self.cat_mut()
-            .open_ddl_zone(NonZeroU64::new(zone_lsn).expect("the zone LSN allocator starts above 0"));
-        zone_lsn
     }
 }
 
@@ -268,13 +254,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         shared.reactor.trains_idle().await;
     }
 
-    // Discard any stale queue entries from a prior failed DDL so they don't
-    // piggyback on this one. (pending_dir_deletions is NOT discarded here: a
-    // failed DDL already clears it on the error path, and recovery legitimately
-    // queues drops here that must be drained — not discarded — by the post-fsync
-    // drain.)
-    let _ = shared.cat_mut().drain_pending_broadcasts();
-
     // Pre-flight global uniqueness for every unique secondary index in this
     // bundle BEFORE reserving the zone LSN or mutating the catalog, so a
     // violation needs no rollback — it just surfaces to the client. This runs
@@ -310,7 +289,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // `max_current_lsn` — the zone must dominate EVERY family's counter
     // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
     // the zone on recovery).
-    let zone_lsn = shared.open_zone(shared.cat().registry().max_current_lsn());
+    let zone_lsn = shared.lsn_alloc.reserve(shared.cat().registry().max_current_lsn());
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
@@ -322,9 +301,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // priority. A stream source is not drained (see `base_tables_reachable_from`):
     // the backfill scans its empty store, so a still-pending stream row can only
     // reach the new view through the tick, and so reaches it at most once.
-    // The between-precheck-and-apply marker holds the single family that was
-    // applied but not yet enqueued (a hook/panic failure), which compensation must
-    // negate; a precheck failure leaves the marker None, so no ghost -1 is written.
     // The ingest loop writes nothing to the SAL (broadcasts are queued and emitted
     // only in the tail below), so the in-loop drain's tick precedes the zone's
     // broadcasts in SAL order.
@@ -343,7 +319,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         ordered.sort_by_key(|(f, _)| f.topo_priority());
     }
     let view_prio = SysFamily::View.topo_priority();
-    let mut applied_not_enqueued: Option<(SysFamily, Batch)> = None;
     let mut drained_sources = false;
     let ingest_res = guard_panic("DDL", || {
         let cat = shared.cat_mut();
@@ -355,8 +330,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
                 }
                 drained_sources = true;
             }
-            cat.precheck_family(family, &fbatch)?;
-            cat.apply_bundle_family(family, fbatch, &mut applied_not_enqueued)?;
+            cat.submit(family, fbatch)?;
         }
         // Compile every new view's circuit here, on the master, while the bundle
         // is still undoable. VIEW_TAB has been applied, so each view is registered
@@ -371,19 +345,12 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         Ok(())
     });
     if let Err(e) = &ingest_res {
-        guard_panic("DDL-compensate", || {
-            shared.cat_mut().compensate_stage_a(applied_not_enqueued.take())
-        })
-        .unwrap_or_else(|ce| {
+        guard_panic("DDL-compensate", || shared.cat_mut().compensate_stage_a()).unwrap_or_else(|ce| {
             gnitz_fatal_abort!("Stage-A DDL compensation failed after DDL error '{}': {}", e, ce);
         });
     }
-    // The zone closes on every exit from the ingest phase, compensated or not.
-    // Nothing between here and its old position past the fsync reads
-    // `ctx.ddl_zone_lsn`: the emission takes the zone LSN as a parameter, and it
-    // all runs under the catalog write lock.
-    shared.cat_mut().close_ddl_zone();
     ingest_res?;
+    shared.cat_mut().pin_queued_to_zone(zone_lsn);
 
     // SAL emission window: broadcast each queued family under the shared
     // zone_lsn, close the zone with the commit sentinel, then fsync. A failure
@@ -394,11 +361,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         emit_zone_to_sal(shared, "DDL", zone_lsn)
     };
     publish_after_fsync(&shared.lsn_alloc, "DDL", zone_lsn, fsync_fut).await;
-
-    // Defer dir removals to the next checkpoint (whose worker-ACK barrier proves
-    // every worker consumed past this DROP; removing here races a lagging
-    // worker's child-dir create).
-    shared.cat_mut().defer_pending_dir_deletions();
 
     // Invalidate unique-filter state for durably-dropped tables/indices so a
     // recreated table with the same ID does not inherit stale filter entries.
@@ -475,7 +437,7 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> impl Fu
     if let Err(e) = emitted {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
     }
-    // An empty bundle (`apply_and_enqueue_family` drops empty batches) opened no
+    // An empty bundle (`submit` queues no empty batch) opened no
     // zone, so this closes nothing: every sentinel follows an ordinary group,
     // which keeps a run of them out of the checkpoint reserve.
     if let Err(e) = scope.commit() {
@@ -533,20 +495,15 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         let _sal_excl = shared.disp().sal_excl().lock().await;
 
         let (base, delta, zone_floor) = shared.cat_mut().reserve_user_sequence(seq_id, count);
-        let zone_lsn = shared.open_zone(zone_floor);
+        let zone_lsn = shared.lsn_alloc.reserve(zone_floor);
 
         // A sys_sequences advance is a pure system-table write (no evaluate_dag,
         // no rollback); a hook failure on a well-formed 2-row delta is an
         // invariant violation — abort rather than compensate.
-        let applied = {
-            let cat = shared.cat_mut();
-            cat.precheck_family(SysFamily::Sequence, &delta)
-                .and_then(|()| cat.apply_and_enqueue_family(SysFamily::Sequence, delta))
-        };
-        if let Err(e) = applied {
+        if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
             gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
         }
-        shared.cat_mut().close_ddl_zone();
+        shared.cat_mut().pin_queued_to_zone(zone_lsn);
 
         // SAL emission under the still-held sal_writer_excl; the fdatasync SQE is
         // submitted synchronously. Both guards drop as this block ends, before

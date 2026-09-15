@@ -98,63 +98,44 @@ _TABLE_DDL = "(pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)"
 
 
 def test_the_boot_sweep_reclaims_exactly_the_dropped_directories(own_server):
-    """A DROP's directory is queued for deletion in memory only, so a crash
-    before the next checkpoint leaks it unless the boot sweep reclaims it — and
-    the sweep must reclaim the dropped ones and nothing else. Three ways to
-    over-reach, one crash, one sweep: they are the same drain, so resolving all
-    three in one pass says more than three separate sweeps would."""
+    """A DROP leaves its directory to the orphan sweep, so a crash before the next
+    checkpoint leaks it unless the boot sweep reclaims it — and the sweep must
+    reclaim the dropped ones and nothing else."""
     own_server.start()
     with gnitz.connect(own_server.sock_path) as conn:
-        for sn in ("after_replay", "dropped", "recreated"):
+        for sn in ("after_replay", "dropped"):
             conn.create_schema(sn)
 
-        # Sweeping before SAL replay would see `b` absent from the DAG — its
+        # Sweeping before SAL replay would see `b` absent from the catalog — its
         # CREATE is committed but not yet flushed — and delete its live dir.
-        # Dropped `a` meanwhile sits in the checkpoint-gated queue, still on disk.
+        # Dropped `a` meanwhile waits for a checkpoint's sweep, still on disk.
         conn.execute_sql(f"CREATE TABLE a {_TABLE_DDL}", schema_name="after_replay")
         a_tid, _ = conn.resolve_table("after_replay", "a")
         conn.drop_table("after_replay", "a")
         conn.execute_sql(f"CREATE TABLE b {_TABLE_DDL}", schema_name="after_replay")
         b_tid, _ = conn.resolve_table("after_replay", "b")
 
-        # The schema-scoped scan cannot reach this subtree — the schema is gone
-        # from `schema_by_id` — so only the replayed queue's drain reclaims it.
+        # A dropped schema's member is reclaimed by the same sweep.
         conn.execute_sql(f"CREATE TABLE t {_TABLE_DDL}", schema_name="dropped")
         dropped_tid, _ = conn.resolve_table("dropped", "t")
         conn.drop_schema("dropped")
 
-        # A schema's path is name-based, so this DROP and CREATE land in the same
-        # deletion queue; the CREATE must clear the DROP's residue, or the drain
-        # removes the live schema recursively.
-        conn.execute_sql(f"CREATE TABLE old {_TABLE_DDL}", schema_name="recreated")
-        conn.drop_schema("recreated")
-        conn.create_schema("recreated")
-        conn.execute_sql(f"CREATE TABLE fresh {_TABLE_DDL}", schema_name="recreated")
-        fresh_tid, _ = conn.resolve_table("recreated", "fresh")
-        conn.execute_sql("INSERT INTO fresh VALUES (1, 11), (2, 22)",
-                         schema_name="recreated")
-
-    def rel_dir(sn, tid):
+    def rel_dir(tid):
         # Named by id alone, so a name reused across a drop names a fresh dir.
-        return os.path.join(own_server.data_dir, sn, f"t_{tid}")
+        return os.path.join(own_server.data_dir, "_relations", f"t_{tid}")
 
-    assert os.path.isdir(rel_dir("after_replay", a_tid)), \
-        "dropped a's dir is gated (still on disk) pre-crash"
+    assert os.path.isdir(rel_dir(a_tid)), \
+        "dropped a's dir waits for the sweep (still on disk) pre-crash"
 
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
         assert conn.resolve_table("after_replay", "b")[0] == b_tid
-        assert os.path.isdir(rel_dir("after_replay", b_tid)), \
+        assert os.path.isdir(rel_dir(b_tid)), \
             "b's SAL-only-created dir must survive recovery"
         conn.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name="after_replay")
         assert bag(scanned(conn, "after_replay", "b"), "pk", "v") == {(1, 100): 1}
-        assert not os.path.exists(rel_dir("after_replay", a_tid)), \
+        assert not os.path.exists(rel_dir(a_tid)), \
             "dropped a's dir must be reclaimed on boot"
-
-        assert bag(scanned(conn, "recreated", "fresh"), "pk", "v") == {
-            (1, 11): 1, (2, 22): 1}
-        assert os.path.isdir(rel_dir("recreated", fresh_tid)), \
-            "the recreated schema's table dir must survive its own replayed DROP"
 
         # A dropped table in a live schema is resolved and missed client-side;
         # a dropped schema is refused by the server before the name is reached.
@@ -163,6 +144,5 @@ def test_the_boot_sweep_reclaims_exactly_the_dropped_directories(own_server):
         with pytest.raises(gnitz.GnitzError):
             conn.resolve_table("dropped", "t")
 
-    assert not os.path.exists(rel_dir("dropped", dropped_tid))
-    assert not os.path.exists(os.path.join(own_server.data_dir, "dropped")), \
-        "dropped schema dir must be gone"
+    assert not os.path.exists(rel_dir(dropped_tid)), \
+        "the dropped schema's table dir must be gone"

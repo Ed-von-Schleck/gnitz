@@ -1156,7 +1156,7 @@ fn has_manifest(base_dir: &str, view_id: u64) -> bool {
 /// The directory one mirrored copy lives in, through the engine's own path
 /// grammar — the same reason [`has_manifest`] builds its path that way.
 fn copy_dir(base_dir: &str, view_id: u64) -> String {
-    relation_dir(base_dir, "_copies", RelationKind::View, view_id as i64)
+    relation_dir(base_dir, RelationKind::View, view_id as i64)
 }
 
 /// A server restart erases the copy: the stored cursor tag no longer matches the

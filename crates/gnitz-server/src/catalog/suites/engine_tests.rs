@@ -461,7 +461,7 @@ fn test_ddl_sync() {
     bb.begin_row(100u128, 1); // sid=100
     bb.put_string("synced");
     bb.end_row();
-    engine.ddl_sync(SCHEMA_TAB_ID, bb.finish()).unwrap();
+    engine.ddl_sync(SCHEMA_TAB_ID, 0, bb.finish()).unwrap();
 
     // Hooks should have registered the schema
     assert!(engine.has_schema("synced"));
@@ -470,77 +470,46 @@ fn test_ddl_sync() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_ddl_sync_zone_lsn_tracking ──────────────────────────────────
+// ── zone_pins_survive_a_flush_and_reopen ─────────────────────────────
 
 #[test]
-fn test_ddl_sync_zone_lsn_tracking() {
-    // Invariant: while a DDL zone is open, `ingest_to_family` pins each
-    // touched system table's `current_lsn` to that zone LSN. After successive
-    // DDL zones, `get_max_flushed_lsn` reports the most recent zone LSN,
-    // and recovery can skip already-applied groups.
+fn zone_pins_survive_a_flush_and_reopen() {
+    // Invariant: `pin_queued_to_zone` pins every family a zone applied to that
+    // zone's LSN, and the pin is what the families flush — so after a reopen
+    // `system_flushed_lsns` still dedups every zone recovery would replay.
     use crate::catalog::sys_tables::{COL_TAB_ID, SCHEMA_TAB_ID, TABLE_TAB_ID};
-    use std::num::NonZeroU64;
 
-    let zone = |lsn: u64| NonZeroU64::new(lsn).unwrap();
     let dir = temp_dir("catalog_zone_lsn");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let current =
+        |engine: &CatalogEngine, id: i64| engine.registry().relation_or_err(id).map_or(0, Relation::current_lsn);
 
     // Zone 5: create a schema. SCHEMA_TAB pinned to lsn=5.
-    engine.ctx.open_ddl_zone(zone(5));
+    let _ = engine.drain_pending_broadcasts();
     engine.create_schema("z").unwrap();
-    assert_eq!(
-        engine
-            .registry()
-            .relation_or_err(SCHEMA_TAB_ID)
-            .map_or(0, Relation::current_lsn),
-        5
-    );
+    engine.pin_queued_to_zone(5);
+    assert_eq!(current(&engine, SCHEMA_TAB_ID), 5);
 
     // Zone 7: create a table. TABLE_TAB and COL_TAB pinned to lsn=7;
     // SCHEMA_TAB stays at 5 (untouched in this zone).
-    engine.ctx.open_ddl_zone(zone(7));
+    let _ = engine.drain_pending_broadcasts();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("z.t", &cols, &[0]).unwrap();
+    engine.pin_queued_to_zone(7);
+    assert_eq!(current(&engine, TABLE_TAB_ID), 7);
+    assert_eq!(current(&engine, COL_TAB_ID), 7);
     assert_eq!(
-        engine
-            .registry()
-            .relation_or_err(TABLE_TAB_ID)
-            .map_or(0, Relation::current_lsn),
-        7
-    );
-    assert_eq!(
-        engine
-            .registry()
-            .relation_or_err(COL_TAB_ID)
-            .map_or(0, Relation::current_lsn),
-        7
-    );
-    assert_eq!(
-        engine
-            .registry()
-            .relation_or_err(SCHEMA_TAB_ID)
-            .map_or(0, Relation::current_lsn),
+        current(&engine, SCHEMA_TAB_ID),
         5,
         "SCHEMA_TAB stays at the most recent zone that touched it"
     );
 
     // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
-    engine.ctx.open_ddl_zone(zone(9));
+    let _ = engine.drain_pending_broadcasts();
     let tid2 = engine.create_table("z.t2", &cols, &[0]).unwrap();
-    assert_eq!(
-        engine
-            .registry()
-            .relation_or_err(TABLE_TAB_ID)
-            .map_or(0, Relation::current_lsn),
-        9
-    );
-    assert_eq!(
-        engine
-            .registry()
-            .relation_or_err(COL_TAB_ID)
-            .map_or(0, Relation::current_lsn),
-        9
-    );
+    engine.pin_queued_to_zone(9);
+    assert_eq!(current(&engine, TABLE_TAB_ID), 9);
+    assert_eq!(current(&engine, COL_TAB_ID), 9);
 
     // system_flushed_lsns covers every system table, and only those.
     let map = engine.registry().system_flushed_lsns();
@@ -557,6 +526,44 @@ fn test_ddl_sync_zone_lsn_tracking() {
     assert!(engine.registry().max_current_lsn() >= 9);
 
     engine.close();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let map = engine.registry().system_flushed_lsns();
+    assert!(map[&TABLE_TAB_ID] >= 9, "TABLE_TAB's flush must carry zone 9: {map:?}");
+    assert!(
+        map[&SCHEMA_TAB_ID] >= 5,
+        "SCHEMA_TAB's flush must carry zone 5: {map:?}"
+    );
+
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── replayed_ddl_sync_group_is_not_replayed_after_a_flush ────────────
+
+/// A DdlSync group recovery re-applies must pin its family like a live zone does:
+/// a crash between the boot flush and the SAL reset replays the tail again, and
+/// only a flushed LSN at or above the group's keeps it from applying twice.
+#[test]
+fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
+    let dir = temp_dir("catalog_ddl_sync_pin");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+
+    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
+    bb.begin_row(100u128, 1);
+    bb.put_string("synced");
+    bb.end_row();
+    engine.ddl_sync(SCHEMA_TAB_ID, 500, bb.finish()).unwrap();
+
+    engine.close();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    let flushed = engine.registry().system_flushed_lsns()[&SCHEMA_TAB_ID];
+    assert!(
+        flushed >= 500,
+        "the flushed SCHEMA_TAB must dedup the group at lsn 500, got {flushed}"
+    );
+    assert!(engine.has_schema("synced"));
+
+    drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -738,7 +745,6 @@ fn test_dep_map_drops_a_retired_views_edges() {
 
     // DROP VIEW retires the last edge, so the base table is a dep-map orphan.
     engine.drop_view("public.v1").unwrap();
-    engine.drain_pending_dir_deletions();
     assert_eq!(engine.dag.get_dep_map(&engine.registry).get(&tid), None);
 
     engine.close();

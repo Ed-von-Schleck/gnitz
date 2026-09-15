@@ -2,87 +2,83 @@ use super::*;
 
 use std::path::Path;
 
-// Locks the checkpoint-gated directory-removal contract independent of the
-// multi-process race: a durable DROP must defer physical removal (the dir
-// survives until the gating checkpoint), and the checkpoint drain must then
-// remove it.
+// A drop leaves its directory to the sweep, and the sweep takes it.
 #[test]
-fn defer_then_drain_gated_deletions() {
-    let dir = temp_dir("defer_then_drain_gated");
+fn dropped_relation_dir_survives_until_the_sweep() {
+    let dir = temp_dir("sweep_dropped_dir");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let tid = engine
+        .create_table("public.t", &[col_def("id", type_code::U64)], &[0])
+        .unwrap();
+    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
 
-    engine.create_schema("s").unwrap();
-    let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
-    let tbl_dir = format!("{dir}/s/t_{tid}");
-    assert!(Path::new(&tbl_dir).exists());
+    engine.drop_table("public.t").unwrap();
+    let _ = engine.drain_pending_broadcasts();
+    assert!(Path::new(&tbl_dir).exists(), "a drop removes no directory itself");
 
-    // DROP SCHEMA cascade queues the table dir and the schema dir.
-    engine.drop_schema("s").unwrap();
-    assert!(
-        !engine.pending_dir_deletions.is_empty(),
-        "DROP must queue dirs for removal"
-    );
-
-    // The DROP-success path defers instead of removing (workers may still be
-    // applying a CREATE of the same entity over the shared on-disk tree).
-    engine.defer_pending_dir_deletions();
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "defer must drain the in-flight queue"
-    );
-    assert!(
-        !engine.checkpoint_gated_deletions.is_empty(),
-        "defer must populate the gated queue"
-    );
-    assert!(
-        Path::new(&tbl_dir).exists(),
-        "dir must survive until the gating checkpoint"
-    );
-
-    // The gating checkpoint fires: now safe to physically remove.
-    engine.drain_checkpoint_gated_deletions();
-    assert!(engine.checkpoint_gated_deletions.is_empty());
+    engine.reclaim_orphan_dirs();
     assert!(
         !Path::new(&tbl_dir).exists(),
-        "checkpoint drain must physically remove the gated dir"
+        "the sweep must reclaim a dropped relation's directory"
     );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
 }
 
-// Locks the cancellation contract: a DROP SCHEMA + CREATE SCHEMA with no
-// intervening checkpoint must not let the gating drain wipe the recreated
-// (name-based) schema dir and the new table beneath it.
+// A change still queued for broadcast may not have reached a worker that is
+// creating the directory it names, so the sweep leaves every directory alone.
 #[test]
-fn drop_then_recreate_schema_survives_gated_drain() {
-    let dir = temp_dir("recreate_schema_trap");
+fn sweep_declines_while_an_applied_change_is_queued() {
+    let dir = temp_dir("sweep_declines_queued");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tid = engine
+        .create_table("public.t", &[col_def("id", type_code::U64)], &[0])
+        .unwrap();
+    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
+    let _ = engine.drain_pending_broadcasts();
+
+    engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+    engine.reclaim_orphan_dirs();
+    assert!(
+        Path::new(&tbl_dir).exists(),
+        "the sweep must decline while the drop is still queued"
+    );
+
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
+    assert!(!Path::new(&tbl_dir).exists(), "the drained drop's directory is swept");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// Liveness is read at sweep time, so an id registered again after its drop
+// keeps its directory.
+#[test]
+fn sweep_keeps_a_re_registered_id() {
+    let dir = temp_dir("sweep_keeps_reregistered");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
 
-    engine.create_schema("s").unwrap();
-    engine.create_table("s.t", &cols, &[0]).unwrap();
-    // DROP SCHEMA cascade queues <dir>/s/t_<old> and <dir>/s.
-    engine.drop_schema("s").unwrap();
-    engine.defer_pending_dir_deletions(); // DROP-success path defers removal
+    engine.drop_table("public.t").unwrap();
+    let _ = engine.drain_pending_broadcasts();
+    engine.register_table(tid, PUBLIC_SCHEMA_ID, "t", &cols, &[0]).unwrap();
 
-    // Recreate before any checkpoint drains the gated queue.
-    engine.create_schema("s").unwrap(); // cancels the gated <dir>/s removal
-    let new_tid = engine.create_table("s.t", &cols, &[0]).unwrap();
-    let new_dir = format!("{dir}/s/t_{new_tid}");
-    assert!(Path::new(&new_dir).exists());
-
-    // The gating checkpoint fires (drained from the checkpoint post-ack path).
-    engine.drain_checkpoint_gated_deletions();
-
-    // RED without the cancel: drain removed <dir>/s recursively, wiping new_dir.
+    engine.reclaim_orphan_dirs();
     assert!(
-        Path::new(&new_dir).exists(),
-        "recreated schema's new table dir must survive the gated drain"
+        Path::new(&tbl_dir).exists(),
+        "a re-registered id's directory must survive the sweep"
     );
-    assert!(Path::new(&format!("{dir}/s")).exists());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
-// gc_orphan_directories — boot-time orphan-directory sweep
+// reclaim_orphan_dirs — the orphan-directory sweep
 // ---------------------------------------------------------------------------
 
 // An orphaned table directory (the residue of a vanished drop, absent from the
@@ -101,15 +97,16 @@ fn gc_reclaims_orphan_table_dir() {
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
-    let live_dir = format!("{dir}/public/t_{tid}");
+    let live_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     assert!(Path::new(&live_dir).exists());
 
-    // Fabricate a sibling orphan dir: table-shaped (`<name>_<digits>`), no live
-    // entity — the residue of a DROP whose gated deletion was lost to a crash.
-    let ghost = format!("{}/public/ghost_{}", dir, tid + 9999);
+    // Fabricate a sibling orphan dir no live entity owns — the residue of a DROP
+    // whose sweep a crash pre-empted.
+    let ghost = format!("{}/ghost_{}", relations_dir(&dir), tid + 9999);
     std::fs::create_dir_all(&ghost).unwrap();
 
-    engine.gc_orphan_directories();
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
 
     assert!(!Path::new(&ghost).exists(), "orphan table dir must be reclaimed");
     assert!(Path::new(&live_dir).exists(), "live table dir must survive");
@@ -122,23 +119,24 @@ fn gc_reclaims_orphan_table_dir() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// An orphaned view directory (`view_<name>_<vid>` shape) is reclaimed, as is the
-// pre-flight compile's throwaway root left by a crash mid-compile — the reason
-// `preflight_dir` puts it under a schema dir with a numeric suffix.
+// An orphaned view directory is reclaimed, as is the pre-flight compile's
+// throwaway root left by a crash mid-compile — the reason `preflight_dir` puts it
+// under the relation root.
 #[test]
 fn gc_reclaims_orphan_view_dir() {
     let dir = temp_dir("gc_orphan_view");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let live_dir = format!("{dir}/public/t_{tid}");
+    let live_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
 
-    let ghost = format!("{}/public/view_ghost_{}", dir, 4242);
+    let ghost = relation_dir(&dir, RelationKind::View, 4242);
     std::fs::create_dir_all(&ghost).unwrap();
-    let preflight = preflight_dir(&dir, "public", 4242);
+    let preflight = preflight_dir(&dir, 4242);
     std::fs::create_dir_all(format!("{preflight}/scratch_x_w0")).unwrap();
 
-    engine.gc_orphan_directories();
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
 
     assert!(!Path::new(&ghost).exists(), "orphan view dir must be reclaimed");
     assert!(
@@ -161,18 +159,19 @@ fn gc_reclaims_orphan_index_dir() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
 
-    let tbl_dir = format!("{dir}/public/t_{tid}");
+    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     let live_idx = format!("{tbl_dir}/idx_{idx_id}");
     assert!(Path::new(&live_idx).exists(), "live index dir must exist");
 
-    // A fabricated orphan index dir, plus a non-index sub-dir that the pattern
-    // guard must leave alone.
+    // A fabricated orphan index dir, plus a non-index sub-dir the sweep must
+    // leave alone.
     let ghost_idx = format!("{}/idx_{}", tbl_dir, idx_id + 9999);
     std::fs::create_dir_all(&ghost_idx).unwrap();
     let non_idx = format!("{tbl_dir}/data_keep");
     std::fs::create_dir_all(&non_idx).unwrap();
 
-    engine.gc_orphan_directories();
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
 
     assert!(!Path::new(&ghost_idx).exists(), "orphan index dir must be reclaimed");
     assert!(Path::new(&live_idx).exists(), "live index dir must survive");
@@ -207,48 +206,26 @@ fn gc_leaves_live_entities_untouched() {
 
     // Id-only directories: `t_{tid}`, regardless of the table name.
     let dirs = [
-        format!("{dir}/public/t_{t1}"),
-        format!("{dir}/public/t_{t1}/idx_{i1}"),
-        format!("{dir}/public/t_{t2}"),
-        format!("{dir}/s2/t_{t3}"),
+        relation_dir(&dir, RelationKind::BaseTable, t1),
+        format!("{}/idx_{i1}", relation_dir(&dir, RelationKind::BaseTable, t1)),
+        relation_dir(&dir, RelationKind::BaseTable, t2),
+        relation_dir(&dir, RelationKind::BaseTable, t3),
     ];
     for d in &dirs {
         assert!(Path::new(d).exists(), "precondition: {d} exists");
     }
 
-    engine.gc_orphan_directories();
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
 
     for d in &dirs {
         assert!(Path::new(d).exists(), "live dir {d} must survive");
     }
-    assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(
         engine.scan(t1).unwrap().0.len(),
         1,
         "flushed table must still read back after the sweep"
     );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// Sub-dirs that are not table/view-shaped (`<name>_<digits>`) are never removed.
-#[test]
-fn gc_skips_non_table_shaped_entries() {
-    let dir = temp_dir("gc_non_table_entries");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
-    engine.create_table("public.t", &cols, &[0]).unwrap();
-
-    let keep1 = format!("{dir}/public/notatable"); // no underscore
-    let keep2 = format!("{dir}/public/foo_notanumber"); // non-numeric suffix
-    std::fs::create_dir_all(&keep1).unwrap();
-    std::fs::create_dir_all(&keep2).unwrap();
-
-    engine.gc_orphan_directories();
-
-    assert!(Path::new(&keep1).exists(), "no-underscore dir must survive");
-    assert!(Path::new(&keep2).exists(), "non-numeric-suffix dir must survive");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -261,87 +238,19 @@ fn gc_is_idempotent() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let live = format!("{dir}/public/t_{tid}");
+    let live = relation_dir(&dir, RelationKind::BaseTable, tid);
 
-    let ghost = format!("{}/public/ghost_{}", dir, tid + 5000);
+    let ghost = format!("{}/ghost_{}", relations_dir(&dir), tid + 5000);
     std::fs::create_dir_all(&ghost).unwrap();
 
-    engine.gc_orphan_directories();
+    let _ = engine.drain_pending_broadcasts();
+    engine.reclaim_orphan_dirs();
     assert!(!Path::new(&ghost).exists());
     assert!(Path::new(&live).exists());
 
-    engine.gc_orphan_directories(); // second run: no-op
+    engine.reclaim_orphan_dirs(); // second run: no-op
     assert!(!Path::new(&ghost).exists());
     assert!(Path::new(&live).exists(), "live dir must survive a repeat sweep");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// The drain reclaims a replayed DROP SCHEMA's subtree that the schema-scoped
-// scan cannot reach (the schema is gone from schema_by_id), and empties the
-// queue SAL replay re-populated.
-#[test]
-fn gc_drains_sal_replay_queue() {
-    let dir = temp_dir("gc_drain_replay_queue");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let gone_schema = format!("{dir}/goneschema");
-    let gone_table = format!("{gone_schema}/t_1");
-    std::fs::create_dir_all(&gone_table).unwrap();
-    // Residue a replayed DROP SCHEMA leaves on the queue.
-    engine.pending_dir_deletions.push(gone_schema.clone());
-
-    engine.gc_orphan_directories();
-
-    assert!(
-        !Path::new(&gone_schema).exists(),
-        "replayed DROP SCHEMA subtree must be reclaimed by the drain"
-    );
-    assert!(engine.pending_dir_deletions.is_empty(), "queue must be drained");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// A recreated same-name schema whose live path SAL replay left in the queue
-// survives the drain — the cancel_gated_deletion fix removes that residue when
-// the recreating CREATE re-fires hook_schema_dir. RED if cancel_gated_deletion
-// clears only the gated queue.
-#[test]
-fn gc_recreated_schema_survives_drain() {
-    let dir = temp_dir("gc_recreate_schema_drain");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let schema_path = format!("{dir}/s");
-
-    // Reproduce the recovery residue directly: a replayed DROP s left <base>/s
-    // on pending_dir_deletions.
-    engine.pending_dir_deletions.push(schema_path.clone());
-
-    // The replayed CREATE s re-fires hook_schema_dir → cancel_gated_deletion,
-    // which must clear the DROP's residue for the path being recreated.
-    engine.create_schema("s").unwrap();
-    assert!(
-        !engine.pending_dir_deletions.contains(&schema_path),
-        "CREATE SCHEMA must clear the replayed DROP's residue from \
-         pending_dir_deletions (cancel_gated_deletion fix)"
-    );
-
-    let cols = vec![col_def("id", type_code::U64)];
-    let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
-    let tbl = format!("{dir}/s/t_{tid}");
-    assert!(Path::new(&tbl).exists());
-
-    engine.gc_orphan_directories();
-
-    assert!(
-        Path::new(&schema_path).exists(),
-        "recreated schema dir must survive the drain"
-    );
-    assert!(
-        Path::new(&tbl).exists(),
-        "table under the recreated schema must survive"
-    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

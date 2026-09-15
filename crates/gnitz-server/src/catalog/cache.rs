@@ -241,7 +241,7 @@ impl CatalogEngine {
     /// the other). Gated on the FK word before the decode: at boot replay the
     /// batch is every live column record in the database.
     pub(in crate::catalog) fn apply_fk_edges_and_locks(&mut self, batch: &Batch) {
-        let CatalogEngine { caches, registry, .. } = self;
+        let caches = &mut self.caches;
         let mut tids: Vec<i64> = Vec::new();
         for i in 0..batch.len() {
             if payload_u64(batch, i, COLTAB_PAY_FK_TABLE_ID) == 0 {
@@ -269,9 +269,7 @@ impl CatalogEngine {
             }
 
             tids.push(edge.child_tid);
-            if registry.has_id(edge.parent_tid) {
-                tids.push(edge.parent_tid);
-            }
+            tids.push(edge.parent_tid);
         }
         self.relock_all(tids);
     }

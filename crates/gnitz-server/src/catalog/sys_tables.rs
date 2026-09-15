@@ -438,9 +438,8 @@ impl SysFamily {
         }
     }
 
-    /// This family's shared wire identity: its table id, its name (which is also
-    /// its subdirectory under `_system_catalog/`), and the column shape the
-    /// schema, the COL_TAB self-description rows, and the client's `Schema` all
+    /// This family's shared wire identity: its table id, its name, and the column
+    /// shape its schema, COL_TAB self-description rows and the client's `Schema`
     /// derive from. Held in `gnitz-wire`, so the engine restates none of it.
     #[inline]
     pub(in crate::catalog) fn wire(self) -> &'static gnitz_wire::WireSysFamily {
@@ -454,7 +453,7 @@ impl SysFamily {
         self as i64
     }
 
-    /// This family's store subdirectory name.
+    /// This family's name.
     #[inline]
     pub(crate) fn name(self) -> &'static str {
         self.wire().name

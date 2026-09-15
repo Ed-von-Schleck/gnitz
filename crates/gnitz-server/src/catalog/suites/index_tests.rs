@@ -909,7 +909,6 @@ fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
         .drop_index(&make_secondary_index_name("public", "child", "refc"))
         .unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
-    assert!(engine.pending_dir_deletions.is_empty());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1009,7 +1008,7 @@ fn test_failed_create_index_leaves_no_directory_internal() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    let tbl_dir = format!("{dir}/public/t_{tid}");
+    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_index_id;
     assert!(engine.create_index("public.t", &["val"], true).is_err());
@@ -2619,12 +2618,11 @@ fn compensated_drop_index_refills_the_restored_circuit() {
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
     let _ = engine.drain_pending_broadcasts();
 
-    let drop = retract_pk_list(engine.sys_relation(SysFamily::Index), vec![idx_id as u128]);
-    engine.precheck_family(SysFamily::Index, &drop).unwrap();
-    engine.apply_bundle_family(SysFamily::Index, drop, &mut None).unwrap();
+    let drop = engine.retract_pk_list(SysFamily::Index, vec![idx_id as u128]);
+    engine.submit(SysFamily::Index, drop).unwrap();
     assert!(engine.registry().relation(tid).unwrap().index_on(&[1]).is_none());
 
-    engine.compensate_stage_a(None).unwrap();
+    engine.compensate_stage_a().unwrap();
 
     let found = seek_by_index(&mut engine, tid, &[1], &[200u128]).unwrap().0;
     let row = found.expect("the restored index must hold the flushed row");

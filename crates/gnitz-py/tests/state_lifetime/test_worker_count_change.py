@@ -221,7 +221,7 @@ def test_an_index_rehomes_onto_the_launched_ranks(own_server):
 
     assert own_server.rebuilt_index_counts() == [1, 1], (
         "every launched rank must re-derive its slice of the one index")
-    table_dir = os.path.join(own_server.data_dir, "idxres", f"t_{tid}")
+    table_dir = os.path.join(own_server.data_dir, "_relations", f"t_{tid}")
     idx_dirs = [d for d in os.listdir(table_dir) if d.startswith("idx_")]
     # Exactly one: a retired child's parent left behind would pass a truthiness
     # check while proving the relayout reclaimed nothing.

@@ -4,8 +4,8 @@
 //! **Not** a production code path. Every real DDL statement (SQL planner,
 //! C-API, `gnitz-py`) is built client-side and pushed over the wire as a
 //! `FLAG_DDL_TXN` bundle of system-table deltas, which the executor applies
-//! through `precheck_family` + `apply_and_enqueue_family`. These wrappers exist
-//! so a unit test can reach the same appliers without a server.
+//! through `submit`. These wrappers let a unit test reach the same appliers
+//! without a server.
 
 use super::super::*;
 use crate::test_support::{idx_tab_batch, push_col_tab_row, push_table_tab_row};
@@ -32,7 +32,7 @@ impl CatalogEngine {
     /// Retract the live row at `pk` in `family` through `submit`, which expands the
     /// drop cascade.
     pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
-        let batch = retract_pk_list(self.sys_relation(family), vec![pk]);
+        let batch = self.retract_pk_list(family, vec![pk]);
         if batch.is_empty() {
             return Err("Entity does not exist in catalog".into());
         }
@@ -213,10 +213,6 @@ impl CatalogEngine {
         let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
         let index_id = self.allocate_index_id().unwrap();
 
-        // Precheck and apply as two steps, exactly as the DDL_TXN handler does:
-        // a precheck rejection wrote nothing, so submitting the compensating −1
-        // would leave a permanent net −1 ghost (sys_indices runs no
-        // `enforce_unique_pk`). Only an apply failure needs the undo.
         let packed_cols = gnitz_wire::pack_pk_cols(&col_indices);
         let batch = idx_tab_batch(
             index_id,
@@ -226,29 +222,16 @@ impl CatalogEngine {
             gnitz_wire::IndexProps { is_unique },
             1,
         );
-        self.precheck_family(SysFamily::Index, &batch)?;
-        if let Err(e) = self.apply_and_enqueue_family(SysFamily::Index, batch) {
-            // The +1 failed in hook_index_register *before* it was enqueued
-            // into pending_broadcasts, so it was never broadcast to workers.
-            // Route the undo through submit_local: it fires the cache-reversal
-            // hooks but does NOT enqueue the −1. Broadcasting the −1 would
-            // deliver a phantom retraction to workers that never saw the +1.
-            let undo = idx_tab_batch(
-                index_id,
-                owner_id,
-                packed_cols,
-                &index_name,
-                gnitz_wire::IndexProps { is_unique },
-                -1,
-            );
-            self.submit_local(SysFamily::Index, undo).unwrap();
-            // The index directory is already gone: the hook staged it before
-            // `Table::new`, and `with_staged_dir` reclaims a stage whose
-            // closure failed. Nothing queued it here — the `-1` retraction
-            // hook only queues a directory whose circuit was registered.
-            return Err(e);
+        // Compensate this DDL alone, as the DDL_TXN handler does a failed bundle:
+        // the earlier fixture DDLs are committed, so they sit outside the undo log.
+        let committed = std::mem::take(&mut self.pending_broadcasts);
+        let res = self.submit(SysFamily::Index, batch);
+        if res.is_err() {
+            self.compensate_stage_a().expect("compensating a fixture CREATE INDEX");
         }
-        Ok(index_id)
+        let this_ddl = std::mem::replace(&mut self.pending_broadcasts, committed);
+        self.pending_broadcasts.extend(this_ddl);
+        res.map(|()| index_id)
     }
 
     pub(in crate::catalog) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
@@ -292,8 +275,6 @@ impl CatalogEngine {
 
     /// Ingest into any relation by raw id: a system family through
     /// [`CatalogEngine::submit`], a user table through the registry's DML path.
-    /// Production emitters name the family and own their batch, so they call
-    /// `submit` and pay no clone.
     pub(in crate::catalog) fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
@@ -319,7 +300,7 @@ impl CatalogEngine {
         pk: &[u32],
     ) -> Result<(), String> {
         let col_batch = self.build_col_batch(tid, OWNER_KIND_TABLE, cols, 1);
-        self.ddl_sync(SysFamily::Column.id(), col_batch)?;
+        self.ddl_sync(SysFamily::Column.id(), 0, col_batch)?;
 
         let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         push_table_tab_row(
@@ -331,6 +312,6 @@ impl CatalogEngine {
             gnitz_wire::TableProps::default().pack(),
             1,
         );
-        self.ddl_sync(SysFamily::Table.id(), bb.finish())
+        self.ddl_sync(SysFamily::Table.id(), 0, bb.finish())
     }
 }

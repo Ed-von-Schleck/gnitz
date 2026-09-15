@@ -94,6 +94,66 @@ fn test_fk_drop_protections() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── Dropping an FK child, alone or with its parent, leaves no lock entry ─────
+
+#[test]
+fn dropped_fk_child_leaves_no_lock_entry() {
+    let dir = temp_dir("fk_child_drop_lock");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let parent_tid = engine
+        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
+        .unwrap();
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("pid_fk", type_code::U64, parent_tid, 0),
+    ];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
+
+    engine.drop_table("public.child").unwrap();
+
+    assert!(
+        !engine.caches.needs_lock.contains_key(&child_tid),
+        "a dropped child must keep no lock entry"
+    );
+    assert!(
+        !engine.fk_lock_set(parent_tid).contains(&child_tid),
+        "the parent's lock set must not name the dropped child"
+    );
+    assert!(engine.fk_children_of(parent_tid).is_empty());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn co_dropped_fk_parent_and_child_leave_no_lock_entry() {
+    let dir = temp_dir("fk_co_drop_lock");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let parent_tid = engine
+        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
+        .unwrap();
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("pid_fk", type_code::U64, parent_tid, 0),
+    ];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
+
+    // One TABLE_TAB batch: the parent unregisters before the child's column rows
+    // retract.
+    let drop = engine.retract_pk_list(SysFamily::Table, vec![parent_tid as u128, child_tid as u128]);
+    engine.submit(SysFamily::Table, drop).unwrap();
+
+    for tid in [parent_tid, child_tid] {
+        assert!(
+            !engine.caches.needs_lock.contains_key(&tid),
+            "co-dropped table {tid} must keep no lock entry"
+        );
+    }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_fk_invalid_targets ──────────────────────────────────────────
 
 #[test]

@@ -24,7 +24,7 @@ mod unique_pk;
 
 pub use build::OnRegister;
 pub use circuit_state::{CircuitState, StateIdx};
-pub use dirs::{ensure_dir, lock_data_dir, relation_dir, staged_dir, DIR_LOCK_RETRY_FOR};
+pub use dirs::{ensure_dir, lock_data_dir, relation_dir, relations_dir, staged_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store::Store;
 
 // ---------------------------------------------------------------------------
@@ -402,7 +402,7 @@ pub struct RelationSpec {
     pub id: i64,
     pub kind: RelationKind,
     pub schema: SchemaDescriptor,
-    /// `<root>/<schema_name>/<t|v>_<id>`, from [`relation_dir`]. The parent of
+    /// `<root>/_relations/<t|v>_<id>`, from [`relation_dir`]. The parent of
     /// the `ChildAddr` subdir the store itself opens.
     pub directory: String,
     pub budgets: ViewBudgets,
@@ -580,14 +580,12 @@ impl RelationRegistry {
         .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={idx_dir})"), e))
     }
 
-    /// Remove `id`'s circuit on `cols`, dropping its store, and return the
-    /// circuit's directory as [`Self::index_dir`] spells it. `None` when no such
+    /// Remove `id`'s circuit on `cols`, dropping its store. A no-op when no such
     /// circuit is registered.
-    pub fn remove_index(&mut self, id: i64, cols: &[u32]) -> Option<String> {
-        let entry = self.tables.get_mut(&id)?;
-        let pos = entry.indexes.iter().position(|ix| ix.cols.as_slice() == cols)?;
-        let index_id = entry.indexes.remove(pos).index_id;
-        self.index_dir(id, index_id)
+    pub fn remove_index(&mut self, id: i64, cols: &[u32]) {
+        if let Some(entry) = self.tables.get_mut(&id) {
+            entry.indexes.retain(|ix| ix.cols.as_slice() != cols);
+        }
     }
 
     /// Set the uniqueness flag of the one circuit on `cols` in place.

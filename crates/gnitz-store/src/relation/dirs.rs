@@ -15,21 +15,17 @@ use crate::storage::{subdir_names, ChildAddr, StoreError};
 /// single-writer.
 const DIR_LOCK_FILENAME: &str = "LOCK";
 
-/// `<base_dir>/<schema_name>/t_<tid>` for a table, `.../v_<vid>` for a view.
-/// Id-only (no embedded name), so a RENAME never changes the path and never
-/// orphans data.
-pub fn relation_dir(base_dir: &str, schema_name: &str, kind: RelationKind, id: i64) -> String {
-    let tag = if kind.is_view() { 'v' } else { 't' };
-    format!("{base_dir}/{schema_name}/{tag}_{id}")
+/// `<base_dir>/_relations` — the directory every relation's store directory sits
+/// in, system families included. Only this crate's hosts write it.
+pub fn relations_dir(base_dir: &str) -> String {
+    format!("{base_dir}/_relations")
 }
 
-/// True if `name` could be a relation directory. Deliberately looser than
-/// [`relation_dir`]: it gates the orphan sweep's `remove_dir_all`, and matching
-/// the exact shape would strand a directory written under an older naming scheme
-/// rather than reclaim it. Anything not ending in `_<digits>` is left alone.
-fn is_table_dir_name(name: &str) -> bool {
-    name.rsplit_once('_')
-        .is_some_and(|(_, id)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+/// `<base_dir>/_relations/v_<id>` for a view, `.../t_<id>` otherwise. Id-only
+/// (no embedded name), so a RENAME never changes the path and never orphans data.
+pub fn relation_dir(base_dir: &str, kind: RelationKind, id: i64) -> String {
+    let tag = if kind.is_view() { 'v' } else { 't' };
+    format!("{}/{tag}_{id}", relations_dir(base_dir))
 }
 
 /// Stage `dir` across `f`: on `Err` remove it, on `Ok` fsync its parent — each
@@ -68,17 +64,10 @@ pub const DIR_LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_se
 /// How long [`lock_data_dir`] sleeps between attempts.
 const DIR_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Create `base_dir` if absent and take the exclusive `flock` on its lock file,
-/// so exactly one live handle writes it — retrying a held lock for `retry`: the
-/// server's restart window, zero for a host whose directory no forked child can
-/// hold.
-///
-/// Two writers on one directory silently corrupt shard state. A forked worker
-/// inherits the open file description, which `flock` treats as one holder, so the
-/// server's own children never contend; a second `open` in the same process does.
-///
-/// The returned file must outlive every store under `base_dir` — closing it
-/// releases the lock.
+/// Create `base_dir` and its [`relations_dir`], and take the exclusive `flock` on
+/// its lock file, retrying a held lock for `retry`. A forked worker shares its
+/// parent's lock; a second `open` in one process contends. The returned file must
+/// outlive every store under `base_dir`.
 pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::File, StoreError> {
     // The directory before the lock: the lock file is opened with
     // `create(true)`, which fails if its directory is absent.
@@ -95,6 +84,9 @@ pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::F
     let deadline = std::time::Instant::now() + retry;
     loop {
         if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // Under the lock: `staged_dir` fsyncs `base_dir` when the root is new.
+            let root = relations_dir(base_dir);
+            staged_dir(&root, || ensure_dir(&root))?;
             return Ok(file);
         }
         let err = std::io::Error::last_os_error();
@@ -139,52 +131,36 @@ impl RelationRegistry {
         }
     }
 
-    /// Remove every relation directory under `schema_dirs` that no registered
-    /// relation owns, and every `idx_<id>` child of a live relation that no
-    /// registered index owns. Only `<tag>_<digits>` names are eligible.
-    /// Best-effort: a failure to remove one orphan is logged and never aborts
-    /// the caller.
-    pub fn reclaim_orphan_relation_dirs(&self, schema_dirs: impl IntoIterator<Item = String>) {
-        self.assert_origin("reclaim_orphan_relation_dirs");
+    /// Best-effort removal of every directory under [`relations_dir`] no registered
+    /// relation owns, and every `idx_<id>` child no registered index owns. Sound
+    /// only where every process sharing `base_dir` has applied this catalog.
+    pub fn reclaim_orphan_relation_dirs(&self, base_dir: &str) {
+        let root = relations_dir(base_dir);
         let live: rustc_hash::FxHashMap<&str, &Relation> = self.relations().map(|e| (e.directory(), e)).collect();
 
-        for schema_dir in schema_dirs {
-            for name in subdir_names(&schema_dir) {
-                let full = format!("{schema_dir}/{name}");
-
-                if let Some(entry) = live.get(full.as_str()) {
-                    // Live table/view: sweep orphaned `idx_<id>` sub-dirs left by
-                    // a standalone DROP INDEX whose gated deletion was lost to a
-                    // crash. Matched on the circuit's own `index_id`, since a
-                    // promoted circuit outlives the IDX_TAB row that named it.
-                    for idx_name in subdir_names(&full) {
-                        let Some(ChildAddr::Index { id }) = ChildAddr::parse(&idx_name) else {
-                            continue;
-                        };
-                        if entry.indexes().iter().any(|ix| ix.id() == id) {
-                            // Its per-worker children are `reconcile_child_dirs`'
-                            // job — the sweep descends into an index dir.
-                            continue;
-                        }
-                        let idx_full = format!("{full}/{idx_name}");
-                        match fs::remove_dir_all(&idx_full) {
-                            Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", idx_full),
-                            Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", idx_full, e),
-                        }
-                    }
-                    continue;
-                }
-
-                // Only `<something>_<digits>` dirs are eligible for removal —
-                // never touch an unexpected entry. Every writer directly under a
-                // schema dir uses that shape, so a matching name absent from
-                // `live` is orphaned either way.
-                if !is_table_dir_name(&name) {
-                    continue;
-                }
+        for name in subdir_names(&root) {
+            let full = format!("{root}/{name}");
+            let Some(entry) = live.get(full.as_str()) else {
                 match fs::remove_dir_all(&full) {
-                    Ok(()) => gnitz_debug!("recovery: removed orphan table/view dir {}", full),
+                    Ok(()) => gnitz_debug!("recovery: removed orphan relation dir {}", full),
                     Err(e) => gnitz_debug!("recovery: failed to remove orphan dir {}: {}", full, e),
+                }
+                continue;
+            };
+            // Matched on the circuit's own `index_id`, since a promoted circuit
+            // outlives the IDX_TAB row that named it.
+            for idx_name in subdir_names(&full) {
+                let Some(ChildAddr::Index { id }) = ChildAddr::parse(&idx_name) else {
+                    continue;
+                };
+                if entry.indexes().iter().any(|ix| ix.id() == id) {
+                    // Its per-worker children are `reconcile_child_dirs`' job.
+                    continue;
+                }
+                let idx_full = format!("{full}/{idx_name}");
+                match fs::remove_dir_all(&idx_full) {
+                    Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", idx_full),
+                    Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", idx_full, e),
                 }
             }
         }

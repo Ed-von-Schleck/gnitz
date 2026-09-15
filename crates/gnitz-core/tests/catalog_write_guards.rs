@@ -3,10 +3,9 @@
 //! What the master refuses to write into its own catalog.
 //!
 //! `GnitzClient` canonicalizes and validates every name it stores, but
-//! `GnitzClient::push_ddl_txn` bypasses that — so the rules the engine's caches, its
-//! qualified-name keys and `hook_schema_dir`'s filesystem path depend on are
-//! enforced at the master's trust boundary, and these tests drive that boundary
-//! directly with hand-built bundles.
+//! `GnitzClient::push_ddl_txn` bypasses that — so the rules the engine's caches and
+//! its qualified-name keys depend on are enforced at the master's trust boundary,
+//! and these tests drive that boundary directly with hand-built bundles.
 
 use gnitz_core::protocol::{BatchAppender, ColumnDef, TypeCode, ZSetBatch};
 use gnitz_core::types::sys_schema;

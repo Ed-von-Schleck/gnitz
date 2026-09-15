@@ -161,10 +161,8 @@ impl Store {
         }
     }
 
-    /// Pin the store's LSN counter to a DDL zone's, so recovery's dedup check
-    /// matches the SAL group LSN that carried the write. Inert where this
-    /// process holds no store.
-    pub(crate) fn pin_lsn(&mut self, lsn: std::num::NonZeroU64) {
+    /// Dispatched [`Table::pin_lsn`]; inert where this process holds no store.
+    pub(crate) fn pin_lsn(&mut self, lsn: u64) {
         if let Some(t) = self.table_mut() {
             t.pin_lsn(lsn);
         }

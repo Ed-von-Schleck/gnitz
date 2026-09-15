@@ -1,8 +1,8 @@
 //! ALTER (rename) catalog mechanics driven directly at the `CatalogEngine`
-//! layer: the reconciling register hooks (a rename pair fires no cascade / no
-//! dir deletion), the post-image retraction contract (CAS, per-PK net,
-//! system-range rewrite guard) exercised with names longer than 12 bytes so the
-//! German-string blob heap is on the CAS path, and the id-only directory resume
+//! layer: the reconciling register hooks (a rename pair fires no cascade), the
+//! post-image retraction contract (CAS, per-PK net, system-range rewrite guard)
+//! exercised with names longer than 12 bytes so the German-string blob heap is on
+//! the CAS path, and the id-only directory resume
 //! across a reopen. The end-to-end SQL surface is in
 //! `crates/gnitz-sql/tests/planner_alter.rs`.
 
@@ -74,19 +74,15 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
-    let table_path = format!("{dir}/public/t_{tid}");
+    let table_path = relation_dir(&dir, RelationKind::BaseTable, tid);
     assert!(Path::new(&table_path).exists());
 
     let pair = table_rename_pair(&engine, tid, "renamed");
     engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();
 
-    // The registration survives; no directory is queued or removed.
+    // The registration survives, so its directory is live.
     assert!(engine.registry().has_id(tid), "rename must not unregister the table");
     assert!(Path::new(&table_path).exists(), "rename must not delete the table dir");
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "rename must queue no dir deletion (reconciling hooks no-op the registration)"
-    );
     // Caches reflect the new name; no persistent ghost row.
     assert!(engine.caches.entity_by_qname.contains_key("public.renamed"));
     assert!(!engine.caches.entity_by_qname.contains_key("public.orig"));
@@ -276,7 +272,6 @@ fn system_range_mutations_rejected() {
     for family in SysFamily::ALL {
         assert!(engine.registry().has_id(family.id()), "{} unregistered", family.name());
     }
-    assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(
         engine.caches.entity_by_id.get(&IDX_TAB_ID),
         Some(&("_system".to_string(), "_indices".to_string())),
@@ -467,10 +462,6 @@ fn insert_first_rename_pair_lands_the_new_name() {
     assert!(
         engine.registry().has_id(tid),
         "a rename must not unregister the table, whatever the row order"
-    );
-    assert!(
-        engine.pending_dir_deletions.is_empty(),
-        "a rename queues no dir deletion"
     );
     assert_eq!(live_rows_for(&engine, tid), 1, "a rename leaves exactly one live row");
 

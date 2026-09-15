@@ -172,22 +172,12 @@ impl RelationRegistry {
     /// `Rejected` means nothing was applied and the request is at fault;
     /// `Storage` means committed data did not reach the store.
     pub fn ingest(&mut self, id: i64, batch: Batch) -> Result<(), StoreError> {
-        self.ingest_batch(id, Incoming::Owned(batch), false, None).map(drop)
+        self.ingest_batch(id, Incoming::Owned(batch), false).map(drop)
     }
 
     /// [`Self::ingest`] over a batch the caller keeps reading; costs one copy.
-    ///
-    /// `zone` pins `id`'s store LSN to a DDL zone's, so recovery's dedup check
-    /// (`msg.lsn <= flushed`) matches the SAL group LSN that carried the write.
-    /// One argument rather than a second verb: a write without its pin, or a pin
-    /// without its write, is a recovery mismatch the caller cannot express here.
-    pub fn ingest_borrowed(
-        &mut self,
-        id: i64,
-        batch: &Batch,
-        zone: Option<std::num::NonZeroU64>,
-    ) -> Result<(), StoreError> {
-        self.ingest_batch(id, Incoming::Borrowed(batch), false, zone).map(drop)
+    pub fn ingest_borrowed(&mut self, id: i64, batch: &Batch) -> Result<(), StoreError> {
+        self.ingest_batch(id, Incoming::Borrowed(batch), false).map(drop)
     }
 
     /// [`Self::ingest`], handing back the batch as the store saw it, after PK
@@ -209,17 +199,11 @@ impl RelationRegistry {
                 )))
             }
         }
-        self.ingest_batch(id, Incoming::Owned(batch), true, None)
+        self.ingest_batch(id, Incoming::Owned(batch), true)
             .map(|b| b.expect("`needed` is set, so the effective batch comes back"))
     }
 
-    fn ingest_batch(
-        &mut self,
-        id: i64,
-        batch: Incoming<'_>,
-        needed: bool,
-        zone: Option<std::num::NonZeroU64>,
-    ) -> Result<Option<Batch>, StoreError> {
+    fn ingest_batch(&mut self, id: i64, batch: Incoming<'_>, needed: bool) -> Result<Option<Batch>, StoreError> {
         let entry = match self.tables.get_mut(&id) {
             Some(e) => e,
             None => {
@@ -241,15 +225,7 @@ impl RelationRegistry {
             )));
         }
 
-        let out = Self::apply(entry, batch, needed)
-            .map_err(|e| StoreError::storage(format!("ingest into relation {id}"), e))?;
-        // After the write, whose own auto-bump would overwrite the pin, and
-        // outside `apply`'s empty-batch short-circuit: a cascade that nets to
-        // nothing still rides a SAL group.
-        if let Some(lsn) = zone {
-            entry.store.pin_lsn(lsn);
-        }
-        Ok(out)
+        Self::apply(entry, batch, needed).map_err(|e| StoreError::storage(format!("ingest into relation {id}"), e))
     }
 
     /// Ingest `source` into this relation's store, then project and ingest one
