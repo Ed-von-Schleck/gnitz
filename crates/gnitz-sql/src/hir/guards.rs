@@ -1,13 +1,10 @@
-//! The pass-neutral guards: what the HIR *rejects*, independent of which pass
-//! notices. Bind classifies a FROM-clause join step here, the classification
-//! rewrite validates each key pair and the key arity here, and lowering checks the
-//! range-join output caps here — so no pass has to reach into another for a rule,
-//! and `hir::lower` depends only downward.
+//! What the HIR rejects, one home per rule, so no stage reaches into another for
+//! one and `hir::lower` depends only downward.
 
-use super::{JoinShape, JoinType};
+use super::{HirExpr, JoinShape, JoinType, SubqueryKind, SubqueryRef};
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_keys;
-use gnitz_core::{ColType, ColumnDef, RangeRel, TypeCode};
+use gnitz_core::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
 
 /// What supplies one join step's key columns, and the step's type — orthogonal in
@@ -57,7 +54,7 @@ pub(crate) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(JoinKey
 
 /// Where one join step's key columns come from.
 pub(crate) enum JoinKeys<'a> {
-    /// `ON <expr>` — the conjuncts are classified as written.
+    /// `ON <expr>` — the conjuncts are placed as written.
     On(&'a Expr),
     /// `USING (c, …)` — each named column is equated across the two sides and the
     /// two copies merge into one output column.
@@ -85,18 +82,10 @@ fn reject_full_join_column_merge(kind: JoinType, clause: &str) -> Result<(), Gni
     )))
 }
 
-/// Outer + residual is unsupported: an outer preserved-side row's null-fill
-/// decides match existence from the inner output (or the MAX/MIN threshold
-/// witness), independently of the residual, and so would not retro-null-fill a row
-/// matched only by residual-failing pairs. A consistent boundary across all join
-/// shapes beats an inconsistent partial one; INNER residuals are fully supported.
-/// One home, so both join emitters and the decorrelated Semi/Anti/Mark joins
-/// reject identically. `Inner` alone allows a residual (a post-join filter);
-/// `Left/Right/Full` reject it (it would have to participate in the null-fill);
-/// `Semi/Anti/Mark` reject it with the EXISTS/IN correlation message (a residual
-/// correlation conjunct cannot participate in the match-existence decision).
-pub(crate) fn reject_outer_with_residual(kind: JoinType, residual_empty: bool) -> Result<(), GnitzSqlError> {
-    if residual_empty {
+/// `residual`, what a join's ON left unkeyed, applies only as a filter over an
+/// INNER product: a null-fill or a match-existence decision reads the keys alone.
+pub(crate) fn reject_outer_with_residual(kind: JoinType, residual: &[HirExpr]) -> Result<(), GnitzSqlError> {
+    if residual.is_empty() {
         return Ok(());
     }
     match kind {
@@ -257,18 +246,6 @@ pub(crate) fn is_join_key_name(name: &str) -> bool {
     name.starts_with("_join_pk") || name.starts_with("_pair_pk")
 }
 
-/// The order-reversing converse of a `RangeRel` (`x OP y` ⟺ `y converse(OP) x`).
-/// Used both to canonicalize a right-table-first range conjunct to left-first and
-/// to derive term AB's rel from the canonical OP (§3 table).
-pub(crate) fn converse_rel(r: RangeRel) -> RangeRel {
-    match r {
-        RangeRel::Lt => RangeRel::Gt,
-        RangeRel::Le => RangeRel::Ge,
-        RangeRel::Gt => RangeRel::Lt,
-        RangeRel::Ge => RangeRel::Le,
-    }
-}
-
 /// Only an INNER step may be keyless: it is the cross join, whose residual (if
 /// any) filters the product. An outer or decorrelated step decides its null-fill
 /// or match existence from a key, and a keyless one would need a global "is the
@@ -306,6 +283,30 @@ pub(crate) fn reject_join_key_arity(n_eq: usize, has_range: bool) -> Result<(), 
         }));
     }
     Ok(())
+}
+
+/// An IN over a nullable operand is three-valued; only a top-level conjunct — a
+/// semi-join, where WHERE reads NULL as false — computes it exactly.
+pub(crate) fn reject_nullable_in(kind: JoinType, s: &SubqueryRef) -> Result<(), GnitzSqlError> {
+    if !matches!(s.kind, SubqueryKind::Exists { nullable: true }) {
+        return Ok(());
+    }
+    match kind {
+        JoinType::Anti => Err(GnitzSqlError::Unsupported(
+            "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
+             NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
+             use NOT EXISTS with an explicit equality instead"
+                .into(),
+        )),
+        JoinType::Mark(_) => Err(GnitzSqlError::Unsupported(
+            "IN (SELECT …) in a mark position (under OR/NOT, in CASE, or projected) requires \
+             the outer operand and the subquery column to be NOT NULL — SQL's 3VL diverges \
+             from the two-valued mark; use a top-level AND `x IN (SELECT …)` conjunct, or \
+             NOT EXISTS with an explicit equality"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Per-column common type for a set-op pair, or `None` to keep the exact-match

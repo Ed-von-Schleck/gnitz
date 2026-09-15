@@ -32,18 +32,7 @@ pub(crate) fn bind_conjuncts<R: Clone, L: LeafBinder<R>>(
     expr: &Expr,
     leaf: &L,
 ) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
-    fn split<R>(e: BExpr<R>, out: &mut Vec<BExpr<R>>) {
-        match e {
-            BExpr::BinOp(l, BinOp::And, r) => {
-                split(*l, out);
-                split(*r, out);
-            }
-            e => out.push(e),
-        }
-    }
-    let mut out = Vec::new();
-    split(bind_structural(expr, leaf)?, &mut out);
-    Ok(out)
+    Ok(bind_structural(expr, leaf)?.conjuncts())
 }
 
 // ---------------------------------------------------------------------------
@@ -299,8 +288,8 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // implicit ELSE NULL (`else_ = None`, lowered to `load_null`).
         //
         // The operand binds once and is cloned per branch. Re-binding it is not
-        // the same thing: each bind mints a fresh node identity, and a subquery
-        // under two identities trips the decorrelation rewrite's one-mark rule.
+        // the same thing: each bind of a subquery records a second subquery,
+        // which decorrelation joins a second time.
         Expr::Case {
             operand,
             conditions,
@@ -419,8 +408,9 @@ fn trim_set(trim_what: Option<&Expr>) -> Result<String, GnitzSqlError> {
     literal_expr_string(e).filter(|s| s.is_ascii()).ok_or_else(bad)
 }
 
-/// The `NOT` wrapper the negatable predicates (BETWEEN, IN, LIKE) share.
-fn maybe_negate<R>(node: BExpr<R>, negated: bool) -> BExpr<R> {
+/// The `NOT` wrapper the negatable predicates (BETWEEN, IN, LIKE, a subquery's
+/// `NOT EXISTS` / `NOT IN`) share.
+pub(crate) fn maybe_negate<R>(node: BExpr<R>, negated: bool) -> BExpr<R> {
     if negated {
         BExpr::Not(Box::new(node))
     } else {
@@ -829,10 +819,7 @@ fn bind_coalesce<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result
     match nullness(&value, leaf) {
         Nullness::Never => Ok(value),
         Nullness::Always => bind_coalesce(rest, leaf),
-        Nullness::Unknown => Ok(BExpr::Case {
-            branches: vec![(null_test(value.clone(), /* want_null = */ false, leaf), value)],
-            else_: Some(Box::new(bind_coalesce(rest, leaf)?)),
-        }),
+        Nullness::Unknown => Ok(BExpr::coalesce(value, bind_coalesce(rest, leaf)?)),
     }
 }
 

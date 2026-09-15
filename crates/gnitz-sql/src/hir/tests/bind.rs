@@ -44,7 +44,7 @@ fn catalog() -> CatalogSnapshot {
 }
 
 /// Bind one `CREATE VIEW` body.
-fn bound(sql: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
+pub(in crate::hir) fn bound(sql: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v AS {sql}")) else {
         panic!("not a CREATE VIEW");
     };

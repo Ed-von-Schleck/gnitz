@@ -3,8 +3,8 @@
 
 use super::super::{slots_of, ColId, HirCol, RelExpr, SetOpKind};
 use super::prims::self_derived_key;
-use super::spine::{open, Spine, Top};
-use super::{materialize, CutMemo};
+use super::spine::{open, open_pair, Top};
+use super::CutMemo;
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical::Frame;
@@ -35,15 +35,10 @@ pub(super) fn lower_setop(
         out.iter().map(|c| c.right).collect(),
     ];
     let live = |ids: &[ColId]| ids.iter().copied().collect::<HashSet<ColId>>();
-    let mut sides = [
-        open(chain, memo, left, &live(&ids[0]))?,
-        open(chain, memo, right, &live(&ids[1]))?,
-    ];
+    let (live_l, live_r) = (live(&ids[0]), live(&ids[1]));
     // UNION / UNION ALL are linear merges the dag drives by cloning one epoch's
     // delta to both sides; every other operator needs two distinct sources.
-    if *op != SetOpKind::Union && sides[0].tid() == sides[1].tid() {
-        sides[1] = Spine::segment(materialize(chain, memo, right, &live(&ids[1]))?);
-    }
+    let sides = open_pair(chain, memo, [left, right], [&live_l, &live_r], *op != SetOpKind::Union)?;
     let mut cb = CircuitBuilder::new();
     let mut hashed = Vec::with_capacity(2);
     for (i, side) in sides.into_iter().enumerate() {

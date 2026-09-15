@@ -213,6 +213,18 @@ wire_enum! {
     }
 }
 
+impl RangeRel {
+    /// The order-reversing converse: `x OP y` ⟺ `y OP.converse() x`.
+    pub fn converse(self) -> RangeRel {
+        match self {
+            RangeRel::Lt => RangeRel::Gt,
+            RangeRel::Le => RangeRel::Ge,
+            RangeRel::Gt => RangeRel::Lt,
+            RangeRel::Ge => RangeRel::Le,
+        }
+    }
+}
+
 /// How a `Reduce` node keys its output. Derived, never transmitted: both sides
 /// call [`Self::for_group_cols`] over facts they already hold — the source PK
 /// column list and the GROUP BY column list — so there is one producer and

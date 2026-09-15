@@ -57,17 +57,6 @@ fn range_key_pair_rejects_strings_but_promotes_integers() {
     );
 }
 
-/// `x OP y ⟺ y converse(OP) x`, and the converse is an involution.
-#[test]
-fn converse_rel_is_an_involution() {
-    for r in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
-        assert_ne!(converse_rel(r), r);
-        assert_eq!(converse_rel(converse_rel(r)), r);
-    }
-    assert_eq!(converse_rel(RangeRel::Lt), RangeRel::Gt);
-    assert_eq!(converse_rel(RangeRel::Le), RangeRel::Ge);
-}
-
 /// The reindex-slot arity is capped by the PK-list width; the keyless case is
 /// no concern of this guard's, at any width.
 #[test]
@@ -109,10 +98,11 @@ fn outer_with_residual_rejects_per_surface() {
         JoinType::Semi,
         JoinType::Mark(crate::hir::ColId::NONE),
     ] {
-        reject_outer_with_residual(k, true).unwrap();
+        reject_outer_with_residual(k, &[]).unwrap();
     }
-    reject_outer_with_residual(JoinType::Inner, false).unwrap();
-    let msg = |k| match reject_outer_with_residual(k, false).unwrap_err() {
+    let residual = [crate::ir::BExpr::LitInt(1)];
+    reject_outer_with_residual(JoinType::Inner, &residual).unwrap();
+    let msg = |k| match reject_outer_with_residual(k, &residual).unwrap_err() {
         GnitzSqlError::Unsupported(s) => s,
         e => panic!("expected Unsupported, got {e:?}"),
     };

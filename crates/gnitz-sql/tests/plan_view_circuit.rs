@@ -116,6 +116,10 @@ const SHAPES: &[Row] = &[
     ("SELECT a.id AS aid, n.v FROM a JOIN n ON a.k = n.k", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
     ("SELECT n.id AS nid, b.w FROM n LEFT JOIN b ON n.k = b.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
     ("SELECT n.id AS nid, m.v FROM n LEFT JOIN m ON n.k = m.k", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 2)]),
+    // An ON conjunct over the null-supplying side filters that input.
+    ("SELECT a.id AS aid, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (NullExtend, 1), (Filter, 1)]),
+    // A filtered derived-table input fuses into the join, cutting no segment.
+    ("SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k", 1, &[], &[(EquiJoin, 2), (Filter, 1)]),
     // Band join: two range terms, one pair-PK output exchange, no worker filter.
     ("SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[&[0, 1]], &[(RangeJoin, 2)]),
     ("SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.k = b.k AND a.v <= b.w", 1, &[&[0, 1]], &[(RangeJoin, 2), (PositivePart, 1), (NullExtend, 1)]),
@@ -147,6 +151,9 @@ const SHAPES: &[Row] = &[
     ("SELECT a.v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", 1, &[], &[(EquiJoin, 2), (PositivePart, 1)]),
     ("SELECT id FROM a WHERE k IN (SELECT k FROM b)", 1, &[], &[(EquiJoin, 2), (PositivePart, 1)]),
     ("SELECT id, EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AS flag FROM a", 1, &[], &[(EquiJoin, 2), (PositivePart, 1)]),
+    // Two marks: the lower one is cut, carrying its mark to the upper one, whose
+    // two branches each filter on the WHERE reading both.
+    ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)", 2, &[], &[(EquiJoin, 4), (PositivePart, 2), (Filter, 2)]),
     ("SELECT id FROM n WHERE EXISTS (SELECT 1 FROM m WHERE m.k = n.k)", 1, &[], &[(EquiJoin, 2), (PositivePart, 1), (Filter, 2)]),
     ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w < a.v)", 1, &[&[0]], &[(RangeJoin, 2), (PositivePart, 1)]),
     ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w < a.v)", 1, &[&[0]], &[(RangeJoin, 2), (Reduce, 1), (WorkerFilter, 1)]),
@@ -314,7 +321,8 @@ fn indexed_predicates_bound_the_backfill_scan() {
         // Each scan carries its bound; the engine drops a twice-scanned source's.
         (&on_ind, "SELECT g FROM t WHERE ind = 5 UNION ALL SELECT g FROM t WHERE ind = 6", &[&[2], &[2]]),
         (&on_ind, "SELECT g, COUNT(*) AS c FROM t WHERE pk = 5 GROUP BY g", &[]),
-        (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", &[]),
+        // A WHERE placed into a join input bounds that input's scan.
+        (&on_ind, "SELECT t.g, COUNT(*) AS c FROM t JOIN u ON t.pk = u.pk WHERE t.ind = 5 GROUP BY t.g", &[&[2]]),
         (&unindexed, "SELECT g, COUNT(*) AS c FROM t WHERE ind = 5 GROUP BY g", &[]),
     ];
     for &(cat, body, want) in rows {

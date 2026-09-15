@@ -20,7 +20,7 @@ use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole, ReindexSlot};
 ///                       `c0 IS NULL OR … OR ck IS NULL`.
 /// The two are exact De Morgan complements, so the LEFT-join match/bypass split
 /// partitions the preserved side with no gap and no double-count. `cols` is
-/// non-empty (k ≥ 1 is guaranteed by the join key classification). At k = 1 this emits
+/// non-empty (k ≥ 1 is guaranteed by the join's keys). At k = 1 this emits
 /// exactly the single-column IsNotNull/IsNull program, so existing single-key
 /// plans are byte-identical.
 pub(crate) fn multi_null_filter_prog(
@@ -76,7 +76,7 @@ pub(crate) fn self_derived_key(cols: &[usize]) -> Vec<ReindexSlot> {
 /// Re-key `node`, which carries `side`'s source rows, onto that source's PK. A trace
 /// key is `ScatterKey`; an internal operand `Auxiliary`.
 pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, side: &JoinSide, role: ReindexRole) -> NodeId {
-    let key: Vec<ReindexSlot> = side.seg.frame.schema.pk_cols.iter().map(|&c| (c, None)).collect();
+    let key: Vec<ReindexSlot> = side.frame.schema.pk_cols.iter().map(|&c| (c, None)).collect();
     cb.map_reindex(node, &key, &side.keep, role)
 }
 

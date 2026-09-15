@@ -214,11 +214,19 @@ fn outer_and_range_join_rules() {
         "SELECT ty.id AS aid, w.id AS bid FROM ty JOIN w ON ty.big < w.big",
     );
     view(&cat, "SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.v < b.w");
+    // An ON conjunct naming only the null-supplying side filters that side.
+    view(&cat, "SELECT a.id AS aid FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3");
     rejects(
         &cat,
         &[
             (
                 "SELECT * FROM a LEFT JOIN b ON a.k = b.k AND a.v <> b.w",
+                "Unsupported",
+                "residual ON predicate",
+            ),
+            // One naming only the preserved side would have to decide the null-fill.
+            (
+                "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND a.v > 5",
                 "Unsupported",
                 "residual ON predicate",
             ),
@@ -271,6 +279,19 @@ fn subquery_rules() {
         "SELECT * FROM a WHERE v = 1 OR EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
         // A nullable IN as a top-level conjunct is the anti-join's own semantics.
         "SELECT * FROM n WHERE k IN (SELECT k FROM b)",
+        // Two negations of a nullable NOT IN are a semi-join.
+        "SELECT * FROM a WHERE NOT (k NOT IN (SELECT k FROM n))",
+        // Marks compose, each read through its own column.
+        "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)",
+        "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v) \
+         OR EXISTS (SELECT 1 FROM b WHERE b.id = a.id)",
+        // A subquery body over a derived table carrying its own subquery.
+        "SELECT id FROM (SELECT id, k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)) d WHERE EXISTS (SELECT 1 FROM b WHERE b.w = d.k)",
+        // Both bounds of a BETWEEN read the one scalar subquery, joined once.
+        "SELECT id FROM a WHERE (SELECT MAX(w) FROM b) BETWEEN a.k AND a.v",
+        "SELECT a.id, (SELECT COUNT(*) FROM b) FROM a",
+        "SELECT a.id FROM a WHERE a.v <> (SELECT COUNT(*) FROM b)",
+        "SELECT a.v FROM a WHERE a.v < ALL (SELECT w FROM b)",
     ] {
         view(&cat, body);
     }
@@ -293,17 +314,14 @@ fn subquery_rules() {
             ("SELECT id FROM n WHERE n.k IN (SELECT k FROM b) OR n.v = 1", "Unsupported", "IN (SELECT …) in a mark position"),
             ("SELECT id, k IN (SELECT k FROM b) AS f FROM n", "Unsupported", "IN (SELECT …) in a mark position"),
             ("SELECT id FROM n WHERE NOT (k IN (SELECT k FROM b))", "Unsupported", "NOT NULL"),
-            ("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR EXISTS (SELECT 1 FROM b WHERE b.w = a.v)", "Unsupported", "at most one EXISTS/IN subquery in a mark position"),
+            ("SELECT id FROM n WHERE (k IN (SELECT k FROM b)) IS NULL", "Unsupported", "IN (SELECT …) in a mark position"),
             ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k GROUP BY b.w) FROM a", "Unsupported", "GROUP BY"),
             ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k < a.k) FROM a", "Unsupported", "range correlation"),
             ("SELECT a.id, (SELECT COUNT(*) FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k) FROM a", "Unsupported", "single FROM table without JOINs"),
             ("SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.v < (SELECT MAX(w) FROM b AS z)", "Unsupported", "scalar subqueries are not supported"),
             ("SELECT a.id, (SELECT b.w FROM b WHERE b.k = a.k) FROM a", "Unsupported", "single aggregate over its correlation group"),
-            ("SELECT a.id, (SELECT COUNT(*) FROM b) FROM a", "Unsupported", "only supported as a top-level WHERE"),
-            ("SELECT a.id FROM a WHERE a.v <> (SELECT COUNT(*) FROM b)", "Unsupported", "only supported as a top-level WHERE"),
             ("SELECT a.v FROM a WHERE a.k = ALL (SELECT k FROM b)", "Unsupported", "`= ALL (SELECT …)` is not supported"),
             ("SELECT a.v FROM a WHERE a.k <> ANY (SELECT k FROM b)", "Unsupported", "`<> ANY (SELECT …)` is not supported"),
-            ("SELECT a.v FROM a WHERE a.v < ALL (SELECT w FROM b)", "Unsupported", "uncorrelated range ALL"),
         ],
     );
 }
@@ -763,6 +781,11 @@ fn capacity_rules() {
     }
     let sql = "CREATE VIEW v WITH (capacity = '1 MB', delta = '1 MB') AS SELECT id, v FROM t";
     assert_rejects(sql, plan(&cat, sql), "Unsupported", "cannot carry a delta feed");
+
+    // A filtered derived-table input fuses into the join's circuit, cutting nothing.
+    let sql = "CREATE VIEW v WITH (capacity = '1 MB') AS \
+               SELECT a.id AS aid, d.w FROM a JOIN (SELECT k, w FROM b WHERE w > 3) d ON a.k = d.k";
+    plan(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
 
     // Only a filter/projection over one relation and an inner equi-join may be
     // bounded; every other shape compiles unbounded.

@@ -50,6 +50,10 @@ _ON = {
     "eq": ("a.k = b.k", lambda ar, br: _EQ(ar["k"], br["k"])),
     "band": ("a.k = b.k AND a.x <= b.y", lambda ar, br: _EQ(ar["k"], br["k"]) and _LE(ar["x"], br["y"])),
     "pair": ("a.k = b.k AND a.x = b.y", lambda ar, br: _EQ(ar["k"], br["k"]) and _EQ(ar["x"], br["y"])),
+    # A conjunct over the null-supplying side alone filters that side's input.
+    "eq_on_b": ("a.k = b.k AND b.y > 20", lambda ar, br: _EQ(ar["k"], br["k"]) and _GT(br["y"], 20)),
+    "band_on_b": ("a.k = b.k AND a.x <= b.y AND b.id > 3",
+                  lambda ar, br: _EQ(ar["k"], br["k"]) and _LE(ar["x"], br["y"]) and br["id"] > 3),
     **{f"range_{n}": (f"a.x {op} b.y", lambda ar, br, f=_cmp(f): f(ar["x"], br["y"]))
        for n, op, f in (("lt", "<", operator.lt), ("le", "<=", operator.le),
                         ("gt", ">", operator.gt), ("ge", ">=", operator.ge))},
@@ -60,6 +64,8 @@ _VIEWS = {
     **{f"eq_{k.lower()}": ("eq", k, None, None) for k in ("INNER", "LEFT", "RIGHT", "FULL")},
     **{f"band_{k.lower()}": ("band", k, None, None) for k in ("LEFT", "RIGHT", "FULL")},
     "pair_left": ("pair", "LEFT", None, None),
+    "eq_on_b_left": ("eq_on_b", "LEFT", None, None),
+    "band_on_b_left": ("band_on_b", "LEFT", None, None),
     **{f"{on}_left": (on, "LEFT", None, None) for on in _ON if on.startswith("range_")},
     # The WHERE is one 3VL filter over the post-null-fill output: a preserved-side
     # predicate keeps the fills that pass, an other-side one drops every fill, and
@@ -69,6 +75,9 @@ _VIEWS = {
     "eq_left_unmatched": ("eq", "LEFT", "b.id IS NULL", lambda ar, br: br is None),
     "eq_full_where_a": ("eq", "FULL", "a.id2 IS NOT NULL", lambda ar, br: ar is not None),
     "band_left_where_a": ("band", "LEFT", "a.x > 15", lambda ar, br: _GT(ar["x"], 15)),
+    "band_left_unmatched": ("band", "LEFT", "b.id IS NULL", lambda ar, br: br is None),
+    "eq_on_b_left_where_a": ("eq_on_b", "LEFT", "a.x > 15 AND b.id IS NULL",
+                             lambda ar, br: _GT(ar["x"], 15) and br is None),
     "range_lt_left_where_a": ("range_lt", "LEFT", "a.x > 15", lambda ar, br: _GT(ar["x"], 15)),
 }
 

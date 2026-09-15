@@ -42,7 +42,7 @@ _CHURN = [
 def test_a_chain_resolves_every_relation_below_each_step(client, schema_name):
     """A hand-written segment and the direct form compile to one chain. A later
     ON may key on a column deep in the accumulator, and a WHERE over the whole
-    chain folds into the last segment's residual. A CTE alias list lines up with
+    chain lands at the step whose inputs it names. A CTE alias list lines up with
     a join body's visible columns and skips its hidden key. An outer step
     null-fills wherever it sits: a preserved row with no match still reaches the
     next step through its own columns, a right-only fill carries NULL keys into

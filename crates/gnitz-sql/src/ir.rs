@@ -8,8 +8,8 @@ pub(crate) use gnitz_expr::{FloatUnaryOp, TrimMode};
 
 /// The bound-expression IR, generic over its leaf reference type `R`, which only
 /// `ColRef` carries. `R` has three instantiations: `usize` (the [`BoundExpr`]
-/// alias), a resolved column index into a batch schema; `HirRef`, the view
-/// path's column identity that survives the structural rewrites; and
+/// alias), a resolved column index into a batch schema; `ColId`, the view
+/// path's column identity that survives every tree the binder builds; and
 /// `Infallible`, in a written `Constant`, where no column can occur.
 /// `PartialEq` is structural equality over the *bound* form — what makes "the same
 /// expression written twice" decidable after names resolve, so `t.a + b` and
@@ -406,6 +406,39 @@ impl<R> BExpr<R> {
         BExpr::BinOp(Box::new(l), op, Box::new(r))
     }
 
+    /// This expression split at every top-level `AND`.
+    pub(crate) fn conjuncts(self) -> Vec<Self> {
+        fn split<R>(e: BExpr<R>, out: &mut Vec<BExpr<R>>) {
+            match e {
+                BExpr::BinOp(l, BinOp::And, r) => {
+                    split(*l, out);
+                    split(*r, out);
+                }
+                e => out.push(e),
+            }
+        }
+        let mut out = Vec::new();
+        split(self, &mut out);
+        out
+    }
+
+    /// `COALESCE(value, fallback)`.
+    pub(crate) fn coalesce(value: BExpr<R>, fallback: BExpr<R>) -> Self
+    where
+        R: Clone,
+    {
+        BExpr::Case {
+            branches: vec![(
+                BExpr::NullTest {
+                    inner: Box::new(value.clone()),
+                    want_null: false,
+                },
+                value,
+            )],
+            else_: Some(Box::new(fallback)),
+        }
+    }
+
     /// The integer a literal spells: a `LitInt`, or a temporal literal's storage
     /// integer — which is why the seek and IN-set recognizers read literals
     /// through here.
@@ -672,6 +705,19 @@ impl BinOp {
             BinOp::Le => Some(CmpOp::Le),
             BinOp::Gt => Some(CmpOp::Gt),
             BinOp::Ge => Some(CmpOp::Ge),
+            _ => None,
+        }
+    }
+
+    /// The four ordering operators, mapped to the relation a range join key
+    /// carries — [`Self::as_cmp`]'s shape and rationale.
+    pub(crate) fn as_range_rel(self) -> Option<gnitz_core::RangeRel> {
+        use gnitz_core::RangeRel;
+        match self {
+            BinOp::Lt => Some(RangeRel::Lt),
+            BinOp::Le => Some(RangeRel::Le),
+            BinOp::Gt => Some(RangeRel::Gt),
+            BinOp::Ge => Some(RangeRel::Ge),
             _ => None,
         }
     }

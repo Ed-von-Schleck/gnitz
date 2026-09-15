@@ -5,7 +5,6 @@
 //! The axis against [`super::prims`] is granularity: `prims` builds one program or
 //! emits at most one node; every item here emits a multi-node DBSP construction.
 
-use super::super::guards::converse_rel;
 use super::super::{slot_of, EqPair, HirRange, JoinType};
 use super::prims::{multi_null_filter_prog, null_gate, rekey_on_source_pk, self_derived_key};
 use super::JoinSide;
@@ -28,11 +27,11 @@ fn resolve_eq_cols(eq: &[EqPair], left: &JoinSide, right: &JoinSide) -> Result<E
     Ok(EquiKeys {
         left: eq
             .iter()
-            .map(|p| slot_of(&left.seg.frame.layout, p.left))
+            .map(|p| slot_of(&left.frame.layout, p.left))
             .collect::<Result<_, _>>()?,
         right: eq
             .iter()
-            .map(|p| slot_of(&right.seg.frame.layout, p.right))
+            .map(|p| slot_of(&right.frame.layout, p.right))
             .collect::<Result<_, _>>()?,
         tcs: eq.iter().map(|p| p.tc).collect(),
     })
@@ -112,7 +111,7 @@ fn gated_side<'a>(
     cols: Vec<usize>,
     tcs: &[TypeCode],
 ) -> Result<EquiSide<'a>, GnitzSqlError> {
-    let columns = &side.seg.frame.schema.columns;
+    let columns = &side.frame.schema.columns;
     let key = side_reindex_key(&cols, columns, tcs);
     let (gated, key_nullable) = null_gate(cb, input, &cols, columns)?;
     let reindex = cb.map_reindex(gated, &key, &side.keep, ReindexRole::ScatterKey);
@@ -339,12 +338,6 @@ impl RangePrologue<'_> {
         self.k() - 1
     }
 
-    /// The view's pre-rekey key-region column defs — one `_join_pk` slot per eq
-    /// pair plus the range slot.
-    pub(crate) fn out_pk_coldefs(&self) -> Vec<ColumnDef> {
-        join_pk_coldefs(&self.all_tcs)
-    }
-
     /// The two range terms and their normalization onto `[key region, A, B]`, each
     /// term's `(delta, trace, relation)` triple paired once. The traces are
     /// parameters because the pure-range shape integrates the worker-filtered slice
@@ -359,7 +352,7 @@ impl RangePrologue<'_> {
     ) -> NodeId {
         let n_eq = self.n_eq() as u8;
         let (reindex_a, reindex_b) = (self.sides[0].reindex, self.sides[1].reindex);
-        let join_ab = cb.join_with_trace_range_node(reindex_a, trace_b, n_eq, converse_rel(self.op));
+        let join_ab = cb.join_with_trace_range_node(reindex_a, trace_b, n_eq, self.op.converse());
         let join_ba = cb.join_with_trace_range_node(reindex_b, trace_a, n_eq, self.op);
         normalize_to_ab(cb, join_ab, join_ba, self.k(), left_n, right_n)
     }
@@ -386,7 +379,7 @@ impl RangePrologue<'_> {
         let reindex_m = cb.map_reindex(red, &self_derived_key(&[1]), &[], ReindexRole::Auxiliary);
         let trace_m = cb.integrate_trace(reindex_m);
 
-        let j_am = cb.join_with_trace_range_node(int_a, trace_m, n_eq, converse_rel(self.op));
+        let j_am = cb.join_with_trace_range_node(int_a, trace_m, n_eq, self.op.converse());
         let j_ma = cb.join_with_trace_range_node(reindex_m, trace_a, n_eq, self.op);
         // Range-join output = [_join_pk x k, delta payload, trace payload]. `m` has no
         // payload, so A sits at `k..k + left_n` in both terms.
@@ -434,11 +427,11 @@ pub(crate) fn range_prologue<'a>(
     } = resolve_eq_cols(eq, left, right)?;
     let left_cols: Vec<usize> = left_cols
         .into_iter()
-        .chain(std::iter::once(slot_of(&left.seg.frame.layout, range.left)?))
+        .chain(std::iter::once(slot_of(&left.frame.layout, range.left)?))
         .collect();
     let right_cols: Vec<usize> = right_cols
         .into_iter()
-        .chain(std::iter::once(slot_of(&right.seg.frame.layout, range.right)?))
+        .chain(std::iter::once(slot_of(&right.frame.layout, range.right)?))
         .collect();
     let all_tcs: Vec<TypeCode> = eq_tcs.into_iter().chain(std::iter::once(range.tc)).collect();
     let a = gated_side(cb, left, inputs[0], left_cols, &all_tcs)?;
@@ -497,10 +490,7 @@ fn union_null_key_rows(
     cols: &[usize],
     left: &JoinSide,
 ) -> Result<NodeId, GnitzSqlError> {
-    let anull = cb.filter(
-        source,
-        multi_null_filter_prog(cols, &left.seg.frame.schema.columns, true)?,
-    );
+    let anull = cb.filter(source, multi_null_filter_prog(cols, &left.frame.schema.columns, true)?);
     let anull_keyed = rekey_on_source_pk(cb, anull, left, ReindexRole::Auxiliary);
     let anull_owned = cb.worker_filter(anull_keyed);
     Ok(cb.union(nf_match, anull_owned))

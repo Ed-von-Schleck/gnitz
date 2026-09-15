@@ -32,6 +32,10 @@ from _uid import uid as _uid
 _OFF_FILE_NPC = 32
 _SHARD_FLAG_SKELETON = 1 << 63
 
+# An inner equi-join whose right input is a filtered derived table, which fuses
+# into the join's own circuit rather than cutting a segment.
+DERIVED_JOIN = "SELECT t.id, t.body, d.w FROM t JOIN (SELECT tid, w FROM u WHERE w > 70) d ON t.id = d.tid"
+
 # A skeleton row is the PK plus one summed weight, so a store that has swept
 # everything it can still holds this much per live key. `pk_stride` is 8 for a
 # single BIGINT PK.
@@ -76,11 +80,12 @@ def _twin(client, sn, name, body, capacity="1 KB"):
     [
         (LINEAR, "1 KB", True),
         (JOIN, "1 KB", True),
+        (DERIVED_JOIN, "1 KB", True),
         # A capacity nothing reaches: a bounded view under its cap must read
         # exactly like any other relation.
         (LINEAR, "1 GB", False),
     ],
-    ids=["linear", "join", "slack"],
+    ids=["linear", "join", "derived_join", "slack"],
 )
 def test_bounded_view_matches_its_unbounded_twin(sweeping_client, sweeping_server, body, capacity, sweeps):
     """Full scans, point seeks and the ad-hoc scan-spec path agree at every step

@@ -417,3 +417,14 @@ fn output_layout_is_the_key_region_then_the_unspelled_row() {
         vec![SyntheticKey, Carried(1), Carried(1)]
     );
 }
+
+/// `x OP y ⟺ y converse(OP) x`, and the converse is an involution.
+#[test]
+fn range_rel_converse_is_an_involution() {
+    for r in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
+        assert_ne!(r.converse(), r);
+        assert_eq!(r.converse().converse(), r);
+    }
+    assert_eq!(RangeRel::Lt.converse(), RangeRel::Gt);
+    assert_eq!(RangeRel::Le.converse(), RangeRel::Ge);
+}

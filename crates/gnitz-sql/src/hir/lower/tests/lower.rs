@@ -2,25 +2,21 @@ use super::*;
 use crate::hir::{ColIdGen, EqPair};
 use gnitz_core::TypeCode;
 
-/// A `SegInput` over `U64` columns named `(name, nullable)`, its layout minted
+/// A `Frame` over `U64` columns named `(name, nullable)`, its layout minted
 /// from `ids`.
-fn seg(ids: &ColIdGen, names: &[(&str, bool)], pk_cols: Vec<u32>) -> SegInput {
+fn frame(ids: &ColIdGen, names: &[(&str, bool)], pk_cols: Vec<u32>) -> Frame {
     let cols: Vec<ColumnDef> = names
         .iter()
         .map(|&(n, nullable)| ColumnDef::new(n, TypeCode::U64, nullable))
         .collect();
-    SegInput {
-        tid: 1,
-        frame: Frame {
-            layout: cols.iter().map(|_| ids.next()).collect(),
-            schema: Arc::new(Schema::from_parts(cols, pk_cols).unwrap()),
-        },
-        desc: None,
+    Frame {
+        layout: cols.iter().map(|_| ids.next()).collect(),
+        schema: Arc::new(Schema::from_parts(cols, pk_cols).unwrap()),
     }
 }
 
 fn class(eq: Vec<EqPair>, range: Option<super::super::HirRange>) -> JoinClass {
-    JoinClass { eq, range, residual: Vec::new() }
+    JoinClass { eq, range }
 }
 
 const NO_DEMAND: Demand<'static> = Demand { items: &[], where_preds: &[] };
@@ -30,11 +26,11 @@ const NO_DEMAND: Demand<'static> = Demand { items: &[], where_preds: &[] };
 #[test]
 fn a_pinned_side_keeps_its_pk_alone() {
     let ids = ColIdGen::new();
-    let left = seg(&ids, &[("v", false), ("id", false)], vec![1]);
-    let right = seg(&ids, &[("id", false), ("w", false)], vec![0]);
+    let left = frame(&ids, &[("v", false), ("id", false)], vec![1]);
+    let right = frame(&ids, &[("id", false), ("w", false)], vec![0]);
     let range = super::super::HirRange {
-        left: left.frame.layout[0],
-        right: right.frame.layout[1],
+        left: left.layout[0],
+        right: right.layout[1],
         op: gnitz_core::RangeRel::Lt,
         tc: TypeCode::U64,
     };
@@ -52,12 +48,12 @@ fn a_pinned_side_keeps_its_pk_alone() {
 #[test]
 fn an_unreferenced_equi_join_keeps_one_left_column() {
     let ids = ColIdGen::new();
-    let left = seg(&ids, &[("k", false), ("v", false)], vec![0]);
-    let right = seg(&ids, &[("k", false), ("w", false)], vec![0]);
+    let left = frame(&ids, &[("k", false), ("v", false)], vec![0]);
+    let right = frame(&ids, &[("k", false), ("w", false)], vec![0]);
     let cls = class(
         vec![EqPair {
-            left: left.frame.layout[0],
-            right: right.frame.layout[0],
+            left: left.layout[0],
+            right: right.layout[0],
             tc: TypeCode::U64,
         }],
         None,
@@ -72,12 +68,12 @@ fn an_unreferenced_equi_join_keeps_one_left_column() {
 #[test]
 fn a_preserved_side_keeps_its_nullable_key() {
     let ids = ColIdGen::new();
-    let left = seg(&ids, &[("id", false), ("k", true)], vec![0]);
-    let right = seg(&ids, &[("id", false), ("k", true)], vec![0]);
+    let left = frame(&ids, &[("id", false), ("k", true)], vec![0]);
+    let right = frame(&ids, &[("id", false), ("k", true)], vec![0]);
     let cls = class(
         vec![EqPair {
-            left: left.frame.layout[1],
-            right: right.frame.layout[1],
+            left: left.layout[1],
+            right: right.layout[1],
             tc: TypeCode::U64,
         }],
         None,
@@ -87,4 +83,39 @@ fn a_preserved_side_keeps_its_nullable_key() {
     assert_eq!(sides[0].keep.as_slice(), &[1u32][..]);
     // The right side has no ν, so its equally-nullable key is not protected.
     assert!(sides[1].keep.is_empty());
+}
+
+/// A band ν is keyed by the source PK, so it keeps every key column; an equi ν
+/// only a nullable one.
+#[test]
+fn a_band_nu_keeps_its_key_columns() {
+    let ids = ColIdGen::new();
+    let left = frame(
+        &ids,
+        &[("id", false), ("k", false), ("x", false), ("v", false)],
+        vec![0],
+    );
+    let right = frame(&ids, &[("id", false), ("k", false), ("y", false)], vec![0]);
+    let eq = vec![EqPair {
+        left: left.layout[1],
+        right: right.layout[1],
+        tc: TypeCode::U64,
+    }];
+    let range = super::super::HirRange {
+        left: left.layout[2],
+        right: right.layout[2],
+        op: gnitz_core::RangeRel::Le,
+        tc: TypeCode::U64,
+    };
+    let sides = join_sides(
+        NO_DEMAND,
+        &class(eq.clone(), Some(range)),
+        JoinType::Left,
+        [left.clone(), right.clone()],
+    );
+    // The pinned PK, then both key columns; the payload `v` nothing reads is not kept.
+    assert_eq!(sides[0].keep.as_slice(), &[0u32, 1, 2][..]);
+    let sides = join_sides(NO_DEMAND, &class(eq, None), JoinType::Left, [left, right]);
+    // An equi ν over a NOT NULL key keeps nothing past the Rule 5 fallback.
+    assert_eq!(sides[0].keep.as_slice(), &[0u32][..]);
 }

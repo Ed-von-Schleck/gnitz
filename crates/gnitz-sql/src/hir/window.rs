@@ -38,10 +38,8 @@
 //! re-emits every row of that partition; the cumulative shape additionally
 //! holds the band self-join's traces over `G`, one row per peer group.
 
-use super::bind::{bind_projection, hir_ref_nullable, type_of, ItemLeaf};
-use super::{
-    as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, JoinType, ProjEntry, RelExpr, TopNKey,
-};
+use super::bind::{bind_projection, ItemLeaf};
+use super::{as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType, ProjEntry, RelExpr, TopNKey};
 use crate::agg::default_agg_name;
 use crate::agg::AggFunc;
 use crate::ast_util::{
@@ -100,11 +98,11 @@ pub(crate) fn bind_window_final<L: ItemLeaf>(
     };
     let win = wleaf.state.into_inner();
     if let Some(q) = &qualify {
-        if let Some(top_n) = top_n_of_qualify(ids, &rel, leaf.env(), &items, q, &win)? {
+        if let Some(top_n) = top_n_of_qualify(ids, &rel, leaf, &items, q, &win)? {
             return Ok((top_n, placed));
         }
     }
-    Ok((desugar(ids, rel, leaf.env(), items, qualify, win)?, placed))
+    Ok((desugar(ids, rel, leaf, items, qualify, win)?, placed))
 }
 
 /// `QUALIFY ROW_NUMBER() OVER (PARTITION BY p… ORDER BY o…) <= n` (also `< n`
@@ -112,10 +110,10 @@ pub(crate) fn bind_window_final<L: ItemLeaf>(
 /// projected: a per-partition top-N, which the operator maintains in
 /// `O(n)` per touched partition where the desugar's band self-join re-emits
 /// the whole partition. `None` for every other shape, which keeps the desugar.
-fn top_n_of_qualify(
+fn top_n_of_qualify<L: ItemLeaf>(
     ids: &ColIdGen,
     input: &Rc<RelExpr>,
-    env: &[HirCol],
+    leaf: &L,
     items: &[ProjEntry],
     qualify: &HirExpr,
     win: &Windows,
@@ -128,8 +126,7 @@ fn top_n_of_qualify(
     }
     let mut referenced = false;
     for it in items {
-        it.expr
-            .for_each_ref(&mut |r| referenced |= matches!(r, HirRef::Col(id) if *id == call.out.id));
+        it.expr.for_each_ref(&mut |id| referenced |= *id == call.out.id);
     }
     if referenced {
         return Ok(None);
@@ -140,7 +137,7 @@ fn top_n_of_qualify(
     let spec = &win.specs[call.spec];
     // The SELECT list and the keys read `W`, the input narrowed to what they
     // reference plus what the keys compute, exactly as the desugar hoists it.
-    let mut h = Hoist::new(ids, env, &[]);
+    let mut h = Hoist::new(ids, leaf, &[]);
     let items = items
         .iter()
         .map(|it| {
@@ -161,7 +158,7 @@ fn top_n_of_qualify(
             nulls_first: !asc,
         })
         .collect();
-    let w = RelExpr::project(Rc::clone(input), h.items);
+    let w = leaf.project(Rc::clone(input), h.items)?;
     let top_n = RelExpr::top_n(w, partition, order, limit, 0);
     Ok(Some(RelExpr::project(top_n, items)))
 }
@@ -173,7 +170,7 @@ fn row_number_bound(qualify: &HirExpr, rn: ColId) -> Option<u64> {
     let BExpr::BinOp(l, op, r) = qualify else {
         return None;
     };
-    let is_rn = |e: &HirExpr| matches!(e, BExpr::ColRef(HirRef::Col(id)) if *id == rn);
+    let is_rn = |e: &HirExpr| matches!(e, BExpr::ColRef(id) if *id == rn);
     // Normalize to `rn OP n`; `x OP y` ⟺ `y OP.converse() x`.
     let (op, n) = match (l.as_ref(), r.as_ref()) {
         (lhs, BExpr::LitInt(n)) if is_rn(lhs) => (*op, *n),
@@ -249,8 +246,7 @@ struct WindowLeaf<'a, L> {
 impl<L: ItemLeaf> WindowLeaf<'_, L> {
     /// The `(type, nullable)` of the placeholder `r` names, when it names one —
     /// a window value's declaration, which the body's own leaf does not know.
-    fn placeholder(&self, r: &HirRef) -> Option<(ColType, bool)> {
-        let HirRef::Col(id) = r else { return None };
+    fn placeholder(&self, id: &ColId) -> Option<(ColType, bool)> {
         self.state
             .borrow()
             .calls
@@ -364,7 +360,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             let already_fixed = |e: &HirExpr| partition.contains(e) || order.iter().any(|(written, _)| written == e);
             let tiebreak: Vec<HirExpr> = key
                 .iter()
-                .map(|&id| BExpr::ColRef(HirRef::Col(id)))
+                .map(|&id| BExpr::ColRef(id))
                 .filter(|e| !already_fixed(e))
                 .collect();
             order.extend(tiebreak.into_iter().map(|e| (e, true)));
@@ -464,7 +460,7 @@ enum KeySlot {
     Residual,
 }
 
-impl<L: ItemLeaf> LeafBinder<HirRef> for WindowLeaf<'_, L> {
+impl<L: ItemLeaf> LeafBinder<ColId> for WindowLeaf<'_, L> {
     fn bind_node(&self, e: &Expr) -> Option<HirExpr> {
         self.inner.bind_node(e)
     }
@@ -493,10 +489,10 @@ impl<L: ItemLeaf> LeafBinder<HirRef> for WindowLeaf<'_, L> {
     /// The one context that admits a window call: it binds to the placeholder
     /// column its value stands in for until the desugar joins it in.
     fn bind_window(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        Ok(BExpr::ColRef(HirRef::Col(self.bind_window_call(f)?.id)))
+        Ok(BExpr::ColRef(self.bind_window_call(f)?.id))
     }
     /// This leaf's own placeholders; everything else is the body's.
-    fn is_nullable(&self, r: &HirRef) -> bool {
+    fn is_nullable(&self, r: &ColId) -> bool {
         self.placeholder(r)
             .map_or_else(|| self.inner.is_nullable(r), |(_, nullable)| nullable)
     }
@@ -509,8 +505,11 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
     fn env(&self) -> &[HirCol] {
         self.inner.env()
     }
-    fn type_of(&self, r: &HirRef) -> ColType {
+    fn type_of(&self, r: &ColId) -> ColType {
         self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(ty, _)| ty)
+    }
+    fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        self.inner.project(source, items)
     }
     fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
         self.inner.wildcard_cols()
@@ -532,7 +531,7 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
                 _ => format!("_{}{idx}", single_fn_name(f).unwrap_or("window").to_ascii_lowercase()),
             });
             let def = ColumnDef::typed(name, out.def.ty(), out.def.is_nullable);
-            (BExpr::ColRef(HirRef::Col(out.id)), def)
+            (BExpr::ColRef(out.id), def)
         }))
     }
 }
@@ -607,27 +606,24 @@ fn frame_is_cumulative(frame: Option<&WindowFrame>, has_order: bool) -> Result<b
 /// The columns of `W`, the relation every window reads: one per distinct
 /// expression the SELECT list, QUALIFY and the window operands reference.
 /// Visible and uniquely named, since `W` may be registered as a segment schema.
-struct Hoist<'a> {
+struct Hoist<'a, L> {
     ids: &'a ColIdGen,
-    env: &'a [HirCol],
+    /// The body's own leaf, which types every column an expression over the
+    /// body's scope names — a subquery's included.
+    leaf: &'a L,
     placeholders: &'a [HirCol],
     items: Vec<ProjEntry>,
-    /// Subquery leaves, keyed by the relation they carry: `HirRef`'s equality
-    /// never matches one, so they cannot be found by scanning `items`.
-    by_sub: HashMap<*const RelExpr, ColId>,
 }
 
-impl<'a> Hoist<'a> {
-    /// A hoist over `env`, with nothing hoisted yet. `placeholders` are the
-    /// window-call outputs a rebuilt expression may still name (empty where the
-    /// calls are gone).
-    fn new(ids: &'a ColIdGen, env: &'a [HirCol], placeholders: &'a [HirCol]) -> Self {
+impl<'a, L: ItemLeaf> Hoist<'a, L> {
+    /// A hoist over `leaf`'s scope; `placeholders` are the window values an
+    /// expression may still name.
+    fn new(ids: &'a ColIdGen, leaf: &'a L, placeholders: &'a [HirCol]) -> Self {
         Hoist {
             ids,
-            env,
+            leaf,
             placeholders,
             items: Vec::new(),
-            by_sub: HashMap::new(),
         }
     }
 
@@ -638,8 +634,8 @@ impl<'a> Hoist<'a> {
         if let Some(it) = self.items.iter().find(|it| it.expr == *e) {
             return it.out.id;
         }
-        let ty = e.infer_ty_with(&|r| type_of(self.env, r));
-        let nullable = !e.never_null_with(&|r| hir_ref_nullable(self.env, r));
+        let ty = e.infer_ty_with(&|r| self.leaf.type_of(r));
+        let nullable = !e.never_null_with(&|r| self.leaf.is_nullable(r));
         let out = HirCol::new(
             self.ids.next(),
             ColumnDef::typed(format!("_w{}", self.items.len()), ty, nullable),
@@ -649,23 +645,14 @@ impl<'a> Hoist<'a> {
         id
     }
 
-    /// `e` with every source reference replaced by its `W` column: a column by
-    /// its pass-through, a subquery leaf by the computed column evaluating it.
+    /// `e` with every source reference replaced by its `W` column's pass-through.
     fn refs(&mut self, e: &HirExpr) -> Result<HirExpr, GnitzSqlError> {
-        e.try_rebuild(&mut |r| -> Result<HirExpr, GnitzSqlError> {
-            let id = match r {
-                HirRef::Col(id) if col_by_id(self.placeholders, *id).is_some() => *id,
-                HirRef::Col(_) => self.hoist(&BExpr::ColRef(r.clone())),
-                HirRef::Subquery(s) => match self.by_sub.get(&Rc::as_ptr(&s.rel)) {
-                    Some(&w) => w,
-                    None => {
-                        let w = self.hoist(&BExpr::ColRef(r.clone()));
-                        self.by_sub.insert(Rc::as_ptr(&s.rel), w);
-                        w
-                    }
-                },
+        e.try_rebuild(&mut |id| -> Result<HirExpr, GnitzSqlError> {
+            let id = match col_by_id(self.placeholders, *id) {
+                Some(_) => *id,
+                None => self.hoist(&BExpr::ColRef(*id)),
             };
-            Ok(BExpr::ColRef(HirRef::Col(id)))
+            Ok(BExpr::ColRef(id))
         })
     }
 }
@@ -693,23 +680,23 @@ impl Read {
         self.cols[i].id
     }
     fn col(&self, i: usize) -> HirExpr {
-        BExpr::ColRef(HirRef::Col(self.id(i)))
+        BExpr::ColRef(self.id(i))
     }
 }
 
 /// Rewrite a windowed body into joins and reduces: hoist `W`, build each
 /// specification's value relation, join every one onto the outer read of `W`,
 /// and project the SELECT list over the result (through the QUALIFY filter).
-fn desugar(
+fn desugar<L: ItemLeaf>(
     ids: &ColIdGen,
     input: Rc<RelExpr>,
-    env: &[HirCol],
+    leaf: &L,
     items: Vec<ProjEntry>,
     qualify: Option<HirExpr>,
     win: Windows,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let placeholders: Vec<HirCol> = win.calls.iter().map(|c| c.out.clone()).collect();
-    let mut h = Hoist::new(ids, env, &placeholders);
+    let mut h = Hoist::new(ids, leaf, &placeholders);
     let items = items
         .into_iter()
         .map(|it| Ok(ProjEntry { expr: h.refs(&it.expr)?, out: it.out }))
@@ -753,7 +740,7 @@ fn desugar(
         Some(pos) => WRel { rel: Rc::clone(&input), pos },
         None => WRel {
             pos: h.items.iter().enumerate().map(|(i, it)| (it.out.id, i)).collect(),
-            rel: RelExpr::project(input, h.items),
+            rel: leaf.project(input, h.items)?,
         },
     };
     let outer = Read::of(ids, &w.rel);
@@ -772,31 +759,17 @@ fn desugar(
         };
         let on = keys
             .into_iter()
-            .map(|(w_col, right_id)| {
-                BExpr::bin(
-                    outer.col(w.pos[&w_col]),
-                    BinOp::Eq,
-                    BExpr::ColRef(HirRef::Col(right_id)),
-                )
-            })
+            .map(|(w_col, right_id)| BExpr::bin(outer.col(w.pos[&w_col]), BinOp::Eq, BExpr::ColRef(right_id)))
             .collect();
-        cur = RelExpr::join(cur, right, JoinType::Inner, on);
+        cur = RelExpr::join(cur, right, JoinType::Inner, on)?;
         values.extend(vals);
     }
 
     // The SELECT list and QUALIFY over the joined relation: a `W` reference
     // reads the outer side, a placeholder its window's value column.
     let remap = |e: &HirExpr| {
-        e.try_rebuild(&mut |r| -> Result<HirExpr, GnitzSqlError> {
-            let id = match r {
-                HirRef::Col(id) => *id,
-                HirRef::Subquery(_) => {
-                    return Err(GnitzSqlError::Internal(
-                        "window desugar: a subquery leaf escaped hoisting".into(),
-                    ))
-                }
-            };
-            let target = match (w.pos.get(&id), values.get(&id)) {
+        e.try_rebuild(&mut |id| -> Result<HirExpr, GnitzSqlError> {
+            let target = match (w.pos.get(id), values.get(id)) {
                 (Some(&p), _) => outer.id(p),
                 (None, Some(&v)) => v,
                 (None, None) => {
@@ -805,7 +778,7 @@ fn desugar(
                     ))
                 }
             };
-            Ok(BExpr::ColRef(HirRef::Col(target)))
+            Ok(BExpr::ColRef(target))
         })
     };
     let items = items
@@ -813,7 +786,7 @@ fn desugar(
         .map(|it| Ok(ProjEntry { expr: remap(&it.expr)?, out: it.out }))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     let rel = match qualify {
-        Some(q) => RelExpr::filter(cur, vec![remap(&q)?]),
+        Some(q) => RelExpr::filter(cur, vec![remap(&q)?])?,
         None => cur,
     };
     Ok(RelExpr::project(rel, items))
@@ -881,7 +854,7 @@ fn present(
                 ColumnDef::typed(format!("_k{i}"), def.ty(), def.is_nullable),
             );
             let id = out.id;
-            items.push(ProjEntry { expr: BExpr::ColRef(HirRef::Col(k)), out });
+            items.push(ProjEntry { expr: BExpr::ColRef(k), out });
             id
         })
         .collect();
@@ -1023,7 +996,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         }
         on.push(lex);
     }
-    let band = RelExpr::join(Rc::clone(&g1.rel), Rc::clone(&g2.rel), JoinType::Inner, on);
+    let band = RelExpr::join(Rc::clone(&g1.rel), Rc::clone(&g2.rel), JoinType::Inner, on)?;
     let band_cols = band.cols();
 
     // R: fold g2's per-group values over the band, keyed by g1's group. RANK

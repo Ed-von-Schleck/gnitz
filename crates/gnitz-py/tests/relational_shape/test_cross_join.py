@@ -24,6 +24,9 @@ _SPELLINGS = {
     "cr": ("FROM t JOIN u ON t.v <> u.w", lambda v, w: v != w),
     "cw": ("FROM t, u WHERE t.v <> u.w", lambda v, w: v != w),
     "cf": ("FROM t CROSS JOIN u WHERE t.v = 0", lambda v, w: v == 0),
+    # A one-sided WHERE filters its side's input before the product.
+    "cu": ("FROM t, u WHERE u.w > 0", lambda v, w: w > 0),
+    "cb": ("FROM t, u WHERE t.v > 0 AND u.w < 5 AND t.v <> u.w", lambda v, w: v > 0 and w < 5 and v != w),
 }
 
 _LONG = "two-one-" + "x" * 40

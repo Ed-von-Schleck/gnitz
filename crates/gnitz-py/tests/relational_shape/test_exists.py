@@ -14,6 +14,8 @@ rewritten to a 0/1 **mark** that ordinary expression evaluation consumes.
 
 Run with GNITZ_WORKERS=4: the correlation key is an exchange key.
 """
+from collections import Counter
+
 from _read import bag, scanned
 
 
@@ -49,10 +51,11 @@ _A_COLS = ("id", "k", "k1", "k2", "t", "x", "v")
 _B_COLS = ("id", "k", "k1", "k2", "t", "w", "y")
 
 _CHURN = [
+    # a(5) shares a(1)'s `k`, `k1` and `k2` but not its `v`.
     ("INSERT INTO a VALUES (1, 10, 7, 70, 50, 10, 100), (2, 20, 7, 71, 5, 20, 200), "
-     "(3, NULL, 8, 70, 50, NULL, 300), (4, 30, 8, 80, 60, 30, 999)",
+     "(3, NULL, 8, 70, 50, NULL, 300), (4, 30, 8, 80, 60, 30, 999), (5, 10, 7, 70, 50, NULL, 5)",
      "a", [(1, 10, 7, 70, 50, 10, 100), (2, 20, 7, 71, 5, 20, 200),
-           (3, None, 8, 70, 50, None, 300), (4, 30, 8, 80, 60, 30, 999)]),
+           (3, None, 8, 70, 50, None, 300), (4, 30, 8, 80, 60, 30, 999), (5, 10, 7, 70, 50, None, 5)]),
     # A NULL-keyed inner row, and an all-NULL range column: an empty threshold.
     ("INSERT INTO b VALUES (1, NULL, 7, 70, 40, 5, NULL)", "b", [(1, None, 7, 70, 40, 5, None)]),
     ("INSERT INTO b VALUES (2, 10, 7, 70, 45, 8, 15)", "b", [(2, 10, 7, 70, 45, 8, 15)]),
@@ -66,6 +69,10 @@ _CHURN = [
     # A NULL outer key becomes a real one.
     ("UPDATE a SET k = 20 WHERE id = 3", "a", [(3, 20, 8, 70, 50, None, 300)]),
     ("DELETE FROM b", "b", [1, 3, 4]),
+    # With no `b.k = 10`, a(1) matches both rows on `k2` and `w < v` and a(5)
+    # neither: two rows one `k` groups, whose match counts differ.
+    ("INSERT INTO b VALUES (6, NULL, 7, 70, 1, 50, NULL), (7, NULL, 7, 70, 1, 60, NULL)",
+     "b", [(6, None, 7, 70, 1, 50, None), (7, None, 7, 70, 1, 60, None)]),
 ]
 
 
@@ -75,7 +82,8 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_na
     which takes the identity projection for the equi shape, the band shape and
     the mark path, whose mark the WHERE consumes without materializing. The mark
     is an ordinary boolean under OR, under NOT and as a `NOT IN`; projected bare
-    or through a searched or a simple CASE, a flip must retract the old row."""
+    or through a searched or a simple CASE, a flip must retract the old row. Two
+    marks compose, and a subquery body reads a derived table with its own."""
     sn = schema_name
     ex = "SELECT 1 FROM b WHERE"
     client.execute_sql(
@@ -104,7 +112,10 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_na
         f"CREATE VIEW mark_range AS SELECT id FROM a WHERE v = 100 OR EXISTS ({ex} {_MARK['range'][0]}); "
         f"CREATE VIEW flag AS SELECT id, EXISTS ({ex} {_MARK['eq'][0]}) AS f FROM a; "
         f"CREATE VIEW searched AS SELECT id, CASE WHEN EXISTS ({ex} {_MARK['eq'][0]}) THEN v ELSE 0 END AS f FROM a; "
-        f"CREATE VIEW simple AS SELECT id, CASE EXISTS ({ex} {_MARK['eq'][0]}) WHEN 1 THEN 10 WHEN 0 THEN 20 END AS f FROM a",
+        f"CREATE VIEW simple AS SELECT id, CASE EXISTS ({ex} {_MARK['eq'][0]}) WHEN 1 THEN 10 WHEN 0 THEN 20 END AS f FROM a; "
+        f"CREATE VIEW mark_two AS SELECT k1 FROM a WHERE EXISTS ({ex} {_CORR['eq'][0]}) OR EXISTS ({ex} {_MARK['band'][0]}); "
+        f"CREATE VIEW derived_exists AS SELECT id FROM (SELECT id, k2 FROM a WHERE EXISTS ({ex} {_CORR['eq'][0]})) d "
+        f"WHERE EXISTS ({ex} b.k2 = d.k2)",
         schema_name=sn)
 
     a, b = {}, {}
@@ -150,6 +161,11 @@ def test_a_subquery_emits_each_outer_row_once_while_it_matches(client, schema_na
             ("mark_range", lambda r: r["v"] == 100 or exists(_MARK["range"][1])(r)),
         ):
             assert bag(scanned(client, sn, name), "id") == ids(keep), (sql, name)
+        in_band = exists(_MARK["band"][1])
+        assert bag(scanned(client, sn, "mark_two"), "k1") == Counter(
+            (r["k1"],) for r in a.values() if exists(_CORR["eq"][1])(r) or in_band(r)), sql
+        assert bag(scanned(client, sn, "derived_exists"), "id") == \
+            ids(lambda r: exists(_CORR["eq"][1])(r) and mark(r)), sql
         for name, value in (("flag", lambda r: int(mark(r))),
                             ("searched", lambda r: r["v"] if mark(r) else 0),
                             ("simple", lambda r: 10 if mark(r) else 20)):

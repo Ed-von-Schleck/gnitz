@@ -314,6 +314,14 @@ fn row_number_needs_a_unique_row_key() {
     );
     // RANK is fine over both.
     plan("SELECT t.id, RANK() OVER (ORDER BY t.a) FROM t JOIN u ON t.k = u.k").unwrap();
+    // A join equating the right side's key matches each left row at most once, and
+    // a decorrelated EXISTS emits each outer row at most once: both keep the left key.
+    plan("SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.a) FROM t JOIN u ON t.k = u.uid").unwrap();
+    plan(
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM \
+         (SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k)) d",
+    )
+    .unwrap();
     plan("SELECT id, RANK() OVER (ORDER BY a) FROM st").unwrap();
     // A derived table that drops the key loses it; one that keeps it keeps it.
     rejects(

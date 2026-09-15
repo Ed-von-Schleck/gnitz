@@ -1,12 +1,9 @@
 //! The EXISTS/IN shell: a decorrelated `Join{Semi|Anti|Mark}` over the
-//! [`super::joincore`] primitives.
+//! [`super::joincore`] primitives, its inputs opened through the spine.
 
-use super::super::split_filter;
-use super::super::{ColId, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr};
+use super::super::{ColId, HirExpr, HirRange, JoinClass, ProjEntry, RelExpr};
 use super::joincore::{band_nu_operands, equi_prologue, range_prologue, src_pk_coldefs};
-use super::{
-    emit_filter, join_sides, materialize, project_tail, resolve_in_place, resolve_input, CutMemo, Demand, JoinSide,
-};
+use super::{emit_filter, emit_join_inputs, project_tail, CutMemo, Demand, JoinSide};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::guards::reject_pure_range_threshold_tc;
@@ -14,8 +11,6 @@ use crate::hir::physical::Frame;
 use crate::hir::JoinType;
 use crate::ir::BExpr;
 use gnitz_core::{CircuitBuilder, ColumnDef, NodeId};
-use std::collections::HashSet;
-use std::rc::Rc;
 
 /// What an EXISTS/IN circuit hands its tail: one branch for semi/anti, two for a
 /// mark join. The kind decides which, so the tail reads the shape off the type
@@ -51,51 +46,21 @@ fn exists_branches(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, kind: J
     }
 }
 
-/// Lower a decorrelated `Project(Filter?(Join{Semi|Anti|Mark}))` to circuit pieces.
+/// Lower a decorrelated `Project(Filter?(Join{Semi|Anti|Mark}))` to circuit pieces,
+/// its WHERE filtering each branch's outer rows.
 pub(super) fn lower_exists_view(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     items: &[ProjEntry],
     where_preds: &[HirExpr],
-    source: &Rc<RelExpr>,
+    source: &RelExpr,
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let RelExpr::Join { left, right, kind, on, .. } = source.as_ref() else {
+    let RelExpr::Join { left, right, kind, on: class } = source else {
         unreachable!("lower_exists_view receives a Join");
     };
-    let class = on.class()?;
-    // A semi/anti view fuses its WHERE into the outer delta before the join terms;
-    // a mark view applies it per branch after the mark. Derived from `kind` here,
-    // so the two stages cannot be handed the wrong one.
-    let (left_prefilter, post_mark) = match kind {
-        JoinType::Mark(_) => (&[][..], where_preds),
-        _ => (where_preds, &[][..]),
-    };
-
-    // Left-input live set (projection + WHERE + correlation-key left cols) for a
-    // cut left input (a nested subquery); a bare Get reads everything.
-    let mut live: HashSet<ColId> = HashSet::new();
-    Demand { items, where_preds }.refs(&mut live);
-    live.extend(class.key_cols(true));
-
-    let left_in = resolve_input(chain, memo, left, &live)?;
-    let (inner_preds, inner_src) = split_filter(right);
-    let mut right_in = resolve_in_place(chain, memo, inner_src)?
-        .ok_or_else(|| GnitzSqlError::Internal("EXISTS/IN inner relation is not read in place".into()))?;
-    // Self-collision: EXISTS/IN over the outer's own relation must read the inner
-    // as a distinct source (single-source-per-epoch). The materialized inner
-    // applies its own WHERE, so it carries the correlation keys alone.
-    let inner_preds = if left_in.tid == right_in.tid {
-        let keys: HashSet<ColId> = class.key_cols(false).collect();
-        right_in = materialize(chain, memo, right, &keys)?;
-        &[][..]
-    } else {
-        inner_preds
-    };
-
-    // A prefilter is consumed before the reindex, so only a post-mark WHERE joins
-    // the projection in the keep demand.
-    let down = Demand { items, where_preds: post_mark };
-    let sides = join_sides(down, class, *kind, [left_in, right_in]);
+    let down = Demand { items, where_preds };
+    let mut cb = CircuitBuilder::new();
+    let ([a, b], sides) = emit_join_inputs(chain, memo, &mut cb, down, [left, right], *kind, class)?;
 
     // A pure-range correlation (no equality prefix) decides existence from a
     // MIN/MAX threshold row, which is carried only at a ≤8-byte width.
@@ -107,21 +72,7 @@ pub(super) fn lower_exists_view(
         )?;
     }
 
-    // Delta per side with its local / inner-local WHERE fused as a prefilter
-    // (before the join terms).
-    let mut cb = CircuitBuilder::new();
-    let a_delta = cb.input_delta(sides[0].seg.tid, None);
-    let a_local = emit_filter(&mut cb, a_delta, left_prefilter, &sides[0].seg.frame)?;
-    let b_delta = cb.input_delta(sides[1].seg.tid, None);
-    let b_local = emit_filter(&mut cb, b_delta, inner_preds, &sides[1].seg.frame)?;
-
-    let core = ExistsCore {
-        sides: &sides,
-        a_local,
-        b_local,
-        class,
-        kind: *kind,
-    };
+    let core = ExistsCore { sides: &sides, a, b, class, kind: *kind };
     let (branches, out_pk_cols) = match &class.range {
         Some(range) => core.range(&mut cb, range)?,
         None => core.equi(&mut cb)?,
@@ -130,7 +81,10 @@ pub(super) fn lower_exists_view(
     // The `[out PK][kept outer]` frame every branch projects against.
     let frame = Frame::keyed(out_pk_cols, sides[0].ids().zip(sides[0].coldefs.iter().cloned()));
     let (node, out) = match branches {
-        ExistsBranches::SemiAnti(node) => project_tail(&mut cb, node, items, &frame)?,
+        ExistsBranches::SemiAnti(node) => {
+            let filtered = emit_filter(&mut cb, node, where_preds, &frame)?;
+            project_tail(&mut cb, filtered, items, &frame)?
+        }
         ExistsBranches::Mark { mark_id, matched, unmatched } => {
             let branch = MarkBranch { mark_id, where_preds, items, frame };
             let (m, out) = branch.emit(&mut cb, matched, 1)?;
@@ -148,12 +102,12 @@ pub(super) fn lower_exists_view(
     Ok(EmitPieces { circuit: cb.build(), out })
 }
 
-/// What the equi and range EXISTS/IN cores both read: the sides, their prefiltered
-/// deltas, the correlation and the decorrelation kind.
+/// What the equi and range EXISTS/IN cores both read: the sides, their emitted
+/// inputs, the correlation and the decorrelation kind.
 struct ExistsCore<'a> {
     sides: &'a [JoinSide; 2],
-    a_local: NodeId,
-    b_local: NodeId,
+    a: NodeId,
+    b: NodeId,
     class: &'a JoinClass,
     kind: JoinType,
 }
@@ -161,9 +115,9 @@ struct ExistsCore<'a> {
 impl ExistsCore<'_> {
     /// Equi correlation, keyed by `_join_pk`: `(branches, _join_pk cols)`.
     fn equi(&self, cb: &mut CircuitBuilder) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
-        let ExistsCore { sides, a_local, b_local, class, kind } = *self;
+        let ExistsCore { sides, a, b, class, kind } = *self;
         let (a_n, b_n) = (sides[0].n(), sides[1].n());
-        let terms = equi_prologue(cb, &class.eq, sides, [a_local, b_local])?;
+        let terms = equi_prologue(cb, &class.eq, sides, [a, b])?;
         let k = terms.k();
 
         // π_A(inner): project each term straight to [_join_pk × k, A].
@@ -174,8 +128,8 @@ impl ExistsCore<'_> {
         );
         let pi_a = cb.union(pa_ab, pa_ba);
 
-        // A_all: the full (locally filtered, NULL keys included) outer input,
-        // re-keyed.
+        // A_all: the full (filtered by its own placed WHERE, NULL keys included)
+        // outer input, re-keyed.
         let a_all = terms.p_all(cb, true);
         Ok((exists_branches(cb, a_all, pi_a, kind), terms.out_pk_coldefs()))
     }
@@ -188,11 +142,11 @@ impl ExistsCore<'_> {
         cb: &mut CircuitBuilder,
         range: &HirRange,
     ) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
-        let ExistsCore { sides, a_local, b_local, class, kind } = *self;
+        let ExistsCore { sides, a, b, class, kind } = *self;
         let left = &sides[0];
         let a_n = left.n();
 
-        let pro = range_prologue(cb, sides, [a_local, b_local], &class.eq, range)?;
+        let pro = range_prologue(cb, sides, [a, b], &class.eq, range)?;
 
         let branches = if pro.n_eq() == 0 {
             // Pure range: the one-row threshold m = MAX/MIN(b.range) decides existence.
@@ -201,7 +155,7 @@ impl ExistsCore<'_> {
             let matched = pro.pure_range_matched(cb, int_a, trace_a);
             // `A − matched` (∪ NULL-range-key rows) — the anti / mark unmatched
             // branch; only a branch that subtracts from A emits the passthrough.
-            let mut unmatched = || pro.pure_range_unmatched(cb, matched, int_a, a_local);
+            let mut unmatched = || pro.pure_range_unmatched(cb, matched, int_a, a);
             // The threshold decides existence directly, so these are the three
             // compositions `exists_branches` states over ν — spelled here against
             // `matched` / `A − matched` because the threshold has no `π_A(inner)`.
@@ -220,12 +174,12 @@ impl ExistsCore<'_> {
             let trace_a = cb.integrate_trace(pro.sides[0].reindex);
             let trace_b = cb.integrate_trace(pro.sides[1].reindex);
             let merged = pro.range_merged(cb, trace_a, trace_b, a_n, sides[1].n());
-            let (a_all, pi_a) = band_nu_operands(cb, merged, pro.k(), 0, left, a_local);
+            let (a_all, pi_a) = band_nu_operands(cb, merged, pro.k(), 0, left, a);
             exists_branches(cb, a_all, pi_a, kind)
         };
 
         // View PK = the outer source PK, hidden (it also rides the payload verbatim).
-        Ok((branches, src_pk_coldefs(&left.seg.frame.schema)))
+        Ok((branches, src_pk_coldefs(&left.frame.schema)))
     }
 }
 
@@ -257,13 +211,13 @@ impl MarkBranch<'_> {
     }
 }
 
-/// Substitute `ColRef(Col(mark_id))` with `LitInt(val)` throughout an expression —
+/// Substitute `ColRef(mark_id)` with `LitInt(val)` throughout an expression —
 /// the mark column's per-branch constant; every other leaf passes through.
 fn subst_mark_lit(e: &HirExpr, mark_id: ColId, val: i64) -> HirExpr {
-    let Ok(out) = e.try_rebuild::<HirRef, std::convert::Infallible>(&mut |r| {
-        Ok(match r {
-            HirRef::Col(id) if *id == mark_id => BExpr::LitInt(val),
-            _ => BExpr::ColRef(r.clone()),
+    let Ok(out) = e.try_rebuild::<ColId, std::convert::Infallible>(&mut |id| {
+        Ok(match *id == mark_id {
+            true => BExpr::LitInt(val),
+            false => BExpr::ColRef(*id),
         })
     });
     out

@@ -24,7 +24,7 @@ mod topn;
 
 use super::chain::{EmitPieces, ViewChain};
 use super::physical::{self, Frame};
-use super::{as_col, slots_of, split_filter, ColId, GetSource, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::{as_col, slots_of, split_filter, ColId, GetSource, HirAgg, HirExpr, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
 use crate::agg::group_pk_def;
 use crate::codec::project_schema::{payload_map, ProjItem};
@@ -110,8 +110,7 @@ pub(crate) fn keyed_frame(
 }
 
 /// The downstream demand on a combine's output: the final projection and the
-/// post-node WHERE (outer joins only; empty for INNER — the rewrite folded the
-/// WHERE into the residual).
+/// WHERE over the node — whatever predicate placement left above it.
 #[derive(Clone, Copy)]
 pub(crate) struct Demand<'a> {
     pub(crate) items: &'a [ProjEntry],
@@ -125,9 +124,8 @@ impl Demand<'_> {
     }
 }
 
-/// A resolved combine input: its delta source and the frame against which key /
-/// group / projection references resolve. A base/segment `Get` maps directly; a
-/// cut subtree resolves to its hidden segment via [`cut_segment`].
+/// A source a spine reads: a relation in place, or a subtree cut to its hidden
+/// segment via [`cut_segment`], with the frame its references resolve against.
 #[derive(Clone)]
 pub(crate) struct SegInput {
     pub tid: u64,
@@ -140,19 +138,17 @@ pub(crate) struct SegInput {
 }
 
 /// The compilation-wide cut memo: a subtree reached twice (a CTE or window input
-/// read through several `Alias`es) is cut to one hidden segment. It is why the
-/// HIR→HIR rewrites preserve `Rc` identity. Every key is a node of the lowered tree.
+/// read through several `Alias`es) is cut to one hidden segment, which is why
+/// bind shares such a subtree as one `Rc`. Every key is a node of the lowered tree.
 pub(crate) type CutMemo = HashMap<*const RelExpr, SegInput>;
 
-/// Insert every `HirRef::Col` id referenced anywhere in `exprs` into `live` — the
+/// Insert every `ColId` referenced anywhere in `exprs` into `live` — the
 /// one home for "which columns does this expression set demand", used to prune a
 /// cut input's segment to exactly the columns its parent reads.
 pub(crate) fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>, live: &mut HashSet<ColId>) {
     for e in exprs {
-        e.for_each_ref(&mut |r| {
-            if let HirRef::Col(id) = r {
-                live.insert(*id);
-            }
+        e.for_each_ref(&mut |id| {
+            live.insert(*id);
         });
     }
 }
@@ -226,7 +222,7 @@ pub(crate) fn project_tail(
     Ok((node, out))
 }
 
-/// Lower a bound + classified `RelExpr` tree to circuit pieces.
+/// Lower a bound `RelExpr` tree to circuit pieces.
 pub(crate) fn lower(chain: &mut ViewChain, rel: Rc<RelExpr>, bounded: bool) -> Result<EmitPieces, GnitzSqlError> {
     if bounded {
         reject_ineligible_capacity_body(&rel)?;
@@ -267,7 +263,7 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                 }
                 // Eligible: filter/projection over one relation.
                 RelExpr::Get { .. } => return Ok(()),
-                RelExpr::Join { kind: JoinType::Inner, on, .. } => match on.class()?.shape() {
+                RelExpr::Join { kind: JoinType::Inner, on, .. } => match on.shape() {
                     // A range/band join's null-fill threshold pipeline is not
                     // replayable per key; a cross join has no key at all, so a
                     // skeleton row names no trace group to replay.
@@ -305,10 +301,9 @@ fn lower_body(chain: &mut ViewChain, memo: &mut CutMemo, rel: &Rc<RelExpr>) -> R
         RelExpr::Project { input, items } => {
             let (fpreds, source) = split_filter(input);
             match source.as_ref() {
-                RelExpr::Join {
-                    kind: JoinType::Semi | JoinType::Anti | JoinType::Mark(_),
-                    ..
-                } => exists::lower_exists_view(chain, memo, items, fpreds, source),
+                RelExpr::Join { kind, .. } if kind.is_decorrelated() => {
+                    exists::lower_exists_view(chain, memo, items, fpreds, source)
+                }
                 RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source),
                 RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source),
                 _ => spine::lower_linear(chain, memo, rel, items),
@@ -336,20 +331,6 @@ fn lowered_whole(rel: &RelExpr) -> bool {
     matches!(rel, RelExpr::Join { .. } | RelExpr::Reduce { .. })
 }
 
-/// Resolve one join input to a `SegInput`: read in place when
-/// [`resolve_in_place`] can, else cut to a hidden segment.
-pub(crate) fn resolve_input(
-    chain: &mut ViewChain,
-    memo: &mut CutMemo,
-    input: &Rc<RelExpr>,
-    live: &HashSet<ColId>,
-) -> Result<SegInput, GnitzSqlError> {
-    match resolve_in_place(chain, memo, input)? {
-        Some(seg) => Ok(seg),
-        None => cut_segment(chain, memo, input, live),
-    }
-}
-
 /// `input` read in place: a catalog `Get`, or an alias of its input's source (cut
 /// whole, since every alias reads that one segment) under the alias's ids.
 pub(crate) fn resolve_in_place(
@@ -373,7 +354,10 @@ pub(crate) fn resolve_in_place(
         RelExpr::Alias { input: inner, cols } => {
             let inner_cols = inner.cols();
             let all: HashSet<ColId> = inner_cols.iter().map(|c| c.id).collect();
-            let SegInput { tid, frame, desc } = resolve_input(chain, memo, inner, &all)?;
+            let SegInput { tid, frame, desc } = match resolve_in_place(chain, memo, inner)? {
+                Some(seg) => seg,
+                None => cut_segment(chain, memo, inner, &all)?,
+            };
             let layout = frame
                 .layout
                 .iter()
@@ -465,8 +449,8 @@ fn filter(
 }
 
 /// Resolve `preds` against `frame` and emit the filter. Shared by the emits that
-/// filter an already-emitted node: HAVING, the join and EXISTS residuals and
-/// prefilters, and a mark branch's WHERE.
+/// filter an already-emitted node: HAVING, and the WHERE over a join, an EXISTS
+/// branch or a mark branch.
 pub(crate) fn emit_filter<'a>(
     cb: &mut gnitz_core::CircuitBuilder,
     node: gnitz_core::NodeId,
@@ -476,11 +460,35 @@ pub(crate) fn emit_filter<'a>(
     filter(cb, node, &physical::resolve_preds(preds, &frame.layout)?, &frame.schema)
 }
 
-/// One side of a join as [`join_sides`] left it: the resolved input, its
+/// A join's two inputs opened through the spine and emitted into `cb`, each
+/// carrying what `down` reads and its own keys, and kept under [`join_sides`].
+pub(crate) fn emit_join_inputs(
+    chain: &mut ViewChain,
+    memo: &mut CutMemo,
+    cb: &mut gnitz_core::CircuitBuilder,
+    down: Demand<'_>,
+    [left, right]: [&Rc<RelExpr>; 2],
+    kind: JoinType,
+    class: &JoinClass,
+) -> Result<([gnitz_core::NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
+    let live = |is_left: bool| {
+        let mut live = HashSet::new();
+        down.refs(&mut live);
+        live.extend(class.key_cols(is_left));
+        live
+    };
+    let (live_l, live_r) = (live(true), live(false));
+    let [l, r] = spine::open_pair(chain, memo, [left, right], [&live_l, &live_r], true)?;
+    let (a, left_frame) = l.emit(cb, spine::Top::Slots, "join input")?;
+    let (b, right_frame) = r.emit(cb, spine::Top::Slots, "join input")?;
+    Ok(([a, b], join_sides(down, class, kind, [left_frame, right_frame])))
+}
+
+/// One side of a join as [`join_sides`] left it: the emitted input's frame, its
 /// reindex-payload keep list in emission order, those columns' defs, and the
 /// pinned source PK's arity (`0` when unpinned).
 pub(crate) struct JoinSide {
-    pub(crate) seg: SegInput,
+    pub(crate) frame: Frame,
     pub(crate) keep: Vec<u32>,
     pub(crate) coldefs: Vec<ColumnDef>,
     pk_arity: usize,
@@ -500,7 +508,7 @@ impl JoinSide {
 
     /// The kept payload's `ColId`s, in keep order.
     pub(crate) fn ids(&self) -> impl Iterator<Item = ColId> + '_ {
-        self.keep.iter().map(|&i| self.seg.frame.layout[i as usize])
+        self.keep.iter().map(|&i| self.frame.layout[i as usize])
     }
 
     /// The type codes of the kept payload columns — what `null_extend` needs to
@@ -514,9 +522,9 @@ impl JoinSide {
 /// into the join's traces, and so onto disk. The five contributors are marked in
 /// order below; a wildcard projection is already expanded into `ProjEntry` column
 /// refs by bind, so Rule 1 covers `SELECT *`.
-pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, inputs: [SegInput; 2]) -> [JoinSide; 2] {
-    let [left_in, right_in] = inputs;
-    let (left_layout, right_layout) = (&left_in.frame.layout, &right_in.frame.layout);
+pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, inputs: [Frame; 2]) -> [JoinSide; 2] {
+    let [left, right] = inputs;
+    let (left_layout, right_layout) = (&left.layout, &right.layout);
     // One keep list per side, so a rule cannot write into the region another rule
     // owns.
     let mut keep = [vec![false; left_layout.len()], vec![false; right_layout.len()]];
@@ -529,29 +537,27 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
         // An id in neither layout is the mark column, which the mark branch
         // substitutes by its `0/1` constant before resolving anything.
     };
-    // Rules 1 + 2: projection, residual ON + top-level WHERE.
+    // Rules 1 + 2: the projection and the WHERE over the join.
     let mut referenced: HashSet<ColId> = HashSet::new();
     down.refs(&mut referenced);
-    collect_live_cols(&class.residual, &mut referenced);
     for id in referenced {
         mark(&mut keep, id);
     }
-    // Rule 3: a side with a ν keeps its nullable join-key components. `map_reindex`
-    // collapses a NULL key to synthetic PK 0, so pruning the key would make a
-    // NULL-keyed row and a real `k = 0` row byte-identical and the NULL row's
-    // null-fill would cancel against the real row's matched multiplicity. Only the
-    // equi shapes need it — the band and pure-range ν key on the source PK, where
-    // NULL and 0 cannot collide — so elsewhere it merely over-keeps.
-    for (side, is_left, seg) in [(0, true, &left_in), (1, false, &right_in)] {
+    // Rule 3: a side with a ν keeps each key column its ν key does not carry, so
+    // rows merging in ν match alike: an equi ν's key writes a NULL as 0, and a
+    // band ν is keyed by the source PK. A pure-range ν subtracts no match count.
+    let nu_lacks = |def: &ColumnDef| match class.shape() {
+        JoinShape::Equi => def.is_nullable,
+        JoinShape::Range => !class.eq.is_empty(),
+        JoinShape::Cross => false,
+    };
+    for (side, is_left, frame) in [(0, true, &left), (1, false, &right)] {
         if !kind.has_nu(is_left) {
             continue;
         }
-        for p in &class.eq {
-            let id = if is_left { p.left } else { p.right };
-            if let Some(pos) = seg.frame.layout.iter().position(|c| *c == id) {
-                if seg.frame.schema.columns[pos].is_nullable {
-                    keep[side][pos] = true;
-                }
+        for id in class.key_cols(is_left) {
+            if let Some(pos) = frame.layout.iter().position(|c| *c == id) {
+                keep[side][pos] |= nu_lacks(&frame.schema.columns[pos]);
             }
         }
     }
@@ -575,27 +581,24 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
         keep[0][0] = true;
     }
     let [kl, kr] = keep;
-    [one_side(left_in, &kl, pins[0]), one_side(right_in, &kr, pins[1])]
+    [one_side(left, &kl, pins[0]), one_side(right, &kr, pins[1])]
 }
 
 /// One side's keep list in emission order: its pinned PK columns first, then every
 /// other kept column in source order. A keep list need not ascend, and the PK at
 /// the front is what makes every pair-PK slot list a range.
-fn one_side(seg: SegInput, keep: &[bool], pin_pk: bool) -> JoinSide {
+fn one_side(frame: Frame, keep: &[bool], pin_pk: bool) -> JoinSide {
     let pinned: Vec<u32> = if pin_pk {
-        seg.frame.schema.pk_cols.clone()
+        frame.schema.pk_cols.clone()
     } else {
         Vec::new()
     };
     let mut cols = pinned.clone();
     cols.extend((0..keep.len() as u32).filter(|i| keep[*i as usize] && !pinned.contains(i)));
-    let coldefs = cols
-        .iter()
-        .map(|&i| seg.frame.schema.columns[i as usize].clone())
-        .collect();
+    let coldefs = cols.iter().map(|&i| frame.schema.columns[i as usize].clone()).collect();
     JoinSide {
         pk_arity: pinned.len(),
-        seg,
+        frame,
         keep: cols,
         coldefs,
     }

@@ -7,8 +7,8 @@
 //! (`resolve_table_factor`).
 
 use super::{
-    as_col, col_by_id, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType, ProjEntry,
-    RelExpr, SetOpKind, SubqueryKind, SubqueryRef, TopNKey,
+    as_col, col_by_id, cross_comparison, hircol_of, side, ColId, ColIdGen, HirAgg, HirCol, HirExpr, JoinType,
+    ProjEntry, RelExpr, SetOpKind, Side, SubqueryKind, SubqueryRef, TopNKey,
 };
 use crate::agg::default_agg_name;
 use crate::agg::AggFunc;
@@ -19,6 +19,7 @@ use crate::ast_util::{
     select_has_window, window_spec_keys, AggArg, FromShape,
 };
 use crate::bind::apply_positional_aliases;
+use crate::bind::structural::maybe_negate;
 use crate::bind::{
     bind_conjuncts, bind_structural, find_unique_column, output_column, single_relation_col_idx, Binder, LeafBinder,
 };
@@ -30,7 +31,7 @@ use crate::validate::{
     as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, Schema};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, Schema, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, NamedWindowExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
     TableFactor,
@@ -327,8 +328,8 @@ fn resolve_table_factor(
 /// reordering), so `a LEFT JOIN b JOIN c` is `(a LEFT JOIN b) JOIN c`, and a
 /// comma binds loosest: `FROM a JOIN b ON …, c` is `((a JOIN b) , c)`.
 ///
-/// Conjuncts bind raw — into `Join.on` from the step, into a `Filter` from the
-/// WHERE. `hir::rewrite` is what classifies them into keys.
+/// Conjuncts are placed as each join and filter is built — the step's into its
+/// join, the WHERE's over the whole fold (`hir::place`).
 fn bind_select(
     cx: &mut BindCx<'_, '_>,
     select: &Select,
@@ -393,9 +394,7 @@ fn bind_select(
         }
     }
 
-    // The WHERE lands as a `Filter` over the source (raw conjuncts; the rewrite
-    // places them). A DISTINCT / GROUP BY over a join sits above the join tree —
-    // the lowering cuts the join to a hidden segment.
+    // A DISTINCT / GROUP BY over a join sits above it; lowering cuts the join.
     let leaf = ScopeLeaf {
         scope: &scope,
         clause: cx.surface.stmt,
@@ -439,7 +438,7 @@ fn bind_body_suffix(
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let mut rel = source;
     if let Some(where_expr) = &select.selection {
-        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?);
+        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?)?;
     }
     if grouped && select.distinct.is_none() {
         // A view body admits window calls; the ad-hoc fold entries below do not,
@@ -454,7 +453,7 @@ fn bind_body_suffix(
         let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
         reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
         let placed = place_order_keys(order_exprs, &mut items, ids, leaf)?;
-        (RelExpr::project(rel, items), placed)
+        (leaf.project(rel, items)?, placed)
     };
     if select.distinct.is_none() {
         return Ok((projected, placed));
@@ -482,7 +481,7 @@ fn expand_wildcard(
     Ok(expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?
         .into_iter()
         .map(|(i, def)| ProjEntry {
-            expr: BExpr::ColRef(HirRef::Col(cols[i].id)),
+            expr: BExpr::ColRef(cols[i].id),
             out: HirCol::new(ids.next(), def),
         })
         .collect())
@@ -492,14 +491,20 @@ fn expand_wildcard(
 /// columns it types, whether a bare `*` is an item, and what a top-level call
 /// item's output column is. One rule for the linear, grouped and windowed
 /// projections, so an item means the same thing wherever it is written.
-pub(crate) trait ItemLeaf: LeafBinder<HirRef> {
+pub(crate) trait ItemLeaf: LeafBinder<ColId> {
     /// The columns in scope — the typing table for every `ColId` this leaf
     /// hands out.
     fn env(&self) -> &[HirCol];
     /// The declared type of a leaf reference. A leaf minting columns of its own
-    /// (a window placeholder) answers for those; everything else is the env's.
-    fn type_of(&self, r: &HirRef) -> ColType {
-        type_of(self.env(), r)
+    /// (a window placeholder, a subquery's column) answers for those; everything
+    /// else is the env's.
+    fn type_of(&self, id: &ColId) -> ColType {
+        hircol_of(self.env(), *id).def.ty()
+    }
+    /// The projection of `items` over `source`. The subquery-binding leaf joins in
+    /// the subqueries its items and `source`'s filter read.
+    fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        Ok(RelExpr::project(source, items))
     }
     /// The columns a bare `*` expands to here, or `None` where `*` is not an item
     /// — a grouped body, where every item is a group key or an aggregate.
@@ -579,8 +584,7 @@ fn bind_proj_expr<L: ItemLeaf>(
     ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
-    // A leaf's own minted column (a window placeholder) is not in its env, so it
-    // takes the computed branch, typed through `leaf.type_of`.
+    // A column the leaf minted (a window value, a subquery) is not in its env.
     let src_def = as_col(&bound).and_then(|id| col_by_id(leaf.env(), id)).map(|c| &c.def);
     let out_def = match src_def {
         Some(d) if !d.is_hidden => aliased_def(d, alias),
@@ -597,20 +601,14 @@ fn bind_proj_expr<L: ItemLeaf>(
     })
 }
 
-/// The declared type of a leaf reference — the env column's type code, or the
-/// bound subquery's contributed value type (a computed projection may embed a
-/// subquery leaf before decorrelation substitutes it).
-pub(crate) fn type_of(env: &[HirCol], r: &HirRef) -> ColType {
-    match r {
-        HirRef::Col(id) => hircol_of(env, *id).def.ty(),
-        HirRef::Subquery(sq) => sq.value_type(),
-    }
-}
-
 /// What a leaf does with a subquery node it meets.
 enum SubPolicy<'a> {
-    /// Bind it in place (the subquery-carrying single-table linear body).
-    Bind(&'a dyn Fn(&Expr) -> Result<HirExpr, GnitzSqlError>),
+    /// Bind it as the column its decorrelation produces, recording it in `subs`
+    /// (the subquery-carrying single-table linear body).
+    Bind {
+        bind: &'a dyn Fn(&Expr) -> Result<HirExpr, GnitzSqlError>,
+        subs: &'a RefCell<Vec<SubqueryRef>>,
+    },
     /// No subquery here: the per-kind rejection, named with this leaf's clause.
     PerKind,
     /// A more specific reason than "not here", stated verbatim: the per-kind
@@ -633,17 +631,40 @@ struct ScopeLeaf<'a> {
     sub: SubPolicy<'a>,
 }
 
+impl ScopeLeaf<'_> {
+    /// The kind of the subquery `id` is the column of, when this leaf bound one.
+    fn recorded(&self, id: ColId) -> Option<SubqueryKind> {
+        match self.sub {
+            SubPolicy::Bind { subs, .. } => subs.borrow().iter().find(|s| s.id == id).map(|s| s.kind),
+            _ => None,
+        }
+    }
+}
+
 impl ItemLeaf for ScopeLeaf<'_> {
     /// The columns in scope, in relation order.
     fn env(&self) -> &[HirCol] {
         &self.scope.combined
     }
+    fn type_of(&self, id: &ColId) -> ColType {
+        match self.recorded(*id) {
+            Some(SubqueryKind::Exists { .. }) => ColType::of(TypeCode::I64),
+            Some(SubqueryKind::Scalar { ty, .. }) => ty,
+            None => hircol_of(self.env(), *id).def.ty(),
+        }
+    }
     fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
         Some(self.scope.unmerged())
     }
+    fn project(&self, source: Rc<RelExpr>, items: Vec<ProjEntry>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        match self.sub {
+            SubPolicy::Bind { subs, .. } => super::decorrelate::decorrelate(source, items, &subs.borrow()),
+            _ => Ok(RelExpr::project(source, items)),
+        }
+    }
 }
 
-impl LeafBinder<HirRef> for ScopeLeaf<'_> {
+impl LeafBinder<ColId> for ScopeLeaf<'_> {
     /// A qualified / unqualified / parenthesized column reference → its `ColId`.
     fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         let id = match col_ref_parts(e) {
@@ -656,7 +677,7 @@ impl LeafBinder<HirRef> for ScopeLeaf<'_> {
                 )))
             }
         };
-        Ok(BExpr::ColRef(HirRef::Col(id)))
+        Ok(BExpr::ColRef(id))
     }
 
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
@@ -669,13 +690,19 @@ impl LeafBinder<HirRef> for ScopeLeaf<'_> {
         ))
     }
 
-    fn is_nullable(&self, r: &HirRef) -> bool {
-        hir_ref_nullable(self.env(), r)
+    /// A subquery's column by its shape (an EXISTS/IN over NOT NULL operands or
+    /// a COUNT never is NULL); every other column by its definition.
+    fn is_nullable(&self, id: &ColId) -> bool {
+        match self.recorded(*id) {
+            Some(SubqueryKind::Exists { nullable }) => nullable,
+            Some(SubqueryKind::Scalar { count, .. }) => !count,
+            None => hircol_of(self.env(), *id).def.is_nullable,
+        }
     }
 
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         match self.sub {
-            SubPolicy::Bind(f) => f(e),
+            SubPolicy::Bind { bind, .. } => bind(e),
             SubPolicy::PerKind => Err(clause_error(
                 self.clause,
                 crate::bind::structural::unsupported_subquery(e),
@@ -685,39 +712,28 @@ impl LeafBinder<HirRef> for ScopeLeaf<'_> {
     }
 }
 
-/// Whether a leaf reference over `env` can be NULL: a column by its definition,
-/// a subquery by its shape (an EXISTS/IN test or a COUNT never is).
-pub(crate) fn hir_ref_nullable(env: &[HirCol], r: &HirRef) -> bool {
-    match r {
-        HirRef::Col(id) => hircol_of(env, *id).def.is_nullable,
-        HirRef::Subquery(s) => !s.never_null(),
-    }
-}
-
 // ── Subquery binding (EXISTS/IN, scalar aggregate, ANY/ALL) ──────────────────────
-//
-// A subquery-carrying single-table linear body binds in ONE pass over the real
-// `bind_structural`, so every desugar/fold the structural recursion performs —
-// COALESCE truncation at a never-NULL COUNT, provably-non-null elision, CASE
-// short-circuit — is reached for free. The body leaf's `SubPolicy::Bind` binds
-// each subquery node to a `HirRef::Subquery` leaf where the walk meets it,
-// reaching the snapshot and the binder through a `RefCell` (the `LeafBinder`
-// methods take `&self`). Decorrelation (`hir::rewrite`) consumes the leaves.
 
 /// Everything a subquery bind resolves against: the body bind's own context,
-/// plus the outer scope it correlates to.
+/// the outer scope it correlates to, and the record of subqueries bound so far.
 struct SubCtx<'a, 'c, 'b> {
     cx: &'a mut BindCx<'c, 'b>,
     outer_env: &'a [HirCol],
     outer_alias: &'a str,
+    subs: &'a RefCell<Vec<SubqueryRef>>,
 }
 
-/// Bind a subquery-carrying single-table linear body to `Project(Filter?(Get))`.
-/// One pass: each subquery binds where `bind_structural` meets it, so the WHERE
-/// and the projection are walked exactly once and in source order.
-///
-/// The `RefCell` is `LeafBinder`'s `&self`; nothing re-enters it, since a nested
-/// subquery is rejected by the inner correlation leaf.
+impl SubCtx<'_, '_, '_> {
+    /// Record `s`, and read it through its column.
+    fn record(&self, s: SubqueryRef) -> HirExpr {
+        let id = s.id;
+        self.subs.borrow_mut().push(s);
+        BExpr::ColRef(id)
+    }
+}
+
+/// Bind a single-relation linear body reading subqueries, each bound to its column
+/// where `bind_structural` meets it.
 fn bind_linear_subquery_body(
     cx: &mut BindCx<'_, '_>,
     select: &Select,
@@ -727,16 +743,18 @@ fn bind_linear_subquery_body(
     order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let (ids, surface) = (cx.ids, cx.surface);
+    let subs = RefCell::new(Vec::new());
     let sub = RefCell::new(SubCtx {
         cx,
         outer_env: &scope.combined,
         outer_alias,
+        subs: &subs,
     });
     let bind_sub = |e: &Expr| bind_one_subquery(&mut sub.borrow_mut(), e);
     let leaf = ScopeLeaf {
         scope,
         clause: surface.stmt,
-        sub: SubPolicy::Bind(&bind_sub),
+        sub: SubPolicy::Bind { bind: &bind_sub, subs: &subs },
     };
     // The `!grouped && !distinct` guard is what routed the body here.
     bind_body_suffix(ids, select, get, &leaf, surface.projection, false, order_exprs)
@@ -794,31 +812,20 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result
             ),
         };
         for bound in bind_conjuncts(where_expr, &leaf)? {
-            let (mut has_outer, mut has_inner) = (false, false);
-            bound.for_each_ref(&mut |r| {
-                if let HirRef::Col(id) = r {
-                    has_outer |= col_by_id(outer_env, *id).is_some();
-                    has_inner |= col_by_id(&inner_cols, *id).is_some();
+            match side(&bound, &inner_cols, outer_env) {
+                Side::Left | Side::Neither => local_preds.push(bound),
+                Side::Right => {
+                    return Err(GnitzSqlError::Unsupported(
+                        "a subquery WHERE conjunct references only the outer relation; \
+                         hoist it into the view's own WHERE clause"
+                            .into(),
+                    ))
                 }
-            });
-            if has_outer && has_inner {
-                correlation.push(bound);
-            } else if has_outer {
-                return Err(GnitzSqlError::Unsupported(
-                    "a subquery WHERE conjunct references only the outer relation; \
-                     hoist it into the view's own WHERE clause"
-                        .into(),
-                ));
-            } else {
-                local_preds.push(bound);
+                Side::Both => correlation.push(bound),
             }
         }
     }
-    let rel = if local_preds.is_empty() {
-        inner_get
-    } else {
-        RelExpr::filter(inner_get, local_preds)
-    };
+    let rel = RelExpr::filter(inner_get, local_preds)?;
     Ok(InnerResolved {
         rel,
         inner_cols,
@@ -836,8 +843,8 @@ fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr,
     }
 }
 
-/// Bind one subquery node into a `BoundSub`, dispatching on its kind. ANY/ALL is
-/// normalized here (`= ANY → IN`, `<> ALL → NOT IN`, range → `x OP (SELECT MIN/MAX)`).
+/// Bind one subquery node to the column it is read through. ANY/ALL is normalized
+/// here (`= ANY → IN`, `<> ALL → NOT IN`, range → `x OP (SELECT MIN/MAX)`).
 fn bind_one_subquery(cx: &mut SubCtx<'_, '_, '_>, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
     match e {
         Expr::Exists { subquery, negated } => bind_exists_sub(cx, subquery, None, *negated),
@@ -851,9 +858,8 @@ fn bind_one_subquery(cx: &mut SubCtx<'_, '_, '_>, e: &Expr) -> Result<HirExpr, G
     }
 }
 
-/// Bind an EXISTS / IN subquery into an `Exists`-kind `SubqueryRef`. For IN, the
-/// `(outer, inner)` equality is carried in `in_pair` (folded into the decorrelated
-/// join's ON); an EXISTS must be correlated.
+/// Bind an EXISTS / IN subquery as an `Exists`-kind `SubqueryRef`. For IN, the
+/// `(outer, inner)` equality joins the correlation; an EXISTS must be correlated.
 fn bind_exists_sub(
     cx: &mut SubCtx<'_, '_, '_>,
     subquery: &Query,
@@ -862,7 +868,8 @@ fn bind_exists_sub(
 ) -> Result<HirExpr, GnitzSqlError> {
     let (outer_env, outer_alias) = (cx.outer_env, cx.outer_alias);
     let ir = resolve_inner(cx, subquery)?;
-    let mut in_pair = None;
+    let mut correlation = ir.correlation;
+    let mut nullable = false;
     if let Some(operand) = in_operand {
         // IN shape: reject a tuple / non-plain-column LHS before extracting the pair.
         if matches!(operand, Expr::Tuple(_)) {
@@ -886,45 +893,37 @@ fn bind_exists_sub(
             &ir.inner_alias,
             "IN (SELECT …): the subquery must select exactly one plain column",
         )?;
-        let nullable = hircol_of(outer_env, outer).def.is_nullable || hircol_of(&ir.inner_cols, inner).def.is_nullable;
-        // NOT IN over a nullable operand diverges from the anti-join (SQL 3VL).
-        if negated && nullable {
-            return Err(GnitzSqlError::Unsupported(
-                "NOT IN (SELECT …) requires the outer operand and the subquery column to be \
-                 NOT NULL (SQL's NULL semantics diverge from the anti-join otherwise); \
-                 use NOT EXISTS with an explicit equality instead"
-                    .into(),
-            ));
-        }
-        in_pair = Some(InPair { outer, inner, nullable });
-    } else if ir.correlation.is_empty() {
+        nullable = hircol_of(outer_env, outer).def.is_nullable || hircol_of(&ir.inner_cols, inner).def.is_nullable;
+        correlation.push(BExpr::bin(BExpr::ColRef(outer), BinOp::Eq, BExpr::ColRef(inner)));
+    } else if correlation.is_empty() {
         return Err(GnitzSqlError::Unsupported(
             "uncorrelated EXISTS (no conjunct pairing an outer and an inner column) is not supported".into(),
         ));
     }
     let subref = SubqueryRef {
-        kind: SubqueryKind::Exists { negated },
+        id: cx.cx.ids.next(),
+        kind: SubqueryKind::Exists { nullable },
         rel: ir.rel,
-        correlation: ir.correlation,
-        in_pair,
+        correlation,
     };
-    Ok(BExpr::ColRef(HirRef::Subquery(Box::new(subref))))
+    Ok(maybe_negate(cx.record(subref), negated))
 }
 
-/// Bind a scalar aggregate subquery into a `Scalar`-kind `SubqueryRef` whose `rel`
-/// is a grouped (correlated) / global (uncorrelated) `Reduce`.
+/// Bind a scalar aggregate subquery as a `Scalar`-kind `SubqueryRef` whose `rel`
+/// reduces grouped (correlated) or globally (uncorrelated).
 fn bind_scalar_sub(cx: &mut SubCtx<'_, '_, '_>, q: &Query) -> Result<HirExpr, GnitzSqlError> {
-    let ids = cx.cx.ids;
+    let (ids, outer_env) = (cx.cx.ids, cx.outer_env);
     let ir = resolve_inner(cx, q)?;
     let err = "a scalar subquery must be a single aggregate over its correlation group";
     let proj_expr = single_projection_expr(ir.inner_select, err)?;
     let (func, arg) = classify_scalar_agg(proj_expr, &ir.inner_cols, &ir.inner_alias, err)?;
-    Ok(BExpr::ColRef(scalar_leaf(ids, ir, func, arg)?))
+    let subref = scalar_leaf(ids, outer_env, ir, func, arg)?;
+    Ok(cx.record(subref))
 }
 
 /// Bind an ANY/ALL quantified comparison. `= ANY`/`<> ALL` route to IN/NOT IN;
-/// range ANY/ALL becomes `x OP (SELECT MIN/MAX)` — the 3VL null-fill wrapper for a
-/// correlated subquery, the bare comparison for an uncorrelated top-level one.
+/// range ANY/ALL becomes `x OP (SELECT MIN/MAX)` — under the null test that
+/// settles an empty set.
 fn bind_quantifier_sub(
     cx: &mut SubCtx<'_, '_, '_>,
     left: &Expr,
@@ -974,8 +973,7 @@ fn bind_quantifier_sub(
                 .into(),
         ));
     }
-    let correlated = !ir.correlation.is_empty();
-    let m_leaf = scalar_leaf(ids, ir, agg_func, Some(inner_col))?;
+    let m = cx.record(scalar_leaf(ids, outer_env, ir, agg_func, Some(inner_col))?);
     let outer_scope = JoinScope::single(outer_alias, outer_env.to_vec());
     let outer_leaf = ScopeLeaf {
         scope: &outer_scope,
@@ -983,27 +981,11 @@ fn bind_quantifier_sub(
         sub: SubPolicy::PerKind,
     };
     let x = bind_structural(left, &outer_leaf)?;
-    let cmp = BExpr::bin(x, bop, BExpr::ColRef(m_leaf.clone()));
-    let value = if correlated {
-        // ANY over ∅ = FALSE, ALL over ∅ = TRUE — the LEFT join sets m = NULL for
-        // an empty group, so the explicit null test makes the edge a definite
-        // constant (exact under negation).
-        let m_test = BExpr::NullTest {
-            inner: Box::new(BExpr::ColRef(m_leaf)),
-            want_null: !is_any,
-        };
-        let op = if is_any { BinOp::And } else { BinOp::Or };
-        BExpr::bin(m_test, op, cmp)
-    } else if is_any {
-        cmp
-    } else {
-        return Err(GnitzSqlError::Unsupported(
-            "an uncorrelated range ANY subquery is only supported as a top-level WHERE conjunct, \
-             and uncorrelated range ALL is unsupported"
-                .into(),
-        ));
-    };
-    Ok(value)
+    let cmp = BExpr::bin(x, bop, m.clone());
+    // ANY over ∅ = FALSE, ALL over ∅ = TRUE: `m` is NULL over no rows, so the
+    // null test makes the edge a definite constant, exact under negation.
+    let m_test = BExpr::NullTest { inner: Box::new(m), want_null: !is_any };
+    Ok(BExpr::bin(m_test, if is_any { BinOp::And } else { BinOp::Or }, cmp))
 }
 
 /// Resolve `e` against `env` as a bare column reference, returning its `ColId`.
@@ -1044,62 +1026,51 @@ fn classify_scalar_agg(
 /// The `Reduce` group columns of a scalar/quantifier subquery: the inner-side
 /// `ColId` of each equality correlation conjunct. A range or non-equality
 /// correlation is rejected (aggregation needs an equality GROUP BY key).
-fn scalar_group_cols(correlation: &[HirExpr], inner_cols: &[HirCol]) -> Result<Vec<ColId>, GnitzSqlError> {
+fn scalar_group_cols(correlation: &[HirExpr], outer: &[HirCol], inner: &[HirCol]) -> Result<Vec<ColId>, GnitzSqlError> {
     let mut cols = Vec::with_capacity(correlation.len());
     for conj in correlation {
-        if let BExpr::BinOp(l, BinOp::Eq, r) = conj {
-            if let (Some(a), Some(b)) = (as_col(l), as_col(r)) {
-                match (col_by_id(inner_cols, a).is_some(), col_by_id(inner_cols, b).is_some()) {
-                    (true, false) => {
-                        cols.push(a);
-                        continue;
-                    }
-                    (false, true) => {
-                        cols.push(b);
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // A range comparison between two columns gets the range-specific message.
-        if let BExpr::BinOp(l, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, r) = conj {
-            if as_col(l).is_some() && as_col(r).is_some() {
+        match cross_comparison(conj, outer, inner) {
+            Some((_, inner, BinOp::Eq)) => cols.push(inner.id),
+            Some((_, _, op)) if op.as_range_rel().is_some() => {
                 return Err(GnitzSqlError::Unsupported(
                     "a scalar/quantifier subquery cannot use a range correlation (only equality \
                      `inner_col = outer_col` conjuncts are supported)"
                         .into(),
-                ));
+                ))
+            }
+            _ => {
+                return Err(GnitzSqlError::Unsupported(
+                    "a scalar/quantifier subquery's correlation contains a conjunct that is not an \
+                     `inner_col = outer_col` equality; filter inside the subquery or a wrapping view"
+                        .into(),
+                ))
             }
         }
-        return Err(GnitzSqlError::Unsupported(
-            "a scalar/quantifier subquery's correlation contains a conjunct that is not an \
-             `inner_col = outer_col` equality; filter inside the subquery or a wrapping view"
-                .into(),
-        ));
     }
     Ok(cols)
 }
 
-/// The single construction site of `SubqueryKind::Scalar`, which
-/// [`SubqueryRef::scalar_agg`] reads back as an invariant: the correlation's
-/// inner-side columns are the reduce's GROUP BY, and its one aggregate is minted
-/// over the inner scope. The finalize composite is applied later by
-/// decorrelation over the raw reduce output.
+/// A scalar subquery: `func(arg)` reduced per correlation group, finalized as its
+/// column.
 fn scalar_leaf(
     ids: &ColIdGen,
+    outer_env: &[HirCol],
     ir: InnerResolved<'_>,
     func: AggFunc,
     arg: Option<ColId>,
-) -> Result<HirRef, GnitzSqlError> {
-    let group_cols = scalar_group_cols(&ir.correlation, &ir.inner_cols)?;
+) -> Result<SubqueryRef, GnitzSqlError> {
+    let group_cols = scalar_group_cols(&ir.correlation, outer_env, &ir.inner_cols)?;
     let agg = HirAgg::new(ids, func, arg, &ir.inner_cols, group_cols.is_empty(), &[])?;
-    Ok(HirRef::Subquery(Box::new(SubqueryRef {
-        kind: SubqueryKind::Scalar,
-        rel: RelExpr::reduce(ir.rel, group_cols, vec![agg]),
+    let (expr, ty, nullable) = agg.as_value();
+    let value = HirCol::new(ids.next(), ColumnDef::typed("_agg", ty, nullable).hidden());
+    let mut items = RelExpr::passthrough_items(group_cols.iter().map(|&id| hircol_of(&ir.inner_cols, id).clone()));
+    items.push(ProjEntry { expr, out: value.clone() });
+    Ok(SubqueryRef {
+        id: value.id,
+        kind: SubqueryKind::Scalar { ty, count: func == AggFunc::Count },
+        rel: RelExpr::project(RelExpr::reduce(ir.rel, group_cols, vec![agg]), items),
         correlation: ir.correlation,
-        in_pair: None,
-    })))
+    })
 }
 
 // ── FROM-join binding ──────────────────────────────────────────────────────────
@@ -1151,7 +1122,7 @@ fn fold_join_step(
         )?,
         _ => pairs
             .iter()
-            .map(|&(l, r)| BExpr::bin(BExpr::ColRef(HirRef::Col(l)), BinOp::Eq, BExpr::ColRef(HirRef::Col(r))))
+            .map(|&(l, r)| BExpr::bin(BExpr::ColRef(l), BinOp::Eq, BExpr::ColRef(r)))
             .collect(),
     };
 
@@ -1163,7 +1134,7 @@ fn fold_join_step(
         scope.merge_away(if kind == JoinType::Right { l } else { r });
     }
 
-    let out = RelExpr::join(left, right_src, kind, on);
+    let out = RelExpr::join(left, right_src, kind, on)?;
     // Reflect this step's null-widening back into the scope so a later ON /
     // the WHERE / the projection resolve against the widened nullability.
     scope.widen_step(kind);
@@ -1343,7 +1314,7 @@ impl<'a> PreMap<'a> {
         if let Some(id) = find_bound(&self.extra, &bound) {
             return Ok(id);
         }
-        let ty = bound.infer_ty_with(&|r: &HirRef| type_of(&self.env, r));
+        let ty = bound.infer_ty_with(&|id: &ColId| hircol_of(&self.env, *id).def.ty());
         // Declared nullable unconditionally (a computed value can be NULL: `a / 0`),
         // so an aggregate over one takes the null-skipping shape. Hidden because
         // only the expression that minted it may reach it.
@@ -1653,7 +1624,7 @@ fn bind_grouped_suffix(
     // HAVING → a Filter over the raw reduce output.
     if let Some(having) = &select.having {
         let hexpr = bind_structural(having, &grouped("HAVING"))?;
-        rel = RelExpr::filter(rel, vec![hexpr]);
+        rel = RelExpr::filter(rel, vec![hexpr])?;
     }
 
     let select_leaf = grouped("GROUP BY SELECT");
@@ -1777,7 +1748,7 @@ impl ItemLeaf for GroupedLeaf<'_> {
     }
 }
 
-impl LeafBinder<HirRef> for GroupedLeaf<'_> {
+impl LeafBinder<ColId> for GroupedLeaf<'_> {
     /// A written GROUP BY key, wherever it appears: `(a + b) * 2` binds over
     /// `GROUP BY a + b`. With no computed key there is nothing to match, and
     /// `bind_column` answers the bare names on its own.
@@ -1787,7 +1758,7 @@ impl LeafBinder<HirRef> for GroupedLeaf<'_> {
         if !self.extra.iter().any(|x| self.group_cols.contains(&x.out.id)) {
             return None;
         }
-        Some(BExpr::ColRef(HirRef::Col(self.group_key(e)?)))
+        Some(BExpr::ColRef(self.group_key(e)?))
     }
 
     /// A group key binds to the column holding it; a name the body resolves but
@@ -1796,7 +1767,7 @@ impl LeafBinder<HirRef> for GroupedLeaf<'_> {
     fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         let bound = bind_structural(e, self.leaf).map_err(|err| clause_error(self.clause, err))?;
         match find_bound(self.extra, &bound).filter(|id| self.group_cols.contains(id)) {
-            Some(id) => Ok(BExpr::ColRef(HirRef::Col(id))),
+            Some(id) => Ok(BExpr::ColRef(id)),
             None => Err(match col_ref_parts(e).map(|(_, n)| n) {
                 Some(name) => GnitzSqlError::Plan(format!(
                     "{}: column '{name}' must appear in GROUP BY or an aggregate function",
@@ -1813,8 +1784,8 @@ impl LeafBinder<HirRef> for GroupedLeaf<'_> {
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
         Ok(self.find_agg(f)?.finalize())
     }
-    fn is_nullable(&self, r: &HirRef) -> bool {
-        hir_ref_nullable(self.env, r)
+    fn is_nullable(&self, id: &ColId) -> bool {
+        hircol_of(self.env, *id).def.is_nullable
     }
 }
 
@@ -1856,4 +1827,4 @@ fn bind_set_op(
 
 #[cfg(test)]
 #[path = "tests/bind.rs"]
-mod tests;
+pub(super) mod tests;

@@ -97,6 +97,47 @@ def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client, 
             Counter(ai for ai, _ in pairs(lambda ar, br: _PURE["lt"][1](ar[2], br[2]))).items(), 1), sql
 
 
+def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client, schema_name):
+    """A band LEFT JOIN over a join-keyed input whose two rows differ only in the
+    range value: each null-fills exactly while nothing matches it."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, g BIGINT NOT NULL, x BIGINT NOT NULL); "
+        "CREATE TABLE q (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, y BIGINT NOT NULL); "
+        "CREATE VIEW band_over_join AS SELECT d.v AS v, r.id AS rid "
+        "FROM (SELECT p.g AS g, p.x AS x, q.v AS v FROM p JOIN q ON p.k = q.k) d "
+        "LEFT JOIN r ON d.g = r.g AND d.x <= r.y",
+        schema_name=sn)
+    churn = [
+        ("INSERT INTO q VALUES (1, 7), (2, 8)", "q", {1: (7,), 2: (8,)}),
+        # p(1) and p(2) share `k` and so `v`, and differ only in `x`.
+        ("INSERT INTO p VALUES (1, 1, 5, 10), (2, 1, 5, 100), (3, 2, 5, 40)",
+         "p", {1: (1, 5, 10), 2: (1, 5, 100), 3: (2, 5, 40)}),
+        # p(1) matches both, p(2) neither.
+        ("INSERT INTO r VALUES (1, 5, 50), (2, 5, 60)", "r", {1: (5, 50), 2: (5, 60)}),
+        ("UPDATE p SET x = 55 WHERE id = 2", "p", {2: (1, 5, 55)}),
+        ("DELETE FROM r WHERE id = 2", "r", {2: None}),
+        ("DELETE FROM q WHERE k = 1", "q", {1: None}),
+    ]
+    state = {"p": {}, "q": {}, "r": {}}
+    for sql, table, changes in churn:
+        client.execute_sql(sql, schema_name=sn)
+        for pk, row in changes.items():
+            if row is None:
+                del state[table][pk]
+            else:
+                state[table][pk] = row
+        want = Counter()
+        for k, g, x in state["p"].values():
+            if k not in state["q"]:
+                continue
+            v = state["q"][k][0]
+            matched = [ri for ri, (rg, y) in state["r"].items() if rg == g and x <= y]
+            want.update([(v, ri) for ri in matched] or [(v, None)])
+        assert bag(scanned(client, sn, "band_over_join"), "v", "rid") == want, sql
+
+
 def test_the_pair_pk_is_the_source_keys_at_their_own_width(client, schema_name):
     """The output key is the source-PK pair. When the range column *is* the PK
     on both sides no co-partition shortcut applies, and the pair key is the pair

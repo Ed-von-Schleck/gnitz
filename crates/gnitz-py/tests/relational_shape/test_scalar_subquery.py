@@ -2,8 +2,8 @@
 `ANY` / `ALL` quantified comparisons that lower onto the same machinery.
 
 A scalar subquery becomes a reduce whose one row per correlation group (or one
-row for the whole relation) is joined back onto the outer row and substituted
-for the subquery wherever it appeared. The two coordinates that decide the
+row for the whole relation) is joined back onto the outer row, which reads the
+subquery as that joined column wherever it appeared. The two coordinates that decide the
 compiled shape are therefore:
 
   * **correlated** — a grouped reduce keyed on the correlation columns, joined
@@ -66,6 +66,13 @@ _VIEWS = [
     "eq_count AS SELECT a.id FROM a WHERE a.v = (SELECT COUNT(*) FROM b)",
     "eq_sum AS SELECT a.id FROM a WHERE a.v = (SELECT SUM(y) FROM d)",
     "lt_sum AS SELECT a.id FROM a WHERE a.v < (SELECT SUM(y) FROM d)",
+    "global_proj AS SELECT a.id, (SELECT COUNT(*) FROM b) AS n, (SELECT MAX(w) FROM b) AS mx FROM a",
+    "ne_count AS SELECT a.id FROM a WHERE a.v <> (SELECT COUNT(*) FROM b)",
+    "global_ge_all AS SELECT a.id FROM a WHERE a.v >= ALL (SELECT w FROM b)",
+    "not_global_lt_any AS SELECT a.id FROM a WHERE NOT (a.v < ANY (SELECT w FROM b))",
+    "avg_cmp AS SELECT a.id FROM a WHERE a.v < (SELECT AVG(w) FROM b)",
+    "or_global AS SELECT a.id FROM a WHERE a.v = 0 OR a.v > (SELECT MIN(w) FROM b)",
+    "shifted AS SELECT a.id FROM a WHERE a.v + 1 < (SELECT MAX(w) FROM b)",
 ]
 
 _CHURN = [
@@ -156,3 +163,39 @@ def test_a_scalar_subquery_reads_its_groups_ground_value_through_churn(client, s
         assert bag(scanned(client, sn, "eq_count"), "id") == ids(lambda i, k, v: v == len(b)), sql
         assert bag(scanned(client, sn, "eq_sum"), "id") == ids(lambda i, k, v: dsum is not None and v == dsum), sql
         assert bag(scanned(client, sn, "lt_sum"), "id") == ids(lambda i, k, v: _gt(dsum, v)), sql
+        assert bag(scanned(client, sn, "global_proj"), "id", "n", "mx") == {(i, len(b), top): 1 for i in a}, sql
+        assert bag(scanned(client, sn, "ne_count"), "id") == ids(lambda i, k, v: v != len(b)), sql
+        assert bag(scanned(client, sn, "global_ge_all"), "id") == ids(lambda i, k, v: top is None or v >= top), sql
+        assert bag(scanned(client, sn, "not_global_lt_any"), "id") == ids(lambda i, k, v: not _gt(top, v)), sql
+        assert bag(scanned(client, sn, "avg_cmp"), "id") == ids(
+            lambda i, k, v: bool(every_w) and v < sum(every_w) / len(every_w)), sql
+        assert bag(scanned(client, sn, "or_global"), "id") == ids(lambda i, k, v: v == 0 or _gt(v, low)), sql
+        assert bag(scanned(client, sn, "shifted"), "id") == ids(lambda i, k, v: _gt(top, v + 1)), sql
+
+
+def test_an_uncorrelated_scalar_over_a_replicated_relation_counts_once(client, schema_name):
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
+        "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, w BIGINT NOT NULL) WITH (replicated = true); "
+        "CREATE VIEW lt_max_r AS SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM rb); "
+        "CREATE VIEW proj_r AS SELECT a.id, (SELECT COUNT(*) FROM rb) AS n FROM a; "
+        "INSERT INTO a VALUES " + ", ".join(f"({i}, {i})" for i in range(1, 21)),
+        schema_name=sn)
+    rb = {}
+    for sql, changes in [
+        ("SELECT 1", {}),
+        ("INSERT INTO rb VALUES (1, 5), (2, 12)", {1: 5, 2: 12}),
+        ("INSERT INTO rb VALUES (3, 30)", {3: 30}),
+        ("DELETE FROM rb WHERE id = 3", {3: None}),
+        ("DELETE FROM rb", {1: None, 2: None}),
+    ]:
+        client.execute_sql(sql, schema_name=sn)
+        for pk, w in changes.items():
+            if w is None:
+                del rb[pk]
+            else:
+                rb[pk] = w
+        top = max(rb.values(), default=None)
+        assert bag(scanned(client, sn, "lt_max_r"), "id") == {(i,): 1 for i in range(1, 21) if _gt(top, i)}, sql
+        assert bag(scanned(client, sn, "proj_r"), "id", "n") == {(i, len(rb)): 1 for i in range(1, 21)}, sql

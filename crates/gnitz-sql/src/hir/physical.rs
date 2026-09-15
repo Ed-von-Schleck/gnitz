@@ -1,10 +1,10 @@
 //! The positional pass, run at lowering. Assigns physical column positions to
-//! the layout-free logical IR: it substitutes each `HirRef::Col(id)` leaf with a
+//! the layout-free logical IR: it substitutes each `ColId` leaf with a
 //! `ColRef(position)` against a node's column layout, and physicalizes a
 //! projection (the pass-through/computed split + the PK-front convention, whose
 //! single home is `place_pk_front`).
 
-use super::{slot_of, ColId, HirExpr, HirRef, ProjEntry};
+use super::{slot_of, ColId, HirExpr, ProjEntry};
 use crate::codec::project_schema::{place_pk_front, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
@@ -52,17 +52,10 @@ impl Frame {
     }
 }
 
-/// Substitute every `HirRef::Col(id)` leaf with `ColRef(position of id in
-/// layout)`. A `HirRef` with no layout slot is an internal compile error, and a
-/// `HirRef::Subquery` leaf must have been consumed by decorrelation — its survival
-/// to physicalization is the one point that rejects it.
+/// Substitute every `ColId` leaf with `ColRef(position of id in layout)`. A
+/// `ColId` with no layout slot is an internal compile error.
 pub(crate) fn resolve_refs(expr: &HirExpr, layout: &[ColId]) -> Result<BoundExpr, GnitzSqlError> {
-    expr.try_rebuild(&mut |r| match r {
-        HirRef::Col(id) => slot_of(layout, *id).map(BoundExpr::ColRef),
-        HirRef::Subquery(_) => Err(GnitzSqlError::Internal(
-            "subquery leaf survived to physicalization".into(),
-        )),
-    })
+    expr.try_rebuild(&mut |id| slot_of(layout, *id).map(BoundExpr::ColRef))
 }
 
 /// Resolve each conjunct against `layout`. The list is what the scan bound and
