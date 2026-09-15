@@ -321,38 +321,29 @@ impl Batch {
         b
     }
 
-    /// Construct a `Batch` from fully pre-built, correctly-laid-out buffers.
-    ///
-    /// `data` must be at least `count * strides[i]` bytes starting at
-    /// `offsets[i]` for every region of `schema`, as produced by
-    /// `compute_offsets_into`.  Used by `slice_to_owned_batch` to avoid an
-    /// intermediate copy.
-    ///
-    /// # Safety
-    /// Caller must guarantee the layout invariant described above.
-    pub(in crate::storage) unsafe fn from_prebuilt(
-        data: Vec<u8>,
-        blob: Vec<u8>,
-        strides: [u8; MAX_BATCH_REGIONS],
-        offsets: [usize; MAX_BATCH_REGIONS],
-        count: usize,
-        schema: SchemaDescriptor,
-    ) -> Self {
-        // The one cross-check on a caller-supplied layout triple.
-        debug_assert_eq!(
-            strides,
-            strides_from_schema(&schema).0,
-            "from_prebuilt: strides disagree with the schema",
-        );
+    /// An owned, tightly packed copy of `mb`'s `count` rows and its whole heap:
+    /// `Raw`, fresh blob id.
+    pub(in crate::storage) fn from_mem_batch(mb: &MemBatch, schema: &SchemaDescriptor) -> Self {
+        let (strides, nr) = strides_from_schema(schema);
+        let nr = nr as usize;
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        let size = compute_offsets_into(&strides, nr, mb.count, &mut offsets);
+        let mut data = acquire_arena(size, Fill::Uninit);
+        // SAFETY: distinct allocations; `mb`'s regions hold `count × stride` bytes
+        // each (a `Batch` by construction, a wire view by its parse), `data` is
+        // sized for `count` rows.
+        unsafe { copy_regions(mb.data, mb.offsets, &mut data, &offsets, &strides, nr, mb.count) };
+        let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
+        blob.extend_from_slice(mb.blob);
         Batch {
             data,
             blob,
             offsets,
             strides,
-            capacity: count,
-            count,
+            capacity: mb.count,
+            count: mb.count,
             layout: Layout::Raw,
-            schema,
+            schema: *schema,
             blob_id: next_blob_id(),
         }
     }
@@ -1333,36 +1324,11 @@ impl Batch {
         if self.holds_nothing() {
             return self.empty_like();
         }
-        // Only clone the actually-used portion of data (count-based, not capacity-based).
-        let nr = self.num_regions();
-        let mut packed_offsets = [0usize; MAX_BATCH_REGIONS];
-        let packed_size = compute_offsets_into(&self.strides, nr, self.count, &mut packed_offsets);
-        let mut new_data = acquire_arena(packed_size, Fill::Uninit);
-        // SAFETY: distinct allocations; `new_data` sized per compute_offsets_into.
-        unsafe {
-            copy_regions(
-                &self.data,
-                &self.offsets,
-                &mut new_data,
-                &packed_offsets,
-                &self.strides,
-                nr,
-                self.count,
-            );
-        }
-        let mut new_blob = acquire_arena(self.blob.len(), Fill::Reserve);
-        new_blob.extend_from_slice(&self.blob);
-        Batch {
-            data: new_data,
-            blob: new_blob,
-            offsets: packed_offsets,
-            strides: self.strides,
-            capacity: self.count,
-            count: self.count,
-            layout: self.layout,
-            schema: self.schema,
-            blob_id: self.blob_id,
-        }
+        // Only the used portion of data (count-based, not capacity-based).
+        let mut b = Self::from_mem_batch(&self.as_mem_batch(), &self.schema);
+        b.layout = self.layout;
+        b.blob_id = self.blob_id;
+        b
     }
 
     /// The PK region as a uniform [`ColPtr`] view (always Raw for an owned

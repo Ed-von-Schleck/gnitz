@@ -19,8 +19,9 @@ use super::super::batch::{
 };
 use super::super::error::StorageError;
 use super::super::layout::*;
+use super::super::merge::ColPtr;
 use super::super::shard_filter;
-use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion};
+use super::{MappedShard, PackedRegion, PayloadRegion, WeightRegion, ZERO_CELL};
 use crate::schema::SchemaColumn;
 use gnitz_foundation::posix_io::{Advice, Mmap};
 use gnitz_wire::{read_i64_le, read_u64_le};
@@ -61,7 +62,7 @@ impl MappedShard {
             return Err(StorageError::InvalidVersion);
         }
 
-        let pk_stride = schema.pk_stride() as u8;
+        let pk_stride = schema.pk_stride();
 
         // The file's own payload-column count, bounded before any arithmetic on
         // it: `desc_len` is `HEADER_SIZE + n · DIR_ENTRY_SIZE` and overflows on a
@@ -117,13 +118,13 @@ impl MappedShard {
             }
         }
 
-        // Normalize a fixed-width region to its `(offset, stride)` view, with the
+        // Resolve a fixed-width region to its `(base, stride)` pointer, with the
         // size check that lets every accessor read `stride`-wide elements without
         // re-validating: Raw must carry `count` of them, Constant exactly one
         // (`stride == 0` then makes every row read that one). Only the weight
         // region may be TwoValue, so a forged TwoValue here is rejected at this
         // decode site instead of being asserted-against at every accessor.
-        let direct_region = |e: &DirEntry, elem_width: usize| -> Result<RegionView, StorageError> {
+        let direct_region = |e: &DirEntry, elem_width: usize| -> Result<ColPtr, StorageError> {
             let (stride, needed) = match e.encoding {
                 ENCODING_RAW => (elem_width, count * elem_width),
                 ENCODING_CONSTANT => (0, elem_width),
@@ -134,14 +135,18 @@ impl MappedShard {
             if e.size != needed {
                 return Err(StorageError::InvalidShard);
             }
-            Ok(RegionView { offset: e.offset, stride })
+            // SAFETY: `offset + size <= file_size` was checked for every entry.
+            Ok(ColPtr {
+                base: unsafe { data.as_ptr().add(e.offset) },
+                stride,
+            })
         };
         // Payload columns are the sole `ENCODING_FOR`-eligible role, and only for
         // the column types the writer packs: the codec widens whole integer
         // cells, so a forged FoR byte on a STRING or float column is rejected.
         let build_payload_region = |e: &DirEntry, col: &SchemaColumn| -> Result<PayloadRegion, StorageError> {
             if e.encoding != ENCODING_FOR {
-                return direct_region(e, col.size() as usize).map(PayloadRegion::Direct);
+                return direct_region(e, col.size() as usize).map(PayloadRegion::Mapped);
             }
             let fi = col.fixed_int().ok_or(StorageError::InvalidShard)?;
             let bw = for_image_bw(e.size, count, fi.width()).ok_or(StorageError::InvalidShard)?;
@@ -163,10 +168,10 @@ impl MappedShard {
                     bitvec_off: e.offset + TWO_VALUE_HEADER,
                 });
             }
-            direct_region(e, FIXED_REGION_BYTES).map(WeightRegion::Direct)
+            direct_region(e, FIXED_REGION_BYTES).map(WeightRegion::Mapped)
         };
 
-        let pk = direct_region(&entries[REG_PK], pk_stride as usize)?;
+        let pk = direct_region(&entries[REG_PK], pk_stride)?;
         let weight = build_weight_region(&entries[REG_WEIGHT])?;
         let null_bmp = direct_region(&entries[REG_NULL_BMP], FIXED_REGION_BYTES)?;
 
@@ -183,16 +188,16 @@ impl MappedShard {
         let mapped = file_npc.min(schema_npc);
         // One region per payload column of the *reader's* schema, so every
         // reader indexes it directly. Indices `[mapped, schema_npc)` name columns
-        // this file predates and become `Absent`.
+        // this file predates and read `ZERO_CELL`.
         let mut col_regions = Vec::with_capacity(schema_npc);
         for (pi, col) in schema.payload_columns() {
             if pi >= mapped {
-                col_regions.push(PayloadRegion::Absent);
+                col_regions.push(PayloadRegion::Mapped(ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 }));
                 continue;
             }
             col_regions.push(build_payload_region(&entries[REG_PAYLOAD_START + pi], col)?);
         }
-        // Old rows wrote `0` in an `Absent` column's null bit, which reads as
+        // Old rows wrote `0` in the null bit of a column the file predates, which reads as
         // "non-null"; this forces them to `1`. The naive `(1 << schema_npc) - 1`
         // is UB at 64.
         let null_pad_mask = gnitz_wire::all_payload_null_mask(schema_npc) & !gnitz_wire::all_payload_null_mask(mapped);

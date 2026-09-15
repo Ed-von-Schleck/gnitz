@@ -272,7 +272,7 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
 /// Callers must pass only net-nonzero weights; both the drain walk and
 /// `merge::drive`'s group fold emit only net-nonzero groups.
 pub(crate) fn scatter_unified_sources(
-    sources: &[UnifiedSource],
+    sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
     rows: &[(u32, u32, i64)],
     writer: &mut DirectWriter<'_>,
@@ -298,14 +298,7 @@ pub(crate) fn scatter_unified_sources(
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
                 let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
-                // Guard against null blob_ptr (source with no string data):
-                // from_raw_parts on a null pointer is UB even when len==0.
-                let src_blob: &[u8] = if src.blob_ptr.is_null() {
-                    &[]
-                } else {
-                    unsafe { std::slice::from_raw_parts(src.blob_ptr, src.blob_len) }
-                };
-                writer.write_string_cell(pi, src_struct, src_blob, base + out);
+                writer.write_string_cell(pi, src_struct, src.blob, base + out);
             }
         } else {
             let dst = &mut writer.col_bufs[pi][base * cs..];
@@ -325,7 +318,7 @@ pub(crate) fn scatter_unified_sources(
 // emits — `DirectWriter` pre-allocates exactly `count` rows per buffer.
 #[inline(always)]
 fn scatter_unified_pk_wt_nbm<const PKS: usize>(
-    sources: &[UnifiedSource],
+    sources: &[UnifiedSource<'_>],
     rows: &[(u32, u32, i64)],
     base: usize,
     writer: &mut DirectWriter<'_>,
@@ -356,7 +349,7 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
 
 #[inline(always)]
 fn gather_unified_col_dispatch(
-    sources: &[UnifiedSource],
+    sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
     rows: &[(u32, u32, i64)],
     pi: usize,
@@ -377,7 +370,7 @@ fn gather_unified_col_dispatch(
 // so the bounds check stays out of the hot inner loop.
 #[inline(always)]
 fn gather_unified_col<const N: usize>(
-    sources: &[UnifiedSource],
+    sources: &[UnifiedSource<'_>],
     cols: &[ColPtr],
     rows: &[(u32, u32, i64)],
     pi: usize,

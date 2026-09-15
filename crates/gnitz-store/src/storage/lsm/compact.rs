@@ -18,6 +18,7 @@ use super::shard_file::ShardWriteOpts;
 use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
 use crate::schema::SchemaDescriptor;
+use gnitz_expr::RowSource;
 
 /// Open the input shards into owned `MappedShard`s, validating checksums. File
 /// I/O lives here so the monomorphised merge loop in [`run_merge`] carries no
@@ -126,10 +127,10 @@ pub(super) fn merge_and_route(
 
     // Phase 2 — one shard per guard, each scattered column-at-a-time from its
     // contiguous survivor slice. The `UnifiedSource` views hold raw pointers into
-    // each shard's mmap (no lifetime tie); `shards` outlives them and every
-    // scatter, all within this call.
+    // each shard's mmap; `shards` outlives them and every scatter, all within
+    // this call.
     let mut cols: Vec<ColPtr> = Vec::with_capacity(shards.len() * schema.num_payload_cols());
-    let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(schema, &mut cols)).collect();
+    let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(&mut cols)).collect();
     let nsurv = survivors.len();
     let mut out: Vec<(PkBuf, String)> = Vec::with_capacity(guards.len());
 

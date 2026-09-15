@@ -8,10 +8,7 @@
 //! `#[inline]`-friendly and read every stride/offset off the `Batch` /
 //! `SchemaDescriptor` view — region math is never re-derived here.
 
-use super::batch::{
-    compute_offsets_into, copy_regions, strides_from_schema, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
-};
-use super::batch_pool::{acquire_arena, Fill};
+use super::batch::{strides_from_schema, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK};
 use super::merge::{BlobCacheGuard, DirectWriter, MemBatch};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
@@ -258,37 +255,7 @@ impl Batch {
             return Ok((Batch::empty_with_schema(schema), bytes_consumed));
         }
 
-        let (strides, nr) = strides_from_schema(schema);
-        let nr_usize = nr as usize;
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let total = compute_offsets_into(&strides, nr_usize, mb.count, &mut offsets);
-        // Uninit arena sized for exactly `mb.count` rows: every live byte of
-        // every region is written by the bulk copies below; only inter-region
-        // align8 padding stays uninit, which no reader or re-encoder touches
-        // (`wal::encode` copies each region's `count * stride` bytes and skips
-        // the padding, and shard/wire/clone paths are all `count`-bounded).
-        let mut data_buf = acquire_arena(total, Fill::Uninit);
-        // SAFETY: both extents are in bounds — each source region was validated to
-        // exactly `count * stride` bytes by the parse above, the destination sized
-        // by `compute_offsets_into` for `mb.count` rows; distinct allocations.
-        unsafe {
-            copy_regions(
-                mb.data,
-                mb.offsets,
-                &mut data_buf,
-                &offsets,
-                &strides,
-                nr_usize,
-                mb.count,
-            );
-        }
-        let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
-        blob.extend_from_slice(mb.blob);
-
-        // SAFETY: `data_buf`/`offsets` were laid out by compute_offsets_into for
-        // `mb.count` rows of these strides and every region was filled above.
-        let batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, mb.count, *schema) };
-        Ok((batch, bytes_consumed))
+        Ok((Batch::from_mem_batch(&mb, schema), bytes_consumed))
     }
 
     /// [`Self::decode_from_wal_block`] for a block a peer wrote, refusing a

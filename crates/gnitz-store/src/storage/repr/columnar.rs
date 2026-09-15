@@ -127,10 +127,7 @@ fn compare_rows_impl<const SKIP: bool, A: RowSource, B: RowSource>(
     let null_word_a = src_a.get_null_word(row_a);
     let null_word_b = src_b.get_null_word(row_b);
     // Both blob arenas are loop-invariant, and only the German-string arm of
-    // `cmp_col_window` reads them. For a `MemBatch` that is a field load, but a
-    // `MappedShard` (and the `Run` wrapping one) resolves the mmap behind two
-    // calls — which this would otherwise pay twice per payload column per
-    // comparison, on the hottest comparator in the merge path.
+    // `cmp_col_window` reads them, so they are hoisted out of the column loop.
     let (blob_a, blob_b) = (src_a.blob(), src_b.blob());
 
     for (payload_col, col) in schema.payload_columns() {

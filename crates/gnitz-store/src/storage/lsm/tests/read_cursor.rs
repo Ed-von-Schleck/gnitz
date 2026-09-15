@@ -1190,8 +1190,8 @@ fn walk_groups(c: &mut ReadCursor) -> Vec<(u64, i64, bool)> {
 }
 
 /// A skeleton shard opens under the full view schema: its payload columns read
-/// `Absent`, its null word is the full pad mask, and its file is small enough to
-/// be worth the trade.
+/// as columns the file predates, its null word is the full pad mask, and its
+/// file is small enough to be worth the trade.
 #[test]
 fn skeleton_shard_opens_under_the_view_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -1201,7 +1201,8 @@ fn skeleton_shard_opens_under_the_view_schema() {
 
     assert!(shard.is_skeleton());
     // The low bits are the writer's own arity — zero — so the ALTER-widening
-    // decode maps every schema payload column to `Absent` and pads it NULL.
+    // decode reads every schema payload column as one the file predates and
+    // pads it NULL.
     let raw = std::fs::read(dir.path().join("sk.db")).unwrap();
     assert_eq!(
         gnitz_wire::read_u64_le(&raw, super::super::layout::OFF_FILE_NPC),

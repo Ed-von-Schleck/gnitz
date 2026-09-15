@@ -23,12 +23,11 @@ use gnitz_wire::read_u64_le;
 use rustc_hash::FxHashMap;
 
 // ---------------------------------------------------------------------------
-// ColPtr / UnifiedSource: type-erased column accessors that work uniformly
-// for in-memory `MemBatch` regions (always Raw, base = data + offset) and
-// shard `RegionView` regions (Raw via mmap offset, Constant via its single
-// inline element with stride 0). Stride 0 makes
-// `base.add(ri * stride) == base` for every row, so a Constant region reads
-// the same bytes for every output row without any branch in the hot loop.
+// ColPtr / UnifiedSource: type-erased column accessors, one `(base, stride)`
+// `ColPtr` per region, for in-memory `MemBatch` and shard sources alike.
+// Stride 0 makes `base.add(ri * stride) == base` for every row, so a region
+// holding one shared element reads the same bytes for every output row without
+// any branch in the hot loop.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -65,7 +64,7 @@ impl ColPtr {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct UnifiedSource {
+pub(crate) struct UnifiedSource<'a> {
     pub pk: ColPtr,
     pub null_bmp: ColPtr,
     /// Payload-column null bits this source cannot answer for, OR'd into every
@@ -79,19 +78,22 @@ pub(crate) struct UnifiedSource {
     /// line because a by-value `[ColPtr; MAX_COLUMNS]` is 1 KiB zeroed per source
     /// per call, whatever the schema's real column count.
     pub cols_off: usize,
-    pub blob_ptr: *const u8,
-    pub blob_len: usize,
+    pub blob: &'a [u8],
 }
 
 /// Derive a `UnifiedSource` view over an in-memory `MemBatch`: every region
 /// becomes a `(base, stride)` `ColPtr` into the batch's `data`, and the blob
-/// arena is carried by pointer+len. Pure pointer arithmetic — no allocation,
+/// arena is borrowed. Pure pointer arithmetic — no allocation,
 /// no scan. The payload `ColPtr`s are appended to `cols`, the flat table the
 /// scatter indexes through `UnifiedSource::cols_off`.
 ///
 /// Shared by the read-cursor drain (shard-vs-MemBatch polymorphism) and the
 /// flush phase-2 scatter, which has only `MemBatch` runs.
-pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource {
+pub(crate) fn mem_batch_to_unified<'a>(
+    mb: &MemBatch<'a>,
+    schema: &SchemaDescriptor,
+    cols: &mut Vec<ColPtr>,
+) -> UnifiedSource<'a> {
     let data_ptr = mb.data.as_ptr();
     let cols_off = cols.len();
     for (pi, col) in schema.payload_columns() {
@@ -112,8 +114,7 @@ pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor, col
         },
         null_pad_mask: 0,
         cols_off,
-        blob_ptr: mb.blob.as_ptr(),
-        blob_len: mb.blob.len(),
+        blob: mb.blob,
     }
 }
 
@@ -624,6 +625,13 @@ impl<'a> DirectWriter<'a> {
         let dest = relocate_german_string_vec(src_struct, src_blob, self.blob, self.blob_cache.get_mut());
         let off = out_row * 16;
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
+    }
+
+    /// Carry a source heap whole into this writer's empty heap, so German-string
+    /// cells copied verbatim keep valid offsets.
+    pub(super) fn copy_blob_verbatim(&mut self, src_blob: &[u8]) {
+        debug_assert!(self.blob.is_empty(), "verbatim heap copy into a heap already written");
+        self.blob.extend_from_slice(src_blob);
     }
 }
 

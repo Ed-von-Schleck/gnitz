@@ -7,6 +7,7 @@ use std::ffi::CStr;
 use std::fs;
 use std::rc::Rc;
 
+use super::super::columnar::ColumnarSource;
 use super::super::compact;
 use super::super::error::StorageError;
 use super::super::shard_reader::MappedShard;

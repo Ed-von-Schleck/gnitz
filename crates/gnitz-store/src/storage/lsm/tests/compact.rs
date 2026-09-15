@@ -1,4 +1,5 @@
 use super::super::batch::{Batch, REG_PAYLOAD_START};
+use super::super::columnar::ColumnarSource;
 use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
 use super::super::merge::{run_merge, BlobCacheGuard};
 use super::super::naming;
@@ -9,6 +10,7 @@ use super::*;
 use crate::schema::key::PkBuf;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_u64_i64, opk_pk, pk_payload_schema};
+use gnitz_expr::RowSource;
 use gnitz_wire::read_i64_le;
 use std::ffi::CStr;
 use std::fs;
@@ -738,7 +740,7 @@ fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
 fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
     let cpath = std::ffi::CString::new(path).unwrap();
     let shard = MappedShard::open(&cpath, schema, false).unwrap();
-    let blob = shard.blob_slice();
+    let blob = shard.blob();
     (0..shard.count)
         .map(|i| {
             let pk = shard.get_pk_bytes(i).to_vec();
@@ -1056,6 +1058,7 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
 mod skeleton_tests {
     use super::super::*;
     use crate::storage::repr::batch::{Batch, REG_NULL_BMP};
+    use crate::storage::repr::columnar::ColumnarSource;
     use crate::storage::repr::layout::{ENCODING_CONSTANT, OFF_FILE_NPC, SHARD_FLAG_SKELETON};
     use crate::storage::repr::shard_file::{region_dir, ShardWriteOpts};
     use crate::storage::repr::shard_reader::MappedShard;

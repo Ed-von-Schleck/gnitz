@@ -1,10 +1,12 @@
-use super::super::batch::{strides_from_schema, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::super::batch::{strides_from_schema, Batch, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::super::columnar::ColumnarSource;
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::shard_file::{region_dir, write_i64_shard, ShardWriteOpts};
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
+use gnitz_expr::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 
 /// Build a shard through `write_as_shard` (uses encoding selection).
@@ -182,9 +184,10 @@ fn padded_shard_pads_the_appended_column() {
     let shard = open_widened(dir.path(), "pad.db", &rows, type_code::I64);
 
     // The walk is driven by the file's own arity: one mapped column, and the
-    // appended one is `Absent` rather than a mis-read directory entry.
+    // appended one reads `ZERO_CELL` rather than a mis-read directory entry (a
+    // mis-read Constant entry would also be stride 0, so the address decides).
     assert_eq!(shard.col_regions.len(), 2);
-    assert!(matches!(shard.col_regions[1], PayloadRegion::Absent));
+    assert!(matches!(shard.col_regions[1], PayloadRegion::Mapped(cp) if std::ptr::eq(cp.base, ZERO_CELL.as_ptr())));
     assert_eq!(shard.null_pad_mask, 1 << 1);
     assert_eq!(shard.count, 5);
 
@@ -226,12 +229,11 @@ fn padded_shard_to_unified_pads() {
     let dir = tempfile::tempdir().unwrap();
     let rows: Vec<(u64, i64)> = (1..=3).map(|i| (i, i as i64)).collect();
     let shard = open_widened(dir.path(), "pad_unified.db", &rows, type_code::I64);
-    let schema = schema_with_appended(type_code::I64);
 
     // Reader 3: the shared column-first scatter reads `null_pad_mask` off the
     // view rather than the shard, so the view must carry it.
     let mut cols = Vec::new();
-    let unified = shard.to_unified(&schema, &mut cols);
+    let unified = shard.to_unified(&mut cols);
     assert_eq!(unified.null_pad_mask, 1 << 1);
     // The absent column reads one shared `'static` zero cell for every row —
     // the same `stride == 0` shape a Constant region uses, so the gather has
@@ -702,7 +704,7 @@ fn get_pk_bytes_returns_the_opk_image_for_every_region_shape() {
         let cpath = std::ffi::CString::new(path).unwrap();
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
 
-        assert_eq!(shard.pk.is_per_row(), per_row, "{what}: region shape");
+        assert_eq!(shard.pk.stride != 0, per_row, "{what}: region shape");
         assert_eq!(shard.pk_stride, 16, "{what}: stride");
         for (i, &pk) in pks.iter().enumerate() {
             assert_eq!(shard.get_pk_bytes(i), &pk.to_be_bytes(), "{what} row {i}: opk bytes");
@@ -756,7 +758,7 @@ fn find_lower_bound_bytes_wide_pk_distinct() {
     write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
     let shard = MappedShard::open(&cpath, &schema, false).unwrap();
     assert_eq!(shard.pk_stride, 24);
-    assert!(shard.pk.is_per_row(), "distinct PKs must keep the PK region per-row");
+    assert!(shard.pk.stride != 0, "distinct PKs must keep the PK region per-row");
 
     // Probe keys covering before, between, and after each row.
     let probes: [[u8; 24]; 5] = [
@@ -812,7 +814,7 @@ fn packed_roundtrip_all_surfaces() {
     let packed = MappedShard::open(&pc, &schema, true).unwrap();
     let raw = MappedShard::open(&rc, &schema, true).unwrap();
     assert!(matches!(packed.col_regions[0], PayloadRegion::Packed(_)));
-    assert!(matches!(raw.col_regions[0], PayloadRegion::Direct(_)));
+    assert!(matches!(raw.col_regions[0], PayloadRegion::Mapped(_)));
 
     // Surface 1 (get_col_ptr): per-row equality vs the Raw control and vs
     // the source values.
@@ -834,19 +836,107 @@ fn packed_roundtrip_all_surfaces() {
     let rbytes = rb.region_or_blob(REG_PAYLOAD_START);
     assert_eq!(pbytes.len(), rbytes.len());
     assert_eq!(pbytes, rbytes, "whole-shard slice payload region byte-identical");
+    // A mid-shard slice reads the decoded image from `start`, not from row 0.
+    let (start, len) = (137, 211);
+    assert_slices_match(&packed, &raw, start, len, &schema);
 
     // Surface 4 (to_unified): read the payload ColPtr per row.
     let mut cols = Vec::new();
-    let pu = packed.to_unified(&schema, &mut cols);
+    let pu = packed.to_unified(&mut cols);
     for (r, &want) in vals.iter().enumerate() {
         let cp = cols[pu.cols_off];
-        let v = unsafe { *(cp.base.add(r * cp.stride) as *const i64) };
+        let v = read_i64_le(unsafe { cp.row(r, 8) }, 0);
         assert_eq!(v, want, "to_unified row {r}");
     }
 }
 
+/// `a.slice(start, len)` and `b.slice(start, len)` hold the same PK, weight,
+/// null and payload bytes.
+fn assert_slices_match(a: &MappedShard, b: &MappedShard, start: usize, len: usize, schema: &SchemaDescriptor) {
+    let (sa, sb) = (
+        a.slice_to_owned_batch(start, len, schema),
+        b.slice_to_owned_batch(start, len, schema),
+    );
+    assert_eq!(sa.count, len);
+    for region in [REG_PK, REG_WEIGHT, REG_NULL_BMP, REG_PAYLOAD_START] {
+        assert_eq!(
+            sa.region_or_blob(region),
+            sb.region_or_blob(region),
+            "slice [{start}, +{len}) region {region}"
+        );
+    }
+}
+
 #[test]
-fn packed_bytes_stable_and_aligned() {
+fn packed_i32_mid_shard_slice() {
+    // The 4-byte decode arm, read through a mid-shard slice.
+    let dir = tempfile::tempdir().unwrap();
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I32, 0),
+        ],
+        &[0],
+    );
+    let n = 400usize;
+    let write = |name: &str, pack: bool| {
+        let mut b = Batch::with_capacity(&schema, n);
+        for i in 0..n {
+            b.begin_row(&(i as u64).to_be_bytes(), 1);
+            b.extend_col(0, &(-70_000i32 + (i % 250) as i32).to_le_bytes());
+            b.commit_row(0);
+        }
+        let cpath = std::ffi::CString::new(dir.path().join(name).to_str().unwrap()).unwrap();
+        b.write_as_shard(&cpath, ShardWriteOpts { pack_ints: pack, ..Default::default() })
+            .unwrap();
+        MappedShard::open(&cpath, &schema, true).unwrap()
+    };
+    let packed = write("packed32.db", true);
+    let raw = write("raw32.db", false);
+    assert!(matches!(packed.col_regions[0], PayloadRegion::Packed(_)));
+    assert!(matches!(raw.col_regions[0], PayloadRegion::Mapped(_)));
+    for r in 0..n {
+        assert_eq!(packed.get_col_ptr(r, 0, 4), raw.get_col_ptr(r, 0, 4), "row {r}");
+    }
+    assert_slices_match(&packed, &raw, 0, n, &schema);
+    assert_slices_match(&packed, &raw, 91, 233, &schema);
+}
+
+/// A mid-shard, odd-length slice over constant weight and null regions and a
+/// column the file predates: the doubling fill's last step is partial, and
+/// every cell must still match the per-row accessors.
+#[test]
+fn slice_constant_regions_mid_shard_odd_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows: Vec<(u64, i64)> = (1..=40).map(|i| (i, i as i64 * 7)).collect();
+    let shard = open_widened(dir.path(), "const_slice.db", &rows, type_code::I64);
+    let schema = schema_with_appended(type_code::I64);
+    assert!(
+        matches!(shard.weight, WeightRegion::Mapped(cp) if cp.stride == 0),
+        "weight is Constant"
+    );
+    assert_eq!(shard.null_bmp.stride, 0, "null bitmap is Constant");
+
+    let (start, len) = (5, 23);
+    let batch = shard.slice_to_owned_batch(start, len, &schema);
+    assert_eq!(batch.count, len);
+    for i in 0..len {
+        let r = start + i;
+        assert_eq!(batch.get_pk_bytes(i), shard.get_pk_bytes(r), "pk row {i}");
+        assert_eq!(batch.get_weight(i), shard.get_weight(r), "weight row {i}");
+        assert_eq!(batch.get_null_word(i), shard.get_null_word(r), "null row {i}");
+        for pi in 0..2 {
+            assert_eq!(
+                batch.get_col_ptr(i, pi, 8),
+                shard.get_col_ptr(r, pi, 8),
+                "col {pi} row {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn packed_bytes_stable() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let pks: Vec<u64> = (0..300).collect();
@@ -859,7 +949,6 @@ fn packed_bytes_stable_and_aligned() {
     let p1 = shard.get_col_ptr(0, 0, 8).as_ptr();
     let p2 = shard.get_col_ptr(0, 0, 8).as_ptr();
     assert_eq!(p1, p2, "packed_bytes address stable across calls");
-    assert_eq!(p1 as usize % 8, 0, "packed_bytes 8-aligned");
 }
 
 #[test]
@@ -1028,7 +1117,7 @@ fn slice_relocates_only_its_own_strings() {
     let at = shard.slice_to_owned_batch(0, CUT + 1, &schema);
     assert_eq!(at.blob.len(), (N - 1) * W, "at the cut the whole region is copied");
     let full = shard.slice_to_owned_batch(0, N, &schema);
-    assert_eq!(full.blob.as_slice(), shard.blob_slice(), "whole shard: verbatim");
+    assert_eq!(full.blob.as_slice(), shard.blob(), "whole shard: verbatim");
 
     for i in 2..CUT {
         assert_eq!(read_german_string(&under, 0, i), wide_string(i, W), "relocated row {i}");

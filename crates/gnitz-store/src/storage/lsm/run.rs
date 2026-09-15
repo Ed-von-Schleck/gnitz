@@ -28,14 +28,6 @@ pub(crate) enum Run {
 }
 
 impl Run {
-    #[inline]
-    pub(crate) fn count(&self) -> usize {
-        match self {
-            Run::Mem(b) => b.count,
-            Run::Shard(s) => s.count,
-        }
-    }
-
     /// First row whose OPK bytes are `>= key`. A raw `memcmp` binary search over
     /// the order-preserving PK region — correct at every PK width with no schema
     /// dependency. `key` must be exactly `pk_stride` OPK bytes.
@@ -55,15 +47,14 @@ impl Run {
     }
 
     /// Build a `UnifiedSource` view backed by either a `MemBatch`'s flat data
-    /// buffer (always Raw regions) or a `MappedShard`'s mmap (Raw or Constant
-    /// regions, indexed by payload position).
+    /// buffer or a `MappedShard`: one `ColPtr` per region.
     ///
     /// Infallible: `MappedShard::open` validates all encoding constraints and
     /// region sizes at open time, so no arm here can fail.
-    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource {
+    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
         match self {
             Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
-            Run::Shard(s) => s.to_unified(schema, cols),
+            Run::Shard(s) => s.to_unified(cols),
         }
     }
 
@@ -139,12 +130,15 @@ impl RowSource for Run {
     fn blob(&self) -> &[u8] {
         match self {
             Run::Mem(b) => &b.blob,
-            Run::Shard(s) => s.blob_slice(),
+            Run::Shard(s) => s.blob(),
         }
     }
     #[inline(always)]
     fn row_count(&self) -> usize {
-        Run::count(self)
+        match self {
+            Run::Mem(b) => b.count,
+            Run::Shard(s) => s.count,
+        }
     }
 }
 

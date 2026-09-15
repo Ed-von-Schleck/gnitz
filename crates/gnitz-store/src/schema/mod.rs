@@ -333,8 +333,7 @@ pub struct SchemaDescriptor {
     /// Total bytes per row of the PK region — sum of
     /// `columns[pk_indices[k]].size()` for k in 0..pk_count. Precomputed once in
     /// `new()` so per-row hot loops never re-run the sum. `u8` matches
-    /// `Batch::pk_stride()` and the cached `pk_stride: u8` fields on
-    /// `MappedShard`/`DirectWriter`/`MemBatch`; `new` asserts the width holds.
+    /// `Batch::pk_stride()`; `new` asserts the width holds.
     pk_stride: u8,
     /// Byte width of the **distribution prefix** — the OPK bytes of the leading
     /// PK columns the placement keys by, the slice every write-side table-key

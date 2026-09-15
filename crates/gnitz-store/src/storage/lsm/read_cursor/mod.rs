@@ -738,7 +738,7 @@ fn build(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usi
     let mut sources = Vec::with_capacity(cap);
     let mut states = Vec::with_capacity(cap);
     for run in runs {
-        let count = run.count();
+        let count = run.row_count();
         if count > 0 {
             sources.push(run);
             states.push(PosCursor { position: 0, count });

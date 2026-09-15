@@ -1,7 +1,9 @@
+use super::super::columnar::ColumnarSource;
 use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_u64_i64, pk_only_schema};
+use gnitz_expr::RowSource;
 use gnitz_wire::read_u64_le;
 use xorf::Filter;
 
@@ -247,10 +249,9 @@ mod for_codec_tests {
         let n = vals.len();
         let image = for_image(&raw, fi)?;
         let bw = for_image_bw(image.len(), n, fi.width()).expect("the encoder's image has FoR geometry");
-        let decoded = decode_for_region(&image, n, bw, fi.width());
-        let bytes = decoded.as_bytes();
-        assert_eq!(bytes.as_ptr() as usize % 8, 0, "decoded buffer 8-aligned");
-        assert_eq!(bytes, &raw[..], "byte-exact roundtrip (bw={bw}, {fi:?})");
+        let mut decoded = vec![0u8; n * fi.width()];
+        decode_for_region(&image, bw, fi.width(), &mut decoded);
+        assert_eq!(decoded, raw, "byte-exact roundtrip (bw={bw}, {fi:?})");
         Some(bw)
     }
 
@@ -398,8 +399,9 @@ mod for_codec_tests {
 
         let iters = 200;
         let start = Instant::now();
+        let mut decoded = vec![0u8; n * 8];
         for _ in 0..iters {
-            let decoded = decode_for_region(black_box(&image), n, bw, 8);
+            decode_for_region(black_box(&image), bw, 8, &mut decoded);
             black_box(&decoded);
         }
         let elapsed = start.elapsed();

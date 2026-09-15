@@ -83,7 +83,7 @@ impl ReadCursor {
         // stays constant across a chunked drain (pinned by
         // `drain_chunk_blob_reservation_stays_o_chunk`).
         let rows_ahead = self.estimated_length();
-        let src_rows: usize = self.sources.iter().map(Run::count).sum();
+        let src_rows: usize = self.sources.iter().map(Run::row_count).sum();
         let blob_cap = prorated_blob_cap(self.total_blob_len(), src_rows, max_rows.min(rows_ahead));
 
         let mut order = std::mem::take(&mut self.merge_order);
@@ -129,7 +129,7 @@ impl ReadCursor {
         if self.sources.len() == 1
             && self.valid
             && self.current_row == 0
-            && self.states[0].count == self.sources[0].count()
+            && self.states[0].count == self.sources[0].row_count()
         {
             if let Run::Mem(rc) = &self.sources[0] {
                 // Non-verifying, deliberately: `RunSet::push` verified this run
