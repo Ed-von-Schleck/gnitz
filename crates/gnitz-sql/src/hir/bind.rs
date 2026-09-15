@@ -215,13 +215,7 @@ impl<'a> QueryTail<'a> {
     /// names a visible output column.
     fn wrap(&self, rel: Rc<RelExpr>, placed: &[usize]) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let cols = rel.cols();
-        let visible: Vec<usize> = cols
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.def.is_hidden)
-            .map(|(i, _)| i)
-            .collect();
-        let order = key_slots(&self.keys, &visible, placed)?
+        let order = key_slots(&self.keys, cols.iter().map(|c| &c.def), placed.iter().copied())?
             .into_iter()
             .zip(&self.keys)
             .map(|(at, key)| {
@@ -458,15 +452,20 @@ fn bind_body_suffix(
     if select.distinct.is_none() {
         return Ok((projected, placed));
     }
-    // DISTINCT dedups the selected columns, so a key that is not one of them —
-    // a hidden item `place_order_keys` appended — would change the set it orders.
+    reject_unselected_distinct_keys(&projected, &placed, ctx)?;
+    Ok((RelExpr::distinct(projected), placed))
+}
+
+/// DISTINCT dedups the selected columns, so an ORDER BY key that is not one of them —
+/// a hidden item `place_order_keys` appended — would change the set it orders.
+fn reject_unselected_distinct_keys(projected: &RelExpr, placed: &[usize], ctx: &str) -> Result<(), GnitzSqlError> {
     let cols = projected.cols();
     if placed.iter().any(|&at| cols[at].def.is_hidden) {
         return Err(GnitzSqlError::Unsupported(format!(
             "{ctx}: an ORDER BY key under SELECT DISTINCT must be a selected column"
         )));
     }
-    Ok((RelExpr::distinct(projected), placed))
+    Ok(())
 }
 
 /// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,
@@ -1491,8 +1490,8 @@ pub(crate) fn bind_adhoc_grouped(
 /// — the same tree, over the same leaf, that a `SELECT DISTINCT` `CREATE VIEW`
 /// body binds, so one written projection means one thing on both paths (a
 /// computed item included). The WHERE is not bound here, for the reason
-/// [`bind_adhoc_grouped`] states. An ORDER BY key must be an output column: a
-/// hidden item would widen the set identity.
+/// [`bind_adhoc_grouped`] states. An ORDER BY key must sort on a selected item: a
+/// hidden one would widen the set identity.
 pub(crate) fn bind_adhoc_distinct(
     ids: &ColIdGen,
     select: &Select,
@@ -1506,18 +1505,69 @@ pub(crate) fn bind_adhoc_distinct(
         clause: "SELECT DISTINCT",
         sub: SubPolicy::PerKind,
     };
-    let items = bind_projection(&select.projection, &leaf, ids, "SELECT DISTINCT")?;
-    let order_cols = order_exprs
+    let order_leaf = ScopeLeaf {
+        scope: &scope,
+        clause: "ORDER BY",
+        sub: SubPolicy::PerKind,
+    };
+    let mut items = bind_projection(&select.projection, &leaf, ids, "SELECT DISTINCT")?;
+    let placed = place_order_keys(order_exprs, &mut items, ids, &order_leaf)?;
+    let projected = RelExpr::project(source, items);
+    reject_unselected_distinct_keys(&projected, &placed, "SELECT DISTINCT")?;
+    Ok((RelExpr::distinct(projected), placed))
+}
+
+/// An ad-hoc SELECT list bound by [`bind_adhoc_projection`].
+pub(crate) struct AdhocProjection {
+    /// The source layout the items' `ColId`s resolve against.
+    pub layout: Vec<ColId>,
+    pub items: Vec<ProjEntry>,
+    /// The item each ORDER BY expression key sorts on.
+    pub placed: Vec<usize>,
+}
+
+/// Bind an ad-hoc single-relation SELECT list through the leaf a view body binds
+/// through: the source PK as hidden pass-through items, then the SELECT list, then
+/// each ORDER BY expression no item already computes. The WHERE is not bound here,
+/// for the reason [`bind_adhoc_grouped`] states.
+pub(crate) fn bind_adhoc_projection(
+    ids: &ColIdGen,
+    projection: &[SelectItem],
+    schema: Arc<Schema>,
+    alias: &str,
+    order_exprs: &[&Expr],
+) -> Result<AdhocProjection, GnitzSqlError> {
+    let (_, scope) = adhoc_source(ids, Arc::clone(&schema), alias);
+    let leaf = ScopeLeaf {
+        scope: &scope,
+        clause: "SELECT",
+        sub: SubPolicy::PerKind,
+    };
+    let written = bind_projection(projection, &leaf, ids, "SELECT")?;
+    reject_duplicate_projection_names(projection, written.iter().map(|e| &e.out.def), "SELECT")?;
+    let cols = &scope.combined;
+    // Hidden, so no SELECT-list name resolves to one and no position counts one; an
+    // ORDER BY key over an unselected PK column sorts on its slot.
+    let mut items: Vec<ProjEntry> = schema
+        .pk_cols
         .iter()
-        .map(|e| {
-            output_column(e, items.iter().map(|it| &it.out.def))?.ok_or_else(|| {
-                GnitzSqlError::Unsupported(
-                    "SELECT DISTINCT: ORDER BY expressions must appear in the select list".into(),
-                )
-            })
+        .map(|&pk| {
+            let c = &cols[pk as usize];
+            RelExpr::passthrough_item(HirCol::new(c.id, c.def.clone().hidden()))
         })
-        .collect::<Result<_, _>>()?;
-    Ok((RelExpr::distinct(RelExpr::project(source, items)), order_cols))
+        .collect();
+    items.extend(written);
+    let order_leaf = ScopeLeaf {
+        scope: &scope,
+        clause: "ORDER BY",
+        sub: SubPolicy::PerKind,
+    };
+    let placed = place_order_keys(order_exprs, &mut items, ids, &order_leaf)?;
+    Ok(AdhocProjection {
+        layout: cols.iter().map(|c| c.id).collect(),
+        items,
+        placed,
+    })
 }
 
 /// The `Get` an ad-hoc body binds over and the one-relation scope its names
@@ -1639,8 +1689,9 @@ fn bind_grouped_suffix(
     Ok((RelExpr::project(rel, items), order_cols))
 }
 
-/// The projection item each key of `order_exprs` sorts on: the SELECT item that
-/// already computes it, else a hidden one appended here.
+/// The projection item each key of `order_exprs` sorts on: the output column it
+/// names, else the item whose bound expression equals the key's — so `t.a + b` and
+/// `a + b` are one item — else a hidden one appended here.
 pub(super) fn place_order_keys<L: ItemLeaf>(
     order_exprs: &[&Expr],
     items: &mut Vec<ProjEntry>,
@@ -1649,10 +1700,16 @@ pub(super) fn place_order_keys<L: ItemLeaf>(
 ) -> Result<Vec<usize>, GnitzSqlError> {
     let mut cols = Vec::with_capacity(order_exprs.len());
     for (i, e) in order_exprs.iter().enumerate() {
-        cols.push(match output_column(e, items.iter().map(|it| &it.out.def))? {
+        if let Some(at) = output_column(e, items.iter().map(|it| &it.out.def))? {
+            cols.push(at);
+            continue;
+        }
+        // A leaf that registers while binding (a window call, a subquery) hands back a
+        // column no existing item names, so such an entry never matches and is appended.
+        let mut entry = bind_scalar_item(e, Some(crate::validate::order_column_name(i)), i, leaf, ids)?;
+        cols.push(match items.iter().position(|it| it.expr == entry.expr) {
             Some(at) => at,
             None => {
-                let mut entry = bind_scalar_item(e, Some(crate::validate::order_column_name(i)), i, leaf, ids)?;
                 entry.out.def.is_hidden = true;
                 items.push(entry);
                 items.len() - 1

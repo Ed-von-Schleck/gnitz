@@ -13,7 +13,7 @@ use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, SourceCursor, StoreError};
-use gnitz_expr::{cmp_order_keys, push_identity_tiebreak, Evaluator, LogicalProgram, OrderLocator};
+use gnitz_expr::{cmp_order_keys, order_locators, Evaluator, LogicalProgram, OrderLocator};
 
 /// The sink a request resolved to, ahead of any walk.
 enum Sink {
@@ -330,15 +330,7 @@ fn topk_keep(keeper: Batch, order: &[OrderLocator], window: i64) -> (Batch, i64)
     let mut perm: Vec<u32> = (0..keeper.count as u32).collect();
     let cmp = |a: &u32, b: &u32| {
         let (ra, rb) = (*a as usize, *b as usize);
-        cmp_order_keys(
-            order,
-            &keeper,
-            ra,
-            keeper.get_null_word(ra),
-            &keeper,
-            rb,
-            keeper.get_null_word(rb),
-        )
+        cmp_order_keys(order, &keeper, ra, &keeper, rb)
     };
     let k = (window as usize).min(perm.len());
     if k < perm.len() {
@@ -369,21 +361,12 @@ fn topk_keep(keeper: Batch, order: &[OrderLocator], window: i64) -> (Batch, i64)
 /// Resolve each ORDER BY key over the sink input — a forged column is a
 /// rejection — then append the identity tiebreak.
 fn resolve_order_locs(order: &[OrderKey], schema: &SchemaDescriptor) -> Result<Vec<OrderLocator>, StoreError> {
-    let mut locs = order
-        .iter()
-        .map(|k| match schema.try_locate(k.col as usize) {
-            Some(loc) => Ok(OrderLocator::of(loc, k)),
-            None => Err(StoreError::rejected(format!(
-                "scan_spec: order key column {} out of range ({} cols)",
-                k.col,
-                schema.num_columns()
-            ))),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if !locs.is_empty() {
-        push_identity_tiebreak(&mut locs, schema);
-    }
-    Ok(locs)
+    order_locators(order, schema).map_err(|col| {
+        StoreError::rejected(format!(
+            "scan_spec: order key column {col} out of range ({} cols)",
+            schema.num_columns()
+        ))
+    })
 }
 
 /// Decode + validate a client predicate blob against `schema`, then build its

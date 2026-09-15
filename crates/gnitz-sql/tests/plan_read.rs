@@ -656,8 +656,8 @@ fn a_read_the_planner_rejects_names_its_rule() {
             "Unsupported",
             "positional column aliases",
         ),
-        // The projection binds before ORDER BY is parsed.
-        ("SELECT nope FROM t ORDER BY 1.5", "Bind", "nope"),
+        // ORDER BY parses before the SELECT list binds, on every surface.
+        ("SELECT nope FROM t ORDER BY 1.5", "Unsupported", "ORDER BY position"),
         ("SELECT id FROM jv", "Bind", "is ambiguous"),
         ("SELECT * FROM jv WHERE id = 5", "Bind", "is ambiguous"),
         ("SELECT _join_pk FROM jv", "Bind", "not found"),
@@ -862,6 +862,7 @@ fn an_order_by_key_binds_where_the_select_list_does() {
         ("SELECT id, v + 1 AS w FROM t ORDER BY v + 1", "projection: 2 columns"),
         ("SELECT id, v + 1 AS w FROM t ORDER BY w", "projection: 2 columns"),
         ("SELECT id FROM t ORDER BY t.id", "projection: 1 columns"),
+        ("SELECT v FROM t ORDER BY id", "projection: 1 columns"),
     ] {
         assert!(
             explain(&cat, sql).contains(&line.to_string()),
@@ -875,6 +876,7 @@ fn an_order_by_key_binds_where_the_select_list_does() {
         "SELECT g, SUM(v) AS s FROM t GROUP BY g ORDER BY SUM(v) + g, MAX(v)",
         "SELECT g + 1 AS h FROM t GROUP BY g + 1 ORDER BY (g + 1) * 2",
         "SELECT DISTINCT v AS w FROM t ORDER BY w DESC, 1",
+        "SELECT DISTINCT v + 1 AS w FROM t ORDER BY v + 1",
     ] {
         assert!(explain(&cat, sql)[3].starts_with("fold:"), "`{sql}`");
     }
@@ -910,7 +912,7 @@ fn an_order_by_key_binds_where_the_select_list_does() {
         (
             "SELECT DISTINCT v FROM t ORDER BY v + 1",
             "Unsupported",
-            "SELECT DISTINCT: ORDER BY expressions must appear in the select list",
+            "SELECT DISTINCT: an ORDER BY key under SELECT DISTINCT must be a selected column",
         ),
         ("SELECT id FROM t ORDER BY nope + 1", "Bind", "column 'nope' not found"),
     ] {

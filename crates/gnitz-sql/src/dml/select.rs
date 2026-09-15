@@ -22,18 +22,18 @@
 use crate::agg::ground_partial_schema;
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
-    scalar_projection_item, FromShape,
+    reject_position_out_of_range, scalar_projection_item, FromShape,
 };
 use crate::bind::{bind_single_table, output_column, Binder};
 use crate::dml::cte::inline_ctes;
 use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, rows_sink, Access, ReadBudget};
 use crate::error::{derivation, reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
-use crate::exec::order::{read_spec_finish, wire_order, Window};
+use crate::exec::order::{order_and_window, Window};
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::hir::bind_and_lower_fold;
 use crate::ir::BoundExpr;
-use crate::tail::{extract_limit, extract_offset, order_exprs, parse_order_by, resolve_position, OrderTarget};
+use crate::tail::{extract_limit, extract_offset, order_exprs, parse_order_by, wire_keys, OrderTarget};
 use crate::validate::{
     as_plain_select, computed_column, reject_duplicate_projection_names, reject_unhonored_query_clauses,
     reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
@@ -70,7 +70,7 @@ pub(super) enum ReadCase {
         /// Nothing in the layout tells a DISTINCT fold from a zero-aggregate GROUP BY.
         is_distinct: bool,
     },
-    /// A FROM-less SELECT: its one row, finished and windowed at plan time.
+    /// A FROM-less SELECT: its one row, finished at plan time.
     Constant {
         schema: Arc<Schema>,
         row: ZSetBatch,
@@ -197,7 +197,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, binder: &Binder<'_>) -> Resu
             const CTX: &str = "SELECT without FROM";
             reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, CTX)?;
             reject_if(select.selection.is_some(), CTX, "WHERE")?;
-            let (schema, row) = plan_constant(query, select, window)?;
+            let (schema, row) = plan_constant(query, select)?;
             return Ok(ReadPlan {
                 case: ReadCase::Constant { schema, row },
                 order: Vec::new(),
@@ -226,7 +226,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, binder: &Binder<'_>) -> Resu
         plan_fold(select, query.order_by.as_ref(), ctx, name, &alias, desc, access)?
     } else {
         // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
-        let limit_k = window.limit.map_or(0, |l| l.saturating_add(window.offset) as u64);
+        let limit_k = window.end().map_or(0, |e| e as u64);
         let (reply_schema, sink, order) = rows_sink(
             &select.projection,
             query.order_by.as_ref(),
@@ -279,7 +279,12 @@ fn plan_fold(
         map: pieces.pre,
         kind: SinkKind::Fold(pieces.agg),
     };
-    let order = wire_order(&keys, &finish.out_schema, &order_cols)?;
+    // The finalize items follow the hidden `_group_pk` `FoldFinish::new` prepends.
+    let order = wire_keys(
+        &keys,
+        &finish.out_schema.columns,
+        order_cols.iter().map(|&at| finish.out_schema.pk_cols.len() + at),
+    )?;
     let case = ReadCase::Fold {
         read: SpecRead { name, desc, access, sink },
         finish: Box::new(finish),
@@ -291,7 +296,7 @@ fn plan_fold(
 
 /// A FROM-less SELECT's one row, finished at plan time: each item is a constant
 /// expression, compiled as a fold's finalize item over the ground row.
-fn plan_constant(query: &Query, select: &Select, window: Window) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
+fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBatch), GnitzSqlError> {
     const CTX: &str = "SELECT without FROM";
     let ground = ground_partial_schema();
     // No relation is in scope: the ground row's one column is hidden, so every
@@ -306,12 +311,9 @@ fn plan_constant(query: &Query, select: &Select, window: Window) -> Result<(Arc<
     }
     reject_duplicate_projection_names(&select.projection, items.iter().map(|(_, d)| d), CTX)?;
     // One row sorts to itself: a key is refused where invalid, never placed.
-    let visible: Vec<usize> = (0..items.len()).collect();
     for key in &parse_order_by(query.order_by.as_ref())? {
         match key.target {
-            OrderTarget::Position(pos) => {
-                resolve_position(pos, &visible)?;
-            }
+            OrderTarget::Position(pos) => reject_position_out_of_range(pos, items.len(), "ORDER BY")?,
             OrderTarget::Expr(e) => {
                 if output_column(e, items.iter().map(|(_, d)| d))?.is_none() {
                     compile_scalar_evaluator(&bind(e)?, &ground)?;
@@ -322,12 +324,7 @@ fn plan_constant(query: &Query, select: &Select, window: Window) -> Result<(Arc<
     let finish = FoldFinish::new(ground, [], &[], items)?;
     let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);
     BatchAppender::new(&mut ground_row, &finish.partial_schema).add_row(gnitz_wire::global_group_key(), 1);
-    Ok(read_spec_finish(
-        Arc::clone(&finish.out_schema),
-        finish.apply(ground_row),
-        &[],
-        window,
-    ))
+    Ok((Arc::clone(&finish.out_schema), finish.apply(ground_row)))
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +341,7 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
     }
     let ReadPlan { case, order, window } = plan;
     let (schema, batch) = match case {
-        ReadCase::Constant { schema, row } => return Ok(SqlResult::Rows { schema, batch: row }),
+        ReadCase::Constant { schema, row } => (schema, row),
         ReadCase::Rows { read, reply_schema } => {
             let batch = fetch_bound(client, read.desc.tid, &read.access, &read.sink, &reply_schema)?;
             (reply_schema, batch)
@@ -356,6 +353,6 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             (Arc::clone(&finish.out_schema), finish.apply(finish.combine(partial)))
         }
     };
-    let (schema, batch) = read_spec_finish(schema, batch, &order, window);
+    let batch = order_and_window(&schema, batch, &order, window);
     Ok(SqlResult::Rows { schema, batch })
 }

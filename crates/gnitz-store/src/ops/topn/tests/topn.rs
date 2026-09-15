@@ -256,16 +256,10 @@ fn the_window_order_is_the_shared_comparator_order() {
         let mb = b.as_mem_batch();
         let locs: Vec<gnitz_expr::OrderLocator> = keys
             .iter()
-            .map(|k| gnitz_expr::OrderLocator {
-                loc: schema().locate(k.col as usize),
-                desc: k.desc,
-                nulls_first: k.nulls_first,
-            })
+            .map(|k| gnitz_expr::OrderLocator::of(schema().locate(k.col as usize), k))
             .collect();
         let mut want: Vec<usize> = (0..b.count).collect();
-        want.sort_by(|&x, &y| {
-            gnitz_expr::cmp_order_keys(&locs, &mb, x, mb.get_null_word(x), &mb, y, mb.get_null_word(y))
-        });
+        want.sort_by(|&x, &y| gnitz_expr::cmp_order_keys(&locs, &mb, x, &mb, y));
         let want: Vec<u64> = want.into_iter().map(|r| rows[r].0).collect();
 
         // The first epoch retracts nothing, so the delta is the window in order.

@@ -892,8 +892,17 @@ impl ZSetBatch {
     }
 
     /// The rows `rows` names, in order, at their paired weights; each row at most once.
-    /// When every row survives the arena moves whole, else only survivors' strings are copied.
+    /// A gather naming every row in place is the batch itself. When every row survives the
+    /// arena moves whole, else only survivors' strings are copied.
     pub fn gather(self, rows: &[(usize, i64)]) -> ZSetBatch {
+        if rows.len() == self.len()
+            && rows
+                .iter()
+                .enumerate()
+                .all(|(i, &(r, w))| r == i && w == self.weights[i])
+        {
+            return self;
+        }
         debug_assert!(
             {
                 let mut seen = vec![false; self.len()];

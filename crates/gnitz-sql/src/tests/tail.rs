@@ -1,6 +1,58 @@
 use super::*;
-use crate::test_support::parse_query;
+use crate::test_support::{col_def, parse_query};
+use gnitz_core::TypeCode;
 use sqlparser::ast::Expr;
+
+/// The ORDER BY keys of `sql`.
+fn keys_of(q: &sqlparser::ast::Query) -> Vec<OrderKey<'_>> {
+    parse_order_by(q.order_by.as_ref()).unwrap()
+}
+
+/// A hidden leading key, then `a`, `b`, `c`.
+fn hidden_led() -> Vec<ColumnDef> {
+    vec![
+        col_def("_group_pk", TypeCode::U128, false).hidden(),
+        col_def("a", TypeCode::I64, false),
+        col_def("b", TypeCode::I64, false),
+        col_def("c", TypeCode::I64, false),
+    ]
+}
+
+#[test]
+fn a_position_names_a_visible_column() {
+    let cols = hidden_led();
+    let q = parse_query("SELECT * FROM t ORDER BY 1, 3");
+    assert_eq!(key_slots(&keys_of(&q), &cols, []).unwrap(), vec![1, 3]);
+    for sql in ["SELECT * FROM t ORDER BY 0", "SELECT * FROM t ORDER BY 4"] {
+        let q = parse_query(sql);
+        match key_slots(&keys_of(&q), &cols, []) {
+            Err(GnitzSqlError::Unsupported(m)) => assert!(m.contains("ORDER BY position"), "{sql}: {m}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn expression_keys_consume_placements_in_order() {
+    let cols = hidden_led();
+    let q = parse_query("SELECT * FROM t ORDER BY a + 1, 2, b + 1 DESC");
+    let keys = keys_of(&q);
+    assert_eq!(order_exprs(&keys).len(), 2);
+    assert_eq!(key_slots(&keys, &cols, [7, 5]).unwrap(), vec![7, 2, 5]);
+    let wire = wire_keys(&keys, &cols, [7, 5]).unwrap();
+    assert_eq!(
+        wire.iter().map(|k| (k.col, k.desc)).collect::<Vec<_>>(),
+        [(7, false), (2, false), (5, true)]
+    );
+    assert!(matches!(key_slots(&keys, &cols, [7]), Err(GnitzSqlError::Internal(_))));
+}
+
+#[test]
+fn null_placement_defaults_follow_the_direction() {
+    let q = parse_query("SELECT * FROM t ORDER BY a, b DESC, c ASC NULLS FIRST, a DESC NULLS LAST");
+    let dirs: Vec<(bool, bool)> = keys_of(&q).iter().map(OrderKey::dir).collect();
+    assert_eq!(dirs, [(false, false), (true, true), (false, true), (true, false)]);
+}
 
 #[test]
 fn extract_limit_offset_literals_and_errors() {

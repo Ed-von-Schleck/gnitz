@@ -44,12 +44,6 @@ pub(crate) fn computed_column_name(idx: usize) -> String {
     format!("_expr{idx}")
 }
 
-/// The hidden column ORDER BY key `i` rides as when it is an expression over the
-/// SELECT list's scope rather than an output column.
-pub(crate) fn order_column(i: usize, nominal: ColType) -> ColumnDef {
-    ColumnDef::typed(order_column_name(i), nominal.register_image(), true).hidden()
-}
-
 /// A hidden ordering column's label, for dumps and EXPLAIN. Placement travels
 /// as a column index, not by this name.
 pub(crate) fn order_column_name(i: usize) -> String {

@@ -240,10 +240,30 @@ impl OrderLocator {
     }
 }
 
+/// The comparator keys `order` names over `schema`: the written keys located, then —
+/// when there is any — the identity tiebreak, which makes the order total over
+/// distinct rows. `Err` carries a key column `schema` does not have.
+pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &dyn SchemaFacts) -> Result<Vec<OrderLocator>, u16> {
+    let mut keys = order
+        .iter()
+        .map(|k| {
+            if (k.col as usize) < schema.num_columns() {
+                Ok(OrderLocator::of(schema.locate(k.col as usize), k))
+            } else {
+                Err(k.col)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !keys.is_empty() {
+        push_identity_tiebreak(&mut keys, schema);
+    }
+    Ok(keys)
+}
+
 /// Append the identity tiebreak — PK columns in key order, then payload columns,
 /// all ASC NULLS FIRST — making the order total over distinct rows. Assumes
 /// `schema`'s PK is a function of row content, since it leads.
-pub fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &dyn SchemaFacts) {
+fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &dyn SchemaFacts) {
     let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
     let mut pk: Vec<(u8, ColumnLocator)> = (0..schema.num_columns())
         .filter_map(|ci| match schema.locate(ci) {
@@ -286,17 +306,17 @@ pub fn cmp_group_cols<A: RowSource, B: RowSource>(
 /// The one ORDER BY comparator, read by both the worker's top-k and the client's
 /// ordering sink. Lexicographic over the keys; NULL placement is absolute —
 /// `nulls_first` decides it and `desc` does not flip it. `Equal` means the keys
-/// did not separate the rows, and each caller applies its own tiebreak.
+/// did not separate the rows; any tiebreak is the tail of `keys`.
 #[inline]
 pub fn cmp_order_keys<A: RowSource, B: RowSource>(
     keys: &[OrderLocator],
     a: &A,
     ra: usize,
-    na: u64,
     b: &B,
     rb: usize,
-    nb: u64,
 ) -> Ordering {
+    let na = a.get_null_word(ra);
+    let nb = b.get_null_word(rb);
     for key in keys {
         // A PK locator answers `false` on both sides and falls through to the
         // value compare.

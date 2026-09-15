@@ -81,7 +81,7 @@ fn order_limit_line(plan: &ReadPlan) -> String {
     if !plan.order.is_empty() {
         facts.push("client sort".to_string());
     }
-    if plan.window.offset > 0 || plan.window.limit.is_some() {
+    if plan.window.cuts() {
         facts.push("client window".to_string());
     }
     if facts.is_empty() {

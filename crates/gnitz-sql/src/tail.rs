@@ -5,6 +5,7 @@
 
 use crate::ast_util::{clause_position, expr_usize_literal, reject_position_out_of_range};
 use crate::error::GnitzSqlError;
+use gnitz_core::ColumnDef;
 use sqlparser::ast::{Expr, LimitClause, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
 
 /// What an ORDER BY key names: a 1-based visible-output position, or an
@@ -107,32 +108,46 @@ fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
     Ok(keys)
 }
 
-/// The physical column index a 1-based ORDER BY position names, given the
-/// physical indices of the visible columns.
-pub(crate) fn resolve_position(pos: usize, visible: &[usize]) -> Result<usize, GnitzSqlError> {
-    reject_position_out_of_range(pos, visible.len(), "ORDER BY")?;
-    Ok(visible[pos - 1])
-}
-
-/// The schema slot each key of `keys` sorts on. A position names a *visible*
-/// column (1-based over `visible`, so a hidden appended key never shifts it); an
-/// expression key takes the slot `placed` records for it, one per
+/// The column each key of `keys` sorts on, over a result whose columns are `cols`. A
+/// position names a *visible* column (1-based, so a hidden column never shifts it);
+/// an expression key takes the slot `placed` records for it, one per
 /// [`order_exprs`] entry in that order.
-pub(crate) fn key_slots(
+pub(crate) fn key_slots<'c>(
     keys: &[OrderKey<'_>],
-    visible: &[usize],
-    placed: &[usize],
+    cols: impl IntoIterator<Item = &'c ColumnDef>,
+    placed: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<usize>, GnitzSqlError> {
-    let mut placed = placed.iter();
+    let visible: Vec<usize> = cols
+        .into_iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_hidden)
+        .map(|(i, _)| i)
+        .collect();
+    let mut placed = placed.into_iter();
     keys.iter()
         .map(|k| match k.target {
-            OrderTarget::Position(pos) => resolve_position(pos, visible),
+            OrderTarget::Position(pos) => {
+                reject_position_out_of_range(pos, visible.len(), "ORDER BY")?;
+                Ok(visible[pos - 1])
+            }
             OrderTarget::Expr(_) => placed
                 .next()
-                .copied()
                 .ok_or_else(|| GnitzSqlError::Internal("ORDER BY placements do not match the keys".into())),
         })
         .collect()
+}
+
+/// [`key_slots`] as wire keys, each carrying its key's direction.
+pub(crate) fn wire_keys<'c>(
+    keys: &[OrderKey<'_>],
+    cols: impl IntoIterator<Item = &'c ColumnDef>,
+    placed: impl IntoIterator<Item = usize>,
+) -> Result<Vec<gnitz_wire::OrderKey>, GnitzSqlError> {
+    Ok(key_slots(keys, cols, placed)?
+        .into_iter()
+        .zip(keys)
+        .map(|(col, k)| k.wire(col))
+        .collect())
 }
 
 /// The `LIMIT n` value, or `None` when absent. A non-integer-literal LIMIT

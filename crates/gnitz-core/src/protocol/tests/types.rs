@@ -991,6 +991,26 @@ fn a_cut_gather_matches_a_row_by_row_rebuild() {
     got.validate(&schema).unwrap();
 }
 
+/// A gather naming every row in place at its own weight is the batch itself; one
+/// clipped weight is not.
+#[test]
+fn an_in_place_gather_is_the_batch() {
+    let (schema, b) = string_batch(&GATHER_VALS);
+    let in_place: Vec<(usize, i64)> = b.weights.iter().copied().enumerate().collect();
+    let weights = b.weights.as_ptr();
+    let got = b.gather(&in_place);
+    assert_eq!(got.weights.as_ptr(), weights);
+
+    let mut clipped = in_place;
+    let last = clipped.len() - 1;
+    clipped[last].1 += 1;
+    let weights = got.weights.as_ptr();
+    let cut = got.gather(&clipped);
+    assert_ne!(cut.weights.as_ptr(), weights);
+    assert_eq!(cut.weights[last], clipped[last].1);
+    cut.validate(&schema).unwrap();
+}
+
 /// A gather keeping every row moves the arena whole: every cell keeps its offset.
 #[test]
 fn a_whole_gather_moves_the_arena() {

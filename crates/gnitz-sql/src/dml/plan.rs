@@ -12,12 +12,11 @@ use std::sync::Arc;
 use crate::access::{
     pk_point_tuple, ranked_index_bounds, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
 };
-use crate::codec::project_schema::{build_read_projection, read_reply_shape, ProjItem};
+use crate::codec::project_schema::{read_reply_shape, ProjItem};
 use crate::error::GnitzSqlError;
-use crate::exec::order::resolve_read_spec_order;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
-use crate::tail::parse_order_by;
+use crate::tail::{order_exprs, parse_order_by, wire_keys};
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
 use gnitz_wire::{IndexWalk, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, SelectItem};
@@ -292,9 +291,10 @@ pub(crate) fn rows_sink(
     alias: &str,
     limit_k: u64,
 ) -> Result<(Arc<Schema>, ReadSink, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
-    let (mut items, mut out_cols) = build_read_projection(projection, schema, alias)?;
     let keys = parse_order_by(order_by)?;
-    let mut order = resolve_read_spec_order(&mut items, &mut out_cols, schema, alias, &keys)?;
+    let crate::hir::AdhocRows { items, cols: out_cols, placed } =
+        crate::hir::bind_adhoc_rows(projection, schema, alias, &order_exprs(&keys))?;
+    let mut order = wire_keys(&keys, &out_cols, placed)?;
     let (reply_schema, map) = if reproduces(schema, &items, &out_cols) {
         for key in &mut order {
             key.col = items[key.col as usize]

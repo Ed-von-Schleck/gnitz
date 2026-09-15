@@ -1,7 +1,7 @@
 """The ORDER BY / OFFSET / LIMIT read bound, over a base table and over a view.
 
-Two properties carry the file. The sink sorts BEFORE projection, so an ORDER BY
-key absent from the SELECT list still resolves; and it counts LIMIT/OFFSET by
+Two properties carry the file. An ORDER BY key absent from the SELECT list rides
+the reply as a hidden column; and the sink counts LIMIT/OFFSET by
 logical **multiplicity** — summed weight — not by Z-set entries, so a cut lands
 in the same place however a bag is split across workers and entries.
 

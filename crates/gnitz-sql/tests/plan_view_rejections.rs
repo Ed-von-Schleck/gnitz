@@ -725,6 +725,21 @@ fn top_n_rules() {
             ),
         ],
     );
+    // An ORDER BY key a SELECT item already computes sorts on that item: the same
+    // stored output as ordering by the item's name, DISTINCT included.
+    let cols = |body: &str| final_view(&view(&cat, body)).output_columns.clone();
+    for (by_expr, by_name) in [
+        (
+            "SELECT id, v + 1 AS w FROM t ORDER BY v + 1 LIMIT 5",
+            "SELECT id, v + 1 AS w FROM t ORDER BY w LIMIT 5",
+        ),
+        (
+            "SELECT DISTINCT v + 1 AS w FROM t ORDER BY v + 1 LIMIT 3",
+            "SELECT DISTINCT v + 1 AS w FROM t ORDER BY w LIMIT 3",
+        ),
+    ] {
+        assert_eq!(cols(by_expr), cols(by_name), "`{by_expr}`");
+    }
 }
 
 #[test]

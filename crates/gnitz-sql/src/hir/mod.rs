@@ -28,6 +28,7 @@ pub use create::{plan_view, PlannedChain, ViewPlan};
 
 use crate::agg::AggFunc;
 use crate::bind::Binder;
+use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
 use chain::{EmitPieces, ViewChain};
@@ -79,6 +80,38 @@ pub(crate) fn bind_and_lower_fold(
         bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema), alias, order_exprs)?
     };
     Ok((lower::fold::lower_fold(&rel)?, order_cols))
+}
+
+/// An ad-hoc rows read's reply items, as [`bind_adhoc_rows`] binds them.
+pub(crate) struct AdhocRows {
+    /// The source PK hidden in front, then the SELECT list, then a hidden item per
+    /// ORDER BY expression no item already computes.
+    pub items: Vec<ProjItem>,
+    /// The output column of each item.
+    pub cols: Vec<ColumnDef>,
+    /// The item each ORDER BY expression key sorts on.
+    pub placed: Vec<usize>,
+}
+
+/// The ad-hoc rows read's entry to the same binder.
+pub(crate) fn bind_adhoc_rows(
+    projection: &[sqlparser::ast::SelectItem],
+    schema: &Arc<Schema>,
+    alias: &str,
+    order_exprs: &[&sqlparser::ast::Expr],
+) -> Result<AdhocRows, GnitzSqlError> {
+    let ids = ColIdGen::new();
+    let bound = bind::bind_adhoc_projection(&ids, projection, Arc::clone(schema), alias, order_exprs)?;
+    let mut items = Vec::with_capacity(bound.items.len());
+    let mut cols = Vec::with_capacity(bound.items.len());
+    for entry in bound.items {
+        items.push(ProjItem::from_bound(physical::resolve_refs(
+            &entry.expr,
+            &bound.layout,
+        )?));
+        cols.push(entry.out.def);
+    }
+    Ok(AdhocRows { items, cols, placed: bound.placed })
 }
 
 /// Opaque column identity, unique within one `bind_and_lower` invocation, never
