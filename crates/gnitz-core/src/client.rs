@@ -622,12 +622,11 @@ impl GnitzClient {
         table_id: u64,
         schema: &Schema,
         batch: &ZSetBatch,
-        mode: WireConflictMode,
         basis: u64,
     ) -> Result<u64, ClientError> {
         let r = self
             .round_trip(Request::PushTxn {
-                families: &[(table_id, schema, batch, mode)],
+                families: &[(table_id, schema, batch, WireConflictMode::Update)],
                 preconditions: &[(table_id, basis)],
             })
             .map(Reply::into_lsn);
@@ -639,9 +638,9 @@ impl GnitzClient {
     /// by UPDATE / DELETE / INSERT ... ON CONFLICT, which read `table_id` before
     /// writing. A blind INSERT uses plain `push_with_mode` and records nothing (a
     /// blind write cannot lose an update). No-op outside a transaction.
-    pub fn txn_push_rmw(&mut self, table_id: u64, schema: &Schema, batch: ZSetBatch, mode: WireConflictMode) {
+    pub fn txn_push_rmw(&mut self, table_id: u64, schema: &Schema, batch: ZSetBatch) {
         if let Some(txn) = &mut self.txn {
-            txn.push(table_id, schema, batch, mode);
+            txn.push(table_id, schema, batch, WireConflictMode::Update);
             txn.record_read(table_id);
         }
     }

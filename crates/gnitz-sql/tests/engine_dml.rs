@@ -342,3 +342,133 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
     assert_eq!(affected(&mut client, &sn, "DELETE FROM t"), ROWS as usize - per_group);
     assert_eq!(count_rows(&mut client, &sn), 0);
 }
+
+// ── UPDATE / DELETE / ON CONFLICT ────────────────────────────────────────────
+
+/// A DECIMAL source rounds into an integer column and a DATE source converts
+/// into a TIMESTAMP one, rather than writing the unscaled or wrong-unit register.
+#[test]
+fn update_set_converts_decimal_and_date_sources() {
+    let (_srv, mut client, sn) = boot(2);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, i BIGINT, d DECIMAL(10,2), dt DATE, ts TIMESTAMP)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "INSERT INTO t VALUES (1, 0, 2.50, DATE '2024-01-02', TIMESTAMP '2000-01-01 00:00:00')",
+    );
+    assert_eq!(affected(&mut client, &sn, "UPDATE t SET i = d, ts = dt"), 1);
+    let got = rows(&mut client, &sn, "SELECT i, dt, ts FROM t", &["i", "dt", "ts"]);
+    assert_eq!(got.len(), 1);
+    let [i, dt, ts, w] = got[0][..] else { panic!("{got:?}") };
+    assert_eq!((i, w), (3, 1));
+    assert_eq!(ts, dt * 86_400_000_000);
+}
+
+#[test]
+fn on_conflict_do_update_sets_a_double_from_excluded() {
+    let (_srv, mut client, sn) = boot(2);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, f DOUBLE)");
+    exec(&mut client, &sn, "INSERT INTO t VALUES (1, 1.5)");
+    exec(
+        &mut client,
+        &sn,
+        "INSERT INTO t VALUES (1, 2.25) ON CONFLICT (id) DO UPDATE SET f = EXCLUDED.f",
+    );
+    let (schema, batch) = read_sql(&mut client, &sn, "SELECT id, f FROM t");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(cell_f64(&schema, &batch, col_idx(&schema, "f"), 0), 2.25);
+}
+
+#[test]
+fn update_rejects_a_qualified_target() {
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    exec(&mut client, &sn, "INSERT INTO t VALUES (1, 1)");
+    assert_rejects_variant(
+        &mut client,
+        &sn,
+        "UPDATE t SET x.v = 1",
+        "Plan",
+        "column must be a simple identifier",
+    );
+    assert_eq!(rows(&mut client, &sn, "SELECT id, v FROM t", &["id", "v"]), [[1, 1, 1]]);
+}
+
+/// Inside a transaction, ON CONFLICT resolves each VALUES row against a buffered
+/// row, a buffered delete and a committed row. The VALUES rows run opposite to
+/// the order the existing rows come back in, so each merge must read its own
+/// incoming row.
+#[test]
+fn on_conflict_in_a_transaction_resolves_against_buffered_and_committed_rows() {
+    let (_srv, mut client, sn) = boot(2);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT)",
+    );
+    exec(&mut client, &sn, "CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT)");
+    exec(
+        &mut client,
+        &sn,
+        "INSERT INTO t VALUES (1, 10, 1), (2, 20, 2), (3, 30, 5)",
+    );
+    exec(&mut client, &sn, "INSERT INTO u VALUES (1, 10), (2, 20), (3, 30)");
+
+    exec(&mut client, &sn, "BEGIN");
+    exec(&mut client, &sn, "INSERT INTO t VALUES (4, 40, 7)");
+    exec(&mut client, &sn, "DELETE FROM t WHERE id = 2");
+    let sql = "INSERT INTO t VALUES (4, 400, 0), (3, 300, 0), (2, 200, 0) \
+               ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, w = w + 1";
+    assert_eq!(affected(&mut client, &sn, sql), 3);
+    exec(&mut client, &sn, "INSERT INTO u VALUES (4, 40)");
+    exec(&mut client, &sn, "DELETE FROM u WHERE id = 2");
+    let sql = "INSERT INTO u VALUES (5, 50), (4, 400), (3, 300), (2, 200) ON CONFLICT (id) DO NOTHING";
+    assert_eq!(affected(&mut client, &sn, sql), 2);
+    exec(&mut client, &sn, "COMMIT");
+
+    assert_eq!(
+        rows(&mut client, &sn, "SELECT * FROM t", &["id", "v", "w"]),
+        at_weight_one(&[vec![1, 10, 1], vec![2, 200, 0], vec![3, 300, 6], vec![4, 400, 8]])
+    );
+    assert_eq!(
+        rows(&mut client, &sn, "SELECT * FROM u", &["id", "v"]),
+        at_weight_one(&[vec![1, 10], vec![2, 200], vec![3, 30], vec![4, 40], vec![5, 50]])
+    );
+}
+
+/// A non-key WHERE inside a transaction matches committed and buffered rows
+/// alike, each exactly once, and sees the transaction's own earlier updates.
+#[test]
+fn update_and_delete_in_a_transaction_match_committed_and_buffered_rows() {
+    let (_srv, mut client, sn) = boot(2);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, s TEXT)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c')",
+    );
+
+    exec(&mut client, &sn, "BEGIN");
+    exec(&mut client, &sn, "INSERT INTO t VALUES (4, 4, 'd'), (5, 5, 'e')");
+    assert_eq!(affected(&mut client, &sn, "UPDATE t SET v = v + 10 WHERE v >= 3"), 3);
+    assert_eq!(affected(&mut client, &sn, "DELETE FROM t WHERE v < 2 OR v = 14"), 2);
+    assert_eq!(affected(&mut client, &sn, "UPDATE t SET s = 'z' WHERE v = 15"), 1);
+    exec(&mut client, &sn, "COMMIT");
+
+    assert_eq!(
+        rows(&mut client, &sn, "SELECT id, v FROM t", &["id", "v"]),
+        at_weight_one(&[vec![2, 2], vec![3, 13], vec![5, 15]])
+    );
+    for (s, id) in [("b", 2), ("c", 3), ("z", 5)] {
+        let sql = format!("SELECT id FROM t WHERE s = '{s}'");
+        assert_eq!(rows(&mut client, &sn, &sql, &["id"]), [[id, 1]], "{sql}");
+    }
+}

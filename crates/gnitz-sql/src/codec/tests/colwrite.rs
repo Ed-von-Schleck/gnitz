@@ -21,7 +21,7 @@ fn expr(src: &str) -> Expr {
 }
 
 #[test]
-fn test_null_append_insert_update_identical_all_variants() {
+fn a_null_cell_is_a_zeroed_cell_of_the_type_stride() {
     // (wire type, expected NULL encoding) per column kind — a zeroed cell of the
     // type's own stride, German-string columns included.
     let cases: [(TypeCode, Vec<u8>); 4] = [
@@ -32,65 +32,16 @@ fn test_null_append_insert_update_identical_all_variants() {
     ];
     for (tc, expected) in cases {
         let mut blob = Vec::new();
-        let mut via_insert = Vec::new();
+        let mut col = Vec::new();
         append_value_to_col(
-            &mut via_insert,
+            &mut col,
             &mut blob,
             ColType::of(tc),
             &bind_constant(&expr("NULL")).unwrap(),
         )
         .unwrap();
-        let mut via_update = Vec::new();
-        append_column_value(&mut via_update, &mut blob, ColumnValue::Null, tc).unwrap();
-        assert_eq!(via_insert, expected, "INSERT NULL encoding for {tc:?}");
-        assert_eq!(via_update, expected, "UPDATE NULL encoding for {tc:?}");
-        assert_eq!(via_insert, via_update, "INSERT vs UPDATE NULL must match for {tc:?}");
+        assert_eq!(col, expected, "NULL encoding for {tc:?}");
         assert!(blob.is_empty(), "a NULL cell spills nothing for {tc:?}");
-    }
-}
-
-/// A SET value out of its column's range is rejected, not truncated to the
-/// low bits. Each case used to write the wrapped byte pattern in the comment.
-#[test]
-fn set_value_out_of_range_is_rejected() {
-    let cases: [(TypeCode, i128); 7] = [
-        (TypeCode::U8, 300),     // wrapped to 44
-        (TypeCode::U8, -1),      // wrapped to 255
-        (TypeCode::I8, 128),     // wrapped to -128
-        (TypeCode::U16, 70000),  // wrapped to 4464
-        (TypeCode::I16, -32769), // wrapped to 32767
-        (TypeCode::U32, -1),     // wrapped to 4294967295
-        (TypeCode::U64, -1),     // wrapped to u64::MAX
-    ];
-    for (tc, v) in cases {
-        let mut col = Vec::new();
-        let e = append_column_value(&mut col, &mut Vec::new(), ColumnValue::Int(v), tc).unwrap_err();
-        assert!(
-            format!("{e:?}").contains("out of range"),
-            "{tc:?} value {v} must be rejected, got {e:?}"
-        );
-    }
-}
-
-/// In-range SET values encode to the column's native little-endian image at
-/// every width and sign — including the upper half of U64, which no `i64`
-/// spells and which the wrap of `-1` used to be the only route to.
-#[test]
-fn set_value_in_range_encodes_natively() {
-    let cases: [(TypeCode, i128, Vec<u8>); 8] = [
-        (TypeCode::U8, 255, vec![255u8]),
-        (TypeCode::I8, -5, vec![(-5i8) as u8]),
-        (TypeCode::U16, 65535, 65535u16.to_le_bytes().to_vec()),
-        (TypeCode::I16, -2, (-2i16).to_le_bytes().to_vec()),
-        (TypeCode::U32, 4294967295, 4294967295u32.to_le_bytes().to_vec()),
-        (TypeCode::I32, -1, (-1i32).to_le_bytes().to_vec()),
-        (TypeCode::U64, u64::MAX as i128, u64::MAX.to_le_bytes().to_vec()),
-        (TypeCode::I64, i64::MIN as i128, i64::MIN.to_le_bytes().to_vec()),
-    ];
-    for (tc, v, expected) in cases {
-        let mut col = Vec::new();
-        append_column_value(&mut col, &mut Vec::new(), ColumnValue::Int(v), tc).unwrap();
-        assert_eq!(col, expected, "encode for {tc:?} value {v}");
     }
 }
 
@@ -229,6 +180,13 @@ fn a_literal_of_the_wrong_kind_is_rejected_by_the_column_type() {
             "{tc:?}: got {e:?}"
         );
     }
+}
+
+/// A non-integral literal into an integer column names the literal it refused.
+#[test]
+fn a_float_literal_into_an_integer_column_names_the_literal() {
+    let e = encoded(TypeCode::I64, &expr("1.5")).unwrap_err();
+    assert!(format!("{e:?}").contains("1.5 is not a"), "got {e:?}");
 }
 
 /// A sign on a string is not a value: either sign used to write `abc`. Refused

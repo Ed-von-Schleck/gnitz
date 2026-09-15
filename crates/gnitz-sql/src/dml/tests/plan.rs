@@ -12,6 +12,16 @@ fn plan_of<'e>(
     bound_and_predicate(schema, conjuncts, budget, &idx_metas_flagged(lists)).expect("the WHERE must plan")
 }
 
+/// How many keys `plan` restricts the transaction's buffered rows to; `None`
+/// when it restricts nothing.
+fn pinned_keys(plan: &AccessPlan<'_>, schema: &Schema) -> Option<usize> {
+    match plan.buffered_scope(schema).0 {
+        BufferedKeys::Keys(keys) => Some(keys.len()),
+        BufferedKeys::Point(_) => Some(1),
+        BufferedKeys::All => None,
+    }
+}
+
 /// The bound's discriminant name, for a shape assertion that does not care
 /// about the descriptor's contents.
 fn shape(bound: &ReadBound) -> &'static str {
@@ -58,7 +68,7 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         assert_eq!(shape(&plan.access.bound), want_shape, "{label}");
         assert_eq!(plan.residual.len(), want_residual, "{label}: residual");
         assert_eq!(
-            plan.buffered_scope(&schema).0.map_or(0, |k| k.len()),
+            pinned_keys(&plan, &schema).unwrap_or(0),
             want_keys,
             "{label}: pinned keys"
         );
@@ -88,7 +98,7 @@ fn an_over_cap_pk_in_list_needs_a_chunking_budget() {
         "None",
         "{n} keys past the one-request cap"
     );
-    assert!(declined.buffered_scope(&schema).0.is_none());
+    assert!(pinned_keys(&declined, &schema).is_none());
     assert!(
         !declined.access.predicate.is_empty(),
         "the list ships as a predicate instead"
@@ -96,7 +106,7 @@ fn an_over_cap_pk_in_list_needs_a_chunking_budget() {
 
     let gathered = plan_of(&where_expr, &schema, &[], ReadBudget::MayChunk);
     assert_eq!(shape(&gathered.access.bound), "PkSet");
-    assert_eq!(gathered.buffered_scope(&schema).0.map_or(0, |k| k.len()), n);
+    assert_eq!(pinned_keys(&gathered, &schema), Some(n));
 }
 
 /// When a PK bound yields to a unique index point, and when it keeps the PK
@@ -201,7 +211,7 @@ fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
     let plan = plan_of(&where_expr, &schema, &[(&[1], true)], ReadBudget::OneRequest);
     assert_eq!(shape(&plan.access.bound), "IndexRange");
     assert!(
-        plan.buffered_scope(&schema).0.is_none(),
+        pinned_keys(&plan, &schema).is_none(),
         "an index bound never pins a PK key"
     );
 }

@@ -1895,6 +1895,7 @@ impl LogicalProgram {
                 .map_or(0, |r| r + 1),
             str_cols,
             result_is_str: self.output.result().is_some_and(|r| (str_class >> r.0) & 1 != 0),
+            result_is_u64: self.output.result().is_some_and(|r| (reg_u64 >> r.0) & 1 != 0),
             is_filter: matches!(role, Role::Filter),
         }
     }
@@ -2692,6 +2693,9 @@ pub(crate) struct ResolvedProgram {
     /// map has none, so this is false for one without a second test of what the
     /// program is for.
     result_is_str: bool,
+    /// True iff [`Self::result_reg`]'s i64 image is a `u64`, per the resolve-time
+    /// U64 tracking. False for a program with no result register.
+    result_is_u64: bool,
     /// True iff this program resolved as [`Role::Filter`], which is what forces
     /// `result_reg` into `bool_input`. The two read-back paths are not
     /// interchangeable either way — a filter's result register may hold no `regs`
@@ -2746,6 +2750,11 @@ impl ResolvedProgram {
     /// rule in `validate_for` rejects a string-valued filter.
     pub(crate) fn result_is_str(&self) -> bool {
         self.result_is_str
+    }
+
+    /// True iff the scalar result is to be read as a `u64`.
+    pub(crate) fn result_is_u64(&self) -> bool {
+        self.result_is_u64
     }
 }
 

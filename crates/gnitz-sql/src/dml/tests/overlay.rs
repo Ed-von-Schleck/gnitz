@@ -23,7 +23,7 @@ fn del(schema: &Schema, pk: u128) -> ZSetBatch {
 }
 
 /// The full net map, straight off a buffer (the client-free half of
-/// `buffered_all`).
+/// `buffered_net` over `BufferedKeys::All`).
 fn net_of(buf: &mut TxnBuffer, tid: u64) -> Net<'_> {
     buf.reads(tid)
         .last_ops()

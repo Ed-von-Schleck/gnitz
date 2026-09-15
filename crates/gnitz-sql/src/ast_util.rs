@@ -19,6 +19,15 @@ pub(crate) fn object_name_ident(name: &sqlparser::ast::ObjectName) -> Option<&sq
     name.0.last().and_then(|p| p.as_ident())
 }
 
+/// The name an `ObjectName` of exactly one plain-identifier part spells; `None`
+/// for a qualified name, so `t.a` is refused rather than truncated to `a`.
+pub(crate) fn single_part_ident(name: &sqlparser::ast::ObjectName) -> Option<&str> {
+    match &name.0[..] {
+        [part] => part.as_ident().map(|i| i.value.as_str()),
+        _ => None,
+    }
+}
+
 /// An `ObjectName`'s parts as plain identifiers. `Err` when the name is empty or
 /// any part is not a plain identifier — the shape every extractor below rejects
 /// identically, before it classifies what a qualifier would have meant.

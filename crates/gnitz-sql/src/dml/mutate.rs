@@ -1,490 +1,368 @@
-//! UPDATE and DELETE: plan the WHERE once through the shared access-path ladder
-//! (`dml::plan`), read the matching rows (UPDATE) or just their keys (DELETE)
-//! back from the server, then write the SET batch or the retraction. The SET-list
-//! helpers (`classify_set_rhs`, `bind_set_program`, `eval_set_value`,
-//! `resolve_set_target`) are also reused by INSERT's `ON CONFLICT DO UPDATE`.
+//! UPDATE and DELETE, as one read-then-write flow: plan the WHERE through the
+//! shared access-path ladder (`dml::plan`), read the rows it matches in the
+//! transaction's effective state (`dml::overlay`), then write the rewritten rows
+//! (UPDATE) or the retraction of their keys (DELETE) under the RMW driver.
+//!
+//! The SET list — [`bind_set_list`] binds the targets, [`classify_set_rhs`]
+//! compiles each value, [`apply_set`] rewrites a batch — is shared with INSERT's
+//! `ON CONFLICT DO UPDATE`.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
-use crate::ast_util::{classify_from, extract_ident_name, extract_table_name_and_alias, FromShape};
+use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_ident, Constant, FromShape};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
-use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
-use crate::codec::pk_codec::{bound_num_literal, pack_pk_value};
-use crate::dml::overlay::{buffered_net, present_rows};
-use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, rows_sink, AccessPlan, ReadBudget};
-use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
+use crate::codec::colwrite::{append_value_to_col, check_not_null};
+use crate::codec::pk_codec::pack_pk_value;
+use crate::dml::overlay::resolve_where_matches;
+use crate::dml::plan::{bind_where, bound_and_predicate, rows_sink, ReadBudget};
+use crate::dml::rmw::commit_rmw_or_buffer;
 use crate::error::GnitzSqlError;
-use crate::exec::residual::matching_indices;
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::ir::BoundExpr;
-use crate::ir::NumLit;
+use crate::ir::{BExpr, BoundExpr, NumLit};
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses};
 use crate::SqlResult;
-use gnitz_core::{retraction_batch, ColumnDef, GnitzClient, Schema, TypeCode, WireConflictMode, ZSetBatch};
+use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{Evaluator, ExprResults};
-use gnitz_wire::decimal::rescale;
-use gnitz_wire::ReadSink;
-use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
+use gnitz_wire::{
+    encode_german_string, german_string_content, is_german_string, null_word_get, null_word_set, ReadSink,
+};
+use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
 
 // ---------------------------------------------------------------------------
-// SET-list helpers (shared with INSERT's ON CONFLICT DO UPDATE)
-// ---------------------------------------------------------------------------
-
-/// A compiled SET / `DO UPDATE SET` right-hand side.
-///
-/// `Const` and `StrCol` are shortcuts for row-independent or verbatim values:
-/// reaching a literal through the VM would run a whole single-row `eval_batch`
-/// per matched row to re-derive a constant, and a bare column read needs no
-/// program at all.
-///
-/// `StrCol` is gated on `TypeCode::String` rather than `is_german_string()` on
-/// purpose: a BLOB column must fall into `Expr`, where `OpcodeBackend`'s column
-/// load rejects it.
-pub(crate) enum SetProgram {
-    /// A row-independent value: a literal, or `NULL`.
-    Const(ColumnValue),
-    /// A bare reference to a `TypeCode::String` column, read verbatim, by its
-    /// payload slot — the address the view reads through.
-    StrCol(usize),
-    /// A computed value, of whichever class the program resolved to. Boxed so a
-    /// `SetProgram` stays small enough to sit in a `Vec` beside the other arms.
-    Expr(Box<Evaluator>),
-}
-
-/// Classify one SET RHS for target column `target` against the schema the rows
-/// it will run over carry. Shared by `UPDATE SET` and `ON CONFLICT DO UPDATE
-/// SET`, including the latter's `EXCLUDED.<col>` short-circuit, so a string
-/// EXCLUDED assignment classifies the same way a bare one does.
-///
-/// The target check is what makes [`eval_set_value`] infallible. Without it a
-/// kind mismatch (`SET int_col = 'abc'`) would surface only from
-/// `append_column_value`, i.e. only once a row matched — so a zero-match WHERE
-/// would report 0 rows updated instead of rejecting.
-pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema) -> Result<SetProgram, GnitzSqlError> {
-    let tc = schema.columns[target].type_code;
-    // Every constant integer shape lands in `Const`, including the negated and
-    // the wide ones the VM cannot lower — so a literal past `i64::MAX` writes
-    // (SET reaches the upper half of U64) and an out-of-range one is caught by
-    // the range check below, before any row is read.
-    let target_ty = schema.columns[target].ty();
-    // A DECIMAL target takes a numeric literal at its own scale (a longer
-    // fraction rounded, as an INSERT cell is) and every other value through a
-    // cast to it, so the register written holds the stored integer.
-    let literal = if target_ty.is_decimal() {
-        expr.decimal_literal()
-            .and_then(|(v, s)| rescale(v, s, target_ty.scale))
-            .map(i128::from)
-    } else {
-        bound_num_literal(expr).and_then(NumLit::to_i128)
-    };
-    let p = if let Some(v) = literal {
-        SetProgram::Const(ColumnValue::Int(v))
-    } else {
-        match expr {
-            BoundExpr::LitStr(s) => SetProgram::Const(ColumnValue::Str(s.clone().into_bytes())),
-            BoundExpr::LitNull => SetProgram::Const(ColumnValue::Null),
-            BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => {
-                SetProgram::StrCol(schema.payload_idx(*c))
-            }
-            _ if target_ty.is_decimal() => {
-                let cast = BoundExpr::Cast {
-                    expr: Box::new(expr.clone()),
-                    to: target_ty,
-                };
-                SetProgram::Expr(Box::new(compile_scalar_evaluator(&cast, schema)?))
-            }
-            // A SET value is written into a fixed-width integer or a string
-            // column; an f64 register has no destination, and nothing downstream
-            // can tell its bit pattern from an integer's.
-            _ if expr.infer_ty(&schema.columns).tc.is_float() => {
-                return Err(GnitzSqlError::Unsupported(
-                    "SET from a floating-point expression is not supported".to_string(),
-                ))
-            }
-            _ => SetProgram::Expr(Box::new(compile_scalar_evaluator(expr, schema)?)),
-        }
-    };
-    let str_valued = match &p {
-        SetProgram::Const(ColumnValue::Null) => return Ok(p), // NULL suits every column
-        SetProgram::Const(cv) => matches!(cv, ColumnValue::Str(_)),
-        SetProgram::StrCol(_) => true,
-        SetProgram::Expr(ev) => ev.result_is_str(),
-    };
-    if !set_target_admits(tc, str_valued) {
-        return Err(GnitzSqlError::Bind(format!(
-            "cannot assign {} value to column '{}' ({tc:?})",
-            if str_valued { "a string" } else { "an integer" },
-            schema.columns[target].name,
-        )));
-    }
-    // A row-independent value is range-checked here, where the column has a name
-    // and no row has been read yet; a computed one can only be checked per row,
-    // in `append_column_value`, against the same `pack_pk_value` rule.
-    if let SetProgram::Const(ColumnValue::Int(v)) = &p {
-        if pack_pk_value(tc, *v).is_none() {
-            return Err(GnitzSqlError::Bind(format!(
-                "{tc:?} value out of range for column '{}': {v}",
-                schema.columns[target].name,
-            )));
-        }
-    }
-    Ok(p)
-}
-
-/// A SET right-hand side bound to the batch it will be read against: the
-/// computed arm is driven over the whole batch when this is built, where a
-/// per-row drive would pay `eval_batch`'s prologue for one row.
-pub(crate) enum SetValues<'a> {
-    Const(&'a ColumnValue),
-    /// A `TypeCode::String` payload slot of the batch it was bound against,
-    /// read verbatim.
-    StrCol {
-        batch: &'a ZSetBatch,
-        pi: usize,
-    },
-    Computed(ExprResults),
-}
-
-/// Bind `p` to `batch`, driving its computed arm over every row up front. The
-/// batch rides in the bound value, so a caller with two candidate scopes in scope
-/// at once cannot read a value back through the wrong one.
-pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, batch: &'a ZSetBatch) -> SetValues<'a> {
-    match p {
-        SetProgram::Const(cv) => SetValues::Const(cv),
-        SetProgram::StrCol(c) => SetValues::StrCol { batch, pi: *c },
-        SetProgram::Expr(ev) => SetValues::Computed(ev.eval_all(batch)),
-    }
-}
-
-/// Read one SET RHS for `row` of the batch `v` was bound against. Infallible:
-/// every *kind* rejection happened at [`classify_set_rhs`]. A computed value's
-/// range is the one verdict that cannot be reached until the value exists, so it
-/// is taken where the value is written (`append_column_value`).
-pub(crate) fn eval_set_value(v: &SetValues<'_>, row: usize) -> ColumnValue {
-    match v {
-        SetValues::Const(cv) => (*cv).clone(),
-        SetValues::StrCol { batch, pi } => {
-            if gnitz_wire::null_word_get(batch.nulls[row], *pi) {
-                ColumnValue::Null
-            } else {
-                let cell = &batch.payload[*pi].bytes[row * 16..row * 16 + 16];
-                ColumnValue::Str(gnitz_wire::german_string_content(cell, &batch.blob).to_vec())
-            }
-        }
-        // A `match` rather than `map_or`: this module builds at opt-level 0,
-        // where `map_or` plus a constructor-as-closure is two out-of-line calls
-        // moving a ~24-byte enum, and the match is free.
-        SetValues::Computed(ExprResults::Scalar(vals)) => match vals[row] {
-            None => ColumnValue::Null,
-            Some(x) => ColumnValue::Int(x as i128),
-        },
-        SetValues::Computed(ExprResults::Str { bytes, spans }) => match spans[row] {
-            None => ColumnValue::Null,
-            Some((o, l)) => ColumnValue::Str(bytes[o..o + l].to_vec()),
-        },
-    }
-}
-
-fn extract_assignment_col_name(assignment: &Assignment, clause: &str) -> Result<String, GnitzSqlError> {
-    match &assignment.target {
-        AssignmentTarget::ColumnName(obj_name) => extract_ident_name(obj_name, clause),
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "only simple column assignments supported in {clause}"
-        ))),
-    }
-}
-
-/// Resolve and validate one `col = expr` SET-list target — shared by UPDATE and
-/// ON CONFLICT DO UPDATE, which differ only in the RHS binding and the `clause`
-/// label used in messages. Extracts the column name, resolves it to a column
-/// index, rejects a PK target, and rejects a column already present in `seen`
-/// (recording it there on success so the next duplicate is caught). Both clauses
-/// enforce the same SQL rules: no PK writes, no duplicate columns.
-pub(crate) fn resolve_set_target(
-    assignment: &Assignment,
-    schema: &Schema,
-    seen: &mut Vec<usize>,
-    clause: &str,
-) -> Result<usize, GnitzSqlError> {
-    let col_name = extract_assignment_col_name(assignment, clause)?;
-    let col_idx = find_unique_column(&schema.columns, &col_name)?
-        .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in {clause}")))?;
-    if schema.is_pk_col(col_idx) {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "cannot assign to primary key column in {clause}"
-        )));
-    }
-    if seen.contains(&col_idx) {
-        return Err(GnitzSqlError::Bind(format!(
-            "multiple assignments to column '{col_name}' in {clause}"
-        )));
-    }
-    seen.push(col_idx);
-    Ok(col_idx)
-}
-
-/// [`build_merged_row`]'s row-invariant plan: each payload column's bitmap slot,
-/// physical index and definition, resolved once per statement — the caller
-/// hoists it out of its row loop, where `payload_columns` would re-scan
-/// `pk_cols` per column per row.
-pub(crate) fn merge_payload_plan(schema: &Schema) -> Vec<(usize, usize, &ColumnDef)> {
-    schema.payload_columns().collect()
-}
-
-/// Build one merged Z-set row into `dst`: PK from `(pk_src, pk_idx)`; null-bitmap
-/// seed and carried (unassigned) columns from `(carry_src, carry_idx)`. For each
-/// payload column, `resolve(ci)` returns `Some(value)` to write that value (and
-/// set/clear its null bit) or `None` to carry the column through unchanged from
-/// `carry_src`. Shared by UPDATE SET (pk_src == carry_src) and ON CONFLICT DO
-/// UPDATE (PK from the incoming row, carry/null-seed from the existing row).
-///
-/// `payload` is [`merge_payload_plan`], collected once by the caller.
-pub(crate) fn build_merged_row<F>(
-    pk_src: &ZSetBatch,
-    pk_idx: usize,
-    carry_src: &ZSetBatch,
-    carry_idx: usize,
-    payload: &[(usize, usize, &ColumnDef)],
-    dst: &mut ZSetBatch,
-    mut resolve: F,
-) -> Result<(), GnitzSqlError>
-where
-    F: FnMut(usize) -> Option<ColumnValue>,
-{
-    dst.pks.push_from(&pk_src.pks, pk_idx);
-    dst.weights.push(1);
-    // Seed from the carry source's null word; each assignment flips only its own
-    // payload bit (set on a NULL result, clear on non-NULL), unassigned bits ride.
-    let mut null_bits = carry_src.nulls[carry_idx];
-    for &(payload_idx, ci, col_def) in payload {
-        match resolve(ci) {
-            Some(cv) => {
-                // The NULL a SET produces at *run* time — an explicit `= NULL`, or
-                // NULL propagation through the compiled RHS — which
-                // `classify_set_rhs` cannot see.
-                let is_null = matches!(cv, ColumnValue::Null);
-                check_not_null(col_def, is_null)?;
-                gnitz_wire::null_word_set(&mut null_bits, payload_idx, is_null);
-                let ZSetBatch { payload: cols, blob, .. } = &mut *dst;
-                append_column_value(&mut cols[payload_idx].bytes, blob, cv, col_def.type_code)?;
-            }
-            None => dst.push_cell_from(payload_idx, carry_src, payload_idx, carry_idx),
-        }
-    }
-    dst.nulls.push(null_bits);
-    Ok(())
-}
-
-/// Write the SET-merged update row for every row of `current` into `dst` (each at
-/// weight +1). `current` is the matched set outright — the server applied the
-/// whole WHERE to the committed rows and `resolve_where_rows` filtered the
-/// buffered ones. The assignment index is built once and reused across rows — it
-/// depends only on `assignments` and `schema`, not the row — mirroring INSERT's
-/// `client_side_merge_do_update` loop.
-fn write_set_rows(
-    current: &ZSetBatch,
-    assignments: &[(usize, SetProgram)],
-    schema: &Schema,
-    dst: &mut ZSetBatch,
-) -> Result<(), GnitzSqlError> {
-    // Bound before the row loop, which then only reads a buffer — leaving
-    // `build_merged_row` and `append_column_value` row-major, so the order their
-    // errors are raised in is unchanged.
-    let bound: Vec<SetValues<'_>> = assignments.iter().map(|(_, p)| bind_set_program(p, current)).collect();
-    // Pre-index assignments by column for O(1) lookup per payload column
-    // (closes the prior O(cols²) per-row `assignments.iter().find`).
-    let mut asn_by_col: Vec<Option<&SetValues<'_>>> = vec![None; schema.columns.len()];
-    for ((ci, _), v) in assignments.iter().zip(&bound) {
-        asn_by_col[*ci] = Some(v);
-    }
-    let payload = merge_payload_plan(schema);
-    for row_idx in 0..current.len() {
-        build_merged_row(current, row_idx, current, row_idx, &payload, dst, |ci| {
-            asn_by_col[ci].map(|v| eval_set_value(v, row_idx))
-        })?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// WHERE resolution — one read for both verbs, under the sink each one needs
-// ---------------------------------------------------------------------------
-
-/// The rows a single-table UPDATE/DELETE `WHERE` (or its absence) resolves to,
-/// under `reply_schema`. Every row of the result matches, so the caller writes
-/// the whole batch — UPDATE reads it under the catalog schema (an identity sink)
-/// and merges the SET list into it; DELETE reads a PK-only reply and keeps its
-/// key region.
-///
-/// **Committed reply rows are final** — the server applied `bound ∧ predicate`,
-/// which together are the whole WHERE. Only the transaction's own buffered rows,
-/// which no server-side walk ever saw, are re-filtered here. So **in autocommit
-/// the reply IS the answer**, returned wholesale with no copy and no client-side
-/// predicate compiled at all.
-fn resolve_where_matches(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Schema,
-    plan: &AccessPlan<'_>,
-    sink: &ReadSink,
-    reply_schema: &Arc<Schema>,
-) -> Result<ZSetBatch, GnitzSqlError> {
-    let committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
-    // In autocommit there is no buffer to overlay, and `buffered_scope`'s gather
-    // can be megabytes of `PkBuf` for a large `pk IN (…)` — so ask only when a
-    // transaction is open, which is the condition its doc already states.
-    if !client.txn_active() {
-        return Ok(committed);
-    }
-    let (keys, preds) = plan.buffered_scope(schema);
-    let net = buffered_net(client, tid, keys.as_deref());
-    if net.is_empty() {
-        return Ok(committed);
-    }
-    let present = present_rows(&net, schema);
-    let matched = matching_indices(preds, &present, schema)?;
-
-    let n = committed.len() + matched.len();
-    let mut eff = ZSetBatch::with_capacity(reply_schema, n);
-    for i in 0..committed.len() {
-        // A PK the transaction has written is decided by its buffered version
-        // below, whatever the committed row said.
-        if !net.contains_key(committed.pks.get_bytes(i)) {
-            eff.copy_row_at(&committed, i, committed.weights[i]);
-        }
-    }
-    for i in matched {
-        // A buffered row carries the catalog layout. The reply is that layout
-        // (UPDATE) or the PK alone (DELETE), which takes the key and nothing else.
-        if eff.payload.is_empty() {
-            eff.pks.push_from(&present.pks, i);
-            eff.weights.push(present.weights[i]);
-            eff.nulls.push(0);
-        } else {
-            eff.copy_row_at(&present, i, present.weights[i]);
-        }
-    }
-    Ok(eff)
-}
-
-// ---------------------------------------------------------------------------
-// UPDATE
+// UPDATE / DELETE
 // ---------------------------------------------------------------------------
 
 pub(crate) fn execute_update(
     client: &mut GnitzClient,
-    update: &sqlparser::ast::Update,
+    update: &Update,
     binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_update_clauses(update)?;
-    let (table, assignments_raw, selection) = (&update.table, &update.assignments, &update.selection);
+    execute_mutation(
+        client,
+        binder,
+        "UPDATE",
+        std::slice::from_ref(&update.table),
+        update.selection.as_ref(),
+        Some(&update.assignments),
+    )
+}
 
-    // `Update.table` is a `TableWithJoins`: `UPDATE a JOIN b ON … SET v = 1`
-    // parses, and honoring only `.relation` would update every row of `a`.
-    let FromShape::SinglePlainRelation(factor) = classify_from(std::slice::from_ref(table)) else {
-        return Err(GnitzSqlError::Unsupported(
-            "UPDATE: exactly one simple FROM table required".to_string(),
-        ));
+pub(crate) fn execute_delete(
+    client: &mut GnitzClient,
+    del: &Delete,
+    binder: &Binder<'_>,
+) -> Result<SqlResult, GnitzSqlError> {
+    reject_unhonored_delete_clauses(del)?;
+    let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
+    execute_mutation(client, binder, "DELETE", from, del.selection.as_ref(), None)
+}
+
+/// A single-table UPDATE (`set` present) or DELETE: read the rows the WHERE
+/// matches, then write the rewritten rows or the retraction of their keys.
+fn execute_mutation(
+    client: &mut GnitzClient,
+    binder: &Binder<'_>,
+    verb: &str,
+    from: &[TableWithJoins],
+    selection: Option<&Expr>,
+    set: Option<&[Assignment]>,
+) -> Result<SqlResult, GnitzSqlError> {
+    // `UPDATE a JOIN b ON … SET v = 1` parses; honoring only the relation would
+    // update all of `a`.
+    let FromShape::SinglePlainRelation(factor) = classify_from(from) else {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{verb}: exactly one simple FROM table required"
+        )));
     };
-    let (table_name, table_alias) = extract_table_name_and_alias(factor, binder.schema_name(), "UPDATE")?;
-
-    let target = binder.resolve_base_table(client, &table_name, "UPDATE")?;
-    let (table_id, schema) = (target.tid, &target.schema);
-
-    // Bind SET assignments; reject PK writes and duplicate columns.
-    let mut assignments: Vec<(usize, BoundExpr)> = Vec::new();
-    let mut seen: Vec<usize> = Vec::with_capacity(assignments_raw.len());
-    for assignment in assignments_raw {
-        let col_idx = resolve_set_target(assignment, schema, &mut seen, "UPDATE SET")?;
-        assignments.push((col_idx, bind_single_table(&assignment.value, schema, &table_alias)?));
-    }
-
-    // Compile the SET list against the catalog schema — the one the RHS was bound
-    // against, and the one the rows come back under, since the identity sink
-    // replies in the source shape. Resolution bakes in payload slots, PK byte
-    // offsets, type codes and the nullability verdict.
-    //
-    // Ahead of the read, not inside it: an un-compilable RHS (`SET int_col =
-    // float_col`) or an out-of-range constant errors deterministically, never
-    // only when at least one row matched.
-    let programs = assignments
-        .iter()
-        .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, schema)?)))
-        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-
-    let where_expr = bind_where(schema, &table_alias, selection.as_ref())?;
-    let plan = bound_and_predicate(schema, &where_expr, ReadBudget::MayChunk, &target.indexes)?;
-    let sink = ReadSink::all_rows();
-
-    // Read the target rows and build the SET batch under the RMW driver: an
-    // autocommit UPDATE commits it lose-update-free via a one-precondition TXN
-    // frame with bounded retry; inside a transaction it buffers and records the
-    // read-set. The build re-runs per retry so a conflict re-reads fresh state.
-    let count = commit_rmw_or_buffer(client, &table_name, table_id, schema, |client| {
-        let matched = resolve_where_matches(client, table_id, schema, &plan, &sink, schema)?;
-        let count = matched.len();
-        let write = if count > 0 {
-            let mut updates = ZSetBatch::with_capacity(schema, count);
-            write_set_rows(&matched, &programs, schema, &mut updates)?;
-            Some(RmwWrite {
-                batch: updates,
-                mode: WireConflictMode::Update,
+    let (table_name, alias) = extract_table_name_and_alias(factor, binder.schema_name(), verb)?;
+    let target = binder.resolve_base_table(client, &table_name, verb)?;
+    let (tid, schema) = (target.tid, &target.schema);
+    // Before the read, so a bad SET list errors whether or not a row matches.
+    let set = set
+        .map(|raw| {
+            bind_set_list(raw, schema, "UPDATE SET", |e, ci| {
+                classify_set_rhs(&bind_single_table(e, schema, &alias)?, Scope::Existing, ci, schema)
             })
-        } else {
-            None
-        };
-        Ok(RmwBuild { count, write })
+        })
+        .transpose()?;
+    let where_expr = bind_where(schema, &alias, selection)?;
+    let plan = bound_and_predicate(schema, &where_expr, ReadBudget::MayChunk, &target.indexes)?;
+    // UPDATE reads whole rows; DELETE the source PK alone, with no blob heap.
+    let (reply_schema, sink) = if set.is_some() {
+        (Arc::clone(schema), ReadSink::all_rows())
+    } else {
+        let (reply, sink, _) = rows_sink(&[], None, schema, &alias, 0)?;
+        (reply, sink)
+    };
+    // The build re-runs per RMW retry, so a conflict re-reads fresh state. Both
+    // writes are built under the catalog schema, so an in-transaction DELETE
+    // buffers in the layout an INSERT does.
+    let count = commit_rmw_or_buffer(client, &table_name, tid, schema, |client| {
+        let (mut rows, buffered) = resolve_where_matches(client, tid, schema, &plan, &sink, &reply_schema)?;
+        Ok(match &set {
+            Some(set) => {
+                rows.extend_from_owned(buffered);
+                apply_set(set, rows, None, schema)?
+            }
+            None => {
+                let mut out = retraction_batch(schema, rows.pks);
+                out.extend_from_owned(retraction_batch(schema, buffered.pks));
+                out
+            }
+        })
     })?;
     Ok(SqlResult::RowsAffected { count })
 }
 
 // ---------------------------------------------------------------------------
-// DELETE
+// The SET list (shared with INSERT's ON CONFLICT DO UPDATE)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn execute_delete(
-    client: &mut GnitzClient,
-    del: &sqlparser::ast::Delete,
-    binder: &Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    reject_unhonored_delete_clauses(del)?;
-    let tables = match &del.from {
-        FromTable::WithFromKeyword(ts) | FromTable::WithoutKeyword(ts) => ts,
-    };
-    let FromShape::SinglePlainRelation(factor) = classify_from(tables) else {
-        return Err(GnitzSqlError::Unsupported(
-            "DELETE: exactly one simple FROM table required".to_string(),
-        ));
-    };
-    let (table_name, table_alias) = extract_table_name_and_alias(factor, binder.schema_name(), "DELETE")?;
+/// Which row a SET right-hand side reads: the row being rewritten, or (ON
+/// CONFLICT DO UPDATE) the incoming VALUES row that collided with it.
+#[derive(Clone, Copy)]
+pub(crate) enum Scope {
+    Existing,
+    Excluded,
+}
 
-    let target = binder.resolve_base_table(client, &table_name, "DELETE")?;
-    let (table_id, schema) = (target.tid, &target.schema);
+pub(crate) struct SetCol {
+    ci: usize,
+    rhs: SetRhs,
+}
 
-    let where_expr = bind_where(schema, &table_alias, del.selection.as_ref())?;
-    let plan = bound_and_predicate(schema, &where_expr, ReadBudget::MayChunk, &target.indexes)?;
-    // An empty projection is the source PK alone: the key region, no blob heap.
-    let (reply_schema, sink, _) = rows_sink(&[], None, schema, &table_alias, 0)?;
+pub(crate) enum SetRhs {
+    /// A literal, encoded once by INSERT's cell encoder into one target cell (a
+    /// string's spill in `spill`).
+    Const { cell: Vec<u8>, spill: Vec<u8>, null: bool },
+    /// Payload slot `src` of the scope's row, of exactly the target's column type.
+    Copy { scope: Scope, src: usize },
+    /// A computed value.
+    Expr { scope: Scope, ev: Box<Evaluator> },
+}
 
-    // Resolve the target PKs and build the retraction batch under the RMW driver
-    // (autocommit: one-precondition TXN frame with bounded retry; in a
-    // transaction: buffer + record the read-set). The build re-runs per retry.
-    //
-    // The retraction is built under the CATALOG schema, whose payload slots
-    // `retraction_batch` zero-fills, so an in-transaction DELETE buffers in the
-    // same layout an INSERT does (`TxnBuffer` appends a tid's later batches to
-    // its family only when their payload layouts are equal).
-    let count = commit_rmw_or_buffer(client, &table_name, table_id, schema, |client| {
-        let matched = resolve_where_matches(client, table_id, schema, &plan, &sink, &reply_schema)?;
-        let pks = matched.pks;
-        let count = pks.len();
-        let write = (count > 0).then(|| RmwWrite {
-            batch: retraction_batch(schema, pks),
-            mode: WireConflictMode::Update,
+/// Each target is one plain identifier naming a non-PK column not already
+/// assigned; `rhs` compiles the value for column `ci`.
+pub(crate) fn bind_set_list(
+    raw: &[Assignment],
+    schema: &Schema,
+    clause: &str,
+    mut rhs: impl FnMut(&Expr, usize) -> Result<SetRhs, GnitzSqlError>,
+) -> Result<Vec<SetCol>, GnitzSqlError> {
+    let mut set: Vec<SetCol> = Vec::with_capacity(raw.len());
+    for a in raw {
+        let name = match &a.target {
+            AssignmentTarget::ColumnName(name) => single_part_ident(name),
+            _ => None,
+        }
+        .ok_or_else(|| GnitzSqlError::Plan(format!("{clause}: column must be a simple identifier")))?;
+        let ci = find_unique_column(&schema.columns, name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in {clause}")))?;
+        if schema.is_pk_col(ci) {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "cannot assign to primary key column in {clause}"
+            )));
+        }
+        if set.iter().any(|s| s.ci == ci) {
+            return Err(GnitzSqlError::Bind(format!(
+                "multiple assignments to column '{name}' in {clause}"
+            )));
+        }
+        set.push(SetCol { ci, rhs: rhs(&a.value, ci)? });
+    }
+    Ok(set)
+}
+
+/// Compile one SET right-hand side for column `target`, against the schema the
+/// rows it reads carry. Every kind rejection happens here, before any row is
+/// read; a computed value's range and a NULL into a NOT NULL column are the
+/// verdicts [`apply_set`] takes per row.
+pub(crate) fn classify_set_rhs(
+    expr: &BoundExpr,
+    scope: Scope,
+    target: usize,
+    schema: &Schema,
+) -> Result<SetRhs, GnitzSqlError> {
+    let col = &schema.columns[target];
+    let ty = col.ty();
+    if let Some(c) = literal_constant(expr) {
+        let (mut cell, mut spill) = (Vec::new(), Vec::new());
+        append_value_to_col(&mut cell, &mut spill, ty, &c)?;
+        return Ok(SetRhs::Const {
+            cell,
+            spill,
+            null: matches!(expr, BoundExpr::LitNull),
         });
-        Ok(RmwBuild { count, write })
-    })?;
-    Ok(SqlResult::RowsAffected { count })
+    }
+    let src = expr.infer_ty(&schema.columns);
+    if let BoundExpr::ColRef(c) = expr {
+        if src == ty && !schema.is_pk_col(*c) {
+            return Ok(SetRhs::Copy { scope, src: schema.payload_idx(*c) });
+        }
+    }
+    // A DECIMAL source into a non-DECIMAL target casts to I64, not the target, so
+    // a narrow target's range is checked per row rather than NULLed by the cast.
+    let cast_to = if ty.is_decimal() {
+        (src != ty).then_some(ty)
+    } else if src.is_decimal() {
+        Some(ColType::of(TypeCode::I64))
+    } else if src.tc.is_temporal() && ty.tc.is_temporal() && src.tc != ty.tc {
+        Some(ty)
+    } else {
+        None
+    };
+    let expr = match cast_to {
+        Some(to) => BoundExpr::Cast { expr: Box::new(expr.clone()), to },
+        // An f64 register has no computed destination: nothing downstream can
+        // tell its bit pattern from an integer's.
+        None if src.tc.is_float() => {
+            return Err(GnitzSqlError::Unsupported(
+                "SET from a floating-point expression is not supported".to_string(),
+            ))
+        }
+        None => expr.clone(),
+    };
+    let ev = compile_scalar_evaluator(&expr, schema)?;
+    let str_valued = ev.result_is_str();
+    let admits = if str_valued {
+        col.type_code == TypeCode::String
+    } else {
+        FixedInt::from_type_code(col.type_code).is_some()
+    };
+    if !admits {
+        return Err(GnitzSqlError::Bind(format!(
+            "cannot assign {} value to column '{}' ({:?})",
+            if str_valued { "a string" } else { "an integer" },
+            col.name,
+            col.type_code,
+        )));
+    }
+    Ok(SetRhs::Expr { scope, ev: Box::new(ev) })
+}
+
+/// `expr` as the constant an INSERT cell binds. A `Constant` carries a wide
+/// literal's sign in `negated`; the binder folds it into the `NumLit`, so it is
+/// split back out.
+fn literal_constant(expr: &BoundExpr) -> Option<Constant> {
+    Some(match expr {
+        BoundExpr::LitWide(n) => Constant {
+            lit: BExpr::LitWide(NumLit { mag: n.mag, neg: false }),
+            negated: n.neg,
+        },
+        BoundExpr::LitInt(_)
+        | BoundExpr::LitFloat { .. }
+        | BoundExpr::LitStr(_)
+        | BoundExpr::LitTemporal { .. }
+        | BoundExpr::LitNull => Constant {
+            lit: expr.try_rebuild::<Infallible, ()>(&mut |_| Err(())).ok()?,
+            negated: false,
+        },
+        _ => return None,
+    })
+}
+
+/// `rows` with every assigned column rewritten and every row at weight +1. Every
+/// right-hand side reads the rows as they were. `excluded` holds the incoming
+/// VALUES rows aligned with `rows` (ON CONFLICT DO UPDATE only).
+///
+/// Rewritten columns are built in `new` and swapped in. Assigning a string column
+/// also rebuilds every other string column into `new`, whose arena then replaces
+/// `rows`'; otherwise nothing is encoded and `rows`' arena is kept.
+pub(crate) fn apply_set(
+    set: &[SetCol],
+    mut rows: ZSetBatch,
+    excluded: Option<&ZSetBatch>,
+    schema: &Schema,
+) -> Result<ZSetBatch, GnitzSqlError> {
+    let n = rows.len();
+    let rebuild = set
+        .iter()
+        .any(|a| is_german_string(schema.columns[a.ci].type_code as u8));
+    let mut new = ZSetBatch::new(schema);
+    let mut nulls = rows.nulls.clone();
+    for a in set {
+        let def = &schema.columns[a.ci];
+        let (pi, tc) = (schema.payload_idx(a.ci), def.type_code);
+        let scoped = |s: Scope| match s {
+            Scope::Existing => &rows,
+            Scope::Excluded => excluded.expect("only ON CONFLICT DO UPDATE binds EXCLUDED"),
+        };
+        new.payload[pi].bytes.reserve_exact(n * tc.wire_stride());
+        match &a.rhs {
+            SetRhs::Const { cell, spill, null } => {
+                let ZSetBatch { payload, blob, .. } = &mut new;
+                // One spill for every row's cell.
+                let cell = if is_german_string(tc as u8) {
+                    encode_german_string(german_string_content(cell, spill), blob).to_vec()
+                } else {
+                    cell.clone()
+                };
+                for w in &mut nulls {
+                    set_null(w, pi, *null, def)?;
+                    payload[pi].bytes.extend_from_slice(&cell);
+                }
+            }
+            SetRhs::Copy { scope, src } => {
+                let b = scoped(*scope);
+                for (r, w) in nulls.iter_mut().enumerate() {
+                    set_null(w, pi, null_word_get(b.nulls[r], *src), def)?;
+                    new.push_cell_from(pi, b, *src, r);
+                }
+            }
+            SetRhs::Expr { scope, ev } => {
+                let ZSetBatch { payload, blob, .. } = &mut new;
+                match ev.eval_all(scoped(*scope)) {
+                    ExprResults::Scalar(vals) => {
+                        let unsigned = ev.result_is_u64();
+                        for (w, v) in nulls.iter_mut().zip(vals) {
+                            set_null(w, pi, v.is_none(), def)?;
+                            let v = v.map_or(0, |x| if unsigned { i128::from(x as u64) } else { i128::from(x) });
+                            let packed = pack_pk_value(tc, v)
+                                .ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {v}")))?;
+                            payload[pi]
+                                .bytes
+                                .extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
+                        }
+                    }
+                    ExprResults::Str { bytes, spans } => {
+                        for (w, span) in nulls.iter_mut().zip(spans) {
+                            set_null(w, pi, span.is_none(), def)?;
+                            let content = span.map_or(&[][..], |(o, l)| &bytes[o..o + l]);
+                            payload[pi]
+                                .bytes
+                                .extend_from_slice(&encode_german_string(content, blob));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if rebuild {
+        for (pi, ci, def) in schema.payload_columns() {
+            if is_german_string(def.type_code as u8) && !set.iter().any(|a| a.ci == ci) {
+                for r in 0..n {
+                    new.push_cell_from(pi, &rows, pi, r);
+                }
+            }
+        }
+        rows.blob = std::mem::take(&mut new.blob);
+    }
+    for (pi, ci, def) in schema.payload_columns() {
+        if set.iter().any(|a| a.ci == ci) || (rebuild && is_german_string(def.type_code as u8)) {
+            std::mem::swap(&mut rows.payload[pi], &mut new.payload[pi]);
+        }
+    }
+    rows.nulls = nulls;
+    rows.weights.fill(1);
+    Ok(rows)
+}
+
+fn set_null(word: &mut u64, pi: usize, null: bool, def: &ColumnDef) -> Result<(), GnitzSqlError> {
+    check_not_null(def, null)?;
+    null_word_set(word, pi, null);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

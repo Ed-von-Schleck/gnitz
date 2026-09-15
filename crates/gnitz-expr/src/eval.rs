@@ -236,6 +236,12 @@ impl Evaluator {
         self.prog.result_is_str()
     }
 
+    /// Whether a [`ExprResults::Scalar`] value is a `u64` bit pattern rather than
+    /// an `i64`: the resolve-time U64 tracking of the result register.
+    pub fn result_is_u64(&self) -> bool {
+        self.prog.result_is_u64()
+    }
+
     /// Move this evaluator onto the nullable arm, rebuilding the scratch — which
     /// [`EvalScratch::new`] sizes for one arm, so flipping the flag alone would
     /// leave the null buffers unallocated. Behind `test_support::both_arms`.

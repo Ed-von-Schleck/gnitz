@@ -19,7 +19,7 @@ use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use crate::tail::parse_order_by;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
-use gnitz_wire::{IndexWalk, ReadBound, ReadSink, ReadSpec, SinkKind};
+use gnitz_wire::{IndexWalk, PkKeys, ReadBound, ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, SelectItem};
 
 // ---------------------------------------------------------------------------
@@ -122,8 +122,8 @@ impl<'e> AccessPlan<'e> {
     }
 
     /// What a DML verb must do about the transaction's own buffered rows, which
-    /// no server-side walk ever saw: the key set to restrict them to (`None` =
-    /// every PK the transaction touched), and the conjuncts to re-impose on them.
+    /// no server-side walk ever saw: the keys to restrict them to, and the
+    /// conjuncts to re-impose on them.
     ///
     /// The two travel together because they are one decision. A bound naming an
     /// **exact key set** — a `PkSet` gather, or a `PkRange` pinning *every* PK
@@ -132,21 +132,27 @@ impl<'e> AccessPlan<'e> {
     /// access recognizers consume (a wide PK literal, a U128 equality) reaches the
     /// expression VM. Any looser bound — a PK *prefix* point names a key group,
     /// not a key — restricts nothing, so the FULL WHERE applies.
-    ///
-    /// The keys are derived here rather than at plan time: only a DML statement
-    /// inside an open transaction asks, and a max-size gather is megabytes of
-    /// `PkBuf`.
-    pub(crate) fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkBuf>>, &[&'e BoundExpr]) {
+    pub(crate) fn buffered_scope(&self, schema: &Schema) -> (BufferedKeys<'_>, &[&'e BoundExpr]) {
         let keys = match &self.access.bound {
-            ReadBound::PkSet(keys) => Some(keys.iter().map(PkBuf::from_bytes).collect()),
-            ReadBound::PkRange(desc) => pk_point_tuple(desc, schema).map(|k| vec![k]),
-            _ => None,
+            ReadBound::PkSet(keys) => BufferedKeys::Keys(keys),
+            ReadBound::PkRange(desc) => pk_point_tuple(desc, schema).map_or(BufferedKeys::All, BufferedKeys::Point),
+            _ => BufferedKeys::All,
         };
         match keys {
-            Some(keys) => (Some(keys), &self.residual),
-            None => (None, &self.all),
+            BufferedKeys::All => (keys, &self.all),
+            _ => (keys, &self.residual),
         }
     }
+}
+
+/// The PKs a plan restricts the transaction's buffered rows to.
+pub(crate) enum BufferedKeys<'a> {
+    /// A `PkSet` gather's keys.
+    Keys(&'a PkKeys),
+    /// A `PkRange` pinning every PK column.
+    Point(PkBuf),
+    /// Every PK the transaction touched.
+    All,
 }
 
 /// Bind a single-table `WHERE` (or its absence) for [`bound_and_predicate`], as

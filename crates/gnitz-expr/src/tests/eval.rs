@@ -1225,3 +1225,57 @@ fn eval_all_reports_one_result_per_row_in_its_own_class() {
         );
     }
 }
+
+/// `result_is_u64` reports the result register's resolve-time U64 tracking: a
+/// U64 load and arithmetic over one are unsigned; a signed load, a comparison and
+/// a cast to a signed type are not.
+#[test]
+fn result_is_u64_follows_the_result_register() {
+    use gnitz_wire::FixedInt;
+    let schema = TestSchema::new(
+        &[(type_code::U64, false), (type_code::U64, true), (type_code::I64, true)],
+        &[0],
+    );
+    let u64_plus_one = |last: LogicalInstr| {
+        vec![
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadConst { val: 1 },
+            last,
+        ]
+    };
+    for (label, instrs, result, want) in [
+        ("u64 load", vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0), true),
+        (
+            "u64 + 1",
+            u64_plus_one(LogicalInstr::IntArith {
+                op: IntArithOp::Add,
+                a: Reg(0),
+                b: Reg(1),
+            }),
+            Reg(2),
+            true,
+        ),
+        ("i64 load", vec![LogicalInstr::LoadColInt { col: 2 }], Reg(0), false),
+        (
+            "u64 > 1",
+            u64_plus_one(LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }),
+            Reg(2),
+            false,
+        ),
+        (
+            "CAST(u64 AS BIGINT)",
+            vec![
+                LogicalInstr::LoadColInt { col: 1 },
+                LogicalInstr::IntCast { a: Reg(0), fi: FixedInt::I64 },
+            ],
+            Reg(1),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            scalar_prog(&schema, instrs, result, vec![]).result_is_u64(),
+            want,
+            "{label}"
+        );
+    }
+}

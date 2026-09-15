@@ -1,36 +1,16 @@
-//! Column value encoding: SQL literal / computed value → one §6 region cell.
+//! Column value encoding: SQL literal → one §6 region cell.
 //!
-//! Two write paths share this module. INSERT appends written constants
-//! (`append_value_to_col`); SET / `ON CONFLICT DO UPDATE` append computed
-//! values (`append_column_value`). Both range-check against the column's type
-//! and reject an out-of-range value through the same `pk_codec` packer, so `300`
-//! means the same thing whichever verb writes it.
-//!
-//! Their admissible domains differ asymmetrically: [`set_target_admits`] limits
-//! SET to `FixedInt ∪ String`, so INSERT can write a float, a UUID or a
-//! `DECIMAL(38,0)` value that SET refuses; nothing SET admits is refused here.
+//! One encoder, [`append_value_to_col`], writes both an INSERT cell and a SET
+//! literal, so `300` means the same thing whichever verb writes it; and
+//! [`check_not_null`] is the NOT NULL verdict both DML write paths take.
 
 use crate::ast_util::Constant;
-use crate::codec::pk_codec::{pack_pk_value, KeyLitError};
+use crate::codec::pk_codec::KeyLitError;
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
-use gnitz_core::{push_zero_cell, ColType, ColumnDef, FixedInt, TypeCode};
+use gnitz_core::{push_zero_cell, ColType, ColumnDef, TypeCode};
 
-/// A computed SET / `DO UPDATE` value.
-///
-/// `Int` is `i128` rather than `i64` because a SET target may be `U64`, whose
-/// upper half no `i64` spells: a literal above `i64::MAX` binds as a wide
-/// literal and is parsed against the target's type code before it gets here.
-/// Every SET-admissible integer type is ≤ 8 bytes ([`set_target_admits`] gates
-/// on `FixedInt`), so `i128` covers the whole domain with room for the sign.
-#[derive(Clone)]
-pub(crate) enum ColumnValue {
-    Int(i128),
-    Str(Vec<u8>),
-    Null,
-}
-
-/// Append one INSERT constant to column region `col`, spilling a string into
+/// Append one written constant to column region `col`, spilling a string into
 /// `blob`. Dispatch is on the *column type*, never on the literal: `'5'` into an
 /// F64 column is `5.0` and `5` into a UUID column is the decimal spelling.
 pub(crate) fn append_value_to_col(
@@ -79,7 +59,10 @@ pub(crate) fn append_value_to_col(
         _ => {
             let packed = c.key_packed(ty).map_err(|e| {
                 GnitzSqlError::Bind(match e {
-                    KeyLitError::NotNumeric => "string literal for non-string column".to_string(),
+                    KeyLitError::NotNumeric if matches!(c.lit, BExpr::LitStr(_)) => {
+                        "string literal for non-string column".to_string()
+                    }
+                    KeyLitError::NotNumeric => format!("{c} is not a {ty} value"),
                     KeyLitError::NotOfType => format!("invalid {} literal: {c}", tc.wire_name()),
                     KeyLitError::NegativeIntoUnsigned | KeyLitError::OutOfRange => {
                         format!("{ty} value out of range: {c}")
@@ -120,47 +103,6 @@ pub(crate) fn check_not_null(col_def: &ColumnDef, is_null: bool) -> Result<(), G
             "NULL value in column '{}' violates NOT NULL",
             col_def.name
         )));
-    }
-    Ok(())
-}
-
-/// Which column types a SET value of each kind may target — the rule
-/// [`append_column_value`] enforces, stated once so the SET compiler can apply
-/// it before any row is fetched instead of only when one matched. `NULL` is
-/// admissible everywhere and needs no entry.
-pub(crate) fn set_target_admits(tc: TypeCode, str_valued: bool) -> bool {
-    if str_valued {
-        tc == TypeCode::String
-    } else {
-        FixedInt::from_type_code(tc).is_some()
-    }
-}
-
-/// Append one computed SET / `DO UPDATE` value to column region `col`, spilling
-/// a string into `blob`.
-pub(crate) fn append_column_value(
-    col: &mut Vec<u8>,
-    blob: &mut Vec<u8>,
-    cv: ColumnValue,
-    tc: TypeCode,
-) -> Result<(), GnitzSqlError> {
-    // `classify_set_rhs` settles the kind match per statement, where it can name
-    // the column; this is the same rule restated where the two `unreachable!`s
-    // below rely on it, and is unreachable in a well-formed compile.
-    debug_assert!(
-        matches!(cv, ColumnValue::Null) || set_target_admits(tc, matches!(cv, ColumnValue::Str(_))),
-        "SET value kind must be settled by classify_set_rhs, not here ({tc:?})"
-    );
-    match cv {
-        ColumnValue::Null => push_zero_cell(col, tc),
-        // Range-checked and packed by the same `pk_codec` rule INSERT uses: an
-        // out-of-range value declines rather than wrapping to its low bits.
-        ColumnValue::Int(i) => {
-            let packed =
-                pack_pk_value(tc, i).ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {i}")))?;
-            col.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
-        }
-        ColumnValue::Str(s) => col.extend_from_slice(&gnitz_wire::encode_german_string(&s, blob)),
     }
     Ok(())
 }

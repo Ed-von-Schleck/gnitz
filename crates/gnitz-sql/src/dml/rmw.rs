@@ -15,23 +15,7 @@
 //!   per-statement retry (the buffered reads are stale by definition).
 
 use crate::error::GnitzSqlError;
-use gnitz_core::{ClientError, GnitzClient, Schema, WireConflictMode, ZSetBatch};
-
-/// The write an RMW statement produces after reading: the batch and the conflict
-/// mode. It is always pushed against the table's catalog schema, which
-/// [`commit_rmw_or_buffer`] takes once rather than each build attempt cloning it.
-pub(crate) struct RmwWrite {
-    pub batch: ZSetBatch,
-    pub mode: WireConflictMode,
-}
-
-/// One build attempt's result: the SQL-reported affected-row `count`, and the
-/// `write` to commit — `None` for a zero-row mutation, which ships nothing (the
-/// engine rejects an empty family batch, so it is short-circuited client-side).
-pub(crate) struct RmwBuild {
-    pub count: usize,
-    pub write: Option<RmwWrite>,
-}
+use gnitz_core::{ClientError, GnitzClient, Schema, ZSetBatch};
 
 /// Max autocommit RMW attempts before the conflict is surfaced to the caller for
 /// its own (application-level) retry. Forward progress each attempt comes from
@@ -39,10 +23,11 @@ pub(crate) struct RmwBuild {
 const RMW_MAX_ATTEMPTS: usize = 4;
 
 /// Commit an autocommit RMW with bounded OCC retry, or buffer it into the open
-/// transaction. `build` re-reads the target and produces the write; it is re-run
-/// on every retry (a conflict means the read was stale). Returns the affected-row
-/// count. `tid` / `table_name` identify the single table the statement writes
-/// (DML is single-table); `table_name` names the conflict if the bound exhausts.
+/// transaction. `build` re-reads the target and produces the batch to write under
+/// the table's catalog `schema`; it is re-run on every retry (a conflict means the
+/// read was stale). Returns the written batch's row count. `tid` / `table_name`
+/// identify the single table the statement writes (DML is single-table);
+/// `table_name` names the conflict if the bound exhausts.
 pub(crate) fn commit_rmw_or_buffer<F>(
     client: &mut GnitzClient,
     table_name: &str,
@@ -51,15 +36,15 @@ pub(crate) fn commit_rmw_or_buffer<F>(
     mut build: F,
 ) -> Result<usize, GnitzSqlError>
 where
-    F: FnMut(&mut GnitzClient) -> Result<RmwBuild, GnitzSqlError>,
+    F: FnMut(&mut GnitzClient) -> Result<ZSetBatch, GnitzSqlError>,
 {
-    // Transaction: build once, buffer the write, record `tid` in the read-set. A
-    // zero-row build buffers nothing and records nothing, so the read-set stays a
-    // subset of the buffered-write (family) tids.
+    // An empty build buffers and records nothing, so the read-set stays a subset
+    // of the family tids.
     if client.txn_active() {
-        let RmwBuild { count, write } = build(client)?;
-        if let Some(w) = write {
-            client.txn_push_rmw(tid, schema, w.batch, w.mode);
+        let batch = build(client)?;
+        let count = batch.len();
+        if count > 0 {
+            client.txn_push_rmw(tid, schema, batch);
         }
         return Ok(count);
     }
@@ -69,12 +54,13 @@ where
     // and deterministically re-conflict).
     let mut basis = client.last_seen_lsn();
     for _ in 0..RMW_MAX_ATTEMPTS {
-        let RmwBuild { count, write } = build(client)?;
-        let Some(w) = write else {
-            return Ok(count);
-        };
-        match client.commit_rmw(tid, schema, &w.batch, w.mode, basis) {
-            Ok(_lsn) => return Ok(count),
+        let batch = build(client)?;
+        // The engine rejects an empty family batch.
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        match client.commit_rmw(tid, schema, &batch, basis) {
+            Ok(_lsn) => return Ok(batch.len()),
             Err(ClientError::TxnConflict { fresh_basis }) => basis = fresh_basis,
             Err(e) => return Err(GnitzSqlError::Exec(e)),
         }

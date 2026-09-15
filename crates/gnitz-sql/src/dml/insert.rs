@@ -1,30 +1,28 @@
 //! INSERT, including the `ON CONFLICT` upsert family. The default form pushes
 //! with `WireConflictMode::Error`; `DO NOTHING` / `DO UPDATE` are resolved
 //! client-side (seek existing PKs, then filter or merge) before a single push.
-//! The SET-list binding and evaluation reuse `mutate`'s shared helpers so a
-//! `DO UPDATE SET` assignment behaves exactly like an `UPDATE ... SET`.
+//! `DO UPDATE SET` binds, compiles and applies its list through `mutate`'s SET
+//! list (`bind_set_list`, `classify_set_rhs`, `apply_set`), so it behaves exactly
+//! like an `UPDATE ... SET`.
 
 use std::sync::Arc;
 
-use crate::ast_util::{bind_constant, extract_object_name, Constant};
+use crate::ast_util::{bind_constant, extract_object_name, single_part_ident, Constant};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::PkPlan;
-use crate::dml::mutate::{
-    bind_set_program, build_merged_row, classify_set_rhs, eval_set_value, merge_payload_plan, resolve_set_target,
-    SetProgram, SetValues,
-};
+use crate::dml::mutate::{apply_set, bind_set_list, classify_set_rhs, Scope, SetCol, SetRhs};
 use crate::dml::overlay::{effective_rows, Conflict};
-use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
+use crate::dml::rmw::commit_rmw_or_buffer;
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{project, resolve_projection};
 use crate::ir::{BExpr, BoundExpr};
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{ColumnDef, GnitzClient, RelClass, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{GnitzClient, RelClass, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
-    Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
-    SetExpr, TableObject, Values,
+    ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
+    TableObject, Values,
 };
 
 /// The resolved INSERT disposition after the ON CONFLICT clause (if any) is bound.
@@ -36,17 +34,7 @@ enum ConflictPlan {
     /// `ON CONFLICT ... DO NOTHING`: filter the conflicting rows out, push the rest.
     DoNothing,
     /// `ON CONFLICT ... DO UPDATE SET ...`: merge each conflicting row, push all.
-    DoUpdate {
-        assignments: Vec<(usize, SetProgram, Scope)>,
-    },
-}
-
-/// Which row a `DO UPDATE SET` right-hand side reads. `EXCLUDED.col` is the only
-/// construct that escapes the existing-row scope.
-#[derive(Clone, Copy)]
-enum Scope {
-    Existing,
-    Excluded,
+    DoUpdate { set: Vec<SetCol> },
 }
 
 /// A conflict target must name exactly the primary key — in any order, as
@@ -112,14 +100,8 @@ fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape,
         return Ok(RowShape { slot_of, expected, serial_ci });
     }
     for (k, name) in columns.iter().enumerate() {
-        // One part only: `INSERT INTO t (t.a)` is rejected, not truncated to `a`.
-        let ident = match &name.0[..] {
-            [part] => part.as_ident(),
-            _ => None,
-        }
-        .ok_or_else(|| GnitzSqlError::Plan("INSERT column list: column must be a simple identifier".into()))?
-        .value
-        .as_str();
+        let ident = single_part_ident(name)
+            .ok_or_else(|| GnitzSqlError::Plan("INSERT column list: column must be a simple identifier".into()))?;
         let ci = find_unique_column(&schema.columns, ident)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("column '{ident}' not found in the INSERT column list")))?;
         if schema.columns[ci].is_serial {
@@ -201,8 +183,10 @@ pub(crate) fn execute_insert(
                             "ON CONFLICT ... DO UPDATE WHERE not supported".to_string(),
                         ));
                     }
-                    let assignments = bind_do_update_assignments(&do_update.assignments, schema, &table_name_str)?;
-                    ConflictPlan::DoUpdate { assignments }
+                    let set = bind_set_list(&do_update.assignments, schema, "ON CONFLICT DO UPDATE SET", |e, ci| {
+                        bind_do_update_rhs(e, ci, schema, &table_name_str)
+                    })?;
+                    ConflictPlan::DoUpdate { set }
                 }
             }
         }
@@ -220,7 +204,7 @@ pub(crate) fn execute_insert(
     let RowShape { slot_of, expected, serial_ci } = insert_row_shape(&insert.columns, schema)?;
     // Built once: `payload_columns` filters on `is_pk_col`, itself a PK-list scan,
     // so leaving it in the row loop pays that scan per row per column.
-    let payload = merge_payload_plan(schema);
+    let payload: Vec<_> = schema.payload_columns().collect();
     // One bound cell per VALUES slot, reused across rows and read by both
     // consumers below, so a row's PK slot and payload slot cannot disagree on
     // what a written constant is.
@@ -328,69 +312,36 @@ pub(crate) fn execute_insert(
             }
         }
         ConflictPlan::DoNothing => {
-            // `Update`, not `Error`: the RMW driver's OCC precondition is what
-            // settles a stale filter, where `Error` would raise a duplicate-key
+            // The RMW driver pushes `Update`, not `Error`: its OCC precondition is
+            // what settles a stale filter, where `Error` would raise a duplicate-key
             // error out of a statement spelled "do nothing".
             let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
-                let filtered = client_side_filter_do_nothing(client, tid, schema, &batch)?;
-                let count = filtered.len();
-                let write = (!filtered.pks.is_empty()).then_some(RmwWrite {
-                    batch: filtered,
-                    mode: WireConflictMode::Update,
-                });
-                Ok(RmwBuild { count, write })
+                client_side_filter_do_nothing(client, tid, schema, &batch)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
-        ConflictPlan::DoUpdate { assignments } => {
+        ConflictPlan::DoUpdate { set } => {
             // Re-merged per RMW retry, so `SET x = x + 1` reads the freshest `x`.
             // Every row rides at +1 and the worker's `enforce_unique_pk` turns a
             // merged one into the retract-and-insert.
             let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
-                let merged = client_side_merge_do_update(client, tid, schema, &batch, &assignments, &payload)?;
-                let write = (!merged.pks.is_empty()).then_some(RmwWrite {
-                    batch: merged,
-                    mode: WireConflictMode::Update,
-                });
-                Ok(RmwBuild { count: n, write })
+                client_side_merge_do_update(client, tid, schema, &batch, &set)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
     }
 }
 
-/// Bind `col = expr` assignments for ON CONFLICT DO UPDATE. The
-/// incoming-row scope uses the pseudo-qualifier `EXCLUDED.<col>`; bare
-/// column names refer to the existing (stored) row.
-fn bind_do_update_assignments(
-    raw: &[Assignment],
-    schema: &Schema,
-    alias: &str,
-) -> Result<Vec<(usize, SetProgram, Scope)>, GnitzSqlError> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut seen: Vec<usize> = Vec::with_capacity(raw.len());
-    for assignment in raw {
-        let col_idx = resolve_set_target(assignment, schema, &mut seen, "ON CONFLICT DO UPDATE SET")?;
-        let (program, scope) = bind_do_update_rhs(&assignment.value, col_idx, schema, alias)?;
-        out.push((col_idx, program, scope));
-    }
-    Ok(out)
-}
-
-fn bind_do_update_rhs(
-    expr: &Expr,
-    target: usize,
-    schema: &Schema,
-    alias: &str,
-) -> Result<(SetProgram, Scope), GnitzSqlError> {
+/// One `DO UPDATE SET` right-hand side. The incoming-row scope uses the
+/// pseudo-qualifier `EXCLUDED.<col>`; bare column names refer to the existing
+/// (stored) row.
+fn bind_do_update_rhs(expr: &Expr, target: usize, schema: &Schema, alias: &str) -> Result<SetRhs, GnitzSqlError> {
     if let Some(col_name) = excluded_col(expr) {
         let col_idx = find_unique_column(&schema.columns, col_name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
-        // Through the same classifier as a bare RHS, so `SET s = EXCLUDED.s`
-        // on a string column is a `StrCol` rather than an integer compile, and
-        // `SET int_col = EXCLUDED.str_col` is rejected here rather than per row.
-        let program = classify_set_rhs(&BoundExpr::ColRef(col_idx), target, schema)?;
-        return Ok((program, Scope::Excluded));
+        // Through the same classifier as a bare RHS, so `SET int_col =
+        // EXCLUDED.str_col` is rejected here rather than per row.
+        return classify_set_rhs(&BoundExpr::ColRef(col_idx), Scope::Excluded, target, schema);
     }
     // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
     // relation in scope); this says why, which its message cannot.
@@ -401,8 +352,12 @@ fn bind_do_update_rhs(
                 .to_string(),
         ));
     }
-    let program = classify_set_rhs(&bind_single_table(expr, schema, alias)?, target, schema)?;
-    Ok((program, Scope::Existing))
+    classify_set_rhs(
+        &bind_single_table(expr, schema, alias)?,
+        Scope::Existing,
+        target,
+        schema,
+    )
 }
 
 /// The column an `EXCLUDED.<col>` reference names. Deliberately unpeeled: the
@@ -451,31 +406,14 @@ fn client_side_merge_do_update(
     tid: u64,
     schema: &Arc<Schema>,
     batch: &ZSetBatch,
-    assignments: &[(usize, SetProgram, Scope)],
-    payload: &[(usize, usize, &ColumnDef)],
+    set: &[SetCol],
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    // `rows` is both the merge's carry source and the `Existing` scope's
-    // evaluation base, so `SET x = x + 1` reads the row a transaction buffered.
+    // `rows` is the `Existing` scope, so `SET x = x + 1` reads the row a
+    // transaction buffered.
     let (rows, verdicts) = effective_rows(client, tid, schema, &batch.pks)?;
-
-    let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
-
-    // Each RHS is bound to its own scope's batch here, which drives every
-    // computed one over that whole batch once; the row loop below then reads a
-    // buffer instead of paying a single-row drive's prologue per conflict.
-    let bound: Vec<SetValues<'_>> = assignments
-        .iter()
-        .map(|(_, p, scope)| match scope {
-            Scope::Existing => bind_set_program(p, &rows),
-            Scope::Excluded => bind_set_program(p, batch),
-        })
-        .collect();
-    // Pre-index assignments by column for O(cols) lookup per row.
-    let mut asn_by_col: Vec<Option<(&SetValues<'_>, Scope)>> = vec![None; schema.columns.len()];
-    for ((ci, _, scope), v) in assignments.iter().zip(&bound) {
-        asn_by_col[*ci] = Some((v, *scope));
-    }
-
+    // The VALUES row each existing row collided with.
+    let mut src_of = vec![0; rows.len()];
+    let mut out = ZSetBatch::with_capacity(schema, verdicts.len());
     for (i, verdict) in verdicts.iter().enumerate() {
         match *verdict {
             Conflict::Repeat => {
@@ -486,23 +424,14 @@ fn client_side_merge_do_update(
                 ));
             }
             Conflict::Fresh => out.copy_row_at(batch, i, batch.weights[i]),
-            // The stored row is `row` of the resolved batch; the incoming row is
-            // row `i` of the VALUES batch.
-            Conflict::Existing(row) => {
-                build_merged_row(batch, i, &rows, row, payload, &mut out, |ci| {
-                    asn_by_col[ci].map(|(v, scope)| {
-                        eval_set_value(
-                            v,
-                            match scope {
-                                Scope::Existing => row,
-                                Scope::Excluded => i,
-                            },
-                        )
-                    })
-                })?;
-            }
+            Conflict::Existing(row) => src_of[row] = i,
         }
     }
+    let mut excluded = ZSetBatch::with_capacity(schema, src_of.len());
+    for &i in &src_of {
+        excluded.copy_row_at(batch, i, 1);
+    }
+    out.extend_from_owned(apply_set(set, rows, Some(&excluded), schema)?);
     Ok(out)
 }
 
