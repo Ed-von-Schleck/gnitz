@@ -65,6 +65,7 @@ mod spine_tests {
     use crate::protocol::transport::poll_fd;
     use crate::protocol::{BatchAppender, ColumnDef, Header, TypeCode};
     use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
+    use crate::GnitzClient;
 
     /// The version a request for `tid` would stamp now; `0` = nothing cached.
     fn stamped(s: &mut Session, tid: u64) -> u16 {
@@ -361,17 +362,18 @@ mod spine_tests {
 
     #[test]
     fn out_of_order_reply_is_a_step_error_and_closes_the_blocking_client() {
-        let (mut s, peer) = pair();
+        let (s, peer) = pair();
+        let mut c = GnitzClient::from_session(s);
         // The peer answers a scan of 5 with a frame naming 6.
         peer.send(&reply_ctrl(6, 1));
-        let r = s.scan(5);
+        let r = c.scan(5);
         assert!(matches!(r, Err(ClientError::Protocol(_))), "{r:?}");
-        assert_eq!(s.interest(), Interest::NONE);
+        assert_eq!(c.session.interest(), Interest::NONE);
         // The next call reports the connection closed instead of submitting.
-        let r = s.scan(5);
+        let r = c.scan(5);
         assert!(matches!(r, Err(ClientError::Closed)));
-        assert!(matches!(s.submit(Request::scan(1)), Err(ClientError::Closed)));
-        assert!(s.step(Interest::READ).unwrap().is_empty());
+        assert!(matches!(c.session.submit(Request::scan(1)), Err(ClientError::Closed)));
+        assert!(c.session.step(Interest::READ).unwrap().is_empty());
     }
 
     #[test]
@@ -490,38 +492,29 @@ mod spine_tests {
     }
 
     /// An aborted park leaves its slot pending — the frame is already on the
-    /// wire, so the next call drains that reply before its own. The hook is the
-    /// host's and outlives the session it was installed on, which is what
-    /// [`crate::GnitzClient::reconnect`] relies on to keep a blocking call
-    /// Ctrl-C-interruptible across a replaced connection.
+    /// wire, so the next call drains that reply before its own.
     #[test]
     fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
-        // Installed on one session, taken out, and moved onto another.
-        let (mut donor, _donor_peer) = pair();
+        let (s, peer) = pair();
+        let mut c = GnitzClient::from_session(s);
         let mut fired = false;
-        donor.set_park_hook(Some(Box::new(move || {
+        c.set_park_hook(Some(Box::new(move || {
             if std::mem::replace(&mut fired, true) {
                 Ok(())
             } else {
                 Err(ClientError::ServerError("interrupted".into()))
             }
         })));
-        let hook = donor.take_park_hook();
-        assert!(hook.is_some(), "the installed hook comes back out");
-        assert!(donor.take_park_hook().is_none(), "and taking it leaves none behind");
-
-        let (mut s, peer) = pair();
-        s.set_park_hook(hook);
         let stop = Arc::new(AtomicBool::new(false));
         let sig = interrupt_self_until(Arc::clone(&stop));
 
         // The peer never answers, so the scan parks; the signal makes the park
         // return `EINTR`, which is the one place the hook runs.
-        let r = s.scan(1);
+        let r = c.scan(1);
         assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m == "interrupted"));
         stop.store(true, Ordering::Relaxed);
         sig.join().unwrap();
-        assert_eq!(s.interest(), Interest::READ, "the abandoned slot stays pending");
+        assert_eq!(c.session.interest(), Interest::READ, "the abandoned slot stays pending");
 
         // The peer answers both requests; the second call must get the second.
         let empty = ZSetBatch::new(&schema_a());
@@ -532,14 +525,15 @@ mod spine_tests {
             peer.send(&reply_cold(1, 1, &schema_a(), &empty, 200, false));
             peer
         });
-        assert_eq!(s.scan(1).unwrap().lsn, Some(200));
+        assert_eq!(c.scan(1).unwrap().lsn, Some(200));
         let _peer = h.join().unwrap();
-        assert_eq!(s.interest(), Interest::NONE);
+        assert_eq!(c.session.interest(), Interest::NONE);
     }
 
     #[test]
     fn a_delta_read_keeps_blocks_undecoded_and_off_the_cache() {
-        let (mut s, peer) = pair();
+        let (s, peer) = pair();
+        let mut c = GnitzClient::from_session(s);
         let sa = schema_a();
         let reply_schema = crate::protocol::ReplySchema::new(std::sync::Arc::new(sa.clone()), 9);
         let block_len = encode_schema_block(&sa, 9).len();
@@ -552,13 +546,12 @@ mod spine_tests {
             peer.send(&reply_warm(9, 0, &peer_schema, &batch_a(&[3]), false));
             peer
         });
-        let (blocks, terminal) = s.delta_read(9, 4, &reply_schema).unwrap();
+        let (blocks, _cursor) = c.delta_read_raw(9, 4, &reply_schema).unwrap();
         let _peer = h.join().unwrap();
         assert_eq!(blocks.len(), 2);
         let (b0, _) = crate::protocol::decode_wal_block(blocks[0].block(), &sa).unwrap();
         assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
-        assert_eq!(terminal.target_id, 9);
-        assert_eq!(stamped(&mut s, 9), 0, "a delta read absorbs nothing");
+        assert_eq!(stamped(&mut c.session, 9), 0, "a delta read absorbs nothing");
     }
 
     #[test]
@@ -567,6 +560,7 @@ mod spine_tests {
         let sa = schema_a();
         let b = batch_a(&[1]);
         warm(&mut s, &peer, 4, 2, &sa);
+        let mut c = GnitzClient::from_session(s);
         // The server rejects the warm push; the blocking verb retries it cold.
         let h = std::thread::spawn(move || {
             peer.drain_request();
@@ -575,10 +569,14 @@ mod spine_tests {
             peer.send(&reply_ctrl(4, 555));
             peer
         });
-        let lsn = s.push_with_mode(4, &sa, &b, WireConflictMode::Update).unwrap();
+        let lsn = c.push(4, &sa, &b).unwrap();
         assert_eq!(lsn, 555);
         let _peer = h.join().unwrap();
-        assert_eq!(s.requests_sent(), 3, "scan, warm push, cold retry — one per frame");
+        assert_eq!(
+            c.session.requests_sent(),
+            3,
+            "scan, warm push, cold retry — one per frame"
+        );
     }
 
     #[test]

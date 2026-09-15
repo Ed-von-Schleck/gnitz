@@ -183,8 +183,8 @@ fn loopback_one_record_two_frames_one_step_completes_both_slots() {
     let ids: Vec<_> = done.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, vec![a, b]);
     for (id, r) in done {
-        let Reply::Ack(m) = r.unwrap() else { panic!("ack") };
-        assert_eq!(m.seek_pk, if id == a { 1 } else { 2 });
+        let Reply::Lsn(n) = r.unwrap() else { panic!("lsn") };
+        assert_eq!(n, if id == a { 1 } else { 2 });
     }
     assert_eq!(
         s.interest(),
@@ -263,8 +263,8 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
         let rev = poll_fd(s.as_raw_fd(), s.interest().poll_events(), None, true).unwrap();
         ready = Interest::from_revents(rev);
     };
-    let Reply::Ack(m) = reply else { panic!("ack") };
-    assert_eq!(m.seek_pk, 9);
+    let Reply::Lsn(n) = reply else { panic!("lsn") };
+    assert_eq!(n, 9);
     lb.join();
 }
 
@@ -410,8 +410,8 @@ fn loopback_reply_and_close_notify_in_one_read_complete_the_slot() {
     assert_eq!(done.len(), 1);
     let (id, reply) = done.swap_remove(0);
     assert_eq!(id, slot);
-    let Reply::Ack(m) = reply.unwrap() else { panic!("ack") };
-    assert_eq!(m.seek_pk, 7);
+    let Reply::Lsn(n) = reply.unwrap() else { panic!("lsn") };
+    assert_eq!(n, 7);
     lb.join();
 }
 

@@ -31,8 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::client::{delta_reply_schema, DeltaCursor, GnitzClient, RelDescriptor};
-use crate::connection::{Interest, PolledView, RawBlock, SlotId};
+use crate::client::{delta_reply_schema, park, DeltaCursor, GnitzClient};
+use crate::connection::{Interest, PolledView, RawBlock, RelDescriptor, SlotId};
 use crate::error::ClientError;
 use crate::protocol::{ReplySchema, Schema, ZSetBatch};
 use gnitz_wire::txn_frame::{DeltaPollItem, DELTA_POLL_MAX_VIEWS};
@@ -626,7 +626,7 @@ impl GnitzClient {
     ) -> Result<ViewPollResults, ClientError> {
         // Split, so the ingest writes to the mirror while the session drains:
         // disjoint fields, so both borrows hold.
-        let Self { session, mirror, .. } = self;
+        let Self { session, mirror, park_hook, .. } = self;
         let Some(mirror) = mirror.as_deref_mut() else {
             return Err(ClientError::NoMirrorStore);
         };
@@ -674,10 +674,10 @@ impl GnitzClient {
                     let i = range.start;
                     range.start += 1;
                     let (tid, prev, _) = views[i];
-                    let fetched = result.map(|(blocks, t)| (blocks, DeltaCursor::from_watermark(t.seek_pk)));
+                    let fetched = result.map(|(blocks, w)| (blocks, DeltaCursor::from_watermark(w)));
                     applied.push((tid, mirror.advance_from(tid, prev, fetched)));
                 };
-                session.step_polling(ready, &mut sink)
+                session.step_polling(ready, Some(&mut sink))
             };
             match stepped {
                 // Every view of a rejected request it had yet to answer fails
@@ -705,7 +705,7 @@ impl GnitzClient {
                 }
             }
             if !open.is_empty() {
-                ready = session.park()?;
+                ready = park(session, park_hook)?;
             }
         }
         Ok(applied)

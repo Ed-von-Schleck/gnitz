@@ -27,11 +27,11 @@ pub use circuit::{
 };
 pub use client::{
     delta_reply_schema, qualified_name, retraction_batch, CatalogSnapshot, DeltaCursor, GnitzClient, IndexMeta,
-    InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
+    InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
-    Completions, Interest, ParkHook, RawBlock, RelTarget, Reply, Request, ScanReply, Session, SlotId, MAX_IN_FLIGHT,
-    MAX_QUEUED_BYTES,
+    Completions, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply, Session, SlotId,
+    MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
 pub use gnitz_wire::{

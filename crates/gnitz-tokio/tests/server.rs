@@ -1,8 +1,8 @@
 #![cfg(feature = "integration")]
 
 //! The tokio client against a real server: the guards that only a live
-//! connection can show — an idle driver that spins, a burst that leaves one
-//! frame at a time, and a `resolve` that must agree with the blocking client's.
+//! connection can show — an idle driver that spins, and a burst that leaves one
+//! frame at a time.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -205,8 +205,8 @@ fn one_writev_per_burst() {
     let srv = ServerHandle::start_with_env(1, &[]);
     let (_c, tid, _s, _sn) = table(srv.sock_path());
     // Every push here is cold — the child connects fresh and never resolves — so
-    // 4 iovecs each, under the 256-frame cold-push writev quantum. A larger `n`,
-    // or a warm-cache or control-only burst, legitimately moves the count.
+    // the burst stays within one writev quantum; a larger `n`, or a warm or
+    // control-only burst, can legitimately move the count.
     let n = 200usize;
     let Some(counts) = strace_test(
         "syscall_count_child",
@@ -308,7 +308,12 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     );
     let (a, b) = (client.clone(), client.clone());
     let (s1, s2) = (Mirror::open(&p1).unwrap(), Mirror::open(&p2).unwrap());
-    let (ra, rb) = rt.block_on(async { tokio::join!(a.attach_mirror(s1), b.attach_mirror(s2)) });
+    let (ra, rb) = rt.block_on(async {
+        tokio::join!(
+            a.with_blocking_client(move |c| c.attach_mirror(s1)),
+            b.with_blocking_client(move |c| c.attach_mirror(s2)),
+        )
+    });
     drop((a, b));
     assert_eq!(
         [ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count(),
@@ -318,17 +323,34 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     // The refused one dropped the store it was passed, so its directory is free.
     let loser = if ra.is_ok() { &p2 } else { &p1 };
     Mirror::open(loser).expect("a refused attach releases the store it was passed");
-    rt.block_on(client.close_mirror()).expect("close");
+    rt.block_on(client.with_blocking_client(GnitzClient::close_mirror))
+        .expect("close");
 
     // The real one: attach, mirror, poll, read off the copy.
-    rt.block_on(client.attach_mirror(Mirror::open(&p1).unwrap()))
+    let store = Mirror::open(&p1).unwrap();
+    rt.block_on(client.with_blocking_client(move |c| c.attach_mirror(store)))
         .expect("attach");
-    let outcome = rt.block_on(client.mirror_view(&sn, "v")).expect("mirror the view");
+    let view_schema = sn.clone();
+    let outcome = rt
+        .block_on(client.with_blocking_client(move |c| c.mirror_view(&view_schema, "v")))
+        .expect("mirror the view");
     assert_eq!(outcome.view_id, vid);
-    assert!(rt.block_on(client.mirrors(vid)).unwrap());
-    assert_eq!(rt.block_on(client.mirrored_ids()).unwrap(), vec![vid]);
-    assert!(rt.block_on(client.cursor_of(vid)).unwrap().is_some());
-    assert!(rt.block_on(client.mirror_poisoned()).unwrap().is_none());
+    assert!(rt
+        .block_on(client.with_blocking_client(move |c| Ok(c.mirrors(vid))))
+        .unwrap());
+    assert_eq!(
+        rt.block_on(client.with_blocking_client(|c| Ok(c.mirrored_ids())))
+            .unwrap(),
+        vec![vid]
+    );
+    assert!(rt
+        .block_on(client.with_blocking_client(move |c| Ok(c.cursor_of(vid))))
+        .unwrap()
+        .is_some());
+    assert!(rt
+        .block_on(client.with_blocking_client(|c| Ok(c.mirror_poisoned().map(str::to_string))))
+        .unwrap()
+        .is_none());
 
     // Two clones polling one view concurrently. One whole advance runs under one
     // lock, so they serialize instead of both fetching `(c, …]` and both
@@ -336,11 +358,17 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     blocking.push(tid, &schema, &rows(50, 50)).unwrap();
     let expected = weights(&blocking.scan(vid).unwrap().batch);
     let (a, b) = (client.clone(), client.clone());
-    let (ra, rb) = rt.block_on(async { tokio::join!(a.poll_mirror(), b.poll_mirror()) });
+    let (ra, rb) = rt.block_on(async {
+        tokio::join!(
+            a.with_blocking_client(GnitzClient::poll_mirror),
+            b.with_blocking_client(GnitzClient::poll_mirror),
+        )
+    });
     ra.expect("the first poll");
     rb.expect("the second poll");
     drop((a, b));
-    rt.block_on(client.poll_mirror()).expect("a third, for the tail round");
+    rt.block_on(client.with_blocking_client(GnitzClient::poll_mirror))
+        .expect("a third, for the tail round");
 
     let local = rt.block_on(client.scan_local_first(vid)).unwrap();
     assert!(local.lsn.is_none(), "a local answer carries no served LSN");
@@ -355,14 +383,32 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
     assert!(unheld.lsn.is_some(), "a delegated read carries the server's LSN");
     assert_eq!(weights(&unheld.batch).len(), 100);
 
-    rt.block_on(client.checkpoint_mirror()).expect("checkpoint");
-    rt.block_on(client.forget_view(vid)).expect("forget");
-    assert!(!rt.block_on(client.mirrors(vid)).unwrap());
+    // A dead or replaced connection is recovered in place, and the copies ride
+    // along: the next poll re-resolves and the view is mirrored again.
+    let target = srv.sock_path().to_string();
+    rt.block_on(client.with_blocking_client(move |c| c.reconnect(&target)))
+        .expect("reconnect");
+    rt.block_on(client.with_blocking_client(GnitzClient::poll_mirror))
+        .expect("a poll after reconnect");
+    assert!(rt
+        .block_on(client.with_blocking_client(move |c| Ok(c.mirrors(vid))))
+        .unwrap());
 
-    rt.block_on(client.close_mirror()).expect("close the store");
-    rt.block_on(client.attach_mirror(Mirror::open(&p1).unwrap()))
+    rt.block_on(client.with_blocking_client(GnitzClient::checkpoint_mirror))
+        .expect("checkpoint");
+    rt.block_on(client.with_blocking_client(move |c| c.forget_view(vid)))
+        .expect("forget");
+    assert!(!rt
+        .block_on(client.with_blocking_client(move |c| Ok(c.mirrors(vid))))
+        .unwrap());
+
+    rt.block_on(client.with_blocking_client(GnitzClient::close_mirror))
+        .expect("close the store");
+    let store = Mirror::open(&p1).unwrap();
+    rt.block_on(client.with_blocking_client(move |c| c.attach_mirror(store)))
         .expect("the same directory can be attached again");
-    rt.block_on(client.close_mirror()).expect("close it again");
+    rt.block_on(client.with_blocking_client(GnitzClient::close_mirror))
+        .expect("close it again");
 
     drop(client);
     rt.block_on(driver).unwrap().unwrap();

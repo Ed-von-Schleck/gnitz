@@ -13,8 +13,8 @@ pub enum ClientError {
     /// after a transport or protocol failure, or the request never reached the
     /// wire because the connection was already gone.
     Closed,
-    /// A mirror verb on a client or handle that never attached a store. The
-    /// message names no method — each binding spells the attach differently.
+    /// A mirror verb on a client that never attached a store. The message names
+    /// no method — each binding spells the attach differently.
     NoMirrorStore,
     /// A relation, index or schema the catalog does not hold, by whatever
     /// `name` the lookup used — a qualified name, a bare index name, or a tid.

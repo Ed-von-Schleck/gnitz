@@ -1,18 +1,5 @@
-//! The protocol session: a sans-io connection state machine and the blocking
-//! verbs written over it.
-//!
-//! The **spine** is [`Session::submit`] and [`Session::step`], plus what a
-//! driver reads between them: [`Session::interest`], [`Session::close`], and
-//! the fd through [`Session::as_raw_fd`] or [`Session::try_clone_fd`]. It is
-//! the whole of the type's public surface, and nothing in it ever waits:
-//! `submit` encodes a request against the connection's schema cache and
-//! registers a slot; `step` does the I/O the driver says the fd is ready for
-//! and reports which slots completed; waiting belongs to whoever drives it.
-//!
-//! Above the spine sit `Session`'s own blocking verb bodies, which park in
-//! `round_trip`. They are crate-internal, so a reactor thread handed a
-//! `&mut Session` cannot block in `poll(2)` on one; the host-facing blocking
-//! verbs live on [`crate::GnitzClient`]. There is no second reply path.
+//! The protocol session: a sans-io connection state machine. Nothing in it
+//! waits; whoever drives [`Session::step`] does.
 //!
 //! Replies leave the server in request order, so there is exactly one reply
 //! accumulator and it belongs to the head of the pending queue: every byte
@@ -26,19 +13,18 @@ use std::time::Instant;
 
 use crate::error::ClientError;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
-use crate::protocol::transport::{poll_fd, Next, CONNECT_TIMEOUT};
+use crate::protocol::transport::{Next, CONNECT_TIMEOUT};
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
     encode_control_frame, encode_ddl_txn, encode_push_txn, hello_handshake, parse_response_frame,
     wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
-    FkTarget, Message, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
-    FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
-    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK,
-    STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    FkTarget, Message, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_CONTINUATION, FLAG_PUSH, FLAG_RESOLVE,
+    FLAG_SCAN_SPEC, FLAG_SEEK, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_OK, STATUS_SAL_FULL,
+    STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::txn_frame;
-use gnitz_wire::RelDescriptorBlob;
+use gnitz_wire::{RelClass, RelDescriptorBlob};
 use lru::LruCache;
 
 /// Per-connection schema LRU capacity. Sized to comfortably hold a session's
@@ -67,6 +53,18 @@ pub struct ScanReply {
 
 /// The single-relation read result.
 pub type ScanResult = Result<ScanReply, ClientError>;
+
+/// One relation, as a RESOLVE describes it.
+#[derive(Debug)]
+pub struct RelDescriptor {
+    pub tid: u64,
+    pub class: RelClass,
+    pub replicated: bool,
+    /// The view keeps a delta feed, so a DELTA_POLL of it is answerable.
+    pub delta: bool,
+    pub schema: Arc<Schema>,
+    pub indexes: Arc<Vec<gnitz_wire::RelIndex>>,
+}
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
 /// block's extent within it. `block()` is the block itself.
@@ -206,17 +204,14 @@ pub enum Request<'a> {
         seek_pk: u128,
         seek_pk_extra: &'a [u8],
     },
-    /// An id allocation: `flag` names the sequence, `count` the run length, and
-    /// the answer rides the terminal frame's `target_id`. Uncorrelated: nothing
-    /// is absorbed into the cache, and it completes as [`Reply::Ack`].
+    /// An id allocation: `flag` names the sequence, `count` the run length.
+    /// Completes as [`Reply::Id`].
     Alloc { target_id: u64, flag: u64, count: u64 },
-    /// An atomic DDL transaction (`FLAG_DDL_TXN`): system-table family batches
-    /// the server ingests under one durable SAL zone, each named by its system
-    /// table id alone. Uncorrelated.
+    /// An atomic DDL transaction: system-table batches, each named by its table
+    /// id, under one durable SAL zone. Completes as [`Reply::Lsn`].
     DdlTxn(&'a [(u64, ZSetBatch)]),
-    /// An atomic user-table push transaction (`FLAG_PUSH_TXN`): families with
-    /// their conflict modes, plus the OCC `(tid, basis)` preconditions the
-    /// server asserts before committing any of them. Uncorrelated.
+    /// An atomic user-table push transaction, and the OCC `(tid, basis)`
+    /// preconditions the server asserts first. Completes as [`Reply::Lsn`].
     PushTxn {
         families: &'a [(u64, &'a Schema, &'a ZSetBatch, WireConflictMode)],
         preconditions: &'a [(u64, u64)],
@@ -284,14 +279,13 @@ pub enum Reply {
     Scan(ScanReply),
     /// `scan_multi`: N per-relation results in request order.
     Multi(Vec<ScanReply>),
-    /// A PUSH ACK's ingest LSN.
+    /// A PUSH or transaction ACK's LSN.
     Lsn(u64),
-    /// A RESOLVE: the live id, the FK-complete schema and the descriptor, or
-    /// `None` when no such relation exists.
-    Resolve(Option<(u64, Arc<Schema>, RelDescriptorBlob)>),
-    /// The terminal frame of a verb whose answer is one of its fields: the id
-    /// allocations and the transaction ACKs.
-    Ack(Message),
+    /// A RESOLVE: the descriptor, its schema FK-complete, or `None` when no such
+    /// relation exists.
+    Resolve(Option<Arc<RelDescriptor>>),
+    /// An id allocation's base id.
+    Id(u64),
     /// A decoded `scan_spec`: its rows under the slot's reply schema.
     Rows(ZSetBatch),
     /// A delta poll: the slot is done, and every view's blocks went to the
@@ -308,13 +302,13 @@ impl Reply {
             Reply::Multi(_) => "Multi",
             Reply::Lsn(_) => "Lsn",
             Reply::Resolve(_) => "Resolve",
-            Reply::Ack(_) => "Ack",
+            Reply::Id(_) => "Id",
             Reply::Rows(_) => "Rows",
             Reply::Polled => "Polled",
         }
     }
 
-    /// A PUSH ACK's ingest LSN.
+    /// A PUSH or transaction ACK's LSN.
     #[inline]
     #[track_caller]
     pub fn into_lsn(self) -> u64 {
@@ -344,25 +338,23 @@ impl Reply {
         }
     }
 
-    /// A RESOLVE's `(live tid, schema, descriptor)`, or `None` when no such
-    /// relation exists. The triple, not a `RelDescriptor`: that lives above
-    /// this module.
+    /// A RESOLVE's descriptor, or `None` when no such relation exists.
     #[inline]
     #[track_caller]
-    pub fn into_resolve(self) -> Option<(u64, Arc<Schema>, RelDescriptorBlob)> {
+    pub fn into_resolve(self) -> Option<Arc<RelDescriptor>> {
         match self {
             Reply::Resolve(d) => d,
             other => wrong_shape(other.kind(), "Resolve"),
         }
     }
 
-    /// The terminal frame, for the verbs whose answer is one of its fields.
+    /// An id allocation's base id.
     #[inline]
     #[track_caller]
-    pub fn into_ack(self) -> Message {
+    pub fn into_id(self) -> u64 {
         match self {
-            Reply::Ack(m) => m,
-            other => wrong_shape(other.kind(), "Ack"),
+            Reply::Id(id) => id,
+            other => wrong_shape(other.kind(), "Id"),
         }
     }
 
@@ -407,7 +399,9 @@ enum SlotKind {
     Push {
         tid: u64,
     },
-    Uncorrelated,
+    Alloc,
+    /// A DDL or push transaction ACK.
+    Commit,
     Resolve,
     ScanSpec {
         reply_schema: Arc<Schema>,
@@ -463,7 +457,7 @@ struct Accumulator {
 /// views holds one train, not M. Positions are filled in request order, and a
 /// terminal naming another view is refused, so the slot's next unanswered
 /// position is the one this belongs to.
-pub(crate) type PolledView = Result<(Vec<RawBlock>, Message), ClientError>;
+pub(crate) type PolledView = Result<(Vec<RawBlock>, u128), ClientError>;
 
 /// The listener a delta poll's results go to, addressed by the slot that asked
 /// — so a train left behind by an abandoned poll is recognised rather than
@@ -485,16 +479,7 @@ pub struct Session {
     next_slot: u64,
     accum: Accumulator,
     closed: bool,
-    /// Run before every park of the blocking client; its `Err` aborts the
-    /// operation. `Send + Sync` so the field cannot silently narrow `Session`'s
-    /// own auto-traits.
-    park_hook: Option<ParkHook>,
 }
-
-/// The blocking client's pre-park hook — how a host runtime gets a turn (the
-/// Python binding runs `PyErr_CheckSignals` here, which is what makes a long
-/// call Ctrl-C-interruptible).
-pub type ParkHook = Box<dyn FnMut() -> Result<(), ClientError> + Send + Sync>;
 
 impl Session {
     /// `target` is an AF_UNIX socket path or a `tls://` target (see
@@ -520,7 +505,6 @@ impl Session {
             next_slot: 1,
             accum: Accumulator::default(),
             closed: false,
-            park_hook: None,
         }
     }
 
@@ -551,19 +535,6 @@ impl Session {
         Ok(self.transport.try_clone_fd()?)
     }
 
-    /// Install (or clear) the hook `round_trip` runs before each park.
-    pub(crate) fn set_park_hook(&mut self, hook: Option<ParkHook>) {
-        self.park_hook = hook;
-    }
-
-    /// Take the hook out, leaving none. What
-    /// [`GnitzClient::reconnect`](crate::GnitzClient::reconnect) moves onto the
-    /// session it replaces this one with — the hook is the host's, and outlives
-    /// the connection it was installed on.
-    pub(crate) fn take_park_hook(&mut self) -> Option<ParkHook> {
-        self.park_hook.take()
-    }
-
     // ── The spine ──────────────────────────────────────────────────────────
 
     /// Encode against this connection's schema cache, enqueue, register a slot.
@@ -592,10 +563,9 @@ impl Session {
                 (parts, SlotKind::Read { tid: target_id, hint })
             }
             Request::Alloc { target_id, flag, count } => {
-                // The run length rides in `seek_col_idx`, the field
-                // `alloc_serial_range` already uses for it.
+                // The run length rides in `seek_col_idx`.
                 let parts = encode_control_frame(target_id, client_id, flag, 0, count, &[]);
-                (parts, SlotKind::Uncorrelated)
+                (parts, SlotKind::Alloc)
             }
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
@@ -603,7 +573,7 @@ impl Session {
                 }
                 (
                     MessageParts::single(encode_ddl_txn(client_id, families)),
-                    SlotKind::Uncorrelated,
+                    SlotKind::Commit,
                 )
             }
             Request::PushTxn { families, preconditions } => {
@@ -612,11 +582,11 @@ impl Session {
                 }
                 (
                     MessageParts::single(encode_push_txn(client_id, families, preconditions)),
-                    SlotKind::Uncorrelated,
+                    SlotKind::Commit,
                 )
             }
             #[cfg(test)]
-            Request::RawFrame(frame) => (MessageParts::single(frame), SlotKind::Uncorrelated),
+            Request::RawFrame(frame) => (MessageParts::single(frame), SlotKind::Commit),
             Request::Resolve(target) => (self.resolve_request(target), SlotKind::Resolve),
             Request::Push { target_id, schema, batch, mode } => {
                 // In-process, so a convenience and never a trust boundary; the
@@ -703,31 +673,21 @@ impl Session {
         Ok(id)
     }
 
-    /// Do the I/O `ready` says the fd will accept — flush the cursor on
-    /// `WRITE`, read until the source is drained on `READ`, neither on an empty
-    /// set — advancing the reply train at the head of the pending queue as
-    /// bytes arrive. Returns every slot that completed, and returns only once
-    /// nothing buffered can advance another one, so a driver may park on
-    /// `interest()` immediately afterwards.
+    /// Do the I/O `ready` allows and return every slot that completed. Afterwards
+    /// a driver may park on `interest()`: nothing buffered can advance, and
+    /// bytes still queued are ones the fd refused.
     ///
-    /// A per-slot `Err` (any `STATUS_*` the server names) leaves the connection
-    /// usable. An `Err` from `step` itself is a transport or protocol failure:
-    /// the byte stream's framing is no longer trustworthy, and the driver's
-    /// only move is `close`.
+    /// An `Err` from `step` itself means the framing is lost; `close`.
     pub fn step(&mut self, ready: Interest) -> Result<Completions, ClientError> {
-        self.step_inner(ready, None)
+        self.step_polling(ready, None)
     }
 
     /// [`Self::step`] for a drain that takes a delta poll's per-view results.
     pub(crate) fn step_polling(
         &mut self,
         ready: Interest,
-        sink: &mut PollSink<'_>,
+        mut sink: Option<&mut PollSink<'_>>,
     ) -> Result<Completions, ClientError> {
-        self.step_inner(ready, Some(sink))
-    }
-
-    fn step_inner(&mut self, ready: Interest, mut sink: Option<&mut PollSink<'_>>) -> Result<Completions, ClientError> {
         let mut done: Completions = Vec::new();
         if self.closed {
             return Ok(done);
@@ -746,9 +706,7 @@ impl Session {
                 }
             }
         }
-        // Last, so that bytes still queued when this returns are ones the fd
-        // refused — a read of its own can queue ciphertext, and flushing before
-        // it would leave that behind and make the two indistinguishable.
+        // Last, so the ciphertext a read queues goes out with this flush.
         if ready.write {
             self.transport.flush()?;
         }
@@ -816,7 +774,7 @@ impl Session {
             SlotKind::Read { tid, .. } | SlotKind::Push { tid } => Some(*tid),
             SlotKind::Multi { tids } => Some(tids[accum.at].0),
             SlotKind::DeltaPoll { .. } => poll.map(|(view, _)| view),
-            SlotKind::Uncorrelated | SlotKind::Resolve | SlotKind::ScanSpec { .. } => None,
+            SlotKind::Alloc | SlotKind::Commit | SlotKind::Resolve | SlotKind::ScanSpec { .. } => None,
         };
         // What a data block decodes under and the version a hint-only frame must carry.
         let (slot_schema, slot_version) = match &head.kind {
@@ -825,7 +783,7 @@ impl Session {
             // Client-authored: the server sends no block and stamps 0.
             SlotKind::ScanSpec { reply_schema, .. } => (Some(Arc::clone(reply_schema)), Some(0)),
             SlotKind::DeltaPoll { .. } => (None, Some(0)),
-            SlotKind::Push { .. } | SlotKind::Uncorrelated | SlotKind::Resolve => (None, None),
+            SlotKind::Push { .. } | SlotKind::Alloc | SlotKind::Commit | SlotKind::Resolve => (None, None),
         };
         // A block earlier in this train (the master's prelim frame) governs the
         // hint-only worker frames after it.
@@ -898,7 +856,7 @@ impl Session {
         let data = accum.data.take();
         if let Some((_, positions)) = poll {
             let blocks = std::mem::take(&mut accum.blocks);
-            let filled = Ok((blocks, terminal));
+            let filled = Ok((blocks, terminal.seek_pk));
             return Ok(Some(fill_poll_position(pending, accum, done, positions, filled)));
         }
         let scan_reply = |schema: Option<Arc<Schema>>, data: Option<ZSetBatch>, terminal: &Message| {
@@ -913,7 +871,8 @@ impl Session {
             SlotKind::Read { .. } => Ok(Reply::Scan(scan_reply(schema, data, &terminal)?)),
             SlotKind::Push { .. } => Ok(Reply::Lsn(terminal.seek_pk as u64)),
             SlotKind::Resolve => resolve_descriptor(terminal, schema).map(Reply::Resolve),
-            SlotKind::Uncorrelated => Ok(Reply::Ack(terminal)),
+            SlotKind::Alloc => Ok(Reply::Id(terminal.target_id)),
+            SlotKind::Commit => Ok(Reply::Lsn(terminal.seek_pk as u64)),
             SlotKind::ScanSpec { reply_schema } => {
                 Ok(Reply::Rows(data.unwrap_or_else(|| ZSetBatch::new(reply_schema))))
             }
@@ -932,212 +891,6 @@ impl Session {
         Ok(None)
     }
 
-    // ── The blocking client ────────────────────────────────────────────────
-
-    /// Submit, then park on `interest()` until that slot completes, running the
-    /// park hook and absorbing `EINTR`. The blocking way to drive the spine.
-    ///
-    /// A `step` error closes the connection: its framing can no longer be
-    /// trusted. A slot abandoned by an aborting park stays pending, and the
-    /// next call drains its train before its own can start.
-    pub(crate) fn round_trip(&mut self, req: Request<'_>) -> Result<Reply, ClientError> {
-        let slot = self.submit(req)?;
-        let mut ready = Interest::WRITE;
-        loop {
-            match self.step(ready) {
-                Ok(mut done) => {
-                    if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
-                        return done.swap_remove(i).1;
-                    }
-                }
-                Err(e) => {
-                    self.close();
-                    return Err(e);
-                }
-            }
-            ready = self.park()?;
-        }
-    }
-
-    /// `poll(2)`, returning the readiness as an `Interest`. The one poll that
-    /// does not retry `EINTR` in place: CPython installs its handlers without
-    /// `SA_RESTART`, so a signal lands here as `EINTR`, and that is when the
-    /// hook runs — a signal arriving anywhere else is delivered when the call
-    /// returns to its host, which is where the hot path stays free of the
-    /// hook's cost (a GIL acquisition, for the Python binding).
-    pub(crate) fn park(&mut self) -> Result<Interest, ClientError> {
-        let interest = self.interest();
-        if interest.is_empty() {
-            return Err(ClientError::Closed);
-        }
-        loop {
-            match poll_fd(self.transport.as_raw_fd(), interest.poll_events(), None, false) {
-                Ok(revents) => return Ok(Interest::from_revents(revents)),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    if let Some(hook) = self.park_hook.as_mut() {
-                        hook()?;
-                    }
-                }
-                Err(e) => return Err(ClientError::Protocol(ProtocolError::IoError(e))),
-            }
-        }
-    }
-
-    /// `round_trip` narrowed to a terminal frame.
-    pub(crate) fn round_trip_ack(&mut self, req: Request<'_>) -> Result<Message, ClientError> {
-        self.round_trip(req).map(|r| r.into_ack())
-    }
-
-    /// `round_trip` narrowed to a single relation's read result.
-    pub(crate) fn round_trip_scan(&mut self, req: Request<'_>) -> ScanResult {
-        self.round_trip(req).map(|r| r.into_scan())
-    }
-
-    /// An id allocation: one uncorrelated control frame, and the answer rides
-    /// the terminal frame's `target_id`.
-    fn alloc(&mut self, target_id: u64, flag: u64, count: u64) -> Result<u64, ClientError> {
-        Ok(self
-            .round_trip_ack(Request::Alloc { target_id, flag, count })?
-            .target_id)
-    }
-
-    pub(crate) fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc_table_ids(1)
-    }
-
-    /// Reserve a contiguous run of `count` relation ids — one round trip and one
-    /// durable sequence advance for the whole run, which is how a multi-segment
-    /// view chain draws its ids. The caller owns `[base, base + count)`. The count
-    /// rides in `seek_col_idx`, the field `alloc_serial_range` already uses for
-    /// it, so the frame is unchanged.
-    pub(crate) fn alloc_table_ids(&mut self, count: u64) -> Result<u64, ClientError> {
-        self.alloc(0, FLAG_ALLOCATE_TABLE_ID, count)
-    }
-
-    pub(crate) fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc(0, FLAG_ALLOCATE_SCHEMA_ID, 0)
-    }
-
-    pub(crate) fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc_index_ids(1)
-    }
-
-    /// [`Self::alloc_table_ids`] for index ids — what a `CREATE TABLE` with `n`
-    /// inline `UNIQUE` constraints draws in one round trip.
-    pub(crate) fn alloc_index_ids(&mut self, count: u64) -> Result<u64, ClientError> {
-        self.alloc(0, FLAG_ALLOCATE_INDEX_ID, count)
-    }
-
-    /// Reserve a contiguous range of `count` SERIAL ids for the sequence keyed
-    /// by `seq_table_id`. Returns the range base; the caller owns
-    /// `[base, base + count)`. The range `count` rides in `seek_col_idx`, and
-    /// `target_id = seq_table_id ≠ 0` steers the master to the durable
-    /// range-advance branch.
-    pub(crate) fn alloc_serial_range(&mut self, seq_table_id: u64, count: u64) -> Result<u64, ClientError> {
-        self.alloc(seq_table_id, FLAG_ALLOCATE_SERIAL_RANGE, count)
-    }
-
-    /// One push, retried once on a mismatch: `feed` evicted the cache entry, so
-    /// the re-submit finds nothing warm and encodes cold. Retrying is safe only
-    /// because the blocking client has exactly one *live* operation, so nothing
-    /// can be ordered against it.
-    pub(crate) fn push_with_mode(
-        &mut self,
-        target_id: u64,
-        schema: &Schema,
-        batch: &ZSetBatch,
-        mode: WireConflictMode,
-    ) -> Result<u64, ClientError> {
-        let push = || Request::Push { target_id, schema, batch, mode };
-        let reply = match self.round_trip(push()) {
-            Err(ClientError::SchemaMismatch) => self.round_trip(push())?,
-            other => other?,
-        };
-        Ok(reply.into_lsn())
-    }
-
-    /// Send an atomic DDL transaction: a bundle of system-table family batches
-    /// (`FLAG_DDL_TXN`) that the server ingests under one durable SAL zone. Used
-    /// by every catalog write — a `CREATE`'s N families or a
-    /// `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single family. Returns the zone
-    /// LSN (echoed in the ACK's `seek_pk`, as `push` does).
-    ///
-    /// No schema cache interaction: system-table schemas are compile-time-fixed
-    /// and known to both sides, so the frame carries a schema block per family
-    /// (via `encode_wal_block`) and the server resolves each family's schema from
-    /// its own catalog.
-    pub(crate) fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<u64, ClientError> {
-        Ok(self.round_trip_ack(Request::DdlTxn(families))?.seek_pk as u64)
-    }
-
-    /// Send an atomic **user-table** push transaction (`FLAG_PUSH_TXN`): a bundle
-    /// of user-table families — each carrying its conflict mode and its schema
-    /// block — that the server validates as a unit under the union of the
-    /// involved table locks and commits under one durable SAL zone. Returns the
-    /// zone LSN (echoed in the ACK's `seek_pk`, as `push` does).
-    ///
-    /// The reply is received uncorrelated, exactly as `push_ddl_txn` does. Each
-    /// family's batch is validated in `submit` before encoding, and `submit`
-    /// bounds the frame against the server ingress cap so an oversized bundle
-    /// fails locally.
-    ///
-    /// `preconditions` carries the OCC `(tid, basis)` assertions ("`tid` not
-    /// written since `basis`"); the server rejects the whole transaction with
-    /// `ClientError::TxnConflict` if any fails. Every precondition tid must be a
-    /// family tid (the engine rejects otherwise). Pass an empty slice for none.
-    pub(crate) fn push_txn(
-        &mut self,
-        families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)],
-        preconditions: &[(u64, u64)],
-    ) -> Result<u64, ClientError> {
-        Ok(self
-            .round_trip_ack(Request::PushTxn { families, preconditions })?
-            .seek_pk as u64)
-    }
-
-    pub(crate) fn scan(&mut self, target_id: u64) -> ScanResult {
-        self.round_trip_scan(Request::scan(target_id))
-    }
-
-    /// Consistent multi-relation scan: snapshot every relation in `tids` at one
-    /// server-side SAL cut and return their results in request order. An atomic
-    /// multi-table commit (a `push_txn`) is either visible in every result or in
-    /// none — never torn across the set. `scan_multi(&[t]) == scan(t)`.
-    ///
-    /// Sends one SCAN_MULTI frame stamped with each relation's cached schema
-    /// version (so warm relations omit their schema block), then reads the N
-    /// reply trains positionally, each decoded and cache-absorbed under its own
-    /// relation. Like `scan`, it does not advance any commit watermark. A
-    /// duplicate tid or a list outside `1..=SCAN_MULTI_MAX_RELATIONS` is
-    /// rejected locally by the shared frame encoder (the same check the server
-    /// runs) before the frame is sent; other shape/tid errors surface from the
-    /// server as `ClientError::ServerError`.
-    pub(crate) fn scan_multi(&mut self, tids: &[u64]) -> MultiScanResult {
-        self.round_trip(Request::ScanMulti(tids)).map(|r| r.into_multi())
-    }
-
-    pub(crate) fn seek(&mut self, target_id: u64, pk: u128, pk_extra: &[u8]) -> ScanResult {
-        self.round_trip_scan(Request::seek(target_id, pk, pk_extra))
-    }
-
-    /// Describe one relation in a single round trip: `(live tid, schema,
-    /// descriptor)`, or `None` when no such relation exists — a successful
-    /// answer the caller renders in its own wording.
-    ///
-    /// The reply is received uncorrelated: a by-name resolve names no id, so
-    /// the requested tid is 0 and only the frame's own `target_id` says which
-    /// relation answered. `feed` absorbs the block under that, so what the cache
-    /// holds is the wire schema; the foreign keys the descriptor carries are
-    /// merged into the copy the caller gets. A schema block carries no FK fields
-    /// at all, so every schema the server sends is FK-less already and a cold
-    /// scan would overwrite a merged one anyway.
-    pub(crate) fn resolve(
-        &mut self,
-        target: RelTarget<'_>,
-    ) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
-        self.round_trip(Request::Resolve(target)).map(|r| r.into_resolve())
-    }
-
     /// The RESOLVE request frame for `target`. The one place the wire's "name
     /// wins, else id" encoding is spelled: the name rides an explicit extra
     /// blob rather than the seek-key channel, whose split would leave the first
@@ -1148,57 +901,6 @@ impl Session {
             RelTarget::Id(tid) => (tid, ""),
         };
         encode_control_frame(target_id, self.client_id, FLAG_RESOLVE, 0, 0, qname.as_bytes())
-    }
-
-    /// A parameterized bounded read, its replies concatenated under `reply_schema`.
-    pub(crate) fn scan_spec(
-        &mut self,
-        target_id: u64,
-        spec: &gnitz_wire::ReadSpec,
-        reply_schema: &ReplySchema,
-    ) -> Result<ZSetBatch, ClientError> {
-        Ok(self
-            .round_trip(Request::ScanSpec { target_id, spec, reply_schema })?
-            .into_rows())
-    }
-
-    /// One view's DELTA_POLL, driven to completion: its raw blocks and terminal frame.
-    pub(crate) fn delta_read(
-        &mut self,
-        view_id: u64,
-        after_tick: u64,
-        reply: &ReplySchema,
-    ) -> Result<(Vec<RawBlock>, Message), ClientError> {
-        let slot = self.submit_delta_poll(&[txn_frame::DeltaPollItem {
-            view_id,
-            after_tick,
-            reply_block: reply.block(),
-        }])?;
-        let mut got: Option<PolledView> = None;
-        let mut ready = Interest::WRITE;
-        loop {
-            let done = match self.step_polling(ready, &mut |s, view| {
-                if s == slot {
-                    got = Some(view)
-                }
-            }) {
-                Ok(done) => done,
-                Err(e) => {
-                    self.close();
-                    return Err(e);
-                }
-            };
-            if let Some((_, completed)) = done.into_iter().find(|(s, _)| *s == slot) {
-                // A per-view fault fills the position (`got`); only a frame-level
-                // rejection completes the slot without one.
-                return match (got, completed) {
-                    (Some(view), _) => view,
-                    (None, Err(e)) => Err(e),
-                    (None, Ok(_)) => unreachable!("a one-view poll completes by filling its position"),
-                };
-            }
-            ready = self.park()?;
-        }
     }
 
     /// The cached `(schema, version)` for `tid`. `get`, so a relation in use
@@ -1264,15 +966,12 @@ fn complete_head(
 }
 
 /// A RESOLVE train, as its terminal frame and the schema block it carried, as
-/// `(live tid, schema, descriptor)`, or `None` when no such relation exists.
+/// the descriptor, or `None` when no such relation exists.
 /// The descriptor's foreign keys are merged into the schema here:
 /// `batch_to_schema` rebuilds every column-layout fact but leaves the FK fields
 /// at 0, because a reference to *another* relation rides the descriptor.
 /// `decode` bounded every `col_idx` against this schema's column count.
-fn resolve_descriptor(
-    msg: Message,
-    schema: Option<Arc<Schema>>,
-) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
+fn resolve_descriptor(msg: Message, schema: Option<Arc<Schema>>) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
     let ncols = schema.as_ref().map_or(0, |s| s.columns.len());
     let Some(desc) = RelDescriptorBlob::decode(&msg.seek_pk_extra, ncols)? else {
         return Ok(None);
@@ -1285,7 +984,14 @@ fn resolve_descriptor(
             cols[fk.col_idx as usize].fk = Some(FkTarget::Table { id: fk.fk_table_id, col: fk.fk_col_idx });
         }
     }
-    Ok(Some((msg.target_id, schema, desc)))
+    Ok(Some(Arc::new(RelDescriptor {
+        tid: msg.target_id,
+        class: desc.class,
+        replicated: desc.replicated,
+        delta: desc.delta,
+        schema,
+        indexes: Arc::new(desc.indexes),
+    })))
 }
 
 #[cfg(test)]

@@ -5,50 +5,31 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use gnitz_tokio::{AsyncClient, Connection};
 use tokio::runtime::Runtime;
 
-/// A socket path nothing else in this process will claim.
-fn unique_path() -> PathBuf {
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("gnitz-tokio-{}-{n}.sock", std::process::id()))
-}
-
-/// Removes its socket path when the test ends.
-struct SockPath(PathBuf);
-
-impl Drop for SockPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Bind, then answer the client's HELLO on a thread of its own — `connect` is
-/// blocking, so somebody has to be servicing it — and hand the stream back.
-fn scripted_peer() -> (SockPath, std::thread::JoinHandle<UnixStream>) {
-    let path = SockPath(unique_path());
-    let listener = UnixListener::bind(&path.0).expect("bind");
-    let handle = std::thread::spawn(move || {
+/// A client connected to a peer that has answered its HELLO, and the peer's end.
+fn connect_to_peer(rt: &Runtime) -> (AsyncClient, Connection, UnixStream) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("peer.sock");
+    let listener = UnixListener::bind(&path).expect("bind");
+    // `connect` blocks until the HELLO is answered.
+    let peer = std::thread::spawn(move || {
         let (mut s, _) = listener.accept().expect("accept");
-        // The HELLO: a 4-byte LE length prefix and its payload.
-        let mut len = [0u8; 4];
-        s.read_exact(&mut len).expect("hello prefix");
-        let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
-        s.read_exact(&mut payload).expect("hello payload");
-        // `encode_hello_ack` frames the ACK itself. `u32::MAX` for the payload
-        // ceiling: the client clamps it to its own hard maximum.
+        read_frame(&mut s);
         s.write_all(&gnitz_wire::encode_hello_ack(u32::MAX, 0))
             .expect("hello ack");
         s
     });
-    (path, handle)
+    let (client, conn) = rt
+        .block_on(gnitz_tokio::connect(path.to_str().expect("utf-8 path")))
+        .expect("connect");
+    (client, conn, peer.join().unwrap())
 }
 
-/// One length-prefixed request frame the client wrote.
+/// One length-prefixed frame the client wrote.
 fn read_frame(s: &mut UnixStream) -> Vec<u8> {
     let mut len = [0u8; 4];
     s.read_exact(&mut len).expect("frame prefix");
@@ -57,19 +38,12 @@ fn read_frame(s: &mut UnixStream) -> Vec<u8> {
     payload
 }
 
-/// What `give_back`'s write rule exists for: a submit issued while a reply is
-/// outstanding must flush before that reply arrives. Giving back write
-/// readiness the fd never refused leaves it to be re-set only by the next read,
-/// so the second frame would wait for the first reply — pipelining lost rather
-/// than a hang, and invisible to a test that submits before the first flush.
+/// A submit issued while a reply is outstanding leaves before that reply
+/// arrives, rather than waiting for the next read to re-arm write readiness.
 #[test]
 fn a_submit_flushes_while_a_reply_is_outstanding() {
-    let (path, accepted) = scripted_peer();
     let rt = Runtime::new().unwrap();
-    let (client, conn) = rt
-        .block_on(gnitz_tokio::connect(path.0.to_str().unwrap()))
-        .expect("connect");
-    let mut peer = accepted.join().unwrap();
+    let (client, conn, mut peer) = connect_to_peer(&rt);
     // A stall shows up as a failed read rather than a hung test.
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
@@ -100,12 +74,8 @@ fn a_submit_flushes_while_a_reply_is_outstanding() {
 /// A dead peer fails every outstanding operation rather than hanging one.
 #[test]
 fn a_connection_error_fails_every_outstanding_operation() {
-    let (path, accepted) = scripted_peer();
     let rt = Runtime::new().unwrap();
-    let (client, conn) = rt
-        .block_on(gnitz_tokio::connect(path.0.to_str().unwrap()))
-        .expect("connect");
-    let mut peer = accepted.join().unwrap();
+    let (client, conn, mut peer) = connect_to_peer(&rt);
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let driver = rt.spawn(conn);
@@ -133,12 +103,8 @@ fn a_connection_error_fails_every_outstanding_operation() {
 /// Dropping every handle closes the channel; the driver quiesces and completes.
 #[test]
 fn dropping_every_handle_ends_the_connection() {
-    let (path, accepted) = scripted_peer();
     let rt = Runtime::new().unwrap();
-    let (client, conn) = rt
-        .block_on(gnitz_tokio::connect(path.0.to_str().unwrap()))
-        .expect("connect");
-    let _peer = accepted.join().unwrap();
+    let (client, conn, _peer) = connect_to_peer(&rt);
 
     let driver = rt.spawn(conn);
     drop(client);
@@ -151,49 +117,15 @@ fn dropping_every_handle_ends_the_connection() {
     );
 }
 
-/// The four mirror accessors are total: a handle that never attached answers as
-/// a store-less `GnitzClient` does rather than refusing.
-#[test]
-fn an_unattached_handle_answers_every_mirror_accessor() {
-    let (path, accepted) = scripted_peer();
-    let rt = Runtime::new().unwrap();
-    let (client, _conn) = rt
-        .block_on(gnitz_tokio::connect(path.0.to_str().unwrap()))
-        .expect("connect");
-    let _peer = accepted.join().unwrap();
-
-    rt.block_on(async {
-        assert!(
-            !client.mirrors(7).await.unwrap(),
-            "a handle with no store mirrors nothing"
-        );
-        assert!(
-            client.cursor_of(7).await.unwrap().is_none(),
-            "no copy means no round to report"
-        );
-        assert!(
-            client.mirrored_ids().await.unwrap().is_empty(),
-            "no copy means no registrations"
-        );
-        assert!(
-            client.mirror_poisoned().await.unwrap().is_none(),
-            "no copy means nothing poisoned"
-        );
-    });
-}
-
 /// `abort` must resolve a waiter whose request never reached the wire. The
 /// `Connection` is kept alive past its own completion — what a `select!` on
 /// `&mut conn` leaves — so nothing drops the channel receiver on its behalf.
 #[test]
 fn a_verb_submitted_after_the_connection_died_still_resolves() {
-    let (path, accepted) = scripted_peer();
     let rt = Runtime::new().unwrap();
-    let (client, mut conn) = rt
-        .block_on(gnitz_tokio::connect(path.0.to_str().unwrap()))
-        .expect("connect");
-    // The peer's half closes, so the driver's first step reads EOF and aborts.
-    drop(accepted.join().unwrap());
+    let (client, mut conn, peer) = connect_to_peer(&rt);
+    // The driver's first step reads EOF and aborts.
+    drop(peer);
 
     let outstanding = rt.spawn({
         let c = client.clone();

@@ -10,7 +10,7 @@ integration = []
 gnitz-core = { path = "../gnitz-core" }
 # `net` brings `AsyncFd`, `rt` the runtime context it must be built inside plus
 # `spawn_blocking`, and `sync` the bounded mpsc and the oneshot the handle and
-# driver share.
+# driver share, and the mutex over the blocking client.
 tokio = { version = "1", default-features = false, features = ["net", "rt", "sync"] }
 
 [dev-dependencies]

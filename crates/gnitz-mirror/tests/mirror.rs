@@ -2568,9 +2568,7 @@ fn a_cross_rename_retracts_the_copy_that_lost_its_name() {
 /// A reconnect keeps every registration, is refused inside a transaction, and
 /// **closes the read gate** until the next poll.
 ///
-/// The park hook rides along too — that it does is asserted where it can be
-/// asserted without a signal race, over the session move `reconnect` performs
-/// (`gnitz-core`'s `a_taken_park_hook_moves_to_the_session_that_replaces_it`).
+/// The park hook is a client field `reconnect` carries into the rebuilt client.
 #[test]
 fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
     let _g = serial();

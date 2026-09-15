@@ -5,30 +5,20 @@
 //! resolving each reply against the request that asked for it. This crate owns
 //! how it waits.
 //!
-//! Off the surface deliberately: `execute_sql`, transactions, DDL and id
-//! allocation. Each is an interleaved read/compute/write sequence over
-//! `GnitzClient` state rather than a wire verb, so serving one here would mean
-//! blocking the driver task. They stay on the blocking client.
-//!
-//! **Mirroring is served by owning a blocking client that mirrors**, so the
-//! reconciliation state machine and every ordering rule its correctness rests on
-//! exist once and this crate runs that code instead of a second copy of it.
-//! Driving the feed here instead would mean rewriting that state machine as
-//! async: it interleaves round trips with blocking store calls, and the raw
-//! delta verbs the cursor protocol runs on are `gnitz-core`-private. The crate still
-//! links no engine: it takes an opened store, as the blocking client does.
+//! The wire verbs run on the driver; every other `GnitzClient` verb, mirroring
+//! included, runs through [`AsyncClient::with_blocking_client`].
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use gnitz_core::{
-    qualified_name, ClientError, DeltaCursor, GnitzClient, Interest, MirrorStore, PollOutcome, RelDescriptor,
-    RelTarget, Reply, Request, ScanReply, Schema, Session, SlotId, WireConflictMode, ZSetBatch,
+    qualified_name, ClientError, GnitzClient, Interest, RelDescriptor, RelTarget, Reply, Request, ScanReply, Schema,
+    Session, SlotId, WireConflictMode, ZSetBatch,
 };
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::{mpsc, oneshot};
@@ -48,40 +38,36 @@ struct Submission {
     reply: oneshot::Sender<Result<Reply, ClientError>>,
 }
 
-/// A channel sender, plus the second client a copy lives inside once one is
-/// attached: `Send + Sync + Clone`. Every method takes `&self`, so sharing one
+/// A channel sender, plus the blocking client every clone shares:
+/// `Send + Sync + Clone`. Every method takes `&self`, so sharing one
 /// is a clone.
 #[derive(Clone)]
 pub struct AsyncClient {
     tx: mpsc::Sender<Submission>,
-    /// What [`AsyncClient::attach_mirror`] connects the feed's own client to.
+    /// What the blocking client connects to.
     target: Arc<str>,
-    /// The blocking client the copy lives inside, once a host attaches a store.
-    /// `Arc` so a clone sees an install on any other; `Mutex<Option<_>>` so the
-    /// `&self` methods every verb takes can install into it and reach it.
-    mirror: Arc<Mutex<Option<GnitzClient>>>,
+    /// The blocking client, `None` until the first
+    /// [`AsyncClient::with_blocking_client`].
+    client: Arc<tokio::sync::Mutex<Option<GnitzClient>>>,
 }
 
-// The handle is shared by cloning, so this is what it promises; the mirror field
+// The handle is shared by cloning, so this is what it promises; the client field
 // is the one thing that could take it away silently.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<AsyncClient>();
 };
 
-/// The mirror slot, recovering a poisoned lock: what it guards is a client whose
-/// own poison state is the real verdict, and a panicking task must not take
-/// every later mirror call down with it.
-fn lock(slot: &Mutex<Option<GnitzClient>>) -> MutexGuard<'_, Option<GnitzClient>> {
-    slot.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Run `f` on a blocking pool thread. A panic in it reaches the caller as an
-/// error rather than aborting the runtime.
+/// Run `f` on a blocking pool thread. A panic in it resumes on the caller.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, ClientError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| ClientError::ServerError(format!("blocking task failed: {e}")))
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => Ok(v),
+        Err(e) => match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            // A blocking task is cancelled only by runtime shutdown.
+            Err(_) => Err(ClientError::Closed),
+        },
+    }
 }
 
 /// Connect to `target` and hand back the handle paired with the driver that
@@ -103,7 +89,7 @@ pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientEr
         AsyncClient {
             tx,
             target,
-            mirror: Arc::new(Mutex::new(None)),
+            client: Arc::new(tokio::sync::Mutex::new(None)),
         },
         Connection {
             session,
@@ -178,169 +164,42 @@ impl AsyncClient {
         let qname = qualified_name(schema_name, name);
         self.call(move |s| s.submit(Request::Resolve(RelTarget::Name(&qname))))
             .await
-            .map(|r| {
-                r.into_resolve()
-                    .map(|(tid, schema, blob)| Arc::new(RelDescriptor::from_resolve(tid, schema, blob)))
-            })
+            .map(Reply::into_resolve)
     }
 
-    // ── Mirroring ──────────────────────────────────────────────────────────
-    //
-    // The verbs hop to a blocking-pool thread: the lock is held across a whole
-    // poll, so waiting for it would stall a reactor thread that long. The
-    // accessors hop only when the slot is contended. A mirroring handle also
-    // holds a second connection — the feed's — and so a second server-side slot.
-
-    /// Read a local copy of one or more views through `store`.
-    ///
-    /// Refused if this handle, or any clone of it, already mirrors — the store
-    /// passed in is dropped, releasing its `flock`. Opening a store is itself
-    /// blocking work, so a host should do that off the reactor too.
-    ///
-    /// The lock spans the whole connect-and-install, and has to: two clones
-    /// calling this at once would otherwise both see no store, both connect, and
-    /// one install would silently drop the other's client — a checkpoint and a
-    /// released `flock`.
-    pub async fn attach_mirror(&self, store: impl MirrorStore + 'static) -> Result<(), ClientError> {
-        let slot = Arc::clone(&self.mirror);
-        let target = Arc::clone(&self.target);
-        blocking(move || {
-            let mut held = lock(&slot);
-            if held.is_some() {
-                return Err(ClientError::ServerError(
-                    "this handle already mirrors; close_mirror before attaching another store".to_string(),
-                ));
-            }
-            let mut client = GnitzClient::connect(&target)?;
-            client.attach_mirror(store)?;
-            *held = Some(client);
-            Ok(())
-        })
-        .await?
-    }
-
-    /// Checkpoint (unless poisoned) and release the store, reporting the final
-    /// checkpoint. The handle can attach again afterwards.
-    ///
-    /// A drop forfeits the rounds since the last checkpoint — at most one
-    /// bootstrap per view, when the feed no longer covers them.
-    pub async fn close_mirror(&self) -> Result<(), ClientError> {
-        let slot = Arc::clone(&self.mirror);
-        blocking(move || {
-            // Taken out in one statement, so the guard drops before the fsync
-            // below and a close stalls no other clone.
-            let mut taken = lock(&slot).take().ok_or(ClientError::NoMirrorStore)?;
-            taken.close_mirror()
-        })
-        .await?
-    }
-
-    /// Mirror `schema_name.name` and bring its copy up to date.
-    pub async fn mirror_view(&self, schema_name: &str, name: &str) -> Result<PollOutcome, ClientError> {
-        let (schema_name, name) = (schema_name.to_string(), name.to_string());
-        self.on_mirror(move |c| c.mirror_view(&schema_name, &name)).await
-    }
-
-    /// Advance every mirrored view by one poll each, one entry per view.
-    ///
-    /// One whole advance runs inside one `spawn_blocking` under the one lock and
-    /// spans no `await`, so two clones polling the same view serialize instead of
-    /// both reading cursor `c`, both fetching `(c, …]` and both applying it —
-    /// which would double every weight in the interval while the row set stayed
-    /// identical.
-    pub async fn poll_mirror(&self) -> Result<Vec<PollOutcome>, ClientError> {
-        self.on_mirror(GnitzClient::poll_mirror).await
-    }
-
-    /// Stop mirroring `table_id`.
-    pub async fn forget_view(&self, table_id: u64) -> Result<(), ClientError> {
-        self.on_mirror(move |c| c.forget_view(table_id)).await
-    }
-
-    /// Make every copy and its cursor durable.
-    pub async fn checkpoint_mirror(&self) -> Result<(), ClientError> {
-        self.on_mirror(GnitzClient::checkpoint_mirror).await
-    }
-
-    /// Whether a read of `table_id` is answered off the copy. `false` on a
-    /// handle that mirrors nothing.
-    pub async fn mirrors(&self, table_id: u64) -> Result<bool, ClientError> {
-        self.on_mirror_or(false, move |c| c.mirrors(table_id)).await
-    }
-
-    /// The round a local read of `table_id` answers at. `None` on a handle that
-    /// mirrors nothing.
-    pub async fn cursor_of(&self, table_id: u64) -> Result<Option<DeltaCursor>, ClientError> {
-        self.on_mirror_or(None, move |c| c.cursor_of(table_id)).await
-    }
-
-    /// Every registration the copy holds. Empty on a handle that mirrors
-    /// nothing.
-    pub async fn mirrored_ids(&self) -> Result<Vec<u64>, ClientError> {
-        self.on_mirror_or(Vec::new(), |c| c.mirrored_ids()).await
-    }
-
-    /// The message that poisoned the copy, if any. `None` on a handle that
-    /// mirrors nothing.
-    pub async fn mirror_poisoned(&self) -> Result<Option<String>, ClientError> {
-        self.on_mirror_or(None, |c| c.mirror_poisoned().map(str::to_string))
-            .await
-    }
-
-    /// Run `f` on the installed client, under the lock, on a blocking thread.
-    async fn on_mirror<T: Send + 'static>(
+    /// Run `f` on a blocking thread against the handle's `GnitzClient`, which
+    /// every clone shares and whose connection opens on first use. Callers
+    /// serialize for the whole of `f`.
+    pub async fn with_blocking_client<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut GnitzClient) -> Result<T, ClientError> + Send + 'static,
     ) -> Result<T, ClientError> {
-        let slot = Arc::clone(&self.mirror);
+        let target = Arc::clone(&self.target);
+        let mut slot = Arc::clone(&self.client).lock_owned().await;
         blocking(move || {
-            let mut held = lock(&slot);
-            f(held.as_mut().ok_or(ClientError::NoMirrorStore)?)
+            let client = match slot.take() {
+                Some(c) => c,
+                None => GnitzClient::connect(&target)?,
+            };
+            f(slot.insert(client))
         })
         .await?
     }
 
-    /// Ask the installed client, or answer as a store-less `GnitzClient` does.
-    /// Uncontended it answers on the caller's thread — an O(1) map read against
-    /// a ~30 µs hop; a contended slot means a poll holds the lock, so it hops.
-    async fn on_mirror_or<T: Send + 'static>(
-        &self,
-        none: T,
-        f: impl FnOnce(&GnitzClient) -> T + Send + 'static,
-    ) -> Result<T, ClientError> {
-        if let Ok(held) = self.mirror.try_lock() {
-            return Ok(held.as_ref().map_or(none, f));
-        }
-        let slot = Arc::clone(&self.mirror);
-        blocking(move || lock(&slot).as_ref().map_or(none, f)).await
-    }
-
     /// [`Self::scan`], answered off the copy when it holds `tid`.
-    ///
-    /// A handle that never attached takes the wire path with no thread hop.
-    /// Otherwise one `spawn_blocking` asks the client's `scan_local`, and a
-    /// relation it does not mirror is delegated on the async path, keeping the
-    /// driver's back-pressure and its reply's LSN.
-    ///
-    /// [`Self::seek`] and [`Self::scan_many`] stay wire-only: no caller has
-    /// needed a local-first form of either.
     pub async fn scan_local_first(&self, tid: u64) -> Result<ScanReply, ClientError> {
-        // A slot we cannot read means an installed store — a poisoned lock
-        // included, which `lock` below recovers. The guard drops with this
-        // statement, so the hop does not wait on a lock this task holds.
-        let attached = !matches!(self.mirror.try_lock().as_deref(), Ok(None));
-        if attached {
-            let slot = Arc::clone(&self.mirror);
-            let local = blocking(move || match lock(&slot).as_mut() {
-                Some(c) => c.scan_local(tid),
-                None => Ok(None),
-            })
-            .await??;
-            if let Some(reply) = local {
-                return Ok(reply);
+        let local = {
+            let mut slot = Arc::clone(&self.client).lock_owned().await;
+            if slot.as_ref().is_some_and(|c| c.mirrors(tid)) {
+                blocking(move || slot.as_mut().map_or(Ok(None), |c| c.scan_local(tid))).await??
+            } else {
+                None
             }
+        };
+        match local {
+            Some(reply) => Ok(reply),
+            None => self.scan(tid).await,
         }
-        self.scan(tid).await
     }
 }
 
@@ -389,18 +248,12 @@ impl Connection {
         }
     }
 
-    /// Abandon every pending slot with `cause`, then hand it back as this
-    /// driver's own result. `ClientError` is not `Clone`, so each slot gets a
-    /// rendering of it.
-    ///
-    /// The channel is closed and drained with them: a submission buffered here,
-    /// or sent after this, has no driver left to answer it and never reached the
-    /// wire.
+    /// Fail every waiter, sent or not, with `Closed`; `cause` is the driver's
+    /// own result.
     fn abort(&mut self, cause: ClientError) -> ClientError {
         self.session.close();
-        let text = cause.to_string();
         for (_, reply) in self.pending.drain(..) {
-            let _ = reply.send(Err(ClientError::ServerError(text.clone())));
+            let _ = reply.send(Err(ClientError::Closed));
         }
         self.rx.close();
         while let Ok(sub) = self.rx.try_recv() {

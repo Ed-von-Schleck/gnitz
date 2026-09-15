@@ -1,7 +1,12 @@
-use crate::connection::{MultiScanResult, RawBlock, RelTarget, ScanReply, ScanResult, Session};
+use crate::connection::{
+    Interest, MultiScanResult, PollSink, PolledView, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply,
+    ScanResult, Session, SlotId,
+};
 use crate::error::ClientError;
+use crate::protocol::transport::poll_fd;
 use crate::protocol::{
-    BatchAppender, ColumnDef, PkBuf, PkColumn, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
+    BatchAppender, ColumnDef, PkBuf, PkColumn, ProtocolError, ReplySchema, Schema, TypeCode, WireConflictMode,
+    ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -11,9 +16,10 @@ use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
+use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::{
-    RelClass, RelDescriptorBlob, TableProps, CIRCUIT_NODES_TAB, COL_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS,
-    IDX_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW, RELTAB_COL_NAME, RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB,
+    RelClass, TableProps, CIRCUIT_NODES_TAB, COL_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS, IDX_TAB,
+    OWNER_KIND_TABLE, OWNER_KIND_VIEW, RELTAB_COL_NAME, RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB,
     TABLE_TAB, VIEW_TAB,
 };
 
@@ -102,8 +108,20 @@ pub struct InlineUniqueIndex<'a> {
     pub name: &'a str,
 }
 
+/// A run of ids from one server-side sequence.
+enum IdRun {
+    Tables(u64),
+    Indexes(u64),
+    Schema,
+    /// The SERIAL sequence of `table_id`.
+    Serial {
+        table_id: u64,
+        count: u64,
+    },
+}
+
 /// A cached half-open range `[next, end)` of unissued SERIAL ids for one table,
-/// drawn from the master by `alloc_serial_range`. Cache-loss on disconnect
+/// drawn from the master by `reserve_serial_ids`. Cache-loss on disconnect
 /// discards the unissued tail (an intentional, PostgreSQL-style gap).
 struct SerialRange {
     next: u64,
@@ -255,36 +273,6 @@ pub struct PlannedView {
     pub delta_bytes: Option<u64>,
 }
 
-/// Everything a statement needs to know about one relation. The statement path
-/// drops one at `end_statement`, so nothing is retained there to go stale; a
-/// mirror registration holds one for its own life instead, kept fresh by
-/// invalidating that registration on every DDL that could move the binding.
-#[derive(Debug)]
-pub struct RelDescriptor {
-    pub tid: u64,
-    pub class: RelClass,
-    pub replicated: bool,
-    /// The view keeps a delta feed, so a DELTA_POLL of it is answerable.
-    pub delta: bool,
-    pub schema: Arc<Schema>,
-    pub indexes: Arc<Vec<IndexMeta>>,
-}
-
-impl RelDescriptor {
-    /// The descriptor a RESOLVE reply describes, from the three values
-    /// [`Reply::Resolve`](crate::Reply::Resolve) carries.
-    pub fn from_resolve(tid: u64, schema: Arc<Schema>, blob: RelDescriptorBlob) -> RelDescriptor {
-        RelDescriptor {
-            tid,
-            class: blob.class,
-            replicated: blob.replicated,
-            delta: blob.delta,
-            schema,
-            indexes: Arc::new(blob.indexes),
-        }
-    }
-}
-
 /// What one statement has already read, dropped whole at `end_statement`.
 ///
 /// One entry per resolved canonical `"schema.name"`, absent verdicts included,
@@ -332,8 +320,13 @@ impl CatalogSnapshot {
     }
 }
 
+/// Run when a signal interrupts a blocking call's wait; an `Err` aborts the call.
+/// The Python binding checks for Ctrl-C here.
+pub type ParkHook = Box<dyn FnMut() -> Result<(), ClientError> + Send>;
+
 pub struct GnitzClient {
     pub(crate) session: Session,
+    pub(crate) park_hook: Option<ParkHook>,
     serial_cache: HashMap<u64, SerialRange>,
     /// What the current statement has resolved and scanned; `None` outside a
     /// statement, so a read issued between statements always hits the wire.
@@ -395,6 +388,7 @@ impl GnitzClient {
         let (session, last_seen_lsn) = Session::connect(target)?;
         Ok(GnitzClient {
             session,
+            park_hook: None,
             serial_cache: HashMap::new(),
             scope: None,
             txn: None,
@@ -410,6 +404,7 @@ impl GnitzClient {
     pub(crate) fn from_session(session: Session) -> GnitzClient {
         GnitzClient {
             session,
+            park_hook: None,
             serial_cache: HashMap::new(),
             scope: None,
             txn: None,
@@ -424,18 +419,42 @@ impl GnitzClient {
         self.session.requests_sent()
     }
 
-    /// Install (or clear) the hook the blocking client runs before each park
-    /// on the fd; its `Err` aborts the operation in progress and leaves the
-    /// connection usable for the next call. The client holds no hook of its
-    /// own — the parking code lives in the session.
-    pub fn set_park_hook(&mut self, hook: Option<crate::connection::ParkHook>) {
-        self.session.set_park_hook(hook);
+    pub fn set_park_hook(&mut self, hook: Option<ParkHook>) {
+        self.park_hook = hook;
     }
 
     /// The client's current OCC basis (running max of observed watermarks).
     /// Read by the SQL layer as its autocommit/BEGIN basis.
     pub fn last_seen_lsn(&self) -> u64 {
         self.last_seen_lsn
+    }
+
+    // ── The blocking driver ────────────────────────────────────────────────
+
+    pub(crate) fn round_trip(&mut self, req: Request<'_>) -> Result<Reply, ClientError> {
+        let slot = self.session.submit(req)?;
+        self.await_slot(slot, None)
+    }
+
+    /// Step and park until `slot` completes, handing `sink` every delta-poll
+    /// position the steps fill.
+    fn await_slot(&mut self, slot: SlotId, mut sink: Option<&mut PollSink<'_>>) -> Result<Reply, ClientError> {
+        let mut ready = Interest::WRITE;
+        loop {
+            match self.session.step_polling(ready, sink.as_deref_mut()) {
+                Ok(mut done) => {
+                    if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
+                        return done.swap_remove(i).1;
+                    }
+                }
+                Err(e) => {
+                    // The framing is lost.
+                    self.session.close();
+                    return Err(e);
+                }
+            }
+            ready = park(&self.session, &mut self.park_hook)?;
+        }
     }
 
     /// Advance `last_seen_lsn` from a commit reply: `Ok(lsn)` and a
@@ -496,7 +515,7 @@ impl GnitzClient {
             // Refill, abandoning whatever tail the old range still held.
             _ => {
                 let want = count.max(SERIAL_RANGE_SIZE);
-                let base = self.session.alloc_serial_range(table_id, want)?;
+                let base = self.alloc(IdRun::Serial { table_id, count: want })?;
                 self.serial_cache
                     .insert(table_id, SerialRange { next: base + count, end: base + want });
                 Ok(base)
@@ -506,16 +525,28 @@ impl GnitzClient {
 
     // --- Raw ops ---
 
+    /// Allocate `run`, returning its first id.
+    fn alloc(&mut self, run: IdRun) -> Result<u64, ClientError> {
+        let (target_id, flag, count) = match run {
+            IdRun::Tables(n) => (0, FLAG_ALLOCATE_TABLE_ID, n),
+            IdRun::Indexes(n) => (0, FLAG_ALLOCATE_INDEX_ID, n),
+            IdRun::Schema => (0, FLAG_ALLOCATE_SCHEMA_ID, 1),
+            IdRun::Serial { table_id, count } => (table_id, FLAG_ALLOCATE_SERIAL_RANGE, count),
+        };
+        self.round_trip(Request::Alloc { target_id, flag, count })
+            .map(Reply::into_id)
+    }
+
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
-        self.session.alloc_table_id()
+        self.alloc(IdRun::Tables(1))
     }
 
     pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
-        self.session.alloc_schema_id()
+        self.alloc(IdRun::Schema)
     }
 
     pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        self.session.alloc_index_id()
+        self.alloc(IdRun::Indexes(1))
     }
 
     pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
@@ -540,7 +571,7 @@ impl GnitzClient {
             txn.push(table_id, schema, batch.clone(), mode);
             return Ok(0);
         }
-        let r = self.session.push_with_mode(table_id, schema, batch, mode);
+        let r = self.send_push(table_id, schema, batch, mode);
         self.track_lsn(r)
     }
 
@@ -559,8 +590,25 @@ impl GnitzClient {
             txn.push(table_id, schema, batch, mode);
             return Ok(0);
         }
-        let r = self.session.push_with_mode(table_id, schema, &batch, mode);
+        let r = self.send_push(table_id, schema, &batch, mode);
         self.track_lsn(r)
+    }
+
+    /// A push, retried once on a schema mismatch — which evicted the stale cache
+    /// entry, so the retry goes out cold.
+    fn send_push(
+        &mut self,
+        target_id: u64,
+        schema: &Schema,
+        batch: &ZSetBatch,
+        mode: WireConflictMode,
+    ) -> Result<u64, ClientError> {
+        let push = || Request::Push { target_id, schema, batch, mode };
+        let reply = match self.round_trip(push()) {
+            Err(ClientError::SchemaMismatch) => self.round_trip(push())?,
+            other => other?,
+        };
+        Ok(reply.into_lsn())
     }
 
     /// Autocommit read-modify-write commit: ship a one-family, one-precondition
@@ -578,8 +626,11 @@ impl GnitzClient {
         basis: u64,
     ) -> Result<u64, ClientError> {
         let r = self
-            .session
-            .push_txn(&[(table_id, schema, batch, mode)], &[(table_id, basis)]);
+            .round_trip(Request::PushTxn {
+                families: &[(table_id, schema, batch, mode)],
+                preconditions: &[(table_id, basis)],
+            })
+            .map(Reply::into_lsn);
         self.track_lsn(r)
     }
 
@@ -596,7 +647,7 @@ impl GnitzClient {
     }
 
     pub fn scan(&mut self, table_id: u64) -> ScanResult {
-        self.session.scan(table_id)
+        self.round_trip(Request::scan(table_id)).map(Reply::into_scan)
     }
 
     /// Run a parameterized bounded read — the ad-hoc SELECT access path — decoding
@@ -607,8 +658,13 @@ impl GnitzClient {
         spec: &gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Result<ZSetBatch, ClientError> {
-        let rs = ReplySchema::new(Arc::clone(reply_schema), table_id);
-        self.session.scan_spec(table_id, spec, &rs)
+        let reply_schema = ReplySchema::new(Arc::clone(reply_schema), table_id);
+        self.round_trip(Request::ScanSpec {
+            target_id: table_id,
+            spec,
+            reply_schema: &reply_schema,
+        })
+        .map(Reply::into_rows)
     }
 
     // ── The read seam ──────────────────────────────────────────────────────
@@ -726,9 +782,8 @@ impl GnitzClient {
             ));
         }
         let mut fresh = GnitzClient::connect(target)?;
-        // The hook lives on the session a reconnect replaces, and it is what
-        // keeps a blocking call Ctrl-C-interruptible.
-        fresh.session.set_park_hook(self.session.take_park_hook());
+        // The hook is what keeps a blocking call Ctrl-C-interruptible.
+        fresh.park_hook = self.park_hook.take();
         fresh.mirror = self.mirror.take();
         if let Some(m) = fresh.mirror.as_deref_mut() {
             m.store.clear_cursors();
@@ -813,22 +868,38 @@ impl GnitzClient {
         after_tick: u64,
         reply_schema: &ReplySchema,
     ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
-        let (blocks, terminal) = self.session.delta_read(view_id, after_tick, reply_schema)?;
-        Ok((blocks, DeltaCursor::from_watermark(terminal.seek_pk)))
+        let item = DeltaPollItem {
+            view_id,
+            after_tick,
+            reply_block: reply_schema.block(),
+        };
+        let slot = self.session.submit_delta_poll(&[item])?;
+        let mut got: Option<PolledView> = None;
+        let mut sink = |s: SlotId, view: PolledView| {
+            if s == slot {
+                got = Some(view);
+            }
+        };
+        // A per-view fault fills the position and completes the slot `Ok`; a
+        // frame-level rejection completes it `Err` with no position filled.
+        self.await_slot(slot, Some(&mut sink))?;
+        let (blocks, watermark) = got.expect("a one-view poll completes by filling its position")?;
+        Ok((blocks, DeltaCursor::from_watermark(watermark)))
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
-    /// in request order. An atomic multi-table `push_txn` is never observed torn
+    /// in request order. An atomic multi-table `txn_commit` is never observed torn
     /// across the result set. Like `scan`, it leaves `last_seen_lsn` untouched.
     pub fn scan_many(&mut self, table_ids: &[u64]) -> MultiScanResult {
-        self.session.scan_multi(table_ids)
+        self.round_trip(Request::ScanMulti(table_ids)).map(Reply::into_multi)
     }
 
     /// A point SEEK by primary key, in the wire's **native** key space, split by
     /// `gnitz_wire::control::split_ctrl_key`. The engine OPK-encodes it against
     /// the relation's schema, so no caller here needs one.
     pub fn seek(&mut self, table_id: u64, pk: u128, pk_extra: &[u8]) -> ScanResult {
-        self.session.seek(table_id, pk, pk_extra)
+        self.round_trip(Request::seek(table_id, pk, pk_extra))
+            .map(Reply::into_scan)
     }
 
     /// The statement's descriptor for `tid` — the by-id twin of [`Self::resolve`].
@@ -839,7 +910,8 @@ impl GnitzClient {
         if let Some(d) = self.catalog().by_tid(tid) {
             return Ok(d);
         }
-        self.fetch_descriptor(RelTarget::Id(tid))?
+        self.round_trip(Request::Resolve(RelTarget::Id(tid)))
+            .map(Reply::into_resolve)?
             .ok_or_else(|| ClientError::NotFound { noun: "relation", name: tid.to_string() })
     }
 
@@ -883,7 +955,7 @@ impl GnitzClient {
         // No client-side name probe: the engine rejects a duplicate against both
         // the persisted `index_by_name` and the rest of this bundle. A rejected
         // bundle burns this index_id, which costs nothing — ids are never reused.
-        let index_id = self.session.alloc_index_id()?;
+        let index_id = self.alloc_index_id()?;
 
         let idx_schema = sys_schema(IDX_TAB);
         let mut batch = ZSetBatch::new(idx_schema);
@@ -910,7 +982,7 @@ impl GnitzClient {
     /// pre-check: a pre-check leaves a window a concurrent DROP can land in and
     /// resurface the "not found" it must suppress.
     pub fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
-        let scanned = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)?;
+        let scanned = checked_sys_rows(IDX_TAB, self.scan(IDX_TAB)?)?;
         let idx_schema = sys_schema(IDX_TAB);
         let mut batch = ZSetBatch::new(idx_schema);
         let mut retired: Vec<usize> = Vec::with_capacity(index_names.len());
@@ -938,7 +1010,7 @@ impl GnitzClient {
     /// `(id, name, indexed columns)` of every live secondary index. Names come back
     /// canonical (lowercase): every writer folds them at store time.
     pub fn index_rows(&mut self) -> Result<Vec<(u64, String, gnitz_wire::PkColList)>, ClientError> {
-        let idx_batch = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)?;
+        let idx_batch = checked_sys_rows(IDX_TAB, self.scan(IDX_TAB)?)?;
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)?.to_string();
@@ -1025,7 +1097,12 @@ impl GnitzClient {
         // every precondition tid is a family tid — the engine's `preconditions ⊆
         // families` rule holds by construction.
         let preconditions: Vec<(u64, u64)> = buf.read_set.iter().map(|&t| (t, buf.basis)).collect();
-        let r = self.session.push_txn(&fam_refs, &preconditions);
+        let r = self
+            .round_trip(Request::PushTxn {
+                families: &fam_refs,
+                preconditions: &preconditions,
+            })
+            .map(Reply::into_lsn);
         self.track_lsn(r)
     }
 
@@ -1056,7 +1133,7 @@ impl GnitzClient {
                 "DDL is not allowed inside a transaction".into(),
             ));
         }
-        self.session.push_ddl_txn(families)?;
+        self.round_trip(Request::DdlTxn(families))?;
         self.forget_retired_views(families);
         Ok(())
     }
@@ -1097,7 +1174,7 @@ impl GnitzClient {
         // illegal characters. The SQL planner has no CREATE SCHEMA surface, so
         // this client entry point is the sole enforcement for schema names.
         let name = gnitz_wire::canonical_identifier(name)?;
-        let new_sid = self.session.alloc_schema_id()?;
+        let new_sid = self.alloc_schema_id()?;
         let schema = sys_schema(SCHEMA_TAB);
         let mut batch = ZSetBatch::new(schema);
         gnitz_wire::sys_rows::write_schema_tab_row(
@@ -1192,7 +1269,7 @@ impl GnitzClient {
             .validate_against_pk(pk_cols.len())
             .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
 
-        let new_tid = self.session.alloc_table_id()?;
+        let new_tid = self.alloc_table_id()?;
         let schema_id = self.lookup_schema_id(&schema_name)?;
 
         // Encode the PK list using the shared wire packer so the engine
@@ -1242,7 +1319,7 @@ impl GnitzClient {
         }
         let mut families: Vec<(u64, ZSetBatch)> = vec![(COL_TAB, col_batch), (TABLE_TAB, tb)];
         if !unique_indexes.is_empty() {
-            let first_index_id = self.session.alloc_index_ids(unique_indexes.len() as u64)?;
+            let first_index_id = self.alloc(IdRun::Indexes(unique_indexes.len() as u64))?;
             let idx_schema = sys_schema(IDX_TAB);
             let mut idx_batch = ZSetBatch::new(idx_schema);
             {
@@ -1372,7 +1449,7 @@ impl GnitzClient {
         // The whole bundle is assigned in one allocation before any substitution
         // runs, because a downstream segment's `ScanDelta` names an upstream
         // segment by its chain-local slot.
-        let base = self.session.alloc_table_ids(views.len() as u64)?;
+        let base = self.alloc(IdRun::Tables(views.len() as u64))?;
         let vids: Vec<u64> = (0..views.len() as u64).map(|k| base + k).collect();
         // The user-named view is the bundle's last element, and every segment
         // names it as owner.
@@ -1506,7 +1583,7 @@ impl GnitzClient {
     fn schema_retractions(&mut self, family: u64, schema_id: u64) -> Result<ZSetBatch, ClientError> {
         let s = sys_schema(family);
         let mut out = ZSetBatch::new(s);
-        let scanned = checked_sys_rows(family, self.session.scan(family)?)?;
+        let scanned = checked_sys_rows(family, self.scan(family)?)?;
         for i in scanned.live_rows() {
             if col_u64(&scanned, s, RELTAB_COL_SCHEMA_ID, i) == schema_id {
                 out.copy_row_at(&scanned, i, -1);
@@ -1742,17 +1819,11 @@ impl GnitzClient {
         if let Some(hit) = self.catalog().get_qname(&qname) {
             return Ok(hit);
         }
-        let found = self.fetch_descriptor(RelTarget::Name(&qname))?;
+        let found = self
+            .round_trip(Request::Resolve(RelTarget::Name(&qname)))
+            .map(Reply::into_resolve)?;
         self.record_relation(qname, found.clone());
         Ok(found)
-    }
-
-    /// One RESOLVE round trip. `Ok(None)` is a relation-absent verdict.
-    fn fetch_descriptor(&mut self, target: RelTarget<'_>) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
-        let Some((tid, schema, blob)) = self.session.resolve(target)? else {
-            return Ok(None);
-        };
-        Ok(Some(Arc::new(RelDescriptor::from_resolve(tid, schema, blob))))
     }
 
     // --- Private catalog-lookup helpers ---
@@ -1761,7 +1832,7 @@ impl GnitzClient {
     /// missing row — or an entirely empty SCHEMA_TAB — is a
     /// [`ClientError::NotFound`], like every other catalog absence.
     pub(crate) fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
-        let batch = checked_sys_rows(SCHEMA_TAB, self.session.scan(SCHEMA_TAB)?)?;
+        let batch = checked_sys_rows(SCHEMA_TAB, self.scan(SCHEMA_TAB)?)?;
         find_schema_id(&batch, schema_name)?.ok_or_else(|| ClientError::NotFound {
             noun: "schema",
             name: schema_name.to_string(),
@@ -1775,8 +1846,27 @@ impl GnitzClient {
     fn seek_sys_row(&mut self, family: u64, id: u64) -> Result<ZSetBatch, ClientError> {
         // Every system family is keyed by a lone integer id, so the whole key
         // rides the control block's narrow word and the extra blob is empty.
-        let reply = self.session.seek(family, id as u128, &[])?;
+        let reply = self.seek(family, id as u128, &[])?;
         checked_sys_rows(family, reply)
+    }
+}
+
+/// Wait for the session's interest, running `hook` on every `EINTR`.
+pub(crate) fn park(session: &Session, hook: &mut Option<ParkHook>) -> Result<Interest, ClientError> {
+    let interest = session.interest();
+    if interest.is_empty() {
+        return Err(ClientError::Closed);
+    }
+    loop {
+        match poll_fd(session.as_raw_fd(), interest.poll_events(), None, false) {
+            Ok(revents) => return Ok(Interest::from_revents(revents)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if let Some(hook) = hook.as_mut() {
+                    hook()?;
+                }
+            }
+            Err(e) => return Err(ClientError::Protocol(ProtocolError::IoError(e))),
+        }
     }
 }
 
