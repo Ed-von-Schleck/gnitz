@@ -6,9 +6,7 @@
 //!
 //! Every system-table write flows through
 //! [`fire_hooks`](CatalogEngine::fire_hooks), which dispatches a static
-//! per-family sequence of two kinds of handler over a sign-partitioned view of
-//! the batch (all retractions before all insertions, so a rename's `-1,+1` pair
-//! on one PK applies in that order):
+//! per-family sequence of two kinds of handler over the batch:
 //!
 //! * `apply_*` — pure cache-delta appliers.
 //! * `hook_*` — side effects: directories, stores, DAG registrations, derived
@@ -59,9 +57,7 @@ use gnitz_wire::ViewProps;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
 pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID};
 pub(crate) use types::{ColumnDef, FkEdge};
-// The reply path's schema-wire-block encoders. The `SchemaWireEntry` they fill
-// is named only inside the catalog — the reply path takes one by value from
-// `schema_wire_entry` and reads its fields — so it is re-exported below.
+// The anonymous schema-wire-block encoder, for a schema no catalog entry describes.
 pub(crate) use schema_block::encode_schema_block;
 
 // Import everything from sys_tables for internal use.
@@ -71,7 +67,7 @@ use sys_tables::*;
 // ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
 //    the submodules through their `use super::*` glob, so they stay re-exported
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
-pub(in crate::catalog) use cache::{CatalogCacheSet, SchemaWireEntry};
+pub(in crate::catalog) use cache::CatalogCacheSet;
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
@@ -110,7 +106,8 @@ pub(crate) struct CatalogEngine {
     /// writer is already using.
     _dir_lock: fs::File,
 
-    /// Every derived lookup the catalog maintains from system-table deltas.
+    /// Every derived lookup the catalog maintains from system-table deltas and
+    /// relation registrations.
     pub(in crate::catalog) caches: CatalogCacheSet,
 
     /// True in the master process, whose index copies stay permanently empty:

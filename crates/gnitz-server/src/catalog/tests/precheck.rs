@@ -220,7 +220,7 @@ fn a_row_retracted_only_with_its_owner_refuses_an_unpaired_retraction() {
     assert!(err.contains("view 20 node 0"), "{err}");
 
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, 300, OWNER_KIND_TABLE, 1, &col_def("v", type_code::U64), -1);
+    push_col_tab_row(&mut bb, 300, 1, &col_def("v", type_code::U64), -1);
     let err = contract_err(&engine, SysFamily::Column, &bb.finish());
     assert!(err.contains("retracted only with its owner"), "{err}");
     assert!(err.contains("column 1 of owner 300"), "{err}");
@@ -261,14 +261,7 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
     // COL_TAB packs the owner into its PK, so its floor is the packed word —
     // and the message renders both halves rather than that word.
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(
-        &mut bb,
-        IDX_TAB_ID,
-        OWNER_KIND_TABLE,
-        0,
-        &col_def("id", type_code::U64),
-        1,
-    );
+    push_col_tab_row(&mut bb, IDX_TAB_ID, 0, &col_def("id", type_code::U64), 1);
     let err = contract_err(&engine, SysFamily::Column, &bb.finish());
     assert!(err.contains("a system column"), "{err}");
     assert!(err.contains(&format!("column 0 of owner {IDX_TAB_ID}")), "{err}");

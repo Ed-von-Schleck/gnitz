@@ -253,7 +253,7 @@ fn system_range_mutations_rejected() {
     // `_system._indices` away.
     let view_create = build_view_tab_row(IDX_TAB_ID, "v");
 
-    let members_before = engine.schema_member_count(PUBLIC_SCHEMA_ID);
+    let members_before = engine.schema_members(PUBLIC_SCHEMA_ID).len();
     for (family, batch, verb, noun) in [
         (SysFamily::Table, &table_drop, "DROP", "table"),
         (SysFamily::Table, &table_rename, "ALTER", "table"),
@@ -269,12 +269,12 @@ fn system_range_mutations_rejected() {
         assert!(engine.registry().has_id(family.id()), "{} unregistered", family.name());
     }
     assert_eq!(
-        engine.caches.entity_by_id.get(&IDX_TAB_ID),
-        Some(&("_system".to_string(), "_indices".to_string())),
+        engine.qualified_name_or_unknown(IDX_TAB_ID),
+        ("_system".to_string(), "_indices".to_string()),
         "the system relation must still resolve under its own name"
     );
     assert_eq!(engine.caches.entity_by_qname.get("public.v"), None);
-    assert_eq!(engine.schema_member_count(PUBLIC_SCHEMA_ID), members_before);
+    assert_eq!(engine.schema_members(PUBLIC_SCHEMA_ID).len(), members_before);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -318,14 +318,7 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
     // > 12 bytes — the Column precheck arm must reject it via the CAS.
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     for (weight, name) in [(-1i64, "stale_wrong_column_x"), (1i64, "new_column_name_here")] {
-        push_col_tab_row(
-            &mut bb,
-            tid,
-            OWNER_KIND_TABLE,
-            col_idx,
-            &col_def(name, type_code::U64),
-            weight,
-        );
+        push_col_tab_row(&mut bb, tid, col_idx, &col_def(name, type_code::U64), weight);
     }
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(
@@ -366,10 +359,7 @@ fn column_rename_on_non_base_owner_rejected() {
     let vid = register_identity_view(&mut engine, tid, "v", &cols);
 
     let err = engine
-        .precheck_family(
-            SysFamily::Column,
-            &col_alter_pair(vid, OWNER_KIND_VIEW, 0, &cols[0], rename_to("id2")),
-        )
+        .precheck_family(SysFamily::Column, &col_alter_pair(vid, 0, &cols[0], rename_to("id2")))
         .unwrap_err();
     assert!(err.contains("not a user base table"), "view owner: {err}");
 
@@ -381,7 +371,7 @@ fn column_rename_on_non_base_owner_rejected() {
     let err = engine
         .precheck_family(
             SysFamily::Column,
-            &col_alter_pair(IDX_TAB_ID, OWNER_KIND_TABLE, 0, &sys_col, rename_to("renamed")),
+            &col_alter_pair(IDX_TAB_ID, 0, &sys_col, rename_to("renamed")),
         )
         .unwrap_err();
     assert!(err.contains("cannot ALTER a system column"), "system owner: {err}");
@@ -410,13 +400,7 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
         engine
             .precheck_family(
                 SysFamily::Column,
-                &col_alter_pair(
-                    tid,
-                    OWNER_KIND_TABLE,
-                    col_idx as i64,
-                    &cols[col_idx],
-                    rename_to(new_name),
-                ),
+                &col_alter_pair(tid, col_idx as i64, &cols[col_idx], rename_to(new_name)),
             )
             .expect("renaming a column with dependent views is legal");
     }
@@ -447,10 +431,7 @@ fn hiding_a_foreign_key_column_rejected() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let err = engine
-        .precheck_family(
-            SysFamily::Column,
-            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], hide),
-        )
+        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], hide))
         .unwrap_err();
     assert!(err.contains("carries a foreign key"), "{err}");
 
@@ -465,17 +446,11 @@ fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
     engine.create_index("public.t", &["c"], false).unwrap();
 
     let err = engine
-        .precheck_family(
-            SysFamily::Column,
-            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], hide),
-        )
+        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], hide))
         .unwrap_err();
     assert!(err.contains("secondary index"), "{err}");
     engine
-        .precheck_family(
-            SysFamily::Column,
-            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], unnull),
-        )
+        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &cols[1], unnull))
         .expect("DROP NOT NULL on an indexed column is legal");
 
     engine.close();
@@ -489,10 +464,7 @@ fn hiding_or_unnulling_a_pk_column_rejected() {
 
     for mutate in [hide as fn(&mut ColumnDef), unnull] {
         let err = engine
-            .precheck_family(
-                SysFamily::Column,
-                &col_alter_pair(tid, OWNER_KIND_TABLE, 0, &cols[0], mutate),
-            )
+            .precheck_family(SysFamily::Column, &col_alter_pair(tid, 0, &cols[0], mutate))
             .unwrap_err();
         assert!(err.contains("primary-key"), "{err}");
     }
@@ -540,7 +512,7 @@ fn a_duplicate_add_column_is_named_before_dependent_views() {
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 2, &nullable_def("v", type_code::U64), 1);
+    push_col_tab_row(&mut bb, tid, 2, &nullable_def("v", type_code::U64), 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("duplicate column name"), "{err}");
 
@@ -555,15 +527,12 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
     let cols = vec![col_def("id", type_code::U64), col_def("a", type_code::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_dropped_col", &cols);
     engine
-        .ingest_to_family(COL_TAB_ID, &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &cols[1], hide))
+        .ingest_to_family(COL_TAB_ID, &col_alter_pair(tid, 1, &cols[1], hide))
         .unwrap();
     let hidden = ColumnDef { is_hidden: true, ..cols[1].clone() };
 
     let err = engine
-        .precheck_family(
-            SysFamily::Column,
-            &col_alter_pair(tid, OWNER_KIND_TABLE, 1, &hidden, rename_to("z")),
-        )
+        .precheck_family(SysFamily::Column, &col_alter_pair(tid, 1, &hidden, rename_to("z")))
         .unwrap_err();
     assert!(err.contains("dropped"), "rename: {err}");
 
@@ -608,9 +577,9 @@ fn insert_first_rename_pair_lands_the_new_name() {
         "the outgoing name must be unmapped"
     );
     assert_eq!(
-        engine.caches.entity_by_id.get(&tid).map(|(_, n)| n.as_str()),
-        Some("renamed"),
-        "entity_by_id must carry the new name"
+        engine.qualified_name_or_unknown(tid).1,
+        "renamed",
+        "the catalog must name the table by its new name"
     );
     assert!(
         engine.registry().has_id(tid),
@@ -638,7 +607,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
         )
         .unwrap();
     let append = |owner: i64, bb: &mut BatchBuilder| {
-        push_col_tab_row(bb, owner, OWNER_KIND_TABLE, 2, &nullable_def("w", type_code::I64), 1);
+        push_col_tab_row(bb, owner, 2, &nullable_def("w", type_code::I64), 1);
     };
 
     // An append bundled with an index family.

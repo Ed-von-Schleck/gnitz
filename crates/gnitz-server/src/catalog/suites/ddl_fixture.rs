@@ -37,7 +37,7 @@ impl CatalogEngine {
 
     pub(in crate::catalog) fn schema_is_empty(&self, schema_name: &str) -> bool {
         match self.caches.schema_by_name.get(schema_name) {
-            Some(&sid) => self.schema_member_count(sid) == 0,
+            Some(&sid) => self.schema_members(sid).is_empty(),
             None => true,
         }
     }
@@ -97,12 +97,7 @@ impl CatalogEngine {
         }
         let sid = self.schema_id(name).expect("the schema exists");
 
-        let members: Vec<i64> = self
-            .caches
-            .members_by_schema
-            .get(&sid)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
+        let members = self.schema_members(sid);
         let (views, tables): (Vec<i64>, Vec<i64>) = members
             .into_iter()
             .partition(|id| self.registry().relation(*id).is_some_and(|e| e.kind().is_view()));
@@ -156,7 +151,7 @@ impl CatalogEngine {
         let flags = gnitz_wire::TableProps::default().pack();
 
         // Write columns first (table hook reads them via sys_columns)
-        self.write_column_records(tid, OWNER_KIND_TABLE, col_defs)?;
+        self.write_column_records(tid, col_defs)?;
 
         // Write table record (triggers hook)
         {
@@ -270,27 +265,16 @@ impl CatalogEngine {
 
     // -- Write helpers for system tables -----------------------------------
 
-    pub(in crate::catalog) fn build_col_batch(
-        &self,
-        owner_id: i64,
-        kind: i64,
-        col_defs: &[ColumnDef],
-        weight: i64,
-    ) -> Batch {
+    pub(in crate::catalog) fn build_col_batch(&self, owner_id: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
         let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
         for (i, cd) in col_defs.iter().enumerate() {
-            push_col_tab_row(&mut bb, owner_id, kind, i as i64, cd, weight);
+            push_col_tab_row(&mut bb, owner_id, i as i64, cd, weight);
         }
         bb.finish()
     }
 
-    pub(crate) fn write_column_records(
-        &mut self,
-        owner_id: i64,
-        kind: i64,
-        col_defs: &[ColumnDef],
-    ) -> Result<(), String> {
-        let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
+    pub(crate) fn write_column_records(&mut self, owner_id: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
+        let batch = self.build_col_batch(owner_id, col_defs, 1);
         self.submit(SysFamily::Column, batch)
     }
 
@@ -320,7 +304,7 @@ impl CatalogEngine {
         cols: &[ColumnDef],
         pk: &[u32],
     ) -> Result<(), String> {
-        let col_batch = self.build_col_batch(tid, OWNER_KIND_TABLE, cols, 1);
+        let col_batch = self.build_col_batch(tid, cols, 1);
         self.ddl_sync(SysFamily::Column.id(), 0, col_batch)?;
 
         let mut bb = BatchBuilder::new(*SysFamily::Table.schema());

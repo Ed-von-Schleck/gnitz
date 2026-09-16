@@ -1,14 +1,6 @@
+use super::cache::RelationEntry;
 use super::*;
-
-/// The columns of a base table that carry a derived FK index circuit: every FK
-/// column outside the PK — a PK column is already stored in the PK region.
-fn fk_circuit_cols<'a>(schema: &'a SchemaDescriptor, col_defs: &'a [ColumnDef]) -> impl Iterator<Item = usize> + 'a {
-    col_defs
-        .iter()
-        .enumerate()
-        .filter(move |&(ci, cd)| cd.fk_table_id != 0 && !schema.is_pk_col(ci))
-        .map(|(ci, _)| ci)
-}
+use std::collections::hash_map::Entry;
 
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
@@ -22,8 +14,6 @@ impl CatalogEngine {
         batch: &Batch,
         on: OnRegister,
     ) -> Result<(), String> {
-        let reordered = Self::canonicalize_for_hooks(batch, family);
-        let batch = reordered.as_ref().unwrap_or(batch);
         if family.allocates_ids() {
             for i in batch.live_rows() {
                 let id = family.leading_id(batch.get_pk(i));
@@ -33,17 +23,10 @@ impl CatalogEngine {
         match family {
             SysFamily::Schema => self.apply_schema_caches(batch),
             SysFamily::Table | SysFamily::View => {
-                self.apply_entity_caches(family, batch);
+                self.apply_entity_caches(batch);
                 self.hook_relation_register(family, batch, on)?;
             }
-            SysFamily::Column => {
-                self.apply_col_names_invalidate(batch);
-                self.apply_fk_edges_and_locks(batch);
-                // MUST be last — after `apply_col_names_invalidate` evicts the
-                // cached col defs — so the descriptor rebuild reads the
-                // post-ALTER column defs.
-                self.hook_column_alter(batch, on)?;
-            }
+            SysFamily::Column => self.hook_column_change(batch)?,
             SysFamily::Index => {
                 self.apply_index_caches(batch);
                 self.hook_index_register(batch)?;
@@ -55,20 +38,6 @@ impl CatalogEngine {
             SysFamily::CircuitNodes => self.dag.apply_circuit_delta(batch),
         }
         Ok(())
-    }
-
-    /// `batch` with every retraction ahead of every insertion — batch-wide, since the
-    /// cache appliers read an outgoing name before its successor lands. `None` when
-    /// `batch` already is.
-    fn canonicalize_for_hooks(batch: &Batch, family: SysFamily) -> Option<Batch> {
-        // `false < true`, so "sorted by (weight > 0)" *is* "retractions first".
-        if (0..batch.len()).is_sorted_by_key(|i| batch.get_weight(i) > 0) {
-            return None;
-        }
-        // Total, because `precheck_family` rejects a delta carrying a zero weight.
-        let mut idx: Vec<u32> = batch.retracted_rows().map(|i| i as u32).collect();
-        idx.extend(batch.live_rows().map(|i| i as u32));
-        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &idx, family.schema()))
     }
 
     // -- Hook handlers ---------------------------------------------------------
@@ -102,17 +71,56 @@ impl CatalogEngine {
         // parent fsync.
         self.registry
             .register(RelationSpec { id, kind, schema, directory, props }, on)?;
+        self.enter_relation(id, kind, &schema, &col_defs);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
-        if kind.is_base_table() {
-            for ci in fk_circuit_cols(&schema, &col_defs) {
-                self.registry
-                    .add_index(id, ci as i64, &[ci as u32], false)
-                    .map_err(|e| format!("{} '{name}' (id={id}) FK index on column {ci}: {e}", kind.noun()))?;
-            }
+        for ci in self.fk_circuit_cols(id) {
+            self.registry
+                .add_index(id, ci as i64, &[ci as u32], false)
+                .map_err(|e| format!("{} '{name}' (id={id}) FK index on column {ci}: {e}", kind.noun()))?;
         }
-        self.recompute_needs_lock(id);
         Ok(())
+    }
+
+    /// Enter registered relation `id`'s [`RelationEntry`], and index the FK edges it
+    /// declares by parent. Only a base table's column records declare one.
+    pub(in crate::catalog) fn enter_relation(
+        &mut self,
+        id: i64,
+        kind: RelationKind,
+        schema: &SchemaDescriptor,
+        defs: &[ColumnDef],
+    ) {
+        let fks: Vec<FkEdge> = defs
+            .iter()
+            .enumerate()
+            .filter(|(_, cd)| kind.is_base_table() && cd.fk_table_id != 0)
+            .map(|(ci, cd)| FkEdge {
+                child_tid: id,
+                fk_col: ci,
+                parent_tid: cd.fk_table_id,
+                parent_col: cd.fk_col_idx as usize,
+            })
+            .collect();
+        for e in &fks {
+            self.caches.fk_by_parent.entry(e.parent_tid).or_default().push(*e);
+        }
+        self.caches
+            .relations
+            .insert(id, RelationEntry::new(id, schema, defs, fks));
+    }
+
+    /// The FK columns of `id` that carry a derived index circuit: those outside its
+    /// PK, whose region already stores them.
+    fn fk_circuit_cols(&self, id: i64) -> Vec<usize> {
+        let Some(schema) = self.registry.relation(id).map(Relation::schema) else {
+            return Vec::new();
+        };
+        self.fk_constraints_of(id)
+            .iter()
+            .map(|e| e.fk_col)
+            .filter(|&c| !schema.is_pk_col(c))
+            .collect()
     }
 
     /// Tear relation `id` out of the registry. Its owned system rows are retracted by
@@ -123,9 +131,17 @@ impl CatalogEngine {
             return;
         }
         self.dag.unregister_table(&mut self.registry, id);
-        // Final: `apply_col_names_invalidate` bumps no unregistered owner.
-        self.caches.purge_schema_version(id);
-        self.recompute_needs_lock(id);
+        self.caches.fk_by_parent.remove(&id);
+        if let Some(entry) = self.caches.relations.remove(&id) {
+            for e in entry.fks {
+                if let Entry::Occupied(mut edges) = self.caches.fk_by_parent.entry(e.parent_tid) {
+                    edges.get_mut().retain(|x| x.child_tid != id);
+                    if edges.get().is_empty() {
+                        edges.remove();
+                    }
+                }
+            }
+        }
     }
 
     /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
@@ -144,7 +160,6 @@ impl CatalogEngine {
         // scans.
         creates.sort_unstable_by_key(|c| c.0);
         for (id, row) in creates {
-            // System tables are registered by `open` before replay reaches their rows.
             if self.registry.has_id(id) {
                 continue;
             }
@@ -200,39 +215,35 @@ impl CatalogEngine {
         })
     }
 
-    /// Rebuild the descriptor of every registered base table a `+1` column row lands
-    /// on, and publish it if it changed. A CREATE's columns land before its owner
-    /// registers, so only an ALTER reaches the rebuild.
-    fn hook_column_alter(&mut self, batch: &Batch, on: OnRegister) -> Result<(), String> {
-        if on == OnRegister::BootReplay {
-            return Ok(());
-        }
-        let mut owners: Vec<i64> = batch
-            .live_rows()
+    /// Apply a column ALTER (or its compensation) to every registered owner.
+    fn hook_column_change(&mut self, batch: &Batch) -> Result<(), String> {
+        let mut owners: Vec<i64> = (0..batch.len())
             .map(|i| SysFamily::Column.leading_id(batch.get_pk(i)))
             .collect();
         owners.sort_unstable();
         owners.dedup();
         for owner in owners {
-            let Some(cur) = self
-                .registry
-                .relation(owner)
-                .filter(|e| e.kind().is_base_table())
-                .map(|e| e.schema())
-            else {
+            let Some((kind, cur)) = self.registry.relation(owner).map(|e| (e.kind(), e.schema())) else {
                 continue;
             };
-            // Rebuild from the post-invalidate col defs. `cur.placement()` is
-            // construction, not a workaround for `eq` ignoring it: without it the
-            // rebuild is stamped KEYED_DEFAULT and loses CLUSTER BY / REPLICATED.
-            let col_defs = self.read_column_defs(owner);
-            let rebuilt =
-                build_schema_from_col_defs(RelationKind::BaseTable, &col_defs, cur.pk_indices(), cur.placement())
-                    .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
-            if rebuilt != cur {
-                let CatalogEngine { registry, dag, .. } = self;
-                dag.swap_schema(registry, owner, rebuilt)?;
-            }
+            let defs = self.read_column_defs(owner);
+            let schema = if kind.is_base_table() {
+                let rebuilt =
+                    build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_indices(), cur.placement())
+                        .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
+                if rebuilt != cur {
+                    let CatalogEngine { registry, dag, .. } = self;
+                    dag.swap_schema(registry, owner, rebuilt)?;
+                }
+                rebuilt
+            } else {
+                cur
+            };
+            self.caches
+                .relations
+                .get_mut(&owner)
+                .expect("every registered relation has an entry")
+                .reschema(owner, &schema, &defs);
         }
         Ok(())
     }
@@ -316,14 +327,7 @@ impl CatalogEngine {
     /// survives while another index row or the owner's FK columns still cover `cols`.
     fn unregister_index(&mut self, owner_id: i64, cols: &[u32]) {
         let survivors = self.indices_on_cols(owner_id, cols);
-        let fk_circuit = match (cols, self.registry.relation(owner_id).map(|e| e.schema())) {
-            ([c], Some(schema)) => {
-                let col_defs = self.read_column_defs(owner_id);
-                let hit = fk_circuit_cols(&schema, &col_defs).any(|ci| ci == *c as usize);
-                hit
-            }
-            _ => false,
-        };
+        let fk_circuit = matches!(cols, [c] if self.fk_circuit_cols(owner_id).contains(&(*c as usize)));
         if survivors.is_empty() && !fk_circuit {
             self.registry.remove_index(owner_id, cols);
         } else {

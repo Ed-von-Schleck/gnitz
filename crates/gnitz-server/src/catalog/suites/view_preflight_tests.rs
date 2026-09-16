@@ -44,7 +44,7 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
     let vid = engine.next_id;
     write_filtered_circuit(engine, vid, base_tid, pred);
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_column_records(vid, &cols).unwrap();
     engine
         .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, name))
         .unwrap();
@@ -151,7 +151,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let new_vid = engine.next_id;
     write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
-    engine.write_column_records(new_vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_column_records(new_vid, &cols).unwrap();
 
     // Reusing the live name without retiring the incumbent is still a collision.
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
@@ -201,7 +201,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let new_vid = engine.next_id;
     write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
-    engine.write_column_records(new_vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_column_records(new_vid, &cols).unwrap();
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);

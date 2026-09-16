@@ -36,16 +36,9 @@ fn send_helpers_publish_on_the_request_id() {
     let req_resp: u32 = 0xCAFE_BABE;
     let req_err: u32 = 0x7FFF_FFFE;
     wp.send_ack(7, req_ack);
-    // Pass ReplySchema::ReaderHeld: it emits no block and so consults
-    // no catalog, which this test does not have (null catalog pointer).
-    // The id round-trip is the assertion of interest.
+    // No block, so no catalog is consulted: this test has none (null catalog pointer).
     let schema = make_schema_u64_i64();
-    wp.send_scan_response(
-        route(8, req_resp),
-        Batch::empty_with_schema(&schema),
-        ReplySchema::ReaderHeld,
-        0,
-    );
+    wp.send_scan_response(route(8, req_resp), Batch::empty_with_schema(&schema), None, 0);
     wp.send_fault(&gnitz_wire::WireFault::from("boom"), req_err);
 
     let decoded_ids: Vec<u32> = walk_frames(region_ptr).iter().map(|(id, _)| *id).collect();
@@ -496,7 +489,7 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
         let r = if force_fifo { fifo_route(1, 3) } else { route(1, 3) };
-        wp.send_shared_scan_response(r, Rc::new(make_n_row_batch(schema, 5)), ReplySchema::ReaderHeld, 0);
+        wp.send_shared_scan_response(r, Rc::new(make_n_row_batch(schema, 5)), None, 0);
 
         if force_fifo {
             assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
@@ -544,7 +537,7 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_shared_scan_response(fifo_route(1, 5), Rc::clone(&batch), ReplySchema::ReaderHeld, 0);
+    wp.send_shared_scan_response(fifo_route(1, 5), Rc::clone(&batch), None, 0);
     assert_eq!(wp.pending_streams.len(), 1, "force_fifo queues even a fitting reply");
     assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
@@ -689,7 +682,7 @@ fn an_oversized_reply_enqueues_a_train() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(3, 5), batch, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(3, 5), batch, None, 0);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
     assert_eq!(ps.next_row, 0);
@@ -713,7 +706,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = 512;
-    wp.send_scan_response(route(1, 5), batch, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(1, 5), batch, None, 0);
 
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
@@ -745,7 +738,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(1, 5), batch, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(1, 5), batch, None, 0);
     assert_eq!(
         wp.pending_streams.len(),
         1,
@@ -787,7 +780,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = budget;
-    wp.send_scan_response(route(1, 5), source, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(1, 5), source, None, 0);
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
         wp.emit_pending_scan_chunk();
@@ -849,7 +842,7 @@ fn a_reader_held_reply_carries_no_block_at_version_0() {
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 
     let small = Batch::zeroed(&projected, 2);
-    wp.send_scan_response(route(tid as u64, 5), small, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(tid as u64, 5), small, None, 0);
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
     let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
@@ -858,16 +851,11 @@ fn a_reader_held_reply_carries_no_block_at_version_0() {
 
     let rows = (ipc::FRAME_CAP / 32) + 4096;
     let big = Batch::zeroed(&projected, rows);
-    wp.send_scan_response(route(tid as u64, 6), big, ReplySchema::ReaderHeld, 0);
+    wp.send_scan_response(route(tid as u64, 6), big, None, 0);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
     assert!(ps.prebuilt_schema.is_none(), "a queued train ships no block");
     assert_eq!(ps.server_version, 0);
-
-    assert!(
-        engine.get_cached_schema_wire_block(tid).is_none(),
-        "a reader-held reply must never populate the table's schema-block cache"
-    );
 
     engine.close();
 }

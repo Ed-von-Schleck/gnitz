@@ -237,8 +237,7 @@ impl Shared {
     /// INSERT and a parent DELETE from deadlocking on the same set, and a repeat
     /// would re-guard a lock this task holds and hang forever.
     ///
-    /// Owned, not a slice: `fk_lock_set` borrows the catalog and this loop
-    /// awaits, so a slice would hold that borrow across a suspension point.
+    /// Owned, because the set is read out of the catalog and this loop awaits.
     async fn lock_tables_exclusive(&self, mut tids: Vec<i64>) -> Vec<WriteGuard> {
         tids.sort_unstable();
         tids.dedup();
@@ -1065,7 +1064,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     let _tlocks = if !reads_committed {
         (Some(shared.table_lock(target_id).read().await), Vec::new())
     } else {
-        let lock_set = shared.cat().fk_lock_set(target_id).to_vec();
+        let lock_set: Vec<i64> = shared.cat().fk_lock_set(target_id).collect();
         (None, shared.lock_tables_exclusive(lock_set).await)
     };
 
@@ -1160,14 +1159,17 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
     }
 
     let (sal_kind, blob) = match seek {
-        Some((spec, schema)) => {
-            let block = shared.cat_mut().schema_wire_entry(target_id, &schema).block;
+        Some((spec, _)) => {
+            let block = shared
+                .cat()
+                .schema_block(target_id)
+                .expect("a read target is registered under the catalog lock");
             (SalMessageKind::ScanSpec, spec.encode(&block))
         }
         None => (SalMessageKind::Scan, Vec::new()),
     };
 
-    let (server_version, prelim) = schema_block_for_reply(shared, target_id, client_version);
+    let (prelim, server_version) = shared.cat().negotiated_schema_block(target_id, client_version);
     if let Some(block) = prelim {
         send_msg(peer, prelim_schema_msg(target_id, server_version, block.as_slice()));
     }
@@ -1266,7 +1268,7 @@ async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) 
     // 3. Acquire the per-table lock union ⋃ fk_lock_set(tid) exclusively.
     let mut union: Vec<i64> = Vec::new();
     for fam in &families {
-        union.extend_from_slice(shared.cat().fk_lock_set(fam.tid));
+        union.extend(shared.cat().fk_lock_set(fam.tid));
     }
     let _tlocks = shared.lock_tables_exclusive(union).await;
 
@@ -1464,9 +1466,7 @@ fn resolve_request_target(
             }
         }
     };
-    // A qname hit is not evidence of registration: `apply_entity_caches` inserts
-    // on the raw row sign while `hook_relation_register` registers only on net-live,
-    // so the two maps are not maintained on one liveness rule.
+    // The registry lookup supplies kind and class, and is the gate a by-id tid passes.
     Ok(shared
         .cat()
         .registry()
@@ -1501,11 +1501,6 @@ fn build_resolve_reply(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) ->
             .relation(tid)
             .is_some_and(Relation::is_replicated);
 
-    // Off the FK edge cache the catalog maintains from the same COL_TAB delta as
-    // the column defs, one edge per (child, child column) — so this needs no band
-    // scan and no `Rc<Vec<ColumnDef>>` cache fill. Unsorted: `fk_by_child` is
-    // push-ordered, and the blob's only consumer scatters by `col_idx`, so order
-    // is unobservable.
     let fks: Vec<gnitz_wire::RelFk> = shared
         .cat()
         .fk_constraints_of(tid)
@@ -1529,17 +1524,10 @@ fn build_resolve_reply(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) ->
         .collect();
     let blob = gnitz_wire::RelDescriptorBlob { class, replicated, fks, indexes }.encode();
 
-    // Clone the `Rc` block out of the cache so no `cat()` borrow outlives it.
-    // The reply always carries the block: a resolving client holds no descriptor
-    // to validate a version against.
-    let schema = shared
-        .cat()
-        .registry()
-        .relation(tid)
-        .map(Relation::schema)
-        .ok_or_else(|| format!("table {tid} not found"))?;
-    let entry = shared.cat_mut().schema_wire_entry(tid, &schema);
-    let (schema_block, server_version) = (entry.block, entry.version);
+    // Negotiated as a client holding no schema: a resolving client has none to validate.
+    let (Some(schema_block), server_version) = shared.cat().negotiated_schema_block(tid, 0) else {
+        return Err(format!("table {tid} not found"));
+    };
     Ok(encode_response_buffer(ipc::WireMsg {
         target_id: tid as u64,
         flags: WireFlags {
@@ -1616,7 +1604,7 @@ async fn read_lock(
     if read_is_fresh(shared, target_id) {
         return Some((g, kind));
     }
-    // No preliminary frame has gone out yet (`schema_block_for_reply`'s block is
+    // No preliminary frame has gone out yet (the negotiated schema block is
     // emitted later), so a failed drain is still reportable as a plain error.
     let g = match drain_and_relock(shared, g).await {
         Ok(g) => g,
@@ -1627,22 +1615,6 @@ async fn read_lock(
     };
     let kind = target_kind_or_reject(shared, peer, target_id, access).await?;
     Some((g, kind))
-}
-
-/// A **master-authored** reply's schema block, through the one negotiation
-/// ([`CatalogEngine::negotiated_schema_block`]) the worker's `reply_schema_block`
-/// also takes. This side resolves the descriptor from the registry, and takes a
-/// `tid` naming no relation as "no block" — a scan of one has nothing to reply
-/// about anyway.
-///
-/// `(server_version, block)` — one version, not two: the effective client version
-/// handed to the workers is `server_version` either way, a cache hit meaning the
-/// client's already equals it.
-fn schema_block_for_reply(shared: &Rc<Shared>, tid: i64, client_version: u16) -> (u16, Option<Rc<Vec<u8>>>) {
-    let (block, server_version) = shared.cat_mut().negotiated_schema_block(tid, client_version, |c| {
-        c.registry().relation(tid).map(Relation::schema)
-    });
-    (server_version, block)
 }
 
 /// The preliminary schema-only frame — carrying `continuation`, the
@@ -1842,7 +1814,7 @@ fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
 }
 
 /// One relation's Phase-1 capture for `scan_multi_body`: exactly what
-/// [`schema_block_for_reply`] answered, carried to the deferred Phase-2 emit.
+/// [`CatalogEngine::negotiated_schema_block`] answered, carried to the deferred Phase-2 emit.
 struct ScanMultiRelPlan {
     tid: i64,
     /// Stamped into the preliminary frame, and handed to the workers as their
@@ -1912,7 +1884,7 @@ async fn scan_multi_body(
             target_kind(shared, tid, Access::UserRead).map_err(|f| f.text)?;
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
-            let (server_version, block) = schema_block_for_reply(shared, tid, client_ver);
+            let (block, server_version) = shared.cat().negotiated_schema_block(tid, client_ver);
             plans.push(ScanMultiRelPlan { tid, server_version, block });
         }
         let disp = shared.disp();
@@ -1972,7 +1944,7 @@ async fn scan_multi_body(
 /// moment a DDL writer queues.
 async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, target_id: i64, client_version: u16) {
     match guard_panic("scan", || shared.cat_mut().scan(target_id)) {
-        Ok((b, _)) => {
+        Ok(b) => {
             let batch_ref = if !b.is_empty() { Some(b) } else { None };
             send_ok_response(
                 shared,
@@ -2055,7 +2027,7 @@ fn send_ok_response(
     arg0: u64,
     client_version: u16,
 ) {
-    let (server_version, schema_block) = schema_block_for_reply(shared, target_id, client_version);
+    let (schema_block, server_version) = shared.cat().negotiated_schema_block(target_id, client_version);
     let schema_arg = schema_block.as_ref().map(|b| b.as_slice());
     send_msg(
         peer,

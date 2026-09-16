@@ -612,7 +612,7 @@ impl SchemaDescriptor {
 
     /// Where this relation's rows live — the one value every placement decision
     /// reads, so no two can disagree. Crate-visible so the
-    /// ALTER … DROP NOT NULL descriptor rebuild (`hook_column_alter`) can carry it
+    /// ALTER … DROP NOT NULL descriptor rebuild (`hook_column_change`) can carry it
     /// across the swap: `SchemaDescriptor::eq` ignores it, so a rebuilt
     /// descriptor must be constructed with it again.
     #[inline]

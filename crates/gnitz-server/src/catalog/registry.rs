@@ -39,19 +39,13 @@ impl CatalogEngine {
         }
     }
 
-    /// Column definitions for `owner_id`, in key order, cached until the next
-    /// COL_TAB delta.
-    pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
-        if let Some(defs) = self.caches.col_defs.get(&owner_id) {
-            return defs.clone();
-        }
+    /// Column definitions for `owner_id`, in key order.
+    pub(in crate::catalog) fn read_column_defs(&self, owner_id: i64) -> Vec<ColumnDef> {
         let mut defs = Vec::new();
         self.for_each_row_under(SysFamily::Column, owner_id, |c| {
             let (src, row) = c.current_row_source();
             defs.push(read_col_tab_row(src, row));
         });
-        let defs = Rc::new(defs);
-        self.caches.col_defs.insert(owner_id, defs.clone());
         defs
     }
 
@@ -61,9 +55,11 @@ impl CatalogEngine {
         self.caches.schema_by_name.contains_key(name)
     }
 
-    /// Number of live member relations (tables + views) in schema `sid`.
-    pub(in crate::catalog) fn schema_member_count(&self, sid: i64) -> usize {
-        self.caches.members_by_schema.get(&sid).map_or(0, |s| s.len())
+    /// The ids of the live member relations (tables and views) of schema `sid`.
+    pub(in crate::catalog) fn schema_members(&self, sid: i64) -> Vec<i64> {
+        let mut ids = self.ids_naming(SysFamily::Table, gnitz_wire::RELTAB_PAY_SCHEMA_ID, &[sid]);
+        ids.extend(self.ids_naming(SysFamily::View, gnitz_wire::RELTAB_PAY_SCHEMA_ID, &[sid]));
+        ids
     }
 
     /// Allocate `count` contiguous catalog object ids and return the first.
@@ -77,11 +73,17 @@ impl CatalogEngine {
 
     /// The qualified `(schema, name)` of `table_id`, or `("?", "?")` when the
     /// catalog has no entry.
-    pub(in crate::catalog) fn qualified_name_or_unknown(&self, table_id: i64) -> (&str, &str) {
-        self.caches
-            .entity_by_id
-            .get(&table_id)
-            .map_or(("?", "?"), |(s, t)| (s.as_str(), t.as_str()))
+    pub(in crate::catalog) fn qualified_name_or_unknown(&self, table_id: i64) -> (String, String) {
+        let Some(row) = self
+            .live_sys_row(SysFamily::Table, table_id)
+            .or_else(|| self.live_sys_row(SysFamily::View, table_id))
+        else {
+            return ("?".into(), "?".into());
+        };
+        let (src, ri) = row.source();
+        let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID) as i64;
+        let schema = self.caches.schema_by_id.get(&sid).map_or("?", String::as_str);
+        (schema.to_string(), payload_string(src, ri, gnitz_wire::RELTAB_PAY_NAME))
     }
 
     /// The entity id registered under a canonical `"schema.relation"` key.

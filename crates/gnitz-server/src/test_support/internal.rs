@@ -95,20 +95,12 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: 
 /// Append one COL_TAB row for column `col_idx` of `owner_id`. Takes the whole
 /// `ColumnDef` rather than its fields, mirroring the catalog's read side, which
 /// reassembles exactly this struct.
-pub fn push_col_tab_row(
-    bb: &mut BatchBuilder,
-    owner_id: i64,
-    owner_kind: i64,
-    col_idx: i64,
-    cd: &ColumnDef,
-    weight: i64,
-) {
+pub fn push_col_tab_row(bb: &mut BatchBuilder, owner_id: i64, col_idx: i64, cd: &ColumnDef, weight: i64) {
     write_col_tab_row(
         bb,
         &ColTabRow {
             owner_id: owner_id as u64,
             col_idx: col_idx as u64,
-            owner_kind: owner_kind as u64,
             name: &cd.name,
             type_code: cd.type_code as u64,
             is_nullable: cd.is_nullable,
@@ -205,9 +197,7 @@ pub fn try_register_identity_view(
 ) -> Result<i64, String> {
     let vid = engine.allocate_ids(1).unwrap();
     write_identity_circuit(engine, vid, source_tid, gnitz_wire::ReadBound::None);
-    engine
-        .write_column_records(vid, gnitz_wire::OWNER_KIND_VIEW as i64, cols)
-        .unwrap();
+    engine.write_column_records(vid, cols).unwrap();
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
     engine.submit(SysFamily::View, bb.finish())?;

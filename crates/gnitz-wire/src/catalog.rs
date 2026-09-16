@@ -147,7 +147,6 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
 pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     col("owner_id", TypeCode::U64, false),
     col("col_idx", TypeCode::U64, false),
-    col("owner_kind", TypeCode::U64, false),
     col("name", TypeCode::String, false),
     col("type_code", TypeCode::U64, false),
     col("is_nullable", TypeCode::U64, false),
@@ -270,7 +269,6 @@ pub const RELTAB_COL_NAME: usize = shared_col_index(TABLE_TAB_COLS, VIEW_TAB_COL
 pub const RELTAB_PAY_SCHEMA_ID: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "schema_id");
 pub const RELTAB_PAY_NAME: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "name");
 
-pub const COLTAB_PAY_OWNER_KIND: usize = pay_index_in_fam(COL_TAB, "owner_kind");
 pub const COLTAB_PAY_NAME: usize = pay_index_in_fam(COL_TAB, "name");
 pub const COLTAB_PAY_TYPE_CODE: usize = pay_index_in_fam(COL_TAB, "type_code");
 pub const COLTAB_PAY_IS_SERIAL: usize = pay_index_in_fam(COL_TAB, "is_serial");
@@ -448,9 +446,6 @@ pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 /// header, a store's `table_id`, a wire batch, a shard file name). `1<<31` sits
 /// short of that ceiling, so an id below it round-trips all of them exactly.
 pub const CATALOG_ID_CEILING: u64 = 1 << 31;
-
-pub const OWNER_KIND_TABLE: u64 = 0;
-pub const OWNER_KIND_VIEW: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Identifier validation (shared between the SQL planner and the engine)

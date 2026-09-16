@@ -44,15 +44,8 @@ fn table_row(table_id: u64, schema_id: u64, name: &str) -> ZSetBatch {
     b
 }
 
-/// The COL_TAB batch for a `(id U64 PK, v I64)` table owned by `owner_id`.
+/// The COL_TAB batch for a `(id U64 PK, v I64)` relation owned by `owner_id`.
 fn two_columns(owner_id: u64) -> ZSetBatch {
-    two_columns_as(owner_id, gnitz_wire::OWNER_KIND_TABLE)
-}
-
-/// The COL_TAB batch for a `(id U64 PK, v I64)` relation owned by `owner_id`,
-/// with a chosen `owner_kind` — the field that decides whether a row declares an
-/// FK, so it may not disagree with what the owner actually is.
-fn two_columns_as(owner_id: u64, owner_kind: u64) -> ZSetBatch {
     let s = sys_schema(COL_TAB);
     let mut b = ZSetBatch::new(s);
     let mut a = BatchAppender::new(&mut b, s);
@@ -63,7 +56,7 @@ fn two_columns_as(owner_id: u64, owner_kind: u64) -> ZSetBatch {
     .iter()
     .enumerate()
     {
-        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, owner_kind, i), 1);
+        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, i), 1);
     }
     b
 }
@@ -81,7 +74,6 @@ fn col_tab_row(
 ) -> ColTabRow<'_> {
     ColTabRow {
         owner_id,
-        owner_kind: gnitz_wire::OWNER_KIND_TABLE,
         col_idx,
         name,
         type_code: type_code as u64,
@@ -425,8 +417,7 @@ fn a_sequence_block_is_refused_from_the_wire() {
 
 /// A COL_TAB row on an owner nothing registers is unretractable — the only
 /// COL_TAB retractor is the owner's own drop cascade, which returns early on an
-/// unregistered id — and `apply_fk_edges_and_locks` would build a permanent FK
-/// edge from its payload.
+/// unregistered id.
 #[test]
 fn a_column_block_whose_owner_is_never_registered_is_refused() {
     let srv = ServerHandle::start();
@@ -434,23 +425,6 @@ fn a_column_block_whose_owner_is_never_registered_is_refused() {
     let tid = s.alloc_id().unwrap();
     let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, two_columns(tid))]).unwrap_err());
     assert!(err.contains("does not create and the catalog does not hold"), "{err}");
-}
-
-/// `owner_kind` alone decides whether a COL_TAB row declares a foreign key, so a
-/// row claiming a kind its owner does not have plants an edge no arm validates.
-#[test]
-fn a_column_row_whose_owner_kind_contradicts_its_owner_is_refused() {
-    let srv = ServerHandle::start();
-    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    let tid = a_table(&mut client, "kindclash");
-
-    let mut s = session(&srv);
-    let err = format!(
-        "{:?}",
-        s.push_ddl_txn(&[(COL_TAB, two_columns_as(tid, gnitz_wire::OWNER_KIND_VIEW))])
-            .unwrap_err()
-    );
-    assert!(err.contains("declares owner_kind"), "{err}");
 }
 
 /// A circuit `+1` under a foreign `view_id` either makes `has_dependents` of its
@@ -523,7 +497,7 @@ fn a_view_scanning_itself_is_refused() {
     let err = format!(
         "{:?}",
         s.push_ddl_txn(&[
-            (COL_TAB, two_columns_as(vid, gnitz_wire::OWNER_KIND_VIEW)),
+            (COL_TAB, two_columns(vid)),
             (gnitz_wire::CIRCUIT_NODES_TAB, nb),
             (gnitz_wire::VIEW_TAB, vb),
         ])

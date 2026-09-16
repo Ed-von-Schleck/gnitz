@@ -266,18 +266,6 @@ struct ReplyRoute {
     fifo: bool,
 }
 
-/// Which schema wire block a worker reply carries, declared by the dispatch arm
-/// that knows where the descriptor came from and resolved by
-/// `reply_schema_block`.
-#[derive(Clone, Copy)]
-enum ReplySchema<'a> {
-    /// The target's own schema: the reply serves and populates the table's
-    /// cached block, and negotiates its version against the client's.
-    Table(&'a SchemaDescriptor),
-    /// A schema the reader already holds: no block, the request's version back.
-    ReaderHeld,
-}
-
 impl WorkerProcess {
     pub fn new(
         catalog: *mut CatalogEngine,
@@ -573,8 +561,9 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Scan => {
-                let (result, schema) = self.cat().scan(target_id)?;
-                self.send_shared_scan_response(route, result, ReplySchema::Table(&schema), client_version);
+                let result = self.cat().scan(target_id)?;
+                let (block, version) = self.cat().negotiated_schema_block(target_id, client_version);
+                self.send_shared_scan_response(route, result, block, version);
                 Ok(())
             }
 
@@ -669,7 +658,7 @@ impl WorkerProcess {
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, ReplySchema::ReaderHeld, client_version);
+        self.send_shared_scan_response(route, keeper, None, client_version);
         Ok(())
     }
 
@@ -686,7 +675,7 @@ impl WorkerProcess {
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
             .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
         let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, ReplySchema::ReaderHeld, client_version);
+        self.send_shared_scan_response(route, keeper, None, client_version);
         Ok(())
     }
 
@@ -908,7 +897,7 @@ impl WorkerProcess {
                 keys.extend_from_slice(batch.get_pk_bytes(i));
             }
             let result = self.cat().registry().gather_bytes(target_id, keys, ref_col)?;
-            self.send_scan_response(route, result, ReplySchema::ReaderHeld, 0);
+            self.send_scan_response(route, result, None, 0);
             return Ok(());
         }
         match lookup {
@@ -961,7 +950,7 @@ impl WorkerProcess {
                     }
                     result
                 };
-                self.send_scan_response(route, result, ReplySchema::ReaderHeld, 0);
+                self.send_scan_response(route, result, None, 0);
                 Ok(())
             }
             HasPkLookup::PrimaryKey => {
@@ -975,7 +964,7 @@ impl WorkerProcess {
                         result.push_key_row(pkb, 1);
                     }
                 }
-                self.send_scan_response(route, result, ReplySchema::ReaderHeld, 0);
+                self.send_scan_response(route, result, None, 0);
                 Ok(())
             }
         }

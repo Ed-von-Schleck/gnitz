@@ -9,7 +9,7 @@
 //! `ColumnDef` lives above `schema` in the layering, so these encoders cannot
 //! join it there without forking the column projection.
 
-use super::{CatalogEngine, ColumnDef, SchemaWireEntry};
+use super::{CatalogEngine, ColumnDef};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
 use std::rc::Rc;
@@ -70,55 +70,19 @@ pub(in crate::catalog) fn encode_named_schema_block(
 }
 
 impl CatalogEngine {
-    /// The cached schema wire entry for `tid` — the encoded block, the schema
-    /// version it was built at. On a miss the
-    /// block is built from the catalog's column defs and stored; it is
-    /// invalidated alongside them whenever DDL modifies the table.
-    ///
-    /// The caller supplies the resolved `schema`: what to do when `tid` names
-    /// no relation differs per call site and stays with them.
-    pub(crate) fn schema_wire_entry(&mut self, tid: i64, schema: &SchemaDescriptor) -> SchemaWireEntry {
-        if let Some(cached) = self.get_cached_schema_wire_block(tid) {
-            return cached;
-        }
-        // One COL_TAB row per physical column — a system family included, since
-        // `bootstrap` writes each one's self-description — is what makes
-        // `defs[ci]` describe `schema.columns[ci]`. A caller with a *projected*
-        // schema builds a one-off anonymous block instead of coming here.
-        let defs = self.read_column_defs(tid);
-        let block = Rc::new(if defs.is_empty() {
-            encode_schema_block(schema, tid as u32)
-        } else {
-            encode_named_schema_block(schema, &defs, tid as u32)
-        });
-        let entry = SchemaWireEntry {
-            block,
-            version: self.get_schema_version(tid),
-        };
-        self.set_schema_wire_block(tid, entry.clone());
-        entry
+    /// `tid`'s named schema block; `None` for an unregistered id.
+    pub(crate) fn schema_block(&self, tid: i64) -> Option<Rc<Vec<u8>>> {
+        self.caches.relations.get(&tid).map(|e| e.schema_block.clone())
     }
 
     /// The schema block a reply to a client at `client_version` carries, and the
-    /// version its flags report. The one place that negotiation is written — the
-    /// master reply path and the worker's both come here.
-    ///
-    /// `descriptor` is consulted only on a miss (as is `None` from it), so a
-    /// warm reply pays no descriptor copy and no hash probe. Reading the version
-    /// first is safe because [`Self::clear_col_cache_no_bump`] drops the cache
-    /// entry *before* the bump, so a surviving entry always matches it.
-    pub(crate) fn negotiated_schema_block(
-        &mut self,
-        tid: i64,
-        client_version: u16,
-        descriptor: impl FnOnce(&Self) -> Option<SchemaDescriptor>,
-    ) -> (Option<Rc<Vec<u8>>>, u16) {
-        let server_version = self.get_schema_version(tid);
-        // Server versions start at 1 and wrap back to 1, so a client's 0 never matches.
-        if client_version == server_version {
-            return (None, server_version);
-        }
-        let block = descriptor(self).map(|s| self.schema_wire_entry(tid, &s).block);
-        (block, server_version)
+    /// version its flags report.
+    pub(crate) fn negotiated_schema_block(&self, tid: i64, client_version: u16) -> (Option<Rc<Vec<u8>>>, u16) {
+        let Some(entry) = self.caches.relations.get(&tid) else {
+            return (None, 1);
+        };
+        let version = entry.schema_version.get();
+        let block = (client_version != version).then(|| entry.schema_block.clone());
+        (block, version)
     }
 }

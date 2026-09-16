@@ -23,6 +23,15 @@ impl CatalogEngine {
         self.sys_relation(family).live_row_at(key.pk_bytes()).1
     }
 
+    /// The ids of `family`'s live rows whose u64 payload `pay` is one of `ids`.
+    pub(in crate::catalog) fn ids_naming(&self, family: SysFamily, pay: usize, ids: &[i64]) -> Vec<i64> {
+        let scan = self.sys_relation(family).full_scan();
+        (0..scan.len())
+            .filter(|&i| ids.contains(&(payload_u64(&*scan, i, pay) as i64)))
+            .map(|i| scan.get_pk(i) as i64)
+            .collect()
+    }
+
     /// Visit every live row of pair-keyed `family` under `leading` — an owner's
     /// column records, or a view's circuit rows.
     pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: i64, f: impl FnMut(&ReadCursor)) {

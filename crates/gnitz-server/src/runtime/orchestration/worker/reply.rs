@@ -93,25 +93,6 @@ impl WorkerProcess {
             .send_status(0, request_id, fault.status, fault.text.as_bytes());
     }
 
-    /// The block a reply of this [`ReplySchema`] carries, and the schema version
-    /// its flags report — which the caller stamps even when the block is
-    /// suppressed, so the version cannot ride inside the `Option`.
-    fn reply_schema_block(
-        &mut self,
-        tid_key: i64,
-        schema: ReplySchema<'_>,
-        client_version: u16,
-    ) -> (Option<Rc<Vec<u8>>>, u16) {
-        match schema {
-            // The dispatch arm already resolved the descriptor, so the
-            // negotiation never has to look one up and cannot miss.
-            ReplySchema::Table(s) => self
-                .cat()
-                .negotiated_schema_block(tid_key, client_version, |_| Some(*s)),
-            ReplySchema::ReaderHeld => (None, client_version),
-        }
-    }
-
     /// Reply with an **owned** `batch`: one frame when it fits, otherwise queued
     /// and split, a frame per `drain_sal` pass. A STRING-column result splits
     /// like any other.
@@ -122,10 +103,9 @@ impl WorkerProcess {
         &mut self,
         route: ReplyRoute,
         batch: Batch,
-        schema: ReplySchema<'_>,
-        client_version: u16,
+        block: Option<Rc<Vec<u8>>>,
+        version: u16,
     ) {
-        let (block, version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
         if !route.fifo
             && emit_whole_if_fits(
                 &self.w2m_writer,
@@ -147,10 +127,9 @@ impl WorkerProcess {
         &mut self,
         route: ReplyRoute,
         batch: Rc<Batch>,
-        schema: ReplySchema<'_>,
-        client_version: u16,
+        block: Option<Rc<Vec<u8>>>,
+        version: u16,
     ) {
-        let (block, version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
         if !route.fifo
             && emit_whole_if_fits(
                 &self.w2m_writer,

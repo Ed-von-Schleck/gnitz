@@ -4,15 +4,15 @@
 
 use std::cmp::Ordering;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use super::*;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
-    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_OWNER_KIND,
-    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
+    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_SCALE,
+    COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
 };
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
@@ -213,19 +213,6 @@ fn check_col_narrowings(batch: &Batch, row: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// A column record must agree with its owner on what that owner is: `owner_kind`
-/// alone decides whether the row declares a foreign key, so a view's columns
-/// claiming `OWNER_KIND_TABLE` would plant an unvalidated `FkEdge`.
-fn check_col_ident(batch: &Batch, row: usize, owner_id: i64, expect_kind: i64) -> Result<(), String> {
-    let kind = payload_u64(batch, row, COLTAB_PAY_OWNER_KIND) as i64;
-    if kind != expect_kind {
-        return Err(format!(
-            "column record of owner {owner_id} declares owner_kind {kind}, which is not what that relation is"
-        ));
-    }
-    Ok(())
-}
-
 /// A circuit `+1` may only name a view this same transaction creates: one under a
 /// foreign `view_id` would pin its source table's drop or rewrite a running circuit.
 fn check_circuit_rows(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
@@ -247,11 +234,18 @@ fn check_circuit_rows(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String>
 impl CatalogEngine {
     /// Check every FK-carrying column of a relation about to be registered.
     /// `pk` must already have passed [`validate_pk_against_cols`], which is what
-    /// makes `pk[0]` an in-bounds, PK-eligible column index.
-    pub(super) fn validate_fk_columns(&self, tid: i64, col_defs: &[ColumnDef], pk: &[u32]) -> Result<(), String> {
+    /// makes `pk[0]` an in-bounds, PK-eligible column index. `net_dead` is what the
+    /// same TABLE_TAB delta drops.
+    pub(super) fn validate_fk_columns(
+        &self,
+        tid: i64,
+        col_defs: &[ColumnDef],
+        pk: &[u32],
+        net_dead: &[i64],
+    ) -> Result<(), String> {
         let self_pk_type = col_defs[pk[0] as usize].type_code;
         for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
-            self.validate_fk_column(cd, tid, pk, self_pk_type)?;
+            self.validate_fk_column(cd, tid, pk, self_pk_type, net_dead)?;
         }
         Ok(())
     }
@@ -262,6 +256,7 @@ impl CatalogEngine {
         self_table_id: i64,
         self_pk: &[u32],
         self_pk_type: u8,
+        net_dead: &[i64],
     ) -> Result<(), String> {
         // `col.fk_col_idx` here is the PARENT's referenced column index (the
         // planner sets the child column's fk_col_idx to it). The target is a
@@ -277,6 +272,12 @@ impl CatalogEngine {
             }
             self_pk_type
         } else {
+            if net_dead.contains(&col.fk_table_id) {
+                return Err(format!(
+                    "FK references table {}, which this transaction drops",
+                    col.fk_table_id
+                ));
+            }
             let entry = self
                 .registry
                 .relation(col.fk_table_id)
@@ -533,8 +534,8 @@ impl CatalogEngine {
     /// `owner_id`'s column records as this batch's `+1` row for `col_idx` leaves
     /// them: the decoded row replaces the live record at that index, or extends
     /// the set when the transition appends one.
-    fn col_defs_with(&mut self, owner_id: i64, col_idx: u64, row: ColumnDef) -> Vec<ColumnDef> {
-        let mut defs = (*self.read_column_defs(owner_id)).clone();
+    fn col_defs_with(&self, owner_id: i64, col_idx: u64, row: ColumnDef) -> Vec<ColumnDef> {
+        let mut defs = self.read_column_defs(owner_id);
         match defs.get_mut(col_idx as usize) {
             Some(live) => *live = row,
             None => defs.push(row),
@@ -578,7 +579,6 @@ impl CatalogEngine {
         if appended.is_serial || appended.is_hidden || appended.fk_table_id != 0 {
             return Err("ADD COLUMN must not append a SERIAL, hidden, or foreign-key column".into());
         }
-        check_col_ident(batch, pj, owner_id, OWNER_KIND_TABLE)?;
         // Last, as in the rewrite-pair arm: a malformed append is reported as
         // malformed whatever depends on the table.
         self.reject_if_dependent_views(owner_id, "ADD COLUMN")
@@ -729,17 +729,12 @@ impl CatalogEngine {
     }
 
     /// Every column record must name an owner this bundle creates or the registry
-    /// holds, of the kind its `owner_kind` claims: a phantom owner is never dropped,
-    /// so nothing would ever retract the row or the `FkEdge` it plants.
+    /// holds: a phantom owner is never dropped, so nothing would ever retract the row.
     fn check_column_owners(&self, cols: &Batch, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
-        // The owners the bundle registers itself, by the kind its block implies.
-        let mut created: FxHashMap<i64, i64> = FxHashMap::default();
-        for (family, kind) in [(SysFamily::Table, OWNER_KIND_TABLE), (SysFamily::View, OWNER_KIND_VIEW)] {
-            let Some(b) = families[family.index()].as_ref() else {
-                continue;
-            };
-            for i in b.live_rows() {
-                created.insert(b.get_pk(i) as i64, kind);
+        let mut created: FxHashSet<i64> = FxHashSet::default();
+        for family in [SysFamily::Table, SysFamily::View] {
+            if let Some(b) = families[family.index()].as_ref() {
+                created.extend(b.live_rows().map(|i| b.get_pk(i) as i64));
             }
         }
         let mut altered: Option<i64> = None;
@@ -752,27 +747,12 @@ impl CatalogEngine {
                     return Err("a column ALTER must be the only change in its DDL transaction".into());
                 }
                 altered = Some(owner_id);
+            } else if !created.contains(&owner_id) {
+                return Err(format!(
+                    "column record names owner {owner_id}, which this transaction \
+                     does not create and the catalog does not hold"
+                ));
             }
-            // What the catalog already says the owner is, else what this
-            // transaction is making it.
-            let owner_kind = self
-                .registry
-                .relation(owner_id)
-                .map(|e| {
-                    if e.kind().is_view() {
-                        OWNER_KIND_VIEW
-                    } else {
-                        OWNER_KIND_TABLE
-                    }
-                })
-                .or_else(|| created.get(&owner_id).copied())
-                .ok_or_else(|| {
-                    format!(
-                        "column record names owner {owner_id}, which this transaction \
-                         does not create and the catalog does not hold"
-                    )
-                })?;
-            check_col_ident(cols, i, owner_id, owner_kind)?;
         }
         Ok(())
     }
@@ -800,7 +780,7 @@ impl CatalogEngine {
             }
         }
         for &sid in net_dead {
-            let n = self.schema_member_count(sid);
+            let n = self.schema_members(sid).len();
             if n > 0 {
                 return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
             }
@@ -808,9 +788,9 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// TABLE_TAB / VIEW_TAB: the CREATE guards (column-record admissibility, FK
-    /// column types, qualified-name uniqueness) and the DROP guards (FK children,
-    /// view dependents).
+    /// TABLE_TAB / VIEW_TAB: the CREATE guards (a free relation id, column-record
+    /// admissibility, FK column types, qualified-name uniqueness) and the DROP
+    /// guards (FK children, view dependents).
     ///
     /// The drop guards key on `net_dead` — the PKs whose bundle net is dead — not
     /// raw `weight < 0`, so a rename pair's net-live `-1` is never rejected as
@@ -834,6 +814,12 @@ impl CatalogEngine {
                 .collect()
         };
         view_creates.sort_unstable();
+
+        for sig in sigs.iter().filter(|s| s.pos.is_some() && s.neg.is_none()) {
+            if self.registry.has_id(sig.leading) {
+                return Err(format!("relation id {} already exists", sig.leading));
+            }
+        }
 
         for i in batch.live_rows() {
             let id = batch.get_pk(i) as i64;
@@ -893,7 +879,7 @@ impl CatalogEngine {
                 // `validate_pk_against_cols` above proved the PK list non-empty
                 // and in range, which is what makes the self-reference type
                 // lookup inside sound.
-                self.validate_fk_columns(id, &col_defs, pk.as_slice())?;
+                self.validate_fk_columns(id, &col_defs, pk.as_slice(), net_dead)?;
             }
 
             self.precheck_qname_unique(sid, name, id, net_dead, &mut claimed)?;

@@ -23,9 +23,10 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
         !engine.caches.entity_by_qname.contains_key(qname),
         "entity_by_qname holds the rejected {noun} {qname}"
     );
-    assert!(
-        !engine.caches.entity_by_id.contains_key(&id),
-        "entity_by_id holds the rejected {noun} {id}"
+    assert_eq!(
+        engine.qualified_name_or_unknown(id),
+        ("?".to_string(), "?".to_string()),
+        "the catalog names the rejected {noun} {id}"
     );
     assert!(
         !engine.registry().has_id(id),
@@ -43,7 +44,7 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
 /// cannot produce.
 fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, owner_id, OWNER_KIND_TABLE, col_idx, cd, 1);
+    push_col_tab_row(&mut bb, owner_id, col_idx, cd, 1);
     engine.ingest_to_family(COL_TAB_ID, &bb.finish())
 }
 
@@ -88,7 +89,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     let tid = engine.allocate_ids(1).unwrap();
     // STRING column is not pk-eligible.
     let cols = vec![col_def("label", type_code::STRING)];
-    engine.write_column_records(tid, OWNER_KIND_TABLE, &cols).unwrap();
+    engine.write_column_records(tid, &cols).unwrap();
 
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badpktable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
@@ -117,7 +118,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
     let new_tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(new_tid, OWNER_KIND_TABLE, &cols).unwrap();
+    engine.write_column_records(new_tid, &cols).unwrap();
 
     let batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
@@ -283,7 +284,7 @@ fn test_idx_tab_view_owner_rejected() {
     // precheck must fire before any backfill).
     let vid = engine.allocate_ids(1).unwrap();
     engine
-        .write_column_records(vid, OWNER_KIND_VIEW, &[col_def("id", type_code::U64)])
+        .write_column_records(vid, &[col_def("id", type_code::U64)])
         .unwrap();
     let batch = build_view_tab_row(vid, "vowner");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
@@ -370,9 +371,10 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         Some(orig_idx_id),
         "index_by_name must still point to the original index"
     );
-    assert!(
-        !engine.caches.indices_by_owner.values().any(|v| v.contains(&new_idx_id)),
-        "the rejected index id must not appear under any owner"
+    assert_eq!(
+        engine.ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[tid]),
+        vec![orig_idx_id],
+        "the rejected index id must not appear under its owner"
     );
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Index).cursor()),
@@ -607,7 +609,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     let new_tid = engine.allocate_ids(1).unwrap();
     // Ascending topo: COL_TAB(1) applied first.
-    let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
+    let col_batch = engine.build_col_batch(new_tid, &cols, 1);
     engine.submit(SysFamily::Column, col_batch).unwrap();
 
     // TABLE_TAB(6): precheck fails (duplicate name), so nothing of it is queued
@@ -630,8 +632,9 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
         tables_before,
         "no ghost -1 TABLE_TAB row"
     );
-    assert!(
-        !engine.caches.entity_by_id.contains_key(&new_tid),
+    assert_eq!(
+        engine.qualified_name_or_unknown(new_tid),
+        ("?".to_string(), "?".to_string()),
         "no phantom entity survives for the reusable new_tid"
     );
 
@@ -651,7 +654,7 @@ fn ddl_txn_hook_failure_is_compensated() {
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
     let new_tid = engine.allocate_ids(1).unwrap();
-    let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
+    let col_batch = engine.build_col_batch(new_tid, &cols, 1);
     engine.submit(SysFamily::Column, col_batch).unwrap();
 
     let blocker = relation_dir(&dir, RelationKind::BaseTable, new_tid);
@@ -705,8 +708,8 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
 
     let cols = vec![col_def("id", type_code::U64)];
     let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
-    engine.write_column_records(a, OWNER_KIND_TABLE, &cols).unwrap();
-    engine.write_column_records(b, OWNER_KIND_TABLE, &cols).unwrap();
+    engine.write_column_records(a, &cols).unwrap();
+    engine.write_column_records(b, &cols).unwrap();
 
     let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     for tid in [a, b] {
@@ -915,10 +918,7 @@ fn compensated_create_table_leaves_no_trace() {
         col_def("val", type_code::I64),
     ];
     for (family, batch) in [
-        (
-            SysFamily::Column,
-            engine.build_col_batch(tid, OWNER_KIND_TABLE, &cols, 1),
-        ),
+        (SysFamily::Column, engine.build_col_batch(tid, &cols, 1)),
         (SysFamily::Table, build_table_tab_row(tid, pack_pk_cols(&[0]), "child")),
     ] {
         engine.submit(family, batch).unwrap();
@@ -939,9 +939,15 @@ fn compensated_create_table_leaves_no_trace() {
     assert!(engine.submit(SysFamily::Index, idx).is_err());
     engine.compensate_stage_a().unwrap();
 
-    assert!(!engine.caches.schema_version.contains_key(&tid));
+    assert!(!engine.caches.relations.contains_key(&tid));
     assert!(!engine.registry().has_id(tid));
-    assert!(!engine.caches.indices_by_owner.contains_key(&tid));
+    assert!(engine
+        .ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[tid])
+        .is_empty());
+    assert!(
+        !engine.fk_children_of(parent).iter().any(|e| e.child_tid == tid),
+        "the parent must keep no edge from the uncreated child"
+    );
     assert_eq!(counts(&engine), before, "no system family may keep a row of the table");
     engine.reclaim_orphan_dirs();
     assert!(

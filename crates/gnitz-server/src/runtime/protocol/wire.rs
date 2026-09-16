@@ -40,7 +40,7 @@ pub(crate) struct WireSchema {
 
 impl WireSchema {
     /// A one-off **anonymous** block, encoded here and cached nowhere: smaller in
-    /// every worker's SAL slot than [`Self::from_catalog`]'s cached *named* one,
+    /// every worker's SAL slot than [`Self::from_catalog`]'s *named* one,
     /// and the only option for a schema no catalog entry describes.
     pub(crate) fn encoded(tid: i64, descriptor: SchemaDescriptor) -> Self {
         WireSchema {
@@ -50,15 +50,12 @@ impl WireSchema {
         }
     }
 
-    /// `tid`'s catalog entry: the cached *named* block, built from `descriptor`
-    /// by the one call below and reused until DDL invalidates it.
-    pub(crate) fn from_catalog(
-        cat: &mut crate::catalog::CatalogEngine,
-        tid: i64,
-        descriptor: SchemaDescriptor,
-    ) -> Self {
-        let entry = cat.schema_wire_entry(tid, &descriptor);
-        WireSchema { tid, descriptor, block: entry.block }
+    /// `tid`'s catalog entry, with its *named* block.
+    pub(crate) fn from_catalog(cat: &crate::catalog::CatalogEngine, tid: i64, descriptor: SchemaDescriptor) -> Self {
+        let block = cat
+            .schema_block(tid)
+            .expect("a wire target is registered under the catalog lock");
+        WireSchema { tid, descriptor, block }
     }
 
     pub(crate) fn descriptor(&self) -> &SchemaDescriptor {

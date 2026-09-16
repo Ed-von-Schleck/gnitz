@@ -156,14 +156,13 @@ fn ddl_txn_roundtrip_client_to_server() {
     use gnitz_wire::{CIRCUIT_NODES_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
 
     // Build a small COL_TAB batch for `oid` with `n` U64 columns.
-    let col_batch = |oid: u64, kind: u64, n: usize| -> ZSetBatch {
+    let col_batch = |oid: u64, n: usize| -> ZSetBatch {
         let s = sys_schema(COL_TAB);
         let mut b = ZSetBatch::new(s);
         {
             let mut a = BatchAppender::new(&mut b, s);
             for i in 0..n {
                 a.add_row_cols(&[oid as u128, i as u128], 1)
-                    .u64_val(kind)
                     .str_val(&format!("c{i}"))
                     .u64_val(4) // type_code U64
                     .u64_val(0) // is_nullable
@@ -237,14 +236,14 @@ fn ddl_txn_roundtrip_client_to_server() {
 
     // 2-family: CREATE TABLE (COL_TAB + TABLE_TAB).
     verify(
-        &[(COL_TAB, col_batch(17, 0, 2)), (TABLE_TAB, table_batch(17, 1))],
+        &[(COL_TAB, col_batch(17, 2)), (TABLE_TAB, table_batch(17, 1))],
         &[false, true],
     );
 
     // 3-family: CREATE TABLE + inline UNIQUE index (COL_TAB + TABLE_TAB + IDX_TAB).
     verify(
         &[
-            (COL_TAB, col_batch(18, 0, 2)),
+            (COL_TAB, col_batch(18, 2)),
             (TABLE_TAB, table_batch(18, 1)),
             (IDX_TAB, idx_batch(100, 18)),
         ],
@@ -295,7 +294,7 @@ fn ddl_txn_roundtrip_client_to_server() {
     };
     verify(
         &[
-            (COL_TAB, col_batch(vid, 1, 1)),
+            (COL_TAB, col_batch(vid, 1)),
             (CIRCUIT_NODES_TAB, nodes),
             (VIEW_TAB, view),
         ],

@@ -242,7 +242,7 @@ fn create_flagged_table(
     flags: u64,
 ) -> i64 {
     let tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(tid, OWNER_KIND_TABLE, cols).unwrap();
+    engine.write_column_records(tid, cols).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(pk_cols), table_name, flags);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
     tid
@@ -266,17 +266,11 @@ fn stream_flags() -> u64 {
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces
 /// the `+1` row from a clone of `old`, while the `-1` reproduces `old`
 /// byte-for-byte — so only the guard under test can reject it.
-fn col_alter_pair(
-    owner_id: i64,
-    owner_kind: i64,
-    col_idx: i64,
-    old: &ColumnDef,
-    mutate: impl FnOnce(&mut ColumnDef),
-) -> Batch {
+fn col_alter_pair(owner_id: i64, col_idx: i64, old: &ColumnDef, mutate: impl FnOnce(&mut ColumnDef)) -> Batch {
     let mut altered = old.clone();
     mutate(&mut altered);
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, owner_id, owner_kind, col_idx, old, -1);
-    push_col_tab_row(&mut bb, owner_id, owner_kind, col_idx, &altered, 1);
+    push_col_tab_row(&mut bb, owner_id, col_idx, old, -1);
+    push_col_tab_row(&mut bb, owner_id, col_idx, &altered, 1);
     bb.finish()
 }

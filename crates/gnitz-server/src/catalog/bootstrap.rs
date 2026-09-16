@@ -86,6 +86,11 @@ impl CatalogEngine {
         // Phase 1: the `_sequences` scalars.
         engine.load_sequence_scalars();
 
+        for family in SysFamily::ALL {
+            let defs = engine.read_column_defs(family.id());
+            engine.enter_relation(family.id(), RelationKind::SystemCatalog, family.schema(), &defs);
+        }
+
         // Phase 2: Replay catalog through hooks
         engine.replay_catalog()?;
 
@@ -144,7 +149,6 @@ impl CatalogEngine {
                         &ColTabRow {
                             owner_id: family.id() as u64,
                             col_idx: i as u64,
-                            owner_kind: gnitz_wire::OWNER_KIND_TABLE,
                             name: c.name,
                             type_code: c.type_code as u64,
                             is_nullable: c.nullable,
@@ -169,20 +173,16 @@ impl CatalogEngine {
     // -- Replay catalog (recovery) -----------------------------------------
 
     fn replay_catalog(&mut self) -> Result<(), String> {
-        // Only these six families need hook-driven replay; `_sequences` is loaded by
-        // `load_sequence_scalars`. CircuitNodes precedes View: view registration reads
-        // the dependency map it fills. Schema
-        // must precede the two relation families (their qualified names need it),
-        // and Index must follow them. COL_TAB replaying last does NOT violate the
-        // COL-before-relation contract: the register hooks read sys_columns
-        // storage directly, which is already loaded (see the hooks.rs dispatch
-        // doc).
-        self.replay_system_table(SysFamily::Schema)?;
-        self.replay_system_table(SysFamily::Table)?;
-        self.replay_system_table(SysFamily::CircuitNodes)?;
-        self.replay_system_table(SysFamily::View)?;
-        self.replay_system_table(SysFamily::Column)?; // FK wiring + col_names invalidation
-        self.replay_system_table(SysFamily::Index)?;
+        let mut families = SysFamily::ALL;
+        families.sort_by_key(|f| f.topo_priority());
+        // `load_sequence_scalars` reads `_sequences`; each registration reads its own
+        // column records.
+        for family in families
+            .into_iter()
+            .filter(|f| !matches!(f, SysFamily::Sequence | SysFamily::Column))
+        {
+            self.replay_system_table(family)?;
+        }
         Ok(())
     }
 

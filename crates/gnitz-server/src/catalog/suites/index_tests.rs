@@ -480,7 +480,9 @@ fn test_drop_table_cascades_fk_index() {
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.registry().has_id(child_tid));
     assert!(
-        !engine2.caches.indices_by_owner.contains_key(&child_tid)
+        engine2
+            .ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[child_tid])
+            .is_empty()
             && !engine2.caches.index_by_name.values().any(|&id| id == child_tid),
         "no index row may exist for the dropped child"
     );
@@ -504,11 +506,12 @@ fn test_drop_table_cascades_multiple_indices() {
     engine.create_index("public.t", &["val1"], false).unwrap();
     engine.create_index("public.t", &["val2"], false).unwrap();
 
-    // Both indices tracked in cache
+    let owned_indices =
+        |engine: &CatalogEngine| engine.ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &[tid]);
     assert_eq!(
-        engine.caches.indices_by_owner.get(&tid).map(|v| v.len()),
-        Some(2),
-        "indices_by_owner must track both indices"
+        owned_indices(&engine).len(),
+        2,
+        "sys_indices must name both indices under the table"
     );
     let (name1, name2) = (
         make_secondary_index_name("public", "t", "val1"),
@@ -533,13 +536,8 @@ fn test_drop_table_cascades_multiple_indices() {
         "idx2 must be removed from the caches"
     );
     assert!(
-        engine
-            .caches
-            .indices_by_owner
-            .get(&tid)
-            .map(|v| v.is_empty())
-            .unwrap_or(true),
-        "indices_by_owner for dropped table must be empty"
+        owned_indices(&engine).is_empty(),
+        "sys_indices must name no index under the dropped table"
     );
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Index).cursor()),
@@ -786,31 +784,27 @@ fn test_seek_by_index_orphan_entry_terminates() {
 }
 
 #[test]
-fn drop_table_purges_the_schema_version_counter() {
-    // Dropping a table must remove its schema_version entry, or it leaks for a
-    // tid that is never reused. The purge is `unregister_relation`'s.
+fn drop_table_removes_the_relation_entry() {
     let (mut engine, tid, dir) = table_fixture(
-        "drop_purges_versions",
+        "drop_removes_relation_entry",
         &[col_def("id", type_code::U64), col_def("val", type_code::I64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
 
-    // A column rename bumps the registered table's version, creating the entry.
-    let rename = col_alter_pair(tid, OWNER_KIND_TABLE, 1, &col_def("val", type_code::I64), |c| {
-        c.name = "val2".into()
-    });
+    // A column rename bumps the registered table's version.
+    let rename = col_alter_pair(tid, 1, &col_def("val", type_code::I64), |c| c.name = "val2".into());
     engine.submit(SysFamily::Column, rename).unwrap();
 
     assert!(
-        engine.caches.schema_version.contains_key(&tid),
-        "live table must have a schema_version entry"
+        engine.caches.relations.contains_key(&tid),
+        "live table must have a relation entry"
     );
 
     engine.drop_table("public.t").unwrap();
 
     assert!(
-        !engine.caches.schema_version.contains_key(&tid),
-        "schema_version must be purged by the drop"
+        !engine.caches.relations.contains_key(&tid),
+        "the relation entry must be removed by the drop"
     );
 
     engine.close();

@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_wire::{COLTAB_PAY_NAME, COLTAB_PAY_OWNER_KIND};
+use gnitz_wire::COLTAB_PAY_NAME;
 use std::collections::HashMap;
 
 // ── test_identifiers ─────────────────────────────────────────────────
@@ -83,12 +83,10 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
     while c.valid {
         if c.current_weight > 0 {
             let (src, row) = c.current_row_source();
-            if payload_u64(src, row, COLTAB_PAY_OWNER_KIND) == OWNER_KIND_TABLE as u64 {
-                // COL_TAB PK = `(owner_id, col_idx)`.
-                let (owner, col_idx) = gnitz_wire::unpack_pair_pk(c.current_key_narrow());
-                let entry = (col_idx, payload_string(src, row, COLTAB_PAY_NAME));
-                described.entry(owner).or_default().push(entry);
-            }
+            // COL_TAB PK = `(owner_id, col_idx)`.
+            let (owner, col_idx) = gnitz_wire::unpack_pair_pk(c.current_key_narrow());
+            let entry = (col_idx, payload_string(src, row, COLTAB_PAY_NAME));
+            described.entry(owner).or_default().push(entry);
         }
         c.advance();
     }
@@ -384,7 +382,7 @@ fn test_restart_long_strings() {
         engine.close();
     }
     {
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        let engine = CatalogEngine::open(&dir, 1).unwrap();
         assert!(engine.get_by_name("longtest", "tbl").is_some());
         // Verify column name survived out-of-line blob round-trip
         let tid = engine.get_by_name("longtest", "tbl").unwrap();
@@ -469,7 +467,7 @@ fn test_hook_relation_register_rejects_malformed_pk() {
         col_def("c3", type_code::F32),
     ];
     let tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
+    engine.write_column_records(tid, &col_defs).unwrap();
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
         let batch = build_table_tab_row(tid, raw_pk_cols, "bad_table");
@@ -580,7 +578,7 @@ fn test_drop_view_removes_directory() {
     // Column records must precede the VIEW_TAB row (hook invariant).
     let vid = engine.next_id;
     let view_cols = vec![col_def("id", type_code::U64)];
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
+    engine.write_column_records(vid, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "myview");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
@@ -636,7 +634,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     let vid = engine.next_id;
     let view_cols = vec![col_def("id", type_code::U64)];
     write_identity_circuit(&mut engine, vid, base_tid, gnitz_wire::ReadBound::None);
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
+    engine.write_column_records(vid, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "depview");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
@@ -750,21 +748,10 @@ fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── table_retract_applies_qname_before_id ────────────────────────────
-// Within apply_entity_caches' retract arm, the qname is removed BEFORE the
-// entity_by_id entry. That order matters: the qualified name is
-// reconstructed from entity_by_id (still present) to remove the
-// entity_by_qname entry. Reverse the two and the -1 reads an
-// already-removed entity_by_id, leaks a stale entity_by_qname[qn] → old
-// tid, and the recreate is then rejected by the qname-uniqueness guard (or
-// resolves to the wrong tid).
-//
-// End-state cache assertions on a single create/drop miss this: both orders
-// leave the same caches. The teeth show only across a drop + same-name
-// recreate.
+// ── dropped_name_resolves_to_its_recreation ──────────────────────────
 #[test]
-fn table_retract_applies_qname_before_id() {
-    let dir = temp_dir("table_retract_qname_before_id");
+fn dropped_name_resolves_to_its_recreation() {
+    let dir = temp_dir("dropped_name_recreate");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
@@ -774,11 +761,10 @@ fn table_retract_applies_qname_before_id() {
     assert_eq!(engine.caches.entity_by_qname.get("public.t").copied(), Some(tid1));
     engine.drop_table("public.t").unwrap();
 
-    // The drop must have cleared the qname mapping; a reversed qname/id
-    // retraction order leaves it pointing at the dropped tid.
+    // The drop must have cleared the qname mapping.
     assert!(
         !engine.caches.entity_by_qname.contains_key("public.t"),
-        "drop must clear entity_by_qname; a reversed retraction order leaks a stale mapping"
+        "drop must clear entity_by_qname"
     );
 
     // Recreate under the same qualified name. A leaked stale mapping would
@@ -837,7 +823,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
         (p_consumer, p_producer),
     ] {
         write_identity_circuit(&mut engine, vid, src, gnitz_wire::ReadBound::None);
-        engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+        engine.write_column_records(vid, &cols).unwrap();
     }
 
     // One VIEW_TAB batch, consumers first — the dependency-reversed row order.
@@ -975,7 +961,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
             col_def("A", type_code::I64),
         ];
         let tid = engine.allocate_ids(1).unwrap();
-        engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
+        engine.write_column_records(tid, &col_defs).unwrap();
         let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), name, flags);
         let err = engine
             .ingest_to_family(TABLE_TAB_ID, &batch)
@@ -993,7 +979,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
         },
     ];
     let tid = engine.allocate_ids(1).unwrap();
-    engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
+    engine.write_column_records(tid, &col_defs).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), "hidden_dup", 0);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
 
@@ -1038,7 +1024,7 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
     let register = |engine: &mut CatalogEngine, name: &str, owner: i64| {
         let vid = engine.next_id;
         write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
-        engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+        engine.write_column_records(vid, &cols).unwrap();
         let mut bb = BatchBuilder::new(*SysFamily::View.schema());
         push_view_tab_row(&mut bb, 1, vid, name, 0, 0, owner);
         engine.submit(SysFamily::View, bb.finish()).unwrap();
@@ -1091,6 +1077,46 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
         count_negative_records(engine.sys_relation(SysFamily::View).cursor()),
         0,
         "the segment must not be retracted twice"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── One relation id names one relation ───────────────────────────────
+#[test]
+fn a_view_create_at_a_registered_table_id_is_refused() {
+    let dir = temp_dir("view_at_table_id");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", type_code::U64)];
+
+    // In its own bundle, against a committed table.
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let err = engine
+        .submit(SysFamily::View, build_view_tab_row(tid, "v"))
+        .expect_err("a view create at a table's id must be refused");
+    assert!(err.contains(&format!("relation id {tid} already exists")), "{err}");
+    assert!(engine
+        .registry()
+        .relation(tid)
+        .is_some_and(|r| r.kind().is_base_table()));
+    let _ = engine.drain_pending_broadcasts();
+
+    // In the same bundle as the TABLE_TAB create.
+    let both = engine.allocate_ids(1).unwrap();
+    engine.write_column_records(both, &cols).unwrap();
+    engine
+        .submit(SysFamily::Table, build_table_tab_row(both, pack_pk_cols(&[0]), "both"))
+        .unwrap();
+    let err = engine
+        .submit(SysFamily::View, build_view_tab_row(both, "both_v"))
+        .expect_err("one bundle may not create one id as a table and a view");
+    assert!(err.contains(&format!("relation id {both} already exists")), "{err}");
+    engine.compensate_stage_a().unwrap();
+    assert!(!engine.registry().has_id(both));
+    assert_eq!(
+        engine.qualified_name_or_unknown(both),
+        ("?".to_string(), "?".to_string())
     );
 
     engine.close();

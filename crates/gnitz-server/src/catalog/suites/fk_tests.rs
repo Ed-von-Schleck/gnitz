@@ -2,6 +2,14 @@ use super::*;
 
 // ── test_fk_lock_set ─────────────────────────────────────────────────
 
+/// `tid`'s lock set as `lock_tables_exclusive` acquires it: sorted and deduped.
+fn lock_set(engine: &CatalogEngine, tid: i64) -> Vec<i64> {
+    let mut set: Vec<i64> = engine.fk_lock_set(tid).collect();
+    set.sort_unstable();
+    set.dedup();
+    set
+}
+
 #[test]
 fn test_fk_lock_set() {
     let dir = temp_dir("fk_lock_set");
@@ -12,10 +20,9 @@ fn test_fk_lock_set() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
         .unwrap();
-    assert_eq!(engine.fk_lock_set(parent_tid), vec![parent_tid]);
+    assert_eq!(lock_set(&engine, parent_tid), vec![parent_tid]);
 
-    // Add a child with FK to parent. Now both tables share a lock neighborhood,
-    // returned sorted ascending so both use the same acquisition order.
+    // Add a child with FK to parent. Now both tables share a lock neighborhood.
     let child_cols = vec![
         col_def("cid", type_code::U64),
         fk_def("fk", type_code::U64, parent_tid, 0),
@@ -24,12 +31,12 @@ fn test_fk_lock_set() {
     let mut expected = vec![parent_tid, child_tid];
     expected.sort_unstable();
     assert_eq!(
-        engine.fk_lock_set(child_tid),
+        lock_set(&engine, child_tid),
         expected,
         "child sees parent in its lock set"
     );
     assert_eq!(
-        engine.fk_lock_set(parent_tid),
+        lock_set(&engine, parent_tid),
         expected,
         "parent sees child in its lock set"
     );
@@ -42,14 +49,14 @@ fn test_fk_lock_set() {
     let child2_tid = engine.create_table("public.child2", &child2_cols, &[0]).unwrap();
     let mut expected3 = vec![parent_tid, child_tid, child2_tid];
     expected3.sort_unstable();
-    assert_eq!(engine.fk_lock_set(parent_tid), expected3);
+    assert_eq!(lock_set(&engine, parent_tid), expected3);
     let mut expected_c2 = vec![parent_tid, child2_tid];
     expected_c2.sort_unstable();
-    assert_eq!(engine.fk_lock_set(child2_tid), expected_c2);
+    assert_eq!(lock_set(&engine, child2_tid), expected_c2);
 
     // Drop child: parent's neighborhood shrinks back to itself + child2 only.
     engine.drop_table("public.child").unwrap();
-    assert_eq!(engine.fk_lock_set(parent_tid), expected_c2);
+    assert_eq!(lock_set(&engine, parent_tid), expected_c2);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -94,10 +101,10 @@ fn test_fk_drop_protections() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Dropping an FK child, alone or with its parent, leaves no lock entry ─────
+// ── Dropping an FK child, alone or with its parent, leaves no edge ───────────
 
 #[test]
-fn dropped_fk_child_leaves_no_lock_entry() {
+fn dropped_fk_child_leaves_no_edge() {
     let dir = temp_dir("fk_child_drop_lock");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let parent_tid = engine
@@ -111,22 +118,20 @@ fn dropped_fk_child_leaves_no_lock_entry() {
 
     engine.drop_table("public.child").unwrap();
 
-    assert!(
-        !engine.caches.needs_lock.contains_key(&child_tid),
-        "a dropped child must keep no lock entry"
-    );
-    assert!(
-        !engine.fk_lock_set(parent_tid).contains(&child_tid),
-        "the parent's lock set must not name the dropped child"
-    );
+    assert!(engine.fk_constraints_of(child_tid).is_empty());
     assert!(engine.fk_children_of(parent_tid).is_empty());
+    assert!(
+        !engine.caches.relations.contains_key(&child_tid),
+        "a dropped child must keep no relation entry"
+    );
+    assert_eq!(lock_set(&engine, parent_tid), vec![parent_tid]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn co_dropped_fk_parent_and_child_leave_no_lock_entry() {
+fn co_dropped_fk_parent_and_child_leave_no_edge() {
     let dir = temp_dir("fk_co_drop_lock");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let parent_tid = engine
@@ -143,12 +148,44 @@ fn co_dropped_fk_parent_and_child_leave_no_lock_entry() {
     let drop = engine.retract_pk_list(SysFamily::Table, vec![parent_tid as u128, child_tid as u128]);
     engine.submit(SysFamily::Table, drop).unwrap();
 
+    assert!(engine.fk_constraints_of(child_tid).is_empty());
+    assert!(engine.fk_children_of(parent_tid).is_empty());
     for tid in [parent_tid, child_tid] {
         assert!(
-            !engine.caches.needs_lock.contains_key(&tid),
-            "co-dropped table {tid} must keep no lock entry"
+            !engine.caches.relations.contains_key(&tid),
+            "co-dropped table {tid} must keep no relation entry"
         );
     }
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
+    let dir = temp_dir("fk_child_of_dropped_parent");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let parent_tid = engine
+        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
+        .unwrap();
+    let child_tid = engine.allocate_ids(1).unwrap();
+    engine
+        .write_column_records(
+            child_tid,
+            &[
+                col_def("cid", type_code::U64),
+                fk_def("pid_fk", type_code::U64, parent_tid, 0),
+            ],
+        )
+        .unwrap();
+
+    let mut batch = engine.retract_pk_list(SysFamily::Table, vec![parent_tid as u128]);
+    batch.append_batch(&build_table_tab_row(child_tid, pack_pk_cols(&[0]), "child"), 0, 1);
+    let err = engine
+        .submit(SysFamily::Table, batch)
+        .expect_err("a child of a parent this delta drops must be refused");
+    assert!(err.contains("which this transaction drops"), "{err}");
+    assert!(engine.registry().has_id(parent_tid));
+    assert!(!engine.registry().has_id(child_tid));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -259,9 +296,9 @@ fn test_fk_self_reference() {
     assert_eq!(as_parent[0].fk_col, 1);
     assert_eq!(as_parent[0].parent_col, 0);
 
-    // Both endpoints are the same table, so the lock set dedupes to one tid —
+    // Both endpoints are the same table, so the acquired set dedupes to one tid —
     // a writer takes exactly one guard, not the same guard twice.
-    assert_eq!(engine.fk_lock_set(emp_tid), vec![emp_tid]);
+    assert_eq!(lock_set(&engine, emp_tid), vec![emp_tid]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

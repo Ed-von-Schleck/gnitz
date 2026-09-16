@@ -23,7 +23,7 @@ fn test_enforce_unique_pk() {
     };
     let live = |engine: &mut CatalogEngine| -> usize {
         engine.registry_mut().flush(tid).unwrap();
-        engine.scan(tid).unwrap().0.len()
+        engine.scan(tid).unwrap().len()
     };
 
     // ST1: insert a new PK.
@@ -248,7 +248,7 @@ fn test_raised_counter_survives_drop_and_flush() {
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         tid = engine.next_id + 500;
-        engine.write_column_records(tid, OWNER_KIND_TABLE, &cols).unwrap();
+        engine.write_column_records(tid, &cols).unwrap();
         engine
             .submit(
                 SysFamily::Table,
@@ -290,7 +290,7 @@ fn test_sequence_gap_recovery() {
 
         // Inject column record for tid=250
         let mut cbb = BatchBuilder::new(*SysFamily::Column.schema());
-        push_col_tab_row(&mut cbb, 250, OWNER_KIND_TABLE, 0, &col_def("id", type_code::U64), 1);
+        push_col_tab_row(&mut cbb, 250, 0, &col_def("id", type_code::U64), 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
         let _ = engine.registry.flush(SysFamily::Table.id());
@@ -334,7 +334,7 @@ fn test_ingest_scan_seek_family() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Scan
-    let scan_batch = engine.scan(tid).unwrap().0;
+    let scan_batch = engine.scan(tid).unwrap();
     assert_eq!(scan_batch.len(), 3);
 
     // Point read, present
@@ -398,7 +398,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Scan — should have exactly 1 row with val=200
-    let scan = engine.scan(tid).unwrap().0;
+    let scan = engine.scan(tid).unwrap();
     assert_eq!(scan.len(), 1);
     assert_eq!(scan.get_pk(0), 1);
     assert_eq!(payload_u64(&*scan, 0, 0), 200, "the later write must win the PK");
@@ -592,31 +592,6 @@ fn test_fk_index_metadata_queries() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Column name caching test ─────────────────────────────────────
-
-#[test]
-fn test_column_defs_cached() {
-    let dir = temp_dir("catalog_colnames");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![
-        col_def("pk", type_code::U64),
-        col_def("alpha", type_code::U64),
-        col_def("beta", type_code::U64),
-    ];
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-
-    let names =
-        |e: &mut CatalogEngine| -> Vec<String> { e.read_column_defs(tid).iter().map(|cd| cd.name.clone()).collect() };
-    assert_eq!(names(&mut engine), vec!["pk", "alpha", "beta"]);
-
-    // Second call should hit cache
-    assert!(engine.caches.col_defs.contains_key(&tid));
-    assert_eq!(names(&mut engine), vec!["pk", "alpha", "beta"]);
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn test_dep_map_is_the_scan_delta_nodes() {
     // The dep map is derived from the circuit's `ScanDelta` nodes: the view id
@@ -712,7 +687,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
     let v2 = engine.allocate_ids(1).unwrap();
     write_identity_circuit(&mut engine, v2, tid, gnitz_wire::ReadBound::None);
-    engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_column_records(v2, &cols).unwrap();
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, v1, "v1", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, v2, "v1", 0, 0, 0);
@@ -750,8 +725,8 @@ fn test_dependent_view_restricts_fire_from_circuit_rows() {
     let mut nullable = cols[1].clone();
     nullable.is_nullable = true;
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 1, &cols[1], -1);
-    push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 1, &nullable, 1);
+    push_col_tab_row(&mut bb, tid, 1, &cols[1], -1);
+    push_col_tab_row(&mut bb, tid, 1, &nullable, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 
@@ -772,7 +747,7 @@ fn test_circuit_table_surface_introspectable() {
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
-    let scan = engine.scan(CIRCUIT_NODES_TAB_ID).unwrap().0;
+    let scan = engine.scan(CIRCUIT_NODES_TAB_ID).unwrap();
     assert_eq!(scan.len(), 1, "scan must expose CircuitNodes rows");
 
     // Compound PK: a point read by the 16-byte at-rest `(view_id, node_id)` OPK region.

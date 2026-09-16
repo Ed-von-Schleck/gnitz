@@ -13,10 +13,9 @@ use std::rc::Rc;
 impl CatalogEngine {
     /// [`RelationRegistry::scan`] with this engine's own circuit layer as
     /// the hydrator.
-    pub(crate) fn scan(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
-        let schema = self.registry.relation_or_err(table_id)?.schema();
+    pub(crate) fn scan(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
         let (dag, registry) = self.dag_and_registry_mut();
-        Ok((registry.scan(table_id, Some(dag))?, schema))
+        Ok(registry.scan(table_id, Some(dag))?)
     }
 
     /// [`RelationRegistry::scan_spec`], hydrating.

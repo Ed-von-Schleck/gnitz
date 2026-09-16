@@ -16,9 +16,9 @@ use gnitz_wire::ViewProps;
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
-    COLTAB_PAY_NAME, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS,
-    IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS,
-    TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
+    COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID,
+    IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX,
+    VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,9 +28,6 @@ use gnitz_wire::{
 pub(super) const SYSTEM_SCHEMA_ID: i64 = 1;
 pub(crate) const PUBLIC_SCHEMA_ID: i64 = 2;
 pub(super) const FIRST_USER_SCHEMA_ID: i64 = gnitz_wire::FIRST_USER_SCHEMA_ID as i64;
-
-pub(super) const OWNER_KIND_TABLE: i64 = gnitz_wire::OWNER_KIND_TABLE as i64;
-pub(super) const OWNER_KIND_VIEW: i64 = gnitz_wire::OWNER_KIND_VIEW as i64;
 
 /// The next catalog object id to allocate.
 pub(super) const SEQ_ID_NEXT_ID: i64 = 1;
@@ -191,43 +188,6 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
         is_serial: payload_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
         is_hidden: payload_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
         scale: payload_u64(src, row, COLTAB_PAY_SCALE) as u8,
-    }
-}
-
-/// The `(owner, column)` off a COL_TAB row's key plus the words deciding whether
-/// it declares a foreign key. Separate from [`read_col_tab_row`] so
-/// `apply_fk_edges_and_locks` never pays that decoder's `name` allocation.
-pub(super) struct ColTabIdent {
-    pub(super) owner_id: i64,
-    pub(super) owner_kind: i64,
-    pub(super) col_idx: u64,
-    pub(super) fk_table_id: i64,
-    pub(super) fk_col_idx: u32,
-}
-
-impl ColTabIdent {
-    /// Does this row declare a foreign key? An FK constrains a *base table's*
-    /// column; a view's COL_TAB rows are clones of the projected source defs,
-    /// so they carry the source's `fk_table_id` without being a constraint
-    /// themselves — reading one as a child would put a view id in a base
-    /// table's lock set and fail every parent DELETE on the view's missing FK
-    /// index.
-    pub(super) fn declares_fk(&self) -> bool {
-        self.fk_table_id != 0 && self.owner_kind == OWNER_KIND_TABLE
-    }
-}
-
-/// Decode COL_TAB `row`'s identity fields, `(owner_id, col_idx)` off the compound
-/// key. A struct rather than a 5-tuple of near-identical integers, two of which
-/// (`col_idx`, `fk_col_idx`) index different column spaces.
-pub(super) fn read_col_tab_ident<S: RowSource>(src: &S, row: usize) -> ColTabIdent {
-    let (owner_id, col_idx) = gnitz_wire::unpack_pair_pk(gnitz_wire::widen_pk_be(src.get_pk_bytes(row)));
-    ColTabIdent {
-        owner_id: owner_id as i64,
-        owner_kind: payload_u64(src, row, COLTAB_PAY_OWNER_KIND) as i64,
-        col_idx,
-        fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
-        fk_col_idx: payload_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
     }
 }
 

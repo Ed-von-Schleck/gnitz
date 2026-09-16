@@ -1,6 +1,6 @@
 //! FK / secondary-index metadata queries (for distributed validation),
-//! the store-handle and schema-descriptor accessors, the cached
-//! schema-wire block, and unique-violation message formatting.
+//! the store-handle and schema-descriptor accessors, and unique-violation
+//! message formatting.
 
 use super::*;
 
@@ -89,44 +89,23 @@ impl CatalogEngine {
 
     /// All FK edges where `table_id` is the child (empty when none).
     pub(crate) fn fk_constraints_of(&self, table_id: i64) -> &[FkEdge] {
-        self.caches
-            .fk_by_child
-            .get(&table_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.caches.relations.get(&table_id).map_or(&[], |e| e.fks.as_slice())
     }
 
-    /// Return the cached schema wire entry (block, version) for
-    /// `table_id`, or `None` if the block isn't yet cached.
-    pub(crate) fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<SchemaWireEntry> {
-        self.caches.schema_wire_cache.get(&table_id).cloned()
-    }
-
-    /// Return the current schema version for `table_id` (1 if unknown).
+    /// Return the current schema version for `table_id` (1 if unregistered).
     pub(crate) fn get_schema_version(&self, table_id: i64) -> u16 {
-        self.caches.get_schema_version(table_id)
-    }
-
-    /// Store an encoded schema wire block in the cache with the version it was
-    /// built at — written together so the invalidation in
-    /// `clear_col_cache_no_bump` keeps them consistent.
-    pub(in crate::catalog) fn set_schema_wire_block(&mut self, table_id: i64, entry: SchemaWireEntry) {
-        self.caches.schema_wire_cache.insert(table_id, entry);
-    }
-
-    /// The full set of table IDs that must be locked together for a write to
-    /// `table_id`, sorted ascending to guarantee deadlock-free acquisition:
-    /// `table_id` itself plus all FK parents (to guard concurrent parent
-    /// DELETE) and FK children (to guard concurrent child INSERT during a
-    /// parent DELETE). Empty if this table requires no lock at all.
-    /// Materialized at DDL time by `recompute_needs_lock`; the borrow is
-    /// sound on the push path because the caller holds the push read lock.
-    pub(crate) fn fk_lock_set(&self, table_id: i64) -> &[i64] {
         self.caches
-            .needs_lock
+            .relations
             .get(&table_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+            .map_or(1, |e| e.schema_version.get())
+    }
+
+    /// The tables a write to `table_id` locks exclusively: itself, its FK parents
+    /// (against a parent DELETE) and its FK children (against a child INSERT).
+    pub(crate) fn fk_lock_set(&self, table_id: i64) -> impl Iterator<Item = i64> + '_ {
+        std::iter::once(table_id)
+            .chain(self.fk_constraints_of(table_id).iter().map(|e| e.parent_tid))
+            .chain(self.fk_children_of(table_id).iter().map(|e| e.child_tid))
     }
 
     /// Does `table_id` carry a constraint whose validation reads committed
@@ -161,37 +140,24 @@ impl CatalogEngine {
     }
 
     /// `(index_id, is_unique)` of every live `sys_indices` row on exactly
-    /// `(owner_id, cols)`, read from storage rather than the caches.
+    /// `(owner_id, cols)`, read from storage.
     pub(super) fn indices_on_cols(&self, owner_id: i64, cols: &[u32]) -> Vec<(i64, bool)> {
-        let Some(ids) = self.caches.indices_by_owner.get(&owner_id) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for &idx_id in ids {
-            let Some(sr) = self.live_sys_row(SysFamily::Index, idx_id) else {
-                continue;
-            };
-            let (src, ri) = sr.source();
-            // A malformed word matches no column list, so it is simply not this
-            // owner's index — the register hook is where such a row is refused.
-            let Ok((row_owner, row_cols, props)) = read_idx_tab_row(src, ri) else {
-                continue;
-            };
-            if row_owner == owner_id && row_cols.as_slice() == cols {
-                out.push((idx_id, props.is_unique));
-            }
-        }
-        out
+        let scan = self.sys_relation(SysFamily::Index).full_scan();
+        (0..scan.len())
+            .filter_map(|i| {
+                // A malformed word matches no column list; the register hook refuses such a row.
+                let (row_owner, row_cols, props) = read_idx_tab_row(&*scan, i).ok()?;
+                (row_owner == owner_id && row_cols.as_slice() == cols).then(|| (scan.get_pk(i) as i64, props.is_unique))
+            })
+            .collect()
     }
 
     /// `(schema, table, columns)` names for `(table_id, col_indices)`, each
     /// falling back to `"?"` when the catalog has no entry. The `columns` field
     /// joins every named column with `, ` (a composite `UNIQUE (a, b)` renders
     /// `"a, b"`). The fallback is defensive: the entity always exists on the
-    /// constraint-violation paths that format these names. Goes through
-    /// `read_column_defs` so these messages read the same cached column defs as
-    /// every other name consumer, instead of opening a second COL_TAB scan.
-    fn qualified_col_names(&mut self, table_id: i64, col_indices: &[u32]) -> (&str, &str, String) {
+    /// constraint-violation paths that format these names.
+    fn qualified_col_names(&self, table_id: i64, col_indices: &[u32]) -> (String, String, String) {
         let defs = self.read_column_defs(table_id);
         let col = col_indices
             .iter()
@@ -207,7 +173,7 @@ impl CatalogEngine {
     /// used when two rows of one ingest batch collide, versus a collision with
     /// already-committed data. A composite index passes its full `col_indices`,
     /// joined as `(a, b)`.
-    pub(crate) fn unique_violation_err(&mut self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
+    pub(crate) fn unique_violation_err(&self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         if in_batch {
             format!("Unique index violation on '{sn}.{tn}' column '{col}': duplicate in batch")
@@ -219,7 +185,7 @@ impl CatalogEngine {
     /// Format the `CREATE UNIQUE INDEX` rejection raised when the target
     /// column(s) already hold duplicate values. Same single-source-of-truth
     /// contract as [`Self::unique_violation_err`].
-    pub(crate) fn unique_create_dup_err(&mut self, table_id: i64, col_indices: &[u32]) -> String {
+    pub(crate) fn unique_create_dup_err(&self, table_id: i64, col_indices: &[u32]) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         format!("cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values")
     }
@@ -230,7 +196,7 @@ impl CatalogEngine {
     /// cannot pair from two different schemas. `in_batch` distinguishes two rows
     /// of one ingest batch sharing a PK from a collision with committed data.
     pub(crate) fn pk_violation_err(
-        &mut self,
+        &self,
         table_id: i64,
         schema: &SchemaDescriptor,
         pk_bytes: &[u8],

@@ -61,7 +61,6 @@ pub fn write_schema_tab_row(sink: &mut impl SysRowSink, r: &SchemaTabRow, weight
 pub struct ColTabRow<'a> {
     pub owner_id: u64,
     pub col_idx: u64,
-    pub owner_kind: u64,
     pub name: &'a str,
     pub type_code: u64,
     pub is_nullable: bool,
@@ -76,7 +75,6 @@ pub struct ColTabRow<'a> {
 /// identity of a column record, so neither half is repeated in the payload.
 pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64) {
     sink.begin_row(&[r.owner_id as u128, r.col_idx as u128], weight);
-    sink.put_u64(r.owner_kind);
     sink.put_string(r.name);
     sink.put_u64(r.type_code);
     sink.put_u64(r.is_nullable as u64);

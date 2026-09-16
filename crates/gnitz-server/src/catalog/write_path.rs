@@ -2,14 +2,7 @@
 //! `fire_hooks`), the broadcast queue, the zone pin, Stage-A compensation, and the
 //! orphan-directory sweep.
 
-use rustc_hash::FxHashMap;
-
 use super::*;
-
-/// Every id `map` lists under any of `owners`.
-fn owned_ids<'a>(map: &'a FxHashMap<i64, Vec<i64>>, owners: &'a [i64]) -> impl Iterator<Item = i64> + 'a {
-    owners.iter().filter_map(|o| map.get(o)).flatten().copied()
-}
 
 impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
@@ -43,7 +36,9 @@ impl CatalogEngine {
         }
         let mut owners = net_dead;
         // A view's segments drop in its own batch, unless the bundle already names them.
-        let segs: Vec<i64> = owned_ids(&self.caches.segments_by_owner, &owners)
+        let segs: Vec<i64> = self
+            .ids_naming(SysFamily::View, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID, &owners)
+            .into_iter()
             .filter(|s| owners.binary_search(s).is_err())
             .collect();
         if !segs.is_empty() {
@@ -55,7 +50,8 @@ impl CatalogEngine {
         }
         let indices = self.retract_pk_list(
             SysFamily::Index,
-            owned_ids(&self.caches.indices_by_owner, &owners)
+            self.ids_naming(SysFamily::Index, gnitz_wire::IDXTAB_PAY_OWNER_ID, &owners)
+                .into_iter()
                 .map(|id| id as u128)
                 .collect(),
         );

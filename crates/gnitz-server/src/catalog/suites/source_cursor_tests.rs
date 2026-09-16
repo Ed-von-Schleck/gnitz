@@ -35,7 +35,7 @@ fn fixture_with(name: &str, bound: Option<IndexBound>, val_of: impl Fn(u64) -> u
         walk: gnitz_wire::IndexWalk::Optional,
     });
     write_identity_circuit(&mut engine, vid, tid, bound);
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_column_records(vid, &cols).unwrap();
     let batch = build_view_tab_row(vid, "v_base");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
     (engine, tid, vid)

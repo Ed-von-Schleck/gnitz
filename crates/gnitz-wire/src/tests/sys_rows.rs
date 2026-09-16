@@ -2,11 +2,11 @@ use super::*;
 use crate::{
     CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
     CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_COLS, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID,
-    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_KIND,
-    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
-    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS, TABLE_TAB_COLS,
-    TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID,
-    VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB_COLS,
+    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_SCALE,
+    COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
+    IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS,
+    TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
+    VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -70,7 +70,6 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     assert_eq!(rec.pk, [r.owner_id as u128, r.col_idx as u128]);
     assert_eq!(rec.weight, weight);
     let v = rec.row(COL_TAB_COLS, 2); // compound PK: two key columns
-    assert_eq!(v[COLTAB_PAY_OWNER_KIND], Val::U64(r.owner_kind));
     assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.name.into()));
     assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.type_code));
     assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.is_nullable as u64));
@@ -84,11 +83,9 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
 /// Each value must land in the payload slot the readers look for it in.
 #[test]
 fn values_land_in_their_named_payload_slots() {
-    // Distinct values per u64 field, and `owner_kind` a sentinel no boolean
-    // can take — it reaches the writer as a plain u64.
+    // Distinct values per u64 field.
     let witness = ColTabRow {
         owner_id: 16,
-        owner_kind: 7,
         col_idx: 2,
         name: "score",
         type_code: 10,

@@ -113,10 +113,7 @@ impl MasterDispatcher {
         &self.sal
     }
 
-    /// `target_id`'s wire identity, off the catalog's cache: the block is built
-    /// on first call and invalidated alongside col_names whenever DDL modifies
-    /// the table, so the SAL write paths (commit/tick/broadcast) pay neither a
-    /// block encode nor a per-column walk per group.
+    /// `target_id`'s wire identity.
     fn wire_schema(&self, target_id: i64) -> wire::WireSchema {
         let descriptor = self.schema_desc_for(target_id);
         wire::WireSchema::from_catalog(self.cat(), target_id, descriptor)

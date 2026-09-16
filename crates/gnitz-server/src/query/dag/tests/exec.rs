@@ -218,9 +218,7 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
     for rank in [0u32, 1] {
         let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2).unwrap();
         let replicated = engine.allocate_ids(1).unwrap();
-        engine
-            .write_column_records(replicated, gnitz_wire::OWNER_KIND_TABLE as i64, &cols)
-            .unwrap();
+        engine.write_column_records(replicated, &cols).unwrap();
         let mut bb = gnitz_store::storage::BatchBuilder::new(*crate::catalog::SysFamily::Table.schema());
         let flags = gnitz_wire::TableProps { replicated: true, ..Default::default() }.pack();
         crate::test_support::push_table_tab_row(

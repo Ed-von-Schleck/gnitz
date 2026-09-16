@@ -364,7 +364,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
     let distinct = circuit.distinct(scan);
     circuit.sink(distinct);
     write_circuit(&mut engine, vid, circuit);
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_column_records(vid, &cols).unwrap();
     engine
         .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced"))
         .unwrap();

@@ -31,8 +31,8 @@ pub(crate) struct ColumnDef {
 // ---------------------------------------------------------------------------
 
 /// One FK constraint as a directed edge, identical whichever end it was reached
-/// from: `fk_by_child` holds the edges whose `child_tid` is the key,
-/// `fk_by_parent` those whose `parent_tid` is. The two column positions are
+/// from: the child's relation entry holds the edges it declares, `fk_by_parent`
+/// those whose `parent_tid` is the key. The two column positions are
 /// easy to transpose, so they are named rather than left as a bare tuple.
 #[derive(Clone, Copy)]
 pub(crate) struct FkEdge {

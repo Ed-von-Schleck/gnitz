@@ -19,8 +19,8 @@ use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::Circuit;
 use gnitz_wire::{
     RelClass, TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
-    COL_TAB, IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, OWNER_KIND_TABLE,
-    OWNER_KIND_VIEW, RELTAB_COL_NAME, RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+    COL_TAB, IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, RELTAB_COL_NAME,
+    RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -1259,12 +1259,7 @@ impl GnitzClient {
         // ingests columns before the TABLE_TAB register hook that reads them.
         let col_s = sys_schema(COL_TAB);
         let mut col_batch = ZSetBatch::new(col_s);
-        append_col_rows(
-            &mut BatchAppender::new(&mut col_batch, col_s),
-            new_tid,
-            OWNER_KIND_TABLE,
-            columns,
-        );
+        append_col_rows(&mut BatchAppender::new(&mut col_batch, col_s), new_tid, columns);
 
         // TABLE_TAB family.
         let tbl_schema = sys_schema(TABLE_TAB);
@@ -1456,8 +1451,11 @@ impl GnitzClient {
                     (segment_name(vid), owner_vid, ViewProps::default())
                 };
 
-                // 1. Column records.
-                append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns);
+                // 1. Column records. A foreign key constrains a base table, not a view.
+                for cd in &mut pv.output_columns {
+                    cd.fk = None;
+                }
+                append_col_rows(&mut col_a, vid, &pv.output_columns);
 
                 // 2. Circuit node rows.
                 gnitz_wire::sys_rows::write_circuit_rows(&mut nodes_a, vid, &pv.circuit);
@@ -1647,7 +1645,7 @@ impl GnitzClient {
         let mut cb = ZSetBatch::new(col_s);
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, OWNER_KIND_TABLE, col_idx), 1);
+            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, col_idx), 1);
         }
         self.push_ddl_txn(&[(COL_TAB, cb)])?;
         Ok(())
@@ -1970,9 +1968,9 @@ fn checked_sys_rows(family: u64, reply: ScanReply) -> Result<ZSetBatch, ClientEr
 }
 
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`.
-fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, owner_kind: u64, columns: &[ColumnDef]) {
+fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, columns: &[ColumnDef]) {
     for (i, cd) in columns.iter().enumerate() {
-        gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, owner_kind, i), 1);
+        gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, i), 1);
     }
 }
 
