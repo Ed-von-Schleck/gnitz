@@ -260,7 +260,7 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (i64, u64)
     let tid = base_with_index(&mut engine);
 
     // The two halves of the verdict, written the way a boot writes them.
-    engine.record_topology(recorded_workers).unwrap();
+    engine.record_topology(recorded_workers);
     let g = engine.bump_checkpoint_generation().unwrap();
 
     // The index is the only rederived store this table owns, so the ephemeral
@@ -358,7 +358,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.vbase");
 
-    let vid = engine.allocate_table_id().unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
     let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(tid as u64, gnitz_wire::ReadBound::None);
     let distinct = circuit.distinct(scan);
@@ -373,7 +373,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
         "the fixture view must compile"
     );
 
-    engine.record_topology(1).unwrap();
+    engine.record_topology(1);
     let g = engine.bump_checkpoint_generation().unwrap();
     engine.flush_ephemeral_round().unwrap();
     assert_eq!(engine.registry().resume_generation(), g);

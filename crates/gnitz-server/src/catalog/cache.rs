@@ -129,11 +129,6 @@ impl CatalogEngine {
             if weight > 0 {
                 self.caches.schema_by_name.insert(name.clone(), sid);
                 self.caches.schema_by_id.insert(sid, name);
-                // Re-derive next_schema_id from the durable SCHEMA_TAB row so a
-                // crash-before-checkpoint never re-issues it (advance_sequence is
-                // memtable-only; this row is fsync'd at CREATE). The Schema family
-                // has no register hook, so this applier is its re-derive site.
-                raise_id_counter(&mut self.next_schema_id, sid);
             } else {
                 self.caches.schema_by_name.remove(&name);
                 self.caches.schema_by_id.remove(&sid);

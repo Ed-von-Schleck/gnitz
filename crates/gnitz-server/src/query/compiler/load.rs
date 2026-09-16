@@ -1,7 +1,7 @@
 //! Circuit loading: read one view's `CircuitNodes` rows into a `LoadedCircuit`.
 
 use super::*;
-use gnitz_store::storage::{payload_bytes, payload_is_null, payload_u64, ReadCursor};
+use gnitz_store::storage::{payload_bytes, payload_is_null, payload_u64};
 use gnitz_wire::{
     CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
     CIRCNODES_PAY_SOURCE_TABLE,
@@ -11,18 +11,16 @@ use gnitz_wire::{
 // System table reading
 // ---------------------------------------------------------------------------
 
-/// A cursor over the `CircuitNodes` system table, if the registry holds it.
-fn circuit_nodes_cursor(registry: &RelationRegistry) -> Option<ReadCursor> {
-    registry
-        .relation(gnitz_wire::CIRCUIT_NODES_TAB as i64)
-        .map(Relation::cursor)
+/// The `CircuitNodes` system table, if the registry holds it.
+fn circuit_nodes(registry: &RelationRegistry) -> Option<&Relation> {
+    registry.relation(gnitz_wire::CIRCUIT_NODES_TAB as i64)
 }
 
 /// Visit every `(view_id, source_table)` scan edge in the CircuitNodes store —
 /// one call per `ScanDelta` node carrying a source, the same rows `load_circuit`
 /// turns into `OpNode::ScanDelta`. Repeats are not filtered; the caller dedups.
 pub(in crate::query) fn for_each_scan_edge(registry: &RelationRegistry, mut f: impl FnMut(i64, i64)) {
-    let Some(mut cur) = circuit_nodes_cursor(registry) else {
+    let Some(mut cur) = circuit_nodes(registry).map(Relation::cursor) else {
         return;
     };
     // Every view's nodes, in view_id order.
@@ -47,7 +45,7 @@ pub(in crate::query) fn for_each_scan_edge(registry: &RelationRegistry, mut f: i
 /// `Circuit::push` — so a sparse id, an input naming a later node and an arity
 /// mismatch each abort the load.
 pub(super) fn load_circuit(registry: &RelationRegistry, view_id: u64) -> Result<LoadedCircuit, String> {
-    let mut nodes_cur = circuit_nodes_cursor(registry).ok_or("the circuit system table is not open")?;
+    let nodes = circuit_nodes(registry).ok_or("the circuit system table is not open")?;
     let mut circuit = gnitz_wire::Circuit::default();
 
     // The circuit table has a compound `(view_id, node_id)` PK; the OPK image of
@@ -58,7 +56,7 @@ pub(super) fn load_circuit(registry: &RelationRegistry, view_id: u64) -> Result<
     // here aborts the WHOLE load.
     let mut invalid: Option<String> = None;
 
-    nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
+    nodes.for_each_positive_with_prefix(&prefix, |ch| {
         if invalid.is_some() {
             return;
         }

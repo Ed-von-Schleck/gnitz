@@ -7,11 +7,9 @@
 
 use rustc_hash::FxHashMap;
 
-use super::pair_opk;
 use super::ColumnDef;
 use gnitz_expr::RowSource;
 use gnitz_store::relation::RelationKind;
-use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{payload_str, payload_string, payload_u64, Batch};
 use gnitz_wire::ViewProps;
@@ -34,25 +32,23 @@ pub(super) const FIRST_USER_SCHEMA_ID: i64 = gnitz_wire::FIRST_USER_SCHEMA_ID as
 pub(super) const OWNER_KIND_TABLE: i64 = gnitz_wire::OWNER_KIND_TABLE as i64;
 pub(super) const OWNER_KIND_VIEW: i64 = gnitz_wire::OWNER_KIND_VIEW as i64;
 
-pub(super) const SEQ_ID_SCHEMAS: i64 = 1;
-pub(super) const SEQ_ID_TABLES: i64 = 2;
-pub(super) const SEQ_ID_INDICES: i64 = 3;
-/// Committed checkpoint generation (monotonic). Falls in the ignored 4..16 gap
-/// of `observe_user_sequence`, so a fresh DB writing no row defaults it to 0.
-pub(super) const SEQ_ID_CHECKPOINT_GEN: i64 = 4;
+/// The next catalog object id to allocate.
+pub(super) const SEQ_ID_NEXT_ID: i64 = 1;
+/// Committed checkpoint generation (monotonic).
+pub(super) const SEQ_ID_CHECKPOINT_GEN: i64 = 2;
 /// Cluster topology: `(worker_count as u64) << 32 | STATE_FORMAT as u64`.
-pub(super) const SEQ_ID_TOPOLOGY: i64 = 5;
+pub(super) const SEQ_ID_TOPOLOGY: i64 = 3;
 
 pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 /// Above every column index, so a catalog index's `idx_<id>` directory never
 /// collides with an FK circuit's, whose id is its column index.
 pub(super) const FIRST_USER_INDEX_ID: i64 = MAX_COLUMNS as i64;
+/// The first id `allocate_ids` hands out.
+pub(super) const FIRST_ALLOCATED_ID: i64 = FIRST_USER_INDEX_ID;
+const _: () = assert!(FIRST_ALLOCATED_ID >= FIRST_USER_SCHEMA_ID && FIRST_ALLOCATED_ID >= FIRST_USER_TABLE_ID);
 
-/// The durable relation-id tripwire in this crate's `i64` id width; the value and
-/// its rationale live on [`gnitz_wire::RELATION_ID_CEILING`].
-/// `precheck_family` — the point an id enters the registry — rejects any id at
-/// or above it.
-pub(super) const RELATION_ID_CEILING: i64 = gnitz_wire::RELATION_ID_CEILING as i64;
+/// [`gnitz_wire::CATALOG_ID_CEILING`] in this crate's `i64` id width.
+pub(super) const CATALOG_ID_CEILING: i64 = gnitz_wire::CATALOG_ID_CEILING as i64;
 
 // The families' table ids in the catalog's `i64` width. Production code names
 // the family — [`SysFamily::id`] *is* the wire id, by discriminant — so these
@@ -497,18 +493,6 @@ impl SysFamily {
         }
     }
 
-    /// The half-open key band `[(leading, 0), (leading + 1, 0))` of this
-    /// pair-keyed family — exactly its rows under `leading`. Stated once so the
-    /// read scan and the drop cascade cannot disagree on the upper bound.
-    pub(in crate::catalog) fn band(self, leading: i64) -> (PkBuf, PkBuf) {
-        assert!(
-            self.wire().pk_cols.len() == 2,
-            "a key band is defined only for a pair-keyed family"
-        );
-        let schema = self.schema();
-        (pair_opk(schema, leading, 0), pair_opk(schema, leading + 1, 0))
-    }
-
     /// The lowest id a client may write in this family's id space; everything
     /// below is bootstrap-owned. Read against [`Self::leading_id`], so Column's
     /// floor is its owner's. `None` where the PK is no id space at all.
@@ -521,15 +505,17 @@ impl SysFamily {
         }
     }
 
-    /// The exclusive upper bound on an id a client may write. Index shares the
-    /// relation ceiling although its ids are a separate space: it needs *a*
-    /// bound, because `hook_index_register` raises the index-id counter off the
-    /// ingested row and `allocate_index_ids` carries no assertion — and a second
-    /// near-duplicate constant would only invite the two to drift.
+    /// The exclusive upper bound on an id a client may write: the ceiling
+    /// `allocate_ids` allocates under.
     pub(super) fn id_ceiling(self) -> Option<i64> {
+        self.allocates_ids().then_some(CATALOG_ID_CEILING)
+    }
+
+    /// Does this family's PK draw from the catalog object-id counter?
+    pub(super) fn allocates_ids(self) -> bool {
         match self {
-            SysFamily::Table | SysFamily::View | SysFamily::Index => Some(RELATION_ID_CEILING),
-            SysFamily::Schema | SysFamily::Column | SysFamily::Sequence | SysFamily::CircuitNodes => None,
+            SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index => true,
+            SysFamily::Column | SysFamily::Sequence | SysFamily::CircuitNodes => false,
         }
     }
 

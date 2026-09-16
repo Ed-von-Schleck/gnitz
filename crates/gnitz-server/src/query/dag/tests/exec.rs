@@ -217,7 +217,7 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
     let cols = view_cols();
     for rank in [0u32, 1] {
         let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2).unwrap();
-        let replicated = engine.allocate_table_id().unwrap();
+        let replicated = engine.allocate_ids(1).unwrap();
         engine
             .write_column_records(replicated, gnitz_wire::OWNER_KIND_TABLE as i64, &cols)
             .unwrap();

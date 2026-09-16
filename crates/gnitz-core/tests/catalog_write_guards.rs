@@ -149,7 +149,7 @@ fn a_schema_name_that_is_not_an_identifier_is_refused() {
     let srv = ServerHandle::start();
     let mut s = session(&srv);
     for name in ["..", "../escape", "a/b", "with space", ""] {
-        let sid = s.alloc_schema_id().unwrap();
+        let sid = s.alloc_id().unwrap();
         let err = s
             .push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, name))])
             .expect_err("a non-identifier schema name must be refused");
@@ -169,7 +169,7 @@ fn a_non_canonical_name_is_refused_for_every_family() {
     let srv = ServerHandle::start();
     let mut s = session(&srv);
 
-    let sid = s.alloc_schema_id().unwrap();
+    let sid = s.alloc_id().unwrap();
     let err = format!(
         "{:?}",
         s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "MixedCase"))])
@@ -180,7 +180,7 @@ fn a_non_canonical_name_is_refused_for_every_family() {
     // The relation families take the same rule (minus the client's leading-`_`
     // policy, which the engine must not apply — it writes `__h…` segments).
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "guards"))]).unwrap();
-    let tid = s.alloc_table_id().unwrap();
+    let tid = s.alloc_id().unwrap();
     let err = format!(
         "{:?}",
         s.push_ddl_txn(&[
@@ -199,10 +199,10 @@ fn a_non_canonical_name_is_refused_for_every_family() {
 fn a_bundle_with_two_blocks_for_one_family_is_refused() {
     let srv = ServerHandle::start();
     let mut s = session(&srv);
-    let sid = s.alloc_schema_id().unwrap();
+    let sid = s.alloc_id().unwrap();
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "dupfam"))]).unwrap();
 
-    let (a, b) = (s.alloc_table_id().unwrap(), s.alloc_table_id().unwrap());
+    let (a, b) = (s.alloc_id().unwrap(), s.alloc_id().unwrap());
     let err = format!(
         "{:?}",
         s.push_ddl_txn(&[
@@ -284,10 +284,10 @@ fn a_three_family_create_table_bundle_still_commits() {
 fn a_wire_supplied_owner_view_id_must_name_a_real_view() {
     let srv = ServerHandle::start();
     let mut s = session(&srv);
-    let sid = s.alloc_schema_id().unwrap();
+    let sid = s.alloc_id().unwrap();
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "owned"))]).unwrap();
 
-    let vid = s.alloc_table_id().unwrap();
+    let vid = s.alloc_id().unwrap();
     let view_s = sys_schema(gnitz_wire::VIEW_TAB);
     let mut b = ZSetBatch::new(view_s);
     gnitz_wire::sys_rows::write_view_tab_row(
@@ -431,7 +431,7 @@ fn a_sequence_block_is_refused_from_the_wire() {
 fn a_column_block_whose_owner_is_never_registered_is_refused() {
     let srv = ServerHandle::start();
     let mut s = session(&srv);
-    let tid = s.alloc_table_id().unwrap();
+    let tid = s.alloc_id().unwrap();
     let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, two_columns(tid))]).unwrap_err());
     assert!(err.contains("does not create and the catalog does not hold"), "{err}");
 }
@@ -463,7 +463,7 @@ fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
     let tid = a_table(&mut client, "phantomview");
 
     let mut s = session(&srv);
-    let phantom = s.alloc_table_id().unwrap();
+    let phantom = s.alloc_id().unwrap();
     let nodes = sys_schema(gnitz_wire::CIRCUIT_NODES_TAB);
     let mut b = ZSetBatch::new(nodes);
     write_circuit_node_row(
@@ -496,10 +496,10 @@ fn a_view_scanning_itself_is_refused() {
     let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let mut s = session(&srv);
-    let sid = s.alloc_schema_id().unwrap();
+    let sid = s.alloc_id().unwrap();
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "selfscan"))]).unwrap();
 
-    let vid = s.alloc_table_id().unwrap();
+    let vid = s.alloc_id().unwrap();
     let mut circuit = gnitz_core::Circuit::default();
     let scan = circuit.input_delta(vid, gnitz_wire::ReadBound::None);
     circuit.sink(scan);
@@ -543,7 +543,7 @@ fn a_view_scanning_itself_is_refused() {
 fn two_schema_rows_sharing_a_name_in_one_bundle_are_refused() {
     let srv = ServerHandle::start();
     let mut s = session(&srv);
-    let (a, b) = (s.alloc_schema_id().unwrap(), s.alloc_schema_id().unwrap());
+    let (a, b) = (s.alloc_id().unwrap(), s.alloc_id().unwrap());
     let sc = sys_schema(SCHEMA_TAB);
     let mut batch = ZSetBatch::new(sc);
     let mut app = BatchAppender::new(&mut batch, sc);
@@ -566,7 +566,7 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
 
     // A row above ±1: `retract_pk_list` emits a hard `-1`, so a row left at 2 is
     // under-retracted and becomes a permanent live ghost.
-    let sid = s.alloc_schema_id().unwrap();
+    let sid = s.alloc_id().unwrap();
     let sc = sys_schema(SCHEMA_TAB);
     let mut heavy = ZSetBatch::new(sc);
     write_schema_tab_row(
@@ -587,7 +587,7 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
     let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, pair)]).unwrap_err());
     assert!(err.contains("more than one row for schema"), "{err}");
 
-    let iid = s.alloc_index_id().unwrap();
+    let iid = s.alloc_id().unwrap();
     let err = format!(
         "{:?}",
         s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, &[(iid, -1), (iid, 1)]))])
@@ -596,7 +596,7 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
     assert!(err.contains("more than one row for index"), "{err}");
 
     // TABLE_TAB does admit a pair, so its rule is one row per *sign*.
-    let dup = s.alloc_table_id().unwrap();
+    let dup = s.alloc_id().unwrap();
     let tt = sys_schema(TABLE_TAB);
     let mut twice = ZSetBatch::new(tt);
     let mut app = BatchAppender::new(&mut twice, tt);
@@ -620,12 +620,9 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
     );
     assert!(err.contains("more than one row for table"), "{err}");
 
-    // `hook_index_register` raises the index-id counter off the ingested row, on
-    // the live path and again on boot replay, and the index allocator carries no
-    // assertion — so a crafted id durably poisons the counter.
     let err = format!(
         "{:?}",
-        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, &[(gnitz_wire::RELATION_ID_CEILING, 1)]))])
+        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, &[(gnitz_wire::CATALOG_ID_CEILING, 1)]))])
             .unwrap_err()
     );
     assert!(err.contains("id ceiling"), "{err}");

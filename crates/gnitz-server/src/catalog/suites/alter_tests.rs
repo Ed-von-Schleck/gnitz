@@ -20,12 +20,8 @@ struct TableRow {
 }
 
 fn live_table_row(engine: &CatalogEngine, tid: i64) -> TableRow {
-    let schema = SysFamily::Table.schema();
-    let key = sys_opk(schema, tid as u128);
-    let store = engine.sys_relation(SysFamily::Table);
-    let sr = store
-        .live_row_at(key.pk_bytes())
-        .1
+    let sr = engine
+        .live_sys_row(SysFamily::Table, tid)
         .unwrap_or_else(|| panic!("live TABLE_TAB row for tid {tid} missing"));
     let (src, row) = sr.source();
     TableRow {
@@ -381,7 +377,7 @@ fn column_rename_on_non_base_owner_rejected() {
     // bootstrap wrote so the `-1` cannot drift from it. A system owner packs a
     // COL_TAB PK below the family's first user id, so the id-space floor is what
     // catches this one, before the owner is ever resolved.
-    let sys_col = engine.scan_column_defs(IDX_TAB_ID).swap_remove(0);
+    let sys_col = engine.read_column_defs(IDX_TAB_ID)[0].clone();
     let err = engine
         .precheck_family(
             SysFamily::Column,
@@ -572,7 +568,7 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
     assert!(err.contains("dropped"), "rename: {err}");
 
     let idx = idx_tab_batch(
-        engine.allocate_index_id().unwrap(),
+        engine.allocate_ids(1).unwrap(),
         tid,
         pack_pk_cols(&[1]),
         "public__t__idx_a",
@@ -651,7 +647,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
     let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
     families[SysFamily::Column.index()] = Some(bb.finish());
     families[SysFamily::Index.index()] = Some(idx_tab_batch(
-        engine.allocate_index_id().unwrap(),
+        engine.allocate_ids(1).unwrap(),
         tid,
         pack_pk_cols(&[1]),
         "public__t__idx_v",

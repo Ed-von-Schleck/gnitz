@@ -61,7 +61,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
 fn index_circuit_for_col_finds_index_and_uniqueness() {
     let dir = temp_dir("index_circuit_for_col");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let tid = engine.next_table_id;
+    let tid = engine.next_id;
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
     setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
@@ -100,7 +100,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     // Parent: wide PK (cols 0..3) + non-PK column `email` (col 3). This is the
     // only test that resolves a genuinely wide (24-byte) PK via the byte-keyed
     // `seek` and reads back a committed non-PK column value.
-    let parent_tid = engine.next_table_id;
+    let parent_tid = engine.next_id;
     let parent_schema = wide_unique_schema(); // [u64;4], pk [0,1,2], col 3 = email
     let parent_pk = pk24(100, 200, 300);
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);

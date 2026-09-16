@@ -63,7 +63,7 @@ fn test_table_tab_no_cols_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
-    let tid = engine.allocate_table_id().unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
     // No column records written — TABLE_TAB ingestion must fail.
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badtable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
@@ -85,7 +85,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
-    let tid = engine.allocate_table_id().unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
     // STRING column is not pk-eligible.
     let cols = vec![col_def("label", type_code::STRING)];
     engine.write_column_records(tid, OWNER_KIND_TABLE, &cols).unwrap();
@@ -116,7 +116,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     let orig_tid = engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
-    let new_tid = engine.allocate_table_id().unwrap();
+    let new_tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(new_tid, OWNER_KIND_TABLE, &cols).unwrap();
 
     let batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
@@ -156,7 +156,7 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
-    let tid = engine.allocate_table_id().unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
     // Insert columns at indices 0 and 2 — index 1 is absent (gap).
     write_col_at_index(&mut engine, tid, 0, &col_def("id", type_code::U64)).unwrap();
     write_col_at_index(&mut engine, tid, 2, &col_def("gapped", type_code::U64)).unwrap();
@@ -183,7 +183,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::View).cursor());
 
-    let vid = engine.allocate_table_id().unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
     // No column records for vid.
     let batch = build_view_tab_row(vid, "badview");
     let result = engine.ingest_to_family(VIEW_TAB_ID, &batch);
@@ -208,7 +208,7 @@ fn test_view_tab_too_many_cols_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::View).cursor());
 
-    let vid = engine.allocate_table_id().unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
     // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
     for i in 0..(gnitz_wire::MAX_COLUMNS as i64 + 1) {
         write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), type_code::U64)).unwrap();
@@ -237,8 +237,8 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
 
-    let nonexistent_owner = engine.allocate_table_id().unwrap();
-    let idx_id = engine.allocate_index_id().unwrap();
+    let nonexistent_owner = engine.allocate_ids(1).unwrap();
+    let idx_id = engine.allocate_ids(1).unwrap();
     let batch = idx_tab_batch(
         idx_id,
         nonexistent_owner,
@@ -281,7 +281,7 @@ fn test_idx_tab_view_owner_rejected() {
 
     // Register a view via the raw system-table path (no circuit needed — the
     // precheck must fire before any backfill).
-    let vid = engine.allocate_table_id().unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
     engine
         .write_column_records(vid, OWNER_KIND_VIEW, &[col_def("id", type_code::U64)])
         .unwrap();
@@ -290,7 +290,7 @@ fn test_idx_tab_view_owner_rejected() {
     assert!(engine.registry().has_id(vid), "view registered");
 
     let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
-    let idx_id = engine.allocate_index_id().unwrap();
+    let idx_id = engine.allocate_ids(1).unwrap();
     let batch = idx_tab_batch(
         idx_id,
         vid,
@@ -349,7 +349,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
 
     let orig_name = "public__idxtest__idx_val";
-    let new_idx_id = engine.allocate_index_id().unwrap();
+    let new_idx_id = engine.allocate_ids(1).unwrap();
     // Same name, different col (ts at index 2) — bypasses create_index dup check.
     let batch = idx_tab_batch(
         new_idx_id,
@@ -420,7 +420,7 @@ fn test_create_index_backfill_fail_no_dir_leak_internal() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Capture the expected index directory before create_index allocates the id.
-    let expected_idx_id = engine.next_index_id;
+    let expected_idx_id = engine.next_id;
     let owner_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     let idx_dir = format!("{owner_dir}/idx_{expected_idx_id}");
 
@@ -452,13 +452,11 @@ fn test_create_index_backfill_fail_no_dir_leak_internal() {
 }
 
 // ---------------------------------------------------------------------------
-// Part 6 — next_index_id follows applied index ids
+// Part 6 — next_id follows applied index ids
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_next_index_id_advances_on_index_register() {
-    // An applied IDX_TAB row raises next_index_id past its id, so a later
-    // allocation never reissues it.
+fn test_next_id_advances_on_index_register() {
     let dir = temp_dir("atomicity_idx_seq");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -466,7 +464,7 @@ fn test_next_index_id_advances_on_index_register() {
     let tid = engine.create_table("public.seqsync", &cols, &[0]).unwrap();
 
     // An index id far ahead of the local counter.
-    let large_idx_id = engine.next_index_id + 500;
+    let large_idx_id = engine.next_id + 500;
     let batch = idx_tab_batch(
         large_idx_id,
         tid,
@@ -477,13 +475,11 @@ fn test_next_index_id_advances_on_index_register() {
     );
     engine.ingest_to_family(IDX_TAB_ID, &batch).unwrap();
 
-    // next_index_id must now be > large_idx_id so that a local
-    // allocate_index_id() never returns large_idx_id again.
     assert!(
-        engine.next_index_id > large_idx_id,
-        "next_index_id ({}) must exceed the registered idx_id ({}) after \
-         hook_index_register",
-        engine.next_index_id,
+        engine.next_id > large_idx_id,
+        "next_id ({}) must exceed the registered idx_id ({}) after \
+         the IDX_TAB row is applied",
+        engine.next_id,
         large_idx_id
     );
 
@@ -491,27 +487,19 @@ fn test_next_index_id_advances_on_index_register() {
 }
 
 #[test]
-fn test_next_schema_id_advances_on_schema_register() {
-    // Pre-fix: the Schema-family appliers never advance next_schema_id, so a
-    // SCHEMA_TAB row replayed from the SAL after a crash-before-checkpoint
-    // restores the schema's caches but leaves next_schema_id stale — the next
-    // CREATE SCHEMA re-allocates the same schema_id. Mirrors
-    // test_next_index_id_advances_on_index_register.
+fn test_next_id_advances_on_schema_register() {
     let dir = temp_dir("atomicity_schema_seq");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    // A SCHEMA_TAB row whose id is far ahead of the recovered counter, standing
-    // in for a durable CREATE SCHEMA whose sys_sequences advance never reached a
-    // flushed shard.
-    let large_sid = engine.next_schema_id + 500;
+    let large_sid = engine.next_id + 500;
     let batch = build_schema_tab_row(large_sid, "recovered_schema");
     engine.ingest_to_family(SCHEMA_TAB_ID, &batch).unwrap();
 
     assert!(
-        engine.next_schema_id > large_sid,
-        "next_schema_id ({}) must exceed the registered sid ({}) so \
-         allocate_schema_id never re-issues it",
-        engine.next_schema_id,
+        engine.next_id > large_sid,
+        "next_id ({}) must exceed the registered sid ({}) so \
+         allocate_ids never re-issues it",
+        engine.next_id,
         large_sid,
     );
 
@@ -522,15 +510,8 @@ fn test_next_schema_id_advances_on_schema_register() {
 
 #[test]
 fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
-    // Schema ids (allocated from FIRST_USER_SCHEMA_ID = 3) and table ids
-    // (from FIRST_USER_TABLE_ID = 16) share one i64 space. As both counters
-    // climb, a freshly-allocated schema id eventually equals an EARLIER table
-    // id. The negative-weight (DROP) precheck must not probe the table-keyed
-    // view-dependency map with a SCHEMA_TAB drop id — a schema row is never a
-    // dependency source. Probing it spuriously matches the unrelated table's
-    // dependents and wrongly rejects the DROP SCHEMA.
-    //
-    // Pre-fix: drop_schema("victim") fails with "View dependency: owner.t".
+    // A client chooses the id its SCHEMA_TAB row carries, so a schema id can equal
+    // a table id; dropping that schema must not read the table's dependents.
     let dir = temp_dir("atomicity_schema_id_collision");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -539,7 +520,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     let tid = engine
         .create_table("owner.t", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let vid = engine.allocate_table_id().unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
     write_identity_circuit(&mut engine, vid, tid, gnitz_wire::ReadBound::None);
     assert_eq!(
         engine.dag.get_dep_map(&engine.registry).get(&tid),
@@ -547,17 +528,9 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
         "precondition: dependency edge T -> V must be present"
     );
 
-    // Allocate filler schemas until the next schema id collides with `tid`,
-    // then create the victim schema so that schema_id("victim") == Some(tid).
-    while engine.next_schema_id < tid {
-        let name = format!("filler_{}", engine.next_schema_id);
-        engine.create_schema(&name).unwrap();
-    }
-    assert_eq!(
-        engine.next_schema_id, tid,
-        "test setup: next schema id must land exactly on tid"
-    );
-    engine.create_schema("victim").unwrap();
+    engine
+        .submit(SysFamily::Schema, build_schema_tab_row(tid, "victim"))
+        .unwrap();
     assert_eq!(
         engine.schema_id("victim").expect("the schema exists"),
         tid,
@@ -580,24 +553,16 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 // `handle_ddl_txn` does.
 // ---------------------------------------------------------------------------
 
-/// The durable relation-id ceiling is enforced at `precheck_family` — the point
-/// an id ENTERS the registry namespace, BEFORE any mutation.
-///
-/// Guarding `allocate_table_id` alone would not cover it: the register hooks take
-/// the id straight off the ingested row and `raise_id_counter` it, and that id is
-/// caller-chosen (a client may preset `circuit.view_id`). The ceiling is a
-/// conservative tripwire held safely short of the u32 physical contract every id
-/// narrows to (see `RELATION_ID_CEILING`). Both families whose PK is a registry
-/// id must reject it. (Index ids are a disjoint namespace that borrows the same
-/// bound for want of one of its own.)
+/// A client chooses the id its row carries, so `precheck_family` holds the id
+/// ceiling before any mutation.
 #[test]
 fn precheck_rejects_relation_id_at_or_above_ceiling() {
     let dir = temp_dir("relation_id_ceiling_reject");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     for (label, tid) in [
-        ("at the ceiling", sys_tables::RELATION_ID_CEILING),
-        ("above the ceiling", sys_tables::RELATION_ID_CEILING + 4096),
+        ("at the ceiling", sys_tables::CATALOG_ID_CEILING),
+        ("above the ceiling", sys_tables::CATALOG_ID_CEILING + 4096),
     ] {
         let table_batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "banded");
         let err = engine
@@ -614,7 +579,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
 
     // A ceiling, not a blanket ban: an ordinary durable id below it still passes
     // this guard (it fails later for unrelated reasons, if at all).
-    let ok_batch = build_table_tab_row(sys_tables::RELATION_ID_CEILING - 1, pack_pk_cols(&[0]), "just_below");
+    let ok_batch = build_table_tab_row(sys_tables::CATALOG_ID_CEILING - 1, pack_pk_cols(&[0]), "just_below");
     let err = engine
         .precheck_family(SysFamily::Table, &ok_batch)
         .err()
@@ -640,7 +605,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     // The setup is not part of the bundle being compensated.
     let _ = engine.drain_pending_broadcasts();
 
-    let new_tid = engine.allocate_table_id().unwrap();
+    let new_tid = engine.allocate_ids(1).unwrap();
     // Ascending topo: COL_TAB(1) applied first.
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
     engine.submit(SysFamily::Column, col_batch).unwrap();
@@ -685,7 +650,7 @@ fn ddl_txn_hook_failure_is_compensated() {
     let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
-    let new_tid = engine.allocate_table_id().unwrap();
+    let new_tid = engine.allocate_ids(1).unwrap();
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
     engine.submit(SysFamily::Column, col_batch).unwrap();
 
@@ -739,7 +704,7 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
     let cols = vec![col_def("id", type_code::U64)];
-    let (a, b) = (engine.allocate_table_id().unwrap(), engine.allocate_table_id().unwrap());
+    let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
     engine.write_column_records(a, OWNER_KIND_TABLE, &cols).unwrap();
     engine.write_column_records(b, OWNER_KIND_TABLE, &cols).unwrap();
 
@@ -764,27 +729,23 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
 }
 
 // ── `_sequences` never accumulates an unmatched retraction ───────────────────
-// A sequence advance retracts the row that is actually live, not a value the
-// caller guessed. `_sequences` runs no `enforce_unique_pk`, so a `-1` against a
-// row that was never inserted would never cancel — a permanent net −1 ghost, in
-// violation of §1 base-table positivity.
 
 #[test]
 fn sequence_advances_leave_no_negative_ghost() {
     let dir = temp_dir("atomicity_seq_no_ghost");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    // First use of every catalog sequence: object ids, the checkpoint generation
-    // (seq 4) and the topology word (seq 5) are all seeded on demand.
+    // First use of every master scalar: the next id, the checkpoint generation
+    // and the topology word are all seeded on demand.
     engine.create_schema("s").unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     engine.create_table("s.t", &cols, &[0]).unwrap();
     engine.create_index("s.t", &["val"], false).unwrap();
-    engine.record_topology(1).unwrap();
+    engine.record_topology(1);
     engine.bump_checkpoint_generation().unwrap();
     // …and a second round, where each retraction now has a live row to cancel.
     engine.create_table("s.t2", &cols, &[0]).unwrap();
-    engine.record_topology(4).unwrap();
+    engine.record_topology(4);
     engine.bump_checkpoint_generation().unwrap();
 
     assert_eq!(
@@ -944,9 +905,8 @@ fn compensated_create_table_leaves_no_trace() {
             })
             .collect()
     };
-    // Allocated first: an allocation advances `sys_sequences` for good.
-    let tid = engine.allocate_table_id().unwrap();
-    let idx_id = engine.allocate_index_id().unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
+    let idx_id = engine.allocate_ids(1).unwrap();
     let before = counts(&engine);
 
     let cols = vec![

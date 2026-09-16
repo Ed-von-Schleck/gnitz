@@ -239,14 +239,10 @@ impl<'a> Request<'a> {
 /// A run of ids from one server-side sequence.
 #[derive(Clone, Copy, Debug)]
 pub enum IdRun {
-    Tables(u64),
-    Indexes(u64),
-    Schema,
+    /// A run of catalog object ids.
+    Ids(u64),
     /// The SERIAL sequence of `table_id`.
-    Serial {
-        table_id: u64,
-        count: u64,
-    },
+    Serial { table_id: u64, count: u64 },
 }
 
 /// What a slot's verb asked for. The spine resolves a reply against the request
@@ -548,9 +544,7 @@ impl Session {
             }
             Request::Alloc(run) => {
                 let (target_id, verb, count) = match run {
-                    IdRun::Tables(n) => (0, ClientVerb::AllocTableId, n),
-                    IdRun::Indexes(n) => (0, ClientVerb::AllocIndexId, n),
-                    IdRun::Schema => (0, ClientVerb::AllocSchemaId, 1),
+                    IdRun::Ids(n) => (0, ClientVerb::AllocIds, n),
                     IdRun::Serial { table_id, count } => (table_id, ClientVerb::AllocSerialRange, count),
                 };
                 let hdr = ControlHeader {

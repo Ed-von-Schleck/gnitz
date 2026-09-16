@@ -1,8 +1,5 @@
 use super::*;
 
-use gnitz_wire::SEQTAB_PAY_VALUE;
-use rustc_hash::FxHashMap;
-
 /// The columns of a base table that carry a derived FK index circuit: every FK
 /// column outside the PK — a PK column is already stored in the PK region.
 fn fk_circuit_cols<'a>(schema: &'a SchemaDescriptor, col_defs: &'a [ColumnDef]) -> impl Iterator<Item = usize> + 'a {
@@ -27,6 +24,12 @@ impl CatalogEngine {
     ) -> Result<(), String> {
         let reordered = Self::canonicalize_for_hooks(batch, family);
         let batch = reordered.as_ref().unwrap_or(batch);
+        if family.allocates_ids() {
+            for i in batch.live_rows() {
+                let id = family.leading_id(batch.get_pk(i));
+                self.next_id = self.next_id.max(id.saturating_add(1));
+            }
+        }
         match family {
             SysFamily::Schema => self.apply_schema_caches(batch),
             SysFamily::Table | SysFamily::View => {
@@ -45,9 +48,8 @@ impl CatalogEngine {
                 self.apply_index_caches(batch);
                 self.hook_index_register(batch)?;
             }
-            // Restore the user-sequence high-water from a durably-committed or
-            // SAL-replayed advance so a committed SERIAL id is never re-issued.
-            SysFamily::Sequence => self.hook_sequence_register(batch),
+            // `_sequences` rows drive no cache.
+            SysFamily::Sequence => {}
             // The dependency map is derived from the `ScanDelta` nodes, so a
             // circuit-node write restates the graph. The circuit itself is
             // loaded by `load_circuit`, not by hooks.
@@ -68,19 +70,6 @@ impl CatalogEngine {
         let mut idx: Vec<u32> = batch.retracted_rows().map(|i| i as u32).collect();
         idx.extend(batch.live_rows().map(|i| i as u32));
         Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &idx, family.schema()))
-    }
-
-    /// Fold a `sys_sequences` advance into `user_sequences`; `observe_user_sequence`
-    /// skips the catalog's own sequences.
-    fn hook_sequence_register(&mut self, batch: &Batch) {
-        for i in 0..batch.len() {
-            if batch.get_weight(i) <= 0 {
-                continue;
-            }
-            let seq_id = batch.get_pk(i) as i64;
-            let hw = payload_u64(batch, i, SEQTAB_PAY_VALUE) as i64;
-            self.observe_user_sequence(seq_id, hw);
-        }
     }
 
     // -- Hook handlers ---------------------------------------------------------
@@ -123,7 +112,6 @@ impl CatalogEngine {
                     .map_err(|e| format!("{} '{name}' (id={id}) FK index on column {ci}: {e}", kind.noun()))?;
             }
         }
-        raise_id_counter(&mut self.next_table_id, id);
         self.recompute_needs_lock(id);
         Ok(())
     }
@@ -144,29 +132,23 @@ impl CatalogEngine {
     /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
     /// create; a rename pair carries both and is neither.
     fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch, on: OnRegister) -> Result<(), String> {
-        let mut creates: Vec<i64> = Vec::new();
-        let mut row_of: FxHashMap<i64, usize> = FxHashMap::default();
+        let mut creates: Vec<(i64, usize)> = Vec::new();
         for sig in pk_signatures(family, batch) {
             match (sig.neg, sig.pos) {
                 (Some(_), None) => self.unregister_relation(sig.leading),
-                (None, Some(row)) => {
-                    creates.push(sig.leading);
-                    row_of.insert(sig.leading, row);
-                }
+                (None, Some(row)) => creates.push((sig.leading, row)),
                 _ => {}
             }
         }
         // Registering a view reads its sources' stamped placement, and ids ascend
         // along every scan edge, so id order registers a view after the views it
         // scans.
-        creates.sort_unstable();
-        creates.dedup();
-        for id in creates {
+        creates.sort_unstable_by_key(|c| c.0);
+        for (id, row) in creates {
             // System tables are registered by `open` before replay reaches their rows.
             if self.registry.has_id(id) {
                 continue;
             }
-            let row = row_of[&id];
             let reg = if family == SysFamily::Table {
                 read_table_tab_row(batch, row).map_err(|e| format!("{e} (tid={id})"))?
             } else {
@@ -283,10 +265,6 @@ impl CatalogEngine {
     /// unique iff ANY index on the column list is unique — so replay reconstructs
     /// an identical result whatever order the index ids arrive in.
     fn register_index(&mut self, idx_id: i64, owner_id: i64, cols: &PkColList, is_unique: bool) -> Result<(), String> {
-        // Keep next_index_id past every applied id, so the counter never reissues a
-        // client-allocated id whose in-memory advance a crash lost.
-        raise_id_counter(&mut self.next_index_id, idx_id);
-
         // Boot replay and worker ddl_sync reach this hook without
         // `precheck_family`, so re-run the shared registration guards here (see
         // `validate_index_registration`). Resolve the owner entry once for

@@ -233,7 +233,7 @@ fn test_fk_self_reference() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Self-referential table: employees.mgr_id -> employees.emp_id
-    let next_tid = engine.next_table_id;
+    let next_tid = engine.next_id;
     let emp_cols = vec![
         col_def("emp_id", type_code::U64),
         ColumnDef {
@@ -329,7 +329,7 @@ fn test_push_reads_committed_state() {
     // `test_fk_self_reference`), so a predicate reading lock-set cardinality
     // would call this batchable. Both FK terms are non-zero, so it stays on the
     // exclusive guard.
-    let next_tid = engine.next_table_id;
+    let next_tid = engine.next_id;
     let tree_cols = vec![
         col_def("id", type_code::U64),
         ColumnDef {

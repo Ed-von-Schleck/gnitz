@@ -237,7 +237,7 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
 
     // A user SERIAL sequence is keyed by its table id; the catalog's own
     // counters live below that floor.
-    let err = contract_err(&engine, SysFamily::Sequence, &seq_batch(SEQ_ID_TABLES, 99, 1));
+    let err = contract_err(&engine, SysFamily::Sequence, &seq_batch(SEQ_ID_NEXT_ID, 99, 1));
     assert!(err.contains("a system sequence"), "{err}");
 
     // COL_TAB packs the owner into its PK, so its floor is the packed word —
@@ -259,15 +259,16 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The ceiling runs where an id ENTERS a catalog namespace. Index needs it as
-/// much as the relation families: `hook_index_register` raises the index-id
-/// counter off the ingested row, and `allocate_index_ids` carries no assertion.
+/// The ceiling runs where an id ENTERS a catalog namespace.
 #[test]
 fn an_id_at_or_above_a_familys_ceiling_is_rejected() {
     let (engine, dir) = open("precheck_id_ceiling");
-    let ceiling = sys_tables::RELATION_ID_CEILING;
+    let ceiling = sys_tables::CATALOG_ID_CEILING;
 
     for id in [ceiling, ceiling + 4096] {
+        let err = contract_err(&engine, SysFamily::Schema, &schema_batch(&[(id, "s", 1)]));
+        assert!(err.contains("id ceiling"), "schema {id}: {err}");
+
         let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         table_row(&mut bb, id, PUBLIC_SCHEMA_ID, "t", 1);
         let err = contract_err(&engine, SysFamily::Table, &bb.finish());

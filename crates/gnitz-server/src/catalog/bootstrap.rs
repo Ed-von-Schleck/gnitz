@@ -47,10 +47,7 @@ impl CatalogEngine {
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
             is_master,
-            next_schema_id: FIRST_USER_SCHEMA_ID,
-            next_table_id: FIRST_USER_TABLE_ID,
-            next_index_id: FIRST_USER_INDEX_ID,
-            user_sequences: std::collections::HashMap::new(),
+            next_id: FIRST_ALLOCATED_ID,
             durable_generation: 0,
             recorded_topology: 0,
             invalid_views: rustc_hash::FxHashSet::default(),
@@ -86,15 +83,8 @@ impl CatalogEngine {
             engine.bootstrap_system_tables()?;
         }
 
-        // Phase 1: Recover sequence counters
-        engine.recover_sequences();
-
-        // Before `replay_catalog`, whose view and index register hooks read it
-        // (through `CatalogEngine::recovery_source`). `recovery_start_generation_bump`
-        // leaves this where it is, so a clean restart resumes from the last
-        // completed checkpoint.
-        let g = engine.durable_generation;
-        engine.registry_mut().set_resume_generation(g);
+        // Phase 1: the `_sequences` scalars.
+        engine.load_sequence_scalars();
 
         // Phase 2: Replay catalog through hooks
         engine.replay_catalog()?;
@@ -176,39 +166,6 @@ impl CatalogEngine {
         self.flush_all_system_tables()
     }
 
-    // -- Recover sequence counters from sys_sequences ----------------------
-
-    fn recover_sequences(&mut self) {
-        let mut cursor = self.sys_relation(SysFamily::Sequence).cursor();
-        cursor.for_each_positive(|c| {
-            let seq_id = c.current_key_narrow() as u64 as i64;
-            let (src, row) = c.current_row_source();
-            let val = payload_u64(src, row, gnitz_wire::SEQTAB_PAY_VALUE) as i64;
-            match seq_id {
-                SEQ_ID_SCHEMAS => raise_id_counter(&mut self.next_schema_id, val),
-                SEQ_ID_TABLES => raise_id_counter(&mut self.next_table_id, val),
-                SEQ_ID_INDICES => raise_id_counter(&mut self.next_index_id, val),
-                // Checkpoint generation is monotonic; a mid-checkpoint crash
-                // may leave two rows, so take the max. Topology is a single
-                // latest-wins value. Both fall in the 4..16 gap
-                // `observe_user_sequence` ignores, so they never leak into
-                // `user_sequences`.
-                SEQ_ID_CHECKPOINT_GEN => self.durable_generation = self.durable_generation.max(val as u64),
-                SEQ_ID_TOPOLOGY => self.recorded_topology = val as u64,
-                // User-table SERIAL sequence (seq_id == table_id ≥
-                // FIRST_USER_TABLE_ID). Store the high-water; next id =
-                // high_water + 1. `observe_user_sequence` ignores a stray
-                // catalog-range seq_id in the empty 4..16 gap, so it is never
-                // misclassified as a user sequence.
-                other => self.observe_user_sequence(other, val),
-            }
-        });
-        // Before `replay_catalog`'s register hooks, which read the verdict through
-        // `rederive_source`. A fresh DB writes no topology row, so the verdict is
-        // `false` and its views rebuild.
-        self.registry.set_resume_enabled(self.topology_matches());
-    }
-
     // -- Replay catalog (recovery) -----------------------------------------
 
     fn replay_catalog(&mut self) -> Result<(), String> {
@@ -236,18 +193,6 @@ impl CatalogEngine {
     }
 
     // -- Close engine ------------------------------------------------------
-
-    /// Flush all system tables (memtable → shard). Called at checkpoint and close.
-    /// Returns the first failure (with the offending sys table id) so the boot
-    /// path can abort before the SAL — the only durable copy of replayed DDL —
-    /// is reset.
-    pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
-        // One barrier over the whole set, not ten: the round batches every
-        // family's manifest, data and directory syncs into three submissions and
-        // builds at most one io_uring. System tables are `SalReplay`, so each
-        // folds memtable + L0 into a durable shard and re-stamps its manifest.
-        self.registry.checkpoint_system().map_err(|e| e.to_string())
-    }
 
     /// The base round over every store this process owns, in **one** barrier —
     /// the user-relation sibling of [`Self::flush_all_system_tables`], and the

@@ -733,12 +733,8 @@ impl MasterDispatcher {
     /// socket is not open), so `pending_deltas` is empty. Freshly backfilled
     /// views are durably checkpointed before the socket opens.
     pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), WireFault> {
-        // The topology row's durability rides the gen bump's system-table flush
-        // (both are `_sequences` rows), so a manifest stamped at a generation
-        // implies the topology row for that layout is durable.
-        self.cat()
-            .record_topology(worker_count)
-            .map_err(|e| format!("topology record failed: {e}"))?;
+        // Recorded before `reclaim_base`, whose generation bump makes it durable.
+        self.cat().record_topology(worker_count);
         self.reclaim_base()?;
         self.restamp_derived(&[])
     }

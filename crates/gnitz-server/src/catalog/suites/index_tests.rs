@@ -138,7 +138,7 @@ fn test_index_registration_failure_no_broadcast_poisoning_internal() {
     let _ = engine.drain_pending_broadcasts();
 
     // The id `create_index` is about to allocate.
-    let failed_idx_id = engine.next_index_id;
+    let failed_idx_id = engine.next_id;
     assert!(
         engine.create_index("public.t", &["val"], true).is_err(),
         "the injected backfill fault must fail the create"
@@ -693,7 +693,7 @@ fn test_failed_index_registration_rolls_back_cleanly_internal() {
 
     let idx_name = make_secondary_index_name("public", "t", "val");
     // The id `create_index` is about to allocate.
-    let failed_idx_id = engine.next_index_id;
+    let failed_idx_id = engine.next_id;
 
     let result = engine.create_index("public.t", &["val"], true);
     assert!(result.is_err(), "the injected backfill fault must fail the create");
@@ -884,7 +884,7 @@ fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
         .unwrap();
     let idx_rows_before = count_records(engine.sys_relation(SysFamily::Index).cursor());
 
-    let child_tid = engine.next_table_id;
+    let child_tid = engine.next_id;
     let cols = vec![
         col_def("cid", type_code::U64),
         fk_def("refc", type_code::U64, parent_tid, 0),
@@ -1010,7 +1010,7 @@ fn test_failed_create_index_leaves_no_directory_internal() {
 
     let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     // The id `create_index` is about to allocate.
-    let failed_idx_id = engine.next_index_id;
+    let failed_idx_id = engine.next_id;
     assert!(engine.create_index("public.t", &["val"], true).is_err());
     assert_eq!(
         count_idx_dirs(&tbl_dir),
@@ -2400,7 +2400,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
 
     let dir = temp_dir("catalog_range_wide_pk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let tid = engine.next_table_id;
+    let tid = engine.next_id;
 
     // pk_stride = 24: three U64 PK columns + one U64 payload `x` (source col 3).
     let schema = SchemaDescriptor::new(&[u64c(), u64c(), u64c(), u64c()], &[0, 1, 2]);

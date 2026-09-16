@@ -208,12 +208,12 @@ pub fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
 }
 
 /// The symbolic id naming element `j` of a view bundle from a later element's
-/// `ScanDelta`. Symbolic ids start at [`gnitz_wire::RELATION_ID_CEILING`], which
+/// `ScanDelta`. Symbolic ids start at [`gnitz_wire::CATALOG_ID_CEILING`], which
 /// no durable relation id reaches, so `create_view_chain` tells them apart from
 /// real relation ids and substitutes the id it allocated — a bundle reaches no
 /// server while it is built.
 pub fn segment_id(j: u64) -> u64 {
-    gnitz_wire::RELATION_ID_CEILING + j
+    gnitz_wire::CATALOG_ID_CEILING + j
 }
 
 /// One view in a [`GnitzClient::create_view_chain`] bundle.
@@ -480,16 +480,9 @@ impl GnitzClient {
         self.round_trip(Request::Alloc(run)).map(Reply::into_id)
     }
 
-    pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc(IdRun::Tables(1))
-    }
-
-    pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc(IdRun::Schema)
-    }
-
-    pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc(IdRun::Indexes(1))
+    /// Allocate one catalog object id (schema, relation or index).
+    pub fn alloc_id(&mut self) -> Result<u64, ClientError> {
+        self.alloc(IdRun::Ids(1))
     }
 
     pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
@@ -896,7 +889,7 @@ impl GnitzClient {
         // No client-side name probe: the engine rejects a duplicate against both
         // the persisted `index_by_name` and the rest of this bundle. A rejected
         // bundle burns this index_id, which costs nothing — ids are never reused.
-        let index_id = self.alloc_index_id()?;
+        let index_id = self.alloc_id()?;
 
         let idx_schema = sys_schema(IDX_TAB);
         let mut batch = ZSetBatch::new(idx_schema);
@@ -1144,7 +1137,7 @@ impl GnitzClient {
         // illegal characters. The SQL planner has no CREATE SCHEMA surface, so
         // this client entry point is the sole enforcement for schema names.
         let name = gnitz_wire::canonical_identifier(name)?;
-        let new_sid = self.alloc_schema_id()?;
+        let new_sid = self.alloc_id()?;
         let schema = sys_schema(SCHEMA_TAB);
         let mut batch = ZSetBatch::new(schema);
         gnitz_wire::sys_rows::write_schema_tab_row(
@@ -1239,7 +1232,22 @@ impl GnitzClient {
             .validate_against_pk(pk_cols.len())
             .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
 
-        let new_tid = self.alloc_table_id()?;
+        // Column types come from `columns`, so a UNIQUE+FK column's
+        // parent-rewritten type is used.
+        for spec in unique_indexes {
+            // Structural rules only (arity, in-range, no duplicates) — unlike a
+            // PK, an indexed column may be nullable. In-range against the actual
+            // column list also keeps the `columns[c]` read panic-free.
+            gnitz_wire::validate_pk_col_list(spec.col_indices, columns.len()).map_err(|msg| {
+                ClientError::ServerError(format!("create_table: unique index '{}': {msg}", spec.name))
+            })?;
+            for &c in spec.col_indices {
+                gnitz_wire::index_key_type(columns[c as usize].type_code as u8)?;
+            }
+        }
+
+        // The table's id, then one per inline UNIQUE index.
+        let new_tid = self.alloc(IdRun::Ids(1 + unique_indexes.len() as u64))?;
         let schema_id = self.lookup_schema_id(&schema_name)?;
 
         // Encode the PK list using the shared wire packer so the engine
@@ -1273,23 +1281,8 @@ impl GnitzClient {
             1,
         );
 
-        // IDX_TAB family — every inline UNIQUE index as one multi-row batch, its
-        // ids drawn in one allocation. Column types come from `columns`, so a
-        // UNIQUE+FK column's parent-rewritten type is used.
-        for spec in unique_indexes {
-            // Structural rules only (arity, in-range, no duplicates) — unlike a
-            // PK, an indexed column may be nullable. In-range against the actual
-            // column list also keeps the `columns[c]` read below panic-free.
-            gnitz_wire::validate_pk_col_list(spec.col_indices, columns.len()).map_err(|msg| {
-                ClientError::ServerError(format!("create_table: unique index '{}': {msg}", spec.name))
-            })?;
-            for &c in spec.col_indices {
-                gnitz_wire::index_key_type(columns[c as usize].type_code as u8)?;
-            }
-        }
         let mut families: Vec<(u64, ZSetBatch)> = vec![(COL_TAB, col_batch), (TABLE_TAB, tb)];
         if !unique_indexes.is_empty() {
-            let first_index_id = self.alloc(IdRun::Indexes(unique_indexes.len() as u64))?;
             let idx_schema = sys_schema(IDX_TAB);
             let mut idx_batch = ZSetBatch::new(idx_schema);
             {
@@ -1298,7 +1291,7 @@ impl GnitzClient {
                     gnitz_wire::sys_rows::write_idx_tab_row(
                         &mut a,
                         &IdxTabRow {
-                            index_id: first_index_id + k as u64,
+                            index_id: new_tid + 1 + k as u64,
                             owner_id: new_tid,
                             source_col_idx: gnitz_wire::pack_pk_cols(spec.col_indices),
                             name: &index_names[k],
@@ -1419,7 +1412,7 @@ impl GnitzClient {
         // The whole bundle is assigned in one allocation before any substitution
         // runs, because a downstream segment's `ScanDelta` names an upstream
         // segment by its position.
-        let base = self.alloc(IdRun::Tables(views.len() as u64))?;
+        let base = self.alloc(IdRun::Ids(views.len() as u64))?;
         let vids: Vec<u64> = (0..views.len() as u64).map(|k| base + k).collect();
         // The user-named view is the bundle's last element, and every segment
         // names it as owner.
@@ -1453,8 +1446,8 @@ impl GnitzClient {
                 // becomes an id no lower than the view's own, which the engine
                 // refuses.
                 for src in pv.circuit.sources_mut() {
-                    if *src >= gnitz_wire::RELATION_ID_CEILING {
-                        *src = base + (*src - gnitz_wire::RELATION_ID_CEILING);
+                    if *src >= gnitz_wire::CATALOG_ID_CEILING {
+                        *src = base + (*src - gnitz_wire::CATALOG_ID_CEILING);
                     }
                 }
                 let (name, owner_view_id, row_props) = if k == last {

@@ -50,7 +50,7 @@ use gnitz_store::relation::{
     OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig,
 };
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, ReadCursor, Slot, StoreError};
+use gnitz_store::storage::{Batch, ReadCursor, Slot, StoreError, StoredRow};
 use gnitz_wire::ViewProps;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
@@ -65,8 +65,7 @@ pub(crate) use types::{ColumnDef, FkEdge};
 pub(crate) use schema_block::encode_schema_block;
 
 // Import everything from sys_tables for internal use.
-use precheck::{check_col_defs, validate_pk_against_cols};
-use registry::build_schema_from_col_defs;
+use precheck::build_schema_from_col_defs;
 use sys_tables::*;
 
 // ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
@@ -74,12 +73,11 @@ use sys_tables::*;
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
 pub(in crate::catalog) use cache::{CatalogCacheSet, SchemaWireEntry};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
-pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_store::storage::ChildAddr;
-pub(in crate::catalog) use utils::{pair_opk, preflight_dir, sys_opk};
+pub(in crate::catalog) use utils::preflight_dir;
 // The relation rung's directory primitives; the catalog only consumes them.
 pub(in crate::catalog) use gnitz_store::relation::{
     lock_data_dir, relation_dir, relations_dir, staged_dir, DIR_LOCK_RETRY_FOR,
@@ -120,24 +118,13 @@ pub(crate) struct CatalogEngine {
     /// `open_master`, cleared by `become_worker`.
     pub(in crate::catalog) is_master: bool,
 
-    // --- Sequence counters ---
-    pub(in crate::catalog) next_schema_id: i64,
-    pub(in crate::catalog) next_table_id: i64,
-    pub(in crate::catalog) next_index_id: i64,
-    /// User-table SERIAL sequences: `seq_id` (== table_id) → high-water (last id
-    /// handed out). Next id = high_water + 1. Populated at recovery from the
-    /// flushed `sys_sequences` shard and newer SAL advances, and durably advanced
-    /// per range reservation. Distinct from the scalar catalog counters above
-    /// because a user sequence's values live in worker-owned rows the master
-    /// cannot re-derive.
-    pub(in crate::catalog) user_sequences: std::collections::HashMap<i64, i64>,
-
-    /// The checkpoint generation durably recorded in `SEQ_ID_CHECKPOINT_GEN` —
-    /// what the next `advance_sequence` must retract, and the floor the next
-    /// bump raises. Recovered at boot (0 on a fresh DB).
+    /// The next catalog object id (schema, relation or index) `allocate_ids`
+    /// hands out. Every applied id-bearing row raises it past its own id.
+    pub(in crate::catalog) next_id: i64,
+    /// The checkpoint generation. Recovered at boot (0 on a fresh DB).
     pub(in crate::catalog) durable_generation: u64,
-    /// The topology word durably recorded in `SEQ_ID_TOPOLOGY`, `0` on a fresh DB
-    /// — which no real word can equal. Half of every resume verdict.
+    /// The recorded topology word, `0` on a fresh DB — which no real word can
+    /// equal. Half of every resume verdict.
     pub(in crate::catalog) recorded_topology: u64,
     /// View ids whose checkpointed state — output stores and operator traces
     /// alike — was rejected at boot (generation mismatch, topology change, or a

@@ -50,7 +50,7 @@ fn reject_non_canonical(name: &str, noun: &str) -> Result<(), String> {
 /// list in hand; messages are bare predicates, and callers add the context. The
 /// duplicate-name rule is ingestion points only — a view segment legitimately
 /// carries two visible columns of one name (a join chain's output).
-pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), String> {
+fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), String> {
     if col_defs.is_empty() {
         return Err("has no column records".into());
     }
@@ -84,17 +84,31 @@ pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Resu
     Ok(())
 }
 
-/// `gnitz-wire`'s PK rule set, in wire's own wording. Also run by
-/// `build_schema_from_col_defs` over the pair it is about to construct from,
-/// which is what makes that builder total where `SchemaDescriptor::new_with_placement`
-/// would abort.
-pub(super) fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(), String> {
+/// `gnitz-wire`'s PK rule set, in wire's own wording.
+fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(), String> {
     gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), |c| {
         let cd = &col_defs[c as usize];
         (cd.type_code, cd.is_nullable)
     })
     .map(|_stride| ())
     .map_err(|rule| rule.to_string())
+}
+
+/// The `SchemaDescriptor` COL_TAB records describe, or the first admissibility
+/// rule they break.
+pub(in crate::catalog) fn build_schema_from_col_defs(
+    kind: RelationKind,
+    col_defs: &[ColumnDef],
+    pk_cols: &[u32],
+    placement: Placement,
+) -> Result<SchemaDescriptor, String> {
+    check_col_defs(kind, col_defs)?;
+    validate_pk_against_cols(col_defs, pk_cols)?;
+    let cols: Vec<SchemaColumn> = col_defs
+        .iter()
+        .map(|cd| SchemaColumn::new(cd.type_code, cd.is_nullable as u8))
+        .collect();
+    Ok(SchemaDescriptor::new_with_placement(&cols, pk_cols, placement))
 }
 
 /// A system row carries weight ±1: a zero weight carries no contract, and the
@@ -133,10 +147,7 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
 /// Bootstrap-owned ids sit below the floor, unreachable ones at or above the
 /// ceiling. Both are properties of the id space rather than of the mutation's
 /// shape, so they cover every sign: a `-1` drops a bootstrap row, a bare `+1`
-/// aliases a bootstrap id into the caches, and a pair renames one. This is the
-/// one point an id ENTERS a catalog namespace before any mutation — the register
-/// hooks take it straight off the ingested row and `raise_id_counter` it, and it
-/// is caller-chosen.
+/// aliases a bootstrap id into the caches, and a pair renames one.
 fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
     let id = sig.leading;
     if family.first_user_id().is_some_and(|floor| id < floor) {
@@ -518,10 +529,8 @@ impl CatalogEngine {
         let blockers = self.dag.get_dep_map(&self.registry).get(&owner_id).cloned();
         let Some(blockers) = blockers else { return Ok(()) };
         let name = |id: i64| {
-            self.caches
-                .entity_by_id
-                .get(&id)
-                .map_or_else(|| id.to_string(), |(sn, en)| format!("{sn}.{en}"))
+            let (sn, en) = self.qualified_name_or_unknown(id);
+            format!("{sn}.{en}")
         };
         let named: Vec<String> = blockers.iter().map(|id| name(*id)).collect();
         Err(format!(

@@ -133,8 +133,8 @@ fn with_watchdog(secs: u64, f: impl FnOnce() + Send + 'static) {
 fn connect_hello_and_alloc_roundtrip() {
     let srv = ServerHandle::start_tls(4);
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("tls connect");
-    let id1 = client.alloc_table_id().unwrap();
-    let id2 = client.alloc_table_id().unwrap();
+    let id1 = client.alloc_id().unwrap();
+    let id2 = client.alloc_id().unwrap();
     assert!(id2 > id1, "alloc ids must advance over TLS");
 }
 
@@ -146,7 +146,7 @@ fn ca_pin_connects_and_bad_verifications_fail() {
 
     // ?ca=dev cert: full verification against the minted self-signed cert.
     let mut pinned = GnitzClient::connect(&srv.tls_target()).expect("ca-pinned connect");
-    pinned.alloc_table_id().unwrap();
+    pinned.alloc_id().unwrap();
 
     // Default webpki roots must REJECT the self-signed dev cert.
     let err = GnitzClient::connect(&format!("tls://{}", srv.tls_endpoint()))
@@ -297,7 +297,7 @@ fn restart_same_port_fails_fast_then_reconnects() {
 
     // A fresh connect on the SAME target (port preserved) succeeds.
     let mut fresh = GnitzClient::connect(&target).expect("reconnect after restart");
-    fresh.alloc_table_id().unwrap();
+    fresh.alloc_id().unwrap();
 }
 
 // ── 8. pipelining liveness (the four-party deadlock shape) ─────────────────
@@ -370,7 +370,7 @@ fn ipv6_loopback_connect_and_ca_verify() {
     assert!(target.starts_with("tls://[::1]:"), "v6 endpoint expected, got {target}");
     // Full verification against the dev cert's ::1 IP SAN.
     let mut client = GnitzClient::connect(&target).expect("ca-pinned tls over [::1]");
-    client.alloc_table_id().unwrap();
+    client.alloc_id().unwrap();
 }
 
 // ── 10. teardown under write backpressure (recv-side / inbound-cap path) ──
@@ -612,5 +612,5 @@ fn first_frame_deadline_reaps_silent_connections() {
 
     // A normal client (HELLO well within 500 ms) is unaffected.
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("a normal client must connect");
-    client.alloc_table_id().unwrap();
+    client.alloc_id().unwrap();
 }

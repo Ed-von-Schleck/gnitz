@@ -11,32 +11,31 @@ pub(in crate::catalog) fn preflight_dir(base_dir: &str, vid: i64) -> String {
 // Copy/retract helpers
 // ---------------------------------------------------------------------------
 
-/// The OPK image of a **single-column** native system-table PK: a U64 id. A
-/// two-column key — COL_TAB's `(owner_id, col_idx)`, the circuit family's
-/// `(view_id, node_id)` — has its own [`pair_opk`].
-pub(in crate::catalog) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> gnitz_store::schema::key::PkBuf {
+/// The OPK image of a **single-column** native system-table PK: a U64 id.
+fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> gnitz_store::schema::key::PkBuf {
     gnitz_store::schema::key::opk_key_cols(schema, &[pk])
 }
 
-/// The OPK image of a pair-keyed system row's compound PK.
-pub(in crate::catalog) fn pair_opk(
-    schema: &SchemaDescriptor,
-    leading: i64,
-    trailing: u64,
-) -> gnitz_store::schema::key::PkBuf {
-    gnitz_store::schema::key::opk_key_cols(schema, &[leading as u64 as u128, trailing as u128])
-}
-
 impl CatalogEngine {
+    /// The live row of single-column-keyed `family` at `id`.
+    pub(in crate::catalog) fn live_sys_row(&self, family: SysFamily, id: i64) -> Option<StoredRow> {
+        let key = sys_opk(family.schema(), id as u128);
+        self.sys_relation(family).live_row_at(key.pk_bytes()).1
+    }
+
+    /// Visit every live row of pair-keyed `family` under `leading` — an owner's
+    /// column records, or a view's circuit rows.
+    pub(in crate::catalog) fn for_each_row_under(&self, family: SysFamily, leading: i64, f: impl FnMut(&ReadCursor)) {
+        self.sys_relation(family)
+            .for_each_positive_with_prefix(&(leading as u64).to_be_bytes(), f)
+    }
+
     /// Emit a weight −1 batch of every live row of pair-keyed `family` under each of
-    /// `leadings` — owners' column records, or views' circuit rows.
+    /// `leadings`.
     pub(in crate::catalog) fn retract_bands(&self, family: SysFamily, leadings: &[i64]) -> Batch {
-        let rel = self.sys_relation(family);
-        let mut batch = Batch::with_capacity(&rel.schema(), 0);
+        let mut batch = Batch::with_capacity(family.schema(), 0);
         for &leading in leadings {
-            let (start, end) = family.band(leading);
-            let (mut cursor, _) = rel.range_cursor(start.pk_bytes(), Some(end.pk_bytes()));
-            cursor.for_each_positive(|c| c.copy_current_row_into(&mut batch, -1));
+            self.for_each_row_under(family, leading, |c| c.copy_current_row_into(&mut batch, -1));
         }
         batch
     }

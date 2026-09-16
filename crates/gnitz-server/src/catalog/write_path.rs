@@ -59,10 +59,13 @@ impl CatalogEngine {
                 .map(|id| id as u128)
                 .collect(),
         );
+        // A SERIAL row's key is its table id.
+        let sequences = self.retract_pk_list(SysFamily::Sequence, owners.iter().map(|&o| o as u128).collect());
         let circuits = self.retract_bands(SysFamily::CircuitNodes, &owners);
         let columns = self.retract_bands(SysFamily::Column, &owners);
         vec![
             (SysFamily::Index, indices),
+            (SysFamily::Sequence, sequences),
             (family, batch),
             (SysFamily::CircuitNodes, circuits),
             (SysFamily::Column, columns),
@@ -73,7 +76,7 @@ impl CatalogEngine {
     fn apply_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
         let id = family.id();
         self.registry
-            .ingest_borrowed(id, &batch)
+            .ingest(id, batch.clone())
             .map_err(|e| format!("sys-table ingest failed (family={id}): {e}"))?;
         batch.set_schema(family.schema());
         self.fire_hooks(family, &batch, OnRegister::Live)

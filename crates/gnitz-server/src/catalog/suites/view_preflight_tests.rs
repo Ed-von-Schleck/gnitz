@@ -41,7 +41,7 @@ fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, p
 /// the DDL ingest loop does: circuit and columns first, then the VIEW_TAB row
 /// (the hook invariant).
 fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str, pred: &[u8]) -> i64 {
-    let vid = engine.next_table_id;
+    let vid = engine.next_id;
     write_filtered_circuit(engine, vid, base_tid, pred);
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
@@ -148,7 +148,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
 
     // The replacement's own rows must exist before its VIEW_TAB row is checked.
-    let new_vid = engine.next_table_id;
+    let new_vid = engine.next_id;
     write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     engine.write_column_records(new_vid, OWNER_KIND_VIEW, &cols).unwrap();
@@ -198,7 +198,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
 
     // The replacing bundle: the new chain's own rows, then one VIEW_TAB batch
     // carrying the incumbent's `-1` and the replacement's `+1`.
-    let new_vid = engine.next_table_id;
+    let new_vid = engine.next_id;
     write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     engine.write_column_records(new_vid, OWNER_KIND_VIEW, &cols).unwrap();

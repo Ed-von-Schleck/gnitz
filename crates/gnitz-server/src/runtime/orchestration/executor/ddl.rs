@@ -450,44 +450,31 @@ async fn publish_after_fsync(alloc: &ZoneLsnAllocator, op: &'static str, zone: u
     alloc.publish(zone);
 }
 
-/// Durably reserve a SERIAL id range for `seq_id` and return the range base.
-///
-/// The high-water must be persisted *at allocation time*: `recover_sequences`
-/// runs pre-fork and the master holds no user-table rows, so a lost advance
-/// cannot be re-derived. Hence the DDL SAL commit path, the same one `CREATE`
-/// uses.
+/// Durably reserve a SERIAL id range for `seq_id` and return its base. It commits
+/// through a DDL SAL zone because the master holds no user-table rows to re-derive
+/// a lost high-water from.
 ///
 /// Both locks are released before the fsync — the whole reserve/mutate/emit span
 /// is synchronous, so catalog readers never block across an `fdatasync`.
 /// `handle_ddl_txn` holds its write guard past the fsync instead, needing it for
 /// `forget_relation`, the filter invalidation and the backfill.
-pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i64) -> Result<i64, String> {
+pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: u64) -> Result<i64, String> {
     let (base, zone_lsn, fsync_fut) = {
         // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under
         // catalog.write cannot deadlock. Both guards drop at the end of this block.
         let _write = shared.catalog_rwlock.write().await;
 
-        // A SERIAL sequence id IS the owning table's id, and only a base table may
-        // own a SERIAL column. Checked under the write lock that guards the
-        // reservation: an unvalidated id would durably write a `sys_sequences`
-        // row that `recover_sequences` replays straight into the catalog's own
-        // id counters at the next open. Not through `target_kind`: this reserves a
-        // range rather than reading or writing rows, so neither `Access` fits and
-        // both its rejections would name a push.
-        if !shared
-            .cat()
-            .registry()
-            .relation(seq_id)
-            .map(Relation::kind)
-            .is_some_and(|k| k.is_base_table())
-        {
-            return Err(format!("sequence {seq_id} is not a base table"));
-        }
-
         let mut excl = shared.disp().sal().lock().await;
 
-        let (base, delta, zone_floor) = shared.cat_mut().reserve_user_sequence(seq_id, count);
-        let zone_lsn = shared.lsn_alloc.reserve(zone_floor);
+        let (base, delta) = shared.cat().reserve_user_sequence(seq_id, count)?;
+        // Above the counter of `_sequences`, the one family this zone writes.
+        let zone_lsn = shared.lsn_alloc.reserve(
+            shared
+                .cat()
+                .registry()
+                .relation(SysFamily::Sequence.id())
+                .map_or(0, Relation::current_lsn),
+        );
 
         // A sys_sequences advance is a pure system-table write (no evaluate_dag,
         // no rollback); a hook failure on a well-formed 2-row delta is an

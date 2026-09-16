@@ -42,8 +42,7 @@ fn test_bootstrap() {
 
     assert!(engine.has_schema("_system"));
     assert!(engine.has_schema("public"));
-    assert_eq!(engine.next_table_id, FIRST_USER_TABLE_ID);
-    assert_eq!(engine.next_schema_id, FIRST_USER_SCHEMA_ID);
+    assert_eq!(engine.next_id, FIRST_ALLOCATED_ID);
 
     let schemas_before = count_records(engine.sys_relation(SysFamily::Schema).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
@@ -469,7 +468,7 @@ fn test_hook_relation_register_rejects_malformed_pk() {
         nullable_def("c2", type_code::U64),
         col_def("c3", type_code::F32),
     ];
-    let tid = engine.allocate_table_id().unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
@@ -579,7 +578,7 @@ fn test_drop_view_removes_directory() {
 
     // Register a view via the raw system-table path (create_view was removed).
     // Column records must precede the VIEW_TAB row (hook invariant).
-    let vid = engine.next_table_id;
+    let vid = engine.next_id;
     let view_cols = vec![col_def("id", type_code::U64)];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
@@ -634,7 +633,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     let base_nodes = count_records(engine.sys_relation(SysFamily::CircuitNodes).cursor());
 
     // Register a view (column and circuit records precede the VIEW_TAB row).
-    let vid = engine.next_table_id;
+    let vid = engine.next_id;
     let view_cols = vec![col_def("id", type_code::U64)];
     write_identity_circuit(&mut engine, vid, base_tid, gnitz_wire::ReadBound::None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
@@ -684,12 +683,31 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 #[test]
 fn ddl_emitters_use_no_raw_handle_capability() {
     let src = include_str!("ddl_fixture.rs");
-    for forbidden in ["ingest_owned_batch", "ingest_borrowed", "apply_family"] {
+    for forbidden in ["ingest_owned_batch", "apply_family"] {
         assert!(
             !src.contains(forbidden),
             "a DDL emitter must not call {forbidden} — emit a delta via submit instead"
         );
     }
+}
+
+// ── drop_table_retracts_its_serial_sequence_row ──────────────────────
+#[test]
+fn drop_table_retracts_its_serial_sequence_row() {
+    let dir = temp_dir("drop_table_serial_row");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+
+    let cols = vec![col_def("id", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let (_base, delta) = engine.reserve_user_sequence(tid, 64).unwrap();
+    engine.submit(SysFamily::Sequence, delta).unwrap();
+    assert_eq!(engine.sequence_value(tid), Some(64));
+
+    engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+    assert_eq!(engine.sequence_value(tid), None, "the drop must retract the SERIAL row");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
 }
 
 // ── drop_cascade_broadcasts_index_owner_columns_in_order ─────────────
@@ -807,10 +825,10 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
 
     // Ids ascend along scan edges, as the DDL precheck requires.
-    let r_producer = engine.allocate_table_id().unwrap();
-    let r_consumer = engine.allocate_table_id().unwrap();
-    let p_producer = engine.allocate_table_id().unwrap();
-    let p_consumer = engine.allocate_table_id().unwrap();
+    let r_producer = engine.allocate_ids(1).unwrap();
+    let r_consumer = engine.allocate_ids(1).unwrap();
+    let p_producer = engine.allocate_ids(1).unwrap();
+    let p_consumer = engine.allocate_ids(1).unwrap();
 
     for (vid, src) in [
         (r_producer, rt),
@@ -956,7 +974,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
             // The catalog folds names, so a case difference is the same name.
             col_def("A", type_code::I64),
         ];
-        let tid = engine.allocate_table_id().unwrap();
+        let tid = engine.allocate_ids(1).unwrap();
         engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
         let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), name, flags);
         let err = engine
@@ -974,7 +992,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
             ..col_def("a", type_code::I64)
         },
     ];
-    let tid = engine.allocate_table_id().unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), "hidden_dup", 0);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
@@ -1018,7 +1036,7 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
         .unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let register = |engine: &mut CatalogEngine, name: &str, owner: i64| {
-        let vid = engine.next_table_id;
+        let vid = engine.next_id;
         write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
         engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
         let mut bb = BatchBuilder::new(*SysFamily::View.schema());
@@ -1033,11 +1051,9 @@ fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
 
 /// Live rows of pair-keyed `family` under `leading`.
 fn band_rows(engine: &CatalogEngine, family: SysFamily, leading: i64) -> usize {
-    let (start, end) = family.band(leading);
-    let (cursor, _) = engine
-        .sys_relation(family)
-        .range_cursor(start.pk_bytes(), Some(end.pk_bytes()));
-    count_records(cursor)
+    let mut count = 0;
+    engine.for_each_row_under(family, leading, |_| count += 1);
+    count
 }
 
 #[test]

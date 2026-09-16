@@ -224,7 +224,7 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
         .unwrap();
     // One identity view per source, `ScanDelta(source) → IntegrateSink`.
     let view_over = |engine: &mut CatalogEngine, source: i64| {
-        let vid = engine.allocate_table_id().unwrap();
+        let vid = engine.allocate_ids(1).unwrap();
         write_identity_circuit(engine, vid, source, gnitz_wire::ReadBound::None);
         vid
     };

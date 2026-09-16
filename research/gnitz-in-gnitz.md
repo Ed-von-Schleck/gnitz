@@ -83,7 +83,7 @@ sweep of every long-lived map in `gnitz-engine` shows why not:
 | `fk_by_child/_by_parent`, `needs_lock` | FK edge count | **push hot path** |
 | `indices_by_owner`, `index_by_name/_by_id` | index count | DDL |
 | `DepMap.forward/reverse` | circuit node count | tick dispatch |
-| `user_sequences`, `invalid_views` | relation count | boot, SERIAL |
+| `invalid_views` | relation count | boot |
 
 Every one is **schema-scaled** — bounded by relation, column or index count, and
 rebuilt only on DDL. For those a view is strictly worse:

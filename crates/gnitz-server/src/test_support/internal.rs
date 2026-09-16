@@ -203,7 +203,7 @@ pub fn try_register_identity_view(
     capacity_bytes: u64,
     delta_bytes: u64,
 ) -> Result<i64, String> {
-    let vid = engine.allocate_table_id().unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
     write_identity_circuit(engine, vid, source_tid, gnitz_wire::ReadBound::None);
     engine
         .write_column_records(vid, gnitz_wire::OWNER_KIND_VIEW as i64, cols)

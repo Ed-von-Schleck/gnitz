@@ -53,7 +53,7 @@ impl CatalogEngine {
         (&mut self.dag, &mut self.registry)
     }
 
-    /// The checkpoint generation durably recorded in `SEQ_ID_CHECKPOINT_GEN`.
+    /// The checkpoint generation.
     pub(crate) fn durable_generation(&self) -> u64 {
         self.durable_generation
     }
@@ -61,13 +61,6 @@ impl CatalogEngine {
     /// The data directory this engine's relations live under.
     pub(crate) fn base_dir(&self) -> &str {
         &self.base_dir
-    }
-
-    /// The high-water mark of user SERIAL sequence `seq_id` (== the table id) —
-    /// the last id handed out. `None` when the sequence has never advanced.
-    #[cfg(test)]
-    pub(crate) fn user_sequence(&self, seq_id: i64) -> Option<i64> {
-        self.user_sequences.get(&seq_id).copied()
     }
 
     /// Whether `view_id`'s checkpointed output was rejected at boot and must be
@@ -168,12 +161,9 @@ impl CatalogEngine {
         let Some(ids) = self.caches.indices_by_owner.get(&owner_id) else {
             return Vec::new();
         };
-        let schema = SysFamily::Index.schema();
-        let rel = self.sys_relation(SysFamily::Index);
         let mut out = Vec::new();
         for &idx_id in ids {
-            let key = sys_opk(schema, idx_id as u128);
-            let Some(sr) = rel.live_row_at(key.pk_bytes()).1 else {
+            let Some(sr) = self.live_sys_row(SysFamily::Index, idx_id) else {
                 continue;
             };
             let (src, ri) = sr.source();

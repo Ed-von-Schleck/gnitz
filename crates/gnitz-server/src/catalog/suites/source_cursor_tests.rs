@@ -29,7 +29,7 @@ fn fixture_with(name: &str, bound: Option<IndexBound>, val_of: impl Fn(u64) -> u
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.create_index("public.base", &["val"], false).unwrap();
 
-    let vid = engine.allocate_table_id().unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
     let bound = bound.map_or(gnitz_wire::ReadBound::None, |bound| gnitz_wire::ReadBound::IndexRange {
         bound,
         walk: gnitz_wire::IndexWalk::Optional,

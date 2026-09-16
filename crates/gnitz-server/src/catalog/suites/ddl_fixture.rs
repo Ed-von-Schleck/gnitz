@@ -29,6 +29,27 @@ pub(super) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 }
 
 impl CatalogEngine {
+    /// The id this catalog holds for schema `name`, or `None` when it holds no
+    /// such schema.
+    pub(in crate::catalog) fn schema_id(&self, name: &str) -> Option<i64> {
+        self.caches.schema_by_name.get(name).copied()
+    }
+
+    pub(in crate::catalog) fn schema_is_empty(&self, schema_name: &str) -> bool {
+        match self.caches.schema_by_name.get(schema_name) {
+            Some(&sid) => self.schema_member_count(sid) == 0,
+            None => true,
+        }
+    }
+
+    pub(in crate::catalog) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
+        self.entity_id_by_qname(&gnitz_wire::qualified_key(schema_name, table_name))
+    }
+
+    pub(in crate::catalog) fn has_index_by_name(&self, name: &str) -> bool {
+        self.caches.index_by_name.contains_key(name)
+    }
+
     /// Retract the live row at `pk` in `family` through `submit`, which expands the
     /// drop cascade.
     pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
@@ -46,7 +67,7 @@ impl CatalogEngine {
         if self.has_schema(name) {
             return Err(format!("Schema already exists: {name}"));
         }
-        let sid = self.allocate_schema_id().unwrap();
+        let sid = self.allocate_ids(1).unwrap();
 
         // Write schema record
         let schema = SysFamily::Schema.schema();
@@ -127,7 +148,7 @@ impl CatalogEngine {
         let sid = self
             .schema_id(schema_name)
             .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
-        let tid = self.allocate_table_id().unwrap();
+        let tid = self.allocate_ids(1).unwrap();
 
         // This in-process test shortcut always builds a keyed, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
@@ -211,7 +232,7 @@ impl CatalogEngine {
             .collect::<Result<_, _>>()?;
 
         let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
-        let index_id = self.allocate_index_id().unwrap();
+        let index_id = self.allocate_ids(1).unwrap();
 
         let packed_cols = gnitz_wire::pack_pk_cols(&col_indices);
         let batch = idx_tab_batch(

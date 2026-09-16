@@ -35,11 +35,9 @@ wire_enum! {
         /// `arg1` SERIAL ids of table `target_id`; the reply's `target_id` is the
         /// run's base.
         AllocSerialRange = 9,
-        /// `arg1` table ids; the reply's `target_id` is the run's base.
-        AllocTableId = 10,
-        AllocSchemaId = 11,
-        /// `arg1` index ids; the reply's `target_id` is the run's base.
-        AllocIndexId = 12,
+        /// `arg1` catalog object ids (schema, relation or index); the reply's
+        /// `target_id` is the run's base.
+        AllocIds = 10,
     }
 }
 

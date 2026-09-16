@@ -32,12 +32,8 @@ struct IdxRow {
 }
 
 fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
-    let schema = SysFamily::Index.schema();
-    let key = sys_opk(schema, idx_id as u128);
-    let store = engine.sys_relation(SysFamily::Index);
-    let sr = store
-        .live_row_at(key.pk_bytes())
-        .1
+    let sr = engine
+        .live_sys_row(SysFamily::Index, idx_id)
         .unwrap_or_else(|| panic!("live IDX_TAB row for index {idx_id} missing"));
     let (src, row) = sr.source();
     // Through the production decoder, so the reproduced row is what the engine

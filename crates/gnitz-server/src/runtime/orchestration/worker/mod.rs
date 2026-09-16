@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
+use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
 use crate::query::{DagEngine, ExchangeCallback};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
@@ -514,6 +514,10 @@ impl WorkerProcess {
             }
 
             SalMessageKind::DdlSync => {
+                // `_sequences` is master state: no worker reads it.
+                if SysFamily::from_id(target_id) == Some(SysFamily::Sequence) {
+                    return Ok(());
+                }
                 if let Some(batch) = batch {
                     if !batch.is_empty() {
                         self.cat().ddl_sync(target_id, lsn, batch)?;

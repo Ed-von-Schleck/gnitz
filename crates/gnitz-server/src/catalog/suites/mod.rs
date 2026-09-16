@@ -241,7 +241,7 @@ fn create_flagged_table(
     pk_cols: &[u32],
     flags: u64,
 ) -> i64 {
-    let tid = engine.allocate_table_id().unwrap();
+    let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, OWNER_KIND_TABLE, cols).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(pk_cols), table_name, flags);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();

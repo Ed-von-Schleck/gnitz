@@ -895,29 +895,15 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &ctrl, data).await,
 
         // `target_id` is the sequence key (= the owning table's id).
-        ClientVerb::AllocSerialRange => {
-            let count = ctrl.hdr.arg1.max(1) as i64;
-            match commit_serial_range_durable(shared, target_id, count).await {
-                Ok(base) => send_control_only(peer, base, WireStatus::Ok),
-                Err(e) => send_error(peer, target_id, e.as_bytes()),
-            }
-        }
+        ClientVerb::AllocSerialRange => match commit_serial_range_durable(shared, target_id, ctrl.hdr.arg1).await {
+            Ok(base) => send_control_only(peer, base, WireStatus::Ok),
+            Err(e) => send_error(peer, target_id, e.as_bytes()),
+        },
 
         // An id allocation names no relation, so `target_id` is not read — and a
         // frame that sets one is still allocated, rather than falling through to
         // a scan of that id.
-        ClientVerb::AllocTableId => {
-            let alloc = shared.cat_mut().allocate_table_ids(ctrl.hdr.arg1);
-            reply_allocation(peer, alloc).await
-        }
-        ClientVerb::AllocSchemaId => {
-            let alloc = shared.cat_mut().allocate_schema_id();
-            reply_allocation(peer, alloc).await
-        }
-        ClientVerb::AllocIndexId => {
-            let alloc = shared.cat_mut().allocate_index_ids(ctrl.hdr.arg1);
-            reply_allocation(peer, alloc).await
-        }
+        ClientVerb::AllocIds => reply_allocation(peer, shared.cat_mut().allocate_ids(ctrl.hdr.arg1)).await,
 
         ClientVerb::ScanSpec => handle_scan_spec(shared, peer, target_id, &ctrl.blob).await,
 
@@ -944,7 +930,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
 /// Reply to an id allocation. The new id rides back as the reply's *target* id —
 /// that id is the whole answer, so the frame carries no schema and no data.
-async fn reply_allocation<E: std::fmt::Display>(peer: &Peer, alloc: Result<i64, E>) {
+async fn reply_allocation(peer: &Peer, alloc: Result<i64, String>) {
     match alloc {
         Ok(new_id) => send_control_only(peer, new_id, WireStatus::Ok),
         Err(e) => {
@@ -1398,11 +1384,8 @@ enum Access {
 
 /// Resolve `target_id`'s kind, rejecting one that cannot serve `access`.
 ///
-/// A stream holds no rows, so it may be written but not read. A view registers into
-/// the same id space as base tables (shared `next_table_id`), so it may be read but
-/// not written — a raw client push addressed to a view tid would otherwise commit
-/// rows into the view's output store that its circuit never produced, permanently
-/// divergent derived state.
+/// A stream holds no rows, so it may be written but not read. A view may be read
+/// but not written: a push would commit rows its circuit never produced.
 ///
 /// Enforced here even though the SQL binder refuses both: the C and Python bindings
 /// reach the engine directly. Every caller addresses a relation by id and owns its

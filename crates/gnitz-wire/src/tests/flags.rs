@@ -31,7 +31,7 @@ fn wire_flags_roundtrip() {
         WireFlags { backfill_pad: true, ..base },
     ]);
     cases.push(WireFlags {
-        verb: ClientVerb::AllocIndexId,
+        verb: ClientVerb::AllocIds,
         conflict_mode: WireConflictMode::Error,
         schema_version: u16::MAX,
         has_schema: true,

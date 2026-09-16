@@ -110,183 +110,159 @@ fn test_orphaned_metadata_recovery() {
 
 // ── user-table SERIAL sequences ──────────────────────────────────────
 
-/// `reserve_user_sequence` seeds an absent sequence at base 1, hands out
-/// contiguous ranges, and advances the in-memory high-water each call.
 #[test]
 fn test_reserve_user_sequence_seed_and_contiguous() {
     let dir = temp_dir("reserve_user_seq");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let seq_id = FIRST_USER_TABLE_ID;
+    let seq_id = engine
+        .create_table("public.t", &[col_def("id", type_code::U64)], &[0])
+        .unwrap();
 
-    // Seed-on-first-use: absent sequence ⇒ base 1, high-water 64. Nothing is
-    // live at this seq_id, so the delta is the bare `+1` insert — a retraction
-    // of a row that does not exist would never cancel and would leave a
-    // permanent net −1 ghost in the no-unique-PK `_sequences`.
-    let (base1, delta1, _) = engine.reserve_user_sequence(seq_id, 64);
+    let (base1, delta1) = engine.reserve_user_sequence(seq_id, 64).unwrap();
     assert_eq!(base1, 1);
-    assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(64));
     assert_eq!(delta1.len(), 1, "first use inserts, retracts nothing");
     assert_eq!(delta1.get_weight(0), 1);
     engine.ingest_to_family(SEQ_TAB_ID, &delta1).unwrap();
+    assert_eq!(engine.sequence_value(seq_id), Some(64));
 
-    // The next range is contiguous: base 65, high-water 128. Now that a row is
-    // live, the delta retracts it and inserts the new high-water — and the `-1`
-    // reproduces the stored value, so the pair cancels.
-    let (base2, delta2, _) = engine.reserve_user_sequence(seq_id, 64);
+    let (base2, delta2) = engine.reserve_user_sequence(seq_id, 64).unwrap();
     assert_eq!(base2, 65);
-    assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(128));
     assert_eq!(delta2.len(), 2);
     assert_eq!(delta2.get_weight(0), -1);
     assert_eq!(payload_u64(&delta2, 0, 0), 64, "the -1 must carry the live high-water");
     assert_eq!(delta2.get_weight(1), 1);
     assert_eq!(payload_u64(&delta2, 1, 0), 128);
+    engine.ingest_to_family(SEQ_TAB_ID, &delta2).unwrap();
+    assert_eq!(engine.sequence_value(seq_id), Some(128));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `saturating_add` keeps a reservation at the i64 ceiling from panicking
-/// (unreachable in practice — the client overflow guard rejects far sooner).
 #[test]
-fn test_reserve_user_sequence_saturates() {
-    let dir = temp_dir("reserve_user_seq_sat");
+fn test_reserve_user_sequence_rejects_exhausted_range() {
+    let dir = temp_dir("reserve_user_seq_exhausted");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let seq_id = FIRST_USER_TABLE_ID;
-    engine.user_sequences.insert(seq_id, i64::MAX - 1);
 
-    let (base, _delta, _) = engine.reserve_user_sequence(seq_id, 64);
-    assert_eq!(base, i64::MAX); // hw + 1
-    assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(i64::MAX));
+    let cols = [col_def("id", type_code::U64)];
+    let full = engine.create_table("public.full", &cols, &[0]).unwrap();
+    engine
+        .ingest_to_family(SEQ_TAB_ID, &engine.sequence_delta(full, (i64::MAX - 1) as u64))
+        .unwrap();
+    let err = engine.reserve_user_sequence(full, 64).err().unwrap();
+    assert!(err.contains("invalid or exhausted"), "{err}");
+    engine.reserve_user_sequence(full, 0).err().unwrap();
+    let edge = engine.create_table("public.edge", &cols, &[0]).unwrap();
+    engine.reserve_user_sequence(edge, 1 << 63).err().unwrap();
+    engine.reserve_user_sequence(edge + 1000, 1).err().unwrap();
+
+    engine
+        .ingest_to_family(SEQ_TAB_ID, &engine.sequence_delta(edge, (i64::MAX - 65) as u64))
+        .unwrap();
+    let (base, delta) = engine.reserve_user_sequence(edge, 64).unwrap();
+    assert_eq!(base, i64::MAX - 64);
+    assert_eq!(payload_u64(&delta, 1, 0), (i64::MAX - 1) as u64, "last = i64::MAX - 1");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// End-to-end durable round-trip: reserve → ingest the delta through the real
-/// family path (firing `hook_sequence_register`) → flush → reopen. Recovery must
-/// restore the high-water, and the next reservation continues at
-/// `high_water + 1`.
 #[test]
 fn test_user_sequence_durable_roundtrip() {
     let dir = temp_dir("user_seq_roundtrip");
-    let user_seq = FIRST_USER_TABLE_ID + 3;
+    let user_seq;
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        let (base, delta, _) = engine.reserve_user_sequence(user_seq, 64);
+        user_seq = engine
+            .create_table("public.t", &[col_def("id", type_code::U64)], &[0])
+            .unwrap();
+        let (base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
         assert_eq!(base, 1);
-        // Clear the synchronously-set map entry to prove the hook re-populates it.
-        engine.user_sequences.remove(&user_seq);
         engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
-        assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
+        assert_eq!(engine.sequence_value(user_seq), Some(64));
         let _ = engine.registry.flush(SysFamily::Sequence.id());
         engine.close();
     }
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
-    let (base2, _delta, _) = engine.reserve_user_sequence(user_seq, 64);
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert_eq!(engine.sequence_value(user_seq), Some(64));
+    let (base2, _delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
     assert_eq!(base2, 65, "next id continues after the recovered high-water");
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `recover_sequences` recovers the checkpoint generation (seq id 4) and the
-/// topology (seq id 5) written by `bump_checkpoint_generation` / `record_topology`,
-/// COW-inheritable by forked workers and read by commit-3 recovery.
 #[test]
 fn test_recover_checkpoint_gen_and_topology() {
     let dir = temp_dir("recover_ckpt_records");
     let expected_topology = crate::catalog::registry::topology_word(4);
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");
-        assert_eq!(engine.recorded_topology, 0, "fresh DB has no topology row");
-        // Boot order: the topology row is written first and its durability
-        // rides the following gen bump's system-table flush.
-        engine.record_topology(4).unwrap();
+        assert_eq!(engine.durable_generation, 0);
+        assert_eq!(engine.recorded_topology, 0);
+        engine.record_topology(4);
         assert_eq!(engine.recorded_topology, expected_topology);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
-        assert_eq!(
-            engine.bump_checkpoint_generation().unwrap(),
-            2,
-            "generation is monotonic"
-        );
+        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 2);
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(
-        engine.durable_generation, 2,
-        "recovered checkpoint generation survives a reopen",
-    );
-    assert_eq!(
-        engine.recorded_topology, expected_topology,
-        "recovered topology (worker_count << 32 | STATE_FORMAT) survives a reopen",
-    );
+    assert_eq!(engine.durable_generation, 2);
+    assert_eq!(engine.recorded_topology, expected_topology);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `recovery_start_generation_bump` advances the durable checkpoint generation
-/// G → G+1 and the in-memory field, and the subsequent `boot_checkpoint` bump
-/// then goes G+1 → G+2 (retracting G+1, not G, so `_sequences` stays clean). Each
-/// step is monotonic, recovered across a reopen via the `.max()` arm.
 #[test]
-fn test_recovery_start_generation_bump_monotonic() {
+fn test_boot_generation_advance_monotonic() {
     let dir = temp_dir("recovery_start_gen_bump");
     {
-        // Simulate two prior checkpoints so the recovered G is 2, not 0.
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        engine.record_topology(4).unwrap();
+        engine.record_topology(4);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 2);
         engine.close();
     }
     {
-        // Recovery start: bump G=2 → 3 durably; the field advances.
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.durable_generation, 2, "recovered G");
-        engine.recovery_start_generation_bump().unwrap();
-        assert_eq!(
-            engine.durable_generation, 3,
-            "recovery-start bump advances the field to G+1"
-        );
-        // The boot checkpoint's single bump (inside `reclaim_base`, which owns it
-        // for every base round) then retracts G+1 and inserts G+2.
-        assert_eq!(
-            engine.bump_checkpoint_generation().unwrap(),
-            4,
-            "boot_checkpoint goes G+1 → G+2"
-        );
+        assert_eq!(engine.durable_generation, 2);
+        assert_eq!(engine.advance_durable_generation().unwrap(), 3);
+        assert_eq!(engine.registry().resume_generation(), 2);
+        assert_eq!(engine.sequence_value(SEQ_ID_CHECKPOINT_GEN), Some(3));
+        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 4);
+        assert_eq!(engine.registry().resume_generation(), 4);
         engine.close();
     }
-    // The final durable generation survives a reopen monotonically.
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(
-        engine.durable_generation, 4,
-        "recovery-start + boot_checkpoint bumps recovered monotonically",
-    );
+    assert_eq!(engine.durable_generation, 4);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The `>= FIRST_USER_TABLE_ID` recovery guard must ignore a stray sequence id
-/// in the empty 4..16 gap, never misclassifying it as a user sequence.
+/// A drop, a system flush and a reopen must not hand out again an id that was
+/// registered without being allocated.
 #[test]
-fn test_recover_ignores_sub_user_seq_id() {
-    let dir = temp_dir("recover_gap_guard");
-    let stray = 7i64; // below FIRST_USER_TABLE_ID
+fn test_raised_counter_survives_drop_and_flush() {
+    let dir = temp_dir("raised_counter_survives_drop");
+    let cols = vec![col_def("id", type_code::U64)];
+    let tid;
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        let schema = SysFamily::Sequence.schema();
-        let mut bb = BatchBuilder::new(*schema);
-        bb.begin_row(stray as u128, 1);
-        bb.put_u64(999);
-        bb.end_row();
-        engine.registry.ingest(SysFamily::Sequence.id(), bb.finish()).unwrap();
-        let _ = engine.registry.flush(SysFamily::Sequence.id());
+        tid = engine.next_id + 500;
+        engine.write_column_records(tid, OWNER_KIND_TABLE, &cols).unwrap();
+        engine
+            .submit(
+                SysFamily::Table,
+                build_table_tab_row(tid, pack_pk_cols(&[0]), "unallocated"),
+            )
+            .unwrap();
+        assert!(engine.next_id > tid);
+        engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+        engine.flush_all_system_tables().unwrap();
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine.user_sequences.contains_key(&stray));
+    assert!(!engine.registry().has_id(tid));
+    assert!(engine.next_id > tid, "next_id {} must stay past {tid}", engine.next_id);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -733,7 +709,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     assert_eq!(engine.dag.get_dep_map(&engine.registry).get(&tid), Some(&vec![v1]));
 
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
-    let v2 = engine.allocate_table_id().unwrap();
+    let v2 = engine.allocate_ids(1).unwrap();
     write_identity_circuit(&mut engine, v2, tid, gnitz_wire::ReadBound::None);
     engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());

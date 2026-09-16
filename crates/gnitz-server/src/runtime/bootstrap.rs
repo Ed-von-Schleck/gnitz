@@ -242,7 +242,7 @@ fn worker_boot_recovery(
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
         catalog.durable_generation() > catalog.registry().resume_generation(),
-        "boot base flush without the recovery-start generation bump ahead of it",
+        "boot base flush without the pre-fork generation advance ahead of it",
     );
     catalog
         .flush_base_round()
@@ -426,13 +426,13 @@ fn master_pre_fork_recovery(
 ) -> Result<(Vec<i64>, u64), String> {
     let tail_lsn = recover_system_tables_from_sal(log, walk_epoch, catalog)?;
 
-    // Checked, and before the gc below: the replayed DDL lives only in master
-    // memory until this makes it durable, so a swallowed failure lets the SAL
-    // reset destroy its only copy and the gc delete the shards it named.
-    catalog.flush_all_system_tables()?;
+    // G → G+1 with the resume generation left at G: a crash before `boot_checkpoint`
+    // rebuilds every un-checkpointed view instead of resuming it stale.
+    catalog.advance_durable_generation()?;
     if SYS_FLUSH_ERROR.armed() {
         return Err("injected system table flush fault".to_string());
     }
+    inject_recovery_panic("genbump");
 
     // Reclaim every directory a committed DROP left behind. After both replays,
     // so a committed-but-unflushed CREATE is not mistaken for an orphan, and
@@ -443,17 +443,9 @@ fn master_pre_fork_recovery(
     // each worker's `rehome` opens what is left.
     catalog.registry().reconcile_child_dirs();
 
-    // Reads `resume_generation`, so it runs before the bump below advances the
-    // durable one. Pre-fork because it peeks every launched rank's manifest on
-    // behalf of workers that do not exist yet.
+    // Pre-fork because it peeks every launched rank's manifest on behalf of
+    // workers that do not exist yet.
     catalog.compute_invalid_views();
-
-    // Durably advance the checkpoint generation G → G+1 while the resume
-    // generation stays at G, closing the reset→boot_checkpoint crash window.
-    catalog
-        .recovery_start_generation_bump()
-        .map_err(|e| format!("recovery-start generation bump failed: {e}"))?;
-    inject_recovery_panic("genbump");
 
     let lsn_seed = catalog.registry().max_current_lsn().max(tail_lsn);
     Ok((swept_base_tables(catalog), lsn_seed))
@@ -602,7 +594,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
         w2m_ptrs,
     } = ipc;
 
-    // `recovery_start_generation_bump` has already run, so this is the floor
+    // Pre-fork recovery has already advanced the generation, so this is the floor
     // every base round must publish past.
     let boot_generation = catalog.durable_generation();
     // SAFETY: every ring was initialized by `create_region` and is never unmapped.

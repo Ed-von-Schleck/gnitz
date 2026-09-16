@@ -341,7 +341,7 @@ def test_restrict_survives_dropping_a_unique_index_on_the_fk_column(client, sche
     sn = schema_name
     client.execute_sql(
         _PARENT + "; "
-        # Moves the index-id counters, which FK circuits must not depend on.
+        # Moves the object-id counter, which FK circuits must not depend on.
         "CREATE INDEX parent_val ON parent(val); "
         "CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
         " pid BIGINT NOT NULL UNIQUE REFERENCES parent(id))",

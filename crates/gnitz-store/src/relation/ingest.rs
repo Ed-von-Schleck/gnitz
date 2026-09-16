@@ -28,44 +28,20 @@ fn inject_ingest_apply_error(
     r
 }
 
-/// A batch on its way into a store: moved in, or borrowed from a caller that
-/// keeps reading it. The variant decides only the final store write — the index
-/// projections read through either.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "one stack temporary per ingest; boxing would \
-    heap-allocate the batch the owned arm exists to move in"
-)]
-enum Incoming<'a> {
-    Owned(Batch),
-    Borrowed(&'a Batch),
-}
-
-impl Incoming<'_> {
-    fn as_ref(&self) -> &Batch {
-        match self {
-            Incoming::Owned(b) => b,
-            Incoming::Borrowed(b) => b,
-        }
-    }
-}
-
 impl RelationRegistry {
     // ── Ingestion ───────────────────────────────────────────────────────
 
     /// Enforce this relation's PK rule, apply the result to its store and index
     /// projections, and hand back the effective batch — what applying a batch to
     /// a relation means.
-    fn apply(entry: &mut Relation, batch: Incoming<'_>, needed: bool) -> Result<Option<Batch>, StorageError> {
-        let effective = match batch {
-            Incoming::Owned(b) if entry.kind.is_base_table() => Incoming::Owned(entry.store.enforce_unique_pk(b)),
-            other => other,
+    fn apply(entry: &mut Relation, batch: Batch, needed: bool) -> Result<Option<Batch>, StorageError> {
+        let effective = if entry.kind.is_base_table() {
+            entry.store.enforce_unique_pk(batch)
+        } else {
+            batch
         };
-        if effective.as_ref().count == 0 {
-            return Ok(match (needed, effective) {
-                (true, Incoming::Owned(b)) => Some(b),
-                _ => None,
-            });
+        if effective.count == 0 {
+            return Ok(needed.then_some(effective));
         }
         Self::ingest_store_and_indices(entry, effective, needed)
     }
@@ -172,12 +148,7 @@ impl RelationRegistry {
     /// `Rejected` means nothing was applied and the request is at fault;
     /// `Storage` means committed data did not reach the store.
     pub fn ingest(&mut self, id: i64, batch: Batch) -> Result<(), StoreError> {
-        self.ingest_batch(id, Incoming::Owned(batch), false).map(drop)
-    }
-
-    /// [`Self::ingest`] over a batch the caller keeps reading; costs one copy.
-    pub fn ingest_borrowed(&mut self, id: i64, batch: &Batch) -> Result<(), StoreError> {
-        self.ingest_batch(id, Incoming::Borrowed(batch), false).map(drop)
+        self.ingest_batch(id, batch, false).map(drop)
     }
 
     /// [`Self::ingest`], handing back the batch as the store saw it, after PK
@@ -199,11 +170,11 @@ impl RelationRegistry {
                 )))
             }
         }
-        self.ingest_batch(id, Incoming::Owned(batch), true)
+        self.ingest_batch(id, batch, true)
             .map(|b| b.expect("`needed` is set, so the effective batch comes back"))
     }
 
-    fn ingest_batch(&mut self, id: i64, batch: Incoming<'_>, needed: bool) -> Result<Option<Batch>, StoreError> {
+    fn ingest_batch(&mut self, id: i64, batch: Batch, needed: bool) -> Result<Option<Batch>, StoreError> {
         let entry = match self.tables.get_mut(&id) {
             Some(e) => e,
             None => {
@@ -217,10 +188,10 @@ impl RelationRegistry {
         // reads the destination's region count, so an unchecked mismatch drops the
         // extra column and ACKs the push as success.
         let want = entry.store.schema().num_payload_cols();
-        if batch.as_ref().num_payload_cols() != want {
+        if batch.num_payload_cols() != want {
             return Err(StoreError::rejected(format!(
                 "push for table_id={id} carries {} payload columns, table schema has {}",
-                batch.as_ref().num_payload_cols(),
+                batch.num_payload_cols(),
                 want
             )));
         }
@@ -237,12 +208,12 @@ impl RelationRegistry {
     /// without poisons its handle.
     fn ingest_store_and_indices(
         entry: &mut Relation,
-        source: Incoming<'_>,
+        source: Batch,
         needed: bool,
     ) -> Result<Option<Batch>, StorageError> {
         let (id, kind) = (entry.id(), entry.kind);
         for ix in entry.indexes.iter_mut() {
-            let idx_batch = crate::storage::batch_project_index(source.as_ref(), &ix.key_spec, &ix.store.schema());
+            let idx_batch = crate::storage::batch_project_index(&source, &ix.key_spec, &ix.store.schema());
             if idx_batch.count > 0 {
                 let index_id = ix.index_id;
                 inject_ingest_apply_error("index", kind, ix.ingest_owned_batch(idx_batch)).inspect_err(|e| {
@@ -258,10 +229,10 @@ impl RelationRegistry {
         }
         // Last, so a caller that does not want the batch back lets the store move
         // it instead of copying it.
-        let (res, effective) = match source {
-            Incoming::Owned(b) if needed => (entry.store.ingest_borrowed_batch(&b), Some(b)),
-            Incoming::Owned(b) => (entry.store.ingest_owned_batch(b), None),
-            Incoming::Borrowed(b) => (entry.store.ingest_borrowed_batch(b), None),
+        let (res, effective) = if needed {
+            (entry.store.ingest_borrowed_batch(&source), Some(source))
+        } else {
+            (entry.store.ingest_owned_batch(source), None)
         };
         inject_ingest_apply_error("store", kind, res).inspect_err(|e| {
             gnitz_error!(

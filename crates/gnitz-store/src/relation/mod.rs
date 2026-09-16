@@ -8,10 +8,11 @@
 use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
+use crate::schema::key::{key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::SchemaDescriptor;
 
 use crate::storage::{
-    Batch, ChildAddr, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, StoredRow, Table,
+    Batch, ChildAddr, ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, StoredRow, Table,
 };
 use gnitz_wire::{PkColList, ViewProps};
 
@@ -322,10 +323,14 @@ impl Relation {
         self.store.cursor_in_range(start, end)
     }
 
-    /// This relation's rows positioned on `[start, end)`, and the raw entry count
-    /// in that range — see [`Store::range_cursor`].
-    pub fn range_cursor(&self, start: &[u8], end: Option<&[u8]>) -> (crate::storage::ReadCursor, usize) {
-        self.store.range_cursor(start, end)
+    /// Visit every positive-weight row whose OPK key begins with `prefix`, through a
+    /// cursor that gathers only the runs overlapping that key band.
+    pub fn for_each_positive_with_prefix(&self, prefix: &[u8], f: impl FnMut(&ReadCursor)) {
+        let band = key_range_between_cuts(KeyCut::min_of(prefix), KeyCut::above(prefix), self.schema().pk_stride());
+        if let Some((start, end)) = band {
+            self.cursor_in_range(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes))
+                .for_each_positive_with_prefix(prefix, f);
+        }
     }
 
     /// Materialize every positive-weight row of this relation's store.

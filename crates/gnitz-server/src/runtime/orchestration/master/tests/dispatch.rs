@@ -1,5 +1,5 @@
 use super::super::fixtures::{test_dispatcher, test_dispatcher_with_writers};
-use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
+use crate::catalog::{CatalogEngine, SysFamily};
 use crate::runtime::sal::{GroupTargets, WorkerSet};
 use gnitz_foundation::posix_io::retry_eintr;
 
@@ -119,12 +119,19 @@ fn an_exclusive_round_keeps_its_write_refusals_status() {
 fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
-    let user_seq = FIRST_USER_TABLE_ID + 3;
+    let user_seq;
     {
         let mut engine = CatalogEngine::open(dir, 1).unwrap();
+        user_seq = engine
+            .create_table(
+                "public.t",
+                &[crate::test_support::col_def("id", gnitz_wire::type_code::U64)],
+                &[0],
+            )
+            .unwrap();
         // Reserve + ingest straight into the catalog — no SAL involved, so the
         // advance lands ONLY in the sys_sequences MemTable.
-        let (_base, delta, _lsn) = engine.reserve_user_sequence(user_seq, 64);
+        let (_base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
         engine.submit(SysFamily::Sequence, delta).unwrap();
 
         let disp = test_dispatcher(Vec::new(), &mut engine);
@@ -138,7 +145,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
 
     let engine = CatalogEngine::open(dir, 1).unwrap();
     assert_eq!(
-        engine.user_sequence(user_seq),
+        engine.sequence_value(user_seq),
         Some(64),
         "sys_sequences high-water must survive a crash right after the checkpoint finalize"
     );
