@@ -476,20 +476,9 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
         // Pre-auth first-frame deadline: HELLO must arrive within this window of
         // accept, else the connection is torn down (covers a stalled handshake
         // and a completed-handshake-no-HELLO squat alike).
-        let deadline = Instant::now() + tls_hello_timeout();
+        let deadline = Instant::now() + tl.pre_auth_window;
         shared.disp().reactor().spawn(connection_loop(peer, s, Some(deadline)));
     }
-}
-
-/// Pre-auth first-frame deadline (`GNITZ_TLS_HELLO_TIMEOUT_MS`, default
-/// 15 000 ms). Exceeds the client's single connect deadline (`CONNECT_TIMEOUT`,
-/// covering TCP connect, handshake and HELLO), so a client is reaped only once
-/// it has given up itself.
-fn tls_hello_timeout() -> std::time::Duration {
-    static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
-        std::time::Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_TLS_HELLO_TIMEOUT_MS", 15_000))
-    })
 }
 
 enum HelloOutcome {
@@ -499,14 +488,15 @@ enum HelloOutcome {
     Reject,
 }
 
-/// `first_frame_deadline` bounds the arrival of the first (HELLO) frame: `Some`
-/// for TLS (pre-auth reap), `None` for AF_UNIX. Only the first recv is raced
+/// `first_frame_deadline` bounds the pre-auth window: `Some` where the transport
+/// has not authenticated this peer and HELLO must arrive within it, `None` where
+/// the socket's own permissions are the gate. Only the first recv is raced
 /// against it.
 async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: Option<Instant>) {
     serve_connection(&peer, &shared, first_frame_deadline).await;
     // The one exit: ship what is corked — a rejection is a corked reply like any
     // other — then retire the fd.
-    peer.flush_egress().await;
+    let _ = peer.flush_egress().await;
     peer.close();
 }
 
@@ -536,14 +526,14 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
         // than the budget: between them these are the whole shipping rule.
         let mut next = peer.try_recv();
         if next.is_none() {
-            if peer.flush_egress().await < 0 {
+            if peer.flush_egress().await.is_err() {
                 return;
             }
             next = peer.recv().await;
         }
         let Some(buf) = next else { return };
         handle_message(peer, buf.as_slice(), shared).await;
-        if peer.flush_if_full().await < 0 {
+        if peer.flush_if_full().await.is_err() {
             return;
         }
     }
@@ -579,8 +569,7 @@ async fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> H
     // Seed the client's OCC basis with the durability watermark now. This runs
     // before the connection message loop, so `published()` is `≤` any later read
     // the client issues — a sound (conservative) basis.
-    let rc = peer.send_hello_ack(shared.lsn_alloc.published()).await;
-    if rc < 0 {
+    if peer.send_hello_ack(shared.lsn_alloc.published()).await.is_err() {
         return HelloOutcome::Reject;
     }
     HelloOutcome::Pass
@@ -1858,7 +1847,7 @@ async fn delta_poll_body(
         }
         // Carry no more than the budget into the next view, and learn here
         // rather than at the end if the client is gone.
-        if peer.flush_if_full().await < 0 {
+        if peer.flush_if_full().await.is_err() {
             return Ok(false);
         }
     }
@@ -1997,7 +1986,7 @@ async fn scan_multi_body(
         send_msg(peer, terminal_scan_msg(plan.tid, lsn, 0));
         // This relation's reply is complete: carry no more than the budget into
         // the next, and learn here rather than at the end if the client is gone.
-        if peer.flush_if_full().await < 0 {
+        if peer.flush_if_full().await.is_err() {
             return Ok(false);
         }
     }

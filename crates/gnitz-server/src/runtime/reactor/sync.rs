@@ -116,8 +116,7 @@ pub mod chan {
 // ---------------------------------------------------------------------------
 
 /// Mutual exclusion with no payload: the guard is a drop token, and what it
-/// protects lives outside. Exposing no shared mode is the point — the SAL
-/// writer and the TLS send path would both compile, and both break, given one.
+/// protects lives outside. No shared mode — [`AsyncRwLock`] is there for that.
 #[derive(Default)]
 pub struct AsyncMutex(AsyncRwLock);
 

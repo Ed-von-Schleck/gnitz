@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
-use crate::runtime::reactor::{ClientConn, Reactor, RecvBuf, SendBody};
+use crate::runtime::reactor::{ClientConn, PeerGone, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 
@@ -85,7 +85,7 @@ impl Peer {
 
     /// Ship what is corked once it reaches [`COALESCE_MAX_BYTES`], bounding the
     /// accumulator across a long pipelined run.
-    pub async fn flush_if_full(&self) -> i32 {
+    pub async fn flush_if_full(&self) -> Result<(), PeerGone> {
         let full = self
             .egress
             .borrow()
@@ -94,44 +94,41 @@ impl Peer {
         if full {
             self.flush_egress().await
         } else {
-            0
+            Ok(())
         }
     }
 
     /// Write everything corked, as one send. No-op when nothing is pending.
-    pub async fn flush_egress(&self) -> i32 {
+    pub async fn flush_egress(&self) -> Result<(), PeerGone> {
         // Taken, not borrowed across the await: the flushed task re-enters `Peer`.
         let Some(buf) = self.egress.borrow_mut().take() else {
-            return 0;
+            return Ok(());
         };
         self.send_raw(SendBody::Pooled(buf)).await
     }
 
-    /// Send one payload behind whatever is corked. It is corked — copied, releasing a
-    /// ring slot at once — when it fits beside bytes already corked, or is at most half
-    /// of [`COALESCE_MAX_BYTES`] so what follows can join it: a copy of at most the
-    /// budget per send saved. Otherwise the cork is flushed and the payload goes out
-    /// alone, zero-copy, holding its ring slot until the send completes. `< 0`: the
-    /// client is gone; a corked payload reports that at its flush.
-    pub async fn send(&self, body: impl Into<SendBody>) -> i32 {
+    /// Send one payload behind whatever is corked. It is corked — copied, releasing
+    /// a ring slot at once — when it fits beside bytes already corked, or is at most
+    /// half of [`COALESCE_MAX_BYTES`] so what follows can join it. Otherwise the cork
+    /// is flushed and the payload goes out alone: on AF_UNIX straight from its ring
+    /// slot, held until the send completes; the TLS arm copies it into rustls.
+    /// `Err`: the client is gone; a corked payload reports that at its flush.
+    pub async fn send(&self, body: impl Into<SendBody>) -> Result<(), PeerGone> {
         let body = body.into();
         let len = body.bytes().len();
         let corked = self.corked_len();
         if !(corked > 0 && corked + len <= COALESCE_MAX_BYTES) {
-            let rc = self.flush_egress().await;
-            if rc < 0 {
-                return rc;
-            }
+            self.flush_egress().await?;
             if len > COALESCE_MAX_BYTES / 2 {
                 return self.send_raw(body).await;
             }
         }
         self.cork(body.bytes());
-        0
+        Ok(())
     }
 
     /// The transport send itself.
-    async fn send_raw(&self, body: SendBody) -> i32 {
+    async fn send_raw(&self, body: SendBody) -> Result<(), PeerGone> {
         match &self.transport {
             Transport::Unix(r) => r.send_owned(&self.conn, body).await.0,
             Transport::Tls(t) => t.send_bytes(body.bytes()).await,
@@ -142,7 +139,7 @@ impl Peer {
     /// `published_lsn` (the durability watermark at connect). The ACK's contents
     /// (status, advertised server frame limit) are protocol policy decided once
     /// here, for every transport.
-    pub async fn send_hello_ack(&self, published_lsn: u64) -> i32 {
+    pub async fn send_hello_ack(&self, published_lsn: u64) -> Result<(), PeerGone> {
         let ack = gnitz_wire::encode_hello_ack(crate::runtime::wire::FRAME_CAP as u32, published_lsn);
         let mut buf = acquire_buf();
         buf.extend_from_slice(&ack);
@@ -151,10 +148,9 @@ impl Peer {
 
     /// Terminal reply send: close the connection on transport failure. Once
     /// the reply is on the wire there is nothing left to do on the
-    /// connection, so a negative send rc (peer gone / write error) simply
-    /// schedules the close.
+    /// connection, so a failed send simply schedules the close.
     pub async fn send_or_close(&self, payload: impl Into<SendBody>) {
-        if self.send(payload).await < 0 {
+        if self.send(payload).await.is_err() {
             self.close();
         }
     }

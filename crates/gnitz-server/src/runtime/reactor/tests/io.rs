@@ -182,17 +182,18 @@ impl Feeder {
     }
 
     /// One read: hand the window as many of `bytes` as it takes. Returns how
-    /// many, or `Err` when the queue closed the connection.
-    fn read(&mut self, bytes: &[u8]) -> Result<usize, ()> {
+    /// many, or why the queue closed the connection.
+    fn read(&mut self, bytes: &[u8]) -> Result<usize, RecvEnd> {
         assert!(self.window.1 > 0, "remaining must never arm a zero-length window");
         let n = bytes.len().min(self.window.1 as usize);
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.window.0, n) };
-        self.window = self.q.deliver(n, 7)?;
+        self.q.deliver(n)?;
+        self.window = self.q.remaining();
         Ok(n)
     }
 
     /// Feed `wire` as whole reads until it is exhausted; returns the read count.
-    fn feed(&mut self, mut wire: &[u8]) -> Result<usize, ()> {
+    fn feed(&mut self, mut wire: &[u8]) -> Result<usize, RecvEnd> {
         let mut reads = 0;
         while !wire.is_empty() {
             let n = self.read(wire)?;

@@ -23,10 +23,9 @@ pub(crate) struct TlsCli {
 }
 
 /// TLS listener runtime inputs, threaded into `ServerExecutor::run` (hence
-/// `pub(crate)`): the bound listener, the rustls config, and both halves of
-/// the "live TLS sessions ≤ `max_conns`" invariant. `Rc<Cell<..>>` also makes
-/// this `!Send`, so the single-reactor-thread assumption the count rests on is
-/// checked rather than assumed.
+/// `pub(crate)`): the bound listener, the rustls config, and this listener's
+/// admission policy — how many peers it admits, and how long an admitted one may
+/// stay unauthenticated.
 pub(crate) struct TlsListener {
     /// Owned rather than a raw fd, so the descriptor is closed on every path
     /// out of [`setup_tls_listener`] — the bound address is published across
@@ -34,6 +33,12 @@ pub(crate) struct TlsListener {
     listener: TcpListener,
     pub cfg: std::sync::Arc<rustls::ServerConfig>,
     pub max_conns: u32,
+    /// How long an admitted peer may stay unauthenticated
+    /// (`GNITZ_TLS_HELLO_TIMEOUT_MS`, default 15 000 ms): HELLO must arrive within
+    /// this of accept. Set above the client's own connect deadline, so a client is
+    /// reaped only once it has given up itself.
+    pub pre_auth_window: std::time::Duration,
+    /// Co-owned with every live [`ConnCountGuard`], which is what decrements it.
     live: Rc<Cell<u32>>,
 }
 
@@ -57,8 +62,8 @@ impl TlsListener {
 
 /// Build the rustls server config (minting + persisting the public dev cert
 /// when no PEM pair is given), bind the TCP listener, and publish the bound
-/// address to `<data_dir>/tls_endpoint` (atomically: tmp + rename, so
-/// existence implies complete content).
+/// address to `<data_dir>/tls_endpoint`. Both files go out through the storage
+/// layer's publisher, so each exists only with its complete content.
 ///
 /// **Bind refusal:** a non-loopback bind with neither `--tls-client-ca` nor
 /// `--allow-unauthenticated` aborts boot — an unauthenticated public bind is
@@ -80,7 +85,8 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
     let (config, dev_pem) = super::config::server_crypto(cert_key, cli.client_ca.as_deref())?;
     if let Some(pem) = dev_pem {
         let path = format!("{data_dir}/tls_dev_cert.pem");
-        std::fs::write(&path, pem).map_err(|e| format!("failed to write {path}: {e}"))?;
+        gnitz_store::storage::publish_file_sync(data_dir, "tls_dev_cert.pem", &[pem.as_bytes()])
+            .map_err(|e| format!("failed to publish {path}: {e}"))?;
         gnitz_info!(
             "TLS: minted a self-signed dev certificate (identity is ephemeral, regenerated every boot); \
              public PEM at {path}"
@@ -107,10 +113,8 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
     let bound = listener
         .local_addr()
         .map_err(|e| format!("failed to read the bound TLS address: {e}"))?;
-    let endpoint_path = format!("{data_dir}/tls_endpoint");
-    let tmp_path = format!("{endpoint_path}.tmp");
-    std::fs::write(&tmp_path, format!("{bound}\n")).map_err(|e| format!("failed to write {tmp_path}: {e}"))?;
-    std::fs::rename(&tmp_path, &endpoint_path).map_err(|e| format!("failed to publish {endpoint_path}: {e}"))?;
+    gnitz_store::storage::publish_file_sync(data_dir, "tls_endpoint", &[format!("{bound}\n").as_bytes()])
+        .map_err(|e| format!("failed to publish {data_dir}/tls_endpoint: {e}"))?;
     gnitz_info!("Listening on tls://{}", bound);
     // A deliberately-unauthenticated non-loopback bind (escape hatch, no CA)
     // stays loud. With a CA the listener is authenticated — no warning.
@@ -126,6 +130,10 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
         listener,
         cfg: config,
         max_conns: cli.max_conns,
+        pre_auth_window: std::time::Duration::from_millis(gnitz_foundation::env::env_num(
+            "GNITZ_TLS_HELLO_TIMEOUT_MS",
+            15_000,
+        )),
         live: Rc::new(Cell::new(0)),
     })
 }

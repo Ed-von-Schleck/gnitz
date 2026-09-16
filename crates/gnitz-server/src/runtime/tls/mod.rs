@@ -1,6 +1,6 @@
-//! TLS 1.3 server transport. A connection's recv filter ([`TlsIngress`]) decrypts
-//! into its `RecvQueue` and never sends; ciphertext leaves only under [`SendHeld`],
-//! so records reach the socket in emission order.
+//! TLS 1.3 server transport. The recv filter ([`TlsIngress`]) decrypts into the
+//! connection's `RecvQueue` and never sends; ciphertext leaves only through
+//! [`TlsShared::flush_records`], so records reach the socket in emission order.
 
 mod config;
 mod listener;
@@ -9,81 +9,63 @@ pub(crate) use listener::{setup_tls_listener, TlsCli, TlsListener};
 
 use std::cell::{Cell, RefCell};
 use std::io::{ErrorKind, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
+
 use crate::runtime::reactor::{
-    chan, shutdown, AsyncMutex, ClientConn, Reactor, RecvFilter, RecvQueue, SendBody, WriteGuard,
+    chan, shutdown, AsyncMutex, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
 };
 
 /// Size of the ciphertext window each recv lands in.
 const CIPHER_WINDOW_BYTES: usize = 64 * 1024;
 
-/// Per-connection TLS state, behind `TlsShared::state`. Never borrowed
-/// across an await.
-struct TlsConn {
-    sess: rustls::ServerConnection,
-    /// `Peer::close()` ran; senders refuse, flusher tears down.
-    closed: bool,
+/// Feed one socket chunk of ciphertext through rustls, enqueueing the plaintext
+/// frames it yields on `q`.
+fn ingest_cipher(sess: &mut rustls::ServerConnection, mut cipher: &[u8], q: &mut RecvQueue) -> Result<(), RecvEnd> {
+    while !cipher.is_empty() {
+        // `Ok(0)` is end-of-stream. An `Err` is rustls's buffer being full, not a
+        // failure: the drain below frees it and the loop retries the rest.
+        if matches!(sess.read_tls(&mut cipher), Ok(0)) {
+            return Err(RecvEnd::PeerClosed);
+        }
+        let io_state = sess.process_new_packets().map_err(|_| RecvEnd::Protocol)?;
+        // Before the close test, so plaintext decrypted in this chunk is still
+        // enqueued when the peer closed in it too.
+        feed_decrypted(sess, q)?;
+        if io_state.peer_has_closed() {
+            return Err(RecvEnd::PeerClosed);
+        }
+    }
+    Ok(())
 }
 
-impl TlsConn {
-    /// Feed one socket chunk of ciphertext through rustls and enqueue whatever
-    /// plaintext frames come out on `q`. `Err` ⇒ recv-side teardown.
-    ///
-    /// An `Err` from `read_tls` is backpressure, not failure, so it is ignored:
-    /// the drain below frees the buffer and the loop retries the unconsumed
-    /// slice. It terminates because one record always fits that buffer.
-    fn ingest_cipher(&mut self, mut cipher: &[u8], q: &mut RecvQueue, fd: i32) -> Result<(), ()> {
-        while !cipher.is_empty() {
-            // `Ok(0)` = end-of-stream: a `close_notify` was already received,
-            // so no further data will ever be read.
-            if matches!(self.sess.read_tls(&mut cipher), Ok(0)) {
-                return Err(());
-            }
-            let io_state = self.sess.process_new_packets().map_err(|_| ())?;
-            // Before the close test, so already-decrypted plaintext is still
-            // enqueued when the peer closed in the same chunk.
-            self.feed_decrypted(q, fd)?;
-            if io_state.peer_has_closed() {
-                return Err(());
-            }
-        }
-        Ok(())
-    }
-
-    /// Drain all currently-available decrypted plaintext into `q`.
-    /// rustls reads plaintext straight into the deframer's write window — no
-    /// intermediate bounce buffer. `Err` ⇒ recv-side teardown (oversize,
-    /// zero-len sentinel, cap breach, or a clean/unclean plaintext close).
-    fn feed_decrypted(&mut self, q: &mut RecvQueue, fd: i32) -> Result<(), ()> {
-        let (mut ptr, mut len) = q.remaining();
-        loop {
-            // SAFETY: ptr/len are the queue's own write window (its carry, or
-            // an in-flight RecvBuf payload), exclusively ours.
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) };
-            // Collapsing WouldBlock into close would kill every live
-            // connection; collapsing close into WouldBlock would spin.
-            match self.sess.reader().read(slice) {
-                Ok(0) => return Err(()), // clean close_notify
-                Ok(m) => (ptr, len) = q.deliver(m, fd)?,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()), // drained; wait
-                Err(_) => return Err(()),                                     // UnexpectedEof (truncation) etc.
-            }
+/// Drain all currently-available decrypted plaintext into `q`'s own write window.
+fn feed_decrypted(sess: &mut rustls::ServerConnection, q: &mut RecvQueue) -> Result<(), RecvEnd> {
+    loop {
+        let (ptr, len) = q.remaining();
+        // SAFETY: ptr/len are the queue's own write window (its carry, or an
+        // in-flight RecvBuf payload), exclusively ours.
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) };
+        match sess.reader().read(slice) {
+            Ok(0) => return Err(RecvEnd::PeerClosed), // clean close_notify
+            Ok(m) => q.deliver(m)?,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()), // drained; wait
+            Err(_) => return Err(RecvEnd::Protocol),
         }
     }
 }
 
 /// Live-TLS-connection counter guard: constructed only by
-/// [`TlsListener::admit`], which is what makes the count and the cap
-/// inseparable. Stored in `TlsShared`, so the count tracks the session lifetime
-/// exactly (a session-init failure drops it inside `start`; a live session
-/// drops it at full teardown, when the last `Rc<TlsShared>` drops).
+/// [`TlsListener::admit`], so the count and the cap are inseparable, and held in
+/// `TlsShared`, so it drops exactly when the session ends.
 pub(crate) struct ConnCountGuard(Rc<Cell<u32>>);
 
 impl ConnCountGuard {
-    pub(in crate::runtime::tls) fn new(c: Rc<Cell<u32>>) -> Self {
+    fn new(c: Rc<Cell<u32>>) -> Self {
         c.set(c.get() + 1);
         Self(c)
     }
@@ -102,21 +84,17 @@ pub(crate) struct TlsShared {
     reactor: Rc<Reactor>,
     /// The socket and its deframed frames; see `ClientConn` for the fd's lifetime.
     conn: Rc<ClientConn>,
-    state: RefCell<TlsConn>,
+    /// The codec state, and nothing else. Never borrowed across an await.
+    state: RefCell<rustls::ServerConnection>,
     /// Decrements the reactor-thread live-connection counter on teardown.
     _conn_guard: ConnCountGuard,
-    /// Taken only through [`TlsShared::lock_send`]. Teardown never takes it.
+    /// This connection is finished, from whichever end: senders refuse and the
+    /// flusher shuts the socket down and exits.
+    closed: Cell<bool>,
+    /// Held across every ciphertext extraction and send. Teardown never takes it.
     send_mutex: AsyncMutex,
-    /// Ciphertext staging, used under [`SendHeld`].
-    cipher_scratch: RefCell<Vec<u8>>,
     /// Wakes the flusher task.
     flush_tx: chan::Sender<()>,
-}
-
-/// Proof that this connection's `send_mutex` is held, which every ciphertext
-/// extraction and send demands.
-struct SendHeld {
-    _guard: WriteGuard,
 }
 
 /// What every accepted TLS socket wants, set here so the accept loop needs no
@@ -147,25 +125,30 @@ impl TlsShared {
         cfg: Arc<rustls::ServerConfig>,
         conn_guard: ConnCountGuard,
     ) -> Result<Rc<TlsShared>, rustls::Error> {
+        /// rustls's outgoing-buffer limit: what one `writer().write()` accepts, and
+        /// so how much ciphertext one encrypt-and-send turn carries.
+        const SEND_BUFFER_BYTES: usize = 256 * 1024;
+
         // `ServerConnection::new` runs first: on failure the moved-in `fd` and
         // `conn_guard` drop here as this frame unwinds — closing the socket and
         // decrementing the count; on success both live in the returned `TlsShared`.
-        let sess = rustls::ServerConnection::new(cfg)?;
+        let mut sess = rustls::ServerConnection::new(cfg)?;
+        sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
         set_socket_options(fd.as_raw_fd());
         let conn = reactor.client_conn(fd);
         let (flush_tx, flush_rx) = chan::unbounded::<()>();
         let tls = Rc::new(TlsShared {
             reactor,
             conn,
-            state: RefCell::new(TlsConn { sess, closed: false }),
+            state: RefCell::new(sess),
             _conn_guard: conn_guard,
+            closed: Cell::new(false),
             send_mutex: AsyncMutex::default(),
-            cipher_scratch: RefCell::new(Vec::new()),
             flush_tx,
         });
         let ingress = TlsIngress {
             tls: Rc::clone(&tls),
-            cipher: vec![0u8; CIPHER_WINDOW_BYTES].into_boxed_slice(),
+            cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
         };
         tls.reactor.register_conn(&tls.conn, Some(Box::new(ingress)));
         tls.reactor.spawn(flusher(Rc::clone(&tls), flush_rx));
@@ -181,66 +164,47 @@ impl TlsShared {
         self.flush_tx.send(());
     }
 
-    async fn lock_send(&self) -> SendHeld {
-        SendHeld { _guard: self.send_mutex.lock().await }
-    }
-
-    /// Everything rustls has queued, in the scratch buffer.
-    fn extract_ciphertext(&self, _: &SendHeld, c: &mut TlsConn) -> Vec<u8> {
-        let mut out = self.cipher_scratch.take();
-        out.clear();
-        while c.sess.wants_write() {
-            let _ = c.sess.write_tls(&mut out);
+    /// Send everything rustls has queued. Callers hold `send_mutex`, which is
+    /// what keeps records in emission order.
+    async fn flush_records(&self, _: &WriteGuard) -> Result<(), PeerGone> {
+        let mut out = PooledSendBuf(acquire_buf());
+        {
+            let mut sess = self.state.borrow_mut();
+            while sess.wants_write() {
+                let _ = sess.write_tls(&mut out.0);
+            }
         }
-        out
-    }
-
-    /// Send one ciphertext buffer, returning it to `cipher_scratch`.
-    async fn send_cipher(&self, _: &SendHeld, cipher: Vec<u8>) -> i32 {
-        let (rc, back) = self.reactor.send_owned(&self.conn, SendBody::Cipher(cipher)).await;
-        if let SendBody::Cipher(v) = back {
-            self.cipher_scratch.replace(v);
-        }
-        rc
+        self.reactor.send_owned(&self.conn, SendBody::from(out)).await.0
     }
 
     /// Encrypt and send `bytes` under one `send_mutex` hold; rustls sizes the chunks.
-    pub(crate) async fn send_bytes(&self, bytes: &[u8]) -> i32 {
-        let send = self.lock_send().await;
+    pub(crate) async fn send_bytes(&self, bytes: &[u8]) -> Result<(), PeerGone> {
+        let send = self.send_mutex.lock().await;
         let mut off = 0;
         while off < bytes.len() {
-            let cipher = {
-                let mut c = self.state.borrow_mut();
-                if c.closed || self.conn.recv_closed() {
-                    return -1;
+            {
+                let mut sess = self.state.borrow_mut();
+                if self.closed.get() {
+                    return Err(PeerGone);
                 }
-                match c.sess.writer().write(&bytes[off..]) {
-                    // A queue we cannot drain: kill, don't spin.
-                    Ok(0) => return -1,
-                    Ok(n) => off += n,
-                    Err(_) => return -1,
+                match sess.writer().write(&bytes[off..]) {
+                    Ok(n) if n > 0 => off += n,
+                    // rustls short-writes only on a full outgoing buffer, which the
+                    // previous turn's flush emptied: a zero here is a wedged session.
+                    _ => return Err(PeerGone),
                 }
-                self.extract_ciphertext(&send, &mut c)
-            }; // state borrow released before the await
-            if self.send_cipher(&send, cipher).await < 0 {
-                return -1;
             }
+            self.flush_records(&send).await?;
         }
-        bytes.len() as i32
+        Ok(())
     }
 
-    /// Sync and idempotent: the first transition of `closed` queues a
-    /// close_notify and notifies the flusher, which flushes it, shuts the
-    /// socket down and exits.
+    /// Sync and idempotent: the first call queues a close_notify and wakes the flusher.
     pub(crate) fn close(&self) {
-        {
-            let mut c = self.state.borrow_mut();
-            if c.closed {
-                return;
-            }
-            c.closed = true;
-            c.sess.send_close_notify();
+        if self.closed.replace(true) {
+            return;
         }
+        self.state.borrow_mut().send_close_notify();
         self.notify_flusher();
     }
 }
@@ -250,30 +214,33 @@ impl TlsShared {
 /// pipelining pushes ahead of reading its ACKs cannot deadlock it.
 struct TlsIngress {
     tls: Rc<TlsShared>,
-    cipher: Box<[u8]>,
+    cipher: Box<[MaybeUninit<u8>]>,
 }
 
 impl RecvFilter for TlsIngress {
     fn window(&mut self) -> (*mut u8, u32) {
-        (self.cipher.as_mut_ptr(), self.cipher.len() as u32)
+        (self.cipher.as_mut_ptr().cast::<u8>(), self.cipher.len() as u32)
     }
 
-    fn ingest(&mut self, n: usize, q: &mut RecvQueue, fd: i32) -> Result<(), ()> {
+    fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {
         // The queue wakes the waiter itself, and only on a completed frame — a
         // large push therefore parks `connection_loop` once per frame, not once
         // per window of ciphertext.
-        let mut c = self.tls.state.borrow_mut();
-        let result = c.ingest_cipher(&self.cipher[..n], q, fd);
-        if c.sess.wants_write() {
+        let mut sess = self.tls.state.borrow_mut();
+        // SAFETY: `n` counts bytes the completed recv wrote into the window.
+        let cipher = unsafe { self.cipher[..n].assume_init_ref() };
+        let result = ingest_cipher(&mut sess, cipher, q);
+        if sess.wants_write() {
             self.tls.notify_flusher();
         }
         result
     }
 
-    fn recv_closed(&mut self, fd: i32) {
+    fn on_recv_closed(&mut self) {
         // Half-close so a writer parked on a full sndbuf errors out and releases
         // `send_mutex`; without it teardown could wedge behind a stalled sender.
-        shutdown(fd);
+        shutdown(self.tls.conn.fd());
+        self.tls.closed.set(true);
         self.tls.notify_flusher();
     }
 }
@@ -283,32 +250,17 @@ impl RecvFilter for TlsIngress {
 async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
     loop {
         {
-            let send = conn.lock_send().await;
-            let out = {
-                let mut c = conn.state.borrow_mut();
-                conn.extract_ciphertext(&send, &mut c)
-            }; // state borrow released here, before the await
-            if out.is_empty() {
-                conn.cipher_scratch.replace(out);
-            } else {
-                let _ = conn.send_cipher(&send, out).await;
-            }
-        } // released before the teardown checks and before parking on rx
+            let send = conn.send_mutex.lock().await;
+            let _ = conn.flush_records(&send).await;
+        } // released before the teardown check and before parking on rx
 
-        // Half-close: ends a parked recv and errors out a parked send, so
-        // `send_mutex` is always released.
-        let closed = conn.state.borrow().closed;
-        if closed || conn.conn.recv_closed() {
+        // Whatever was queued is out, including a close_notify: finish the socket.
+        if conn.closed.get() {
             shutdown(conn.conn.fd());
-        }
-        // The local close ran, so nothing more will ever be queued for this
-        // connection: exit and release this task's `Rc<TlsShared>`. The socket
-        // closes once the recv filter and the `Peer` have released theirs too.
-        if closed {
             return;
         }
-        // Coalesce a burst of notifications: park on the next, then drain
-        // any that piled up so we make exactly one more flush pass, not N.
+        // The queue is a flag, not a stream: park on the next notification, then
+        // drop whatever piled up behind it.
         rx.recv().await;
         while rx.try_recv().is_some() {}
     }

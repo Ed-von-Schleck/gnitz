@@ -85,7 +85,7 @@ pub(crate) async fn forward_scan(peer: &Peer, lease: &Lease) -> Result<bool, Wir
     for w in lease.workers() {
         let mut train = Train::new(lease, w, "scan");
         while let Some((slot, ctrl)) = train.next().await? {
-            if (ctrl.hdr.flags.has_data || ctrl.hdr.flags.has_schema) && peer.send(slot).await < 0 {
+            if (ctrl.hdr.flags.has_data || ctrl.hdr.flags.has_schema) && peer.send(slot).await.is_err() {
                 return Ok(false);
             }
         }

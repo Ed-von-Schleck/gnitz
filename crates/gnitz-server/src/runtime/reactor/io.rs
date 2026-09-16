@@ -2,6 +2,7 @@
 //! deframer, and the [`ClientConn`] owning a socket and its [`RecvQueue`].
 
 use std::cell::{Cell, RefCell};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -54,10 +55,14 @@ impl InboundBudget {
         InboundBudget { held: Cell::new(0), cap }
     }
 
-    /// Bytes currently held (test observability).
-    #[cfg(test)]
+    /// Bytes currently held.
     pub(super) fn held(&self) -> usize {
         self.held.get()
+    }
+
+    /// The ceiling `held` may not be pushed past.
+    pub(super) fn cap(&self) -> usize {
+        self.cap
     }
 
     /// Charge and allocate one inbound frame payload buffer. Charges
@@ -123,6 +128,34 @@ impl Drop for RecvBuf {
 /// Size of the per-connection read staging buffer.
 const CARRY_BYTES: usize = 32 * 1024;
 
+/// Why a connection's recv side ended. Logged once, where the reactor retires
+/// the connection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RecvEnd {
+    /// EOF, a close sentinel, or a `close_notify`: the peer is done.
+    PeerClosed,
+    /// The recv itself failed (`-ECONNRESET`, `-EBADF`, …).
+    Socket,
+    /// A declared frame payload above the connection's ceiling.
+    Oversize,
+    /// The declared frame's `want` bytes would push the inbound budget past its cap.
+    CapBreach { want: usize },
+    /// The bytes did not parse as this transport's framing.
+    Protocol,
+}
+
+impl RecvEnd {
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            RecvEnd::PeerClosed => "peer closed",
+            RecvEnd::Socket => "socket error",
+            RecvEnd::Oversize => "oversize frame",
+            RecvEnd::CapBreach { .. } => "inbound cap breach",
+            RecvEnd::Protocol => "protocol error",
+        }
+    }
+}
+
 /// The inbound half of one client connection: the deframer, the frames it has
 /// completed, the single task awaiting them, and the recv-closed verdict. Both
 /// transports embed one, so the whole ingress policy is written once.
@@ -130,7 +163,8 @@ pub(crate) struct RecvQueue {
     /// The deframer's staging buffer. One read fills it; every length prefix found
     /// in it allocates its own payload buffer and the bytes behind it move straight
     /// across, so a pipelined run costs one read rather than one per frame.
-    carry: Box<[u8]>,
+    /// Uninitialised: only bytes a completed recv wrote are ever read back.
+    carry: Box<[MaybeUninit<u8>]>,
     /// Bytes at the front of `carry` the parse has not consumed. At most a split
     /// length prefix: [`RecvQueue::deliver`] compacts before it returns.
     filled: usize,
@@ -156,7 +190,7 @@ pub(crate) struct RecvQueue {
 impl RecvQueue {
     pub(crate) fn new(budget: Rc<InboundBudget>) -> Self {
         RecvQueue {
-            carry: vec![0u8; CARRY_BYTES].into_boxed_slice(),
+            carry: Box::new_uninit_slice(CARRY_BYTES),
             filled: 0,
             pending: None,
             max_payload_len: HELLO_PRE_HANDSHAKE_LEN,
@@ -178,7 +212,7 @@ impl RecvQueue {
         }
         // `filled` is at most a split prefix, so this is never empty.
         (
-            unsafe { self.carry.as_mut_ptr().add(self.filled) },
+            unsafe { self.carry.as_mut_ptr().add(self.filled).cast::<u8>() },
             (self.carry.len() - self.filled) as u32,
         )
     }
@@ -192,11 +226,9 @@ impl RecvQueue {
     }
 
     /// Advance by `n` bytes just written into the window, queueing every frame
-    /// they complete — one read can carry a whole pipelined run. Returns the
-    /// window the *next* bytes must land in. `Err` ⇒ the recv side must close:
-    /// oversize frame, cap breach, or the zero-length sentinel; `fd` names the
-    /// connection in the cap-breach log.
-    pub(crate) fn deliver(&mut self, n: usize, fd: i32) -> Result<(*mut u8, u32), ()> {
+    /// they complete — one read can carry a whole pipelined run. The window the
+    /// *next* bytes must land in is [`Self::remaining`], unchanged by an `Err`.
+    pub(crate) fn deliver(&mut self, n: usize) -> Result<(), RecvEnd> {
         let RecvQueue {
             carry,
             filled,
@@ -213,6 +245,8 @@ impl RecvQueue {
         }
         // How much of the carry the parse has consumed.
         let mut cur = 0;
+        // SAFETY: `filled` counts bytes a completed recv wrote into the carry.
+        let init: &[u8] = unsafe { carry[..*filled].assume_init_ref() };
         loop {
             if let Some((buf, mut pos)) = pending.take() {
                 // Whatever the read carried past this frame's length prefix; a
@@ -222,7 +256,7 @@ impl RecvQueue {
                 // and the payload's unfilled tail; the two allocations are
                 // distinct.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(carry.as_ptr().add(cur), buf.ptr.add(pos), take);
+                    std::ptr::copy_nonoverlapping(init.as_ptr().add(cur), buf.ptr.add(pos), take);
                 }
                 pos += take;
                 cur += take;
@@ -238,21 +272,17 @@ impl RecvQueue {
             if *filled - cur < FRAME_LEN_PREFIX_BYTES {
                 break;
             }
-            let hdr: [u8; FRAME_LEN_PREFIX_BYTES] = carry[cur..cur + FRAME_LEN_PREFIX_BYTES].try_into().unwrap();
+            let hdr: [u8; FRAME_LEN_PREFIX_BYTES] = init[cur..cur + FRAME_LEN_PREFIX_BYTES].try_into().unwrap();
             let plen = u32::from_le_bytes(hdr) as usize;
             // Zero is the close sentinel, not a frame.
-            if plen == 0 || plen > *max_payload_len {
-                return Err(());
+            if plen == 0 {
+                return Err(RecvEnd::PeerClosed);
+            }
+            if plen > *max_payload_len {
+                return Err(RecvEnd::Oversize);
             }
             let Some(buf) = budget.alloc(plen) else {
-                gnitz_warn!(
-                    "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
-                    fd,
-                    budget.held.get(),
-                    frame_weight(plen),
-                    budget.cap,
-                );
-                return Err(());
+                return Err(RecvEnd::CapBreach { want: frame_weight(plen) });
             };
             cur += FRAME_LEN_PREFIX_BYTES;
             *pending = Some((buf, 0));
@@ -262,7 +292,7 @@ impl RecvQueue {
         // next window is the rest of the carry.
         carry.copy_within(cur..*filled, 0);
         *filled -= cur;
-        Ok(self.remaining())
+        Ok(())
     }
 
     /// Take a completed frame without parking, beside [`Self::poll_recv`].
@@ -336,10 +366,6 @@ impl ClientConn {
     pub(crate) fn set_max_payload_len(&self, limit: usize) {
         self.q.borrow_mut().set_max_payload_len(limit);
     }
-
-    pub(crate) fn recv_closed(&self) -> bool {
-        self.q.borrow().recv_closed()
-    }
 }
 
 /// What stands between a socket and its `RecvQueue` when the socket's bytes are
@@ -347,11 +373,10 @@ impl ClientConn {
 pub(crate) trait RecvFilter {
     /// Where the next socket bytes land; valid until the recv completes.
     fn window(&mut self) -> (*mut u8, u32);
-    /// `n` bytes landed in the window: queue the frames they complete. `Err`
-    /// ends the recv side.
-    fn ingest(&mut self, n: usize, q: &mut RecvQueue, fd: i32) -> Result<(), ()>;
+    /// `n` bytes landed in the window: queue the frames they complete.
+    fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd>;
     /// The recv side ended.
-    fn recv_closed(&mut self, fd: i32);
+    fn on_recv_closed(&mut self);
 }
 
 #[cfg(test)]

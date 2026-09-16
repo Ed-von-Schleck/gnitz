@@ -5,7 +5,7 @@ use std::os::fd::OwnedFd;
 
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
-use super::io::{ClientConn, RecvFilter};
+use super::io::{ClientConn, RecvEnd, RecvFilter};
 use super::*;
 
 /// A connection with a recv armed on it — the reactor's whole per-connection
@@ -20,7 +20,6 @@ pub(super) struct Armed {
 pub(crate) enum SendBody {
     Pooled(PooledSendBuf),
     Slot(W2mSlot),
-    Cipher(Vec<u8>),
 }
 
 impl SendBody {
@@ -28,7 +27,6 @@ impl SendBody {
         match self {
             SendBody::Pooled(b) => &b.0,
             SendBody::Slot(s) => s.frame_bytes(),
-            SendBody::Cipher(v) => v,
         }
     }
 }
@@ -44,6 +42,11 @@ impl From<W2mSlot> for SendBody {
         SendBody::Slot(s)
     }
 }
+
+/// This client's egress side is finished: a send failed, or the client was
+/// evicted for making no progress.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PeerGone;
 
 /// Client-egress deadline (`GNITZ_CLIENT_SEND_TIMEOUT_MS`): one kernel send making no
 /// progress for this long evicts the client.
@@ -156,33 +159,47 @@ impl Reactor {
         let mut conns = self.inner.conns.borrow_mut();
         let Some(armed) = conns.get_mut(&fd) else { return };
         let mut q = armed.conn.q.borrow_mut();
-        let next = if res <= 0 || q.recv_closed() {
-            Err(())
+        let next = if res < 0 {
+            Err(RecvEnd::Socket)
+        } else if res == 0 || q.recv_closed() {
+            Err(RecvEnd::PeerClosed)
         } else {
             match &mut armed.filter {
-                None => q.deliver(res as usize, fd),
-                Some(f) => f.ingest(res as usize, &mut q, fd).map(|()| f.window()),
+                None => q.deliver(res as usize).map(|()| q.remaining()),
+                Some(f) => f.ingest(res as usize, &mut q).map(|()| f.window()),
             }
         };
         drop(q);
         match next {
             Ok((ptr, len)) => arm_recv(&mut self.inner.ring.borrow_mut(), fd, ptr, len),
-            Err(()) => {
+            Err(end) => {
+                match end {
+                    RecvEnd::PeerClosed => {
+                        gnitz_debug!("reactor: fd={fd} recv side ended: {} (res={res})", end.as_str())
+                    }
+                    RecvEnd::CapBreach { want } => gnitz_warn!(
+                        "reactor: fd={fd} recv side ended: {} (want={} B, held={} B, cap={} B)",
+                        end.as_str(),
+                        want,
+                        self.inner.inbound.held(),
+                        self.inner.inbound.cap(),
+                    ),
+                    _ => gnitz_warn!("reactor: fd={fd} recv side ended: {} (res={res})", end.as_str()),
+                }
                 let mut armed = conns.remove(&fd).expect("entry present");
                 drop(conns);
                 armed.conn.q.borrow_mut().close();
                 if let Some(f) = &mut armed.filter {
-                    f.recv_closed(fd);
+                    f.on_recv_closed();
                 }
             } // `armed` drops: the reactor's hold on the connection ends
         }
     }
 
-    /// Send `body`'s whole byte range on `conn`, returning the bytes sent (>= 0) or a
-    /// negative errno, and `body` back. Loops on short sends; each kernel send has
-    /// its own `Limits::client_send_timeout` deadline, past which the client is
-    /// evicted.
-    pub(crate) async fn send_owned(&self, conn: &ClientConn, mut body: SendBody) -> (i32, SendBody) {
+    /// Send `body`'s whole byte range on `conn`, handing `body` back either way.
+    /// Loops on short sends; each kernel send has its own
+    /// `Limits::client_send_timeout` deadline, past which the client is evicted.
+    pub(crate) async fn send_owned(&self, conn: &ClientConn, mut body: SendBody) -> (Result<(), PeerGone>, SendBody) {
         let (ptr, len) = {
             let b = body.bytes();
             (b.as_ptr(), b.len())
@@ -197,9 +214,13 @@ impl Reactor {
             );
             let mut op = std::pin::pin!(op);
             let deadline = Instant::now() + self.inner.limits.client_send_timeout;
-            let (rc, back) = match select2(op.as_mut(), self.timer(deadline)).await {
-                Either::A(done) => done,
-                // Evicted: `shutdown` errors the send out; a result that raced it counts as failed.
+            let rc = match select2(op.as_mut(), self.timer(deadline)).await {
+                Either::A((rc, back)) => {
+                    body = back.expect("a send carries its body");
+                    rc
+                }
+                // Evicted; a completion that raced the timer still counts as failed.
+                // The CQE is awaited because the kernel may read the carry until it lands.
                 Either::B(()) => {
                     gnitz_warn!(
                         "client fd={} made no send progress for {:?}; evicting",
@@ -207,17 +228,17 @@ impl Reactor {
                         self.inner.limits.client_send_timeout
                     );
                     shutdown(conn.fd());
-                    let (rc, back) = op.await;
-                    (rc.min(-1), back)
+                    let (_, back) = op.await;
+                    return (Err(PeerGone), back.expect("a send carries its body"));
                 }
             };
-            body = back.expect("a send carries its body");
+            // A zero is the kernel accepting nothing, which is not progress either.
             if rc <= 0 {
-                return (if rc < 0 { rc } else { sent as i32 }, body);
+                return (Err(PeerGone), body);
             }
             sent += rc as usize;
         }
-        (sent as i32, body)
+        (Ok(()), body)
     }
 }
 

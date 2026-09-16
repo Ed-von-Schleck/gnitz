@@ -33,7 +33,7 @@ mod test_support;
 mod uring;
 mod wake_queue;
 
-pub(crate) use conn::{shutdown, SendBody};
+pub(crate) use conn::{shutdown, PeerGone, SendBody};
 
 pub(crate) use futures::{worker_error, Lease};
 use futures::{OpFuture, Route, RouteKey, TimerFuture};
@@ -43,7 +43,7 @@ use wake_queue::WakeQueue;
 
 #[cfg(test)]
 pub(crate) use io::InboundBudget;
-pub(crate) use io::{ClientConn, RecvBuf, RecvFilter, RecvQueue};
+pub(crate) use io::{ClientConn, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
 pub use sync::{chan, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard};
 
 /// The ceilings and deadlines a reactor is built with, fixed for its life.

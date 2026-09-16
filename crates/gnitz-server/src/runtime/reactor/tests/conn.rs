@@ -12,7 +12,7 @@ use crate::runtime::test_support::try_poll_once;
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
 /// One whole-payload client send, with nothing racing it.
-async fn owned_send(r: &Reactor, conn: &ClientConn, payload: Vec<u8>) -> i32 {
+async fn owned_send(r: &Reactor, conn: &ClientConn, payload: Vec<u8>) -> Result<(), PeerGone> {
     r.send_owned(conn, SendBody::Pooled(PooledSendBuf(payload))).await.0
 }
 
@@ -60,7 +60,7 @@ fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
 #[test]
 fn send_cqe_wakes_its_waker_and_returns_the_body() {
     let r = make_reactor();
-    r.inner.ops.open(77, Some(SendBody::Cipher(vec![0xAB; 16])));
+    r.inner.ops.open(77, Some(SendBody::Pooled(pooled(&[0xAB; 16]))));
     let mut fut = std::pin::pin!(OpFuture { id: 77, inner: Rc::clone(&r.inner) });
     let waker = make_waker(11);
     let mut cx = Context::from_waker(&waker);
@@ -130,7 +130,7 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
         poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
         "EOF must end the recv side and drop the reactor's entry"
     );
-    assert!(conn.recv_closed());
+    assert!(conn.q.borrow().recv_closed());
     assert!(matches!(try_poll_once(conn.recv()), Some(None)), "recv reports the end");
 
     partner.set_nonblocking(true).expect("nonblocking");
@@ -179,10 +179,9 @@ fn send_owned_loops_until_full_payload_sent_over_socketpair() {
     // would otherwise never return and the whole binary would hang.
     let sent = r.block_on(async move { owned_send(&r2, &conn, payload).await });
     let received = drain_t.join().expect("drain thread");
-    assert_eq!(
-        sent as usize, payload_len,
-        "send_owned must loop on partial CQEs until the full \
-         payload is sent (got rc={sent}, expected {payload_len})"
+    assert!(
+        sent.is_ok(),
+        "send_owned must loop on partial CQEs until the full payload is sent"
     );
     assert_eq!(
         received, payload_len,
@@ -207,10 +206,10 @@ fn send_owned_evicts_a_client_that_never_drains() {
     let payload = vec![0x7Au8; 1024 * 1024];
     let (r2, c2) = (Rc::clone(&r), Rc::clone(&conn));
     let start = Instant::now();
-    let rc = r.block_on(async move { owned_send(&r2, &c2, payload).await });
+    let res = r.block_on(async move { owned_send(&r2, &c2, payload).await });
     let elapsed = start.elapsed();
 
-    assert!(rc < 0, "a client that never drains must be evicted, got rc={rc}");
+    assert!(res.is_err(), "a client that never drains must be evicted");
     assert!(
         elapsed >= TIMEOUT,
         "eviction must wait out the full deadline ({TIMEOUT:?}), took {elapsed:?}"
@@ -263,7 +262,7 @@ fn fanout_coalesced_egress_bench() {
                     let run_per_frame = async |bufs: Vec<PooledSendBuf>| {
                         let t = Instant::now();
                         for buf in bufs {
-                            black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await.0);
+                            let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await.0);
                         }
                         t.elapsed()
                     };
@@ -274,7 +273,7 @@ fn fanout_coalesced_egress_bench() {
                         for _ in 0..w {
                             buf.extend_from_slice(&frame);
                         }
-                        black_box(r2.send_owned(&conn, SendBody::Pooled(PooledSendBuf(buf))).await.0);
+                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(PooledSendBuf(buf))).await.0);
                         t.elapsed()
                     };
                     if i % 2 == 0 {
@@ -384,7 +383,7 @@ fn corked_replies_leave_as_one_send() {
             read_available(&rx, 4096).is_empty(),
             "corking must put nothing on the wire before a flush",
         );
-        assert!(peer.flush_egress().await > 0, "the flush must send");
+        peer.flush_egress().await.expect("the flush must send");
     });
 
     assert_eq!(
@@ -410,7 +409,8 @@ fn a_slot_forward_cannot_overtake_a_corked_reply() {
     let c = corked.clone();
     r.block_on(async move {
         peer.cork(&c);
-        assert!(peer.send(slot).await > 0, "the slot forward must send");
+        peer.send(slot).await.expect("the slot forward must send");
+        assert_eq!(peer.corked_len(), 0, "the slot went out alone, not corked");
     });
 
     let seen = read_available(&receiver, 256 * 1024);
@@ -433,11 +433,13 @@ fn a_small_slot_is_corked_behind_corked_bytes() {
     let corked = vec![0x5Au8; 128];
 
     let (c, rx) = (corked.clone(), Rc::clone(&receiver));
+    let both = corked.len() + slot_bytes.len();
     r.block_on(async move {
         peer.cork(&c);
-        assert_eq!(peer.send(slot).await, 0, "a small slot is corked, not sent");
+        peer.send(slot).await.expect("corking cannot fail");
+        assert_eq!(peer.corked_len(), both, "a small slot is corked, not sent");
         assert!(read_available(&rx, 4096).is_empty(), "nothing is on the wire yet");
-        assert!(peer.flush_egress().await > 0, "the flush must send");
+        peer.flush_egress().await.expect("the flush must send");
     });
 
     let mut expected = corked;
@@ -485,16 +487,11 @@ fn a_full_accumulator_ships_between_messages() {
     let frame = vec![0x3Cu8; 4096];
 
     r.block_on(async move {
-        let mut shipped = 0;
-        while shipped == 0 {
+        while peer.corked_len() < COALESCE_MAX_BYTES {
             peer.cork(&frame);
-            shipped = peer.flush_if_full().await;
         }
-        assert!(
-            shipped as usize >= COALESCE_MAX_BYTES,
-            "the flush ships everything corked, got {shipped}"
-        );
-        assert_eq!(peer.flush_if_full().await, 0, "and leaves nothing pending");
+        peer.flush_if_full().await.expect("the flush must send");
+        assert_eq!(peer.corked_len(), 0, "the flush ships everything corked");
     });
 
     assert!(drain.join().expect("drain") >= COALESCE_MAX_BYTES);

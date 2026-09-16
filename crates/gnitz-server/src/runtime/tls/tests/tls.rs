@@ -53,12 +53,12 @@ fn handshaken_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
     (client, server)
 }
 
-/// A session and the queue it deframes into, whose inbound budget is wide
-/// enough never to trip: the cap is the fd path's to test.
-fn test_conn(sess: rustls::ServerConnection, max_payload_len: usize) -> (TlsConn, RecvQueue) {
+/// The queue a session deframes into, whose inbound budget is wide enough never
+/// to trip: the cap is the fd path's to test.
+fn test_queue(max_payload_len: usize) -> RecvQueue {
     let mut q = RecvQueue::new(Rc::new(InboundBudget::new(usize::MAX)));
     q.set_max_payload_len(max_payload_len);
-    (TlsConn { sess, closed: false }, q)
+    q
 }
 
 /// Client-side: buffer `frames` (each as [len:u32 LE][payload]) as
@@ -100,29 +100,29 @@ fn frame_payloads(q: &mut RecvQueue) -> Vec<Vec<u8>> {
 
 #[test]
 fn pipelined_frames_deframe_in_order() {
-    let (mut client, server) = handshaken_pair();
-    let (mut conn, mut q) = test_conn(server, 1 << 20);
+    let (mut client, mut server) = handshaken_pair();
+    let mut q = test_queue(1 << 20);
 
     let f1 = vec![0xAAu8; 10];
     let f2 = vec![0xBBu8; 100_000]; // spans multiple 16 KiB records
     let f3 = b"tail".to_vec();
     let cipher = encrypt_frames(&mut client, &[&f1, &f2, &f3]);
-    conn.ingest_cipher(&cipher, &mut q, -1).unwrap();
+    ingest_cipher(&mut server, &cipher, &mut q).unwrap();
 
     assert_eq!(frame_payloads(&mut q), vec![f1, f2, f3]);
 }
 
 #[test]
 fn split_ciphertext_delivery_reassembles() {
-    let (mut client, server) = handshaken_pair();
-    let (mut conn, mut q) = test_conn(server, 1 << 20);
+    let (mut client, mut server) = handshaken_pair();
+    let mut q = test_queue(1 << 20);
 
     let payload: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
     let cipher = encrypt_frames(&mut client, &[&payload]);
     // Deliver in awkward chunks (mid-record splits included): a chunk that
     // ends mid-record must leave the session waiting, not close it.
     for chunk in cipher.chunks(1_313) {
-        conn.ingest_cipher(chunk, &mut q, -1).unwrap();
+        ingest_cipher(&mut server, chunk, &mut q).unwrap();
     }
     assert_eq!(frame_payloads(&mut q), vec![payload]);
 }
