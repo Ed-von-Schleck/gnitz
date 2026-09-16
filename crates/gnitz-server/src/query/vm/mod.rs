@@ -238,11 +238,6 @@ pub(in crate::query) struct VmHandle {
     pub(super) pending_ground_row: bool,
 }
 
-// SAFETY: a VmHandle is only accessed from the single worker thread that owns
-// the plan. Its tables and bound cursors hold `Rc`s into the thread's own batch
-// and shard allocations, none of which is shared with another thread.
-unsafe impl Send for VmHandle {}
-
 impl VmHandle {
     /// Open a fresh cursor on every trace register's backing store. Eager rather
     /// than per-instruction, so an operator sees `z⁻¹(I(X))` — the integral

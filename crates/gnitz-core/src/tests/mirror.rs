@@ -35,8 +35,9 @@ const TAG: u64 = 0xFEED;
 enum Ev {
     Register(u64, String),
     Invalidate(u64, Invalidate),
-    /// `(tid, shape, the round the cursor moved to)`.
-    Ingest(u64, Shape, u64),
+    /// `(tid, whether the copy already held a cursor, the round it moved to)` —
+    /// the cursor being what the live store derives the blocks' shape from.
+    Ingest(u64, bool, u64),
 }
 
 #[derive(Clone, Default)]
@@ -94,14 +95,12 @@ impl MirrorStore for StubStore {
         Ok(())
     }
 
-    fn ingest(&mut self, tid: u64, _b: Vec<RawBlock>, shape: Shape, next: DeltaCursor) -> Result<(), MirrorError> {
-        self.log.push(Ev::Ingest(tid, shape, next.tick));
+    fn ingest(&mut self, tid: u64, _b: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError> {
+        // The live store's derivation, over this stub's own cursor map.
+        self.log
+            .push(Ev::Ingest(tid, self.cursors.contains_key(&tid), next.tick));
         self.cursors.insert(tid, next);
         Ok(())
-    }
-
-    fn scan(&mut self, _tid: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
-        Ok(ZSetBatch::new(schema))
     }
 
     fn scan_spec(
@@ -452,7 +451,7 @@ fn no_recovery_runs_before_every_ingest_has() {
     let events = log.take();
     let first_ingest = events
         .iter()
-        .position(|e| matches!(e, Ev::Ingest(t, Shape::Stamped, 11) if *t == alive))
+        .position(|e| matches!(e, Ev::Ingest(t, true, 11) if *t == alive))
         .expect("phase 1 ingested the reply it had");
     let first_teardown = events.iter().position(|e| matches!(e, Ev::Invalidate(..)));
     assert!(
@@ -505,7 +504,7 @@ fn a_reseed_onto_a_live_copy_does_not_erase_it() {
         "the live copy must not be erased: {events:?}",
     );
     assert!(
-        !events.iter().any(|e| matches!(e, Ev::Ingest(8, Shape::Plain, _))),
+        !events.iter().any(|e| matches!(e, Ev::Ingest(8, false, _))),
         "and must not be re-read whole: {events:?}",
     );
     assert!(

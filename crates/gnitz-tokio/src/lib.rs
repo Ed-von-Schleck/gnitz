@@ -190,7 +190,7 @@ impl AsyncClient {
         let local = {
             let mut slot = Arc::clone(&self.client).lock_owned().await;
             if slot.as_ref().is_some_and(|c| c.mirrors(tid)) {
-                blocking(move || slot.as_mut().map_or(Ok(None), |c| c.scan_local(tid))).await??
+                blocking(move || slot.as_mut().expect("held above").scan_local(tid)).await??
             } else {
                 None
             }

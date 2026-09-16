@@ -24,14 +24,6 @@ use crate::handle::{engine, Mirror};
 use crate::register::descriptor_of;
 
 impl Mirror {
-    /// Every row of the copy, decoded under `schema` — the client-side schema
-    /// its registration resolved.
-    pub(crate) fn scan_inner(&mut self, table_id: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
-        let desc = self.registry.relation_or_err(table_id as i64).map_err(engine)?.schema();
-        let batch = self.registry.scan(table_id as i64, None).map_err(engine)?;
-        reply_batch(&batch, &desc, schema)
-    }
-
     /// Run the spec against the copy through the engine's own executor, and reply
     /// through the client's block decoder.
     ///

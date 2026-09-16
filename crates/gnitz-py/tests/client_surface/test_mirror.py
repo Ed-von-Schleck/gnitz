@@ -188,10 +188,10 @@ def test_every_refusal_names_why(client, mirror, schema_name):
 
 
 @pytest.mark.parametrize("case,env", [
-    ("poison", {"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"}),
+    ("erase", {"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"}),
     ("panic", {"GNITZ_INJECT_MIRROR_INGEST_PANIC": "1"}),
 ], ids=["storage-fault", "panicking-apply"])
-def test_a_fault_poisons_the_copy_and_the_process_lives(client, server, schema_name, mirror_dir, case, env):
+def test_a_fault_degrades_one_copy_and_the_process_lives(client, server, schema_name, mirror_dir, case, env):
     """The host process surviving a fault is the whole reason the crate is safe
     to link into someone's application.
 

@@ -195,15 +195,15 @@ fn test_user_sequence_durable_roundtrip() {
 #[test]
 fn test_recover_checkpoint_gen_and_topology() {
     let dir = temp_dir("recover_ckpt_records");
-    let expected_topology = gnitz_store::relation::topology_word(4);
+    let expected_topology = crate::catalog::registry::topology_word(4);
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");
-        assert_eq!(engine.registry().recorded_topology(), 0, "fresh DB has no topology row");
+        assert_eq!(engine.recorded_topology, 0, "fresh DB has no topology row");
         // Boot order: the topology row is written first and its durability
         // rides the following gen bump's system-table flush.
         engine.record_topology(4).unwrap();
-        assert_eq!(engine.registry().recorded_topology(), expected_topology);
+        assert_eq!(engine.recorded_topology, expected_topology);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
         assert_eq!(
             engine.bump_checkpoint_generation().unwrap(),
@@ -218,8 +218,7 @@ fn test_recover_checkpoint_gen_and_topology() {
         "recovered checkpoint generation survives a reopen",
     );
     assert_eq!(
-        engine.registry().recorded_topology(),
-        expected_topology,
+        engine.recorded_topology, expected_topology,
         "recovered topology (worker_count << 32 | STATE_FORMAT) survives a reopen",
     );
     engine.close();

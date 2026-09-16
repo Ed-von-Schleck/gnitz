@@ -92,15 +92,13 @@ pub(crate) enum RecoverySource {
     /// The tail is recovered by replaying the fsynced SAL over the shards loaded
     /// from the manifest at open. Base tables and master system tables.
     SalReplay,
-    /// The relation is rebuilt from its sources, and the ephemeral checkpoint
-    /// round force-persists it with a generation-stamped manifest: view
-    /// operator-trace tables, view output stores, secondary indexes.
+    /// Derived state, force-persisted by the ephemeral checkpoint round with a
+    /// generation-stamped manifest: view operator-trace tables, view output
+    /// stores, secondary indexes.
     Rederive {
         /// The generation a manifest must carry for the open to resume from it
-        /// instead of erasing it. `None` is how a caller whose verdict has more
-        /// to it than the generation — a topology change invalidates every
-        /// rederived relation — says "never resume" without inventing a
-        /// generation no manifest can hold.
+        /// instead of erasing it. `None` says "never resume", for a caller whose
+        /// verdict turns on more than the generation.
         resume_at: Option<u64>,
     },
 }

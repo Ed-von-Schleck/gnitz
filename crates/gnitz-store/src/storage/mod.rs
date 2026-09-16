@@ -33,6 +33,7 @@ mod spill;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 
 use gnitz_foundation::posix_io;
 
@@ -173,6 +174,23 @@ impl Drop for StagedFile {
             unsafe { libc::unlink(self.tmp_path.as_ptr()) };
         }
     }
+}
+
+/// Publish `parts`, concatenated, as `<dir>/<filename>`: staged as a `.tmp`,
+/// `fdatasync`ed, renamed, with the directory fsynced either side of the rename.
+/// An uncommitted [`StagedFile`] unlinks itself, so a failure leaves no `.tmp`.
+/// Mode `0o644`.
+pub fn publish_file_sync(dir: &str, filename: &str, parts: &[&[u8]]) -> Result<(), StorageError> {
+    let staged = StagedFile::create(&cstr(format!("{dir}/{filename}"))?)?;
+    let mut offset = 0u64;
+    for part in parts {
+        staged.file().write_all_at(part, offset)?;
+        offset += part.len() as u64;
+    }
+    staged.sync()?;
+    fsync_dir(dir)?;
+    staged.commit()?;
+    fsync_dir(dir)
 }
 
 /// The suffix [`StagedFile`] stages under — also how startup GC names a stray

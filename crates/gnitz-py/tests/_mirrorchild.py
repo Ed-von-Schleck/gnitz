@@ -22,44 +22,36 @@ def _env():
     return os.environ["MIRROR_DIR"], os.environ["MIRROR_TARGET"], os.environ["MIRROR_SCHEMA"]
 
 
-def poison():
-    """An armed ingest seam poisons the copy, and the process lives on."""
+def erase():
+    """An armed ingest seam erases the copy it was applying to; the store and the
+    process both live on."""
     base, target, sn = _env()
     m = gnitz.connect(target)
     m.mirror_at(base)
     try:
         m.mirror_view(sn, "f")
         raise SystemExit("the armed seam must fail the bootstrap ingest")
-    except gnitz.GnitzMirrorPoisonedError as e:
-        assert isinstance(e, gnitz.GnitzError), "the poison class must stay catchable as GnitzError"
-    assert m.mirror_poisoned is not None, "the client reports what poisoned its copy"
+    except gnitz.GnitzMirrorPoisonedError:
+        raise SystemExit("one copy's fault must not poison the store")
+    except gnitz.GnitzError:
+        pass
+    assert m.mirror_poisoned is None, "the store stays usable"
 
-    # Every call that touches a copy is refused with the same class.
-    for call in (m.poll, m.checkpoint, lambda: m.forget_view(0)):
-        try:
-            call()
-            raise SystemExit("a poisoned copy must refuse this call")
-        except gnitz.GnitzMirrorPoisonedError:
-            pass
+    # Intact, so the calls that span the store still answer.
+    m.poll()
+    m.checkpoint()
 
-    # The bootstrap never finished, so this view has no valid copy — and a read
-    # of one is *delegated*, not refused. That is the whole point of gating on
-    # what the copy holds rather than on whether a store is attached: a poisoned
-    # copy must not take the connection's own reads down with it.
+    # The bootstrap never finished, so this view has no valid copy, and a read of
+    # one is delegated rather than refused.
     [vid] = m.mirrored_ids()
     assert m.mirrors(vid) is False
-    assert rows(m, sn, "SELECT * FROM f"), (
-        "a read the copy cannot answer is delegated, poisoned store or not"
-    )
+    assert rows(m, sn, "SELECT * FROM f"), "a read the copy cannot answer is delegated"
     assert len(m.scan(vid)) > 0, "and so is a scan of it"
     assert rows(m, sn, "SELECT * FROM t")
 
-    # `close_mirror` is the only way out of a poison, and it keeps the
-    # connection: the copy goes, the directory is released, and the client can
-    # attach again. Reopening `base` from a second client is what proves the lock
-    # came back.
+    # The copy goes, the directory is released, and the client can attach again;
+    # reopening `base` from a second client checks the lock came back.
     m.close_mirror()
-    assert m.mirror_poisoned is None, "the poison went with the store"
     second = gnitz.connect(target)
     second.mirror_at(base)
     second.close()
@@ -131,4 +123,4 @@ def crash():
 
 
 if __name__ == "__main__":
-    {"poison": poison, "panic": panic, "crash": crash}[sys.argv[1]]()
+    {"erase": erase, "panic": panic, "crash": crash}[sys.argv[1]]()

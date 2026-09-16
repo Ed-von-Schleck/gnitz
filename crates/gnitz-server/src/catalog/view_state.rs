@@ -75,7 +75,7 @@ impl CatalogEngine {
     /// phase 2 propagates invalidity to any view scanning an invalid source,
     /// following scan edges forward from every locally invalid view.
     pub(crate) fn compute_invalid_views(&mut self) {
-        let topo_valid = self.registry.topology_matches();
+        let topo_valid = self.topology_matches();
 
         let view_ids = self.registry.view_ids();
         // A worker-count or STATE_FORMAT change re-shapes every keyed store, so no

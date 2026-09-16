@@ -1,5 +1,4 @@
 use super::*;
-use gnitz_foundation::env::env_num;
 use gnitz_wire::sys_rows::{
     write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, TableTabRow,
 };
@@ -38,13 +37,8 @@ impl CatalogEngine {
         // Every store this process opens — the system tables here, every
         // relation and index through the registry, every view's operator scratch
         // through the compiler — is tuned by this one value, read from the
-        // environment once. `env_num` refuses a zero and an unparseable value.
-        let defaults = StoreConfig::default();
-        let config = StoreConfig {
-            ram_tier_bytes: env_num("GNITZ_RAM_TIER_BYTES", defaults.ram_tier_bytes),
-            scan_chunk_rows: env_num("GNITZ_SCAN_CHUNK_ROWS", defaults.scan_chunk_rows),
-            adhoc_group_cap: env_num("GNITZ_ADHOC_GROUP_CAP", defaults.adhoc_group_cap),
-        };
+        // environment once under the server's own `GNITZ_` namespace.
+        let config = StoreConfig::from_env("GNITZ_");
 
         let mut engine = CatalogEngine {
             registry: RelationRegistry::new(Slot::new(0, num_workers), config),
@@ -58,6 +52,7 @@ impl CatalogEngine {
             next_index_id: FIRST_USER_INDEX_ID,
             user_sequences: std::collections::HashMap::new(),
             durable_generation: 0,
+            recorded_topology: 0,
             invalid_views: rustc_hash::FxHashSet::default(),
             pending_broadcasts: Vec::new(),
         };
@@ -199,7 +194,7 @@ impl CatalogEngine {
                 // `observe_user_sequence` ignores, so they never leak into
                 // `user_sequences`.
                 SEQ_ID_CHECKPOINT_GEN => self.durable_generation = self.durable_generation.max(val as u64),
-                SEQ_ID_TOPOLOGY => self.registry.set_recorded_topology(val as u64),
+                SEQ_ID_TOPOLOGY => self.recorded_topology = val as u64,
                 // User-table SERIAL sequence (seq_id == table_id ≥
                 // FIRST_USER_TABLE_ID). Store the high-water; next id =
                 // high_water + 1. `observe_user_sequence` ignores a stray
@@ -208,6 +203,10 @@ impl CatalogEngine {
                 other => self.observe_user_sequence(other, val),
             }
         });
+        // Before `replay_catalog`'s register hooks, which read the verdict through
+        // `rederive_source`. A fresh DB writes no topology row, so the verdict is
+        // `false` and its views rebuild.
+        self.registry.set_resume_enabled(self.topology_matches());
     }
 
     // -- Replay catalog (recovery) -----------------------------------------

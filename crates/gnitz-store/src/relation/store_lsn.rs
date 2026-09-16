@@ -61,6 +61,9 @@ impl RelationRegistry {
             "rehome runs once per process, on a process that still owns its stores",
         );
         let previous = std::mem::replace(&mut self.slot, slot);
+        // A rehome moves between ranks of one layout, never between layouts: a
+        // host latches its resume verdict against this count once.
+        debug_assert_eq!(previous.of, slot.of, "rehome must keep the launched worker count");
         self.residency = Residency::Worker;
         // The master's system-family stores stay open here and replay the same
         // catalog deltas, but only the master writes `_sys/` shards.

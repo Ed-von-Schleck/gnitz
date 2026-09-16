@@ -26,6 +26,19 @@ impl CatalogEngine {
         &mut self.registry
     }
 
+    /// `worker_count << 32 | STATE_FORMAT` for the count this process launched
+    /// with — what a persisted record of derived state must carry to be honoured.
+    pub(in crate::catalog) fn launched_topology(&self) -> u64 {
+        super::registry::topology_word(self.registry.slot().of)
+    }
+
+    /// Whether persisted derived state was written under this boot's topology.
+    /// Half of every resume verdict, and what the registry's `resume_enabled` is
+    /// latched from.
+    pub(crate) fn topology_matches(&self) -> bool {
+        self.recorded_topology == self.launched_topology()
+    }
+
     /// Both halves at once, proven disjoint here rather than asserted at each
     /// caller. The epoch entries need it: they read the plan cache while
     /// ingesting into the registry.

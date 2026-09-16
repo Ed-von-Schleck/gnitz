@@ -35,7 +35,7 @@ pub use gnitz_wire::{
     validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, ReindexSlot, RelClass, TableProps,
     FIRST_USER_TABLE_ID, TABLE_TAB,
 };
-pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape};
+pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::{
     native_le_key, opk_key_cols, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn,
     PkBuf, PkColumn, ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch,

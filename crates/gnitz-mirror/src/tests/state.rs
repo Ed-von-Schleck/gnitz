@@ -40,13 +40,13 @@ fn one_cursor() -> Option<DeltaCursor> {
 /// Put `bytes` back and read them.
 fn reread(dir: &str, bytes: &[u8]) -> Option<PersistedState> {
     std::fs::write(path(dir), bytes).unwrap();
-    read_state(dir)
+    read_state(dir).map(|(state, _)| state)
 }
 
 #[test]
 fn a_round_trip_keeps_the_generation_the_record_and_its_cursor() {
     let (dir, _) = written("round_trip", one_cursor());
-    let state = read_state(&dir).expect("the file just written reads back");
+    let (state, _) = read_state(&dir).expect("the file just written reads back");
     assert_eq!(state.generation, 9);
     assert_eq!(
         state.records,
@@ -61,7 +61,7 @@ fn a_round_trip_keeps_the_generation_the_record_and_its_cursor() {
 #[test]
 fn a_registration_written_without_a_cursor_reads_back_without_one() {
     let (dir, _) = written("no_cursor", None);
-    let state = read_state(&dir).expect("a record with no cursor is still a record");
+    let (state, _) = read_state(&dir).expect("a record with no cursor is still a record");
     assert_eq!(
         state.records.get(&7).map(|r| r.cursor),
         Some(None),

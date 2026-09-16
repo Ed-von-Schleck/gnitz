@@ -704,8 +704,8 @@ fn only_a_fed_view_can_be_mirrored() {
     assert!(e.contains("keeps no delta feed"), "{e}");
 }
 
-/// A storage fault reaches the host as an error and poisons the handle, rather
-/// than ending the process.
+/// A storage fault reaches the host as an error and degrades one copy; the
+/// process and the store both live.
 ///
 /// This is the acceptance test for making the engine safe to link, and it drives
 /// the `Err` channel — the one that holds in both build profiles. The seam
@@ -724,7 +724,7 @@ fn a_storage_fault_does_not_kill_the_host() {
     let (server, dir) = child_fixture();
 
     run_child(
-        "poisons_on_a_storage_fault_child",
+        "a_storage_fault_degrades_one_copy_child",
         &server,
         &dir,
         &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")],
@@ -732,24 +732,47 @@ fn a_storage_fault_does_not_kill_the_host() {
     );
 }
 
-/// Runs only in the child the test above spawns.
+/// Runs only in the child the test above spawns. The armed fault fails every
+/// store ingest in this process, so no sibling copy survives here;
+/// `tests/store.rs` covers that.
 #[test]
-fn poisons_on_a_storage_fault_child() {
+fn a_storage_fault_degrades_one_copy_child() {
     let Some((sock, dir)) = child_target() else { return };
+    let mut direct = GnitzClient::connect(&sock).unwrap();
     let mut mirror = mirroring_client(&sock, &dir);
     let err = mirror
         .mirror_view("s", "v_keyed")
         .expect_err("the armed seam must fail the bootstrap ingest");
     assert!(
-        matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
-        "an ingest fault must poison the store: {err}",
+        !matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
+        "an ingest fault damages one copy, so it must not poison the store: {err}",
     );
-    assert!(mirror.mirror_poisoned().is_some());
-    // Every subsequent call is refused rather than answering off a copy with a
-    // hole in it.
-    assert!(mirror.poll_mirror().is_err());
-    assert!(mirror.checkpoint_mirror().is_err());
-    // And the drop checkpoints nothing.
+    assert!(mirror.mirror_poisoned().is_none(), "the handle stays usable");
+
+    // The copy was erased, so the read is delegated rather than answered off a
+    // copy with a hole in it.
+    let [tid] = mirror.mirrored_ids()[..] else {
+        panic!("the failed ingest must leave exactly its own registration behind")
+    };
+    assert!(!mirror.mirrors(tid), "an erased copy is not answered locally");
+    let local = query(&mut mirror, "s", "SELECT * FROM v_keyed");
+    let remote = query(&mut direct, "s", "SELECT * FROM v_keyed");
+    assert_same_zset(
+        "the read must be delegated, not answered off the erased copy",
+        (&local.0, &local.1),
+        (&remote.0, &remote.1),
+    );
+
+    // The store is intact, so it still publishes.
+    mirror
+        .checkpoint_mirror()
+        .expect("a store with one erased copy is still safe to publish");
+    // A poll succeeds at the call level, with that view's failure inside.
+    let report = mirror.poll_mirror().expect("a per-view fault is not the call's");
+    assert!(
+        report.iter().all(|o| !o.result.reseeded()),
+        "the armed seam refuses every re-bootstrap too: {report:?}",
+    );
     drop(mirror);
     println!("{CHILD_OK}");
 }
@@ -1957,6 +1980,43 @@ fn delegation_is_correct_for_every_read_shape() {
         compared > 300,
         "the delegated differential compared only {compared} rows"
     );
+}
+
+/// The mirror reads every `StoreConfig` knob, not just the RAM tier.
+///
+/// `adhoc_group_cap` bounds the fold fallibly, so a copy ignoring it fails a wide
+/// `GROUP BY` with no knob to turn. Driven by lowering the cap.
+#[test]
+fn a_mirrored_group_by_honours_the_group_cap() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    // `b` is `a % 7`, so this folds seven groups.
+    let grouped = "SELECT b, COUNT(*) AS n FROM v_keyed GROUP BY b";
+    fx.mirror_both();
+    fx.quiesce();
+    fx.differential("s", grouped);
+
+    // A cap below the group count: the local fold refuses.
+    {
+        fx.mirror = None;
+        let _cap = EnvVar::set("GNITZ_MIRROR_ADHOC_GROUP_CAP", "3");
+        fx.open();
+        fx.mirror_both();
+        fx.quiesce();
+        let err = SqlPlanner::new(fx.mirror.as_mut().unwrap(), "s")
+            .execute(grouped)
+            .expect_err("seven groups must not fit a cap of three");
+        assert!(!err.to_string().is_empty(), "the refusal must say something: {err}");
+    }
+
+    // Raised past the group count, the same read answers what the server does.
+    fx.mirror = None;
+    let _cap = EnvVar::set("GNITZ_MIRROR_ADHOC_GROUP_CAP", "4096");
+    fx.open();
+    fx.mirror_both();
+    fx.quiesce();
+    fx.differential("s", grouped);
 }
 
 /// A failing checkpoint is reported, and the handle survives it.

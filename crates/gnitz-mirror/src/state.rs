@@ -16,7 +16,6 @@
 //! every weight while the row set stays identical.
 
 use std::collections::HashMap;
-use std::io::Write;
 
 use gnitz_core::{DeltaCursor, MirrorError};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
@@ -70,13 +69,14 @@ pub(crate) struct PersistedState {
     pub(crate) records: HashMap<u64, MirrorRecord>,
 }
 
-/// Read the state file, or `None`.
+/// Read the state file: the state, and the body bytes it was decoded from. A
+/// checkpoint compares its own encoding against those bytes.
 ///
 /// `None` on any of: an absent file, a short one, a block the codec refuses —
 /// a version, extent or checksum mismatch — or bytes past the block's end. The
 /// caller then resumes nothing and reclaims the whole copies tree —
 /// conservative in the one direction that is never wrong.
-pub(crate) fn read_state(base_dir: &str) -> Option<PersistedState> {
+pub(crate) fn read_state(base_dir: &str) -> Option<(PersistedState, Vec<u8>)> {
     let bytes = std::fs::read(path(base_dir)).ok()?;
     if bytes.len() < HEADER_LEN {
         return None;
@@ -101,10 +101,12 @@ pub(crate) fn read_state(base_dir: &str) -> Option<PersistedState> {
             },
         );
     }
-    Some(PersistedState {
+    let state = PersistedState {
         generation: read_u64_le(&bytes, 0),
         records,
-    })
+    };
+    // The remainder, by the length check above.
+    Some((state, bytes[HEADER_LEN..].to_vec()))
 }
 
 /// The records as the file's body: one [`STATE_SCHEMA`] row per relation, as a
@@ -135,26 +137,14 @@ pub(crate) fn encode_records(records: &HashMap<u64, MirrorRecord>) -> Vec<u8> {
     bb.finish().encode_to_wire_vec(0, true)
 }
 
-/// Replace the state file atomically: write a temp, `fdatasync` it, rename it
-/// into place, then fsync the directory so the rename itself is durable.
-/// `block` is [`encode_records`]'s output.
+/// Replace the state file atomically. `block` is [`encode_records`]'s output,
+/// written as a second part rather than concatenated onto the header.
+///
+/// Staged through the storage layer so an uncommitted `.tmp` is unlinked: this
+/// file sits at `base_dir`, which no sweep walks.
 pub(crate) fn write_state(base_dir: &str, generation: u64, block: &[u8]) -> Result<(), MirrorError> {
-    let mut buf = generation.to_le_bytes().to_vec();
-    buf.extend_from_slice(block);
-
-    let final_path = path(base_dir);
-    let tmp_path = format!("{final_path}.tmp");
-    let io = |what: &str, e: std::io::Error| MirrorError::Engine(format!("mirror state file: {what}: {e}"));
-    {
-        let mut f = std::fs::File::create(&tmp_path).map_err(|e| io("create", e))?;
-        f.write_all(&buf).map_err(|e| io("write", e))?;
-        f.sync_data().map_err(|e| io("fdatasync", e))?;
-    }
-    std::fs::rename(&tmp_path, &final_path).map_err(|e| io("rename", e))?;
-    // The rename is a directory entry, i.e. metadata, so it needs a full `fsync`
-    // of the directory rather than the `sync_data` above.
-    gnitz_store::storage::fsync_dir(base_dir)
-        .map_err(|e| MirrorError::Engine(format!("mirror state file: directory fsync: {e}")))
+    gnitz_store::storage::publish_file_sync(base_dir, STATE_FILENAME, &[&generation.to_le_bytes(), block])
+        .map_err(|e| MirrorError::Engine(format!("mirror state file: {e}")))
 }
 
 fn path(base_dir: &str) -> String {

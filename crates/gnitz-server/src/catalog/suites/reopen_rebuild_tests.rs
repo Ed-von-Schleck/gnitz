@@ -284,7 +284,7 @@ fn index_rebuild_is_skipped_after_resume() {
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
-        engine.registry().topology_matches() && engine.registry().resume_generation() == g,
+        engine.topology_matches() && engine.registry().resume_generation() == g,
         "a matching topology leaves the recovered generation as the whole verdict"
     );
     assert_eq!(
@@ -313,7 +313,7 @@ fn index_rebuild_forced_by_topology_change() {
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
-        !engine.registry().topology_matches(),
+        !engine.topology_matches(),
         "a foreign topology must refuse every manifest"
     );
     assert!(

@@ -4,7 +4,7 @@
 //! The seam sits at the **store**, not at the read surface. [`GnitzClient`] owns
 //! the copy and delegates the reads it does not hold; the copy answers questions
 //! about itself and never about a connection. So the trait below carries the
-//! store's own lifecycle and two reads, and everything that resolves a name,
+//! store's own lifecycle and one read, and everything that resolves a name,
 //! drives the feed or classifies a failure is the client's — [`GnitzClient`]'s
 //! mirror methods and the state machine at the bottom of this file.
 //!
@@ -80,14 +80,12 @@ pub trait MirrorStore: Send {
     /// the store does not hold is `Ok(())`.
     fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError>;
 
-    /// Apply `blocks` to `tid`'s copy under `shape`, then advance its cursor to
-    /// `next`.
-    fn ingest(&mut self, tid: u64, blocks: Vec<RawBlock>, shape: Shape, next: DeltaCursor) -> Result<(), MirrorError>;
-
-    /// Every row of `tid`'s copy, decoded under `schema` — the client-side schema
-    /// its registration resolved, hidden columns included: the whole-copy read
-    /// the client's `scan_local` verb asks for.
-    fn scan(&mut self, tid: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError>;
+    /// Apply `blocks` to `tid`'s copy, then advance its cursor to `next`.
+    ///
+    /// The blocks' shape is read off the copy's cursor: plain rows for a copy
+    /// holding none, round-stamped rows for one that kept it. Mismatching that
+    /// decodes against the wrong schema.
+    fn ingest(&mut self, tid: u64, blocks: Vec<RawBlock>, next: DeltaCursor) -> Result<(), MirrorError>;
 
     /// Run `spec` against `tid`'s copy, replying under `reply_schema`.
     fn scan_spec(
@@ -122,17 +120,6 @@ pub trait MirrorStore: Send {
     fn poisoned(&self) -> Option<&str>;
 }
 
-/// Which reply shape a train of blocks carries. The bytes do not say; the caller
-/// does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Shape {
-    /// A bootstrap's: the view's own rows, in the view's own schema.
-    Plain,
-    /// A poll's: the delta store's rows, keyed by the round number prepended to
-    /// the view's key.
-    Stamped,
-}
-
 /// How far to tear a mirrored relation down. **A ladder: each level does
 /// everything the level above it does, and then more**, which is what makes "a
 /// cursor never outlives its copy" structural rather than a rule a caller has to
@@ -161,9 +148,8 @@ pub enum MirrorError {
     /// registry rejected, a read the spec could not express.
     Engine(String),
     /// The store is poisoned and refuses every further call that touches a copy.
-    /// A delta that did not reach the store leaves a hole the cursor would step
-    /// over, so continuing would answer reads off a copy that is silently
-    /// missing rows. The message names what poisoned it.
+    /// Raised for a teardown that could not erase the copy it was clearing, and
+    /// for a panic caught mid-call. A failed ingest erases that copy instead.
     ///
     /// [`GnitzClient::close_mirror`] is the only recovery.
     Poisoned(String),
@@ -284,7 +270,7 @@ impl MirrorState {
     ) -> Result<PollResult, ClientError> {
         let (blocks, at) = fetched?;
         let next = prev.advanced_to(at)?;
-        self.store.ingest(tid, blocks, Shape::Stamped, next)?;
+        self.store.ingest(tid, blocks, next)?;
         Ok(PollResult::Advanced)
     }
 }
@@ -489,7 +475,7 @@ impl GnitzClient {
         let view_schema = ReplySchema::new(Arc::clone(&self.mirrored_view(tid)?.desc.schema), tid);
         let (blocks, cursor) = self.delta_bootstrap_raw(tid, &view_schema)?;
         let m = self.mirror_state()?;
-        m.store.ingest(tid, blocks, Shape::Plain, cursor)?;
+        m.store.ingest(tid, blocks, cursor)?;
         m.owed_reseed.insert(tid);
         Ok((tid, PollResult::Reseeded))
     }

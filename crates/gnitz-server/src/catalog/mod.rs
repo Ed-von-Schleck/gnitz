@@ -135,6 +135,9 @@ pub(crate) struct CatalogEngine {
     /// what the next `advance_sequence` must retract, and the floor the next
     /// bump raises. Recovered at boot (0 on a fresh DB).
     pub(in crate::catalog) durable_generation: u64,
+    /// The topology word durably recorded in `SEQ_ID_TOPOLOGY`, `0` on a fresh DB
+    /// — which no real word can equal. Half of every resume verdict.
+    pub(in crate::catalog) recorded_topology: u64,
     /// View ids whose checkpointed state — output stores and operator traces
     /// alike — was rejected at boot (generation mismatch, topology change, or a
     /// transitively-invalid source view) and must

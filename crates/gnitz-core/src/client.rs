@@ -681,7 +681,8 @@ impl GnitzClient {
             return Ok(None);
         };
         let schema = Arc::clone(&view.desc.schema);
-        let batch = store.scan(table_id, &schema)?;
+        let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
+        let batch = store.scan_spec(table_id, spec, &schema)?;
         Ok(Some(ScanReply { schema, batch, lsn: None }))
     }
 

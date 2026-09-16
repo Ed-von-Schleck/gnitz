@@ -66,10 +66,15 @@ impl Mirror {
     }
 }
 
+/// The engine descriptor a wire schema block denotes. Shared by a record
+/// replayed at open and a `Schema` a registration resolved.
+pub(crate) fn descriptor_of_block(block: &[u8]) -> Result<SchemaDescriptor, MirrorError> {
+    gnitz_store::schema::decode_schema_block(block)
+        .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))
+}
+
 /// The engine descriptor a client `Schema` denotes, through the shared codec —
 /// so neither end is a second spelling of the block's rules.
 pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorError> {
-    let block = gnitz_core::protocol::codec::encode_schema_block(schema, 0);
-    gnitz_store::schema::decode_schema_block(&block)
-        .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))
+    descriptor_of_block(&gnitz_core::protocol::codec::encode_schema_block(schema, 0))
 }

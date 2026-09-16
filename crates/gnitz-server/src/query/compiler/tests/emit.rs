@@ -642,7 +642,7 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
     // wrong reason.
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry.set_resume_generation(G);
-    registry.set_recorded_topology(registry.launched_topology());
+    registry.set_resume_enabled(true);
     registry
         .register(
             RelationSpec {

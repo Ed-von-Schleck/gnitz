@@ -5,6 +5,18 @@
 
 use super::*;
 
+/// Operator-state format version. Bump on any change to an operator-state
+/// schema; a mismatch marks every Rederive view invalid at boot. Shard and
+/// manifest layout carry their own version words.
+const STATE_FORMAT: u32 = 8;
+
+/// The durable topology word recorded in `_sequences` ([`SEQ_ID_TOPOLOGY`]):
+/// `(worker_count << 32) | STATE_FORMAT`. One packer, shared by the boot-time
+/// recorder and the resume-verdict validator.
+pub(in crate::catalog) fn topology_word(worker_count: u32) -> u64 {
+    ((worker_count as u64) << 32) | STATE_FORMAT as u64
+}
+
 /// The one place COL_TAB column records become a `SchemaDescriptor`, and the
 /// front door for the whole relation-admissibility rule set: every rule
 /// [`check_col_defs`] and [`validate_pk_against_cols`] state, duplicate visible
@@ -328,18 +340,17 @@ impl CatalogEngine {
         batch
     }
 
-    /// Record the cluster topology (`worker_count << 32 | STATE_FORMAT`) in
-    /// `_sequences` (seq id 5). Idempotent: a same-topology restart already
-    /// holds the current value, so the write is skipped. Does not flush — the
-    /// server's caller (`boot_checkpoint`) bumps the checkpoint generation right
-    /// after, and that flush carries this row to the same shard.
+    /// Record the cluster topology in `_sequences` (seq id 5) and latch the
+    /// registry's resume verdict from it. Idempotent. Does not flush — the
+    /// caller's following generation bump carries this row to the same shard.
     pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), StoreError> {
-        let value = gnitz_store::relation::topology_word(worker_count);
-        if self.registry.recorded_topology() == value {
+        let value = topology_word(worker_count);
+        if self.recorded_topology == value {
             return Ok(());
         }
         self.advance_sequence(SEQ_ID_TOPOLOGY, value as i64)?;
-        self.registry.set_recorded_topology(value);
+        self.recorded_topology = value;
+        self.registry.set_resume_enabled(value == self.launched_topology());
         Ok(())
     }
 }

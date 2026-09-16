@@ -9,13 +9,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, TypeCode};
+use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, TypeCode, ZSetBatch};
 use gnitz_mirror::Mirror;
+use gnitz_store::relation::{relation_dir, RelationKind};
 use gnitz_store::schema::make_delta_schema;
-use gnitz_store::storage::Batch;
+use gnitz_store::storage::{Batch, ChildAddr, Slot};
 use gnitz_store_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
+use gnitz_wire::{ReadBound, ReadSpec};
 
 /// Every test in this binary takes this lock: `cargo test` runs a target's tests
 /// as threads of one process, and a store open touches process-wide state — the
@@ -92,7 +94,7 @@ fn registered(name: &str) -> (Mirror, String) {
 /// only in payload onto one entry, and would let a payload the round-stamp strip
 /// mangled pass unnoticed — the keys and their weights would still line up.
 fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
-    let batch = store.scan(tid, &view_schema()).expect("a scan of a held copy");
+    let batch = whole_copy(store, tid).expect("a scan of a held copy");
     let vals = &batch.payload[0].bytes;
     let mut out = BTreeMap::new();
     for row in 0..batch.weights.len() {
@@ -104,8 +106,48 @@ fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
     out
 }
 
-/// The `MirrorStore` bound the client's `Box<dyn MirrorStore>` needs, and the
-/// whole reason `handle.rs` carries an `unsafe impl`.
+/// Every row of the copy, through the unbounded spec `scan_local` sends.
+fn whole_copy(store: &mut Mirror, tid: u64) -> Result<ZSetBatch, MirrorError> {
+    store.scan_spec(tid, ReadSpec::all_rows(ReadBound::None), &view_schema())
+}
+
+/// One copy's directory, through the engine's own path grammar.
+fn copy_dir(base_dir: &str, tid: u64) -> String {
+    relation_dir(base_dir, RelationKind::View, tid as i64)
+}
+
+/// Whether `tid`'s copy currently has a published manifest — the on-disk
+/// difference between a checkpointed store and one that never published.
+fn has_manifest(base_dir: &str, tid: u64) -> bool {
+    std::path::Path::new(&ChildAddr::worker(Slot::SOLO).manifest(&copy_dir(base_dir, tid))).exists()
+}
+
+/// Two registered copies, one row each at round 4, checkpointed and closed.
+/// Returns the directory.
+fn two_checkpointed_copies(name: &str) -> String {
+    let dir = scratch_dir("mirror_store", name);
+    let mut store = Mirror::open(&dir).expect("a fresh store");
+    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+    store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
+    store.ingest(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+    store.ingest(OTHER_TID, plain(&[(9, 1, 90)]), cursor(4)).unwrap();
+    store.checkpoint().unwrap();
+    dir
+}
+
+/// Make `tid`'s copy refuse to open: a regular file where its per-worker child
+/// directory belongs. The copy's own directory stays a directory, so a sweep can
+/// still remove it.
+fn block_copy(base_dir: &str, tid: u64) {
+    let child = ChildAddr::worker(Slot::SOLO).dir(&copy_dir(base_dir, tid));
+    std::fs::remove_dir_all(&child).expect("the copy's child directory");
+    std::fs::write(&child, b"not a directory").expect("block the child path");
+}
+
+/// The `MirrorStore` bound the client's `Box<dyn MirrorStore>` needs.
+///
+/// Passes while the `unsafe impl` exists, whatever is behind it: a later
+/// `pub fn` returning an `Rc` breaks soundness and still compiles here.
 #[test]
 fn the_store_is_send() {
     fn assert_send<T: Send>() {}
@@ -119,9 +161,7 @@ fn a_registration_stands_and_a_moved_name_retracts_the_incumbent() {
     let _g = serial();
     let (mut store, _dir) = registered("registration");
 
-    store
-        .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
-        .unwrap();
+    store.ingest(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
     store
         .register(TID, SCHEMA, "v", &view_schema())
         .expect("a second registration");
@@ -140,7 +180,7 @@ fn a_registration_stands_and_a_moved_name_retracts_the_incumbent() {
         "a retracted registration takes its cursor with it, or the next poll \
          delivers onto an erased copy and loses everything below its round",
     );
-    assert!(store.scan(TID, &view_schema()).is_err(), "and its copy is gone");
+    assert!(whole_copy(&mut store, TID).is_err(), "and its copy is gone");
 }
 
 /// The ladder, level by level: each does everything the level above it does, and
@@ -155,15 +195,13 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
     let _g = serial();
     for (level, want) in [(Invalidate::Cursor, 2usize), (Invalidate::Copy, 0)] {
         let (mut store, _dir) = registered(&format!("ladder_{level:?}"));
-        store
-            .ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), Shape::Plain, cursor(4))
-            .unwrap();
+        store.ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
         assert_eq!(held(&mut store, TID).len(), 2);
 
         store.invalidate(TID, level).unwrap();
         assert_eq!(store.cursor_of(TID), None, "{level:?} drops the cursor");
 
-        store.ingest(TID, Vec::new(), Shape::Plain, cursor(4)).unwrap();
+        store.ingest(TID, Vec::new(), cursor(4)).unwrap();
         assert_eq!(
             held(&mut store, TID).len(),
             want,
@@ -172,16 +210,12 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
     }
 
     let (mut store, _dir) = registered("ladder_registration");
-    store
-        .ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), Shape::Plain, cursor(4))
-        .unwrap();
+    store.ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
     store.invalidate(TID, Invalidate::Registration).unwrap();
     assert_eq!(store.cursor_of(TID), None);
-    assert!(store.scan(TID, &view_schema()).is_err(), "the copy is gone");
+    assert!(whole_copy(&mut store, TID).is_err(), "the copy is gone");
     assert!(
-        store
-            .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(5))
-            .is_err(),
+        store.ingest(TID, plain(&[(1, 1, 10)]), cursor(5)).is_err(),
         "and so is the registration that named its shape",
     );
     store
@@ -198,13 +232,11 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
 fn an_ingest_applies_before_it_advances() {
     let _g = serial();
     let (mut store, _dir) = registered("ingest");
-    store
-        .ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), Shape::Plain, cursor(4))
-        .unwrap();
+    store.ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
     assert_eq!(store.cursor_of(TID), Some(cursor(4)));
 
     store
-        .ingest(TID, stamped(5, &[(1, 1, 10), (3, 1, 30)]), Shape::Stamped, cursor(5))
+        .ingest(TID, stamped(5, &[(1, 1, 10), (3, 1, 30)]), cursor(5))
         .unwrap();
     assert_eq!(store.cursor_of(TID), Some(cursor(5)));
     assert_eq!(
@@ -229,12 +261,8 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
         let mut store = Mirror::open(&dir).expect("a fresh store");
         store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
         store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
-        store
-            .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
-            .unwrap();
-        store
-            .ingest(OTHER_TID, plain(&[(9, 1, 90)]), Shape::Plain, cursor(4))
-            .unwrap();
+        store.ingest(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
+        store.ingest(OTHER_TID, plain(&[(9, 1, 90)]), cursor(4)).unwrap();
         store.checkpoint().unwrap();
     }
     {
@@ -245,9 +273,7 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
             "both positions came back",
         );
         store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
-        store
-            .ingest(TID, stamped(5, &[(1, 1, 10)]), Shape::Stamped, cursor(5))
-            .unwrap();
+        store.ingest(TID, stamped(5, &[(1, 1, 10)]), cursor(5)).unwrap();
         store.checkpoint().unwrap();
     }
 
@@ -259,6 +285,101 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
     );
     store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
     assert_eq!(held(&mut store, OTHER_TID), BTreeMap::from([((9, 90), 1)]));
+}
+
+/// A failed ingest erases that copy and leaves the others alone, the store still
+/// readable and publishable.
+///
+/// Weight-exact: a re-applied interval leaves the row set identical.
+#[test]
+fn a_failed_ingest_erases_that_copy_and_spares_the_rest() {
+    let _g = serial();
+    let dir = scratch_dir("mirror_store", "failed_ingest");
+    let mut store = Mirror::open(&dir).expect("a fresh store");
+    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+    store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
+    store.ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4)).unwrap();
+    store.ingest(OTHER_TID, plain(&[(9, 1, 90)]), cursor(4)).unwrap();
+
+    let err = store
+        .ingest(TID, vec![RawBlock::from_block(vec![0xFF; 64])], cursor(5))
+        .expect_err("an undecodable block must fail the ingest");
+    assert!(
+        !matches!(err, MirrorError::Poisoned(_)),
+        "one copy's fault must not poison the store: {err}",
+    );
+    assert!(store.poisoned().is_none(), "and the store must not be poisoned");
+
+    assert_eq!(store.cursor_of(TID), None, "the erased copy keeps no cursor");
+    assert!(held(&mut store, TID).is_empty(), "and holds no rows");
+    assert_eq!(
+        store.cursor_of(OTHER_TID),
+        Some(cursor(4)),
+        "the sibling copy keeps its position",
+    );
+    assert_eq!(
+        held(&mut store, OTHER_TID),
+        BTreeMap::from([((9, 90), 1)]),
+        "and its rows",
+    );
+    store
+        .checkpoint()
+        .expect("a store holding one erased copy is still safe to publish");
+
+    // With no cursor the next poll bootstraps, and a bootstrap's train is plain.
+    store.ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(9)).unwrap();
+    assert_eq!(
+        held(&mut store, TID),
+        BTreeMap::from([((1, 10), 1), ((2, 20), 1)]),
+        "the re-bootstrapped copy holds exactly one materialisation",
+    );
+}
+
+/// One copy that will not open costs that copy; the store still opens.
+#[test]
+fn an_unopenable_copy_bootstraps_and_its_siblings_resume() {
+    let _g = serial();
+    let dir = two_checkpointed_copies("unopenable_copy");
+    block_copy(&dir, TID);
+
+    let mut store = Mirror::open(&dir).expect("one unopenable copy must not fail the open");
+    assert_eq!(
+        store.cursor_of(TID),
+        None,
+        "the copy that did not open keeps no cursor, so its view bootstraps",
+    );
+    assert_eq!(
+        store.cursor_of(OTHER_TID),
+        Some(cursor(4)),
+        "and its sibling resumes at the position its checkpoint recorded",
+    );
+    store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
+    assert_eq!(
+        held(&mut store, OTHER_TID),
+        BTreeMap::from([((9, 90), 1)]),
+        "with the rows that went with it",
+    );
+}
+
+/// When every copy fails to open, the orphan sweep is skipped: the fault may be
+/// transient, and the sweep deletes every copy on disk.
+#[test]
+fn a_wholly_failed_open_sweeps_nothing() {
+    let _g = serial();
+    let dir = two_checkpointed_copies("wholly_failed_open");
+    block_copy(&dir, TID);
+    block_copy(&dir, OTHER_TID);
+
+    let store = Mirror::open(&dir).expect("the open must degrade rather than fail");
+    assert_eq!(store.cursor_of(TID), None);
+    assert_eq!(store.cursor_of(OTHER_TID), None);
+    drop(store);
+    for tid in [TID, OTHER_TID] {
+        assert!(
+            std::path::Path::new(&copy_dir(&dir, tid)).exists(),
+            "a transient fault must not cost the copy on disk",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,9 +413,7 @@ fn failed_copy_teardown_child() {
     {
         let mut store = Mirror::open(&dir).expect("a fresh store");
         store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
-        store
-            .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
-            .unwrap();
+        store.ingest(TID, plain(&[(1, 1, 10)]), cursor(4)).unwrap();
         store.checkpoint().expect("the cursor is durable before the failure");
 
         store
@@ -352,7 +471,7 @@ fn auto_checkpoint_failure_child() {
     store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
 
     store
-        .ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), Shape::Plain, cursor(4))
+        .ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), cursor(4))
         .expect_err("the byte threshold drives a checkpoint, and the armed seam fails it");
     assert!(store.poisoned().is_none(), "a failed checkpoint is not a poisoning");
     assert_eq!(
@@ -364,12 +483,77 @@ fn auto_checkpoint_failure_child() {
 
     // The seam is one-shot, so this round's own checkpoint is the real thing.
     store
-        .ingest(TID, stamped(5, &[(2, 1, 20)]), Shape::Stamped, cursor(5))
+        .ingest(TID, stamped(5, &[(2, 1, 20)]), cursor(5))
         .expect("the next round applies");
     assert_eq!(
         held(&mut store, TID),
         BTreeMap::from([((1, 10), 1), ((2, 20), 2)]),
         "the interval the failed checkpoint covered must not be applied a second time",
+    );
+    println!("{CHILD_OK}");
+}
+
+/// A failed checkpoint must not leave the applied-byte counter over its
+/// threshold, or every later ingest retries one and re-fails.
+///
+/// Observed through the manifest: a stranded counter makes the sub-threshold
+/// apply below checkpoint, and the one-shot is already spent, so it publishes.
+#[test]
+fn a_failed_checkpoint_does_not_strand_the_byte_counter() {
+    let _g = serial();
+    if !cfg!(debug_assertions) {
+        return; // the seam folds away in a release build
+    }
+    let out = run_test_in_child(
+        module_path!(),
+        "failed_checkpoint_byte_counter_child",
+        &[
+            ("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR", "1"),
+            ("GNITZ_MIRROR_CHECKPOINT_BYTES", "512"),
+        ],
+    );
+    assert_child_ok(
+        &out,
+        "a failed checkpoint must not leave every later ingest re-attempting one",
+    );
+}
+
+/// Runs only in the child the test above spawns.
+#[test]
+fn failed_checkpoint_byte_counter_child() {
+    if !in_child_test() {
+        return;
+    }
+    /// The threshold the parent arms.
+    const THRESHOLD: usize = 512;
+
+    let dir = scratch_dir("mirror_store", "failed_checkpoint_counter");
+    let mut store = Mirror::open(&dir).expect("a fresh store");
+    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+
+    let rows: Vec<(u64, i64, i64)> = (0..40).map(|i| (i as u64, 1, i as i64 * 10)).collect();
+    let big = plain(&rows);
+    let big_bytes: usize = big.iter().map(|b| b.block().len()).sum();
+    assert!(
+        big_bytes > THRESHOLD,
+        "the first train must cross the threshold: {big_bytes}"
+    );
+    store
+        .ingest(TID, big, cursor(4))
+        .expect_err("crossing the threshold drives a checkpoint, and the armed seam fails it");
+    assert!(store.poisoned().is_none(), "a failed checkpoint is not a poisoning");
+    assert!(!has_manifest(&dir, TID), "the failed checkpoint published nothing");
+
+    let small = stamped(5, &[(1, 1, 10)]);
+    let small_bytes: usize = small.iter().map(|b| b.block().len()).sum();
+    assert!(
+        small_bytes < THRESHOLD,
+        "the second train must stay under it: {small_bytes}"
+    );
+    store.ingest(TID, small, cursor(5)).expect("a sub-threshold apply");
+    assert!(
+        !has_manifest(&dir, TID),
+        "a sub-threshold apply must drive no checkpoint; the counter was left over threshold",
     );
     println!("{CHILD_OK}");
 }

@@ -5,6 +5,7 @@
 //! one site deciding its child address, recovery source, capacity stamp and
 //! delta store.
 
+use gnitz_foundation::env::env_num;
 use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
@@ -119,9 +120,11 @@ pub enum RelationKind {
     /// sources; owns a DML-enforced PK, so `enforce_unique_pk` runs on every
     /// ingest and its accumulated per-PK weight is always in {0, 1}.
     BaseTable,
-    /// Materialised view: ephemeral, rebuilt from its sources, and resumed from
-    /// a generation-stamped manifest when the ephemeral checkpoint round left
-    /// one. Partitioned.
+    /// Materialised view: ephemeral, resumed from a generation-stamped manifest
+    /// when the ephemeral checkpoint round left one. Partitioned.
+    ///
+    /// Not necessarily *rebuilt* from its sources: a mirror registers its fed
+    /// copies under this kind too.
     View,
     /// Ingestion point: storeless, partitioned, append-only. Pushed rows exist
     /// only as the deltas they produce; nothing is retained, so there is nothing
@@ -409,29 +412,11 @@ pub struct RelationSpec {
 }
 
 // ---------------------------------------------------------------------------
-// Topology
-// ---------------------------------------------------------------------------
-
-/// Operator-state format version. Bump on any change to an operator-state
-/// schema; a mismatch (recorded in `_sequences` via `SEQ_ID_TOPOLOGY`) marks
-/// every Rederive view invalid at boot, so its state is rebuilt. Shard and
-/// manifest layout changes are carried by their own version words.
-const STATE_FORMAT: u32 = 8;
-
-/// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
-/// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the
-/// boot-time recorder and the resume-verdict validator, so the two can never
-/// drift on the encoding.
-pub fn topology_word(worker_count: u32) -> u64 {
-    ((worker_count as u64) << 32) | STATE_FORMAT as u64
-}
-
-// ---------------------------------------------------------------------------
 // RelationRegistry
 // ---------------------------------------------------------------------------
 
 /// Everything a registry is tuned by. `Default` is the production value of every
-/// field; the server overrides fields from its environment before constructing.
+/// field; a host overrides them through [`StoreConfig::from_env`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StoreConfig {
     /// The RAM-tier ceiling every store this registry opens is sized to.
@@ -450,6 +435,19 @@ impl Default for StoreConfig {
             ram_tier_bytes: crate::storage::DEFAULT_RAM_TIER_BYTES,
             scan_chunk_rows: 65_536,
             adhoc_group_cap: 65_536,
+        }
+    }
+}
+
+impl StoreConfig {
+    /// Every field from `<prefix>RAM_TIER_BYTES`, `<prefix>SCAN_CHUNK_ROWS` and
+    /// `<prefix>ADHOC_GROUP_CAP`, each falling back to [`Default`].
+    pub fn from_env(prefix: &str) -> Self {
+        let d = StoreConfig::default();
+        StoreConfig {
+            ram_tier_bytes: env_num(&format!("{prefix}RAM_TIER_BYTES"), d.ram_tier_bytes),
+            scan_chunk_rows: env_num(&format!("{prefix}SCAN_CHUNK_ROWS"), d.scan_chunk_rows),
+            adhoc_group_cap: env_num(&format!("{prefix}ADHOC_GROUP_CAP"), d.adhoc_group_cap),
         }
     }
 }
@@ -479,8 +477,9 @@ pub struct RelationRegistry {
     pub(crate) residency: Residency,
     /// The generation a manifest must carry to be resumed from.
     pub(crate) resume_generation: u64,
-    /// `worker_count << 32 | STATE_FORMAT` as last recorded.
-    pub(crate) recorded_topology: u64,
+    /// See [`RelationRegistry::set_resume_enabled`]. `false` until a host says
+    /// otherwise, so one that never answers rebuilds.
+    pub(crate) resume_enabled: bool,
 }
 
 impl RelationRegistry {
@@ -498,7 +497,7 @@ impl RelationRegistry {
             },
             residency: Residency::Origin,
             resume_generation: 0,
-            recorded_topology: 0,
+            resume_enabled: false,
         }
     }
 
@@ -715,41 +714,21 @@ impl RelationRegistry {
 
     // ── The resume fence ────────────────────────────────────────────────
 
-    /// The one writer of `resume_generation`, and the one writer of
-    /// `recorded_topology`. Kept apart because their callers set them at
-    /// different moments: the worker latches a generation off a `FlushEph`
-    /// header with no topology in hand, and `record_topology` writes a
-    /// `_sequences` row the registry knows nothing about.
+    /// The one writer of `resume_generation`. A worker latches it off a
+    /// `FlushEph` header, with no verdict in hand.
     pub fn set_resume_generation(&mut self, g: u64) {
         self.resume_generation = g;
     }
 
-    pub fn set_recorded_topology(&mut self, word: u64) {
-        self.recorded_topology = word;
-    }
-
-    /// The topology word last recorded — `0` until something records one.
-    pub fn recorded_topology(&self) -> u64 {
-        self.recorded_topology
-    }
-
-    /// `worker_count << 32 | STATE_FORMAT` for the count this process launched
-    /// with — what a persisted record of derived state must carry to be honoured.
-    pub fn launched_topology(&self) -> u64 {
-        topology_word(self.slot.of)
+    /// Whether persisted derived state may be resumed this boot. The host decides
+    /// what invalidates it.
+    pub fn set_resume_enabled(&mut self, enabled: bool) {
+        self.resume_enabled = enabled;
     }
 
     /// The generation a manifest must carry to be resumed from.
     pub fn resume_generation(&self) -> u64 {
         self.resume_generation
-    }
-
-    /// True when this boot's `(worker count, STATE_FORMAT)` is the one the
-    /// persisted derived state was written under. Half of every resume verdict:
-    /// a change on either axis invalidates every rederived relation regardless
-    /// of what generation its manifest carries.
-    pub fn topology_matches(&self) -> bool {
-        self.recorded_topology == self.launched_topology()
     }
 
     /// What every store this registry opens starts from; the two bounded kinds
@@ -760,13 +739,13 @@ impl RelationRegistry {
 
     /// The recovery policy for a rederived relation — a view's output store and
     /// operator traces, a secondary index: resume from a manifest at this
-    /// registry's resume generation, and only while the topology it was written
-    /// under still holds. The one constructor of a generation-bearing
+    /// registry's resume generation, and only while the host's own verdict
+    /// admits a resume at all. The one constructor of a generation-bearing
     /// `RecoverySource`, so no consumer can sample a generation of its own at a
     /// second moment.
     pub(crate) fn rederive_source(&self) -> RecoverySource {
         RecoverySource::Rederive {
-            resume_at: self.topology_matches().then_some(self.resume_generation),
+            resume_at: self.resume_enabled.then_some(self.resume_generation),
         }
     }
 }
