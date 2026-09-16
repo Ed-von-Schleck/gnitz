@@ -195,7 +195,7 @@ pub struct Shared {
     /// is ever held across an `.await`.
     table_commit_lsn: RefCell<FxHashMap<i64, u64>>,
     /// The default for a `table_commit_lsn` miss (a table not written this boot),
-    /// seeded to `max_current_lsn()` — the value `lsn_alloc.published()`
+    /// seeded to `max_system_lsn()` — the value `lsn_alloc.published()`
     /// also starts at. Within a boot every live OCC basis is ≥ it and every
     /// commit's zone exceeds it, so a miss cannot false-pass. That rests on no
     /// basis surviving a restart (`gnitz-core`'s `last_seen_lsn`), not on this

@@ -26,8 +26,7 @@ impl ShardIndex {
     }
 
     fn load_manifest(&mut self, path: &str) -> Result<(), StorageError> {
-        let cpath = super::super::cstr(path).unwrap();
-        if let Some((entries, header)) = super::super::manifest::read_file(&cpath)? {
+        if let Some((entries, header)) = super::super::manifest::read_file(path)? {
             self.install_manifest(&entries, &header)?;
         }
         Ok(())

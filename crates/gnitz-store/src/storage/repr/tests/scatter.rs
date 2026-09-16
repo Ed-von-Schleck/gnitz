@@ -140,8 +140,8 @@ fn route_rows_by_pk_follows_the_distribution_prefix() {
     }
     let batch = bb.finish();
 
-    let mut slots: Vec<Vec<u32>> = vec![Vec::new(); NW];
-    route_rows_by_pk(&batch.as_mem_batch(), &by_prefix, &mut slots);
+    let mut rows = Vec::new();
+    let slots = route_rows_by_pk(&batch.as_mem_batch(), &by_prefix, &mut rows, NW);
     let want = by_prefix.worker_for_pk(&opk_pk(&by_prefix, &[7, 0]), NW);
     assert_eq!(
         slots[want],
@@ -155,8 +155,8 @@ fn route_rows_by_pk_follows_the_distribution_prefix() {
     );
 
     // Hashing the whole PK spreads that same group instead.
-    let mut full_slots: Vec<Vec<u32>> = vec![Vec::new(); NW];
-    route_rows_by_pk(&batch.as_mem_batch(), &by_full, &mut full_slots);
+    let mut full_rows = Vec::new();
+    let full_slots = route_rows_by_pk(&batch.as_mem_batch(), &by_full, &mut full_rows, NW);
     assert!(
         full_slots.iter().filter(|s| !s.is_empty()).count() > 1,
         "the full-PK placement must not co-locate the group"

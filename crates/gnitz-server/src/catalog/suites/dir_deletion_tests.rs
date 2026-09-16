@@ -260,11 +260,7 @@ fn gc_is_idempotent() {
 // Boot relayout (`repartition_relation`) and child-dir reclamation
 // (`reconcile_child_dirs`)
 //
-// A relation's children are named `w{k}of{n}`, so a set laid out for a different
-// worker count is a disjoint set of names. That is what lets the boot rewrite
-// write the new layout beside the old one and lets the sweep afterwards reclaim
-// whatever the rewrite already consumed. Both run inside `CatalogEngine::open`,
-// so reopening the same directory at a different count is the whole test.
+// The relayout runs inside `CatalogEngine::open`; a test calls the sweep itself.
 // ---------------------------------------------------------------------------
 
 /// Register a REPLICATED base table with one row, and return
@@ -341,26 +337,25 @@ fn child_rows(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) ->
         .collect()
 }
 
-/// The subset of `rows` that `worker_for_pk` places on worker `k` of `of` — the
-/// router's own verdict, so seeding and expectation cannot disagree.
-fn rows_for_worker(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32, k: u32) -> Vec<(u128, i64)> {
+/// The subset of `rows` worker `k` of `of` holds, by the engine's own router.
+fn owned_rows(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32, k: u32) -> Vec<(u128, i64)> {
     rows.iter()
         .copied()
         .filter(|&(pk, _)| {
             let opk = gnitz_store::schema::key::opk_key(schema, &pk.to_le_bytes());
-            schema.worker_for_pk(opk.pk_bytes(), of as usize) == k as usize
+            schema.placement().is_replicated() || schema.worker_for_pk(opk.pk_bytes(), of as usize) == k as usize
         })
         .collect()
 }
 
 /// The sorted `(worker, pk, weight)` triples `rows` must read back as at `of`
 /// workers — what `set_rows` is compared against.
-fn expected_placement(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32) -> Vec<(u32, u128, i64)> {
-    let mut want: Vec<(u32, u128, i64)> = rows
-        .iter()
-        .map(|&(pk, _)| {
-            let opk = gnitz_store::schema::key::opk_key(schema, &pk.to_le_bytes());
-            (schema.worker_for_pk(opk.pk_bytes(), of as usize) as u32, pk, 1)
+fn expected(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32) -> Vec<(u32, u128, i64)> {
+    let mut want: Vec<(u32, u128, i64)> = (0..of)
+        .flat_map(|k| {
+            owned_rows(schema, rows, of, k)
+                .into_iter()
+                .map(move |(pk, _)| (k, pk, 1))
         })
         .collect();
     want.sort_unstable();
@@ -397,15 +392,13 @@ fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32,
     v
 }
 
-/// Replace the `of`-worker child set of `tid` with exactly `rows`, each routed by
-/// `worker_for_pk` and every child published — including the empty ones, which is
-/// what a real checkpoint's unconditional base round does. Any existing set at
-/// that count is discarded first, so the result is the set and nothing else.
-fn seed_child_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
+/// Replace the `of`-worker child set of `tid` with exactly `rows`, publishing
+/// every child — the empty ones too, as a checkpoint's base round does.
+fn seed_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
     for k in 0..of {
         fs::remove_dir_all(child_path(rel, k, of)).ok();
         let mut registry = child_registry(rel, k, of, schema, tid);
-        fill_child(&mut registry, tid, schema, &rows_for_worker(&schema, rows, of, k));
+        fill_child(&mut registry, tid, schema, &owned_rows(&schema, rows, of, k));
     }
 }
 
@@ -417,18 +410,17 @@ fn retired_children_are_reclaimed() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
 
-    // A set laid out for another count, a rank above the launched count, and a
-    // scratch dir from a rank that no longer exists.
+    // A set laid out for another count, and a scratch dir from a rank that no
+    // longer exists.
     for k in 0..2 {
         fabricate_dir(&child_path(&rel, k, 2), "marker");
     }
-    fabricate_dir(&format!("{rel}/w9of3"), "marker");
     fabricate_dir(&format!("{rel}/scratch_agg_w7"), "marker");
     fabricate_dir(&format!("{rel}/delta_w5"), "marker");
     // Not a child at all: an index dir must be left alone.
     fabricate_dir(&format!("{rel}/idx_7"), "marker");
 
-    engine.registry().reconcile_child_dirs();
+    engine.registry().reconcile_child_dirs().unwrap();
 
     assert!(
         Path::new(&child_path(&rel, 0, 3)).exists(),
@@ -437,7 +429,6 @@ fn retired_children_are_reclaimed() {
     for k in 0..2 {
         assert!(!Path::new(&child_path(&rel, k, 2)).exists(), "wrong layout count");
     }
-    assert!(!Path::new(&format!("{rel}/w9of3")).exists(), "rank 9 is not launched");
     assert!(!Path::new(&format!("{rel}/scratch_agg_w7")).exists());
     assert!(
         !Path::new(&format!("{rel}/delta_w5")).exists(),
@@ -505,11 +496,11 @@ fn keyed_table_round_trips_across_worker_counts() {
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..N).map(|id| (id, id as i64 * 10)).collect();
-        seed_child_set(&rel, w_old, schema, tid, &rows);
+        seed_set(&rel, w_old, schema, tid, &rows);
 
         let engine = CatalogEngine::open(&dir, w_new).unwrap();
         let got = set_rows(&rel, w_new, schema, tid);
-        let want = expected_placement(&schema, &rows, w_new);
+        let want = expected(&schema, &rows, w_new);
         assert_eq!(got, want, "{w_old}->{w_new}: the Z-set must survive exactly");
         if w_old != w_new {
             assert!(
@@ -544,7 +535,7 @@ fn repartition_handles_a_relation_with_empty_children() {
     // `opk_key` reads the packed native value in PK-list order, so PK column 0
     // (`a`) is the LOW u128 half: `a = 1` for every row, `b` varies.
     let rows: Vec<(u128, i64)> = (0..20u128).map(|b| (1u128 | (b << 64), b as i64)).collect();
-    seed_child_set(&rel, 3, schema, tid, &rows);
+    seed_set(&rel, 3, schema, tid, &rows);
     let occupied = (0..3)
         .filter(|&k| !child_rows(&rel, k, 3, schema, tid).is_empty())
         .count();
@@ -567,12 +558,10 @@ fn repartition_handles_a_relation_with_empty_children() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Crash after the target set is written but before the source is removed: two
-/// complete sets survive. The layout sequence — one above the source's — is what
-/// picks the newer one; resolving by "whichever count the boot happens to launch"
-/// would come up on stale rows the moment the cluster reboots at the old count.
+/// A crash between a relayout's target publish and its source removal leaves two
+/// complete sets holding the same rows.
 #[test]
-fn two_complete_sets_resolve_by_layout_sequence() {
+fn two_complete_sets_left_by_a_crash_relay_either() {
     let dir = temp_dir("repartition_two_sets");
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
@@ -581,32 +570,18 @@ fn two_complete_sets_resolve_by_layout_sequence() {
     let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
-    // A 2-set holding the current content, relayed to a 4-set — which the
-    // relayout stamps one layout sequence above its source's.
-    let new_rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64 + 1000)).collect();
-    seed_child_set(&rel, 2, schema, tid, &new_rows);
-    let engine = CatalogEngine::open(&dir, 4).unwrap();
-    drop(engine);
-    assert!(!Path::new(&child_path(&rel, 0, 2)).exists());
+    let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
+    seed_set(&rel, 2, schema, tid, &rows);
+    seed_set(&rel, 4, schema, tid, &rows);
 
-    // A resurrected 2-set holding the *old* content — the state a crash between
-    // "target durable" and "source removed" leaves. Freshly published, so it
-    // carries layout sequence 0, below the relayed 4-set's.
-    let old_rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
-    seed_child_set(&rel, 2, schema, tid, &old_rows);
-
-    // Reboot at a third count: the newer (4-worker) set must be the source.
     let engine = CatalogEngine::open(&dir, 3).unwrap();
-    let got = set_rows(&rel, 3, schema, tid);
-    assert_eq!(got.len(), 40);
-    for k in 0..3 {
-        let registry = child_registry(&rel, k, 3, schema, tid);
-        let batch = registry.relation_or_err(tid).unwrap().cursor().materialize();
-        for i in 0..batch.len() {
+    assert_eq!(set_rows(&rel, 3, schema, tid), expected(&schema, &rows, 3));
+    engine.registry().reconcile_child_dirs().unwrap();
+    for of in [2, 4] {
+        for k in 0..of {
             assert!(
-                payload_u64(&*batch, i, 0) >= 1000,
-                "the stale 2-set won: row {} carries the old payload",
-                batch.get_pk(i)
+                !Path::new(&child_manifest(&rel, k, of)).exists(),
+                "w{k}of{of} survived the relayout and the sweep"
             );
         }
     }
@@ -629,16 +604,16 @@ fn a_partial_target_is_cleared_rather_than_merged() {
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
-    seed_child_set(&rel, 2, schema, tid, &rows);
+    seed_set(&rel, 2, schema, tid, &rows);
 
     // Attempt 1 got as far as `w0of4`, holding rows it had already placed.
     let mut torn = child_registry(&rel, 0, 4, schema, tid);
-    fill_child(&mut torn, tid, schema, &rows_for_worker(&schema, &rows, 4, 0));
+    fill_child(&mut torn, tid, schema, &owned_rows(&schema, &rows, 4, 0));
     drop(torn);
 
     let engine = CatalogEngine::open(&dir, 4).unwrap();
     let got = set_rows(&rel, 4, schema, tid);
-    let want = expected_placement(&schema, &rows, 4);
+    let want = expected(&schema, &rows, 4);
     assert_eq!(got, want, "attempt 1's rows must be cleared, not summed to weight 2");
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
@@ -659,7 +634,7 @@ fn a_torn_set_at_the_launched_count_is_not_a_relayout() {
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..60u128).map(|id| (id, id as i64)).collect();
-    seed_child_set(&rel, 3, schema, tid, &rows);
+    seed_set(&rel, 3, schema, tid, &rows);
     // Worker 2 never got as far as publishing.
     fs::remove_file(child_manifest(&rel, 2, 3)).unwrap();
     let published = set_rows(&rel, 3, schema, tid);
@@ -694,96 +669,45 @@ fn repartition_refuses_an_unreadable_child_grammar() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A manifest at a worker count that has no complete set is data this pass
-/// cannot place. Coming up without it would be silent loss, so the boot refuses.
+/// A foreign-count set missing a rank's manifest never finished a checkpoint, so
+/// its rows are still in the SAL tail: nothing moves, and the sweep retires it.
 #[test]
-fn repartition_refuses_a_torn_set_at_a_foreign_count() {
-    let dir = temp_dir("repartition_refuses_torn");
-    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-    let mut engine = CatalogEngine::open(&dir, 4).unwrap();
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
-    engine.close();
-
-    seed_child_set(
-        &rel,
-        4,
-        schema,
-        tid,
-        &(0..40u128).map(|id| (id, id as i64)).collect::<Vec<_>>(),
-    );
-    fs::remove_file(child_manifest(&rel, 3, 4)).unwrap();
-
-    let Err(err) = CatalogEngine::open(&dir, 2) else {
-        panic!("an incomplete foreign-count set must refuse to boot");
-    };
-    assert!(err.contains("Refusing to boot"), "{err}");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The `(worker, pk, weight)` triples a replicated `rows` must read back as at
-/// `of` workers — every rank holds every row. Sibling of [`expected_placement`],
-/// which is the key-routed rule.
-fn expected_replication(rows: &[(u128, i64)], of: u32) -> Vec<(u32, u128, i64)> {
-    (0..of)
-        .flat_map(|k| rows.iter().map(move |&(pk, _)| (k, pk, 1i64)))
-        .collect()
-}
-
-/// Fill every child of a replicated relation's `of`-worker set with all of
-/// `rows` and publish it. `seed_child_set`'s hash routing is the keyed rule and
-/// would leave each replica holding a slice.
-fn seed_replicated_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
-    for k in 0..of {
-        fs::remove_dir_all(child_path(rel, k, of)).ok();
-        let mut registry = child_registry(rel, k, of, schema, tid);
-        fill_child(&mut registry, tid, schema, rows);
-    }
-}
-
-/// A replicated child set is a set of copies, so one survivor is a whole usable
-/// copy and a rank that never published still leaves the set relayable. Any
-/// survivor is safe, not only the newest: linking from a lagging one lowers the
-/// target's watermark and replays more, and cannot lose a row. The same shape on
-/// a keyed relation is a hash slice, not a copy, so it is still refused.
-#[test]
-fn a_replicated_set_relays_from_one_surviving_rank() {
-    for missing in [1u32, 0] {
-        let dir = temp_dir(&format!("repartition_replicated_partial_{missing}"));
-        let mut engine = CatalogEngine::open(&dir, 3).unwrap();
+fn a_torn_foreign_set_moves_nothing() {
+    for (name, flags) in [("keyed", 0), ("replicated", replicated_flags())] {
+        let dir = temp_dir(&format!("repartition_torn_foreign_{name}"));
         let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-        let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
-        let rel = engine.registry().relation_or_err(rt).unwrap().directory().to_string();
-        let schema = engine.registry().relation(rt).map(Relation::schema).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 4).unwrap();
+        let tid = create_flagged_table(&mut engine, "t", &cols, &[0], flags);
+        let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
         engine.close();
 
-        let rows: Vec<(u128, i64)> = (0..30u128).map(|id| (id, id as i64)).collect();
-        seed_replicated_set(&rel, 3, schema, rt, &rows);
-        fs::remove_file(child_manifest(&rel, missing, 3)).unwrap();
+        let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
+        seed_set(&rel, 4, schema, tid, &rows);
+        fs::remove_file(child_manifest(&rel, 3, 4)).unwrap();
 
-        let engine = CatalogEngine::open(&dir, 2).unwrap();
-        let got = set_rows(&rel, 2, schema, rt);
-        assert_eq!(
-            got,
-            expected_replication(&rows, 2),
-            "rank {missing} missing: every launched rank holds the copy"
-        );
-        assert!(
-            !Path::new(&child_path(&rel, 0, 3)).exists(),
-            "rank {missing} missing: the source set is retired"
-        );
+        let engine = CatalogEngine::open(&dir, 2)
+            .unwrap_or_else(|e| panic!("{name}: a torn foreign set must not refuse the boot: {e}"));
+        for k in 0..2 {
+            assert!(
+                !Path::new(&child_manifest(&rel, k, 2)).exists(),
+                "{name}: w{k}of2 was relaid from a torn set"
+            );
+        }
+        engine.registry().reconcile_child_dirs().unwrap();
+        for k in 0..4 {
+            assert!(
+                !Path::new(&child_manifest(&rel, k, 4)).exists(),
+                "{name}: the sweep must retire w{k}of4"
+            );
+        }
         drop(engine);
         let _ = fs::remove_dir_all(&dir);
     }
 }
 
-/// The relaxation reaches the relay-source decision only. A relayout that
-/// crashed after its first target's publish leaves a *partial* set at the
-/// launched count carrying a layout sequence one above the source's; treating
-/// that as the live set would report `Current` and bring the relation up with an
-/// empty store on every rank whose child was never written — silently, and
-/// differently per worker.
+/// A relayout that crashed after its first target's publish leaves a partial
+/// set at the launched count beside its complete source, which must still relay.
 #[test]
 fn a_partial_target_at_the_launched_count_is_not_current() {
     let dir = temp_dir("repartition_partial_target_replicated");
@@ -794,26 +718,25 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     let schema = engine.registry().relation(rt).map(Relation::schema).unwrap();
     engine.close();
 
-    // A 2-set relayed to 4, so the 4-set carries layout sequence 1.
+    // A 2-set relayed to 4.
     let rows: Vec<(u128, i64)> = (0..30u128).map(|id| (id, id as i64)).collect();
-    seed_replicated_set(&rel, 2, schema, rt, &rows);
+    seed_set(&rel, 2, schema, rt, &rows);
     let engine = CatalogEngine::open(&dir, 4).unwrap();
     drop(engine);
     for k in 0..4 {
         assert!(Path::new(&child_manifest(&rel, k, 4)).exists());
     }
 
-    // Tear two ranks out of it and put a fresh 2-set (sequence 0) back beside
-    // it: the torn 4-set now outranks the complete 2-set on sequence alone.
+    // Tear two ranks out of it and put the complete 2-set back beside it.
     for k in 2..4 {
         fs::remove_dir_all(child_path(&rel, k, 4)).ok();
     }
-    seed_replicated_set(&rel, 2, schema, rt, &rows);
+    seed_set(&rel, 2, schema, rt, &rows);
 
     let engine = CatalogEngine::open(&dir, 4).unwrap();
     assert_eq!(
         set_rows(&rel, 4, schema, rt),
-        expected_replication(&rows, 4),
+        expected(&schema, &rows, 4),
         "the torn 4-set must be relaid over, not accepted as current"
     );
     drop(engine);
@@ -832,7 +755,7 @@ fn repartition_is_not_run_on_an_unchanged_restart() {
     let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
-    seed_child_set(
+    seed_set(
         &rel,
         2,
         schema,

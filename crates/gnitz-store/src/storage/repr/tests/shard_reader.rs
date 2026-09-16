@@ -1334,7 +1334,7 @@ fn empty_shard_carries_no_filter_and_a_zero_checksum() {
 /// The digest is seeded with the basename and nothing else: a shard renamed
 /// out from under the manifest fails to open, while one hard-linked into
 /// another directory under the same name still opens. The second half is
-/// what `link_child` relies on when it seeds a sibling child.
+/// what the replicated relayout relies on when it links a sibling child.
 #[test]
 fn the_digest_seed_separates_names_not_directories() {
     let dir = tempfile::tempdir().unwrap();

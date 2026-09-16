@@ -59,7 +59,6 @@ impl ShardIndex {
         // Compaction output names must never reuse a value baked into a live,
         // manifest-referenced shard across a restart.
         self.compact_seq = header.compact_seq;
-        self.layout_seq = header.layout_seq;
 
         let stride = self.schema.pk_stride();
         for raw in entries {
@@ -107,9 +106,7 @@ impl ShardIndex {
     /// one-shot shard write already registered its shard, so the current index is
     /// authoritative — no pending entry to splice in.
     ///
-    /// The checkpoint generation comes from the round; the layout sequence is
-    /// this store's own, loaded at open and re-stamped here so it survives every
-    /// checkpoint.
+    /// The checkpoint generation comes from the round.
     pub(crate) fn prepare_manifest(
         &self,
         manifest_path: &CStr,
@@ -119,7 +116,6 @@ impl ShardIndex {
         let header = ManifestHeader {
             compact_seq: self.compact_seq,
             checkpoint_gen,
-            layout_seq: self.layout_seq,
             run_bytes: self.l0_run_bytes,
         };
         manifest::prepare_file(manifest_path, &entries, header)

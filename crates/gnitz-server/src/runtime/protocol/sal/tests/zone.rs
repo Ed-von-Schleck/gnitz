@@ -576,8 +576,8 @@ fn the_demotion_is_global_across_slots() {
 /// A group whose family is absent from the map is not validated, so damage in
 /// one cannot demote the zone it sits in.
 ///
-/// This is the shape a stream takes: `user_flushed_lsns` omits storeless
-/// relations, and the committer coalesces a stream push into a base table's
+/// This is the shape a stream takes: the Push walk's map holds base tables
+/// only, and the committer coalesces a stream push into a base table's
 /// commit batch — base group first (it opens the zone; a stream group never
 /// does), stream group second, inside the span. With the stream present at LSN
 /// 0 instead, a torn stream slot would discard the fdatasync'd base push beside

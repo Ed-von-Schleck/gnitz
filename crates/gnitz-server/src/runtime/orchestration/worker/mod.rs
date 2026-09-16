@@ -621,11 +621,8 @@ impl WorkerProcess {
                 "a Push group named system table_id={target_id}; a system family arrives as DdlSync"
             ));
         }
-        // A storage fault here means committed data was not applied while the
-        // client already holds a durability ACK, so this worker has diverged from
-        // the durable SAL. Restart + SAL replay re-applies the batch — its zone
-        // stays above the flushed-shard watermark — where a fault reply would
-        // neither apply nor replay it and the next checkpoint would orphan it.
+        // A storage fault leaves an ACKed push unapplied. Only a restart replays
+        // it; a fault reply would let the next checkpoint discard it.
         let effective = match self.cat().registry_mut().ingest_returning_effective(target_id, batch) {
             Ok(b) => b,
             // An ingest never produces `DeltaExpired`; the or-pattern is what

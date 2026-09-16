@@ -54,11 +54,14 @@ impl Slot {
     /// A one-worker process: the mirror, and every unit test.
     pub const SOLO: Slot = Slot { rank: 0, of: 1 };
 
-    /// Panics on `rank >= of` or `of == 0`: a slot outside its own layout names a
-    /// child the boot sweep deletes as unowned.
+    /// Panics outside [`Self::try_new`]'s range.
     pub fn new(rank: u32, of: u32) -> Slot {
-        assert!(of >= 1 && rank < of, "slot {rank} of {of}");
-        Slot { rank, of }
+        Slot::try_new(rank, of).unwrap_or_else(|| panic!("slot {rank} of {of}"))
+    }
+
+    /// `None` unless `rank < of`.
+    pub fn try_new(rank: u32, of: u32) -> Option<Slot> {
+        (rank < of).then_some(Slot { rank, of })
     }
 }
 
@@ -94,14 +97,15 @@ impl<'a> ChildAddr<'a> {
         manifest::path(&self.dir(rel_dir))
     }
 
-    /// The child `name` denotes, or `None` if it is in neither grammar. The
-    /// scratch split is right-anchored because child names contain `_`
-    /// themselves (`_reduce_{vid}_{nid}`).
+    /// The child `name` denotes, or `None` if it is not exactly the name a builder
+    /// produces.
     pub fn parse(name: &'a str) -> Option<Self> {
-        if let Some(rest) = name.strip_prefix('w') {
-            if let Some((rank, of)) = rest.split_once("of") {
-                return Some(ChildAddr::Worker { rank: parse_id(rank)?, of: parse_id(of)? });
-            }
+        Self::parse_grammar(name).filter(|addr| addr.name() == name)
+    }
+
+    fn parse_grammar(name: &'a str) -> Option<Self> {
+        if let Some((rank, of)) = name.strip_prefix('w').and_then(|rest| rest.split_once("of")) {
+            return Slot::try_new(parse_id(rank)?, parse_id(of)?).map(ChildAddr::worker);
         }
         if let Some(id) = name.strip_prefix("idx_") {
             return Some(ChildAddr::Index { id: parse_id(id)? });
@@ -109,19 +113,16 @@ impl<'a> ChildAddr<'a> {
         if let Some(rank) = name.strip_prefix("delta_w") {
             return Some(ChildAddr::Delta { rank: parse_id(rank)? });
         }
+        // Right-anchored: a scratch child's own name contains `_w`.
         let (child, rank) = name.strip_prefix("scratch_")?.rsplit_once("_w")?;
         Some(ChildAddr::Scratch { child, rank: parse_id(rank)? })
     }
 
-    /// True when a relation launched at `num_workers` still owns this child. A
-    /// worker child laid out for a different count is the previous layout, which
-    /// the boot repartition has already consumed; one above the launched count is
-    /// stale either way. Scratch is judged by rank alone — the next compile
-    /// recreates what it needs. An index directory is owned at every count; its
-    /// own contents are swept by the catalog.
+    /// Whether a cluster of `num_workers` owns this child. An index directory's
+    /// own children are swept separately.
     pub(crate) fn is_owned_by(&self, num_workers: u32) -> bool {
         match *self {
-            ChildAddr::Worker { rank, of } => rank < num_workers && of == num_workers,
+            ChildAddr::Worker { of, .. } => of == num_workers,
             ChildAddr::Scratch { rank, .. } | ChildAddr::Delta { rank } => rank < num_workers,
             ChildAddr::Index { .. } => true,
         }
@@ -146,84 +147,49 @@ pub(super) fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAd
 /// child is in no checkpoint round (it is erased at open), and an `Index` child
 /// cannot appear here at all — `CREATE INDEX` is gated on a base table, and only
 /// views reach the resume verdict.
-pub(crate) fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Vec<String> {
-    let scratch = subdir_names(rel_dir);
+pub(crate) fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Result<Vec<String>, StorageError> {
+    let scratch = subdir_names(rel_dir)?;
     let scratch = scratch
         .iter()
         .filter(|n| matches!(ChildAddr::parse(n), Some(ChildAddr::Scratch { .. })))
         .map(|n| manifest::path(&format!("{rel_dir}/{n}")));
-    cluster_children(num_workers)
+    Ok(cluster_children(num_workers)
         .map(|c| c.manifest(rel_dir))
         .chain(scratch)
-        .collect()
+        .collect())
 }
 
 /// Whether every state child of `rel_dir` carries a manifest at `generation`.
-/// A failed read answers `false`, which is safe here because the verdict's only
-/// consequence is a rebuild — `manifest::at_generation` keeps the `Err` for
-/// `Table::new`, whose consequence is erasing shards.
+/// Any I/O failure answers `false`, which only costs a rebuild.
 pub(crate) fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64) -> bool {
-    state_child_manifests(rel_dir, num_workers)
-        .iter()
-        .all(|m| manifest::at_generation(m, generation).unwrap_or(false))
+    state_child_manifests(rel_dir, num_workers).is_ok_and(|manifests| {
+        manifests
+            .iter()
+            .all(|m| manifest::at_generation(m, generation).unwrap_or(false))
+    })
 }
 
-/// Immediate sub-directory names of `path`. Empty if `path` is missing or
-/// unreadable — both mean "nothing to scan" for a boot sweep. Non-directory
-/// entries are skipped.
-///
-/// Materialized rather than streamed: callers unlink entries from the directory
-/// they are walking, and `readdir` may skip entries when the directory is
-/// modified mid-iteration.
-pub(crate) fn subdir_names(path: &str) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(path) else {
-        return Vec::new();
+/// Immediate sub-directory names of `path`, none if it is missing. Collected
+/// before return, since callers remove entries from the directory they walk.
+pub(crate) fn subdir_names(path: &str) -> Result<Vec<String>, StorageError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
     };
-    entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect()
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
 }
 
-/// A directory-name id component: non-empty and all ASCII digits, so no sign,
-/// whitespace or `+` slips through `FromStr`.
+/// A directory-name id component: ASCII digits only.
 fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
-/// Hard-link the shards `entries` names from `source` into `target`, then
-/// publish `target`'s own manifest. Only sound where the two children are copies
-/// of one another: a replicated base table's are, a key-routed table's are not.
-///
-/// Links the manifest's shard set, not whatever the directory holds, so orphans
-/// and half-written `.tmp` files are never carried over. A published shard is
-/// never rewritten in place, so the link is byte-equivalent at O(shards).
-///
-/// The manifest is rewritten under `layout_seq`; the rest of `source_header`
-/// carries over.
-pub(super) fn link_child(
-    source: &str,
-    target: &str,
-    entries: &[manifest::ManifestEntryRaw],
-    source_header: manifest::ManifestHeader,
-    layout_seq: u64,
-) -> Result<(), StorageError> {
-    fs::create_dir_all(target)?;
-    for e in entries {
-        fs::hard_link(
-            format!("{source}/{}", e.filename_str()),
-            format!("{target}/{}", e.filename_str()),
-        )?;
-    }
-    manifest::publish_sync(
-        target,
-        entries,
-        manifest::ManifestHeader { layout_seq, ..source_header },
-    )
+    s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse().ok())?
 }
 
 /// Create a child directory, answering whether **this call** created it. A child
@@ -245,15 +211,12 @@ pub(crate) fn create_child(dir: &str) -> Result<bool, StorageError> {
     }
 }
 
-/// Unlink a child's manifest, make that durable, then remove the directory.
-/// `remove_dir_all` deletes in readdir order, so unlinking the manifest first
-/// is what keeps a crash from leaving a manifest whose shards are gone — a
-/// state a `SalReplay` open cannot recover from. Best-effort: failing to
-/// reclaim costs disk space, not correctness.
-pub(crate) fn remove_child(dir: &str) {
-    let _ = fs::remove_file(manifest::path(dir));
-    let _ = fsync_dir(dir);
+/// Retire a child: once this returns `Ok`, no crash brings its manifest back.
+pub(crate) fn remove_child(dir: &str) -> Result<(), StorageError> {
+    manifest::unlink(dir)?;
+    // Without its manifest the directory holds no reachable rows.
     let _ = fs::remove_dir_all(dir);
+    Ok(())
 }
 
 /// `fsync` a directory so its entries are durable.
@@ -273,17 +236,18 @@ pub fn fsync_dir(dir: &str) -> Result<(), StorageError> {
 /// children are per-worker stores under the same grammar, so the sweep descends
 /// into it. Runs after the boot repartition, which has already consumed any
 /// previous-layout set it needed.
-pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) {
-    for name in subdir_names(dir) {
+pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) -> Result<(), StorageError> {
+    for name in subdir_names(dir)? {
         let Some(child) = ChildAddr::parse(&name) else { continue };
         let full = format!("{dir}/{name}");
         if !child.is_owned_by(num_workers) {
             gnitz_debug!("recovery: removing retired child dir {}", full);
-            remove_child(&full);
+            remove_child(&full)?;
         } else if matches!(child, ChildAddr::Index { .. }) {
-            reclaim_retired_children(&full, num_workers);
+            reclaim_retired_children(&full, num_workers)?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

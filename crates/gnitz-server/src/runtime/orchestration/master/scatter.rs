@@ -22,18 +22,16 @@ thread_local! {
     static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Route each row to its owning worker, through the shared placement rule the
-/// boot relayout also drives.
+/// Route each row to its owning worker.
 fn fill_scatter(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, out: &mut Vec<Vec<u32>>) {
-    let slots = gnitz_store::ops::reset_slots(out, num_workers);
-    gnitz_store::storage::route_rows_by_pk(&batch.as_mem_batch(), schema, slots);
+    gnitz_store::storage::route_rows_by_pk(&batch.as_mem_batch(), schema, out, num_workers);
 }
 
 /// One list of every live row. Weight-0 rows are dropped, as in `fill_scatter`:
 /// they are not Z-set elements, and a client is free to send one.
 fn fill_live(batch: &Batch, out: &mut Vec<Vec<u32>>) {
     let mb = batch.as_mem_batch();
-    let live = &mut gnitz_store::ops::reset_slots(out, 1)[0];
+    let live = &mut gnitz_store::storage::reset_slots(out, 1)[0];
     live.extend((0..batch.len()).filter(|&i| mb.get_weight(i) != 0).map(|i| i as u32));
 }
 

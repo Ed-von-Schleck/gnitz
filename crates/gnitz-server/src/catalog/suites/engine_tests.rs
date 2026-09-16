@@ -480,13 +480,12 @@ fn zone_pins_survive_a_flush_and_reopen() {
     assert_eq!(map.get(&TABLE_TAB_ID), Some(&9));
     assert_eq!(map.get(&COL_TAB_ID), Some(&9));
     assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
-    // and the user half is the complement: both created tables, no system family.
-    let users = engine.registry().user_flushed_lsns();
-    assert!(users.contains_key(&tid) && users.contains_key(&tid2));
-    assert!(users.keys().all(|&t| t >= FIRST_USER_TABLE_ID));
+    // The Push walk replays both created tables.
+    let bases = engine.registry().base_table_ids();
+    assert!(bases.contains(&tid) && bases.contains(&tid2));
 
-    // max_current_lsn is at least the highest zone LSN observed.
-    assert!(engine.registry().max_current_lsn() >= 9);
+    // max_system_lsn is at least the highest zone LSN observed.
+    assert!(engine.registry().max_system_lsn() >= 9);
 
     engine.close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();

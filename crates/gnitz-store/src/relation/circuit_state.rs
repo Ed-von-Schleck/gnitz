@@ -41,7 +41,7 @@ impl Drop for CircuitState {
         // `created` at the commit, so this removes nothing.
         self.tables.clear();
         for dir in self.created.drain(..) {
-            remove_child(&dir);
+            let _ = remove_child(&dir);
         }
     }
 }

@@ -43,7 +43,14 @@ impl RelationRegistry {
         // previous child set, which the open would shadow and
         // `reconcile_child_dirs` would then delete.
         if matches!(on, OnRegister::BootReplay) && spec.kind.is_base_table() {
-            crate::storage::repartition_relation(&spec.directory, &spec.schema, spec.id as u32, self.slot.of)?;
+            crate::storage::repartition_relation(
+                &spec.directory,
+                &spec.schema,
+                spec.id as u32,
+                self.slot.of,
+                self.config.ram_tier_bytes,
+                self.config.scan_chunk_rows,
+            )?;
         }
         let stores = staged_dir(&spec.directory, || {
             self.build_relation_store(spec.kind, &spec.directory, spec.id, spec.schema, spec.props)

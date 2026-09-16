@@ -18,7 +18,6 @@ fn hdr(compact_seq: u64, checkpoint_gen: u64) -> ManifestHeader {
     ManifestHeader {
         compact_seq,
         checkpoint_gen,
-        layout_seq: 0,
         run_bytes: 1 << 20,
     }
 }
@@ -96,7 +95,7 @@ fn write_read_file_roundtrip() {
         write_manifest(&cpath, &entries, hdr(5, 2));
         assert!(path.exists());
 
-        let (out, header) = read_file(&cpath).unwrap().unwrap();
+        let (out, header) = read_file(path.to_str().unwrap()).unwrap().unwrap();
         assert_eq!(header, hdr(5, 2), "count={count}");
         assert_eq!(out.len(), count);
         for (i, e) in out.iter().enumerate() {
@@ -109,10 +108,9 @@ fn write_read_file_roundtrip() {
 fn read_file_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("DOES_NOT_EXIST");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
     assert!(
-        read_file(&cpath).unwrap().is_none(),
+        read_file(path.to_str().unwrap()).unwrap().is_none(),
         "missing manifest file reads as the empty manifest"
     );
 }
@@ -193,22 +191,22 @@ fn peek_header_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("MANIFEST_GEN");
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let peek = || peek_header(path.to_str().unwrap()).unwrap();
 
     // Absent file ⇒ Ok(None).
-    assert_eq!(peek_header(&cpath).unwrap(), None);
+    assert_eq!(peek(), None);
 
     // Every header field is independent and round-trips.
     let full = ManifestHeader {
         compact_seq: 3,
         checkpoint_gen: 42,
-        layout_seq: 7,
         run_bytes: 9 << 20,
     };
     write_manifest(&cpath, &[make_entry(1, "shard_1.db")], full);
-    assert_eq!(peek_header(&cpath).unwrap(), Some(full));
-    assert_eq!(peek_header(&cpath).unwrap().unwrap().run_bytes, 9 << 20);
+    assert_eq!(peek(), Some(full));
+    assert_eq!(peek().unwrap().run_bytes, 9 << 20);
 
     // Republish at generation 0 (the base-round stamp).
     write_manifest(&cpath, &[make_entry(1, "shard_1.db")], hdr(3, 0));
-    assert_eq!(peek_header(&cpath).unwrap().unwrap().checkpoint_gen, 0);
+    assert_eq!(peek().unwrap().checkpoint_gen, 0);
 }

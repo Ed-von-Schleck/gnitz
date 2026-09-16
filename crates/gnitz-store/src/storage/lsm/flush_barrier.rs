@@ -79,12 +79,9 @@ pub(crate) fn flush_barrier<'a>(
     Ok(())
 }
 
-/// Make every file in `paths` durable: open each `O_RDONLY` and fdatasync it
-/// through one ring submission per sub-chunk, so a large set never holds more
-/// than [`FD_CHUNK_THRESHOLD`] fds open at once (EMFILE). The one spelling of
-/// "these written files are now on disk" — the checkpoint barrier and the boot
-/// relayout both go through it.
-pub(super) fn sync_by_path(ring: &mut LazyRing, paths: &[&CStr]) -> Result<(), StorageError> {
+/// fdatasync every file in `paths`, one ring submission per sub-chunk of at most
+/// [`FD_CHUNK_THRESHOLD`] open fds.
+fn sync_by_path(ring: &mut LazyRing, paths: &[&CStr]) -> Result<(), StorageError> {
     for sub in paths.chunks(FD_CHUNK_THRESHOLD) {
         let owned: Vec<OwnedFd> = sub
             .iter()

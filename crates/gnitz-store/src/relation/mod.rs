@@ -348,9 +348,7 @@ impl Relation {
         self.store.table().map_or((0, None), |t| t.live_row_at(key))
     }
 
-    /// This relation's recovery watermark: the highest LSN its store has flushed;
-    /// `0` where this process holds no store. `0` is not "exclude me" — a
-    /// relation admitted at it would make the worker skip its own replay.
+    /// This relation's store LSN counter; `0` where this process holds no store.
     pub fn current_lsn(&self) -> u64 {
         self.store.current_lsn()
     }
@@ -666,6 +664,15 @@ impl RelationRegistry {
     /// True iff at least one registered relation carries a delta feed.
     pub fn any_delta_feed(&self) -> bool {
         self.tables.values().any(Relation::has_delta_feed)
+    }
+
+    /// Every registered base table id; streams and views are not base tables.
+    pub fn base_table_ids(&self) -> Vec<i64> {
+        self.tables
+            .iter()
+            .filter(|(_, e)| e.kind.is_base_table())
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// Every registered view id.

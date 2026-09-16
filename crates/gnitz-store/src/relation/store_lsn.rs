@@ -3,7 +3,7 @@
 //! recovery and the DDL zone allocator read.
 
 use super::{RelationKind, RelationRegistry, Residency, Store};
-use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError, Table};
+use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError};
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
@@ -140,7 +140,7 @@ impl RelationRegistry {
     /// Idempotent and unconditional: a boot dying between this and
     /// `record_topology` leaves the recorded count unchanged, so a "the count
     /// changed" trigger would skip the repair on the retry.
-    pub fn reconcile_child_dirs(&self) {
+    pub fn reconcile_child_dirs(&self) -> Result<(), StoreError> {
         self.assert_origin("reconcile_child_dirs");
         for entry in self.tables.values() {
             // System tables are single-partition `Table`s with no children.
@@ -149,8 +149,10 @@ impl RelationRegistry {
             }
             // A storeless relation's `directory` names a path that was never created;
             // `reclaim_retired_children` reads it as having no children and returns.
-            reclaim_retired_children(entry.directory(), self.slot.of);
+            reclaim_retired_children(entry.directory(), self.slot.of)
+                .map_err(|e| StoreError::storage(format!("reclaim children of {}", entry.directory()), e))?;
         }
+        Ok(())
     }
 
     /// Reset a relation's store and per-worker operator scratch to an empty,
@@ -167,7 +169,10 @@ impl RelationRegistry {
             .get(&vid)
             .ok_or_else(|| StoreError::rejected(format!("reset_view: relation {vid} is not registered")))?;
         let dir = entry.directory().to_string();
-        entry.store().table().map(Table::unlink_manifest);
+        if let Some(t) = entry.store().table() {
+            t.unlink_manifest()
+                .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
+        }
 
         let rank = self.slot.rank;
 
@@ -176,11 +181,10 @@ impl RelationRegistry {
         self.rebuild_relation_store(vid, "reset view output")?;
 
         // Remove this worker's per-view operator scratch dirs (rank-stamped).
-        // Through `remove_child` so a crash mid-removal cannot leave a manifest
-        // behind whose shards are gone — `remove_dir_all` deletes in readdir order.
-        for name in subdir_names(&dir) {
+        let scratch_err = |e| StoreError::storage(format!("reset_view: scratch of {vid}"), e);
+        for name in subdir_names(&dir).map_err(scratch_err)? {
             if matches!(ChildAddr::parse(&name), Some(ChildAddr::Scratch { rank: r, .. }) if r == rank) {
-                remove_child(&format!("{dir}/{name}"));
+                remove_child(&format!("{dir}/{name}")).map_err(scratch_err)?;
             }
         }
         Ok(())
@@ -200,16 +204,6 @@ impl RelationRegistry {
         })
     }
 
-    /// Every registered relation's `(table id, kind, current_lsn)` — the one walk
-    /// behind both the recovery dedup maps and the zone-allocator floor. The
-    /// registry owns a system family's store exactly as it owns a user
-    /// relation's, so one walk covers both bands.
-    fn all_store_lsns(&self) -> impl Iterator<Item = (i64, RelationKind, u64)> + '_ {
-        self.tables
-            .iter()
-            .map(|(&tid, entry)| (tid, entry.kind(), entry.current_lsn()))
-    }
-
     /// Raise `id`'s store LSN counter to at least `lsn`; a no-op for an unregistered
     /// id or a detached store.
     pub fn pin_lsn(&mut self, id: i64, lsn: u64) {
@@ -218,31 +212,21 @@ impl RelationRegistry {
         }
     }
 
-    /// The system families' `table id → max flushed LSN`: the dedup filter for the
-    /// master's pre-fork SAL walk. Selected by the kind the iterator already
-    /// yields, not by an id band — every system family is registered
-    /// `SystemCatalog`, and nothing else is.
+    /// The system families' `table id → LSN counter`: the replay floors of the
+    /// master's pre-fork SAL walk.
     pub fn system_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
-        self.all_store_lsns()
-            .filter(|&(_, kind, _)| kind == RelationKind::SystemCatalog)
-            .map(|(tid, _, lsn)| (tid, lsn))
-            .collect()
+        self.system_lsns().collect()
     }
 
-    /// The user relations' `table id → max flushed LSN`: the dedup filter for a
-    /// worker's post-fork SAL walk. A storeless relation is absent rather than
-    /// present at 0 — there is nothing to recover into, and a stream admitted at
-    /// LSN 0 would make the worker skip its own replay.
-    pub fn user_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
-        self.all_store_lsns()
-            .filter(|&(_, kind, _)| matches!(kind, RelationKind::BaseTable | RelationKind::View))
-            .map(|(tid, _, lsn)| (tid, lsn))
-            .collect()
+    /// The highest system-family LSN counter.
+    pub fn max_system_lsn(&self) -> u64 {
+        self.system_lsns().map(|(_, lsn)| lsn).max().unwrap_or(0)
     }
 
-    /// Maximum `current_lsn` across every store this process holds; a detached store
-    /// counts as `0`.
-    pub fn max_current_lsn(&self) -> u64 {
-        self.all_store_lsns().map(|(_, _, lsn)| lsn).max().unwrap_or(0)
+    fn system_lsns(&self) -> impl Iterator<Item = (i64, u64)> + '_ {
+        self.tables
+            .iter()
+            .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)
+            .map(|(&tid, entry)| (tid, entry.current_lsn()))
     }
 }

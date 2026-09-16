@@ -58,8 +58,8 @@ pub(crate) use lsm::flush_barrier::{flush_barrier, FlushRound};
 pub(crate) use lsm::table::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 pub use merge::MemBatch;
 pub use scatter::batch_project_index;
-pub use scatter::route_rows_by_pk;
 pub(crate) use scatter::scatter_unified_sources;
+pub use scatter::{reset_slots, route_rows_by_pk};
 
 // ── Operator hot-path types ──────────────────────────────────────────────────
 pub use batch::Layout;
@@ -112,9 +112,7 @@ pub(super) fn cstr(s: impl Into<Vec<u8>>) -> Result<std::ffi::CString, error::St
     std::ffi::CString::new(s).map_err(|_| error::StorageError::InvalidPath)
 }
 
-/// Path strings as `CString`s — the compaction input list (a `Vec<String>`), the
-/// barrier's by-path fdatasync sweep list (borrowed `&str`s off the live
-/// entries) and the relayout's own publish list take the same conversion.
+/// Path strings as `CString`s.
 pub(super) fn to_cstrings<S: AsRef<str>>(
     paths: impl IntoIterator<Item = S>,
 ) -> Result<Vec<std::ffi::CString>, error::StorageError> {

@@ -354,49 +354,6 @@ fn flush_prepare_drop_cleans_tmp_files() {
     );
 }
 
-/// A table's layout sequence is loaded at open and re-stamped by every
-/// publish, so it survives an arbitrary number of checkpoints. That
-/// persistence is what lets the boot relayout resolve two complete sets after
-/// a crash by picking the newer one — a publish that reset it to 0 would make
-/// a stale set win.
-#[test]
-fn base_publish_preserves_the_layout_sequence() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("layout_seq");
-    let schema = make_schema_u64_i64();
-    let cpath = crate::storage::cstr(super::super::manifest::path(tdir.to_str().unwrap())).unwrap();
-    let peek_layout_seq = |p: &std::ffi::CStr| super::super::manifest::peek_header(p).unwrap().map(|h| h.layout_seq);
-
-    // Stamp a set at sequence 7, as the relayout's target write would.
-    {
-        let mut t = new_table(&tdir, schema, 88, 1 << 20, RecoverySource::SalReplay);
-        t.ingest_owned_batch(make_batch(&[(1, 1, 10)])).unwrap();
-        t.flush().unwrap();
-        let (entries, header) = super::super::manifest::read_file(&cpath).unwrap().unwrap();
-        super::super::manifest::prepare_file(
-            &cpath,
-            &entries,
-            super::super::manifest::ManifestHeader { layout_seq: 7, ..header },
-        )
-        .unwrap()
-        .commit()
-        .unwrap();
-    }
-
-    // Two further checkpoints, one with new rows and one without, must both
-    // re-stamp 7 rather than reset it.
-    let mut t = new_table(&tdir, schema, 88, 1 << 20, RecoverySource::SalReplay);
-    t.ingest_owned_batch(make_batch(&[(2, 1, 20)])).unwrap();
-    t.flush().unwrap();
-    assert_eq!(peek_layout_seq(&cpath), Some(7));
-    t.flush().unwrap();
-    assert_eq!(
-        peek_layout_seq(&cpath),
-        Some(7),
-        "an unchanged publish must not reset the layout sequence"
-    );
-}
-
 /// Table::new on a corrupted manifest must return Err and must not run
 /// gc_orphans — any stray shard files must survive untouched.
 #[test]
@@ -1336,8 +1293,8 @@ fn generation_preserved_by_compaction_republish() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("gen_republish");
     let schema = make_schema_u64_i64();
-    let manifest_path = std::ffi::CString::new(tdir.join("manifest.bin").to_str().unwrap()).unwrap();
-    let read_generation = |path: &std::ffi::CStr| -> u64 { read_file(path).unwrap().unwrap().1.checkpoint_gen };
+    let manifest_path = tdir.join("manifest.bin").to_str().unwrap().to_string();
+    let read_generation = |path: &str| -> u64 { read_file(path).unwrap().unwrap().1.checkpoint_gen };
 
     // Publish at generation G1 with a compaction pending.
     let mut t = new_table(&tdir, schema, 7900, 96, RecoverySource::SalReplay);

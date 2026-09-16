@@ -1,4 +1,3 @@
-use super::super::cstr;
 use super::*;
 
 #[test]
@@ -34,6 +33,10 @@ fn parse_rejects_names_in_no_grammar() {
         "delta_w",
         "delta_wx",
         "delta_0",
+        "w0of0",
+        "w3of3",
+        "w01of2",
+        "idx_07",
         "manifest.bin",
     ] {
         assert_eq!(ChildAddr::parse(name), None, "{name} is not a child dir");
@@ -61,6 +64,7 @@ fn state_children_are_the_output_stores_and_the_scratch() {
     }
 
     let mut got: Vec<String> = state_child_manifests(&dir, 2)
+        .unwrap()
         .iter()
         .map(|m| {
             m.strip_prefix(&format!("{dir}/"))
@@ -78,15 +82,13 @@ fn state_children_are_the_output_stores_and_the_scratch() {
 #[test]
 fn state_children_name_every_launched_rank_on_an_empty_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    assert_eq!(state_child_manifests(tmp.path().to_str().unwrap(), 3).len(), 3);
+    assert_eq!(state_child_manifests(tmp.path().to_str().unwrap(), 3).unwrap().len(), 3);
 }
 
 #[test]
 fn ownership_follows_the_launched_count() {
-    // A worker child survives iff its rank is launched AND it was laid out
-    // for exactly this count.
+    // A worker child survives iff it was laid out for exactly this count.
     assert!(ChildAddr::Worker { rank: 2, of: 3 }.is_owned_by(3));
-    assert!(!ChildAddr::Worker { rank: 3, of: 3 }.is_owned_by(3));
     assert!(!ChildAddr::Worker { rank: 0, of: 2 }.is_owned_by(4));
     assert!(!ChildAddr::Worker { rank: 0, of: 8 }.is_owned_by(4));
     // Scratch is judged by rank alone.
@@ -104,49 +106,4 @@ fn cluster_children_is_the_launched_set() {
     let got: Vec<String> = cluster_children(3).map(|c| c.name()).collect();
     assert_eq!(got, ["w0of3", "w1of3", "w2of3"]);
     assert!(cluster_children(3).all(|c| c.is_owned_by(3)));
-}
-
-/// `link_child` hard-links the source's shards into a sibling child under
-/// the same basename, which is what keeps their descriptive digests valid
-/// where they land.
-#[test]
-fn linked_child_shard_opens_under_its_linked_name() {
-    use crate::storage::repr::shard_reader::MappedShard;
-    use crate::test_support::{make_batch, make_schema_u64_i64};
-
-    let tmp = tempfile::tempdir().unwrap();
-    let rel_dir = tmp.path().to_str().unwrap().to_string();
-    let schema = make_schema_u64_i64();
-    let source = ChildAddr::Worker { rank: 0, of: 2 }.dir(&rel_dir);
-    std::fs::create_dir_all(&source).unwrap();
-
-    let name = &super::super::naming::spill_shard_name(42, 1);
-    let rows: Vec<(u64, i64, i64)> = (1..=4).map(|i| (i, 1, i as i64 * 10)).collect();
-    make_batch(&schema, &rows)
-        .write_as_shard(
-            &cstr(format!("{source}/{name}")).unwrap(),
-            super::super::shard_file::ShardWriteOpts::default(),
-        )
-        .unwrap();
-
-    let entries = [manifest::ManifestEntryRaw::new(
-        name,
-        1,
-        0,
-        crate::schema::key::PkBuf::zeroed(0),
-    )];
-
-    let target = ChildAddr::Worker { rank: 1, of: 2 }.dir(&rel_dir);
-    link_child(&source, &target, &entries, manifest::ManifestHeader::default(), 1).unwrap();
-
-    let shard = MappedShard::open(&cstr(format!("{target}/{name}")).unwrap(), &schema, true)
-        .expect("a hard-linked shard keeps its basename, so its digest still validates");
-    assert_eq!(shard.count, 4);
-    assert_eq!(
-        manifest::peek_header(&cstr(manifest::path(&target)).unwrap())
-            .unwrap()
-            .map(|h| h.layout_seq),
-        Some(1),
-        "the linked child carries the target layout sequence",
-    );
 }

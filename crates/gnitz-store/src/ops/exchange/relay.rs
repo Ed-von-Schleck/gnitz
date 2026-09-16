@@ -88,7 +88,7 @@ pub fn op_repartition_batches(
 
     Ok(WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
-        super::reset_slots(&mut worker_rows, num_workers);
+        crate::storage::reset_slots(&mut worker_rows, num_workers);
 
         let is_pk_routing = scatter_key.is_pk_routed();
         for (si, mb) in mem_batches.iter().enumerate() {
@@ -158,7 +158,7 @@ pub fn op_relay_scatter_consolidated(
 
     Ok(WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
-        super::reset_slots(&mut worker_rows, num_workers);
+        crate::storage::reset_slots(&mut worker_rows, num_workers);
 
         match second {
             // One contributing source: already ordered and folded, so a

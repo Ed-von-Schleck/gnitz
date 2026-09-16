@@ -10,15 +10,14 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 // Manifest file format
 // ---------------------------------------------------------------------------
 //
-// Header (64 bytes):
+// Header (56 bytes):
 //   [0,8)   Magic   0x4D414E49464E5447
-//   [8,16)  Version u64 (11)
+//   [8,16)  Version u64 (12)
 //   [16,24) Count   u64
 //   [24,32) Compaction sequence u64
 //   [32,40) Checkpoint generation u64
-//   [40,48) Layout sequence u64
-//   [48,56) R — the shard index's guard byte unit, u64
-//   [56,64) Checksum — XXH3-64 over the whole file, these eight bytes excluded
+//   [40,48) R — the shard index's guard byte unit, u64
+//   [48,56) Checksum — XXH3-64 over the whole file, these eight bytes excluded
 //
 // Entry, laid out by the `W_*` widths below (224 bytes at MAX_PK_BYTES = 80):
 //   max_lsn    u64
@@ -36,16 +35,15 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 // `install_manifest` holds the schema, exactly as `ShardEntry::open` does.
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 11;
-const HEADER_SIZE: usize = 64;
+const VERSION: u64 = 12;
+const HEADER_SIZE: usize = 56;
 
 // Header offsets.
 const OFF_ENTRY_COUNT: usize = 16;
 const OFF_COMPACT_SEQ: usize = 24;
 const OFF_CHECKPOINT_GEN: usize = 32;
-const OFF_LAYOUT_SEQ: usize = 40;
-const OFF_RUN_BYTES: usize = 48;
-const OFF_CHECKSUM: usize = 56;
+const OFF_RUN_BYTES: usize = 40;
+const OFF_CHECKSUM: usize = 48;
 
 // One entry's field widths, in layout order. Each offset is the running sum of
 // the widths before it and `ENTRY_SIZE` is the total, so a width edit moves the
@@ -117,12 +115,6 @@ pub(crate) struct ManifestHeader {
     /// conditional reload (`Rederive`) and the boot resume verdict.
     /// A base publish stamps 0; nothing reads it back from a base table.
     pub(crate) checkpoint_gen: u64,
-    /// The layout sequence of the `w{k}of{n}` child set this manifest belongs
-    /// to. `Table::new` loads it and every publish re-stamps it, so it survives
-    /// checkpoints; the boot relayout stamps a target set one above its
-    /// source's, which is what decides the live set when two complete sets
-    /// survive a crash.
-    pub layout_seq: u64,
     /// The shard index's `R`. Stored, not derived: a guard of one distinct key
     /// outgrows `R` and cannot be split, so no shard size recovers it.
     pub run_bytes: u64,
@@ -146,7 +138,6 @@ fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], header: ManifestH
     write_u64_le(out_buf, OFF_ENTRY_COUNT, count as u64);
     write_u64_le(out_buf, OFF_COMPACT_SEQ, header.compact_seq);
     write_u64_le(out_buf, OFF_CHECKPOINT_GEN, header.checkpoint_gen);
-    write_u64_le(out_buf, OFF_LAYOUT_SEQ, header.layout_seq);
     write_u64_le(out_buf, OFF_RUN_BYTES, header.run_bytes);
 
     // Write entries field-by-field (symmetric with parse; immune to padding changes).
@@ -207,7 +198,6 @@ fn verify(buf: &[u8]) -> Result<(ManifestHeader, usize), StorageError> {
         ManifestHeader {
             compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
             checkpoint_gen: read_u64_le(buf, OFF_CHECKPOINT_GEN),
-            layout_seq: read_u64_le(buf, OFF_LAYOUT_SEQ),
             run_bytes: read_u64_le(buf, OFF_RUN_BYTES),
         },
         count,
@@ -247,9 +237,8 @@ pub(crate) const fn serialized_size(count: usize) -> usize {
 /// Read a manifest file into memory. `Ok(None)` when it does not exist yet
 /// (first-time table boot ⇒ empty manifest); any other read failure is
 /// `Err(Io)`.
-fn read_bytes(path: &std::ffi::CStr) -> Result<Option<Vec<u8>>, StorageError> {
-    use std::os::unix::ffi::OsStrExt;
-    match std::fs::read(std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()))) {
+fn read_bytes(path: &str) -> Result<Option<Vec<u8>>, StorageError> {
+    match std::fs::read(path) {
         Ok(buf) => Ok(Some(buf)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -259,9 +248,7 @@ fn read_bytes(path: &std::ffi::CStr) -> Result<Option<Vec<u8>>, StorageError> {
 /// Read and parse a manifest file in one open. `Ok(None)` when the file does
 /// not exist yet; a damaged one is an error, since its shards are already open
 /// for business and dropping them silently would lose data.
-pub(crate) fn read_file(
-    path: &std::ffi::CStr,
-) -> Result<Option<(Vec<ManifestEntryRaw>, ManifestHeader)>, StorageError> {
+pub(crate) fn read_file(path: &str) -> Result<Option<(Vec<ManifestEntryRaw>, ManifestHeader)>, StorageError> {
     read_bytes(path)?.map(|buf| parse(&buf)).transpose()
 }
 
@@ -292,6 +279,17 @@ pub(crate) fn tmp_path(dir: &str) -> String {
     format!("{}{STAGING_SUFFIX}", path(dir))
 }
 
+/// Durably unlink `dir`'s manifest; an absent manifest or directory is already
+/// unlinked.
+pub(crate) fn unlink(dir: &str) -> Result<(), StorageError> {
+    let absent_ok = |r: Result<(), StorageError>| match r {
+        Err(StorageError::Io(libc::ENOENT)) => Ok(()),
+        r => r,
+    };
+    absent_ok(std::fs::remove_file(path(dir)).map_err(StorageError::from))?;
+    absent_ok(super::child_dir::fsync_dir(dir))
+}
+
 /// A manifest's header without decoding its entries. `Ok(None)` when there is no
 /// usable manifest — absent, or damaged: a damaged manifest names no generation,
 /// and every caller answers that by rebuilding. Only a failed read is `Err(Io)`;
@@ -299,7 +297,7 @@ pub(crate) fn tmp_path(dir: &str) -> String {
 ///
 /// The digest spans the entries, so no header-only peek can skip reading them,
 /// but decoding them is another matter — this stops at [`verify`].
-pub(crate) fn peek_header(path: &std::ffi::CStr) -> Result<Option<ManifestHeader>, StorageError> {
+pub(crate) fn peek_header(path: &str) -> Result<Option<ManifestHeader>, StorageError> {
     Ok(read_bytes(path)?.and_then(|buf| Some(verify(&buf).ok()?.0)))
 }
 
@@ -307,27 +305,7 @@ pub(crate) fn peek_header(path: &std::ffi::CStr) -> Result<Option<ManifestHeader
 /// absent, damaged, or a different generation. A failed read stays `Err`: it is
 /// not evidence of staleness.
 pub(crate) fn at_generation(manifest_path: &str, generation: u64) -> Result<bool, StorageError> {
-    let c = super::super::cstr(manifest_path.to_string())?;
-    Ok(peek_header(&c)?.is_some_and(|h| h.checkpoint_gen == generation))
-}
-
-/// Stage `entries` as `dir`'s manifest and rename it into place, durable at
-/// every step: the `.tmp` is fdatasync'd and the directory fsync'd before the
-/// rename, and fsync'd again after it. A crash therefore leaves a manifest-less
-/// directory the next boot redoes, never a manifest whose shards are missing.
-///
-/// The blocking counterpart of the barrier's io_uring publish, for the boot
-/// paths that publish one directory at a time.
-pub(super) fn publish_sync(
-    dir: &str,
-    entries: &[ManifestEntryRaw],
-    header: ManifestHeader,
-) -> Result<(), StorageError> {
-    let staged = prepare_file(&super::cstr(path(dir))?, entries, header)?;
-    staged.sync()?;
-    super::child_dir::fsync_dir(dir)?;
-    staged.commit()?;
-    super::child_dir::fsync_dir(dir)
+    Ok(peek_header(manifest_path)?.is_some_and(|h| h.checkpoint_gen == generation))
 }
 
 // ---------------------------------------------------------------------------

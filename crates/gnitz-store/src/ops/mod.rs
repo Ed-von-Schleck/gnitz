@@ -36,9 +36,7 @@ mod bench_join;
 
 pub use distinct::{op_weight_clamp, ClampPreset};
 pub use exchange::op_worker_filter;
-pub use exchange::{
-    op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, reset_slots, ScatterSpec,
-};
+pub use exchange::{op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, ScatterSpec};
 pub use join::{merge_schemas_for_join, op_join_delta_trace, JoinProbe, RangeProbe};
 pub use linear::{null_extend_output_schema, op_union, union_nullability_merge};
 pub use linear::{op_filter, op_negate};

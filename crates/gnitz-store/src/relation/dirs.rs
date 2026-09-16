@@ -117,15 +117,13 @@ impl RelationRegistry {
             .map(|e| ChildAddr::Index { id: index_id }.dir(e.directory()))
     }
 
-    /// Drop `id`'s entry and erase this process's store directory for it. Its own
-    /// child goes through [`remove_child`](crate::storage) first, so a crash
-    /// mid-removal leaves no manifest whose shards are gone.
+    /// Drop `id`'s entry and erase this process's store directory for it.
     pub fn unregister_and_erase(&mut self, id: i64) {
         let Some(dir) = self.relation(id).map(|e| e.directory().to_string()) else {
             return;
         };
         self.unregister(id);
-        crate::storage::remove_child(&ChildAddr::worker(self.slot).dir(&dir));
+        let _ = crate::storage::remove_child(&ChildAddr::worker(self.slot).dir(&dir));
         if let Err(e) = fs::remove_dir_all(&dir) {
             gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
         }
@@ -138,7 +136,7 @@ impl RelationRegistry {
         let root = relations_dir(base_dir);
         let live: rustc_hash::FxHashMap<&str, &Relation> = self.relations().map(|e| (e.directory(), e)).collect();
 
-        for name in subdir_names(&root) {
+        for name in subdir_names(&root).unwrap_or_default() {
             let full = format!("{root}/{name}");
             let Some(entry) = live.get(full.as_str()) else {
                 match fs::remove_dir_all(&full) {
@@ -149,7 +147,7 @@ impl RelationRegistry {
             };
             // Matched on the circuit's own `index_id`, since a promoted circuit
             // outlives the IDX_TAB row that named it.
-            for idx_name in subdir_names(&full) {
+            for idx_name in subdir_names(&full).unwrap_or_default() {
                 let Some(ChildAddr::Index { id }) = ChildAddr::parse(&idx_name) else {
                     continue;
                 };

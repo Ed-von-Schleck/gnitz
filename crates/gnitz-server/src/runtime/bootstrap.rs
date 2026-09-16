@@ -48,9 +48,8 @@ fn decode_group_slot(msg: &SalMessage, w: u32, data: &[u8]) -> Result<ipc::Decod
     ipc::decode_sal_slot(data).map_err(corrupt)
 }
 
-/// Master pre-fork replay of every committed DdlSync group. Returns the tail's
-/// highest committed zone LSN, of any kind.
-fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut CatalogEngine) -> Result<u64, String> {
+/// Master pre-fork replay of every committed DdlSync group.
+fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut CatalogEngine) -> Result<(), String> {
     let family_lsns = catalog.registry().system_flushed_lsns();
     let tail = CommittedTail::open(log, epoch, SalMessageKind::DdlSync, &family_lsns)?;
 
@@ -75,7 +74,7 @@ fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut Catalog
     if replayed > 0 {
         gnitz_note!("SAL system table recovery: replayed {replayed} entries");
     }
-    Ok(tail.max_committed_lsn())
+    Ok(())
 }
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
@@ -138,7 +137,14 @@ fn recover_from_sal(
     swept_bases: &[i64],
     catalog: &mut CatalogEngine,
 ) -> Result<HashMap<i64, Batch>, String> {
-    let family_lsns = catalog.registry().user_flushed_lsns();
+    // Floor 0: `enforce_unique_pk` makes re-applying a group the shards already
+    // hold a no-op.
+    let family_lsns: HashMap<i64, u64> = catalog
+        .registry()
+        .base_table_ids()
+        .into_iter()
+        .map(|id| (id, 0))
+        .collect();
     let tail = CommittedTail::open(log, walk_epoch, SalMessageKind::Push, &family_lsns)?;
 
     let mut pending: HashMap<i64, Batch> = HashMap::new();
@@ -180,8 +186,8 @@ fn recover_from_sal(
             let owned = if reslice {
                 // The write path's own router, so what survives is exactly what the master
                 // would have written to this rank's slot.
-                let slots = gnitz_store::ops::reset_slots(&mut rows, slot.of as usize);
-                gnitz_store::storage::route_rows_by_pk(&batch.as_mem_batch(), &schema, slots);
+                let slots =
+                    gnitz_store::storage::route_rows_by_pk(&batch.as_mem_batch(), &schema, &mut rows, slot.of as usize);
                 batch.ascending_subset(&slots[slot.rank as usize])
             } else {
                 batch
@@ -417,14 +423,13 @@ fn run_worker_child(
 }
 
 /// The master's half of recovery before any worker exists: the sweep set every
-/// worker inherits, and a zone-LSN seed above every store counter and every
-/// committed tail zone — taken before the fork detaches the user stores.
+/// worker inherits, and a zone-LSN seed above every system-family counter.
 fn master_pre_fork_recovery(
     catalog: &mut CatalogEngine,
     log: SalLog,
     walk_epoch: u32,
 ) -> Result<(Vec<i64>, u64), String> {
-    let tail_lsn = recover_system_tables_from_sal(log, walk_epoch, catalog)?;
+    recover_system_tables_from_sal(log, walk_epoch, catalog)?;
 
     // G → G+1 with the resume generation left at G: a crash before `boot_checkpoint`
     // rebuilds every un-checkpointed view instead of resuming it stale.
@@ -441,13 +446,16 @@ fn master_pre_fork_recovery(
 
     // Drop the child directories this boot's worker count no longer owns, before
     // each worker's `rehome` opens what is left.
-    catalog.registry().reconcile_child_dirs();
+    catalog
+        .registry()
+        .reconcile_child_dirs()
+        .map_err(|e| format!("child-dir sweep failed: {e}"))?;
 
     // Pre-fork because it peeks every launched rank's manifest on behalf of
     // workers that do not exist yet.
     catalog.compute_invalid_views();
 
-    let lsn_seed = catalog.registry().max_current_lsn().max(tail_lsn);
+    let lsn_seed = catalog.registry().max_system_lsn();
     Ok((swept_base_tables(catalog), lsn_seed))
 }
 

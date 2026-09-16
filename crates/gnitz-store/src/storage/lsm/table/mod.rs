@@ -154,8 +154,8 @@ pub(crate) struct Table {
     /// [`StoreBudgets`]'s RAM-tier ceiling (spill). The checkpoint barrier folds
     /// this tier into one durable shard for `SalReplay` tables.
     ram_tier: RunSet,
-    /// The disk tier, and the one owner of this store's schema, directory,
-    /// table id and layout sequence.
+    /// The disk tier, and the one owner of this store's schema, directory and
+    /// table id.
     shard_index: ShardIndex,
 
     recovery_source: RecoverySource,
@@ -220,19 +220,18 @@ impl Table {
         };
 
         let path = table.manifest_full_path();
-        let cpath = super::super::cstr(path.as_str())?;
         let loaded = match recovery_source {
             // Erased at open, so it reads nothing: an I/O error on the file it is
             // about to unlink must not abort it.
             RecoverySource::Rederive { resume_at: None } => None,
             // Rebuilt from its sources, so damage is erased rather than fatal.
-            RecoverySource::Rederive { resume_at: Some(want) } => match super::manifest::read_file(&cpath) {
+            RecoverySource::Rederive { resume_at: Some(want) } => match super::manifest::read_file(&path) {
                 Ok(v) => v.filter(|(_, h)| h.checkpoint_gen == want),
                 Err(e @ StorageError::Io(_)) => return Err(e),
                 Err(_) => None,
             },
             // Its shards are its only copy, so damage stops the open.
-            RecoverySource::SalReplay => super::manifest::read_file(&cpath)?,
+            RecoverySource::SalReplay => super::manifest::read_file(&path)?,
         };
 
         if let Some((entries, header)) = &loaded {
@@ -241,7 +240,7 @@ impl Table {
             table.resumed_from_checkpoint = rederived;
         } else if rederived {
             // So a later re-open cannot re-peek what this one rejected.
-            table.unlink_manifest();
+            table.unlink_manifest()?;
         }
         table.shard_index.gc_orphans();
 
@@ -304,11 +303,16 @@ impl Table {
         self.resumed_from_checkpoint
     }
 
-    /// Unlink this store's manifest, so the next `Rederive` open
-    /// peeks `None` and erases the shards instead of reloading them — how a
-    /// caller rejects state it must not resume from.
-    pub(crate) fn unlink_manifest(&self) {
-        let _ = std::fs::remove_file(self.manifest_full_path());
+    /// Durably unlink this store's manifest, so the next `Rederive` open erases
+    /// its shards instead of reloading them.
+    pub(crate) fn unlink_manifest(&self) -> Result<(), StorageError> {
+        super::manifest::unlink(&self.shard_index.output_dir)
+    }
+
+    /// See [`ShardIndex::append_terminal_run`].
+    pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
+        self.cached_full_scan.set(None);
+        self.shard_index.append_terminal_run(run)
     }
 
     /// Publish `schema` across this store (any column ALTER). All-or-nothing:
@@ -342,7 +346,7 @@ impl Table {
         // Ingest overflow always folds into the RAM tier; durability lives in the
         // fsynced SAL, and the checkpoint barrier writes the durable shard. Bump
         // `current_lsn` unconditionally so spill/barrier shard naming is
-        // collision-free (it feeds only the master's zone-LSN allocator floor).
+        // collision-free.
         self.current_lsn += 1;
 
         let consolidated = batch.into_consolidated(&self.shard_index.schema);
@@ -372,17 +376,14 @@ impl Table {
     // Flush
     // ------------------------------------------------------------------
 
-    /// The next-shard LSN counter. Seeded `max_lsn + 1` at open, bumped on every
-    /// ingest; feeds spill/barrier shard naming and the master's zone-LSN
-    /// allocator floor.
+    /// The next-shard LSN counter: seeded `max_lsn + 1` at open, bumped on every
+    /// ingest, raised by [`Self::pin_lsn`].
     pub(crate) fn current_lsn(&self) -> u64 {
         self.current_lsn
     }
 
-    /// Pin the LSN counter to a recovery watermark, monotonically: the counter
-    /// only ever moves forward. Idempotent SAL re-replay legitimately presents
-    /// an older zone LSN (the dedupe filter under-dedupes by design), and
-    /// regressing the counter would let a later spill reuse a live shard name.
+    /// Raise the LSN counter to `lsn`. Never lowers it, which would reuse a live
+    /// shard name.
     pub(crate) fn pin_lsn(&mut self, lsn: u64) {
         self.current_lsn = self.current_lsn.max(lsn);
     }

@@ -7,9 +7,11 @@ use std::ffi::CStr;
 use std::fs;
 use std::rc::Rc;
 
+use super::super::batch::Batch;
 use super::super::columnar::ColumnarSource;
 use super::super::compact;
 use super::super::error::StorageError;
+use super::super::shard_file::ShardWriteOpts;
 use super::super::shard_reader::MappedShard;
 use super::super::to_cstrings;
 use super::{
@@ -43,6 +45,40 @@ impl ShardIndex {
     pub(crate) fn add_unsynced_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
         let entry = ShardEntry::open(path, &self.schema, max_lsn, false)?;
         self.l0.push(entry);
+        Ok(())
+    }
+
+    /// Write `run` as one unpublished shard at the terminal level, under a new
+    /// guard keyed by its first PK.
+    pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
+        assert!(
+            run.count > 0 && run.consolidated_verified(&self.schema),
+            "a terminal run is consolidated"
+        );
+        let first = PkBuf::from_bytes(run.get_pk_bytes(0));
+        let terminal = &self.levels[TERMINAL_LEVEL_IDX];
+        assert!(
+            terminal.guards.last().is_none_or(|g| g.key_extent().1 < first),
+            "a terminal run ascends past every key its level holds"
+        );
+        self.compact_seq += 1;
+        let level = Self::level_num(TERMINAL_LEVEL_IDX);
+        let name = super::super::naming::compact_shard_name(self.table_id, self.compact_seq, level, 0);
+        let path = format!("{}/{name}", self.output_dir);
+        run.write_as_shard(
+            &super::super::cstr(path.as_str())?,
+            ShardWriteOpts {
+                skip_pk_filter: self.skip_pk_filter,
+                ..ShardWriteOpts::COMPACTION
+            },
+        )?;
+        let entry = ShardEntry::open(&path, &self.schema, 0, false).inspect_err(|_| {
+            let _ = fs::remove_file(&path);
+        })?;
+        self.l0_run_bytes = self.l0_run_bytes.max(entry.shard.file_len());
+        self.levels[TERMINAL_LEVEL_IDX]
+            .guards
+            .push(LevelGuard { guard_key: first, entries: vec![entry] });
         Ok(())
     }
 

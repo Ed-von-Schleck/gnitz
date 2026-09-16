@@ -124,9 +124,7 @@ impl Table {
     ///
     /// The name is unique for this `Table`: `current_lsn` bumps once per ingest
     /// and at most one shard is written per ingest, so a directory needs a single
-    /// writing process. The boot repartition writes through the compaction
-    /// grammar instead, because it stamps a manifest LSN floor below the names it
-    /// wrote and this counter is re-derived from that floor at the next open.
+    /// writing process.
     ///
     /// Transactional. The run is borrowed — not removed — so a write failure
     /// leaves heap intact for retry with nothing on disk; a registration
@@ -135,7 +133,7 @@ impl Table {
     fn persist_ram_tier(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
         let shard_name = super::super::naming::spill_shard_name(self.shard_index.table_id, self.current_lsn);
         let lsn_max = self.current_lsn - 1;
-        // Real LSNs, so a reopen seeds `current_lsn = max_lsn() + 1`.
+        // So a reopen seeds `current_lsn` above every spill name.
         let final_full = format!("{}/{}", self.shard_index.output_dir, shard_name);
         let full_c = super::super::cstr(final_full.as_str())?;
 

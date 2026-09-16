@@ -352,13 +352,14 @@ impl RelationRegistry {
         &mut self,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
     ) {
-        for s in state {
-            for t in s.tables_mut() {
-                t.unlink_manifest();
+        let unlink = |t: &mut Table| {
+            if let Err(e) = t.unlink_manifest() {
+                gnitz_warn!("unlink of a derived manifest failed: {}", e);
             }
+        };
+        for s in state {
+            s.tables_mut().for_each(unlink);
         }
-        for t in self.collect_ephemeral_output_tables() {
-            t.unlink_manifest();
-        }
+        self.collect_ephemeral_output_tables().into_iter().for_each(unlink);
     }
 }

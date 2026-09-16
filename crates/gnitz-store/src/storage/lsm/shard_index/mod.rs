@@ -403,8 +403,6 @@ pub(super) struct ShardIndex {
     /// registered L0 bytes one `run_compact` consumed, floored at
     /// [`MIN_GUARD_BYTES`] and persisted in the manifest header.
     l0_run_bytes: u64,
-    /// This child set's layout sequence — see `ManifestHeader::layout_seq`.
-    layout_seq: u64,
     /// What bounds this store's registered on-disk shard bytes, and how a sweep
     /// evicts. Unbounded for every store but a capacity-bounded view's output
     /// store and a view's delta store.
@@ -442,7 +440,6 @@ impl ShardIndex {
             compact_seq: 0,
             pending_deletions: Vec::new(),
             l0_run_bytes: MIN_GUARD_BYTES,
-            layout_seq: 0,
             budget,
             dropped_max: PkBuf::zeroed(schema.pk_stride()),
             skip_pk_filter,

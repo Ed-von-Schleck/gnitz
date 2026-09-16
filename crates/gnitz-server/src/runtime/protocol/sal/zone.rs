@@ -70,8 +70,8 @@ pub(crate) struct CommittedTail<'a> {
     epoch: u32,
     /// A group is this walk's iff it is of this kind…
     kind: SalMessageKind,
-    /// …and its zone LSN is past what its family already has on disk. A family
-    /// absent from the map has no store to recover into.
+    /// …and its zone LSN is above its family's replay floor. A family absent from
+    /// the map has no store to recover into.
     family_lsns: &'a HashMap<i64, u64>,
     committed: HashSet<u64>,
 }
@@ -105,11 +105,6 @@ impl<'a> CommittedTail<'a> {
                 .family_lsns
                 .get(&(msg.target_id as i64))
                 .is_some_and(|&f| msg.lsn > f)
-    }
-
-    /// The highest committed zone LSN in the tail, of any kind; `0` for none.
-    pub(crate) fn max_committed_lsn(&self) -> u64 {
-        self.committed.iter().copied().max().unwrap_or(0)
     }
 
     /// Pass 2: this walk's groups from every committed zone, in log order.

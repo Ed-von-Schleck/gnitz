@@ -278,10 +278,10 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
 
     // Reserve the zone LSN but do NOT publish it until fsync confirms
     // durability. A DDL bundle writes arbitrary system families, so the floor is
-    // `max_current_lsn` — the zone must dominate EVERY family's counter
+    // `max_system_lsn` — the zone must dominate every system family's counter
     // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
     // the zone on recovery).
-    let zone_lsn = shared.lsn_alloc.reserve(shared.cat().registry().max_current_lsn());
+    let zone_lsn = shared.lsn_alloc.reserve(shared.cat().registry().max_system_lsn());
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
