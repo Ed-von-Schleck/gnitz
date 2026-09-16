@@ -96,7 +96,7 @@ impl CatalogEngine {
         for &vid in &view_ids {
             let stream_fed = self
                 .dag
-                .get_source_ids(&self.registry, vid)
+                .get_source_ids(vid)
                 .iter()
                 .any(|s| self.registry.relation(*s).map(Relation::kind) == Some(RelationKind::Stream));
             if stream_fed {
@@ -111,7 +111,7 @@ impl CatalogEngine {
         // Phase 2: every registered view downstream of an invalid one.
         let view_set: FxHashSet<i64> = view_ids.iter().copied().collect();
         let seeds = invalid.iter().copied().collect();
-        let reached = self.dag.dependent_closure(&self.registry, seeds);
+        let reached = self.dag.dependent_closure(seeds);
         invalid.extend(reached.into_iter().filter(|v| view_set.contains(v)));
         self.invalid_views = invalid;
     }

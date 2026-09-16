@@ -1562,8 +1562,7 @@ fn build_resolve_reply(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) ->
 /// which is where a stream lands: its reserved LSN is never published.
 ///
 /// A non-view target is vacuously fresh and answers before the closure walk.
-/// Caller holds the catalog read lock; the call is synchronous throughout, so
-/// `source_closure`'s `&mut` rebuild crosses no await.
+/// Caller holds the catalog read lock.
 fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
     if !shared
         .cat()
@@ -1575,8 +1574,10 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
         return true;
     }
     let ticked = shared.last_tick_lsn.get();
-    let (dag, registry) = shared.cat_mut().dag_and_registry_mut();
-    dag.source_closure(registry, vec![target])
+    shared
+        .cat()
+        .dag()
+        .source_closure(vec![target])
         .into_iter()
         .all(|s| shared.commit_lsn_of(s) <= ticked)
 }

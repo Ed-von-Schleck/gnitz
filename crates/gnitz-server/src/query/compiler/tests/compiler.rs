@@ -264,3 +264,27 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
     );
     engine.close();
 }
+
+/// The node cap is what keeps every downstream `u16` id — registers, tables —
+/// in range without any per-plan arithmetic, so it is enforced in the one
+/// constructor every plan passes through rather than at each plan build.
+#[test]
+fn a_circuit_over_the_node_limit_is_rejected() {
+    use gnitz_wire::NodeInputs;
+    let chain = |n: usize| {
+        let mut c = gnitz_wire::Circuit::default();
+        c.push(scan_delta(10), NodeInputs::Source).unwrap();
+        for nid in 1..n {
+            c.push(OpNode::Negate, NodeInputs::Unary(nid - 1)).unwrap();
+        }
+        LoadedCircuit::new(c)
+    };
+    assert_eq!(
+        rejection(chain(MAX_CIRCUIT_NODES + 1)),
+        "circuit exceeds the node limit"
+    );
+    assert!(
+        chain(MAX_CIRCUIT_NODES).is_ok(),
+        "exactly MAX_CIRCUIT_NODES is accepted"
+    );
+}

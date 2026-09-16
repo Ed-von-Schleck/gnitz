@@ -169,6 +169,15 @@ fn decode_rejects_scan_missing_source_table() {
         .contains("source_table"));
 }
 
+/// A `source_table` cell on any opcode but `ScanDelta` is a row `encode_op_node`
+/// never writes.
+#[test]
+fn decode_rejects_a_source_table_off_a_scan() {
+    assert!(decode_op_node(Opcode::IntegrateSink.as_wire(), Some(3), None)
+        .unwrap_err()
+        .contains("carries a source_table"));
+}
+
 /// An opcode outside the space is a corrupt circuit, not a node to skip.
 #[test]
 fn decode_rejects_an_unknown_opcode() {
@@ -494,6 +503,26 @@ fn push_refuses_an_arity_mismatch_and_a_forward_input() {
         "an input naming an earlier node is accepted"
     );
     assert_eq!(c.nodes().len(), 2, "a refused push appends nothing");
+
+    // Slot 1 is filled solely by a binary join: a forged bundle filling it on a
+    // reduce would hand it a delta register with no `Integrate` behind it.
+    let reduce = OpNode::Reduce {
+        group_cols: vec![0],
+        agg: vec![crate::AggDescriptor {
+            agg_op: crate::AggFunc::Count,
+            col_idx: 1,
+        }],
+        global_ground: false,
+    };
+    assert_eq!(
+        c.push(reduce, NodeInputs::Binary { a: 0, b: 1 }).unwrap_err(),
+        "node's inputs do not match its operator's arity"
+    );
+    assert_eq!(
+        c.push(OpNode::ExchangeShard { shard_cols: vec![0] }, NodeInputs::Source)
+            .unwrap_err(),
+        "node's inputs do not match its operator's arity"
+    );
 }
 
 /// A row's slots round-trip through `NodeInputs`, and a slot 1 filled behind an

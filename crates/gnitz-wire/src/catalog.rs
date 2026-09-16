@@ -200,8 +200,8 @@ pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[
 // The circuit table uses a real compound primary key `(view_id, node_id)`
 // instead of hand-packing both halves into one U128 column. PK = columns [0, 1].
 //
-// `opcode` and `source_table` stay scannable columns so `for_each_scan_edge` can
-// rebuild the dependency map without the `params` codec. `input_0`/`input_1` are
+// `opcode` and `source_table` stay scannable columns, so a node's scan edge reads
+// without the `params` codec. `input_0`/`input_1` are
 // port-indexed, so the column name *is* the port; keeping them out of `params`
 // leaves a parameterless node with no blob cell at all.
 pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[

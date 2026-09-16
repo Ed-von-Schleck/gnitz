@@ -285,8 +285,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
-    // new view's base sources once the circuit rows are in the memtable
-    // (so get_source_ids resolves) but before VIEW_TAB registers the view — after
+    // new view's base sources once the circuit rows are applied (so the dependency
+    // map names the view's sources) but before VIEW_TAB registers the view — after
     // registration the view is a dependent of those bases, so an undrained pending
     // delta would tick it through `evaluate_dag` over rows the backfill below also
     // scans, counting them twice. VIEW_TAB is the first family at or past view
@@ -316,8 +316,9 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
         for (family, fbatch) in ordered {
             if view_create && !drained_sources && family.topo_priority() >= view_prio {
                 let sources = {
-                    let (dag, reg) = shared.cat_mut().dag_and_registry_mut();
-                    dag.base_tables_reachable_from(reg, new_view_ids.clone())
+                    let cat = shared.cat();
+                    cat.dag()
+                        .base_tables_reachable_from(cat.registry(), new_view_ids.clone())
                 };
                 for src in sources {
                     shared.disp().drain_tick_blocking(src)?;

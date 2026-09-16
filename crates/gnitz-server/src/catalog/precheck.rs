@@ -11,9 +11,8 @@ use gnitz_store::schema::make_index_schema;
 use gnitz_store::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
-    CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_SOURCE_TABLE, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN,
-    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE,
-    IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
+    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_OWNER_KIND,
+    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
 };
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
@@ -131,8 +130,8 @@ fn check_row_weights(family: SysFamily, batch: &Batch) -> Result<(), String> {
 
 /// A family that admits a rewrite pair takes at most one row per sign; one that
 /// admits none takes at most one row per PK. For the circuit family this is
-/// the whole batch-local contract: a duplicate `(view_id, node_id)` makes
-/// `load_circuit`'s node insert last-writer-wins in cursor order.
+/// the whole batch-local contract: two `+1` rows on one `(view_id, node_id)`
+/// consolidate to weight 2, and the drop's `-1` band would leave one behind.
 fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
     if sig.repeats_a_sign || (family.pair_change_mask().is_none() && sig.is_pair()) {
         return Err(format!(
@@ -229,11 +228,6 @@ fn check_col_ident(batch: &Batch, row: usize, owner_id: i64, expect_kind: i64) -
 
 /// A circuit `+1` may only name a view this same transaction creates: one under a
 /// foreign `view_id` would pin its source table's drop or rewrite a running circuit.
-///
-/// A `ScanDelta` row must scan a relation older than its view. Ids are drawn from
-/// one ascending counter and a source exists before its view, so every legitimate
-/// bundle passes — and ascending id order stays a dependency order, which the tick
-/// scheduler, the backfill and view registration sort by.
 fn check_circuit_rows(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
     // Sorted once: this runs per row of a client-supplied block bounded only by
     // the 64 MB frame.
@@ -245,14 +239,6 @@ fn check_circuit_rows(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String>
             return Err(format!(
                 "circuit row names view {view_id}, which this transaction does not create"
             ));
-        }
-        if payload_u64(batch, i, CIRCNODES_PAY_OPCODE) == gnitz_wire::Opcode::ScanDelta.as_wire() {
-            let source = payload_u64(batch, i, CIRCNODES_PAY_SOURCE_TABLE);
-            if source >= view_id as u64 {
-                return Err(format!(
-                    "circuit row of view {view_id} scans relation {source}, which is not older than it"
-                ));
-            }
         }
     }
     Ok(())
@@ -400,7 +386,8 @@ impl CatalogEngine {
     /// The shape rules every system row passes before its family's arm runs, in
     /// the order each becomes checkable. `check_pk_multiplicity` is what lets the
     /// two rules after it index `sig.neg` / `sig.pos` directly rather than
-    /// rescanning: it makes those the only rows of their sign.
+    /// rescanning: it makes those the only rows of their sign. A family whose rows
+    /// are retracted only with their owner refuses an unpaired `-1`.
     ///
     /// Returns the per-PK signatures and the PKs whose net is dead — the genuine
     /// drops, which the drop guards key on so a rename pair's net-live `-1` is
@@ -412,8 +399,15 @@ impl CatalogEngine {
         let mut net_dead: Vec<i64> = Vec::new();
         for sig in &sigs {
             check_pk_multiplicity(family, sig)?;
+            if family.retracts_with_owner() && sig.pos.is_none() && sig.neg.is_some() {
+                return Err(format!(
+                    "a {} is retracted only with its owner ({})",
+                    family.row_noun(),
+                    family.pk_label(sig.pk)
+                ));
+            }
             check_id_range(family, sig)?;
-            if family.pk_is_live_row_identity() && self.check_cas_and_net(family, batch, sig)? <= 0 {
+            if self.check_cas_and_net(family, batch, sig)? <= 0 {
                 net_dead.push(sig.pk as i64);
             }
             check_pair_fields(family, batch, sig)?;
@@ -459,8 +453,11 @@ impl CatalogEngine {
                 return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
             }
 
-            match (sig.neg, sig.pos) {
-                (Some(nj), Some(pj)) => {
+            let Some(pj) = sig.pos else {
+                unreachable!("the contract refuses a column PK with no `+1`");
+            };
+            match sig.neg {
+                Some(nj) => {
                     // `check_col_narrowings` bounded these booleans to `{0, 1}`.
                     let (old, new) = (read_col_tab_row(batch, nj), read_col_tab_row(batch, pj));
                     // A dropped column is gone from every surface: nothing may
@@ -505,15 +502,7 @@ impl CatalogEngine {
                     }
                     self.reject_if_dependent_views(owner_id, op)?;
                 }
-                (None, Some(pj)) => self.precheck_column_append(batch, pj, owner_id, col_idx, &owner_schema)?,
-                // The contract rejects a PK carrying neither sign, so this is
-                // the unpaired `-1`.
-                _ => {
-                    return Err(
-                        "cannot retract a column of a registered table (physical column removal is not supported)"
-                            .into(),
-                    );
-                }
+                None => self.precheck_column_append(batch, pj, owner_id, col_idx, &owner_schema)?,
             }
         }
         Ok(())
@@ -523,11 +512,12 @@ impl CatalogEngine {
     /// compiled circuit's `ScanDelta` register schema is baked from the base
     /// descriptor and its operator traces hold re-keyed base rows at the old
     /// shape.
-    fn reject_if_dependent_views(&mut self, owner_id: i64, op: &str) -> Result<(), String> {
+    fn reject_if_dependent_views(&self, owner_id: i64, op: &str) -> Result<(), String> {
         // Name the table and one blocking view: the recovery is to drop that
         // view, which a bare id leaves the author to go and look up.
-        let blockers = self.dag.get_dep_map(&self.registry).get(&owner_id).cloned();
-        let Some(blockers) = blockers else { return Ok(()) };
+        let Some(blockers) = self.dag.get_dep_map().get(&owner_id) else {
+            return Ok(());
+        };
         let name = |id: i64| {
             let (sn, en) = self.qualified_name_or_unknown(id);
             format!("{sn}.{en}")
@@ -648,6 +638,14 @@ impl CatalogEngine {
         // nothing to recompute from. `ScanDelta` is the only external-source
         // opcode, so `source_ids` covers every circuit's every source.
         for &src in source_ids {
+            // Ids come from one ascending counter and a source exists before its view, so
+            // ascending id order is a dependency order — which tick scheduling, backfill and
+            // view registration sort by.
+            if src >= vid {
+                return Err(format!(
+                    "view '{name}' (vid={vid}) scans relation {src}, which is not older than it"
+                ));
+            }
             let Some(e) = self.registry.relation(src) else {
                 continue;
             };
@@ -858,7 +856,7 @@ impl CatalogEngine {
                 // creating bundle, so the view's sources resolve here; an
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
                 // row to validate.
-                let source_ids = self.dag.get_source_ids(&self.registry, id);
+                let source_ids = self.dag.get_source_ids(id);
                 self.validate_view_options(id, v.name, v.props, v.owner_view_id, &source_ids)?;
                 self.validate_view_owner(id, v.name, v.owner_view_id, &view_creates)?;
                 (v.schema_id, v.name, v.pk, RelationKind::View)
@@ -917,7 +915,7 @@ impl CatalogEngine {
             }
         }
 
-        let dep_map = self.dag.get_dep_map(&self.registry);
+        let dep_map = self.dag.get_dep_map();
         for &id in net_dead {
             if let Some(dependents) = dep_map.get(&id) {
                 // A dependent that is itself being dropped in this same batch is

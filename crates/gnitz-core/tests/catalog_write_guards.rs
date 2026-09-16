@@ -490,7 +490,7 @@ fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
 
 /// A view whose circuit scans itself would make its own backfill and tick order
 /// undefined; ascending id order is dependency order only while every scan edge
-/// names an older relation, so the engine refuses the bundle before applying it.
+/// names an older relation, so the engine refuses the bundle and undoes what it applied.
 #[test]
 fn a_view_scanning_itself_is_refused() {
     let srv = ServerHandle::start();

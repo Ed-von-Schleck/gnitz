@@ -489,10 +489,7 @@ impl MasterDispatcher {
         ordered.sort_unstable();
         ordered.dedup();
         for vid in ordered {
-            let sources = {
-                let (dag, registry) = self.cat().dag_and_registry_mut();
-                dag.get_source_ids(registry, vid)
-            };
+            let sources = self.cat().dag().get_source_ids(vid);
             for src in sources {
                 self.fan_out_backfill(vid, src).map_err(|e| WireFault {
                     status: e.status,
@@ -581,10 +578,7 @@ impl MasterDispatcher {
         if !cat.registry().any_delta_feed() {
             return;
         }
-        let reached = {
-            let (dag, registry) = cat.dag_and_registry_mut();
-            dag.dependent_closure(registry, vec![tid])
-        };
+        let reached = cat.dag().dependent_closure(vec![tid]);
         let mut map = self.last_delta_round.borrow_mut();
         for vid in reached {
             if cat.registry().relation(vid).is_some_and(Relation::has_delta_feed) {

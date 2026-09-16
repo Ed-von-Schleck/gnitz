@@ -72,7 +72,6 @@ impl DagEngine {
     pub(crate) fn unregister_table(&mut self, registry: &mut RelationRegistry, table_id: i64) {
         registry.unregister(table_id);
         self.invalidate(table_id);
-        self.dep.invalidate();
     }
 
     /// Empty `view_id`'s output store and drop the plan compiled against it. The
@@ -102,7 +101,7 @@ impl DagEngine {
         table_id: i64,
         schema: SchemaDescriptor,
     ) -> Result<(), String> {
-        if self.has_dependents(registry, table_id) {
+        if self.has_dependents(table_id) {
             return Err(format!(
                 "swap_schema: table {table_id} has dependent views; RESTRICT should have rejected the ALTER"
             ));
@@ -128,11 +127,11 @@ impl DagEngine {
     pub(crate) fn invalidate_all(&mut self) {
         self.cache.clear();
         self.meta.clear();
-        self.dep.invalidate();
     }
 
-    pub(crate) fn invalidate_dep_map(&mut self) {
-        self.dep.invalidate();
+    /// Apply one `CircuitNodes` delta to the dependency map.
+    pub(crate) fn apply_circuit_delta(&mut self, batch: &Batch) {
+        self.dep.apply(batch);
     }
 
     // ── Compilation ─────────────────────────────────────────────────────

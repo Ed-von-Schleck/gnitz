@@ -50,10 +50,9 @@ impl CatalogEngine {
             }
             // `_sequences` rows drive no cache.
             SysFamily::Sequence => {}
-            // The dependency map is derived from the `ScanDelta` nodes, so a
-            // circuit-node write restates the graph. The circuit itself is
-            // loaded by `load_circuit`, not by hooks.
-            SysFamily::CircuitNodes => self.dag.invalidate_dep_map(),
+            // The dependency map is maintained from circuit-row deltas; the circuit itself is
+            // read by `load_circuit` when a view compiles.
+            SysFamily::CircuitNodes => self.dag.apply_circuit_delta(batch),
         }
         Ok(())
     }
@@ -183,7 +182,7 @@ impl CatalogEngine {
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
         // so `get_source_ids` resolves here. Re-check for the paths that skip the
         // precheck (boot replay, worker `ddl_sync`).
-        let source_ids = self.dag.get_source_ids(&self.registry, vid);
+        let source_ids = self.dag.get_source_ids(vid);
         self.validate_view_options(vid, name, props, owner_view_id, &source_ids)?;
         // Stamping the fold is what makes placement transitive:
         // `hook_relation_register` registers this view after its sources, so a view

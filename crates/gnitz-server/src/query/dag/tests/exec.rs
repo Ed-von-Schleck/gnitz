@@ -67,10 +67,10 @@ fn live_weight(engine: &CatalogEngine, tid: i64) -> i64 {
 /// feeds, and a tick of an intermediate view runs only what that view reaches.
 #[test]
 fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
-    let (mut engine, base, a, b, deep) = engine_with_fanout("schedule");
+    let (engine, base, a, b, deep) = engine_with_fanout("schedule");
     let step = |view, producer| Step { view, producer };
 
-    let (dag, registry) = engine.dag_and_registry_mut();
+    let (dag, registry) = (engine.dag(), engine.registry());
     assert_eq!(
         dag.tick_schedule(registry, base),
         vec![step(a, base), step(b, base), step(deep, a)],

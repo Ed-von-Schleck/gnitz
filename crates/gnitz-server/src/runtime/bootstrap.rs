@@ -97,15 +97,16 @@ fn inject_recovery_panic(stage: &str) {
 /// for a reproducible drive order. Keyed on the boot verdict and not on what the
 /// tail contained, because the sweep is also what compiles a view at boot, and
 /// the boot checkpoint publishes traces only for compiled views.
-fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
+fn swept_base_tables(catalog: &CatalogEngine) -> Vec<i64> {
     let keeps_state: Vec<i64> = catalog
         .registry()
         .view_ids()
         .into_iter()
         .filter(|&vid| !catalog.view_is_invalid(vid))
         .collect();
-    let (dag, registry) = catalog.dag_and_registry_mut();
-    dag.base_tables_reachable_from(registry, keeps_state)
+    catalog
+        .dag()
+        .base_tables_reachable_from(catalog.registry(), keeps_state)
 }
 
 /// Which of a group's slots `slot` replays, and whether what it reads is still

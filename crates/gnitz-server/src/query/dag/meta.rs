@@ -8,61 +8,65 @@
 
 use super::*;
 use gnitz_store::relation::Relation;
+use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
-/// The bidirectional view-dependency index with its validity flag bundled in, so
-/// "valid but stale" is unreachable: only `get_or_rebuild` sets `valid` (after
-/// repopulating both maps), and only `invalidate` clears it.
+/// The bidirectional view-dependency index, kept current by every `CircuitNodes` delta.
+/// A `forward` / `reverse` entry exists only while it holds an id.
 #[derive(Default)]
 pub(super) struct DepMap {
-    /// source_table_id → [view_ids]. An entry exists only because an edge was
-    /// pushed into it, so a present entry is never empty.
+    /// source_table_id → [view_ids]
     pub(in crate::query) forward: FxHashMap<i64, Vec<i64>>,
-    pub(in crate::query) reverse: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
-    pub(in crate::query) valid: bool,
+    /// view_id → [source_table_ids]
+    pub(in crate::query) reverse: FxHashMap<i64, Vec<i64>>,
+    /// Every `(view, source)` pair the two maps hold, so linking one is a hash probe.
+    pub(in crate::query) edges: FxHashSet<(i64, i64)>,
 }
 
 impl DepMap {
-    /// Both maps are a pure function of the `CircuitNodes` system table, so only
-    /// a writer of that table has dirtied them — the catalog ingest hook, and a
-    /// dropped base table whose scan edges outlive it.
-    pub(super) fn invalidate(&mut self) {
-        self.valid = false;
-    }
-
-    /// Rebuild both maps from the CircuitNodes system table if
-    /// stale and return the forward (source → views) map. An edge is one
-    /// `ScanDelta` node, read through the same reader that builds the circuit,
-    /// so the graph the scheduler walks names the sources the circuit actually
-    /// scans.
-    ///
-    /// The registry is a disjoint parameter rather than a field of the engine, so
-    /// reading the circuit table through it does not double-borrow against
-    /// `&mut self.dep`.
-    pub(super) fn get_or_rebuild(&mut self, registry: &RelationRegistry) -> &FxHashMap<i64, Vec<i64>> {
-        if self.valid {
-            return &self.forward;
-        }
-        self.forward.clear();
-        self.reverse.clear();
-        // A view scanning one source twice yields two nodes, and a source's
-        // forward entries interleave across views — dedup with a seen set
-        // instead of a per-row `Vec::contains` scan.
-        let mut seen: FxHashSet<(i64, i64)> = FxHashSet::default();
-        compiler::for_each_scan_edge(registry, |v_id, dep_tid| {
-            if seen.insert((v_id, dep_tid)) {
-                self.forward.entry(dep_tid).or_default().push(v_id);
-                self.reverse.entry(v_id).or_default().push(dep_tid);
+    /// Apply one `CircuitNodes` delta. An edge is one `ScanDelta` row. A view's rows arrive
+    /// with the bundle creating it and leave with its drop (the catalog refuses any other
+    /// `-1`), so a `+1` links an edge once however many scans name it, and a `-1` forgets
+    /// the whole view. Both are idempotent: a Stage-A compensation negates a batch even
+    /// when that batch's ingest failed before its hook ran. Linear in the delta and the
+    /// edges it removes.
+    pub(super) fn apply(&mut self, batch: &Batch) {
+        let mut gone: FxHashSet<i64> = FxHashSet::default();
+        let mut touched: FxHashSet<i64> = FxHashSet::default();
+        for i in batch.retracted_rows() {
+            let view = compiler::read_circuit_node_row(batch, i).view_id as i64;
+            if gone.insert(view) {
+                for source in self.reverse.remove(&view).into_iter().flatten() {
+                    self.edges.remove(&(view, source));
+                    touched.insert(source);
+                }
             }
-        });
-        self.valid = true;
-        &self.forward
+        }
+        for source in touched {
+            if let Entry::Occupied(mut views) = self.forward.entry(source) {
+                views.get_mut().retain(|v| !gone.contains(v));
+                if views.get().is_empty() {
+                    views.remove();
+                }
+            }
+        }
+        for i in batch.live_rows() {
+            let row = compiler::read_circuit_node_row(batch, i);
+            let Some(source) = row.scan_source().map(|s| s as i64) else {
+                continue;
+            };
+            let view = row.view_id as i64;
+            if self.edges.insert((view, source)) {
+                self.reverse.entry(view).or_default().push(source);
+                self.forward.entry(source).or_default().push(view);
+            }
+        }
     }
 
     /// Transitive closure of `seeds` over one half of the map, seeds excluded.
     /// Both directions are this one walk, so they cannot drift: `forward` reaches
     /// a source's dependents, `reverse` reaches a view's sources, and
-    /// `get_or_rebuild` writes both halves from the same `ScanDelta` node.
+    /// `apply` writes both halves from the same `ScanDelta` node.
     pub(super) fn closure(edges: &FxHashMap<i64, Vec<i64>>, seeds: Vec<i64>) -> FxHashSet<i64> {
         let mut reachable: FxHashSet<i64> = FxHashSet::default();
         let mut stack = seeds;
@@ -80,15 +84,13 @@ impl DepMap {
 impl DagEngine {
     // ── Dependency map ──────────────────────────────────────────────────
 
-    /// Rebuild the dependency maps from the CircuitNodes system table if stale
-    /// and return the forward (source → views) map.
-    pub(crate) fn get_dep_map(&mut self, registry: &RelationRegistry) -> &FxHashMap<i64, Vec<i64>> {
-        self.dep.get_or_rebuild(registry)
+    /// The forward (source → views) map.
+    pub(crate) fn get_dep_map(&self) -> &FxHashMap<i64, Vec<i64>> {
+        &self.dep.forward
     }
 
     /// Return all direct source table IDs for a view.
-    pub(crate) fn get_source_ids(&mut self, registry: &RelationRegistry, view_id: i64) -> Vec<i64> {
-        self.get_dep_map(registry);
+    pub(crate) fn get_source_ids(&self, view_id: i64) -> Vec<i64> {
         self.dep.reverse.get(&view_id).cloned().unwrap_or_default()
     }
 
@@ -99,8 +101,7 @@ impl DagEngine {
     /// Applies no `tables` kind filter, so a source absent from `tables` is still
     /// reported: the read-freshness test that drives this must not narrow its own
     /// input, or a dropped source would vanish from the closure and read as fresh.
-    pub(crate) fn source_closure(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> FxHashSet<i64> {
-        self.get_dep_map(registry);
+    pub(crate) fn source_closure(&self, seeds: Vec<i64>) -> FxHashSet<i64> {
         DepMap::closure(&self.dep.reverse, seeds)
     }
 
@@ -111,16 +112,15 @@ impl DagEngine {
     /// Beside [`Self::source_closure`] rather than re-derived outside the crate
     /// off `get_dep_map`, because the two directions belong next to each other and
     /// only one of them was reachable from outside.
-    pub(crate) fn dependent_closure(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> FxHashSet<i64> {
-        self.get_dep_map(registry);
+    pub(crate) fn dependent_closure(&self, seeds: Vec<i64>) -> FxHashSet<i64> {
         DepMap::closure(&self.dep.forward, seeds)
     }
 
     /// Whether any view scans `id` directly — one step of
     /// [`Self::dependent_closure`], and the one spelling of the test, so no
     /// caller has to know that a `forward` entry is never empty.
-    pub(crate) fn has_dependents(&mut self, registry: &RelationRegistry, id: i64) -> bool {
-        self.get_dep_map(registry).contains_key(&id)
+    pub(crate) fn has_dependents(&self, id: i64) -> bool {
+        self.dep.forward.contains_key(&id)
     }
 
     /// Transitive base-table sources of `seeds` (views), deduplicated and
@@ -136,9 +136,9 @@ impl DagEngine {
     /// preceded by a drain: it backfills from the stream's empty store and starts
     /// accumulating from its own registration. Whether a row pushed just before the
     /// CREATE lands in it therefore depends on whether its tick had already fired.
-    pub(crate) fn base_tables_reachable_from(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> Vec<i64> {
+    pub(crate) fn base_tables_reachable_from(&self, registry: &RelationRegistry, seeds: Vec<i64>) -> Vec<i64> {
         let mut bases: Vec<i64> = self
-            .source_closure(registry, seeds)
+            .source_closure(seeds)
             .into_iter()
             .filter(|&s| {
                 registry

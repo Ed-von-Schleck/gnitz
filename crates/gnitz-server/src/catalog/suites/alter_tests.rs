@@ -401,7 +401,7 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let vid = register_identity_view(&mut engine, tid, "v", &cols);
     assert_eq!(
-        engine.dag.get_dep_map(&engine.registry).get(&tid),
+        engine.dag.get_dep_map().get(&tid),
         Some(&vec![vid]),
         "precondition: the table has a dependent view"
     );

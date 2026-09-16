@@ -1040,6 +1040,9 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
 /// but empty cell is damaged — no layout here encodes to zero bytes.
 pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) -> Result<OpNode, String> {
     let op = Opcode::from_wire(opcode).ok_or_else(|| format!("unknown opcode {opcode}"))?;
+    if src_tab.is_some() && !matches!(op, Opcode::ScanDelta) {
+        return Err(format!("{op:?} carries a source_table"));
+    }
     if params.is_some_and(<[u8]>::is_empty) {
         return Err(format!("{op:?} carries an empty parameter cell"));
     }

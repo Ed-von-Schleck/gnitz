@@ -533,6 +533,15 @@ impl SysFamily {
         }
     }
 
+    /// Are this family's rows retracted only with the relation that owns them — as a band,
+    /// by the drop cascade? A client delta may then carry no unpaired `-1` for it.
+    pub(super) fn retracts_with_owner(self) -> bool {
+        match self {
+            SysFamily::Column | SysFamily::CircuitNodes => true,
+            SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index | SysFamily::Sequence => false,
+        }
+    }
+
     /// May a client-pushed `DDL_TXN` bundle carry a block for this family?
     /// `false` for Sequence alone: boot feeds its rows straight into the id
     /// counters and the resume verdict, where a forged value aborts every
@@ -546,22 +555,6 @@ impl SysFamily {
             | SysFamily::Column
             | SysFamily::Index
             | SysFamily::CircuitNodes => true,
-        }
-    }
-
-    /// Is this family's PK the identity of at most one live row — the premise
-    /// `check_cas_and_net` rests on, and its sole gate? False for the circuit
-    /// family alone, whose `(view_id, node_id)` addresses a node of a circuit.
-    /// Not PK arity: Column is pair-keyed and still `true`.
-    pub(super) fn pk_is_live_row_identity(self) -> bool {
-        match self {
-            SysFamily::CircuitNodes => false,
-            SysFamily::Schema
-            | SysFamily::Table
-            | SysFamily::View
-            | SysFamily::Column
-            | SysFamily::Index
-            | SysFamily::Sequence => true,
         }
     }
 

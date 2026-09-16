@@ -226,3 +226,61 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[CIRCNODES_PAY_INPUT_1], Val::Null);
     assert_eq!(v[CIRCNODES_PAY_PARAMS], Val::Null);
 }
+
+/// Pushing each row `write_circuit_rows` would lay down rebuilds the circuit, and a
+/// row whose id skips the next index is refused.
+#[test]
+fn push_row_rebuilds_the_rows_and_refuses_a_gap() {
+    use crate::{encode_op_node, Circuit, NodeInputs, OpNode, Opcode};
+    let mut original = Circuit::default();
+    let scan = original
+        .push(
+            OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
+            NodeInputs::Source,
+        )
+        .unwrap();
+    let filter = original
+        .push(OpNode::Filter(vec![1, 2, 3]), NodeInputs::Unary(scan))
+        .unwrap();
+    original.push(OpNode::IntegrateSink, NodeInputs::Unary(filter)).unwrap();
+
+    let mut rebuilt = Circuit::default();
+    for (node_id, node) in original.nodes().iter().enumerate() {
+        let (opcode, source_table, params) = encode_op_node(&node.op);
+        let row = CircuitNodeRow {
+            view_id: 1,
+            node_id: node_id as u64,
+            opcode: opcode.as_wire(),
+            source_table,
+            inputs: node.inputs.to_slots(),
+            params: params.as_deref(),
+        };
+        rebuilt.push_row(&row).unwrap();
+    }
+    assert_eq!(rebuilt, original);
+
+    let gap = CircuitNodeRow {
+        view_id: 1,
+        node_id: 5,
+        opcode: Opcode::Negate.as_wire(),
+        source_table: None,
+        inputs: [Some(0), None],
+        params: None,
+    };
+    assert_eq!(
+        rebuilt.push_row(&gap).unwrap_err(),
+        "circuit node ids are not dense from 0"
+    );
+
+    let row = |opcode: Opcode, source_table| CircuitNodeRow {
+        view_id: 1,
+        node_id: 0,
+        opcode: opcode.as_wire(),
+        source_table,
+        inputs: [None, None],
+        params: None,
+    };
+    assert_eq!(row(Opcode::ScanDelta, Some(7)).scan_source(), Some(7));
+    assert_eq!(row(Opcode::IntegrateSink, Some(7)).scan_source(), None);
+    assert_eq!(row(Opcode::ScanDelta, None).scan_source(), None);
+}

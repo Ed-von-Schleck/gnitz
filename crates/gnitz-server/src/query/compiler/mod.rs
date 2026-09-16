@@ -29,7 +29,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 
 // `pub(super)` by default: `dag` is the only module that names the compiler, so
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
-pub(super) use load::for_each_scan_edge;
+pub(super) use load::read_circuit_node_row;
 pub(crate) use routing::RelayRoute;
 pub(super) use routing::ViewMeta;
 

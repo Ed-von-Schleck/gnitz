@@ -183,19 +183,19 @@ impl DagEngine {
     /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
     /// execution order. A pure function of the dep map, which is
     /// worker-identical — what keeps the workers in lockstep.
-    fn tick_schedule(&mut self, registry: &RelationRegistry, source_id: i64) -> Vec<Step> {
+    fn tick_schedule(&self, registry: &RelationRegistry, source_id: i64) -> Vec<Step> {
         // A push into a table no view scans is the common case, and reaches
         // nothing.
-        if !self.has_dependents(registry, source_id) {
+        if !self.has_dependents(source_id) {
             return Vec::new();
         }
-        let mut producers = self.dependent_closure(registry, vec![source_id]);
+        let mut producers = self.dependent_closure(vec![source_id]);
         producers.insert(source_id);
         let mut schedule: Vec<Step> = Vec::new();
         for producer in producers {
             for &view in self.dep.forward.get(&producer).into_iter().flatten() {
-                // The dep map is built from `CircuitNodes`, which can still name a
-                // relation the registry no longer holds.
+                // The dep map can still name a view the registry has just dropped:
+                // a drop unregisters the view before its circuit rows are retracted.
                 if registry.has_id(view) {
                     schedule.push(Step { view, producer });
                 }

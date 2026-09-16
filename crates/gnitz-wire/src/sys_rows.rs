@@ -178,7 +178,7 @@ pub struct CircuitNodeRow<'a> {
     pub view_id: u64,
     pub node_id: u64,
     pub opcode: u64,
-    /// `None` for every opcode but `ScanDelta`.
+    /// `Some` exactly for `ScanDelta`.
     pub source_table: Option<u64>,
     /// The producers feeding this node's input slots, in port order: `None` past
     /// the operator's arity. A port takes one producer, which is why it is a
@@ -226,6 +226,28 @@ pub fn write_circuit_rows(sink: &mut impl SysRowSink, view_id: u64, circuit: &cr
             },
             1,
         );
+    }
+}
+
+impl CircuitNodeRow<'_> {
+    /// The relation a `ScanDelta` row scans; `None` for every other opcode and for a
+    /// `ScanDelta` whose cell is NULL.
+    pub fn scan_source(&self) -> Option<u64> {
+        self.source_table
+            .filter(|_| self.opcode == crate::Opcode::ScanDelta.as_wire())
+    }
+}
+
+impl crate::Circuit {
+    /// Append the node `row` describes: [`write_circuit_rows`]'s inverse, fed one row at a
+    /// time in `node_id` order. Refuses a row whose id is not the next index, and whatever
+    /// [`crate::decode_op_node`], [`crate::NodeInputs::from_slots`] or [`Self::push`] refuses.
+    pub fn push_row(&mut self, row: &CircuitNodeRow) -> Result<crate::NodeId, String> {
+        if row.node_id != self.nodes().len() as u64 {
+            return Err("circuit node ids are not dense from 0".into());
+        }
+        let op = crate::decode_op_node(row.opcode, row.source_table, row.params)?;
+        self.push(op, crate::NodeInputs::from_slots(row.inputs)?)
     }
 }
 

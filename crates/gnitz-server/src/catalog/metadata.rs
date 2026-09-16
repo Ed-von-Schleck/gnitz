@@ -20,6 +20,11 @@ impl CatalogEngine {
         &self.registry
     }
 
+    /// The DBSP layer's view state: plan cache, per-view metadata and the dependency map.
+    pub(crate) fn dag(&self) -> &DagEngine {
+        &self.dag
+    }
+
     /// [`Self::registry`] for the callers that register, ingest into or flush a
     /// relation.
     pub(crate) fn registry_mut(&mut self) -> &mut RelationRegistry {

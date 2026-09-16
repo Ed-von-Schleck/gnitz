@@ -169,8 +169,9 @@ impl CatalogEngine {
     // -- Replay catalog (recovery) -----------------------------------------
 
     fn replay_catalog(&mut self) -> Result<(), String> {
-        // Only these five families need hook-driven replay; Circuit* and
-        // sys_sequences are loaded directly by other open-time paths. Schema
+        // Only these six families need hook-driven replay; `_sequences` is loaded by
+        // `load_sequence_scalars`. CircuitNodes precedes View: view registration reads
+        // the dependency map it fills. Schema
         // must precede the two relation families (their qualified names need it),
         // and Index must follow them. COL_TAB replaying last does NOT violate the
         // COL-before-relation contract: the register hooks read sys_columns
@@ -178,6 +179,7 @@ impl CatalogEngine {
         // doc).
         self.replay_system_table(SysFamily::Schema)?;
         self.replay_system_table(SysFamily::Table)?;
+        self.replay_system_table(SysFamily::CircuitNodes)?;
         self.replay_system_table(SysFamily::View)?;
         self.replay_system_table(SysFamily::Column)?; // FK wiring + col_names invalidation
         self.replay_system_table(SysFamily::Index)?;

@@ -187,9 +187,9 @@ fn a_rewrite_pair_is_rejected_for_a_family_with_no_pair_mask() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A duplicate `(view_id, node_id)` makes `load_circuit`'s node insert
-/// last-writer-wins in cursor order, so rule 3 is the circuit family's whole
-/// batch-local contract.
+/// Two `+1` rows on one `(view_id, node_id)` consolidate to weight 2, and the
+/// drop's `-1` band would leave one behind, so rule 3 is the circuit family's
+/// whole batch-local contract.
 #[test]
 fn a_duplicate_circuit_key_is_rejected_and_a_distinct_one_is_not() {
     let (engine, dir) = open("precheck_circuit_dup");
@@ -201,11 +201,29 @@ fn a_duplicate_circuit_key_is_rejected_and_a_distinct_one_is_not() {
     assert!(err.contains("more than one row for circuit row"), "{err}");
     assert!(err.contains("view 20 node 0"), "the message names both halves: {err}");
 
-    // Two nodes of one view are distinct keys, and the circuit family takes no
-    // live-row probe — that their view exists is the bundle guard's rule.
+    // Two nodes of one view are distinct keys; that their view exists is the
+    // bundle guard's rule.
     engine
         .check_family_contract(SysFamily::CircuitNodes, &circuit_batch(&[(20, 0, 1), (20, 1, 1)]))
         .unwrap();
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Circuit and column rows leave only as their owner's band, which the drop cascade
+/// applies without the precheck, so a client `-1` for one is always a forgery.
+#[test]
+fn a_row_retracted_only_with_its_owner_refuses_an_unpaired_retraction() {
+    let (engine, dir) = open("precheck_owner_retraction");
+    let err = contract_err(&engine, SysFamily::CircuitNodes, &circuit_batch(&[(20, 0, -1)]));
+    assert!(err.contains("retracted only with its owner"), "{err}");
+    assert!(err.contains("view 20 node 0"), "{err}");
+
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    push_col_tab_row(&mut bb, 300, OWNER_KIND_TABLE, 1, &col_def("v", type_code::U64), -1);
+    let err = contract_err(&engine, SysFamily::Column, &bb.finish());
+    assert!(err.contains("retracted only with its owner"), "{err}");
+    assert!(err.contains("column 1 of owner 300"), "{err}");
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }

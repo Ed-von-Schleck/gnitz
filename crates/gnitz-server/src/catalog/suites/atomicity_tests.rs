@@ -523,7 +523,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     let vid = engine.allocate_ids(1).unwrap();
     write_identity_circuit(&mut engine, vid, tid, gnitz_wire::ReadBound::None);
     assert_eq!(
-        engine.dag.get_dep_map(&engine.registry).get(&tid),
+        engine.dag.get_dep_map().get(&tid),
         Some(&vec![vid]),
         "precondition: dependency edge T -> V must be present"
     );
