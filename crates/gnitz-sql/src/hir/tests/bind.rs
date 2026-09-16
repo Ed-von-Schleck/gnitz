@@ -19,7 +19,6 @@ fn catalog() -> CatalogSnapshot {
                 tid,
                 class: RelClass::Table,
                 replicated: false,
-                delta: false,
                 schema,
                 indexes: Arc::new(Vec::new()),
             })),
@@ -49,10 +48,10 @@ pub(in crate::hir) fn bound(sql: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
         panic!("not a CREATE VIEW");
     };
     let cat = catalog();
-    let binder = Binder::new("public");
     let ids = ColIdGen::new();
     let body = crate::validate::reject_query_envelope_body(&cv.query, "view body")?;
-    let mut cx = BindCx::new(&cat, &binder, &ids, crate::hir::bind::ViewSurface::CREATE);
+    let view = crate::hir::bind::ViewBody { stmt: "CREATE VIEW", replacing: None };
+    let mut cx = BindCx::new(&cat, "public", &ids, view);
     bind_body(&mut cx, body)
 }
 

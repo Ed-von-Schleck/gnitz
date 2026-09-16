@@ -9,9 +9,9 @@ use gnitz_foundation::fault::Seam;
 use gnitz_foundation::gnitz_debug;
 use gnitz_store::relation::{
     lock_data_dir, relation_dir, OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
-    ViewBudgets,
 };
 use gnitz_store::storage::{Slot, StoreError};
+use gnitz_wire::ViewProps;
 
 use crate::state::{encode_records, read_state, write_state, MirrorRecord};
 
@@ -156,7 +156,7 @@ impl Mirror {
                     directory: relation_dir(&self.base_dir, RelationKind::View, tid as i64),
                     // No skeleton row is ever written, so nothing can ask this
                     // store to hydrate; and the store maintains no feed of its own.
-                    budgets: ViewBudgets::default(),
+                    props: ViewProps::default(),
                 },
                 OnRegister::Live,
             )

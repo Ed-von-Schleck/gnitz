@@ -623,25 +623,15 @@ impl CatalogEngine {
         &self,
         vid: i64,
         name: &str,
-        budgets: gnitz_store::relation::ViewBudgets,
+        props: gnitz_wire::ViewProps,
         owner_view_id: i64,
         source_ids: &[i64],
     ) -> Result<(), String> {
         // An internal chain segment is a relation the planner mints, never
         // something an option clause may name.
-        if (budgets.capacity_bytes.is_some() || budgets.delta_bytes.is_some()) && owner_view_id != 0 {
+        if props != gnitz_wire::ViewProps::Plain && owner_view_id != 0 {
             return Err(format!(
                 "catalog invariant violated: internal segment '{name}' (vid={vid}) carries a WITH option."
-            ));
-        }
-        // A bounded view's `Delta(0)` cannot be a function of the tick round, and
-        // the whole feed contract is that it is: hydrating a skeleton key reads the
-        // source's live store, which `handle_push` advances outside any tick, so
-        // the bootstrap would carry a push the next poll delivers again.
-        if budgets.capacity_bytes.is_some() && budgets.delta_bytes.is_some() {
-            return Err(format!(
-                "view '{name}' (vid={vid}) declares both `capacity` and `delta`; \
-                 a capacity-bounded view cannot carry a delta feed"
             ));
         }
         // Both rules trace to skeleton rows being recomputed from the *source*
@@ -653,14 +643,16 @@ impl CatalogEngine {
                 continue;
             };
             if e.is_bounded() {
+                let (sn, tn) = self.qualified_name_or_unknown(src);
                 return Err(format!(
-                    "view '{name}' (vid={vid}) reads relation {src}, which is a \
+                    "view '{name}' (vid={vid}) reads '{sn}.{tn}', which is a \
                      capacity-bounded view; views cannot be created over one"
                 ));
             }
-            if budgets.capacity_bytes.is_some() && e.kind() == RelationKind::Stream {
+            if matches!(props, gnitz_wire::ViewProps::Bounded { .. }) && e.kind() == RelationKind::Stream {
+                let (sn, tn) = self.qualified_name_or_unknown(src);
                 return Err(format!(
-                    "view '{name}' (vid={vid}) reads relation {src}, which is a stream; \
+                    "view '{name}' (vid={vid}) reads '{sn}.{tn}', which is a stream; \
                      a capacity-bounded view cannot be created over one"
                 ));
             }
@@ -858,7 +850,7 @@ impl CatalogEngine {
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
                 // row to validate.
                 let source_ids = self.dag.get_source_ids(&self.registry, id);
-                self.validate_view_options(id, v.name, v.budgets, v.owner_view_id, &source_ids)?;
+                self.validate_view_options(id, v.name, v.props, v.owner_view_id, &source_ids)?;
                 self.validate_view_owner(id, v.name, v.owner_view_id, &view_creates)?;
                 (v.schema_id, v.name, v.pk, RelationKind::View)
             };

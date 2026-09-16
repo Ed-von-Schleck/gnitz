@@ -1,10 +1,11 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_batch, make_schema_u64_i64, pk_only_schema, pk_payload_schema, sum_weights};
-use gnitz_store::relation::{CircuitState, OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
+use gnitz_store::relation::{CircuitState, OnRegister, RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::storage::Slot;
 use gnitz_wire::type_code;
+use gnitz_wire::ViewProps;
 use std::collections::HashMap;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -78,7 +79,7 @@ fn home(dir: &str, id: u64, rows: impl IntoIterator<Item = (i64, SchemaDescripto
                 kind: RelationKind::View,
                 schema: make_schema_u64_i64(),
                 directory: dir.to_string(),
-                budgets: ViewBudgets::default(),
+                props: ViewProps::default(),
             },
             OnRegister::Live,
         )
@@ -650,7 +651,7 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
                 kind: RelationKind::View,
                 schema,
                 directory: dir.to_string(),
-                budgets: ViewBudgets::default(),
+                props: ViewProps::default(),
             },
             OnRegister::Live,
         )

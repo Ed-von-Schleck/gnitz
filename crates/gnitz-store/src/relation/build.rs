@@ -46,7 +46,7 @@ impl RelationRegistry {
             crate::storage::repartition_relation(&spec.directory, &spec.schema, spec.id as u32, self.slot.of)?;
         }
         let stores = staged_dir(&spec.directory, || {
-            self.build_relation_store(spec.kind, &spec.directory, spec.id, spec.schema, spec.budgets)
+            self.build_relation_store(spec.kind, &spec.directory, spec.id, spec.schema, spec.props)
         })?;
         self.tables.insert(spec.id, Relation::new(spec, stores));
         Ok(())
@@ -71,14 +71,14 @@ impl RelationRegistry {
         directory: &str,
         id: i64,
         schema: SchemaDescriptor,
-        budgets: ViewBudgets,
+        props: ViewProps,
     ) -> Result<(Store, Option<Box<Store>>), StoreError> {
         // Above every early return below, so it runs on **every** process: the
         // post-fork master opens no user store at all, and a limit first noticed
         // on a worker would be a fatal abort taken after the client was told the
         // CREATE succeeded.
-        let delta = budgets
-            .delta_bytes
+        let delta = props
+            .delta_bytes()
             .map(|budget| {
                 crate::schema::make_delta_schema(&schema)
                     .map(|delta_schema| (budget, delta_schema))
@@ -125,7 +125,7 @@ impl RelationRegistry {
             schema,
             id as u32,
             recovery,
-            self.store_budgets().bounded(budgets.capacity_bytes),
+            self.store_budgets().bounded(props.capacity_bytes()),
         )
         .map_err(|e| StoreError::storage(format!("open relation {id} (dir={directory})"), e))?;
         Ok((

@@ -297,8 +297,7 @@ fn a_wire_supplied_owner_view_id_must_name_a_real_view() {
             schema_id: sid,
             name: "seg",
             pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
-            capacity_bytes: 0,
-            delta_bytes: 0,
+            props: gnitz_wire::ViewProps::default(),
             owner_view_id: 999_999,
         },
         1,
@@ -399,9 +398,8 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
                 circuit,
                 output_columns: cols.to_vec(),
                 pk_cols: vec![0],
-                capacity_bytes: None,
-                delta_bytes: None,
             }],
+            gnitz_core::ViewProps::default(),
             true,
         )
         .expect("the replacement bundle applies");
@@ -507,7 +505,7 @@ fn a_view_scanning_itself_is_refused() {
     circuit.sink(scan);
     let nodes = sys_schema(gnitz_wire::CIRCUIT_NODES_TAB);
     let mut nb = ZSetBatch::new(nodes);
-    gnitz_wire::sys_rows::write_circuit_rows(&mut BatchAppender::new(&mut nb, nodes), vid, circuit);
+    gnitz_wire::sys_rows::write_circuit_rows(&mut BatchAppender::new(&mut nb, nodes), vid, &circuit);
     let view_s = sys_schema(gnitz_wire::VIEW_TAB);
     let mut vb = ZSetBatch::new(view_s);
     gnitz_wire::sys_rows::write_view_tab_row(
@@ -517,8 +515,7 @@ fn a_view_scanning_itself_is_refused() {
             schema_id: sid,
             name: "v",
             pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
-            capacity_bytes: 0,
-            delta_bytes: 0,
+            props: gnitz_wire::ViewProps::default(),
             owner_view_id: 0,
         },
         1,

@@ -2,14 +2,13 @@
 
 use super::*;
 use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, zset_of};
-use gnitz_store::relation::{
-    OnRegister, RelationKind, RelationRegistry, RelationSpec, StateIdx, StoreConfig, ViewBudgets,
-};
+use gnitz_store::relation::{OnRegister, RelationKind, RelationRegistry, RelationSpec, StateIdx, StoreConfig};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, Slot, StorageError};
 use gnitz_wire::type_code;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
+use gnitz_wire::ViewProps;
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
@@ -33,7 +32,7 @@ fn vm_registry(dir: &std::path::Path) -> RelationRegistry {
                 kind: RelationKind::View,
                 schema: make_schema_u128_i64(),
                 directory: dir.to_str().unwrap().to_string(),
-                budgets: ViewBudgets::default(),
+                props: ViewProps::default(),
             },
             OnRegister::Live,
         )

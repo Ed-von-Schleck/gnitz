@@ -70,7 +70,7 @@ fn sample(op: Opcode) -> OpNode {
 
 /// Re-decode a node through the row fields `encode_op_node` produces.
 fn roundtrip(op: OpNode) -> Result<OpNode, String> {
-    let (opcode, src_tab, params) = encode_op_node(op);
+    let (opcode, src_tab, params) = encode_op_node(&op);
     decode_op_node(opcode.as_wire(), src_tab, params.as_deref())
 }
 
@@ -134,7 +134,7 @@ fn every_op_node_variant_roundtrips() {
 #[test]
 fn each_sample_encodes_under_its_own_opcode() {
     for &op in Opcode::ALL {
-        let (opcode, ..) = encode_op_node(sample(op));
+        let (opcode, ..) = encode_op_node(&sample(op));
         assert_eq!(opcode, op, "{op:?} encodes under {opcode:?}");
     }
 }
@@ -145,7 +145,7 @@ fn each_sample_encodes_under_its_own_opcode() {
 #[test]
 fn a_truncated_or_over_long_params_cell_is_rejected() {
     for &op in Opcode::ALL {
-        let (_, src_tab, params) = encode_op_node(sample(op));
+        let (_, src_tab, params) = encode_op_node(&sample(op));
         let mut over_long = params.clone().unwrap_or_default();
         over_long.push(0);
         let decode = |bytes: &[u8]| decode_op_node(op.as_wire(), src_tab, Some(bytes));
@@ -252,7 +252,7 @@ fn a_map_reindex_whose_role_or_key_is_unusable_is_rejected() {
 /// must stay distinguishable, so the common shape costs nothing.
 #[test]
 fn unbounded_scan_delta_encodes_identically() {
-    let fields = encode_op_node(OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None });
+    let fields = encode_op_node(&OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None });
     assert_eq!(fields, (Opcode::ScanDelta, Some(7), None));
     assert_eq!(
         decode_op_node(Opcode::ScanDelta.as_wire(), Some(7), None).unwrap(),
@@ -401,7 +401,7 @@ fn top_n_rejects_too_many_keys() {
                 nulls_first: false,
             })
             .collect();
-        let (_, _, params) = encode_op_node(OpNode::TopN {
+        let (_, _, params) = encode_op_node(&OpNode::TopN {
             group_cols: vec![],
             order,
             limit,

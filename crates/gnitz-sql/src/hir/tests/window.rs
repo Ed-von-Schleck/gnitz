@@ -3,7 +3,7 @@
 //! clause the user wrote.
 
 use crate::error::GnitzSqlError;
-use crate::hir::{plan_view, ViewPlan};
+use crate::hir::{plan_create_view, ViewPlan};
 use crate::test_support::{col_def, parse_stmt};
 use gnitz_core::{CatalogSnapshot, ColumnDef, RelClass, RelDescriptor, Schema, TypeCode};
 use std::sync::Arc;
@@ -21,7 +21,6 @@ fn catalog() -> CatalogSnapshot {
                 tid,
                 class,
                 replicated: false,
-                delta: false,
                 schema,
                 indexes: Arc::new(Vec::new()),
             })),
@@ -52,8 +51,10 @@ fn catalog() -> CatalogSnapshot {
 /// Plan `CREATE VIEW v AS <sql>`: the chain's segment count (the final view
 /// included) and the final view's output columns.
 fn plan(sql: &str) -> Result<(usize, Vec<ColumnDef>), GnitzSqlError> {
-    let stmt = parse_stmt(&format!("CREATE VIEW v AS {sql}"));
-    match plan_view(&stmt, &catalog(), "public")? {
+    let sqlparser::ast::Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v AS {sql}")) else {
+        panic!("not a CREATE VIEW");
+    };
+    match plan_create_view(&cv, &catalog(), "public")? {
         ViewPlan::Create { chain, .. } => {
             let cols = chain
                 .views

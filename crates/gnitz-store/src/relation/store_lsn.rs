@@ -119,15 +119,15 @@ impl RelationRegistry {
     /// preparation first. Both stores are rebuilt, so a fed view cannot come back
     /// declaring a feed it has no store for.
     pub(crate) fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), StoreError> {
-        let (dir, schema, kind, budgets) = {
+        let (dir, schema, kind, props) = {
             let e = self
                 .tables
                 .get(&tid)
                 .ok_or_else(|| StoreError::rejected(format!("{what}: relation {tid} is not registered")))?;
-            (e.directory().to_string(), e.schema(), e.kind(), e.budgets())
+            (e.directory().to_string(), e.schema(), e.kind(), e.props())
         };
         let stores = self
-            .build_relation_store(kind, &dir, tid, schema, budgets)
+            .build_relation_store(kind, &dir, tid, schema, props)
             .map_err(|e| e.in_context(&format!("{what} tid={tid}")))?;
         self.tables.get_mut(&tid).expect("entry read above").set_stores(stores);
         Ok(())

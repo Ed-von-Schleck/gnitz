@@ -131,16 +131,9 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     col("name", TypeCode::String, false),
     // Packed view-PK column list (`pack_pk_cols`).
     col("pk_col_idx", TypeCode::U64, false),
-    // `CREATE VIEW … WITH (capacity = …)`, in bytes; `0` is unbounded. Presence
-    // of a capacity *is* the bounded classification — a second flag word could
-    // only ever disagree with it. The engine reads it at boot from the replayed
-    // rows; nothing else records it.
+    // `ViewProps::row_words`: `WITH (capacity = …)` in bytes, `0` absent.
     col("capacity_bytes", TypeCode::U64, false),
-    // `CREATE VIEW … WITH (delta = …)`, in bytes; `0` is no feed. Presence of a
-    // budget *is* the fed classification, exactly as `capacity_bytes` above.
-    // Orthogonal to it: the two are refused together, but by a rule, not by the
-    // encoding. The engine reads it at boot from the replayed rows; nothing else
-    // records it.
+    // `ViewProps::row_words`: `WITH (delta = …)` in bytes, `0` absent.
     col("delta_bytes", TypeCode::U64, false),
     // The user view this row is an internal chain segment of; `0` is a user
     // view. A column rather than a name prefix, because the precheck can
@@ -899,6 +892,55 @@ impl TableProps {
             ));
         }
         Ok(())
+    }
+}
+
+/// The `WITH (…)` options of one user-named view.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub enum ViewProps {
+    #[default]
+    Plain,
+    /// `WITH (capacity = …)`: the view's output store is bounded, dehydrating past it.
+    Bounded { capacity_bytes: u64 },
+    /// `WITH (delta = …)`: the view keeps its recent deltas in a store of its own.
+    Fed { delta_bytes: u64 },
+}
+
+impl ViewProps {
+    /// The props two optional budgets name.
+    pub fn from_budgets(capacity_bytes: Option<u64>, delta_bytes: Option<u64>) -> Result<ViewProps, String> {
+        match (capacity_bytes, delta_bytes) {
+            (None, None) => Ok(ViewProps::Plain),
+            (Some(capacity_bytes), None) => Ok(ViewProps::Bounded { capacity_bytes }),
+            (None, Some(delta_bytes)) => Ok(ViewProps::Fed { delta_bytes }),
+            (Some(_), Some(_)) => Err("a capacity-bounded view cannot carry a delta feed: its bootstrap read \
+                                       hydrates from the source relation's live store, which no tick round governs"
+                .to_string()),
+        }
+    }
+
+    /// Decode the `(capacity, delta)` `VIEW_TAB` words, where `0` is absent.
+    pub fn from_row(capacity: u64, delta: u64) -> Result<ViewProps, String> {
+        Self::from_budgets((capacity != 0).then_some(capacity), (delta != 0).then_some(delta))
+    }
+
+    /// The `(capacity, delta)` `VIEW_TAB` words.
+    pub fn row_words(self) -> (u64, u64) {
+        (self.capacity_bytes().unwrap_or(0), self.delta_bytes().unwrap_or(0))
+    }
+
+    pub fn capacity_bytes(self) -> Option<u64> {
+        match self {
+            ViewProps::Bounded { capacity_bytes } => Some(capacity_bytes),
+            _ => None,
+        }
+    }
+
+    pub fn delta_bytes(self) -> Option<u64> {
+        match self {
+            ViewProps::Fed { delta_bytes } => Some(delta_bytes),
+            _ => None,
+        }
     }
 }
 

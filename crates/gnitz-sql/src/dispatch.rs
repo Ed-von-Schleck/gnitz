@@ -193,9 +193,9 @@ pub(crate) fn execute_statement(
             reject_if(table.is_some(), CTX, "ON <table> (MySQL DROP INDEX target)")?;
             ddl::execute_drop(client, schema_name, object_type, names, *if_exists)
         }
-        Statement::CreateView(_) => {
+        Statement::CreateView(cv) => {
             let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
-                crate::plan_view(stmt, cat, schema_name)
+                crate::plan_create_view(cv, cat, schema_name)
             })?;
             crate::hir::execute_create_view(client, schema_name, plan)
         }
@@ -204,9 +204,9 @@ pub(crate) fn execute_statement(
         Statement::Update(update) => dml::execute_update(client, update, &binder),
         Statement::Delete(del) => dml::execute_delete(client, del, &binder),
         Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a),
-        Statement::AlterView { .. } => {
+        Statement::AlterView { name, query, columns, with_options } => {
             let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
-                crate::plan_view(stmt, cat, schema_name)
+                crate::plan_alter_view(name, columns, query, with_options, cat, schema_name)
             })?;
             crate::hir::execute_alter_view(client, schema_name, plan)
         }

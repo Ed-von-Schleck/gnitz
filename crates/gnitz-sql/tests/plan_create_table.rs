@@ -225,6 +225,12 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
             "Unsupported",
             "TEMPORARY",
         ),
+        // Inheriting would silently drop the parent's columns.
+        (
+            "CREATE TABLE t (id BIGINT PRIMARY KEY) INHERITS (p)",
+            "Unsupported",
+            "INHERITS",
+        ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT CHECK (x > 0))",
             "Unsupported",
@@ -357,7 +363,7 @@ fn if_not_exists_plans_a_skip_but_a_bad_with_key_still_errors() {
         other => panic!("expected a skip, got {:?}", other.map(|_| "a create")),
     }
     let sql = "CREATE TABLE IF NOT EXISTS tv (id BIGINT PRIMARY KEY) WITH (bogus = true)";
-    assert_rejects(sql, plan_table(&cat, sql), "Plan", "bogus");
+    assert_rejects(sql, plan_table(&cat, sql), "Unsupported", "bogus");
 }
 
 /// A name the snapshot has not probed is the control signal `plan_resolving`

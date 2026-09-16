@@ -17,41 +17,6 @@ fn absence_is_the_empty_blob() {
     assert_eq!(crate::german_string::german_spill_len(present.len()), 0);
 }
 
-/// The feed bit round-trips on a plain view and is refused on every other
-/// class — a bounded one included, since `capacity` and `delta` are refused
-/// together everywhere else. A blob claiming otherwise is rejected rather
-/// than believed.
-#[test]
-fn delta_flag_roundtrips_on_a_view_and_is_refused_elsewhere() {
-    let d = RelDescriptorBlob {
-        class: RelClass::View,
-        delta: true,
-        ..Default::default()
-    };
-    assert_eq!(roundtrip(&d, 2), d);
-    for class in [RelClass::Table, RelClass::Stream, RelClass::BoundedView] {
-        let mut bytes = RelDescriptorBlob { class, ..Default::default() }.encode();
-        bytes[1] |= DESC_FLAG_DELTA;
-        assert!(RelDescriptorBlob::decode(&bytes, 2).unwrap_err().contains("delta feed"));
-    }
-}
-
-/// The encoder's own admission rule must be the decoder's: a `BoundedView`
-/// carrying a feed would otherwise encode cleanly and then fail its own decode.
-/// `debug_assert`, so this is a debug-build claim — which is where the E2E suite
-/// and every unit run live.
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "only a plain view can carry a delta feed")]
-fn encoding_a_bounded_view_with_a_feed_is_refused() {
-    let _ = RelDescriptorBlob {
-        class: RelClass::BoundedView,
-        delta: true,
-        ..Default::default()
-    }
-    .encode();
-}
-
 #[test]
 fn empty_lists_roundtrip() {
     let d = RelDescriptorBlob::default();
@@ -63,7 +28,6 @@ fn multi_column_index_and_multi_fk_roundtrip() {
     let d = RelDescriptorBlob {
         class: RelClass::BoundedView,
         replicated: true,
-        delta: false,
         fks: vec![
             RelFk {
                 col_idx: 0,
@@ -96,7 +60,13 @@ fn multi_column_index_and_multi_fk_roundtrip() {
 /// per-worker partials.
 #[test]
 fn every_class_roundtrips_with_replicated() {
-    for class in [RelClass::Table, RelClass::Stream, RelClass::View, RelClass::BoundedView] {
+    for class in [
+        RelClass::Table,
+        RelClass::Stream,
+        RelClass::View,
+        RelClass::BoundedView,
+        RelClass::FedView,
+    ] {
         for &replicated in &[false, true] {
             let d = RelDescriptorBlob { class, replicated, ..Default::default() };
             let back = roundtrip(&d, 2);
@@ -188,7 +158,20 @@ fn each_decode_guard_rejects_its_own_forgery() {
             "no relation class",
         ),
         ("every class bit", flags(DESC_FLAG_CLASS), 4, "no relation class"),
-        // Bit 5: the lowest bit above `DESC_FLAG_DELTA`, so this names no flag
+        (
+            "bounded and fed",
+            flags(DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_DELTA),
+            4,
+            "no relation class",
+        ),
+        ("fed without view", flags(DESC_FLAG_DELTA), 4, "no relation class"),
+        (
+            "fed stream",
+            flags(DESC_FLAG_STREAM | DESC_FLAG_DELTA),
+            4,
+            "no relation class",
+        ),
+        // Bit 5: the lowest bit above the class bits, so this names no flag
         // rather than setting one that exists.
         ("unknown flag bit", flags(1 << 5), 0, "unknown flag bits"),
         ("trailing byte", trailing, 0, "trailing"),

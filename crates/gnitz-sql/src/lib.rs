@@ -26,8 +26,8 @@ mod validate;
 pub use ddl::{plan_create_table, TablePlan};
 pub use dml::{explain_lines, plan_read, ReadPlan};
 pub use error::GnitzSqlError;
-pub use hir::{plan_view, PlannedChain, ViewPlan};
-// The planning entry points take a `sqlparser::ast::Statement`, so a caller must
+pub use hir::{plan_alter_view, plan_create_view, PlannedChain, ViewPlan};
+// The planning entry points take `sqlparser::ast` nodes, so a caller must
 // be able to build one with the same pinned parser the planner matches on.
 pub use sqlparser;
 

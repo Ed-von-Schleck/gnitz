@@ -963,22 +963,22 @@ pub(crate) fn read_compute_map(r: &mut Reader) -> Result<ComputeMap, String> {
 /// Encode a typed `OpNode` into its `CircuitNodes` row fields — the inverse of
 /// [`decode_op_node`]. The expression blob is carried opaquely (each crate
 /// encodes it with its own encoder before building the `OpNode`).
-pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
+pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
     let mut w = Writer::with_capacity(32);
     match op {
         // An unbounded `ScanDelta` carries no params at all: the common shape
         // costs nothing, and "absent" and "empty" stay distinguishable.
-        OpNode::ScanDelta { source, bound: crate::ReadBound::None } => (Opcode::ScanDelta, Some(source), None),
+        OpNode::ScanDelta { source, bound: crate::ReadBound::None } => (Opcode::ScanDelta, Some(*source), None),
         OpNode::ScanDelta { source, bound } => {
-            crate::read_spec::write_read_bound(&mut w, &bound);
-            (Opcode::ScanDelta, Some(source), Some(w.into_vec()))
+            crate::read_spec::write_read_bound(&mut w, bound);
+            (Opcode::ScanDelta, Some(*source), Some(w.into_vec()))
         }
         OpNode::Filter(program) => {
-            w.bytes32(&program);
+            w.bytes32(program);
             (Opcode::Filter, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::Projection(cols)) => {
-            write_cols(&mut w, &cols);
+            write_cols(&mut w, cols);
             (Opcode::MapProj, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::Compute(map)) => {
@@ -987,13 +987,13 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
         }
         OpNode::Map(MapKind::Reindex { keep, key, role }) => {
             w.u8(role.as_wire());
-            write_cols_with_tcs(&mut w, &key);
-            write_cols(&mut w, &keep);
+            write_cols_with_tcs(&mut w, key);
+            write_cols(&mut w, keep);
             (Opcode::MapReindex, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::HashRow { cols, branch_id }) => {
-            w.u8(branch_id);
-            write_cols_with_tcs(&mut w, &cols);
+            w.u8(*branch_id);
+            write_cols_with_tcs(&mut w, cols);
             (Opcode::MapHashRow, None, Some(w.into_vec()))
         }
         OpNode::Negate => (Opcode::Negate, None, None),
@@ -1001,35 +1001,35 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
         OpNode::Distinct => (Opcode::Distinct, None, None),
         OpNode::PositivePart => (Opcode::PositivePart, None, None),
         OpNode::Reduce { group_cols, agg, global_ground } => {
-            w.u8(global_ground as u8);
-            write_cols(&mut w, &group_cols);
-            write_aggs(&mut w, &agg);
+            w.u8(*global_ground as u8);
+            write_cols(&mut w, group_cols);
+            write_aggs(&mut w, agg);
             (Opcode::Reduce, None, Some(w.into_vec()))
         }
         OpNode::Join(JoinKind::Equi) => (Opcode::JoinEqui, None, None),
         OpNode::Join(JoinKind::Range { n_eq, rel }) => {
-            w.u8(n_eq).u8(rel.as_wire());
+            w.u8(*n_eq).u8(rel.as_wire());
             (Opcode::JoinRange, None, Some(w.into_vec()))
         }
         OpNode::Join(JoinKind::Cross) => (Opcode::JoinCross, None, None),
         OpNode::IntegrateSink => (Opcode::IntegrateSink, None, None),
         OpNode::IntegrateTrace => (Opcode::IntegrateTrace, None, None),
         OpNode::ExchangeShard { shard_cols } => {
-            write_cols(&mut w, &shard_cols);
+            write_cols(&mut w, shard_cols);
             (Opcode::ExchangeShard, None, Some(w.into_vec()))
         }
         OpNode::NullExtend { type_codes } => {
             write_count(&mut w, type_codes.len());
             for tc in type_codes {
-                w.u8(tc);
+                w.u8(*tc);
             }
             (Opcode::NullExtend, None, Some(w.into_vec()))
         }
         OpNode::WorkerFilter => (Opcode::WorkerFilter, None, None),
         OpNode::TopN { group_cols, order, limit, offset } => {
-            w.u64(limit).u64(offset);
-            write_cols(&mut w, &group_cols);
-            write_order_keys(&mut w, &order);
+            w.u64(*limit).u64(*offset);
+            write_cols(&mut w, group_cols);
+            write_order_keys(&mut w, order);
             (Opcode::TopN, None, Some(w.into_vec()))
         }
     }

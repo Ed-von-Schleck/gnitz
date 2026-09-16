@@ -161,8 +161,7 @@ fn values_land_in_their_named_payload_slots() {
             schema_id: 4,
             name: "v",
             pk_col_idx: 6,
-            capacity_bytes: 4096,
-            delta_bytes: 1 << 20,
+            props: crate::ViewProps::Fed { delta_bytes: 1 << 20 },
             owner_view_id: 21,
         },
         1,
@@ -172,7 +171,7 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(4));
     assert_eq!(v[RELTAB_PAY_NAME], Val::Str("v".into()));
     assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
-    assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(4096));
+    assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(0));
     assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));
     assert_eq!(v[VIEWTAB_PAY_OWNER_VIEW_ID], Val::U64(21));
 

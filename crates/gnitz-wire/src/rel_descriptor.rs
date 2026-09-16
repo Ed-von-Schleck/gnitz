@@ -13,9 +13,9 @@
 //!
 //! ```text
 //! u8   version
-//! u8   flags         bit 0 = replicated; bits 1..4 = the relation's class
-//!                    (bit 1 = view, bit 2 = capacity-bounded, bit 3 = stream);
-//!                    bit 4 = the view carries a delta feed
+//! u8   flags         bit 0 = replicated; bits 1..5 = the relation's class
+//!                    (bit 1 = view, bit 2 = capacity-bounded, bit 3 = stream,
+//!                    bit 4 = delta feed)
 //! u16  fk_count
 //! u16  index_count
 //!      fk_count    × { u32 col_idx, u32 fk_col_idx, u64 fk_table_id }
@@ -38,23 +38,15 @@ use crate::{unpack_pk_cols, PkColList};
 /// other value rather than guessing at field offsets.
 const VERSION: u8 = 1;
 
-/// Descriptor `flags` bit 0: the relation's rows are a full copy on every worker.
+/// Descriptor `flags` bit 0: the ingestion point's rows are a full copy on every
+/// worker.
 const DESC_FLAG_REPLICATED: u8 = 1 << 0;
-/// Descriptor `flags` bits 1..4: the [`RelClass`] encoding. Spare bits of the
-/// existing byte, so no field offset moves and `VERSION` stays put.
+/// Descriptor `flags` bits 1..5: the [`RelClass`] encoding.
 const DESC_FLAG_VIEW: u8 = 1 << 1;
 const DESC_FLAG_BOUNDED: u8 = 1 << 2;
 const DESC_FLAG_STREAM: u8 = 1 << 3;
-const DESC_FLAG_CLASS: u8 = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_STREAM;
-/// Descriptor `flags` bit 4: the view was created `WITH (delta = …)`, so it keeps
-/// its recent deltas in a store of its own and answers a DELTA_POLL.
-///
-/// A bool beside the class rather than a fourth [`RelClass`] variant: the two are
-/// orthogonal in principle — `capacity` and `delta` are refused together today
-/// only because a bounded view hydrates from a store no tick governs — so folding
-/// it in would square `View`/`BoundedView` the moment that is lifted.
-/// [`RelDescriptorBlob::decode`] holds today's rule instead.
 const DESC_FLAG_DELTA: u8 = 1 << 4;
+const DESC_FLAG_CLASS: u8 = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_STREAM | DESC_FLAG_DELTA;
 
 /// What a relation *is* — the one vocabulary the client and the engine share for
 /// this. A single value rather than three independent booleans, so the impossible
@@ -71,22 +63,25 @@ pub enum RelClass {
     /// A view created `WITH (capacity = …)`. Views may not be created over one (the
     /// leaf rule) and `ALTER VIEW … AS` may not retarget one.
     BoundedView,
+    /// A view created `WITH (delta = …)`: it keeps its recent deltas in a store of
+    /// its own and answers a DELTA_POLL. `ALTER VIEW … AS` may not retarget one.
+    FedView,
 }
 
 impl RelClass {
-    /// What to call this relation in a message to the user. Both view classes are
-    /// "view": the rules that turn on the capacity carry their own wording.
+    /// What to call this relation in a message to the user. Every view class is
+    /// "view": the rules that turn on an option carry their own wording.
     pub fn noun(self) -> &'static str {
         match self {
             RelClass::Table => "table",
             RelClass::Stream => "stream",
-            RelClass::View | RelClass::BoundedView => "view",
+            RelClass::View | RelClass::BoundedView | RelClass::FedView => "view",
         }
     }
 
-    /// True for both view classes.
+    /// True for every view class.
     pub fn is_view(self) -> bool {
-        matches!(self, RelClass::View | RelClass::BoundedView)
+        matches!(self, RelClass::View | RelClass::BoundedView | RelClass::FedView)
     }
 
     fn to_flags(self) -> u8 {
@@ -95,6 +90,7 @@ impl RelClass {
             RelClass::Stream => DESC_FLAG_STREAM,
             RelClass::View => DESC_FLAG_VIEW,
             RelClass::BoundedView => DESC_FLAG_VIEW | DESC_FLAG_BOUNDED,
+            RelClass::FedView => DESC_FLAG_VIEW | DESC_FLAG_DELTA,
         }
     }
 
@@ -104,6 +100,7 @@ impl RelClass {
             DESC_FLAG_STREAM => Ok(RelClass::Stream),
             DESC_FLAG_VIEW => Ok(RelClass::View),
             f if f == DESC_FLAG_VIEW | DESC_FLAG_BOUNDED => Ok(RelClass::BoundedView),
+            f if f == DESC_FLAG_VIEW | DESC_FLAG_DELTA => Ok(RelClass::FedView),
             f => Err(format!("rel descriptor: no relation class for flag bits {f:#04x}")),
         }
     }
@@ -133,12 +130,9 @@ pub struct RelIndex {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct RelDescriptorBlob {
     pub class: RelClass,
-    /// The relation's rows are a full copy on every worker.
+    /// The relation is an ingestion point whose rows are a full copy on every
+    /// worker. Never set on a view.
     pub replicated: bool,
-    /// The view keeps a delta feed: a subscriber discovers the capability here
-    /// instead of probing for it with a read that errors. Never set on a
-    /// non-view.
-    pub delta: bool,
     pub fks: Vec<RelFk>,
     pub indexes: Vec<RelIndex>,
 }
@@ -154,13 +148,7 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(self.fks.len() <= u16::MAX as usize && self.indexes.len() <= u16::MAX as usize);
         let mut w = Writer::with_capacity(HEADER_LEN + 16 * (self.fks.len() + self.indexes.len()));
-        debug_assert!(
-            !self.delta || self.class == RelClass::View,
-            "only a plain view can carry a delta feed"
-        );
-        let flags = self.class.to_flags()
-            | if self.replicated { DESC_FLAG_REPLICATED } else { 0 }
-            | if self.delta { DESC_FLAG_DELTA } else { 0 };
+        let flags = self.class.to_flags() | if self.replicated { DESC_FLAG_REPLICATED } else { 0 };
         w.u8(VERSION)
             .u8(flags)
             .u16(self.fks.len() as u16)
@@ -192,24 +180,10 @@ impl RelDescriptorBlob {
             return Err(format!("rel descriptor: unknown version {version}"));
         }
         let flags = r.u8()?;
-        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_CLASS | DESC_FLAG_DELTA) != 0 {
+        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_CLASS) != 0 {
             return Err(format!("rel descriptor: unknown flag bits {flags:#04x}"));
         }
         let class = RelClass::from_flags(flags)?;
-        let delta = flags & DESC_FLAG_DELTA != 0;
-        // A plain view, not merely any view: `capacity` and `delta` are refused
-        // together at the SQL layer and again at `view_registration`, so a
-        // `BoundedView` carrying a feed is a combination the system does not
-        // build. This is the boundary that keeps it unbuildable off the wire too.
-        if delta && class != RelClass::View {
-            return Err(format!(
-                "rel descriptor: a delta feed on a {} names no relation",
-                match class {
-                    RelClass::BoundedView => "capacity-bounded view",
-                    other => other.noun(),
-                }
-            ));
-        }
         let fk_count = r.u16()? as usize;
         let index_count = r.u16()? as usize;
 
@@ -244,7 +218,6 @@ impl RelDescriptorBlob {
         Ok(Some(RelDescriptorBlob {
             class,
             replicated: flags & DESC_FLAG_REPLICATED != 0,
-            delta,
             fks,
             indexes,
         }))

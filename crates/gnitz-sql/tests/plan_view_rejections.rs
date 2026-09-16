@@ -761,17 +761,18 @@ fn ambiguous_and_hidden_column_rules() {
 #[test]
 fn capacity_rules() {
     let cat = cat();
-    for (clause, needle) in [
-        ("WITH (foo = '1 MB')", "unknown CREATE VIEW option"),
+    for (clause, variant, needle) in [
+        ("WITH (foo = '1 MB')", "Unsupported", "unknown CREATE VIEW option"),
         // An unknown key names every key that would have been read, so the
         // message is enough to fix the statement without opening the grammar.
-        ("WITH (foo = '1 MB')", "capacity"),
-        ("WITH (foo = '1 MB')", "delta"),
-        ("WITH (capacity = 5)", "single-quoted"),
-        ("WITH (capacity = 'lots')", "not a size"),
+        ("WITH (foo = '1 MB')", "Unsupported", "capacity"),
+        ("WITH (foo = '1 MB')", "Unsupported", "delta"),
+        ("WITH (capacity = 5)", "Plan", "single-quoted"),
+        ("WITH (capacity = 'lots')", "Plan", "not a size"),
+        ("WITH (capacity = '1 MB', capacity = '4 GB')", "Plan", "more than once"),
     ] {
         let sql = format!("CREATE VIEW v {clause} AS SELECT id, v FROM t");
-        assert_rejects(&sql, plan(&cat, &sql), "Plan", needle);
+        assert_rejects(&sql, plan(&cat, &sql), variant, needle);
     }
     let sql = "CREATE VIEW v WITH (capacity = '1 MB', delta = '1 MB') AS SELECT id, v FROM t";
     assert_rejects(sql, plan(&cat, sql), "Unsupported", "cannot carry a delta feed");
@@ -804,6 +805,18 @@ fn capacity_rules() {
         assert_rejects(&sql, plan(&cat, &sql), "Unsupported", "capacity");
     }
 
+    // An inner equi-join root whose sides cut a segment of their own: the root
+    // shape is eligible, but the cut would hold an unbounded copy of its rows.
+    for body in [
+        "SELECT x.id, y.v FROM t x JOIN t y ON x.id = y.g",
+        "SELECT t.id, u.v, a.k FROM t JOIN u ON t.id = u.g JOIN a ON a.id = t.id",
+        "SELECT t.id, d.s FROM t JOIN (SELECT g, SUM(v) AS s FROM u GROUP BY g) d ON t.id = d.g",
+    ] {
+        assert!(view(&cat, body).views.len() > 1, "`{body}` cuts a segment unbounded");
+        let sql = format!("CREATE VIEW v WITH (capacity = '1 MB') AS {body}");
+        assert_rejects(&sql, plan(&cat, &sql), "Unsupported", "more than one view");
+    }
+
     // A bounded view is a leaf, and cannot be retargeted.
     rejects(
         &cat,
@@ -828,6 +841,9 @@ fn capacity_rules() {
     );
     let sql = "ALTER VIEW bv AS SELECT id, v FROM t WHERE v > 0";
     assert_rejects(sql, plan(&cat, sql), "Unsupported", "capacity-bounded");
+    // A fed view cannot be retargeted either: its feed would be silently dropped.
+    let sql = "ALTER VIEW fv AS SELECT id, v FROM t WHERE v > 0";
+    assert_rejects(sql, plan(&cat, sql), "Unsupported", "delta feed");
 }
 
 /// Both retarget spellings: never onto a body that reads the view itself, and
@@ -841,6 +857,8 @@ fn a_retarget_never_reads_itself_nor_replaces_a_non_view() {
     for verb in ["ALTER VIEW", "CREATE OR REPLACE VIEW"] {
         for (target, body, needle) in [
             ("tv", "SELECT id, v FROM tv", "itself"),
+            // A CTE is bound whether or not the body reads it.
+            ("tv", "WITH x AS (SELECT id FROM tv) SELECT id, v FROM t", "itself"),
             ("t", "SELECT id, v FROM u", "is a table"),
             ("st", "SELECT id, v FROM u", "is a stream"),
         ] {
@@ -848,9 +866,12 @@ fn a_retarget_never_reads_itself_nor_replaces_a_non_view() {
             assert_rejects(&sql, plan(&cat, &sql), "Unsupported", needle);
         }
     }
+    // The self-reference outranks the leaf rule a bounded view would also break.
+    let sql = "CREATE OR REPLACE VIEW bv AS SELECT id, v FROM bv";
+    assert_rejects(sql, plan(&cat, sql), "Unsupported", "itself");
 }
 
-/// The statement clauses `plan_view` itself turns away, on both spellings:
+/// The statement clauses the view planners themselves turn away, on both spellings:
 /// the entry point rejects them, not a guard a caller must remember to run.
 #[test]
 fn view_statement_rejected_clause_matrix() {
@@ -880,6 +901,10 @@ fn view_statement_rejected_clause_matrix() {
             "CREATE VIEW v OPTIONS(capacity = '4 MB') AS SELECT id FROM t",
             "OPTIONS",
         ),
+        // `CREATE TABLE` honours CLUSTER BY, so a view silently dropping it would
+        // be built unclustered.
+        ("CREATE VIEW v CLUSTER BY (id) AS SELECT id FROM t", "CLUSTER BY"),
+        ("CREATE VIEW v COMMENT = 'x' AS SELECT id FROM t", "COMMENT"),
     ] {
         assert_rejects(sql, plan(&cat, sql), "Unsupported", needle);
     }

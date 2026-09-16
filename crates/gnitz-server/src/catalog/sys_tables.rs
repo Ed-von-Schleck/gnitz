@@ -10,10 +10,11 @@ use rustc_hash::FxHashMap;
 use super::pair_opk;
 use super::ColumnDef;
 use gnitz_expr::RowSource;
-use gnitz_store::relation::{RelationKind, ViewBudgets};
+use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{payload_str, payload_string, payload_u64, Batch};
+use gnitz_wire::ViewProps;
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
@@ -98,9 +99,7 @@ pub(super) struct RelationRegistration<'a> {
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
     pub(super) placement: Placement,
-    /// The `WITH (…)` byte budgets; both `None` for a base table and for a plain
-    /// view.
-    pub(super) budgets: ViewBudgets,
+    pub(super) props: ViewProps,
 }
 
 /// Decode TABLE_TAB `row` into the whole registration it describes, `id` off the
@@ -137,7 +136,7 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
         } else {
             Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
         },
-        budgets: ViewBudgets::default(),
+        props: ViewProps::default(),
     })
 }
 
@@ -147,26 +146,27 @@ pub(super) struct ViewRegistration<'a> {
     pub(super) schema_id: i64,
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
-    pub(super) budgets: ViewBudgets,
+    pub(super) props: ViewProps,
     /// The user view this row is an internal chain segment of; `0` for a user
     /// view.
     pub(super) owner_view_id: i64,
 }
 
-/// Decode VIEW_TAB `row`. A `0` budget word decodes to `None` here so no caller
-/// repeats the sentinel.
+/// Decode VIEW_TAB `row`.
 pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistration<'_>, String> {
     let name = payload_str(batch, row, RELTAB_PAY_NAME);
     let pk = unpack_pk_cols(payload_u64(batch, row, VIEWTAB_PAY_PK_COL_IDX))
         .map_err(|rule| format!("catalog invariant violated: view '{name}' {rule}"))?;
+    let props = ViewProps::from_row(
+        payload_u64(batch, row, VIEWTAB_PAY_CAPACITY),
+        payload_u64(batch, row, VIEWTAB_PAY_DELTA),
+    )
+    .map_err(|e| format!("view '{name}': {e}"))?;
     Ok(ViewRegistration {
         schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
-        budgets: ViewBudgets {
-            capacity_bytes: Some(payload_u64(batch, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
-            delta_bytes: Some(payload_u64(batch, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
-        },
+        props,
         owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
     })
 }

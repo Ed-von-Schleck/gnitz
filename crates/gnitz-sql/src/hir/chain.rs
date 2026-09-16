@@ -33,33 +33,25 @@ pub(crate) fn admit(schema: &Schema, what: &str) -> Result<(), GnitzSqlError> {
 /// exactly, which the resolve loop needs to re-run a pass.
 pub(crate) struct ViewChain {
     pub(crate) segments: Vec<PlannedView>,
+    /// A capacity-bounded view, which must compile to exactly one view.
+    pub(crate) bounded: bool,
 }
 
 impl ViewChain {
-    pub(crate) fn new() -> Self {
-        ViewChain { segments: Vec::new() }
+    pub(crate) fn new(bounded: bool) -> Self {
+        ViewChain { segments: Vec::new(), bounded }
     }
 
     /// Push one emitted circuit: the one path every circuit, hidden or final,
-    /// reaches — so no emitter has to remember the checks, and none can be added
-    /// that escapes them.
-    fn push(
-        &mut self,
-        circuit: Circuit,
-        schema: Schema,
-        capacity_bytes: Option<u64>,
-        delta_bytes: Option<u64>,
-        what: &str,
-    ) -> Result<(), GnitzSqlError> {
+    /// reaches.
+    fn push(&mut self, circuit: Circuit, schema: Schema, what: &str) -> Result<&mut PlannedView, GnitzSqlError> {
         admit(&schema, what)?;
         self.segments.push(PlannedView {
             circuit,
             output_columns: schema.columns,
             pk_cols: schema.pk_cols,
-            capacity_bytes,
-            delta_bytes,
         });
-        Ok(())
+        Ok(self.segments.last_mut().expect("just pushed"))
     }
 
     /// Add one hidden segment: run `emit` (the emitter may push its own upstream
@@ -72,9 +64,16 @@ impl ViewChain {
         &mut self,
         emit: impl FnOnce(&mut ViewChain) -> Result<EmitPieces, GnitzSqlError>,
     ) -> Result<SegInput, GnitzSqlError> {
+        if self.bounded {
+            return Err(GnitzSqlError::Unsupported(
+                "CREATE VIEW WITH (capacity …): this body compiles to more than one view, whose \
+                 intermediate results are unbounded; only a filter/projection over one relation \
+                 and an inner equi-join are supported"
+                    .to_string(),
+            ));
+        }
         let EmitPieces { circuit, out } = emit(self)?;
-        // Capacity and delta feeds belong to the user-named view alone.
-        self.push(circuit, Schema::clone(&out.schema), None, None, "view segment output")?;
+        self.push(circuit, Schema::clone(&out.schema), "view segment output")?;
         Ok(SegInput {
             tid: segment_id(self.segments.len() as u64 - 1),
             frame: out,
@@ -84,19 +83,8 @@ impl ViewChain {
     }
 
     /// Push the user-named view, always the chain's last element.
-    pub(crate) fn push_final(
-        &mut self,
-        pieces: EmitPieces,
-        capacity_bytes: Option<u64>,
-        delta_bytes: Option<u64>,
-    ) -> Result<(), GnitzSqlError> {
+    pub(crate) fn push_final(&mut self, pieces: EmitPieces) -> Result<&mut PlannedView, GnitzSqlError> {
         let EmitPieces { circuit, out } = pieces;
-        self.push(
-            circuit,
-            Arc::unwrap_or_clone(out.schema),
-            capacity_bytes,
-            delta_bytes,
-            "view output",
-        )
+        self.push(circuit, Arc::unwrap_or_clone(out.schema), "view output")
     }
 }

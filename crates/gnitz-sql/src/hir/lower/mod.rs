@@ -9,8 +9,7 @@
 //! * source collision — [`materialize`];
 //! * reduce derivation — [`resolve_reduce_specs`], [`keyed_frame`];
 //! * join keep — [`join_sides`];
-//! * addressing — `physical::Frame`, [`project_front`], [`project_tail`];
-//! * exchange topology — asserted in `ViewChain::push`.
+//! * addressing — `physical::Frame`, [`project_front`], [`project_tail`].
 
 mod exists;
 pub(crate) mod fold;
@@ -223,25 +222,17 @@ pub(crate) fn project_tail(
 }
 
 /// Lower a bound `RelExpr` tree to circuit pieces.
-pub(crate) fn lower(chain: &mut ViewChain, rel: Rc<RelExpr>, bounded: bool) -> Result<EmitPieces, GnitzSqlError> {
-    if bounded {
+pub(crate) fn lower(chain: &mut ViewChain, rel: Rc<RelExpr>) -> Result<EmitPieces, GnitzSqlError> {
+    if chain.bounded {
         reject_ineligible_capacity_body(&rel)?;
     }
     let mut memo = CutMemo::new();
     lower_body(chain, &mut memo, &rel)
 }
 
-/// Reject a body a capacity-bounded view cannot have. Eligibility is a **positive
-/// list** of exactly the two shapes per-key hydration can replay: a
-/// filter/projection over one relation, and a plain inner equi-join. Anything else
-/// falls through to a rejection, so a new body shape does not silently inherit
-/// eligibility.
-///
-/// One classifier over the bound tree, asked once before lowering, rather than a
-/// rule restated in each `lower_body` arm: a per-arm rule is one a new arm can
-/// forget, and it reads as a whitelist while behaving as a blacklist.
-/// `build_query_segments` supplies the other half of the rule (the body must not
-/// have cut into hidden segments), which no single-tree walk can see.
+/// Reject a root shape per-key hydration cannot replay: every shape but a
+/// filter/projection over one relation and an inner equi-join. A cut below an
+/// eligible root is `ViewChain::add_segment`'s to refuse.
 fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
     let shape = match rel {
         RelExpr::Project { input, items } => {

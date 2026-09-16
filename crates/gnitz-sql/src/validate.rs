@@ -402,20 +402,12 @@ pub(crate) fn reject_unhonored_select_clauses(
 /// dropped one is a clean error rather than a silent wrong result.
 #[derive(Clone, Copy)]
 pub(crate) enum QueryEnvelope {
-    /// No envelope clause at all — every narrowing site but the two below: a CTE
-    /// body (nested CTE), a derived table, a sub-query inner, an INSERT source,
-    /// a parenthesized set-op side.
+    /// No envelope clause at all: a CTE body (nested CTE), a derived table, a
+    /// sub-query inner, an INSERT source, a parenthesized set-op side.
     Bare,
-    /// A view body, shared by CREATE VIEW and `ALTER VIEW … AS`: a `WITH` (CTE)
-    /// clause is compiled by the `bind_ctes` phase, and `ORDER BY` + `LIMIT` are
-    /// maintained as a top-N. No other tail clause has incremental-view
-    /// semantics. The sink pair's own rules, a leftover `OFFSET` included, are
-    /// the body binder's.
-    ViewBody,
-    /// Direct SELECT: a `WITH` (expanded by `dml::cte`), plus the
-    /// client-side ordering sink — `ORDER BY` and `LIMIT`/`OFFSET` are applied
-    /// to the fetched batch, so this guard leaves them to the caller.
-    DirectSelect,
+    /// A whole query — a view body or a direct SELECT: its `WITH` and its
+    /// `ORDER BY` / `LIMIT` / `OFFSET` are left to the caller.
+    WithAndTail,
 }
 
 /// Reject every `Query`-envelope clause a narrowing site does not consume. `GenericDialect`
@@ -432,8 +424,7 @@ pub(crate) fn reject_unhonored_query_clauses(
     honored: QueryEnvelope,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    let with_ok = !matches!(honored, QueryEnvelope::Bare);
-    let sink_ok = matches!(honored, QueryEnvelope::DirectSelect | QueryEnvelope::ViewBody);
+    let whole = matches!(honored, QueryEnvelope::WithAndTail);
     let sqlparser::ast::Query {
         // Dispatched on by the caller (the SELECT / set-op / VALUES / CTE body).
         body: _,
@@ -450,9 +441,9 @@ pub(crate) fn reject_unhonored_query_clauses(
         pipe_operators,
     } = query;
 
-    reject_if(!with_ok && with.is_some(), context, "WITH (CTE)")?;
-    reject_if(!sink_ok && limit_clause.is_some(), context, "LIMIT/OFFSET")?;
-    reject_if(!sink_ok && order_by.is_some(), context, "ORDER BY")?;
+    reject_if(!whole && with.is_some(), context, "WITH (CTE)")?;
+    reject_if(!whole && limit_clause.is_some(), context, "LIMIT/OFFSET")?;
+    reject_if(!whole && order_by.is_some(), context, "ORDER BY")?;
     reject_if(fetch.is_some(), context, "FETCH")?;
     reject_if(!locks.is_empty(), context, "FOR UPDATE/SHARE")?;
     reject_if(for_clause.is_some(), context, "FOR XML/JSON/BROWSE")?;
@@ -661,25 +652,12 @@ pub(crate) fn reject_unhonored_delete_clauses(del: &sqlparser::ast::Delete) -> R
     Ok(())
 }
 
-/// Reject every `CREATE TABLE` envelope clause `execute_create_table` does not consume. `name`,
-/// `columns`, `constraints`, `cluster_by`, `table_options` are consumed (column/constraint contents
-/// are further guarded by [`reject_unhonored_column_options`] / [`reject_unhonored_table_constraints`];
-/// `table_options` carries the `WITH (replicated = …)` option, parsed by `parse_replicated_option`).
-/// Rejected: `query` (CTAS), `temporary`/`global` (silent permanent table), `like`/`clone` (empty
-/// table, ignoring the template), `on_commit`, `primary_key` (silently substitutes the PK), and
-/// `partition_of`/`for_values` (silently creates a standalone table instead of a partition child). The
-/// `_`-bound remainder parses under `GenericDialect` or not, but carries no gnitz-honorable semantics
-/// — storage/engine/vendor metadata accepted as no-ops, never changing a result.
-/// `if_not_exists` is consumed (the dispatcher's skip route); `or_replace` is rejected — no dialect
-/// gnitz targets defines `CREATE OR REPLACE TABLE`, and the plain reading of it, dropping a table and
-/// its rows to install a new shape, is what `DROP TABLE` already spells out loud.
-///
-/// Exhaustive destructure (no `..`) over every field: a future `sqlparser` field stops the build.
+/// Reject every `CREATE TABLE` clause the planner does not consume. Exhaustive
+/// destructure (no `..`): a future `sqlparser` field stops the build.
 pub(crate) fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::CreateTable) -> Result<(), GnitzSqlError> {
     const CTX: &str = "CREATE TABLE";
     let sqlparser::ast::CreateTable {
-        // Consumed (column/constraint contents further guarded by the column-option and table-constraint guards;
-        // `table_options` carries `WITH (replicated = …)`).
+        // Consumed (column/constraint contents further guarded by the column-option and table-constraint guards).
         name: _,
         columns: _,
         constraints: _,
@@ -694,6 +672,7 @@ pub(crate) fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::Cre
         query,
         like,
         clone,
+        inherits,
         on_commit,
         primary_key,
         partition_of,
@@ -716,7 +695,6 @@ pub(crate) fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::Cre
         order_by: _,
         partition_by: _,
         clustered_by: _,
-        inherits: _,
         strict: _,
         copy_grants: _,
         enable_schema_evolution: _,
@@ -750,36 +728,47 @@ pub(crate) fn reject_unhonored_create_table_clauses(create: &sqlparser::ast::Cre
     reject_if(global.is_some(), CTX, "GLOBAL/LOCAL")?;
     reject_if(like.is_some(), CTX, "LIKE")?;
     reject_if(clone.is_some(), CTX, "CLONE")?;
+    reject_if(inherits.is_some(), CTX, "INHERITS")?;
     reject_if(on_commit.is_some(), CTX, "ON COMMIT")?;
     reject_if(primary_key.is_some(), CTX, "PRIMARY KEY expression")?;
     reject_if(partition_of.is_some() || for_values.is_some(), CTX, "PARTITION OF")?;
     Ok(())
 }
 
-/// The `key = value` pairs of a `CREATE` statement's `WITH (…)` clause — the only
-/// option form gnitz reads; an absent clause is the empty list. Every other form,
-/// and every entry that is not a pair, is rejected rather than accepted as a
-/// vendor no-op: gnitz's `WITH` keys decide what the relation *is*, so a silently
-/// ignored `OPTIONS(stream = true)` would yield an ordinary durable table with no
-/// error anywhere. `context` names the statement.
-pub(crate) fn kv_options<'a>(
+/// The values of a `CREATE` statement's `WITH (key = value, …)` clause, one slot per
+/// entry of `keys`. Any other option form, unknown key or repeated key is rejected.
+pub(crate) fn kv_options<'a, const N: usize>(
     options: &'a sqlparser::ast::CreateTableOptions,
     context: &str,
-) -> Result<Vec<(&'a sqlparser::ast::Ident, &'a sqlparser::ast::Expr)>, GnitzSqlError> {
+    keys: [&str; N],
+) -> Result<[Option<&'a sqlparser::ast::Expr>; N], GnitzSqlError> {
+    let mut slots = [None; N];
     let form = match options {
         sqlparser::ast::CreateTableOptions::With(opts) => {
-            return opts
-                .iter()
-                .map(|opt| match opt {
-                    sqlparser::ast::SqlOption::KeyValue { key, value } => Ok((key, value)),
-                    other => Err(GnitzSqlError::Unsupported(format!(
-                        "unsupported {context} option in WITH (…), which takes `key = value` entries: {other:?}"
-                    ))),
-                })
-                .collect()
+            for opt in opts {
+                let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
+                    return Err(GnitzSqlError::Unsupported(format!(
+                        "unsupported {context} option in WITH (…), which takes `key = value` entries: {opt:?}"
+                    )));
+                };
+                let Some(at) = keys.iter().position(|k| key.value.eq_ignore_ascii_case(k)) else {
+                    let listed: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
+                    return Err(GnitzSqlError::Unsupported(format!(
+                        "unknown {context} option '{}'; the supported options are {}",
+                        key.value,
+                        listed.join(", ")
+                    )));
+                };
+                if slots[at].replace(value).is_some() {
+                    return Err(GnitzSqlError::Plan(format!(
+                        "{context} option `{}` is given more than once",
+                        keys[at]
+                    )));
+                }
+            }
+            return Ok(slots);
         }
-        // The common case: collecting an empty exact-size iterator allocates nothing.
-        sqlparser::ast::CreateTableOptions::None => return Ok(Vec::new()),
+        sqlparser::ast::CreateTableOptions::None => return Ok(slots),
         sqlparser::ast::CreateTableOptions::Options(_) => "OPTIONS (…)",
         sqlparser::ast::CreateTableOptions::Plain(_) => "space-separated options",
         sqlparser::ast::CreateTableOptions::TableProperties(_) => "TBLPROPERTIES (…)",
@@ -789,21 +778,16 @@ pub(crate) fn kv_options<'a>(
     )))
 }
 
-/// Reject every `CREATE VIEW` clause `execute_create_view` does not consume
-/// (`name`, `query`, `options` — see `hir::create::decode_view_options` — plus
-/// `columns` as positional output aliases and `or_replace`/`if_not_exists` as the
-/// dispatcher's create route). `materialized` is accepted — a gnitz view is already
-/// incrementally materialized. `temporary` (silent permanent view) and `to`
-/// (silently ignored target) are rejected, as is `or_alter`: T-SQL's `CREATE OR
-/// ALTER` is `OR REPLACE` under another name. `with_no_schema_binding` parses but is
-/// a no-op optimizer hint; the rest cannot populate under `GenericDialect`.
+/// Reject every `CREATE VIEW` clause the planner does not consume. Exhaustive
+/// destructure (no `..`): a future `sqlparser` field stops the build.
 pub(crate) fn reject_unhonored_create_view_clauses(cv: &sqlparser::ast::CreateView) -> Result<(), GnitzSqlError> {
     const CTX: &str = "CREATE VIEW";
     let sqlparser::ast::CreateView {
         name: _,
         query: _,
+        options: _,
         materialized: _, // accepted: names gnitz's real behavior
-        // Consumed here (they are mutually exclusive) and by the dispatcher's
+        // Consumed here (they are mutually exclusive) and by the planner's
         // replace / skip routes.
         or_replace,
         if_not_exists,
@@ -811,18 +795,21 @@ pub(crate) fn reject_unhonored_create_view_clauses(cv: &sqlparser::ast::CreateVi
         with_no_schema_binding: _, // no-op optimizer hint
         secure: _,                 // Snowflake SECURE modifier: no result impact
         copy_grants: _,            // Snowflake COPY GRANTS: no result impact
-        options: _,
-        columns, // consumed: positional output aliases, checked for decorations below
-        cluster_by: _,
-        comment: _,
-        params: _, // cannot populate under GenericDialect
+        columns,                   // consumed: positional output aliases, checked for decorations below
+        params: _,                 // cannot populate under GenericDialect
+        // Rejected: each would be silently dropped.
+        cluster_by,
+        comment,
         or_alter,
         temporary,
-        to, // rejected
+        to,
     } = cv;
     reject_if(*or_alter, CTX, "OR ALTER (spell it OR REPLACE)")?;
     reject_if(*temporary, CTX, "TEMPORARY")?;
     reject_if(to.is_some(), CTX, "TO (target table)")?;
+    // `CREATE TABLE` honours CLUSTER BY; a view would silently build unclustered.
+    reject_if(!cluster_by.is_empty(), CTX, "CLUSTER BY")?;
+    reject_if(comment.is_some(), CTX, "COMMENT")?;
     // A view column alias names a column and nothing else: a declared type or a
     // column option would have to be checked against the body's derived type or
     // silently ignored, and gnitz does neither.

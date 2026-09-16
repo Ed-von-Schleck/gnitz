@@ -7,8 +7,8 @@
 use crate::catalog::{CatalogEngine, ColumnDef, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
-    write_circuit_rows, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row, ColTabRow,
-    IdxTabRow, TableTabRow, ViewTabRow,
+    write_circuit_rows, write_col_tab_row, write_idx_tab_row, write_table_tab_row, ColTabRow, IdxTabRow, SysRowSink,
+    TableTabRow,
 };
 use gnitz_wire::type_code;
 use gnitz_wire::Circuit;
@@ -75,7 +75,7 @@ pub fn sum_weights(mut c: ReadCursor) -> i64 {
 /// the client commits with.
 pub fn write_circuit(engine: &mut CatalogEngine, vid: i64, circuit: Circuit) {
     let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
-    write_circuit_rows(&mut bb, vid as u64, circuit);
+    write_circuit_rows(&mut bb, vid as u64, &circuit);
     engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
 }
 
@@ -170,9 +170,8 @@ pub fn idx_tab_batch(
     bb.finish()
 }
 
-/// Append one raw VIEW_TAB row at `weight`, with both `WITH (…)` budgets in
-/// bytes (`0` = off) and `owner_view_id` (`0` = a user view). The PK list is the
-/// single column `[0]`.
+/// Append one raw VIEW_TAB row with PK list `[0]`, word by word, so a test can forge
+/// budget words no `ViewProps` holds (`0` = off; `owner_view_id` `0` = a user view).
 pub fn push_view_tab_row(
     bb: &mut BatchBuilder,
     weight: i64,
@@ -182,19 +181,15 @@ pub fn push_view_tab_row(
     delta_bytes: u64,
     owner_view_id: i64,
 ) {
-    write_view_tab_row(
-        bb,
-        &ViewTabRow {
-            view_id: vid as u64,
-            schema_id: PUBLIC_SCHEMA_ID as u64,
-            name: view_name,
-            pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
-            capacity_bytes,
-            delta_bytes,
-            owner_view_id: owner_view_id as u64,
-        },
-        weight,
-    );
+    let sink: &mut dyn SysRowSink = bb;
+    sink.begin_row(&[vid as u128], weight);
+    sink.put_u64(PUBLIC_SCHEMA_ID as u64);
+    sink.put_string(view_name);
+    sink.put_u64(gnitz_wire::pack_pk_cols(&[0]));
+    sink.put_u64(capacity_bytes);
+    sink.put_u64(delta_bytes);
+    sink.put_u64(owner_view_id as u64);
+    sink.end_row();
 }
 
 /// Register an identity view over `source_tid` through the raw system-table

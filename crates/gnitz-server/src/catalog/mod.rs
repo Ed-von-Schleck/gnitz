@@ -47,10 +47,11 @@ use std::rc::Rc;
 
 use crate::query::DagEngine;
 use gnitz_store::relation::{
-    OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig, ViewBudgets,
+    OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig,
 };
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, ReadCursor, Slot, StoreError};
+use gnitz_wire::ViewProps;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries

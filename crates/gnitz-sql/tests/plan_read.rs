@@ -1000,14 +1000,10 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
         let stmt = parse(sql);
         match &stmt {
             Statement::CreateView(_) => {
-                let (looped, asked) = resolving(&known, |c| gnitz_sql::plan_view(&stmt, c, SN));
-                let chain = |p| match p {
-                    gnitz_sql::ViewPlan::Create { chain, .. } => chain,
-                    gnitz_sql::ViewPlan::Skip { .. } => panic!("`{sql}` planned a skip"),
-                };
-                let looped = chain(looped.unwrap_or_else(|e| panic!("`{sql}`: {e:?}")));
+                let (looped, asked) = resolving(&known, |c| plan(c, sql));
+                let looped = looped.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
                 assert_eq!(asked, want, "`{sql}`");
-                let single = chain(gnitz_sql::plan_view(&stmt, &known, SN).unwrap());
+                let single = plan(&known, sql).unwrap();
                 assert_eq!(looped.views.len(), single.views.len(), "`{sql}`");
                 for (a, b) in looped.views.iter().zip(&single.views) {
                     assert_eq!(a.circuit, b.circuit, "`{sql}`");
@@ -1036,7 +1032,7 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
     ] {
         let stmt = parse(sql);
         let (plan, asked) = resolving(&known, |c| match &stmt {
-            Statement::CreateView(_) => gnitz_sql::plan_view(&stmt, c, SN).map(|_| ()),
+            Statement::CreateView(_) => plan(c, sql).map(|_| ()),
             _ => read(c, sql).map(|_| ()),
         });
         assert_eq!(variant_of(&err_of(plan)).0, variant, "`{sql}`");
@@ -1072,7 +1068,7 @@ fn no_shape_leaks_a_control_signal_out_of_the_loop() {
         ] {
             let stmt = parse(&sql);
             let (out, _) = resolving(&cat, |c| match &stmt {
-                Statement::CreateView(_) => gnitz_sql::plan_view(&stmt, c, SN).map(|_| ()),
+                Statement::CreateView(_) => plan(c, &sql).map(|_| ()),
                 _ => gnitz_sql::plan_read(&stmt, c, SN).map(|_| ()),
             });
             if let Err(e @ (GnitzSqlError::CatalogMiss(_) | GnitzSqlError::Internal(_))) = out {

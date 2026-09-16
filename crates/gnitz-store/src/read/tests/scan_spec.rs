@@ -1,7 +1,8 @@
 use super::*;
-use crate::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
+use crate::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig};
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::{BatchBuilder, Slot, StoreError};
+use gnitz_wire::ViewProps;
 use gnitz_wire::{AggDescriptor, AggReadSpec, IndexWalk, ReadSink};
 
 // ── The executor — `scan_spec` over a registry built in-crate ────────
@@ -39,7 +40,7 @@ fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
                 kind: RelationKind::View,
                 schema,
                 directory: crate::test_support::scratch_dir("read", name),
-                budgets: ViewBudgets { capacity_bytes: None, delta_bytes: None },
+                props: ViewProps::default(),
             },
             OnRegister::Live,
         )
@@ -216,10 +217,7 @@ fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::op
                 kind: RelationKind::View,
                 schema,
                 directory: crate::test_support::scratch_dir("read", name),
-                budgets: ViewBudgets {
-                    capacity_bytes: Some(1),
-                    delta_bytes: None,
-                },
+                props: ViewProps::Bounded { capacity_bytes: 1 },
             },
             OnRegister::Live,
         )

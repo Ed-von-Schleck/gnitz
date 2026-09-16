@@ -40,7 +40,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
                 kind: RelationKind::BaseTable,
                 schema,
                 directory: dir.to_string(),
-                budgets: ViewBudgets::default(),
+                props: ViewProps::default(),
             },
             OnRegister::Live,
         )
@@ -112,7 +112,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
                 kind: RelationKind::BaseTable,
                 schema: parent_schema,
                 directory: dir.clone(),
-                budgets: ViewBudgets::default(),
+                props: ViewProps::default(),
             },
             OnRegister::Live,
         )

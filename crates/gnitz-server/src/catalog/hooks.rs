@@ -96,7 +96,7 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            budgets,
+            props,
         } = reg;
         let col_defs = self.read_column_defs(id);
         let directory = relation_dir(&self.base_dir, kind, id);
@@ -113,7 +113,7 @@ impl CatalogEngine {
         // `register` owns the boot relayout, the staged-directory reclaim and the
         // parent fsync.
         self.registry
-            .register(RelationSpec { id, kind, schema, directory, budgets }, on)?;
+            .register(RelationSpec { id, kind, schema, directory, props }, on)?;
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
         if kind.is_base_table() {
@@ -180,7 +180,7 @@ impl CatalogEngine {
     }
 
     /// The registration values for VIEW_TAB row `i`: placement folded out of the
-    /// view's sources' own stamped placements, plus the `WITH` budgets.
+    /// view's sources' own stamped placements, plus the `WITH` options.
     ///
     /// The view's physical PK is the persisted leading-k column list: a single
     /// synthetic hash column for join/set-op/distinct views, or the source PK
@@ -195,14 +195,14 @@ impl CatalogEngine {
             schema_id,
             name,
             pk,
-            budgets,
+            props,
             owner_view_id,
         } = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={vid})"))?;
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
         // so `get_source_ids` resolves here. Re-check for the paths that skip the
         // precheck (boot replay, worker `ddl_sync`).
         let source_ids = self.dag.get_source_ids(&self.registry, vid);
-        self.validate_view_options(vid, name, budgets, owner_view_id, &source_ids)?;
+        self.validate_view_options(vid, name, props, owner_view_id, &source_ids)?;
         // Stamping the fold is what makes placement transitive:
         // `hook_relation_register` registers this view after its sources, so a view
         // over it reads the answer back off one value.
@@ -215,7 +215,7 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            budgets,
+            props,
         })
     }
 

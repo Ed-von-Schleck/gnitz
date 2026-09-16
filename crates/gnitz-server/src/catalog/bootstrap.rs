@@ -68,7 +68,7 @@ impl CatalogEngine {
                         kind: RelationKind::SystemCatalog,
                         schema: *family.schema(),
                         directory: relation_dir(base_dir, RelationKind::SystemCatalog, family.id()),
-                        budgets: ViewBudgets::default(),
+                        props: ViewProps::default(),
                     },
                     OnRegister::Live,
                 )

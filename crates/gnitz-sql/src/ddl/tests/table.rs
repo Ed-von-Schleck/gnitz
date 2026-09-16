@@ -31,8 +31,26 @@ fn unknown_with_key_and_non_boolean_value_are_rejected() {
     let t = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
     let e = parse_table_options(&table_options_of(&format!("{t} WITH (streem = true)"))).unwrap_err();
     assert!(format!("{e:?}").contains("streem"), "must name the typo'd key: {e:?}");
+    assert!(matches!(e, GnitzSqlError::Unsupported(_)), "{e:?}");
     let e = parse_table_options(&table_options_of(&format!("{t} WITH (stream = 1)"))).unwrap_err();
     assert!(format!("{e:?}").contains("stream"), "must name the key: {e:?}");
+}
+
+/// A repeated key is refused rather than won by its last spelling, which would
+/// turn `stream = true, stream = false` into an ordinary table.
+#[test]
+fn a_repeated_with_key_is_rejected() {
+    let t = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
+    for tail in [
+        "WITH (stream = true, stream = false)",
+        "WITH (replicated = true, REPLICATED = true)",
+    ] {
+        let e = parse_table_options(&table_options_of(&format!("{t} {tail}"))).unwrap_err();
+        assert!(
+            matches!(&e, GnitzSqlError::Plan(m) if m.contains("more than once")),
+            "{tail}: {e:?}"
+        );
+    }
 }
 
 /// A non-`WITH` option form carries keys nothing reads, so accepting it would

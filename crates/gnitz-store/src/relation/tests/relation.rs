@@ -25,7 +25,7 @@ fn register_entry(
         kind,
         schema,
         directory,
-        budgets: ViewBudgets::default(),
+        props: ViewProps::default(),
     };
     registry.register(spec, OnRegister::Live).unwrap();
 }
@@ -157,10 +157,7 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
                 kind: RelationKind::View,
                 schema,
                 directory: relation_test_dir("fed_view_delta"),
-                budgets: ViewBudgets {
-                    capacity_bytes: None,
-                    delta_bytes: Some(1 << 20),
-                },
+                props: ViewProps::Fed { delta_bytes: 1 << 20 },
             },
             OnRegister::Live,
         )

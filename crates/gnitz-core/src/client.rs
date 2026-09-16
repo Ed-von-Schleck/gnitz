@@ -18,8 +18,8 @@ use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::Circuit;
 use gnitz_wire::{
-    RelClass, TableProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COL_TAB,
-    IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, OWNER_KIND_TABLE,
+    RelClass, TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
+    COL_TAB, IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, OWNER_KIND_TABLE,
     OWNER_KIND_VIEW, RELTAB_COL_NAME, RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
@@ -221,14 +221,6 @@ pub struct PlannedView {
     pub circuit: Circuit,
     pub output_columns: Vec<ColumnDef>,
     pub pk_cols: Vec<u32>,
-    /// `WITH (capacity = …)` in bytes, set on the chain's **final** segment only;
-    /// `None` is unbounded. Hidden chain segments never carry one.
-    pub capacity_bytes: Option<u64>,
-    /// `WITH (delta = …)` in bytes, set on the chain's **final** segment only —
-    /// the one the client names and the only one whose store it can read; the
-    /// hidden segments tick in the same round without carrying feeds of their own.
-    /// `None` is no feed.
-    pub delta_bytes: Option<u64>,
 }
 
 /// What one statement has already read, dropped whole at `end_statement`.
@@ -1350,9 +1342,8 @@ impl GnitzClient {
                 output_columns: output_columns.to_vec(),
                 // Minimal SCAN→SINK passthrough: single output PK at slot 0.
                 pk_cols: vec![0],
-                capacity_bytes: None,
-                delta_bytes: None,
             }],
+            ViewProps::default(),
             false,
         )?;
         Ok(vids[0])
@@ -1373,8 +1364,8 @@ impl GnitzClient {
     /// output slots (`[0]` for a synthetic-PK view, `0..k` for a compound-PK
     /// passthrough).
     ///
-    /// **`views.last()` is the user-named view and takes `view_name`**; every
-    /// earlier element is an internal segment it owns — see [`segment_name`].
+    /// **`views.last()` is the user-named view: it takes `view_name` and `props`**;
+    /// every earlier element is an internal segment it owns — see [`segment_name`].
     /// [`segment_id`]`(j)` inside `views[k]` names `views[j]`, which the engine
     /// requires to precede it.
     ///
@@ -1387,6 +1378,7 @@ impl GnitzClient {
         schema_name: &str,
         view_name: &str,
         views: Vec<PlannedView>,
+        props: ViewProps,
         replace: bool,
     ) -> Result<Vec<u64>, ClientError> {
         let view_name = gnitz_wire::canonical_identifier(view_name)?;
@@ -1465,17 +1457,17 @@ impl GnitzClient {
                         *src = base + (*src - gnitz_wire::RELATION_ID_CEILING);
                     }
                 }
-                let (name, owner_view_id) = if k == last {
-                    (view_name.clone(), 0)
+                let (name, owner_view_id, row_props) = if k == last {
+                    (view_name.clone(), 0, props)
                 } else {
-                    (segment_name(vid), owner_vid)
+                    (segment_name(vid), owner_vid, ViewProps::default())
                 };
 
                 // 1. Column records.
                 append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns);
 
                 // 2. Circuit node rows.
-                gnitz_wire::sys_rows::write_circuit_rows(&mut nodes_a, vid, pv.circuit);
+                gnitz_wire::sys_rows::write_circuit_rows(&mut nodes_a, vid, &pv.circuit);
 
                 // 3. View row — the VIEW_TAB register hook triggers server-side
                 // compilation. Encode the view PK with the shared wire packer so the
@@ -1487,8 +1479,7 @@ impl GnitzClient {
                         schema_id,
                         name: &name,
                         pk_col_idx: gnitz_wire::pack_pk_cols(&pv.pk_cols),
-                        capacity_bytes: pv.capacity_bytes.unwrap_or(0),
-                        delta_bytes: pv.delta_bytes.unwrap_or(0),
+                        props: row_props,
                         owner_view_id,
                     },
                     1,

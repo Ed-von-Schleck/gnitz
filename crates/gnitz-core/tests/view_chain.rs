@@ -11,7 +11,7 @@
 //! entirely on the driver visiting a producer before its consumer.
 
 use gnitz_core::{
-    BatchAppender, Circuit, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ZSetBatch,
+    BatchAppender, Circuit, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ViewProps, ZSetBatch,
 };
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
@@ -46,8 +46,6 @@ fn segment(source_id: u64, cols: &[ColumnDef]) -> PlannedView {
         circuit,
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
-        capacity_bytes: None,
-        delta_bytes: None,
     }
 }
 
@@ -109,7 +107,7 @@ fn a_chain_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let (base_tid, cols) = make_base(&mut client, &sn);
 
     let vids = client
-        .create_view_chain(&sn, "f", chain(base_tid, &cols), false)
+        .create_view_chain(&sn, "f", chain(base_tid, &cols), ViewProps::default(), false)
         .unwrap();
     let owner = *vids.last().unwrap();
     assert_eq!(
@@ -157,13 +155,19 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     // A committed view whose name the bundle's user-named view reuses.
     let taken = *client
-        .create_view_chain(&sn, "taken", vec![segment(base_tid, &cols)], false)
+        .create_view_chain(
+            &sn,
+            "taken",
+            vec![segment(base_tid, &cols)],
+            ViewProps::default(),
+            false,
+        )
         .unwrap()
         .last()
         .unwrap();
 
     let err = client
-        .create_view_chain(&sn, "taken", chain(base_tid, &cols), false)
+        .create_view_chain(&sn, "taken", chain(base_tid, &cols), ViewProps::default(), false)
         .unwrap_err()
         .to_string();
     assert!(err.contains("already exists"), "got: {err}");
@@ -180,7 +184,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         segment(gnitz_core::segment_id(0), &cols),
     ];
     let err = client
-        .create_view_chain(&sn, "fwd", forward, false)
+        .create_view_chain(&sn, "fwd", forward, ViewProps::default(), false)
         .unwrap_err()
         .to_string();
     assert!(err.contains("not older"), "got: {err}");
@@ -200,7 +204,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         ..segment(base_tid, &cols)
     }];
     let err = client
-        .create_view_chain(&sn, "wide", planned, false)
+        .create_view_chain(&sn, "wide", planned, ViewProps::default(), false)
         .unwrap_err()
         .to_string();
     assert!(
@@ -216,7 +220,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
     let planned: Vec<PlannedView> = (0..over).map(|_| segment(base_tid, &cols)).collect();
     let err = client
-        .create_view_chain(&sn, "x", planned, false)
+        .create_view_chain(&sn, "x", planned, ViewProps::default(), false)
         .unwrap_err()
         .to_string();
     assert!(

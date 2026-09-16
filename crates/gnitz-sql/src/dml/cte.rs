@@ -67,7 +67,7 @@ pub(super) fn inline_ctes(
             let mut cols = cte_columns(cat, binder, &body, &ctx)?;
             apply_positional_aliases(
                 cte.alias.columns.iter().map(|a| &a.name),
-                cols.iter_mut().map(|(d, _)| d).collect(),
+                cols.iter_mut().map(|(d, _)| d),
                 &ctx,
             )?;
             // The projection-shaped check, not the raw one: a wildcard naming no

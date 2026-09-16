@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use gnitz_core::{
     CatalogSnapshot, Circuit, ColumnDef, IndexMeta, OpNode, PkColList, PlannedView, RelClass, RelDescriptor, Schema,
-    TypeCode,
+    TypeCode, ViewProps,
 };
 use gnitz_sql::sqlparser::ast::Statement;
 use gnitz_sql::sqlparser::dialect::GenericDialect;
 use gnitz_sql::sqlparser::parser::Parser;
-use gnitz_sql::{plan_read, plan_view, GnitzSqlError, PlannedChain, ReadPlan, ViewPlan};
+use gnitz_sql::{plan_alter_view, plan_create_view, plan_read, GnitzSqlError, PlannedChain, ReadPlan, ViewPlan};
 
 pub const SN: &str = "s";
 
@@ -91,7 +91,6 @@ pub fn rel_with(
         tid,
         class,
         replicated,
-        delta: false,
         schema: Arc::new(Schema { columns, pk_cols }),
         indexes: Arc::new(
             indexes
@@ -146,6 +145,7 @@ pub fn catalog(rels: Vec<(&str, Arc<RelDescriptor>)>) -> CatalogSnapshot {
 /// | `r` | `(id PK, v)`, replicated |
 /// | `tv` | a view with `t`'s columns |
 /// | `bv` | a capacity-bounded view with `t`'s columns |
+/// | `fv` | a view with a delta feed, with `t`'s columns |
 pub fn base() -> CatalogSnapshot {
     let i = TypeCode::I64;
     let tgv = || vec![col("id", i), col("g", i), col("v", i)];
@@ -186,16 +186,23 @@ pub fn base() -> CatalogSnapshot {
         ),
         ("tv", rel(24, RelClass::View, false, tgv(), vec![0], &[])),
         ("bv", rel(25, RelClass::BoundedView, false, tgv(), vec![0], &[])),
+        ("fv", rel(26, RelClass::FedView, false, tgv(), vec![0], &[])),
     ])
 }
 
 /// Plan a `CREATE VIEW` / `ALTER VIEW … AS` against `cat`. None of the statements
 /// here carry `IF NOT EXISTS`, the one clause that plans a skip.
 pub fn plan(cat: &CatalogSnapshot, sql: &str) -> Result<PlannedChain, GnitzSqlError> {
-    plan_view(&parse(sql), cat, SN).map(|p| match p {
-        ViewPlan::Create { chain, .. } => chain,
-        ViewPlan::Skip { .. } => panic!("`{sql}` planned a skip"),
-    })
+    match parse(sql) {
+        Statement::CreateView(cv) => plan_create_view(&cv, cat, SN).map(|p| match p {
+            ViewPlan::Create { chain, .. } => chain,
+            ViewPlan::Skip { .. } => panic!("`{sql}` planned a skip"),
+        }),
+        Statement::AlterView { name, columns, query, with_options } => {
+            plan_alter_view(&name, &columns, &query, &with_options, cat, SN)
+        }
+        _ => panic!("`{sql}` is not a view statement"),
+    }
 }
 
 /// Plan a read (`SELECT` / `EXPLAIN`) against `cat`.
@@ -217,10 +224,10 @@ pub fn view(cat: &CatalogSnapshot, body: &str) -> PlannedChain {
 /// server would after `CREATE VIEW`.
 pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &PlannedChain) {
     let fv = final_view(chain);
-    let class = if fv.capacity_bytes.is_some() {
-        RelClass::BoundedView
-    } else {
-        RelClass::View
+    let class = match chain.props {
+        ViewProps::Plain => RelClass::View,
+        ViewProps::Bounded { .. } => RelClass::BoundedView,
+        ViewProps::Fed { .. } => RelClass::FedView,
     };
     let pk_cols = fv.pk_cols.clone();
     cat.insert(

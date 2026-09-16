@@ -122,10 +122,8 @@ pub struct ViewTabRow<'a> {
     pub schema_id: u64,
     pub name: &'a str,
     pub pk_col_idx: u64,
-    /// `WITH (capacity = …)` in bytes; `0` is unbounded.
-    pub capacity_bytes: u64,
-    /// `WITH (delta = …)` in bytes; `0` is no delta feed.
-    pub delta_bytes: u64,
+    /// The view's `WITH (…)` budgets; both absent on a chain segment.
+    pub props: crate::ViewProps,
     /// The user view this row is an internal chain segment of; `0` is a user
     /// view.
     pub owner_view_id: u64,
@@ -136,8 +134,9 @@ pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i6
     sink.put_u64(r.schema_id);
     sink.put_string(r.name);
     sink.put_u64(r.pk_col_idx);
-    sink.put_u64(r.capacity_bytes);
-    sink.put_u64(r.delta_bytes);
+    let (capacity, delta) = r.props.row_words();
+    sink.put_u64(capacity);
+    sink.put_u64(delta);
     sink.put_u64(r.owner_view_id);
     sink.end_row();
 }
@@ -212,9 +211,9 @@ pub fn write_circuit_node_row(sink: &mut impl SysRowSink, r: &CircuitNodeRow, we
 }
 
 /// Write every node of `view_id`'s circuit at `+1`, each keyed by its index.
-pub fn write_circuit_rows(sink: &mut impl SysRowSink, view_id: u64, circuit: crate::Circuit) {
+pub fn write_circuit_rows(sink: &mut impl SysRowSink, view_id: u64, circuit: &crate::Circuit) {
     for (node_id, node) in circuit.nodes().iter().enumerate() {
-        let (opcode, source_table, params) = crate::encode_op_node(node.op.clone());
+        let (opcode, source_table, params) = crate::encode_op_node(&node.op);
         write_circuit_node_row(
             sink,
             &CircuitNodeRow {

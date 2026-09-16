@@ -3,8 +3,9 @@
 //! private items.
 
 use super::*;
-use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
+use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::storage::Slot;
+use gnitz_wire::ViewProps;
 
 // Input slots reach the compiler only in hand-written fixtures; every production
 // read of an operand goes through `NodeInputs`. Slot 0 is a unary operator's
@@ -91,7 +92,7 @@ pub(in crate::query) fn register_sources(
             kind: RelationKind::Stream,
             schema,
             directory: String::new(),
-            budgets: ViewBudgets::default(),
+            props: ViewProps::default(),
         };
         registry
             .register(spec, OnRegister::Live)

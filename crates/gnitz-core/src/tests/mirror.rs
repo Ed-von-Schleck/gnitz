@@ -208,8 +208,7 @@ impl Peer {
     fn reply_resolved(&self, tid: u64) {
         let schema = view_schema();
         let blob = RelDescriptorBlob {
-            class: RelClass::View,
-            delta: true,
+            class: RelClass::FedView,
             ..Default::default()
         };
         let empty = ZSetBatch::new(&schema);
@@ -267,9 +266,8 @@ fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session))
             name: name.to_string(),
             desc: Arc::new(RelDescriptor {
                 tid,
-                class: RelClass::View,
+                class: RelClass::FedView,
                 replicated: false,
-                delta: true,
                 schema: Arc::clone(&schema),
                 indexes: Arc::new(Vec::new()),
             }),

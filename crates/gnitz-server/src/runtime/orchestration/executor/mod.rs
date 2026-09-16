@@ -1544,20 +1544,7 @@ fn build_resolve_reply(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) ->
             is_unique: ic.is_unique(),
         })
         .collect();
-    let blob = gnitz_wire::RelDescriptorBlob {
-        class,
-        replicated,
-        // Answered off the registry's own `delta_bytes`, so a subscriber discovers
-        // the capability here instead of probing for it with a read that errors.
-        delta: shared
-            .cat()
-            .registry()
-            .relation(tid)
-            .is_some_and(Relation::has_delta_feed),
-        fks,
-        indexes,
-    }
-    .encode();
+    let blob = gnitz_wire::RelDescriptorBlob { class, replicated, fks, indexes }.encode();
 
     // Clone the `Rc` block out of the cache so no `cat()` borrow outlives it.
     // The reply always carries the block: a resolving client holds no descriptor

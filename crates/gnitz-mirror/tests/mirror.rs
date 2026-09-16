@@ -418,8 +418,11 @@ fn a_registered_view_is_described_locally() {
         "describing a registered view must issue no request"
     );
     assert_eq!(desc.tid, keyed, "the copy is held under the server's id");
-    assert!(desc.class.is_view());
-    assert!(desc.delta, "only a fed view can be mirrored");
+    assert_eq!(
+        desc.class,
+        gnitz_core::RelClass::FedView,
+        "only a fed view can be mirrored"
+    );
     assert!(!desc.replicated, "a resolve reports replication for a base table alone");
     assert!(desc.indexes.is_empty(), "only a base table may own an index");
 

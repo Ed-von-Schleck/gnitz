@@ -324,7 +324,7 @@ fn child_registry(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64
                 kind: RelationKind::BaseTable,
                 schema,
                 directory: rel.to_string(),
-                budgets: ViewBudgets::default(),
+                props: ViewProps::default(),
             },
             OnRegister::Live,
         )

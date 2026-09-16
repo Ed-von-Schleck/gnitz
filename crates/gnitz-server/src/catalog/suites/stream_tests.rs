@@ -89,8 +89,10 @@ fn bounded_view_over_a_stream_is_rejected() {
     };
 
     let err = register_bounded(&mut engine, sid, "bounded_over_stream").expect_err("must be rejected");
-    assert!(err.contains("is a stream"), "got: {err}");
-    assert!(err.contains(&sid.to_string()), "must name the source: {err}");
+    assert!(
+        err.contains("'public.s', which is a stream"),
+        "must name the source: {err}"
+    );
 
     // The same registration over a base table is accepted, so the rejection is
     // about the source's kind and not about the capacity clause.

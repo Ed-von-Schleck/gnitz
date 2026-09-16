@@ -893,6 +893,28 @@ fn a_view_declaring_both_capacity_and_delta_is_rejected() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A bounded view a view may not read is named by its qualified name, not its id:
+/// the engine's message is the one every client that bypasses the SQL planner sees.
+#[test]
+fn a_bounded_view_source_is_named() {
+    let dir = temp_dir("refused_view_source_named");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![
+        crate::test_support::col_def("id", gnitz_wire::type_code::U64),
+        crate::test_support::col_def("v", gnitz_wire::type_code::I64),
+    ];
+    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+    let bv = try_register_identity_view(&mut engine, tid, "bv", &cols, 4 << 20, 0).expect("a bounded view");
+
+    let err = try_register_identity_view(&mut engine, bv, "over_bv", &cols, 0, 0).expect_err("a leaf view");
+    assert!(
+        err.contains("'public.bv', which is a capacity-bounded view"),
+        "got: {err}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A fed view's delta store prepends a `_tick` key column, so a view already at
 /// `MAX_COLUMNS` cannot carry a feed. Refused at registration, on every process:
 /// the post-fork master opens no user store at all, so leaving it to the store

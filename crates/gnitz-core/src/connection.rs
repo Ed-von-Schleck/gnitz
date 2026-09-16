@@ -58,8 +58,6 @@ pub struct RelDescriptor {
     pub tid: u64,
     pub class: RelClass,
     pub replicated: bool,
-    /// The view keeps a delta feed, so a DELTA_POLL of it is answerable.
-    pub delta: bool,
     pub schema: Arc<Schema>,
     pub indexes: Arc<Vec<gnitz_wire::RelIndex>>,
 }
@@ -1008,7 +1006,6 @@ fn resolve_descriptor(msg: Message, schema: Option<Arc<Schema>>) -> Result<Optio
         tid: msg.hdr.target_id,
         class: desc.class,
         replicated: desc.replicated,
-        delta: desc.delta,
         schema,
         indexes: Arc::new(desc.indexes),
     })))

@@ -1,4 +1,4 @@
-//! The circuit shape a view body compiles to, read straight off `plan_view`.
+//! The circuit shape a view body compiles to, read straight off the view planner.
 //!
 //! Each row pins only what CLAUDE.md §3 and the placement contracts require:
 //! segment count, where the exchanges sit and what they shard on, the two join

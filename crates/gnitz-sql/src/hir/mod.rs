@@ -24,10 +24,9 @@ mod place;
 mod window;
 
 pub(crate) use create::{execute_alter_view, execute_create_view};
-pub use create::{plan_view, PlannedChain, ViewPlan};
+pub use create::{plan_alter_view, plan_create_view, PlannedChain, ViewPlan};
 
 use crate::agg::AggFunc;
-use crate::bind::Binder;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
@@ -43,17 +42,16 @@ use std::sync::Arc;
 /// tree is whole; the lowering decides what each shared subtree becomes.
 pub(crate) fn bind_and_lower(
     cat: &CatalogSnapshot,
-    binder: &Binder<'_>,
+    schema_name: &str,
     chain: &mut ViewChain,
     query: &sqlparser::ast::Query,
-    bounded: bool,
-    surface: bind::ViewSurface,
+    view: bind::ViewBody,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let mut cx = bind::BindCx::new(cat, binder, &ids, surface);
+    let mut cx = bind::BindCx::new(cat, schema_name, &ids, view);
     bind::bind_ctes(&mut cx, query)?;
     let rel = bind::bind_query(&mut cx, query)?;
-    lower::lower(chain, rel, bounded)
+    lower::lower(chain, rel)
 }
 
 /// The ad-hoc read path's entry to the same core: bind a single-relation grouped

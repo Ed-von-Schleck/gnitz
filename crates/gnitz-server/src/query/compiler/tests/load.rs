@@ -1,8 +1,9 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
-use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
+use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::storage::Slot;
 use gnitz_wire::OpNode;
+use gnitz_wire::ViewProps;
 
 // ── load_circuit against the real system tables ─────────────────────────
 
@@ -36,7 +37,7 @@ impl CircuitTables {
                     kind: RelationKind::SystemCatalog,
                     schema: Self::schema(),
                     directory: format!("{}/nodes", tmp.path().to_str().unwrap()),
-                    budgets: ViewBudgets::default(),
+                    props: ViewProps::default(),
                 },
                 OnRegister::Live,
             )
@@ -63,7 +64,7 @@ impl CircuitTables {
         op: OpNode,
         input: Option<u64>,
     ) {
-        let (opcode, source_table, params) = gnitz_wire::encode_op_node(op);
+        let (opcode, source_table, params) = gnitz_wire::encode_op_node(&op);
         Self::raw_row(
             bb,
             view_id,

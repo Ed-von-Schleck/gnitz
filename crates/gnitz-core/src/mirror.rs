@@ -339,25 +339,21 @@ impl GnitzClient {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         let name = gnitz_wire::canonical_identifier(name)?;
         let rel = self.resolve_relation(&schema_name, &name)?;
-        if !rel.class.is_view() {
-            return Err(ClientError::ServerError(format!(
+        match rel.class {
+            RelClass::FedView => self.bind(&schema_name, &name, rel),
+            RelClass::Table | RelClass::Stream => Err(ClientError::ServerError(format!(
                 "'{schema_name}.{name}' is a {}; only a view can be mirrored",
                 rel.class.noun()
-            )));
-        }
-        if rel.class == RelClass::BoundedView {
-            return Err(ClientError::ServerError(format!(
+            ))),
+            RelClass::BoundedView => Err(ClientError::ServerError(format!(
                 "view '{schema_name}.{name}' is capacity-bounded, and a capacity and a feed \
                  are refused together, so it carries no feed to subscribe to"
-            )));
-        }
-        if !rel.delta {
-            return Err(ClientError::ServerError(format!(
+            ))),
+            RelClass::View => Err(ClientError::ServerError(format!(
                 "view '{schema_name}.{name}' keeps no delta feed; \
                  create it WITH (delta = '<size>') to mirror it"
-            )));
+            ))),
         }
-        self.bind(&schema_name, &name, rel)
     }
 
     /// Record `desc.tid` as mirrored under `schema_name.name` — **already

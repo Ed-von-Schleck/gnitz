@@ -174,7 +174,7 @@ pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
 /// decide its access and sink.
 fn plan_query(cat: &CatalogSnapshot, query: &Query, binder: &Binder<'_>) -> Result<ReadPlan, GnitzSqlError> {
     // ORDER BY / LIMIT / OFFSET are the client finish's; any other query clause is refused.
-    reject_unhonored_query_clauses(query, QueryEnvelope::DirectSelect, "direct SELECT")?;
+    reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, "direct SELECT")?;
     let select = match query.body.as_ref() {
         SetExpr::SetOperation { .. } => return Err(derivation("set operation")),
         // Not the derivation template: CREATE VIEW refuses these bodies too.

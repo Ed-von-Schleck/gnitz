@@ -184,11 +184,7 @@ fn resolve_fk_target(
         return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, site);
     }
 
-    // The one relation-name catalog probe outside the Binder funnels: hold the
-    // FK target to the same reserved-prefix rule they enforce.
-    validate_user_name(&ref_table)?;
-    let ref_rel = probe(cat, schema_name, &ref_table)?
-        .ok_or_else(|| crate::error::missing_relation("FK target", schema_name, &ref_table))?;
+    let ref_rel = crate::bind::probe_relation(cat, schema_name, &ref_table)?;
     let ref_schema = &ref_rel.schema;
     // The PK/UNIQUE tests below read only the schema, and both a view's and a
     // stream's PK look exactly like a base table's without being the unique, stored
@@ -226,30 +222,21 @@ fn resolve_fk_target(
 }
 
 /// The boolean properties of `CREATE TABLE … WITH (…)`. `dist_prefix_len` is left
-/// at its default; the CLUSTER BY phase fills it. An unknown key is rejected so a
-/// typo cannot be silently ignored.
+/// at its default; the CLUSTER BY phase fills it.
 fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps, GnitzSqlError> {
-    let mut props = TableProps::default();
-    for (key, value) in kv_options(table_options, "CREATE TABLE")? {
-        let slot = if key.value.eq_ignore_ascii_case("replicated") {
-            &mut props.replicated
-        } else if key.value.eq_ignore_ascii_case("stream") {
-            &mut props.stream
-        } else {
-            return Err(GnitzSqlError::Plan(format!(
-                "unknown CREATE TABLE option '{}'; the supported options are `replicated` and `stream`",
-                key.value
-            )));
-        };
-        let Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) = value else {
-            return Err(GnitzSqlError::Plan(format!(
-                "WITH ({} = …) expects a boolean (true/false)",
-                key.value
-            )));
-        };
-        *slot = *b;
-    }
-    Ok(props)
+    let [replicated, stream] = kv_options(table_options, "CREATE TABLE", ["replicated", "stream"])?;
+    let flag = |key: &str, value: Option<&Expr>| match value {
+        None => Ok(false),
+        Some(Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. })) => Ok(*b),
+        Some(_) => Err(GnitzSqlError::Plan(format!(
+            "WITH ({key} = …) expects a boolean (true/false)"
+        ))),
+    };
+    Ok(TableProps {
+        replicated: flag("replicated", replicated)?,
+        stream: flag("stream", stream)?,
+        ..TableProps::default()
+    })
 }
 
 /// One UNIQUE constraint as written: the column list — one element for a
@@ -690,9 +677,7 @@ pub(crate) fn execute_drop(
 ) -> Result<SqlResult, GnitzSqlError> {
     // The kind is the statement's, not each name's, so it is settled once.
     if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "DROP {object_type:?} not supported"
-        )));
+        return Err(crate::error::unsupported_clause("DROP", &object_type.to_string()));
     }
     let mut targets: Vec<String> = Vec::with_capacity(names.len());
     for obj_name in names {

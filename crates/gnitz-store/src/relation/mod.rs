@@ -13,7 +13,7 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{
     Batch, ChildAddr, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, StoredRow, Table,
 };
-use gnitz_wire::PkColList;
+use gnitz_wire::{PkColList, ViewProps};
 
 mod build;
 mod circuit_state;
@@ -192,17 +192,6 @@ impl Residency {
 // Relation — one relation in this process
 // ---------------------------------------------------------------------------
 
-/// The `WITH (…)` byte budgets a view can carry. One value rather than two
-/// arguments, so every path that opens a relation's store carries both or
-/// neither.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct ViewBudgets {
-    /// `WITH (capacity = …)`, in bytes; `None` for every unbounded relation.
-    pub capacity_bytes: Option<u64>,
-    /// `WITH (delta = …)`, in bytes; `None` for every relation with no feed.
-    pub delta_bytes: Option<u64>,
-}
-
 /// One relation in this process: its identity, its shape, and this process's
 /// store for it. Every read below answers for a process that holds no store —
 /// empty cursor, empty scan, `false`, `0` — so no caller branches on residency
@@ -213,7 +202,7 @@ pub struct Relation {
     /// threaded in beside it to log or to phrase an error.
     id: i64,
     store: Store,
-    /// The delta store, when this process holds one — `budgets.delta_bytes` is
+    /// The delta store, when this process holds one — `props` is
     /// what says a feed *exists*. `Box` because it embeds a second
     /// `SchemaDescriptor` (360 bytes), which every relation would pay inline.
     delta: Option<Box<Store>>,
@@ -223,16 +212,14 @@ pub struct Relation {
     /// exists once the relation is created, so it anchors an `O_TMPFILE` spill
     /// onto the same disk as the relation's data.
     directory: String,
-    /// The budgets this relation was registered with: what a rehome or a rebuild
-    /// hands back to `build_relation_store`, and the answer the post-fork master
-    /// gives when it has no `Table` to ask.
-    budgets: ViewBudgets,
+    /// The `WITH (…)` options this relation was registered with, which a rebuild
+    /// reopens its stores from.
+    props: ViewProps,
 }
 
 impl Relation {
     /// A registry entry with no secondary indexes yet — the one insert
-    /// [`RelationRegistry::register`] makes. Both budgets are `None` for
-    /// everything but a bounded or a fed view.
+    /// [`RelationRegistry::register`] makes.
     pub(crate) fn new(spec: RelationSpec, stores: (Store, Option<Box<Store>>)) -> Self {
         Relation {
             id: spec.id,
@@ -241,7 +228,7 @@ impl Relation {
             kind: spec.kind,
             directory: spec.directory,
             indexes: Vec::new(),
-            budgets: spec.budgets,
+            props: spec.props,
         }
     }
 
@@ -283,21 +270,21 @@ impl Relation {
         &self.directory
     }
 
-    pub fn budgets(&self) -> ViewBudgets {
-        self.budgets
+    pub fn props(&self) -> ViewProps {
+        self.props
     }
 
     /// Whether this relation retains its recent deltas for a feed reader. The
     /// budget is what says a feed *exists*; whether this process holds the store
     /// for it is a separate question, [`Self::delta_or_err`]'s.
     pub fn has_delta_feed(&self) -> bool {
-        self.budgets.delta_bytes.is_some()
+        matches!(self.props, ViewProps::Fed { .. })
     }
 
     /// Whether a capacity bounds this relation's registered shard bytes, so its
     /// sweep may leave skeleton rows behind.
     pub fn is_bounded(&self) -> bool {
-        self.budgets.capacity_bytes.is_some()
+        matches!(self.props, ViewProps::Bounded { .. })
     }
 
     /// Whether every worker holds the whole relation rather than a partition of
@@ -312,18 +299,15 @@ impl Relation {
         self.indexes.iter().any(SecondaryIndex::is_unique)
     }
 
-    /// What the client is told this relation is. Lives beside the two fields that
-    /// decide it, so a new [`RelationKind`] is a compile error here rather than a
-    /// silent `Table` at the wire boundary. A bounded view is its own wire class:
-    /// the client's leaf rule refuses to bind one inside a view body, and
-    /// `ALTER VIEW … AS` refuses to retarget it.
+    /// What the client is told this relation is.
     pub fn class(&self) -> gnitz_wire::RelClass {
         use gnitz_wire::RelClass;
-        match self.kind {
-            RelationKind::Stream => RelClass::Stream,
-            RelationKind::View if self.is_bounded() => RelClass::BoundedView,
-            RelationKind::View => RelClass::View,
-            RelationKind::BaseTable | RelationKind::SystemCatalog => RelClass::Table,
+        match (self.kind, self.props) {
+            (RelationKind::Stream, _) => RelClass::Stream,
+            (RelationKind::View, ViewProps::Plain) => RelClass::View,
+            (RelationKind::View, ViewProps::Bounded { .. }) => RelClass::BoundedView,
+            (RelationKind::View, ViewProps::Fed { .. }) => RelClass::FedView,
+            (RelationKind::BaseTable | RelationKind::SystemCatalog, _) => RelClass::Table,
         }
     }
 
@@ -408,7 +392,7 @@ pub struct RelationSpec {
     /// `<root>/_relations/<t|v>_<id>`, from [`relation_dir`]. The parent of
     /// the `ChildAddr` subdir the store itself opens.
     pub directory: String,
-    pub budgets: ViewBudgets,
+    pub props: ViewProps,
 }
 
 // ---------------------------------------------------------------------------
