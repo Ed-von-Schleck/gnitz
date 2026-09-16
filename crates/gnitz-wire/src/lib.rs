@@ -91,7 +91,6 @@ mod catalog;
 mod circuit;
 mod codec;
 mod error;
-mod expr;
 mod flags;
 mod german_string;
 mod handshake;
@@ -112,8 +111,10 @@ pub mod wal;
 
 pub use catalog::*;
 pub use circuit::*;
+// The cursor itself, for the one payload this crate frames but never reads:
+// `gnitz-expr`'s program blob.
+pub use codec::{Reader, Writer};
 pub use error::*;
-pub use expr::*;
 pub use flags::*;
 pub use german_string::*;
 pub use handshake::*;

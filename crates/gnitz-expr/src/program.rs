@@ -12,7 +12,7 @@
 use crate::calendar::CalendarOp;
 use crate::like::LikeMatcher;
 use crate::{ColumnLocator, SchemaFacts};
-use gnitz_wire::{encode_german_string, FixedInt, TypeCode};
+use gnitz_wire::{encode_german_string, FixedInt, Reader, TypeCode, Writer};
 use std::fmt;
 use std::num::NonZeroU8;
 
@@ -22,10 +22,20 @@ use std::num::NonZeroU8;
 /// program at the limit.
 pub const MAX_REGS: usize = u64::BITS as usize;
 
-/// One wire instruction, `[opcode, selector, a1, a2, a3]`, in bytes.
-const INSTR_BYTES: usize = 5 * 4;
-/// One wire sink pair, `[kind, value]`, in bytes.
-const SINK_BYTES: usize = 2 * 4;
+/// The const pool's entry cap: an instruction names at most one pool entry, and
+/// `from_instrs` caps instructions at [`MAX_REGS`] — so an entry past this is one
+/// no instruction can index.
+const MAX_CONST_POOL: usize = MAX_REGS;
+
+/// One wire instruction, `[opcode, selector, a1, a2, a3]`.
+const INSTR_WORDS: usize = 5;
+/// One wire sink pair, `[kind, value]`.
+const SINK_WORDS: usize = 2;
+/// The two above as byte strides. One constant per region serves as both the
+/// item type's array size and the region's stride, so the blob's entry counts
+/// and the arrays they frame cannot disagree.
+const INSTR_BYTES: usize = INSTR_WORDS * 4;
+const SINK_BYTES: usize = SINK_WORDS * 4;
 /// The blob's `output` word for a program that writes output slots. `u32::MAX`,
 /// which no register index can be — the register file is 64 deep.
 const MAP_OUTPUT: u32 = u32::MAX;
@@ -110,7 +120,7 @@ pub enum ExprValidateErr {
 
 /// The client-facing rendering. Lives on the type so the planner's `Unsupported`
 /// and the engine's compile rejection print the same wording, and so the limit
-/// printed is the one [`LogicalProgram::from_wire`] enforces. The three variants
+/// printed is the one [`LogicalProgram::from_blob`] enforces. The three variants
 /// an API mistake can raise get sentences — a large SQL predicate or computed
 /// projection, and a `LogicalProgram` a client hand-built through
 /// [`crate::ExprBuilder`] and `gnitz_wire::Circuit`. The rest are
@@ -1093,7 +1103,7 @@ impl LogicalInstr {
     /// inverse of [`LogicalProgram::decode_instr`] — the two are the only
     /// statements of the word layout, held together by the round-trip test.
     /// Unused words are 0, matching what the decoder ignores.
-    pub fn to_wire(self) -> [u32; 5] {
+    pub fn to_wire(self) -> [u32; INSTR_WORDS] {
         use LogicalInstr as L;
         // Every arm is `[op, selector, a1, a2, a3]`; these shorten the common
         // shapes. `sel` is 0 for an opcode that names no family.
@@ -1184,12 +1194,63 @@ impl LogicalInstr {
 impl Sink {
     /// Serialise to the wire pair `[kind, value]`, the inverse of
     /// [`LogicalProgram::decode_sink`].
-    fn to_wire(self) -> [u32; 2] {
+    fn to_wire(self) -> [u32; SINK_WORDS] {
         match self {
             Sink::Col(src_col) => [SinkKind::Col.as_wire(), src_col],
             Sink::Reg(r) => [SinkKind::Reg.as_wire(), r.0 as u32],
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The blob framing
+// ---------------------------------------------------------------------------
+
+/// Serialise an expr program. Layout (all little-endian):
+///
+/// ```text
+/// 0   4   output (u32)
+/// 4   4   instruction count N
+/// 8   20N instruction words
+/// ..  4   sink count M
+/// ..  8M  sink words
+/// ..  4   const-pool count S
+/// ..  S × { 4-byte length L, L bytes }
+/// ```
+///
+/// The register count is not carried: a register is the index of the
+/// instruction that writes it, so N *is* the register file's size.
+///
+/// `output` is the register a filter's or scalar's result is read out of, or the
+/// `MAP_OUTPUT` sentinel for a program that writes output slots.
+pub fn encode_expr_blob(
+    output: u32,
+    code: impl ExactSizeIterator<Item = [u32; INSTR_WORDS]>,
+    sinks: impl ExactSizeIterator<Item = [u32; SINK_WORDS]>,
+    const_strings: &[Vec<u8>],
+) -> Vec<u8> {
+    let (n, m) = (code.len(), sinks.len());
+    // The exact encoded length, so nothing reallocates.
+    let mut w = Writer::with_capacity(
+        16 + n * INSTR_BYTES + m * SINK_BYTES + const_strings.iter().map(|s| 4 + s.len()).sum::<usize>(),
+    );
+    w.u32(output).u32(n as u32);
+    for instr in code {
+        for word in instr {
+            w.u32(word);
+        }
+    }
+    w.u32(m as u32);
+    for sink in sinks {
+        for word in sink {
+            w.u32(word);
+        }
+    }
+    w.u32(const_strings.len() as u32);
+    for s in const_strings {
+        w.bytes32(s);
+    }
+    w.into_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,10 +1315,10 @@ impl LogicalProgram {
     /// every `LogicalProgram` in every profile.
     ///
     /// The fallible entry point: [`Self::new`] unwraps it (a failure is a
-    /// compiler bug), `from_wire` propagates it (bad client input), and
+    /// compiler bug), [`Self::from_blob`] propagates it (bad client input), and
     /// [`ExprBuilder::build`](crate::ExprBuilder::build) hands its instructions
-    /// straight here rather than encoding them to wire words for `from_wire` to
-    /// decode back.
+    /// straight here rather than encoding them to a blob for [`Self::from_blob`]
+    /// to decode back.
     pub(crate) fn from_instrs(
         instrs: Vec<LogicalInstr>,
         output: Output,
@@ -1342,7 +1403,7 @@ impl LogicalProgram {
     /// one encode: `ExprBuilder` never produces wire words, so a blob can only
     /// come from a program already validated here.
     pub fn to_blob_bytes(&self) -> Vec<u8> {
-        gnitz_wire::encode_expr_blob(
+        encode_expr_blob(
             self.output.result().map_or(MAP_OUTPUT, |r| r.0 as u32),
             self.instrs.iter().copied().map(LogicalInstr::to_wire),
             self.output.slots().iter().copied().map(Sink::to_wire),
@@ -1350,15 +1411,20 @@ impl LogicalProgram {
         )
     }
 
-    /// A program blob: framing decoded, then lowered. The output word says
-    /// which profile it is, so there is one entry point; `label` names the call
-    /// site in a `CorruptBlob`, ahead of the framing's own message.
+    /// A program blob: the header walked, then the regions lowered into the
+    /// typed logical form — the inverse of [`encode_expr_blob`]. The output word
+    /// says which profile it is, so there is one entry point; `label` names the
+    /// call site in a `CorruptBlob`, ahead of the framing's own message.
+    ///
+    /// Every count is bounded against the bytes present before any cap applies,
+    /// so a forged count reports truncation rather than a limit it never reached.
     pub fn from_blob(blob: &[u8], label: &'static str) -> Result<Self, ExprValidateErr> {
-        let corrupt = |msg: String| ExprValidateErr::CorruptBlob(format!("{label}: {msg}"));
-        let b = gnitz_wire::decode_expr_blob(blob).map_err(corrupt)?;
-        // Bounded ahead of the narrowing below, which would fold a forged word
-        // onto a register the bytes do not name.
-        let result_reg = match b.output {
+        use ExprValidateErr as E;
+        let corrupt = |msg: String| E::CorruptBlob(format!("{label}: {msg}"));
+        let mut r = Reader::new(blob, "expr blob");
+        // Bounded before the `as u16`: `0x1_0000` would truncate to register 0,
+        // which `written_before(1)` accepts.
+        let result_reg = match r.u32().map_err(corrupt)? {
             MAP_OUTPUT => None,
             w if w as usize > MAX_REGS => {
                 return Err(corrupt(format!(
@@ -1367,39 +1433,43 @@ impl LogicalProgram {
             }
             w => Some(Reg(w as u16)),
         };
-        let const_strings = b.const_strings.into_iter().map(<[u8]>::to_vec).collect();
-        Self::from_wire(b.code, b.sinks, result_reg, const_strings)
-    }
-
-    /// Lower a blob's two regions into the typed logical form. Both lengths and
-    /// both counts are checked before either decode loop reads a word, so a
-    /// forged 64 MB region is rejected without being walked.
-    pub fn from_wire(
-        code: &[u8],
-        sinks: &[u8],
-        result_reg: Option<Reg>,
-        const_strings: Vec<Vec<u8>>,
-    ) -> Result<Self, ExprValidateErr> {
-        use ExprValidateErr as E;
-        // Whole entries or nothing: a leftover tail is a truncated instruction
-        // or sink pair, which reads as a different program than the bytes spell.
-        let (code, code_tail) = code.as_chunks::<INSTR_BYTES>();
-        let (sinks, sink_tail) = sinks.as_chunks::<SINK_BYTES>();
-        if !code_tail.is_empty() || !sink_tail.is_empty() {
-            return Err(E::CorruptBlob("expr region length".into()));
+        let n = r.u32().map_err(corrupt)? as usize;
+        let code = r.take(n * INSTR_BYTES).map_err(corrupt)?;
+        if n > MAX_REGS {
+            return Err(E::TooManyRegs(n as u32));
         }
-        if code.len() > MAX_REGS {
-            return Err(E::TooManyRegs(code.len() as u32));
+        let m = r.u32().map_err(corrupt)? as usize;
+        let sinks = r.take(m * SINK_BYTES).map_err(corrupt)?;
+        if m > gnitz_wire::MAX_COLUMNS {
+            return Err(corrupt(format!("sink count {m} exceeds {}", gnitz_wire::MAX_COLUMNS)));
         }
-        if sinks.len() > gnitz_wire::MAX_COLUMNS {
-            return Err(E::CorruptBlob(format!(
-                "sink count {} exceeds {}",
-                sinks.len(),
-                gnitz_wire::MAX_COLUMNS
+        // No fixed-stride region to bound this count, so it is capped as declared.
+        let s = r.u32().map_err(corrupt)? as usize;
+        if s > MAX_CONST_POOL {
+            return Err(corrupt(format!(
+                "declared const-pool count {s} exceeds {MAX_CONST_POOL}"
             )));
         }
-        let instrs = code.iter().map(Self::decode_instr).collect::<Result<Vec<_>, _>>()?;
-        let sinks = sinks.iter().map(Self::decode_sink).collect::<Result<Vec<_>, _>>()?;
+        // Never pre-sized: no allocation here is sized by a number the sender chose.
+        let mut const_strings: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..s {
+            const_strings.push(r.bytes32().map_err(corrupt)?.to_vec());
+        }
+        r.expect_consumed().map_err(corrupt)?;
+
+        // Each region was taken at a multiple of its stride, so no tail remains.
+        let instrs = code
+            .as_chunks::<INSTR_BYTES>()
+            .0
+            .iter()
+            .map(Self::decode_instr)
+            .collect::<Result<Vec<_>, _>>()?;
+        let sinks = sinks
+            .as_chunks::<SINK_BYTES>()
+            .0
+            .iter()
+            .map(Self::decode_sink)
+            .collect::<Result<Vec<_>, _>>()?;
         Self::from_instrs(instrs, Output::new(result_reg, sinks)?, const_strings)
     }
 
@@ -1780,7 +1850,14 @@ impl LogicalProgram {
                         // The kernel binary-searches this, so ascending order is a
                         // precondition. Sorted rather than rejected: membership does not
                         // depend on order, so a skewed pool has a right answer.
-                        set.sort_unstable();
+                        //
+                        // Guarded because the client always ships sorted, and `is_sorted`
+                        // short-circuits at the first inversion — so the shipped shape
+                        // never pays the sort, which dominates the resolve when it runs.
+                        // `from_blob_bench` prices both shapes.
+                        if !set.is_sorted() {
+                            set.sort_unstable();
+                        }
                         let slot = int_sets.len() as u32;
                         int_sets.push(set);
                         slot

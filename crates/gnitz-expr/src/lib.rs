@@ -2,7 +2,8 @@
 //! client alike.
 //!
 //! A leaf crate below the entire engine: its only in-workspace dependency is
-//! `gnitz-wire` (type codes, the OPK codec, the German-string layout), so both
+//! `gnitz-wire` (type codes, the OPK codec, the German-string layout, and the
+//! bounds-checked byte cursor its blob framing reads through), so both
 //! the server and the client-side planner can link it without pulling in
 //! storage, the catalog, or the runtime. Its one external crate, `memchr`, is
 //! `no_std` and dependency-free and supplies the substring scan behind LIKE.
@@ -22,9 +23,11 @@
 //! *what the schema says about it*.
 //!
 //! `LogicalInstr::to_wire` and `LogicalProgram::decode_instr` are two tables over
-//! [`ExprOp`]; the vocabulary and both tables live in `program.rs`, and
-//! `tests/program.rs`'s drift tests check them against each other. `gnitz-wire`
-//! keeps only the framing, which counts those words without interpreting one.
+//! [`ExprOp`]; the vocabulary, both tables and the blob framing that carries
+//! them all live in `program.rs`, and `tests/program.rs`'s drift tests check
+//! them against each other. `gnitz-wire` keeps only `EXPR_BLOB_VERSION`, the
+//! word its `SYS_SCHEMA_DIGEST` const fold must see — it cannot depend on this
+//! crate to reach one.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its

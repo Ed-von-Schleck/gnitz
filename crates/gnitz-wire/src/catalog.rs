@@ -363,9 +363,18 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
         i += 1;
     }
     h = (h ^ crate::circuit::CIRCUIT_PARAMS_VERSION as u64).wrapping_mul(PRIME);
-    h = (h ^ crate::expr::EXPR_BLOB_VERSION as u64).wrapping_mul(PRIME);
+    h = (h ^ EXPR_BLOB_VERSION as u64).wrapping_mul(PRIME);
     h
 };
+
+/// Version of the compiled expression-program blob, whose layout and encoder
+/// live in `gnitz-expr`. It sits here because [`SYS_SCHEMA_DIGEST`] folds it in
+/// at `const` time and this crate cannot depend on that one.
+///
+/// Carried by no blob — each rides a slot of an already-versioned container.
+/// Bumping it rejects both carriers of a stale one: a stored
+/// `CIRCUIT_NODES.params` cell, and an old client's live `ReadSpec` predicate.
+pub const EXPR_BLOB_VERSION: u8 = 5;
 
 // ---------------------------------------------------------------------------
 // System table IDs

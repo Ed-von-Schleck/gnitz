@@ -12,13 +12,13 @@
 use super::*;
 
 /// A predicate blob whose register file exceeds `MAX_REGS`, so
-/// `LogicalProgram::from_wire` rejects it. Forged word by word: the client's
+/// `LogicalProgram::from_blob` rejects it. Forged word by word: the client's
 /// `ExprBuilder` refuses to build an over-cap program, so only a corrupt
 /// circuit can carry one — which is the input the pre-flight exists to catch.
 fn over_cap_pred_blob() -> Vec<u8> {
     let n = gnitz_expr::MAX_REGS as u32 + 1;
     let code = (0..n).map(|dst| gnitz_expr::LogicalInstr::LoadConst { val: dst as i64 }.to_wire());
-    gnitz_wire::encode_expr_blob(n - 1, code, std::iter::empty(), &[] as &[&[u8]])
+    gnitz_expr::encode_expr_blob(n - 1, code, std::iter::empty(), &[])
 }
 
 /// `ScanDelta(base_tid) → Filter(pred) → Distinct → Integrate` for `vid`. The

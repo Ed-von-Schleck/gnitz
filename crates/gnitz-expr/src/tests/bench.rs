@@ -19,7 +19,7 @@ use crate::test_support::{
     both_arms, filter_prog, is_null_op, make_n_col_view, map_prog, passing_rows, push_payload_cols, scalar_prog,
     schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, ConstIdx, Evaluator, IntArithOp, LogicalInstr, Reg, Sink};
+use crate::{CmpOp, ConstIdx, Evaluator, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
 
 /// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
 /// bench built. A misspelled selector would otherwise drive nothing and
@@ -769,4 +769,69 @@ fn expr_kernel_bench() {
         std::hint::black_box(acc)
     );
     selected("GNITZ_BENCH_SHAPE", &only, n_selected);
+}
+
+/// Retired instructions for the per-request decode of an ad-hoc predicate:
+/// `from_blob` plus the `resolve_filter` that decodes its const pool. A
+/// predicate-only read reaches every worker, so this pair runs once per request
+/// per worker.
+///
+/// `n` is the reachable maximum: an `IN` list over a non-PK integer column stays
+/// in the residual, riding one pool entry of 8 bytes per item with no item-count
+/// cap below `MAX_READ_SPEC_BYTES`.
+///
+/// `GNITZ_BENCH_POOL` picks the pool's order, which is the whole point: the two
+/// shapes hold the same values and differ only in whether `resolve`'s `is_sorted`
+/// guard can answer without sorting, so differencing them prices the guard.
+///
+/// At the `n` below, differenced over `GNITZ_BENCH_PASSES` 1 and 201:
+///
+/// | pool shape | instructions per decode + resolve |
+/// |------------|----------------------------------:|
+/// | ascending  |                           570,030 |
+/// | scrambled  |                        46,412,905 |
+///
+/// The sort dominates whenever it runs, which is what the guard keeps the
+/// shipped shape off.
+///
+/// Build first — `perf stat` around a cold `cargo test` measures the compile,
+/// not the bench.
+///
+///   cargo build -p gnitz-expr --release --tests
+///   for s in ascending scrambled; do for p in 1 201; do \
+///     GNITZ_BENCH_POOL=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
+///     cargo test -p gnitz-expr --release from_blob_bench -- --ignored --nocapture
+///   done; done
+#[test]
+#[ignore]
+fn from_blob_bench() {
+    let passes = bench_passes();
+    let shape = std::env::var("GNITZ_BENCH_POOL").unwrap_or_else(|_| "ascending".to_string());
+    let schema = schema_pk_ints(1, false);
+    let n = 262_144usize;
+    let set: Vec<i64> = match shape.as_str() {
+        // What the client ships: sorted and deduped, so the guard answers off one
+        // scan and no sort runs.
+        "ascending" => (0..n as i64).collect(),
+        // The same values permuted — `n` is a power of two and the multiplier odd,
+        // so this is a bijection — leaving order the only difference, and the sort
+        // running in full.
+        "scrambled" => (0..n).map(|i| (i.wrapping_mul(2_654_435_761) % n) as i64).collect(),
+        other => panic!("GNITZ_BENCH_POOL must be ascending/scrambled, got {other:?}"),
+    };
+    let mut b = ExprBuilder::new();
+    let set_idx = b.add_const_int_set(&set);
+    let col = b.emit(LogicalInstr::LoadColInt { col: 1 });
+    let hit = b.emit(LogicalInstr::IntInSet { value_reg: col, set_idx });
+    let blob = b.build(Some(hit)).expect("a well-formed predicate").to_blob_bytes();
+
+    let mut acc = 0usize;
+    for _ in 0..passes {
+        let prog = LogicalProgram::from_blob(std::hint::black_box(&blob), "bench").expect("decodes");
+        acc += prog.resolve_filter(&schema).expect("resolves").prog.int_sets[0].len();
+    }
+    println!(
+        "from_blob_bench shape={shape} passes={passes} n={n} acc={}",
+        std::hint::black_box(acc)
+    );
 }
