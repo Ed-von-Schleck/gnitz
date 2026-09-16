@@ -60,23 +60,22 @@ impl PendingScan {
         let base = self.base_frame();
         let overhead = base.size();
         let start = self.next_row;
-        let chunk = self.batch.wire_chunk_within(start, overhead, budget);
-        let size = overhead + chunk.wire_byte_size();
+        let (chunk, size) = self.batch.wire_chunk_within(start, overhead, budget);
         // Over `budget` only at one row, since `budget <= FRAME_CAP`; over
         // FRAME_CAP there is nothing left to narrow.
         if size > FRAME_CAP {
             return Err(oversized_reply(size));
         }
-        let has_more = start + chunk.len() < self.batch.len();
+        let has_more = start + chunk.rows() < self.batch.len();
         w2m.send_msg(
             self.route.request_id,
             &WireMsg {
                 flags: WireFlags::train_frame(self.server_version, !has_more),
-                data: WireData::Whole(&chunk),
+                data: WireData::of_chunk(&self.batch, start, &chunk),
                 ..base
             },
         );
-        self.next_row = start + chunk.len();
+        self.next_row = start + chunk.rows();
         Ok(has_more)
     }
 }
@@ -250,9 +249,8 @@ pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor) -> usize
 /// Unclamped, that test-only override builds a frame the W2M ring cannot hold,
 /// which `w2m::try_reserve` asserts against and which aborts in release.
 ///
-/// Charging per key over-counts the region alignment `block_size_from` does
-/// once, so the count is conservative; `send_unique_preflight_keys` asserts the
-/// frame it actually builds.
+/// A block's size is affine in its row count, so charging every key the same
+/// width is exact; `send_unique_preflight_keys` asserts the frame it builds.
 pub(crate) fn preflight_keys_per_frame(frame_schema: &SchemaDescriptor, budget: usize, overhead: usize) -> usize {
     let per_key = gnitz_store::storage::wire_block_size(frame_schema, 1, 0)
         - gnitz_store::storage::wire_block_size(frame_schema, 0, 0);

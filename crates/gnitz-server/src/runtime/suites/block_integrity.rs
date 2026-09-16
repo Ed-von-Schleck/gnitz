@@ -58,7 +58,7 @@ fn schema_block_count_forgeries_are_rejected() {
 fn single_bit_header_sweep_changes_nothing_observable() {
     let schema = make_schema_u64_i64();
     let clean_data = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec(7, true);
-    let (reference, _) = Batch::decode_from_wal_block(&clean_data, &schema, true).expect("clean");
+    let reference = Batch::decode_from_wal_block(&clean_data, &schema, true).expect("clean");
     let ref_rows: Vec<(u128, i64)> = (0..reference.len())
         .map(|i| (reference.get_pk(i), reference.get_weight(i)))
         .collect();
@@ -69,7 +69,7 @@ fn single_bit_header_sweep_changes_nothing_observable() {
         if (WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8).contains(&byte) {
             return; // the checksum field itself: a flip there is caught by design
         }
-        let Ok((decoded, _)) = Batch::decode_from_wal_block(buf, &schema, true) else {
+        let Ok(decoded) = Batch::decode_from_wal_block(buf, &schema, true) else {
             return;
         };
         if (WAL_OFF_TID..WAL_OFF_TID + 4).contains(&byte) {

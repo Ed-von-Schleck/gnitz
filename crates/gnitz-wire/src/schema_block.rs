@@ -25,9 +25,9 @@
 use crate::german_string::german_spill_len;
 use crate::wal;
 use crate::{
-    blob_extent, encode_german_string, german_string_content, is_pk_eligible, is_valid_type_code, payload_region_in,
-    read_u64_le, wire_stride, write_u64_le, LEADING_COL_PK, MAX_COLUMNS, MAX_PK_COLUMNS, META_SCHEMA_COLS,
-    REG_NULL_BMP, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
+    encode_german_string, german_string_cell_ok, german_string_content, is_pk_eligible, is_valid_type_code,
+    payload_region_in, read_u64_le, wire_stride, write_u64_le, LEADING_COL_PK, MAX_COLUMNS, MAX_PK_COLUMNS,
+    META_SCHEMA_COLS, REG_NULL_BMP, REG_PK, REG_WEIGHT,
 };
 
 const REG_TYPE_CODE: usize = payload_region_in(META_SCHEMA_COLS, "type_code");
@@ -137,12 +137,7 @@ const FIXED_ROW_BYTES: usize = {
 
 /// Block size for `n` columns spilling `blob` bytes of long names.
 fn block_len(n: usize, blob: usize) -> usize {
-    let mut sizes = [0u32; SCHEMA_BLOCK_REGIONS];
-    for (r, sz) in sizes.iter_mut().enumerate() {
-        *sz = (n * ROW_BYTES[r]) as u32;
-    }
-    sizes[REG_BLOB] = blob as u32;
-    wal::block_size(&sizes)
+    wal::body_start(SCHEMA_BLOCK_REGIONS) + n * FIXED_ROW_BYTES + blob
 }
 
 /// Encoded size of the block for `cols` — the size [`encode`] reserves, so
@@ -297,12 +292,14 @@ impl<'a> SchemaBlock<'a> {
             }
             let meta = ColMeta::from_flags(fl);
 
-            // A name cell whose heap extent overruns the blob is a decode error,
-            // not an empty name: the name is the column's identity downstream.
+            // A name cell not in canonical form is a decode error, not an empty
+            // name: the name is the column's identity downstream. Asked through
+            // the cell's own predicate, so a heap extent past the blob and a
+            // pad/prefix skew — which would order two equal names unequal — are
+            // refused by the same rule every other German-string boundary applies.
             let cell = &block[name_off + i * 16..name_off + (i + 1) * 16];
-            let len = crate::read_u32_le(cell, 0) as usize;
-            if len > SHORT_STRING_THRESHOLD && blob_extent(blob.len(), read_u64_le(cell, 8), len).is_none() {
-                return Err("schema name blob arena out of bounds");
+            if !german_string_cell_ok(cell, blob) {
+                return Err("schema name cell is not in canonical form");
             }
 
             if let Some(pos) = meta.pk_pos {

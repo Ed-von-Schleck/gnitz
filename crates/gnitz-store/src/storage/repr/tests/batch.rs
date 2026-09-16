@@ -429,9 +429,9 @@ fn batch_region_access() {
 
     // 2 columns: PK (U64) + payload (I64) — regions pk(0), weight(1),
     // null(2), col0(3), blob(4).
-    assert_eq!(batch.region_or_blob(0).len(), 8);
-    assert_eq!(batch.region_or_blob(3).len(), 8);
-    assert!(batch.region_or_blob(4).is_empty(), "no strings ⇒ empty heap");
+    assert_eq!(batch.region_at(0).len(), 8);
+    assert_eq!(batch.region_at(3).len(), 8);
+    assert!(batch.blob.is_empty(), "no strings ⇒ empty heap");
 }
 
 /// Dropping a batch returns its data buffer to the thread-local pool, and a

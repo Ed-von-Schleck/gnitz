@@ -67,7 +67,7 @@ fn delta_ingest_bench() {
         let t0 = Instant::now();
         let mut batches: Vec<Batch> = Vec::with_capacity(k);
         for blk in &blocks {
-            let (b, _) = Batch::decode_from_wal_block(blk, &schema, false).unwrap();
+            let b = Batch::decode_from_wal_block(blk, &schema, false).unwrap();
             batches.push(b);
         }
         let decode_ns = t0.elapsed().as_nanos() as f64;

@@ -65,6 +65,7 @@ pub(crate) use scatter::scatter_unified_sources;
 pub use batch::Layout;
 pub use batch_builder::BatchBuilder;
 pub use batch_wire::wire_block_size;
+pub use batch_wire::WireChunk;
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
 // weight, and every out-of-storage consumer (the comparators, the group-key
 // extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.

@@ -832,8 +832,8 @@ fn packed_roundtrip_all_surfaces() {
     // payload region against the control.
     let pb = packed.slice_to_owned_batch(0, packed.count, &schema);
     let rb = raw.slice_to_owned_batch(0, raw.count, &schema);
-    let pbytes = pb.region_or_blob(REG_PAYLOAD_START);
-    let rbytes = rb.region_or_blob(REG_PAYLOAD_START);
+    let pbytes = pb.region_at(REG_PAYLOAD_START);
+    let rbytes = rb.region_at(REG_PAYLOAD_START);
     assert_eq!(pbytes.len(), rbytes.len());
     assert_eq!(pbytes, rbytes, "whole-shard slice payload region byte-identical");
     // A mid-shard slice reads the decoded image from `start`, not from row 0.
@@ -860,8 +860,8 @@ fn assert_slices_match(a: &MappedShard, b: &MappedShard, start: usize, len: usiz
     assert_eq!(sa.count, len);
     for region in [REG_PK, REG_WEIGHT, REG_NULL_BMP, REG_PAYLOAD_START] {
         assert_eq!(
-            sa.region_or_blob(region),
-            sb.region_or_blob(region),
+            sa.region_at(region),
+            sb.region_at(region),
             "slice [{start}, +{len}) region {region}"
         );
     }

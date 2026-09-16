@@ -118,12 +118,17 @@ pub(crate) fn mem_batch_to_unified<'a>(
     }
 }
 
-/// Identity-keyed dedup cache for `relocate_german_string_vec`.
-///
-/// Key: `(src_blob.as_ptr() as usize, old_offset, length)`. The same source
-/// span is copied at most once per merge — the cached value is the offset
-/// inside the destination blob where the bytes were appended.
+/// Identity-keyed dedup cache for `relocate_german_string_vec`, keyed by
+/// [`blob_span_key`]: the same source span is copied at most once, and the
+/// cached value is where it landed in the destination blob.
 pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
+
+/// One source span, identified by the heap it lives in. Shared so a sizing pass
+/// charges exactly the spans a relocation copies.
+#[inline]
+pub(super) fn blob_span_key(src_blob: &[u8], start: usize, length: usize) -> (usize, usize, usize) {
+    (src_blob.as_ptr() as usize, start, length)
+}
 
 /// Reserve hint for a destination heap taking `out_rows` of a `src_rows`-row
 /// source whose heap is `src_blob` bytes: that slice's row-proportional share.
@@ -233,7 +238,7 @@ fn relocate_long_german_string(
     let new_offset = dst_blob.len();
     let off = match cache {
         Some(cache) => {
-            let key = (src_blob.as_ptr() as usize, span.start, length);
+            let key = blob_span_key(src_blob, span.start, length);
             *cache.entry(key).or_insert_with(|| {
                 dst_blob.extend_from_slice(&src_blob[span]);
                 new_offset
@@ -548,7 +553,7 @@ impl<'a> DirectWriter<'a> {
         rows: usize,
         blob: &'a mut Vec<u8>,
     ) -> Self {
-        use super::batch::{compute_offsets_into, strides_from_schema, MAX_BATCH_REGIONS, REG_PAYLOAD_START};
+        use super::batch::{compute_offsets_into, strides_from_schema, MAX_BATCH_REGIONS};
 
         let (strides, nr) = strides_from_schema(schema);
         let nr = nr as usize;
@@ -572,9 +577,22 @@ impl<'a> DirectWriter<'a> {
             base = offsets[r] + sz;
             rest = remainder;
         }
+        Self::over_regions(regions, schema, blob, rows)
+    }
+
+    /// Open over one already-carved writable slice per fixed region, in region
+    /// order. `hint_rows` sizes the blob dedup cache.
+    pub(crate) fn over_regions(
+        mut regions: Vec<&'a mut [u8]>,
+        schema: &'a SchemaDescriptor,
+        blob: &'a mut Vec<u8>,
+        hint_rows: usize,
+    ) -> Self {
+        use super::batch::REG_PAYLOAD_START;
+
         let col_bufs = regions.split_off(REG_PAYLOAD_START);
         let [pk, weight, null_bmp] = <[&mut [u8]; REG_PAYLOAD_START]>::try_from(regions)
-            .expect("strides_from_schema always emits the three fixed regions first");
+            .expect("a region carve always emits the three fixed regions first");
 
         DirectWriter {
             pk,
@@ -583,7 +601,7 @@ impl<'a> DirectWriter<'a> {
             null_bmp,
             col_bufs,
             blob,
-            blob_cache: BlobCacheGuard::acquire(schema, rows),
+            blob_cache: BlobCacheGuard::acquire(schema, hint_rows),
             count: 0,
             schema,
         }

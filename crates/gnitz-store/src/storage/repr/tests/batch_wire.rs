@@ -76,8 +76,23 @@ fn decode_from_wal_block_rejects_header_count_forgeries() {
     );
 
     let empty = Batch::empty_with_schema(&schema).encode_to_wire_vec(7, true);
-    let (decoded, _) = Batch::decode_from_wal_block(&empty, &schema, true).expect("an empty block decodes");
+    let decoded = Batch::decode_from_wal_block(&empty, &schema, true).expect("an empty block decodes");
     assert_eq!(decoded.count, 0);
+}
+
+/// A zero-row block declaring heap bytes decodes to an empty heap: no cell can
+/// resolve against a heap at zero rows.
+#[test]
+fn a_zero_row_block_carrying_heap_bytes_decodes_to_an_empty_heap() {
+    use crate::test_support::make_schema_pk_u64_payload_string;
+    let schema = make_schema_pk_u64_payload_string();
+    let mut empty = Batch::empty_with_schema(&schema);
+    empty.blob.extend_from_slice(b"heap bytes no row references");
+    let block = empty.encode_to_wire_vec(7, true);
+
+    let decoded = Batch::decode_from_wal_block(&block, &schema, true).expect("a zero-row block decodes");
+    assert_eq!(decoded.len(), 0);
+    assert!(decoded.blob.is_empty(), "a zero-row block carries no heap");
 }
 
 /// The variable-length blob region is the one whose extent the schema cannot
@@ -94,8 +109,13 @@ fn decode_mem_batch_rejects_blob_region_past_block() {
     buf[entry + 4..entry + 8].copy_from_slice(&8u32.to_le_bytes());
 
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let r = decode_mem_batch_from_wal_block(&buf, &schema, &mut offsets);
+    let r = decode_mem_batch_from_wal_block(&buf, &schema, false, &mut offsets);
     assert_eq!(r.err(), Some("data WAL block invalid"));
+}
+
+/// Rows the chunker takes from `start` under `budget`.
+fn chunk_rows(b: &Batch, start: usize, overhead: usize, budget: usize) -> usize {
+    b.wire_chunk_within(start, overhead, budget).0.rows()
 }
 
 // ---------------------------------------------------------------------------
@@ -165,9 +185,9 @@ fn wire_chunk_within_counts_a_shared_span_once() {
     let (_, distinct) = string_rows(&distinct_rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
 
     let budget = shared.wire_byte_size();
-    assert_eq!(shared.wire_chunk_within(0, 0, budget).len(), N);
+    assert_eq!(chunk_rows(&shared, 0, 0, budget), N);
     assert!(
-        distinct.wire_chunk_within(0, 0, budget).len() < N,
+        chunk_rows(&distinct, 0, 0, budget) < N,
         "the same budget cannot hold {N} private 200-byte copies"
     );
 }
@@ -175,7 +195,7 @@ fn wire_chunk_within_counts_a_shared_span_once() {
 /// A short (inline) string contributes no heap bytes. Reading a heap extent off
 /// one instead — its bytes 8..16 are content, not an offset — yields a bogus
 /// span and one row per frame. Both arms are covered: an all-short batch has an
-/// empty heap and takes the bisection, and one long row puts the rest on the
+/// empty heap and inverts exactly, and one long row puts the rest on the
 /// forward walk.
 #[test]
 fn wire_chunk_within_does_not_collapse_on_short_strings() {
@@ -190,12 +210,22 @@ fn wire_chunk_within_does_not_collapse_on_short_strings() {
 
     // Room for ten rows beside the block header.
     let budget = all_short.wire_byte_size_range(10);
-    assert_eq!(all_short.wire_chunk_within(0, 0, budget).len(), 10);
+    assert_eq!(chunk_rows(&all_short, 0, 0, budget), 10);
     assert_eq!(
-        mixed.wire_chunk_within(1, 0, budget).len(),
+        chunk_rows(&mixed, 1, 0, budget),
         10,
         "the short rows past the long one cost their fixed width and nothing more"
     );
+
+    // An empty heap is framed off the source; a live one relocates.
+    assert!(matches!(
+        all_short.wire_chunk_within(0, 0, budget).0,
+        super::WireChunk::Range { .. }
+    ));
+    assert!(matches!(
+        mixed.wire_chunk_within(1, 0, budget).0,
+        super::WireChunk::Owned(_)
+    ));
 }
 
 /// A row too wide for the budget still ships: the chunk carries it alone rather
@@ -203,5 +233,5 @@ fn wire_chunk_within_does_not_collapse_on_short_strings() {
 #[test]
 fn wire_chunk_within_never_returns_an_empty_chunk() {
     let (_, batch) = string_rows(&[(1, &"w".repeat(4096)), (2, &"w".repeat(4096))]);
-    assert_eq!(batch.wire_chunk_within(0, 0, 64).len(), 1);
+    assert_eq!(chunk_rows(&batch, 0, 0, 64), 1);
 }

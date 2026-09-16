@@ -4,7 +4,7 @@ use crate::runtime::wire::{
 };
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, MAX_BATCH_REGIONS};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block, CTRL_HEADER_SIZE};
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
@@ -298,26 +298,45 @@ fn decode_wire_round_trips_every_control_field() {
 // Scan chunking tests
 // ---------------------------------------------------------------------------
 
-/// One chunk of a reply train — rows [2, 5) of an 8-row batch — round-trips
-/// through the frame codec at its predicted size.
+/// One chunk of a reply train — rows [2, 5) of an 8-row blobless batch — framed
+/// straight off the source is byte-identical to the same rows built as a batch
+/// of their own.
 #[test]
-fn encode_chunk_roundtrip() {
+fn a_range_chunk_frames_identically_to_the_same_rows_whole() {
     let sd = simple_schema();
     let batch = make_blobless_batch(8);
     let blk = sblock(&sd, 1);
 
     // A budget sized for exactly three rows of this schema.
-    let chunk = batch.wire_chunk_within(2, 0, make_blobless_batch(3).wire_byte_size());
-    assert_eq!(chunk.len(), 3);
+    let (chunk, _) = batch.wire_chunk_within(2, 0, make_blobless_batch(3).wire_byte_size());
+    assert_eq!(chunk.rows(), 3);
+    assert!(
+        matches!(chunk, WireChunk::Range { .. }),
+        "a blobless batch is framed off the source, with no sub-batch built"
+    );
+
     let msg = WireMsg {
         target_id: 1,
         schema_block: Some(&blk),
-        data: WireData::Whole(&chunk),
+        data: WireData::of_chunk(&batch, 2, &chunk),
         ..Default::default()
     };
     let sz = msg.size();
     let mut buf = vec![0u8; sz];
     assert_eq!(msg.encode(&mut buf), sz);
+
+    // The same rows as a batch of their own, framed the long way round.
+    let mut owned = Batch::with_capacity(&sd, 3);
+    owned.append_batch(&batch, 2, 5);
+    let whole = WireMsg {
+        target_id: 1,
+        schema_block: Some(&blk),
+        data: WireData::Whole(&owned),
+        ..Default::default()
+    };
+    let mut whole_buf = vec![0u8; whole.size()];
+    whole.encode(&mut whole_buf);
+    assert_eq!(buf, whole_buf, "framing off the source must be byte-identical");
 
     // Every region must be sliced by the same range: PK, weight and payload are
     // distinct per row, so a range applied to one region and not another shows up.

@@ -78,13 +78,11 @@ pub(crate) struct PersistedState {
 /// conservative in the one direction that is never wrong.
 pub(crate) fn read_state(base_dir: &str) -> Option<(PersistedState, Vec<u8>)> {
     let bytes = std::fs::read(path(base_dir)).ok()?;
-    if bytes.len() < HEADER_LEN {
+    let block = gnitz_wire::wal::block_slice_at(&bytes, HEADER_LEN).ok()?;
+    if HEADER_LEN + block.len() != bytes.len() {
         return None;
     }
-    let (batch, used) = Batch::decode_from_wal_block(&bytes[HEADER_LEN..], &STATE_SCHEMA, true).ok()?;
-    if HEADER_LEN + used != bytes.len() {
-        return None;
-    }
+    let batch = Batch::decode_from_wal_block(block, &STATE_SCHEMA, true).ok()?;
     let mut records = HashMap::with_capacity(batch.len());
     for row in 0..batch.len() {
         let cursor = (!payload_is_null(&batch, row, TAG)).then(|| DeltaCursor {

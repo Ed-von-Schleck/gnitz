@@ -532,7 +532,10 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     let mut batch = long_string_batch(&schema, &[(1, "a long enough value"), (2, "another long value")]);
     batch.blob.extend_from_slice(&[0u8; 4096]);
     let batch = Rc::new(batch);
-    let compacted = batch.wire_chunk_within(0, 0, usize::MAX);
+    let (chunk, _) = batch.wire_chunk_within(0, 0, usize::MAX);
+    let gnitz_store::storage::WireChunk::Owned(compacted) = chunk else {
+        panic!("a heap-bearing batch must relocate into a chunk of its own");
+    };
     assert!(
         compacted.wire_byte_size() < batch.wire_byte_size(),
         "the fixture must have a dedupable heap for the size test to discriminate"

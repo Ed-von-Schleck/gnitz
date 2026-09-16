@@ -150,6 +150,7 @@ pub use wal::{
 // ---------------------------------------------------------------------------
 
 /// Align `n` up to an 8-byte boundary.
+#[inline(always)]
 pub const fn align8(n: usize) -> usize {
     (n + 7) & !7
 }

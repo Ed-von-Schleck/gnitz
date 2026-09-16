@@ -74,8 +74,7 @@ impl WorkerProcess {
         let overhead = frame(false).size();
         let mut next_row = 0;
         while next_row < batch.len() {
-            let chunk = batch.wire_chunk_within(next_row, overhead, ipc::FRAME_CAP);
-            let size = overhead + chunk.wire_byte_size();
+            let (chunk, size) = batch.wire_chunk_within(next_row, overhead, ipc::FRAME_CAP);
             if size > ipc::FRAME_CAP {
                 // One row too wide to frame. A reply faults its client with
                 // `oversized_reply`; an exchange has no client to fault.
@@ -87,11 +86,12 @@ impl WorkerProcess {
                     ipc::FRAME_CAP,
                 );
             }
-            next_row += chunk.len();
+            let start = next_row;
+            next_row += chunk.rows();
             self.w2m_writer.send_msg(
                 W2M_EXCHANGE_RING_ID,
                 &ipc::WireMsg {
-                    data: ipc::WireData::Whole(&chunk),
+                    data: ipc::WireData::of_chunk(batch, start, &chunk),
                     ..frame(next_row == batch.len())
                 },
             );

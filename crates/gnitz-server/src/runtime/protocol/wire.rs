@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
-use gnitz_store::storage::{Batch, Layout, MemBatch, MAX_BATCH_REGIONS};
+use gnitz_store::storage::{Batch, Layout, MemBatch, WireChunk, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{frame_blocks, peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
@@ -87,6 +87,13 @@ pub enum WireData<'a> {
     #[default]
     None,
     Whole(&'a Batch),
+    /// Rows `[start, start + rows)` framed directly off `batch`, with no heap —
+    /// so no payload cell of those rows may reference one.
+    Range {
+        batch: &'a Batch,
+        start: usize,
+        rows: usize,
+    },
     /// The rows `indices` selects, in that order, encoded straight into the
     /// destination — no per-worker sub-`Batch` in between. Valid only for a
     /// schema with no German-string column.
@@ -97,19 +104,30 @@ pub enum WireData<'a> {
 }
 
 impl<'a> WireData<'a> {
+    /// The payload for one frame of a train over `batch`, from `start`.
+    pub(crate) fn of_chunk(batch: &'a Batch, start: usize, chunk: &'a WireChunk) -> Self {
+        match chunk {
+            WireChunk::Range { rows } => WireData::Range { batch, start, rows: *rows },
+            WireChunk::Owned(b) => WireData::Whole(b),
+        }
+    }
+
     /// Rows this payload carries; `0` means the slot or frame is dataless.
     pub(crate) fn row_count(&self) -> usize {
         match *self {
             WireData::None => 0,
             WireData::Whole(b) => b.len(),
+            WireData::Range { rows, .. } => rows,
             WireData::Scattered { indices, .. } => indices.len(),
         }
     }
 
+    /// The batch this frame's layout claim is read off — for a `Range`, the
+    /// source, whose claim a contiguous subrange keeps.
     fn batch(&self) -> Option<&'a Batch> {
         match *self {
             WireData::None => None,
-            WireData::Whole(b) | WireData::Scattered { batch: b, .. } => Some(b),
+            WireData::Whole(b) | WireData::Range { batch: b, .. } | WireData::Scattered { batch: b, .. } => Some(b),
         }
     }
 
@@ -117,6 +135,7 @@ impl<'a> WireData<'a> {
         match *self {
             WireData::None => 0,
             WireData::Whole(b) => b.wire_byte_size(),
+            WireData::Range { batch, rows, .. } => batch.wire_byte_size_range(rows),
             WireData::Scattered { batch, indices } => batch.wire_byte_size_range(indices.len()),
         }
     }
@@ -203,6 +222,7 @@ impl<'a> WireMsg<'a> {
             pos += match self.data {
                 WireData::None => unreachable!("has_data implies a batch"),
                 WireData::Whole(b) => b.encode_to_wire(tid, out, pos, false),
+                WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, tid, out, pos),
                 WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, tid, out, pos),
             };
         }
@@ -274,9 +294,7 @@ pub fn decode_client_frame(
 /// Decode one SAL slot.
 pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, &'static str> {
     let control = peek_control_block(data)?;
-    let (schema, data_batch) = decode_frame(data, &control, None, |b, s| {
-        Batch::decode_from_wal_block(b, s, false).map(|(b, _)| b)
-    })?;
+    let (schema, data_batch) = decode_frame(data, &control, None, |b, s| Batch::decode_from_wal_block(b, s, false))?;
     let mut decoded = DecodedWire { control, schema, data_batch };
     certify_engine_frame(&mut decoded);
     Ok(decoded)
@@ -289,7 +307,7 @@ pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
     let control = peek_control_block(data)?;
     let (schema, data_batch) = decode_frame(data, &control, None, |block, schema| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
+        let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, false, &mut offsets)?;
         let mut owned = Batch::with_capacity(schema, mb.len());
         owned.append_mem_batch(&mb);
         Ok(owned)
@@ -308,7 +326,7 @@ pub(crate) fn decode_train_frame<'a>(
     offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<Option<MemBatch<'a>>, String> {
     let (block_schema, batch) = decode_frame(data, control, Some(expected), move |block, schema| {
-        gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, offsets)
+        gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, false, offsets)
     })?;
     if let Some(s) = &block_schema {
         validate_schema_match(s, expected)?;

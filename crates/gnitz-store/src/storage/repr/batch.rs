@@ -60,11 +60,6 @@ pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
 /// size. Entries past `num_regions` are untouched; every caller passes an
 /// all-zero array. An out-parameter rather than a return because the array is
 /// 544 bytes and this does not inline, so a return was a `memcpy` per batch.
-///
-/// Region starts pad through `gnitz_wire::align8` — the same primitive
-/// `wal`'s directory walk pads with, which is what makes
-/// `encode_scattered_to_wire` land its regions where the directory it already
-/// wrote names them.
 pub(in crate::storage) fn compute_offsets_into(
     strides: &[u8; MAX_BATCH_REGIONS],
     num_regions: usize,
@@ -75,7 +70,7 @@ pub(in crate::storage) fn compute_offsets_into(
     // join, a bulk full-scan/merge) can have a cumulative offset > 4 GB even
     // though each individual region is still capped at 4 GB by the u32 wire
     // region sizes. A `u32` store silently truncated the per-region offset, so
-    // `region_or_blob` aliased an earlier region — silent corruption. Not a wire
+    // `region_at` aliased an earlier region — silent corruption. Not a wire
     // change: the WAL/exchange encoding serializes region *sizes* and recomputes
     // offsets via this fn on receive, so offsets never cross a process boundary.
     let mut off = 0usize;
@@ -385,9 +380,10 @@ impl Batch {
     }
 
     /// The live `count * stride` bytes of region `r` — the one range computation
-    /// every fixed-region accessor below shares.
+    /// every fixed-region accessor below shares, and the slice the wire and shard
+    /// framers build their region lists from.
     #[inline(always)]
-    fn region_at(&self, r: usize) -> &[u8] {
+    pub(super) fn region_at(&self, r: usize) -> &[u8] {
         let off = self.offsets[r];
         &self.data[off..off + self.count * self.strides[r] as usize]
     }
@@ -891,6 +887,22 @@ impl Batch {
     }
 }
 
+/// Bit `pi` set = payload slot `pi` of `dst`'s schema is a German string.
+pub(super) fn string_mask(dst: &Batch) -> u64 {
+    let npc = dst.num_payload_cols();
+    debug_assert!(npc <= 64, "string mask indexes payload slots, bounded by the null word");
+    let mut mask = 0u64;
+    for (pi, col) in dst.schema.payload_columns() {
+        if pi >= npc {
+            break;
+        }
+        if gnitz_wire::is_german_string(col.type_code) {
+            mask |= 1 << pi;
+        }
+    }
+    mask
+}
+
 /// An open append into one destination batch — the only way to reach
 /// [`Batch::append_ranges_inner`], so no caller can skip its setup or repay it.
 ///
@@ -909,25 +921,10 @@ pub(crate) struct AppendSession<'d> {
 }
 
 impl<'d> AppendSession<'d> {
-    fn string_mask(dst: &Batch) -> u64 {
-        let npc = dst.num_payload_cols();
-        debug_assert!(npc <= 64, "string mask indexes payload slots, bounded by the null word");
-        let mut mask = 0u64;
-        for (pi, col) in dst.schema.payload_columns() {
-            if pi >= npc {
-                break;
-            }
-            if gnitz_wire::is_german_string(col.type_code) {
-                mask |= 1 << pi;
-            }
-        }
-        mask
-    }
-
     /// The session holds a pooled blob dedup cache for its whole life, so
     /// repeated long-string spans are appended once across every push.
     pub(crate) fn open(dst: &'d mut Batch, hint_rows: usize) -> Self {
-        let mask = Self::string_mask(dst);
+        let mask = string_mask(dst);
         let guard = BlobCacheGuard::acquire(&dst.schema, hint_rows);
         AppendSession { dst, mask, guard }
     }
@@ -1516,24 +1513,6 @@ impl Batch {
         self.blob_id = src.blob_id;
     }
 
-    /// Safe `&[u8]` view of region `idx` — `count * stride` bytes for a fixed
-    /// region, the whole heap for the trailing blob — for callers that frame the
-    /// batch into a byte buffer (`batch_wire`'s wire encoders) or hand it to the
-    /// shard writer. The region copy stays bounds-checked, no raw pointers.
-    pub(crate) fn region_or_blob(&self, idx: usize) -> &[u8] {
-        let blob_idx = self.num_regions();
-        if idx < blob_idx {
-            self.region_at(idx)
-        } else if idx == blob_idx {
-            &self.blob
-        } else {
-            panic!(
-                "region_or_blob: index {idx} out of range ({} regions incl. blob)",
-                blob_idx + 1
-            );
-        }
-    }
-
     /// Per-row byte stride of every fixed region, in region order.
     pub(super) fn strides(&self) -> &[u8] {
         &self.strides[..self.num_regions()]
@@ -1782,7 +1761,7 @@ impl ColumnarSource for Batch {
 ///
 /// The arena is **uninitialized** ([`Batch::with_capacity`]'s contract): every
 /// [`merge::DirectWriter`] entry point writes each live byte of each row it
-/// counts, and every reader — accessor, `region_or_blob`, `total_bytes` — bounds
+/// counts, and every reader — accessor, `region_at`, `total_bytes` — bounds
 /// the batch to `count`, so the `[count, capacity)` tail and the inter-region
 /// alignment padding are never read and never serialized.
 pub(crate) fn write_to_batch(

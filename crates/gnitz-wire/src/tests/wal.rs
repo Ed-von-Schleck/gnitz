@@ -7,7 +7,7 @@ use super::*;
 fn stored_shape_is_pinned_to_the_format_words() {
     assert_eq!(
         (crate::SYS_SCHEMA_DIGEST, WAL_FORMAT_VERSION),
-        (1141557738800393037, 20),
+        (1141557738800393037, 21),
         "system-family column shapes changed"
     );
 }
@@ -28,7 +28,7 @@ fn as_slices(regions: &[Vec<u8>]) -> Vec<&[u8]> {
 /// framer makes: the header fields come back, each region's bytes are verbatim,
 /// `block_size_of` predicts the length `encode` returns, a second block appends
 /// behind the first and `block_slice_at` finds it by its own SIZE field, and a
-/// region of odd length still leaves the next one 8-byte aligned.
+/// region of odd length is followed immediately by the next one.
 #[test]
 fn encode_and_parse_roundtrip_append_and_alignment() {
     let regions = make_test_regions();
@@ -65,12 +65,15 @@ fn encode_and_parse_roundtrip_append_and_alignment() {
         assert_eq!(h.table_id, want_tid);
     }
 
-    // A 5-byte region must still leave the next one 8-byte aligned.
+    // Regions pack end to end: a 5-byte region leaves no gap behind it, so the
+    // block is exactly its directory plus its region bytes.
     let (r0, r1) = ([1u8, 2, 3, 4, 5], [6u8, 7, 8, 9]);
     let odd: [&[u8]; 2] = [&r0, &r1];
     let end = encode(&mut buf, 0, 0, 2, &odd, true).unwrap();
     validate_and_parse(&buf[..end], &mut offsets, &mut rsizes, true).unwrap();
-    assert_eq!(offsets[1] % 8, 0, "region 1 not 8-byte aligned: {}", offsets[1]);
+    assert_eq!(offsets[0] as usize, body_start(2));
+    assert_eq!(offsets[1], offsets[0] + r0.len() as u64, "regions pack end to end");
+    assert_eq!(end, body_start(2) + r0.len() + r1.len());
 }
 
 /// Every framer guard, against the block that trips it. The error kind is what

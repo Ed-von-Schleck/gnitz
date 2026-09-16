@@ -1,7 +1,7 @@
 //! The low-level WAL-block codec — the one framer client and engine agree on.
 //!
-//! A WAL block is `[32B header][directory: num_regions × 8B][data regions,
-//! 8B-aligned]`. This module owns the header constants, the region-directory
+//! A WAL block is `[32B header][directory: num_regions × 8B][data regions, packed
+//! end to end]`. This module owns the header constants, the region-directory
 //! framer ([`encode`] / [`validate_and_parse`]), the size/header/checksum
 //! helpers the SAL scatter writer shares, and the region-count cap.
 //!
@@ -19,7 +19,7 @@
 //!   [24,28) NUM_REGIONS  u32
 //!   [28,32) RESERVED     u32
 
-use crate::{align8, checksum, read_u32_le, read_u64_le, write_u32_le, write_u64_le, WalError};
+use crate::{checksum, read_u32_le, read_u64_le, write_u32_le, write_u64_le, WalError};
 
 /// The fixed regions that precede the payload columns in the region
 /// convention, in order: PK, weight, null bitmap. Payload column `pi` lives at region
@@ -47,7 +47,7 @@ pub const WAL_HEADER_SIZE: usize = 32;
 /// this module's digest pin enforces. A SAL frame carries its own schema block
 /// and replay decodes against that, so nothing but this word rejects a stale
 /// frame, or an old client's catalog writes.
-pub const WAL_FORMAT_VERSION: u32 = 20;
+pub const WAL_FORMAT_VERSION: u32 = 21;
 
 pub const WAL_OFF_TID: usize = 0;
 pub const WAL_OFF_COUNT: usize = 4;
@@ -63,55 +63,40 @@ pub const WAL_OFF_NUM_REGIONS: usize = 24;
 /// is not in the arena, so `MAX_BATCH_REGIONS` is this less one slot.
 pub const MAX_WIRE_REGIONS: usize = 69;
 
-/// Compute the total byte size of a WAL block with the given regions.
-/// The region count is `region_sizes.len()` — no separate count param.
-pub fn block_size(region_sizes: &[u32]) -> usize {
-    block_size_from(region_sizes.len(), region_sizes.iter().map(|&sz| sz as usize))
-}
-
-/// Total byte size of the WAL block that would frame `regions` — the
-/// slice-taking sibling of [`block_size`], for a caller that already holds the
-/// `&[&[u8]]` [`encode`] takes and would otherwise materialize a parallel
-/// `&[u32]` size array just to measure it.
+/// Total byte size of the WAL block that would frame `regions`, for a caller
+/// that already holds the `&[&[u8]]` [`encode`] takes.
 pub fn block_size_of(regions: &[&[u8]]) -> usize {
-    block_size_from(regions.len(), regions.iter().map(|r| r.len()))
+    body_start(regions.len()) + regions.iter().map(|r| r.len()).sum::<usize>()
 }
 
 /// Where a block's first region begins: the header, then one 8-byte directory
-/// entry per region, `align8`ed as the region walk below pads. The one spelling
-/// of that offset — a block whose regions are all empty is exactly this long.
+/// entry per region. The one spelling of that offset — a block whose regions are
+/// all empty is exactly this long.
 pub const fn body_start(num_regions: usize) -> usize {
-    align8(WAL_HEADER_SIZE + num_regions * 8)
+    WAL_HEADER_SIZE + num_regions * 8
 }
 
-/// The block-size walk both public forms share: header, directory, then each
-/// region `align8`-padded before its data — the same walk
-/// [`write_header_and_directory`] performs.
-fn block_size_from(count: usize, sizes: impl Iterator<Item = usize>) -> usize {
-    let mut pos = body_start(count);
-    for sz in sizes {
-        pos = align8(pos) + sz;
-    }
-    pos
+/// Byte size of the block [`frame_in_place`] frames: `count` rows over the fixed
+/// regions `row_bytes` (each one's per-row width), with a `blob_len`-byte heap
+/// last.
+pub fn strided_block_size(row_bytes: &[u8], count: usize, blob_len: usize) -> usize {
+    body_start(row_bytes.len() + 1) + count * row_bytes.iter().map(|&s| s as usize).sum::<usize>() + blob_len
 }
 
-/// Write the 32-byte WAL header (all fields) and the region directory into
-/// `block`, zero-filling inter-region align8 gaps. Shared by [`encode`] (which
-/// then copies prebuilt region bytes) and the SAL scatter writer
-/// (`encode_scattered_to_wire`), which carves the body and scatters rows
-/// directly — the one place the block framing is spelled out.
+/// Write the 32-byte WAL header and the region directory into `block` — the one
+/// place a block's framing is spelled out. Each region's start goes into its own
+/// directory entry, read back through [`dir_entry`].
 ///
-/// Each region's start position goes into its own directory entry, read back
-/// through [`dir_entry`]. The caller stamps the body checksum afterwards via [`stamp_checksum`]
-/// (or leaves the zeroed checksum field for unchecksummed IPC paths).
-pub fn write_header_and_directory(
+/// The checksum field is left zeroed; [`stamp_checksum`] fills it where a reader
+/// verifies one.
+fn write_header_and_directory(
     block: &mut [u8],
     table_id: u32,
     entry_count: u32,
-    region_sizes: impl ExactSizeIterator<Item = u32>,
+    num_regions: usize,
+    region_sizes: impl Iterator<Item = u32>,
     total_size: usize,
 ) {
-    let num_regions = region_sizes.len();
     debug_assert!(
         num_regions <= MAX_WIRE_REGIONS,
         "num_regions={num_regions} exceeds the block directory's capacity"
@@ -119,23 +104,55 @@ pub fn write_header_and_directory(
     block[..WAL_HEADER_SIZE].fill(0);
     let mut pos = body_start(num_regions);
     for (i, sz) in region_sizes.enumerate() {
-        // At most 7 bytes by construction, so this stays a handful of stores
-        // rather than a `memset` call per region.
-        let aligned = align8(pos);
-        for b in block[pos..aligned].iter_mut() {
-            *b = 0;
-        }
-        pos = aligned;
         let dir_off = dir_entry_offset(i);
         write_u32_le(block, dir_off, pos as u32);
         write_u32_le(block, dir_off + 4, sz);
         pos += sz as usize;
     }
+    debug_assert_eq!(pos, total_size, "the directory walk must cover the whole block");
     write_u32_le(block, WAL_OFF_TID, table_id);
     write_u32_le(block, WAL_OFF_COUNT, entry_count);
     write_u32_le(block, WAL_OFF_SIZE, total_size as u32);
     write_u32_le(block, WAL_OFF_VERSION, WAL_FORMAT_VERSION);
     write_u32_le(block, WAL_OFF_NUM_REGIONS, num_regions as u32);
+}
+
+/// Frame a block of `count` rows over the fixed regions `row_bytes` (each one's
+/// per-row width) into `out[offset..]`: returns the total size and one writable
+/// slice per fixed region, in directory order.
+///
+/// The trailing blob region is named at size zero, so the block carries no heap.
+pub fn frame_in_place<'a>(
+    out: &'a mut [u8],
+    offset: usize,
+    table_id: u32,
+    count: usize,
+    row_bytes: &[u8],
+) -> (usize, Vec<&'a mut [u8]>) {
+    let num_regions = row_bytes.len() + 1;
+    let total_size = strided_block_size(row_bytes, count, 0);
+    let block = &mut out[offset..offset + total_size];
+
+    write_header_and_directory(
+        block,
+        table_id,
+        count as u32,
+        num_regions,
+        row_bytes
+            .iter()
+            .map(|&s| (count * s as usize) as u32)
+            .chain(std::iter::once(0)),
+        total_size,
+    );
+
+    let mut rest: &mut [u8] = &mut block[body_start(num_regions)..];
+    let mut regions: Vec<&mut [u8]> = Vec::with_capacity(row_bytes.len());
+    for &s in row_bytes {
+        let (region, remainder) = std::mem::take(&mut rest).split_at_mut(count * s as usize);
+        regions.push(region);
+        rest = remainder;
+    }
+    (total_size, regions)
 }
 
 /// Stamp the XXH3 body checksum of a fully-written block into its header.
@@ -184,7 +201,7 @@ pub struct WalBlockHeader {
 /// `Err(WalError::BufferTooSmall)` if `out_buf` cannot fit the encoded block.
 ///
 /// The block layout is:
-///   [32B header][directory: num_regions * 8B][data regions, 8B-aligned]
+///   [32B header][directory: num_regions * 8B][data regions, packed end to end]
 ///
 /// Directory entries store offsets relative to block start (not buffer start).
 /// Region sizes are `regions[i].len()`; a zero-length region occupies a
@@ -215,6 +232,7 @@ pub fn encode(
         block,
         table_id,
         entry_count,
+        regions.len(),
         regions.iter().map(|r| r.len() as u32),
         total_size,
     );

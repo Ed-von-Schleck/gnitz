@@ -153,7 +153,7 @@ fn each_schema_guard_rejects_its_own_forgery() {
             b[pk_off..pk_off + 8].copy_from_slice(&5u64.to_be_bytes());
         }),
         // Row 1's name is the long one; push its heap offset past the heap.
-        ("schema name blob arena out of bounds", |b, offs| {
+        ("schema name cell is not in canonical form", |b, offs| {
             write_u64_le(b, offs[REG_NAME] as usize + 16 + 8, 1 << 20)
         }),
     ];
