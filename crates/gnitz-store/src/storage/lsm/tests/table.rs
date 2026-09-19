@@ -23,8 +23,8 @@ fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
 
 /// `Table::new(...)` at a `budget`-byte memtable, with the per-test boilerplate
 /// folded away.
-fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, id: u32, budget: usize, rs: RecoverySource) -> Table {
-    let mut t = Table::new(dir.to_str().unwrap(), schema, id, rs, StoreBudgets::default()).unwrap();
+fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, budget: usize, rs: RecoverySource) -> Table {
+    let mut t = Table::new(dir.to_str().unwrap(), schema, rs, StoreBudgets::default()).unwrap();
     t.set_memtable_budget(budget);
     t
 }
@@ -44,24 +44,19 @@ impl Table {
     }
 }
 
-/// Compaction output rather than flat spill? The `_L` level segment separates
-/// the two grammars. Only these tests ask — production reads each shard's level
-/// off the manifest.
-fn is_compaction_output(name: &str) -> bool {
-    name.contains("_L")
+/// Whether `path` names a compaction output rather than a spill.
+fn is_compaction_output(path: &str) -> bool {
+    path.rsplit('/').next().unwrap().contains("_P")
 }
 
-/// Names of the "flat" `shard_{table_id}_{lsn}.db` files directly in `dir` —
-/// the unified spill/barrier naming. Excludes L1+ compaction outputs
-/// (`shard_{tid}_{seq}_L{n}_P{part}.db`, distinguished by the `_L` level
-/// marker).
-fn shard_db_files(dir: &std::path::Path, table_id: u32) -> Vec<String> {
-    let prefix = super::super::naming::shard_prefix(table_id);
+/// Spill/barrier shard names in `dir`.
+fn shard_db_files(dir: &std::path::Path) -> Vec<String> {
+    let prefix = super::super::naming::SHARD_PREFIX;
     std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with(&prefix) && n.ends_with(".db") && !is_compaction_output(n))
+                .filter(|n| n.starts_with(prefix) && n.ends_with(".db") && !is_compaction_output(n))
                 .collect()
         })
         .unwrap_or_default()
@@ -74,18 +69,16 @@ fn count_files(dir: &std::path::Path, pred: impl Fn(&str) -> bool) -> usize {
         .unwrap_or(0)
 }
 
-/// Count compaction-output files for `table_id` — named
-/// `shard_{tid}_{seq}_L{n}_P{part}.db`; the `_L` marker distinguishes them
-/// from flat spill/barrier shards. Presence proves a compaction ran.
-fn compaction_output_count(dir: &std::path::Path, table_id: u32) -> usize {
-    let shard = super::super::naming::shard_prefix(table_id);
-    count_files(dir, |n| n.starts_with(&shard) && is_compaction_output(n))
+/// Compaction outputs in `dir`; any at all proves a compaction ran.
+fn compaction_output_count(dir: &std::path::Path) -> usize {
+    let shard = super::super::naming::SHARD_PREFIX;
+    count_files(dir, |n| n.starts_with(shard) && is_compaction_output(n))
 }
 
-/// Count every on-disk shard/compaction-output file for `table_id`.
-fn all_shard_file_count(dir: &std::path::Path, table_id: u32) -> usize {
-    let shard = super::super::naming::shard_prefix(table_id);
-    count_files(dir, |n| n.starts_with(&shard))
+/// Count every on-disk shard/compaction-output file in `dir`.
+fn all_shard_file_count(dir: &std::path::Path) -> usize {
+    let shard = super::super::naming::SHARD_PREFIX;
+    count_files(dir, |n| n.starts_with(shard))
 }
 
 /// Run a full synchronous force-publish flush stamped at `generation` —
@@ -93,8 +86,8 @@ fn all_shard_file_count(dir: &std::path::Path, table_id: u32) -> usize {
 /// tests don't observe.
 fn flush_ephemeral_at(t: &mut Table, generation: u64) {
     if let Some(work) = t.flush_prepare(FlushRound::Ephemeral(generation)).unwrap() {
-        let _ = t.flush_commit(work).unwrap();
-        t.drain_deletions();
+        let (_, bytes) = t.flush_commit(work).unwrap();
+        t.published_durably(bytes);
     }
 }
 
@@ -120,7 +113,7 @@ fn table_lifecycle_serves_rows_across_flush_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("lifecycle");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, tid, 1 << 20, rs);
+        let mut t = new_table(&tdir, schema, 1 << 20, rs);
         assert!(t.memtable.is_empty());
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
@@ -133,7 +126,7 @@ fn table_lifecycle_serves_rows_across_flush_and_reopen() {
         assert!(t.has_pk(20));
 
         if reopens {
-            let t2 = new_table(&tdir, schema, tid, 1 << 20, rs);
+            let t2 = new_table(&tdir, schema, 1 << 20, rs);
             assert!(t2.has_pk(10), "table {tid}: row must reload from the manifest");
             assert!(t2.has_pk(20));
         }
@@ -146,13 +139,7 @@ fn table_retract_pk() {
     let tdir = dir.path().join("retract_test");
     let schema = make_schema_u64_i64();
 
-    let mut t = new_table(
-        &tdir,
-        schema,
-        400,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
@@ -178,13 +165,7 @@ fn test_retract_pk_after_update() {
     let tdir = dir.path().join("retract_update_test");
     let schema = make_schema_u64_i64();
 
-    let mut t = new_table(
-        &tdir,
-        schema,
-        600,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     // Batch 1: INSERT (PK=10, weight=+1, val=100)
     t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
@@ -216,13 +197,7 @@ fn test_ingest_owned_batch_unsorted() {
     let tdir = dir.path().join("ingest_owned_unsorted_test");
     let schema = make_schema_u64_i64();
 
-    let mut t = new_table(
-        &tdir,
-        schema,
-        700,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     // Build a reverse-sorted batch (PK order: 30, 20, 10).
     let batch = make_batch(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
@@ -253,7 +228,7 @@ fn test_memtable_overflow_auto_flush() {
     // Each row is 32 bytes (PK 8 + weight 8 + null_bmp 8 + col 8).
     // First call: 2 rows = 64 bytes, below threshold → no flush.
     // Second call: pre-check 64 < 96 → no pre-flush; upsert → 128 > 96 → post-flush.
-    let mut t = new_table(&tdir, schema, 1200, 96, RecoverySource::Rederive { resume_at: None });
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::Rederive { resume_at: None });
 
     t.ingest_owned_batch(make_batch(&[(1, 1, 10), (2, 1, 20)])).unwrap();
     assert!(!t.memtable.is_empty(), "two rows must not yet trigger overflow");
@@ -287,7 +262,7 @@ fn test_retract_pk_shard_fallback_multiple_payloads() {
     // Durable: `retract_pk` is base-table-only (base tables are durable), so
     // the flushed rows must land in a real shard for the shard-fallback path
     // under test — not the RAM tier (which a non-durable flush would use).
-    let mut t = new_table(&tdir, schema, 1000, 1 << 20, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
 
     // Batch 1: INSERT (PK=10, weight=+1, val=100)
     t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
@@ -316,14 +291,14 @@ fn test_retract_pk_shard_fallback_multiple_payloads() {
 /// manifest `.tmp`, leaving the directory clean for a future retry. The
 /// folded shard was written at its final name (not a `.tmp`) and registered
 /// in the index by `flush_prepare`, so it survives as an orphan the next
-/// open's `gc_orphans` reclaims — no `.tmp` residue either way.
+/// open's `install` reclaims — no `.tmp` residue either way.
 #[test]
 fn flush_prepare_drop_cleans_tmp_files() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("drop_clean_test");
     let schema = make_schema_u64_i64();
 
-    let mut t = new_table(&tdir, schema, 1100, 1 << 20, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
 
     t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
@@ -355,7 +330,7 @@ fn flush_prepare_drop_cleans_tmp_files() {
 }
 
 /// Table::new on a corrupted manifest must return Err and must not run
-/// gc_orphans — any stray shard files must survive untouched.
+/// the orphan sweep — any stray shard files must survive untouched.
 #[test]
 fn table_new_corrupted_manifest_preserves_stray_shard() {
     let dir = tempfile::tempdir().unwrap();
@@ -368,18 +343,20 @@ fn table_new_corrupted_manifest_preserves_stray_shard() {
     std::fs::write(&manifest_path, b"not a valid manifest").unwrap();
 
     // Drop a stray shard file.
-    let stray = tdir.join(super::super::naming::spill_shard_name(200, 1));
+    let stray = tdir.join(super::super::naming::spill_shard_name(1));
     std::fs::write(&stray, b"orphan").unwrap();
 
     let result = Table::new(
         tdir.to_str().unwrap(),
         schema,
-        200,
         RecoverySource::SalReplay,
         StoreBudgets::default(),
     );
     assert!(result.is_err(), "Table::new must fail on corrupted manifest");
-    assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
+    assert!(
+        stray.exists(),
+        "stray shard must survive when the orphan sweep did not run"
+    );
 }
 
 /// Non-durable `flush_prepare` consolidates the snapshot into the in-memory
@@ -391,13 +368,7 @@ fn flush_prepare_non_durable_done_inline() {
     let tdir = dir.path().join("done_inline_test");
     let schema = make_schema_u64_i64();
 
-    let mut t = new_table(
-        &tdir,
-        schema,
-        1200,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
     assert!(
@@ -410,7 +381,7 @@ fn flush_prepare_non_durable_done_inline() {
     );
     assert!(!t.ram_tier.is_empty(), "snapshot must land in the RAM tier");
     assert!(
-        shard_db_files(&tdir, 1200).is_empty(),
+        shard_db_files(&tdir).is_empty(),
         "Rederive flush must not write a shard file"
     );
     assert!(t.has_pk(10));
@@ -434,7 +405,7 @@ fn wide_pk_membership_and_retract_resolve_twins_in_every_tier() {
         let dir = tempfile::tempdir().unwrap();
         let schema = wide_pk_3xu64_schema();
         assert_eq!(schema.pk_stride(), 24);
-        let mut t = new_table(dir.path(), schema, tid, 1 << 20, rs);
+        let mut t = new_table(dir.path(), schema, 1 << 20, rs);
 
         let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
         let twin_a = pk3(1, 1, 100);
@@ -509,7 +480,7 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
         (5003, RecoverySource::Rederive { resume_at: None }),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let mut t = new_table(dir.path(), schema, tid, 1 << 20, rs);
+        let mut t = new_table(dir.path(), schema, 1 << 20, rs);
 
         // Payload marker == the signed leading value, so scan order is read
         // back without decoding the PK. `w` lets the same builder emit the
@@ -565,20 +536,14 @@ fn nondurable_flush_writes_no_file() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("no_file_test");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        100,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
         .unwrap();
     assert!(t.flush_prepare(FlushRound::Base).unwrap().is_none());
 
     assert!(
-        shard_db_files(&tdir, 100).is_empty(),
+        shard_db_files(&tdir).is_empty(),
         "a sub-ceiling base-round flush must write no shard file"
     );
     assert!(t.all_shard_arcs().is_empty());
@@ -598,13 +563,7 @@ fn nondurable_cross_flush_fold_nets_to_zero() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("cross_fold_test");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        100,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     // 6 alternating +1 / -1 flushes on (k=7, v=70): each lands in its own
     // run until the threshold folds them. Net weight is 0.
@@ -618,7 +577,7 @@ fn nondurable_cross_flush_fold_nets_to_zero() {
     assert!(!weights.contains_key(&7), "net-zero key folds away (0 rows)");
     assert!(t.ram_tier.len() <= FOLD_THRESHOLD, "run set must stay folded",);
     assert!(
-        shard_db_files(&tdir, 100).is_empty(),
+        shard_db_files(&tdir).is_empty(),
         "churn must not spill (tiny, sub-ceiling)"
     );
 }
@@ -630,13 +589,7 @@ fn nondurable_run_count_stays_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("run_bound_test");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        100,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     let n = FOLD_THRESHOLD as u64 + 4;
     for k in 0..n {
@@ -653,20 +606,14 @@ fn nondurable_run_count_stays_bounded() {
 }
 
 /// A flush past the RAM-tier ceiling (shrunk via the test seam) spills the
-/// folded run to a `shard_{tid}_{lsn}` file, drains heap, and keeps rows
+/// folded run to a `shard_{lsn}` file, drains heap, and keeps rows
 /// readable.
 #[test]
 fn nondurable_ceiling_spill_to_disk() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("ceiling_spill_test");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        100,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
     t.ram_tier.set_budget(100); // < one flush (~10 rows × 32 B)
 
     let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -674,7 +621,7 @@ fn nondurable_ceiling_spill_to_disk() {
     t.flush().unwrap();
 
     assert!(
-        !shard_db_files(&tdir, 100).is_empty(),
+        !shard_db_files(&tdir).is_empty(),
         "ceiling breach must spill to a shard file"
     );
     assert_eq!(t.ram_tier.len(), 0, "heap drained after spill");
@@ -695,7 +642,7 @@ fn repeated_spill_stays_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("repeated_spill_test");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
 
     const ROUNDS: u64 = 20;
@@ -710,9 +657,9 @@ fn repeated_spill_stays_bounded() {
         // Raw spill shards do not accumulate with rounds — disk L0 self-folds
         // into L1 and the consumed raw shards are unlinked.
         assert!(
-            shard_db_files(&tdir, 100).len() <= L0_COMPACT_THRESHOLD + 1,
+            shard_db_files(&tdir).len() <= L0_COMPACT_THRESHOLD + 1,
             "round {r}: {} raw shards accumulated",
-            shard_db_files(&tdir, 100).len(),
+            shard_db_files(&tdir).len(),
         );
     }
 
@@ -728,13 +675,7 @@ fn nondurable_has_pk_over_in_memory_runs() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("has_pk_inmem_test");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        100,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
     t.flush().unwrap();
@@ -754,13 +695,7 @@ fn nondurable_mixed_disk_and_heap_read() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("mixed_read_test");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        100,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     // Force keys 0..10 to disk.
     t.ram_tier.set_budget(100);
@@ -812,13 +747,7 @@ fn inmem_retract_multiple_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("inmem_retract_payloads");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        5001,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     // Run 1: INSERT (PK=10, +1, val=100).
     t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
@@ -851,13 +780,7 @@ fn inmem_cross_tier_netting() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("inmem_cross_tier");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        5004,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     // RAM run: two payloads for PK=5 (val=50, val=60), each +1.
     t.ingest_owned_batch(make_batch(&[(5, 1, 50), (5, 1, 60)])).unwrap();
@@ -890,7 +813,7 @@ fn retract_groups_across_all_three_tiers() {
     let tdir = dir.path().join("retract_three_tier");
     let schema = make_schema_u64_i64();
     // Durable: shard tier participation requires SalReplay persistence.
-    let mut t = new_table(&tdir, schema, 5014, 1 << 20, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
 
     // Shard: (7, val=70, +1) — flushed durably.
     t.ingest_owned_batch(make_batch(&[(7, 1, 70)])).unwrap();
@@ -928,13 +851,7 @@ fn inmem_fold_rebuilds_run_bloom() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("inmem_fold_bloom");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        5005,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     // One key per flush past the fold threshold; the folded run's bloom is
     // rebuilt over the merged batch.
@@ -976,7 +893,7 @@ fn barrier_flush_folds_populated_l0_not_empty() {
     let schema = make_schema_u64_i64();
     // Small memtable budget (96 B): an 8-row batch (256 B) overflows the
     // memtable into the RAM tier, leaving the memtable empty.
-    let mut t = new_table(&tdir, schema, 7100, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
 
     let rows: Vec<(u64, i64, i64)> = (0..8).map(|k| (k, 1, (k * 10) as i64)).collect();
     t.ingest_owned_batch(make_batch(&rows)).unwrap();
@@ -993,14 +910,14 @@ fn barrier_flush_folds_populated_l0_not_empty() {
     assert!(!t.all_shard_arcs().is_empty(), "barrier wrote a durable shard");
 
     // Reopen (SalReplay loads the manifest) → every row survives.
-    let t2 = new_table(&tdir, schema, 7100, 96, RecoverySource::SalReplay);
+    let t2 = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     for k in 0..8u128 {
         assert!(t2.has_pk(k), "row {k} must survive barrier flush + reopen");
     }
 }
 
 /// Spill unification (SalReplay): a ceiling breach spills to
-/// `shard_{tid}_{lsn}.db` (the unified naming), registered with
+/// `shard_{lsn}.db` (the unified naming), registered with
 /// `max_lsn == current_lsn - 1`. Two spills land at distinct `current_lsn`
 /// → two distinct filenames. After a manifest-publishing barrier flush,
 /// reopen seeds `current_lsn = max_lsn + 1` and every row survives.
@@ -1011,7 +928,7 @@ fn salreplay_spill_unified_naming_and_lsn() {
     let schema = make_schema_u64_i64();
     // Small memtable budget forces overflow → flush_to_ram; tiny ceiling forces
     // the folded L0 to spill.
-    let mut t = new_table(&tdir, schema, 7200, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
 
     // First spill: 10 rows (320 B) overflow, fold to L0 (320 B > 100) → spill.
@@ -1024,10 +941,10 @@ fn salreplay_spill_unified_naming_and_lsn() {
         lsn1 - 1,
         "spill registers with real LSNs (max_lsn == current_lsn - 1)"
     );
-    let files1 = shard_db_files(&tdir, 7200);
+    let files1 = shard_db_files(&tdir);
     assert_eq!(
         files1,
-        vec![super::super::naming::spill_shard_name(7200, lsn1)],
+        vec![super::super::naming::spill_shard_name(lsn1)],
         "unified spill naming"
     );
 
@@ -1037,13 +954,13 @@ fn salreplay_spill_unified_naming_and_lsn() {
     assert_eq!(t.ram_tier.len(), 0, "second spill drains the RAM tier");
     let lsn2 = t.current_lsn;
     assert!(lsn2 > lsn1, "current_lsn strictly increased between spills");
-    let mut files2 = shard_db_files(&tdir, 7200);
+    let mut files2 = shard_db_files(&tdir);
     files2.sort();
     assert_eq!(
         files2,
         vec![
-            super::super::naming::spill_shard_name(7200, lsn1),
-            super::super::naming::spill_shard_name(7200, lsn2)
+            super::super::naming::spill_shard_name(lsn1),
+            super::super::naming::spill_shard_name(lsn2)
         ],
         "two spills → two distinct shard files"
     );
@@ -1053,7 +970,7 @@ fn salreplay_spill_unified_naming_and_lsn() {
     t.ingest_owned_batch(make_batch(&[(500, 1, 5000)])).unwrap();
     t.flush().unwrap();
 
-    let t2 = new_table(&tdir, schema, 7200, 96, RecoverySource::SalReplay);
+    let t2 = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     assert_eq!(
         t2.current_lsn,
         t2.shard_index.max_lsn() + 1,
@@ -1082,7 +999,7 @@ fn salreplay_barrier_folds_memtable_and_l0_then_spill_writes_one_shard() {
     {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("barrier_filter");
-        let mut t = new_table(&tdir, schema, 7300, 96, RecoverySource::SalReplay);
+        let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
 
         // Overflow 8 rows into L0, then leave 2 rows live in the memtable.
         let over: Vec<(u64, i64, i64)> = (0..8).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -1106,7 +1023,7 @@ fn salreplay_barrier_folds_memtable_and_l0_then_spill_writes_one_shard() {
     {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("spill_filter");
-        let mut t = new_table(&tdir, schema, 7301, 96, RecoverySource::SalReplay);
+        let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ram_tier.set_budget(100);
 
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -1125,13 +1042,7 @@ fn current_lsn_bumps_on_every_ingest_including_rederive() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("lsn_bump_rederive");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(
-        &tdir,
-        schema,
-        7400,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::Rederive { resume_at: None });
 
     assert_eq!(t.current_lsn, 1, "fresh Rederive table starts at LSN 1");
     t.ingest_owned_batch(make_batch(&[(1, 1, 10)])).unwrap();
@@ -1149,7 +1060,7 @@ fn salreplay_overflow_into_l0_retract() {
     let tdir = dir.path().join("salreplay_l0_retract");
     let schema = make_schema_u64_i64();
     // Small memtable budget so an 8-row ingest overflows it into the RAM tier.
-    let mut t = new_table(&tdir, schema, 7500, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
 
     let rows: Vec<(u64, i64, i64)> = (0..8).map(|k| (k, 1, (k * 10) as i64)).collect();
     t.ingest_owned_batch(make_batch(&rows)).unwrap();
@@ -1178,13 +1089,13 @@ fn salreplay_overflow_into_l0_retract() {
 /// manifest was published — must still barrier-flush to a staged publish and durably
 /// capture the spill. Without the unsynced-shard disjunct the barrier returns
 /// `Empty`, the spill is never manifested, and a
-/// reopen's `gc_orphans` deletes it — acknowledged rows lost.
+/// reopen's `install` deletes it — acknowledged rows lost.
 #[test]
 fn lone_spill_survives_checkpoint_barrier() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("lone_spill_ckpt");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(&tdir, schema, 7600, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
 
     // One over-ceiling ingest → one spill shard (1 < L0 compaction threshold,
@@ -1198,7 +1109,7 @@ fn lone_spill_survives_checkpoint_barrier() {
     // (verified below via the manifest/shard the reopen sees).
     t.flush().unwrap();
 
-    let t2 = new_table(&tdir, schema, 7600, 96, RecoverySource::SalReplay);
+    let t2 = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     assert!(
         !t2.all_shard_arcs().is_empty(),
         "manifest must reference the spill shard"
@@ -1211,13 +1122,13 @@ fn lone_spill_survives_checkpoint_barrier() {
 /// Deferred-cleanup crash simulation. After a mid-epoch compaction that did
 /// not republish (SalReplay defers), a crash (drop without a barrier) reopens
 /// from the *old* manifest: the cut state is intact, and the unreferenced
-/// compaction outputs + post-cut spills are orphans reclaimed by `gc_orphans`.
+/// compaction outputs + post-cut spills are orphans reclaimed by `install`.
 #[test]
 fn deferred_cleanup_crash_sim_reopens_from_old_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("deferred_cleanup_crash");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(&tdir, schema, 7700, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
 
     // Cut A: one row, published by a barrier (manifest M0 references its shard).
@@ -1231,17 +1142,17 @@ fn deferred_cleanup_crash_sim_reopens_from_old_manifest() {
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
     }
     assert!(
-        compaction_output_count(&tdir, 7700) > 0,
+        compaction_output_count(&tdir) > 0,
         "post-cut compaction must have produced deferred outputs"
     );
     // Crash: drop without a barrier flush → reopen from the old manifest M0.
     drop(t);
 
-    let t2 = new_table(&tdir, schema, 7700, 96, RecoverySource::SalReplay);
+    let t2 = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     assert!(t2.has_pk(1000), "cut A row survives the crash (loaded from M0)");
     assert!(!t2.has_pk(0), "post-cut orphaned data must not resurrect");
     assert_eq!(
-        compaction_output_count(&tdir, 7700),
+        compaction_output_count(&tdir),
         0,
         "deferred compaction outputs (never in M0) must be gc'd at open"
     );
@@ -1256,7 +1167,7 @@ fn compact_then_quiet_barrier_publishes_compacted_index() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("compact_then_quiet");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(&tdir, schema, 7800, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
 
     let mut all_keys = Vec::new();
@@ -1269,11 +1180,11 @@ fn compact_then_quiet_barrier_publishes_compacted_index() {
     }
     assert_eq!(t.ram_tier.len(), 0, "spilled: RAM tier empty");
     assert!(t.memtable.is_empty(), "no live memtable rows");
-    assert!(compaction_output_count(&tdir, 7800) > 0, "compaction ran");
+    assert!(compaction_output_count(&tdir) > 0, "compaction ran");
 
     t.flush().unwrap();
 
-    let t2 = new_table(&tdir, schema, 7800, 96, RecoverySource::SalReplay);
+    let t2 = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     for pk in &all_keys {
         assert!(
             t2.has_pk(*pk as u128),
@@ -1288,26 +1199,26 @@ fn compact_then_quiet_barrier_publishes_compacted_index() {
 /// republish re-stamps a newer one.
 #[test]
 fn generation_preserved_by_compaction_republish() {
-    use super::super::manifest::read_file;
+    use super::super::manifest::read;
 
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("gen_republish");
     let schema = make_schema_u64_i64();
-    let manifest_path = tdir.join("manifest.bin").to_str().unwrap().to_string();
-    let read_generation = |path: &str| -> u64 { read_file(path).unwrap().unwrap().1.checkpoint_gen };
+    let read_generation =
+        |dir: &std::path::Path| -> u64 { read(dir.to_str().unwrap()).unwrap().unwrap().checkpoint_gen };
 
     // Publish at generation G1 with a compaction pending.
-    let mut t = new_table(&tdir, schema, 7900, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
     for r in 0..6u64 {
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
         flush_ephemeral_at(&mut t, 0x1111);
     }
-    assert!(compaction_output_count(&tdir, 7900) > 0, "compaction ran");
+    assert!(compaction_output_count(&tdir) > 0, "compaction ran");
     flush_ephemeral_at(&mut t, 0x1111);
     assert_eq!(
-        read_generation(&manifest_path),
+        read_generation(&tdir),
         0x1111,
         "republished manifest carries the passed generation",
     );
@@ -1316,7 +1227,7 @@ fn generation_preserved_by_compaction_republish() {
     t.ingest_owned_batch(make_batch(&[(9999, 1, 1)])).unwrap();
     flush_ephemeral_at(&mut t, 0x2222);
     assert_eq!(
-        read_generation(&manifest_path),
+        read_generation(&tdir),
         0x2222,
         "later republish re-stamps the newer generation",
     );
@@ -1334,7 +1245,7 @@ fn rederive_checkpointed_conditional_load() {
 
     // Publish a durable shard + manifest stamped at generation 7.
     {
-        let mut t = new_table(&tdir, schema, 7910, 96, RecoverySource::SalReplay);
+        let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ingest_owned_batch(make_batch(&[(1, 1, 100), (2, 1, 200)])).unwrap();
         flush_ephemeral_at(&mut t, 7);
     }
@@ -1342,7 +1253,7 @@ fn rederive_checkpointed_conditional_load() {
 
     // Matching generation ⇒ shards load, rows present.
     {
-        let t = new_table(&tdir, schema, 7910, 96, RecoverySource::Rederive { resume_at: Some(7) });
+        let t = new_table(&tdir, schema, 96, RecoverySource::Rederive { resume_at: Some(7) });
         assert!(
             t.has_pk_bytes(&1u64.to_be_bytes()) && t.has_pk_bytes(&2u64.to_be_bytes()),
             "matching-generation reopen must load the checkpointed shards"
@@ -1352,7 +1263,7 @@ fn rederive_checkpointed_conditional_load() {
 
     // Mismatched generation ⇒ shards erased, manifest unlinked.
     {
-        let t = new_table(&tdir, schema, 7910, 96, RecoverySource::Rederive { resume_at: Some(8) });
+        let t = new_table(&tdir, schema, 96, RecoverySource::Rederive { resume_at: Some(8) });
         assert!(
             !t.has_pk_bytes(&1u64.to_be_bytes()) && !t.has_pk_bytes(&2u64.to_be_bytes()),
             "mismatched-generation reopen must erase the stale shards"
@@ -1360,7 +1271,7 @@ fn rederive_checkpointed_conditional_load() {
     }
     assert!(
         !manifest_path.exists(),
-        "mismatched-generation reopen must unlink manifest.bin so a re-open cannot re-peek it"
+        "mismatched-generation reopen must unlink manifest.bin so a re-open cannot reload it"
     );
 }
 
@@ -1371,16 +1282,15 @@ fn rederive_checkpointed_conditional_load() {
 fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let table_id = 7911;
 
     // A checkpointed table with one published shard, and the path to the
     // manifest that names it.
     let checkpointed = |name: &str| -> (std::path::PathBuf, std::path::PathBuf) {
         let tdir = dir.path().join(name);
-        let mut t = new_table(&tdir, schema, table_id, 96, RecoverySource::SalReplay);
+        let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ingest_owned_batch(make_batch(&[(1, 1, 100)])).unwrap();
         flush_ephemeral_at(&mut t, 7);
-        assert_eq!(shard_db_files(&tdir, table_id).len(), 1, "{name}: shard published");
+        assert_eq!(shard_db_files(&tdir).len(), 1, "{name}: shard published");
         let manifest = std::path::PathBuf::from(crate::storage::lsm::manifest::path(tdir.to_str().unwrap()));
         (tdir, manifest)
     };
@@ -1388,7 +1298,6 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
         Table::new(
             tdir.to_str().unwrap(),
             schema,
-            table_id,
             RecoverySource::Rederive { resume_at: Some(7) },
             StoreBudgets::default(),
         )
@@ -1398,7 +1307,7 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
     let damages: [(&str, Damage); 3] = [
         ("truncated", |b| b.truncate(20)),
         ("bad_magic", |b| b[0] ^= 0xFF),
-        // Inside the first entry's filename, which only the digest checks.
+        // Inside the first entry, which only the digest checks.
         ("checksum", |b| b[60] ^= 0x01),
     ];
     for (name, damage) in damages {
@@ -1413,10 +1322,7 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
             !t.has_pk_bytes(&1u64.to_be_bytes()),
             "{name}: the rebuild verdict opens empty"
         );
-        assert!(
-            shard_db_files(&tdir, table_id).is_empty(),
-            "{name}: stale shards erased"
-        );
+        assert!(shard_db_files(&tdir).is_empty(), "{name}: stale shards erased");
     }
 
     // Replacing the manifest with a directory makes `std::fs::read` fail
@@ -1430,50 +1336,24 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
         "reading a manifest that is a directory must surface the errno"
     );
     assert_eq!(
-        shard_db_files(&tdir, table_id).len(),
+        shard_db_files(&tdir).len(),
         1,
         "a failed read must not erase the shards"
     );
 }
 
-/// A `SalReplay` table publishes on every barrier, whatever its tier holds:
-/// an unchanged one re-stamps its manifest (which is what makes "every
-/// `w{k}of{n}` has a manifest" a decidable completeness test for the boot
-/// relayout), a lone unsynced spill lands in the sweep list, and compaction
-/// outputs are swept while the inputs they superseded are not.
+/// A `SalReplay` table's barrier gate: a lone unsynced spill lands in the sweep
+/// list, and compaction outputs are swept while the inputs they superseded are
+/// not.
 #[test]
 fn barrier_gate_matrix() {
     let schema = make_schema_u64_i64();
-
-    // Arm 1 — an unchanged tier still publishes, with nothing to sweep and no
-    // new shard.
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("gate_empty");
-        let mut t = new_table(&tdir, schema, 7900, 1 << 20, RecoverySource::SalReplay);
-        t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
-        t.flush().unwrap();
-        let shards_before = shard_db_files(&tdir, 7900).len();
-        let w = t
-            .flush_prepare(FlushRound::Base)
-            .unwrap()
-            .expect("a SalReplay table must publish even when unchanged");
-        assert!(
-            w.sync_paths.is_empty(),
-            "an unchanged tier has nothing left to fdatasync"
-        );
-        assert_eq!(
-            shard_db_files(&tdir, 7900).len(),
-            shards_before,
-            "an empty RAM tier publishes no new shard"
-        );
-    }
 
     // Arm 2 — a lone unsynced spill stages a publish with the spill swept.
     {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("gate_unsynced");
-        let mut t = new_table(&tdir, schema, 7901, 96, RecoverySource::SalReplay);
+        let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ram_tier.set_budget(100);
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
@@ -1491,7 +1371,7 @@ fn barrier_gate_matrix() {
     {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("gate_pending");
-        let mut t = new_table(&tdir, schema, 7902, 96, RecoverySource::SalReplay);
+        let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
         t.ram_tier.set_budget(100);
         // Five spills put L0 over the threshold, and the fifth registration
         // compacts — so the last thing to leave a file unswept is that compaction.
@@ -1500,12 +1380,9 @@ fn barrier_gate_matrix() {
             t.ingest_owned_batch(make_batch(&rows)).unwrap();
             assert_eq!(t.ram_tier.len(), 0, "round {r} spilled");
         }
-        assert!(
-            compaction_output_count(&tdir, 7902) > 0,
-            "the spills drove a compaction"
-        );
+        assert!(compaction_output_count(&tdir) > 0, "the spills drove a compaction");
 
-        let shards_before = shard_db_files(&tdir, 7902).len();
+        let shards_before = shard_db_files(&tdir).len();
         let w = t
             .flush_prepare(FlushRound::Base)
             .unwrap()
@@ -1517,25 +1394,109 @@ fn barrier_gate_matrix() {
             "the superseded inputs must have left the sweep list, got {swept:?}",
         );
         assert_eq!(
-            shard_db_files(&tdir, 7902).len(),
+            shard_db_files(&tdir).len(),
             shards_before,
             "an empty RAM tier publishes no new shard"
         );
     }
 }
 
-/// Every shard file of `table_id` on disk is either `published` or one the index
-/// still registers unpublished — no unpublished file outlives the entry naming it.
-fn assert_unpublished_inputs_gone(t: &Table, dir: &std::path::Path, table_id: u32, published: &str) {
+/// A store publishes iff its manifest would differ from the one this process
+/// last made durable: the first barrier publishes, an idle one stages nothing,
+/// and one written row publishes again.
+#[test]
+fn an_idle_store_publishes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let tdir = dir.path().join("idle");
+    let mut t = new_table(&tdir, make_schema_u64_i64(), 1 << 20, RecoverySource::SalReplay);
+    t.flush().unwrap();
+    assert!(tdir.join("manifest.bin").exists(), "the first barrier publishes");
+    assert!(
+        t.flush_prepare(FlushRound::Base).unwrap().is_none(),
+        "an idle store stages nothing"
+    );
+
+    t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
+    assert!(
+        t.flush_prepare(FlushRound::Base).unwrap().is_some(),
+        "a written row publishes"
+    );
+}
+
+/// A manifest loaded at open may never have been made durable by the process
+/// that wrote it, so the first round of a new process publishes regardless.
+#[test]
+fn a_reopened_store_publishes_on_its_first_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let tdir = dir.path().join("reopened");
+    let schema = make_schema_u64_i64();
+    {
+        let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
+        t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
+        t.flush().unwrap();
+    }
+    let mut t = new_table(&tdir, schema, 1 << 20, RecoverySource::SalReplay);
+    assert!(t.flush_prepare(FlushRound::Base).unwrap().is_some());
+}
+
+/// An unlinked manifest is no longer durable, so the next round republishes.
+#[test]
+fn an_unlinked_manifest_republishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let tdir = dir.path().join("unlinked");
+    let mut t = new_table(&tdir, make_schema_u64_i64(), 1 << 20, RecoverySource::SalReplay);
+    t.flush().unwrap();
+    t.unlink_manifest().unwrap();
+    assert!(t.flush_prepare(FlushRound::Base).unwrap().is_some());
+}
+
+/// A push that retracts every row, spills, and compacts the whole L0 to nothing
+/// leaves an index with no shards — which must still publish, or a reopen would
+/// load the previous manifest's shards and bring the retracted rows back.
+#[test]
+fn a_compaction_to_nothing_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let tdir = dir.path().join("to_nothing");
+    let schema = make_schema_u64_i64();
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
+    let rows = |r: u64, w: i64| -> Vec<(u64, i64, i64)> { (0..10).map(|k| (r * 100 + k, w, 1)).collect() };
+    for r in 0..L0_COMPACT_THRESHOLD as u64 {
+        t.ingest_owned_batch(make_batch(&rows(r, 1))).unwrap();
+        t.flush().unwrap();
+    }
+    assert_eq!(
+        shard_db_files(&tdir).len(),
+        L0_COMPACT_THRESHOLD,
+        "one published shard per round"
+    );
+
+    t.ram_tier.set_budget(100);
+    let retract: Vec<(u64, i64, i64)> = (0..L0_COMPACT_THRESHOLD as u64).flat_map(|r| rows(r, -1)).collect();
+    t.ingest_owned_batch(make_batch(&retract)).unwrap();
+    assert_eq!(t.ram_tier.len(), 0, "the retraction spilled");
+    assert!(t.all_shard_arcs().is_empty(), "the compaction cancelled everything");
+
+    assert!(
+        t.flush_prepare(FlushRound::Base).unwrap().is_some(),
+        "an emptied index publishes"
+    );
+    t.flush().unwrap();
+    drop(t);
+    let t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
+    assert_eq!(t.full_scan().count, 0, "no retracted row comes back");
+}
+
+/// Every shard file on disk is either `published` or one the index still
+/// registers unpublished — no unpublished file outlives the entry naming it.
+fn assert_unpublished_inputs_gone(t: &Table, dir: &std::path::Path, published: &str) {
     let live: Vec<&str> = t
         .shard_index
         .unsynced_paths()
         .map(|p| p.rsplit('/').next().unwrap())
         .collect();
-    let prefix = super::super::naming::shard_prefix(table_id);
     for f in std::fs::read_dir(dir).unwrap().flatten() {
         let name = f.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) {
+        if name.starts_with(super::super::naming::SHARD_PREFIX) {
             assert!(
                 name == published || live.contains(&name.as_str()),
                 "superseded unpublished shard {name} is still on disk"
@@ -1551,13 +1512,13 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("rederive_eph_drain");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(&tdir, schema, 8000, 96, RecoverySource::Rederive { resume_at: None });
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::Rederive { resume_at: None });
     t.ram_tier.set_budget(100);
 
     // One published shard, so the churn below supersedes a file a manifest names.
     t.ingest_owned_batch(make_batch(&[(10_000, 1, 1)])).unwrap();
     super::super::flush_barrier::flush_barrier([&mut t], FlushRound::Ephemeral(1)).unwrap();
-    let published = shard_db_files(&tdir, 8000);
+    let published = shard_db_files(&tdir);
     assert_eq!(published.len(), 1, "the publish wrote one shard");
 
     for r in 0..8u64 {
@@ -1565,17 +1526,17 @@ fn rederive_ephemeral_flush_drains_deferred_compaction() {
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
         assert_eq!(t.ram_tier.len(), 0, "round {r} spilled");
     }
-    assert!(compaction_output_count(&tdir, 8000) > 0, "compaction must have run");
-    assert_unpublished_inputs_gone(&t, &tdir, 8000, &published[0]);
+    assert!(compaction_output_count(&tdir) > 0, "compaction must have run");
+    assert_unpublished_inputs_gone(&t, &tdir, &published[0]);
     assert!(
         tdir.join(&published[0]).exists(),
         "the published input waits for the barrier"
     );
 
-    let files_before = all_shard_file_count(&tdir, 8000);
+    let files_before = all_shard_file_count(&tdir);
     t.flush().unwrap();
     assert_eq!(
-        all_shard_file_count(&tdir, 8000),
+        all_shard_file_count(&tdir),
         files_before,
         "the base round must publish nothing for a Rederive table, so nothing drains"
     );
@@ -1601,21 +1562,21 @@ fn salreplay_flush_drains_deferred_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("salreplay_flush_drain");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(&tdir, schema, 8100, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
 
     // One published shard, so the churn below supersedes a file a manifest names.
     t.ingest_owned_batch(make_batch(&[(10_000, 1, 1)])).unwrap();
     t.flush().unwrap();
-    let published = shard_db_files(&tdir, 8100);
+    let published = shard_db_files(&tdir);
     assert_eq!(published.len(), 1, "the publish wrote one shard");
 
     for r in 0..6u64 {
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
     }
-    assert!(compaction_output_count(&tdir, 8100) > 0, "compaction ran");
-    assert_unpublished_inputs_gone(&t, &tdir, 8100, &published[0]);
+    assert!(compaction_output_count(&tdir) > 0, "compaction ran");
+    assert_unpublished_inputs_gone(&t, &tdir, &published[0]);
     assert!(
         tdir.join(&published[0]).exists(),
         "the published input waits for the barrier"
@@ -1633,7 +1594,7 @@ fn salreplay_flush_drains_deferred_compaction() {
         assert!(t.has_pk(k), "row {k} present after flush-drain");
     }
 
-    let t2 = new_table(&tdir, schema, 8100, 96, RecoverySource::SalReplay);
+    let t2 = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     for k in all_keys() {
         assert!(t2.has_pk(k), "row {k} survives flush-drain + reopen");
     }
@@ -1646,7 +1607,7 @@ fn a_store_held_in_ram_never_spills() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("held_in_ram");
     let schema = make_schema_u64_i64();
-    let mut t = new_table(&tdir, schema, 8300, 96, RecoverySource::SalReplay);
+    let mut t = new_table(&tdir, schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(96);
     t.hold_in_ram();
 
@@ -1676,7 +1637,7 @@ fn a_store_held_in_ram_never_spills() {
 fn a_range_opened_cursor_sees_every_row_the_whole_index_would() {
     let schema = make_schema_u64_i64();
     let dir = tempfile::tempdir().unwrap();
-    let mut t = new_table(dir.path(), schema, 8200, 96, RecoverySource::SalReplay);
+    let mut t = new_table(dir.path(), schema, 96, RecoverySource::SalReplay);
     t.ram_tier.set_budget(100);
     // Interleaved bands across several spills, so the shards the router has to
     // pick from overlap in neither key order nor write order.
@@ -1713,19 +1674,19 @@ fn pk_filter_follows_whether_the_store_is_probed() {
     // Six ceiling breaches: each spills an L0 shard, the fifth crosses the L0
     // threshold and the sixth leaves a spill sitting above the fold — so one
     // store registers both shard writers' output at once.
-    let build = |dir: &std::path::Path, id: u32, rs: RecoverySource| {
-        let mut t = new_table(dir, schema, id, 96, rs);
+    let build = |dir: &std::path::Path, rs: RecoverySource| {
+        let mut t = new_table(dir, schema, 96, rs);
         t.ram_tier.set_budget(100);
         for r in 0..6u64 {
             let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
             t.ingest_owned_batch(make_batch(&rows)).unwrap();
         }
-        assert!(compaction_output_count(dir, id) > 0, "the spills drove a compaction");
+        assert!(compaction_output_count(dir) > 0, "the spills drove a compaction");
         t
     };
     let dir = tempfile::tempdir().unwrap();
 
-    let base = build(&dir.path().join("base"), 8100, RecoverySource::SalReplay);
+    let base = build(&dir.path().join("base"), RecoverySource::SalReplay);
     let shards = base.all_shard_arcs();
     assert!(shards.len() > 1, "spills and compaction outputs both present");
     assert!(
@@ -1735,7 +1696,6 @@ fn pk_filter_follows_whether_the_store_is_probed() {
 
     let reder = build(
         &dir.path().join("rederive"),
-        8101,
         RecoverySource::Rederive { resume_at: None },
     );
     assert!(
@@ -1759,7 +1719,7 @@ fn pk_filter_follows_whether_the_store_is_probed() {
 fn repeated_flushes_compact_l0() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut t = new_table(dir.path(), schema, 8200, 96, RecoverySource::SalReplay);
+    let mut t = new_table(dir.path(), schema, 96, RecoverySource::SalReplay);
     let flushes = 40u64;
     for i in 0..flushes {
         t.ingest_owned_batch(make_batch(&[(i, i as i64, 1)])).unwrap();

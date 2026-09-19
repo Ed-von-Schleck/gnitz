@@ -119,15 +119,12 @@ fn secondary_index_avi_decomposition_bench() {
     // A fresh table per iteration, opened outside the clock: an ingest into a
     // table already holding 500k entries would be measuring the memtable's
     // growth, not the population.
-    let mut id = 2000u32;
     let full = bench_time_each(
         ITERS,
         || {
-            id += 1;
             let mut t = Table::new(
                 tmp.path().to_str().unwrap(),
                 avi_schema,
-                id,
                 RecoverySource::Rederive { resume_at: None },
                 StoreBudgets::default(),
             )

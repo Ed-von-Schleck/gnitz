@@ -444,7 +444,7 @@ fn master_pre_fork_recovery(
         .reconcile_child_dirs()
         .map_err(|e| format!("child-dir sweep failed: {e}"))?;
 
-    // Pre-fork because it peeks every launched rank's manifest on behalf of
+    // Pre-fork because it reads every launched rank's manifest on behalf of
     // workers that do not exist yet.
     catalog.compute_invalid_views();
 

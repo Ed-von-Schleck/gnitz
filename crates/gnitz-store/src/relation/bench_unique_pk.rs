@@ -51,7 +51,6 @@ fn unique_pk_bench() {
         let mut t = Table::new(
             dir.path().join("warm").to_str().unwrap(),
             schema,
-            1,
             RecoverySource::SalReplay,
             StoreBudgets::default(),
         )
@@ -73,7 +72,7 @@ fn unique_pk_bench() {
         ("update", HOT_KEYS, 1_000),
         ("insert1", 0, 1),
     ];
-    for (id, &(label, hot, rows_per_push)) in arms.iter().enumerate() {
+    for &(label, hot, rows_per_push) in arms.iter() {
         let pushes = TOTAL_ROWS / rows_per_push;
         // Untimed: build every push up front, so the timed region holds only the
         // enforcement walk and the store ingest.
@@ -94,7 +93,6 @@ fn unique_pk_bench() {
         let mut table = Table::new(
             dir.path().join(label).to_str().unwrap(),
             schema,
-            100 + id as u32,
             RecoverySource::SalReplay,
             StoreBudgets::default(),
         )

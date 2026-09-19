@@ -30,7 +30,7 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
     }
-    pub(crate) fn u64(&mut self, v: u64) -> &mut Self {
+    pub fn u64(&mut self, v: u64) -> &mut Self {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
     }
@@ -104,7 +104,7 @@ impl<'a> Reader<'a> {
     pub fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    pub(crate) fn u64(&mut self) -> Result<u64, String> {
+    pub fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     pub(crate) fn u128(&mut self) -> Result<u128, String> {
@@ -128,7 +128,7 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| format!("{}: truncated reading descriptor length", self.ctx))
     }
 
-    pub(crate) fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         self.buf.len() - self.off
     }
 

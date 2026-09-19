@@ -69,7 +69,6 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
         let mut pt = Table::new(
             dir.path().to_str().unwrap(),
             schema,
-            1234,
             RecoverySource::Rederive { resume_at: None },
             StoreBudgets::default(),
         )
@@ -143,7 +142,6 @@ fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
     let mut pt = Table::new(
         dir.path().to_str().unwrap(),
         schema,
-        4321,
         RecoverySource::Rederive { resume_at: None },
         StoreBudgets::default(),
     )

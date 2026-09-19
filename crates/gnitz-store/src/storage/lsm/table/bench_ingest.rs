@@ -36,7 +36,6 @@ fn delta_ingest_bench() {
         let mut t = Table::new(
             dir.path().join("warm").to_str().unwrap(),
             schema,
-            1,
             RecoverySource::Rederive { resume_at: None },
             StoreBudgets::default(),
         )
@@ -78,7 +77,6 @@ fn delta_ingest_bench() {
         let mut table = Table::new(
             dir.path().join(format!("ingest{id}")).to_str().unwrap(),
             schema,
-            100 + id as u32,
             RecoverySource::Rederive { resume_at: None },
             StoreBudgets::default(),
         )
@@ -128,7 +126,6 @@ fn delta_ingest_bench() {
         let mut table = Table::new(
             dir.path().join(format!("q{id}")).to_str().unwrap(),
             schema,
-            200 + id as u32,
             RecoverySource::Rederive { resume_at: None },
             StoreBudgets::default(),
         )
@@ -187,7 +184,6 @@ fn delta_ingest_bench() {
         let mut table = Table::new(
             dir.path().join(format!("c{id}")).to_str().unwrap(),
             schema,
-            300 + id as u32,
             RecoverySource::Rederive { resume_at: None },
             StoreBudgets::default(),
         )

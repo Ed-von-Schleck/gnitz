@@ -25,11 +25,9 @@ impl ShardIndex {
         self.find_pk_bytes(opk.pk_bytes(), filter_key, visitor);
     }
 
-    fn load_manifest(&mut self, path: &str) -> Result<(), StorageError> {
-        if let Some((entries, header)) = super::super::manifest::read_file(path)? {
-            self.install_manifest(&entries, &header)?;
-        }
-        Ok(())
+    fn load_manifest(&mut self) -> Result<(), StorageError> {
+        let m = super::super::manifest::read(&self.output_dir)?;
+        self.install(m.as_ref())
     }
 }
 
@@ -159,21 +157,20 @@ fn assert_all_found(idx: &ShardIndex, keys: impl IntoIterator<Item = u64>) {
     }
 }
 
-/// Publish the index's manifest at `path` for reload tests: stage the
-/// `.tmp` via the production `prepare_manifest`, then rename it into place
-/// (the barrier's `flush_commit` step, minus the fsyncs the round-trip
-/// doesn't observe).
-fn publish_manifest(idx: &ShardIndex, path: &std::path::Path) {
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    let m = idx.prepare_manifest(&cpath, 0).unwrap();
-    m.commit().unwrap();
+/// Publish the index's manifest as the barrier does, minus the fsyncs.
+fn publish_manifest(idx: &ShardIndex) {
+    let bytes = super::super::manifest::encode(&idx.manifest(0));
+    super::super::manifest::prepare(&idx.output_dir, &bytes)
+        .unwrap()
+        .commit()
+        .unwrap();
 }
 
 #[test]
 fn test_add_unsynced_shard_and_find_pk() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     let path1 = write_test_shard(dir.path(), "s1.db", &[10, 20, 30], &[100, 200, 300]);
     let path2 = write_test_shard(dir.path(), "s2.db", &[25, 35, 40], &[250, 350, 400]);
@@ -200,7 +197,7 @@ fn test_add_unsynced_shard_and_find_pk() {
 fn test_manifest_roundtrip_with_levels() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // Add enough shards to trigger compaction to L1
     for i in 0..5u64 {
@@ -212,12 +209,11 @@ fn test_manifest_roundtrip_with_levels() {
     idx.run_compact().unwrap();
 
     // Publish manifest
-    let manifest_path = dir.path().join("MANIFEST");
-    publish_manifest(&idx, &manifest_path);
+    publish_manifest(&idx);
 
     // Load into a fresh index
-    let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
-    idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    let mut idx2 = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    idx2.load_manifest().unwrap();
 
     // Every key is findable in the reloaded index.
     assert_all_found(&idx2, (0..5u64).map(|i| i * 10 + 1));
@@ -237,7 +233,7 @@ fn test_manifest_roundtrip_with_levels() {
 fn test_run_compact_l0_to_l1() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // Add > L0_COMPACT_THRESHOLD shards
     let mut all_pks = Vec::new();
@@ -266,7 +262,7 @@ fn test_run_compact_l0_to_l1() {
 fn the_rebalance_holds_every_level_at_its_targets() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
     let guard = idx.levels[0].get_or_create_guard(gk(0));
@@ -299,7 +295,7 @@ fn the_rebalance_holds_every_level_at_its_targets() {
 fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // Two destination guards over disjoint key bands, each large enough that
     // the trailing rebalance would neither merge nor split them.
@@ -320,7 +316,7 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     // band down, 3 folds the second — which is the one blocked here.
     // compact_seq 3 is the second band's terminal fold; it routes into the one
     // destination guard its span overlaps, so its single output is part 0.
-    let blocker = dir.path().join(naming::compact_shard_name(42, 3, 2, 0));
+    let blocker = dir.path().join(naming::compact_shard_name(3, 0));
     std::fs::create_dir_all(&blocker).unwrap();
 
     let hi_dest_file = idx.levels[1].guards[1].entries[0].filename.clone();
@@ -346,7 +342,7 @@ fn test_l1_guard_routing_gap_key_below_first_guard() {
     // findable after an L0→L1 compaction.
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // L1 already has a guard at key 100 (keys 100, 200).
     let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
@@ -409,7 +405,7 @@ fn test_find_guards_for_range() {
 fn test_try_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // Create real files
     let path1 = write_test_shard(dir.path(), "cleanup1.db", &[1], &[10]);
@@ -437,13 +433,13 @@ fn test_try_cleanup() {
 fn test_unsynced_tracking_register_prune_clear() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     assert!(idx.unsynced_paths().next().is_none());
     let mut spills = Vec::new();
     for i in 0..5u64 {
         let pk = (i + 1) * 10;
-        let p = write_test_shard(dir.path(), &naming::spill_shard_name(42, i), &[pk], &[pk as i64]);
+        let p = write_test_shard(dir.path(), &naming::spill_shard_name(i), &[pk], &[pk as i64]);
         idx.add_unsynced_shard(&p, i + 1).unwrap();
         spills.push(p);
     }
@@ -478,16 +474,15 @@ fn test_unsynced_tracking_register_prune_clear() {
 fn reload_and_widen_owe_no_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
     for i in 0..3u64 {
-        let p = write_test_shard(dir.path(), &naming::spill_shard_name(42, i), &[i * 10 + 1], &[i as i64]);
+        let p = write_test_shard(dir.path(), &naming::spill_shard_name(i), &[i * 10 + 1], &[i as i64]);
         idx.add_unsynced_shard(&p, i + 1).unwrap();
     }
-    let manifest_path = dir.path().join("MANIFEST");
-    publish_manifest(&idx, &manifest_path);
+    publish_manifest(&idx);
 
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
-    idx.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    idx.load_manifest().unwrap();
     assert!(idx.unsynced_paths().next().is_none(), "a manifest names durable files");
 
     let wide = SchemaDescriptor::new(
@@ -510,7 +505,7 @@ fn reload_and_widen_owe_no_sweep() {
 fn test_max_lsn() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     assert_eq!(idx.max_lsn(), 0);
 
@@ -537,13 +532,7 @@ fn test_run_compact_failure_leaves_l0_intact() {
 
     // Output dir that does not exist: the finalizing write fails.
     let missing_out_dir = dir.path().join("no_such_dir");
-    let mut idx = ShardIndex::new(
-        42,
-        missing_out_dir.to_str().unwrap(),
-        schema,
-        ShardBudget::Unbounded,
-        false,
-    );
+    let mut idx = ShardIndex::new(missing_out_dir.to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // Add L0_COMPACT_THRESHOLD + 1 shards (triggers compaction).
     let mut all_pks = Vec::new();
@@ -576,7 +565,7 @@ fn test_run_compact_failure_leaves_l0_intact() {
 fn a_vertical_does_not_lose_keys_below_the_destination_guard() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // L1 guard at key=100: 5 shards (> GUARD_FILE_THRESHOLD=4) with keys in [100, 199]
     let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
@@ -619,7 +608,7 @@ fn a_vertical_does_not_lose_keys_below_the_destination_guard() {
 fn a_vertical_into_a_guards_lower_tail_does_not_shadow_it() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // L2 guard at key 200, holding keys on both sides of it.
     let dest_pks = [50u64, 150, 250];
@@ -650,7 +639,7 @@ fn a_vertical_into_a_guards_lower_tail_does_not_shadow_it() {
 fn a_vertical_bands_its_source_at_the_destination_partition() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     let mut dest_pks = Vec::new();
     for (name, base, key) in [("d_lo.db", 200u64, gk(100)), ("d_hi.db", 100_100, gk(100_000))] {
@@ -695,7 +684,7 @@ fn a_vertical_bands_its_source_at_the_destination_partition() {
 fn test_vertical_disjoint_guards_no_name_collision() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // Key 250 routes to the gk(100) bucket; 6000 to the gk(5000) bucket.
     // L1 guard gk(100): two entries (keys 100, 110).
@@ -736,10 +725,9 @@ fn test_vertical_disjoint_guards_no_name_collision() {
     }
 
     // Publish + reload into a fresh index: every key must survive.
-    let manifest_path = dir.path().join("MANIFEST");
-    publish_manifest(&idx, &manifest_path);
-    let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
-    idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    publish_manifest(&idx);
+    let mut idx2 = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    idx2.load_manifest().unwrap();
     let l2_ends = l2_pks.iter().flat_map(|pks| [pks[0], *pks.last().unwrap()]);
     assert_all_found(&idx2, [100u64, 110, 5000, 5010].into_iter().chain(l2_ends));
 }
@@ -754,7 +742,7 @@ fn test_vertical_disjoint_guards_no_name_collision() {
 fn test_vertical_same_guard_recompaction_try_cleanup_keeps_live() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
 
     // L2 guard gk(100) pre-seeded with key 250.
     {
@@ -786,77 +774,63 @@ fn test_vertical_same_guard_recompaction_try_cleanup_keeps_live() {
     );
 
     // Publish + reload: every key survives.
-    let manifest_path = dir.path().join("MANIFEST");
-    publish_manifest(&idx, &manifest_path);
-    let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
-    idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    publish_manifest(&idx);
+    let mut idx2 = ShardIndex::new(dir.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    idx2.load_manifest().unwrap();
     assert_all_found(&idx2, [100u64, 110, 120, 130, 250]);
 }
 
-/// `gc_orphans` unlinks exactly the files that belong to this table and no
-/// live entry names: stale shards of either grammar, half-written `.tmp`
-/// leftovers, and the staged manifest. Another table's files, and this table's
-/// live shard, are not its to touch. Asserting the surviving *set* rather than
-/// a removal count catches a file wrongly kept and one wrongly deleted alike.
+/// `install` unlinks exactly the files no live entry names: stale shards of
+/// either grammar, half-written `.tmp` leftovers, and the staged manifest.
 #[test]
-fn gc_orphans_removes_exactly_the_unreferenced_files_of_its_own_table() {
+fn install_removes_exactly_the_unreferenced_files() {
     let dir = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        42,
         dir.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
         false,
     );
 
-    let live = naming::spill_shard_name(42, 1);
+    let live = naming::spill_shard_name(1);
     let live_path = write_test_shard(dir.path(), &live, &[10], &[100]);
     idx.add_unsynced_shard(&live_path, 1).unwrap();
 
     let doomed = [
-        naming::spill_shard_name(42, 99),                   // stale spill
-        naming::compact_shard_name(42, 7, 1, 0),            // stale compaction output
-        format!("{}.tmp", naming::spill_shard_name(42, 5)), // half-written spill
-        format!("{}.tmp", naming::compact_shard_name(42, 3, 1, 0)),
+        naming::spill_shard_name(99),                   // stale spill
+        naming::compact_shard_name(7, 0),               // stale compaction output
+        format!("{}.tmp", naming::spill_shard_name(5)), // half-written spill
+        format!("{}.tmp", naming::compact_shard_name(3, 0)),
         "manifest.bin.tmp".to_string(),
     ];
-    let kept = [
-        naming::spill_shard_name(99, 1),         // another table's spill
-        naming::compact_shard_name(99, 1, 1, 0), // another table's output
-    ];
-    for name in doomed.iter().chain(kept.iter()) {
+    for name in &doomed {
         std::fs::write(dir.path().join(name), b"x").unwrap();
     }
 
-    idx.gc_orphans();
+    idx.install(None).unwrap();
 
     let mut survivors: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     survivors.sort();
-    let mut want: Vec<String> = kept.iter().cloned().chain([live]).collect();
-    want.sort();
-    assert_eq!(survivors, want);
+    assert_eq!(survivors, [live]);
 }
 
-/// An index that never loaded a manifest names no live shard, so every file of
-/// its table is an orphan — the boot-time case, where a crash left a shard the
-/// manifest was never updated to reference.
+/// With no manifest, every shard in the directory is an orphan.
 #[test]
-fn gc_orphans_on_an_empty_index_removes_every_shard_of_its_table() {
+fn install_of_no_manifest_removes_every_shard() {
     let dir = tempfile::tempdir().unwrap();
-    let idx = ShardIndex::new(
-        42,
+    let mut idx = ShardIndex::new(
         dir.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
         false,
     );
-    let stray = dir.path().join(naming::spill_shard_name(42, 7));
+    let stray = dir.path().join(naming::spill_shard_name(7));
     std::fs::write(&stray, b"orphan").unwrap();
 
-    idx.gc_orphans();
+    idx.install(None).unwrap();
     assert!(!stray.exists());
 }
 
@@ -958,7 +932,6 @@ const OVER_TARGET_ROWS: u64 = 5000;
 fn an_overfull_guard_splits_at_its_own_key_quantiles() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -987,7 +960,6 @@ fn an_overfull_guard_splits_at_its_own_key_quantiles() {
 fn splitting_guard_zero_mints_keys_below_its_own() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1016,7 +988,6 @@ fn splitting_guard_zero_mints_keys_below_its_own() {
 fn a_guard_of_one_distinct_key_neither_splits_nor_refolds() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1071,7 +1042,7 @@ fn a_wide_pk_sharing_its_leading_sixteen_bytes_still_splits() {
     let path = tmp.path().join("wide.db");
     shard_file::write_test_shard(&path, &schema, &rows, shard_file::ShardWriteOpts::default());
 
-    let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
     seed_guard(&mut idx, 0, PkBuf::zeroed(24), path.to_str().unwrap(), 1);
     let target = idx.guard_target_bytes(0);
     let before = idx.levels[0].guards[0].bytes();
@@ -1125,7 +1096,7 @@ fn the_byte_target_bounds_a_guard_at_every_stride() {
         let tmp = tempfile::tempdir().unwrap();
         let schema = stride_schema(pk_cols);
         assert_eq!(schema.pk_stride(), pk_cols * 8);
-        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+        let mut idx = ShardIndex::new(tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
         let p = write_trailing_key_shard(tmp.path(), "big.db", pk_cols, 1, OVER_TARGET_ROWS);
         seed_guard(&mut idx, 0, trailing_gk(pk_cols, 1), &p, 1);
 
@@ -1157,7 +1128,7 @@ fn underfull_guards_merge_at_every_stride() {
     for pk_cols in [1usize, 3, 4] {
         let tmp = tempfile::tempdir().unwrap();
         let schema = stride_schema(pk_cols);
-        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+        let mut idx = ShardIndex::new(tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
         for i in 0..4u64 {
             let base = 1 + i * 1000;
             let p = write_trailing_key_shard(tmp.path(), &format!("g{i}.db"), pk_cols, base, 100);
@@ -1197,7 +1168,6 @@ fn underfull_guards_merge_at_every_stride() {
 fn a_guard_far_over_target_splits_in_bounded_steps() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_pk_u64_payload_string(),
         ShardBudget::Unbounded,
@@ -1236,7 +1206,7 @@ fn a_guard_far_over_target_splits_in_bounded_steps() {
 fn a_guard_whose_rows_all_cancel_is_removed() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
     // Five entries, so the file threshold fires: two insert/retract pairs and
     // one more insert that its own pair cancels.
     for i in 0..5u64 {
@@ -1268,7 +1238,6 @@ fn a_guard_whose_rows_all_cancel_is_removed() {
 fn underfull_neighbours_merge_into_the_runs_lowest_key() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1306,7 +1275,6 @@ fn underfull_neighbours_merge_into_the_runs_lowest_key() {
 fn a_merge_run_does_not_cross_a_representation_boundary() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1341,7 +1309,6 @@ fn a_merge_run_does_not_cross_a_representation_boundary() {
 fn a_first_dehydration_never_splits() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1365,7 +1332,6 @@ fn a_first_dehydration_never_splits() {
 fn a_dehydrated_guard_over_target_splits_and_stays_skeleton() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1413,7 +1379,6 @@ fn a_dehydrated_guard_over_target_splits_and_stays_skeleton() {
 fn the_guard_count_comes_back_down_after_the_bytes_do() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1462,7 +1427,6 @@ fn the_guard_count_comes_back_down_after_the_bytes_do() {
 fn a_range_gather_visits_only_the_guards_that_can_own_it() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1496,7 +1460,6 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
 fn the_guard_target_tracks_the_l0_folds_the_store_has_seen() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1532,16 +1495,14 @@ fn the_guard_target_tracks_the_l0_folds_the_store_has_seen() {
         idx.levels.iter().flat_map(|l| &l.guards).any(|g| g.bytes() > folded),
         "premise: a guard larger than R"
     );
-    let manifest_path = tmp.path().join("MANIFEST");
-    publish_manifest(&idx, &manifest_path);
+    publish_manifest(&idx);
     let mut reloaded = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
         false,
     );
-    reloaded.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    reloaded.load_manifest().unwrap();
     assert_eq!(reloaded.l0_run_bytes, folded, "R survives a restart as it was observed");
 }
 
@@ -1551,7 +1512,6 @@ fn the_guard_target_tracks_the_l0_folds_the_store_has_seen() {
 fn a_budgeted_terminal_target_is_an_eighth_of_the_budget_within_the_clamp() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1600,7 +1560,6 @@ fn the_balanced_l1_target_computes_its_product_in_u128() {
 /// with ascending LSNs so write-recency victim ordering is observable.
 fn index_with_l0(dir: &std::path::Path, n: u64) -> ShardIndex {
     let mut idx = ShardIndex::new(
-        1,
         dir.to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1764,16 +1723,14 @@ fn a_superseded_shard_waits_for_the_barrier_only_if_a_manifest_names_it() {
 
     let dir = tmp.path().join("published");
     std::fs::create_dir_all(&dir).unwrap();
-    let manifest_path = dir.join("MANIFEST");
-    publish_manifest(&index_with_l0(&dir, 5), &manifest_path);
+    publish_manifest(&index_with_l0(&dir, 5));
     let mut idx = ShardIndex::new(
-        1,
         dir.to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
         false,
     );
-    idx.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+    idx.load_manifest().unwrap();
     let inputs = files(&idx);
     assert_eq!(inputs.len(), 5);
     idx.run_compact().unwrap();
@@ -1804,7 +1761,6 @@ fn a_superseded_shard_waits_for_the_barrier_only_if_a_manifest_names_it() {
 fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1851,7 +1807,6 @@ fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
 fn a_drop_removes_nothing_above_the_floor_it_raises() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1906,7 +1861,7 @@ fn a_drop_removes_nothing_above_the_floor_it_raises() {
 fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
     // Three hydrated terminal guards at distinct write recencies, each too
     // big for the rebalance to merge into its neighbour.
     for (i, base) in [1u64, 10_000, 20_000].into_iter().enumerate() {
@@ -1950,7 +1905,6 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
 fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(
-        1,
         tmp.path().to_str().unwrap(),
         make_schema_u64_i64(),
         ShardBudget::Unbounded,
@@ -1987,7 +1941,7 @@ fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
 fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
-    let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
+    let mut idx = ShardIndex::new(tmp.path().to_str().unwrap(), schema, ShardBudget::Unbounded, false);
     // Three well-separated terminal bands, each too big for the rebalance to
     // merge into its neighbour or to split.
     for (i, base) in [1u64, 10_000, 20_000].into_iter().enumerate() {

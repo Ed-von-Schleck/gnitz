@@ -571,15 +571,9 @@ impl RelationRegistry {
         index_id: i64,
         schema: SchemaDescriptor,
     ) -> Result<Box<Table>, StoreError> {
-        Table::new(
-            &ChildAddr::worker(slot).dir(idx_dir),
-            schema,
-            index_id as u32,
-            recovery,
-            budgets,
-        )
-        .map(Box::new)
-        .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={idx_dir})"), e))
+        Table::new(&ChildAddr::worker(slot).dir(idx_dir), schema, recovery, budgets)
+            .map(Box::new)
+            .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={idx_dir})"), e))
     }
 
     /// Remove `id`'s circuit on `cols`, dropping its store. A no-op when no such

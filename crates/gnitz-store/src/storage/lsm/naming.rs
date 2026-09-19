@@ -1,46 +1,32 @@
-//! The single owner of a shard's **basename** grammar. Every producer (flush
-//! spill/barrier shards, compaction outputs) and the one cleaner (`gc_orphans`)
-//! route through here, so writer and cleaner can never disagree about which
-//! files belong to a table.
-//!
-//! Not the directory half of a full path: each producer prepends its own store's
-//! `output_dir`.
+//! A shard's basename grammar, shared by its producers and the one cleaner. A
+//! store owns its directory, so every shard and staging file in it is the store's.
 
 use std::collections::HashSet;
 
-/// Flat spill/barrier shard basename: `shard_{tid}_{lsn}.db`.
-pub(super) fn spill_shard_name(table_id: u32, lsn: u64) -> String {
-    format!("shard_{table_id}_{lsn}.db")
+use super::STAGING_SUFFIX;
+
+/// Basename prefix both grammars share.
+pub(super) const SHARD_PREFIX: &str = "shard_";
+
+/// Flat spill/barrier shard basename: `shard_{lsn}.db`.
+pub(super) fn spill_shard_name(lsn: u64) -> String {
+    format!("{SHARD_PREFIX}{lsn}.db")
 }
 
-/// Compaction-output shard basename: `shard_{tid}_{seq}_L{level}_P{part}.db`.
-/// `compact_seq` is per-table monotonic and manifest-persisted and `part` is the
-/// output's index within the compaction, so `(seq, part)` is unique over the
-/// table's lifetime — which keeps the finalizing rename from clobbering a live
-/// shard. Collision-free against the flat grammar: a spill name has no `_L`.
-pub(super) fn compact_shard_name(table_id: u32, compact_seq: u64, level_num: usize, part: usize) -> String {
-    let name = format!("shard_{table_id}_{compact_seq}_L{level_num}_P{part}.db");
-    debug_assert!(
-        name.len() < super::manifest::W_FILENAME,
-        "compaction basename overflows the manifest field: {name}"
-    );
-    name
+/// Compaction-output shard basename: `shard_{seq}_P{part}.db`. `compact_seq`
+/// never repeats within a store: the manifest carries it across a restart.
+pub(super) fn compact_shard_name(compact_seq: u64, part: usize) -> String {
+    format!("{SHARD_PREFIX}{compact_seq}_P{part}.db")
 }
 
-/// Basename prefix both grammars share; `.tmp` leftovers match it too. The one
-/// way to ask "does this file belong to `table_id`".
-pub(super) fn shard_prefix(table_id: u32) -> String {
-    format!("shard_{table_id}_")
-}
-
-/// Remove every one of `table_id`'s shard files in `dir` whose basename is not
-/// in `keep`. `keep = ∅` erases them all. Best-effort per file.
-pub(super) fn remove_shard_files(dir: &str, table_id: u32, keep: &HashSet<&str>) {
-    let prefix = shard_prefix(table_id);
+/// Remove every staging file and every shard not in `keep` from `dir`,
+/// best-effort.
+pub(super) fn remove_stale_files(dir: &str, keep: &HashSet<&str>) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) && !keep.contains(name) {
+                let stale = name.ends_with(STAGING_SUFFIX) || (name.starts_with(SHARD_PREFIX) && !keep.contains(name));
+                if stale {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }

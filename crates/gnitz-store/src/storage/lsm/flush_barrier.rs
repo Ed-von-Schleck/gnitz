@@ -2,9 +2,10 @@
 //!
 //! One pass over a table set: prepare each table, batch every fdatasync through
 //! a single io_uring, commit each manifest rename, fsync the directories that
-//! received one, then drain the deferred compaction deletions. Publishing N
-//! tables costs a handful of ring submissions instead of ~4 blocking syscalls
-//! per table, and never holds more than [`FD_CHUNK_THRESHOLD`] fds open.
+//! received one, then record each manifest as durable and drain the deferred
+//! compaction deletions. Publishing N tables costs a handful of ring
+//! submissions instead of ~4 blocking syscalls per table, and never holds more
+//! than [`FD_CHUNK_THRESHOLD`] fds open.
 
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -25,8 +26,8 @@ pub(crate) enum FlushRound {
     /// Base tables: a `SalReplay` store publishes a manifest, a rederived one
     /// folds to RAM inline and publishes nothing.
     Base,
-    /// View state: force-publish every operator trace and output store,
-    /// stamping each manifest with the checkpoint generation.
+    /// View state: every operator trace and output store publishes a manifest
+    /// stamped with the checkpoint generation.
     Ephemeral(u64),
 }
 
@@ -50,10 +51,9 @@ pub(crate) fn flush_barrier<'a>(
     let mut ring = LazyRing::default();
     let mut pending: Vec<(&'a mut Table, FlushWork)> = Vec::new();
     let mut pending_fds = 0usize;
-    // Tables that published a manifest this round — drained only after every
-    // chunk succeeded, so a crash between publish and drain loads the cut
-    // manifest over intact files.
-    let mut flushed: Vec<&'a mut Table> = Vec::new();
+    // Drained only after every chunk succeeded, so a crash between publish and
+    // drain loads the cut manifest over intact files.
+    let mut flushed: Vec<(&'a mut Table, Vec<u8>)> = Vec::new();
 
     for t in tables {
         let Some(work) = t.flush_prepare(round)? else {
@@ -73,8 +73,8 @@ pub(crate) fn flush_barrier<'a>(
     // Every published manifest is durable now, so a superseded compaction input
     // can no longer be unlinked while a manifest still referencing it is
     // unpublished.
-    for t in flushed {
-        t.drain_deletions();
+    for (t, bytes) in flushed {
+        t.published_durably(bytes);
     }
     Ok(())
 }
@@ -101,7 +101,7 @@ fn sync_by_path(ring: &mut LazyRing, paths: &[&CStr]) -> Result<(), StorageError
 fn publish_chunk<'a>(
     ring: &mut LazyRing,
     pending: &mut Vec<(&'a mut Table, FlushWork)>,
-    flushed: &mut Vec<&'a mut Table>,
+    flushed: &mut Vec<(&'a mut Table, Vec<u8>)>,
 ) -> Result<(), StorageError> {
     if pending.is_empty() {
         return Ok(());
@@ -120,8 +120,9 @@ fn publish_chunk<'a>(
     // not fdatasync: the rename is metadata.
     let mut dir_fds: Vec<OwnedFd> = Vec::with_capacity(pending.len());
     for (t, work) in pending.drain(..) {
-        dir_fds.push(t.flush_commit(work)?);
-        flushed.push(t);
+        let (fd, bytes) = t.flush_commit(work)?;
+        dir_fds.push(fd);
+        flushed.push((t, bytes));
     }
     let raw: Vec<libc::c_int> = dir_fds.iter().map(|f| f.as_raw_fd()).collect();
     ring.batch_sync(&raw, io_uring::types::FsyncFlags::empty())

@@ -63,13 +63,12 @@ fn state_children_are_the_output_stores_and_the_scratch() {
         std::fs::create_dir_all(format!("{dir}/{name}")).unwrap();
     }
 
-    let mut got: Vec<String> = state_child_manifests(&dir, 2)
+    let mut got: Vec<String> = state_child_dirs(&dir, 2)
         .unwrap()
         .iter()
-        .map(|m| {
-            m.strip_prefix(&format!("{dir}/"))
-                .and_then(|rest| rest.split('/').next())
-                .expect("a manifest sits one level under the relation directory")
+        .map(|d| {
+            d.strip_prefix(&format!("{dir}/"))
+                .expect("a child sits one level under the relation directory")
                 .to_string()
         })
         .collect();
@@ -77,12 +76,11 @@ fn state_children_are_the_output_stores_and_the_scratch() {
     assert_eq!(got, ["scratch_agg_w0", "scratch_agg_w1", "w0of2", "w1of2"]);
 }
 
-/// An output store's manifest is enumerated whether or not its directory is
-/// there — an absent one must read as a mismatch, not vanish from the verdict.
+/// An output store's directory is enumerated whether or not it is there — an absent one must read as a mismatch, not vanish from the verdict.
 #[test]
 fn state_children_name_every_launched_rank_on_an_empty_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    assert_eq!(state_child_manifests(tmp.path().to_str().unwrap(), 3).unwrap().len(), 3);
+    assert_eq!(state_child_dirs(tmp.path().to_str().unwrap(), 3).unwrap().len(), 3);
 }
 
 #[test]

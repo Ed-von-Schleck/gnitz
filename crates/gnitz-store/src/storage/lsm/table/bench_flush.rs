@@ -147,7 +147,6 @@ fn flush_cadence_amplification_bench() {
         let mut table = Table::new(
             dir.path().join("warmup").to_str().unwrap(),
             schema,
-            1,
             RecoverySource::Rederive { resume_at: None },
             bench_budgets(),
         )
@@ -169,7 +168,7 @@ fn flush_cadence_amplification_bench() {
         ("churn_h65536_d512", Gen::Churn(65536, 512), 1000),
     ];
 
-    for (id, (label, gen, ticks_n)) in configs.into_iter().enumerate() {
+    for (label, gen, ticks_n) in configs {
         let ticks: Vec<Batch> = match gen {
             Gen::Distinct(d) => gen_distinct(&schema, d, ticks_n),
             Gen::Churn(h, d) => gen_churn(&schema, h, d, ticks_n),
@@ -180,7 +179,6 @@ fn flush_cadence_amplification_bench() {
         let mut table = Table::new(
             dir.path().join(label).to_str().unwrap(),
             schema,
-            100 + id as u32,
             RecoverySource::Rederive { resume_at: None },
             bench_budgets(),
         )
@@ -257,7 +255,6 @@ fn compaction_amplification_bench() {
     let mut table = Table::new(
         dir.to_str().unwrap(),
         schema,
-        7,
         RecoverySource::Rederive { resume_at: None },
         bench_budgets(),
     )
@@ -343,7 +340,6 @@ fn filter_share_of_compaction_bench() {
     let mut table = Table::new(
         dir.to_str().unwrap(),
         schema,
-        9,
         RecoverySource::SalReplay,
         bench_budgets(),
     )

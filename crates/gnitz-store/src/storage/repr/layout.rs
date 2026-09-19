@@ -139,9 +139,8 @@ pub(crate) const fn desc_len(num_regions: usize) -> usize {
 /// The seed binds a prefix to the name it was written under, so a prefix that
 /// arrives from elsewhere — a rename, or a misdirected write carrying a
 /// same-shaped neighbour's first sector — fails to validate. It separates names,
-/// not directories: `spill_shard_name` is `shard_{table_id}_{lsn}.db` and every
-/// child of a partitioned table shares the `table_id`, so the same name in two
-/// sibling partition directories seeds identically.
+/// not directories: the naming grammar has no directory component, so a spill
+/// name repeats across sibling partition directories and seeds identically.
 pub(crate) fn desc_digest(basename: &[u8], data: &[u8], num_regions: usize) -> u64 {
     gnitz_wire::digest_with_hole(basename, &data[..desc_len(num_regions)], OFF_DESC_CHECKSUM)
 }

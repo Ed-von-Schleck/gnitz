@@ -62,8 +62,7 @@ impl ShardIndex {
             "a terminal run ascends past every key its level holds"
         );
         self.compact_seq += 1;
-        let level = Self::level_num(TERMINAL_LEVEL_IDX);
-        let name = super::super::naming::compact_shard_name(self.table_id, self.compact_seq, level, 0);
+        let name = super::super::naming::compact_shard_name(self.compact_seq, 0);
         let path = format!("{}/{name}", self.output_dir);
         run.write_as_shard(
             &super::super::cstr(path.as_str())?,
@@ -251,8 +250,6 @@ impl ShardIndex {
             &self.schema,
             compact::Output {
                 dir: &self.output_dir,
-                table_id: self.table_id,
-                level_num: Self::level_num(dest_idx),
                 compact_seq,
                 skip_pk_filter: self.skip_pk_filter,
             },
@@ -286,7 +283,7 @@ impl ShardIndex {
             if e.published {
                 self.pending_deletions.push(e.filename);
             } else {
-                // A leftover is an orphan the next open's `gc_orphans` reclaims.
+                // A leftover is an orphan the next open's `install` reclaims.
                 let _ = fs::remove_file(&e.filename);
             }
         }
@@ -550,7 +547,7 @@ impl ShardIndex {
     /// Merge one L1 band with the terminal guards its span overlaps — a run of
     /// exactly one once [`Self::vertical_fold`] has banded the source. The
     /// terminal level is the deepest destination: an L2→L3 fold would serialize a
-    /// level `install_manifest` rejects.
+    /// level `install` rejects.
     fn fold_band_into_terminal(&mut self, src_guard_idx: usize) -> Result<(), StorageError> {
         let src = &self.levels[0].guards[src_guard_idx];
         let src_guard_key = src.guard_key;

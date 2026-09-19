@@ -151,7 +151,7 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> 
     } else {
         RecoverySource::Rederive { resume_at: None }
     };
-    Table::new(dir.to_str().unwrap(), schema, 1, p, StoreBudgets::default()).unwrap()
+    Table::new(dir.to_str().unwrap(), schema, p, StoreBudgets::default()).unwrap()
 }
 
 proptest! {
@@ -288,11 +288,11 @@ proptest! {
             table.flush().unwrap();
         }
         // Registering the WAVES'th shard crosses `l0.len() > 4`, so the flush
-        // loop itself compacted. A compaction output carries the `_L` level
+        // loop itself compacted. A compaction output carries the `_P` part
         // marker; the count is not fixed (L0 -> L1 emits one shard per guard).
         let compacted = std::fs::read_dir(dir.path().join("cp")).unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains("_L"))
+            .filter(|e| e.file_name().to_string_lossy().contains("_P"))
             .count();
         prop_assert!(compacted > 0, "WAVES flushes must have driven an L0->L1 compaction");
 

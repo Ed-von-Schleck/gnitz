@@ -173,10 +173,10 @@ impl Store {
         }
     }
 
-    /// Unlink this store's checkpoint manifest, so the next open peeks `None`.
+    /// Unlink this store's checkpoint manifest, so the next open reads `None`.
     /// A detached store published none.
-    pub(crate) fn unlink_manifest(&self) -> Result<(), StorageError> {
-        match self.table() {
+    pub(crate) fn unlink_manifest(&mut self) -> Result<(), StorageError> {
+        match self.table_mut() {
             Some(t) => t.unlink_manifest(),
             None => Ok(()),
         }

@@ -8,8 +8,7 @@
 
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::ffi::{CStr, CString};
-use std::os::fd::OwnedFd;
+use std::ffi::CString;
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -113,9 +112,11 @@ pub(in crate::storage) struct FlushWork {
     /// Full paths of every file written unsynced since the last publish — prior
     /// spills plus this barrier's own folded shard.
     pub(in crate::storage) sync_paths: Vec<CString>,
-    /// The staged manifest `.tmp`, its fd open from `prepare_file` until
+    /// The staged manifest `.tmp`, its fd open from `manifest::prepare` until
     /// `flush_commit` consumes the work.
     pub(in crate::storage) manifest: StagedFile,
+    /// The staged manifest's bytes.
+    pub(in crate::storage) bytes: Vec<u8>,
 }
 
 /// Index of the first candidate in `pool` (pool order) whose payload group nets
@@ -154,8 +155,7 @@ pub(crate) struct Table {
     /// [`StoreBudgets`]'s RAM-tier ceiling (spill). The checkpoint barrier folds
     /// this tier into one durable shard for `SalReplay` tables.
     ram_tier: RunSet,
-    /// The disk tier, and the one owner of this store's schema, directory and
-    /// table id.
+    /// The disk tier, and the one owner of this store's schema and directory.
     shard_index: ShardIndex,
 
     recovery_source: RecoverySource,
@@ -183,6 +183,9 @@ pub(crate) struct Table {
     /// `full_scan` stays `&self` — a read reborrowed as `&mut` would widen its
     /// callers' aliasing obligation to "no reference at all live".
     cached_full_scan: Cell<Option<Rc<Batch>>>,
+
+    /// The manifest bytes this process's last barrier made durable here.
+    durable_manifest: Option<Vec<u8>>,
 }
 
 mod flush;
@@ -199,14 +202,13 @@ impl Table {
     pub(crate) fn new(
         dir: &str,
         schema: SchemaDescriptor,
-        table_id: u32,
         recovery_source: RecoverySource,
         budgets: StoreBudgets,
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
         // flush: this is the master's CREATE VIEW pre-flight, where a client is
-        // still waiting. The fd is dropped — a relation pins none at rest.
-        open_table_dirfd(dir)?;
+        // still waiting.
+        ensure_table_dir(dir)?;
 
         // `skip_pk_filter` is exactly "is rederived": only a `SalReplay` store is
         // point-probed by PK, so only it needs the filters its shards would
@@ -215,39 +217,37 @@ impl Table {
         let mut table = Table {
             memtable: RunSet::new(MEMTABLE_BYTES),
             ram_tier: RunSet::new(budgets.ram_tier_bytes),
-            shard_index: ShardIndex::new(table_id, dir, schema, budgets.shard, rederived),
+            shard_index: ShardIndex::new(dir, schema, budgets.shard, rederived),
             recovery_source,
             current_lsn: 1,
             resumed_from_checkpoint: false,
             held_in_ram: false,
             retract_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
+            durable_manifest: None,
         };
 
-        let path = table.manifest_full_path();
         let loaded = match recovery_source {
             // Erased at open, so it reads nothing: an I/O error on the file it is
             // about to unlink must not abort it.
             RecoverySource::Rederive { resume_at: None } => None,
             // Rebuilt from its sources, so damage is erased rather than fatal.
-            RecoverySource::Rederive { resume_at: Some(want) } => match super::manifest::read_file(&path) {
-                Ok(v) => v.filter(|(_, h)| h.checkpoint_gen == want),
+            RecoverySource::Rederive { resume_at: Some(want) } => match super::manifest::read(dir) {
+                Ok(m) => m.filter(|m| m.checkpoint_gen == want),
                 Err(e @ StorageError::Io(_)) => return Err(e),
                 Err(_) => None,
             },
             // Its shards are its only copy, so damage stops the open.
-            RecoverySource::SalReplay => super::manifest::read_file(&path)?,
+            RecoverySource::SalReplay => super::manifest::read(dir)?,
         };
 
-        if let Some((entries, header)) = &loaded {
-            table.shard_index.install_manifest(entries, header)?;
-            table.current_lsn = table.shard_index.max_lsn() + 1;
-            table.resumed_from_checkpoint = rederived;
-        } else if rederived {
-            // So a later re-open cannot re-peek what this one rejected.
+        if loaded.is_none() && rederived {
+            // So a later re-open cannot reload what this one rejected.
             table.unlink_manifest()?;
         }
-        table.shard_index.gc_orphans();
+        table.shard_index.install(loaded.as_ref())?;
+        table.current_lsn = table.shard_index.max_lsn() + 1;
+        table.resumed_from_checkpoint = rederived && loaded.is_some();
 
         Ok(table)
     }
@@ -269,12 +269,6 @@ impl Table {
     /// See [`ShardIndex::has_skeleton_shard`].
     pub(crate) fn has_skeleton_rows(&self) -> bool {
         self.shard_index.has_skeleton_shard()
-    }
-
-    /// Full path of this table's manifest — a pure function of the directory,
-    /// carrying no state worth caching.
-    fn manifest_full_path(&self) -> String {
-        super::manifest::path(&self.shard_index.output_dir)
     }
 
     /// True when this store is rebuilt from its sources at open. It is the whole
@@ -310,7 +304,8 @@ impl Table {
 
     /// Durably unlink this store's manifest, so the next `Rederive` open erases
     /// its shards instead of reloading them.
-    pub(crate) fn unlink_manifest(&self) -> Result<(), StorageError> {
+    pub(crate) fn unlink_manifest(&mut self) -> Result<(), StorageError> {
+        self.durable_manifest = None;
         super::manifest::unlink(&self.shard_index.output_dir)
     }
 
@@ -621,10 +616,10 @@ impl Table {
         self.shard_index.run_compact()
     }
 
-    /// Unlink compaction-superseded shard files, once no surviving manifest can
-    /// reference them — post-publish. Best-effort: a still-present file is
-    /// retried on the next drain.
-    pub(in crate::storage) fn drain_deletions(&mut self) {
+    /// The barrier's step once `bytes` is durable: record it, and unlink the
+    /// shards compaction superseded (best-effort; a survivor is retried).
+    pub(super) fn published_durably(&mut self, bytes: Vec<u8>) {
+        self.durable_manifest = Some(bytes);
         self.shard_index.try_cleanup();
     }
 }
@@ -646,25 +641,13 @@ fn pk_match_start(run: &Batch, key: &[u8]) -> Option<usize> {
 // OS helpers
 // ---------------------------------------------------------------------------
 
-/// Open a table's directory, creating it (and any missing parent) if absent —
-/// the one way in, and the only thing that re-creates an absent one: the shard
-/// write goes by path and `ENOENT`s instead.
-///
-/// Every opened fd gets the NOCOW hint (btrfs; ignored elsewhere), so it also
-/// covers directories the catalog's layout staging pre-created.
-pub(super) fn open_table_dirfd(dir: &str) -> Result<OwnedFd, StorageError> {
+/// Create `dir` and any missing parent, and give it the NOCOW hint (btrfs;
+/// ignored elsewhere).
+pub(super) fn ensure_table_dir(dir: &str) -> Result<(), StorageError> {
     use std::os::fd::AsRawFd;
-    let open = |c: &CStr| gnitz_foundation::posix_io::open_owned(c, libc::O_RDONLY | libc::O_DIRECTORY);
-    let dir_c = super::super::cstr(dir)?;
-    let fd = match open(&dir_c) {
-        Ok(fd) => fd,
-        Err(_) => {
-            std::fs::create_dir_all(dir)?;
-            open(&dir_c)?
-        }
-    };
-    gnitz_foundation::posix_io::try_set_nocow(fd.as_raw_fd());
-    Ok(fd)
+    std::fs::create_dir_all(dir)?;
+    gnitz_foundation::posix_io::try_set_nocow(std::fs::File::open(dir)?.as_raw_fd());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -86,7 +86,6 @@ impl RelationRegistry {
         let table = Table::new(
             &child_dir,
             schema,
-            id as u32,
             recovery,
             self.store_budgets().bounded(props.capacity_bytes()),
         )
@@ -129,7 +128,6 @@ impl RelationRegistry {
         let table = Table::new(
             &child.dir(directory),
             delta_schema,
-            id as u32,
             RecoverySource::Rederive { resume_at: None },
             budgets.delta(budget),
         )

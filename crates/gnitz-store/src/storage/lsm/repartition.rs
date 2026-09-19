@@ -66,7 +66,6 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, StoreError>
 pub(crate) fn repartition_relation(
     rel_dir: &str,
     schema: &SchemaDescriptor,
-    table_id: u32,
     launched: u32,
     ram_tier_bytes: usize,
     chunk_rows: usize,
@@ -75,14 +74,13 @@ pub(crate) fn repartition_relation(
         return Ok(());
     };
     gnitz_info!("repartition: {} from {} to {} worker(s)", rel_dir, source, launched);
-    relay(rel_dir, schema, table_id, source, launched, ram_tier_bytes, chunk_rows)
+    relay(rel_dir, schema, source, launched, ram_tier_bytes, chunk_rows)
         .map_err(|e| StoreError::storage(format!("repartition {rel_dir} to {launched} worker(s)"), e))
 }
 
 fn relay(
     rel_dir: &str,
     schema: &SchemaDescriptor,
-    table_id: u32,
     source: u32,
     launched: u32,
     ram_tier_bytes: usize,
@@ -93,7 +91,7 @@ fn relay(
     if schema.placement().is_replicated() {
         link_targets(rel_dir, source, launched)?;
     } else {
-        rewrite_targets(rel_dir, schema, table_id, source, launched, ram_tier_bytes, chunk_rows)?;
+        rewrite_targets(rel_dir, schema, source, launched, ram_tier_bytes, chunk_rows)?;
     }
     fsync_dir(rel_dir)?;
     remove_set(rel_dir, source)
@@ -107,15 +105,12 @@ fn remove_set(rel_dir: &str, of: u32) -> Result<(), StorageError> {
 /// 0's published files, which no publish rewrites in place.
 fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), StorageError> {
     let source_dir = ChildAddr::Worker { rank: 0, of: source }.dir(rel_dir);
-    let (entries, _) = manifest::read_file(&manifest::path(&source_dir))?.ok_or(StorageError::Io(libc::ENOENT))?;
+    let m = manifest::read(&source_dir)?.ok_or(StorageError::Io(libc::ENOENT))?;
     for target in cluster_children(launched) {
         let dir = target.dir(rel_dir);
-        super::table::open_table_dirfd(&dir)?;
-        for e in &entries {
-            fs::hard_link(
-                format!("{source_dir}/{}", e.filename_str()),
-                format!("{dir}/{}", e.filename_str()),
-            )?;
+        super::table::ensure_table_dir(&dir)?;
+        for e in &m.entries {
+            fs::hard_link(format!("{source_dir}/{}", e.name), format!("{dir}/{}", e.name))?;
         }
         // The shards are durable before a manifest names them.
         fsync_dir(&dir)?;
@@ -130,7 +125,6 @@ fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), Storage
 fn rewrite_targets(
     rel_dir: &str,
     schema: &SchemaDescriptor,
-    table_id: u32,
     source: u32,
     launched: u32,
     ram_tier_bytes: usize,
@@ -139,7 +133,7 @@ fn rewrite_targets(
     let budgets = StoreBudgets::new(ram_tier_bytes);
     let open = |of: u32| {
         cluster_children(of)
-            .map(|c| Table::new(&c.dir(rel_dir), *schema, table_id, RecoverySource::SalReplay, budgets))
+            .map(|c| Table::new(&c.dir(rel_dir), *schema, RecoverySource::SalReplay, budgets))
             .collect::<Result<Vec<Table>, _>>()
     };
     let sources = open(source)?;

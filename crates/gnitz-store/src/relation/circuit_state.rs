@@ -72,7 +72,7 @@ impl CircuitState {
         if create_child(&dir).map_err(|e| StoreError::storage(format!("create child store '{dir}'"), e))? {
             self.created.push(dir.clone());
         }
-        let table = Table::new(&dir, schema, view_id as u32, recovery, reg.store_budgets())
+        let table = Table::new(&dir, schema, recovery, reg.store_budgets())
             .map_err(|e| StoreError::storage(format!("open child store '{dir}'"), e))?;
         let idx = StateIdx(u16::try_from(self.tables.len()).expect("a plan holds far fewer than 65536 child stores"));
         self.tables.push(table);

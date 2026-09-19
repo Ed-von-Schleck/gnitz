@@ -87,7 +87,7 @@ impl CatalogEngine {
         // manifest at g). A *transitive* stream source needs no walk here: phase 2
         // propagates invalidity down every dependency chain. The source test comes
         // first, so it short-circuits the per-child manifest reads.
-        // An unpeekable manifest reads as a mismatch, which is the verdict a child
+        // An unreadable manifest reads as a mismatch, which is the verdict a child
         // whose manifest a previous open erased must get: its siblings may still
         // be at `g`.
         let mut invalid: FxHashSet<i64> = FxHashSet::default();

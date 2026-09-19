@@ -267,7 +267,7 @@ impl RelationRegistry {
     }
 
     /// Unlink the manifest of every store [`Self::checkpoint_ephemeral`]
-    /// publishes, so the next open peeks `None` and erases those shards instead
+    /// publishes, so the next open reads `None` and erases those shards instead
     /// of resuming them. Its inverse, over the same two collections.
     pub fn unlink_ephemeral_manifests<'s>(
         &mut self,

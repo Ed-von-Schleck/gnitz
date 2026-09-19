@@ -239,11 +239,10 @@ pub fn rs_files_under(
 /// A rederived table under `dir` at the default budgets — nothing a test puts
 /// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
 /// needs somewhere to put rows.
-pub(crate) fn scratch_table(dir: &str, schema: SchemaDescriptor, table_id: u32) -> Table {
+pub(crate) fn scratch_table(dir: &str, schema: SchemaDescriptor) -> Table {
     Table::new(
         dir,
         schema,
-        table_id,
         RecoverySource::Rederive { resume_at: None },
         StoreBudgets::default(),
     )

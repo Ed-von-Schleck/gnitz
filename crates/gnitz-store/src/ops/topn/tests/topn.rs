@@ -59,8 +59,8 @@ impl Harness {
     fn new(group_cols: &[u32], order: &[OrderKey], limit: u64, offset: u64) -> Self {
         let plan = TopNPlan::from_wire(&schema(), group_cols, order, limit, offset).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let index = scratch_table(dir.path().join("idx").to_str().unwrap(), plan.index.schema, 1);
-        let trace_out = scratch_table(dir.path().join("out").to_str().unwrap(), plan.output_schema, 2);
+        let index = scratch_table(dir.path().join("idx").to_str().unwrap(), plan.index.schema);
+        let trace_out = scratch_table(dir.path().join("out").to_str().unwrap(), plan.output_schema);
         Harness { _dir: dir, plan, index, trace_out }
     }
 

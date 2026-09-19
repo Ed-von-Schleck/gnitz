@@ -673,9 +673,10 @@ table publishes a manifest on the ingest path, so the fsynced SAL alone carries
 durability and every table's overflow lives in the RAM tier. A checkpoint
 persists the base and system tables, then, after draining pending view ticks,
 every view's operator traces and output stores under a monotonic checkpoint
-generation. It publishes **unconditionally**, even for an empty or unchanged
-store: the resume verdict and the boot relayout each decide by "every child
-carries a manifest", which a gated publish would make undecidable.
+generation. Each store's publish is skipped only when the manifest it would
+write is byte-identical to the one this process last made durable; every store
+publishes at its first checkpoint in a process, so the resume verdict and the
+boot relayout can each decide by "every child carries a manifest".
 
 At open a view is **resumed from its checkpoint when generation-valid, rebuilt
 otherwise; a secondary index resumes on its own generation check alone, outside

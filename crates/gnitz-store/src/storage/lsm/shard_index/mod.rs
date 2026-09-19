@@ -386,7 +386,6 @@ impl ShardBudget {
 }
 
 pub(super) struct ShardIndex {
-    pub(super) table_id: u32,
     pub(super) output_dir: String,
     pub schema: SchemaDescriptor,
 
@@ -416,23 +415,16 @@ pub(super) struct ShardIndex {
 }
 
 impl ShardIndex {
-    /// The 1-based level *number* of a 0-based tier index — used only by the two
-    /// serde boundaries that carry it, the shard filename and the manifest field.
+    /// The 1-based level *number* of a 0-based tier index — used only by the one
+    /// serde boundary that carries it, the manifest field.
     pub(super) fn level_num(level_idx: usize) -> usize {
         level_idx + 1
     }
 
     /// `skip_pk_filter` declares that nothing point-probes this store by PK, so
     /// its shards need no PK filter.
-    pub(super) fn new(
-        table_id: u32,
-        output_dir: &str,
-        schema: SchemaDescriptor,
-        budget: ShardBudget,
-        skip_pk_filter: bool,
-    ) -> Self {
+    pub(super) fn new(output_dir: &str, schema: SchemaDescriptor, budget: ShardBudget, skip_pk_filter: bool) -> Self {
         ShardIndex {
-            table_id,
             output_dir: output_dir.to_string(),
             schema,
             l0: Vec::new(),

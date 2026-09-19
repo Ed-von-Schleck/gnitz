@@ -259,7 +259,7 @@ impl Mirror {
             Invalidate::Cursor => Ok(()),
             Invalidate::Copy => {
                 // The reset unlinks this worker's child manifest, so the rebuilt
-                // store's `Rederive` open peeks `None` and *erases* the stale
+                // store's `Rederive` open reads `None` and *erases* the stale
                 // shards rather than reloading them, then rebuilds the handle
                 // empty. It is exactly the state transition a bootstrap needs.
                 self.registry

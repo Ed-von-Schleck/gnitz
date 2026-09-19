@@ -91,8 +91,8 @@ impl<'a> ChildAddr<'a> {
         format!("{rel_dir}/{}", self.name())
     }
 
-    /// The child's manifest — what the boot resume verdict peeks and a rebuild
-    /// unlinks.
+    /// The child's manifest path — what the boot relayout's completeness test
+    /// looks for.
     pub fn manifest(&self, rel_dir: &str) -> String {
         manifest::path(&self.dir(rel_dir))
     }
@@ -130,14 +130,12 @@ impl<'a> ChildAddr<'a> {
 }
 
 /// Every child a relation has across the whole cluster at `num_workers` — one
-/// per launched rank. The checkpoint's ephemeral round stamps exactly this set
-/// unconditionally, and [`state_child_manifests`] reads it back, so the two must
-/// be read together when either changes.
+/// per launched rank.
 pub(super) fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
     (0..num_workers).map(move |rank| ChildAddr::Worker { rank, of: num_workers })
 }
 
-/// The manifest of every child under `rel_dir` that carries the relation's
+/// The directory of every child under `rel_dir` that carries the relation's
 /// checkpointed state at `num_workers`: each launched rank's output store, and
 /// every operator-scratch child. Those are what the ephemeral checkpoint round
 /// publishes, and the boot resume verdict accepts a view only when all of them
@@ -147,14 +145,14 @@ pub(super) fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAd
 /// child is in no checkpoint round (it is erased at open), and an `Index` child
 /// cannot appear here at all — `CREATE INDEX` is gated on a base table, and only
 /// views reach the resume verdict.
-pub(crate) fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Result<Vec<String>, StorageError> {
+pub(crate) fn state_child_dirs(rel_dir: &str, num_workers: u32) -> Result<Vec<String>, StorageError> {
     let scratch = subdir_names(rel_dir)?;
     let scratch = scratch
         .iter()
         .filter(|n| matches!(ChildAddr::parse(n), Some(ChildAddr::Scratch { .. })))
-        .map(|n| manifest::path(&format!("{rel_dir}/{n}")));
+        .map(|n| format!("{rel_dir}/{n}"));
     Ok(cluster_children(num_workers)
-        .map(|c| c.manifest(rel_dir))
+        .map(|c| c.dir(rel_dir))
         .chain(scratch)
         .collect())
 }
@@ -162,10 +160,9 @@ pub(crate) fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Result<V
 /// Whether every state child of `rel_dir` carries a manifest at `generation`.
 /// Any I/O failure answers `false`, which only costs a rebuild.
 pub(crate) fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64) -> bool {
-    state_child_manifests(rel_dir, num_workers).is_ok_and(|manifests| {
-        manifests
-            .iter()
-            .all(|m| manifest::at_generation(m, generation).unwrap_or(false))
+    state_child_dirs(rel_dir, num_workers).is_ok_and(|dirs| {
+        dirs.iter()
+            .all(|d| matches!(manifest::read(d), Ok(Some(m)) if m.checkpoint_gen == generation))
     })
 }
 
@@ -194,7 +191,7 @@ fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
 
 /// Create a child directory, answering whether **this call** created it. A child
 /// that was already there carries checkpointed state, whose loss
-/// [`state_child_manifests`] cannot see: it enumerates the scratch children, so
+/// [`state_child_dirs`] cannot see: it enumerates the scratch children, so
 /// the survivors alone answer the resume verdict.
 #[must_use = "only a child this call created may be removed again"]
 pub(crate) fn create_child(dir: &str) -> Result<bool, StorageError> {

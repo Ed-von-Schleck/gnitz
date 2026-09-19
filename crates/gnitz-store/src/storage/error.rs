@@ -27,8 +27,6 @@ pub enum StorageError {
     InvalidVersion,
     /// xxh3 checksum did not match the stored value.
     ChecksumMismatch,
-    /// Output buffer was too small to hold the encoded form.
-    BufferTooSmall,
     /// Shard directory entry / encoding byte / region offset failed validation.
     InvalidShard,
     /// CString conversion failed (path contained an interior NUL).
@@ -53,7 +51,6 @@ impl fmt::Display for StorageError {
             StorageError::InvalidMagic => f.write_str("invalid magic"),
             StorageError::InvalidVersion => f.write_str("invalid version"),
             StorageError::ChecksumMismatch => f.write_str("checksum mismatch"),
-            StorageError::BufferTooSmall => f.write_str("buffer too small"),
             StorageError::InvalidShard => f.write_str("invalid shard layout"),
             StorageError::InvalidPath => f.write_str("invalid path"),
         }

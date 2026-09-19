@@ -65,13 +65,11 @@ fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec
         .collect()
 }
 
-/// Where one compaction's outputs go: the four values `naming::compact_shard_name`
-/// needs, plus whether the store they belong to is ever point-probed by PK. They
+/// Where one compaction's outputs go: the directory and the sequence value
+/// `naming::compact_shard_name` needs, plus whether the store they belong to is ever point-probed by PK. They
 /// travel together and are decided together, by `ShardIndex::compact_into`.
 pub(super) struct Output<'a> {
     pub dir: &'a str,
-    pub table_id: u32,
-    pub level_num: usize,
     pub compact_seq: u64,
     pub skip_pk_filter: bool,
 }
@@ -151,7 +149,7 @@ pub(super) fn merge_and_route(
         let path = format!(
             "{}/{}",
             dest.dir,
-            super::naming::compact_shard_name(dest.table_id, dest.compact_seq, dest.level_num, g)
+            super::naming::compact_shard_name(dest.compact_seq, g)
         );
         // A skeleton guard writes its folded rows under the PK-only schema; a
         // hydrated one writes the bucket at full width. The writer's schema drives

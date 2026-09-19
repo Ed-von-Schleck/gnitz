@@ -95,7 +95,6 @@ impl RelationRegistry {
                 crate::storage::repartition_relation(
                     entry.directory(),
                     &entry.schema(),
-                    entry.id() as u32,
                     self.slot.of,
                     self.config.ram_tier_bytes,
                     self.config.scan_chunk_rows,
@@ -114,22 +113,22 @@ impl RelationRegistry {
     /// well-formed state, before an invalid view is rebuilt. The caller drops the
     /// cached plan.
     ///
-    /// The manifest is unlinked first so the rebuild's `Rederive` open peeks
+    /// The manifest is unlinked first so the rebuild's `Rederive` open reads
     /// `None` and *erases* the stale shards — without which a transitively-invalid
     /// view whose own manifests are still at the resume generation would reload
     /// them.
     pub fn reset_view(&mut self, vid: i64) -> Result<(), StoreError> {
-        let entry = self.relation_or_err(vid).map_err(|e| e.in_context("reset_view"))?;
+        let entry = self.relation_mut_or_err(vid).map_err(|e| e.in_context("reset_view"))?;
         let dir = entry.directory().to_string();
         entry
-            .store()
+            .store
             .unlink_manifest()
             .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
 
         let rank = self.slot.rank;
 
         // Rebuild empty. `Table::new` erases the stale shards (manifest now
-        // absent → `Rederive` peek `None`).
+        // absent → `Rederive` reads `None`).
         self.rebuild_relation_store(vid, "reset view output")?;
 
         // Remove this worker's per-view operator scratch dirs (rank-stamped).

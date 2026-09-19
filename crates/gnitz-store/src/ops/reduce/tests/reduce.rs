@@ -97,7 +97,7 @@ impl Avi {
         // position `j` in that subset exactly as production has it.
         let bake = make_bake(in_schema, group_cols, agg_descs);
         let dir = tempfile::tempdir().unwrap();
-        let mut table = scratch_table(dir.path().to_str().unwrap(), bake.schema, 0);
+        let mut table = scratch_table(dir.path().to_str().unwrap(), bake.schema);
         for b in history {
             use super::avi::avi_batch;
             table.ingest_owned_batch(avi_batch(b, &bake)).unwrap();
@@ -3964,7 +3964,7 @@ fn avi_read_extreme(
     // The aggregate's type is the source column's type.
     let avi_schema = avi_schema(in_schema, group_by);
     let tmp = tempfile::tempdir().unwrap();
-    let mut avi_t = scratch_table(tmp.path().to_str().unwrap(), avi_schema, 0);
+    let mut avi_t = scratch_table(tmp.path().to_str().unwrap(), avi_schema);
     let agg = AggDescriptor {
         col_idx,
         agg_op: if for_max { AggFunc::Max } else { AggFunc::Min },
@@ -5516,7 +5516,7 @@ fn build_combined_avi(
     deltas: &[&Batch],
 ) -> crate::storage::Table {
     let avi_schema = avi_schema(in_schema, group_cols);
-    let mut t = scratch_table(dir.to_str().unwrap(), avi_schema, 0);
+    let mut t = scratch_table(dir.to_str().unwrap(), avi_schema);
     let bake = make_bake(in_schema, group_cols, agg_descs);
     for d in deltas {
         use super::avi::avi_batch;
@@ -6104,7 +6104,7 @@ fn run_reduce_trace_epochs(
 ) -> (std::rc::Rc<Batch>, usize) {
     // A fresh tempdir per call isolates shard files, so a constant table_id is
     // collision-free.
-    let mut trace = scratch_table(dir.to_str().unwrap(), *out_schema, 0);
+    let mut trace = scratch_table(dir.to_str().unwrap(), *out_schema);
     let mut max_sources = 0usize;
     for (i, d) in epochs.iter().enumerate() {
         // Sources the cursor for THIS epoch's probe sees: memtable runs + folded
@@ -6441,9 +6441,9 @@ fn run_minmax_epochs(
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
-    let mut trace_out = scratch_table(dir, *out_schema, 0);
+    let mut trace_out = scratch_table(dir, *out_schema);
     let avi_schema = avi_schema(in_schema, group_by);
-    let mut avi_t = scratch_table(dir, avi_schema, 2);
+    let mut avi_t = scratch_table(dir, avi_schema);
 
     let avi_bake = make_bake(in_schema, group_by, aggs);
     let mut states = Vec::with_capacity(epochs.len());
