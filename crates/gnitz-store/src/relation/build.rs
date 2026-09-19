@@ -3,6 +3,8 @@
 //! whether a delta store is opened.
 
 use super::*;
+use crate::schema::Placement;
+use crate::storage::remove_child;
 use gnitz_foundation::fault::Seam;
 
 /// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
@@ -89,6 +91,17 @@ impl RelationRegistry {
             self.store_budgets().bounded(props.capacity_bytes()),
         )
         .map_err(|e| StoreError::storage(format!("open relation {id} (dir={directory})"), e))?;
+        let serves_feed = !schema.placement().is_replicated() || self.slot.rank == Placement::REPLICA_OWNER;
+        let delta = match delta {
+            Some(d) if serves_feed => Some(d),
+            Some(_) => {
+                // So a rank that serves no feed leaves no delta store behind.
+                remove_child(&ChildAddr::delta(self.slot).dir(directory))
+                    .map_err(|e| StoreError::storage(format!("remove unserved delta store of view {id}"), e))?;
+                None
+            }
+            None => None,
+        };
         Ok((
             Store::owned(Box::new(table), schema),
             delta

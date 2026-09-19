@@ -376,3 +376,38 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
         sub.assert_converged("after the restart's bootstrap")
         _churn(client, sn, 121, 240)
         sub.assert_converged("after post-restart churn")
+
+
+@NEEDS_MULTI
+def test_a_replicated_feed_lives_on_worker_zero_alone(own_server):
+    """A replicated view's feed is served by worker 0, so worker 0 is the only
+    rank that opens a delta store for it. Asserted on the directories: the feed
+    itself is per-worker and every other rank's store would be written and never
+    read.
+
+    A view over only replicated sources is itself replicated, which is what makes
+    this a feed over a replicated placement rather than over a partitioned one.
+    """
+    own_server.start()
+    with gnitz.connect(own_server.sock_path) as client:
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        client.execute_sql(
+            "CREATE TABLE r (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
+            "WITH (replicated = true)",
+            schema_name=sn,
+        )
+        _mk_feed(client, sn, "f", "SELECT id, v FROM r WHERE v > 10")
+        sub = Subscriber(client, sn, "f")
+        sub.bootstrap()
+        for i in range(1, 40):
+            client.execute_sql(f"INSERT INTO r VALUES ({i}, {i * 10})", schema_name=sn)
+        sub.assert_converged("over a replicated source")
+        # The bootstrap ran before the inserts, so every row in the copy reached
+        # it as a retained round through the one rank that serves the feed.
+        assert sub.copy, "the feed carried the rounds the churn produced"
+        vid = sub.vid
+
+    view_dir = os.path.join(own_server.data_dir, "_relations", f"v_{vid}")
+    feeds = sorted(d for d in os.listdir(view_dir) if d.startswith("delta_w"))
+    assert feeds == ["delta_w0"], f"only worker 0 serves this feed, found {feeds}"

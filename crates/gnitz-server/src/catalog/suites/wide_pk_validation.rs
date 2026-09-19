@@ -49,7 +49,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
         .registry_mut()
         .ingest(tid, wide_val_batch(&schema, base_rows))
         .unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 }
 
 // ── index_circuit_for_col existence + uniqueness lookup ────────────────
@@ -112,7 +112,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
         })
         .unwrap();
     engine.registry_mut().ingest(parent_tid, pb).unwrap();
-    engine.registry_mut().flush(parent_tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // A point read resolves the committed parent row by full PK bytes.
     let seen = pk_group(&mut engine, parent_tid, &parent_pk);
@@ -147,7 +147,7 @@ fn native_and_byte_point_reads_agree_narrow() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Retract key 2 so it is present-but-dead.
     let mut del = BatchBuilder::new(schema);
@@ -155,7 +155,7 @@ fn native_and_byte_point_reads_agree_narrow() {
     del.put_u64(20);
     del.end_row();
     engine.ingest_to_family(tid, &del.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.
     for key in [1u64, 2, 3, 99] {

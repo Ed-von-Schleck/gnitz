@@ -109,7 +109,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         bb.put_u64(70);
         bb.end_row();
         engine.ingest_to_family(tid, &bb.finish()).unwrap();
-        engine.registry_mut().flush(tid).unwrap();
+        engine.registry_mut().checkpoint_base().unwrap();
 
         let pair = table_rename_pair(&engine, tid, "renamed");
         engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();

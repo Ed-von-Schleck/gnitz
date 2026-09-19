@@ -670,11 +670,9 @@ impl CatalogEngine {
     /// The shared IDX_TAB registration guard: a base-table owner, returned for
     /// the callers' schema/context reads.
     ///
-    /// Only base tables can own a secondary index: index projection runs on the
-    /// base-table DML paths (`ingest_store_and_indices`) alone, and view deltas
-    /// land via the circuit-evaluation terminal-view moves, which never project
-    /// into a secondary index. The SQL binder rejects this by name resolution;
-    /// this rejects a raw wire push before the row is persisted or broadcast.
+    /// Only base tables can own a secondary index. The SQL binder rejects this
+    /// by name resolution; this rejects a raw wire push before the row is
+    /// persisted or broadcast.
     pub(in crate::catalog) fn validate_index_registration(
         &self,
         owner_id: i64,

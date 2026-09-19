@@ -52,8 +52,8 @@ impl RelationRegistry {
         // master writes `_sys/` shards.
         if residency == Residency::Worker {
             for entry in self.tables.values_mut() {
-                if let (RelationKind::SystemCatalog, Some(t)) = (entry.kind(), entry.store.table_mut()) {
-                    t.hold_in_ram();
+                if entry.kind() == RelationKind::SystemCatalog {
+                    entry.store.hold_in_ram();
                 }
             }
         }
@@ -66,10 +66,7 @@ impl RelationRegistry {
     /// declaring a feed it has no store for.
     pub(crate) fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), StoreError> {
         let (dir, schema, kind, props) = {
-            let e = self
-                .tables
-                .get(&tid)
-                .ok_or_else(|| StoreError::rejected(format!("{what}: relation {tid} is not registered")))?;
+            let e = self.relation_or_err(tid).map_err(|e| e.in_context(what))?;
             (e.directory().to_string(), e.schema(), e.kind(), e.props())
         };
         let stores = self
@@ -122,15 +119,12 @@ impl RelationRegistry {
     /// view whose own manifests are still at the resume generation would reload
     /// them.
     pub fn reset_view(&mut self, vid: i64) -> Result<(), StoreError> {
-        let entry = self
-            .tables
-            .get(&vid)
-            .ok_or_else(|| StoreError::rejected(format!("reset_view: relation {vid} is not registered")))?;
+        let entry = self.relation_or_err(vid).map_err(|e| e.in_context("reset_view"))?;
         let dir = entry.directory().to_string();
-        if let Some(t) = entry.store().table() {
-            t.unlink_manifest()
-                .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
-        }
+        entry
+            .store()
+            .unlink_manifest()
+            .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
 
         let rank = self.slot.rank;
 

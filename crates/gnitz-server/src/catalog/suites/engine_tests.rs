@@ -22,7 +22,7 @@ fn test_enforce_unique_pk() {
         bb.finish()
     };
     let live = |engine: &mut CatalogEngine| -> usize {
-        engine.registry_mut().flush(tid).unwrap();
+        engine.registry_mut().checkpoint_base().unwrap();
         engine.scan(tid).unwrap().len()
     };
 
@@ -97,7 +97,7 @@ fn test_orphaned_metadata_recovery() {
                 ),
             )
             .unwrap();
-        let _ = engine.registry.flush(SysFamily::Index.id());
+        let _ = engine.registry.checkpoint_system();
         engine.close();
     }
 
@@ -180,7 +180,7 @@ fn test_user_sequence_durable_roundtrip() {
         assert_eq!(base, 1);
         engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
         assert_eq!(engine.sequence_value(user_seq), Some(64));
-        let _ = engine.registry.flush(SysFamily::Sequence.id());
+        let _ = engine.registry.checkpoint_system();
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -293,8 +293,8 @@ fn test_sequence_gap_recovery() {
         write_col_tab_row(&mut cbb, &col_def("id", type_code::U64).col_tab_row(250, 0), 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
-        let _ = engine.registry.flush(SysFamily::Table.id());
-        let _ = engine.registry.flush(SysFamily::Column.id());
+        let _ = engine.registry.checkpoint_system();
+        let _ = engine.registry.checkpoint_system();
         engine.close();
     }
 
@@ -331,7 +331,7 @@ fn test_ingest_scan_seek_family() {
     bb.put_u64(300);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Scan
     let scan_batch = engine.scan(tid).unwrap();
@@ -387,7 +387,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
     let mut bb = BatchBuilder::new(schema);
@@ -395,7 +395,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(200);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Scan — should have exactly 1 row with val=200
     let scan = engine.scan(tid).unwrap();

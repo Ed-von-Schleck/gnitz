@@ -69,13 +69,16 @@ impl CatalogEngine {
     }
 
     /// Ingest one delta into its family's store and fire its hooks.
-    fn apply_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
+    fn apply_family(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
         let id = family.id();
-        self.registry
-            .ingest(id, batch.clone())
+        let mut applied = self
+            .registry
+            .ingest_returning(id, batch)
             .map_err(|e| format!("sys-table ingest failed (family={id}): {e}"))?;
-        batch.set_schema(family.schema());
-        self.fire_hooks(family, &batch)
+        // The hooks read the rows through the catalog's descriptor, not the
+        // descriptor the delta arrived under.
+        applied.set_schema(family.schema());
+        self.fire_hooks(family, &applied)
     }
 
     /// Apply one DdlSync group — a worker's broadcast or the master's pre-fork SAL

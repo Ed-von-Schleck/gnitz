@@ -57,9 +57,7 @@ fn cut<'a>(
 /// arrived. Arrival order survives either way — sorting first would turn
 /// intra-batch last-insert-wins into sorted-last-wins.
 pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut batch: Batch) -> Batch {
-    // Empty-batch guard: empty batches reach the engine via the
-    // `CatalogStore` ingest wrappers, which — unlike the worker loop — do
-    // not pre-filter `count == 0`.
+    // Empty-batch guard: nothing above filters `count == 0` before the PK rule.
     if batch.count == 0 {
         return batch;
     }

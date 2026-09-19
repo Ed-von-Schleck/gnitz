@@ -434,7 +434,7 @@ impl IndexKeySpec {
     /// payload. Built from the promoters [`Self::write_span`] encodes through, so
     /// the schema's leading-key width *is* [`Self::key_size`]. `None` only on the
     /// limits [`Self::new`] has already checked.
-    pub fn output_schema(&self, source: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> Option<SchemaDescriptor> {
         let mut b = DerivedSchema::new();
         for c in &self.cols[..self.n as usize] {
             b.push_pk(c.out)?;

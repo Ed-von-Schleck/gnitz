@@ -907,9 +907,19 @@ impl Eq for SchemaDescriptor {}
 /// `gnitz-core` client or a crafted persisted row replayed at boot, neither of
 /// which goes through the SQL planner's pre-check.
 pub fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
-    IndexKeySpec::new(source_cols, source)?
+    index_spec_and_schema(source_cols, source).map(|(_, schema)| schema)
+}
+
+/// [`make_index_schema`] keeping the [`IndexKeySpec`] it derives the schema from.
+pub fn index_spec_and_schema(
+    source_cols: &[u32],
+    source: &SchemaDescriptor,
+) -> Result<(IndexKeySpec, SchemaDescriptor), String> {
+    let spec = IndexKeySpec::new(source_cols, source)?;
+    let schema = spec
         .output_schema(source)
-        .ok_or_else(|| "Index: composite key is not a valid primary key".to_string())
+        .ok_or_else(|| "Index: composite key is not a valid primary key".to_string())?;
+    Ok((spec, schema))
 }
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema block. Every wire rule —
@@ -928,8 +938,8 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str
 }
 
 /// The delta store's stamp column: the `_tick` round number, leading the delta
-/// schema's PK. Named here so the stamp/strip pair below reads its width off the
-/// column rather than repeating the literal at each offset.
+/// schema's PK. Named so its width is read off the column rather than written as
+/// a literal at each offset.
 pub(crate) const DELTA_TICK_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
 // `stamped_with_pk_prefix` writes the stamp as a `u64`'s big-endian image, which
 // is this column's OPK image only at this width.

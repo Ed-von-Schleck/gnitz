@@ -593,9 +593,19 @@ impl WorkerProcess {
                 "a Push group named system table_id={target_id}; a system family arrives as DdlSync"
             ));
         }
+        // A view is the other non-ingestion-point, and the master already
+        // rejects one client-facing.
+        let kind = self.cat().registry().relation_or_err(target_id)?.kind();
+        if !kind.is_ingestion_point() {
+            return Err(format!(
+                "a Push group named relation {target_id}, which is a {}; \
+                 a push targets a base table or a stream",
+                kind.noun()
+            ));
+        }
         // A storage fault leaves an ACKed push unapplied. Only a restart replays
         // it; a fault reply would let the next checkpoint discard it.
-        let effective = match self.cat().registry_mut().ingest_returning_effective(target_id, batch) {
+        let effective = match self.cat().registry_mut().ingest_returning(target_id, batch) {
             Ok(b) => b,
             // An ingest never produces `DeltaExpired`; the or-pattern is what
             // keeps the match total without a third arm.
@@ -768,10 +778,7 @@ impl WorkerProcess {
         // the key spec is built from the owner schema + column list — the same
         // inputs the master builds from, so the reply frame layout agrees. It
         // also bounds-checks the columns: a protocol mismatch, not a user error.
-        let spec = gnitz_store::schema::IndexKeySpec::new(col_indices, &schema)?;
-        let idx_schema = spec
-            .output_schema(&schema)
-            .ok_or_else(|| "Index: composite key is not a valid primary key".to_string())?;
+        let (spec, idx_schema) = gnitz_store::schema::index_spec_and_schema(col_indices, &schema)?;
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         let stride = spec.key_size();

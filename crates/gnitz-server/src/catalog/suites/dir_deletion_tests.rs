@@ -96,7 +96,7 @@ fn gc_reclaims_orphan_table_dir() {
     bb.put_u64(10);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
     let live_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     assert!(Path::new(&live_dir).exists());
 
@@ -196,7 +196,7 @@ fn gc_leaves_live_entities_untouched() {
     bb.put_u64(7);
     bb.end_row();
     engine.ingest_to_family(t1, &bb.finish()).unwrap();
-    engine.registry_mut().flush(t1).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
     let i1 = engine.create_index("public.flushed", &["val"], false).unwrap();
 
     let t2 = engine.create_table("public.empty", &cols, &[0]).unwrap();
@@ -276,7 +276,7 @@ fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i6
     bb.end_row();
     engine.ingest_to_family(rt, &bb.finish()).unwrap();
     if flush {
-        engine.registry_mut().flush(rt).unwrap();
+        engine.registry_mut().checkpoint_base().unwrap();
     }
     (rt, rel_dir)
 }

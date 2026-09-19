@@ -1,10 +1,10 @@
 //! `Store` — one store this process may hold, and the schema it is read in.
-//! Every store the registry holds is one of these, so no owner and no caller
-//! names a residency.
+//! Every question about one is answered here for the detached case too, so no
+//! caller decides what a process holding no store answers.
 
 use crate::schema::key::{leading_u64, PkBuf};
 use crate::schema::{IndexKeySpec, SchemaDescriptor};
-use crate::storage::{Batch, ReadCursor, StorageError, Table};
+use crate::storage::{Batch, ReadCursor, RecoverySource, StorageError, StoredRow, Table};
 
 /// One store this process may hold, and the schema it is read in. A stream has
 /// one nowhere and the master opens no user store; both read empty and
@@ -47,12 +47,13 @@ impl Store {
     }
 
     /// This process's `Table`, or `None` when it holds none.
-    pub(crate) fn table(&self) -> Option<&Table> {
+    fn table(&self) -> Option<&Table> {
         self.table.as_deref()
     }
 
-    /// [`Self::table`] as `&mut`.
-    pub(crate) fn table_mut(&mut self) -> Option<&mut Table> {
+    /// [`Self::table`] as `&mut`, for a caller that needs the `Table` itself
+    /// rather than a verb here.
+    pub(in crate::relation) fn table_mut(&mut self) -> Option<&mut Table> {
         self.table.as_deref_mut()
     }
 
@@ -120,6 +121,8 @@ impl Store {
     }
 
     /// Ingest a `Batch` by move — no copy, and the caller does not keep it.
+    /// `#[inline]` for [`Table::ingest_owned_batch`]'s reason.
+    #[inline]
     pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         match self.table_mut() {
             Some(t) => t.ingest_owned_batch(batch),
@@ -144,10 +147,37 @@ impl Store {
         }
     }
 
-    /// Dispatched flush.
-    pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
-        match self.table_mut() {
-            Some(t) => t.flush(),
+    /// Whether a live row carries this OPK key; a detached store holds no key.
+    pub(crate) fn has_pk_bytes(&self, key: &[u8]) -> bool {
+        self.table().is_some_and(|t| t.has_pk_bytes(key))
+    }
+
+    /// The net weight at `key` and the live row if there is one; a detached
+    /// store has neither.
+    pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
+        self.table().map_or((0, None), |t| t.live_row_at(key))
+    }
+
+    /// The policy this store was opened under, frozen at that open. A detached
+    /// store rederives: it publishes nothing a later open could resume from.
+    pub(crate) fn recovery_source(&self) -> RecoverySource {
+        self.table()
+            .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source)
+    }
+
+    /// Keep this store's shards in RAM, publishing none. A detached store holds
+    /// nothing to keep.
+    pub(crate) fn hold_in_ram(&mut self) {
+        if let Some(t) = self.table_mut() {
+            t.hold_in_ram();
+        }
+    }
+
+    /// Unlink this store's checkpoint manifest, so the next open peeks `None`.
+    /// A detached store published none.
+    pub(crate) fn unlink_manifest(&self) -> Result<(), StorageError> {
+        match self.table() {
+            Some(t) => t.unlink_manifest(),
             None => Ok(()),
         }
     }

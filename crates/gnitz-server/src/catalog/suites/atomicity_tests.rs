@@ -419,7 +419,7 @@ fn test_create_index_backfill_fail_no_dir_leak_internal() {
     bb.put_u64(42u64);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Capture the expected index directory before create_index allocates the id.
     let expected_idx_id = engine.next_id;

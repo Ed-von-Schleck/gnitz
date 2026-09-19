@@ -113,14 +113,14 @@ fn ephemeral_flush_includes_index_circuits() {
 
     // Put one row in the index table's memtable.
     {
-        let ic = registry.relation_mut(70).and_then(|r| r.index_on_mut(&[1])).unwrap();
-        let index_schema = ic.schema();
-        let mut batch = Batch::with_capacity(&index_schema, 1);
+        let mut batch = Batch::with_capacity(&parent_schema, 1);
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &7u64.to_le_bytes());
         batch.count += 1;
-        ic.ingest_owned_batch(batch).unwrap();
+        let ic = registry.relation_mut(70).and_then(|r| r.index_on_mut(&[1])).unwrap();
+        assert!(ic.project_and_ingest(&batch).unwrap(), "the projection is not empty");
     }
 
     registry.set_resume_generation(1);
@@ -193,11 +193,9 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     assert_eq!(rounds, vec![(4, 1), (5, -1)], "each round keeps its own weight");
 }
 
-// A storage error while applying committed data in `ingest_store_and_indices`
-// is returned rather than swallowed; the process that owns the recovery
-// decision makes it (for a server, restart + SAL replay, asserted beside its
-// own call site and end-to-end by `test_ingest_apply_error_aborts_and_replays`).
-// Driven via the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam.
+// A storage error while applying committed data is returned rather than
+// swallowed, so the process that owns the recovery decision is the one that
+// makes it. Driven via the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam.
 #[test]
 fn test_ingest_apply_error_is_returned() {
     let out = crate::test_support::run_test_in_child(
@@ -243,7 +241,7 @@ fn ingest_apply_error_returned_internal() {
                 ..
             })
         ),
-        "ingest_store_and_indices must return the storage error when the seam is armed",
+        "the ingest must return the storage error when the seam is armed",
     );
     println!("{}", crate::test_support::CHILD_OK);
 }

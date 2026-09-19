@@ -275,7 +275,7 @@ pub fn decode_client_frame(
     control: DecodedControl,
     hint: Option<&SchemaDescriptor>,
 ) -> Result<DecodedWire, &'static str> {
-    let (schema, data_batch) = decode_frame(data, &control, hint, Batch::decode_foreign_wal_block)?;
+    let (schema, data_batch) = decode_frame(data, &control, hint, |b, s| Batch::decode_foreign_wal_block(b, s, s))?;
     Ok(DecodedWire { control, schema, data_batch })
 }
 

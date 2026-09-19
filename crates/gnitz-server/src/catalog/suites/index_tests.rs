@@ -22,7 +22,7 @@ fn test_index_creation_and_backfill() {
     }
     let batch = bb.finish();
     engine.ingest_to_family(tid, &batch).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Create index
     let _idx_id = engine.create_index("public.tfanout", &["val"], false).unwrap();
@@ -55,7 +55,7 @@ fn test_index_live_fanout() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Create index — should backfill 5 rows
     engine.create_index("public.tfanout", &["val"], false).unwrap();
@@ -66,7 +66,7 @@ fn test_index_live_fanout() {
     bb2.put_u64(777);
     bb2.end_row();
     engine.ingest_to_family(tid, &bb2.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Verify index has 6 entries via DagEngine's index circuit
     let entry = engine.registry().relation_or_err(tid).unwrap();
@@ -132,7 +132,7 @@ fn test_index_registration_failure_no_broadcast_poisoning_internal() {
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Clear broadcasts accumulated by table/column creation + ingest.
     let _ = engine.drain_pending_broadcasts();
@@ -189,7 +189,7 @@ fn test_seek_by_index_found() {
     bb.put_u64(300);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Seek by index: val=200 → should find PK=20
     let result = seek_by_index(&mut engine, tid, &[1], &[200u128]).unwrap().0;
@@ -216,7 +216,7 @@ fn test_seek_by_index_not_found() {
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Seek by index: val=999 → should return None
     let result = seek_by_index(&mut engine, tid, &[1], &[999u128]).unwrap().0;
@@ -251,7 +251,7 @@ fn test_seek_by_index_negative_i64() {
     bb.put_u64(10);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // The seek key is the value's native bit pattern (2's complement); the index
     // stores it order-preserving (signed I64 OPK) and the seek re-encodes
@@ -298,7 +298,7 @@ fn test_seek_by_index_negative_i32() {
     bb.put_int(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // The seek key is the I32 value's zero-extended native bit pattern; projection
     // and seek both sign-extend it from I32 into the promoted signed I64 index
@@ -342,7 +342,7 @@ fn test_seek_by_index_u8_column() {
     bb.put_int(99);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let result = seek_by_index(&mut engine, tid, &[1], &[42u128]).unwrap().0;
     assert!(result.is_some(), "U8 index lookup must find the row");
@@ -373,7 +373,7 @@ fn test_seek_by_index_u16_column() {
     bb.put_int(443);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let result = seek_by_index(&mut engine, tid, &[1], &[443u128]).unwrap().0;
     assert!(result.is_some(), "U16 index lookup must find the row");
@@ -597,7 +597,7 @@ fn test_compound_pk_secondary_index_seek() {
     }
     let b = bb.finish();
     engine.ingest_to_family(tid, &b).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // val=100 → exactly one match
     let r = seek_by_index(&mut engine, tid, &[2], &[100u128]).unwrap().0;
@@ -636,7 +636,7 @@ fn test_compound_pk_secondary_index_retract() {
     bb.end_row();
     let b = bb.finish();
     engine.ingest_to_family(tid, &b).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     assert!(seek_by_index(&mut engine, tid, &[2], &[500u128]).unwrap().0.is_some());
 
@@ -647,7 +647,7 @@ fn test_compound_pk_secondary_index_retract() {
     rb.end_row();
     let r = rb.finish();
     engine.ingest_to_family(tid, &r).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     assert!(
         seek_by_index(&mut engine, tid, &[2], &[500u128]).unwrap().0.is_none(),
@@ -687,7 +687,7 @@ fn test_failed_index_registration_rolls_back_cleanly_internal() {
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let idx_name = make_secondary_index_name("public", "t", "val");
     // The id `create_index` is about to allocate.
@@ -772,7 +772,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
         .expect("index circuit on col 1")
         .ingest_owned_batch(b)
         .unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // The indexed value resolves to an orphan whose source row is missing.
     // Must return None and, crucially, must not hang.
@@ -964,7 +964,7 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     bb.put_u64(20);
     bb.end_row();
     engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(child_tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     engine.create_index("public.child", &["refc"], true).unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
@@ -1000,7 +1000,7 @@ fn test_failed_create_index_leaves_no_directory_internal() {
     bb.put_u64(9);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     // The id `create_index` is about to allocate.
@@ -1105,7 +1105,7 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     engine.registry_mut().set_scan_chunk_rows(3);
     engine.create_index("public.t", &["val"], true).unwrap();
@@ -1151,7 +1151,7 @@ fn test_composite_index_full_key_seek() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Full-key seek (a=1, b=200) → PK 20 only. cols a=1, b=2.
     let r = seek_by_index(&mut engine, tid, &[1, 2], &[1u128, 200u128]).unwrap().0;
@@ -1194,7 +1194,7 @@ fn test_composite_index_leading_prefix_seek() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Leading-prefix seek over (a, b) supplying only a=1 (K=1 < N=2) must match
     // every row with a=1 (PKs 10 and 20), regardless of b.
@@ -1238,7 +1238,7 @@ fn test_composite_index_signed_unsigned_u128_mix() {
     bb.put_int(big);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // i32(-5) is its zero-extended u32 bit pattern as the native key.
     let r = seek_by_index(&mut engine, tid, &[1, 2, 3], &[(-5i32) as u32 as u128, 7u128, big])
@@ -1277,7 +1277,7 @@ fn test_composite_index_null_in_any_key_skipped() {
     bb.put_u64(200);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Leading-prefix seek a=1 must find only PK 20 (PK 10 has NULL b → not indexed).
     let r = seek_by_index(&mut engine, tid, &[1, 2], &[1u128]).unwrap().0;
@@ -1798,7 +1798,7 @@ fn test_seek_by_index_range_unsigned_pure_range() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32];
     // x > 10  → {20,30} = PKs {3,4}
@@ -1841,7 +1841,7 @@ fn test_seek_by_index_range_signed_between() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let pk = |v: i32| (v as u32) as u128;
     let c = &[1u32];
@@ -1889,7 +1889,7 @@ fn test_seek_by_index_range_composite_eq_prefix() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32, 2u32]; // index (a, b)
                            // a = 7 AND b < 50 → {(7,10),(7,49)} = PKs {1,2}; (8,0) is absent (the end
@@ -1925,7 +1925,7 @@ fn test_seek_by_index_range_open_ended() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32];
     // x > 2 (unbounded above) → {3,4}
@@ -1966,7 +1966,7 @@ fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
     bb.put_u64(30);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32];
     // x > 10: After(10) cuts past the whole duplicate group — including the
@@ -2001,7 +2001,7 @@ fn test_seek_by_index_range_retraction() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Retract PK 2 (x=15) → net weight 0; it must vanish from the range scan
     // (no ghost entry) at both the index and the source resolve.
@@ -2011,7 +2011,7 @@ fn test_seek_by_index_range_retraction() {
     rb.put_u64(15);
     rb.end_row();
     engine.ingest_to_family(tid, &rb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32];
     // x > 0 → {5,25} = PKs {1,3}; PK 2 (retracted x=15) absent.
@@ -2042,7 +2042,7 @@ fn test_seek_by_index_range_null_excluded() {
     bb.put_u64(15);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32];
     // The I64 type-edge cuts (the range column is I64 here, not U64).
@@ -2098,7 +2098,7 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32];
     let max = u64::MAX as u128;
@@ -2133,7 +2133,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32];
     // x <= u64::MAX → every indexed row, the MAX row included.
@@ -2170,7 +2170,7 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let c = &[1u32, 2u32]; // index (a, b)
     let max = u64::MAX as u128;
@@ -2240,7 +2240,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // x ∈ [10, 20] → all six rows, each at weight 1.
     let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
@@ -2258,7 +2258,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     rb.put_u64(10);
     rb.end_row();
     engine.ingest_to_family(tid, &rb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], Before(10), After(20)))
         .unwrap()
@@ -2306,7 +2306,7 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // Prefix seek a=7 → PKs {1,2,5,8}, all with a=7; PK 99 (a=8) absent.
     let r = seek_by_index(&mut engine, tid, &[1, 2], &[7u128])
@@ -2351,7 +2351,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let r = seek_by_index_range(&mut engine, tid, &[1], RangeDescriptor::new(&[], After(15), Before(25)))
         .unwrap()
@@ -2418,7 +2418,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // The registry projects the index itself, from the same `key_spec` and index
     // schema a hand-written projection would use.
     engine.registry_mut().ingest(tid, bb).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     // x ∈ [10, 30] → all three wide-PK rows, resolved by their full 24-byte key.
     let r = seek_by_index_range(&mut engine, tid, &[3], RangeDescriptor::new(&[], Before(10), After(30)))
@@ -2463,7 +2463,7 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let r = seek_by_index(&mut engine, tid, &[1], &[50u128])
         .unwrap()
@@ -2534,7 +2534,7 @@ fn test_seek_by_index_composite_prefix_null_gate() {
     bb.put_u64(9);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let r = seek_by_index(&mut engine, tid, &[1, 2], &[5u128]).unwrap().0;
     assert_eq!(
@@ -2566,7 +2566,7 @@ fn test_seek_by_index_multi_value_regression() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let r = seek_by_index(&mut engine, tid, &[1], &[20u128]).unwrap().0;
     assert_eq!(result_triples(r), vec![(2, 20, 1)]);
@@ -2595,7 +2595,7 @@ fn compensated_drop_index_refills_the_restored_circuit() {
     bb.put_u64(200);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
+    engine.registry_mut().checkpoint_base().unwrap();
 
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
     let _ = engine.drain_pending_broadcasts();

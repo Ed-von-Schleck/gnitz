@@ -342,6 +342,10 @@ impl Table {
 
     /// Ingest an already-constructed Batch into the memtable.
     /// The relation-store ingest entry point.
+    ///
+    /// `#[inline]`: it takes a 1 KiB `Batch` by value, and every stateful
+    /// operator calls it once per epoch.
+    #[inline]
     pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         self.push_memtable(batch.into_consolidated(&self.shard_index.schema))
     }

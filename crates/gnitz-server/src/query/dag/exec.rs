@@ -205,9 +205,7 @@ impl DagEngine {
             .expect("the schedule runs every producer before the steps it feeds");
             let needed = readers.contains_key(&step.view);
             let out = self.run_view_epoch(registry, step.view, input, step.producer, exchange)?;
-            let echo = registry
-                .ingest_view_delta(step.view, out, round, needed)
-                .map_err(|e| format!("view store ingest failed (view_id={}): {e}", step.view))?;
+            let echo = registry.ingest_view_delta(step.view, out, round, needed)?;
             // A view with two producers runs one epoch per producer, and its
             // readers see the union. An empty output is kept too, so a consumer's
             // exchange rounds run on every worker.
@@ -239,9 +237,7 @@ impl DagEngine {
                 sub.vm.release();
             }
         }
-        registry
-            .flush(view_id)
-            .map_err(|e| format!("view store flush failed (view_id={view_id}): {e}"))
+        registry.fold_to_ram(view_id).map_err(|e| e.to_string())
     }
 }
 

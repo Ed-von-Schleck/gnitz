@@ -104,14 +104,14 @@ pub(in crate::storage) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8
     (strides, nr as u8)
 }
 
-/// Copy `count` rows of every region from `src` (regions at `src_offsets`)
-/// into `dst` (regions at `dst_offsets`), one bulk copy per region. Shared by
-/// the `reserve_rows` out-of-place grow, `clone_batch`, and the wire decode in
-/// `batch_wire`.
+/// Copy `count` rows of each region in `regions` from `src` (regions at
+/// `src_offsets`) into `dst` (regions at `dst_offsets`), one bulk copy per
+/// region. A caller whose two sides disagree on a region's pitch leaves that
+/// region out and writes it itself.
 ///
 /// # Safety
-/// `src` and `dst` are distinct allocations; for every region `i < nr`, both
-/// `src_offsets[i] + count * strides[i]` and `dst_offsets[i] + count *
+/// `src` and `dst` are distinct allocations; for every region `i` in `regions`,
+/// both `src_offsets[i] + count * strides[i]` and `dst_offsets[i] + count *
 /// strides[i]` are in bounds (both sides sized by `compute_offsets_into` for at
 /// least `count` rows).
 pub(super) unsafe fn copy_regions(
@@ -120,10 +120,10 @@ pub(super) unsafe fn copy_regions(
     dst: &mut [u8],
     dst_offsets: &[usize; MAX_BATCH_REGIONS],
     strides: &[u8; MAX_BATCH_REGIONS],
-    nr: usize,
+    regions: std::ops::Range<usize>,
     count: usize,
 ) {
-    for i in 0..nr {
+    for i in regions {
         let len = count * strides[i] as usize;
         if len == 0 {
             continue;
@@ -316,18 +316,55 @@ impl Batch {
         b
     }
 
-    /// An owned, tightly packed copy of `mb`'s `count` rows and its whole heap:
-    /// `Raw`, fresh blob id.
-    pub(in crate::storage) fn from_mem_batch(mb: &MemBatch, schema: &SchemaDescriptor) -> Self {
-        let (strides, nr) = strides_from_schema(schema);
+    /// An owned, tightly packed copy of `mb`'s `count` rows and its whole heap,
+    /// read under `in_schema` and written under `out_schema`: `Raw`, fresh blob
+    /// id.
+    ///
+    /// `out_schema`'s PK is a suffix of `in_schema`'s, dropping that many leading
+    /// key bytes per row; passing one schema twice is the verbatim copy.
+    ///
+    /// `Raw` even from a `Consolidated` source: dropping a leading key region
+    /// preserves neither sortedness nor distinctness once the batch spans more
+    /// than one prefix value.
+    pub(in crate::storage) fn from_mem_batch(
+        mb: &MemBatch,
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
+    ) -> Self {
+        let (strides, nr) = strides_from_schema(out_schema);
         let nr = nr as usize;
+        let (in_pk, out_pk) = (in_schema.pk_stride(), out_schema.pk_stride());
+        let skip = in_pk
+            .checked_sub(out_pk)
+            .expect("from_mem_batch: out_schema's PK is a suffix of in_schema's");
+        debug_assert_eq!(in_schema.num_payload_cols(), out_schema.num_payload_cols());
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let size = compute_offsets_into(&strides, nr, mb.count, &mut offsets);
         let mut data = acquire_arena(size, Fill::Uninit);
         // SAFETY: distinct allocations; `mb`'s regions hold `count × stride` bytes
-        // each (a `Batch` by construction, a wire view by its parse), `data` is
-        // sized for `count` rows.
-        unsafe { copy_regions(mb.data, mb.offsets, &mut data, &offsets, &strides, nr, mb.count) };
+        // each (a `Batch` by construction, a wire view by its parse), and `data`
+        // is sized for `count` rows. The PK region is left out: only these share
+        // a pitch across the two schemas.
+        unsafe {
+            copy_regions(
+                mb.data,
+                mb.offsets,
+                &mut data,
+                &offsets,
+                &strides,
+                REG_WEIGHT..nr,
+                mb.count,
+            )
+        };
+        let src_pk = &mb.data[mb.offsets[REG_PK]..][..mb.count * in_pk];
+        let dst_pk = &mut data[offsets[REG_PK]..][..mb.count * out_pk];
+        if skip == 0 {
+            dst_pk.copy_from_slice(src_pk);
+        } else {
+            for (out, src) in dst_pk.chunks_exact_mut(out_pk).zip(src_pk.chunks_exact(in_pk)) {
+                out.copy_from_slice(&src[skip..]);
+            }
+        }
         let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
         blob.extend_from_slice(mb.blob);
         Batch {
@@ -338,7 +375,7 @@ impl Batch {
             capacity: mb.count,
             count: mb.count,
             layout: Layout::Raw,
-            schema: *schema,
+            schema: *out_schema,
             blob_id: next_blob_id(),
         }
     }
@@ -606,7 +643,7 @@ impl Batch {
                     &mut new_data,
                     &new_offsets,
                     &self.strides,
-                    nr,
+                    0..nr,
                     self.count,
                 );
             }
@@ -1199,10 +1236,9 @@ impl Batch {
         out
     }
 
-    /// A fresh `out_schema` batch of this batch's rows, with what a widen, a
-    /// stamp and a strip all copy identically already taken: blob heap, weights,
-    /// and every payload column of `in_schema`. Each caller rewrites the one
-    /// region it owns.
+    /// A fresh `out_schema` batch of this batch's rows carrying everything but
+    /// the PK and NULL regions: blob heap, weights, and every payload column of
+    /// `in_schema`.
     ///
     /// **`count` is published while the PK and NULL regions are unwritten** — the
     /// caller must write both, or a release build reads uninitialized arena bytes.
@@ -1271,42 +1307,6 @@ impl Batch {
         output
     }
 
-    /// Copy every row into `out_schema`, dropping the eight leading big-endian
-    /// bytes [`Self::stamped_with_pk_prefix`] wrote — the inverse of that call,
-    /// with the schemas swapped.
-    ///
-    /// **It does not inherit the layout claim, where the stamp does.** Removing
-    /// the prefix preserves neither sortedness nor distinctness once the batch
-    /// spans more than one stamp value: the rows are ordered by stamp first, so
-    /// round 5's key 100 sits before round 6's key 3, and the same
-    /// `(key, payload)` element legitimately appears under two stamps. The result
-    /// claims `Layout::Raw` so the consumer's sort-and-fold runs.
-    pub fn stripped_of_pk_prefix(&self, out_schema: &SchemaDescriptor) -> Self {
-        let in_schema = &self.schema;
-        let in_stride = in_schema.pk_stride();
-        let out_stride = out_schema.pk_stride();
-        let stamp_bytes = DELTA_TICK_COL.size() as usize;
-        debug_assert_eq!(in_stride, out_stride + stamp_bytes);
-        debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
-        if self.count == 0 {
-            return Self::empty_with_schema(out_schema);
-        }
-
-        let mut output = self.shell_for(in_schema, out_schema);
-        output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
-
-        let src_pk = self.pk_data();
-        for (dst, src) in output
-            .pk_data_mut()
-            .chunks_exact_mut(out_stride)
-            .zip(src_pk.chunks_exact(in_stride))
-        {
-            dst.copy_from_slice(&src[stamp_bytes..]);
-        }
-
-        output
-    }
-
     /// Copy every row into `out_schema`, which must extend this batch's schema
     /// with extra trailing payload columns, filling those columns with NULL.
     /// The PK region, weights and existing payload columns carry over verbatim,
@@ -1353,7 +1353,7 @@ impl Batch {
             return self.empty_like();
         }
         // Only the used portion of data (count-based, not capacity-based).
-        let mut b = Self::from_mem_batch(&self.as_mem_batch(), &self.schema);
+        let mut b = Self::from_mem_batch(&self.as_mem_batch(), &self.schema, &self.schema);
         b.layout = self.layout;
         b.blob_id = self.blob_id;
         b
@@ -1535,11 +1535,10 @@ impl Batch {
             self.blob.is_empty(),
             "share_blob_from replaces the heap: a batch already holding rows would re-resolve them",
         );
-        // Reuse the pooled destination buffer rather than dropping it for a
-        // fresh exact-sized clone (an allocation per call). The blob bytes are
-        // identical, so the shared blob_id and every German-string offset stay
-        // valid — a behavioral no-op apart from the saved allocation.
+        // The bytes are identical, so the shared blob_id and every German-string
+        // offset stay valid.
         self.blob.clear();
+        self.reserve_blob(src.blob.len());
         self.blob.extend_from_slice(&src.blob);
         self.blob_id = src.blob_id;
     }
@@ -1687,9 +1686,13 @@ impl Batch {
     /// Consume this batch, consolidating it if needed. The returned batch is
     /// certified `Consolidated`.
     ///
-    /// Fast path: an already-consolidated (or empty) `self` is returned by move
-    /// with no allocation. Slow path: sorts and weight-folds into a fresh batch,
+    /// Fast path: an already-consolidated (or empty) `self` is returned by move,
+    /// allocating nothing. Slow path: sorts and weight-folds into a fresh batch,
     /// then drops `self`.
+    ///
+    /// `#[inline]`: the move is still a 1 KiB struct copy, and the call is
+    /// cross-crate, so without a hint it is not an inline candidate outside LTO.
+    #[inline]
     pub fn into_consolidated(mut self, schema: &SchemaDescriptor) -> Batch {
         if self.consolidated_verified(schema) {
             // Already consolidated, or empty (structurally consolidated): return

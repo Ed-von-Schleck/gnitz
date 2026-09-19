@@ -22,9 +22,7 @@ impl Table {
     /// `SalReplay` table folds memtable + RAM tier into one shard, syncs it and
     /// the staged manifest, renames the manifest into place, fsyncs the
     /// directory, and drains its deferred compaction cleanup.
-    ///
-    /// Its one production caller is the post-backfill fold, and that runs on a
-    /// view — so the durable arm is reached from tests alone.
+    #[cfg(test)]
     pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
         super::super::flush_barrier::flush_barrier([&mut *self], FlushRound::Base)
     }

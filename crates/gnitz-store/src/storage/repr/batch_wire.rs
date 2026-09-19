@@ -240,7 +240,7 @@ impl Batch {
     ) -> Result<Self, &'static str> {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mb = decode_mem_batch_from_wal_block(data, schema, verify_checksum, &mut offsets)?;
-        Ok(Batch::from_mem_batch(&mb, schema))
+        Ok(Batch::from_mem_batch(&mb, schema, schema))
     }
 
     /// [`Self::decode_from_wal_block`] for a block a peer wrote, refusing a
@@ -248,12 +248,19 @@ impl Batch {
     /// padding that would split one element's weight across two rows.
     ///
     /// The refusal lands on the borrowed view, so a corrupt block costs neither
-    /// the region copy nor the heap copy `from_mem_batch` would pay.
-    pub fn decode_foreign_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<Self, &'static str> {
+    /// the region copy nor the heap copy `from_mem_batch` would pay. `out_schema`
+    /// is what the rows land in — see [`Batch::from_mem_batch`] for what the two
+    /// schemas may differ in; a reader that wants the block as it stands passes
+    /// `in_schema` twice.
+    pub fn decode_foreign_wal_block(
+        data: &[u8],
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
+    ) -> Result<Self, &'static str> {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let mb = decode_mem_batch_from_wal_block(data, schema, false, &mut offsets)?;
-        validate_string_heap_extents(&mb, schema)?;
-        Ok(Batch::from_mem_batch(&mb, schema))
+        let mb = decode_mem_batch_from_wal_block(data, in_schema, false, &mut offsets)?;
+        validate_string_heap_extents(&mb, in_schema)?;
+        Ok(Batch::from_mem_batch(&mb, in_schema, out_schema))
     }
 }
 

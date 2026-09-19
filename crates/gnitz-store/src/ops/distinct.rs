@@ -37,7 +37,7 @@ impl ClampPreset {
 /// selects the operator.
 ///
 /// Returns `(output_batch, consolidated_delta)`; the consolidated delta is
-/// returned so the caller can feed it to `ingest_batch`.
+/// returned so the caller can feed it to the relation ingest.
 pub fn op_weight_clamp(
     delta: Batch,
     cursor: &mut ReadCursor,

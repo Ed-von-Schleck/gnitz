@@ -15,7 +15,10 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
     let schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a string long enough to spill";
     let clean = make_batch_bytes(&schema, &[(1, 1, b"short"), (2, 1, long)]).encode_to_wire_vec(1, false);
-    assert_eq!(Batch::decode_foreign_wal_block(&clean, &schema).map(|b| b.len()), Ok(2));
+    assert_eq!(
+        Batch::decode_foreign_wal_block(&clean, &schema, &schema).map(|b| b.len()),
+        Ok(2)
+    );
 
     let (cells, _) = gnitz_wire::wal::dir_entry(&clean, REG_PAYLOAD_START);
     let forgeries: [fn(&mut [u8]); 2] = [
@@ -29,7 +32,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
         forge(&mut buf[cells + row * 16..cells + (row + 1) * 16]);
         assert!(Batch::decode_from_wal_block(&buf, &schema, false).is_ok(), "row {row}");
         assert_eq!(
-            Batch::decode_foreign_wal_block(&buf, &schema).err(),
+            Batch::decode_foreign_wal_block(&buf, &schema, &schema).err(),
             Some("data WAL German string is not in canonical form"),
             "row {row}"
         );

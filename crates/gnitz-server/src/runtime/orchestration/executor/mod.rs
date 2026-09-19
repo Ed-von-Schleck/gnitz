@@ -1347,7 +1347,7 @@ fn decode_client_wire(
 
 /// Decode and validate one family block of a client `DDL_TXN` or `PUSH_TXN`.
 fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'static str> {
-    let b = Batch::decode_foreign_wal_block(slice, schema)?;
+    let b = Batch::decode_foreign_wal_block(slice, schema, schema)?;
     validate_client_batch(&b)?;
     Ok(b)
 }

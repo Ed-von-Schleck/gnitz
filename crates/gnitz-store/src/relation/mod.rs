@@ -87,10 +87,22 @@ impl SecondaryIndex {
         &self.store
     }
 
-    /// Write index rows directly. The one write to an index that does not ride a
-    /// base-table push, so the caller owns the `key_spec` projection.
+    /// Write index rows directly, in the index's own layout — the one write that
+    /// does not ride a projection of the owner. For tests that need an entry no
+    /// projection of the owner could produce.
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         self.store.ingest_owned_batch(batch)
+    }
+
+    /// Project `source` into this index's layout and ingest the result.
+    /// `Ok(false)` when the projection was empty: the key spec rejects rows, so
+    /// a non-empty `source` can still project to nothing.
+    pub(crate) fn project_and_ingest(&mut self, source: &Batch) -> Result<bool, StorageError> {
+        let projected = source.project_index(&self.key_spec, &self.store.schema());
+        if projected.is_empty() {
+            return Ok(false);
+        }
+        self.store.ingest_owned_batch(projected).map(|()| true)
     }
 
     /// Whether this process's store of the index came back from a checkpoint
@@ -201,7 +213,7 @@ pub struct Relation {
     /// threaded in beside it to log or to phrase an error.
     id: i64,
     store: Store,
-    /// The delta store, when this process holds one — `props` is
+    /// The delta store, on the ranks that serve this view's feed — `props` is
     /// what says a feed *exists*. `Box` because it embeds a second
     /// `SchemaDescriptor` (360 bytes), which every relation would pay inline.
     delta: Option<Box<Store>>,
@@ -338,12 +350,12 @@ impl Relation {
 
     /// Whether a live row carries this OPK key.
     pub fn has_pk(&self, key: &[u8]) -> bool {
-        self.store.table().is_some_and(|t| t.has_pk_bytes(key))
+        self.store.has_pk_bytes(key)
     }
 
     /// The net weight at `key`, and the live row if there is one.
     pub fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        self.store.table().map_or((0, None), |t| t.live_row_at(key))
+        self.store.live_row_at(key)
     }
 
     /// This relation's store LSN counter; `0` where this process holds no store.
@@ -515,10 +527,8 @@ impl RelationRegistry {
             }
             (e.schema(), e.directory.clone())
         };
-        let key_spec = crate::schema::IndexKeySpec::new(cols, &owner_schema).map_err(StoreError::rejected)?;
-        let index_schema = key_spec
-            .output_schema(&owner_schema)
-            .ok_or_else(|| StoreError::rejected("Index: composite key is not a valid primary key".to_string()))?;
+        let (key_spec, index_schema) =
+            crate::schema::index_spec_and_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
         let idx_dir = ChildAddr::Index { id: index_id }.dir(&owner_dir);
         ensure_dir(&idx_dir)?;
         let store = match self.residency.owns_stores() {
@@ -591,10 +601,7 @@ impl RelationRegistry {
     /// column ALTER): update the registry copy and push the same value down into
     /// the owned `Table`, which re-opens its shards if the region count grew.
     pub fn swap_schema(&mut self, id: i64, schema: SchemaDescriptor) -> Result<(), StoreError> {
-        let entry = self
-            .tables
-            .get_mut(&id)
-            .expect("swap_schema: relation must be registered");
+        let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
         if !schema.is_trailing_append_of(&entry.store.schema()) {
@@ -651,8 +658,16 @@ impl RelationRegistry {
     /// same by the mutating paths, so which verb asked cannot change what a
     /// client reads.
     pub fn relation_or_err(&self, id: i64) -> Result<&Relation, StoreError> {
-        self.relation(id)
-            .ok_or_else(|| StoreError::rejected(format!("relation {id} is not registered")))
+        self.relation(id).ok_or_else(|| Self::unregistered(id))
+    }
+
+    /// [`Self::relation_or_err`] as `&mut`.
+    pub fn relation_mut_or_err(&mut self, id: i64) -> Result<&mut Relation, StoreError> {
+        self.relation_mut(id).ok_or_else(|| Self::unregistered(id))
+    }
+
+    fn unregistered(id: i64) -> StoreError {
+        StoreError::rejected(format!("relation {id} is not registered"))
     }
 
     /// Every registered relation, in no defined order — what the boot orphan

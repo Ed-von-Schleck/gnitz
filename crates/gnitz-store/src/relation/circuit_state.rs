@@ -12,8 +12,9 @@ use crate::storage::{
 /// than the output they feed, which the registry's *current* verdict would give.
 fn output_store_recovery(reg: &RelationRegistry, view_id: i64) -> RecoverySource {
     reg.relation(view_id)
-        .and_then(|r| r.store().table())
-        .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source)
+        .map_or(RecoverySource::Rederive { resume_at: None }, |r| {
+            r.store().recovery_source()
+        })
 }
 
 /// A `u16` index into one [`CircuitState`], minted only by

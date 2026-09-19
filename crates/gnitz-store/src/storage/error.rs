@@ -87,15 +87,16 @@ impl StoreError {
         StoreError::Storage { context: context.into(), err }
     }
 
-    /// Prefix a `Storage` context with what the caller was doing; the other
-    /// variants are the callee's whole answer and pass through unchanged.
-    pub(crate) fn in_context(self, what: &str) -> Self {
+    /// Prefix the refusal with what the caller was doing. A `DeltaExpired`
+    /// message is the callee's whole answer, so it passes through.
+    pub fn in_context(self, what: &str) -> Self {
         match self {
             StoreError::Storage { context, err } => StoreError::Storage {
                 context: format!("{what}: {context}"),
                 err,
             },
-            other => other,
+            StoreError::Rejected(m) => StoreError::Rejected(format!("{what}: {m}")),
+            other @ StoreError::DeltaExpired(_) => other,
         }
     }
 }

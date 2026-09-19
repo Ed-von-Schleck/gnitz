@@ -64,9 +64,9 @@ impl SkeletonHydrator for DagEngine {
         // The gather opens over the range its own key list spans.
         let mut gather = match hydration.seed {
             HydrationSeed::Relation(source) => {
-                let entry = registry.relation_or_err(source).map_err(|_| {
-                    StoreError::rejected(format!("hydrate: view {view_id} source {source} is unregistered"))
-                })?;
+                let entry = registry
+                    .relation_or_err(source)
+                    .map_err(|e| e.in_context(&format!("hydrate: view {view_id} source")))?;
                 // A linear view's physical PK is the leading source-PK columns,
                 // byte-identical to the source PK, so the store's own keys index
                 // the source directly.

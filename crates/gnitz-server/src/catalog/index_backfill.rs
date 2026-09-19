@@ -1,6 +1,6 @@
-//! Secondary-index construction: the chunked base-table scan that projects into
-//! an index circuit's store, and its two entry points (a fresh CREATE INDEX and
-//! the boot rebuild in `open_stores`). The store itself is the registry's.
+//! Secondary-index construction: which indexes need filling and when it is safe
+//! to fill them, at its two entry points — a fresh CREATE INDEX and the boot
+//! rebuild. The scan that fills them is the registry's, as is the store.
 
 use super::*;
 use gnitz_foundation::fault::Seam;
@@ -36,7 +36,7 @@ impl CatalogEngine {
                 "backfill_index into a non-empty index (owner {owner_id}): would double-count"
             ));
         }
-        self.stream_index_projection(owner_id, &[PkColList::from_slice(cols)])
+        self.fill_indexes(owner_id, &[PkColList::from_slice(cols)])
     }
 
     /// Fill every index store that neither resumed from its checkpoint nor holds
@@ -61,42 +61,20 @@ impl CatalogEngine {
         let mut rebuilt = 0usize;
         for (owner_id, targets) in worklist {
             rebuilt += targets.len();
-            self.stream_index_projection(owner_id, &targets)?;
+            self.fill_indexes(owner_id, &targets)?;
         }
         Ok(rebuilt)
     }
 
-    /// One chunked scan of `owner_id`, each chunk projected into every target
-    /// circuit's index layout and ingested through it. Peak memory is
-    /// O(chunk × row_width).
+    /// Fill `targets` from `owner_id`'s own slice.
     ///
     /// No uniqueness check, for a fresh unique index or a promotion alike:
     /// `validate_unique_index_create` ran the global pre-flight before the
     /// IDX_TAB `+1`, and a partition-local check cannot see a duplicate
     /// straddling two workers' slices.
-    fn stream_index_projection(&mut self, owner_id: i64, targets: &[PkColList]) -> Result<(), String> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-        let chunk_rows = self.registry.scan_chunk_rows();
-        let Some(mut handle) = self.registry.relation(owner_id).map(|r| r.cursor()) else {
-            return Ok(());
-        };
-        while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-            for cols in targets {
-                let ic = self
-                    .registry
-                    .relation_mut(owner_id)
-                    .and_then(|r| r.index_on_mut(cols.as_slice()))
-                    .ok_or_else(|| format!("index circuit on {:?} of {owner_id} vanished", cols.as_slice()))?;
-                let projected = chunk.project_index(&ic.key_spec(), &ic.schema());
-                if projected.is_empty() {
-                    continue;
-                }
-                ic.ingest_owned_batch(projected)
-                    .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
-            }
-        }
-        Ok(())
+    fn fill_indexes(&mut self, owner_id: i64, targets: &[PkColList]) -> Result<(), String> {
+        self.registry
+            .project_into_indexes(owner_id, targets)
+            .map_err(|e| format!("index backfill: {e}"))
     }
 }

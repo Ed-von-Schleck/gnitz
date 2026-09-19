@@ -65,7 +65,7 @@ def test_a_failed_boot_leaves_the_sal_intact(seam, own_server):
 def test_a_failed_live_apply_aborts_the_cluster_and_replays(inject, with_index,
                                                             own_server):
     """A storage error applying a committed PUSH aborts the owning worker inside
-    `ingest_store_and_indices`, and the master's watchdog turns the dead worker
+    the relation ingest, and the master's watchdog turns the dead worker
     into a cluster shutdown — exit 2, which neither a clean shutdown (0) nor a
     boot failure (1) can produce, so the status alone proves the abort fired. The
     load-bearing assertion is the next boot: the un-flushed PUSH zone stayed above
@@ -94,6 +94,27 @@ def test_a_failed_live_apply_aborts_the_cluster_and_replays(inject, with_index,
     own_server.start()
     with gnitz.connect(own_server.sock_path) as conn:
         assert bag(scanned(conn, "apply_err", "t"), "pk", "val") == _WANT
+
+
+def test_an_empty_index_projection_reports_no_write(own_server):
+    """The `index` seam reports from an ingest that has already run. A push whose
+    indexed column is NULL in every row projects to nothing and ingests nothing,
+    so the seam has no write to report from and the push must survive it.
+
+    Absorbing the empty-projection skip into the ingest would make this abort the
+    cluster over a write that never happened."""
+    own_server.start(extra_env={"GNITZ_INJECT_INGEST_APPLY_ERROR": "index"})
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.create_schema("nullidx")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)",
+            schema_name="nullidx")
+        conn.execute_sql("CREATE INDEX ON t(val)", schema_name="nullidx")
+        conn.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL)",
+                         schema_name="nullidx")
+        assert bag(scanned(conn, "nullidx", "t"), "pk", "val") == {(1, None): 1, (2, None): 1}
+    assert own_server.proc.poll() is None, \
+        "no index ingest ran, so the seam must not have fired"
 
 
 def test_a_failed_tick_reports_and_requeues(tick_emit_fault_server):

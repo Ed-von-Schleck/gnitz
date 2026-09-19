@@ -128,7 +128,7 @@ fn replay_slots(written: u32, slot: Slot, replicated: bool) -> (Range<u32>, bool
 }
 
 /// Per-worker post-fork user-table replay for `slot`, applying each Push group
-/// through `ingest_returning_effective` — the exact call `handle_push` makes, so
+/// through `ingest_returning` — the exact call `handle_push` makes, so
 /// retractions cancel correctly. The returned map seeds the worker's
 /// `pending_deltas` for the master's tick sweep to drain into the views.
 fn recover_from_sal(
@@ -179,7 +179,7 @@ fn recover_from_sal(
                 continue;
             };
             // Above both arms because both need it: the re-cut reads `schema`'s
-            // payload columns off the batch, and `ingest_batch` rejects a
+            // payload columns off the batch, and the ingest rejects a
             // payload-count mismatch outright.
             if batch.schema().num_payload_cols() < schema.num_payload_cols() {
                 batch = batch.widened_with_null_tail(&schema);
@@ -196,15 +196,12 @@ fn recover_from_sal(
             if owned.is_empty() {
                 continue;
             }
-            let effective = catalog
-                .registry_mut()
-                .ingest_returning_effective(tid, owned)
-                .map_err(|e| {
-                    format!(
-                        "SAL replay apply failed (table_id={}, lsn={}): {e}",
-                        msg.target_id, msg.lsn
-                    )
-                })?;
+            let effective = catalog.registry_mut().ingest_returning(tid, owned).map_err(|e| {
+                format!(
+                    "SAL replay apply failed (table_id={}, lsn={}): {e}",
+                    msg.target_id, msg.lsn
+                )
+            })?;
             if swept_bases.contains(&tid) {
                 buffer_pending_delta(&mut pending, tid, effective);
             }

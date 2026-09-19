@@ -27,13 +27,9 @@ impl Mirror {
         for raw in blocks {
             let block = raw.block();
             applied += block.len();
-            let batch = match Batch::decode_foreign_wal_block(block, &in_desc) {
+            let batch = match Batch::decode_foreign_wal_block(block, &in_desc, &view_desc) {
                 Ok(b) => b,
                 Err(e) => return Err(self.erase_copy(table_id, format!("decoding a delta for {table_id}: {e}"))),
-            };
-            let batch = match stamped {
-                false => batch,
-                true => batch.stripped_of_pk_prefix(&view_desc),
             };
             if batch.is_empty() {
                 continue;
