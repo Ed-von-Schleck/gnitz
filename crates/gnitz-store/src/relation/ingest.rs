@@ -213,7 +213,7 @@ impl RelationRegistry {
     ) -> Result<Option<Batch>, StorageError> {
         let (id, kind) = (entry.id(), entry.kind);
         for ix in entry.indexes.iter_mut() {
-            let idx_batch = crate::storage::batch_project_index(&source, &ix.key_spec, &ix.store.schema());
+            let idx_batch = source.project_index(&ix.key_spec, &ix.store.schema());
             if idx_batch.count > 0 {
                 let index_id = ix.index_id;
                 inject_ingest_apply_error("index", kind, ix.ingest_owned_batch(idx_batch)).inspect_err(|e| {

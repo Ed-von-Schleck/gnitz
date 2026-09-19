@@ -1143,6 +1143,8 @@ impl Batch {
     /// its own weight. A caller emitting *different* weights follows with
     /// `overwrite_weights` — one sequential blit,
     /// against a per-(row, column) dispatch in the scatter.
+    ///
+    /// `indices` must name no weight-0 row (debug-asserted in the scatter).
     pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
         if indices.is_empty() {
             return Self::empty_with_schema(schema);
@@ -1157,7 +1159,8 @@ impl Batch {
     /// layout: taking rows in source order preserves (PK, payload) ordering and
     /// leaves weights untouched, so a consolidated source yields a consolidated
     /// subset. A reordering caller wants
-    /// [`from_indexed_rows`](Self::from_indexed_rows).
+    /// [`from_indexed_rows`](Self::from_indexed_rows), whose weight-0 precondition
+    /// this inherits.
     pub fn ascending_subset(&self, indices: &[u32]) -> Self {
         debug_assert!(
             indices.windows(2).all(|w| w[0] < w[1]),
@@ -1165,6 +1168,34 @@ impl Batch {
         );
         let mut out = Self::from_indexed_rows(&self.as_mem_batch(), indices, &self.schema);
         out.inherit_layout(self);
+        out
+    }
+
+    /// Project every live row into one secondary-index entry. An index schema is
+    /// all PK and no payload, so the entry *is* its key `(indexed col(s) [promoted]
+    /// ‖ source PK)`, composed by `spec.write_entry` — which also decides the SQL
+    /// NULL-distinctness skip.
+    pub fn project_index(&self, spec: &crate::schema::IndexKeySpec, idx_schema: &SchemaDescriptor) -> Batch {
+        let idx_stride = idx_schema.pk_stride();
+
+        let mut out = Batch::with_capacity(idx_schema, self.count);
+        // `SchemaDescriptor::new` bounds every index `pk_stride` by `MAX_PK_BYTES`.
+        let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
+
+        let mb = self.as_mem_batch();
+
+        for row in 0..self.count {
+            let weight = mb.get_weight(row);
+            if weight == 0 {
+                continue;
+            }
+            if !spec.write_entry(&mb, row, &mut idx_pk_buf) {
+                continue;
+            }
+            out.push_key_row(&idx_pk_buf[..idx_stride], weight);
+        }
+
+        // Left `Raw`: entries arrive in source order, and the index ingest folds them.
         out
     }
 
@@ -1681,6 +1712,19 @@ impl Batch {
     /// ```
     pub(crate) fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
         (!batch.consolidated_verified(schema)).then(|| Self::consolidate_into_new(batch, schema))
+    }
+
+    /// An owned, certified-`Consolidated` copy: folds if needed, else clones and
+    /// pins the tag. The borrowed counterpart of [`Self::into_consolidated`].
+    pub(crate) fn to_consolidated(&self, schema: &SchemaDescriptor) -> Batch {
+        match Self::consolidate_if_needed(self, schema) {
+            Some(folded) => folded,
+            None => {
+                let mut c = self.clone_batch();
+                c.layout = Layout::Consolidated;
+                c
+            }
+        }
     }
 
     /// Sort and weight-fold `batch` into a fresh certified batch — the

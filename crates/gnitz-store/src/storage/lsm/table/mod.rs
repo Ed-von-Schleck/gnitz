@@ -338,38 +338,30 @@ impl Table {
     /// Ingest an already-constructed Batch into the memtable.
     /// The relation-store ingest entry point.
     pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+        self.push_memtable(batch.into_consolidated(&self.shard_index.schema))
+    }
+
+    /// [`Self::ingest_owned_batch`] for a caller that keeps reading `batch`.
+    pub(crate) fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
+        self.push_memtable(batch.to_consolidated(&self.shard_index.schema))
+    }
+
+    /// The tail both entry points share, taking a batch already certified
+    /// `Consolidated`.
+    fn push_memtable(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
         self.cached_full_scan.set(None);
 
-        // Ingest overflow always folds into the RAM tier; durability lives in the
-        // fsynced SAL, and the checkpoint barrier writes the durable shard. Bump
-        // `current_lsn` unconditionally so spill/barrier shard naming is
-        // collision-free.
+        // `current_lsn` names the next spill/barrier shard.
         self.current_lsn += 1;
 
-        let consolidated = batch.into_consolidated(&self.shard_index.schema);
-        self.memtable.push(Rc::new(consolidated), &self.shard_index.schema);
+        self.memtable.push(Rc::new(batch), &self.shard_index.schema);
         if self.memtable.is_full() {
             self.flush_to_ram()?;
         }
         Ok(())
-    }
-
-    /// Ingest a borrowed Batch, copying it exactly once: an unconsolidated
-    /// batch is consolidated straight into the owned copy the memtable keeps
-    /// (the consolidation pass IS the copy), an already-consolidated batch is
-    /// cloned verbatim. The borrow-based twin of [`Self::ingest_owned_batch`]
-    /// for callers that keep reading `batch` afterwards — `clone_batch()` +
-    /// `ingest_owned_batch()` would copy an unconsolidated batch twice.
-    pub(crate) fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
-        if batch.count == 0 {
-            return Ok(());
-        }
-        let owned =
-            Batch::consolidate_if_needed(batch, &self.shard_index.schema).unwrap_or_else(|| batch.clone_batch());
-        self.ingest_owned_batch(owned)
     }
 
     // ------------------------------------------------------------------
@@ -475,8 +467,7 @@ impl Table {
     }
 
     /// Return the fully consolidated batch of all live rows, caching the result.
-    /// The cache is invalidated wherever the row set can move: `ingest_owned_batch`,
-    /// `swap_schema`, the RAM-tier fold and the spill commit in `flush.rs`.
+    /// The cache is dropped wherever the row set moves.
     /// Cheap on repeated calls: returns `Rc::clone` of the cached batch.
     /// Infallible: delegates to `open_cursor`.
     pub(crate) fn full_scan(&self) -> Rc<Batch> {

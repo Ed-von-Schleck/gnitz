@@ -122,9 +122,9 @@ impl Table {
     /// if it pushed the disk tier over its threshold. The shared commit point of
     /// the spill and barrier paths.
     ///
-    /// The name is unique for this `Table`: `current_lsn` bumps once per ingest
-    /// and at most one shard is written per ingest, so a directory needs a single
-    /// writing process.
+    /// The name is unique for this `Table`: `current_lsn` bumps once per batch
+    /// pushed to the memtable and at most one shard is written per push, so a
+    /// directory needs a single writing process.
     ///
     /// Transactional. The run is borrowed — not removed — so a write failure
     /// leaves heap intact for retry with nothing on disk; a registration

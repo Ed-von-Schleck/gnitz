@@ -57,7 +57,6 @@ pub use error::{StorageError, StoreError};
 pub(crate) use lsm::flush_barrier::{flush_barrier, FlushRound};
 pub(crate) use lsm::table::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 pub use merge::MemBatch;
-pub use scatter::batch_project_index;
 pub(crate) use scatter::scatter_unified_sources;
 pub use scatter::{reset_slots, route_rows_by_pk};
 

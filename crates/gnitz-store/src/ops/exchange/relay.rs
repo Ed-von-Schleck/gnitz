@@ -93,7 +93,13 @@ pub fn op_repartition_batches(
         let is_pk_routing = scatter_key.is_pk_routed();
         for (si, mb) in mem_batches.iter().enumerate() {
             for i in 0..mb.count {
-                worker_rows[scatter_key.worker(mb, i)].push((si as u32, i as u32, mb.get_weight(i)));
+                // A weight-0 row is not a Z-set element; these sources are
+                // unconsolidated, so one is representable here.
+                let w = mb.get_weight(i);
+                if w == 0 {
+                    continue;
+                }
+                worker_rows[scatter_key.worker(mb, i)].push((si as u32, i as u32, w));
             }
         }
 

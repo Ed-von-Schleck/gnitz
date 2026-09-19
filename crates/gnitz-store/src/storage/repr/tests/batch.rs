@@ -650,3 +650,34 @@ fn batch_release_bench() {
         take.as_nanos() as f64 / ITERS as f64,
     );
 }
+
+/// A weight-0 source row projects to no index entry; a surviving row's entry
+/// carries that row's own weight, retractions included.
+#[test]
+fn project_index_drops_ghosts_and_carries_each_weight() {
+    use crate::schema::{make_index_schema, IndexKeySpec};
+
+    let owner = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let cols = [1u32];
+    let idx_schema = make_index_schema(&cols, &owner).unwrap();
+    let spec = IndexKeySpec::new(&cols, &owner).unwrap();
+
+    let mut bb = crate::storage::BatchBuilder::new(owner);
+    for &(id, a, w) in &[(1u128, 10i64, 1i64), (2, 20, 0), (3, 30, -1)] {
+        bb.begin_row(id, w);
+        bb.put_int(a as u128);
+        bb.end_row();
+    }
+    let src = bb.finish();
+
+    let projected = src.project_index(&spec, &idx_schema);
+    assert_eq!(projected.len(), 2, "the weight-0 row projects to no entry");
+    assert_eq!(projected.get_weight(0), 1);
+    assert_eq!(projected.get_weight(1), -1, "a retraction projects as a retraction");
+}

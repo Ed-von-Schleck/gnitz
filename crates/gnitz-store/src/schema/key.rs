@@ -484,7 +484,7 @@ impl IndexKeySpec {
     /// [`Self::write_span`] plus the source-PK OPK suffix: one row's full index
     /// entry key `[span ‖ src_pk]` in `dst[..key_size() + pk_stride]`. The single
     /// definition of "this row's index entry", shared by the write-side
-    /// projection (`batch_project_index`) and the in-batch uniqueness validator,
+    /// projection (`Batch::project_index`) and the in-batch uniqueness validator,
     /// so the two agree byte-for-byte by construction. Returns `false` (row not
     /// indexed — NULL in an indexed column; `dst` partially written) exactly as
     /// `write_span` does. Full-arity specs only: a prefix spec would place the

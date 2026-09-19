@@ -1,7 +1,7 @@
 use super::super::merge::mem_batch_to_unified;
 use super::*;
 use crate::schema::SchemaDescriptor;
-use crate::storage::BatchBuilder;
+use crate::storage::{Batch, BatchBuilder};
 use crate::test_support::{make_batch_opk, make_schema_u128_i64, make_schema_u64_i64, wide_pk_3xu64_schema};
 
 /// One row read back out of a scatter destination: the PK bytes verbatim, the
@@ -76,8 +76,7 @@ fn scatter_copy_gathers_selected_rows_at_every_stride() {
 
 /// `scatter_unified_sources` emits its `(source, row, weight)` triples in list
 /// order, taking each output weight from the triple rather than from the source
-/// row. The stride-24 case is the only coverage of the `PKS = 0` arm here; the
-/// German-string and NULL depth lives in `merge`'s materialization differential.
+/// row. The stride-24 case is the only coverage of the `PKS = 0` arm here.
 #[test]
 fn scatter_unified_sources_emits_in_list_order_at_every_stride() {
     for (schema, stride) in stride_cases() {
@@ -161,4 +160,117 @@ fn route_rows_by_pk_follows_the_distribution_prefix() {
         full_slots.iter().filter(|s| !s.is_empty()).count() > 1,
         "the full-PK placement must not co-locate the group"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The shard-backed source shapes. `mem_batch_to_unified` is always full-stride
+// and unpadded, so these build their `UnifiedSource` by hand.
+// ---------------------------------------------------------------------------
+
+/// U64 pk + two nullable I64 payload columns; slot 1 stands for an appended one.
+fn two_nullable_payloads() -> SchemaDescriptor {
+    use crate::schema::{type_code, SchemaColumn};
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    )
+}
+
+/// One row per `(pk, weight, payload_0, payload_1, null_word)`.
+fn batch_with_null_words(schema: &SchemaDescriptor, rows: &[(u128, i64, i64, i64, u64)]) -> Batch {
+    let mut b = Batch::with_capacity(schema, rows.len());
+    for &(pk, w, v0, v1, nw) in rows {
+        b.extend_pk(pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_col(0, &v0.to_le_bytes());
+        b.extend_col(1, &v1.to_le_bytes());
+        b.commit_row(nw);
+    }
+    b
+}
+
+/// Scatter `rows` into a `Batch`, which reads back through the ordinary accessors.
+fn unified_to_batch(
+    schema: &SchemaDescriptor,
+    sources: &[UnifiedSource<'_>],
+    cols: &[ColPtr],
+    rows: &[(u32, u32, i64)],
+    blob_cap: usize,
+) -> Batch {
+    crate::storage::write_to_batch(schema, rows.len(), blob_cap, |w| {
+        scatter_unified_sources(sources, cols, rows, w);
+    })
+}
+
+/// `null_pad_mask` forces the columns a pre-`ALTER` shard has no bits for to
+/// NULL: each output null word is the source row's own bits ORed with the mask.
+#[test]
+fn scatter_unified_sources_ors_the_null_pad_mask_into_every_row() {
+    let schema = two_nullable_payloads();
+    // Slot 1 is the appended column; the source's own bits name slot 0 only.
+    let src = batch_with_null_words(&schema, &[(1, 1, 10, 0, 0b00), (2, 1, 20, 0, 0b01)]);
+    let mb = src.as_mem_batch();
+    let mut cols = Vec::new();
+    let mut source = mem_batch_to_unified(&mb, &schema, &mut cols);
+    source.null_pad_mask = 0b10;
+    let rows: &[(u32, u32, i64)] = &[(0, 1, 1), (0, 0, 1)];
+
+    let out = unified_to_batch(&schema, &[source], &cols, rows, 1);
+    assert_eq!(out.get_null_word(0), 0b11, "source row 1's bit, plus the pad bit");
+    assert_eq!(
+        out.get_null_word(1),
+        0b10,
+        "source row 0 is NULL in the appended column only"
+    );
+}
+
+/// A Constant (stride-0) PK or null_bmp region repeats its one row for every
+/// output row, while the payload `ColPtr`s keep their own stride.
+#[test]
+fn scatter_unified_sources_repeats_a_constant_region() {
+    let schema = two_nullable_payloads();
+    let src = batch_with_null_words(&schema, &[(7, 1, 10, 11, 0b01), (9, 1, 20, 21, 0b10)]);
+    let mb = src.as_mem_batch();
+    let mut cols = Vec::new();
+    let mut source = mem_batch_to_unified(&mb, &schema, &mut cols);
+    let const_pk = src.get_pk_bytes(0).to_vec();
+    source.pk.stride = 0;
+    source.null_bmp.stride = 0;
+    let rows: &[(u32, u32, i64)] = &[(0, 1, 1), (0, 0, 1)];
+
+    let out = unified_to_batch(&schema, &[source], &cols, rows, 1);
+    for row in 0..2 {
+        assert_eq!(out.get_pk_bytes(row), &const_pk[..], "row {row} takes the constant key");
+        assert_eq!(out.get_null_word(row), 0b01, "row {row} takes the constant null word");
+    }
+    assert_eq!(gnitz_wire::read_i64_le(out.col_data(0), 0), 20);
+    assert_eq!(gnitz_wire::read_i64_le(out.col_data(0), 8), 10);
+}
+
+/// Both kernels relocate a German-string cell into the destination's blob heap,
+/// so a value too long to inline still reads back equal.
+#[test]
+fn both_kernels_relocate_german_string_cells() {
+    use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string, read_german_string};
+
+    let schema = make_schema_pk_u64_payload_string();
+    let short: &[u8] = b"tiny";
+    let long: &[u8] = b"a string far past the twelve-byte inline prefix";
+    let src = make_batch_bytes(&schema, &[(1, 1, short), (2, 1, long)]);
+    let mb = src.as_mem_batch();
+
+    let one = Batch::from_indexed_rows(&mb, &[1, 0], &schema);
+    assert_eq!(read_german_string(&one, 0, 0), long);
+    assert_eq!(read_german_string(&one, 0, 1), short);
+
+    let mut cols = Vec::new();
+    let sources = [mem_batch_to_unified(&mb, &schema, &mut cols)];
+    let rows: &[(u32, u32, i64)] = &[(0, 1, 1), (0, 0, 1)];
+    let many = unified_to_batch(&schema, &sources, &cols, rows, src.blob.len());
+    assert_eq!(read_german_string(&many, 0, 0), long);
+    assert_eq!(read_german_string(&many, 0, 1), short);
 }

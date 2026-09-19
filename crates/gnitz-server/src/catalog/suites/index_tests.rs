@@ -1414,7 +1414,7 @@ fn test_make_index_schema_over_limit_errs_not_panics() {
 #[test]
 fn test_seek_prefix_matches_projection() {
     // The seek encoder (IndexKeySpec::seek_prefix) and the projection encoder
-    // (batch_project_index) must produce byte-identical leading-key bytes for the
+    // (`Batch::project_index`) must produce byte-identical leading-key bytes for the
     // same native values — that equality is what makes every composite seek find
     // the projected entry.
     use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
@@ -1437,11 +1437,7 @@ fn test_seek_prefix_matches_projection() {
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        gnitz_store::storage::batch_project_index(
-            &b,
-            &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(),
-            &idx,
-        )
+        b.project_index(&gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(), &idx)
     };
     assert_eq!(projected.len(), 1);
 
@@ -1459,7 +1455,7 @@ fn test_seek_prefix_matches_projection() {
 }
 
 /// `IndexKeySpec::key_bytes` produces exactly the leading `idx_key_size` bytes
-/// that `batch_project_index` writes as the index PK prefix — so the in-memory
+/// that `Batch::project_index` writes as the index PK prefix — so the in-memory
 /// key, the projected index entry, and the seek prefix all agree, across a
 /// signed / unsigned / U128 column mix.
 #[test]
@@ -1494,8 +1490,7 @@ fn index_key_spec_equals_projected_leading_span() {
     let batch = bb.finish();
 
     // Reference: the projected index entry's leading idx_key_size bytes.
-    let projected =
-        gnitz_store::storage::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner).unwrap(), &idx_schema);
+    let projected = batch.project_index(&IndexKeySpec::new(&cols, &owner).unwrap(), &idx_schema);
     assert_eq!(projected.len(), rows.len());
 
     let mb = batch.as_mem_batch();
@@ -1522,7 +1517,7 @@ fn native_u128_at(v: i64, sz: usize) -> u128 {
 /// Project a single value (zero-extended native `u128`) through a one-column
 /// secondary index — `src` column 1 indexed by `idx` — returning the OPK
 /// leading-key span the write path (`IndexKeySpec::write_span` via
-/// `batch_project_index`) stores.
+/// `Batch::project_index`) stores.
 fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u128) -> Vec<u8> {
     let mut bb = BatchBuilder::new(src);
     bb.begin_row(1u128, 1);
@@ -1530,7 +1525,7 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        gnitz_store::storage::batch_project_index(&b, &gnitz_store::schema::IndexKeySpec::new(&[1], &src).unwrap(), idx)
+        b.project_index(&gnitz_store::schema::IndexKeySpec::new(&[1], &src).unwrap(), idx)
     };
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
@@ -1742,11 +1737,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         bb.end_row();
         let projected = {
             let b = bb.finish();
-            gnitz_store::storage::batch_project_index(
-                &b,
-                &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(),
-                &idx,
-            )
+            b.project_index(&gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(), &idx)
         };
         spans.push(projected.get_pk_bytes(0)[..key_size].to_vec());
     }
@@ -2519,7 +2510,7 @@ fn result_ab_quads(r: Option<Rc<Batch>>) -> Vec<(u128, u64, u64, i64)> {
 #[test]
 fn test_seek_by_index_composite_prefix_null_gate() {
     // Index (a, b) with b nullable; rows (pk=1,a=5,b=NULL) and (pk=1,a=5,b=9).
-    // The NULL-b row is absent from the index (`batch_project_index` skips a row
+    // The NULL-b row is absent from the index (`Batch::project_index` skips a row
     // with a NULL in any indexed column), so the prefix seek on a=5 must return
     // only (1,5,9). The full-arity gather spec re-applies the all-column NULL
     // gate; a seek-side (prefix-arity) spec would resurrect the NULL row.

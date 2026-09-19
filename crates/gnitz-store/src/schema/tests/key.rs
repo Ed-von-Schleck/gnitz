@@ -529,7 +529,7 @@ fn pkbuf_byte_order_is_lexicographic() {
 }
 
 /// A row NULL in ANY indexed column is skipped (`key_bytes` → false) —
-/// SQL NULL-distinctness, mirroring `batch_project_index`.
+/// SQL NULL-distinctness, mirroring `Batch::project_index`.
 #[test]
 fn index_key_spec_skips_any_null_column() {
     let owner = SchemaDescriptor::new(

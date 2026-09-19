@@ -523,10 +523,9 @@ impl PosCursor {
 /// to count (a ghost weight) need nothing: every reader bounds the batch to
 /// `count`.
 pub(crate) struct DirectWriter<'a> {
-    // The repartition-scatter cluster (sibling `repr::scatter`) writes these
-    // fixed-region buffers directly in its fused per-row loops, so they are
-    // `pub(super)` (visible within `repr`); `blob`/`blob_cache` stay private —
-    // scatter reaches the heap only through `write_string_cell`.
+    // `repr`'s row-copy kernels write these fixed regions directly, so they are
+    // `pub(super)`; `blob`/`blob_cache` stay private — the heap is reached only
+    // through `write_string_cell`.
     pub(super) pk: &'a mut [u8],
     pub(super) pk_stride: u8,
     pub(super) weight: &'a mut [u8],
@@ -635,9 +634,8 @@ impl<'a> DirectWriter<'a> {
 
     /// Write one 16-byte German string struct from raw source slices.
     ///
-    /// `#[inline]`: called per row in the German-string column pass of all three
-    /// `repr::scatter` entry points, a sibling module — the hint is what carries
-    /// the inline across that boundary.
+    /// `#[inline]`: called per row from sibling modules in `repr`; the hint is
+    /// what carries the inline across that boundary.
     #[inline]
     pub(super) fn write_string_cell(&mut self, payload_col: usize, src_struct: &[u8], src_blob: &[u8], out_row: usize) {
         let dest = relocate_german_string_vec(src_struct, src_blob, self.blob, self.blob_cache.get_mut());

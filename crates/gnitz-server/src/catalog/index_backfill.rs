@@ -93,7 +93,7 @@ impl CatalogEngine {
                     .relation_mut(owner_id)
                     .and_then(|r| r.index_on_mut(cols.as_slice()))
                     .ok_or_else(|| format!("index circuit on {:?} of {owner_id} vanished", cols.as_slice()))?;
-                let projected = gnitz_store::storage::batch_project_index(&chunk, &ic.key_spec(), &ic.schema());
+                let projected = chunk.project_index(&ic.key_spec(), &ic.schema());
                 if projected.is_empty() {
                     continue;
                 }
