@@ -327,18 +327,14 @@ impl RelationRegistry {
             .map_err(|e| StoreError::storage("system catalog flush", e))
     }
 
-    /// The ephemeral round at `generation`: every compiled circuit's operator
-    /// state first, then this registry's rederived output stores, in two
-    /// barriers. That order is why both halves are one call — an output manifest
-    /// at `generation` must imply that view's traces already are, which is what
-    /// the next boot's resume verdict reads. A host that maintains no circuit
-    /// passes an empty iterator.
+    /// The ephemeral round at the resume generation: `state`'s operator traces,
+    /// then this registry's rederived output stores, in two barriers — so an
+    /// output manifest implies its view's traces are already durable.
     pub fn checkpoint_ephemeral<'s>(
         &mut self,
-        generation: u64,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
     ) -> Result<(), StoreError> {
-        let round = crate::storage::FlushRound::Ephemeral(generation);
+        let round = crate::storage::FlushRound::Ephemeral(self.resume_generation);
         let traces: Vec<&mut Table> = state.into_iter().flat_map(|s| s.tables_mut()).collect();
         crate::storage::flush_barrier(traces, round).map_err(|e| StoreError::storage("ephemeral trace flush", e))?;
         crate::storage::flush_barrier(self.collect_ephemeral_output_tables(), round)

@@ -1,7 +1,6 @@
 //! Secondary-index construction: the chunked base-table scan that projects into
 //! an index circuit's store, and its two entry points (a fresh CREATE INDEX and
-//! the worker's boot rebuild). The store itself is the registry's — opened by
-//! `add_index`, rehomed by `rehome`.
+//! the boot rebuild in `open_stores`). The store itself is the registry's.
 
 use super::*;
 use gnitz_foundation::fault::Seam;
@@ -40,12 +39,9 @@ impl CatalogEngine {
         self.stream_index_projection(owner_id, &[PkColList::from_slice(cols)])
     }
 
-    /// Worker-boot index rebuild: fill every index store that neither resumed
-    /// from its checkpoint nor holds rows, from the rehomed base slice. Runs
-    /// BEFORE SAL replay, which projects the committed tail into the index once
-    /// more. Returns how many were filled — 0 on a clean restart at the same
-    /// topology, and 0 again on a repeat call, since a filled store is skipped.
-    pub(crate) fn backfill_all_indexes(&mut self) -> Result<usize, String> {
+    /// Fill every index store that neither resumed from its checkpoint nor holds
+    /// rows, from this process's base slice. Returns how many were filled.
+    pub(in crate::catalog) fn backfill_all_indexes(&mut self) -> Result<usize, String> {
         // Snapshotted: the projection mutably borrows `self`.
         let worklist: Vec<(i64, Vec<PkColList>)> = self
             .registry

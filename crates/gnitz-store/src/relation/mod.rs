@@ -24,7 +24,6 @@ mod store;
 mod store_lsn;
 mod unique_pk;
 
-pub use build::OnRegister;
 pub use circuit_state::{CircuitState, StateIdx};
 pub use dirs::{ensure_dir, lock_data_dir, relation_dir, relations_dir, staged_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store::Store;
@@ -95,8 +94,7 @@ impl SecondaryIndex {
     }
 
     /// Whether this process's store of the index came back from a checkpoint
-    /// manifest at its open — the open this process made, or the one it
-    /// inherited through the fork.
+    /// manifest at its open.
     pub fn resumed(&self) -> bool {
         self.store.resumed_from_checkpoint()
     }
@@ -171,21 +169,21 @@ impl RelationKind {
 /// What a process is to the stores it registered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Residency {
-    /// Opened its own stores and has not re-homed: the pre-fork master, and any
-    /// standalone host. The only residency that may read or delete across ranks,
-    /// because it is the only one that can speak for a rank it is not.
+    /// The server's master: holds the system families' stores and no user store,
+    /// which is what lets it relay and reclaim any rank's children.
+    Master,
+    /// A standalone host — a mirror, a unit-test engine or fixture: owns every
+    /// store it registers, at its slot, and may read any rank's manifests.
     Origin,
-    /// Re-homed onto this worker's own slot. Owns its stores; speaks for itself.
+    /// A forked worker, at its own slot. Owns its stores; speaks for itself.
     Worker,
-    /// Holds no user store: the post-fork master, which detached every one.
-    Detached,
 }
 
 impl Residency {
-    /// True while this process owns the stores it registered.
+    /// True iff this process opens a store for every relation it registers.
     #[inline]
     pub fn owns_stores(self) -> bool {
-        !matches!(self, Residency::Detached)
+        !matches!(self, Residency::Master)
     }
 }
 
@@ -454,14 +452,14 @@ impl StoreConfig {
 /// are non-atomic.
 pub struct RelationRegistry {
     pub(crate) tables: FxHashMap<i64, Relation>,
-    /// Which worker this process is, of how many: what names the `w{k}of{n}`
-    /// child every store of this process opens. The pre-fork master is
-    /// `(0, W)`, so it opens the child worker 0 will inherit; a worker becomes
-    /// its own slot through [`Self::rehome`].
+    /// Which worker this process is, of how many: names the `w{k}of{n}` child
+    /// its stores open under.
     pub(crate) slot: Slot,
     pub(crate) config: StoreConfig,
     /// What this process is to the stores it registered.
     pub(crate) residency: Residency,
+    /// Set by [`Self::reconcile_child_dirs`]; [`Self::open_stores`] requires it.
+    pub(crate) children_reconciled: bool,
     /// The generation a manifest must carry to be resumed from.
     pub(crate) resume_generation: u64,
     /// See [`RelationRegistry::set_resume_enabled`]. `false` until a host says
@@ -470,10 +468,8 @@ pub struct RelationRegistry {
 }
 
 impl RelationRegistry {
-    /// An empty registry at `slot`, tuned by `config`. The one constructor:
-    /// `CatalogEngine::open` calls it with `(0, launched worker count)` and the
-    /// server's environment overrides, `Mirror::open` with [`Slot::SOLO`].
-    /// `config.scan_chunk_rows` is clamped to at least one row.
+    /// An empty [`Residency::Origin`] registry at `slot`, tuned by `config`, whose
+    /// `scan_chunk_rows` is clamped to at least one row.
     pub fn new(slot: Slot, config: StoreConfig) -> Self {
         RelationRegistry {
             tables: FxHashMap::default(),
@@ -483,8 +479,18 @@ impl RelationRegistry {
                 ..config
             },
             residency: Residency::Origin,
+            children_reconciled: false,
             resume_generation: 0,
             resume_enabled: false,
+        }
+    }
+
+    /// An empty [`Residency::Master`] registry for `worker_count` workers, tuned
+    /// by `config`.
+    pub fn master(worker_count: u32, config: StoreConfig) -> Self {
+        RelationRegistry {
+            residency: Residency::Master,
+            ..Self::new(Slot::new(0, worker_count), config)
         }
     }
 
@@ -497,8 +503,8 @@ impl RelationRegistry {
 
     /// Enter a secondary index on `owner` over `cols` and open this process's
     /// store for it under `<owner dir>/idx_<index_id>/w{rank}of{n}`. The index
-    /// directory is created on every process, so the post-fork master — which
-    /// registers no store — still owns the path a later DROP removes.
+    /// directory is created on every process, so the master — which opens no
+    /// user store — still owns the path a later DROP removes.
     pub fn add_index(&mut self, owner: i64, index_id: i64, cols: &[u32], is_unique: bool) -> Result<(), StoreError> {
         let (owner_schema, owner_dir) = {
             let e = self.relation_or_err(owner)?;
@@ -601,11 +607,6 @@ impl RelationRegistry {
             .store
             .swap_schema(schema)
             .map_err(|e| StoreError::storage(format!("ALTER on table {id}: reopening shards"), e))
-    }
-
-    /// Drop every entry, and with it every owned store and its fds.
-    pub fn close(&mut self) {
-        self.tables.clear();
     }
 
     // ── Registry reads ──────────────────────────────────────────────────

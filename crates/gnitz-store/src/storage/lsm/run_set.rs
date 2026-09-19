@@ -115,6 +115,7 @@ impl RunSet {
     }
 
     /// Rebind the ceiling a drain is judged against.
+    #[cfg(test)]
     pub(super) fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
         self.bloom.take(); // its key capacity was sized from the old budget

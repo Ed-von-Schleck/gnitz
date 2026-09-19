@@ -8,7 +8,7 @@
 //! without a server.
 
 use super::super::*;
-use crate::test_support::{idx_tab_batch, push_col_tab_row, push_table_tab_row};
+use crate::test_support::{idx_tab_batch, push_table_tab_row};
 use gnitz_wire::pack_pk_cols;
 use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 
@@ -267,9 +267,7 @@ impl CatalogEngine {
 
     pub(in crate::catalog) fn build_col_batch(&self, owner_id: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
         let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-        for (i, cd) in col_defs.iter().enumerate() {
-            push_col_tab_row(&mut bb, owner_id, i as i64, cd, weight);
-        }
+        write_col_tab_rows(&mut bb, owner_id, col_defs, weight);
         bb.finish()
     }
 

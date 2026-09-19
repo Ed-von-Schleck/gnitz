@@ -169,6 +169,10 @@ pub(crate) struct Table {
     /// legitimately empty index over a large owner.
     resumed_from_checkpoint: bool,
 
+    /// Set by [`Self::hold_in_ram`]: the RAM tier folds past its budget but never
+    /// persists.
+    held_in_ram: bool,
+
     /// Reused candidate pool for `live_row_at`'s grouping pass; taken out and
     /// handed back per call (dropping its `Rc`s) with capacity retained, so the
     /// path stops allocating once warmed up. In a `Cell` so the probe that fills
@@ -215,6 +219,7 @@ impl Table {
             recovery_source,
             current_lsn: 1,
             resumed_from_checkpoint: false,
+            held_in_ram: false,
             retract_scratch: Cell::new(Vec::new()),
             cached_full_scan: Cell::new(None),
         };
@@ -328,7 +333,7 @@ impl Table {
     /// Never spill again: a process that holds this store as a read replica of
     /// another process's directory must not write into it.
     pub(crate) fn hold_in_ram(&mut self) {
-        self.ram_tier.set_budget(usize::MAX);
+        self.held_in_ram = true;
     }
 
     // ------------------------------------------------------------------

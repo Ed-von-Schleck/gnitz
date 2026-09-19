@@ -5,27 +5,6 @@
 use super::*;
 use gnitz_foundation::fault::Seam;
 
-/// What [`RelationRegistry::register`] does to `spec`'s existing children before
-/// it opens its own store.
-///
-/// The caller decides, because only the caller knows whether its worker count is
-/// the cluster's. A registry opened at some rank to read or write one child is
-/// `Residency::Origin` too, and a relayout triggered off *its* count would relay
-/// the whole relation onto a count nobody launched.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OnRegister {
-    /// Open the store as the directory stands — every live DDL, every
-    /// compensation, and every test fixture.
-    Live,
-    /// This registration is the boot shard replay, and this process's worker
-    /// count is the one the cluster launched: a **base table**'s existing
-    /// children are relayed onto it first. Bound to the open because the
-    /// relayout reads the previous child set, which the open would shadow and
-    /// `reconcile_child_dirs` would then delete. No other kind carries rows
-    /// across a worker-count change.
-    BootReplay,
-}
-
 /// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
 /// directory and its child subdir, so a concurrent DROP races it.
 static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
@@ -38,20 +17,7 @@ impl RelationRegistry {
     ///
     /// Opens through [`staged_dir`], so a directory this call creates is removed
     /// again if the open fails and has its parent fsynced if it succeeds.
-    pub fn register(&mut self, spec: RelationSpec, on: OnRegister) -> Result<(), StoreError> {
-        // Before the open, and for a base table only: the relayout reads the
-        // previous child set, which the open would shadow and
-        // `reconcile_child_dirs` would then delete.
-        if matches!(on, OnRegister::BootReplay) && spec.kind.is_base_table() {
-            crate::storage::repartition_relation(
-                &spec.directory,
-                &spec.schema,
-                spec.id as u32,
-                self.slot.of,
-                self.config.ram_tier_bytes,
-                self.config.scan_chunk_rows,
-            )?;
-        }
+    pub fn register(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
         let stores = staged_dir(&spec.directory, || {
             self.build_relation_store(spec.kind, &spec.directory, spec.id, spec.schema, spec.props)
         })?;
@@ -59,19 +25,9 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Build this process's store for a top-level relation: one `Table` under
-    /// this slot's `w{rank}of{n}` child. Only user relations are built here —
-    /// system catalog tables are plain single `Table`s built at bootstrap.
-    ///
-    /// The child is homed at THIS process's own worker rank, so a live CREATE on
-    /// each worker post-fork builds a distinct dir. Both store-less cases are
-    /// decided here rather than at the callers, so a new caller cannot build a
-    /// `Table` for one of them.
-    ///
-    /// A fed view's delta store is opened here too and the capacity stamped here,
-    /// so neither can come back missing from a rehome or a rebuild. Creates
-    /// `directory` when the kind owns a store; [`staged_dir`] makes that creation
-    /// crash-safe.
+    /// Build this process's stores for a top-level relation: one `Table` at this
+    /// slot's `w{rank}of{n}` child (flat under `directory` for a system family),
+    /// and a fed view's delta store. Every open and rebuild comes through here.
     pub(crate) fn build_relation_store(
         &self,
         kind: RelationKind,
@@ -80,10 +36,8 @@ impl RelationRegistry {
         schema: SchemaDescriptor,
         props: ViewProps,
     ) -> Result<(Store, Option<Box<Store>>), StoreError> {
-        // Above every early return below, so it runs on **every** process: the
-        // post-fork master opens no user store at all, and a limit first noticed
-        // on a worker would be a fatal abort taken after the client was told the
-        // CREATE succeeded.
+        // On every process, the master included: a limit first noticed on a
+        // worker would abort after the CREATE was acknowledged.
         let delta = props
             .delta_bytes()
             .map(|budget| {
@@ -105,7 +59,7 @@ impl RelationRegistry {
             RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
         };
         ensure_dir(directory)?;
-        if !self.residency.owns_stores() {
+        if kind != RelationKind::SystemCatalog && !self.residency.owns_stores() {
             return Ok((Store::detached(schema), None));
         }
 
@@ -126,7 +80,7 @@ impl RelationRegistry {
             _ => ChildAddr::worker(self.slot).dir(directory),
         };
         // Every store this worker opens for a relation comes through here, so a
-        // bounded view cannot come back unbounded from a rehome or a rebuild.
+        // bounded view cannot come back unbounded from a reopen or a rebuild.
         let table = Table::new(
             &child_dir,
             schema,

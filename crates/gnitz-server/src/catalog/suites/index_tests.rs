@@ -2380,7 +2380,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // and its index directly (as `wide_pk_validation.rs` does). The leading PK
     // column is distinct per row, so the base flush orders the shard by the wide
     // PK — which the resolve's binary-search seek relies on.
-    use gnitz_store::relation::{OnRegister, RelationKind};
+    use gnitz_store::relation::RelationKind;
     use gnitz_store::schema::SchemaDescriptor;
 
     let dir = temp_dir("catalog_range_wide_pk");
@@ -2406,16 +2406,13 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
 
     engine
         .registry_mut()
-        .register(
-            RelationSpec {
-                id: tid,
-                kind: RelationKind::BaseTable,
-                schema,
-                directory: dir.clone(),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: tid,
+            kind: RelationKind::BaseTable,
+            schema,
+            directory: dir.clone(),
+            props: ViewProps::default(),
+        })
         .unwrap();
     engine.registry_mut().add_index(tid, tid + 1, &[3], false).unwrap();
     // The registry projects the index itself, from the same `key_spec` and index

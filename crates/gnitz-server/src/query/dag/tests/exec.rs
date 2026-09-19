@@ -197,7 +197,8 @@ impl ExchangeCallback for Recorder {
 fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
     let cols = view_cols();
     for rank in [0u32, 1] {
-        let mut engine = CatalogEngine::open(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2).unwrap();
+        let mut engine =
+            CatalogEngine::open_master(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2).unwrap();
         let replicated = engine.allocate_ids(1).unwrap();
         engine.write_column_records(replicated, &cols).unwrap();
         let mut bb = gnitz_store::storage::BatchBuilder::new(*crate::catalog::SysFamily::Table.schema());
@@ -213,7 +214,10 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
         );
         engine.submit(crate::catalog::SysFamily::Table, bb.finish()).unwrap();
         let keyed = engine.create_table("public.kt", &cols, &[0]).unwrap();
-        engine.become_worker(gnitz_store::storage::Slot::new(rank, 2)).unwrap();
+        engine.registry_mut().reconcile_child_dirs().unwrap();
+        engine
+            .open_stores(rank, gnitz_store::relation::Residency::Worker)
+            .unwrap();
 
         let delta = delta_for(&engine, replicated, &[(1, 1, 10), (2, 1, 20)]);
         let registry = engine.registry();

@@ -127,9 +127,7 @@ impl DagEngine {
         self.views.remove(&view_id);
     }
 
-    /// Drop every memo. Only `close` and the tests that assert a cold
-    /// recompile want this: a memo is a pure function of the circuit and the
-    /// registry's schemas, so clearing one discards work rather than staleness.
+    /// Drop every memo, for the tests that assert a cold recompile.
     #[cfg(test)]
     pub(crate) fn invalidate_all(&mut self) {
         self.views.clear();
@@ -230,14 +228,6 @@ impl DagEngine {
         // `map(drop)` closes the plan — and the child stores it opened under
         // `root` — before the caller removes the directory.
         compile_circuit(registry, view_id, root, entry).map(drop)
-    }
-
-    /// Close the DagEngine, dropping all cached plans. Reached from the
-    /// crash-semantics tests through `CatalogEngine::close`; the server flushes
-    /// durably per zone and exits via abort or process teardown instead.
-    #[cfg(test)]
-    pub(crate) fn close(&mut self) {
-        self.invalidate_all();
     }
 
     /// Every compiled view plan's operator state, for the ephemeral checkpoint

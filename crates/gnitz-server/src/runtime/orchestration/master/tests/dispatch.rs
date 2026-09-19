@@ -155,7 +155,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
 /// A whole checkpoint is `reclaim_base` + `restamp_derived`: the base round owns
 /// the one generation bump that invalidates every checkpointed view, and the
 /// ephemeral round re-stamps the derived state at that same generation, so
-/// nothing is left rebuild-on-boot. `boot_checkpoint` is one such pair.
+/// nothing is left rebuild-on-boot.
 #[test]
 fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -188,9 +188,10 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     disp.boot_checkpoint(1).unwrap();
     assert_eq!(
         disp.cat().durable_generation(),
-        gen + 2,
-        "boot_checkpoint is one whole checkpoint, not two bumps",
+        gen + 1,
+        "boot_checkpoint restamps at the reserved generation without a bump",
     );
+    assert!(!disp.derived_needs_restamp());
 
     drop(disp);
     engine.close();

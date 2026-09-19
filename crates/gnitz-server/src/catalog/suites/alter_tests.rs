@@ -318,7 +318,11 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
     // > 12 bytes — the Column precheck arm must reject it via the CAS.
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     for (weight, name) in [(-1i64, "stale_wrong_column_x"), (1i64, "new_column_name_here")] {
-        push_col_tab_row(&mut bb, tid, col_idx, &col_def(name, type_code::U64), weight);
+        write_col_tab_row(
+            &mut bb,
+            &col_def(name, type_code::U64).col_tab_row(tid, col_idx as usize),
+            weight,
+        );
     }
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(
@@ -512,7 +516,7 @@ fn a_duplicate_add_column_is_named_before_dependent_views() {
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, tid, 2, &nullable_def("v", type_code::U64), 1);
+    write_col_tab_row(&mut bb, &nullable_def("v", type_code::U64).col_tab_row(tid, 2), 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("duplicate column name"), "{err}");
 
@@ -607,7 +611,7 @@ fn a_column_alter_must_be_its_bundles_only_change() {
         )
         .unwrap();
     let append = |owner: i64, bb: &mut BatchBuilder| {
-        push_col_tab_row(bb, owner, 2, &nullable_def("w", type_code::I64), 1);
+        write_col_tab_row(bb, &nullable_def("w", type_code::I64).col_tab_row(owner, 2), 1);
     };
 
     // An append bundled with an index family.

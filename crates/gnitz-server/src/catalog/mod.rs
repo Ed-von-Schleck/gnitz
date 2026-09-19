@@ -44,18 +44,18 @@ use std::fs;
 use std::rc::Rc;
 
 use crate::query::DagEngine;
-use gnitz_store::relation::{
-    OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig,
-};
+use gnitz_store::relation::{Relation, RelationKind, RelationRegistry, RelationSpec, Residency, StoreConfig};
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, ReadCursor, Slot, StoreError, StoredRow};
+use gnitz_store::storage::{Batch, ReadCursor, StoreError, StoredRow};
 use gnitz_wire::ViewProps;
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
+#[cfg(test)]
+pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
-pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID};
+pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID};
 pub(crate) use types::{ColumnDef, FkEdge};
 // The anonymous schema-wire-block encoder, for a schema no catalog entry describes.
 pub(crate) use schema_block::encode_schema_block;
@@ -110,19 +110,9 @@ pub(crate) struct CatalogEngine {
     /// relation registrations.
     pub(in crate::catalog) caches: CatalogCacheSet,
 
-    /// True in the master process, whose index copies stay permanently empty:
-    /// its index hook skips the backfill the workers run slice-local. Set by
-    /// `open_master`, cleared by `become_worker`.
-    pub(in crate::catalog) is_master: bool,
-
     /// The next catalog object id (schema, relation or index) `allocate_ids`
     /// hands out. Every applied id-bearing row raises it past its own id.
     pub(in crate::catalog) next_id: i64,
-    /// The checkpoint generation. Recovered at boot (0 on a fresh DB).
-    pub(in crate::catalog) durable_generation: u64,
-    /// The recorded topology word, `0` on a fresh DB — which no real word can
-    /// equal. Half of every resume verdict.
-    pub(in crate::catalog) recorded_topology: u64,
     /// View ids whose checkpointed state — output stores and operator traces
     /// alike — was rejected at boot (generation mismatch, topology change, or a
     /// transitively-invalid source view) and must

@@ -7,7 +7,7 @@ use crate::schema::{IndexKeySpec, SchemaDescriptor};
 use crate::storage::{Batch, ReadCursor, StorageError, Table};
 
 /// One store this process may hold, and the schema it is read in. A stream has
-/// one nowhere and the post-fork master detached every one; both read empty and
+/// one nowhere and the master opens no user store; both read empty and
 /// absorb nothing.
 ///
 /// The schema is held beside the `Table` rather than read off it: a process

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, zset_of};
-use gnitz_store::relation::{OnRegister, RelationKind, RelationRegistry, RelationSpec, StateIdx, StoreConfig};
+use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateIdx, StoreConfig};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, Slot, StorageError};
 use gnitz_wire::type_code;
@@ -26,16 +26,13 @@ const VIEW_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 fn vm_registry(dir: &std::path::Path) -> RelationRegistry {
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry
-        .register(
-            RelationSpec {
-                id: VIEW_ID,
-                kind: RelationKind::View,
-                schema: make_schema_u128_i64(),
-                directory: dir.to_str().unwrap().to_string(),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: VIEW_ID,
+            kind: RelationKind::View,
+            schema: make_schema_u128_i64(),
+            directory: dir.to_str().unwrap().to_string(),
+            props: ViewProps::default(),
+        })
         .unwrap();
     registry
 }

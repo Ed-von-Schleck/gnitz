@@ -128,42 +128,29 @@ impl CatalogEngine {
         Ok((base, self.sequence_delta(seq_id, last as u64)))
     }
 
-    /// The master scalars, by seq id: what [`Self::flush_all_system_tables`]
-    /// writes to `_sequences` and [`Self::load_sequence_scalars`] reads back.
-    fn sequence_scalars(&self) -> [(i64, u64); 3] {
-        [
-            (SEQ_ID_NEXT_ID, self.next_id as u64),
-            (SEQ_ID_CHECKPOINT_GEN, self.durable_generation),
-            (SEQ_ID_TOPOLOGY, self.recorded_topology),
-        ]
+    /// Move `_sequences` row `seq_id` to `value`.
+    fn set_sequence(&mut self, seq_id: i64, value: u64) -> Result<(), String> {
+        let delta = self.sequence_delta(seq_id, value);
+        self.registry
+            .ingest(SysFamily::Sequence.id(), delta)
+            .map_err(|e| format!("sys_sequences ingest (seq {seq_id}) failed: {e}"))
     }
 
-    /// Write the master scalars to `_sequences`, then flush every system table in
-    /// one barrier.
+    /// Write the next catalog id to `_sequences`, then flush every system table
+    /// in one barrier.
     pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
-        for (seq_id, value) in self.sequence_scalars() {
-            let delta = self.sequence_delta(seq_id, value);
-            self.registry
-                .ingest(SysFamily::Sequence.id(), delta)
-                .map_err(|e| format!("sys_sequences ingest (seq {seq_id}) failed: {e}"))?;
-        }
-        self.registry.checkpoint_system().map_err(|e| e.to_string())
+        self.set_sequence(SEQ_ID_NEXT_ID, self.next_id as u64)?;
+        Ok(self.registry.checkpoint_system()?)
     }
 
-    /// Load the master scalars stored in `_sequences`, and latch the registry's
-    /// resume verdict and generation from them.
+    /// Load the next catalog id stored in `_sequences`, and latch the registry's
+    /// resume verdict and generation from the checkpoint rows beside it.
     pub(in crate::catalog) fn load_sequence_scalars(&mut self) {
         if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {
             self.next_id = v as i64;
         }
-        if let Some(v) = self.sequence_value(SEQ_ID_CHECKPOINT_GEN) {
-            self.durable_generation = v;
-        }
-        if let Some(v) = self.sequence_value(SEQ_ID_TOPOLOGY) {
-            self.recorded_topology = v;
-        }
         self.registry.set_resume_enabled(self.topology_matches());
-        self.registry.set_resume_generation(self.durable_generation);
+        self.registry.set_resume_generation(self.durable_generation());
     }
 
     // -- Checkpoint records -------------------------------------------------
@@ -171,10 +158,11 @@ impl CatalogEngine {
     /// Advance the checkpoint generation and flush it durable, leaving the resume
     /// generation where it is.
     pub(crate) fn advance_durable_generation(&mut self) -> Result<u64, String> {
-        self.durable_generation += 1;
+        let g = self.durable_generation() + 1;
+        self.set_sequence(SEQ_ID_CHECKPOINT_GEN, g)?;
         self.flush_all_system_tables()
             .map_err(|e| format!("checkpoint generation flush failed: {e}"))?;
-        Ok(self.durable_generation)
+        Ok(g)
     }
 
     /// [`Self::advance_durable_generation`], then stamp every manifest published
@@ -185,11 +173,27 @@ impl CatalogEngine {
         Ok(g)
     }
 
+    /// The ephemeral checkpoint round: persist every view's operator traces and
+    /// output stores, and every index, at the registry's resume generation.
+    pub(crate) fn flush_ephemeral_round(&mut self) -> Result<(), String> {
+        let CatalogEngine { registry, dag, .. } = self;
+        Ok(registry.checkpoint_ephemeral(dag.collect_ephemeral_state())?)
+    }
+
+    /// Unlink the manifest of every store [`Self::flush_ephemeral_round`]
+    /// publishes, so the next open erases those stores instead of resuming them.
+    pub(crate) fn unlink_derived_manifests(&mut self) {
+        let CatalogEngine { registry, dag, .. } = self;
+        let state = dag.collect_ephemeral_state();
+        registry.unlink_ephemeral_manifests(state);
+    }
+
     /// Record the launched topology and latch the registry's resume verdict from
-    /// it.
-    pub(crate) fn record_topology(&mut self, worker_count: u32) {
-        self.recorded_topology = topology_word(worker_count);
+    /// it. Durable at the next system flush.
+    pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), String> {
+        self.set_sequence(SEQ_ID_TOPOLOGY, topology_word(worker_count))?;
         self.registry.set_resume_enabled(self.topology_matches());
+        Ok(())
     }
 }
 

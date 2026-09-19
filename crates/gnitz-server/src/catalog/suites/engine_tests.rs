@@ -197,17 +197,17 @@ fn test_recover_checkpoint_gen_and_topology() {
     let expected_topology = crate::catalog::registry::topology_word(4);
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.durable_generation, 0);
-        assert_eq!(engine.recorded_topology, 0);
-        engine.record_topology(4);
-        assert_eq!(engine.recorded_topology, expected_topology);
+        assert_eq!(engine.durable_generation(), 0);
+        assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), 0);
+        engine.record_topology(4).unwrap();
+        assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), expected_topology);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 2);
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.durable_generation, 2);
-    assert_eq!(engine.recorded_topology, expected_topology);
+    assert_eq!(engine.durable_generation(), 2);
+    assert_eq!(engine.sequence_value(SEQ_ID_TOPOLOGY).unwrap_or(0), expected_topology);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -217,14 +217,14 @@ fn test_boot_generation_advance_monotonic() {
     let dir = temp_dir("recovery_start_gen_bump");
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        engine.record_topology(4);
+        engine.record_topology(4).unwrap();
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 2);
         engine.close();
     }
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.durable_generation, 2);
+        assert_eq!(engine.durable_generation(), 2);
         assert_eq!(engine.advance_durable_generation().unwrap(), 3);
         assert_eq!(engine.registry().resume_generation(), 2);
         assert_eq!(engine.sequence_value(SEQ_ID_CHECKPOINT_GEN), Some(3));
@@ -233,7 +233,7 @@ fn test_boot_generation_advance_monotonic() {
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.durable_generation, 4);
+    assert_eq!(engine.durable_generation(), 4);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -290,7 +290,7 @@ fn test_sequence_gap_recovery() {
 
         // Inject column record for tid=250
         let mut cbb = BatchBuilder::new(*SysFamily::Column.schema());
-        push_col_tab_row(&mut cbb, 250, 0, &col_def("id", type_code::U64), 1);
+        write_col_tab_row(&mut cbb, &col_def("id", type_code::U64).col_tab_row(250, 0), 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
         let _ = engine.registry.flush(SysFamily::Table.id());
@@ -529,24 +529,28 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_store_detach ─────────────────────────────────────────────────
+// ── test_master_holds_no_user_store ───────────────────────────────
 
-/// Detaching (what the post-fork master does) leaves every registered relation
-/// readable-as-empty and writable-as-a-no-op, rather than panicking or holding a
-/// second live `Table` on worker 0's directory.
+/// The master registers every relation but opens only the system families'
+/// stores.
 #[test]
-fn test_store_detach() {
-    let dir = temp_dir("catalog_store_detach");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+fn test_master_holds_no_user_store() {
+    let dir = temp_dir("catalog_master_no_user_store");
+    let mut engine = CatalogEngine::open_master(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    assert!(engine.registry().residency().owns_stores());
 
-    engine.registry_mut().detach();
     assert!(!engine.registry().residency().owns_stores());
     let entry = engine.registry().relation_or_err(tid).unwrap();
-    assert!(!entry.cursor().valid, "a detached store reads empty");
+    assert!(!entry.cursor().valid, "the master's copy of a user store reads empty");
     assert_eq!(entry.current_lsn(), 0);
+    for family in [SysFamily::Schema, SysFamily::Table, SysFamily::Column] {
+        assert!(
+            engine.sys_relation(family).cursor().valid,
+            "{} still reads its seed rows",
+            family.name()
+        );
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -725,8 +729,8 @@ fn test_dependent_view_restricts_fire_from_circuit_rows() {
     let mut nullable = cols[1].clone();
     nullable.is_nullable = true;
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, tid, 1, &cols[1], -1);
-    push_col_tab_row(&mut bb, tid, 1, &nullable, 1);
+    write_col_tab_row(&mut bb, &cols[1].col_tab_row(tid, 1), -1);
+    write_col_tab_row(&mut bb, &nullable.col_tab_row(tid, 1), 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 

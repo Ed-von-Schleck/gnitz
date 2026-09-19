@@ -708,15 +708,11 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Boot-end checkpoint, as exclusive rounds: record the
-    /// launched topology, then reclaim and re-stamp. The drain set is empty —
-    /// recovery already drained everything and no pushes are admitted yet (the
-    /// socket is not open), so `pending_deltas` is empty. Freshly backfilled
-    /// views are durably checkpointed before the socket opens.
+    /// Boot-end checkpoint: record the launched topology, then restamp every view
+    /// and index at the generation reserved pre-fork. The workers published their
+    /// base stores during recovery, and no push is admitted yet.
     pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), WireFault> {
-        // Recorded before `reclaim_base`, whose generation bump makes it durable.
-        self.cat().record_topology(worker_count);
-        self.reclaim_base()?;
+        self.cat().record_topology(worker_count)?;
         self.restamp_derived(&[])
     }
 

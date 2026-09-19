@@ -75,7 +75,7 @@ impl CatalogEngine {
             .ingest(id, batch.clone())
             .map_err(|e| format!("sys-table ingest failed (family={id}): {e}"))?;
         batch.set_schema(family.schema());
-        self.fire_hooks(family, &batch, OnRegister::Live)
+        self.fire_hooks(family, &batch)
     }
 
     /// Apply one DdlSync group — a worker's broadcast or the master's pre-fork SAL

@@ -6,7 +6,7 @@
 //! enforcement over a wide PK runs distributed and is covered end-to-end.
 
 use super::*;
-use gnitz_store::relation::{OnRegister, Relation, RelationKind};
+use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::BatchBuilder;
 
@@ -34,16 +34,13 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
     let schema = wide_unique_schema();
     engine
         .registry_mut()
-        .register(
-            RelationSpec {
-                id: tid,
-                kind: RelationKind::BaseTable,
-                schema,
-                directory: dir.to_string(),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: tid,
+            kind: RelationKind::BaseTable,
+            schema,
+            directory: dir.to_string(),
+            props: ViewProps::default(),
+        })
         .unwrap();
     engine.registry_mut().add_index(tid, tid + 1, &[3], true).unwrap();
     // The registry projects the index itself, from the same `key_spec` and index
@@ -106,16 +103,13 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
     engine
         .registry_mut()
-        .register(
-            RelationSpec {
-                id: parent_tid,
-                kind: RelationKind::BaseTable,
-                schema: parent_schema,
-                directory: dir.clone(),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: parent_tid,
+            kind: RelationKind::BaseTable,
+            schema: parent_schema,
+            directory: dir.clone(),
+            props: ViewProps::default(),
+        })
         .unwrap();
     engine.registry_mut().ingest(parent_tid, pb).unwrap();
     engine.registry_mut().flush(parent_tid).unwrap();

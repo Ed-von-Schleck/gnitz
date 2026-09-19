@@ -7,8 +7,7 @@
 use crate::catalog::{CatalogEngine, ColumnDef, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
-    write_circuit_rows, write_col_tab_row, write_idx_tab_row, write_table_tab_row, ColTabRow, IdxTabRow, SysRowSink,
-    TableTabRow,
+    write_circuit_rows, write_idx_tab_row, write_table_tab_row, IdxTabRow, SysRowSink, TableTabRow,
 };
 use gnitz_wire::type_code;
 use gnitz_wire::Circuit;
@@ -96,28 +95,6 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: 
 //
 // Fixtures over `gnitz_wire::sys_rows`' codecs, defaulting what a test never
 // varies. Production writes the wire struct inline.
-
-/// Append one COL_TAB row for column `col_idx` of `owner_id`. Takes the whole
-/// `ColumnDef` rather than its fields, mirroring the catalog's read side, which
-/// reassembles exactly this struct.
-pub fn push_col_tab_row(bb: &mut BatchBuilder, owner_id: i64, col_idx: i64, cd: &ColumnDef, weight: i64) {
-    write_col_tab_row(
-        bb,
-        &ColTabRow {
-            owner_id: owner_id as u64,
-            col_idx: col_idx as u64,
-            name: &cd.name,
-            type_code: cd.type_code as u64,
-            is_nullable: cd.is_nullable,
-            fk_table_id: cd.fk_table_id as u64,
-            fk_col_idx: cd.fk_col_idx as u64,
-            is_serial: cd.is_serial,
-            is_hidden: cd.is_hidden,
-            scale: cd.scale,
-        },
-        weight,
-    );
-}
 
 /// Append one TABLE_TAB row at `weight`.
 pub fn push_table_tab_row(

@@ -11,7 +11,10 @@ use super::ColumnDef;
 use gnitz_expr::RowSource;
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{payload_str, payload_string, payload_u64, Batch};
+use gnitz_store::storage::{payload_str, payload_string, payload_u64, Batch, BatchBuilder};
+use gnitz_wire::sys_rows::{
+    write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, TableTabRow,
+};
 use gnitz_wire::ViewProps;
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
@@ -188,6 +191,32 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
         is_serial: payload_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
         is_hidden: payload_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
         scale: payload_u64(src, row, COLTAB_PAY_SCALE) as u8,
+    }
+}
+
+impl ColumnDef {
+    /// This column as COL_TAB row `(owner_id, col_idx)` — the inverse of
+    /// [`read_col_tab_row`].
+    pub(super) fn col_tab_row(&self, owner_id: i64, col_idx: usize) -> ColTabRow<'_> {
+        ColTabRow {
+            owner_id: owner_id as u64,
+            col_idx: col_idx as u64,
+            name: &self.name,
+            type_code: self.type_code as u64,
+            is_nullable: self.is_nullable,
+            fk_table_id: self.fk_table_id as u64,
+            fk_col_idx: self.fk_col_idx as u64,
+            is_serial: self.is_serial,
+            is_hidden: self.is_hidden,
+            scale: self.scale,
+        }
+    }
+}
+
+/// `defs` as `owner_id`'s COL_TAB rows, keyed by position, at `weight`.
+pub(super) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: i64, defs: &[ColumnDef], weight: i64) {
+    for (i, cd) in defs.iter().enumerate() {
+        write_col_tab_row(bb, &cd.col_tab_row(owner_id, i), weight);
     }
 }
 
@@ -421,6 +450,50 @@ impl SysFamily {
     #[inline]
     pub(crate) fn schema(self) -> &'static SchemaDescriptor {
         &SCHEMAS[self.index()]
+    }
+
+    /// This family's column definitions, from the same wire slice its schema is
+    /// built from — compile-time data, never read back from COL_TAB.
+    pub(in crate::catalog) fn column_defs(self) -> Vec<ColumnDef> {
+        self.wire()
+            .cols
+            .iter()
+            .map(|c| ColumnDef {
+                name: c.name.to_string(),
+                type_code: c.type_code as u8,
+                is_nullable: c.nullable,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// The rows a fresh database's store of this family starts with.
+    pub(in crate::catalog) fn write_seed_rows(self, bb: &mut BatchBuilder) {
+        match self {
+            SysFamily::Schema => {
+                for (schema_id, name) in [(SYSTEM_SCHEMA_ID, "_system"), (PUBLIC_SCHEMA_ID, "public")] {
+                    write_schema_tab_row(bb, &SchemaTabRow { schema_id: schema_id as u64, name }, 1);
+                }
+            }
+            SysFamily::Table => {
+                for family in SysFamily::ALL {
+                    let row = TableTabRow {
+                        table_id: family.id() as u64,
+                        schema_id: SYSTEM_SCHEMA_ID as u64,
+                        name: family.name(),
+                        pk_col_idx: gnitz_wire::pack_pk_cols(family.wire().pk_cols),
+                        flags: 0,
+                    };
+                    write_table_tab_row(bb, &row, 1);
+                }
+            }
+            SysFamily::Column => {
+                for family in SysFamily::ALL {
+                    write_col_tab_rows(bb, family.id(), &family.column_defs(), 1);
+                }
+            }
+            SysFamily::View | SysFamily::Index | SysFamily::Sequence | SysFamily::CircuitNodes => {}
+        }
     }
 
     /// Topological creation priority: lower = created first, destroyed last.

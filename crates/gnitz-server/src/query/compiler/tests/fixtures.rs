@@ -3,7 +3,7 @@
 //! private items.
 
 use super::*;
-use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig};
+use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::storage::Slot;
 use gnitz_wire::ViewProps;
 
@@ -94,9 +94,7 @@ pub(in crate::query) fn register_sources(
             directory: String::new(),
             props: ViewProps::default(),
         };
-        registry
-            .register(spec, OnRegister::Live)
-            .expect("a stream registers without a store");
+        registry.register(spec).expect("a stream registers without a store");
     }
 }
 

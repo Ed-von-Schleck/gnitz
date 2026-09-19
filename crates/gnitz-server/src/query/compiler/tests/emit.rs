@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_batch, make_schema_u64_i64, pk_only_schema, pk_payload_schema, sum_weights};
-use gnitz_store::relation::{CircuitState, OnRegister, RelationKind, RelationSpec, StoreConfig};
+use gnitz_store::relation::{CircuitState, RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::storage::Slot;
 use gnitz_wire::type_code;
@@ -77,16 +77,13 @@ fn home(dir: &str, id: u64, rows: impl IntoIterator<Item = (i64, SchemaDescripto
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     register_sources(&mut registry, rows);
     registry
-        .register(
-            RelationSpec {
-                id: id as i64,
-                kind: RelationKind::View,
-                schema: make_schema_u64_i64(),
-                directory: dir.to_string(),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: id as i64,
+            kind: RelationKind::View,
+            schema: make_schema_u64_i64(),
+            directory: dir.to_string(),
+            props: ViewProps::default(),
+        })
         .unwrap();
     Home { dir: dir.to_string(), id, registry }
 }
@@ -649,16 +646,13 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
     registry.set_resume_generation(G);
     registry.set_resume_enabled(true);
     registry
-        .register(
-            RelationSpec {
-                id: VIEW_ID as i64,
-                kind: RelationKind::View,
-                schema,
-                directory: dir.to_string(),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: VIEW_ID as i64,
+            kind: RelationKind::View,
+            schema,
+            directory: dir.to_string(),
+            props: ViewProps::default(),
+        })
         .unwrap();
     register_sources(&mut registry, [(10, schema)]);
 
@@ -668,7 +662,7 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
         .open_child(&registry, VIEW_ID as i64, dir, CHILD, schema)
         .unwrap();
     committed.ingest_owned(idx, make_batch(&schema, &[(1, 1, 5)])).unwrap();
-    registry.checkpoint_ephemeral(G, [&mut committed]).unwrap();
+    registry.checkpoint_ephemeral([&mut committed]).unwrap();
     committed.commit();
     drop(committed);
 

@@ -260,7 +260,7 @@ fn gc_is_idempotent() {
 // Boot relayout (`repartition_relation`) and child-dir reclamation
 // (`reconcile_child_dirs`)
 //
-// The relayout runs inside `CatalogEngine::open`; a test calls the sweep itself.
+// Both run inside the test `CatalogEngine::open`.
 // ---------------------------------------------------------------------------
 
 /// Register a REPLICATED base table with one row, and return
@@ -314,16 +314,13 @@ fn child_manifest(rel: &str, k: u32, of: u32) -> String {
 fn child_registry(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> RelationRegistry {
     let mut registry = RelationRegistry::new(Slot::new(k, of), StoreConfig::default());
     registry
-        .register(
-            RelationSpec {
-                id: tid,
-                kind: RelationKind::BaseTable,
-                schema,
-                directory: rel.to_string(),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: tid,
+            kind: RelationKind::BaseTable,
+            schema,
+            directory: rel.to_string(),
+            props: ViewProps::default(),
+        })
         .unwrap();
     registry
 }
@@ -409,6 +406,7 @@ fn retired_children_are_reclaimed() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    engine.close();
 
     // A set laid out for another count, and a scratch dir from a rank that no
     // longer exists.
@@ -420,7 +418,7 @@ fn retired_children_are_reclaimed() {
     // Not a child at all: an index dir must be left alone.
     fabricate_dir(&format!("{rel}/idx_7"), "marker");
 
-    engine.registry().reconcile_child_dirs().unwrap();
+    let engine = CatalogEngine::open(&dir, 3).unwrap();
 
     assert!(
         Path::new(&child_path(&rel, 0, 3)).exists(),
@@ -576,7 +574,6 @@ fn two_complete_sets_left_by_a_crash_relay_either() {
 
     let engine = CatalogEngine::open(&dir, 3).unwrap();
     assert_eq!(set_rows(&rel, 3, schema, tid), expected(&schema, &rows, 3));
-    engine.registry().reconcile_child_dirs().unwrap();
     for of in [2, 4] {
         for k in 0..of {
             assert!(
@@ -694,7 +691,6 @@ fn a_torn_foreign_set_moves_nothing() {
                 "{name}: w{k}of2 was relaid from a torn set"
             );
         }
-        engine.registry().reconcile_child_dirs().unwrap();
         for k in 0..4 {
             assert!(
                 !Path::new(&child_manifest(&rel, k, 4)).exists(),

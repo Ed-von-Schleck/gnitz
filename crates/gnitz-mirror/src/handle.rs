@@ -8,7 +8,7 @@ use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::gnitz_debug;
 use gnitz_store::relation::{
-    lock_data_dir, relation_dir, OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
+    lock_data_dir, relation_dir, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
 };
 use gnitz_store::storage::{Slot, StoreError};
 use gnitz_wire::ViewProps;
@@ -146,20 +146,17 @@ impl Mirror {
     pub(crate) fn enter(&mut self, tid: u64, rec: MirrorRecord) -> Result<(), MirrorError> {
         let schema = crate::register::descriptor_of_block(&rec.block)?;
         self.registry
-            .register(
-                RelationSpec {
-                    id: tid as i64,
-                    // `View` maps to `Rederive`, and gives the `v_` directory
-                    // prefix and the `RelClass::View` a copy reports.
-                    kind: RelationKind::View,
-                    schema,
-                    directory: relation_dir(&self.base_dir, RelationKind::View, tid as i64),
-                    // No skeleton row is ever written, so nothing can ask this
-                    // store to hydrate; and the store maintains no feed of its own.
-                    props: ViewProps::default(),
-                },
-                OnRegister::Live,
-            )
+            .register(RelationSpec {
+                id: tid as i64,
+                // `View` maps to `Rederive`, and gives the `v_` directory
+                // prefix and the `RelClass::View` a copy reports.
+                kind: RelationKind::View,
+                schema,
+                directory: relation_dir(&self.base_dir, RelationKind::View, tid as i64),
+                // No skeleton row is ever written, so nothing can ask this
+                // store to hydrate; and the store maintains no feed of its own.
+                props: ViewProps::default(),
+            })
             .map_err(engine)?;
         self.records.insert(tid, rec);
         Ok(())
@@ -238,7 +235,7 @@ impl Mirror {
         }
         let generation = self.registry.resume_generation() + 1;
         self.registry.set_resume_generation(generation);
-        self.registry.checkpoint_ephemeral(generation, []).map_err(engine)?;
+        self.registry.checkpoint_ephemeral([]).map_err(engine)?;
         write_state(&self.base_dir, generation, &block)?;
         self.published_block = block;
         Ok(())

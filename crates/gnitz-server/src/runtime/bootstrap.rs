@@ -24,7 +24,7 @@ use crate::runtime::tls::{setup_tls_listener, TlsCli};
 use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
-use gnitz_store::relation::Relation;
+use gnitz_store::relation::{Relation, Residency};
 use gnitz_store::storage::{Batch, Slot};
 
 // ---------------------------------------------------------------------------
@@ -232,15 +232,9 @@ fn worker_boot_recovery(
     walk_epoch: u32,
     swept_bases: &[i64],
 ) -> Result<HashMap<i64, Batch>, String> {
-    // Before any store is touched: each re-homes from the pre-fork master's
-    // child to this slot's own, and every plan compiled after this is baked with
-    // the slot.
-    catalog.become_worker(slot)?;
-    // Before the replay below, which projects the tail into each index exactly
-    // once: a rebuild after it would double-count every replayed row.
-    let rebuilt = catalog
-        .backfill_all_indexes()
-        .map_err(|e| format!("boot index backfill failed: {e}"))?;
+    // Before any other catalog work, and before the replay below, which
+    // projects the tail into each index exactly once.
+    let rebuilt = catalog.open_stores(slot.rank, Residency::Worker)?;
     // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
     // every index resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {rebuilt} index(es)");
@@ -252,7 +246,8 @@ fn worker_boot_recovery(
         "boot base flush without the pre-fork generation advance ahead of it",
     );
     catalog
-        .flush_base_round()
+        .registry_mut()
+        .checkpoint_base()
         .map_err(|e| format!("boot flush failed: {e}"))?;
     if BOOT_FLUSH_ERROR.armed() {
         return Err("injected boot flush fault".to_string());
@@ -392,7 +387,7 @@ fn run_worker_child(
 
     // Pin after the log re-tag, so a failed pin is recorded in this worker's own
     // `worker_N.log` rather than the master's stdout, and before every
-    // allocation below — trim, re-home, index rebuild, SAL replay, backfill —
+    // allocation below — trim, store open, index rebuild, SAL replay, backfill —
     // whose first touch decides which node its memory lands on.
     if let Some(p) = placement {
         p.pin_worker(w);
@@ -432,8 +427,8 @@ fn master_pre_fork_recovery(
 ) -> Result<(Vec<i64>, u64), String> {
     recover_system_tables_from_sal(log, walk_epoch, catalog)?;
 
-    // G → G+1 with the resume generation left at G: a crash before `boot_checkpoint`
-    // rebuilds every un-checkpointed view instead of resuming it stale.
+    // G → G+1, the resume generation left at G: until `boot_checkpoint`
+    // restamps at G+1, a crash rebuilds every view instead of resuming it.
     catalog.advance_durable_generation()?;
     if SYS_FLUSH_ERROR.armed() {
         return Err("injected system table flush fault".to_string());
@@ -445,10 +440,10 @@ fn master_pre_fork_recovery(
     // before the fork, so no worker is applying a DdlSync the master emitted.
     catalog.reclaim_orphan_dirs();
 
-    // Drop the child directories this boot's worker count no longer owns, before
-    // each worker's `rehome` opens what is left.
+    // Relay each base table onto this boot's worker count and drop the children
+    // it no longer owns, before any worker opens a store.
     catalog
-        .registry()
+        .registry_mut()
         .reconcile_child_dirs()
         .map_err(|e| format!("child-dir sweep failed: {e}"))?;
 
@@ -498,11 +493,6 @@ fn master_post_fork_recovery(
     num_workers: u32,
     swept_bases: &[i64],
 ) -> Result<(), String> {
-    // Before the workers get anywhere: each is re-homing the very stores this
-    // process inherited handles to, and two live `Table`s on one directory is
-    // the hazard.
-    disp.cat().registry_mut().detach();
-
     // Wait for all workers to complete recovery and signal readiness.
     // Before any drain: a drain drops frames no lease routes.
     let ready = disp.reactor().lease_acks(1, WorkerSet::ALL);
@@ -555,8 +545,8 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     // Child directories + shard files.
     posix_io::raise_fd_limit(65536);
 
-    // Pin the master before `CatalogEngine::open`: the boot-time system-table
-    // flush below creates the master's first io_uring ring, and an io-wq pool
+    // Pin the master before the catalog opens: the first system-table flush
+    // creates the master's first io_uring ring, and an io-wq pool
     // keeps the mask its ring's creating thread held. Each forked child then
     // inherits this mask until its own pin narrows it. See `runtime::affinity`
     // for the placement itself and what it assumes about the host.
@@ -575,8 +565,6 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
 
     gnitz_info!("Opening database at {}", data_dir);
 
-    // As the master: the pre-fork replay hooks skip the index backfill their
-    // forked children run slice-local.
     let catalog =
         CatalogEngine::open_master(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
 
@@ -586,8 +574,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     let ipc = acquire_shared_ipc(data_dir, nw)?;
     gnitz_debug!("SAL fd={}", ipc.sal_fd);
 
-    // Leaked: it outlives every borrow the dispatcher and reactor hold, and
-    // dropping it would run `CircuitState::drop`, which removes directories.
+    // Leaked: the dispatcher and reactor borrow it for the life of the process.
     let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
 
     let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog, ipc.sal_log(), ipc.walk_epoch)?;

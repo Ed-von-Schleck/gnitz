@@ -27,7 +27,7 @@ fn register_entry(
         directory,
         props: ViewProps::default(),
     };
-    registry.register(spec, OnRegister::Live).unwrap();
+    registry.register(spec).unwrap();
 }
 
 #[test]
@@ -63,7 +63,6 @@ fn test_add_remove_index_circuit() {
 
     registry.remove_index(50, &[2]);
     assert_eq!(registry.relation(50).unwrap().indexes().len(), 0);
-    registry.close();
 }
 
 /// `UniquePreflight` hands `index_cols` its `arg1` raw, where `HasPk` would
@@ -89,7 +88,6 @@ fn a_flag_clear_arg1_names_no_index() {
             .expect_err("a flag-clear word names no column list");
         assert!(err.to_string().contains("invalid column list"), "{raw}: {err}");
     }
-    registry.close();
 }
 
 /// An index store is rederived, so a base round only folds it to RAM; the
@@ -125,7 +123,8 @@ fn ephemeral_flush_includes_index_circuits() {
         ic.ingest_owned_batch(batch).unwrap();
     }
 
-    registry.checkpoint_ephemeral(1, []).unwrap();
+    registry.set_resume_generation(1);
+    registry.checkpoint_ephemeral([]).unwrap();
     let idx_dir = ChildAddr::Index { id: 999 }.dir(&owner_dir);
     let store_dir = ChildAddr::worker(Slot::SOLO).dir(&idx_dir);
     let shard_count = std::fs::read_dir(&store_dir)
@@ -137,8 +136,6 @@ fn ephemeral_flush_includes_index_circuits() {
         shard_count > 0,
         "the ephemeral round must publish the index circuit's shard"
     );
-
-    registry.close();
 }
 
 /// A fed view's delta store takes the epoch output **weights and all**: the
@@ -151,16 +148,13 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let vid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     registry
-        .register(
-            RelationSpec {
-                id: vid,
-                kind: RelationKind::View,
-                schema,
-                directory: relation_test_dir("fed_view_delta"),
-                props: ViewProps::Fed { delta_bytes: 1 << 20 },
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: vid,
+            kind: RelationKind::View,
+            schema,
+            directory: relation_test_dir("fed_view_delta"),
+            props: ViewProps::Fed { delta_bytes: 1 << 20 },
+        })
         .unwrap();
 
     let row = |w: i64| {
@@ -197,8 +191,6 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
         cur.advance();
     }
     assert_eq!(rounds, vec![(4, 1), (5, -1)], "each round keeps its own weight");
-
-    registry.close();
 }
 
 // A storage error while applying committed data in `ingest_store_and_indices`

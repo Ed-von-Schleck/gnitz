@@ -76,7 +76,12 @@ fn test_bootstrap() {
 fn bootstrap_self_description_matches_the_wire_column_lists() {
     let dir = temp_dir("bootstrap_self_description");
     let engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert_self_description(&engine);
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
 
+fn assert_self_description(engine: &CatalogEngine) {
     // Every live COL_TAB row, grouped by the table it describes.
     let mut described: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
     let mut c = engine.sys_relation(SysFamily::Column).cursor();
@@ -110,7 +115,67 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
         "COL_TAB describes unregistered table ids: {:?}",
         described.keys().collect::<Vec<_>>()
     );
+}
 
+/// Every stored weight in `family`'s store.
+fn family_weights(engine: &CatalogEngine, family: SysFamily) -> Vec<i64> {
+    let mut c = engine.sys_relation(family).cursor();
+    let mut v = Vec::new();
+    while c.valid {
+        v.push(c.current_weight);
+        c.advance();
+    }
+    v
+}
+
+/// Open a fresh database, close it, and unlink `family`'s manifest — a first
+/// boot that crashed inside its flush barrier with every other family published.
+fn fresh_db_missing_manifest(name: &str, family: SysFamily) -> String {
+    let dir = temp_dir(name);
+    CatalogEngine::open(&dir, 1).unwrap().close();
+    let manifest = format!(
+        "{}/manifest.bin",
+        relation_dir(&dir, RelationKind::SystemCatalog, family.id())
+    );
+    fs::remove_file(&manifest).unwrap();
+    dir
+}
+
+/// A family whose manifest never published is seeded again, and only it: the
+/// families that did publish keep their seed rows at weight 1.
+#[test]
+fn an_unpublished_tables_family_is_reseeded_alone() {
+    let dir = fresh_db_missing_manifest("seed_missing_tables", SysFamily::Table);
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
+
+    let col_rows: usize = SysFamily::ALL.iter().map(|f| f.wire().cols.len()).sum();
+    for (family, rows) in [
+        (SysFamily::Schema, 2),
+        (SysFamily::Column, col_rows),
+        (SysFamily::Table, SysFamily::COUNT),
+    ] {
+        let weights = family_weights(&engine, family);
+        assert_eq!(weights.len(), rows, "{} row count", family.name());
+        assert!(
+            weights.iter().all(|&w| w == 1),
+            "{} weights: {weights:?}",
+            family.name()
+        );
+        assert_eq!(count_records(engine.sys_relation(family).cursor()), rows);
+        assert_eq!(count_negative_records(engine.sys_relation(family).cursor()), 0);
+    }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An unpublished `_columns` does not stop the open: the system families'
+/// entries are compile-time data, and the reseed restores the self-description.
+#[test]
+fn an_unpublished_columns_family_is_reseeded() {
+    let dir = fresh_db_missing_manifest("seed_missing_columns", SysFamily::Column);
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert_self_description(&engine);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -921,7 +986,7 @@ fn a_bounded_view_source_is_named() {
 
 /// A fed view's delta store prepends a `_tick` key column, so a view already at
 /// `MAX_COLUMNS` cannot carry a feed. Refused at registration, on every process:
-/// the post-fork master opens no user store at all, so leaving it to the store
+/// the master opens no user store at all, so leaving it to the store
 /// open would be a worker-side fatal abort taken after the client was told the
 /// CREATE succeeded.
 #[test]

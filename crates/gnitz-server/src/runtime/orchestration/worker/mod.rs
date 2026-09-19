@@ -928,7 +928,7 @@ impl WorkerProcess {
         // by the next auto-tick or the scan barrier. Live entries drain on the
         // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
         // GC'd in the DdlSync arm (retain(has_id)).
-        self.cat().flush_base_round()
+        Ok(self.cat().registry_mut().checkpoint_base()?)
     }
 
     /// Run one DAG drive with the exchange context, returning the collective

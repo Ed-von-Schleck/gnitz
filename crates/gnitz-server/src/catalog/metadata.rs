@@ -41,7 +41,7 @@ impl CatalogEngine {
     /// Half of every resume verdict, and what the registry's `resume_enabled` is
     /// latched from.
     pub(crate) fn topology_matches(&self) -> bool {
-        self.recorded_topology == self.launched_topology()
+        self.sequence_value(SEQ_ID_TOPOLOGY) == Some(self.launched_topology())
     }
 
     /// Both halves at once, proven disjoint here rather than asserted at each
@@ -58,9 +58,9 @@ impl CatalogEngine {
         (&mut self.dag, &mut self.registry)
     }
 
-    /// The checkpoint generation.
+    /// The checkpoint generation, `0` on a fresh database.
     pub(crate) fn durable_generation(&self) -> u64 {
-        self.durable_generation
+        self.sequence_value(SEQ_ID_CHECKPOINT_GEN).unwrap_or(0)
     }
 
     /// The data directory this engine's relations live under.

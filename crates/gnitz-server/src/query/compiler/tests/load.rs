@@ -1,6 +1,6 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
-use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig};
+use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::storage::Slot;
 use gnitz_wire::OpNode;
 use gnitz_wire::ViewProps;
@@ -29,16 +29,13 @@ impl CircuitTables {
         // A `SystemCatalog` registration homes the store flat under its own
         // directory, the shape `bootstrap.rs` gives every family.
         registry
-            .register(
-                RelationSpec {
-                    id: gnitz_wire::CIRCUIT_NODES_TAB as i64,
-                    kind: RelationKind::SystemCatalog,
-                    schema: Self::schema(),
-                    directory: format!("{}/nodes", tmp.path().to_str().unwrap()),
-                    props: ViewProps::default(),
-                },
-                OnRegister::Live,
-            )
+            .register(RelationSpec {
+                id: gnitz_wire::CIRCUIT_NODES_TAB as i64,
+                kind: RelationKind::SystemCatalog,
+                schema: Self::schema(),
+                directory: format!("{}/nodes", tmp.path().to_str().unwrap()),
+                props: ViewProps::default(),
+            })
             .unwrap();
         Self { registry, _tmp: tmp }
     }

@@ -21,6 +21,8 @@ mod wide_pk_validation;
 
 use super::sys_tables::*;
 use super::*;
+use gnitz_store::relation::SecondaryIndex;
+use gnitz_store::storage::Slot;
 use gnitz_wire::{pack_pk_cols, type_code, PK_LIST_PACKED_FLAG};
 
 use std::fs;
@@ -49,10 +51,11 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: i64, key: u128) -> std::rc::
 }
 
 use crate::test_support::{
-    col_def, fk_def, idx_tab_batch, nullable_def, opk_pk, pk_payload_schema, push_col_tab_row, push_table_tab_row,
-    push_view_tab_row, register_identity_view, scratch_dir, seek_by_index, seek_by_index_range, sum_weights,
-    try_register_identity_view, uuid_def, write_circuit, write_identity_circuit,
+    col_def, fk_def, idx_tab_batch, nullable_def, opk_pk, pk_payload_schema, push_table_tab_row, push_view_tab_row,
+    register_identity_view, scratch_dir, seek_by_index, seek_by_index_range, sum_weights, try_register_identity_view,
+    uuid_def, write_circuit, write_identity_circuit,
 };
+use gnitz_wire::sys_rows::write_col_tab_row;
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
 /// (system families included) must hold none. A `-1` that retracts a row nothing
@@ -270,7 +273,7 @@ fn col_alter_pair(owner_id: i64, col_idx: i64, old: &ColumnDef, mutate: impl FnO
     let mut altered = old.clone();
     mutate(&mut altered);
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, owner_id, col_idx, old, -1);
-    push_col_tab_row(&mut bb, owner_id, col_idx, &altered, 1);
+    write_col_tab_row(&mut bb, &old.col_tab_row(owner_id, col_idx as usize), -1);
+    write_col_tab_row(&mut bb, &altered.col_tab_row(owner_id, col_idx as usize), 1);
     bb.finish()
 }

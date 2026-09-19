@@ -66,7 +66,7 @@ impl Table {
         let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) else {
             return Ok(());
         };
-        if !self.ram_tier.is_full() {
+        if self.held_in_ram || !self.ram_tier.is_full() {
             return Ok(());
         }
         self.persist_ram_tier(run)

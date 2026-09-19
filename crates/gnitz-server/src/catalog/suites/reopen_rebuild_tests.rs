@@ -55,18 +55,9 @@ fn index_weight(engine: &mut CatalogEngine, tid: i64) -> i64 {
 }
 
 // ── index_rebuilds_once_view_defers_on_reopen ───────────────────────────
-// Create a base table with N rows, a secondary index, and an identity view
-// over it; close; reopen. The base table must come back from its durable
-// shards (non-empty — otherwise the index rebuilding to an empty result would
-// pass the equality vacuously), the secondary index must hold exactly the
-// single-materialisation weights (not doubled), and the view must be **empty**
-// both at registration and after reopen — every view is populated by the
-// server's distributed backfill, which this single-process engine has no
-// counterpart to.
-//
-// This path therefore exercises `backfill_index` (still inline at open) against
-// the *absence* of any catalog-layer view fill. View population is covered by
-// the E2E suite.
+// A base table with N rows, a secondary index and an identity view over it,
+// closed and reopened: the base comes back non-empty, the index at exactly one
+// materialisation, and the view empty — only the server's backfill fills a view.
 
 #[test]
 fn index_rebuilds_once_view_defers_on_reopen() {
@@ -147,13 +138,8 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 }
 
 // ── index_rebuilds_across_chunk_boundary ─────────────────────────────────
-// Boot backfills stream the source in `scan_chunk_rows`-sized chunks. The
-// chunk size cannot be shrunk before open() (the backfill runs during shard
-// replay, before any test code can touch the engine), so exercise the real
-// boundary with a base table one chunk plus a remainder wide. The secondary
-// index must rebuild across that boundary exactly once, ingesting every chunk.
-// (The catalog layer never fills a view at all;
-// `index_rebuilds_once_view_defers_on_reopen` pins that.)
+// The open's index rebuild streams the base in `scan_chunk_rows` chunks: a base
+// one chunk plus a remainder wide must rebuild across the boundary exactly once.
 
 #[test]
 fn index_rebuilds_across_chunk_boundary() {
@@ -231,7 +217,7 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
 
     assert_index_intact(&mut engine);
 
-    // The hook's fill is in the store, so the rebuild has nothing to add.
+    // The open's fill is in the store, so the rebuild has nothing to add.
     engine.backfill_all_indexes().unwrap();
     assert_index_intact(&mut engine);
 
@@ -260,12 +246,12 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (i64, u64)
     let tid = base_with_index(&mut engine);
 
     // The two halves of the verdict, written the way a boot writes them.
-    engine.record_topology(recorded_workers);
+    engine.record_topology(recorded_workers).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
 
     // The index is the only rederived store this table owns, so the ephemeral
     // round publishes exactly it.
-    engine.registry_mut().checkpoint_ephemeral(g, []).unwrap();
+    engine.registry_mut().checkpoint_ephemeral([]).unwrap();
 
     engine.close();
     (tid, g)
@@ -273,10 +259,9 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (i64, u64)
 
 // ── index_rebuild_is_skipped_after_resume ───────────────────────────────
 // An index whose manifest carries the committed generation reloads its shards,
-// so neither the registration hook nor the boot rebuild may re-derive it — the
-// full-slice scan this mechanism exists to remove. A rebuild that ran anyway
-// would show up twice over: in the returned count, and (had the hook backfilled
-// on top of the loaded shards) in doubled weights.
+// so the boot rebuild may not re-derive it — the full-slice scan this mechanism
+// exists to remove. A rebuild that ran anyway would show up twice over: in the
+// returned count, and (on top of the loaded shards) in doubled weights.
 #[test]
 fn index_rebuild_is_skipped_after_resume() {
     let dir = temp_dir("index_resume_skips_rebuild");
@@ -305,7 +290,7 @@ fn index_rebuild_is_skipped_after_resume() {
 // ── index_rebuild_forced_by_topology_change ─────────────────────────────
 // The other half of the verdict: the checkpoint recorded four workers and this
 // boot launches one, so the generation still matches the manifest but the
-// topology does not, and the hook's open erases the store and backfills it.
+// topology does not, so the open erases the store and its rebuild fills it.
 #[test]
 fn index_rebuild_forced_by_topology_change() {
     let dir = temp_dir("index_resume_topology_change");
@@ -328,12 +313,12 @@ fn index_rebuild_forced_by_topology_change() {
     assert_eq!(
         index_weight(&mut engine, tid),
         N,
-        "the hook's backfill replaces the erased state, never adds to it"
+        "the open's rebuild replaces the erased state, never adds to it"
     );
     assert_eq!(
         engine.backfill_all_indexes().unwrap(),
         0,
-        "the hook already filled the store, so the boot rebuild has nothing to do"
+        "the open already filled the store, so a second rebuild has nothing to do"
     );
 
     engine.close();
@@ -373,7 +358,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
         "the fixture view must compile"
     );
 
-    engine.record_topology(1);
+    engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
     engine.flush_ephemeral_round().unwrap();
     assert_eq!(engine.registry().resume_generation(), g);

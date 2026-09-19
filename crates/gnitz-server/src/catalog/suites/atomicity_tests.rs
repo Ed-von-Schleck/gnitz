@@ -44,7 +44,7 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
 /// cannot produce.
 fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    push_col_tab_row(&mut bb, owner_id, col_idx, cd, 1);
+    write_col_tab_row(&mut bb, &cd.col_tab_row(owner_id, col_idx as usize), 1);
     engine.ingest_to_family(COL_TAB_ID, &bb.finish())
 }
 
@@ -744,11 +744,11 @@ fn sequence_advances_leave_no_negative_ghost() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     engine.create_table("s.t", &cols, &[0]).unwrap();
     engine.create_index("s.t", &["val"], false).unwrap();
-    engine.record_topology(1);
+    engine.record_topology(1).unwrap();
     engine.bump_checkpoint_generation().unwrap();
     // …and a second round, where each retraction now has a live row to cancel.
     engine.create_table("s.t2", &cols, &[0]).unwrap();
-    engine.record_topology(4);
+    engine.record_topology(4).unwrap();
     engine.bump_checkpoint_generation().unwrap();
 
     assert_eq!(

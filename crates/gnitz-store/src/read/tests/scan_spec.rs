@@ -1,5 +1,5 @@
 use super::*;
-use crate::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig};
+use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::{BatchBuilder, Slot, StoreError};
 use gnitz_wire::ViewProps;
@@ -34,16 +34,13 @@ fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
     let schema = id_val_schema();
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry
-        .register(
-            RelationSpec {
-                id: TID,
-                kind: RelationKind::View,
-                schema,
-                directory: crate::test_support::scratch_dir("read", name),
-                props: ViewProps::default(),
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: TID,
+            kind: RelationKind::View,
+            schema,
+            directory: crate::test_support::scratch_dir("read", name),
+            props: ViewProps::default(),
+        })
         .unwrap();
     let mut bb = BatchBuilder::new(schema);
     for id in 0..n {
@@ -211,19 +208,17 @@ fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::op
     let schema = id_val_schema();
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry
-        .register(
-            RelationSpec {
-                id: TID,
-                kind: RelationKind::View,
-                schema,
-                directory: crate::test_support::scratch_dir("read", name),
-                props: ViewProps::Bounded { capacity_bytes: 1 },
-            },
-            OnRegister::Live,
-        )
+        .register(RelationSpec {
+            id: TID,
+            kind: RelationKind::View,
+            schema,
+            directory: crate::test_support::scratch_dir("read", name),
+            props: ViewProps::Bounded { capacity_bytes: 1 },
+        })
         .unwrap();
     ingest(&mut registry, on_disk);
-    registry.checkpoint_ephemeral(1, []).unwrap();
+    registry.set_resume_generation(1);
+    registry.checkpoint_ephemeral([]).unwrap();
     assert!(
         registry.relation_or_err(TID).unwrap().store().has_skeleton_rows(),
         "premise: the capacity sweep must have dehydrated the flushed shard",

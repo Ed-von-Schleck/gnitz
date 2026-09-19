@@ -8,12 +8,7 @@ impl CatalogEngine {
     // Call order is dependency order. A relation's COL_TAB rows must be in storage
     // when its register hook runs: live DDL applies ascending `topo_priority`, and
     // boot replay opens every sys store first.
-    pub(in crate::catalog) fn fire_hooks(
-        &mut self,
-        family: SysFamily,
-        batch: &Batch,
-        on: OnRegister,
-    ) -> Result<(), String> {
+    pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         if family.allocates_ids() {
             for i in batch.live_rows() {
                 let id = family.leading_id(batch.get_pk(i));
@@ -24,7 +19,7 @@ impl CatalogEngine {
             SysFamily::Schema => self.apply_schema_caches(batch),
             SysFamily::Table | SysFamily::View => {
                 self.apply_entity_caches(batch);
-                self.hook_relation_register(family, batch, on)?;
+                self.hook_relation_register(family, batch)?;
             }
             SysFamily::Column => self.hook_column_change(batch)?,
             SysFamily::Index => {
@@ -45,7 +40,7 @@ impl CatalogEngine {
     /// Build a relation's store and enter it in the registry — the create half of
     /// [`hook_relation_register`](Self::hook_relation_register), over the values
     /// its per-family builder decoded.
-    fn register_relation(&mut self, reg: RelationRegistration<'_>, on: OnRegister) -> Result<(), String> {
+    fn register_relation(&mut self, reg: RelationRegistration<'_>) -> Result<(), String> {
         let RelationRegistration {
             kind,
             id,
@@ -67,10 +62,9 @@ impl CatalogEngine {
             id,
             self.registry.slot().of
         );
-        // `register` owns the boot relayout, the staged-directory reclaim and the
-        // parent fsync.
+        // `register` owns the staged-directory reclaim and the parent fsync.
         self.registry
-            .register(RelationSpec { id, kind, schema, directory, props }, on)?;
+            .register(RelationSpec { id, kind, schema, directory, props })?;
         self.enter_relation(id, kind, &schema, &col_defs);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
@@ -146,7 +140,7 @@ impl CatalogEngine {
 
     /// The TABLE_TAB / VIEW_TAB register hook: a PK carrying one sign is a drop or a
     /// create; a rename pair carries both and is neither.
-    fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch, on: OnRegister) -> Result<(), String> {
+    fn hook_relation_register(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let mut creates: Vec<(i64, usize)> = Vec::new();
         for sig in pk_signatures(family, batch) {
             match (sig.neg, sig.pos) {
@@ -168,7 +162,7 @@ impl CatalogEngine {
             } else {
                 self.view_registration(batch, row, id)?
             };
-            self.register_relation(reg, on)?;
+            self.register_relation(reg)?;
             // A view registers empty; the backfill, checkpoint resume or boot rebuild
             // fills it.
         }
@@ -300,17 +294,9 @@ impl CatalogEngine {
         // out-of-range or ineligible one.
         staged_dir(&idx_dir, || {
             self.registry.add_index(owner_id, idx_id, cols.as_slice(), is_unique)?;
-            let resumed = self
-                .registry
-                .relation(owner_id)
-                .and_then(|r| r.index_on(cols.as_slice()))
-                .is_some_and(SecondaryIndex::resumed);
-            // The master never populates its index copies (they stay permanently
-            // empty; distributed HAS_PK/seek probes union the workers' slice-local
-            // copies). Workers and standalone backfill from their local base slice
-            // — unless the store resumed from a checkpointed manifest, which
-            // already holds those rows.
-            if !self.is_master && !resumed {
+            // A store-owning process fills the index from its own base slice; the
+            // master holds neither.
+            if self.registry.residency().owns_stores() {
                 if let Err(e) = self.backfill_index(owner_id, cols.as_slice()) {
                     // The circuit was entered before the backfill so the
                     // projection could ingest through it; a failed CREATE INDEX
