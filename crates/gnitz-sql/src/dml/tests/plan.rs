@@ -3,21 +3,15 @@ use crate::test_support::{bind_where, col_def, idx_metas_flagged, pk_schema, two
 use gnitz_core::TypeCode;
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
-fn plan_of<'e>(
-    conjuncts: &'e [BoundExpr],
-    schema: &Schema,
-    lists: &[(&[u32], bool)],
-    budget: ReadBudget,
-) -> AccessPlan<'e> {
-    bound_and_predicate(schema, conjuncts, budget, &idx_metas_flagged(lists)).expect("the WHERE must plan")
+fn plan_of<'e>(conjuncts: &'e [BoundExpr], schema: &Schema, lists: &[(&[u32], bool)]) -> AccessPlan<'e> {
+    bound_and_predicate(schema, conjuncts, &idx_metas_flagged(lists)).expect("the WHERE must plan")
 }
 
-/// How many keys `plan` restricts the transaction's buffered rows to; `None`
-/// when it restricts nothing.
+/// How many keys `plan`'s bound pins; `None` when it pins none.
 fn pinned_keys(plan: &AccessPlan<'_>) -> Option<usize> {
-    match plan.buffered_scope().0 {
-        BufferedKeys::Keys(keys) => Some(keys.len()),
-        BufferedKeys::All => None,
+    match &plan.bound {
+        ReadBound::PkSet(keys) => Some(keys.len()),
+        _ => None,
     }
 }
 
@@ -27,7 +21,7 @@ fn shape(bound: &ReadBound) -> &'static str {
     match bound {
         ReadBound::None => "None",
         ReadBound::PkRange(_) => "PkRange",
-        ReadBound::IndexRange { .. } => "IndexRange",
+        ReadBound::IndexRange(_) => "IndexRange",
         ReadBound::PkSet(_) => "PkSet",
     }
 }
@@ -52,9 +46,9 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         // key restriction supplies the consumed PK conjunct, the residual the rest.
         (Some("id IN (7, 9) AND v > 5"), "PkSet", 1, 2),
         (Some("id = 7 AND v > 5"), "PkSet", 1, 1),
-        // No PK conjunct: the index rung, then the unbounded scan. An
-        // arithmetic WHERE has no `col OP literal` conjunct at all.
-        (Some("v = 7"), "IndexRange", 1, 0),
+        // No PK conjunct: the index rung, which applies its conjunct exactly, then
+        // the unbounded scan. An arithmetic WHERE has no `col OP literal` conjunct.
+        (Some("v = 7"), "IndexRange", 0, 0),
         (Some("id + v = 7"), "None", 1, 0),
         // A non-integral literal pins no key, and a top-level OR pins nothing
         // at all: both stay a predicate over the whole table.
@@ -62,46 +56,34 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         (Some("v = 5 OR id = 1"), "None", 1, 0),
     ] {
         let bound_where = sql.map(|s| bind_where(s, &schema)).unwrap_or_default();
-        let plan = plan_of(&bound_where, &schema, idx, ReadBudget::OneRequest);
+        let plan = plan_of(&bound_where, &schema, idx);
         let label = sql.unwrap_or("<no WHERE>");
-        assert_eq!(shape(&plan.access.bound), want_shape, "{label}");
+        assert_eq!(shape(&plan.bound), want_shape, "{label}");
         assert_eq!(plan.residual.len(), want_residual, "{label}: residual");
         assert_eq!(pinned_keys(&plan).unwrap_or(0), want_keys, "{label}: pinned keys");
         assert_eq!(
-            plan.access.predicate.is_empty(),
+            plan.predicate.is_empty(),
             want_residual == 0,
             "{label}: the residual is what ships as a predicate"
         );
     }
 }
 
-/// The budget is the whole difference between the verbs: a gather past the
-/// wire's per-request key cap declines to the rest of the ladder (an ordinary
-/// predicate scan) unless the caller may chunk.
+/// A lone `pk IN (…)` list is keys the statement spelled out, so however long it is
+/// it plans one gather.
 #[test]
-fn an_over_cap_pk_in_list_needs_a_chunking_budget() {
+fn a_long_in_list_plans_one_pk_set() {
     let schema = pk_schema(TypeCode::U64);
-    let n = gnitz_wire::MAX_PK_SET_KEYS + 1;
+    let n = 70_000;
     // Built directly: the same list as SQL text is megabytes for the parser.
     let where_expr = [BoundExpr::InList {
         inner: Box::new(BoundExpr::ColRef(0)),
         items: (0..n as i64).map(BoundExpr::LitInt).collect(),
     }];
-    let declined = plan_of(&where_expr, &schema, &[], ReadBudget::OneRequest);
-    assert_eq!(
-        shape(&declined.access.bound),
-        "None",
-        "{n} keys past the one-request cap"
-    );
-    assert!(pinned_keys(&declined).is_none());
-    assert!(
-        !declined.access.predicate.is_empty(),
-        "the list ships as a predicate instead"
-    );
-
-    let gathered = plan_of(&where_expr, &schema, &[], ReadBudget::MayChunk);
-    assert_eq!(shape(&gathered.access.bound), "PkSet");
-    assert_eq!(pinned_keys(&gathered), Some(n));
+    let plan = plan_of(&where_expr, &schema, &[]);
+    assert_eq!(shape(&plan.bound), "PkSet");
+    assert_eq!(pinned_keys(&plan), Some(n));
+    assert!(plan.predicate.is_empty());
 }
 
 /// When a PK bound yields to a unique index point, and when it keeps the PK
@@ -134,8 +116,8 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
         ("id = 7 AND v = 42", uniq, "PkSet", "a PK point is never given up"),
     ] {
         let where_expr = bind_where(sql, &schema);
-        let plan = plan_of(&where_expr, &schema, idx, ReadBudget::OneRequest);
-        assert_eq!(shape(&plan.access.bound), want, "{sql}: {why}");
+        let plan = plan_of(&where_expr, &schema, idx);
+        assert_eq!(shape(&plan.bound), want, "{sql}: {why}");
     }
 
     // A descriptor pinning any PK column keeps the PK walk, unique point on
@@ -157,18 +139,15 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
         ("tenant = 7 AND email = 42", "a bare prefix lowers to a pinned point"),
     ] {
         let where_expr = bind_where(sql, &compound);
-        let plan = plan_of(&where_expr, &compound, email_uniq, ReadBudget::OneRequest);
-        assert_eq!(shape(&plan.access.bound), "PkRange", "{sql}: {why}");
+        let plan = plan_of(&where_expr, &compound, email_uniq);
+        assert_eq!(shape(&plan.bound), "PkRange", "{sql}: {why}");
     }
 }
 
-/// The index walk is marked exact — and its conjunct stripped from the
-/// predicate — exactly when the predicate could not carry that conjunct: a
-/// literal past the VM's `i64` constant on a narrow column, or a wide-int
-/// column outright. An ordinary narrow bound keeps the whole WHERE, leaving
-/// the worker free to trade the walk for a full cursor.
+/// An index walk is exact, so it ships only the conjuncts it does not consume — a
+/// wide literal or a wide-int column included.
 #[test]
-fn an_index_walk_is_exact_only_when_the_predicate_cannot_carry_its_conjunct() {
+fn an_index_walk_ships_only_its_residual() {
     // `(id U64 pk, v U64, w U64)` — `w` keeps a companion conjunct off the PK,
     // which would otherwise take the PK-range rung ahead of any index.
     let narrow = Schema {
@@ -181,61 +160,68 @@ fn an_index_walk_is_exact_only_when_the_predicate_cannot_carry_its_conjunct() {
     };
     let wide = two_col(TypeCode::U128); // `val` is U128
     let idx: &[(&[u32], bool)] = &[(&[1], false)];
-    for (schema, sql, want_required, want_residual) in [
-        (&narrow, "v = 5", false, 1),
-        (&narrow, "v = 5 AND w = 9", false, 2),
-        (&narrow, "v = 18446744073709551615", true, 0),
-        (&wide, "val = 7", true, 0),
+    for (schema, sql, want_residual) in [
+        (&narrow, "v = 5", 0),
+        (&narrow, "v = 5 AND w = 9", 1),
+        (&narrow, "v = 18446744073709551615", 0),
+        (&wide, "val = 7", 0),
+        (&wide, "val > 7", 0),
     ] {
         let where_expr = bind_where(sql, schema);
-        let plan = plan_of(&where_expr, schema, idx, ReadBudget::OneRequest);
-        let ReadBound::IndexRange { walk, .. } = plan.access.bound else {
-            panic!("{sql}: expected an index bound, got {}", shape(&plan.access.bound));
-        };
-        assert_eq!(walk == IndexWalk::Required, want_required, "{sql}: walk");
+        let plan = plan_of(&where_expr, schema, idx);
+        assert_eq!(shape(&plan.bound), "IndexRange", "{sql}");
         assert_eq!(plan.residual.len(), want_residual, "{sql}: residual");
+        assert_eq!(plan.predicate.is_empty(), want_residual == 0, "{sql}: predicate");
     }
 }
 
 /// A candidate whose residual the expression VM refuses falls through to the next:
 /// the PK walk keeps `val = 7` on a U128 column residual, where the index walk
-/// strips it and keeps only the PK conjunct.
+/// consumes it and keeps only the PK conjunct.
 #[test]
 fn an_uncompilable_pk_residual_falls_through_to_the_index() {
     let schema = two_col(TypeCode::U128);
     for sql in ["pk > 5 AND val = 7", "pk IN (1, 2) AND val = 7"] {
         let where_expr = bind_where(sql, &schema);
-        let plan = plan_of(&where_expr, &schema, &[(&[1], false)], ReadBudget::OneRequest);
-        let ReadBound::IndexRange { walk, .. } = plan.access.bound else {
-            panic!("{sql}: expected an index bound, got {}", shape(&plan.access.bound));
-        };
-        assert_eq!(walk, IndexWalk::Required, "{sql}");
+        let plan = plan_of(&where_expr, &schema, &[(&[1], false)]);
+        assert_eq!(shape(&plan.bound), "IndexRange", "{sql}");
         assert_eq!(plan.residual.len(), 1, "{sql}: the PK conjunct stays residual");
     }
 }
 
-/// A PK bound pinning no PK column yields to a point covering every column of
-/// a UNIQUE index — one row, where the unpinned range admits the table.
+/// When no candidate's residual compiles, the error is the best candidate's: the
+/// conjunct that candidate could not consume, not one it did.
 #[test]
-fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
-    let schema = two_col(TypeCode::U64);
-    let where_expr = bind_where("pk > 0 AND val = 42", &schema);
-    let plan = plan_of(&where_expr, &schema, &[(&[1], true)], ReadBudget::OneRequest);
-    assert_eq!(shape(&plan.access.bound), "IndexRange");
-    assert!(pinned_keys(&plan).is_none(), "an index bound never pins a PK key");
+fn an_unsupported_residual_reports_the_best_candidates_blocker() {
+    let schema = Schema {
+        columns: vec![
+            col_def("id", TypeCode::U128, false),
+            col_def("name", TypeCode::String, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let where_expr = bind_where("id = 7 AND name + 1 > 0", &schema);
+    let Err(err) = bound_and_predicate(&schema, &where_expr, &[]) else {
+        panic!("`name + 1` cannot compile");
+    };
+    let only_name = bind_where("name + 1 > 0", &schema);
+    let Err(want) = compile_wire_conjuncts(only_name.iter(), &schema.columns) else {
+        panic!("`name + 1` cannot compile on its own either");
+    };
+    assert_eq!(err.to_string(), want.to_string());
 }
 
-/// `rows_sink` over `sql` against `schema`, read as relation `t`.
-fn rows_sink_of(sql: &str, schema: &Arc<Schema>) -> (Arc<Schema>, ReadSink, Vec<gnitz_wire::OrderKey>) {
+/// `rows_reply` over `sql` against `schema`, read as relation `t`.
+fn rows_reply_of(sql: &str, schema: &Arc<Schema>) -> RowsReply {
     let q = crate::test_support::parse_query(sql);
     let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() else {
         panic!("`{sql}` is not a plain SELECT");
     };
-    rows_sink(&sel.projection, q.order_by.as_ref(), schema, "t", 0).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
+    rows_reply(&sel.projection, q.order_by.as_ref(), schema, "t").unwrap_or_else(|e| panic!("`{sql}`: {e:?}"))
 }
 
-/// A projection reproducing the relation replies in its layout with no map, ORDER BY keys
-/// on source columns; any other projection ships a map.
+/// A projection reproducing the relation replies in its layout with no program, ORDER BY
+/// keys on source columns; any other projection carries a program.
 #[test]
 fn only_a_reproducing_projection_ships_no_map() {
     let u = TypeCode::U64;
@@ -251,18 +237,14 @@ fn only_a_reproducing_projection_ships_no_map() {
         ("SELECT id, v, w FROM t", vec![]),
         ("SELECT * FROM t ORDER BY w", vec![2u16]),
     ] {
-        let (reply, sink, order) = rows_sink_of(sql, &t);
+        let RowsReply { schema: reply, program, order } = rows_reply_of(sql, &t);
         assert!(Arc::ptr_eq(&reply, &t), "`{sql}`: the source schema itself");
-        assert!(sink.map.is_none(), "`{sql}`");
+        assert!(program.is_none(), "`{sql}`");
         assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), keys, "`{sql}`");
-        let SinkKind::Rows { order: shipped, .. } = &sink.kind else {
-            panic!("`{sql}`: a rows sink");
-        };
-        assert_eq!(shipped, &order, "`{sql}`: the worker orders by the same keys");
     }
     let mid = schema(["v", "id", "w"], 1);
-    let (reply, sink, order) = rows_sink_of("SELECT * FROM t ORDER BY id", &mid);
-    assert!(Arc::ptr_eq(&reply, &mid) && sink.map.is_none());
+    let RowsReply { schema: reply, program, order } = rows_reply_of("SELECT * FROM t ORDER BY id", &mid);
+    assert!(Arc::ptr_eq(&reply, &mid) && program.is_none());
     assert_eq!(order.iter().map(|k| k.col).collect::<Vec<_>>(), [1u16]);
     for sql in [
         "SELECT v, id, w FROM t",
@@ -271,8 +253,8 @@ fn only_a_reproducing_projection_ships_no_map() {
         // The hidden key appended for `w` sits where the omitted column would.
         "SELECT id, v FROM t ORDER BY w",
     ] {
-        let (reply, sink, _) = rows_sink_of(sql, &t);
-        assert!(sink.map.is_some(), "`{sql}`");
+        let RowsReply { schema: reply, program, .. } = rows_reply_of(sql, &t);
+        assert!(program.is_some(), "`{sql}`");
         assert!(!Arc::ptr_eq(&reply, &t), "`{sql}`");
     }
 }

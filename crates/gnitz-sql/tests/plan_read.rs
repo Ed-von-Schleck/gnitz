@@ -55,7 +55,7 @@ fn explain(cat: &CatalogSnapshot, sql: &str) -> Vec<String> {
 #[test]
 fn explain_names_every_decision() {
     let cat = cat();
-    const TRADED: &str = "access: index range on (v) — may be traded for a full scan on low selectivity";
+    const INDEX_V: &str = "access: index range on (v)";
     for (sql, want) in [
         // A projection reproducing the relation's columns ships no map.
         (
@@ -82,8 +82,8 @@ fn explain_names_every_decision() {
             "SELECT * FROM t WHERE v = 3 ORDER BY w",
             [
                 "read table t",
-                TRADED,
-                "predicate: server-side",
+                INDEX_V,
+                "predicate: none",
                 "projection: 3 columns (unprojected)",
                 "order/limit: client sort",
             ],
@@ -151,24 +151,24 @@ fn explain_names_every_decision() {
                 "order/limit: none",
             ],
         ),
-        // An inexact index bound keeps the whole WHERE in the predicate.
+        // An index bound is exact, so the conjunct it consumes does not ship.
         (
             "SELECT w FROM t WHERE v = 5",
             [
                 "read table t",
-                TRADED,
-                "predicate: server-side",
+                INDEX_V,
+                "predicate: none",
                 "projection: 1 columns",
                 "order/limit: none",
             ],
         ),
-        // A literal past the VM's i64 constant has no compiled form, so the walk
-        // must apply it and nothing ships.
+        // A literal past the VM's i64 constant has no compiled form; the walk
+        // applies it.
         (
             "SELECT w FROM t WHERE v = 18446744073709551615",
             [
                 "read table t",
-                "access: index range on (v) — exact walk, never traded",
+                INDEX_V,
                 "predicate: none",
                 "projection: 1 columns",
                 "order/limit: none",
@@ -179,7 +179,7 @@ fn explain_names_every_decision() {
             "SELECT id FROM t WHERE v = 10 AND w BETWEEN 1 AND 9",
             [
                 "read table t",
-                TRADED,
+                INDEX_V,
                 "predicate: server-side",
                 "projection: 1 columns",
                 "order/limit: none",
@@ -187,12 +187,12 @@ fn explain_names_every_decision() {
         ),
         // A 128-bit conjunct has no VM register, so the best-ranked bound (the
         // point on `flag`, whose residual is that conjunct) yields to the walk
-        // that consumes it byte-exactly.
+        // that consumes it.
         (
             "SELECT id FROM wide WHERE flag = 1 AND big BETWEEN 100 AND 200",
             [
                 "read table wide",
-                "access: index range on (big) — exact walk, never traded",
+                "access: index range on (big)",
                 "predicate: server-side",
                 "projection: 1 columns",
                 "order/limit: none",
@@ -341,8 +341,8 @@ fn explain_names_every_decision() {
             "SELECT v, COUNT(*) FROM t WHERE v = 10 GROUP BY v LIMIT 0",
             [
                 "read table t",
-                TRADED,
-                "predicate: server-side",
+                INDEX_V,
+                "predicate: none",
                 "fold: group by (v): COUNT(*)",
                 "order/limit: no request (LIMIT 0)",
             ],

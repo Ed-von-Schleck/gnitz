@@ -2,10 +2,10 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::ir::BoundExpr;
 use gnitz_core::{Schema, ZSetBatch};
+use gnitz_expr::RangeMembership;
 
-/// Indices of the rows of `batch` that pass every residual predicate, in
-/// increasing order. Serves the UPDATE/DELETE resolution, which re-imposes the
-/// WHERE on the transaction's own buffered rows and needs the passing indices.
+/// Indices of the rows of `batch` inside `walk` that pass every residual predicate, in
+/// increasing order: the transaction's own buffered rows an UPDATE/DELETE matches.
 ///
 /// The conjuncts are AND-compiled once, then
 /// driven over the whole batch by the shared evaluator — the same program a
@@ -25,37 +25,28 @@ pub(crate) fn matching_indices(
     preds: &[&BoundExpr],
     batch: &ZSetBatch,
     schema: &Schema,
+    walk: Option<&RangeMembership>,
 ) -> Result<Vec<usize>, GnitzSqlError> {
     let n = batch.pks.len();
-    // Zero rows → zero matches, before any compilation. Nothing to test means the
-    // predicate need not be expressible: a transaction that buffered only
-    // tombstones must not raise `Unsupported` for a WHERE the VM cannot compile.
+    // Zero rows: nothing to test.
     if n == 0 {
         return Ok(Vec::new());
     }
-    // No residual → every row, before any compilation. This exempts a bound that
-    // applies the whole WHERE by itself — a `pk IN (…)` gather, a full-PK point,
-    // no `WHERE` at all — from building a view and materializing German cells for
-    // a predicate that does not exist.
-    //
-    // `None` from the compile is the statically-true verdict: the binder
-    // const-folds a null test on a non-nullable column, so
-    // `WHERE nonnull_col IS NOT NULL` arrives as `LitInt(1)` and must keep every
-    // row. The mirror needs nothing — `LitInt(0)` compiles to a real
-    // `LoadConst 0` and drops every row.
-    let Some(ev) = compile_conjuncts_evaluator(preds.iter().copied(), schema)? else {
-        return Ok((0..n).collect());
-    };
-    // The row count comes from the batch, so the drive cannot run past its end.
+    // `None` is the statically-true verdict: the binder const-folds a null test on a
+    // non-nullable column, so `WHERE nonnull_col IS NOT NULL` arrives as `LitInt(1)`.
+    let ev = compile_conjuncts_evaluator(preds.iter().copied(), schema)?;
     let mut ranges = Vec::new();
-    ev.filter_ranges(batch, &mut ranges);
-    // Ranges arrive in increasing order with `end` EXCLUSIVE, so `matched` keeps
-    // the sorted-index contract its callers rely on.
-    let mut matched = Vec::with_capacity(n);
-    for (start, end) in ranges {
-        matched.extend(start..end);
+    let mut words = Vec::new();
+    match (ev, walk) {
+        (None, None) => return Ok((0..n).collect()),
+        (None, Some(w)) => w.filter_ranges(batch, &mut words, &mut ranges),
+        (Some(ev), None) => ev.filter_ranges(batch, &mut ranges),
+        (Some(ev), Some(w)) => {
+            w.filter_words(batch, &mut words);
+            ev.filter_ranges_within(batch, &words, &mut ranges);
+        }
     }
-    Ok(matched)
+    Ok(ranges.into_iter().flat_map(|(s, e)| s..e).collect())
 }
 
 #[cfg(test)]

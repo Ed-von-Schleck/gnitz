@@ -78,18 +78,8 @@ fn a_refused_write_names_its_rule_and_writes_nothing() {
         ),
         ("INSERT IGNORE INTO t VALUES (2, 20, 'b')", "Unsupported", "IGNORE"),
         ("REPLACE INTO t VALUES (2, 20, 'b')", "Unsupported", "REPLACE INTO"),
-        // RETURNING projects plain source columns, a PK among them, and not
-        // beside ON CONFLICT.
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') RETURNING v + 1",
-            "Unsupported",
-            "RETURNING",
-        ),
-        (
-            "INSERT INTO t VALUES (2, 20, 'b') RETURNING v",
-            "Unsupported",
-            "PRIMARY KEY",
-        ),
+        // RETURNING binds as a SELECT list does, so it refuses what one refuses,
+        // and it is not accepted beside ON CONFLICT.
         (
             "INSERT INTO t VALUES (2, 20, 'b') RETURNING * REPLACE (v + 1 AS v)",
             "Unsupported",

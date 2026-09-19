@@ -7,25 +7,23 @@
 //! a read of that index — the last op per PK, `Present`/`Deleted` by weight sign
 //! (mirroring the engine's own per-table fold).
 //!
-//! - [`resolve_where_matches`] — the one overlay read: the committed reply of an
-//!   access plan, less every PK the transaction wrote, plus the transaction's own
-//!   rows the plan matches (UPDATE, DELETE, and through [`effective_rows`] the ON
-//!   CONFLICT paths).
-//! - [`effective_rows`] — a PK column's existing rows and per-row verdicts.
-//! - [`buffered_net`] — the net map over the keys a plan restricts the buffer to.
-//!   It borrows each buffered row **in place** (no copy).
-//! - [`present_rows`] — that map's live rows, materialized once as a batch, before
-//!   the caller's next `&mut client`.
+//! - [`resolve_where_matches`] — the committed rows a `ReadSpec` returns, less every
+//!   PK the transaction wrote, plus the transaction's own rows it matches (UPDATE,
+//!   DELETE).
+//! - [`KeyProbe`] — the rows a batch's keys already hold, and a verdict per key (the
+//!   ON CONFLICT paths).
 //!
 //! The map is **empty in autocommit**: `HashMap::new()` does not allocate.
 
 use std::sync::Arc;
 
-use crate::dml::plan::{fetch_bound, AccessPlan, BufferedKeys};
+use crate::codec::project_schema::key_reply;
 use crate::error::GnitzSqlError;
 use crate::exec::residual::matching_indices;
+use crate::ir::BoundExpr;
 use gnitz_core::{GnitzClient, PkBuf, PkColumn, Schema, ZSetBatch};
-use gnitz_wire::{PkKeys, ReadBound, ReadSink};
+use gnitz_expr::RangeMembership;
+use gnitz_wire::{PkKeys, ReadBound, ReadSink, ReadSpec};
 use std::collections::{HashMap, HashSet};
 
 /// A PK's net effect within the transaction so far. `Present` borrows the
@@ -44,97 +42,129 @@ pub(crate) enum Conflict {
     Repeat,
     /// Nothing holds this PK: absent from the store, or buffered as deleted.
     Fresh,
-    /// Row `usize` of the returned batch holds it.
-    Existing(usize),
+    /// A row holds this PK.
+    Existing,
 }
 
-/// The rows `plan` matches in the transaction's effective state: the committed
-/// reply under `reply_schema` without the PKs the transaction has written, and the
-/// transaction's own matching rows under `schema`. Each part's arena holds only
-/// its own rows' strings.
-///
-/// Committed reply rows are final — the server applied the whole WHERE. Only the
-/// buffered rows, which no server-side walk ever saw, are re-filtered here.
+/// The rows `spec` matches in the transaction's effective state: the committed reply
+/// under `reply_schema` without the PKs the transaction has written, and the
+/// transaction's own rows under `schema` inside `spec`'s bound that pass `residual`,
+/// the conjuncts the bound does not apply.
 pub(crate) fn resolve_where_matches(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
-    plan: &AccessPlan<'_>,
-    sink: &ReadSink,
+    spec: &ReadSpec,
+    residual: &[&BoundExpr],
     reply_schema: &Arc<Schema>,
 ) -> Result<(ZSetBatch, ZSetBatch), GnitzSqlError> {
-    let committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
-    let (keys, preds) = plan.buffered_scope();
-    let net = buffered_net(client, tid, keys);
+    // A DML target is a base table, which is never mirrored.
+    let committed = client.scan_spec(tid, spec, reply_schema)?;
+    let net = buffered_net(client, tid, &spec.bound);
     if net.is_empty() {
         return Ok((committed, ZSetBatch::new(schema)));
     }
-    // A PK the transaction has written is decided by its buffered version,
-    // whatever the committed row said.
+    // A PK the transaction has written is decided by its buffered version.
     let keep: Vec<(usize, i64)> = (0..committed.len())
         .filter(|&i| !net.contains_key(committed.pks.get_bytes(i)))
         .map(|i| (i, committed.weights[i]))
         .collect();
     let present = present_rows(&net, schema);
-    let matched: Vec<(usize, i64)> = matching_indices(preds, &present, schema)?
+    let walk = range_walk(&spec.bound, schema)?;
+    let matched: Vec<(usize, i64)> = matching_indices(residual, &present, schema, walk.as_ref())?
         .into_iter()
         .map(|i| (i, present.weights[i]))
         .collect();
     Ok((committed.gather(&keep), present.gather(&matched)))
 }
 
-/// One [`Conflict`] per row of `pks`, plus the rows that exist as one owned batch.
-/// The transaction's last buffered op on a key wins; every other key comes from
-/// one `PkSet` gather.
-pub(crate) fn effective_rows(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Arc<Schema>,
-    pks: &PkColumn,
-) -> Result<(ZSetBatch, Vec<Conflict>), GnitzSqlError> {
-    let keys = PkKeys::from_keys(schema.pk_stride(), (0..pks.len()).map(|i| pks.get_bytes(i)));
-    // No WHERE behind it, so the gather is the whole selection.
-    let plan = AccessPlan::new(ReadBound::PkSet(keys), &[], Vec::new(), schema)?;
-    let (mut rows, buffered) = resolve_where_matches(client, tid, schema, &plan, &ReadSink::all_rows(), schema)?;
-    rows.extend_from_owned(buffered);
-    let verdicts = {
-        let at: HashMap<&[u8], usize> = (0..rows.len()).map(|r| (rows.pks.get_bytes(r), r)).collect();
-        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(pks.len());
-        (0..pks.len())
-            .map(|i| {
-                let key = pks.get_bytes(i);
-                match (seen.insert(key), at.get(key)) {
-                    (false, _) => Conflict::Repeat,
-                    (true, Some(&row)) => Conflict::Existing(row),
-                    (true, None) => Conflict::Fresh,
-                }
-            })
-            .collect()
+/// The walk a range `bound` names, as a row filter; a `PkSet` or no bound names none.
+fn range_walk(bound: &ReadBound, schema: &Schema) -> Result<Option<RangeMembership>, GnitzSqlError> {
+    let walk = match *bound {
+        ReadBound::PkRange(desc) => RangeMembership::new(&schema.pk_cols, desc, schema),
+        ReadBound::IndexRange(b) => RangeMembership::new(b.idx_cols.as_slice(), b.desc, schema),
+        ReadBound::None | ReadBound::PkSet(_) => return Ok(None),
     };
-    Ok((rows, verdicts))
+    walk.map(Some).map_err(GnitzSqlError::Internal)
 }
 
-/// The transaction's net effect on `tid` over `keys`: an exact key set restricts
-/// it — its residual does not constrain the PK, so an unrelated buffered row must
-/// not enter the candidates — else it is every PK the transaction touched.
-///
-/// **Empty in autocommit**, and in any transaction that has not written `tid`.
-pub(crate) fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, keys: BufferedKeys<'_>) -> Net<'a> {
+/// A read of the rows a batch's keys already hold: one `PkSet` gather of them.
+pub(crate) struct KeyProbe<'a> {
+    pks: &'a PkColumn,
+    spec: ReadSpec,
+    reply: Arc<Schema>,
+}
+
+impl<'a> KeyProbe<'a> {
+    /// The keys' rows, whole.
+    pub(crate) fn rows(schema: &Arc<Schema>, pks: &'a PkColumn) -> Self {
+        KeyProbe::new(schema, pks, ReadSink::all_rows(), Arc::clone(schema))
+    }
+
+    /// The keys' rows as keys alone, for their verdicts.
+    pub(crate) fn keys(schema: &Schema, pks: &'a PkColumn) -> Result<Self, GnitzSqlError> {
+        let (reply, map) = key_reply(schema)?;
+        let sink = ReadSink { map: Some(map), ..ReadSink::all_rows() };
+        Ok(KeyProbe::new(schema, pks, sink, Arc::new(reply)))
+    }
+
+    fn new(schema: &Schema, pks: &'a PkColumn, sink: ReadSink, reply: Arc<Schema>) -> Self {
+        let keys = PkKeys::from_keys(schema.pk_stride(), (0..pks.len()).map(|i| pks.get_bytes(i)));
+        let spec = ReadSpec {
+            bound: ReadBound::PkSet(keys),
+            predicate: Vec::new(),
+            sink,
+        };
+        KeyProbe { pks, spec, reply }
+    }
+
+    /// The rows that exist — the committed ones in this probe's reply, the transaction's
+    /// own under `schema` — and one [`Conflict`] per key. The transaction's last buffered
+    /// op on a key wins.
+    pub(crate) fn resolve(
+        &self,
+        client: &mut GnitzClient,
+        tid: u64,
+        schema: &Arc<Schema>,
+    ) -> Result<(ZSetBatch, ZSetBatch, Vec<Conflict>), GnitzSqlError> {
+        let (committed, buffered) = resolve_where_matches(client, tid, schema, &self.spec, &[], &self.reply)?;
+        let held: HashSet<&[u8]> = (0..committed.len())
+            .map(|r| committed.pks.get_bytes(r))
+            .chain((0..buffered.len()).map(|r| buffered.pks.get_bytes(r)))
+            .collect();
+        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(self.pks.len());
+        let verdicts = (0..self.pks.len())
+            .map(|i| {
+                let key = self.pks.get_bytes(i);
+                match (seen.insert(key), held.contains(key)) {
+                    (false, _) => Conflict::Repeat,
+                    (true, true) => Conflict::Existing,
+                    (true, false) => Conflict::Fresh,
+                }
+            })
+            .collect();
+        Ok((committed, buffered, verdicts))
+    }
+}
+
+/// The transaction's net effect on `tid`: over a `PkSet`'s keys, else over every PK it
+/// touched. **Empty in autocommit**, and in any transaction that has not written `tid`.
+fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, bound: &ReadBound) -> Net<'a> {
     let Some(buf) = client.txn_reads(tid) else {
         return Net::new();
     };
-    match keys {
-        BufferedKeys::Keys(keys) => keys
+    match bound {
+        ReadBound::PkSet(keys) => keys
             .iter()
             .filter_map(|k| buf.last_op(k).map(|(b, r)| (PkBuf::from_bytes(k), op_of(b, r))))
             .collect(),
-        BufferedKeys::All => buf.last_ops().map(|(pk, b, r)| (pk, op_of(b, r))).collect(),
+        _ => buf.last_ops().map(|(pk, b, r)| (pk, op_of(b, r))).collect(),
     }
 }
 
 /// The transaction's own live rows: every `Present` op in `net`, materialized
 /// under `schema` as one batch.
-pub(crate) fn present_rows(net: &Net, schema: &Schema) -> ZSetBatch {
+fn present_rows(net: &Net, schema: &Schema) -> ZSetBatch {
     let mut out = ZSetBatch::with_capacity(schema, net.len());
     for op in net.values() {
         if let Buffered::Present(batch, row) = op {

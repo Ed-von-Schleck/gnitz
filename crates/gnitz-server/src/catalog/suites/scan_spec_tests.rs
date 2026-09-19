@@ -753,3 +753,33 @@ fn reply_pk_stride_mismatch_errs() {
     let spec = identity_spec(ReadBound::None, vec![], 0);
     assert!(e.scan_spec(tid, spec, &bad).is_err());
 }
+
+/// An index walk returns exactly its range through the index, as a full scan past the
+/// selectivity gate, and after the index is dropped.
+#[test]
+fn an_index_walk_serves_exactly_its_range_with_or_without_the_index() {
+    let (mut engine, tid) = fixture("spec_index_walk", 200, |id| id as i64 - 100);
+    engine.create_index("public.t", &["val"], false).unwrap();
+    let p = |v: i64| gnitz_wire::FixedInt::I64.pack(v as i128);
+    let walk = |start: Cut, end: Cut| {
+        let bound = ReadBound::IndexRange(gnitz_wire::IndexBound {
+            idx_cols: gnitz_wire::PkColList::from_slice(&[1]),
+            desc: RangeDescriptor::new(&[], start, end),
+        });
+        identity_spec(bound, vec![], 0)
+    };
+    let sorted = |mut rows: Vec<(u128, i64, i64)>| {
+        rows.sort_unstable();
+        rows
+    };
+    let expect = |lo: i64, hi: i64| -> Vec<(u128, i64, i64)> { (lo..hi).map(|v| ((v + 100) as u128, v, 1)).collect() };
+    // 60 of 200 rows, far past the 1/16 selectivity gate, across zero.
+    let wide = walk(Cut::Before(p(-10)), Cut::Before(p(50)));
+    let narrow = walk(Cut::After(p(-3)), Cut::After(p(1)));
+    assert_eq!(sorted(run(&mut engine, tid, &wide)), expect(-10, 50));
+    assert_eq!(sorted(run(&mut engine, tid, &narrow)), expect(-2, 2));
+    engine.drop_index("public__t__idx_val").unwrap();
+    assert_eq!(sorted(run(&mut engine, tid, &wide)), expect(-10, 50));
+    assert_eq!(sorted(run(&mut engine, tid, &narrow)), expect(-2, 2));
+    engine.close();
+}

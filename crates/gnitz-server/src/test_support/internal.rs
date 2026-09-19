@@ -204,7 +204,7 @@ pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: i64, name:
     try_register_identity_view(engine, source_tid, name, cols, 0, 0).unwrap()
 }
 
-/// The rows an `IndexRange`/`Required` read of `range` over `cols` returns, or
+/// The rows an `IndexRange` read of `range` over `cols` returns, or
 /// `None` when none match — the production read, through `open_bound`.
 pub fn seek_by_index_range(
     engine: &mut CatalogEngine,
@@ -217,13 +217,10 @@ pub fn seek_by_index_range(
         .relation_or_err(tid)
         .map_err(|e| gnitz_wire::WireFault::from(e.to_string()))?
         .schema();
-    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::IndexRange {
-        bound: gnitz_wire::IndexBound {
-            idx_cols: gnitz_wire::PkColList::from_slice(cols),
-            desc: range,
-        },
-        walk: gnitz_wire::IndexWalk::Required,
-    });
+    let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::IndexRange(gnitz_wire::IndexBound {
+        idx_cols: gnitz_wire::PkColList::from_slice(cols),
+        desc: range,
+    }));
     let rows = engine.scan_spec(tid, spec, &schema)?;
     Ok(((!rows.is_empty()).then_some(rows), schema))
 }

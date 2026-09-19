@@ -46,7 +46,7 @@ fn first_index(
     candidates(conjuncts, sch, metas)
         .into_iter()
         .find_map(|c| match c.bound {
-            ReadBound::IndexRange { bound, .. } => Some((
+            ReadBound::IndexRange(bound) => Some((
                 bound.idx_cols.as_slice().to_vec(),
                 bound.desc,
                 conjuncts.len() - c.consumed.len(),
@@ -381,17 +381,52 @@ fn a_list_gather_needs_every_pk_column() {
     assert_eq!(pk_in_keys_of("id IN (7)", &pk_schema(TypeCode::U64)), Some(vec![7]));
 }
 
-/// Two lists cross into a product exponential in the SQL text, so one past a
-/// request's worth of keys gathers nothing.
+/// A cross product of lists past the cap gathers nothing; a lone list that long gathers.
 #[test]
-fn a_list_product_past_one_request_is_no_set() {
+fn a_list_product_past_the_cap_is_no_set() {
     let schema = compound_schema_u64_u64();
-    let list = |col: usize| BoundExpr::InList {
+    let list = |col: usize, n: i64| BoundExpr::InList {
         inner: Box::new(BoundExpr::ColRef(col)),
-        items: (0..300).map(BoundExpr::LitInt).collect(),
+        items: (0..n).map(BoundExpr::LitInt).collect(),
     };
-    assert!(300 * 300 > PkKeys::max_per_request(schema.pk_stride()));
-    assert!(set_keys_of(&[list(0), list(1)], &schema).is_none());
+    const { assert!(300 * 300 > MAX_CROSS_PRODUCT_KEYS) };
+    assert!(set_keys_of(&[list(0, 300), list(1, 300)], &schema).is_none());
+    let point = bind_where("b = 3", &schema);
+    let lone = [list(0, MAX_CROSS_PRODUCT_KEYS as i64 + 1), point[0].clone()];
+    assert_eq!(
+        set_keys_of(&lone, &schema).map(|k| k.len()),
+        Some(MAX_CROSS_PRODUCT_KEYS + 1)
+    );
+}
+
+/// Crossed keys ascend in OPK order with the PK list against schema order and a signed
+/// column beside an unsigned one.
+#[test]
+fn crossed_keys_ascend_in_pk_list_order() {
+    let schema = Schema {
+        columns: vec![col_def("a", TypeCode::I32, false), col_def("b", TypeCode::U16, false)],
+        pk_cols: vec![1, 0],
+    };
+    let where_expr = bind_where("a IN (2, -1, -3) AND b IN (5, 1)", &schema);
+    let keys = candidates(&where_expr, &schema, &[])
+        .into_iter()
+        .find_map(|c| match c.bound {
+            ReadBound::PkSet(keys) => Some(keys),
+            _ => None,
+        })
+        .expect("both PK columns carry a list");
+    let (i32_tc, u16_tc) = (TypeCode::I32 as u8, TypeCode::U16 as u8);
+    let mut want = Vec::new();
+    for b in [1u128, 5] {
+        for a in [-3i128, -1, 2] {
+            let key = gnitz_wire::encode_pk_natives(
+                [(u16_tc, u16_tc), (i32_tc, i32_tc)],
+                [b, gnitz_wire::FixedInt::I32.pack(a)],
+            );
+            want.extend_from_slice(key.pk_bytes());
+        }
+    }
+    assert_eq!(keys.as_bytes(), &want[..]);
 }
 
 #[test]
@@ -913,7 +948,7 @@ fn kinds(conjuncts: &[BoundExpr], sch: &Schema, lists: &[(&[u32], bool)]) -> Vec
         .map(|c| match c.bound {
             ReadBound::None => "None",
             ReadBound::PkRange(_) => "PkRange",
-            ReadBound::IndexRange { .. } => "IndexRange",
+            ReadBound::IndexRange(_) => "IndexRange",
             ReadBound::PkSet(_) => "PkSet",
         })
         .collect()

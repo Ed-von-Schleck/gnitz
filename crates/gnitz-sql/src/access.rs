@@ -5,8 +5,8 @@
 
 use crate::codec::pk_codec::{bound_key_literal, col_key_literal, BoundLit, KeyLitError};
 use crate::ir::{BExpr, BinOp, BoundExpr};
-use gnitz_core::{Cut, IndexMeta, PkColumn, RangeDescriptor, Schema, TypeCode, PK_LIST_MAX_COLS};
-use gnitz_wire::{IndexBound, IndexWalk, PkKeys, ReadBound};
+use gnitz_core::{Cut, IndexMeta, RangeDescriptor, Schema, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_wire::{key_image, IndexBound, PkKeys, ReadBound};
 use std::cmp::Reverse;
 
 /// Classify a bound binary op as `col OP literal`, the `ColRef` on either side.
@@ -65,8 +65,9 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
             .iter()
             .map(|i| bound_key_literal(col_key_literal(i, c)?, c.type_code).ok())
             .collect::<Option<_>>()?;
-        // The binder keeps a list as written; a repeat is no second key.
-        keys.sort_unstable();
+        // In key order, so the key set crosses the lists already sorted. The binder
+        // keeps a list as written; a repeat is no second key.
+        keys.sort_unstable_by_key(|&v| key_image(c.type_code as u8, v));
         keys.dedup();
         return Some((*col, Pin::In(keys)));
     }
@@ -117,15 +118,9 @@ impl Folded {
     }
 }
 
-/// Cut order on a column of type `tc`: value in key order (a signed type's sign bit
-/// flipped at its stride, as the OPK encoding does), then `Before` below `After`.
+/// Cut order on a column of type `tc`: value in key order, then `Before` below `After`.
 fn cut_key(c: Cut, tc: TypeCode) -> (u128, bool) {
-    let flip = if tc.is_signed_int() {
-        1u128 << (8 * tc.wire_stride() - 1)
-    } else {
-        0
-    };
-    (c.value() ^ flip, matches!(c, Cut::After(_)))
+    (key_image(tc as u8, c.value()), matches!(c, Cut::After(_)))
 }
 
 /// Every `Eq`/`Start`/`End` pin on `col` intersected; `Eq(v)` is the interval
@@ -196,6 +191,10 @@ fn bound_column_list(cols: &[u32], terms: &[Term], schema: &Schema) -> Option<(R
 // The PK key set
 // ---------------------------------------------------------------------------
 
+/// The size past which a crossed key set is served as a predicate scan instead: a
+/// product of lists grows multiplicatively past anything the statement spelled out.
+const MAX_CROSS_PRODUCT_KEYS: usize = 65_536;
+
 /// The PK keys the WHERE names: each PK column's point, else its first IN list,
 /// crossed into OPK keys.
 fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
@@ -220,28 +219,39 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
         lists[k] = Some(keys);
         consumed.push(conjunct);
     }
-    let lists = &lists[..pk_count];
-    let slices: Vec<&[u128]> = lists
+    let slices: Vec<&[u128]> = lists[..pk_count]
         .iter()
         .zip(&points)
         .map(|(l, p)| l.unwrap_or(std::slice::from_ref(p)))
         .collect();
     let n = slices.iter().try_fold(1usize, |n, s| n.checked_mul(s.len()))?;
     let longest = slices.iter().map(|s| s.len()).max().unwrap_or(1);
-    let stride = schema.pk_stride();
     // Only a cross product is capped: a lone list is keys the statement spelled out.
-    if n > longest.max(PkKeys::max_per_request(stride)) {
+    if n > longest.max(MAX_CROSS_PRODUCT_KEYS) {
         return None;
     }
-    let mut col = PkColumn::empty_for_schema(schema);
-    col.reserve(n);
+    // Each position's values as that column's OPK bytes, once. Every list is in key
+    // order, so varying the last position fastest emits strictly ascending tuples.
+    let encoded: Vec<(usize, Vec<u8>)> = schema
+        .pk_cols
+        .iter()
+        .zip(&slices)
+        .map(|(&col, s)| {
+            let tc = schema.columns[col as usize].type_code as u8;
+            let bytes: Vec<u8> = s
+                .iter()
+                .flat_map(|&v| gnitz_wire::encode_pk_natives([(tc, tc)], [v]).pk_bytes().to_vec())
+                .collect();
+            (gnitz_wire::wire_stride(tc), bytes)
+        })
+        .collect();
+    let stride = schema.pk_stride();
+    let mut bytes = Vec::with_capacity(n * stride);
     let mut at = [0usize; PK_LIST_MAX_COLS];
-    let mut tuple = [0u128; PK_LIST_MAX_COLS];
     for _ in 0..n {
-        for (k, s) in slices.iter().enumerate() {
-            tuple[k] = s[at[k]];
+        for (k, (w, b)) in encoded.iter().enumerate() {
+            bytes.extend_from_slice(&b[at[k] * w..(at[k] + 1) * w]);
         }
-        col.push_natives(schema, &tuple[..pk_count]);
         for k in (0..pk_count).rev() {
             at[k] += 1;
             if at[k] < slices[k].len() {
@@ -250,8 +260,7 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
             at[k] = 0;
         }
     }
-    let keys = PkKeys::from_keys(stride, (0..n).map(|i| col.get_bytes(i)));
-    Some((keys, consumed))
+    Some((PkKeys::from_sorted(stride, bytes), consumed))
 }
 
 // ---------------------------------------------------------------------------
@@ -341,8 +350,14 @@ pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[In
             bounded_sides: bounded_sides(&desc, tc),
             narrower: Reverse(cols.len()),
         };
-        let walk = ReadBound::IndexRange { bound, walk: IndexWalk::Optional };
-        out.push((tier, rank, Candidate { bound: walk, consumed }));
+        out.push((
+            tier,
+            rank,
+            Candidate {
+                bound: ReadBound::IndexRange(bound),
+                consumed,
+            },
+        ));
     }
     // Stable, so a full tie keeps declared order.
     out.sort_by_key(|(tier, rank, _)| (*tier, Reverse(*rank)));

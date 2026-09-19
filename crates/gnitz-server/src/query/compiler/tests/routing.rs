@@ -908,10 +908,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
     };
     let scan = |source: u64, b: Option<gnitz_wire::IndexBound>| OpNode::ScanDelta {
         source,
-        bound: b.map_or(gnitz_wire::ReadBound::None, |bound| gnitz_wire::ReadBound::IndexRange {
-            bound,
-            walk: gnitz_wire::IndexWalk::Optional,
-        }),
+        bound: b.map_or(gnitz_wire::ReadBound::None, gnitz_wire::ReadBound::IndexRange),
     };
     let bounds_of = |a: OpNode, b: OpNode| {
         let loaded = loaded_for_test(
@@ -923,7 +920,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
             .source_bounds
             .iter()
             .map(|(&s, b)| match b {
-                gnitz_wire::ReadBound::IndexRange { bound, .. } => (s, bound.idx_cols.as_slice().to_vec()),
+                gnitz_wire::ReadBound::IndexRange(bound) => (s, bound.idx_cols.as_slice().to_vec()),
                 other => panic!("source {s}: unexpected bound {other:?}"),
             })
             .collect();

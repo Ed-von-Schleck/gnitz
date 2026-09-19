@@ -238,8 +238,8 @@ impl EvalScratch {
 
     /// The filter bitmap covering `n` rows. No bit past `n` is set — both arms
     /// of [`Self::write_filter_words`] see to that.
-    pub(crate) fn filter_words(&self, n: usize) -> &[u64] {
-        &self.filter_bits[..n.div_ceil(64)]
+    pub(crate) fn filter_words_mut(&mut self, n: usize) -> &mut [u64] {
+        &mut self.filter_bits[..n.div_ceil(64)]
     }
 
     /// The result register's value at row `i` of the morsel just evaluated, or

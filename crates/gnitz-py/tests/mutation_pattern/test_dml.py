@@ -15,11 +15,9 @@ one BEGIN … COMMIT — and both must report the given per-statement counts and
 leave the given Z-set.
 """
 
+import gnitz
 import pytest
-from _read import bag, scanned
-
-# `ReadSpec`'s wire cap on a `pk IN (…)` gather; DML chunks past it.
-MAX_PK_SET_KEYS = 65_536
+from _read import bag, rows, scanned
 
 _U64_MAX = (1 << 64) - 1
 _I64_MIN = -(1 << 63)
@@ -113,13 +111,22 @@ _SCENARIOS = {
     "u64-max-key": _wide_key("BIGINT UNSIGNED", _U64_MAX, 1, 1),
     "i64-min-key": _wide_key("BIGINT", _I64_MIN, -1, -1),
     "uuid-key": _wide_key("UUID", f"'{_UUID_A}'", f"'{_UUID_B}'", _UUID_B),
-    # A 128-bit PK range pins no key, so a buffered row would face the whole
-    # WHERE; a transaction holding only a tombstone has none to face.
     "u128-range": (
         "CREATE TABLE {t} (id DECIMAL(38,0) NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
         ", ".join(f"({i}, {i})" for i in range(1, 11)),
-        [("DELETE FROM {t} WHERE id = 1", 1), ("DELETE FROM {t} WHERE id > 5", 5)],
-        [(i, i) for i in range(2, 6)]),
+        [("INSERT INTO {t} VALUES (20, 20), (0, 0)", 2),
+         ("DELETE FROM {t} WHERE id = 1", 1),
+         ("DELETE FROM {t} WHERE id > 5", 6)],
+        [(0, 0), *((i, i) for i in range(2, 6))]),
+    "u128-index-range": (
+        "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, u DECIMAL(38,0) NOT NULL, v BIGINT NOT NULL); "
+        "CREATE INDEX ON {t} (u)",
+        "(1, 1, 0), (2, 100, 0), (3, 200, 0)",
+        [("INSERT INTO {t} VALUES (4, 150, 0)", 1),
+         ("UPDATE {t} SET v = 1 WHERE u > 99", 3),
+         ("UPDATE {t} SET v = 2 WHERE u > 99 AND u < 160", 2),
+         ("DELETE FROM {t} WHERE u >= 200", 1)],
+        [(1, 1, 0), (2, 100, 2), (4, 150, 2)]),
 }
 
 
@@ -137,22 +144,29 @@ def test_a_transaction_resolves_each_statement_as_autocommit_does(
     assert bag(scanned(client, sn, "ac")) == bag(scanned(client, sn, "tx")) == dict.fromkeys(final, 1)
 
 
-def test_a_pk_set_past_the_wire_cap_is_gathered_in_chunks(client, schema_name):
-    """Longer than one `ReadSpec` can carry: DML chunks the gather across
-    requests rather than declining to a full scan. Absent keys contribute
-    nothing, so the count is the rows actually touched."""
-    sn = schema_name
-    present = [1, 2, 3, MAX_PK_SET_KEYS, MAX_PK_SET_KEYS + 1]
-    outside = MAX_PK_SET_KEYS + 2
+@pytest.mark.parametrize("placement", ["keyed", "replicated", "view"])
+def test_a_long_pk_in_list_is_one_gather(client, schema_name, placement):
+    """A `pk IN (…)` list is read as one gather however long it is, over a keyed
+    table, a replicated one, and a view over the replicated one. Absent keys
+    contribute nothing."""
+    sn, n = schema_name, 70_000
+    opts = "" if placement == "keyed" else " WITH (replicated = true)"
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL); "
-        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in present + [outside]),
-        schema_name=sn)
+        f"CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL){opts}", schema_name=sn)
+    read = "t"
+    if placement == "view":
+        client.execute_sql("CREATE VIEW w AS SELECT id, v FROM t", schema_name=sn)
+        read = "w"
+    tid, schema = client.resolve_table(sn, "t")
+    client.push(tid, gnitz.ZSetBatch(schema).extend([{"id": i, "v": i} for i in range(0, n + 10, 2)]))
 
-    keys = ", ".join(str(i) for i in range(1, MAX_PK_SET_KEYS + 2))
+    keys = ", ".join(str(i) for i in range(1, n + 1))
+    inside = {(i, i): 1 for i in range(2, n + 1, 2)}
+    outside = {(i, i): 1 for i in (0, *range(n + 2, n + 10, 2))}
+    assert bag(rows(client, sn, f"SELECT id, v FROM {read} WHERE id IN ({keys})")) == inside
     res = client.execute_sql(f"DELETE FROM t WHERE id IN ({keys})", schema_name=sn)
-    assert res[0]["count"] == len(present)
-    assert bag(scanned(client, sn, "t")) == {(outside, outside): 1}
+    assert res[0]["count"] == len(inside)
+    assert bag(scanned(client, sn, read)) == outside
 
 
 def test_an_update_over_a_pk_set_reads_back_every_committed_row(client, schema_name):

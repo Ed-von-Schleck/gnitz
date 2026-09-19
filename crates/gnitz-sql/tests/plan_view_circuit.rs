@@ -347,7 +347,7 @@ fn indexed_predicates_bound_the_backfill_scan() {
                     ReadBound::None => None,
                     ReadBound::PkRange(_) => Some("pk range".to_string()),
                     ReadBound::PkSet(keys) => Some(format!("pk set {}", keys.len())),
-                    ReadBound::IndexRange { bound, .. } => Some(format!("{:?}", bound.idx_cols.as_slice())),
+                    ReadBound::IndexRange(bound) => Some(format!("{:?}", bound.idx_cols.as_slice())),
                 },
                 _ => None,
             })

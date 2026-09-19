@@ -5,6 +5,7 @@
 //! list (`bind_set_list`, `classify_set_rhs`, `apply_set`), so it behaves exactly
 //! like an `UPDATE ... SET`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ast_util::{bind_constant, extract_object_name, single_part_ident, Constant};
@@ -12,10 +13,11 @@ use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::PkPlan;
 use crate::dml::mutate::{apply_set, bind_set_list, classify_set_rhs, Scope, SetCol, SetRhs};
-use crate::dml::overlay::{effective_rows, Conflict};
+use crate::dml::overlay::{Conflict, KeyProbe};
+use crate::dml::plan::{rows_reply, RowsReply};
 use crate::dml::rmw::commit_rmw_or_buffer;
 use crate::error::GnitzSqlError;
-use crate::exec::batch::{project, resolve_projection};
+use crate::exec::client_map::ClientMap;
 use crate::ir::{BExpr, BoundExpr};
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
@@ -280,13 +282,18 @@ pub(crate) fn execute_insert(
 
     match plan {
         ConflictPlan::Error => {
-            // Resolved before the push, so a bad RETURNING list writes nothing.
-            // The SERIAL ids are already stamped, so the reply is a projection of
-            // the batch just built — no round trip.
-            let proj = insert
+            // Before the push, so a RETURNING list that fails to bind writes nothing.
+            let returning = insert
                 .returning
                 .as_deref()
-                .map(|items| resolve_projection(items, schema, &table_name_str))
+                .map(|items| {
+                    let RowsReply { schema: out_schema, program, .. } =
+                        rows_reply(items, None, schema, &table_name_str)?;
+                    let map = program
+                        .map(|p| ClientMap::new(p, schema, Arc::clone(&out_schema)))
+                        .transpose()?;
+                    Ok::<_, GnitzSqlError>((out_schema, map))
+                })
                 .transpose()?;
             // The engine refuses `Error` on a stream (its PK is not unique) and
             // leaves `Update` unread: the push appends, so the same row twice is
@@ -296,15 +303,17 @@ pub(crate) fn execute_insert(
             } else {
                 WireConflictMode::Error
             };
-            // Split on the projection: `push_owned` gives the batch away when
-            // nothing will project it, saving a deep clone inside a transaction.
-            match proj {
-                Some(proj) => {
+            // Split on RETURNING: `push_owned` gives the batch away when nothing
+            // will project it, saving a deep clone inside a transaction.
+            match returning {
+                Some((schema_out, map)) => {
                     client.push_with_mode(tid, schema, &batch, mode)?;
-                    let (proj_schema, proj_batch) = project(proj, schema, batch);
                     Ok(SqlResult::Rows {
-                        schema: Arc::new(proj_schema),
-                        batch: proj_batch,
+                        schema: schema_out,
+                        batch: match map {
+                            Some(m) => m.apply(batch),
+                            None => batch,
+                        },
                     })
                 }
                 None => {
@@ -314,11 +323,12 @@ pub(crate) fn execute_insert(
             }
         }
         ConflictPlan::DoNothing => {
+            let probe = KeyProbe::keys(schema, &batch.pks)?;
             // The RMW driver pushes `Update`, not `Error`: its OCC precondition is
             // what settles a stale filter, where `Error` would raise a duplicate-key
             // error out of a statement spelled "do nothing".
             let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
-                client_side_filter_do_nothing(client, tid, schema, &batch)
+                client_side_filter_do_nothing(client, tid, schema, &probe, &batch)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
@@ -326,8 +336,9 @@ pub(crate) fn execute_insert(
             // Re-merged per RMW retry, so `SET x = x + 1` reads the freshest `x`.
             // Every row rides at +1 and the worker's `enforce_unique_pk` turns a
             // merged one into the retract-and-insert.
+            let probe = KeyProbe::rows(schema, &batch.pks);
             let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
-                client_side_merge_do_update(client, tid, schema, &batch, &set)
+                client_side_merge_do_update(client, tid, schema, &probe, &batch, &set)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
@@ -382,14 +393,15 @@ fn expr_contains_excluded(expr: &Expr) -> bool {
 }
 
 /// Drop incoming rows whose PK already exists, returning the filtered ZSetBatch.
-/// Intra-batch duplicate PKs keep only the first occurrence.
+/// Intra-batch duplicate PKs keep only the first occurrence. `probe` reads `batch`'s keys.
 fn client_side_filter_do_nothing(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
+    probe: &KeyProbe,
     batch: &ZSetBatch,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let (_, verdicts) = effective_rows(client, tid, schema, &batch.pks)?;
+    let (_, _, verdicts) = probe.resolve(client, tid, schema)?;
     let mut out = ZSetBatch::with_capacity(schema, verdicts.len());
     for (i, verdict) in verdicts.iter().enumerate() {
         // `Repeat` and `Existing` alike mean the PK is already claimed.
@@ -407,14 +419,16 @@ fn client_side_merge_do_update(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
+    probe: &KeyProbe,
     batch: &ZSetBatch,
     set: &[SetCol],
 ) -> Result<ZSetBatch, GnitzSqlError> {
     // `rows` is the `Existing` scope, so `SET x = x + 1` reads the row a
     // transaction buffered.
-    let (rows, verdicts) = effective_rows(client, tid, schema, &batch.pks)?;
-    // The VALUES row each existing row collided with.
-    let mut src_of = vec![0; rows.len()];
+    let (mut rows, buffered, verdicts) = probe.resolve(client, tid, schema)?;
+    rows.extend_from_owned(buffered);
+    // The VALUES row each existing key collided with.
+    let mut src_of: HashMap<&[u8], usize> = HashMap::with_capacity(rows.len());
     let mut out = ZSetBatch::with_capacity(schema, verdicts.len());
     for (i, verdict) in verdicts.iter().enumerate() {
         match *verdict {
@@ -426,12 +440,14 @@ fn client_side_merge_do_update(
                 ));
             }
             Conflict::Fresh => out.copy_row_at(batch, i, batch.weights[i]),
-            Conflict::Existing(row) => src_of[row] = i,
+            Conflict::Existing => {
+                src_of.insert(batch.pks.get_bytes(i), i);
+            }
         }
     }
-    let mut excluded = ZSetBatch::with_capacity(schema, src_of.len());
-    for &i in &src_of {
-        excluded.copy_row_at(batch, i, 1);
+    let mut excluded = ZSetBatch::with_capacity(schema, rows.len());
+    for r in 0..rows.len() {
+        excluded.copy_row_at(batch, src_of[rows.pks.get_bytes(r)], 1);
     }
     out.extend_from_owned(apply_set(set, rows, Some(&excluded), schema)?);
     Ok(out)

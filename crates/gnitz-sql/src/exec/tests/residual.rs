@@ -6,7 +6,7 @@ use gnitz_core::{BatchAppender, TypeCode};
 /// Which rows `pred` selects — the real path (fold → compile → adapter →
 /// vectorized kernel), which is what every test here exists to pin.
 fn matches(pred: &BoundExpr, batch: &ZSetBatch, schema: &Schema) -> Vec<usize> {
-    matching_indices(&[pred], batch, schema).expect("residual must compile")
+    matching_indices(&[pred], batch, schema, None).expect("residual must compile")
 }
 
 fn eq(col: usize, v: i64) -> BoundExpr {
@@ -51,7 +51,7 @@ fn and_fold_null_conjunct_excludes_either_way() {
     let val_null = eq(1, 0); // NULL = 0 → UNKNOWN
     for other in [pk_true, pk_false] {
         assert!(
-            matching_indices(&[&other, &val_null], &batch, &schema)
+            matching_indices(&[&other, &val_null], &batch, &schema, None)
                 .unwrap()
                 .is_empty(),
             "a NULL conjunct must exclude the row"
@@ -88,11 +88,11 @@ fn compound_pk_colref_reads_byte_region() {
     BatchAppender::new(&mut batch, &schema).i64_val(42);
     // Both PK columns and the payload, as one three-conjunct AND chain.
     let (a, b, v) = (eq(0, 7), eq(1, 9), eq(2, 42));
-    assert_eq!(matching_indices(&[&a, &b, &v], &batch, &schema).unwrap(), vec![0]);
+    assert_eq!(matching_indices(&[&a, &b, &v], &batch, &schema, None).unwrap(), vec![0]);
     // The second PK column is addressed at its own OPK byte offset, not the
     // first one's.
     let wrong = eq(1, 7);
-    assert!(matching_indices(&[&wrong], &batch, &schema).unwrap().is_empty());
+    assert!(matching_indices(&[&wrong], &batch, &schema, None).unwrap().is_empty());
 }
 
 // ------------------------------------------------------------------
@@ -103,7 +103,7 @@ fn compound_pk_colref_reads_byte_region() {
 fn wide_pk_is_rejected() {
     let schema = pk_schema(TypeCode::U128);
     let batch = pk_row(&schema, u128::MAX);
-    let err = matching_indices(&[&eq(0, 1)], &batch, &schema).expect_err("U128 PK must be rejected");
+    let err = matching_indices(&[&eq(0, 1)], &batch, &schema, None).expect_err("U128 PK must be rejected");
     assert!(err.to_string().contains("U128"), "error must name the type: {err}");
 }
 
@@ -112,7 +112,8 @@ fn uuid_payload_is_rejected() {
     let schema = uuid_schema_payload();
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch, &schema).add_row(1, 1).u128_val(0);
-    let err = matching_indices(&[&BoundExpr::ColRef(1)], &batch, &schema).expect_err("UUID column must be rejected");
+    let err =
+        matching_indices(&[&BoundExpr::ColRef(1)], &batch, &schema, None).expect_err("UUID column must be rejected");
     assert!(err.to_string().contains("UUID"), "error should mention UUID: {err}");
 }
 
@@ -163,7 +164,28 @@ fn string_column_residual_filters() {
 fn the_keep_every_row_exits() {
     let schema = two_col(TypeCode::I64);
     let batch = batch_2col(7i64.to_le_bytes().to_vec(), TypeCode::I64, 0);
-    assert_eq!(matching_indices(&[], &batch, &schema).unwrap(), vec![0]);
+    assert_eq!(matching_indices(&[], &batch, &schema, None).unwrap(), vec![0]);
     assert_eq!(matches(&BoundExpr::LitInt(1), &batch, &schema), vec![0]);
     assert!(matches(&BoundExpr::LitInt(0), &batch, &schema).is_empty());
+}
+
+/// A walk narrows the rows before the residual tests them, alone or beside one.
+#[test]
+fn a_walk_and_a_residual_both_apply() {
+    let schema = two_col(TypeCode::I64);
+    let mut batch = ZSetBatch::new(&schema);
+    {
+        let mut a = BatchAppender::new(&mut batch, &schema);
+        for (pk, v) in [(1u128, 10i64), (5, 50), (6, 0), (9, 90)] {
+            a.add_row(pk, 1).i64_val(v);
+        }
+    }
+    let desc = gnitz_wire::RangeDescriptor::new(&[], gnitz_wire::Cut::After(1), gnitz_wire::Cut::Before(9));
+    let walk = RangeMembership::new(&schema.pk_cols, desc, &schema).unwrap();
+    assert_eq!(matching_indices(&[], &batch, &schema, Some(&walk)).unwrap(), vec![1, 2]);
+    let positive = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitInt(0));
+    assert_eq!(
+        matching_indices(&[&positive], &batch, &schema, Some(&walk)).unwrap(),
+        vec![1]
+    );
 }

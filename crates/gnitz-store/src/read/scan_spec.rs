@@ -13,7 +13,7 @@ use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, SourceCursor, StoreError};
-use gnitz_expr::{cmp_order_keys, order_locators, Evaluator, LogicalProgram, OrderLocator};
+use gnitz_expr::{cmp_order_keys, order_locators, Evaluator, LogicalProgram, OrderLocator, RangeMembership};
 
 /// The sink a request resolved to, ahead of any walk.
 enum Sink {
@@ -48,7 +48,7 @@ impl RelationRegistry {
             }
             return self.scan(target_id, hydrator);
         }
-        let source = self.open_bound(target_id, bound)?;
+        let (source, membership) = self.open_bound(target_id, bound)?;
         let predicate = (!predicate.is_empty())
             .then(|| compile_predicate(&predicate, &src_schema))
             .transpose()?;
@@ -76,7 +76,9 @@ impl RelationRegistry {
         let mut rows = Survivors {
             source: LiveSource::new(self, target_id, source, hydrator),
             predicate,
+            membership,
             ranges: Vec::new(),
+            walk_words: Vec::new(),
         };
         let chunk_rows = self.config.scan_chunk_rows;
         Ok(Rc::new(match sink {
@@ -132,7 +134,9 @@ impl RelationRegistry {
         let mut rows = Survivors {
             source: LiveSource::new(self, id, SourceCursor::Full(Box::new(cursor)), None),
             predicate: None,
+            membership: None,
             ranges: Vec::new(),
+            walk_words: Vec::new(),
         };
         Ok(Rc::new(stream_rows(
             &mut rows,
@@ -170,13 +174,23 @@ type SurvivorChunk<'r> = (Batch, &'r mut Vec<(usize, usize)>);
 struct Survivors<'a, 'h> {
     source: LiveSource<'a, 'h>,
     predicate: Option<Evaluator>,
+    /// The walk an index bound names, when the source is a full scan standing in for it.
+    membership: Option<RangeMembership>,
     /// The current chunk's surviving row ranges; scratch reused across chunks.
     ranges: Vec<(usize, usize)>,
+    /// The current chunk's `membership` bits; scratch reused across chunks.
+    walk_words: Vec<u64>,
 }
 
 impl Survivors<'_, '_> {
+    /// Whether every source row survives: nothing filters it.
+    fn keeps_every_row(&self) -> bool {
+        self.predicate.is_none() && self.membership.is_none()
+    }
+
     /// The next non-empty source chunk and its surviving row ranges — the whole
-    /// chunk when there is no predicate — or `None` once the source is exhausted.
+    /// chunk when there is no predicate and no membership — or `None` once the source
+    /// is exhausted.
     fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, StoreError> {
         let chunk = loop {
             let Some(chunk) = self.source.next_chunk(max_rows)? else {
@@ -186,11 +200,17 @@ impl Survivors<'_, '_> {
                 break chunk;
             }
         };
-        match &self.predicate {
-            Some(f) => f.filter_ranges(&chunk.as_mem_batch(), &mut self.ranges),
-            None => {
+        let mb = chunk.as_mem_batch();
+        match (&self.predicate, &self.membership) {
+            (None, None) => {
                 self.ranges.clear();
                 self.ranges.push((0, chunk.count));
+            }
+            (Some(f), None) => f.filter_ranges(&mb, &mut self.ranges),
+            (None, Some(m)) => m.filter_ranges(&mb, &mut self.walk_words, &mut self.ranges),
+            (Some(f), Some(m)) => {
+                m.filter_words(&mb, &mut self.walk_words);
+                f.filter_ranges_within(&mb, &self.walk_words, &mut self.ranges);
             }
         }
         Ok(Some((chunk, &mut self.ranges)))
@@ -243,10 +263,9 @@ fn stream_rows(
     window: i64,
 ) -> Result<Batch, StoreError> {
     let early_stop = window > 0;
-    // `window`-sized chunks make the early stop O(window) rather than O(chunk),
-    // but only while every drained row survives: with a predicate a tiny chunk
-    // degrades to row-at-a-time cursor driving, so over-read a full one instead.
-    let drain_rows = match early_stop && rows.predicate.is_none() {
+    // `window`-sized chunks stop in O(window), but a filtered one could survive no row
+    // and turn the drain row-at-a-time.
+    let drain_rows = match early_stop && rows.keeps_every_row() {
         true => (window as usize).clamp(1, chunk_rows),
         false => chunk_rows,
     };

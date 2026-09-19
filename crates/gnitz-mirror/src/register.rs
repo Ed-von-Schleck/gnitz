@@ -6,8 +6,8 @@
 //!
 //! **No copy holds a skeleton row and none owns an index**: the registration
 //! `Mirror::enter` builds carries neither a capacity budget nor an index. That
-//! is what keeps the DBSP layer unreachable, and what stops an `IndexRange {
-//! walk: Required }` bound from ever meeting a store with no index to answer it.
+//! is what keeps the DBSP layer unreachable; an `IndexRange` bound over a copy is
+//! served by the full scan narrowed to the walk's rows.
 
 use gnitz_core::{Invalidate, MirrorError, Schema};
 use gnitz_store::schema::SchemaDescriptor;

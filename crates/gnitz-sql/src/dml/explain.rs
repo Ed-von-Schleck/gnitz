@@ -5,12 +5,11 @@
 //!
 //! It reaches nothing: describing a query is as server-free as compiling one.
 
-use crate::dml::plan::Access;
 use crate::dml::select::{ReadCase, ReadPlan, SpecRead};
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::sys_rows::SysRowSink;
-use gnitz_wire::{AggFunc, AggReadSpec, IndexWalk, ReadBound, SinkKind};
+use gnitz_wire::{AggFunc, AggReadSpec, ReadBound, SinkKind};
 
 /// Describe `plan` without running it: the EXPLAIN reply.
 pub(crate) fn execute_explain(plan: &ReadPlan) -> SqlResult {
@@ -31,9 +30,9 @@ pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
                 order_limit,
             ]
         }
-        ReadCase::Rows { read, reply_schema } => (read, projection_line(reply_schema, read.sink.map.is_none())),
+        ReadCase::Rows { read, reply_schema } => (read, projection_line(reply_schema, read.spec.sink.map.is_none())),
         ReadCase::Fold { read, finish, reduce_schema, is_distinct } => {
-            let SinkKind::Fold(agg) = &read.sink.kind else {
+            let SinkKind::Fold(agg) = &read.spec.sink.kind else {
                 unreachable!("a fold read ships a fold sink")
             };
             (
@@ -44,10 +43,10 @@ pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
     };
     vec![
         read_line(read),
-        format!("access: {}", access_line(&read.access, &read.desc.schema)),
+        format!("access: {}", access_line(&read.spec.bound, &read.desc.schema)),
         format!(
             "predicate: {}",
-            if read.access.has_predicate() {
+            if !read.spec.predicate.is_empty() {
                 "server-side"
             } else {
                 "none"
@@ -67,7 +66,7 @@ fn order_limit_line(plan: &ReadPlan) -> String {
     // The per-worker cut is OFFSET+LIMIT deep, because the client windows. With no
     // ORDER BY keys the same wire field just stops the worker early.
     if let ReadCase::Rows { read, .. } = &plan.case {
-        if let SinkKind::Rows { limit_k, .. } = &read.sink.kind {
+        if let SinkKind::Rows { limit_k, .. } = &read.spec.sink.kind {
             if *limit_k > 0 {
                 facts.push(if plan.order.is_empty() {
                     format!("server early-stop {limit_k}")
@@ -108,14 +107,14 @@ fn read_line(read: &SpecRead) -> String {
 }
 
 /// The walk the bound names; a one-key `PkSet` is a point lookup.
-fn access_line(access: &Access, schema: &Schema) -> String {
-    match access.bound() {
+fn access_line(bound: &ReadBound, schema: &Schema) -> String {
+    match bound {
         ReadBound::None => "full scan".to_string(),
         ReadBound::PkRange(_) => "pk range walk".to_string(),
         ReadBound::PkSet(keys) if keys.len() == 1 => "pk point lookup".to_string(),
         // The keys ship deduplicated, so this is the distinct key count.
         ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
-        ReadBound::IndexRange { bound, walk } => {
+        ReadBound::IndexRange(bound) => {
             let cols = bound
                 .idx_cols
                 .as_slice()
@@ -123,12 +122,7 @@ fn access_line(access: &Access, schema: &Schema) -> String {
                 .map(|&c| schema.columns[c as usize].name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            match walk {
-                IndexWalk::Required => format!("index range on ({cols}) — exact walk, never traded"),
-                IndexWalk::Optional => {
-                    format!("index range on ({cols}) — may be traded for a full scan on low selectivity")
-                }
-            }
+            format!("index range on ({cols})")
         }
     }
 }

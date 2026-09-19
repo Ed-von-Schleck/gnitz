@@ -14,8 +14,9 @@ use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_i
 use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::pack_num;
+use crate::codec::project_schema::key_reply;
 use crate::dml::overlay::resolve_where_matches;
-use crate::dml::plan::{bind_where, bound_and_predicate, rows_sink, ReadBudget};
+use crate::dml::plan::{bind_where, bound_and_predicate};
 use crate::dml::rmw::commit_rmw_or_buffer;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_scalar_evaluator;
@@ -25,7 +26,7 @@ use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{Evaluator, ExprResults};
 use gnitz_wire::{
-    encode_german_string, german_string_content, is_german_string, null_word_get, null_word_set, ReadSink,
+    encode_german_string, german_string_content, is_german_string, null_word_get, null_word_set, ReadSink, ReadSpec,
 };
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
 
@@ -89,19 +90,20 @@ fn execute_mutation(
         })
         .transpose()?;
     let where_expr = bind_where(schema, &alias, selection)?;
-    let plan = bound_and_predicate(schema, &where_expr, ReadBudget::MayChunk, &target.indexes)?;
+    let (bound, predicate, residual) = bound_and_predicate(schema, &where_expr, &target.indexes)?.into_parts();
     // UPDATE reads whole rows; DELETE the source PK alone, with no blob heap.
     let (reply_schema, sink) = if set.is_some() {
         (Arc::clone(schema), ReadSink::all_rows())
     } else {
-        let (reply, sink, _) = rows_sink(&[], None, schema, &alias, 0)?;
-        (reply, sink)
+        let (reply, map) = key_reply(schema)?;
+        (Arc::new(reply), ReadSink { map: Some(map), ..ReadSink::all_rows() })
     };
+    let spec = ReadSpec { bound, predicate, sink };
     // The build re-runs per RMW retry, so a conflict re-reads fresh state. Both
     // writes are built under the catalog schema, so an in-transaction DELETE
     // buffers in the layout an INSERT does.
     let count = commit_rmw_or_buffer(client, &table_name, tid, schema, |client| {
-        let (mut rows, buffered) = resolve_where_matches(client, tid, schema, &plan, &sink, &reply_schema)?;
+        let (mut rows, buffered) = resolve_where_matches(client, tid, schema, &spec, &residual, &reply_schema)?;
         Ok(match &set {
             Some(set) => {
                 rows.extend_from_owned(buffered);

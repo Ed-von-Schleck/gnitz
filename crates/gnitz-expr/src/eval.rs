@@ -179,6 +179,16 @@ impl Evaluator {
     /// across chunks). The bitmap stays inside the scratch. `[(0, n)]` is the
     /// agreed spelling of "no predicate".
     pub fn filter_ranges(&self, mb: &dyn BatchView, out: &mut Vec<(usize, usize)>) {
+        self.filter_ranges_over(mb, None, out);
+    }
+
+    /// [`Self::filter_ranges`], keeping only the rows whose bit is also set in `mask`
+    /// (one bit per row of `mb`).
+    pub fn filter_ranges_within(&self, mb: &dyn BatchView, mask: &[u64], out: &mut Vec<(usize, usize)>) {
+        self.filter_ranges_over(mb, Some(mask), out);
+    }
+
+    fn filter_ranges_over(&self, mb: &dyn BatchView, mask: Option<&[u64]>, out: &mut Vec<(usize, usize)>) {
         assert!(
             self.prog.is_filter(),
             "filter_ranges on an evaluator that did not resolve as a filter: only \
@@ -191,7 +201,13 @@ impl Evaluator {
         self.drive(mb, 0, n, |scratch, _, morsel_start, m| {
             scratch.write_filter_words(&self.prog, morsel_start, m)
         });
-        scan_filter_bits(self.scratch.borrow().filter_words(n), n, out);
+        let mut scratch = self.scratch.borrow_mut();
+        let words = scratch.filter_words_mut(n);
+        if let Some(mask) = mask {
+            assert_eq!(mask.len(), words.len(), "filter_ranges_within: one mask bit per row");
+            words.iter_mut().zip(mask).for_each(|(w, m)| *w &= m);
+        }
+        scan_filter_bits(words, n, out);
     }
 
     /// Evaluate every row of `mb` in one morsel-at-a-time pass, where

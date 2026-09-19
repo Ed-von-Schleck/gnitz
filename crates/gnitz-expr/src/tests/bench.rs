@@ -776,9 +776,8 @@ fn expr_kernel_bench() {
 /// predicate-only read reaches every worker, so this pair runs once per request
 /// per worker.
 ///
-/// `n` is the reachable maximum: an `IN` list over a non-PK integer column stays
-/// in the residual, riding one pool entry of 8 bytes per item with no item-count
-/// cap below `MAX_READ_SPEC_BYTES`.
+/// An `IN` list over a non-PK integer column stays in the residual, riding one
+/// pool entry of 8 bytes per item; only the request frame bounds the item count.
 ///
 /// `GNITZ_BENCH_POOL` picks the pool's order, which is the whole point: the two
 /// shapes hold the same values and differ only in whether `resolve`'s `is_sorted`

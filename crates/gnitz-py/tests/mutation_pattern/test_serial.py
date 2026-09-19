@@ -52,7 +52,11 @@ def test_returning_answers_from_the_stamped_ids(client, schema_name, serial_t):
     assert bag(rows(client, sn, "INSERT INTO t (name) VALUES ('d') RETURNING id, name")) == {(4, "d"): 1}
     [row] = rows(client, sn, "INSERT INTO t (name) VALUES ('e') RETURNING * EXCEPT (name)")
     assert (row._fields, row.id) == (("id",), 5)
-    assert bag(scanned(client, sn, "t")) == {(i + 1, n): 1 for i, n in enumerate("abcde")}
+    # A RETURNING list binds as a SELECT list: expressions, and no key required.
+    [row] = rows(client, sn, "INSERT INTO t (name) VALUES ('f') RETURNING name, id + 1 AS nxt")
+    assert (row._fields, row.name, row.nxt) == (("name", "nxt"), "f", 7)
+    assert bag(rows(client, sn, "INSERT INTO t (name) VALUES ('g') RETURNING name")) == {("g",): 1}
+    assert bag(scanned(client, sn, "t")) == {(i + 1, n): 1 for i, n in enumerate("abcdefg")}
 
 
 def test_concurrent_connections_never_share_an_id(client, schema_name, serial_t, server):

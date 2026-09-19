@@ -5,7 +5,6 @@
 
 use super::*;
 use gnitz_store::storage::SourceCursor;
-use gnitz_wire::{IndexWalk, ReadBound};
 use gnitz_wire::{ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
 use std::rc::Rc;
@@ -116,7 +115,7 @@ impl CatalogEngine {
     }
 
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the
-    /// circuit carries for it; its `Filter` stays authoritative.
+    /// circuit carries for it; the circuit's `Filter` applies the WHERE.
     pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Result<SourceCursor, String> {
         // A store-less handle reads empty rather than erroring: correct for a
         // stream, a wrong answer for a process whose store is elsewhere. Hard, not
@@ -126,11 +125,10 @@ impl CatalogEngine {
             "source cursor in a process owning no base store (view {view_id}, source {source})",
         );
         let CatalogEngine { registry, dag, .. } = self;
-        let bound = match dag.source_scan_bound(registry, view_id, source) {
-            // A backfill hint: an index the source no longer has falls back to the full scan.
-            ReadBound::IndexRange { bound, .. } => ReadBound::IndexRange { bound, walk: IndexWalk::Optional },
-            bound => bound,
-        };
-        registry.open_bound(source, bound).map_err(String::from)
+        let bound = dag.source_scan_bound(registry, view_id, source);
+        registry
+            .open_bound(source, bound)
+            .map(|(cursor, _walk)| cursor)
+            .map_err(String::from)
     }
 }

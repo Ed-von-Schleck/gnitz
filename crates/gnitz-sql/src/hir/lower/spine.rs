@@ -194,13 +194,11 @@ fn source(
         candidates(&conjuncts, &frame.schema, &d.indexes)
             .into_iter()
             .map(|c| c.bound)
-            // The cell decodes under the per-request key cap.
-            .filter(|b| !matches!(b, ReadBound::PkSet(keys) if !keys.fits_one_request()))
             // A backfill never routes, and the engine may trade an index walk for the
             // full scan, which it cannot do for a PK range.
             .min_by_key(|b| match b {
                 ReadBound::PkSet(_) => 0,
-                ReadBound::IndexRange { .. } => 1,
+                ReadBound::IndexRange(_) => 1,
                 _ => 2,
             })
             .unwrap_or(ReadBound::None)

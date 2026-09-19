@@ -137,7 +137,7 @@ fn gt(ci: usize, v: i64) -> BoundExpr {
     BExpr::bin(BExpr::ColRef(ci), BinOp::Gt, BExpr::LitInt(v))
 }
 
-/// The partial mirrors what `fetch_bound` concatenates: replies in worker
+/// The partial mirrors what a fold read concatenates: replies in worker
 /// order, so a group's rows split across two workers and the keys arrive
 /// descending — the emission ordinal and the group key then disagree on both
 /// order and value, and only the key is a function of the data.
@@ -298,7 +298,7 @@ fn having_compacts_before_an_identity_finalize() {
     let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
     let partial = partial_schema(&[1], &specs);
     let f = finish_of(&partial, &specs, &[gt(2, 1)], passthrough_all(&partial));
-    assert!(f.identity);
+    assert!(f.finalize.is_identity());
 
     let got = f.apply(batch(
         &partial,
@@ -333,7 +333,7 @@ fn a_projecting_finalize_runs_the_map() {
             (plus_one, ColumnDef::new("c1", TypeCode::I64, true)),
         ],
     );
-    assert!(!f.identity);
+    assert!(!f.finalize.is_identity());
 
     let got = f.apply(batch(
         &partial,

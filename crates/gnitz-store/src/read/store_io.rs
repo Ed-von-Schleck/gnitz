@@ -11,10 +11,9 @@ use crate::relation::RelationRegistry;
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::{project_schema, ColumnLocator};
 use crate::storage::{Batch, BoundedIndexCursor, PkSetGather, SkeletonKeys, SourceCursor, StoreError};
-use gnitz_wire::{IndexWalk, ReadBound};
+use gnitz_expr::RangeMembership;
+use gnitz_wire::{IndexBound, ReadBound};
 
-/// An optional index walk is taken only while its range covers at most
-/// `1/INDEX_SCAN_RATIO` of the local base slice.
 const INDEX_SCAN_RATIO: usize = 16;
 
 /// A source drained chunk by chunk, each skeleton row it meets replaced by that key's
@@ -106,13 +105,12 @@ impl RelationRegistry {
         Ok(out)
     }
 
-    /// Open `bound`'s source over `id`, without walking it. An `Optional` index walk that
-    /// finds no index, or whose range is too unselective to pay for itself, opens the full scan.
-    pub fn open_bound(&self, id: i64, bound: ReadBound) -> Result<SourceCursor, StoreError> {
+    /// Open `bound`'s source over `id`, without walking it. An index walk served by a
+    /// full scan comes with the membership that narrows the scan to the walk's rows.
+    pub fn open_bound(&self, id: i64, bound: ReadBound) -> Result<(SourceCursor, Option<RangeMembership>), StoreError> {
         let entry = self.relation_or_err(id)?;
-        let full = || SourceCursor::Full(Box::new(entry.cursor()));
-        Ok(match bound {
-            ReadBound::None => full(),
+        let cursor = match bound {
+            ReadBound::None => SourceCursor::Full(Box::new(entry.cursor())),
             ReadBound::PkRange(desc) => SourceCursor::Full(Box::new(
                 entry.store().pk_range_cursor(&desc).map_err(StoreError::rejected)?,
             )),
@@ -129,33 +127,35 @@ impl RelationRegistry {
                 let gather = PkSetGather::open(keys.into_bytes(), schema, |s, e| entry.cursor_in_range(s, e));
                 SourceCursor::PkSet(Box::new(gather))
             }
-            ReadBound::IndexRange { bound, walk } => {
-                let cols = self.bound_cols_against(id, bound.idx_cols, "open_bound")?;
-                let Some(ic) = entry.index_on(cols.as_slice()) else {
-                    return match walk {
-                        IndexWalk::Optional => Ok(full()),
-                        IndexWalk::Required => Err(StoreError::rejected(format!(
-                            "No index on cols {:?} for table {id}",
-                            cols.as_slice()
-                        ))),
-                    };
-                };
-                let spec = ic.key_spec();
-                let (idx, matches) = ic
-                    .store()
-                    .cursor_over(&spec, &bound.desc)
-                    .map_err(StoreError::rejected)?;
-                if walk == IndexWalk::Optional && matches > entry.store().estimated_rows() / INDEX_SCAN_RATIO {
-                    return Ok(full());
-                }
-                SourceCursor::Bounded(Box::new(BoundedIndexCursor::new(
-                    idx,
-                    entry.cursor(),
-                    spec,
-                    matches.min(self.config.scan_chunk_rows),
-                )))
+            ReadBound::IndexRange(bound) => return self.open_index_walk(id, bound),
+        };
+        Ok((cursor, None))
+    }
+
+    /// The index walk `bound` names over `id`: through its index while the range covers at
+    /// most `1/INDEX_SCAN_RATIO` of the local slice, else a full scan and its membership.
+    fn open_index_walk(
+        &self,
+        id: i64,
+        bound: IndexBound,
+    ) -> Result<(SourceCursor, Option<RangeMembership>), StoreError> {
+        let entry = self.relation_or_err(id)?;
+        let cols = self.bound_cols_against(id, bound.idx_cols, "open_bound")?;
+        if let Some(ic) = entry.index_on(cols.as_slice()) {
+            let spec = ic.key_spec();
+            let (idx, matches) = ic
+                .store()
+                .cursor_over(&spec, &bound.desc)
+                .map_err(StoreError::rejected)?;
+            if matches <= entry.store().estimated_rows() / INDEX_SCAN_RATIO {
+                let rows = matches.min(self.config.scan_chunk_rows);
+                let walk = BoundedIndexCursor::new(idx, entry.cursor(), spec, rows);
+                return Ok((SourceCursor::Bounded(Box::new(walk)), None));
             }
-        })
+        }
+        let walk = RangeMembership::new(cols.as_slice(), bound.desc, &entry.schema())
+            .map_err(|e| StoreError::rejected(format!("open_bound: {e} (table {id})")))?;
+        Ok((SourceCursor::Full(Box::new(entry.cursor())), Some(walk)))
     }
 }
 

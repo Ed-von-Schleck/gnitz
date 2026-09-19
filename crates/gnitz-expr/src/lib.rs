@@ -67,6 +67,7 @@ mod eval;
 mod like;
 mod locator;
 mod program;
+mod range;
 mod schema_facts;
 mod view;
 
@@ -77,6 +78,7 @@ pub use eval::*;
 pub use like::*;
 pub use locator::*;
 pub use program::*;
+pub use range::*;
 pub use schema_facts::*;
 pub use view::*;
 

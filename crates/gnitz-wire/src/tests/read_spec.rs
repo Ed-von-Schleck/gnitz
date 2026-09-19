@@ -8,11 +8,6 @@ fn block() -> Vec<u8> {
     vec![9u8; 40]
 }
 
-/// The spec part of an encoded request: its bytes past the reply block.
-fn spec_len(bytes: &[u8], block: &[u8]) -> usize {
-    bytes.len() - 4 - block.len()
-}
-
 fn sample_order() -> Vec<OrderKey> {
     vec![
         OrderKey { col: 3, desc: false, nulls_first: true },
@@ -37,22 +32,14 @@ fn roundtrips_every_bound_against_every_sink() {
     let bounds = [
         ReadBound::None,
         ReadBound::PkRange(RangeDescriptor::new(&[], After(10), After(u64::MAX as u128))),
-        ReadBound::IndexRange {
-            bound: IndexBound {
-                idx_cols: crate::PkColList::from_slice(&[1, 2]),
-                desc: RangeDescriptor::new(&[7], Before(1), Before(u128::MAX)),
-            },
-            walk: IndexWalk::Optional,
-        },
-        // The required form: the client stripped the bounded conjuncts, so the
-        // flag must survive the round trip or the walk becomes tradeable.
-        ReadBound::IndexRange {
-            bound: IndexBound {
-                idx_cols: crate::PkColList::from_slice(&[3]),
-                desc: RangeDescriptor::point(&[], u128::MAX),
-            },
-            walk: IndexWalk::Required,
-        },
+        ReadBound::IndexRange(IndexBound {
+            idx_cols: crate::PkColList::from_slice(&[1, 2]),
+            desc: RangeDescriptor::new(&[7], Before(1), Before(u128::MAX)),
+        }),
+        ReadBound::IndexRange(IndexBound {
+            idx_cols: crate::PkColList::from_slice(&[3]),
+            desc: RangeDescriptor::point(&[], u128::MAX),
+        }),
         ReadBound::PkSet(keys(8)),
         // A compound key wider than any scalar.
         ReadBound::PkSet(keys(24)),
@@ -102,7 +89,6 @@ fn roundtrips_every_bound_against_every_sink() {
                     sink: ReadSink { map: map.clone(), kind: kind.clone() },
                 };
                 let bytes = spec.encode(&block);
-                assert!(spec_len(&bytes, &block) <= MAX_READ_SPEC_BYTES);
                 assert_eq!(ReadSpec::decode(&bytes), Ok((spec.clone(), &block[..])), "{spec:?}");
             }
         }
@@ -114,13 +100,10 @@ fn roundtrips_every_bound_against_every_sink() {
 #[test]
 fn an_index_bound_pinning_every_column_is_refused_at_decode() {
     let spec = |eq: &[u128]| {
-        ReadSpec::all_rows(ReadBound::IndexRange {
-            bound: IndexBound {
-                idx_cols: crate::PkColList::from_slice(&[1, 2]),
-                desc: RangeDescriptor::new(eq, Before(1), After(9)),
-            },
-            walk: IndexWalk::Optional,
-        })
+        ReadSpec::all_rows(ReadBound::IndexRange(IndexBound {
+            idx_cols: crate::PkColList::from_slice(&[1, 2]),
+            desc: RangeDescriptor::new(eq, Before(1), After(9)),
+        }))
     };
     let block = block();
     let Err(err) = ReadSpec::decode(&spec(&[7, 8]).encode(&block)) else {
@@ -132,38 +115,28 @@ fn an_index_bound_pinning_every_column_is_refused_at_decode() {
 }
 
 /// `from_keys` is the one sort: duplicates collapse and the list comes out
-/// ascending whatever order it went in, and `per_request` splits it into
-/// consecutive lists that concatenate back to it.
+/// ascending whatever order it went in; `from_sorted` takes that order as given.
 #[test]
-fn pk_keys_sort_dedup_and_split() {
+fn pk_keys_sort_and_dedup() {
     let raw: Vec<[u8; 2]> = vec![[0, 9], [0, 1], [0, 9], [1, 0]];
     let k = PkKeys::from_keys(2, raw.iter().map(|k| &k[..]));
     assert_eq!(k.iter().collect::<Vec<_>>(), vec![&[0, 1][..], &[0, 9], &[1, 0]]);
     assert_eq!(k.len(), 3);
-
-    // Per-request caps: every scalar-wide stride takes the key cap, and a wide
-    // one the byte budget of that many 16-byte keys.
-    assert_eq!(PkKeys::max_per_request(8), MAX_PK_SET_KEYS);
-    assert_eq!(PkKeys::max_per_request(16), MAX_PK_SET_KEYS);
-    assert_eq!(PkKeys::max_per_request(32), MAX_PK_SET_KEYS / 2);
-
-    let many: Vec<[u8; 4]> = (0..(MAX_PK_SET_KEYS as u32 + 5)).map(u32::to_be_bytes).collect();
-    let big = PkKeys::from_keys(4, many.iter().map(|k| &k[..]));
-    let parts: Vec<PkKeys> = big.per_request().collect();
-    assert_eq!(
-        parts.iter().map(PkKeys::len).collect::<Vec<_>>(),
-        vec![MAX_PK_SET_KEYS, 5]
-    );
-    let rejoined: Vec<u8> = parts.iter().flat_map(|p| p.as_bytes().to_vec()).collect();
-    assert_eq!(rejoined, big.as_bytes());
+    assert_eq!(PkKeys::from_sorted(2, vec![0, 1, 0, 9, 1, 0]), k);
 }
 
-/// A widest-stride list at its per-request cap still encodes under the spec's
-/// byte ceiling — the reason the cap is a byte budget rather than a key count.
 #[test]
-fn a_wide_pk_set_at_its_cap_fits_the_spec_ceiling() {
+#[should_panic(expected = "strictly ascending")]
+fn pk_keys_from_sorted_refuses_a_repeat() {
+    PkKeys::from_sorted(2, vec![0, 1, 0, 1]);
+}
+
+/// A long list of the widest keys round-trips whole: the frame is the only bound on a
+/// key list.
+#[test]
+fn a_long_wide_pk_set_round_trips_whole() {
     let stride = crate::MAX_PK_BYTES;
-    let n = PkKeys::max_per_request(stride);
+    let n = 70_000usize;
     let raw: Vec<Vec<u8>> = (0..n as u32)
         .map(|i| {
             let mut k = vec![0u8; stride];
@@ -177,7 +150,6 @@ fn a_wide_pk_set_at_its_cap_fits_the_spec_ceiling() {
     )));
     let block = block();
     let bytes = spec.encode(&block);
-    assert!(spec_len(&bytes, &block) <= MAX_READ_SPEC_BYTES, "{} bytes", bytes.len());
     assert_eq!(ReadSpec::decode(&bytes), Ok((spec, &block[..])));
 }
 
@@ -221,9 +193,6 @@ fn each_decode_guard_rejects_its_own_forgery() {
         .find(|&b| AggFunc::from_wire(b).is_none())
         .expect("some byte names no aggregate");
 
-    // The count is read before any per-key bytes, so no keys are needed.
-    let pk_set_over_cap = pk_set_blob(8, (MAX_PK_SET_KEYS + 1) as u32, &[]);
-    let wide_over_cap = pk_set_blob(32, (MAX_PK_SET_KEYS / 2 + 1) as u32, &[]);
     let zero_stride = pk_set_blob(0, 0, &[]);
     let over_wide_stride = pk_set_blob((crate::MAX_PK_BYTES + 1) as u8, 0, &[]);
     let unsorted = pk_set_blob(1, 2, &[5, 3]);
@@ -237,11 +206,6 @@ fn each_decode_guard_rejects_its_own_forgery() {
         // Chop the last PkSet key's bytes off.
         let bytes = ReadSpec::all_rows(ReadBound::PkSet(keys(8))).encode(&[]);
         bytes[..bytes.len() - 4].to_vec()
-    };
-    let oversized = {
-        let mut bytes = 0u32.to_le_bytes().to_vec();
-        bytes.resize(4 + MAX_READ_SPEC_BYTES + 1, 0);
-        bytes
     };
     let bad_agg_op = {
         let mut bytes = fold_header();
@@ -272,14 +236,11 @@ fn each_decode_guard_rejects_its_own_forgery() {
             poke(19, (MAX_ORDER_KEYS + 1) as u8),
             "order keys: 17 exceeds cap",
         ),
-        ("PkSet cap", pk_set_over_cap, "PkSet count"),
-        ("wide PkSet cap", wide_over_cap, "PkSet count"),
         ("zero stride", zero_stride, "PkSet stride"),
         ("over-wide stride", over_wide_stride, "PkSet stride"),
         ("unsorted keys", unsorted, "strictly ascending"),
         ("duplicate keys", duplicate, "strictly ascending"),
         ("trailing bytes", trailing, "trailing"),
-        ("oversized blob", oversized, "exceeds cap"),
         ("unknown aggregate", bad_agg_op, "unknown agg func id"),
         (
             "group col cap",
@@ -327,13 +288,10 @@ fn peek_bound_reads_only_the_routing_bounds() {
     }
 
     assert!(peek_bound(&with(ReadBound::None)).is_none());
-    let index = ReadBound::IndexRange {
-        bound: IndexBound {
-            idx_cols: crate::PkColList::from_slice(&[1]),
-            desc: RangeDescriptor::point(&[], 3),
-        },
-        walk: IndexWalk::Required,
-    };
+    let index = ReadBound::IndexRange(IndexBound {
+        idx_cols: crate::PkColList::from_slice(&[1]),
+        desc: RangeDescriptor::point(&[], 3),
+    });
     assert!(peek_bound(&with(index)).is_none());
     // Cut inside the key list: the count names bytes the blob does not hold.
     let key_end = 4 + block.len() + 1 + 1 + 4 + set.as_bytes().len();

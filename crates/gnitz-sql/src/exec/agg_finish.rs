@@ -26,7 +26,7 @@ use rustc_hash::FxHashMap;
 use crate::agg::group_pk_def;
 use crate::codec::project_schema::{reply_program, ProjItem};
 use crate::error::GnitzSqlError;
-use crate::exec::batch::move_payload;
+use crate::exec::client_map::ClientMap;
 use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::ir::BoundExpr;
 
@@ -44,12 +44,7 @@ pub(crate) struct FoldFinish {
     /// held value, `None` for a summing merge.
     merge: Vec<Option<Ordering>>,
     pub(crate) having: Option<Evaluator>,
-    finalize: Evaluator,
-    /// The finalize map's column moves as `(output slot, source slot)`: equal-width payload
-    /// copies only.
-    copies: Vec<(usize, usize)>,
-    /// The finalize map reproduces its input.
-    identity: bool,
+    finalize: ClientMap,
 }
 
 impl FoldFinish {
@@ -75,28 +70,13 @@ impl FoldFinish {
             cols.push(def);
         }
         let (out_schema, program) = reply_program(&items, cols, &partial_schema, "aggregate SELECT output schema")?;
-        let identity = program.is_identity_map(&partial_schema, &out_schema);
-        let finalize = program.resolve_map(&partial_schema, &out_schema)?;
-        // A finalize pass-through keeps its partial column's type (a group column's def, or an
-        // aggregate's view type), so every move is a verbatim payload copy.
-        let copies = finalize
-            .copies()
-            .iter()
-            .map(|&(loc, out, width)| match loc {
-                ColumnLocator::Payload { slot, size, .. } if size == width => Ok((out as usize, slot as usize)),
-                _ => Err(GnitzSqlError::Internal(
-                    "a finalize item copies a key or a promoted column".into(),
-                )),
-            })
-            .collect::<Result<_, _>>()?;
+        let finalize = ClientMap::new(program, &partial_schema, Arc::new(out_schema))?;
         Ok(FoldFinish {
             partial_schema: Arc::new(partial_schema),
-            out_schema: Arc::new(out_schema),
+            out_schema: Arc::clone(finalize.out_schema()),
             merge,
             having,
             finalize,
-            copies,
-            identity,
         })
     }
 
@@ -147,67 +127,7 @@ impl FoldFinish {
             ev.filter_ranges(&groups, &mut ranges);
             groups.retain_ranges(&ranges);
         }
-        if self.identity {
-            return groups;
-        }
-        self.map_batch(groups)
-    }
-
-    /// The finalize map over every row of `src`, each row keeping its PK and weight.
-    fn map_batch(&self, src: ZSetBatch) -> ZSetBatch {
-        let (ev, n) = (&self.finalize, src.len());
-        let mut out = ZSetBatch::new(&self.out_schema);
-        out.nulls = vec![0; n];
-        let str_emits = !ev.str_emits().is_empty();
-        if str_emits {
-            // Appended to, so copied: a copied German cell keeps its offset into it.
-            out.blob = src.blob.clone();
-        }
-        for &(_, pi, stride) in ev.scalar_emits() {
-            out.payload[pi as usize].bytes = vec![0; n * stride as usize];
-        }
-        for &(_, pi) in ev.str_emits() {
-            out.payload[pi as usize].bytes = vec![0; n * 16];
-        }
-        {
-            let ZSetBatch { nulls, payload, blob, .. } = &mut out;
-            let nb = gnitz_wire::as_le_bytes_mut(nulls);
-            ev.null_perm()
-                .write_rows(gnitz_wire::as_le_bytes(&src.nulls), 0, nb, 0, n);
-            if ev.emits_anything() {
-                ev.eval_morsels(&src, 0, n, |row0, mo| {
-                    for &(reg, pi, stride) in ev.scalar_emits() {
-                        mo.emit_scalar_cells(
-                            reg as usize,
-                            &mut payload[pi as usize].bytes,
-                            nb,
-                            row0,
-                            pi as usize,
-                            stride as usize,
-                        );
-                    }
-                    for &(reg, pi) in ev.str_emits() {
-                        mo.emit_str_cells(
-                            reg as usize,
-                            &mut payload[pi as usize].bytes,
-                            nb,
-                            blob,
-                            row0,
-                            pi as usize,
-                        );
-                    }
-                });
-            }
-        }
-        // The evaluator is done with `src`; its parts move into the output.
-        let ZSetBatch { pks, weights, mut payload, blob, .. } = src;
-        move_payload(&mut out.payload, &mut payload, &self.copies);
-        if !str_emits {
-            out.blob = blob;
-        }
-        out.pks = pks;
-        out.weights = weights;
-        out
+        self.finalize.apply(groups)
     }
 }
 

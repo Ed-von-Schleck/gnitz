@@ -25,8 +25,9 @@ use crate::ast_util::{
     reject_position_out_of_range, scalar_projection_item, FromShape,
 };
 use crate::bind::{bind_single_table, output_column, probe_relation};
+use crate::codec::project_schema::compute_map;
 use crate::dml::cte::inline_ctes;
-use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, rows_sink, Access, ReadBudget};
+use crate::dml::plan::{bind_where, bound_and_predicate, rows_reply, RowsReply};
 use crate::error::{derivation, reject_if, GnitzSqlError};
 use crate::exec::agg_finish::FoldFinish;
 use crate::exec::order::{order_and_window, Window};
@@ -40,7 +41,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{ReadSink, ReadSpec, SinkKind};
+use gnitz_wire::{ReadBound, ReadSink, ReadSpec, SinkKind};
 use sqlparser::ast::{OrderBy, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
@@ -82,8 +83,7 @@ pub(super) struct SpecRead {
     /// As written in FROM.
     pub(super) name: String,
     pub(super) desc: Arc<RelDescriptor>,
-    pub(super) access: Access,
-    pub(super) sink: ReadSink,
+    pub(super) spec: ReadSpec,
 }
 
 impl ReadPlan {
@@ -97,14 +97,10 @@ impl ReadPlan {
         }
     }
 
-    /// The `ReadSpec` this read ships; `None` for a constant row. One, not a list:
-    /// an over-cap `PkSet` gather needs `ReadBudget::MayChunk`, and a read plans
-    /// under `OneRequest`.
-    pub fn spec(&self) -> Option<ReadSpec> {
+    /// The `ReadSpec` this read ships; `None` for a constant row.
+    pub fn spec(&self) -> Option<&ReadSpec> {
         match &self.case {
-            ReadCase::Rows { read, .. } | ReadCase::Fold { read, .. } => {
-                Some(read.access.spec(read.access.bound().clone(), &read.sink))
-            }
+            ReadCase::Rows { read, .. } | ReadCase::Fold { read, .. } => Some(&read.spec),
             ReadCase::Constant { .. } => None,
         }
     }
@@ -227,24 +223,29 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
     } else {
         // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
         let limit_k = window.end().map_or(0, |e| e as u64);
-        let (reply_schema, sink, order) = rows_sink(
-            &select.projection,
-            query.order_by.as_ref(),
-            &desc.schema,
-            &alias,
-            limit_k,
-        )?;
-        let read = SpecRead { name, desc, access, sink };
+        let RowsReply { schema: reply_schema, program, order } =
+            rows_reply(&select.projection, query.order_by.as_ref(), &desc.schema, &alias)?;
+        let k = desc.schema.pk_cols.len();
+        let sink = ReadSink {
+            map: program.map(|p| compute_map(p, &reply_schema.columns[k..])),
+            kind: SinkKind::Rows { order: order.clone(), limit_k },
+        };
+        let (bound, predicate) = access;
+        let read = SpecRead {
+            name,
+            desc,
+            spec: ReadSpec { bound, predicate, sink },
+        };
         (ReadCase::Rows { read, reply_schema }, order)
     };
     Ok(ReadPlan { case, order, window })
 }
 
-/// The WHERE → access step. The bound WHERE lives and dies here; only the owned
-/// [`Access`] outlives it.
-fn plan_access(desc: &RelDescriptor, alias: &str, select: &Select) -> Result<Access, GnitzSqlError> {
+/// The WHERE → access step: the bound and the compiled predicate.
+fn plan_access(desc: &RelDescriptor, alias: &str, select: &Select) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
     let bound_where = bind_where(&desc.schema, alias, select.selection.as_ref())?;
-    Ok(bound_and_predicate(&desc.schema, &bound_where, ReadBudget::OneRequest, &desc.indexes)?.access)
+    let (bound, predicate, _) = bound_and_predicate(&desc.schema, &bound_where, &desc.indexes)?.into_parts();
+    Ok((bound, predicate))
 }
 
 /// A GROUP BY / global aggregate / HAVING / DISTINCT read, bound by the front end a
@@ -256,7 +257,7 @@ fn plan_fold(
     name: String,
     alias: &str,
     desc: Arc<RelDescriptor>,
-    access: Access,
+    (bound, predicate): (ReadBound, Vec<u8>),
 ) -> Result<(ReadCase, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
     // The keys bind with the SELECT list, so one over a column the grouping does
     // not cover rejects before the fold is dispatched, as HAVING already does.
@@ -286,7 +287,11 @@ fn plan_fold(
         order_cols.iter().map(|&at| finish.out_schema.pk_cols.len() + at),
     )?;
     let case = ReadCase::Fold {
-        read: SpecRead { name, desc, access, sink },
+        read: SpecRead {
+            name,
+            desc,
+            spec: ReadSpec { bound, predicate, sink },
+        },
         finish: Box::new(finish),
         reduce_schema: pieces.reduce_schema,
         is_distinct: select.distinct.is_some(),
@@ -343,13 +348,13 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
     let (schema, batch) = match case {
         ReadCase::Constant { schema, row } => (schema, row),
         ReadCase::Rows { read, reply_schema } => {
-            let batch = fetch_bound(client, read.desc.tid, &read.access, &read.sink, &reply_schema)?;
+            let batch = client.scan_spec_local_first(read.desc.tid, read.spec, &reply_schema)?;
             (reply_schema, batch)
         }
         ReadCase::Fold { read, finish, .. } => {
             // A wire error (the per-worker group cap included) is hard: the fold is
             // mid-flight on the workers and cannot fall back.
-            let partial = fetch_bound(client, read.desc.tid, &read.access, &read.sink, &finish.partial_schema)?;
+            let partial = client.scan_spec_local_first(read.desc.tid, read.spec, &finish.partial_schema)?;
             (Arc::clone(&finish.out_schema), finish.apply(finish.combine(partial)))
         }
     };

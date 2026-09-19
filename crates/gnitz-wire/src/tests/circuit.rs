@@ -27,13 +27,10 @@ fn sample(op: Opcode) -> OpNode {
         // whole backing array, so a reordered list fails the round-trip.
         Opcode::ScanDelta => OpNode::ScanDelta {
             source: 42,
-            bound: crate::ReadBound::IndexRange {
-                bound: crate::IndexBound {
-                    idx_cols: crate::PkColList::from_slice(&[9, 3, 5]),
-                    desc: crate::RangeDescriptor::new(&[7, 11], crate::Cut::After(4), crate::Cut::Before(90)),
-                },
-                walk: crate::IndexWalk::Optional,
-            },
+            bound: crate::ReadBound::IndexRange(crate::IndexBound {
+                idx_cols: crate::PkColList::from_slice(&[9, 3, 5]),
+                desc: crate::RangeDescriptor::new(&[7, 11], crate::Cut::After(4), crate::Cut::Before(90)),
+            }),
         },
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: vec![0, 2] },
         Opcode::NullExtend => OpNode::NullExtend {
@@ -269,7 +266,7 @@ fn unbounded_scan_delta_encodes_identically() {
     );
 }
 
-/// Every kind of read bound survives as a backfill hint, the walk byte included.
+/// Every kind of read bound survives as a backfill hint.
 #[test]
 fn every_scan_bound_kind_roundtrips() {
     let desc = crate::RangeDescriptor::new(&[3], crate::Cut::Before(1), crate::Cut::After(9));
@@ -277,13 +274,10 @@ fn every_scan_bound_kind_roundtrips() {
     for bound in [
         crate::ReadBound::PkRange(desc),
         crate::ReadBound::PkSet(keys),
-        crate::ReadBound::IndexRange {
-            bound: crate::IndexBound {
-                idx_cols: crate::PkColList::from_slice(&[2, 1]),
-                desc,
-            },
-            walk: crate::IndexWalk::Required,
-        },
+        crate::ReadBound::IndexRange(crate::IndexBound {
+            idx_cols: crate::PkColList::from_slice(&[2, 1]),
+            desc,
+        }),
     ] {
         let node = OpNode::ScanDelta { source: 7, bound };
         assert_eq!(roundtrip(node.clone()).unwrap(), node);
@@ -301,12 +295,11 @@ fn a_malformed_scan_bound_is_rejected() {
         &crate::RangeDescriptor::new(&[1], crate::Cut::Before(0), crate::Cut::After(9)),
     );
     let desc = w.into_vec();
-    // An `IndexRange` cell: tag, column word, `tail`, then an Optional walk byte.
+    // An `IndexRange` cell: tag, column word, then `tail`.
     let index_range = |word: u64, tail: &[u8]| {
         let mut p = vec![2u8];
         p.extend_from_slice(&word.to_le_bytes());
         p.extend_from_slice(tail);
-        p.push(0);
         p
     };
     // A `PkSet` cell: tag, stride, count, then the key bytes.
@@ -324,7 +317,6 @@ fn a_malformed_scan_bound_is_rejected() {
     };
     let mut trailing = pk_set(1, 1, &[5]);
     trailing.push(0);
-    let cap = crate::PkKeys::max_per_request(8) as u32;
     let cases: &[(&str, Vec<u8>)] = &[
         ("unknown bound tag", vec![9]),
         // A column-list word whose count is past the arity cap — `as_slice` would
@@ -345,7 +337,7 @@ fn a_malformed_scan_bound_is_rejected() {
         ),
         ("zero stride", pk_set(0, 0, &[])),
         ("over-wide stride", pk_set(crate::MAX_PK_BYTES as u8 + 1, 0, &[])),
-        ("count over the cap", pk_set(8, cap + 1, &[])),
+        ("count past the cell", pk_set(8, 2, &[0; 8])),
         ("unsorted keys", pk_set(1, 2, &[5, 4])),
         ("pk range past the arity cap", over_arity),
         ("trailing bytes", trailing),

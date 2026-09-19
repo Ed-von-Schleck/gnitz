@@ -68,16 +68,24 @@ pub fn encode_pk_natives(cols: impl IntoIterator<Item = (u8, u8)>, natives: impl
     let mut out = PkBuf::zeroed(0);
     for ((src_tc, target_tc), native) in cols.into_iter().zip(natives) {
         let src_w = crate::wire_stride(src_tc);
-        let low = if src_w == 16 {
-            native
-        } else {
-            native & ((1u128 << (src_w * 8)) - 1)
-        };
         out.append(crate::wire_stride(target_tc), |dst| {
-            store_opk_image(low ^ opk_bias(src_tc, src_w), src_tc, src_w, target_tc, dst)
+            store_opk_image(key_image(src_tc, native), src_tc, src_w, target_tc, dst)
         });
     }
     out
+}
+
+/// A native value's image in its column's key order: masked to the type's width, sign bit
+/// flipped for a signed type — the OPK bytes read as a big-endian integer.
+#[inline(always)]
+pub fn key_image(tc: u8, native: u128) -> u128 {
+    let w = crate::wire_stride(tc);
+    let low = if w == 16 {
+        native
+    } else {
+        native & ((1u128 << (w * 8)) - 1)
+    };
+    low ^ opk_bias(tc, w)
 }
 
 /// The image of zero in a `width`-byte column of type `tc`: `2^(width·8−1)` if

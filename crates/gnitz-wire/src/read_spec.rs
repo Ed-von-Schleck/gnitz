@@ -8,19 +8,11 @@ use crate::circuit::{read_aggs, read_cols, read_compute_map, write_aggs, write_c
 use crate::circuit::{read_order_keys, write_order_keys, AggDescriptor, ComputeMap};
 use crate::codec::{Reader, Writer};
 use crate::range::{read_index_bound, read_range_descriptor, write_index_bound, write_range_descriptor};
-use crate::range::{IndexBound, IndexWalk, RangeDescriptor};
+use crate::range::{IndexBound, RangeDescriptor};
 use crate::MAX_PK_BYTES;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
-/// Decode-side ceiling on one `pk IN (…)` gather. A longer list is served as
-/// several gathers or as an ordinary predicate scan, never rejected.
-pub const MAX_PK_SET_KEYS: usize = 65_536;
-/// Decode-side ceiling on an encoded `ReadSpec`, the reply block excluded.
-pub(crate) const MAX_READ_SPEC_BYTES: usize = 2 << 20;
-/// The key bytes one request may carry: half the spec cap, the rest left to the
-/// predicate and the map.
-const MAX_PK_SET_BYTES: usize = MAX_READ_SPEC_BYTES / 2;
 
 const BOUND_NONE: u8 = 0;
 const BOUND_PK_RANGE: u8 = 1;
@@ -91,7 +83,8 @@ impl ReadSink {
 }
 
 /// OPK keys of one stride, strictly ascending — the order a forward gather
-/// sweeps. Fields private: every constructor sorts and dedups, or validates.
+/// sweeps. Any number of keys: the request frame is the only bound on a list.
+/// Fields private: every constructor sorts and dedups, or validates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PkKeys {
     stride: u8,
@@ -111,20 +104,15 @@ impl PkKeys {
         PkKeys { stride: stride as u8, bytes: ks.concat() }
     }
 
-    /// The most keys of `stride` one request carries: `MAX_PK_SET_KEYS`, and
-    /// no more than `MAX_PK_SET_BYTES` of them.
-    pub const fn max_per_request(stride: usize) -> usize {
-        let by_bytes = MAX_PK_SET_BYTES / stride;
-        if by_bytes < MAX_PK_SET_KEYS {
-            by_bytes
-        } else {
-            MAX_PK_SET_KEYS
-        }
-    }
-
-    /// Whether this list goes out as one request.
-    pub fn fits_one_request(&self) -> bool {
-        self.len() <= Self::max_per_request(self.stride())
+    /// Keys of `stride` already concatenated in strictly ascending order.
+    pub fn from_sorted(stride: usize, bytes: Vec<u8>) -> Self {
+        assert!((1..=MAX_PK_BYTES).contains(&stride), "PkKeys: stride {stride}");
+        assert_eq!(bytes.len() % stride, 0, "PkKeys: key width");
+        assert!(
+            strictly_ascending(&bytes, stride),
+            "PkKeys: keys are not strictly ascending"
+        );
+        PkKeys { stride: stride as u8, bytes }
     }
 
     pub fn stride(&self) -> usize {
@@ -150,14 +138,11 @@ impl PkKeys {
     pub fn iter(&self) -> std::slice::ChunksExact<'_, u8> {
         self.bytes.chunks_exact(self.stride())
     }
+}
 
-    /// Consecutive sub-lists of at most [`Self::max_per_request`] keys.
-    pub fn per_request(&self) -> impl Iterator<Item = PkKeys> + '_ {
-        let n = Self::max_per_request(self.stride()) * self.stride();
-        self.bytes
-            .chunks(n)
-            .map(|c| PkKeys { stride: self.stride, bytes: c.to_vec() })
-    }
+/// Whether `bytes`, read as keys of `stride`, strictly ascend.
+fn strictly_ascending(bytes: &[u8], stride: usize) -> bool {
+    bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b)
 }
 
 /// The bound a `ReadSpec` walks before the predicate and the sink. The range
@@ -171,9 +156,9 @@ pub enum ReadBound {
     /// point lookup is `n_eq = pk_count − 1` with degenerate cuts. Exact — no
     /// residual is needed for the bound itself.
     PkRange(RangeDescriptor),
-    /// Secondary-index range walk. An index holds no row with a NULL in any
-    /// indexed column, so neither does the walk.
-    IndexRange { bound: IndexBound, walk: IndexWalk },
+    /// Secondary-index range walk, exact with or without the index. An index holds no
+    /// row with a NULL in any indexed column, so neither does the walk.
+    IndexRange(IndexBound),
     /// An exact key set, at any PK arity — a `pk IN (…)` gather or one fully
     /// pinned key.
     PkSet(PkKeys),
@@ -200,8 +185,7 @@ impl ReadSpec {
         }
     }
 
-    /// The SCAN_SPEC request blob: `reply_block`, then this spec. The block leads so
-    /// `decode` caps the spec alone; a schema's column names are unbounded.
+    /// The SCAN_SPEC request blob: `reply_block`, then this spec.
     pub fn encode(&self, reply_block: &[u8]) -> Vec<u8> {
         let keys = match &self.bound {
             ReadBound::PkSet(k) => k.as_bytes().len(),
@@ -244,12 +228,6 @@ impl ReadSpec {
     pub fn decode(buf: &[u8]) -> Result<(ReadSpec, &[u8]), String> {
         let mut r = Reader::new(buf, "read_spec");
         let block = r.bytes32()?;
-        if r.remaining() > MAX_READ_SPEC_BYTES {
-            return Err(format!(
-                "read_spec: {} bytes exceeds cap {MAX_READ_SPEC_BYTES}",
-                r.remaining()
-            ));
-        }
 
         let bound = read_read_bound(&mut r)?;
 
@@ -301,13 +279,9 @@ pub(crate) fn write_read_bound(w: &mut Writer, b: &ReadBound) {
             w.u8(BOUND_PK_RANGE);
             write_range_descriptor(w, desc);
         }
-        ReadBound::IndexRange { bound, walk } => {
+        ReadBound::IndexRange(bound) => {
             w.u8(BOUND_INDEX_RANGE);
             write_index_bound(w, bound);
-            w.u8(match walk {
-                IndexWalk::Optional => 0,
-                IndexWalk::Required => 1,
-            });
         }
         ReadBound::PkSet(keys) => {
             w.u8(BOUND_PK_SET)
@@ -324,27 +298,19 @@ pub(crate) fn read_read_bound(r: &mut Reader) -> Result<ReadBound, String> {
     Ok(match r.u8()? {
         BOUND_NONE => ReadBound::None,
         BOUND_PK_RANGE => ReadBound::PkRange(read_range_descriptor(r)?),
-        BOUND_INDEX_RANGE => {
-            let bound = read_index_bound(r).map_err(|e| format!("read_spec: {e}"))?;
-            let walk = match r.u8()? {
-                0 => IndexWalk::Optional,
-                1 => IndexWalk::Required,
-                other => return Err(format!("read_spec: IndexRange walk byte {other} is not 0 or 1")),
-            };
-            ReadBound::IndexRange { bound, walk }
-        }
+        BOUND_INDEX_RANGE => ReadBound::IndexRange(read_index_bound(r).map_err(|e| format!("read_spec: {e}"))?),
         BOUND_PK_SET => {
             let stride = r.u8()? as usize;
             if !(1..=MAX_PK_BYTES).contains(&stride) {
                 return Err(format!("read_spec: PkSet stride {stride} outside 1..={MAX_PK_BYTES}"));
             }
             let count = r.u32()? as usize;
-            let cap = PkKeys::max_per_request(stride);
-            if count > cap {
-                return Err(format!("read_spec: PkSet count {count} exceeds cap {cap}"));
-            }
-            let bytes = r.take(count * stride)?;
-            if !bytes.chunks_exact(stride).is_sorted_by(|a, b| a < b) {
+            let bytes = r.take(
+                count
+                    .checked_mul(stride)
+                    .ok_or("read_spec: PkSet key count overflows")?,
+            )?;
+            if !strictly_ascending(bytes, stride) {
                 return Err("read_spec: PkSet keys are not strictly ascending".to_string());
             }
             ReadBound::PkSet(PkKeys {

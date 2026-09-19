@@ -17,7 +17,7 @@ use gnitz_core::{
 };
 use gnitz_mirror::Mirror;
 use gnitz_sql::{SqlPlanner, SqlResult};
-use gnitz_wire::{IndexBound, IndexWalk, PkColList, RangeDescriptor, ReadBound, ReadSpec};
+use gnitz_wire::{IndexBound, PkColList, RangeDescriptor, ReadBound, ReadSpec};
 
 use crate::read::{scan_result, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, rust_schema_to_py};
@@ -335,13 +335,10 @@ impl PyGnitzClient {
                     col_indices.len()
                 ))
             })?;
-        let spec = ReadSpec::all_rows(ReadBound::IndexRange {
-            bound: IndexBound {
-                idx_cols: PkColList::from_slice(&col_indices),
-                desc: RangeDescriptor::point(eq, last),
-            },
-            walk: IndexWalk::Required,
-        });
+        let spec = ReadSpec::all_rows(ReadBound::IndexRange(IndexBound {
+            idx_cols: PkColList::from_slice(&col_indices),
+            desc: RangeDescriptor::point(eq, last),
+        }));
         let batch = self.call(py, |c| c.scan_spec(table_id, &spec, &schema))?;
         scan_result(py, ScanReply { schema, batch, lsn: None })
     }

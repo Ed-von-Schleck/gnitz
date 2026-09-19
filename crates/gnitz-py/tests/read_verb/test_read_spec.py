@@ -164,10 +164,9 @@ def test_an_indexed_predicate_gathers_from_every_owner(client, kv):
             {(i, i * 10): 1 for i in range(NROWS) if lo <= i * 10 <= hi}
 
 
-def test_a_nonselective_bound_degrades_but_keeps_the_conjunct(client, kv):
-    """An indexed range covering nearly the whole table is traded for a full
-    cursor, and still returns only matching rows — the conjunct stays in the
-    server predicate rather than being consumed by a bound that was dropped."""
+def test_a_nonselective_index_walk_returns_only_its_range(client, kv):
+    """An indexed range covering nearly the whole table is served by a full
+    scan, and still returns only the rows inside the range."""
     assert bag(rows(client, kv, "SELECT id FROM t WHERE v >= 10")) == \
         {(i,): 1 for i in range(1, NROWS)}
 

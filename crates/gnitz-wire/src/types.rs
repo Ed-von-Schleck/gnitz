@@ -175,11 +175,8 @@ impl TypeCode {
         TypeCode::from_validated_u8(register_image_type(self as u8))
     }
 
-    /// The 16-byte integer-ish types (U128, UUID, I128) with no i64 slot in the
-    /// expression VM: a bound on such a column cannot be re-imposed by a
-    /// compiled predicate, so a range walk over it must be byte-exact
-    /// (un-gated). The SQL layer reads this when deciding which conjuncts it may
-    /// strip; it then ships the verdict as the bound's `IndexWalk`.
+    /// The 16-byte integer-ish types (U128, UUID, I128), which have no i64 slot in
+    /// the expression VM.
     pub const fn is_wide_int(self) -> bool {
         is_wide_int(self as u8)
     }

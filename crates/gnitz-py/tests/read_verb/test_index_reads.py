@@ -6,12 +6,11 @@ back as "no such row" — so each case asserts the full result set with its
 weights. A key answered by two workers is a doubled weight, which a PK list
 cannot see.
 
-A SQL index walk whose conjuncts the server predicate also carries is optional:
-a worker trades it for a full scan when the range covers more than a small
-fraction of its rows, and that scan returns the same answer — so a small table
-passes every assertion here without ever opening the index. Each table that is
-meant to be walked is padded with `PAD` rows no case's predicate selects: a NULL
-indexed cell, which the index does not hold, or an out-of-range value.
+A worker trades an index walk for a full scan narrowed to the walk's rows when
+the range covers more than a small fraction of its rows, so a small table passes
+every assertion here without ever opening the index. Each table that is meant to
+be walked is padded with `PAD` rows no case's predicate selects: a NULL indexed
+cell, which the index does not hold, or an out-of-range value.
 """
 
 import pytest
