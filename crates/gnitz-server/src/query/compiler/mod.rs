@@ -31,7 +31,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
 pub(super) use load::read_circuit_node_row;
 pub(crate) use routing::RelayRoute;
-pub(super) use routing::ViewMeta;
+pub(super) use routing::{ViewMeta, OUTPUT_RELAY};
 
 /// The most nodes one view's circuit may hold. A real circuit is 15–40 nodes;
 /// the headroom is what makes the `u16` register and table ids safe under any
@@ -236,13 +236,17 @@ pub(super) struct CompileOutput {
     /// The combine phase every side's relayed batch seeds — and, for a circuit
     /// with no `ExchangeShard`, the whole plan.
     pub(in crate::query) post: SubPlan,
+    /// This worker computes the view's whole result locally: it is replicated, or
+    /// this process is the only worker. Not on [`ViewMeta`], which the master
+    /// derives under its own slot.
+    pub(in crate::query) self_contained: bool,
 }
 
 impl CompileOutput {
     /// Every sub-plan of the view, for whole-plan sweeps (regfile clears,
     /// checkpoint table collection).
     pub(super) fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
-        let Self { sides, post } = self;
+        let Self { sides, post, .. } = self;
         sides
             .sides_mut()
             .iter_mut()
@@ -282,12 +286,12 @@ pub(super) fn compile_view(
     if bounded && !carve.sides.is_empty() {
         return Err("bounded view: only a linear body and an inner equi-join are supported".into());
     }
-    let placement = view_schema.placement();
+    let self_contained = view_schema.placement().is_replicated() || site.registry.slot().of <= 1;
     let mut side_plans = Vec::with_capacity(carve.sides.len());
     let mut seeds = Vec::with_capacity(carve.sides.len());
     for side in &carve.sides {
         let ex_in = loaded.inputs(side.shard).unary();
-        let (plan, _) = build_plan(&loaded, &side.nodes, site, placement, &[], ex_in)?;
+        let (plan, _) = build_plan(&loaded, &side.nodes, site, self_contained, &[], ex_in)?;
         let schema = plan.vm.program.out_schema();
         // `ScatterKey::new` bounds the same columns, but only mid-round in the
         // master relay; here a corrupt node is a `CREATE VIEW` rejection.
@@ -297,7 +301,7 @@ pub(super) fn compile_view(
         seeds.push((side.shard, schema));
         side_plans.push(plan);
     }
-    let (post, post_regs) = build_plan(&loaded, &carve.post, site, placement, &seeds, loaded.sink()?)?;
+    let (post, post_regs) = build_plan(&loaded, &carve.post, site, self_contained, &seeds, loaded.sink()?)?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
     if !post.vm.program.out_schema().same_physical_layout(view_schema) {
@@ -324,7 +328,7 @@ pub(super) fn compile_view(
         1 => Sides::Unary(sides.pop().expect("one side")),
         _ => Sides::Pair(sides.try_into().ok().expect("carve admits at most two sides")),
     };
-    let mut output = CompileOutput { sides, post };
+    let mut output = CompileOutput { sides, post, self_contained };
     // Past every fallible step: from here the plan owns its child stores. Every
     // other exit leaves each sub-plan's state armed, so it erases what it opened.
     for sub in output.sub_plans_mut() {

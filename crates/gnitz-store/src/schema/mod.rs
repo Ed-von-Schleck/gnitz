@@ -293,6 +293,10 @@ impl Placement {
     /// rejects it at the decode boundary, where the corrupt row can be named.
     pub const KEYED_DEFAULT: Placement = Placement::Keyed { prefix_len: 0 };
 
+    /// The worker whose copy of a replicated relation is the counted one: it
+    /// alone captures a replicated view's delta feed, and it answers reads.
+    pub const REPLICA_OWNER: u32 = 0;
+
     /// True iff a row's owning worker is derived from its key. A relation that
     /// is not key-routed still holds one store per worker; what differs is which
     /// rows arrive there — a broadcast copy (`Replicated`) or whatever that

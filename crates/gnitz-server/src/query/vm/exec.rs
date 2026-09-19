@@ -27,20 +27,20 @@ fn tick_ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StorageError {
 
 /// Execute one epoch over `inputs`, one `(register, batch)` per seeded input —
 /// two for a set-op post phase, one everywhere else. Returns the output
-/// register's batch, or `None` when the epoch produced nothing.
+/// register's batch, empty when the epoch produced nothing.
 ///
 /// Seeds, compacts and binds its own cursors, so a caller hands over batches and
 /// gets a delta back with no prologue of its own to order.
 pub(in crate::query) fn execute_epoch_multi(
     vm: &mut VmHandle,
     inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
-) -> Result<Option<Batch>, StorageError> {
+) -> Result<Batch, StorageError> {
     let all_empty = seed_inputs(vm, inputs);
     // A global-ground reduce mints its V₀ row on one empty epoch; every other
     // opcode is inert on empty input. Cleared before the run, because `trace_out`
     // holds V₀ afterwards either way.
     if all_empty && !std::mem::take(&mut vm.pending_ground_row) {
-        return Ok(None);
+        return Ok(Batch::empty_with_schema(&vm.program.out_schema()));
     }
     vm.state.compact_all();
     vm.bind_trace_cursors();
@@ -66,7 +66,7 @@ impl<'a> Replay<'a> {
     /// Seed one register out of a store and dispatch from `start_pc`, past the
     /// prologue that seed replaces. Read-only-ness is `reject_state_writers`'s to
     /// enforce; the one writer it admits is handled by [`IntegrateMode::Skip`].
-    pub(in crate::query) fn chunk(&mut self, seed: (DeltaReg, Batch)) -> Result<Option<Batch>, StorageError> {
+    pub(in crate::query) fn chunk(&mut self, seed: (DeltaReg, Batch)) -> Result<Batch, StorageError> {
         seed_inputs(self.vm, std::iter::once(seed));
         dispatch(self.vm, self.start_pc, IntegrateMode::Skip)
     }
@@ -121,7 +121,7 @@ fn take_or_clone(batches: &mut [Batch], last_read: &[u32], reg: DeltaReg, pc: us
 }
 
 /// Run the instruction stream from `start_pc` and extract the output register.
-fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Result<Option<Batch>, StorageError> {
+fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Result<Batch, StorageError> {
     // Destructured because the three are disjoint fields: that is what lets an
     // operator hold a batch and a cursor (or a table) at once, with no interior
     // mutability and no raw pointer.
@@ -300,22 +300,25 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
     // Extract the output, labelled with the output register's own schema. An
     // operator's identity path can hand an input batch straight back (see
     // `op_union`), so the label on it may be an operand's; downstream — the
-    // exchange wire, `prepare_relay`, the dag driver's fan-out — cannot re-derive it.
+    // exchange wire, `prepare_relay`, the dag driver — cannot re-derive it.
     let out = &mut batches[program.out_reg.at()];
-    Ok((!out.is_empty()).then(|| {
-        let mut batch = out.take();
-        let want = program.out_schema();
-        // Only a narrower nullability may legitimately arrive here. A different
-        // physical layout means the batch was built against another schema
-        // entirely, which the stamp would hide from the wire encode.
-        debug_assert!(
-            batch.schema().same_physical_layout(&want),
-            "VM output register {}: batch label is not the register's physical layout",
-            program.out_reg.0,
-        );
-        batch.set_schema(&want);
-        batch
-    }))
+    let want = program.out_schema();
+    // An empty register can still carry a seed's foreign schema, so it is
+    // rebuilt rather than taken.
+    if out.is_empty() {
+        return Ok(Batch::empty_with_schema(&want));
+    }
+    let mut batch = out.take();
+    // Only a narrower nullability may legitimately arrive here. A different
+    // physical layout means the batch was built against another schema
+    // entirely, which the stamp would hide from the wire encode.
+    debug_assert!(
+        batch.schema().same_physical_layout(&want),
+        "VM output register {}: batch label is not the register's physical layout",
+        program.out_reg.0,
+    );
+    batch.set_schema(&want);
+    Ok(batch)
 }
 
 /// The cursor bound to trace register `reg`. Every path into [`dispatch`] binds

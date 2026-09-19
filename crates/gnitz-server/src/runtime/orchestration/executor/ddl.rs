@@ -288,7 +288,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
     // new view's base sources once the circuit rows are applied (so the dependency
     // map names the view's sources) but before VIEW_TAB registers the view — after
     // registration the view is a dependent of those bases, so an undrained pending
-    // delta would tick it through `evaluate_dag` over rows the backfill below also
+    // delta would tick it through a `Drive::Tick` over rows the backfill below also
     // scans, counting them twice. VIEW_TAB is the first family at or past view
     // priority. A stream source is not drained (see `base_tables_reachable_from`):
     // the backfill scans its empty store, so a still-pending stream row can only
@@ -477,7 +477,7 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
                 .map_or(0, Relation::current_lsn),
         );
 
-        // A sys_sequences advance is a pure system-table write (no evaluate_dag,
+        // A sys_sequences advance is a pure system-table write (no view tick,
         // no rollback); a hook failure on a well-formed 2-row delta is an
         // invariant violation — abort rather than compensate.
         if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {

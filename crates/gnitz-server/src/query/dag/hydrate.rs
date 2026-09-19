@@ -38,13 +38,10 @@ impl SkeletonHydrator for DagEngine {
                 "hydrate: view {view_id} is not a registered relation"
             )));
         };
-        // The plan cache is lazy and is dropped on every rebuild, so a read
+        // The plan is memoized lazily and is dropped on every rebuild, so a read
         // arriving before the view's first tick would otherwise find nothing.
-        // `Ok(false)` is that same registry lookup, which the check above already
-        // passed, so only a real compile failure leaves here.
-        let compiled = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;
-        debug_assert!(compiled, "ensure_compiled false for a registered view");
-        let Sides::Unexchanged { hydration: Some(hydration) } = &self.cache[&view_id].sides else {
+        let (_, plan) = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;
+        let Sides::Unexchanged { hydration: Some(hydration) } = &plan.sides else {
             return Err(StoreError::rejected(format!(
                 "hydrate: view {view_id} was not compiled as capacity-bounded"
             )));
@@ -62,7 +59,6 @@ impl SkeletonHydrator for DagEngine {
         // The ranged cursor open takes `&self` and the cursor owns its runs via
         // `Rc`, so both borrows of the registry end here and the VM is free to
         // run below.
-        let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted the plan");
         let sub = &mut plan.post;
         let seed_schema = *sub.vm.program.schema_of(hydration.in_reg);
         // The gather opens over the range its own key list spans.
@@ -86,13 +82,11 @@ impl SkeletonHydrator for DagEngine {
             let produced = replay
                 .chunk((hydration.in_reg, seed))
                 .map_err(|e| StoreError::rejected(format!("hydrate: view {view_id} replay failed: {e}")))?;
-            if let Some(b) = produced {
-                debug_assert!(
-                    b.schema().same_physical_layout(&view_schema),
-                    "hydration produced a batch that is not in the view's schema",
-                );
-                out.append_batch(&b, 0, b.len());
-            }
+            debug_assert!(
+                produced.schema().same_physical_layout(&view_schema),
+                "hydration produced a batch that is not in the view's schema",
+            );
+            out.append_batch(&produced, 0, produced.len());
         }
 
         // Drops the seed cursor's merge tree before the consolidate below

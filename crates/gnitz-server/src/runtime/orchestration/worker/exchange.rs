@@ -15,9 +15,9 @@ impl WorkerProcess {
         }
     }
 
-    /// Publish an exchange frame train to the master and block until its ExchangeRelay
-    /// for `view_id` comes back on the SAL, returning it with the backfill
-    /// decision the master stamped onto it. Messages arriving mid-wait are
+    /// Publish `batch` as an exchange frame train to the master and block until
+    /// its ExchangeRelay for `view_id` comes back on the SAL, returning it with
+    /// the backfill decision the master stamped onto it. Messages arriving mid-wait are
     /// dispatched per [`in_eval`]; a relay for another `(view_id, source_id)`
     /// parks in `pending_relays`.
     ///
@@ -25,11 +25,14 @@ impl WorkerProcess {
     pub(super) fn do_exchange_wait(
         &mut self,
         view_id: i64,
-        batch: &Batch,
+        batch: Batch,
         source_id: i64,
         pad: bool,
     ) -> (Batch, BackfillDecision) {
-        self.publish_exchange(view_id, batch, source_id, pad);
+        self.publish_exchange(view_id, &batch, source_id, pad);
+        // Before the park, so this worker never holds its own partition and the
+        // relayed one at once.
+        drop(batch);
 
         let want_key = (view_id, source_id);
 

@@ -1,29 +1,34 @@
 use super::*;
 
+/// A plan-less memo, the shape `view_meta` leaves behind.
+fn memo() -> Box<ViewEntry> {
+    Box::new(ViewEntry { meta: ViewMeta::empty(), plan: None })
+}
+
 #[test]
 fn test_invalidation() {
     let mut dag = DagEngine::new();
-    dag.meta.insert(42, Rc::new(ViewMeta::empty()));
+    dag.views.insert(42, memo());
 
     dag.invalidate(42);
-    assert!(!dag.meta.contains_key(&42));
+    assert!(!dag.views.contains_key(&42));
 
-    dag.meta.insert(99, Rc::new(ViewMeta::empty()));
+    dag.views.insert(99, memo());
     dag.invalidate_all();
-    assert!(dag.meta.is_empty());
+    assert!(dag.views.is_empty());
 }
 
-/// Wiring: the production table/view-drop path routes through `evict_meta`.
+/// Wiring: the production table/view-drop path drops the memo with the relation.
 #[test]
-fn unregister_table_evicts_the_dropped_relations_meta() {
+fn unregister_table_evicts_the_dropped_relations_memo() {
     let mut registry = gnitz_store::relation::RelationRegistry::new(
         gnitz_store::storage::Slot::SOLO,
         gnitz_store::relation::StoreConfig::default(),
     );
     let mut dag = DagEngine::new();
-    dag.meta.insert(43, Rc::new(ViewMeta::empty()));
+    dag.views.insert(43, memo());
     dag.unregister_table(&mut registry, 43);
-    assert!(!dag.meta.contains_key(&43), "unregister_table must evict");
+    assert!(!dag.views.contains_key(&43), "unregister_table must evict");
 }
 
 /// Install `edges` (source → view) into the dep map, the same entries

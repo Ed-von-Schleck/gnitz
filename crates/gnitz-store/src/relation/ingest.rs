@@ -2,7 +2,7 @@
 //! application, index projection, and the flush / checkpoint table collection.
 
 use super::{Relation, RelationKind, RelationRegistry};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{Placement, SchemaDescriptor};
 use crate::storage::{Batch, StorageError, StoreError, Table};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
@@ -52,9 +52,9 @@ impl RelationRegistry {
     ///
     /// The capture must happen here: the store's fold drops net-zero rows, so
     /// after it an insert and its later retraction are both unrecoverable. A
-    /// replicated view captures on worker 0 alone, where its delta reads are
-    /// served. Returns the batch only when `needed`; otherwise it is moved into
-    /// the store.
+    /// replicated view captures on [`Placement::REPLICA_OWNER`] alone, where its
+    /// delta reads are served. Returns the batch only when `needed`; otherwise it
+    /// is moved into the store.
     pub fn ingest_view_delta(
         &mut self,
         view_id: i64,
@@ -63,10 +63,10 @@ impl RelationRegistry {
         needed: bool,
     ) -> Result<Option<Batch>, StorageError> {
         let rank = self.slot.rank;
-        let Some(entry) = self.tables.get_mut(&view_id) else {
-            gnitz_warn!("relation: ingest_view_delta — relation {} is not registered", view_id);
-            return Ok(None);
-        };
+        let entry = self
+            .tables
+            .get_mut(&view_id)
+            .unwrap_or_else(|| panic!("ingest_view_delta: relation {view_id} is not registered"));
         debug_assert!(
             entry.kind.is_view(),
             "ingest_view_delta drives the tick path, which only ever reaches a view; \
@@ -84,7 +84,7 @@ impl RelationRegistry {
             .as_deref()
             .map(|feed| feed.schema())
             .zip(round)
-            .filter(|_| !entry.store.schema().placement().is_replicated() || rank == 0);
+            .filter(|_| !entry.store.schema().placement().is_replicated() || rank == Placement::REPLICA_OWNER);
         // Only a captured batch pays the up-front fold; every other view hands the
         // batch straight to the store ingest it always did.
         let folded = capture.and_then(|_| Batch::consolidate_if_needed(&batch, &entry.store.schema()));

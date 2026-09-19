@@ -11,10 +11,6 @@ use std::rc::Rc;
 
 /// How the master relay routes one source's delta into a view.
 pub(crate) enum RelayRoute {
-    /// The source feeds several distinct reindex keys: no single key
-    /// co-partitions it with the trace sides, so the round must be refused
-    /// rather than routed by a key nothing was stored under.
-    NoSingleKey,
     /// Pure range join (`n_eq == 0`) or cross join: the matches are spread over
     /// the whole other side, so every worker needs the full delta and trims to
     /// its owned slice (`WorkerFilter`) before integrating.
@@ -33,23 +29,21 @@ pub(crate) enum RelayRoute {
 /// source table id → the join/group reindex key its scans feed.
 type JoinShardMap = FxHashMap<i64, ReindexKey>;
 
-/// What one source gets: how the master routes its delta, and whether the worker
-/// must send it through the scatter at all.
-struct SourceRelay {
-    route: RelayRoute,
-    scatter: bool,
-}
+/// The source id a round carries when it is not a source's own scatter: a
+/// side's relayed output, which routes by the view's own shard columns.
+pub(in crate::query) const OUTPUT_RELAY: i64 = 0;
 
 /// Per-view circuit metadata, derived from one circuit load — the master's relay
 /// key and the worker's scatter set together, so the two processes cannot derive
 /// disagreeing halves. `derive` reads the circuit only through
 /// [`LoadedCircuit::ops`], which orders identically in both.
 pub(crate) struct ViewMeta {
-    /// source table id → that source's relay entry. A source absent from this
-    /// map carries no reindex key of its own and takes `default_route`.
-    source_routes: FxHashMap<i64, SourceRelay>,
-    /// The route of everything absent from `source_routes`, including the output
-    /// relay (`source_id == 0`): the view's own shard columns under `GroupKey`.
+    /// source table id → how the master routes the delta this source scatters.
+    /// A source absent from it does not scatter, and whatever it does relay
+    /// takes `default_route`.
+    source_routes: FxHashMap<i64, RelayRoute>,
+    /// The route of everything absent from `source_routes`, including
+    /// [`OUTPUT_RELAY`]: the view's own shard columns under `GroupKey`.
     default_route: RelayRoute,
     /// The circuit's one `ExchangeShard` is a proven no-op: every row it would
     /// move already sits on the worker owning its distribution key.
@@ -64,7 +58,7 @@ pub(crate) struct ViewMeta {
 }
 
 impl ViewMeta {
-    /// An empty fixture, enough to occupy a memo slot.
+    /// An empty fixture, enough to occupy a memo entry.
     #[cfg(test)]
     pub(in crate::query) fn empty() -> ViewMeta {
         ViewMeta {
@@ -76,24 +70,24 @@ impl ViewMeta {
         }
     }
 
-    /// Load `view_id`'s circuit and derive its metadata. `None` when the circuit
+    /// Load `view_id`'s circuit and derive its metadata. `Err` when the circuit
     /// cannot be read, is malformed, or carries an unscatterable source — there
     /// is no default route, since a key nothing was stored under would scatter a
     /// delta away from the traces it must meet.
-    pub(in crate::query) fn for_view(registry: &RelationRegistry, view_id: i64) -> Option<ViewMeta> {
-        let loaded = load::load_circuit(registry, view_id as u64).ok()?;
-        ViewMeta::derive(&loaded, registry).ok()
+    pub(in crate::query) fn for_view(registry: &RelationRegistry, view_id: i64) -> Result<ViewMeta, String> {
+        let loaded = load::load_circuit(registry, view_id as u64)?;
+        ViewMeta::derive(&loaded, registry)
     }
 
     /// `registry` supplies what the circuit alone cannot: co-partitioning and the
     /// output-shard elision both test a shard key against a *source relation's*
     /// distribution prefix. `Err` when a source's reindex maps carry no route
-    /// key, so its delta cannot be scattered.
+    /// key, or carry two distinct ones, so its delta cannot be scattered.
     pub(in crate::query) fn derive(loaded: &LoadedCircuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
-        // source → the distinct key sequences its scans feed. Deduped across scan
-        // nodes as well as within one, so two scans on a source carrying the same
-        // key resolve to one sequence rather than tripping the pack-key gate below.
-        let mut seqs: FxHashMap<i64, Vec<ReindexKey>> = FxHashMap::default();
+        // source → the one key sequence its scans feed. A second, distinct one is
+        // refused: the delta would scatter by a key one trace side is not stored
+        // under, dropping its matches silently.
+        let mut seqs: JoinShardMap = FxHashMap::default();
         let mut outside_joins: FxHashSet<i64> = FxHashSet::default();
         let mut set_fed: FxHashSet<i64> = FxHashSet::default();
         let mut untrimmed: FxHashSet<i64> = FxHashSet::default();
@@ -123,31 +117,20 @@ impl ViewMeta {
             if !owner_trimmed {
                 untrimmed.insert(*source as i64);
             }
-            // Every live circuit holds one scan to one sequence, so a second means
-            // a newly-constructible shape that wants a real plan, not a refusal.
-            debug_assert!(
-                node_seqs.len() <= 1,
-                "scan {nid} feeds {} distinct scatter keys; no single pack key routes it",
-                node_seqs.len(),
-            );
-            let acc = seqs.entry(*source as i64).or_default();
             for seq in node_seqs {
-                if !acc.contains(&seq) {
-                    acc.push(seq);
+                match seqs.entry(*source as i64) {
+                    Entry::Vacant(e) => {
+                        e.insert(seq);
+                    }
+                    Entry::Occupied(e) if *e.get() != seq => {
+                        return Err(format!("source {source} feeds several distinct scatter keys"))
+                    }
+                    Entry::Occupied(_) => {}
                 }
             }
         }
-        seqs.retain(|_, s| !s.is_empty());
         let source_bounds = bounds.into_iter().filter(|(_, b)| *b != ReadBound::None).collect();
 
-        // The co-partition prefix test wants the sequences CONCATENATED, and wants
-        // a conservative refusal when a source carries more than one key: the
-        // concatenation matches no source's distribution prefix, so that source
-        // correctly goes through the exchange.
-        let concatenated: JoinShardMap = seqs
-            .iter()
-            .map(|(&tid, s)| (tid, s.iter().flatten().copied().collect()))
-            .collect();
         let join_relay = circuit_join_relay(loaded)?;
         let shards: Vec<(NodeId, &[u32])> = loaded.exchange_shards().collect();
         let repartitions = !shards.is_empty() || join_relay.is_some();
@@ -158,9 +141,9 @@ impl ViewMeta {
         // no source distribution places them: nothing co-partitions, and every
         // source relays — except an owner-trimmed one already on its PK's owner.
         let co_partitioned = match join_relay {
-            JoinRelay::WholeKey => compute_co_partitioned(&concatenated, registry, &outside_joins, &set_fed),
+            JoinRelay::WholeKey => compute_co_partitioned(&seqs, registry, &outside_joins, &set_fed),
             JoinRelay::EqPrefix { .. } => FxHashSet::default(),
-            JoinRelay::Broadcast => concatenated
+            JoinRelay::Broadcast => seqs
                 .iter()
                 .filter(|&(tid, cols)| owner_trimmed(tid) && native_partition_is(registry, *tid, cols))
                 .map(|(&tid, _)| tid)
@@ -174,24 +157,14 @@ impl ViewMeta {
         let shard_cols: Option<Rc<[u32]>> = shards.last().map(|&(_, cols)| Rc::from(cols));
         let source_routes = seqs
             .into_iter()
-            .map(|(tid, s)| {
-                // The relay packs ONE sequence or refuses, never the concatenation
-                // `compute_co_partitioned` reads: the delta would scatter by
-                // `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or
-                // `pack(b)`, dropping every match silently.
-                let route = match <[_; 1]>::try_from(s) {
+            .filter(|(tid, _)| !co_partitioned.contains(tid))
+            .map(|(tid, seq)| {
+                let route = match join_relay == JoinRelay::Broadcast && owner_trimmed(&tid) {
                     // Routes each row to the worker its owner filter keeps it on.
-                    Ok([seq]) if join_relay == JoinRelay::Broadcast && owner_trimmed(&tid) => {
-                        join_route(seq, JoinRelay::WholeKey)
-                    }
-                    Ok([seq]) => join_route(seq, join_relay),
-                    Err(_) => RelayRoute::NoSingleKey,
+                    true => join_route(seq, JoinRelay::WholeKey),
+                    false => join_route(seq, join_relay),
                 };
-                let relay = SourceRelay {
-                    route,
-                    scatter: !co_partitioned.contains(&tid),
-                };
-                (tid, relay)
+                (tid, route)
             })
             .collect();
 
@@ -206,9 +179,7 @@ impl ViewMeta {
 
     /// How the master relay routes `source_id`'s delta into this view.
     pub(crate) fn relay_route(&self, source_id: i64) -> &RelayRoute {
-        self.source_routes
-            .get(&source_id)
-            .map_or(&self.default_route, |relay| &relay.route)
+        self.source_routes.get(&source_id).unwrap_or(&self.default_route)
     }
 
     /// True iff `source_id`'s delta must go through the join scatter: it carries a
@@ -216,14 +187,7 @@ impl ViewMeta {
     /// key nor a replicated partner met only through join terms makes the
     /// exchange unnecessary.
     pub(in crate::query) fn scatters(&self, source_id: i64) -> bool {
-        self.source_routes.get(&source_id).is_some_and(|relay| relay.scatter)
-    }
-
-    /// True iff this view's relay routing holds a key for `id` — not every source
-    /// it scans, so it answers eviction (over-eviction is safe) and nothing that
-    /// must enumerate sources.
-    pub(in crate::query) fn routes_source(&self, id: i64) -> bool {
-        self.source_routes.contains_key(&id)
+        self.source_routes.contains_key(&source_id)
     }
 }
 

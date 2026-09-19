@@ -20,7 +20,7 @@ impl CatalogEngine {
         &self.registry
     }
 
-    /// The DBSP layer's view state: plan cache, per-view metadata and the dependency map.
+    /// The DBSP layer's view state: one memo per view and the dependency map.
     pub(crate) fn dag(&self) -> &DagEngine {
         &self.dag
     }

@@ -80,11 +80,16 @@ pub fn write_circuit(engine: &mut CatalogEngine, vid: i64, circuit: Circuit) {
 }
 
 /// The minimal identity circuit `ScanDelta(source, bound) → Integrate`.
-pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, bound: gnitz_wire::ReadBound) {
+pub fn identity_circuit(source_tid: i64, bound: gnitz_wire::ReadBound) -> Circuit {
     let mut circuit = Circuit::default();
     let scan = circuit.input_delta(source_tid as u64, bound);
     circuit.sink(scan);
-    write_circuit(engine, vid, circuit);
+    circuit
+}
+
+/// [`identity_circuit`] written as `vid`'s circuit.
+pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, bound: gnitz_wire::ReadBound) {
+    write_circuit(engine, vid, identity_circuit(source_tid, bound));
 }
 
 // ── Positional row builders ──────────────────────────────────────────────
@@ -184,9 +189,27 @@ pub fn push_view_tab_row(
     sink.end_row();
 }
 
-/// Register an identity view over `source_tid` through the raw system-table
-/// path, returning its vid or the registration's own error. Budgets in bytes,
+/// Register a view running `circuit` through the raw system-table path,
+/// returning its vid or the registration's own error. Budgets in bytes,
 /// `0` = off.
+pub fn try_register_view(
+    engine: &mut CatalogEngine,
+    circuit: Circuit,
+    name: &str,
+    cols: &[ColumnDef],
+    capacity_bytes: u64,
+    delta_bytes: u64,
+) -> Result<i64, String> {
+    let vid = engine.allocate_ids(1).unwrap();
+    write_circuit(engine, vid, circuit);
+    engine.write_column_records(vid, cols).unwrap();
+    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
+    push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
+    engine.submit(SysFamily::View, bb.finish())?;
+    Ok(vid)
+}
+
+/// [`try_register_view`] for an identity view over `source_tid`.
 pub fn try_register_identity_view(
     engine: &mut CatalogEngine,
     source_tid: i64,
@@ -195,13 +218,8 @@ pub fn try_register_identity_view(
     capacity_bytes: u64,
     delta_bytes: u64,
 ) -> Result<i64, String> {
-    let vid = engine.allocate_ids(1).unwrap();
-    write_identity_circuit(engine, vid, source_tid, gnitz_wire::ReadBound::None);
-    engine.write_column_records(vid, cols).unwrap();
-    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
-    engine.submit(SysFamily::View, bb.finish())?;
-    Ok(vid)
+    let circuit = identity_circuit(source_tid, gnitz_wire::ReadBound::None);
+    try_register_view(engine, circuit, name, cols, capacity_bytes, delta_bytes)
 }
 
 /// [`try_register_identity_view`] for an unbounded view that must succeed.

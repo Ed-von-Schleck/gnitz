@@ -162,8 +162,7 @@ pub fn op_relay_scatter_consolidated(
 
         match second {
             // One contributing source: already ordered and folded, so a
-            // tournament would compare per row to fold nothing. Reached by every
-            // single-worker run.
+            // tournament would compare per row to fold nothing.
             None => {
                 let mb = &mem_batches[first];
                 for row in 0..mb.count {

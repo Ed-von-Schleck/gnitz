@@ -19,12 +19,10 @@ use gnitz_store::ops::{merge_schemas_for_join, ClampPreset, JoinProbe, RangeProb
 /// to the emit arms as one `&mut` instead of a dozen parallel parameters.
 pub(super) struct EmitCtx<'a> {
     pub(in crate::query) loaded: &'a LoadedCircuit,
-    /// The view's placement, stamped at registration. Every `ScanDelta` source of
-    /// a replicated view is replicated too, so the view runs correct-local on
-    /// every worker: the `WorkerFilter` arm emits nothing (the trim would drop
-    /// rows this worker legitimately owns a copy of), and `emit_reduce` makes
-    /// every worker the owner of the global-aggregate seed.
-    pub(in crate::query) placement: gnitz_store::schema::Placement,
+    /// This worker holds the view's whole input: the `WorkerFilter` arm emits
+    /// nothing (the trim would drop rows it legitimately owns a copy of), and
+    /// `emit_reduce` makes it the owner of the global-aggregate seed.
+    pub(in crate::query) self_contained: bool,
     pub(in crate::query) site: super::ViewSite<'a>,
     pub(in crate::query) builder: ProgramBuilder,
     pub(in crate::query) out_reg_of: Vec<Option<OutReg>>,
@@ -266,7 +264,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             // A replicated view runs correct-local over the full broadcast, and at
             // one worker every partition is owned here — the filter is the identity
             // either way, and executing it would clone the whole delta each epoch.
-            if ctx.placement.is_replicated() || slot.of <= 1 {
+            if ctx.self_contained {
                 return Ok(OutReg::Delta(in_reg));
             }
             let out_reg = ctx.push_delta_reg(ctx.reg_schema(in_reg));
@@ -362,7 +360,7 @@ fn emit_reduce(
     }
     let unsharded = shard_cols.is_none();
     let slot = ctx.site.registry.slot();
-    let i_am_owner = ctx.placement.is_replicated()
+    let i_am_owner = ctx.self_contained
         || unsharded
         || slot.rank as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), slot.of as usize);
 
@@ -406,13 +404,13 @@ pub(super) fn build_plan(
     loaded: &LoadedCircuit,
     ordered: &[NodeId],
     site: super::ViewSite<'_>,
-    placement: gnitz_store::schema::Placement,
+    self_contained: bool,
     seeds: &[(NodeId, SchemaDescriptor)],
     out: NodeId,
 ) -> Result<(SubPlan, Vec<Option<OutReg>>), String> {
     let mut ctx = EmitCtx {
         loaded,
-        placement,
+        self_contained,
         site,
         builder: ProgramBuilder::new(),
         out_reg_of: vec![None; loaded.len()],

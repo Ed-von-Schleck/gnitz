@@ -240,7 +240,7 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
 /// either key alone would leave the trace side keyed by the other.
 #[test]
 fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
-    let two_scans = |key_a: &[u32], key_b: &[u32]| -> ViewMeta {
+    let two_scans = |key_a: &[u32], key_b: &[u32]| -> Result<ViewMeta, String> {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(10)),
@@ -258,19 +258,14 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
                 (4, 5, SLOT_IN),
             ],
         );
-        ViewMeta::derive(&loaded, &sources([])).unwrap()
+        ViewMeta::derive(&loaded, &sources([]))
     };
 
-    let agreed = two_scans(&[1], &[1]);
-    assert_eq!(
-        join_cols(agreed.relay_route(10)),
-        Some(vec![1]),
-        "one key reached twice routes by that key"
-    );
-    let conflicting = two_scans(&[1], &[2]);
+    let agreed = two_scans(&[1], &[1]).expect("one key reached twice routes by that key");
+    assert_eq!(join_cols(agreed.relay_route(10)), Some(vec![1]));
     assert!(
-        matches!(conflicting.relay_route(10), RelayRoute::NoSingleKey),
-        "two distinct keys must refuse the round, not pick one"
+        two_scans(&[1], &[2]).is_err(),
+        "two distinct keys must refuse the compile, not pick one or concatenate them"
     );
 }
 
@@ -492,7 +487,6 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
         ViewMeta::derive(&loaded, &sources([(7, schema), (9, make_schema_u64_i64())])).unwrap()
     };
     let keyed = meta(make_schema_u64_i64());
-    assert_eq!(join_cols(keyed.relay_route(7)), Some(vec![0]), "routed by its PK");
     assert!(!keyed.scatters(7), "already on its PK's owner");
     assert!(matches!(keyed.relay_route(9), RelayRoute::Broadcast));
     assert!(keyed.scatters(9));

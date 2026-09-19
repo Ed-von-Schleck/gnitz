@@ -9,7 +9,6 @@
 use super::*;
 use gnitz_store::relation::Relation;
 use std::collections::hash_map::Entry;
-use std::rc::Rc;
 
 /// The bidirectional view-dependency index, kept current by every `CircuitNodes` delta.
 /// A `forward` / `reverse` entry exists only while it holds an id.
@@ -216,7 +215,7 @@ impl DagEngine {
         // sources, so the destructure above has already returned. An unreadable
         // circuit proves nothing, so it keeps the default.
         match self.view_meta(registry, view_id) {
-            Some(m) if !m.repartitions => placement,
+            Ok(m) if !m.repartitions => placement,
             _ => Placement::KEYED_DEFAULT,
         }
     }
@@ -224,26 +223,15 @@ impl DagEngine {
     // ── ViewMeta (plan-free routing metadata) ───────────────────────────
 
     /// The memoized per-view routing metadata, computed on first touch. Cheaper
-    /// than full compilation: no code emission. `None` — an unreadable or
-    /// unroutable circuit — is not memoized, so a later touch retries.
-    pub(crate) fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Option<Rc<ViewMeta>> {
-        if let Some(m) = self.meta.get(&view_id) {
-            return Some(m.clone());
+    /// than full compilation: no code emission. An unreadable or unroutable
+    /// circuit is not memoized, so a later touch retries.
+    pub(crate) fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<&ViewMeta, String> {
+        if let Entry::Vacant(slot) = self.views.entry(view_id) {
+            slot.insert(Box::new(ViewEntry {
+                meta: ViewMeta::for_view(registry, view_id)?,
+                plan: None,
+            }));
         }
-        let meta = Rc::new(ViewMeta::for_view(registry, view_id)?);
-        self.meta.insert(view_id, meta.clone());
-        Some(meta)
-    }
-
-    /// Drop the memoized metadata mentioning `id` — as the owning view, or as a
-    /// join source of another view's map (a dropped relation can be either).
-    /// Over-eviction is always safe: entries are recomputed on next touch.
-    pub(super) fn evict_meta(&mut self, id: i64) {
-        self.meta.remove(&id);
-        self.meta.retain(|_, m| !m.routes_source(id));
+        Ok(&self.views.get(&view_id).expect("memoized above").meta)
     }
 }
-
-#[cfg(test)]
-#[path = "tests/meta.rs"]
-mod tests;

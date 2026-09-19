@@ -1,8 +1,8 @@
-//! The tick schedule, the fan-out that feeds it, and the two drivers over it.
+//! The tick schedule and the one driver over it.
 
 use super::*;
 use crate::catalog::{CatalogEngine, ColumnDef};
-use crate::test_support::{col_def, make_batch, make_schema_u64_i64, register_identity_view, scratch_dir, sum_weights};
+use crate::test_support::{col_def, make_batch, register_identity_view, scratch_dir, sum_weights, try_register_view};
 use gnitz_store::relation::Relation;
 use gnitz_wire::type_code;
 
@@ -12,7 +12,7 @@ use gnitz_wire::type_code;
 struct NoExchange;
 
 impl ExchangeCallback for NoExchange {
-    fn do_exchange(&mut self, view_id: i64, _batch: &Batch, _source_id: i64) -> Batch {
+    fn do_exchange(&mut self, view_id: i64, _batch: Batch, _source_id: i64) -> Batch {
         panic!("view {view_id} relayed: these tests cover the non-exchanged path only");
     }
 }
@@ -70,60 +70,18 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     let (engine, base, a, b, deep) = engine_with_fanout("schedule");
     let step = |view, producer| Step { view, producer };
 
-    let (dag, registry) = (engine.dag(), engine.registry());
+    let dag = engine.dag();
     assert_eq!(
-        dag.tick_schedule(registry, base),
+        dag.tick_schedule(base),
         vec![step(a, base), step(b, base), step(deep, a)],
         "every edge of the closure, producers first",
     );
     assert_eq!(
-        dag.tick_schedule(registry, a),
+        dag.tick_schedule(a),
         vec![step(deep, a)],
         "a tick of an intermediate view runs only what it reaches",
     );
-    assert!(
-        dag.tick_schedule(registry, deep).is_empty(),
-        "a terminal view reaches nothing",
-    );
-}
-
-// ── Fan-out ─────────────────────────────────────────────────────────────────
-
-/// A producer's output reaches every step it feeds; a second round of the same
-/// producer unions into what the first left, rather than overwriting it.
-#[test]
-fn fan_out_reaches_every_consumer_and_a_second_round_merges() {
-    let schema = make_schema_u64_i64();
-    let mut inputs: Vec<Option<Batch>> = (0..3).map(|_| None).collect();
-
-    DagEngine::fan_out(&mut inputs, &[0, 2], make_batch(&schema, &[(1, 1, 10)]));
-    assert_eq!(inputs[0].as_ref().map(|b| b.len()), Some(1));
-    assert!(inputs[1].is_none(), "a step this producer does not feed stays empty");
-    assert_eq!(inputs[2].as_ref().map(|b| b.len()), Some(1));
-
-    // Second round: both slots already hold rows, so both take the union.
-    DagEngine::fan_out(&mut inputs, &[0, 2], make_batch(&schema, &[(2, 1, 20)]));
-    assert_eq!(inputs[0].as_ref().map(|b| b.len()), Some(2), "merged, not overwritten");
-    assert_eq!(inputs[2].as_ref().map(|b| b.len()), Some(2));
-}
-
-/// An empty round still deposits a batch — that is what keeps a downstream
-/// exchange running in lockstep on every worker — and it deposits it as a fill,
-/// so the next real round unions against rows rather than against a placeholder.
-#[test]
-fn an_empty_round_fills_rather_than_merges() {
-    let schema = make_schema_u64_i64();
-    let mut inputs: Vec<Option<Batch>> = vec![None];
-
-    DagEngine::fan_out(&mut inputs, &[0], Batch::empty_with_schema(&schema));
-    assert_eq!(
-        inputs[0].as_ref().map(|b| b.len()),
-        Some(0),
-        "the placeholder is queued"
-    );
-
-    DagEngine::fan_out(&mut inputs, &[0], make_batch(&schema, &[(1, 1, 10)]));
-    assert_eq!(inputs[0].as_ref().map(|b| b.len()), Some(1));
+    assert!(dag.tick_schedule(deep).is_empty(), "a terminal view reaches nothing");
 }
 
 // ── The drivers ─────────────────────────────────────────────────────────────
@@ -132,12 +90,13 @@ fn an_empty_round_fills_rather_than_merges() {
 /// plans: each view ingests what its own epoch produced, and a view over a view
 /// sees its producer's output rather than the base delta.
 #[test]
-fn evaluate_dag_drives_the_whole_closure() {
+fn a_tick_drives_the_whole_closure() {
     let (mut engine, base, a, b, deep) = engine_with_fanout("evaluate");
 
     let delta = delta_for(&engine, base, &[(1, 1, 10), (2, 1, 20)]);
     let (dag, registry) = engine.dag_and_registry_mut();
-    dag.evaluate_dag(registry, base, delta, 1, &mut NoExchange).unwrap();
+    dag.drive(registry, Drive::Tick { source: base, round: 1 }, delta, &mut NoExchange)
+        .unwrap();
 
     assert_eq!(live_weight(&engine, a), 2);
     assert_eq!(live_weight(&engine, b), 2);
@@ -158,25 +117,51 @@ fn an_empty_tick_produces_nothing() {
 
     let schema = engine.registry().relation(base).map(Relation::schema).unwrap();
     let (dag, registry) = engine.dag_and_registry_mut();
-    dag.evaluate_dag(registry, base, Batch::empty_with_schema(&schema), 1, &mut NoExchange)
+    let tick = Drive::Tick { source: base, round: 1 };
+    dag.drive(registry, tick, Batch::empty_with_schema(&schema), &mut NoExchange)
         .unwrap();
 
     assert_eq!(live_weight(&engine, a), 0);
 }
 
-/// The backfill driver runs the named view alone — not the source's closure,
-/// which would double-count into the dependents the source already populated —
-/// and reports whether the chunk produced rows.
+/// A view two producers feed runs one epoch per producer, and the view reading
+/// it sees the union of the two — not the last one alone.
+#[test]
+fn a_two_producer_view_feeds_its_reader_the_union() {
+    let (mut engine, base) = engine_with_base("two_producers");
+    let cols = view_cols();
+    let a = register_identity_view(&mut engine, base, "va", &cols);
+    let b = register_identity_view(&mut engine, base, "vb", &cols);
+    let mut circuit = gnitz_wire::Circuit::default();
+    let left = circuit.input_delta(a as u64, gnitz_wire::ReadBound::None);
+    let right = circuit.input_delta(b as u64, gnitz_wire::ReadBound::None);
+    let merged = circuit.union(left, right);
+    circuit.sink(merged);
+    let u = try_register_view(&mut engine, circuit, "vu", &cols, 0, 0).unwrap();
+    let d = register_identity_view(&mut engine, u, "vd", &cols);
+
+    let delta = delta_for(&engine, base, &[(1, 1, 10), (2, 1, 20)]);
+    let (dag, registry) = engine.dag_and_registry_mut();
+    dag.drive(registry, Drive::Tick { source: base, round: 1 }, delta, &mut NoExchange)
+        .unwrap();
+
+    assert_eq!(live_weight(&engine, u), 4, "both producers' epochs land");
+    assert_eq!(live_weight(&engine, d), 4, "its reader sees both, once each");
+}
+
+/// A backfill drive runs the named view alone — not the source's closure, which
+/// would double-count into the dependents the source already populated.
 #[test]
 fn backfill_chunk_runs_only_the_named_view() {
     let (mut engine, base) = engine_with_base("backfill");
     let cols = view_cols();
     let a = register_identity_view(&mut engine, base, "va", &cols);
     let b = register_identity_view(&mut engine, base, "vb", &cols);
+    let backfill = |view| Drive::Backfill { view, source: base };
 
     let chunk = delta_for(&engine, base, &[(1, 1, 10)]);
     let (dag, registry) = engine.dag_and_registry_mut();
-    assert!(dag.backfill_chunk(registry, a, base, chunk, &mut NoExchange).unwrap());
+    dag.drive(registry, backfill(a), chunk, &mut NoExchange).unwrap();
     assert_eq!(live_weight(&engine, a), 1);
     assert_eq!(
         live_weight(&engine, b),
@@ -186,28 +171,24 @@ fn backfill_chunk_runs_only_the_named_view() {
 
     let empty = Batch::empty_with_schema(&engine.registry().relation(base).map(Relation::schema).unwrap());
     let (dag, registry) = engine.dag_and_registry_mut();
-    assert!(
-        !dag.backfill_chunk(registry, a, base, empty, &mut NoExchange).unwrap(),
-        "a chunk producing no rows reports none",
-    );
+    dag.drive(registry, backfill(a), empty, &mut NoExchange).unwrap();
+    assert_eq!(live_weight(&engine, a), 1, "a chunk with no rows adds none");
 
-    // An unregistered view is not a driver error; it is a relation that went away.
+    // A view the registry no longer holds is a fail-stop, not a silent skip.
     let (dag, registry) = engine.dag_and_registry_mut();
     let empty = Batch::empty_with_schema(&registry.relation(base).map(Relation::schema).unwrap());
-    assert!(!dag
-        .backfill_chunk(registry, 999_999, base, empty, &mut NoExchange)
-        .unwrap());
+    assert!(dag.drive(registry, backfill(999_999), empty, &mut NoExchange).is_err());
 }
 
 // ── The relay's single-sourcing ─────────────────────────────────────────────
 
-/// Records the row count of every batch a relay sends.
+/// Records the row count of every batch a relay sends, and relays it back.
 struct Recorder(Vec<usize>);
 
 impl ExchangeCallback for Recorder {
-    fn do_exchange(&mut self, _view_id: i64, batch: &Batch, _source_id: i64) -> Batch {
+    fn do_exchange(&mut self, _view_id: i64, batch: Batch, _source_id: i64) -> Batch {
         self.0.push(batch.len());
-        batch.clone_batch()
+        batch
     }
 }
 
@@ -237,16 +218,11 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
         let delta = delta_for(&engine, replicated, &[(1, 1, 10), (2, 1, 20)]);
         let registry = engine.registry();
         let mut sent = Recorder(Vec::new());
-        let mut relay = Relay {
-            exchange: &mut sent,
-            registry,
-            view_id: 99,
-            elide: false,
-            rank_zero: registry.slot().rank == 0,
-        };
-        relay.send(&delta, replicated);
-        relay.send(&delta, keyed);
-        relay.round(delta.clone_batch(), RelayKey::OWN_SHARD);
+        // One relay per source: muting is bound at construction.
+        Relay::new(&mut sent, registry, 99, replicated, false).send(delta.clone_batch(), replicated, true);
+        Relay::new(&mut sent, registry, 99, keyed, false).send(delta.clone_batch(), keyed, true);
+        // A single-side round is not single-sourced, so it is sent by every rank.
+        Relay::new(&mut sent, registry, 99, replicated, false).round(delta, false);
 
         let replicated_rows = if rank == 0 { 2 } else { 0 };
         assert_eq!(sent.0, vec![replicated_rows, 2, 2], "rank {rank}");

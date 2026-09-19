@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
-use crate::query::{DagEngine, ExchangeCallback};
+use crate::query::{DagEngine, Drive, ExchangeCallback};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
@@ -109,7 +109,7 @@ struct RelayHit {
 }
 
 struct WorkerExchangeHandler {
-    /// [`InEval::DeferPreAck`]: drained inside `evaluate_dag`, so a catalog
+    /// [`InEval::DeferPreAck`]: drained inside `drive_dag`, so a catalog
     /// mutation lands before the ACK that implies it.
     deferred: Vec<Request>,
     /// [`InEval::DeferPostAck`]: drained at top level, so a replayed tick cannot
@@ -127,42 +127,25 @@ struct WorkerExchangeHandler {
     pending_relays: HashMap<(i64, i64), (Batch, BackfillDecision)>,
 }
 
-/// Bridges the DAG's `ExchangeCallback` requirement to `WorkerProcess` for a
-/// maintenance tick. Holds a mutable reference to the worker so `do_exchange`
-/// can re-enter the worker's handlers (`handle_push`, `handle_flush_all`)
-/// inline when those messages arrive mid-wait.
-///
-/// A tick issues no pad bit and reads no backfill decision — it has no field to
-/// record one in, which is what keeps the collective-termination protocol to
-/// the backfill path.
-struct TickExchangeCtx<'a> {
+/// Bridges the DAG's `ExchangeCallback` requirement to `WorkerProcess`. Holds a
+/// mutable reference to the worker so `do_exchange` can re-enter the worker's
+/// handlers (`handle_push`, `handle_flush_all`) inline when those messages
+/// arrive mid-wait.
+struct DagExchangeCtx<'a> {
     worker: &'a mut WorkerProcess,
-}
-
-impl ExchangeCallback for TickExchangeCtx<'_> {
-    fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch {
-        let (batch, _) = self.worker.do_exchange_wait(view_id, batch, source_id, false);
-        batch
-    }
-}
-
-/// [`TickExchangeCtx`] for one chunk of a distributed backfill: it stamps the
-/// chunk's pad bit onto every exchange it issues, and records the decision the
-/// master stamps back.
-struct BackfillExchangeCtx<'a> {
-    worker: &'a mut WorkerProcess,
-    /// Whether this worker's source partition is already drained, so this
-    /// chunk's rounds are empty pads. The master ANDs it across workers.
+    /// This worker's source partition is already drained, so its rounds are
+    /// empty pads. The master ANDs it across workers. Only a backfill pads.
     pad: bool,
-    /// The chunk's collective verdict, `None` exactly when the chunk issued no
-    /// exchange — a view with no barrier, which `handle_backfill` terminates on
-    /// local drain exhaustion instead. Every round of a chunk yields the same
-    /// verdict, so writing it per round is a restatement, not a race.
+    /// The drive's collective verdict, `None` exactly when it issued no exchange
+    /// — a view with no barrier, which `handle_backfill` terminates on local
+    /// drain exhaustion instead. Every round yields the same verdict, so writing
+    /// it per round is a restatement, not a race. The master stamps `Stop` and
+    /// `Checkpoint` onto a backfill round alone, so a tick's is always `Continue`.
     verdict: Option<BackfillDecision>,
 }
 
-impl ExchangeCallback for BackfillExchangeCtx<'_> {
-    fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch {
+impl ExchangeCallback for DagExchangeCtx<'_> {
+    fn do_exchange(&mut self, view_id: i64, batch: Batch, source_id: i64) -> Batch {
         let (batch, decision) = self.worker.do_exchange_wait(view_id, batch, source_id, self.pad);
         // The master writes the next round at cursor 0 of a new epoch. Not the
         // flush path: its ACK would read as this worker's terminal ACK.
@@ -642,7 +625,7 @@ impl WorkerProcess {
             let schema = self.cat().registry().relation_or_err(target_id)?.schema();
             Batch::empty_with_schema(&schema)
         };
-        self.evaluate_dag(target_id, delta, round);
+        self.drive_dag(Drive::Tick { source: target_id, round }, delta, false);
         Ok(())
     }
 
@@ -695,7 +678,7 @@ impl WorkerProcess {
     /// A view that runs NO exchange has no barrier: no relay arrives, the slot
     /// stays `None`, and the worker self-terminates on local drain exhaustion.
     ///
-    /// **View-scoped.** Drives ONLY `view_id` (`backfill_chunk`), never the
+    /// **View-scoped.** Drives ONLY `view_id` ([`Drive::Backfill`]), never the
     /// source's whole dependent closure: the source may already have populated
     /// dependents (live CREATE VIEW over a source with prior views; recovery
     /// step-4 rebuild next to resumed siblings) that a closure re-drive would
@@ -717,14 +700,13 @@ impl WorkerProcess {
         // Compiled before the first chunk: a failure here is an error reply, where the
         // same failure inside a chunk's epoch is a fatal abort mid-round.
         let (dag, registry) = self.cat().dag_and_registry_mut();
-        dag.ensure_compiled(registry, view_id)?;
+        dag.compile_view(registry, view_id)?;
         let chunk_rows = self.cat().registry().scan_chunk_rows();
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
         // the source has diverged from the catalog.
         let schema = self.cat().registry().relation_or_err(source_tid)?.schema();
         let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
-        let mut produced_any = false;
 
         loop {
             // `None` ⇒ partition exhausted: this round is an empty PAD. The
@@ -733,8 +715,7 @@ impl WorkerProcess {
             let drained = handle.drain_chunk(chunk_rows);
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-            let (produced, signal) = self.backfill_chunk(view_id, source_tid, chunk, pad);
-            produced_any |= produced;
+            let signal = self.drive_dag(Drive::Backfill { view: view_id, source: source_tid }, chunk, pad);
             // Stop on the master's collective verdict, or — with no barrier,
             // hence no verdict — on local drain exhaustion.
             if signal == Some(BackfillDecision::Stop) || (signal.is_none() && pad) {
@@ -742,50 +723,16 @@ impl WorkerProcess {
             }
         }
 
-        // `produced_any` is false for a join's first source, which only fills its
-        // trace. A spill fault leaves the view store unbounded, so the process
-        // cannot continue; the watchdog turns this into a cluster abort.
+        // A spill fault leaves the view store unbounded, so the process cannot
+        // continue; the watchdog turns this into a cluster abort.
         let (dag, registry) = self.cat().dag_and_registry_mut();
-        if let Err(e) = dag.finish_backfill(registry, view_id, produced_any) {
+        if let Err(e) = dag.finish_backfill(registry, view_id) {
             gnitz_fatal_abort!(
                 "worker: {} — view state cannot be bounded; aborting for restart+re-derive",
                 e,
             );
         }
         Ok(())
-    }
-
-    /// View-scoped backfill of one chunk: run only `view_id`'s epoch over a
-    /// chunk of `source_id` (through the exchange ctx, so its scatter/relay
-    /// round runs across the worker barrier) and ingest the output. `pad` says
-    /// this worker's partition is already drained. Returns whether the view
-    /// produced rows, plus [`BackfillExchangeCtx::verdict`]. The worker analogue
-    /// of `evaluate_dag`, for a single view rather than the whole closure.
-    fn backfill_chunk(
-        &mut self,
-        view_id: i64,
-        source_id: i64,
-        delta: Batch,
-        pad: bool,
-    ) -> (bool, Option<BackfillDecision>) {
-        let (dag, reg) = self.cat().dag_and_registry_mut();
-        let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
-        let mut ctx = BackfillExchangeCtx { worker: self, pad, verdict: None };
-        let produced = unsafe { &mut *dag }.backfill_chunk(unsafe { &mut *reg }, view_id, source_id, delta, &mut ctx);
-        let verdict = ctx.verdict;
-        // Apply DDL_SYNC messages deferred during exchange waits (mirrors
-        // `evaluate_dag`).
-        self.dispatch_deferred();
-        match produced {
-            Ok(p) => (p, verdict),
-            Err(e) => gnitz_fatal_abort!(
-                "worker: backfill ingest failed (view_id={}, source_id={}): {} — \
-                 aborting for restart+re-derive",
-                view_id,
-                source_id,
-                e,
-            ),
-        }
     }
 
     /// CREATE UNIQUE INDEX pre-flight, worker side: project every
@@ -984,28 +931,27 @@ impl WorkerProcess {
         self.cat().flush_base_round()
     }
 
-    /// Run multi-worker DAG evaluation with the exchange context. `tick_round` is
-    /// the round the triggering group carried, which stamps every fed view's
-    /// captured delta.
-    fn evaluate_dag(&mut self, source_id: i64, delta: Batch, tick_round: u64) {
+    /// Run one DAG drive with the exchange context, returning the collective
+    /// backfill verdict its rounds carried. `pad` marks this worker's source
+    /// partition already drained, which only a backfill chunk sets.
+    fn drive_dag(&mut self, what: Drive, delta: Batch, pad: bool) -> Option<BackfillDecision> {
         let (dag, reg) = self.cat().dag_and_registry_mut();
         let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
-        let mut ctx = TickExchangeCtx { worker: self };
-        let res = unsafe { &mut *dag }.evaluate_dag(unsafe { &mut *reg }, source_id, delta, tick_round, &mut ctx);
-        // Apply DDL_SYNC messages deferred during exchange waits.
+        let mut ctx = DagExchangeCtx { worker: self, pad, verdict: None };
+        let res = unsafe { &mut *dag }.drive(unsafe { &mut *reg }, what, delta, &mut ctx);
+        let verdict = ctx.verdict;
+        // DDL_SYNC messages deferred during exchange waits land before the ACK.
         self.dispatch_deferred();
-        // The whole tick path funnels through the call above, so this is the one
-        // site that answers a storage fault during view maintenance. Restart
-        // re-derives every view from its durable base tables.
+        // The one site that answers a storage fault during view maintenance:
+        // restart re-derives every view from its durable base tables.
         if let Err(e) = res {
             gnitz_fatal_abort!(
-                "worker: view-maintenance tick failed (source_id={}, round={}): {} — \
-                 aborting for restart+re-derive",
-                source_id,
-                tick_round,
+                "worker: view maintenance failed ({:?}): {} — aborting for restart+re-derive",
+                what,
                 e,
             );
         }
+        verdict
     }
 
     /// Publish and exit. The publish is not optional — a mid-backfill

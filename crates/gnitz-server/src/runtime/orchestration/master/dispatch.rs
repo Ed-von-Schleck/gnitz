@@ -389,20 +389,10 @@ impl MasterDispatcher {
         };
 
         let (dag, registry) = cat.dag_and_registry_mut();
-        let Some(meta) = dag.view_meta(registry, view_id) else {
-            return Err(format!(
-                "view {view_id}: circuit unreadable or unroutable; source {source_id}'s delta has no \
-                 scatter key"
-            ));
-        };
-        let route = meta.relay_route(source_id);
-        let dest = match route {
-            RelayRoute::NoSingleKey => {
-                return Err(format!(
-                    "view {view_id}: source {source_id} feeds several distinct reindex keys; no single \
-                     scatter key co-partitions it"
-                ))
-            }
+        let meta = dag
+            .view_meta(registry, view_id)
+            .map_err(|e| format!("view {view_id}: {e}"))?;
+        let dest = match meta.relay_route(source_id) {
             RelayRoute::Broadcast => Ok(vec![op_relay_broadcast(&sources, &schema)]),
             RelayRoute::GroupKey(cols) => scatter(ScatterSpec::GroupKey(cols)),
             RelayRoute::JoinKey(slots) => scatter(ScatterSpec::JoinKey(slots)),

@@ -222,7 +222,7 @@ impl CatalogEngine {
     pub(crate) fn flush_ephemeral_round(&mut self) -> Result<(), String> {
         let generation = self.registry.resume_generation();
         let CatalogEngine { registry, dag, .. } = self;
-        let state = dag.collect_ephemeral_state(registry);
+        let state = dag.collect_ephemeral_state();
         registry
             .checkpoint_ephemeral(generation, state)
             .map_err(|e| e.to_string())
@@ -234,7 +234,7 @@ impl CatalogEngine {
     /// order — which is why the two live together.
     pub(crate) fn unlink_derived_manifests(&mut self) {
         let CatalogEngine { registry, dag, .. } = self;
-        let state = dag.collect_ephemeral_state(registry);
+        let state = dag.collect_ephemeral_state();
         registry.unlink_ephemeral_manifests(state);
     }
 

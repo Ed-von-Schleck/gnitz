@@ -14,7 +14,7 @@ use gnitz_wire::ViewProps;
 
 /// One epoch seeding a single input register — production seeds through
 /// `execute_epoch_multi` directly, with one entry per exchange side.
-fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Option<Batch>, StorageError> {
+fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Batch, StorageError> {
     execute_epoch_multi(vm, std::iter::once((DeltaReg(input_reg), input)))
 }
 
@@ -172,19 +172,19 @@ fn test_filter_negate_pipeline() {
 
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 1, -5), (3, 1, 20)]);
     let mut vm = builder.build(vec![RegisterMeta::delta(schema); 3], DeltaReg(2));
-    let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
+    let result = execute_epoch(&mut vm, input, 0).unwrap();
 
     assert_eq!(extract_rows(&result), vec![(1, -1, 10), (3, -1, 20)]);
 }
 
-/// An epoch whose input consolidated to nothing produces no output batch at all
-/// — ghost elimination reaches the VM's own epilogue, not just the operators.
+/// An epoch whose input consolidated to nothing produces no rows at all —
+/// ghost elimination reaches the VM's own epilogue, not just the operators.
 #[test]
 fn test_empty_input() {
     let schema = make_schema_u128_i64();
     let mut vm = union_program(schema);
     let result = execute_epoch(&mut vm, make_batch_u128(&schema, &[]), 0);
-    assert!(result.unwrap().is_none());
+    assert!(result.unwrap().is_empty());
 }
 
 #[test]
@@ -195,9 +195,7 @@ fn test_union_operator() {
     let input_b = make_batch_u128(&schema, &[(3, 1, 30)]);
 
     let mut vm = union_program(schema);
-    let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), input), (DeltaReg(2), input_b)])
-        .unwrap()
-        .unwrap();
+    let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), input), (DeltaReg(2), input_b)]).unwrap();
 
     assert_eq!(result.len(), 3);
 }
@@ -216,8 +214,7 @@ fn a_union_with_an_empty_left_operand_returns_the_right_one() {
         &mut vm,
         [(DeltaReg(0), make_batch_u128(&schema, &[])), (DeltaReg(2), input_b)],
     )
-    .unwrap()
-    .expect("the right operand is the whole output");
+    .unwrap();
 
     assert_eq!(extract_rows(&result), vec![(3, 2, 30), (4, -1, 40)]);
     assert_eq!(
@@ -261,9 +258,7 @@ fn test_union_runs_under_the_merged_output_schema() {
         RegisterMeta::delta(schema_b),
     ];
     let mut vm = builder.build(reg_meta, DeltaReg(1));
-    let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), left), (DeltaReg(2), right)])
-        .unwrap()
-        .unwrap();
+    let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), left), (DeltaReg(2), right)]).unwrap();
 
     assert_eq!(result.len(), 2, "Z-Set + keeps both rows");
     assert!(
@@ -297,7 +292,7 @@ fn test_union_identity_path_output_carries_out_register_schema() {
         RegisterMeta::delta(schema_b),
     ];
     let mut vm = builder.build(reg_meta, DeltaReg(1));
-    let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), left)]).unwrap().unwrap();
+    let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), left)]).unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(
         *result.schema(),
@@ -320,7 +315,7 @@ fn test_self_union_doubles_weights() {
     });
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]);
     let mut vm = builder.build(vec![RegisterMeta::delta(schema); 2], DeltaReg(1));
-    let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
+    let result = execute_epoch(&mut vm, input, 0).unwrap();
     assert_eq!(
         extract_rows(&result),
         vec![(1, 2, 10), (2, 6, 20)],
@@ -353,9 +348,7 @@ fn a_non_consuming_union_leaves_its_operand_readable() {
 
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]);
     let mut vm = builder.build(vec![RegisterMeta::delta(schema); 4], DeltaReg(3));
-    let result = execute_epoch(&mut vm, input, 0)
-        .unwrap()
-        .expect("the trailing reader must still see the union's operand");
+    let result = execute_epoch(&mut vm, input, 0).unwrap();
     assert_eq!(extract_rows(&result), vec![(1, -1, 10), (2, -3, 20)]);
 }
 
@@ -366,15 +359,11 @@ fn test_input_consolidation() {
     let schema = make_schema_u128_i64();
 
     let mut vm = union_program(schema);
-    let result = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10), (2, 1, 20)]), 0)
-        .unwrap()
-        .unwrap();
+    let result = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10), (2, 1, 20)]), 0).unwrap();
     assert_eq!(extract_rows(&result), vec![(1, 1, 10), (2, 1, 20)]);
 
     let mut vm = union_program(schema);
-    let result = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 5, 42)]), 0)
-        .unwrap()
-        .unwrap();
+    let result = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 5, 42)]), 0).unwrap();
     assert_eq!(extract_rows(&result), vec![(1, 5, 42)]);
 }
 
@@ -384,14 +373,10 @@ fn test_delta_isolation_across_ticks() {
     let schema = make_schema_u128_i64();
     let mut vm = union_program(schema);
 
-    let r1 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0)
-        .unwrap()
-        .unwrap();
+    let r1 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0).unwrap();
     assert_eq!(r1.len(), 1);
 
-    let r2 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(2, 1, 20), (3, 1, 30)]), 0)
-        .unwrap()
-        .unwrap();
+    let r2 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(2, 1, 20), (3, 1, 30)]), 0).unwrap();
     // Exactly tick 2's two rows, not three: no bleed from tick 1.
     assert_eq!(extract_rows(&r2), vec![(2, 1, 20), (3, 1, 30)]);
 }
@@ -421,7 +406,7 @@ fn test_map_operator() {
     let input = make_batch_2col(in_schema, &[(1, 1, 10, 100), (2, 1, 20, 200)]);
     let reg_meta = vec![RegisterMeta::delta(in_schema), RegisterMeta::delta(out_schema)];
     let mut vm = builder.build(reg_meta, DeltaReg(1));
-    let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
+    let result = execute_epoch(&mut vm, input, 0).unwrap();
 
     // The projected column is the second payload col (100, 200).
     assert_eq!(extract_rows(&result), vec![(1, 1, 100), (2, 1, 200)]);
@@ -456,21 +441,17 @@ fn test_distinct_multi_tick() {
     let mut vm = builder.build(reg_meta, DeltaReg(2));
 
     // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
-    let r1 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 3, 42)]), 0)
-        .unwrap()
-        .unwrap();
+    let r1 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 3, 42)]), 0).unwrap();
     assert_eq!(extract_rows(&r1), vec![(1, 1, 42)], "clamped to +1");
 
     // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
     // No boundary crossing → output should be empty.
     let r2 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, -1, 42)]), 0);
-    assert!(r2.unwrap().is_none(), "no boundary crossing: output should be empty");
+    assert!(r2.unwrap().is_empty(), "no boundary crossing: output should be empty");
 
     // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
     // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
-    let r3 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, -2, 42)]), 0)
-        .unwrap()
-        .unwrap();
+    let r3 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, -2, 42)]), 0).unwrap();
     assert_eq!(extract_rows(&r3), vec![(1, -1, 42)], "retraction");
 }
 
@@ -505,7 +486,7 @@ fn test_join_delta_trace() {
     let mut vm = builder.build(reg_meta, DeltaReg(2));
 
     let input = make_batch_u128(&left_schema, &[(10, 2, 50)]);
-    let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
+    let result = execute_epoch(&mut vm, input, 0).unwrap();
     assert_eq!(
         vm.regfile.batches[1].len(),
         0,
@@ -565,7 +546,7 @@ fn test_reduce_groups_by_a_payload_column() {
 
     // Both rows in group=1, values 10 and 20.
     let input = make_batch_2col(in_schema, &[(1, 1, 1, 10), (2, 1, 1, 20)]);
-    let r1 = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
+    let r1 = execute_epoch(&mut vm, input, 0).unwrap();
 
     assert_eq!(r1.len(), 1, "one group → one output row");
     let sum_val = i64::from_le_bytes(r1.col_data(1)[0..8].try_into().unwrap());
@@ -609,7 +590,7 @@ fn test_reduce_multi_agg() {
 
     // Three rows all with pk=1, vals 10, 20, 30.
     let input = make_batch_u128(&in_schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
-    let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
+    let result = execute_epoch(&mut vm, input, 0).unwrap();
 
     assert_eq!(result.len(), 1, "multi-agg should produce 1 group");
     let count_val = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
@@ -646,15 +627,13 @@ fn an_empty_epoch_mints_the_ground_row_once() {
         "the latch is derived from the finished reduce-plan pool",
     );
 
-    let first = execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
-        .unwrap()
-        .expect("the ground row");
-    assert_eq!(first.len(), 1);
+    let first = execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0).unwrap();
+    assert_eq!(first.len(), 1, "the ground row");
     assert!(!vm.pending_ground_row, "cleared before the pass, not after it");
     assert!(
         execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
             .unwrap()
-            .is_none(),
+            .is_empty(),
         "a second empty epoch has nothing left to mint",
     );
 }
@@ -680,7 +659,7 @@ fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
     assert!(!vm.pending_ground_row);
     assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
         .unwrap()
-        .is_none());
+        .is_empty());
 }
 
 /// Without a ground row an empty epoch produces nothing and runs no dispatch —
@@ -706,10 +685,8 @@ fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
     let mut vm = builder.build(vec![RegisterMeta::delta(schema); 3], DeltaReg(1));
     assert!(!vm.pending_ground_row);
 
-    let out = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0)
-        .unwrap()
-        .expect("one row through");
-    assert_eq!(out.len(), 1);
+    let out = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0).unwrap();
+    assert_eq!(out.len(), 1, "one row through");
     assert_eq!(
         vm.regfile.batches[2].len(),
         1,
@@ -718,7 +695,7 @@ fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
 
     assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&schema), 0)
         .unwrap()
-        .is_none());
+        .is_empty());
     assert!(
         vm.regfile.batches.iter().all(|b| b.is_empty()),
         "the skipped epoch still released the previous one's batches",

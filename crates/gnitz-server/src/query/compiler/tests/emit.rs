@@ -10,6 +10,10 @@ use std::collections::HashMap;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
 
+/// Every registry below is `Slot::SOLO`, so every plan here computes its whole
+/// result locally — what `build_plan`'s `self_contained` takes.
+const SELF_CONTAINED: bool = true;
+
 /// `ScanDelta(10) → mid → IntegrateSink`, planned up to `mid`: a guard test varies
 /// one field of `mid`.
 struct MidCircuit {
@@ -36,7 +40,7 @@ impl MidCircuit {
             &loaded,
             &subgraph_ordered(&loaded, 1),
             home(self.tmp.path().to_str().unwrap(), 1, [(10, self.in_schema)]).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[],
             1,
         )
@@ -115,7 +119,7 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
             &loaded,
             ordered,
             bare_home(1, [(10, pk_only_schema(&[type_code::U64]))]).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[],
             1,
         )
@@ -155,7 +159,7 @@ fn a_trace_register_reaching_a_delta_port_is_rejected() {
             &loaded,
             &loaded.ordered_where(|_| true),
             home(dir.path().to_str().unwrap(), 1, [(10, one)]).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[],
             2,
         )
@@ -191,7 +195,7 @@ fn a_plan_whose_output_is_an_integral_is_rejected() {
         &loaded,
         &loaded.ordered_where(|_| true),
         home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
+        SELF_CONTAINED,
         &[],
         1,
     );
@@ -232,7 +236,7 @@ fn a_global_aggregate_under_a_keyed_shard_is_rejected() {
             &loaded,
             &loaded.ordered_where(|n| n >= 2),
             home(dir.path().to_str().unwrap(), 1, [(10, schema)]).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[(1, schema)],
             3,
         )
@@ -363,7 +367,7 @@ fn plan_two_source_join(
             [(10, delta_schema), (11, trace_schema)],
         )
         .site(),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
+        SELF_CONTAINED,
         &[],
         3,
     )
@@ -394,7 +398,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
             &loaded,
             &loaded.ordered_where(|_| true),
             home(dir.path().to_str().unwrap(), 1, [(10, two_col), (11, two_col)]).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[],
             3,
         )
@@ -425,7 +429,7 @@ fn a_wide_pk_join_compiles() {
         &loaded,
         &subgraph_ordered(&loaded, 3),
         home(dir.path().to_str().unwrap(), 1, [(10, schema), (20, schema)]).site(),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
+        SELF_CONTAINED,
         &[],
         3
     )
@@ -454,7 +458,7 @@ fn a_failed_compile_removes_the_scratch_dirs_it_created() {
         &loaded,
         &subgraph_ordered(&loaded, 2),
         home(view_dir.to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
+        SELF_CONTAINED,
         &[],
         2,
     );
@@ -552,7 +556,7 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
             &loaded,
             &loaded.ordered_where(|_| true),
             home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[],
             distinct_id,
         )
@@ -586,7 +590,7 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
             &loaded,
             &loaded.ordered_where(|_| true),
             bare_home(1, [(10, two_col), (11, two_col)]).site(),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[],
             out,
         )
@@ -683,7 +687,7 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
             &loaded,
             &subgraph_ordered(&loaded, 2),
             site,
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            SELF_CONTAINED,
             &[],
             2,
         )),
