@@ -279,7 +279,7 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
         "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY, v BIGINT UNSIGNED NOT NULL, s TEXT NOT NULL) \
          WITH (replicated = true)",
     );
-    let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
 
     // Binary push, not `INSERT … VALUES`: the parse cost would dominate and this
     // test is about the read.

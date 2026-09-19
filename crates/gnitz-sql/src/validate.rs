@@ -77,7 +77,7 @@ pub(crate) fn reject_duplicate_projection_names<'a>(
 
 /// The first name `names` repeats, folded case-insensitively as SQL identifiers
 /// are, and returned as the user spelled it at the repeat.
-fn first_duplicate<'a>(names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+pub(crate) fn first_duplicate<'a>(names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     names.into_iter().find(|n| !seen.insert(n.to_ascii_lowercase()))
 }
@@ -208,14 +208,24 @@ pub(crate) enum ClassWant {
     BaseTableOrStream,
     /// Any view, bounded or fed included.
     View,
+    /// What an ad-hoc read may name: anything holding rows, so not a stream.
+    Readable,
 }
 
 impl ClassWant {
+    /// Each arm lists the wants that admit its class, so a new `RelClass` is a
+    /// compile error until its row is decided, and a new `ClassWant` admits
+    /// nothing until it is listed.
     fn accepts(self, class: RelClass) -> bool {
-        match self {
-            ClassWant::BaseTable => class == RelClass::Table,
-            ClassWant::BaseTableOrStream => !class.is_view(),
-            ClassWant::View => class.is_view(),
+        match class {
+            RelClass::Table => matches!(
+                self,
+                ClassWant::BaseTable | ClassWant::BaseTableOrStream | ClassWant::Readable
+            ),
+            RelClass::Stream => matches!(self, ClassWant::BaseTableOrStream),
+            RelClass::View | RelClass::BoundedView | RelClass::FedView => {
+                matches!(self, ClassWant::View | ClassWant::Readable)
+            }
         }
     }
 
@@ -225,6 +235,7 @@ impl ClassWant {
             ClassWant::BaseTable => "a base table",
             ClassWant::BaseTableOrStream => "a base table or a stream",
             ClassWant::View => "a view",
+            ClassWant::Readable => "a table or a view (a stream is read only inside a view body)",
         }
     }
 }

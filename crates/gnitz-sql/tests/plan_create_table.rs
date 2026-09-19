@@ -253,8 +253,8 @@ fn an_unhonoured_clause_or_fk_target_is_named() {
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES phantom(id))",
-            "Bind",
-            "does not exist",
+            "Exec",
+            "not found",
         ),
         (
             "CREATE TABLE t (id BIGINT PRIMARY KEY, r BIGINT REFERENCES st(id))",

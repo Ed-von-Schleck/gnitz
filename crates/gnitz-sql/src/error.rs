@@ -3,8 +3,9 @@ use std::fmt;
 #[derive(Debug)]
 pub enum GnitzSqlError {
     Parse(sqlparser::parser::ParserError),
-    /// The statement disagrees with a **catalog relation**: a name that does not
-    /// resolve, a value count against the schema, a nullability.
+    /// The statement disagrees with a **catalog relation**: a column name that
+    /// does not resolve, a value count against the schema, a nullability. A
+    /// relation that does not resolve is `Exec(NotFound)`.
     Bind(String),
     /// Two parts of the **statement** disagree, or a literal is out of range —
     /// no catalog decides it. A set-op column-count mismatch is `Plan`; an arity
@@ -111,11 +112,10 @@ pub(crate) fn derivation(construct: &str) -> GnitzSqlError {
     ))
 }
 
-/// The one "this relation is not there" rejection — a disagreement with the
-/// catalog, hence [`GnitzSqlError::Bind`]. The name is reported **raw**: someone
-/// who wrote `MyTable` must be told about `MyTable`, not its folded spelling.
-pub(crate) fn missing_relation(noun: &str, schema: &str, name: &str) -> GnitzSqlError {
-    GnitzSqlError::Bind(format!("{noun} '{schema}.{name}' does not exist"))
+/// A relation miss read from the statement's snapshot: the snapshot-side twin of
+/// `GnitzClient::resolve_relation`'s miss, so both report the same `ClientError`.
+pub(crate) fn missing_relation(schema: &str, name: &str) -> GnitzSqlError {
+    GnitzSqlError::Exec(gnitz_core::not_found("relation", schema, name))
 }
 
 /// [`unsupported_clause`] when `present`. A run of these reads as the table of

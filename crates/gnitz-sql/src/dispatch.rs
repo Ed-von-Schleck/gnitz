@@ -1,8 +1,7 @@
 //! Statement dispatch — the one module that reaches both the compile side
-//! (`ddl` and the `hir` view compiler) and the execute side (`dml`). Builds the
-//! per-statement `Binder` and routes a `Statement` to the matching handler.
+//! (`ddl` and the `hir` view compiler) and the execute side (`dml`). Routes a
+//! `Statement` to the matching handler.
 
-use crate::bind::Binder;
 use crate::error::reject_if;
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
@@ -89,7 +88,8 @@ pub(crate) fn plan_resolving<T>(
 /// a mirrored `SELECT` round-trip-free. Everything below the split is DDL, DML or
 /// transaction control, which only a connection can serve — and what stops one of
 /// those planning against a binding only as fresh as the last poll is the resolve
-/// its arm names, [`GnitzClient::resolve`].
+/// its handler uses, [`GnitzClient::resolve`] (directly or through
+/// `resolve_relation`).
 pub(crate) fn execute_statement(
     client: &mut GnitzClient,
     schema_name: &str,
@@ -111,10 +111,6 @@ pub(crate) fn execute_statement(
         }
         _ => {}
     }
-
-    // Only the write verbs below reach a binder: the read paths above bind inside
-    // the pure planner, against the statement's snapshot rather than a connection.
-    let binder = Binder::new(schema_name);
 
     match stmt {
         // Transaction control is a pure client-state-machine transition, so the
@@ -199,10 +195,10 @@ pub(crate) fn execute_statement(
             })?;
             crate::hir::execute_create_view(client, schema_name, plan)
         }
-        Statement::Insert(insert) => dml::execute_insert(client, insert, &binder),
-        Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci, &binder),
-        Statement::Update(update) => dml::execute_update(client, update, &binder),
-        Statement::Delete(del) => dml::execute_delete(client, del, &binder),
+        Statement::Insert(insert) => dml::execute_insert(client, schema_name, insert),
+        Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci),
+        Statement::Update(update) => dml::execute_update(client, schema_name, update),
+        Statement::Delete(del) => dml::execute_delete(client, schema_name, del),
         Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a),
         Statement::AlterView { name, query, columns, with_options } => {
             let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {

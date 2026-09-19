@@ -1021,7 +1021,7 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
     absent.insert(SN, "t", None);
     let e = err_of(read(&absent, "SELECT id FROM t"));
     assert!(
-        !matches!(e, GnitzSqlError::CatalogMiss(_)) && format!("{e}").contains("does not exist"),
+        !matches!(e, GnitzSqlError::CatalogMiss(_)) && format!("{e}").contains("not found"),
         "got {e:?}"
     );
 

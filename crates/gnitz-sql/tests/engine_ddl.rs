@@ -12,7 +12,7 @@ use gnitz_sql::SqlResult;
 /// `Some(is_unique)` of the single-column index on `table.col`, `None` when the
 /// column carries no index.
 fn unique_on(client: &mut GnitzClient, sn: &str, table: &str, col: &str) -> Option<bool> {
-    let (tid, schema) = client.resolve_table_id(sn, table).unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(sn, table).unwrap();
     let want = [col_idx(&schema, col) as u32];
     client
         .describe_by_id(tid)
@@ -126,7 +126,7 @@ fn pk_admission_matrix() {
     ];
     for &(sql, table, pk_indices, stride, tcs, names) in accepted {
         exec(&mut client, &sn, sql);
-        let s = client.resolve_table_id(&sn, table).unwrap().1;
+        let s = client.resolve_table_or_view_id(&sn, table).unwrap().1;
         assert_eq!(s.pk_cols, pk_indices, "{table}");
         assert_eq!(s.pk_stride(), stride, "{table}");
         for ((&pi, &tc), &name) in pk_indices.iter().zip(tcs).zip(names) {
@@ -192,7 +192,7 @@ fn fk_child_adopts_the_parent_pk_type() {
         &sn,
         "CREATE TABLE child (cid INT PRIMARY KEY, p_id INT REFERENCES parent(id))",
     );
-    let s = client.resolve_table_id(&sn, "child").unwrap().1;
+    let s = client.resolve_table_or_view_id(&sn, "child").unwrap().1;
     let fk = &s.columns[col_idx(&s, "p_id")];
     assert_eq!(fk.type_code, TypeCode::I64);
     assert!(matches!(fk.fk, Some(gnitz_core::FkTarget::Table { .. })));
@@ -279,7 +279,7 @@ fn inline_unique_matrix() {
         assert_rejects_variant(&mut client, &sn, sql, variant, needle);
     }
     assert!(
-        client.resolve_table_id(&sn, "ux").is_err(),
+        client.resolve_table_or_view_id(&sn, "ux").is_err(),
         "a rejected table is not created"
     );
 }
@@ -298,7 +298,23 @@ fn relation_names_are_case_insensitive() {
         "already exists",
     );
     exec(&mut client, &sn, "DROP TABLE fOO");
-    assert!(client.resolve_table_id(&sn, "foo").is_err());
+    assert!(client.resolve_table_or_view_id(&sn, "foo").is_err());
+}
+
+/// Every SQL surface reports an absent relation as the one classified `NotFound`,
+/// naming the relation as the statement spelled it.
+#[test]
+fn an_absent_relation_is_one_not_found_everywhere() {
+    let (_srv, mut client, sn) = boot(1);
+    for (sql, name) in [
+        ("SELECT * FROM nope", "nope"),
+        ("SELECT * FROM NoPe", "NoPe"),
+        ("ALTER TABLE nope ADD COLUMN x BIGINT", "nope"),
+        ("INSERT INTO NoPe VALUES (1)", "NoPe"),
+        ("DROP TABLE NoPe", "NoPe"),
+    ] {
+        assert_rejects_variant(&mut client, &sn, sql, "Exec", &format!("{sn}.{name}"));
+    }
 }
 
 /// `__fk_` is reserved nowhere: an FK index has no name at all, so every
@@ -405,7 +421,7 @@ fn alter_results_and_if_exists_no_ops() {
     exec(&mut client, &sn, "CREATE VIEW vw AS SELECT id, v FROM t WHERE v >= 20");
 
     assert_altered(&mut client, &sn, "ALTER TABLE t RENAME TO t2", "table", "t2");
-    assert_rejects_variant(&mut client, &sn, "SELECT * FROM t", "Bind", "does not exist");
+    assert_rejects_variant(&mut client, &sn, "SELECT * FROM t", "Exec", "not found");
     assert_eq!(
         view_rows(&mut client, &sn, "t2", &["id", "v"]),
         at_weight_one(&[vec![1, 10], vec![2, 20], vec![3, 30]])
@@ -591,7 +607,7 @@ fn alter_rejection_matrix() {
             "is a stream",
         ),
         ("ALTER TABLE t RENAME TO otherschema.t2", "Unsupported", "cross-schema"),
-        ("ALTER TABLE nope RENAME TO x", "Bind", "does not exist"),
+        ("ALTER TABLE nope RENAME TO x", "Exec", "not found"),
         // The new name is checked before the IF EXISTS no-op.
         (
             "ALTER TABLE IF EXISTS nope RENAME TO _x",
@@ -678,7 +694,7 @@ fn a_multi_name_drop_is_one_atomic_zone() {
 
     // `b` is read by a view, so its drop refuses — and `a` survives with it.
     assert_rejects_variant(&mut client, &sn, "DROP TABLE a, b", "Exec", "View dependency");
-    assert!(client.resolve_table_id(&sn, "a").is_ok(), "a is untouched");
+    assert!(client.resolve_table_or_view_id(&sn, "a").is_ok(), "a is untouched");
 
     // Two `-1`s on one catalog PK is not a retraction the engine accepts.
     assert_rejects_variant(&mut client, &sn, "DROP TABLE a, A", "Plan", "named more than once");
@@ -686,13 +702,13 @@ fn a_multi_name_drop_is_one_atomic_zone() {
     // A FK child co-dropped in the same batch is self-resolving, so the pair
     // drops in either written order.
     exec(&mut client, &sn, "DROP TABLE parent, child");
-    assert!(client.resolve_table_id(&sn, "parent").is_err());
-    assert!(client.resolve_table_id(&sn, "child").is_err());
+    assert!(client.resolve_table_or_view_id(&sn, "parent").is_err());
+    assert!(client.resolve_table_or_view_id(&sn, "child").is_err());
 
     exec(&mut client, &sn, "DROP VIEW keeper");
     exec(&mut client, &sn, "DROP TABLE a, b");
-    assert!(client.resolve_table_id(&sn, "a").is_err());
-    assert!(client.resolve_table_id(&sn, "b").is_err());
+    assert!(client.resolve_table_or_view_id(&sn, "a").is_err());
+    assert!(client.resolve_table_or_view_id(&sn, "b").is_err());
 }
 
 /// A qualifier naming the session schema is accepted; any other is a cross-schema

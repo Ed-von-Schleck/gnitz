@@ -5,7 +5,7 @@
 use crate::error::GnitzSqlError;
 use crate::hir::{plan_create_view, ViewPlan};
 use crate::test_support::{col_def, parse_stmt};
-use gnitz_core::{CatalogSnapshot, ColumnDef, RelClass, RelDescriptor, Schema, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColumnDef, PlannedView, RelClass, RelDescriptor, Schema, TypeCode};
 use std::sync::Arc;
 
 /// `t(id BIGINT PK, k BIGINT, a BIGINT, b BIGINT NULL, s TEXT, f DOUBLE)`,
@@ -22,7 +22,7 @@ fn catalog() -> CatalogSnapshot {
                 class,
                 replicated: false,
                 schema,
-                indexes: Arc::new(Vec::new()),
+                indexes: Vec::new(),
             })),
         );
     };
@@ -51,18 +51,19 @@ fn catalog() -> CatalogSnapshot {
 /// Plan `CREATE VIEW v AS <sql>`: the chain's segment count (the final view
 /// included) and the final view's output columns.
 fn plan(sql: &str) -> Result<(usize, Vec<ColumnDef>), GnitzSqlError> {
+    let (n, last) = plan_in(&catalog(), sql)?;
+    Ok((n, last.output_columns))
+}
+
+/// [`plan`] against `cat`, returning the final view whole.
+fn plan_in(cat: &CatalogSnapshot, sql: &str) -> Result<(usize, PlannedView), GnitzSqlError> {
     let sqlparser::ast::Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v AS {sql}")) else {
         panic!("not a CREATE VIEW");
     };
-    match plan_create_view(&cv, &catalog(), "public")? {
-        ViewPlan::Create { chain, .. } => {
-            let cols = chain
-                .views
-                .last()
-                .expect("a chain ends in the view")
-                .output_columns
-                .clone();
-            Ok((chain.views.len(), cols))
+    match plan_create_view(&cv, cat, "public")? {
+        ViewPlan::Create { mut chain, .. } => {
+            let n = chain.views.len();
+            Ok((n, chain.views.pop().expect("a chain ends in the view")))
         }
         ViewPlan::Skip { .. } => panic!("a free name is never skipped"),
     }
@@ -330,6 +331,35 @@ fn row_number_needs_a_unique_row_key() {
         "ROW_NUMBER needs an input with a unique row key",
     );
     plan("SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM (SELECT id, a, k FROM t) d").unwrap();
+}
+
+/// Only a hidden `_join_pk` is a minted pair key: a user may name a visible key
+/// column so, over a table or through a view's alias, and keeps its row key.
+#[test]
+fn a_user_named_join_pk_column_is_a_row_key() {
+    let mut cat = catalog();
+    let rel = |tid, class, columns, pk_cols| {
+        Some(Arc::new(RelDescriptor {
+            tid,
+            class,
+            replicated: false,
+            schema: Arc::new(Schema { columns, pk_cols }),
+            indexes: Vec::new(),
+        }))
+    };
+    let jt_cols = vec![
+        col_def("_join_pk", TypeCode::I64, false),
+        col_def("a", TypeCode::I64, false),
+    ];
+    cat.insert("public", "jt", rel(10, RelClass::Table, jt_cols, vec![0]));
+    plan_in(&cat, "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM jt").unwrap();
+
+    let (_, aliased) = plan_in(&cat, "SELECT id AS _join_pk, a FROM t").unwrap();
+    let pk = aliased.pk_cols.iter().map(|&i| &aliased.output_columns[i as usize]);
+    assert!(pk.clone().all(|c| !c.is_hidden) && pk.clone().any(|c| c.name == "_join_pk"));
+    let jv = rel(11, RelClass::View, aliased.output_columns, aliased.pk_cols);
+    cat.insert("public", "jv", jv);
+    plan_in(&cat, "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM jv").unwrap();
 }
 
 #[test]

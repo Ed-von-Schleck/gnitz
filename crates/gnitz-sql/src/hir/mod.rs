@@ -785,7 +785,7 @@ impl RelExpr {
                 let pk = &schema.pk_cols;
                 if pk
                     .iter()
-                    .any(|&i| guards::is_join_key_name(&schema.columns[i as usize].name))
+                    .any(|&i| guards::is_minted_join_key(&schema.columns[i as usize]))
                 {
                     return None;
                 }

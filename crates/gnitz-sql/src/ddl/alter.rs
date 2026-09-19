@@ -59,14 +59,13 @@ pub(crate) fn execute_alter_table(
         ));
     };
     let source_name = extract_object_name(&alter.name, schema_name, "ALTER TABLE")?;
-    validate_user_name(&source_name)?;
     let Alter { ctx, object, name, action } = parse(operation, schema_name)?;
 
     let Some(rel) = client.resolve(schema_name, &source_name)? else {
         return if alter.if_exists {
             Ok(altered(object, name))
         } else {
-            Err(missing_relation("table", schema_name, &source_name))
+            Err(missing_relation(schema_name, &source_name))
         };
     };
     // `RENAME TO` accepts a view too, as Postgres does: views bind sources by id
@@ -115,7 +114,6 @@ fn parse<'a>(operation: &'a AlterTableOperation, schema_name: &str) -> Result<Al
             // `RENAME TO` and (some dialects') `RENAME AS` both mean rename-to.
             let (RenameTableNameKind::To(target) | RenameTableNameKind::As(target)) = table_name;
             let new_name = extract_object_name(target, schema_name, "ALTER TABLE")?;
-            validate_user_name(&new_name)?;
             alter(CTX, "table", new_name, Action::RenameRelation)
         }
         AlterTableOperation::RenameColumn { old_column_name, new_column_name } => alter(

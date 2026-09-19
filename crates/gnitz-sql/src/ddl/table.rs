@@ -2,14 +2,14 @@
 //! and CREATE INDEX. The compile side's only non-view surface.
 
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
-use crate::bind::{find_unique_column, probe, Binder};
+use crate::bind::{find_unique_column, probe, probe_relation};
 use crate::error::GnitzSqlError;
 use crate::types::{serial_underlying, sql_col_type};
 use crate::validate::{
     canonical_user_name, kv_options, non_key_eligible_error, reject_column_overflow, reject_duplicate_names,
     reject_repeated_object, reject_unbuildable_index_key, reject_unhonored_column_options,
     reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses, reject_unhonored_table_constraints,
-    require_class, validate_user_name, ClassWant, ColumnOptionSite,
+    require_class, ClassWant, ColumnOptionSite,
 };
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineUniqueIndex, TableProps, TypeCode};
@@ -184,7 +184,7 @@ fn resolve_fk_target(
         return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, site);
     }
 
-    let ref_rel = crate::bind::probe_relation(cat, schema_name, &ref_table)?;
+    let ref_rel = probe_relation(cat, schema_name, &ref_table)?;
     let ref_schema = &ref_rel.schema;
     // The PK/UNIQUE tests below read only the schema, and both a view's and a
     // stream's PK look exactly like a base table's without being the unique, stored
@@ -501,7 +501,6 @@ pub fn plan_create_table(
 ) -> Result<TablePlan, GnitzSqlError> {
     reject_unhonored_create_table_clauses(create)?;
     let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?;
-    validate_user_name(&table_name)?;
 
     // The `WITH (…)` keys and values are decidable from the statement's own text.
     // `dist_prefix_len` is the other half of `props`, and needs CLUSTER BY.
@@ -683,15 +682,10 @@ pub(crate) fn execute_drop(
     for obj_name in names {
         // An index name is global, so a qualifier on one means nothing; a table
         // or view name is schema-scoped, and the active schema is the session's.
-        let name = match object_type {
+        targets.push(match object_type {
             ObjectType::Index => extract_index_name(obj_name, "DROP")?,
             _ => extract_object_name(obj_name, schema_name, "DROP")?,
-        };
-        // No user object can carry a leading `_`, so this keeps a synthesized hidden
-        // view undroppable by name — a clearer error than the engine's own refusal,
-        // which stays the backstop.
-        validate_user_name(&name)?;
-        targets.push(name);
+        });
     }
     reject_repeated_object(targets.iter().map(String::as_str), "DROP")?;
     let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
@@ -751,7 +745,6 @@ pub(crate) fn execute_create_index(
     client: &mut GnitzClient,
     schema_name: &str,
     ci: &sqlparser::ast::CreateIndex,
-    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_create_index_clauses(ci)?;
     let table_name = extract_object_name(&ci.table_name, schema_name, "CREATE INDEX")?;
@@ -761,7 +754,8 @@ pub(crate) fn execute_create_index(
         .map(|n| extract_index_name(n, "CREATE INDEX"))
         .transpose()?;
     // The one resolve on this path: `create_index_core` takes the descriptor.
-    let target = binder.resolve_base_table(client, &table_name, "CREATE INDEX")?;
+    let target = client.resolve_relation(schema_name, &table_name)?;
+    require_class(&target, &table_name, ClassWant::BaseTable, "CREATE INDEX")?;
     create_index_core(
         client,
         schema_name,

@@ -59,7 +59,7 @@ pub struct RelDescriptor {
     pub class: RelClass,
     pub replicated: bool,
     pub schema: Arc<Schema>,
-    pub indexes: Arc<Vec<gnitz_wire::RelIndex>>,
+    pub indexes: Vec<gnitz_wire::RelIndex>,
 }
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
@@ -990,7 +990,7 @@ fn resolve_descriptor(
         class: desc.class,
         replicated: desc.replicated,
         schema,
-        indexes: Arc::new(desc.indexes),
+        indexes: desc.indexes,
     })))
 }
 

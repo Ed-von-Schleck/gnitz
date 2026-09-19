@@ -24,7 +24,7 @@ use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
     reject_position_out_of_range, scalar_projection_item, FromShape,
 };
-use crate::bind::{bind_single_table, output_column, Binder};
+use crate::bind::{bind_single_table, output_column, probe_relation};
 use crate::dml::cte::inline_ctes;
 use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, rows_sink, Access, ReadBudget};
 use crate::error::{derivation, reject_if, GnitzSqlError};
@@ -36,7 +36,7 @@ use crate::ir::BoundExpr;
 use crate::tail::{extract_limit, extract_offset, order_exprs, parse_order_by, wire_keys, OrderTarget};
 use crate::validate::{
     as_plain_select, computed_column, reject_duplicate_projection_names, reject_unhonored_query_clauses,
-    reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
+    reject_unhonored_select_clauses, require_class, ClassWant, HonoredClauses, QueryEnvelope,
 };
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
@@ -165,14 +165,13 @@ pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
             ))
         }
     };
-    let binder = Binder::new(schema_name);
-    let flat = inline_ctes(cat, &binder, query)?;
-    plan_query(cat, flat.as_ref().unwrap_or(query), &binder)
+    let flat = inline_ctes(cat, schema_name, query)?;
+    plan_query(cat, flat.as_ref().unwrap_or(query), schema_name)
 }
 
 /// Validate an ad-hoc SELECT's shape, resolve the one relation it reads, and
 /// decide its access and sink.
-fn plan_query(cat: &CatalogSnapshot, query: &Query, binder: &Binder<'_>) -> Result<ReadPlan, GnitzSqlError> {
+fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result<ReadPlan, GnitzSqlError> {
     // ORDER BY / LIMIT / OFFSET are the client finish's; any other query clause is refused.
     reject_unhonored_query_clauses(query, QueryEnvelope::WithAndTail, "direct SELECT")?;
     let select = match query.body.as_ref() {
@@ -207,7 +206,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, binder: &Binder<'_>) -> Resu
         FromShape::SinglePlainRelation(f) => f,
         FromShape::Derived(construct) => return Err(derivation(construct)),
     };
-    let (name, alias) = extract_table_name_and_alias(factor, binder.schema_name(), "FROM")?;
+    let (name, alias) = extract_table_name_and_alias(factor, schema_name, "FROM")?;
     // DISTINCT wins the split: its fold does not group, so DISTINCT + GROUP BY keeps the
     // GROUP BY rejection.
     let distinct = select.distinct.is_some();
@@ -218,7 +217,8 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, binder: &Binder<'_>) -> Resu
         (false, false) => "direct SELECT",
     };
     reject_unhonored_select_clauses(select, HonoredClauses::for_body(fold, distinct), ctx)?;
-    let desc = binder.resolve(cat, &name)?;
+    let desc = probe_relation(cat, schema_name, &name)?;
+    require_class(&desc, &name, ClassWant::Readable, ctx)?;
     // WHERE → access before either sink's shape, so a query unsupported on both axes names
     // the same one whichever sink it lands on.
     let access = plan_access(&desc, &alias, select)?;

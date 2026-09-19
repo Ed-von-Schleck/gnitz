@@ -11,7 +11,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_ident, Constant, FromShape};
-use crate::bind::{bind_single_table, find_unique_column, Binder};
+use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::pack_num;
 use crate::dml::overlay::resolve_where_matches;
@@ -20,7 +20,7 @@ use crate::dml::rmw::commit_rmw_or_buffer;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::{BExpr, BoundExpr, NumLit};
-use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses};
+use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses, require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{Evaluator, ExprResults};
@@ -35,13 +35,13 @@ use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, Tabl
 
 pub(crate) fn execute_update(
     client: &mut GnitzClient,
+    schema_name: &str,
     update: &Update,
-    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_update_clauses(update)?;
     execute_mutation(
         client,
-        binder,
+        schema_name,
         "UPDATE",
         std::slice::from_ref(&update.table),
         update.selection.as_ref(),
@@ -51,19 +51,19 @@ pub(crate) fn execute_update(
 
 pub(crate) fn execute_delete(
     client: &mut GnitzClient,
+    schema_name: &str,
     del: &Delete,
-    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_delete_clauses(del)?;
     let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
-    execute_mutation(client, binder, "DELETE", from, del.selection.as_ref(), None)
+    execute_mutation(client, schema_name, "DELETE", from, del.selection.as_ref(), None)
 }
 
 /// A single-table UPDATE (`set` present) or DELETE: read the rows the WHERE
 /// matches, then write the rewritten rows or the retraction of their keys.
 fn execute_mutation(
     client: &mut GnitzClient,
-    binder: &Binder<'_>,
+    schema_name: &str,
     verb: &str,
     from: &[TableWithJoins],
     selection: Option<&Expr>,
@@ -76,8 +76,9 @@ fn execute_mutation(
             "{verb}: exactly one simple FROM table required"
         )));
     };
-    let (table_name, alias) = extract_table_name_and_alias(factor, binder.schema_name(), verb)?;
-    let target = binder.resolve_base_table(client, &table_name, verb)?;
+    let (table_name, alias) = extract_table_name_and_alias(factor, schema_name, verb)?;
+    let target = client.resolve_relation(schema_name, &table_name)?;
+    require_class(&target, &table_name, ClassWant::BaseTable, verb)?;
     let (tid, schema) = (target.tid, &target.schema);
     // Before the read, so a bad SET list errors whether or not a row matches.
     let set = set

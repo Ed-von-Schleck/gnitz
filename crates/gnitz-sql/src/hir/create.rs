@@ -2,13 +2,13 @@
 //! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) and then
 //! `bind_and_lower` of the body — into a `ViewChain` committed atomically.
 
-use crate::bind::{apply_positional_aliases, probe};
+use crate::bind::{apply_positional_aliases, probe, probe_relation};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::bind::ViewBody;
 use crate::hir::chain::ViewChain;
 use crate::validate::{
-    kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, require_class,
-    validate_user_name, ClassWant, QueryEnvelope,
+    kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, require_class, ClassWant,
+    QueryEnvelope,
 };
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, ViewProps};
@@ -89,7 +89,6 @@ pub struct PlannedChain {
 pub fn plan_create_view(cv: &CreateView, cat: &CatalogSnapshot, schema_name: &str) -> Result<ViewPlan, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
     let view_name = crate::ast_util::extract_object_name(&cv.name, schema_name, "CREATE VIEW")?;
-    validate_user_name(&view_name)?;
 
     // Each clause tests the name alone: a view's catalog rows hold its circuit, not its text.
     let replacing = if cv.if_not_exists {
@@ -134,7 +133,6 @@ pub fn plan_alter_view(
     // Only `CREATE OR REPLACE VIEW` states a view's options.
     reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
     let view_name = crate::ast_util::extract_object_name(name, schema_name, "ALTER VIEW")?;
-    validate_user_name(&view_name)?;
     let old_vid = resolve_view_id(cat, schema_name, &view_name)?;
     let view = ViewBody {
         stmt: "ALTER VIEW",
@@ -193,14 +191,14 @@ pub(crate) fn execute_alter_view(
 
 /// Resolve `name` to the id of a VIEW `ALTER VIEW … AS` may retarget.
 fn resolve_view_id(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Result<u64, GnitzSqlError> {
-    let rel =
-        probe(cat, schema_name, name)?.ok_or_else(|| crate::error::missing_relation("View", schema_name, name))?;
+    let rel = probe_relation(cat, schema_name, name)?;
     require_class(&rel, name, ClassWant::View, "ALTER VIEW")?;
     // `ALTER VIEW` states no options, so it would drop these.
     let option = match rel.class {
         RelClass::BoundedView => "a capacity-bounded view",
         RelClass::FedView => "a view with a delta feed",
-        _ => return Ok(rel.tid),
+        RelClass::View => return Ok(rel.tid),
+        RelClass::Table | RelClass::Stream => unreachable!("require_class admits views only"),
     };
     Err(GnitzSqlError::Unsupported(format!(
         "ALTER VIEW cannot retarget {option}; DROP and CREATE '{name}' instead"

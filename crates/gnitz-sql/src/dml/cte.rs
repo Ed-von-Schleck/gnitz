@@ -11,11 +11,11 @@ use crate::ast_util::{
     body_is_grouped, classify_from, col_ref_parts, expand_wildcard_item, expr_node_count, expr_operands_mut,
     extract_table_name_and_alias, is_bare_wildcard_projection, object_name_ident, scalar_projection_item, FromShape,
 };
-use crate::bind::{apply_positional_aliases, reject_foreign_qualifier, single_relation_col_idx, Binder};
+use crate::bind::{apply_positional_aliases, probe_relation, reject_foreign_qualifier, single_relation_col_idx};
 use crate::error::{derivation, unsupported_clause, GnitzSqlError};
 use crate::validate::{
     as_plain_select, computed_column_name, cte_body, non_recursive_ctes, reject_duplicate_projection_names,
-    reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
+    reject_unhonored_select_clauses, require_class, validate_user_name, ClassWant, HonoredClauses,
 };
 use gnitz_core::{CatalogSnapshot, ColumnDef, TypeCode};
 use sqlparser::ast::{
@@ -42,7 +42,7 @@ struct Cte {
 /// Expand `query`'s CTEs into its body. `None` when it has no `WITH`.
 pub(super) fn inline_ctes(
     cat: &CatalogSnapshot,
-    binder: &Binder<'_>,
+    schema_name: &str,
     query: &Query,
 ) -> Result<Option<Query>, GnitzSqlError> {
     let ctes = non_recursive_ctes(query)?;
@@ -60,11 +60,11 @@ pub(super) fn inline_ctes(
             return Err(derivation("grouped CTE"));
         }
         let mut body = body.clone();
-        expand(&macros, &mut body, None, binder.schema_name())?;
+        expand(&macros, &mut body, None, schema_name)?;
         let cols = if is_bare_wildcard_projection(&body.projection) && cte.alias.columns.is_empty() {
             None
         } else {
-            let mut cols = cte_columns(cat, binder, &body, &ctx)?;
+            let mut cols = cte_columns(cat, schema_name, &body, &ctx)?;
             apply_positional_aliases(
                 cte.alias.columns.iter().map(|a| &a.name),
                 cols.iter_mut().map(|(d, _)| d),
@@ -87,7 +87,7 @@ pub(super) fn inline_ctes(
     let mut flat = query.clone();
     flat.with = None;
     if let SetExpr::Select(sel) = flat.body.as_mut() {
-        expand(&macros, sel, flat.order_by.as_mut(), binder.schema_name())?;
+        expand(&macros, sel, flat.order_by.as_mut(), schema_name)?;
     }
     Ok(Some(flat))
 }
@@ -97,7 +97,7 @@ pub(super) fn inline_ctes(
 /// route would reject it.
 fn cte_columns(
     cat: &CatalogSnapshot,
-    binder: &Binder<'_>,
+    schema_name: &str,
     body: &Select,
     ctx: &str,
 ) -> Result<Vec<(ColumnDef, Expr)>, GnitzSqlError> {
@@ -116,8 +116,9 @@ fn cte_columns(
             FromShape::Empty => return Err(unsupported_clause(ctx, "SELECT * without FROM")),
             FromShape::Derived(c) => return Err(derivation(c)),
         };
-        let (table, _) = extract_table_name_and_alias(tf, binder.schema_name(), ctx)?;
-        let desc = binder.resolve(cat, &table)?;
+        let (table, _) = extract_table_name_and_alias(tf, schema_name, ctx)?;
+        let desc = probe_relation(cat, schema_name, &table)?;
+        require_class(&desc, &table, ClassWant::Readable, ctx)?;
         for (i, def) in expand_wildcard_item(o, &desc.schema.columns, ctx)? {
             cols.push((def, Expr::Identifier(Ident::new(desc.schema.columns[i].name.clone()))));
         }
@@ -263,25 +264,20 @@ fn item_for(name: &str, expr: Expr) -> SelectItem {
 /// Replace every reference to a macro column in `e` with the expression behind
 /// it; `alias` is what a written qualifier must name.
 fn subst(e: &mut Expr, m: &Cte, alias: &str) -> Result<(), GnitzSqlError> {
-    let is_col_ref = match e {
-        Expr::Identifier(_) => true,
-        Expr::CompoundIdentifier(p) => p.len() == 2,
-        _ => false,
-    };
-    if !is_col_ref {
+    let Some((qual, name)) = col_ref_parts(e) else {
         for o in expr_operands_mut(e) {
             subst(o, m, alias)?;
         }
         return Ok(());
-    }
+    };
     match &m.cols {
         // A bare-`*` macro exposes the source as it is, so the name stands and
         // only the qualifier is the macro's to check. The written qualifier is
         // dropped with it: the FROM is now the source, under its own name.
         None => {
-            let (qual, name) = col_ref_parts(e).expect("a column reference");
             reject_foreign_qualifier(qual, name, alias)?;
-            *e = Expr::Identifier(Ident::new(name.to_string()));
+            let bare = Expr::Identifier(Ident::new(name.to_string()));
+            *e = bare;
         }
         Some(cols) => {
             let i = single_relation_col_idx(cols.iter().map(|(d, _)| d), alias, e)?;

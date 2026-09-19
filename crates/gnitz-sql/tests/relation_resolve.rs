@@ -10,7 +10,6 @@
 //! stale under another client's DDL.
 
 use gnitz_core::GnitzClient;
-use std::sync::Arc;
 
 mod common;
 use common::*;
@@ -48,7 +47,7 @@ fn resolve_reports_found_absent_and_missing_schema() {
     let err = client.resolve_relation(&sn, "nope").unwrap_err();
     assert!(
         matches!(&err, gnitz_core::ClientError::NotFound { noun, name }
-            if *noun == "table or view" && name == &format!("{sn}.nope")),
+            if *noun == "relation" && name == &format!("{sn}.nope")),
         "got: {err:?}"
     );
 
@@ -57,10 +56,9 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert!(err.contains("not found"), "got: {err}");
 }
 
-/// A view resolves through the same path as a table and reports its class, while
-/// `resolve_table_id` — which answers only for a base table — must still miss on it.
+/// A view resolves through the same path as a table and reports its class.
 #[test]
-fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
+fn a_view_resolves_as_a_view() {
     let (_srv, mut client, sn) = boot(1);
     exec(&mut client, &sn, T_ID_V);
     exec(&mut client, &sn, "CREATE VIEW v AS SELECT id, v FROM t");
@@ -68,12 +66,6 @@ fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
     let rel = client.resolve_relation(&sn, "v").unwrap();
     assert_eq!(rel.class, gnitz_core::RelClass::View);
     assert_eq!(client.resolve(&sn, "v").unwrap().map(|d| d.tid), Some(rel.tid));
-
-    let err = client.resolve_table_id(&sn, "v").unwrap_err();
-    assert!(
-        matches!(&err, gnitz_core::ClientError::NotFound { noun, .. } if *noun == "table"),
-        "got: {err:?}"
-    );
 }
 
 /// A name longer than the PK-region head rides the request's explicit blob, so
@@ -89,7 +81,7 @@ fn a_long_relation_name_round_trips() {
         &sn,
         &format!("CREATE TABLE {long} (id BIGINT NOT NULL PRIMARY KEY)"),
     );
-    let (tid, schema) = client.resolve_table_id(&sn, &long).unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(&sn, &long).unwrap();
     assert!(tid >= gnitz_core::FIRST_USER_TABLE_ID);
     assert_eq!(schema.columns[0].name, "id");
 
@@ -111,7 +103,7 @@ fn descriptor_fields_round_trip() {
         "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, other BIGINT NOT NULL UNIQUE, gone BIGINT NOT NULL)",
     );
     exec(&mut client, &sn, "ALTER TABLE p DROP COLUMN gone");
-    let (p_tid, p) = client.resolve_table_id(&sn, "p").unwrap();
+    let (p_tid, p) = client.resolve_table_or_view_id(&sn, "p").unwrap();
     assert_eq!(p.columns.len(), 3, "the dropped column is still physically present");
     assert!(p.columns[2].is_hidden);
     assert!(!p.columns[1].is_hidden);
@@ -123,7 +115,7 @@ fn descriptor_fields_round_trip() {
          a BIGINT NOT NULL REFERENCES p(id), \
          b BIGINT NOT NULL REFERENCES p(other))",
     );
-    let (_, c) = client.resolve_table_id(&sn, "c").unwrap();
+    let (_, c) = client.resolve_table_or_view_id(&sn, "c").unwrap();
     assert!(c.columns[0].is_serial);
     assert!(!c.columns[1].is_serial);
     use gnitz_core::FkTarget;
@@ -142,24 +134,24 @@ fn the_index_list_is_exact_across_create_and_drop() {
         &sn,
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
     );
-    let (tid, _) = client.resolve_table_id(&sn, "t").unwrap();
+    let (tid, _) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     assert!(client.describe_by_id(tid).unwrap().indexes.is_empty(), "no index yet");
 
     exec(&mut client, &sn, "CREATE INDEX ix_ab ON t(a, b)");
-    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
+    let list = client.describe_by_id(tid).unwrap().indexes.clone();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].cols.as_slice(), &[1, 2], "the full declared column list");
     assert!(!list[0].is_unique);
 
     exec(&mut client, &sn, "CREATE UNIQUE INDEX ix_a ON t(a)");
-    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
+    let list = client.describe_by_id(tid).unwrap().indexes.clone();
     assert_eq!(
         list.iter().find(|m| m.cols.as_slice() == [1]).map(|m| m.is_unique),
         Some(true)
     );
 
     exec(&mut client, &sn, "DROP INDEX ix_ab");
-    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
+    let list = client.describe_by_id(tid).unwrap().indexes.clone();
     assert_eq!(list.len(), 1, "the dropped index is gone from the next resolve");
     assert_eq!(list[0].cols.as_slice(), &[1]);
 }
@@ -183,8 +175,8 @@ fn only_a_base_table_reports_its_replication() {
     );
     exec(&mut client, &sn, "CREATE VIEW rv AS SELECT id, v FROM r");
 
-    let (r_tid, _) = client.resolve_table_id(&sn, "r").unwrap();
-    let (plain_tid, _) = client.resolve_table_id(&sn, "plain").unwrap();
+    let (r_tid, _) = client.resolve_table_or_view_id(&sn, "r").unwrap();
+    let (plain_tid, _) = client.resolve_table_or_view_id(&sn, "plain").unwrap();
     let rv_tid = client.resolve_relation(&sn, "rv").unwrap().tid;
     let replicated = |c: &mut GnitzClient, tid: u64| c.describe_by_id(tid).unwrap().replicated;
 
@@ -227,7 +219,7 @@ fn an_unregistered_id_is_a_clean_miss() {
     let mut c2 = GnitzClient::connect(srv.sock_path()).unwrap();
     c2.create_schema("after").unwrap();
     exec(&mut c2, "after", "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)");
-    c2.resolve_table_id("after", "t").unwrap();
+    c2.resolve_table_or_view_id("after", "t").unwrap();
 }
 
 // ── Statement cost ───────────────────────────────────────────────────────
@@ -263,8 +255,8 @@ fn a_read_costs_two_requests() {
     }
 }
 
-/// A relation is resolved once per statement, on the success path and on the
-/// error ladder alike.
+/// A relation is resolved once per statement, on the success path and on a miss
+/// alike.
 #[test]
 fn one_statement_resolves_a_relation_once() {
     let (_srv, mut client, sn) = boot(1);
@@ -280,11 +272,11 @@ fn one_statement_resolves_a_relation_once() {
         "DROP COLUMN resolves once, seeks the stored row once, pushes once"
     );
 
-    // An absent INSERT target runs the two-probe error ladder — still one resolve.
+    // An absent INSERT target costs one resolve.
     let n = requests_for(&mut client, |c| {
         assert_rejects_variant(c, &sn, "INSERT INTO nope (id) VALUES (1)", "Exec", "nope");
     });
-    assert_eq!(n, 1, "the two-probe error ladder costs one resolve");
+    assert_eq!(n, 1, "an absent target costs one resolve");
 }
 
 /// `DROP SCHEMA` is one bundle whatever the member count: the SCHEMA_TAB probe,
@@ -329,13 +321,13 @@ fn a_second_client_sees_a_rename_then_recreate() {
         rows(&mut b, &sn, "SELECT id, v FROM t", &["id", "v"]),
         vec![vec![1, 100, 1]]
     );
-    let (old_tid, _) = b.resolve_table_id(&sn, "t").unwrap();
+    let (old_tid, _) = b.resolve_table_or_view_id(&sn, "t").unwrap();
 
     exec(&mut a, &sn, "ALTER TABLE t RENAME TO u");
     exec(&mut a, &sn, T_ID_V);
     exec(&mut a, &sn, "INSERT INTO t (id, v) VALUES (2, 200), (3, 300)");
 
-    let (new_tid, _) = b.resolve_table_id(&sn, "t").unwrap();
+    let (new_tid, _) = b.resolve_table_or_view_id(&sn, "t").unwrap();
     assert_ne!(new_tid, old_tid, "the name now binds a different relation");
     assert_eq!(
         rows(&mut b, &sn, "SELECT id, v FROM t", &["id", "v"]),
@@ -354,7 +346,7 @@ fn a_second_client_sees_a_rename_then_recreate() {
 }
 
 /// `ALTER COLUMN … DROP NOT NULL` on A, then a raw binary `push` on B through
-/// `resolve_table_id` + `push` — the surface with no SQL layer above it.
+/// `resolve_table_or_view_id` + `push` — the surface with no SQL layer above it.
 #[test]
 fn a_second_client_pushes_after_a_column_alter() {
     use gnitz_core::{BatchAppender, ZSetBatch};
@@ -362,14 +354,14 @@ fn a_second_client_pushes_after_a_column_alter() {
     let mut b = GnitzClient::connect(srv.sock_path()).unwrap();
 
     exec(&mut a, &sn, T_ID_V);
-    let (tid, schema) = b.resolve_table_id(&sn, "t").unwrap();
+    let (tid, schema) = b.resolve_table_or_view_id(&sn, "t").unwrap();
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch, &schema).add_row(1, 1).i64_val(10);
     b.push(tid, &schema, &batch).unwrap();
 
     exec(&mut a, &sn, "ALTER TABLE t ALTER COLUMN v DROP NOT NULL");
 
-    let (tid2, schema2) = b.resolve_table_id(&sn, "t").unwrap();
+    let (tid2, schema2) = b.resolve_table_or_view_id(&sn, "t").unwrap();
     assert_eq!(tid2, tid);
     assert!(schema2.columns[1].is_nullable, "B sees the relaxed column");
     let mut batch = ZSetBatch::new(&schema2);
@@ -398,7 +390,7 @@ fn a_second_client_pushes_after_a_column_alter() {
 fn a_recreated_schema_resolves_its_new_members() {
     let (_srv, mut client, sn) = boot(1);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)");
-    let (old_tid, _) = client.resolve_table_id(&sn, "t").unwrap();
+    let (old_tid, _) = client.resolve_table_or_view_id(&sn, "t").unwrap();
 
     client.drop_schema(&sn).unwrap();
     client.create_schema(&sn).unwrap();
@@ -408,7 +400,7 @@ fn a_recreated_schema_resolves_its_new_members() {
     );
 
     exec(&mut client, &sn, T_ID_V);
-    let (new_tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
+    let (new_tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     assert_ne!(new_tid, old_tid);
     assert_eq!(schema.columns.len(), 2);
 }

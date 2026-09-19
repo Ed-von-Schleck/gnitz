@@ -150,10 +150,13 @@ fn resolve_relation(cx: &mut BindCx<'_>, name: &str) -> Result<Rc<RelExpr>, Gnit
     }
     // Leaf rule: a bounded view's skeleton rows hydrate by replaying its sources,
     // which a view over it cannot reach.
-    if rel.class == RelClass::BoundedView {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "'{name}' is a capacity-bounded view; views cannot be created over it"
-        )));
+    match rel.class {
+        RelClass::BoundedView => {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "'{name}' is a capacity-bounded view; views cannot be created over it"
+            )))
+        }
+        RelClass::Table | RelClass::Stream | RelClass::View | RelClass::FedView => {}
     }
     Ok(RelExpr::get(cx.ids, rel))
 }
@@ -267,12 +270,12 @@ pub(crate) fn bind_body(cx: &mut BindCx<'_>, body: &SetExpr) -> Result<Rc<RelExp
 }
 
 /// Resolve one FROM table factor to `(source subtree, alias, output cols)`. A
-/// table/CTE name resolves via the binder to a base or segment `Get`; a derived
+/// table/CTE name resolves via `resolve_relation` to a base or segment `Get`; a derived
 /// table binds its subquery recursively to an **inline** subtree (never a
 /// segment — single-use and non-LATERAL, so uncorrelated) whose `AS d(col…)`
 /// aliases are applied to the returned cols (same `ColId`s, overridden names) the
 /// caller pushes into its scope/env. The subtree itself keeps its own names; a
-/// derived alias resolves through the caller's scope, never the binder cache.
+/// derived alias resolves through the caller's scope, never the catalog snapshot.
 fn resolve_table_factor(
     cx: &mut BindCx<'_>,
     factor: &TableFactor,
@@ -1150,8 +1153,7 @@ fn merge_pairs(
 
 /// The name-resolution scope of a FROM-join body: all in-scope (null-widened)
 /// `HirCol`s in relation order, plus each relation's alias (as written) and span.
-/// Resolves a qualified or unqualified reference to a `ColId`, raising the same
-/// not-found and ambiguity messages the single-relation binder does.
+/// Resolves a qualified or unqualified reference to a `ColId`.
 struct JoinScope {
     combined: Vec<HirCol>,
     /// The columns a `USING` / `NATURAL` step merged away. A `Vec` because it is

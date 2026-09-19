@@ -170,7 +170,7 @@ fn a_non_canonical_name_is_refused_for_every_family() {
     assert!(err.contains("not canonical"), "{err}");
 
     // The relation families take the same rule (minus the client's leading-`_`
-    // policy, which the engine must not apply — it writes `__h…` segments).
+    // policy, which the engine must not apply — the client writes `_seg…` segments).
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "guards"))]).unwrap();
     let tid = s.alloc_id().unwrap();
     let err = format!(

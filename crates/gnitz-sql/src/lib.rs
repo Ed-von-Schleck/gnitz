@@ -111,9 +111,7 @@ impl<'a> SqlPlanner<'a> {
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
             // The snapshot lives on the client whether the read is local or
-            // delegated: the planner's resolve loop fills it by name and the
-            // index / replication probes read it back by id, so a delegated read
-            // costs one RESOLVE rather than two.
+            // delegated: the planner's resolve loop fills it by name.
             self.client.begin_statement();
             let r = dispatch::execute_statement(self.client, &self.schema_name, stmt);
             self.client.end_statement();

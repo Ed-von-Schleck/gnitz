@@ -81,6 +81,11 @@ def test_an_absent_relation_is_a_miss_not_a_writability_failure(client, schema_n
     # Still a GnitzError, so an existing broad handler keeps working.
     assert isinstance(ei.value, gnitz.GnitzError)
 
+    # SQL reports the same class for a read and a write.
+    for sql in ("SELECT * FROM nope", "INSERT INTO nope VALUES (1)"):
+        with pytest.raises(gnitz.GnitzNotFoundError):
+            client.execute_sql(sql, schema_name=schema_name)
+
     with pytest.raises(gnitz.GnitzError):
         client.drop_schema("nonexistent_schema_xyz")
     with pytest.raises(gnitz.GnitzError):

@@ -63,7 +63,7 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
     client
         .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
         .unwrap();
-    let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
 
     let build = || {
         let mut batch = ZSetBatch::new(&schema);

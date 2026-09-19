@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use crate::ast_util::{bind_constant, extract_object_name, single_part_ident, Constant};
-use crate::bind::{bind_single_table, find_unique_column, Binder};
+use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::PkPlan;
 use crate::dml::mutate::{apply_set, bind_set_list, classify_set_rhs, Scope, SetCol, SetRhs};
@@ -129,12 +129,12 @@ fn insert_row_shape(columns: &[ObjectName], schema: &Schema) -> Result<RowShape,
 
 pub(crate) fn execute_insert(
     client: &mut GnitzClient,
+    schema_name: &str,
     insert: &Insert,
-    binder: &Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_insert_clauses(insert)?;
     let table_name_str = match &insert.table {
-        TableObject::TableName(obj_name) => extract_object_name(obj_name, binder.schema_name(), "INSERT")?,
+        TableObject::TableName(obj_name) => extract_object_name(obj_name, schema_name, "INSERT")?,
         _ => {
             return Err(GnitzSqlError::Unsupported(
                 "INSERT with table function not supported".to_string(),
@@ -147,7 +147,8 @@ pub(crate) fn execute_insert(
         .ok_or_else(|| GnitzSqlError::Unsupported("INSERT without VALUES not supported".to_string()))?;
     let rows = extract_values_rows(source)?;
 
-    let target = binder.resolve_push_target(client, &table_name_str)?;
+    let target = client.resolve_relation(schema_name, &table_name_str)?;
+    require_class(&target, &table_name_str, ClassWant::BaseTableOrStream, "INSERT")?;
     let (tid, schema) = (target.tid, &target.schema);
     let is_stream = target.class == RelClass::Stream;
 

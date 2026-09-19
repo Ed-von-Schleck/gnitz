@@ -31,7 +31,7 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     client
         .create_table(&sn, "t", &cols(), &[0], TableProps::default(), &[])
         .unwrap();
-    let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     (client, tid, schema, sn)
 }
 

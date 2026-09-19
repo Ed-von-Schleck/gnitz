@@ -20,7 +20,7 @@ fn catalog() -> CatalogSnapshot {
                 class: RelClass::Table,
                 replicated: false,
                 schema,
-                indexes: Arc::new(Vec::new()),
+                indexes: Vec::new(),
             })),
         );
     };

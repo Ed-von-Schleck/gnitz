@@ -22,8 +22,8 @@ pub mod types;
 // this list carries no meaning beyond "spelled often enough to be worth
 // shortening".
 pub use client::{
-    delta_reply_schema, qualified_name, retraction_batch, segment_id, CatalogSnapshot, DeltaCursor, GnitzClient,
-    IndexMeta, InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
+    delta_reply_schema, not_found, qualified_name, retraction_batch, segment_id, CatalogSnapshot, DeltaCursor,
+    GnitzClient, IndexMeta, InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
     Completions, IdRun, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply, Session, SlotId,

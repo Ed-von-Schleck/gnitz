@@ -4,7 +4,7 @@ use gnitz_core::{ColumnDef, Schema, TypeCode};
 
 #[test]
 fn validate_user_name_rejects_reserved_and_malformed() {
-    // Leading `_` is reserved (system prefix + synthesized `__h…` views).
+    // Leading `_` is reserved (system prefix + synthesized `_seg…` segments).
     assert!(matches!(validate_user_name("_hidden"), Err(GnitzSqlError::Plan(_))));
     assert!(matches!(validate_user_name("_seg4096"), Err(GnitzSqlError::Plan(_))));
     // Empty and illegal characters.

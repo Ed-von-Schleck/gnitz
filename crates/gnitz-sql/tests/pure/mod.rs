@@ -92,15 +92,13 @@ pub fn rel_with(
         class,
         replicated,
         schema: Arc::new(Schema { columns, pk_cols }),
-        indexes: Arc::new(
-            indexes
-                .iter()
-                .map(|&(cols, is_unique)| IndexMeta {
-                    cols: PkColList::from_slice(cols),
-                    is_unique,
-                })
-                .collect(),
-        ),
+        indexes: indexes
+            .iter()
+            .map(|&(cols, is_unique)| IndexMeta {
+                cols: PkColList::from_slice(cols),
+                is_unique,
+            })
+            .collect(),
     })
 }
 

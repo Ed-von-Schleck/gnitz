@@ -234,11 +234,13 @@ pub(crate) fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) 
     validate_join_key_pair(left, right)
 }
 
-/// Whether a column name is one the join lowering mints for a synthetic join key
+/// Whether `col` is a synthetic join key the join lowering minted
 /// (`join_pk_coldefs` / `pair_pk_coldefs`). Such a key identifies a matched
-/// *pair*, not a row, so a relation keyed by one has no row identity.
-pub(crate) fn is_join_key_name(name: &str) -> bool {
-    name.starts_with("_join_pk") || name.starts_with("_pair_pk")
+/// *pair*, not a row, so a relation keyed by one has no row identity. The
+/// lowering mints every such key hidden; a visible column of that name is one a
+/// user named.
+pub(crate) fn is_minted_join_key(col: &ColumnDef) -> bool {
+    col.is_hidden && (col.name.starts_with("_join_pk") || col.name.starts_with("_pair_pk"))
 }
 
 /// Only an INNER step may be keyless: it is the cross join, whose residual (if

@@ -1,29 +1,23 @@
 use crate::ast_util::col_ref_parts;
 use crate::error::GnitzSqlError;
-use gnitz_core::{CatalogSnapshot, ColumnDef, GnitzClient, RelClass, RelDescriptor};
+use gnitz_core::{CatalogSnapshot, ColumnDef, RelDescriptor};
 use sqlparser::ast::{Expr, Ident};
 use std::sync::Arc;
 
-/// Find the column named `col_name` in `columns`, case-insensitively.
+/// The one visible column of `columns` named `col_name`, matched
+/// case-insensitively, as its physical index into `columns`.
 ///
-/// - `Ok(Some(idx))` — exactly one column matches.
-/// - `Ok(None)` — no column matches (callers attach their own "not found" text).
-/// - `Err(Bind)` — more than one column matches. A `SELECT *` join view carries
+/// - `Ok(Some(idx))` — exactly one visible column matches.
+/// - `Ok(None)` — no visible column matches (callers attach their own "not
+///   found" text).
+/// - `Err(Bind)` — more than one matches. A `SELECT *` join view carries
 ///   same-named columns from both sides; an unqualified reference to such a name
 ///   is ambiguous (standard SQL) and must be rejected, not silently bound to the
 ///   first match.
 ///
-/// Hidden columns (`is_hidden`) are skipped as match candidates but keep their
-/// physical position, so the returned index is always the real offset into
-/// `columns` (every caller adds a physical `col_offset` to it). Every
-/// readable-relation (table or view) name→index resolution funnels through
-/// here, so a synthetic view key (`_join_pk`, `_group_pk`, …) or an unprojected
-/// passthrough PK is unresolvable by name everywhere, without pruning any
-/// schema or shifting any offset — and a visible name shared with a hidden
-/// column is not spuriously ambiguous. (The DML sites that resolve names by
-/// hand — INSERT/UPDATE column lists — target base tables, whose only hidden
-/// columns come from DROP COLUMN and are excluded here by the `!c.is_hidden`
-/// filter, so a dropped column is unnameable.)
+/// Hidden columns are never candidates but keep their position, so a synthetic
+/// view key is unnameable and a visible name shared with a hidden column is not
+/// ambiguous.
 pub(crate) fn find_unique_column<'a>(
     columns: impl IntoIterator<Item = &'a ColumnDef>,
     col_name: &str,
@@ -62,68 +56,13 @@ pub(crate) fn output_column<'a>(
     }
 }
 
-pub(crate) struct Binder<'a> {
-    schema_name: &'a str,
-}
-
-impl<'a> Binder<'a> {
-    pub(crate) fn new(schema_name: &'a str) -> Self {
-        Binder { schema_name }
-    }
-
-    /// The session schema every name this binder resolves is scoped to.
-    pub(crate) fn schema_name(&self) -> &'a str {
-        self.schema_name
-    }
-
-    /// Resolve `name` as an ad-hoc read's source.
-    pub(crate) fn resolve(&self, cat: &CatalogSnapshot, name: &str) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
-        let rel = probe_relation(cat, self.schema_name, name)?;
-        if rel.class == RelClass::Stream {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "'{name}' is a stream; it holds no rows and can only be read inside a view body"
-            )));
-        }
-        Ok(rel)
-    }
-
-    /// Resolve the base table an UPDATE, DELETE or CREATE INDEX (`op`) writes.
-    pub(crate) fn resolve_base_table(
-        &self,
-        client: &mut GnitzClient,
-        name: &str,
-        op: &str,
-    ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
-        crate::validate::validate_user_name(name)?;
-        let rel = client.resolve_relation(self.schema_name, name)?;
-        crate::validate::require_class(&rel, name, crate::validate::ClassWant::BaseTable, op)?;
-        Ok(rel)
-    }
-
-    /// Resolve an INSERT target, which may be a base table or a stream — the one
-    /// writable-target caller that admits a stream. Same name rule as
-    /// [`Self::resolve_base_table`].
-    pub(crate) fn resolve_push_target(
-        &self,
-        client: &mut GnitzClient,
-        name: &str,
-    ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
-        crate::validate::validate_user_name(name)?;
-        let rel = client.resolve_relation(self.schema_name, name)?;
-        crate::validate::require_class(&rel, name, crate::validate::ClassWant::BaseTableOrStream, "INSERT")?;
-        Ok(rel)
-    }
-}
-
 /// The relation `name` a statement reads: [`probe`], with absence an error.
 pub(crate) fn probe_relation(
     cat: &CatalogSnapshot,
     schema_name: &str,
     name: &str,
 ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
-    // A leading `_` names a hidden chain segment, which no statement may read.
-    crate::validate::validate_user_name(name)?;
-    probe(cat, schema_name, name)?.ok_or_else(|| crate::error::missing_relation("Table or view", schema_name, name))
+    probe(cat, schema_name, name)?.ok_or_else(|| crate::error::missing_relation(schema_name, name))
 }
 
 /// The relation `name` resolves to in the statement's snapshot, `None` for a free

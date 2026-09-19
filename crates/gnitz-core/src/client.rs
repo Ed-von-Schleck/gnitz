@@ -18,8 +18,8 @@ use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::Circuit;
 use gnitz_wire::{
-    RelClass, TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME,
-    COL_TAB, IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, RELTAB_COL_NAME,
+    TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COL_TAB,
+    IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, RELTAB_COL_NAME,
     RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
@@ -53,11 +53,13 @@ pub fn qualified_name(schema_name: &str, name: &str) -> String {
 }
 
 /// The classified absence every schema-qualified catalog lookup reports, rather
-/// than a spelling of one message per call site.
-fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
+/// than a spelling of one message per call site. `name` reaches the message only,
+/// never a key, so it is reported as the caller spelled it: someone who wrote
+/// `MyTab` is told about `MyTab`.
+pub fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
     ClientError::NotFound {
         noun,
-        name: qualified_name(schema_name, name),
+        name: format!("{schema_name}.{name}"),
     }
 }
 
@@ -117,7 +119,7 @@ pub const MAX_CHAIN_SEGMENTS: usize = 64;
 
 /// How an internal chain segment is named, from its own allocated view id.
 ///
-/// Unique because vids are, and unspellable at every user surface because
+/// Unique because vids are, and unspellable at every SQL surface because
 /// [`crate::validate_user_identifier`] rejects a leading `_`. Ownership is the
 /// `owner_view_id` column, not the name.
 fn segment_name(vid: u64) -> String {
@@ -226,7 +228,7 @@ pub struct PlannedView {
 /// What one statement has already read, dropped whole at `end_statement`.
 ///
 /// One entry per resolved canonical `"schema.name"`, absent verdicts included,
-/// so a two-probe error ladder costs one round trip rather than two.
+/// so `plan_resolving`'s re-run reads a miss back instead of asking again.
 /// [`Self::get`] and [`Self::insert`] build the key through [`qualified_name`]
 /// themselves, so a case-varying reference cannot split into two entries.
 ///
@@ -1516,13 +1518,13 @@ impl GnitzClient {
         let s = sys_schema(family);
         let mut batch = ZSetBatch::new(s);
         let mut retired: Vec<u64> = Vec::with_capacity(names.len());
-        for name in names {
-            let name = gnitz_wire::canonical_identifier(name)?;
+        for &raw in names {
+            let name = gnitz_wire::canonical_identifier(raw)?;
             let Some((scanned, i)) = self.relation_retraction(family, noun, &schema_name, &name)? else {
                 if if_exists {
                     continue;
                 }
-                return Err(not_found(noun, &schema_name, &name));
+                return Err(not_found(noun, &schema_name, raw));
             };
             let id = scanned.pks.get(s, i) as u64;
             if !retired.contains(&id) {
@@ -1683,23 +1685,12 @@ impl GnitzClient {
         self.push_ddl_txn(&[(family, b)])
     }
 
-    /// Resolve `table_name` under `schema_name` to its id and schema. Anything that
-    /// is not a base table is reported as absent — callers that need to tell the
-    /// classes apart use [`Self::resolve_relation`], which returns the class.
-    pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Arc<Schema>), ClientError> {
-        let d = self.resolve(schema_name, table_name)?;
-        match d.filter(|d| d.class == RelClass::Table) {
-            Some(d) => Ok((d.tid, Arc::clone(&d.schema))),
-            None => Err(not_found("table", schema_name, table_name)),
-        }
-    }
-
     /// Resolve `name` under `schema_name`, rejecting a missing relation. The
     /// erroring form of [`Self::resolve`], for the callers whose next step needs
     /// the relation to exist.
     pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<Arc<RelDescriptor>, ClientError> {
         self.resolve(schema_name, name)?
-            .ok_or_else(|| not_found("table or view", schema_name, name))
+            .ok_or_else(|| not_found("relation", schema_name, name))
     }
 
     pub fn resolve_table_or_view_id(
@@ -1714,11 +1705,11 @@ impl GnitzClient {
     // --- Relation resolution ---
 
     /// The statement's descriptor for `schema_name.name`, or `None` when no such
-    /// relation exists. Every relation lookup routes through here: the binder's
-    /// writable-target check, ALTER's target resolution, the planner's resolve
-    /// loop. One round trip per relation per statement — the scope holds the
-    /// absent verdict too, so a two-probe error ladder does not pay twice. `Err`
-    /// is a missing schema or a decode error, not a miss.
+    /// relation exists. Every relation lookup routes through here: the SQL write
+    /// targets, ALTER's target resolution, the planner's resolve loop. One round
+    /// trip per relation per statement — the scope holds the absent verdict too,
+    /// so `plan_resolving`'s re-run reads a miss back instead of asking again.
+    /// `Err` is a missing schema or a decode error, not a miss.
     pub fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         // Built once and reused as the memo key, the wire target and the memo
         // write.

@@ -42,7 +42,7 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<
     client
         .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
         .unwrap();
-    let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     (client, sn, tid, schema)
 }
 
@@ -244,7 +244,7 @@ fn unix_and_tls_clients_share_a_table() {
     let mut unix_client = GnitzClient::connect(srv.sock_path()).unwrap();
 
     tls_client.push(tid, &schema, &make_batch(&schema, 0, 100)).unwrap();
-    let (utid, uschema) = unix_client.resolve_table_id(&sn, "t").unwrap();
+    let (utid, uschema) = unix_client.resolve_table_or_view_id(&sn, "t").unwrap();
     assert_eq!(utid, tid);
     unix_client
         .push(utid, &uschema, &make_batch(&uschema, 100, 100))

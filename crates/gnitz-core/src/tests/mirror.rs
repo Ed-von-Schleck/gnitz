@@ -268,7 +268,7 @@ fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session))
                 class: RelClass::FedView,
                 replicated: false,
                 schema: Arc::clone(&schema),
-                indexes: Arc::new(Vec::new()),
+                indexes: Vec::new(),
             }),
             delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema).unwrap()), tid)),
         };

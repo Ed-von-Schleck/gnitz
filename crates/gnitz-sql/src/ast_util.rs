@@ -7,6 +7,7 @@ use std::convert::Infallible;
 use crate::agg::AggFunc;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
+use crate::validate::{first_duplicate, validate_user_name};
 use gnitz_core::{ColumnDef, TypeCode};
 use gnitz_wire::decimal::decimal_of_number_text;
 use sqlparser::ast::{
@@ -48,30 +49,43 @@ fn object_name_parts<'a>(name: &'a sqlparser::ast::ObjectName, context: &str) ->
 /// parameter, never part of the statement, so a qualifier is accepted only when
 /// it names `session_schema`; anything else names a relation no gnitz statement
 /// can reach.
+///
+/// The name is checked by [`validate_user_name`]: a leading `_` names a hidden
+/// chain segment, which no statement may read or write.
 pub(crate) fn extract_object_name(
     name: &sqlparser::ast::ObjectName,
     session_schema: &str,
     context: &str,
 ) -> Result<String, GnitzSqlError> {
-    match object_name_parts(name, context)?.as_slice() {
-        [n] => Ok((*n).to_string()),
-        [s, n] if s.eq_ignore_ascii_case(session_schema) => Ok((*n).to_string()),
-        [s, ..] => Err(GnitzSqlError::Unsupported(format!(
-            "{context}: cross-schema names are not supported \
+    let n = match object_name_parts(name, context)?.as_slice() {
+        [n] => *n,
+        [s, n] if s.eq_ignore_ascii_case(session_schema) => *n,
+        [s, ..] => {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{context}: cross-schema names are not supported \
              (qualifier '{s}' is not the session schema '{session_schema}')"
-        ))),
+            )))
+        }
         // `object_name_parts` rejects the empty name, so this is 3+ parts.
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "{context}: '{name}' has too many name parts"
-        ))),
-    }
+        _ => {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{context}: '{name}' has too many name parts"
+            )))
+        }
+    };
+    validate_user_name(n)?;
+    Ok(n.to_string())
 }
 
 /// An index name, which is global rather than schema-scoped — so a qualifier
-/// would read as a scoping that does not exist, and is rejected.
+/// would read as a scoping that does not exist, and is rejected. The name is
+/// checked by [`validate_user_name`], as a relation name is.
 pub(crate) fn extract_index_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
     match object_name_parts(name, context)?.as_slice() {
-        [n] => Ok((*n).to_string()),
+        [n] => {
+            validate_user_name(n)?;
+            Ok((*n).to_string())
+        }
         _ => Err(GnitzSqlError::Unsupported(format!(
             "{context}: an index name takes no qualifier (index names are global, not schema-scoped)"
         ))),
@@ -934,7 +948,7 @@ pub(crate) fn extract_table_name_and_alias(
 }
 
 /// A strictly simple identifier expression's name, or the shared
-/// "column must be a simple identifier" Bind error. Backs [`index_column_ident`]
+/// "column must be a simple identifier" Unsupported error. Backs [`index_column_ident`]
 /// and the CLUSTER BY column list (a `Vec<Expr>` in sqlparser).
 pub(crate) fn simple_ident_expr<'a>(e: &'a sqlparser::ast::Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
     match e {
@@ -1089,12 +1103,10 @@ where
             "{ctx}: SELECT * RENAME names excluded column '{f}'"
         )));
     }
-    for (i, (f, _)) in rename.iter().enumerate() {
-        if rename[i + 1..].iter().any(|(g, _)| g.eq_ignore_ascii_case(f)) {
-            return Err(GnitzSqlError::Plan(format!(
-                "{ctx}: SELECT * RENAME names column '{f}' twice"
-            )));
-        }
+    if let Some(f) = first_duplicate(rename.iter().map(|&(f, _)| f)) {
+        return Err(GnitzSqlError::Plan(format!(
+            "{ctx}: SELECT * RENAME names column '{f}' twice"
+        )));
     }
     Ok(cols
         .into_iter()

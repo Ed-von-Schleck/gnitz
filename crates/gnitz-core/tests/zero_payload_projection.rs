@@ -81,7 +81,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     client
         .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
         .unwrap();
-    let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
 
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch, &schema);
@@ -135,7 +135,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     client
         .create_table(&sn, "t", &cols, &[3, 0], TableProps::default(), &[])
         .unwrap();
-    let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
+    let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     assert_eq!(schema.pk_stride(), 12, "I64 then U32, tightly packed");
 
     // `(c3, c0)` packed native little-endian in PK-list order — c3 at offset 0,
