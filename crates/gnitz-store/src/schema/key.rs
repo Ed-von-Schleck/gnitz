@@ -719,12 +719,25 @@ pub(crate) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &
     hasher.update(content);
 }
 
+/// Column `c` of `schema` as a key column, `what` naming the key in a refusal.
+/// A float has none: `+0.0` and `-0.0` differ byte-wise but compare equal.
+pub(crate) fn locate_key_col(schema: &SchemaDescriptor, c: u32, what: &str) -> Result<ColumnLocator, OpBuildErr> {
+    let loc = schema
+        .try_locate(c as usize)
+        .ok_or_else(|| OpBuildErr::oob_col(&format!("{what}: column"), c, schema))?;
+    if gnitz_wire::is_float(loc.type_code()) {
+        return Err(OpBuildErr::shape(format!(
+            "{what}: column {c} is a float, which has no order-preserving key image"
+        )));
+    }
+    Ok(loc)
+}
+
 /// Hash one group column into the streaming fold — the single per-column body
 /// [`FoldCols::key_row`] streams.
 ///
-/// Reads the null bit unconditionally, like the sibling `cmp_group_cols`:
-/// a NOT NULL column never carries one, so masking it off would cost a per-row
-/// AND to change nothing.
+/// Reads the null bit unconditionally: a NOT NULL column never carries one, so
+/// masking it off would cost a per-row AND to change nothing.
 #[inline]
 fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, null_word: u64, loc: ColumnLocator) {
     // A PK column is never null, so this is the payload-only NULL gate.
@@ -936,10 +949,6 @@ impl ReindexPacker {
     /// The whole trust boundary for a key list off the wire: a forged circuit is
     /// rejected, never panicked on.
     ///
-    /// A float has no key image: OPK bytes are compared raw, and `+0.0`/`-0.0`
-    /// differ byte-wise while comparing equal. The SQL planner refuses one
-    /// already; this is the boundary for a raw `gnitz-core` client.
-    ///
     /// A carried target's domain is `join_key_common_type`'s codomain — the
     /// *key* domain, whose collapse to U128 is what a `_join_pk` slot does to a
     /// UUID pair, not the value domain `gnitz_wire::int_domain_fits` answers.
@@ -953,14 +962,7 @@ impl ReindexPacker {
         let mut cols = [ColPromoter::PLACEHOLDER; MAX_PK_COLUMNS];
         let mut stride = 0usize;
         for (i, &(c, carried)) in key.iter().enumerate() {
-            let loc = schema
-                .try_locate(c as usize)
-                .ok_or_else(|| OpBuildErr::oob_col("reindex key: column", c, schema))?;
-            if gnitz_wire::is_float(loc.type_code()) {
-                return Err(OpBuildErr::shape(format!(
-                    "reindex key: column {c} is a float, which has no order-preserving key image"
-                )));
-            }
+            let loc = locate_key_col(schema, c, "reindex key")?;
             if carried.is_some_and(|t| gnitz_wire::join_key_common_type(loc.type_code(), t as u8) != Some(t as u8)) {
                 return Err(OpBuildErr::shape(format!(
                     "reindex key: column {c} does not promote to the carried target"
@@ -1041,9 +1043,7 @@ impl ReindexPacker {
     /// Greedy: pack leading columns while the budget still leaves room for the
     /// fold slot the rest would need. Unlike a join key this is total over
     /// *arity* — the overflow folds into one hash slot — so no group set is
-    /// refused for being wide. It refuses only an out-of-range column and a float
-    /// one, which keys on bytes here exactly as in [`Self::new`], and for the
-    /// same reason.
+    /// refused for being wide; it refuses what [`locate_key_col`] refuses.
     pub(crate) fn new_group_key(
         schema: &SchemaDescriptor,
         group_cols: &[u32],
@@ -1065,14 +1065,7 @@ impl ReindexPacker {
         // The range test precedes it — every read below indexes the fixed array
         // raw, where `[num_columns, 65)` reads back as a lying 8-byte column.
         for &c in group_cols {
-            let col = schema
-                .column(c as usize)
-                .ok_or_else(|| OpBuildErr::oob_col("group key: column", c, schema))?;
-            if gnitz_wire::is_float(col.type_code) {
-                return Err(OpBuildErr::shape(format!(
-                    "group key: column {c} is a float, which has no order-preserving key image"
-                )));
-            }
+            locate_key_col(schema, c, "group key")?;
         }
         let has_bitmap = group_cols.iter().any(|&c| schema.columns[c as usize].nullable != 0);
 

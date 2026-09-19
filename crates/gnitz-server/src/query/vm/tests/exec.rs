@@ -63,7 +63,7 @@ fn push_reduce(
     i_am_owner: bool,
 ) -> SchemaDescriptor {
     let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, gcols, aggs, global_ground, i_am_owner).unwrap();
-    let out_schema = plan.output_schema;
+    let out_schema = plan.shape.output_schema;
     let plan_idx = b.add_reduce_plan(plan, None);
     b.push(Instr::Reduce {
         in_reg: DeltaReg(0),

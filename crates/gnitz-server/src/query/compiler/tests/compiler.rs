@@ -1,7 +1,7 @@
 use super::fixtures::*;
 use super::*;
 use crate::catalog::CatalogEngine;
-use crate::test_support::{col_def, pk_only_schema, scratch_dir, write_identity_circuit};
+use crate::test_support::{col_def, pk_only_schema, scratch_dir, write_circuit, write_identity_circuit};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::{type_code, OpNode};
 
@@ -261,6 +261,49 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
     assert_eq!(
         rejection(against(&string_payload, v_u64_i64)),
         "sink schema does not match view output schema",
+    );
+    engine.close();
+}
+
+/// A shard column the relay's group key would refuse is a `CREATE VIEW`
+/// rejection: the relay routes by it only mid-round, where a refusal aborts the
+/// master.
+#[test]
+fn a_float_shard_column_is_rejected() {
+    let dir = scratch_dir("compiler", "float_shard");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let source = engine
+        .create_table(
+            "public.u64_f64",
+            &[col_def("id", type_code::U64), col_def("v", type_code::F64)],
+            &[0],
+        )
+        .unwrap();
+    let view_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::F64, 0),
+        ],
+        &[0],
+    );
+    let compile = |engine: &mut CatalogEngine, shard_col: u32| {
+        let vid = engine.allocate_ids(1).unwrap();
+        let mut circuit = gnitz_wire::Circuit::default();
+        let scan = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
+        let shard = circuit.shard(scan, &[shard_col]);
+        circuit.sink(shard);
+        write_circuit(engine, vid, circuit);
+        let site = ViewSite {
+            dir: &dir,
+            id: vid as u64,
+            registry: engine.registry(),
+        };
+        compile_view(site, &view_schema, false).map(drop)
+    };
+    assert!(compile(&mut engine, 0).is_ok(), "an integer shard column compiles");
+    assert_eq!(
+        rejection(compile(&mut engine, 1)),
+        "group key: column 1 is a float, which has no order-preserving key image",
     );
     engine.close();
 }

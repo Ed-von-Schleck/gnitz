@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use gnitz_core::{ColumnDef, Schema, ZSetBatch};
-use gnitz_expr::{cmp_group_cols, ColumnLocator, Evaluator, SchemaFacts};
+use gnitz_expr::{ColumnLocator, Evaluator, SchemaFacts};
 use gnitz_wire::AggFunc as WireAggFunc;
 use rustc_hash::FxHashMap;
 
@@ -29,9 +29,6 @@ use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
 use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::ir::BoundExpr;
-
-/// The end of an `older` chain.
-const NO_ROW: usize = usize::MAX;
 
 /// An ad-hoc fold's reply, or a FROM-less SELECT's ground row, to its result: combine the
 /// partials, then the HAVING filter and finalize map a grouped view runs over its reduce output.
@@ -88,27 +85,23 @@ impl FoldFinish {
         let locs: Vec<ColumnLocator> = (1..schema.columns.len())
             .map(|ci| SchemaFacts::locate(schema, ci))
             .collect();
-        let (group_locs, agg_locs) = locs.split_at(n_group);
-        // `_group_pk` → the newest group's first row; `older[r]` the next-older first row with
-        // r's key. The key is a digest, so a hit is confirmed by value — and already
-        // hashed, so the map need not hash it again.
-        let mut newest: FxHashMap<u128, usize> = FxHashMap::with_capacity_and_hasher(partial.len(), Default::default());
-        let mut older: Vec<usize> = Vec::with_capacity(partial.len());
+        let agg_locs = &locs[n_group..];
+        // `_group_pk` → the group's first row. The key is the group's identity, as it is on the
+        // view path.
+        let mut first_of: FxHashMap<u128, usize> =
+            FxHashMap::with_capacity_and_hasher(partial.len(), Default::default());
         let mut keep: Vec<(usize, usize)> = Vec::new();
         for row in 0..partial.len() {
             debug_assert_eq!(partial.weights[row], 1, "a fold partial is one reduce row");
             let key = u128::from_le_bytes(partial.pks.get_bytes(row).try_into().expect("_group_pk is 16 bytes"));
-            let hit = std::iter::successors(newest.get(&key).copied(), |&r| Some(older[r]).filter(|&o| o != NO_ROW))
-                .find(|&first| cmp_group_cols(&partial, row, &partial, first, group_locs).is_eq());
-            match hit {
+            match first_of.get(&key).copied() {
                 Some(first) => {
-                    older.push(NO_ROW);
                     for (k, (loc, &wins)) in agg_locs.iter().zip(&self.merge).enumerate() {
                         merge_cell(&mut partial, first, row, n_group + k, wins, loc);
                     }
                 }
                 None => {
-                    older.push(newest.insert(key, row).unwrap_or(NO_ROW));
+                    first_of.insert(key, row);
                     match keep.last_mut() {
                         Some((_, end)) if *end == row => *end += 1,
                         _ => keep.push((row, row + 1)),

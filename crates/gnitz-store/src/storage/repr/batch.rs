@@ -149,6 +149,13 @@ pub enum Layout {
     Consolidated,
 }
 
+/// A batch's end at one moment: its row count and blob length.
+#[derive(Clone, Copy)]
+pub(crate) struct RowMark {
+    count: usize,
+    blob_len: usize,
+}
+
 /// Owned columnar batch.  All fixed-stride column data lives in a single
 /// contiguous `data` buffer.  Blob data is separate (variable-length).
 ///
@@ -1065,6 +1072,45 @@ impl Batch {
         self.layout = layout;
     }
 
+    /// The batch's current end, to [`Self::truncate_to`] later.
+    #[inline]
+    pub(crate) fn mark(&self) -> RowMark {
+        RowMark {
+            count: self.count,
+            blob_len: self.blob.len(),
+        }
+    }
+
+    /// The rows appended since `mark`.
+    #[inline]
+    pub(crate) fn rows_since(&self, mark: RowMark) -> usize {
+        self.count - mark.count
+    }
+
+    /// Drop every row, and every blob byte, appended since `mark`.
+    #[inline]
+    pub(crate) fn truncate_to(&mut self, mark: RowMark) {
+        debug_assert!(mark.count <= self.count && mark.blob_len <= self.blob.len());
+        self.count = mark.count;
+        self.blob.truncate(mark.blob_len);
+    }
+
+    /// Exchange rows `a` and `b`. Their strings index this batch's own blob, so
+    /// they move with the rows.
+    pub(crate) fn swap_rows(&mut self, a: usize, b: usize) {
+        debug_assert!(a < self.count && b < self.count);
+        if a == b {
+            return;
+        }
+        let (lo, hi) = (a.min(b), a.max(b));
+        for r in 0..self.num_regions() {
+            let stride = self.strides[r] as usize;
+            let (head, tail) = self.region_at_mut(r).split_at_mut(hi * stride);
+            head[lo * stride..(lo + 1) * stride].swap_with_slice(&mut tail[..stride]);
+        }
+        self.downgrade();
+    }
+
     /// Reset to no layout claim. Every order/fold-destroying mutator calls this.
     #[inline]
     pub(crate) fn downgrade(&mut self) {
@@ -1109,7 +1155,7 @@ impl Batch {
     /// Runs for every layout including `Raw`, since an unsorted arrival (a union
     /// concat, a null-extend widening) is exactly where a null-fill enters.
     ///
-    /// Consumers are free to read the bit raw (`cmp_group_cols`) or to
+    /// Consumers are free to read the bit raw (the group-key fold) or to
     /// believe the declaration (`FixedIntNonnull`, the evaluator's
     /// `nullable_slots`, a projection's `NullPerm`) only because this holds.
     #[cfg(debug_assertions)]

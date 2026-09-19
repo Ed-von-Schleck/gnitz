@@ -1,10 +1,15 @@
-//! The group key shared by the reduce and the exchange scatter: whether a group
-//! set has a canonical (order-preserving, injective) single-column key, and the
-//! 128-bit key of a row either way.
+//! The group key shared by the reduce, the top-N and the exchange scatter:
+//! whether a group set has a canonical (order-preserving, injective)
+//! single-column key, the 128-bit key of a row either way, and the one grouping
+//! mechanism built on it — a group is its output PK.
 
-use crate::schema::key::{FoldCols, NarrowPkOpk, ReindexPacker};
-use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor};
-use crate::storage::MemBatch;
+use std::ops::Range;
+
+use crate::schema::key::{locate_key_col, pk_width_dispatch, FoldCols, NarrowPkOpk, PkSortKey, ReindexPacker};
+use crate::schema::{
+    type_code, ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor,
+};
+use crate::storage::{Batch, MemBatch};
 use gnitz_expr::RowSource;
 
 /// Whether the group key of `group_by_cols` can be emitted through the
@@ -17,10 +22,8 @@ use gnitz_expr::RowSource;
 /// the other. `opk_image` dispatches on the locator, so the two need no
 /// separate arm here.
 ///
-/// A canonical key is **injective** on the group value, which is what lets a
-/// key-equality test stand in for a value comparison (the ad-hoc fold's
-/// per-row confirmation), and it is order-preserving, so sorting by it visits
-/// groups in ascending output-PK order.
+/// A canonical key is **injective** on the group value and order-preserving, so
+/// sorting by it visits groups in ascending output-PK order.
 #[inline]
 pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> bool {
     if group_by_cols.len() != 1 {
@@ -56,14 +59,15 @@ pub(super) struct GroupKeyCols {
 }
 
 impl GroupKeyCols {
-    pub(crate) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
-        // Resolve first: `locate` carries the release-active in-range assert, so
-        // every index is proven before anything else reads `schema.columns`.
-        let cols = group_by_cols.iter().map(|&c| schema.locate(c as usize)).collect();
-        GroupKeyCols {
+    pub(crate) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Result<Self, OpBuildErr> {
+        let cols = group_by_cols
+            .iter()
+            .map(|&c| locate_key_col(schema, c, "group key"))
+            .collect::<Result<_, _>>()?;
+        Ok(GroupKeyCols {
             canonical: single_col_canonical_group_key(schema, group_by_cols),
             cols: FoldCols::new(cols),
-        }
+        })
     }
 
     /// The single column the group key is the canonical `opk_image` of, or
@@ -122,23 +126,152 @@ impl OutPk<'_> {
     }
 }
 
-/// The output PK of the group `row` of `mb` belongs to, under `out_key` — the
-/// one derivation for every operator keyed like a reduce (the reduce itself and
-/// the top-N). `PkPermutation` borrows the input PK region; every other kind
-/// keys by a value it does not carry, at the output's `out_stride`.
-#[inline]
-pub(super) fn group_out_pk<'a>(
-    out_key: ReduceOutKey,
-    group_key: &GroupKeyCols,
+/// How an operator keyed like a reduce (the reduce itself, the ad-hoc fold, the
+/// top-N) groups its input and keys its output. A group is its output PK.
+pub(super) struct GroupOutKey {
+    pub(super) kind: ReduceOutKey,
+    pub(super) group: GroupKeyCols,
     out_stride: usize,
-    mb: &'a MemBatch,
-    row: usize,
-) -> OutPk<'a> {
-    if out_key == ReduceOutKey::PkPermutation {
-        OutPk::Borrowed(mb.get_pk_bytes(row))
-    } else {
-        OutPk::Narrow(NarrowPkOpk::new(group_key.key_row(mb, row), out_stride))
+}
+
+impl GroupOutKey {
+    /// `output` is the schema built for `kind`, whose PK region the key fills.
+    pub(super) fn new(
+        input: &SchemaDescriptor,
+        group_cols: &[u32],
+        kind: ReduceOutKey,
+        output: &SchemaDescriptor,
+    ) -> Result<Self, OpBuildErr> {
+        Ok(GroupOutKey {
+            kind,
+            group: GroupKeyCols::new(input, group_cols)?,
+            out_stride: output.pk_stride(),
+        })
     }
+
+    /// The output PK of `row`'s group.
+    #[inline]
+    pub(super) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
+        if self.kind == ReduceOutKey::PkPermutation {
+            OutPk::Borrowed(mb.get_pk_bytes(row))
+        } else {
+            OutPk::Narrow(NarrowPkOpk::new(self.group.key_row(mb, row), self.out_stride))
+        }
+    }
+
+    /// `V₀`, the output PK of the empty group set's one group.
+    #[inline]
+    pub(super) fn ground_pk(&self) -> NarrowPkOpk {
+        NarrowPkOpk::new(gnitz_wire::global_group_key(), self.out_stride)
+    }
+
+    /// The group columns the output carries as its leading payload. Only a
+    /// synthetic key has any: a natural key is the group value itself.
+    #[inline(always)]
+    pub(super) fn exemplar_locs(&self) -> &[ColumnLocator] {
+        if self.kind == ReduceOutKey::SyntheticFold {
+            self.group.cols.locs()
+        } else {
+            &[]
+        }
+    }
+
+    /// `batch`'s groups as runs in ascending output-PK order.
+    pub(super) fn runs(&self, batch: &Batch) -> GroupRuns {
+        let mb = &batch.as_mem_batch();
+        let n = mb.count;
+        // One run, with no key to compute.
+        if n <= 1 || self.group.cols.is_empty() {
+            return GroupRuns::in_place(n, |_| ());
+        }
+        let pk_keyed = self.kind == ReduceOutKey::PkPermutation;
+        // A leading-PK-column key is that column's OPK bytes, widened.
+        let leading_pk_col = matches!(self.group.canonical_col(), Some(ColumnLocator::Pk { byte_off: 0, .. }));
+        if (pk_keyed || leading_pk_col) && batch.consolidated_verified(batch.schema()) {
+            return match pk_keyed {
+                true => GroupRuns::in_place(n, |i| mb.get_pk_bytes(i)),
+                false => GroupRuns::in_place(n, |i| self.group.key_row(mb, i)),
+            };
+        }
+        if pk_keyed {
+            return pk_width_dispatch!(
+                mb.pk_stride as usize,
+                |K| GroupRuns::sorted(n, |i| K::from_opk(mb.get_pk_bytes(i))),
+                GroupRuns::sorted(n, |i| mb.get_pk_bytes(i)),
+            );
+        }
+        // Exact, not a truncation: a canonical key over a ≤8-byte column fits 64
+        // bits, and halves the sorted payload for `GROUP BY <BIGINT>`.
+        if self.group.canonical_col().is_some_and(|c| c.size() <= 8) {
+            GroupRuns::sorted(n, |i| self.group.key_row(mb, i) as u64)
+        } else {
+            GroupRuns::sorted(n, |i| self.group.key_row(mb, i))
+        }
+    }
+}
+
+/// A batch's groups as contiguous runs of positions, in ascending output-PK
+/// order. A position maps to a batch row through [`Self::row`].
+pub(super) struct GroupRuns {
+    /// Position → row, or `None` when the batch is already in group order.
+    order: Option<Vec<u32>>,
+    /// Each run's exclusive end position, ascending; the last is the row count.
+    ends: Vec<u32>,
+}
+
+impl GroupRuns {
+    /// Runs over rows already in group order.
+    fn in_place<K: PartialEq>(n: usize, key: impl Fn(usize) -> K) -> Self {
+        GroupRuns { order: None, ends: run_ends(n, key) }
+    }
+
+    /// Runs over `0..n` sorted by `key`, computed once per row. The row index
+    /// breaks ties, so a group's rows keep source order — which a float SUM's low
+    /// bits depend on.
+    pub(super) fn sorted<K: Ord>(n: usize, key: impl Fn(usize) -> K) -> Self {
+        let mut pairs: Vec<(K, u32)> = (0..n).map(|i| (key(i), i as u32)).collect();
+        pairs.sort_unstable();
+        GroupRuns {
+            ends: run_ends(n, |p| &pairs[p].0),
+            order: Some(pairs.into_iter().map(|(_, i)| i).collect()),
+        }
+    }
+
+    /// The batch row at visit position `pos`.
+    #[inline(always)]
+    pub(super) fn row(&self, pos: usize) -> usize {
+        self.order.as_ref().map_or(pos, |o| o[pos] as usize)
+    }
+
+    /// The group count.
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Each group's position range, in visit order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        let starts = std::iter::once(0).chain(self.ends.iter().map(|&e| e as usize));
+        starts.zip(self.ends.iter().map(|&e| e as usize)).map(|(s, e)| s..e)
+    }
+}
+
+/// The exclusive end of each run of equal adjacent keys over `0..n`.
+fn run_ends<K: PartialEq>(n: usize, key: impl Fn(usize) -> K) -> Vec<u32> {
+    let mut ends = Vec::new();
+    if n == 0 {
+        return ends;
+    }
+    let mut prev = key(0);
+    for i in 1..n {
+        let k = key(i);
+        if k != prev {
+            ends.push(i as u32);
+        }
+        prev = k;
+    }
+    ends.push(n as u32);
+    ends
 }
 
 #[cfg(test)]

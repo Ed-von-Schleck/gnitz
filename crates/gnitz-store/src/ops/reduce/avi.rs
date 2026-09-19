@@ -54,10 +54,6 @@ struct AviAgg {
     /// LLVM lifts neither the type resolve nor the direction test out of the
     /// (row × aggregate) loop.
     spec: ExtremeSpec,
-    /// Whether this ordinal's extreme may be folded off the stored output column
-    /// instead of probed. A float never is, its pre-step cost never having been
-    /// weighed against the seek it would save.
-    trace_foldable: bool,
 }
 
 /// The AVI resources a reduce's `ReducePlan` carries, baked once at compile time.
@@ -90,11 +86,7 @@ impl AviBake {
             .enumerate()
             .filter_map(|(k, acc)| {
                 let spec = acc.extreme_index_spec()?;
-                Some(AviAgg {
-                    acc_idx: k as u8,
-                    trace_foldable: !matches!(spec.kind, ImageKind::Scalar(k) if k.is_float()),
-                    spec,
-                })
+                Some(AviAgg { acc_idx: k as u8, spec })
             })
             .collect();
         let mut b = crate::schema::DerivedSchema::new();
@@ -106,17 +98,10 @@ impl AviBake {
         Ok(AviBake { schema: b.finish(), key_packer, aggs })
     }
 
-    /// Whether any ordinal can take the probe-skip path — the gate on
-    /// pre-stepping MIN/MAX accumulators during the group walk.
-    pub(super) fn any_trace_foldable(&self) -> bool {
-        self.aggs.iter().any(|a| a.trace_foldable)
-    }
-
-    /// Each ordinal's accumulator index and its [`AviAgg::trace_foldable`] bit,
-    /// in ordinal order.
+    /// Each ordinal's accumulator index, in ordinal order.
     #[inline]
-    pub(super) fn acc_indices(&self) -> impl Iterator<Item = (usize, bool)> + '_ {
-        self.aggs.iter().map(|a| (a.acc_idx as usize, a.trace_foldable))
+    pub(super) fn acc_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.aggs.iter().map(|a| a.acc_idx as usize)
     }
 
     /// Pack `row`'s group columns into the leading bytes of `buf`. Split from

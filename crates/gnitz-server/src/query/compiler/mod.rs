@@ -10,6 +10,7 @@ use rustc_hash::FxHashMap;
 use crate::query::vm::{DeltaReg, ProgramBuilder, RegisterMeta, TraceReg, VmHandle};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::expr::MapPlan;
+use gnitz_store::ops::ScatterSpec;
 use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
 use gnitz_store::schema::{OpBuildErr, SchemaDescriptor};
 use gnitz_wire::{AggDescriptor, NodeId, NodeInputs};
@@ -293,11 +294,8 @@ pub(super) fn compile_view(
         let ex_in = loaded.inputs(side.shard).unary();
         let (plan, _) = build_plan(&loaded, &side.nodes, site, self_contained, &[], ex_in)?;
         let schema = plan.vm.program.out_schema();
-        // `ScatterKey::new` bounds the same columns, but only mid-round in the
-        // master relay; here a corrupt node is a `CREATE VIEW` rejection.
-        if let Some(&c) = side.cols.iter().find(|&&c| schema.column(c as usize).is_none()) {
-            return Err(OpBuildErr::oob_col("exchange shard: column", c, &schema).into());
-        }
+        // The relay routes by this spec mid-round, where a refusal aborts the master.
+        ScatterSpec::GroupKey(side.cols).check(&schema)?;
         seeds.push((side.shard, schema));
         side_plans.push(plan);
     }

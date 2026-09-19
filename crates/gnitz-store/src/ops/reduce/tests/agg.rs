@@ -32,6 +32,7 @@ fn f64_acc(agg_op: AggFunc) -> Accumulator {
     let aggs = [AggDescriptor { col_idx: 1, agg_op }, AggDescriptor::COUNT_STAR];
     let mut accs = super::super::plan::ReducePlan::from_wire(&schema, &[0], &aggs, false, false)
         .unwrap()
+        .shape
         .acc_template;
     accs.swap_remove(0)
 }

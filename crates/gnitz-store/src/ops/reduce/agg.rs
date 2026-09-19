@@ -32,12 +32,7 @@ pub struct Accumulator {
     /// A wide extreme's native bytes, under the same `has_value` as `acc`.
     wide: Box<[u8]>,
     has_value: bool,
-    /// [`AggFunc::is_linear`], hoisted in `new`: the group walk reads it once
-    /// per row per aggregate, and `AggFunc::empty_renders_zero` is a
-    /// cross-crate `const fn` that would be a real call at `opt-level=0`.
-    linear: bool,
-    /// [`AggFunc::empty_renders_zero`], hoisted for the same reason — read once
-    /// per emitted aggregate column.
+    /// [`AggFunc::empty_renders_zero`], resolved once in `new`.
     renders_zero: bool,
     /// The aggregated column in an input row.
     src: ColumnLocator,
@@ -59,10 +54,8 @@ enum StepKind {
     /// Count the row after the NULL gate, still without reading its value.
     CountNonNull,
     /// Add `value * weight` into the slot, reading the value as `ScalarKind`.
+    /// SUM and SumZero alike: they differ only in `renders_zero`.
     Sum(ScalarKind),
-    /// [`Self::Sum`]'s fold under Count's `0` empty-value; see
-    /// [`AggFunc::empty_renders_zero`].
-    SumZero(ScalarKind),
     /// Keep the extreme: a scalar as its MIN-oriented order image in `acc`, a
     /// wide value as its native bytes in `wide`. `max` picks the direction.
     Extreme { max: bool, kind: ImageKind },
@@ -88,26 +81,23 @@ impl Accumulator {
         let kind = match agg_op {
             AggFunc::Count => StepKind::Count,
             AggFunc::CountNonNull => StepKind::CountNonNull,
-            AggFunc::Sum => StepKind::Sum(scalar()?),
-            AggFunc::SumZero => StepKind::SumZero(scalar()?),
+            AggFunc::Sum | AggFunc::SumZero => StepKind::Sum(scalar()?),
             AggFunc::Min | AggFunc::Max => StepKind::Extreme {
                 max: agg_op == AggFunc::Max,
                 kind: ImageKind::of(tc)?,
             },
         };
-        let linear = agg_op.is_linear();
         // `fold_stored`'s linear arms read the whole slot as one `u64`, which
-        // `agg_output_type` guarantees: I64 for the count family and SumZero,
-        // the 8-byte register image for SUM.
+        // `agg_output_type` guarantees: I64 for the count family, the 8-byte
+        // register image for the SUM family.
         debug_assert!(
-            !linear || out.size() == 8,
+            !agg_op.is_linear() || out.size() == 8,
             "a linear aggregate's output column is 8 bytes"
         );
         Some(Accumulator {
             acc: 0,
             wide: Box::default(),
             has_value: false,
-            linear,
             renders_zero: agg_op.empty_renders_zero(),
             src,
             out,
@@ -123,7 +113,7 @@ impl Accumulator {
 
     #[inline(always)]
     pub(super) fn is_linear(&self) -> bool {
-        self.linear
+        !matches!(self.kind, StepKind::Extreme { .. })
     }
 
     /// Width of this aggregate's output column — the emitted value's truncation.
@@ -164,8 +154,7 @@ impl Accumulator {
 
     /// The emitted value, or `None` for an accumulator no row contributed to —
     /// which renders its empty form, not a value. MIN/MAX invert the order image
-    /// they hold; an `F32` extreme also promotes to the `F64` output column
-    /// `agg_output_type` declares for it.
+    /// they hold.
     pub(super) fn value(&self) -> Option<AggValue<'_>> {
         if !self.has_value {
             return None;
@@ -173,11 +162,7 @@ impl Accumulator {
         Some(match self.kind {
             StepKind::Extreme { kind: ImageKind::Wide(kind), .. } => AggValue::Wide(kind, &self.wide),
             StepKind::Extreme { kind: ImageKind::Scalar(kind), .. } => {
-                let bits = kind.order_inverse(self.acc as u64);
-                AggValue::Bits(match kind {
-                    ScalarKind::F32 => f64::to_bits(f32::from_bits(bits as u32) as f64),
-                    _ => bits,
-                })
+                AggValue::Bits(kind.order_inverse(self.acc as u64))
             }
             _ => AggValue::Bits(self.acc as u64),
         })
@@ -296,20 +281,20 @@ impl Accumulator {
                 self.acc = self.acc.wrapping_add(weight);
                 self.has_value = true;
             }
-            StepKind::Sum(ScalarKind::Int(fi)) | StepKind::SumZero(ScalarKind::Int(fi)) => {
+            StepKind::Sum(ScalarKind::Int(fi)) => {
                 self.acc = self
                     .acc
                     .wrapping_add(self.src.decode_i64(mb, row, fi).wrapping_mul(weight));
                 self.has_value = true;
             }
-            StepKind::Sum(ScalarKind::F32) | StepKind::SumZero(ScalarKind::F32) => {
+            StepKind::Sum(ScalarKind::F32) => {
                 let bits = self.src.bytes(mb, row);
                 self.add_float(
                     f32::from_bits(u32::from_le_bytes(bits.try_into().unwrap())) as f64,
                     weight,
                 );
             }
-            StepKind::Sum(ScalarKind::F64) | StepKind::SumZero(ScalarKind::F64) => {
+            StepKind::Sum(ScalarKind::F64) => {
                 let bits = self.src.bytes(mb, row);
                 self.add_float(f64::from_bits(u64::from_le_bytes(bits.try_into().unwrap())), weight);
             }
@@ -333,27 +318,20 @@ impl Accumulator {
             return;
         }
         match self.kind {
-            // Branch on the *source* type, not the output column's: a float
-            // SumZero's column is labelled I64 while the accumulator holds `f64`
-            // bits, and both ends of this round trip read the source.
-            StepKind::Sum(k) | StepKind::SumZero(k) if k.is_float() => {
+            // A float sum's register image is `f64` bits whatever the source
+            // width, so the stored value adds as an `f64`.
+            StepKind::Sum(k) if k.is_float() => {
                 let cur = f64::from_bits(self.acc as u64);
                 self.acc = f64::to_bits(cur + f64::from_bits(self.stored_u64(out_row, row))) as i64;
                 self.has_value = true;
             }
-            StepKind::Count | StepKind::CountNonNull | StepKind::Sum(_) | StepKind::SumZero(_) => {
+            StepKind::Count | StepKind::CountNonNull | StepKind::Sum(_) => {
                 self.acc = self.acc.wrapping_add(self.stored_u64(out_row, row) as i64);
                 self.has_value = true;
             }
             StepKind::Extreme { max, kind } => {
-                // `agg_output_type(Min|Max, src) == src` for every non-float
-                // source, so the stored column is in the accumulator's own
-                // domain and re-encoding it is exact. A float source's output
-                // widens to F64 and always probes instead.
-                debug_assert!(
-                    !matches!(kind, ImageKind::Scalar(k) if k.is_float()),
-                    "a float extreme is never folded from its output column"
-                );
+                // `agg_output_type(Min|Max, src) == src`, so re-encoding the
+                // stored column is exact.
                 self.fold_extreme_at(self.out, out_row, row, max, kind);
             }
         }

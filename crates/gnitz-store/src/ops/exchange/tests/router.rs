@@ -164,7 +164,7 @@ fn test_scatter_key_packed_matches_image_routing() {
         b.count += 1;
         let mb = b.as_mem_batch();
         for col in [0u32, 1u32] {
-            let legacy = worker_for_key(GroupKeyCols::new(&schema, &[col]).key_row(&mb, 0), NW);
+            let legacy = worker_for_key(GroupKeyCols::new(&schema, &[col]).unwrap().key_row(&mb, 0), NW);
             assert_eq!(packed(&schema, &[col], &mb, 0), legacy, "compound-PK sub-col {col}");
         }
     }

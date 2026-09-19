@@ -283,9 +283,9 @@ def test_a_string_round_trips_at_each_length_class(client, schema_name):
 
 
 # (SQL type, four values in ascending order). The integer widths straddle the
-# sign and the byte boundaries; FLOAT widens to an F64 extremum, exactly since
-# the values are dyadic; TEXT shares a prefix past the inline length; UUID and
-# DECIMAL(38,0) order on all 16 bytes, the UUIDs differing only past byte 8.
+# sign and the byte boundaries; TEXT shares a prefix past the inline length;
+# UUID and DECIMAL(38,0) order on all 16 bytes, the UUIDs differing only past
+# byte 8.
 _ORDERED = [
     ("TINYINT", [I8_MIN, -5, 0, I8_MAX]),
     ("SMALLINT", [I16_MIN, -1, 256, I16_MAX]),

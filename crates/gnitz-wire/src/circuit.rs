@@ -169,34 +169,27 @@ pub struct ComputeMap {
 /// emitted batch read, so neither can scramble the other's column widths.
 ///
 /// MIN/MAX *select* an existing row, so the extremum is itself a value of the
-/// source type: `MIN(INT)` is `INT`, `MAX(TEXT)` is `TEXT`. A float widens to
-/// F64, the width the accumulator holds it at.
+/// source type: `MIN(INT)` is `INT`, `MAX(TEXT)` is `TEXT`, `MIN(REAL)` is `REAL`.
 ///
 /// SUM over a U64 source is typed **U64**: the i64 `wrapping_add` accumulator's
 /// bit pattern already *is* the true sum mod 2^64 at the same width, so the label
 /// is the only choice, and it lets a downstream unsigned compare re-seed
 /// correctly. A narrow unsigned source still widens to I64 (its sum stays
-/// < 2^63). AVG is planner-lowered before the wire and never reaches this rule.
+/// < 2^63). SumZero folds as SUM does and is typed as SUM is. AVG is
+/// planner-lowered before the wire and never reaches this rule.
 pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
     use crate::types::type_code;
-    let is_float = crate::types::is_float(src_tc);
     match func {
-        AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => type_code::I64,
+        AggFunc::Count | AggFunc::CountNonNull => type_code::I64,
         // Exactly the 8-byte register image the accumulator holds. A temporal
         // image names a narrower slot than that image, and a sum of calendar
         // values is not one — the planner rejects SUM over a temporal column
         // before it gets here, so this is what a forged circuit lands on.
-        AggFunc::Sum => match crate::types::register_image_type(src_tc) {
+        AggFunc::Sum | AggFunc::SumZero => match crate::types::register_image_type(src_tc) {
             t if crate::is_temporal(t) => type_code::I64,
             t => t,
         },
-        AggFunc::Min | AggFunc::Max => {
-            if is_float {
-                type_code::F64
-            } else {
-                src_tc
-            }
-        }
+        AggFunc::Min | AggFunc::Max => src_tc,
     }
 }
 

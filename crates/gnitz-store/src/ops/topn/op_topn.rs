@@ -1,10 +1,8 @@
 //! Incremental TOP-N: δ_out = TopN(history + δ_in) − TopN(history), per group
 //! the delta touched.
 
-use crate::schema::key::pk_bytes_eq;
 use crate::schema::MAX_PK_BYTES;
 use crate::storage::{Batch, ReadCursor};
-use gnitz_wire::ReduceOutKey;
 
 use super::plan::TopNPlan;
 
@@ -20,18 +18,22 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
     }
     let mb = delta.as_mem_batch();
 
-    let groups = touched_groups(&mb, n, plan);
+    let runs = plan.key.runs(delta);
 
     // A hint: one window per touched group, capped by the delta rows that could
     // have touched one, and never below the window a single-row delta still fills.
     let window = 2 * plan.limit as usize;
-    let cap = window.saturating_mul(groups.len()).min(n).max(window);
+    let cap = window.saturating_mul(runs.len()).min(n).max(window);
     let mut out = Batch::with_capacity(output_schema, cap);
     let mut key = [0u8; MAX_PK_BYTES];
 
-    for &exemplar in &groups {
-        let exemplar = exemplar as usize;
-        let out_pk = plan.out_pk(&mb, exemplar);
+    // Runs ascend in output-PK order, so the `trace_out` probes do too.
+    for run in runs.iter() {
+        // A group whose every delta row is a ghost was not touched.
+        let Some(exemplar) = run.map(|p| runs.row(p)).find(|&r| mb.get_weight(r) != 0) else {
+            continue;
+        };
+        let out_pk = plan.key.out_pk(&mb, exemplar);
         let out_pk_bytes = out_pk.bytes();
 
         // −TopN(history): the stored rows, at minus their stored weight.
@@ -64,34 +66,6 @@ pub fn op_topn(delta: &Batch, trace_out: &mut ReadCursor, history: &mut ReadCurs
         }
     }
 
-    gnitz_debug!("op_topn: in={} groups={} out={}", n, groups.len(), out.count);
+    gnitz_debug!("op_topn: in={} groups={} out={}", n, runs.len(), out.count);
     out
-}
-
-/// One row of each group `delta` touches. The digest only makes a group's rows
-/// adjacent; under `PkPermutation` the output PK decides which stored rows the
-/// retraction cancels, so a digest collision there must not merge two groups.
-/// Every other kind keys the output *by* the digest.
-fn touched_groups(mb: &crate::storage::MemBatch, n: usize, plan: &TopNPlan) -> Vec<u32> {
-    // An empty group set folds to one key, so the first weighted row is the whole
-    // answer — the sort and the `n`-sized allocation below are pure waste.
-    let pk_keyed = plan.out_key == ReduceOutKey::PkPermutation;
-    if !pk_keyed && plan.group_key.cols.is_empty() {
-        return (0..n)
-            .find(|&r| mb.get_weight(r) != 0)
-            .map(|r| r as u32)
-            .into_iter()
-            .collect();
-    }
-    let mut groups: Vec<(u128, u32)> = Vec::with_capacity(n);
-    groups.extend(
-        (0..n)
-            .filter(|&r| mb.get_weight(r) != 0)
-            .map(|r| (plan.group_key.key_row(mb, r), r as u32)),
-    );
-    groups.sort_unstable();
-    groups.dedup_by(|a, b| {
-        a.0 == b.0 && (!pk_keyed || pk_bytes_eq(mb.get_pk_bytes(a.1 as usize), mb.get_pk_bytes(b.1 as usize)))
-    });
-    groups.into_iter().map(|(_, row)| row).collect()
 }

@@ -129,10 +129,6 @@ fn strs(b: &ZSetBatch, pi: usize) -> Vec<String> {
         .collect()
 }
 
-fn null_bits(b: &ZSetBatch, pi: usize) -> Vec<bool> {
-    b.nulls.iter().map(|&w| gnitz_wire::null_word_get(w, pi)).collect()
-}
-
 fn gt(ci: usize, v: i64) -> BoundExpr {
     BExpr::bin(BExpr::ColRef(ci), BinOp::Gt, BExpr::LitInt(v))
 }
@@ -248,32 +244,6 @@ fn sums_wrap_and_floats_add() {
     assert_eq!(got.nulls, [0]);
     assert_eq!(ints(&got, 0), [i64::MIN]);
     assert_eq!(got.payload[1].bytes, 3.75f64.to_le_bytes());
-}
-
-/// Rows sharing a `_group_pk` but not their group values stay apart, a NULL
-/// group value included — which is also not the zero its cell holds.
-#[test]
-fn a_digest_collision_keeps_groups_apart() {
-    let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
-    let partial = partial_schema(&[1], &specs);
-    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
-
-    let got = f.combine(batch(
-        &partial,
-        &[
-            (0x42, &[Int(10), Int(1)]),
-            (0x42, &[Int(20), Int(2)]),
-            (0x42, &[Null, Int(5)]),
-            (0x42, &[Int(10), Int(3)]),
-            (0x42, &[Int(0), Int(7)]),
-            (0x42, &[Null, Int(11)]),
-        ],
-    ));
-
-    assert_eq!(got.pks, PkColumn::from_natives(&partial, [0x42; 4]));
-    assert_eq!(null_bits(&got, 0), [false, false, true, false]);
-    assert_eq!(ints(&got, 0), [10, 20, 0, 0]);
-    assert_eq!(ints(&got, 1), [4, 2, 16, 7]);
 }
 
 #[test]

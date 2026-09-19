@@ -245,20 +245,21 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 let baked = &program.reduce_plans[plan_idx.at()];
                 let to_cursor = bound_cursor(cursors, *trace_out_reg);
 
+                // An empty delta touches no group.
                 let mut avi_cursor = match baked.avi_table.zip(baked.plan.avi.as_ref()) {
-                    Some((idx, bake)) => Some(
+                    Some((idx, bake)) if !batches[in_reg.at()].is_empty() => Some(
                         state
                             .ingest_then_cursor(idx, ops::avi_batch(&batches[in_reg.at()], bake))
                             .map_err(|e| tick_ingest_err("avi", idx, e))?,
                     ),
-                    None => None,
+                    _ => None,
                 };
 
                 gnitz_debug!(
                     "vm: REDUCE in_count={} avi={} aggs={}",
                     batches[in_reg.at()].len(),
                     avi_cursor.is_some(),
-                    baked.plan.acc_template.len()
+                    baked.plan.shape.acc_template.len()
                 );
 
                 let raw_out = ops::op_reduce(&batches[in_reg.at()], to_cursor, avi_cursor.as_mut(), &baked.plan);

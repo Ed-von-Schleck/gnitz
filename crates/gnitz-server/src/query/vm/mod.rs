@@ -296,8 +296,8 @@ impl RegisterMeta {
 }
 
 /// One `Instr::Reduce`'s baked operator data: the plan and the table its combined
-/// value index lives in. Paired at construction, so the dispatch never reconciles
-/// "the plan carries a bake" against "the instruction names a table".
+/// value index lives in. The builder pairs a table with exactly the plans that
+/// carry a bake.
 pub(in crate::query) struct BakedReduce {
     pub(in crate::query) plan: gnitz_store::ops::ReducePlan,
     pub(in crate::query) avi_table: Option<StateIdx>,

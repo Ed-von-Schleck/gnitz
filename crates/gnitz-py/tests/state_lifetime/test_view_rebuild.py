@@ -436,7 +436,7 @@ def test_a_min_max_view_decodes_back_to_the_same_value_after_a_restart(own_serve
     than the output row: the AVI stores an order-preserving image, and a resumed
     view must decode back to the value it emitted. One column per arm the image
     has — a signed narrow int (sign-flipped), a full-width unsigned (identity),
-    and both float widths (`total_cmp` order, F32 widening to an F64 output).
+    and both float widths (`total_cmp` order).
 
     MIN/MAX select a stored value rather than folding one, so the float columns
     must come back bit-identical; a tolerance window here would pass a decode

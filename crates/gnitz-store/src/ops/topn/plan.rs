@@ -2,10 +2,9 @@
 //! compile-time facts, baked once at emit time.
 
 use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaDescriptor};
-use crate::storage::MemBatch;
 use gnitz_wire::{OrderKey, ReduceOutSlot};
 
-use super::super::group_key::{group_out_pk, GroupKeyCols, OutPk, GROUP_PK_COL};
+use super::super::group_key::{GroupOutKey, GROUP_PK_COL};
 use super::index::TopNIndex;
 
 /// The baked per-instruction top-N plan. Built by [`TopNPlan::from_wire`] only.
@@ -14,8 +13,8 @@ pub struct TopNPlan {
     /// would have ([`ReduceOutKey`]), then every input column not in that region,
     /// in input schema order. Derived here so no caller derives it a second time.
     pub output_schema: SchemaDescriptor,
-    pub(super) out_key: ReduceOutKey,
-    pub(super) group_key: GroupKeyCols,
+    /// How a row's group is found and keyed in the output.
+    pub(super) key: GroupOutKey,
     /// Weight slots to skip, then to keep, per group. `limit ≥ 1`.
     pub(super) offset: u64,
     pub(super) limit: u64,
@@ -69,19 +68,7 @@ impl TopNPlan {
         let (output_schema, carried) = build_topn_output_schema(input_schema, out_key, group_cols)
             .ok_or_else(|| OpBuildErr::shape("top-n: output exceeds MAX_COLUMNS"))?;
         let index = TopNIndex::new(input_schema, group_cols, order, &carried)?;
-        Ok(TopNPlan {
-            output_schema,
-            out_key,
-            group_key: GroupKeyCols::new(input_schema, group_cols),
-            offset,
-            limit,
-            index,
-        })
-    }
-
-    /// The output PK of the group `row` of `mb` belongs to.
-    #[inline]
-    pub(super) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
-        group_out_pk(self.out_key, &self.group_key, self.output_schema.pk_stride(), mb, row)
+        let key = GroupOutKey::new(input_schema, group_cols, out_key, &output_schema)?;
+        Ok(TopNPlan { output_schema, key, offset, limit, index })
     }
 }

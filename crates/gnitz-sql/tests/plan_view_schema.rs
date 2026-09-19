@@ -580,8 +580,7 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
             &[0],
             &[TypeCode::U128, i, i],
         ),
-        // An integer extremum is one of its input values, so it keeps the source
-        // width; a float one widens to F64.
+        // An extremum is one of its input values, so it keeps the source type.
         (
             "SELECT g, MIN(i8) AS a, MAX(i16) AS b, MIN(i32) AS c, MAX(u32) AS d, MIN(f32) AS e \
              FROM nw GROUP BY g",
@@ -600,7 +599,7 @@ fn an_aggregate_output_column_is_typed_by_its_argument_and_grouping() {
                 TypeCode::I16,
                 TypeCode::I32,
                 TypeCode::U32,
-                TypeCode::F64,
+                TypeCode::F32,
             ],
         ),
     ];

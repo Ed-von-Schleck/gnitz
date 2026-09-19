@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::key::NarrowPkOpk;
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::Layout;
 use gnitz_wire::{read_i64_le, AggDescriptor, AggFunc};

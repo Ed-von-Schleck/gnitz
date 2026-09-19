@@ -365,7 +365,7 @@ fn emit_reduce(
         || slot.rank as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), slot.of as usize);
 
     let plan = gnitz_store::ops::ReducePlan::from_wire(&in_reg_schema, group_cols, agg, global_ground, i_am_owner)?;
-    let reduce_out_schema = plan.output_schema;
+    let reduce_out_schema = plan.shape.output_schema;
 
     let trace_reg = ctx.push_trace_reg(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema)?;
     let out_reg = ctx.push_delta_reg(reduce_out_schema);

@@ -51,7 +51,7 @@ mod suites;
 // ── Relations, batches and the flush path ───────────────────────────────────
 pub use batch::Batch;
 pub use batch::MAX_BATCH_REGIONS;
-pub(crate) use batch::{range_rows, write_to_batch};
+pub(crate) use batch::{range_rows, write_to_batch, RowMark};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::{StorageError, StoreError};
 pub(crate) use lsm::flush_barrier::{flush_barrier, FlushRound};
@@ -83,9 +83,8 @@ pub(crate) use columnar::pk_group_end;
 pub use columnar::compare_rows_except;
 pub use columnar::{payload_bytes, payload_is_null, payload_str, payload_string, payload_u64};
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
-// caller names `crate::schema::key::X`. Re-exporting it split one byte-order
-// rule across two import paths, visibly — `ops/reduce/sort.rs` and
-// `read/scan_spec.rs` each imported from both in adjacent lines.
+// caller names `crate::schema::key::X`, so one byte-order rule has one import
+// path.
 pub(crate) use lsm::child_dir::children_at_generation;
 pub use lsm::child_dir::fsync_dir;
 pub(crate) use lsm::child_dir::reclaim_retired_children;

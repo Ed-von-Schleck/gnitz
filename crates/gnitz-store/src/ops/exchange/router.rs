@@ -55,6 +55,13 @@ pub enum ScatterSpec<'a> {
     JoinKey(&'a [gnitz_wire::ReindexSlot]),
 }
 
+impl ScatterSpec<'_> {
+    /// Refused exactly where [`ScatterKey::new`] would refuse it.
+    pub fn check(self, schema: &SchemaDescriptor) -> Result<(), OpBuildErr> {
+        ScatterKey::new(self, schema, 1).map(drop)
+    }
+}
+
 /// Per-scatter row router, built once (out of the row loop — a packer's
 /// per-column schema classification is hoisted here) and applied per row. The
 /// variant is picked from circuit metadata, not per-query data:
@@ -78,8 +85,7 @@ pub enum ScatterSpec<'a> {
 ///   the group-key fold, which `op_reduce` also uses for the group's output
 ///   PK — the two must agree or the result is mis-gathered. The fold keeps
 ///   NULL distinct because a NULL group and a 0 group must not collide on one
-///   output PK; scatter routing has no such requirement, but local grouping
-///   (`cmp_group_cols`) still separates co-located groups.
+///   output PK.
 // One `ScatterKey` is built per scatter (a stack local) and read per row, so
 // the `ReindexPacker` and its scratch stay inline — boxing would add a heap
 // alloc and a per-row pointer chase for no benefit.
@@ -104,11 +110,8 @@ pub(super) struct ScatterKey {
 }
 
 impl ScatterKey {
-    /// Refused when `schema` cannot route by `spec` — a column it has not got, or
-    /// one a reindex key cannot pack. The route reaches here off a client-pushed
-    /// circuit row, and both fold paths resolve columns through `locate`'s
-    /// release-active assert, so this is where it is rejected. The reason travels
-    /// because the master relay renders it to the client.
+    /// Refused when `schema` cannot route by `spec`: a column it has not got, or
+    /// one the group key or a reindex key refuses.
     #[inline]
     pub(crate) fn new(
         spec: ScatterSpec<'_>,
@@ -122,12 +125,7 @@ impl ScatterKey {
         let pk = schema.pk_indices();
         let kind = match spec {
             ScatterSpec::GroupKey(cols) if cols == pk => ScatterKind::PkBytes,
-            ScatterSpec::GroupKey(cols) => {
-                if let Some(&c) = cols.iter().find(|&&c| schema.column(c as usize).is_none()) {
-                    return Err(OpBuildErr::oob_col("scatter group key: column", c, schema));
-                }
-                ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols) }
-            }
+            ScatterSpec::GroupKey(cols) => ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols)? },
             ScatterSpec::JoinKey(slots)
                 if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc.is_none()) =>
             {
