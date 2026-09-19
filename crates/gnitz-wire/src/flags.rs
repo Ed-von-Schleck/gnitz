@@ -47,6 +47,9 @@ wire_enum! {
 
 /// The control header's `flags` word. `pack`/`unpack` are the only code that knows
 /// the bit layout, so no two fields can overlap and no consumer re-derives one.
+///
+/// Bits 32/33 — which blocks follow the header — belong to the control codec, so
+/// `pack` leaves them clear and `unpack` ignores them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireFlags {
     /// Bits 0-7.
@@ -55,10 +58,6 @@ pub struct WireFlags {
     pub conflict_mode: WireConflictMode,
     /// Bits 16-31: the relation schema version the frame speaks, 0 = none.
     pub schema_version: u16,
-    /// Bit 32.
-    pub has_schema: bool,
-    /// Bit 33.
-    pub has_data: bool,
     /// Bit 34: more frames of this reply follow. Set on every per-worker reply
     /// frame, absent on the master's terminal frame.
     pub continuation: bool,
@@ -75,6 +74,9 @@ pub struct WireFlags {
     pub backfill_pad: bool,
 }
 
+pub(crate) const FLAG_HAS_SCHEMA: u64 = 1 << 32;
+pub(crate) const FLAG_HAS_DATA: u64 = 1 << 33;
+
 const RESERVED_BITS: u64 = !crate::low_bits_mask(42);
 
 impl WireFlags {
@@ -85,8 +87,6 @@ impl WireFlags {
             verb: ClientVerb::Scan,
             conflict_mode: WireConflictMode::Update,
             schema_version,
-            has_schema: false,
-            has_data: false,
             continuation: true,
             batch_consolidated: false,
             scan_last: last,
@@ -100,8 +100,6 @@ impl WireFlags {
         self.verb as u64
             | (self.conflict_mode as u64) << 8
             | (self.schema_version as u64) << 16
-            | (self.has_schema as u64) << 32
-            | (self.has_data as u64) << 33
             | (self.continuation as u64) << 34
             | (self.batch_consolidated as u64) << 35
             | (self.scan_last as u64) << 36
@@ -121,8 +119,6 @@ impl WireFlags {
             verb: ClientVerb::from_wire(w as u8).ok_or("flags: unknown request verb")?,
             conflict_mode: WireConflictMode::from_wire((w >> 8) as u8).ok_or("flags: unknown conflict mode")?,
             schema_version: (w >> 16) as u16,
-            has_schema: bit(32),
-            has_data: bit(33),
             continuation: bit(34),
             batch_consolidated: bit(35),
             scan_last: bit(36),
@@ -130,16 +126,6 @@ impl WireFlags {
             backfill: BackfillDecision::from_wire(((w >> 39) & 3) as u8).ok_or("flags: unknown backfill decision")?,
             backfill_pad: bit(41),
         })
-    }
-
-    /// The verb a client frame names. Only a push carries rows, so a data block on
-    /// any other verb — `Scan` included, which would answer it with a table dump — is
-    /// malformed.
-    pub fn client_verb(self) -> Result<ClientVerb, &'static str> {
-        if self.has_data && self.verb != ClientVerb::Push {
-            return Err("frame carries a data block on a verb other than PUSH");
-        }
-        Ok(self.verb)
     }
 }
 

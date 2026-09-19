@@ -750,12 +750,12 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1, "the fault is the whole reply");
     let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
-    assert_eq!(ctrl.hdr.status, gnitz_wire::WireStatus::Error);
+    let fault = ctrl.fault().expect("a fault frame");
+    assert_eq!(fault.status, gnitz_wire::WireStatus::Error);
     assert_eq!(frames[0].0, 5);
-    let text = String::from_utf8_lossy(&ctrl.blob);
     assert!(
-        text.contains("exceeds the maximum frame payload"),
-        "the fault names the cap: {text}"
+        fault.text.contains("exceeds the maximum frame payload"),
+        "the fault names the cap: {fault}"
     );
 }
 
@@ -846,7 +846,7 @@ fn a_reader_held_reply_carries_no_block_at_version_0() {
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
     let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
-    assert!(!ctrl.hdr.flags.has_schema, "a fitting reply ships no block");
+    assert!(ctrl.schema.is_none(), "a fitting reply ships no block");
     assert_eq!(ctrl.hdr.flags.schema_version, 0);
 
     let rows = (ipc::FRAME_CAP / 32) + 4096;

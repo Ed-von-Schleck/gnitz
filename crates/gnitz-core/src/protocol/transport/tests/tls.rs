@@ -284,14 +284,14 @@ fn loopback_deadline_over_tls_never_tears_a_frame() {
     let deadline = || Some(Instant::now() + Duration::from_millis(100));
     // The big frame is sent once; on expiry its remainder is queue state,
     // and the small frame that follows queues behind it.
-    let expired = match t.send_framed(&big, deadline()) {
+    let expired = match t.send_frame(big.clone(), deadline()) {
         Ok(()) => false,
         Err(ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => true,
         Err(e) => panic!("{e}"),
     };
     assert!(expired, "the deadline must have fired");
     loop {
-        match t.send_framed(b"after", deadline()) {
+        match t.send_frame(b"after".to_vec(), deadline()) {
             Ok(()) => break,
             Err(ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => panic!("{e}"),

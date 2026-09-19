@@ -8,10 +8,7 @@
 
 use std::fmt;
 
-/// A malformed WAL block, as diagnosed by [`crate::wal::validate_and_parse`] /
-/// [`crate::wal::encode`]. Coarse by design: every caller either `expect`s the
-/// encode (a too-small output buffer is a caller bug) or maps a decode failure
-/// into its own string-based protocol/storage error.
+/// A malformed WAL block, as diagnosed by [`crate::wal::validate_and_parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalError {
     /// Buffer is shorter than the header / a directory entry / a region extent
@@ -21,8 +18,6 @@ pub enum WalError {
     InvalidVersion,
     /// XXH3 body checksum did not match the stored value.
     ChecksumMismatch,
-    /// Output buffer was too small to hold the encoded block.
-    BufferTooSmall,
     /// Region count exceeds the directory cap, or a directory entry failed
     /// validation.
     InvalidShard,
@@ -34,7 +29,6 @@ impl WalError {
             WalError::Truncated => "truncated",
             WalError::InvalidVersion => "invalid version",
             WalError::ChecksumMismatch => "checksum mismatch",
-            WalError::BufferTooSmall => "buffer too small",
             WalError::InvalidShard => "invalid shard layout",
         }
     }

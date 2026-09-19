@@ -120,7 +120,7 @@ fn single_bit_header_sweep_changes_nothing_observable() {
 
 /// Every bit of a slot of a zoned push group — laid out by the fast path
 /// (`scatter::with_group`), the SAL's highest-volume writer — is covered by that
-/// slot's directory checksum, and by no other slot's. Clearing `has_data` is the
+/// slot's directory checksum, and by no other slot's. Clearing the data-block bit is the
 /// costliest flip in that span: the decode reads `Ok` with no batch, so a
 /// committed push slot's rows would vanish silently.
 #[test]

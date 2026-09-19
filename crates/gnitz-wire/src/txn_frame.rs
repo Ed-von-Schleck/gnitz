@@ -16,10 +16,9 @@
 //! the mode byte, the 10-byte relation record, the 16-byte precondition — from
 //! being restated on each side of the wire.
 //!
-//! The per-item WAL blocks are **pre-encoded bytes**: what a schema or data block
-//! contains belongs to `schema_block` and to each side's batch codec, and every
-//! block is self-sizing (its `WAL_OFF_SIZE`), so the frame walk needs nothing
-//! beyond the bytes.
+//! What a schema or data block contains belongs to `schema_block` and to each
+//! side's batch codec. Every block is self-sizing (its `WAL_OFF_SIZE`), so the
+//! frame walk needs nothing beyond the bytes.
 //!
 //! **In the reply direction `target_id` says what a fault covers.** A fault at
 //! `0` — which [`validate_item_ids`] keeps out of every item list — rejects the
@@ -27,8 +26,8 @@
 //! `DELTA_POLL` answers per item; the other three fault at `0` alone.
 
 use crate::codec::{Reader, Writer};
-use crate::control::{encode_ctrl_block, ControlHeader, DecodedControl, CTRL_HEADER_SIZE};
-use crate::wal;
+use crate::control::{encode_frame_head, ControlHeader, DecodedControl, CTRL_HEADER_SIZE};
+use crate::wal::{self, WalBlock};
 use crate::{read_u32_le, ClientVerb, WireConflictMode, WireFlags, WAL_OFF_TID};
 
 /// Bytes one `SCAN_MULTI` relation record occupies: a `u64` tid and the client's
@@ -85,37 +84,11 @@ fn prologue(verb: ClientVerb, arg1: u64, body_hint: usize) -> Writer {
         arg1,
         ..Default::default()
     };
+    let mut head = [0u8; CTRL_HEADER_SIZE];
+    encode_frame_head(&mut head, &hdr, &[], None, false);
     let mut w = Writer::with_capacity(CTRL_HEADER_SIZE + body_hint);
-    // Written into the frame, not into a scratch `Vec` and copied in.
-    encode_ctrl_block(w.reserve(CTRL_HEADER_SIZE), &hdr, &[]);
+    w.raw(&head);
     w
-}
-
-/// One WAL block a transaction frame carries, as the region list it is framed
-/// from rather than as bytes.
-///
-/// The frame encoders below size the whole frame from these and then write each
-/// block **into** it, so a batch is copied once — into the frame — instead of
-/// once into a per-block `Vec` and again into the frame. At the 64 MB frame cap
-/// that second copy is milliseconds, on a path every autocommit `UPDATE` /
-/// `DELETE` runs and an OCC retry re-runs.
-pub struct WalBlock<'a> {
-    pub table_id: u32,
-    pub entry_count: u32,
-    pub regions: &'a [&'a [u8]],
-}
-
-impl WalBlock<'_> {
-    /// The framed size — what the frame reserves for this block.
-    pub fn size(&self) -> usize {
-        crate::wal::block_size_of(self.regions)
-    }
-
-    /// Frame this block into `dst`, which must be exactly [`Self::size`] bytes.
-    fn write(&self, dst: &mut [u8]) {
-        crate::wal::encode(dst, 0, self.table_id, self.entry_count, self.regions, false)
-            .expect("WAL encode: the frame reserved block_size_of bytes");
-    }
 }
 
 /// Encode an atomic **DDL transaction** frame (`ClientVerb::DdlTxn`), without the
@@ -130,8 +103,7 @@ impl WalBlock<'_> {
 pub fn encode_ddl_txn(blocks: &[WalBlock<'_>]) -> Vec<u8> {
     let mut w = prologue(ClientVerb::DdlTxn, 0, blocks.iter().map(|b| b.size()).sum());
     for b in blocks {
-        let n = b.size();
-        b.write(w.reserve(n));
+        w.block(b);
     }
     w.into_vec()
 }
@@ -147,8 +119,11 @@ pub fn encode_ddl_txn(blocks: &[WalBlock<'_>]) -> Vec<u8> {
 ///
 /// A `preconditions` entry `(tid, basis)` asserts "no commit has written `tid`
 /// with a zone LSN greater than `basis`". Their count rides `arg1`.
-pub fn encode_push_txn(families: &[(WireConflictMode, &[u8], WalBlock<'_>)], preconditions: &[(u64, u64)]) -> Vec<u8> {
-    let body: usize = families.iter().map(|(_, s, d)| 1 + s.len() + d.size()).sum();
+pub fn encode_push_txn(
+    families: &[(WireConflictMode, impl AsRef<[u8]>, WalBlock<'_>)],
+    preconditions: &[(u64, u64)],
+) -> Vec<u8> {
+    let body: usize = families.iter().map(|(_, s, d)| 1 + s.as_ref().len() + d.size()).sum();
     let mut w = prologue(
         ClientVerb::PushTxn,
         preconditions.len() as u64,
@@ -158,9 +133,7 @@ pub fn encode_push_txn(families: &[(WireConflictMode, &[u8], WalBlock<'_>)], pre
         w.u64(*tid).u64(*basis);
     }
     for (mode, schema_block, wal_block) in families {
-        w.u8(mode.as_wire()).raw(schema_block);
-        let n = wal_block.size();
-        wal_block.write(w.reserve(n));
+        w.u8(mode.as_wire()).raw(schema_block.as_ref()).block(wal_block);
     }
     w.into_vec()
 }

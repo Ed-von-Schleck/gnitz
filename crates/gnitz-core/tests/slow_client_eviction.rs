@@ -58,7 +58,7 @@ fn slow_scan_client_is_evicted_after_deadline() {
         ..Default::default()
     };
     let scan = encode_frame(hdr, &[], None, None);
-    slow.send_parts(scan, None).expect("send scan");
+    slow.send_frame(scan, None).expect("send scan");
 
     let evicted = peer_hung_up_within(slow.as_raw_fd(), 8000);
     drop(slow);

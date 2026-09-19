@@ -45,7 +45,7 @@ pub(crate) fn reply_ctrl(tid: u64, lsn: u64) -> Vec<u8> {
         arg0: lsn,
         ..Default::default()
     };
-    crate::protocol::encode_frame(hdr, &[], None, None).ctrl
+    crate::protocol::encode_frame(hdr, &[], None, None)
 }
 
 /// `[u32 LE len][payload]`, what a peer writes.

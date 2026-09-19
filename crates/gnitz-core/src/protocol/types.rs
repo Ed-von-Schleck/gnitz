@@ -806,6 +806,13 @@ impl ZSetBatch {
     /// rule for a batch that never went through the push path.
     pub(crate) fn check_columns(&self) -> Result<(), std::string::String> {
         let n = self.len();
+        let regions = gnitz_wire::wal::num_regions(self.payload.len());
+        if regions > gnitz_wire::MAX_WIRE_REGIONS {
+            return Err(format!(
+                "{regions} regions exceeds the {} a block directory holds",
+                gnitz_wire::MAX_WIRE_REGIONS
+            ));
+        }
         for (pi, col) in self.payload.iter().enumerate() {
             let (got, want) = (col.bytes.len(), n * col.stride());
             if got != want {

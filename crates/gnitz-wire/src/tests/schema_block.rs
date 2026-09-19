@@ -51,15 +51,6 @@ fn rejects_a_directory_that_overflows_the_buffer() {
     );
 }
 
-#[test]
-fn encoded_len_matches_what_encode_writes() {
-    let cols = [
-        col(TypeCode::U64, "id", Some(0), false),
-        col(TypeCode::String, "spills_into_the_blob_heap", None, false),
-    ];
-    assert_eq!(encode(1, &cols).len(), encoded_len(&cols));
-}
-
 /// A block with fewer regions than the meta-schema shape. Every region this
 /// decoder reads still fits, so a lower-bound check would accept it.
 #[test]
@@ -117,14 +108,13 @@ fn rejects_a_block_with_no_pk_column() {
 }
 
 /// One forgery: a mutation of a parsed block, given its region offsets.
-type Forge = fn(&mut [u8], &[u64]);
+type Forge = fn(&mut [u8], &[usize]);
 
 /// [`simple`] with `mutate` applied against its parsed region offsets.
 fn forged(mutate: Forge) -> Vec<u8> {
     let mut block = simple();
-    let mut offs = [0u64; wal::MAX_WIRE_REGIONS];
-    let mut sizes = [0u32; wal::MAX_WIRE_REGIONS];
-    wal::validate_and_parse(&block, &mut offs, &mut sizes, false).unwrap();
+    wal::validate_and_parse(&block, false).unwrap();
+    let offs: Vec<usize> = (0..SCHEMA_BLOCK_REGIONS).map(|r| wal::dir_entry(&block, r).0).collect();
     mutate(&mut block, &offs);
     block
 }
@@ -140,21 +130,21 @@ fn each_schema_guard_rejects_its_own_forgery() {
         // decode rejects it — so the two ends would disagree on which blocks
         // are legal.
         ("schema: invalid type code", |b, offs| {
-            write_u64_le(b, offs[REG_TYPE_CODE] as usize, 0x0000_0001_0000_0002)
+            write_u64_le(b, offs[REG_TYPE_CODE], 0x0000_0001_0000_0002)
         }),
         // The block asserts no column field is null; a set bit would mean the
         // type, flags or name of that column is absent from the cells the
         // decoder nonetheless reads.
         ("schema block declares a null column field", |b, offs| {
-            write_u64_le(b, offs[REG_NULL_BMP] as usize, 1)
+            write_u64_le(b, offs[REG_NULL_BMP], 1)
         }),
         ("schema col_idx not in monotonic order", |b, offs| {
-            let pk_off = offs[REG_PK] as usize;
+            let pk_off = offs[REG_PK];
             b[pk_off..pk_off + 8].copy_from_slice(&5u64.to_be_bytes());
         }),
         // Row 1's name is the long one; push its heap offset past the heap.
         ("schema name cell is not in canonical form", |b, offs| {
-            write_u64_le(b, offs[REG_NAME] as usize + 16 + 8, 1 << 20)
+            write_u64_le(b, offs[REG_NAME] + 16 + 8, 1 << 20)
         }),
     ];
     for (want, forge) in cases {

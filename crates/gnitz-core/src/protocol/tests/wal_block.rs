@@ -601,7 +601,7 @@ fn decoding_regions_equals_decoding_the_framed_block() {
     b.payload[0].bytes = german_col(&vals, &mut blob);
     b.blob = blob;
 
-    let regions = crate::protocol::regions::regions(&b);
+    let regions = b.regions();
     let mut local = ZSetBatch::new(&schema);
     decode_regions_into(&mut local, &regions, b.len(), &schema).unwrap();
     let (remote, _) = decode_wal_block(&encode_wal_block(9, &b), &schema).unwrap();

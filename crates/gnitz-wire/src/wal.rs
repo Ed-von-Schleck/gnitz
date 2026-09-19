@@ -2,7 +2,7 @@
 //!
 //! A WAL block is `[32B header][directory: num_regions × 8B][data regions, packed
 //! end to end]`. This module owns the header constants, the region-directory
-//! framer ([`encode`] / [`validate_and_parse`]), the size/header/checksum
+//! framer ([`WalBlock`] / [`validate_and_parse`]), the size/header/checksum
 //! helpers the SAL scatter writer shares, and the region-count cap.
 //!
 //! It is representation-agnostic: regions are raw byte slices, with no `Batch`
@@ -18,6 +18,9 @@
 //!   [16,24) CHECKSUM     u64 (XXH3 over [WAL_HEADER_SIZE, SIZE))
 //!   [24,28) NUM_REGIONS  u32
 //!   [28,32) RESERVED     u32
+
+use std::mem::MaybeUninit;
+use std::ops::Deref;
 
 use crate::{checksum, read_u32_le, read_u64_le, write_u32_le, write_u64_le, WalError};
 
@@ -63,10 +66,93 @@ pub const WAL_OFF_NUM_REGIONS: usize = 24;
 /// is not in the arena, so `MAX_BATCH_REGIONS` is this less one slot.
 pub const MAX_WIRE_REGIONS: usize = 69;
 
-/// Total byte size of the WAL block that would frame `regions`, for a caller
-/// that already holds the `&[&[u8]]` [`encode`] takes.
-pub fn block_size_of(regions: &[&[u8]]) -> usize {
-    body_start(regions.len()) + regions.iter().map(|r| r.len()).sum::<usize>()
+/// A block's canonical region list, held inline.
+pub struct Regions<'a> {
+    slots: [MaybeUninit<&'a [u8]>; MAX_WIRE_REGIONS],
+    len: usize,
+}
+
+impl<'a> Regions<'a> {
+    pub const fn new() -> Self {
+        Regions {
+            slots: [const { MaybeUninit::uninit() }; MAX_WIRE_REGIONS],
+            len: 0,
+        }
+    }
+
+    /// Append `region`. Panics past [`MAX_WIRE_REGIONS`].
+    pub fn push(&mut self, region: &'a [u8]) {
+        self.slots[self.len].write(region);
+        self.len += 1;
+    }
+}
+
+impl Default for Regions<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> Deref for Regions<'a> {
+    type Target = [&'a [u8]];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `push` initialised every slot below `len`, and `MaybeUninit<T>` has `T`'s layout.
+        unsafe { std::slice::from_raw_parts(self.slots.as_ptr().cast(), self.len) }
+    }
+}
+
+/// One WAL block as the region list it is framed from.
+pub struct WalBlock<'a> {
+    pub table_id: u32,
+    pub entry_count: u32,
+    pub regions: Regions<'a>,
+}
+
+impl WalBlock<'_> {
+    /// The framed size: header, directory and every region.
+    pub fn size(&self) -> usize {
+        body_start(self.regions.len()) + self.regions.iter().map(|r| r.len()).sum::<usize>()
+    }
+
+    /// The header and directory, into the first [`body_start`] bytes of `block`.
+    fn write_head(&self, block: &mut [u8]) {
+        write_header_and_directory(
+            block,
+            self.table_id,
+            self.entry_count,
+            self.regions.len(),
+            self.regions.iter().map(|r| r.len() as u32),
+            self.size(),
+        );
+    }
+
+    /// Frame into `dst`, which must hold [`Self::size`] bytes. `checksum_body`
+    /// stamps the XXH3 body checksum, which only SAL recovery reads.
+    pub fn write(&self, dst: &mut [u8], checksum_body: bool) {
+        let total_size = self.size();
+        let block = &mut dst[..total_size];
+        self.write_head(block);
+        let mut at = body_start(self.regions.len());
+        for r in self.regions.iter() {
+            block[at..at + r.len()].copy_from_slice(r);
+            at += r.len();
+        }
+        if checksum_body {
+            stamp_checksum(block, total_size);
+        }
+    }
+
+    /// Append the framed block to `out`, with no body checksum.
+    pub fn append_to(&self, out: &mut Vec<u8>) {
+        let at = out.len();
+        out.reserve(self.size());
+        out.resize(at + body_start(self.regions.len()), 0);
+        self.write_head(&mut out[at..]);
+        for r in self.regions.iter() {
+            out.extend_from_slice(r);
+        }
+    }
 }
 
 /// Where a block's first region begins: the header, then one 8-byte directory
@@ -194,68 +280,6 @@ pub struct WalBlockHeader {
     pub total_size: usize,
 }
 
-/// Encode a WAL block from region byte slices into `out_buf` starting at
-/// `out_offset`.
-///
-/// Returns the new offset (= `out_offset + total_block_size`) on success, or
-/// `Err(WalError::BufferTooSmall)` if `out_buf` cannot fit the encoded block.
-///
-/// The block layout is:
-///   [32B header][directory: num_regions * 8B][data regions, packed end to end]
-///
-/// Directory entries store offsets relative to block start (not buffer start).
-/// Region sizes are `regions[i].len()`; a zero-length region occupies a
-/// directory slot but no body bytes. Each region is copied verbatim — the
-/// `&[u8]` slices make the length structural, so there is no separate size
-/// array to keep in sync and no null-pointer sentinel.
-///
-/// `checksum_body = true` stamps the XXH3 body checksum, which only SAL recovery
-/// verifies; every other frame skips the computation.
-pub fn encode(
-    out_buf: &mut [u8],
-    out_offset: usize,
-    table_id: u32,
-    entry_count: u32,
-    regions: &[&[u8]],
-    checksum_body: bool,
-) -> Result<usize, WalError> {
-    let total_size = block_size_of(regions);
-
-    if out_offset + total_size > out_buf.len() {
-        return Err(WalError::BufferTooSmall);
-    }
-
-    let block = &mut out_buf[out_offset..out_offset + total_size];
-
-    // Phase 1: header + directory.
-    write_header_and_directory(
-        block,
-        table_id,
-        entry_count,
-        regions.len(),
-        regions.iter().map(|r| r.len() as u32),
-        total_size,
-    );
-
-    // Phase 2: copy each region to the position its directory entry names.
-    // Coalescing source-adjacent runs into one `copy_nonoverlapping` is unsound:
-    // the regions are independent `&[u8]`s, so a copy spanning past region `i`'s
-    // length reads outside its provenance.
-    for (i, r) in regions.iter().enumerate() {
-        if r.is_empty() {
-            continue;
-        }
-        let (dst, _) = dir_entry(block, i);
-        block[dst..dst + r.len()].copy_from_slice(r);
-    }
-
-    if checksum_body {
-        stamp_checksum(block, total_size);
-    }
-
-    Ok(out_offset + total_size)
-}
-
 /// The WAL block starting at `off`, sized by its own `SIZE` field.
 ///
 /// Every framed decoder walks a run of concatenated blocks this way — control,
@@ -291,25 +315,11 @@ fn verify_body_checksum(block: &[u8]) -> Result<(), WalError> {
     Ok(())
 }
 
-/// Validate a WAL block and extract its header + directory entries.
+/// Validate a WAL block and slice out its header and regions.
 ///
-/// On success: the returned [`WalBlockHeader`] carries the header fields, the
-/// first `num_regions` slots of `out_region_offsets`/`out_region_sizes` are
-/// populated, and every region's `[offset, offset + size)` extent is guaranteed
-/// to lie within the block (`offset + size <= total_size <= block.len()`) —
-/// decoders can index each region without a further bounds check.
-///
-/// A block whose region count exceeds `MAX_WIRE_REGIONS` (or the out slices)
-/// is rejected as `InvalidShard` — no well-formed producer emits one.
-///
-/// `verify_checksum = true` verifies the XXH3 body checksum, for SAL recovery,
-/// the one reader of blocks written with one; every other decode passes `false`.
-pub fn validate_and_parse(
-    block: &[u8],
-    out_region_offsets: &mut [u64],
-    out_region_sizes: &mut [u32],
-    verify_checksum: bool,
-) -> Result<WalBlockHeader, WalError> {
+/// `verify_checksum` verifies the XXH3 body checksum, which only SAL recovery —
+/// the one reader of blocks written with one — passes `true` for.
+pub fn validate_and_parse(block: &[u8], verify_checksum: bool) -> Result<(WalBlockHeader, Regions<'_>), WalError> {
     if block.len() < WAL_HEADER_SIZE {
         return Err(WalError::Truncated);
     }
@@ -336,9 +346,10 @@ pub fn validate_and_parse(
     };
 
     let n = header.num_regions as usize;
-    if n > MAX_WIRE_REGIONS || n > out_region_offsets.len() || n > out_region_sizes.len() {
+    if n > MAX_WIRE_REGIONS {
         return Err(WalError::InvalidShard);
     }
+    let mut regions = Regions::new();
     for i in 0..n {
         let dir_off = dir_entry_offset(i);
         if dir_off + 8 > total_size {
@@ -346,20 +357,16 @@ pub fn validate_and_parse(
         }
         let off = read_u32_le(block, dir_off) as usize;
         let sz = read_u32_le(block, dir_off + 4) as usize;
-        // The region's data extent must lie within the block. `total_size <=
-        // block.len()` (checked above), so this is the tightest in-block bound.
-        // Without it a directory entry could name a region running past the
-        // block end, which decoders would silently zero-fill (a dropped column,
-        // or an emptied blob heap) rather than reject. `off`/`sz` are u32, so
-        // `off + sz` cannot overflow usize on a 64-bit target.
+        // Against `total_size`, not `block.len()`: a block in a multi-block
+        // buffer must not name a region reaching into the next one. `off`/`sz`
+        // are u32, so the sum cannot overflow a 64-bit usize.
         if off + sz > total_size {
             return Err(WalError::Truncated);
         }
-        out_region_offsets[i] = off as u64;
-        out_region_sizes[i] = sz as u32;
+        regions.push(&block[off..off + sz]);
     }
 
-    Ok(header)
+    Ok((header, regions))
 }
 
 #[cfg(test)]

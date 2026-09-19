@@ -355,7 +355,7 @@ fn a_range_chunk_frames_identically_to_the_same_rows_whole() {
     }
 }
 
-/// A continuation frame (`has_data`, no `has_schema`) decodes against a
+/// A continuation frame (a data block, no schema block) decodes against a
 /// schema hint, and not without one.
 #[test]
 fn continuation_frame_decoded_with_schema_hint() {

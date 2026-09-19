@@ -4,20 +4,17 @@ use super::*;
 /// is absent or blank falls back to the default rather than surfacing a blank
 /// one — the warm-push guard's rejection must stay legible.
 ///
-/// Driven through a real encoded control frame, not a hand-built `Message`:
-/// which statuses reach the classifier carrying text is the decoder's decision,
-/// and a hand-built one can express a state the decoder never produces.
+/// Driven through a real encoded frame: a hand-built control can express a state
+/// the encoder never produces.
 #[test]
 fn check_response_classifies_every_status() {
-    use crate::protocol::message::{encode_frame, parse_response_frame};
+    use crate::protocol::message::encode_frame;
 
     let classify = |status: WireStatus, text: &str| {
         let hdr = ControlHeader { status, arg0: 77, ..Default::default() };
-        let frame = encode_frame(hdr, text.as_bytes(), None, None).ctrl;
-        let mut msg = parse_response_frame(&frame, None)
-            .expect("a control frame parses")
-            .message;
-        check_response(&mut msg).map(|()| msg)
+        let frame = encode_frame(hdr, text.as_bytes(), None, None);
+        let ctrl = peek_control_block(&frame).expect("a control frame parses");
+        check_response(&ctrl)
     };
     let err = |status, text: &str| classify(status, text).expect_err("a non-OK status is an error");
 
@@ -147,17 +144,17 @@ mod spine_tests {
     /// A reply frame carrying its schema block at `version`, data, and `lsn` in
     /// `arg0`; `cont` sets `continuation`.
     fn reply_cold(tid: u64, version: u16, schema: &Schema, batch: &ZSetBatch, lsn: u64, cont: bool) -> Vec<u8> {
-        encode_frame(reply_header(tid, version, lsn, cont), &[], Some(schema), Some(batch)).to_vec()
+        encode_frame(reply_header(tid, version, lsn, cont), &[], Some(schema), Some(batch))
     }
 
     /// A hint-only reply frame: data, no schema block, `version` in the flags.
     fn reply_warm(tid: u64, version: u16, batch: &ZSetBatch, cont: bool) -> Vec<u8> {
-        encode_frame(reply_header(tid, version, 0, cont), &[], None, Some(batch)).to_vec()
+        encode_frame(reply_header(tid, version, 0, cont), &[], None, Some(batch))
     }
 
     fn reply_status(status: WireStatus, text: &str, arg0: u64) -> Vec<u8> {
         let hdr = ControlHeader { status, arg0, ..Default::default() };
-        encode_frame(hdr, text.as_bytes(), None, None).ctrl
+        encode_frame(hdr, text.as_bytes(), None, None)
     }
 
     /// A cache entry for `tid` at `version`, warmed by one cold-answered scan —
@@ -291,6 +288,27 @@ mod spine_tests {
         };
         assert_eq!(r.batch.pks.to_vec_u128(&sa), vec![5, 6]);
         assert_eq!(stamped(&mut s, t), 0, "the entry was evicted before the reply");
+    }
+
+    /// A hint-only frame stamped at another version would decode under a schema
+    /// the server is no longer speaking, so the step fails instead.
+    #[test]
+    fn a_hint_only_frame_at_the_wrong_version_fails_the_step() {
+        let (mut s, peer) = pair();
+        let sa = schema_a();
+        let t = 1000;
+        warm(&mut s, &peer, t, 7, &sa);
+
+        let slot = s.submit(Request::scan(t)).unwrap();
+        s.step(Interest::WRITE).unwrap();
+        peer.drain_request();
+        peer.send(&reply_warm(t, 8, &batch_a(&[5]), false));
+        let e = drive(&mut s, slot).expect_err("a stale stamp is a decode error");
+        assert!(
+            matches!(&e, ClientError::Protocol(ProtocolError::DecodeError(m))
+                if m == "schema version mismatch: expected 7, server 8"),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -547,7 +565,7 @@ mod spine_tests {
         let (blocks, _cursor) = c.delta_read_raw(9, 4, &reply_schema).unwrap();
         let _peer = h.join().unwrap();
         assert_eq!(blocks.len(), 2);
-        let (b0, _) = crate::protocol::decode_wal_block(blocks[0].block(), &sa).unwrap();
+        let (b0, _) = crate::protocol::wal_block::decode_wal_block(blocks[0].block(), &sa).unwrap();
         assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
         assert_eq!(stamped(&mut c.session, 9), 0, "a delta read absorbs nothing");
     }

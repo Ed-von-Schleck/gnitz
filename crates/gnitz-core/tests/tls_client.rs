@@ -15,14 +15,14 @@ use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use gnitz_core::protocol::{
-    encode_frame, hello_handshake, parse_response, set_sockopt_int, ClientTransport, ClientVerb, WireFlags, WireStatus,
+    encode_frame, hello_handshake, set_sockopt_int, ClientTransport, ClientVerb, WireFlags, WireStatus,
 };
-use gnitz_wire::control::ControlHeader;
+use gnitz_wire::control::{peek_control_block, ControlHeader};
 
 /// One control-only frame, blocking until it is on the wire.
 fn send_control(t: &mut ClientTransport, target_id: u64, flags: WireFlags) -> Result<(), gnitz_core::ProtocolError> {
     let hdr = ControlHeader { flags, target_id, ..Default::default() };
-    t.send_parts(encode_frame(hdr, &[], None, None), None)
+    t.send_frame(encode_frame(hdr, &[], None, None), None)
 }
 use gnitz_core::TableProps;
 use gnitz_core::{ColumnDef, GnitzClient, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch};
@@ -60,8 +60,7 @@ fn send_push(
         target_id: tid,
         ..Default::default()
     };
-    let parts = encode_frame(hdr, &[], Some(schema), Some(batch));
-    t.send_parts(parts, None)
+    t.send_frame(encode_frame(hdr, &[], Some(schema), Some(batch)), None)
 }
 
 /// Rows `(start + i, (start + i) * 3, 7)` for `count` rows.
@@ -106,7 +105,7 @@ fn eviction_observed_within(t: &mut ClientTransport, ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        match t.send_framed(&[0u8; 8], Some(Instant::now() + Duration::from_secs(1))) {
+        match t.send_frame(vec![0u8; 8], Some(Instant::now() + Duration::from_secs(1))) {
             Err(gnitz_core::ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(_) => return true,
             Ok(()) => continue,
@@ -262,11 +261,11 @@ fn wire_version_mismatch_hello_gets_status_error() {
     let srv = ServerHandle::start_tls(1);
     let mut t = ClientTransport::connect(&srv.tls_target(), None).unwrap();
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
-    t.send_framed(&payload, None).unwrap();
+    t.send_frame(payload.to_vec(), None).unwrap();
     let buf = t.recv_framed(None).unwrap();
-    let (msg, _) = parse_response(&buf, None).unwrap();
-    assert_eq!(msg.hdr.status, WireStatus::Error);
-    let text = msg.error_text.unwrap_or_default();
+    let ctrl = peek_control_block(&buf).unwrap();
+    assert_eq!(ctrl.hdr.status, WireStatus::Error);
+    let text = ctrl.fault().map(|f| f.text).unwrap_or_default();
     assert!(
         text.contains("version"),
         "a WireStatus::Error must name the version mismatch, got: {text}"
@@ -336,24 +335,18 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
             let buf = t.recv_framed(None).unwrap();
-            let (ack, _) = parse_response(&buf, None).unwrap();
+            let ack = peek_control_block(&buf).unwrap();
             assert_eq!(ack.hdr.status, WireStatus::Ok, "push ACK must be OK");
         }
         let mut rows = 0usize;
-        let mut schema_seen: Option<(std::sync::Arc<Schema>, u16)> = None;
         loop {
             let buf = t.recv_framed(None).unwrap();
-            let hint = schema_seen.as_ref().map(|(s, v)| (s.as_ref(), *v));
-            let (msg, data) = parse_response(&buf, hint).unwrap();
-            assert_eq!(msg.hdr.status, WireStatus::Ok, "scan frame must be OK");
-            let flags = msg.hdr.flags;
-            if let Some(s) = msg.schema {
-                schema_seen = Some((s, flags.schema_version));
+            let ctrl = peek_control_block(&buf).unwrap();
+            assert_eq!(ctrl.hdr.status, WireStatus::Ok, "scan frame must be OK");
+            if let Some(r) = ctrl.data {
+                rows += gnitz_wire::read_u32_le(&buf[r], gnitz_wire::WAL_OFF_COUNT) as usize;
             }
-            if let Some(b) = data {
-                rows += b.len();
-            }
-            if !flags.continuation {
+            if !ctrl.hdr.flags.continuation {
                 break;
             }
         }

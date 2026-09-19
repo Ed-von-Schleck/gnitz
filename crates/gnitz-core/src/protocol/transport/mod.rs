@@ -7,7 +7,7 @@
 //! [`Inner::write_slices`] — and everything above them is transport-blind:
 //! the [`FrameReader`] that turns reads into frames, the owned outbound queue
 //! that [`ClientTransport::flush`] drains through a partial-write cursor, and
-//! the blocking wrappers ([`ClientTransport::send_parts`],
+//! the blocking wrappers ([`ClientTransport::send_frame`],
 //! [`ClientTransport::recv_framed`]) that park in `poll(2)` around those
 //! cores. Nothing beneath the wrappers ever waits.
 //!
@@ -29,7 +29,6 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use super::error::ProtocolError;
-use super::message::MessageParts;
 
 mod tls;
 
@@ -265,19 +264,10 @@ impl ClientTransport {
         self.reader.max_payload_len
     }
 
-    /// Send a length-prefixed frame: `[u32 LE payload_length][payload]`.
-    /// Scripted-peer scaffolding: production paths hand the parts they already
-    /// hold to [`Self::send_parts`] instead of flattening into one buffer.
-    #[cfg(any(test, feature = "integration"))]
-    pub fn send_framed(&mut self, data: &[u8], until: Option<Instant>) -> Result<(), ProtocolError> {
-        self.send_parts(MessageParts::single(data.to_vec()), until)
-    }
-
-    /// Send one owned frame — a single length prefix over the concatenation of
-    /// its parts — blocking behind anything still queued, and no longer than
-    /// `until`.
-    pub fn send_parts(&mut self, parts: MessageParts, until: Option<Instant>) -> Result<(), ProtocolError> {
-        self.enqueue(parts)?;
+    /// Send one owned frame — `[u32 LE payload_length][payload]` — blocking
+    /// behind anything still queued, and no longer than `until`.
+    pub fn send_frame(&mut self, payload: Vec<u8>, until: Option<Instant>) -> Result<(), ProtocolError> {
+        self.enqueue(payload)?;
         self.flush_blocking(until)
     }
 
@@ -291,11 +281,9 @@ impl ClientTransport {
 
     /// Queue an owned frame behind everything already queued. Nothing is
     /// written here; `flush` / `flush_blocking` ship the queue.
-    pub(crate) fn enqueue(&mut self, parts: MessageParts) -> Result<(), ProtocolError> {
-        let payload = parts.byte_len();
-        let prefix = frame_len_prefix(payload)?;
-        self.queue
-            .push(prefix, parts, payload + gnitz_wire::FRAME_LEN_PREFIX_BYTES);
+    pub(crate) fn enqueue(&mut self, payload: Vec<u8>) -> Result<(), ProtocolError> {
+        let prefix = frame_len_prefix(payload.len())?;
+        self.queue.push(prefix, payload);
         Ok(())
     }
 
@@ -313,7 +301,7 @@ impl ClientTransport {
                 return Ok(false);
             }
             let ClientTransport { inner, queue, .. } = self;
-            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_MAX_CHUNK.min(4 * queue.len()));
+            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(IOV_MAX_CHUNK.min(2 * queue.len()));
             queue.build_slices(&mut slices);
             match inner.write_slices(&slices)? {
                 WriteOutcome::Written(n) => queue.advance(n),
@@ -552,27 +540,20 @@ impl FrameReader {
 // ── Framing: the outbound queue ──────────────────────────────────────────────
 
 /// Slices per `flush` chunk: Linux's `UIO_MAXIOV`. std clamps to `IOV_MAX`
-/// itself, so this bounds the local slice array rather than the syscall.
-///
-/// Divided by a frame's non-empty segment count it is the **writev quantum**:
-/// 512 pipelined frames for a control-only verb, 341 for a warm push, 256 for a
-/// cold one. A driver's own request-channel depth does not enter it.
+/// itself, so this bounds the local slice array rather than the syscall. A frame
+/// is two slices, so one chunk carries 512 pipelined frames.
 const IOV_MAX_CHUNK: usize = 1024;
 
-/// One queue entry: a frame with its own length prefix, and the byte count of
-/// the two together.
+/// One queue entry: a frame's payload and its own length prefix.
 struct QueuedFrame {
     prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES],
-    parts: MessageParts,
-    total: usize,
+    payload: Vec<u8>,
 }
 
 impl QueuedFrame {
-    /// The segments in wire order, empty ones included: `build_slices` skips
-    /// them with the same test that advances its cursor.
-    fn segments(&self) -> [&[u8]; 4] {
-        let [ctrl, schema, data] = self.parts.segments();
-        [&self.prefix, ctrl, schema, data]
+    /// The two slices in wire order.
+    fn segments(&self) -> [&[u8]; 2] {
+        [&self.prefix, &self.payload]
     }
 }
 
@@ -588,9 +569,9 @@ struct OutQueue {
 }
 
 impl OutQueue {
-    fn push(&mut self, prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], parts: MessageParts, total: usize) {
-        self.bytes += total;
-        self.frames.push_back(QueuedFrame { prefix, parts, total });
+    fn push(&mut self, prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], payload: Vec<u8>) {
+        self.bytes += gnitz_wire::FRAME_LEN_PREFIX_BYTES + payload.len();
+        self.frames.push_back(QueuedFrame { prefix, payload });
     }
 
     fn is_empty(&self) -> bool {
@@ -634,7 +615,7 @@ impl OutQueue {
         self.off += n;
         while let Some(f) = self.frames.front() {
             // Ends the borrow before the pop.
-            let total = f.total;
+            let total = gnitz_wire::FRAME_LEN_PREFIX_BYTES + f.payload.len();
             if self.off < total {
                 break;
             }
@@ -689,7 +670,7 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
 /// included — not each leg.
 pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<u64, ProtocolError> {
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16);
-    t.send_parts(MessageParts::single(payload.to_vec()), until)?;
+    t.send_frame(payload.to_vec(), until)?;
 
     let buf = t.recv_framed(until)?;
     if buf.len() == gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize {
@@ -703,8 +684,11 @@ pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Resul
 
     // Not an ACK — the server sent a `WireStatus::Error` control block. The frame is
     // well-formed, so its error is the peer's refusal, not a decode failure.
-    let msg = super::message::parse_response_frame(&buf, None)?.message;
-    let err = msg.error_text.unwrap_or_else(|| "HELLO rejected".into());
+    let ctrl = gnitz_wire::control::peek_control_block(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    let err = match ctrl.fault() {
+        Some(f) if !f.text.is_empty() => f.text,
+        _ => "HELLO rejected".into(),
+    };
     Err(ProtocolError::ServerRejected(err))
 }
 

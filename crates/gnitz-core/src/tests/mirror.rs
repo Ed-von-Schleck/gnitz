@@ -190,17 +190,17 @@ impl Peer {
             arg1: tag,
             ..Default::default()
         };
-        self.send(&encode_frame(h, &[], None, None).ctrl);
+        self.send(&encode_frame(h, &[], None, None));
     }
 
     fn reply_status(&self, target_id: u64, status: WireStatus, text: &str) {
         let h = ControlHeader { status, target_id, ..Default::default() };
-        self.send(&encode_frame(h, text.as_bytes(), None, None).ctrl);
+        self.send(&encode_frame(h, text.as_bytes(), None, None));
     }
 
     /// A RESOLVE answering "no such relation": an empty descriptor blob.
     fn reply_absent(&self) {
-        self.send(&encode_frame(ControlHeader::default(), &[], None, None).ctrl);
+        self.send(&encode_frame(ControlHeader::default(), &[], None, None));
     }
 
     /// A RESOLVE answering with `tid`: the schema block plus a view descriptor
@@ -213,8 +213,7 @@ impl Peer {
         };
         let empty = ZSetBatch::new(&schema);
         let hdr = ControlHeader { target_id: tid, ..Default::default() };
-        let parts = encode_frame(hdr, &blob.encode(), Some(&schema), Some(&empty));
-        self.send(&parts.to_vec());
+        self.send(&encode_frame(hdr, &blob.encode(), Some(&schema), Some(&empty)));
     }
 }
 

@@ -877,7 +877,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     };
     let target_id = ctrl.hdr.target_id as i64;
 
-    let verb = match ctrl.hdr.flags.client_verb() {
+    let verb = match ctrl.client_verb() {
         Ok(v) => v,
         Err(e) => {
             send_error(peer, target_id, e.as_bytes());
@@ -964,7 +964,7 @@ fn decode_push_frame(
     let client_version = ctrl.hdr.flags.schema_version;
 
     // A cold frame ships its own schema block and needs no hint.
-    let catalog_schema = if ctrl.hdr.flags.has_data && !ctrl.hdr.flags.has_schema {
+    let catalog_schema = if ctrl.data.is_some() && ctrl.schema.is_none() {
         if client_version == 0 {
             return Err(PushReject::Error("a data block without a schema block".to_string()));
         }
@@ -996,6 +996,8 @@ fn decode_push_frame(
 async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_wire::control::DecodedControl) {
     let target_id = ctrl.hdr.target_id as i64;
     let flags = ctrl.hdr.flags;
+    // A cold frame authored its own schema; `ctrl` moves into the decode below.
+    let cold = ctrl.schema.is_some();
     let client_version = flags.schema_version;
 
     // Decoding happens before the lock below, and cannot suspend: see
@@ -1036,7 +1038,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         // A cold frame authored its schema, so it gets the mismatch in words;
         // a warm one is told to evict its cache entry and retry cold, where
         // that wording is reachable.
-        if flags.has_schema {
+        if cold {
             send_error(peer, target_id, e.as_bytes());
         } else {
             send_control_only(peer, target_id, WireStatus::SchemaMismatch);
@@ -1981,9 +1983,9 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     let base = out.len();
     let total = base + PFX + sz;
     out.reserve(PFX + sz);
-    // SAFETY: `encode` writes every byte of the payload and the frame length
-    // prefix is written immediately below. wal::encode zeros inter-region padding
-    // (Step 1), so no byte is left uninitialised regardless of column type.
+    // SAFETY: `encode` writes every byte of the payload — a block's header,
+    // directory and regions pack end to end — and the length prefix is written
+    // immediately below.
     #[allow(clippy::uninit_vec)]
     unsafe {
         out.set_len(total);

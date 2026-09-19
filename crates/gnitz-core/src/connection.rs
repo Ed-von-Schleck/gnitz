@@ -12,17 +12,17 @@ use std::time::Instant;
 
 use crate::client::DeltaCursor;
 use crate::error::ClientError;
-use crate::protocol::message::MessageParts;
+use crate::protocol::codec::schema_from_block;
 use crate::protocol::transport::{Next, CONNECT_TIMEOUT};
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
-    encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, parse_response_frame, ClientTransport, ClientVerb,
-    FkTarget, Message, ProtocolError, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
+    encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, ClientTransport, ClientVerb, FkTarget,
+    ProtocolError, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
 };
-use gnitz_wire::control::ControlHeader;
+use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
-use gnitz_wire::{RelClass, RelDescriptorBlob};
+use gnitz_wire::{RelClass, RelDescriptorBlob, WireFault};
 use lru::LruCache;
 
 /// Per-connection schema LRU capacity. Sized to comfortably hold a session's
@@ -91,29 +91,24 @@ pub type MultiScanResult = Result<Vec<ScanReply>, ClientError>;
 
 /// Classify a reply frame's status. Every status but `Ok` is an error; one this
 /// build does not know was already refused by the control-header decode.
-fn check_response(msg: &mut Message) -> Result<(), ClientError> {
-    match msg.hdr.status {
-        WireStatus::Ok => Ok(()),
+fn check_response(ctrl: &DecodedControl) -> Result<(), ClientError> {
+    let Some(WireFault { status, text }) = ctrl.fault() else {
+        return Ok(());
+    };
+    match status {
+        WireStatus::Ok => unreachable!("fault() is None under Ok"),
         WireStatus::SchemaMismatch => Err(ClientError::SchemaMismatch),
         WireStatus::DeltaExpired => Err(ClientError::DeltaExpired),
         // The frame's `target_id` is the relation the request named, so the id is
         // the whole of what there is to say.
         WireStatus::NotFound => Err(ClientError::NotFound {
             noun: "relation",
-            name: msg.hdr.target_id.to_string(),
+            name: ctrl.hdr.target_id.to_string(),
         }),
-        WireStatus::SalFull => Err(ClientError::SalFull(msg.error_text.take().unwrap_or_default())),
-        WireStatus::TxnConflict => Err(ClientError::TxnConflict { fresh_basis: msg.hdr.arg0 }),
-        // Fall back to the default text on an empty string, not only on None:
-        // an `Error` with Some("") would otherwise surface as a blank
-        // ServerError. This matters because the warm-push guard converts
-        // silent corruption into a surfaced error, which must be legible.
-        WireStatus::Error => Err(ClientError::ServerError(
-            msg.error_text
-                .take()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "unknown server error".into()),
-        )),
+        WireStatus::SalFull => Err(ClientError::SalFull(text)),
+        WireStatus::TxnConflict => Err(ClientError::TxnConflict { fresh_basis: ctrl.hdr.arg0 }),
+        WireStatus::Error if text.is_empty() => Err(ClientError::ServerError("unknown server error".into())),
+        WireStatus::Error => Err(ClientError::ServerError(text)),
     }
 }
 
@@ -526,7 +521,7 @@ impl Session {
                 format!("connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap")
             }));
         }
-        let (parts, kind) = match req {
+        let (frame, kind) = match req {
             Request::Read { target_id, seek } => {
                 let hint = self.cached_hint(target_id);
                 let flags = WireFlags {
@@ -539,8 +534,8 @@ impl Session {
                     ..Default::default()
                 };
                 let hdr = ControlHeader { flags, target_id, ..Default::default() };
-                let parts = encode_frame(hdr, seek.unwrap_or(&[]), None, None);
-                (parts, SlotKind::Read { tid: target_id, hint })
+                let frame = encode_frame(hdr, seek.unwrap_or(&[]), None, None);
+                (frame, SlotKind::Read { tid: target_id, hint })
             }
             Request::Alloc(run) => {
                 let (target_id, verb, count) = match run {
@@ -559,58 +554,58 @@ impl Session {
                 for (tid, batch) in families {
                     batch.validate(crate::types::sys_schema(*tid))?;
                 }
-                (MessageParts::single(encode_ddl_txn(families)), SlotKind::Commit)
+                (encode_ddl_txn(families), SlotKind::Commit)
             }
             Request::PushTxn { families, preconditions } => {
                 for (_, schema, batch, _) in families {
                     batch.validate(schema)?;
                 }
-                (
-                    MessageParts::single(encode_push_txn(families, preconditions)),
-                    SlotKind::Commit,
-                )
+                (encode_push_txn(families, preconditions), SlotKind::Commit)
             }
             #[cfg(test)]
-            Request::RawFrame(frame) => (MessageParts::single(frame), SlotKind::Commit),
-            Request::Resolve(target) => (self.resolve_request(target), SlotKind::Resolve),
+            Request::RawFrame(frame) => (frame, SlotKind::Commit),
+            Request::Resolve(target) => {
+                // The wire lets the name win over the id, so the name rides the blob.
+                let (target_id, qname) = match target {
+                    RelTarget::Name(q) => (0, q),
+                    RelTarget::Id(tid) => (tid, ""),
+                };
+                let hdr = ControlHeader {
+                    flags: WireFlags {
+                        verb: ClientVerb::Resolve,
+                        ..Default::default()
+                    },
+                    target_id,
+                    ..Default::default()
+                };
+                (encode_frame(hdr, qname.as_bytes(), None, None), SlotKind::Resolve)
+            }
             Request::Push { target_id, schema, batch, mode } => {
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
                 // remember to.
                 batch.validate(schema)?;
+                // A version proves the catalog has not changed, not that the
+                // caller encoded under the same types — and a schema-less frame
+                // under mismatched types is reinterpreted silently at rest.
+                let version = match self.cached_hint(target_id) {
+                    Some((cached, v)) if v != 0 && schema.types_match(&cached) => v,
+                    _ => 0,
+                };
                 // The push verb marks the frame as a push independent of data
                 // presence, so an empty batch (a legitimate empty Z-set delta)
                 // is ACKed as a no-op push instead of being mistaken for a scan.
-                let base_flags = WireFlags {
+                let flags = WireFlags {
                     verb: ClientVerb::Push,
                     conflict_mode: mode,
+                    schema_version: version,
                     ..Default::default()
                 };
-                // The warm path is gated on `types_match`, not the version
-                // alone: a version proves the catalog has not changed, not
-                // that the caller encoded under the same column types, and a
-                // schema-less frame under mismatched types is reinterpreted
-                // silently at rest.
-                let warm_version = match self.cached_hint(target_id) {
-                    Some((cached, v)) if v != 0 && schema.types_match(&cached) => Some(v),
-                    _ => None,
-                };
-                let parts = match warm_version {
-                    Some(v) => {
-                        let flags = WireFlags { schema_version: v, ..base_flags };
-                        let hdr = ControlHeader { flags, target_id, ..Default::default() };
-                        encode_frame(hdr, &[], None, Some(batch))
-                    }
-                    None => {
-                        let hdr = ControlHeader {
-                            flags: base_flags,
-                            target_id,
-                            ..Default::default()
-                        };
-                        encode_frame(hdr, &[], Some(schema), Some(batch))
-                    }
-                };
-                (parts, SlotKind::Push { tid: target_id })
+                let hdr = ControlHeader { flags, target_id, ..Default::default() };
+                (
+                    encode_frame(hdr, &[], (version == 0).then_some(schema), Some(batch)),
+                    SlotKind::Push { tid: target_id },
+                )
             }
             Request::ScanSpec { target_id, spec, reply_schema } => {
                 // The reply schema rides the request blob and stays with the slot
@@ -624,8 +619,10 @@ impl Session {
                     target_id,
                     ..Default::default()
                 };
-                let parts = encode_frame(hdr, &blob, None, None);
-                (parts, SlotKind::ScanSpec { reply_schema: reply_schema.schema() })
+                (
+                    encode_frame(hdr, &blob, None, None),
+                    SlotKind::ScanSpec { reply_schema: reply_schema.schema() },
+                )
             }
             Request::ScanMulti(tids) => {
                 // Rejected here, in every build profile, before a frame exists.
@@ -635,22 +632,22 @@ impl Session {
                 // connection by one frame.
                 txn_frame::validate_item_ids("SCAN_MULTI", tids, |&tid| tid)?;
                 let tids: Vec<(u64, Option<Hint>)> = tids.iter().map(|&tid| (tid, self.cached_hint(tid))).collect();
-                (
-                    MessageParts::single(self.encode_scan_multi_frame(&tids)),
-                    SlotKind::Multi { tids },
-                )
+                let relations: Vec<(u64, u16)> = tids
+                    .iter()
+                    .map(|(tid, h)| (*tid, h.as_ref().map_or(0, |h| h.1)))
+                    .collect();
+                (txn_frame::encode_scan_multi(&relations), SlotKind::Multi { tids })
             }
         };
-        self.enqueue_slot(parts, kind)
+        self.enqueue_slot(frame, kind)
     }
 
     /// DELTA_POLL: one train per item, in order, delivered to the [`PollSink`] of a
     /// [`Self::step_polling`] drain — without which they are dropped, hence no [`Request`].
     pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem<'_>]) -> Result<SlotId, ClientError> {
         txn_frame::validate_item_ids("DELTA_POLL", views, |v| v.view_id)?;
-        let parts = MessageParts::single(txn_frame::encode_delta_poll(views));
         self.enqueue_slot(
-            parts,
+            txn_frame::encode_delta_poll(views),
             SlotKind::DeltaPoll {
                 views: views.iter().map(|v| v.view_id).collect(),
             },
@@ -662,8 +659,8 @@ impl Session {
     /// client accepted can still exceed what the peer will take. Refused here,
     /// it is an error the caller can act on rather than an ingress rejection and
     /// a dropped connection.
-    fn enqueue_slot(&mut self, parts: MessageParts, kind: SlotKind) -> Result<SlotId, ClientError> {
-        let total = parts.byte_len();
+    fn enqueue_slot(&mut self, frame: Vec<u8>, kind: SlotKind) -> Result<SlotId, ClientError> {
+        let total = frame.len();
         let limit = self.transport.egress_limit();
         if total > limit {
             return Err(ClientError::ServerError(format!(
@@ -671,7 +668,7 @@ impl Session {
                  split the request"
             )));
         }
-        self.transport.enqueue(parts)?;
+        self.transport.enqueue(frame)?;
         let id = SlotId(self.next_slot);
         self.next_slot += 1;
         self.pending.push_back(Slot { id, kind });
@@ -778,30 +775,33 @@ impl Session {
             SlotKind::DeltaPoll { .. } => poll.map(|(view, _)| view),
             SlotKind::Alloc | SlotKind::Commit | SlotKind::Resolve | SlotKind::ScanSpec { .. } => None,
         };
-        // What a data block decodes under and the version a hint-only frame must carry.
-        let (slot_schema, slot_version) = match &head.kind {
-            SlotKind::Read { hint, .. } => hint.clone().unzip(),
-            SlotKind::Multi { tids } => tids[accum.at].1.clone().unzip(),
+        // What a frame carrying no schema block of its own decodes under.
+        let slot_hint: Option<Hint> = match &head.kind {
+            SlotKind::Read { hint, .. } => hint.clone(),
+            SlotKind::Multi { tids } => tids[accum.at].1.clone(),
             // Client-authored: the server sends no block and stamps 0.
-            SlotKind::ScanSpec { reply_schema, .. } => (Some(Arc::clone(reply_schema)), Some(0)),
-            SlotKind::DeltaPoll { .. } => (None, Some(0)),
-            SlotKind::Push { .. } | SlotKind::Alloc | SlotKind::Commit | SlotKind::Resolve => (None, None),
-        };
-        // A block earlier in this train (the master's prelim frame) governs the
-        // hint-only worker frames after it.
-        let (hint_schema, version) = match &accum.schema {
-            Some((s, v)) => (Some(Arc::clone(s)), Some(*v)),
-            None => (slot_schema, slot_version),
+            SlotKind::ScanSpec { reply_schema, .. } => Some((Arc::clone(reply_schema), 0)),
+            SlotKind::DeltaPoll { .. }
+            | SlotKind::Push { .. }
+            | SlotKind::Alloc
+            | SlotKind::Commit
+            | SlotKind::Resolve => None,
         };
 
-        let mut parsed = parse_response_frame(&buf, version)?;
-        if let Err(e) = check_response(&mut parsed.message) {
+        let ctrl = peek_control_block(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+        let frame_schema = ctrl
+            .schema
+            .clone()
+            .map(|r| schema_from_block(&buf[r]))
+            .transpose()?
+            .map(Arc::new);
+        if let Err(e) = check_response(&ctrl) {
             // A DELTA_POLL failure that names a view ends that view's position
             // alone; only one naming no relation fails the request.
             if let Some((view, positions)) = poll {
-                if parsed.message.hdr.target_id != 0 {
-                    if parsed.message.hdr.target_id != view {
-                        return Err(out_of_order(view, parsed.message.hdr.target_id));
+                if ctrl.hdr.target_id != 0 {
+                    if ctrl.hdr.target_id != view {
+                        return Err(out_of_order(view, ctrl.hdr.target_id));
                     }
                     return Ok(Some(fill_poll_position(pending, accum, done, positions, Err(e))));
                 }
@@ -818,27 +818,41 @@ impl Session {
             // Replies arrive in request order and the hint is keyed by
             // `target_id`, so an out-of-order frame would decode under the
             // wrong schema silently; make it loud, before any absorb.
-            if parsed.message.hdr.target_id != tid {
-                return Err(out_of_order(tid, parsed.message.hdr.target_id));
+            if ctrl.hdr.target_id != tid {
+                return Err(out_of_order(tid, ctrl.hdr.target_id));
             }
         }
         // Keyed on the tid the *frame* carries, which a correlated slot just
         // asserted is its own and a by-name RESOLVE (requested id 0) reports as
         // the live one.
-        if let Some(sch) = parsed.message.schema.as_ref() {
-            let version = parsed.message.hdr.flags.schema_version;
+        if let Some(sch) = frame_schema.as_ref() {
+            let version = ctrl.hdr.flags.schema_version;
             if head.kind.absorbs_schema() {
-                schema_cache.put(parsed.message.hdr.target_id, (Arc::clone(sch), version));
+                schema_cache.put(ctrl.hdr.target_id, (Arc::clone(sch), version));
             }
             accum.schema = Some((Arc::clone(sch), version));
+        }
+        // What this train decodes under: a block earlier in it (the master's
+        // prelim frame, or this frame's own), else the slot's hint.
+        let train: Option<Hint> = accum.schema.clone().or(slot_hint);
+
+        // A hint-only frame decodes against the schema already in hand, so all
+        // that is left to check is its stamp.
+        if frame_schema.is_none() && ctrl.data.is_some() {
+            let (want, got) = (train.as_ref().map_or(0, |h| h.1), ctrl.hdr.flags.schema_version);
+            if want != got {
+                return Err(ClientError::Protocol(ProtocolError::DecodeError(format!(
+                    "schema version mismatch: expected {want}, server {got}"
+                ))));
+            }
         }
 
         // Decoded straight into the accumulator: a train carries one data frame
         // per worker, and a per-frame batch would be copied in and dropped.
-        match parsed.data_block.take() {
+        match ctrl.data.clone() {
             Some(r) if head.kind.keeps_blocks_raw() => accum.blocks.push(RawBlock { frame: buf, block: r }),
             Some(r) => {
-                let eff = parsed.effective(hint_schema.as_deref()).ok_or_else(|| {
+                let eff = train.as_ref().map(|h| &*h.0).ok_or_else(|| {
                     ClientError::Protocol(ProtocolError::DecodeError("no schema for data block".into()))
                 })?;
                 let sink = accum.data.get_or_insert_with(|| ZSetBatch::new(eff));
@@ -847,44 +861,44 @@ impl Session {
             None => {}
         }
 
-        let terminal = parsed.message;
-        if terminal.hdr.flags.continuation {
+        if ctrl.hdr.flags.continuation {
             return Ok(None);
         }
 
-        // The train terminated. These `take()`s also clear the accumulator
-        // between SCAN_MULTI positions.
-        let schema = accum.schema.take().map(|h| h.0).or(hint_schema);
+        // The train terminated.
+        let schema = train.map(|h| h.0);
         let data = accum.data.take();
         if let Some((_, positions)) = poll {
             let blocks = std::mem::take(&mut accum.blocks);
-            let cursor = DeltaCursor {
-                tag: terminal.hdr.arg1,
-                tick: terminal.hdr.arg0,
-            };
+            let cursor = DeltaCursor { tag: ctrl.hdr.arg1, tick: ctrl.hdr.arg0 };
             let filled = Ok((blocks, cursor));
             return Ok(Some(fill_poll_position(pending, accum, done, positions, filled)));
         }
-        let scan_reply = |schema: Option<Arc<Schema>>, data: Option<ZSetBatch>, terminal: &Message| {
+        let scan_reply = |schema: Option<Arc<Schema>>, data: Option<ZSetBatch>, lsn: u64| {
             let schema = schema.ok_or_else(no_schema)?;
             Ok::<_, ClientError>(ScanReply {
                 batch: data.unwrap_or_else(|| ZSetBatch::new(&schema)),
                 schema,
-                lsn: Some(terminal.hdr.arg0),
+                lsn: Some(lsn),
             })
         };
         let reply = match &head.kind {
-            SlotKind::Read { .. } => Ok(Reply::Scan(scan_reply(schema, data, &terminal)?)),
-            SlotKind::Push { .. } => Ok(Reply::Lsn(terminal.hdr.arg0)),
-            SlotKind::Resolve => resolve_descriptor(terminal, schema).map(Reply::Resolve),
-            SlotKind::Alloc => Ok(Reply::Id(terminal.hdr.target_id)),
-            SlotKind::Commit => Ok(Reply::Lsn(terminal.hdr.arg0)),
+            SlotKind::Read { .. } => Ok(Reply::Scan(scan_reply(schema, data, ctrl.hdr.arg0)?)),
+            SlotKind::Push { .. } => Ok(Reply::Lsn(ctrl.hdr.arg0)),
+            SlotKind::Resolve => resolve_descriptor(ctrl, schema).map(Reply::Resolve),
+            SlotKind::Alloc => Ok(Reply::Id(ctrl.hdr.target_id)),
+            SlotKind::Commit => Ok(Reply::Lsn(ctrl.hdr.arg0)),
             SlotKind::ScanSpec { reply_schema } => {
                 Ok(Reply::Rows(data.unwrap_or_else(|| ZSetBatch::new(reply_schema))))
             }
             SlotKind::Multi { tids } => {
-                accum.replies.push(scan_reply(schema, data, &terminal)?);
-                accum.at += 1;
+                accum.replies.push(scan_reply(schema, data, ctrl.hdr.arg0)?);
+                // This position's train is over; the next one starts clean.
+                *accum = Accumulator {
+                    at: accum.at + 1,
+                    replies: std::mem::take(&mut accum.replies),
+                    ..Default::default()
+                };
                 if accum.at < tids.len() {
                     return Ok(None);
                 }
@@ -897,38 +911,10 @@ impl Session {
         Ok(None)
     }
 
-    /// The RESOLVE request frame for `target`. The one place the wire's "name
-    /// wins, else id" encoding is spelled: the name rides the blob.
-    fn resolve_request(&self, target: RelTarget<'_>) -> MessageParts {
-        let (target_id, qname) = match target {
-            RelTarget::Name(q) => (0, q),
-            RelTarget::Id(tid) => (tid, ""),
-        };
-        let hdr = ControlHeader {
-            flags: WireFlags {
-                verb: ClientVerb::Resolve,
-                ..Default::default()
-            },
-            target_id,
-            ..Default::default()
-        };
-        encode_frame(hdr, qname.as_bytes(), None, None)
-    }
-
     /// The cached `(schema, version)` for `tid`. `get`, so a relation in use
     /// keeps its LRU recency; the version is what the request stamps.
     fn cached_hint(&mut self, tid: u64) -> Option<Hint> {
         self.schema_cache.get(&tid).map(|(s, v)| (Arc::clone(s), *v))
-    }
-
-    /// A SCAN_MULTI request frame, each tid stamped with the version of the
-    /// hint beside it.
-    fn encode_scan_multi_frame(&self, tids: &[(u64, Option<Hint>)]) -> Vec<u8> {
-        let relations: Vec<(u64, u16)> = tids
-            .iter()
-            .map(|(tid, h)| (*tid, h.as_ref().map_or(0, |h| h.1)))
-            .collect();
-        txn_frame::encode_scan_multi(&relations)
     }
 }
 
@@ -983,9 +969,12 @@ fn complete_head(
 /// `batch_to_schema` rebuilds every column-layout fact but leaves the FK fields
 /// at 0, because a reference to *another* relation rides the descriptor.
 /// `decode` bounded every `col_idx` against this schema's column count.
-fn resolve_descriptor(msg: Message, schema: Option<Arc<Schema>>) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+fn resolve_descriptor(
+    ctrl: DecodedControl,
+    schema: Option<Arc<Schema>>,
+) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
     let ncols = schema.as_ref().map_or(0, |s| s.columns.len());
-    let Some(desc) = RelDescriptorBlob::decode(&msg.blob, ncols)? else {
+    let Some(desc) = RelDescriptorBlob::decode(&ctrl.blob, ncols)? else {
         return Ok(None);
     };
     let mut schema =
@@ -997,7 +986,7 @@ fn resolve_descriptor(msg: Message, schema: Option<Arc<Schema>>) -> Result<Optio
         }
     }
     Ok(Some(Arc::new(RelDescriptor {
-        tid: msg.hdr.target_id,
+        tid: ctrl.hdr.target_id,
         class: desc.class,
         replicated: desc.replicated,
         schema,

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
 use gnitz_store::storage::{Batch, Layout, MemBatch, WireChunk, MAX_BATCH_REGIONS};
-use gnitz_wire::control::{frame_blocks, peek_control_block, DecodedControl};
+use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
 /// The operative bound on **every** reply the server emits, forwarded or not,
@@ -158,7 +158,7 @@ pub struct WireMsg<'a> {
     pub status: WireStatus,
     pub data: WireData<'a>,
     /// These bytes *are* the frame's schema block, and their length sizes it;
-    /// `None` emits none and leaves `has_schema` clear. Usually from a
+    /// `None` emits none and leaves the frame's schema bit clear. Usually from a
     /// [`WireSchema`], which pairs them with the descriptor they encode.
     pub schema_block: Option<&'a [u8]>,
     pub blob: &'a [u8],
@@ -171,10 +171,7 @@ impl<'a> WireMsg<'a> {
 
     /// Total encoded size, without allocating.
     pub fn size(&self) -> usize {
-        let mut total = gnitz_wire::control::ctrl_block_size(self.blob.len());
-        if let Some(block) = self.schema_block {
-            total += block.len();
-        }
+        let mut total = gnitz_wire::control::frame_head_size(self.blob.len(), self.schema_block.map_or(0, <[u8]>::len));
         if self.has_data() {
             total += self.data.wire_byte_size();
         }
@@ -187,8 +184,6 @@ impl<'a> WireMsg<'a> {
         let has_data = self.has_data();
 
         let wire_flags = WireFlags {
-            has_schema: self.schema_block.is_some(),
-            has_data,
             // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
             // (debug-verified) at its producer, so the shipped claim is
             // verified-by-construction.
@@ -196,7 +191,7 @@ impl<'a> WireMsg<'a> {
             ..self.flags
         };
 
-        let mut pos = gnitz_wire::control::encode_ctrl_block(
+        let mut pos = gnitz_wire::control::encode_frame_head(
             out,
             &gnitz_wire::control::ControlHeader {
                 status: self.status,
@@ -206,13 +201,9 @@ impl<'a> WireMsg<'a> {
                 arg1: self.arg1,
             },
             self.blob,
+            self.schema_block,
+            has_data,
         );
-
-        if let Some(block) = self.schema_block {
-            let end = pos + block.len();
-            out[pos..end].copy_from_slice(block);
-            pos = end;
-        }
 
         if has_data {
             let tid = self.target_id as u32;
@@ -356,12 +347,11 @@ fn decode_frame<'a, B>(
     hint: Option<&SchemaDescriptor>,
     decode: impl FnOnce(&'a [u8], &SchemaDescriptor) -> Result<B, &'static str>,
 ) -> Result<(Option<SchemaDescriptor>, Option<B>), &'static str> {
-    let blocks = frame_blocks(data, control)?;
-    let block_schema = match blocks.schema {
-        Some(r) => Some(decode_schema_block(&data[r])?),
+    let block_schema = match &control.schema {
+        Some(r) => Some(decode_schema_block(&data[r.clone()])?),
         None => None,
     };
-    let Some(r) = blocks.data else {
+    let Some(r) = control.data.clone() else {
         return Ok((block_schema, None));
     };
     let schema = block_schema

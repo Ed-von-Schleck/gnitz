@@ -11,19 +11,16 @@ const REGION: &[u8] = &[7u8; 24];
 
 /// A minimal WAL block carrying `tid`, as the frame encoders take it.
 fn wal_block(tid: u32) -> WalBlock<'static> {
-    WalBlock {
-        table_id: tid,
-        entry_count: 1,
-        regions: &[REGION],
-    }
+    let mut regions = wal::Regions::new();
+    regions.push(REGION);
+    WalBlock { table_id: tid, entry_count: 1, regions }
 }
 
 /// The same block already framed — what a decode must hand back, and what a
 /// *schema* block (which the frame carries pre-encoded) is built from.
 fn block(tid: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; 4096];
-    let n = wal::encode(&mut buf, 0, tid, 1, &[REGION], false).unwrap();
-    buf.truncate(n);
+    let mut buf = Vec::new();
+    wal_block(tid).append_to(&mut buf);
     buf
 }
 

@@ -14,7 +14,10 @@ fn absence_is_the_empty_blob() {
     assert_eq!(RelDescriptorBlob::decode(&[], 0), Ok(None));
     let present = RelDescriptorBlob::default().encode();
     assert_eq!(present.len(), HEADER_LEN);
-    assert_eq!(crate::german_string::german_spill_len(present.len()), 0);
+    assert!(
+        present.len() <= crate::SHORT_STRING_THRESHOLD,
+        "the blob must ride inline"
+    );
 }
 
 #[test]

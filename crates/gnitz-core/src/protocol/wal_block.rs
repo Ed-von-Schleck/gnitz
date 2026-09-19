@@ -4,8 +4,6 @@ use super::error::ProtocolError;
 use super::types::{check_not_null, Schema, ZSetBatch};
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
 // ── Region read helpers ───────────────────────────────────────────────────────
 
 /// Append a region of 64-bit values (u64 or i64) to `dst` via bulk memcpy.
@@ -39,19 +37,11 @@ fn read_64bit_region_into<T: Copy>(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Frame the batch's §6 region list ([`super::regions::regions`]) into a WAL
-/// block.
-///
-/// For a lone block. A transaction frame instead hands `gnitz-wire` the region
-/// lists and lets it frame each block into the frame itself, which is one copy
-/// rather than two.
+/// The batch as a lone WAL block.
+#[cfg(test)]
 pub(crate) fn encode_wal_block(table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
-    let regions = super::regions::regions(batch);
-    // Size the output to exactly one block, then frame in place, so encode never
-    // returns BufferTooSmall.
-    let mut out = vec![0u8; gnitz_wire::wal::block_size_of(&regions)];
-    gnitz_wire::wal::encode(&mut out, 0, table_id, batch.len() as u32, &regions, false)
-        .expect("WAL encode: pre-sized buffer");
+    let mut out = Vec::new();
+    batch.wal_block(table_id as u64).append_to(&mut out);
     out
 }
 
@@ -59,10 +49,11 @@ pub(crate) fn encode_wal_block(table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
 /// Returns `(ZSetBatch, table_id)`.
 ///
 /// Verifies no checksum: both client transports are integrity-protected.
-pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
+#[cfg(test)]
+pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
     let mut sink = ZSetBatch::new(schema);
-    let table_id = decode_wal_block_impl(data, schema, &mut sink)?;
-    Ok((sink, table_id))
+    decode_wal_block_into(&mut sink, data, schema)?;
+    Ok((sink, gnitz_wire::read_u32_le(data, gnitz_wire::WAL_OFF_TID)))
 }
 
 /// [`decode_wal_block`] appending into `sink` instead of building a fresh batch
@@ -74,7 +65,8 @@ pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32)
 /// closes the session on a `step` error, and `Session::close` resets the
 /// accumulator, so no torn batch is read back.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
-    decode_wal_block_impl(data, schema, sink).map(|_| ())
+    let (header, regions) = gnitz_wire::wal::validate_and_parse(data, false)?;
+    decode_regions_into(sink, &regions, header.entry_count as usize, schema)
 }
 
 /// `sink` is a well-formed batch of `schema`, and so can be appended to.
@@ -82,23 +74,6 @@ fn sink_matches(sink: &ZSetBatch, schema: &Schema) -> Result<(), ProtocolError> 
     let sink_err = |e: String| ProtocolError::DecodeError(format!("decode sink: {e}"));
     sink.layout_matches(schema).map_err(sink_err)?;
     sink.check_columns().map_err(sink_err)
-}
-
-fn decode_wal_block_impl(data: &[u8], schema: &Schema, sink: &mut ZSetBatch) -> Result<u32, ProtocolError> {
-    // Shared framer validates format: version, `total_size` in-bounds, region
-    // count ≤ cap, and every region's [off, off+sz) extent within the block. On
-    // success each region slices unchecked.
-    let mut region_offsets = [0u64; gnitz_wire::MAX_WIRE_REGIONS];
-    let mut region_sizes = [0u32; gnitz_wire::MAX_WIRE_REGIONS];
-    let header = gnitz_wire::wal::validate_and_parse(data, &mut region_offsets, &mut region_sizes, false)?;
-    let num_regions = header.num_regions as usize;
-    let mut regions: [&[u8]; gnitz_wire::MAX_WIRE_REGIONS] = [&[]; gnitz_wire::MAX_WIRE_REGIONS];
-    for (r, region) in regions[..num_regions].iter_mut().enumerate() {
-        let off = region_offsets[r] as usize;
-        *region = &data[off..off + region_sizes[r] as usize];
-    }
-    decode_regions_into(sink, &regions[..num_regions], header.entry_count as usize, schema)?;
-    Ok(header.table_id)
 }
 
 /// Decode `count` rows laid out as `regions` (canonical order, blob last) under `schema`,
@@ -118,10 +93,6 @@ pub fn decode_regions_into(
         )));
     }
     let pk_stride = schema.pk_stride();
-
-    if count == 0 {
-        return Ok(());
-    }
 
     sink_matches(sink, schema)?;
 

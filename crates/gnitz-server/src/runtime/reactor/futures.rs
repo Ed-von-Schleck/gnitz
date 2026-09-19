@@ -4,19 +4,16 @@
 use std::ops::Range;
 
 use gnitz_wire::control::DecodedControl;
-use gnitz_wire::{WireFault, WireStatus};
+use gnitz_wire::WireFault;
 
 use super::*;
 use crate::runtime::sal::WorkerSet;
 
 /// Worker `w`'s reply as a fault, keeping its status, or `None` when it succeeded.
 pub(crate) fn worker_error(w: usize, op: &str, ctrl: &DecodedControl) -> Option<WireFault> {
-    (ctrl.hdr.status != WireStatus::Ok).then(|| {
-        let msg = String::from_utf8_lossy(&ctrl.blob);
-        WireFault {
-            status: ctrl.hdr.status,
-            text: format!("worker {w}: {op}: {msg}"),
-        }
+    ctrl.fault().map(|f| WireFault {
+        text: format!("worker {w}: {op}: {}", f.text),
+        ..f
     })
 }
 

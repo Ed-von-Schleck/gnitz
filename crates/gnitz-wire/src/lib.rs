@@ -16,9 +16,7 @@
 //! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which
 //! module a symbol lives in. `control`, `schema_block`, `sys_rows`, `txn_frame`
 //! and `wal` stay named modules and are referenced by path
-//! (`gnitz_wire::wal::encode`). Only `wal::encode` and `schema_block::encode`
-//! actually collide at the root; the other three are namespaced for consistency
-//! with them rather than by necessity. `wal`'s *constants* (`WAL_*`,
+//! (`gnitz_wire::wal::WalBlock`). `wal`'s *constants* (`WAL_*`,
 //! `MAX_WIRE_REGIONS`, the `REG_*` region-convention indices) are flat-exported,
 //! since they are referenced pervasively.
 //!
@@ -126,7 +124,7 @@ pub use types::*;
 pub use uuid::*;
 pub use xxh::*;
 // Flat-export `wal`'s constants (referenced everywhere) but not its framer
-// functions (`encode`/`block_size`/… stay `gnitz_wire::wal::`-qualified).
+// items (`WalBlock`/`validate_and_parse`/… stay `gnitz_wire::wal::`-qualified).
 pub use wal::{
     MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
     WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,

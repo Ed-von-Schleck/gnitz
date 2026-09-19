@@ -9,7 +9,6 @@
 //! `Err` naming the format it was reading (`Reader::new`'s `ctx`), never a panic.
 //!
 //! Both types are `pub`; a method is `pub` only where that framing needs it.
-//! [`Writer::reserve`], whose body is `unsafe`, is not one of them.
 
 /// A little-endian forward writer — the inverse of [`Reader`].
 pub struct Writer(Vec<u8>);
@@ -47,29 +46,15 @@ impl Writer {
         self
     }
 
+    /// A WAL block, framed straight onto the end of the buffer.
+    pub(crate) fn block(&mut self, b: &crate::wal::WalBlock<'_>) -> &mut Self {
+        b.append_to(&mut self.0);
+        self
+    }
+
     /// A `u32`-length-prefixed byte section — the inverse of [`Reader::bytes32`].
     pub fn bytes32(&mut self, bytes: &[u8]) -> &mut Self {
         self.u32(bytes.len() as u32).raw(bytes)
-    }
-
-    /// Extend by `n` zero bytes and hand back the slice covering them, for a
-    /// section a codec fills in place rather than building elsewhere and copying.
-    ///
-    /// One `memset`, not `Vec::resize`: that is a per-element write loop, which
-    /// LLVM turns into a memset only from `-O1` up — and this runs over whole
-    /// frame bodies on the client's push path, which the E2E suite exercises at
-    /// `opt-level=0`.
-    pub(crate) fn reserve(&mut self, n: usize) -> &mut [u8] {
-        let at = self.0.len();
-        self.0.reserve(n);
-        // SAFETY: `reserve` guarantees `n` bytes of spare capacity past `at`, and
-        // they are zeroed before `set_len` publishes them, so no uninitialized
-        // byte is ever observable.
-        unsafe {
-            std::ptr::write_bytes(self.0.as_mut_ptr().add(at), 0, n);
-            self.0.set_len(at + n);
-        }
-        &mut self.0[at..]
     }
 
     pub fn into_vec(self) -> Vec<u8> {

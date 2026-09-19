@@ -22,7 +22,6 @@
 //! region[6] blob      the German-string heap
 //! ```
 
-use crate::german_string::german_spill_len;
 use crate::wal;
 use crate::{
     encode_german_string, german_string_cell_ok, german_string_content, is_pk_eligible, is_valid_type_code,
@@ -135,17 +134,6 @@ const FIXED_ROW_BYTES: usize = {
     sum
 };
 
-/// Block size for `n` columns spilling `blob` bytes of long names.
-fn block_len(n: usize, blob: usize) -> usize {
-    wal::body_start(SCHEMA_BLOCK_REGIONS) + n * FIXED_ROW_BYTES + blob
-}
-
-/// Encoded size of the block for `cols` — the size [`encode`] reserves, so
-/// the reservation and the write read one rule.
-fn encoded_len(cols: &[SchemaBlockCol]) -> usize {
-    block_len(cols.len(), cols.iter().map(|c| german_spill_len(c.name.len())).sum())
-}
-
 /// The block for `cols`, without a checksum: a frame that carries one stamps its
 /// own copy.
 pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
@@ -171,9 +159,18 @@ pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
     }
 
     // `null` stays all-zero: no meta-schema column is nullable.
-    let regions: [&[u8]; SCHEMA_BLOCK_REGIONS] = [pk, weight, null, type_code, flags, names, &blob];
-    let mut out = vec![0u8; encoded_len(cols)];
-    wal::encode(&mut out, 0, tid, n as u32, &regions, false).expect("schema block buffer too small");
+    let slices: [&[u8]; SCHEMA_BLOCK_REGIONS] = [pk, weight, null, type_code, flags, names, &blob];
+    let mut regions = wal::Regions::new();
+    for r in slices {
+        regions.push(r);
+    }
+    let mut out = Vec::new();
+    wal::WalBlock {
+        table_id: tid,
+        entry_count: n as u32,
+        regions,
+    }
+    .append_to(&mut out);
     out
 }
 
@@ -183,11 +180,10 @@ pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
 /// ordering, type-code validity, PK eligibility and arity — so building a
 /// `Schema` / `SchemaDescriptor` from it cannot fail on wire grounds.
 pub struct SchemaBlock<'a> {
-    block: &'a [u8],
     count: usize,
-    tc_off: usize,
-    fl_off: usize,
-    name_off: usize,
+    type_codes: &'a [u8],
+    flags: &'a [u8],
+    names: &'a [u8],
     blob: &'a [u8],
     pk_indices: [u32; MAX_PK_COLUMNS],
     pk_count: usize,
@@ -207,17 +203,13 @@ impl<'a> SchemaBlock<'a> {
         // Format validity — header size, version, `total_size` in bounds, body
         // checksum, region count ≤ cap, and every region's extent within the
         // block — is the shared framer's job. What is added below is schema
-        // conformance only; the parsed directory lands in `offs`/`sizes` with
-        // every extent already bounded.
-        let mut offs = [0u64; wal::MAX_WIRE_REGIONS];
-        let mut sizes = [0u32; wal::MAX_WIRE_REGIONS];
-        let header = wal::validate_and_parse(block, &mut offs, &mut sizes, verify_checksum).map_err(|e| match e {
+        // conformance only; every returned region is already bounded.
+        let (header, regions) = wal::validate_and_parse(block, verify_checksum).map_err(|e| match e {
             crate::WalError::InvalidVersion => "schema block wrong version",
             crate::WalError::ChecksumMismatch => "schema block checksum mismatch",
             // Region count exceeds the directory cap — a forged over-long header.
             crate::WalError::InvalidShard => "schema block directory overflows buffer",
-            // Truncated / BufferTooSmall: shorter than its header, directory, or
-            // a declared region requires.
+            // Truncated: shorter than its header, directory or regions require.
             _ => "schema block truncated",
         })?;
 
@@ -235,18 +227,10 @@ impl<'a> SchemaBlock<'a> {
             return Err("schema block region count mismatch");
         }
 
-        let reg = |r: usize| (offs[r] as usize, sizes[r] as usize);
-        let (pk_off, pk_sz) = reg(REG_PK);
-        let (null_off, _) = reg(REG_NULL_BMP);
-        let (tc_off, _) = reg(REG_TYPE_CODE);
-        let (fl_off, _) = reg(REG_FLAGS);
-        let (name_off, _) = reg(REG_NAME);
-        let (blob_off, blob_sz) = reg(REG_BLOB);
-
         // Every fixed-stride region must be exactly `count` rows wide, against
         // the same table `block_len` sizes them with.
         for (r, &per_row) in ROW_BYTES.iter().enumerate().take(REG_BLOB) {
-            if sizes[r] as usize != count * per_row {
+            if regions[r].len() != count * per_row {
                 return Err("schema block region size mismatch");
             }
         }
@@ -256,7 +240,7 @@ impl<'a> SchemaBlock<'a> {
         // the type, flags or name of that column is absent, and every read below
         // takes the cell at face value.
         for i in 0..count {
-            if read_u64_le(block, null_off + i * 8) != 0 {
+            if read_u64_le(regions[REG_NULL_BMP], i * 8) != 0 {
                 return Err("schema block declares a null column field");
             }
         }
@@ -265,20 +249,25 @@ impl<'a> SchemaBlock<'a> {
         // columns by physical row position, so a gap, a duplicate, or a reorder
         // would silently re-route a column's type. It is an unsigned U64 PK
         // stored OPK, hence the big-endian read.
-        let pk_data = &block[pk_off..pk_off + pk_sz];
+        let pk_data = regions[REG_PK];
         for i in 0..count {
             if u64::from_be_bytes(pk_data[i * 8..(i + 1) * 8].try_into().unwrap()) != i as u64 {
                 return Err("schema col_idx not in monotonic order");
             }
         }
 
-        let blob = &block[blob_off..blob_off + blob_sz];
+        let (type_codes, flags, names, blob) = (
+            regions[REG_TYPE_CODE],
+            regions[REG_FLAGS],
+            regions[REG_NAME],
+            regions[REG_BLOB],
+        );
         let mut pk_pairs = [(0u8, 0u32); MAX_PK_COLUMNS];
         let mut pk_count = 0usize;
         let mut pk_stride = 0usize;
 
         for i in 0..count {
-            let raw_tc = read_u64_le(block, tc_off + i * 8);
+            let raw_tc = read_u64_le(type_codes, i * 8);
             // The whole word, not its low byte: truncating here would admit a
             // block the peer's `u8`-typed decode rejects, so the two ends would
             // disagree on which blocks are admissible.
@@ -286,7 +275,7 @@ impl<'a> SchemaBlock<'a> {
                 return Err("schema: invalid type code");
             }
             let tc = raw_tc as u8;
-            let fl = read_u64_le(block, fl_off + i * 8);
+            let fl = read_u64_le(flags, i * 8);
             if fl & !DEFINED_BITS != 0 {
                 return Err("schema: unknown column meta bits");
             }
@@ -297,7 +286,7 @@ impl<'a> SchemaBlock<'a> {
             // the cell's own predicate, so a heap extent past the blob and a
             // pad/prefix skew — which would order two equal names unequal — are
             // refused by the same rule every other German-string boundary applies.
-            let cell = &block[name_off + i * 16..name_off + (i + 1) * 16];
+            let cell = &names[i * 16..(i + 1) * 16];
             if !german_string_cell_ok(cell, blob) {
                 return Err("schema name cell is not in canonical form");
             }
@@ -341,11 +330,10 @@ impl<'a> SchemaBlock<'a> {
         }
 
         Ok(SchemaBlock {
-            block,
             count,
-            tc_off,
-            fl_off,
-            name_off,
+            type_codes,
+            flags,
+            names,
             blob,
             pk_indices,
             pk_count,
@@ -360,10 +348,10 @@ impl<'a> SchemaBlock<'a> {
     /// Column `i`. Panics past `num_columns()`.
     pub fn column(&self, i: usize) -> SchemaBlockCol<'a> {
         assert!(i < self.count, "schema block column {i} out of range");
-        let cell = &self.block[self.name_off + i * 16..self.name_off + (i + 1) * 16];
+        let cell = &self.names[i * 16..(i + 1) * 16];
         SchemaBlockCol {
-            type_code: read_u64_le(self.block, self.tc_off + i * 8) as u8,
-            meta: ColMeta::from_flags(read_u64_le(self.block, self.fl_off + i * 8)),
+            type_code: read_u64_le(self.type_codes, i * 8) as u8,
+            meta: ColMeta::from_flags(read_u64_le(self.flags, i * 8)),
             // `decode` bounded every long cell's heap extent, so this resolves
             // to the real content rather than the degraded-empty fallback.
             name: german_string_content(cell, self.blob),

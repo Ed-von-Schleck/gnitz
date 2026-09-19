@@ -15,11 +15,12 @@
 //! would never build.
 
 use gnitz_core::protocol::{
-    encode_frame, hello_handshake, parse_response, ClientTransport, ClientVerb, ColumnDef, Schema, TypeCode, WireFlags,
+    encode_frame, hello_handshake, ClientTransport, ClientVerb, ColumnDef, Schema, TypeCode, WireFlags,
 };
 use gnitz_core::TableProps;
 use gnitz_core::{BatchAppender, GnitzClient, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_wire::control::peek_control_block;
 
 /// Ship `batch` as a PUSH, bypassing the client-side `ZSetBatch::validate` that
 /// `Session::submit` runs by writing the encoded frame to the socket itself —
@@ -35,13 +36,13 @@ fn hostile_push(t: &mut ClientTransport, tid: u64, schema: &Schema, batch: &ZSet
         target_id: tid,
         ..Default::default()
     };
-    let parts = encode_frame(hdr, &[], Some(schema), Some(batch));
-    t.send_parts(parts, None).map_err(|e| e.to_string())?;
+    let frame = encode_frame(hdr, &[], Some(schema), Some(batch));
+    t.send_frame(frame, None).map_err(|e| e.to_string())?;
     let buf = t.recv_framed(None).map_err(|e| e.to_string())?;
-    let (msg, _) = parse_response(&buf, None).map_err(|e| e.to_string())?;
-    match msg.error_text {
-        Some(text) => Err(text),
-        None => Ok(msg.hdr.arg0),
+    let ctrl = peek_control_block(&buf).map_err(str::to_string)?;
+    match ctrl.fault() {
+        Some(f) => Err(f.text),
+        None => Ok(ctrl.hdr.arg0),
     }
 }
 

@@ -18,6 +18,8 @@ fn control(view_id: i64, source_id: i64, flags: WireFlags) -> DecodedControl {
         },
         blob: Vec::new(),
         block_size: 0,
+        schema: None,
+        data: None,
     }
 }
 

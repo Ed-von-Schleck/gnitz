@@ -107,7 +107,7 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
         );
         let last = ctrl.hdr.flags.scan_last;
         assert!(
-            !ctrl.hdr.flags.has_schema,
+            ctrl.schema.is_none(),
             "no pre-flight frame carries a schema block: the master builds it"
         );
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
@@ -199,7 +199,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
         let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
         assert_eq!(ctrl.hdr.status, WireStatus::Ok);
         assert!(ctrl.hdr.flags.scan_last, "single frame must be terminal");
-        assert!(!ctrl.hdr.flags.has_data, "no data on empty train");
+        assert!(ctrl.data.is_none(), "no data on empty train");
         drop(slot);
         assert!(receiver.try_read_slot(0).is_none());
     });

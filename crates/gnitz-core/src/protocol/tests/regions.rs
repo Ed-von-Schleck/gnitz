@@ -1,4 +1,3 @@
-use super::*;
 use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::{decode_wal_block, encode_wal_block};
 use crate::test_support::payload_of;
@@ -318,7 +317,7 @@ fn the_region_list_rejects_a_region_whose_length_contradicts_its_type() {
     // The region list's own guard, for a batch that never went through
     // `ZSetBatch::validate` — which states the same rule for the push path.
     batch.payload[2].bytes.truncate(16);
-    let _ = regions(&batch);
+    let _ = batch.regions();
 }
 
 // ── The encode path shares the builder ───────────────────────────────────

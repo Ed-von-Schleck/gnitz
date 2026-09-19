@@ -19,8 +19,6 @@ fn wire_flags_roundtrip() {
     );
     cases.extend([0, 1, u16::MAX].map(|schema_version| WireFlags { schema_version, ..base }));
     cases.extend([
-        WireFlags { has_schema: true, ..base },
-        WireFlags { has_data: true, ..base },
         WireFlags { continuation: true, ..base },
         WireFlags { batch_consolidated: true, ..base },
         WireFlags { scan_last: true, ..base },
@@ -34,8 +32,6 @@ fn wire_flags_roundtrip() {
         verb: ClientVerb::AllocIds,
         conflict_mode: WireConflictMode::Error,
         schema_version: u16::MAX,
-        has_schema: true,
-        has_data: true,
         continuation: true,
         batch_consolidated: true,
         scan_last: true,
@@ -54,30 +50,11 @@ fn wire_flags_roundtrip() {
 #[test]
 fn wire_flags_reject_unknown() {
     assert!(WireFlags::unpack(1 << 42).is_err());
+    // Bits 32/33 are the control codec's, so the flags word neither refuses nor
+    // carries them.
+    assert_eq!(WireFlags::unpack(3 << 32), Ok(WireFlags::default()));
     assert!(WireFlags::unpack(3 << 39).is_err());
     assert!(WireFlags::unpack(1 << 63).is_err());
     assert!(WireFlags::unpack(13).is_err());
     assert!(WireFlags::unpack(2 << 8).is_err());
-}
-
-/// Only a push carries rows. A data block on any other verb — `Scan`
-/// included, which is the dangerous one, since that frame would otherwise be
-/// answered with a streamed table dump — is a malformed frame.
-#[test]
-fn client_verb_rejects_data_on_a_non_push_verb() {
-    let with_data = |verb| WireFlags {
-        verb,
-        has_data: true,
-        ..Default::default()
-    };
-    assert_eq!(with_data(ClientVerb::Push).client_verb(), Ok(ClientVerb::Push));
-    for &verb in ClientVerb::ALL {
-        if verb == ClientVerb::Push {
-            continue;
-        }
-        assert!(
-            with_data(verb).client_verb().is_err(),
-            "{verb:?} must not accept a data block"
-        );
-    }
 }

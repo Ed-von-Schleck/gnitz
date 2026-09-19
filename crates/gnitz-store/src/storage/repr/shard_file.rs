@@ -6,7 +6,7 @@ use std::os::unix::fs::FileExt;
 
 use super::super::error::StorageError;
 use super::super::StagedFile;
-use super::batch::{Batch, MAX_WIRE_REGIONS, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::batch::{Batch, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::shard_filter;
 use crate::schema::key::probe_key;
@@ -258,9 +258,8 @@ impl Batch {
     pub(crate) fn write_as_shard(&self, path: &CStr, opts: ShardWriteOpts) -> Result<(), StorageError> {
         let schema = self.schema();
         let n = self.count;
-        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
-        let num_regions = self.fill_regions(&mut regions);
-        let regions = &regions[..num_regions];
+        let regions = self.wire_regions();
+        let num_regions = regions.len();
         // Shards are ghost-free by construction: flush persists the run set's
         // consolidated net-state run and compaction's merge drops net-zero groups.
         debug_assert!(
