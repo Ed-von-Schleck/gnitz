@@ -237,9 +237,6 @@ impl DagEngine {
         let mut state: Vec<&mut CircuitState> = Vec::new();
         for plan in self.views.values_mut().filter_map(|e| e.plan.as_mut()) {
             for sub in plan.sub_plans_mut() {
-                // Drop the bound cursors before the fold so none holds a stale
-                // snapshot.
-                sub.vm.reset_trace_cursors();
                 state.push(&mut sub.vm.state);
             }
         }

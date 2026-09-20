@@ -26,11 +26,9 @@ pub fn op_reduce(
     let shape = &plan.shape;
     let output_schema = &shape.output_schema;
 
-    // Only the non-linear aggregates need net weights.
-    let cs = if plan.avi.is_none() {
-        None
-    } else {
-        Batch::consolidate_if_needed(delta, &plan.input_schema)
+    let cs = match plan.consolidates_input() {
+        true => Batch::consolidate_if_needed(delta, &plan.input_schema),
+        false => None,
     };
     let working: &Batch = cs.as_ref().unwrap_or(delta);
 

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use super::exchange::{ExchangeAccumulator, PendingRelay};
 use super::scatter::{with_commit_indices, with_group};
 use super::*;
-use crate::query::RelayRoute;
+use crate::query::{RelayRoute, OUTPUT_RELAY};
 use crate::runtime::orchestration::guard_panic;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{select2, Either};
@@ -380,7 +380,15 @@ impl MasterDispatcher {
         let meta = dag
             .view_meta(registry, view_id)
             .map_err(|e| format!("view {view_id}: {e}"))?;
-        let dest = match meta.relay_route(source_id) {
+        // `prepare_relay` turns this `Err` into a cluster abort, taken over
+        // scattering under a key the rows were never stored under.
+        let route = match source_id {
+            OUTPUT_RELAY => meta.output_route(),
+            id => meta
+                .source_route(id)
+                .ok_or_else(|| format!("view {view_id}: source {id} has no relay route"))?,
+        };
+        let dest = match route {
             // A probe with no equality key must see the whole delta: a match can
             // live on any worker's trace. The per-worker slices are disjoint, so
             // their concatenation is the delta exactly once.

@@ -66,12 +66,13 @@ fn gated_side<'a>(
 ) -> Result<EquiSide<'a>, GnitzSqlError> {
     let columns = &side.frame.schema.columns;
     let key = side_reindex_key(&cols, columns, tcs);
+    let role = side.scatter_key(&key)?;
     if !gate_after {
         let gated = null_gate(cb, input, &cols, columns)?;
-        let reindex = cb.map_reindex(gated, &key, &side.keep, ReindexRole::ScatterKey);
+        let reindex = cb.map_reindex(gated, &key, &side.keep, role);
         return Ok(EquiSide { side, all: reindex, reindex });
     }
-    let all = cb.map_reindex(input, &key, &side.keep, ReindexRole::ScatterKey);
+    let all = cb.map_reindex(input, &key, &side.keep, role);
     let k = tcs.len();
     let gate_cols: Vec<usize> = cols
         .iter()
@@ -421,7 +422,7 @@ fn own_a(
     scatter: bool,
 ) -> Result<(NodeId, NodeId), GnitzSqlError> {
     let role = match scatter {
-        true => ReindexRole::ScatterKey,
+        true => side.scatter_pk(),
         false => ReindexRole::Auxiliary,
     };
     let range_slot = slot_of(&side.frame.layout, range.left)?;

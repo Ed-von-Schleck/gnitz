@@ -1,10 +1,9 @@
-//! VM test fixtures: the registry and child stores a hand-built program's trace
-//! registers are backed by. A child of `vm`, so both `builder`'s and `exec`'s
+//! VM test fixtures: the registry and child stores a hand-built plan's
+//! operators read and write. A child of `vm`, so both `builder`'s and `exec`'s
 //! tests reach it.
 
 use super::*;
-use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateIdx, StoreConfig};
-use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_store::storage::Slot;
 use gnitz_wire::ViewProps;
 
@@ -27,16 +26,51 @@ pub(in crate::query) fn vm_registry(dir: &std::path::Path) -> RelationRegistry {
     registry
 }
 
-/// One child store backing a trace register, opened the way a compile opens one.
-pub(in crate::query) fn owned_table(
-    builder: &mut ProgramBuilder,
-    registry: &RelationRegistry,
-    dir: &std::path::Path,
-    name: &str,
-    schema: SchemaDescriptor,
-) -> StateIdx {
-    builder
-        .state
-        .open_child(registry, VIEW_ID, dir.to_str().unwrap(), name, schema)
-        .unwrap()
+/// What the emitter hands `build`, assembled by a test instead.
+#[derive(Default)]
+pub(in crate::query) struct TestPlan {
+    pub(in crate::query) state: CircuitState,
+    pub(in crate::query) instructions: Vec<Instr>,
+    pub(in crate::query) integrates: Vec<(DeltaReg, StateIdx)>,
+}
+
+impl TestPlan {
+    pub(in crate::query) fn push(&mut self, in_reg: u16, out_reg: u16, op: Op) {
+        self.instructions.push(Instr {
+            in_reg: DeltaReg(in_reg),
+            out_reg: DeltaReg(out_reg),
+            op,
+        });
+    }
+
+    pub(in crate::query) fn integrate(&mut self, in_reg: u16, trace: StateIdx) {
+        self.integrates.push((DeltaReg(in_reg), trace));
+    }
+
+    /// One child store, opened the way a compile opens one.
+    pub(in crate::query) fn table(
+        &mut self,
+        registry: &RelationRegistry,
+        dir: &std::path::Path,
+        name: &str,
+        schema: SchemaDescriptor,
+    ) -> StateIdx {
+        self.state
+            .open_child(registry, VIEW_ID, dir.to_str().unwrap(), name, schema)
+            .unwrap()
+    }
+
+    pub(in crate::query) fn build(self, schemas: Vec<SchemaDescriptor>, out: u16) -> Box<VmHandle> {
+        super::build(self.instructions, self.integrates, schemas, self.state, DeltaReg(out))
+    }
+}
+
+/// The net contents of one child store, as a Z-set — how a test sees what an
+/// epoch left in a trace.
+pub(in crate::query) fn trace_zset(
+    vm: &VmHandle,
+    idx: StateIdx,
+    schema: &SchemaDescriptor,
+) -> std::collections::HashMap<crate::test_support::RowKey, i64> {
+    crate::test_support::zset_of(&vm.state.cursor(idx).materialize(), schema)
 }

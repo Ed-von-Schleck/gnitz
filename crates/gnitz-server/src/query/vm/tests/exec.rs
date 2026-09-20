@@ -19,25 +19,20 @@ fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Batc
 }
 
 /// A reduce with no value index, over the register convention every test reduce
-/// shares: 0 = input delta, 1 = output trace, 2 = raw delta out. `out_key` is the
-/// one kind a given (schema, group cols) admits, so it is derived, not passed.
+/// shares: 0 = input delta, 1 = raw delta out, integrating into `out_trace`.
 fn push_reduce(
-    b: &mut ProgramBuilder,
+    p: &mut TestPlan,
     aggs: &[AggDescriptor],
     gcols: &[u32],
     in_schema: SchemaDescriptor,
+    out_trace: StateIdx,
     global_ground: bool,
     i_am_owner: bool,
 ) -> SchemaDescriptor {
     let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, gcols, aggs, global_ground, i_am_owner).unwrap();
     let out_schema = plan.shape.output_schema;
-    let plan_idx = b.add_reduce_plan(plan, None);
-    b.push(Instr::Reduce {
-        in_reg: DeltaReg(0),
-        trace_out_reg: TraceReg(1),
-        out_reg: DeltaReg(2),
-        plan_idx,
-    });
+    let baked = Box::new(BakedReduce { plan, avi_table: None });
+    p.push(0, 1, Op::Reduce { out_trace, plan: baked });
     out_schema
 }
 
@@ -93,13 +88,9 @@ fn union_nullability_schemas() -> (SchemaDescriptor, SchemaDescriptor, SchemaDes
 /// A pass-through program: `reg1 = reg0 ∪ reg2`, with reg2 never seeded unless
 /// the test seeds it. Three delta registers under one schema, output reg 1.
 fn union_program(schema: SchemaDescriptor) -> Box<VmHandle> {
-    let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: DeltaReg(0),
-        in_b: DeltaReg(2),
-        out_reg: DeltaReg(1),
-    });
-    builder.build(vec![RegisterMeta::delta(schema); 3], DeltaReg(1))
+    let mut p = TestPlan::default();
+    p.push(0, 1, Op::Union { in_b: DeltaReg(2) });
+    p.build(vec![schema; 3], 1)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -122,20 +113,12 @@ fn test_filter_negate_pipeline() {
         }, // r2 = r0 > r1
     ];
     let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, gnitz_expr::Output::Result(Reg(2)), vec![]);
-    let mut builder = ProgramBuilder::new();
-    let pred_idx = builder.push_predicate(pred_prog.resolve_filter(&schema).unwrap());
-    builder.push(Instr::Filter {
-        in_reg: DeltaReg(0),
-        out_reg: DeltaReg(1),
-        pred_idx,
-    });
-    builder.push(Instr::Negate {
-        in_reg: DeltaReg(1),
-        out_reg: DeltaReg(2),
-    });
+    let mut p = TestPlan::default();
+    p.push(0, 1, Op::Filter(Box::new(pred_prog.resolve_filter(&schema).unwrap())));
+    p.push(1, 2, Op::Negate);
 
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 1, -5), (3, 1, 20)]);
-    let mut vm = builder.build(vec![RegisterMeta::delta(schema); 3], DeltaReg(2));
+    let mut vm = p.build(vec![schema; 3], 2);
     let result = execute_epoch(&mut vm, input, 0).unwrap();
 
     assert_eq!(extract_rows(&result), vec![(1, -1, 10), (3, -1, 20)]);
@@ -210,18 +193,9 @@ fn test_union_runs_under_the_merged_output_schema() {
     let mut right = rb.finish();
     right.certify_layout(Layout::Consolidated);
 
-    let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: DeltaReg(0),
-        in_b: DeltaReg(2),
-        out_reg: DeltaReg(1),
-    });
-    let reg_meta = vec![
-        RegisterMeta::delta(schema_a),
-        RegisterMeta::delta(merged),
-        RegisterMeta::delta(schema_b),
-    ];
-    let mut vm = builder.build(reg_meta, DeltaReg(1));
+    let mut p = TestPlan::default();
+    p.push(0, 1, Op::Union { in_b: DeltaReg(2) });
+    let mut vm = p.build(vec![schema_a, merged, schema_b], 1);
     let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), left), (DeltaReg(2), right)]).unwrap();
 
     assert_eq!(result.len(), 2, "Z-Set + keeps both rows");
@@ -244,18 +218,9 @@ fn test_union_identity_path_output_carries_out_register_schema() {
     // path and hands `batch_a` straight back with `schema_a` still on it.
     let left = make_batch_u128(&schema_a, &[(1, 1, -3)]);
 
-    let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: DeltaReg(0),
-        in_b: DeltaReg(2),
-        out_reg: DeltaReg(1),
-    });
-    let reg_meta = vec![
-        RegisterMeta::delta(schema_a),
-        RegisterMeta::delta(merged),
-        RegisterMeta::delta(schema_b),
-    ];
-    let mut vm = builder.build(reg_meta, DeltaReg(1));
+    let mut p = TestPlan::default();
+    p.push(0, 1, Op::Union { in_b: DeltaReg(2) });
+    let mut vm = p.build(vec![schema_a, merged, schema_b], 1);
     let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), left)]).unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(
@@ -271,14 +236,10 @@ fn test_union_identity_path_output_carries_out_register_schema() {
 #[test]
 fn test_self_union_doubles_weights() {
     let schema = make_schema_u128_i64();
-    let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: DeltaReg(0),
-        in_b: DeltaReg(0),
-        out_reg: DeltaReg(1),
-    });
+    let mut p = TestPlan::default();
+    p.push(0, 1, Op::Union { in_b: DeltaReg(0) });
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]);
-    let mut vm = builder.build(vec![RegisterMeta::delta(schema); 2], DeltaReg(1));
+    let mut vm = p.build(vec![schema; 2], 1);
     let result = execute_epoch(&mut vm, input, 0).unwrap();
     assert_eq!(
         extract_rows(&result),
@@ -294,24 +255,14 @@ fn test_self_union_doubles_weights() {
 #[test]
 fn a_non_consuming_union_leaves_its_operand_readable() {
     let schema = make_schema_u128_i64();
-    let mut builder = ProgramBuilder::new();
+    let mut p = TestPlan::default();
     // reg1 = -reg0; reg2 = reg0 ∪ reg1; reg3 = -reg0 again.
-    builder.push(Instr::Negate {
-        in_reg: DeltaReg(0),
-        out_reg: DeltaReg(1),
-    });
-    builder.push(Instr::Union {
-        in_a: DeltaReg(0),
-        in_b: DeltaReg(1),
-        out_reg: DeltaReg(2),
-    });
-    builder.push(Instr::Negate {
-        in_reg: DeltaReg(0),
-        out_reg: DeltaReg(3),
-    });
+    p.push(0, 1, Op::Negate);
+    p.push(0, 2, Op::Union { in_b: DeltaReg(1) });
+    p.push(0, 3, Op::Negate);
 
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]);
-    let mut vm = builder.build(vec![RegisterMeta::delta(schema); 4], DeltaReg(3));
+    let mut vm = p.build(vec![schema; 4], 3);
     let result = execute_epoch(&mut vm, input, 0).unwrap();
     assert_eq!(extract_rows(&result), vec![(1, -1, 10), (2, -3, 20)]);
 }
@@ -351,25 +302,18 @@ fn test_map_operator() {
     let in_schema = make_schema(&[type_code::I64, type_code::I64]);
     let out_schema = make_schema_u128_i64();
 
-    let mut builder = ProgramBuilder::new();
-    let map_idx = builder.push_map(
-        gnitz_store::expr::MapPlan::from_map(
-            gnitz_expr::LogicalProgram::copy_cols(&[2]),
-            &in_schema,
-            &out_schema,
-            gnitz_store::expr::PkSource::Inherit,
-        )
-        .unwrap(),
-    );
-    builder.push(Instr::Map {
-        in_reg: DeltaReg(0),
-        out_reg: DeltaReg(1),
-        map_idx,
-    });
+    let mut p = TestPlan::default();
+    let map = gnitz_store::expr::MapPlan::from_map(
+        gnitz_expr::LogicalProgram::copy_cols(&[2]),
+        &in_schema,
+        &out_schema,
+        gnitz_store::expr::PkSource::Inherit,
+    )
+    .unwrap();
+    p.push(0, 1, Op::Map(Box::new(map)));
 
     let input = make_batch_2col(in_schema, &[(1, 1, 10, 100), (2, 1, 20, 200)]);
-    let reg_meta = vec![RegisterMeta::delta(in_schema), RegisterMeta::delta(out_schema)];
-    let mut vm = builder.build(reg_meta, DeltaReg(1));
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
     let result = execute_epoch(&mut vm, input, 0).unwrap();
 
     // The projected column is the second payload col (100, 200).
@@ -384,25 +328,18 @@ fn test_distinct_multi_tick() {
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
-    let mut builder = ProgramBuilder::new();
-    // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
-    let table = owned_table(&mut builder, &registry, dir.path(), "dist_test", schema);
-    builder.push(Instr::WeightClamp {
-        in_reg: DeltaReg(0),
-        hist_reg: TraceReg(1),
-        out_reg: DeltaReg(2),
-        preset: gnitz_store::ops::ClampPreset::Distinct,
-    });
-
-    let reg_meta = vec![
-        RegisterMeta::delta(schema),
-        RegisterMeta::trace(schema, table),
-        RegisterMeta::delta(schema),
-    ];
-
-    // The history register is backed by the plan's owned table, so each tick
-    // opens its cursor through `bind_trace_cursors` — the production path.
-    let mut vm = builder.build(reg_meta, DeltaReg(2));
+    let mut p = TestPlan::default();
+    // reg 0 = input delta, reg 1 = output delta, over a real history store.
+    let hist = p.table(&registry, dir.path(), "dist_test", schema);
+    p.push(
+        0,
+        1,
+        Op::WeightClamp {
+            hist,
+            preset: gnitz_store::ops::ClampPreset::Distinct,
+        },
+    );
+    let mut vm = p.build(vec![schema; 2], 1);
 
     // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
     let r1 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 3, 42)]), 0).unwrap();
@@ -429,42 +366,20 @@ fn test_join_delta_trace() {
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
-    let mut builder = ProgramBuilder::new();
-    let table = owned_table(&mut builder, &registry, dir.path(), "join_test", right_schema);
+    let mut p = TestPlan::default();
+    let trace = p.table(&registry, dir.path(), "join_test", right_schema);
     // Three trace rows on one PK, differing in payload.
     let trace_batch = make_batch_u128(&right_schema, &[(10, 1, 100), (10, 1, 200), (10, 1, 300)]);
-    builder.state.ingest_owned(table, trace_batch).unwrap();
-    // reg 0 = left delta, reg 1 = right trace, reg 2 = output
-    let probe = gnitz_store::ops::JoinPlan::from_wire(
-        gnitz_wire::JoinKind::Equi,
-        false,
-        &left_schema,
-        &right_schema,
-    )
-    .unwrap()
-    .probe;
-    builder.push(Instr::JoinDT {
-        probe,
-        delta_reg: DeltaReg(0),
-        trace_reg: TraceReg(1),
-        out_reg: DeltaReg(2),
-    });
-
-    let reg_meta = vec![
-        RegisterMeta::delta(left_schema),
-        RegisterMeta::trace(right_schema, table),
-        RegisterMeta::delta(join_schema),
-    ];
-    let mut vm = builder.build(reg_meta, DeltaReg(2));
+    p.state.ingest_owned(trace, trace_batch).unwrap();
+    // reg 0 = left delta, reg 1 = output
+    let probe = gnitz_store::ops::JoinPlan::from_wire(gnitz_wire::JoinKind::Equi, false, &left_schema, &right_schema)
+        .unwrap()
+        .probe;
+    p.push(0, 1, Op::JoinDT { trace, probe });
+    let mut vm = p.build(vec![left_schema, join_schema], 1);
 
     let input = make_batch_u128(&left_schema, &[(10, 2, 50)]);
     let result = execute_epoch(&mut vm, input, 0).unwrap();
-    assert_eq!(
-        vm.regfile.batches[1].len(),
-        0,
-        "a trace is reached through its cursor, never its register's batch — which is what \
-         lets the per-epoch clear run over every register blind",
-    );
 
     // 1 delta row × 3 trace rows, each at the weight product 2 × 1, and each
     // carrying the left payload before the right.
@@ -493,8 +408,8 @@ fn test_reduce_groups_by_a_payload_column() {
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
-    let mut builder = ProgramBuilder::new();
-    let trace_out_table = owned_table(&mut builder, &registry, dir.path(), "tr_out", out_schema);
+    let mut p = TestPlan::default();
+    let out_trace = p.table(&registry, dir.path(), "tr_out", out_schema);
     // SUM of payload col 1 (schema col 2), plus the trailing Count cardinality
     // companion every all-linear reduce carries.
     let agg_descs = [
@@ -503,18 +418,9 @@ fn test_reduce_groups_by_a_payload_column() {
     ];
     let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
-    push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
-    builder.push(Instr::Integrate {
-        in_reg: DeltaReg(2),
-        trace_reg: TraceReg(1),
-    });
-
-    let reg_meta = vec![
-        RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, trace_out_table),
-        RegisterMeta::delta(out_schema),
-    ];
-    let mut vm = builder.build(reg_meta, DeltaReg(2));
+    push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false, false);
+    p.integrate(1, out_trace);
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
 
     // Both rows in group=1, values 10 and 20.
     let input = make_batch_2col(in_schema, &[(1, 1, 1, 10), (2, 1, 1, 20)]);
@@ -535,8 +441,8 @@ fn test_reduce_multi_agg() {
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
-    let mut builder = ProgramBuilder::new();
-    let trace_out_table = owned_table(&mut builder, &registry, dir.path(), "ma_tr_out", out_schema);
+    let mut p = TestPlan::default();
+    let out_trace = p.table(&registry, dir.path(), "ma_tr_out", out_schema);
     let agg_descs = [
         AggDescriptor {
             col_idx: 1, // schema col index for the val column
@@ -547,18 +453,9 @@ fn test_reduce_multi_agg() {
     // GROUP BY col 0 (= pk, schema col index 0)
     let group_cols = [0u32];
 
-    push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
-    builder.push(Instr::Integrate {
-        in_reg: DeltaReg(2),
-        trace_reg: TraceReg(1),
-    });
-
-    let reg_meta = vec![
-        RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, trace_out_table),
-        RegisterMeta::delta(out_schema),
-    ];
-    let mut vm = builder.build(reg_meta, DeltaReg(2));
+    push_reduce(&mut p, &agg_descs, &group_cols, in_schema, out_trace, false, false);
+    p.integrate(1, out_trace);
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
 
     // Three rows all with pk=1, vals 10, 20, 30.
     let input = make_batch_u128(&in_schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
@@ -581,22 +478,23 @@ fn an_empty_epoch_mints_the_ground_row_once() {
     let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
-    let mut builder = ProgramBuilder::new();
-    let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, true);
-    let trace_table = owned_table(&mut builder, &registry, dir.path(), "ground_tr", out_schema);
-    builder.push(Instr::Integrate {
-        in_reg: DeltaReg(2),
-        trace_reg: TraceReg(1),
-    });
-    let reg_meta = vec![
-        RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, trace_table),
-        RegisterMeta::delta(out_schema),
-    ];
-    let mut vm = builder.build(reg_meta, DeltaReg(2));
+    let mut p = TestPlan::default();
+    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true, true).unwrap();
+    let out_schema = plan.shape.output_schema;
+    let out_trace = p.table(&registry, dir.path(), "ground_tr", out_schema);
+    p.push(
+        0,
+        1,
+        Op::Reduce {
+            out_trace,
+            plan: Box::new(BakedReduce { plan, avi_table: None }),
+        },
+    );
+    p.integrate(1, out_trace);
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
     assert!(
         vm.pending_ground_row,
-        "the latch is derived from the finished reduce-plan pool",
+        "the latch is derived from the emitted reduce plans",
     );
 
     let first = execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0).unwrap();
@@ -619,15 +517,22 @@ fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
     let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
-    let mut builder = ProgramBuilder::new();
-    let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, false);
-    let trace_table = owned_table(&mut builder, &registry, dir.path(), "unowned_tr", out_schema);
-    let reg_meta = vec![
-        RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, trace_table),
-        RegisterMeta::delta(out_schema),
-    ];
-    let mut vm = builder.build(reg_meta, DeltaReg(2));
+    let mut p = TestPlan::default();
+    let out_schema = {
+        let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true, false).unwrap();
+        let s = plan.shape.output_schema;
+        let out_trace = p.table(&registry, dir.path(), "unowned_tr", s);
+        p.push(
+            0,
+            1,
+            Op::Reduce {
+                out_trace,
+                plan: Box::new(BakedReduce { plan, avi_table: None }),
+            },
+        );
+        s
+    };
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
     assert!(!vm.pending_ground_row);
     assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
         .unwrap()
@@ -640,36 +545,24 @@ fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
 #[test]
 fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
     let schema = make_schema_u128_i64();
-    let mut builder = ProgramBuilder::new();
+    let mut p = TestPlan::default();
     // Reg 1 is the sink; reg 2 is written and never read, so nothing frees it
     // and it is what still holds rows when the epoch ends — the precondition the
     // empty epoch below has to clear.
-    builder.push(Instr::WorkerFilter {
-        in_reg: DeltaReg(0),
-        out_reg: DeltaReg(1),
-        worker_id: 0,
-        num_workers: 1,
-    });
-    builder.push(Instr::Negate {
-        in_reg: DeltaReg(0),
-        out_reg: DeltaReg(2),
-    });
-    let mut vm = builder.build(vec![RegisterMeta::delta(schema); 3], DeltaReg(1));
+    p.push(0, 1, Op::WorkerFilter { worker_id: 0, num_workers: 1 });
+    p.push(0, 2, Op::Negate);
+    let mut vm = p.build(vec![schema; 3], 1);
     assert!(!vm.pending_ground_row);
 
     let out = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0).unwrap();
     assert_eq!(out.len(), 1, "one row through");
-    assert_eq!(
-        vm.regfile.batches[2].len(),
-        1,
-        "a register nothing reads keeps its batch"
-    );
+    assert_eq!(vm.batches[2].len(), 1, "a register nothing reads keeps its batch");
 
     assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&schema), 0)
         .unwrap()
         .is_empty());
     assert!(
-        vm.regfile.batches.iter().all(|b| b.is_empty()),
+        vm.batches.iter().all(|b| b.is_empty()),
         "the skipped epoch still released the previous one's batches",
     );
 }
@@ -681,54 +574,25 @@ type JoinRows<'a> = &'a [(u128, i64, i64)];
 
 /// `ΔA ⋈ z⁻¹I(B) + ΔB ⋈ z⁻¹I(A)` as the planner builds it: both terms in side
 /// order, both integrates, one union. Registers are 0/1 = the two deltas,
-/// 2/3 = their traces, 4/5 = the terms, 6 = the union.
+/// 2/3 = the terms, 4 = the union.
 fn two_term_join(
-    b: &mut ProgramBuilder,
+    p: &mut TestPlan,
     registry: &RelationRegistry,
     dir: &std::path::Path,
     kind: gnitz_wire::JoinKind,
     schema: SchemaDescriptor,
-) -> (SchemaDescriptor, Vec<RegisterMeta>) {
-    let trace_a = owned_table(b, registry, dir, "ta", schema);
-    let trace_b = owned_table(b, registry, dir, "tb", schema);
+) -> (SchemaDescriptor, Vec<SchemaDescriptor>) {
+    let trace_a = p.table(registry, dir, "ta", schema);
+    let trace_b = p.table(registry, dir, "tb", schema);
     let plan = |right: bool| gnitz_store::ops::JoinPlan::from_wire(kind, right, &schema, &schema).unwrap();
     let out_schema = plan(false).out_schema;
 
-    b.push(Instr::JoinDT {
-        delta_reg: DeltaReg(0),
-        trace_reg: TraceReg(3),
-        out_reg: DeltaReg(4),
-        probe: plan(false).probe,
-    });
-    b.push(Instr::JoinDT {
-        delta_reg: DeltaReg(1),
-        trace_reg: TraceReg(2),
-        out_reg: DeltaReg(5),
-        probe: plan(true).probe,
-    });
-    b.push(Instr::Union {
-        in_a: DeltaReg(4),
-        in_b: DeltaReg(5),
-        out_reg: DeltaReg(6),
-    });
-    b.push(Instr::Integrate {
-        in_reg: DeltaReg(0),
-        trace_reg: TraceReg(2),
-    });
-    b.push(Instr::Integrate {
-        in_reg: DeltaReg(1),
-        trace_reg: TraceReg(3),
-    });
-    let meta = vec![
-        RegisterMeta::delta(schema),
-        RegisterMeta::delta(schema),
-        RegisterMeta::trace(schema, trace_a),
-        RegisterMeta::trace(schema, trace_b),
-        RegisterMeta::delta(out_schema),
-        RegisterMeta::delta(out_schema),
-        RegisterMeta::delta(out_schema),
-    ];
-    (out_schema, meta)
+    p.push(0, 2, Op::JoinDT { trace: trace_b, probe: plan(false).probe });
+    p.push(1, 3, Op::JoinDT { trace: trace_a, probe: plan(true).probe });
+    p.push(2, 4, Op::Union { in_b: DeltaReg(3) });
+    p.integrate(0, trace_a);
+    p.integrate(1, trace_b);
+    (out_schema, vec![schema, schema, out_schema, out_schema, out_schema])
 }
 
 /// The product both terms together must denote: every `(a, b)` pair the kind
@@ -773,9 +637,9 @@ fn a_two_term_join_denotes_the_product_across_both_epochs() {
         let dir = tempfile::tempdir().unwrap();
         let registry = vm_registry(dir.path());
         let schema = make_schema_u128_i64();
-        let mut builder = ProgramBuilder::new();
-        let (out_schema, meta) = two_term_join(&mut builder, &registry, dir.path(), kind, schema);
-        let mut vm = builder.build(meta, DeltaReg(6));
+        let mut p = TestPlan::default();
+        let (out_schema, schemas) = two_term_join(&mut p, &registry, dir.path(), kind, schema);
+        let mut vm = p.build(schemas, 4);
 
         let a = execute_epoch(&mut vm, make_batch_u128_raw(&schema, a_raw), 0).unwrap();
         assert!(a.is_empty(), "{kind:?}: nothing to join against yet");
@@ -787,4 +651,123 @@ fn a_two_term_join_denotes_the_product_across_both_epochs() {
             "{kind:?}",
         );
     }
+}
+
+// ── Integrates run after the range, and a replay runs none ───────────────
+
+/// A `Reduce` and a `TopN` both return the register their integrate reads, so an
+/// integrate running against the extracted output would write nothing and the
+/// operator would never see its own history: the second epoch would add a row
+/// instead of retracting the first one's.
+#[test]
+fn a_second_epoch_retracts_the_first_ones_aggregate() {
+    let in_schema = make_schema_u128_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let registry = vm_registry(dir.path());
+
+    let mut p = TestPlan::default();
+    let plan = gnitz_store::ops::ReducePlan::from_wire(
+        &in_schema,
+        &[],
+        &[
+            AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum },
+            AggDescriptor::COUNT_STAR,
+        ],
+        false,
+        false,
+    )
+    .unwrap();
+    let out_schema = plan.shape.output_schema;
+    let out_trace = p.table(&registry, dir.path(), "sum_tr", out_schema);
+    p.push(
+        0,
+        1,
+        Op::Reduce {
+            out_trace,
+            plan: Box::new(BakedReduce { plan, avi_table: None }),
+        },
+    );
+    p.integrate(1, out_trace);
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
+
+    let sum_of = |vm: &VmHandle| -> Vec<i64> {
+        let out = vm.state.cursor(out_trace).materialize();
+        (0..out.len())
+            .map(|i| i64::from_le_bytes(out.col_data(0)[i * 8..(i + 1) * 8].try_into().unwrap()))
+            .collect()
+    };
+
+    execute_epoch(&mut vm, make_batch_u128(&in_schema, &[(1, 1, 10), (2, 1, 20)]), 0).unwrap();
+    assert_eq!(sum_of(&vm), vec![30], "the integrate wrote the first aggregate");
+
+    execute_epoch(&mut vm, make_batch_u128(&in_schema, &[(3, 1, 5)]), 0).unwrap();
+    assert_eq!(
+        sum_of(&vm),
+        vec![35],
+        "the second epoch retracted 30 and integrated 35, leaving one live row",
+    );
+}
+
+/// A `TopN`'s integrate is the same aliasing shape, through a different emit arm.
+#[test]
+fn a_second_topn_epoch_retracts_the_first_ones_row() {
+    let in_schema = make_schema_u128_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let registry = vm_registry(dir.path());
+
+    let mut p = TestPlan::default();
+    let order = [gnitz_wire::OrderKey { col: 1, desc: true, nulls_first: false }];
+    let plan = gnitz_store::ops::TopNPlan::from_wire(&in_schema, &[], &order, 1, 0).unwrap();
+    let out_schema = plan.output_schema;
+    let out_trace = p.table(&registry, dir.path(), "topn_tr", out_schema);
+    let index_table = p.table(&registry, dir.path(), "topn_idx", plan.index.schema);
+    p.push(
+        0,
+        1,
+        Op::TopN {
+            out_trace,
+            plan: Box::new(BakedTopN { plan, index_table }),
+        },
+    );
+    p.integrate(1, out_trace);
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
+
+    execute_epoch(&mut vm, make_batch_u128(&in_schema, &[(1, 1, 10)]), 0).unwrap();
+    assert_eq!(trace_zset(&vm, out_trace, &out_schema).len(), 1);
+
+    // A strictly greater value displaces the top row entirely.
+    execute_epoch(&mut vm, make_batch_u128(&in_schema, &[(2, 1, 99)]), 0).unwrap();
+    let held = trace_zset(&vm, out_trace, &out_schema);
+    assert_eq!(
+        held.len(),
+        1,
+        "the first row was retracted, not kept beside the new one"
+    );
+    assert!(held.values().all(|&w| w == 1));
+}
+
+/// A hydration replay seeds a register out of a trace and re-runs the program
+/// over it; running the integrates too would write that seed back and double the
+/// trace's weights on every read.
+#[test]
+fn a_replay_leaves_every_trace_as_it_found_it() {
+    let schema = make_schema_u128_i64();
+    let dir = tempfile::tempdir().unwrap();
+    let registry = vm_registry(dir.path());
+
+    let mut p = TestPlan::default();
+    let trace = p.table(&registry, dir.path(), "replay_tr", schema);
+    p.push(0, 1, Op::WorkerFilter { worker_id: 0, num_workers: 1 });
+    p.integrate(1, trace);
+    let mut vm = p.build(vec![schema; 2], 1);
+
+    let rows = [(1u128, 1i64, 10i64), (2, 1, 20)];
+    execute_epoch(&mut vm, make_batch_u128(&schema, &rows), 0).unwrap();
+    let before = trace_zset(&vm, trace, &schema);
+    assert_eq!(before.len(), 2);
+
+    let seed = (DeltaReg(0), make_batch_u128(&schema, &rows));
+    let replayed = replay_chunk(&mut vm, 0, seed).unwrap();
+    assert_eq!(replayed.len(), 2, "the replay still produces the rows it recomputed");
+    assert_eq!(trace_zset(&vm, trace, &schema), before, "and writes none of them back");
 }

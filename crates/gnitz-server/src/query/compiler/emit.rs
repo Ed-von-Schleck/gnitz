@@ -8,8 +8,9 @@
 //! read them.
 
 use super::*;
-use crate::query::vm::Instr;
+use crate::query::vm::{BakedReduce, BakedTopN, Instr, Op};
 use gnitz_store::ops::{ClampPreset, JoinPlan};
+use gnitz_store::relation::CircuitState;
 
 // ---------------------------------------------------------------------------
 // EmitCtx — the per-plan build state every emit arm works against
@@ -18,24 +19,26 @@ use gnitz_store::ops::{ClampPreset, JoinPlan};
 /// All state of one `build_plan` invocation. Owned by `build_plan` and threaded
 /// to the emit arms as one `&mut` instead of a dozen parallel parameters.
 pub(super) struct EmitCtx<'a> {
-    pub(in crate::query) loaded: &'a LoadedCircuit,
+    loaded: &'a LoadedCircuit,
     /// This worker holds the view's whole input: the `WorkerFilter` arm emits
     /// nothing (the trim would drop rows it legitimately owns a copy of), and
     /// `emit_reduce` makes it the owner of the global-aggregate seed.
-    pub(in crate::query) self_contained: bool,
-    pub(in crate::query) site: super::ViewSite<'a>,
-    pub(in crate::query) builder: ProgramBuilder,
-    pub(in crate::query) out_reg_of: Vec<Option<OutReg>>,
-    pub(in crate::query) reg_meta: Vec<RegisterMeta>,
-    pub(in crate::query) source_reg_map: FxHashMap<i64, DeltaReg>,
+    self_contained: bool,
+    site: super::ViewSite<'a>,
+    state: CircuitState,
+    instructions: Vec<Instr>,
+    integrates: Vec<(DeltaReg, StateIdx)>,
+    delta_schemas: Vec<SchemaDescriptor>,
+    out_reg_of: Vec<Option<OutReg>>,
+    source_reg_map: FxHashMap<i64, DeltaReg>,
 }
 
-/// What a node's emission left its value in — the one place the two register
-/// kinds meet, so every emit arm names the port kind it means.
+/// What a node's emission left its value in — the one place a delta and a trace
+/// meet, so every emit arm names the port kind it means.
 #[derive(Clone, Copy)]
 pub(super) enum OutReg {
     Delta(DeltaReg),
-    Trace(TraceReg),
+    Trace(StateIdx),
 }
 
 impl OutReg {
@@ -46,9 +49,9 @@ impl OutReg {
         }
     }
 
-    pub(super) fn trace(self) -> Result<TraceReg, String> {
+    pub(super) fn trace(self) -> Result<StateIdx, String> {
         match self {
-            OutReg::Trace(r) => Ok(r),
+            OutReg::Trace(t) => Ok(t),
             OutReg::Delta(_) => Err("operand port takes an integral, not a delta".into()),
         }
     }
@@ -58,8 +61,7 @@ impl EmitCtx<'_> {
     /// Open one child store of this plan's operator state. The returned
     /// [`StateIdx`] is the only way to reach it.
     fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<StateIdx, String> {
-        self.builder
-            .state
+        self.state
             .open_child(
                 self.site.registry,
                 self.site.id as i64,
@@ -70,15 +72,8 @@ impl EmitCtx<'_> {
             .map_err(|e| format!("child table create failed: {e}"))
     }
 
-    /// Allocate a trace register and the child store backing it
-    /// (`bind_trace_cursors` opens a cursor on it each epoch). Returns the
-    /// register and no index: the register is how every instruction reaches the
-    /// store ([`crate::query::vm::Program::trace_table_idx`]).
-    fn push_trace_reg(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<TraceReg, String> {
-        let idx = self.create_child_table(child_name, schema)?;
-        let id = TraceReg(self.mint_reg());
-        self.reg_meta.push(RegisterMeta::trace(schema, idx));
-        Ok(id)
+    fn push(&mut self, in_reg: DeltaReg, out_reg: DeltaReg, op: Op) {
+        self.instructions.push(Instr { in_reg, out_reg, op });
     }
 
     /// The register `src` produced. The one rejection left after the load held
@@ -100,31 +95,26 @@ impl EmitCtx<'_> {
     }
 
     /// A join's `(delta, trace)` operands.
-    fn join_in(&self, nid: NodeId) -> Result<(DeltaReg, TraceReg), String> {
+    fn join_in(&self, nid: NodeId) -> Result<(DeltaReg, StateIdx), String> {
         let (d, t) = self.loaded.inputs(nid).binary();
         Ok((self.reg_of(d)?.delta()?, self.reg_of(t)?.trace()?))
     }
 
     /// The schema register `r` is labelled with — the emit-time twin of
     /// [`crate::query::vm::Program::schema_of`].
-    fn reg_schema(&self, r: impl Into<u16>) -> SchemaDescriptor {
-        self.reg_meta[r.into() as usize].schema
-    }
-
-    /// The next register id, asserting it fits the `u16` instruction field.
-    fn mint_reg(&self) -> u16 {
-        assert!(
-            self.reg_meta.len() < u16::MAX as usize,
-            "register count exceeds u16::MAX; `LoadedCircuit::new` caps a circuit at {} nodes",
-            super::MAX_CIRCUIT_NODES,
-        );
-        self.reg_meta.len() as u16
+    fn reg_schema(&self, r: DeltaReg) -> SchemaDescriptor {
+        self.delta_schemas[r.0 as usize]
     }
 
     /// Allocate a fresh delta register and return its id.
     fn push_delta_reg(&mut self, schema: SchemaDescriptor) -> DeltaReg {
-        let id = DeltaReg(self.mint_reg());
-        self.reg_meta.push(RegisterMeta::delta(schema));
+        assert!(
+            self.delta_schemas.len() < u16::MAX as usize,
+            "register count exceeds u16::MAX; `LoadedCircuit::new` caps a circuit at {} nodes",
+            super::MAX_CIRCUIT_NODES,
+        );
+        let id = DeltaReg(self.delta_schemas.len() as u16);
+        self.delta_schemas.push(schema);
         id
     }
 }
@@ -165,9 +155,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let pred = LogicalProgram::from_blob(blob, "filter")
                 .and_then(|p| p.resolve_filter(&in_schema))
                 .map_err(|e| OpBuildErr::Program("filter: invalid predicate program", e))?;
-            let pred_idx = ctx.builder.push_predicate(pred);
             let out_reg = ctx.push_delta_reg(in_schema);
-            ctx.builder.push(Instr::Filter { in_reg, out_reg, pred_idx });
+            ctx.push(in_reg, out_reg, Op::Filter(Box::new(pred)));
             Ok(OutReg::Delta(out_reg))
         }
 
@@ -176,7 +165,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
         gnitz_wire::OpNode::Negate => {
             let in_reg = ctx.unary_delta_in(nid)?;
             let out_reg = ctx.push_delta_reg(ctx.reg_schema(in_reg));
-            ctx.builder.push(Instr::Negate { in_reg, out_reg });
+            ctx.push(in_reg, out_reg, Op::Negate);
             Ok(OutReg::Delta(out_reg))
         }
 
@@ -184,7 +173,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let (in_a, in_b) = ctx.binary_delta_in(nid)?;
             let out_schema = gnitz_store::ops::union_nullability_merge(&ctx.reg_schema(in_a), &ctx.reg_schema(in_b))?;
             let out_reg = ctx.push_delta_reg(out_schema);
-            ctx.builder.push(Instr::Union { in_a, in_b, out_reg });
+            ctx.push(in_a, out_reg, Op::Union { in_b });
             Ok(OutReg::Delta(out_reg))
         }
 
@@ -200,37 +189,28 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let plan =
                 gnitz_store::ops::TopNPlan::from_wire(&ctx.reg_schema(in_reg), group_cols, order, *limit, *offset)?;
             let out_schema = plan.output_schema;
-            let trace_out_reg = ctx.push_trace_reg(&format!("_topn_{}_{nid}", ctx.site.id), out_schema)?;
+            let out_trace = ctx.create_child_table(&format!("_topn_{}_{nid}", ctx.site.id), out_schema)?;
             let out_reg = ctx.push_delta_reg(out_schema);
             // The ordered index of every input row — the operator's whole
             // history, so a failed create fails the compile as a reduce's does.
-            let index = ctx.create_child_table(&format!("_topnidx_{}_{nid}", ctx.site.id), plan.index.schema)?;
-            let plan_idx = ctx.builder.add_topn_plan(plan, index);
-            ctx.builder
-                .push(Instr::TopN { in_reg, trace_out_reg, out_reg, plan_idx });
-            ctx.builder.push(Instr::Integrate {
-                in_reg: out_reg,
-                trace_reg: trace_out_reg,
-            });
+            let index_table = ctx.create_child_table(&format!("_topnidx_{}_{nid}", ctx.site.id), plan.index.schema)?;
+            let baked = Box::new(BakedTopN { plan, index_table });
+            ctx.push(in_reg, out_reg, Op::TopN { out_trace, plan: baked });
+            ctx.integrates.push((out_reg, out_trace));
             Ok(OutReg::Delta(out_reg))
         }
 
         gnitz_wire::OpNode::Join { kind, delta_is_right } => {
-            let (delta_reg, trace_reg) = ctx.join_in(nid)?;
+            let (delta_reg, trace) = ctx.join_in(nid)?;
             // One constructor owns every kind's guards and its output layout.
             let plan = JoinPlan::from_wire(
                 *kind,
                 *delta_is_right,
                 &ctx.reg_schema(delta_reg),
-                &ctx.reg_schema(trace_reg),
+                ctx.state.schema_of(trace),
             )?;
             let out_reg = ctx.push_delta_reg(plan.out_schema);
-            ctx.builder.push(Instr::JoinDT {
-                delta_reg,
-                trace_reg,
-                out_reg,
-                probe: plan.probe,
-            });
+            ctx.push(delta_reg, out_reg, Op::JoinDT { trace, probe: plan.probe });
             Ok(OutReg::Delta(out_reg))
         }
 
@@ -246,9 +226,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             // Must fail the compile on a table-open error: emitting the view without
             // the Integrate would compile a view that never persists its differential
             // state, leaving its output permanently empty.
-            let trace_reg = ctx.push_trace_reg(&format!("_int_{}_{nid}", ctx.site.id), in_reg_schema)?;
-            ctx.builder.push(Instr::Integrate { in_reg, trace_reg });
-            Ok(OutReg::Trace(trace_reg))
+            let trace = ctx.create_child_table(&format!("_int_{}_{nid}", ctx.site.id), in_reg_schema)?;
+            ctx.integrates.push((in_reg, trace));
+            Ok(OutReg::Trace(trace))
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {
@@ -267,12 +247,11 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
                 return Ok(OutReg::Delta(in_reg));
             }
             let out_reg = ctx.push_delta_reg(ctx.reg_schema(in_reg));
-            ctx.builder.push(Instr::WorkerFilter {
-                in_reg,
-                out_reg,
+            let op = Op::WorkerFilter {
                 worker_id: slot.rank,
                 num_workers: slot.of,
-            });
+            };
+            ctx.push(in_reg, out_reg, op);
             Ok(OutReg::Delta(out_reg))
         }
 
@@ -283,11 +262,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let out_schema =
                 gnitz_store::ops::null_extend_output_schema(&ctx.reg_schema(in_reg), type_codes, *nulls_first)?;
             let out_reg = ctx.push_delta_reg(out_schema);
-            ctx.builder.push(Instr::NullExtend {
-                in_reg,
-                out_reg,
-                nulls_first: *nulls_first,
-            });
+            ctx.push(in_reg, out_reg, Op::NullExtend { nulls_first: *nulls_first });
             Ok(OutReg::Delta(out_reg))
         }
     }
@@ -302,10 +277,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 fn emit_clamp(ctx: &mut EmitCtx, nid: NodeId, preset: ClampPreset) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let schema = ctx.reg_schema(in_reg);
-    let hist_reg = ctx.push_trace_reg(&format!("_hist_{}_{nid}", ctx.site.id), schema)?;
+    let hist = ctx.create_child_table(&format!("_hist_{}_{nid}", ctx.site.id), schema)?;
     let out_reg = ctx.push_delta_reg(schema);
-    ctx.builder
-        .push(Instr::WeightClamp { in_reg, hist_reg, out_reg, preset });
+    ctx.push(in_reg, out_reg, Op::WeightClamp { hist, preset });
     Ok(OutReg::Delta(out_reg))
 }
 
@@ -325,9 +299,8 @@ fn emit_map(ctx: &mut EmitCtx, nid: NodeId, mk: &gnitz_wire::MapKind) -> Result<
         return Ok(OutReg::Delta(in_reg));
     }
     let out_schema = *plan.out_schema();
-    let map_idx = ctx.builder.push_map(plan);
     let out_reg = ctx.push_delta_reg(out_schema);
-    ctx.builder.push(Instr::Map { in_reg, out_reg, map_idx });
+    ctx.push(in_reg, out_reg, Op::Map(Box::new(plan)));
     Ok(OutReg::Delta(out_reg))
 }
 
@@ -371,7 +344,7 @@ fn emit_reduce(
     let plan = gnitz_store::ops::ReducePlan::from_wire(&in_reg_schema, group_cols, agg, global_ground, i_am_owner)?;
     let reduce_out_schema = plan.shape.output_schema;
 
-    let trace_reg = ctx.push_trace_reg(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema)?;
+    let out_trace = ctx.create_child_table(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema)?;
     let out_reg = ctx.push_delta_reg(reduce_out_schema);
 
     // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
@@ -379,21 +352,14 @@ fn emit_reduce(
     // a memory-pressure flush. `?`, not a swallowed failure: a non-linear reduce
     // has no other history, and would otherwise compute MIN/MAX from the delta
     // alone while still retracting the old row.
-    let avi = match &plan.avi {
+    let avi_table = match &plan.avi {
         Some(bake) => Some(ctx.create_child_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema)?),
         None => None,
     };
 
-    let plan_idx = ctx.builder.add_reduce_plan(plan, avi);
-
-    ctx.builder.push(Instr::Reduce {
-        in_reg: in_reg_id,
-        trace_out_reg: trace_reg,
-        out_reg,
-        plan_idx,
-    });
-
-    ctx.builder.push(Instr::Integrate { in_reg: out_reg, trace_reg });
+    let baked = Box::new(BakedReduce { plan, avi_table });
+    ctx.push(in_reg_id, out_reg, Op::Reduce { out_trace, plan: baked });
+    ctx.integrates.push((out_reg, out_trace));
     Ok(OutReg::Delta(out_reg))
 }
 
@@ -416,9 +382,11 @@ pub(super) fn build_plan(
         loaded,
         self_contained,
         site,
-        builder: ProgramBuilder::new(),
+        state: CircuitState::new(),
+        instructions: Vec::with_capacity(16),
+        integrates: Vec::new(),
+        delta_schemas: Vec::new(),
         out_reg_of: vec![None; loaded.len()],
-        reg_meta: Vec::new(),
         source_reg_map: FxHashMap::default(),
     };
     for &(ex_nid, schema) in seeds {
@@ -431,14 +399,16 @@ pub(super) fn build_plan(
     }
     let out_reg = ctx.reg_of(out)?.delta()?;
     let EmitCtx {
-        builder,
-        reg_meta,
+        instructions,
+        integrates,
+        delta_schemas,
+        state,
         source_reg_map,
         out_reg_of,
         ..
     } = ctx;
     let plan = SubPlan {
-        vm: builder.build(reg_meta, out_reg),
+        vm: crate::query::vm::build(instructions, integrates, delta_schemas, state, out_reg),
         source_reg_map,
     };
     Ok((plan, out_reg_of))

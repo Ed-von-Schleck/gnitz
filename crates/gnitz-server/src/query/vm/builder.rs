@@ -1,159 +1,66 @@
-//! `ProgramBuilder` — the resource pools behind a `Program`, plus `push`.
-//!
-//! Emission constructs `Instr` literals directly (there is deliberately no
-//! per-opcode constructor mirror); the builder's job is holding the resources
-//! those instructions index — predicates, map plans, tables, and the baked
-//! operator pools — and assembling the final `Program`. Each `push`/`add`
-//! returns the index that *is* the instruction operand, so nothing has to be
-//! numbered twice.
+//! `build`: the liveness and consolidation passes that turn an emitted plan into
+//! a runnable [`VmHandle`].
 
 use super::*;
-use gnitz_store::expr::MapPlan;
 
-pub(in crate::query) struct ProgramBuilder {
+/// Assemble one emitted plan. `out_reg` is the register the epoch's output is
+/// extracted from; `integrates` run after the whole instruction range.
+pub(in crate::query) fn build(
     instructions: Vec<Instr>,
-    predicates: Vec<gnitz_expr::Evaluator>,
-    maps: Vec<MapPlan>,
-    pub(in crate::query) state: CircuitState,
-    reduce_plans: Vec<BakedReduce>,
-    topn_plans: Vec<BakedTopN>,
+    integrates: Vec<(DeltaReg, StateIdx)>,
+    delta_schemas: Vec<SchemaDescriptor>,
+    state: CircuitState,
+    out_reg: DeltaReg,
+) -> Box<VmHandle> {
+    // Destructive-register liveness, over the EMITTED instructions — so an
+    // elided node's register aliasing is seen through, not re-derived from
+    // graph edges. Forward, so the last write wins.
+    let mut last_read = vec![u32::MAX; delta_schemas.len()];
+    for (pc, instr) in instructions.iter().enumerate() {
+        for reg in instr.reads().into_iter().flatten() {
+            last_read[reg.at()] = pc as u32;
+        }
+    }
+    for (i, (in_reg, _)) in integrates.iter().enumerate() {
+        last_read[in_reg.at()] = (instructions.len() + i) as u32;
+    }
+    // After the scan, not before: the sink can itself be an operand, and the
+    // epoch epilogue reads it after the last instruction has run.
+    last_read[out_reg.at()] = u32::MAX;
+
+    // Consolidation is the Z-set identity, so folding at the first reader
+    // serves every later one.
+    let mut consolidate_at = vec![u32::MAX; delta_schemas.len()];
+    for instr in &instructions {
+        if facts(&instr.op).consolidates_in {
+            consolidate_at[instr.in_reg.at()] = first_read_of(&instructions, instr.in_reg) as u32;
+        }
+    }
+
+    let pending_ground_row = instructions
+        .iter()
+        .any(|i| matches!(&i.op, Op::Reduce { plan, .. } if plan.plan.seeds_ground));
+
+    Box::new(VmHandle {
+        // Each vector grew by pushes and is then held for the cached plan's
+        // lifetime, so its slack is dead heap per sub-plan, per view, per worker.
+        batches: delta_schemas.iter().map(Batch::empty_with_schema).collect(),
+        program: Program {
+            instructions: shrunk(instructions),
+            integrates: shrunk(integrates),
+            delta_schemas: shrunk(delta_schemas),
+            last_read,
+            consolidate_at,
+            out_reg,
+        },
+        state,
+        pending_ground_row,
+    })
 }
 
-impl ProgramBuilder {
-    pub(crate) fn new() -> Self {
-        ProgramBuilder {
-            instructions: Vec::with_capacity(16),
-            predicates: Vec::new(),
-            maps: Vec::new(),
-            state: CircuitState::new(),
-            reduce_plans: Vec::new(),
-            topn_plans: Vec::new(),
-        }
-    }
-
-    pub(in crate::query) fn push(&mut self, instr: Instr) {
-        self.instructions.push(instr);
-    }
-
-    // ── Resources ────────────────────────────────────────────────────────
-
-    /// Take ownership of `pred`, returning its `Instr::Filter` operand.
-    pub(in crate::query) fn push_predicate(&mut self, pred: gnitz_expr::Evaluator) -> PredIdx {
-        let idx = PredIdx(self.predicates.len() as u16);
-        self.predicates.push(pred);
-        idx
-    }
-
-    /// Take ownership of `plan`, returning its `Instr::Map` operand.
-    pub(in crate::query) fn push_map(&mut self, plan: MapPlan) -> MapIdx {
-        let idx = MapIdx(self.maps.len() as u16);
-        self.maps.push(plan);
-        idx
-    }
-
-    /// Store a baked reduce plan with the table its value index lives in,
-    /// returning its `Instr::Reduce::plan_idx`.
-    pub(in crate::query) fn add_reduce_plan(
-        &mut self,
-        plan: gnitz_store::ops::ReducePlan,
-        avi_table: Option<StateIdx>,
-    ) -> PlanIdx {
-        debug_assert_eq!(
-            plan.avi.is_some(),
-            avi_table.is_some(),
-            "a value-index table exists iff the plan carries the bake that keys it",
-        );
-        let idx = PlanIdx(self.reduce_plans.len() as u16);
-        self.reduce_plans.push(BakedReduce { plan, avi_table });
-        idx
-    }
-
-    /// Store a baked top-N plan with the table its ordered index lives in,
-    /// returning its `Instr::TopN::plan_idx`.
-    pub(in crate::query) fn add_topn_plan(
-        &mut self,
-        plan: gnitz_store::ops::TopNPlan,
-        index_table: StateIdx,
-    ) -> TopNIdx {
-        let idx = TopNIdx(self.topn_plans.len() as u16);
-        self.topn_plans.push(BakedTopN { plan, index_table });
-        idx
-    }
-
-    // ── Build ────────────────────────────────────────────────────────────
-
-    /// Consume the builder into a runnable `VmHandle`, `out_reg` being the
-    /// register the epoch's output is extracted from.
-    pub(in crate::query) fn build(mut self, mut reg_meta: Vec<RegisterMeta>, out_reg: DeltaReg) -> Box<VmHandle> {
-        // Each pool grows by pushes and is then held for the cached plan's
-        // lifetime, so its slack is dead heap per sub-plan, per view, per worker.
-        // (`reduce_plans` has none: its stride is over 1024, so it grows exactly.)
-        reg_meta.shrink_to_fit();
-        // Sink every `Integrate` to the end, stably — see `Instr::Integrate`. A
-        // graph order cannot express it: `join_ab` needs `trace_b` and `join_ba`
-        // `trace_a`, so both integrates precede both joins there.
-        self.instructions
-            .sort_by_key(|i| matches!(i, Instr::Integrate { .. }));
-        self.instructions.shrink_to_fit();
-        self.predicates.shrink_to_fit();
-        self.maps.shrink_to_fit();
-
-        let regfile = RegisterFile::new(&reg_meta);
-        // The trace registers name their own backing tables, so the bind list is
-        // read off the metas rather than tracked alongside them.
-        let trace_regs: Vec<(TraceReg, StateIdx)> = reg_meta
-            .iter()
-            .enumerate()
-            .filter_map(|(reg, m)| m.owned_table.map(|t| (TraceReg(reg as u16), t)))
-            .collect();
-
-        // Destructive-register liveness, over the EMITTED instructions — so an
-        // elided node's register aliasing is seen through, not re-derived from
-        // graph edges. Forward, so the last write wins.
-        let mut last_read = vec![u32::MAX; reg_meta.len()];
-        for (pc, instr) in self.instructions.iter().enumerate() {
-            for reg in reads(instr).into_iter().flatten() {
-                last_read[reg.at()] = pc as u32;
-            }
-        }
-        // After the scan, not before: the sink can itself be an operand, and the
-        // epoch epilogue reads it after the last instruction has run.
-        last_read[out_reg.at()] = u32::MAX;
-
-        // Read off the baked plans rather than accumulated during emission, so
-        // `ReducePlan::from_wire` stays the single home of the conjunction.
-        let pending_ground_row = self.reduce_plans.iter().any(|b| b.plan.seeds_ground);
-
-        let mut program = Program {
-            instructions: self.instructions,
-            reg_meta,
-            predicates: self.predicates,
-            maps: self.maps,
-            reduce_plans: self.reduce_plans,
-            topn_plans: self.topn_plans,
-            last_read,
-            consolidate_at: Vec::new(),
-            out_reg,
-        };
-
-        // Consolidation is the Z-set identity, so folding at the first reader
-        // serves every later one.
-        let mut consolidate_at = vec![u32::MAX; program.reg_meta.len()];
-        for instr in &program.instructions {
-            if let Some(reg) = consolidated_input(instr, &program) {
-                consolidate_at[reg.at()] = program.first_read(reg) as u32;
-            }
-        }
-        program.consolidate_at = consolidate_at;
-
-        Box::new(VmHandle {
-            program,
-            regfile,
-            state: self.state,
-            trace_regs,
-            pending_ground_row,
-        })
-    }
+fn shrunk<T>(mut v: Vec<T>) -> Vec<T> {
+    v.shrink_to_fit();
+    v
 }
 
 #[cfg(test)]

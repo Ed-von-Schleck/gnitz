@@ -32,9 +32,9 @@ fn more_than_two_exchange_shards_are_rejected() {
                 (1, 4, SLOT_IN),
                 (2, 5, SLOT_IN),
                 (3, 6, SLOT_IN),
-                (4, 6, SLOT_TRACE),
+                (4, 6, SLOT_B),
                 (6, 7, SLOT_IN),
-                (5, 7, SLOT_TRACE),
+                (5, 7, SLOT_B),
                 (7, 8, SLOT_IN),
             ],
         ),
@@ -60,7 +60,7 @@ fn exchange_sides_sharding_on_different_keys_are_rejected() {
                 (0, 2, SLOT_IN),
                 (1, 3, SLOT_IN),
                 (2, 4, SLOT_IN),
-                (3, 4, SLOT_TRACE),
+                (3, 4, SLOT_B),
                 (4, 5, SLOT_IN)
             ],
         ),
@@ -85,7 +85,7 @@ fn exchange_sides_sharing_an_ancestor_are_rejected() {
                 (0, 1, SLOT_IN),
                 (0, 2, SLOT_IN),
                 (1, 3, SLOT_IN),
-                (2, 3, SLOT_TRACE),
+                (2, 3, SLOT_B),
                 (3, 4, SLOT_IN)
             ],
         ),
@@ -126,7 +126,7 @@ fn a_post_phase_scan_in_an_exchanged_plan_is_rejected() {
                 (3, OpNode::Union),
                 (4, OpNode::IntegrateSink),
             ],
-            vec![(0, 2, SLOT_IN), (2, 3, SLOT_IN), (1, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
+            vec![(0, 2, SLOT_IN), (2, 3, SLOT_IN), (1, 3, SLOT_B), (3, 4, SLOT_IN)],
         ),
         "an exchanged plan scans a relation outside every exchange side"
     );
@@ -152,7 +152,7 @@ fn the_carve_splits_sides_from_the_post_phase() {
             (2, 3, SLOT_IN),
             (1, 4, SLOT_IN),
             (3, 5, SLOT_IN),
-            (4, 5, SLOT_TRACE),
+            (4, 5, SLOT_B),
             (5, 6, SLOT_IN),
             (6, 7, SLOT_IN),
         ],

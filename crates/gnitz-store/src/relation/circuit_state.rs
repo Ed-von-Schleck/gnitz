@@ -86,6 +86,12 @@ impl CircuitState {
         self.created = Vec::new();
     }
 
+    /// The schema of the store `idx` names — how a compiler types an operand it
+    /// reaches only through its table.
+    pub fn schema_of(&self, idx: StateIdx) -> &SchemaDescriptor {
+        self.at(idx).schema()
+    }
+
     pub fn cursor(&self, idx: StateIdx) -> ReadCursor {
         self.at(idx).open_cursor()
     }

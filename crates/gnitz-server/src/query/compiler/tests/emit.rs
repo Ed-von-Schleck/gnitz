@@ -124,7 +124,7 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
 
     let (carved, out_reg_of) = plan(&subgraph_ordered(&loaded, 1)).expect("the carve production performs");
     assert_eq!(
-        carved.vm.program.out_reg,
+        carved.vm.program.out_reg(),
         out_reg_of[1]
             .expect("node 1 is in the plan")
             .delta()
@@ -134,11 +134,10 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
     assert_eq!(rejection(plan(&[0])), "operand is produced outside this plan");
 }
 
-/// A trace register routed into a delta port reads permanent emptiness — a
-/// silently empty view. The load settles port *arity* and nothing else, so
-/// this rejection is all that stands between a hand-built circuit and that.
+/// An integral routed into a delta port names a store, not a batch: every port
+/// that takes a delta refuses one.
 #[test]
-fn a_trace_register_reaching_a_delta_port_is_rejected() {
+fn an_integral_reaching_a_delta_port_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let one = make_schema_u64_i64();
     // `ScanDelta(10) → IntegrateTrace → consumer`, planned as a subgraph ending
@@ -171,16 +170,16 @@ fn a_trace_register_reaching_a_delta_port_is_rejected() {
     assert_eq!(
         rejection(plan(
             gnitz_wire::OpNode::Union,
-            vec![(0, 1, SLOT_IN), (0, 2, SLOT_IN), (1, 2, SLOT_TRACE)]
+            vec![(0, 1, SLOT_IN), (0, 2, SLOT_IN), (1, 2, SLOT_B)]
         )),
         GUARD,
         "a union's right operand is a delta port, not a trace one",
     );
 }
 
-/// The sink is the one register no emit arm resolves, so `build_plan` is where a
+/// The sink is the one operand no emit arm resolves, so `build_plan` is where a
 /// plan whose output is an integral is refused: the epoch epilogue extracts a
-/// *batch*, and a trace register's is permanently empty.
+/// *batch*, and an integral is a store.
 #[test]
 fn a_plan_whose_output_is_an_integral_is_rejected() {
     let loaded = loaded_for_test(
@@ -351,7 +350,7 @@ fn a_cross_join_accepts_sides_of_different_pk_strides() {
 }
 
 /// Compile the minimal two-source join circuit — a delta on `SLOT_IN`, the
-/// integral of a second scan on `SLOT_TRACE` — at the given kind and side
+/// integral of a second scan on `SLOT_B` — at the given kind and side
 /// schemas. The probe preconditions are all this shape exercises, so the join
 /// kind and the two schemas are the only things a caller varies.
 fn plan_two_source_join(
@@ -369,7 +368,7 @@ fn plan_two_source_join(
             (3, OpNode::Join { kind, delta_is_right: false }),
             (4, OpNode::IntegrateSink),
         ],
-        vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
+        vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_B), (3, 4, SLOT_IN)],
     );
     build_plan(
         &loaded,
@@ -390,7 +389,7 @@ fn plan_two_source_join(
 /// A trace port fed by a node that is not an integral is rejected at compile
 /// time: the load checks a `Join`'s port arity, not its producer's kind,
 /// and such a register would reach the dispatch with no cursor. The ONLY
-/// difference between the two builds is which node feeds `SLOT_TRACE`.
+/// difference between the two builds is which node feeds `SLOT_B`.
 #[test]
 fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -411,7 +410,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
                     },
                 ),
             ],
-            vec![(1, 2, SLOT_IN), (0, 3, SLOT_IN), (trace_src, 3, SLOT_TRACE)],
+            vec![(1, 2, SLOT_IN), (0, 3, SLOT_IN), (trace_src, 3, SLOT_B)],
         );
         build_plan(
             &loaded,
@@ -446,7 +445,7 @@ fn a_wide_pk_join_compiles() {
             ),
             (4, gnitz_wire::OpNode::IntegrateSink),
         ],
-        vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
+        vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_B), (3, 4, SLOT_IN)],
     );
     // The plan owns scratch dirs under `dir`, so it must drop first: build it
     // inside the assert rather than binding it past `dir`'s scope.
@@ -519,8 +518,8 @@ fn the_two_clamp_operators_carry_their_own_presets() {
         (gnitz_wire::OpNode::PositivePart, ClampPreset::PositivePart),
     ] {
         let (plan, _) = fixture.build(op.clone()).expect("both clamps compile");
-        let got = plan.vm.program.instructions.iter().find_map(|i| match i {
-            Instr::WeightClamp { preset, .. } => Some(*preset),
+        let got = plan.vm.program.ops().find_map(|op| match op {
+            Op::WeightClamp { preset, .. } => Some(*preset),
             _ => None,
         });
         assert_eq!(got, Some(want), "{op:?}");
@@ -534,26 +533,22 @@ fn the_two_clamp_operators_carry_their_own_presets() {
 // register rather than per view.
 
 /// Every destructive opcode's take verdict in program order, labelled by its
-/// slot; a `Union` contributes both operands. Read off the same `reads` table
-/// the dispatch decides through, against the `last_read` the build produced —
-/// so this asserts the verdict the VM will act on, not an intermediate.
+/// slot; a `Union` contributes both operands.
 fn consume_flags(plan: &SubPlan) -> Vec<(&'static str, bool)> {
-    let program = &plan.vm.program;
-    program
-        .instructions
-        .iter()
-        .enumerate()
-        .flat_map(|(pc, instr)| {
-            let label = match instr {
-                Instr::Union { .. } => ["union.a", "union.b"],
-                Instr::WeightClamp { .. } => ["clamp", ""],
-                Instr::Negate { .. } => ["negate", ""],
+    plan.vm
+        .program
+        .take_verdicts()
+        .flat_map(|(op, takes)| {
+            let label = match op {
+                Op::Union { .. } => ["union.a", "union.b"],
+                Op::WeightClamp { .. } => ["clamp", ""],
+                Op::Negate => ["negate", ""],
                 _ => return Vec::new(),
             };
-            crate::query::vm::reads(instr)
+            takes
                 .into_iter()
                 .enumerate()
-                .filter_map(|(slot, reg)| Some((label[slot], program.last_read[reg?.0 as usize] == pc as u32)))
+                .filter_map(|(slot, takes)| Some((label[slot], takes?)))
                 .collect()
         })
         .collect()
@@ -627,7 +622,7 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
     assert_eq!(
         flags(
             HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, gnitz_wire::OpNode::Union),]),
-            vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)],
+            vec![(0, 2, SLOT_IN), (1, 2, SLOT_B)],
             2,
         ),
         vec![("union.a", true), ("union.b", true)],
@@ -641,7 +636,7 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
                 (1, gnitz_wire::OpNode::Negate),
                 (2, gnitz_wire::OpNode::Union),
             ]),
-            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 2, SLOT_TRACE)],
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 2, SLOT_B)],
             1,
         ),
         vec![("negate", false), ("union.a", false), ("union.b", true)],
@@ -726,4 +721,35 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
         "the committed trace row must survive a failed compile"
     );
     reopened.commit();
+}
+
+// ── Replica sides ───────────────────────────────────────────────────────
+
+/// A muted relay round drops a side's rows, so it must fire exactly when every
+/// worker computed the same ones — a fact about the side's sources, not its
+/// arity.
+#[test]
+fn a_side_emits_a_replica_only_over_replicated_sources_it_does_not_trim() {
+    use gnitz_store::schema::Placement;
+    let tmp = tempfile::tempdir().unwrap();
+    let replica_of = |schema: SchemaDescriptor, mid: gnitz_wire::OpNode| {
+        let loaded = loaded_for_test(
+            [(0, scan_delta(10)), (1, mid), (2, gnitz_wire::OpNode::IntegrateSink)],
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
+        );
+        let h = home(tmp.path().to_str().unwrap(), 1, [(10, schema)]);
+        let (plan, _) =
+            build_plan(&loaded, &subgraph_ordered(&loaded, 1), h.site(), false, &[], 1).expect("the fixture compiles");
+        emits_replica(&plan, &h.registry)
+    };
+    let replicated = make_schema_u64_i64().with_placement(Placement::Replicated);
+    assert!(replica_of(replicated, gnitz_wire::OpNode::Negate));
+    assert!(
+        !replica_of(make_schema_u64_i64(), gnitz_wire::OpNode::Negate),
+        "a keyed source gives each worker its own slice"
+    );
+    assert!(
+        !replica_of(replicated, gnitz_wire::OpNode::WorkerFilter),
+        "a trimmed side emits a slice of the replica, not the replica"
+    );
 }

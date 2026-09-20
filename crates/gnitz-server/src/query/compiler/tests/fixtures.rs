@@ -9,9 +9,10 @@ use gnitz_wire::ViewProps;
 
 // Input slots reach the compiler only in hand-written fixtures; every production
 // read of an operand goes through `NodeInputs`. Slot 0 is a unary operator's
-// input and a binary one's delta/left operand, slot 1 the trace/right operand.
+// input and a binary one's delta/left operand, slot 1 its second operand —
+// a join's trace port, a union's right-hand side.
 pub(in crate::query) const SLOT_IN: usize = 0;
-pub(in crate::query) const SLOT_TRACE: usize = 1;
+pub(in crate::query) const SLOT_B: usize = 1;
 
 /// Build a `LoadedCircuit` from raw nodes and `(producer, consumer, slot)` edges,
 /// pushing the nodes in id order from 0 — so a fixture holds to the same
@@ -52,14 +53,15 @@ pub(in crate::query) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
     }
 }
 
-/// A `ScatterKey` reindex on `cols` — the routing walks' only variable. The
-/// fixtures that vary `keep`, the promotion targets or the role spell the
-/// variant out instead, so the field they turn on stays visible.
-pub(in crate::query) fn scatter_reindex(cols: &[u32]) -> gnitz_wire::OpNode {
+/// A `ScatterKey` reindex on `cols`, stating `source`'s route as the same
+/// columns — what a spine that moves no column produces. A fixture turning on
+/// any other field spells the variant out instead.
+pub(in crate::query) fn scatter_reindex(source: u64, cols: &[u32]) -> gnitz_wire::OpNode {
+    let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
     gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
         keep: vec![0],
-        key: cols.iter().map(|&c| (c, None)).collect(),
-        role: gnitz_wire::ReindexRole::ScatterKey,
+        key: key.clone(),
+        role: gnitz_wire::ReindexRole::ScatterKey { source, source_key: key },
     })
 }
 

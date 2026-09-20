@@ -15,7 +15,7 @@ use crate::hir::physical::Frame;
 use crate::ir::BExpr;
 use crate::validate::reject_pk_list_arity;
 
-use gnitz_core::{Circuit, ColumnDef, NodeId, ReindexRole};
+use gnitz_core::{Circuit, ColumnDef, NodeId};
 use gnitz_wire::JoinKind;
 use std::borrow::Cow;
 
@@ -224,8 +224,8 @@ fn emit_range(
 fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSide; 2]) -> Vec<Branch> {
     let (left, right) = (&sides[0], &sides[1]);
 
-    let reindex_a = rekey_on_source_pk(cb, input_a, left, ReindexRole::ScatterKey);
-    let reindex_b = rekey_on_source_pk(cb, input_b, right, ReindexRole::ScatterKey);
+    let reindex_a = rekey_on_source_pk(cb, input_a, left, left.scatter_pk());
+    let reindex_b = rekey_on_source_pk(cb, input_b, right, right.scatter_pk());
     let int_a = cb.worker_filter(reindex_a);
     let int_b = cb.worker_filter(reindex_b);
     let trace_a = cb.integrate_trace(int_a);

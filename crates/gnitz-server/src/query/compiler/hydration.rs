@@ -118,7 +118,7 @@ pub(super) fn derive_hydration(
             Hydration {
                 start_pc: plan.vm.program.first_read(in_reg),
                 in_reg,
-                seed: HydrationSeed::Trace(plan.vm.program.trace_table_idx(reg_of(t_a)?.trace()?)),
+                seed: HydrationSeed::Trace(reg_of(t_a)?.trace()?),
             }
         }
     };
@@ -127,18 +127,11 @@ pub(super) fn derive_hydration(
     Ok(hydration)
 }
 
-/// Trust boundary on the program the read-only dispatch will run from `start_pc`:
-/// that dispatch suppresses `Integrate`, so any *other* state writer would make a
-/// read mutate the state it reads. None is reachable from an eligible shape, so
-/// this turns a planner that under-rejects into a loud DDL failure rather than a
-/// silently-mutating read. `writes_state_during_replay` is exhaustive over
-/// `Instr` and lives beside the arm that does the suppressing, so a new
-/// state-writing opcode cannot slip past this and the two cannot drift.
+/// Trust boundary on the program the read-only dispatch will run from
+/// `start_pc`: it runs no integrate, so any *other* state writer would make a
+/// read mutate the state it reads.
 fn reject_state_writers(plan: &SubPlan, start_pc: usize) -> Result<(), String> {
-    if plan.vm.program.instructions[start_pc..]
-        .iter()
-        .any(crate::query::vm::writes_state_during_replay)
-    {
+    if plan.vm.program.writes_state_from(start_pc) {
         return Err("bounded view: the replayed program writes operator state".into());
     }
     Ok(())

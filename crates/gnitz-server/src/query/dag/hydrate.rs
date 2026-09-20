@@ -77,10 +77,8 @@ impl SkeletonHydrator for DagEngine {
                 PkSetGather::open(keys, seed_schema, |s, e| state.cursor_in_range(seed_table, s, e))
             }
         };
-        let mut replay = vm::Replay::start(&mut sub.vm, hydration.start_pc);
         while let Some(seed) = gather.next_chunk(registry.scan_chunk_rows()) {
-            let produced = replay
-                .chunk((hydration.in_reg, seed))
+            let produced = vm::replay_chunk(&mut sub.vm, hydration.start_pc, (hydration.in_reg, seed))
                 .map_err(|e| StoreError::rejected(format!("hydrate: view {view_id} replay failed: {e}")))?;
             debug_assert!(
                 produced.schema().same_physical_layout(&view_schema),

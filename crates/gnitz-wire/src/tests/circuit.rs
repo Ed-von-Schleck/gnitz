@@ -61,7 +61,10 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
             keep: vec![0],
             key: vec![(2, None), (5, Some(TypeCode::I64))],
-            role: ReindexRole::ScatterKey,
+            role: ReindexRole::ScatterKey {
+                source: 4,
+                source_key: vec![(1, None), (6, Some(TypeCode::I64))],
+            },
         }),
         Opcode::TopN => OpNode::TopN {
             group_cols: vec![1],
@@ -109,7 +112,16 @@ fn every_op_node_variant_roundtrips() {
         limit: 1,
         offset: 0,
     });
-    for &role in ReindexRole::ALL {
+    // Both roles, and a scatter key that differs from the node's own key — the
+    // shape the two coordinate systems exist for.
+    for role in [
+        ReindexRole::Auxiliary,
+        ReindexRole::ScatterKey { source: 0, source_key: vec![(0, None)] },
+        ReindexRole::ScatterKey {
+            source: u64::MAX,
+            source_key: vec![(9, Some(TypeCode::I64)), (0, None)],
+        },
+    ] {
         nodes.push(OpNode::Map(MapKind::Reindex {
             keep: vec![0],
             key: vec![(2, None), (5, Some(TypeCode::I64))],
@@ -210,7 +222,7 @@ fn decode_rejects_an_unknown_opcode() {
 fn decode_rejects_an_out_of_domain_reindex_target() {
     let reindex = |tc: u8| {
         let mut w = Vec::new();
-        w.push(ReindexRole::ScatterKey.as_wire());
+        w.push(ROLE_AUXILIARY);
         w.extend(1u16.to_le_bytes()); // one key column
         w.extend(3u32.to_le_bytes());
         w.push(tc);
@@ -272,9 +284,21 @@ fn a_map_reindex_whose_role_or_key_is_unusable_is_rejected() {
     };
     let decode = |p: Vec<u8>| decode_op_node(Opcode::MapReindex.as_wire(), None, Some(&p));
     assert!(decode(params(99, 1)).unwrap_err().contains("unknown route-key role"));
-    assert!(decode(params(ReindexRole::Auxiliary.as_wire(), 0))
+    assert!(decode(params(ROLE_AUXILIARY, 0))
         .unwrap_err()
         .contains("names no key columns"));
+    // A stated route with no source columns would scatter the whole relation
+    // onto one worker.
+    let mut empty_route = vec![ROLE_SCATTER_KEY];
+    empty_route.extend(7u64.to_le_bytes());
+    empty_route.extend(0u16.to_le_bytes()); // no source columns
+    empty_route.extend(1u16.to_le_bytes()); // one key column
+    empty_route.extend(3u32.to_le_bytes());
+    empty_route.push(0);
+    empty_route.extend(0u16.to_le_bytes()); // no kept columns
+    assert!(decode(empty_route)
+        .unwrap_err()
+        .contains("scatter key names no source columns"));
 }
 
 /// An unbounded `ScanDelta` writes no parameters at all: "absent" and "empty"

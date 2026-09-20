@@ -801,7 +801,7 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
     let reindex = |keep: Vec<u32>, key_cols: Vec<u32>| gnitz_wire::MapKind::Reindex {
         keep,
         key: key_cols.into_iter().map(|c| (c, None)).collect(),
-        role: gnitz_wire::ReindexRole::ScatterKey,
+        role: gnitz_wire::ReindexRole::Auxiliary,
     };
     let three = SchemaDescriptor::new(
         &[

@@ -21,6 +21,21 @@ fn class(eq: Vec<EqPair>, range: Option<super::super::HirRange>) -> JoinClass {
 
 const NO_DEMAND: Demand<'static> = Demand { items: &[], where_preds: &[] };
 
+/// Both sides opened straight off their relation, which is what the keep rules
+/// are stated over.
+fn origins(left: &Frame, right: &Frame) -> [SourceOrigin; 2] {
+    let opened = |tid, frame: &Frame| {
+        super::spine::Spine::segment(SegInput {
+            tid,
+            frame: frame.clone(),
+            desc: None,
+            pk_repeats: false,
+        })
+        .origin()
+    };
+    [opened(1, left), opened(2, right)]
+}
+
 /// A shape packing its output key out of the payload keeps that side's PK alone,
 /// at the front of the keep list: the ν fallback must not add a second identity.
 #[test]
@@ -37,7 +52,8 @@ fn a_pinned_side_keeps_its_pk_alone() {
     let cls = class(Vec::new(), Some(range));
     // A range conjunct alone: the key columns are not kept by the demand rules,
     // only the pinned PKs are.
-    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right]);
+    let o = origins(&left, &right);
+    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right], o);
     assert_eq!((sides[0].keep.as_slice(), sides[0].pa()), (&[1u32][..], 1));
     assert_eq!((sides[1].keep.as_slice(), sides[1].pa()), (&[0u32][..], 1));
 }
@@ -58,7 +74,8 @@ fn an_unreferenced_equi_join_keeps_one_left_column() {
         }],
         None,
     );
-    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right]);
+    let o = origins(&left, &right);
+    let sides = join_sides(NO_DEMAND, &cls, JoinType::Inner, [left, right], o);
     assert_eq!((sides[0].keep.as_slice(), sides[0].pa()), (&[0u32][..], 0));
     assert!(sides[1].keep.is_empty());
 }
@@ -78,7 +95,8 @@ fn a_preserved_side_keeps_its_nullable_key() {
         }],
         None,
     );
-    let sides = join_sides(NO_DEMAND, &cls, JoinType::Left, [left, right]);
+    let o = origins(&left, &right);
+    let sides = join_sides(NO_DEMAND, &cls, JoinType::Left, [left, right], o);
     // Left has a ν and a nullable key at slot 1: that key, not the Rule 5 fallback.
     assert_eq!(sides[0].keep.as_slice(), &[1u32][..]);
     // The right side has no ν, so its equally-nullable key is not protected.
@@ -112,10 +130,12 @@ fn a_band_nu_keeps_its_key_columns() {
         &class(eq.clone(), Some(range)),
         JoinType::Left,
         [left.clone(), right.clone()],
+        origins(&left, &right),
     );
     // The pinned PK, then both key columns; the payload `v` nothing reads is not kept.
     assert_eq!(sides[0].keep.as_slice(), &[0u32, 1, 2][..]);
-    let sides = join_sides(NO_DEMAND, &class(eq, None), JoinType::Left, [left, right]);
+    let o = origins(&left, &right);
+    let sides = join_sides(NO_DEMAND, &class(eq, None), JoinType::Left, [left, right], o);
     // An equi ν over a NOT NULL key keeps nothing past the Rule 5 fallback.
     assert_eq!(sides[0].keep.as_slice(), &[0u32][..]);
 }

@@ -18,8 +18,6 @@ pub(super) struct DepMap {
     pub(in crate::query) forward: FxHashMap<i64, Vec<i64>>,
     /// view_id → [source_table_ids]
     pub(in crate::query) reverse: FxHashMap<i64, Vec<i64>>,
-    /// Every `(view, source)` pair the two maps hold, so linking one is a hash probe.
-    pub(in crate::query) edges: FxHashSet<(i64, i64)>,
 }
 
 impl DepMap {
@@ -36,7 +34,6 @@ impl DepMap {
             let view = compiler::read_circuit_node_row(batch, i).view_id as i64;
             if gone.insert(view) {
                 for source in self.reverse.remove(&view).into_iter().flatten() {
-                    self.edges.remove(&(view, source));
                     touched.insert(source);
                 }
             }
@@ -55,8 +52,9 @@ impl DepMap {
                 continue;
             };
             let view = row.view_id as i64;
-            if self.edges.insert((view, source)) {
-                self.reverse.entry(view).or_default().push(source);
+            let srcs = self.reverse.entry(view).or_default();
+            if !srcs.contains(&source) {
+                srcs.push(source);
                 self.forward.entry(source).or_default().push(view);
             }
         }

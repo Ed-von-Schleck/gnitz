@@ -330,8 +330,8 @@ fn equi_merge_walk_skips_a_ghost_group_across_sources() {
     );
 }
 
-/// A pre-advanced trace cursor must still produce the full walk — the shape a
-/// trace register shared by two ops in one epoch takes.
+/// A pre-advanced trace cursor must still produce the full walk: the merge walk
+/// self-positions rather than assuming a fresh cursor.
 #[test]
 fn equi_merge_walk_self_positions_a_stale_cursor() {
     let s = make_schema_u64_i64();
@@ -474,10 +474,9 @@ fn range_join_orders_a_signed_key_by_its_opk_image() {
     }
 }
 
-/// The range op against a *used* trace cursor: `bind_trace_cursors` binds one
-/// per trace register, so two ops on one trace share it for the whole epoch. A
-/// parked and an exhausted cursor must both produce the fresh-cursor output —
-/// the group skip reads the cursor position.
+/// The range op against a *used* trace cursor: a parked and an exhausted cursor
+/// must both produce the fresh-cursor output — the group skip reads the cursor
+/// position.
 #[test]
 fn range_join_reuses_a_stale_trace_cursor() {
     let schema = make_range_schema(1, false);

@@ -317,6 +317,11 @@ impl Table {
         self.shard_index.append_terminal_run(run)
     }
 
+    /// This store's schema.
+    pub(crate) fn schema(&self) -> &SchemaDescriptor {
+        &self.shard_index.schema
+    }
+
     /// Publish `schema` across this store (any column ALTER). All-or-nothing:
     /// only the shard index's swap can fail, and it runs first.
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {

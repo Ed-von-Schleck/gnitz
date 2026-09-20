@@ -2,7 +2,7 @@ use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema};
 use gnitz_wire::type_code;
-use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel, ReindexRole, TypeCode};
+use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel, TypeCode};
 use std::collections::HashMap;
 
 /// 3-column compound PK `(U32, U64, U64)` + one payload, so a `CLUSTER BY`
@@ -207,15 +207,21 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
     let scatters = |also_union: bool| {
         let mut nodes = vec![
             (0, scan_delta(7)),
-            (1, scatter_reindex(&[1])),
+            (1, scatter_reindex(7, &[1])),
             (2, scan_delta(8)),
-            (3, scatter_reindex(&[1])),
-            (4, OpNode::Join { kind: JoinKind::Equi, delta_is_right: false }),
+            (3, scatter_reindex(8, &[1])),
+            (
+                4,
+                OpNode::Join {
+                    kind: JoinKind::Equi,
+                    delta_is_right: false,
+                },
+            ),
         ];
-        let mut edges = vec![(0, 1, SLOT_IN), (2, 3, SLOT_IN), (1, 4, SLOT_IN), (3, 4, SLOT_TRACE)];
+        let mut edges = vec![(0, 1, SLOT_IN), (2, 3, SLOT_IN), (1, 4, SLOT_IN), (3, 4, SLOT_B)];
         if also_union {
             nodes.extend([(5, OpNode::Union), (6, OpNode::IntegrateSink)]);
-            edges.extend([(1, 5, SLOT_IN), (4, 5, SLOT_TRACE), (5, 6, SLOT_IN)]);
+            edges.extend([(1, 5, SLOT_IN), (4, 5, SLOT_B), (5, 6, SLOT_IN)]);
         } else {
             nodes.push((5, OpNode::IntegrateSink));
             edges.push((4, 5, SLOT_IN));
@@ -244,17 +250,23 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(10)),
-                (1, scatter_reindex(key_a)),
+                (1, scatter_reindex(10, key_a)),
                 (2, scan_delta(10)),
-                (3, scatter_reindex(key_b)),
-                (4, gnitz_wire::OpNode::Join { kind: gnitz_wire::JoinKind::Equi, delta_is_right: false }),
+                (3, scatter_reindex(10, key_b)),
+                (
+                    4,
+                    gnitz_wire::OpNode::Join {
+                        kind: gnitz_wire::JoinKind::Equi,
+                        delta_is_right: false,
+                    },
+                ),
                 (5, gnitz_wire::OpNode::IntegrateSink),
             ],
             vec![
                 (0, 1, SLOT_IN),
                 (2, 3, SLOT_IN),
                 (1, 4, SLOT_IN),
-                (3, 4, SLOT_TRACE),
+                (3, 4, SLOT_B),
                 (4, 5, SLOT_IN),
             ],
         );
@@ -262,66 +274,170 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
     };
 
     let agreed = two_scans(&[1], &[1]).expect("one key reached twice routes by that key");
-    assert_eq!(join_cols(agreed.relay_route(10)), Some(vec![1]));
+    assert_eq!(join_cols(agreed.source_route(10)), Some(vec![1]));
     assert!(
         two_scans(&[1], &[2]).is_err(),
         "two distinct keys must refuse the compile, not pick one or concatenate them"
     );
 }
 
-/// A source whose path to the join carries no reindex Map has no route key of its
-/// own, so it takes the view's shard columns — and never the join scatter.
+/// A source that feeds no join states no route at all: its rows are already
+/// where the view needs them. Source 20's rows reach the sink through a `Union`
+/// beside the join's output, which is not a join operand.
 #[test]
-fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
+fn a_source_outside_every_join_takes_the_view_shard_route() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),
-            (1, scan_delta(20)),
-            (2, scatter_reindex(&[2])),
-            (3, gnitz_wire::OpNode::IntegrateTrace),
-            (4, gnitz_wire::OpNode::Join { kind: gnitz_wire::JoinKind::Equi, delta_is_right: false }),
-            (5, gnitz_wire::OpNode::IntegrateSink),
+            (1, scatter_reindex(10, &[2])),
+            (2, gnitz_wire::OpNode::IntegrateTrace),
+            (
+                3,
+                gnitz_wire::OpNode::Join {
+                    kind: gnitz_wire::JoinKind::Equi,
+                    delta_is_right: false,
+                },
+            ),
+            (4, scan_delta(20)),
+            (5, gnitz_wire::OpNode::Union),
+            (6, gnitz_wire::OpNode::IntegrateSink),
         ],
         vec![
-            (0, 2, SLOT_IN),
-            (1, 3, SLOT_IN), // ScanDelta(20) → IntegrateTrace, no reindex
-            (3, 4, SLOT_TRACE),
-            (2, 4, SLOT_IN),
-            (4, 5, SLOT_IN),
+            (0, 1, SLOT_IN),
+            (1, 2, SLOT_IN),
+            (1, 3, SLOT_IN),
+            (2, 3, SLOT_B),
+            (3, 5, SLOT_IN),
+            (4, 5, SLOT_B),
+            (5, 6, SLOT_IN),
         ],
     );
     let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
-    assert_eq!(join_cols(meta.relay_route(10)), Some(vec![2]));
+    assert_eq!(join_cols(meta.source_route(10)), Some(vec![2]));
     assert!(
         meta.scatters(10),
         "a keyed source with no matching distribution scatters"
     );
-    assert_eq!(
-        group_key_cols(meta.relay_route(20)),
-        Some(vec![]),
-        "a keyless source routes by the view's shard cols — this fixture has none"
+    assert!(
+        meta.source_route(20).is_none(),
+        "a source outside every join has no route"
     );
-    assert!(!meta.scatters(20), "a keyless source is not in the scatter set");
+    assert!(!meta.scatters(20), "and is not in the scatter set");
+    assert_eq!(
+        group_key_cols(Some(meta.output_route())),
+        Some(vec![]),
+        "the output relay routes by the view's shard cols — this fixture has none"
+    );
 }
 
-/// A scan reaching only `Auxiliary` reindex maps is what a planner call site that
-/// forgot its role produces. Honouring it would scatter the delta by nothing
-/// while the trace side is keyed, so the compile is refused instead.
+/// A join operand with no stated route would be integrated wherever it was
+/// produced while the trace side is scattered by the key, so the compile is
+/// refused.
 #[test]
-fn a_scan_whose_reindex_maps_are_all_auxiliary_is_rejected() {
+fn a_join_operand_whose_source_states_no_route_is_rejected() {
     let aux = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
         keep: vec![0],
         key: vec![(1, None)],
         role: gnitz_wire::ReindexRole::Auxiliary,
     });
     let loaded = loaded_for_test(
-        [(0, scan_delta(10)), (1, aux), (2, gnitz_wire::OpNode::IntegrateSink)],
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
+        [
+            (0, scan_delta(10)),
+            (1, aux),
+            (2, gnitz_wire::OpNode::IntegrateTrace),
+            (
+                3,
+                gnitz_wire::OpNode::Join {
+                    kind: gnitz_wire::JoinKind::Equi,
+                    delta_is_right: false,
+                },
+            ),
+            (4, gnitz_wire::OpNode::IntegrateSink),
+        ],
+        vec![
+            (0, 1, SLOT_IN),
+            (1, 2, SLOT_IN),
+            (1, 3, SLOT_IN),
+            (2, 3, SLOT_B),
+            (3, 4, SLOT_IN),
+        ],
     );
-    assert_eq!(
-        rejection(ViewMeta::derive(&loaded, &sources([]))),
-        "a source's reindex maps carry no route key, so its delta cannot be scattered",
-        "an orphaned reindex must fail the compile"
+    assert!(
+        rejection(ViewMeta::derive(&loaded, &sources([]))).contains("states no scatter key"),
+        "an auxiliary-only join operand must fail the compile"
+    );
+}
+
+/// A `Map` between the scan and the reindex moves the key, so the route is read
+/// as the source's own columns: reading the node's own key would scatter source
+/// 7 by column 2 of a relation whose join column is 5.
+#[test]
+fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
+    let reindex = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
+        keep: vec![0],
+        key: vec![(2, None)],
+        role: gnitz_wire::ReindexRole::ScatterKey { source: 7, source_key: vec![(5, None)] },
+    });
+    let loaded = loaded_for_test(
+        [
+            (0, scan_delta(7)),
+            (1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![5]))),
+            (2, reindex),
+            (3, gnitz_wire::OpNode::IntegrateTrace),
+            (
+                4,
+                gnitz_wire::OpNode::Join {
+                    kind: gnitz_wire::JoinKind::Equi,
+                    delta_is_right: false,
+                },
+            ),
+            (5, gnitz_wire::OpNode::IntegrateSink),
+        ],
+        vec![
+            (0, 1, SLOT_IN),
+            (1, 2, SLOT_IN),
+            (2, 3, SLOT_IN),
+            (2, 4, SLOT_IN),
+            (3, 4, SLOT_B),
+            (4, 5, SLOT_IN),
+        ],
+    );
+    let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
+    assert_eq!(join_cols(meta.source_route(7)), Some(vec![5]));
+}
+
+/// The relay scatters by the stated key mid-round, where a refusal aborts the
+/// master. A circuit is client-supplied, so a key the relation cannot route by —
+/// here a column it has not got — is refused at derive instead.
+#[test]
+fn a_stated_route_the_relation_cannot_route_by_is_rejected() {
+    let loaded = loaded_for_test(
+        [
+            (0, scan_delta(7)),
+            (1, scatter_reindex(7, &[9])),
+            (2, gnitz_wire::OpNode::IntegrateTrace),
+            (
+                3,
+                gnitz_wire::OpNode::Join {
+                    kind: gnitz_wire::JoinKind::Equi,
+                    delta_is_right: false,
+                },
+            ),
+            (4, gnitz_wire::OpNode::IntegrateSink),
+        ],
+        vec![
+            (0, 1, SLOT_IN),
+            (1, 2, SLOT_IN),
+            (1, 3, SLOT_IN),
+            (2, 3, SLOT_B),
+            (3, 4, SLOT_IN),
+        ],
+    );
+    // Unknown to the registry, the key cannot be checked at all; known, it is.
+    assert!(ViewMeta::derive(&loaded, &sources([])).is_ok());
+    assert!(
+        rejection(ViewMeta::derive(&loaded, &sources([(7, make_schema_u64_i64())]))).contains("source 7 scatter key"),
+        "a key naming a column the relation has not got must fail the compile"
     );
 }
 
@@ -333,29 +449,36 @@ fn a_scan_whose_reindex_maps_are_all_auxiliary_is_rejected() {
 fn a_band_join_whose_n_eq_overruns_the_reindex_key_is_rejected() {
     let nodes: HashMap<NodeId, OpNode> = HashMap::from([
         (0, scan_delta(7)),
-        (1, scatter_reindex(&[1, 2])),
+        (1, scatter_reindex(7, &[1, 2])),
         (2, scan_delta(9)),
+        (3, scatter_reindex(9, &[1, 2])),
         (
-            3,
+            4,
             OpNode::Join {
                 kind: JoinKind::Range { n_eq: 5, rel: RangeRel::Lt },
                 delta_is_right: false,
             },
         ),
-        (4, OpNode::IntegrateSink),
+        (5, OpNode::IntegrateSink),
     ]);
-    let edges = vec![(0, 1, SLOT_IN), (1, 3, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)];
+    let edges = vec![
+        (0, 1, SLOT_IN),
+        (1, 4, SLOT_IN),
+        (2, 3, SLOT_IN),
+        (3, 4, SLOT_B),
+        (4, 5, SLOT_IN),
+    ];
     assert_eq!(
         rejection(ViewMeta::derive(&loaded_for_test(nodes, edges), &sources([]))),
         "band join: n_eq does not match the source's reindex key arity",
     );
 }
 
-/// One shape covering every route: source 7 is the join relay, source 9 the
-/// keyless one, source 0 the output relay.
+/// One shape covering every route: sources 7 and 9 are the join's two operands,
+/// source 0 the output relay.
 ///
 ///   ScanDelta(7) → Map(reindex key_cols) ─┐
-///   ScanDelta(9) ─────────────────────────→ Join(kind)
+///   ScanDelta(9) → Map(reindex key_cols) ─→ Join(kind)
 ///                                           → ExchangeShard([1]) → IntegrateSink
 fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
     join_meta_in(kind, key_cols, sources([]))
@@ -366,18 +489,20 @@ fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
 fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: RelationRegistry) -> ViewMeta {
     let nodes: HashMap<NodeId, OpNode> = HashMap::from([
         (0, scan_delta(7)),
-        (1, scatter_reindex(key_cols)),
+        (1, scatter_reindex(7, key_cols)),
         (2, scan_delta(9)),
-        (3, OpNode::Join { kind, delta_is_right: false }),
-        (4, OpNode::ExchangeShard { shard_cols: vec![1] }),
-        (5, OpNode::IntegrateSink),
+        (3, scatter_reindex(9, key_cols)),
+        (4, OpNode::Join { kind, delta_is_right: false }),
+        (5, OpNode::ExchangeShard { shard_cols: vec![1] }),
+        (6, OpNode::IntegrateSink),
     ]);
     let edges = vec![
         (0, 1, SLOT_IN),
-        (1, 3, SLOT_IN),
-        (2, 3, SLOT_TRACE),
-        (3, 4, SLOT_IN),
+        (1, 4, SLOT_IN),
+        (2, 3, SLOT_IN),
+        (3, 4, SLOT_B),
         (4, 5, SLOT_IN),
+        (5, 6, SLOT_IN),
     ];
     ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).expect("fixture routes")
 }
@@ -386,17 +511,17 @@ fn pure_range(n_eq: u8) -> JoinKind {
     JoinKind::Range { n_eq, rel: RangeRel::Lt }
 }
 
-/// The `GroupKey` scatter's columns, or `None` when the route is not one.
-fn group_key_cols(route: &RelayRoute) -> Option<Vec<u32>> {
-    match route {
+/// The `GroupKey` scatter's columns, or `None` when there is no such route.
+fn group_key_cols(route: Option<&RelayRoute>) -> Option<Vec<u32>> {
+    match route? {
         RelayRoute::GroupKey(cols) => Some(cols.to_vec()),
         _ => None,
     }
 }
 
-/// The `JoinKey` scatter's columns, or `None` when the route is not one.
-fn join_cols(route: &RelayRoute) -> Option<Vec<u32>> {
-    match route {
+/// The `JoinKey` scatter's columns, or `None` when there is no such route.
+fn join_cols(route: Option<&RelayRoute>) -> Option<Vec<u32>> {
+    match route? {
         RelayRoute::JoinKey(slots) => Some(slots.iter().map(|&(c, _)| c).collect()),
         _ => None,
     }
@@ -406,14 +531,13 @@ fn join_cols(route: &RelayRoute) -> Option<Vec<u32>> {
 /// its matches spread over the whole key space, so a scatter would leave each
 /// worker probing a slice it does not own and drop rows silently.
 ///
-/// The join relay governs a JOIN relay ONLY: neither the output relay
-/// (`source_id == 0`) nor a source whose scans reach no reindex key (9) is
-/// one, and reading either as one broadcasts what must scatter.
+/// The join relay governs a JOIN relay ONLY: the output relay (`source_id == 0`)
+/// is not one, and reading it as one broadcasts what must scatter.
 #[test]
 fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
     let meta = join_meta(pure_range(0), &[1]);
     assert!(
-        matches!(meta.relay_route(7), RelayRoute::Broadcast),
+        matches!(meta.source_route(7), Some(RelayRoute::Broadcast)),
         "the keyed input relay of a pure-range join must broadcast"
     );
     non_join_relays_route_by_shard_cols(&meta);
@@ -425,24 +549,19 @@ fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
 fn a_cross_join_broadcasts_like_a_pure_range_join() {
     let meta = join_meta(JoinKind::Cross, &[1]);
     assert!(
-        matches!(meta.relay_route(7), RelayRoute::Broadcast),
+        matches!(meta.source_route(7), Some(RelayRoute::Broadcast)),
         "the keyed input relay of a cross join must broadcast"
     );
     non_join_relays_route_by_shard_cols(&meta);
 }
 
-/// Shared tail of the two broadcast tests: the relays that are NOT the join's
-/// keyed input route by the view's shard cols, exactly as under an equi join.
+/// Shared tail of the two broadcast tests: the output relay is not a join relay,
+/// so it routes by the view's shard cols, exactly as under an equi join.
 fn non_join_relays_route_by_shard_cols(meta: &ViewMeta) {
     assert_eq!(
-        group_key_cols(meta.relay_route(0)).as_deref(),
+        group_key_cols(Some(meta.output_route())).as_deref(),
         Some(&[1u32][..]),
         "source 0 is not a join relay: it routes by the view's shard cols"
-    );
-    assert_eq!(
-        group_key_cols(meta.relay_route(9)).as_deref(),
-        Some(&[1u32][..]),
-        "a source carrying no reindex key routes by the view's shard cols"
     );
 }
 
@@ -455,13 +574,13 @@ fn non_join_relays_route_by_shard_cols(meta: &ViewMeta) {
 fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
     let band = join_meta(pure_range(1), &[3, 4]);
     assert_eq!(
-        join_cols(band.relay_route(7)),
+        join_cols(band.source_route(7)),
         Some(vec![3]),
         "the trailing range slot must not route"
     );
 
     let equi = join_meta(JoinKind::Equi, &[3, 4]);
-    assert_eq!(join_cols(equi.relay_route(7)), Some(vec![3, 4]));
+    assert_eq!(join_cols(equi.source_route(7)), Some(vec![3, 4]));
 }
 
 /// A broadcast join relays its keyed source even where that source's distribution
@@ -492,12 +611,18 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(7)),
-                (1, scatter_reindex(&[0])),
+                (1, scatter_reindex(7, &[0])),
                 (2, OpNode::WorkerFilter),
                 (3, OpNode::IntegrateTrace),
                 (4, scan_delta(9)),
-                (5, scatter_reindex(&[1])),
-                (6, OpNode::Join { kind: pure_range(0), delta_is_right: false }),
+                (5, scatter_reindex(9, &[1])),
+                (
+                    6,
+                    OpNode::Join {
+                        kind: pure_range(0),
+                        delta_is_right: false,
+                    },
+                ),
                 (7, OpNode::IntegrateSink),
             ],
             vec![
@@ -506,7 +631,7 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
                 (2, 3, SLOT_IN),
                 (4, 5, SLOT_IN),
                 (5, 6, SLOT_IN),
-                (3, 6, SLOT_TRACE),
+                (3, 6, SLOT_B),
                 (6, 7, SLOT_IN),
             ],
         );
@@ -514,11 +639,11 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
     };
     let keyed = meta(make_schema_u64_i64());
     assert!(!keyed.scatters(7), "already on its PK's owner");
-    assert!(matches!(keyed.relay_route(9), RelayRoute::Broadcast));
+    assert!(matches!(keyed.source_route(9), Some(RelayRoute::Broadcast)));
     assert!(keyed.scatters(9));
 
     let replicated = meta(make_schema_u64_i64().with_placement(Placement::Replicated));
-    assert_eq!(join_cols(replicated.relay_route(7)), Some(vec![0]));
+    assert_eq!(join_cols(replicated.source_route(7)), Some(vec![0]));
     assert!(
         replicated.scatters(7),
         "a replicated copy is relayed by key from one worker"
@@ -560,12 +685,25 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
         repartitions_of(
             HashMap::from([
                 (0, scan_delta(7)),
-                (1, scatter_reindex(&[1])),
+                (1, scatter_reindex(7, &[1])),
                 (2, scan_delta(9)),
-                (3, OpNode::Join { kind: JoinKind::Equi, delta_is_right: false }),
-                (4, OpNode::IntegrateSink),
+                (3, scatter_reindex(9, &[1])),
+                (
+                    4,
+                    OpNode::Join {
+                        kind: JoinKind::Equi,
+                        delta_is_right: false
+                    }
+                ),
+                (5, OpNode::IntegrateSink),
             ]),
-            vec![(0, 1, SLOT_IN), (1, 3, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
+            vec![
+                (0, 1, SLOT_IN),
+                (1, 4, SLOT_IN),
+                (2, 3, SLOT_IN),
+                (3, 4, SLOT_B),
+                (4, 5, SLOT_IN),
+            ],
         ),
         "an equi-join carries no ExchangeShard and still repartitions"
     );
@@ -581,7 +719,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
     let loaded = loaded_for_test(
         [
             (0, scan_delta(7)),
-            (1, scatter_reindex(&[1])),
+            (1, scatter_reindex(7, &[1])),
             (2, OpNode::ExchangeShard { shard_cols: vec![1] }),
             (
                 3,
@@ -609,7 +747,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
                 (3, OpNode::Join { kind, delta_is_right: false }),
                 (4, OpNode::IntegrateSink),
             ],
-            vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
+            vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_B), (3, 4, SLOT_IN)],
         )
     };
     let range = |n_eq| gnitz_wire::JoinKind::Range { n_eq, rel: gnitz_wire::RangeRel::Lt };
@@ -643,11 +781,11 @@ fn joins_calling_for_different_relays_are_rejected() {
                 (0, 2, SLOT_IN),
                 (1, 3, SLOT_IN),
                 (0, 4, SLOT_IN),
-                (3, 4, SLOT_TRACE),
+                (3, 4, SLOT_B),
                 (1, 5, SLOT_IN),
-                (2, 5, SLOT_TRACE),
+                (2, 5, SLOT_B),
                 (4, 6, SLOT_IN),
-                (5, 6, SLOT_TRACE),
+                (5, 6, SLOT_B),
                 (6, 7, SLOT_IN),
             ],
         )
@@ -666,174 +804,6 @@ fn joins_calling_for_different_relays_are_rejected() {
         "circuit joins need different relays",
         "the compile is refused"
     );
-}
-
-// ── scatter_key_of_scan: the forward (scan → reindex Map) walk ──────────
-
-/// The pure-range-join shape the planner emits at `n_eq == 0`: the reindex Map
-/// feeds the `Join(Range)` DIRECTLY as the delta term AND feeds a
-/// `WorkerFilter → IntegrateTrace` toward the trace term. Its key is collected
-/// once, from the flag — the fan-out is not a second contribution — and the
-/// `WorkerFilter` is not a `Filter`, so the walk never steps through it.
-#[test]
-fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(99)),
-            (1, scatter_reindex(&[2])),
-            (2, OpNode::WorkerFilter),
-            (3, OpNode::IntegrateTrace),
-            (
-                4,
-                OpNode::Join { kind: gnitz_wire::JoinKind::Range { n_eq: 0, rel: gnitz_wire::RangeRel::Le }, delta_is_right: false },
-            ),
-        ],
-        vec![
-            (0, 1, SLOT_IN),
-            (1, 4, SLOT_IN), // reindex Map → Join (delta term, DIRECT edge)
-            (1, 2, SLOT_IN), // reindex Map → WorkerFilter (toward the trace)
-            (2, 3, SLOT_IN),
-            (3, 4, SLOT_TRACE),
-        ],
-    );
-    assert_eq!(scatter_key_of_scan(&loaded, 0).0, vec![vec![(2, None)]]);
-}
-
-/// A source joined on two different keys (`t ⋈ t1 ON t.a = t1.x ⋈ t2 ON t.b =
-/// t2.y`) fans into two reindex Maps, and both sequences must be collected as
-/// SEPARATE sequences: it is the sequence count, not the column count, that
-/// decides whether one pack key can route the source at all.
-#[test]
-fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(42)),
-            (1, scatter_reindex(&[2])),
-            (2, OpNode::Filter(dummy_expr_blob())),
-            (3, scatter_reindex(&[5])),
-        ],
-        // The second reindex sits behind a Filter, which the walk steps through.
-        vec![(0, 1, SLOT_IN), (0, 2, SLOT_IN), (2, 3, SLOT_IN)],
-    );
-    assert_eq!(
-        scatter_key_of_scan(&loaded, 0).0,
-        vec![vec![(2, None)], vec![(5, None)]],
-        "two distinct keys stay two sequences"
-    );
-}
-
-/// Within one sequence, duplicate columns are PRESERVED: an overlapping key
-/// (`a.x = b.p AND a.x = b.q`) reindexes `[x, x]`, possibly with distinct
-/// per-slot promotion targets, and the scatter packer must mirror the trace-side
-/// `ReindexPacker` slot-for-slot. Across sibling Maps carrying an IDENTICAL
-/// sequence it collapses to one, which concatenating would double.
-#[test]
-fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
-    let overlapping = loaded_for_test(
-        [
-            (0, scan_delta(42)),
-            (
-                1,
-                OpNode::Map(MapKind::Reindex {
-                    keep: vec![0],
-                    key: vec![(3, None), (3, Some(gnitz_wire::TypeCode::I64))],
-                    role: ReindexRole::ScatterKey,
-                }),
-            ),
-        ],
-        vec![(0, 1, SLOT_IN)],
-    );
-    assert_eq!(
-        scatter_key_of_scan(&overlapping, 0).0,
-        vec![vec![(3, None), (3, Some(gnitz_wire::TypeCode::I64))]],
-        "duplicate slots and their promotion targets survive"
-    );
-
-    let siblings = loaded_for_test(
-        [
-            (0, scan_delta(7)),
-            (1, OpNode::Filter(dummy_expr_blob())),
-            (2, scatter_reindex(&[2])),
-            (3, OpNode::Filter(dummy_expr_blob())),
-            (4, scatter_reindex(&[2])),
-        ],
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 3, SLOT_IN), (3, 4, SLOT_IN)],
-    );
-    assert_eq!(
-        scatter_key_of_scan(&siblings, 0).0,
-        vec![vec![(2, None)]],
-        "identical sibling sequences collapse to one"
-    );
-}
-
-/// Only the join reindex defines a source's scatter key, and the planner says
-/// which one it is by flagging the role. A band LEFT join's left scan also feeds
-/// an `Auxiliary` `a.pk` re-key for the null-fill; concatenating that would
-/// corrupt the eq-prefix scatter. A scan reaching ONLY auxiliary maps is instead
-/// a planner call site that forgot its role, and is reported as orphaned.
-#[test]
-fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
-    let aux_rekey = || {
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            key: vec![(0, None)],
-            role: ReindexRole::Auxiliary,
-        })
-    };
-    let circuit = |join_reindex: OpNode, aux_rekey: OpNode| {
-        loaded_for_test(
-            [
-                (0, scan_delta(10)),
-                (1, join_reindex),
-                (2, OpNode::IntegrateTrace),
-                (
-                    3,
-                    OpNode::Join { kind: gnitz_wire::JoinKind::Range { n_eq: 1, rel: gnitz_wire::RangeRel::Le }, delta_is_right: false },
-                ),
-                (4, aux_rekey),
-                (5, OpNode::Map(MapKind::Projection(vec![]))),
-                (6, OpNode::Distinct),
-            ],
-            vec![
-                (0, 1, SLOT_IN),
-                (1, 3, SLOT_IN),
-                (1, 2, SLOT_IN), // join reindex → its own integral
-                (2, 3, SLOT_TRACE),
-                (0, 4, SLOT_IN),
-                (4, 5, SLOT_IN),
-                (5, 6, SLOT_IN), // aux a.pk re-key → proj → distinct
-            ],
-        )
-    };
-    assert_eq!(
-        scatter_key_of_scan(&circuit(scatter_reindex(&[1, 2]), aux_rekey()), 0),
-        (vec![vec![(1, None), (2, None)]], false, false),
-        "only the trace/probe-feeding reindex defines the scatter key"
-    );
-    assert_eq!(
-        scatter_key_of_scan(&circuit(aux_rekey(), aux_rekey()), 0),
-        (vec![], true, true),
-        "a scan reaching no ScatterKey map at all is orphaned"
-    );
-}
-
-/// A `Map` that does not re-key contributes nothing to the scatter.
-#[test]
-fn a_non_reindex_map_contributes_no_scatter_key() {
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(7)),
-            (
-                1,
-                OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
-                    program: dummy_expr_blob(),
-                    out_cols: vec![],
-                })),
-            ),
-        ],
-        vec![(0, 1, SLOT_IN)],
-    );
-    assert!(scatter_key_of_scan(&loaded, 0).0.is_empty());
 }
 
 // ── scan_through_row_local: the backward (shard → scan) walk ────────────
@@ -857,7 +827,7 @@ fn the_shard_walk_crosses_row_local_nodes_and_nothing_else() {
         scan_through_row_local(&loaded_for_test(nodes, edges), shard)
     };
     let filter = || OpNode::Filter(dummy_expr_blob());
-    let rekey = || scatter_reindex(&[2]);
+    let rekey = || scatter_reindex(7, &[2]);
     let copy = || OpNode::Map(MapKind::Projection(vec![1]));
     let compute = || {
         OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
@@ -912,7 +882,7 @@ fn the_shard_walk_bails_at_a_fan_in() {
         for (i, op) in tail.into_iter().enumerate() {
             nodes.insert(i + 3, op);
         }
-        let mut edges = vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)];
+        let mut edges = vec![(0, 2, SLOT_IN), (1, 2, SLOT_B)];
         edges.extend((2..shard).map(|i| (i, i + 1, SLOT_IN)));
         scan_through_row_local(&loaded_for_test(nodes, edges), shard)
     };
@@ -939,7 +909,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
     let bounds_of = |a: OpNode, b: OpNode| {
         let loaded = loaded_for_test(
             [(0, a), (1, b), (2, OpNode::Union), (3, OpNode::IntegrateSink)],
-            vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE), (2, 3, SLOT_IN)],
+            vec![(0, 2, SLOT_IN), (1, 2, SLOT_B), (2, 3, SLOT_IN)],
         );
         let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
         let mut got: Vec<(i64, Vec<u32>)> = meta

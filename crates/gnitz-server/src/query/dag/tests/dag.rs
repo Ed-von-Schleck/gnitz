@@ -38,7 +38,6 @@ fn dag_with_deps(edges: &[(i64, i64)]) -> DagEngine {
     for &(src, view) in edges {
         dag.dep.forward.entry(src).or_default().push(view);
         dag.dep.reverse.entry(view).or_default().push(src);
-        dag.dep.edges.insert((view, src));
     }
     dag
 }

@@ -123,6 +123,13 @@ pub struct ReducePlan {
 }
 
 impl ReducePlan {
+    /// True iff this reduce needs its input delta folded to net weights: only
+    /// the non-linear aggregates, which walk the value index.
+    #[inline]
+    pub fn consolidates_input(&self) -> bool {
+        self.avi.is_some()
+    }
+
     /// `Err` for a shape [`ReduceShape`] refuses, a ground row over a group set,
     /// and a reduce without a COUNT(*).
     pub fn from_wire(

@@ -332,30 +332,22 @@ pub enum JoinKind {
     Cross,
 }
 
-wire_enum! {
-    /// What a reindex `Map` re-keys *for*. One scan can fan out into several
-    /// reindex Maps on different keys — a band outer join hangs its null-fill's
-    /// source-PK re-key and its scatter-key re-key off the same `ScanDelta`
-    /// (`SELECT * FROM a LEFT JOIN b ON a.k = b.k AND a.v < b.w`) — and can also
-    /// carry re-keys that only move already-routed rows, so the two cannot be told
-    /// apart by graph shape. The planner states which is which at the call site,
-    /// where it knows.
-    pub enum ReindexRole: u8 {
-        /// A re-key of rows a `ScatterKey` already placed — an outer join's
-        /// null-fill putting its preserved side back on that side's own PK so the
-        /// set difference stays partition-local, or any re-key of an operator's
-        /// output.
-        Auxiliary = 0,
-        /// The join/group key of this Map's source relation — the key the exchange
-        /// scatters that source's delta by.
-        ///
-        /// Not "an exchange is needed": a replicated or co-partitioned source is a
-        /// `ScatterKey` too, and whether the exchange runs stays the engine's call
-        /// (`compute_co_partitioned`). Naming only the scattered sides would move
-        /// that decision into the planner.
-        ScatterKey = 1,
-    }
+/// What a reindex `Map` re-keys *for*. A scan can fan out into several reindex
+/// Maps on different keys, and a re-key of already-routed rows looks the same
+/// from the graph, so the planner states which is which where it knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReindexRole {
+    /// A re-key of rows a `ScatterKey` already placed.
+    Auxiliary,
+    /// The join key of `source`, in `source`'s own column indices, which is
+    /// what the master's relay scatters that delta by. The Map's own `key` is
+    /// that key in this node's input layout; a `Map` in between moves one and
+    /// not the other.
+    ScatterKey { source: u64, source_key: Vec<ReindexSlot> },
 }
+
+const ROLE_AUXILIARY: u8 = 0;
+const ROLE_SCATTER_KEY: u8 = 1;
 
 /// One slot of a reindex or hash-row key list: a source column, and the
 /// promotion target the planner carried for it. What an absent target means is
@@ -614,10 +606,16 @@ impl Circuit {
         Ok(self.nodes.len() - 1)
     }
 
-    /// Every `ScanDelta` source, for the client's segment substitution.
+    /// Every relation id a node names — a `ScanDelta`'s source and the relation
+    /// a reindex states its route over — for the client's segment substitution,
+    /// which must move both or route a delta by a relation nothing scans.
     pub fn sources_mut(&mut self) -> impl Iterator<Item = &mut u64> {
         self.nodes.iter_mut().filter_map(|n| match &mut n.op {
             OpNode::ScanDelta { source, .. } => Some(source),
+            OpNode::Map(MapKind::Reindex {
+                role: ReindexRole::ScatterKey { source, .. },
+                ..
+            }) => Some(source),
             _ => None,
         })
     }
@@ -997,7 +995,15 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             (Opcode::MapExpr, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::Reindex { keep, key, role }) => {
-            w.u8(role.as_wire());
+            match role {
+                ReindexRole::Auxiliary => {
+                    w.u8(ROLE_AUXILIARY);
+                }
+                ReindexRole::ScatterKey { source, source_key } => {
+                    w.u8(ROLE_SCATTER_KEY).u64(*source);
+                    write_cols_with_tcs(&mut w, source_key);
+                }
+            }
             write_cols_with_tcs(&mut w, key);
             write_cols(&mut w, keep);
             (Opcode::MapReindex, None, Some(w.into_vec()))
@@ -1088,8 +1094,18 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             // The role decides which worker a row lands on, so an unknown value is
             // a refusal — unlike a `ScanDelta` bound, which only decides scan speed.
             let role_byte = r.u8()?;
-            let role = ReindexRole::from_wire(role_byte)
-                .ok_or_else(|| format!("MAP_REINDEX unknown route-key role {role_byte}"))?;
+            let role = match role_byte {
+                ROLE_AUXILIARY => ReindexRole::Auxiliary,
+                ROLE_SCATTER_KEY => {
+                    let source = r.u64()?;
+                    let source_key = read_cols_with_tcs(&mut r)?;
+                    if source_key.is_empty() {
+                        return Err("MAP_REINDEX scatter key names no source columns".to_string());
+                    }
+                    ReindexRole::ScatterKey { source, source_key }
+                }
+                other => return Err(format!("MAP_REINDEX unknown route-key role {other}")),
+            };
             let key = read_cols_with_tcs(&mut r)?;
             if key.is_empty() {
                 return Err("MAP_REINDEX names no key columns".to_string());

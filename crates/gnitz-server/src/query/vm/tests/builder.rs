@@ -3,64 +3,31 @@ use super::*;
 use crate::test_support::make_schema_u128_i64;
 use gnitz_wire::{AggDescriptor, AggFunc};
 
-/// A delta register nothing else names, so each instruction below reads a
-/// register of its own.
-fn reg(i: u16) -> DeltaReg {
-    DeltaReg(i)
-}
-
-/// `Integrate` runs after every other instruction whatever order the emitter
-/// pushed them in, which is what makes it the last reader of its register.
+/// An integrate runs after the whole instruction range, so it is the last reader
+/// of its register and ingests by move rather than by copy.
 #[test]
-fn every_integrate_is_scheduled_last() {
+fn an_integrate_is_the_last_reader_of_its_register() {
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
     let schema = make_schema_u128_i64();
-    let mut b = ProgramBuilder::new();
+    let mut p = TestPlan::default();
 
-    let t0 = owned_table(&mut b, &registry, dir.path(), "t0", schema);
-    let t1 = owned_table(&mut b, &registry, dir.path(), "t1", schema);
-    // Emission order: integrate, negate, integrate, negate.
-    b.push(Instr::Integrate {
-        in_reg: reg(0),
-        trace_reg: TraceReg(1),
-    });
-    b.push(Instr::Negate {
-        in_reg: reg(0),
-        out_reg: reg(2),
-    });
-    b.push(Instr::Integrate {
-        in_reg: reg(2),
-        trace_reg: TraceReg(3),
-    });
-    b.push(Instr::Negate {
-        in_reg: reg(2),
-        out_reg: reg(4),
-    });
+    let t0 = p.table(&registry, dir.path(), "t0", schema);
+    let t1 = p.table(&registry, dir.path(), "t1", schema);
+    p.push(0, 1, Op::Negate);
+    p.push(1, 2, Op::Negate);
+    p.integrate(0, t0);
+    p.integrate(1, t1);
 
-    let meta = vec![
-        RegisterMeta::delta(schema),
-        RegisterMeta::trace(schema, t0),
-        RegisterMeta::delta(schema),
-        RegisterMeta::trace(schema, t1),
-        RegisterMeta::delta(schema),
-    ];
-    let vm = b.build(meta, reg(4));
-    let is_integrate: Vec<bool> = vm
-        .program
-        .instructions
-        .iter()
-        .map(|i| matches!(i, Instr::Integrate { .. }))
-        .collect();
-    assert_eq!(is_integrate, [false, false, true, true]);
-
-    // Being last is what earns the move: each integrate's register is released
-    // by it rather than cloned into it.
-    for (pc, instr) in vm.program.instructions.iter().enumerate() {
-        if let Instr::Integrate { in_reg, .. } = instr {
-            assert_eq!(vm.program.last_read[in_reg.at()], pc as u32);
-        }
-    }
+    let vm = p.build(vec![schema; 3], 2);
+    let n = vm.program.instructions.len();
+    assert_eq!(vm.program.last_read[0], n as u32);
+    assert_eq!(vm.program.last_read[1], n as u32 + 1);
+    assert_eq!(
+        vm.program.last_read[2],
+        u32::MAX,
+        "the sink is never taken out from under the epoch epilogue"
+    );
 }
 
 /// `consolidate_at` marks each consolidating instruction's input at its FIRST
@@ -72,12 +39,12 @@ fn consolidate_at_marks_the_first_reader_of_every_folded_register() {
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
     let schema = make_schema_u128_i64();
-    let mut b = ProgramBuilder::new();
+    let mut p = TestPlan::default();
 
-    let hist = owned_table(&mut b, &registry, dir.path(), "hist", schema);
-    let join_trace = owned_table(&mut b, &registry, dir.path(), "jt", schema);
-    let red_trace = owned_table(&mut b, &registry, dir.path(), "rt", schema);
-    let lin_trace = owned_table(&mut b, &registry, dir.path(), "lt", schema);
+    let hist = p.table(&registry, dir.path(), "hist", schema);
+    let join_trace = p.table(&registry, dir.path(), "jt", schema);
+    let red_trace = p.table(&registry, dir.path(), "rt", schema);
+    let lin_trace = p.table(&registry, dir.path(), "lt", schema);
 
     // MIN carries a value index, so `op_reduce` consolidates; COUNT alone does
     // not.
@@ -92,63 +59,54 @@ fn consolidate_at_marks_the_first_reader_of_every_folded_register() {
         true,
     )
     .unwrap();
-    assert!(avi_plan.avi.is_some());
-    let avi_table = owned_table(&mut b, &registry, dir.path(), "avi", avi_plan.avi.as_ref().unwrap().schema);
-    let avi_idx = b.add_reduce_plan(avi_plan, Some(avi_table));
+    assert!(avi_plan.consolidates_input());
+    let avi_table = p.table(&registry, dir.path(), "avi", avi_plan.avi.as_ref().unwrap().schema);
 
     let linear_plan =
         gnitz_store::ops::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false, true).unwrap();
-    assert!(linear_plan.avi.is_none());
-    let linear_idx = b.add_reduce_plan(linear_plan, None);
+    assert!(!linear_plan.consolidates_input());
 
     let probe = gnitz_store::ops::JoinPlan::from_wire(gnitz_wire::JoinKind::Equi, false, &schema, &schema)
         .unwrap()
         .probe;
 
-    // reg 0 = clamp input, reg 4 = join delta, reg 8 = avi-reduce input,
-    // reg 11 = linear-reduce input. Each is negated first, so the pc that folds
+    // reg 0 = clamp input, reg 2 = join delta, reg 4 = avi-reduce input,
+    // reg 6 = linear-reduce input. Each is negated first, so the pc that folds
     // it is that negate and not the consolidating instruction.
-    let negate = |b: &mut ProgramBuilder, from: u16, to: u16| {
-        b.push(Instr::Negate {
-            in_reg: reg(from),
-            out_reg: reg(to),
-        })
-    };
-    negate(&mut b, 0, 2);
-    b.push(Instr::WeightClamp {
-        in_reg: reg(0),
-        hist_reg: TraceReg(1),
-        out_reg: reg(3),
-        preset: gnitz_store::ops::ClampPreset::Distinct,
-    });
-    negate(&mut b, 4, 6);
-    b.push(Instr::JoinDT {
-        delta_reg: reg(4),
-        trace_reg: TraceReg(5),
-        out_reg: reg(7),
-        probe,
-    });
-    negate(&mut b, 8, 10);
-    b.push(Instr::Reduce {
-        in_reg: reg(8),
-        trace_out_reg: TraceReg(9),
-        out_reg: reg(13),
-        plan_idx: avi_idx,
-    });
-    negate(&mut b, 11, 14);
-    b.push(Instr::Reduce {
-        in_reg: reg(11),
-        trace_out_reg: TraceReg(12),
-        out_reg: reg(15),
-        plan_idx: linear_idx,
-    });
+    p.push(0, 1, Op::Negate);
+    p.push(
+        0,
+        8,
+        Op::WeightClamp {
+            hist,
+            preset: gnitz_store::ops::ClampPreset::Distinct,
+        },
+    );
+    p.push(2, 3, Op::Negate);
+    p.push(2, 9, Op::JoinDT { trace: join_trace, probe });
+    p.push(4, 5, Op::Negate);
+    p.push(
+        4,
+        10,
+        Op::Reduce {
+            out_trace: red_trace,
+            plan: Box::new(BakedReduce {
+                plan: avi_plan,
+                avi_table: Some(avi_table),
+            }),
+        },
+    );
+    p.push(6, 7, Op::Negate);
+    p.push(
+        6,
+        11,
+        Op::Reduce {
+            out_trace: lin_trace,
+            plan: Box::new(BakedReduce { plan: linear_plan, avi_table: None }),
+        },
+    );
 
-    let mut meta = vec![RegisterMeta::delta(schema); 16];
-    for (i, t) in [(1, hist), (5, join_trace), (9, red_trace), (12, lin_trace)] {
-        meta[i] = RegisterMeta::trace(schema, t);
-    }
-    let vm = b.build(meta, reg(15));
-
+    let vm = p.build(vec![schema; 12], 11);
     let marked: Vec<(usize, u32)> = vm
         .program
         .consolidate_at
@@ -158,7 +116,7 @@ fn consolidate_at_marks_the_first_reader_of_every_folded_register() {
         .map(|(r, &pc)| (r, pc))
         .collect();
     // The clamp input, the join delta and the value-indexed reduce's input, each
-    // at the negate that reads it first. The linear reduce's input (reg 11) is
+    // at the negate that reads it first. The linear reduce's input (reg 6) is
     // absent.
-    assert_eq!(marked, vec![(0, 0), (4, 2), (8, 4)]);
+    assert_eq!(marked, vec![(0, 0), (2, 2), (4, 4)]);
 }

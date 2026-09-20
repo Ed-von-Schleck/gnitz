@@ -7,7 +7,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::query::vm::{DeltaReg, ProgramBuilder, RegisterMeta, TraceReg, VmHandle};
+use crate::query::vm::{DeltaReg, VmHandle};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::expr::MapPlan;
 use gnitz_store::ops::ScatterSpec;
@@ -31,12 +31,13 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 // `pub(super)` by default: `dag` is the only module that names the compiler, so
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
 pub(super) use load::read_circuit_node_row;
-pub(crate) use routing::RelayRoute;
-pub(super) use routing::{ViewMeta, OUTPUT_RELAY};
+pub(super) use routing::ViewMeta;
+pub(crate) use routing::{RelayRoute, OUTPUT_RELAY};
 
 /// The most nodes one view's circuit may hold. A real circuit is 15–40 nodes;
-/// the headroom is what makes the `u16` register and table ids safe under any
-/// future node kind minting up to three of each (`3 × 16_384 + 2 < u16::MAX`).
+/// the headroom is what makes the `u16` register ids safe under any future node
+/// kind minting up to three per node (`3 × 16_384 + 2 < u16::MAX`). Child-store
+/// ids are bounded independently, by `CircuitState::open_child`.
 pub(in crate::query) const MAX_CIRCUIT_NODES: usize = 16_384;
 
 // ---------------------------------------------------------------------------
@@ -186,10 +187,9 @@ impl LoadedCircuit {
 // CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
 
-/// A compiled sub-pipeline: the VM program, its register layout, and its
-/// source-to-input-register map. One per `build_plan` call — an exchange side,
-/// or the post-combine phase, which for an exchange-free circuit is the whole
-/// plan.
+/// A compiled sub-pipeline: the VM and the sources whose delta seeds it. One
+/// per `build_plan` call — an exchange side, or the post-combine phase, which
+/// for an exchange-free circuit is the whole plan.
 pub(super) struct SubPlan {
     pub(in crate::query) vm: Box<VmHandle>,
     /// source table id → the input register its delta seeds.
@@ -201,6 +201,18 @@ pub(super) struct SubPlan {
 pub(super) struct Side {
     pub(in crate::query) plan: SubPlan,
     pub(in crate::query) seed_reg: DeltaReg,
+    /// Every worker computes this side's whole output, so a muted round must
+    /// publish nothing rather than relay each row `W` times.
+    pub(in crate::query) emits_replica: bool,
+}
+
+/// Every relation the side scans is replicated and nothing trims its result, so
+/// each worker's output is a copy of the others'.
+fn emits_replica(plan: &SubPlan, registry: &RelationRegistry) -> bool {
+    plan.source_reg_map
+        .keys()
+        .all(|tid| registry.relation(*tid).is_some_and(Relation::is_replicated))
+        && !plan.vm.program.trims_per_worker()
 }
 
 /// What a compiled view repartitions through: one sub-pipeline per
@@ -244,7 +256,7 @@ pub(super) struct CompileOutput {
 }
 
 impl CompileOutput {
-    /// Every sub-plan of the view, for whole-plan sweeps (regfile clears,
+    /// Every sub-plan of the view, for whole-plan sweeps (register clears,
     /// checkpoint table collection).
     pub(super) fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
         let Self { sides, post, .. } = self;
@@ -293,7 +305,7 @@ pub(super) fn compile_view(
     for side in &carve.sides {
         let ex_in = loaded.inputs(side.shard).unary();
         let (plan, _) = build_plan(&loaded, &side.nodes, site, self_contained, &[], ex_in)?;
-        let schema = plan.vm.program.out_schema();
+        let schema = *plan.vm.program.out_schema();
         // The relay routes by this spec mid-round, where a refusal aborts the master.
         ScatterSpec::GroupKey(side.cols).check(&schema)?;
         seeds.push((side.shard, schema));
@@ -310,6 +322,7 @@ pub(super) fn compile_view(
         .zip(&carve.sides)
         .map(|(plan, c)| {
             Ok(Side {
+                emits_replica: emits_replica(&plan, site.registry),
                 plan,
                 seed_reg: post_regs[c.shard]
                     .ok_or("an exchange side seeds no register of the post phase")?

@@ -31,6 +31,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{ColumnDef, ReduceOutKey, RelDescriptor, Schema};
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
+use spine::SourceOrigin;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -471,13 +472,23 @@ pub(crate) fn emit_join_inputs(
         live
     };
     let (live_l, live_r) = (live(true), live(false));
-    let [l, r] = spine::open_pair(chain, memo, [left, right], [&live_l, &live_r], true)?;
+    let [mut l, mut r] = spine::open_pair(chain, memo, [left, right], [&live_l, &live_r], true)?;
+    // A key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`) is no
+    // column of the scanned relation, so nothing over that relation can state
+    // where its delta scatters. Cut to a segment, the computed column is one.
+    if !l.keys_reach_source(class.key_cols(true)) {
+        l = spine::Spine::segment(materialize(chain, memo, left, &live_l)?);
+    }
+    if !r.keys_reach_source(class.key_cols(false)) {
+        r = spine::Spine::segment(materialize(chain, memo, right, &live_r)?);
+    }
+    let (origin_l, origin_r) = (l.origin(), r.origin());
     let left_pk_repeats = l.pk_repeats();
     let (a, left_frame) = l.emit(cb, spine::Top::Slots, "join input")?;
     let (b, right_frame) = r.emit(cb, spine::Top::Slots, "join input")?;
     Ok((
         [a, b],
-        join_sides(down, class, kind, [left_frame, right_frame]),
+        join_sides(down, class, kind, [left_frame, right_frame], [origin_l, origin_r]),
         left_pk_repeats,
     ))
 }
@@ -490,9 +501,26 @@ pub(crate) struct JoinSide {
     pub(crate) keep: Vec<u32>,
     pub(crate) coldefs: Vec<ColumnDef>,
     pk_arity: usize,
+    origin: SourceOrigin,
 }
 
 impl JoinSide {
+    /// `key`, this side's reindex key in its own emitted layout, restated over
+    /// the relation the master scatters.
+    pub(crate) fn scatter_key(
+        &self,
+        key: &[gnitz_core::ReindexSlot],
+    ) -> Result<gnitz_core::ReindexRole, GnitzSqlError> {
+        self.origin.scatter_role(&self.frame, key).ok_or_else(|| {
+            GnitzSqlError::Internal("a join key column is not a column of the relation it scatters".into())
+        })
+    }
+
+    /// The scatter key of a re-key onto this side's source PK.
+    pub(crate) fn scatter_pk(&self) -> gnitz_core::ReindexRole {
+        self.origin.scatter_pk()
+    }
+
     /// The kept payload width.
     pub(crate) fn n(&self) -> usize {
         self.keep.len()
@@ -520,8 +548,15 @@ impl JoinSide {
 /// into the join's traces, and so onto disk. The five contributors are marked in
 /// order below; a wildcard projection is already expanded into `ProjEntry` column
 /// refs by bind, so Rule 1 covers `SELECT *`.
-pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, inputs: [Frame; 2]) -> [JoinSide; 2] {
+pub(crate) fn join_sides(
+    down: Demand<'_>,
+    class: &JoinClass,
+    kind: JoinType,
+    inputs: [Frame; 2],
+    origins: [SourceOrigin; 2],
+) -> [JoinSide; 2] {
     let [left, right] = inputs;
+    let [origin_l, origin_r] = origins;
     let (left_layout, right_layout) = (&left.layout, &right.layout);
     // One keep list per side, so a rule cannot write into the region another rule
     // owns.
@@ -578,13 +613,16 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
         keep[0][0] = true;
     }
     let [kl, kr] = keep;
-    [one_side(left, &kl, pins[0]), one_side(right, &kr, pins[1])]
+    [
+        one_side(left, origin_l, &kl, pins[0]),
+        one_side(right, origin_r, &kr, pins[1]),
+    ]
 }
 
 /// One side's keep list in emission order: its pinned PK columns first, then every
 /// other kept column in source order. A keep list need not ascend, and the PK at
 /// the front is what makes every pair-PK slot list a range.
-fn one_side(frame: Frame, keep: &[bool], pin_pk: bool) -> JoinSide {
+fn one_side(frame: Frame, origin: SourceOrigin, keep: &[bool], pin_pk: bool) -> JoinSide {
     let pinned: Vec<u32> = if pin_pk {
         frame.schema.pk_cols.clone()
     } else {
@@ -598,6 +636,7 @@ fn one_side(frame: Frame, keep: &[bool], pin_pk: bool) -> JoinSide {
         frame,
         keep: cols,
         coldefs,
+        origin,
     }
 }
 

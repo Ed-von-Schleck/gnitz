@@ -50,18 +50,18 @@ impl<'a> Relay<'a> {
 
     /// One repartition round of a side's output. Run even for an empty batch, so
     /// the collective rounds stay balanced across workers.
-    fn round(&mut self, batch: Batch, single_sourced: bool) -> Batch {
+    fn round(&mut self, batch: Batch, emits_replica: bool) -> Batch {
         match self.elide {
             true => batch,
-            false => self.send(batch, OUTPUT_RELAY, single_sourced),
+            false => self.send(batch, OUTPUT_RELAY, emits_replica),
         }
     }
 
     /// Publish `batch` under `key` and take back what this worker owns. A muted
-    /// round publishes an empty batch instead: every worker holds the same rows,
-    /// so sending them all would relay each one `W` times.
-    fn send(&mut self, batch: Batch, key: i64, single_sourced: bool) -> Batch {
-        if self.muted && single_sourced {
+    /// round publishes an empty batch instead: under `replica` every worker holds
+    /// the same rows, so sending them all would relay each one `W` times.
+    fn send(&mut self, batch: Batch, key: i64, replica: bool) -> Batch {
+        if self.muted && replica {
             let empty = Batch::empty_with_schema(batch.schema());
             drop(batch);
             return self.exchange.do_exchange(self.view_id, empty, key);
@@ -113,7 +113,7 @@ impl DagEngine {
                 vm::execute_epoch_multi(&mut post.vm, [seed])
             }
             Sides::Unary(side) => {
-                let seed = Self::run_side(side, Some(input), src_id, false, relay)?;
+                let seed = Self::run_side(side, Some(input), src_id, relay)?;
                 vm::execute_epoch_multi(&mut post.vm, [seed])
             }
             Sides::Pair([a, b]) => {
@@ -125,10 +125,9 @@ impl DagEngine {
                     (false, true) => (None, Some(input)),
                     (false, false) => (None, None),
                 };
-                // A set-op side is row-local over its one source.
                 let seeds = [
-                    Self::run_side(a, da, src_id, true, relay)?,
-                    Self::run_side(b, db, src_id, true, relay)?,
+                    Self::run_side(a, da, src_id, relay)?,
+                    Self::run_side(b, db, src_id, relay)?,
                 ];
                 vm::execute_epoch_multi(&mut post.vm, seeds)
             }
@@ -142,11 +141,10 @@ impl DagEngine {
         side: &mut Side,
         delta: Option<Batch>,
         src_id: i64,
-        single_sourced: bool,
         relay: &mut Relay<'_>,
     ) -> Result<(vm::DeltaReg, Batch), StorageError> {
         // The pre-exchange schema, never the view's combine-widened one.
-        let schema = side.plan.vm.program.out_schema();
+        let schema = *side.plan.vm.program.out_schema();
         let Some(delta) = delta else {
             return Ok((side.seed_reg, Batch::empty_with_schema(&schema)));
         };
@@ -154,7 +152,7 @@ impl DagEngine {
         let pre = vm::execute_epoch_multi(&mut side.plan.vm, [seed])?;
         Ok((
             side.seed_reg,
-            relay.round(pre, single_sourced).into_consolidated(&schema),
+            relay.round(pre, side.emits_replica).into_consolidated(&schema),
         ))
     }
 

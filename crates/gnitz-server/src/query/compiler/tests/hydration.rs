@@ -37,11 +37,11 @@ fn equi_join(mutate: impl FnOnce(&mut HashMap<NodeId, OpNode>, &mut Vec<(NodeId,
         (2, 4, SLOT_IN),
         (3, 5, SLOT_IN),
         (2, 6, SLOT_IN),
-        (5, 6, SLOT_TRACE),
+        (5, 6, SLOT_B),
         (3, 7, SLOT_IN),
-        (4, 7, SLOT_TRACE),
+        (4, 7, SLOT_B),
         (6, 8, SLOT_IN),
-        (7, 8, SLOT_TRACE),
+        (7, 8, SLOT_B),
         (8, 9, SLOT_IN),
         (9, 10, SLOT_IN),
         (10, 11, SLOT_IN),
@@ -128,7 +128,7 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
                 (2, OpNode::Union),
                 (3, OpNode::IntegrateSink),
             ],
-            vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE), (2, 3, SLOT_IN)],
+            vec![(0, 2, SLOT_IN), (1, 2, SLOT_B), (2, 3, SLOT_IN)],
         ),
         "bounded view: union input is not an inner delta/trace join",
     );
@@ -137,8 +137,8 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
     // no trace integrates `J_a`'s own delta port.
     rejected(
         equi_join(|_, edges| {
-            edges.retain(|&(s, d, p)| !(s == 4 && d == 7 && p == SLOT_TRACE));
-            edges.push((5, 7, SLOT_TRACE));
+            edges.retain(|&(s, d, p)| !(s == 4 && d == 7 && p == SLOT_B));
+            edges.push((5, 7, SLOT_B));
         }),
         "bounded view: the join's trace port is not the other branch's delta integral",
     );
