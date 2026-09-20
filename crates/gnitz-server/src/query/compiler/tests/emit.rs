@@ -317,16 +317,18 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
         ],
         &[1, 2],
     );
-    assert!(plan(pk_last, pk_last, 1).is_ok(), "a 4-byte eq prefix leaves a range slot");
+    assert!(
+        plan(pk_last, pk_last, 1).is_ok(),
+        "a 4-byte eq prefix leaves a range slot"
+    );
 }
 
 /// The equi probe takes the same key-layout check the range probe does, including
 /// a same-stride pair whose OPK images differ by the sign flip.
 #[test]
 fn equi_join_pk_type_mismatches_are_rejected_at_compile_time() {
-    let plan = |delta_schema, trace_schema| {
-        plan_two_source_join(gnitz_wire::JoinKind::Equi, delta_schema, trace_schema)
-    };
+    let plan =
+        |delta_schema, trace_schema| plan_two_source_join(gnitz_wire::JoinKind::Equi, delta_schema, trace_schema);
     let signed = pk_payload_schema(&[type_code::I64]);
     let unsigned = pk_payload_schema(&[type_code::U64]);
     let narrow = pk_payload_schema(&[type_code::U32]);

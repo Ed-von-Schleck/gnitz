@@ -24,8 +24,20 @@ fn equi_join(mutate: impl FnOnce(&mut HashMap<NodeId, OpNode>, &mut Vec<(NodeId,
         (3, m()),
         (4, OpNode::IntegrateTrace),
         (5, OpNode::IntegrateTrace),
-        (6, OpNode::Join { kind: JoinKind::Equi, delta_is_right: false }),
-        (7, OpNode::Join { kind: JoinKind::Equi, delta_is_right: true }),
+        (
+            6,
+            OpNode::Join {
+                kind: JoinKind::Equi,
+                delta_is_right: false,
+            },
+        ),
+        (
+            7,
+            OpNode::Join {
+                kind: JoinKind::Equi,
+                delta_is_right: true,
+            },
+        ),
         (8, OpNode::Union),
         (9, OpNode::Filter(dummy_expr_blob())),
         (10, m()),
