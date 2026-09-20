@@ -14,11 +14,10 @@
 mod ddl;
 
 use std::cell::{Cell, RefCell};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gnitz_store::storage::batch_pool::PooledSendBuf;
 use rustc_hash::FxHashMap;
 
 use super::guard_panic;
@@ -367,11 +366,6 @@ impl ServerExecutor {
     /// global live-connection cap.
     pub fn run(dispatcher: Rc<MasterDispatcher>, server_fd: i32, tls: Option<TlsListener>, lsn_seed: u64) -> i32 {
         let reactor = Rc::clone(dispatcher.reactor());
-        reactor.attach_listener(server_fd);
-        if let Some(tl) = &tls {
-            reactor.attach_listener(tl.fd());
-        }
-        let accept_ctx = AcceptCtx { unix_fd: server_fd, tls };
 
         // Every zone LSN this boot allocates exceeds `lsn_seed`; the boot
         // recovery that computes it states what it dominates.
@@ -400,7 +394,10 @@ impl ServerExecutor {
         install_shutdown_signal_handlers();
 
         reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
-        reactor.spawn(accept_loop(Rc::clone(&shared), accept_ctx));
+        reactor.spawn(unix_accept_loop(Rc::clone(&shared), server_fd));
+        if let Some(tl) = tls {
+            reactor.spawn(tls_accept_loop(Rc::clone(&shared), tl));
+        }
         reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
         reactor.spawn(watchdog(Rc::clone(&shared)));
 
@@ -419,41 +416,28 @@ impl ServerExecutor {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-/// Accept-routing inputs: which listener fd is which, and the TLS listener.
-/// Carried explicitly, because the reactor records no listener fd — an accept
-/// reports which listener it came from through the udata round-trip, and this
-/// maps that back to a role.
-struct AcceptCtx {
-    unix_fd: i32,
-    tls: Option<TlsListener>,
+async fn unix_accept_loop(shared: Rc<Shared>, listen_fd: i32) {
+    let mut accepted = shared.disp().reactor().attach_listener(listen_fd);
+    loop {
+        let fd = accepted.recv().await;
+        let peer = Peer::unix(fd, Rc::clone(shared.disp().reactor()));
+        let s = Rc::clone(&shared);
+        // No pre-auth deadline: access here is gated by the socket path's
+        // filesystem permissions, and whoever can open it already has full
+        // DDL/DML authority, so squatting gains nothing.
+        shared.disp().reactor().spawn(connection_loop(peer, s, None));
+    }
 }
 
-async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
+async fn tls_accept_loop(shared: Rc<Shared>, tl: TlsListener) {
+    let mut accepted = shared.disp().reactor().attach_listener(tl.fd());
     loop {
-        let (raw_fd, listener) = shared.disp().reactor().accept().await;
-        if raw_fd < 0 {
-            continue;
-        }
-        // SAFETY: a freshly-accepted fd, owned by nothing else. Every early
-        // `continue` below closes it by dropping this.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        if listener == ctx.unix_fd {
-            let peer = Peer::unix(fd, Rc::clone(shared.disp().reactor()));
-            let s = Rc::clone(&shared);
-            // No pre-auth deadline: access here is gated by the socket path's
-            // filesystem permissions, and whoever can open it already has full
-            // DDL/DML authority, so squatting gains nothing.
-            shared.disp().reactor().spawn(connection_loop(peer, s, None));
-            continue;
-        }
-        let Some(tl) = ctx.tls.as_ref().filter(|tl| listener == tl.fd()) else {
-            gnitz_warn!("accept from unknown listener fd={listener}; closing conn fd={raw_fd}");
-            continue;
-        };
+        let fd = accepted.recv().await;
+        let raw = fd.as_raw_fd();
         // Global connection cap: close the freshly-accepted fd before any TLS
         // work when the live count is at the cap.
         let Some(guard) = tl.admit() else {
-            gnitz_warn!("tls: connection cap {} reached; closing fd={raw_fd}", tl.max_conns);
+            gnitz_warn!("tls: connection cap {} reached; closing fd={raw}", tl.max_conns);
             continue;
         };
         let conn = match TlsShared::start(
@@ -466,7 +450,7 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
             Err(e) => {
                 // `fd` and `guard` were moved into `start`; on the error path they
                 // already dropped (closing and decrementing) inside its frame.
-                gnitz_warn!("tls: session init failed for fd={raw_fd}: {e}");
+                gnitz_warn!("tls: session init failed for fd={raw}: {e}");
                 continue;
             }
         };
@@ -478,13 +462,6 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
         let deadline = Instant::now() + tl.pre_auth_window;
         shared.disp().reactor().spawn(connection_loop(peer, s, Some(deadline)));
     }
-}
-
-enum HelloOutcome {
-    /// Connection accepted.
-    Pass,
-    /// Caller must close the connection.
-    Reject,
 }
 
 /// `first_frame_deadline` bounds the pre-auth window: `Some` where the transport
@@ -516,7 +493,7 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
         None => peer.recv().await,
     };
     let Some(buf) = first else { return };
-    if let HelloOutcome::Reject = run_hello_handshake(peer, shared, buf.as_slice()).await {
+    if !run_hello_handshake(peer, shared, buf.as_slice()) {
         return;
     }
 
@@ -538,19 +515,17 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
     }
 }
 
-/// Validate a HELLO frame, elevate the connection's payload limit, and
-/// reply with the symmetric ACK. See `ClientConn::set_max_payload_len` for
-/// why the limit must be raised before any `.await` here.
-async fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> HelloOutcome {
+/// Validate a HELLO frame, elevate the connection's payload limit, and cork the
+/// symmetric ACK. `false` = refused.
+fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> bool {
     // `decode_hello_payload` validates the 8-byte length; the magic
     // check below is defence-in-depth on top of the pre-handshake recv
     // ceiling that already excludes non-HELLO first frames.
-    let hello = match gnitz_wire::decode_hello_payload(data) {
-        Ok(h) => h,
-        Err(_) => return HelloOutcome::Reject,
+    let Ok(hello) = gnitz_wire::decode_hello_payload(data) else {
+        return false;
     };
     if hello.magic != gnitz_wire::HELLO_MAGIC {
-        return HelloOutcome::Reject;
+        return false;
     }
 
     let server_version = gnitz_wire::WAL_FORMAT_VERSION as u16;
@@ -560,18 +535,18 @@ async fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> H
             hello.version, server_version,
         );
         send_error(peer, 0, msg.as_bytes());
-        return HelloOutcome::Reject;
+        return false;
     }
 
     peer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
 
-    // Seed the client's OCC basis with the durability watermark now. This runs
-    // before the connection message loop, so `published()` is `≤` any later read
-    // the client issues — a sound (conservative) basis.
-    if peer.send_hello_ack(shared.lsn_alloc.published()).await.is_err() {
-        return HelloOutcome::Reject;
-    }
-    HelloOutcome::Pass
+    // The watermark seeding the client's OCC basis is read before the message
+    // loop, so it is `≤` any later read the client issues — a sound basis.
+    peer.cork(&gnitz_wire::encode_hello_ack(
+        ipc::FRAME_CAP as u32,
+        shared.lsn_alloc.published(),
+    ));
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -908,16 +883,11 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
         // A plain read guard, not `read_lock`: a resolve answers catalog shape,
         // and a view tick moves a view's rows, never its shape — so the tick
-        // drain `read_lock` waits for buys nothing here. The guard scope ends at
-        // the reply buffer, so the lock is never held across the send.
+        // drain `read_lock` waits for buys nothing here.
         ClientVerb::Resolve => {
-            let reply = {
-                let _g = shared.catalog_rwlock.read().await;
-                build_resolve_reply(shared, target_id, &ctrl.blob)
-            };
-            match reply {
-                Ok(buf) => peer.send_or_close(buf).await,
-                Err(msg) => send_error(peer, target_id, msg.as_bytes()),
+            let _g = shared.catalog_rwlock.read().await;
+            if let Err(msg) = build_resolve_reply(shared, peer, target_id, &ctrl.blob) {
+                send_error(peer, target_id, msg.as_bytes());
             }
         }
 
@@ -1186,7 +1156,7 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
         ..Default::default()
     };
     let result = disp.fan_out_scan(peer, sal_kind, template).await;
-    finish_scan_fanout(peer, target_id, lsn, result).await;
+    finish_scan_fanout(peer, target_id, lsn, result);
 }
 
 /// The two success shapes of `push_txn_body`. `Committed` carries the durable
@@ -1480,13 +1450,14 @@ fn resolve_request_target(
 /// carrying what the block cannot (kind, placement, foreign keys, secondary
 /// indexes). Served entirely from the typed caches the master already
 /// maintains; it writes no SAL group and wakes no worker.
-fn build_resolve_reply(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) -> Result<PooledSendBuf, String> {
+fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_blob: &[u8]) -> Result<(), String> {
     let Some((tid, kind, class)) = resolve_request_target(shared, target_id, name_blob)? else {
         // Relation absent is a successful answer, not an error: the client owes a
         // different wording per entry point ("Table …", "Table or view …",
         // `Ok(None)`), so it renders it itself. An empty descriptor blob says so,
         // and `target_id = 0` names no relation.
-        return Ok(encode_response_buffer(ipc::WireMsg::default()));
+        send_msg(peer, ipc::WireMsg::default());
+        return Ok(());
     };
 
     // Only an ingestion point reports its placement. A view and a system family are
@@ -1530,16 +1501,20 @@ fn build_resolve_reply(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) ->
     let (Some(schema_block), server_version) = shared.cat().negotiated_schema_block(tid, 0) else {
         return Err(format!("table {tid} not found"));
     };
-    Ok(encode_response_buffer(ipc::WireMsg {
-        target_id: tid as u64,
-        flags: WireFlags {
-            schema_version: server_version,
+    send_msg(
+        peer,
+        ipc::WireMsg {
+            target_id: tid as u64,
+            flags: WireFlags {
+                schema_version: server_version,
+                ..Default::default()
+            },
+            schema_block: Some(schema_block.as_slice()),
+            blob: &blob,
             ..Default::default()
         },
-        schema_block: Some(schema_block.as_slice()),
-        blob: &blob,
-        ..Default::default()
-    }))
+    );
+    Ok(())
 }
 
 /// True when no un-ticked commit can reach `target`: every source feeding it —
@@ -1643,17 +1618,12 @@ fn terminal_scan_msg(target_id: i64, arg0: u64, arg1: u64) -> ipc::WireMsg<'stat
     }
 }
 
-/// Finish one scan-shaped fan-out: `Ok(true)` → the terminal frame (stamped
-/// with the pre-dispatch `lsn`), `Ok(false)` → the forward already failed
-/// (close the peer), `Err` → a fault frame carrying the worker's own status.
-/// Shared by the plain read and the ScanSpec handler.
-async fn finish_scan_fanout(peer: &Peer, target_id: i64, lsn: u64, result: Result<bool, WireFault>) {
+/// Finish one scan-shaped fan-out: the terminal frame stamped with the
+/// pre-dispatch `lsn`, or the worker's own fault.
+fn finish_scan_fanout(peer: &Peer, target_id: i64, lsn: u64, result: Result<(), WireFault>) {
     match result {
         // Corked, not sent: the terminal joins whatever the forward corked.
-        Ok(true) => {
-            send_msg(peer, terminal_scan_msg(target_id, lsn, 0));
-        }
-        Ok(false) => peer.close(),
+        Ok(()) => send_msg(peer, terminal_scan_msg(target_id, lsn, 0)),
         Err(f) => send_fault(peer, target_id, &f),
     }
 }
@@ -1676,7 +1646,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob
         .disp()
         .fan_out_scan(peer, SalMessageKind::ScanSpec, template)
         .await;
-    finish_scan_fanout(peer, target_id, lsn, result).await;
+    finish_scan_fanout(peer, target_id, lsn, result);
 }
 
 /// DELTA_POLL: advance N mirrored views in one request, one catalog lock and —
@@ -1688,13 +1658,9 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob
 /// Never drains pending ticks: a delta read reports what has happened, and a
 /// round not yet ticked is one the next poll carries.
 async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
-    match delta_poll_body(shared, peer, ctrl, data).await {
-        // Every view's train and terminal is already out.
-        Ok(true) => {}
-        // Client disconnected mid-stream: leases dropped in the body.
-        Ok(false) => peer.close(),
-        // A frame-shape rejection, before any group was written.
-        Err(f) => send_fault(peer, 0, &f),
+    // A frame-shape rejection, before any group was written.
+    if let Err(f) = delta_poll_body(shared, peer, ctrl, data).await {
+        send_fault(peer, 0, &f);
     }
 }
 
@@ -1708,16 +1674,14 @@ enum PollPosition {
     Moved,
 }
 
-/// Body of [`handle_delta_poll`]. `Ok(true)` once every view's train and
-/// terminal have been sent; `Ok(false)` on client disconnect; `Err` on a
-/// frame-shape rejection. A per-view failure is not an `Err` — it goes out as
-/// that view's own fault frame and the rest of the poll continues.
+/// Body of [`handle_delta_poll`]. A per-view failure is not an `Err` — it goes out
+/// as that view's own fault frame and the rest of the poll continues.
 async fn delta_poll_body(
     shared: &Rc<Shared>,
     peer: &Peer,
     ctrl: &DecodedControl,
     data: &[u8],
-) -> Result<bool, WireFault> {
+) -> Result<(), WireFault> {
     let views = gnitz_wire::txn_frame::decode_delta_poll(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
     validate_item_ids("DELTA_POLL", &views, |v| v.view_id)?;
 
@@ -1784,8 +1748,7 @@ async fn delta_poll_body(
             PollPosition::Moved => {
                 let lease = dispatches.next().expect("one dispatch per moved view");
                 match forward_scan(peer, &lease).await {
-                    Ok(true) => send_msg(peer, terminal(dispatch_round)),
-                    Ok(false) => return Ok(false),
+                    Ok(()) => send_msg(peer, terminal(dispatch_round)),
                     Err(fault) => send_fault(peer, tid, &fault),
                 }
             }
@@ -1793,10 +1756,10 @@ async fn delta_poll_body(
         // Carry no more than the budget into the next view, and learn here
         // rather than at the end if the client is gone.
         if peer.flush_if_full().await.is_err() {
-            return Ok(false);
+            return Ok(());
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Whether a delta read after `after_tick` already sits at the view's last round,
@@ -1832,29 +1795,22 @@ struct ScanMultiRelPlan {
 /// story: an atomic commit is either wholly before the cut (visible in every
 /// train) or wholly after (visible in none), never torn across the result set.
 async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
-    match scan_multi_body(shared, peer, ctrl, data).await {
-        // Phase 2 already streamed every train and terminal.
-        Ok(true) => {}
-        // Client disconnected mid-stream: leases dropped in the body, close the peer.
-        Ok(false) => peer.close(),
-        // Shape/tid rejection (before any group is written) or a worker fault
-        // mid-stream (leases already dropped in the body): one error frame. The
-        // client discards any partial results it read.
-        Err(f) => send_fault(peer, 0, &f),
+    // A shape/tid rejection before any group was written, or a worker fault
+    // mid-stream: one error frame either way.
+    if let Err(f) = scan_multi_body(shared, peer, ctrl, data).await {
+        send_fault(peer, 0, &f);
     }
 }
 
-/// Body of `handle_scan_multi`. `Ok(true)` once every relation's train and
-/// terminal have been sent; `Ok(false)` on client disconnect; `Err(msg)` on a
-/// shape/tid rejection or a mid-stream worker fault. Every scan's lease lives in
-/// the `dispatches` vec and drops on return, so any error/disconnect return
-/// removes every route and discards undrained frames at the ring boundary.
+/// Body of `handle_scan_multi`. Every scan's lease lives in the `dispatches` vec
+/// and drops on return, so an early return removes every route and discards
+/// undrained frames at the ring boundary.
 async fn scan_multi_body(
     shared: &Rc<Shared>,
     peer: &Peer,
     ctrl: &DecodedControl,
     data: &[u8],
-) -> Result<bool, WireFault> {
+) -> Result<(), WireFault> {
     // ── Phase 0: decode + frame-local shape rules ──────────────────────────
     // The authoritative run of the shared shape validator — a client may skip
     // its own. tid legality is Phase 1's, under the catalog lock.
@@ -1922,20 +1878,16 @@ async fn scan_multi_body(
         }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
-        match forward_scan(peer, d).await {
-            Ok(true) => {}
-            Ok(false) => return Ok(false),
-            Err(f) => return Err(f),
-        }
+        forward_scan(peer, d).await?;
         // Terminal frame for this relation (tid + the shared LSN).
         send_msg(peer, terminal_scan_msg(plan.tid, lsn, 0));
         // This relation's reply is complete: carry no more than the budget into
         // the next, and learn here rather than at the end if the client is gone.
         if peer.flush_if_full().await.is_err() {
-            return Ok(false);
+            return Ok(());
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 /// The master-local half of [`handle_read`]: a SCAN of a catalog family. The rows
@@ -1965,18 +1917,8 @@ async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, target_id: i64, cl
 // Wire-protocol response helpers
 // ---------------------------------------------------------------------------
 
-/// Frame one reply into a pooled send buffer. Callers build the [`ipc::WireMsg`]
-/// with the fields they actually set and leave the rest at `Default`.
-fn encode_response_buffer(msg: ipc::WireMsg<'_>) -> PooledSendBuf {
-    let mut inner = gnitz_store::storage::batch_pool::acquire_buf();
-    inner.reserve(8192);
-    encode_response_into(&mut inner, msg);
-    PooledSendBuf(inner)
-}
-
-/// Append `msg`'s framed bytes to `out`. The corking replies encode straight
-/// into the peer's accumulator through this, so a reply that will be batched
-/// never passes through a buffer of its own.
+/// Append `msg`'s framed bytes to `out`, so a corked reply never passes through a
+/// buffer of its own.
 fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
     let sz = msg.size();
@@ -1997,10 +1939,8 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
 }
 
 /// Cork `msg` for the client — and the one place a master-authored reply meets
-/// [`ipc::FRAME_CAP`]. The master-local system-family scan and seek have no other
-/// bound; the builders that encode without coming through here are structurally
-/// bounded (a schema block by `MAX_COLS`, prelim frames by carrying no data, a
-/// resolve descriptor by the relation's FK and index counts).
+/// [`ipc::FRAME_CAP`]: the master-local system-family scan and seek have no other
+/// bound. The one reply not framed here is the fixed-size HELLO ACK.
 ///
 /// Corking rather than sending is what lets a pipelined run of these leave
 /// together, and is sound because every reply through here is the last thing its

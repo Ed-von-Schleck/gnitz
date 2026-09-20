@@ -495,14 +495,13 @@ impl MasterDispatcher {
         })
     }
 
-    /// Send a scan-shaped read of `kind` and forward the replies to `peer`;
-    /// `Ok(false)` on a client disconnect.
+    /// Send a scan-shaped read of `kind` and forward the replies to `peer`.
     pub(crate) async fn fan_out_scan(
         &self,
         peer: &Peer,
         kind: SalMessageKind,
         template: wire::WireMsg<'_>,
-    ) -> Result<bool, WireFault> {
+    ) -> Result<(), WireFault> {
         forward_scan(
             peer,
             &self.scan(DirectGroup { template, ..DirectGroup::new(kind) }).await?,

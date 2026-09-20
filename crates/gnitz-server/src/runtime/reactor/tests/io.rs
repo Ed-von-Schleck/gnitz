@@ -17,7 +17,7 @@ fn capped_reactor(cap: usize) -> Reactor {
 fn registered(r: &Reactor, max_payload: Option<usize>) -> (Rc<ClientConn>, UnixStream) {
     let (local, partner) = UnixStream::pair().expect("socketpair");
     let conn = r.client_conn(OwnedFd::from(local));
-    r.register_conn(&conn, None);
+    r.register_conn(&conn, Box::new(Plain));
     if let Some(limit) = max_payload {
         conn.set_max_payload_len(limit);
     }

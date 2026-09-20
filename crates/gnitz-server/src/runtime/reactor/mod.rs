@@ -33,7 +33,7 @@ mod test_support;
 mod uring;
 mod wake_queue;
 
-pub(crate) use conn::{shutdown, PeerGone, SendBody};
+pub(crate) use conn::{PeerGone, SendBody};
 
 pub(crate) use futures::{worker_error, Lease};
 use futures::{OpFuture, Route, RouteKey, TimerFuture};
@@ -43,7 +43,7 @@ use wake_queue::WakeQueue;
 
 #[cfg(test)]
 pub(crate) use io::InboundBudget;
-pub(crate) use io::{ClientConn, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
+pub(crate) use io::{ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
 pub use sync::{chan, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard};
 
 /// The ceilings and deadlines a reactor is built with, fixed for its life.
@@ -173,8 +173,9 @@ struct ReactorShared {
     inbound: Rc<io::InboundBudget>,
     /// The deadlines and ceilings this reactor was built with.
     limits: Limits,
-    /// Accepted `(conn_fd, listener_fd)` pairs not yet claimed.
-    accepts: RefCell<WakeQueue<(i32, i32)>>,
+    /// Every attached listener, indexed by the id its accept SQEs carry. See
+    /// [`conn::Listener`].
+    listeners: RefCell<Vec<conn::Listener>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// Exchange frames, as `(worker, frame)`, awaiting their round's driver. The
@@ -223,7 +224,7 @@ impl Reactor {
             conns: RefCell::new(FxHashMap::default()),
             inbound: Rc::new(io::InboundBudget::new(limits.inbound_cap)),
             limits,
-            accepts: RefCell::new(WakeQueue::default()),
+            listeners: RefCell::new(Vec::new()),
             shutdown: Cell::new(false),
             exchanges: RefCell::new(WakeQueue::default()),
             w2m,

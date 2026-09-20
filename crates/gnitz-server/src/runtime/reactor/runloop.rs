@@ -163,7 +163,7 @@ impl Reactor {
                 self.inner.w2m.clear_waitv();
             }
             KIND_OP => self.inner.ops.complete(id, cqe.res),
-            KIND_ACCEPT => self.handle_accept_cqe(id as i32, cqe.res, cqe.flags),
+            KIND_ACCEPT => self.handle_accept_cqe(id as usize, cqe.res, cqe.flags),
             KIND_RECV => self.handle_recv_cqe(id as i32, cqe.res),
             _ => gnitz_error!(
                 "reactor: CQE with unknown kind={} (user_data={:#x})",

@@ -5,8 +5,9 @@ use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
-use crate::runtime::reactor::{ClientConn, PeerGone, Reactor, RecvBuf, SendBody};
+use crate::runtime::reactor::{ClientConn, PeerGone, Plain, Reactor, RecvBuf, SendBody};
 use crate::runtime::tls::TlsShared;
+use crate::runtime::w2m::W2mSlot;
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 
 /// Ceiling on a concatenation of client-bound frames (coalesced scan heads, corked
@@ -14,8 +15,9 @@ use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 /// measures the trade.
 pub(crate) const COALESCE_MAX_BYTES: usize = 32 * 1024;
 
-/// Transport-neutral handle to one client connection. Owned by the
-/// connection task; handlers borrow it to send replies.
+/// Transport-neutral handle to one client connection. Owned by the connection
+/// task; handlers borrow it to send replies. A failed send closes the connection,
+/// so a `PeerGone` from any method means it is already closed.
 pub struct Peer {
     conn: Rc<ClientConn>,
     transport: Transport,
@@ -34,7 +36,7 @@ enum Transport {
 impl Peer {
     pub fn unix(fd: OwnedFd, reactor: Rc<Reactor>) -> Peer {
         let conn = reactor.client_conn(fd);
-        reactor.register_conn(&conn, None);
+        reactor.register_conn(&conn, Box::new(Plain));
         Peer {
             conn,
             transport: Transport::Unix(reactor),
@@ -107,64 +109,44 @@ impl Peer {
         self.send_raw(SendBody::Pooled(buf)).await
     }
 
-    /// Send one payload behind whatever is corked. It is corked — copied, releasing
-    /// a ring slot at once — when it fits beside bytes already corked, or is at most
-    /// half of [`COALESCE_MAX_BYTES`] so what follows can join it. Otherwise the cork
-    /// is flushed and the payload goes out alone: on AF_UNIX straight from its ring
-    /// slot, held until the send completes; the TLS arm copies it into rustls.
-    /// `Err`: the client is gone; a corked payload reports that at its flush.
-    pub async fn send(&self, body: impl Into<SendBody>) -> Result<(), PeerGone> {
-        let body = body.into();
-        let len = body.bytes().len();
+    /// Send one worker frame behind whatever is corked. Corking copies it, releasing
+    /// its ring slot at once; a frame too large to join the cork goes out alone,
+    /// straight from that slot on AF_UNIX. A corked frame reports a gone peer at its
+    /// flush, not here.
+    pub async fn send(&self, slot: W2mSlot) -> Result<(), PeerGone> {
+        let len = slot.frame_bytes().len();
         let corked = self.corked_len();
         if !(corked > 0 && corked + len <= COALESCE_MAX_BYTES) {
             self.flush_egress().await?;
             if len > COALESCE_MAX_BYTES / 2 {
-                return self.send_raw(body).await;
+                return self.send_raw(SendBody::Slot(slot)).await;
             }
         }
-        self.cork(body.bytes());
+        self.cork(slot.frame_bytes());
         Ok(())
     }
 
-    /// The transport send itself.
+    /// The transport send itself, and the one funnel every `PeerGone` comes through.
     async fn send_raw(&self, body: SendBody) -> Result<(), PeerGone> {
-        match &self.transport {
-            Transport::Unix(r) => r.send_owned(&self.conn, body).await.0,
-            Transport::Tls(t) => t.send_bytes(body.bytes()).await,
-        }
-    }
-
-    /// Send the OK HELLO ACK frame, seeding the client's OCC basis with
-    /// `published_lsn` (the durability watermark at connect). The ACK's contents
-    /// (status, advertised server frame limit) are protocol policy decided once
-    /// here, for every transport.
-    pub async fn send_hello_ack(&self, published_lsn: u64) -> Result<(), PeerGone> {
-        let ack = gnitz_wire::encode_hello_ack(crate::runtime::wire::FRAME_CAP as u32, published_lsn);
-        let mut buf = acquire_buf();
-        buf.extend_from_slice(&ack);
-        self.send(PooledSendBuf(buf)).await
-    }
-
-    /// Terminal reply send: close the connection on transport failure. Once
-    /// the reply is on the wire there is nothing left to do on the
-    /// connection, so a failed send simply schedules the close.
-    pub async fn send_or_close(&self, payload: impl Into<SendBody>) {
-        if self.send(payload).await.is_err() {
+        let r = match &self.transport {
+            Transport::Unix(r) => r.send_owned(&self.conn, body).await,
+            Transport::Tls(t) => t.send(body).await,
+        };
+        if r.is_err() {
             self.close();
         }
+        r
     }
 
     /// Elevate the per-connection inbound frame ceiling after HELLO.
-    /// Must run synchronously before any `.await` in the handshake task
-    /// (see [`ClientConn::set_max_payload_len`]).
     pub fn set_max_payload_len(&self, limit: usize) {
         self.conn.set_max_payload_len(limit);
     }
 
+    /// Idempotent on both transports.
     pub fn close(&self) {
         match &self.transport {
-            Transport::Unix(r) => r.close_conn(&self.conn),
+            Transport::Unix(_) => self.conn.close(),
             Transport::Tls(t) => t.close(),
         }
     }

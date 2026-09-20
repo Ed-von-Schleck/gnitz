@@ -34,9 +34,9 @@ pub(super) fn resolve_inbound_cap() -> usize {
 /// Accounted memory weight of one inbound payload buffer of `len` bytes.
 #[inline]
 fn frame_weight(len: usize) -> usize {
-    // Floor: a 1-byte payload really costs ~48 B (malloc's 32 B min chunk +
-    // 16 B RecvBuf in the VecDeque); without the floor a tiny-frame flood
-    // bypasses the byte cap ~48x. Keeps accounted bytes ≥ real RSS.
+    // Floor: a 1-byte payload really costs tens of bytes — the allocator's
+    // minimum chunk plus the `RecvBuf` beside it — so without a floor a
+    // tiny-frame flood slips far under the byte cap. Keeps accounted bytes ≥ RSS.
     len.max(64)
 }
 
@@ -60,68 +60,53 @@ impl InboundBudget {
         self.held.get()
     }
 
-    /// The ceiling `held` may not be pushed past.
-    pub(super) fn cap(&self) -> usize {
-        self.cap
-    }
-
-    /// Charge and allocate one inbound frame payload buffer. Charges
-    /// `frame_weight(plen)` at header-parse time, *before* any payload byte
-    /// arrives, so a declared-but-dribbled frame can never accumulate
-    /// uncounted bytes; `None` = cap breach (refused before malloc, so the
-    /// budget never overshoots) or malloc failure.
+    /// Charge and allocate one frame payload buffer. `None` = the charge would
+    /// breach the cap, or the allocation failed; neither charges anything.
     fn alloc(self: &Rc<Self>, plen: usize) -> Option<RecvBuf> {
         if self.held.get() + frame_weight(plen) > self.cap {
-            return None; // refuse before malloc — no overshoot
-        }
-        // SAFETY: plen > 0 (zero-length frames are the close sentinel,
-        // rejected before this call); null is checked below.
-        let pbuf = unsafe { libc::malloc(plen) as *mut u8 };
-        if pbuf.is_null() {
             return None;
         }
-        // RecvBuf::new charges frame_weight(plen); its Drop refunds.
-        Some(RecvBuf::new(pbuf, plen, Rc::clone(self)))
+        let mut v: Vec<MaybeUninit<u8>> = Vec::new();
+        v.try_reserve_exact(plen).ok()?;
+        // SAFETY: `plen` elements are reserved, and `MaybeUninit` needs no init.
+        unsafe { v.set_len(plen) };
+        Some(RecvBuf::new(v.into_boxed_slice(), Rc::clone(self)))
     }
 }
 
-/// One complete inbound frame payload, owned. Malloc'd when its header is
-/// parsed and freed on drop on every exit path, including task cancellation at
-/// an `.await` point. `ptr` is never null and `len` never 0: a failed malloc or
-/// a zero-length frame closes the connection before a message is queued.
-///
-/// Its `frame_weight` is charged to the global [`InboundBudget`] at
-/// construction and refunded on drop, so the OOM guard's accounting is tied to
-/// buffer lifetime — every release path (consume, connection reap, task-cancel)
-/// reconciles with no manual decrement to forget.
+/// One complete inbound frame payload, owned. Its `frame_weight` is charged to
+/// the global [`InboundBudget`] at construction and refunded on drop, so the
+/// charge lasts exactly as long as the buffer.
 pub struct RecvBuf {
-    pub(super) ptr: *mut u8,
-    pub(super) len: usize,
+    buf: Box<[MaybeUninit<u8>]>,
     /// `Rc` rather than a raw pointer so the budget provably outlives every
     /// buffer regardless of reactor-teardown field-drop order.
     budget: Rc<InboundBudget>,
 }
 
 impl RecvBuf {
-    /// Take ownership of a freshly-malloc'd `len`-byte payload buffer and charge
-    /// its `frame_weight` to `budget`. The matching refund is in `Drop`.
-    fn new(ptr: *mut u8, len: usize, budget: Rc<InboundBudget>) -> Self {
-        budget.held.set(budget.held.get() + frame_weight(len));
-        RecvBuf { ptr, len, budget }
+    fn new(buf: Box<[MaybeUninit<u8>]>, budget: Rc<InboundBudget>) -> Self {
+        budget.held.set(budget.held.get() + frame_weight(buf.len()));
+        RecvBuf { buf, budget }
+    }
+
+    /// Whether the unfilled `pos..` tail would take a whole `carry_len` read on its
+    /// own, and so is read into directly instead of through the carry a carry at a time.
+    fn takes_a_whole_read(&self, pos: usize, carry_len: usize) -> bool {
+        self.buf.len() - pos >= carry_len
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: ptr/len describe a completed reactor recv (non-null by the
-        // struct invariant); the buffer is exclusively owned until drop.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        // SAFETY: the deframer queues a frame only once every byte of `buf` has
+        // been written.
+        unsafe { self.buf.assume_init_ref() }
     }
 }
 
 impl Drop for RecvBuf {
     fn drop(&mut self) {
         let held = &self.budget.held;
-        held.set(held.get().saturating_sub(frame_weight(self.len)));
-        unsafe { libc::free(self.ptr as *mut libc::c_void) }
+        held.set(held.get().saturating_sub(frame_weight(self.buf.len())));
     }
 }
 
@@ -142,18 +127,6 @@ pub(crate) enum RecvEnd {
     CapBreach { want: usize },
     /// The bytes did not parse as this transport's framing.
     Protocol,
-}
-
-impl RecvEnd {
-    pub(crate) const fn as_str(&self) -> &'static str {
-        match self {
-            RecvEnd::PeerClosed => "peer closed",
-            RecvEnd::Socket => "socket error",
-            RecvEnd::Oversize => "oversize frame",
-            RecvEnd::CapBreach { .. } => "inbound cap breach",
-            RecvEnd::Protocol => "protocol error",
-        }
-    }
 }
 
 /// The inbound half of one client connection: the deframer, the frames it has
@@ -200,21 +173,18 @@ impl RecvQueue {
         }
     }
 
-    /// The window the next bytes must land in. A payload whose unfilled tail
-    /// would take a whole read on its own is read into directly, so a large frame
-    /// is not copied through the carry a carry at a time.
+    /// The window the next bytes must land in.
     pub(crate) fn remaining(&mut self) -> (*mut u8, u32) {
-        if let Some((buf, pos)) = &self.pending {
-            if buf.len - *pos >= self.carry.len() {
-                // SAFETY: `pos <= buf.len`, and the buffer is exclusively ours.
-                return (unsafe { buf.ptr.add(*pos) }, (buf.len - *pos) as u32);
+        let carry_len = self.carry.len();
+        if let Some((buf, pos)) = &mut self.pending {
+            if buf.takes_a_whole_read(*pos, carry_len) {
+                let tail = &mut buf.buf[*pos..];
+                return (tail.as_mut_ptr().cast::<u8>(), tail.len() as u32);
             }
         }
         // `filled` is at most a split prefix, so this is never empty.
-        (
-            unsafe { self.carry.as_mut_ptr().add(self.filled).cast::<u8>() },
-            (self.carry.len() - self.filled) as u32,
-        )
+        let tail = &mut self.carry[self.filled..];
+        (tail.as_mut_ptr().cast::<u8>(), tail.len() as u32)
     }
 
     pub(crate) fn set_max_payload_len(&mut self, limit: usize) {
@@ -240,7 +210,7 @@ impl RecvQueue {
         } = self;
         // Where the bytes landed — the same test `remaining` chose the window by.
         match pending {
-            Some((buf, pos)) if buf.len - *pos >= carry.len() => *pos += n,
+            Some((buf, pos)) if buf.takes_a_whole_read(*pos, carry.len()) => *pos += n,
             _ => *filled += n,
         }
         // How much of the carry the parse has consumed.
@@ -248,19 +218,14 @@ impl RecvQueue {
         // SAFETY: `filled` counts bytes a completed recv wrote into the carry.
         let init: &[u8] = unsafe { carry[..*filled].assume_init_ref() };
         loop {
-            if let Some((buf, mut pos)) = pending.take() {
+            if let Some((mut buf, mut pos)) = pending.take() {
                 // Whatever the read carried past this frame's length prefix; a
                 // direct read landed the rest in `buf` already.
-                let take = (buf.len - pos).min(*filled - cur);
-                // SAFETY: `take` is bounded by both the carry's unconsumed span
-                // and the payload's unfilled tail; the two allocations are
-                // distinct.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(init.as_ptr().add(cur), buf.ptr.add(pos), take);
-                }
+                let take = (buf.buf.len() - pos).min(*filled - cur);
+                buf.buf[pos..pos + take].write_copy_of_slice(&init[cur..cur + take]);
                 pos += take;
                 cur += take;
-                if pos < buf.len {
+                if pos < buf.buf.len() {
                     *pending = Some((buf, pos));
                     break;
                 }
@@ -345,8 +310,21 @@ impl ClientConn {
         }
     }
 
-    pub(crate) fn fd(&self) -> i32 {
+    pub(super) fn fd(&self) -> i32 {
         self.fd.as_raw_fd()
+    }
+
+    /// `shutdown(SHUT_RDWR)`: errors out a pending recv or send on the socket, which
+    /// `close` would not. Never closes the fd; a peer already gone is not an error.
+    pub(crate) fn shutdown(&self) {
+        let _ = gnitz_foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(self.fd(), libc::SHUT_RDWR) });
+    }
+
+    /// End the recv side now and shut the socket down, so an armed recv completes
+    /// even for a client that never sends again. Idempotent.
+    pub(crate) fn close(&self) {
+        self.q.borrow_mut().close();
+        self.shutdown();
     }
 
     /// Next frame, or `None` once the recv side is closed and drained.
@@ -360,23 +338,31 @@ impl ClientConn {
         self.q.borrow_mut().try_recv()
     }
 
-    /// Must run before the caller's next `.await`: the recv re-arms as soon as the
-    /// current frame is deframed, and a frame arriving before the raise is refused
-    /// at the old ceiling.
+    /// Raise the ceiling on incoming frame payloads to the HELLO-negotiated limit.
     pub(crate) fn set_max_payload_len(&self, limit: usize) {
         self.q.borrow_mut().set_max_payload_len(limit);
     }
 }
 
-/// What stands between a socket and its `RecvQueue` when the socket's bytes are
-/// not the frames themselves.
+/// What stands between a socket and its `RecvQueue`.
 pub(crate) trait RecvFilter {
     /// Where the next socket bytes land; valid until the recv completes.
-    fn window(&mut self) -> (*mut u8, u32);
+    fn window(&mut self, q: &mut RecvQueue) -> (*mut u8, u32);
     /// `n` bytes landed in the window: queue the frames they complete.
     fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd>;
-    /// The recv side ended.
-    fn on_recv_closed(&mut self);
+}
+
+/// A socket whose bytes are the frames themselves.
+pub(crate) struct Plain;
+
+impl RecvFilter for Plain {
+    fn window(&mut self, q: &mut RecvQueue) -> (*mut u8, u32) {
+        q.remaining()
+    }
+
+    fn ingest(&mut self, n: usize, q: &mut RecvQueue) -> Result<(), RecvEnd> {
+        q.deliver(n)
+    }
 }
 
 #[cfg(test)]

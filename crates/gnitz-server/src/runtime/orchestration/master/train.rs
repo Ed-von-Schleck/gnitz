@@ -79,18 +79,18 @@ pub(super) async fn drain_index_scan(
 }
 
 /// Forward every reply train of `lease` to `peer` in reply order, skipping frames
-/// that carry nothing the client reads. `Ok(false)` on client disconnect; `Err` on
-/// the first worker fault, leaving the rest undrained.
-pub(crate) async fn forward_scan(peer: &Peer, lease: &Lease) -> Result<bool, WireFault> {
+/// that carry nothing the client reads. Stops at the first failed send, which
+/// closes the peer; `Err` on the first worker fault, leaving the rest undrained.
+pub(crate) async fn forward_scan(peer: &Peer, lease: &Lease) -> Result<(), WireFault> {
     for w in lease.workers() {
         let mut train = Train::new(lease, w, "scan");
         while let Some((slot, ctrl)) = train.next().await? {
             if (ctrl.data.is_some() || ctrl.schema.is_some()) && peer.send(slot).await.is_err() {
-                return Ok(false);
+                return Ok(());
             }
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 
 use crate::runtime::reactor::{
-    chan, shutdown, AsyncMutex, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
+    chan, AsyncMutex, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
 };
 
 /// Size of the ciphertext window each recv lands in.
@@ -150,7 +150,7 @@ impl TlsShared {
             tls: Rc::clone(&tls),
             cipher: Box::new_uninit_slice(CIPHER_WINDOW_BYTES),
         };
-        tls.reactor.register_conn(&tls.conn, Some(Box::new(ingress)));
+        tls.reactor.register_conn(&tls.conn, Box::new(ingress));
         tls.reactor.spawn(flusher(Rc::clone(&tls), flush_rx));
         Ok(tls)
     }
@@ -174,29 +174,35 @@ impl TlsShared {
                 let _ = sess.write_tls(&mut out.0);
             }
         }
-        self.reactor.send_owned(&self.conn, SendBody::from(out)).await.0
+        self.reactor.send_owned(&self.conn, SendBody::Pooled(out)).await
     }
 
-    /// Encrypt and send `bytes` under one `send_mutex` hold; rustls sizes the chunks.
-    pub(crate) async fn send_bytes(&self, bytes: &[u8]) -> Result<(), PeerGone> {
+    /// Encrypt and send `body` under one `send_mutex` hold; rustls sizes the chunks.
+    pub(crate) async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
         let send = self.send_mutex.lock().await;
+        let len = body.bytes().len();
         let mut off = 0;
-        while off < bytes.len() {
+        while off < len {
             {
                 let mut sess = self.state.borrow_mut();
                 if self.closed.get() {
                     return Err(PeerGone);
                 }
-                match sess.writer().write(&bytes[off..]) {
+                match sess.writer().write(&body.bytes()[off..]) {
                     Ok(n) if n > 0 => off += n,
                     // rustls short-writes only on a full outgoing buffer, which the
                     // previous turn's flush emptied: a zero here is a wedged session.
                     _ => return Err(PeerGone),
                 }
             }
+            if off == len {
+                break;
+            }
             self.flush_records(&send).await?;
         }
-        Ok(())
+        // rustls holds every byte now: release the body — a W2M slot — before the send.
+        drop(body);
+        self.flush_records(&send).await
     }
 
     /// Sync and idempotent: the first call queues a close_notify and wakes the flusher.
@@ -218,7 +224,7 @@ struct TlsIngress {
 }
 
 impl RecvFilter for TlsIngress {
-    fn window(&mut self) -> (*mut u8, u32) {
+    fn window(&mut self, _q: &mut RecvQueue) -> (*mut u8, u32) {
         (self.cipher.as_mut_ptr().cast::<u8>(), self.cipher.len() as u32)
     }
 
@@ -235,11 +241,13 @@ impl RecvFilter for TlsIngress {
         }
         result
     }
+}
 
-    fn on_recv_closed(&mut self) {
-        // Half-close so a writer parked on a full sndbuf errors out and releases
-        // `send_mutex`; without it teardown could wedge behind a stalled sender.
-        shutdown(self.tls.conn.fd());
+impl Drop for TlsIngress {
+    fn drop(&mut self) {
+        // Shut the socket down so a writer parked on a full sndbuf errors out and
+        // releases `send_mutex`, rather than wedging teardown behind it.
+        self.tls.conn.shutdown();
         self.tls.closed.set(true);
         self.tls.notify_flusher();
     }
@@ -256,7 +264,7 @@ async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
 
         // Whatever was queued is out, including a close_notify: finish the socket.
         if conn.closed.get() {
-            shutdown(conn.conn.fd());
+            conn.conn.shutdown();
             return;
         }
         // The queue is a flag, not a stream: park on the next notification, then

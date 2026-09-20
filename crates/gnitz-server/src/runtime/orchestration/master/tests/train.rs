@@ -288,8 +288,7 @@ fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
     fx.route();
 
     let before = fx.receiver.release_cursor(0);
-    let drained = poll_once(forward_scan(&fx.peer, &fx.lease)).expect("healthy train");
-    assert!(drained, "the train drained without a client disconnect");
+    poll_once(forward_scan(&fx.peer, &fx.lease)).expect("healthy train");
     assert!(
         fx.receiver.release_cursor(0) > before,
         "the dropped slot was released at the ring"
@@ -329,7 +328,7 @@ fn forward_scan_coalesces_single_frame_heads() {
 
     let done = try_poll_once(forward_scan(&fx.peer, &fx.lease));
     assert!(
-        matches!(done, Some(Ok(true))),
+        matches!(done, Some(Ok(()))),
         "corking sends nothing, so the forward finishes in one poll"
     );
     for (w, &was) in before.iter().enumerate() {

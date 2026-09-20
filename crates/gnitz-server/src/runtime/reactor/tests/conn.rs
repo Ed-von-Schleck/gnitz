@@ -13,7 +13,7 @@ use gnitz_store::storage::batch_pool::PooledSendBuf;
 
 /// One whole-payload client send, with nothing racing it.
 async fn owned_send(r: &Reactor, conn: &ClientConn, payload: Vec<u8>) -> Result<(), PeerGone> {
-    r.send_owned(conn, SendBody::Pooled(PooledSendBuf(payload))).await.0
+    r.send_owned(conn, SendBody::Pooled(PooledSendBuf(payload))).await
 }
 
 /// A pooled send buffer holding `bytes`.
@@ -123,7 +123,7 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
     let fd = conn.fd();
-    r.register_conn(&conn, None);
+    r.register_conn(&conn, Box::new(Plain));
 
     partner.shutdown(std::net::Shutdown::Write).expect("half-close");
     assert!(
@@ -144,22 +144,22 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
     assert_eq!(partner.read(&mut buf).ok(), Some(0), "and closes with its last holder");
 }
 
-/// `close_conn` ends an armed recv, even one not yet submitted, so a silent peer
+/// `close` ends an armed recv, even one not yet submitted, so a silent peer
 /// cannot pin the connection.
 #[test]
-fn close_conn_ends_an_armed_recv() {
+fn close_ends_an_armed_recv() {
     let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
     let fd = conn.fd();
-    r.register_conn(&conn, None);
-    r.close_conn(&conn);
+    r.register_conn(&conn, Box::new(Plain));
+    conn.close();
 
     // The peer neither writes nor closes: only the shutdown can complete the
     // recv.
     assert!(
         poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
-        "close_conn must end the armed recv; without it the entry lives until the peer acts"
+        "close must end the armed recv; without it the entry lives until the peer acts"
     );
     drop(partner);
 }
@@ -199,7 +199,7 @@ fn send_owned_evicts_a_client_that_never_drains() {
         ..Limits::TEST
     };
     let (r, sender, _receiver) = egress_pair(limits, Some(4 * 1024));
-    let conn = Rc::new(r.client_conn(sender));
+    let conn = r.client_conn(sender);
 
     // Far larger than both buffers, and nothing ever reads the other
     // end — the send stalls partway and only the deadline can end it.
@@ -262,7 +262,7 @@ fn fanout_coalesced_egress_bench() {
                     let run_per_frame = async |bufs: Vec<PooledSendBuf>| {
                         let t = Instant::now();
                         for buf in bufs {
-                            let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await.0);
+                            let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(buf)).await);
                         }
                         t.elapsed()
                     };
@@ -273,7 +273,7 @@ fn fanout_coalesced_egress_bench() {
                         for _ in 0..w {
                             buf.extend_from_slice(&frame);
                         }
-                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(PooledSendBuf(buf))).await.0);
+                        let _ = black_box(r2.send_owned(&conn, SendBody::Pooled(PooledSendBuf(buf))).await);
                         t.elapsed()
                     };
                     if i % 2 == 0 {
@@ -302,27 +302,35 @@ fn fanout_coalesced_egress_bench() {
     }
 }
 
-/// The accept dispatch arm: a failed accept queues nothing, a successful one
-/// queues `(conn_fd, listener_fd)` — the listener rides the udata id and is the
-/// accept loop's unix-vs-tls routing key — and wakes the parked awaiter.
+/// The accept dispatch arm: a failed accept queues nothing on its listener's
+/// channel and wakes nobody; a successful one hands the accepted fd to the
+/// parked awaiter.
 #[test]
 fn dispatch_accept_queues_successes_and_wakes_the_awaiter() {
     let r = make_reactor();
     let listener = fake_listener();
+    let mut rx = r.attach_listener(listener);
     let waker = make_waker(42);
-    let mut fut = std::pin::pin!(r.accept());
+    let mut fut = std::pin::pin!(rx.recv());
     assert!(fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
 
-    cqe(&r, KIND_ACCEPT, listener as u64, -libc::ECONNABORTED);
-    assert_eq!(r.inner.accepts.borrow().len(), 0, "res<0 must queue nothing");
-    assert!(!r.inner.run_queue.borrow().is_queued(42), "nor wake the awaiter");
+    cqe(&r, KIND_ACCEPT, 0, -libc::ECONNABORTED);
+    assert!(!r.inner.run_queue.borrow().is_queued(42), "res<0 must wake nobody");
+    assert!(
+        fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending(),
+        "nor queue anything for the awaiter"
+    );
 
-    cqe(&r, KIND_ACCEPT, listener as u64, 9);
+    let accepted = fake_listener();
+    cqe(&r, KIND_ACCEPT, 0, accepted);
     assert!(
         r.inner.run_queue.borrow().is_queued(42),
         "res>=0 must wake the parked accept future"
     );
-    assert_eq!(r.inner.accepts.borrow_mut().pop(), Some((9, listener)));
+    match fut.as_mut().poll(&mut Context::from_waker(&waker)) {
+        Poll::Ready(fd) => assert_eq!(fd.as_raw_fd(), accepted, "carrying the accepted fd"),
+        Poll::Pending => panic!("a queued fd must resolve"),
+    }
 
     unsafe { libc::close(listener) };
 }
@@ -335,11 +343,12 @@ fn dispatch_accept_queues_successes_and_wakes_the_awaiter() {
 fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
     let r = make_reactor();
     let (a, b) = (fake_listener(), fake_listener());
+    let (_rx_a, _rx_b) = (r.attach_listener(a), r.attach_listener(b));
 
     // `CQE_F_MORE` clear (`flags = 0`) is the kernel saying the multishot SQE
     // is gone; -EMFILE is why.
-    r.handle_accept_cqe(a, -libc::EMFILE, 0);
-    r.handle_accept_cqe(b, -libc::EMFILE, 0);
+    r.handle_accept_cqe(0, -libc::EMFILE, 0);
+    r.handle_accept_cqe(1, -libc::EMFILE, 0);
     assert_eq!(
         r.inner.tasks.borrow().len(),
         2,
@@ -459,7 +468,7 @@ fn one_recv_completion_queues_a_whole_pipelined_run() {
     let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
-    r.register_conn(&conn, None);
+    r.register_conn(&conn, Box::new(Plain));
     conn.set_max_payload_len(1 << 20);
 
     const N: usize = 12;

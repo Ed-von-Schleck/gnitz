@@ -1,7 +1,7 @@
 //! Reactor client connections. Nothing here flushes: an SQE ships with the tick's
 //! own submit, before the task awaiting it can run.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use gnitz_store::storage::batch_pool::PooledSendBuf;
 
@@ -12,11 +12,17 @@ use super::*;
 /// state. The entry exists exactly while the recv SQE is outstanding.
 pub(super) struct Armed {
     conn: Rc<ClientConn>,
-    filter: Option<Box<dyn RecvFilter>>,
+    filter: Box<dyn RecvFilter>,
+}
+
+/// One attached listener: the fd its accepts name, and where they are delivered.
+pub(super) struct Listener {
+    fd: i32,
+    accepted: chan::Sender<OwnedFd>,
 }
 
 /// An owned client-bound payload. It rides the send's park slot while the kernel
-/// may read it and comes back with the result, so no payload is boxed per send.
+/// may read it; the send loop takes it back between short sends.
 pub(crate) enum SendBody {
     Pooled(PooledSendBuf),
     Slot(W2mSlot),
@@ -31,18 +37,6 @@ impl SendBody {
     }
 }
 
-impl From<PooledSendBuf> for SendBody {
-    fn from(b: PooledSendBuf) -> Self {
-        SendBody::Pooled(b)
-    }
-}
-
-impl From<W2mSlot> for SendBody {
-    fn from(s: W2mSlot) -> Self {
-        SendBody::Slot(s)
-    }
-}
-
 /// This client's egress side is finished: a send failed, or the client was
 /// evicted for making no progress.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,16 +48,10 @@ pub(super) fn resolve_client_send_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000))
 }
 
-/// `shutdown(SHUT_RDWR)`: errors out a pending `OP_SEND` on `fd`, which `close` does
-/// not. Never closes the fd; a peer already gone is not an error.
-pub(crate) fn shutdown(fd: i32) {
-    let _ = gnitz_foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(fd, libc::SHUT_RDWR) });
-}
-
-/// Arm (or re-arm) `listener`'s multishot accept. The listener fd rides the
-/// udata id, so its completions route back to it without reactor state.
-fn arm_accept(ring: &mut IoUringRing, listener: i32) {
-    ring.prep_accept(listener, udata(KIND_ACCEPT, listener as u32 as u64));
+/// Arm (or re-arm) the multishot accept of the listener at index `id`, which rides
+/// the udata so its completions route back through `listeners`.
+fn arm_accept(ring: &mut IoUringRing, fd: i32, id: usize) {
+    ring.prep_accept(fd, udata(KIND_ACCEPT, id as u64));
 }
 
 /// Arm a recv into `[ptr, ptr+len)` on `fd`. The fd rides the udata id, so the
@@ -74,32 +62,36 @@ fn arm_recv(ring: &mut IoUringRing, fd: i32, ptr: *mut u8, len: u32) {
 }
 
 impl Reactor {
-    /// Attach a listen socket fd and arm its multishot-accept SQE. Callable
-    /// once per listener (AF_UNIX + optional TLS); the listener fd rides the
-    /// SQE's udata `id` field so each accepted connection resolves as
-    /// `(conn_fd, listener_fd)`.
-    pub fn attach_listener(&self, listener_fd: i32) {
-        let mut ring = self.inner.ring.borrow_mut();
-        arm_accept(&mut ring, listener_fd);
-        if let Err(e) = ring.submit() {
-            gnitz_fatal_abort!(
-                "reactor: accept SQE flush failed (errno={}) — no connections can be accepted",
-                e,
-            );
-        }
+    /// Attach a listen socket fd and arm its multishot accept; every connection it
+    /// accepts arrives on the returned channel.
+    pub fn attach_listener(&self, fd: i32) -> chan::Receiver<OwnedFd> {
+        let (accepted, rx) = chan::unbounded::<OwnedFd>();
+        let id = {
+            let mut listeners = self.inner.listeners.borrow_mut();
+            listeners.push(Listener { fd, accepted });
+            listeners.len() - 1
+        };
+        arm_accept(&mut self.inner.ring.borrow_mut(), fd, id);
+        rx
     }
 
-    /// Route an accept completion: queue the accepted fd for the accept loop
-    /// and, when the multishot SQE has been cancelled, re-arm the listener.
-    pub(super) fn handle_accept_cqe(&self, listener: i32, res: i32, flags: u32) {
-        if res >= 0 {
-            self.inner.accepts.borrow_mut().push((res, listener));
-        }
+    /// Route an accept completion: hand the accepted fd to its listener's accept
+    /// loop and, when the multishot SQE has been cancelled, re-arm the listener.
+    pub(super) fn handle_accept_cqe(&self, id: usize, res: i32, flags: u32) {
+        let fd = {
+            let listeners = self.inner.listeners.borrow();
+            let listener = &listeners[id];
+            if res >= 0 {
+                // SAFETY: a fresh fd from the kernel, owned by nothing else.
+                listener.accepted.send(unsafe { OwnedFd::from_raw_fd(res) });
+            }
+            listener.fd
+        };
         if flags & CQE_F_MORE != 0 {
             return;
         }
         if res != -libc::EMFILE && res != -libc::ENFILE {
-            arm_accept(&mut self.inner.ring.borrow_mut(), listener);
+            arm_accept(&mut self.inner.ring.borrow_mut(), fd, id);
             return;
         }
         // Out of fds: back off before re-arming so closing connections get a
@@ -109,14 +101,8 @@ impl Reactor {
         self.spawn(async move {
             let deadline = Instant::now() + inner.limits.accept_rearm_backoff;
             TimerFuture::new(deadline, Rc::clone(&inner)).await;
-            arm_accept(&mut inner.ring.borrow_mut(), listener);
+            arm_accept(&mut inner.ring.borrow_mut(), fd, id);
         });
-    }
-
-    /// The next newly-accepted `(conn_fd, listener_fd)` pair. Called by the
-    /// accept-loop task.
-    pub async fn accept(&self) -> (i32, i32) {
-        std::future::poll_fn(|cx| self.inner.accepts.borrow_mut().poll(cx)).await
     }
 
     /// A connection over `fd`, charging the reactor's inbound budget. Nothing is
@@ -125,14 +111,11 @@ impl Reactor {
         Rc::new(ClientConn::new(fd, Rc::clone(&self.inner.inbound)))
     }
 
-    /// Arm `conn`'s first recv, into `filter.window()` or the queue's own window, and
-    /// hold the connection until the recv side ends.
-    pub(crate) fn register_conn(&self, conn: &Rc<ClientConn>, mut filter: Option<Box<dyn RecvFilter>>) {
+    /// Arm `conn`'s first recv into `filter`'s window, and hold the connection
+    /// until the recv side ends.
+    pub(crate) fn register_conn(&self, conn: &Rc<ClientConn>, mut filter: Box<dyn RecvFilter>) {
         let fd = conn.fd();
-        let (ptr, len) = match &mut filter {
-            Some(f) => f.window(),
-            None => conn.q.borrow_mut().remaining(),
-        };
+        let (ptr, len) = filter.window(&mut conn.q.borrow_mut());
         arm_recv(&mut self.inner.ring.borrow_mut(), fd, ptr, len);
         // The entry holds the connection and so its fd open, so no live entry
         // can share this fd number.
@@ -144,17 +127,6 @@ impl Reactor {
         debug_assert!(prev.is_none(), "fd={fd} registered while an entry still holds it");
     }
 
-    /// End `conn`'s recv side now: close its queue and, if a recv is armed, shut
-    /// the socket down — nothing else would complete that recv for a client that
-    /// goes silent after being refused.
-    pub(crate) fn close_conn(&self, conn: &ClientConn) {
-        conn.q.borrow_mut().close();
-        // A recv that already ended retired its entry.
-        if self.inner.conns.borrow().contains_key(&conn.fd()) {
-            shutdown(conn.fd());
-        }
-    }
-
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
         let mut conns = self.inner.conns.borrow_mut();
         let Some(armed) = conns.get_mut(&fd) else { return };
@@ -164,42 +136,34 @@ impl Reactor {
         } else if res == 0 || q.recv_closed() {
             Err(RecvEnd::PeerClosed)
         } else {
-            match &mut armed.filter {
-                None => q.deliver(res as usize).map(|()| q.remaining()),
-                Some(f) => f.ingest(res as usize, &mut q).map(|()| f.window()),
-            }
+            armed
+                .filter
+                .ingest(res as usize, &mut q)
+                .map(|()| armed.filter.window(&mut q))
         };
         drop(q);
         match next {
             Ok((ptr, len)) => arm_recv(&mut self.inner.ring.borrow_mut(), fd, ptr, len),
             Err(end) => {
                 match end {
-                    RecvEnd::PeerClosed => {
-                        gnitz_debug!("reactor: fd={fd} recv side ended: {} (res={res})", end.as_str())
-                    }
-                    RecvEnd::CapBreach { want } => gnitz_warn!(
-                        "reactor: fd={fd} recv side ended: {} (want={} B, held={} B, cap={} B)",
-                        end.as_str(),
-                        want,
+                    RecvEnd::PeerClosed => gnitz_debug!("reactor: fd={fd} recv side ended: {end:?}"),
+                    _ => gnitz_warn!(
+                        "reactor: fd={fd} recv side ended: {end:?} (res={res}, inbound held={} of {} B)",
                         self.inner.inbound.held(),
-                        self.inner.inbound.cap(),
+                        self.inner.limits.inbound_cap,
                     ),
-                    _ => gnitz_warn!("reactor: fd={fd} recv side ended: {} (res={res})", end.as_str()),
                 }
-                let mut armed = conns.remove(&fd).expect("entry present");
+                let armed = conns.remove(&fd).expect("entry present");
                 drop(conns);
                 armed.conn.q.borrow_mut().close();
-                if let Some(f) = &mut armed.filter {
-                    f.on_recv_closed();
-                }
             } // `armed` drops: the reactor's hold on the connection ends
         }
     }
 
-    /// Send `body`'s whole byte range on `conn`, handing `body` back either way.
-    /// Loops on short sends; each kernel send has its own
-    /// `Limits::client_send_timeout` deadline, past which the client is evicted.
-    pub(crate) async fn send_owned(&self, conn: &ClientConn, mut body: SendBody) -> (Result<(), PeerGone>, SendBody) {
+    /// Send `body`'s whole byte range on `conn`. Loops on short sends; each kernel
+    /// send has its own `Limits::client_send_timeout` deadline, past which the
+    /// client is evicted.
+    pub(crate) async fn send_owned(&self, conn: &ClientConn, mut body: SendBody) -> Result<(), PeerGone> {
         let (ptr, len) = {
             let b = body.bytes();
             (b.as_ptr(), b.len())
@@ -220,25 +184,25 @@ impl Reactor {
                     rc
                 }
                 // Evicted; a completion that raced the timer still counts as failed.
-                // The CQE is awaited because the kernel may read the carry until it lands.
                 Either::B(()) => {
                     gnitz_warn!(
                         "client fd={} made no send progress for {:?}; evicting",
                         conn.fd(),
                         self.inner.limits.client_send_timeout
                     );
-                    shutdown(conn.fd());
-                    let (_, back) = op.await;
-                    return (Err(PeerGone), back.expect("a send carries its body"));
+                    // The abandoned send completes only once the socket errors, and
+                    // its park slot holds the body until it does.
+                    conn.shutdown();
+                    return Err(PeerGone);
                 }
             };
             // A zero is the kernel accepting nothing, which is not progress either.
             if rc <= 0 {
-                return (Err(PeerGone), body);
+                return Err(PeerGone);
             }
             sent += rc as usize;
         }
-        (Ok(()), body)
+        Ok(())
     }
 }
 

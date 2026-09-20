@@ -8,8 +8,8 @@ use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
 /// The operative bound on **every** reply the server emits, forwarded or not,
-/// and the limit the HELLO ACK advertises (`Peer::send_hello_ack`). A worker
-/// frame reaches a client verbatim, so this is the only readable size there; for
+/// and the limit the HELLO ACK advertises. A worker frame reaches a client
+/// verbatim, so this is the only readable size there; for
 /// a reply the master consumes instead — `HasPk`, `Gather`, the
 /// unique pre-flight — it turns a would-be `try_reserve` abort into an error at
 /// the producer. It bounds the one non-reply a worker emits too, its exchange
