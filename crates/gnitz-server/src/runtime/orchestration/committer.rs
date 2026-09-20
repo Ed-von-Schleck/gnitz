@@ -443,22 +443,17 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
             dones.push(p.done);
         }
 
-        // A single push ships the client's batch as it stands. A coalesced run
-        // merges into one batch sized for the whole run in rows *and* blob bytes:
-        // `append_batch` otherwise regrows the heap once per source. The merge
-        // reads client-supplied batches, so it is guarded.
+        // A single push ships the client's batch as it stands; a coalesced run
+        // concatenates into one. The concat reads client-supplied batches, so it
+        // is guarded.
         let merged = if tail.is_empty() {
             head
         } else {
-            let total_rows = head.len() + tail.iter().map(|b| b.len()).sum::<usize>();
-            let total_blob = head.blob.len() + tail.iter().map(|b| b.blob.len()).sum::<usize>();
             match guard_panic("commit_merge", || {
-                let mut m = Batch::with_capacity_blob(&shared.disp().schema_desc_for(tid), total_rows, total_blob);
-                m.append_batch(&head, 0, head.len());
-                for pb in &tail {
-                    m.append_batch(pb, 0, pb.len());
-                }
-                Ok::<_, String>(m)
+                Ok::<_, String>(Batch::concat(
+                    &shared.disp().schema_desc_for(tid),
+                    std::iter::once(&head).chain(tail.iter()),
+                ))
             }) {
                 Ok(m) => m,
                 Err(panic_msg) => {

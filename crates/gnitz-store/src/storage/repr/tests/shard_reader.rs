@@ -233,7 +233,7 @@ fn padded_shard_to_unified_pads() {
     // Reader 3: the shared column-first scatter reads `null_pad_mask` off the
     // view rather than the shard, so the view must carry it.
     let mut cols = Vec::new();
-    let unified = shard.to_unified(&mut cols);
+    let unified = shard.to_unified(&schema_with_appended(type_code::I64), &mut cols);
     assert_eq!(unified.null_pad_mask, 1 << 1);
     // The absent column reads one shared `'static` zero cell for every row —
     // the same `stride == 0` shape a Constant region uses, so the gather has
@@ -842,7 +842,7 @@ fn packed_roundtrip_all_surfaces() {
 
     // Surface 4 (to_unified): read the payload ColPtr per row.
     let mut cols = Vec::new();
-    let pu = packed.to_unified(&mut cols);
+    let pu = packed.to_unified(&schema, &mut cols);
     for (r, &want) in vals.iter().enumerate() {
         let cp = cols[pu.cols_off];
         let v = read_i64_le(unsafe { cp.row(r, 8) }, 0);

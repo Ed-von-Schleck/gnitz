@@ -1,7 +1,9 @@
 use super::*;
 use crate::ops::group_key::GroupKeyCols;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::test_support::{make_batch, make_schema_u64_i64};
+use crate::test_support::{
+    make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
+};
 
 #[test]
 fn test_worker_filter_keeps_only_this_workers_rows() {
@@ -41,13 +43,11 @@ fn test_worker_filter_empty_in_empty_out() {
     assert_eq!(out.count, 0);
 }
 
-/// The `ScatterKey` collapse replaced the single-column `route_partition_key`
-/// (routable-int → `opk_image`, string → `german_string_promote_key`) and the
-/// `compound_join_packer` path with one packed-`ReindexPacker` route.
-/// For every reachable `JoinKey` shape, the packed owner must equal
-/// what the pre-collapse routing produced — so no row moves workers. The
-/// NULL arms are null-blind by design (they read the canonically-zeroed key
-/// slot), exactly as the deleted `route_partition_key` was.
+/// A `JoinKey` scatter's packed route equals the per-type OPK image of the same
+/// column — an integer's `opk_image`, a string's `german_string_promote_key`, a
+/// compound-PK sub-column's group fold — which is what co-partitions the delta
+/// scatter with the reindexed trace. The NULL arms route by the
+/// canonically-zeroed key slot, where the reindex Map stamps them too.
 #[test]
 fn test_scatter_key_packed_matches_image_routing() {
     use crate::storage::MemBatch;
@@ -57,7 +57,6 @@ fn test_scatter_key_packed_matches_image_routing() {
     fn packed(schema: &SchemaDescriptor, cols: &[u32], mb: &MemBatch, row: usize) -> usize {
         let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
         let mut sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema, NW).expect("the fixture key routes");
-        assert!(!sk.is_pk_routed(), "test key shapes must take the packed route");
         sk.worker(mb, row)
     }
 
@@ -84,8 +83,8 @@ fn test_scatter_key_packed_matches_image_routing() {
         let mb = b.as_mem_batch();
         for row in 0..2 {
             // Image: routable-int → loc.opk_image → worker_for_key (null-blind).
-            let legacy = worker_for_key(schema.locate(1).opk_image(&mb, row), NW);
-            assert_eq!(packed(&schema, &[1], &mb, row), legacy, "I64 row {row}");
+            let image = worker_for_key(schema.locate(1).opk_image(&mb, row), NW);
+            assert_eq!(packed(&schema, &[1], &mb, row), image, "I64 row {row}");
         }
     }
 
@@ -112,16 +111,16 @@ fn test_scatter_key_packed_matches_image_routing() {
         let mb = b.as_mem_batch();
         for row in 0..2 {
             // Image: string → german_string_promote_key → worker_for_key.
-            let legacy = worker_for_key(
+            let image = worker_for_key(
                 crate::schema::key::german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob),
                 NW,
             );
-            assert_eq!(packed(&schema, &[1], &mb, row), legacy, "STRING row {row}");
+            assert_eq!(packed(&schema, &[1], &mb, row), image, "STRING row {row}");
         }
     }
 
-    // (5) U128 payload key: `is_pk_eligible` includes U128, so the
-    // wide arm of `loc.opk_image` fed `worker_for_key`.
+    // (5) U128 payload key: `is_pk_eligible` includes U128, so the image comes
+    // from the wide arm of `loc.opk_image`.
     {
         let schema = SchemaDescriptor::new(
             &[
@@ -137,13 +136,12 @@ fn test_scatter_key_packed_matches_image_routing() {
         b.extend_col(0, &(u128::MAX - 7).to_le_bytes());
         b.count += 1;
         let mb = b.as_mem_batch();
-        let legacy = worker_for_key(schema.locate(1).opk_image(&mb, 0), NW);
-        assert_eq!(packed(&schema, &[1], &mb, 0), legacy, "U128 payload");
+        let image = worker_for_key(schema.locate(1).opk_image(&mb, 0), NW);
+        assert_eq!(packed(&schema, &[1], &mb, 0), image, "U128 payload");
     }
 
-    // (6) single sub-column of a compound PK — the one legacy join-key
-    // shape that fell through `route_partition_key`'s non-PK guard to the
-    // group fold `GroupKeyCols::key_row` (its Pk arm is `opk_image`).
+    // (6) single sub-column of a compound PK — the shape whose image comes from
+    // the group fold `GroupKeyCols::key_row` (its Pk arm is `opk_image`).
     {
         let schema = SchemaDescriptor::new(
             &[
@@ -164,8 +162,8 @@ fn test_scatter_key_packed_matches_image_routing() {
         b.count += 1;
         let mb = b.as_mem_batch();
         for col in [0u32, 1u32] {
-            let legacy = worker_for_key(GroupKeyCols::new(&schema, &[col]).unwrap().key_row(&mb, 0), NW);
-            assert_eq!(packed(&schema, &[col], &mb, 0), legacy, "compound-PK sub-col {col}");
+            let image = worker_for_key(GroupKeyCols::new(&schema, &[col]).unwrap().key_row(&mb, 0), NW);
+            assert_eq!(packed(&schema, &[col], &mb, 0), image, "compound-PK sub-col {col}");
         }
     }
 }
@@ -194,4 +192,111 @@ fn scatter_key_refuses_a_key_this_schema_cannot_route() {
         ScatterKey::new(ScatterSpec::JoinKey(&[(1, None)]), &schema, nw).is_err(),
         "a reindex key over a float column, which no OPK packs"
     );
+}
+
+/// Run one `GroupKey` scatter's router over `row`.
+fn group_worker(schema: &SchemaDescriptor, cols: &[u32], b: &Batch, row: usize, nw: usize) -> usize {
+    ScatterKey::new(ScatterSpec::GroupKey(cols), schema, nw)
+        .expect("the fixture key routes")
+        .worker(&b.as_mem_batch(), row)
+}
+
+/// Rows sharing a `Fold` routing key land on one worker whatever their PKs — the
+/// co-partition GROUP BY and the set ops depend on. A string is covered in both
+/// length classes, since inline and heap cells are read differently.
+#[test]
+fn equal_group_keys_route_to_one_worker() {
+    let nw = 4;
+
+    let schema = make_schema_u64_i64();
+    let b = make_batch(&schema, &[(1, 1, 42), (2, 1, 42), (3, 1, 42), (4, 1, 7)]);
+    let owner = group_worker(&schema, &[1], &b, 0, nw);
+    for row in 1..3 {
+        assert_eq!(
+            group_worker(&schema, &[1], &b, row, nw),
+            owner,
+            "I64 group 42 row {row}"
+        );
+    }
+
+    let s_schema = make_schema_pk_u64_payload_string();
+    // "hello" is ≤ 12 bytes and lives inline; the long one lives in the heap.
+    let long: &[u8] = b"this is a longer string for heap";
+    let sb = make_batch_bytes(
+        &s_schema,
+        &[
+            (1, 1, b"hello"),
+            (2, 1, b"hello"),
+            (3, 1, b"world"),
+            (10, 1, long),
+            (11, 1, long),
+        ],
+    );
+    assert_eq!(
+        group_worker(&s_schema, &[1], &sb, 0, nw),
+        group_worker(&s_schema, &[1], &sb, 1, nw),
+        "equal inline strings must route together"
+    );
+    assert_eq!(
+        group_worker(&s_schema, &[1], &sb, 3, nw),
+        group_worker(&s_schema, &[1], &sb, 4, nw),
+        "equal heap strings must route together"
+    );
+}
+
+/// A payload column routes by its value's OPK image, so a payload FK lands where
+/// the same value stored as a PK column would.
+#[test]
+fn a_payload_group_key_routes_by_the_values_opk_image() {
+    let schema = make_schema_u64_i64();
+    let nw = 4;
+    let vals: Vec<i64> = (0..64i64).map(|i| i * 997 + 1).collect();
+    let rows: Vec<(u64, i64, i64)> = vals.iter().enumerate().map(|(i, &v)| (i as u64 + 1, 1, v)).collect();
+    let b = make_batch(&schema, &rows);
+
+    for (row, &v) in vals.iter().enumerate() {
+        let mut opk = [0u8; 8];
+        gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut opk);
+        assert_eq!(
+            group_worker(&schema, &[1], &b, row, nw),
+            worker_for_pk_bytes(&opk, nw),
+            "val={v}"
+        );
+    }
+}
+
+/// Every [`ScatterKey::route_into`] arm lands each row where
+/// [`ScatterKey::worker`] puts it, at that row's own weight, and drops weight-0.
+#[test]
+fn route_into_agrees_with_worker_on_every_scatter_kind() {
+    let schema = make_schema_u64_i64();
+    let nw = 4;
+    let b = make_batch_raw(&schema, &[(1, 1, 70), (9, 3, 70), (4, 0, 55), (6, -2, 13)]);
+    let mb = b.as_mem_batch();
+
+    for spec in [
+        ScatterSpec::GroupKey(&[0u32]),     // PkBytes: the key IS the PK list
+        ScatterSpec::GroupKey(&[1u32]),     // Fold: a payload group key
+        ScatterSpec::JoinKey(&[(1, None)]), // Packed: a non-PK reindex key
+    ] {
+        let mut pool: Vec<Vec<(u32, u32, i64)>> = Vec::new();
+        let slots = crate::storage::reset_slots(&mut pool, nw);
+        ScatterKey::new(spec, &schema, nw)
+            .expect("the fixture key routes")
+            .route_into(&mb, 3, slots);
+
+        let mut key = ScatterKey::new(spec, &schema, nw).expect("the fixture key routes");
+        let mut want: Vec<(usize, u32, u32, i64)> = (0..b.count)
+            .filter(|&r| mb.get_weight(r) != 0)
+            .map(|r| (key.worker(&mb, r), 3u32, r as u32, mb.get_weight(r)))
+            .collect();
+        let mut got: Vec<(usize, u32, u32, i64)> = slots
+            .iter()
+            .enumerate()
+            .flat_map(|(w, rows)| rows.iter().map(move |&(si, r, wt)| (w, si, r, wt)))
+            .collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "{spec:?}: route_into must match worker row for row");
+    }
 }

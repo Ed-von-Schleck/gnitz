@@ -29,10 +29,10 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
         let src_mb = src.as_mem_batch();
 
         let mut cols = Vec::new();
-        let unified = [crate::storage::mem_batch_to_unified(&src_mb, &schema, &mut cols)];
+        let unified = [super::super::merge::mem_batch_to_unified(&src_mb, &schema, &mut cols)];
         let survivors: Vec<(u32, u32, i64)> = (0..rows.len()).map(|i| (0, i as u32, src_mb.get_weight(i))).collect();
         let out = write_to_batch(&schema, rows.len(), 0, |w| {
-            crate::storage::scatter_unified_sources(&unified, &cols, &survivors, w);
+            super::super::scatter::scatter_unified_sources(&unified, &cols, &survivors, w);
         });
 
         assert_eq!(out.count, rows.len(), "tc={tc} stride={stride}: row count");

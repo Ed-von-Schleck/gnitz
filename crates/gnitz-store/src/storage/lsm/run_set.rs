@@ -12,10 +12,10 @@
 use std::cell::OnceCell;
 use std::rc::Rc;
 
-use super::batch::{write_to_batch, Batch, Layout};
+use super::batch::{Batch, Layout};
 use super::bloom::BloomFilter;
 use super::merge::{self, MemBatch};
-use super::scatter::scatter_unified_sources;
+use super::scatter::UnifiedSet;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
 
@@ -245,14 +245,7 @@ fn consolidate_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch
     if survivors.is_empty() {
         return Batch::empty_with_schema(schema);
     }
-    let mut cols = Vec::with_capacity(batches.len() * schema.num_payload_cols());
-    let unified: Vec<_> = batches
-        .iter()
-        .map(|b| merge::mem_batch_to_unified(b, schema, &mut cols))
-        .collect();
-    let mut result = write_to_batch(schema, survivors.len(), total_blob, |writer| {
-        scatter_unified_sources(&unified, &cols, &survivors, writer);
-    });
+    let mut result = UnifiedSet::of(batches, schema).materialize(schema, &survivors, total_blob);
     result.certify_layout(Layout::Consolidated);
     result
 }

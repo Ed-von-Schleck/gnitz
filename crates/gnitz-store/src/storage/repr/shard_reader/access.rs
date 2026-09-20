@@ -191,21 +191,6 @@ impl MappedShard {
         batch.certify_layout(Layout::Consolidated);
         batch
     }
-
-    /// Derive a `UnifiedSource` view over this shard: its region `ColPtr`s, with
-    /// one payload `ColPtr` per reader-schema column appended to `cols`. A
-    /// packed column is decoded here if no read has decoded it yet.
-    pub(crate) fn to_unified(&self, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
-        let cols_off = cols.len();
-        cols.extend((0..self.col_regions.len()).map(|pi| self.payload_col(pi)));
-        UnifiedSource {
-            pk: self.pk,
-            null_bmp: self.null_bmp,
-            null_pad_mask: self.null_pad_mask,
-            cols_off,
-            blob: self.blob(),
-        }
-    }
 }
 
 impl RowSource for MappedShard {
@@ -242,6 +227,20 @@ impl RowSource for MappedShard {
 }
 
 impl ColumnarSource for MappedShard {
+    /// A packed column is decoded here if no read has decoded it yet. `schema`
+    /// is ignored: `open` already widened this shard's directory to it.
+    fn to_unified(&self, _schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
+        let cols_off = cols.len();
+        cols.extend((0..self.col_regions.len()).map(|pi| self.payload_col(pi)));
+        UnifiedSource {
+            pk: self.pk,
+            null_bmp: self.null_bmp,
+            null_pad_mask: self.null_pad_mask,
+            cols_off,
+            blob: self.blob(),
+        }
+    }
+
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         debug_assert!(row < self.count);

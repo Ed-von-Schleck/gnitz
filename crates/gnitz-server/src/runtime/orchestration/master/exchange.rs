@@ -7,7 +7,7 @@
 //! worker has sent its TERMINAL frame into it, yielding a [`PendingRelay`].
 //!
 //! A worker publishes its partition as a `FRAME_CAP`-bounded train (see
-//! `worker/exchange.rs`), so a slot accumulates over several frames and only the
+//! `worker/exchange.rs`), so a worker's list holds several frames and only the
 //! terminal one — flagged `scan_last`, the engine's one train-end rule — reports
 //! the worker.
 //!
@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use crate::runtime::sal::WorkerSet;
 use crate::runtime::wire::DecodedWire;
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{Batch, Layout};
+use gnitz_store::storage::Batch;
 use gnitz_wire::MAX_WORKERS;
 
 /// Per-view accumulator for exchange frames, keyed by `(view_id, source_id)`.
@@ -32,16 +32,11 @@ pub struct ExchangeAccumulator {
 }
 
 struct ExchangeRound {
-    /// One slot per live worker — sized `nw`, not `MAX_WORKERS`: `Batch` is
+    /// One frame list per live worker — sized `nw`, not `MAX_WORKERS`: `Batch` is
     /// ~1 KB, so a fixed 64-slot array would build and move ~70 KB per round to
-    /// use a handful of slots. A worker's slot accumulates its train in frame
+    /// use a handful of slots. A worker's list accumulates its train in frame
     /// order, which is source-row order.
-    payloads: Vec<Option<Batch>>,
-    /// AND of the layout claims of worker `w`'s frames, re-installed on the
-    /// completed slot: `append_batch` downgrades what it appends into, so a
-    /// multi-frame slot would otherwise lose its source's claim and drop the
-    /// round onto the re-sorting `op_repartition_batches`.
-    consolidated: Vec<bool>,
+    payloads: Vec<Vec<Batch>>,
     /// The workers that have reported. A set rather than a counter, so a worker
     /// reporting twice cannot complete the round while another worker's slot is
     /// still empty.
@@ -56,7 +51,7 @@ struct ExchangeRound {
 /// SAL hold; `collect_exclusive` does both inside its exclusive hold.
 pub struct PendingRelay {
     pub view_id: i64,
-    pub payloads: Vec<Option<Batch>>,
+    pub payloads: Vec<Vec<Batch>>,
     pub schema: SchemaDescriptor,
     pub source_id: i64,
     /// True iff every worker reported a backfill pad for this round (the final,
@@ -85,8 +80,7 @@ impl ExchangeAccumulator {
         let nw = self.nw;
 
         let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
-            payloads: (0..nw).map(|_| None).collect(),
-            consolidated: vec![true; nw],
+            payloads: (0..nw).map(|_| Vec::new()).collect(),
             reported: WorkerSet::EMPTY,
             schema: None,
             all_pad: true,
@@ -98,13 +92,7 @@ impl ExchangeAccumulator {
             round.schema = Some(schema);
         }
         if let Some(b) = decoded.data_batch {
-            round.consolidated[w] &= b.layout() == Layout::Consolidated;
-            match &mut round.payloads[w] {
-                // Frames are consecutive ascending row ranges of one partition,
-                // so arrival order reproduces it. The first is moved, not copied.
-                Some(acc) => acc.append_batch(&b, 0, b.len()),
-                slot @ None => *slot = Some(b),
-            }
+            round.payloads[w].push(b);
         }
         // Bookkeeping rides the terminal frame alone, so a partial train cannot
         // complete the round.
@@ -119,7 +107,7 @@ impl ExchangeAccumulator {
         if round.reported != WorkerSet::ALL.within(nw) {
             return None;
         }
-        let mut round = self.rounds.remove(&key).unwrap();
+        let round = self.rounds.remove(&key).unwrap();
         let schema = match round.schema {
             Some(s) => s,
             None => {
@@ -131,13 +119,6 @@ impl ExchangeAccumulator {
                 return None;
             }
         };
-        // Debug-verified by `certify_layout`, so a concatenation that is not in
-        // fact consolidated fails here rather than silently costing the scatter.
-        for (payload, ok) in round.payloads.iter_mut().zip(&round.consolidated) {
-            if let (Some(b), true) = (payload.as_mut(), *ok) {
-                b.certify_layout(Layout::Consolidated);
-            }
-        }
         Some(PendingRelay {
             view_id: vid,
             payloads: round.payloads,

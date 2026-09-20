@@ -45,18 +45,6 @@ impl Run {
         }
     }
 
-    /// Build a `UnifiedSource` view backed by either a `MemBatch`'s flat data
-    /// buffer or a `MappedShard`: one `ColPtr` per region.
-    ///
-    /// Infallible: `MappedShard::open` validates all encoding constraints and
-    /// region sizes at open time, so no arm here can fail.
-    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
-        match self {
-            Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
-            Run::Shard(s) => s.to_unified(cols),
-        }
-    }
-
     /// Bulk-copy `[start, start + row_count)` into an owned batch — one memcpy
     /// per column. The arms differ only in the layout they may claim, which is a
     /// property of the backing: `Mem` inherits the source's tag, a shard is
@@ -142,6 +130,18 @@ impl RowSource for Run {
 }
 
 impl ColumnarSource for Run {
+    /// Backed by either a `MemBatch`'s flat data buffer or a `MappedShard`: one
+    /// `ColPtr` per region.
+    ///
+    /// Infallible: `MappedShard::open` validates all encoding constraints and
+    /// region sizes at open time, so no arm here can fail.
+    fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
+        match self {
+            Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
+            Run::Shard(s) => s.to_unified(schema, cols),
+        }
+    }
+
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         match self {

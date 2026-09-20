@@ -475,6 +475,10 @@ impl<'a> ColumnarSource for MemBatch<'a> {
     fn get_weight(&self, row: usize) -> i64 {
         MemBatch::get_weight(self, row)
     }
+
+    fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
+        mem_batch_to_unified(self, schema, cols)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +701,11 @@ pub(crate) fn run_merge<S: ColumnarSource>(
 pub(crate) trait ColumnarSource: RowSource {
     /// The row's signed Z-set weight / multiplicity (region[1]).
     fn get_weight(&self, row: usize) -> i64;
+
+    /// A [`UnifiedSource`] over this source's regions, its payload `ColPtr`s
+    /// appended to `cols`. A backing carrying its own column directory ignores
+    /// `schema`.
+    fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_>;
 
     /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
     /// a capacity-bounded view's skeleton shard. `false` for every in-memory

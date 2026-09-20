@@ -14,7 +14,7 @@ use crate::runtime::reactor::{select2, Either};
 use crate::runtime::sal::{SalFit, SalScope};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
-use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, ScatterSpec};
+use gnitz_store::ops::{op_relay_scatter, ScatterSpec};
 use gnitz_store::relation::Relation;
 
 /// One round of a checkpoint.
@@ -373,29 +373,20 @@ impl MasterDispatcher {
         } = relay;
 
         let cat = self.cat();
-        let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
-
-        // Every contributing source must be consolidated to take the merge-walk
-        // scatter; a single non-consolidated one falls back to the re-sorting
-        // repartition. The scatter (`op_relay_scatter_consolidated`) debug-verifies
-        // each.
+        let sources: Vec<&Batch> = payloads.iter().flatten().filter(|b| !b.is_empty()).collect();
         let num_workers = self.num_workers();
-        let scatter = |spec: ScatterSpec<'_>| {
-            if sources.iter().flatten().all(|b| b.is_consolidated()) {
-                op_relay_scatter_consolidated(&sources, spec, &schema, num_workers)
-            } else {
-                op_repartition_batches(&sources, spec, &schema, num_workers)
-            }
-        };
 
         let (dag, registry) = cat.dag_and_registry_mut();
         let meta = dag
             .view_meta(registry, view_id)
             .map_err(|e| format!("view {view_id}: {e}"))?;
         let dest = match meta.relay_route(source_id) {
-            RelayRoute::Broadcast => Ok(vec![op_relay_broadcast(&sources, &schema)]),
-            RelayRoute::GroupKey(cols) => scatter(ScatterSpec::GroupKey(cols)),
-            RelayRoute::JoinKey(slots) => scatter(ScatterSpec::JoinKey(slots)),
+            // A probe with no equality key must see the whole delta: a match can
+            // live on any worker's trace. The per-worker slices are disjoint, so
+            // their concatenation is the delta exactly once.
+            RelayRoute::Broadcast => Ok(vec![Batch::concat(&schema, sources.iter().copied())]),
+            RelayRoute::GroupKey(cols) => op_relay_scatter(&sources, ScatterSpec::GroupKey(cols), &schema, num_workers),
+            RelayRoute::JoinKey(slots) => op_relay_scatter(&sources, ScatterSpec::JoinKey(slots), &schema, num_workers),
         };
         // The scatter key's own reason, not a restatement: it names the column
         // and the bound it missed.

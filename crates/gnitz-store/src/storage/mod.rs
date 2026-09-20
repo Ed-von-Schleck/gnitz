@@ -51,13 +51,13 @@ mod suites;
 // ── Relations, batches and the flush path ───────────────────────────────────
 pub use batch::Batch;
 pub use batch::MAX_BATCH_REGIONS;
-pub(crate) use batch::{range_rows, write_to_batch, RowMark};
+pub(crate) use batch::{range_rows, RowMark};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::{StorageError, StoreError};
 pub(crate) use lsm::flush_barrier::{flush_barrier, FlushRound};
 pub(crate) use lsm::table::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 pub use merge::MemBatch;
-pub(crate) use scatter::scatter_unified_sources;
+pub(crate) use scatter::UnifiedSet;
 pub use scatter::{reset_slots, route_rows_by_pk};
 
 // ── Operator hot-path types ──────────────────────────────────────────────────
@@ -88,7 +88,7 @@ pub use lsm::read_cursor::{PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
 pub use lsm::run::StoredRow;
 pub(crate) use merge::BlobCacheGuard;
-pub(crate) use merge::{mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, run_merge, BlobCache};
+pub(crate) use merge::{prorated_blob_cap, relocate_german_string_vec, run_merge, BlobCache};
 pub use spill::{KeyProducer, SpillSort};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to

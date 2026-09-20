@@ -6,8 +6,9 @@
 //! so the triple is the only channel for a merge fold's net weight — which is
 //! not any one source row's weight.
 
-use super::batch::FIXED_REGION_BYTES;
-use super::merge::{ColPtr, DirectWriter, MemBatch, UnifiedSource};
+use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
+use super::merge::{ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::is_german_string;
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
@@ -248,6 +249,46 @@ fn gather_unified_col<const N: usize>(
         let src = unsafe { sources.get_unchecked(si as usize) };
         let ptr = unsafe { cols.get_unchecked(src.cols_off + pi).row_ptr(ri as usize) };
         unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr().add(out * N), N) };
+    }
+}
+
+/// [`scatter_unified_sources`]'s source side: the per-source [`UnifiedSource`]
+/// views and the flat payload-`ColPtr` table they index into, so the two cannot
+/// be paired wrongly.
+pub(crate) struct UnifiedSet<'a> {
+    sources: Vec<UnifiedSource<'a>>,
+    cols: Vec<ColPtr>,
+    payload_cols: usize,
+}
+
+impl<'a> UnifiedSet<'a> {
+    pub(crate) fn of<S: ColumnarSource>(sources: &'a [S], schema: &SchemaDescriptor) -> Self {
+        let payload_cols = schema.num_payload_cols();
+        let mut cols = Vec::with_capacity(sources.len() * payload_cols);
+        let sources = sources.iter().map(|s| s.to_unified(schema, &mut cols)).collect();
+        UnifiedSet { sources, cols, payload_cols }
+    }
+
+    /// Copy the rows `rows` names, in the order given, each at the weight its
+    /// triple carries, into a fresh batch claiming no layout.
+    ///
+    /// `out_schema` may be narrower than the one the views were built against,
+    /// which writes fewer payload columns than the sources carry.
+    pub(crate) fn materialize(
+        &self,
+        out_schema: &SchemaDescriptor,
+        rows: &[(u32, u32, i64)],
+        blob_cap: usize,
+    ) -> Batch {
+        assert!(
+            out_schema.num_payload_cols() <= self.payload_cols,
+            "UnifiedSet::materialize: out_schema has {} payload columns, the views carry {}",
+            out_schema.num_payload_cols(),
+            self.payload_cols,
+        );
+        write_to_batch(out_schema, rows.len(), blob_cap, |writer| {
+            scatter_unified_sources(&self.sources, &self.cols, rows, writer);
+        })
     }
 }
 

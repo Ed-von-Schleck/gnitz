@@ -201,7 +201,7 @@ fn unified_to_batch(
     rows: &[(u32, u32, i64)],
     blob_cap: usize,
 ) -> Batch {
-    crate::storage::write_to_batch(schema, rows.len(), blob_cap, |w| {
+    super::super::batch::write_to_batch(schema, rows.len(), blob_cap, |w| {
         scatter_unified_sources(sources, cols, rows, w);
     })
 }

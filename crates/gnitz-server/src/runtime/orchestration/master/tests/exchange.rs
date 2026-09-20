@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_store::storage::Layout;
 use gnitz_wire::control::{ControlHeader, DecodedControl};
 use gnitz_wire::WireFlags;
 
@@ -132,9 +133,7 @@ fn rounds_are_keyed_by_source_id() {
 }
 
 /// Only a train's terminal frame counts: intermediate frames add payload and
-/// leave the round open, the slot accumulates them in frame order, and the
-/// concatenation keeps the `Consolidated` claim — losing which would silently
-/// drop the round onto the re-sorting repartition.
+/// leave the round open, and the worker's list keeps them in frame order.
 #[test]
 fn a_workers_train_completes_only_on_its_terminal_frame() {
     let mut acc = ExchangeAccumulator::new(2);
@@ -150,39 +149,10 @@ fn a_workers_train_completes_only_on_its_terminal_frame() {
         .process(0, make_frame(7, 3, &[5, 6], true))
         .expect("worker 0's terminal frame completes the round");
 
-    let w0 = relay.payloads[0].as_ref().expect("worker 0's accumulated partition");
-    assert_eq!(w0.len(), 4, "both frames' rows land in the slot");
-    let keys: Vec<u64> = (0..w0.len())
-        .map(|i| u64::from_be_bytes(w0.get_pk_bytes(i).try_into().unwrap()))
+    let keys: Vec<u64> = relay.payloads[0]
+        .iter()
+        .flat_map(|f| (0..f.len()).map(|i| u64::from_be_bytes(f.get_pk_bytes(i).try_into().unwrap())))
         .collect();
+    assert_eq!(relay.payloads[0].len(), 2, "both frames land in the worker's list");
     assert_eq!(keys, vec![1, 2, 5, 6], "in frame order, which is source-row order");
-    assert_eq!(
-        w0.layout(),
-        Layout::Consolidated,
-        "the claim every frame carried must survive the concatenation"
-    );
-}
-
-/// A worker whose train carries one `Raw` frame must NOT come back certified:
-/// the claim is the AND over its frames, not the accumulated batch's own
-/// `is_consolidated()`, which any one-row batch answers `true` to.
-#[test]
-fn one_unconsolidated_frame_clears_the_slots_claim() {
-    let mut acc = ExchangeAccumulator::new(1);
-    let mut raw = make_frame(7, 3, &[1], false);
-    raw.control.hdr.flags.batch_consolidated = false;
-    raw.data_batch = Some({
-        let mut b = chunk(&[1]);
-        b.certify_layout(Layout::Raw);
-        b
-    });
-    assert!(acc.process(0, raw).is_none());
-    let relay = acc
-        .process(0, make_frame(7, 3, &[2], true))
-        .expect("the terminal frame completes the round");
-    assert_eq!(
-        relay.payloads[0].as_ref().unwrap().layout(),
-        Layout::Raw,
-        "one unclaimed frame leaves the whole slot unclaimed"
-    );
 }

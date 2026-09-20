@@ -78,8 +78,6 @@ impl ScatterSpec<'_> {
 ///   same place the reindex Map stamps it. (Float columns, the only type whose
 ///   OPK image would diverge from the routing hash, cannot be join keys — they
 ///   are rejected at plan time — so packing every `JoinKey` is exact.)
-///   `buf` is the pack scratch; `pack_into` fully overwrites the `out_stride`
-///   prefix it reads, so no inter-row clear is needed.
 /// - `Fold`: a `GroupKey` (GROUP BY / set-op) scatter routes by the
 ///   null-distinct group fold — the baked [`GroupKeyCols`], byte-identical to
 ///   the group-key fold, which `op_reduce` also uses for the group's output
@@ -113,7 +111,7 @@ impl ScatterKey {
     /// Refused when `schema` cannot route by `spec`: a column it has not got, or
     /// one the group key or a reindex key refuses.
     #[inline]
-    pub(crate) fn new(
+    pub(super) fn new(
         spec: ScatterSpec<'_>,
         schema: &SchemaDescriptor,
         num_workers: usize,
@@ -139,26 +137,48 @@ impl ScatterKey {
         Ok(ScatterKey { kind, num_workers })
     }
 
-    /// Whether this scatter routes by native PK bytes — the callers' gate for
-    /// layout propagation (only a PK-routed sub-batch is an in-order subset of
-    /// its source).
-    #[inline]
-    pub(super) fn is_pk_routed(&self) -> bool {
-        matches!(self.kind, ScatterKind::PkBytes)
-    }
-
     /// Route one row to its owning worker.
     #[inline]
     pub(super) fn worker(&mut self, mb: &MemBatch, row: usize) -> usize {
         let nw = self.num_workers;
         match &mut self.kind {
             ScatterKind::PkBytes => worker_for_pk_bytes(mb.get_pk_bytes(row), nw),
-            ScatterKind::Packed { packer, buf } => {
-                packer.pack_into(&mut buf[..packer.out_stride], mb, row);
-                worker_for_pk_bytes(&buf[..packer.out_stride], nw)
-            }
+            ScatterKind::Packed { packer, buf } => worker_for_pk_bytes(packer.pack_prefix(buf, mb, row), nw),
             ScatterKind::Fold { keys } => worker_for_key(keys.key_row(mb, row), nw),
         }
+    }
+
+    /// Route every row of one source into `slots`, dropping the weight-0 rows
+    /// an unconsolidated source may carry — not Z-set elements.
+    pub(super) fn route_into(&mut self, mb: &MemBatch, si: u32, slots: &mut [Vec<(u32, u32, i64)>]) {
+        let nw = self.num_workers;
+        match &mut self.kind {
+            ScatterKind::PkBytes => route_rows(mb, si, slots, |mb, row| worker_for_pk_bytes(mb.get_pk_bytes(row), nw)),
+            ScatterKind::Packed { packer, buf } => route_rows(mb, si, slots, |mb, row| {
+                worker_for_pk_bytes(packer.pack_prefix(buf, mb, row), nw)
+            }),
+            ScatterKind::Fold { keys } => {
+                route_rows(mb, si, slots, |mb, row| worker_for_key(keys.key_row(mb, row), nw))
+            }
+        }
+    }
+}
+
+/// Generic in `worker`, and `#[inline(always)]`, so each [`ScatterKind`] arm
+/// monomorphizes its key derivation into the row loop.
+#[inline(always)]
+fn route_rows(
+    mb: &MemBatch,
+    si: u32,
+    slots: &mut [Vec<(u32, u32, i64)>],
+    mut worker: impl FnMut(&MemBatch, usize) -> usize,
+) {
+    for row in 0..mb.count {
+        let w = mb.get_weight(row);
+        if w == 0 {
+            continue;
+        }
+        slots[worker(mb, row)].push((si, row as u32, w));
     }
 }
 

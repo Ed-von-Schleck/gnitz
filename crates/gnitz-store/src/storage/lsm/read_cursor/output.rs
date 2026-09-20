@@ -8,10 +8,10 @@
 
 use std::rc::Rc;
 
-use super::super::batch::{write_to_batch, Batch, Layout};
+use super::super::batch::{Batch, Layout};
 use super::super::merge::{prorated_blob_cap, ColumnarSource};
 use super::super::run::Run;
-use super::super::scatter::scatter_unified_sources;
+use super::super::scatter::UnifiedSet;
 use super::{ReadCursor, SkeletonKeys};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use gnitz_expr::RowSource;
@@ -100,17 +100,9 @@ impl ReadCursor {
         let drained = if order.is_empty() {
             Batch::empty_with_schema(&self.schema)
         } else {
-            let mut cols = Vec::with_capacity(self.sources.len() * self.schema.num_payload_cols());
-            let unified: Vec<_> = self
-                .sources
-                .iter()
-                .map(|s| s.to_unified(&self.schema, &mut cols))
-                .collect();
-            let mut batch = write_to_batch(&self.schema, order.len(), blob_cap, |writer| {
-                scatter_unified_sources(&unified, &cols, &order, writer);
-            });
+            let mut batch = UnifiedSet::of(&self.sources, &self.schema).materialize(&self.schema, &order, blob_cap);
             // The merge walk emits in (PK, payload) order with consolidated
-            // weights; `write_to_batch` returns `Raw`, so certify `Consolidated`.
+            // weights, which the materialize does not claim on its own.
             batch.certify_layout(Layout::Consolidated);
             batch
         };

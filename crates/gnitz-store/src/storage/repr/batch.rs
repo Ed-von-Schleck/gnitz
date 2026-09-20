@@ -896,8 +896,7 @@ impl Batch {
         if !shares_blob && !src.blob.is_empty() {
             // The rows this call copies, not the whole source heap: a many-run merge
             // appends into one output, and the whole heap per run ratchets capacity.
-            self.blob
-                .reserve(merge::prorated_blob_cap(src.blob.len(), src.count, total));
+            self.reserve_blob(merge::prorated_blob_cap(src.blob.len(), src.count, total));
         }
         for &(start, end) in ranges {
             let n = end - start;
@@ -1117,10 +1116,9 @@ impl Batch {
         self.layout = Layout::Raw;
     }
 
-    /// Copy a faithful-propagation source's already-verified layout tag without
-    /// re-verifying: the source was verified at its birth and a subset / faithful
-    /// copy (filter, null-extend, partition-filter, single-source sub-slice)
-    /// preserves order, weights, and (PK, payload) distinctness.
+    /// Copy `src`'s already-verified layout tag without re-verifying. Sound only
+    /// where this batch is a source-order subsequence of `src`, which preserves
+    /// order, weights and (PK, payload) distinctness alike.
     #[inline]
     pub(crate) fn inherit_layout(&mut self, src: &Batch) {
         self.layout = src.layout;
@@ -1496,6 +1494,25 @@ impl Batch {
         out
     }
 
+    /// Every source's rows, in order, in one fresh batch, sized for the whole
+    /// run in rows *and* blob bytes up front. Claims no layout: a concatenation
+    /// can break (PK, payload) order. An empty run allocates nothing.
+    pub fn concat<'s>(schema: &SchemaDescriptor, sources: impl Iterator<Item = &'s Batch> + Clone) -> Batch {
+        let (mut rows, mut blob) = (0usize, 0usize);
+        for src in sources.clone() {
+            rows += src.count;
+            blob += src.blob.len();
+        }
+        if rows == 0 {
+            return Batch::empty_with_schema(schema);
+        }
+        let mut out = Batch::with_capacity_blob(schema, rows, blob);
+        for src in sources {
+            out.append_batch(src, 0, src.count);
+        }
+        out
+    }
+
     /// No rows and no string heap — so this batch already *is* its own cleared
     /// and its own copied form, and `clear`/`clone_batch` can hand back what
     /// they were given. Both keep `blob_id`: `shares_blob_with` also requires
@@ -1787,11 +1804,8 @@ impl Batch {
         let mb = batch.as_mem_batch();
         let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batch.count);
         merge::consolidate_groups(&mb, schema, &mut survivors);
-        let mut cols = Vec::with_capacity(schema.num_payload_cols());
-        let unified = [merge::mem_batch_to_unified(&mb, schema, &mut cols)];
-        let mut result = write_to_batch(schema, survivors.len(), mb.blob.len(), |writer| {
-            super::scatter::scatter_unified_sources(&unified, &cols, &survivors, writer);
-        });
+        let set = super::scatter::UnifiedSet::of(std::slice::from_ref(&mb), schema);
+        let mut result = set.materialize(schema, &survivors, mb.blob.len());
         result.certify_layout(Layout::Consolidated);
         result
     }

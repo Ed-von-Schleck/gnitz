@@ -9,11 +9,10 @@
 
 use std::ffi::CStr;
 
-use super::batch::write_to_batch;
 use super::error::StorageError;
 use super::merge::prorated_blob_cap;
-use super::merge::{run_merge, ColPtr, UnifiedSource};
-use super::scatter::scatter_unified_sources;
+use super::merge::run_merge;
+use super::scatter::UnifiedSet;
 use super::shard_file::ShardWriteOpts;
 use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
@@ -124,11 +123,8 @@ pub(super) fn merge_and_route(
         .collect();
 
     // Phase 2 — one shard per guard, each scattered column-at-a-time from its
-    // contiguous survivor slice. The `UnifiedSource` views hold raw pointers into
-    // each shard's mmap; `shards` outlives them and every scatter, all within
-    // this call.
-    let mut cols: Vec<ColPtr> = Vec::with_capacity(shards.len() * schema.num_payload_cols());
-    let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(&mut cols)).collect();
+    // contiguous survivor slice.
+    let set = UnifiedSet::of(&shards, schema);
     let nsurv = survivors.len();
     let mut out: Vec<(PkBuf, String)> = Vec::with_capacity(guards.len());
 
@@ -152,10 +148,7 @@ pub(super) fn merge_and_route(
             super::naming::compact_shard_name(dest.compact_seq, g)
         );
         // A skeleton guard writes its folded rows under the PK-only schema; a
-        // hydrated one writes the bucket at full width. The writer's schema drives
-        // the payload loop, so under a zero-payload schema `write_to_batch` carves
-        // no payload buffer and the scatter iterates zero payload columns while the
-        // fused pass still writes PK and weight.
+        // hydrated one writes the bucket at full width.
         let (wschema, rows, blob_cap) = match &folded {
             Some(rows) => (
                 skel_schema
@@ -172,9 +165,7 @@ pub(super) fn merge_and_route(
             skip_pk_filter: dest.skip_pk_filter,
             ..ShardWriteOpts::COMPACTION
         };
-        let mut batch = write_to_batch(wschema, rows.len(), blob_cap, |writer| {
-            scatter_unified_sources(&unified, &cols, rows, writer);
-        });
+        let mut batch = set.materialize(wschema, rows, blob_cap);
         if folded.is_some() {
             // The fused pass copied the *source's* payload null bits, which mean
             // nothing without a payload. Zeroing collapses the region to
