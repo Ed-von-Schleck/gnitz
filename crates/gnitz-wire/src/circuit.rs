@@ -343,6 +343,10 @@ pub enum ReindexRole {
     /// what the master's relay scatters that delta by. The Map's own `key` is
     /// that key in this node's input layout; a `Map` in between moves one and
     /// not the other.
+    ///
+    /// The engine checks `source_key` is well-formed over `source`, never that
+    /// it names the same columns the Map's own `key` does: the correspondence
+    /// is a trusted client claim.
     ScatterKey { source: u64, source_key: Vec<ReindexSlot> },
 }
 

@@ -87,7 +87,7 @@ impl DagEngine {
         let (meta, plan) = self.ensure_compiled(registry, view_id)?;
         let elide = plan.self_contained || meta.skips_exchange;
         let mut relay = Relay::new(exchange, registry, view_id, src_id, elide);
-        let input = match !plan.self_contained && meta.scatters(src_id) {
+        let input = match !plan.self_contained && meta.source_route(src_id).is_some() {
             true => relay.send(input, src_id, true),
             false => input,
         };

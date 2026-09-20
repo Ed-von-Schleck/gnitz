@@ -112,6 +112,18 @@ impl LoadedCircuit {
     }
 }
 
+/// True iff `op` carries every row through on its own worker with the PK region
+/// intact — the one definition of where the shard-skip back-walk and a bounded
+/// view's hydration seed may cross. A `Reindex` or `HashRow` Map replaces the PK
+/// region; a `WorkerFilter` drops rows.
+fn keeps_rows_and_pk_region(op: &gnitz_wire::OpNode) -> bool {
+    use gnitz_wire::{MapKind, OpNode};
+    matches!(
+        op,
+        OpNode::Filter(_) | OpNode::Map(MapKind::Projection(_) | MapKind::Compute(_))
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Carve — the circuit split at its exchanges
 // ---------------------------------------------------------------------------

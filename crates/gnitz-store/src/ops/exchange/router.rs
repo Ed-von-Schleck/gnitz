@@ -1,11 +1,11 @@
 //! Exchange worker routing: `ScatterSpec`, `ScatterKey`, and the per-row
 //! routing-key helpers.
 
-use crate::schema::{OpBuildErr, SchemaDescriptor};
+use crate::schema::{OpBuildErr, Placement, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
-use super::super::group_key::GroupKeyCols;
+use super::super::group_key::{single_col_canonical_group_key, GroupKeyCols};
 use crate::schema::key::ReindexPacker;
 
 /// Keep only the rows this worker owns, by packed-PK hash — the trace-side
@@ -59,6 +59,31 @@ impl ScatterSpec<'_> {
     /// Refused exactly where [`ScatterKey::new`] would refuse it.
     pub fn check(self, schema: &SchemaDescriptor) -> Result<(), OpBuildErr> {
         ScatterKey::new(self, schema, 1).map(drop)
+    }
+
+    /// True iff the exchange this spec describes would move nothing: its columns
+    /// are exactly `schema`'s distribution prefix, and its [`ScatterKind`] hashes
+    /// them to the bytes `worker_for_pk` already placed the rows by.
+    pub fn routes_to_native_owner(self, schema: &SchemaDescriptor) -> bool {
+        let Placement::Keyed { prefix_len } = schema.placement() else {
+            return false;
+        };
+        let pk = schema.pk_indices();
+        let (cols, native_hash): (Vec<u32>, bool) = match self {
+            // `PkBytes` over the whole PK, or `Fold` over the one column's
+            // `opk_image`. A wider fold is Xxh3 over material no PK hash sees.
+            ScatterSpec::GroupKey(cols) => (
+                cols.to_vec(),
+                cols == pk || single_col_canonical_group_key(schema, cols),
+            ),
+            // `PkBytes` or `Packed`, both re-emitting the columns' own OPK bytes
+            // — unless a slot promotes, which packs wider than its source column.
+            ScatterSpec::JoinKey(slots) => (
+                slots.iter().map(|&(c, _)| c).collect(),
+                slots.iter().all(|&(_, t)| t.is_none()),
+            ),
+        };
+        native_hash && gnitz_wire::validate_dist_prefix(pk, &cols).is_ok_and(|n| n == prefix_len as usize)
     }
 }
 

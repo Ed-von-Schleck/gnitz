@@ -1,76 +1,37 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema};
+use gnitz_store::schema::Placement;
 use gnitz_wire::type_code;
-use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel, TypeCode};
+use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
 use std::collections::HashMap;
 
 /// 3-column compound PK `(U32, U64, U64)` + one payload, so a `CLUSTER BY`
 /// prefix has more than one proper-prefix width to be tested at.
 fn three_col_pk_schema(dist_k: u8) -> SchemaDescriptor {
-    three_col_placed(Placement::Keyed { prefix_len: dist_k })
+    pk_payload_schema(&[type_code::U32, type_code::U64, type_code::U64])
+        .with_placement(Placement::Keyed { prefix_len: dist_k })
 }
 
-fn three_col_placed(placement: Placement) -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::U32, type_code::U64, type_code::U64]).with_placement(placement)
-}
-
-/// The distribution prefix must match EXACTLY: a super-prefix would let the two
-/// sides of a join skip their exchange at different widths, hashing equal join
-/// keys to different workers and silently dropping matches.
+/// The shard key indexes the output layout of whatever the back-walk crossed,
+/// the distribution prefix the source's own columns, so the two are reconciled
+/// before the elision predicate sees them.
 #[test]
-fn shard_cols_match_dist_key_is_exact_prefix() {
-    // `Keyed { k }` matches `pk_indices()[..k]` and nothing else.
-    for (k, want) in [(1u8, &[0u32][..]), (2, &[0, 1]), (0, &[0, 1, 2])] {
-        let s = three_col_pk_schema(k); // k = 0 is the default: the whole PK
-        for cand in [&[][..], &[0], &[0, 1], &[0, 1, 2], &[1]] {
-            assert_eq!(
-                shard_cols_match_dist_key(&s, cand),
-                cand == want,
-                "k={k}: {cand:?} against dist key {want:?}"
-            );
-        }
-    }
-    // A relation whose rows are not placed by `worker_for_pk` has no shard key
-    // naming where they already are, whatever its PK columns look like.
-    for p in [Placement::Replicated, Placement::Local] {
-        let s = three_col_placed(p);
-        for cand in [&[][..], &[0], &[0, 1, 2]] {
-            assert!(!shard_cols_match_dist_key(&s, cand), "{p:?}: {cand:?}");
-        }
-    }
-}
-
-/// The output IPC is elided only where the output's own route key reproduces the
-/// input prefix's: at `k == 1` (one column, same `widen_pk_be` value) and at
-/// `k == |PK|` (the source PK re-emitted verbatim). In between, a multi-column
-/// key folds through Xxh3 into a u128 unrelated to the prefix's, so the output
-/// would land on another worker and the addressing store would lose it.
-#[test]
-fn the_output_exchange_skips_only_at_the_two_ends_of_the_prefix() {
+fn the_output_exchange_skip_reads_the_shard_key_in_the_sources_columns() {
     let skips = |schema: SchemaDescriptor, shard_cols: Vec<u32>| {
         let loaded = loaded_for_test(
-            [
-                (0, scan_delta(7)),
-                (1, gnitz_wire::OpNode::ExchangeShard { shard_cols }),
-            ],
+            [(0, scan_delta(7)), (1, OpNode::ExchangeShard { shard_cols })],
             vec![(0, 1, SLOT_IN)],
         );
-        let ext = sources([(7, schema)]);
-        ViewMeta::derive(&loaded, &ext).unwrap().skips_exchange
+        ViewMeta::derive(&loaded, &sources([(7, schema)]))
+            .unwrap()
+            .skips_exchange
     };
     assert!(
         skips(three_col_pk_schema(1), vec![0]),
-        "k == 1: one column routes alike"
+        "unmapped, the shard key is already in the source's columns"
     );
-    assert!(
-        !skips(three_col_pk_schema(2), vec![0, 1]),
-        "1 < k < |PK|: the fold is unrelated to the prefix, so the shard must run"
-    );
-    assert!(skips(three_col_pk_schema(0), vec![0, 1, 2]), "k == |PK|: PK re-emitted");
-    // The key must still BE the distribution prefix.
     assert!(!skips(three_col_pk_schema(1), vec![1]), "not the leading column");
-    assert!(!skips(three_col_placed(Placement::Local), vec![0, 1, 2]), "unkeyed");
 
     // Behind a PK-preserving map the shard columns index the map's output, whose
     // leading slots are the source PK — here the source's column 2.
@@ -87,13 +48,14 @@ fn the_output_exchange_skips_only_at_the_two_ends_of_the_prefix() {
         let loaded = loaded_for_test(
             [
                 (0, scan_delta(7)),
-                (1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![0, 1]))),
-                (2, gnitz_wire::OpNode::ExchangeShard { shard_cols }),
+                (1, OpNode::Map(MapKind::Projection(vec![0, 1]))),
+                (2, OpNode::ExchangeShard { shard_cols }),
             ],
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         );
-        let ext = sources([(7, schema)]);
-        ViewMeta::derive(&loaded, &ext).unwrap().skips_exchange
+        ViewMeta::derive(&loaded, &sources([(7, schema)]))
+            .unwrap()
+            .skips_exchange
     };
     assert!(behind_a_map(vec![0]), "the map's slot 0 is the source PK");
     assert!(
@@ -107,22 +69,20 @@ fn the_output_exchange_skips_only_at_the_two_ends_of_the_prefix() {
 #[test]
 fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // Compound PK (a, b) at columns 0, 1; column 2 is payload.
-    let compound = pk_payload_schema(&[type_code::U64; 2]);
-    let ext = sources([(7, compound)]);
-    let none = FxHashSet::default();
-    let co = |cols: Vec<gnitz_wire::ReindexSlot>| {
-        compute_co_partitioned(&JoinShardMap::from_iter([(7i64, cols)]), &ext, &none, &none).contains(&7)
+    let compound = || pk_payload_schema(&[type_code::U64; 2]);
+    let both = |key: &[u32], ext: RelationRegistry| {
+        let meta = join_meta_in(JoinKind::Equi, key, [false; 2], ext);
+        (meta.source_route(7).is_none(), meta.source_route(9).is_none())
     };
-    assert!(co(vec![(0, None), (1, None)]), "shard [pk0, pk1] equals pk_indices()");
-    assert!(
-        !co(vec![(1, None), (0, None)]),
-        "permuted [pk1, pk0] != pk_indices() order"
+    assert_eq!(
+        both(&[0, 1], sources([(7, compound()), (9, compound())])),
+        (true, true),
+        "the key [pk0, pk1] is pk_indices(): both sides already sit where it routes"
     );
-    // A promoted key (a carried target) never co-partitions: native PK
-    // partitions are at the source width, not the T-wide trace key.
-    assert!(
-        !co(vec![(0, Some(TypeCode::I64)), (1, None)]),
-        "a promoted PK slot must go through the exchange"
+    assert_eq!(
+        both(&[1, 0], sources([(7, compound()), (9, compound())])),
+        (false, false),
+        "permuted [pk1, pk0] is not the distribution prefix order"
     );
 
     // Two single-PK (U64) join sides keyed on a NON-PK payload column, so neither
@@ -130,72 +90,38 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // replication.
     let base = make_schema_u64_i64;
     let replicated = base().with_placement(Placement::Replicated);
-    let join_on_payload = JoinShardMap::from_iter([(7i64, vec![(1u32, None)]), (8i64, vec![(1u32, None)])]);
-    let skips = |ext: RelationRegistry, outside_joins: &[i64], set_fed: &[i64]| {
-        let co = compute_co_partitioned(
-            &join_on_payload,
-            &ext,
-            &outside_joins.iter().copied().collect(),
-            &set_fed.iter().copied().collect(),
-        );
-        (co.contains(&7), co.contains(&8))
-    };
-    let both_skip = |ext: RelationRegistry, outside_joins: &[i64]| skips(ext, outside_joins, &[]);
     assert_eq!(
-        both_skip(sources([(7, base()), (8, base())]), &[]),
+        both(&[1], sources([(7, base()), (9, base())])),
         (false, false),
         "two partitioned sides on a non-PK key both go through the exchange"
     );
     // A partitioned fact skips too when its partner is replicated: it stays in
     // its own PK partitioning and joins the full local dim copy.
     assert_eq!(
-        both_skip(sources([(7, replicated), (8, base())]), &[]),
+        both(&[1], sources([(7, replicated), (9, base())])),
         (true, true),
         "a replicated dim lets both sides skip"
     );
     assert_eq!(
-        both_skip(sources([(7, replicated), (8, base())]), &[8]),
-        (true, true),
-        "the partitioned side's own delta is on one worker either way"
-    );
-    // A replicated delta consumed outside the join — an outer join's preserved
-    // side under its clamp — would count once per worker.
-    assert_eq!(
-        both_skip(sources([(7, replicated), (8, base())]), &[7]),
-        (false, false),
-        "a replicated side used outside its join terms makes both sides scatter"
-    );
-    assert_eq!(
-        both_skip(sources([(7, replicated), (8, replicated)]), &[]),
+        both(&[1], sources([(7, replicated), (9, replicated)])),
         (true, true),
         "replicated ⋈ replicated"
     );
-    // A partitioned side clamped to a set needs every row of a key on one worker,
-    // so it scatters by the key while its replicated partner still skips.
-    assert_eq!(
-        skips(sources([(7, replicated), (8, base())]), &[], &[8]),
-        (true, false),
-        "a partitioned set-fed side scatters beside a skipping replicated partner"
-    );
-    assert_eq!(
-        skips(sources([(7, replicated), (8, base())]), &[], &[7]),
-        (true, true),
-        "a replicated side clamps its whole copy on every worker, so it keeps its skip"
-    );
-    // The write broadcast already put a replicated source's full trace on every
-    // worker, so the promotion gate that blocks a partitioned source does not
-    // apply to it.
-    let ext_r = sources([(7, replicated)]);
-    assert!(
-        compute_co_partitioned(
-            &JoinShardMap::from_iter([(7i64, vec![(0u32, Some(TypeCode::I64))])]),
-            &ext_r,
-            &FxHashSet::default(),
-            &FxHashSet::default()
-        )
-        .contains(&7),
-        "replicated source skips regardless of carried type-promotion"
-    );
+}
+
+/// A partitioned side clamped to a set needs every row of a key on one worker,
+/// so it scatters. A replicated side clamps its whole copy on every worker.
+#[test]
+fn a_set_fed_partitioned_side_scatters_beside_a_skipping_replicated_partner() {
+    let base = make_schema_u64_i64;
+    let ext = || sources([(7, base().with_placement(Placement::Replicated)), (9, base())]);
+    let skips = |distinct: [bool; 2]| {
+        let meta = join_meta_in(JoinKind::Equi, &[1], distinct, ext());
+        (meta.source_route(7).is_none(), meta.source_route(9).is_none())
+    };
+    assert_eq!(skips([false, false]), (true, true), "neither side is clamped");
+    assert_eq!(skips([false, true]), (true, false), "the partitioned side is clamped");
+    assert_eq!(skips([true, false]), (true, true), "the replicated side is clamped");
 }
 
 /// `derive` reads "used outside a join" off the circuit: the replicated source 7
@@ -231,13 +157,63 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
             (8, make_schema_u64_i64()),
         ]);
         let meta = ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).unwrap();
-        (meta.scatters(7), meta.scatters(8))
+        (meta.source_route(7).is_some(), meta.source_route(8).is_some())
     };
     assert_eq!(scatters(false), (false, false), "join terms alone: both skip");
     assert_eq!(
         scatters(true),
         (true, true),
         "the replicated delta used directly: both scatter"
+    );
+}
+
+/// An owner-trimmed source cannot take the replicated-partner skip: its own
+/// filter drops every row the relay did not place.
+///
+///   ScanDelta(7) → Map(reindex [1]) → WorkerFilter → IntegrateTrace ─┐
+///   ScanDelta(9) → Map(reindex [1]) ────────────────────────────────→ Join(Equi)
+#[test]
+fn an_owner_trimmed_source_is_refused_the_replicated_partner_skip() {
+    let loaded = loaded_for_test(
+        [
+            (0, scan_delta(7)),
+            (1, scatter_reindex(7, &[1])),
+            (2, OpNode::WorkerFilter),
+            (3, OpNode::IntegrateTrace),
+            (4, scan_delta(9)),
+            (5, scatter_reindex(9, &[1])),
+            (
+                6,
+                OpNode::Join {
+                    kind: JoinKind::Equi,
+                    delta_is_right: false,
+                },
+            ),
+            (7, OpNode::IntegrateSink),
+        ],
+        vec![
+            (0, 1, SLOT_IN),
+            (1, 2, SLOT_IN),
+            (2, 3, SLOT_IN),
+            (4, 5, SLOT_IN),
+            (5, 6, SLOT_IN),
+            (3, 6, SLOT_B),
+            (6, 7, SLOT_IN),
+        ],
+    );
+    let ext = sources([
+        (7, make_schema_u64_i64()),
+        (9, make_schema_u64_i64().with_placement(Placement::Replicated)),
+    ]);
+    let meta = ViewMeta::derive(&loaded, &ext).unwrap();
+    assert_eq!(
+        join_cols(meta.source_route(7)),
+        Some(vec![1]),
+        "the trimmed source relays by the whole key it states"
+    );
+    assert!(
+        meta.source_route(9).is_none(),
+        "its replicated partner still skips: every worker holds its whole copy"
     );
 }
 
@@ -255,12 +231,12 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
                 (3, scatter_reindex(10, key_b)),
                 (
                     4,
-                    gnitz_wire::OpNode::Join {
-                        kind: gnitz_wire::JoinKind::Equi,
+                    OpNode::Join {
+                        kind: JoinKind::Equi,
                         delta_is_right: false,
                     },
                 ),
-                (5, gnitz_wire::OpNode::IntegrateSink),
+                (5, OpNode::IntegrateSink),
             ],
             vec![
                 (0, 1, SLOT_IN),
@@ -285,22 +261,22 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
 /// where the view needs them. Source 20's rows reach the sink through a `Union`
 /// beside the join's output, which is not a join operand.
 #[test]
-fn a_source_outside_every_join_takes_the_view_shard_route() {
+fn a_source_outside_every_join_states_no_route() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),
             (1, scatter_reindex(10, &[2])),
-            (2, gnitz_wire::OpNode::IntegrateTrace),
+            (2, OpNode::IntegrateTrace),
             (
                 3,
-                gnitz_wire::OpNode::Join {
-                    kind: gnitz_wire::JoinKind::Equi,
+                OpNode::Join {
+                    kind: JoinKind::Equi,
                     delta_is_right: false,
                 },
             ),
             (4, scan_delta(20)),
-            (5, gnitz_wire::OpNode::Union),
-            (6, gnitz_wire::OpNode::IntegrateSink),
+            (5, OpNode::Union),
+            (6, OpNode::IntegrateSink),
         ],
         vec![
             (0, 1, SLOT_IN),
@@ -315,18 +291,8 @@ fn a_source_outside_every_join_takes_the_view_shard_route() {
     let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
     assert_eq!(join_cols(meta.source_route(10)), Some(vec![2]));
     assert!(
-        meta.scatters(10),
-        "a keyed source with no matching distribution scatters"
-    );
-    assert!(
         meta.source_route(20).is_none(),
         "a source outside every join has no route"
-    );
-    assert!(!meta.scatters(20), "and is not in the scatter set");
-    assert_eq!(
-        group_key_cols(Some(meta.output_route())),
-        Some(vec![]),
-        "the output relay routes by the view's shard cols — this fixture has none"
     );
 }
 
@@ -335,7 +301,7 @@ fn a_source_outside_every_join_takes_the_view_shard_route() {
 /// refused.
 #[test]
 fn a_join_operand_whose_source_states_no_route_is_rejected() {
-    let aux = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
+    let aux = OpNode::Map(MapKind::Reindex {
         keep: vec![0],
         key: vec![(1, None)],
         role: gnitz_wire::ReindexRole::Auxiliary,
@@ -344,15 +310,15 @@ fn a_join_operand_whose_source_states_no_route_is_rejected() {
         [
             (0, scan_delta(10)),
             (1, aux),
-            (2, gnitz_wire::OpNode::IntegrateTrace),
+            (2, OpNode::IntegrateTrace),
             (
                 3,
-                gnitz_wire::OpNode::Join {
-                    kind: gnitz_wire::JoinKind::Equi,
+                OpNode::Join {
+                    kind: JoinKind::Equi,
                     delta_is_right: false,
                 },
             ),
-            (4, gnitz_wire::OpNode::IntegrateSink),
+            (4, OpNode::IntegrateSink),
         ],
         vec![
             (0, 1, SLOT_IN),
@@ -373,7 +339,7 @@ fn a_join_operand_whose_source_states_no_route_is_rejected() {
 /// 7 by column 2 of a relation whose join column is 5.
 #[test]
 fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
-    let reindex = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
+    let reindex = OpNode::Map(MapKind::Reindex {
         keep: vec![0],
         key: vec![(2, None)],
         role: gnitz_wire::ReindexRole::ScatterKey { source: 7, source_key: vec![(5, None)] },
@@ -381,17 +347,17 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
     let loaded = loaded_for_test(
         [
             (0, scan_delta(7)),
-            (1, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![5]))),
+            (1, OpNode::Map(MapKind::Projection(vec![5]))),
             (2, reindex),
-            (3, gnitz_wire::OpNode::IntegrateTrace),
+            (3, OpNode::IntegrateTrace),
             (
                 4,
-                gnitz_wire::OpNode::Join {
-                    kind: gnitz_wire::JoinKind::Equi,
+                OpNode::Join {
+                    kind: JoinKind::Equi,
                     delta_is_right: false,
                 },
             ),
-            (5, gnitz_wire::OpNode::IntegrateSink),
+            (5, OpNode::IntegrateSink),
         ],
         vec![
             (0, 1, SLOT_IN),
@@ -415,15 +381,15 @@ fn a_stated_route_the_relation_cannot_route_by_is_rejected() {
         [
             (0, scan_delta(7)),
             (1, scatter_reindex(7, &[9])),
-            (2, gnitz_wire::OpNode::IntegrateTrace),
+            (2, OpNode::IntegrateTrace),
             (
                 3,
-                gnitz_wire::OpNode::Join {
-                    kind: gnitz_wire::JoinKind::Equi,
+                OpNode::Join {
+                    kind: JoinKind::Equi,
                     delta_is_right: false,
                 },
             ),
-            (4, gnitz_wire::OpNode::IntegrateSink),
+            (4, OpNode::IntegrateSink),
         ],
         vec![
             (0, 1, SLOT_IN),
@@ -475,48 +441,49 @@ fn a_band_join_whose_n_eq_overruns_the_reindex_key_is_rejected() {
 }
 
 /// One shape covering every route: sources 7 and 9 are the join's two operands,
-/// source 0 the output relay.
+/// each optionally clamped to a set on the way in, and source 0 the output relay.
 ///
-///   ScanDelta(7) → Map(reindex key_cols) ─┐
-///   ScanDelta(9) → Map(reindex key_cols) ─→ Join(kind)
-///                                           → ExchangeShard([1]) → IntegrateSink
-fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
-    join_meta_in(kind, key_cols, sources([]))
+///   ScanDelta(7) → [Distinct] → Map(reindex key_cols) ─┐
+///   ScanDelta(9) → [Distinct] → Map(reindex key_cols) ─→ Join(kind)
+///                                        → ExchangeShard([1]) → IntegrateSink
+fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: RelationRegistry) -> ViewMeta {
+    let mut nodes: Vec<(NodeId, OpNode)> = Vec::new();
+    let mut edges: Vec<(NodeId, NodeId, usize)> = Vec::new();
+    let mut operands = Vec::new();
+    for (i, &source) in [7u64, 9].iter().enumerate() {
+        let mut cur = nodes.len();
+        nodes.push((cur, scan_delta(source)));
+        if distinct[i] {
+            let d = nodes.len();
+            nodes.push((d, OpNode::Distinct));
+            edges.push((cur, d, SLOT_IN));
+            cur = d;
+        }
+        let rekey = nodes.len();
+        nodes.push((rekey, scatter_reindex(source, key_cols)));
+        edges.push((cur, rekey, SLOT_IN));
+        operands.push(rekey);
+    }
+    let join = nodes.len();
+    nodes.push((join, OpNode::Join { kind, delta_is_right: false }));
+    edges.push((operands[0], join, SLOT_IN));
+    edges.push((operands[1], join, SLOT_B));
+    let shard = nodes.len();
+    nodes.push((shard, OpNode::ExchangeShard { shard_cols: vec![1] }));
+    edges.push((join, shard, SLOT_IN));
+    let sink = nodes.len();
+    nodes.push((sink, OpNode::IntegrateSink));
+    edges.push((shard, sink, SLOT_IN));
+    ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).expect("fixture routes")
 }
 
-/// [`join_meta`] against a host that knows the sources' schemas, so
-/// co-partitioning is decidable.
-fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: RelationRegistry) -> ViewMeta {
-    let nodes: HashMap<NodeId, OpNode> = HashMap::from([
-        (0, scan_delta(7)),
-        (1, scatter_reindex(7, key_cols)),
-        (2, scan_delta(9)),
-        (3, scatter_reindex(9, key_cols)),
-        (4, OpNode::Join { kind, delta_is_right: false }),
-        (5, OpNode::ExchangeShard { shard_cols: vec![1] }),
-        (6, OpNode::IntegrateSink),
-    ]);
-    let edges = vec![
-        (0, 1, SLOT_IN),
-        (1, 4, SLOT_IN),
-        (2, 3, SLOT_IN),
-        (3, 4, SLOT_B),
-        (4, 5, SLOT_IN),
-        (5, 6, SLOT_IN),
-    ];
-    ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).expect("fixture routes")
+/// [`join_meta_in`] against a host that knows no schema, so nothing skips.
+fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
+    join_meta_in(kind, key_cols, [false; 2], sources([]))
 }
 
 fn pure_range(n_eq: u8) -> JoinKind {
     JoinKind::Range { n_eq, rel: RangeRel::Lt }
-}
-
-/// The `GroupKey` scatter's columns, or `None` when there is no such route.
-fn group_key_cols(route: Option<&RelayRoute>) -> Option<Vec<u32>> {
-    match route? {
-        RelayRoute::GroupKey(cols) => Some(cols.to_vec()),
-        _ => None,
-    }
 }
 
 /// The `JoinKey` scatter's columns, or `None` when there is no such route.
@@ -527,42 +494,23 @@ fn join_cols(route: Option<&RelayRoute>) -> Option<Vec<u32>> {
     }
 }
 
-/// A pure-range join (`n_eq == 0`) must broadcast the keyed source's delta:
-/// its matches spread over the whole key space, so a scatter would leave each
-/// worker probing a slice it does not own and drop rows silently.
-///
-/// The join relay governs a JOIN relay ONLY: the output relay (`source_id == 0`)
-/// is not one, and reading it as one broadcasts what must scatter.
+/// A pure-range join (`n_eq == 0`) and a cross join spread their matches over
+/// the whole key space, so the keyed source's delta must be broadcast. The
+/// output relay (`source_id == 0`) is not a join relay and still scatters.
 #[test]
-fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
-    let meta = join_meta(pure_range(0), &[1]);
-    assert!(
-        matches!(meta.source_route(7), Some(RelayRoute::Broadcast)),
-        "the keyed input relay of a pure-range join must broadcast"
-    );
-    non_join_relays_route_by_shard_cols(&meta);
-}
-
-/// A cross join has no key at all, so its keyed source broadcasts exactly as a
-/// pure-range join's does.
-#[test]
-fn a_cross_join_broadcasts_like_a_pure_range_join() {
-    let meta = join_meta(JoinKind::Cross, &[1]);
-    assert!(
-        matches!(meta.source_route(7), Some(RelayRoute::Broadcast)),
-        "the keyed input relay of a cross join must broadcast"
-    );
-    non_join_relays_route_by_shard_cols(&meta);
-}
-
-/// Shared tail of the two broadcast tests: the output relay is not a join relay,
-/// so it routes by the view's shard cols, exactly as under an equi join.
-fn non_join_relays_route_by_shard_cols(meta: &ViewMeta) {
-    assert_eq!(
-        group_key_cols(Some(meta.output_route())).as_deref(),
-        Some(&[1u32][..]),
-        "source 0 is not a join relay: it routes by the view's shard cols"
-    );
+fn the_keyed_source_of_a_keyless_join_broadcasts_and_the_output_relay_does_not() {
+    for kind in [pure_range(0), JoinKind::Cross] {
+        let meta = join_meta(kind, &[1]);
+        assert!(
+            matches!(meta.source_route(7), Some(RelayRoute::Broadcast)),
+            "{kind:?}: the keyed input relay must broadcast"
+        );
+        assert_eq!(
+            meta.output_shard_cols(),
+            &[1u32][..],
+            "{kind:?}: source 0 is not a join relay — it routes by the view's shard cols"
+        );
+    }
 }
 
 /// A band join (`n_eq >= 1`) scatters by the equality prefix, dropping the
@@ -583,6 +531,34 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
     assert_eq!(join_cols(equi.source_route(7)), Some(vec![3, 4]));
 }
 
+/// A band join's relay scatters by the truncated `[eq…]` key, so its skip turns
+/// on whether THAT key is the source's distribution prefix.
+#[test]
+fn a_band_join_skips_the_relay_where_its_equality_prefix_is_the_distribution_key() {
+    let skips = |dist_k: u8| {
+        let schema = pk_payload_schema(&[type_code::U64; 2]).with_placement(Placement::Keyed { prefix_len: dist_k });
+        join_meta_in(pure_range(1), &[0, 1], [false; 2], sources([(7, schema), (9, schema)]))
+            .source_route(7)
+            .is_none()
+    };
+    assert!(skips(1), "CLUSTER BY (pk0) is exactly the prefix the relay scatters by");
+    assert!(
+        !skips(2),
+        "the full-PK distribution is wider than the eq prefix, so the relay must run"
+    );
+}
+
+/// A band join takes the replicated-partner skip too: the replicated trace is
+/// whole on every worker, so the range probe finds every match locally.
+#[test]
+fn a_band_join_skips_beside_a_replicated_partner() {
+    let base = || pk_payload_schema(&[type_code::U64; 2]);
+    let ext = sources([(7, base().with_placement(Placement::Replicated)), (9, base())]);
+    let meta = join_meta_in(pure_range(1), &[0, 1], [false; 2], ext);
+    assert!(meta.source_route(7).is_none(), "the replicated side");
+    assert!(meta.source_route(9).is_none(), "and its partitioned partner");
+}
+
 /// A broadcast join relays its keyed source even where that source's distribution
 /// IS the key it reindexes on: its matches spread over the whole other side, so
 /// co-partitioning places none of them. The equi-join over the same fixture is
@@ -591,17 +567,16 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
 fn a_broadcast_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip() {
     let keyed_by_pk = |kind| {
         let ext = sources([(7i64, make_schema_u64_i64())]);
-        join_meta_in(kind, &[0], ext).scatters(7)
+        join_meta_in(kind, &[0], [false; 2], ext).source_route(7).is_some()
     };
     assert!(!keyed_by_pk(JoinKind::Equi), "the equi join skips the relay");
     assert!(keyed_by_pk(pure_range(0)), "the range join must relay anyway");
     assert!(keyed_by_pk(JoinKind::Cross), "the cross join must relay anyway");
 }
 
-/// A source whose PK re-key only an owner filter reads needs its rows on that PK's
-/// owner and nowhere else, so under a broadcast join relay it routes by the PK and
-/// skips the relay where its distribution already places it there. The partner
-/// feeding the join directly still broadcasts.
+/// A source whose PK re-key only an owner filter reads routes by the whole key
+/// it states, whatever relay the circuit's joins call for, and skips the relay
+/// where its distribution already places it there.
 ///
 ///   ScanDelta(7) → Map(reindex pk) → WorkerFilter → IntegrateTrace ─┐
 ///   ScanDelta(9) → Map(reindex [1]) ──────────────────────────────→ Join(range, n_eq 0)
@@ -638,14 +613,13 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
         ViewMeta::derive(&loaded, &sources([(7, schema), (9, make_schema_u64_i64())])).unwrap()
     };
     let keyed = meta(make_schema_u64_i64());
-    assert!(!keyed.scatters(7), "already on its PK's owner");
+    assert!(keyed.source_route(7).is_none(), "already on its PK's owner");
     assert!(matches!(keyed.source_route(9), Some(RelayRoute::Broadcast)));
-    assert!(keyed.scatters(9));
 
     let replicated = meta(make_schema_u64_i64().with_placement(Placement::Replicated));
-    assert_eq!(join_cols(replicated.source_route(7)), Some(vec![0]));
-    assert!(
-        replicated.scatters(7),
+    assert_eq!(
+        join_cols(replicated.source_route(7)),
+        Some(vec![0]),
         "a replicated copy is relayed by key from one worker"
     );
 }
@@ -728,6 +702,7 @@ fn pk_source_names_only_the_relation_whose_pk_region_survives_to_the_sink() {
 /// join routes by the whole key, and each join kind names its own relay.
 #[test]
 fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key() {
+    let relay_of_circuit = |loaded: &LoadedCircuit| source_uses(loaded).map(|(_, relay)| relay);
     let loaded = loaded_for_test(
         [
             (0, scan_delta(7)),
@@ -748,9 +723,9 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
         ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN), (3, 4, SLOT_IN)],
     );
-    assert_eq!(circuit_join_relay(&loaded), Ok(None));
+    assert_eq!(relay_of_circuit(&loaded), Ok(None));
 
-    let joined = |kind: gnitz_wire::JoinKind| {
+    let joined = |kind: JoinKind| {
         loaded_for_test(
             [
                 (0, scan_delta(7)),
@@ -762,14 +737,13 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
             vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_B), (3, 4, SLOT_IN)],
         )
     };
-    let range = |n_eq| gnitz_wire::JoinKind::Range { n_eq, rel: gnitz_wire::RangeRel::Lt };
     for (kind, want) in [
-        (gnitz_wire::JoinKind::Equi, JoinRelay::WholeKey),
-        (range(2), JoinRelay::EqPrefix { n_eq: 2 }),
-        (range(0), JoinRelay::Broadcast),
-        (gnitz_wire::JoinKind::Cross, JoinRelay::Broadcast),
+        (JoinKind::Equi, JoinRelay::WholeKey),
+        (pure_range(2), JoinRelay::EqPrefix { n_eq: 2 }),
+        (pure_range(0), JoinRelay::Broadcast),
+        (JoinKind::Cross, JoinRelay::Broadcast),
     ] {
-        assert_eq!(circuit_join_relay(&joined(kind)), Ok(Some(want)), "{kind:?}");
+        assert_eq!(relay_of_circuit(&joined(kind)), Ok(Some(want)), "{kind:?}");
     }
 }
 
@@ -777,7 +751,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
 /// relays are refused rather than routed by whichever the walk reaches first.
 #[test]
 fn joins_calling_for_different_relays_are_rejected() {
-    let two_joins = |second: gnitz_wire::JoinKind| {
+    let two_joins = |second: JoinKind| {
         loaded_for_test(
             [
                 (0, scan_delta(7)),
@@ -787,7 +761,7 @@ fn joins_calling_for_different_relays_are_rejected() {
                 (
                     4,
                     OpNode::Join {
-                        kind: gnitz_wire::JoinKind::Equi,
+                        kind: JoinKind::Equi,
                         delta_is_right: false,
                     },
                 ),
@@ -809,16 +783,16 @@ fn joins_calling_for_different_relays_are_rejected() {
         )
     };
     assert_eq!(
-        circuit_join_relay(&two_joins(gnitz_wire::JoinKind::Equi)),
+        source_uses(&two_joins(JoinKind::Equi)).map(|(_, relay)| relay),
         Ok(Some(JoinRelay::WholeKey)),
         "both terms of one join carry the same kind"
     );
     assert_eq!(
-        rejection(circuit_join_relay(&two_joins(gnitz_wire::JoinKind::Cross))),
+        rejection(source_uses(&two_joins(JoinKind::Cross)).map(drop)),
         "circuit joins need different relays"
     );
     assert_eq!(
-        rejection(ViewMeta::derive(&two_joins(gnitz_wire::JoinKind::Cross), &sources([])).map(drop)),
+        rejection(ViewMeta::derive(&two_joins(JoinKind::Cross), &sources([])).map(drop)),
         "circuit joins need different relays",
         "the compile is refused"
     );

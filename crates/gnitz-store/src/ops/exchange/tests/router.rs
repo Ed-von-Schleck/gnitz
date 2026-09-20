@@ -300,3 +300,141 @@ fn route_into_agrees_with_worker_on_every_scatter_kind() {
         assert_eq!(got, want, "{spec:?}: route_into must match worker row for row");
     }
 }
+
+// ── routes_to_native_owner: the exchange-elision predicate ──────────────
+
+/// A 3-column compound PK `(U32, I32, U64)` + an I64 payload, so a distribution
+/// prefix has a proper-prefix width to be wrong at.
+fn three_col_schema(placement: Placement) -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::I32, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1, 2],
+    )
+    .with_placement(placement)
+}
+
+/// `n` rows over [`three_col_schema`], their PK columns varying independently.
+fn three_col_batch(schema: &SchemaDescriptor, n: usize) -> Batch {
+    let mut b = Batch::with_capacity(schema, n);
+    for i in 0..n as u32 {
+        let mut pk = [0u8; 16];
+        gnitz_wire::encode_pk_column(&(i % 5 + 1).to_le_bytes(), type_code::U32, &mut pk[0..4]);
+        gnitz_wire::encode_pk_column(&(-(i as i32) * 3).to_le_bytes(), type_code::I32, &mut pk[4..8]);
+        gnitz_wire::encode_pk_column(&(u64::from(i) * 31 + 7).to_le_bytes(), type_code::U64, &mut pk[8..16]);
+        b.extend_pk_bytes(&pk);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &i64::from(i).to_le_bytes());
+        b.count += 1;
+    }
+    b
+}
+
+/// The unpromoted key slots for `cols`.
+fn slots_of(cols: &[u32]) -> Vec<gnitz_wire::ReindexSlot> {
+    cols.iter().map(|&c| (c, None)).collect()
+}
+
+/// The predicate's whole promise: wherever it accepts, the scatter it describes
+/// routes every row to the worker the table-key router already placed it on.
+#[test]
+fn every_accepted_spec_routes_each_row_to_its_tables_own_worker() {
+    const NW: usize = 4;
+    let mut accepted = 0usize;
+    for k in [1u8, 2, 3] {
+        let schema = three_col_schema(Placement::Keyed { prefix_len: k });
+        let b = three_col_batch(&schema, 24);
+        let mb = b.as_mem_batch();
+        for cols in [&[0u32][..], &[0, 1], &[0, 1, 2], &[1], &[1, 0]] {
+            let js = slots_of(cols);
+            for spec in [ScatterSpec::GroupKey(cols), ScatterSpec::JoinKey(&js)] {
+                if !spec.routes_to_native_owner(&schema) {
+                    continue;
+                }
+                accepted += 1;
+                let mut key = ScatterKey::new(spec, &schema, NW).expect("an accepted spec routes");
+                for row in 0..mb.count {
+                    assert_eq!(
+                        key.worker(&mb, row),
+                        schema.worker_for_pk(mb.get_pk_bytes(row), NW),
+                        "k={k}, {spec:?}, row {row}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(accepted, 5, "the accept side must cover both kinds at both ends");
+}
+
+/// Over a 2-of-3 proper prefix a `GroupKey` really does land its rows elsewhere,
+/// where the same columns as a `JoinKey` pack the prefix's own OPK bytes: the
+/// refusal is about the hash, not the width.
+#[test]
+fn a_proper_prefix_group_key_is_refused_and_does_route_elsewhere() {
+    const NW: usize = 4;
+    let schema = three_col_schema(Placement::Keyed { prefix_len: 2 });
+    let cols = [0u32, 1];
+    assert!(!ScatterSpec::GroupKey(&cols).routes_to_native_owner(&schema));
+    assert!(ScatterSpec::JoinKey(&slots_of(&cols)).routes_to_native_owner(&schema));
+
+    let b = three_col_batch(&schema, 24);
+    let mb = b.as_mem_batch();
+    let mut key = ScatterKey::new(ScatterSpec::GroupKey(&cols), &schema, NW).expect("the fixture key routes");
+    assert!(
+        (0..mb.count).any(|row| key.worker(&mb, row) != schema.worker_for_pk(mb.get_pk_bytes(row), NW)),
+        "the fold must disagree with the prefix hash somewhere"
+    );
+}
+
+/// The distribution prefix must match exactly, carry no promotion, and belong to
+/// a relation `worker_for_pk` actually places.
+#[test]
+fn routes_to_native_owner_is_the_exact_unpromoted_distribution_prefix() {
+    for (k, want) in [(1u8, &[0u32][..]), (2, &[0, 1]), (0, &[0, 1, 2])] {
+        let s = three_col_schema(Placement::Keyed { prefix_len: k }); // k = 0 is the default: the whole PK
+        for cand in [&[][..], &[0], &[0, 1], &[0, 1, 2], &[1], &[1, 0]] {
+            assert_eq!(
+                ScatterSpec::JoinKey(&slots_of(cand)).routes_to_native_owner(&s),
+                cand == want,
+                "k={k}: {cand:?} against the distribution key {want:?}"
+            );
+        }
+        let promoted: Vec<gnitz_wire::ReindexSlot> = want
+            .iter()
+            .map(|&c| (c, (c == 0).then_some(gnitz_wire::TypeCode::U64)))
+            .collect();
+        assert!(
+            !ScatterSpec::JoinKey(&promoted).routes_to_native_owner(&s),
+            "k={k}: a carried target moves the slot off its source column's width"
+        );
+    }
+    for p in [Placement::Replicated, Placement::Local] {
+        let s = three_col_schema(p);
+        for cand in [&[][..], &[0], &[0, 1, 2]] {
+            assert!(
+                !ScatterSpec::GroupKey(cand).routes_to_native_owner(&s),
+                "{p:?}: {cand:?}"
+            );
+            assert!(
+                !ScatterSpec::JoinKey(&slots_of(cand)).routes_to_native_owner(&s),
+                "{p:?}: {cand:?}"
+            );
+        }
+    }
+}
+
+/// A `GroupKey` over the distribution prefix routes natively only at the two
+/// ends of the key width, so a `CLUSTER BY` of 2+ proper-prefix columns buys a
+/// `GROUP BY` on it no locality.
+#[test]
+fn a_group_key_routes_natively_only_at_the_two_ends_of_the_prefix() {
+    for (k, cols, want) in [(1u8, &[0u32][..], true), (2, &[0, 1], false), (3, &[0, 1, 2], true)] {
+        let s = three_col_schema(Placement::Keyed { prefix_len: k });
+        assert_eq!(ScatterSpec::GroupKey(cols).routes_to_native_owner(&s), want, "k={k}");
+    }
+}

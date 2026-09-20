@@ -381,23 +381,35 @@ impl MasterDispatcher {
             .map_err(|e| format!("view {view_id}: {e}"))?;
         // `prepare_relay` turns this `Err` into a cluster abort, taken over
         // scattering under a key the rows were never stored under.
-        let route = match source_id {
-            OUTPUT_RELAY => meta.output_route(),
-            id => meta
+        let dest = match source_id {
+            OUTPUT_RELAY => op_relay_scatter(
+                &sources,
+                ScatterSpec::GroupKey(meta.output_shard_cols()),
+                &schema,
+                num_workers,
+            ),
+            id => match meta
                 .source_route(id)
-                .ok_or_else(|| format!("view {view_id}: source {id} has no relay route"))?,
-        };
-        let dest = match route {
-            // A probe with no equality key must see the whole delta: a match can
-            // live on any worker's trace. The per-worker slices are disjoint, so
-            // their concatenation is the delta exactly once.
-            RelayRoute::Broadcast => Ok(vec![Batch::concat(&schema, sources.iter().copied())]),
-            RelayRoute::GroupKey(cols) => op_relay_scatter(&sources, ScatterSpec::GroupKey(cols), &schema, num_workers),
-            RelayRoute::JoinKey(slots) => op_relay_scatter(&sources, ScatterSpec::JoinKey(slots), &schema, num_workers),
+                .ok_or_else(|| format!("view {view_id}: source {id} has no relay route"))?
+            {
+                // A probe with no equality key must see the whole delta: a match
+                // can live on any worker's trace. The per-worker slices are
+                // disjoint, so their concatenation is the delta exactly once.
+                RelayRoute::Broadcast => Ok(vec![Batch::concat(&schema, sources.iter().copied())]),
+                RelayRoute::JoinKey(slots) => {
+                    op_relay_scatter(&sources, ScatterSpec::JoinKey(slots), &schema, num_workers)
+                }
+            },
         };
         // The scatter key's own reason, not a restatement: it names the column
         // and the bound it missed.
-        let dest = dest.map_err(|e| format!("view {view_id}: source {source_id} relay key: {e}"))?;
+        let dest = dest.map_err(|e| {
+            let round = match source_id {
+                OUTPUT_RELAY => "output relay key".to_string(),
+                id => format!("source {id} relay key"),
+            };
+            format!("view {view_id}: {round}: {e}")
+        })?;
 
         Ok(RelayPrepared {
             view: wire::WireSchema::encoded(view_id, schema),
