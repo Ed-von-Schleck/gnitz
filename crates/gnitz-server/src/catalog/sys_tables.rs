@@ -22,7 +22,7 @@ use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
     COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID,
     IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX,
-    VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
+    VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +97,7 @@ pub(super) struct RelationRegistration<'a> {
     pub(super) pk: PkColList,
     pub(super) placement: Placement,
     pub(super) props: ViewProps,
+    pub(super) pk_repeats: bool,
 }
 
 /// Decode TABLE_TAB `row` into the whole registration it describes, `id` off the
@@ -134,6 +135,8 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
             Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
         },
         props: ViewProps::default(),
+        // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
+        pk_repeats: props.stream,
     })
 }
 
@@ -147,6 +150,8 @@ pub(super) struct ViewRegistration<'a> {
     /// The user view this row is an internal chain segment of; `0` for a user
     /// view.
     pub(super) owner_view_id: i64,
+    /// [`gnitz_wire::VIEW_FLAG_PK_REPEATS`].
+    pub(super) pk_repeats: bool,
 }
 
 /// Decode VIEW_TAB `row`.
@@ -165,6 +170,7 @@ pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistr
         pk,
         props,
         owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
+        pk_repeats: payload_u64(batch, row, VIEWTAB_PAY_FLAGS) & gnitz_wire::VIEW_FLAG_PK_REPEATS != 0,
     })
 }
 

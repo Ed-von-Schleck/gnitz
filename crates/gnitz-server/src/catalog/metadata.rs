@@ -87,6 +87,11 @@ impl CatalogEngine {
 
     // -- FK / index metadata queries (for distributed validation) -------------
 
+    /// [`RelationEntry::pk_repeats`] of `id`; `false` for an unregistered one.
+    pub(crate) fn pk_repeats_of(&self, id: i64) -> bool {
+        self.caches.relations.get(&id).is_some_and(|e| e.pk_repeats)
+    }
+
     /// All FK edges where `table_id` is the child (empty when none).
     pub(crate) fn fk_constraints_of(&self, table_id: i64) -> &[FkEdge] {
         self.caches.relations.get(&table_id).map_or(&[], |e| e.fks.as_slice())

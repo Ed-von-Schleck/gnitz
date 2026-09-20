@@ -40,3 +40,17 @@ fn a_computed_string_projection_declares_a_string_column() {
     // A numeric expression still takes its register image.
     assert_eq!(computed_column(None, 0, TypeCode::F32.into()).type_code, TypeCode::F64);
 }
+
+/// A synthesized key list is capped by the PK-list width, whatever assembled it
+/// — a join's reindex slots or a join output's pair PK. A zero-slot list is the
+/// keyless join, which this rule has nothing to say about.
+#[test]
+fn pk_list_arity_bounds() {
+    reject_pk_list_arity("join key list", 0).unwrap();
+    reject_pk_list_arity("join key list", gnitz_core::PK_LIST_MAX_COLS).unwrap();
+    let over = reject_pk_list_arity("range JOIN output PK", gnitz_core::PK_LIST_MAX_COLS + 1).unwrap_err();
+    let GnitzSqlError::Unsupported(msg) = over else {
+        panic!("expected Unsupported, got {over:?}");
+    };
+    assert!(msg.contains("range JOIN output PK"), "{msg}");
+}

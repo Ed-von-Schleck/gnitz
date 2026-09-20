@@ -370,9 +370,12 @@ pub(crate) enum GetSource {
 }
 
 impl GetSource {
-    /// A stream holds no rows, so nothing read from one has a row identity.
-    fn is_stream(&self) -> bool {
-        matches!(self, GetSource::Catalog { desc } if desc.class == gnitz_core::RelClass::Stream)
+    /// The relation's own answer; the ad-hoc source has no relation to ask.
+    fn pk_repeats(&self) -> bool {
+        match self {
+            GetSource::Catalog { desc } => desc.pk_repeats,
+            GetSource::AdHoc => true,
+        }
     }
 }
 
@@ -572,8 +575,8 @@ impl JoinType {
     /// `positive_part(P_all − π_P(inner))`. Wider than [`Self::preserves`], which
     /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
     /// neither side yet all three decide per left row by match existence. The
-    /// reindex keep set protects exactly the ν operands, so it asks this rather
-    /// than `preserves`.
+    /// reindex keep set protects the ν operands, so it asks this rather than
+    /// `preserves`.
     pub(crate) fn has_nu(self, is_left: bool) -> bool {
         self.preserves(is_left) || (is_left && self.is_decorrelated())
     }
@@ -690,6 +693,22 @@ impl JoinClass {
     }
 }
 
+/// Per-column common type for a set-op pair, or `None` to keep the exact-match
+/// type-mismatch error. A differing pair is admitted only where the lowering's
+/// column copy can widen into the target, which `check_copy_types` decides with
+/// this same predicate.
+fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
+    if l == r {
+        return Some(l);
+    }
+    if !l.decimal_domains_match(r) {
+        return None;
+    }
+    let t = l.tc.join_key_common_type(r.tc)?;
+    let widens = |src: TypeCode| gnitz_wire::is_widening_promotion(src as u8, t as u8);
+    (widens(l.tc) && widens(r.tc)).then_some(ColType::of(t))
+}
+
 impl RelExpr {
     /// A base table or committed/hidden-view source: one fresh `ColId` per
     /// registered schema column, in schema order (so a `ColId`'s env position is
@@ -737,9 +756,11 @@ impl RelExpr {
         Rc::new(RelExpr::Reduce { input, group_cols, aggs })
     }
 
-    /// A DISTINCT over its input's visible columns.
-    pub(crate) fn distinct(input: Rc<RelExpr>) -> Rc<RelExpr> {
-        Rc::new(RelExpr::Distinct { input })
+    /// A DISTINCT over its input's visible columns. The one home of the float
+    /// rule for a DISTINCT row identity, which the lowering keys on a hash of.
+    pub(crate) fn distinct(input: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        crate::validate::reject_float_keys(input.cols().iter().map(|c| &c.def), "SELECT DISTINCT")?;
+        Ok(Rc::new(RelExpr::Distinct { input }))
     }
 
     /// A top-N over `input`. `limit ≥ 1`, and every key names an input column.
@@ -779,17 +800,10 @@ impl RelExpr {
         }
         match self {
             RelExpr::Get { source, schema, cols } => {
-                if source.is_stream() {
+                if source.pk_repeats() {
                     return None;
                 }
-                let pk = &schema.pk_cols;
-                if pk
-                    .iter()
-                    .any(|&i| guards::is_minted_join_key(&schema.columns[i as usize]))
-                {
-                    return None;
-                }
-                Some(pk.iter().map(|&i| cols[i as usize].id).collect())
+                Some(schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Filter { .. } | RelExpr::Project { .. } | RelExpr::Alias { .. } => {
                 unreachable!("key_through maps a pass-through node")
@@ -858,9 +872,10 @@ impl RelExpr {
     }
 
     /// A set operation. Pairs the two sides' output columns positionally,
-    /// promoting each pair to its common type (`set_op_common_type`) and stamping
+    /// promoting each pair to its common type ([`set_op_common_type`]) and stamping
     /// the per-operator output nullability (Union `l||r`, Intersect `l&&r`, Except
-    /// `l`). Rejects an arity or type mismatch — the one home for those guards.
+    /// `l`). Rejects an arity or type mismatch, and a float output column — the
+    /// content hash identifying a set-op row cannot carry one.
     pub(crate) fn set_op(
         ids: &ColIdGen,
         op: SetOpKind,
@@ -879,7 +894,7 @@ impl RelExpr {
         }
         let mut out = Vec::with_capacity(lcols.len());
         for (i, (l, r)) in lcols.iter().zip(&rcols).enumerate() {
-            let ty = guards::set_op_common_type(l.def.ty(), r.def.ty()).ok_or_else(|| {
+            let ty = set_op_common_type(l.def.ty(), r.def.ty()).ok_or_else(|| {
                 GnitzSqlError::Plan(format!(
                     "set operation: column {} type mismatch ({} vs {})",
                     i,
@@ -906,6 +921,7 @@ impl RelExpr {
                 out: HirCol::new(ids.next(), def),
             });
         }
+        crate::validate::reject_float_keys(out.iter().map(|c| &c.out.def), "set operation")?;
         Ok(Rc::new(RelExpr::SetOp { op, all, left, right, out }))
     }
 
@@ -952,3 +968,7 @@ impl RelExpr {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/hir.rs"]
+mod tests;

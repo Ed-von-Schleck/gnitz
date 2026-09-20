@@ -12,7 +12,7 @@
 
 use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
-use crate::schema::key::ReindexPacker;
+use crate::schema::key::{locate_key_col, ReindexPacker};
 use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
 use gnitz_wire::RowHasher;
@@ -340,6 +340,9 @@ fn hashrow_output_schema(
     b.push_pk(SchemaColumn::new(crate::schema::type_code::U128, 0))
         .ok_or_else(over)?;
     for &(c, tgt) in cols {
+        // A key column, not merely an in-range one — the screen the reindex and
+        // top-N key kinds clear at this same boundary.
+        locate_key_col(in_schema, c, "hash-row map")?;
         let src = in_schema
             .column(c as usize)
             .ok_or_else(|| OpBuildErr::oob_col("hash-row map: column", c, in_schema))?;

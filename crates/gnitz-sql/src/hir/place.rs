@@ -3,12 +3,12 @@
 //! in a `Filter` above the join.
 
 use super::guards::{
-    reject_join_key_arity, reject_keyless_non_inner, reject_outer_with_residual, reject_pure_range,
-    validate_join_key_pair, validate_range_join_key_pair,
+    reject_join_shape, reject_outer_with_residual, validate_join_key_pair, validate_range_join_key_pair,
 };
 use super::{cross_comparison, side, EqPair, HirCol, HirExpr, HirRange, JoinClass, JoinType, RelExpr, Side};
 use crate::error::GnitzSqlError;
 use crate::ir::BinOp;
+use crate::validate::reject_pk_list_arity;
 use std::rc::Rc;
 
 /// Where a conjunct was written: in the join's own ON, or in a filter over it.
@@ -28,9 +28,11 @@ impl RelExpr {
     ) -> Result<Rc<RelExpr>, GnitzSqlError> {
         let on = on.into_iter().flat_map(HirExpr::conjuncts).collect();
         let placed = place(&left, &right, kind, JoinClass::default(), on, Origin::On)?;
-        reject_join_key_arity(placed.class.eq.len(), placed.class.range.is_some())?;
-        reject_keyless_non_inner(kind, placed.class.shape())?;
-        reject_pure_range(kind, &placed.class)?;
+        reject_pk_list_arity(
+            "join key list",
+            placed.class.eq.len() + usize::from(placed.class.range.is_some()),
+        )?;
+        reject_join_shape(kind, placed.class.shape())?;
         reject_outer_with_residual(kind, &placed.above)?;
         placed.build(&left, &right, kind)
     }
@@ -146,11 +148,7 @@ impl JoinClass {
         // Past the arity cap an ON comparison still claims its slot, so the cap's
         // error reports the count written; a filter comparison stays a filter.
         let fits = origin == Origin::On
-            || reject_join_key_arity(
-                self.eq.len() + usize::from(range.is_none()),
-                self.range.is_some() || range.is_some(),
-            )
-            .is_ok();
+            || self.eq.len() + 1 + usize::from(self.range.is_some()) <= gnitz_core::PK_LIST_MAX_COLS;
         if !(slot && fits) {
             return Ok(Some(conj));
         }

@@ -4,7 +4,7 @@
 //! same "populate before the operator reads" contract.
 //!
 //! ```text
-//! PK      = group key (the AVI packer) ‖ leading 8 bytes of image_0
+//! PK      = group key (the AVI packer) ‖ leading bytes of image_0
 //! payload = image_0 … image_{k-1}   (BLOB, one per ORDER BY key)
 //!         ‖ the output row's payload columns, in output order
 //! ```
@@ -15,21 +15,22 @@
 //! leading image bytes in the PK keep one group's entries off the merge's
 //! row-by-row equal-PK arm, exactly as the AVI's value column does.
 
-use crate::schema::key::{leading_u64, ReindexPacker};
+use crate::schema::key::ReindexPacker;
 use crate::schema::{type_code, ColumnLocator, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::OrderKey;
 
 use super::super::group_key::push_group_index_key;
-use super::super::order_image::{append_image, ImageKind};
+use super::super::order_image::{append_image, write_image_slot, ImageKind};
 
-/// The PK column carrying `image_0`'s leading bytes, and the reservation the
-/// group key is packed inside.
+/// The PK column carrying `image_0`, and the reservation the group key is packed
+/// inside.
 const LEAD_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
+/// [`LEAD_COL`] for a wide `image_0`.
+const WIDE_LEAD_COL: SchemaColumn = SchemaColumn::new(type_code::U128, 0);
 const SUFFIX: [SchemaColumn; 1] = [LEAD_COL];
-const LEAD_BYTES: usize = LEAD_COL.size() as usize;
-const _: () = assert!(LEAD_BYTES == 8);
+const WIDE_SUFFIX: [SchemaColumn; 1] = [WIDE_LEAD_COL];
 /// One image column: content-ordered, never NULL (a NULL value has an image).
 const IMAGE_COL: SchemaColumn = SchemaColumn::new(type_code::BLOB, 0);
 
@@ -68,6 +69,8 @@ pub struct TopNIndex {
     /// two schemas is never re-spelled at a call site.
     carried_in_input: Vec<ColumnLocator>,
     pub(super) carried_in_index: Vec<ColumnLocator>,
+    /// Width of the lead slot this bake's suffix reserved, by `order[0]`'s kind.
+    lead_bytes: usize,
 }
 
 impl TopNIndex {
@@ -82,7 +85,6 @@ impl TopNIndex {
         if order.is_empty() {
             return Err(OpBuildErr::shape("top-n: no order keys"));
         }
-        let key_packer = ReindexPacker::new_group_key(input, group_cols, &SUFFIX)?;
         let order = order
             .iter()
             .map(|key| {
@@ -92,8 +94,13 @@ impl TopNIndex {
                 Ok(OrderSpec { key: OrderLocator::of(loc, key), kind })
             })
             .collect::<Result<Vec<_>, OpBuildErr>>()?;
+        let suffix = match order[0].kind {
+            ImageKind::Wide(_) => &WIDE_SUFFIX,
+            ImageKind::Scalar(_) => &SUFFIX,
+        };
+        let key_packer = ReindexPacker::new_group_key(input, group_cols, suffix)?;
         let mut b = crate::schema::DerivedSchema::new();
-        push_group_index_key(&mut b, &key_packer, &SUFFIX);
+        push_group_index_key(&mut b, &key_packer, suffix);
         const OVERFLOW: &str = "top-n: index exceeds MAX_COLUMNS";
         for _ in &order {
             b.push(IMAGE_COL).ok_or_else(|| OpBuildErr::shape(OVERFLOW))?;
@@ -110,6 +117,7 @@ impl TopNIndex {
             carried_in_input: carried_cols.iter().map(|&c| input.locate(c as usize)).collect(),
             carried_in_index: (tail..schema.num_columns()).map(|c| schema.locate(c)).collect(),
             schema,
+            lead_bytes: suffix[0].size() as usize,
         })
     }
 
@@ -142,12 +150,11 @@ impl TopNIndex {
                 continue;
             }
             self.group_prefix(&mut key, &mb, row);
-            // `image_0` doubles as the PK's lead (the whole window is overwritten,
-            // so no stale bytes leak across rows); every image is written once.
+            // `image_0` doubles as the PK's lead; every image is written once.
             image.clear();
             self.order[0].append_image(&mb, row, &mut image);
-            key[stride..stride + LEAD_BYTES].copy_from_slice(&leading_u64(&image).to_be_bytes());
-            out.begin_row(&key[..stride + LEAD_BYTES], weight);
+            write_image_slot(&mut key[stride..stride + self.lead_bytes], &image);
+            out.begin_row(&key[..stride + self.lead_bytes], weight);
             out.extend_col_blob(0, &image);
             for (i, spec) in self.order.iter().enumerate().skip(1) {
                 image.clear();

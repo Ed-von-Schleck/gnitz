@@ -238,3 +238,35 @@ def test_a_computed_window_argument_or_key_is_declared_as_the_value_it_computes(
     client.execute_sql("UPDATE w SET d = DATE '2019-12-31', g = 2 WHERE id = 2", schema_name=sn)
     check()
     assert bag(scanned(client, sn, "by_day"), "id", "c") == {(1, 1): 1, (2, 2): 1, (3, 2): 1}
+
+
+def test_row_number_reads_the_row_key_off_the_registered_view(client, schema_name):
+    """`ROW_NUMBER` numbers the rows of its input, so it needs one whose PK
+    identifies a row. Which relations have one is carried on the relation itself
+    and travels back to a later statement's planner through RESOLVE: a view over
+    a stream, a join view keyed on the join key and a `LIMIT n > 1` top-N view all
+    lose it, while a plain projection over a table keeps it."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE s (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL) "
+        "WITH (stream = true); "
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL); "
+        "CREATE TABLE u (uid BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL); "
+        "CREATE VIEW sv AS SELECT id, a FROM s; "
+        "CREATE VIEW jv AS SELECT t.id AS id, t.a AS a FROM t JOIN u ON t.k = u.k; "
+        "CREATE VIEW tv AS SELECT id, a FROM t ORDER BY a LIMIT 2; "
+        "CREATE VIEW pv AS SELECT id, a FROM t", schema_name=sn)
+
+    for name in ("sv", "jv", "tv"):
+        try:
+            client.execute_sql(
+                f"CREATE VIEW rn_{name} AS SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM {name}",
+                schema_name=sn)
+        except Exception as e:
+            assert "unique row key" in str(e), (name, e)
+        else:
+            raise AssertionError(f"{name}: ROW_NUMBER over a repeating PK must be refused")
+    client.execute_sql(
+        "CREATE VIEW rn_pv AS SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM pv", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (1, 1, 30), (2, 1, 10), (3, 2, 20)", schema_name=sn)
+    assert bag(scanned(client, sn, "rn_pv"), "a", "rn") == {(10, 1): 1, (20, 2): 1, (30, 3): 1}

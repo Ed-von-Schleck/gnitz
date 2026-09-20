@@ -250,6 +250,7 @@ fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
                 circuit,
                 output_columns: cols(),
                 pk_cols: vec![0],
+                pk_repeats: false,
             }],
             gnitz_core::ViewProps::Fed { delta_bytes: 8 << 20 },
             false,

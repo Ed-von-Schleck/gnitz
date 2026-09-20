@@ -90,5 +90,6 @@ pub(super) fn lower_reduce(
     let (node, out) = project_tail(&mut cb, filtered, items, &having_frame)?;
     reject_duplicate_column_names(out.schema.columns.iter(), "GROUP BY view")?;
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb, out })
+    // One row per group key, which the reduce output is keyed on.
+    Ok(EmitPieces { circuit: cb, out, pk_repeats: false })
 }

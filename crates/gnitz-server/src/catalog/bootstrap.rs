@@ -37,6 +37,7 @@ impl CatalogEngine {
                 RelationKind::SystemCatalog,
                 family.schema(),
                 &family.column_defs(),
+                false,
             );
         }
 

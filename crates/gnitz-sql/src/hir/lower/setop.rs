@@ -8,7 +8,6 @@ use super::CutMemo;
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical::Frame;
-use crate::validate::reject_float_keys;
 use gnitz_core::{Circuit, ColumnDef, ReindexSlot, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -22,9 +21,6 @@ pub(super) fn lower_setop(
     let RelExpr::SetOp { op, all, left, right, out } = setop else {
         unreachable!("lower_setop receives a SetOp");
     };
-
-    // A float set-identity column breaks content-hash equality (IEEE-754).
-    reject_float_keys(out.iter().map(|c| &c.out.def), "set operation")?;
 
     // UNION ALL keeps both copies of an identical row, so the right side hashes on
     // a distinct branch id; every deduplicating op uses branch 0.
@@ -78,6 +74,8 @@ pub(super) fn lower_setop(
     Ok(EmitPieces {
         circuit: cb,
         out: hashed_out("_set_pk", out.iter().map(|c| &c.out)),
+        // A content hash identifies its own row.
+        pk_repeats: false,
     })
 }
 
@@ -89,8 +87,6 @@ pub(super) fn lower_distinct(
     input: &Rc<RelExpr>,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let side_cols = input.cols();
-    // A float set-identity column breaks content-hash equality (IEEE-754).
-    reject_float_keys(side_cols.iter().map(|c| &c.def), "SELECT DISTINCT")?;
     let ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
     let spine = open(chain, memo, input, &ids.iter().copied().collect())?;
     let mut cb = Circuit::default();
@@ -102,6 +98,8 @@ pub(super) fn lower_distinct(
     Ok(EmitPieces {
         circuit: cb,
         out: hashed_out("_distinct_pk", side_cols.iter()),
+        // A content hash identifies its own row.
+        pk_repeats: false,
     })
 }
 

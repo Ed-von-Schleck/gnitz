@@ -125,6 +125,11 @@ impl Spine<'_> {
         self.seg.desc.as_ref().is_some_and(|d| d.replicated)
     }
 
+    /// The opened source's, since no fused level re-keys.
+    pub(crate) fn pk_repeats(&self) -> bool {
+        self.seg.pk_repeats
+    }
+
     /// A hidden segment read whole, with nothing fused above it.
     pub(crate) fn segment(seg: SegInput) -> Spine<'static> {
         Spine { seg, levels: Vec::new() }
@@ -135,7 +140,7 @@ impl Spine<'_> {
     /// `what` names an emitted projection whose schema is inadmissible.
     pub(crate) fn emit(self, cb: &mut Circuit, top: Top, what: &str) -> Result<(NodeId, Frame), GnitzSqlError> {
         let Spine { seg, levels } = self;
-        let SegInput { tid, mut frame, desc } = seg;
+        let SegInput { tid, mut frame, desc, pk_repeats: _ } = seg;
         let output_at = match top {
             Top::Output => levels.iter().rposition(|(l, _)| matches!(l, Level::Project(_))),
             Top::Slots => None,
@@ -244,7 +249,8 @@ pub(super) fn lower_linear(
     let live = items.iter().map(|it| it.out.id).collect();
     let spine = open(chain, memo, rel, &live)?;
     let mut cb = Circuit::default();
+    let pk_repeats = spine.pk_repeats();
     let (node, out) = spine.emit(&mut cb, Top::Output, "view output")?;
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb, out })
+    Ok(EmitPieces { circuit: cb, out, pk_repeats })
 }

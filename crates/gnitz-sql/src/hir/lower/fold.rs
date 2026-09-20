@@ -8,7 +8,6 @@ use super::{keyed_frame, resolve_reduce_specs, ReduceSpecs};
 use crate::codec::project_schema::read_reply_shape;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr};
-use crate::validate::reject_float_keys;
 use gnitz_core::{ColumnDef, ReduceOutKey, Schema};
 use gnitz_wire::{AggReadSpec, ComputeMap};
 use std::sync::Arc;
@@ -63,9 +62,6 @@ pub(crate) fn lower_fold(rel: &RelExpr) -> Result<FoldPieces, GnitzSqlError> {
                     "ad-hoc SELECT DISTINCT body is not a projection".into(),
                 ));
             };
-            // A float set-identity column breaks content-hash equality (IEEE-754) —
-            // the same gate a DISTINCT view is lowered under.
-            reject_float_keys(items.iter().map(|e| &e.out.def), "SELECT DISTINCT")?;
             // Bare items group the source columns where they lie; any computed item
             // makes the projection the pre-map and groups its columns.
             let (pre, group_cols) = match items.iter().map(|e| as_col(&e.expr)).collect::<Option<Vec<_>>>() {

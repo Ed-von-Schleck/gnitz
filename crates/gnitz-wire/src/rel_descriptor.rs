@@ -46,6 +46,9 @@ const DESC_FLAG_VIEW: u8 = 1 << 1;
 const DESC_FLAG_BOUNDED: u8 = 1 << 2;
 const DESC_FLAG_STREAM: u8 = 1 << 3;
 const DESC_FLAG_DELTA: u8 = 1 << 4;
+/// Bit 5: a stream, or a view its planner marked
+/// [`crate::VIEW_FLAG_PK_REPEATS`].
+const DESC_FLAG_PK_REPEATS: u8 = 1 << 5;
 const DESC_FLAG_CLASS: u8 = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_STREAM | DESC_FLAG_DELTA;
 
 /// What a relation *is* — the one vocabulary the client and the engine share for
@@ -133,6 +136,8 @@ pub struct RelDescriptorBlob {
     /// The relation is an ingestion point whose rows are a full copy on every
     /// worker. Never set on a view.
     pub replicated: bool,
+    /// [`DESC_FLAG_PK_REPEATS`], reported for every class unlike `replicated`.
+    pub pk_repeats: bool,
     pub fks: Vec<RelFk>,
     pub indexes: Vec<RelIndex>,
 }
@@ -148,7 +153,9 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(self.fks.len() <= u16::MAX as usize && self.indexes.len() <= u16::MAX as usize);
         let mut w = Writer::with_capacity(HEADER_LEN + 16 * (self.fks.len() + self.indexes.len()));
-        let flags = self.class.to_flags() | if self.replicated { DESC_FLAG_REPLICATED } else { 0 };
+        let flags = self.class.to_flags()
+            | if self.replicated { DESC_FLAG_REPLICATED } else { 0 }
+            | if self.pk_repeats { DESC_FLAG_PK_REPEATS } else { 0 };
         w.u8(VERSION)
             .u8(flags)
             .u16(self.fks.len() as u16)
@@ -180,7 +187,7 @@ impl RelDescriptorBlob {
             return Err(format!("rel descriptor: unknown version {version}"));
         }
         let flags = r.u8()?;
-        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_CLASS) != 0 {
+        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_PK_REPEATS | DESC_FLAG_CLASS) != 0 {
             return Err(format!("rel descriptor: unknown flag bits {flags:#04x}"));
         }
         let class = RelClass::from_flags(flags)?;
@@ -218,6 +225,7 @@ impl RelDescriptorBlob {
         Ok(Some(RelDescriptorBlob {
             class,
             replicated: flags & DESC_FLAG_REPLICATED != 0,
+            pk_repeats: flags & DESC_FLAG_PK_REPEATS != 0,
             fks,
             indexes,
         }))

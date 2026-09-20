@@ -15,7 +15,9 @@
 //! payload grouped by a U32 payload (AVI stride 13, inside the `u128` sort-key
 //! arm), into a fresh table whose memtable never flushes mid-run. Production
 //! `GROUP BY <BIGINT>` is stride 17, one byte past that arm, and a view backfill
-//! chunks at ~16k rows per worker, where the sort's share is lower.
+//! chunks at ~16k rows per worker, where the sort's share is lower. A second
+//! shape runs the same decomposition over a wide MAX, whose key slot and BLOB
+//! image payload the scalar one does not pay.
 
 use std::time::Duration;
 
@@ -64,18 +66,43 @@ fn build_input(schema: &SchemaDescriptor) -> Batch {
     b
 }
 
-/// The production bake for `MIN(val) GROUP BY grp`, reached the way the compiler
-/// reaches it — through the plan that owns the accumulators the bake reads.
-fn min_bake(schema: &SchemaDescriptor) -> AviBake {
+/// Source schema for the wide shape: U64 pk | U32 grp | U128 val.
+fn wide_src_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::U128, 0),
+        ],
+        &[0],
+    )
+}
+
+/// [`build_input`] over [`wide_src_schema`], the value scrambled across the
+/// whole 128-bit range.
+fn build_wide_input(schema: &SchemaDescriptor) -> Batch {
+    let mut b = Batch::with_capacity(schema, N_ROWS);
+    for row in 0..N_ROWS as u64 {
+        b.extend_pk(row as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_col(0, &((row % N_GROUPS) as u32).to_le_bytes());
+        let v = (row.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128) << 64 | row as u128;
+        b.extend_col(1, &v.to_le_bytes());
+        b.commit_row(0);
+    }
+    b
+}
+
+/// The production bake for one extreme over `col` grouped by `grp`, reached the
+/// way the compiler reaches it — through the plan that owns the accumulators the
+/// bake reads.
+fn extreme_bake(schema: &SchemaDescriptor, col: u32, agg_op: AggFunc) -> AviBake {
     let group = [1u32];
-    let aggs = [
-        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
-        AggDescriptor::COUNT_STAR,
-    ];
+    let aggs = [AggDescriptor { col_idx: col, agg_op }, AggDescriptor::COUNT_STAR];
     ReducePlan::from_wire(schema, &group, &aggs, false, false)
         .unwrap()
         .avi
-        .expect("a MIN reduce is value-indexed")
+        .expect("a MIN/MAX reduce is value-indexed")
 }
 
 fn ns_per_row(elapsed: Duration) -> f64 {
@@ -101,17 +128,38 @@ fn report(index: &str, population: Duration, sort: Duration, full: Duration) {
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_avi_decomposition_bench() {
     let schema = src_schema();
-    let bake = min_bake(&schema);
+    decompose(
+        "AVI (U32 grp, I64 val)",
+        extreme_bake(&schema, 2, AggFunc::Min),
+        build_input(&schema),
+    );
+}
+
+/// The wide shape, under the scalar one's group key.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn secondary_index_avi_wide_decomposition_bench() {
+    let schema = wide_src_schema();
+    decompose(
+        "AVI (U32 grp, U128 val)",
+        extreme_bake(&schema, 2, AggFunc::Max),
+        build_wide_input(&schema),
+    );
+}
+
+/// The per-layer decomposition of one bake's population, timed and reported.
+fn decompose(label: &str, bake: AviBake, input: Batch) {
     let avi_schema = bake.schema;
-    let input = build_input(&schema);
+    let bake = &bake;
+    let input = &input;
     let tmp = tempfile::tempdir().unwrap();
 
     let population = bench_time(ITERS, || {
-        std::hint::black_box(avi_batch(&input, &bake));
+        std::hint::black_box(avi_batch(input, bake));
     });
     let sort = bench_time_each(
         ITERS,
-        || avi_batch(&input, &bake),
+        || avi_batch(input, bake),
         |b| {
             std::hint::black_box(b.into_consolidated(&avi_schema));
         },
@@ -133,12 +181,12 @@ fn secondary_index_avi_decomposition_bench() {
             t
         },
         |mut t| {
-            t.ingest_owned_batch(avi_batch(&input, &bake)).unwrap();
+            t.ingest_owned_batch(avi_batch(input, bake)).unwrap();
             std::hint::black_box(&t);
         },
     );
 
-    report("AVI (U32 grp)", population, sort, full);
+    report(label, population, sort, full);
 }
 
 /// Time the `into_consolidated` sort layer for a single-column PK schema

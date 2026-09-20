@@ -21,6 +21,8 @@ fn catalog() -> CatalogSnapshot {
                 tid,
                 class,
                 replicated: false,
+                // A stream's PK is a routing and sort key, never unique.
+                pk_repeats: class == RelClass::Stream,
                 schema,
                 indexes: Vec::new(),
             })),
@@ -333,16 +335,81 @@ fn row_number_needs_a_unique_row_key() {
     plan("SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM (SELECT id, a, k FROM t) d").unwrap();
 }
 
-/// Only a hidden `_join_pk` is a minted pair key: a user may name a visible key
-/// column so, over a table or through a view's alias, and keeps its row key.
+/// Plan `sql` as a view body and register it under `name`, carrying the
+/// `pk_repeats` its own lowering stated. Returns that bit.
+fn register_view(cat: &mut CatalogSnapshot, tid: u64, name: &str, sql: &str) -> bool {
+    let (_, v) = plan_in(cat, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    cat.insert(
+        "public",
+        name,
+        Some(Arc::new(RelDescriptor {
+            tid,
+            class: RelClass::View,
+            replicated: false,
+            pk_repeats: v.pk_repeats,
+            schema: Arc::new(Schema {
+                columns: v.output_columns,
+                pk_cols: v.pk_cols,
+            }),
+            indexes: Vec::new(),
+        })),
+    );
+    v.pk_repeats
+}
+
+/// `ROW_NUMBER` reads the row key off the relation, so a view whose own lowering
+/// said its PK repeats loses it: over a stream, over a join key, or over a
+/// partition holding more than one slot.
+#[test]
+fn row_number_reads_the_row_key_off_the_view_that_states_it() {
+    let mut cat = catalog();
+    let reg = |cat: &mut CatalogSnapshot, tid, name, sql| register_view(cat, tid, name, sql);
+    assert!(reg(&mut cat, 20, "sv", "SELECT id, a FROM st"));
+    assert!(reg(
+        &mut cat,
+        21,
+        "jv2",
+        "SELECT t.id AS id, t.a AS a FROM t JOIN u ON t.k = u.k"
+    ));
+    assert!(reg(&mut cat, 22, "tv2", "SELECT id, a FROM t ORDER BY a LIMIT 2"));
+    assert!(!reg(&mut cat, 23, "pv", "SELECT id, a FROM t"));
+    assert!(!reg(&mut cat, 24, "tv1", "SELECT id, a FROM t ORDER BY a LIMIT 1"));
+
+    let over = |cat: &CatalogSnapshot, name: &str| {
+        plan_in(
+            cat,
+            &format!("SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM {name}"),
+        )
+    };
+    let refusal = |cat: &CatalogSnapshot, name: &str| {
+        let Err(err) = over(cat, name) else {
+            panic!("{name}: ROW_NUMBER must be refused");
+        };
+        format!("{err:?}")
+    };
+    for name in ["sv", "jv2", "tv2"] {
+        let err = refusal(&cat, name);
+        assert!(err.contains("unique row key"), "{name}: {err}");
+    }
+    over(&cat, "pv").unwrap_or_else(|e| panic!("pv: {e:?}"));
+    // `tv1` keeps its row key — the refusal names its `_group_pk`'s width, not
+    // the key.
+    let err = refusal(&cat, "tv1");
+    assert!(err.contains("128-bit columns"), "tv1: {err}");
+}
+
+/// The relation states whether its PK repeats; no key column's *name* is read.
+/// So a user may name a key column `_join_pk`, over a table or through a view's
+/// alias, and keep its row key.
 #[test]
 fn a_user_named_join_pk_column_is_a_row_key() {
     let mut cat = catalog();
-    let rel = |tid, class, columns, pk_cols| {
+    let rel = |tid, class, pk_repeats, columns, pk_cols| {
         Some(Arc::new(RelDescriptor {
             tid,
             class,
             replicated: false,
+            pk_repeats,
             schema: Arc::new(Schema { columns, pk_cols }),
             indexes: Vec::new(),
         }))
@@ -351,13 +418,22 @@ fn a_user_named_join_pk_column_is_a_row_key() {
         col_def("_join_pk", TypeCode::I64, false),
         col_def("a", TypeCode::I64, false),
     ];
-    cat.insert("public", "jt", rel(10, RelClass::Table, jt_cols, vec![0]));
+    cat.insert("public", "jt", rel(10, RelClass::Table, false, jt_cols, vec![0]));
     plan_in(&cat, "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM jt").unwrap();
 
     let (_, aliased) = plan_in(&cat, "SELECT id AS _join_pk, a FROM t").unwrap();
     let pk = aliased.pk_cols.iter().map(|&i| &aliased.output_columns[i as usize]);
     assert!(pk.clone().all(|c| !c.is_hidden) && pk.clone().any(|c| c.name == "_join_pk"));
-    let jv = rel(11, RelClass::View, aliased.output_columns, aliased.pk_cols);
+    // Carrying the bit that view's own lowering stated — a projection passing a
+    // table's PK through.
+    assert!(!aliased.pk_repeats);
+    let jv = rel(
+        11,
+        RelClass::View,
+        aliased.pk_repeats,
+        aliased.output_columns,
+        aliased.pk_cols,
+    );
     cat.insert("public", "jv", jv);
     plan_in(&cat, "SELECT a, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM jv").unwrap();
 }

@@ -163,6 +163,7 @@ pub fn push_view_tab_row(
     sink.put_u64(capacity_bytes);
     sink.put_u64(delta_bytes);
     sink.put_u64(owner_view_id as u64);
+    sink.put_u64(0); // flags
     sink.end_row();
 }
 

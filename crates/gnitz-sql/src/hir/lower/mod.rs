@@ -134,6 +134,8 @@ pub(crate) struct SegInput {
     /// The lowering reads every catalog fact off this: the scan-bound index list
     /// and the reduce's replication flag.
     pub desc: Option<Arc<RelDescriptor>>,
+    /// Off `desc` for a catalog relation, off the pushed segment otherwise.
+    pub pk_repeats: bool,
 }
 
 /// The compilation-wide cut memo: a subtree reached twice (a CTE or window input
@@ -337,12 +339,13 @@ pub(crate) fn resolve_in_place(
                 layout: cols.iter().map(|c| c.id).collect(),
                 schema: Arc::clone(schema),
             },
+            pk_repeats: desc.pk_repeats,
             desc: Some(Arc::clone(desc)),
         })),
         RelExpr::Alias { input: inner, cols } => {
             let inner_cols = inner.cols();
             let all: HashSet<ColId> = inner_cols.iter().map(|c| c.id).collect();
-            let SegInput { tid, frame, desc } = match resolve_in_place(chain, memo, inner)? {
+            let SegInput { tid, frame, desc, pk_repeats } = match resolve_in_place(chain, memo, inner)? {
                 Some(seg) => seg,
                 None => cut_segment(chain, memo, inner, &all)?,
             };
@@ -360,6 +363,7 @@ pub(crate) fn resolve_in_place(
                 tid,
                 frame: Frame { layout, schema: frame.schema },
                 desc,
+                pk_repeats,
             }))
         }
         _ => Ok(None),
@@ -449,6 +453,8 @@ pub(crate) fn emit_filter<'a>(
 
 /// A join's two inputs opened through the spine and emitted into `cb`, each
 /// carrying what `down` reads and its own keys, and kept under [`join_sides`].
+/// The trailing flag is the LEFT input's `pk_repeats`, which an `OuterPk` output
+/// carries over.
 pub(crate) fn emit_join_inputs(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
@@ -457,7 +463,7 @@ pub(crate) fn emit_join_inputs(
     [left, right]: [&Rc<RelExpr>; 2],
     kind: JoinType,
     class: &JoinClass,
-) -> Result<([gnitz_core::NodeId; 2], [JoinSide; 2]), GnitzSqlError> {
+) -> Result<([gnitz_core::NodeId; 2], [JoinSide; 2], bool), GnitzSqlError> {
     let live = |is_left: bool| {
         let mut live = HashSet::new();
         down.refs(&mut live);
@@ -466,9 +472,14 @@ pub(crate) fn emit_join_inputs(
     };
     let (live_l, live_r) = (live(true), live(false));
     let [l, r] = spine::open_pair(chain, memo, [left, right], [&live_l, &live_r], true)?;
+    let left_pk_repeats = l.pk_repeats();
     let (a, left_frame) = l.emit(cb, spine::Top::Slots, "join input")?;
     let (b, right_frame) = r.emit(cb, spine::Top::Slots, "join input")?;
-    Ok(([a, b], join_sides(down, class, kind, [left_frame, right_frame])))
+    Ok((
+        [a, b],
+        join_sides(down, class, kind, [left_frame, right_frame]),
+        left_pk_repeats,
+    ))
 }
 
 /// One side of a join as [`join_sides`] left it: the emitted input's frame, its

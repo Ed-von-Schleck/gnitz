@@ -31,6 +31,7 @@ fn multi_column_index_and_multi_fk_roundtrip() {
     let d = RelDescriptorBlob {
         class: RelClass::BoundedView,
         replicated: true,
+        pk_repeats: true,
         fks: vec![
             RelFk {
                 col_idx: 0,
@@ -174,9 +175,9 @@ fn each_decode_guard_rejects_its_own_forgery() {
             4,
             "no relation class",
         ),
-        // Bit 5: the lowest bit above the class bits, so this names no flag
-        // rather than setting one that exists.
-        ("unknown flag bit", flags(1 << 5), 0, "unknown flag bits"),
+        // Bit 6: the lowest bit above the flags that exist, so this names no
+        // flag rather than setting one that does.
+        ("unknown flag bit", flags(1 << 6), 0, "unknown flag bits"),
         ("trailing byte", trailing, 0, "trailing"),
         ("unknown version", bad_version, 0, "rel descriptor"),
         ("index column count", bad_index_count, 4, "out of range"),

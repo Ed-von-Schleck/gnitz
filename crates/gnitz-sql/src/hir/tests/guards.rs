@@ -57,22 +57,13 @@ fn range_key_pair_rejects_strings_but_promotes_integers() {
     );
 }
 
-/// The reindex-slot arity is capped by the PK-list width; the keyless case is
-/// no concern of this guard's, at any width.
+/// Only an INNER step may be keyless (the cross join), and a pure-range step
+/// preserves the left side only; every other (shape, kind) pair exists.
 #[test]
-fn join_key_arity_bounds() {
-    reject_join_key_arity(0, false).unwrap();
-    reject_join_key_arity(gnitz_core::PK_LIST_MAX_COLS, false).unwrap();
-    assert!(reject_join_key_arity(gnitz_core::PK_LIST_MAX_COLS + 1, false).is_err());
-    // The range slot counts toward the same cap.
-    assert!(reject_join_key_arity(gnitz_core::PK_LIST_MAX_COLS, true).is_err());
-}
-
-/// Only an INNER step may be keyless (the cross join); every other kind needs an
-/// equi or range key, and no kind is refused once it has one.
-#[test]
-fn only_an_inner_step_may_be_keyless() {
-    reject_keyless_non_inner(JoinType::Inner, JoinShape::Cross).unwrap();
+fn join_shape_admission() {
+    for shape in [JoinShape::Cross, JoinShape::Equi, JoinShape::Band, JoinShape::PureRange] {
+        reject_join_shape(JoinType::Inner, shape).unwrap();
+    }
     for kind in [
         JoinType::Left,
         JoinType::Right,
@@ -81,10 +72,16 @@ fn only_an_inner_step_may_be_keyless() {
         JoinType::Anti,
         JoinType::Mark(crate::hir::ColId::NONE),
     ] {
-        assert!(reject_keyless_non_inner(kind, JoinShape::Cross).is_err(), "{kind:?}");
-        reject_keyless_non_inner(kind, JoinShape::Band).unwrap();
-        reject_keyless_non_inner(kind, JoinShape::PureRange).unwrap();
-        reject_keyless_non_inner(kind, JoinShape::Equi).unwrap();
+        assert!(reject_join_shape(kind, JoinShape::Cross).is_err(), "{kind:?}");
+        reject_join_shape(kind, JoinShape::Band).unwrap();
+        reject_join_shape(kind, JoinShape::Equi).unwrap();
+        // A pure-range step derives its null-fill from a left-side threshold, so
+        // only the orientations preserving the right side are refused.
+        assert_eq!(
+            reject_join_shape(kind, JoinShape::PureRange).is_err(),
+            kind.preserves_right(),
+            "{kind:?}"
+        );
     }
 }
 
@@ -112,26 +109,4 @@ fn outer_with_residual_rejects_per_surface() {
     assert!(msg(JoinType::Semi).contains("EXISTS/IN correlation"));
     assert!(msg(JoinType::Anti).contains("EXISTS/IN correlation"));
     assert!(msg(JoinType::Mark(crate::hir::ColId::NONE)).contains("EXISTS/IN correlation"));
-}
-
-/// Set-op columns promote on the same integer ladder, but only to a concrete
-/// ≤ 8-byte integer — the widening path loads through one i64 register.
-#[test]
-fn set_op_common_type_caps_at_eight_bytes() {
-    let common = |l: TypeCode, r: TypeCode| set_op_common_type(l.into(), r.into()).map(|t| t.tc);
-    assert_eq!(common(TypeCode::U64, TypeCode::U64), Some(TypeCode::U64));
-    assert_eq!(common(TypeCode::U32, TypeCode::I32), Some(TypeCode::I64));
-    assert_eq!(common(TypeCode::I32, TypeCode::I64), Some(TypeCode::I64));
-    // The I128 collapse and every 16-byte / non-integer pair are rejected.
-    assert_eq!(common(TypeCode::U64, TypeCode::I64), None);
-    assert_eq!(common(TypeCode::U128, TypeCode::I64), None);
-    assert_eq!(common(TypeCode::String, TypeCode::U64), None);
-    // A DECIMAL unions only with the same DECIMAL: the stored integers of two
-    // scales, or of a scale and an integer column, never mean the same value.
-    assert_eq!(
-        set_op_common_type(ColType::decimal(2), ColType::decimal(2)),
-        Some(ColType::decimal(2))
-    );
-    assert_eq!(set_op_common_type(ColType::decimal(2), ColType::decimal(3)), None);
-    assert_eq!(set_op_common_type(ColType::decimal(0), TypeCode::I64.into()), None);
 }

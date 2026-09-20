@@ -291,6 +291,7 @@ fn a_wire_supplied_owner_view_id_must_name_a_real_view() {
             pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
             props: gnitz_wire::ViewProps::default(),
             owner_view_id: 999_999,
+            pk_repeats: false,
         },
         1,
     );
@@ -390,6 +391,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
                 circuit,
                 output_columns: cols.to_vec(),
                 pk_cols: vec![0],
+                pk_repeats: false,
             }],
             gnitz_core::ViewProps::default(),
             true,
@@ -491,6 +493,7 @@ fn a_view_scanning_itself_is_refused() {
             pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
             props: gnitz_wire::ViewProps::default(),
             owner_view_id: 0,
+            pk_repeats: false,
         },
         1,
     );

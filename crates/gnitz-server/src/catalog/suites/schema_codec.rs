@@ -289,7 +289,8 @@ fn ddl_txn_roundtrip_client_to_server() {
             .u64_val(0) // pk_col_idx
             .u64_val(0) // capacity_bytes
             .u64_val(0) // delta_bytes
-            .u64_val(0); // owner_view_id
+            .u64_val(0) // owner_view_id
+            .u64_val(0); // flags
         b
     };
     verify(

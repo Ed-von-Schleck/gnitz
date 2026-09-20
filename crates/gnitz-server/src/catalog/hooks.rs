@@ -49,6 +49,7 @@ impl CatalogEngine {
             pk,
             placement,
             props,
+            pk_repeats,
         } = reg;
         let col_defs = self.read_column_defs(id);
         let directory = relation_dir(&self.base_dir, kind, id);
@@ -65,7 +66,7 @@ impl CatalogEngine {
         // `register` owns the staged-directory reclaim and the parent fsync.
         self.registry
             .register(RelationSpec { id, kind, schema, directory, props })?;
-        self.enter_relation(id, kind, &schema, &col_defs);
+        self.enter_relation(id, kind, &schema, &col_defs, pk_repeats);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
         for ci in self.fk_circuit_cols(id) {
@@ -84,6 +85,7 @@ impl CatalogEngine {
         kind: RelationKind,
         schema: &SchemaDescriptor,
         defs: &[ColumnDef],
+        pk_repeats: bool,
     ) {
         let fks: Vec<FkEdge> = defs
             .iter()
@@ -101,7 +103,7 @@ impl CatalogEngine {
         }
         self.caches
             .relations
-            .insert(id, RelationEntry::new(id, schema, defs, fks));
+            .insert(id, RelationEntry::new(id, schema, defs, fks, pk_repeats));
     }
 
     /// The FK columns of `id` that carry a derived index circuit: those outside its
@@ -187,6 +189,7 @@ impl CatalogEngine {
             pk,
             props,
             owner_view_id,
+            pk_repeats,
         } = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={vid})"))?;
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
         // so `get_source_ids` resolves here. Re-check for the paths that skip the
@@ -206,6 +209,7 @@ impl CatalogEngine {
             pk,
             placement,
             props,
+            pk_repeats,
         })
     }
 

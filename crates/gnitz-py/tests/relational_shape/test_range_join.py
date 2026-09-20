@@ -97,6 +97,78 @@ def test_a_range_join_is_the_product_its_predicate_admits_through_churn(client, 
             Counter(ai for ai, _ in pairs(lambda ar, br: _PURE["lt"][1](ar[2], br[2]))).items(), 1), sql
 
 
+# `(x, y)` per side of the two pure-range pairs whose common type is 16 bytes: a
+# cross-sign BIGINT/BIGINT UNSIGNED pair promotes to a signed 128-bit slot, and a
+# DECIMAL(38,0) pair to an unsigned one. Both sides straddle the widths a narrower
+# slot would alias — the sign boundary, 2**63, and 2**64.
+_SIGNED_X = {1: -9, 2: 0, 3: 7, 4: 2 ** 62}
+_UNSIGNED_Y = {1: 0, 2: 8, 3: 2 ** 63, 4: 2 ** 64 - 1}
+_WIDE_X = {1: 0, 2: 5, 3: (1 << 64) + 1, 4: 10 ** 38 - 1}
+_WIDE_Y = {1: 1, 2: 1 << 64, 3: 1 << 100, 4: 10 ** 38 - 2}
+
+
+def _vals(rows):
+    return ", ".join(f"({pk}, {v})" for pk, v in rows.items())
+
+
+def test_a_pure_range_threshold_carries_a_sixteen_byte_range_column(client, schema_name):
+    """A pure-range LEFT JOIN and a pure-range EXISTS both decide per left row
+    from `m = MIN/MAX(b.range)`, reindexed back onto the range slot. The slot
+    holds the PAIR's common type, which is 16 bytes both for a cross-sign
+    BIGINT/BIGINT UNSIGNED pair and for a DECIMAL(38,0) one.
+
+    The right side starts empty and is emptied again, so each run passes through
+    `A - 0 = A`, where the threshold has no ground row and every left row
+    null-fills."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE sa (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL); "
+        "CREATE TABLE sb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT UNSIGNED NOT NULL); "
+        "CREATE TABLE wa (id BIGINT NOT NULL PRIMARY KEY, x DECIMAL(38,0) NOT NULL); "
+        "CREATE TABLE wb (id BIGINT NOT NULL PRIMARY KEY, y DECIMAL(38,0) NOT NULL); "
+        "CREATE VIEW s_left AS SELECT sa.id AS aid, sb.id AS bid FROM sa LEFT JOIN sb ON sa.x < sb.y; "
+        "CREATE VIEW s_ex AS SELECT sa.id AS aid FROM sa WHERE EXISTS (SELECT 1 FROM sb WHERE sb.y > sa.x); "
+        "CREATE VIEW w_left AS SELECT wa.id AS aid, wb.id AS bid FROM wa LEFT JOIN wb ON wa.x < wb.y; "
+        "CREATE VIEW w_ex AS SELECT wa.id AS aid FROM wa WHERE EXISTS (SELECT 1 FROM wb WHERE wb.y > wa.x)",
+        schema_name=sn)
+
+    state = {t: {} for t in ("sa", "sb", "wa", "wb")}
+    churn = [
+        # Both right sides empty: every left row null-fills and nothing EXISTS.
+        (f"INSERT INTO sa VALUES {_vals(_SIGNED_X)}", [("sa", pk, v) for pk, v in _SIGNED_X.items()]),
+        (f"INSERT INTO wa VALUES {_vals(_WIDE_X)}", [("wa", pk, v) for pk, v in _WIDE_X.items()]),
+        (f"INSERT INTO sb VALUES {_vals(_UNSIGNED_Y)}", [("sb", pk, v) for pk, v in _UNSIGNED_Y.items()]),
+        (f"INSERT INTO wb VALUES {_vals(_WIDE_Y)}", [("wb", pk, v) for pk, v in _WIDE_Y.items()]),
+        # Leave one right row on each side: the threshold recedes and the rows it
+        # no longer covers return to their null-fill.
+        ("DELETE FROM sb WHERE id > 1", [("sb", pk, None) for pk in (2, 3, 4)]),
+        ("DELETE FROM wb WHERE id > 1", [("wb", pk, None) for pk in (2, 3, 4)]),
+        # A left row moving under the surviving threshold starts matching.
+        ("UPDATE wa SET x = 0 WHERE id = 4", [("wa", 4, 0)]),
+        # Back to an empty right side.
+        ("DELETE FROM sb WHERE id = 1", [("sb", 1, None)]),
+        ("DELETE FROM wb WHERE id = 1", [("wb", 1, None)]),
+        ("DELETE FROM sa WHERE id > 0", [("sa", pk, None) for pk in _SIGNED_X]),
+        ("DELETE FROM wa WHERE id > 0", [("wa", pk, None) for pk in _WIDE_X]),
+    ]
+    for sql, updates in churn:
+        client.execute_sql(sql, schema_name=sn)
+        for table, pk, v in updates:
+            if v is None:
+                del state[table][pk]
+            else:
+                state[table][pk] = v
+        for a, b, left, ex in (("sa", "sb", "s_left", "s_ex"), ("wa", "wb", "w_left", "w_ex")):
+            want_left, want_ex = Counter(), Counter()
+            for ai, ax in state[a].items():
+                hits = [bi for bi, by in state[b].items() if ax < by]
+                want_left.update([(ai, bi) for bi in hits] or [(ai, None)])
+                if hits:
+                    want_ex[(ai,)] += 1
+            assert bag(scanned(client, sn, left), "aid", "bid") == want_left, (sql, left)
+            assert bag(scanned(client, sn, ex), "aid") == want_ex, (sql, ex)
+
+
 def test_a_band_null_fill_over_a_join_keyed_input_counts_each_row_once(client, schema_name):
     """A band LEFT JOIN over a join-keyed input whose two rows differ only in the
     range value: each null-fills exactly while nothing matches it."""

@@ -140,6 +140,8 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     // validate it against a forger. Appended, not inserted: the `RELTAB_*`
     // constants below pin `name` to the same slot in TABLE_TAB and VIEW_TAB.
     col("owner_view_id", TypeCode::U64, false),
+    // See `VIEW_FLAG_PK_REPEATS` for the bit layout.
+    col("flags", TypeCode::U64, false),
 ];
 
 // Keyed by the compound `(owner_id, col_idx)` — the pair *is* a column record's
@@ -236,6 +238,7 @@ pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(VIEW_TAB, "pk_col_idx
 pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in_fam(VIEW_TAB, "capacity_bytes");
 pub const VIEWTAB_PAY_DELTA: usize = pay_index_in_fam(VIEW_TAB, "delta_bytes");
 pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in_fam(VIEW_TAB, "owner_view_id");
+pub const VIEWTAB_PAY_FLAGS: usize = pay_index_in_fam(VIEW_TAB, "flags");
 
 // `RELTAB_*`: an address valid in TABLE_TAB and VIEW_TAB alike, for the readers
 // that take either family through one code path. A column at the same slot in
@@ -770,6 +773,12 @@ const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte; the full
 /// byte is deliberate headroom.
 const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
+
+/// `VIEW_TAB.flags` bit 0: two of the view's rows may carry the same PK, so its
+/// PK region identifies no row — a view over a stream, one keyed on a join key or
+/// a source-PK pair, or a top-N holding more than one slot per partition. The
+/// planner that compiled the view states it; the engine stores it verbatim.
+pub const VIEW_FLAG_PK_REPEATS: u64 = 1 << 0;
 
 /// `IDX_TAB.flags` bit 0: the index enforces uniqueness.
 const INDEX_FLAG_UNIQUE: u64 = 1 << 0;

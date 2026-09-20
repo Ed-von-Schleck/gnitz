@@ -5,8 +5,8 @@ use crate::{
     COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_SCALE,
     COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
     IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS,
-    TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
-    VIEW_TAB_COLS,
+    TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_FLAGS, VIEWTAB_PAY_OWNER_VIEW_ID,
+    VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -160,6 +160,7 @@ fn values_land_in_their_named_payload_slots() {
             pk_col_idx: 6,
             props: crate::ViewProps::Fed { delta_bytes: 1 << 20 },
             owner_view_id: 21,
+            pk_repeats: true,
         },
         1,
     );
@@ -171,6 +172,7 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(0));
     assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));
     assert_eq!(v[VIEWTAB_PAY_OWNER_VIEW_ID], Val::U64(21));
+    assert_eq!(v[VIEWTAB_PAY_FLAGS], Val::U64(crate::VIEW_FLAG_PK_REPEATS));
 
     let mut r = Recorder::default();
     write_schema_tab_row(&mut r, &SchemaTabRow { schema_id: 3, name: "public" }, 1);

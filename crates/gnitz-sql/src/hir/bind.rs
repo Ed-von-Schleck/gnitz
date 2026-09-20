@@ -25,7 +25,6 @@ use crate::bind::{
     LeafBinder,
 };
 use crate::error::{reject_if, GnitzSqlError};
-use crate::hir::guards::{join_keys_and_type, JoinKeys};
 use crate::ir::{BExpr, BinOp};
 use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, OrderKey};
 use crate::validate::{
@@ -34,8 +33,8 @@ use crate::validate::{
 };
 use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RelClass, Schema, TypeCode};
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, NamedWindowExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    TableFactor,
+    BinaryOperator, Expr, Function, JoinConstraint, JoinOperator, NamedWindowExpr, Query, Select, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, TableFactor,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -350,7 +349,7 @@ fn bind_select(
         // Item 0's relation seeded the accumulator above; every later item is one
         // more INNER step carrying no keys of its own — the comma's whole meaning.
         if i > 0 {
-            let comma = (JoinKeys::None, JoinType::Inner);
+            let comma = (&JoinConstraint::None, JoinType::Inner);
             left = fold_join_step(cx, &mut scope, left, &item.relation, comma)?;
         }
         // Then that item's own JOIN chain, left-deep in syntactic order.
@@ -439,7 +438,7 @@ fn bind_body_suffix(
         return Ok((projected, placed));
     }
     reject_unselected_distinct_keys(&projected, &placed, ctx)?;
-    Ok((RelExpr::distinct(projected), placed))
+    Ok((RelExpr::distinct(projected)?, placed))
 }
 
 /// DISTINCT dedups the selected columns, so an ORDER BY key that is not one of them —
@@ -1056,6 +1055,32 @@ fn scalar_leaf(
 
 // ── FROM-join binding ──────────────────────────────────────────────────────────
 
+/// What supplies one join step's key columns, and the step's type — orthogonal in
+/// the grammar, so `NATURAL LEFT JOIN` is `(JoinConstraint::Natural, JoinType::Left)`.
+fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(&JoinConstraint, JoinType), GnitzSqlError> {
+    let sqlparser::ast::Join {
+        relation: _, // resolved by the caller as the step's right input
+        // Inert: ClickHouse's `GLOBAL` asks for evaluation against the whole
+        // right relation, which a DBSP bilinear join already does.
+        global: _,
+        join_operator,
+    } = join;
+    Ok(match join_operator {
+        JoinOperator::Inner(c) | JoinOperator::Join(c) => (c, JoinType::Inner),
+        JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (c, JoinType::Left),
+        JoinOperator::RightOuter(c) | JoinOperator::Right(c) => (c, JoinType::Right),
+        JoinOperator::FullOuter(c) => (c, JoinType::Full),
+        JoinOperator::CrossJoin(c) => (c, JoinType::Inner),
+        _ => {
+            return Err(GnitzSqlError::Unsupported(
+                "JOIN: only INNER / LEFT / RIGHT / FULL JOIN, with ON / USING / \
+                 NATURAL, are supported"
+                    .into(),
+            ))
+        }
+    })
+}
+
 /// Fold one join step onto the accumulated left input: resolve the right
 /// relation, derive the step's ON conjuncts from its constraint, merge away the
 /// duplicate copy of each `USING` / `NATURAL` column, and widen the scope by the
@@ -1065,35 +1090,38 @@ fn fold_join_step(
     scope: &mut JoinScope,
     left: Rc<RelExpr>,
     relation: &TableFactor,
-    (keys, kind): (JoinKeys<'_>, JoinType),
+    (keys, kind): (&JoinConstraint, JoinType),
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let (right_src, ralias, rcols) = resolve_table_factor(cx, relation)?;
 
     // Before `scope.push` below: a `USING`/`NATURAL` name pairs against the left
     // side alone, where an `ON` (bound after the push) sees both sides.
-    let pairs = match &keys {
-        JoinKeys::Using(cols) => {
+    let (pairs, merge_clause) = match keys {
+        JoinConstraint::Using(cols) => {
             let mut names = Vec::with_capacity(cols.len());
-            for c in *cols {
+            for c in cols {
                 names.push(crate::ast_util::extract_ident_name(c, "JOIN USING")?);
             }
             crate::validate::reject_duplicate_names(names.iter().map(String::as_str), "JOIN USING")?;
-            merge_pairs(scope, &rcols, &names, "USING")?
+            (merge_pairs(scope, &rcols, &names, "USING")?, "USING")
         }
-        JoinKeys::Natural => {
+        JoinConstraint::Natural => {
             // SQL's rule: no shared name makes the step keyless, i.e. a CROSS
             // JOIN. The keyless guard decides it like any other keyless step.
-            merge_pairs(scope, &rcols, &scope.shared_names(&rcols), "NATURAL")?
+            (
+                merge_pairs(scope, &rcols, &scope.shared_names(&rcols), "NATURAL")?,
+                "NATURAL",
+            )
         }
-        JoinKeys::On(_) | JoinKeys::None => Vec::new(),
+        JoinConstraint::On(_) | JoinConstraint::None => (Vec::new(), ""),
     };
 
     scope.push(&ralias, rcols);
 
     // Every other form states its keys as `pairs`, empty for a keyless step — so a
     // step with no constraint of its own needs no arm, and the WHERE may key it.
-    let on = match &keys {
-        JoinKeys::On(e) => bind_conjuncts(
+    let on = match keys {
+        JoinConstraint::On(e) => bind_conjuncts(
             e,
             &ScopeLeaf {
                 scope,
@@ -1106,6 +1134,16 @@ fn fold_join_step(
             .map(|&(l, r)| BExpr::bin(BExpr::ColRef(l), BinOp::Eq, BExpr::ColRef(r)))
             .collect(),
     };
+
+    if kind == JoinType::Full && !pairs.is_empty() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "FULL JOIN … {merge_clause} is not supported: the merged column would be \
+             COALESCE(left, right), which the join scope cannot name — the merge \
+             retargets the shared name to one side's column, and a column reference \
+             cannot name an expression. Write the equality as `ON …` and project the \
+             two columns you want."
+        )));
+    }
 
     // The merged column's value is the PRESERVED side's copy, so the other side's
     // stops answering an unqualified reference and leaves `*`. `alias.col` still
@@ -1495,7 +1533,7 @@ pub(crate) fn bind_adhoc_distinct(
     let placed = place_order_keys(order_exprs, &mut items, ids, &order_leaf)?;
     let projected = RelExpr::project(source, items);
     reject_unselected_distinct_keys(&projected, &placed, "SELECT DISTINCT")?;
-    Ok((RelExpr::distinct(projected), placed))
+    Ok((RelExpr::distinct(projected)?, placed))
 }
 
 /// An ad-hoc SELECT list bound by [`bind_adhoc_projection`].
@@ -1518,7 +1556,15 @@ pub(crate) fn bind_adhoc_projection(
     alias: &str,
     order_exprs: &[&Expr],
 ) -> Result<AdhocProjection, GnitzSqlError> {
-    let (_, scope) = adhoc_source(ids, Arc::clone(&schema), alias);
+    // The ids a `Get` would mint; this surface reads only the scope.
+    let scope = JoinScope::single(
+        alias,
+        schema
+            .columns
+            .iter()
+            .map(|c| HirCol::new(ids.next(), c.clone()))
+            .collect(),
+    );
     let leaf = ScopeLeaf {
         scope: &scope,
         clause: "SELECT",
@@ -1621,7 +1667,7 @@ fn bind_grouped_suffix(
     let input = match distinct_arg(&calls)? {
         Some(arg) => {
             reject_float_key(&hircol_of(&pre.env, arg).def, "DISTINCT aggregate")?;
-            RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)))
+            RelExpr::distinct(RelExpr::project(input, pre.items_for(&reads)))?
         }
         None if pre.extra.is_empty() => input,
         None => RelExpr::project(input, pre.items_for(&reads)),

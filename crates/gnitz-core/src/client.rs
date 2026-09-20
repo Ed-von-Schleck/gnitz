@@ -218,6 +218,9 @@ pub struct PlannedView {
     pub circuit: Circuit,
     pub output_columns: Vec<ColumnDef>,
     pub pk_cols: Vec<u32>,
+    /// [`gnitz_wire::VIEW_FLAG_PK_REPEATS`], stated by the emitter that minted
+    /// the key.
+    pub pk_repeats: bool,
 }
 
 /// What one statement has already read, dropped whole at `end_statement`.
@@ -1326,6 +1329,7 @@ impl GnitzClient {
                 output_columns: output_columns.to_vec(),
                 // Minimal SCAN→SINK passthrough: single output PK at slot 0.
                 pk_cols: vec![0],
+                pk_repeats: false,
             }],
             ViewProps::default(),
             false,
@@ -1468,6 +1472,7 @@ impl GnitzClient {
                         pk_col_idx: gnitz_wire::pack_pk_cols(&pv.pk_cols),
                         props: row_props,
                         owner_view_id,
+                        pk_repeats: pv.pk_repeats,
                     },
                     1,
                 );

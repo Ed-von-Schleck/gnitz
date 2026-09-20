@@ -92,5 +92,6 @@ pub(super) fn lower_topn(
         cb.top_n(node, &group, &keys, *limit, *offset)
     };
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb, out })
+    // Keyed by the partition, which holds `limit` slots.
+    Ok(EmitPieces { circuit: cb, out, pk_repeats: *limit > 1 })
 }

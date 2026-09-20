@@ -6,13 +6,15 @@
 //! ingest — that batch's own sort-and-consolidate plus a memtable push — on top
 //! of the reduce's own group sort. `MIN(a), MAX(a), MIN(b)` triples it.
 
-use crate::schema::key::{leading_u64, ReindexPacker};
+use crate::schema::key::ReindexPacker;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::{Batch, ReadCursor};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
 
-use super::super::order_image::{append_wide_image, scalar_image, wide_native, wide_native_of_image, ImageKind};
+use super::super::order_image::{
+    append_wide_image, scalar_image, wide_native, wide_native_of_image, write_image_slot, ImageKind,
+};
 use super::agg::{Accumulator, ExtremeSpec};
 
 // ---------------------------------------------------------------------------
@@ -24,22 +26,22 @@ use super::agg::{Accumulator, ExtremeSpec};
 /// `MIN(a)` and `MAX(a)` coexist with no collision, and within an ordinal the
 /// `for_max` encoding sorts the extreme first.
 const ORDINAL_COL: SchemaColumn = SchemaColumn::new(type_code::U8, 0);
-/// The order-encoded aggregate value: [`scalar_image`]'s `u64`, or a wide
-/// ordinal's leading image bytes — never read back there, but spreading one
-/// ordinal's entries over many PKs so the linear equal-PK walks stay short.
+/// The ordinal's image, spreading one ordinal's entries over many PKs so the
+/// linear equal-PK walks stay short.
 const VALUE_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
+/// [`VALUE_COL`] for a bake with a wide ordinal.
+const WIDE_VALUE_COL: SchemaColumn = SchemaColumn::new(type_code::U128, 0);
 /// A wide ordinal's whole image, and the order the seek follows: a BLOB payload
 /// sorts by content. Pushed only when a wide ordinal exists.
 const WIDE_COL: SchemaColumn = SchemaColumn::new(type_code::BLOB, 0);
-/// What the AVI appends behind a group key. The schema pushes exactly this, and
-/// it is also the reservation `new_group_key` packs the group key inside — so
-/// the suffix's width and column count have one definition, not two.
+/// What the AVI appends behind a group key — one of the two, by whether the bake
+/// has a wide ordinal. The schema pushes exactly this, and it is also the
+/// reservation `new_group_key` packs the group key inside.
 const SUFFIX: [SchemaColumn; 2] = [ORDINAL_COL, VALUE_COL];
+const WIDE_SUFFIX: [SchemaColumn; 2] = [ORDINAL_COL, WIDE_VALUE_COL];
 const ORDINAL_BYTES: usize = ORDINAL_COL.size() as usize;
-const VALUE_BYTES: usize = VALUE_COL.size() as usize;
-// The writers below store the ordinal as one bare byte and the value through
-// `u64::to_be_bytes`, which is each column's OPK image only at these two widths.
-const _: () = assert!(ORDINAL_BYTES == 1 && VALUE_BYTES == 8);
+// [`AviBake::prefix`] stores the ordinal as one bare byte.
+const _: () = assert!(ORDINAL_BYTES == 1);
 
 // ---------------------------------------------------------------------------
 // The compile-time bake
@@ -66,6 +68,9 @@ pub struct AviBake {
     pub schema: SchemaDescriptor,
     /// The value-indexed aggregates in accumulator order; entry `j` is ordinal `j`.
     aggs: Vec<AviAgg>,
+    /// Width of the value slot this bake's suffix reserved; every ordinal of one
+    /// bake shares it, wide or scalar.
+    value_bytes: usize,
 }
 
 impl AviBake {
@@ -81,7 +86,6 @@ impl AviBake {
         group_by_cols: &[u32],
         accs: &[Accumulator],
     ) -> Result<Self, crate::schema::OpBuildErr> {
-        let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &SUFFIX)?;
         let aggs: Vec<AviAgg> = accs
             .iter()
             .enumerate()
@@ -90,13 +94,21 @@ impl AviBake {
                 Some(AviAgg { acc_idx: k as u8, spec })
             })
             .collect();
+        let has_wide = aggs.iter().any(|a| matches!(a.spec.kind, ImageKind::Wide(_)));
+        let suffix = if has_wide { &WIDE_SUFFIX } else { &SUFFIX };
+        let key_packer = ReindexPacker::new_group_key(src, group_by_cols, suffix)?;
         let mut b = crate::schema::DerivedSchema::new();
-        super::super::group_key::push_group_index_key(&mut b, &key_packer, &SUFFIX);
-        if aggs.iter().any(|a| matches!(a.spec.kind, ImageKind::Wide(_))) {
+        super::super::group_key::push_group_index_key(&mut b, &key_packer, suffix);
+        if has_wide {
             b.push(WIDE_COL)
                 .expect("one payload column fits behind a PK-only schema");
         }
-        Ok(AviBake { schema: b.finish(), key_packer, aggs })
+        Ok(AviBake {
+            schema: b.finish(),
+            key_packer,
+            aggs,
+            value_bytes: suffix[1].size() as usize,
+        })
     }
 
     /// Each ordinal's accumulator index, in ordinal order.
@@ -121,16 +133,13 @@ impl AviBake {
         &buf[..self.key_packer.out_stride + ORDINAL_BYTES]
     }
 
-    /// `group ‖ ordinal ‖ scalar_image` over the same buffer: the prefix, then the
-    /// value big-endian so the index's raw lexicographic byte order *is* the
-    /// encoded value's order. Written through [`Self::prefix`], so the ordinal's
-    /// position has one definition; the whole constant-length window is
-    /// overwritten, so no stale bytes leak across the ordinal loop.
+    /// `group ‖ ordinal ‖ image` over the same buffer, the image big-endian so
+    /// the index's raw lexicographic byte order *is* the encoded value's order.
     #[inline]
-    pub(super) fn entry<'a>(&self, buf: &'a mut [u8], ord: u8, av: u64) -> &'a [u8] {
+    pub(super) fn entry<'a>(&self, buf: &'a mut [u8], ord: u8, image: &[u8]) -> &'a [u8] {
         let n = self.prefix(buf, ord).len();
-        buf[n..n + VALUE_BYTES].copy_from_slice(&av.to_be_bytes());
-        &buf[..n + VALUE_BYTES]
+        write_image_slot(&mut buf[n..n + self.value_bytes], image);
+        &buf[..n + self.value_bytes]
     }
 
     /// Seek ordinal `ord`'s group and seed `acc` with its extreme, or reset `acc`
@@ -147,7 +156,7 @@ impl AviBake {
         // under the prefix is it — undo the complement to get what `acc` holds.
         match spec.kind {
             ImageKind::Scalar(_) => {
-                let av = Self::av_of(cur.current_pk_bytes(), prefix.len());
+                let av = self.av_of(cur.current_pk_bytes(), prefix.len());
                 acc.seed_encoded_extreme(if spec.for_max { !av } else { av });
             }
             ImageKind::Wide(kind) => {
@@ -159,16 +168,16 @@ impl AviBake {
         }
     }
 
-    /// The encoded value out of a full entry PK, given the prefix length it was
-    /// sought by — the read-back half of [`Self::entry`].
+    /// A scalar ordinal's encoded value out of a full entry PK, given the prefix
+    /// length it was sought by — the read-back half of [`Self::entry`].
     #[inline]
-    fn av_of(pk: &[u8], prefix_len: usize) -> u64 {
+    fn av_of(&self, pk: &[u8], prefix_len: usize) -> u64 {
         debug_assert_eq!(
             pk.len(),
-            prefix_len + VALUE_BYTES,
+            prefix_len + self.value_bytes,
             "AVI key = seek prefix (group ‖ ordinal) ‖ value",
         );
-        u64::from_be_bytes(pk[prefix_len..prefix_len + VALUE_BYTES].try_into().unwrap())
+        u64::from_be_bytes(pk[prefix_len..prefix_len + 8].try_into().unwrap())
     }
 }
 
@@ -208,8 +217,8 @@ pub fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
             let ExtremeSpec { loc, kind, for_max } = a.spec;
             match kind {
                 ImageKind::Scalar(kind) => {
-                    let av = scalar_image(&loc, kind, for_max, &mb, row);
-                    out.push_zero_filled_row(bake.entry(&mut key, j as u8, av), weight, 0);
+                    let av = scalar_image(&loc, kind, for_max, &mb, row).to_be_bytes();
+                    out.push_zero_filled_row(bake.entry(&mut key, j as u8, &av), weight, 0);
                 }
                 ImageKind::Wide(kind) => {
                     image.clear();
@@ -219,7 +228,7 @@ pub fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
                         wide_native(&loc, kind, &mb, row, &mut scratch),
                         &mut image,
                     );
-                    out.begin_row(bake.entry(&mut key, j as u8, leading_u64(&image)), weight);
+                    out.begin_row(bake.entry(&mut key, j as u8, &image), weight);
                     out.extend_col_blob(0, &image);
                     out.commit_row(0);
                 }

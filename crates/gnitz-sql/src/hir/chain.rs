@@ -15,6 +15,9 @@ use std::sync::Arc;
 pub(crate) struct EmitPieces {
     pub circuit: Circuit,
     pub out: Frame,
+    /// Whether two output rows may share the frame's leading key. Stated by the
+    /// emitter that minted that key, never re-derived from the HIR.
+    pub pk_repeats: bool,
 }
 
 /// `Schema::validate_parts`, with a rejection naming the stage `what`.
@@ -44,12 +47,19 @@ impl ViewChain {
 
     /// Push one emitted circuit: the one path every circuit, hidden or final,
     /// reaches.
-    fn push(&mut self, circuit: Circuit, schema: Schema, what: &str) -> Result<&mut PlannedView, GnitzSqlError> {
+    fn push(
+        &mut self,
+        circuit: Circuit,
+        schema: Schema,
+        pk_repeats: bool,
+        what: &str,
+    ) -> Result<&mut PlannedView, GnitzSqlError> {
         admit(&schema, what)?;
         self.segments.push(PlannedView {
             circuit,
             output_columns: schema.columns,
             pk_cols: schema.pk_cols,
+            pk_repeats,
         });
         Ok(self.segments.last_mut().expect("just pushed"))
     }
@@ -72,19 +82,20 @@ impl ViewChain {
                     .to_string(),
             ));
         }
-        let EmitPieces { circuit, out } = emit(self)?;
-        self.push(circuit, Schema::clone(&out.schema), "view segment output")?;
+        let EmitPieces { circuit, out, pk_repeats } = emit(self)?;
+        self.push(circuit, Schema::clone(&out.schema), pk_repeats, "view segment output")?;
         Ok(SegInput {
             tid: segment_id(self.segments.len() as u64 - 1),
             frame: out,
             // A chain-minted id, not a catalog one: no kind, no index bound.
             desc: None,
+            pk_repeats,
         })
     }
 
     /// Push the user-named view, always the chain's last element.
     pub(crate) fn push_final(&mut self, pieces: EmitPieces) -> Result<&mut PlannedView, GnitzSqlError> {
-        let EmitPieces { circuit, out } = pieces;
-        self.push(circuit, Arc::unwrap_or_clone(out.schema), "view output")
+        let EmitPieces { circuit, out, pk_repeats } = pieces;
+        self.push(circuit, Arc::unwrap_or_clone(out.schema), pk_repeats, "view output")
     }
 }

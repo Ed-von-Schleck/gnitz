@@ -19,14 +19,22 @@ pub(in crate::catalog) struct RelationEntry {
     pub(in crate::catalog) schema_block: Rc<Vec<u8>>,
     /// The FK edges this relation declares as a child.
     pub(in crate::catalog) fks: Vec<FkEdge>,
+    pub(in crate::catalog) pk_repeats: bool,
 }
 
 impl RelationEntry {
-    pub(in crate::catalog) fn new(id: i64, schema: &SchemaDescriptor, defs: &[ColumnDef], fks: Vec<FkEdge>) -> Self {
+    pub(in crate::catalog) fn new(
+        id: i64,
+        schema: &SchemaDescriptor,
+        defs: &[ColumnDef],
+        fks: Vec<FkEdge>,
+        pk_repeats: bool,
+    ) -> Self {
         RelationEntry {
             schema_version: NonZeroU16::MIN,
             schema_block: Rc::new(encode_named_schema_block(schema, defs, id as u32)),
             fks,
+            pk_repeats,
         }
     }
 

@@ -723,8 +723,9 @@ pub const fn int_domain_fits(src: u8, target: u8) -> bool {
 /// a narrower integer into a wider slot; there is no narrowing and no
 /// representation change). The `is_fixed_int(target)` gate is this caller's own
 /// scope, not a screen on the rule: a column copy only ever widens into a
-/// ≤8-byte slot. Shared by the engine compiler's carried-target validation and
-/// the expression validator's column-sink slot check so the two cannot drift.
+/// ≤8-byte slot. The expression validator's `check_copy_types` asks it of every
+/// column sink, and the SQL planner asks it of a set-op pair's promotion target
+/// so the two agree on what a copy may do.
 #[inline]
 pub fn is_widening_promotion(src: u8, target: u8) -> bool {
     is_fixed_int(target) && int_domain_fits(src, target)
@@ -1086,17 +1087,17 @@ pub const fn reindex_output_type_code(tc: u8) -> u8 {
 }
 
 /// Common reindex output type code for an equijoin key pair, or `None` if the
-/// pair cannot co-partition under an existing type code. Floats and one-sided
-/// german-string pairs are rejected upstream (in `validate_join_key_pair`) and
-/// never reach here. The returned code is the reindex OUTPUT type directly (the
-/// promoted integer type with its true sign for ≤8-byte ints; U128 for the
-/// unsigned-16B and german-string cases), so it is exactly what the slot type,
-/// the `ColPromoter`, and the `_join_pk` stamp all need.
+/// pair cannot co-partition under an existing type code. The returned code is the
+/// reindex OUTPUT type directly (the promoted integer type with its true sign for
+/// ≤8-byte ints; U128 for the unsigned-16B and german-string cases), so it is
+/// exactly what the slot type, the `ColPromoter`, and the `_join_pk` stamp all
+/// need.
 pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     // Equal types: the reindex output type (identity for fixed ints; U128 for
-    // U128/UUID and STRING/BLOB content hashes).
+    // U128/UUID and STRING/BLOB content hashes). A float pair is the one equal
+    // pair that co-partitions under none: `±0.0` are byte-unequal but compare equal.
     if l == r {
-        return Some(reindex_output_type_code(l));
+        return (is_pk_eligible(l) || is_german_string(l)).then(|| reindex_output_type_code(l));
     }
     // Both german strings: a 16-byte XXH3 content hash (U128 slot). A one-sided
     // string pair is rejected in validate_join_key_pair and never reaches here.

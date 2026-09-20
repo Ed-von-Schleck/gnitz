@@ -1,7 +1,6 @@
 //! The one join shell: every `Join` step, decorrelated kinds included, over the
 //! circuit primitives in [`super::joincore`], its output key read off [`OutKey`].
 
-use super::super::guards::reject_pair_pk_overflow;
 use super::super::{ColId, HirExpr, JoinClass, JoinShape, JoinType, OutKey, ProjEntry, RelExpr};
 use super::exists;
 use super::joincore::{
@@ -14,6 +13,7 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical::Frame;
 use crate::ir::BExpr;
+use crate::validate::reject_pk_list_arity;
 
 use gnitz_core::{Circuit, ColumnDef, NodeId, ReindexRole};
 use gnitz_wire::JoinKind;
@@ -40,17 +40,17 @@ pub(super) fn lower_join_view(
     let down = Demand { items, where_preds };
 
     let mut cb = Circuit::default();
-    let (inputs, sides) = emit_join_inputs(chain, memo, &mut cb, down, [left, right], kind, class)?;
+    let (inputs, sides, left_pk_repeats) = emit_join_inputs(chain, memo, &mut cb, down, [left, right], kind, class)?;
 
     let out_key = class.out_key(kind);
     let out_pk = match out_key {
         OutKey::JoinKey => join_pk_coldefs(&class.eq.iter().map(|p| p.tc).collect::<Vec<_>>()),
         OutKey::PairPk => {
             let surface = match class.shape() {
-                JoinShape::Cross => "CROSS JOIN",
-                _ => "range JOIN",
+                JoinShape::Cross => "CROSS JOIN output PK",
+                _ => "range JOIN output PK",
             };
-            reject_pair_pk_overflow(surface, sides[0].pa(), sides[1].pa())?;
+            reject_pk_list_arity(surface, sides[0].pa() + sides[1].pa())?;
             pair_pk_coldefs(&sides[0].frame.schema, &sides[1].frame.schema)
         }
         OutKey::OuterPk { .. } => src_pk_coldefs(&sides[0].frame.schema),
@@ -60,11 +60,11 @@ pub(super) fn lower_join_view(
     let branches = match (class.shape(), kind.is_decorrelated()) {
         (JoinShape::Equi, false) => emit_equi(&mut cb, inputs, class, kind, &sides, unique)?,
         (JoinShape::Band | JoinShape::PureRange, false) => emit_range(&mut cb, inputs, class, kind, &sides, unique)?,
-        (JoinShape::Cross, false) => emit_cross(&mut cb, inputs, &sides),
+        (JoinShape::Cross, _) if kind == JoinType::Inner => emit_cross(&mut cb, inputs, &sides),
+        (JoinShape::Cross, _) => unreachable!("reject_join_shape refuses a keyless non-INNER join"),
         (JoinShape::Equi, true) => exists::equi(&mut cb, inputs, class, kind, &sides, unique[1])?,
         (JoinShape::Band, true) => exists::band(&mut cb, inputs, class, kind, &sides, unique[1])?,
         (JoinShape::PureRange, true) => exists::pure_range(&mut cb, inputs, class, kind, &sides)?,
-        (JoinShape::Cross, true) => unreachable!("reject_keyless_non_inner refuses a keyless decorrelated join"),
     };
 
     // The frame every branch filters and projects against.
@@ -97,7 +97,12 @@ pub(super) fn lower_join_view(
         false => node,
     };
     cb.sink(node);
-    Ok(EmitPieces { circuit: cb, out })
+    // A join key and a pair PK each identify a matched pair, not a row.
+    let pk_repeats = match out_key {
+        OutKey::JoinKey | OutKey::PairPk => true,
+        OutKey::OuterPk { .. } => left_pk_repeats,
+    };
+    Ok(EmitPieces { circuit: cb, out, pk_repeats })
 }
 
 /// Substitute `ColRef(mark_id)` with `LitInt(val)` throughout an expression —
@@ -184,12 +189,15 @@ fn emit_range(
     let rekey = pro.pair_keyed(cb, merged);
     let node = match (kind, class.shape()) {
         (JoinType::Inner, _) => rekey,
-        (_, JoinShape::PureRange) => {
+        (JoinType::Left, JoinShape::PureRange) => {
             // Pure-range threshold subtraction: `A − matched` against `m = MAX/MIN(b.range)`.
             let (owned, matched) = pro.threshold(cb);
             let nu_a = cb.difference(owned, matched);
             let branch = emit_range_null_fill_tail(cb, sides, nu_a, true);
             cb.union(branch, rekey)
+        }
+        (JoinType::Right | JoinType::Full, JoinShape::PureRange) => {
+            unreachable!("reject_join_shape refuses a pure-range RIGHT/FULL join")
         }
         _ => {
             // Band ν_A (preserves_left) and/or ν_B (preserves_right).

@@ -254,16 +254,26 @@ pub(crate) fn require_class(rel: &RelDescriptor, name: &str, want: ClassWant, op
     )))
 }
 
-/// Reject a counted column list wider than the engine's column limit, before the
-/// wire encoder's assertion. `what` names the list.
-pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
-    if cols > gnitz_core::MAX_COLUMNS {
+/// Reject a counted column list wider than `cap`, before the wire encoder's
+/// assertion. `what` names the list; the two caps below are the only ones.
+fn reject_arity(what: &str, cols: usize, cap: usize) -> Result<(), GnitzSqlError> {
+    if cols > cap {
         return Err(GnitzSqlError::Unsupported(format!(
-            "{what} has {cols} columns, exceeding the {}-column limit",
-            gnitz_core::MAX_COLUMNS
+            "{what} has {cols} columns, exceeding the {cap}-column limit"
         )));
     }
     Ok(())
+}
+
+/// A relation's column list, against the engine's column limit.
+pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
+    reject_arity(what, cols, gnitz_core::MAX_COLUMNS)
+}
+
+/// A synthesized key list — a join's reindex slots, or a join output's pair PK —
+/// against the width a registered PK may have.
+pub(crate) fn reject_pk_list_arity(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
+    reject_arity(what, cols, gnitz_core::PK_LIST_MAX_COLS)
 }
 
 /// The `Select` clauses a shape legitimately consumes, beyond the universal

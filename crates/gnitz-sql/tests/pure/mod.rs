@@ -91,6 +91,7 @@ pub fn rel_with(
         tid,
         class,
         replicated,
+        pk_repeats: class == RelClass::Stream,
         schema: Arc::new(Schema { columns, pk_cols }),
         indexes: indexes
             .iter()

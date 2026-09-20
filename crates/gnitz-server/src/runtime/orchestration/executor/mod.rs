@@ -1495,7 +1495,16 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
             is_unique: ic.is_unique(),
         })
         .collect();
-    let blob = gnitz_wire::RelDescriptorBlob { class, replicated, fks, indexes }.encode();
+    // Reported for every class, unlike `replicated` above.
+    let pk_repeats = class == gnitz_wire::RelClass::Stream || shared.cat().pk_repeats_of(tid);
+    let blob = gnitz_wire::RelDescriptorBlob {
+        class,
+        replicated,
+        pk_repeats,
+        fks,
+        indexes,
+    }
+    .encode();
 
     // Negotiated as a client holding no schema: a resolving client has none to validate.
     let (Some(schema_block), server_version) = shared.cat().negotiated_schema_block(tid, 0) else {

@@ -46,7 +46,8 @@ pub(crate) fn wide_native<'a>(
 /// Append the order image of one wide value to `out`: the OPK bytes of a
 /// 16-byte integer, or a **prefix-free** byte string (`0x00` escaped to
 /// `0x00 0xFF`, `0x00 0x00` appended). Prefix-freeness is what lets `invert`
-/// reverse the order exactly and a truncated `leading_u64` window still order.
+/// reverse the order exactly and a truncated [`write_image_slot`] window still
+/// order.
 pub(crate) fn append_wide_image(kind: WideKind, invert: bool, native: &[u8], out: &mut Vec<u8>) {
     let start = out.len();
     match kind {
@@ -67,6 +68,16 @@ pub(crate) fn append_wide_image(kind: WideKind, invert: bool, native: &[u8], out
     if invert {
         out[start..].iter_mut().for_each(|b| *b = !*b);
     }
+}
+
+/// Write `image` into an index key slot, zero-padding or truncating to its
+/// width. Images are prefix-free, so a truncated window still orders — but a
+/// wide image discriminates only across all 16 bytes.
+#[inline]
+pub(crate) fn write_image_slot(slot: &mut [u8], image: &[u8]) {
+    let take = image.len().min(slot.len());
+    slot[..take].copy_from_slice(&image[..take]);
+    slot[take..].fill(0);
 }
 
 /// [`append_wide_image`]'s inverse: the native bytes back out of an index image.

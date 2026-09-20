@@ -19,6 +19,7 @@ fn catalog() -> CatalogSnapshot {
                 tid,
                 class: RelClass::Table,
                 replicated: false,
+                pk_repeats: false,
                 schema,
                 indexes: Vec::new(),
             })),

@@ -46,6 +46,7 @@ fn segment(source_id: u64, cols: &[ColumnDef]) -> PlannedView {
         circuit,
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
+        pk_repeats: false,
     }
 }
 

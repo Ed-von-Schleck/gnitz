@@ -133,7 +133,7 @@ fn join_key_rules() {
                 "Unsupported",
                 "content hash never matches",
             ),
-            (&over_cap, "Unsupported", "equijoin key columns"),
+            (&over_cap, "Unsupported", "join key list"),
             (
                 "SELECT * FROM a LEFT JOIN b ON a.v <> b.w",
                 "Unsupported",
@@ -193,6 +193,13 @@ fn outer_and_range_join_rules() {
         "SELECT ty.id AS aid, w.id AS bid FROM ty JOIN w ON ty.big < w.big",
     );
     view(&cat, "SELECT a.id AS aid, b.id AS bid FROM a LEFT JOIN b ON a.v < b.w");
+    // A pure-range LEFT threshold carries the range column at the PAIR's common
+    // width — 16 bytes both-sided, and for a cross-sign 8-byte pair.
+    view(
+        &cat,
+        "SELECT ty.id AS aid, w.id AS bid FROM ty LEFT JOIN w ON ty.big < w.big",
+    );
+    view(&cat, "SELECT w.id AS aid, a.id AS bid FROM w LEFT JOIN a ON w.x < a.k");
     // An ON conjunct naming only the null-supplying side filters that side.
     view(&cat, "SELECT a.id AS aid FROM a LEFT JOIN b ON a.k = b.k AND b.w > 3");
     rejects(
@@ -229,21 +236,10 @@ fn outer_and_range_join_rules() {
                 "Unsupported",
                 "pure-range RIGHT/FULL",
             ),
-            // Both guards apply to a 16-byte pure-range FULL; the orientation one answers.
             (
                 "SELECT ty.id AS aid, w.id AS bid FROM ty FULL JOIN w ON ty.big < w.big",
                 "Unsupported",
                 "pure-range RIGHT/FULL",
-            ),
-            (
-                "SELECT ty.id AS aid, w.id AS bid FROM ty LEFT JOIN w ON ty.big < w.big",
-                "Unsupported",
-                "needs a ≤8-byte integer range column",
-            ),
-            (
-                "SELECT w.id AS aid, a.id AS bid FROM w LEFT JOIN a ON w.x < a.k",
-                "Unsupported",
-                "needs a ≤8-byte integer range column",
             ),
         ],
     );
@@ -271,6 +267,9 @@ fn subquery_rules() {
         "SELECT a.id, (SELECT COUNT(*) FROM b) FROM a",
         "SELECT a.id FROM a WHERE a.v <> (SELECT COUNT(*) FROM b)",
         "SELECT a.v FROM a WHERE a.v < ALL (SELECT w FROM b)",
+        // A pure-range correlation runs the same threshold a pure-range LEFT
+        // JOIN does, at the range pair's common width.
+        "SELECT * FROM ty WHERE EXISTS (SELECT 1 FROM w WHERE w.big < ty.big)",
     ] {
         view(&cat, body);
     }
@@ -283,7 +282,6 @@ fn subquery_rules() {
             ("SELECT * FROM a WHERE k NOT IN (SELECT k FROM n)", "Unsupported", "NOT NULL"),
             ("SELECT * FROM a WHERE (k, v) IN (SELECT k, w FROM b)", "Unsupported", "tuple"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w > 5)", "Unsupported", "needs at least one equijoin"),
-            ("SELECT * FROM ty WHERE EXISTS (SELECT 1 FROM w WHERE w.big < ty.big)", "Unsupported", "8-byte integer range column"),
             ("SELECT k, COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) GROUP BY k", "Unsupported", "GROUP BY/aggregates"),
             ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN a AS z ON b.k = z.k WHERE b.k = a.k)", "Unsupported", "single FROM table without JOINs"),
             ("SELECT * FROM a WHERE EXISTS (SELECT k FROM b WHERE b.k = a.k GROUP BY k)", "Unsupported", "GROUP BY"),
