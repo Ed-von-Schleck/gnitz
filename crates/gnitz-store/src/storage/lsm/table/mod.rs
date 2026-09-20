@@ -7,22 +7,22 @@
 //! `Rederive` ones.
 
 use std::cell::Cell;
-use std::cmp::Ordering;
 use std::ffi::CString;
 use std::rc::Rc;
 
 use super::batch::Batch;
-use super::columnar::{pk_group_end, with_payload_cmp, ColumnarSource};
 use super::error::StorageError;
-use super::merge::RowComparator;
+use super::merge::ColumnarSource;
 use super::read_cursor::{self, ReadCursor};
 use super::run::{Run, StoredRow};
 use super::run_set::RunSet;
+use super::seek::pk_group_end;
 use super::shard_index::{ShardBudget, ShardIndex};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
 use super::StagedFile;
 use crate::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key, PkBuf};
+use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 
 /// Ingest runs fold into the RAM tier once they pass this. 192 KiB and 768 KiB
@@ -120,26 +120,28 @@ pub(in crate::storage) struct FlushWork {
 }
 
 /// Index of the first candidate in `pool` (pool order) whose payload group nets
-/// strictly positive — the live row for the PK the pool was gathered for. `cmp`
-/// is the payload comparator the merge seats pick between, so this groups the way
+/// strictly positive — the live row for the PK the pool was gathered for.
+/// `payload` is the order the merge seats pick between, so this groups the way
 /// every other (PK, payload) grouping in storage does.
 ///
 /// "First" is a performance choice: every production caller holds at most one
 /// positive group at a PK — a base table by `enforce_unique_pk`, a system table
 /// by the catalog precheck's per-PK CAS and `0..=1` net bound. *Which member* of
 /// the group comes back is unspecified.
-fn first_live_payload_group(
+fn first_live_payload_group<P: PayloadOrder>(
     schema: &SchemaDescriptor,
     pool: &[StoredRow],
-    cmp: impl RowComparator<Run>,
+    payload: P,
 ) -> Option<usize> {
     (0..pool.len()).find(|&i| {
-        let net: i64 = pool
+        let (run, row) = (&pool[i].run, pool[i].row);
+        let others: i64 = pool
             .iter()
-            .filter(|c| cmp(schema, &pool[i].run, pool[i].row, &c.run, c.row) == Ordering::Equal)
-            .map(StoredRow::weight)
+            .enumerate()
+            .filter(|&(j, c)| j != i && payload.compare(schema, run, row, &c.run, c.row).is_eq())
+            .map(|(_, c)| c.weight())
             .sum();
-        net > 0
+        pool[i].weight() + others > 0
     })
 }
 

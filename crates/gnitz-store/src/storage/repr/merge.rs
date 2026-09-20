@@ -14,9 +14,10 @@ use std::ops::ControlFlow;
 
 use super::batch::Batch;
 use super::batch_pool::tls_pool;
-use super::columnar::{pk_group_end, with_payload_cmp, ColumnarSource};
 use super::heap::{HeapNode, LoserTree};
-use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
+use super::seek::pk_group_end;
+use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
+use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::read_u64_le;
@@ -666,11 +667,10 @@ impl<'a> DirectWriter<'a> {
 /// matching rows inside one sorted source) and cross-source duplicates in one
 /// pass.
 ///
-/// Builds the payload comparator once via `with_payload_cmp!`, seats one
-/// [`PosCursor`] per source, and drives [`drive`]; the PK axis is
-/// settled by `compare_pk_ordering` (one byte comparator at every width).
-/// Each source's walk bound is its own
-/// [`ColumnarSource::row_count`].
+/// Selects the payload order once via `with_payload_cmp!`, seats one
+/// [`PosCursor`] per source, and drives [`drive`]; the PK axis is settled by
+/// `compare_pk_ordering` (one byte comparator at every width). Each source's
+/// walk bound is its own [`RowSource::row_count`].
 /// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
 /// group; the caller turns `(src, row)` into its output (a `DirectWriter` row for
 /// flush, a guard-routed shard append for compaction).
@@ -687,20 +687,25 @@ pub(crate) fn run_merge<S: ColumnarSource>(
         .map(|s| PosCursor { position: 0, count: s.row_count() })
         .collect();
 
-    // Dispatch the payload comparator, monomorphizing one branch-free copy of the
+    // Dispatch the payload order, monomorphizing one branch-free copy of the
     // merge loop; the PK axis is `compare_pk_ordering` (no stride dispatch).
     with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
 }
 
-/// The payload comparator every merge path is monomorphized over: row `ai` of an
-/// `A` against row `bi` of a `B`, one source type at every seat but the read
-/// cursor's walk against an in-memory batch. `Copy` lets one selected comparator
-/// forward down a whole call chain at no cost. `with_payload_cmp!` picks it.
-pub(crate) trait RowComparator<A, B = A>:
-    Fn(&SchemaDescriptor, &A, usize, &B, usize) -> Ordering + Copy
-{
+/// A `RowSource` that also carries the Z-set weight: a storage row the N-way
+/// merge folds.
+pub(crate) trait ColumnarSource: RowSource {
+    /// The row's signed Z-set weight / multiplicity (region[1]).
+    fn get_weight(&self, row: usize) -> i64;
+
+    /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
+    /// a capacity-bounded view's skeleton shard. `false` for every in-memory
+    /// source, which always carries its payload.
+    #[inline(always)]
+    fn is_skeleton(&self) -> bool {
+        false
+    }
 }
-impl<A, B, F> RowComparator<A, B> for F where F: Fn(&SchemaDescriptor, &A, usize, &B, usize) -> Ordering + Copy {}
 
 /// The merge's heap order, shared by [`drive`] and by the read cursor's own tree
 /// rebuild and forward seek, so the two can never diverge on the (PK, payload)
@@ -708,24 +713,24 @@ impl<A, B, F> RowComparator<A, B> for F where F: Fn(&SchemaDescriptor, &A, usize
 /// type — no `dyn` — so each caller monomorphizes its own branch-free copy.
 ///
 /// `compare_pk_ordering` on each player's full OPK bytes (exact at every width —
-/// no cached key, no stride dispatch), then the payload `row_cmp`.
+/// no cached key, no stride dispatch), then the `payload` order.
 ///
 /// `coarsen` collapses the payload axis for a cursor holding a skeleton run: a
 /// skeleton row sorts before every hydrated row of its PK, making it the exemplar
-/// [`drive`] folds the whole PK group into. Tested ahead of `row_cmp`, so a
+/// [`drive`] folds the whole PK group into. Tested ahead of `payload`, so a
 /// skeleton row's absent columns are never read. A runtime flag, not a second
 /// monomorphisation axis: it is constant for a cursor's life and reached only on
 /// a PK tie.
 #[inline]
-pub(crate) fn merge_less<'a, S, RowCmp>(
+pub(crate) fn merge_less<'a, S, P>(
     schema: &'a SchemaDescriptor,
     sources: &'a [S],
-    row_cmp: RowCmp,
+    payload: P,
     coarsen: bool,
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a
 where
     S: ColumnarSource,
-    RowCmp: RowComparator<S> + 'a,
+    P: PayloadOrder + 'a,
 {
     move |a, b| {
         let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
@@ -740,7 +745,7 @@ where
                         return sa && !sb;
                     }
                 }
-                row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less
+                payload.compare(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less
             }
         }
     }
@@ -760,21 +765,21 @@ where
 /// `#[inline(always)]`: each caller's `emit` returns a constant `ControlFlow`, so
 /// forced inlining folds the branch and drops the unused arm per monomorphisation.
 #[inline(always)]
-pub(crate) fn drive<S, RowCmp>(
+pub(crate) fn drive<S, P>(
     tree: &mut LoserTree,
     schema: &SchemaDescriptor,
     sources: &[S],
     cursors: &mut [PosCursor],
-    row_cmp: RowCmp,
+    payload: P,
     coarsen: bool,
     mut emit: impl FnMut(usize, usize, i64) -> ControlFlow<()>,
 ) where
     S: ColumnarSource,
-    RowCmp: RowComparator<S>,
+    P: PayloadOrder,
 {
     // `less` and `same_group` read `(source_idx, row)` out of the heap node and
     // never touch `cursors`, so they coexist with the `&mut cursors` `step!` holds.
-    let less = merge_less(schema, sources, row_cmp, coarsen);
+    let less = merge_less(schema, sources, payload, coarsen);
     let same_group = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
         if !pk_bytes_eq(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
             return false;
@@ -782,7 +787,7 @@ pub(crate) fn drive<S, RowCmp>(
         if coarsen && (sources[a_src].is_skeleton() || sources[b_src].is_skeleton()) {
             return true;
         }
-        row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
+        payload.compare(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
     };
     // Sources are ghost-free, so the advance is a bare `position + 1`.
     macro_rules! step {
@@ -834,15 +839,15 @@ pub(crate) fn drive<S, RowCmp>(
 /// [`drive`]. Monomorphised per (source, payload) so the hot loop stays
 /// branch-free.
 #[inline]
-fn run_merge_body<S, RowCmp>(
+fn run_merge_body<S, P>(
     sources: &[S],
     cursors: &mut [PosCursor],
     schema: &SchemaDescriptor,
     mut emit: impl FnMut(usize, usize, i64),
-    row_cmp: RowCmp,
+    payload: P,
 ) where
     S: ColumnarSource,
-    RowCmp: RowComparator<S>,
+    P: PayloadOrder,
 {
     // §2's one silent failure: a merge reads each source linearly, so an
     // out-of-order input makes the heap deliver duplicates non-adjacently and
@@ -853,7 +858,7 @@ fn run_merge_body<S, RowCmp>(
     for (si, src) in sources.iter().enumerate() {
         for r in 1..src.row_count() {
             let ord = compare_pk_ordering(src.get_pk_bytes(r - 1), src.get_pk_bytes(r))
-                .then_with(|| row_cmp(schema, src, r - 1, src, r));
+                .then_with(|| payload.compare(schema, src, r - 1, src, r));
             debug_assert_ne!(ord, Ordering::Greater, "run_merge: source {si} unsorted at row {r}");
         }
     }
@@ -861,12 +866,12 @@ fn run_merge_body<S, RowCmp>(
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| cursors[i].is_valid().then(|| cursors[i].position as u32),
-        merge_less(schema, sources, row_cmp, false),
+        merge_less(schema, sources, payload, false),
     );
     // `coarsen: false` — skeleton folding is a read-path concern, and compaction
     // re-materializes per PK anyway (`compact::merge_and_route`). The literal also
     // const-folds the skeleton test out of this monomorphisation.
-    drive(&mut tree, schema, sources, cursors, row_cmp, false, |src, row, w| {
+    drive(&mut tree, schema, sources, cursors, payload, false, |src, row, w| {
         emit(src, row, w);
         ControlFlow::Continue(())
     });
@@ -910,10 +915,7 @@ impl Batch {
 }
 
 #[inline]
-fn merged_consolidated_body<RowCmp>(a: &Batch, b: &Batch, schema: &SchemaDescriptor, row_cmp: RowCmp) -> Batch
-where
-    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
-{
+fn merged_consolidated_body<P: PayloadOrder>(a: &Batch, b: &Batch, schema: &SchemaDescriptor, payload: P) -> Batch {
     let (n_a, n_b) = (a.count, b.count);
     let (mb_a, mb_b) = (a.as_mem_batch(), b.as_mem_batch());
 
@@ -959,7 +961,7 @@ where
                         };
                     }
                     while ia < ga && jb < gb {
-                        match row_cmp(schema, &mb_a, ia, &mb_b, jb) {
+                        match payload.compare(schema, &mb_a, ia, &mb_b, jb) {
                             Ordering::Less => {
                                 if !matches!(open, Open::A(_)) {
                                     flush!();
@@ -1041,83 +1043,58 @@ struct SortEntry<K> {
     idx: u32,
 }
 
-/// The argsort half of [`consolidate_groups`]. [`PkSortKey`] is the whole OPK
-/// image up to a 32-byte stride, so the key compare is exact and a tie goes
-/// straight to the payload comparator; wider strides compare the bytes.
+/// The argsort half of [`consolidate_groups`]: [`PkSortKey`] carries the whole
+/// OPK image, so a key tie goes straight to the payload order.
 #[inline]
-fn consolidate_groups_inner<RowCmp>(
+fn consolidate_groups_inner<P: PayloadOrder>(
     n: usize,
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     out: &mut Vec<(u32, u32, i64)>,
-    row_cmp: RowCmp,
-) where
-    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
-{
-    pk_width_dispatch!(
-        batch.pk_stride as usize,
-        |K| {
-            let mut entries: Vec<SortEntry<K>> = (0..n as u32)
-                .map(|i| SortEntry {
-                    key: K::from_opk(batch.get_pk_bytes(i as usize)),
-                    idx: i,
-                })
-                .collect();
-            entries.sort_unstable_by(|a, b| {
-                let (x, y) = (a.idx as usize, b.idx as usize);
-                a.key.cmp(&b.key).then_with(|| row_cmp(schema, batch, x, batch, y))
-            });
-            drain_groups(n, batch, schema, row_cmp, |pos| entries[pos].idx as usize, out);
-        },
-        {
-            let mut order: Vec<u32> = (0..n as u32).collect();
-            order.sort_unstable_by(|&a, &b| {
-                let (x, y) = (a as usize, b as usize);
-                compare_pk_bytes(batch.get_pk_bytes(x), batch.get_pk_bytes(y))
-                    .then_with(|| row_cmp(schema, batch, x, batch, y))
-            });
-            drain_groups(n, batch, schema, row_cmp, |pos| order[pos] as usize, out);
-        }
-    )
+    payload: P,
+) {
+    pk_width_dispatch!(batch.pk_stride as usize, |K| {
+        let mut entries: Vec<SortEntry<K>> = (0..n as u32)
+            .map(|i| SortEntry {
+                key: K::from_opk(batch.get_pk_bytes(i as usize)),
+                idx: i,
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| {
+            let (x, y) = (a.idx as usize, b.idx as usize);
+            Ord::cmp(&a.key, &b.key).then_with(|| payload.compare(schema, batch, x, batch, y))
+        });
+        drain_groups(&entries, batch, schema, payload, out);
+    })
 }
 
-/// The fold half of [`consolidate_groups`]: walk the sorted order and push one
+/// The fold half of [`consolidate_groups`]: walk the sorted entries and push one
 /// survivor per (PK, payload) group whose weights do not cancel.
-///
-/// `resolve(pos)` maps a position in the sorted order to the batch row index.
-/// Group detection is [`pk_bytes_eq`] on the two rows' OPK bytes, then the
-/// payload `row_cmp` — the same two terms [`drive`]'s group boundary uses.
 #[inline]
-fn drain_groups<RowCmp>(
-    n: usize,
+fn drain_groups<K: Copy + Eq, P: PayloadOrder>(
+    entries: &[SortEntry<K>],
     batch: &MemBatch,
     schema: &SchemaDescriptor,
-    row_cmp: RowCmp,
-    resolve: impl Fn(usize) -> usize,
+    payload: P,
     out: &mut Vec<(u32, u32, i64)>,
-) where
-    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
-{
-    let mut pending_idx = resolve(0);
-    let mut pending_weight = batch.get_weight(pending_idx);
+) {
+    let mut pending = entries[0];
+    let mut pending_weight = batch.get_weight(pending.idx as usize);
 
-    for pos in 1..n {
-        let cur_idx = resolve(pos);
-        let same_group = pk_bytes_eq(batch.get_pk_bytes(pending_idx), batch.get_pk_bytes(cur_idx))
-            && row_cmp(schema, batch, pending_idx, batch, cur_idx) == Ordering::Equal;
-
-        if same_group {
-            pending_weight += batch.get_weight(cur_idx);
+    for cur in &entries[1..] {
+        let (pi, ci) = (pending.idx as usize, cur.idx as usize);
+        if pending.key == cur.key && payload.compare(schema, batch, pi, batch, ci).is_eq() {
+            pending_weight += batch.get_weight(ci);
         } else {
             if pending_weight != 0 {
-                out.push((0, pending_idx as u32, pending_weight));
+                out.push((0, pending.idx, pending_weight));
             }
-            pending_idx = cur_idx;
-            pending_weight = batch.get_weight(cur_idx);
+            pending = *cur;
+            pending_weight = batch.get_weight(ci);
         }
     }
     if pending_weight != 0 {
-        out.push((0, pending_idx as u32, pending_weight));
+        out.push((0, pending.idx, pending_weight));
     }
 }
 

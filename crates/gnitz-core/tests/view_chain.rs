@@ -72,7 +72,7 @@ fn live_view_vids(client: &mut GnitzClient) -> Vec<u64> {
 fn segment_vids_of(client: &mut GnitzClient, owner_vid: u64) -> Vec<u64> {
     let b = client.scan(gnitz_wire::VIEW_TAB).expect("scan VIEW_TAB").batch;
     let view_tab = gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB);
-    let owners = &b.payload[view_tab.payload_idx(gnitz_wire::VIEWTAB_COL_OWNER_VIEW_ID)].bytes;
+    let owners = &b.payload[gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID].bytes;
     (0..b.len())
         .filter(|&i| b.weights[i] > 0)
         .filter(|&i| u64::from_le_bytes(owners[i * 8..i * 8 + 8].try_into().unwrap()) == owner_vid)

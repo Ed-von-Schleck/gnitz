@@ -8,8 +8,8 @@
 
 use std::rc::Rc;
 
-use super::columnar::ColumnarSource;
 use super::error::StorageError;
+use super::merge::ColumnarSource;
 use super::shard_reader::MappedShard;
 use crate::schema::key::PkBuf;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_in_range};

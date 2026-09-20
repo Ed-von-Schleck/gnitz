@@ -1,6 +1,6 @@
 //! The batch shapes the evaluator and the resolved-addressing types read
 //! through: [`RowSource`] (one row at a time) and [`BatchView`] (whole regions,
-//! for the vectorized kernels).
+//! for the vectorized kernels), plus the by-slot cell readers over the former.
 
 /// Read one row's columns. The **one** per-row access shape in the system: the
 /// resolved-addressing types ([`crate::ColumnLocator`]) bind to it, the engine's
@@ -148,6 +148,45 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic payload-cell readers
+// ---------------------------------------------------------------------------
+//
+// [`RowSource`] is the whole surface reading one cell needs, so one spelling
+// serves a batch, a stored row, a positioned read cursor and a mirror alike.
+
+/// One row's fixed 8-byte payload slot `pi`, little-endian.
+pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
+    let cell = src.get_col_ptr(row, pi, 8);
+    // Exactly 8 bytes by construction — `get_col_ptr` returns the width asked for.
+    u64::from_le_bytes(cell.try_into().expect("an 8-byte payload cell"))
+}
+
+/// One row's German-string (STRING or BLOB) payload slot `pi`, resolved through
+/// the source's own blob heap so a value over 12 bytes reads back whole.
+pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> &[u8] {
+    let cell = src.get_col_ptr(row, pi, 16);
+    gnitz_wire::german_string_content(cell, src.blob())
+}
+
+/// [`payload_bytes`] as a `&str`; empty when not UTF-8. The borrowed twin of
+/// [`payload_string`], for a consumer that only reads the cell.
+pub fn payload_str<S: RowSource>(src: &S, row: usize, pi: usize) -> &str {
+    std::str::from_utf8(payload_bytes(src, row, pi)).unwrap_or_default()
+}
+
+/// [`payload_str`] as an owned `String`, for a consumer that keeps the value.
+pub fn payload_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
+    payload_str(src, row, pi).to_string()
+}
+
+/// Whether one row's payload slot `pi` holds NULL — the null-bit member of this
+/// family, so a reader that needs both the bit and the value addresses them
+/// through the same payload index.
+pub fn payload_is_null<S: RowSource>(src: &S, row: usize, pi: usize) -> bool {
+    gnitz_wire::null_word_get(src.get_null_word(row), pi)
 }
 
 #[cfg(test)]

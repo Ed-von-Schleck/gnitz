@@ -160,7 +160,7 @@ fn wire_chunk_compacts_the_heap_and_inherits_the_layout() {
         src.blob.len()
     );
     for (i, want) in [(0usize, "the second long value"), (1, "the third long value")] {
-        assert_eq!(crate::storage::payload_string(&chunk, i, 0), want);
+        assert_eq!(gnitz_expr::payload_string(&chunk, i, 0), want);
         assert_eq!(chunk.get_pk(i), (i + 2) as u128);
         assert_eq!(chunk.get_weight(i), 1);
     }

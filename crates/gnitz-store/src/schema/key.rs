@@ -250,54 +250,47 @@ impl NarrowPkOpk {
     }
 }
 
-/// A fixed-width order-preserving sort key built by left-aligning a row's
-/// `pk_stride` OPK bytes big-endian. The OPK bytes are order-preserving, and every
-/// row in one batch shares a single `pk_stride` (hence identical zero padding past
-/// `opk.len()`), so for two equal-length OPK slices that fit in `size_of::<K>()`
-/// bytes `K::from_opk(a).cmp(&K::from_opk(b)) == compare_pk_bytes(a, b)`. The key
-/// is the *whole* PK image (not a 16-byte prefix), so a key sort is exact with no
-/// PK-byte tiebreak. Used by the reduce sort to width-match the key to `pk_stride`
-/// (`u64`/`u128`/`[u128; 2]` for strides ≤8/≤16/≤32; wider PKs byte-walk directly).
-pub(crate) trait PkSortKey: Ord + Copy {
-    fn from_opk(opk: &[u8]) -> Self;
+/// A whole-PK sort key ordered exactly as `compare_pk_bytes` orders the bytes it
+/// was built from, so a key sort needs no PK-byte tiebreak. Keys compare only
+/// against keys built from the same number of bytes.
+pub(crate) trait PkSortKey<'a>: Ord + Copy {
+    fn from_opk(opk: &'a [u8]) -> Self;
 }
 
-/// Run `$body` with `$k` bound to the [`PkSortKey`] whose width matches `$stride`;
-/// strides too wide to pack into a register key take `$wide`.
-///
-/// The one statement of the width taxonomy the impls below define. A stride→width
-/// `match` spelled at a call site instead goes stale silently when an impl is
-/// added: the new width keeps falling to `$wide` and merely gets slower, with
-/// nothing to fail.
+/// Run `$body` with `$k` bound to the [`PkSortKey`] matching `$stride` — the one
+/// statement of the width taxonomy the impls below define.
 macro_rules! pk_width_dispatch {
-    ($stride:expr, |$k:ident| $body:expr, $wide:expr $(,)?) => {
+    ($stride:expr, |$k:ident| $body:expr $(,)?) => {
         match $stride {
             0..=8 => {
-                type $k = u64;
+                type $k<'k> = u64;
                 $body
             }
             9..=16 => {
-                type $k = u128;
+                type $k<'k> = u128;
                 $body
             }
             17..=32 => {
-                type $k = [u128; 2];
+                type $k<'k> = [u128; 2];
                 $body
             }
-            _ => $wide,
+            _ => {
+                type $k<'k> = &'k [u8];
+                $body
+            }
         }
     };
 }
 pub(crate) use pk_width_dispatch;
 
-impl PkSortKey for u64 {
+impl PkSortKey<'_> for u64 {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u64 {
         leading_u64(opk)
     }
 }
 
-impl PkSortKey for u128 {
+impl PkSortKey<'_> for u128 {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u128 {
         // Identical left-align to `u64`, one width up; `pack_pk_be` is the canonical
@@ -306,7 +299,14 @@ impl PkSortKey for u128 {
     }
 }
 
-impl PkSortKey for [u128; 2] {
+impl<'a> PkSortKey<'a> for &'a [u8] {
+    #[inline(always)]
+    fn from_opk(opk: &'a [u8]) -> Self {
+        opk
+    }
+}
+
+impl PkSortKey<'_> for [u128; 2] {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> [u128; 2] {
         // Dispatched only for 17..=32-byte strides: hi = the full leading 16 bytes

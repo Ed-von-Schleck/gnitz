@@ -14,7 +14,7 @@
 use std::rc::Rc;
 
 use super::batch::Batch;
-use super::columnar::ColumnarSource;
+use super::merge::ColumnarSource;
 use super::merge::{ColPtr, UnifiedSource};
 use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
@@ -28,9 +28,8 @@ pub(crate) enum Run {
 }
 
 impl Run {
-    /// First row whose OPK bytes are `>= key`. A raw `memcmp` binary search over
-    /// the order-preserving PK region — correct at every PK width with no schema
-    /// dependency. `key` must be exactly `pk_stride` OPK bytes.
+    /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride`
+    /// bytes. Correct at every PK width with no schema dependency.
     pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         match self {
             Run::Mem(b) => b.find_lower_bound_bytes(key),

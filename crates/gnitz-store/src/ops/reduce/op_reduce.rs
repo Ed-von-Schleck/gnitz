@@ -2,8 +2,9 @@
 
 use std::cmp::Ordering;
 
+use crate::schema::payload_order::compare_rows;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{compare_rows, Batch, Layout, ReadCursor, RowMark};
+use crate::storage::{Batch, Layout, ReadCursor, RowMark};
 
 use super::emit::emit_reduce_row;
 use super::plan::ReducePlan;

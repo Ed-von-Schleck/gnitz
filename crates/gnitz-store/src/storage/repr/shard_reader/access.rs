@@ -2,8 +2,8 @@
 //! the OPK binary searches — plus the bulk `*_owned_batch` materializers.
 
 use super::super::batch::{write_to_batch, Batch, Layout, FIXED_REGION_BYTES};
-use super::super::columnar::ColumnarSource;
 use super::super::layout::{for_image_len, two_value_bit};
+use super::super::merge::ColumnarSource;
 use super::super::merge::{prorated_blob_cap, should_relocate_blob, ColPtr, UnifiedSource};
 use super::{MappedShard, PackedRegion, PayloadRegion, WeightRegion};
 use crate::schema::SchemaDescriptor;
@@ -74,11 +74,10 @@ impl MappedShard {
         }
     }
 
-    /// First row whose OPK bytes are `>= key`. A raw `memcmp` binary search —
-    /// correct at every PK width with no schema dependency. `key` must be
-    /// exactly `pk_stride` OPK bytes.
+    /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride`
+    /// bytes. Correct at every PK width with no schema dependency.
     pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        unsafe { super::super::columnar::seek_lower_bound(self.count, self.pk_stride, self.pk, key) }
+        unsafe { super::super::seek::seek_lower_bound(self.count, self.pk_stride, self.pk, key) }
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
@@ -86,7 +85,7 @@ impl MappedShard {
     /// IS the hint, never worse than `find_lower_bound_bytes`. `key` must be
     /// exactly `pk_stride` OPK bytes.
     pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        unsafe { super::super::columnar::seek_advance_to(self.count, self.pk_stride, self.pk, key, hint) }
+        unsafe { super::super::seek::seek_advance_to(self.count, self.pk_stride, self.pk, key, hint) }
     }
 
     /// Bulk-copy a contiguous slice of rows into an Batch.

@@ -2,7 +2,7 @@
 
 use super::*;
 use gnitz_expr::RowSource;
-use gnitz_store::storage::{payload_bytes, payload_is_null, payload_u64};
+use gnitz_expr::{payload_bytes, payload_is_null, payload_u64};
 use gnitz_wire::sys_rows::CircuitNodeRow;
 use gnitz_wire::{
     CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,

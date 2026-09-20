@@ -76,6 +76,7 @@ fn test_relocate_german_string_vec_cache_hit_dedups() {
 
 use super::super::batch::{Batch, Layout};
 use super::*;
+use crate::schema::key::compare_pk_bytes;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_u128_i64, pk_payload_schema, pk_u64_two_i64_schema};
 
@@ -982,7 +983,7 @@ mod merge_materialize_vs_reference {
         let mut idx: Vec<usize> = (0..n).collect();
         idx.sort_by(
             |&x, &y| match compare_pk_bytes(mb.get_pk_bytes(x), mb.get_pk_bytes(y)) {
-                Ordering::Equal => super::super::super::columnar::compare_rows(schema, &mb, x, &mb, y),
+                Ordering::Equal => crate::schema::payload_order::compare_rows(schema, &mb, x, &mb, y),
                 ord => ord,
             },
         );
@@ -994,7 +995,7 @@ mod merge_materialize_vs_reference {
             i += 1;
             while i < n
                 && compare_pk_bytes(mb.get_pk_bytes(head), mb.get_pk_bytes(idx[i])) == Ordering::Equal
-                && super::super::super::columnar::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
+                && crate::schema::payload_order::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
             {
                 w += mb.get_weight(idx[i]);
                 i += 1;
@@ -1216,7 +1217,7 @@ fn consolidate_reference(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, 
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(
         |&x, &y| match compare_pk_bytes(mb.get_pk_bytes(x), mb.get_pk_bytes(y)) {
-            Ordering::Equal => super::super::columnar::compare_rows(schema, &mb, x, &mb, y),
+            Ordering::Equal => crate::schema::payload_order::compare_rows(schema, &mb, x, &mb, y),
             ord => ord,
         },
     );
@@ -1228,7 +1229,7 @@ fn consolidate_reference(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, 
         i += 1;
         while i < n
             && compare_pk_bytes(mb.get_pk_bytes(head), mb.get_pk_bytes(idx[i])) == Ordering::Equal
-            && super::super::columnar::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
+            && crate::schema::payload_order::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
         {
             w += mb.get_weight(idx[i]);
             i += 1;

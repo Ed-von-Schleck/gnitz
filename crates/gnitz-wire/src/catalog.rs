@@ -26,7 +26,7 @@ pub(crate) const fn col(name: &'static str, type_code: TypeCode, nullable: bool)
 /// Panics (const-eval failure) if absent, so a renamed/removed column fails the
 /// build rather than silently mis-indexing. `==` on `&str` is not const-stable,
 /// hence the manual byte compare.
-pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
+const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
     let mut i = 0;
     while i < cols.len() {
         let a = cols[i].name.as_bytes();
@@ -224,37 +224,25 @@ pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
 // catalog batches and must agree on every position, so they are stated once,
 // here, rather than derived again in each crate.
 //
-// `*_PAY_*` index the payload region — the space every engine-side read uses.
-// `*_COL_*` index a full schema, PK slot included: the shape of the client's
-// `ZSetBatch::columns[..]`, and nothing else reads it.
+// The indices address the payload region — the space every catalog read, engine
+// and client alike, uses.
 
-pub const SCHEMATAB_COL_NAME: usize = col_index_in(SCHEMA_TAB_COLS, "name");
 pub const SCHEMATAB_PAY_NAME: usize = pay_index_in_fam(SCHEMA_TAB, "name");
 
-pub const TABTAB_COL_FLAGS: usize = col_index_in(TABLE_TAB_COLS, "flags");
 pub const TABTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(TABLE_TAB, "pk_col_idx");
 pub const TABTAB_PAY_FLAGS: usize = pay_index_in_fam(TABLE_TAB, "flags");
 
 pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(VIEW_TAB, "pk_col_idx");
 pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in_fam(VIEW_TAB, "capacity_bytes");
 pub const VIEWTAB_PAY_DELTA: usize = pay_index_in_fam(VIEW_TAB, "delta_bytes");
-pub const VIEWTAB_COL_OWNER_VIEW_ID: usize = col_index_in(VIEW_TAB_COLS, "owner_view_id");
 pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in_fam(VIEW_TAB, "owner_view_id");
 
 // `RELTAB_*`: an address valid in TABLE_TAB and VIEW_TAB alike, for the readers
 // that take either family through one code path. A column at the same slot in
 // both but read through neither stays two constants.
 
-/// `name`'s index in two column lists that must agree on it. Const-eval fails if
-/// they do not, so the shared address cannot be claimed for a column that moved.
-const fn shared_col_index(a: &[WireSysCol], b: &[WireSysCol], name: &str) -> usize {
-    let i = col_index_in(a, name);
-    assert!(i == col_index_in(b, name), "the two families disagree on this column");
-    i
-}
-
-/// [`shared_col_index`] in the payload index space, over two families rather
-/// than two column lists — each half then carries its own key.
+/// `name`'s payload index in two families that must agree on it — each half
+/// carries its own key.
 const fn shared_pay_index(a: u64, b: u64, name: &str) -> usize {
     let i = pay_index_in_fam(a, name);
     assert!(
@@ -264,8 +252,6 @@ const fn shared_pay_index(a: u64, b: u64, name: &str) -> usize {
     i
 }
 
-pub const RELTAB_COL_SCHEMA_ID: usize = shared_col_index(TABLE_TAB_COLS, VIEW_TAB_COLS, "schema_id");
-pub const RELTAB_COL_NAME: usize = shared_col_index(TABLE_TAB_COLS, VIEW_TAB_COLS, "name");
 pub const RELTAB_PAY_SCHEMA_ID: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "schema_id");
 pub const RELTAB_PAY_NAME: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "name");
 
@@ -284,10 +270,6 @@ pub const CIRCNODES_PAY_INPUT_0: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "in
 pub const CIRCNODES_PAY_INPUT_1: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "input_1");
 pub const CIRCNODES_PAY_PARAMS: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "params");
 
-pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");
-pub const IDXTAB_COL_NAME: usize = col_index_in(IDX_TAB_COLS, "name");
-pub const IDXTAB_COL_OWNER_ID: usize = col_index_in(IDX_TAB_COLS, "owner_id");
-pub const IDXTAB_COL_FLAGS: usize = col_index_in(IDX_TAB_COLS, "flags");
 pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in_fam(IDX_TAB, "owner_id");
 pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in_fam(IDX_TAB, "source_col_idx");
 pub const IDXTAB_PAY_NAME: usize = pay_index_in_fam(IDX_TAB, "name");

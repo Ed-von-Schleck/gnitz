@@ -1,6 +1,6 @@
 use super::schema_block::encode_named_schema_block;
 use super::*;
-use gnitz_store::storage::payload_str;
+use gnitz_expr::payload_str;
 use gnitz_wire::{IDXTAB_PAY_NAME, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
 use rustc_hash::FxHashMap;
 use std::hash::Hash;

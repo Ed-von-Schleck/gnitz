@@ -6,7 +6,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::batch_pool::{acquire_arena, debug_poison, recycle_buf, Fill};
-use super::columnar::ColumnarSource;
 use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ColumnLocator, SchemaDescriptor, DELTA_TICK_COL};
@@ -1135,20 +1134,6 @@ impl Batch {
         self.layout = layout;
     }
 
-    /// Debug-only (PK, payload) order of adjacent rows `i` and `i + 1` — the total
-    /// order every merge/consolidation path sorts by. The verifier selects
-    /// `row_cmp` once and threads it in; `with_payload_cmp!` expands at its call
-    /// site, so selecting it here would run per row.
-    #[cfg(debug_assertions)]
-    fn adjacent_pair_ord<RowCmp>(&self, schema: &SchemaDescriptor, i: usize, row_cmp: RowCmp) -> std::cmp::Ordering
-    where
-        RowCmp: super::merge::RowComparator<Batch>,
-    {
-        use crate::schema::key::compare_pk_bytes;
-        compare_pk_bytes(self.get_pk_bytes(i), self.get_pk_bytes(i + 1))
-            .then_with(|| row_cmp(schema, self, i, self, i + 1))
-    }
-
     /// Debug-only: assert no row sets a null bit under a payload column `schema`
     /// declares NOT NULL — the invariant the client-decode boundary enforces in
     /// release, checked here against every batch the engine itself builds.
@@ -1184,14 +1169,16 @@ impl Batch {
     /// eliminated, §2).
     #[cfg(debug_assertions)]
     pub(crate) fn debug_verify_consolidated(&self, schema: &SchemaDescriptor) {
-        super::columnar::with_payload_cmp!(schema, Self::debug_verify_consolidated_body, self, schema)
+        crate::schema::payload_order::with_payload_cmp!(schema, Self::debug_verify_consolidated_body, self, schema)
     }
 
     #[cfg(debug_assertions)]
-    fn debug_verify_consolidated_body<RowCmp>(&self, schema: &SchemaDescriptor, row_cmp: RowCmp)
-    where
-        RowCmp: super::merge::RowComparator<Batch>,
-    {
+    fn debug_verify_consolidated_body<P: crate::schema::payload_order::PayloadOrder>(
+        &self,
+        schema: &SchemaDescriptor,
+        payload: P,
+    ) {
+        use crate::schema::key::compare_pk_bytes;
         for i in 0..self.count {
             debug_assert_ne!(
                 self.get_weight(i),
@@ -1199,8 +1186,10 @@ impl Batch {
                 "batch flagged consolidated, but row {i} has weight 0 (ghost not eliminated)"
             );
             if i + 1 < self.count {
+                let ord = compare_pk_bytes(self.get_pk_bytes(i), self.get_pk_bytes(i + 1))
+                    .then_with(|| payload.compare(schema, self, i, self, i + 1));
                 debug_assert_eq!(
-                    self.adjacent_pair_ord(schema, i, row_cmp),
+                    ord,
                     std::cmp::Ordering::Less,
                     "batch flagged consolidated, but rows {i},{} are not strictly \
                      increasing (unsorted or unfolded duplicate)",
@@ -1418,16 +1407,12 @@ impl Batch {
         }
     }
 
-    /// Binary search for the first row whose OPK bytes are `>= key`. After the
-    /// OPK-at-rest flip this is a raw `memcmp` search with no schema dependency,
-    /// correct for compound, signed, and wide (`pk_stride > 16`) PKs alike.
-    ///
-    /// `key` must be exactly `pk_stride` OPK bytes — identical width to the
-    /// stored regions it is compared against.
-    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+    /// First row whose OPK bytes are `>= key`; `key` is exactly `pk_stride`
+    /// bytes. Correct at every PK width with no schema dependency.
+    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let stride = self.pk_stride() as usize;
         let cp = self.pk_col_ptr();
-        unsafe { super::columnar::seek_lower_bound(self.count, stride, cp, key) }
+        unsafe { super::seek::seek_lower_bound(self.count, stride, cp, key) }
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
@@ -1438,7 +1423,7 @@ impl Batch {
     pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
         let stride = self.pk_stride() as usize;
         let cp = self.pk_col_ptr();
-        unsafe { super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }
+        unsafe { super::seek::seek_advance_to(self.count, stride, cp, key, hint) }
     }
 
     /// Bulk-copy every `[start, end)` range of `src`, in list order, onto this
@@ -1836,13 +1821,6 @@ impl RowSource for Batch {
     #[inline(always)]
     fn row_count(&self) -> usize {
         Batch::len(self)
-    }
-}
-
-impl ColumnarSource for Batch {
-    #[inline(always)]
-    fn get_weight(&self, row: usize) -> i64 {
-        Batch::get_weight(self, row)
     }
 }
 

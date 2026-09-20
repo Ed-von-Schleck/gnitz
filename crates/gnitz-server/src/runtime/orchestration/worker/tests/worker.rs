@@ -808,11 +808,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
             .expect("every frame decodes against the client's own schema");
         let b = decoded.as_ref().expect("data block");
         for r in 0..b.len() {
-            got.push((
-                mem_pk(b, r),
-                b.get_weight(r),
-                gnitz_store::storage::payload_string(b, r, 0),
-            ));
+            got.push((mem_pk(b, r), b.get_weight(r), gnitz_expr::payload_string(b, r, 0)));
         }
     }
     let want: Vec<(u128, i64, String)> = rows.iter().map(|(k, v)| (*k as u128, 1i64, v.clone())).collect();

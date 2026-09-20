@@ -9,12 +9,11 @@
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::columnar::with_payload_cmp;
-use super::super::columnar::ColumnarSource;
-use super::super::merge::{prorated_blob_cap, RowComparator};
+use super::super::merge::{prorated_blob_cap, ColumnarSource};
 use super::super::run::Run;
 use super::super::scatter::scatter_unified_sources;
 use super::{ReadCursor, SkeletonKeys};
+use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use gnitz_expr::RowSource;
 
 impl ReadCursor {
@@ -23,10 +22,9 @@ impl ReadCursor {
     /// break order/folding).
     ///
     /// This is `Batch::append_row_from_source_bytes` applied at the cursor's
-    /// current position: `Run` implements `ColumnarSource`, so the shared
-    /// appender does the weight/null/payload write (German-string blob relocation
-    /// included) with no hand-rolled per-column loop here. The byte-form PK is
-    /// correct at every width.
+    /// current position: the shared appender does the null/payload write,
+    /// German-string relocation included. The byte-form PK is correct at every
+    /// width.
     ///
     /// Cold catalog-builder callers re-fold downstream; the operator caller
     /// (`op_reduce`) wants `Raw` anyway — it emits retract/insert pairs in emit
@@ -205,12 +203,12 @@ impl ReadCursor {
     /// One `merge::drive` for the whole chunk: re-entering it per emitted group
     /// rebuilt the comparator closures each time, ~39 instructions per row.
     #[inline]
-    fn drain_sorted_into_with<RowCmp: RowComparator<Run>>(
+    fn drain_sorted_into_with<P: PayloadOrder>(
         &mut self,
         max_rows: usize,
         rows_ahead: usize,
         out: &mut Vec<(u32, u32, i64)>,
-        row_cmp: RowCmp,
+        payload: P,
     ) {
         out.clear();
         out.reserve(max_rows.min(rows_ahead));
@@ -225,7 +223,7 @@ impl ReadCursor {
 
         // The group that did not fit, which the next drain resumes from.
         let mut last: Option<(usize, usize, i64)> = None;
-        self.drive(row_cmp, |gs, gr, nw| {
+        self.drive(payload, |gs, gr, nw| {
             if out.len() == max_rows {
                 last = Some((gs, gr, nw));
                 std::ops::ControlFlow::Break(())

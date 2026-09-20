@@ -8,7 +8,8 @@
 
 use crate::schema::key::{leading_u64, ReindexPacker};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
-use crate::storage::{payload_bytes, Batch, ReadCursor};
+use crate::storage::{Batch, ReadCursor};
+use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
 
 use super::super::order_image::{append_wide_image, scalar_image, wide_native, wide_native_of_image, ImageKind};

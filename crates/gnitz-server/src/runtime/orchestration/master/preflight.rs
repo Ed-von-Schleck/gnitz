@@ -93,19 +93,16 @@ impl PipelinedCheck {
 
     /// The batch rows whose probe key starts with `key`. The batch must be
     /// PK-sorted, as every check whose replies are mapped back to rows is.
+    ///
+    /// `0x00` is the OPK minimum of every suffix, so the zero-padded key's lower
+    /// bound is the prefix's.
     fn rows_of(&self, key: &[u8]) -> Range<usize> {
-        let n = self.batch.len();
-        let at = |j: usize| &self.batch.get_pk_bytes(j)[..key.len()];
-        let (mut lo, mut hi) = (0, n);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if at(mid) < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo..lo + (lo..n).take_while(|&j| at(j) == key).count()
+        let b = &self.batch;
+        let lo = b.find_lower_bound_bytes(PkBuf::from_bytes(key).padded(b.pk_stride() as usize));
+        lo..lo
+            + (lo..b.len())
+                .take_while(|&j| b.get_pk_bytes(j).starts_with(key))
+                .count()
     }
 }
 

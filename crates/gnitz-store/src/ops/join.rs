@@ -15,6 +15,7 @@ use crate::storage::{Batch, BlobCacheGuard, MemBatch, ReadCursor};
 
 use super::cogroup::cogroup_intersection;
 
+use gnitz_expr::RowSource;
 use gnitz_wire::{merge_null_words, RangeRel};
 
 // ---------------------------------------------------------------------------
@@ -176,10 +177,12 @@ pub fn op_join_delta_trace(
 
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         let w_trace = c.current_weight;
+        let (right, right_row) = c.current_row_source();
+        let right_null = right.get_null_word(right_row);
         for i in rs..re {
             let w_out = delta_mb.get_weight(i).wrapping_mul(w_trace);
             if w_out != 0 {
-                writer.write(&delta_mb, i, c, w_out);
+                writer.write(&delta_mb, i, right, right_row, right_null, w_out);
             }
         }
     };
@@ -362,24 +365,30 @@ impl<'s> JoinRowWriter<'s> {
     }
 
     /// Write one output row at `weight`: the left half from `left[left_row]`, the
-    /// right half from `right`'s current row — both through the shared,
-    /// monomorphic `Batch::append_payload_cols` body (German-string blob
-    /// relocation included).
+    /// right half from `right[right_row]` — both through the shared, monomorphic
+    /// `Batch::append_payload_cols` body (German-string blob relocation
+    /// included).
     #[inline]
-    fn write(&mut self, left: &MemBatch, left_row: usize, right: &ReadCursor, weight: i64) {
+    fn write<R: RowSource>(
+        &mut self,
+        left: &MemBatch,
+        left_row: usize,
+        right: &R,
+        right_row: usize,
+        right_null: u64,
+        weight: i64,
+    ) {
         let left_null = left.get_null_word(left_row);
-        let right_null = right.current_null_word;
         let null_word = merge_null_words(left_null, right_null, self.left_npc);
 
         let output = &mut self.output;
         output.begin_row(left.get_pk_bytes(left_row), weight);
 
         output.append_payload_cols(0, self.left_schema, left, left_row, left_null, self.cache.get_mut());
-        let (right_src, right_row) = right.current_row_source();
         output.append_payload_cols(
             self.left_npc,
             self.right_schema,
-            right_src,
+            right,
             right_row,
             right_null,
             self.cache.get_mut(),

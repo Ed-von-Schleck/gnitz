@@ -223,7 +223,7 @@ fn leading_u64_reads_eight_bytes_at_every_stride() {
         );
         if width <= 8 {
             assert_eq!(
-                <u64 as PkSortKey>::from_opk(&bytes[..width]),
+                <u64 as PkSortKey<'_>>::from_opk(&bytes[..width]),
                 leading_u64(&bytes[..width]),
                 "width {width}: the sort key is the value accessor at strides ≤ 8",
             );

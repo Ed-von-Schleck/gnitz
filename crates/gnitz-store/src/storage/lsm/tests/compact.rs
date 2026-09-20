@@ -1,6 +1,6 @@
 use super::super::batch::{Batch, REG_PAYLOAD_START};
-use super::super::columnar::ColumnarSource;
 use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
+use super::super::merge::ColumnarSource;
 use super::super::merge::{run_merge, BlobCacheGuard};
 use super::super::naming;
 use super::super::shard_file::{self, region_dir, ShardWriteOpts};
@@ -1046,8 +1046,8 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
 mod skeleton_tests {
     use super::super::*;
     use crate::storage::repr::batch::{Batch, REG_NULL_BMP};
-    use crate::storage::repr::columnar::ColumnarSource;
     use crate::storage::repr::layout::{ENCODING_CONSTANT, OFF_FILE_NPC, SHARD_FLAG_SKELETON};
+    use crate::storage::repr::merge::ColumnarSource;
     use crate::storage::repr::shard_file::{region_dir, ShardWriteOpts};
     use crate::storage::repr::shard_reader::MappedShard;
     use crate::test_support::make_schema_u64_i64;

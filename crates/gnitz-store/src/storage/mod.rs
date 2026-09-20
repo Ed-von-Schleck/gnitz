@@ -39,11 +39,11 @@ use gnitz_foundation::posix_io;
 
 // L2 representation lives under `repr/`. It has no facade of its own; the leaf
 // items are re-exported below and the submodules aliased here so the LSM siblings
-// keep their `super::<mod>` paths and the in-storage `with_payload_cmp!` /
-// `crate::storage::batch_pool` paths resolve without touching the moved bodies.
+// keep their `super::<mod>` paths and the `crate::storage::batch_pool` path
+// resolves without touching the moved bodies.
 mod repr;
 pub use repr::batch_pool;
-use repr::{batch, batch_builder, batch_wire, columnar, merge, scatter};
+use repr::{batch, batch_builder, batch_wire, merge, scatter, seek};
 
 #[cfg(test)]
 mod suites;
@@ -65,23 +65,10 @@ pub use batch::Layout;
 pub use batch_builder::BatchBuilder;
 pub use batch_wire::wire_block_size;
 pub use batch_wire::WireChunk;
-// `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
-// weight, and every out-of-storage consumer (the comparators, the group-key
-// extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.
-// `cmp_col_window` is NOT re-exported: it lives in `gnitz-wire`, where the
-// client-side comparators can reach the same STRING/BLOB-before-fixed-width rule.
-// `compare_rows_fixedint_nonnull` and `with_payload_cmp!` are NOT re-exported:
-// picking between the two payload comparators is a merge-seat decision, and
-// every seat is in storage. The macro names the comparator through
-// `crate::storage::columnar`, which resolves only from inside storage.
-pub use columnar::compare_rows;
+// `ColumnarSource` stays inside storage: everything out of it reads rows
+// through `gnitz_expr::RowSource`.
 // The equal-PK group bracket, reached from `ops` as well as from inside repr.
-pub(crate) use columnar::pk_group_end;
-// The three generic payload-cell readers: one spelling for every `RowSource`,
-// which is what lets a catalog decoder read a `Batch`, a `StoredRow` and a
-// positioned `ReadCursor` through the same call.
-pub use columnar::compare_rows_except;
-pub use columnar::{payload_bytes, payload_is_null, payload_str, payload_string, payload_u64};
+pub(crate) use seek::pk_group_end;
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
 // caller names `crate::schema::key::X`, so one byte-order rule has one import
 // path.

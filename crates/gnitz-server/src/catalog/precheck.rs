@@ -2,13 +2,11 @@
 //! system-table deltas — and the registration guards `hooks.rs` re-runs for the
 //! paths whose rows are not a client's.
 
-use std::cmp::Ordering;
-
 use rustc_hash::FxHashSet;
 
 use super::*;
+use gnitz_expr::{cmp_order_keys, OrderLocator, RowSource, SchemaFacts};
 use gnitz_store::schema::make_index_schema;
-use gnitz_store::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_SCALE,
@@ -169,6 +167,28 @@ fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether row `ra` of `a` and row `rb` of `b` differ in a payload column outside
+/// `mask` (bit `pi` exempts payload column `pi`). NULL equals NULL, and
+/// STRING/BLOB compare by content through each side's own blob heap.
+fn payload_differs(
+    schema: &dyn SchemaFacts,
+    mask: u64,
+    a: &impl RowSource,
+    ra: usize,
+    b: &impl RowSource,
+    rb: usize,
+) -> bool {
+    let keys: Vec<OrderLocator> = (0..schema.num_payload_cols())
+        .filter(|&pi| (mask >> pi) & 1 == 0)
+        .map(|pi| OrderLocator {
+            loc: schema.locate(schema.payload_col_idx(pi)),
+            desc: false,
+            nulls_first: true,
+        })
+        .collect();
+    cmp_order_keys(&keys, a, ra, b, rb).is_ne()
+}
+
 /// A rewrite pair's `+1` may differ from its `-1` only in the family's declared
 /// mask. Comparing the two batch rows is equivalent to comparing the live row
 /// against the `+1`, because the CAS proved the `-1` content-equals live.
@@ -179,7 +199,7 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
     let mask = family
         .pair_change_mask()
         .expect("check_pk_multiplicity rejects a pair in a family declaring no mask");
-    if compare_rows_except(family.schema(), batch, nj, batch, pj, mask) != Ordering::Equal {
+    if payload_differs(family.schema(), mask, batch, nj, batch, pj) {
         return Err(format!(
             "a system-catalog rewrite pair on {} {} changes a field it may not",
             family.row_noun(),
@@ -354,10 +374,6 @@ impl CatalogEngine {
     /// element that exists — and `live + Σ batch` must land in `{0, 1}`: the sys
     /// stores run no `enforce_unique_pk`, so nothing else stops a duplicate live
     /// head or a persistent negative ghost. Returns the net weight.
-    ///
-    /// `compare_rows` routes a STRING/BLOB column through each side's own blob
-    /// heap, so a name past the inline German-string prefix compares by content
-    /// where a raw region `memcmp` would false-reject a valid rename.
     fn check_cas_and_net(&self, family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<i64, String> {
         let noun = family.row_noun();
         let (live_weight, live) = self.sys_relation(family).live_row_at(batch.get_pk_bytes(sig.row));
@@ -368,7 +384,7 @@ impl CatalogEngine {
                 ));
             };
             let (src, ri) = sr.source();
-            if compare_rows(family.schema(), src, ri, batch, nj) != Ordering::Equal {
+            if payload_differs(family.schema(), 0, src, ri, batch, nj) {
                 return Err(format!(
                     "catalog changed concurrently: the retracted {noun} differs from the current one"
                 ));

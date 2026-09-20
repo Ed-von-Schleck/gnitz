@@ -1,10 +1,10 @@
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::payload_string;
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, opk_pk, pk_payload_schema,
 };
+use gnitz_expr::payload_string;
 use gnitz_wire::read_i64_le;
 
 /// A union case row: an index into the shape's key list, a weight, and a payload.
@@ -140,7 +140,7 @@ fn union_orders_shared_pk_string_payloads_through_the_generic_comparator() {
     // stop exercising the generic arm — fail loudly here instead.
     assert_eq!(
         schema.payload_cmp,
-        crate::schema::PayloadCmpKind::Generic,
+        crate::schema::payload_order::PayloadCmpKind::Generic,
         "U64+STRING must select the GENERIC payload comparator",
     );
 
@@ -322,7 +322,7 @@ fn union_merge_bench() {
 /// `FixedIntNonnull` fast comparator to the null-aware `Generic` one.
 #[test]
 fn union_merges_nullability_and_reclassifies_the_comparator() {
-    use crate::schema::PayloadCmpKind;
+    use crate::schema::payload_order::PayloadCmpKind;
     let nonnull = pk_payload_schema(&[type_code::U128]);
     let nullable = SchemaDescriptor::new(
         &[

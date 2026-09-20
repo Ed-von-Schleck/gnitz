@@ -194,11 +194,9 @@ impl GroupOutKey {
             };
         }
         if pk_keyed {
-            return pk_width_dispatch!(
-                mb.pk_stride as usize,
-                |K| GroupRuns::sorted(n, |i| K::from_opk(mb.get_pk_bytes(i))),
-                GroupRuns::sorted(n, |i| mb.get_pk_bytes(i)),
-            );
+            return pk_width_dispatch!(mb.pk_stride as usize, |K| GroupRuns::sorted(n, |i| K::from_opk(
+                mb.get_pk_bytes(i)
+            )));
         }
         // Exact, not a truncation: a canonical key over a ≤8-byte column fits 64
         // bits, and halves the sorted payload for `GROUP BY <BIGINT>`.

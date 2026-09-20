@@ -4,7 +4,7 @@ use crate::test_support::pk_only_schema;
 
 /// Two rows both NULL in an `I64` payload column, carrying DIFFERENT bytes under
 /// the null bit. [`compare_rows`] reads `null == null` and makes them one element;
-/// [`compare_rows_fixedint_nonnull`] never reads the null word and splits them by
+/// [`FixedIntNonnull`] never reads the null word and splits them by
 /// the garbage — which is why a nullable schema must resolve to `Generic`.
 #[test]
 fn null_equality_separates_the_two_payload_comparators() {
@@ -30,13 +30,13 @@ fn null_equality_separates_the_two_payload_comparators() {
         "null-aware: two NULL cells are one element whatever lies under the bit",
     );
     assert_ne!(
-        compare_rows_fixedint_nonnull(&non_null, &pair, 0, &pair, 1),
+        FixedIntNonnull.compare(&non_null, &pair, 0, &pair, 1),
         Ordering::Equal,
         "null-blind: the fixed-int comparator orders by the garbage bytes",
     );
 }
 
-/// A minimal ColumnarSource for unit tests.
+/// A minimal `RowSource` for unit tests.
 struct TestBatch {
     null_bmp: Vec<u8>,
     col_data: Vec<Vec<u8>>,
@@ -60,12 +60,6 @@ impl RowSource for TestBatch {
     }
     fn row_count(&self) -> usize {
         self.null_bmp.len() / 8
-    }
-}
-
-impl ColumnarSource for TestBatch {
-    fn get_weight(&self, _row: usize) -> i64 {
-        1
     }
 }
 
@@ -252,7 +246,7 @@ fn compare_rows_resolves_each_source_against_its_own_blob() {
 }
 
 // -----------------------------------------------------------------------
-// Fast path: schema_is_fixedint_nonnull / compare_rows_fixedint_nonnull
+// Fast path: PayloadCmpKind / FixedIntNonnull
 // -----------------------------------------------------------------------
 
 fn make_schema(cols: &[(u8, u8)]) -> SchemaDescriptor {
@@ -266,37 +260,37 @@ fn make_schema(cols: &[(u8, u8)]) -> SchemaDescriptor {
     SchemaDescriptor::new(&columns[..n], &[0])
 }
 
-/// `schema_is_fixedint_nonnull`: all-signed, all-unsigned, and mixed-sign
-/// non-null schemas all pass; nullable and U128/UUID/F32/F64/STRING/BLOB fail.
+/// `PayloadCmpKind`: all-signed, all-unsigned, and mixed-sign non-null schemas
+/// all resolve to `FixedIntNonnull`; nullable and U128/UUID/F32/F64/STRING/BLOB
+/// fall to `Generic`.
 #[test]
-fn test_schema_is_fixedint_nonnull_bounds() {
-    // All-signed, non-nullable → true
-    assert!(schema_is_fixedint_nonnull(&make_schema(&[
+fn payload_cmp_kind_bounds() {
+    let fast = |s: &SchemaDescriptor| s.payload_cmp == PayloadCmpKind::FixedIntNonnull;
+
+    // All-signed, non-nullable → fast
+    assert!(fast(&make_schema(&[
         (type_code::I8, 0),
         (type_code::I16, 0),
         (type_code::I32, 0),
         (type_code::I64, 0),
     ])));
-    // All-unsigned, non-nullable → true
-    assert!(schema_is_fixedint_nonnull(&make_schema(&[
+    // All-unsigned, non-nullable → fast
+    assert!(fast(&make_schema(&[
         (type_code::U8, 0),
         (type_code::U16, 0),
         (type_code::U32, 0),
         (type_code::U64, 0),
     ])));
-    // Mixed signed/unsigned, non-nullable → true
-    assert!(schema_is_fixedint_nonnull(&make_schema(&[
-        (type_code::I64, 0),
-        (type_code::U32, 0),
-    ])));
-    // Empty payload (all-PK) → vacuously true
-    assert!(schema_is_fixedint_nonnull(&pk_only_schema(&[type_code::U64])));
+    // Mixed signed/unsigned, non-nullable → fast
+    assert!(fast(&make_schema(&[(type_code::I64, 0), (type_code::U32, 0)])));
+    // Empty payload (all-PK) → vacuously fast
+    assert!(fast(&pk_only_schema(&[type_code::U64])));
 
-    // Nullable fixed int → false
-    assert!(!schema_is_fixedint_nonnull(&make_schema(&[(type_code::I32, 1)])));
-    assert!(!schema_is_fixedint_nonnull(&make_schema(&[(type_code::U32, 1)])));
+    // Nullable fixed int → generic
+    assert!(!fast(&make_schema(&[(type_code::I32, 1)])));
+    assert!(!fast(&make_schema(&[(type_code::U32, 1)])));
 
-    // Each non-fixed-int type → false (U128/UUID exceed 8 bytes; floats/strings/blobs)
+    // Each non-fixed-int type → generic (U128/UUID exceed 8 bytes; floats/strings/blobs)
     for tc in [
         type_code::U128,
         type_code::UUID,
@@ -306,20 +300,17 @@ fn test_schema_is_fixedint_nonnull_bounds() {
         type_code::BLOB,
     ] {
         assert!(
-            !schema_is_fixedint_nonnull(&make_schema(&[(tc, 0)])),
+            !fast(&make_schema(&[(tc, 0)])),
             "expected schema with type_code={tc} to be rejected",
         );
     }
 
     // A single disqualifier among valid columns kills it.
-    assert!(!schema_is_fixedint_nonnull(&make_schema(&[
-        (type_code::I64, 0),
-        (type_code::U128, 0),
-    ])));
+    assert!(!fast(&make_schema(&[(type_code::I64, 0), (type_code::U128, 0)])));
 }
 
 // -----------------------------------------------------------------------
-// compare_rows_fixedint_nonnull ≡ compare_rows property test
+// FixedIntNonnull ≡ Generic property test
 // -----------------------------------------------------------------------
 
 mod fixedint_proptest {
@@ -364,105 +355,17 @@ mod fixedint_proptest {
         fn fixedint_matches_generic((types, n, col_data) in arb_case()) {
             let payload: Vec<(u8, u8)> = types.iter().map(|&t| (t, 0)).collect();
             let schema = make_schema(&payload);
-            prop_assert!(schema_is_fixedint_nonnull(&schema));
+            prop_assert_eq!(schema.payload_cmp, PayloadCmpKind::FixedIntNonnull);
 
             let batch = TestBatch { null_bmp: vec![0u8; n * 8], col_data, blob: vec![] };
             for i in 0..n {
                 for j in 0..n {
                     prop_assert_eq!(
-                        compare_rows_fixedint_nonnull(&schema, &batch, i, &batch, j),
+                        FixedIntNonnull.compare(&schema, &batch, i, &batch, j),
                         compare_rows(&schema, &batch, i, &batch, j),
                         "mismatch at ({}, {})", i, j,
                     );
                 }
-            }
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
-// gallop_lower_bound_bytes / binary_lower_bound
-// -----------------------------------------------------------------------
-
-/// Galloping seek equals the from-scratch lower bound for EVERY hint and key.
-/// Sweeps `hint` across `0..=count` (gallop branch, O(1) boundary-at-hint,
-/// `hint == count` run-off, and the overshoot fallback all fall out of the
-/// full sweep) and `key` across below-min / present / absent-between /
-/// duplicate / above-max values. 2-byte BE keys so memcmp order = numeric.
-#[test]
-fn gallop_lower_bound_matches_binary_over_all_hints() {
-    let vals: [u16; 8] = [10, 10, 20, 30, 30, 30, 40, 50]; // duplicates + gaps
-    let arr: Vec<[u8; 2]> = vals.iter().map(|v| v.to_be_bytes()).collect();
-    let count = arr.len();
-    let get = |i: usize| &arr[i][..];
-
-    let probes: [u16; 12] = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60];
-    for &p in &probes {
-        let key = p.to_be_bytes();
-        // Naive linear reference: first index whose bytes are >= key.
-        let expected = (0..count).find(|&i| get(i) >= &key[..]).unwrap_or(count);
-        assert_eq!(
-            binary_lower_bound(0, count, &key, &get),
-            expected,
-            "binary_lower_bound key={p}"
-        );
-        for hint in 0..=count {
-            assert_eq!(
-                gallop_lower_bound_bytes(count, &key, hint, get),
-                expected,
-                "gallop key={p} hint={hint}"
-            );
-        }
-    }
-}
-
-/// `count == 0` returns 0 for every hint and never indexes the (empty) array.
-#[test]
-fn gallop_lower_bound_count_zero() {
-    let arr: Vec<[u8; 2]> = vec![];
-    let get = |i: usize| &arr[i][..];
-    let key = 7u16.to_be_bytes();
-    assert_eq!(gallop_lower_bound_bytes(0, &key, 0, get), 0);
-    assert_eq!(binary_lower_bound(0, 0, &key, &get), 0);
-}
-
-/// The register dispatch (`lower_bound_opk` / `gallop_opk`) must return the same
-/// index as the byte oracle at every width arm — `u64` (≤8), `u128` (9..=16),
-/// `[u128; 2]` (17..=32) and the byte fallback (>32). Values span two bytes, so
-/// a wrong-endian load miscompares rather than passing by accident.
-#[test]
-fn lower_bound_opk_matches_byte_search() {
-    // Right-align a value into the OPK tail (high bytes zero, the natural layout
-    // for a small key) at any stride; `* 7` leaves gaps for between-key probes.
-    let enc = |val: u64, stride: usize| -> Vec<u8> {
-        let mut k = vec![0u8; stride];
-        let t = stride.min(8);
-        k[stride - t..].copy_from_slice(&val.to_be_bytes()[8 - t..]);
-        k
-    };
-    for &stride in &[4usize, 8, 12, 16, 24, 32, 40] {
-        let n = 200usize;
-        let region: Vec<u8> = (0..n).flat_map(|i| enc((i as u64) * 7 + 3, stride)).collect();
-        let get = |i: usize| &region[i * stride..i * stride + stride];
-
-        // Every stored key, a below-all and above-all key, and one landing in
-        // each inter-key gap (the last lands above all). All exactly `stride`.
-        let mut probes: Vec<Vec<u8>> = (0..n).map(|i| get(i).to_vec()).collect();
-        probes.push(enc(0, stride)); // below all (the min stored key encodes 3)
-        probes.push(vec![0xffu8; stride]); // above all
-        probes.extend((0..n).map(|i| enc((i as u64) * 7 + 3 + 4, stride))); // in-gap
-
-        for p in &probes {
-            assert_eq!(p.len(), stride);
-            let oracle = binary_lower_bound(0, n, p, &get);
-            assert_eq!(lower_bound_opk(n, p, stride, get), oracle, "stride={stride} p={p:02x?}");
-            for &hint in &[0usize, n / 3, n, oracle] {
-                assert_eq!(gallop_lower_bound_bytes(n, p, hint, get), oracle);
-                assert_eq!(
-                    gallop_opk(n, p, hint, stride, get),
-                    oracle,
-                    "gallop stride={stride} p={p:02x?}"
-                );
             }
         }
     }

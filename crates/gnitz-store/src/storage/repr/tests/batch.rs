@@ -1,7 +1,7 @@
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::payload_string;
 use crate::test_support::{pk_payload_schema, u64_pk_schema, wide_pk_3xu64_schema};
+use gnitz_expr::payload_string;
 
 #[test]
 fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
@@ -199,7 +199,7 @@ fn extend_pk_bytes_length_mismatch_panics() {
 }
 
 /// `Batch` feeds its own count, stride and PK base into the shared seek kernel
-/// (swept exhaustively in `columnar`); both entry points must agree with a
+/// (swept exhaustively in `seek`); both entry points must agree with a
 /// linear scan over the same batch, at a narrow and a wide stride.
 #[test]
 fn pk_seeks_agree_with_a_linear_scan() {

@@ -13,34 +13,29 @@ use std::sync::Arc;
 
 use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
-use gnitz_expr::SchemaFacts;
+use gnitz_expr::{payload_bytes, payload_is_null, payload_u64};
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::txn_frame::DeltaPollItem;
 use gnitz_wire::Circuit;
 use gnitz_wire::{
     TableProps, ViewProps, CIRCUIT_NODES_TAB, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COL_TAB,
-    IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDX_TAB, RELTAB_COL_NAME,
-    RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+    IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB, RELTAB_PAY_NAME,
+    RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
 
-fn col_u64(batch: &ZSetBatch, schema: &Schema, ci: usize, i: usize) -> u64 {
-    gnitz_wire::read_u64_le(SchemaFacts::locate(schema, ci).bytes(batch, i), 0)
-}
-
-/// Row `i` of a system-table STRING column. Every such column is declared
+/// Row `i` of a system-table STRING payload column. Every such column is declared
 /// non-nullable, so a NULL is a malformed reply, not a case — this is the trust
 /// boundary that says so rather than substituting `""`. UTF-8 is validated here
 /// too: the region carries bytes.
-fn col_str<'a>(batch: &'a ZSetBatch, schema: &Schema, ci: usize, i: usize) -> Result<&'a str, ClientError> {
-    let loc = SchemaFacts::locate(schema, ci);
-    if loc.is_null(batch, i) {
+fn col_str(batch: &ZSetBatch, pi: usize, i: usize) -> Result<&str, ClientError> {
+    if payload_is_null(batch, i, pi) {
         return Err(ClientError::ServerError(format!(
             "col_str: NULL in a non-nullable system column at row {i}"
         )));
     }
-    std::str::from_utf8(gnitz_wire::german_string_content(loc.bytes(batch, i), &batch.blob))
+    std::str::from_utf8(payload_bytes(batch, i, pi))
         .map_err(|e| ClientError::ServerError(format!("col_str: invalid UTF-8 at row {i}: {e}")))
 }
 
@@ -921,10 +916,9 @@ impl GnitzClient {
     /// The `-1` is the stored row, so the engine's CAS re-proves owner and
     /// uniqueness against the live row.
     pub fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
-        let s = sys_schema(IDX_TAB);
         self.drop_index_rows(&[name], "constraint", if_exists, |b, i| {
-            col_u64(b, s, IDXTAB_COL_OWNER_ID, i) == tid
-                && gnitz_wire::IndexProps::from_flags(col_u64(b, s, IDXTAB_COL_FLAGS, i)).is_unique
+            payload_u64(b, i, IDXTAB_PAY_OWNER_ID) == tid
+                && gnitz_wire::IndexProps::from_flags(payload_u64(b, i, IDXTAB_PAY_FLAGS)).is_unique
         })
     }
 
@@ -948,7 +942,7 @@ impl GnitzClient {
             let name = gnitz_wire::canonical_identifier(name)?;
             let mut hit = None;
             for i in scanned.live_rows() {
-                if col_str(&scanned, idx_schema, IDXTAB_COL_NAME, i)? == name && matches(&scanned, i) {
+                if col_str(&scanned, IDXTAB_PAY_NAME, i)? == name && matches(&scanned, i) {
                     hit = Some(i);
                     break;
                 }
@@ -978,8 +972,8 @@ impl GnitzClient {
         let idx_batch = checked_sys_rows(IDX_TAB, self.scan(IDX_TAB)?)?;
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
-            let name = col_str(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)?.to_string();
-            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_SOURCE_COLS, i))
+            let name = col_str(&idx_batch, IDXTAB_PAY_NAME, i)?.to_string();
+            let cols = gnitz_wire::unpack_pk_cols(payload_u64(&idx_batch, i, IDXTAB_PAY_SOURCE_COLS))
                 .map_err(|rule| ClientError::ServerError(format!("index '{name}': {rule}")))?;
             out.push((idx_batch.pks.get(sys_schema(IDX_TAB), i) as u64, name, cols));
         }
@@ -1547,7 +1541,7 @@ impl GnitzClient {
         let mut out = ZSetBatch::new(s);
         let scanned = checked_sys_rows(family, self.scan(family)?)?;
         for i in scanned.live_rows() {
-            if col_u64(&scanned, s, RELTAB_COL_SCHEMA_ID, i) == schema_id {
+            if payload_u64(&scanned, i, RELTAB_PAY_SCHEMA_ID) == schema_id {
                 out.copy_row_at(&scanned, i, -1);
             }
         }
@@ -1591,7 +1585,7 @@ impl GnitzClient {
         let desc = self.resolve(&schema_name, &current_name)?.ok_or_else(missing)?;
 
         let family = if desc.class.is_view() { VIEW_TAB } else { TABLE_TAB };
-        let name_pi = sys_schema(family).payload_idx(RELTAB_COL_NAME);
+        let name_pi = RELTAB_PAY_NAME;
         self.rewrite_sys_row(family, desc.tid as u128, missing, |b, row| {
             b.set_string_cell(row, name_pi, &new_name)
         })?;
@@ -1937,7 +1931,7 @@ impl<'a> TxnReads<'a> {
 /// corrupt catalog batch.
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientError> {
     for i in batch.live_rows() {
-        if col_str(batch, sys_schema(SCHEMA_TAB), SCHEMATAB_COL_NAME, i)? == name {
+        if col_str(batch, SCHEMATAB_PAY_NAME, i)? == name {
             return Ok(Some(batch.pks.get(sys_schema(SCHEMA_TAB), i) as u64));
         }
     }

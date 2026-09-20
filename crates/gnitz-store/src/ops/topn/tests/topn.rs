@@ -5,8 +5,9 @@
 use std::collections::BTreeMap;
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{payload_is_null, payload_string, Batch, BatchBuilder, Table};
+use crate::storage::{Batch, BatchBuilder, Table};
 use crate::test_support::scratch_table;
+use gnitz_expr::{payload_is_null, payload_string};
 use gnitz_wire::{read_i64_le, OrderKey};
 
 use super::op_topn::op_topn;

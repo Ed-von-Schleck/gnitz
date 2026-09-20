@@ -18,8 +18,9 @@
 use std::collections::HashMap;
 
 use gnitz_core::{DeltaCursor, MirrorError};
+use gnitz_expr::{payload_bytes, payload_is_null, payload_string, payload_u64};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{payload_bytes, payload_is_null, payload_string, payload_u64, Batch, BatchBuilder};
+use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::{read_u64_le, type_code};
 
 /// `<base_dir>/mirror_state` — the file this module owns.

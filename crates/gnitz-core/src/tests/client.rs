@@ -125,15 +125,15 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
     let mut pair = ZSetBatch::new(schema);
     pair.copy_row_at(&scanned, i, -1);
     pair.copy_row_at(&scanned, i, 1);
-    pair.set_string_cell(1, schema.payload_idx(RELTAB_COL_NAME), "t2");
+    pair.set_string_cell(1, RELTAB_PAY_NAME, "t2");
 
     assert_eq!(pair.weights, vec![-1, 1]);
     assert_eq!(pair.pks.to_vec_u128(schema), vec![7, 7], "the rename keeps the id");
     assert_eq!(pair.nulls, vec![scanned.nulls[i]; 2]);
     // Every non-name column is the stored row's, in both halves.
-    let flags = &pair.payload[schema.payload_idx(gnitz_wire::TABTAB_COL_FLAGS)].bytes;
+    let flags = &pair.payload[gnitz_wire::TABTAB_PAY_FLAGS].bytes;
     assert_eq!(flags[..], [9u64.to_le_bytes(), 9u64.to_le_bytes()].concat()[..]);
-    let names: Vec<&[u8]> = pair.payload[schema.payload_idx(RELTAB_COL_NAME)]
+    let names: Vec<&[u8]> = pair.payload[RELTAB_PAY_NAME]
         .bytes
         .as_chunks::<16>()
         .0

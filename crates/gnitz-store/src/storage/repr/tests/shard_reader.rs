@@ -1,7 +1,7 @@
 use super::super::batch::{strides_from_schema, Batch, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
-use super::super::columnar::ColumnarSource;
 use super::super::error::StorageError;
 use super::super::layout::*;
+use super::super::merge::ColumnarSource;
 use super::super::shard_file::{region_dir, write_i64_shard, ShardWriteOpts};
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};

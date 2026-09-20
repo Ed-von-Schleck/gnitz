@@ -158,7 +158,7 @@ fn shard_point_probe_bench() {
 // Three `#[ignore]`d benches isolating `advance_to` as a general-purpose sorted-
 // run seek primitive, so a win generalises to every caller and schema instead of
 // overfitting the one DAG (`test_view_maintenance`) that flagged it. Each spans
-// the primitive's full envelope: all four `opk_width_dispatch!` arms (stride
+// the primitive's full envelope: all four `PkSortKey` width arms (stride
 // 8/16/24/40), gallop depths from adjacent to deep (gap 1..4096), and — the
 // load-bearing axis — both cache tiers. The macro bottleneck is memory-latency-
 // bound, so a cache-hot bench is a false proxy: `hot` measures the compute floor,
@@ -197,8 +197,8 @@ impl Tier {
     }
 }
 
-/// The four `opk_width_dispatch!` arms: 8 → `u64`, 16 → `u128`, 24 → `[u128;2]`,
-/// 40 → byte-`memcmp` fallback. Stride 8 is the profiled anchor; the other three
+/// The four `PkSortKey` width arms: 8 → `u64`, 16 → `u128`, 24 → `[u128;2]`,
+/// 40 → `&[u8]`. Stride 8 is the profiled anchor; the other three
 /// guard against a win that quietly regresses a wider PK another workload uses.
 ///
 /// 12 and 13 sit in `pack_pk_be`'s overlapping-load band, which no whole-width
@@ -235,7 +235,7 @@ fn adv_schema_5xu64() -> SchemaDescriptor {
 /// Schema for a bench stride: single-column PKs for 8/16 (the profiled shape and
 /// its `u128` sibling), compound all-`U64` for 24/40 (the wide dispatch arms). All
 /// carry one I64 payload — a `FixedIntNonnull` schema, so a `Multi` merge's PK-tie
-/// tiebreak runs `compare_rows_fixedint_nonnull` (the profile's 3.30% child).
+/// tiebreak runs the `FixedIntNonnull` order (the profile's 3.30% child).
 fn adv_bench_schema(stride: usize) -> SchemaDescriptor {
     match stride {
         8 => make_schema_u64_i64(),    // U64 PK + I64
@@ -678,7 +678,7 @@ fn adv_time_cursor_stationary(c: &mut ReadCursor, tier: Tier, scratch: &mut [u8]
     secs.as_nanos() as f64 / iters as f64
 }
 
-/// Bench 1 — leaf `gallop_opk` in isolation (no cursor, no loser tree): call
+/// Bench 1 — the leaf galloping seek in isolation (no cursor, no loser tree): call
 /// `Batch`/`MappedShard::advance_to` directly. Reproduces the leaf gallop work the
 /// profile splits across `Run::advance_to` self-time (8.77%) and
 /// `lower_bound_by` (2.04%), plus — cold — the scattered `get_pk_bytes` mmap-load

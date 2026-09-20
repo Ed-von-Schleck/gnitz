@@ -1,4 +1,4 @@
-use super::super::columnar::ColumnarSource;
+use super::super::merge::ColumnarSource;
 use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};

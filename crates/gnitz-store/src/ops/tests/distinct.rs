@@ -1,5 +1,6 @@
 use super::*;
-use crate::schema::{type_code, PayloadCmpKind, SchemaColumn};
+use crate::schema::payload_order::PayloadCmpKind;
+use crate::schema::{type_code, SchemaColumn};
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_blob, make_schema_u128_i64,
     make_schema_u64_i64, opk_pk, pk_payload_schema, trace_cursor, u64_pk_schema,

@@ -9,9 +9,10 @@ use rustc_hash::FxHashMap;
 
 use super::ColumnDef;
 use gnitz_expr::RowSource;
+use gnitz_expr::{payload_str, payload_string, payload_u64};
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{payload_str, payload_string, payload_u64, Batch, BatchBuilder};
+use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{
     write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, TableTabRow,
 };

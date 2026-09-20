@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 
-use gnitz_wire::{is_fixed_int, is_signed_int};
+use gnitz_wire::is_signed_int;
 
 /// Why a store-side operator constructor refused the parameters it was handed —
 /// one vocabulary for all of them, so the constructor rather than each caller
@@ -77,6 +77,10 @@ pub(crate) use gnitz_expr::ColumnLocator;
 /// schema and storage, and is the **one** import path: a second re-export would
 /// leave the byte-order rule spelled two ways in adjacent lines of one call site.
 pub mod key;
+
+/// The payload row order — the second term of the (PK, payload) total order —
+/// and the per-schema selection between its two comparators.
+pub(crate) mod payload_order;
 
 /// The precomputed per-row read/encode plan for an index's OPK leading-key span.
 /// Lives in [`key`] with the rest of the native→OPK encoders it shares its byte
@@ -230,38 +234,6 @@ impl SchemaColumn {
     }
 }
 
-/// Pre-computed payload row-comparator strategy for a schema. Stored on
-/// `SchemaDescriptor` and computed once in `new()` so every merge/sort/join
-/// dispatch reads a single field instead of iterating over columns.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PayloadCmpKind {
-    /// All payload columns are non-nullable fixed-width ints ≤ 8 bytes (any sign).
-    /// Vacuously true for zero-payload (all-PK) schemas.
-    FixedIntNonnull,
-    /// Any schema with a disqualifying payload column: nullable, float, string,
-    /// blob, or U128/UUID. (Mixed signed/unsigned fixed ints stay in the fast
-    /// path — only a non-fixed-int column falls back here.)
-    Generic,
-}
-
-/// Walks payload columns only. PK columns must not be examined: U128/UUID are
-/// PK-eligible but not `is_fixed_int`, so a U128 PK would wrongly force `Generic`.
-const fn compute_payload_cmp(
-    cols: &[SchemaColumn],
-    payload_to_ci: &[u8; MAX_COLUMNS],
-    num_payload: usize,
-) -> PayloadCmpKind {
-    let mut pi = 0;
-    while pi < num_payload {
-        let col = cols[payload_to_ci[pi] as usize];
-        if !(col.nullable == 0 && is_fixed_int(col.type_code)) {
-            return PayloadCmpKind::Generic;
-        }
-        pi += 1;
-    }
-    PayloadCmpKind::FixedIntNonnull
-}
-
 /// Where a relation's rows live — the one value every consumer reads, so the
 /// store shape, the read routing, and the join/reduce co-partition analyzers
 /// cannot answer differently. Stamped at registration on base tables (from
@@ -357,9 +329,8 @@ pub struct SchemaDescriptor {
     /// past `num_payload_cols()` are zero fill nothing reads.
     payload_to_ci: [u8; MAX_COLUMNS],
     /// Pre-computed payload comparator strategy. Derived from column types in
-    /// `new()`; read by every merge/sort/join dispatch (via `with_payload_cmp!`)
-    /// in place of calling `schema_is_fixedint_nonnull` at each site.
-    pub payload_cmp: PayloadCmpKind,
+    /// `new()`; read by every merge/sort/join dispatch (via `with_payload_cmp!`).
+    pub(crate) payload_cmp: payload_order::PayloadCmpKind,
     /// Whether any payload column is a German string. Cached for the same reason
     /// `payload_cmp` is: the blob-cache and append paths ask per batch, and the
     /// answer is a walk of the payload columns. Free in the struct's tail padding
@@ -490,7 +461,7 @@ impl SchemaDescriptor {
         );
         let pk_stride = stride_acc as u8;
         let payload_to_ci = compute_payload_to_ci(cols.len(), pk_indices);
-        let payload_cmp = compute_payload_cmp(cols, &payload_to_ci, cols.len() - pk_indices.len());
+        let payload_cmp = payload_order::compute_payload_cmp(cols, &payload_to_ci, cols.len() - pk_indices.len());
         let has_german_string = {
             let mut i = 0;
             let mut found = false;

@@ -1,7 +1,7 @@
 //! L2 storage representation — the pure in-memory batch repr and the operations
 //! that work directly on it: region layout (`batch`), wire/shard serialization
-//! (`batch_wire`), TLS buffer recycling (`batch_pool`), the columnar comparators
-//! (`columnar`), sort-merge consolidation (`merge`), the row-selecting and
+//! (`batch_wire`), TLS buffer recycling (`batch_pool`), the OPK lower-bound
+//! search (`seek`), sort-merge consolidation (`merge`), the row-selecting and
 //! row-copying passes — PK routing and the column-first scatter
 //! (`scatter`) —, the fused k-way merge kernel (`heap`), the PK-probe filters
 //! (`bloom`, `shard_filter`), the shard-image encoder and its atomic writer
@@ -29,11 +29,11 @@ pub(super) mod batch_builder;
 pub mod batch_pool;
 pub(super) mod batch_wire;
 pub(super) mod bloom;
-pub(super) mod columnar;
 pub(super) mod heap;
 pub(super) mod layout;
 pub(super) mod merge;
 pub(super) mod scatter;
+pub(super) mod seek;
 pub(super) mod shard_file;
 pub(super) mod shard_filter;
 pub(in crate::storage) mod shard_reader;

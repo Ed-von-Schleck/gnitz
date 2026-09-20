@@ -10,14 +10,13 @@ use std::rc::Rc;
 
 #[cfg(test)]
 use super::batch::Batch;
-use super::columnar::with_payload_cmp;
-use super::columnar::ColumnarSource;
 use super::heap::{HeapNode, LoserTree};
 use super::merge::MemBatch;
-use super::merge::{self, PosCursor, RowComparator};
+use super::merge::{self, ColumnarSource, PosCursor};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
+use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 
 mod gather;
@@ -93,7 +92,6 @@ pub struct ReadCursor {
     // Current row state
     pub valid: bool,
     pub current_weight: i64,
-    pub(crate) current_null_word: u64,
     current_entry_idx: usize,
     current_row: usize,
 }
@@ -149,7 +147,6 @@ impl ReadCursor {
             schema,
             valid: false,
             current_weight: 0,
-            current_null_word: 0,
             current_entry_idx: 0,
             current_row: 0,
         };
@@ -177,7 +174,7 @@ impl ReadCursor {
     /// forward-seek paths key the tree through, so a tree maintained in place
     /// cannot order rows differently from how it was played.
     #[inline]
-    fn rebuild_and_advance_merge_with<RowCmp: RowComparator<Run>>(&mut self, row_cmp: RowCmp) {
+    fn rebuild_and_advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
         {
             // Destructured so the tournament's `&mut tree` and the comparator's
             // `&sources` / `&states` are disjoint field borrows.
@@ -191,10 +188,10 @@ impl ReadCursor {
             } = &mut *self;
             tree.rebuild(
                 |i| states[i].is_valid().then(|| states[i].position as u32),
-                merge::merge_less(schema, sources, row_cmp, *any_skeleton),
+                merge::merge_less(schema, sources, payload, *any_skeleton),
             );
         }
-        self.advance_merge_with(row_cmp);
+        self.advance_merge_with(payload);
     }
 
     /// Position the cursor on the half-open OPK range `[start, end)` and report the
@@ -292,7 +289,7 @@ impl ReadCursor {
     }
 
     #[inline]
-    fn seek_forward_merge_with<RowCmp: RowComparator<Run>>(&mut self, key: &[u8], row_cmp: RowCmp) {
+    fn seek_forward_merge_with<P: PayloadOrder>(&mut self, key: &[u8], payload: P) {
         // Scoping the field borrows to `seek_phase` frees `self` for the advance.
         let ReadCursor {
             tree,
@@ -302,9 +299,9 @@ impl ReadCursor {
             any_skeleton,
             ..
         } = &mut *self;
-        let less = merge::merge_less(schema, sources, row_cmp, *any_skeleton);
+        let less = merge::merge_less(schema, sources, payload, *any_skeleton);
         Self::seek_phase(tree, sources, states, key, &less);
-        self.advance_merge_with(row_cmp);
+        self.advance_merge_with(payload);
     }
 
     /// Advance every laggard head (OPK `< key`) to its own `lower_bound(key)`,
@@ -438,15 +435,10 @@ impl ReadCursor {
     }
 
     #[inline]
-    fn for_each_pk_group_row_with<RowCmp: RowComparator<Run>, F: FnMut(&ReadCursor)>(
-        &mut self,
-        key: &[u8],
-        mut f: F,
-        row_cmp: RowCmp,
-    ) {
+    fn for_each_pk_group_row_with<P: PayloadOrder, F: FnMut(&ReadCursor)>(&mut self, key: &[u8], mut f: F, payload: P) {
         while self.valid && self.current_pk_eq(key) {
             f(&*self);
-            self.advance_with(row_cmp);
+            self.advance_with(payload);
         }
     }
 
@@ -466,11 +458,13 @@ impl ReadCursor {
     }
 
     #[inline]
-    fn for_each_mem_row_weight_with<F, RowCmp>(&mut self, mb: &MemBatch, range: Range<usize>, mut f: F, row_cmp: RowCmp)
-    where
-        F: FnMut(usize, i64),
-        RowCmp: for<'x> merge::RowComparator<Run, MemBatch<'x>>,
-    {
+    fn for_each_mem_row_weight_with<F: FnMut(usize, i64), P: PayloadOrder>(
+        &mut self,
+        mb: &MemBatch,
+        range: Range<usize>,
+        mut f: F,
+        payload: P,
+    ) {
         if range.is_empty() {
             return;
         }
@@ -488,17 +482,17 @@ impl ReadCursor {
                 if !self.valid || !self.current_pk_eq(key) {
                     break 0;
                 }
-                match row_cmp(
+                match payload.compare(
                     &self.schema,
                     &self.sources[self.current_entry_idx],
                     self.current_row,
                     mb,
                     i,
                 ) {
-                    Ordering::Less => self.advance(),
+                    Ordering::Less => self.advance_with(payload),
                     Ordering::Equal => {
                         let w = self.current_weight;
-                        self.advance();
+                        self.advance_with(payload);
                         break w;
                     }
                     Ordering::Greater => break 0,
@@ -516,18 +510,18 @@ impl ReadCursor {
         with_payload_cmp!(self.schema, Self::for_each_row_while_with::<_, _, _>, self, cont, f);
     }
 
-    /// Threads the monomorphized `row_cmp` through each advance, so the per-row
-    /// step never re-selects the comparator.
+    /// Threads the selected `payload` order through each advance, so the per-row
+    /// step never re-selects it.
     #[inline]
-    fn for_each_row_while_with<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor), RowCmp: RowComparator<Run>>(
+    fn for_each_row_while_with<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor), P: PayloadOrder>(
         &mut self,
         cont: C,
         mut f: F,
-        row_cmp: RowCmp,
+        payload: P,
     ) {
         while self.valid && cont(self.current_pk_bytes()) {
             f(&*self);
-            self.advance_with(row_cmp);
+            self.advance_with(payload);
         }
     }
 
@@ -612,14 +606,21 @@ impl ReadCursor {
     }
 
     /// Step to the next live group; an advance consumes the group it emitted, so
-    /// stepping is just re-driving. Mode before comparator, so the single-source
+    /// stepping is just re-driving. Mode before order, so the single-source
     /// bypass skips a `with_payload_cmp!` dispatch it never uses.
     #[inline]
     pub fn advance(&mut self) {
         match self.mode {
             Some(i) => self.advance_single(i),
-            None => with_payload_cmp!(self.schema, Self::advance_merge_with, self),
+            None => self.advance_merge(),
         }
+    }
+
+    /// [`Self::advance`]'s merge arm, out of line: every walk that selected its
+    /// order once inlines [`Self::advance_merge_with`] instead.
+    #[inline(never)]
+    fn advance_merge(&mut self) {
+        with_payload_cmp!(self.schema, Self::advance_merge_with, self)
     }
 
     /// Commit (or invalidate from) the `(source_idx, row, net_weight)` an advance
@@ -632,7 +633,6 @@ impl ReadCursor {
             self.current_weight = weight;
             self.current_entry_idx = idx;
             self.current_row = row;
-            self.current_null_word = self.sources[idx].get_null_word(row);
         } else {
             self.valid = false;
         }
@@ -652,23 +652,23 @@ impl ReadCursor {
         self.commit_emitted(emitted);
     }
 
-    /// Advance to the next live group with the payload comparator already
-    /// selected — the form a walk that selected it once reuses per row.
-    #[inline]
-    fn advance_with<RowCmp: RowComparator<Run>>(&mut self, row_cmp: RowCmp) {
+    /// Advance to the next live group with the payload order already selected —
+    /// the form a walk that selected it once reuses per row.
+    #[inline(always)]
+    fn advance_with<P: PayloadOrder>(&mut self, payload: P) {
         match self.mode {
             Some(i) => self.advance_single(i),
-            None => self.advance_merge_with(row_cmp),
+            None => self.advance_merge_with(payload),
         }
     }
 
     /// The five-field destructure both merge-mode walks need before handing the
     /// tournament to [`merge::drive`]: `advance_merge_with` takes one group,
     /// `output::drain_sorted_into_with` a whole chunk.
-    #[inline]
-    pub(super) fn drive<RowCmp: RowComparator<Run>>(
+    #[inline(always)]
+    pub(super) fn drive<P: PayloadOrder>(
         &mut self,
-        row_cmp: RowCmp,
+        payload: P,
         emit: impl FnMut(usize, usize, i64) -> std::ops::ControlFlow<()>,
     ) {
         let ReadCursor {
@@ -680,19 +680,19 @@ impl ReadCursor {
             ..
         } = &mut *self;
         let coarsen = *any_skeleton;
-        merge::drive(tree, schema, sources, states, row_cmp, coarsen, emit);
+        merge::drive(tree, schema, sources, states, payload, coarsen, emit);
     }
 
     /// Merge-mode advance (`self.mode.is_none()`), monomorphized on payload.
     /// [`merge::drive`] folds tied rows; `emit` `Break`s on the first non-ghost
     /// group, so ghosts are passed over rather than surfaced.
-    #[inline]
-    fn advance_merge_with<RowCmp: RowComparator<Run>>(&mut self, row_cmp: RowCmp) {
+    #[inline(always)]
+    fn advance_merge_with<P: PayloadOrder>(&mut self, payload: P) {
         // The emitted group comes back as a tuple rather than being written to
         // `self.current_*` in place: the drive already holds `&mut self`, so the
         // closure cannot.
         let mut emitted: Option<(usize, usize, i64)> = None;
-        self.drive(row_cmp, |gs, gr, nw| {
+        self.drive(payload, |gs, gr, nw| {
             emitted = Some((gs, gr, nw));
             std::ops::ControlFlow::Break(())
         });

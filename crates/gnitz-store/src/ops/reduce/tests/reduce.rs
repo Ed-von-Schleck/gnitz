@@ -4382,7 +4382,7 @@ fn german_string_min_max_recede_through_the_value_index() {
     let (pi_min, pi_max) = (2usize, 3usize);
     let content = |b: &Batch, row: usize, pi: usize| -> Vec<u8> {
         let mb = b.as_mem_batch();
-        crate::storage::payload_bytes(&mb, row, pi).to_vec()
+        gnitz_expr::payload_bytes(&mb, row, pi).to_vec()
     };
 
     // All four share the 8 bytes the key's value slot holds, so the ordering the

@@ -36,7 +36,7 @@ fn scan_all_with_val(cursor: &mut ReadCursor) -> Vec<(u64, i64, i64)> {
     while cursor.valid {
         let (src, row) = cursor.current_row_source();
         // Logical col 1 is payload slot 0 of this fixture's schema.
-        let val = crate::storage::payload_u64(src, row, 0) as i64;
+        let val = gnitz_expr::payload_u64(src, row, 0) as i64;
         rows.push((cursor.current_key_narrow() as u64, cursor.current_weight, val));
         cursor.advance();
     }
@@ -764,7 +764,7 @@ fn a_long_string_whose_offset_overruns_the_blob_reads_back_empty() {
     // it is payload index 0.
     let (src, row) = cursor.current_row_source();
     assert_eq!(
-        crate::storage::payload_bytes(src, row, 0),
+        gnitz_expr::payload_bytes(src, row, 0),
         &[] as &[u8],
         "out-of-bounds long-string offset must decode to empty, not panic"
     );

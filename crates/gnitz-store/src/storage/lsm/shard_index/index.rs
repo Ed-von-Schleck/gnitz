@@ -8,9 +8,9 @@ use std::fs;
 use std::rc::Rc;
 
 use super::super::batch::Batch;
-use super::super::columnar::ColumnarSource;
 use super::super::compact;
 use super::super::error::StorageError;
+use super::super::merge::ColumnarSource;
 use super::super::shard_file::ShardWriteOpts;
 use super::super::shard_reader::MappedShard;
 use super::super::to_cstrings;
