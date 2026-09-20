@@ -4,7 +4,7 @@
 use super::*;
 use crate::query::compiler::{Side, Sides, OUTPUT_RELAY};
 use gnitz_store::relation::Relation;
-use gnitz_store::storage::StorageError;
+use gnitz_store::storage::StoreError;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
 /// is the sort order, and sorting puts a view after every view it reads, because
@@ -103,7 +103,7 @@ impl DagEngine {
         input: Batch,
         src_id: i64,
         relay: &mut Relay<'_>,
-    ) -> Result<Batch, StorageError> {
+    ) -> Result<Batch, StoreError> {
         let CompileOutput { sides, post, .. } = plan;
         // Each arm hands `execute_epoch_multi` a fixed-size array: the seed count
         // is the side count, known here, so no arm heap-allocates to carry it.
@@ -135,14 +135,15 @@ impl DagEngine {
     }
 
     /// One side's seed for the post phase, `None` where the delta does not reach
-    /// it. The consolidate hands the post phase one folded seed per side, whether
-    /// or not the exchange ran.
+    /// it. Folded because a `Raw` seed carries `op_relay_scatter`'s
+    /// source-by-source order, which varies with the worker count, and a float
+    /// SUM's low bits follow the order its group's rows are added in.
     fn run_side(
         side: &mut Side,
         delta: Option<Batch>,
         src_id: i64,
         relay: &mut Relay<'_>,
-    ) -> Result<(vm::DeltaReg, Batch), StorageError> {
+    ) -> Result<(vm::DeltaReg, Batch), StoreError> {
         // The pre-exchange schema, never the view's combine-widened one.
         let schema = *side.plan.vm.program.out_schema();
         let Some(delta) = delta else {

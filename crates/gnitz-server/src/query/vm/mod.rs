@@ -36,12 +36,20 @@ impl DeltaReg {
     }
 }
 
-/// One VM instruction: the delta it reads, the delta it writes, and the
-/// operator between them, with all operator-specific data pre-resolved.
+/// One VM instruction: the delta it reads, the delta it writes, the operator
+/// between them with all operator-specific data pre-resolved, and the verdicts
+/// [`build`] baked for it.
 pub(in crate::query) struct Instr {
     pub(in crate::query) in_reg: DeltaReg,
     pub(in crate::query) out_reg: DeltaReg,
     pub(in crate::query) op: Op,
+    /// Per [`Instr::reads`] operand: no later reader, so this one may take it.
+    takes: [bool; 2],
+    /// Per [`Instr::reads`] operand: the first reader of a register some
+    /// instruction needs at net weights, so this one folds it.
+    folds: [bool; 2],
+    /// [`OpFacts::inert_on_empty`], baked.
+    inert_on_empty: bool,
 }
 
 /// The operators, each boxing whatever the emitter baked for it.
@@ -92,8 +100,24 @@ pub(in crate::query) enum Op {
 /// One `Op::Reduce`'s baked operator data: the plan and the table its combined
 /// value index lives in.
 pub(in crate::query) struct BakedReduce {
-    pub(in crate::query) plan: gnitz_store::ops::ReducePlan,
-    pub(in crate::query) avi_table: Option<StateIdx>,
+    pub(in crate::query) plan: ops::ReducePlan,
+    avi_table: Option<StateIdx>,
+}
+
+impl BakedReduce {
+    pub(in crate::query) fn new(plan: ops::ReducePlan, avi_table: Option<StateIdx>) -> BakedReduce {
+        assert_eq!(
+            plan.avi.is_some(),
+            avi_table.is_some(),
+            "a reduce's value-index bake and its table are set together",
+        );
+        BakedReduce { plan, avi_table }
+    }
+
+    /// The combined value index: its table and the bake that projects into it.
+    fn avi(&self) -> Option<(StateIdx, &ops::AviBake)> {
+        self.avi_table.zip(self.plan.avi.as_ref())
+    }
 }
 
 /// One `Op::TopN`'s baked operator data: the plan and the table its ordered
@@ -105,70 +129,89 @@ pub(in crate::query) struct BakedTopN {
 
 /// Everything the VM's passes need to know about one operator, classified once.
 struct OpFacts {
-    /// The second delta this operator reads.
-    second_in: Option<DeltaReg>,
     /// It reads its input at net weights, so the VM folds that register first.
     consolidates_in: bool,
     /// It writes operator state — a history table, a value index, an ordered
     /// index. Not the output trace, which a `Program::integrates` entry writes.
     writes_state: bool,
-    /// On an empty input delta it produces an empty output and touches no trace,
-    /// so the dispatch loop can skip it whole.
+    /// With every delta operand empty its kernel returns
+    /// `empty_with_schema(out_reg)` and touches no trace.
     inert_on_empty: bool,
 }
 
-/// Each arm states its difference from `linear`, and matches its variant with
-/// no `..`: an opcode that gains a second delta operand must break this, not
-/// become a register the liveness pass lets someone take mid-read.
-#[inline]
 fn facts(op: &Op) -> OpFacts {
     let linear = OpFacts {
-        second_in: None,
         consolidates_in: false,
         writes_state: false,
-        inert_on_empty: false,
+        inert_on_empty: true,
     };
     match op {
         Op::Filter(_)
         | Op::Map(_)
         | Op::Negate
-        | Op::WorkerFilter { worker_id: _, num_workers: _ }
-        | Op::NullExtend { nulls_first: _ } => linear,
-        Op::Union { in_b } => OpFacts { second_in: Some(*in_b), ..linear },
-        Op::WeightClamp { hist: _, preset: _ } => OpFacts {
+        | Op::Union { .. }
+        | Op::WorkerFilter { .. }
+        | Op::NullExtend { .. } => linear,
+        Op::WeightClamp { .. } => OpFacts {
             consolidates_in: true,
             writes_state: true,
-            inert_on_empty: true,
             ..linear
         },
-        Op::JoinDT { trace: _, probe: _ } => OpFacts {
-            consolidates_in: true,
-            inert_on_empty: true,
-            ..linear
-        },
-        Op::Reduce { out_trace: _, plan } => OpFacts {
+        Op::JoinDT { .. } => OpFacts { consolidates_in: true, ..linear },
+        Op::Reduce { plan, .. } => OpFacts {
             consolidates_in: plan.plan.consolidates_input(),
             writes_state: true,
+            // A global-ground reduce mints V₀ from an empty delta.
             inert_on_empty: !plan.plan.seeds_ground,
-            ..linear
         },
-        Op::TopN { out_trace: _, plan: _ } => OpFacts {
-            writes_state: true,
-            inert_on_empty: true,
-            ..linear
-        },
+        Op::TopN { .. } => OpFacts { writes_state: true, ..linear },
     }
 }
 
 impl Instr {
-    /// The registers whose batch this instruction reads, in operand order.
+    /// The verdicts are [`build`]'s to fill.
+    pub(in crate::query) fn new(in_reg: DeltaReg, out_reg: DeltaReg, op: Op) -> Instr {
+        Instr {
+            in_reg,
+            out_reg,
+            op,
+            takes: [false; 2],
+            folds: [false; 2],
+            inert_on_empty: false,
+        }
+    }
+
+    /// The registers whose batch this instruction reads, in operand order. No
+    /// `..` in the match: an opcode that gains a delta operand must fail to
+    /// compile here.
     #[inline]
     fn reads(&self) -> [Option<DeltaReg>; 2] {
-        [Some(self.in_reg), facts(&self.op).second_in]
+        let second = match &self.op {
+            Op::Union { in_b } => Some(*in_b),
+            Op::Filter(_)
+            | Op::Map(_)
+            | Op::Negate
+            | Op::WeightClamp { hist: _, preset: _ }
+            | Op::JoinDT { trace: _, probe: _ }
+            | Op::WorkerFilter { worker_id: _, num_workers: _ }
+            | Op::NullExtend { nulls_first: _ }
+            | Op::Reduce { out_trace: _, plan: _ }
+            | Op::TopN { out_trace: _, plan: _ } => None,
+        };
+        [Some(self.in_reg), second]
+    }
+
+    /// Each operand [`Instr::reads`] has, with its index into `takes`/`folds`.
+    #[inline]
+    fn operands(&self) -> impl Iterator<Item = (usize, DeltaReg)> {
+        self.reads()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.map(|r| (i, r)))
     }
 }
 
-/// Opaque handle owning a compiled program, its registers and its tables.
+/// A compiled program with the registers and child stores it runs over.
 pub(in crate::query) struct VmHandle {
     pub(in crate::query) program: Program,
     /// One batch per delta register.
@@ -177,8 +220,8 @@ pub(in crate::query) struct VmHandle {
     /// [`StateIdx`] names. Here and not on the immutable `Program` so the
     /// dispatch can hold `&Program` and `&mut CircuitState` at once.
     pub(in crate::query) state: CircuitState,
-    /// The program carries a global-ground `Reduce` this worker owns whose ground
-    /// row has not been minted yet — the one reason an empty epoch is worth
+    /// No epoch has been dispatched yet and the program carries a global-ground
+    /// `Reduce` this worker owns — the one reason an all-empty epoch is worth
     /// dispatching.
     pending_ground_row: bool,
 }
@@ -201,23 +244,22 @@ impl VmHandle {
 /// instructions name except the mutable child stores ([`VmHandle`]).
 pub(in crate::query) struct Program {
     instructions: Vec<Instr>,
-    /// `(delta, trace)`, run after the whole instruction range — and not at all
-    /// by a replay, which is what makes a replay read-only.
-    integrates: Vec<(DeltaReg, StateIdx)>,
+    /// Run after the whole instruction range — and not at all by a replay, which
+    /// is what makes a replay read-only.
+    integrates: Vec<Integrate>,
     delta_schemas: Vec<SchemaDescriptor>,
-    /// For each register, the pc of the last instruction that reads it — so an
-    /// instruction may empty a register in place exactly when it is that reader.
-    /// An integrate's pc continues past the instruction range. `u32::MAX` marks a
-    /// register no instruction may take: the sink (read by the epoch epilogue,
-    /// which no instruction spells) and any register nothing reads.
-    last_read: Vec<u32>,
-    /// For each register some instruction consolidates, the pc of its **first**
-    /// reader, which folds it in place. `u32::MAX` elsewhere.
-    consolidate_at: Vec<u32>,
     /// The register the epoch's output is extracted from. Here rather than passed
-    /// in, because `last_read` bakes "the sink is never takeable" against it: two
+    /// in, because `build` bakes "the sink is never takeable" against it: two
     /// spellings could disagree and nothing would catch it.
     out_reg: DeltaReg,
+}
+
+/// One tick's accumulation of a register into its trace.
+struct Integrate {
+    reg: DeltaReg,
+    trace: StateIdx,
+    /// Nothing reads `reg` after this, so the ingest may take its batch.
+    take: bool,
 }
 
 /// The pc of the first instruction reading `reg`, or `instructions.len()` when
@@ -269,8 +311,9 @@ impl Program {
     /// reader — the take verdict the dispatch acts on.
     #[cfg(test)]
     pub(in crate::query) fn take_verdicts(&self) -> impl Iterator<Item = (&Op, [Option<bool>; 2])> + '_ {
-        self.instructions.iter().enumerate().map(|(pc, instr)| {
-            let takes = instr.reads().map(|r| r.map(|r| self.last_read[r.at()] == pc as u32));
+        self.instructions.iter().map(|instr| {
+            let reads = instr.reads();
+            let takes = [reads[0].map(|_| instr.takes[0]), reads[1].map(|_| instr.takes[1])];
             (&instr.op, takes)
         })
     }

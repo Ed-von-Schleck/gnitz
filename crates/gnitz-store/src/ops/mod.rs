@@ -40,5 +40,5 @@ pub use join::{op_join_delta_trace, JoinPlan, JoinProbe};
 pub use linear::{null_extend_output_schema, op_union, union_nullability_merge};
 pub use linear::{op_filter, op_negate};
 pub(crate) use reduce::AdhocFold;
-pub use reduce::{avi_batch, op_reduce, ReducePlan};
+pub use reduce::{avi_batch, op_reduce, AviBake, ReducePlan};
 pub use topn::{op_topn, TopNPlan};

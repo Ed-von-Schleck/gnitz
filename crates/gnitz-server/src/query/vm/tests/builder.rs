@@ -3,10 +3,10 @@ use super::*;
 use crate::test_support::make_schema_u128_i64;
 use gnitz_wire::{AggDescriptor, AggFunc};
 
-/// An integrate runs after the whole instruction range, so it is the last reader
-/// of its register and ingests by move rather than by copy.
+/// An integrate runs after every instruction, so it takes its register and the
+/// instructions reading it copy — unless that register is the sink.
 #[test]
-fn an_integrate_is_the_last_reader_of_its_register() {
+fn an_integrate_takes_its_register_unless_it_is_the_sink() {
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
     let schema = make_schema_u128_i64();
@@ -14,28 +14,32 @@ fn an_integrate_is_the_last_reader_of_its_register() {
 
     let t0 = p.table(&registry, dir.path(), "t0", schema);
     let t1 = p.table(&registry, dir.path(), "t1", schema);
+    let t2 = p.table(&registry, dir.path(), "t2", schema);
     p.push(0, 1, Op::Negate);
     p.push(1, 2, Op::Negate);
     p.integrate(0, t0);
     p.integrate(1, t1);
+    p.integrate(2, t2);
 
     let vm = p.build(vec![schema; 3], 2);
-    let n = vm.program.instructions.len();
-    assert_eq!(vm.program.last_read[0], n as u32);
-    assert_eq!(vm.program.last_read[1], n as u32 + 1);
+    let takes: Vec<bool> = vm.program.integrates.iter().map(|i| i.take).collect();
     assert_eq!(
-        vm.program.last_read[2],
-        u32::MAX,
+        takes,
+        vec![true, true, false],
         "the sink is never taken out from under the epoch epilogue"
+    );
+    assert!(
+        vm.program.instructions.iter().all(|i| i.takes == [false; 2]),
+        "an integrate reads after every instruction, so none of them may take",
     );
 }
 
-/// `consolidate_at` marks each consolidating instruction's input at its FIRST
-/// reader, and nothing else. Here every marked register is read by a cheaper
-/// instruction first, so the mark cannot be confused with the reader that needs
-/// the fold.
+/// Each consolidating instruction's input is folded at its FIRST reader, and
+/// nothing else is folded at all. Here every folded register is read by a
+/// cheaper instruction first, so the fold cannot be confused with the reader
+/// that needs it.
 #[test]
-fn consolidate_at_marks_the_first_reader_of_every_folded_register() {
+fn a_folded_register_is_folded_by_its_first_reader() {
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
     let schema = make_schema_u128_i64();
@@ -90,10 +94,7 @@ fn consolidate_at_marks_the_first_reader_of_every_folded_register() {
         10,
         Op::Reduce {
             out_trace: red_trace,
-            plan: Box::new(BakedReduce {
-                plan: avi_plan,
-                avi_table: Some(avi_table),
-            }),
+            plan: Box::new(BakedReduce::new(avi_plan, Some(avi_table))),
         },
     );
     p.push(6, 7, Op::Negate);
@@ -102,18 +103,22 @@ fn consolidate_at_marks_the_first_reader_of_every_folded_register() {
         11,
         Op::Reduce {
             out_trace: lin_trace,
-            plan: Box::new(BakedReduce { plan: linear_plan, avi_table: None }),
+            plan: Box::new(BakedReduce::new(linear_plan, None)),
         },
     );
 
     let vm = p.build(vec![schema; 12], 11);
-    let marked: Vec<(usize, u32)> = vm
+    // `(register, pc)` for every operand the dispatch folds.
+    let marked: Vec<(usize, usize)> = vm
         .program
-        .consolidate_at
+        .instructions
         .iter()
         .enumerate()
-        .filter(|&(_, &pc)| pc != u32::MAX)
-        .map(|(r, &pc)| (r, pc))
+        .flat_map(|(pc, instr)| {
+            instr
+                .operands()
+                .filter_map(move |(i, r)| instr.folds[i].then_some((r.at(), pc)))
+        })
         .collect();
     // The clamp input, the join delta and the value-indexed reduce's input, each
     // at the negate that reads it first. The linear reduce's input (reg 6) is

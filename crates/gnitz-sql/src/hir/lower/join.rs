@@ -138,8 +138,9 @@ fn emit_equi(
 /// `inner ∪ ν_A ∪ ν_B` — the equi outer join's null-fill, unioned onto the inner
 /// output for each preserved side; `inner_merged` unchanged for INNER.
 ///
-/// `inner_merged` feeds both `π_P` and these unions, so it rides the
-/// non-destructive second union operand throughout (`op_union` empties the first).
+/// `inner_merged` feeds both `π_P` and these unions, so it rides the second
+/// union operand throughout — a cost choice, the VM's liveness pass deciding per
+/// operand which register a union may empty.
 fn emit_equi_null_fill(
     cb: &mut Circuit,
     inner_merged: NodeId,

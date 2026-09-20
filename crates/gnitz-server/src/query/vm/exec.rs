@@ -2,23 +2,12 @@
 
 use super::*;
 use gnitz_store::ops;
-use gnitz_store::storage::{Batch, StorageError};
+use gnitz_store::storage::{Batch, StorageError, StoreError};
 
-/// Storage failure while integrating a tick's delta into a child store: the
-/// view/history state has diverged from its durable inputs and there is no
-/// sound continue (dropping the delta permanently desyncs the integral). The
-/// error is returned so the process that owns the recovery decision makes it —
-/// for a server, restart + SAL replay. This only logs; every call site applies
-/// `?` to what it hands back.
-fn tick_ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StorageError {
-    gnitz_error!(
-        "vm: {} ingest failed (state_idx={:?}): {} — tick state diverged \
-         from durable inputs",
-        op,
-        idx,
-        e,
-    );
-    e
+/// The one context template for a `vm:` ingest fault.
+#[cold]
+fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StoreError {
+    StoreError::storage(format!("vm: {op} ingest (state_idx={idx:?})"), e)
 }
 
 /// Execute one epoch over `inputs`, one `(register, batch)` per seeded input —
@@ -27,15 +16,14 @@ fn tick_ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StorageError {
 pub(in crate::query) fn execute_epoch_multi(
     vm: &mut VmHandle,
     inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
-) -> Result<Batch, StorageError> {
+) -> Result<Batch, StoreError> {
     let all_empty = seed_inputs(vm, inputs);
-    // A global-ground reduce mints its V₀ row on one empty epoch; every other
-    // opcode is inert on empty input. Cleared before the run, because `trace_out`
-    // holds V₀ afterwards either way.
-    if all_empty && !std::mem::take(&mut vm.pending_ground_row) {
+    // Spent by any dispatched epoch, not just an empty one: the ground reduce
+    // runs either way and leaves V₀ in its output trace.
+    let ground_pending = std::mem::take(&mut vm.pending_ground_row);
+    if all_empty && !ground_pending {
         return Ok(Batch::empty_with_schema(vm.program.out_schema()));
     }
-    vm.state.compact_all();
     run_instructions(vm, 0)?;
     run_integrates(vm)?;
     Ok(take_output(vm))
@@ -43,13 +31,13 @@ pub(in crate::query) fn execute_epoch_multi(
 
 /// One chunk of a capacity-bounded view's hydration replay: seed a register out
 /// of a store and run from `start_pc`, past the prologue that seed replaces.
-/// Runs no integrate and no compaction; that the instructions write no state
-/// either is `reject_state_writers`'s to enforce.
+/// Runs no integrate; that the instructions write no state either is
+/// `reject_state_writers`'s to enforce.
 pub(in crate::query) fn replay_chunk(
     vm: &mut VmHandle,
     start_pc: usize,
     seed: (DeltaReg, Batch),
-) -> Result<Batch, StorageError> {
+) -> Result<Batch, StoreError> {
     seed_inputs(vm, std::iter::once(seed));
     run_instructions(vm, start_pc)?;
     Ok(take_output(vm))
@@ -65,8 +53,7 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (DeltaReg, Ba
     for (input_reg, input_batch) in inputs {
         all_empty &= input_batch.is_empty();
         // Rows under the wrong layout would scramble every downstream read
-        // silently. An empty batch has none, and legitimately carries a foreign
-        // schema (a dep_map view with no matching rows), so it is exempt.
+        // silently. An empty batch has no rows to misread, so it is exempt.
         if !input_batch.is_empty() {
             assert_eq!(
                 input_batch.schema().num_columns(),
@@ -80,27 +67,25 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (DeltaReg, Ba
     all_empty
 }
 
-/// The batch of register `reg`, taken in place when instruction `pc` is its last
-/// reader and copied otherwise.
+/// Register `reg`'s batch, moved out when `take` and copied otherwise.
 ///
 /// `#[inline]`: it returns a `Batch` by value, so a call would cost an extra
 /// sret move at every site.
 #[inline]
-fn take_or_clone(batches: &mut [Batch], last_read: &[u32], reg: DeltaReg, pc: usize) -> Batch {
+fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
     let batch = &mut batches[reg.at()];
-    match last_read[reg.at()] == pc as u32 {
+    match take {
         true => batch.take(),
         false => batch.clone_batch(),
     }
 }
 
 /// Run the instruction stream from `start_pc`.
-fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StorageError> {
+fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StoreError> {
     // Destructured because the three are disjoint fields: that is what lets an
     // operator hold a batch and a cursor (or a table) at once, with no interior
     // mutability and no raw pointer.
     let VmHandle { program, batches, state, .. } = vm;
-    let last_read = &program.last_read[..];
 
     gnitz_debug!(
         "vm: dispatch out_reg={} instrs={}",
@@ -108,115 +93,96 @@ fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StorageErr
         program.instructions.len()
     );
 
-    // Indexed, so `pc` is the absolute offset `last_read` is keyed by.
-    for pc in start_pc..program.instructions.len() {
-        let instr = &program.instructions[pc];
+    for instr in &program.instructions[start_pc..] {
         let (in_reg, out_reg) = (instr.in_reg, instr.out_reg);
-        let facts = facts(&instr.op);
 
         // Fold in place what this instruction is the first reader of: the raw
         // batch is freed and every later reader sees the folded form, where a
         // kernel's own fold would allocate a copy beside it.
-        for r in instr.reads().into_iter().flatten() {
-            if program.consolidate_at[r.at()] == pc as u32 {
+        for (i, r) in instr.operands() {
+            if instr.folds[i] {
                 batches[r.at()].consolidate_in_place(program.schema_of(r));
             }
         }
 
-        // An `inert_on_empty` kernel returns exactly this for an empty input, so
-        // skipping it saves opening a cursor over a trace it reads nothing from.
-        if facts.inert_on_empty && batches[in_reg.at()].is_empty() {
-            batches[out_reg.at()] = Batch::empty_with_schema(program.schema_of(out_reg));
+        let all_empty = instr.operands().all(|(_, r)| batches[r.at()].is_empty());
+        // The kernel would return exactly this, so skip it and its trace cursor.
+        let out = if instr.inert_on_empty && all_empty {
+            Batch::empty_with_schema(program.schema_of(out_reg))
         } else {
             match &instr.op {
                 Op::Filter(pred) => {
                     let schema = program.schema_of(in_reg);
-                    let result = match ops::op_filter(&batches[in_reg.at()], pred, schema) {
+                    match ops::op_filter(&batches[in_reg.at()], pred, schema) {
                         Some(kept) => kept,
-                        None => take_or_clone(batches, last_read, in_reg, pc),
-                    };
-                    batches[out_reg.at()] = result;
+                        None => take_or_clone(batches, in_reg, instr.takes[0]),
+                    }
                 }
 
-                Op::Map(plan) => {
-                    let result = plan.evaluate_map_batch(&batches[in_reg.at()]);
-                    batches[out_reg.at()] = result;
-                }
+                Op::Map(plan) => plan.evaluate_map_batch(&batches[in_reg.at()]),
 
-                Op::Negate => {
-                    let result = ops::op_negate(take_or_clone(batches, last_read, in_reg, pc));
-                    batches[out_reg.at()] = result;
-                }
+                Op::Negate => ops::op_negate(take_or_clone(batches, in_reg, instr.takes[0])),
 
                 Op::Union { in_b } => {
-                    // The union's own (nullability-merged) schema, not the left
-                    // input's — see `op_union` for why a narrower one mis-sorts
-                    // nulls.
-                    let out_schema = program.schema_of(out_reg);
-                    let result = if in_reg == *in_b {
-                        // Z + Z doubles every weight. Delegating would take `in_a`
-                        // and then add the emptied `in_b` to it, yielding Z.
-                        let mut batch = take_or_clone(batches, last_read, in_reg, pc);
+                    if in_reg == *in_b {
+                        // Z + Z doubles every weight; delegating would take
+                        // operand 0 and add the emptied operand 1 to it. Only a
+                        // hand-built circuit aliases them.
+                        let mut batch = take_or_clone(batches, in_reg, instr.takes[0]);
                         batch.map_weights(|w| w.wrapping_mul(2));
                         batch
                     } else if batches[in_reg.at()].is_empty() {
-                        // `0 + B = B`. Here rather than in `op_union`, which can
-                        // only clone B; taking an operand is the VM's decision. The
-                        // mirror needs no arm — `op_union` hands `batch_a`, already
-                        // taken, straight back.
-                        take_or_clone(batches, last_read, *in_b, pc)
+                        // `0 + B = B`, taking B rather than cloning it — which is
+                        // why the arm is here and not in `op_union`.
+                        take_or_clone(batches, *in_b, instr.takes[1])
                     } else {
+                        // The union's own (nullability-merged) schema, not the
+                        // left input's — see `op_union` for why a narrower one
+                        // mis-sorts nulls.
                         ops::op_union(
-                            take_or_clone(batches, last_read, in_reg, pc),
+                            take_or_clone(batches, in_reg, instr.takes[0]),
                             &batches[in_b.at()],
-                            out_schema,
+                            program.schema_of(out_reg),
                         )
-                    };
-                    batches[out_reg.at()] = result;
+                    }
                 }
 
                 Op::WeightClamp { hist, preset } => {
                     let schema = program.schema_of(in_reg);
-                    let delta = take_or_clone(batches, last_read, in_reg, pc);
+                    let delta = take_or_clone(batches, in_reg, instr.takes[0]);
                     // Opened before the ingest below: the clamp reads `z⁻¹(I)`.
                     let mut cursor = state.cursor(*hist);
                     let (output, consolidated) = ops::op_weight_clamp(delta, &mut cursor, schema, *preset);
                     drop(cursor);
-                    batches[out_reg.at()] = output;
                     state
                         .ingest_owned(*hist, consolidated)
-                        .map_err(|e| tick_ingest_err("weight-clamp history", *hist, e))?;
+                        .map_err(|e| ingest_err("weight-clamp history", *hist, e))?;
+                    output
                 }
 
-                Op::JoinDT { trace, probe } => {
-                    let result = ops::op_join_delta_trace(
-                        &batches[in_reg.at()],
-                        &mut state.cursor(*trace),
-                        program.schema_of(out_reg),
-                        *probe,
-                    );
-                    batches[out_reg.at()] = result;
-                }
+                Op::JoinDT { trace, probe } => ops::op_join_delta_trace(
+                    &batches[in_reg.at()],
+                    &mut state.cursor(*trace),
+                    program.schema_of(out_reg),
+                    *probe,
+                ),
 
                 Op::WorkerFilter { worker_id, num_workers } => {
-                    let result = ops::op_worker_filter(&batches[in_reg.at()], *worker_id, *num_workers);
-                    batches[out_reg.at()] = result;
+                    ops::op_worker_filter(&batches[in_reg.at()], *worker_id, *num_workers)
                 }
 
                 Op::NullExtend { nulls_first } => {
-                    let out_schema = program.schema_of(out_reg);
-                    let result = batches[in_reg.at()].widened_with_nulls(out_schema, *nulls_first);
-                    batches[out_reg.at()] = result;
+                    batches[in_reg.at()].widened_with_nulls(program.schema_of(out_reg), *nulls_first)
                 }
 
                 Op::Reduce { out_trace, plan } => {
                     // An empty delta touches no group; only a ground-seeding
                     // reduce reaches here with one.
-                    let mut avi_cursor = match plan.avi_table.zip(plan.plan.avi.as_ref()) {
+                    let mut avi_cursor = match plan.avi() {
                         Some((idx, bake)) if !batches[in_reg.at()].is_empty() => Some(
                             state
                                 .ingest_then_cursor(idx, ops::avi_batch(&batches[in_reg.at()], bake))
-                                .map_err(|e| tick_ingest_err("avi", idx, e))?,
+                                .map_err(|e| ingest_err("avi", idx, e))?,
                         ),
                         _ => None,
                     };
@@ -229,30 +195,26 @@ fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StorageErr
                     );
 
                     let mut to_cursor = state.cursor(*out_trace);
-                    let raw_out =
-                        ops::op_reduce(&batches[in_reg.at()], &mut to_cursor, avi_cursor.as_mut(), &plan.plan);
-                    batches[out_reg.at()] = raw_out;
+                    ops::op_reduce(&batches[in_reg.at()], &mut to_cursor, avi_cursor.as_mut(), &plan.plan)
                 }
 
                 Op::TopN { out_trace, plan } => {
-                    gnitz_debug!("vm: TOPN in_count={}", batches[in_reg.at()].len());
                     let idx = plan.index_table;
                     let mut history = state
                         .ingest_then_cursor(idx, plan.plan.index.batch(&batches[in_reg.at()]))
-                        .map_err(|e| tick_ingest_err("topn index", idx, e))?;
+                        .map_err(|e| ingest_err("topn index", idx, e))?;
                     let mut to_cursor = state.cursor(*out_trace);
-                    batches[out_reg.at()] =
-                        ops::op_topn(&batches[in_reg.at()], &mut to_cursor, &mut history, &plan.plan);
+                    ops::op_topn(&batches[in_reg.at()], &mut to_cursor, &mut history, &plan.plan)
                 }
             }
-        }
+        };
+        batches[out_reg.at()] = out;
 
         // Free every operand this instruction was the last reader of, here
         // rather than per arm — so a register's lifetime follows the dataflow
         // instead of whether some kernel happens to take `Batch` by value.
-        // Idempotent: releasing an already-emptied batch returns immediately.
-        for r in instr.reads().into_iter().flatten() {
-            if last_read[r.at()] == pc as u32 {
+        for (i, r) in instr.operands() {
+            if instr.takes[i] {
                 batches[r.at()].release_buffers();
             }
         }
@@ -264,17 +226,17 @@ fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StorageErr
 
 /// Accumulate each delta into its trace, after the whole instruction range — so
 /// no cursor opened in that range can observe this tick's integration.
-fn run_integrates(vm: &mut VmHandle) -> Result<(), StorageError> {
+fn run_integrates(vm: &mut VmHandle) -> Result<(), StoreError> {
     let VmHandle { program, batches, state, .. } = vm;
-    for (i, &(in_reg, trace)) in program.integrates.iter().enumerate() {
-        gnitz_debug!("vm: INTEGRATE in_count={}", batches[in_reg.at()].len());
+    for &Integrate { reg, trace, take } in &program.integrates {
+        gnitz_debug!("vm: INTEGRATE in_count={}", batches[reg.at()].len());
         // Not `take_or_clone`: for a `Raw` register its clone arm would cost a
         // clone plus the trace's own consolidate, where moving costs one.
-        let res = match program.last_read[in_reg.at()] == (program.instructions.len() + i) as u32 {
-            true => state.ingest_owned(trace, batches[in_reg.at()].take()),
-            false => state.ingest_borrowed(trace, &batches[in_reg.at()]),
+        let res = match take {
+            true => state.ingest_owned(trace, batches[reg.at()].take()),
+            false => state.ingest_borrowed(trace, &batches[reg.at()]),
         };
-        res.map_err(|e| tick_ingest_err("integrate", trace, e))?;
+        res.map_err(|e| ingest_err("integrate", trace, e))?;
     }
     Ok(())
 }
@@ -287,8 +249,6 @@ fn take_output(vm: &mut VmHandle) -> Batch {
     let VmHandle { program, batches, .. } = vm;
     let want = program.out_schema();
     let out = &mut batches[program.out_reg.at()];
-    // An empty register can still carry a seed's foreign schema, so it is
-    // rebuilt rather than taken.
     if out.is_empty() {
         return Batch::empty_with_schema(want);
     }

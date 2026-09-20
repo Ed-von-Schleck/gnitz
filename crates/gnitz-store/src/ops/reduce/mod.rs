@@ -20,6 +20,6 @@ mod bench_secondary_index;
 mod tests;
 
 pub(crate) use adhoc_fold::AdhocFold;
-pub use avi::avi_batch;
+pub use avi::{avi_batch, AviBake};
 pub use op_reduce::op_reduce;
 pub use plan::ReducePlan;

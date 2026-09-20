@@ -108,23 +108,13 @@ impl CircuitState {
         self.at_mut(idx).ingest_borrowed_batch(batch)
     }
 
-    /// Ingest, compact, then open a cursor — in that order, so a prefix seek
-    /// over an operator's own index sees the rows this epoch just wrote. A
-    /// caller that opened the cursor first would read its own writes out.
+    /// Ingest, then open a cursor — in that order, so a prefix seek over an
+    /// operator's own index sees the rows this epoch just wrote. A caller that
+    /// opened the cursor first would read its own writes out.
     pub fn ingest_then_cursor(&mut self, idx: StateIdx, batch: Batch) -> Result<ReadCursor, StorageError> {
         let t = self.at_mut(idx);
         t.ingest_owned_batch(batch)?;
-        t.compact_if_needed()?;
         Ok(t.open_cursor())
-    }
-
-    /// Bound the L0 fan-in of every child. The epoch path's job, not a read's: a
-    /// compaction mutates shard state, and an `Err` leaves the shard index
-    /// unchanged, so a cursor opened afterwards still sees a consistent snapshot.
-    pub fn compact_all(&mut self) {
-        for t in &mut self.tables {
-            let _ = t.compact_if_needed();
-        }
     }
 
     /// True iff this state holds at least one child and every one came back from

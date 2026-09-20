@@ -444,8 +444,7 @@ impl Table {
 
     /// Open a read-only cursor over every tier. Does NOT mutate the table —
     /// compaction is a maintenance operation, not part of the read path. Cheap
-    /// and infallible. Maintenance paths that want an up-to-date L1 call
-    /// `compact_if_needed` first.
+    /// and infallible.
     ///
     /// Opening is Θ(sources), so a read that knows its key bound beforehand
     /// should take [`Self::open_cursor_in_range`].
@@ -616,7 +615,7 @@ impl Table {
 
     /// Run L0→L1+ compaction if the disk tier crossed its threshold. Publishes no
     /// manifest: the barrier is the sole publish point.
-    pub(crate) fn compact_if_needed(&mut self) -> Result<(), StorageError> {
+    fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());
         }

@@ -5,7 +5,7 @@ use super::*;
 use crate::test_support::{make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, opk_pk, zset_of};
 use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, StorageError};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, StoreError};
 use gnitz_wire::type_code;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
@@ -14,7 +14,7 @@ use gnitz_wire::AggFunc;
 
 /// One epoch seeding a single input register — production seeds through
 /// `execute_epoch_multi` directly, with one entry per exchange side.
-fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Batch, StorageError> {
+fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Batch, StoreError> {
     execute_epoch_multi(vm, std::iter::once((DeltaReg(input_reg), input)))
 }
 
@@ -31,7 +31,7 @@ fn push_reduce(
 ) -> SchemaDescriptor {
     let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, gcols, aggs, global_ground, i_am_owner).unwrap();
     let out_schema = plan.shape.output_schema;
-    let baked = Box::new(BakedReduce { plan, avi_table: None });
+    let baked = Box::new(BakedReduce::new(plan, None));
     p.push(0, 1, Op::Reduce { out_trace, plan: baked });
     out_schema
 }
@@ -487,7 +487,7 @@ fn an_empty_epoch_mints_the_ground_row_once() {
         1,
         Op::Reduce {
             out_trace,
-            plan: Box::new(BakedReduce { plan, avi_table: None }),
+            plan: Box::new(BakedReduce::new(plan, None)),
         },
     );
     p.integrate(1, out_trace);
@@ -505,6 +505,43 @@ fn an_empty_epoch_mints_the_ground_row_once() {
             .unwrap()
             .is_empty(),
         "a second empty epoch has nothing left to mint",
+    );
+}
+
+/// A non-empty first epoch mints V₀ through the reduce's ordinary path, so it
+/// spends the latch too — and the all-empty epoch after it has nothing left to
+/// dispatch for.
+#[test]
+fn a_non_empty_epoch_spends_the_ground_latch_too() {
+    let in_schema = make_schema_u128_i64();
+    let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
+    let dir = tempfile::tempdir().unwrap();
+    let registry = vm_registry(dir.path());
+    let mut p = TestPlan::default();
+    let plan = gnitz_store::ops::ReducePlan::from_wire(&in_schema, &[], &aggs, true, true).unwrap();
+    let out_schema = plan.shape.output_schema;
+    let out_trace = p.table(&registry, dir.path(), "ground_tr", out_schema);
+    p.push(
+        0,
+        1,
+        Op::Reduce {
+            out_trace,
+            plan: Box::new(BakedReduce::new(plan, None)),
+        },
+    );
+    p.integrate(1, out_trace);
+    let mut vm = p.build(vec![in_schema, out_schema], 1);
+    assert!(vm.pending_ground_row);
+
+    let first = execute_epoch(&mut vm, make_batch_u128(&in_schema, &[(1, 1, 10)]), 0).unwrap();
+    assert_eq!(first.len(), 1, "the global group's own row, at V₀'s key");
+    assert!(!vm.pending_ground_row, "a dispatched epoch spends the latch either way");
+
+    assert!(
+        execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
+            .unwrap()
+            .is_empty(),
+        "the trace already holds V₀, so there is nothing left to mint",
     );
 }
 
@@ -527,7 +564,7 @@ fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
             1,
             Op::Reduce {
                 out_trace,
-                plan: Box::new(BakedReduce { plan, avi_table: None }),
+                plan: Box::new(BakedReduce::new(plan, None)),
             },
         );
         s
@@ -684,7 +721,7 @@ fn a_second_epoch_retracts_the_first_ones_aggregate() {
         1,
         Op::Reduce {
             out_trace,
-            plan: Box::new(BakedReduce { plan, avi_table: None }),
+            plan: Box::new(BakedReduce::new(plan, None)),
         },
     );
     p.integrate(1, out_trace);

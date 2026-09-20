@@ -36,11 +36,8 @@ pub(in crate::query) struct TestPlan {
 
 impl TestPlan {
     pub(in crate::query) fn push(&mut self, in_reg: u16, out_reg: u16, op: Op) {
-        self.instructions.push(Instr {
-            in_reg: DeltaReg(in_reg),
-            out_reg: DeltaReg(out_reg),
-            op,
-        });
+        self.instructions
+            .push(Instr::new(DeltaReg(in_reg), DeltaReg(out_reg), op));
     }
 
     pub(in crate::query) fn integrate(&mut self, in_reg: u16, trace: StateIdx) {

@@ -73,7 +73,7 @@ impl EmitCtx<'_> {
     }
 
     fn push(&mut self, in_reg: DeltaReg, out_reg: DeltaReg, op: Op) {
-        self.instructions.push(Instr { in_reg, out_reg, op });
+        self.instructions.push(Instr::new(in_reg, out_reg, op));
     }
 
     /// The register `src` produced. The one rejection left after the load held
@@ -357,7 +357,7 @@ fn emit_reduce(
         None => None,
     };
 
-    let baked = Box::new(BakedReduce { plan, avi_table });
+    let baked = Box::new(BakedReduce::new(plan, avi_table));
     ctx.push(in_reg_id, out_reg, Op::Reduce { out_trace, plan: baked });
     ctx.integrates.push((out_reg, out_trace));
     Ok(OutReg::Delta(out_reg))
