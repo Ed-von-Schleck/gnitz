@@ -258,7 +258,8 @@ impl Batch {
     pub(crate) fn write_as_shard(&self, path: &CStr, opts: ShardWriteOpts) -> Result<(), StorageError> {
         let schema = self.schema();
         let n = self.count;
-        let regions = self.wire_regions();
+        let mut regions = gnitz_wire::region::Regions::new();
+        self.wire_regions(&mut regions);
         let num_regions = regions.len();
         // Shards are ghost-free by construction: flush persists the run set's
         // consolidated net-state run and compaction's merge drops net-zero groups.

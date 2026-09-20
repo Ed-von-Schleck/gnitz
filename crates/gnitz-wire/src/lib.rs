@@ -14,11 +14,9 @@
 //!
 //! The crate is organized into topic modules, and most items are re-exported
 //! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which
-//! module a symbol lives in. `control`, `schema_block`, `sys_rows`, `txn_frame`
-//! and `wal` stay named modules and are referenced by path
-//! (`gnitz_wire::wal::WalBlock`). `wal`'s *constants* (`WAL_*`,
-//! `MAX_WIRE_REGIONS`, the `REG_*` region-convention indices) are flat-exported,
-//! since they are referenced pervasively.
+//! module a symbol lives in. `control`, `region`, `schema_block`, `sys_rows`,
+//! `txn_frame` and `wal` stay named modules and are referenced by path
+//! (`gnitz_wire::wal::WalBlock`).
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -88,7 +86,6 @@ macro_rules! wire_enum {
 mod catalog;
 mod circuit;
 mod codec;
-mod error;
 mod flags;
 mod german_string;
 mod handshake;
@@ -102,6 +99,7 @@ mod xxh;
 
 pub mod control;
 pub mod decimal;
+pub mod region;
 pub mod schema_block;
 pub mod sys_rows;
 pub mod txn_frame;
@@ -112,7 +110,6 @@ pub use circuit::*;
 // The cursor itself, for the one payload this crate frames but never reads:
 // `gnitz-expr`'s program blob.
 pub use codec::{Reader, Writer};
-pub use error::*;
 pub use flags::*;
 pub use german_string::*;
 pub use handshake::*;
@@ -123,12 +120,13 @@ pub use rel_descriptor::*;
 pub use types::*;
 pub use uuid::*;
 pub use xxh::*;
-// Flat-export `wal`'s constants (referenced everywhere) but not its framer
-// items (`WalBlock`/`validate_and_parse`/… stay `gnitz_wire::wal::`-qualified).
-pub use wal::{
-    MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
-    WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+// Flat-export what production reaches for pervasively; the framer items and the
+// rest of the header offsets stay module-qualified.
+pub use region::{
+    all_payload_null_mask, merge_null_words, null_word_at, null_word_get, null_word_set, MAX_WIRE_REGIONS,
+    REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
+pub use wal::{WAL_FORMAT_VERSION, WAL_OFF_TID};
 
 // ---------------------------------------------------------------------------
 // Low-level byte primitives.
@@ -151,16 +149,6 @@ pub use wal::{
 #[inline(always)]
 pub const fn align8(n: usize) -> usize {
     (n + 7) & !7
-}
-
-#[inline]
-pub(crate) fn read_u16_le(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
-}
-
-#[inline]
-pub(crate) fn write_u16_le(buf: &mut [u8], off: usize, val: u16) {
-    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
 }
 
 #[inline]
@@ -241,29 +229,6 @@ pub fn read_unsigned_exact(bytes: &[u8]) -> u64 {
     }
 }
 
-/// True iff payload null-bit `pi` is set in `word` (the column is NULL).
-///
-/// The null word packs one bit per *payload* column: bit `pi` is the `pi`-th
-/// non-PK column in schema order (the region convention, whose `REG_NULL_BMP`
-/// index this crate already owns). These two accessors are the **one** read/write
-/// convention for the bitmap, shared by the client (`gnitz-core`), the evaluator
-/// (`gnitz-expr`) and the engine — it was previously spelled out in each.
-#[inline(always)]
-pub fn null_word_get(word: u64, pi: usize) -> bool {
-    (word >> pi) & 1 == 1
-}
-
-/// Set (`is_null == true`) or clear (`is_null == false`) payload null-bit `pi`
-/// in `word`. See [`null_word_get`].
-#[inline(always)]
-pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
-    if is_null {
-        *word |= 1u64 << pi;
-    } else {
-        *word &= !(1u64 << pi);
-    }
-}
-
 /// A `u64` with its low `n` bits set, total at every `n`: `1u64 << 64` is
 /// undefined, so `n >= 64` answers all-ones directly. The one place that guard
 /// lives, whatever the bits mean — a caller whose `n` is provably below 64 needs
@@ -293,32 +258,6 @@ impl Iterator for BitIter {
         self.0 &= self.0 - 1;
         Some(i)
     }
-}
-
-/// Null word with the low `npc` payload bits set — "all `npc` payload columns
-/// are null". `npc` reaches the row-major cap of 64 only when a schema has
-/// exactly 64 payload columns.
-#[inline]
-pub fn all_payload_null_mask(npc: usize) -> u64 {
-    low_bits_mask(npc)
-}
-
-/// A row's null word rebased onto output payload slot `at`. Slot 64 and beyond
-/// hold no bit in a null word, so the shift saturates instead of panicking.
-#[inline]
-pub fn null_word_at(word: u64, at: usize) -> u64 {
-    if at < 64 {
-        word << at
-    } else {
-        0
-    }
-}
-
-/// Concatenate two rows' null words for an output row laid out as
-/// `[left payload..., right payload...]`.
-#[inline]
-pub fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
-    left | null_word_at(right, left_npc)
 }
 
 #[inline]

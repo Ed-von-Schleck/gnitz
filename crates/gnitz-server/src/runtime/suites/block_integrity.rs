@@ -1,12 +1,12 @@
 //! The descriptive bytes a frame carries outside any checksum — a data block's
-//! 32-byte WAL header and a schema record's arity prefix — and the per-slot
-//! checksum a zoned SAL group's directory carries.
+//! WAL header and a schema record's arity prefix — and the per-slot checksum a
+//! zoned SAL group's directory carries.
 
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::schema::decode_schema_block;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
-use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_TID};
+use gnitz_wire::wal::{WAL_HEADER_SIZE, WAL_OFF_TID};
 
 /// A schema record for a 4-column schema, keyed by its first column.
 fn schema_record_4col() -> Vec<u8> {
@@ -67,15 +67,14 @@ fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
     });
 }
 
-/// Every single-bit flip in a data block's header, driven through the parser the
-/// SAL replay path uses. An accepted decode must be observationally identical to
-/// the clean one. `TID` is deliberately unconstrained, and the assertion below
-/// says so rather than letting it pass as "no observable change".
+/// Every single-bit flip in a data block's header, driven through the parser
+/// the SAL replay path uses. The header carries no checksum, so structural
+/// relations alone hold every field but `TID`.
 #[test]
 fn single_bit_header_sweep_changes_nothing_observable() {
     let schema = make_schema_u64_i64();
-    let clean_data = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec(7, true);
-    let reference = Batch::decode_from_wal_block(&clean_data, &schema, true).expect("clean");
+    let clean_data = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec(7);
+    let reference = Batch::decode_from_wal_block(&clean_data, &schema).expect("clean");
     let ref_rows: Vec<(u128, i64)> = (0..reference.len())
         .map(|i| (reference.get_pk(i), reference.get_weight(i)))
         .collect();
@@ -83,10 +82,7 @@ fn single_bit_header_sweep_changes_nothing_observable() {
     let mut tid_accepts = 0usize;
     let mut buf = clean_data.clone();
     sweep_bit_flips(&mut buf, 0..WAL_HEADER_SIZE, |byte, bit, buf| {
-        if (WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8).contains(&byte) {
-            return; // the checksum field itself: a flip there is caught by design
-        }
-        let Ok(decoded) = Batch::decode_from_wal_block(buf, &schema, true) else {
+        let Ok(decoded) = Batch::decode_from_wal_block(buf, &schema) else {
             return;
         };
         if (WAL_OFF_TID..WAL_OFF_TID + 4).contains(&byte) {

@@ -5,8 +5,7 @@
 //! the copies, bootstrap every view — so the only failure that matters is a
 //! damaged file read back as a *plausible* one: a record naming copies at a feed
 //! position they never reached, which the next poll re-applies an interval onto,
-//! doubling every weight while the row set stays identical. The generation word
-//! sits outside the sweep: a flipped generation can never equal the manifests'.
+//! doubling every weight while the row set stays identical.
 
 use gnitz_store_testkit::scratch_dir;
 
@@ -69,18 +68,18 @@ fn a_registration_written_without_a_cursor_reads_back_without_one() {
     );
 }
 
-/// Every bit of the block: a flip either refuses the file or reads back the
-/// undamaged state (a flipped table id is immaterial), never a
+/// Every bit of the file, generation word and digest included: a flip either
+/// refuses the file or reads back the undamaged state, never a
 /// plausible-and-wrong one.
 #[test]
-fn a_flip_anywhere_in_the_block_is_refused_or_immaterial() {
+fn a_flip_anywhere_in_the_file_is_refused_or_immaterial() {
     let (dir, bytes) = written("bit_flips", one_cursor());
     let want = PersistedState {
         generation: 9,
         records: records(one_cursor()),
     };
     let mut buf = bytes.clone();
-    gnitz_store_testkit::sweep_bit_flips(&mut buf, HEADER_LEN..bytes.len(), |byte, bit, damaged| {
+    gnitz_store_testkit::sweep_bit_flips(&mut buf, 0..bytes.len(), |byte, bit, damaged| {
         if let Some(got) = reread(&dir, damaged) {
             assert_eq!(
                 got, want,
@@ -89,6 +88,18 @@ fn a_flip_anywhere_in_the_block_is_refused_or_immaterial() {
         }
     });
     assert!(reread(&dir, &bytes).is_some(), "the sweep restored every byte");
+}
+
+/// The generation word is inside the digest's span, so a flip there is refused
+/// rather than read back as a record set that absorbed a different tick range.
+#[test]
+fn a_flipped_generation_is_refused() {
+    let (dir, bytes) = written("generation", one_cursor());
+    for bit in 0..64 {
+        let mut damaged = bytes.clone();
+        damaged[bit / 8] ^= 1 << (bit % 8);
+        assert!(reread(&dir, &damaged).is_none(), "generation bit {bit} was accepted");
+    }
 }
 
 /// A file cut short anywhere, and one with a byte after the block.

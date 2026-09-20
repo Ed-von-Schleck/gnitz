@@ -35,10 +35,10 @@ fn frame(hdr: &ControlHeader, blob: &[u8], schema_block: Option<&[u8]>, data: Op
 
 /// A stand-in WAL block of `body` region bytes.
 fn wal_block(tid: u32, body: &'static [u8]) -> Vec<u8> {
-    let mut regions = crate::wal::Regions::new();
-    regions.push(body);
+    let mut b = crate::wal::WalBlock::new(tid, 1);
+    b.regions.push(body);
     let mut out = Vec::new();
-    crate::wal::WalBlock { table_id: tid, entry_count: 1, regions }.append_to(&mut out);
+    b.append_to(&mut out);
     out
 }
 

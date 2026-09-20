@@ -78,7 +78,7 @@ impl MappedShard {
         // The file's blob-region index, and with it the directory length the
         // digest covers.
         let file_nr = REG_PAYLOAD_START + file_npc;
-        let num_regions = file_nr + 1;
+        let num_regions = gnitz_wire::region::num_regions(file_npc);
 
         // Ahead of every structural check, so no forged byte reaches unchecked
         // arithmetic. The span's length comes from the file's own arity, so a

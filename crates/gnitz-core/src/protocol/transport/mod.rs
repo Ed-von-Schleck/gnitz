@@ -669,7 +669,7 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
 /// OCC basis. `until` bounds the exchange as a whole — on TLS the handshake
 /// included — not each leg.
 pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<u64, ProtocolError> {
-    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16);
+    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION);
     t.send_frame(payload.to_vec(), until)?;
 
     let buf = t.recv_framed(until)?;

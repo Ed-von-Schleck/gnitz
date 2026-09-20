@@ -53,7 +53,7 @@ fn cursor(tick: u64) -> DeltaCursor {
 
 /// One wire block holding `batch`, as a reply frame would have carried it.
 fn block_of(batch: &Batch) -> RawBlock {
-    RawBlock::from_block(batch.encode_to_wire_vec(TID as u32, false))
+    RawBlock::from_block(batch.encode_to_wire_vec(TID as u32))
 }
 
 /// A bootstrap's train: the view's own rows, in the view's own schema.

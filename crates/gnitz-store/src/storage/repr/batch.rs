@@ -33,7 +33,7 @@ pub const MAX_BATCH_REGIONS: usize = MAX_WIRE_REGIONS - 1;
 /// How many payload columns the region array can hold — the writer's own cap.
 /// Deliberately looser than the semantic cap a real table hits first (64, from
 /// `MAX_COLUMNS` with at least one PK column), so a change to the PK rules
-/// cannot turn a valid shard into `InvalidShard`.
+/// cannot turn a valid shard into an error.
 pub(in crate::storage) const MAX_PAYLOAD_REGIONS: usize = MAX_BATCH_REGIONS - REG_PAYLOAD_START;
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
@@ -72,7 +72,7 @@ pub(in crate::storage) fn compute_offsets_into(
     // region sizes. A `u32` store silently truncated the per-region offset, so
     // `region_at` aliased an earlier region — silent corruption. Not a wire
     // change: the WAL/exchange encoding serializes region *sizes* and recomputes
-    // offsets via this fn on receive, so offsets never cross a process boundary.
+    // offsets on receive, so offsets never cross a process boundary.
     let mut off = 0usize;
     for i in 0..num_regions {
         off = align8(off);
@@ -467,7 +467,7 @@ impl Batch {
     /// per payload column. Also the blob region's index in the wire/shard
     /// layout, which has no slot in either array.
     #[inline(always)]
-    pub(super) fn num_regions(&self) -> usize {
+    pub(super) fn arena_regions(&self) -> usize {
         REG_PAYLOAD_START + self.num_payload_cols()
     }
     /// Byte width of the PK region (8 for U64 PK, 16 for U128/wide-narrow,
@@ -629,7 +629,7 @@ impl Batch {
         if self.count + n <= self.capacity {
             return;
         }
-        let nr = self.num_regions();
+        let nr = self.arena_regions();
         let new_cap = (self.capacity * 2).max(8).max(self.count + n);
         let mut new_offsets = [0usize; MAX_BATCH_REGIONS];
         let new_total = compute_offsets_into(&self.strides, nr, new_cap, &mut new_offsets);
@@ -1102,7 +1102,7 @@ impl Batch {
             return;
         }
         let (lo, hi) = (a.min(b), a.max(b));
-        for r in 0..self.num_regions() {
+        for r in 0..self.arena_regions() {
             let stride = self.strides[r] as usize;
             let (head, tail) = self.region_at_mut(r).split_at_mut(hi * stride);
             head[lo * stride..(lo + 1) * stride].swap_with_slice(&mut tail[..stride]);
@@ -1202,7 +1202,7 @@ impl Batch {
     /// unused capacity and inter-region padding, so a caller sizing a RAM budget
     /// against it is measuring rows held, not bytes allocated.
     pub(crate) fn total_bytes(&self) -> usize {
-        let nr = self.num_regions();
+        let nr = self.arena_regions();
         let mut total = self.blob.len();
         for i in 0..nr {
             total += self.count * self.strides[i] as usize;
@@ -1530,7 +1530,7 @@ impl Batch {
         if self.data.capacity() == 0 && self.blob.capacity() == 0 {
             return;
         }
-        let nr = self.num_regions();
+        let nr = self.arena_regions();
         self.offsets[..nr].fill(0);
         recycle_buf(std::mem::take(&mut self.data));
         recycle_buf(std::mem::take(&mut self.blob));
@@ -1553,7 +1553,7 @@ impl Batch {
         // each region — everything past `count` is already poisoned, and this
         // runs per epoch on every VM delta register.
         if cfg!(debug_assertions) {
-            let nr = self.num_regions();
+            let nr = self.arena_regions();
             for (&start, &stride) in self.offsets[..nr].iter().zip(&self.strides[..nr]) {
                 debug_poison(&mut self.data[start..start + self.count * stride as usize]);
             }
@@ -1604,7 +1604,7 @@ impl Batch {
 
     /// Per-row byte stride of every fixed region, in region order.
     pub(super) fn strides(&self) -> &[u8] {
-        &self.strides[..self.num_regions()]
+        &self.strides[..self.arena_regions()]
     }
 
     /// Append `source[row]` under a raw-OPK-bytes key, with blob deduplication.
@@ -1855,8 +1855,7 @@ impl RowSource for Batch {
 /// Allocate a single contiguous arena, run a merge/copy operation via
 /// DirectWriter, and return the arena as a Batch — zero copy-out.
 ///
-/// In steady state the arena is recycled from the thread-local buffer pool,
-/// so this path allocates nothing.
+/// In steady state the arena is recycled from the thread-local buffer pool.
 ///
 /// The arena is **uninitialized** ([`Batch::with_capacity`]'s contract): every
 /// [`merge::DirectWriter`] entry point writes each live byte of each row it

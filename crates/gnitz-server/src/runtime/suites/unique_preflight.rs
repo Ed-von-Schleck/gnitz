@@ -10,7 +10,9 @@
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::wire::{self, unique_preflight_wire_schema};
-use crate::runtime::worker::{preflight_frame_overhead, preflight_keys_per_frame, send_unique_preflight_keys};
+use crate::runtime::worker::{
+    preflight_frame_overhead, preflight_keys_per_frame, preflight_per_key, send_unique_preflight_keys,
+};
 use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::make_index_schema;
@@ -50,14 +52,7 @@ fn u128_frame_schema() -> SchemaDescriptor {
 /// worth of data. Written through the production accounting, so a test cannot
 /// pin a per-frame key count the emitter would not itself choose.
 fn budget_for(frame_schema: &SchemaDescriptor, n: usize) -> usize {
-    preflight_frame_overhead(frame_schema) + n * per_key(frame_schema)
-}
-
-/// The data block's growth for one key — what `preflight_keys_per_frame`
-/// divides the row budget by.
-fn per_key(frame_schema: &SchemaDescriptor) -> usize {
-    gnitz_store::storage::wire_block_size(frame_schema, 1, 0)
-        - gnitz_store::storage::wire_block_size(frame_schema, 0, 0)
+    preflight_frame_overhead(frame_schema) + n * preflight_per_key(frame_schema)
 }
 
 /// Build the real sorted-span producer over pre-sorted `keys` via
@@ -216,7 +211,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
 fn preflight_frames_are_cut_by_the_byte_budget() {
     let frame_schema = u128_frame_schema();
     // 16 B span + 8 B weight + 8 B null word per key.
-    assert_eq!(per_key(&frame_schema), 32);
+    assert_eq!(preflight_per_key(&frame_schema), 32);
     let overhead = preflight_frame_overhead(&frame_schema);
     let budget = overhead + 8 * 32;
     assert_eq!(

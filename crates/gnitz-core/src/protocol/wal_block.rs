@@ -65,8 +65,10 @@ pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatc
 /// closes the session on a `step` error, and `Session::close` resets the
 /// accumulator, so no torn batch is read back.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
-    let (header, regions) = gnitz_wire::wal::validate_and_parse(data, false)?;
-    decode_regions_into(sink, &regions, header.entry_count as usize, schema)
+    let mut regions = gnitz_wire::region::Regions::new();
+    let count = gnitz_wire::wal::validate_and_parse(data, &mut regions)
+        .map_err(|e| ProtocolError::DecodeError(format!("WAL {e}")))?;
+    decode_regions_into(sink, &regions, count as usize, schema)
 }
 
 /// `sink` is a well-formed batch of `schema`, and so can be appended to.
@@ -86,7 +88,7 @@ pub fn decode_regions_into(
 ) -> Result<(), ProtocolError> {
     // Client's half of the split: schema conformance.
     let num_regions = regions.len();
-    let expected_num_regions = gnitz_wire::wal::num_regions(schema.num_payload_cols());
+    let expected_num_regions = gnitz_wire::region::num_regions(schema.num_payload_cols());
     if num_regions != expected_num_regions {
         return Err(ProtocolError::DecodeError(format!(
             "WAL block num_regions mismatch: expected {expected_num_regions}, got {num_regions}"

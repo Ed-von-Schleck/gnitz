@@ -1,11 +1,18 @@
 use super::*;
 use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::test_support::payload_of;
-use gnitz_wire::WAL_OFF_VERSION;
+use gnitz_wire::wal::{body_start, dir_entry_offset, WAL_OFF_NUM_REGIONS, WAL_OFF_VERSION};
 
-/// Return the `(offset, size)` of a region from a block's directory.
+/// Region `region_idx`'s `(offset, size)`, walking the size-only directory the
+/// way the parser does.
 fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
-    gnitz_wire::wal::dir_entry(block, region_idx)
+    let n = gnitz_wire::read_u32_le(block, WAL_OFF_NUM_REGIONS) as usize;
+    let size = |r: usize| gnitz_wire::read_u32_le(block, dir_entry_offset(r)) as usize;
+    assert!(region_idx < n, "region {region_idx} is not in the directory");
+    (
+        body_start(n) + (0..region_idx).map(size).sum::<usize>(),
+        size(region_idx),
+    )
 }
 
 fn u64_schema() -> Schema {
@@ -601,7 +608,8 @@ fn decoding_regions_equals_decoding_the_framed_block() {
     b.payload[0].bytes = german_col(&vals, &mut blob);
     b.blob = blob;
 
-    let regions = b.regions();
+    let mut regions = gnitz_wire::region::Regions::new();
+    b.regions(&mut regions);
     let mut local = ZSetBatch::new(&schema);
     decode_regions_into(&mut local, &regions, b.len(), &schema).unwrap();
     let (remote, _) = decode_wal_block(&encode_wal_block(9, &b), &schema).unwrap();

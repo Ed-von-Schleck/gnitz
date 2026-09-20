@@ -52,7 +52,8 @@ fn reply_batch(batch: &Batch, desc: &SchemaDescriptor, schema: &Schema) -> Resul
         schema.num_columns(),
         "a local reply must be produced under the schema it is decoded against",
     );
-    let regions = batch.wire_regions();
+    let mut regions = gnitz_wire::region::Regions::new();
+    batch.wire_regions(&mut regions);
     let mut rows = ZSetBatch::new(schema);
     decode_regions_into(&mut rows, &regions, batch.len(), schema).map_err(|e| MirrorError::Engine(e.to_string()))?;
     Ok(rows)

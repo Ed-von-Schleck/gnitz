@@ -61,17 +61,17 @@ pub const HELLO_ACK_PAYLOAD_LEN: u32 = 16;
 /// Total wire size of an ACK frame (length prefix + payload).
 pub(crate) const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
 
-/// HELLO payload fields; bytes `[6..8)` are reserved padding.
+/// HELLO payload fields.
 const HELLO_OFF_MAGIC: usize = 0;
 const HELLO_OFF_VERSION: usize = 4;
 
 /// Build a HELLO payload (the bytes after the length prefix). Every sender
 /// frames it through its transport's standard framed send, which derives
 /// the identical 4-byte prefix.
-pub fn encode_hello_payload(version: u16) -> [u8; HELLO_PAYLOAD_LEN as usize] {
+pub fn encode_hello_payload(version: u32) -> [u8; HELLO_PAYLOAD_LEN as usize] {
     let mut out = [0u8; HELLO_PAYLOAD_LEN as usize];
     crate::write_u32_le(&mut out, HELLO_OFF_MAGIC, HELLO_MAGIC);
-    crate::write_u16_le(&mut out, HELLO_OFF_VERSION, version);
+    crate::write_u32_le(&mut out, HELLO_OFF_VERSION, version);
     out
 }
 
@@ -79,7 +79,7 @@ pub fn encode_hello_payload(version: u16) -> [u8; HELLO_PAYLOAD_LEN as usize] {
 #[derive(Debug, Clone, Copy)]
 pub struct HelloHeader {
     pub magic: u32,
-    pub version: u16,
+    pub version: u32,
 }
 
 /// Decode a HELLO payload. The caller must have already consumed the
@@ -90,7 +90,7 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str>
     }
     Ok(HelloHeader {
         magic: crate::read_u32_le(payload, HELLO_OFF_MAGIC),
-        version: crate::read_u16_le(payload, HELLO_OFF_VERSION),
+        version: crate::read_u32_le(payload, HELLO_OFF_VERSION),
     })
 }
 

@@ -17,39 +17,12 @@ fn checksum_matches_c_xxh3_64bits() {
     );
 }
 
-/// The null-bitmap convention, pinned where it is now defined: setting and
-/// clearing bit `pi` must leave every other payload slot untouched.
 #[test]
 fn as_le_bytes_mut_writes_through_to_the_typed_slice() {
     let mut words = [0u64; 2];
     as_le_bytes_mut(&mut words)[8..16].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
     assert_eq!(words, [0, 0x0102_0304_0506_0708]);
     assert_eq!(&as_le_bytes(&words)[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
-}
-
-#[test]
-fn null_word_get_set_roundtrip() {
-    let mut w = 0u64;
-    assert!(!null_word_get(w, 3));
-    null_word_set(&mut w, 3, true);
-    assert!(null_word_get(w, 3));
-    assert_eq!(w, 0b1000);
-    // Clearing leaves the other bits untouched.
-    null_word_set(&mut w, 5, true);
-    null_word_set(&mut w, 3, false);
-    assert!(!null_word_get(w, 3));
-    assert!(null_word_get(w, 5));
-    assert_eq!(w, 0b100000);
-}
-
-/// `npc == 64` is the row-major cap, where the naive `(1 << npc) - 1` would
-/// shift by the word width.
-#[test]
-fn all_payload_null_mask_covers_the_full_word() {
-    assert_eq!(all_payload_null_mask(0), 0);
-    assert_eq!(all_payload_null_mask(1), 0b1);
-    assert_eq!(all_payload_null_mask(63), u64::MAX >> 1);
-    assert_eq!(all_payload_null_mask(64), u64::MAX);
 }
 
 /// `BitIter` yields lowest-first and stops at the empty mask — including for
@@ -60,15 +33,6 @@ fn bit_iter_yields_set_bits_lowest_first() {
     assert_eq!(BitIter(0b1011).collect::<Vec<_>>(), vec![0, 1, 3]);
     assert_eq!(BitIter(1u64 << 63).collect::<Vec<_>>(), vec![63]);
     assert_eq!(BitIter(low_bits_mask(64)).count(), 64);
-}
-
-/// `left_npc == 64` is the row-major cap, where the naive
-/// `left | (right << left_npc)` would shift by the word width. It is
-/// reachable only with an empty right side, so dropping the shift is exact.
-#[test]
-fn merge_null_words_at_the_full_left_width() {
-    assert_eq!(merge_null_words(0b1011, 0, 64), 0b1011);
-    assert_eq!(merge_null_words(u64::MAX, 0, 64), u64::MAX);
 }
 
 #[test]

@@ -702,8 +702,7 @@ fn the_blob_layout_is_pinned_to_its_version_word() {
     assert_eq!(
         (prog.to_blob_bytes(), gnitz_wire::EXPR_BLOB_VERSION),
         (want, 5),
-        "the expr-blob layout changed: bump EXPR_BLOB_VERSION (and WAL_FORMAT_VERSION, \
-         as its own pin then instructs) before pasting the bytes reported here"
+        "the expr-blob layout changed: bump EXPR_BLOB_VERSION before pasting the bytes reported here"
     );
 }
 

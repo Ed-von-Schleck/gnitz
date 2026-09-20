@@ -317,7 +317,7 @@ fn the_region_list_rejects_a_region_whose_length_contradicts_its_type() {
     // The region list's own guard, for a batch that never went through
     // `ZSetBatch::validate` — which states the same rule for the push path.
     batch.payload[2].bytes.truncate(16);
-    let _ = batch.regions();
+    batch.regions(&mut gnitz_wire::region::Regions::new());
 }
 
 // ── The encode path shares the builder ───────────────────────────────────

@@ -11,9 +11,9 @@ const REGION: &[u8] = &[7u8; 24];
 
 /// A minimal WAL block carrying `tid`, as the frame encoders take it.
 fn wal_block(tid: u32) -> WalBlock<'static> {
-    let mut regions = wal::Regions::new();
-    regions.push(REGION);
-    WalBlock { table_id: tid, entry_count: 1, regions }
+    let mut b = WalBlock::new(tid, 1);
+    b.regions.push(REGION);
+    b
 }
 
 /// The same block already framed — what a decode must hand back, and what a

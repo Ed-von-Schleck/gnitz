@@ -2,10 +2,8 @@
 //! which views, under which schema, at which feed position, for which checkpoint
 //! generation.
 //!
-//! A file holding one Z-set batch in the engine's wire codec, which checks the
-//! version, every region extent and an XXH3-64 over the body on the way back
-//! in. Only the generation word ahead of it carries no redundancy, and a
-//! flipped generation can never equal the manifests'.
+//! A file holding one Z-set batch in the engine's wire codec, behind a header
+//! carrying the generation and a digest over every other byte of the file.
 //!
 //! **The header carries the generation the records were written for, and a
 //! reopen acts on them only at that generation.** Written after the copies are
@@ -21,7 +19,7 @@ use gnitz_core::{DeltaCursor, MirrorError};
 use gnitz_expr::{payload_bytes, payload_is_null, payload_string, payload_u64};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder};
-use gnitz_wire::{read_u64_le, type_code};
+use gnitz_wire::{read_u64_le, type_code, write_u64_le};
 
 /// `<base_dir>/mirror_state` — the file this module owns.
 const STATE_FILENAME: &str = "mirror_state";
@@ -45,8 +43,15 @@ const TICK: usize = 1;
 const SCHEMA_NAME: usize = 2;
 const NAME: usize = 3;
 const BLOCK: usize = 4;
-/// `generation u64 LE ‖ checksummed wire block of STATE_SCHEMA rows`.
-const HEADER_LEN: usize = 8;
+/// `generation u64 LE ‖ digest u64 LE ‖ wire block of STATE_SCHEMA rows`.
+const OFF_GENERATION: usize = 0;
+const OFF_DIGEST: usize = 8;
+const HEADER_LEN: usize = 16;
+
+/// The file's own digest, over everything but the eight bytes holding it.
+fn digest_of(bytes: &[u8]) -> u64 {
+    gnitz_wire::digest_with_hole(&[], bytes, OFF_DIGEST)
+}
 
 /// What one mirrored relation's registration fixed, kept so a checkpoint can
 /// rewrite the file for a relation this session never re-mirrored — for which
@@ -73,17 +78,18 @@ pub(crate) struct PersistedState {
 /// Read the state file: the state, and the body bytes it was decoded from. A
 /// checkpoint compares its own encoding against those bytes.
 ///
-/// `None` on any of: an absent file, a short one, a block the codec refuses —
-/// a version, extent or checksum mismatch — or bytes past the block's end. The
-/// caller then resumes nothing and reclaims the whole copies tree —
-/// conservative in the one direction that is never wrong.
+/// `None` for any damage at all: the caller then resumes nothing and reclaims
+/// the whole copies tree — conservative in the one direction that is never wrong.
 pub(crate) fn read_state(base_dir: &str) -> Option<(PersistedState, Vec<u8>)> {
     let bytes = std::fs::read(path(base_dir)).ok()?;
+    if bytes.len() < HEADER_LEN || digest_of(&bytes) != read_u64_le(&bytes, OFF_DIGEST) {
+        return None;
+    }
     let block = gnitz_wire::wal::block_slice_at(&bytes, HEADER_LEN).ok()?;
     if HEADER_LEN + block.len() != bytes.len() {
         return None;
     }
-    let batch = Batch::decode_from_wal_block(block, &STATE_SCHEMA, true).ok()?;
+    let batch = Batch::decode_from_wal_block(block, &STATE_SCHEMA).ok()?;
     let mut records = HashMap::with_capacity(batch.len());
     for row in 0..batch.len() {
         let cursor = (!payload_is_null(&batch, row, TAG)).then(|| DeltaCursor {
@@ -101,7 +107,7 @@ pub(crate) fn read_state(base_dir: &str) -> Option<(PersistedState, Vec<u8>)> {
         );
     }
     let state = PersistedState {
-        generation: read_u64_le(&bytes, 0),
+        generation: read_u64_le(&bytes, OFF_GENERATION),
         records,
     };
     // The remainder, by the length check above.
@@ -109,8 +115,8 @@ pub(crate) fn read_state(base_dir: &str) -> Option<(PersistedState, Vec<u8>)> {
 }
 
 /// The records as the file's body: one [`STATE_SCHEMA`] row per relation, as a
-/// checksummed wire block. **Tid-sorted**, so the bytes are a function of the
-/// content alone and a checkpoint can decide by comparing them.
+/// wire block. **Tid-sorted**, so the bytes are a function of the content alone
+/// and a checkpoint can decide by comparing them.
 pub(crate) fn encode_records(records: &HashMap<u64, MirrorRecord>) -> Vec<u8> {
     let mut ids: Vec<u64> = records.keys().copied().collect();
     ids.sort_unstable();
@@ -133,16 +139,23 @@ pub(crate) fn encode_records(records: &HashMap<u64, MirrorRecord>) -> Vec<u8> {
         bb.put_blob(&r.block);
         bb.end_row();
     }
-    bb.finish().encode_to_wire_vec(0, true)
+    bb.finish().encode_to_wire_vec(0)
 }
 
-/// Replace the state file atomically. `block` is [`encode_records`]'s output,
-/// written as a second part rather than concatenated onto the header.
+/// Replace the state file atomically: [`encode_records`]'s output behind a
+/// header the digest is stamped into last.
 ///
 /// Staged through the storage layer so an uncommitted `.tmp` is unlinked: this
 /// file sits at `base_dir`, which no sweep walks.
 pub(crate) fn write_state(base_dir: &str, generation: u64, block: &[u8]) -> Result<(), MirrorError> {
-    gnitz_store::storage::publish_file_sync(base_dir, STATE_FILENAME, &[&generation.to_le_bytes(), block])
+    let mut bytes = Vec::with_capacity(HEADER_LEN + block.len());
+    bytes.extend_from_slice(&[0u8; HEADER_LEN]);
+    bytes.extend_from_slice(block);
+    write_u64_le(&mut bytes, OFF_GENERATION, generation);
+    let digest = digest_of(&bytes);
+    write_u64_le(&mut bytes, OFF_DIGEST, digest);
+
+    gnitz_store::storage::publish_file_sync(base_dir, STATE_FILENAME, &[&bytes])
         .map_err(|e| MirrorError::Engine(format!("mirror state file: {e}")))
 }
 

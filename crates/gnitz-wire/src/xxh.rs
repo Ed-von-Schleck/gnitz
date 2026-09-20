@@ -1,6 +1,6 @@
 //! XXH3 hashing — the one owner in the workspace.
 //!
-//! Both ends compute some of these (the WAL body checksum, the global group
+//! Both ends compute some of these (the wide-PK routing hash, the global group
 //! key) and the engine alone computes the rest (shard and manifest header
 //! digests, row and group identity). They live together because a second XXH3
 //! definition elsewhere could drift from this one with nothing to catch it:
@@ -9,8 +9,8 @@
 
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64, Xxh3Default};
 
-/// XXH3-64 over `b` — the WAL body checksum, the wide-PK routing hash, and the
-/// engine's shard-region and filter checksums.
+/// XXH3-64 over `b` — the wide-PK routing hash, and the engine's shard-region
+/// and filter checksums.
 #[inline]
 pub fn checksum(b: &[u8]) -> u64 {
     xxh3_64(b)

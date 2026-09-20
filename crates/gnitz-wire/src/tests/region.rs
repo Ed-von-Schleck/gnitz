@@ -1,0 +1,60 @@
+use super::*;
+
+#[test]
+fn num_regions_counts_the_fixed_three_the_payload_and_the_heap() {
+    assert_eq!(num_regions(0), REG_PAYLOAD_START + 1);
+    assert_eq!(num_regions(2), REG_PAYLOAD_START + 3);
+    assert_eq!(MAX_WIRE_REGIONS, num_regions(crate::MAX_COLUMNS));
+}
+
+/// A filled list reads back as the slice it was pushed from, and `clear` makes
+/// it reusable: an out-param filler would otherwise append behind the last fill.
+#[test]
+fn a_region_list_fills_reads_back_and_clears() {
+    let (a, b) = ([1u8, 2, 3], [4u8; 8]);
+    let mut regions = Regions::new();
+    assert!(regions.is_empty());
+
+    regions.push(&a);
+    regions.push(&b);
+    assert_eq!(&*regions, &[&a[..], &b[..]]);
+
+    regions.clear();
+    assert!(regions.is_empty());
+    regions.push(&b);
+    assert_eq!(&*regions, &[&b[..]]);
+}
+
+#[test]
+fn null_word_get_set_roundtrip() {
+    let mut w = 0u64;
+    assert!(!null_word_get(w, 3));
+    null_word_set(&mut w, 3, true);
+    assert!(null_word_get(w, 3));
+    assert_eq!(w, 0b1000);
+    // Clearing leaves the other bits untouched.
+    null_word_set(&mut w, 5, true);
+    null_word_set(&mut w, 3, false);
+    assert!(!null_word_get(w, 3));
+    assert!(null_word_get(w, 5));
+    assert_eq!(w, 0b100000);
+}
+
+/// `npc == 64` is the row-major cap, where the naive `(1 << npc) - 1` would
+/// shift by the word width.
+#[test]
+fn all_payload_null_mask_covers_the_full_word() {
+    assert_eq!(all_payload_null_mask(0), 0);
+    assert_eq!(all_payload_null_mask(1), 0b1);
+    assert_eq!(all_payload_null_mask(63), u64::MAX >> 1);
+    assert_eq!(all_payload_null_mask(64), u64::MAX);
+}
+
+/// `left_npc == 64` is the row-major cap, where the naive
+/// `left | (right << left_npc)` would shift by the word width. It is
+/// reachable only with an empty right side, so dropping the shift is exact.
+#[test]
+fn merge_null_words_at_the_full_left_width() {
+    assert_eq!(merge_null_words(0b1011, 0, 64), 0b1011);
+    assert_eq!(merge_null_words(u64::MAX, 0, 64), u64::MAX);
+}

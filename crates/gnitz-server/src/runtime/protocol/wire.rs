@@ -210,7 +210,7 @@ impl<'a> WireMsg<'a> {
             let tid = self.target_id as u32;
             pos += match self.data {
                 WireData::None => unreachable!("has_data implies a batch"),
-                WireData::Whole(b) => b.encode_to_wire(tid, out, pos, false),
+                WireData::Whole(b) => b.encode_to_wire(tid, out, pos),
                 WireData::Range { batch, start, rows } => batch.encode_range_to_wire(start, rows, tid, out, pos),
                 WireData::Scattered { batch, indices } => batch.encode_scattered_to_wire(indices, tid, out, pos),
             };
@@ -276,15 +276,13 @@ pub fn decode_client_frame(
     control: DecodedControl,
     hint: Option<&SchemaDescriptor>,
 ) -> Result<DecodedWire, String> {
-    let (schema, data_batch) = decode_frame(data, &control, hint, |b, s| Batch::decode_foreign_wal_block(b, s, s))?;
-    Ok(DecodedWire { control, schema, data_batch })
+    decode_frame(data, control, hint, |b, s| Batch::decode_foreign_wal_block(b, s, s))
 }
 
 /// Decode one SAL slot.
 pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
-    let (schema, data_batch) = decode_frame(data, &control, None, |b, s| Batch::decode_from_wal_block(b, s, false))?;
-    let mut decoded = DecodedWire { control, schema, data_batch };
+    let mut decoded = decode_frame(data, control, None, Batch::decode_from_wal_block)?;
     certify_engine_frame(&mut decoded);
     Ok(decoded)
 }
@@ -294,14 +292,13 @@ pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, String> {
 /// is where it is compacted.
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
-    let (schema, data_batch) = decode_frame(data, &control, None, |block, schema| {
+    let mut decoded = decode_frame(data, control, None, |block, schema| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, false, &mut offsets)?;
+        let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
         let mut owned = Batch::with_capacity(schema, mb.len());
         owned.append_mem_batch(&mb);
         Ok(owned)
     })?;
-    let mut decoded = DecodedWire { control, schema, data_batch };
     certify_engine_frame(&mut decoded);
     Ok(decoded)
 }
@@ -314,13 +311,16 @@ pub(crate) fn decode_train_frame<'a>(
     expected: &SchemaDescriptor,
     offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<Option<MemBatch<'a>>, String> {
-    let (block_schema, batch) = decode_frame(data, control, Some(expected), move |block, schema| {
-        gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, false, offsets)
-    })?;
+    let mut block_schema = None;
+    let data_block = decode_schema_into(data, control, &mut block_schema)?;
     if let Some(s) = &block_schema {
         validate_schema_match(s, expected)?;
     }
-    Ok(batch)
+    let Some(r) = data_block else { return Ok(None) };
+    let schema = block_schema.as_ref().unwrap_or(expected);
+    let mb =
+        gnitz_store::storage::decode_mem_batch_from_wal_block(&data[r], schema, offsets).map_err(str::to_string)?;
+    Ok(Some(mb))
 }
 
 /// Install an engine-authored frame's layout claim: its `batch_consolidated`
@@ -340,27 +340,38 @@ fn certify_engine_frame(decoded: &mut DecodedWire) {
     }
 }
 
-/// A frame's own schema, and its data decoded through `decode` against that
-/// schema or else `hint`.
-fn decode_frame<'a, B>(
-    data: &'a [u8],
+/// Decode a frame's own schema block into `out`, and hand back the extent of
+/// its data block.
+fn decode_schema_into(
+    data: &[u8],
     control: &DecodedControl,
+    out: &mut Option<SchemaDescriptor>,
+) -> Result<Option<std::ops::Range<usize>>, String> {
+    if let Some(r) = &control.schema {
+        *out = Some(decode_schema_block(&data[r.clone()])?);
+    }
+    Ok(control.data.clone())
+}
+
+/// A frame decoded into its `DecodedWire`, every field built in the slot it
+/// stays in rather than assembled from a returned tuple.
+fn decode_frame(
+    data: &[u8],
+    control: DecodedControl,
     hint: Option<&SchemaDescriptor>,
-    decode: impl FnOnce(&'a [u8], &SchemaDescriptor) -> Result<B, &'static str>,
-) -> Result<(Option<SchemaDescriptor>, Option<B>), String> {
-    let block_schema = match &control.schema {
-        Some(r) => Some(decode_schema_block(&data[r.clone()])?),
-        None => None,
-    };
-    let Some(r) = control.data.clone() else {
-        return Ok((block_schema, None));
-    };
+    decode: impl FnOnce(&[u8], &SchemaDescriptor) -> Result<Batch, &'static str>,
+) -> Result<DecodedWire, String> {
+    let mut out = DecodedWire { control, schema: None, data_batch: None };
+    let data_block = decode_schema_into(data, &out.control, &mut out.schema)?;
+    let Some(r) = data_block else { return Ok(out) };
+
+    let (block_schema, batch) = (&out.schema, &mut out.data_batch);
     let schema = block_schema
         .as_ref()
         .or(hint)
         .ok_or("a data block without a schema block")?;
-    let batch = decode(&data[r], schema).map_err(str::to_string)?;
-    Ok((block_schema, Some(batch)))
+    *batch = Some(decode(&data[r], schema).map_err(str::to_string)?);
+    Ok(out)
 }
 
 #[cfg(test)]

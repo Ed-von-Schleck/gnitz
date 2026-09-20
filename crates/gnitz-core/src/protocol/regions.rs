@@ -5,33 +5,31 @@
 
 use super::types::ZSetBatch;
 use gnitz_wire::as_le_bytes;
-use gnitz_wire::wal::{Regions, WalBlock};
+use gnitz_wire::region::Regions;
+use gnitz_wire::wal::WalBlock;
 
 impl ZSetBatch {
     /// This batch as the §6 canonical region list. Panics unless every payload
     /// region is the length its type and the row count imply — the rule
     /// `ZSetBatch::validate` applies on the push path.
-    pub(crate) fn regions(&self) -> Regions<'_> {
+    pub(crate) fn regions<'s>(&'s self, out: &mut Regions<'s>) {
         self.check_columns()
             .expect("ZSetBatch payload regions match their types");
-        let mut regions = Regions::new();
-        regions.push(self.pks.region());
-        regions.push(as_le_bytes(&self.weights));
-        regions.push(as_le_bytes(&self.nulls));
+        out.clear();
+        out.push(self.pks.region());
+        out.push(as_le_bytes(&self.weights));
+        out.push(as_le_bytes(&self.nulls));
         for c in &self.payload {
-            regions.push(&c.bytes);
+            out.push(&c.bytes);
         }
-        regions.push(&self.blob); // the blob arena is always the last region
-        regions
+        out.push(&self.blob); // the blob arena is always the last region
     }
 
     /// This batch as the WAL block that frames it under `table_id`.
     pub(crate) fn wal_block(&self, table_id: u64) -> WalBlock<'_> {
-        WalBlock {
-            table_id: table_id as u32,
-            entry_count: self.len() as u32,
-            regions: self.regions(),
-        }
+        let mut block = WalBlock::new(table_id as u32, self.len() as u32);
+        self.regions(&mut block.regions);
+        block
     }
 }
 

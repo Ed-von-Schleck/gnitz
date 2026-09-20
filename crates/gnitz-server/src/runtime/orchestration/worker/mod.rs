@@ -218,7 +218,7 @@ use reply::PendingScan;
 /// `runtime::suites::unique_preflight` — production goes through
 /// `send_unique_preflight_keys`, which applies both itself.
 #[cfg(test)]
-pub(crate) use reply::{preflight_frame_overhead, preflight_keys_per_frame};
+pub(crate) use reply::{preflight_frame_overhead, preflight_keys_per_frame, preflight_per_key};
 
 /// `GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR`: fail the pre-flight on every worker so
 /// tests can assert the master surfaces the fault, drains the fan-out, and

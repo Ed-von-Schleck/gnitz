@@ -526,7 +526,7 @@ fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> bool {
         return false;
     }
 
-    let server_version = gnitz_wire::WAL_FORMAT_VERSION as u16;
+    let server_version = gnitz_wire::WAL_FORMAT_VERSION;
     if hello.version != server_version {
         let msg = format!(
             "unsupported wire version: peer={}, server={}",

@@ -63,7 +63,7 @@ pub use scatter::{reset_slots, route_rows_by_pk};
 // ── Operator hot-path types ──────────────────────────────────────────────────
 pub use batch::Layout;
 pub use batch_builder::BatchBuilder;
-pub use batch_wire::wire_block_size;
+pub use batch_wire::schema_block_terms;
 pub use batch_wire::WireChunk;
 // `ColumnarSource` stays inside storage: everything out of it reads rows
 // through `gnitz_expr::RowSource`.

@@ -260,7 +260,7 @@ fn unix_and_tls_clients_share_a_table() {
 fn wire_version_mismatch_hello_gets_status_error() {
     let srv = ServerHandle::start_tls(1);
     let mut t = ClientTransport::connect(&srv.tls_target(), None).unwrap();
-    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
+    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION.wrapping_add(1));
     t.send_frame(payload.to_vec(), None).unwrap();
     let buf = t.recv_framed(None).unwrap();
     let ctrl = peek_control_block(&buf).unwrap();
@@ -344,7 +344,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
             let ctrl = peek_control_block(&buf).unwrap();
             assert_eq!(ctrl.hdr.status, WireStatus::Ok, "scan frame must be OK");
             if let Some(r) = ctrl.data {
-                rows += gnitz_wire::read_u32_le(&buf[r], gnitz_wire::WAL_OFF_COUNT) as usize;
+                rows += gnitz_wire::read_u32_le(&buf[r], gnitz_wire::wal::WAL_OFF_COUNT) as usize;
             }
             if !ctrl.hdr.flags.continuation {
                 break;

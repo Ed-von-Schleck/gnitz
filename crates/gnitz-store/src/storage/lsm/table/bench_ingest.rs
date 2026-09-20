@@ -58,7 +58,7 @@ fn delta_ingest_bench() {
         let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(k);
         for j in 0..k {
             let b = make_delta(&schema, (j * n) as u64, n);
-            blocks.push(b.encode_to_wire_vec(7, false));
+            blocks.push(b.encode_to_wire_vec(7));
         }
         let wire_bytes: usize = blocks.iter().map(Vec::len).sum();
 
@@ -66,7 +66,7 @@ fn delta_ingest_bench() {
         let t0 = Instant::now();
         let mut batches: Vec<Batch> = Vec::with_capacity(k);
         for blk in &blocks {
-            let b = Batch::decode_from_wal_block(blk, &schema, false).unwrap();
+            let b = Batch::decode_from_wal_block(blk, &schema).unwrap();
             batches.push(b);
         }
         let decode_ns = t0.elapsed().as_nanos() as f64;

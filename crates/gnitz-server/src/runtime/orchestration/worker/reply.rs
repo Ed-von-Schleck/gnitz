@@ -220,7 +220,13 @@ fn oversized_reply(sz: usize) -> gnitz_wire::WireFault {
 /// before it is divided into keys, or the frame runs over.
 pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor) -> usize {
     let framing = reply_frame(ReplyRoute::default(), None, 0, true).size();
-    framing + gnitz_store::storage::wire_block_size(frame_schema, 0, 0)
+    framing + gnitz_store::storage::schema_block_terms(frame_schema).0
+}
+
+/// The data block's growth for one key — the per-row term of the affine size
+/// [`preflight_keys_per_frame`] divides the row budget by.
+pub(crate) fn preflight_per_key(frame_schema: &SchemaDescriptor) -> usize {
+    gnitz_store::storage::schema_block_terms(frame_schema).1
 }
 
 /// Keys one pre-flight frame may carry: [`unique_preflight_keys_per_frame`]
@@ -228,11 +234,10 @@ pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor) -> usize
 /// Unclamped, that test-only override builds a frame the W2M ring cannot hold,
 /// which `w2m::try_reserve` asserts against and which aborts in release.
 ///
-/// A block's size is affine in its row count, so charging every key the same
-/// width is exact; `send_unique_preflight_keys` asserts the frame it builds.
+/// Charging every key the same width is exact, since a block's size is affine
+/// in its row count; `send_unique_preflight_keys` asserts the frame it builds.
 pub(crate) fn preflight_keys_per_frame(frame_schema: &SchemaDescriptor, budget: usize, overhead: usize) -> usize {
-    let per_key = gnitz_store::storage::wire_block_size(frame_schema, 1, 0)
-        - gnitz_store::storage::wire_block_size(frame_schema, 0, 0);
+    let per_key = preflight_per_key(frame_schema);
     unique_preflight_keys_per_frame()
         .min(budget.saturating_sub(overhead) / per_key.max(1))
         .max(1)

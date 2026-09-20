@@ -1,6 +1,7 @@
 //! The little-endian byte cursor pair every variable-length codec encodes and
 //! decodes through — this crate's, and the `gnitz-expr` program blob it carries
-//! opaquely. [`Writer`] appends, [`Reader`] consumes, and the two are field-for-field
+//! opaquely. `wal` is the exception: it frames in place, so a scatter can fill
+//! the region slices it hands back. [`Writer`] appends, [`Reader`] consumes, and the two are field-for-field
 //! inverses — a format is written and parsed against one shared definition of
 //! what each width means, so no codec hand-rolls its own offset arithmetic or
 //! `to_le_bytes` chain.

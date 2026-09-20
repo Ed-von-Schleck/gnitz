@@ -135,7 +135,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         None
     };
     let data_block = if word & FLAG_HAS_DATA != 0 {
-        let len = crate::wal::block_slice_at(data, off).map_err(|e| e.as_str())?.len();
+        let len = crate::wal::block_slice_at(data, off)?.len();
         Some(off..off + len)
     } else {
         None

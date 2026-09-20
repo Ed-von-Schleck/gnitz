@@ -1,15 +1,13 @@
 use super::*;
 
 /// The HELLO payload's byte layout and its decode are one contract: magic at
-/// 0..4, version at 4..6, reserved zero padding at 6..8, and nothing else is a
-/// HELLO.
+/// 0..4, version at 4..8, and nothing else is a HELLO.
 #[test]
 fn hello_payload_layout_and_decode() {
     let payload = encode_hello_payload(0x1234);
     assert_eq!(payload.len(), HELLO_PAYLOAD_LEN as usize);
     assert_eq!(crate::read_u32_le(&payload, 0), HELLO_MAGIC);
-    assert_eq!(crate::read_u16_le(&payload, 4), 0x1234);
-    assert_eq!(&payload[6..8], &[0, 0]);
+    assert_eq!(crate::read_u32_le(&payload, 4), 0x1234);
 
     let h = decode_hello_payload(&payload).expect("a well-formed payload");
     assert_eq!(h.magic, HELLO_MAGIC);

@@ -563,40 +563,40 @@ impl<'a> DirectWriter<'a> {
         let nr = nr as usize;
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         compute_offsets_into(&strides, nr, rows, &mut offsets);
+        Self::over_regions(data, &offsets, &strides, nr, rows, schema, blob)
+    }
 
-        // Walk regions in order, splitting off [alignment pad | region] for each;
-        // `base` is the absolute offset of `rest[0]`, so `offsets[r] - base` is
-        // the pad to discard before region `r`. The region order IS the field
-        // order — `REG_PK`, `REG_WEIGHT`, `REG_NULL_BMP`, then the payload
-        // columns — so the split below is the whole carve.
-        let mut regions: Vec<&mut [u8]> = Vec::with_capacity(nr);
+    /// One writable slice per fixed region, carved at `offsets[r]` from
+    /// `data`'s own start — so a wire block's header and directory come out as
+    /// the first region's leading pad.
+    pub(crate) fn over_regions(
+        data: &'a mut [u8],
+        offsets: &[usize],
+        strides: &[u8],
+        nr: usize,
+        rows: usize,
+        schema: &'a SchemaDescriptor,
+        blob: &'a mut Vec<u8>,
+    ) -> Self {
+        use super::batch::REG_PAYLOAD_START;
+        debug_assert!(nr >= REG_PAYLOAD_START, "a carve must cover the three fixed regions");
+
+        let mut fixed: [&mut [u8]; REG_PAYLOAD_START] = [&mut [], &mut [], &mut []];
+        let mut col_bufs: Vec<&mut [u8]> = Vec::with_capacity(nr - REG_PAYLOAD_START);
         let mut rest: &mut [u8] = data;
         let mut base = 0usize;
         for r in 0..nr {
-            let pad = offsets[r] - base;
-            let after_pad = std::mem::take(&mut rest).split_at_mut(pad).1;
+            let after_pad = std::mem::take(&mut rest).split_at_mut(offsets[r] - base).1;
             let sz = rows * strides[r] as usize;
             let (region, remainder) = after_pad.split_at_mut(sz);
-            regions.push(region);
+            match fixed.get_mut(r) {
+                Some(slot) => *slot = region,
+                None => col_bufs.push(region),
+            }
             base = offsets[r] + sz;
             rest = remainder;
         }
-        Self::over_regions(regions, schema, blob, rows)
-    }
-
-    /// Open over one already-carved writable slice per fixed region, in region
-    /// order. `hint_rows` sizes the blob dedup cache.
-    pub(crate) fn over_regions(
-        mut regions: Vec<&'a mut [u8]>,
-        schema: &'a SchemaDescriptor,
-        blob: &'a mut Vec<u8>,
-        hint_rows: usize,
-    ) -> Self {
-        use super::batch::REG_PAYLOAD_START;
-
-        let col_bufs = regions.split_off(REG_PAYLOAD_START);
-        let [pk, weight, null_bmp] = <[&mut [u8]; REG_PAYLOAD_START]>::try_from(regions)
-            .expect("a region carve always emits the three fixed regions first");
+        let [pk, weight, null_bmp] = fixed;
 
         DirectWriter {
             pk,
@@ -605,7 +605,7 @@ impl<'a> DirectWriter<'a> {
             null_bmp,
             col_bufs,
             blob,
-            blob_cache: BlobCacheGuard::acquire(schema, hint_rows),
+            blob_cache: BlobCacheGuard::acquire(schema, rows),
             count: 0,
             schema,
         }
