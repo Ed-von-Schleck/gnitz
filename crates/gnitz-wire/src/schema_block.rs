@@ -1,58 +1,28 @@
-//! The **meta-schema block** codec: the one WAL block that carries a relation's
-//! column shape across the wire — engine → client on every schema-bearing reply,
-//! client → engine on every schema-bearing push and per-family `PUSH_TXN` block.
-//!
-//! Both directions live here because the block is a contract, not a
-//! representation: each side owns a different schema type (`Schema` in the
-//! client, `SchemaDescriptor` in the engine), and neither needs to be visible to
-//! the other for the *bytes* to be defined once. The codec therefore speaks in
-//! neutral per-column facts — `(type_code, flags, name)` plus the ordered PK
-//! list — and each side builds its own type from them.
-//!
-//! The block is a normal WAL block over the [`META_SCHEMA_COLS`] shape:
-//! one row per column, keyed by `col_idx`.
+//! The **meta-schema record**: the one encoding that carries a relation's column
+//! shape across the wire — engine → client on every schema-bearing reply, client
+//! → engine on every schema-bearing push and per-family `PUSH_TXN` record.
 //!
 //! ```text
-//! region[0] pk        col_idx, u64 OPK (big-endian), 8 B/row
-//! region[1] weight    i64 LE, always 1
-//! region[2] null      u64 LE, always 0 (no column is nullable)
-//! region[3] type_code u64 LE
-//! region[4] flags     u64 LE ([`ColMeta`])
-//! region[5] name      16-byte German-string cells
-//! region[6] blob      the German-string heap
+//! u32              column_count
+//! u8               pk_count
+//! u8 × pk_count    PK column indices, in declared PK-tuple order
+//! per column:
+//!   u8             type_code
+//!   u8             flags        NULLABLE | HIDDEN | SERIAL
+//!   u8             scale
+//!   u32 + bytes    name
 //! ```
+//!
+//! The record carries no length of its own; every carrier length-prefixes it.
 
-use crate::wal;
-use crate::{
-    encode_german_string, german_string_cell_ok, german_string_content, is_pk_eligible, is_valid_type_code,
-    payload_region_in, read_u64_le, wire_stride, write_u64_le, LEADING_COL_PK, MAX_COLUMNS, MAX_PK_COLUMNS,
-    META_SCHEMA_COLS, REG_NULL_BMP, REG_PK, REG_WEIGHT,
-};
+use crate::codec::{Reader, Writer};
+use crate::{is_valid_type_code, MAX_COLUMNS, MAX_PK_COLUMNS};
 
-const REG_TYPE_CODE: usize = payload_region_in(META_SCHEMA_COLS, "type_code");
-const REG_FLAGS: usize = payload_region_in(META_SCHEMA_COLS, "flags");
-const REG_NAME: usize = payload_region_in(META_SCHEMA_COLS, "name");
+const CTX: &str = "schema record";
 
-/// Exactly how many regions a meta-schema block has: the fixed three, one per
-/// META_SCHEMA payload column, and the blob heap. A block naming any other count
-/// is not this block, so the decoder rejects it rather than reading whichever
-/// regions happen to be present.
-pub(crate) const SCHEMA_BLOCK_REGIONS: usize = wal::num_regions(META_SCHEMA_COLS.len() - 1);
-const REG_BLOB: usize = SCHEMA_BLOCK_REGIONS - 1;
-
-/// `col_idx` is a `U64` primary key, so its OPK image is 8 big-endian bytes.
-const PK_STRIDE: usize = 8;
-
-// The codec writes one 8-byte big-endian `col_idx` per row into region 0, which
-// is only the block's key if `col_idx` is the whole key and is that column.
-const _: () = {
-    assert!(LEADING_COL_PK.len() == 1 && LEADING_COL_PK[0] == 0);
-    assert!(META_SCHEMA_COLS[0].type_code as u8 == crate::type_code::U64);
-};
-
-/// One column as the block carries it. `name` borrows the block's own bytes on
+/// One column as the record carries it. `name` borrows the record's own bytes on
 /// decode; on encode it is whatever the caller has (an empty slice for the
-/// anonymous blocks that describe physical shape only).
+/// anonymous records that describe physical shape only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaBlockCol<'a> {
     pub type_code: u8,
@@ -60,8 +30,7 @@ pub struct SchemaBlockCol<'a> {
     pub name: &'a [u8],
 }
 
-/// One column's meta word as the schema block carries it. A struct for the reason
-/// `TableProps` is one: three independent booleans a positional call would swap.
+/// One column's catalog facts as the record carries them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ColMeta {
     pub nullable: bool,
@@ -73,294 +42,134 @@ pub struct ColMeta {
     pub serial: bool,
     /// A DECIMAL column's scale; 0 for every other type.
     pub scale: u8,
-    /// Position in the PK tuple, or `None` for a non-PK column. Compound-PK
-    /// schemas need it so the decoder rebuilds the declared PK order rather than
-    /// column-position order (`PRIMARY KEY (b, a)` decodes to `[b, a]`).
-    pub pk_pos: Option<u8>,
 }
 
-const NULLABLE: u64 = 1 << 0;
-const IS_PK: u64 = 1 << 1;
-const HIDDEN: u64 = 1 << 2;
-const SERIAL: u64 = 1 << 3;
-const PK_POS_SHIFT: u32 = 8;
-const SCALE_SHIFT: u32 = 16;
-const DEFINED_BITS: u64 = NULLABLE | IS_PK | HIDDEN | SERIAL | 0xFF << PK_POS_SHIFT | 0xFF << SCALE_SHIFT;
+const NULLABLE: u8 = 1 << 0;
+const HIDDEN: u8 = 1 << 1;
+const SERIAL: u8 = 1 << 2;
+const DEFINED_FLAGS: u8 = NULLABLE | HIDDEN | SERIAL;
 
 impl ColMeta {
-    fn pack(self) -> u64 {
-        let pk = self.pk_pos.map_or(0, |p| IS_PK | (p as u64) << PK_POS_SHIFT);
-        pk | (self.scale as u64) << SCALE_SHIFT
-            | if self.nullable { NULLABLE } else { 0 }
-            | if self.hidden { HIDDEN } else { 0 }
-            | if self.serial { SERIAL } else { 0 }
+    fn flags(self) -> u8 {
+        (if self.nullable { NULLABLE } else { 0 })
+            | (if self.hidden { HIDDEN } else { 0 })
+            | (if self.serial { SERIAL } else { 0 })
     }
 
-    fn from_flags(w: u64) -> ColMeta {
+    fn from_parts(flags: u8, scale: u8) -> ColMeta {
         ColMeta {
-            nullable: w & NULLABLE != 0,
-            hidden: w & HIDDEN != 0,
-            serial: w & SERIAL != 0,
-            scale: (w >> SCALE_SHIFT) as u8,
-            pk_pos: (w & IS_PK != 0).then_some((w >> PK_POS_SHIFT) as u8),
+            nullable: flags & NULLABLE != 0,
+            hidden: flags & HIDDEN != 0,
+            serial: flags & SERIAL != 0,
+            scale,
         }
     }
 }
 
-/// Per-row bytes of each region, indexed by region: the `col_idx` key, weight,
-/// null word, type_code, flags, the 16-byte German-string name cell, and the
-/// blob heap (which is not per-row). Encode sizing, the scratch-buffer split and
-/// the decode-side shape check all read this one table, so a stride change
-/// cannot land in two of the three.
-const ROW_BYTES: [usize; SCHEMA_BLOCK_REGIONS] = {
-    let mut t = [0usize; SCHEMA_BLOCK_REGIONS];
-    t[REG_PK] = PK_STRIDE;
-    t[REG_WEIGHT] = 8;
-    t[REG_NULL_BMP] = 8;
-    t[REG_TYPE_CODE] = 8;
-    t[REG_FLAGS] = 8;
-    t[REG_NAME] = 16;
-    t[REG_BLOB] = 0; // sized by the spill, not by the row count
-    t
-};
+/// Bytes one column occupies before its name: type code, flags, scale, and the
+/// name's own length prefix.
+const COL_FIXED_BYTES: usize = 3 + 4;
 
-/// Per-row bytes of the six fixed-stride regions.
-const FIXED_ROW_BYTES: usize = {
-    let (mut sum, mut r) = (0usize, 0);
-    while r < REG_BLOB {
-        sum += ROW_BYTES[r];
-        r += 1;
-    }
-    sum
-};
+/// Written for a PK count or column index the record's `u8` fields cannot hold.
+const PK_FIELD_OVERFLOW: u8 = u8::MAX;
+const _: () = assert!(
+    PK_FIELD_OVERFLOW as usize >= MAX_COLUMNS,
+    "a PK index this wide must be refused"
+);
+const _: () = assert!(
+    PK_FIELD_OVERFLOW as usize > MAX_PK_COLUMNS,
+    "a PK count this wide must be refused"
+);
 
-/// The block for `cols`, without a checksum: a frame that carries one stamps its
-/// own copy.
-pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
-    let n = cols.len();
-    // One scratch buffer carved into the six fixed-stride regions, so a block
-    // whose names all fit inline (the anonymous case, and most named ones)
-    // costs a single allocation. The blob heap grows only if a name spills.
-    let mut fixed = vec![0u8; n * FIXED_ROW_BYTES];
-    let (pk, rest) = fixed.split_at_mut(n * PK_STRIDE);
-    let (weight, rest) = rest.split_at_mut(n * 8);
-    let (null, rest) = rest.split_at_mut(n * 8);
-    let (type_code, rest) = rest.split_at_mut(n * 8);
-    let (flags, names) = rest.split_at_mut(n * 8);
-    let mut blob: Vec<u8> = Vec::new();
-
-    for (i, c) in cols.iter().enumerate() {
-        // The PK region is OPK: an unsigned column encodes big-endian.
-        pk[i * PK_STRIDE..(i + 1) * PK_STRIDE].copy_from_slice(&(i as u64).to_be_bytes());
-        write_u64_le(weight, i * 8, 1);
-        write_u64_le(type_code, i * 8, c.type_code as u64);
-        write_u64_le(flags, i * 8, c.meta.pack());
-        names[i * 16..(i + 1) * 16].copy_from_slice(&encode_german_string(c.name, &mut blob));
+/// One column, read forward.
+fn take_col<'a>(r: &mut Reader<'a>) -> Result<SchemaBlockCol<'a>, String> {
+    let type_code = r.u8()?;
+    if !is_valid_type_code(type_code) {
+        return Err(format!("{CTX}: invalid type code {type_code}"));
     }
-
-    // `null` stays all-zero: no meta-schema column is nullable.
-    let slices: [&[u8]; SCHEMA_BLOCK_REGIONS] = [pk, weight, null, type_code, flags, names, &blob];
-    let mut regions = wal::Regions::new();
-    for r in slices {
-        regions.push(r);
+    let flags = r.u8()?;
+    if flags & !DEFINED_FLAGS != 0 {
+        return Err(format!("{CTX}: unknown column meta bits {flags:#x}"));
     }
-    let mut out = Vec::new();
-    wal::WalBlock {
-        table_id: tid,
-        entry_count: n as u32,
-        regions,
-    }
-    .append_to(&mut out);
-    out
+    let scale = r.u8()?;
+    let name = r.bytes32()?;
+    Ok(SchemaBlockCol {
+        type_code,
+        meta: ColMeta::from_parts(flags, scale),
+        name,
+    })
 }
 
-/// A validated meta-schema block, borrowing the bytes it was decoded from.
-///
-/// Everything a consumer needs is checked here — region shape, `col_idx`
-/// ordering, type-code validity, PK eligibility and arity — so building a
-/// `Schema` / `SchemaDescriptor` from it cannot fail on wire grounds.
+/// The record for `cols` keyed by `pk_cols`, in declared PK-tuple order.
+pub fn encode(cols: &[SchemaBlockCol], pk_cols: &[u32]) -> Vec<u8> {
+    let columns: usize = cols.iter().map(|c| COL_FIXED_BYTES + c.name.len()).sum();
+    let mut w = Writer::with_capacity(4 + 1 + pk_cols.len() + columns);
+    w.u32(cols.len() as u32)
+        .u8(u8::try_from(pk_cols.len()).unwrap_or(PK_FIELD_OVERFLOW));
+    for &c in pk_cols {
+        debug_assert!(u8::try_from(c).is_ok(), "PK column index {c} does not fit the record");
+        w.u8(u8::try_from(c).unwrap_or(PK_FIELD_OVERFLOW));
+    }
+    for c in cols {
+        w.u8(c.type_code).u8(c.meta.flags()).u8(c.meta.scale).bytes32(c.name);
+    }
+    w.into_vec()
+}
+
+/// A well-formed meta-schema record, borrowing the bytes it was decoded from.
 pub struct SchemaBlock<'a> {
     count: usize,
-    type_codes: &'a [u8],
-    flags: &'a [u8],
-    names: &'a [u8],
-    blob: &'a [u8],
+    cols: &'a [u8],
     pk_indices: [u32; MAX_PK_COLUMNS],
     pk_count: usize,
 }
 
-impl<'a> SchemaBlock<'a> {
-    /// Decode and validate `block`.
-    ///
-    /// `max_pk` bounds the PK arity this consumer can represent. The two sides
-    /// pass different values on purpose and they are **not** merged: the client
-    /// passes `PK_LIST_MAX_COLS`, the capacity of the persisted PK-list codec it
-    /// must round-trip a key through; the engine passes `MAX_PK_COLUMNS`, the
-    /// width of its internal secondary-index schema. Folding one into the other
-    /// would silently widen the client-facing limit.
-    pub fn decode(block: &'a [u8], verify_checksum: bool, max_pk: usize) -> Result<Self, &'static str> {
-        debug_assert!(max_pk <= MAX_PK_COLUMNS, "max_pk exceeds the PK-array capacity");
-        // Format validity — header size, version, `total_size` in bounds, body
-        // checksum, region count ≤ cap, and every region's extent within the
-        // block — is the shared framer's job. What is added below is schema
-        // conformance only; every returned region is already bounded.
-        let (header, regions) = wal::validate_and_parse(block, verify_checksum).map_err(|e| match e {
-            crate::WalError::InvalidVersion => "schema block wrong version",
-            crate::WalError::ChecksumMismatch => "schema block checksum mismatch",
-            // Region count exceeds the directory cap — a forged over-long header.
-            crate::WalError::InvalidShard => "schema block directory overflows buffer",
-            // Truncated: shorter than its header, directory or regions require.
-            _ => "schema block truncated",
-        })?;
-
-        let count = header.entry_count as usize;
-        if count == 0 {
-            return Err("empty schema block");
+/// Decode and validate `buf`.
+pub fn decode(buf: &[u8]) -> Result<SchemaBlock<'_>, String> {
+    let mut r = Reader::new(buf, CTX);
+    let count = r.u32()? as usize;
+    if count == 0 || count > MAX_COLUMNS {
+        return Err(format!("{CTX}: column count {count} out of range 1..={MAX_COLUMNS}"));
+    }
+    let pk_count = r.u8()? as usize;
+    if pk_count == 0 || pk_count > MAX_PK_COLUMNS {
+        return Err(format!(
+            "{CTX}: pk column count {pk_count} out of range 1..={MAX_PK_COLUMNS}"
+        ));
+    }
+    let mut pk_indices = [0u32; MAX_PK_COLUMNS];
+    for k in 0..pk_count {
+        let ci = r.u8()? as u32;
+        if ci as usize >= count {
+            return Err(format!("{CTX}: pk index {ci} names no column"));
         }
-        if count > MAX_COLUMNS {
-            return Err("schema exceeds column limit");
+        if pk_indices[..k].contains(&ci) {
+            return Err(format!("{CTX}: pk names column {ci} twice"));
         }
-        // Exact, not a lower bound: a block with fewer regions still has every
-        // region this decoder reads, so a lower bound would accept a block the
-        // producer never emits and the peer rejects.
-        if header.num_regions as usize != SCHEMA_BLOCK_REGIONS {
-            return Err("schema block region count mismatch");
-        }
-
-        // Every fixed-stride region must be exactly `count` rows wide, against
-        // the same table `block_len` sizes them with.
-        for (r, &per_row) in ROW_BYTES.iter().enumerate().take(REG_BLOB) {
-            if regions[r].len() != count * per_row {
-                return Err("schema block region size mismatch");
-            }
-        }
-
-        // No meta-schema column is nullable, so the encoder writes an all-zero
-        // null word per row. Checked rather than assumed: a set bit would mean
-        // the type, flags or name of that column is absent, and every read below
-        // takes the cell at face value.
-        for i in 0..count {
-            if read_u64_le(regions[REG_NULL_BMP], i * 8) != 0 {
-                return Err("schema block declares a null column field");
-            }
-        }
-
-        // `col_idx` must be exactly `[0, 1, …, count-1]`: consumers address
-        // columns by physical row position, so a gap, a duplicate, or a reorder
-        // would silently re-route a column's type. It is an unsigned U64 PK
-        // stored OPK, hence the big-endian read.
-        let pk_data = regions[REG_PK];
-        for i in 0..count {
-            if u64::from_be_bytes(pk_data[i * 8..(i + 1) * 8].try_into().unwrap()) != i as u64 {
-                return Err("schema col_idx not in monotonic order");
-            }
-        }
-
-        let (type_codes, flags, names, blob) = (
-            regions[REG_TYPE_CODE],
-            regions[REG_FLAGS],
-            regions[REG_NAME],
-            regions[REG_BLOB],
-        );
-        let mut pk_pairs = [(0u8, 0u32); MAX_PK_COLUMNS];
-        let mut pk_count = 0usize;
-        let mut pk_stride = 0usize;
-
-        for i in 0..count {
-            let raw_tc = read_u64_le(type_codes, i * 8);
-            // The whole word, not its low byte: truncating here would admit a
-            // block the peer's `u8`-typed decode rejects, so the two ends would
-            // disagree on which blocks are admissible.
-            if raw_tc > u8::MAX as u64 || !is_valid_type_code(raw_tc as u8) {
-                return Err("schema: invalid type code");
-            }
-            let tc = raw_tc as u8;
-            let fl = read_u64_le(flags, i * 8);
-            if fl & !DEFINED_BITS != 0 {
-                return Err("schema: unknown column meta bits");
-            }
-            let meta = ColMeta::from_flags(fl);
-
-            // A name cell not in canonical form is a decode error, not an empty
-            // name: the name is the column's identity downstream. Asked through
-            // the cell's own predicate, so a heap extent past the blob and a
-            // pad/prefix skew — which would order two equal names unequal — are
-            // refused by the same rule every other German-string boundary applies.
-            let cell = &names[i * 16..(i + 1) * 16];
-            if !german_string_cell_ok(cell, blob) {
-                return Err("schema name cell is not in canonical form");
-            }
-
-            if let Some(pos) = meta.pk_pos {
-                // Rejected here rather than at each side's schema constructor,
-                // whose asserts would abort the process on a nullable/STRING/BLOB
-                // key.
-                if meta.nullable {
-                    return Err("PK column must be non-nullable");
-                }
-                if !is_pk_eligible(tc) {
-                    return Err("PK column type not PK-eligible");
-                }
-                if pk_count >= max_pk {
-                    return Err("too many PK columns");
-                }
-                // Same reason: an over-wide PK region is a release-active
-                // `assert!` in every consumer's schema constructor, and the
-                // column cap bounds it only by the coincidence that
-                // `MAX_PK_BYTES == MAX_PK_COLUMNS * 16`.
-                pk_stride += wire_stride(tc);
-                if pk_stride > crate::MAX_PK_BYTES {
-                    return Err("PK region too wide");
-                }
-                pk_pairs[pk_count] = (pos, i as u32);
-                pk_count += 1;
-            }
-        }
-        if pk_count == 0 {
-            return Err("no PK column");
-        }
-
-        // Sort by position in the PK tuple, so `PRIMARY KEY (b, a)` decodes back
-        // to the order the user declared. Single-PK schemas all carry position
-        // 0, making this a no-op on the common path.
-        pk_pairs[..pk_count].sort_by_key(|(p, _)| *p);
-        let mut pk_indices = [0u32; MAX_PK_COLUMNS];
-        for (k, (_, ci)) in pk_pairs[..pk_count].iter().enumerate() {
-            pk_indices[k] = *ci;
-        }
-
-        Ok(SchemaBlock {
-            count,
-            type_codes,
-            flags,
-            names,
-            blob,
-            pk_indices,
-            pk_count,
-        })
+        pk_indices[k] = ci;
     }
 
+    let rest = r.remaining();
+    let cols = r.take(rest)?;
+    let mut cr = Reader::new(cols, CTX);
+    for _ in 0..count {
+        take_col(&mut cr)?;
+    }
+    cr.expect_consumed()?;
+
+    Ok(SchemaBlock { count, cols, pk_indices, pk_count })
+}
+
+impl<'a> SchemaBlock<'a> {
     #[inline]
     pub fn num_columns(&self) -> usize {
         self.count
     }
 
-    /// Column `i`. Panics past `num_columns()`.
-    pub fn column(&self, i: usize) -> SchemaBlockCol<'a> {
-        assert!(i < self.count, "schema block column {i} out of range");
-        let cell = &self.names[i * 16..(i + 1) * 16];
-        SchemaBlockCol {
-            type_code: read_u64_le(self.type_codes, i * 8) as u8,
-            meta: ColMeta::from_flags(read_u64_le(self.flags, i * 8)),
-            // `decode` bounded every long cell's heap extent, so this resolves
-            // to the real content rather than the degraded-empty fallback.
-            name: german_string_content(cell, self.blob),
-        }
-    }
-
     /// Every column in physical order.
-    pub fn columns(&self) -> impl ExactSizeIterator<Item = SchemaBlockCol<'a>> + '_ {
-        (0..self.count).map(|i| self.column(i))
+    pub fn columns(&self) -> impl Iterator<Item = SchemaBlockCol<'a>> {
+        let mut r = Reader::new(self.cols, CTX);
+        (0..self.count).map(move |_| take_col(&mut r).expect("decode walked this section"))
     }
 
     /// The PK column indices, in declared PK-tuple order. Never empty.

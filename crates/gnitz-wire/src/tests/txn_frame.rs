@@ -100,7 +100,7 @@ fn push_txn_with_no_preconditions_carries_no_section() {
     let (fams, pre) = peeked(&frame, decode_push_txn).unwrap();
     assert_eq!(fams.len(), 1);
     assert!(pre.is_empty());
-    assert_eq!(frame.len(), CTRL_HEADER_SIZE + 1 + s.len() + wal_block(16).size());
+    assert_eq!(frame.len(), CTRL_HEADER_SIZE + 1 + 4 + s.len() + wal_block(16).size());
 }
 
 #[test]

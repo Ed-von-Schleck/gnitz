@@ -1,11 +1,9 @@
-//! The meta-schema block across the two adapters that build it: this catalog's
-//! (`SchemaDescriptor` → block) and `gnitz-core`'s (client `Schema` → block).
+//! The meta-schema record across the two adapters that build it: this catalog's
+//! (`SchemaDescriptor` → record) and `gnitz-core`'s (client `Schema` → record).
 //!
 //! It lives on this side because nothing links this crate, so the client is the
-//! half that can be pulled in — as a dev-dependency. A divergence between the
-//! two adapters is a live bug in `gnitz-mirror`, whose read path does exactly
-//! this conversion: `descriptor_of` encodes a client `Schema` to a block and
-//! decodes it back as a `SchemaDescriptor`.
+//! half that can be pulled in — as a dev-dependency. The two must agree byte for
+//! byte: each encodes what the other decodes on every schema-bearing frame.
 
 use crate::catalog::schema_block::encode_named_schema_block;
 use crate::test_support::{arb_type_code, named_col_defs};
@@ -16,7 +14,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
-/// `max_pk` bounds the generated PK arity: the catalog codec supports up to
+/// `max_pk` bounds the generated PK arity: the engine's schemas run to
 /// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted
 /// client codec caps at `PK_LIST_MAX_COLS` (4) — tests that decode through the
 /// client (`batch_to_schema` → `Schema::validate_parts`) must stay within it.
@@ -111,7 +109,7 @@ proptest! {
     #[test]
     fn schema_roundtrip_catalog_codec(original in arb_schema(MAX_PK_COLUMNS)) {
         let original = &original;
-        let wire = encode_named_schema_block(original, &named_col_defs(&synthetic_names(original)), 0);
+        let wire = encode_named_schema_block(original, &named_col_defs(&synthetic_names(original)));
         let decoded = decode_schema_block(&wire)
             .expect("decode must succeed for any valid schema");
         assert_descriptor_eq(original, &decoded)?;
@@ -123,7 +121,7 @@ proptest! {
         use gnitz_core::protocol::codec::{encode_schema_block, schema_from_block};
 
         let client = descriptor_to_client_schema(&original);
-        let wire = encode_schema_block(&client, 0);
+        let wire = encode_schema_block(&client);
         prop_assert_eq!(schema_from_block(&wire).unwrap(), client);
     }
 
@@ -133,8 +131,8 @@ proptest! {
         use gnitz_core::protocol::codec::encode_schema_block;
 
         let original = &original;
-        let catalog = encode_named_schema_block(original, &named_col_defs(&synthetic_names(original)), 7);
-        let client = encode_schema_block(&descriptor_to_client_schema(original), 7);
+        let catalog = encode_named_schema_block(original, &named_col_defs(&synthetic_names(original)));
+        let client = encode_schema_block(&descriptor_to_client_schema(original));
         prop_assert_eq!(catalog, client);
     }
 }

@@ -490,8 +490,9 @@ pub enum PkRule {
     NotPacked,
     /// No PK columns at all. Every base table has an enforced primary key.
     Empty,
-    /// Arity past [`crate::PK_LIST_MAX_COLS`], the persisted PK-list codec capacity.
-    TooManyColumns { count: usize },
+    /// Arity past the cap the caller passed, which rides along so the message
+    /// names the bound that was actually applied.
+    TooManyColumns { count: usize, max: usize },
     /// A PK index that names no column.
     IndexOutOfRange { col: u32 },
     /// The same column listed twice — it would double-count in the stride and
@@ -532,10 +533,9 @@ impl PkRule {
         match *self {
             PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
             PkRule::Empty => format!("{what} must name at least one column"),
-            PkRule::TooManyColumns { count } => format!(
-                "{what} column count {count} out of range 1..={}",
-                crate::PK_LIST_MAX_COLS
-            ),
+            PkRule::TooManyColumns { count, max } => {
+                format!("{what} column count {count} out of range 1..={max}")
+            }
             PkRule::IndexOutOfRange { col } => format!("{what} index {col} out of bounds"),
             PkRule::Duplicate { col } => format!("{what} names column {col} twice"),
             PkRule::NotEligible { col, type_code } => format!(
@@ -561,17 +561,20 @@ impl core::fmt::Display for PkRule {
 }
 
 /// The structural half of the primary-key admission rule: non-empty, within the
-/// [`crate::PK_LIST_MAX_COLS`] arity cap, every index naming a real column, no
-/// duplicates. Split from the column-type half so a caller holding only the PK
-/// list can run it alone; `ncols` is whatever bound that caller has — a real
-/// column count, or a field width for a list whose columns do not exist yet.
-pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize) -> Result<(), PkRule> {
-    if !crate::pk_list_arity_ok(pk_cols.len()) {
-        return Err(if pk_cols.is_empty() {
-            PkRule::Empty
-        } else {
-            PkRule::TooManyColumns { count: pk_cols.len() }
-        });
+/// `max_pk` arity cap, every index naming a real column, no duplicates. Split
+/// from the column-type half so a caller holding only the PK list can run it
+/// alone; `ncols` is whatever bound that caller has — a real column count, or a
+/// field width for a list whose columns do not exist yet.
+///
+/// `max_pk` is the caller's own arity cap: [`crate::PK_LIST_MAX_COLS`] for a
+/// user-declared key, which must round-trip through the persisted PK-list word,
+/// and [`crate::MAX_PK_COLUMNS`] for an engine schema derived from one.
+pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Result<(), PkRule> {
+    if pk_cols.is_empty() {
+        return Err(PkRule::Empty);
+    }
+    if pk_cols.len() > max_pk {
+        return Err(PkRule::TooManyColumns { count: pk_cols.len(), max: max_pk });
     }
     for (j, &c) in pk_cols.iter().enumerate() {
         if c as usize >= ncols {
@@ -610,8 +613,13 @@ fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (u8, bool)) ->
 
 /// Both halves of the primary-key admission rule, for the callers that hold the
 /// columns up front. Returns the validated `pk_stride`.
-pub fn validate_pk_tuple(pk_cols: &[u32], ncols: usize, col: impl Fn(u32) -> (u8, bool)) -> Result<usize, PkRule> {
-    validate_pk_indices(pk_cols, ncols)?;
+pub fn validate_pk_tuple(
+    pk_cols: &[u32],
+    ncols: usize,
+    max_pk: usize,
+    col: impl Fn(u32) -> (u8, bool),
+) -> Result<usize, PkRule> {
+    validate_pk_indices(pk_cols, ncols, max_pk)?;
     validate_pk_column_types(pk_cols, col)
 }
 

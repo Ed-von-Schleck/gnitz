@@ -15,8 +15,8 @@ use crate::{read_u32_le, read_u64_le, ClientVerb, WireFault, WireFlags, WireStat
 //   [24,32) ARG0       u64
 //   [32,40) ARG1       u64
 //   [40, 40+BLOB_LEN)  blob; under a non-`Ok` STATUS, the UTF-8 error text
-//   then a schema block (FLAGS bit 32) and a data block (bit 33), each present
-//   iff its bit is set
+//   then a `u32`-length-prefixed schema record (FLAGS bit 32) and a self-sizing
+//   data block (bit 33), each present iff its bit is set
 const OFF_STATUS: usize = 0;
 const OFF_BLOB_LEN: usize = 4;
 const OFF_FLAGS: usize = 8;
@@ -67,13 +67,19 @@ impl DecodedControl {
     }
 }
 
-/// Bytes of the control header, its blob and an optional schema block.
-pub const fn frame_head_size(blob_len: usize, schema_block_len: usize) -> usize {
-    CTRL_HEADER_SIZE + blob_len + schema_block_len
+/// Bytes of the control header, its blob and an optional length-prefixed schema
+/// record.
+pub const fn frame_head_size(blob_len: usize, schema_len: Option<usize>) -> usize {
+    CTRL_HEADER_SIZE
+        + blob_len
+        + match schema_len {
+            Some(n) => 4 + n,
+            None => 0,
+        }
 }
 
-/// Write the control header, `blob` and `schema_block` into the front of `out`,
-/// returning the offset a data block follows at.
+/// Write the control header, `blob` and the length-prefixed `schema_block` into
+/// the front of `out`, returning the offset a data block follows at.
 #[inline]
 pub fn encode_frame_head(
     out: &mut [u8],
@@ -100,6 +106,8 @@ pub fn encode_frame_head(
     tail[..blob.len()].copy_from_slice(blob);
     let mut pos = CTRL_HEADER_SIZE + blob.len();
     if let Some(sb) = schema_block {
+        out[pos..pos + 4].copy_from_slice(&(sb.len() as u32).to_le_bytes());
+        pos += 4;
         out[pos..pos + sb.len()].copy_from_slice(sb);
         pos += sb.len();
     }
@@ -119,17 +127,19 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     let flags = WireFlags::unpack(word)?;
     let block_size = CTRL_HEADER_SIZE + blob_len;
     let mut off = block_size;
-    let mut next = |present: bool| -> Result<Option<Range<usize>>, &'static str> {
-        if !present {
-            return Ok(None);
-        }
-        let len = crate::wal::block_slice_at(data, off).map_err(|e| e.as_str())?.len();
-        let r = off..off + len;
-        off += len;
-        Ok(Some(r))
+    let schema = if word & FLAG_HAS_SCHEMA != 0 {
+        let r = crate::codec::bytes32_extent(data, off).ok_or("schema record runs past the frame")?;
+        off = r.end;
+        Some(r)
+    } else {
+        None
     };
-    let schema = next(word & FLAG_HAS_SCHEMA != 0)?;
-    let data_block = next(word & FLAG_HAS_DATA != 0)?;
+    let data_block = if word & FLAG_HAS_DATA != 0 {
+        let len = crate::wal::block_slice_at(data, off).map_err(|e| e.as_str())?.len();
+        Some(off..off + len)
+    } else {
+        None
+    };
     Ok(DecodedControl {
         hdr: ControlHeader {
             status,

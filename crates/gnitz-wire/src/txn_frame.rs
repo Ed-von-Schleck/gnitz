@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! DDL_TXN     ctrl            | [data block]*
-//! PUSH_TXN    ctrl (arg1 = p) | p × [u64 tid][u64 basis_lsn] | ([u8 mode][schema block][data block])*
+//! PUSH_TXN    ctrl (arg1 = p) | p × [u64 tid][u64 basis_lsn] | ([u8 mode][u32 len][schema record][data block])*
 //! SCAN_MULTI  ctrl            | ([u64 tid][u16 schema_version])*
 //! DELTA_POLL  ctrl            | ([u64 view_id][u64 after_tick][u32 len][reply block])*
 //! ```
@@ -16,16 +16,17 @@
 //! the mode byte, the 10-byte relation record, the 16-byte precondition — from
 //! being restated on each side of the wire.
 //!
-//! What a schema or data block contains belongs to `schema_block` and to each
-//! side's batch codec. Every block is self-sizing (its `WAL_OFF_SIZE`), so the
-//! frame walk needs nothing beyond the bytes.
+//! What a schema record or data block contains belongs to `schema_block` and to
+//! each side's batch codec. A data block is self-sizing (its `WAL_OFF_SIZE`) and
+//! a schema record carries a length prefix, so the frame walk needs nothing
+//! beyond the bytes.
 //!
 //! **In the reply direction `target_id` says what a fault covers.** A fault at
 //! `0` — which [`validate_item_ids`] keeps out of every item list — rejects the
 //! whole frame; one naming an item ends that item's position and no other. Only
 //! `DELTA_POLL` answers per item; the other three fault at `0` alone.
 
-use crate::codec::{Reader, Writer};
+use crate::codec::{bytes32_extent, Reader, Writer};
 use crate::control::{encode_frame_head, ControlHeader, DecodedControl, CTRL_HEADER_SIZE};
 use crate::wal::{self, WalBlock};
 use crate::{read_u32_le, ClientVerb, WireConflictMode, WireFlags, WAL_OFF_TID};
@@ -123,7 +124,10 @@ pub fn encode_push_txn(
     families: &[(WireConflictMode, impl AsRef<[u8]>, WalBlock<'_>)],
     preconditions: &[(u64, u64)],
 ) -> Vec<u8> {
-    let body: usize = families.iter().map(|(_, s, d)| 1 + s.as_ref().len() + d.size()).sum();
+    let body: usize = families
+        .iter()
+        .map(|(_, s, d)| 1 + 4 + s.as_ref().len() + d.size())
+        .sum();
     let mut w = prologue(
         ClientVerb::PushTxn,
         preconditions.len() as u64,
@@ -133,7 +137,7 @@ pub fn encode_push_txn(
         w.u64(*tid).u64(*basis);
     }
     for (mode, schema_block, wal_block) in families {
-        w.u8(mode.as_wire()).raw(schema_block.as_ref()).block(wal_block);
+        w.u8(mode.as_wire()).bytes32(schema_block.as_ref()).block(wal_block);
     }
     w.into_vec()
 }
@@ -195,8 +199,8 @@ pub fn decode_ddl_txn<'a>(frame: &'a [u8], ctrl: &DecodedControl) -> Result<Vec<
 }
 
 /// One decoded `PUSH_TXN` family: the target `tid` (read from the data
-/// block's `WAL_OFF_TID`), the conflict `mode`, and the borrowed schema and
-/// data WAL-block slices — same lifetime discipline as [`decode_ddl_txn`]'s
+/// block's `WAL_OFF_TID`), the conflict `mode`, and the borrowed schema record
+/// and data WAL-block slices — same lifetime discipline as [`decode_ddl_txn`]'s
 /// `(u32, &[u8])`.
 pub struct TxnFamily<'a> {
     pub tid: u32,
@@ -236,8 +240,9 @@ pub fn decode_push_txn<'a>(frame: &'a [u8], ctrl: &DecodedControl) -> Result<Dec
         let mode =
             WireConflictMode::from_wire(frame[off]).ok_or_else(|| format!("{CTX}: unknown family conflict mode"))?;
         off += 1;
-        let schema_block = wal::block_slice_at(frame, off).map_err(|e| format!("{CTX}: schema block: {e}"))?;
-        off += schema_block.len();
+        let section = bytes32_extent(frame, off).ok_or_else(|| format!("{CTX}: schema record truncated"))?;
+        let schema_block = &frame[section.clone()];
+        off = section.end;
         let wal_block = wal::block_slice_at(frame, off).map_err(|e| format!("{CTX}: data block: {e}"))?;
         off += wal_block.len();
         families.push(TxnFamily {

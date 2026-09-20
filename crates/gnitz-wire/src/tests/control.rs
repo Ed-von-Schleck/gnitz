@@ -26,7 +26,7 @@ fn encode(hdr: &ControlHeader, blob: &[u8]) -> Vec<u8> {
 
 /// A whole frame: the head, then `data` if given.
 fn frame(hdr: &ControlHeader, blob: &[u8], schema_block: Option<&[u8]>, data: Option<&[u8]>) -> Vec<u8> {
-    let mut buf = vec![0u8; frame_head_size(blob.len(), schema_block.map_or(0, <[u8]>::len))];
+    let mut buf = vec![0u8; frame_head_size(blob.len(), schema_block.map(<[u8]>::len))];
     let n = encode_frame_head(&mut buf, hdr, blob, schema_block, data.is_some());
     assert_eq!(n, buf.len());
     buf.extend_from_slice(data.unwrap_or_default());
@@ -62,33 +62,38 @@ fn encode_roundtrips() {
     }
 }
 
-/// The block bits are set from what the head writes and the peek locates each
-/// block from them, in order: schema, then data.
+/// The section bits are set from what the head writes and the peek locates each
+/// section from them, in order: the length-prefixed schema record, then the
+/// self-sizing data block.
 #[test]
-fn peek_locates_the_blocks_the_head_announced() {
+fn peek_locates_the_sections_the_head_announced() {
     let hdr = probe_header();
-    let (sb, db) = (wal_block(1, b"schema"), wal_block(1, b"a data region"));
+    // Arbitrary bytes: the frame sizes the record from its prefix, never parses it.
+    let (sb, db) = (b"schema record bytes".to_vec(), wal_block(1, b"a data region"));
     let head = CTRL_HEADER_SIZE + 3;
+    let schema_at = head + 4..head + 4 + sb.len();
+    let data_after_schema = schema_at.end..schema_at.end + db.len();
     let cases = [
-        (Some(&sb[..]), None, Some(head..head + sb.len()), None),
+        (Some(&sb[..]), None, Some(schema_at.clone()), None),
         (None, Some(&db[..]), None, Some(head..head + db.len())),
-        (
-            Some(&sb[..]),
-            Some(&db[..]),
-            Some(head..head + sb.len()),
-            Some(head + sb.len()..head + sb.len() + db.len()),
-        ),
+        (Some(&sb[..]), Some(&db[..]), Some(schema_at), Some(data_after_schema)),
     ];
     for (schema_block, data, want_schema, want_data) in cases {
         let buf = frame(&hdr, b"abc", schema_block, data);
         let dec = peek_control_block(&buf).expect("decode");
-        assert_eq!(dec.hdr, hdr, "the block bits are not a flags field");
+        assert_eq!(dec.hdr, hdr, "the section bits are not a flags field");
         assert_eq!(dec.schema, want_schema);
         assert_eq!(dec.data, want_data);
     }
-    // A block the bits announce but the frame does not hold is refused.
+    // A section the bits announce but the frame does not hold is refused, at
+    // every length short of the whole.
     let buf = frame(&hdr, b"abc", Some(&sb), None);
-    assert_eq!(peek_control_block(&buf[..buf.len() - 1]).err(), Some("truncated"));
+    for cut in head..buf.len() {
+        assert!(peek_control_block(&buf[..cut]).is_err(), "cut at {cut}");
+    }
+    // An empty record is a present one: the prefix distinguishes it from absent.
+    let empty = frame(&hdr, b"abc", Some(&[]), None);
+    assert_eq!(peek_control_block(&empty).unwrap().schema, Some(head + 4..head + 4));
 }
 
 /// A data block is malformed on every verb but PUSH — `Scan` above all, which

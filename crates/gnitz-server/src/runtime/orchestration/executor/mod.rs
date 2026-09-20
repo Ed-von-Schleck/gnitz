@@ -1305,7 +1305,7 @@ fn decode_client_wire(
     data: &[u8],
     ctrl: gnitz_wire::control::DecodedControl,
     hint: Option<&SchemaDescriptor>,
-) -> Result<ipc::DecodedWire, &'static str> {
+) -> Result<ipc::DecodedWire, String> {
     let decoded = ipc::decode_client_frame(data, ctrl, hint)?;
     if let Some(b) = decoded.data_batch.as_ref() {
         validate_client_batch(b)?;

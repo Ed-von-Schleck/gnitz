@@ -173,7 +173,7 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
 fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor) -> &'static [u8] {
     // No data batch — a header-only relay. `arg0` echoes the source_id the
     // waiter matches on; the default `flags.backfill` is `Continue`.
-    let block = crate::catalog::encode_schema_block(schema, target_id as u32);
+    let block = crate::catalog::encode_schema_block(schema);
     let msg = ipc::WireMsg {
         target_id,
         arg0: source_id,
@@ -186,7 +186,7 @@ fn encode_relay_frame(target_id: u64, source_id: u64, schema: &SchemaDescriptor)
 /// Encode a wire frame carrying `batch` under `schema`. Leaked to `'static`
 /// for `dispatch`, which takes its payload from the SAL mapping.
 fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -> &'static [u8] {
-    let block = crate::catalog::encode_schema_block(schema, target_id as u32);
+    let block = crate::catalog::encode_schema_block(schema);
     let msg = ipc::WireMsg {
         target_id,
         schema_block: Some(&block),
@@ -433,7 +433,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         ("padded", make_n_row_batch(padded_schema(), 40)),
     ] {
         let schema = *batch.schema();
-        let block = Rc::new(crate::catalog::encode_schema_block(&schema, 1));
+        let block = Rc::new(crate::catalog::encode_schema_block(&schema));
         let per_row = frame_size(schema, 2, None) - frame_size(schema, 1, None);
         // Room for four rows beside the schema block on the first frame.
         let budget = frame_size(schema, 4, Some(block.as_slice()));
@@ -593,8 +593,8 @@ fn pending_streams_drain_two_trains_fifo() {
     );
     let batch_a = make_n_row_batch(schema_a, 10);
     let batch_b = make_n_row_batch(schema_b, 5);
-    let block_a = Rc::new(crate::catalog::encode_schema_block(&schema_a, 1));
-    let block_b = Rc::new(crate::catalog::encode_schema_block(&schema_b, 2));
+    let block_a = Rc::new(crate::catalog::encode_schema_block(&schema_a));
+    let block_b = Rc::new(crate::catalog::encode_schema_block(&schema_b));
 
     // Budget: exactly the first chunk's size at 4 rows (A's schema block
     // included), so train A's 10 rows span at least two frames.

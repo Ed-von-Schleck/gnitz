@@ -304,7 +304,7 @@ impl Schema {
                 cd.name, cd.type_code, cd.scale
             ));
         }
-        gnitz_wire::validate_pk_tuple(pk_cols, columns.len(), |c| {
+        gnitz_wire::validate_pk_tuple(pk_cols, columns.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
             let cd = &columns[c as usize];
             (cd.type_code as u8, cd.is_nullable)
         })

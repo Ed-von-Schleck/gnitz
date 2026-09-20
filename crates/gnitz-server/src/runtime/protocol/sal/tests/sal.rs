@@ -676,7 +676,7 @@ fn footprint_equals_emitted_bytes() {
     let nw = 4;
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let block = crate::catalog::encode_schema_block(&schema, 16);
+    let block = crate::catalog::encode_schema_block(&schema);
 
     let log = TestLog::new(1 << 20, nw, 1);
 
@@ -901,7 +901,7 @@ fn a_rowless_push_slot_carries_no_schema_block() {
     assert_eq!(with_rows, 1, "one row routes to exactly one worker");
 
     // The relay's own empty slot is the counter-case, on the same writer.
-    let block = crate::catalog::encode_schema_block(&schema, 16);
+    let block = crate::catalog::encode_schema_block(&schema);
     let worker_data = [WireData::None, WireData::None, WireData::None, WireData::None];
     let base = log.cursor();
     log.writer

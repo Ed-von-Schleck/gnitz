@@ -45,7 +45,7 @@ impl WireSchema {
     pub(crate) fn encoded(tid: i64, descriptor: SchemaDescriptor) -> Self {
         WireSchema {
             tid,
-            block: Rc::new(crate::catalog::encode_schema_block(&descriptor, tid as u32)),
+            block: Rc::new(crate::catalog::encode_schema_block(&descriptor)),
             descriptor,
         }
     }
@@ -157,9 +157,10 @@ pub struct WireMsg<'a> {
     pub arg1: u64,
     pub status: WireStatus,
     pub data: WireData<'a>,
-    /// These bytes *are* the frame's schema block, and their length sizes it;
-    /// `None` emits none and leaves the frame's schema bit clear. Usually from a
-    /// [`WireSchema`], which pairs them with the descriptor they encode.
+    /// These bytes *are* the frame's schema record, and their length sizes the
+    /// prefix that announces it; `None` emits none and leaves the frame's schema
+    /// bit clear. Usually from a [`WireSchema`], which pairs them with the
+    /// descriptor they encode.
     pub schema_block: Option<&'a [u8]>,
     pub blob: &'a [u8],
 }
@@ -171,7 +172,7 @@ impl<'a> WireMsg<'a> {
 
     /// Total encoded size, without allocating.
     pub fn size(&self) -> usize {
-        let mut total = gnitz_wire::control::frame_head_size(self.blob.len(), self.schema_block.map_or(0, <[u8]>::len));
+        let mut total = gnitz_wire::control::frame_head_size(self.blob.len(), self.schema_block.map(<[u8]>::len));
         if self.has_data() {
             total += self.data.wire_byte_size();
         }
@@ -274,13 +275,13 @@ pub fn decode_client_frame(
     data: &[u8],
     control: DecodedControl,
     hint: Option<&SchemaDescriptor>,
-) -> Result<DecodedWire, &'static str> {
+) -> Result<DecodedWire, String> {
     let (schema, data_batch) = decode_frame(data, &control, hint, |b, s| Batch::decode_foreign_wal_block(b, s, s))?;
     Ok(DecodedWire { control, schema, data_batch })
 }
 
 /// Decode one SAL slot.
-pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, &'static str> {
+pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
     let (schema, data_batch) = decode_frame(data, &control, None, |b, s| Batch::decode_from_wal_block(b, s, false))?;
     let mut decoded = DecodedWire { control, schema, data_batch };
@@ -291,7 +292,7 @@ pub fn decode_sal_slot(data: &[u8]) -> Result<DecodedWire, &'static str> {
 /// Decode one W2M ring frame into an owned `DecodedWire`. The append relocates
 /// the blob heap: an exchange frame can carry a whole unfiltered heap, and this
 /// is where it is compacted.
-pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
+pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, String> {
     let control = peek_control_block(data)?;
     let (schema, data_batch) = decode_frame(data, &control, None, |block, schema| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
@@ -346,7 +347,7 @@ fn decode_frame<'a, B>(
     control: &DecodedControl,
     hint: Option<&SchemaDescriptor>,
     decode: impl FnOnce(&'a [u8], &SchemaDescriptor) -> Result<B, &'static str>,
-) -> Result<(Option<SchemaDescriptor>, Option<B>), &'static str> {
+) -> Result<(Option<SchemaDescriptor>, Option<B>), String> {
     let block_schema = match &control.schema {
         Some(r) => Some(decode_schema_block(&data[r.clone()])?),
         None => None,
@@ -358,7 +359,7 @@ fn decode_frame<'a, B>(
         .as_ref()
         .or(hint)
         .ok_or("a data block without a schema block")?;
-    let batch = decode(&data[r], schema)?;
+    let batch = decode(&data[r], schema).map_err(str::to_string)?;
     Ok((block_schema, Some(batch)))
 }
 

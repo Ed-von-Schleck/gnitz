@@ -83,7 +83,7 @@ fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), Stri
 
 /// `gnitz-wire`'s PK rule set, in wire's own wording.
 fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(), String> {
-    gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), |c| {
+    gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
         let cd = &col_defs[c as usize];
         (cd.type_code, cd.is_nullable)
     })

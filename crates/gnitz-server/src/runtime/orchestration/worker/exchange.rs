@@ -57,7 +57,7 @@ impl WorkerProcess {
     /// [`ipc::FRAME_CAP`] — the bound every other producer already holds itself
     /// to. What a frame carries is [`exchange_frame`]'s; this only cuts rows.
     fn publish_exchange(&self, view_id: i64, batch: &Batch, source_id: i64, pad: bool) {
-        let block = crate::catalog::encode_schema_block(batch.schema(), view_id as u32);
+        let block = crate::catalog::encode_schema_block(batch.schema());
         let frame = |last| exchange_frame(view_id, source_id, &block, last, pad);
 
         // Whole and unsplit off the source batch — no sub-batch, no per-row

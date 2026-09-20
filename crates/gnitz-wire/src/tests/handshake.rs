@@ -52,5 +52,5 @@ fn the_length_prefix_discriminates_the_pre_handshake_frames() {
     assert_ne!(HELLO_PAYLOAD_LEN, HELLO_ACK_PAYLOAD_LEN);
     assert!((HELLO_PAYLOAD_LEN as usize) < smallest_ctrl);
     assert!((HELLO_ACK_PAYLOAD_LEN as usize) < smallest_ctrl);
-    assert!(crate::control::frame_head_size(128, 0) < MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
+    assert!(crate::control::frame_head_size(128, None) < MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
 }

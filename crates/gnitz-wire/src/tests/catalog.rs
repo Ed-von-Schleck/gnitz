@@ -2,19 +2,14 @@ use super::*;
 
 /// Every system table's key must be admissible for its own column list. The
 /// pair is the thing both crates build from, so it is validated here rather
-/// than trusted at each derivation site. Swept over `SYS_FAMILIES` (plus the
-/// meta-schema block, which is not a family), so a newly added family is
-/// covered without editing this test.
+/// than trusted at each derivation site. Swept over `SYS_FAMILIES`, so a newly
+/// added family is covered without editing this test.
 #[test]
 fn system_table_keys_are_valid_for_their_columns() {
-    let meta = ("meta_schema", META_SCHEMA_COLS, LEADING_COL_PK);
-    let families = SYS_FAMILIES
-        .iter()
-        .map(|f| (f.name, f.cols, f.pk_cols))
-        .chain(std::iter::once(meta));
-    for (name, cols, pk) in families {
+    for f in SYS_FAMILIES {
+        let (name, cols, pk) = (f.name, f.cols, f.pk_cols);
         assert!(cols.len() <= MAX_COLUMNS, "{name}: too many columns");
-        crate::validate_pk_tuple(pk, cols.len(), |c| {
+        crate::validate_pk_tuple(pk, cols.len(), PK_LIST_MAX_COLS, |c| {
             let col = &cols[c as usize];
             (col.type_code as u8, col.nullable)
         })
@@ -49,7 +44,7 @@ fn a_crafted_pk_col_count_is_rejected_at_unpack() {
     for n in over {
         assert_eq!(
             unpack_pk_cols(PK_LIST_PACKED_FLAG | n as u64),
-            Err(crate::PkRule::TooManyColumns { count: n })
+            Err(crate::PkRule::TooManyColumns { count: n, max: PK_LIST_MAX_COLS })
         );
     }
 }

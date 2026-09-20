@@ -448,3 +448,62 @@ fn covers_pk_accepts_any_superset_of_the_pk_columns() {
     assert!(single.covers_pk(&[1, 0]));
     assert!(!single.covers_pk(&[1]));
 }
+
+// ── Admission: the fallible constructor and the wire record ──────────────
+
+/// Every rule `new_with_placement` would abort the process on is an `Err` here.
+#[test]
+fn try_new_rejects_what_the_panicking_constructor_aborts_on() {
+    let key = SchemaColumn::new(type_code::U64, 0);
+    let wide_pk: Vec<u32> = (0..=MAX_PK_COLUMNS as u32).collect();
+
+    assert!(SchemaDescriptor::try_new(&[key, key], &[0]).is_ok());
+    assert!(SchemaDescriptor::try_new(&[key], &[]).is_err(), "no PK column");
+    assert!(
+        SchemaDescriptor::try_new(&[key], &[1]).is_err(),
+        "PK index past the columns"
+    );
+    assert!(
+        SchemaDescriptor::try_new(&[key, key], &[0, 0]).is_err(),
+        "the same column twice"
+    );
+    assert!(
+        SchemaDescriptor::try_new(&[SchemaColumn::new(type_code::U64, 1)], &[0]).is_err(),
+        "nullable PK column"
+    );
+    assert!(
+        SchemaDescriptor::try_new(&[SchemaColumn::new(type_code::F64, 0)], &[0]).is_err(),
+        "PK-ineligible column type"
+    );
+    assert!(
+        SchemaDescriptor::try_new(&[key; MAX_PK_COLUMNS + 1], &wide_pk).is_err(),
+        "PK arity past MAX_PK_COLUMNS"
+    );
+    // The shared PK validator bounds indices against the column count, never
+    // the column count itself.
+    assert!(
+        SchemaDescriptor::try_new(&[key; MAX_COLUMNS + 1], &[0]).is_err(),
+        "column count past MAX_COLUMNS"
+    );
+}
+
+/// A nullable or PK-ineligible key column is a schema rule, so the wire codec
+/// admits such a record and this decode is what refuses it.
+#[test]
+fn decode_schema_block_rejects_a_nullable_or_ineligible_pk_column() {
+    use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
+
+    let col = |tc, nullable| SchemaBlockCol {
+        type_code: tc,
+        meta: ColMeta { nullable, ..Default::default() },
+        name: b"k",
+    };
+    for bad in [col(type_code::U64, true), col(type_code::F64, false)] {
+        let record = gnitz_wire::schema_block::encode(&[bad], &[0]);
+        assert!(
+            gnitz_wire::schema_block::decode(&record).is_ok(),
+            "the record itself is well-formed"
+        );
+        assert!(decode_schema_block(&record).is_err());
+    }
+}

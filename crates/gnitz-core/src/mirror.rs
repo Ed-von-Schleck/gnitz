@@ -372,7 +372,7 @@ impl GnitzClient {
             schema_name: schema_name.to_string(),
             name: name.to_string(),
             desc,
-            delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema)?), tid)),
+            delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema)?))),
         };
         let retracted = self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
         let m = self.mirror_state()?;
@@ -468,7 +468,7 @@ impl GnitzClient {
         // Everything between here and the ingest below is a copy that does not
         // exist, and the missing cursor is what says so.
         self.mirror_state()?.store.invalidate(tid, Invalidate::Copy)?;
-        let view_schema = ReplySchema::new(Arc::clone(&self.mirrored_view(tid)?.desc.schema), tid);
+        let view_schema = ReplySchema::new(Arc::clone(&self.mirrored_view(tid)?.desc.schema));
         let (blocks, cursor) = self.delta_bootstrap_raw(tid, &view_schema)?;
         let m = self.mirror_state()?;
         m.store.ingest(tid, blocks, cursor)?;

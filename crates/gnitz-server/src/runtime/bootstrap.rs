@@ -45,7 +45,7 @@ fn decode_group_slot(msg: &SalMessage, w: u32, data: &[u8]) -> Result<ipc::Decod
     if !msg.slot_intact(w, data) {
         return Err(corrupt("slot checksum mismatch"));
     }
-    ipc::decode_sal_slot(data).map_err(corrupt)
+    ipc::decode_sal_slot(data).map_err(|e| corrupt(&e))
 }
 
 /// Master pre-fork replay of every committed DdlSync group.

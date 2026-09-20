@@ -10,14 +10,14 @@
 //! served by the full scan narrowed to the walk's rows.
 
 use gnitz_core::{Invalidate, MirrorError, Schema};
-use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 
 use crate::handle::Mirror;
 use crate::state::MirrorRecord;
 
 impl Mirror {
     /// Reconcile the local registry against `tid`'s upstream layout: a record
-    /// holding `tid` under the same schema block stands, cursor and all, and
+    /// holding `tid` under the same schema record stands, cursor and all, and
     /// takes the upstream name; anything else at this id or this name is a
     /// relation that changed identity, whose copy is retracted. Returns the id
     /// whose registration that retracted, so the caller can drop its own
@@ -29,7 +29,7 @@ impl Mirror {
         name: &str,
         schema: &Schema,
     ) -> Result<Option<u64>, MirrorError> {
-        let block = gnitz_core::protocol::codec::encode_schema_block(schema, 0);
+        let block = gnitz_core::protocol::codec::encode_schema_block(schema);
         // Whatever the store holds under this name at another id was renamed or
         // recreated upstream; its copy directory and state row outlive every
         // checkpoint if nothing retracts them. Outside the match because a pure
@@ -66,15 +66,22 @@ impl Mirror {
     }
 }
 
-/// The engine descriptor a wire schema block denotes. Shared by a record
-/// replayed at open and a `Schema` a registration resolved.
+/// The engine descriptor a wire schema record denotes.
 pub(crate) fn descriptor_of_block(block: &[u8]) -> Result<SchemaDescriptor, MirrorError> {
     gnitz_store::schema::decode_schema_block(block)
-        .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))
+        .map_err(|e| MirrorError::Engine(format!("mirror: schema record: {e}")))
 }
 
-/// The engine descriptor a client `Schema` denotes, through the shared codec —
-/// so neither end is a second spelling of the block's rules.
+/// The engine descriptor a client `Schema` denotes.
 pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorError> {
-    descriptor_of_block(&gnitz_core::protocol::codec::encode_schema_block(schema, 0))
+    let cols: Vec<SchemaColumn> = schema
+        .columns
+        .iter()
+        .map(|c| SchemaColumn::new(c.type_code as u8, c.is_nullable as u8))
+        .collect();
+    SchemaDescriptor::try_new(&cols, &schema.pk_cols).map_err(|e| MirrorError::Engine(format!("mirror: schema: {e}")))
 }
+
+#[cfg(test)]
+#[path = "tests/register.rs"]
+mod tests;

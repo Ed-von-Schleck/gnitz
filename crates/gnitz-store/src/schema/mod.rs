@@ -368,6 +368,22 @@ const fn compute_payload_to_ci(num_columns: usize, pk_indices: &[u32]) -> [u8; M
 }
 
 impl SchemaDescriptor {
+    /// [`Self::new`] as an `Err` rather than an abort.
+    pub fn try_new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Result<Self, String> {
+        if cols.len() > MAX_COLUMNS {
+            return Err(format!(
+                "column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
+                cols.len()
+            ));
+        }
+        gnitz_wire::validate_pk_tuple(pk_indices, cols.len(), MAX_PK_COLUMNS, |c| {
+            let col = &cols[c as usize];
+            (col.type_code, col.nullable != 0)
+        })
+        .map_err(|rule| rule.to_string())?;
+        Ok(Self::new(cols, pk_indices))
+    }
+
     /// Construct a SchemaDescriptor from a column list and PK index list.
     /// Accepts up to `MAX_PK_COLUMNS` entries.
     #[track_caller]
@@ -382,10 +398,9 @@ impl SchemaDescriptor {
     /// sources.
     ///
     /// **A `const fn` whose `assert!`s fire in release and abort the process.**
-    /// Untrusted column lists never reach it directly: `DerivedSchema::push_pk`,
-    /// `build_schema_from_col_defs`, `decode_schema_block`,
-    /// `union_nullability_merge` and `unique_preflight_wire_schema` are the total
-    /// front doors that reject what this would abort on. A `Keyed` prefix is **normalized**: `0` (the persisted "default"
+    /// An untrusted column list goes through [`Self::try_new`], which rejects
+    /// what this would abort on.
+    /// A `Keyed` prefix is **normalized**: `0` (the persisted "default"
     /// sentinel) and any value past `|PK|` (only reachable from a corrupted
     /// catalog flag) both clamp to the full PK, so `dist_stride == pk_stride` and
     /// routing stays byte-identical to the full-PK default. Every derived schema
@@ -891,19 +906,15 @@ pub fn index_spec_and_schema(
     Ok((spec, schema))
 }
 
-/// Rebuild a [`SchemaDescriptor`] from a meta-schema block. Every wire rule —
-/// region shape, `col_idx` ordering, type-code validity, PK eligibility and
-/// arity — is enforced by the shared codec, so this is only the projection onto
-/// the engine's own type; column names are carried but nothing engine-side reads
-/// one. The arity bound is `MAX_PK_COLUMNS`, the engine's own limit, deliberately
-/// wider than the client's `PK_LIST_MAX_COLS`.
-pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, &'static str> {
-    let sb = gnitz_wire::schema_block::SchemaBlock::decode(data, false, MAX_PK_COLUMNS)?;
+/// Rebuild a [`SchemaDescriptor`] from a meta-schema record. Column names are
+/// carried on the wire but nothing engine-side reads one.
+pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
+    let sb = gnitz_wire::schema_block::decode(data)?;
     let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (col, c) in cols[..sb.num_columns()].iter_mut().zip(sb.columns()) {
         *col = SchemaColumn::new(c.type_code, c.meta.nullable as u8);
     }
-    Ok(SchemaDescriptor::new(&cols[..sb.num_columns()], sb.pk_indices()))
+    SchemaDescriptor::try_new(&cols[..sb.num_columns()], sb.pk_indices())
 }
 
 /// The delta store's stamp column: the `_tick` round number, leading the delta

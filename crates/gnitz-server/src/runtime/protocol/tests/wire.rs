@@ -10,12 +10,6 @@ use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
 use gnitz_wire::{ClientVerb, WireFlags, WireStatus};
 
-/// The anonymous schema block a frame for `sd` under `target_id` carries — what
-/// every producer in the tree hands `WireMsg::schema_block`.
-fn sblock(sd: &SchemaDescriptor, target_id: u64) -> Vec<u8> {
-    encode_schema_block(sd, target_id as u32)
-}
-
 /// The narrow frame schema every fixture here uses: `(u64 pk, u64 val)`.
 fn simple_schema() -> SchemaDescriptor {
     u64_pk_schema(SchemaColumn::new(type_code::U64, 0))
@@ -48,7 +42,7 @@ fn make_blobless_batch(n: usize) -> Batch {
 #[test]
 fn encode_decode_roundtrip_with_schema() {
     let sd = simple_schema();
-    let blk = sblock(&sd, 1);
+    let blk = encode_schema_block(&sd);
     let wire = WireMsg {
         target_id: 1,
         schema_block: Some(&blk),
@@ -69,7 +63,7 @@ fn encode_decode_roundtrip_with_schema() {
 fn encode_decode_roundtrip_with_data() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
-    let blk = sblock(&sd, 5);
+    let blk = encode_schema_block(&sd);
     let wire = WireMsg {
         target_id: 5,
         schema_block: Some(&blk),
@@ -106,7 +100,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     ];
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
-        let block = crate::catalog::encode_schema_block(&original, 0);
+        let block = crate::catalog::encode_schema_block(&original);
         let decoded = decode_schema_block(&block).unwrap();
         assert!(
             original == decoded,
@@ -132,7 +126,7 @@ fn encode_decode_string_column() {
     bb.end_row();
     let batch = bb.finish();
 
-    let blk = sblock(&sd, 10);
+    let blk = encode_schema_block(&sd);
     let wire = WireMsg {
         target_id: 10,
         schema_block: Some(&blk),
@@ -158,7 +152,7 @@ fn encode_decode_string_column() {
 fn every_frame_shape() -> Vec<Vec<u8>> {
     let sd = simple_schema();
     let batch = make_simple_batch(1, 42);
-    let blk = sblock(&sd, 1);
+    let blk = encode_schema_block(&sd);
     vec![
         WireMsg { target_id: 1, ..Default::default() }.encode_to_vec(),
         WireMsg {
@@ -204,7 +198,7 @@ fn encode_writes_exactly_the_predicted_size() {
     let batch = make_simple_batch(100, 999);
     let empty = make_blobless_batch(0);
     let few = make_blobless_batch(4);
-    let blk = sblock(&sd, 0);
+    let blk = encode_schema_block(&sd);
     let msgs = [
         WireMsg::default(),
         WireMsg {
@@ -305,7 +299,7 @@ fn decode_wire_round_trips_every_control_field() {
 fn a_range_chunk_frames_identically_to_the_same_rows_whole() {
     let sd = simple_schema();
     let batch = make_blobless_batch(8);
-    let blk = sblock(&sd, 1);
+    let blk = encode_schema_block(&sd);
 
     // A budget sized for exactly three rows of this schema.
     let (chunk, _) = batch.wire_chunk_within(2, 0, make_blobless_batch(3).wire_byte_size());
@@ -410,7 +404,7 @@ fn decode_applies_batch_flags() {
     let schema = two_col_schema(0);
     let batch = make_batch(&schema, &[(1, 1, 42)]);
 
-    let blk = sblock(&schema, 7);
+    let blk = encode_schema_block(&schema);
     let wire = WireMsg {
         target_id: 7,
         schema_block: Some(&blk),
@@ -490,7 +484,7 @@ fn scattered_roundtrips_over_a_padded_schema() {
         ],
         &[0],
     );
-    let blk = sblock(&sd, 3);
+    let blk = encode_schema_block(&sd);
 
     let mut bb = BatchBuilder::new(sd);
     for i in 0..8u32 {

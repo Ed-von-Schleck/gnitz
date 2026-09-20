@@ -271,7 +271,7 @@ fn fixture_priming(views: &[(u64, &str, u64)], prime: impl FnOnce(&mut Session))
                 schema: Arc::clone(&schema),
                 indexes: Vec::new(),
             }),
-            delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema).unwrap()), tid)),
+            delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema).unwrap()))),
         };
         client.mirror.as_deref_mut().unwrap().views.insert(tid, entry);
     }
@@ -371,7 +371,7 @@ fn only_a_vanished_relation_pays_a_probe() {
 #[test]
 fn a_leftover_slot_does_not_shift_the_replies() {
     let schema = Arc::new(view_schema());
-    let rs = ReplySchema::new(Arc::clone(&schema), 7);
+    let rs = ReplySchema::new(Arc::clone(&schema));
     let spec = gnitz_wire::ReadSpec::all_rows(gnitz_wire::ReadBound::None);
     // A slot submitted and never drained: what an aborting park leaves behind.
     let (mut client, peer, _log) = fixture_priming(&[(7, "a", 4), (8, "b", 4)], |s| {

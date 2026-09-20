@@ -1,6 +1,6 @@
-//! The meta-schema block: this crate's adapter to the shared codec.
+//! The meta-schema record: this crate's adapter to the shared codec.
 //!
-//! The block's layout and every rule about what makes one admissible live in
+//! The record's layout and every rule about what makes one admissible live in
 //! `gnitz_wire::schema_block` — the one implementation the client runs too.
 //! What stays here is the translation between a [`SchemaDescriptor`] (+ the
 //! [`ColumnDef`]s that name it) and the codec's neutral per-column facts.
@@ -31,20 +31,11 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
             let def = defs.map(|d| &d[ci]);
             SchemaBlockCol {
                 type_code: col.type_code,
-                // For compound PKs the position within `pk_indices()` is what
-                // determines decode order — column order ≠ PK order in general
-                // (e.g. `PRIMARY KEY (b, a)`). Carrying the position lets the
-                // decoder rebuild `pk_indices` exactly as the user wrote them.
                 meta: ColMeta {
                     nullable: col.nullable != 0,
                     hidden: def.is_some_and(|d| d.is_hidden),
                     serial: def.is_some_and(|d| d.is_serial),
                     scale: def.map_or(0, |d| d.scale),
-                    pk_pos: schema
-                        .pk_indices()
-                        .iter()
-                        .position(|&p| p as usize == ci)
-                        .map(|p| p as u8),
                 },
                 name: def.map_or(&b""[..], |d| d.name.as_bytes()),
             }
@@ -54,28 +45,24 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
 
 /// Encode `schema`'s physical column shape, without the names and catalog flags
 /// nothing engine-side reads.
-pub(crate) fn encode_schema_block(schema: &SchemaDescriptor, tid: u32) -> Vec<u8> {
-    gnitz_wire::schema_block::encode(tid, &schema_block_cols(schema, None))
+pub(crate) fn encode_schema_block(schema: &SchemaDescriptor) -> Vec<u8> {
+    gnitz_wire::schema_block::encode(&schema_block_cols(schema, None), schema.pk_indices())
 }
 
 /// [`encode_schema_block`] plus the per-column catalog facts the descriptor
-/// does not carry — name, `is_hidden`, `is_serial`. The block a *client*
+/// does not carry — name, `is_hidden`, `is_serial`. The record a *client*
 /// decodes into a `Schema`, so it is the one that must be named.
-pub(in crate::catalog) fn encode_named_schema_block(
-    schema: &SchemaDescriptor,
-    defs: &[ColumnDef],
-    tid: u32,
-) -> Vec<u8> {
-    gnitz_wire::schema_block::encode(tid, &schema_block_cols(schema, Some(defs)))
+pub(in crate::catalog) fn encode_named_schema_block(schema: &SchemaDescriptor, defs: &[ColumnDef]) -> Vec<u8> {
+    gnitz_wire::schema_block::encode(&schema_block_cols(schema, Some(defs)), schema.pk_indices())
 }
 
 impl CatalogEngine {
-    /// `tid`'s named schema block; `None` for an unregistered id.
+    /// `tid`'s named schema record; `None` for an unregistered id.
     pub(crate) fn schema_block(&self, tid: i64) -> Option<Rc<Vec<u8>>> {
         self.caches.relations.get(&tid).map(|e| e.schema_block.clone())
     }
 
-    /// The schema block a reply to a client at `client_version` carries, and the
+    /// The schema record a reply to a client at `client_version` carries, and the
     /// version its flags report.
     pub(crate) fn negotiated_schema_block(&self, tid: i64, client_version: u16) -> (Option<Rc<Vec<u8>>>, u16) {
         let Some(entry) = self.caches.relations.get(&tid) else {

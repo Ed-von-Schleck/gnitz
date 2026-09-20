@@ -247,7 +247,7 @@ impl<'a> CommittedTail<'a> {
                 let verdict = if msg.slot_intact(w, bytes) {
                     ipc::decode_sal_slot(bytes).map(drop)
                 } else {
-                    Err("slot checksum mismatch")
+                    Err("slot checksum mismatch".to_string())
                 };
                 if let Err(e) = verdict {
                     gnitz_warn!(

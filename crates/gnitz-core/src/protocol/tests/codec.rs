@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::types::TypeCode;
+use gnitz_wire::PK_LIST_MAX_COLS;
 
 /// Every fact a `Schema` carries must survive the block round-trip: column
 /// types, nullability, names, the `hidden`/`serial` markers, and the
@@ -16,7 +17,7 @@ fn schema_survives_the_block_roundtrip() {
         ],
         pk_cols: vec![0],
     };
-    let block = encode_schema_block(&original, 0);
+    let block = encode_schema_block(&original);
     assert_eq!(schema_from_block(&block).unwrap(), original);
 }
 
@@ -31,14 +32,14 @@ fn compound_pk_decodes_in_declared_order() {
         // `PRIMARY KEY (b, a)` — the reverse of column order.
         pk_cols: vec![1, 0],
     };
-    let block = encode_schema_block(&original, 9);
+    let block = encode_schema_block(&original);
     assert_eq!(schema_from_block(&block).unwrap().pk_cols, vec![1, 0]);
 }
 
-/// A column name that spills the German-string inline cell must come back
-/// whole, from the block's blob heap.
+/// A long column name must come back whole: the record carries each name as its
+/// own length-prefixed section, with no inline/spill split.
 #[test]
-fn a_long_column_name_survives_the_blob_heap() {
+fn a_long_column_name_survives_the_record() {
     let long = "a_column_name_well_past_the_inline_cell";
     let original = Schema {
         columns: vec![
@@ -47,38 +48,36 @@ fn a_long_column_name_survives_the_blob_heap() {
         ],
         pk_cols: vec![0],
     };
-    let block = encode_schema_block(&original, 1);
+    let block = encode_schema_block(&original);
     assert_eq!(schema_from_block(&block).unwrap().columns[1].name, long);
 }
 
-/// The wire caps the client enforces on a decoded block. The rejections
-/// themselves are `gnitz-wire`'s; what this pins is that the client asks for
-/// *its* limits — in particular `PK_LIST_MAX_COLS`, not the engine's wider
-/// `MAX_PK_COLUMNS`.
+/// The client's PK arity cap is `PK_LIST_MAX_COLS` — a key it accepts must
+/// round-trip through the persisted PK-list word — so it must refuse a record
+/// the shared codec, capped wider, admits.
 #[test]
 fn a_pk_wider_than_the_client_codec_is_rejected() {
     let n = PK_LIST_MAX_COLS + 1;
     let cols: Vec<SchemaBlockCol> = (0..n)
-        .map(|i| SchemaBlockCol {
+        .map(|_| SchemaBlockCol {
             type_code: TypeCode::U64 as u8,
-            meta: ColMeta {
-                pk_pos: Some(i as u8),
-                ..Default::default()
-            },
+            meta: ColMeta::default(),
             name: b"k",
         })
         .collect();
-    let block = gnitz_wire::schema_block::encode(1, &cols);
+    let pk: Vec<u32> = (0..n as u32).collect();
+    let block = gnitz_wire::schema_block::encode(&cols, &pk);
+    assert!(gnitz_wire::schema_block::decode(&block).is_ok(), "the codec admits it");
     assert!(matches!(schema_from_block(&block), Err(ProtocolError::DecodeError(_))));
 }
 
 #[test]
-fn a_truncated_block_is_a_decode_error_not_a_panic() {
+fn a_truncated_record_is_a_decode_error_not_a_panic() {
     let schema = Schema {
         columns: vec![ColumnDef::new("id", TypeCode::U64, false)],
         pk_cols: vec![0],
     };
-    let block = encode_schema_block(&schema, 1);
+    let block = encode_schema_block(&schema);
     for cut in [0, 8, block.len() / 2, block.len() - 1] {
         assert!(schema_from_block(&block[..cut]).is_err(), "cut at {cut}");
     }

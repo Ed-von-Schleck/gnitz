@@ -103,7 +103,7 @@ impl CatalogEngine {
         }
         self.caches
             .relations
-            .insert(id, RelationEntry::new(id, schema, defs, fks, pk_repeats));
+            .insert(id, RelationEntry::new(schema, defs, fks, pk_repeats));
     }
 
     /// The FK columns of `id` that carry a derived index circuit: those outside its
@@ -241,7 +241,7 @@ impl CatalogEngine {
                 .relations
                 .get_mut(&owner)
                 .expect("every registered relation has an entry")
-                .reschema(owner, &schema, &defs);
+                .reschema(&schema, &defs);
         }
         Ok(())
     }

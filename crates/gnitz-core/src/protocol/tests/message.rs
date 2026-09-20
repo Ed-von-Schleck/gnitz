@@ -79,11 +79,7 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     for (fam, (exp_tid, exp_mode, exp_rows)) in decoded.iter().zip(expected) {
         assert_eq!(fam.tid, exp_tid);
         assert_eq!(fam.mode, exp_mode);
-        // The schema block is this family's, keyed under this family's tid.
-        assert_eq!(
-            gnitz_wire::read_u32_le(fam.schema_block, gnitz_wire::WAL_OFF_TID),
-            exp_tid
-        );
+        // The schema record is this family's.
         let block_schema = schema_from_block(fam.schema_block).unwrap();
         assert_eq!(block_schema, schema);
         // ... and the data block decodes against it, with this family's rows.

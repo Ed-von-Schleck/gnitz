@@ -552,8 +552,8 @@ mod spine_tests {
         let (s, peer) = pair();
         let mut c = GnitzClient::from_session(s);
         let sa = schema_a();
-        let reply_schema = crate::protocol::ReplySchema::new(std::sync::Arc::new(sa.clone()), 9);
-        let block_len = encode_schema_block(&sa, 9).len();
+        let reply_schema = crate::protocol::ReplySchema::new(std::sync::Arc::new(sa.clone()));
+        let block_len = encode_schema_block(&sa).len();
         let h = std::thread::spawn(move || {
             let req = peer.drain_request();
             assert!(req.len() >= block_len, "the reply schema rides the request");
@@ -633,8 +633,9 @@ mod spine_tests {
         let cold_len = peer.drain_request().len();
         assert_eq!(
             cold_len - warm_len,
-            encode_schema_block(&sa, 4).len(),
-            "the cold frame is longer by exactly the schema block the warm ones omitted"
+            4 + encode_schema_block(&sa).len(),
+            "the cold frame is longer by exactly the schema record the warm ones omitted, \
+             plus the length prefix that announces it"
         );
 
         // The second stale push fails too — every push encoded at the stale stamp does.

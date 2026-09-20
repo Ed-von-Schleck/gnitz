@@ -593,7 +593,7 @@ impl GnitzClient {
         spec: &gnitz_wire::ReadSpec,
         reply_schema: &Arc<Schema>,
     ) -> Result<ZSetBatch, ClientError> {
-        let reply_schema = ReplySchema::new(Arc::clone(reply_schema), table_id);
+        let reply_schema = ReplySchema::new(Arc::clone(reply_schema));
         self.round_trip(Request::ScanSpec {
             target_id: table_id,
             spec,
@@ -736,7 +736,7 @@ impl GnitzClient {
         view_id: u64,
         view_schema: &Arc<Schema>,
     ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
-        self.delta_read(view_id, 0, &ReplySchema::new(Arc::clone(view_schema), view_id))
+        self.delta_read(view_id, 0, &ReplySchema::new(Arc::clone(view_schema)))
     }
 
     /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
@@ -759,7 +759,7 @@ impl GnitzClient {
         cursor: DeltaCursor,
         reply_schema: &Arc<Schema>,
     ) -> Result<(ZSetBatch, DeltaCursor), ClientError> {
-        let rs = ReplySchema::new(Arc::clone(reply_schema), view_id);
+        let rs = ReplySchema::new(Arc::clone(reply_schema));
         let (data, next) = self.delta_read(view_id, cursor.poll_after()?, &rs)?;
         Ok((data, cursor.advanced_to(next)?))
     }

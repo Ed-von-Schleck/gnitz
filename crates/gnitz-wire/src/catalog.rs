@@ -81,12 +81,6 @@ pub(crate) const fn pay_index_in_fam(id: u64, name: &str) -> usize {
     pay_index_in_keyed(f.cols, name, f.pk_cols)
 }
 
-/// Region index of the payload column named `name` in a single-leading-key list:
-/// the fixed regions, then the payload columns in schema order.
-pub(crate) const fn payload_region_in(cols: &[WireSysCol], name: &str) -> usize {
-    crate::REG_PAYLOAD_START + pay_index_in_keyed(cols, name, LEADING_COL_PK)
-}
-
 // Every system table's column shape is defined once, here, and reached through
 // `SYS_FAMILIES` (by `sys_family_index(id)`), which pairs each shape with the
 // key that goes with it: the engine builds its `SchemaDescriptor`s and the COL_TAB
@@ -162,8 +156,8 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
     // `ColMeta::hidden`; the engine never branches on it.
     col("is_hidden", TypeCode::U64, false),
-    // A DECIMAL column's scale, else 0. Echoed into reply schema blocks' scale
-    // bits; the engine never branches on it.
+    // A DECIMAL column's scale, else 0. Echoed into a reply schema block's
+    // `ColMeta::scale`; the engine never branches on it.
     col("scale", TypeCode::U64, false),
 ];
 
@@ -179,18 +173,6 @@ pub(crate) const IDX_TAB_COLS: &[WireSysCol] = &[
     // planner's name/column probe, so a second `U64` would widen every row for
     // one bit.
     col("flags", TypeCode::U64, false),
-];
-
-/// The reply **schema block**'s column shape. Not a system table — it is the
-/// per-message block describing a reply's columns — but it is a wire schema both
-/// ends exchange, so it belongs with them. Its codec is
-/// [`crate::schema_block`], which is what both ends actually run; the `flags`
-/// word is packed by [`crate::schema_block::ColMeta`].
-pub(crate) const META_SCHEMA_COLS: &[WireSysCol] = &[
-    col("col_idx", TypeCode::U64, false),
-    col("type_code", TypeCode::U64, false),
-    col("flags", TypeCode::U64, false),
-    col("name", TypeCode::String, false),
 ];
 
 pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[
@@ -578,9 +560,9 @@ const PK_LIST_COL_MAX: u32 = (1 << PK_LIST_COL_BITS) - 1;
 /// [`validate_pk_col_list`] caller passes when it holds no column count of its own.
 pub const PK_LIST_COL_LIMIT: usize = 1 << PK_LIST_COL_BITS;
 
-/// The PK-list arity rule: `1..=PK_LIST_MAX_COLS` columns. One predicate behind
-/// every spelling of it — the panicking constructors, the fallible decode, and
-/// the validator — so they cannot disagree on the bound.
+/// The **user-facing** PK-list arity rule: `1..=PK_LIST_MAX_COLS` columns — what
+/// the persisted `u64` word can round-trip. One predicate behind every spelling
+/// of *that* bound, so they cannot disagree on it.
 #[inline]
 pub(crate) const fn pk_list_arity_ok(n: usize) -> bool {
     n >= 1 && n <= PK_LIST_MAX_COLS
@@ -673,7 +655,8 @@ pub fn validate_pk_col_list(cols: &[u32], ncols: usize) -> Result<(), String> {
     // The rule itself is `validate_pk_indices`. Only the wording differs — these
     // lists are also secondary-index column lists, which "primary key ..." would
     // misname.
-    crate::validate_pk_indices(cols, ncols).map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))
+    crate::validate_pk_indices(cols, ncols, crate::PK_LIST_MAX_COLS)
+        .map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))
 }
 
 /// Validate a `CLUSTER BY` column list against the table's PK, returning the
@@ -732,7 +715,7 @@ pub fn unpack_pk_cols(packed: u64) -> Result<PkColList, crate::PkRule> {
         return Err(if n == 0 {
             crate::PkRule::Empty
         } else {
-            crate::PkRule::TooManyColumns { count: n }
+            crate::PkRule::TooManyColumns { count: n, max: PK_LIST_MAX_COLS }
         });
     }
     let mut cols = [0u32; PK_LIST_MAX_COLS];

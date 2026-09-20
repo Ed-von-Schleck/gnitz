@@ -561,7 +561,7 @@ pub fn plan_create_table(
     // The admission rule is `gnitz-wire`'s, shared with the client gateway and the
     // engine catalog. Only the wording is the planner's: it names the offending
     // column, which the engine cannot.
-    let pk_stride = gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), |c| {
+    let pk_stride = gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
         let cd = &cols[c as usize];
         (cd.type_code as u8, cd.is_nullable)
     })

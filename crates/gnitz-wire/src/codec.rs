@@ -141,3 +141,13 @@ impl<'a> Reader<'a> {
         }
     }
 }
+
+/// The extent of the `u32`-length-prefixed section at `off`, or `None` when
+/// `buf` does not hold it whole — [`Reader::bytes32`] for a walk that carries
+/// absolute offsets instead of a cursor.
+pub(crate) fn bytes32_extent(buf: &[u8], off: usize) -> Option<std::ops::Range<usize>> {
+    let body = off.checked_add(4)?;
+    let n = u32::from_le_bytes(buf.get(off..body)?.try_into().unwrap()) as usize;
+    let end = body.checked_add(n)?;
+    (end <= buf.len()).then_some(body..end)
+}

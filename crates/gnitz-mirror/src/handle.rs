@@ -322,7 +322,11 @@ impl MirrorStore for Mirror {
                 panic!("injected mirror ingest panic");
             }
             if !blocks.is_empty() {
-                let desc = crate::register::descriptor_of_block(&rec.block)?;
+                let desc = m
+                    .registry
+                    .relation(tid as i64)
+                    .ok_or_else(|| MirrorError::Engine(format!("relation {tid} has no open copy")))?
+                    .schema();
                 let applied = m.ingest_blocks(tid, blocks, stamped, desc)?;
                 m.applied_bytes += applied;
             }

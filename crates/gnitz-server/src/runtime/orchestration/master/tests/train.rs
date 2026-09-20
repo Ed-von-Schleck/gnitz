@@ -99,7 +99,7 @@ fn send_frame(
     batch: Option<&Batch>,
 ) -> usize {
     use crate::runtime::wire::{self as ipc};
-    let block = schema.map(|s| crate::catalog::encode_schema_block(s, 1));
+    let block = schema.map(crate::catalog::encode_schema_block);
     let msg = ipc::WireMsg {
         target_id: 1,
         flags,

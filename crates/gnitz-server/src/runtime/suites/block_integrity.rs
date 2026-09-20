@@ -1,15 +1,15 @@
-//! The descriptive bytes of a WAL block — its 32-byte header, outside the block's
-//! own checksum, so only the exact region-size relations constrain it — and the
-//! per-slot checksum a zoned SAL group's directory carries.
+//! The descriptive bytes a frame carries outside any checksum — a data block's
+//! 32-byte WAL header and a schema record's arity prefix — and the per-slot
+//! checksum a zoned SAL group's directory carries.
 
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::schema::decode_schema_block;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
-use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_TID};
+use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_TID};
 
-/// A schema WAL block for a 4-column schema.
-fn schema_block_4col() -> Vec<u8> {
+/// A schema record for a 4-column schema, keyed by its first column.
+fn schema_record_4col() -> Vec<u8> {
     use gnitz_store::schema::SchemaColumn;
     use gnitz_wire::type_code;
     let cols = [
@@ -19,41 +19,58 @@ fn schema_block_4col() -> Vec<u8> {
         SchemaColumn::new(type_code::F64, 1),
     ];
     let schema = SchemaDescriptor::new(&cols, &[0]);
-    crate::catalog::encode_schema_block(&schema, 7)
+    crate::catalog::encode_schema_block(&schema)
 }
 
 // ---------------------------------------------------------------------------
 // The header's forgeable fields, through the real consumers
 // ---------------------------------------------------------------------------
 
-/// A forged lower `COUNT` on a schema block passes the col_idx monotonicity
-/// check on the truncated prefix `[0, 1, …]`, so only the exact region size
-/// rejects it — every fixed-stride region must be exactly `count` rows wide, and
-/// a lowered `count` leaves each one too long. The descriptor it would otherwise
-/// yield is what every later block for that table is decoded against.
+/// A forged lower `column_count` leaves every field it does read well-formed,
+/// so only the trailing-bytes rule rejects it.
 #[test]
-fn schema_block_count_forgeries_are_rejected() {
-    let clean = schema_block_4col();
+fn schema_record_column_count_forgeries_are_rejected() {
+    let clean = schema_record_4col();
     assert_eq!(
-        decode_schema_block(&clean).expect("clean schema block").num_columns(),
+        decode_schema_block(&clean).expect("clean schema record").num_columns(),
         4
     );
     for forged_count in [3u32, 2, 1] {
         let mut buf = clean.clone();
-        gnitz_wire::write_u32_le(&mut buf, WAL_OFF_COUNT, forged_count);
-        assert_eq!(
-            decode_schema_block(&buf).err(),
-            Some("schema block region size mismatch"),
-            "schema COUNT 4 -> {forged_count} must be rejected"
+        gnitz_wire::write_u32_le(&mut buf, 0, forged_count);
+        let err = decode_schema_block(&buf).expect_err("column_count 4 -> {forged_count}");
+        assert!(
+            err.contains("trailing bytes"),
+            "column_count 4 -> {forged_count}: {err}"
         );
     }
 }
 
-/// Every single-bit flip in either block kind's header, driven through the
-/// parser the SAL replay path uses. An accepted decode must be observationally
-/// identical to the clean one. `TID` is deliberately unconstrained, and the
-/// assertion below says so rather than letting it pass as "no observable
-/// change".
+/// The arity prefix carries no redundancy of its own, so every flip in it must
+/// either be refused or change the descriptor.
+#[test]
+fn no_flip_in_a_schema_records_arity_prefix_is_silently_inert() {
+    let mut buf = schema_record_4col();
+    let reference = decode_schema_block(&buf).expect("clean");
+    let prefix = 4 + 1 + reference.pk_indices().len();
+    sweep_bit_flips(&mut buf, 0..prefix, |byte, bit, buf| {
+        let Ok(decoded) = decode_schema_block(buf) else {
+            return;
+        };
+        let same = decoded.num_columns() == reference.num_columns()
+            && decoded.pk_indices() == reference.pk_indices()
+            && (0..decoded.num_columns()).all(|c| {
+                decoded.columns[c].type_code == reference.columns[c].type_code
+                    && decoded.columns[c].nullable == reference.columns[c].nullable
+            });
+        assert!(!same, "schema prefix byte {byte} bit {bit} changed nothing observable");
+    });
+}
+
+/// Every single-bit flip in a data block's header, driven through the parser the
+/// SAL replay path uses. An accepted decode must be observationally identical to
+/// the clean one. `TID` is deliberately unconstrained, and the assertion below
+/// says so rather than letting it pass as "no observable change".
 #[test]
 fn single_bit_header_sweep_changes_nothing_observable() {
     let schema = make_schema_u64_i64();
@@ -90,28 +107,6 @@ fn single_bit_header_sweep_changes_nothing_observable() {
         "every `TID` flip is accepted and inert — nothing on the SAL path reads it, \
          and routing uses the group header's digest-protected `target_id`"
     );
-
-    let mut buf = schema_block_4col();
-    let reference = decode_schema_block(&buf).expect("clean");
-    sweep_bit_flips(&mut buf, 0..WAL_HEADER_SIZE, |byte, bit, buf| {
-        if (WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8).contains(&byte) {
-            return;
-        }
-        let Ok(decoded) = decode_schema_block(buf) else {
-            return;
-        };
-        assert_eq!(
-            decoded.num_columns(),
-            reference.num_columns(),
-            "schema byte {byte} bit {bit} changed the column count"
-        );
-        for c in 0..decoded.num_columns() {
-            assert_eq!(
-                decoded.columns[c].type_code, reference.columns[c].type_code,
-                "schema byte {byte} bit {bit} changed column {c}"
-            );
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------

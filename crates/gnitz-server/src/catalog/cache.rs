@@ -24,7 +24,6 @@ pub(in crate::catalog) struct RelationEntry {
 
 impl RelationEntry {
     pub(in crate::catalog) fn new(
-        id: i64,
         schema: &SchemaDescriptor,
         defs: &[ColumnDef],
         fks: Vec<FkEdge>,
@@ -32,16 +31,16 @@ impl RelationEntry {
     ) -> Self {
         RelationEntry {
             schema_version: NonZeroU16::MIN,
-            schema_block: Rc::new(encode_named_schema_block(schema, defs, id as u32)),
+            schema_block: Rc::new(encode_named_schema_block(schema, defs)),
             fks,
             pk_repeats,
         }
     }
 
     /// Re-encode the schema block for a changed column set, under a new version.
-    pub(in crate::catalog) fn reschema(&mut self, id: i64, schema: &SchemaDescriptor, defs: &[ColumnDef]) {
+    pub(in crate::catalog) fn reschema(&mut self, schema: &SchemaDescriptor, defs: &[ColumnDef]) {
         self.schema_version = self.schema_version.checked_add(1).unwrap_or(NonZeroU16::MIN);
-        self.schema_block = Rc::new(encode_named_schema_block(schema, defs, id as u32));
+        self.schema_block = Rc::new(encode_named_schema_block(schema, defs));
     }
 }
 

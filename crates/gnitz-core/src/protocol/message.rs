@@ -8,9 +8,9 @@ use gnitz_wire::wal::WalBlock;
 /// data block, and still ships its schema block.
 pub fn encode_frame(hdr: ControlHeader, blob: &[u8], schema: Option<&Schema>, data: Option<&ZSetBatch>) -> Vec<u8> {
     let tid = hdr.target_id;
-    let schema = schema.map(|s| encode_schema_block(s, tid as u32));
+    let schema = schema.map(encode_schema_block);
     let data = data.filter(|b| !b.is_empty()).map(|b| b.wal_block(tid));
-    let head = frame_head_size(blob.len(), schema.as_ref().map_or(0, Vec::len));
+    let head = frame_head_size(blob.len(), schema.as_ref().map(Vec::len));
     let mut out = Vec::with_capacity(head + data.as_ref().map_or(0, WalBlock::size));
     out.resize(head, 0);
     let written = encode_frame_head(&mut out, &hdr, blob, schema.as_deref(), data.is_some());
@@ -29,7 +29,7 @@ pub fn encode_push_txn(
 ) -> Vec<u8> {
     let families: Vec<(WireConflictMode, Vec<u8>, WalBlock<'_>)> = families
         .iter()
-        .map(|(tid, schema, batch, mode)| (*mode, encode_schema_block(schema, *tid as u32), batch.wal_block(*tid)))
+        .map(|(tid, schema, batch, mode)| (*mode, encode_schema_block(schema), batch.wal_block(*tid)))
         .collect();
     gnitz_wire::txn_frame::encode_push_txn(&families, preconditions)
 }

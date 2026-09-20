@@ -205,7 +205,7 @@ fn read_route_reaches_the_owners_a_bound_names() {
 
     const NW: usize = 4;
     let keyed = crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U64]);
-    let block = crate::catalog::encode_schema_block(&keyed, 1);
+    let block = crate::catalog::encode_schema_block(&keyed);
     let key = |k: u64| k.to_be_bytes();
     let set_blob = |keys: &[u64]| {
         let keys: Vec<[u8; 8]> = keys.iter().map(|&k| key(k)).collect();
