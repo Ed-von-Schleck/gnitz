@@ -77,7 +77,7 @@ pub(super) fn server_crypto(
     cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
     // gnitz connections are long-lived, so resumption tickets buy nothing, and
     // emitting none saves the post-handshake `NewSessionTicket`: one record, and
-    // one `send_mutex` acquisition ahead of connection_loop's HELLO ACK.
+    // one `send_lock` acquisition ahead of connection_loop's HELLO ACK.
     // 0-RTT stays off (`max_early_data_size` defaults to 0): once a future auth
     // layer gives a session DML authority, replayable early data is replayable DML.
     cfg.send_tls13_tickets = 0;

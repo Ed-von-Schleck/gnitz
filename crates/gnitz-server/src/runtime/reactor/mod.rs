@@ -44,7 +44,7 @@ use wake_queue::WakeQueue;
 #[cfg(test)]
 pub(crate) use io::InboundBudget;
 pub(crate) use io::{ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
-pub use sync::{chan, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard};
+pub use sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
 
 /// The ceilings and deadlines a reactor is built with, fixed for its life.
 /// Startup resolves them from the environment; a test that has to wait one out

@@ -16,7 +16,7 @@ pub(crate) mod zone;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::reactor::{AsyncMutex, WriteGuard};
+use crate::runtime::reactor::{AsyncRwLock, WriteGuard};
 use crate::runtime::w2m::SalWake;
 use crate::runtime::wire::{WireData, WireMsg};
 use gnitz_foundation::fault::Seam;
@@ -868,7 +868,7 @@ pub(crate) struct SalWriter {
     /// log writer's own field — never read off some other per-worker resource.
     num_workers: usize,
     /// Taken by every [`SalExcl`].
-    excl: AsyncMutex,
+    excl: AsyncRwLock,
     /// One wake per worker, in worker order.
     wakes: Vec<SalWake>,
     /// The workers groups written since the last [`SalExcl::wake`] reached.
@@ -891,7 +891,7 @@ impl SalWriter {
             checkpoint_threshold,
             refused_transient: Cell::new(false),
             num_workers,
-            excl: AsyncMutex::default(),
+            excl: AsyncRwLock::default(),
             wakes,
             reached: Cell::new(0),
         }
@@ -901,7 +901,7 @@ impl SalWriter {
     pub(crate) async fn lock(&self) -> SalExcl<'_> {
         SalExcl {
             writer: self,
-            _guard: self.excl.lock().await,
+            _guard: self.excl.write().await,
         }
     }
 
@@ -911,7 +911,7 @@ impl SalWriter {
             writer: self,
             _guard: self
                 .excl
-                .try_lock()
+                .try_write()
                 .expect("an exclusive SAL write found a task holding the writer"),
         }
     }

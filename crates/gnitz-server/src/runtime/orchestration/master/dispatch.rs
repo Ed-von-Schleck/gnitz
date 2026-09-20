@@ -9,7 +9,6 @@ use super::scatter::{with_commit_indices, with_group};
 use super::*;
 use crate::query::{RelayRoute, OUTPUT_RELAY};
 use crate::runtime::orchestration::guard_panic;
-use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{select2, Either};
 use crate::runtime::sal::{SalFit, SalScope};
 use gnitz_foundation::fault::Seam;
@@ -492,20 +491,6 @@ impl MasterDispatcher {
         self.exclusive_round("view tick drain", false, |excl, t| {
             self.write_tick_group(excl, source_id, t)
         })
-    }
-
-    /// Send a scan-shaped read of `kind` and forward the replies to `peer`.
-    pub(crate) async fn fan_out_scan(
-        &self,
-        peer: &Peer,
-        kind: SalMessageKind,
-        template: wire::WireMsg<'_>,
-    ) -> Result<(), WireFault> {
-        forward_scan(
-            peer,
-            &self.scan(DirectGroup { template, ..DirectGroup::new(kind) }).await?,
-        )
-        .await
     }
 
     /// Broadcast a DDL batch to every worker inside `scope`'s zone — one LSN

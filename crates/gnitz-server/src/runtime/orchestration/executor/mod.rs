@@ -1098,7 +1098,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
 async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control::DecodedControl, verb: ClientVerb) {
     let target_id = ctrl.hdr.target_id as i64;
     let client_version = ctrl.hdr.flags.schema_version;
-    let Some((_g, kind)) = read_lock(shared, peer, target_id, Access::Read).await else {
+    let Some((g, kind)) = read_lock(shared, peer, target_id, Access::Read).await else {
         return;
     };
     let lsn = shared.last_tick_lsn.get();
@@ -1153,7 +1153,8 @@ async fn handle_read(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::contro
         blob: &blob,
         ..Default::default()
     };
-    let result = disp.fan_out_scan(peer, sal_kind, template).await;
+    let group = DirectGroup { template, ..DirectGroup::new(sal_kind) };
+    let result = fan_out_scan(shared, peer, g, group).await;
     finish_scan_fanout(peer, target_id, lsn, result);
 }
 
@@ -1625,6 +1626,19 @@ fn terminal_scan_msg(target_id: i64, arg0: u64, arg1: u64) -> ipc::WireMsg<'stat
     }
 }
 
+/// One scan-shaped fan-out: the cut under `guard`, then the reply train without
+/// it — a slow client's egress must not hold the catalog read lock.
+async fn fan_out_scan(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    guard: ReadGuard,
+    group: DirectGroup<'_>,
+) -> Result<(), WireFault> {
+    let lease = shared.disp().scan(group).await?;
+    drop(guard);
+    forward_scan(peer, &lease).await
+}
+
 /// Finish one scan-shaped fan-out: the terminal frame stamped with the
 /// pre-dispatch `lsn`, or the worker's own fault.
 fn finish_scan_fanout(peer: &Peer, target_id: i64, lsn: u64, result: Result<(), WireFault>) {
@@ -1640,7 +1654,7 @@ fn finish_scan_fanout(peer: &Peer, target_id: i64, lsn: u64, result: Result<(), 
 async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob: &[u8]) {
     // `UserRead`: a `ReadSpec` has only a fan-out realization, which a catalog
     // family has no form of.
-    let Some((_g, _kind)) = read_lock(shared, peer, target_id, Access::UserRead).await else {
+    let Some((g, _kind)) = read_lock(shared, peer, target_id, Access::UserRead).await else {
         return;
     };
     let lsn = shared.last_tick_lsn.get();
@@ -1649,10 +1663,11 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, target_id: i64, blob
         blob,
         ..Default::default()
     };
-    let result = shared
-        .disp()
-        .fan_out_scan(peer, SalMessageKind::ScanSpec, template)
-        .await;
+    let group = DirectGroup {
+        template,
+        ..DirectGroup::new(SalMessageKind::ScanSpec)
+    };
+    let result = fan_out_scan(shared, peer, g, group).await;
     finish_scan_fanout(peer, target_id, lsn, result);
 }
 
@@ -1900,9 +1915,9 @@ async fn scan_multi_body(
 /// The master-local half of [`handle_read`]: a SCAN of a catalog family. The rows
 /// come from the catalog, never from the frame, so the frame is not a parameter.
 ///
-/// Takes NO lock: the caller holds the catalog read guard, and `read_ok` is
-/// `!has_writer && writers_waiting == 0`, so a nested read parks forever the
-/// moment a DDL writer queues.
+/// Takes NO lock: the caller holds the catalog read guard, and the lock is
+/// writer-preferring, so a nested read parks forever the moment a DDL writer
+/// queues.
 async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, target_id: i64, client_version: u16) {
     match guard_panic("scan", || shared.cat_mut().scan(target_id)) {
         Ok(b) => {

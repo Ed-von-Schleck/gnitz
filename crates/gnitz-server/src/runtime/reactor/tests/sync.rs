@@ -1,5 +1,5 @@
-//! The single-threaded async primitives: `oneshot`, `chan`, `AsyncMutex`,
-//! `AsyncRwLock` and the cancellation shapes each must survive.
+//! The single-threaded async primitives: `oneshot`, `chan`, `AsyncRwLock` and
+//! the cancellation shapes each must survive.
 
 use std::cell::Cell as StdCell;
 
@@ -7,7 +7,7 @@ use super::super::test_support::*;
 use super::super::*;
 
 // ------------------------------------------------------------------
-// Primitives: oneshot / chan / AsyncMutex / AsyncRwLock
+// Primitives: oneshot / chan / AsyncRwLock
 // ------------------------------------------------------------------
 
 #[test]
@@ -45,15 +45,15 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
 }
 
 #[test]
-fn async_mutex_serializes_access() {
+fn async_rwlock_write_serializes_access() {
     let r = make_reactor();
     let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::default());
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     for i in 0u32..3 {
-        let m = Rc::clone(&mutex);
+        let m = Rc::clone(&lock);
         let ord = Rc::clone(&order);
         r.spawn(async move {
-            let g = m.lock().await;
+            let g = m.write().await;
             let len = ord.borrow().len();
             ord.borrow_mut().push(i);
             // Fail loudly if another task entered the section while this
@@ -118,37 +118,36 @@ fn async_rwlock_writer_waits_for_readers() {
     assert!(r_end_pos < w_start_pos, "writer must run after reader finishes: {o:?}");
 }
 
-/// A `WriteFuture` dropped while parked (e.g. via `select2`) leaves a stale
-/// waker behind. The release path must wake every candidate — handing the lock
-/// to that one entry alone would block every live waiter forever.
+/// A `WriteFuture` dropped while parked (e.g. via `select2`) takes its queue entry
+/// with it, and must hand the lock on: absorbing the release into an entry nobody
+/// polls again would block every live waiter forever.
 #[test]
-fn async_mutex_cancelled_waiter_does_not_block_remaining() {
+fn async_rwlock_cancelled_waiter_does_not_block_remaining() {
     let r = make_reactor();
-    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::default());
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
 
-    // Task A: holds the mutex, yields once (letting B and C park), then releases.
-    let m_a = Rc::clone(&mutex);
+    // Task A: holds the lock, yields once (letting B and C park), then releases.
+    let m_a = Rc::clone(&lock);
     r.spawn(async move {
-        let _g = m_a.lock().await;
+        let _g = m_a.write().await;
         YieldOnce::new().await;
     });
 
     // Task B: races lock acquisition against an immediately-ready future.
     // `select2` polls the lock future first (it parks its waker), then
-    // `ready()` resolves. The lock future is dropped, but its stale waker
-    // remains in the queue.
-    let m_b = Rc::clone(&mutex);
+    // `ready()` resolves, dropping the lock future while it is queued.
+    let m_b = Rc::clone(&lock);
     r.spawn(async move {
-        let _ = select2(m_b.lock(), std::future::ready(())).await;
+        let _ = select2(m_b.write(), std::future::ready(())).await;
     });
 
-    // Task C: must acquire the mutex once A releases — must not be
-    // blocked by B's stale waker absorbing the single-pop release signal.
-    let m_c = Rc::clone(&mutex);
+    // Task C: must acquire the lock once A releases, B's cancellation
+    // notwithstanding.
+    let m_c = Rc::clone(&lock);
     let d = Rc::clone(&done);
     r.spawn(async move {
-        let _g = m_c.lock().await;
+        let _g = m_c.write().await;
         d.set(true);
     });
 
@@ -157,7 +156,7 @@ fn async_mutex_cancelled_waiter_does_not_block_remaining() {
     }
     assert!(
         done.get(),
-        "task C must acquire the mutex after task B's cancelled waiter"
+        "task C must acquire the lock after task B's cancelled waiter"
     );
 }
 
@@ -166,8 +165,7 @@ fn async_mutex_cancelled_waiter_does_not_block_remaining() {
 // writer.
 // ─────────────────────────────────────────────────────────────────
 
-/// When a write waiter is queued (writers_waiting > 0), ReadFuture
-/// must block. The writer acquires the lock before the new reader.
+/// A waiting writer blocks a new reader, and acquires the lock before it.
 #[test]
 fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     let r = make_reactor();
@@ -210,8 +208,8 @@ fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     );
 }
 
-/// Readers hold the lock and the cancelled WriteFuture was the last live write
-/// waiter: the readers `writers_waiting > 0` was blocking must now enter.
+/// Readers hold the lock and the cancelled `WriteFuture` was the last waiting
+/// writer: the readers it was blocking must now enter.
 #[test]
 fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     let r = make_reactor();
@@ -230,8 +228,8 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
         }
     });
 
-    // Task B: races write acquisition vs cancel_rx. WriteFuture parks
-    // (writers_waiting=1); cancel_rx stays Pending until cancel_tx sends.
+    // Task B: races write acquisition vs cancel_rx. The WriteFuture parks;
+    // cancel_rx stays Pending until cancel_tx sends.
     let l_b = Rc::clone(&lock);
     r.spawn(async move {
         let _ = select2(l_b.write(), cancel_rx).await;
@@ -264,8 +262,8 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
 /// Whatever the mix, every task must run to completion and the lock must end
 /// holding nothing.
 ///
-/// The three counters are the whole assertion — the waiter queues legitimately
-/// retain stale wakers at rest, so an empty-queue check would be wrong.
+/// `is_quiescent` is the whole assertion: it is blind to `read_waiters`, which
+/// legitimately retains stale wakers at rest.
 #[test]
 fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
     const SHAPES: u32 = 4;
@@ -315,6 +313,43 @@ fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
             assert!(lock.is_quiescent(), "mix {mix} of {len}: the lock did not end idle");
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// The write handoff: one release admits one writer.
+// ─────────────────────────────────────────────────────────────────
+
+/// A release admits one parked writer, not all of them: `N` writers cost
+/// `2N - 1` polls of the acquire, where waking all of them costs
+/// `1 + (N - 1)(N + 2) / 2`. Polls, not wall clock.
+#[test]
+fn async_rwlock_write_release_admits_one_writer() {
+    const N: usize = 16;
+    let r = make_reactor();
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
+    let polls: Rc<StdCell<usize>> = Rc::new(StdCell::new(0));
+
+    for _ in 0..N {
+        let l = Rc::clone(&lock);
+        let c = Rc::clone(&polls);
+        r.spawn(async move {
+            let mut acquire = std::pin::pin!(l.write());
+            let _g = std::future::poll_fn(|cx| {
+                c.set(c.get() + 1);
+                acquire.as_mut().poll(cx)
+            })
+            .await;
+            // Without this nothing contends and every acquire takes one poll.
+            YieldOnce::new().await;
+        });
+    }
+
+    r.block_until_idle();
+    assert!(
+        polls.get() <= 3 * N,
+        "each release must wake one writer: {} polls for {N} writers",
+        polls.get()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────

@@ -8,8 +8,8 @@
 //! and weights over TLS, big frames in both directions, UNIX+TLS
 //! coexistence, HELLO version rejection, restart fail-fast, pipelining
 //! liveness (the four-party deadlock shape), and the per-send eviction
-//! deadline that keeps a `send_mutex`-holding send from wedging a
-//! connection against a TCP-alive non-reading peer.
+//! deadline that keeps a send holding the connection's send lock from
+//! wedging it against a TCP-alive non-reading peer.
 
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -420,13 +420,13 @@ fn inbound_cap_breach_closes_stalled_connection() {
     });
 }
 
-// ── 11. per-send eviction deadline (send_mutex must never wedge) ───────────
+// ── 11. per-send eviction deadline (the send lock must never wedge) ───────
 
 #[test]
 fn stalled_scan_client_is_evicted_by_send_deadline() {
     // The client completes HELLO, asks for a big scan, then stops reading
     // entirely — no recv-side death, no inbound-cap breach; ONLY the send
-    // deadline can fire. Holding send_mutex across an unbounded send would
+    // deadline can fire. Holding the send lock across an unbounded send would
     // wedge the connection forever; the deadline's shutdown must evict
     // instead. This exercises the one guarded send primitive every TLS
     // send shares (`Peer::send` → `send_bytes` → `send_owned`): a forwarded
@@ -455,7 +455,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
             "server must evict the stalled scan client within the deadline window"
         );
 
-        // No cluster freeze / no mutex wedge: a concurrent client still works.
+        // No cluster freeze / no lock wedge: a concurrent client still works.
         assert_eq!(setup.scan(tid).unwrap().batch.len(), 200_000);
     });
 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 
 use crate::runtime::reactor::{
-    chan, AsyncMutex, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
+    chan, AsyncRwLock, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
 };
 
 /// Size of the ciphertext window each recv lands in.
@@ -92,7 +92,7 @@ pub(crate) struct TlsShared {
     /// flusher shuts the socket down and exits.
     closed: Cell<bool>,
     /// Held across every ciphertext extraction and send. Teardown never takes it.
-    send_mutex: AsyncMutex,
+    send_lock: AsyncRwLock,
     /// Wakes the flusher task.
     flush_tx: chan::Sender<()>,
 }
@@ -143,7 +143,7 @@ impl TlsShared {
             state: RefCell::new(sess),
             _conn_guard: conn_guard,
             closed: Cell::new(false),
-            send_mutex: AsyncMutex::default(),
+            send_lock: AsyncRwLock::default(),
             flush_tx,
         });
         let ingress = TlsIngress {
@@ -164,7 +164,7 @@ impl TlsShared {
         self.flush_tx.send(());
     }
 
-    /// Send everything rustls has queued. Callers hold `send_mutex`, which is
+    /// Send everything rustls has queued. Callers hold `send_lock`, which is
     /// what keeps records in emission order.
     async fn flush_records(&self, _: &WriteGuard) -> Result<(), PeerGone> {
         let mut out = PooledSendBuf(acquire_buf());
@@ -177,9 +177,9 @@ impl TlsShared {
         self.reactor.send_owned(&self.conn, SendBody::Pooled(out)).await
     }
 
-    /// Encrypt and send `body` under one `send_mutex` hold; rustls sizes the chunks.
+    /// Encrypt and send `body` under one `send_lock` hold; rustls sizes the chunks.
     pub(crate) async fn send(&self, body: SendBody) -> Result<(), PeerGone> {
-        let send = self.send_mutex.lock().await;
+        let send = self.send_lock.write().await;
         let len = body.bytes().len();
         let mut off = 0;
         while off < len {
@@ -216,7 +216,7 @@ impl TlsShared {
 }
 
 /// Ciphertext in, plaintext frames out, inside the recv completion. Never locks
-/// `send_mutex` and never sends — it only notifies the flusher — so a client
+/// `send_lock` and never sends — it only notifies the flusher — so a client
 /// pipelining pushes ahead of reading its ACKs cannot deadlock it.
 struct TlsIngress {
     tls: Rc<TlsShared>,
@@ -246,7 +246,7 @@ impl RecvFilter for TlsIngress {
 impl Drop for TlsIngress {
     fn drop(&mut self) {
         // Shut the socket down so a writer parked on a full sndbuf errors out and
-        // releases `send_mutex`, rather than wedging teardown behind it.
+        // releases `send_lock`, rather than wedging teardown behind it.
         self.tls.conn.shutdown();
         self.tls.closed.set(true);
         self.tls.notify_flusher();
@@ -258,7 +258,7 @@ impl Drop for TlsIngress {
 async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
     loop {
         {
-            let send = conn.send_mutex.lock().await;
+            let send = conn.send_lock.write().await;
             let _ = conn.flush_records(&send).await;
         } // released before the teardown check and before parking on rx
 

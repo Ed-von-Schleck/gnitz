@@ -1,5 +1,5 @@
 //! Async primitives for the reactor's single thread: `oneshot`, `chan`,
-//! `AsyncMutex`, `AsyncRwLock` and `select2`.
+//! `AsyncRwLock` and `select2`.
 //!
 //! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the reactor never leaves
 //! its thread, so a channel send costs no atomic and a waker registration no
@@ -101,10 +101,6 @@ pub mod chan {
             std::future::poll_fn(|cx| self.inner.borrow_mut().poll(cx)).await
         }
 
-        /// Non-blocking receive: returns `Some(T)` if the queue has an item,
-        /// `None` otherwise. Never awaits — which is what lets the committer
-        /// batch whatever is already pipelined behind a request without waiting
-        /// on a timer for more.
         pub fn try_recv(&mut self) -> Option<T> {
             self.inner.borrow_mut().pop()
         }
@@ -112,54 +108,38 @@ pub mod chan {
 }
 
 // ---------------------------------------------------------------------------
-// AsyncMutex
-// ---------------------------------------------------------------------------
-
-/// Mutual exclusion with no payload: the guard is a drop token, and what it
-/// protects lives outside. No shared mode — [`AsyncRwLock`] is there for that.
-#[derive(Default)]
-pub struct AsyncMutex(AsyncRwLock);
-
-impl AsyncMutex {
-    pub fn lock(&self) -> WriteFuture {
-        self.0.write()
-    }
-
-    /// The guard, iff nothing holds the lock now.
-    pub fn try_lock(&self) -> Option<WriteGuard> {
-        self.0.try_write()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // AsyncRwLock (writer-preference)
 // ---------------------------------------------------------------------------
 //
-// Payload-free, like `AsyncMutex`: both guards are drop tokens admitting
-// entry to a critical section, and what they protect lives outside.
-// Writer-preference blocks new readers as soon as a writer parks, so a
-// writer cannot starve behind a stream of readers.
+// Payload-free: both guards are drop tokens admitting entry to a critical
+// section, and what they protect lives outside. Writer-preference blocks new
+// readers as soon as a writer parks, so a writer cannot starve behind a stream
+// of readers.
+
+/// A parked writer's waker, shared by its `WriteFuture` and its queue entry.
+type WakerSlot = RefCell<Option<Waker>>;
 
 #[derive(Default)]
 struct RwLockInner {
     readers: usize,
     has_writer: bool,
-    /// Live parked `WriteFuture`s, counted off each future's own `parked` flag
-    /// and not off `write_waiters.len()`, which drops to 0 a wake before they do.
-    writers_waiting: usize,
-    /// Wakers of parked futures. A cancelled future leaves its entry behind, so
-    /// these hold stale wakers at rest — never assert one empty, and never hand
-    /// the lock to a single entry out of one. [`AsyncRwLock::wake_next`] takes
-    /// the whole queue, which is what makes a stale entry harmless.
+    /// Woken as a set: `read_ok` admits all of them or none, so there is nothing
+    /// here to choose between. A cancelled reader's waker stays behind, harmlessly.
     read_waiters: VecDeque<Waker>,
-    write_waiters: VecDeque<Waker>,
+    /// Parked `WriteFuture`s, woken one at a time in queue order. A woken entry
+    /// keeps its place, its slot emptied, until its future acquires or drops.
+    write_waiters: VecDeque<Rc<WakerSlot>>,
 }
 
 impl RwLockInner {
+    fn unqueue(&mut self, waiter: &Rc<WakerSlot>) {
+        self.write_waiters.retain(|w| !Rc::ptr_eq(w, waiter));
+    }
+
     /// A reader may enter: no writer holds the lock and none is waiting, so a
     /// stream of readers cannot starve a writer.
     fn read_ok(&self) -> bool {
-        !self.has_writer && self.writers_waiting == 0
+        !self.has_writer && self.write_waiters.is_empty()
     }
 
     /// A writer may enter: nobody holds the lock in either mode.
@@ -179,11 +159,11 @@ impl AsyncRwLock {
     }
 
     pub fn write(&self) -> WriteFuture {
-        WriteFuture { lock: self.clone(), parked: false }
+        WriteFuture { lock: self.clone(), waiter: None }
     }
 
-    /// The write guard iff [`RwLockInner::write_ok`]: nobody holds the lock in
-    /// either mode. A parked writer does not refuse it.
+    /// The write guard iff nobody holds the lock in either mode. A parked writer
+    /// does not refuse it.
     pub fn try_write(&self) -> Option<WriteGuard> {
         let mut s = self.0.borrow_mut();
         if !s.write_ok() {
@@ -193,29 +173,26 @@ impl AsyncRwLock {
         Some(WriteGuard { lock: self.clone() })
     }
 
-    /// Wake every future the current state now admits — writers first, readers
-    /// only when no writer waits. The whole queue, since it may hold stale
-    /// wakers; the first woken task to poll acquires and the rest re-park.
-    ///
-    /// Called by every transition that can admit someone: the two guard
-    /// releases and a cancelled `WriteFuture`. Miss one and its waiters park
-    /// until the next release, which for a reader behind the catalog lock means
-    /// until the next DDL.
+    /// Admit whoever the state now allows: the first parked writer, or every
+    /// parked reader when no writer waits.
     fn wake_next(&self) {
-        // Scoped so the borrow cannot span the wakes: a wake re-enters the run
-        // queue and can drive a poll that borrows this state again.
-        let wakers = {
-            let mut s = self.0.borrow_mut();
-            if s.write_ok() && s.writers_waiting > 0 {
-                std::mem::take(&mut s.write_waiters)
-            } else if s.read_ok() {
-                std::mem::take(&mut s.read_waiters)
-            } else {
-                VecDeque::new()
-            }
+        let mut s = self.0.borrow_mut();
+        let next = if s.write_ok() {
+            s.write_waiters.front().cloned()
+        } else {
+            None
         };
-        for w in wakers {
-            w.wake();
+        if let Some(slot) = next {
+            drop(s);
+            if let Some(waker) = slot.borrow_mut().take() {
+                waker.wake();
+            }
+        } else if s.read_ok() {
+            let queued = std::mem::take(&mut s.read_waiters);
+            drop(s);
+            for w in queued {
+                w.wake();
+            }
         }
     }
 
@@ -229,12 +206,12 @@ impl AsyncRwLock {
         self.wake_next();
     }
 
-    /// True iff nothing holds or waits for the lock. The waiter queues are not
-    /// part of it — they retain stale wakers by design; see their own doc.
+    /// True iff nothing holds or waits for the lock. `read_waiters` is not part
+    /// of it: it retains stale wakers by design; see its own doc.
     #[cfg(test)]
     pub(super) fn is_quiescent(&self) -> bool {
         let s = self.0.borrow();
-        s.readers == 0 && !s.has_writer && s.writers_waiting == 0
+        s.readers == 0 && !s.has_writer && s.write_waiters.is_empty()
     }
 }
 
@@ -267,42 +244,39 @@ impl Drop for ReadGuard {
 
 pub struct WriteFuture {
     lock: AsyncRwLock,
-    /// Whether this future is counted in `writers_waiting`. Re-polling a parked
-    /// future must not count it twice, and a `select2` re-polls a parked future
-    /// on every wake.
-    parked: bool,
+    /// This future's entry in `write_waiters`: `Some` iff it is queued.
+    waiter: Option<Rc<WakerSlot>>,
 }
 
 impl Future for WriteFuture {
     type Output = WriteGuard;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
-        // Split borrow: `parked` is written while `lock`'s state is borrowed, and
-        // the two fields are disjoint.
-        let Self { lock, parked } = self.get_mut();
+        let Self { lock, waiter } = self.get_mut();
         let mut s = lock.0.borrow_mut();
         if s.write_ok() {
             s.has_writer = true;
-            if *parked {
-                s.writers_waiting -= 1;
-                *parked = false;
+            if let Some(w) = waiter.take() {
+                s.unqueue(&w);
             }
             return Poll::Ready(WriteGuard { lock: lock.clone() });
         }
-        if !*parked {
-            s.writers_waiting += 1;
-            *parked = true;
+        match waiter {
+            Some(w) => crate::runtime::reactor::park_waker(&mut w.borrow_mut(), cx.waker()),
+            None => {
+                let w = Rc::new(RefCell::new(Some(cx.waker().clone())));
+                s.write_waiters.push_back(Rc::clone(&w));
+                *waiter = Some(w);
+            }
         }
-        s.write_waiters.push_back(cx.waker().clone());
         Poll::Pending
     }
 }
 
 impl Drop for WriteFuture {
     fn drop(&mut self) {
-        if !self.parked {
-            return;
-        }
-        self.lock.0.borrow_mut().writers_waiting -= 1;
+        let Some(waiter) = self.waiter.take() else { return };
+        self.lock.0.borrow_mut().unqueue(&waiter);
+        // This future may have been the last writer blocking the parked readers.
         self.lock.wake_next();
     }
 }
@@ -334,8 +308,6 @@ where
     A: Future,
     B: Future,
 {
-    // Stack-pinned (`pin!`), not `Box::pin`: select2 runs per client egress
-    // frame, so two heap allocations per call are worth avoiding.
     let mut a = std::pin::pin!(a);
     let mut b = std::pin::pin!(b);
     std::future::poll_fn(move |cx| {
