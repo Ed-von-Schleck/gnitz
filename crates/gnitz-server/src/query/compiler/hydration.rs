@@ -35,13 +35,17 @@ pub(in crate::query) enum HydrationSeed {
 /// body replays over, or which delta/trace node pair a join body seeds from.
 /// Read off the graph: which nodes emit instructions depends on the worker count.
 fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
-    use gnitz_wire::{JoinKind, OpNode};
+    use gnitz_wire::{JoinKind, MapKind, OpNode};
 
     // 1. From the sink's input, walk back through single-input Filter/Map nodes.
     let mut cur = loaded.inputs(loaded.sink()?).unary();
     loop {
         match loaded.op(cur) {
-            OpNode::Filter(_) | OpNode::Map(_) => cur = loaded.inputs(cur).unary(),
+            // `Reindex`/`HashRow` overwrite the PK region the linear seed
+            // indexes the source store by.
+            OpNode::Filter(_) | OpNode::Map(MapKind::Projection(_) | MapKind::Compute(_)) => {
+                cur = loaded.inputs(cur).unary()
+            }
             // The linear shape: the whole program replays over the source store,
             // seeded at this `ScanDelta`'s own register.
             OpNode::ScanDelta { source, .. } => {

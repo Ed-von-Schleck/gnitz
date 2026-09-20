@@ -248,7 +248,8 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
             id: vid as u64,
             registry: engine.registry(),
         };
-        compile_view(site, view_schema, false).map(drop)
+        let loaded = load_circuit(engine.registry(), vid as u64)?;
+        compile_view(&loaded, site, view_schema, false).map(drop)
     };
     assert!(against(&view_schema, v_u64_only).is_ok(), "an equal pair compiles");
     for vid in [v_u64_i64, v_u64_str] {
@@ -298,7 +299,8 @@ fn a_float_shard_column_is_rejected() {
             id: vid as u64,
             registry: engine.registry(),
         };
-        compile_view(site, &view_schema, false).map(drop)
+        let loaded = load_circuit(engine.registry(), vid as u64)?;
+        compile_view(&loaded, site, &view_schema, false).map(drop)
     };
     assert!(compile(&mut engine, 0).is_ok(), "an integer shard column compiles");
     assert_eq!(
@@ -308,20 +310,23 @@ fn a_float_shard_column_is_rejected() {
     engine.close();
 }
 
+/// A chain of `n` nodes: one `ScanDelta` and `n - 1` `Negate`s.
+fn node_chain(n: usize) -> gnitz_wire::Circuit {
+    use gnitz_wire::NodeInputs;
+    let mut c = gnitz_wire::Circuit::default();
+    c.push(scan_delta(10), NodeInputs::Source).unwrap();
+    for nid in 1..n {
+        c.push(OpNode::Negate, NodeInputs::Unary(nid - 1)).unwrap();
+    }
+    c
+}
+
 /// The node cap is what keeps every downstream `u16` id — registers, tables —
 /// in range without any per-plan arithmetic, so it is enforced in the one
 /// constructor every plan passes through rather than at each plan build.
 #[test]
 fn a_circuit_over_the_node_limit_is_rejected() {
-    use gnitz_wire::NodeInputs;
-    let chain = |n: usize| {
-        let mut c = gnitz_wire::Circuit::default();
-        c.push(scan_delta(10), NodeInputs::Source).unwrap();
-        for nid in 1..n {
-            c.push(OpNode::Negate, NodeInputs::Unary(nid - 1)).unwrap();
-        }
-        LoadedCircuit::new(c)
-    };
+    let chain = |n: usize| LoadedCircuit::new(node_chain(n));
     assert_eq!(
         rejection(chain(MAX_CIRCUIT_NODES + 1)),
         "circuit exceeds the node limit"
@@ -330,4 +335,33 @@ fn a_circuit_over_the_node_limit_is_rejected() {
         chain(MAX_CIRCUIT_NODES).is_ok(),
         "exactly MAX_CIRCUIT_NODES is accepted"
     );
+}
+
+/// The write-side twin of the test above, on the same boundary: the precheck
+/// refuses an over-cap block before it is stored.
+#[test]
+fn an_over_cap_circuit_block_is_refused_at_ingest() {
+    use crate::catalog::SysFamily;
+    use gnitz_store::storage::BatchBuilder;
+
+    let dir = scratch_dir("compiler", "ingest_node_cap");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let vid = engine.allocate_ids(1).unwrap();
+
+    let bundle = |n: usize| {
+        let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
+        gnitz_wire::sys_rows::write_circuit_rows(&mut bb, vid as u64, &node_chain(n));
+        let mut families: [Option<gnitz_store::storage::Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
+        families[SysFamily::CircuitNodes.index()] = Some(bb.finish());
+        engine.precheck_bundle(&families, &[vid])
+    };
+    assert_eq!(
+        rejection(bundle(MAX_CIRCUIT_NODES + 1)),
+        format!("view {vid} exceeds the {MAX_CIRCUIT_NODES}-node circuit limit"),
+    );
+    assert!(
+        bundle(MAX_CIRCUIT_NODES).is_ok(),
+        "exactly MAX_CIRCUIT_NODES is accepted"
+    );
+    engine.close();
 }

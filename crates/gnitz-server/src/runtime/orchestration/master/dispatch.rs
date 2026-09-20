@@ -474,7 +474,8 @@ impl MasterDispatcher {
         ordered.sort_unstable();
         ordered.dedup();
         for vid in ordered {
-            let sources = self.cat().dag().get_source_ids(vid);
+            // Owned: the loop body calls `cat()` again.
+            let sources = self.cat().dag().sources_of(vid).to_vec();
             for src in sources {
                 self.fan_out_backfill(vid, src).map_err(|e| WireFault {
                     status: e.status,

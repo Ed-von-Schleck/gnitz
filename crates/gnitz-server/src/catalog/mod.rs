@@ -43,7 +43,7 @@ mod suites;
 use std::fs;
 use std::rc::Rc;
 
-use crate::query::DagEngine;
+use crate::query::{DagEngine, MAX_CIRCUIT_NODES};
 use gnitz_store::relation::{Relation, RelationKind, RelationRegistry, RelationSpec, Residency, StoreConfig};
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, ReadCursor, StoreError, StoredRow};

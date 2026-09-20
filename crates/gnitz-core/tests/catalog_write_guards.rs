@@ -429,7 +429,7 @@ fn a_column_block_whose_owner_is_never_registered_is_refused() {
     assert!(err.contains("does not create and the catalog does not hold"), "{err}");
 }
 
-/// A circuit `+1` under a foreign `view_id` either makes `has_dependents` of its
+/// A circuit `+1` under a foreign `view_id` either makes the dependents of its
 /// source permanently true, blocking `DROP TABLE` forever, or injects nodes into
 /// a running view's circuit that the next `load_circuit` picks up.
 #[test]

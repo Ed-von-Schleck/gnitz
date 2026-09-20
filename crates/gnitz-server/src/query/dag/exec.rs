@@ -164,7 +164,7 @@ impl DagEngine {
     fn tick_schedule(&self, source_id: i64) -> Vec<Step> {
         let mut schedule: Vec<Step> = Vec::new();
         for producer in std::iter::once(source_id).chain(self.dependent_closure(vec![source_id])) {
-            for &view in self.dep.forward.get(&producer).into_iter().flatten() {
+            for &view in self.dependents_of(producer) {
                 schedule.push(Step { view, producer });
             }
         }

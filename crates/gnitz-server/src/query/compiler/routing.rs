@@ -45,10 +45,13 @@ pub(crate) struct ViewMeta {
     /// The circuit's one `ExchangeShard` is a proven no-op: every row it would
     /// move already sits on the worker owning its distribution key.
     pub(in crate::query) skips_exchange: bool,
+    /// The relation whose PK region this view's output PK region is, byte for
+    /// byte. `None` unless a walk back from the sink proves it.
+    pub(in crate::query) pk_source: Option<i64>,
     /// The circuit moves rows off the worker that produced them: it carries an
     /// output `ExchangeShard`, or a `Join`, whose inputs the runtime join-shard
     /// scatter repartitions without an `ExchangeShard` node.
-    pub(in crate::query) repartitions: bool,
+    exchanges: bool,
     /// source table id → the bound its backfill scan narrows by. Absent for a
     /// source scanned twice, whose one backfill cursor feeds both scans.
     pub(in crate::query) source_bounds: FxHashMap<i64, ReadBound>,
@@ -62,20 +65,17 @@ impl ViewMeta {
             source_routes: FxHashMap::default(),
             output_route: group_key_route(None),
             skips_exchange: false,
-            repartitions: false,
+            pk_source: None,
+            exchanges: false,
             source_bounds: FxHashMap::default(),
         }
     }
 
-    /// Load `view_id`'s circuit and derive its metadata. `Err` when the circuit
-    /// cannot be read, is malformed, or carries an unscatterable source — there
-    /// is no default route, since a key nothing was stored under would scatter a
-    /// delta away from the traces it must meet.
-    pub(in crate::query) fn for_view(registry: &RelationRegistry, view_id: i64) -> Result<ViewMeta, String> {
-        let loaded = load::load_circuit(registry, view_id as u64)?;
-        ViewMeta::derive(&loaded, registry)
-    }
-
+    /// Derive `loaded`'s routing metadata. `Err` when the circuit is malformed
+    /// or carries an unscatterable source — there is no default route, since a
+    /// key nothing was stored under would scatter a delta away from the traces
+    /// it must meet.
+    ///
     /// `registry` supplies what the circuit alone cannot: co-partitioning and the
     /// output-shard elision both test a shard key against a *source relation's*
     /// distribution prefix. `Err` when a source feeding a join states no route
@@ -114,7 +114,12 @@ impl ViewMeta {
         let source_bounds = bounds.into_iter().filter(|(_, b)| *b != ReadBound::None).collect();
 
         let shards: Vec<(NodeId, &[u32])> = loaded.exchange_shards().collect();
-        let repartitions = !shards.is_empty() || join_relay.is_some();
+        let exchanges = !shards.is_empty() || join_relay.is_some();
+        let pk_source = loaded
+            .sink()
+            .ok()
+            .and_then(|sink| scan_through_row_local(loaded, sink))
+            .map(|(tid, _)| tid);
         let join_relay = join_relay.unwrap_or(JoinRelay::WholeKey);
         // Every scatter key of the source is read only by owner filters.
         let owner_trimmed = |tid: &i64| !untrimmed.contains(tid);
@@ -162,7 +167,8 @@ impl ViewMeta {
             source_routes,
             output_route: group_key_route(shard_cols),
             skips_exchange,
-            repartitions,
+            pk_source,
+            exchanges,
             source_bounds,
         })
     }
@@ -177,6 +183,12 @@ impl ViewMeta {
     /// How a side's relayed output is routed: by the view's own shard columns.
     pub(crate) fn output_route(&self) -> &RelayRoute {
         &self.output_route
+    }
+
+    /// The rows land where the circuit's own exchange put them, rather than
+    /// where a source's PK region did.
+    pub(in crate::query) fn places_rows_by_own_key(&self) -> bool {
+        self.pk_source.is_none() && self.exchanges
     }
 
     /// True iff `source_id`'s delta must go through the join scatter: it carries a
@@ -398,9 +410,9 @@ fn scan_consumption(loaded: &LoadedCircuit, scan_nid: NodeId) -> ScanConsumption
     consumed
 }
 
-/// Walk back from the `ExchangeShard` at `enid` through nodes that keep rows on
-/// their worker and the PK region verbatim, to its `ScanDelta`: `(table id, whether
-/// a map was crossed)`. Every input names an earlier node, so no visited guard.
+/// Walk back from `enid` through nodes that keep rows on their worker and the PK
+/// region verbatim, to its `ScanDelta`: `(table id, whether a map was crossed)`.
+/// Every input names an earlier node, so no visited guard.
 fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(i64, bool)> {
     let (mut cur, mut mapped) = (enid, false);
     loop {

@@ -632,16 +632,22 @@ fn test_dep_map_is_the_scan_delta_nodes() {
     }
     engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
 
-    let dep_map = engine.dag.get_dep_map().clone();
     assert_eq!(
-        dep_map.get(&100),
-        Some(&vec![400]),
+        engine.dag.dependents_of(100),
+        &[400i64][..],
         "the repeated source yields one edge"
     );
-    assert_eq!(dep_map.get(&200), Some(&vec![400]), "table 200 must feed view 400");
-    assert_eq!(dep_map.get(&300), None, "a non-ScanDelta node contributes no edge");
+    assert_eq!(
+        engine.dag.dependents_of(200),
+        &[400i64][..],
+        "table 200 must feed view 400"
+    );
+    assert!(
+        engine.dag.dependents_of(300).is_empty(),
+        "a non-ScanDelta node contributes no edge"
+    );
 
-    let mut sources = engine.dag.get_source_ids(400);
+    let mut sources = engine.dag.sources_of(400).to_vec();
     sources.sort_unstable();
     assert_eq!(sources, vec![100, 200], "both ScanDelta sources of view 400");
 
@@ -659,17 +665,16 @@ fn test_dep_map_view_on_view_chain() {
     write_identity_circuit(&mut engine, 107, 100, gnitz_wire::ReadBound::None);
     write_identity_circuit(&mut engine, 108, 107, gnitz_wire::ReadBound::None);
 
-    let dep_map = engine.dag.get_dep_map().clone();
-    assert_eq!(dep_map.get(&100), Some(&vec![107]), "base 100 feeds view 107");
-    assert_eq!(dep_map.get(&107), Some(&vec![108]), "view 107 feeds view 108");
-    assert_eq!(engine.dag.get_source_ids(107), vec![100]);
-    assert_eq!(engine.dag.get_source_ids(108), vec![107]);
+    assert_eq!(engine.dag.dependents_of(100), &[107i64][..], "base 100 feeds view 107");
+    assert_eq!(engine.dag.dependents_of(107), &[108i64][..], "view 107 feeds view 108");
+    assert_eq!(engine.dag.sources_of(107), &[100i64][..]);
+    assert_eq!(engine.dag.sources_of(108), &[107i64][..]);
     engine.close();
 
     // Boot replays the circuit rows into the map.
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(engine.dag.get_source_ids(107), vec![100]);
-    assert_eq!(engine.dag.get_source_ids(108), vec![107]);
+    assert_eq!(engine.dag.sources_of(107), &[100i64][..]);
+    assert_eq!(engine.dag.sources_of(108), &[107i64][..]);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -686,7 +691,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let v1 = register_identity_view(&mut engine, tid, "v1", &cols);
-    assert_eq!(engine.dag.get_dep_map().get(&tid), Some(&vec![v1]));
+    assert_eq!(engine.dag.dependents_of(tid), &[v1][..]);
 
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
     let v2 = engine.allocate_ids(1).unwrap();
@@ -697,14 +702,14 @@ fn test_dep_map_drops_a_retired_views_edges() {
     push_view_tab_row(&mut bb, 1, v2, "v1", 0, 0, 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
     assert_eq!(
-        engine.dag.get_dep_map().get(&tid),
-        Some(&vec![v2]),
+        engine.dag.dependents_of(tid),
+        &[v2][..],
         "the replaced view's edge is gone, the replacement's is present"
     );
 
     // DROP VIEW retires the last edge, so the base table is a dep-map orphan.
     engine.drop_view("public.v1").unwrap();
-    assert_eq!(engine.dag.get_dep_map().get(&tid), None);
+    assert!(engine.dag.dependents_of(tid).is_empty());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

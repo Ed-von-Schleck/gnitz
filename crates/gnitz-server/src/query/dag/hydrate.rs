@@ -18,7 +18,6 @@
 use super::*;
 use crate::query::compiler::{HydrationSeed, Sides};
 use gnitz_store::read::SkeletonHydrator;
-use gnitz_store::relation::Relation;
 use gnitz_store::storage::{PkSetGather, StoreError};
 
 /// Recompute the output rows of the capacity-bounded view `view_id` for `keys`
@@ -33,11 +32,10 @@ use gnitz_store::storage::{PkSetGather, StoreError};
 /// memory.
 impl SkeletonHydrator for DagEngine {
     fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: i64, keys: Vec<u8>) -> Result<Batch, StoreError> {
-        let Some(view_schema) = registry.relation(view_id).map(Relation::schema) else {
-            return Err(StoreError::rejected(format!(
-                "hydrate: view {view_id} is not a registered relation"
-            )));
-        };
+        let view_schema = registry
+            .relation_or_err(view_id)
+            .map_err(|e| e.in_context(&format!("hydrate: view {view_id}")))?
+            .schema();
         // The plan is memoized lazily and is dropped on every rebuild, so a read
         // arriving before the view's first tick would otherwise find nothing.
         let (_, plan) = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;

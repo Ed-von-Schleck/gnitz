@@ -30,7 +30,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 
 // `pub(super)` by default: `dag` is the only module that names the compiler, so
 // a `pub(crate)` would publish it to the catalog and runtime rungs too.
-pub(super) use load::read_circuit_node_row;
+pub(super) use load::{load_circuit, read_circuit_node_row};
 pub(super) use routing::ViewMeta;
 pub(crate) use routing::{RelayRoute, OUTPUT_RELAY};
 
@@ -38,7 +38,10 @@ pub(crate) use routing::{RelayRoute, OUTPUT_RELAY};
 /// the headroom is what makes the `u16` register ids safe under any future node
 /// kind minting up to three per node (`3 × 16_384 + 2 < u16::MAX`). Child-store
 /// ids are bounded independently, by `CircuitState::open_child`.
-pub(in crate::query) const MAX_CIRCUIT_NODES: usize = 16_384;
+///
+/// The catalog precheck rejects an over-cap bundle, so a stored circuit always
+/// loads; this constructor re-checks for the rows no precheck saw.
+pub(crate) const MAX_CIRCUIT_NODES: usize = 16_384;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -268,13 +271,6 @@ impl CompileOutput {
     }
 }
 
-/// One compile's two products: the plan the dag caches, and the plan-free
-/// `ViewMeta` the master relay and the worker dispatch read.
-pub(super) struct CompiledView {
-    pub(in crate::query) output: CompileOutput,
-    pub(in crate::query) meta: ViewMeta,
-}
-
 /// Where a view's rederived children are created, and under what policy.
 #[derive(Clone, Copy)]
 pub(super) struct ViewSite<'a> {
@@ -284,16 +280,14 @@ pub(super) struct ViewSite<'a> {
     pub(in crate::query) registry: &'a RelationRegistry,
 }
 
-/// Compile a circuit for a single view: read the circuit from the system
-/// tables, derive its routing metadata, carve it at its exchanges, then
+/// Compile one view's already-loaded circuit: carve it at its exchanges, then
 /// `build_plan` each side and the post phase.
 pub(super) fn compile_view(
+    loaded: &LoadedCircuit,
     site: ViewSite<'_>,
     view_schema: &SchemaDescriptor,
     bounded: bool,
-) -> Result<CompiledView, String> {
-    let loaded = load::load_circuit(site.registry, site.id)?;
-    let meta = ViewMeta::derive(&loaded, site.registry)?;
+) -> Result<CompileOutput, String> {
     let carve = loaded.carve()?;
     // A per-key replay of an exchanged plan would need the exchange to run too.
     if bounded && !carve.sides.is_empty() {
@@ -304,14 +298,14 @@ pub(super) fn compile_view(
     let mut seeds = Vec::with_capacity(carve.sides.len());
     for side in &carve.sides {
         let ex_in = loaded.inputs(side.shard).unary();
-        let (plan, _) = build_plan(&loaded, &side.nodes, site, self_contained, &[], ex_in)?;
+        let (plan, _) = build_plan(loaded, &side.nodes, site, self_contained, &[], ex_in)?;
         let schema = *plan.vm.program.out_schema();
         // The relay routes by this spec mid-round, where a refusal aborts the master.
         ScatterSpec::GroupKey(side.cols).check(&schema)?;
         seeds.push((side.shard, schema));
         side_plans.push(plan);
     }
-    let (post, post_regs) = build_plan(&loaded, &carve.post, site, self_contained, &seeds, loaded.sink()?)?;
+    let (post, post_regs) = build_plan(loaded, &carve.post, site, self_contained, &seeds, loaded.sink()?)?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
     if !post.vm.program.out_schema().same_physical_layout(view_schema) {
@@ -333,7 +327,7 @@ pub(super) fn compile_view(
     let sides = match sides.len() {
         0 => Sides::Unexchanged {
             hydration: bounded
-                .then(|| derive_hydration(&loaded, &post, &post_regs))
+                .then(|| derive_hydration(loaded, &post, &post_regs))
                 .transpose()?,
         },
         1 => Sides::Unary(sides.pop().expect("one side")),
@@ -345,7 +339,7 @@ pub(super) fn compile_view(
     for sub in output.sub_plans_mut() {
         sub.vm.state.commit();
     }
-    Ok(CompiledView { output, meta })
+    Ok(output)
 }
 
 #[cfg(test)]

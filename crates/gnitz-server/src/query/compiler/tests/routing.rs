@@ -650,28 +650,26 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
     );
 }
 
-/// `repartitions` is the single bit `source_placement` reads before letting a
-/// view inherit its source's placement, so each of its two terms is asserted on a
-/// circuit carrying that term ALONE — a fixture carrying both would pass with
-/// either term deleted. The join term is what an `ExchangeShard` test misses: an
-/// equi-join repartitions its inputs through the runtime join-shard scatter and
-/// emits no shard node to see it by.
+/// `pk_source` names the relation whose PK region the view's output PK region
+/// is. Each shape that breaks that identity — an output shard, a bare equi-join,
+/// a re-keying `Map` with neither — is asserted on a circuit carrying it ALONE.
 #[test]
-fn repartitions_covers_the_output_shard_and_a_bare_join() {
-    let repartitions_of = |nodes, edges| {
+fn pk_source_names_only_the_relation_whose_pk_region_survives_to_the_sink() {
+    let pk_source_of = |nodes, edges| {
         ViewMeta::derive(&loaded_for_test(nodes, edges), &sources([]))
             .unwrap()
-            .repartitions
+            .pk_source
     };
-    assert!(
-        !repartitions_of(
+    assert_eq!(
+        pk_source_of(
             HashMap::from([(0, scan_delta(7)), (1, OpNode::IntegrateSink)]),
             vec![(0, 1, SLOT_IN)],
         ),
+        Some(7),
         "a bare scan re-emits its source's PK region"
     );
-    assert!(
-        repartitions_of(
+    assert_eq!(
+        pk_source_of(
             HashMap::from([
                 (0, scan_delta(7)),
                 (1, OpNode::ExchangeShard { shard_cols: vec![] }),
@@ -679,10 +677,11 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
             ]),
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         ),
-        "a global aggregate shards on the empty key — still a repartition"
+        None,
+        "a global aggregate shards on the empty key — the rows move"
     );
-    assert!(
-        repartitions_of(
+    assert_eq!(
+        pk_source_of(
             HashMap::from([
                 (0, scan_delta(7)),
                 (1, scatter_reindex(7, &[1])),
@@ -705,7 +704,20 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
                 (4, 5, SLOT_IN),
             ],
         ),
-        "an equi-join carries no ExchangeShard and still repartitions"
+        None,
+        "an equi-join carries no ExchangeShard and still re-keys"
+    );
+    assert_eq!(
+        pk_source_of(
+            HashMap::from([
+                (0, scan_delta(7)),
+                (1, scatter_reindex(7, &[1])),
+                (2, OpNode::IntegrateSink),
+            ]),
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
+        ),
+        None,
+        "a bare Reindex exchanges nothing and still replaces the PK region"
     );
 }
 
@@ -772,7 +784,13 @@ fn joins_calling_for_different_relays_are_rejected() {
                 (1, scan_delta(9)),
                 (2, OpNode::IntegrateTrace),
                 (3, OpNode::IntegrateTrace),
-                (4, OpNode::Join { kind: gnitz_wire::JoinKind::Equi, delta_is_right: false }),
+                (
+                    4,
+                    OpNode::Join {
+                        kind: gnitz_wire::JoinKind::Equi,
+                        delta_is_right: false,
+                    },
+                ),
                 (5, OpNode::Join { kind: second, delta_is_right: false }),
                 (6, OpNode::Union),
                 (7, OpNode::IntegrateSink),

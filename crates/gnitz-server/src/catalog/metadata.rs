@@ -140,11 +140,7 @@ impl CatalogEngine {
 
     /// All FK edges where `parent_id` is the parent (empty when none).
     pub(crate) fn fk_children_of(&self, parent_id: i64) -> &[FkEdge] {
-        self.caches
-            .fk_by_parent
-            .get(&parent_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.caches.fk_by_parent.get(&parent_id).map_or(&[], Vec::as_slice)
     }
 
     /// `(index_id, is_unique)` of every live `sys_indices` row on exactly

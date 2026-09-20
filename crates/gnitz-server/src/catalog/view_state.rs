@@ -94,7 +94,7 @@ impl CatalogEngine {
         for &vid in &view_ids {
             let stream_fed = self
                 .dag
-                .get_source_ids(vid)
+                .sources_of(vid)
                 .iter()
                 .any(|s| self.registry.relation(*s).map(Relation::kind) == Some(RelationKind::Stream));
             if stream_fed {

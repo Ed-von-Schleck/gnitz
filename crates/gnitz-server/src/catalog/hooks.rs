@@ -192,9 +192,9 @@ impl CatalogEngine {
             pk_repeats,
         } = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={vid})"))?;
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
-        // so `get_source_ids` resolves here. Re-check for the paths that skip the
+        // so the sources resolve here. Re-check for the paths that skip the
         // precheck (boot replay, worker `ddl_sync`).
-        let source_ids = self.dag.get_source_ids(vid);
+        let source_ids = self.dag.sources_of(vid).to_vec();
         self.validate_view_options(vid, name, props, owner_view_id, &source_ids)?;
         // Stamping the fold is what makes placement transitive:
         // `hook_relation_register` registers this view after its sources, so a view

@@ -202,7 +202,8 @@ fn recover_from_sal(
                     msg.target_id, msg.lsn
                 )
             })?;
-            if swept_bases.contains(&tid) {
+            // `base_tables_reachable_from` returns them sorted and deduplicated.
+            if swept_bases.binary_search(&tid).is_ok() {
                 buffer_pending_delta(&mut pending, tid, effective);
             }
             applied = true;

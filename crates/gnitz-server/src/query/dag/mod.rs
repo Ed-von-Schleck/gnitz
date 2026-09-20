@@ -1,7 +1,7 @@
 //! DagEngine: one memo per view — its routing metadata and its compiled plan —
 //! and the compilation entry point. Epoch execution lives in `exec`, per-key
-//! hydration in `hydrate`, and the dependency map and the plan-free metadata
-//! queries in `meta`.
+//! hydration in `hydrate`, and the dependency map and the placement fold in
+//! `meta`.
 //!
 //! Which relations exist, and the stores behind them, are the `relation` rung's
 //! — a sibling, not a field. Every method here that reaches a relation takes the
@@ -12,9 +12,11 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
+use std::collections::hash_map::Entry;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::query::compiler::{self, CompileOutput, CompiledView, SubPlan, ViewMeta};
+use crate::query::compiler::{self, CompileOutput, SubPlan, ViewMeta};
 use crate::query::vm;
 use gnitz_store::ops;
 use gnitz_store::relation::{CircuitState, Relation, RelationRegistry};
@@ -109,7 +111,7 @@ impl DagEngine {
         table_id: i64,
         schema: SchemaDescriptor,
     ) -> Result<(), String> {
-        if self.has_dependents(table_id) {
+        if !self.dependents_of(table_id).is_empty() {
             return Err(format!(
                 "swap_schema: table {table_id} has dependent views; RESTRICT should have rejected the ALTER"
             ));
@@ -127,12 +129,6 @@ impl DagEngine {
         self.views.remove(&view_id);
     }
 
-    /// Drop every memo, for the tests that assert a cold recompile.
-    #[cfg(test)]
-    pub(crate) fn invalidate_all(&mut self) {
-        self.views.clear();
-    }
-
     /// Apply one `CircuitNodes` delta to the dependency map.
     pub(crate) fn apply_circuit_delta(&mut self, batch: &Batch) {
         self.dep.apply(batch);
@@ -144,6 +140,34 @@ impl DagEngine {
     /// compile `view_id` now and keep it.
     pub(crate) fn compile_view(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<(), String> {
         self.ensure_compiled(registry, view_id).map(drop)
+    }
+
+    /// The memoized per-view routing metadata, computed on first touch. Cheaper
+    /// than full compilation: no code emission. An unreadable or unroutable
+    /// circuit is not memoized, so a later touch retries.
+    pub(crate) fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<&ViewMeta, String> {
+        if !self.views.contains_key(&view_id) {
+            let loaded = compiler::load_circuit(registry, view_id as u64)?;
+            self.memoize_meta(registry, view_id, &loaded)?;
+        }
+        Ok(&self.views.get(&view_id).expect("memoized above").meta)
+    }
+
+    /// Memoize `loaded`'s routing metadata under `view_id`. Skipped when a memo
+    /// exists: a live view's circuit rows never change.
+    fn memoize_meta(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: i64,
+        loaded: &compiler::LoadedCircuit,
+    ) -> Result<(), String> {
+        if let Entry::Vacant(slot) = self.views.entry(view_id) {
+            slot.insert(Box::new(ViewEntry {
+                meta: ViewMeta::derive(loaded, registry)?,
+                plan: None,
+            }));
+        }
+        Ok(())
     }
 
     /// This view's memo, with its plan compiled. `Err` when `view_id` is not a
@@ -160,26 +184,18 @@ impl DagEngine {
     ) -> Result<(&ViewMeta, &mut CompileOutput), String> {
         if self.views.get(&view_id).is_none_or(|e| e.plan.is_none()) {
             let relation = registry.relation_or_err(view_id)?;
-            let compiled = compile_circuit(registry, view_id, relation.directory(), relation).map_err(|err| {
-                format!(
-                    "view_id={view_id} does not compile from its durable circuit — this build no \
+            let loaded = compiler::load_circuit(registry, view_id as u64)?;
+            self.memoize_meta(registry, view_id, &loaded)?;
+            let output =
+                compile_circuit(&loaded, registry, view_id, relation.directory(), relation).map_err(|err| {
+                    format!(
+                        "view_id={view_id} does not compile from its durable circuit — this build no \
                          longer accepts that circuit or its expr blobs, its derived state is \
                          corrupt or unreadable, or resources are exhausted: {err}"
-                )
-            })?;
+                    )
+                })?;
             gnitz_debug!("dag: compiled view_id={}", view_id);
-            let CompiledView { output, meta } = compiled;
-            match self.views.get_mut(&view_id) {
-                // In place, so a plan-less memo keeps the address a caller took.
-                Some(entry) => {
-                    entry.meta = meta;
-                    entry.plan = Some(output);
-                }
-                None => {
-                    self.views
-                        .insert(view_id, Box::new(ViewEntry { meta, plan: Some(output) }));
-                }
-            }
+            self.views.get_mut(&view_id).expect("filled above").plan = Some(output);
         }
         let entry = self.views.get_mut(&view_id).expect("compiled above");
         Ok((&entry.meta, entry.plan.as_mut().expect("compiled above")))
@@ -225,9 +241,10 @@ impl DagEngine {
         let entry = registry
             .relation_or_err(view_id)
             .map_err(|e| format!("pre-flight: {e}"))?;
+        let loaded = compiler::load_circuit(registry, view_id as u64)?;
         // `map(drop)` closes the plan — and the child stores it opened under
         // `root` — before the caller removes the directory.
-        compile_circuit(registry, view_id, root, entry).map(drop)
+        compile_circuit(&loaded, registry, view_id, root, entry).map(drop)
     }
 
     /// Every compiled view plan's operator state, for the ephemeral checkpoint
@@ -244,19 +261,20 @@ impl DagEngine {
     }
 }
 
-/// Read `view_id`'s circuit out of the system tables and compile it, homing
-/// every scratch child under `dir`. The directory is a parameter and not read
-/// off `entry` because the pre-flight compiles into a throwaway root.
+/// Compile `view_id`'s loaded circuit, homing every scratch child under `dir`.
+/// The directory is a parameter and not read off `entry` because the pre-flight
+/// compiles into a throwaway root.
 fn compile_circuit(
+    loaded: &compiler::LoadedCircuit,
     registry: &RelationRegistry,
     view_id: i64,
     dir: &str,
     entry: &Relation,
-) -> Result<compiler::CompiledView, String> {
+) -> Result<CompileOutput, String> {
     let site = compiler::ViewSite { dir, id: view_id as u64, registry };
     // The compiler layer sees only the circuit system table, never `VIEW_TAB`,
     // so it cannot derive whether the view is capacity-bounded.
-    compiler::compile_view(site, &entry.schema(), entry.is_bounded())
+    compiler::compile_view(loaded, site, &entry.schema(), entry.is_bounded())
 }
 
 // ---------------------------------------------------------------------------
