@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::query::vm::Instr;
-use gnitz_store::ops::{merge_schemas_for_join, ClampPreset, JoinProbe, RangeProbe};
+use gnitz_store::ops::{ClampPreset, JoinPlan};
 
 // ---------------------------------------------------------------------------
 // EmitCtx — the per-plan build state every emit arm works against
@@ -215,23 +215,22 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             Ok(OutReg::Delta(out_reg))
         }
 
-        gnitz_wire::OpNode::Join(kind) => {
+        gnitz_wire::OpNode::Join { kind, delta_is_right } => {
             let (delta_reg, trace_reg) = ctx.join_in(nid)?;
-            let a_schema = ctx.reg_schema(delta_reg);
-            let b_schema = ctx.reg_schema(trace_reg);
-            // Every kind produces the same output layout — only the probe differs —
-            // so the schema, the register meta and the operand registers are shared.
-            let probe = match kind {
-                gnitz_wire::JoinKind::Equi => JoinProbe::Equi,
-                gnitz_wire::JoinKind::Range { n_eq, rel } => {
-                    JoinProbe::Range(RangeProbe::new(&a_schema, &b_schema, *n_eq, *rel)?)
-                }
-                gnitz_wire::JoinKind::Cross => JoinProbe::Cross,
-            };
-            let out_schema =
-                merge_schemas_for_join(&a_schema, &b_schema).ok_or("join: merged schema exceeds MAX_COLUMNS")?;
-            let out_reg = ctx.push_delta_reg(out_schema);
-            ctx.builder.push(Instr::JoinDT { delta_reg, trace_reg, out_reg, probe });
+            // One constructor owns every kind's guards and its output layout.
+            let plan = JoinPlan::from_wire(
+                *kind,
+                *delta_is_right,
+                &ctx.reg_schema(delta_reg),
+                &ctx.reg_schema(trace_reg),
+            )?;
+            let out_reg = ctx.push_delta_reg(plan.out_schema);
+            ctx.builder.push(Instr::JoinDT {
+                delta_reg,
+                trace_reg,
+                out_reg,
+                probe: plan.probe,
+            });
             Ok(OutReg::Delta(out_reg))
         }
 
@@ -277,13 +276,18 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             Ok(OutReg::Delta(out_reg))
         }
 
-        gnitz_wire::OpNode::NullExtend { type_codes } => {
+        gnitz_wire::OpNode::NullExtend { type_codes, nulls_first } => {
             let in_reg = ctx.unary_delta_in(nid)?;
             // Built once and homed in `reg_meta`; the op derives its
             // appended-column count from it.
-            let out_schema = gnitz_store::ops::null_extend_output_schema(&ctx.reg_schema(in_reg), type_codes)?;
+            let out_schema =
+                gnitz_store::ops::null_extend_output_schema(&ctx.reg_schema(in_reg), type_codes, *nulls_first)?;
             let out_reg = ctx.push_delta_reg(out_schema);
-            ctx.builder.push(Instr::NullExtend { in_reg, out_reg });
+            ctx.builder.push(Instr::NullExtend {
+                in_reg,
+                out_reg,
+                nulls_first: *nulls_first,
+            });
             Ok(OutReg::Delta(out_reg))
         }
     }

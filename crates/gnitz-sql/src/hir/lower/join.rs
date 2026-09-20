@@ -5,10 +5,10 @@ use super::super::guards::reject_pair_pk_overflow;
 use super::super::{ColId, HirExpr, JoinClass, JoinShape, JoinType, OutKey, ProjEntry, RelExpr};
 use super::exists;
 use super::joincore::{
-    ba_to_ab_cols, emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, pair_pk_coldefs, pair_pk_slots,
-    range_prologue, src_pk_coldefs, EquiTerms,
+    emit_range_null_fill_tail, equi_prologue, join_pk_coldefs, join_terms, pair_pk_coldefs, range_prologue,
+    src_pk_coldefs, EquiTerms,
 };
-use super::prims::{rekey_on_source_pk, self_derived_key};
+use super::prims::rekey_on_source_pk;
 use super::{emit_filter, emit_join_inputs, project_tail, CutMemo, Demand, JoinSide};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
@@ -123,7 +123,7 @@ fn emit_equi(
     unique: [bool; 2],
 ) -> Result<Vec<Branch>, GnitzSqlError> {
     let terms = equi_prologue(cb, class, sides, inputs, kind, unique[1])?;
-    let inner_merged = terms.merged(cb);
+    let inner_merged = terms.inner;
     Ok(vec![(
         emit_equi_null_fill(cb, inner_merged, kind, &terms, unique),
         None,
@@ -145,11 +145,10 @@ fn emit_equi_null_fill(
     if kind == JoinType::Inner {
         return inner_merged;
     }
-    let k = terms.k();
-    let (pl, pr) = (terms.kept_n(true), terms.kept_n(false));
-    // Each preserved side P: the other side supplies the NULL region. Every branch
-    // is built before the first union, so each `π_P` reads `inner_merged` ahead of
-    // the union that could move it.
+    // Each preserved side P: the other side supplies the NULL region, on its own
+    // side of the payload, so every branch is `[_join_pk, A, B]`. All are built
+    // before the first union, so each `π_P` reads `inner_merged` ahead of the
+    // union that could move it.
     let branches: Vec<NodeId> = [true, false]
         .into_iter()
         .filter(|&preserved_is_left| kind.preserves(preserved_is_left))
@@ -158,15 +157,9 @@ fn emit_equi_null_fill(
             let nu_p = terms.nu(cb, inner_merged, preserved_is_left, other_unique);
             // A side that keeps nothing contributes no NULL region at all.
             let o_tcs = terms.kept_type_codes(!preserved_is_left);
-            let ext = if o_tcs.is_empty() {
-                nu_p
-            } else {
-                cb.null_extend(nu_p, &o_tcs)
-            };
-            if preserved_is_left {
-                ext // [_join_pk, A, NULL-B] — canonical
-            } else {
-                cb.map(ext, &ba_to_ab_cols(k, pl, pr).collect::<Vec<_>>())
+            match o_tcs.is_empty() {
+                true => nu_p,
+                false => cb.null_extend(nu_p, &o_tcs, !preserved_is_left),
             }
         })
         .collect();
@@ -222,8 +215,6 @@ fn emit_range(
 /// broadcast delta is paired against.
 fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSide; 2]) -> Vec<Branch> {
     let (left, right) = (&sides[0], &sides[1]);
-    let (pl, pr) = (left.n(), right.n());
-    let (pa, pb) = (left.pa(), right.pa());
 
     let reindex_a = rekey_on_source_pk(cb, input_a, left, ReindexRole::ScatterKey);
     let reindex_b = rekey_on_source_pk(cb, input_b, right, ReindexRole::ScatterKey);
@@ -231,26 +222,10 @@ fn emit_cross(cb: &mut Circuit, [input_a, input_b]: [NodeId; 2], sides: &[JoinSi
     let int_b = cb.worker_filter(reindex_b);
     let trace_a = cb.integrate_trace(int_a);
     let trace_b = cb.integrate_trace(int_b);
-    let join_ab = cb.join(reindex_a, trace_b, JoinKind::Cross); // [a.pk × pa, A, B]
-    let join_ba = cb.join(reindex_b, trace_a, JoinKind::Cross); // [b.pk × pb, B, A]
-
-    // Re-key both terms onto the pair-PK: their key regions are two different
-    // source keys, and a union needs one schema. `keep` is the reindex's OUTPUT
-    // payload order, so BA's `[B, A]` → `[A, B]` rides the same node.
-    let ab = cb.map_reindex(
-        join_ab,
-        &self_derived_key(&pair_pk_slots(sides, pa, pa + pl)),
-        &(pa as u32..(pa + pl + pr) as u32).collect::<Vec<_>>(),
-        ReindexRole::Auxiliary,
-    );
-    let ba_keep: Vec<u32> = ba_to_ab_cols(pb, pl, pr).collect();
-    let ba = cb.map_reindex(
-        join_ba,
-        &self_derived_key(&pair_pk_slots(sides, pb + pr, pb)),
-        &ba_keep,
-        ReindexRole::Auxiliary,
-    );
-    vec![(cb.union(ab, ba), None)] // [pair-PK, A, B]
+    // A keyless term keys on `[left PK…, right PK…]`, which is the pair-PK itself,
+    // so both terms already share one schema.
+    let inner = join_terms(cb, [reindex_a, reindex_b], [trace_a, trace_b], JoinKind::Cross);
+    vec![(inner, None)] // [pair-PK, A, B]
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────────

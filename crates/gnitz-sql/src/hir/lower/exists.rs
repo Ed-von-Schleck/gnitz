@@ -45,7 +45,7 @@ pub(super) fn equi(
     b_unique: bool,
 ) -> Result<Vec<Branch>, GnitzSqlError> {
     let terms = equi_prologue(cb, class, sides, inputs, kind, b_unique)?;
-    let matched = terms.merged(cb);
+    let matched = terms.inner;
     Ok(exists_branches(cb, kind, Split::Matched(matched), terms.p_all(true)))
 }
 

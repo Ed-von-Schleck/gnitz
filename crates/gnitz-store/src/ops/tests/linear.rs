@@ -362,13 +362,33 @@ fn union_of_mismatched_input_layouts_is_rejected() {
     );
 }
 
+/// The schema `NULL_EXTEND` compiles to and the rows its dispatch writes are two
+/// derivations of one layout, off one `nulls_first`: the fill columns must read
+/// NULL at the slots the schema declares nullable, on either side.
+#[test]
+fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
+    let in_schema = make_schema_u64_i64();
+    let input = crate::test_support::make_batch(&in_schema, &[(1, 1, 42)]);
+    for nulls_first in [false, true] {
+        let out_schema = null_extend_output_schema(&in_schema, &[type_code::I64, type_code::STRING], nulls_first)
+            .expect("two fill columns extend cleanly");
+        let out = input.widened_with_nulls(&out_schema, nulls_first);
+
+        let declared: Vec<bool> = out_schema.payload_columns().map(|(_, c)| c.nullable == 1).collect();
+        let written: Vec<bool> = (0..out_schema.num_payload_cols())
+            .map(|pi| gnitz_wire::null_word_get(out.get_null_word(0), pi))
+            .collect();
+        assert_eq!(written, declared, "nulls_first={nulls_first}");
+    }
+}
+
 /// The null-extend output is the input schema plus one nullable column per
 /// fill slot, so the bound is on the *merged* width — a list-length bound alone
 /// would miss a near-max-width input taking a short extension over the limit.
 #[test]
 fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     const GUARD: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
-    let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![type_code::I64; n]);
+    let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![type_code::I64; n], false);
     let narrow = make_schema_u64_i64();
     let out = extend(&narrow, 1).expect("a short type_codes list extends cleanly");
     assert_eq!(out.num_columns(), narrow.num_columns() + 1);

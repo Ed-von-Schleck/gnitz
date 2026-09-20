@@ -3,6 +3,7 @@
 //! `Batch` owns its memory (two `Vec<u8>` buffers — data + blob).
 //! `MemBatch<'a>` in the merge module is the borrowed slice-view counterpart.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::batch_pool::{acquire_arena, debug_poison, recycle_buf, Fill};
@@ -1273,14 +1274,14 @@ impl Batch {
 
     /// A fresh `out_schema` batch of this batch's rows carrying everything but
     /// the PK and NULL regions: blob heap, weights, and every payload column of
-    /// `in_schema`.
+    /// `in_schema`, landed at output slot `first_slot + pi`.
     ///
     /// **`count` is published while the PK and NULL regions are unwritten** — the
     /// caller must write both, or a release build reads uninitialized arena bytes.
-    fn shell_for(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Batch {
+    fn shell_for(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor, first_slot: usize) -> Batch {
         debug_assert!(
-            out_schema.num_payload_cols() >= in_schema.num_payload_cols(),
-            "shell_for copies every payload column of in_schema at its own index",
+            out_schema.num_payload_cols() >= first_slot + in_schema.num_payload_cols(),
+            "shell_for copies every payload column of in_schema at first_slot + its own index",
         );
         let n = self.count;
         let mut out = Self::with_capacity(out_schema, n);
@@ -1294,7 +1295,8 @@ impl Batch {
         out.weight_data_mut().copy_from_slice(self.weight_data());
         for (pi, col) in in_schema.payload_columns() {
             let stride = col.size() as usize;
-            out.col_data_mut(pi).copy_from_slice(&self.col_data(pi)[..n * stride]);
+            out.col_data_mut(first_slot + pi)
+                .copy_from_slice(&self.col_data(pi)[..n * stride]);
         }
         out
     }
@@ -1308,7 +1310,7 @@ impl Batch {
     /// `Consolidated` stays `Consolidated` and the stamp never forces a re-sort
     /// the caller would not otherwise have paid for.
     ///
-    /// The sibling of [`Self::widened_with_null_tail`] rather than a call into it:
+    /// The sibling of [`Self::widened_with_nulls`] rather than a call into it:
     /// that one asserts the two schemas share a PK stride, and this changes it by
     /// eight bytes. The NULL words copy whole here because the payload space is
     /// identical — the delta schema is a reordering of the view's columns, not a
@@ -1324,7 +1326,7 @@ impl Batch {
             return Self::empty_with_schema(out_schema);
         }
 
-        let mut output = self.shell_for(in_schema, out_schema);
+        let mut output = self.shell_for(in_schema, out_schema, 0);
         output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
 
         let stamp = prefix.to_be_bytes();
@@ -1342,14 +1344,13 @@ impl Batch {
         output
     }
 
-    /// Copy every row into `out_schema`, which must extend this batch's schema
-    /// with extra trailing payload columns, filling those columns with NULL.
-    /// The PK region, weights and existing payload columns carry over verbatim,
-    /// so the layout does too.
+    /// Copy every row into `out_schema`, which extends this batch's schema with
+    /// NULL-filled payload columns — ahead of this batch's own under
+    /// `nulls_first`, behind them otherwise. It must share this batch's PK stride.
     ///
-    /// `out_schema` must share this batch's PK stride and have at least as many
-    /// payload columns.
-    pub fn widened_with_null_tail(&self, out_schema: &SchemaDescriptor) -> Self {
+    /// The layout claim carries over: an all-NULL column compares equal on every
+    /// row, so (PK, payload) order and distinctness stay the original columns'.
+    pub fn widened_with_nulls(&self, out_schema: &SchemaDescriptor, nulls_first: bool) -> Self {
         let in_schema = &self.schema;
         debug_assert_eq!(out_schema.pk_stride(), in_schema.pk_stride());
         let in_npc = in_schema.num_payload_cols();
@@ -1359,19 +1360,29 @@ impl Batch {
         if n == 0 {
             return Self::empty_with_schema(out_schema);
         }
+        let n_new = out_npc - in_npc;
 
-        let mut output = self.shell_for(in_schema, out_schema);
+        let first_slot = if nulls_first { n_new } else { 0 };
+        let mut output = self.shell_for(in_schema, out_schema, first_slot);
         output.pk_data_mut().copy_from_slice(self.pk_data());
 
         // Zeroing just the appended columns keeps every counted row fully written
         // without provisioning the whole arena zeroed (`Batch::with_capacity`).
         // Nothing reads the value: every reader decides on the null bit.
-        for pi in in_npc..out_npc {
+        let new_slots = match nulls_first {
+            true => 0..n_new,
+            false => in_npc..out_npc,
+        };
+        for pi in new_slots {
             output.col_data_mut(pi).fill(0);
         }
-        let tail_null_bits = gnitz_wire::all_payload_null_mask(out_npc - in_npc);
+        let new_null_bits = gnitz_wire::all_payload_null_mask(n_new);
         for row in 0..n {
-            let out_null = gnitz_wire::merge_null_words(self.get_null_word(row), tail_null_bits, in_npc);
+            let in_null = self.get_null_word(row);
+            let out_null = match nulls_first {
+                true => gnitz_wire::merge_null_words(new_null_bits, in_null, n_new),
+                false => gnitz_wire::merge_null_words(in_null, new_null_bits, in_npc),
+            };
             output.set_null_word(row, out_null);
         }
 
@@ -1417,9 +1428,9 @@ impl Batch {
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
     /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
-    /// IS the hint, never worse than `find_lower_bound_bytes`. Used by the
-    /// sorted-stream co-group merge, whose probe keys ascend, so the boundary
-    /// only moves forward. `key` must be exactly `pk_stride` OPK bytes.
+    /// IS the hint, never worse than `find_lower_bound_bytes`. Used by the join's
+    /// equi merge walk, whose probe keys ascend, so the boundary only moves
+    /// forward. `key` must be exactly `pk_stride` OPK bytes.
     pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
         let stride = self.pk_stride() as usize;
         let cp = self.pk_col_ptr();
@@ -1622,19 +1633,17 @@ impl Batch {
         self.commit_row(null_word);
     }
 
-    /// Append the payload columns described by `schema` from `src[row]` into
-    /// this batch's payload slots starting at `out_pi_base`, relocating German
-    /// strings into `self.blob`. `null_word` is the **source-side** null word
-    /// (bit `pi` per source payload slot); a null column zero-fills its slot.
-    /// Shared by the whole-row appender above (`out_pi_base == 0`, `schema` =
-    /// the batch's own) and the join row writer, which appends the left half at
-    /// base 0 and the right half at the left payload count. Does not bump
-    /// `count` or touch the layout. `#[inline]` — no per-row cross-file call
-    /// boundary.
+    /// Append one source row's payload columns into this batch's output slots
+    /// `out`, typed by `schema` and fed from source slot `out_pi - out.start`,
+    /// relocating German strings into `self.blob`. `null_word` is the
+    /// **source-side** null word; a null column zero-fills its slot. The join is
+    /// the sole caller, appending each half at that half's own slot range. Does
+    /// not bump `count` or touch the layout. `#[inline]` — no per-row cross-file
+    /// call boundary.
     #[inline]
     pub(crate) fn append_payload_cols<S: RowSource>(
         &mut self,
-        out_pi_base: usize,
+        out: Range<usize>,
         schema: &SchemaDescriptor,
         src: &S,
         row: usize,
@@ -1642,18 +1651,14 @@ impl Batch {
         mut blob_cache: Option<&mut BlobCache>,
     ) {
         let src_blob = src.blob();
-        for (pi, col) in schema.payload_columns() {
+        let base = out.start;
+        for out_pi in out {
+            let col = schema.columns[schema.payload_col_idx(out_pi)];
+            let pi = out_pi - base;
             let cs = col.size() as usize;
             let is_null = gnitz_wire::null_word_get(null_word, pi);
             let cell = (!is_null).then(|| src.get_col_ptr(row, pi, cs));
-            self.append_payload_cell(
-                out_pi_base + pi,
-                col.type_code,
-                cs,
-                cell,
-                src_blob,
-                blob_cache.as_deref_mut(),
-            );
+            self.append_payload_cell(out_pi, col.type_code, cs, cell, src_blob, blob_cache.as_deref_mut());
         }
     }
 
@@ -1733,6 +1738,15 @@ impl Batch {
             return self;
         }
         Self::consolidate_into_new(&self, schema)
+    }
+
+    /// Consolidate this batch where it stands. The tag is read first so an
+    /// already-folded batch is not moved out and back for nothing;
+    /// [`Self::into_consolidated`] then owns the fold.
+    pub fn consolidate_in_place(&mut self, schema: &SchemaDescriptor) {
+        if !self.is_consolidated() {
+            *self = self.take().into_consolidated(schema);
+        }
     }
 
     /// Consolidate a borrowed batch if needed. Returns `None` when the batch is

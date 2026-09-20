@@ -5,15 +5,15 @@ use std::collections::HashMap;
 
 /// The inner-equi-join shape `equi_prologue` produces, as node ids:
 /// two `ScanDelta`s, a reindex `Map` and an `IntegrateTrace` per side, the
-/// two cross-wired `Join(Equi)` terms behind their normalization maps,
-/// a `Union`, a residual `Filter`, a projection `Map`, and the sink.
+/// two cross-wired `Join(Equi)` terms, a `Union`, a residual `Filter`, a
+/// projection `Map`, and the sink.
 ///
 /// ```text
 ///   0 scanA → 2 reindexA ─┬─→ 4 traceA ──────────┐
 ///                         └─────────────┐        │
 ///   1 scanB → 3 reindexB ─┬─→ 5 traceB ─┼→ 6 J_ab│ (delta=2, trace=5)
 ///                         └─────────────┴────────┴→ 7 J_ba (delta=3, trace=4)
-///   6 → 8 map → 10 union ← 9 map ← 7;  10 → 11 filter → 12 map → 13 sink
+///   6 → 8 union ← 7;  8 → 9 filter → 10 map → 11 sink
 /// ```
 fn equi_join(mutate: impl FnOnce(&mut HashMap<NodeId, OpNode>, &mut Vec<(NodeId, NodeId, usize)>)) -> LoadedCircuit {
     let m = || OpNode::Map(MapKind::Projection(vec![0]));
@@ -24,14 +24,12 @@ fn equi_join(mutate: impl FnOnce(&mut HashMap<NodeId, OpNode>, &mut Vec<(NodeId,
         (3, m()),
         (4, OpNode::IntegrateTrace),
         (5, OpNode::IntegrateTrace),
-        (6, OpNode::Join(JoinKind::Equi)),
-        (7, OpNode::Join(JoinKind::Equi)),
-        (8, m()),
-        (9, m()),
-        (10, OpNode::Union),
-        (11, OpNode::Filter(dummy_expr_blob())),
-        (12, m()),
-        (13, OpNode::IntegrateSink),
+        (6, OpNode::Join { kind: JoinKind::Equi, delta_is_right: false }),
+        (7, OpNode::Join { kind: JoinKind::Equi, delta_is_right: true }),
+        (8, OpNode::Union),
+        (9, OpNode::Filter(dummy_expr_blob())),
+        (10, m()),
+        (11, OpNode::IntegrateSink),
     ]);
     let mut edges = vec![
         (0, 2, SLOT_IN),
@@ -43,12 +41,10 @@ fn equi_join(mutate: impl FnOnce(&mut HashMap<NodeId, OpNode>, &mut Vec<(NodeId,
         (3, 7, SLOT_IN),
         (4, 7, SLOT_TRACE),
         (6, 8, SLOT_IN),
-        (7, 9, SLOT_IN),
-        (8, 10, SLOT_IN),
-        (9, 10, SLOT_TRACE),
+        (7, 8, SLOT_TRACE),
+        (8, 9, SLOT_IN),
+        (9, 10, SLOT_IN),
         (10, 11, SLOT_IN),
-        (11, 12, SLOT_IN),
-        (12, 13, SLOT_IN),
     ];
     mutate(&mut nodes, &mut edges);
     loaded_for_test(nodes, edges)

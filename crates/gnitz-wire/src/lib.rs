@@ -303,17 +303,22 @@ pub fn all_payload_null_mask(npc: usize) -> u64 {
     low_bits_mask(npc)
 }
 
+/// A row's null word rebased onto output payload slot `at`. Slot 64 and beyond
+/// hold no bit in a null word, so the shift saturates instead of panicking.
+#[inline]
+pub fn null_word_at(word: u64, at: usize) -> u64 {
+    if at < 64 {
+        word << at
+    } else {
+        0
+    }
+}
+
 /// Concatenate two rows' null words for an output row laid out as
-/// `[left payload..., right payload...]`. The right bits shift up by `left_npc`.
-/// `left_npc` reaches 64 only when the right side has no payload columns, in
-/// which case `right` is 0 and the dropped shift is a no-op.
+/// `[left payload..., right payload...]`.
 #[inline]
 pub fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
-    if left_npc < 64 {
-        left | (right << left_npc)
-    } else {
-        left
-    }
+    left | null_word_at(right, left_npc)
 }
 
 #[inline]

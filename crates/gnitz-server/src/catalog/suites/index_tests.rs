@@ -1441,10 +1441,10 @@ fn test_seek_prefix_matches_projection() {
     };
     assert_eq!(projected.len(), 1);
 
-    let key_size = idx.leading_key_size(2);
+    let spec = IndexKeySpec::new(&[1, 2], &src).unwrap();
+    let key_size = spec.key_size();
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
 
-    let spec = IndexKeySpec::new(&[1, 2], &src).unwrap();
     let opk = spec.seek_prefix(&[(-5i32) as u32 as u128, 42u128]);
     assert_eq!(opk.pk_bytes().len(), key_size);
     assert_eq!(
@@ -1725,7 +1725,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         &[0],
     );
     let idx = make_index_schema(&[1, 2], &src).unwrap();
-    let key_size = idx.leading_key_size(2);
+    let key_size = IndexKeySpec::new(&[1, 2], &src).unwrap().key_size();
     // (a, b) in strictly ascending numeric order — including same-`a` tie pairs.
     let rows: &[(i32, u64)] = &[(i32::MIN, 5), (-1, 0), (-1, 9), (0, 0), (0, 1), (1, 0), (i32::MAX, 7)];
     let mut spans: Vec<Vec<u8>> = Vec::new();

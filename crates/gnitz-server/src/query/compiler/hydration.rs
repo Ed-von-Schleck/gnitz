@@ -53,16 +53,11 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
     }
     let union = cur;
 
-    // 2. Both `Union` inputs must be `Join(Equi)`, optionally behind the
-    //    per-branch `Map` that restores canonical `[A, B]` column order (an
-    //    identity the emitter elides on one branch, a real permutation on the
-    //    other — both are in the circuit either way).
+    // 2. Both `Union` inputs must be `Join(Equi)`: each term writes its own side
+    //    order, so neither branch carries a reordering `Map`.
     let (branch_a, branch_b) = loaded.inputs(union).binary();
-    let join_of = |mut nid: NodeId| -> Result<NodeId, String> {
-        if matches!(loaded.op(nid), OpNode::Map(_)) {
-            nid = loaded.inputs(nid).unary();
-        }
-        matches!(loaded.op(nid), OpNode::Join(JoinKind::Equi))
+    let join_of = |nid: NodeId| -> Result<NodeId, String> {
+        matches!(loaded.op(nid), OpNode::Join { kind: JoinKind::Equi, .. })
             .then_some(nid)
             .ok_or_else(|| "bounded view: union input is not an inner delta/trace join".to_string())
     };

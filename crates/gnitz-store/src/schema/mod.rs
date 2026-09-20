@@ -727,15 +727,6 @@ impl SchemaDescriptor {
         })
     }
 
-    /// Byte width of the leading `n` columns — the sum, never just `columns[0]`,
-    /// since a multi-column span can exceed 16 bytes. Its one production caller
-    /// takes a join trace schema's equi-key prefix width (`ops/join.rs`); index
-    /// code reads `IndexKeySpec::key_size()` instead.
-    #[inline]
-    pub fn leading_key_size(&self, n: usize) -> usize {
-        self.columns[..n].iter().map(|c| c.size() as usize).sum()
-    }
-
     /// Resolve where column `col_idx`'s value lives. The canonical entry point
     /// for reading a column whose index is not statically a payload column.
     #[inline]

@@ -1,4 +1,4 @@
-//! Microbenchmarks for the two delta-trace join probes. Ignored by default;
+//! Microbenchmarks for the three delta-trace join kinds. Ignored by default;
 //! wall-clock on a contended box is not decisive, so take every A/B from
 //! instructions retired:
 //!
@@ -20,12 +20,11 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use super::join::merge_schemas_for_join;
-use super::{op_join_delta_trace, JoinProbe, RangeProbe};
+use super::{op_join_delta_trace, JoinPlan};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout, ReadCursor};
 use crate::test_support::bench_time;
-use gnitz_wire::RangeRel;
+use gnitz_wire::{JoinKind, RangeRel};
 
 /// Rows on the larger side of every fixture. Big enough that the per-call
 /// preamble (one `Batch::with_capacity`, one blob-cache acquire) is noise
@@ -36,6 +35,10 @@ const ITERS: usize = 20;
 
 /// Source counts swept per shape: a `Single`-mode cursor and a `Multi`-mode one.
 const SOURCE_COUNTS: [usize; 2] = [1, 4];
+
+/// Both delta sides: the emit loop writes the two payload halves at whichever
+/// output slot range the side flag puts them.
+const SIDES: [bool; 2] = [false, true];
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -134,6 +137,26 @@ fn cursor_over(schema: &SchemaDescriptor, p: Payload, rows: &[Row], n: usize) ->
 // Timing
 // ---------------------------------------------------------------------------
 
+/// Time `ITERS` calls of one join kind and print the row. The plan is built
+/// outside the timed region, as the compiler bakes it.
+fn time_join(
+    name: String,
+    kind: JoinKind,
+    delta_is_right: bool,
+    schema: &SchemaDescriptor,
+    delta: &Batch,
+    cursor: &mut ReadCursor,
+) {
+    let plan = JoinPlan::from_wire(kind, delta_is_right, schema, schema).expect("bench join plan is well-formed");
+    let mut out_rows = 0;
+    let elapsed = bench_time(ITERS, || {
+        let out = op_join_delta_trace(delta, cursor, schema, &plan.out_schema, plan.probe);
+        out_rows = out.count;
+        std::hint::black_box(&out);
+    });
+    report(&name, elapsed, delta.count, out_rows);
+}
+
 /// Print one row of the result table. `rows` is the output row count of a
 /// single call — the emit-side work the timing has to be read against, since a
 /// fan-out shape emits far more rows than either input holds.
@@ -216,24 +239,55 @@ fn join_equi_dt_bench() {
     println!("\n=== equi delta-trace join ({ITERS} iters) ===");
     for p in [Payload::Int, Payload::Nullable, Payload::Str] {
         let schema = schema_for(&[type_code::U64], p);
-        let out_schema = merge_schemas_for_join(&schema, &schema).unwrap();
         for shape in &EQUI_SHAPES {
             let (delta_rows, trace_rows) = equi_rows(shape);
             let delta = build(&schema, p, &delta_rows);
             for srcs in SOURCE_COUNTS {
-                let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
-                let mut out_rows = 0;
-                let elapsed = bench_time(ITERS, || {
-                    let out = op_join_delta_trace(&delta, &mut cursor, &schema, &schema, &out_schema, JoinProbe::Equi);
-                    out_rows = out.count;
-                    std::hint::black_box(&out);
-                });
-                report(
-                    &format!("equi {:<24} {:<8} src={srcs}", shape.name, p.tag()),
-                    elapsed,
-                    delta.count,
-                    out_rows,
-                );
+                for right in SIDES {
+                    let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
+                    time_join(
+                        format!("equi {:<24} {:<8} src={srcs} right={right}", shape.name, p.tag()),
+                        JoinKind::Equi,
+                        right,
+                        &schema,
+                        &delta,
+                        &mut cursor,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross (keyless) delta-trace join
+// ---------------------------------------------------------------------------
+
+/// `(delta rows, trace rows)` per keyless shape. The product is what the walk
+/// emits, so both sides stay small next to `N`.
+const CROSS_SHAPES: [(&str, usize, usize); 3] = [("64x64", 64, 64), ("512x8", 512, 8), ("8x512", 8, 512)];
+
+#[test]
+#[ignore]
+fn join_cross_dt_bench() {
+    println!("\n=== cross delta-trace join ({ITERS} iters) ===");
+    let rows = |n: usize| -> Vec<Row> { (0..n as u128).map(|k| (vec![k], k as i64)).collect() };
+    for p in [Payload::Int, Payload::Nullable, Payload::Str] {
+        let schema = schema_for(&[type_code::U64], p);
+        for (name, d, t) in CROSS_SHAPES {
+            let delta = build(&schema, p, &rows(d));
+            for srcs in SOURCE_COUNTS {
+                for right in SIDES {
+                    let mut cursor = cursor_over(&schema, p, &rows(t), srcs);
+                    time_join(
+                        format!("cross {name:<23} {:<8} src={srcs} right={right}", p.tag()),
+                        JoinKind::Cross,
+                        right,
+                        &schema,
+                        &delta,
+                        &mut cursor,
+                    );
+                }
             }
         }
     }
@@ -342,38 +396,25 @@ fn range_rows(shape: &RangeShape) -> (Vec<Row>, Vec<Row>) {
 #[ignore]
 fn join_range_dt_bench() {
     println!("\n=== range delta-trace join ({ITERS} iters) ===");
-    const RELS: [RangeRel; 4] = [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge];
     for p in [Payload::Int, Payload::Nullable, Payload::Str] {
         for shape in &RANGE_SHAPES {
             let schema = schema_for(shape.pk_types, p);
-            let out_schema = merge_schemas_for_join(&schema, &schema).unwrap();
-            let n_eq = shape.pk_types.len() - 1;
+            let n_eq = (shape.pk_types.len() - 1) as u8;
             let (delta_rows, trace_rows) = range_rows(shape);
             let delta = build(&schema, p, &delta_rows);
-            for rel in RELS {
+            for &rel in RangeRel::ALL {
                 for srcs in SOURCE_COUNTS {
-                    let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
-                    let mut out_rows = 0;
-                    let elapsed = bench_time(ITERS, || {
-                        let out = op_join_delta_trace(
+                    for right in SIDES {
+                        let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
+                        time_join(
+                            format!("range {:<32} {:<8} {rel:?} src={srcs} right={right}", shape.name, p.tag()),
+                            JoinKind::Range { n_eq, rel },
+                            right,
+                            &schema,
                             &delta,
                             &mut cursor,
-                            &schema,
-                            &schema,
-                            &out_schema,
-                            JoinProbe::Range(
-                                RangeProbe::new(&schema, &schema, n_eq as u8, rel).expect("bench probe is well-formed"),
-                            ),
                         );
-                        out_rows = out.count;
-                        std::hint::black_box(&out);
-                    });
-                    report(
-                        &format!("range {:<32} {:<8} {rel:?} src={srcs}", shape.name, p.tag()),
-                        elapsed,
-                        delta.count,
-                        out_rows,
-                    );
+                    }
                 }
             }
         }

@@ -194,10 +194,11 @@ epoch, the same source feeding both inputs, is rejected by the planner (self-joi
 and same-relation INTERSECT/EXCEPT guards; the discriminator is source-id
 equality, not base-table overlap).
 
-**Join output schema** is `[left_PK, left_payload..., right_payload...]`. Output
-PK = left input PK = the join key after exchange repartition; the right batch's
-PK is not duplicated. Original table PKs survive as payload columns, moved there
-by `map_reindex`.
+**Join output schema** is `[key, left_payload..., right_payload...]` over the
+**SQL sides**, not the delta/trace ports — so both terms of the symmetric form
+share one schema. The key is the shared join key; the other input's PK region is
+not duplicated. Original table PKs survive as payload columns, moved there by
+`map_reindex`.
 
 **Keyless (cross) joins** — `CROSS JOIN`, a comma-separated FROM, or an ON/WHERE
 with no cross-table comparison — are INNER only; every other kind is rejected at

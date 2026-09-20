@@ -53,8 +53,8 @@ fn weight_clamp_emits_the_clamped_transition_at_both_presets() {
     assert_eq!(out.count, 0);
 }
 
-/// Several payloads at one PK, exercising the (PK, payload) sub-merge inside the
-/// `cogroup_left` group: a retraction to zero, a no-op bump, and a brand-new
+/// Several payloads at one PK, exercising the (PK, payload) sub-merge inside one
+/// group of the walk: a retraction to zero, a no-op bump, and a brand-new
 /// payload, all walked against a multi-payload trace group in lockstep.
 #[test]
 fn distinct_sub_merges_the_payloads_within_one_pk_group() {
@@ -72,6 +72,69 @@ fn distinct_sub_merges_the_payloads_within_one_pk_group() {
         .map(|r| (gnitz_wire::read_i64_le(out.col_data(0), r * 8), out.get_weight(r)))
         .collect();
     assert_eq!(got, vec![(10, -1), (40, 1)], "only the 10-retract and the 40-insert");
+}
+
+/// `(pk, weight, payload)` fixture rows, pre-sorted by `(pk, payload)`.
+type ClampRows = &'static [(u64, i64, i64)];
+
+/// Naive reference: probe each delta element against the trace on its own,
+/// instead of walking the two sides in lockstep.
+fn naive_clamp(delta: ClampRows, trace: ClampRows) -> Vec<(u64, i64, i64)> {
+    delta
+        .iter()
+        .filter_map(|&(pk, dw, val)| {
+            let w_old: i64 = trace
+                .iter()
+                .filter(|&&(p, _, v)| (p, v) == (pk, val))
+                .map(|&(_, w, _)| w)
+                .sum();
+            let out = (w_old + dw).clamp(-1, 1) - w_old.clamp(-1, 1);
+            (out != 0).then_some((pk, val, out))
+        })
+        .collect()
+}
+
+/// The group walk over the shapes it has to survive: empty on each side,
+/// disjoint keys, shared keys, several payloads at one key, and a large size
+/// skew in each direction.
+#[test]
+fn weight_clamp_matches_the_naive_clamp_over_every_shape() {
+    let schema = make_schema_u64_i64();
+    let cases: &[(ClampRows, ClampRows)] = &[
+        (&[], &[(1, 1, 10)]),
+        (&[(1, 1, 10)], &[]),
+        (&[(1, 1, 10), (3, 1, 30)], &[(2, 1, 20), (4, 1, 40)]),
+        (&[(1, -1, 10), (2, 1, 20)], &[(1, 1, 10), (2, 1, 22)]),
+        // several payloads at one PK against a multi-payload trace group
+        (
+            &[(1, 1, 10), (1, -1, 11), (5, 1, 50)],
+            &[(1, 1, 11), (1, 1, 12), (1, 1, 13), (5, 1, 55)],
+        ),
+        // huge delta, tiny trace
+        (
+            &[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, -1, 4), (5, 1, 5), (6, 1, 6)],
+            &[(4, 1, 4)],
+        ),
+        // tiny delta, huge trace
+        (
+            &[(4, -1, 4)],
+            &[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5), (6, 1, 6)],
+        ),
+    ];
+    for &(d, t) in cases {
+        let mut ch = trace_cursor(make_batch(&schema, t), schema);
+        let (out, _) = op_distinct(make_batch(&schema, d), &mut ch, &schema);
+        let got: Vec<(u64, i64, i64)> = (0..out.count)
+            .map(|r| {
+                (
+                    out.get_pk(r) as u64,
+                    gnitz_wire::read_i64_le(out.col_data(0), r * 8),
+                    out.get_weight(r),
+                )
+            })
+            .collect();
+        assert_eq!(got, naive_clamp(d, t), "delta={d:?} trace={t:?}");
+    }
 }
 
 /// One distinct case: the delta rows, and the `(PK bytes, weight)` output.

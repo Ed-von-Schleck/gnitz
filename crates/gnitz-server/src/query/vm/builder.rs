@@ -89,6 +89,11 @@ impl ProgramBuilder {
         // lifetime, so its slack is dead heap per sub-plan, per view, per worker.
         // (`reduce_plans` has none: its stride is over 1024, so it grows exactly.)
         reg_meta.shrink_to_fit();
+        // Sink every `Integrate` to the end, stably — see `Instr::Integrate`. A
+        // graph order cannot express it: `join_ab` needs `trace_b` and `join_ba`
+        // `trace_a`, so both integrates precede both joins there.
+        self.instructions
+            .sort_by_key(|i| matches!(i, Instr::Integrate { .. }));
         self.instructions.shrink_to_fit();
         self.predicates.shrink_to_fit();
         self.maps.shrink_to_fit();
@@ -119,7 +124,7 @@ impl ProgramBuilder {
         // `ReducePlan::from_wire` stays the single home of the conjunction.
         let pending_ground_row = self.reduce_plans.iter().any(|b| b.plan.seeds_ground);
 
-        let program = Program {
+        let mut program = Program {
             instructions: self.instructions,
             reg_meta,
             predicates: self.predicates,
@@ -127,8 +132,19 @@ impl ProgramBuilder {
             reduce_plans: self.reduce_plans,
             topn_plans: self.topn_plans,
             last_read,
+            consolidate_at: Vec::new(),
             out_reg,
         };
+
+        // Consolidation is the Z-set identity, so folding at the first reader
+        // serves every later one.
+        let mut consolidate_at = vec![u32::MAX; program.reg_meta.len()];
+        for instr in &program.instructions {
+            if let Some(reg) = consolidated_input(instr, &program) {
+                consolidate_at[reg.at()] = program.first_read(reg) as u32;
+            }
+        }
+        program.consolidate_at = consolidate_at;
 
         Box::new(VmHandle {
             program,
@@ -139,3 +155,7 @@ impl ProgramBuilder {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "tests/builder.rs"]
+mod tests;

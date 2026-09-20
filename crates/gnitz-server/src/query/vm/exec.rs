@@ -138,6 +138,15 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
     // Indexed, so `pc` is the absolute offset `last_read` is keyed by.
     for pc in start_pc..program.instructions.len() {
         let instr = &program.instructions[pc];
+
+        // Fold what this instruction is the first reader of, here rather than in
+        // the kernel that needs it — the mirror of the release loop below.
+        for r in reads(instr).into_iter().flatten() {
+            if program.consolidate_at[r.at()] == pc as u32 {
+                batches[r.at()].consolidate_in_place(program.schema_of(r));
+            }
+        }
+
         match instr {
             Instr::Filter { in_reg, out_reg, pred_idx } => {
                 let pred = &program.predicates[pred_idx.at()];
@@ -200,14 +209,12 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
             }
 
             Instr::JoinDT { delta_reg, trace_reg, out_reg, probe } => {
-                let left_schema = program.schema_of(*delta_reg);
-                let right_schema = program.schema_of(*trace_reg);
+                let delta_schema = program.schema_of(*delta_reg);
                 let out_schema = program.schema_of(*out_reg);
                 let result = ops::op_join_delta_trace(
                     &batches[delta_reg.at()],
                     bound_cursor(cursors, *trace_reg),
-                    left_schema,
-                    right_schema,
+                    delta_schema,
                     out_schema,
                     *probe,
                 );
@@ -219,9 +226,9 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 batches[out_reg.at()] = result;
             }
 
-            Instr::NullExtend { in_reg, out_reg } => {
+            Instr::NullExtend { in_reg, out_reg, nulls_first } => {
                 let out_schema = program.schema_of(*out_reg);
-                let result = batches[in_reg.at()].widened_with_null_tail(out_schema);
+                let result = batches[in_reg.at()].widened_with_nulls(out_schema, *nulls_first);
                 batches[out_reg.at()] = result;
             }
 

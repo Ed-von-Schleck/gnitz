@@ -300,15 +300,16 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
         plan(wide, wide, 1).is_ok(),
         "a matched pair at the common promoted type must compile"
     );
-    const STRIDE: &str =
-        "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)";
-    assert_eq!(rejection(plan(narrow, wide, 1)), STRIDE, "delta side narrower");
-    assert_eq!(rejection(plan(wide, narrow, 1)), STRIDE, "delta side wider");
+    assert_eq!(rejection(plan(narrow, wide, 1)), TYPES, "delta side narrower");
+    assert_eq!(rejection(plan(wide, narrow, 1)), TYPES, "delta side wider");
+    assert_eq!(
+        rejection(plan(wide, wide, 2)),
+        "range join: n_eq does not match trace key arity"
+    );
 
-    // `leading_key_size` sums *schema*-order columns, so a PK-last column order —
-    // which the packer never emits but a crafted circuit can name — puts the whole
-    // 8-byte key inside the `n_eq = 1` prefix while the key arity is still
-    // `n_eq + 1`. That leaves no range slot.
+    // A PK-last column order, which the packer never emits but a crafted circuit
+    // can name: read in PK-list order, its `n_eq = 1` prefix is 4 bytes and the
+    // range slot keeps the other 4.
     let pk_last = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::I64, 0),
@@ -317,11 +318,26 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
         ],
         &[1, 2],
     );
-    assert_eq!(
-        rejection(plan(pk_last, pk_last, 1)),
-        "range join: eq prefix covers the whole key"
-    );
+    assert!(plan(pk_last, pk_last, 1).is_ok(), "a 4-byte eq prefix leaves a range slot");
 }
+
+/// The equi probe takes the same key-layout check the range probe does, including
+/// a same-stride pair whose OPK images differ by the sign flip.
+#[test]
+fn equi_join_pk_type_mismatches_are_rejected_at_compile_time() {
+    let plan = |delta_schema, trace_schema| {
+        plan_two_source_join(gnitz_wire::JoinKind::Equi, delta_schema, trace_schema)
+    };
+    let signed = pk_payload_schema(&[type_code::I64]);
+    let unsigned = pk_payload_schema(&[type_code::U64]);
+    let narrow = pk_payload_schema(&[type_code::U32]);
+    assert!(plan(signed, signed).is_ok(), "a matched pair compiles");
+    assert_eq!(rejection(plan(signed, unsigned)), TYPES, "same stride, opposite sign");
+    assert_eq!(rejection(plan(unsigned, narrow)), TYPES, "different strides");
+}
+
+/// The one rejection both keyed probes share.
+const TYPES: &str = "join: delta and trace PK column types differ (both sides must reindex at the pair's common type)";
 
 /// The cross probe compares no key, so the two sides' PK regions need not agree
 /// on a stride — the pair the range probe rejects above compiles as a cross
@@ -350,7 +366,7 @@ fn plan_two_source_join(
             (0, scan_delta(10)),
             (1, scan_delta(11)),
             (2, OpNode::IntegrateTrace),
-            (3, OpNode::Join(kind)),
+            (3, OpNode::Join { kind, delta_is_right: false }),
             (4, OpNode::IntegrateSink),
         ],
         vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
@@ -387,7 +403,13 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
                 (0, scan_delta(10)),
                 (1, scan_delta(11)),
                 (2, gnitz_wire::OpNode::IntegrateTrace),
-                (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
+                (
+                    3,
+                    gnitz_wire::OpNode::Join {
+                        kind: gnitz_wire::JoinKind::Equi,
+                        delta_is_right: false,
+                    },
+                ),
             ],
             vec![(1, 2, SLOT_IN), (0, 3, SLOT_IN), (trace_src, 3, SLOT_TRACE)],
         );
@@ -415,7 +437,13 @@ fn a_wide_pk_join_compiles() {
             (0, scan_delta(10)),
             (1, scan_delta(20)),
             (2, gnitz_wire::OpNode::IntegrateTrace),
-            (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
+            (
+                3,
+                gnitz_wire::OpNode::Join {
+                    kind: gnitz_wire::JoinKind::Equi,
+                    delta_is_right: false,
+                },
+            ),
             (4, gnitz_wire::OpNode::IntegrateSink),
         ],
         vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],

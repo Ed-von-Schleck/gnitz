@@ -143,7 +143,7 @@ impl RunSet {
         let mut bytes = 0;
         for run in &mut self.runs {
             if run.num_payload_cols() < npc {
-                let widened = run.widened_with_null_tail(schema);
+                let widened = run.widened_with_nulls(schema, false);
                 *run = Rc::new(widened);
             }
             bytes += run.total_bytes();

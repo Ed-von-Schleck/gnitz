@@ -527,39 +527,73 @@ fn from_ranges_inherits_its_source_layout() {
     );
 }
 
-/// Regression: the widen must carry the input's blob heap, or a long
-/// (> 12 byte) string in the output resolves against an empty heap and reads
-/// back as garbage.
+/// The widen at both NULL placements: the input's payload lands where the
+/// placement leaves it, the fill column reads NULL, and the input's blob heap
+/// comes along — without it a long (> 12 byte) string reads back as garbage.
 #[test]
-fn widened_with_null_tail_carries_the_blob() {
+fn widened_with_nulls_places_the_fill_on_either_side() {
     use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string, read_german_string};
     let in_schema = make_schema_pk_u64_payload_string();
     let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
-    let b = make_batch_bytes(&in_schema, &[(1, 1, long)]);
+    let mut b = make_batch_bytes(&in_schema, &[(1, 1, long)]);
+    b.certify_layout(Layout::Consolidated);
 
-    // One appended nullable I64 column — the shape a LEFT JOIN null-fill widens
-    // to: the input schema verbatim, then the fill column.
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-    let out = b.widened_with_null_tail(&out_schema);
+    let cols = |first: bool| -> SchemaDescriptor {
+        let pk = SchemaColumn::new(type_code::U64, 0);
+        let s = SchemaColumn::new(type_code::STRING, 0);
+        let fill = SchemaColumn::new(type_code::I64, 1);
+        let cols = match first {
+            true => [pk, fill, s],
+            false => [pk, s, fill],
+        };
+        SchemaDescriptor::new(&cols, &[0])
+    };
 
-    assert_eq!(out.count, 1);
-    assert!(!out.blob.is_empty(), "output blob must be propagated");
-    assert_eq!(
-        read_german_string(&out, 0, 0),
-        long,
-        "long string must resolve to the original"
-    );
-    assert!(
-        gnitz_wire::null_word_get(out.get_null_word(0), 1),
-        "the appended column reads NULL",
-    );
+    for nulls_first in [false, true] {
+        let out_schema = cols(nulls_first);
+        let out = b.widened_with_nulls(&out_schema, nulls_first);
+        let (str_slot, fill_slot) = match nulls_first {
+            true => (1, 0),
+            false => (0, 1),
+        };
+
+        assert_eq!(out.count, 1);
+        assert_eq!(out.get_pk(0), 1);
+        assert!(!out.blob.is_empty(), "output blob must be propagated ({nulls_first})");
+        assert_eq!(
+            read_german_string(&out, str_slot, 0),
+            long,
+            "long string must resolve to the original ({nulls_first})"
+        );
+        let nw = out.get_null_word(0);
+        assert!(gnitz_wire::null_word_get(nw, fill_slot), "the fill column reads NULL");
+        assert!(!gnitz_wire::null_word_get(nw, str_slot), "the input column stays live");
+        assert_eq!(out.layout(), Layout::Consolidated, "({nulls_first})");
+    }
+}
+
+/// `consolidate_in_place` folds a raw batch, leaves a certified one alone, and
+/// is a no-op on an empty one.
+#[test]
+fn consolidate_in_place_folds_once_and_certifies() {
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+    let schema = make_schema_u64_i64();
+
+    let mut raw = make_batch_raw(&schema, &[(2, 1, 20), (1, 1, 10), (1, 2, 10)]);
+    assert_eq!(raw.layout(), Layout::Raw);
+    raw.consolidate_in_place(&schema);
+    assert_eq!(raw.layout(), Layout::Consolidated);
+    assert_eq!(raw.count, 2);
+    assert_eq!((raw.get_pk(0), raw.get_weight(0)), (1, 3));
+
+    let mut already = crate::test_support::make_batch(&schema, &[(1, 1, 10)]);
+    already.consolidate_in_place(&schema);
+    assert_eq!(already.count, 1);
+    assert_eq!(already.layout(), Layout::Consolidated);
+
+    let mut empty = Batch::empty_with_schema(&schema);
+    empty.consolidate_in_place(&schema);
+    assert_eq!(empty.count, 0);
 }
 
 /// Every operator's empty early-return goes through one of these two, so both

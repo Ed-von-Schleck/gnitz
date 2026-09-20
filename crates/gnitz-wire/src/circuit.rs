@@ -58,7 +58,7 @@ wire_enum! {
 /// The `params` blob layout, folded into [`crate::SYS_SCHEMA_DIGEST`] rather
 /// than written into the blob: the digest is what refuses a stored
 /// `CIRCUIT_NODES` blob decoded under a new layout.
-pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 4;
+pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 5;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -194,10 +194,10 @@ pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
 }
 
 wire_enum! {
-    /// The relation a **trace** slot must satisfy versus the **delta** slot in a
-    /// range-join probe (`{ trace_slot REL delta_slot }`). Canonicalized from the
-    /// ON clause's `L.x OP R.y`: term AB's rel is the converse of OP, term BA's
-    /// rel is OP itself. Wire values are stable.
+    /// The range relation between the two **SQL sides** of a join:
+    /// `left_slot REL right_slot`, the ON clause's `a.x OP b.y` verbatim. Each
+    /// join instruction resolves it against its own `delta_is_right`. Wire values
+    /// are stable.
     pub enum RangeRel: u8 {
         Lt = 0,
         Le = 1,
@@ -317,7 +317,7 @@ pub enum ReduceOutSlot {
 }
 
 /// Join physical strategy carried by `OpNode::Join`, one variant per join
-/// opcode. `Range` keeps `JoinKind: Copy` (its fields are `Copy`).
+/// opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinKind {
     Equi,
@@ -440,7 +440,13 @@ pub enum OpNode {
         /// from the planner.
         global_ground: bool,
     },
-    Join(JoinKind),
+    /// The delta-trace join. `delta_is_right` says which SQL side the delta port
+    /// carries, so either term of the two-term form writes
+    /// `[key, left payload…, right payload…]`.
+    Join {
+        kind: JoinKind,
+        delta_is_right: bool,
+    },
     /// Primary INTEGRATE: writes to view storage.
     IntegrateSink,
     /// Accumulates Z-set for a join trace.
@@ -448,8 +454,12 @@ pub enum OpNode {
     ExchangeShard {
         shard_cols: Vec<u32>,
     },
+    /// Widen every row with NULL columns of `type_codes`, ahead of the input's
+    /// payload under `nulls_first` and behind it otherwise — the side order an
+    /// outer join's null-fill needs.
     NullExtend {
         type_codes: Vec<u8>,
+        nulls_first: bool,
     },
     /// Keep only rows whose packed-PK partition is owned by this worker (**pure**
     /// range-join broadcast input; a band join scatters by its eq prefix and omits
@@ -480,7 +490,7 @@ impl OpNode {
         match self {
             // The circuit's own input: fed by the source drive, not by a producer.
             OpNode::ScanDelta { .. } => 0,
-            OpNode::Union | OpNode::Join(_) => 2,
+            OpNode::Union | OpNode::Join { .. } => 2,
             OpNode::Filter(_)
             | OpNode::Map(_)
             | OpNode::Negate
@@ -689,9 +699,13 @@ impl Circuit {
         self.add(OpNode::PositivePart, NodeInputs::Unary(diff))
     }
 
-    /// [`OpNode::Join`]: `delta` probes the integral `trace`.
-    pub fn join(&mut self, delta: NodeId, trace: NodeId, kind: JoinKind) -> NodeId {
-        self.add(OpNode::Join(kind), NodeInputs::Binary { a: delta, b: trace })
+    /// [`OpNode::Join`]: `delta` probes the integral `trace`. `delta_is_right`
+    /// names the SQL side the delta port carries.
+    pub fn join(&mut self, delta: NodeId, trace: NodeId, kind: JoinKind, delta_is_right: bool) -> NodeId {
+        self.add(
+            OpNode::Join { kind, delta_is_right },
+            NodeInputs::Binary { a: delta, b: trace },
+        )
     }
 
     /// [`OpNode::WorkerFilter`].
@@ -776,9 +790,13 @@ impl Circuit {
         self.add(OpNode::IntegrateTrace, NodeInputs::Unary(input))
     }
 
-    /// [`OpNode::NullExtend`].
-    pub fn null_extend(&mut self, input: NodeId, type_codes: &[u8]) -> NodeId {
-        let op = OpNode::NullExtend { type_codes: type_codes.to_vec() };
+    /// [`OpNode::NullExtend`]. `nulls_first` places the NULL columns ahead of the
+    /// input's payload.
+    pub fn null_extend(&mut self, input: NodeId, type_codes: &[u8], nulls_first: bool) -> NodeId {
+        let op = OpNode::NullExtend {
+            type_codes: type_codes.to_vec(),
+            nulls_first,
+        };
         self.add(op, NodeInputs::Unary(input))
     }
 
@@ -999,19 +1017,27 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             write_aggs(&mut w, agg);
             (Opcode::Reduce, None, Some(w.into_vec()))
         }
-        OpNode::Join(JoinKind::Equi) => (Opcode::JoinEqui, None, None),
-        OpNode::Join(JoinKind::Range { n_eq, rel }) => {
-            w.u8(*n_eq).u8(rel.as_wire());
-            (Opcode::JoinRange, None, Some(w.into_vec()))
+        // The side flag leads every join's params, so all three opcodes carry one.
+        OpNode::Join { kind, delta_is_right } => {
+            w.u8(*delta_is_right as u8);
+            let opcode = match kind {
+                JoinKind::Equi => Opcode::JoinEqui,
+                JoinKind::Range { n_eq, rel } => {
+                    w.u8(*n_eq).u8(rel.as_wire());
+                    Opcode::JoinRange
+                }
+                JoinKind::Cross => Opcode::JoinCross,
+            };
+            (opcode, None, Some(w.into_vec()))
         }
-        OpNode::Join(JoinKind::Cross) => (Opcode::JoinCross, None, None),
         OpNode::IntegrateSink => (Opcode::IntegrateSink, None, None),
         OpNode::IntegrateTrace => (Opcode::IntegrateTrace, None, None),
         OpNode::ExchangeShard { shard_cols } => {
             write_cols(&mut w, shard_cols);
             (Opcode::ExchangeShard, None, Some(w.into_vec()))
         }
-        OpNode::NullExtend { type_codes } => {
+        OpNode::NullExtend { type_codes, nulls_first } => {
+            w.u8(*nulls_first as u8);
             write_count(&mut w, type_codes.len());
             for tc in type_codes {
                 w.u8(*tc);
@@ -1092,18 +1118,29 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             let agg = read_aggs(&mut r)?;
             OpNode::Reduce { group_cols, agg, global_ground }
         }
-        Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
+        Opcode::JoinEqui => OpNode::Join {
+            kind: JoinKind::Equi,
+            delta_is_right: r.u8()? != 0,
+        },
         Opcode::JoinRange => {
+            let delta_is_right = r.u8()? != 0;
             let n_eq = r.u8()?;
             let rel_byte = r.u8()?;
             let rel = RangeRel::from_wire(rel_byte).ok_or_else(|| format!("JOIN unknown rel {rel_byte}"))?;
-            OpNode::Join(JoinKind::Range { n_eq, rel })
+            OpNode::Join {
+                kind: JoinKind::Range { n_eq, rel },
+                delta_is_right,
+            }
         }
-        Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
+        Opcode::JoinCross => OpNode::Join {
+            kind: JoinKind::Cross,
+            delta_is_right: r.u8()? != 0,
+        },
         Opcode::IntegrateSink => OpNode::IntegrateSink,
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: read_cols(&mut r)? },
         Opcode::NullExtend => {
+            let nulls_first = r.u8()? != 0;
             let n = read_count(&mut r, "NULL_EXTEND")?;
             let mut type_codes = Vec::with_capacity(n);
             for _ in 0..n {
@@ -1114,7 +1151,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
                 }
                 type_codes.push(tc);
             }
-            OpNode::NullExtend { type_codes }
+            OpNode::NullExtend { type_codes, nulls_first }
         }
         Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::TopN => {

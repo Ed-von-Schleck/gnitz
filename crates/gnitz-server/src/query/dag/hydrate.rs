@@ -28,8 +28,8 @@ use gnitz_store::storage::{PkSetGather, StoreError};
 /// `keys` is taken by value because the gather below owns its key list; the
 /// caller built the buffer for this call and has no further use for it.
 ///
-/// The registry's `scan_chunk_rows` bounds the seed batch only; `JoinDT`'s
-/// cogroup accepts multi-key deltas, so the chunking costs nothing but peak
+/// The registry's `scan_chunk_rows` bounds the seed batch only; `JoinDT`'s equi
+/// walk accepts multi-key deltas, so the chunking costs nothing but peak
 /// memory.
 impl SkeletonHydrator for DagEngine {
     fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: i64, keys: Vec<u8>) -> Result<Batch, StoreError> {

@@ -1,9 +1,7 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, Layout, ReadCursor};
-
-use super::cogroup::cogroup_left;
+use crate::storage::{pk_group_end, Batch, Layout, ReadCursor};
 
 // ---------------------------------------------------------------------------
 // Distinct
@@ -61,8 +59,11 @@ pub fn op_weight_clamp(
     let mut emit_weights: Vec<i64> = Vec::new();
 
     let consolidated_mb = consolidated.as_mem_batch();
-    cogroup_left(&consolidated, cursor, |_, range, m| {
-        m.for_each_mem_row_weight(&consolidated_mb, range, |i, w_old| {
+    let mut i = 0;
+    while i < n {
+        let j = pk_group_end(&consolidated, i);
+        cursor.seek_pk_group_ascending(consolidated.get_pk_bytes(i));
+        cursor.for_each_mem_row_weight(&consolidated_mb, i..j, |i, w_old| {
             let w_new = w_old.wrapping_add(consolidated_mb.get_weight(i));
             let out_w = w_new.clamp(lo, hi) - w_old.clamp(lo, hi);
             if out_w != 0 {
@@ -74,7 +75,8 @@ pub fn op_weight_clamp(
                 emit_weights.push(out_w);
             }
         });
-    });
+        i = j;
+    }
 
     // 3. Scatter-copy emitting rows, column-first, then blit the *clamp's* net
     //    weights over the finished region — one sequential `n·8` write against a

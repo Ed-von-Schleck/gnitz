@@ -210,7 +210,7 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
             (1, scatter_reindex(&[1])),
             (2, scan_delta(8)),
             (3, scatter_reindex(&[1])),
-            (4, OpNode::Join(JoinKind::Equi)),
+            (4, OpNode::Join { kind: JoinKind::Equi, delta_is_right: false }),
         ];
         let mut edges = vec![(0, 1, SLOT_IN), (2, 3, SLOT_IN), (1, 4, SLOT_IN), (3, 4, SLOT_TRACE)];
         if also_union {
@@ -247,7 +247,7 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
                 (1, scatter_reindex(key_a)),
                 (2, scan_delta(10)),
                 (3, scatter_reindex(key_b)),
-                (4, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
+                (4, gnitz_wire::OpNode::Join { kind: gnitz_wire::JoinKind::Equi, delta_is_right: false }),
                 (5, gnitz_wire::OpNode::IntegrateSink),
             ],
             vec![
@@ -279,7 +279,7 @@ fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
             (1, scan_delta(20)),
             (2, scatter_reindex(&[2])),
             (3, gnitz_wire::OpNode::IntegrateTrace),
-            (4, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
+            (4, gnitz_wire::OpNode::Join { kind: gnitz_wire::JoinKind::Equi, delta_is_right: false }),
             (5, gnitz_wire::OpNode::IntegrateSink),
         ],
         vec![
@@ -325,6 +325,32 @@ fn a_scan_whose_reindex_maps_are_all_auxiliary_is_rejected() {
     );
 }
 
+/// A band join naming more equality slots than its source's reindex key holds.
+/// The circuit is client-supplied catalog data, so the route is refused rather
+/// than sliced — and `derive` runs on the master and on every worker, ahead of
+/// any compile that could have caught it.
+#[test]
+fn a_band_join_whose_n_eq_overruns_the_reindex_key_is_rejected() {
+    let nodes: HashMap<NodeId, OpNode> = HashMap::from([
+        (0, scan_delta(7)),
+        (1, scatter_reindex(&[1, 2])),
+        (2, scan_delta(9)),
+        (
+            3,
+            OpNode::Join {
+                kind: JoinKind::Range { n_eq: 5, rel: RangeRel::Lt },
+                delta_is_right: false,
+            },
+        ),
+        (4, OpNode::IntegrateSink),
+    ]);
+    let edges = vec![(0, 1, SLOT_IN), (1, 3, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)];
+    assert_eq!(
+        rejection(ViewMeta::derive(&loaded_for_test(nodes, edges), &sources([]))),
+        "band join: n_eq does not match the source's reindex key arity",
+    );
+}
+
 /// One shape covering every route: source 7 is the join relay, source 9 the
 /// keyless one, source 0 the output relay.
 ///
@@ -342,7 +368,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: RelationRegistry) -> View
         (0, scan_delta(7)),
         (1, scatter_reindex(key_cols)),
         (2, scan_delta(9)),
-        (3, OpNode::Join(kind)),
+        (3, OpNode::Join { kind, delta_is_right: false }),
         (4, OpNode::ExchangeShard { shard_cols: vec![1] }),
         (5, OpNode::IntegrateSink),
     ]);
@@ -471,7 +497,7 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
                 (3, OpNode::IntegrateTrace),
                 (4, scan_delta(9)),
                 (5, scatter_reindex(&[1])),
-                (6, OpNode::Join(pure_range(0))),
+                (6, OpNode::Join { kind: pure_range(0), delta_is_right: false }),
                 (7, OpNode::IntegrateSink),
             ],
             vec![
@@ -536,7 +562,7 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
                 (0, scan_delta(7)),
                 (1, scatter_reindex(&[1])),
                 (2, scan_delta(9)),
-                (3, OpNode::Join(JoinKind::Equi)),
+                (3, OpNode::Join { kind: JoinKind::Equi, delta_is_right: false }),
                 (4, OpNode::IntegrateSink),
             ]),
             vec![(0, 1, SLOT_IN), (1, 3, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
@@ -580,7 +606,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
                 (0, scan_delta(7)),
                 (1, scan_delta(9)),
                 (2, OpNode::IntegrateTrace),
-                (3, OpNode::Join(kind)),
+                (3, OpNode::Join { kind, delta_is_right: false }),
                 (4, OpNode::IntegrateSink),
             ],
             vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
@@ -608,8 +634,8 @@ fn joins_calling_for_different_relays_are_rejected() {
                 (1, scan_delta(9)),
                 (2, OpNode::IntegrateTrace),
                 (3, OpNode::IntegrateTrace),
-                (4, OpNode::Join(gnitz_wire::JoinKind::Equi)),
-                (5, OpNode::Join(second)),
+                (4, OpNode::Join { kind: gnitz_wire::JoinKind::Equi, delta_is_right: false }),
+                (5, OpNode::Join { kind: second, delta_is_right: false }),
                 (6, OpNode::Union),
                 (7, OpNode::IntegrateSink),
             ],
@@ -659,7 +685,7 @@ fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
             (3, OpNode::IntegrateTrace),
             (
                 4,
-                OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 0, rel: gnitz_wire::RangeRel::Le }),
+                OpNode::Join { kind: gnitz_wire::JoinKind::Range { n_eq: 0, rel: gnitz_wire::RangeRel::Le }, delta_is_right: false },
             ),
         ],
         vec![
@@ -762,7 +788,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
                 (2, OpNode::IntegrateTrace),
                 (
                     3,
-                    OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 1, rel: gnitz_wire::RangeRel::Le }),
+                    OpNode::Join { kind: gnitz_wire::JoinKind::Range { n_eq: 1, rel: gnitz_wire::RangeRel::Le }, delta_is_right: false },
                 ),
                 (4, aux_rekey),
                 (5, OpNode::Map(MapKind::Projection(vec![]))),

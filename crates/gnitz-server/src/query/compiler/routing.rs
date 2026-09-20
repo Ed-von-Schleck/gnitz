@@ -164,9 +164,9 @@ impl ViewMeta {
                     true => join_route(seq, JoinRelay::WholeKey),
                     false => join_route(seq, join_relay),
                 };
-                (tid, route)
+                Ok((tid, route?))
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
 
         Ok(ViewMeta {
             source_routes,
@@ -199,19 +199,18 @@ fn group_key_route(shard_cols: Option<Rc<[u32]>>) -> RelayRoute {
 
 /// The route a source carrying a reindex key takes. `pairs` is that key,
 /// `(column, promotion target)` per slot, in trace-side reindex order.
-fn join_route(pairs: ReindexKey, relay: JoinRelay) -> RelayRoute {
+fn join_route(pairs: ReindexKey, relay: JoinRelay) -> Result<RelayRoute, String> {
     let route_len = match relay {
-        JoinRelay::Broadcast => return RelayRoute::Broadcast,
+        JoinRelay::Broadcast => return Ok(RelayRoute::Broadcast),
         JoinRelay::WholeKey => pairs.len(),
-        JoinRelay::EqPrefix { n_eq } => {
-            debug_assert!(
-                pairs.len() == n_eq as usize + 1,
-                "band-join reindex key = [eq…, range]: len must be n_eq + 1"
-            );
-            n_eq as usize
+        // A band join's reindex key is `[eq…, range]`; a circuit is client-supplied,
+        // so a wider `n_eq` is refused rather than sliced.
+        JoinRelay::EqPrefix { n_eq } if pairs.len() == n_eq as usize + 1 => n_eq as usize,
+        JoinRelay::EqPrefix { .. } => {
+            return Err("band join: n_eq does not match the source's reindex key arity".into())
         }
     };
-    RelayRoute::JoinKey(Rc::from(&pairs[..route_len]))
+    Ok(RelayRoute::JoinKey(Rc::from(&pairs[..route_len])))
 }
 
 /// True iff `cols` is **exactly** `schema`'s distribution prefix, so a derived
@@ -395,7 +394,7 @@ fn scan_consumption(loaded: &LoadedCircuit, scan_nid: NodeId) -> ScanConsumption
             continue;
         }
         match loaded.op(nid) {
-            gnitz_wire::OpNode::Join(_) => {}
+            gnitz_wire::OpNode::Join { .. } => {}
             gnitz_wire::OpNode::Filter(_) | gnitz_wire::OpNode::Map(_) | gnitz_wire::OpNode::IntegrateTrace => {
                 reached[nid] = true
             }
@@ -458,7 +457,7 @@ fn circuit_join_relay(loaded: &LoadedCircuit) -> Result<Option<JoinRelay>, Strin
     use gnitz_wire::{JoinKind, OpNode};
     let mut relay = None;
     for (_, op) in loaded.ops() {
-        let OpNode::Join(kind) = op else { continue };
+        let OpNode::Join { kind, .. } = op else { continue };
         let this = match kind {
             JoinKind::Equi => JoinRelay::WholeKey,
             JoinKind::Range { n_eq: 0, .. } | JoinKind::Cross => JoinRelay::Broadcast,

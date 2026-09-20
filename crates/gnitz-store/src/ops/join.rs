@@ -4,122 +4,186 @@
 //! against the trace on equal key, `Range` walks an ordered half-open span per
 //! delta equality group, `Cross` walks the whole trace once against the whole
 //! delta. All three drive the same emission — the product of a contiguous
-//! delta run with the cursor's current trace row — and all produce
-//! `[left_PK, left_payload…, right_payload…]`.
+//! delta run with the cursor's current trace row — and all write
+//! `[key, left payload…, right payload…]` over the SQL sides, keyed by the delta
+//! PK, or by `[left PK…, right PK…]` under `Cross`.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, pk_bytes_eq, KeyCut, PkBuf};
-use crate::schema::{DerivedSchema, SchemaDescriptor};
-use crate::storage::{Batch, BlobCacheGuard, MemBatch, ReadCursor};
-
-use super::cogroup::cogroup_intersection;
+use crate::schema::{DerivedSchema, OpBuildErr, SchemaDescriptor, MAX_PK_BYTES};
+use crate::storage::{pk_group_end, Batch, BlobCacheGuard, MemBatch, ReadCursor};
 
 use gnitz_expr::RowSource;
-use gnitz_wire::{merge_null_words, RangeRel};
+use gnitz_wire::{null_word_at, JoinKind, RangeRel};
 
 // ---------------------------------------------------------------------------
-// The probe
+// The plan
 // ---------------------------------------------------------------------------
 
-/// How one join instruction probes its trace. Baked by the compiler, which holds
-/// both sides' schemas and so resolves the probe once, off the epoch path.
+/// One join instruction's compiler-baked artifact: how it probes its trace, and
+/// the schema it writes under.
+pub struct JoinPlan {
+    pub probe: JoinProbe,
+    pub out_schema: SchemaDescriptor,
+}
+
+/// How one join instruction probes its trace, and which SQL side its delta port
+/// carries. Baked by the compiler, which holds both sides' schemas and so
+/// resolves the probe once, off the epoch path.
 #[derive(Clone, Copy)]
-pub enum JoinProbe {
+pub struct JoinProbe {
+    walk: Walk,
+    /// The delta port is the join's **right** side, so the trace's half of the
+    /// output comes first.
+    delta_is_right: bool,
+}
+
+/// Which trace walk a probe drives.
+#[derive(Clone, Copy)]
+enum Walk {
     /// Equal key: the trace group at each delta group's own PK.
     Equi,
     /// An ordered span within an equality group.
     Range(RangeProbe),
-    /// Every trace row, for every delta row: the keyless join. Neither side's
-    /// key takes part, so the probe has nothing to resolve.
+    /// Every trace row, for every delta row: the keyless join. No key decides a
+    /// match, so both key regions ride into the output as the pair key.
     Cross,
 }
 
-/// A range relation as its two independent dimensions, plus the width they
-/// operate at. [`RangeProbe::new`] is the only public constructor, so the pair
-/// always spells a real relation over a key width the sweep can slice.
+impl JoinPlan {
+    /// Resolve a wire join node against its two input schemas, or name the
+    /// precondition the circuit violated. A circuit is client-supplied catalog
+    /// data, so these are refusals rather than debug asserts.
+    pub fn from_wire(
+        kind: JoinKind,
+        delta_is_right: bool,
+        delta: &SchemaDescriptor,
+        trace: &SchemaDescriptor,
+    ) -> Result<JoinPlan, OpBuildErr> {
+        let walk = match kind {
+            JoinKind::Equi => {
+                same_pk_types(delta, trace)?;
+                Walk::Equi
+            }
+            JoinKind::Range { n_eq, rel } => {
+                same_pk_types(delta, trace)?;
+                Walk::Range(RangeProbe::new(trace, n_eq, rel, delta_is_right)?)
+            }
+            JoinKind::Cross => Walk::Cross,
+        };
+        let (left, right) = match delta_is_right {
+            true => (trace, delta),
+            false => (delta, trace),
+        };
+        let out_schema = merge_schemas_for_join(kind, left, right)
+            .ok_or_else(|| OpBuildErr::shape("join: merged schema exceeds MAX_COLUMNS"))?;
+        Ok(JoinPlan {
+            probe: JoinProbe { walk, delta_is_right },
+            out_schema,
+        })
+    }
+}
+
+/// A keyed walk reads one side's PK region as the other's, so the two key
+/// layouts must be identical down to the OPK encoding each column type implies.
+fn same_pk_types(delta: &SchemaDescriptor, trace: &SchemaDescriptor) -> Result<(), OpBuildErr> {
+    fn types(s: &SchemaDescriptor) -> impl Iterator<Item = u8> + '_ {
+        s.pk_columns().map(|(_, c)| c.type_code)
+    }
+    if types(delta).eq(types(trace)) {
+        return Ok(());
+    }
+    Err(OpBuildErr::shape(
+        "join: delta and trace PK column types differ (both sides must reindex at the pair's common type)",
+    ))
+}
+
+/// The key region, then both sides' payloads in SQL side order. A keyed join
+/// inherits the shared key; `Cross` matches on neither, so it mints the pair.
+fn merge_schemas_for_join(
+    kind: JoinKind,
+    left: &SchemaDescriptor,
+    right: &SchemaDescriptor,
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    match kind {
+        JoinKind::Cross => {
+            b.push_pk_of(left)?;
+            b.push_pk_of(right)?;
+        }
+        JoinKind::Equi | JoinKind::Range { .. } => b.push_pk_of(left)?,
+    }
+    for (_, c) in left.payload_columns().chain(right.payload_columns()) {
+        b.push(*c)?;
+    }
+    Some(b.finish())
+}
+
+// ---------------------------------------------------------------------------
+// The range probe
+// ---------------------------------------------------------------------------
+
+/// A range relation as the trace slot's relation to the delta slot, plus the
+/// width the equality prefix operates at.
 #[derive(Clone, Copy)]
-pub struct RangeProbe {
+struct RangeProbe {
     /// Width in OPK bytes of the equality-pinned leading slots; the rest of a PK
     /// region is the range slot.
     eq_size: usize,
-    /// Matches lie above the delta row's slot (`Gt`/`Ge`), not below (`Lt`/`Le`).
-    prefix: bool,
-    /// A trace slot equal to the delta row's own matches (`Ge`/`Le`).
-    nonstrict: bool,
+    /// `{ trace_slot REL delta_slot }`.
+    rel: RangeRel,
 }
 
 impl RangeProbe {
-    /// Resolve a wire range relation against the two input schemas, or name the
-    /// precondition the circuit violated. `Result`, not a debug assert: a circuit
-    /// is client-supplied catalog data, and the sweep's `pk[..eq_size]` /
-    /// `pk[eq_size..]` slices have nothing else establishing them.
-    pub fn new(
-        delta_schema: &SchemaDescriptor,
-        trace_schema: &SchemaDescriptor,
+    /// Resolve a wire `left REL right` against the trace schema's key region.
+    fn new(
+        trace: &SchemaDescriptor,
         n_eq: u8,
         rel: RangeRel,
-    ) -> Result<RangeProbe, &'static str> {
-        // The trace's reindexed key is `[eq slots…, range slot]`.
-        if n_eq as usize + 1 != trace_schema.pk_indices().len() {
-            return Err("range join: n_eq does not match trace key arity");
+        delta_is_right: bool,
+    ) -> Result<RangeProbe, OpBuildErr> {
+        // The reindexed key is `[eq slots…, range slot]`.
+        if n_eq as usize + 1 != trace.pk_indices().len() {
+            return Err(OpBuildErr::shape("range join: n_eq does not match trace key arity"));
         }
-        // Both sides reindex at the pair's common promoted type, so their PK
-        // regions have one width — which the sweep slices both of at.
-        if delta_schema.pk_stride() != trace_schema.pk_stride() {
-            return Err(
-                "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)",
-            );
-        }
-        // Not implied by the arity check above: `leading_key_size` sums *schema*-
-        // order columns, so a crafted circuit can spend the whole key on the eq
-        // prefix while still naming `n_eq + 1` PK columns.
-        let eq_size = trace_schema.leading_key_size(n_eq as usize);
-        if eq_size >= trace_schema.pk_stride() {
-            return Err("range join: eq prefix covers the whole key");
-        }
-        Ok(RangeProbe::of(eq_size, rel))
+        // In PK order, so the range slot always keeps a span of its own.
+        let eq_size = trace.pk_columns().take(n_eq as usize).map(|(_, c)| c.size() as usize).sum();
+        // `rel` relates left to right; the probe relates trace to delta.
+        let rel = match delta_is_right {
+            true => rel,
+            false => rel.converse(),
+        };
+        Ok(RangeProbe { eq_size, rel })
     }
 
-    /// The relation's two dimensions at a validated `eq_size`. Private: only
-    /// [`RangeProbe::new`] establishes that width against a real key region.
-    fn of(eq_size: usize, rel: RangeRel) -> RangeProbe {
-        let (prefix, nonstrict) = match rel {
-            RangeRel::Gt => (true, false),
-            RangeRel::Ge => (true, true),
-            RangeRel::Lt => (false, false),
-            RangeRel::Le => (false, true),
-        };
-        RangeProbe { eq_size, prefix, nonstrict }
+    /// Matches lie above the delta row's slot, not below it.
+    #[inline]
+    fn above(&self) -> bool {
+        matches!(self.rel, RangeRel::Gt | RangeRel::Ge)
+    }
+
+    /// The cut falls below the delta row's own slot, so an equal trace slot lies
+    /// on the far side of it.
+    #[inline]
+    fn cuts_below(&self) -> bool {
+        matches!(self.rel, RangeRel::Ge | RangeRel::Lt)
     }
 
     /// The trace key range this probe covers for a delta row whose PK region is
     /// `pk` (`equality prefix ‖ range slot`). `None` when it is provably empty.
     fn cut_points(&self, pk: &[u8]) -> Option<(PkBuf, Option<PkBuf>)> {
         let group = &pk[..self.eq_size];
-        let (start, end) = match (self.prefix, self.nonstrict) {
-            // Gt: (slot, group end)
-            (true, false) => (KeyCut::above(pk), KeyCut::above(group)),
-            // Ge: [slot, group end)
-            (true, true) => (KeyCut::min_of(pk), KeyCut::above(group)),
-            // Lt: [group start, slot)
-            (false, false) => (KeyCut::min_of(group), KeyCut::min_of(pk)),
-            // Le: [group start, slot]
-            (false, true) => (KeyCut::min_of(group), KeyCut::above(pk)),
+        let slot = match self.cuts_below() {
+            true => KeyCut::min_of(pk),
+            false => KeyCut::above(pk),
+        };
+        let (start, end) = match self.above() {
+            true => (slot, KeyCut::above(group)),
+            false => (KeyCut::min_of(group), slot),
         };
         key_range_between_cuts(start, end, pk.len())
-    }
-
-    /// The row of the delta group `[lo, hi)` whose slot the group's single cut is
-    /// taken on. The union of the rows' spans opens at the group's smallest slot
-    /// and closes at its largest, and only one of those two bounds is open.
-    #[inline]
-    fn cut_row(&self, lo: usize, hi: usize) -> usize {
-        if self.prefix {
-            lo
-        } else {
-            hi - 1
-        }
     }
 
     /// The greatest ordering a delta slot may have against a trace slot while
@@ -127,10 +191,9 @@ impl RangeProbe {
     /// `Le` put an equal slot after the split, `Ge` and `Lt` before it.
     #[inline]
     fn last_before_split(&self) -> Ordering {
-        if self.prefix != self.nonstrict {
-            Ordering::Less
-        } else {
-            Ordering::Equal
+        match self.cuts_below() {
+            true => Ordering::Equal,
+            false => Ordering::Less,
         }
     }
 }
@@ -139,9 +202,8 @@ impl RangeProbe {
 // The operator
 // ---------------------------------------------------------------------------
 
-/// Join delta rows against the trace. Output schema:
-/// `[left_PK, left_payload..., right_payload...]`, built by
-/// [`merge_schemas_for_join`] above and handed down as `out_schema`.
+/// Join delta rows against the trace, writing `[key, left payload…, right
+/// payload…]` under the `out_schema` [`JoinPlan::from_wire`] derived above.
 ///
 /// Emission is trace-major under every probe: each trace row is walked once and
 /// producted against a contiguous, random-access delta run. So the output is
@@ -151,57 +213,134 @@ impl RangeProbe {
 pub fn op_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
-    left_schema: &SchemaDescriptor,
-    right_schema: &SchemaDescriptor,
+    delta_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
     probe: JoinProbe,
 ) -> Batch {
-    let cs = Batch::consolidate_if_needed(delta, left_schema);
+    let cs = Batch::consolidate_if_needed(delta, delta_schema);
     let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty_with_schema(out_schema);
     }
     let delta_mb = consolidated.as_mem_batch();
-    // A keyless probe emits exactly `n × |trace|` rows, so the arena is sized once
-    // rather than re-copied at every doubling. A keyed probe walks a bounded span
-    // per delta row and has no such bound: `n` is its floor.
-    let rows = match probe {
-        JoinProbe::Cross => {
-            cursor.rewind();
-            n.saturating_mul(cursor.estimated_length())
-        }
-        _ => n,
+    let is_cross = matches!(probe.walk, Walk::Cross);
+    // The keyless probe reads no key, so it positions at row 0 instead of seeking.
+    if is_cross {
+        cursor.rewind();
+    }
+    // From there it emits at most `n × |trace|` rows, so the arena is sized once
+    // rather than re-copied at every doubling; a keyed probe has no such bound.
+    let rows = match is_cross {
+        true => n.saturating_mul(cursor.estimated_length()),
+        false => n,
     };
-    let mut writer = JoinRowWriter::open(left_schema, right_schema, out_schema, rows);
+
+    // Both output regions run the left SQL side first, so one split places the
+    // delta's and the trace's half of every row.
+    let split = |d: usize, t: usize| -> (Range<usize>, Range<usize>) {
+        match probe.delta_is_right {
+            true => (t..t + d, 0..t),
+            false => (0..d, d..d + t),
+        }
+    };
+    let d_npc = delta_schema.num_payload_cols();
+    let d_pk = delta_schema.pk_stride();
+    let out_pk = out_schema.pk_stride();
+    let (d_slots, t_slots) = split(d_npc, out_schema.num_payload_cols() - d_npc);
+    let mut pair = is_cross.then(|| {
+        let (delta, trace) = split(d_pk, out_pk - d_pk);
+        PairKey {
+            buf: [0u8; MAX_PK_BYTES],
+            len: out_pk,
+            delta,
+            trace,
+        }
+    });
+
+    let mut output = Batch::with_capacity(out_schema, rows);
+    let mut cache = BlobCacheGuard::acquire(out_schema, rows);
 
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         let w_trace = c.current_weight;
-        let (right, right_row) = c.current_row_source();
-        let right_null = right.get_null_word(right_row);
+        let (t_src, t_row) = c.current_row_source();
+        let t_null = t_src.get_null_word(t_row);
+        // Every row this call writes shares one trace row, so its null bits
+        // rebase once rather than per delta row.
+        let t_bits = null_word_at(t_null, t_slots.start);
+        if let Some(k) = pair.as_mut() {
+            k.buf[k.trace.clone()].copy_from_slice(c.current_pk_bytes());
+        }
         for i in rs..re {
             let w_out = delta_mb.get_weight(i).wrapping_mul(w_trace);
-            if w_out != 0 {
-                writer.write(&delta_mb, i, right, right_row, right_null, w_out);
+            if w_out == 0 {
+                continue;
             }
+            let d_pk_bytes = delta_mb.get_pk_bytes(i);
+            let pk = match pair.as_mut() {
+                Some(k) => {
+                    k.buf[k.delta.clone()].copy_from_slice(d_pk_bytes);
+                    &k.buf[..k.len]
+                }
+                None => d_pk_bytes,
+            };
+            output.begin_row(pk, w_out);
+
+            let d_null = delta_mb.get_null_word(i);
+            output.append_payload_cols(d_slots.clone(), out_schema, &delta_mb, i, d_null, cache.get_mut());
+            output.append_payload_cols(t_slots.clone(), out_schema, t_src, t_row, t_null, cache.get_mut());
+            // Each half's null bits rebase onto the slot its columns landed at.
+            output.commit_row(t_bits | null_word_at(d_null, d_slots.start));
         }
     };
 
-    match probe {
-        JoinProbe::Equi => cogroup_intersection(consolidated, cursor, |key, r, m| {
-            m.for_each_pk_group_row(key, |c| emit(r.start, r.end, c));
-        }),
-        JoinProbe::Range(probe) => range_merge_walk(&delta_mb, cursor, probe, emit),
-        JoinProbe::Cross => {
-            // Every probe positions its own cursor; this one has no key to seek
-            // by, so it rewinds. Idempotent — the sizing pass above also rewinds,
-            // and neither relies on the other having run.
-            cursor.rewind();
-            cursor.for_each_row_while(|_| true, |c| emit(0, n, c))
-        }
+    match probe.walk {
+        Walk::Equi => equi_merge_walk(consolidated, cursor, emit),
+        Walk::Range(range) => range_merge_walk(&delta_mb, cursor, range, emit),
+        Walk::Cross => cursor.for_each_row_while(|_| true, |c| emit(0, n, c)),
     }
 
-    writer.finish()
+    output
+}
+
+/// `Cross`'s output key under construction: the pair `[left PK…, right PK…]`,
+/// assembled per row because neither source key is the output's. A keyed probe
+/// has none — its key is the delta's PK region verbatim.
+struct PairKey {
+    buf: [u8; MAX_PK_BYTES],
+    len: usize,
+    delta: Range<usize>,
+    trace: Range<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// The equi walk
+// ---------------------------------------------------------------------------
+
+/// Equal-key merge walk. Both pointers galloping-skip to catch up, so the cost
+/// is bounded by the smaller side's matches whichever side that is. It opens with
+/// `advance_to(delta[0])`, which is backward-capable, so a trace cursor another
+/// op left elsewhere in this epoch is repositioned rather than mis-walked.
+fn equi_merge_walk(delta: &Batch, m: &mut ReadCursor, mut emit: impl FnMut(usize, usize, &ReadCursor)) {
+    let n = delta.count;
+    if n == 0 {
+        return;
+    }
+    m.advance_to(delta.get_pk_bytes(0));
+    let mut i = 0;
+    while i < n && m.valid {
+        let dk = delta.get_pk_bytes(i);
+        match compare_pk_ordering(dk, m.current_pk_bytes()) {
+            Ordering::Less => i = delta.advance_to(m.current_pk_bytes(), i), // skip delta
+            // The comparison above IS the forward gallop's precondition.
+            Ordering::Greater => m.advance_to_forward(dk), // skip trace
+            Ordering::Equal => {
+                let j = pk_group_end(delta, i); // delta group
+                m.for_each_pk_group_row(dk, |c| emit(i, j, c));
+                i = j;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,15 +383,19 @@ fn sweep_eq_group(
     hi: usize,
     emit: &mut impl FnMut(usize, usize, &ReadCursor),
 ) -> Option<usize> {
-    let Some((start, end)) = probe.cut_points(delta.get_pk_bytes(probe.cut_row(lo, hi))) else {
+    // The group's spans share a closed bound, so one cut covers the group — taken
+    // on the row carrying the open one.
+    let cut_row = if probe.above() { lo } else { hi - 1 };
+    let Some((start, end)) = probe.cut_points(delta.get_pk_bytes(cut_row)) else {
         // Provably empty, so the cursor is never positioned here — and so it says
         // nothing about what the trace holds after this group either.
         return Some(hi);
     };
     // Hoisted out of the sweep: the walk below reads these once per covered trace
-    // row, where loading them back off `probe` costs more than the branch each
-    // one decides — worth ~1% of the range kernel on `join_range_dt_bench`.
-    let RangeProbe { eq_size, prefix, .. } = probe;
+    // row, where loading them back off `probe` costs more than the branch each one
+    // decides.
+    let eq_size = probe.eq_size;
+    let above = probe.above();
     let last_before_split = probe.last_before_split();
 
     // Galloping skip to the covered start: seeded at the live position it passes
@@ -274,7 +417,7 @@ fn sweep_eq_group(
             while ptr < hi && compare_pk_ordering(&delta.get_pk_bytes(ptr)[eq_size..], s) <= last_before_split {
                 ptr += 1;
             }
-            let (rs, re) = if prefix { (lo, ptr) } else { (ptr, hi) };
+            let (rs, re) = if above { (lo, ptr) } else { (ptr, hi) };
             emit(rs, re, c);
         },
     );
@@ -305,101 +448,6 @@ fn skip_to_group(delta: &MemBatch, eq_size: usize, from: usize, group: &[u8]) ->
         hi += 1;
     }
     hi
-}
-
-// ---------------------------------------------------------------------------
-// The output schema
-// ---------------------------------------------------------------------------
-
-/// `left`'s PK, then both sides' payloads — the layout [`JoinRowWriter`] below
-/// writes, homed beside it because that writer derives the same layout
-/// independently, from the same `(left, right)` pair (`extend_pk_bytes(left)`,
-/// then `append_payload_cols` at 0 and at `left_npc`). An outer join's null-fill
-/// columns are appended by the compiler's own null-extend builder, not here.
-pub fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> Option<SchemaDescriptor> {
-    let mut b = DerivedSchema::new();
-    b.push_pk_of(left)?;
-    for (_, c) in left.payload_columns().chain(right.payload_columns()) {
-        b.push(*c)?;
-    }
-    Some(b.finish())
-}
-
-// ---------------------------------------------------------------------------
-// The row writer
-// ---------------------------------------------------------------------------
-
-/// One join's output under construction: the batch, the blob dedup cache, and
-/// the two input schemas that fix the row layout `[left_PK, left_payload...,
-/// right_payload...]`. Opened from the same `(left, right)` pair
-/// [`merge_schemas_for_join`] derives `out_schema` from, so the schema and the
-/// rows written under it come from one input.
-struct JoinRowWriter<'s> {
-    output: Batch,
-    /// One dedup cache for the whole join: a `D×T` key group re-appends each left
-    /// payload `T` times and each right payload `D` times.
-    cache: BlobCacheGuard,
-    left_schema: &'s SchemaDescriptor,
-    right_schema: &'s SchemaDescriptor,
-    /// The left half's payload count: the right half's first payload slot, and
-    /// the bit the two null words are joined at.
-    left_npc: usize,
-}
-
-impl<'s> JoinRowWriter<'s> {
-    /// `rows` seeds the output capacity: exact for a 1:1 key match, a floor
-    /// otherwise.
-    fn open(
-        left_schema: &'s SchemaDescriptor,
-        right_schema: &'s SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-        rows: usize,
-    ) -> Self {
-        JoinRowWriter {
-            output: Batch::with_capacity(out_schema, rows),
-            cache: BlobCacheGuard::acquire(out_schema, rows),
-            left_schema,
-            right_schema,
-            left_npc: left_schema.num_payload_cols(),
-        }
-    }
-
-    /// Write one output row at `weight`: the left half from `left[left_row]`, the
-    /// right half from `right[right_row]` — both through the shared, monomorphic
-    /// `Batch::append_payload_cols` body (German-string blob relocation
-    /// included).
-    #[inline]
-    fn write<R: RowSource>(
-        &mut self,
-        left: &MemBatch,
-        left_row: usize,
-        right: &R,
-        right_row: usize,
-        right_null: u64,
-        weight: i64,
-    ) {
-        let left_null = left.get_null_word(left_row);
-        let null_word = merge_null_words(left_null, right_null, self.left_npc);
-
-        let output = &mut self.output;
-        output.begin_row(left.get_pk_bytes(left_row), weight);
-
-        output.append_payload_cols(0, self.left_schema, left, left_row, left_null, self.cache.get_mut());
-        output.append_payload_cols(
-            self.left_npc,
-            self.right_schema,
-            right,
-            right_row,
-            right_null,
-            self.cache.get_mut(),
-        );
-
-        output.commit_row(null_word);
-    }
-
-    fn finish(self) -> Batch {
-        self.output
-    }
 }
 
 // ---------------------------------------------------------------------------

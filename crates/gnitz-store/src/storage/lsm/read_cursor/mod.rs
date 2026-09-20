@@ -262,7 +262,7 @@ impl ReadCursor {
     /// [`Self::advance_to`] with its forward precondition already established:
     /// positioned, and below `key`. Skipping that comparison is the whole reason
     /// the two are separate.
-    fn advance_to_forward(&mut self, key: &[u8]) {
+    pub(crate) fn advance_to_forward(&mut self, key: &[u8]) {
         // Only the merge mode has a tournament an in-place gallop can maintain.
         if self.mode.is_none() {
             self.seek_forward_merge(key);
@@ -424,7 +424,7 @@ impl ReadCursor {
 
     /// Walk the equal-`key` PK group from wherever the cursor stands, invoking
     /// `f` at each emitted row; on return the cursor sits past the group. Seek-free
-    /// — a cogroup's `Equal` arm has just located `key` through the merge, and
+    /// — the equi walk's `Equal` arm has just located `key` through the merge, and
     /// everyone else positions first ([`Self::seek_pk_group_ascending`] under a
     /// sorted key list, [`Self::advance_to`] otherwise).
     ///

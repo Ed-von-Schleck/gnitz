@@ -182,7 +182,7 @@ fn recover_from_sal(
             // payload columns off the batch, and the ingest rejects a
             // payload-count mismatch outright.
             if batch.schema().num_payload_cols() < schema.num_payload_cols() {
-                batch = batch.widened_with_null_tail(&schema);
+                batch = batch.widened_with_nulls(&schema, false);
             }
             let owned = if reslice {
                 // The write path's own router, so what survives is exactly what the master

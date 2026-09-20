@@ -1,14 +1,14 @@
 //! Dispatch-loop tests: one epoch of a hand-built program per opcode path.
 
+use super::fixtures::*;
 use super::*;
-use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, zset_of};
-use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, StateIdx, StoreConfig};
+use crate::test_support::{make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, opk_pk, zset_of};
+use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, Slot, StorageError};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, StorageError};
 use gnitz_wire::type_code;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
-use gnitz_wire::ViewProps;
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
@@ -16,39 +16,6 @@ use gnitz_wire::ViewProps;
 /// `execute_epoch_multi` directly, with one entry per exchange side.
 fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Batch, StorageError> {
     execute_epoch_multi(vm, std::iter::once((DeltaReg(input_reg), input)))
-}
-
-/// The view id every plan below is compiled for.
-const VIEW_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-
-/// A registry holding one view homed under `dir` — the shape the VM actually
-/// runs, and what `CircuitState::open_child` reads its recovery policy from.
-fn vm_registry(dir: &std::path::Path) -> RelationRegistry {
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
-    registry
-        .register(RelationSpec {
-            id: VIEW_ID,
-            kind: RelationKind::View,
-            schema: make_schema_u128_i64(),
-            directory: dir.to_str().unwrap().to_string(),
-            props: ViewProps::default(),
-        })
-        .unwrap();
-    registry
-}
-
-/// One child store backing a trace register, opened the way a compile opens one.
-fn owned_table(
-    builder: &mut ProgramBuilder,
-    registry: &RelationRegistry,
-    dir: &std::path::Path,
-    name: &str,
-    schema: SchemaDescriptor,
-) -> StateIdx {
-    builder
-        .state
-        .open_child(registry, VIEW_ID, dir.to_str().unwrap(), name, schema)
-        .unwrap()
 }
 
 /// A reduce with no value index, over the register convention every test reduce
@@ -468,8 +435,16 @@ fn test_join_delta_trace() {
     let trace_batch = make_batch_u128(&right_schema, &[(10, 1, 100), (10, 1, 200), (10, 1, 300)]);
     builder.state.ingest_owned(table, trace_batch).unwrap();
     // reg 0 = left delta, reg 1 = right trace, reg 2 = output
+    let probe = gnitz_store::ops::JoinPlan::from_wire(
+        gnitz_wire::JoinKind::Equi,
+        false,
+        &left_schema,
+        &right_schema,
+    )
+    .unwrap()
+    .probe;
     builder.push(Instr::JoinDT {
-        probe: gnitz_store::ops::JoinProbe::Equi,
+        probe,
         delta_reg: DeltaReg(0),
         trace_reg: TraceReg(1),
         out_reg: DeltaReg(2),
@@ -697,4 +672,119 @@ fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
         vm.regfile.batches.iter().all(|b| b.is_empty()),
         "the skipped epoch still released the previous one's batches",
     );
+}
+
+// ── The two-term DBSP join, end to end ────────────────────────────────────
+
+/// One side's rows as `(pk, weight, payload)`.
+type JoinRows<'a> = &'a [(u128, i64, i64)];
+
+/// `ΔA ⋈ z⁻¹I(B) + ΔB ⋈ z⁻¹I(A)` as the planner builds it: both terms in side
+/// order, both integrates, one union. Registers are 0/1 = the two deltas,
+/// 2/3 = their traces, 4/5 = the terms, 6 = the union.
+fn two_term_join(
+    b: &mut ProgramBuilder,
+    registry: &RelationRegistry,
+    dir: &std::path::Path,
+    kind: gnitz_wire::JoinKind,
+    schema: SchemaDescriptor,
+) -> (SchemaDescriptor, Vec<RegisterMeta>) {
+    let trace_a = owned_table(b, registry, dir, "ta", schema);
+    let trace_b = owned_table(b, registry, dir, "tb", schema);
+    let plan = |right: bool| gnitz_store::ops::JoinPlan::from_wire(kind, right, &schema, &schema).unwrap();
+    let out_schema = plan(false).out_schema;
+
+    b.push(Instr::JoinDT {
+        delta_reg: DeltaReg(0),
+        trace_reg: TraceReg(3),
+        out_reg: DeltaReg(4),
+        probe: plan(false).probe,
+    });
+    b.push(Instr::JoinDT {
+        delta_reg: DeltaReg(1),
+        trace_reg: TraceReg(2),
+        out_reg: DeltaReg(5),
+        probe: plan(true).probe,
+    });
+    b.push(Instr::Union {
+        in_a: DeltaReg(4),
+        in_b: DeltaReg(5),
+        out_reg: DeltaReg(6),
+    });
+    b.push(Instr::Integrate {
+        in_reg: DeltaReg(0),
+        trace_reg: TraceReg(2),
+    });
+    b.push(Instr::Integrate {
+        in_reg: DeltaReg(1),
+        trace_reg: TraceReg(3),
+    });
+    let meta = vec![
+        RegisterMeta::delta(schema),
+        RegisterMeta::delta(schema),
+        RegisterMeta::trace(schema, trace_a),
+        RegisterMeta::trace(schema, trace_b),
+        RegisterMeta::delta(out_schema),
+        RegisterMeta::delta(out_schema),
+        RegisterMeta::delta(out_schema),
+    ];
+    (out_schema, meta)
+}
+
+/// The product both terms together must denote: every `(a, b)` pair the kind
+/// admits, at `w_a · w_b`, keyed as the output schema keys it and carrying A's
+/// payload before B's.
+fn join_reference(
+    kind: gnitz_wire::JoinKind,
+    schema: &SchemaDescriptor,
+    a: JoinRows<'_>,
+    b: JoinRows<'_>,
+) -> std::collections::HashMap<crate::test_support::RowKey, i64> {
+    let mut want = std::collections::HashMap::new();
+    for &(a_pk, a_w, a_v) in a {
+        for &(b_pk, b_w, b_v) in b {
+            if matches!(kind, gnitz_wire::JoinKind::Equi) && a_pk != b_pk {
+                continue;
+            }
+            let key = match kind {
+                gnitz_wire::JoinKind::Cross => [opk_pk(schema, &[a_pk]), opk_pk(schema, &[b_pk])].concat(),
+                _ => opk_pk(schema, &[a_pk]),
+            };
+            let cells = vec![Some(a_v.to_le_bytes().to_vec()), Some(b_v.to_le_bytes().to_vec())];
+            *want.entry((key, cells)).or_insert(0) += a_w * b_w;
+        }
+    }
+    want.retain(|_, w| *w != 0);
+    want
+}
+
+/// Both join kinds, over UNSORTED deltas carrying a cancelling duplicate: the
+/// A-sourced epoch integrates A and emits nothing, the B-sourced one joins
+/// against it, and the two epochs together denote the product weight for weight.
+#[test]
+fn a_two_term_join_denotes_the_product_across_both_epochs() {
+    // Raw (unsorted, with a pair that cancels) and the Z-set each denotes.
+    let a_raw: JoinRows = &[(2, 1, 20), (1, 1, 10), (1, 2, 10)];
+    let a_net: JoinRows = &[(1, 3, 10), (2, 1, 20)];
+    let b_raw: JoinRows = &[(2, 1, 200), (1, 1, 100), (1, -1, 100), (1, 1, 101)];
+    let b_net: JoinRows = &[(1, 1, 101), (2, 1, 200)];
+
+    for kind in [gnitz_wire::JoinKind::Equi, gnitz_wire::JoinKind::Cross] {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = vm_registry(dir.path());
+        let schema = make_schema_u128_i64();
+        let mut builder = ProgramBuilder::new();
+        let (out_schema, meta) = two_term_join(&mut builder, &registry, dir.path(), kind, schema);
+        let mut vm = builder.build(meta, DeltaReg(6));
+
+        let a = execute_epoch(&mut vm, make_batch_u128_raw(&schema, a_raw), 0).unwrap();
+        assert!(a.is_empty(), "{kind:?}: nothing to join against yet");
+
+        let b = execute_epoch(&mut vm, make_batch_u128_raw(&schema, b_raw), 1).unwrap();
+        assert_eq!(
+            zset_of(&b, &out_schema),
+            join_reference(kind, &schema, a_net, b_net),
+            "{kind:?}",
+        );
+    }
 }

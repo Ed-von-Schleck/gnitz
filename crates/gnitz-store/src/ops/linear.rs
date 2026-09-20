@@ -2,7 +2,7 @@
 //!
 //! The other two live with the batch mechanics they are: MAP is
 //! `crate::expr::MapPlan::evaluate_map_batch`, null-extend
-//! `Batch::widened_with_null_tail`.
+//! `Batch::widened_with_nulls`.
 
 use gnitz_expr::Evaluator;
 
@@ -56,23 +56,32 @@ pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Re
     Ok(SchemaDescriptor::new(&cols, a.pk_indices()))
 }
 
-/// Output schema of an outer-join NULL_EXTEND ([`Batch::widened_with_null_tail`]):
-/// the input schema verbatim (PK region unchanged), then one nullable column per
-/// null-fill `type_codes` entry. `decode_op_node` rejects an undecodable type
-/// code, so every entry is a real column type.
+/// Output schema of an outer-join NULL_EXTEND ([`Batch::widened_with_nulls`]):
+/// the input's PK region unchanged, then its payload and one nullable column per
+/// `type_codes` entry, in the order `nulls_first` selects. `decode_op_node`
+/// rejects an undecodable type code, so every entry is a real column type.
 pub fn null_extend_output_schema(
     in_schema: &SchemaDescriptor,
     type_codes: &[u8],
+    nulls_first: bool,
 ) -> Result<SchemaDescriptor, OpBuildErr> {
     const OVERFLOW: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
     let mut b = DerivedSchema::new();
     let over = || OpBuildErr::shape(OVERFLOW);
     b.push_pk_of(in_schema).ok_or_else(over)?;
+    let nulls = |b: &mut DerivedSchema| {
+        type_codes
+            .iter()
+            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, 1)).ok_or_else(over))
+    };
+    if nulls_first {
+        nulls(&mut b)?;
+    }
     for (_, c) in in_schema.payload_columns() {
         b.push(*c).ok_or_else(over)?;
     }
-    for &tc in type_codes {
-        b.push(SchemaColumn::new(tc, 1)).ok_or_else(over)?;
+    if !nulls_first {
+        nulls(&mut b)?;
     }
     Ok(b.finish())
 }

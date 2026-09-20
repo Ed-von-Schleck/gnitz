@@ -165,7 +165,7 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
         let ic = &entry.indexes()[0];
         let idx_schema = ic.schema();
         let src_pk_stride = entry.schema().pk_stride();
-        let idx_key_size = idx_schema.leading_key_size(1);
+        let idx_key_size = ic.key_spec().key_size();
         let mut probe = ic.cursor();
         let mut key = Vec::new();
         while probe.valid {
@@ -393,7 +393,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     let idx_schema = ic.schema();
     let src_pk_stride = entry.schema().pk_stride();
     let idx_pk_stride = idx_schema.pk_stride();
-    let idx_key_size = idx_schema.leading_key_size(1);
+    let idx_key_size = ic.key_spec().key_size();
 
     let mut probe = ic.cursor();
     let mut orphan_key = Vec::new();

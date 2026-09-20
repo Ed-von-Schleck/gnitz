@@ -13,6 +13,10 @@ use gnitz_store::storage::{Batch, ReadCursor};
 mod builder;
 mod exec;
 
+#[cfg(test)]
+#[path = "tests/fixtures.rs"]
+pub(in crate::query) mod fixtures;
+
 pub(in crate::query) use builder::ProgramBuilder;
 pub(in crate::query) use exec::{execute_epoch_multi, Replay};
 
@@ -107,9 +111,9 @@ pub(in crate::query) enum Instr {
         out_reg: DeltaReg,
         preset: ops::ClampPreset,
     },
-    /// The delta-trace inner join, equi and range alike: the probe is baked by
-    /// the compiler from the wire's `JoinKind`, so the wire's relation spelling
-    /// never reaches the instruction set.
+    /// The delta-trace inner join, equi, range and cross alike: the probe is
+    /// baked by the compiler from the wire's `JoinKind` and side flag, so neither
+    /// spelling reaches the instruction set.
     JoinDT {
         delta_reg: DeltaReg,
         trace_reg: TraceReg,
@@ -122,13 +126,18 @@ pub(in crate::query) enum Instr {
         worker_id: u32,
         num_workers: u32,
     },
-    /// Widen every row with NULL-filled trailing payload columns — the LEFT JOIN
-    /// null-fill's unmatched preserved rows. The appended column count is the
-    /// difference between the two registers' schemas, which the compiler built.
+    /// Widen every row with NULL-filled payload columns — the LEFT JOIN
+    /// null-fill's unmatched preserved rows — on the side `nulls_first` names.
+    /// The column count is the difference between the two registers' schemas.
     NullExtend {
         in_reg: DeltaReg,
         out_reg: DeltaReg,
+        nulls_first: bool,
     },
+    /// Accumulate a delta into its trace. `ProgramBuilder::build` schedules every
+    /// `Integrate` last, which makes it the last reader of its register, so it
+    /// ingests by move. Operators still read `z⁻¹(I)`: `bind_trace_cursors`
+    /// snapshots before the first instruction runs.
     Integrate {
         in_reg: DeltaReg,
         /// The trace this delta accumulates into, named by its register.
@@ -182,7 +191,11 @@ pub(in crate::query) fn reads(instr: &Instr) -> [Option<DeltaReg>; 2] {
             worker_id: _,
             num_workers: _,
         } => [Some(*in_reg), None],
-        Instr::NullExtend { in_reg, out_reg: _ } => [Some(*in_reg), None],
+        Instr::NullExtend {
+            in_reg,
+            out_reg: _,
+            nulls_first: _,
+        } => [Some(*in_reg), None],
         Instr::Integrate { in_reg, trace_reg: _ } => [Some(*in_reg), None],
         Instr::Reduce {
             in_reg,
@@ -216,6 +229,44 @@ pub(in crate::query) fn writes_state_during_replay(instr: &Instr) -> bool {
         | Instr::NullExtend { .. }
         | Instr::Union { .. }
         | Instr::JoinDT { .. } => false,
+    }
+}
+
+/// The register whose batch `instr` consolidates before reading it, if any. The
+/// builder turns these into [`Program::consolidate_at`]. Spelled out variant by
+/// variant for the same reason [`reads`] is.
+///
+/// `Integrate` is left out although it consolidates: it folds what it moves at no
+/// extra cost, and a hydration replay skips it. `TopN` does not consolidate.
+pub(in crate::query) fn consolidated_input(instr: &Instr, program: &Program) -> Option<DeltaReg> {
+    match instr {
+        Instr::JoinDT {
+            delta_reg,
+            trace_reg: _,
+            out_reg: _,
+            probe: _,
+        } => Some(*delta_reg),
+        Instr::WeightClamp {
+            in_reg,
+            hist_reg: _,
+            out_reg: _,
+            preset: _,
+        } => Some(*in_reg),
+        // `op_reduce` consolidates only when it has a value index to walk.
+        Instr::Reduce {
+            in_reg,
+            trace_out_reg: _,
+            out_reg: _,
+            plan_idx,
+        } => program.reduce_plans[plan_idx.at()].plan.avi.is_some().then_some(*in_reg),
+        Instr::Filter { .. }
+        | Instr::Map { .. }
+        | Instr::Negate { .. }
+        | Instr::Union { .. }
+        | Instr::WorkerFilter { .. }
+        | Instr::NullExtend { .. }
+        | Instr::Integrate { .. }
+        | Instr::TopN { .. } => None,
     }
 }
 
@@ -329,6 +380,10 @@ pub(in crate::query) struct Program {
     /// `u32::MAX` marks a register no instruction may take: the sink (read by the
     /// epoch epilogue, which no instruction spells) and any register nothing reads.
     pub(in crate::query) last_read: Vec<u32>,
+    /// For each register some instruction consolidates ([`consolidated_input`]),
+    /// the pc of its **first** reader, which folds it in place. `u32::MAX`
+    /// elsewhere.
+    pub(in crate::query) consolidate_at: Vec<u32>,
     /// The register the epoch's output is extracted from. Here rather than passed
     /// in, because `last_read` bakes "the sink is never takeable" against it: two
     /// spellings could disagree and nothing would catch it.

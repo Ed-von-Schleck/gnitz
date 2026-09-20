@@ -13,9 +13,18 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::Filter => OpNode::Filter(vec![1, 2, 3, 4]),
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,
-        Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
-        Opcode::JoinRange => OpNode::Join(JoinKind::Range { n_eq: 3, rel: RangeRel::Le }),
-        Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
+        Opcode::JoinEqui => OpNode::Join {
+            kind: JoinKind::Equi,
+            delta_is_right: true,
+        },
+        Opcode::JoinRange => OpNode::Join {
+            kind: JoinKind::Range { n_eq: 3, rel: RangeRel::Le },
+            delta_is_right: true,
+        },
+        Opcode::JoinCross => OpNode::Join {
+            kind: JoinKind::Cross,
+            delta_is_right: true,
+        },
         Opcode::IntegrateSink => OpNode::IntegrateSink,
         Opcode::Reduce => OpNode::Reduce {
             group_cols: vec![2, 7],
@@ -35,6 +44,7 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: vec![0, 2] },
         Opcode::NullExtend => OpNode::NullExtend {
             type_codes: vec![crate::type_code::I64, crate::type_code::STRING],
+            nulls_first: true,
         },
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
         Opcode::MapProj => OpNode::Map(MapKind::Projection(vec![4, 0, 9])),
@@ -114,11 +124,23 @@ fn every_op_node_variant_roundtrips() {
             global_ground: false,
         });
     }
-    // Every join kind, and every relation the range kind can carry — `Join`'s
-    // own sample can only be one of them.
-    nodes.extend([OpNode::Join(JoinKind::Equi), OpNode::Join(JoinKind::Cross)]);
-    for &rel in RangeRel::ALL {
-        nodes.push(OpNode::Join(JoinKind::Range { n_eq: 3, rel }));
+    // Every join kind on either side, and every relation the range kind can carry
+    // — `Join`'s own sample can only be one of them. Same for the null-extend's
+    // two placements.
+    for delta_is_right in [false, true] {
+        for kind in [JoinKind::Equi, JoinKind::Cross] {
+            nodes.push(OpNode::Join { kind, delta_is_right });
+        }
+        for &rel in RangeRel::ALL {
+            nodes.push(OpNode::Join {
+                kind: JoinKind::Range { n_eq: 3, rel },
+                delta_is_right,
+            });
+        }
+        nodes.push(OpNode::NullExtend {
+            type_codes: vec![crate::type_code::I64],
+            nulls_first: delta_is_right,
+        });
     }
     for node in nodes {
         assert_eq!(roundtrip(node.clone()).unwrap(), node, "round-trip failed for {node:?}");
@@ -224,7 +246,8 @@ fn decode_rejects_an_out_of_domain_reindex_target() {
 /// test, and the schema it lands in becomes every downstream node's input.
 #[test]
 fn decode_rejects_invalid_null_extend_type_code() {
-    let mut params = 1u16.to_le_bytes().to_vec();
+    let mut params = vec![0u8]; // nulls_first
+    params.extend(1u16.to_le_bytes());
     params.push(200);
     let err = decode_op_node(Opcode::NullExtend.as_wire(), None, Some(&params)).unwrap_err();
     assert!(err.contains("invalid column type code"), "got: {err}");
