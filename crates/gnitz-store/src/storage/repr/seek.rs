@@ -93,6 +93,20 @@ pub(crate) fn pk_group_end<S: RowSource>(src: &S, start: usize) -> usize {
     j
 }
 
+/// [`pk_group_end`] over a leading `width`-byte key prefix rather than the whole
+/// key — the range join's equality-group bracket. Its own loop: folded into
+/// [`pk_group_end`], this slice bound would be paid by every consolidating merge.
+#[inline]
+pub(crate) fn pk_prefix_group_end<S: RowSource>(src: &S, start: usize, width: usize) -> usize {
+    let k = &src.get_pk_bytes(start)[..width];
+    let count = src.row_count();
+    let mut j = start + 1;
+    while j < count && crate::schema::key::pk_bytes_eq(&src.get_pk_bytes(j)[..width], k) {
+        j += 1;
+    }
+    j
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

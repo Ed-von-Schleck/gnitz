@@ -67,8 +67,8 @@ pub use batch_wire::wire_block_size;
 pub use batch_wire::WireChunk;
 // `ColumnarSource` stays inside storage: everything out of it reads rows
 // through `gnitz_expr::RowSource`.
-// The equal-PK group bracket, reached from `ops` as well as from inside repr.
-pub(crate) use seek::pk_group_end;
+// The PK group brackets, reached from `ops` as well as from inside repr.
+pub(crate) use seek::{pk_group_end, pk_prefix_group_end};
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
 // caller names `crate::schema::key::X`, so one byte-order rule has one import
 // path.

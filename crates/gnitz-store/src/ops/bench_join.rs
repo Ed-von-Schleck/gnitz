@@ -150,7 +150,7 @@ fn time_join(
     let plan = JoinPlan::from_wire(kind, delta_is_right, schema, schema).expect("bench join plan is well-formed");
     let mut out_rows = 0;
     let elapsed = bench_time(ITERS, || {
-        let out = op_join_delta_trace(delta, cursor, schema, &plan.out_schema, plan.probe);
+        let out = op_join_delta_trace(delta, cursor, &plan.out_schema, plan.probe);
         out_rows = out.count;
         std::hint::black_box(&out);
     });
@@ -311,15 +311,19 @@ struct RangeShape {
     /// Keep every `miss_stride`-th delta eq-group in the trace; `1` = every one
     /// matches. `> 1` is what the walk's trailing group skip targets.
     miss_stride: usize,
+    /// Trace slots per eq group, which with `N` fixes the group count. Ignored
+    /// at `n_eq = 0`, one group holding all of `N`.
+    slots_per_group: u64,
 }
 
-const RANGE_SHAPES: [RangeShape; 5] = [
+const RANGE_SHAPES: [RangeShape; 6] = [
     RangeShape {
         name: "n_eq=0 stride=8 wide-span",
         pk_types: &[type_code::U64],
         span_num: 1,
         span_den: 16,
         miss_stride: 1,
+        slots_per_group: 64,
     },
     RangeShape {
         name: "n_eq=0 stride=8 narrow-span",
@@ -327,6 +331,7 @@ const RANGE_SHAPES: [RangeShape; 5] = [
         span_num: 15,
         span_den: 16,
         miss_stride: 1,
+        slots_per_group: 64,
     },
     RangeShape {
         name: "n_eq=1 stride=8 wide-span",
@@ -334,6 +339,7 @@ const RANGE_SHAPES: [RangeShape; 5] = [
         span_num: 1,
         span_den: 16,
         miss_stride: 1,
+        slots_per_group: 64,
     },
     RangeShape {
         name: "n_eq=1 stride=12 wide-span",
@@ -341,6 +347,7 @@ const RANGE_SHAPES: [RangeShape; 5] = [
         span_num: 1,
         span_den: 16,
         miss_stride: 1,
+        slots_per_group: 64,
     },
     RangeShape {
         name: "n_eq=1 stride=12 mostly-unmatched",
@@ -348,12 +355,19 @@ const RANGE_SHAPES: [RangeShape; 5] = [
         span_num: 1,
         span_den: 16,
         miss_stride: 16,
+        slots_per_group: 64,
+    },
+    // 512 delta groups against a trace holding four — a ~128-group skip between
+    // sweeps, where the shapes above skip at most 15 rows.
+    RangeShape {
+        name: "n_eq=1 stride=12 sparse-groups",
+        pk_types: &[type_code::U32, type_code::U64],
+        span_num: 1,
+        span_den: 16,
+        miss_stride: 128,
+        slots_per_group: 8,
     },
 ];
-
-/// Slot values per eq group in a band shape. `n_eq = 0` is one group instead,
-/// holding the whole `N`-row trace.
-const SLOTS_PER_GROUP: u64 = 64;
 
 /// Delta probes per group at `n_eq = 0`, spread across the shape's span. A band
 /// shape probes once per group instead, so its delta row count is its group
@@ -366,7 +380,7 @@ fn range_rows(shape: &RangeShape) -> (Vec<Row>, Vec<Row>) {
     let n_eq = shape.pk_types.len() - 1;
     let (groups, slots) = match n_eq {
         0 => (1usize, N as u64),
-        _ => ((N / SLOTS_PER_GROUP as usize).max(1), SLOTS_PER_GROUP),
+        _ => ((N / shape.slots_per_group as usize).max(1), shape.slots_per_group),
     };
     let base = shape.span_num * slots / shape.span_den;
     let mut delta = Vec::new();
@@ -407,7 +421,11 @@ fn join_range_dt_bench() {
                     for right in SIDES {
                         let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
                         time_join(
-                            format!("range {:<32} {:<8} {rel:?} src={srcs} right={right}", shape.name, p.tag()),
+                            format!(
+                                "range {:<32} {:<8} {rel:?} src={srcs} right={right}",
+                                shape.name,
+                                p.tag()
+                            ),
                             JoinKind::Range { n_eq, rel },
                             right,
                             &schema,

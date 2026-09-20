@@ -55,6 +55,12 @@ fn op_reduce(
     i_am_owner: bool,
 ) -> Batch {
     let plan = make_plan(input_schema, group_by_cols, agg_descs, global_ground, i_am_owner);
+    // The VM folds the register before both the kernel and the value index.
+    let cs = plan
+        .consolidates_input()
+        .then(|| Batch::consolidate_if_needed(delta, input_schema))
+        .flatten();
+    let delta = cs.as_ref().unwrap_or(delta);
     // A non-linear reduce always carries a value index. `None` from a caller
     // means "the index holds exactly this delta" — the single-tick shape — so
     // build it here; a caller with prior history passes its own cursor.

@@ -101,13 +101,12 @@ impl TopNIndex {
         let key_packer = ReindexPacker::new_group_key(input, group_cols, suffix)?;
         let mut b = crate::schema::DerivedSchema::new();
         push_group_index_key(&mut b, &key_packer, suffix);
-        const OVERFLOW: &str = "top-n: index exceeds MAX_COLUMNS";
+        let over = |e| OpBuildErr::shape(format!("top-n: index {e}"));
         for _ in &order {
-            b.push(IMAGE_COL).ok_or_else(|| OpBuildErr::shape(OVERFLOW))?;
+            b.push(IMAGE_COL).map_err(over)?;
         }
         for &c in carried_cols {
-            b.push(input.columns[c as usize])
-                .ok_or_else(|| OpBuildErr::shape(OVERFLOW))?;
+            b.push(input.columns[c as usize]).map_err(over)?;
         }
         let schema = b.finish();
         let tail = schema.num_columns() - carried_cols.len();

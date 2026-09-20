@@ -65,20 +65,19 @@ pub fn null_extend_output_schema(
     type_codes: &[u8],
     nulls_first: bool,
 ) -> Result<SchemaDescriptor, OpBuildErr> {
-    const OVERFLOW: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
     let mut b = DerivedSchema::new();
-    let over = || OpBuildErr::shape(OVERFLOW);
-    b.push_pk_of(in_schema).ok_or_else(over)?;
+    let over = |e| OpBuildErr::shape(format!("null-extend: merged schema {e}"));
+    b.push_pk_of(in_schema).map_err(over)?;
     let nulls = |b: &mut DerivedSchema| {
         type_codes
             .iter()
-            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, 1)).ok_or_else(over))
+            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, 1)).map_err(over))
     };
     if nulls_first {
         nulls(&mut b)?;
     }
     for (_, c) in in_schema.payload_columns() {
-        b.push(*c).ok_or_else(over)?;
+        b.push(*c).map_err(over)?;
     }
     if !nulls_first {
         nulls(&mut b)?;

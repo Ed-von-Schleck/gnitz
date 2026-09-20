@@ -107,7 +107,7 @@ pub(in crate::query) struct BakedTopN {
 struct OpFacts {
     /// The second delta this operator reads.
     second_in: Option<DeltaReg>,
-    /// It folds its input before reading it.
+    /// It reads its input at net weights, so the VM folds that register first.
     consolidates_in: bool,
     /// It writes operator state — a history table, a value index, an ordered
     /// index. Not the output trace, which a `Program::integrates` entry writes.

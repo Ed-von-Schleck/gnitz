@@ -88,6 +88,34 @@ pub(crate) mod payload_order;
 /// schemas, so call sites keep naming `crate::schema::IndexKeySpec`.
 pub use key::IndexKeySpec;
 
+/// Which fixed bound a [`DerivedSchema`] push hit. Callers prefix it with what
+/// they were building.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SchemaBound {
+    Columns,
+    /// A key column behind a payload one, which [`DerivedSchema::finish`]'s
+    /// dense `0..pk_len` PK list cannot express.
+    PkAfterPayload,
+    PkColumns,
+    PkBytes,
+    /// A key column whose type has no order-preserving encoding.
+    PkType(u8),
+    PkNullable,
+}
+
+impl std::fmt::Display for SchemaBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaBound::Columns => write!(f, "exceeds MAX_COLUMNS ({MAX_COLUMNS})"),
+            SchemaBound::PkAfterPayload => write!(f, "places a key column behind a payload column"),
+            SchemaBound::PkColumns => write!(f, "key exceeds MAX_PK_COLUMNS ({MAX_PK_COLUMNS})"),
+            SchemaBound::PkBytes => write!(f, "key exceeds MAX_PK_BYTES ({MAX_PK_BYTES})"),
+            SchemaBound::PkType(tc) => write!(f, "keys on column type {tc}, which is not PK-eligible"),
+            SchemaBound::PkNullable => write!(f, "keys on a nullable column"),
+        }
+    }
+}
+
 /// Accumulator for a derived schema whose PK is its leading `pk_len` columns —
 /// the shape of every schema the compiler and the reduce planner build
 /// (join / map / reindex / hash-row / null-extend / reduce outputs). PK columns
@@ -122,10 +150,10 @@ impl DerivedSchema {
     }
 
     /// Append one payload column.
-    pub(crate) fn push(&mut self, col: SchemaColumn) -> Option<()> {
-        *self.cols.get_mut(self.n)? = col;
+    pub(crate) fn push(&mut self, col: SchemaColumn) -> Result<(), SchemaBound> {
+        *self.cols.get_mut(self.n).ok_or(SchemaBound::Columns)? = col;
         self.n += 1;
-        Some(())
+        Ok(())
     }
 
     /// Append one PK column, which [`Self::finish`] numbers `0..pk_len` — so a
@@ -134,29 +162,36 @@ impl DerivedSchema {
     ///
     /// Rejects everything `SchemaDescriptor::new` *asserts* (see
     /// [`SchemaDescriptor::new_with_placement`]), so a caller passing an unvetted
-    /// column type gets a `None` rather than an abort inside `finish()`.
-    pub(crate) fn push_pk(&mut self, col: SchemaColumn) -> Option<()> {
-        if self.pk_len != self.n
-            || self.pk_len == MAX_PK_COLUMNS
-            || self.pk_bytes + col.size() as usize > MAX_PK_BYTES
-            || !gnitz_wire::is_pk_eligible(col.type_code)
-            || col.nullable != 0
-        {
-            return None;
+    /// column type gets a [`SchemaBound`] rather than an abort inside `finish()`.
+    pub(crate) fn push_pk(&mut self, col: SchemaColumn) -> Result<(), SchemaBound> {
+        if self.pk_len != self.n {
+            return Err(SchemaBound::PkAfterPayload);
+        }
+        if self.pk_len == MAX_PK_COLUMNS {
+            return Err(SchemaBound::PkColumns);
+        }
+        if self.pk_bytes + col.size() as usize > MAX_PK_BYTES {
+            return Err(SchemaBound::PkBytes);
+        }
+        if !gnitz_wire::is_pk_eligible(col.type_code) {
+            return Err(SchemaBound::PkType(col.type_code));
+        }
+        if col.nullable != 0 {
+            return Err(SchemaBound::PkNullable);
         }
         self.push(col)?;
         self.pk_len += 1;
         self.pk_bytes += col.size() as usize;
-        Some(())
+        Ok(())
     }
 
     /// Append `schema`'s PK columns in PK-list order — the shared prologue of
     /// every builder that inherits its input's key.
-    pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) -> Option<()> {
+    pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) -> Result<(), SchemaBound> {
         for (_, c) in schema.pk_columns() {
             self.push_pk(*c)?;
         }
-        Some(())
+        Ok(())
     }
 
     pub(crate) fn finish(&self) -> SchemaDescriptor {
@@ -902,7 +937,7 @@ pub fn index_spec_and_schema(
     let spec = IndexKeySpec::new(source_cols, source)?;
     let schema = spec
         .output_schema(source)
-        .ok_or_else(|| "Index: composite key is not a valid primary key".to_string())?;
+        .map_err(|e| format!("Index: composite key {e}"))?;
     Ok((spec, schema))
 }
 
@@ -959,9 +994,9 @@ pub fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     for c in gnitz_wire::delta_schema_order(view.pk_indices(), view.num_columns()) {
         match c {
-            DeltaCol::Tick => b.push_pk(DELTA_TICK_COL)?,
-            DeltaCol::Key(i) => b.push_pk(view.columns[i])?,
-            DeltaCol::Payload(i) => b.push(view.columns[i])?,
+            DeltaCol::Tick => b.push_pk(DELTA_TICK_COL).ok()?,
+            DeltaCol::Key(i) => b.push_pk(view.columns[i]).ok()?,
+            DeltaCol::Payload(i) => b.push(view.columns[i]).ok()?,
         }
     }
     Some(b.finish().with_placement(Placement::Local))
@@ -992,11 +1027,11 @@ const _: () = {
 /// column list can reach.
 pub fn project_schema(schema: &SchemaDescriptor, project: &[u32]) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
-    b.push_pk_of(schema)?;
+    b.push_pk_of(schema).ok()?;
     for &p in project {
         let i = p as usize;
         if schema.try_payload_idx(i).is_some() {
-            b.push(schema.columns[i])?;
+            b.push(schema.columns[i]).ok()?;
         }
     }
     Some(b.finish())

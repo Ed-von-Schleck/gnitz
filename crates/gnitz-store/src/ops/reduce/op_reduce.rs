@@ -26,13 +26,10 @@ pub fn op_reduce(
     let shape = &plan.shape;
     let output_schema = &shape.output_schema;
 
-    let cs = match plan.consolidates_input() {
-        true => Batch::consolidate_if_needed(delta, &plan.input_schema),
-        false => None,
-    };
-    let working: &Batch = cs.as_ref().unwrap_or(delta);
+    // Folded by the VM at this register's first reader.
+    debug_assert!(!plan.consolidates_input() || delta.is_consolidated());
 
-    if working.count == 0 {
+    if delta.count == 0 {
         // An empty source delivers only empty deltas, so the ground row is minted
         // here: by the one worker owning V₀, and only while no V₀ row is stored.
         if plan.seeds_ground {
@@ -46,8 +43,8 @@ pub fn op_reduce(
         return Batch::empty_with_schema(output_schema);
     }
 
-    let mb = working.as_mem_batch();
-    let runs = shape.key.runs(working);
+    let mb = delta.as_mem_batch();
+    let runs = shape.key.runs(delta);
 
     let mut out = Batch::with_capacity(output_schema, 2 * runs.len());
     let mut accs = shape.acc_template.clone();
@@ -113,12 +110,7 @@ pub fn op_reduce(
         consolidate_group(&mut out, output_schema, mark);
     }
 
-    gnitz_debug!(
-        "op_reduce: in={} groups={} out={}",
-        working.count,
-        runs.len(),
-        out.count
-    );
+    gnitz_debug!("op_reduce: in={} groups={} out={}", delta.count, runs.len(), out.count);
 
     // A consolidated batch reaches a view store by move, allocation included.
     if out.count < runs.len() {

@@ -21,7 +21,8 @@ use gnitz_expr::RowSource;
 use gnitz_wire::{Cut, RangeDescriptor, RowHasher, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{
-    type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS,
+    type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES,
+    MAX_PK_COLUMNS,
 };
 
 // ---------------------------------------------------------------------------
@@ -432,15 +433,15 @@ impl IndexKeySpec {
     /// The index schema this spec's entries land in: the promoted key columns in
     /// declared order, then `source`'s PK columns, all in the PK with zero
     /// payload. Built from the promoters [`Self::write_span`] encodes through, so
-    /// the schema's leading-key width *is* [`Self::key_size`]. `None` only on the
+    /// the schema's leading-key width *is* [`Self::key_size`]. `Err` only on the
     /// limits [`Self::new`] has already checked.
-    pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    pub(in crate::schema) fn output_schema(&self, source: &SchemaDescriptor) -> Result<SchemaDescriptor, SchemaBound> {
         let mut b = DerivedSchema::new();
         for c in &self.cols[..self.n as usize] {
             b.push_pk(c.out)?;
         }
         b.push_pk_of(source)?;
-        Some(b.finish())
+        Ok(b.finish())
     }
 
     /// A base table's own PK as the degenerate span, each column at its own type, so a
@@ -1021,16 +1022,16 @@ impl ReindexPacker {
         in_schema: &SchemaDescriptor,
         payload_cols: &[u32],
     ) -> Result<SchemaDescriptor, OpBuildErr> {
-        const OVERFLOW: &str = "reindex map: output exceeds MAX_COLUMNS";
+        let over = |e| OpBuildErr::shape(format!("reindex map: output {e}"));
         let mut b = DerivedSchema::new();
         for c in self.key_columns() {
-            b.push_pk(c).ok_or_else(|| OpBuildErr::shape(OVERFLOW))?;
+            b.push_pk(c).map_err(over)?;
         }
         for &c in payload_cols {
             let col = in_schema
                 .column(c as usize)
                 .ok_or_else(|| OpBuildErr::oob_col("reindex map: payload column", c, in_schema))?;
-            b.push(col).ok_or_else(|| OpBuildErr::shape(OVERFLOW))?;
+            b.push(col).map_err(over)?;
         }
         Ok(b.finish())
     }

@@ -1,7 +1,7 @@
 //! `ReducePlan`, everything `op_reduce` needs baked at emit time, and the
 //! `ReduceShape` part of it the ad-hoc fold shares.
 
-use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor};
+use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaBound, SchemaColumn, SchemaDescriptor};
 
 use super::super::group_key::GroupOutKey;
 use super::agg::Accumulator;
@@ -19,14 +19,14 @@ fn check_cols(schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDes
     )
 }
 
-/// Build the reduce output schema from `out_key`. `None` when the columns would
-/// overflow the fixed `[_; 65]` schema array.
+/// Build the reduce output schema from `out_key`. `Err` with the bound the
+/// columns overflowed.
 pub(super) fn build_reduce_output_schema(
     input: &SchemaDescriptor,
     group_cols: &[u32],
     agg_descs: &[AggDescriptor],
     out_key: ReduceOutKey,
-) -> Option<SchemaDescriptor> {
+) -> Result<SchemaDescriptor, SchemaBound> {
     let mut b = DerivedSchema::new();
     for slot in out_key.output_layout(input.pk_indices(), group_cols, group_cols.iter().copied()) {
         match slot {
@@ -45,7 +45,7 @@ pub(super) fn build_reduce_output_schema(
             nullable as u8,
         ))?;
     }
-    Some(b.finish())
+    Ok(b.finish())
 }
 
 /// What a reduce's rows look like, shared by the circuit reduce and the ad-hoc
@@ -88,7 +88,7 @@ impl ReduceShape {
         out_key: ReduceOutKey,
     ) -> Result<Self, OpBuildErr> {
         let output_schema = build_reduce_output_schema(input, group_cols, aggs, out_key)
-            .ok_or_else(|| OpBuildErr::shape("reduce: output exceeds MAX_COLUMNS"))?;
+            .map_err(|e| OpBuildErr::shape(format!("reduce: output {e}")))?;
         // The aggregates are the trailing output columns.
         let cbase = output_schema.num_columns() - aggs.len();
         let acc_template: Vec<Accumulator> = aggs
@@ -112,7 +112,6 @@ impl ReduceShape {
 /// [`ReducePlan::from_wire`] only.
 pub struct ReducePlan {
     pub shape: ReduceShape,
-    pub(super) input_schema: SchemaDescriptor,
     /// This worker publishes the global-aggregate ground row.
     pub seeds_ground: bool,
     /// Position of the COUNT(*) carrying a group's net cardinality.
@@ -155,7 +154,6 @@ impl ReducePlan {
         };
         Ok(ReducePlan {
             shape,
-            input_schema: *input_schema,
             seeds_ground: global_ground && i_am_owner,
             cardinality,
             avi,

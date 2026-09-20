@@ -125,7 +125,6 @@ fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StorageErr
 
         // An `inert_on_empty` kernel returns exactly this for an empty input, so
         // skipping it saves opening a cursor over a trace it reads nothing from.
-        // `is_empty` is a pre-fold count: a delta that merely cancels still runs.
         if facts.inert_on_empty && batches[in_reg.at()].is_empty() {
             batches[out_reg.at()] = Batch::empty_with_schema(program.schema_of(out_reg));
         } else {
@@ -193,7 +192,6 @@ fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StorageErr
                     let result = ops::op_join_delta_trace(
                         &batches[in_reg.at()],
                         &mut state.cursor(*trace),
-                        program.schema_of(in_reg),
                         program.schema_of(out_reg),
                         *probe,
                     );

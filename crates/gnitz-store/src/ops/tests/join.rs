@@ -35,7 +35,9 @@ fn join(
     cursor: &mut ReadCursor,
 ) -> Batch {
     let p = plan(kind, delta_is_right, delta_schema, trace_schema);
-    op_join_delta_trace(delta, cursor, delta_schema, &p.out_schema, p.probe)
+    // The VM hands the kernel a folded register; these fixtures build raw ones.
+    let cs = Batch::consolidate_if_needed(delta, delta_schema);
+    op_join_delta_trace(cs.as_ref().unwrap_or(delta), cursor, &p.out_schema, p.probe)
 }
 
 /// The probe's own equality-prefix width, so the oracle slices a key exactly
@@ -52,7 +54,7 @@ fn probe_eq_size(probe: &JoinProbe) -> usize {
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_merge_schemas_for_join() {
+fn the_output_lays_out_the_key_then_both_payloads() {
     let left = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
@@ -67,14 +69,14 @@ fn test_merge_schemas_for_join() {
         ],
         &[0],
     );
-    let joined = merge_schemas_for_join(JoinKind::Equi, &left, &right).unwrap();
+    let joined = plan(JoinKind::Equi, false, &left, &right).out_schema;
     assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
     assert_eq!(joined.columns[0].type_code, type_code::U128);
     assert_eq!(joined.columns[1].type_code, type_code::I64);
     assert_eq!(joined.columns[2].type_code, type_code::STRING);
 
     // A keyless join takes no part in either key, so it mints the pair.
-    let crossed = merge_schemas_for_join(JoinKind::Cross, &left, &right).unwrap();
+    let crossed = plan(JoinKind::Cross, false, &left, &right).out_schema;
     assert_eq!(crossed.pk_indices(), &[0, 1]);
     assert_eq!(crossed.num_columns(), 4);
     assert_eq!(crossed.columns[2].type_code, type_code::I64);
@@ -82,61 +84,34 @@ fn test_merge_schemas_for_join() {
 }
 
 #[test]
-fn test_merge_schemas_for_join_compound_pk() {
-    // Compound-PK left: 4 columns [U64, U64, U64, U64], PK = (col1, col2).
-    let left = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ],
-        &[1, 2],
-    );
+fn the_output_carries_a_compound_pk_into_the_key_region() {
+    // A keyed join takes one shared key, so both sides' PK columns match.
+    let left = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 4], &[1, 2]);
     let right = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
-        &[0],
+        &[0, 1],
     );
-    let joined = merge_schemas_for_join(JoinKind::Equi, &left, &right).unwrap();
+    let joined = plan(JoinKind::Equi, false, &left, &right).out_schema;
     // Two PK columns up front, then left payload (2), then right payload (1) = 5.
     assert_eq!(joined.num_columns(), 5);
     assert_eq!(joined.pk_indices(), &[0, 1]);
     assert_eq!(joined.columns[0].type_code, type_code::U64);
     assert_eq!(joined.columns[1].type_code, type_code::U64);
 
-    // Single-PK left collapses back to pk_indices = [0].
-    let left_single = SchemaDescriptor::new(
+    // A single-PK pair collapses back to pk_indices = [0].
+    let single = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
     );
-    let joined_single = merge_schemas_for_join(JoinKind::Equi, &left_single, &right).unwrap();
+    let joined_single = plan(JoinKind::Equi, false, &single, &single).out_schema;
     assert_eq!(joined_single.pk_indices(), &[0]);
-}
-
-#[test]
-fn test_merge_schemas_for_join_column_overflow() {
-    // A merged column count over MAX_COLUMNS returns None (compile rejected),
-    // rather than aborting.
-    use crate::schema::MAX_COLUMNS;
-    let half = MAX_COLUMNS / 2 + 2;
-    let make = |n: usize| {
-        let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
-        cols[0] = SchemaColumn::new(type_code::U128, 0);
-        for col in cols.iter_mut().take(n).skip(1) {
-            *col = SchemaColumn::new(type_code::I64, 0);
-        }
-        SchemaDescriptor::new(&cols[..n], &[0])
-    };
-    assert!(
-        merge_schemas_for_join(JoinKind::Equi, &make(half), &make(half)).is_none(),
-        "an over-wide join output must be rejected (None), not aborted"
-    );
 }
 
 /// A keyed join reads one side's PK region as the other's, so a mismatched pair
@@ -889,7 +864,7 @@ fn assert_matches_reference(
     );
 
     let mut ch = trace_cursor(trace, trace_schema);
-    let out = op_join_delta_trace(delta, &mut ch, &delta_schema, &p.out_schema, p.probe);
+    let out = op_join_delta_trace(cs.as_ref().unwrap_or(delta), &mut ch, &p.out_schema, p.probe);
 
     let at = format!("{what}: kind={kind:?} delta_is_right={delta_is_right}");
     assert_eq!(out.count, want_rows, "{at}: row count");

@@ -1,7 +1,7 @@
 //! `TopNPlan` — everything `op_topn` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
 
-use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaDescriptor};
+use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaBound, SchemaDescriptor};
 use gnitz_wire::{OrderKey, ReduceOutSlot};
 
 use super::super::group_key::{GroupOutKey, GROUP_PK_COL};
@@ -22,13 +22,13 @@ pub struct TopNPlan {
     pub index: TopNIndex,
 }
 
-/// The top-N output schema and the input columns it carries as payload. `None`
-/// when the columns would overflow the fixed schema array.
+/// The top-N output schema and the input columns it carries as payload. `Err`
+/// with the bound the columns overflowed.
 fn build_topn_output_schema(
     input: &SchemaDescriptor,
     out_key: ReduceOutKey,
     group_cols: &[u32],
-) -> Option<(SchemaDescriptor, Vec<u32>)> {
+) -> Result<(SchemaDescriptor, Vec<u32>), SchemaBound> {
     let mut b = DerivedSchema::new();
     let mut carried = Vec::new();
     for slot in out_key.output_layout(input.pk_indices(), group_cols, 0..input.num_columns() as u32) {
@@ -41,7 +41,7 @@ fn build_topn_output_schema(
             }
         }
     }
-    Some((b.finish(), carried))
+    Ok((b.finish(), carried))
 }
 
 impl TopNPlan {
@@ -66,7 +66,7 @@ impl TopNPlan {
         }
         let out_key = input_schema.reduce_out_key(group_cols);
         let (output_schema, carried) = build_topn_output_schema(input_schema, out_key, group_cols)
-            .ok_or_else(|| OpBuildErr::shape("top-n: output exceeds MAX_COLUMNS"))?;
+            .map_err(|e| OpBuildErr::shape(format!("top-n: output {e}")))?;
         let index = TopNIndex::new(input_schema, group_cols, order, &carried)?;
         let key = GroupOutKey::new(input_schema, group_cols, out_key, &output_schema)?;
         Ok(TopNPlan { output_schema, key, offset, limit, index })

@@ -387,7 +387,10 @@ fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
 /// would miss a near-max-width input taking a short extension over the limit.
 #[test]
 fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
-    const GUARD: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
+    let guard = format!(
+        "null-extend: merged schema exceeds MAX_COLUMNS ({})",
+        crate::schema::MAX_COLUMNS
+    );
     let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![type_code::I64; n], false);
     let narrow = make_schema_u64_i64();
     let out = extend(&narrow, 1).expect("a short type_codes list extends cleanly");
@@ -398,7 +401,7 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
         extend(&narrow, crate::schema::MAX_COLUMNS)
             .expect_err("overflow")
             .to_string(),
-        GUARD
+        guard
     );
     // 64 + 2 > 65: the merged width, which a bound on the list length misses.
     let wide = {
@@ -406,5 +409,5 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
         cols[0] = SchemaColumn::new(type_code::U64, 0);
         SchemaDescriptor::new(&cols, &[0])
     };
-    assert_eq!(extend(&wide, 2).expect_err("overflow").to_string(), GUARD);
+    assert_eq!(extend(&wide, 2).expect_err("overflow").to_string(), guard);
 }

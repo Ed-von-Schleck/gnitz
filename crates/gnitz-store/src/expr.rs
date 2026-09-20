@@ -311,11 +311,11 @@ fn compute_map_output_schema(
     in_schema: &SchemaDescriptor,
     out_cols: &[(u8, bool)],
 ) -> Result<SchemaDescriptor, OpBuildErr> {
-    let over = || OpBuildErr::shape("compute map: output exceeds MAX_COLUMNS");
+    let over = |e| OpBuildErr::shape(format!("compute map: output {e}"));
     let mut b = DerivedSchema::new();
-    b.push_pk_of(in_schema).ok_or_else(over)?;
+    b.push_pk_of(in_schema).map_err(over)?;
     for &(tc, nullable) in out_cols {
-        b.push(SchemaColumn::new(tc, nullable as u8)).ok_or_else(over)?;
+        b.push(SchemaColumn::new(tc, nullable as u8)).map_err(over)?;
     }
     Ok(b.finish())
 }
@@ -335,10 +335,10 @@ fn hashrow_output_schema(
     in_schema: &SchemaDescriptor,
     cols: &[gnitz_wire::ReindexSlot],
 ) -> Result<SchemaDescriptor, OpBuildErr> {
-    let over = || OpBuildErr::shape("hash-row map: output exceeds MAX_COLUMNS");
+    let over = |e| OpBuildErr::shape(format!("hash-row map: output {e}"));
     let mut b = DerivedSchema::new();
     b.push_pk(SchemaColumn::new(crate::schema::type_code::U128, 0))
-        .ok_or_else(over)?;
+        .map_err(over)?;
     for &(c, tgt) in cols {
         // A key column, not merely an in-range one — the screen the reindex and
         // top-N key kinds clear at this same boundary.
@@ -347,7 +347,7 @@ fn hashrow_output_schema(
             .column(c as usize)
             .ok_or_else(|| OpBuildErr::oob_col("hash-row map: column", c, in_schema))?;
         b.push(SchemaColumn::new(tgt.map_or(src.type_code, |t| t as u8), src.nullable))
-            .ok_or_else(over)?;
+            .map_err(over)?;
     }
     Ok(b.finish())
 }
