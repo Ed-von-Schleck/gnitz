@@ -428,3 +428,23 @@ fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
     assert!(wide.pk_stride() > 16);
     assert_eq!(wide.format_pk_bytes(&opk_pk(&wide, &[7, 8, 9])), "7, 8, 9");
 }
+
+// ── PK coverage ──────────────────────────────────────────────────────────
+
+/// `covers_pk` asks containment, not equality: any order, and any extra column.
+#[test]
+fn covers_pk_accepts_any_superset_of_the_pk_columns() {
+    let col = SchemaColumn::new(type_code::U64, 0);
+
+    let compound = SchemaDescriptor::new(&[col; 4], &[1, 2]);
+    assert!(compound.covers_pk(&[1, 2]));
+    assert!(compound.covers_pk(&[2, 1]), "the PK's own order is irrelevant");
+    assert!(compound.covers_pk(&[2, 3, 1]), "an extra column does not weaken it");
+    assert!(!compound.covers_pk(&[1]), "half a compound PK determines no row");
+    assert!(!compound.covers_pk(&[0, 3]));
+
+    let single = SchemaDescriptor::new(&[col; 2], &[0]);
+    assert!(single.covers_pk(&[0]));
+    assert!(single.covers_pk(&[1, 0]));
+    assert!(!single.covers_pk(&[1]));
+}

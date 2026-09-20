@@ -107,18 +107,12 @@ impl<'l> PreflightKeyStream<'l> {
 pub(super) struct PreflightAccumulator {
     prev: Option<PkBuf>,
     pub(super) duplicate: bool,
-    /// The filter this pre-flight will publish. `insert` owns the cap
-    /// discipline: on overflow it drops the set whole and disables itself, so
-    /// the seed is never truncated — a truncated seed would publish a warm but
-    /// incomplete filter whose "proven absent" answers would let a genuine
-    /// duplicate skip the INSERT broadcast. Every span reaching `insert` is
-    /// distinct (spans arrive sorted, so duplicates are adjacent and stop at
-    /// the `prev` check).
+    /// The filter this pre-flight will publish.
     filter: UniqueFilter,
 }
 
 impl PreflightAccumulator {
-    pub(crate) fn new(cap: usize) -> Self {
+    pub(super) fn new(cap: usize) -> Self {
         PreflightAccumulator {
             prev: None,
             duplicate: false,
@@ -130,7 +124,7 @@ impl PreflightAccumulator {
     /// once a duplicate is found — the verdict is monotonic, so the caller
     /// stops merging useful spans (but still drains every worker's train).
     /// Spans are byte-equal iff value-equal, so equality is a plain compare.
-    pub(crate) fn offer(&mut self, key: PkBuf) -> bool {
+    pub(super) fn offer(&mut self, key: PkBuf) -> bool {
         if self.duplicate {
             return false;
         }
@@ -139,13 +133,13 @@ impl PreflightAccumulator {
             return false;
         }
         self.prev = Some(key);
-        self.filter.insert(key.pk_bytes());
+        let _ = self.filter.insert(key.pk_bytes());
         true
     }
 
     /// The filter holding every distinct span this pre-flight saw, ready to
     /// publish.
-    pub(crate) fn into_seed(self) -> UniqueFilter {
+    pub(super) fn into_seed(self) -> UniqueFilter {
         self.filter
     }
 }
@@ -211,9 +205,9 @@ impl MasterDispatcher {
     /// distinct-key cardinality.
     ///
     /// On success the index is safe to commit and broadcast and the returned
-    /// filter seeds the master's unique-filter cache; on failure the
-    /// caller returns a client error and never broadcasts, so no worker
-    /// reaches the fatal `DdlSync` backfill path.
+    /// filter, when there is one, seeds the master's unique-filter cache; on
+    /// failure the caller returns a client error and never broadcasts, so no
+    /// worker reaches the fatal `DdlSync` backfill path.
     ///
     /// MUST run inside the DDL critical section (committer barrier drained,
     /// catalog write lock held) and BEFORE the IDX_TAB +1 is appended/broadcast,
@@ -221,27 +215,22 @@ impl MasterDispatcher {
     /// backfill and no concurrent INSERT can be ordered between the snapshot and
     /// the backfill.
     ///
-    /// An unknown table yields an empty set (nothing to validate).
+    /// `None` when the index covers the owner's PK and so can never collide.
     pub async fn validate_unique_index_create(
         &self,
         owner_id: i64,
         col_indices: &[u32],
-    ) -> Result<UniqueFilter, WireFault> {
+    ) -> Result<Option<UniqueFilter>, WireFault> {
         let (idx_schema, packed) = {
             let cat = self.cat();
-            let owner_schema = match cat.registry().relation(owner_id).map(Relation::schema) {
-                Some(s) => s,
-                None => return Ok(UniqueFilter::new()),
+            let Some(owner_schema) = cat.registry().relation(owner_id).map(Relation::schema) else {
+                // Created in this same bundle, so empty: seed it and spare the
+                // first INSERT a warm-up scan.
+                return Ok(Some(UniqueFilter::new()));
             };
-            // Trivial-uniqueness short-circuit, generalised to the compound PK:
-            // a composite index whose columns are the table's enforced-unique PK
-            // (set equality — the SQL may list them in another order) can never
-            // collide, so the scan is skipped and the seed stays empty. The index
-            // key IS the PK here, so a span collision would be a PK collision,
-            // which `enforce_unique_pk` already makes impossible.
-            let pk = owner_schema.pk_indices();
-            if col_indices.len() == pk.len() && pk.iter().all(|p| col_indices.contains(p)) {
-                return Ok(UniqueFilter::new());
+            // A PK-covering index skips the scan, and every check it would ever plan.
+            if owner_schema.covers_pk(col_indices) {
+                return Ok(None);
             }
             // Build the index schema (the circuit is not registered until this
             // pre-flight succeeds) for the merge's reply-frame layout and the
@@ -281,7 +270,7 @@ impl MasterDispatcher {
         if merged.duplicate {
             return Err(self.cat().unique_create_dup_err(owner_id, col_indices).into());
         }
-        Ok(merged.into_seed())
+        Ok(Some(merged.into_seed()))
     }
 }
 

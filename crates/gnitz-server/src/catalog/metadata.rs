@@ -121,7 +121,10 @@ impl CatalogEngine {
     pub(crate) fn has_row_constraints(&self, table_id: i64) -> bool {
         !self.fk_constraints_of(table_id).is_empty()
             || !self.fk_children_of(table_id).is_empty()
-            || self.registry.relation(table_id).is_some_and(Relation::has_unique_index)
+            || self
+                .registry
+                .relation(table_id)
+                .is_some_and(|r| r.unique_indexes_to_check().next().is_some())
     }
 
     /// Does validating a write of `mode` to `table_id` read committed state?

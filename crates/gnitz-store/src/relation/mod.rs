@@ -304,10 +304,13 @@ impl Relation {
         self.schema().placement().is_replicated()
     }
 
-    /// Whether any secondary index on this relation enforces uniqueness. An FK
-    /// auto-index is not one, so this is narrower than "carries an index".
-    pub fn has_unique_index(&self) -> bool {
-        self.indexes.iter().any(SecondaryIndex::is_unique)
+    /// The unique secondary indexes a write must still check: one covering the
+    /// PK cannot collide, so it is not among them.
+    pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {
+        let schema = self.schema();
+        self.indexes
+            .iter()
+            .filter(move |ic| ic.is_unique() && !schema.covers_pk(ic.cols().as_slice()))
     }
 
     /// What the client is told this relation is.

@@ -84,8 +84,7 @@ pub struct MasterDispatcher {
     /// Per-(table_id, column list) filter skipping redundant unique-index
     /// occupancy broadcasts. Keyed by the decoded list, so a composite index is
     /// identified by its whole column list and dropping `(a, b)` never touches
-    /// a distinct single-column filter on `a`. See the UniqueFilter comment
-    /// block.
+    /// a distinct single-column filter on `a`.
     unique_filters: RefCell<FxHashMap<(i64, PkColList), UniqueFilter>>,
 
     /// The generation the last ephemeral round stamped. Set unconditionally, so

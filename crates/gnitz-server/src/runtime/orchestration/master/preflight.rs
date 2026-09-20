@@ -19,7 +19,6 @@ use super::train::drain_index_scan;
 use crate::catalog::FkEdge;
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
-use gnitz_store::relation::Relation;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::IndexKeySpec;
 use gnitz_store::storage::MemBatch;
@@ -503,16 +502,9 @@ impl MasterDispatcher {
 
         // Warm the unique filters before planning, so no await sits between the
         // bursts: nothing consumes a filter until U-SEC's elision test, and a
-        // warm one returns before awaiting anything. A write that will fail
-        // U-PK therefore pays the warm-up scan first, once per table per boot.
+        // warm one returns before awaiting anything.
         for t in &b.tables {
-            if self
-                .cat()
-                .registry()
-                .relation(t.tid)
-                .is_some_and(Relation::has_unique_index)
-                && b.surviving(t.tid).next().is_some()
-            {
+            if t.fold.is_some() && b.surviving(t.tid).next().is_some() {
                 self.ensure_unique_filters_warm(t.tid).await?;
             }
         }
@@ -658,17 +650,15 @@ fn plan_unique_checks<'a>(
         let tid = t.tid;
         // Copied out of the catalog in one walk: `disp.cat()` hands out
         // `&mut CatalogEngine` from `&self`, so the borrow must end before the
-        // dispatcher calls below. It comes first because a table with no unique
-        // index may have no fold to walk at all.
-        let uniques: Vec<(PkColList, SchemaDescriptor, IndexKeySpec)> = disp
-            .cat()
-            .registry()
-            .relation(tid)
-            .map_or(&[][..], Relation::indexes)
-            .iter()
-            .filter(|ic| ic.is_unique())
-            .map(|ic| (ic.cols(), ic.schema(), ic.key_spec()))
-            .collect();
+        // dispatcher calls below. It comes first because a table with nothing to
+        // check may have no fold for `surviving` to walk.
+        let uniques: Vec<(PkColList, SchemaDescriptor, IndexKeySpec)> = match disp.cat().registry().relation(tid) {
+            Some(r) => r
+                .unique_indexes_to_check()
+                .map(|ic| (ic.cols(), ic.schema(), ic.key_spec()))
+                .collect(),
+            None => Vec::new(),
+        };
         if uniques.is_empty() || b.surviving(tid).next().is_none() {
             continue;
         }

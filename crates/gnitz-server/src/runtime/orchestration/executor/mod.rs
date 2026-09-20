@@ -295,15 +295,13 @@ impl Shared {
     /// catalog *read* guard, so holding the write guard is what proves no task
     /// holds or awaits the lock being removed.
     ///
-    /// The dispatcher's own per-relation entry — the idle-poll gate's last-round
-    /// map — goes here too rather than through a second hook of the feed's own:
-    /// this is already the one place a dropped relation's per-relation master
-    /// state is cleared, and ids are never reused, so nothing else would ever
-    /// reclaim it.
+    /// Every per-relation master state a drop must reclaim is cleared here: ids
+    /// are never reused, so nothing else would ever reclaim it.
     fn forget_relation(&self, _catalog_write: &WriteGuard, id: i64) {
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
         self.disp().forget_delta_round(id);
+        self.disp().unique_filter_invalidate_table(id);
     }
 
     /// Credit `rows` against each tid's pending-tick count and fire the auto-tick

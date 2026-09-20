@@ -711,6 +711,13 @@ impl SchemaDescriptor {
         pk.len() == 1 && pk[0] as usize == ci
     }
 
+    /// True when `cols` holds every PK column. The span such a list encodes is
+    /// a fixed-width OPK concatenation and widening is injective, so the span
+    /// determines the row's PK: a unique index on `cols` cannot collide.
+    pub fn covers_pk(&self, cols: &[u32]) -> bool {
+        self.pk_indices().iter().all(|p| cols.contains(p))
+    }
+
     /// Inverse of `payload_idx`: dense payload slot → logical column index.
     /// Caller must ensure `pi < num_payload_cols()`.
     #[inline]

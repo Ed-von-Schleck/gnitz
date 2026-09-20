@@ -270,9 +270,9 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
             // No zone LSN reserved, no catalog mutation yet: just surface
             // the violation to the client. The write lock drops on return.
             Err(e) => return Err(e),
-            // Hold the pre-flight's filter to publish post-commit, keyed by
-            // the column list (the filter-map key).
-            Ok(filter) => filter_seeds.push((owner_id, cols, filter)),
+            Ok(Some(filter)) => filter_seeds.push((owner_id, cols, filter)),
+            // The index covers the owner's PK: nothing will consult a filter.
+            Ok(None) => {}
         }
     }
 
@@ -354,11 +354,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
     let fsync_fut = emit_zone_to_sal(shared, &mut shared.disp().sal().lock().await, "DDL", zone_lsn);
     publish_after_fsync(&shared.lsn_alloc, "DDL", zone_lsn, fsync_fut).await;
 
-    // Invalidate unique-filter state for durably-dropped tables/indices so a
-    // recreated table with the same ID does not inherit stale filter entries.
-    for &tid in &tables.drops {
-        shared.disp().unique_filter_invalidate_table(tid);
-    }
     // Relation ids are never reissued within a boot, so these entries are dead.
     for &id in tables.drops.iter().chain(&views.drops) {
         shared.forget_relation(&catalog_write, id);
@@ -458,7 +453,7 @@ async fn publish_after_fsync(alloc: &ZoneLsnAllocator, op: &'static str, zone: u
 /// Both locks are released before the fsync — the whole reserve/mutate/emit span
 /// is synchronous, so catalog readers never block across an `fdatasync`.
 /// `handle_ddl_txn` holds its write guard past the fsync instead, needing it for
-/// `forget_relation`, the filter invalidation and the backfill.
+/// its post-fsync catalog cleanup and the backfill.
 pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: u64) -> Result<i64, String> {
     let (base, zone_lsn, fsync_fut) = {
         // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under

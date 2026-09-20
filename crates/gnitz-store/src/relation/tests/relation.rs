@@ -245,3 +245,31 @@ fn ingest_apply_error_returned_internal() {
     );
     println!("{}", crate::test_support::CHILD_OK);
 }
+
+/// Not unique, or covering the PK: either one excludes an index.
+#[test]
+fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
+    let mut registry = solo_registry();
+    let schema = SchemaDescriptor::new(
+        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
+        &[0],
+    );
+    register_entry(
+        &mut registry,
+        60,
+        schema,
+        RelationKind::BaseTable,
+        relation_test_dir("unique_to_check"),
+    );
+    registry.add_index(60, 901, &[0], true).unwrap(); // exactly the PK
+    registry.add_index(60, 902, &[2, 0], true).unwrap(); // the PK plus a payload column
+    registry.add_index(60, 903, &[1], true).unwrap(); // the only real check
+    registry.add_index(60, 904, &[2], false).unwrap(); // not unique at all
+
+    let r = registry.relation(60).unwrap();
+    let cols: Vec<Vec<u32>> = r
+        .unique_indexes_to_check()
+        .map(|ic| ic.cols().as_slice().to_vec())
+        .collect();
+    assert_eq!(cols, vec![vec![1u32]]);
+}

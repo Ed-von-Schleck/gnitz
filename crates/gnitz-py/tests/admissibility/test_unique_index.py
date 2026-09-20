@@ -233,10 +233,12 @@ def test_worker_fault_mid_preflight(unique_preflight_fault_server):
     # All workers answer a full scan: nobody is wedged on a half-drained
     # pre-flight train.
     assert bag(scanned(srv, sn, "t")) == dict.fromkeys(seed + [(100, 1)], 1)
-    # The PK short-circuit returns before any fan-out, so it succeeds even
-    # while every worker's scan path is faulted.
+    # The PK-covering short-circuit returns before any fan-out, so it succeeds
+    # even while every worker's scan path is faulted — for the PK exactly, and
+    # for any column list containing it.
     srv.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
     assert _has_index(srv, sn)
+    srv.execute_sql("CREATE UNIQUE INDEX ON t(pk, val)", schema_name=sn)
 
 
 def test_preflight_spill_is_bounded_and_exact(unique_preflight_spill_server):

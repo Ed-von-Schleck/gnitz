@@ -91,7 +91,7 @@ fn preflight_seed_proves_absence_only_when_it_fits_the_cap() {
         let cols = PkColList::from_slice(&[0]);
         disp.unique_filter_seed(7, cols, seed);
         assert!(
-            disp.unique_filters.borrow()[&(7, cols)].warm,
+            disp.unique_filters.borrow()[&(7, cols)].is_warm(),
             "a published seed is warm, so no warmup scan rebuilds over it"
         );
         assert_eq!(
@@ -104,4 +104,29 @@ fn preflight_seed_proves_absence_only_when_it_fits_the_cap() {
             "a seeded key falls through either way"
         );
     }
+}
+
+/// The cap is tested before the insert, so a filter sitting at exactly `cap`
+/// has to tell a repeat span — which grows nothing — from a distinct one.
+#[test]
+fn a_filter_at_its_cap_still_accepts_a_repeat_span() {
+    let mut f = UniqueFilter::with_cap(3);
+    for k in 1..=3u64 {
+        assert!(f.insert(span_u64(k).pk_bytes()));
+    }
+    assert!(!f.capped(), "exactly at the cap is not past it");
+
+    assert!(f.insert(span_u64(2).pk_bytes()), "a repeat span costs no capacity");
+    assert!(!f.capped());
+    assert_eq!(f.len(), 3);
+    assert!(
+        !f.may_contain(span_u64(4).pk_bytes()),
+        "a filter that never capped still proves absence"
+    );
+
+    assert!(
+        !f.insert(span_u64(4).pk_bytes()),
+        "the first distinct span past the cap disables the filter"
+    );
+    assert!(f.capped());
 }

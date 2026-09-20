@@ -33,12 +33,19 @@ fn accumulator_distinct_keys_no_duplicate() {
     let keys: Vec<PkBuf> = [1u128, 2, 3, 100, u128::MAX].into_iter().map(span).collect();
     assert!(offer_all(&mut acc, &keys));
     assert!(!acc.duplicate);
-    let seed = acc.into_seed();
+    let mut seed = acc.into_seed();
     assert!(!seed.capped(), "under-cap seed must not report capped");
+    seed.mark_warm(); // as `unique_filter_seed` publishes it
     for k in &keys {
-        assert!(seed.may_contain(k.pk_bytes()), "seed under cap holds every span");
+        assert!(
+            !seed.proves_all_absent([k.pk_bytes()].into_iter()),
+            "seed under cap holds every span"
+        );
     }
-    assert!(!seed.may_contain(span(999).pk_bytes()), "and nothing else");
+    assert!(
+        seed.proves_all_absent([span(999).pk_bytes()].into_iter()),
+        "and nothing else"
+    );
 }
 
 /// A duplicate found after the cap has been crossed is still detected — the
