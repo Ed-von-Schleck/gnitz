@@ -381,6 +381,17 @@ impl<'a> MemBatch<'a> {
         &self.data[off..off + self.count * 8]
     }
 
+    /// Wrapping sum of the weights of rows `[start, end)`, over one
+    /// bounds-checked slice of the weight region.
+    #[inline]
+    pub(crate) fn sum_weights(&self, start: usize, end: usize) -> i64 {
+        self.weight()[start * 8..end * 8]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .fold(0i64, |a, w| a.wrapping_add(i64::from_le_bytes(*w)))
+    }
+
     /// Null bitmap region as a contiguous slice (`count * 8` bytes).
     #[inline(always)]
     pub(crate) fn null_bmp(&self) -> &'a [u8] {

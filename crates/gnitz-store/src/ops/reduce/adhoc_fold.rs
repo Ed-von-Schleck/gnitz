@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 
 use gnitz_wire::AggReadSpec;
 
-use super::agg::Accumulator;
+use super::agg::{Accumulator, BulkStep};
 
 use super::emit::emit_reduce_row;
 use super::plan::{build_reduce_output_schema, ReduceShape};
@@ -27,12 +27,14 @@ use crate::storage::{Batch, StoreError};
 /// The request-scoped fold state.
 pub(crate) struct AdhocFold {
     shape: ReduceShape,
-    /// Row `ord` is group `ord`'s key and group columns.
+    /// Row `ord` is group `ord`'s key and group columns; a global fold's one
+    /// group is row 0 from [`Self::new`].
     groups: Batch,
-    carried: Vec<ColumnLocator>,
-    /// Group `ord` owns `accs[ord * n_aggs .. (ord + 1) * n_aggs]`; a global
-    /// fold's one group is ordinal 0.
+    /// Group `ord` owns `accs[ord * n_aggs .. (ord + 1) * n_aggs]`.
     accs: Vec<Accumulator>,
+    /// A global fold's [`BulkStep`] per accumulator, resolved in [`Self::new`];
+    /// empty for a grouped fold.
+    bulk: Vec<BulkStep>,
     /// Group key → group ordinal.
     by_key: FxHashMap<u128, u32>,
     /// The previous row's `(key, ordinal)`, so a run of one group skips the map.
@@ -48,14 +50,18 @@ impl AdhocFold {
         let shape = ReduceShape::for_fold(src_schema, &agg.group_cols, &agg.aggs).map_err(refuse)?;
         let group_schema =
             build_reduce_output_schema(src_schema, &agg.group_cols, &[], shape.key.kind).map_err(refuse)?;
+        let mut groups = Batch::empty_with_schema(&group_schema);
+        let (mut accs, mut bulk) = (Vec::new(), Vec::new());
+        if shape.is_global() {
+            // A global fold's one group exists over no input: every worker emits it.
+            emit_reduce_row(&mut groups, None, shape.key.ground_pk().bytes(), &[]);
+            accs.extend_from_slice(&shape.acc_template);
+            bulk.extend(accs.iter().map(Accumulator::bulk_step));
+        }
         Ok(AdhocFold {
-            accs: if shape.is_global() {
-                shape.acc_template.clone()
-            } else {
-                Vec::new()
-            },
-            groups: Batch::empty_with_schema(&group_schema),
-            carried: shape.key.carried_locs(&group_schema),
+            accs,
+            bulk,
+            groups,
             shape,
             by_key: FxHashMap::default(),
             last: None,
@@ -75,6 +81,7 @@ impl AdhocFold {
             shape,
             groups,
             accs,
+            bulk,
             by_key,
             last,
             group_cap,
@@ -82,9 +89,9 @@ impl AdhocFold {
         } = self;
         let mb = chunk.as_mem_batch();
         if shape.is_global() {
-            for &(s, e) in ranges {
-                for acc in accs.iter_mut() {
-                    acc.step_rows(&mb, s..e);
+            for (acc, step) in accs.iter_mut().zip(bulk.iter()) {
+                for &(s, e) in ranges {
+                    step(acc, &mb, s..e);
                 }
             }
             return Ok(());
@@ -109,8 +116,7 @@ impl AdhocFold {
                             }
                             emit_reduce_row(
                                 groups,
-                                Some((&mb, row)),
-                                shape.key.exemplar_locs(),
+                                Some((&mb, row, shape.key.exemplar_locs())),
                                 shape.key.narrow_pk(key).bytes(),
                                 &[],
                             );
@@ -130,23 +136,19 @@ impl AdhocFold {
     }
 
     /// Emit one partial reduce-output row per present group (weight +1), in the
-    /// synthetic-fold reply layout and group-discovery order — or a global fold's
-    /// one row, which a worker that saw no rows emits as the ground row.
+    /// synthetic-fold reply layout and group-discovery order.
     pub(crate) fn finish(self) -> Batch {
-        let shape = &self.shape;
-        let n_aggs = shape.acc_template.len();
-        // The exact output row count is the group count — reserve once.
-        let mut output = Batch::with_capacity(&shape.output_schema, self.groups.count.max(1));
-        if shape.is_global() {
-            emit_reduce_row(&mut output, None, &[], shape.key.ground_pk().bytes(), &self.accs);
-            return output;
-        }
+        let n_aggs = self.shape.acc_template.len();
+        let gs = self.groups.schema();
+        let carried: Vec<ColumnLocator> = (0..gs.num_payload_cols())
+            .map(|pi| gs.locate(gs.payload_col_idx(pi)))
+            .collect();
+        let mut output = Batch::with_capacity(&self.shape.output_schema, self.groups.count);
         let groups_mb = self.groups.as_mem_batch();
         for ord in 0..self.groups.count {
             emit_reduce_row(
                 &mut output,
-                Some((&groups_mb, ord)),
-                &self.carried,
+                Some((&groups_mb, ord, &carried)),
                 groups_mb.get_pk_bytes(ord),
                 &self.accs[ord * n_aggs..(ord + 1) * n_aggs],
             );

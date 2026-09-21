@@ -15,17 +15,6 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
 use gnitz_expr::{cmp_order_keys, order_locators, Evaluator, LogicalProgram, OrderLocator, RangeMembership};
 
-/// The sink a request resolved to, ahead of any walk.
-enum Sink {
-    Fold(Box<AdhocFold>),
-    /// ORDER BY locators over the sink input, tiebreak appended when any key is
-    /// present, and the summed-weight window.
-    Rows {
-        order: Vec<OrderLocator>,
-        window: i64,
-    },
-}
-
 impl RelationRegistry {
     /// Execute `spec` on this worker's slice, replying in `reply_schema`'s layout.
     pub fn scan_spec(
@@ -43,9 +32,7 @@ impl RelationRegistry {
             (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
             resolve_order_locs(order, &src_schema)?;
-            if !reply_schema.same_physical_layout(&src_schema) {
-                return Err(layout_mismatch());
-            }
+            check_layout(reply_schema, &src_schema)?;
             return self.scan(target_id, hydrator);
         }
         let (source, membership) = self.open_bound(target_id, bound)?;
@@ -59,20 +46,6 @@ impl RelationRegistry {
             .transpose()
             .map_err(|e| StoreError::rejected(format!("scan_spec map: {e}")))?;
         let sink_in = map.as_ref().map_or(src_schema, |m| *m.out_schema());
-        let sink = match &sink.kind {
-            SinkKind::Fold(agg) => Sink::Fold(Box::new(AdhocFold::new(&sink_in, agg, self.config.adhoc_group_cap)?)),
-            SinkKind::Rows { order, limit_k } => Sink::Rows {
-                order: resolve_order_locs(order, &sink_in)?,
-                window: saturated_window(*limit_k),
-            },
-        };
-        let produced = match &sink {
-            Sink::Fold(f) => f.output_schema(),
-            Sink::Rows { .. } => &sink_in,
-        };
-        if !reply_schema.same_physical_layout(produced) {
-            return Err(layout_mismatch());
-        }
         let mut rows = Survivors {
             source: LiveSource::new(self, target_id, source, hydrator),
             predicate,
@@ -81,12 +54,22 @@ impl RelationRegistry {
             walk_words: Vec::new(),
         };
         let chunk_rows = self.config.scan_chunk_rows;
-        Ok(Rc::new(match sink {
-            Sink::Fold(fold) => run_fold_sink(&mut rows, chunk_rows, map.as_ref(), *fold)?,
-            Sink::Rows { order, window } if !order.is_empty() && window > 0 => {
-                topk_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, &order, window)?
+        Ok(Rc::new(match &sink.kind {
+            SinkKind::Fold(agg) => {
+                let fold = AdhocFold::new(&sink_in, agg, self.config.adhoc_group_cap)?;
+                check_layout(reply_schema, fold.output_schema())?;
+                run_fold_sink(&mut rows, chunk_rows, map.as_ref(), fold)?
             }
-            Sink::Rows { window, .. } => stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window)?,
+            SinkKind::Rows { order, limit_k } => {
+                let order = resolve_order_locs(order, &sink_in)?;
+                check_layout(reply_schema, &sink_in)?;
+                let window = saturated_window(*limit_k);
+                if !order.is_empty() && window > 0 {
+                    topk_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, &order, window)?
+                } else {
+                    stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window)?
+                }
+            }
         }))
     }
 
@@ -123,17 +106,18 @@ impl RelationRegistry {
                 feed.schema(),
             )
         };
-        if !reply_schema.same_physical_layout(&schema) {
-            return Err(layout_mismatch());
-        }
+        check_layout(reply_schema, &schema)?;
         Ok(cursor.materialize())
     }
 }
 
 /// The reply guard's refusal: a keeper built in any other layout would ship its
 /// regions under the client's strides.
-fn layout_mismatch() -> StoreError {
-    StoreError::rejected("reply schema does not match the output layout")
+fn check_layout(reply: &SchemaDescriptor, produced: &SchemaDescriptor) -> Result<(), StoreError> {
+    if !reply.same_physical_layout(produced) {
+        return Err(StoreError::rejected("reply schema does not match the output layout"));
+    }
+    Ok(())
 }
 
 /// Whether a walk over rounds `(after_tick, cut]` misses a round this worker
@@ -209,10 +193,8 @@ fn run_fold_sink(
                 dst.clear();
                 plan.append_map_ranges(&chunk, dst, ranges);
                 // The map already dropped the non-survivors, so every row of
-                // `dst` folds — and a chunk none survived maps to nothing.
-                if dst.count > 0 {
-                    fold.fold_ranges(dst, &[(0, dst.count)])?;
-                }
+                // `dst` folds.
+                fold.fold_ranges(dst, &[(0, dst.count)])?;
             }
             None => fold.fold_ranges(&chunk, ranges)?,
         }
@@ -250,19 +232,20 @@ fn stream_rows(
     let mut summed: i64 = 0;
 
     while let Some((chunk, ranges)) = rows.next(drain_rows)? {
+        let mb = chunk.as_mem_batch();
         if early_stop {
             // Cut at the row whose weight reaches the window: a range, or a hydrated group, can
             // run far past it.
             for i in 0..ranges.len() {
                 let (s, e) = ranges[i];
-                let range_sum = chunk.sum_weights(s, e);
+                let range_sum = mb.sum_weights(s, e);
                 if summed + range_sum < window {
                     summed += range_sum;
                     continue;
                 }
                 let mut end = s;
                 while summed < window && end < e {
-                    summed += chunk.get_weight(end);
+                    summed += mb.get_weight(end);
                     end += 1;
                 }
                 ranges[i].1 = end;
@@ -300,7 +283,10 @@ fn topk_rows(
         // Weighed off the source — the same weights that land in the keeper,
         // read from a contiguous region rather than row-by-row off the
         // destination.
-        summed += ranges.iter().map(|&(s, e)| chunk.sum_weights(s, e)).sum::<i64>();
+        let mb = chunk.as_mem_batch();
+        summed = ranges
+            .iter()
+            .fold(summed, |a, &(s, e)| a.wrapping_add(mb.sum_weights(s, e)));
         append_survivors(map, &chunk, &mut keeper, ranges);
         if summed > residency_cap {
             (keeper, summed) = topk_keep(keeper, order, window);

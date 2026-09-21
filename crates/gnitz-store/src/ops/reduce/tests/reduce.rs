@@ -1607,8 +1607,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     let accs = plan.shape.acc_template.clone();
     emit_reduce_row(
         &mut output,
-        Some((&mb, 0)),
-        plan.shape.key.exemplar_locs(),
+        Some((&mb, 0, plan.shape.key.exemplar_locs())),
         mb.get_pk_bytes(0),
         &accs,
     );
@@ -4876,8 +4875,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     let mut output = Batch::with_capacity(&out_schema, 1);
     emit_reduce_row(
         &mut output,
-        Some((&mb, 0)),
-        plan.shape.key.exemplar_locs(),
+        Some((&mb, 0, plan.shape.key.exemplar_locs())),
         mb.get_pk_bytes(0),
         &accs,
     );
@@ -4921,13 +4919,7 @@ fn ground_row_renders_count_family_zero_null_clear() {
     let mut raw_output = Batch::with_capacity(&out_schema, 1);
     let v0 = [0u8; 16]; // U128 ground PK (V₀)
     let plan = make_plan(&in_schema, &[], &descs, true, true);
-    emit_reduce_row(
-        &mut raw_output,
-        None,
-        plan.shape.key.exemplar_locs(),
-        &v0,
-        &plan.shape.acc_template,
-    );
+    emit_reduce_row(&mut raw_output, None, &v0, &plan.shape.acc_template);
 
     assert_eq!(raw_output.count, 1, "ground row emitted");
     let out_mb = raw_output.as_mem_batch();

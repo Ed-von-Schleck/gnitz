@@ -25,31 +25,25 @@ fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, null_word:
     }
 }
 
-/// Emit one `[key…, group columns…, aggregates…]` row at weight +1: a group's
-/// new value, copying its group columns from `exemplar` at `exemplar_locs`, or
-/// the ground row, which has none.
+/// Emit one `[key…, group columns…, aggregates…]` row at weight +1, copying the
+/// group columns from `group`'s row at its locators; the ground row has none.
 pub(super) fn emit_reduce_row(
     output: &mut Batch,
-    exemplar: Option<(&MemBatch, usize)>,
-    exemplar_locs: &[ColumnLocator],
+    group: Option<(&MemBatch, usize, &[ColumnLocator])>,
     out_pk_bytes: &[u8],
     accs: &[Accumulator],
 ) {
-    debug_assert!(
-        exemplar.is_some() || exemplar_locs.is_empty(),
-        "only an exemplar-free layout emits without an exemplar row"
-    );
     output.begin_row(out_pk_bytes, 1);
     let mut null_word: u64 = 0;
-
-    if let Some((input_mb, exemplar_row)) = exemplar {
-        for (out_pi, loc) in exemplar_locs.iter().enumerate() {
-            output.append_cell_from(out_pi, loc, input_mb, exemplar_row, &mut null_word);
+    let mut base = 0;
+    if let Some((src, row, locs)) = group {
+        for (out_pi, loc) in locs.iter().enumerate() {
+            output.append_cell_from(out_pi, loc, src, row, &mut null_word);
         }
+        base = locs.len();
     }
     for (k, acc) in accs.iter().enumerate() {
-        emit_agg_col(output, acc, exemplar_locs.len() + k, &mut null_word);
+        emit_agg_col(output, acc, base + k, &mut null_word);
     }
-
     output.commit_row(null_word);
 }

@@ -559,19 +559,8 @@ impl Batch {
         }
         self.downgrade();
     }
-    /// Summed weight of rows `[start, end)`, read straight off the contiguous
-    /// weight region so the fold vectorizes (rather than a `get_weight` per row).
-    #[inline]
-    pub(crate) fn sum_weights(&self, start: usize, end: usize) -> i64 {
-        self.weight_data()[start * FIXED_REGION_BYTES..end * FIXED_REGION_BYTES]
-            .as_chunks::<FIXED_REGION_BYTES>()
-            .0
-            .iter()
-            .map(|w| i64::from_le_bytes(*w))
-            .sum()
-    }
     /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
-    /// Branch-free over the same contiguous region [`Self::sum_weights`] reads, so
+    /// Branch-free over the contiguous weight region, so
     /// the conforming case is one pass with no early exit to serialize it.
     #[inline]
     pub fn all_weights_positive(&self) -> bool {

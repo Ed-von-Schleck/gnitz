@@ -6,7 +6,7 @@ use std::ops::Range;
 use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::MemBatch;
 use gnitz_expr::RowSource;
-use gnitz_wire::{AggFunc, ImageKind, ScalarKind, WideKind};
+use gnitz_wire::{AggFunc, FixedInt, ImageKind, ScalarKind, WideKind};
 
 use super::super::order_image::{scalar_image, scalar_native_of_image, wide_native, wide_native_of_image};
 
@@ -214,19 +214,80 @@ impl Accumulator {
         }
     }
 
-    /// [`Self::step_from_batch`] over each of `rows` at its own weight.
-    #[inline]
-    pub(super) fn step_rows(&mut self, mb: &MemBatch, rows: Range<usize>) {
+    /// This accumulator's [`BulkStep`]. A linear aggregate over a payload column
+    /// folds the column's value, weight and null regions in one loop; an
+    /// extreme, or a PK column, steps each row as [`Self::step_from_batch`] does.
+    /// Rows fold in row order, so a float sum matches stepping each row.
+    pub(super) fn bulk_step(&self) -> BulkStep {
+        let ColumnLocator::Payload { .. } = self.src else {
+            return Self::step_each;
+        };
         match self.kind {
-            StepKind::Count => {
-                self.acc = rows.fold(self.acc, |acc, row| acc.wrapping_add(mb.get_weight(row)));
-            }
-            kind => {
-                for row in rows {
-                    self.apply(kind, self.src, mb, row, mb.get_weight(row));
-                }
-            }
+            StepKind::Count => Self::count_rows,
+            StepKind::CountNonNull => Self::count_non_null_rows,
+            StepKind::Sum(ScalarKind::Int(fi)) => match fi {
+                FixedInt::U8 => Self::sum_int_rows::<1, false>,
+                FixedInt::I8 => Self::sum_int_rows::<1, true>,
+                FixedInt::U16 => Self::sum_int_rows::<2, false>,
+                FixedInt::I16 => Self::sum_int_rows::<2, true>,
+                FixedInt::U32 => Self::sum_int_rows::<4, false>,
+                FixedInt::I32 => Self::sum_int_rows::<4, true>,
+                // A wrapping 64-bit sum is the same bits signed or unsigned.
+                FixedInt::U64 | FixedInt::I64 => Self::sum_int_rows::<8, true>,
+            },
+            StepKind::Sum(ScalarKind::F32) => Self::sum_float_rows::<4>,
+            StepKind::Sum(ScalarKind::F64) => Self::sum_float_rows::<8>,
+            StepKind::Extreme { .. } => Self::step_each,
         }
+    }
+
+    fn step_each(&mut self, mb: &MemBatch, rows: Range<usize>) {
+        for row in rows {
+            self.apply(self.kind, self.src, mb, row, mb.get_weight(row));
+        }
+    }
+
+    fn count_rows(&mut self, mb: &MemBatch, rows: Range<usize>) {
+        self.acc = self.acc.wrapping_add(mb.sum_weights(rows.start, rows.end));
+    }
+
+    fn count_non_null_rows(&mut self, mb: &MemBatch, rows: Range<usize>) {
+        self.acc = fold_col::<0, _>(mb, self.src, rows, self.acc, |a, _, w, null| {
+            a.wrapping_add(if null { 0 } else { w })
+        });
+    }
+
+    /// SUM over an `N`-byte integer column, sign-extended when `SIGNED`.
+    fn sum_int_rows<const N: usize, const SIGNED: bool>(&mut self, mb: &MemBatch, rows: Range<usize>) {
+        let shift = 64 - 8 * N as u32;
+        self.acc = fold_col::<N, _>(mb, self.src, rows, self.acc, |a, v, w, null| {
+            let mut le = [0u8; 8];
+            le[..N].copy_from_slice(&v);
+            let bits = u64::from_le_bytes(le) << shift;
+            let v = if SIGNED {
+                (bits as i64) >> shift
+            } else {
+                (bits >> shift) as i64
+            };
+            a.wrapping_add(if null { 0 } else { v.wrapping_mul(w) })
+        });
+    }
+
+    /// SUM over an `f32` (`N = 4`) or `f64` (`N = 8`) column; the slot holds
+    /// `f64` bits either way.
+    fn sum_float_rows<const N: usize>(&mut self, mb: &MemBatch, rows: Range<usize>) {
+        let sum = fold_col::<N, _>(mb, self.src, rows, f64::from_bits(self.acc as u64), |a, v, w, null| {
+            let v = match N {
+                4 => f32::from_le_bytes(v[..4].try_into().unwrap()) as f64,
+                _ => f64::from_le_bytes(v[..8].try_into().unwrap()),
+            };
+            if null {
+                a
+            } else {
+                a + v * w as f64
+            }
+        });
+        self.acc = sum.to_bits() as i64;
     }
 
     #[inline]
@@ -244,6 +305,37 @@ impl Accumulator {
         let cur = f64::from_bits(self.acc as u64);
         self.acc = f64::to_bits(cur + v * weight as f64) as i64;
     }
+}
+
+/// One accumulator's step over a range of a batch's rows, each at its own
+/// weight. [`Accumulator::bulk_step`] picks it once per fold.
+pub(super) type BulkStep = fn(&mut Accumulator, &MemBatch, Range<usize>);
+
+/// Fold rows `rows` of `N`-byte payload column `src` as `(value, weight, is
+/// NULL)`, in row order. `N = 0` reads no value.
+#[inline(always)]
+fn fold_col<const N: usize, T>(
+    mb: &MemBatch,
+    src: ColumnLocator,
+    rows: Range<usize>,
+    init: T,
+    mut f: impl FnMut(T, [u8; N], i64, bool) -> T,
+) -> T {
+    let ColumnLocator::Payload { slot, .. } = src else {
+        unreachable!("bulk_step folds a payload column only")
+    };
+    let (slot, Range { start, end }) = (slot as usize, rows);
+    let weights = mb.weight()[start * 8..end * 8].as_chunks::<8>().0;
+    let nulls = mb.null_bmp()[start * 8..end * 8].as_chunks::<8>().0;
+    let rows = weights
+        .iter()
+        .zip(nulls)
+        .map(|(w, nw)| (i64::from_le_bytes(*w), (u64::from_le_bytes(*nw) >> slot) & 1 == 1));
+    if N == 0 {
+        return rows.fold(init, |a, (w, null)| f(a, [0; N], w, null));
+    }
+    let vals = mb.col_data(slot, N)[start * N..end * N].as_chunks::<N>().0;
+    vals.iter().zip(rows).fold(init, |a, (v, (w, null))| f(a, *v, w, null))
 }
 
 #[cfg(test)]

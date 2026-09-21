@@ -186,13 +186,6 @@ impl GroupOutKey {
         }
     }
 
-    /// [`Self::exemplar_locs`]' columns in an `output` row.
-    pub(super) fn carried_locs(&self, output: &SchemaDescriptor) -> Vec<ColumnLocator> {
-        (0..self.exemplar_locs().len())
-            .map(|pi| output.locate(output.payload_col_idx(pi)))
-            .collect()
-    }
-
     /// `batch`'s groups as runs in ascending output-PK order.
     pub(super) fn runs(&self, batch: &Batch) -> GroupRuns {
         let mb = &batch.as_mem_batch();

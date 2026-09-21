@@ -15,6 +15,7 @@
 //! worker count.
 
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use gnitz_core::{ColumnDef, Schema, ZSetBatch};
@@ -53,9 +54,9 @@ impl FoldFinish {
         let merge = ops
             .into_iter()
             .map(|op| match op {
+                WireAggFunc::Count | WireAggFunc::CountNonNull | WireAggFunc::Sum => None,
                 WireAggFunc::Min => Some(Ordering::Less),
                 WireAggFunc::Max => Some(Ordering::Greater),
-                _ => None,
             })
             .collect();
         let having = compile_conjuncts_evaluator(having, &partial_schema)?;
@@ -93,14 +94,15 @@ impl FoldFinish {
         for row in 0..partial.len() {
             debug_assert_eq!(partial.weights[row], 1, "a fold partial is one reduce row");
             let key = u128::from_le_bytes(partial.pks.get_bytes(row).try_into().expect("_group_pk is 16 bytes"));
-            match first_of.get(&key).copied() {
-                Some(first) => {
+            match first_of.entry(key) {
+                Entry::Occupied(e) => {
+                    let first = *e.get();
                     for (k, (loc, &wins)) in agg_locs.iter().zip(&self.merge).enumerate() {
                         merge_cell(&mut partial, first, row, n_group + k, wins, loc);
                     }
                 }
-                None => {
-                    first_of.insert(key, row);
+                Entry::Vacant(e) => {
+                    e.insert(row);
                     match keep.last_mut() {
                         Some((_, end)) if *end == row => *end += 1,
                         _ => keep.push((row, row + 1)),
