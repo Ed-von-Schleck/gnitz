@@ -261,12 +261,8 @@ impl Batch {
         let mut regions = gnitz_wire::region::Regions::new();
         self.wire_regions(&mut regions);
         let num_regions = regions.len();
-        // Shards are ghost-free by construction: flush persists the run set's
-        // consolidated net-state run and compaction's merge drops net-zero groups.
-        debug_assert!(
-            !(0..n).any(|i| read_i64_le(regions[REG_WEIGHT], i * 8) == 0),
-            "shard writer got weight-0 rows; every producer consolidates first",
-        );
+        #[cfg(debug_assertions)]
+        self.debug_verify_consolidated(schema);
         debug_assert!(
             !opts.skeleton || schema.num_payload_cols() == 0,
             "a skeleton shard must be written under the PK-only projection of its relation's schema",

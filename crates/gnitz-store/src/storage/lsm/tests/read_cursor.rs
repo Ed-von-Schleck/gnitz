@@ -313,7 +313,7 @@ fn advance_to_lands_like_seek_bytes_monotone() {
 /// only laggards. After emitting `5`, `b_lag`'s head is `30` and `b_ahead`'s
 /// is `50`; seeking `40` gallops `b_lag` (30 → 90) while leaving `b_ahead`
 /// (50) untouched, then lands on `50`. The trailing `95` then exhausts the
-/// last live source (the `pop_top` branch).
+/// last live source (the `step_top(None)` branch).
 #[test]
 fn advance_to_forward_skips_ahead_source() {
     let schema = make_schema_u128_i64();
@@ -362,7 +362,7 @@ fn advance_to_forward_lands_past_straddling_ghost() {
 }
 
 /// A source whose `lower_bound(key)` is its end exhausts mid-sweep, forcing
-/// the seek-phase `pop_top` branch; the remaining source must still merge
+/// the seek-phase drop branch; the remaining source must still merge
 /// correctly, and a later forward seek over the now-drained heap must
 /// invalidate cleanly (the fast path no-ops on an empty tree).
 #[test]
@@ -370,7 +370,7 @@ fn advance_to_forward_exhausts_source_mid_sweep() {
     let schema = make_schema_u128_i64();
     let b_short = make_batch(&[(10u128, 1, 100), (20, 1, 200)]); // max 20
     let b_long = make_batch(&[(10u128, 1, 100), (50, 1, 500), (90, 1, 900)]);
-    // 40 gallops b_short to its end (pop_top), leaving b_long to emit 50;
+    // 40 gallops b_short to its end (dropping it), leaving b_long to emit 50;
     // 60 → 90; 100 → exhausted (fast path over an empty heap).
     assert_advance_to_matches_seek_oracle(schema, &[b_short, b_long], &[40, 60, 100]);
 }

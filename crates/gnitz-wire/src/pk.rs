@@ -399,6 +399,14 @@ impl PkBuf {
         f(&mut self.bytes[..width])
     }
 
+    #[inline]
+    fn debug_assert_zero_tail(&self) {
+        debug_assert!(
+            self.bytes[self.len as usize..].iter().all(|&b| b == 0),
+            "PkBuf tail past len must be zero; widening would carry stale bytes",
+        );
+    }
+
     /// The key's OPK bytes — the single PK accessor.
     #[inline(always)]
     pub fn pk_bytes(&self) -> &[u8] {
@@ -411,11 +419,12 @@ impl PkBuf {
         self.len as usize
     }
 
-    /// The key zero-padded to `width` bytes — sound because the tail past `len`
-    /// is always zero. Widens an index leading-key span to a full PK stride.
+    /// The key zero-padded to `width` bytes. Widens an index leading-key span to
+    /// a full PK stride.
     #[inline]
     pub fn padded(&self, width: usize) -> &[u8] {
         debug_assert!(self.len as usize <= width && width <= crate::MAX_PK_BYTES);
+        self.debug_assert_zero_tail();
         &self.bytes[..width]
     }
 
@@ -423,6 +432,7 @@ impl PkBuf {
     #[inline]
     pub fn widened(mut self, width: usize) -> Self {
         debug_assert!(self.len as usize <= width && width <= crate::MAX_PK_BYTES);
+        self.debug_assert_zero_tail();
         self.len = width as u8;
         self
     }

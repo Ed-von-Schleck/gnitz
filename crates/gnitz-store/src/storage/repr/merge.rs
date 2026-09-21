@@ -499,6 +499,16 @@ pub(crate) struct PosCursor {
 }
 
 impl PosCursor {
+    /// A cursor over `[0, count)`, from row 0.
+    #[inline]
+    pub(crate) fn new(count: usize) -> Self {
+        debug_assert!(
+            count < u32::MAX as usize,
+            "merge source exceeds the heap node's u32 row"
+        );
+        PosCursor { position: 0, count }
+    }
+
     #[inline]
     pub(crate) fn is_valid(&self) -> bool {
         self.position < self.count
@@ -686,10 +696,7 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     if sources.is_empty() {
         return;
     }
-    let mut cursors: Vec<PosCursor> = sources
-        .iter()
-        .map(|s| PosCursor { position: 0, count: s.row_count() })
-        .collect();
+    let mut cursors: Vec<PosCursor> = sources.iter().map(|s| PosCursor::new(s.row_count())).collect();
 
     // Dispatch the payload order, monomorphizing one branch-free copy of the
     // merge loop; the PK axis is `compare_pk_ordering` (no stride dispatch).
@@ -716,10 +723,8 @@ pub(crate) trait ColumnarSource: RowSource {
     }
 }
 
-/// The merge's heap order, shared by [`drive`] and by the read cursor's own tree
-/// rebuild and forward seek, so the two can never diverge on the (PK, payload)
-/// total order. An `#[inline]` closure builder generic over the concrete source
-/// type — no `dyn` — so each caller monomorphizes its own branch-free copy.
+/// The heap order [`drive`] and the read cursor share. Generic over the source
+/// type, so each caller monomorphizes its own branch-free copy.
 ///
 /// `compare_pk_ordering` on each player's full OPK bytes (exact at every width —
 /// no cached key, no stride dispatch), then the `payload` order.
@@ -808,15 +813,8 @@ pub(crate) fn drive<S, P>(
         }};
     }
 
-    loop {
-        if tree.is_empty() {
-            return;
-        }
-
-        let (group_src, group_row) = {
-            let top = tree.peek();
-            (top.source_idx as usize, top.row as usize)
-        };
+    while let Some(top) = tree.peek() {
+        let (group_src, group_row) = (top.source_idx as usize, top.row as usize);
 
         // Open the group: take the root's weight and step past it. The first row
         // is the exemplar, so `same_group` would be tautologically true — and its
@@ -826,11 +824,8 @@ pub(crate) fn drive<S, P>(
 
         // Fold tied rows: each iteration peeks the new root, breaks at the group
         // boundary, otherwise accumulates weight and steps again.
-        while !tree.is_empty() {
-            let (cur_src, cur_row) = {
-                let top = tree.peek();
-                (top.source_idx as usize, top.row as usize)
-            };
+        while let Some(top) = tree.peek() {
+            let (cur_src, cur_row) = (top.source_idx as usize, top.row as usize);
             if !same_group(group_src, group_row, cur_src, cur_row) {
                 break;
             }
@@ -844,9 +839,8 @@ pub(crate) fn drive<S, P>(
     }
 }
 
-/// The tripwire and the tournament build for [`run_merge`]; the walk itself is
-/// [`drive`]. Monomorphised per (source, payload) so the hot loop stays
-/// branch-free.
+/// The tournament build for [`run_merge`]; the walk itself is [`drive`].
+/// Monomorphised per (source, payload) so the hot loop stays branch-free.
 #[inline]
 fn run_merge_body<S, P>(
     sources: &[S],
@@ -858,20 +852,6 @@ fn run_merge_body<S, P>(
     S: ColumnarSource,
     P: PayloadOrder,
 {
-    // §2's one silent failure: a merge reads each source linearly, so an
-    // out-of-order input makes the heap deliver duplicates non-adjacently and
-    // the fold sums weights against the wrong element — no error, no assertion.
-    // Checked here rather than in a wrapper type at one seat, so flush,
-    // compaction, relay and shard sources are all covered.
-    #[cfg(debug_assertions)]
-    for (si, src) in sources.iter().enumerate() {
-        for r in 1..src.row_count() {
-            let ord = compare_pk_ordering(src.get_pk_bytes(r - 1), src.get_pk_bytes(r))
-                .then_with(|| payload.compare(schema, src, r - 1, src, r));
-            debug_assert_ne!(ord, Ordering::Greater, "run_merge: source {si} unsorted at row {r}");
-        }
-    }
-
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| cursors[i].is_valid().then(|| cursors[i].position as u32),

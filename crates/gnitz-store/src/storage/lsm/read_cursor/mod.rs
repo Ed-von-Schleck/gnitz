@@ -305,11 +305,9 @@ impl ReadCursor {
     }
 
     /// Advance every laggard head (OPK `< key`) to its own `lower_bound(key)`,
-    /// restoring the loser tree with one `replace_top`/`pop_top` per gallop. Only
-    /// the root is ever a laggard — it is the global min, so once it reaches `key`
-    /// every head has — and each gallop moves that source to `>= key`, so the loop
-    /// touches at most `num_sources` leaves and terminates. It leaves the tree
-    /// positioned exactly as a from-scratch rebuild at `key` would.
+    /// restoring the loser tree with one `step_top` per gallop. Only the root can
+    /// lag — it is the global min — so the loop gallops it alone, and leaves the
+    /// tree positioned exactly as a from-scratch rebuild at `key` would.
     fn seek_phase(
         heap: &mut LoserTree,
         sources: &[Run],
@@ -317,8 +315,7 @@ impl ReadCursor {
         key: &[u8],
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        while !heap.is_empty() {
-            let HeapNode { source_idx: src, row } = *heap.peek();
+        while let Some(HeapNode { source_idx: src, row }) = heap.peek() {
             let (src, row) = (src as usize, row as usize);
             // The root is the global min, so once its OPK bytes reach `key` every
             // head has. `compare_pk_ordering` compares the full stride bytes —
@@ -598,13 +595,6 @@ impl ReadCursor {
         });
     }
 
-    /// Every positive-weight row from HERE to the end of the cursor's window.
-    /// The prefix form narrows within the window; this takes the whole of it,
-    /// which for a cursor positioned over a range is that range.
-    pub fn for_each_positive<F: FnMut(&ReadCursor)>(&mut self, f: F) {
-        self.for_each_positive_while(|_| true, f);
-    }
-
     /// Step to the next live group; an advance consumes the group it emitted, so
     /// stepping is just re-driving. Mode before order, so the single-source
     /// bypass skips a `with_payload_cmp!` dispatch it never uses.
@@ -741,7 +731,7 @@ fn build(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usi
         let count = run.row_count();
         if count > 0 {
             sources.push(run);
-            states.push(PosCursor { position: 0, count });
+            states.push(PosCursor::new(count));
         }
     }
     ReadCursor::new(sources, states, schema, position)

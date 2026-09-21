@@ -3,7 +3,7 @@
 //! (`batch_wire`), TLS buffer recycling (`batch_pool`), the OPK lower-bound
 //! search (`seek`), sort-merge consolidation (`merge`), the row-selecting and
 //! row-copying passes — PK routing and the column-first scatter
-//! (`scatter`) —, the fused k-way merge kernel (`heap`), the PK-probe filters
+//! (`scatter`) —, the N-way min-merge tournament (`heap`), the PK-probe filters
 //! (`bloom`, `shard_filter`), the shard-image encoder and its atomic writer
 //! (`shard_file`), and the shard-format constants (`layout`). The low-level
 //! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and

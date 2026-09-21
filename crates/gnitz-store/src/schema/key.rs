@@ -41,7 +41,7 @@ use crate::schema::{
 /// operands are one relation's rows (a merge, a group fold, a probe); reach for
 /// this one where a width may differ or the operand is untrusted.
 #[inline(always)]
-pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
+pub(crate) fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
 }
 
@@ -162,8 +162,9 @@ pub fn seek_opk_bytes(schema: &SchemaDescriptor, key: &[u8]) -> Result<PkBuf, St
 /// widths straight into a register, value-equal to the pad-and-copy (a narrow
 /// value occupies the high bits, the low bits zero; `≥16` reads the
 /// order-preserving leading 16 bytes) — pinned by
-/// `pack_pk_be_specialization_matches_naive`. Widths 9..=15 get two overlapping
-/// loads for the same reason; only 1/3/5/6/7 reach the pad-and-copy arm.
+/// `pack_pk_be_specialization_matches_naive`, which covers every width. The
+/// remaining arms compose the same fixed-width loads: none copies through a
+/// runtime length, which would be an out-of-line `memcpy` per key.
 ///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
 /// packs as `1·2^64`, not 1. Opposite alignment from `gnitz_wire::widen_pk_be`
@@ -188,12 +189,27 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
             let low = (tail & ((1u64 << (8 * m)) - 1)) as u128;
             (hi << 64) | (low << (64 - 8 * m))
         }
-        // 1/3/5/6/7: too narrow for the overlapping-load trick (`len - 8` underflows).
-        len => {
-            let mut buf = [0u8; 16];
-            buf[..len].copy_from_slice(pk_bytes);
-            u128::from_be_bytes(buf)
+        1 => (pk_bytes[0] as u128) << 120,
+        3 => {
+            let hi = u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128;
+            (hi << 112) | ((pk_bytes[2] as u128) << 104)
         }
+        5 => {
+            let hi = u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128;
+            (hi << 96) | ((pk_bytes[4] as u128) << 88)
+        }
+        6 => {
+            let hi = u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128;
+            let lo = u16::from_be_bytes(pk_bytes[4..6].try_into().unwrap()) as u128;
+            (hi << 96) | (lo << 80)
+        }
+        7 => {
+            let hi = u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128;
+            let mid = u16::from_be_bytes(pk_bytes[4..6].try_into().unwrap()) as u128;
+            (hi << 96) | (mid << 80) | ((pk_bytes[6] as u128) << 72)
+        }
+        // Width 0: an empty OPK region packs to zero.
+        _ => 0,
     }
 }
 

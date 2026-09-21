@@ -38,17 +38,14 @@ use super::repr::heap::{HeapNode, LoserTree};
 use crate::schema::key::compare_pk_bytes;
 use gnitz_foundation::posix_io::{self, Advice, Mmap};
 
-/// Sort `idx` (rebuilt as `0..flat.len()/stride`) by the byte-lexicographic
-/// order of the fixed-`stride` records of `flat` — the same `compare_pk_bytes`
-/// order every merge path uses. Indirect (index-permutation) so the records
-/// themselves never move.
+/// Sort `idx` (rebuilt as `0..flat.len()/stride`) by the byte order of the
+/// fixed-`stride` records of `flat` — the OPK order every merge reads a PK
+/// region in. Indirect, so the records themselves never move.
 ///
-/// Shared with `index_gather`, whose per-chunk PK scratch is the same
-/// flat-record accumulator this module's header argues for.
-pub(crate) fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
+/// `compare_pk_bytes`, not the merge's `compare_pk_ordering`: same order, but at
+/// a runtime stride it measures slower here — see `sort_indices_bench`.
+pub fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
     let n = flat.len() / stride;
-    // u32 indices bound each run (and the in-RAM fast path) to 2^32 records —
-    // the same per-source bound the LoserTree merge asserts.
     assert!(n <= u32::MAX as usize, "spill run exceeds u32 records");
     idx.clear();
     idx.extend(0..n as u32);
@@ -206,10 +203,10 @@ impl SpillSort {
     }
 }
 
-/// The record at `(source_idx, row)` of the mapped spill file.
+/// The record at `(src, row)` of the mapped spill file.
 #[inline]
-fn record_at<'a>(bytes: &'a [u8], run_starts: &[usize], stride: usize, n: &HeapNode) -> &'a [u8] {
-    let off = run_starts[n.source_idx as usize] + n.row as usize * stride;
+fn record_at<'a>(bytes: &'a [u8], run_starts: &[usize], stride: usize, src: usize, row: u32) -> &'a [u8] {
+    let off = run_starts[src] + row as usize * stride;
     &bytes[off..off + stride]
 }
 
@@ -222,8 +219,8 @@ fn record_less<'a>(
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + 'a {
     move |a, b| {
         compare_pk_bytes(
-            record_at(bytes, run_starts, stride, a),
-            record_at(bytes, run_starts, stride, b),
+            record_at(bytes, run_starts, stride, a.source_idx as usize, a.row),
+            record_at(bytes, run_starts, stride, b.source_idx as usize, b.row),
         )
         .is_lt()
     }
@@ -258,20 +255,14 @@ pub struct MergeProducer {
 
 impl MergeProducer {
     fn next(&mut self) -> Option<&[u8]> {
-        if self.tree.is_empty() {
-            return None;
-        }
-        let (src, row) = {
-            let n = self.tree.peek();
-            (n.source_idx as usize, n.row)
-        };
+        let HeapNode { source_idx: src, row } = self.tree.peek()?;
+        let src = src as usize;
         let bytes = self.map.as_slice();
         let less = record_less(bytes, &self.run_starts, self.stride);
         self.tree
             .step_top((row + 1 < self.run_lens[src]).then_some(row + 1), &less);
         self.remaining -= 1;
-        let off = self.run_starts[src] + row as usize * self.stride;
-        Some(&bytes[off..off + self.stride])
+        Some(record_at(bytes, &self.run_starts, self.stride, src, row))
     }
 }
 

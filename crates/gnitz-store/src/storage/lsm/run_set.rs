@@ -144,6 +144,10 @@ impl RunSet {
         for run in &mut self.runs {
             if run.num_payload_cols() < npc {
                 let widened = run.widened_with_nulls(schema, false);
+                debug_assert!(
+                    widened.consolidated_verified(schema),
+                    "widen_runs: the widened run must still be consolidated",
+                );
                 *run = Rc::new(widened);
             }
             bytes += run.total_bytes();

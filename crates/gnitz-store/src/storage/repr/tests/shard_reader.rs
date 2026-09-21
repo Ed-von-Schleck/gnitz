@@ -1369,17 +1369,11 @@ fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescr
     write_i64_shard(&cpath, &all_pk, &pk_only, &[], ShardWriteOpts::default());
 
     vec![
-        // Constant PK / Constant weight / Constant null / Constant payload.
+        // One row: a repeated PK is not a consolidated run, so that is the only
+        // shape whose every region is Constant-encoded.
         (
             "all-constant",
-            build_test_shard_weights(
-                dir,
-                "sw_const.db",
-                &vec![1u64; n],
-                &vec![1i64; n],
-                &vec![7i64; n],
-                false,
-            ),
+            build_test_shard_weights(dir, "sw_const.db", &[1u64], &[1i64], &[7i64], false),
             make_schema_u64_i64(),
         ),
         // TwoValue weight, and a FoR-packed payload.
