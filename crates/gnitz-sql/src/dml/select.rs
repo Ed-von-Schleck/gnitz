@@ -228,7 +228,10 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
         let k = desc.schema.pk_cols.len();
         let sink = ReadSink {
             map: program.map(|p| compute_map(p, &reply_schema.columns[k..])),
-            kind: SinkKind::Rows { order: order.clone(), limit_k },
+            kind: SinkKind::Rows {
+                order: if limit_k > 0 { order.clone() } else { Vec::new() },
+                limit_k,
+            },
         };
         let (bound, predicate) = access;
         let read = SpecRead {

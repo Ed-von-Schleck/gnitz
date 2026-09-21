@@ -117,7 +117,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
 /// A **permuted, non-adjacent** compound PK — `pk_cols = [3, 0]`, an `I64` first
 /// and a `U32` second, with negative key values so the OPK sign flip is in play.
 /// The reply's PK columns are catalog clones in PK-list order, so each one's
-/// `pk_byte_offset` is the same running sum and the region is byte-identical.
+/// `locate`'s `byte_off` is the same running sum and the region is byte-identical.
 #[test]
 fn a_permuted_compound_pk_round_trips_verbatim() {
     let srv = ServerHandle::start_n(4);

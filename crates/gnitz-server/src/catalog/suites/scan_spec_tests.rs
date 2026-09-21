@@ -391,7 +391,7 @@ fn order_key_column_out_of_range_is_rejected() {
     let spec = identity_spec(
         ReadBound::None,
         vec![OrderKey { col: 99, desc: false, nulls_first: false }],
-        0,
+        1,
     );
     let reply_schema = e.registry.relation(tid).map(Relation::schema).unwrap();
     assert!(e.scan_spec(tid, spec, &reply_schema).is_err());

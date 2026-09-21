@@ -2,7 +2,7 @@
 //! the bound, filter, map, then forward rows or fold them. A capacity-bounded
 //! view's rows hydrate chunk by chunk as the sink drains them.
 
-use gnitz_wire::{Cut, OrderKey, RangeDescriptor, ReadBound, ReadSpec, SinkKind};
+use gnitz_wire::{Cut, RangeDescriptor, ReadBound, ReadSpec, SinkKind};
 
 use std::rc::Rc;
 
@@ -26,12 +26,11 @@ impl RelationRegistry {
     ) -> Result<Rc<Batch>, StoreError> {
         let ReadSpec { bound, predicate, sink } = spec;
         let src_schema = self.relation_or_err(target_id)?.schema();
-        // Nothing bounded, filtered, mapped or cut (a worker orders only under a cut): the
-        // relation whole, off the store's cached snapshot.
-        if let (ReadBound::None, true, None, SinkKind::Rows { order, limit_k: 0 }) =
+        // Nothing bounded, filtered, mapped or cut: the relation whole, off the
+        // store's cached snapshot.
+        if let (ReadBound::None, true, None, SinkKind::Rows { limit_k: 0, .. }) =
             (&bound, predicate.is_empty(), &sink.map, &sink.kind)
         {
-            resolve_order_locs(order, &src_schema)?;
             check_layout(reply_schema, &src_schema)?;
             return self.scan(target_id, hydrator);
         }
@@ -61,13 +60,23 @@ impl RelationRegistry {
                 run_fold_sink(&mut rows, chunk_rows, map.as_ref(), fold)?
             }
             SinkKind::Rows { order, limit_k } => {
-                let order = resolve_order_locs(order, &sink_in)?;
                 check_layout(reply_schema, &sink_in)?;
                 let window = saturated_window(*limit_k);
-                if !order.is_empty() && window > 0 {
-                    topk_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, &order, window)?
-                } else {
+                if order.is_empty() {
                     stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window)?
+                } else {
+                    debug_assert!(window > 0, "decode admits an order only under a cut");
+                    sink_in
+                        .check_cols(order.iter().map(|k| ("scan_spec: order key column", k.col as u32)))
+                        .map_err(|e| StoreError::rejected(e.to_string()))?;
+                    topk_rows(
+                        &mut rows,
+                        chunk_rows,
+                        map.as_ref(),
+                        &sink_in,
+                        &order_locators(order, &sink_in),
+                        window,
+                    )?
                 }
             }
         }))
@@ -337,17 +346,6 @@ fn topk_keep(keeper: Batch, order: &[OrderLocator], window: i64) -> (Batch, i64)
         Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm, keeper.schema()),
         acc,
     )
-}
-
-/// Resolve each ORDER BY key over the sink input — a forged column is a
-/// rejection — then append the identity tiebreak.
-fn resolve_order_locs(order: &[OrderKey], schema: &SchemaDescriptor) -> Result<Vec<OrderLocator>, StoreError> {
-    order_locators(order, schema).map_err(|col| {
-        StoreError::rejected(format!(
-            "scan_spec: order key column {col} out of range ({} cols)",
-            schema.num_columns()
-        ))
-    })
 }
 
 /// Decode + validate a client predicate blob against `schema`, then build its

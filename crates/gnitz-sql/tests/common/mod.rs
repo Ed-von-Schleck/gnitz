@@ -106,7 +106,7 @@ pub fn cell_f64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> f6
 
 /// Is payload column `ci` NULL in `row`?
 pub fn is_null_at(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> bool {
-    gnitz_wire::null_word_get(batch.nulls[row], schema.payload_idx(ci))
+    gnitz_expr::SchemaFacts::locate(schema, ci).is_null(batch, row)
 }
 
 /// The named integer columns of every row `sql` returns, each row with its

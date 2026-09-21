@@ -768,8 +768,7 @@ impl SchemaDescriptor {
         self.pk_indices().iter().all(|p| cols.contains(p))
     }
 
-    /// Inverse of `payload_idx`: dense payload slot → logical column index.
-    /// Caller must ensure `pi < num_payload_cols()`.
+    /// Inverse of `try_payload_idx`: dense payload slot → logical column index.
     #[inline]
     pub(crate) fn payload_col_idx(&self, pi: usize) -> usize {
         debug_assert!(pi < self.num_payload_cols(), "payload_col_idx: pi out of range");
@@ -784,72 +783,26 @@ impl SchemaDescriptor {
         })
     }
 
-    /// Resolve where column `col_idx`'s value lives. The canonical entry point
-    /// for reading a column whose index is not statically a payload column.
+    /// [`gnitz_expr::SchemaFacts::locate`], callable without the trait in scope.
     #[inline]
     pub fn locate(&self, col_idx: usize) -> ColumnLocator {
-        // Release-active: an out-of-range `col_idx` otherwise falls through to
-        // the payload arm with a slot no batch region answers for. A last-line
-        // guard against an internal bug — an untrusted index is bounded by the
-        // operator constructor that took it — and free, never running per row.
-        assert!(
-            col_idx < self.num_columns(),
-            "locate: col_idx {col_idx} out of bounds (num_columns = {})",
-            self.num_columns(),
-        );
-        let col = self.columns[col_idx];
-        let (mut byte_off, mut pk_below) = (0u8, 0usize);
-        for (ci, c) in self.pk_columns() {
-            if ci == col_idx {
-                return ColumnLocator::Pk {
-                    byte_off,
-                    size: col.size(),
-                    type_code: col.type_code,
-                };
-            }
-            byte_off += c.size();
-            pk_below += usize::from(ci < col_idx);
-        }
-        // `byte_off` has reached `pk_stride` here, which `new_with_placement`
-        // asserts fits `MAX_PK_BYTES` — so the accumulation above cannot wrap.
-        ColumnLocator::Payload {
-            slot: (col_idx - pk_below) as u8,
-            size: col.size(),
-            type_code: col.type_code,
-        }
+        gnitz_expr::SchemaFacts::locate(self, col_idx)
     }
 }
 
-/// The schema surface the expression compiler resolves and validates against.
-/// Every method forwards to the inherent one — written UFCS, because most
-/// collide by name and Rust prefers the inherent method in receiver-dot
-/// position, which would recurse instead of forwarding. `payload_slot` and
-/// `is_pk_col` are not restated: the trait derives both from `locate`, inverting
-/// the inherent chain (`is_pk_col` → `try_payload_idx` → `locate`). The two
-/// agree in range; out of range the trait panics in `locate`, exactly as
-/// `gnitz_core::Schema`, the other implementor, does.
-///
-/// No `#[inline]` on the forwarders — every caller reaches them through
-/// `&dyn SchemaFacts`, so the hint cannot fire through the vtable.
 impl gnitz_expr::SchemaFacts for SchemaDescriptor {
-    fn locate(&self, ci: usize) -> ColumnLocator {
-        SchemaDescriptor::locate(self, ci)
+    fn pk_cols(&self) -> &[u32] {
+        self.pk_indices()
     }
 
     fn payload_col_idx(&self, pi: usize) -> usize {
         SchemaDescriptor::payload_col_idx(self, pi)
     }
 
-    fn num_payload_cols(&self) -> usize {
-        SchemaDescriptor::num_payload_cols(self)
-    }
-
     fn num_columns(&self) -> usize {
-        SchemaDescriptor::num_columns(self)
+        self.num_columns as usize
     }
 
-    // The last two read the column table directly: the field *is* the fact, so
-    // there is no inherent method to forward to and nothing to recompute.
     fn col_type_code(&self, ci: usize) -> u8 {
         self.columns[ci].type_code
     }

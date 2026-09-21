@@ -1,12 +1,9 @@
 //! Order images: the byte strings whose plain lexicographic order *is* a
-//! column's typed order, shared by the reduce's aggregate-value index (one
-//! extreme per group) and the top-N index (every row of a group in ORDER BY
-//! order). One encoder, so the two indexes cannot disagree on what "smaller"
-//! means for any type.
+//! column's typed order, the keys of the indexes that walk a column in order.
 
 use crate::schema::{type_code, ColumnLocator, SchemaColumn};
 use gnitz_expr::RowSource;
-use gnitz_wire::{ImageKind, ScalarKind, TypeCode, WideKind};
+use gnitz_wire::{ImageKind, ScalarKind, WideKind};
 
 /// The index PK column [`write_image_slot`] fills with an image's leading bytes:
 /// a scalar image whole, a wide one's first 16 bytes.
@@ -33,25 +30,17 @@ pub(crate) fn wide_native<'a>(
     }
 }
 
-/// Append the order image of one wide value to `out`: the OPK bytes of a
-/// 16-byte integer, or a **prefix-free** byte string (`0x00` escaped to
-/// `0x00 0xFF`, `0x00 0x00` appended). Prefix-freeness is what lets `invert`
-/// reverse the order exactly and a truncated [`write_image_slot`] window still
-/// order.
-fn append_wide_image(kind: WideKind, invert: bool, native: &[u8], out: &mut Vec<u8>) {
+/// Append the order image of byte string `content` to `out`: `0x00` escaped to
+/// `0x00 0xFF`, then a `0x00 0x00` terminator, so no image is a prefix of another.
+fn append_bytes_image(invert: bool, content: &[u8], out: &mut Vec<u8>) {
     let start = out.len();
-    match kind {
-        WideKind::Fixed(tc) => return out.extend_from_slice(&int16_image_of(tc, invert, native)),
-        WideKind::Bytes => {
-            for &b in native {
-                out.push(b);
-                if b == 0 {
-                    out.push(0xFF);
-                }
-            }
-            out.extend_from_slice(&[0, 0]);
+    for &b in content {
+        out.push(b);
+        if b == 0 {
+            out.push(0xFF);
         }
     }
+    out.extend_from_slice(&[0, 0]);
     if invert {
         out[start..].iter_mut().for_each(|b| *b = !*b);
     }
@@ -60,25 +49,9 @@ fn append_wide_image(kind: WideKind, invert: bool, native: &[u8], out: &mut Vec<
 /// The order image of a 16-byte integer column at `loc` in `row`, **known
 /// non-NULL**: its OPK bytes, complemented when `invert`.
 #[inline(always)]
-pub(crate) fn int16_image(
-    loc: &ColumnLocator,
-    tc: TypeCode,
-    invert: bool,
-    src: &impl RowSource,
-    row: usize,
-) -> [u8; 16] {
-    let mut scratch = [0u8; 16];
-    int16_image_of(tc, invert, loc.native_le_bytes(src, row, &mut scratch))
-}
-
-#[inline(always)]
-fn int16_image_of(tc: TypeCode, invert: bool, native: &[u8]) -> [u8; 16] {
-    let mut image = [0u8; 16];
-    gnitz_wire::encode_pk_column(native, tc as u8, &mut image);
-    if invert {
-        image.iter_mut().for_each(|b| *b = !*b);
-    }
-    image
+pub(crate) fn int16_image(loc: &ColumnLocator, invert: bool, src: &impl RowSource, row: usize) -> [u8; 16] {
+    let image = loc.opk_image(src, row);
+    (if invert { !image } else { image }).to_be_bytes()
 }
 
 /// Whether `kind`'s image has a fixed width: every kind's but a byte string's.
@@ -86,9 +59,7 @@ pub(crate) fn has_fixed_image(kind: ImageKind) -> bool {
     kind != ImageKind::Wide(WideKind::Bytes)
 }
 
-/// Write `image` into an index key slot, zero-padding or truncating to its
-/// width. Images are prefix-free, so a truncated window still orders — but a
-/// wide image discriminates only across all 16 bytes.
+/// Write `image` into an index key slot, zero-padding or truncating to its width.
 #[inline]
 pub(crate) fn write_image_slot(slot: &mut [u8], image: &[u8]) {
     let take = image.len().min(slot.len());
@@ -96,7 +67,8 @@ pub(crate) fn write_image_slot(slot: &mut [u8], image: &[u8]) {
     slot[take..].fill(0);
 }
 
-/// [`append_wide_image`]'s inverse: the native bytes back out of an index image.
+/// [`append_bytes_image`]'s and [`int16_image`]'s inverse: the native bytes back
+/// out of an index image.
 pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -> Vec<u8> {
     let mut v = image.to_vec();
     if invert {
@@ -125,10 +97,8 @@ pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -
     }
 }
 
-/// The order image of a scalar column at `loc` in `row`, **known non-NULL**: the
-/// `u64` whose unsigned order is the column's typed order, complemented when
-/// `invert` so an ascending walk yields the column's *largest* value first. Its
-/// big-endian bytes are what an index stores.
+/// The order image of a scalar column at `loc` in `row`, **known non-NULL**:
+/// [`ColumnLocator::order_bits`], complemented when `invert`.
 #[inline]
 pub(crate) fn scalar_image(
     loc: &ColumnLocator,
@@ -152,9 +122,8 @@ pub(crate) fn scalar_native_of_image(kind: ScalarKind, invert: bool, image: u64)
     kind.order_inverse(if invert { !image } else { image })
 }
 
-/// Append the order image of the column at `loc` in `row`, **known non-NULL**:
-/// the scalar image big-endian, or the wide image. `invert` complements it, so
-/// an ascending byte walk yields the column's *largest* value first.
+/// Append the order image of the column at `loc` in `row`, **known non-NULL**,
+/// complemented when `invert`.
 #[inline]
 pub(crate) fn append_image(
     loc: &ColumnLocator,
@@ -166,10 +135,12 @@ pub(crate) fn append_image(
 ) {
     match kind {
         ImageKind::Scalar(kind) => out.extend_from_slice(&scalar_image(loc, kind, invert, src, row).to_be_bytes()),
-        ImageKind::Wide(kind) => {
-            let mut scratch = [0u8; 16];
-            append_wide_image(kind, invert, wide_native(loc, kind, src, row, &mut scratch), out);
-        }
+        ImageKind::Wide(WideKind::Fixed(_)) => out.extend_from_slice(&int16_image(loc, invert, src, row)),
+        ImageKind::Wide(WideKind::Bytes) => append_bytes_image(
+            invert,
+            gnitz_wire::german_string_content(loc.bytes(src, row), src.blob()),
+            out,
+        ),
     }
 }
 

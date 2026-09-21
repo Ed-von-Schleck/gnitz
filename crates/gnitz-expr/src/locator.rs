@@ -1,31 +1,17 @@
 //! Resolved column addressing: where a logical column physically lives in a
 //! row, and the canonical `u128` keys derived from it.
-//!
-//! Every method here is `#[inline(always)]`: the per-row callers live in
-//! gnitz-store, which builds at opt-level 0 in dev, where only the
-//! always-inline pass runs.
 
 use std::cmp::Ordering;
 
 use crate::{RowSource, SchemaFacts};
 
 /// Where a logical column's value physically lives in a row, resolved once from
-/// the schema. The only sanctioned way to read a column whose index is not
-/// statically known to be a payload column: it cannot silently treat a PK
-/// column as payload.
-/// A 4-byte `Copy` value (three `u8` fields + a 1-byte tag). The coordinates
-/// match the schema's own widths — a PK byte offset and a payload slot both fit
-/// a `u8`, and every fixed-width column is ≤ 16 bytes — so `locate` stores them
-/// without widening and a `Vec<ColumnLocator>` (group-key / emit columns) stays
-/// dense. The two width claims are enforced below rather than asserted here.
+/// the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnLocator {
-    /// PK column: the value lives in the PK region at `byte_off`, width `size`,
-    /// type `type_code`. PK columns are non-nullable, and the region is OPK at
-    /// every [`RowSource`], which is what the OPK-inverting readers below undo.
+    /// In the OPK-encoded PK region at `byte_off`; never NULL.
     Pk { byte_off: u8, size: u8, type_code: u8 },
-    /// Payload column: value is native-LE in dense payload slot `slot` (also its
-    /// null-bitmap bit position), width `size`, type `type_code`.
+    /// Native little-endian in payload slot `slot`, which is also its null bit.
     Payload { slot: u8, size: u8, type_code: u8 },
 }
 
@@ -33,9 +19,6 @@ const _: () = assert!(
     std::mem::size_of::<ColumnLocator>() <= 8,
     "ColumnLocator must stay packed; a usize coordinate would balloon it to 24 bytes",
 );
-// The `u8` coordinates above only address the whole schema while these hold.
-// `MAX_PK_BYTES` is derived (`MAX_PK_COLUMNS * 16`), so it can move without
-// anyone editing this file.
 const _: () = assert!(
     gnitz_wire::MAX_PK_BYTES <= u8::MAX as usize,
     "ColumnLocator::Pk::byte_off is u8; the PK region no longer fits it",
@@ -46,9 +29,7 @@ const _: () = assert!(
 );
 
 impl ColumnLocator {
-    /// The designated padding locator: a zero-width PK column at offset 0.
-    /// Names no real column — it fills the unused slots of a fixed-size
-    /// locator array, mirroring `SchemaColumn::EMPTY` beside it.
+    /// Padding for fixed-size locator arrays; names no real column.
     pub const EMPTY: ColumnLocator = ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 };
 
     #[inline(always)]
@@ -65,9 +46,11 @@ impl ColumnLocator {
         }
     }
 
-    /// True iff this column is NULL in `row`. PK columns are never null, and
-    /// short-circuit *before* the null-word load — per-row callers hitting that
-    /// arm must not pay a load for a value they never read.
+    fn type_code_enum(&self) -> Option<gnitz_wire::TypeCode> {
+        gnitz_wire::TypeCode::try_from_u8(self.type_code())
+    }
+
+    /// True iff this column is NULL in `row`.
     #[inline(always)]
     pub fn is_null(&self, mb: &impl RowSource, row: usize) -> bool {
         match *self {
@@ -76,9 +59,7 @@ impl ColumnLocator {
         }
     }
 
-    /// [`Self::is_null`] against an already-read null word, for the callers that
-    /// hold one: a row loop reading several columns, or one that needs the word
-    /// for a group fold anyway.
+    /// [`Self::is_null`] against `row`'s already-read null word.
     #[inline(always)]
     pub fn is_null_word(&self, null_word: u64) -> bool {
         match *self {
@@ -87,17 +68,9 @@ impl ColumnLocator {
         }
     }
 
-    /// Raw at-rest bytes of the column in `row`: OPK/big-endian for a PK column,
-    /// native little-endian for a payload column. For hashing, group keys, and
-    /// verbatim copies. On a STRING/BLOB column these are the 16-byte German-string
-    /// struct (a blob heap offset for long strings), not the content — content
-    /// callers resolve through the blob arena. The returned slice borrows the
-    /// batch (`'b`), not the `&self` receiver, so it stays valid after the locator
-    /// borrow is dropped (matching [`RowSource::get_pk_bytes`]/
-    /// [`RowSource::get_col_ptr`], whose returns are tied to the batch reference).
-    /// The batch lifetime must be named: under elision `&self` would capture the
-    /// return and [`Self::native_le_bytes`]'s `Payload` arm — which hands this
-    /// slice back as `&'a [u8]` — would stop compiling.
+    /// Raw at-rest bytes of the column in `row`: OPK for a PK column, native
+    /// little-endian for a payload column, the 16-byte German-string cell for a
+    /// STRING/BLOB.
     #[inline(always)]
     pub fn bytes<'b>(&self, mb: &'b impl RowSource, row: usize) -> &'b [u8] {
         match *self {
@@ -109,12 +82,8 @@ impl ColumnLocator {
         }
     }
 
-    /// Native little-endian value bytes of the column in `row`: a payload
-    /// column verbatim, a PK column OPK-decoded into `scratch` (undoing the
-    /// big-endian sign-flipped at-rest form). The value-reading counterpart to
-    /// [`Self::bytes`] — every consumer that interprets a column's *value*
-    /// (aggregation, order-encoding, exemplar copies) must read through here so
-    /// a PK-source column can never be consumed in its at-rest byte order.
+    /// Native little-endian value bytes of the column in `row`; a PK column is
+    /// OPK-decoded into `scratch`.
     #[inline(always)]
     pub fn native_le_bytes<'a, 'b: 'a>(
         &self,
@@ -132,30 +101,29 @@ impl ColumnLocator {
         }
     }
 
-    /// The ≤8-byte integer value in `row`, widened to `i64` under `fi`'s
-    /// signedness. The fused form of [`Self::native_le_bytes`] followed by
-    /// `FixedInt::decode_le_i64`, and the one place either kind of column becomes
-    /// an integer: a PK column goes through the OPK inverse without materializing
-    /// its native image first, a payload column reads verbatim.
-    ///
-    /// `fi` must be the column's own type (`FixedInt::from_type_code(type_code())`);
-    /// the width assert inside `decode_opk_i64` is what catches a caller that
-    /// pairs a locator with someone else's.
+    /// The ≤8-byte integer value in `row`, widened to `i64`. `fi` is the
+    /// column's own type.
     #[inline(always)]
     pub fn decode_i64(&self, mb: &impl RowSource, row: usize, fi: gnitz_wire::FixedInt) -> i64 {
+        debug_assert_eq!(
+            self.type_code_enum().and_then(gnitz_wire::FixedInt::from_type_code),
+            Some(fi)
+        );
         match *self {
             ColumnLocator::Pk { .. } => gnitz_wire::decode_opk_i64(self.bytes(mb, row), fi),
             ColumnLocator::Payload { .. } => fi.decode_le_i64(self.bytes(mb, row)),
         }
     }
 
-    /// The column's value in `row` as its order-preserving `u64` image: plain
-    /// unsigned order over it *is* `gnitz_wire::cmp_typed_le`'s order, with
-    /// `total_cmp`'s NaN and -0.0 positions for floats. `kind` pairs with the
-    /// column as [`Self::decode_i64`]'s `fi` does — every arm reads the whole
-    /// column window, so a mispairing panics on width.
+    /// The column's value in `row` as a `u64` whose unsigned order is the
+    /// column's typed order (`total_cmp`'s for floats). `kind` is the column's
+    /// own.
     #[inline(always)]
     pub fn order_bits(&self, mb: &impl RowSource, row: usize, kind: gnitz_wire::ScalarKind) -> u64 {
+        debug_assert_eq!(
+            self.type_code_enum().and_then(gnitz_wire::ScalarKind::from_type_code),
+            Some(kind)
+        );
         match kind {
             gnitz_wire::ScalarKind::Int(fi) => (self.decode_i64(mb, row, fi) as u64) ^ ((fi.is_signed() as u64) << 63),
             // A float is never a PK column, so `bytes` is already the native image.
@@ -168,14 +136,8 @@ impl ColumnLocator {
         }
     }
 
-    /// Order two rows on this column, **both known non-NULL** — the caller keeps
-    /// its own NULL policy, direction and tiebreak. A PK window is OPK, so plain
-    /// byte order *is* its typed order (an LE decode would invert it); a payload
-    /// window is native LE and goes through the typed dispatch, which is also
-    /// what routes STRING/BLOB to content comparison.
-    ///
-    /// The two sources are separate types so a cursor-vs-exemplar compare and an
-    /// intra-batch argsort share one body.
+    /// Order two rows on this column, **both known non-NULL**: a PK window by
+    /// its OPK bytes, a payload window by typed value (STRING/BLOB by content).
     #[inline(always)]
     pub fn cmp_non_null<A: RowSource, B: RowSource>(&self, a: &A, ra: usize, b: &B, rb: usize) -> Ordering {
         match *self {
@@ -186,25 +148,22 @@ impl ColumnLocator {
         }
     }
 
-    /// Write this column's value in `row` as `out_tc`'s OPK bytes into `dst`; `out_tc`
-    /// must hold every value of this column's type. Index projection and join
-    /// repartitioning both encode through here, so their keys agree byte for byte.
+    /// Write this column's value in `row` as `out_tc`'s OPK bytes into `dst`;
+    /// `out_tc` must hold every value of this column's type.
     #[inline(always)]
     pub fn encode_opk_promoted(&self, mb: &impl RowSource, row: usize, out_tc: u8, dst: &mut [u8]) {
         gnitz_wire::store_opk_image(self.opk_image(mb, row), self.type_code(), self.size(), out_tc, dst);
     }
 
-    /// The value's image: its OPK bytes at its own type as a big-endian integer, which
-    /// a payload column computes from its native bytes. `is_null`-gate first; a
-    /// STRING/BLOB column's content is the caller's to hash.
+    /// The value in `row`, **known non-NULL**, as its OPK bytes read as a
+    /// big-endian integer. A STRING/BLOB yields its cell, not its content.
     #[inline(always)]
     pub fn opk_image(&self, mb: &impl RowSource, row: usize) -> u128 {
         let cell = self.bytes(mb, row);
         match *self {
             ColumnLocator::Pk { .. } => gnitz_wire::widen_pk_be(cell),
             ColumnLocator::Payload { size, type_code, .. } => {
-                // `opk_bias`'s u128 shift, spelled at the cell's width: −8% instructions on
-                // `reindex_pack_bench` against the `u128` form.
+                // Biased at the cell's width; the `u128` form measured slower.
                 let signed = gnitz_wire::is_signed_int(type_code);
                 if size == 16 {
                     u128::from_le_bytes(cell.try_into().unwrap()) ^ ((signed as u128) << 127)
@@ -216,20 +175,17 @@ impl ColumnLocator {
     }
 }
 
-/// One resolved ORDER BY key: where the column lives, plus the two order rules
-/// that decide its contribution — the direction, and the **absolute** NULL
-/// placement `desc` does not flip.
+/// One resolved ORDER BY key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderLocator {
     pub loc: ColumnLocator,
     pub desc: bool,
+    /// NULLs sort first, whatever `desc` says.
     pub nulls_first: bool,
 }
 
 impl OrderLocator {
-    /// The key `wire` names, over a column already located. Direction and NULL
-    /// placement ride through unchanged: the wire spells them in the same sense
-    /// this does, so no reader of a wire key re-flips them.
+    /// The key `wire` names, over a column already located.
     #[inline]
     pub fn of(loc: ColumnLocator, wire: &gnitz_wire::OrderKey) -> Self {
         OrderLocator {
@@ -240,46 +196,33 @@ impl OrderLocator {
     }
 }
 
-/// The comparator keys `order` names over `schema`: the written keys located, then —
-/// when there is any — the identity tiebreak, which makes the order total over
-/// distinct rows. `Err` carries a key column `schema` does not have.
-pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &dyn SchemaFacts) -> Result<Vec<OrderLocator>, u16> {
-    let mut keys = order
+/// The keys `order` names over `schema`, then — unless there are none — the
+/// identity tiebreak. Panics on a column `schema` does not have.
+pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &dyn SchemaFacts) -> Vec<OrderLocator> {
+    let mut keys: Vec<OrderLocator> = order
         .iter()
-        .map(|k| {
-            if (k.col as usize) < schema.num_columns() {
-                Ok(OrderLocator::of(schema.locate(k.col as usize), k))
-            } else {
-                Err(k.col)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|k| OrderLocator::of(schema.locate(k.col as usize), k))
+        .collect();
     if !keys.is_empty() {
         push_identity_tiebreak(&mut keys, schema);
     }
-    Ok(keys)
+    keys
 }
 
-/// Append the identity tiebreak — PK columns in key order, then payload columns,
-/// all ASC NULLS FIRST — making the order total over distinct rows. Assumes
-/// `schema`'s PK is a function of row content, since it leads.
+/// Every column ascending, NULLS FIRST, PK columns leading as in the (PK,
+/// payload) consolidation order: a total order over distinct rows.
 fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &dyn SchemaFacts) {
     let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
-    let mut pk: Vec<(u8, ColumnLocator)> = (0..schema.num_columns())
-        .filter_map(|ci| match schema.locate(ci) {
-            loc @ ColumnLocator::Pk { byte_off, .. } => Some((byte_off, loc)),
-            ColumnLocator::Payload { .. } => None,
-        })
-        .collect();
-    pk.sort_unstable_by_key(|&(off, _)| off);
-    keys.extend(pk.into_iter().map(|(_, loc)| asc(loc)));
-    keys.extend((0..schema.num_payload_cols()).map(|pi| asc(schema.locate(schema.payload_col_idx(pi)))));
+    keys.extend(schema.pk_cols().iter().map(|&c| asc(schema.locate(c as usize))));
+    keys.extend(
+        (0..schema.num_columns())
+            .map(|ci| schema.locate(ci))
+            .filter(|l| matches!(l, ColumnLocator::Payload { .. }))
+            .map(asc),
+    );
 }
 
-/// The one ORDER BY comparator, read by both the worker's top-k and the client's
-/// ordering sink. Lexicographic over the keys; NULL placement is absolute —
-/// `nulls_first` decides it and `desc` does not flip it. `Equal` means the keys
-/// did not separate the rows; any tiebreak is the tail of `keys`.
+/// Lexicographic over `keys`.
 #[inline]
 pub fn cmp_order_keys<A: RowSource, B: RowSource>(
     keys: &[OrderLocator],
@@ -291,29 +234,17 @@ pub fn cmp_order_keys<A: RowSource, B: RowSource>(
     let na = a.get_null_word(ra);
     let nb = b.get_null_word(rb);
     for key in keys {
-        // A PK locator answers `false` on both sides and falls through to the
-        // value compare.
-        match (key.loc.is_null_word(na), key.loc.is_null_word(nb)) {
-            (true, true) => continue,
-            (true, false) => {
-                return if key.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                return if key.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => {}
+        let (xa, xb) = (key.loc.is_null_word(na), key.loc.is_null_word(nb));
+        if xa != xb {
+            return if xa == key.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
         }
-        // The locator carries both the addressing and the order rule: a PK
-        // column's OPK window compares raw (order-preserving), a payload column
-        // through the typed dispatch that routes STRING/BLOB by content.
+        if xa {
+            continue;
+        }
         let mut ord = key.loc.cmp_non_null(a, ra, b, rb);
         if key.desc {
             ord = ord.reverse();

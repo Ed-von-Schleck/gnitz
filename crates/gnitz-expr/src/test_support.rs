@@ -114,46 +114,22 @@ impl BatchView for TestView {
     }
 }
 
-/// A [`SchemaFacts`] over a `(type_code, nullable)` column table plus a PK list
-/// in PK-list order (which is where each PK column's OPK byte offset comes from,
-/// and which is independent of column order).
-///
-/// A type code is stored and reported verbatim — including an **undecodable**
-/// one. A release engine can carry one (a corrupt SAL, a crafted wire schema)
-/// and the validator tests exist to pin what happens then, so there is no
-/// decodability assert here to escape from.
+/// A [`SchemaFacts`] over a `(type_code, nullable)` column table and a PK list.
+/// Type codes are reported verbatim, undecodable ones included.
 pub struct TestSchema {
     cols: Vec<(u8, bool)>,
-    pk: Vec<usize>,
-    /// Per column: OPK byte offset for a PK column, dense payload slot otherwise
-    /// — two namespaces, disjoint by column.
-    addr: Vec<u8>,
+    pk: Vec<u32>,
     payload_to_ci: Vec<usize>,
     pk_stride: usize,
 }
 
 impl TestSchema {
     pub fn new(cols: &[(u8, bool)], pk: &[usize]) -> Self {
-        let mut addr = vec![0u8; cols.len()];
-        let mut off = 0usize;
-        for &ci in pk {
-            addr[ci] = off as u8;
-            off += gnitz_wire::wire_stride(cols[ci].0);
-        }
-        let mut payload_to_ci = Vec::new();
-        for (ci, a) in addr.iter_mut().enumerate() {
-            if !pk.contains(&ci) {
-                *a = payload_to_ci.len() as u8;
-                payload_to_ci.push(ci);
-            }
-        }
         TestSchema {
             cols: cols.to_vec(),
-            pk: pk.to_vec(),
-            addr,
-            payload_to_ci,
-            // The running offset after the whole PK list *is* the PK stride.
-            pk_stride: off,
+            pk: pk.iter().map(|&ci| ci as u32).collect(),
+            payload_to_ci: (0..cols.len()).filter(|ci| !pk.contains(ci)).collect(),
+            pk_stride: pk.iter().map(|&ci| gnitz_wire::wire_stride(cols[ci].0)).sum(),
         }
     }
 
@@ -171,20 +147,11 @@ impl TestSchema {
 }
 
 impl SchemaFacts for TestSchema {
-    fn locate(&self, ci: usize) -> ColumnLocator {
-        let (type_code, _) = self.cols[ci];
-        let size = gnitz_wire::wire_stride(type_code) as u8;
-        if self.pk.contains(&ci) {
-            ColumnLocator::Pk { byte_off: self.addr[ci], size, type_code }
-        } else {
-            ColumnLocator::Payload { slot: self.addr[ci], size, type_code }
-        }
+    fn pk_cols(&self) -> &[u32] {
+        &self.pk
     }
     fn payload_col_idx(&self, pi: usize) -> usize {
         self.payload_to_ci[pi]
-    }
-    fn num_payload_cols(&self) -> usize {
-        self.payload_to_ci.len()
     }
     fn num_columns(&self) -> usize {
         self.cols.len()

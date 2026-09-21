@@ -3,7 +3,7 @@ use crate::relation::{RelationKind, RelationSpec, StoreConfig};
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::{BatchBuilder, Slot, StoreError};
 use gnitz_wire::ViewProps;
-use gnitz_wire::{AggDescriptor, AggReadSpec, IndexBound, PkColList, ReadSink};
+use gnitz_wire::{AggDescriptor, AggReadSpec, IndexBound, OrderKey, PkColList, ReadSink};
 
 // ── The executor — `scan_spec` over a registry built in-crate ────────
 //
@@ -117,20 +117,13 @@ fn a_maximal_limit_k_neither_overflows_nor_trims() {
     assert_eq!(got.count, 5);
 }
 
-/// A whole-relation spec, ordered or not, is the store's cached snapshot, and still
-/// refuses a forged order column or a foreign reply layout.
+/// A whole-relation spec is the store's cached snapshot, and still refuses a
+/// foreign reply layout.
 #[test]
 fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
     let mut r = rows_fixture("whole_relation", 4, 1);
     let snapshot = r.scan(TID, None).unwrap();
-    for spec in [rows_spec(Vec::new(), 0), rows_spec(val_desc(), 0)] {
-        assert!(Rc::ptr_eq(&run(&mut r, &spec).unwrap(), &snapshot));
-    }
-    let forged = vec![OrderKey { col: 99, desc: false, nulls_first: false }];
-    let Err(err) = run(&mut r, &rows_spec(forged, 0)) else {
-        panic!("a forged order column must be refused on the snapshot path");
-    };
-    assert!(err.to_string().contains("order key column 99"), "{err}");
+    assert!(Rc::ptr_eq(&run(&mut r, &rows_spec(Vec::new(), 0)).unwrap(), &snapshot));
     let mismatched = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -150,7 +143,7 @@ fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
 fn an_out_of_range_order_key_is_rejected() {
     let mut r = rows_fixture("order_oob", 4, 1);
     let order = vec![OrderKey { col: 99, desc: false, nulls_first: false }];
-    let Err(err) = run(&mut r, &rows_spec(order, 0)) else {
+    let Err(err) = run(&mut r, &rows_spec(order, 1)) else {
         panic!("an out-of-range order key must be rejected");
     };
     assert!(err.to_string().contains("order key column 99"), "{err}");

@@ -24,7 +24,7 @@ use crate::ir::{BExpr, BoundExpr, NumLit};
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses, require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
-use gnitz_expr::{Evaluator, ExprResults};
+use gnitz_expr::{Evaluator, ExprResults, SchemaFacts};
 use gnitz_wire::{
     encode_german_string, german_string_content, is_german_string, null_word_get, null_word_set, ReadSink, ReadSpec,
 };
@@ -201,8 +201,8 @@ pub(crate) fn classify_set_rhs(
     }
     let src = expr.infer_ty(&schema.columns);
     if let BoundExpr::ColRef(c) = expr {
-        if src == ty && !schema.is_pk_col(*c) {
-            return Ok(SetRhs::Copy { scope, src: schema.payload_idx(*c) });
+        if let (true, Some(slot)) = (src == ty, schema.payload_slot(*c)) {
+            return Ok(SetRhs::Copy { scope, src: slot as usize });
         }
     }
     // A DECIMAL source into a non-DECIMAL target casts to I64, not the target, so
@@ -287,7 +287,8 @@ pub(crate) fn apply_set(
     let mut nulls = rows.nulls.clone();
     for a in set {
         let def = &schema.columns[a.ci];
-        let (pi, tc) = (schema.payload_idx(a.ci), def.type_code);
+        let pi = schema.payload_slot(a.ci).expect("a SET target is a payload column") as usize;
+        let tc = def.type_code;
         let scoped = |s: Scope| match s {
             Scope::Existing => &rows,
             Scope::Excluded => excluded.expect("only ON CONFLICT DO UPDATE binds EXCLUDED"),

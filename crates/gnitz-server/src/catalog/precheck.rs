@@ -5,7 +5,7 @@
 use rustc_hash::FxHashSet;
 
 use super::*;
-use gnitz_expr::{cmp_order_keys, OrderLocator, RowSource, SchemaFacts};
+use gnitz_expr::{RowSource, SchemaFacts};
 use gnitz_store::schema::make_index_schema;
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
@@ -178,15 +178,15 @@ fn payload_differs(
     b: &impl RowSource,
     rb: usize,
 ) -> bool {
-    let keys: Vec<OrderLocator> = (0..schema.num_payload_cols())
+    (0..schema.num_payload_cols())
         .filter(|&pi| (mask >> pi) & 1 == 0)
-        .map(|pi| OrderLocator {
-            loc: schema.locate(schema.payload_col_idx(pi)),
-            desc: false,
-            nulls_first: true,
+        .any(|pi| {
+            let loc = schema.locate(schema.payload_col_idx(pi));
+            match (loc.is_null(a, ra), loc.is_null(b, rb)) {
+                (false, false) => loc.cmp_non_null(a, ra, b, rb).is_ne(),
+                (na, nb) => na != nb,
+            }
         })
-        .collect();
-    cmp_order_keys(&keys, a, ra, b, rb).is_ne()
 }
 
 /// A rewrite pair's `+1` may differ from its `-1` only in the family's declared

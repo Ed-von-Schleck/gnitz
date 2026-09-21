@@ -193,18 +193,6 @@ impl Schema {
         self.pk_cols.iter().any(|&p| p as usize == ci)
     }
 
-    /// Byte offset of PK column `col_idx` within the packed PK region — the
-    /// running sum [`Self::locate`]'s `Pk` arm reports as `byte_off`.
-    #[inline]
-    pub fn pk_byte_offset(&self, col_idx: usize) -> usize {
-        debug_assert!(self.is_pk_col(col_idx));
-        self.pk_cols
-            .iter()
-            .take_while(|&&pi| pi as usize != col_idx)
-            .map(|&pi| self.columns[pi as usize].type_code.wire_stride())
-            .sum()
-    }
-
     /// Per-PK-column `(wire_stride, type_code)` in compound-key order, for the
     /// OPK encode/decode column walk. Collect once and reuse across rows so the
     /// per-row loop never re-iterates the schema.
@@ -214,14 +202,6 @@ impl Schema {
             let tc = self.columns[ci as usize].type_code;
             (tc.wire_stride(), tc as u8)
         })
-    }
-
-    /// Map a logical column index to its dense payload index. Caller must
-    /// ensure `col_idx` is not the PK column.
-    #[inline]
-    pub fn payload_idx(&self, col_idx: usize) -> usize {
-        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be a PK column");
-        col_idx - self.pk_cols.iter().filter(|&&p| (p as usize) < col_idx).count()
     }
 
     /// Iterate over the non-PK ("payload") columns.
@@ -336,41 +316,13 @@ impl Schema {
     }
 }
 
-/// The schema surface the shared expression compiler resolves and validates
-/// against — the client's half of the impl the engine's `SchemaDescriptor`
-/// provides, so one compiler serves both.
-///
-/// `num_columns` and `num_payload_cols` are written UFCS: the inherent method of
-/// the same name would shadow the trait one in receiver-dot position and recurse.
-/// The last two read the column table, which *is* the fact; everything else the
-/// trait derives from `locate`.
 impl gnitz_expr::SchemaFacts for Schema {
-    fn locate(&self, ci: usize) -> gnitz_expr::ColumnLocator {
-        let tc = self.columns[ci].type_code;
-        // Every narrowing is in range: a payload slot is below MAX_COLUMNS, a PK
-        // byte offset below MAX_PK_BYTES, every fixed width is <= 16.
-        let size = tc.wire_stride() as u8;
-        if Schema::is_pk_col(self, ci) {
-            gnitz_expr::ColumnLocator::Pk {
-                byte_off: Schema::pk_byte_offset(self, ci) as u8,
-                size,
-                type_code: tc as u8,
-            }
-        } else {
-            gnitz_expr::ColumnLocator::Payload {
-                slot: Schema::payload_idx(self, ci) as u8,
-                size,
-                type_code: tc as u8,
-            }
-        }
-    }
-
-    fn num_payload_cols(&self) -> usize {
-        Schema::num_payload_cols(self)
+    fn pk_cols(&self) -> &[u32] {
+        &self.pk_cols
     }
 
     fn num_columns(&self) -> usize {
-        Schema::num_columns(self)
+        self.columns.len()
     }
 
     fn col_type_code(&self, ci: usize) -> u8 {

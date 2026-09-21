@@ -862,9 +862,9 @@ fn nullable_str_blob_schema() -> Schema {
 #[test]
 fn null_sets_the_bitmap_bit() {
     let schema = nullable_str_blob_schema();
-    // payload_idx(col 1 = String) = 0 → bit 0; payload_idx(col 2 = Blob) = 1 → bit 1
-    let str_bit = 1u64 << schema.payload_idx(1);
-    let blob_bit = 1u64 << schema.payload_idx(2);
+    // payload_slot(col 1 = String) = 0 → bit 0; payload_slot(col 2 = Blob) = 1 → bit 1
+    let str_bit = 1u64 << gnitz_expr::SchemaFacts::payload_slot(&schema, 1).unwrap();
+    let blob_bit = 1u64 << gnitz_expr::SchemaFacts::payload_slot(&schema, 2).unwrap();
     let mut batch = ZSetBatch::new(&schema);
     {
         let mut a = BatchAppender::new(&mut batch, &schema);

@@ -223,8 +223,8 @@ impl WideEntry<'_> {
             weight,
         } = *self;
         match kind {
-            WideKind::Fixed(tc) => {
-                let image = int16_image(loc, tc, max, mb, row);
+            WideKind::Fixed(_) => {
+                let image = int16_image(loc, max, mb, row);
                 out.push_zero_filled_row(bake.entry(key, ord, &image), weight, 0);
             }
             WideKind::Bytes => {

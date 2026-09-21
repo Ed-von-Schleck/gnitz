@@ -389,7 +389,7 @@ struct IndexKeyCol {
 
 impl IndexKeyCol {
     /// Unused slots of the fixed array: the schema layer's designated padding
-    /// column and locator. `kind` is arbitrary — nothing reads past `n`.
+    /// column and locator. Nothing reads past `n`.
     const EMPTY: IndexKeyCol = IndexKeyCol {
         loc: ColumnLocator::EMPTY,
         out: SchemaColumn::EMPTY,

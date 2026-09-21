@@ -4,9 +4,6 @@ use gnitz_core::TypeCode;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::OrderKey;
 
-// The per-key comparison itself (`cmp_order_keys`) is pinned by gnitz-expr's own
-// tests; the tests here cover the finish built on it.
-
 // ---- paginate (multiplicity walk) ----
 
 #[test]
@@ -193,14 +190,10 @@ fn offset_and_limit_inside_one_entry() {
 /// *which* of several entries sharing an identity survives is not.
 fn expand_kv(schema: &Schema, out: &ZSetBatch) -> Vec<(u64, Option<i64>)> {
     let v_ci = schema.columns.iter().position(|c| c.name == "v").unwrap();
+    let v_loc = gnitz_expr::SchemaFacts::locate(schema, v_ci);
     let mut rows = Vec::new();
     for i in 0..out.len() {
-        let v = if gnitz_wire::null_word_get(out.nulls[i], schema.payload_idx(v_ci)) {
-            None
-        } else {
-            let buf = &out.payload[schema.payload_idx(v_ci)].bytes;
-            Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
-        };
+        let v = (!v_loc.is_null(out, i)).then(|| v_loc.decode_i64(out, i, gnitz_wire::FixedInt::I64));
         for _ in 0..out.weights[i] {
             rows.push((out.pks.get(schema, i) as u64, v));
         }

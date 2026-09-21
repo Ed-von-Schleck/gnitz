@@ -78,7 +78,7 @@ pub(crate) fn order_and_window(
         batch.weights.iter().all(|&w| w > 0),
         "ordering sink: non-positive weight violates the bag invariant"
     );
-    let tiebroken = order_locators(order, schema).expect("planned order keys index the result schema");
+    let tiebroken = order_locators(order, schema);
     // A cut appends the identity tiebreak, so it picks the same rows the worker's top-k
     // kept, on every worker count. Without one the written keys alone order: ties are
     // SQL's to leave open, and a total order would cost n·log n comparisons where equal

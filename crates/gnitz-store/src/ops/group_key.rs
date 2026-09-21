@@ -12,32 +12,13 @@ use crate::schema::{
 use crate::storage::{Batch, MemBatch};
 use gnitz_expr::RowSource;
 
-/// Whether the group key of `group_by_cols` can be emitted through the
-/// canonical (order-preserving) fast path — `ColumnLocator::opk_image` on the
-/// single group column — rather than the XXH3 fold (multi-column, nullable, or
-/// non-routable type). Two shapes qualify: a single PK (sub-)column, whose OPK
-/// window widens directly; and a single non-nullable routable-int payload
-/// column, which OPK-encodes then widens to the same image — so a value routes
-/// identically whether it is the PK on one side of a join or a payload FK on
-/// the other. `opk_image` dispatches on the locator, so the two need no
-/// separate arm here.
-///
-/// A canonical key is **injective** on the group value and order-preserving, so
-/// sorting by it visits groups in ascending output-PK order.
+/// Whether the group key of `group_by_cols` is the single column's
+/// `ColumnLocator::opk_image` rather than the XXH3 fold: injective and
+/// order-preserving, so sorting by it visits groups in ascending output-PK order.
 #[inline]
 pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> bool {
-    if group_by_cols.len() != 1 {
-        return false;
-    }
-    let c = group_by_cols[0] as usize;
-    if schema.is_pk_col(c) {
-        return true;
-    }
-    // `try_payload_idx` is the totality gate: `Some` proves `c` names a real
-    // payload column, so the read below cannot land on a padding slot.
-    schema
-        .try_payload_idx(c)
-        .is_some_and(|_| schema.columns[c].nullable == 0 && gnitz_wire::is_pk_eligible(schema.columns[c].type_code))
+    matches!(*group_by_cols, [c] if schema.column(c as usize)
+        .is_some_and(|col| col.nullable == 0 && gnitz_wire::is_pk_eligible(col.type_code)))
 }
 
 /// The 128-bit group key of a row: the single group column's OPK image where

@@ -1,13 +1,10 @@
 //! The [`SchemaFacts`] consistency harness, and proof it is not vacuous.
 
 use crate::test_support::TestSchema;
-use crate::{assert_schema_facts_consistent, ColumnLocator, SchemaFacts};
+use crate::{assert_schema_facts_consistent, SchemaFacts};
 use gnitz_wire::type_code as tc;
 
-/// Column table and PK list of the fixture below. The PK list is **permuted and
-/// non-contiguous** (`PRIMARY KEY (c2, c0)`), the shape a harness that inferred
-/// PK order from column order could not see: `c2` sits at OPK offset 0 and `c0`
-/// at 8, the reverse of their column order.
+/// `PRIMARY KEY (c2, c0)`: PK-list order reverses column order.
 const TINY: [(u8, bool); 4] = [(tc::U32, false), (tc::F64, true), (tc::I64, false), (tc::STRING, false)];
 const TINY_PK: [usize; 2] = [2, 0];
 
@@ -24,11 +21,8 @@ enum Fault {
 struct Faulty(TestSchema, Fault);
 
 impl SchemaFacts for Faulty {
-    fn locate(&self, ci: usize) -> ColumnLocator {
-        self.0.locate(ci)
-    }
-    fn num_payload_cols(&self) -> usize {
-        self.0.num_payload_cols()
+    fn pk_cols(&self) -> &[u32] {
+        self.0.pk_cols()
     }
     fn num_columns(&self) -> usize {
         self.0.num_columns()

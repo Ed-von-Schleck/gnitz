@@ -114,6 +114,27 @@ fn an_index_bound_pinning_every_column_is_refused_at_decode() {
     assert_eq!(ReadSpec::decode(&ok.encode(&block)), Ok((ok.clone(), &block[..])));
 }
 
+/// A worker orders only under a cut, so an order key with no cut is a frame no
+/// client sends, refused at decode.
+#[test]
+fn an_order_key_without_a_cut_is_refused_at_decode() {
+    let spec = |limit_k| ReadSpec {
+        bound: ReadBound::None,
+        predicate: vec![],
+        sink: ReadSink {
+            map: None,
+            kind: SinkKind::Rows { order: sample_order(), limit_k },
+        },
+    };
+    let block = block();
+    let Err(err) = ReadSpec::decode(&spec(0).encode(&block)) else {
+        panic!("an order key without a cut must be refused");
+    };
+    assert!(err.contains("an order key without a cut"), "{err}");
+    let ok = spec(1);
+    assert_eq!(ReadSpec::decode(&ok.encode(&block)), Ok((ok.clone(), &block[..])));
+}
+
 /// `from_keys` is the one sort: duplicates collapse and the list comes out
 /// ascending whatever order it went in; `from_sorted` takes that order as given.
 #[test]

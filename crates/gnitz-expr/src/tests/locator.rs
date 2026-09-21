@@ -2,10 +2,10 @@
 
 use std::cmp::Ordering;
 
-use crate::test_support::{locator_fixture as fixture, TestView};
-use crate::ColumnLocator;
+use crate::test_support::{locator_fixture as fixture, TestSchema, TestView};
+use crate::{cmp_order_keys, order_locators, ColumnLocator, OrderLocator};
 use gnitz_wire::type_code as tc;
-use gnitz_wire::{FixedInt, ScalarKind};
+use gnitz_wire::{FixedInt, OrderKey, ScalarKind};
 
 #[test]
 fn pk_locator_reads_decode_the_opk_sign_flip() {
@@ -285,5 +285,84 @@ fn order_bits_gives_floats_the_total_order() {
                 );
             }
         }
+    }
+}
+
+/// The identity tiebreak follows the written keys: PK columns in PK-list order
+/// (here the reverse of column order), then payload columns in slot order, all
+/// ASC NULLS FIRST. No written key, no tiebreak.
+#[test]
+fn order_locators_append_the_identity_tiebreak_in_pk_list_order() {
+    // `PRIMARY KEY (c3, c0)`.
+    let schema = TestSchema::new(
+        &[(tc::U32, false), (tc::STRING, true), (tc::F64, false), (tc::I64, false)],
+        &[3, 0],
+    );
+    let written = OrderKey { col: 2, desc: true, nulls_first: false };
+    let c0 = ColumnLocator::Pk { byte_off: 8, size: 4, type_code: tc::U32 };
+    let c1 = ColumnLocator::Payload { slot: 0, size: 16, type_code: tc::STRING };
+    let c2 = ColumnLocator::Payload { slot: 1, size: 8, type_code: tc::F64 };
+    let c3 = ColumnLocator::Pk { byte_off: 0, size: 8, type_code: tc::I64 };
+    let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
+    assert_eq!(
+        order_locators(&[written], &schema),
+        vec![
+            OrderLocator { loc: c2, desc: true, nulls_first: false },
+            asc(c3),
+            asc(c0),
+            asc(c1),
+            asc(c2)
+        ],
+    );
+    assert!(order_locators(&[], &schema).is_empty());
+}
+
+/// NULL placement is absolute: `nulls_first` alone decides it, whatever the
+/// direction, and two NULLs tie.
+#[test]
+fn null_placement_ignores_the_direction() {
+    let mut v = TestView::new(3, 0);
+    let slot = v.push_col(8);
+    v.set_payload(1, slot, &5i64.to_le_bytes());
+    v.set_null(0, slot);
+    v.set_null(2, slot);
+    let loc = ColumnLocator::Payload {
+        slot: slot as u8,
+        size: 8,
+        type_code: tc::I64,
+    };
+    for nulls_first in [false, true] {
+        let want = if nulls_first { Ordering::Less } else { Ordering::Greater };
+        for desc in [false, true] {
+            let keys = [OrderLocator { loc, desc, nulls_first }];
+            assert_eq!(
+                cmp_order_keys(&keys, &v, 0, &v, 1),
+                want,
+                "nulls_first={nulls_first} desc={desc}"
+            );
+            assert_eq!(
+                cmp_order_keys(&keys, &v, 1, &v, 0),
+                want.reverse(),
+                "nulls_first={nulls_first} desc={desc}"
+            );
+            assert_eq!(cmp_order_keys(&keys, &v, 0, &v, 2), Ordering::Equal, "two NULLs tie");
+        }
+    }
+}
+
+/// A PK key never reads the null word: with every bit set, it still orders by
+/// value, where a NULL arm would call the rows tied.
+#[test]
+fn a_pk_key_never_takes_the_null_arm() {
+    let mut v = TestView::new(2, 8);
+    for (row, x) in [1u64, 2].into_iter().enumerate() {
+        v.set_pk_col(row, 0, &x.to_le_bytes(), tc::U64);
+        v.set_null_word(row, u64::MAX);
+    }
+    let loc = ColumnLocator::Pk { byte_off: 0, size: 8, type_code: tc::U64 };
+    for desc in [false, true] {
+        let keys = [OrderLocator { loc, desc, nulls_first: true }];
+        let want = if desc { Ordering::Greater } else { Ordering::Less };
+        assert_eq!(cmp_order_keys(&keys, &v, 0, &v, 1), want, "desc={desc}");
     }
 }

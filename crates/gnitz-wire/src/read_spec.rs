@@ -58,7 +58,7 @@ pub enum SinkKind {
     /// Forward rows, ORDER BY / LIMIT top-k.
     Rows {
         /// ORDER BY keys applied in sequence; `col` indexes the sink input (=
-        /// the reply layout). `len ≤ MAX_ORDER_KEYS`.
+        /// the reply layout). `len ≤ MAX_ORDER_KEYS`; empty unless `limit_k > 0`.
         order: Vec<OrderKey>,
         /// OFFSET + LIMIT in logical rows (summed weight). 0 = unbounded.
         /// (`LIMIT 0` never reaches the wire — the SQL layer short-circuits an
@@ -243,6 +243,9 @@ impl ReadSpec {
             SINK_ROWS => {
                 let limit_k = r.u64()?;
                 let order = read_order_keys(&mut r).map_err(|e| format!("read_spec: {e}"))?;
+                if limit_k == 0 && !order.is_empty() {
+                    return Err("read_spec: an order key without a cut".into());
+                }
                 SinkKind::Rows { order, limit_k }
             }
             SINK_FOLD => {
