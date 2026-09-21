@@ -3,68 +3,82 @@
 
 use crate::ColumnLocator;
 
-/// A schema's column table and PK list, and everything derived from them. Every
-/// implementor runs [`assert_schema_facts_matrix`] in its own tests.
-pub trait SchemaFacts {
+/// A schema's column table and PK list — the only thing an implementor writes.
+pub trait ColumnTable {
     /// The PK columns in PK-list order, which is the order they pack into the
     /// OPK region.
     fn pk_cols(&self) -> &[u32];
-    /// Where column `ci`'s value physically lives. Panics on an out-of-range `ci`.
-    fn locate(&self, ci: usize) -> ColumnLocator {
-        assert!(
-            ci < self.num_columns(),
-            "locate: col_idx {ci} out of bounds (num_columns = {})",
-            self.num_columns()
-        );
-        let type_code = self.col_type_code(ci);
-        let size = gnitz_wire::wire_stride(type_code) as u8;
-        let (mut byte_off, mut pk_below) = (0usize, 0usize);
-        for &p in self.pk_cols() {
-            let p = p as usize;
-            if p == ci {
-                return ColumnLocator::Pk {
-                    byte_off: byte_off as u8,
-                    size,
-                    type_code,
-                };
-            }
-            byte_off += gnitz_wire::wire_stride(self.col_type_code(p));
-            pk_below += usize::from(p < ci);
-        }
-        ColumnLocator::Payload {
-            slot: (ci - pk_below) as u8,
-            size,
-            type_code,
-        }
-    }
-    /// Dense payload slot of `ci`, or `None` for a PK column.
-    fn payload_slot(&self, ci: usize) -> Option<u8> {
-        match self.locate(ci) {
-            ColumnLocator::Payload { slot, .. } => Some(slot),
-            ColumnLocator::Pk { .. } => None,
-        }
-    }
-    /// True iff column `ci` is a PK column.
-    fn is_pk_col(&self, ci: usize) -> bool {
-        self.payload_slot(ci).is_none()
-    }
-    /// Inverse of [`Self::payload_slot`], for `pi < num_payload_cols()`.
-    fn payload_col_idx(&self, pi: usize) -> usize {
-        (0..self.num_columns())
-            .filter(|&ci| !self.is_pk_col(ci))
-            .nth(pi)
-            .expect("payload_col_idx: pi out of range")
-    }
-    /// Number of non-PK columns.
-    fn num_payload_cols(&self) -> usize {
-        self.num_columns() - self.pk_cols().len()
-    }
     /// Number of logical columns (PK + payload).
     fn num_columns(&self) -> usize;
     /// Column `ci`'s wire type code.
     fn col_type_code(&self, ci: usize) -> u8;
     /// True iff column `ci` admits NULL.
     fn col_nullable(&self, ci: usize) -> bool;
+}
+
+/// Everything derived from a [`ColumnTable`]. Blanket-implemented, so no type
+/// can answer one of these differently from the derivation.
+pub trait SchemaFacts: ColumnTable {
+    /// Where column `ci`'s value physically lives, or `None` when `ci` is out of
+    /// range.
+    fn try_locate(&self, ci: usize) -> Option<ColumnLocator> {
+        if ci >= self.num_columns() {
+            return None;
+        }
+        let type_code = self.col_type_code(ci);
+        let size = gnitz_wire::wire_stride(type_code) as u8;
+        Some(match gnitz_wire::payload_slot(self.pk_cols(), ci) {
+            Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
+            None => ColumnLocator::Pk {
+                byte_off: self
+                    .pk_cols()
+                    .iter()
+                    .take_while(|&&p| p as usize != ci)
+                    .map(|&p| gnitz_wire::wire_stride(self.col_type_code(p as usize)))
+                    .sum::<usize>() as u8,
+                size,
+                type_code,
+            },
+        })
+    }
+    /// [`Self::try_locate`] for a column that must exist. Panics on an
+    /// out-of-range `ci`.
+    fn locate(&self, ci: usize) -> ColumnLocator {
+        self.try_locate(ci).unwrap_or_else(|| {
+            panic!(
+                "locate: col_idx {ci} out of bounds (num_columns = {})",
+                self.num_columns()
+            )
+        })
+    }
+    /// True iff column `ci` is a PK column; false for an out-of-range `ci`.
+    fn is_pk_col(&self, ci: usize) -> bool {
+        self.pk_cols().iter().any(|&p| p as usize == ci)
+    }
+    /// Dense payload slot of `ci`, or `None` for a PK column or an out-of-range
+    /// `ci`.
+    fn payload_slot(&self, ci: usize) -> Option<usize> {
+        match self.try_locate(ci)? {
+            ColumnLocator::Payload { slot, .. } => Some(slot as usize),
+            ColumnLocator::Pk { .. } => None,
+        }
+    }
+    /// Inverse of [`Self::payload_slot`]. Panics unless `pi < num_payload_cols()`.
+    fn payload_col_idx(&self, pi: usize) -> usize {
+        assert!(pi < self.num_payload_cols(), "payload_col_idx: pi {pi} out of range");
+        gnitz_wire::payload_col_idx(self.pk_cols(), pi)
+    }
+    /// Number of non-PK columns.
+    fn num_payload_cols(&self) -> usize {
+        self.num_columns() - self.pk_cols().len()
+    }
+    /// Total encoded PK width — the PK region's per-row stride.
+    fn pk_stride(&self) -> usize {
+        self.pk_cols()
+            .iter()
+            .map(|&p| gnitz_wire::wire_stride(self.col_type_code(p as usize)))
+            .sum()
+    }
 
     /// Bit `pi` set iff payload slot `pi`'s column admits NULL.
     fn nullable_payload_slots(&self) -> u64 {
@@ -79,148 +93,66 @@ pub trait SchemaFacts {
     fn not_null_payload_slots(&self) -> u64 {
         gnitz_wire::all_payload_null_mask(self.num_payload_cols()) & !self.nullable_payload_slots()
     }
-}
 
-/// One [`SCHEMA_FACTS_CASES`] entry: a schema's column table as
-/// `(type_code, nullable)`, and its PK list in PK-LIST order.
-type SchemaFactsCase = (&'static [(u8, bool)], &'static [usize]);
-
-/// The shape matrix every implementor is driven against.
-const SCHEMA_FACTS_CASES: &[SchemaFactsCase] = {
-    use gnitz_wire::type_code as tc;
-    &[
-        // Single unsigned PK at column 0; U64/F64/STRING/U128 payload, one nullable.
-        (
-            &[
-                (tc::U64, false),
-                (tc::U64, false),
-                (tc::F64, true),
-                (tc::STRING, false),
-                (tc::U128, false),
-            ],
-            &[0],
-        ),
-        // Single signed PK NOT at column 0 — the payload slots renumber around
-        // it, so the `ci - 1` closed form does not hold.
-        (
-            &[(tc::STRING, true), (tc::I64, false), (tc::U64, false), (tc::F32, true)],
-            &[1],
-        ),
-        // Compound two-column PK (signed + unsigned, mixed widths).
-        (
-            &[(tc::I32, false), (tc::U16, false), (tc::F64, false), (tc::BLOB, true)],
-            &[0, 1],
-        ),
-        // Compound PK whose PK-LIST order REVERSES its column order
-        // (`PRIMARY KEY (b, a)`), skipping a column in between: the OPK offsets
-        // follow the pk list, so column 3 sits at offset 0 and column 0 at 8.
-        (
-            &[(tc::U32, false), (tc::STRING, true), (tc::F64, false), (tc::I64, false)],
-            &[3, 0],
-        ),
-        // Every fixed width as a PK column: 1/2/4/8 signed, plus a 16-byte
-        // payload column.
-        (
-            &[
-                (tc::I8, false),
-                (tc::U16, false),
-                (tc::I32, false),
-                (tc::U64, false),
-                (tc::I128, true),
-                (tc::UUID, false),
-            ],
-            &[0, 1, 2, 3],
-        ),
-        // Every fixed width as a payload column, all nullable.
-        (
-            &[
-                (tc::U64, false),
-                (tc::U8, true),
-                (tc::I16, true),
-                (tc::U32, true),
-                (tc::I64, true),
-                (tc::U128, true),
-            ],
-            &[0],
-        ),
-        // PK-only: no payload columns at all.
-        (&[(tc::U32, false)], &[0]),
-    ]
-};
-
-/// Drive [`assert_schema_facts_consistent`] over every [`SCHEMA_FACTS_CASES`]
-/// shape, building the implementor from each case's column table and PK list.
-pub fn assert_schema_facts_matrix<S: SchemaFacts>(build: impl Fn(&[(u8, bool)], &[usize]) -> S) {
-    for &(cols, pk) in SCHEMA_FACTS_CASES {
-        assert_schema_facts_consistent(&build(cols, pk), cols, pk);
-    }
-}
-
-/// Assert that `s` is the schema of column table `cols` and PK list `pk`, and
-/// that its [`SchemaFacts`] answers agree with each other.
-pub(crate) fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, bool)], pk: &[usize]) {
-    assert_eq!(s.num_columns(), cols.len(), "num_columns()");
-    assert_eq!(s.num_payload_cols(), cols.len() - pk.len(), "num_payload_cols()");
-
-    // Expected OPK byte offset per PK column, walked in PK-list order.
-    let mut pk_off = vec![0usize; cols.len()];
-    let mut running = 0usize;
-    for &ci in pk {
-        pk_off[ci] = running;
-        running += gnitz_wire::wire_stride(cols[ci].0);
+    /// The output-key kind a reduce grouped by `group` over this schema warrants.
+    fn reduce_out_key(&self, group: &[u32]) -> gnitz_wire::ReduceOutKey {
+        gnitz_wire::ReduceOutKey::for_group_cols(self.pk_cols(), group, |c| {
+            (self.col_type_code(c as usize), self.col_nullable(c as usize))
+        })
     }
 
-    // Expected payload slots: non-PK columns numbered left to right.
-    let mut want_nullable_mask = 0u64;
-    let mut want_not_null_mask = 0u64;
-    let mut next_pi = 0usize;
-
-    for (ci, &(want_tc, want_nullable)) in cols.iter().enumerate() {
-        let want_pk = pk.contains(&ci);
-        let want_slot = next_pi;
-        if !want_pk {
-            let bit = 1u64 << next_pi;
-            *if want_nullable {
-                &mut want_nullable_mask
-            } else {
-                &mut want_not_null_mask
-            } |= bit;
-            next_pi += 1;
-        }
-        assert_eq!(s.col_type_code(ci), want_tc, "col_type_code({ci})");
-        assert_eq!(s.col_nullable(ci), want_nullable, "col_nullable({ci})");
-        assert_eq!(s.is_pk_col(ci), want_pk, "is_pk_col({ci})");
-
-        let loc = s.locate(ci);
-        assert_eq!(
-            matches!(loc, ColumnLocator::Pk { .. }),
-            want_pk,
-            "locate({ci}) variant disagrees with is_pk_col({ci})",
+    /// One row's PK as OPK bytes, from its PK columns' native little-endian
+    /// images in PK-list order. Reads the first `pk_stride()` bytes of
+    /// `native_le`.
+    fn opk_key(&self, native_le: &[u8]) -> gnitz_wire::PkBuf {
+        let stride = self.pk_stride();
+        debug_assert!(
+            native_le.len() >= stride,
+            "opk_key: native_le ({}) shorter than pk_stride ({stride})",
+            native_le.len(),
         );
-        assert_eq!(loc.type_code(), want_tc, "locate({ci}).type_code()");
-        assert_eq!(loc.size(), gnitz_wire::wire_stride(want_tc), "locate({ci}).size()");
-        match loc {
-            ColumnLocator::Payload { slot, .. } => {
-                assert_eq!(slot as usize, want_slot, "locate({ci}) payload slot");
-                assert_eq!(s.payload_col_idx(want_slot), ci, "payload_col_idx({want_slot})");
-            }
-            ColumnLocator::Pk { byte_off, .. } => {
-                assert_eq!(byte_off as usize, pk_off[ci], "locate({ci}) OPK byte offset");
-            }
-        }
+        gnitz_wire::encode_pk_tuple(
+            self.pk_cols().iter().map(|&p| {
+                let tc = self.col_type_code(p as usize);
+                (gnitz_wire::wire_stride(tc), tc)
+            }),
+            &native_le[..stride],
+        )
     }
 
-    assert_eq!(
-        s.nullable_payload_slots(),
-        want_nullable_mask,
-        "nullable_payload_slots()"
-    );
-    assert_eq!(
-        s.not_null_payload_slots(),
-        want_not_null_mask,
-        "not_null_payload_slots()"
-    );
+    /// [`Self::opk_key`] from one native value per PK column, in PK-list order.
+    fn opk_key_cols(&self, natives: &[u128]) -> gnitz_wire::PkBuf {
+        debug_assert_eq!(
+            natives.len(),
+            self.pk_cols().len(),
+            "opk_key_cols: one native value per PK column",
+        );
+        gnitz_wire::encode_pk_natives(
+            self.pk_cols().iter().map(|&p| {
+                let tc = self.col_type_code(p as usize);
+                (tc, tc)
+            }),
+            natives.iter().copied(),
+        )
+    }
+
+    /// The inverse of [`Self::opk_key`]: `key`'s columns as native
+    /// little-endian images at the same offsets, zero past `key.len()`.
+    fn native_le_key(&self, key: &[u8]) -> [u8; gnitz_wire::MAX_PK_BYTES] {
+        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let mut off = 0;
+        for &p in self.pk_cols() {
+            let tc = self.col_type_code(p as usize);
+            let w = gnitz_wire::wire_stride(tc);
+            gnitz_wire::decode_pk_column(&key[off..off + w], tc, &mut buf[off..off + w]);
+            off += w;
+        }
+        debug_assert_eq!(off, key.len(), "native_le_key: schema stride != key width");
+        buf
+    }
 }
+
+impl<T: ColumnTable + ?Sized> SchemaFacts for T {}
 
 #[cfg(test)]
 #[path = "tests/schema_facts.rs"]

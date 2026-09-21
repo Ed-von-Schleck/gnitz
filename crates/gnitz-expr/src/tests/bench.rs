@@ -19,7 +19,9 @@ use crate::test_support::{
     both_arms, filter_prog, is_null_op, make_n_col_view, map_prog, passing_rows, push_payload_cols, scalar_prog,
     schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, ConstIdx, Evaluator, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
+use crate::{
+    CmpOp, ConstIdx, Evaluator, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Reg, SchemaFacts, Sink,
+};
 
 /// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
 /// bench built. A misspelled selector would otherwise drive nothing and

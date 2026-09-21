@@ -39,7 +39,7 @@ use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::key::seek_opk_bytes;
-use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::schema::{SchemaDescriptor, SchemaFacts};
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::txn_frame::{validate_item_ids, DeltaPollItem};
@@ -1339,20 +1339,7 @@ fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch,
 /// Refuses a null bit on a NOT NULL column, which the null-aware readers and the
 /// schema-trusting ones would read differently.
 fn validate_client_batch(b: &Batch) -> Result<(), &'static str> {
-    let not_null = gnitz_expr::SchemaFacts::not_null_payload_slots(b.schema());
-    if not_null == 0 {
-        return Ok(());
-    }
-    // OR-reduce, then one test: the conforming case walks every row either way,
-    // so a per-row branch would only add work. The same branch-free fold over the
-    // same contiguous count-bounded region as `Batch::all_weights_positive`.
-    let acc = b
-        .null_bmp_data()
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .fold(0u64, |a, w| a | u64::from_le_bytes(*w));
-    if acc & not_null != 0 {
+    if gnitz_wire::first_not_null_violation(b.schema().not_null_payload_slots(), b.null_bmp_data()).is_some() {
         return Err("client batch sets a null bit on a NOT NULL column");
     }
     Ok(())

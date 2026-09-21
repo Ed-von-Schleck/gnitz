@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::batch_pool::{acquire_arena, debug_poison, recycle_buf, Fill};
 use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{ColumnLocator, SchemaDescriptor, DELTA_TICK_COL};
+use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts, DELTA_TICK_COL};
 use gnitz_expr::RowSource;
 use gnitz_wire::{align8, read_i64_le, read_u64_le};
 
@@ -787,7 +787,7 @@ impl Batch {
     /// `BatchBuilder::begin_row_opk`, and through it the `SysRowSink` the
     /// catalog writes rows with, dispatches to.
     pub fn extend_pk_opk(&mut self, native_col_vals: &[u128]) {
-        self.extend_pk_bytes(crate::schema::key::opk_key_cols(&self.schema, native_col_vals).pk_bytes());
+        self.extend_pk_bytes(self.schema.opk_key_cols(native_col_vals).pk_bytes());
     }
 
     /// Fill `nbytes` of zeros at the current row position in a payload column.
@@ -1100,32 +1100,16 @@ impl Batch {
         self.layout = layout;
     }
 
-    /// Debug-only: assert no row sets a null bit under a payload column `schema`
-    /// declares NOT NULL — the invariant the client-decode boundary enforces in
-    /// release, checked here against every batch the engine itself builds.
-    /// Runs for every layout including `Raw`, since an unsorted arrival (a union
-    /// concat, a null-extend widening) is exactly where a null-fill enters.
-    ///
-    /// Consumers are free to read the bit raw (the group-key fold) or to
-    /// believe the declaration (`FixedIntNonnull`, the evaluator's
-    /// `nullable_slots`, a projection's `NullPerm`) only because this holds.
+    /// Debug-only: no row sets a null bit under a payload column `schema`
+    /// declares NOT NULL. Release checks this only at client decode; readers
+    /// that trust the declaration rely on it for every batch the engine builds.
     #[cfg(debug_assertions)]
     fn debug_verify_null_bits(&self, schema: &SchemaDescriptor) {
-        let nonnull = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
-        if nonnull == 0 {
-            return;
-        }
-        let mut acc = 0u64;
-        for row in 0..self.count {
-            acc |= self.get_null_word(row);
-        }
-        debug_assert_eq!(
-            acc & nonnull,
-            0,
+        let violation = gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), self.null_bmp_data());
+        debug_assert!(
+            violation.is_none(),
             "batch sets a null bit under a payload column the operating schema declares \
-             NOT NULL (slots={:#x}, first offending row={:?} of {})",
-            acc & nonnull,
-            (0..self.count).find(|&r| self.get_null_word(r) & nonnull != 0),
+             NOT NULL: (row, payload slot) = {violation:?} of {} rows",
             self.count,
         );
     }

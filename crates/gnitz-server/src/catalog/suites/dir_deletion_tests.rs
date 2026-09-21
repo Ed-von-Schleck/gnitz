@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_expr::SchemaFacts;
 
 use std::path::Path;
 
@@ -331,7 +332,7 @@ fn owned_rows(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32, k: u32) 
     rows.iter()
         .copied()
         .filter(|&(pk, _)| {
-            let opk = gnitz_store::schema::key::opk_key(schema, &pk.to_le_bytes());
+            let opk = schema.opk_key(&pk.to_le_bytes());
             schema.placement().is_replicated() || schema.worker_for_pk(opk.pk_bytes(), of as usize) == k as usize
         })
         .collect()

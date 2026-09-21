@@ -5,6 +5,7 @@
 //! that, plus every fallback that degrades a bound to a full scan.
 
 use super::*;
+use gnitz_expr::SchemaFacts;
 use gnitz_store::storage::SourceCursor;
 use gnitz_wire::{Cut, IndexBound, PkColList, RangeDescriptor};
 
@@ -204,7 +205,7 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     // The premise this pins: the store now holds no live row at the victim's key,
     // which is what makes the gather's per-PK probe copy nothing in the middle of
     // the chunk.
-    let victim_key = gnitz_store::schema::key::opk_key(&schema, &(victim as u128).to_le_bytes());
+    let victim_key = schema.opk_key(&(victim as u128).to_le_bytes());
     let probe_entry = engine.registry.relation_or_err(tid).unwrap();
     let mut probe = probe_entry.cursor();
     probe.seek_bytes(victim_key.pk_bytes());

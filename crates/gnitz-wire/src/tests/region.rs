@@ -58,3 +58,14 @@ fn merge_null_words_at_the_full_left_width() {
     assert_eq!(merge_null_words(0b1011, 0, 64), 0b1011);
     assert_eq!(merge_null_words(u64::MAX, 0, 64), u64::MAX);
 }
+
+#[test]
+fn first_not_null_violation_names_the_first_row_and_its_lowest_offending_slot() {
+    let words: [u64; 4] = [0b0001, 0b0000, 0b1100, 0b0100];
+    let bmp = crate::as_le_bytes(&words);
+    assert_eq!(first_not_null_violation(0, bmp), None);
+    assert_eq!(first_not_null_violation(0b0010, bmp), None);
+    assert_eq!(first_not_null_violation(0b0110, bmp), Some((2, 2)));
+    assert_eq!(first_not_null_violation(0b1001, bmp), Some((0, 0)));
+    assert_eq!(first_not_null_violation(!0, &[]), None);
+}

@@ -6,7 +6,7 @@
 
 mod common;
 use common::*;
-use gnitz_core::{GnitzClient, TypeCode};
+use gnitz_core::{GnitzClient, SchemaFacts, TypeCode};
 use gnitz_sql::SqlResult;
 
 /// `Some(is_unique)` of the single-column index on `table.col`, `None` when the

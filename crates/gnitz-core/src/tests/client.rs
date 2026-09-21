@@ -1,4 +1,5 @@
 use super::*;
+use crate::SchemaFacts;
 
 fn kv_schema() -> Schema {
     Schema {
@@ -61,7 +62,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
 
     let mut op = |tid, pk: u64| {
         buf.reads(tid)
-            .last_op(crate::opk_key_cols(&kv_schema(), [pk as u128]).pk_bytes())
+            .last_op(kv_schema().opk_key_cols(&[pk as u128]).pk_bytes())
             .map(|(b, row)| (b.weights[row], row))
     };
     assert_eq!(op(16, 1), Some((1, 0)), "the last of three ops on pk=1");

@@ -50,35 +50,18 @@ const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
     panic!("column not found")
 }
 
-/// Dense **payload** index of `name` in `cols` — its position among the non-PK
-/// columns, which is the slot the null bitmap and the payload region address it
-/// by. Takes `pk_cols` itself rather than a count so a list and its key cannot
-/// be stated apart, and so the leading-key precondition is checkable.
-///
-/// Every failure is a const-eval panic: a non-leading key, `name` naming a PK
-/// column, and — through `col_index_in` — a renamed one.
-pub(crate) const fn pay_index_in_keyed(cols: &[WireSysCol], name: &str, pk_cols: &[u32]) -> usize {
-    // `ci - pk_cols.len()` is the payload index only for a leading key; any
-    // other renumbers around each PK position.
-    let mut k = 0;
-    while k < pk_cols.len() {
-        assert!(pk_cols[k] as usize == k, "a payload index needs a leading key");
-        k += 1;
-    }
-    let ci = col_index_in(cols, name);
-    assert!(ci >= pk_cols.len(), "a PK column has no payload index");
-    ci - pk_cols.len()
-}
-
-/// [`pay_index_in_keyed`] against the column list and key of system family `id`,
-/// so a `*_PAY_*` constant names one family and cannot pair a list with a key
-/// that is not its own.
+/// Payload slot of column `name` in system family `id`, whose column list and
+/// key are paired in one place. A PK column or an unknown name is a const-eval
+/// panic.
 pub(crate) const fn pay_index_in_fam(id: u64, name: &str) -> usize {
     let f = &SYS_FAMILIES[match sys_family_index(id) {
         Some(i) => i,
         None => panic!("not a system family"),
     }];
-    pay_index_in_keyed(f.cols, name, f.pk_cols)
+    match payload_slot(f.pk_cols, col_index_in(f.cols, name)) {
+        Some(pi) => pi,
+        None => panic!("a PK column has no payload slot"),
+    }
 }
 
 // Every system table's column shape is defined once, here, and reached through
@@ -494,7 +477,7 @@ pub fn delta_schema_order(pk_indices: &[u32], num_columns: usize) -> Vec<DeltaCo
     out.extend(pk_indices.iter().map(|&i| DeltaCol::Key(i as usize)));
     out.extend(
         (0..num_columns)
-            .filter(|&i| !pk_indices.contains(&(i as u32)))
+            .filter(|&ci| payload_slot(pk_indices, ci).is_some())
             .map(DeltaCol::Payload),
     );
     out
@@ -508,6 +491,47 @@ pub fn delta_schema_order(pk_indices: &[u32], num_columns: usize) -> Vec<DeltaCo
 /// Capped at 65 by the row-major null bitmap: each row stores one u64 word
 /// with one bit per payload column, so payload columns ≤ 64.
 pub const MAX_COLUMNS: usize = 65;
+
+/// Payload slot of column `ci`: its position among the columns not in `pk`, or
+/// `None` for a PK column. Inverse of [`payload_col_idx`].
+pub const fn payload_slot(pk: &[u32], ci: usize) -> Option<usize> {
+    if contains_col(pk, ci) {
+        return None;
+    }
+    let mut below = 0;
+    let mut k = 0;
+    while k < pk.len() {
+        below += ((pk[k] as usize) < ci) as usize;
+        k += 1;
+    }
+    Some(ci - below)
+}
+
+/// Column index of payload slot `pi`: the `pi`-th column not in `pk`.
+pub const fn payload_col_idx(pk: &[u32], pi: usize) -> usize {
+    let mut ci = 0;
+    let mut slot = 0;
+    loop {
+        if !contains_col(pk, ci) {
+            if slot == pi {
+                return ci;
+            }
+            slot += 1;
+        }
+        ci += 1;
+    }
+}
+
+const fn contains_col(cols: &[u32], ci: usize) -> bool {
+    let mut k = 0;
+    while k < cols.len() {
+        if cols[k] as usize == ci {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
 
 /// Sizing cap for the compound-PK column list.
 ///

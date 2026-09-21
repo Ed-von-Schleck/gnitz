@@ -83,6 +83,20 @@ pub fn all_payload_null_mask(npc: usize) -> u64 {
     crate::low_bits_mask(npc)
 }
 
+/// The first `(row, payload slot)` whose little-endian `u64` null word in
+/// `null_bmp` sets a bit in `not_null`.
+pub fn first_not_null_violation(not_null: u64, null_bmp: &[u8]) -> Option<(usize, usize)> {
+    let words = null_bmp.as_chunks::<8>().0;
+    // A conforming batch takes only this branch-free pass.
+    if not_null == 0 || words.iter().fold(0u64, |a, w| a | u64::from_le_bytes(*w)) & not_null == 0 {
+        return None;
+    }
+    words.iter().enumerate().find_map(|(row, w)| {
+        let bad = u64::from_le_bytes(*w) & not_null;
+        (bad != 0).then(|| (row, bad.trailing_zeros() as usize))
+    })
+}
+
 /// A row's null word rebased onto output payload slot `at`; slot 64 and beyond
 /// hold no bit.
 #[inline]

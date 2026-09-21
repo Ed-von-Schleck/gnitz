@@ -71,6 +71,30 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
     assert!(matches!(schema_from_block(&block), Err(ProtocolError::DecodeError(_))));
 }
 
+/// The record's decode bounds only its own arrays; an empty, out-of-range or
+/// duplicate PK list is a schema rule, refused here.
+#[test]
+fn an_empty_out_of_range_or_duplicate_pk_is_rejected() {
+    let cols: Vec<SchemaBlockCol> = (0..3)
+        .map(|_| SchemaBlockCol {
+            type_code: TypeCode::U64 as u8,
+            meta: ColMeta::default(),
+            name: b"k",
+        })
+        .collect();
+    for pk in [&[][..], &[3], &[1, 1]] {
+        let block = gnitz_wire::schema_block::encode(&cols, pk);
+        assert!(
+            gnitz_wire::schema_block::decode(&block).is_ok(),
+            "{pk:?}: the codec admits it"
+        );
+        assert!(
+            matches!(schema_from_block(&block), Err(ProtocolError::DecodeError(_))),
+            "{pk:?}"
+        );
+    }
+}
+
 #[test]
 fn a_truncated_record_is_a_decode_error_not_a_panic() {
     let schema = Schema {

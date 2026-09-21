@@ -125,8 +125,8 @@ pub use xxh::*;
 // Flat-export what production reaches for pervasively; the framer items and the
 // rest of the header offsets stay module-qualified.
 pub use region::{
-    all_payload_null_mask, merge_null_words, null_word_at, null_word_get, null_word_set, MAX_WIRE_REGIONS,
-    REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+    all_payload_null_mask, first_not_null_violation, merge_null_words, null_word_at, null_word_get, null_word_set,
+    MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
 pub use wal::{WAL_FORMAT_VERSION, WAL_OFF_TID};
 

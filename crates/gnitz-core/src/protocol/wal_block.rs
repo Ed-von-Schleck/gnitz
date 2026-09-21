@@ -2,6 +2,7 @@
 
 use super::error::ProtocolError;
 use super::types::{check_not_null, Schema, ZSetBatch};
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 // ── Region read helpers ───────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ pub use connection::{
     MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use error::ClientError;
+pub use gnitz_expr::{ColumnTable, SchemaFacts};
 pub use gnitz_wire::{agg_output_type, Circuit, MapKind, Node, NodeId, NodeInputs, OpNode, RangeRel, ReindexRole};
 pub use gnitz_wire::{
     validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, ReindexSlot, RelClass, TableProps,
@@ -37,7 +38,7 @@ pub use gnitz_wire::{
 };
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::{
-    native_le_key, opk_key_cols, push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn,
-    PkBuf, PkColumn, ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch,
-    MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    push_zero_cell, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PayloadColumn, PkBuf, PkColumn,
+    ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch, MAX_COLUMNS, MAX_PK_BYTES,
+    PK_LIST_MAX_COLS,
 };

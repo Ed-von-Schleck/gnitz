@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{ColType, ColumnDef, Schema};
+use gnitz_core::{ColType, ColumnDef, Schema, SchemaFacts};
 
 use crate::build_pylist;
 

@@ -134,3 +134,36 @@ fn table_flags_roundtrip() {
         props(true, true, 2),
     );
 }
+
+/// Every PK list of up to 4 distinct indices, in every order, over 1..=6
+/// columns, against the naive "`pi`-th non-PK column".
+#[test]
+fn payload_col_idx_and_payload_slot_number_the_non_pk_columns() {
+    fn lists(n: u32, len: usize, cur: &mut Vec<u32>, out: &mut Vec<Vec<u32>>) {
+        out.push(cur.clone());
+        if cur.len() == len {
+            return;
+        }
+        for c in 0..n {
+            if !cur.contains(&c) {
+                cur.push(c);
+                lists(n, len, cur, out);
+                cur.pop();
+            }
+        }
+    }
+    for n in 1..=6u32 {
+        let mut all = Vec::new();
+        lists(n, 4.min(n as usize), &mut Vec::new(), &mut all);
+        for pk in &all {
+            let payload: Vec<usize> = (0..n).filter(|c| !pk.contains(c)).map(|c| c as usize).collect();
+            for (pi, &ci) in payload.iter().enumerate() {
+                assert_eq!(payload_col_idx(pk, pi), ci, "n {n}, pk {pk:?}, pi {pi}");
+            }
+            for ci in 0..n as usize {
+                let want = payload.iter().position(|&c| c == ci);
+                assert_eq!(payload_slot(pk, ci), want, "n {n}, pk {pk:?}, ci {ci}");
+            }
+        }
+    }
+}

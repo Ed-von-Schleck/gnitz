@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::key::compare_pk_bytes;
-use crate::schema::{type_code, SchemaColumn};
+use crate::schema::{type_code, SchemaColumn, SchemaFacts};
 use crate::storage::Batch;
 use crate::test_support::{batch_of_pk_bytes, pk_payload_schema, wide_pk_3xu64_schema};
 
@@ -31,7 +31,7 @@ fn single_col_group_key_is_the_opk_image_from_either_side() {
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         if !col1_is_pk {
-            b.extend_col(schema.try_payload_idx(1).unwrap(), le);
+            b.extend_col(schema.payload_slot(1).unwrap(), le);
         }
         b.count += 1;
         GroupKeyCols::new(&schema, &[1]).unwrap().key_row(&b.as_mem_batch(), 0)

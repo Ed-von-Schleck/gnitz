@@ -38,7 +38,7 @@ fn typed_cmp_pk_le(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
 /// Compare two native-LE PK tuples the way storage now does: encode each to
 /// OPK, then `compare_pk_bytes` (a raw memcmp). Mirrors the read path.
 fn cmp_pk_le(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
-    compare_pk_bytes(opk_key(schema, a).pk_bytes(), opk_key(schema, b).pk_bytes())
+    compare_pk_bytes(schema.opk_key(a).pk_bytes(), schema.opk_key(b).pk_bytes())
 }
 
 /// The load-bearing OPK property: a raw memcmp of the order-preserving keys
@@ -302,7 +302,7 @@ mod opk_proptest {
             let cols: Vec<SchemaColumn> =
                 types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
             let s = SchemaDescriptor::new(&cols, &perm);
-            let (oa, ob) = (opk_key(&s, &a), opk_key(&s, &b));
+            let (oa, ob) = (s.opk_key(&a), s.opk_key(&b));
             let (oa, ob) = (oa.pk_bytes(), ob.pk_bytes());
             prop_assert_eq!(compare_pk_ordering(oa, ob), compare_pk_bytes(oa, ob));
             prop_assert_eq!(
@@ -321,7 +321,7 @@ mod opk_proptest {
             let cols: Vec<SchemaColumn> =
                 types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
             let s = SchemaDescriptor::new(&cols, &perm);
-            let (oa, ob) = (opk_key(&s, &a), opk_key(&s, &b));
+            let (oa, ob) = (s.opk_key(&a), s.opk_key(&b));
             let (oa, ob) = (oa.pk_bytes(), ob.pk_bytes());
             prop_assert_eq!(pk_bytes_eq(oa, ob), oa == ob);
             prop_assert!(pk_bytes_eq(oa, oa));
@@ -351,7 +351,7 @@ fn seek_opk_bytes_narrow_matches_opk_key() {
     ];
     for s in cases {
         for v in [0u128, 1, 0x0123_4567_89AB_CDEF, 0x8000_0000_0000_0000, u64::MAX as u128] {
-            let want = opk_key(&s, &v.to_le_bytes());
+            let want = s.opk_key(&v.to_le_bytes());
             let got = seek_opk_bytes(&s, &v.to_le_bytes()).expect("narrow seek encodes");
             assert_eq!(got, want, "narrow seek must match opk_key for {s:?} v={v:#x}");
         }
@@ -1539,7 +1539,7 @@ fn pk_range_signed_i64() {
     let neg1 = (-1i64 as u64) as u128;
     let d = RangeDescriptor::new(&[], Cut::After(neg1), Cut::After((i64::MAX as u64) as u128));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-    assert_eq!(start, opk_key(&s, &0i64.to_le_bytes()));
+    assert_eq!(start, s.opk_key(&0i64.to_le_bytes()));
     assert!(end.is_none());
 }
 
@@ -1551,7 +1551,7 @@ fn pk_range_compound_prefix_eq() {
     let d = RangeDescriptor::new(&[5], Cut::After(3), Cut::After(u64::MAX as u128));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
     // start = OPK(5,4) — the prefix `(5,3)` incremented on b.
-    let s54 = opk_key(&s, &{
+    let s54 = s.opk_key(&{
         let mut v = Vec::new();
         v.extend_from_slice(&5u64.to_le_bytes());
         v.extend_from_slice(&4u64.to_le_bytes());
@@ -1559,7 +1559,7 @@ fn pk_range_compound_prefix_eq() {
     });
     assert_eq!(start, s54);
     // end = the successor of `(5, MAX)` — carries into `a`, i.e. OPK(6, 0).
-    let s60 = opk_key(&s, &{
+    let s60 = s.opk_key(&{
         let mut v = Vec::new();
         v.extend_from_slice(&6u64.to_le_bytes());
         v.extend_from_slice(&0u64.to_le_bytes());

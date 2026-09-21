@@ -10,7 +10,7 @@
 //! a MAX image is complemented, so each ordinal's first entry is its extreme.
 
 use crate::schema::key::ReindexPacker;
-use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
@@ -83,7 +83,7 @@ impl AviBake {
                 .expect("one payload column fits behind a PK-only schema");
         }
         let schema = b.finish();
-        debug_assert!(!has_payload || schema.try_payload_idx(schema.num_columns() - 1) == Some(IMAGE_SLOT));
+        debug_assert!(!has_payload || schema.payload_slot(schema.num_columns() - 1) == Some(IMAGE_SLOT));
         Ok(Some(AviBake {
             schema,
             key_packer,

@@ -914,7 +914,7 @@ async fn resolve_parent_deltas(
         // The reply's one payload column, off the projected schema rather than
         // the parent's — and not column 0, since `project_schema` keeps the PK
         // region ahead of it.
-        locators.push(reply.locate(SchemaFacts::payload_col_idx(&reply, 0)));
+        locators.push(reply.locate(reply.payload_col_idx(0)));
         checks.push(PipelinedCheck {
             keyspace: Keyspace::OwnPk,
             probe: Probe::Project { col: pcol, reply: Box::new(reply) },

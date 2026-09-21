@@ -15,7 +15,7 @@ use crate::test_support::{
     both_arms, filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols, row_str,
     row_value, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, LogicalInstr, ResolvedProgram, RowSource};
+use crate::{CmpOp, Evaluator, LogicalInstr, ResolvedProgram, RowSource, SchemaFacts};
 
 /// `eval_batch` with the string-buffer table the drive methods assemble. These
 /// tests sit below `Evaluator`, so they build the same preamble it does.

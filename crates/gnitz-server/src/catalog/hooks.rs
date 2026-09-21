@@ -1,5 +1,6 @@
 use super::cache::RelationEntry;
 use super::*;
+use gnitz_expr::SchemaFacts;
 use std::collections::hash_map::Entry;
 
 impl CatalogEngine {

@@ -1,7 +1,7 @@
 //! Range membership over key images, driven through [`TestView`].
 
 use crate::test_support::{TestSchema, TestView};
-use crate::RangeMembership;
+use crate::{RangeMembership, SchemaFacts};
 use gnitz_wire::type_code as tc;
 use gnitz_wire::{Cut, FixedInt, RangeDescriptor};
 

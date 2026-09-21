@@ -247,7 +247,7 @@ fn test_new_constructs_schema() {
 }
 
 #[test]
-fn test_try_payload_idx_around_pk() {
+fn test_payload_slot_around_pk() {
     // pk_index = 1: col 0 maps to payload 0, col 2 maps to payload 1, and
     // the PK column (1) has no payload slot.
     let s = SchemaDescriptor::new(
@@ -258,9 +258,9 @@ fn test_try_payload_idx_around_pk() {
         ],
         &[1],
     );
-    assert_eq!(s.try_payload_idx(0), Some(0));
-    assert_eq!(s.try_payload_idx(2), Some(1));
-    assert_eq!(s.try_payload_idx(1), None);
+    assert_eq!(s.payload_slot(0), Some(0));
+    assert_eq!(s.payload_slot(2), Some(1));
+    assert_eq!(s.payload_slot(1), None);
 }
 
 #[test]
@@ -361,25 +361,34 @@ fn test_duplicate_pk_guard_panics_in_release() {
     let _ = SchemaDescriptor::new(&cols, &[0, 0]);
 }
 
-// ── SchemaFacts conformance ──────────────────────────────────────────────
+// ── ColumnTable ──────────────────────────────────────────────────────────
 
-/// `SchemaDescriptor`'s `SchemaFacts` forwarders must report exactly what
-/// the schema itself does, over the shared shape matrix. The harness is the
-/// only way to reach the trait methods: most collide by name with an
-/// inherent method that Rust would prefer in receiver-dot position, so a
-/// forwarder that silently reimplements — and thereby flips `no_nulls` or
-/// the `check_col` admissibility dispatch — would go unnoticed by a direct
-/// check.
+/// The descriptor's `ColumnTable` answers are what it was built from, and its
+/// cached `pk_stride` is the derived one.
 #[test]
-fn schema_descriptor_conforms_to_schema_facts() {
-    gnitz_expr::assert_schema_facts_matrix(|cols, pk| {
-        let scols: Vec<SchemaColumn> = cols
-            .iter()
-            .map(|&(tc, nullable)| SchemaColumn::new(tc, nullable as u8))
-            .collect();
-        let pk_idx: Vec<u32> = pk.iter().map(|&i| i as u32).collect();
-        SchemaDescriptor::new(&scols, &pk_idx)
-    });
+fn schema_descriptor_column_table() {
+    use type_code::{F64, I32, STRING, U64};
+    // (columns as (type_code, nullable), pk list, not_null_payload_slots)
+    type Shape = (&'static [(u8, u8)], &'static [u32], u64);
+    let shapes: &[Shape] = &[
+        (&[(U64, 0), (I32, 0), (STRING, 1)], &[0], 0b01),
+        (&[(STRING, 1), (U64, 0), (F64, 0)], &[1], 0b10),
+        (&[(I32, 0), (U64, 0), (F64, 1), (I32, 0)], &[0, 1], 0b10),
+        (&[(U64, 0), (STRING, 1), (F64, 0), (I32, 0)], &[3, 0], 0b10),
+        (&[(U64, 0), (I32, 0)], &[0, 1], 0),
+    ];
+    for &(cols, pk, not_null) in shapes {
+        let scols: Vec<SchemaColumn> = cols.iter().map(|&(tc, n)| SchemaColumn::new(tc, n)).collect();
+        let s = SchemaDescriptor::new(&scols, pk);
+        assert_eq!(ColumnTable::num_columns(&s), cols.len(), "{pk:?}");
+        assert_eq!(ColumnTable::pk_cols(&s), pk, "{pk:?}");
+        for (ci, &(tc, n)) in cols.iter().enumerate() {
+            assert_eq!(ColumnTable::col_type_code(&s, ci), tc, "{pk:?}: col {ci}");
+            assert_eq!(ColumnTable::col_nullable(&s, ci), n != 0, "{pk:?}: col {ci}");
+        }
+        assert_eq!(s.not_null_payload_slots(), not_null, "{pk:?}: not_null_payload_slots");
+        assert_eq!(s.pk_stride(), SchemaFacts::pk_stride(&s), "{pk:?}: cached pk_stride");
+    }
 }
 
 // ── PK rendering ─────────────────────────────────────────────────────────
@@ -505,5 +514,26 @@ fn decode_schema_block_rejects_a_nullable_or_ineligible_pk_column() {
             "the record itself is well-formed"
         );
         assert!(decode_schema_block(&record).is_err());
+    }
+}
+
+/// The record's decode bounds only its own arrays; an empty, out-of-range or
+/// duplicate PK list is a schema rule, refused here.
+#[test]
+fn decode_schema_block_rejects_an_empty_out_of_range_or_duplicate_pk() {
+    use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
+
+    let col = SchemaBlockCol {
+        type_code: type_code::U64,
+        meta: ColMeta::default(),
+        name: b"k",
+    };
+    for pk in [&[][..], &[3], &[1, 1]] {
+        let record = gnitz_wire::schema_block::encode(&[col; 3], pk);
+        assert!(
+            gnitz_wire::schema_block::decode(&record).is_ok(),
+            "{pk:?}: the record itself is well-formed"
+        );
+        assert!(decode_schema_block(&record).is_err(), "{pk:?}");
     }
 }

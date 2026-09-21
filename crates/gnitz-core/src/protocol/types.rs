@@ -1,4 +1,5 @@
 use super::error::ProtocolError;
+use gnitz_expr::{ColumnTable, SchemaFacts};
 
 pub use gnitz_wire::{ColType, FixedInt, PkBuf, ReduceOutKey, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
@@ -155,19 +156,6 @@ impl Schema {
         self.pk_cols.len()
     }
 
-    /// On-wire PK region stride: sum of each PK column's `wire_stride()`,
-    /// tightly packed (no inter-column padding), mirroring the engine
-    /// `SchemaDescriptor` layout. For a single-PK schema this equals the lone
-    /// PK column's `wire_stride()`, so the PK region is byte-for-byte
-    /// unchanged.
-    #[inline]
-    pub fn pk_stride(&self) -> usize {
-        self.pk_cols
-            .iter()
-            .map(|&ci| self.columns[ci as usize].type_code.wire_stride())
-            .sum()
-    }
-
     /// The lone PK column's index, or `None` for a compound key. Total, so a
     /// caller cannot reach the first of several PK columns by mistake.
     #[inline]
@@ -178,43 +166,14 @@ impl Schema {
         }
     }
 
-    /// Number of non-PK ("payload") columns: `columns.len() - pk_count`.
-    #[inline]
-    pub fn num_payload_cols(&self) -> usize {
-        self.num_columns() - self.pk_cols.len()
-    }
-
-    /// True iff column `ci` is a PK column. Total: every PK index is in range,
-    /// so an out-of-range `ci` matches none of them.
-    #[inline]
-    pub fn is_pk_col(&self, ci: usize) -> bool {
-        // Widen the stored index rather than narrowing `ci`: `ci as u32` would
-        // truncate a large index onto a real PK column.
-        self.pk_cols.iter().any(|&p| p as usize == ci)
-    }
-
-    /// Per-PK-column `(wire_stride, type_code)` in compound-key order, for the
-    /// OPK encode/decode column walk. Collect once and reuse across rows so the
-    /// per-row loop never re-iterates the schema.
-    #[inline]
-    pub fn pk_col_codes(&self) -> impl Iterator<Item = (usize, u8)> + '_ {
-        self.pk_cols.iter().map(move |&ci| {
-            let tc = self.columns[ci as usize].type_code;
-            (tc.wire_stride(), tc as u8)
-        })
-    }
-
-    /// Iterate over the non-PK ("payload") columns.
-    ///
-    /// Yields `(payload_idx, col_idx, &ColumnDef)`. The enumerated index is
-    /// the dense payload index (null-bitmap bit position).
+    /// The non-PK ("payload") columns as `(payload slot, col_idx, &ColumnDef)`,
+    /// in slot order.
     #[inline]
     pub fn payload_columns(&self) -> impl Iterator<Item = (usize, usize, &ColumnDef)> {
-        let n = self.num_columns();
-        (0..n)
-            .filter(move |ci| !self.is_pk_col(*ci))
+        self.columns
+            .iter()
             .enumerate()
-            .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
+            .filter_map(|(ci, c)| Some((self.payload_slot(ci)?, ci, c)))
     }
 
     /// Iterate over the *visible* (non-hidden) columns, yielding
@@ -249,10 +208,7 @@ impl Schema {
     /// derives the same), and `group` in output-key order: sharding by it lands
     /// each output row on the worker owning its PK.
     pub fn reduce_key(&self, group: &[u32]) -> (ReduceOutKey, Vec<u32>) {
-        let key = ReduceOutKey::for_group_cols(&self.pk_cols, group, |c| {
-            let cd = &self.columns[c as usize];
-            (cd.type_code as u8, cd.is_nullable)
-        });
+        let key = self.reduce_out_key(group);
         (key, key.key_region(&self.pk_cols, group).unwrap_or(group).to_vec())
     }
 
@@ -276,9 +232,10 @@ impl Schema {
                 columns.len()
             ));
         }
-        if let Some(cd) = columns.iter().find(|cd| {
-            cd.scale > gnitz_wire::decimal::MAX_DECIMAL_SCALE || (cd.scale != 0 && cd.type_code != TypeCode::Decimal)
-        }) {
+        if let Some(cd) = columns
+            .iter()
+            .find(|cd| !gnitz_wire::decimal::scale_admissible(cd.type_code as u8, cd.scale))
+        {
             return Err(format!(
                 "column '{}' ({:?}) carries scale {}",
                 cd.name, cd.type_code, cd.scale
@@ -316,7 +273,7 @@ impl Schema {
     }
 }
 
-impl gnitz_expr::SchemaFacts for Schema {
+impl ColumnTable for Schema {
     fn pk_cols(&self) -> &[u32] {
         &self.pk_cols
     }
@@ -332,36 +289,6 @@ impl gnitz_expr::SchemaFacts for Schema {
     fn col_nullable(&self, ci: usize) -> bool {
         self.columns[ci].is_nullable
     }
-}
-
-/// One row's PK as OPK bytes, from the PK columns' native values in PK-list
-/// order — the one native→OPK column walk on the client, and the same bytes a
-/// [`PkColumn`] row holds. Crossing into the wire's *native* key space is named:
-/// this in, [`native_le_key`] out.
-pub fn opk_key_cols(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> PkBuf {
-    let key = gnitz_wire::encode_pk_natives(schema.pk_col_codes().map(|(_, tc)| (tc, tc)), natives);
-    debug_assert_eq!(key.width(), schema.pk_stride(), "opk_key_cols: one value per PK column");
-    key
-}
-
-/// [`opk_key_cols`] for a key already packed as its columns' native
-/// little-endian bytes.
-pub fn opk_key_native_bytes(schema: &Schema, native_le: &[u8]) -> PkBuf {
-    gnitz_wire::encode_pk_tuple(schema.pk_col_codes(), native_le)
-}
-
-/// `key`, one row of OPK bytes, in the wire's native key space: its columns
-/// decoded back to their native little-endian images, at the same offsets. The
-/// inverse of [`opk_key_cols`]; valid bytes are `0..key.len()`.
-pub fn native_le_key(schema: &Schema, key: &[u8]) -> [u8; MAX_PK_BYTES] {
-    let mut buf = [0u8; MAX_PK_BYTES];
-    let mut off = 0;
-    for (w, tc) in schema.pk_col_codes() {
-        gnitz_wire::decode_pk_column(&key[off..off + w], tc, &mut buf[off..off + w]);
-        off += w;
-    }
-    debug_assert_eq!(off, key.len(), "native_le_key: schema stride != key width");
-    buf
 }
 
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
@@ -429,7 +356,7 @@ impl PkColumn {
             "PkColumn::get: a {}-byte key has no scalar form",
             opk.len(),
         );
-        let native = native_le_key(schema, opk);
+        let native = schema.native_le_key(opk);
         u128::from_le_bytes(native[..gnitz_wire::NARROW_PK_MAX_BYTES].try_into().unwrap())
     }
 
@@ -457,12 +384,12 @@ impl PkColumn {
     /// Append one row given as its `stride` native little-endian column bytes.
     pub fn push_bytes(&mut self, schema: &Schema, native_le: &[u8]) {
         debug_assert_eq!(native_le.len(), self.width());
-        self.push_region_bytes(opk_key_native_bytes(schema, native_le).pk_bytes());
+        self.push_region_bytes(schema.opk_key(native_le).pk_bytes());
     }
 
     /// Append one row from the PK columns' native values in PK-list order.
     pub fn push_natives(&mut self, schema: &Schema, natives: &[u128]) {
-        self.push_region_bytes(opk_key_cols(schema, natives.iter().copied()).pk_bytes());
+        self.push_region_bytes(schema.opk_key_cols(natives).pk_bytes());
     }
 
     /// Append whole OPK rows verbatim — `opk` is a multiple of `stride` bytes
@@ -893,22 +820,13 @@ impl ZSetBatch {
 /// No row sets a null bit on a NOT NULL payload column of `schema`, whose declaration
 /// every reader past the decoder trusts.
 pub(crate) fn check_not_null(nulls: &[u64], schema: &Schema) -> Result<(), String> {
-    let not_null_mask = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
-    if nulls.iter().fold(0u64, |a, &w| a | w) & not_null_mask == 0 {
-        return Ok(());
+    match gnitz_wire::first_not_null_violation(schema.not_null_payload_slots(), gnitz_wire::as_le_bytes(nulls)) {
+        None => Ok(()),
+        Some((row, slot)) => Err(format!(
+            "row {row} sets a null bit on NOT NULL column '{}'",
+            schema.columns[schema.payload_col_idx(slot)].name
+        )),
     }
-    let (row, offending) = nulls
-        .iter()
-        .enumerate()
-        .map(|(row, &w)| (row, w & not_null_mask))
-        .find(|&(_, o)| o != 0)
-        .expect("the fold found a NOT NULL bit set");
-    let pi = offending.trailing_zeros() as usize;
-    let name = schema
-        .payload_columns()
-        .find(|(p, _, _)| *p == pi)
-        .map_or("?", |(_, _, c)| c.name.as_str());
-    Err(format!("row {row} sets a null bit on NOT NULL column '{name}'"))
 }
 
 /// A [`ZSetBatch`]'s extent at one moment, taken by [`ZSetBatch::mark`].

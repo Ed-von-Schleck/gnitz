@@ -24,7 +24,7 @@ fn row_value(ev: &Evaluator, mb: &dyn BatchView, row: usize) -> Option<i64> {
 // ci5 BLOB   payload slot 3, nullable
 // ci6 U128   payload slot 4, non-nullable
 //
-// A naive `payload_col_idx` (the identity) and a column-order OPK
+// A `ci - 1` slot rule and a column-order OPK
 // derivation both pass on a PK-at-column-0 schema and fail here.
 
 const PK3: [i64; 3] = [-5, 100, 1i64 << 40];

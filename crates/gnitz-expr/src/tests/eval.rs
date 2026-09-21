@@ -12,7 +12,7 @@ use crate::test_support::{
     passing_ranges, passing_rows, push_payload_cols, row_value, scalar_prog, schema_pk_ints, schema_pk_strings,
     set_row_pk, FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, NullPerm};
+use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, NullPerm, SchemaFacts};
 
 /// True iff `ev`'s predicate passes for `row`, read back as a value. `ev` must be
 /// the *scalar* resolution: `eval_all` refuses a filter-resolved evaluator.

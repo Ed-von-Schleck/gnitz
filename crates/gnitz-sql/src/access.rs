@@ -6,6 +6,7 @@
 use crate::codec::pk_codec::{bound_key_literal, col_key_literal, BoundLit, KeyLitError};
 use crate::ir::{BExpr, BinOp, BoundExpr};
 use gnitz_core::{Cut, IndexMeta, RangeDescriptor, Schema, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::{key_image, IndexBound, PkKeys, ReadBound};
 use std::cmp::Reverse;
 
@@ -57,7 +58,7 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
             return None;
         };
         // Only a PK key set consumes a list; an index bound is one interval.
-        if !schema.pk_cols.contains(&(*col as u32)) {
+        if !schema.is_pk_col(*col) {
             return None;
         }
         let c = &schema.columns[*col];

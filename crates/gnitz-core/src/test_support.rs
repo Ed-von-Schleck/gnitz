@@ -3,6 +3,7 @@
 //! because the suites that read them are spread over three directories — a
 //! `tests` module is private to its parent, so none of them can host the rest.
 
+use gnitz_expr::SchemaFacts;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::protocol::transport::{frame_len_prefix, ClientTransport};

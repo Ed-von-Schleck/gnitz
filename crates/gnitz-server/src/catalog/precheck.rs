@@ -59,10 +59,10 @@ fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), Stri
     if let Some(cd) = col_defs.iter().find(|cd| !gnitz_wire::is_valid_type_code(cd.type_code)) {
         return Err(format!("column '{}' has invalid type code {}", cd.name, cd.type_code));
     }
-    if let Some(cd) = col_defs.iter().find(|cd| {
-        cd.scale > gnitz_wire::decimal::MAX_DECIMAL_SCALE
-            || (cd.scale != 0 && cd.type_code != gnitz_wire::type_code::DECIMAL)
-    }) {
+    if let Some(cd) = col_defs
+        .iter()
+        .find(|cd| !gnitz_wire::decimal::scale_admissible(cd.type_code, cd.scale))
+    {
         return Err(format!(
             "column '{}' has type code {} and cannot carry scale {}",
             cd.name, cd.type_code, cd.scale
@@ -171,7 +171,7 @@ fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
 /// `mask` (bit `pi` exempts payload column `pi`). NULL equals NULL, and
 /// STRING/BLOB compare by content through each side's own blob heap.
 fn payload_differs(
-    schema: &dyn SchemaFacts,
+    schema: &SchemaDescriptor,
     mask: u64,
     a: &impl RowSource,
     ra: usize,

@@ -1,6 +1,7 @@
 //! Storage-level reads and retractions over the system tables.
 
 use super::*;
+use gnitz_expr::SchemaFacts;
 
 // ---------------------------------------------------------------------------
 // Copy/retract helpers
@@ -8,7 +9,7 @@ use super::*;
 
 /// The OPK image of a **single-column** native system-table PK: a U64 id.
 fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> gnitz_store::schema::key::PkBuf {
-    gnitz_store::schema::key::opk_key_cols(schema, &[pk])
+    schema.opk_key_cols(&[pk])
 }
 
 impl CatalogEngine {

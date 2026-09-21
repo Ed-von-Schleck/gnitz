@@ -202,7 +202,7 @@ pub(crate) fn classify_set_rhs(
     let src = expr.infer_ty(&schema.columns);
     if let BoundExpr::ColRef(c) = expr {
         if let (true, Some(slot)) = (src == ty, schema.payload_slot(*c)) {
-            return Ok(SetRhs::Copy { scope, src: slot as usize });
+            return Ok(SetRhs::Copy { scope, src: slot });
         }
     }
     // A DECIMAL source into a non-DECIMAL target casts to I64, not the target, so
@@ -287,7 +287,7 @@ pub(crate) fn apply_set(
     let mut nulls = rows.nulls.clone();
     for a in set {
         let def = &schema.columns[a.ci];
-        let pi = schema.payload_slot(a.ci).expect("a SET target is a payload column") as usize;
+        let pi = schema.payload_slot(a.ci).expect("a SET target is a payload column");
         let tc = def.type_code;
         let scoped = |s: Scope| match s {
             Scope::Existing => &rows,

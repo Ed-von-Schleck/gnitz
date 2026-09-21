@@ -1,6 +1,7 @@
 use super::*;
 use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::test_support::payload_of;
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::wal::{body_start, dir_entry_offset, WAL_OFF_NUM_REGIONS, WAL_OFF_VERSION};
 
 /// Region `region_idx`'s `(offset, size)`, walking the size-only directory the

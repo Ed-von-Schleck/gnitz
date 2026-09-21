@@ -1632,7 +1632,7 @@ impl LogicalProgram {
         let n = in_schema.num_columns();
         n == out_schema.num_columns()
             && (0..n).all(|ci| in_schema.locate(ci) == out_schema.locate(ci))
-            && self.sequential_copy_base() == Some(n - in_schema.num_payload_cols())
+            && self.sequential_copy_base() == Some(in_schema.pk_cols().len())
     }
 
     /// Lower to the resolved form under one [`Role`], running the one-shot
@@ -1653,10 +1653,9 @@ impl LogicalProgram {
         // `check_col`'s `ColKind::payload_only` rule rejects a PK column for
         // every opcode resolved through here, and the constructors run the
         // schema pass before resolving.
-        let payload_slot = |ci: usize| {
-            schema
-                .payload_slot(ci)
-                .expect("validate pinned this operand to a payload column")
+        let payload_slot = |ci: usize| match schema.locate(ci) {
+            ColumnLocator::Payload { slot, .. } => slot,
+            ColumnLocator::Pk { .. } => unreachable!("validate pinned this operand to a payload column"),
         };
         let mut instrs = Vec::with_capacity(self.instrs.len());
         // Decoded `IntInSet` pools, indexed by the resolved `set_idx`. Decoded
@@ -2532,7 +2531,7 @@ fn check_copy_types(
     out: u32,
 ) -> Result<(), ExprValidateErr> {
     let src_tc = in_schema.col_type_code(src_col as usize);
-    let out_tc = out_schema.col_type_code(out_schema.payload_col_idx(out as usize));
+    let out_tc = slot_type_code(out_schema, out);
     let ok = src_tc == out_tc || gnitz_wire::is_widening_promotion(src_tc, out_tc);
     if ok {
         Ok(())
@@ -2577,10 +2576,7 @@ fn check_emit_slot(
     Ok(())
 }
 
-/// The type code of output payload slot `out`. `col_type_code`, like the emit
-/// and copy checks — not `locate`, whose extra work (a release-active bound
-/// assert, plus an O(pk_count) OPK-offset walk for a PK column) buys nothing
-/// here: `size()` IS `wire_stride(type_code)`.
+/// The type code of output payload slot `out`.
 fn slot_type_code(os: &dyn SchemaFacts, out: u32) -> u8 {
     os.col_type_code(os.payload_col_idx(out as usize))
 }
@@ -2863,8 +2859,6 @@ fn u64_verdict(rule: U64Rule, ops: &Operands, schema: &dyn SchemaFacts, so_far: 
             .iter()
             .flatten()
             .any(|&(reg, read)| read == ReadAs::Value && (so_far >> reg.0) & 1 != 0),
-        // `col_type_code` and `locate(..).type_code()` are held equal by
-        // `assert_schema_facts_matrix`, so this is the locator's own code.
         U64Rule::FromColType => ops
             .cols
             .iter()

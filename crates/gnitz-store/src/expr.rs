@@ -13,7 +13,7 @@
 use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
 use crate::schema::key::{locate_key_col, ReindexPacker};
-use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor};
+use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, SchemaFacts};
 use crate::storage::Batch;
 use gnitz_wire::RowHasher;
 
@@ -386,7 +386,7 @@ impl MapPlan {
                 // A *payload* column, not merely an in-range one: `project_schema`
                 // skips a PK index while `copy_cols` still numbers a sink for it.
                 for &c in cols {
-                    if in_schema.try_payload_idx(c as usize).is_none() {
+                    if in_schema.payload_slot(c as usize).is_none() {
                         return Err(OpBuildErr::shape(format!(
                             "projection map: column {c} is not a payload column of a {}-column schema",
                             in_schema.num_columns()
@@ -441,7 +441,10 @@ impl MapPlan {
             .iter()
             .any(|c| gnitz_wire::is_german_string(c.0.type_code()));
         // A copy's source locator is exactly what `locate` gives for its column.
-        let is_copied = |ci| ev.copies().iter().any(|c| c.0 == in_schema.locate(ci));
+        let is_copied = |ci| {
+            let loc = in_schema.locate(ci);
+            ev.copies().iter().any(|c| c.0 == loc)
+        };
         let keeps_every_string = in_schema.has_german_string()
             && (0..in_schema.num_columns())
                 .filter(|&ci| gnitz_wire::is_german_string(in_schema.columns[ci].type_code))

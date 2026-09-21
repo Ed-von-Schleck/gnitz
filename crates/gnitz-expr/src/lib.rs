@@ -19,8 +19,9 @@
 //! one), its resolution against a schema, and
 //! the morsel-oriented vectorized kernels that evaluate the resolved form — plus
 //! the two contracts they read through, [`ColumnLocator`] / [`RowSource`] /
-//! [`BatchView`] for *where a value physically sits* and [`SchemaFacts`] for
-//! *what the schema says about it*.
+//! [`BatchView`] for *where a value physically sits* and [`ColumnTable`] /
+//! [`SchemaFacts`] for *what the schema says about it* — the column table an
+//! implementor writes, and everything derived from it.
 //!
 //! `LogicalInstr::to_wire` and `LogicalProgram::decode_instr` are two tables over
 //! [`ExprOp`]; the vocabulary, both tables and the blob framing that carries

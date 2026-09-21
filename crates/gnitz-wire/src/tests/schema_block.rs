@@ -77,47 +77,16 @@ fn a_five_column_pk_decodes_to_five_indices() {
     assert_eq!(decode(&record).unwrap().pk_indices(), pk.as_slice());
 }
 
-/// The four arity and index rules, which together make `pk_indices()` total.
+/// The one PK rule decode keeps: the arity bound on its own `pk_indices` array.
 #[test]
-fn each_arity_and_index_rule_rejects_its_own_record() {
-    let three = [
-        col(TypeCode::U64, "a", false),
-        col(TypeCode::U64, "b", false),
-        col(TypeCode::U64, "c", false),
-    ];
-
-    assert_eq!(
-        decode_err(&encode(&three, &[])),
-        format!("schema record: pk column count 0 out of range 1..={MAX_PK_COLUMNS}")
-    );
-
+fn a_pk_wider_than_max_pk_columns_is_refused() {
     let wide_pk: Vec<u32> = (0..=MAX_PK_COLUMNS as u32).collect();
     assert_eq!(
         decode_err(&encode(&all_key_cols(MAX_PK_COLUMNS + 1), &wide_pk)),
         format!(
-            "schema record: pk column count {} out of range 1..={MAX_PK_COLUMNS}",
+            "schema record: pk column count {} exceeds {MAX_PK_COLUMNS}",
             MAX_PK_COLUMNS + 1
         )
-    );
-
-    assert_eq!(
-        decode_err(&encode(&three, &[3])),
-        "schema record: pk index 3 names no column"
-    );
-    assert_eq!(
-        decode_err(&encode(&three, &[1, 1])),
-        "schema record: pk names column 1 twice"
-    );
-}
-
-/// `encode` is total: an index no column can have is written straight through,
-/// and refused at the decode.
-#[test]
-fn an_out_of_range_pk_index_encodes_without_panicking() {
-    let cols = [col(TypeCode::U64, "a", false), col(TypeCode::U64, "b", false)];
-    assert_eq!(
-        decode_err(&encode(&cols, &[200])),
-        "schema record: pk index 200 names no column"
     );
 }
 

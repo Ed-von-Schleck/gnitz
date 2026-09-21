@@ -21,8 +21,8 @@ use gnitz_expr::RowSource;
 use gnitz_wire::{Cut, RangeDescriptor, RowHasher, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{
-    type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES,
-    MAX_PK_COLUMNS,
+    type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts,
+    MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
 
 // ---------------------------------------------------------------------------
@@ -109,48 +109,6 @@ pub(crate) fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) ->
 // Order-preserving PK encoder
 // ---------------------------------------------------------------------------
 
-/// OPK-encode a PK from its **native LE** bytes, returning it as a `pk_stride`-
-/// wide [`PkBuf`]. `native_le` must hold at least `pk_stride` bytes (in pk-list
-/// column order); any trailing bytes are ignored. This is the single native→OPK
-/// encoder for **every** PK width — a caller holding a narrow value passes
-/// `&value.to_le_bytes()`; the seek path goes through [`seek_opk_bytes`].
-///
-/// The schema-typed face of [`gnitz_wire::encode_pk_tuple`], fed
-/// `schema.pk_columns()`, so a non-identity `pk_indices` (e.g. `[1, 0]`) encodes
-/// in pk-list order — which is the order the resulting bytes are compared in.
-///
-/// The encoding is **injective**: `encode(a) == encode(b)` iff `a == b`
-/// byte-for-byte, because each column's transform is a bijection on its byte
-/// range. Consolidation grouping relies on this — an OPK equality test is
-/// exactly a PK-byte equality test.
-#[inline]
-pub fn opk_key(schema: &SchemaDescriptor, native_le: &[u8]) -> PkBuf {
-    let stride = schema.pk_stride();
-    debug_assert!(
-        native_le.len() >= stride,
-        "opk_key: native_le ({}) shorter than pk_stride ({stride})",
-        native_le.len(),
-    );
-    gnitz_wire::encode_pk_tuple(
-        schema.pk_columns().map(|(_, c)| (c.size() as usize, c.type_code)),
-        &native_le[..stride],
-    )
-}
-
-/// [`opk_key`] from one native value per PK column, in PK-list order — prefer it
-/// wherever the columns are held separately.
-pub fn opk_key_cols(schema: &SchemaDescriptor, natives: &[u128]) -> PkBuf {
-    debug_assert_eq!(
-        natives.len(),
-        schema.pk_indices().len(),
-        "opk_key_cols: one native value per PK column",
-    );
-    gnitz_wire::encode_pk_natives(
-        schema.pk_columns().map(|(_, c)| (c.type_code, c.type_code)),
-        natives.iter().copied(),
-    )
-}
-
 /// A wire seek key (packed native-LE PK columns) as the OPK a PK region holds. Only
 /// the PK's own stride is read, so a scalar key may arrive as a 16-byte word.
 pub fn seek_opk_bytes(schema: &SchemaDescriptor, key: &[u8]) -> Result<PkBuf, String> {
@@ -158,7 +116,7 @@ pub fn seek_opk_bytes(schema: &SchemaDescriptor, key: &[u8]) -> Result<PkBuf, St
     let key = key
         .get(..stride)
         .ok_or_else(|| format!("key of {} bytes is shorter than the {stride}-byte PK", key.len()))?;
-    Ok(opk_key(schema, key))
+    Ok(schema.opk_key(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -242,8 +200,8 @@ pub(crate) fn leading_u64(pk_bytes: &[u8]) -> u64 {
 /// The `stride` OPK bytes of a narrow PK value that is **already in OPK/route
 /// space** — the widened image `widen_pk_be` produces, sign-flipped for a signed
 /// key. Right-aligning it big-endian reproduces the key's OPK region at any
-/// width. A *native* value must be encoded through [`opk_key`] instead, which
-/// applies the per-column sign flip this does not.
+/// width. A *native* value must be encoded through [`SchemaFacts::opk_key`]
+/// instead, which applies the per-column sign flip this does not.
 ///
 /// The home for "right-align a `u128` into an OPK of width `stride`" wherever
 /// the stride is a runtime value — the batch PK setters and the reduce

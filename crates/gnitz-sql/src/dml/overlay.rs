@@ -15,6 +15,7 @@
 //!
 //! The map is **empty in autocommit**: `HashMap::new()` does not allocate.
 
+use gnitz_expr::SchemaFacts;
 use std::sync::Arc;
 
 use crate::codec::project_schema::key_reply;

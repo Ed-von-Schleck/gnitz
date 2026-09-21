@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
 use pyo3::Borrowed;
 
-use gnitz_core::{ColType, PkColumn, ScanReply, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColType, PkColumn, ScanReply, Schema, SchemaFacts, TypeCode, ZSetBatch};
 use gnitz_wire::decimal::{decimal_of_f64, parse_decimal, rescale};
 
 use crate::read::{scan_result, PyScanResult};

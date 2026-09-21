@@ -13,7 +13,7 @@
 //! permuted, non-adjacent compound PK whose OPK sign flip must survive.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{BatchAppender, GnitzClient, TableProps, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, SchemaFacts, TableProps, ZSetBatch};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};

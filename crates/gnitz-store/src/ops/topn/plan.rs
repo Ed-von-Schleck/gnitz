@@ -1,7 +1,7 @@
 //! `TopNPlan` — everything `op_topn` needs that is a pure function of
 //! compile-time facts, baked once at emit time.
 
-use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaBound, SchemaDescriptor};
+use crate::schema::{DerivedSchema, OpBuildErr, ReduceOutKey, SchemaBound, SchemaDescriptor, SchemaFacts};
 use gnitz_wire::{OrderKey, ReduceOutSlot};
 
 use super::super::group_key::{GroupOutKey, GROUP_PK_COL};

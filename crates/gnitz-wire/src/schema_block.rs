@@ -132,21 +132,12 @@ pub fn decode(buf: &[u8]) -> Result<SchemaBlock<'_>, String> {
         return Err(format!("{CTX}: column count {count} out of range 1..={MAX_COLUMNS}"));
     }
     let pk_count = r.u8()? as usize;
-    if pk_count == 0 || pk_count > MAX_PK_COLUMNS {
-        return Err(format!(
-            "{CTX}: pk column count {pk_count} out of range 1..={MAX_PK_COLUMNS}"
-        ));
+    if pk_count > MAX_PK_COLUMNS {
+        return Err(format!("{CTX}: pk column count {pk_count} exceeds {MAX_PK_COLUMNS}"));
     }
     let mut pk_indices = [0u32; MAX_PK_COLUMNS];
-    for k in 0..pk_count {
-        let ci = r.u8()? as u32;
-        if ci as usize >= count {
-            return Err(format!("{CTX}: pk index {ci} names no column"));
-        }
-        if pk_indices[..k].contains(&ci) {
-            return Err(format!("{CTX}: pk names column {ci} twice"));
-        }
-        pk_indices[k] = ci;
+    for slot in &mut pk_indices[..pk_count] {
+        *slot = r.u8()? as u32;
     }
 
     let rest = r.remaining();
@@ -172,7 +163,8 @@ impl<'a> SchemaBlock<'a> {
         (0..self.count).map(move |_| take_col(&mut r).expect("decode walked this section"))
     }
 
-    /// The PK column indices, in declared PK-tuple order. Never empty.
+    /// The PK column indices, in declared PK-tuple order, not yet checked
+    /// against the columns.
     #[inline]
     pub fn pk_indices(&self) -> &[u32] {
         &self.pk_indices[..self.pk_count]

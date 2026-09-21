@@ -18,7 +18,7 @@
 
 use proptest::prelude::*;
 
-use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_store::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout};
 use gnitz_wire::type_code;
 
@@ -248,7 +248,7 @@ pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) ->
 /// The oracle is `opk_key_cols` itself — the encoder the ingest path writes
 /// through — not a second spelling of it.
 pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
-    gnitz_store::schema::key::opk_key_cols(schema, vals).pk_bytes().to_vec()
+    schema.opk_key_cols(vals).pk_bytes().to_vec()
 }
 
 /// [`make_batch_raw`] over [`make_schema_u128_i64`]-shaped schemas — native

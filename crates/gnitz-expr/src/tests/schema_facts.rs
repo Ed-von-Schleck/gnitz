@@ -1,72 +1,142 @@
-//! The [`SchemaFacts`] consistency harness, and proof it is not vacuous.
+//! The one [`SchemaFacts`] derivation, checked against absolute answers.
 
 use crate::test_support::TestSchema;
-use crate::{assert_schema_facts_consistent, SchemaFacts};
+use crate::{ColumnLocator, ColumnTable, SchemaFacts};
 use gnitz_wire::type_code as tc;
 
-/// `PRIMARY KEY (c2, c0)`: PK-list order reverses column order.
-const TINY: [(u8, bool); 4] = [(tc::U32, false), (tc::F64, true), (tc::I64, false), (tc::STRING, false)];
-const TINY_PK: [usize; 2] = [2, 0];
+/// One case: a column table as `(type_code, nullable)`, and its PK list in
+/// PK-LIST order.
+type Case = (&'static [(u8, bool)], &'static [u32]);
 
-/// Which faithful answer [`Faulty`] corrupts. The two are the methods an
-/// implementor may write by hand rather than derive: `payload_col_idx` off a
-/// precomputed table, and the nullability masks off a precomputed field.
-enum Fault {
-    PayloadColIdxOffByOne,
-    NullableMaskDrifted,
-}
+const CASES: &[Case] = &[
+    // Single unsigned PK at column 0; U64/F64/STRING/U128 payload, one nullable.
+    (
+        &[
+            (tc::U64, false),
+            (tc::U64, false),
+            (tc::F64, true),
+            (tc::STRING, false),
+            (tc::U128, false),
+        ],
+        &[0],
+    ),
+    // Single signed PK NOT at column 0 — the payload slots renumber around it,
+    // so the `ci - 1` closed form does not hold.
+    (
+        &[(tc::STRING, true), (tc::I64, false), (tc::U64, false), (tc::F32, true)],
+        &[1],
+    ),
+    // Compound two-column PK (signed + unsigned, mixed widths).
+    (
+        &[(tc::I32, false), (tc::U16, false), (tc::F64, false), (tc::BLOB, true)],
+        &[0, 1],
+    ),
+    // PK-list order reverses column order, with a column in between: OPK
+    // offsets follow the PK list.
+    (
+        &[(tc::U32, false), (tc::STRING, true), (tc::F64, false), (tc::I64, false)],
+        &[3, 0],
+    ),
+    // Every fixed width 1/2/4/8 as a PK column, plus a 16-byte payload column.
+    (
+        &[
+            (tc::I8, false),
+            (tc::U16, false),
+            (tc::I32, false),
+            (tc::U64, false),
+            (tc::I128, true),
+            (tc::UUID, false),
+        ],
+        &[0, 1, 2, 3],
+    ),
+    // Every fixed width as a payload column, all nullable.
+    (
+        &[
+            (tc::U64, false),
+            (tc::U8, true),
+            (tc::I16, true),
+            (tc::U32, true),
+            (tc::I64, true),
+            (tc::U128, true),
+        ],
+        &[0],
+    ),
+    // PK-only: no payload columns at all.
+    (&[(tc::U32, false)], &[0]),
+];
 
-/// A faithful [`TestSchema`] with exactly one answer perturbed — the fault as
-/// data, so one set of forwarders serves every case.
-struct Faulty(TestSchema, Fault);
-
-impl SchemaFacts for Faulty {
-    fn pk_cols(&self) -> &[u32] {
-        self.0.pk_cols()
-    }
-    fn num_columns(&self) -> usize {
-        self.0.num_columns()
-    }
-    fn col_type_code(&self, ci: usize) -> u8 {
-        self.0.col_type_code(ci)
-    }
-    fn col_nullable(&self, ci: usize) -> bool {
-        self.0.col_nullable(ci)
-    }
-    fn payload_col_idx(&self, pi: usize) -> usize {
-        self.0.payload_col_idx(pi) + usize::from(matches!(self.1, Fault::PayloadColIdxOffByOne))
-    }
-    fn nullable_payload_slots(&self) -> u64 {
-        self.0.nullable_payload_slots() << u32::from(matches!(self.1, Fault::NullableMaskDrifted))
-    }
-}
-
-/// Run the harness over [`TestSchema`] — the fixture every kernel test in this
-/// crate resolves its programs against, so its payload slots and OPK offsets are
-/// what decide those tests' column addresses.
 #[test]
-fn schema_facts_harness_accepts_a_faithful_impl() {
-    crate::assert_schema_facts_matrix(TestSchema::new);
-}
+fn schema_facts_match_the_column_table() {
+    for &(cols, pk) in CASES {
+        let s = TestSchema::new(cols, pk);
+        let ctx = format!("cols {cols:?}, pk {pk:?}");
 
-/// The harness must not be vacuous: an off-by-one `payload_col_idx` — the
-/// forwarder-reimplementation failure mode that silently type-checks a column
-/// or register sink against a neighbouring output column — has to fail it.
-#[test]
-#[should_panic(expected = "payload_col_idx")]
-fn schema_facts_harness_rejects_an_off_by_one_payload_col_idx() {
-    assert_faulty(Fault::PayloadColIdxOffByOne);
-}
+        assert_eq!(s.pk_cols(), pk, "{ctx}: pk_cols()");
+        assert_eq!(s.num_columns(), cols.len(), "{ctx}: num_columns()");
+        assert_eq!(s.num_payload_cols(), cols.len() - pk.len(), "{ctx}: num_payload_cols()");
+        let want_stride: usize = pk.iter().map(|&p| gnitz_wire::wire_stride(cols[p as usize].0)).sum();
+        assert_eq!(s.pk_stride(), want_stride, "{ctx}: pk_stride()");
 
-/// The nullability masks decide which null bits a batch may carry, and an
-/// implementor is free to override them off a precomputed field — so the harness
-/// has to fail one that disagrees with the column table it was built from.
-#[test]
-#[should_panic(expected = "nullable_payload_slots")]
-fn schema_facts_harness_rejects_a_drifted_nullable_mask() {
-    assert_faulty(Fault::NullableMaskDrifted);
-}
+        // Expected OPK byte offset per PK column: the running sum in PK-list order.
+        let mut pk_off = vec![0usize; cols.len()];
+        let mut running = 0usize;
+        for &p in pk {
+            pk_off[p as usize] = running;
+            running += gnitz_wire::wire_stride(cols[p as usize].0);
+        }
 
-fn assert_faulty(fault: Fault) {
-    assert_schema_facts_consistent(&Faulty(TestSchema::new(&TINY, &TINY_PK), fault), &TINY, &TINY_PK);
+        // Expected payload slots: non-PK columns numbered left to right.
+        let (mut want_nullable, mut want_not_null) = (0u64, 0u64);
+        let mut next_slot = 0usize;
+        for (ci, &(want_tc, nullable)) in cols.iter().enumerate() {
+            let want_pk = pk.contains(&(ci as u32));
+            assert_eq!(s.is_pk_col(ci), want_pk, "{ctx}: is_pk_col({ci})");
+
+            let loc = s.locate(ci);
+            assert_eq!(loc.type_code(), want_tc, "{ctx}: locate({ci}).type_code()");
+            assert_eq!(
+                loc.size(),
+                gnitz_wire::wire_stride(want_tc),
+                "{ctx}: locate({ci}).size()"
+            );
+            match loc {
+                ColumnLocator::Pk { byte_off, .. } => {
+                    assert!(want_pk, "{ctx}: locate({ci}) is Pk for a payload column");
+                    assert_eq!(byte_off as usize, pk_off[ci], "{ctx}: locate({ci}) OPK byte offset");
+                    assert_eq!(s.payload_slot(ci), None, "{ctx}: payload_slot({ci})");
+                }
+                ColumnLocator::Payload { slot, .. } => {
+                    assert!(!want_pk, "{ctx}: locate({ci}) is Payload for a PK column");
+                    assert_eq!(slot as usize, next_slot, "{ctx}: locate({ci}) payload slot");
+                    assert_eq!(s.payload_slot(ci), Some(next_slot), "{ctx}: payload_slot({ci})");
+                    assert_eq!(s.payload_col_idx(next_slot), ci, "{ctx}: payload_col_idx({next_slot})");
+                    *if nullable {
+                        &mut want_nullable
+                    } else {
+                        &mut want_not_null
+                    } |= 1u64 << next_slot;
+                    next_slot += 1;
+                }
+            }
+        }
+
+        assert_eq!(s.try_locate(s.num_columns()), None, "{ctx}: try_locate(num_columns())");
+        // An index that truncates onto a PK column as a `u32` is still out of range.
+        assert!(!s.is_pk_col(pk[0] as usize + (1 << 32)), "{ctx}: is_pk_col past u32");
+        assert_eq!(
+            s.payload_slot(s.num_columns()),
+            None,
+            "{ctx}: payload_slot(num_columns())"
+        );
+        assert_eq!(
+            s.nullable_payload_slots(),
+            want_nullable,
+            "{ctx}: nullable_payload_slots()"
+        );
+        assert_eq!(
+            s.not_null_payload_slots(),
+            want_not_null,
+            "{ctx}: not_null_payload_slots()"
+        );
+    }
 }

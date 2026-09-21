@@ -13,6 +13,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineUniqueIndex, TableProps, TypeCode};
+use gnitz_expr::SchemaFacts;
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,

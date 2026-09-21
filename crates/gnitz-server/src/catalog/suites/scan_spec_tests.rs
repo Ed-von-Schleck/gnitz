@@ -7,6 +7,7 @@
 //! output-slot coverage.
 
 use super::*;
+use gnitz_expr::SchemaFacts;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
 use gnitz_wire::{Cut, OrderKey, PkKeys, RangeDescriptor, ReadBound, ReadSpec};
@@ -202,9 +203,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     }
 
     // The FK dereference gather and the `pk IN (…)` set gather.
-    let pks: Vec<_> = (0..N)
-        .map(|id| gnitz_store::schema::key::opk_key(&schema, &id.to_le_bytes()))
-        .collect();
+    let pks: Vec<_> = (0..N).map(|id| schema.opk_key(&id.to_le_bytes())).collect();
     let gathered = e
         .registry
         .gather_bytes(tid, pks.iter().flat_map(|p| p.pk_bytes()).copied().collect(), 1)

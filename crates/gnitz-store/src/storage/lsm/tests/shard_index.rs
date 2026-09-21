@@ -3,7 +3,7 @@ use super::super::naming;
 use super::super::shard_file;
 use super::*;
 use crate::schema::key::probe_key;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SchemaFacts};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_payload_schema};
 
 /// Test-only adapters: production budgets a store at construction and reads its
@@ -20,7 +20,7 @@ impl ShardIndex {
     /// Native-`u128` oracle over [`ShardIndex::find_pk_bytes`]: it OPK-encodes
     /// the value first. Wide PKs cannot fit a u128.
     fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
-        let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
+        let opk = self.schema.opk_key(&key.to_le_bytes());
         let filter_key = crate::schema::key::probe_key(opk.pk_bytes());
         self.find_pk_bytes(opk.pk_bytes(), filter_key, visitor);
     }

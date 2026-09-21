@@ -71,9 +71,9 @@ fn a_mixed_scalar_and_wide_bake_reads_both_ordinals_back() {
         delta.extend_pk(pk as u128);
         delta.extend_weight(&1i64.to_le_bytes());
         delta.extend_null_bmp(&0u64.to_le_bytes());
-        delta.extend_col(src.try_payload_idx(1).unwrap(), &g.to_le_bytes());
-        delta.extend_col(src.try_payload_idx(2).unwrap(), &a.to_le_bytes());
-        delta.extend_col(src.try_payload_idx(3).unwrap(), &b.to_le_bytes());
+        delta.extend_col(src.payload_slot(1).unwrap(), &g.to_le_bytes());
+        delta.extend_col(src.payload_slot(2).unwrap(), &a.to_le_bytes());
+        delta.extend_col(src.payload_slot(3).unwrap(), &b.to_le_bytes());
         delta.count += 1;
     }
 
@@ -105,7 +105,7 @@ fn one_group_delta(src: &SchemaDescriptor, n: u64, mut put: impl FnMut(&mut Batc
     let mut delta = Batch::with_capacity(src, n as usize);
     for pk in 0..n {
         delta.begin_row(&pk.to_be_bytes(), 1);
-        delta.extend_col(src.try_payload_idx(1).unwrap(), &7i32.to_le_bytes());
+        delta.extend_col(src.payload_slot(1).unwrap(), &7i32.to_le_bytes());
         put(&mut delta, pk);
         delta.commit_row(0);
     }
@@ -130,13 +130,13 @@ fn a_sixteen_byte_only_bake_keeps_its_image_in_the_key() {
     let plan = ReducePlan::from_wire(&src, &[1], &descs, false, false).unwrap();
     let schema = &plan.avi.as_ref().unwrap().schema;
     assert!(
-        (0..schema.num_columns()).all(|c| schema.try_payload_idx(c).is_none()),
+        (0..schema.num_columns()).all(|c| schema.payload_slot(c).is_none()),
         "no payload column"
     );
 
     let values = [3u128 << 100, (1 << 64) | 5, 1 << 64, u128::MAX];
     let delta = one_group_delta(&src, values.len() as u64, |b, pk| {
-        b.extend_col(src.try_payload_idx(2).unwrap(), &values[pk as usize].to_le_bytes());
+        b.extend_col(src.payload_slot(2).unwrap(), &values[pk as usize].to_le_bytes());
     });
     let accs = index_and_seed(&plan, &delta);
     assert_eq!(wide_value(&accs[0]), (1u128 << 64).to_le_bytes(), "MIN(v)");
@@ -165,8 +165,8 @@ fn a_sixteen_byte_and_string_bake_reads_both_ordinals_back() {
     let rows = [(9u128 << 70, 'b'), (4 << 70, 'z'), (6 << 70, 'm')];
     let delta = one_group_delta(&src, rows.len() as u64, |b, pk| {
         let (a, last) = rows[pk as usize];
-        b.extend_col(src.try_payload_idx(2).unwrap(), &a.to_le_bytes());
-        b.extend_col_blob(src.try_payload_idx(3).unwrap(), format!("{SLOT_WIDE}{last}").as_bytes());
+        b.extend_col(src.payload_slot(2).unwrap(), &a.to_le_bytes());
+        b.extend_col_blob(src.payload_slot(3).unwrap(), format!("{SLOT_WIDE}{last}").as_bytes());
     });
     let accs = index_and_seed(&plan, &delta);
     assert_eq!(wide_value(&accs[0]), (4u128 << 70).to_le_bytes(), "MIN(a)");

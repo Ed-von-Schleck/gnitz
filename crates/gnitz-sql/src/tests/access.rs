@@ -7,6 +7,7 @@ use crate::test_support::{
     neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
 };
 use gnitz_core::PkBuf;
+use gnitz_expr::SchemaFacts;
 use sqlparser::ast::Expr;
 
 /// Bind against `schema` as relation `t` — the alias every qualified reference
@@ -357,7 +358,7 @@ fn set_keys_of(conjuncts: &[BoundExpr], schema: &Schema) -> Option<Vec<u128>> {
 /// A gather's OPK keys decoded back to native values, in key order.
 fn natives(schema: &Schema, keys: &PkKeys) -> Vec<u128> {
     keys.iter()
-        .map(|k| u128::from_le_bytes(gnitz_core::native_le_key(schema, k)[..16].try_into().unwrap()))
+        .map(|k| u128::from_le_bytes(schema.native_le_key(k)[..16].try_into().unwrap()))
         .collect()
 }
 
@@ -489,7 +490,7 @@ fn one_key_in_list_names_the_pk_key() {
     let schema = compound_schema_u64_u64();
     let expr = bind_where("a IN (7) AND b = 3", &schema);
     let (pk, residual) = pk_point_of(&expr, &schema).expect("one-key IN names a key");
-    assert_eq!(pk, gnitz_core::opk_key_cols(&schema, [7, 3]).pk_bytes());
+    assert_eq!(pk, schema.opk_key_cols(&[7, 3]).pk_bytes());
     assert_eq!(residual, 0);
 }
 
@@ -518,11 +519,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     let row = vec![literal.clone(), num_expr("0")];
     let got_insert: PkBuf =
         extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-    assert_eq!(
-        got_insert,
-        gnitz_core::opk_key_cols(&schema, [expected]),
-        "extract_pk_value"
-    );
+    assert_eq!(got_insert, schema.opk_key_cols(&[expected]), "extract_pk_value");
 
     // 2. The equality term (bound WHERE pk = literal).
     let eq = bind1(&eq_expr("id", literal.clone()), &schema).expect("bind eq");

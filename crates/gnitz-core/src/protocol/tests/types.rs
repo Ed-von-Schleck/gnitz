@@ -1,20 +1,42 @@
 use super::*;
 
-/// `Schema` must answer the shared `SchemaFacts` shape matrix exactly. This
-/// is where an OPK byte offset or a payload-slot off-by-one would
-/// miscompute silently rather than error, and the harness is the only way to
-/// reach the trait methods — two of them collide by name with an inherent
-/// method Rust prefers in receiver-dot position.
+/// `Schema`'s `ColumnTable` answers are what it was built from.
 #[test]
-fn schema_conforms_to_schema_facts() {
-    gnitz_expr::assert_schema_facts_matrix(|cols, pk| {
+fn schema_column_table() {
+    use gnitz_expr::{ColumnTable, SchemaFacts};
+    use TypeCode as T;
+    // (columns as (type, nullable), pk list, not_null_payload_slots)
+    type Shape = (&'static [(TypeCode, bool)], &'static [u32], u64);
+    let shapes: &[Shape] = &[
+        (&[(T::U64, false), (T::I32, false), (T::String, true)], &[0], 0b01),
+        (&[(T::String, true), (T::U64, false), (T::F64, false)], &[1], 0b10),
+        (
+            &[(T::I32, false), (T::U64, false), (T::F64, true), (T::I32, false)],
+            &[0, 1],
+            0b10,
+        ),
+        (
+            &[(T::U64, false), (T::String, true), (T::F64, false), (T::I32, false)],
+            &[3, 0],
+            0b10,
+        ),
+        (&[(T::U64, false), (T::I32, false)], &[0, 1], 0),
+    ];
+    for &(cols, pk, not_null) in shapes {
         let columns: Vec<ColumnDef> = cols
             .iter()
             .enumerate()
-            .map(|(i, &(tc, nullable))| ColumnDef::new(format!("c{i}"), TypeCode::from_validated_u8(tc), nullable))
+            .map(|(i, &(tc, n))| ColumnDef::new(format!("c{i}"), tc, n))
             .collect();
-        Schema::from_parts(columns, pk.iter().map(|&c| c as u32).collect()).expect("client-valid schema")
-    });
+        let s = Schema::from_parts(columns, pk.to_vec()).expect("client-valid schema");
+        assert_eq!(ColumnTable::num_columns(&s), cols.len(), "{pk:?}");
+        assert_eq!(ColumnTable::pk_cols(&s), pk, "{pk:?}");
+        for (ci, &(tc, n)) in cols.iter().enumerate() {
+            assert_eq!(ColumnTable::col_type_code(&s, ci), tc as u8, "{pk:?}: col {ci}");
+            assert_eq!(ColumnTable::col_nullable(&s, ci), n, "{pk:?}: col {ci}");
+        }
+        assert_eq!(s.not_null_payload_slots(), not_null, "{pk:?}: not_null_payload_slots");
+    }
 }
 
 #[test]

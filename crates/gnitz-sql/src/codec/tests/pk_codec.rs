@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::{
     col_def, compound_schema_u64_u64, neg_num_expr, num_expr, pk_schema, uuid_schema_pk, uuid_str_expr,
 };
+use gnitz_expr::SchemaFacts;
 
 fn compound_schema_u64_u64_u128() -> Schema {
     Schema {
@@ -40,10 +41,7 @@ fn test_uuid_pk_string_literal_accepted() {
     let row = vec![uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")];
     let pk = extract_pk_value(&row, &schema).unwrap();
     // UUID PK has stride 16; decoding the key recovers the parsed u128.
-    assert_eq!(
-        pk,
-        gnitz_core::opk_key_cols(&schema, [0x550e8400_e29b_41d4_a716_446655440000_u128])
-    );
+    assert_eq!(pk, schema.opk_key_cols(&[0x550e8400_e29b_41d4_a716_446655440000_u128]));
 }
 
 #[test]
@@ -106,7 +104,7 @@ fn negative_zero_is_accepted_by_an_unsigned_wide_pk() {
         let schema = pk_schema(tc);
         let row = vec![neg_num_expr("0"), num_expr("0")];
         let pk = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("{tc:?}: {e}"));
-        assert_eq!(pk, gnitz_core::opk_key_cols(&schema, [0]), "{tc:?}");
+        assert_eq!(pk, schema.opk_key_cols(&[0]), "{tc:?}");
     }
 }
 

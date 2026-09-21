@@ -30,6 +30,7 @@ use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{ColumnDef, ReduceOutKey, RelDescriptor, Schema};
+use gnitz_expr::SchemaFacts;
 use gnitz_wire::{AggDescriptor, ReduceOutSlot};
 use spine::SourceOrigin;
 use std::collections::{HashMap, HashSet};

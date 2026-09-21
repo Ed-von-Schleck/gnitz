@@ -10,8 +10,8 @@
 use gnitz_wire::type_code as tc;
 
 use crate::{
-    BatchView, ColumnLocator, Evaluator, ExprResults, LogicalInstr, LogicalProgram, Output, Reg, RowSource,
-    SchemaFacts, Sink,
+    BatchView, ColumnLocator, ColumnTable, Evaluator, ExprResults, LogicalInstr, LogicalProgram, Output, Reg,
+    RowSource, SchemaFacts, Sink,
 };
 
 /// A [`BatchView`] over owned buffers, laid out region-wise like the physical
@@ -114,44 +114,29 @@ impl BatchView for TestView {
     }
 }
 
-/// A [`SchemaFacts`] over a `(type_code, nullable)` column table and a PK list.
+/// A [`ColumnTable`] over a `(type_code, nullable)` column table and a PK list.
 /// Type codes are reported verbatim, undecodable ones included.
 pub struct TestSchema {
     cols: Vec<(u8, bool)>,
     pk: Vec<u32>,
-    payload_to_ci: Vec<usize>,
-    pk_stride: usize,
 }
 
 impl TestSchema {
-    pub fn new(cols: &[(u8, bool)], pk: &[usize]) -> Self {
-        TestSchema {
-            cols: cols.to_vec(),
-            pk: pk.iter().map(|&ci| ci as u32).collect(),
-            payload_to_ci: (0..cols.len()).filter(|ci| !pk.contains(ci)).collect(),
-            pk_stride: pk.iter().map(|&ci| gnitz_wire::wire_stride(cols[ci].0)).sum(),
-        }
+    pub fn new(cols: &[(u8, bool)], pk: &[u32]) -> Self {
+        TestSchema { cols: cols.to_vec(), pk: pk.to_vec() }
     }
 
     /// As [`TestSchema::new`], with the PK at `pk_index` and every other column
     /// of `col_types` a nullable payload.
     pub fn with_pk_at(pk_index: usize, col_types: &[u8]) -> Self {
         let cols: Vec<(u8, bool)> = col_types.iter().enumerate().map(|(i, &t)| (t, i != pk_index)).collect();
-        TestSchema::new(&cols, &[pk_index])
-    }
-
-    /// Total encoded PK width — the PK region's per-row stride.
-    pub fn pk_stride(&self) -> usize {
-        self.pk_stride
+        TestSchema::new(&cols, &[pk_index as u32])
     }
 }
 
-impl SchemaFacts for TestSchema {
+impl ColumnTable for TestSchema {
     fn pk_cols(&self) -> &[u32] {
         &self.pk
-    }
-    fn payload_col_idx(&self, pi: usize) -> usize {
-        self.payload_to_ci[pi]
     }
     fn num_columns(&self) -> usize {
         self.cols.len()

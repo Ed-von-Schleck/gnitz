@@ -71,6 +71,9 @@ pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 /// `SchemaDescriptor::locate` produces one.
 pub(crate) use gnitz_expr::ColumnLocator;
 
+/// Re-exported so a crate linking `gnitz-store` alone can name them.
+pub use gnitz_expr::{ColumnTable, SchemaFacts};
+
 /// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
 /// (whole PK, seek wire pair, index leading span), compare/pack, and the
 /// re-export of the width-tagged `PkBuf` those encoders return. Sits below both
@@ -382,20 +385,10 @@ const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 360);
 
 const fn compute_payload_to_ci(num_columns: usize, pk_indices: &[u32]) -> [u8; MAX_COLUMNS] {
     let mut payload_to_ci = [0u8; MAX_COLUMNS];
-    let mut pi: u8 = 0;
-    let mut ci: usize = 0;
+    let mut ci = 0;
     while ci < num_columns {
-        let mut is_pk = false;
-        let mut k = 0;
-        while k < pk_indices.len() {
-            if pk_indices[k] as usize == ci {
-                is_pk = true;
-            }
-            k += 1;
-        }
-        if !is_pk {
-            payload_to_ci[pi as usize] = ci as u8;
-            pi += 1;
+        if let Some(pi) = gnitz_wire::payload_slot(pk_indices, ci) {
+            payload_to_ci[pi] = ci as u8;
         }
         ci += 1;
     }
@@ -700,19 +693,6 @@ impl SchemaDescriptor {
         self.has_german_string
     }
 
-    /// Dense payload slot (batch payload region + null-bitmap bit position) for
-    /// `col_idx`, or `None` when it names no payload column of this schema —
-    /// a PK column, or out of range. Total, so it doubles as the "is this a real
-    /// payload column" test. Derived from [`Self::locate`], so "count the PK
-    /// columns below `col_idx`" has one implementation.
-    #[inline]
-    pub(crate) fn try_payload_idx(&self, col_idx: usize) -> Option<usize> {
-        match self.try_locate(col_idx)? {
-            ColumnLocator::Payload { slot, .. } => Some(slot as usize),
-            ColumnLocator::Pk { .. } => None,
-        }
-    }
-
     /// The column at `ci`, or `None` when it is out of range. The bounded read
     /// for a client-supplied index: `columns[ci]` and `columns.get(ci)` both
     /// answer for the `[num_columns, MAX_COLUMNS)` slots, which hold
@@ -734,31 +714,12 @@ impl SchemaDescriptor {
         Ok(())
     }
 
-    /// Where column `ci` lives, or `None` when it is out of range — the total
-    /// [`Self::locate`], whose own bound is a release-active panic.
-    #[inline]
-    pub(crate) fn try_locate(&self, ci: usize) -> Option<ColumnLocator> {
-        (ci < self.num_columns()).then(|| self.locate(ci))
-    }
-
-    /// True iff column `ci` is a PK column. Total: every PK index is in range,
-    /// so an out-of-range `ci` matches none of them. [`Self::locate`] is the
-    /// partial one — it resolves a column and requires it to exist.
-    #[inline]
-    pub fn is_pk_col(&self, ci: usize) -> bool {
-        // Widen the stored index rather than narrowing `ci`: `ci as u32` would
-        // truncate a large index onto a real PK column.
-        self.pk_indices().iter().any(|&p| p as usize == ci)
-    }
-
     /// True iff column `ci` is this schema's *only* PK column — the shape an
     /// FK target must have for the parent probe to read the referenced value
-    /// straight out of the packed PK region. Same widen-don't-narrow contract as
-    /// [`Self::is_pk_col`].
+    /// straight out of the packed PK region.
     #[inline]
     pub fn is_lone_pk_col(&self, ci: usize) -> bool {
-        let pk = self.pk_indices();
-        pk.len() == 1 && pk[0] as usize == ci
+        self.pk_indices().len() == 1 && self.is_pk_col(ci)
     }
 
     /// True when `cols` holds every PK column. The span such a list encodes is
@@ -768,35 +729,23 @@ impl SchemaDescriptor {
         self.pk_indices().iter().all(|p| cols.contains(p))
     }
 
-    /// Inverse of `try_payload_idx`: dense payload slot → logical column index.
+    /// [`SchemaFacts::payload_col_idx`], from a table filled at construction.
     #[inline]
-    pub(crate) fn payload_col_idx(&self, pi: usize) -> usize {
+    pub fn payload_col_idx(&self, pi: usize) -> usize {
         debug_assert!(pi < self.num_payload_cols(), "payload_col_idx: pi out of range");
         self.payload_to_ci[pi] as usize
     }
 
-    /// The output-key kind a reduce grouped by `cols` over this schema warrants.
-    pub(crate) fn reduce_out_key(&self, cols: &[u32]) -> ReduceOutKey {
-        ReduceOutKey::for_group_cols(self.pk_indices(), cols, |c| {
-            let col = &self.columns[c as usize];
-            (col.type_code, col.nullable != 0)
-        })
-    }
-
-    /// [`gnitz_expr::SchemaFacts::locate`], callable without the trait in scope.
+    /// [`SchemaFacts::locate`], callable without the trait in scope.
     #[inline]
     pub fn locate(&self, col_idx: usize) -> ColumnLocator {
-        gnitz_expr::SchemaFacts::locate(self, col_idx)
+        SchemaFacts::locate(self, col_idx)
     }
 }
 
-impl gnitz_expr::SchemaFacts for SchemaDescriptor {
+impl ColumnTable for SchemaDescriptor {
     fn pk_cols(&self) -> &[u32] {
         self.pk_indices()
-    }
-
-    fn payload_col_idx(&self, pi: usize) -> usize {
-        SchemaDescriptor::payload_col_idx(self, pi)
     }
 
     fn num_columns(&self) -> usize {
@@ -983,7 +932,7 @@ pub fn project_schema(schema: &SchemaDescriptor, project: &[u32]) -> Option<Sche
     b.push_pk_of(schema).ok()?;
     for &p in project {
         let i = p as usize;
-        if schema.try_payload_idx(i).is_some() {
+        if schema.payload_slot(i).is_some() {
             b.push(schema.columns[i]).ok()?;
         }
     }

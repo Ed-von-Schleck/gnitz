@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::two_col;
 use gnitz_core::{PkColumn, TxnBuffer, TypeCode, WireConflictMode};
+use gnitz_expr::SchemaFacts;
 
 /// (pk U64 PK, val I64) rows as (pk, val, weight).
 fn batch(schema: &Schema, rows: &[(u128, i64, i64)]) -> ZSetBatch {
@@ -47,7 +48,7 @@ fn is_deleted(net: &Net, pk: u128) -> bool {
 
 /// The identity key for `pk` under [`two_col`]'s single U64 PK.
 fn key(pk: u128) -> PkBuf {
-    gnitz_core::opk_key_cols(&two_col(TypeCode::I64), [pk])
+    two_col(TypeCode::I64).opk_key_cols(&[pk])
 }
 
 fn rows_of(b: &ZSetBatch) -> Vec<(u128, i64)> {

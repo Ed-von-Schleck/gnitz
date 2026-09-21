@@ -10,7 +10,7 @@ use gnitz_expr::RowSource;
 fn row_val(fr: &StoredRow) -> i64 {
     i64::from_le_bytes(RowSource::get_col_ptr(&fr.run, fr.row, 0, 8).try_into().unwrap())
 }
-use crate::schema::{type_code, SchemaDescriptor};
+use crate::schema::{type_code, SchemaDescriptor, SchemaFacts};
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_u64_i64, opk_pk, pk_payload_schema, wide_pk_3xu64_schema, wide_row,
 };
@@ -34,12 +34,12 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, budget: usize, rs:
 /// one an already-encoded key would double the sign flip.
 impl Table {
     fn has_pk(&self, key: u128) -> bool {
-        let opk = crate::schema::key::opk_key(&self.shard_index.schema, &key.to_le_bytes());
+        let opk = self.shard_index.schema.opk_key(&key.to_le_bytes());
         self.has_pk_bytes(opk.pk_bytes())
     }
 
     fn retract_pk(&self, key: u128) -> (i64, Option<StoredRow>) {
-        let opk = crate::schema::key::opk_key(&self.shard_index.schema, &key.to_le_bytes());
+        let opk = self.shard_index.schema.opk_key(&key.to_le_bytes());
         self.live_row_at(opk.pk_bytes())
     }
 }
