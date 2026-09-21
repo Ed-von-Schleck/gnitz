@@ -25,7 +25,7 @@ impl CircuitTables {
 
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+        let mut registry = RelationRegistry::new(tmp.path().to_str().unwrap(), Slot::SOLO, StoreConfig::default());
         // A `SystemCatalog` registration homes the store flat under its own
         // directory, the shape `bootstrap.rs` gives every family.
         registry
@@ -33,7 +33,6 @@ impl CircuitTables {
                 id: gnitz_wire::CIRCUIT_NODES_TAB as i64,
                 kind: RelationKind::SystemCatalog,
                 schema: Self::schema(),
-                directory: format!("{}/nodes", tmp.path().to_str().unwrap()),
                 props: ViewProps::default(),
             })
             .unwrap();

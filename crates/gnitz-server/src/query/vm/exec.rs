@@ -166,9 +166,7 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
                     *probe,
                 ),
 
-                Op::WorkerFilter { worker_id, num_workers } => {
-                    ops::op_worker_filter(&batches[in_reg.at()], *worker_id, *num_workers)
-                }
+                Op::WorkerFilter { slot } => ops::op_worker_filter(&batches[in_reg.at()], *slot),
 
                 Op::NullExtend { nulls_first } => {
                     batches[in_reg.at()].widened_with_nulls(program.schema_of(out_reg), *nulls_first)

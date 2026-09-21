@@ -2,10 +2,10 @@
 //!
 //! One pass over a table set: prepare each table, batch every fdatasync through
 //! a single io_uring, commit each manifest rename, fsync the directories that
-//! received one, then record each manifest as durable and drain the deferred
-//! compaction deletions. Publishing N tables costs a handful of ring
-//! submissions instead of ~4 blocking syscalls per table, and never holds more
-//! than [`FD_CHUNK_THRESHOLD`] fds open.
+//! received one and the parents of a first publish, then record each manifest
+//! as durable and drain the deferred compaction deletions. Publishing N tables
+//! costs a handful of ring submissions instead of ~4 blocking syscalls per
+//! table, and never holds more than [`FD_CHUNK_THRESHOLD`] fds open.
 
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -59,9 +59,9 @@ pub(crate) fn flush_barrier<'a>(
         let Some(work) = t.flush_prepare(round)? else {
             continue;
         };
-        // Each work opens one fd per unsynced file (the by-path sweep) plus the
-        // manifest `.tmp` fd.
-        pending_fds += work.sync_paths.len() + 1;
+        // Each work opens one fd per unsynced file (the by-path sweep), the
+        // manifest `.tmp` fd, and one per entry directory.
+        pending_fds += work.sync_paths.len() + 1 + work.entry_dirs.len();
         pending.push((t, work));
         if pending_fds >= FD_CHUNK_THRESHOLD {
             publish_chunk(&mut ring, &mut pending, &mut flushed)?;
@@ -96,8 +96,8 @@ fn sync_by_path(ring: &mut LazyRing, paths: &[&CStr]) -> Result<(), StorageError
 
 /// One fd-bounded chunk: batch-fdatasync the manifest `.tmp` fds and the
 /// unsynced files, rename each manifest into place, then batch-fsync the
-/// directories that received one. Every fd this chunk opened is closed before
-/// the next chunk starts.
+/// directories that received one and each first publish's entry directories.
+/// Every fd this chunk opened is closed before the next chunk starts.
 fn publish_chunk<'a>(
     ring: &mut LazyRing,
     pending: &mut Vec<(&'a mut Table, FlushWork)>,
@@ -119,10 +119,15 @@ fn publish_chunk<'a>(
     // Publish, then make the renames durable. A directory needs a full fsync,
     // not fdatasync: the rename is metadata.
     let mut dir_fds: Vec<OwnedFd> = Vec::with_capacity(pending.len());
-    for (t, work) in pending.drain(..) {
+    let mut entry_dirs = std::collections::BTreeSet::new();
+    for (t, mut work) in pending.drain(..) {
+        entry_dirs.extend(std::mem::take(&mut work.entry_dirs));
         let (fd, bytes) = t.flush_commit(work)?;
         dir_fds.push(fd);
         flushed.push((t, bytes));
+    }
+    for dir in entry_dirs {
+        dir_fds.push(std::fs::File::open(dir)?.into());
     }
     let raw: Vec<libc::c_int> = dir_fds.iter().map(|f| f.as_raw_fd()).collect();
     ring.batch_sync(&raw, io_uring::types::FsyncFlags::empty())

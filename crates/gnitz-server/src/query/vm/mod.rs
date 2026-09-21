@@ -8,7 +8,7 @@ use gnitz_store::expr::MapPlan;
 use gnitz_store::ops;
 use gnitz_store::relation::{CircuitState, StateIdx};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::Batch;
+use gnitz_store::storage::{Batch, Slot};
 
 mod builder;
 mod exec;
@@ -76,8 +76,7 @@ pub(in crate::query) enum Op {
         probe: ops::JoinProbe,
     },
     WorkerFilter {
-        worker_id: u32,
-        num_workers: u32,
+        slot: Slot,
     },
     /// Widen every row with NULL-filled payload columns — the LEFT JOIN
     /// null-fill's unmatched preserved rows — on the side `nulls_first` names.
@@ -193,7 +192,7 @@ impl Instr {
             | Op::Negate
             | Op::WeightClamp { hist: _, preset: _ }
             | Op::JoinDT { trace: _, probe: _ }
-            | Op::WorkerFilter { worker_id: _, num_workers: _ }
+            | Op::WorkerFilter { slot: _ }
             | Op::NullExtend { nulls_first: _ }
             | Op::Reduce { out_trace: _, plan: _ }
             | Op::TopN { out_trace: _, plan: _ } => None,

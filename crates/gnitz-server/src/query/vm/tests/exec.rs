@@ -583,7 +583,7 @@ fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
     // Reg 1 is the sink; reg 2 is written and never read, so nothing frees it
     // and it is what still holds rows when the epoch ends — the precondition the
     // empty epoch below has to clear.
-    p.push(0, 1, Op::WorkerFilter { worker_id: 0, num_workers: 1 });
+    p.push(0, 1, Op::WorkerFilter { slot: Slot::SOLO });
     p.push(0, 2, Op::Negate);
     let mut vm = p.build(vec![schema; 3], 1);
     assert!(!vm.pending_ground_row);
@@ -789,7 +789,7 @@ fn a_replay_leaves_every_trace_as_it_found_it() {
 
     let mut p = TestPlan::default();
     let trace = p.table("replay_tr", schema);
-    p.push(0, 1, Op::WorkerFilter { worker_id: 0, num_workers: 1 });
+    p.push(0, 1, Op::WorkerFilter { slot: Slot::SOLO });
     p.integrate(1, trace);
     let mut vm = p.build_in(&registry, vec![schema; 2], 1);
 

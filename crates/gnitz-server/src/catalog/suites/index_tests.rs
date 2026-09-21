@@ -121,8 +121,12 @@ fn test_failed_create_index_rolls_back() {
 
     // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_id;
-    // A file where the index directory goes.
-    let blocker = ChildAddr::Index { id: failed_idx_id }.dir(&relation_dir(&dir, RelationKind::BaseTable, tid));
+    // A file where this process's index store goes.
+    let index = ChildAddr {
+        kind: ChildKind::Index(failed_idx_id),
+        slot: engine.registry.slot(),
+    };
+    let blocker = index.dir(&relation_dir(&dir, RelationKind::BaseTable, tid));
     fs::write(&blocker, b"not a directory").unwrap();
     let idx_name = make_secondary_index_name("public", "t", "val");
 
@@ -2274,7 +2278,6 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
-            directory: dir.clone(),
             props: ViewProps::default(),
         })
         .unwrap();

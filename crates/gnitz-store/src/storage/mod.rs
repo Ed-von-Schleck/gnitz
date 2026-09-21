@@ -71,13 +71,12 @@ pub(crate) use seek::{pk_group_end, pk_prefix_group_end};
 // caller names `crate::schema::key::X`, so one byte-order rule has one import
 // path.
 pub(crate) use lsm::child_dir::children_at_generation;
-pub use lsm::child_dir::fsync_dir;
 pub(crate) use lsm::child_dir::reclaim_retired_children;
 pub(crate) use lsm::child_dir::remove_child;
-// `ChildAddr` and `Slot` are *names*, not stores: the crash-fixture and relayout
-// tests assert on the on-disk shape through them.
 pub(crate) use lsm::child_dir::subdir_names;
-pub use lsm::child_dir::{ChildAddr, Slot};
+pub use lsm::child_dir::Slot;
+// Other crates' tests assert on the on-disk layout through these.
+pub use lsm::child_dir::{ChildAddr, ChildKind};
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub use lsm::index_gather::SourceCursor;
 pub(crate) use lsm::read_cursor::empty as empty_cursor;
@@ -159,7 +158,7 @@ impl Drop for StagedFile {
 }
 
 /// Publish `parts`, concatenated, as `<dir>/<filename>`: staged as a `.tmp`,
-/// `fdatasync`ed, renamed, with the directory fsynced either side of the rename.
+/// `fdatasync`ed, renamed, and the directory fsynced after the rename.
 /// An uncommitted [`StagedFile`] unlinks itself, so a failure leaves no `.tmp`.
 /// Mode `0o644`.
 pub fn publish_file_sync(dir: &str, filename: &str, parts: &[&[u8]]) -> Result<(), StorageError> {
@@ -170,9 +169,30 @@ pub fn publish_file_sync(dir: &str, filename: &str, parts: &[&[u8]]) -> Result<(
         offset += part.len() as u64;
     }
     staged.sync()?;
-    fsync_dir(dir)?;
     staged.commit()?;
     fsync_dir(dir)
+}
+
+/// Create `dir` and any missing parent; whether this call created `dir`.
+pub(crate) fn create_dir(dir: &str) -> Result<bool, StorageError> {
+    let path = std::path::Path::new(dir);
+    let mut made = std::fs::create_dir(path);
+    if matches!(&made, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        made = std::fs::create_dir(path);
+    }
+    match made {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `fsync` a directory so its entries are durable.
+pub(crate) fn fsync_dir(dir: &str) -> Result<(), StorageError> {
+    File::open(dir).and_then(|d| d.sync_all()).map_err(StorageError::from)
 }
 
 /// The suffix [`StagedFile`] stages under — also how startup GC names a stray

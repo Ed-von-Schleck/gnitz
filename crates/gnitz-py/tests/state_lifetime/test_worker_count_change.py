@@ -222,11 +222,8 @@ def test_an_index_rehomes_onto_the_launched_ranks(own_server):
     assert own_server.rebuilt_index_counts() == [1, 1], (
         "every launched rank must re-derive its slice of the one index")
     table_dir = os.path.join(own_server.data_dir, "_relations", f"t_{tid}")
-    idx_dirs = [d for d in os.listdir(table_dir) if d.startswith("idx_")]
-    # Exactly one: a retired child's parent left behind would pass a truthiness
-    # check while proving the relayout reclaimed nothing.
-    assert len(idx_dirs) == 1, f"one index directory under {table_dir}, got {idx_dirs}"
-    for idx in idx_dirs:
-        children = os.listdir(os.path.join(table_dir, idx))
-        assert len(children) == own_server.workers, (
-            f"only the launched ranks may keep a child under {idx}, got {children}")
+    idx_dirs = sorted(d for d in os.listdir(table_dir) if d.startswith("idx_"))
+    (idx_id,) = {d.split("_")[1] for d in idx_dirs}
+    n = own_server.workers
+    assert idx_dirs == [f"idx_{idx_id}_w{k}of{n}" for k in range(n)], (
+        f"only the launched ranks may keep an index child under {table_dir}, got {idx_dirs}")

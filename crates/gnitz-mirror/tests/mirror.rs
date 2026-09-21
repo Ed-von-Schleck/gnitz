@@ -21,7 +21,7 @@ use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult,
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlPlanner;
 use gnitz_store::relation::{relation_dir, RelationKind};
-use gnitz_store::storage::{ChildAddr, Slot};
+use gnitz_store::storage::{ChildAddr, ChildKind, Slot};
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
@@ -1176,7 +1176,8 @@ fn state_file(base_dir: &str) -> String {
 /// answering `false` forever. A copy is laid out for one worker, at the solo
 /// slot every mirror opens under.
 fn has_manifest(base_dir: &str, view_id: u64) -> bool {
-    std::path::Path::new(&ChildAddr::worker(Slot::SOLO).manifest(&copy_dir(base_dir, view_id))).exists()
+    std::path::Path::new(&ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.manifest(&copy_dir(base_dir, view_id)))
+        .exists()
 }
 
 /// The directory one mirrored copy lives in, through the engine's own path

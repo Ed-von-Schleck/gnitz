@@ -1,9 +1,7 @@
 //! L4 relation registry — what relations this process holds, and the stores
 //! behind them.
 //!
-//! Every relation enters through [`RelationRegistry::register`], which is the
-//! one site deciding its child address, recovery source, capacity stamp and
-//! delta store.
+//! Every relation enters through [`RelationRegistry::register`].
 
 use gnitz_foundation::env::env_num;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -12,7 +10,8 @@ use crate::schema::key::{key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::SchemaDescriptor;
 
 use crate::storage::{
-    Batch, ChildAddr, ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, StoredRow, Table,
+    Batch, ChildAddr, ChildKind, ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, StoredRow,
+    Table,
 };
 use gnitz_wire::{PkColList, ViewProps};
 
@@ -25,7 +24,7 @@ mod store_lsn;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
-pub(crate) use dirs::{ensure_dir, staged_dir};
+pub(crate) use dirs::ensure_dir;
 pub use dirs::{lock_data_dir, relation_dir, relations_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store::Store;
 
@@ -226,20 +225,6 @@ pub struct Relation {
 }
 
 impl Relation {
-    /// A registry entry with no secondary indexes yet — the one insert
-    /// [`RelationRegistry::register`] makes.
-    pub(crate) fn new(spec: RelationSpec, stores: (Store, Option<Box<Store>>)) -> Self {
-        Relation {
-            id: spec.id,
-            store: stores.0,
-            delta: stores.1,
-            kind: spec.kind,
-            directory: spec.directory,
-            indexes: Vec::new(),
-            props: spec.props,
-        }
-    }
-
     /// Install both stores at once. The only writer of either field after
     /// construction, so nothing can replace one and leave the other — which for a
     /// fed view is a `delta_bytes` in the catalog with no delta store anywhere.
@@ -391,17 +376,11 @@ impl Relation {
 // The relation to register
 // ---------------------------------------------------------------------------
 
-/// Everything [`RelationRegistry::register`] needs to enter a relation and open
-/// its store — [`Relation::new`]'s parameter list plus the id and minus the
-/// stores it is `register`'s job to open, so the two cannot disagree on what a
-/// registration carries.
+/// A relation to [`RelationRegistry::register`].
 pub struct RelationSpec {
     pub id: i64,
     pub kind: RelationKind,
     pub schema: SchemaDescriptor,
-    /// `<root>/_relations/<t|v>_<id>`, from [`relation_dir`]. The parent of
-    /// the `ChildAddr` subdir the store itself opens.
-    pub directory: String,
     pub props: ViewProps,
 }
 
@@ -461,6 +440,8 @@ impl StoreConfig {
 /// are non-atomic.
 pub struct RelationRegistry {
     pub(crate) tables: FxHashMap<i64, Relation>,
+    /// The data directory every relation's [`relation_dir`] sits under.
+    pub(crate) base_dir: String,
     /// Which worker this process is, of how many: names the `w{k}of{n}` child
     /// its stores open under.
     pub(crate) slot: Slot,
@@ -478,11 +459,11 @@ pub struct RelationRegistry {
 }
 
 impl RelationRegistry {
-    /// An empty [`Residency::Origin`] registry at `slot`, tuned by `config`, whose
-    /// `scan_chunk_rows` is clamped to at least one row.
-    pub fn new(slot: Slot, config: StoreConfig) -> Self {
+    /// An empty [`Residency::Origin`] registry over the data directory `base_dir`.
+    pub fn new(base_dir: &str, slot: Slot, config: StoreConfig) -> Self {
         RelationRegistry {
             tables: FxHashMap::default(),
+            base_dir: base_dir.to_string(),
             slot,
             config: StoreConfig {
                 scan_chunk_rows: config.scan_chunk_rows.max(1),
@@ -496,12 +477,11 @@ impl RelationRegistry {
         }
     }
 
-    /// An empty [`Residency::Master`] registry for `worker_count` workers, tuned
-    /// by `config`.
-    pub fn master(worker_count: u32, config: StoreConfig) -> Self {
+    /// An empty [`Residency::Master`] registry over `base_dir` for `worker_count` workers.
+    pub fn master(base_dir: &str, worker_count: u32, config: StoreConfig) -> Self {
         RelationRegistry {
             residency: Residency::Master,
-            ..Self::new(Slot::new(0, worker_count), config)
+            ..Self::new(base_dir, Slot::new(0, worker_count), config)
         }
     }
 
@@ -527,54 +507,47 @@ impl RelationRegistry {
         }
         let (key_spec, index_schema) =
             crate::schema::index_spec_and_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
-        let idx_dir = ChildAddr::Index { id: index_id }.dir(&owner_dir);
-        let chunk_rows = self.config.scan_chunk_rows;
-        staged_dir(&idx_dir, || {
-            ensure_dir(&idx_dir)?;
-            let store = match self.residency.owns_stores() {
-                false => Store::detached(index_schema),
-                true => Store::owned(
-                    Self::open_index_table(
-                        self.slot,
-                        RecoverySource::Rederive { resume_at: None },
-                        self.store_budgets(),
-                        &idx_dir,
-                        index_id,
-                        index_schema,
-                    )?,
+        let store = match self.residency.owns_stores() {
+            false => Store::detached(index_schema),
+            true => Store::owned(
+                Self::open_index_table(
+                    self.slot,
+                    RecoverySource::Rederive { resume_at: None },
+                    self.store_budgets(),
+                    &owner_dir,
+                    index_id,
                     index_schema,
-                ),
-            };
-            let mut ix = SecondaryIndex {
-                cols: PkColList::from_slice(cols),
-                index_id,
-                store,
-                key_spec,
-                is_unique,
-                covers_pk: owner_schema.covers_pk(cols),
-            };
-            let entry = self.tables.get_mut(&owner).expect("resolved above");
-            ingest::fill_indexes(&entry.store, chunk_rows, owner, &mut [&mut ix])?;
-            entry.indexes.push(ix);
-            Ok(())
-        })
+                )?,
+                index_schema,
+            ),
+        };
+        let mut ix = SecondaryIndex {
+            cols: PkColList::from_slice(cols),
+            index_id,
+            store,
+            key_spec,
+            is_unique,
+            covers_pk: owner_schema.covers_pk(cols),
+        };
+        let entry = self.tables.get_mut(&owner).expect("resolved above");
+        ingest::fill_indexes(&entry.store, self.config.scan_chunk_rows, owner, &mut [&mut ix])?;
+        entry.indexes.push(ix);
+        Ok(())
     }
 
-    /// This process's store of one index: at `slot`'s child of `idx_dir`, under
-    /// the given rederive policy and store budgets. An associated function so a
-    /// caller holding `&mut` into `tables` can open without a second borrow of
-    /// `self`.
+    /// `slot`'s store of index `index_id` over the relation at `owner_dir`.
     fn open_index_table(
         slot: Slot,
         recovery: RecoverySource,
         budgets: StoreBudgets,
-        idx_dir: &str,
+        owner_dir: &str,
         index_id: i64,
         schema: SchemaDescriptor,
     ) -> Result<Box<Table>, StoreError> {
-        Table::new(&ChildAddr::worker(slot).dir(idx_dir), schema, recovery, budgets)
+        let dir = ChildAddr { kind: ChildKind::Index(index_id), slot }.dir(owner_dir);
+        Table::new(&dir, schema, recovery, budgets)
             .map(Box::new)
-            .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={idx_dir})"), e))
+            .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={dir})"), e))
     }
 
     /// Remove `id`'s circuit on `cols`, dropping its store. A no-op when no such

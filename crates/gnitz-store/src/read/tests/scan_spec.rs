@@ -32,13 +32,16 @@ fn id_val_schema() -> SchemaDescriptor {
 /// a large weight reach far more cheaply than many rows.
 fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
     let schema = id_val_schema();
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    let mut registry = RelationRegistry::new(
+        &crate::test_support::scratch_dir("read", name),
+        Slot::SOLO,
+        StoreConfig::default(),
+    );
     registry
         .register(RelationSpec {
             id: TID,
             kind: RelationKind::View,
             schema,
-            directory: crate::test_support::scratch_dir("read", name),
             props: ViewProps::default(),
         })
         .unwrap();
@@ -213,13 +216,16 @@ fn walk_row(id: u64) -> (Option<i64>, Option<u128>) {
 /// `WALK_ROWS` rows of [`walk_row`], an index on `val` and on `big` when `indexed`.
 fn walk_fixture(name: &str, indexed: bool) -> RelationRegistry {
     let schema = walk_schema();
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    let mut registry = RelationRegistry::new(
+        &crate::test_support::scratch_dir("read", name),
+        Slot::SOLO,
+        StoreConfig::default(),
+    );
     registry
         .register(RelationSpec {
             id: TID,
             kind: RelationKind::BaseTable,
             schema,
-            directory: crate::test_support::scratch_dir("read", name),
             props: ViewProps::default(),
         })
         .unwrap();
@@ -329,12 +335,15 @@ fn a_walk_over_an_unindexable_column_is_refused() {
         ],
         &[0],
     );
-    let mut r = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    let mut r = RelationRegistry::new(
+        &crate::test_support::scratch_dir("read", "walk_float"),
+        Slot::SOLO,
+        StoreConfig::default(),
+    );
     r.register(RelationSpec {
         id: TID,
         kind: RelationKind::View,
         schema,
-        directory: crate::test_support::scratch_dir("read", "walk_float"),
         props: ViewProps::default(),
     })
     .unwrap();
@@ -350,13 +359,16 @@ fn a_walk_over_an_unindexable_column_is_refused() {
 /// skeleton row here can only fail, so a read that succeeds proves it met none.
 fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64>) -> RelationRegistry {
     let schema = id_val_schema();
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    let mut registry = RelationRegistry::new(
+        &crate::test_support::scratch_dir("read", name),
+        Slot::SOLO,
+        StoreConfig::default(),
+    );
     registry
         .register(RelationSpec {
             id: TID,
             kind: RelationKind::View,
             schema,
-            directory: crate::test_support::scratch_dir("read", name),
             props: ViewProps::Bounded { capacity_bytes: 1 },
         })
         .unwrap();

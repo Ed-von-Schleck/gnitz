@@ -7,9 +7,7 @@ use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Sc
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::gnitz_debug;
-use gnitz_store::relation::{
-    lock_data_dir, relation_dir, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
-};
+use gnitz_store::relation::{lock_data_dir, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_store::storage::{Slot, StoreError};
 use gnitz_wire::ViewProps;
 
@@ -92,7 +90,7 @@ impl Mirror {
         // The mirror's own knobs, under its own prefix.
         let config = StoreConfig::from_env("GNITZ_MIRROR_");
         let state = read_state(base_dir);
-        let mut registry = RelationRegistry::new(Slot::SOLO, config);
+        let mut registry = RelationRegistry::new(base_dir, Slot::SOLO, config);
         // A copy holds no operator state, so only the generation decides a resume.
         registry.set_resume_enabled(true);
         if let Some((s, _)) = &state {
@@ -136,7 +134,7 @@ impl Mirror {
         // directory, whose stale manifests the restarted generation would accept.
         // Skipped after a failed `enter`: the fault may be transient.
         if !entry_failed {
-            mirror.registry.reclaim_orphan_relation_dirs(base_dir);
+            mirror.registry.reclaim_orphan_relation_dirs();
         }
         Ok(mirror)
     }
@@ -152,7 +150,6 @@ impl Mirror {
                 // prefix and the `RelClass::View` a copy reports.
                 kind: RelationKind::View,
                 schema,
-                directory: relation_dir(&self.base_dir, RelationKind::View, tid as i64),
                 // No skeleton row is ever written, so nothing can ask this
                 // store to hydrate; and the store maintains no feed of its own.
                 props: ViewProps::default(),
@@ -274,8 +271,9 @@ impl Mirror {
                 self.records.remove(&tid);
                 // The directory goes now: a mirror re-registers ids within one
                 // session, so a later `enter` would reopen these shards.
-                self.registry.unregister_and_erase(tid as i64);
-                Ok(())
+                self.registry
+                    .unregister_and_erase(tid as i64)
+                    .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))
             }
         }
     }

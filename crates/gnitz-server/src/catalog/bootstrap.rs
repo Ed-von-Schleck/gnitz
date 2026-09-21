@@ -44,9 +44,8 @@ impl CatalogEngine {
         let dir_lock = lock_data_dir(base_dir, DIR_LOCK_RETRY_FOR)?;
 
         let mut engine = CatalogEngine {
-            registry: RelationRegistry::master(num_workers, StoreConfig::from_env("GNITZ_")),
+            registry: RelationRegistry::master(base_dir, num_workers, StoreConfig::from_env("GNITZ_")),
             dag: DagEngine::default(),
-            base_dir: base_dir.to_string(),
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
             next_id: FIRST_ALLOCATED_ID,
@@ -60,7 +59,6 @@ impl CatalogEngine {
                     id: family.id(),
                     kind: RelationKind::SystemCatalog,
                     schema: *family.schema(),
-                    directory: relation_dir(base_dir, RelationKind::SystemCatalog, family.id()),
                     props: ViewProps::default(),
                 })
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;

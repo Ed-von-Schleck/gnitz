@@ -117,6 +117,9 @@ pub(in crate::storage) struct FlushWork {
     pub(in crate::storage) manifest: StagedFile,
     /// The staged manifest's bytes.
     pub(in crate::storage) bytes: Vec<u8>,
+    /// On the store's first publish in this process, the directories whose
+    /// entries name its directory and its relation's.
+    pub(in crate::storage) entry_dirs: Vec<std::path::PathBuf>,
 }
 
 /// Index of the first candidate in `pool` (pool order) whose payload group nets
@@ -206,7 +209,7 @@ impl Table {
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
         // flush.
-        ensure_table_dir(dir)?;
+        let created = crate::storage::create_dir(dir)?;
 
         // `skip_pk_filter` is exactly "is rederived": only a `SalReplay` store is
         // point-probed by PK, so only it needs the filters its shards would
@@ -226,6 +229,7 @@ impl Table {
         };
 
         let loaded = match recovery_source {
+            _ if created => None,
             // Erased at open, so it reads nothing: an I/O error on the file it is
             // about to unlink must not abort it.
             RecoverySource::Rederive { resume_at: None } => None,
@@ -239,7 +243,7 @@ impl Table {
             RecoverySource::SalReplay => super::manifest::read(dir)?,
         };
 
-        if loaded.is_none() && rederived {
+        if loaded.is_none() && rederived && !created {
             // So a later re-open cannot reload what this one rejected.
             table.unlink_manifest()?;
         }
@@ -626,19 +630,6 @@ fn pk_match_start(run: &Batch, key: &[u8]) -> Option<usize> {
     }
     let start = run.find_lower_bound_bytes(key);
     (start < count && pk_bytes_eq(run.get_pk_bytes(start), key)).then_some(start)
-}
-
-// ---------------------------------------------------------------------------
-// OS helpers
-// ---------------------------------------------------------------------------
-
-/// Create `dir` and any missing parent, and give it the NOCOW hint (btrfs;
-/// ignored elsewhere).
-pub(super) fn ensure_table_dir(dir: &str) -> Result<(), StorageError> {
-    use std::os::fd::AsRawFd;
-    std::fs::create_dir_all(dir)?;
-    gnitz_foundation::posix_io::try_set_nocow(std::fs::File::open(dir)?.as_raw_fd());
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

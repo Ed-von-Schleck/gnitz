@@ -142,8 +142,8 @@ fn gc_reclaims_orphan_view_dir() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// An orphaned `idx_<id>` sub-dir inside a live table dir is reclaimed; the live
-// index dir and a non-index sibling sub-dir survive.
+// An orphaned index child inside a live table dir is reclaimed; the live index
+// child and a non-index sibling sub-dir survive.
 #[test]
 fn gc_reclaims_orphan_index_dir() {
     let dir = temp_dir("gc_orphan_index");
@@ -153,12 +153,19 @@ fn gc_reclaims_orphan_index_dir() {
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
 
     let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
-    let live_idx = format!("{tbl_dir}/idx_{idx_id}");
+    let index_child = |id| {
+        ChildAddr {
+            kind: ChildKind::Index(id),
+            slot: Slot::SOLO,
+        }
+        .dir(&tbl_dir)
+    };
+    let live_idx = index_child(idx_id);
     assert!(Path::new(&live_idx).exists(), "live index dir must exist");
 
     // A fabricated orphan index dir, plus a non-index sub-dir the sweep must
     // leave alone.
-    let ghost_idx = format!("{}/idx_{}", tbl_dir, idx_id + 9999);
+    let ghost_idx = index_child(idx_id + 9999);
     std::fs::create_dir_all(&ghost_idx).unwrap();
     let non_idx = format!("{tbl_dir}/data_keep");
     std::fs::create_dir_all(&non_idx).unwrap();
@@ -200,7 +207,11 @@ fn gc_leaves_live_entities_untouched() {
     // Id-only directories: `t_{tid}`, regardless of the table name.
     let dirs = [
         relation_dir(&dir, RelationKind::BaseTable, t1),
-        format!("{}/idx_{i1}", relation_dir(&dir, RelationKind::BaseTable, t1)),
+        ChildAddr {
+            kind: ChildKind::Index(i1),
+            slot: Slot::SOLO,
+        }
+        .dir(&relation_dir(&dir, RelationKind::BaseTable, t1)),
         relation_dir(&dir, RelationKind::BaseTable, t2),
         relation_dir(&dir, RelationKind::BaseTable, t3),
     ];
@@ -294,24 +305,29 @@ fn fabricate_dir(path: &str, marker: &str) {
 /// `rel`'s `w{k}of{of}` child directory, and its manifest — the grammar spelled
 /// once here rather than in every assertion below.
 fn child_path(rel: &str, k: u32, of: u32) -> String {
-    ChildAddr::Worker { rank: k, of }.dir(rel)
+    rows_child(k, of).dir(rel)
 }
 
 fn child_manifest(rel: &str, k: u32, of: u32) -> String {
-    ChildAddr::Worker { rank: k, of }.manifest(rel)
+    rows_child(k, of).manifest(rel)
 }
 
-/// A registry at rank `k` of `of` holding `tid` under `rel`. A `CatalogEngine`
-/// is one process at rank 0, so a test needing a *complete* `w{k}of{n}` set has
-/// to stand up the other ranks itself.
-fn child_registry(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> RelationRegistry {
-    let mut registry = RelationRegistry::new(Slot::new(k, of), StoreConfig::default());
+fn rows_child(k: u32, of: u32) -> ChildAddr<'static> {
+    ChildAddr {
+        kind: ChildKind::Rows,
+        slot: Slot::new(k, of),
+    }
+}
+
+/// Rank `k` of `of`'s registry over the engine's base directory `dir`, holding
+/// base table `tid`: a `CatalogEngine` is rank 0 alone.
+fn child_registry(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> RelationRegistry {
+    let mut registry = RelationRegistry::new(dir, Slot::new(k, of), StoreConfig::default());
     registry
         .register(RelationSpec {
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
-            directory: rel.to_string(),
             props: ViewProps::default(),
         })
         .unwrap();
@@ -319,8 +335,8 @@ fn child_registry(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64
 }
 
 /// Every row of one child, as `(pk, weight)`.
-fn child_rows(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u128, i64)> {
-    let registry = child_registry(rel, k, of, schema, tid);
+fn child_rows(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u128, i64)> {
+    let registry = child_registry(dir, k, of, schema, tid);
     let batch = registry.relation_or_err(tid).unwrap().cursor().materialize();
     (0..batch.len())
         .map(|i| (batch.get_pk(i), batch.get_weight(i)))
@@ -369,11 +385,11 @@ fn fill_child(registry: &mut RelationRegistry, tid: i64, schema: SchemaDescripto
 }
 
 /// Sorted `(worker, pk, weight)` triples across every child of the `of`-worker set.
-fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32, u128, i64)> {
+fn set_rows(dir: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32, u128, i64)> {
     let mut v = Vec::new();
     for k in 0..of {
         v.extend(
-            child_rows(rel, k, of, schema, tid)
+            child_rows(dir, k, of, schema, tid)
                 .into_iter()
                 .map(|(pk, w)| (k, pk, w)),
         );
@@ -384,10 +400,11 @@ fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32,
 
 /// Replace the `of`-worker child set of `tid` with exactly `rows`, publishing
 /// every child — the empty ones too, as a checkpoint's base round does.
-fn seed_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
+fn seed_set(dir: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
+    let rel = relation_dir(dir, RelationKind::BaseTable, tid);
     for k in 0..of {
-        fs::remove_dir_all(child_path(rel, k, of)).ok();
-        let mut registry = child_registry(rel, k, of, schema, tid);
+        fs::remove_dir_all(child_path(&rel, k, of)).ok();
+        let mut registry = child_registry(dir, k, of, schema, tid);
         fill_child(&mut registry, tid, schema, &owned_rows(&schema, rows, of, k));
     }
 }
@@ -401,15 +418,14 @@ fn retired_children_are_reclaimed() {
     let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
     engine.close();
 
-    // A set laid out for another count, and a scratch dir from a rank that no
-    // longer exists.
     for k in 0..2 {
         fabricate_dir(&child_path(&rel, k, 2), "marker");
     }
-    fabricate_dir(&format!("{rel}/scratch_agg_w7"), "marker");
-    fabricate_dir(&format!("{rel}/delta_w5"), "marker");
-    // Not a child at all: an index dir must be left alone.
-    fabricate_dir(&format!("{rel}/idx_7"), "marker");
+    let retired = ["scratch_agg_w1of2", "delta_w5of7", "idx_7_w0of2"];
+    let current = "scratch_agg_w2of3";
+    for name in retired.iter().chain([&current]) {
+        fabricate_dir(&format!("{rel}/{name}"), "marker");
+    }
 
     let engine = CatalogEngine::open(&dir, 3).unwrap();
 
@@ -420,14 +436,12 @@ fn retired_children_are_reclaimed() {
     for k in 0..2 {
         assert!(!Path::new(&child_path(&rel, k, 2)).exists(), "wrong layout count");
     }
-    assert!(!Path::new(&format!("{rel}/scratch_agg_w7")).exists());
+    for name in retired {
+        assert!(!Path::new(&format!("{rel}/{name}")).exists(), "{name} is retired");
+    }
     assert!(
-        !Path::new(&format!("{rel}/delta_w5")).exists(),
-        "rank 5 is not launched"
-    );
-    assert!(
-        Path::new(&format!("{rel}/idx_7")).exists(),
-        "an index dir is not a child"
+        Path::new(&format!("{rel}/{current}")).exists(),
+        "{current} is laid out for this count"
     );
 
     engine.close();
@@ -456,7 +470,7 @@ fn replicated_table_is_relinked_at_a_new_worker_count() {
         );
     }
     assert_eq!(
-        set_rows(&rel, 3, schema, rt),
+        set_rows(&dir, 3, schema, rt),
         (0..3).map(|k| (k, 1u128, 1i64)).collect::<Vec<_>>(),
         "every rank reads back the full copy"
     );
@@ -487,10 +501,10 @@ fn keyed_table_round_trips_across_worker_counts() {
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..N).map(|id| (id, id as i64 * 10)).collect();
-        seed_set(&rel, w_old, schema, tid, &rows);
+        seed_set(&dir, w_old, schema, tid, &rows);
 
         let engine = CatalogEngine::open(&dir, w_new).unwrap();
-        let got = set_rows(&rel, w_new, schema, tid);
+        let got = set_rows(&dir, w_new, schema, tid);
         let want = expected(&schema, &rows, w_new);
         assert_eq!(got, want, "{w_old}->{w_new}: the Z-set must survive exactly");
         if w_old != w_new {
@@ -526,9 +540,9 @@ fn repartition_handles_a_relation_with_empty_children() {
     // `opk_key` reads the packed native value in PK-list order, so PK column 0
     // (`a`) is the LOW u128 half: `a = 1` for every row, `b` varies.
     let rows: Vec<(u128, i64)> = (0..20u128).map(|b| (1u128 | (b << 64), b as i64)).collect();
-    seed_set(&rel, 3, schema, tid, &rows);
+    seed_set(&dir, 3, schema, tid, &rows);
     let occupied = (0..3)
-        .filter(|&k| !child_rows(&rel, k, 3, schema, tid).is_empty())
+        .filter(|&k| !child_rows(&dir, k, 3, schema, tid).is_empty())
         .count();
     assert_eq!(occupied, 1, "a shared distribution prefix puts every row on one worker");
     for k in 0..3 {
@@ -539,7 +553,7 @@ fn repartition_handles_a_relation_with_empty_children() {
     }
 
     let engine = CatalogEngine::open(&dir, 2).unwrap();
-    let got = set_rows(&rel, 2, schema, tid);
+    let got = set_rows(&dir, 2, schema, tid);
     assert_eq!(got.len(), 20, "every row survives a relayout off a skewed set");
     assert!(got.iter().all(|&(_, _, w)| w == 1), "no row may double");
     let mut pks: Vec<u128> = got.iter().map(|&(_, pk, _)| pk).collect();
@@ -562,11 +576,11 @@ fn two_complete_sets_left_by_a_crash_relay_either() {
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
-    seed_set(&rel, 2, schema, tid, &rows);
-    seed_set(&rel, 4, schema, tid, &rows);
+    seed_set(&dir, 2, schema, tid, &rows);
+    seed_set(&dir, 4, schema, tid, &rows);
 
     let engine = CatalogEngine::open(&dir, 3).unwrap();
-    assert_eq!(set_rows(&rel, 3, schema, tid), expected(&schema, &rows, 3));
+    assert_eq!(set_rows(&dir, 3, schema, tid), expected(&schema, &rows, 3));
     for of in [2, 4] {
         for k in 0..of {
             assert!(
@@ -589,20 +603,19 @@ fn a_partial_target_is_cleared_rather_than_merged() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
-    seed_set(&rel, 2, schema, tid, &rows);
+    seed_set(&dir, 2, schema, tid, &rows);
 
     // Attempt 1 got as far as `w0of4`, holding rows it had already placed.
-    let mut torn = child_registry(&rel, 0, 4, schema, tid);
+    let mut torn = child_registry(&dir, 0, 4, schema, tid);
     fill_child(&mut torn, tid, schema, &owned_rows(&schema, &rows, 4, 0));
     drop(torn);
 
     let engine = CatalogEngine::open(&dir, 4).unwrap();
-    let got = set_rows(&rel, 4, schema, tid);
+    let got = set_rows(&dir, 4, schema, tid);
     let want = expected(&schema, &rows, 4);
     assert_eq!(got, want, "attempt 1's rows must be cleared, not summed to weight 2");
     drop(engine);
@@ -624,14 +637,14 @@ fn a_torn_set_at_the_launched_count_is_not_a_relayout() {
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..60u128).map(|id| (id, id as i64)).collect();
-    seed_set(&rel, 3, schema, tid, &rows);
+    seed_set(&dir, 3, schema, tid, &rows);
     // Worker 2 never got as far as publishing.
     fs::remove_file(child_manifest(&rel, 2, 3)).unwrap();
-    let published = set_rows(&rel, 3, schema, tid);
+    let published = set_rows(&dir, 3, schema, tid);
 
     let engine = CatalogEngine::open(&dir, 3).unwrap();
     assert_eq!(
-        set_rows(&rel, 3, schema, tid),
+        set_rows(&dir, 3, schema, tid),
         published,
         "a torn set at the launched count is left exactly as it was"
     );
@@ -673,7 +686,7 @@ fn a_torn_foreign_set_moves_nothing() {
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
-        seed_set(&rel, 4, schema, tid, &rows);
+        seed_set(&dir, 4, schema, tid, &rows);
         fs::remove_file(child_manifest(&rel, 3, 4)).unwrap();
 
         let engine = CatalogEngine::open(&dir, 2)
@@ -709,7 +722,7 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
 
     // A 2-set relayed to 4.
     let rows: Vec<(u128, i64)> = (0..30u128).map(|id| (id, id as i64)).collect();
-    seed_set(&rel, 2, schema, rt, &rows);
+    seed_set(&dir, 2, schema, rt, &rows);
     let engine = CatalogEngine::open(&dir, 4).unwrap();
     drop(engine);
     for k in 0..4 {
@@ -720,11 +733,11 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     for k in 2..4 {
         fs::remove_dir_all(child_path(&rel, k, 4)).ok();
     }
-    seed_set(&rel, 2, schema, rt, &rows);
+    seed_set(&dir, 2, schema, rt, &rows);
 
     let engine = CatalogEngine::open(&dir, 4).unwrap();
     assert_eq!(
-        set_rows(&rel, 4, schema, rt),
+        set_rows(&dir, 4, schema, rt),
         expected(&schema, &rows, 4),
         "the torn 4-set must be relaid over, not accepted as current"
     );
@@ -745,7 +758,7 @@ fn repartition_is_not_run_on_an_unchanged_restart() {
     engine.close();
 
     seed_set(
-        &rel,
+        &dir,
         2,
         schema,
         tid,

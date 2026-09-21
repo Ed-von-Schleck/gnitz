@@ -3,7 +3,7 @@
 //! flushed-LSN bookkeeping that recovery and the DDL zone allocator read.
 
 use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex, Store};
-use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError};
+use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot, StoreError};
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
@@ -39,14 +39,7 @@ impl RelationRegistry {
             for ix in &mut entry.indexes {
                 let (index_id, schema) = (ix.index_id, ix.store.schema());
                 ix.store = Store::owned(
-                    Self::open_index_table(
-                        slot,
-                        recovery,
-                        budgets,
-                        &ChildAddr::Index { id: index_id }.dir(&owner_dir),
-                        index_id,
-                        schema,
-                    )?,
+                    Self::open_index_table(slot, recovery, budgets, &owner_dir, index_id, schema)?,
                     schema,
                 );
             }
@@ -107,8 +100,6 @@ impl RelationRegistry {
                     self.config.scan_chunk_rows,
                 )?;
             }
-            // A storeless relation's `directory` names a path that was never created;
-            // `reclaim_retired_children` reads it as having no children and returns.
             reclaim_retired_children(entry.directory(), self.slot.of)
                 .map_err(|e| StoreError::storage(format!("reclaim children of {}", entry.directory()), e))?;
         }
@@ -137,10 +128,10 @@ impl RelationRegistry {
             .relation_or_err(vid)
             .map_err(|e| e.in_context("begin_rebuild"))?
             .directory();
-        let rank = self.slot.rank;
+        let slot = self.slot;
         let scratch_err = |e| StoreError::storage(format!("begin_rebuild: scratch of {vid}"), e);
         for name in subdir_names(dir).map_err(scratch_err)? {
-            if matches!(ChildAddr::parse(&name), Some(ChildAddr::Scratch { rank: r, .. }) if r == rank) {
+            if ChildAddr::parse(&name).is_some_and(|c| matches!(c.kind, ChildKind::Scratch(_)) && c.slot == slot) {
                 remove_child(&format!("{dir}/{name}")).map_err(scratch_err)?;
             }
         }
@@ -148,13 +139,9 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Whether every rederived child of `view_id`, on **every launched rank**,
+    /// Whether every checkpointed child of `view_id`, on **every launched rank**,
     /// carries a manifest at this registry's resume generation — the store half
-    /// of the resume verdict. It reads the operator scratch alongside the output
-    /// store, which is what rejects an output store one generation ahead of the
-    /// integral beneath it: the ephemeral round stamps every output store but
-    /// only a *compiled* view's traces. `false` for an id this registry does not
-    /// hold.
+    /// of the resume verdict. `false` for an id this registry does not hold.
     pub fn view_children_resumable(&self, view_id: i64) -> bool {
         // A worker cannot speak for its peers.
         assert!(

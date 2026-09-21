@@ -11,13 +11,14 @@ use std::collections::BTreeSet;
 use std::fs;
 
 use super::batch::{Batch, Layout};
-use super::child_dir::{cluster_children, fsync_dir, remove_child, subdir_names, ChildAddr};
+use super::child_dir::{cluster_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot};
 use super::error::{StorageError, StoreError};
 use super::flush_barrier::{flush_barrier, FlushRound};
 use super::manifest;
 use super::read_cursor;
 use super::table::{RecoverySource, StoreBudgets, Table};
 use crate::schema::SchemaDescriptor;
+use crate::storage::fsync_dir;
 
 /// The worker count of the complete child set to relay onto `launched`; `None`
 /// when nothing moves. A set missing a rank's manifest never finished a
@@ -27,8 +28,8 @@ fn relay_source(rel_dir: &str, launched: u32) -> Result<Option<u32>, StoreError>
     let names = subdir_names(rel_dir).map_err(|e| StoreError::storage(format!("repartition: list {rel_dir}"), e))?;
     for name in names {
         match ChildAddr::parse(&name) {
-            Some(ChildAddr::Worker { of, .. }) if of != launched => {
-                foreign.insert(of);
+            Some(ChildAddr { kind: ChildKind::Rows, slot }) if slot.of != launched => {
+                foreign.insert(slot.of);
             }
             Some(_) => {}
             None => {
@@ -104,11 +105,15 @@ fn remove_set(rel_dir: &str, of: u32) -> Result<(), StorageError> {
 /// Replicated relations: every child is a copy, so each target hard-links rank
 /// 0's published files, which no publish rewrites in place.
 fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), StorageError> {
-    let source_dir = ChildAddr::Worker { rank: 0, of: source }.dir(rel_dir);
+    let source_dir = ChildAddr {
+        kind: ChildKind::Rows,
+        slot: Slot::new(0, source),
+    }
+    .dir(rel_dir);
     let m = manifest::read(&source_dir)?.ok_or(StorageError::Io(libc::ENOENT))?;
     for target in cluster_children(launched) {
         let dir = target.dir(rel_dir);
-        super::table::ensure_table_dir(&dir)?;
+        crate::storage::create_dir(&dir)?;
         for e in &m.entries {
             fs::hard_link(format!("{source_dir}/{}", e.name), format!("{dir}/{}", e.name))?;
         }

@@ -28,9 +28,8 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 
 /// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
 /// with `base_rows`. Bypasses `create_table`'s stride gate and
-/// `ingest_to_family`, so it does not exercise the enforcement path. The base
-/// store lands at `<dir>/w0of1` and the index at `<dir>/idx_<tid+1>/w0of1`.
-fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) {
+/// `ingest_to_family`, so it does not exercise the enforcement path.
+fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
     engine
         .registry
@@ -38,7 +37,6 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
-            directory: dir.to_string(),
             props: ViewProps::default(),
         })
         .unwrap();
@@ -58,7 +56,7 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
     let tid = engine.next_id;
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
-    setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
+    setup_wide_unique(&mut engine, tid, &[(pk24(1, 1, 1), 42, 1)]);
 
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
     let ic = engine
@@ -104,7 +102,6 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
             id: parent_tid,
             kind: RelationKind::BaseTable,
             schema: parent_schema,
-            directory: dir.clone(),
             props: ViewProps::default(),
         })
         .unwrap();

@@ -288,7 +288,6 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
             .map(std::os::fd::IntoRawFd::into_raw_fd)
             .map_err(|e| format!("failed to open SAL file: {e}"))?
     };
-    posix_io::try_set_nocow(sal_fd);
     // The SAL is a real file, and reserving its blocks now is what keeps a later
     // write from failing for want of disk space.
     let sal_len = sal_mmap_size();

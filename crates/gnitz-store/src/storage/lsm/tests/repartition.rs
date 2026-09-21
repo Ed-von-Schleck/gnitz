@@ -19,7 +19,11 @@ fn schema() -> SchemaDescriptor {
 /// A `w{k}of{of}` child of `rel`, opened as the durable ingest path opens one.
 fn open_child(rel: &str, k: u32, of: u32) -> Table {
     Table::new(
-        &ChildAddr::Worker { rank: k, of }.dir(rel),
+        &ChildAddr {
+            kind: ChildKind::Rows,
+            slot: Slot::new(k, of),
+        }
+        .dir(rel),
         schema(),
         RecoverySource::SalReplay,
         StoreBudgets::default(),
@@ -69,7 +73,7 @@ fn a_relayout_writes_filtered_terminal_runs() {
     keys.sort_unstable();
     assert_eq!(keys, (0..400u64).collect::<Vec<_>>());
     assert!(
-        !std::path::Path::new(&ChildAddr::Worker { rank: 0, of: 1 }.dir(rel)).exists(),
+        !std::path::Path::new(&ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.dir(rel)).exists(),
         "the source set is removed"
     );
 }
@@ -81,7 +85,7 @@ fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
     let rel = rel.to_str().unwrap();
     seed_set(rel, &(0..100u128).map(|id| (id, id as i64)).collect::<Vec<_>>());
 
-    let source = ChildAddr::Worker { rank: 0, of: 1 }.dir(rel);
+    let source = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.dir(rel);
     let shards: Vec<_> = std::fs::read_dir(&source)
         .unwrap()
         .map(|e| e.unwrap().path())

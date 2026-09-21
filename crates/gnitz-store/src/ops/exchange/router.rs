@@ -2,37 +2,23 @@
 //! routing-key helpers.
 
 use crate::schema::{OpBuildErr, Placement, SchemaDescriptor};
-use crate::storage::{Batch, MemBatch};
+use crate::storage::{Batch, MemBatch, Slot};
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
 use super::super::group_key::{single_col_canonical_group_key, GroupKeyCols};
 use crate::schema::key::ReindexPacker;
 
-/// Keep only the rows this worker owns, by packed-PK hash — the trace-side
-/// counterpart of a broadcast join input relay. A pure range join (n_eq == 0)
-/// has no eq prefix to scatter by, and a cross join no key at all, so both
-/// broadcast; every worker receives the full delta and, before it integrates
-/// into the trace, this drops the rows whose `worker_for_pk_bytes` owner is not
-/// `worker_id`. (A band join scatters by the eq prefix instead — its trace is
-/// already eq-prefix-partitioned and carries no `WorkerFilter`.) It is the SAME
-/// hash the equality scatter (`ScatterSpec::JoinKey`)
-/// applies to the SAME packed PK bytes, so the integrated trace is partitioned
-/// identically to a scattered equi-join trace — no trace replicates, no match
-/// duplicates. Worker identity is a compile-time constant baked into the emitted
-/// instruction; `num_workers <= 1` (single process) keeps every row.
-pub fn op_worker_filter(batch: &Batch, worker_id: u32, num_workers: u32) -> Batch {
+/// Keep only the rows `slot` owns: those whose PK `worker_for_pk_bytes` routes
+/// to it, the hash the equality scatter routes a join key by. A broadcast delta
+/// filtered here integrates into a trace partitioned like a scattered one.
+pub fn op_worker_filter(batch: &Batch, slot: Slot) -> Batch {
     let n = batch.count;
-    if num_workers <= 1 || n == 0 {
-        // Single process owns every row; degenerate to identity (preserving
-        // the source's sorted/consolidated flags via clone_batch).
+    if n == 0 {
         return batch.clone_batch();
     }
-    let nw = num_workers as usize;
-    let wid = worker_id as usize;
+    let nw = slot.of as usize;
+    let wid = slot.rank as usize;
     let mb = batch.as_mem_batch();
-
-    // Keep just this worker's rows, routed by the same key→worker function the
-    // equality scatter uses.
     let mut indices: Vec<u32> = Vec::with_capacity(n / nw + 1);
     for i in 0..n {
         if worker_for_pk_bytes(mb.get_pk_bytes(i), nw) == wid {

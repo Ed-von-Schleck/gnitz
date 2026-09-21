@@ -11,16 +11,15 @@ use gnitz_wire::ViewProps;
 /// The view id every plan below is compiled for.
 pub(in crate::query) const VIEW_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 
-/// A registry holding one view homed under `dir` — the shape the VM actually
-/// runs, and what `CircuitState::open` reads its recovery policy from.
+/// A registry over the base directory `dir` holding one view, whose output store
+/// `CircuitState::open` reads its recovery policy from.
 pub(in crate::query) fn vm_registry(dir: &std::path::Path) -> RelationRegistry {
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    let mut registry = RelationRegistry::new(dir.to_str().unwrap(), Slot::SOLO, StoreConfig::default());
     registry
         .register(RelationSpec {
             id: VIEW_ID,
             kind: RelationKind::View,
             schema: crate::test_support::make_schema_u128_i64(),
-            directory: dir.to_str().unwrap().to_string(),
             props: ViewProps::default(),
         })
         .unwrap();

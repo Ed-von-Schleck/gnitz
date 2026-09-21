@@ -3,7 +3,7 @@
 
 use super::RelationRegistry;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ChildAddr, ReadCursor, StorageError, StoreError, Table};
+use crate::storage::{Batch, ChildAddr, ChildKind, ReadCursor, StorageError, StoreError, Table};
 
 /// A `u16` index into one [`CircuitState`], minted only by
 /// [`StateLayout::declare`].
@@ -50,7 +50,11 @@ impl CircuitState {
             .children
             .into_iter()
             .map(|(child, schema)| {
-                let dir = ChildAddr::Scratch { child: &child, rank: reg.slot().rank }.dir(view.directory());
+                let dir = ChildAddr {
+                    kind: ChildKind::Scratch(&child),
+                    slot: reg.slot(),
+                }
+                .dir(view.directory());
                 // Unbounded: a bounded view's hydration reads these traces back.
                 Table::new(&dir, schema, recovery, reg.store_budgets())
                     .map_err(|e| StoreError::storage(format!("open child store '{dir}'"), e))

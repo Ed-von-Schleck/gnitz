@@ -852,7 +852,11 @@ fn compensated_create_table_leaves_no_trace() {
     assert!(engine.registry.relation(tid).unwrap().index_on(&[1]).is_some());
 
     let reldir = relation_dir(&dir, RelationKind::BaseTable, tid);
-    let blocker = ChildAddr::Index { id: idx_id }.dir(&reldir);
+    let blocker = ChildAddr {
+        kind: ChildKind::Index(idx_id),
+        slot: engine.registry.slot(),
+    }
+    .dir(&reldir);
     fs::write(&blocker, b"not a directory").unwrap();
     let idx = idx_tab_batch(
         idx_id,

@@ -225,22 +225,12 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
         }
 
         gnitz_wire::OpNode::WorkerFilter => {
-            // Drops the rows this worker does not own before they reach
-            // `integrate_trace`, by the compile-time slot.
             let in_reg = ctx.unary_delta_in(nid)?;
-            let slot = ctx.registry.slot();
-            // A replicated view runs correct-local over the full broadcast, and at
-            // one worker every partition is owned here — the filter is the identity
-            // either way, and executing it would clone the whole delta each epoch.
             if ctx.self_contained {
                 return Ok(OutReg::Delta(in_reg));
             }
             let out_reg = ctx.push_delta_reg(ctx.reg_schema(in_reg));
-            let op = Op::WorkerFilter {
-                worker_id: slot.rank,
-                num_workers: slot.of,
-            };
-            ctx.push(in_reg, out_reg, op);
+            ctx.push(in_reg, out_reg, Op::WorkerFilter { slot: ctx.registry.slot() });
             Ok(OutReg::Delta(out_reg))
         }
 

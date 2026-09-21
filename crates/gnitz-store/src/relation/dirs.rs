@@ -1,5 +1,4 @@
-//! Relation directory naming, crash-safe staging of a directory a create makes,
-//! and the data-directory lock.
+//! Relation directory naming, the orphan sweeps, and the data-directory lock.
 //!
 //! Every directory a relation registration itself names is *built* and *parsed
 //! back* here, so the creation path and the orphan sweeps can never disagree on
@@ -9,7 +8,7 @@
 use std::fs;
 
 use super::{Relation, RelationKind, RelationRegistry};
-use crate::storage::{subdir_names, ChildAddr, StoreError};
+use crate::storage::{create_dir, fsync_dir, remove_child, subdir_names, ChildAddr, ChildKind, StoreError};
 
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
 /// single-writer.
@@ -28,30 +27,10 @@ pub fn relation_dir(base_dir: &str, kind: RelationKind, id: i64) -> String {
     format!("{}/{tag}_{id}", relations_dir(base_dir))
 }
 
-/// Stage `dir` across `f`: on `Err` remove it, on `Ok` fsync its parent — each
-/// only when `f` is what created it, which is observed rather than declared. A
-/// directory that was already there holds an existing relation's rows, and a
-/// caller that creates none neither cleans up nor syncs.
-pub(crate) fn staged_dir<T, E>(dir: &str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
-    let existed = std::path::Path::new(dir).exists();
-    let out = f();
-    if existed || !std::path::Path::new(dir).exists() {
-        return out;
-    }
-    if out.is_err() {
-        let _ = fs::remove_dir_all(dir);
-    } else if let Some(parent) = dir.rsplit_once('/').map(|(p, _)| p) {
-        // A new directory entry is metadata in the parent.
-        let _ = crate::storage::fsync_dir(parent);
-    }
-    out
-}
-
 pub(crate) fn ensure_dir(path: &str) -> Result<(), StoreError> {
-    // `create_dir_all` already succeeds on an existing directory; the only
-    // `AlreadyExists` it reports is a non-directory blocking the path, which is
-    // a genuine failure.
-    fs::create_dir_all(path).map_err(|e| StoreError::storage(format!("create directory '{path}'"), e.into()))
+    create_dir(path)
+        .map(drop)
+        .map_err(|e| StoreError::storage(format!("create directory '{path}'"), e))
 }
 
 /// How long the server has [`lock_data_dir`] retry before it reports the
@@ -68,6 +47,7 @@ const DIR_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_mill
 /// its lock file, retrying a held lock for `retry`. A forked worker shares its
 /// parent's lock; a second `open` in one process contends. The returned file must
 /// outlive every store under `base_dir`.
+/// Sets NOCOW on `base_dir`, which everything later created under it inherits.
 pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::File, StoreError> {
     // The directory before the lock: the lock file is opened with
     // `create(true)`, which fails if its directory is absent.
@@ -84,9 +64,12 @@ pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::F
     let deadline = std::time::Instant::now() + retry;
     loop {
         if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            // Under the lock: `staged_dir` fsyncs `base_dir` when the root is new.
+            gnitz_foundation::posix_io::try_set_nocow(base_dir);
             let root = relations_dir(base_dir);
-            staged_dir(&root, || ensure_dir(&root))?;
+            let create_err = |e| StoreError::storage(format!("create '{root}'"), e);
+            if create_dir(&root).map_err(create_err)? {
+                fsync_dir(base_dir).map_err(create_err)?;
+            }
             return Ok(file);
         }
         let err = std::io::Error::last_os_error();
@@ -106,23 +89,25 @@ pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::F
 }
 
 impl RelationRegistry {
-    /// Drop `id`'s entry and erase this process's store directory for it.
-    pub fn unregister_and_erase(&mut self, id: i64) {
+    /// Drop `id`'s entry and erase this process's store for it.
+    pub fn unregister_and_erase(&mut self, id: i64) -> Result<(), StoreError> {
         let Some(dir) = self.relation(id).map(|e| e.directory().to_string()) else {
-            return;
+            return Ok(());
         };
         self.unregister(id);
-        let _ = crate::storage::remove_child(&ChildAddr::worker(self.slot).dir(&dir));
+        let child = ChildAddr { kind: ChildKind::Rows, slot: self.slot }.dir(&dir);
+        remove_child(&child).map_err(|e| StoreError::storage(format!("erase relation {id} (dir={child})"), e))?;
         if let Err(e) = fs::remove_dir_all(&dir) {
             gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
         }
+        Ok(())
     }
 
     /// Best-effort removal of every directory under [`relations_dir`] no registered
-    /// relation owns, and every `idx_<id>` child no registered index owns. Sound
-    /// only where every process sharing `base_dir` has applied this catalog.
-    pub fn reclaim_orphan_relation_dirs(&self, base_dir: &str) {
-        let root = relations_dir(base_dir);
+    /// relation owns, and every index child no registered index owns. Sound only
+    /// where every process sharing the base directory has applied this catalog.
+    pub fn reclaim_orphan_relation_dirs(&self) {
+        let root = relations_dir(&self.base_dir);
         let live: rustc_hash::FxHashMap<&str, &Relation> = self.relations().map(|e| (e.directory(), e)).collect();
 
         for name in subdir_names(&root).unwrap_or_default() {
@@ -136,24 +121,19 @@ impl RelationRegistry {
             };
             // Matched on the circuit's own `index_id`, since a promoted circuit
             // outlives the IDX_TAB row that named it.
-            for idx_name in subdir_names(&full).unwrap_or_default() {
-                let Some(ChildAddr::Index { id }) = ChildAddr::parse(&idx_name) else {
+            for child in subdir_names(&full).unwrap_or_default() {
+                let Some(ChildAddr { kind: ChildKind::Index(id), .. }) = ChildAddr::parse(&child) else {
                     continue;
                 };
                 if entry.indexes().iter().any(|ix| ix.id() == id) {
-                    // Its per-worker children are `reconcile_child_dirs`' job.
                     continue;
                 }
-                let idx_full = format!("{full}/{idx_name}");
-                match fs::remove_dir_all(&idx_full) {
-                    Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", idx_full),
-                    Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", idx_full, e),
+                let child_full = format!("{full}/{child}");
+                match remove_child(&child_full) {
+                    Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", child_full),
+                    Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", child_full, e),
                 }
             }
         }
     }
 }
-
-#[cfg(test)]
-#[path = "tests/dirs.rs"]
-mod tests;

@@ -76,19 +76,12 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Phase 1 of the barrier flush: fold the memtable into the RAM tier, commit
-    /// one folded net-state shard, decide whether to publish, and if so stage the
-    /// manifest. The barrier's by-path sweep fdatasyncs every unsynced file;
-    /// `flush_commit` renames the manifest alone.
+    /// one folded net-state shard, and stage the manifest unless it is the one
+    /// this process last made durable. The barrier fdatasyncs every unsynced
+    /// file; `flush_commit` renames the manifest.
     ///
-    /// A rederived table on the **base** round publishes nothing — it is rebuilt
-    /// from its sources at open — and just folds to RAM inline. The base round
-    /// stamps generation 0, so a manifest published here would be the one a
-    /// `Rederive` open accepts while the resume generation is still 0: the view
-    /// would resume from a base-round snapshot its operator traces never matched,
-    /// and the replayed delta would land twice.
-    ///
-    /// Every other table publishes iff its manifest differs from the one this
-    /// process last made durable, so a process's first round always publishes it.
+    /// A rederived table on the base round only folds to RAM: a `Rederive` open
+    /// would resume from the generation-0 manifest it would publish.
     pub(in crate::storage) fn flush_prepare(&mut self, round: FlushRound) -> Result<Option<FlushWork>, StorageError> {
         if matches!(round, FlushRound::Base) && self.is_rederived() {
             self.flush_to_ram()?;
@@ -101,6 +94,7 @@ impl Table {
             self.persist_ram_tier(run)?;
         }
         let bytes = manifest::encode(&self.shard_index.manifest(round.checkpoint_gen()));
+        let first_publish = self.durable_manifest.is_none();
         self.durable_manifest.take_if(|durable| *durable != bytes);
         if self.durable_manifest.is_some() {
             debug_assert!(
@@ -111,7 +105,17 @@ impl Table {
         }
         let sync_paths = super::super::to_cstrings(self.shard_index.unsynced_paths())?;
         let manifest = manifest::prepare(&self.shard_index.output_dir, &bytes)?;
-        Ok(Some(FlushWork { sync_paths, manifest, bytes }))
+        let entry_dirs = match first_publish {
+            false => Vec::new(),
+            true => std::path::Path::new(&self.shard_index.output_dir)
+                .ancestors()
+                .skip(1)
+                .take(2)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(std::path::Path::to_path_buf)
+                .collect(),
+        };
+        Ok(Some(FlushWork { sync_paths, manifest, bytes, entry_dirs }))
     }
 
     /// Commit the RAM tier's single folded net-state run to disk at its final

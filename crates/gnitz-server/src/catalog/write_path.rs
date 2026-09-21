@@ -126,7 +126,7 @@ impl CatalogEngine {
     /// while an applied DDL's broadcasts are still queued.
     pub(crate) fn reclaim_orphan_dirs(&self) {
         if self.pending_broadcasts.is_empty() {
-            self.registry.reclaim_orphan_relation_dirs(&self.base_dir);
+            self.registry.reclaim_orphan_relation_dirs();
         }
     }
 

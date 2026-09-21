@@ -132,7 +132,7 @@ pub(crate) fn unlink(dir: &str) -> Result<(), StorageError> {
         r => r,
     };
     absent_ok(std::fs::remove_file(path(dir)).map_err(StorageError::from))?;
-    absent_ok(super::child_dir::fsync_dir(dir))
+    absent_ok(crate::storage::fsync_dir(dir))
 }
 
 // ---------------------------------------------------------------------------

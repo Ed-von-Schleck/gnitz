@@ -410,4 +410,4 @@ def test_a_replicated_feed_lives_on_worker_zero_alone(own_server):
 
     view_dir = os.path.join(own_server.data_dir, "_relations", f"v_{vid}")
     feeds = sorted(d for d in os.listdir(view_dir) if d.startswith("delta_w"))
-    assert feeds == ["delta_w0"], f"only worker 0 serves this feed, found {feeds}"
+    assert feeds == [f"delta_w0of{own_server.workers}"], f"only worker 0 serves this feed, found {feeds}"

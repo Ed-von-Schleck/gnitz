@@ -46,20 +46,16 @@ impl CatalogEngine {
             pk_repeats,
         } = reg;
         let col_defs = self.read_column_defs(id);
-        let directory = relation_dir(&self.base_dir, kind, id);
         let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
             .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
         gnitz_debug!(
-            "catalog: creating {} dir={} name={} id={} workers={}",
+            "catalog: creating {} name={} id={} workers={}",
             kind.noun(),
-            directory,
             name,
             id,
             self.registry.slot().of
         );
-        // `register` owns the staged-directory reclaim and the parent fsync.
-        self.registry
-            .register(RelationSpec { id, kind, schema, directory, props })?;
+        self.registry.register(RelationSpec { id, kind, schema, props })?;
         self.enter_relation(id, kind, &schema, &col_defs, pk_repeats);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.

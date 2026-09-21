@@ -13,7 +13,7 @@ use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorError, MirrorStore, R
 use gnitz_mirror::Mirror;
 use gnitz_store::relation::{relation_dir, RelationKind};
 use gnitz_store::schema::make_delta_schema;
-use gnitz_store::storage::{Batch, ChildAddr, Slot};
+use gnitz_store::storage::{Batch, ChildAddr, ChildKind, Slot};
 use gnitz_store_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
@@ -119,7 +119,8 @@ fn copy_dir(base_dir: &str, tid: u64) -> String {
 /// Whether `tid`'s copy currently has a published manifest — the on-disk
 /// difference between a checkpointed store and one that never published.
 fn has_manifest(base_dir: &str, tid: u64) -> bool {
-    std::path::Path::new(&ChildAddr::worker(Slot::SOLO).manifest(&copy_dir(base_dir, tid))).exists()
+    std::path::Path::new(&ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.manifest(&copy_dir(base_dir, tid)))
+        .exists()
 }
 
 /// Two registered copies, one row each at round 4, checkpointed and closed.
@@ -139,7 +140,7 @@ fn two_checkpointed_copies(name: &str) -> String {
 /// directory belongs. The copy's own directory stays a directory, so a sweep can
 /// still remove it.
 fn block_copy(base_dir: &str, tid: u64) {
-    let child = ChildAddr::worker(Slot::SOLO).dir(&copy_dir(base_dir, tid));
+    let child = ChildAddr { kind: ChildKind::Rows, slot: Slot::SOLO }.dir(&copy_dir(base_dir, tid));
     std::fs::remove_dir_all(&child).expect("the copy's child directory");
     std::fs::write(&child, b"not a directory").expect("block the child path");
 }

@@ -72,14 +72,12 @@ use sys_tables::*;
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
 pub(in crate::catalog) use cache::CatalogCacheSet;
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
-// The child-directory grammar and the directory primitives are storage's; the
-// catalog only consumes them.
+// Directory primitives the catalog consumes rather than owns.
+pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, DIR_LOCK_RETRY_FOR};
 #[cfg(test)]
-pub(in crate::catalog) use gnitz_store::storage::ChildAddr;
-// The relation rung's directory primitives; the catalog only consumes them.
+pub(in crate::catalog) use gnitz_store::relation::{relation_dir, relations_dir};
 #[cfg(test)]
-pub(in crate::catalog) use gnitz_store::relation::relations_dir;
-pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, relation_dir, DIR_LOCK_RETRY_FOR};
+pub(in crate::catalog) use gnitz_store::storage::{ChildAddr, ChildKind};
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
 pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;
@@ -99,7 +97,6 @@ pub(crate) struct CatalogEngine {
     /// and no VM at all, which is what the split exists for.
     pub(crate) registry: RelationRegistry,
     pub(crate) dag: DagEngine,
-    pub(in crate::catalog) base_dir: String,
 
     /// The `flock` keeping a second writer off `base_dir`. Declared after
     /// `registry`, so it is released only once every store is closed.

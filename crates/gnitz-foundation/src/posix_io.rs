@@ -76,18 +76,14 @@ pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) {
     }
 }
 
-/// Ask btrfs to overwrite `fd` in place instead of copying (`FS_NOCOW_FL`).
+/// Ask btrfs to overwrite `path` in place instead of copying (`FS_NOCOW_FL`).
 ///
 /// Best-effort, like [`madvise_hugepage`]: ext4/xfs/tmpfs reject the flag with
 /// `EOPNOTSUPP` and have no copy-on-write path to disable, so a failure here is
 /// the normal case off btrfs and carries no information worth reporting.
-///
-/// A `SETFLAGS` that changes nothing still commits a btrfs transaction (~7 µs,
-/// against ~0.3 µs for the read alone) and every store re-open lands here, so
-/// the already-set case returns after the read.
-pub fn try_set_nocow(fd: i32) {
-    // FS_IOC_GETFLAGS = 0x80086601, FS_IOC_SETFLAGS = 0x40086602
-    // FS_NOCOW_FL = 0x00800000
+pub fn try_set_nocow(path: &str) {
+    let Ok(file) = std::fs::File::open(path) else { return };
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
     const FS_IOC_GETFLAGS: libc::c_ulong = 0x80086601;
     const FS_IOC_SETFLAGS: libc::c_ulong = 0x40086602;
     const FS_NOCOW_FL: libc::c_int = 0x00800000;

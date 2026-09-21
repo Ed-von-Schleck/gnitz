@@ -1,7 +1,8 @@
 use super::*;
 
-fn solo_registry() -> RelationRegistry {
-    RelationRegistry::new(Slot::SOLO, StoreConfig::default())
+/// A one-worker registry over a fresh base directory named `name`.
+fn solo_registry(name: &str) -> RelationRegistry {
+    RelationRegistry::new(&relation_test_dir(name), Slot::SOLO, StoreConfig::default())
 }
 
 /// A scratch directory for one test. `scratch_dir` removes it on entry, so
@@ -11,36 +12,24 @@ fn relation_test_dir(name: &str) -> String {
     crate::test_support::scratch_dir("relation", name)
 }
 
-/// Enter `id`, opening its store under `directory` — which `add_index` also
-/// creates `idx_<id>` under.
-fn register_entry(
-    registry: &mut RelationRegistry,
-    id: i64,
-    schema: SchemaDescriptor,
-    kind: RelationKind,
-    directory: String,
-) {
+/// Enter `id` and open its store; returns its relation directory, which
+/// `add_index` also opens its index children under.
+fn register_entry(registry: &mut RelationRegistry, id: i64, schema: SchemaDescriptor, kind: RelationKind) -> String {
     let spec = RelationSpec {
         id,
         kind,
         schema,
-        directory,
         props: ViewProps::default(),
     };
     registry.register(spec).unwrap();
+    registry.relation(id).unwrap().directory().to_string()
 }
 
 #[test]
 fn test_register_unregister_table() {
-    let mut registry = solo_registry();
+    let mut registry = solo_registry("reg_unreg");
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
-    register_entry(
-        &mut registry,
-        100,
-        schema,
-        RelationKind::BaseTable,
-        relation_test_dir("reg_unreg"),
-    );
+    register_entry(&mut registry, 100, schema, RelationKind::BaseTable);
     assert!(registry.has_id(100));
 
     registry.unregister(100);
@@ -49,15 +38,14 @@ fn test_register_unregister_table() {
 
 #[test]
 fn test_add_remove_index_circuit() {
-    let mut registry = solo_registry();
+    let mut registry = solo_registry("idx_parent_owner");
     // A real 3-column owner schema: registration precomputes the circuit's
     // `key_spec` from it, which locates indexed column 2.
     let schema = SchemaDescriptor::new(
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
         &[0],
     );
-    let owner_dir = relation_test_dir("idx_parent_owner");
-    register_entry(&mut registry, 50, schema, RelationKind::BaseTable, owner_dir);
+    register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
     registry.add_index(50, 999, &[2], false).unwrap();
     assert_eq!(registry.relation(50).unwrap().indexes().len(), 1);
 
@@ -66,16 +54,19 @@ fn test_add_remove_index_circuit() {
 }
 
 #[test]
-fn a_master_creates_the_index_directory_it_opens_no_store_in() {
-    let mut registry = RelationRegistry::master(1, StoreConfig::default());
+fn a_master_creates_no_index_directory() {
+    let mut registry = RelationRegistry::master(&relation_test_dir("idx_master_dir"), 1, StoreConfig::default());
     let schema = SchemaDescriptor::new(
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 2],
         &[0],
     );
-    let owner_dir = relation_test_dir("idx_master_dir");
-    register_entry(&mut registry, 50, schema, RelationKind::BaseTable, owner_dir.clone());
+    let owner_dir = register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
     registry.add_index(50, 999, &[1], false).unwrap();
-    assert!(std::path::Path::new(&ChildAddr::Index { id: 999 }.dir(&owner_dir)).is_dir());
+    let index = ChildAddr {
+        kind: ChildKind::Index(999),
+        slot: Slot::SOLO,
+    };
+    assert!(!std::path::Path::new(&index.dir(&owner_dir)).exists());
 }
 
 /// `UniquePreflight` hands `index_cols` its `arg1` raw, where `HasPk` would
@@ -83,13 +74,12 @@ fn a_master_creates_the_index_directory_it_opens_no_store_in() {
 /// Neither `0` nor a garbage non-zero word names a column list.
 #[test]
 fn a_flag_clear_arg1_names_no_index() {
-    let mut registry = solo_registry();
+    let mut registry = solo_registry("arg1_zero_owner");
     let schema = SchemaDescriptor::new(
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
         &[0],
     );
-    let owner_dir = relation_test_dir("arg1_zero_owner");
-    register_entry(&mut registry, 50, schema, RelationKind::BaseTable, owner_dir);
+    register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
     registry.add_index(50, 999, &[2], false).unwrap();
 
     assert!(registry
@@ -107,21 +97,14 @@ fn a_flag_clear_arg1_names_no_index() {
 /// ephemeral round is what force-persists it, index circuits included.
 #[test]
 fn ephemeral_flush_includes_index_circuits() {
-    let mut registry = solo_registry();
+    let mut registry = solo_registry("flush_ic_owner");
     // A real 2-column owner schema: registration precomputes the circuit's
     // `key_spec` from it, which locates indexed column 1.
     let parent_schema = SchemaDescriptor::new(
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 2],
         &[0],
     );
-    let owner_dir = relation_test_dir("flush_ic_owner");
-    register_entry(
-        &mut registry,
-        70,
-        parent_schema,
-        RelationKind::BaseTable,
-        owner_dir.clone(),
-    );
+    let owner_dir = register_entry(&mut registry, 70, parent_schema, RelationKind::BaseTable);
     registry.add_index(70, 999, &[1], false).unwrap();
 
     // Put one row in the index table's memtable.
@@ -138,8 +121,11 @@ fn ephemeral_flush_includes_index_circuits() {
 
     registry.set_resume_generation(1);
     registry.checkpoint_ephemeral([]).unwrap();
-    let idx_dir = ChildAddr::Index { id: 999 }.dir(&owner_dir);
-    let store_dir = ChildAddr::worker(Slot::SOLO).dir(&idx_dir);
+    let store_dir = ChildAddr {
+        kind: ChildKind::Index(999),
+        slot: Slot::SOLO,
+    }
+    .dir(&owner_dir);
     let shard_count = std::fs::read_dir(&store_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -157,7 +143,7 @@ fn ephemeral_flush_includes_index_circuits() {
 /// folds them to nothing and the feed is the only place they survive.
 #[test]
 fn a_fed_view_retains_each_round_at_its_own_weight() {
-    let mut registry = solo_registry();
+    let mut registry = solo_registry("fed_view_delta");
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let vid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     registry
@@ -165,7 +151,6 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
             id: vid,
             kind: RelationKind::View,
             schema,
-            directory: relation_test_dir("fed_view_delta"),
             props: ViewProps::Fed { delta_bytes: 1 << 20 },
         })
         .unwrap();
@@ -231,16 +216,10 @@ fn ingest_apply_error_returned_internal() {
     if !crate::test_support::in_child_test() {
         return;
     }
-    let mut registry = solo_registry();
+    let mut registry = solo_registry("seam_abort");
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-    register_entry(
-        &mut registry,
-        tid,
-        schema,
-        RelationKind::View,
-        relation_test_dir("seam_abort"),
-    );
+    register_entry(&mut registry, tid, schema, RelationKind::View);
     let mut batch = Batch::with_capacity(&schema, 1);
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
@@ -262,18 +241,12 @@ fn ingest_apply_error_returned_internal() {
 /// Not unique, or covering the PK: either one excludes an index.
 #[test]
 fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
-    let mut registry = solo_registry();
+    let mut registry = solo_registry("unique_to_check");
     let schema = SchemaDescriptor::new(
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
         &[0],
     );
-    register_entry(
-        &mut registry,
-        60,
-        schema,
-        RelationKind::BaseTable,
-        relation_test_dir("unique_to_check"),
-    );
+    register_entry(&mut registry, 60, schema, RelationKind::BaseTable);
     registry.add_index(60, 901, &[0], true).unwrap(); // exactly the PK
     registry.add_index(60, 902, &[2, 0], true).unwrap(); // the PK plus a payload column
     registry.add_index(60, 903, &[1], true).unwrap(); // the only real check

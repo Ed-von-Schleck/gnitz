@@ -93,7 +93,6 @@ pub(in crate::query) fn register_sources(
             id,
             kind: RelationKind::Stream,
             schema,
-            directory: String::new(),
             props: ViewProps::default(),
         };
         registry.register(spec).expect("a stream registers without a store");
@@ -102,7 +101,7 @@ pub(in crate::query) fn register_sources(
 
 /// A fresh single-worker registry holding only `rows`.
 pub(in crate::query) fn sources(rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>) -> RelationRegistry {
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    let mut registry = RelationRegistry::new("", Slot::SOLO, StoreConfig::default());
     register_sources(&mut registry, rows);
     registry
 }
