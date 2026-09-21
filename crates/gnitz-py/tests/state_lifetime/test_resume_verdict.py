@@ -13,6 +13,7 @@ the view's Z-set. That marker is the only observable the distinction has.
 import pytest
 import gnitz
 from _read import bag, scanned
+from _serverproc import NEEDS_MULTI
 
 
 def _checkpoint_cut(srv, schema, workers=None):
@@ -197,6 +198,7 @@ def test_a_changed_worker_count_rebuilds_the_cut_plus_tail_exactly(own_server):
 _ROWS = 40
 
 
+@NEEDS_MULTI  # a single worker's backfill never relays, so it never reclaims
 def test_a_backfill_reclaim_restamps_the_state_it_invalidated(own_server):
     """A CREATE VIEW whose backfill reclaims the SAL invalidates every
     checkpointed view and index; the window re-stamps them before it returns, so
