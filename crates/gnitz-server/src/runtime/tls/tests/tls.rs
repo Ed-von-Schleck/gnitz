@@ -1,7 +1,7 @@
 //! Unit tests for what is specific to the TLS ingress path: driving the
-//! connection's `RecvQueue` from `rustls::Reader::read`, across record
+//! connection's `RecvQueue` from rustls's `fill_buf`, across record
 //! boundaries and awkward socket-chunk splits. The policy the queue owns —
-//! the per-frame ceiling, the inbound charge, the zero-length sentinel — is
+//! the per-frame ceiling, the inbound charge, the zero-length prefix — is
 //! covered once, on the fd path, in `reactor::tests`.
 //!
 //! No sockets: a rustls client+server pair is handshaken by shuttling
@@ -9,8 +9,7 @@
 //! into the server session and drained through `ingest_cipher`.
 
 use super::*;
-use crate::runtime::reactor::InboundBudget;
-use crate::runtime::test_support::try_poll_once;
+use crate::runtime::reactor::Budget;
 
 /// Handshake an in-memory client/server pair (dev-cert server config). The
 /// client verifies for real against the minted dev certificate's public
@@ -53,11 +52,11 @@ fn handshaken_pair() -> (rustls::ClientConnection, rustls::ServerConnection) {
     (client, server)
 }
 
-/// The queue a session deframes into, whose inbound budget is wide enough never
-/// to trip: the cap is the fd path's to test.
-fn test_queue(max_payload_len: usize) -> RecvQueue {
-    let mut q = RecvQueue::new(Rc::new(InboundBudget::new(usize::MAX)));
-    q.set_max_payload_len(max_payload_len);
+/// The established queue a session deframes into, whose inbound budget is wide
+/// enough never to trip: the cap is the fd path's to test.
+fn test_queue() -> RecvQueue {
+    let mut q = RecvQueue::new(Budget::new(usize::MAX));
+    q.mark_established();
     q
 }
 
@@ -89,19 +88,17 @@ fn encrypt_frames(client: &mut rustls::ClientConnection, frames: &[&[u8]]) -> Ve
     out
 }
 
-/// Every frame the queue will hand a reader, drained the way `recv()` does.
+/// Every frame the queue holds, in order.
 fn frame_payloads(q: &mut RecvQueue) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    while let Some(Some(buf)) = try_poll_once(std::future::poll_fn(|cx| q.poll_recv(cx))) {
-        out.push(buf.as_slice().to_vec());
-    }
-    out
+    std::iter::from_fn(|| q.try_recv())
+        .map(|b| b.as_slice().to_vec())
+        .collect()
 }
 
 #[test]
 fn pipelined_frames_deframe_in_order() {
     let (mut client, mut server) = handshaken_pair();
-    let mut q = test_queue(1 << 20);
+    let mut q = test_queue();
 
     let f1 = vec![0xAAu8; 10];
     let f2 = vec![0xBBu8; 100_000]; // spans multiple 16 KiB records
@@ -115,7 +112,7 @@ fn pipelined_frames_deframe_in_order() {
 #[test]
 fn split_ciphertext_delivery_reassembles() {
     let (mut client, mut server) = handshaken_pair();
-    let mut q = test_queue(1 << 20);
+    let mut q = test_queue();
 
     let payload: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
     let cipher = encrypt_frames(&mut client, &[&payload]);

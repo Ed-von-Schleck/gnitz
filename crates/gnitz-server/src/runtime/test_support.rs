@@ -14,10 +14,24 @@ impl crate::runtime::wire::WireMsg<'_> {
     }
 }
 
-/// Reap `pid` and require a clean exit. A forked child that panics unwinds into
-/// a copy of the test harness whose main thread no longer exists, so without
-/// this the parent's own assertions are the only thing standing between a
-/// broken child and a green test.
+/// Run `body` in a child process that shares this process's fd table, and return
+/// its pid. The child exits 0, or 1 if `body` panics.
+///
+/// # Safety
+/// `body` must not allocate, and must open or close no fd.
+pub(crate) unsafe fn fork_child(body: impl FnOnce()) -> libc::pid_t {
+    // SAFETY: a null stack runs the child on a copy-on-write copy of this one.
+    let pid = unsafe { libc::syscall(libc::SYS_clone, libc::CLONE_FILES | libc::SIGCHLD, 0, 0, 0, 0) };
+    assert!(pid >= 0, "clone failed: {}", std::io::Error::last_os_error());
+    if pid == 0 {
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok();
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    pid as libc::pid_t
+}
+
+/// Reap `pid` and require a clean exit: a panic in a [`fork_child`] body is seen
+/// only here.
 pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     let mut status = 0i32;
     gnitz_foundation::posix_io::retry_eintr(|| libc::waitpid(pid, &mut status, 0))

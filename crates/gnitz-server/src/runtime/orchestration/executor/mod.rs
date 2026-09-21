@@ -34,7 +34,7 @@ use crate::runtime::master::{
     forward_scan, MasterDispatcher, WORKER_WATCH,
 };
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
+use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind, WorkerSet};
 use crate::runtime::wire::{self as ipc, validate_schema_match};
 use gnitz_store::relation::{Relation, RelationKind};
@@ -444,7 +444,7 @@ async fn tls_accept_loop(shared: Rc<Shared>, tl: TlsListener) {
         // Global connection cap: close the freshly-accepted fd before any TLS
         // work when the live count is at the cap.
         let Some(guard) = tl.admit() else {
-            gnitz_warn!("tls: connection cap {} reached; closing fd={raw}", tl.max_conns);
+            gnitz_warn!("tls: connection cap {} reached; closing fd={raw}", tl.max_conns());
             continue;
         };
         let conn = match TlsShared::start(
@@ -515,19 +515,16 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
             next = peer.recv().await;
         }
         let Some(buf) = next else { return };
-        handle_message(peer, buf.as_slice(), shared).await;
+        handle_message(peer, buf, shared).await;
         if peer.flush_if_full().await.is_err() {
             return;
         }
     }
 }
 
-/// Validate a HELLO frame, elevate the connection's payload limit, and cork the
-/// symmetric ACK. `false` = refused.
+/// Validate a HELLO frame, cork the ACK, and raise the connection to the
+/// established frame ceiling. `false` = refused.
 fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> bool {
-    // `decode_hello_payload` validates the 8-byte length; the magic
-    // check below is defence-in-depth on top of the pre-handshake recv
-    // ceiling that already excludes non-HELLO first frames.
     let Ok(hello) = gnitz_wire::decode_hello_payload(data) else {
         return false;
     };
@@ -545,14 +542,10 @@ fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> bool {
         return false;
     }
 
-    peer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
-
     // The watermark seeding the client's OCC basis is read before the message
     // loop, so it is `≤` any later read the client issues — a sound basis.
-    peer.cork(&gnitz_wire::encode_hello_ack(
-        ipc::FRAME_CAP as u32,
-        shared.lsn_alloc.published(),
-    ));
+    peer.cork(&gnitz_wire::encode_hello_ack(shared.lsn_alloc.published()));
+    peer.mark_established();
     true
 }
 
@@ -846,7 +839,8 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
 // Message dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
+async fn handle_message(peer: &Peer, buf: RecvBuf, shared: &Rc<Shared>) {
+    let data = buf.as_slice();
     // ONE control-header parse for the whole request: routing, the schema-hint
     // decision and the push decode all read this same parse.
     let ctrl = match gnitz_wire::control::peek_control_block(data) {
@@ -871,7 +865,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         // The bundle frames name no single relation in `target_id`: each carries
         // its items after the control header and decodes its own body from `data`.
         ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, &ctrl, data).await,
-        ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, data).await,
+        ClientVerb::PushTxn => handle_push_txn(shared, peer, &ctrl, buf).await,
         ClientVerb::ScanMulti => handle_scan_multi(shared, peer, &ctrl, data).await,
         ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, &ctrl, data).await,
 
@@ -898,7 +892,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
             }
         }
 
-        ClientVerb::Push => handle_push(shared, peer, data, ctrl).await,
+        ClientVerb::Push => handle_push(shared, peer, buf, ctrl).await,
 
         ClientVerb::Scan | ClientVerb::Seek => handle_read(shared, peer, &ctrl, verb).await,
     }
@@ -970,16 +964,15 @@ fn decode_push_frame(
 /// same existence + writability gate a non-empty push passes, so a client bug
 /// that happens to produce an empty batch (a `delete` with an empty pk list)
 /// fails the way a non-empty one would instead of being masked by a no-op ACK.
-async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_wire::control::DecodedControl) {
+async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: gnitz_wire::control::DecodedControl) {
     let target_id = ctrl.hdr.target_id as i64;
     let flags = ctrl.hdr.flags;
     // A cold frame authored its own schema; `ctrl` moves into the decode below.
     let cold = ctrl.schema.is_some();
     let client_version = flags.schema_version;
 
-    // Decoding happens before the lock below, and cannot suspend: see
-    // `decode_push_frame`.
-    let decoded = match decode_push_frame(shared, data, ctrl) {
+    let (decoded, _charge) = buf.decode(|data| decode_push_frame(shared, data, ctrl));
+    let decoded = match decoded {
         Ok(d) => d,
         Err(PushReject::SchemaMismatch) => {
             send_control_only(peer, target_id, WireStatus::SchemaMismatch);
@@ -1185,8 +1178,8 @@ enum PushTxnOutcome {
 /// late drain check; both locks are held through the committer ACK. Every
 /// rejection is pre-SAL, so an `Err` reply — and a `Conflict` outcome — mean
 /// "nothing committed".
-async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, data: &[u8]) {
-    match push_txn_body(shared, ctrl, data).await {
+async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl, buf: RecvBuf) {
+    match push_txn_body(shared, ctrl, buf).await {
         Ok(outcome) => {
             let (arg0, status) = match outcome {
                 // Standard single-frame ACK (uncorrelated, as the DDL_TXN reply is).
@@ -1201,25 +1194,16 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, ctrl: &DecodedControl
 
 /// The body of `handle_push_txn`. Returns `Committed(zone_lsn)` on a durable
 /// commit or `Conflict(fresh_basis)` when the OCC precondition check fails.
-async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -> Result<PushTxnOutcome, WireFault> {
-    // 1. Decode + frame-local shape rules (no catalog access). The frame carries
-    //    the families and the OCC preconditions (each `(tid, basis)`).
-    let (raw, preconditions) =
-        gnitz_wire::txn_frame::decode_push_txn(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
-    if raw.is_empty() {
-        return Err("TXN: empty family bundle".into());
-    }
+async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, buf: RecvBuf) -> Result<PushTxnOutcome, WireFault> {
+    // 1. Decode.
+    let (decoded, _charge) = buf.decode(|data| decode_push_txn_frame(data, ctrl));
+    let DecodedTxn { families, preconditions } = decoded?;
 
     // 2. Catalog read lock (excludes a concurrent DROP/DDL), then the
-    //    catalog-dependent shape rules + per-family batch decode.
+    //    catalog-dependent rules per family.
     let _cat = shared.catalog_rwlock.read().await;
-    let mut families: Vec<TxnFamily> = Vec::with_capacity(raw.len());
-    for fam in &raw {
-        // The wire carries the tid as u32; the catalog addresses it as i64.
-        let tid = fam.tid as i64;
-        if tid < FIRST_USER_TABLE_ID {
-            return Err(format!("TXN: {tid} is not a user table").into());
-        }
+    for fam in &families {
+        let tid = fam.tid;
         // Same existence + writability gate the plain-push arm applies, so a view
         // target is rejected identically. Refusing a stream keeps every transaction
         // family `recoverable`, so a transaction always opens a zone.
@@ -1228,18 +1212,7 @@ async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) 
         if target_kind(shared, tid, Access::Write).map_err(|f| f.text)? == RelationKind::Stream {
             return Err(format!("table {tid} is a stream: a stream cannot be written inside a transaction").into());
         }
-        // The schema block is always present; validate it against the catalog
-        // per family (a concurrent DDL between buffer time and commit surfaces as
-        // a clean error the application re-runs).
-        let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block)
-            .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
-        let catalog_schema = validate_client_schema(shared, tid, &wire_schema)?;
-        let batch = decode_client_batch(fam.wal_block, &catalog_schema)
-            .map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
-        if batch.is_empty() {
-            return Err(format!("TXN: empty batch for table {tid}").into());
-        }
-        families.push(TxnFamily { tid, mode: fam.mode, batch });
+        validate_client_schema(shared, tid, fam.batch.schema())?;
     }
     // Capture the family tids BEFORE `families` is moved into the commit request,
     // for the precondition-membership check and the post-commit map bump.
@@ -1291,6 +1264,39 @@ async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) 
     //    acquire the lock until this one releases (after the bump).
     shared.record_commit_lsn(family_tids.iter().copied(), lsn);
     Ok(PushTxnOutcome::Committed(lsn))
+}
+
+/// A `PUSH_TXN` frame's families, their batches decoded, and its OCC
+/// preconditions (each `(tid, basis)`).
+struct DecodedTxn {
+    families: Vec<TxnFamily>,
+    preconditions: Vec<(u64, u64)>,
+}
+
+/// Decode a `PUSH_TXN` frame, applying every rule that needs no catalog.
+fn decode_push_txn_frame(data: &[u8], ctrl: &DecodedControl) -> Result<DecodedTxn, WireFault> {
+    let (raw, preconditions) =
+        gnitz_wire::txn_frame::decode_push_txn(data, ctrl).map_err(|e| format!("decode error: {e}"))?;
+    if raw.is_empty() {
+        return Err("TXN: empty family bundle".into());
+    }
+    let mut families: Vec<TxnFamily> = Vec::with_capacity(raw.len());
+    for fam in &raw {
+        // The wire carries the tid as u32; the catalog addresses it as i64.
+        let tid = fam.tid as i64;
+        if tid < FIRST_USER_TABLE_ID {
+            return Err(format!("TXN: {tid} is not a user table").into());
+        }
+        let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block)
+            .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
+        let batch = decode_client_batch(fam.wal_block, &wire_schema)
+            .map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
+        if batch.is_empty() {
+            return Err(format!("TXN: empty batch for table {tid}").into());
+        }
+        families.push(TxnFamily { tid, mode: fam.mode, batch });
+    }
+    Ok(DecodedTxn { families, preconditions })
 }
 
 /// Compare a client-supplied schema against the catalog's own descriptor for

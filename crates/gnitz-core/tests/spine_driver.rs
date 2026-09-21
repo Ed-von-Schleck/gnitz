@@ -12,11 +12,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gnitz_core::protocol::set_sockopt_int;
 use gnitz_core::{
     ColumnDef, GnitzClient, Interest, PkColumn, Reply, Request, Schema, Session, SlotId, TableProps, TypeCode,
     WireConflictMode, ZSetBatch, MAX_IN_FLIGHT,
 };
+use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 
 /// A `(pk BIGINT, a BIGINT)` table reachable through `target`, and the
@@ -96,7 +96,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     let (mut s, _lsn) = Session::connect(target).unwrap();
     // Small socket buffers so the outbound queue is drained across several
     // steps rather than in one writev.
-    set_sockopt_int(s.as_raw_fd(), libc::SO_SNDBUF, 64 * 1024);
+    set_sockopt_int(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 64 * 1024);
     let sent_before = s.requests_sent();
     let n = 40usize;
     let per = 5_000usize;

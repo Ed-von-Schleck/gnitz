@@ -133,15 +133,7 @@ pub(super) fn egress_pair(limits: Limits, sndbuf: Option<i32>) -> (Rc<Reactor>, 
     let (sender, receiver) = (OwnedFd::from(sender), OwnedFd::from(receiver));
     if let Some(bytes) = sndbuf {
         for (fd, opt) in [(&sender, libc::SO_SNDBUF), (&receiver, libc::SO_RCVBUF)] {
-            unsafe {
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    opt,
-                    &bytes as *const _ as *const libc::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-            }
+            gnitz_foundation::posix_io::set_sockopt_int(fd.as_raw_fd(), libc::SOL_SOCKET, opt, bytes);
         }
     }
     (Rc::new(make_reactor_with(limits)), sender, receiver)

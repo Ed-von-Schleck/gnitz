@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::test_support::*;
 use super::*;
-use crate::runtime::test_support::try_poll_once;
+use crate::runtime::test_support::{fork_child, try_poll_once};
 use gnitz_wire::{WireFault, WireStatus};
 
 /// A lease routes `n` consecutive ids, each for every worker of its set, for
@@ -291,18 +291,17 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     let region = unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) };
     let ptr = region.ptr();
 
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed");
-    if pid == 0 {
-        // Child: publish a monotonic req_id stream as fast as possible. The
+    let child = || {
+        // Publish a monotonic req_id stream as fast as possible. The
         // parent's wake protocol must not drop any of them under the resulting
         // drain-refresh-arm race pressure.
         let writer = W2mWriter::new(ptr);
         for req_id in 1..=N_MESSAGES {
             writer.send_status(req_id, req_id as u32, WireStatus::Ok, &[]);
         }
-        unsafe { libc::_exit(0) };
-    }
+    };
+
+    let pid = unsafe { fork_child(child) };
 
     let reactor = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
     // A fresh reactor's first lease is 1..=N, which is what the child publishes.

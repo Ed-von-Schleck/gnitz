@@ -7,15 +7,14 @@ use gnitz_store::storage::{Batch, Layout, MemBatch, WireChunk, MAX_BATCH_REGIONS
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
-/// The operative bound on **every** reply the server emits, forwarded or not,
-/// and the limit the HELLO ACK advertises. A worker frame reaches a client
+/// The operative bound on **every** reply the server emits, forwarded or not:
+/// the established frame ceiling a client reads under. A worker frame reaches a client
 /// verbatim, so this is the only readable size there; for
 /// a reply the master consumes instead — `HasPk`, `Gather`, the
 /// unique pre-flight — it turns a would-be `try_reserve` abort into an error at
 /// the producer. It bounds the one non-reply a worker emits too, its exchange
 /// partition (`publish_exchange`), so nothing the engine sends is unbounded.
-/// The server's *ingress* limit is the wire constant itself.
-pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
+pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD;
 
 /// The one text for a reply that cannot be framed within [`FRAME_CAP`].
 pub(crate) fn oversized_frame_message(sz: usize) -> String {

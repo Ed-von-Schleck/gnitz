@@ -479,7 +479,7 @@ impl Session {
     }
 
     /// A session over an already-established transport, for the scripted-peer
-    /// tests. Keeps whatever frame ceiling the transport negotiated.
+    /// tests. Keeps whatever frame ceiling the transport holds.
     #[cfg(test)]
     pub(crate) fn from_transport(transport: ClientTransport) -> Self {
         Self::over(transport)
@@ -657,14 +657,12 @@ impl Session {
         )
     }
 
-    /// Queue an encoded request and open its slot. The caps are asymmetric —
-    /// 256 MB inbound, 64 MB outbound — so a bundle built from a reply this
-    /// client accepted can still exceed what the peer will take. Refused here,
-    /// it is an error the caller can act on rather than an ingress rejection and
-    /// a dropped connection.
+    /// Queue an encoded request and open its slot. A frame past the ceiling is
+    /// refused here rather than by the server's ingress cap, which would drop
+    /// the connection.
     fn enqueue_slot(&mut self, frame: Vec<u8>, kind: SlotKind) -> Result<SlotId, ClientError> {
         let total = frame.len();
-        let limit = self.transport.egress_limit();
+        let limit = gnitz_wire::MAX_FRAME_PAYLOAD;
         if total > limit {
             return Err(ClientError::ServerError(format!(
                 "request frame is {total} bytes, exceeding the {limit}-byte server ingress cap; \

@@ -85,6 +85,21 @@ pub fn raise_fd_limit(target: u64) {
     }
 }
 
+/// `setsockopt(level, opt)` with a `c_int` value. Best-effort: a refused option
+/// is not an error worth surfacing anywhere this is called.
+pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) {
+    // SAFETY: setsockopt on a caller-supplied fd with a properly-sized option value.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// Create an anonymous temporary file (`O_TMPFILE`) on the filesystem backing
 /// `dir`.
 ///

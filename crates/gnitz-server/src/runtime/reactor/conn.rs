@@ -131,9 +131,11 @@ impl Reactor {
         let mut conns = self.inner.conns.borrow_mut();
         let Some(armed) = conns.get_mut(&fd) else { return };
         let mut q = armed.conn.q.borrow_mut();
-        let next = if res < 0 {
+        let next = if q.recv_closed() {
+            Err(RecvEnd::Closed)
+        } else if res < 0 {
             Err(RecvEnd::Socket)
-        } else if res == 0 || q.recv_closed() {
+        } else if res == 0 {
             Err(RecvEnd::PeerClosed)
         } else {
             armed
@@ -145,17 +147,20 @@ impl Reactor {
         match next {
             Ok((ptr, len)) => arm_recv(&mut self.inner.ring.borrow_mut(), fd, ptr, len),
             Err(end) => {
-                match end {
-                    RecvEnd::PeerClosed => gnitz_debug!("reactor: fd={fd} recv side ended: {end:?}"),
-                    _ => gnitz_warn!(
-                        "reactor: fd={fd} recv side ended: {end:?} (res={res}, inbound held={} of {} B)",
-                        self.inner.inbound.held(),
-                        self.inner.limits.inbound_cap,
-                    ),
-                }
                 let armed = conns.remove(&fd).expect("entry present");
                 drop(conns);
-                armed.conn.q.borrow_mut().close();
+                if end.is_clean() {
+                    gnitz_debug!("reactor: fd={fd} recv side ended: {end}");
+                    armed.conn.q.borrow_mut().close();
+                } else {
+                    gnitz_warn!(
+                        "reactor: fd={fd} recv side ended: {end} (res={res}, inbound held={} of {} B)",
+                        self.inner.inbound.held(),
+                        self.inner.inbound.cap(),
+                    );
+                    armed.conn.abort();
+                    armed.conn.shutdown();
+                }
             } // `armed` drops: the reactor's hold on the connection ends
         }
     }

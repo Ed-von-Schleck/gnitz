@@ -8,6 +8,7 @@ integration = []
 
 [dependencies]
 gnitz-expr  = { path = "../gnitz-expr" }
+gnitz-foundation = { path = "../gnitz-foundation" }
 gnitz-wire  = { path = "../gnitz-wire" }
 libc.workspace = true
 lru         = "0.12"

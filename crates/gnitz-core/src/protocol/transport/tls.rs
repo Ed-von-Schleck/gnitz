@@ -10,13 +10,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
 use std::time::Instant;
 
+use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_wire::ALPN_GNITZ;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 use super::super::error::ProtocolError;
-use super::{set_sockopt_int, timed_out, write_nonblocking, ClientTransport, Inner, ReadOutcome, WriteOutcome};
+use super::{timed_out, write_nonblocking, ClientTransport, Inner, ReadOutcome, WriteOutcome};
 
 /// Parsed `HOST:PORT[?QUERY]` (the part after the `tls://` prefix).
 struct Target {
@@ -170,7 +171,7 @@ pub(super) fn connect_tls(rest: &str, until: Option<Instant>) -> Result<ClientTr
     sock.set_nodelay(true)?;
     // Bare SO_KEEPALIVE: a silently half-open connection is eventually reaped rather
     // than parking an untimed read forever.
-    set_sockopt_int(sock.as_raw_fd(), libc::SO_KEEPALIVE, 1);
+    set_sockopt_int(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
     sock.set_nonblocking(true)?;
     let mut conn = ClientConnection::new(cfg, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("tls: {e}")))?;

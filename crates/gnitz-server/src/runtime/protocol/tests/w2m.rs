@@ -1,6 +1,6 @@
 use super::fixtures::make_ring;
 use super::*;
-use crate::runtime::test_support::{assert_child_exited_ok, SharedRegion};
+use crate::runtime::test_support::{assert_child_exited_ok, fork_child, SharedRegion};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::WireStatus;
 use std::sync::atomic::AtomicBool;
@@ -41,17 +41,15 @@ fn a_shared_futex_wake_crosses_a_process_boundary() {
         (*atomic_ptr).store(7, Ordering::Release);
     }
 
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        // Child: bump the atomic, then wake the parent.
+    let child = || {
+        // Bump the atomic, then wake the parent.
         unsafe {
             (*atomic_ptr).store(8, Ordering::Release);
         }
         futex_wake_u32(atomic_ptr as *const AtomicU32, 1, "test child");
-        unsafe {
-            libc::_exit(0);
-        }
-    }
+    };
+
+    let pid = unsafe { fork_child(child) };
 
     // `Retry` covers both proofs: woken by the child, or the value had
     // already moved. `TimedOut` is the failure this asserts against.
@@ -88,15 +86,15 @@ fn futex_waitv_wakes_on_any_word() {
     assert_eq!(rc, Parked::TimedOut, "no wake must time out");
     assert!(t.elapsed().as_millis() >= 15, "timed out before the deadline");
 
-    let pid = unsafe { libc::fork() }; // wake on the NON-FIRST word
-    if pid == 0 {
+    // Wake on the NON-FIRST word.
+    let child = || {
         unsafe {
             libc::usleep(5_000);
             (*w1).fetch_add(1, Ordering::Release);
         }
         futex_wake_u32(w1, 1, "test child");
-        unsafe { libc::_exit(0) };
-    }
+    };
+    let pid = unsafe { fork_child(child) };
     let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 5000);
     assert_eq!(rc, Parked::Retry, "a wake on the non-first word must not time out");
     unsafe { assert_child_exited_ok(pid) };
@@ -451,9 +449,7 @@ fn w2m_publish_drain_bench() {
     let cptr = counters.ptr() as *mut u64;
     unsafe { std::ptr::write_bytes(counters.ptr(), 0, 4096) };
 
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed");
-    if pid == 0 {
+    let child = || {
         let writer = W2mWriter::new(ptr);
         let hdr = unsafe { W2mRingHeader::from_raw(ptr) };
         let t = Instant::now();
@@ -467,9 +463,10 @@ fn w2m_publish_drain_bench() {
         unsafe {
             cptr.write(woke_master);
             cptr.add(1).write(t.elapsed().as_nanos() as u64);
-            libc::_exit(0);
         }
-    }
+    };
+
+    let pid = unsafe { fork_child(child) };
 
     let receiver = W2mReceiver::new(vec![ptr]);
     let t = Instant::now();
@@ -642,13 +639,11 @@ fn a_parked_worker_wakes_on_a_forked_masters_sal_wake() {
     let region = unsafe { make_ring(CTRL_HEADER_SIZE, 2, 8) };
     let ptr = region.ptr();
     let seq = || unsafe { super::fixtures::sal_wake_seq(ptr) };
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed");
-    if pid == 0 {
+    let child = || {
         std::thread::sleep(Duration::from_millis(50));
         unsafe { SalWake::new(ptr) }.wake();
-        unsafe { libc::_exit(0) };
-    }
+    };
+    let pid = unsafe { fork_child(child) };
     // "Empty" until the wake publishes: the condition a worker re-tests is the
     // SAL's, and here the sequence stands in for it.
     W2mWriter::new(ptr).sal_park().park(|| seq() == 0);

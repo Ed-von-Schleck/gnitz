@@ -41,9 +41,7 @@ use park::ParkMap;
 use runloop::{RunQueue, REACTOR_RUN_QUEUE};
 use wake_queue::WakeQueue;
 
-#[cfg(test)]
-pub(crate) use io::InboundBudget;
-pub(crate) use io::{ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
+pub(crate) use io::{Budget, Charge, ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
 pub use sync::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, WriteGuard};
 
 /// The ceilings and deadlines a reactor is built with, fixed for its life.
@@ -169,8 +167,8 @@ struct ReactorShared {
     next_op_id: Cell<u64>,
     /// Every connection with a recv armed on it, by fd. See [`conn::Armed`].
     conns: RefCell<FxHashMap<i32, conn::Armed>>,
-    /// The OOM guard shared by every connection. See [`io::InboundBudget`].
-    inbound: Rc<io::InboundBudget>,
+    /// The OOM guard shared by every connection, charged per inbound frame.
+    inbound: Rc<io::Budget>,
     /// The deadlines and ceilings this reactor was built with.
     limits: Limits,
     /// Every attached listener, indexed by the id its accept SQEs carry. See
@@ -222,7 +220,7 @@ impl Reactor {
             deadlines: RefCell::new(BTreeMap::new()),
             next_op_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
-            inbound: Rc::new(io::InboundBudget::new(limits.inbound_cap)),
+            inbound: io::Budget::new(limits.inbound_cap),
             limits,
             listeners: RefCell::new(Vec::new()),
             shutdown: Cell::new(false),

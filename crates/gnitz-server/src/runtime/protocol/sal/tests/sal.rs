@@ -4,7 +4,7 @@ use super::{
     GroupTargets, SalMessageKind, SalReader, SalStep, WorkerSet, CHECKPOINT_RESERVE, MIN_SAL_BYTES, OFF_DIGEST,
     OFF_IN_REQUEST_ORDER, OFF_KIND, OFF_ZONE_START, PREFIX_BYTES, SENTINEL_SIZE,
 };
-use crate::runtime::test_support::{assert_child_exited_ok, try_poll_once};
+use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once};
 use crate::runtime::w2m::fixtures::sal_wake_seq;
 use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
 use crate::test_support::{make_batch_raw, sweep_bit_flips};
@@ -299,8 +299,7 @@ fn sal_cross_process_checkpoint() {
     let buf = vec![0xAAu8; 64];
     let buf2 = vec![0xBBu8; 64];
 
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
+    let child = || {
         let reader = SalReader::new(log.log(), 0, 0);
         let writer = W2mWriter::new(ring);
         for _ in 0..2 {
@@ -314,8 +313,9 @@ fn sal_cross_process_checkpoint() {
             reader.rewind();
             writer.send_status(slot[0] as u64, msg.lsn as u32, gnitz_wire::WireStatus::Ok, b"");
         }
-        unsafe { libc::_exit(0) };
-    }
+    };
+
+    let pid = unsafe { fork_child(child) };
 
     let wake = unsafe { SalWake::new(ring) };
     let receiver = W2mReceiver::new(vec![ring]);

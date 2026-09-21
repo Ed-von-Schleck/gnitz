@@ -2,6 +2,7 @@ use super::*;
 use crate::connection::{Interest, Reply, Request, Session};
 use crate::protocol::transport::{hello_handshake, poll_fd, CONNECT_TIMEOUT};
 use crate::test_support::{framed, reply_ctrl};
+use gnitz_foundation::posix_io::set_sockopt_int;
 use std::io::Read;
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -78,7 +79,7 @@ impl Loopback {
         let cfg = Arc::new(cfg);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         if let Some(sz) = rcvbuf {
-            set_sockopt_int(listener.as_raw_fd(), libc::SO_RCVBUF, sz);
+            set_sockopt_int(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, sz);
         }
         let port = listener.local_addr().unwrap().port();
         let thread = std::thread::spawn(move || {
@@ -98,7 +99,7 @@ impl Loopback {
                 let hello = read_frame(&mut end);
                 assert_eq!(hello.len(), gnitz_wire::HELLO_PAYLOAD_LEN as usize);
                 // `encode_hello_ack` frames the ACK itself.
-                let ack = gnitz_wire::encode_hello_ack(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32, 0);
+                let ack = gnitz_wire::encode_hello_ack(0);
                 end.write_all(&ack).unwrap();
                 end.flush().unwrap();
             }
@@ -115,7 +116,7 @@ impl Loopback {
         let until = Some(Instant::now() + CONNECT_TIMEOUT);
         let mut t = ClientTransport::connect(&self.target, until).unwrap();
         hello_handshake(&mut t, until).unwrap();
-        assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
+        assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD);
         t
     }
 
@@ -226,7 +227,7 @@ fn loopback_large_reply_spanning_many_records_is_intact() {
     let p = payload.clone();
     let lb = Loopback::start(move |mut end| write_frame(&mut end, &p));
     let mut t = lb.connect();
-    set_sockopt_int(t.as_raw_fd(), libc::SO_RCVBUF, 256 * 1024);
+    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 256 * 1024);
     assert_eq!(t.recv_framed(None).unwrap(), payload);
     lb.join();
 }
@@ -244,7 +245,7 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
         write_frame(&mut end, &reply_ctrl(0, 9));
     });
     let t = lb.connect();
-    set_sockopt_int(t.as_raw_fd(), libc::SO_SNDBUF, 8 * 1024);
+    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024);
     let mut s = Session::from_transport(t);
     let slot = s.submit(Request::RawFrame(frame)).unwrap();
     assert!(s.step(Interest::WRITE).unwrap().is_empty());
@@ -280,7 +281,7 @@ fn loopback_deadline_over_tls_never_tears_a_frame() {
         assert_eq!(read_frame(&mut end), b"after");
     });
     let mut t = lb.connect();
-    set_sockopt_int(t.as_raw_fd(), libc::SO_SNDBUF, 16 * 1024);
+    set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 16 * 1024);
     let deadline = || Some(Instant::now() + Duration::from_millis(100));
     // The big frame is sent once; on expiry its remainder is queue state,
     // and the small frame that follows queues behind it.

@@ -36,7 +36,7 @@ use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
 /// capped at this plus one whole request — and one request is itself bounded
-/// only by `MAX_FRAME_PAYLOAD_SERVER`.
+/// only by `MAX_FRAME_PAYLOAD`.
 const MAX_PENDING_ROWS: usize = 100_000;
 
 /// One request to the committer.

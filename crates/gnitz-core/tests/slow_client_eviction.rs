@@ -7,8 +7,9 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::protocol::{encode_frame, hello_handshake, set_sockopt_int, ClientTransport};
+use gnitz_core::protocol::{encode_frame, hello_handshake, ClientTransport};
 use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TableProps, TypeCode, ZSetBatch};
+use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
 /// Wait up to `deadline_ms` for the server to shut down its end of `fd`,
@@ -51,7 +52,7 @@ fn slow_scan_client_is_evicted_after_deadline() {
     let mut slow = ClientTransport::connect(srv.sock_path(), None).expect("connect");
     // A tiny receive buffer stalls the first scan frame's server-side send
     // against a non-draining peer.
-    set_sockopt_int(slow.as_raw_fd(), libc::SO_RCVBUF, 4096);
+    set_sockopt_int(slow.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 4096);
     hello_handshake(&mut slow, None).expect("hello");
     let hdr = gnitz_wire::control::ControlHeader {
         target_id: table_id,

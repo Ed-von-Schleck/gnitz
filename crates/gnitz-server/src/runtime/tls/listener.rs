@@ -3,12 +3,11 @@
 //! — an unauthenticated public bind is impossible by accident — is the other
 //! half of the rule `config` states, where the CA becomes an mTLS verifier.
 
-use std::cell::Cell;
 use std::net::TcpListener;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
-use super::ConnCountGuard;
+use crate::runtime::reactor::{Budget, Charge};
 
 /// TLS listener request from the CLI: the address to bind, optional operator
 /// cert/key PEM paths (a self-signed dev cert is minted when absent), the
@@ -32,14 +31,13 @@ pub(crate) struct TlsListener {
     /// two fallible steps after the bind.
     listener: TcpListener,
     pub cfg: std::sync::Arc<rustls::ServerConfig>,
-    pub max_conns: u32,
     /// How long an admitted peer may stay unauthenticated
     /// (`GNITZ_TLS_HELLO_TIMEOUT_MS`, default 15 000 ms): HELLO must arrive within
     /// this of accept. Set above the client's own connect deadline, so a client is
     /// reaped only once it has given up itself.
     pub pre_auth_window: std::time::Duration,
-    /// Co-owned with every live [`ConnCountGuard`], which is what decrements it.
-    live: Rc<Cell<u32>>,
+    /// Live sessions under the connection cap; each holds one [`Charge`] of it.
+    live: Rc<Budget>,
 }
 
 impl TlsListener {
@@ -49,14 +47,13 @@ impl TlsListener {
         self.listener.as_raw_fd()
     }
 
-    /// Admit one session, or `None` at the cap. Test and increment are one
-    /// call, so there is no window between them and no other way to obtain a
-    /// [`ConnCountGuard`]. The guard's `Drop` decrements.
-    pub(crate) fn admit(&self) -> Option<ConnCountGuard> {
-        if self.live.get() >= self.max_conns {
-            return None;
-        }
-        Some(ConnCountGuard::new(Rc::clone(&self.live)))
+    pub(crate) fn max_conns(&self) -> usize {
+        self.live.cap()
+    }
+
+    /// Admit one session, or `None` at the cap.
+    pub(crate) fn admit(&self) -> Option<Charge> {
+        self.live.charge(1)
     }
 }
 
@@ -129,11 +126,10 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
     Ok(TlsListener {
         listener,
         cfg: config,
-        max_conns: cli.max_conns,
         pre_auth_window: std::time::Duration::from_millis(gnitz_foundation::env::env_num(
             "GNITZ_TLS_HELLO_TIMEOUT_MS",
             15_000,
         )),
-        live: Rc::new(Cell::new(0)),
+        live: Budget::new(cli.max_conns as usize),
     })
 }

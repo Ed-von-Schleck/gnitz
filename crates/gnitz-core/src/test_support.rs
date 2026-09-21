@@ -22,11 +22,11 @@ pub(crate) fn make_socketpair() -> (OwnedFd, OwnedFd) {
     }
 }
 
-/// A transport over `fd`, established under the client ceiling — the shape
-/// every post-handshake connection has.
+/// A transport over `fd`, established — the shape every post-handshake
+/// connection has.
 pub(crate) fn established(fd: OwnedFd) -> ClientTransport {
     let mut t = ClientTransport::from_unix_fd(fd);
-    t.mark_established(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
+    t.mark_established();
     t
 }
 

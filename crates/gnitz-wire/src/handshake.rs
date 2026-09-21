@@ -4,30 +4,21 @@
 // Frame size limits
 // ---------------------------------------------------------------------------
 
-/// Maximum frame payload the server will accept from a client.
-/// Tighter than the client limit: protects the master process from a
-/// misbehaving or malicious peer before any allocation occurs.
-pub const MAX_FRAME_PAYLOAD_SERVER: usize = 64 * 1024 * 1024; // 64 MB
-
-/// Maximum frame payload the client library will accept from the server.
-/// Larger than the server limit: a legitimate batch push can be hundreds
-/// of MB; the server is trusted so the risk model is different.
-pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
+/// The payload ceiling both ends apply once the HELLO ACK is in hand.
+pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024; // 64 MB
 
 /// Payload ceiling the client applies to a frame arriving **before** the HELLO
 /// ACK, when the peer has proved nothing yet: without it, four header bytes from
-/// an unauthenticated peer would size a 256 MB allocation. Both frames legal
+/// an unauthenticated peer would size a 64 MB allocation. Both frames legal
 /// there — the ACK and a `WireStatus::Error` control block — fit it. The server
 /// bounds its own pre-handshake frame the same way (`HELLO_PAYLOAD_LEN`).
 pub const MAX_FRAME_PAYLOAD_PRE_HANDSHAKE: usize = 4 * 1024;
 
 /// Width of the length prefix in front of every framed payload, on every path
 /// that carries one: the client socket stream (`recv_framed` and its senders),
-/// the reactor's header recv, and the W2M ring slot the master forwards to a
-/// client verbatim. A `u32` LE count of the payload bytes that follow.
-///
-/// Zero is the **close sentinel**, never an empty frame: a reader that decodes
-/// one treats the stream as closed, so no sender may emit one.
+/// the server's client ingress, and the W2M ring slot the master forwards to a
+/// client verbatim. A `u32` LE count of the payload bytes that follow. Zero is
+/// never a legal length.
 pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
 
 // ---------------------------------------------------------------------------
@@ -56,7 +47,7 @@ pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 pub const HELLO_PAYLOAD_LEN: u32 = 8;
 
 /// ACK payload length in bytes (excluding the 4-byte length prefix).
-pub const HELLO_ACK_PAYLOAD_LEN: u32 = 16;
+pub const HELLO_ACK_PAYLOAD_LEN: u32 = 12;
 
 /// Total wire size of an ACK frame (length prefix + payload).
 pub(crate) const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
@@ -96,27 +87,24 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str>
 
 /// ACK payload fields, relative to the payload (past the length prefix).
 const ACK_OFF_MAGIC: usize = 0;
-const ACK_OFF_LIMIT: usize = 4;
-const ACK_OFF_LSN: usize = 8;
+const ACK_OFF_LSN: usize = 4;
 
 /// Build an ACK frame ready to ship over the wire (length prefix + payload).
 /// `published_lsn` is the server's durability watermark at connect, seeding the
 /// client's OCC basis, so a connection needs no separate watermark read.
-pub fn encode_hello_ack(limit_bytes: u32, published_lsn: u64) -> [u8; HELLO_ACK_FRAME_SIZE] {
+pub fn encode_hello_ack(published_lsn: u64) -> [u8; HELLO_ACK_FRAME_SIZE] {
     let mut out = [0u8; HELLO_ACK_FRAME_SIZE];
     crate::write_u32_le(&mut out, 0, HELLO_ACK_PAYLOAD_LEN);
     let payload = &mut out[FRAME_LEN_PREFIX_BYTES..];
     crate::write_u32_le(payload, ACK_OFF_MAGIC, HELLO_MAGIC);
-    crate::write_u32_le(payload, ACK_OFF_LIMIT, limit_bytes);
     crate::write_u64_le(payload, ACK_OFF_LSN, published_lsn);
     out
 }
 
-/// Parsed ACK payload (the 16 bytes following the length prefix).
+/// Parsed ACK payload (the 12 bytes following the length prefix).
 #[derive(Debug, Clone, Copy)]
 pub struct HelloAck {
     pub magic: u32,
-    pub limit_bytes: u32,
     /// Server durability watermark at connect — the client's initial OCC basis.
     pub published_lsn: u64,
 }
@@ -129,7 +117,6 @@ pub fn decode_hello_ack(payload: &[u8]) -> Result<HelloAck, &'static str> {
     }
     Ok(HelloAck {
         magic: crate::read_u32_le(payload, ACK_OFF_MAGIC),
-        limit_bytes: crate::read_u32_le(payload, ACK_OFF_LIMIT),
         published_lsn: crate::read_u64_le(payload, ACK_OFF_LSN),
     })
 }

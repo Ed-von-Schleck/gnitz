@@ -5,6 +5,9 @@ use std::task::{Context, Poll, Waker};
 
 use super::park_waker;
 
+/// Slots a drained queue keeps; a burst past this returns its excess on draining.
+const RETAINED_SLOTS: usize = 1024;
+
 pub(super) struct WakeQueue<T> {
     queue: VecDeque<T>,
     /// The one awaiter. One left by a dropped awaiter at most re-polls a live task:
@@ -27,7 +30,7 @@ impl<T> WakeQueue<T> {
 
     /// Hand the next value to the awaiter, or park it.
     pub(super) fn poll(&mut self, cx: &Context<'_>) -> Poll<T> {
-        match self.queue.pop_front() {
+        match self.take() {
             Some(v) => Poll::Ready(v),
             None => {
                 self.park(cx);
@@ -51,7 +54,20 @@ impl<T> WakeQueue<T> {
 
     /// Take the next value without parking. For a caller that must not await.
     pub(super) fn pop(&mut self) -> Option<T> {
-        self.queue.pop_front()
+        self.take()
+    }
+
+    /// Drop every queued value and the capacity they held.
+    pub(super) fn clear(&mut self) {
+        self.queue = VecDeque::new();
+    }
+
+    fn take(&mut self) -> Option<T> {
+        let v = self.queue.pop_front();
+        if self.queue.is_empty() && self.queue.capacity() > RETAINED_SLOTS {
+            self.queue.shrink_to(RETAINED_SLOTS);
+        }
+        v
     }
 
     #[cfg(test)]

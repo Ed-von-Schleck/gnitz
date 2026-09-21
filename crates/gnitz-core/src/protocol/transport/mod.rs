@@ -28,6 +28,8 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use gnitz_wire::{Deframer, FrameLenError};
+
 use super::error::ProtocolError;
 
 mod tls;
@@ -44,10 +46,6 @@ pub struct ClientTransport {
     inner: Inner,
     reader: FrameReader,
     queue: OutQueue,
-    /// The largest payload this peer accepts, from the HELLO ACK — the server's
-    /// own ingress cap until `mark_established` reads the negotiated one.
-    /// `Session::submit` refuses past it.
-    egress_limit: usize,
 }
 
 enum Inner {
@@ -132,21 +130,6 @@ fn write_nonblocking(mut write: impl FnMut() -> std::io::Result<usize>) -> Resul
     }
 }
 
-/// `setsockopt(SOL_SOCKET, opt)` with a `c_int` value; a refused option is
-/// not an error worth surfacing anywhere this is called.
-pub fn set_sockopt_int(fd: RawFd, opt: libc::c_int, val: libc::c_int) {
-    // SAFETY: setsockopt on a valid fd with a properly-sized option value.
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            opt,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-}
-
 /// One `recv` into possibly-uninitialised storage: the Unix read core, and the
 /// TLS arm's ciphertext read.
 fn recv_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome, ProtocolError> {
@@ -218,7 +201,6 @@ impl ClientTransport {
             inner,
             reader: FrameReader::new(gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE),
             queue: OutQueue::default(),
-            egress_limit: gnitz_wire::MAX_FRAME_PAYLOAD_SERVER,
         }
     }
 
@@ -258,10 +240,10 @@ impl ClientTransport {
     }
 
     /// The payload ceiling `recv_framed` enforces: the pre-handshake bound
-    /// until `mark_established`, then the negotiated one.
+    /// until `mark_established`, then the established one.
     #[cfg(test)]
     pub(crate) fn max_payload_len(&self) -> usize {
-        self.reader.max_payload_len
+        self.reader.deframer.max_payload_len()
     }
 
     /// Send one owned frame — `[u32 LE payload_length][payload]` — blocking
@@ -324,11 +306,6 @@ impl ClientTransport {
         self.queue.bytes
     }
 
-    /// The payload ceiling this peer advertised in its HELLO ACK.
-    pub(crate) fn egress_limit(&self) -> usize {
-        self.egress_limit
-    }
-
     /// Bytes queued, or ciphertext pending: the `WRITE` half of a driver's
     /// interest.
     pub(crate) fn wants_write(&self) -> bool {
@@ -377,19 +354,17 @@ impl ClientTransport {
         self.reader.drained = false;
     }
 
-    /// The HELLO ACK is in hand: its figure replaces the pre-handshake bound in
-    /// both directions, clamped — the peer does not get to raise our ceilings.
-    pub(crate) fn mark_established(&mut self, server_limit: usize) {
-        self.reader.max_payload_len = server_limit.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
-        self.egress_limit = server_limit.min(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
+    /// The HELLO ACK is in hand: raise the inbound ceiling from the pre-handshake
+    /// bound to the established one.
+    pub(crate) fn mark_established(&mut self) {
+        self.reader.deframer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD);
     }
 }
 
 // ── Framing: the reader ──────────────────────────────────────────────────────
 
-/// Size of the header scratch: large enough that one read serves a whole run
-/// of pipelined push ACKs, and the ceiling on the one memcpy `carry` can
-/// force.
+/// Size of the read scratch: large enough that one read serves a whole run
+/// of pipelined push ACKs.
 const SCRATCH_BYTES: usize = 64 * 1024;
 
 /// What `next_frame` produced.
@@ -400,19 +375,13 @@ pub(crate) enum Next {
     Pending,
 }
 
-/// Turns reads into frames without copying a payload out of a scratch buffer.
-/// The header is read into a scratch that may over-read (surplus kept in
-/// `carry`); once the length is known the payload is allocated at exactly
-/// that size, the carry moves across, and the remainder is read directly into
-/// it. The copy is bounded by one read's surplus, never by the frame.
+/// Turns reads into frames. A read lands in the scratch unless a payload is in
+/// progress, in which case it goes straight into that payload's tail.
 struct FrameReader {
     scratch: Box<[MaybeUninit<u8>]>,
     /// The initialised, not-yet-consumed bytes of `scratch`.
     carry: Range<usize>,
-    /// The payload being filled: `len()` of `capacity()` bytes, where the
-    /// capacity *is* the frame's declared length — allocated exactly, never grown.
-    partial: Option<Vec<u8>>,
-    max_payload_len: usize,
+    deframer: Deframer<Box<[MaybeUninit<u8>]>>,
     /// A read returned 0. Raised once nothing buffered can advance a frame,
     /// so the frame delivered by the same read is not lost.
     eof: bool,
@@ -427,8 +396,7 @@ impl FrameReader {
         FrameReader {
             scratch: Box::new_uninit_slice(SCRATCH_BYTES),
             carry: 0..0,
-            partial: None,
-            max_payload_len,
+            deframer: Deframer::new(max_payload_len),
             eof: false,
             drained: false,
         }
@@ -447,14 +415,22 @@ impl FrameReader {
 
     fn next_frame(&mut self, inner: &mut Inner, may_read: bool) -> Result<Next, ProtocolError> {
         loop {
-            if let Some(frame) = self.advance_from_carry()? {
-                return Ok(Next::Frame(frame));
+            // SAFETY: `carry` covers exactly the bytes a read initialised.
+            let mut src = unsafe { self.scratch[self.carry.clone()].assume_init_ref() };
+            let before = src.len();
+            let frame = self
+                .deframer
+                .feed(&mut src, |len| Ok::<_, ProtocolError>(Box::new_uninit_slice(len)))?;
+            self.carry.start += before - src.len();
+            if let Some(b) = frame {
+                // SAFETY: the deframer hands a payload out only once every byte is written.
+                return Ok(Next::Frame(unsafe { b.assume_init() }.into_vec()));
             }
             if !may_read {
                 return Ok(Next::Pending);
             }
             if self.eof {
-                return Err(Self::eof_error(self.partial.is_some() || !self.carry.is_empty()));
+                return Err(Self::eof_error(self.deframer.is_mid_frame()));
             }
             if self.drained {
                 return Ok(Next::Pending);
@@ -467,65 +443,23 @@ impl FrameReader {
         }
     }
 
-    /// Consume `carry` into the frame in progress — a header becomes a
-    /// payload allocation of exactly its declared length, payload bytes fill
-    /// it — and hand the frame out once it is whole.
-    fn advance_from_carry(&mut self) -> Result<Option<Vec<u8>>, ProtocolError> {
-        loop {
-            match self.partial.as_mut() {
-                Some(p) => {
-                    let take = (p.capacity() - p.len()).min(self.carry.len());
-                    // SAFETY: `carry` covers exactly the bytes a read initialised.
-                    let src = unsafe { self.scratch[self.carry.start..self.carry.start + take].assume_init_ref() };
-                    p.spare_capacity_mut()[..take].write_copy_of_slice(src);
-                    // SAFETY: the copy above initialised `take` bytes at the
-                    // head of the spare capacity.
-                    unsafe { p.set_len(p.len() + take) };
-                    self.carry.start += take;
-                    if p.len() < p.capacity() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(self.partial.take().unwrap()));
-                }
-                None => {
-                    if self.carry.len() < gnitz_wire::FRAME_LEN_PREFIX_BYTES {
-                        return Ok(None);
-                    }
-                    let hdr = &self.scratch[self.carry.start..self.carry.start + gnitz_wire::FRAME_LEN_PREFIX_BYTES];
-                    // SAFETY: `carry` covers exactly the bytes a read initialised.
-                    let hdr = unsafe { hdr.assume_init_ref() };
-                    let payload_len = parse_frame_len(hdr.try_into().unwrap(), self.max_payload_len)?;
-                    self.carry.start += gnitz_wire::FRAME_LEN_PREFIX_BYTES;
-                    self.partial = Some(Vec::with_capacity(payload_len));
-                }
-            }
-        }
-    }
-
-    /// One read into wherever the next bytes belong: the payload in progress
-    /// (the carry is always empty while one is short), else the scratch
-    /// behind the carry, which holds at most three header bytes and is
-    /// compacted to the front first.
+    /// One read, into the payload in progress when there is one, else into the
+    /// whole scratch.
     fn read_more(&mut self, inner: &mut Inner) -> Result<ReadOutcome, ProtocolError> {
-        let outcome = match self.partial.as_mut() {
-            Some(p) => {
-                let outcome = inner.read_into(p.spare_capacity_mut())?;
+        debug_assert!(self.carry.is_empty(), "a read would land ahead of carried bytes");
+        let outcome = match self.deframer.payload_tail() {
+            Some(tail) => {
+                let outcome = inner.read_into(tail)?;
                 if let ReadOutcome::Data { n, .. } = outcome {
-                    // SAFETY: the read initialised `n` bytes at the head of the
-                    // spare capacity.
-                    unsafe { p.set_len(p.len() + n) };
+                    // SAFETY: the read initialised `n` bytes at the head of the tail.
+                    unsafe { self.deframer.filled(n) };
                 }
                 outcome
             }
             None => {
-                if self.carry.start > 0 {
-                    let len = self.carry.len();
-                    self.scratch.copy_within(self.carry.clone(), 0);
-                    self.carry = 0..len;
-                }
-                let outcome = inner.read_into(&mut self.scratch[self.carry.end..])?;
+                let outcome = inner.read_into(&mut self.scratch[..])?;
                 if let ReadOutcome::Data { n, .. } = outcome {
-                    self.carry.end += n;
+                    self.carry = 0..n;
                 }
                 outcome
             }
@@ -625,34 +559,23 @@ impl OutQueue {
     }
 }
 
-/// Decode a received length prefix against the per-connection ceiling, refusing
-/// the close sentinel. The one enforcement point for every framed recv.
-pub(crate) fn parse_frame_len(
-    hdr: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES],
-    max_payload_len: usize,
-) -> Result<usize, ProtocolError> {
-    let payload_len = u32::from_le_bytes(hdr) as usize;
-    if payload_len == 0 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "zero-length close sentinel",
-        )));
+impl From<FrameLenError> for ProtocolError {
+    fn from(e: FrameLenError) -> Self {
+        match e {
+            FrameLenError::Zero => ProtocolError::DecodeError("zero-length frame".into()),
+            FrameLenError::Oversize { len, max } => {
+                ProtocolError::DecodeError(format!("payload length {len} exceeds maximum {max} bytes"))
+            }
+        }
     }
-    if payload_len > max_payload_len {
-        return Err(ProtocolError::DecodeError(format!(
-            "payload length {payload_len} exceeds maximum {max_payload_len} bytes"
-        )));
-    }
-    Ok(payload_len)
 }
 
-/// Encode a frame's length prefix, refusing the close sentinel and anything
-/// past `u32::MAX`. The one enforcement point for every framed send.
+/// Encode a frame's length prefix, refusing zero and anything past `u32::MAX`. The one enforcement point for every framed send.
 pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], ProtocolError> {
     if len == 0 {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "empty frame (would collide with the protocol close sentinel)",
+            "empty frame (zero is never a legal length)",
         )));
     }
     if len > u32::MAX as usize {
@@ -664,8 +587,7 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
     Ok((len as u32).to_le_bytes())
 }
 
-/// Send HELLO, parse the ACK, and mark the transport established under its
-/// payload limit. Returns the server's `published_lsn`, which seeds the client's
+/// Send HELLO, parse the ACK, and mark the transport established. Returns the server's `published_lsn`, which seeds the client's
 /// OCC basis. `until` bounds the exchange as a whole — on TLS the handshake
 /// included — not each leg.
 pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Result<u64, ProtocolError> {
@@ -678,7 +600,7 @@ pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Resul
         if ack.magic != gnitz_wire::HELLO_MAGIC {
             return Err(ProtocolError::DecodeError("HELLO ACK magic mismatch".into()));
         }
-        t.mark_established(ack.limit_bytes as usize);
+        t.mark_established();
         return Ok(ack.published_lsn);
     }
 

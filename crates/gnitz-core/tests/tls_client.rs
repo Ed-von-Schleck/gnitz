@@ -14,9 +14,8 @@
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
-use gnitz_core::protocol::{
-    encode_frame, hello_handshake, set_sockopt_int, ClientTransport, ClientVerb, WireFlags, WireStatus,
-};
+use gnitz_core::protocol::{encode_frame, hello_handshake, ClientTransport, ClientVerb, WireFlags, WireStatus};
+use gnitz_foundation::posix_io::set_sockopt_int;
 use gnitz_wire::control::{peek_control_block, ControlHeader};
 
 /// One control-only frame, blocking until it is on the wire.
@@ -90,7 +89,7 @@ fn make_batch(schema: &Schema, start: u64, count: usize) -> ZSetBatch {
 /// deadlock but is a test artifact.
 fn set_small_bufs(fd: RawFd) {
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        set_sockopt_int(fd, opt, 128 * 1024);
+        set_sockopt_int(fd, libc::SOL_SOCKET, opt, 128 * 1024);
     }
 }
 
@@ -392,11 +391,8 @@ fn inbound_cap_breach_closes_stalled_connection() {
         // connection_loop in its guarded send.
         send_control(&mut t, tid, WireFlags::default()).unwrap();
 
-        // Pipeline ~80 MB of pushes; the pump queues them until the 64 MiB
-        // cap trips and the recv side tears the connection down. The rows
-        // duplicate block 0 exactly (idempotent upserts), so however many
-        // queued frames the draining connection_loop applies before hitting
-        // the closed queue, the table's net content is unchanged.
+        // Pipeline ~80 MB of pushes past the 64 MiB cap; the breach discards
+        // them unapplied. Each duplicates block 0, so the scan below holds regardless.
         let push_flags = WireFlags {
             verb: ClientVerb::Push,
             conflict_mode: WireConflictMode::Update,

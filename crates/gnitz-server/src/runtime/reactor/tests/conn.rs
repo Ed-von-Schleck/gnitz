@@ -123,7 +123,7 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
     let fd = conn.fd();
-    r.register_conn(&conn, Box::new(Plain));
+    r.register_conn(&conn, Box::new(Plain::new()));
 
     partner.shutdown(std::net::Shutdown::Write).expect("half-close");
     assert!(
@@ -144,16 +144,17 @@ fn a_closed_connection_drops_its_entry_and_closes_with_its_last_holder() {
     assert_eq!(partner.read(&mut buf).ok(), Some(0), "and closes with its last holder");
 }
 
-/// `close` ends an armed recv, even one not yet submitted, so a silent peer
-/// cannot pin the connection.
+/// A local close ends an armed recv, even one not yet submitted, so a silent
+/// peer cannot pin the connection.
 #[test]
 fn close_ends_an_armed_recv() {
     let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
     let fd = conn.fd();
-    r.register_conn(&conn, Box::new(Plain));
-    conn.close();
+    r.register_conn(&conn, Box::new(Plain::new()));
+    conn.abort();
+    conn.shutdown();
 
     // The peer neither writes nor closes: only the shutdown can complete the
     // recv.
@@ -162,6 +163,41 @@ fn close_ends_an_armed_recv() {
         "close must end the armed recv; without it the entry lives until the peer acts"
     );
     drop(partner);
+}
+
+/// A refused recv side runs nothing it queued: the frames ahead of the refusal are
+/// discarded and refunded at once, and the socket is shut down so the peer — and
+/// any task parked in a send to it — sees the end now.
+#[test]
+fn a_refused_recv_discards_its_queue_and_shuts_down() {
+    let (local, mut partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let r = make_reactor();
+    let conn = r.client_conn(OwnedFd::from(local));
+    let fd = conn.fd();
+    r.register_conn(&conn, Box::new(Plain::new()));
+    conn.mark_established();
+
+    let mut wire = framed(&[0x42u8; 100]);
+    wire.extend_from_slice(&((gnitz_wire::MAX_FRAME_PAYLOAD + 1) as u32).to_le_bytes());
+    gnitz_foundation::posix_io::write_all_fd(partner.as_raw_fd(), &wire).expect("write");
+
+    assert!(
+        poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
+        "the oversize prefix ends the recv side"
+    );
+    assert!(conn.try_recv().is_none(), "the frame ahead of the refusal is discarded");
+    assert_eq!(
+        r.inner.inbound.held(),
+        0,
+        "and refunded while the connection is still held"
+    );
+
+    partner
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let mut buf = [0u8; 1];
+    assert_eq!(partner.read(&mut buf).ok(), Some(0), "the partner reads EOF");
+    drop(conn);
 }
 
 /// A payload far larger than the socket buffers completes across many short sends.
@@ -468,21 +504,27 @@ fn one_recv_completion_queues_a_whole_pipelined_run() {
     let (local, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     let r = make_reactor();
     let conn = r.client_conn(OwnedFd::from(local));
-    r.register_conn(&conn, Box::new(Plain));
-    conn.set_max_payload_len(1 << 20);
+    r.register_conn(&conn, Box::new(Plain::new()));
+    conn.mark_established();
 
     const N: usize = 12;
     let wire: Vec<u8> = (0..N).flat_map(|i| framed(&vec![i as u8; 600])).collect();
     gnitz_foundation::posix_io::write_all_fd(partner.as_raw_fd(), &wire).expect("write");
 
-    let queued = || conn.q.borrow().queued();
-    assert!(poll_until(&r, 10_000, || queued() > 0), "the run must be deframed");
+    let mut got = Vec::new();
+    assert!(
+        poll_until(&r, 10_000, || {
+            got.extend(std::iter::from_fn(|| conn.try_recv()));
+            !got.is_empty()
+        }),
+        "the run must be deframed"
+    );
     assert_eq!(
-        queued(),
+        got.len(),
         N,
         "the first completion must queue every frame the read carried, not one",
     );
-    assert_eq!(conn.try_recv().map(|b| b.as_slice()[0]), Some(0), "in order");
+    assert_eq!(got[0].as_slice()[0], 0, "in order");
     drop(partner);
 }
 

@@ -1,4 +1,4 @@
-//! Client ingress: the frame deframer over its carry, and the global
+//! Client ingress: `Plain`'s reads over the deframer, and the global
 //! inbound-memory budget every `RecvBuf` is charged against.
 
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -14,21 +14,21 @@ fn capped_reactor(cap: usize) -> Reactor {
 }
 
 /// A registered connection over one end of a fresh socketpair, and the other end.
-fn registered(r: &Reactor, max_payload: Option<usize>) -> (Rc<ClientConn>, UnixStream) {
+fn registered(r: &Reactor, established: bool) -> (Rc<ClientConn>, UnixStream) {
     let (local, partner) = UnixStream::pair().expect("socketpair");
     let conn = r.client_conn(OwnedFd::from(local));
-    r.register_conn(&conn, Box::new(Plain));
-    if let Some(limit) = max_payload {
-        conn.set_max_payload_len(limit);
+    r.register_conn(&conn, Box::new(Plain::new()));
+    if established {
+        conn.mark_established();
     }
     (conn, partner)
 }
 
 /// `wire` into a fresh connection capped at `cap` ends its recv side without
-/// parking a reader, and leaves nothing charged once the connection drops.
-fn assert_refused(cap: usize, max_payload: Option<usize>, wire: &[u8], why: &str) {
+/// parking a reader or delivering a frame, and leaves nothing charged.
+fn assert_refused(cap: usize, established: bool, wire: &[u8], why: &str) {
     let r = capped_reactor(cap);
-    let (conn, partner) = registered(&r, max_payload);
+    let (conn, partner) = registered(&r, established);
     let fd = conn.fd();
     gnitz_foundation::posix_io::write_all_fd(partner.as_raw_fd(), wire).expect("write");
 
@@ -36,16 +36,12 @@ fn assert_refused(cap: usize, max_payload: Option<usize>, wire: &[u8], why: &str
         poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&fd)),
         "{why}"
     );
-    loop {
-        match try_poll_once(conn.recv()) {
-            Some(Some(_)) => continue,
-            Some(None) => break,
-            None => panic!("{why}: recv after the close must never park"),
-        }
-    }
-    drop(conn);
+    assert!(
+        matches!(try_poll_once(conn.recv()), Some(None)),
+        "{why}: a refusal discards the queue, and recv never parks after it"
+    );
     assert_eq!(r.inner.inbound.held(), 0, "{why}: budget must be reconciled");
-    drop(partner);
+    drop((conn, partner));
 }
 
 /// The four ways an inbound frame is refused at its header, before any payload
@@ -55,32 +51,31 @@ fn inbound_frames_are_refused_at_the_header() {
     let repeat = |payload: &[u8], n: usize| -> Vec<u8> { (0..n).flat_map(|_| framed(payload)).collect() };
 
     // frame_weight(100) = 100. Two frames = 200 held; the 3rd pushes 300 > 250.
-    assert_refused(
-        250,
-        Some(1 << 20),
-        &repeat(&[0xAB; 100], 3),
-        "cumulative weight over cap",
-    );
+    assert_refused(250, true, &repeat(&[0xAB; 100], 3), "cumulative weight over cap");
 
     // 1-byte payloads each weigh the 64-byte floor, so 64 frames = 4096 and the
     // 65th breaches. Without the floor 65 frames would weigh 65 B and never trip.
     assert_refused(
         4096,
-        None,
+        false,
         &repeat(&[0xCD], 65),
         "tiny-frame flood via the weight floor",
     );
 
-    // No `set_max_payload_len`: the ceiling is still the 8-byte HELLO payload.
+    // Not established: the ceiling is still the 8-byte HELLO payload.
     assert_refused(
         usize::MAX,
-        None,
+        false,
         &framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN + 1]),
         "first frame over the pre-handshake ceiling",
     );
 
-    // A zero-length frame is the close sentinel, not a frame.
-    assert_refused(usize::MAX, None, &0u32.to_le_bytes(), "the zero-length close sentinel");
+    assert_refused(
+        usize::MAX,
+        false,
+        &0u32.to_le_bytes(),
+        "a zero-length prefix is a protocol violation",
+    );
 }
 
 /// In-flight (partial, un-completed) payloads are accounted, and a second
@@ -90,7 +85,7 @@ fn inbound_frames_are_refused_at_the_header() {
 fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     // Exactly one 10_000-byte in-flight buffer fits.
     let r = capped_reactor(10_000);
-    let (conn1, partner1) = registered(&r, Some(1 << 20));
+    let (conn1, partner1) = registered(&r, true);
 
     // Header claims 10_000 bytes but only 100 are delivered: the buffer
     // is malloc'd and counted at header-parse time, yet no frame completes.
@@ -101,14 +96,13 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
 
     let counted = poll_until(&r, 10_000, || r.inner.inbound.held() == 10_000);
     assert!(counted, "in-flight buffer was not accounted");
-    assert_eq!(
-        conn1.q.borrow().queued(),
-        0,
+    assert!(
+        conn1.try_recv().is_none(),
         "no frame should have completed from a partial payload"
     );
 
     // Second connection whose first frame would breach the now-full cap.
-    let (conn2, partner2) = registered(&r, Some(1 << 20));
+    let (conn2, partner2) = registered(&r, true);
     let fd2 = conn2.fd();
     gnitz_foundation::posix_io::write_all_fd(partner2.as_raw_fd(), &framed(&[0x22u8; 100])).expect("write");
 
@@ -128,7 +122,7 @@ fn inbound_cap_accounting_balances_on_consume() {
     // One recv deframes a whole round and charges every frame in it, so the peak
     // is a round rather than a frame — and the cap below admits one.
     let r = capped_reactor(15_000);
-    let (conn, partner) = registered(&r, Some(1 << 20));
+    let (conn, partner) = registered(&r, true);
 
     let payload = vec![0x7Eu8; 1_000]; // frame_weight = 1_000
     for _round in 0..2 {
@@ -154,26 +148,27 @@ fn inbound_cap_accounting_balances_on_consume() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// The deframer over its carry, driven through `RecvQueue` directly: the
-// window is a raw pointer either transport writes into.
+// `Plain`'s reads over the deframer, driven the way the reactor drives them:
+// the window is a raw pointer a recv writes into.
 // ─────────────────────────────────────────────────────────────────
 
-/// One `RecvQueue` plus the window it last handed out, driven one simulated
-/// read at a time. Uncapped: the cap and the payload ceiling have their own
-/// tests, through `assert_refused`.
+/// One uncapped `RecvQueue` behind a `Plain`, and the window it last handed out,
+/// driven one simulated read at a time.
 struct Feeder {
     q: io::RecvQueue,
-    budget: Rc<io::InboundBudget>,
+    plain: io::Plain,
+    budget: Rc<io::Budget>,
     window: (*mut u8, u32),
 }
 
 impl Feeder {
     fn new() -> Feeder {
-        let budget = Rc::new(io::InboundBudget::new(usize::MAX));
+        let budget = io::Budget::new(usize::MAX);
         let mut q = io::RecvQueue::new(Rc::clone(&budget));
-        q.set_max_payload_len(1 << 20);
-        let window = q.remaining();
-        Feeder { q, budget, window }
+        q.mark_established();
+        let mut plain = io::Plain::new();
+        let window = plain.window(&mut q);
+        Feeder { q, plain, budget, window }
     }
 
     /// Inbound bytes this connection currently holds charged.
@@ -184,11 +179,11 @@ impl Feeder {
     /// One read: hand the window as many of `bytes` as it takes. Returns how
     /// many, or why the queue closed the connection.
     fn read(&mut self, bytes: &[u8]) -> Result<usize, RecvEnd> {
-        assert!(self.window.1 > 0, "remaining must never arm a zero-length window");
+        assert!(self.window.1 > 0, "a window is never zero-length");
         let n = bytes.len().min(self.window.1 as usize);
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.window.0, n) };
-        self.q.deliver(n)?;
-        self.window = self.q.remaining();
+        self.plain.ingest(n, &mut self.q)?;
+        self.window = self.plain.window(&mut self.q);
         Ok(n)
     }
 
@@ -209,9 +204,9 @@ impl Feeder {
             .collect()
     }
 
-    /// The window is the whole carry exactly when nothing is left buffered.
-    fn carry_is_empty(&self) -> bool {
-        self.window.1 as usize == io::CARRY_BYTES
+    /// Nothing is left buffered between frames.
+    fn is_idle(&self) -> bool {
+        !self.q.deframer.is_mid_frame()
     }
 }
 
@@ -229,35 +224,18 @@ fn one_read_queues_every_frame_it_carries() {
         "a 16-frame run must cost one read"
     );
     assert_eq!(f.drain(), payloads, "every frame, in order");
-    assert!(f.carry_is_empty(), "a fully consumed run leaves the carry empty");
+    assert!(f.is_idle(), "a fully consumed run leaves nothing buffered");
 }
 
-/// A frame split at every byte boundary — inside the length prefix and inside
-/// the payload alike — completes exactly once, and while only a prefix is
-/// buffered the connection holds no charged buffer.
+/// While only part of a length prefix has arrived the connection holds no
+/// charged buffer: the whole prefix is the charge point.
 #[test]
-fn a_frame_split_at_any_boundary_completes_once() {
-    let payload = vec![0x5Au8; 40];
-    let wire = framed(&payload);
-    for split in 1..wire.len() {
+fn a_split_prefix_charges_nothing() {
+    let wire = framed(&[0x5Au8; 40]);
+    for split in 1..gnitz_wire::FRAME_LEN_PREFIX_BYTES {
         let mut f = Feeder::new();
-
         assert_eq!(f.read(&wire[..split]).expect("no refusal"), split);
-        if split < gnitz_wire::FRAME_LEN_PREFIX_BYTES {
-            assert_eq!(
-                f.held(),
-                0,
-                "split={split}: a prefix alone charges nothing — the header is the charge point",
-            );
-        }
-        assert!(
-            f.drain().is_empty(),
-            "split={split}: no frame completes from a fragment"
-        );
-
-        f.feed(&wire[split..]).expect("no refusal");
-        assert_eq!(f.drain(), vec![payload.clone()], "split={split}");
-        assert!(f.carry_is_empty(), "split={split}: nothing left buffered");
+        assert_eq!(f.held(), 0, "split={split}");
     }
 }
 
@@ -278,11 +256,11 @@ fn a_frame_larger_than_the_carry_reads_into_its_own_buffer() {
     let reads = f.feed(&wire).expect("no refusal");
     assert_eq!(reads, 3, "one carry read, one direct read, one carry read for the tail");
     assert_eq!(f.drain(), vec![big, small]);
-    assert!(f.carry_is_empty());
+    assert!(f.is_idle());
 }
 
 /// A frame straddling the end of a carry read completes on the **next** read,
-/// in the same `deliver` that parses the frames behind it — so reads per run
+/// in the same `ingest` that parses the frames behind it — so reads per run
 /// stay `⌈bytes / CARRY_BYTES⌉` rather than twice that minus one.
 #[test]
 fn a_straddling_frame_rides_the_next_carry_read() {
@@ -299,10 +277,10 @@ fn a_straddling_frame_rides_the_next_carry_read() {
 }
 
 /// A read that exactly fills the carry and ends part-way into a length prefix
-/// compacts and completes on the next read — the case that would arm a
-/// zero-length window if compaction were skipped.
+/// leaves the whole carry as the next window, and the frame behind that prefix
+/// completes on the next read.
 #[test]
-fn a_prefix_split_by_a_full_carry_compacts() {
+fn a_prefix_split_by_a_full_carry_resumes() {
     // Two frames whose wire bytes total `CARRY_BYTES - 2`, so the first read
     // ends two bytes into the third frame's length prefix.
     const P: usize = io::CARRY_BYTES / 2 - gnitz_wire::FRAME_LEN_PREFIX_BYTES - 1;
@@ -323,37 +301,23 @@ fn a_prefix_split_by_a_full_carry_compacts() {
     );
     assert_eq!(
         f.window.1 as usize,
-        io::CARRY_BYTES - 2,
-        "the two carried prefix bytes must be compacted to the front",
+        io::CARRY_BYTES,
+        "the next window is the whole carry"
     );
 
-    f.feed(&wire[taken..]).expect("no refusal");
+    assert_eq!(f.feed(&wire[taken..]).expect("no refusal"), 1);
     assert_eq!(f.drain(), vec![c]);
 }
 
-/// The zero-length close sentinel refuses the connection, and the frames parsed
-/// ahead of it in the same read are queued before it does.
-#[test]
-fn frames_ahead_of_the_close_sentinel_are_queued() {
-    let payload = vec![0x77u8; 128];
-    let mut wire = framed(&payload);
-    wire.extend_from_slice(&0u32.to_le_bytes());
-
-    let mut f = Feeder::new();
-    assert!(f.read(&wire).is_err(), "the sentinel closes the recv side");
-    assert_eq!(f.drain(), vec![payload], "the frame ahead of it was already queued");
-}
-
 /// The pre-handshake ceiling adjudicates every frame in the first read, not
-/// just the first: HELLO is a synchronous handshake, so a peer that pipelines
-/// anything behind it is refused rather than served.
+/// just the first: a frame over the HELLO size pipelined behind it is refused.
 #[test]
 fn nothing_may_ride_with_hello() {
     let mut wire = framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN]);
     wire.extend_from_slice(&framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN + 1]));
     assert_refused(
         usize::MAX,
-        None,
+        false,
         &wire,
         "a frame pipelined behind HELLO is under the pre-handshake ceiling",
     );

@@ -8,7 +8,7 @@ mod listener;
 pub(crate) use listener::{setup_tls_listener, TlsCli, TlsListener};
 
 use std::cell::{Cell, RefCell};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
 
 use crate::runtime::reactor::{
-    chan, AsyncRwLock, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
+    chan, AsyncRwLock, Charge, ClientConn, PeerGone, Reactor, RecvEnd, RecvFilter, RecvQueue, SendBody, WriteGuard,
 };
 
 /// Size of the ciphertext window each recv lands in.
@@ -27,67 +27,43 @@ const CIPHER_WINDOW_BYTES: usize = 64 * 1024;
 /// frames it yields on `q`.
 fn ingest_cipher(sess: &mut rustls::ServerConnection, mut cipher: &[u8], q: &mut RecvQueue) -> Result<(), RecvEnd> {
     while !cipher.is_empty() {
-        // `Ok(0)` is end-of-stream. An `Err` is rustls's buffer being full, not a
-        // failure: the drain below frees it and the loop retries the rest.
-        if matches!(sess.read_tls(&mut cipher), Ok(0)) {
-            return Err(RecvEnd::PeerClosed);
-        }
-        let io_state = sess.process_new_packets().map_err(|_| RecvEnd::Protocol)?;
-        // Before the close test, so plaintext decrypted in this chunk is still
-        // enqueued when the peer closed in it too.
+        // An `Err` is rustls's buffer being full, not a failure: the drain below
+        // frees it and the loop retries the rest.
+        let _ = sess.read_tls(&mut cipher);
+        sess.process_new_packets().map_err(|_| RecvEnd::Protocol)?;
         feed_decrypted(sess, q)?;
-        if io_state.peer_has_closed() {
-            return Err(RecvEnd::PeerClosed);
-        }
     }
     Ok(())
 }
 
-/// Drain all currently-available decrypted plaintext into `q`'s own write window.
+/// Hand every decrypted plaintext chunk rustls holds to `q`. A peer's close_notify
+/// ends the recv side here, once the plaintext ahead of it is queued.
 fn feed_decrypted(sess: &mut rustls::ServerConnection, q: &mut RecvQueue) -> Result<(), RecvEnd> {
+    let mut reader = sess.reader();
     loop {
-        let (ptr, len) = q.remaining();
-        // SAFETY: ptr/len are the queue's own write window (its carry, or an
-        // in-flight RecvBuf payload), exclusively ours.
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) };
-        match sess.reader().read(slice) {
-            Ok(0) => return Err(RecvEnd::PeerClosed), // clean close_notify
-            Ok(m) => q.deliver(m)?,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()), // drained; wait
+        let n = match reader.fill_buf() {
+            Ok([]) => return Err(RecvEnd::PeerClosed),
+            Ok(chunk) => {
+                q.feed(chunk)?;
+                chunk.len()
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
             Err(_) => return Err(RecvEnd::Protocol),
-        }
-    }
-}
-
-/// Live-TLS-connection counter guard: constructed only by
-/// [`TlsListener::admit`], so the count and the cap are inseparable, and held in
-/// `TlsShared`, so it drops exactly when the session ends.
-pub(crate) struct ConnCountGuard(Rc<Cell<u32>>);
-
-impl ConnCountGuard {
-    fn new(c: Rc<Cell<u32>>) -> Self {
-        c.set(c.get() + 1);
-        Self(c)
-    }
-}
-
-impl Drop for ConnCountGuard {
-    fn drop(&mut self) {
-        debug_assert!(self.0.get() > 0, "tls conn count underflow");
-        self.0.set(self.0.get() - 1);
+        };
+        reader.consume(n);
     }
 }
 
 /// Shared handle to one TLS connection. The recv filter holds one too, so
-/// `ConnCountGuard` tracks the session until the socket closes.
+/// the connection-count charge tracks the session until the socket closes.
 pub(crate) struct TlsShared {
     reactor: Rc<Reactor>,
     /// The socket and its deframed frames; see `ClientConn` for the fd's lifetime.
     conn: Rc<ClientConn>,
     /// The codec state, and nothing else. Never borrowed across an await.
     state: RefCell<rustls::ServerConnection>,
-    /// Decrements the reactor-thread live-connection counter on teardown.
-    _conn_guard: ConnCountGuard,
+    /// This session's place under the listener's connection cap.
+    _conn_guard: Charge,
     /// This connection is finished, from whichever end: senders refuse and the
     /// flusher shuts the socket down and exits.
     closed: Cell<bool>,
@@ -100,20 +76,13 @@ pub(crate) struct TlsShared {
 /// What every accepted TLS socket wants, set here so the accept loop needs no
 /// socket-option knowledge. Best-effort: a socket that refuses either works on.
 fn set_socket_options(fd: i32) {
-    let on: libc::c_int = 1;
-    let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    for (level, opt) in [
-        // Small control frames must not pay Nagle's 40 ms batching delay
-        // (AF_UNIX has none, so this restores latency parity).
-        (libc::IPPROTO_TCP, libc::TCP_NODELAY),
-        // Untuned: a silently half-open connection is reaped by the kernel
-        // default probing (~2 h) rather than parking a recv forever.
-        (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
-    ] {
-        unsafe {
-            libc::setsockopt(fd, level, opt, &on as *const _ as *const libc::c_void, len);
-        }
-    }
+    use gnitz_foundation::posix_io::set_sockopt_int;
+    // Small control frames must not pay Nagle's 40 ms batching delay
+    // (AF_UNIX has none, so this restores latency parity).
+    set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+    // Untuned: a silently half-open connection is reaped by the kernel
+    // default probing (~2 h) rather than parking a recv forever.
+    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
 }
 
 impl TlsShared {
@@ -123,7 +92,7 @@ impl TlsShared {
         reactor: Rc<Reactor>,
         fd: OwnedFd,
         cfg: Arc<rustls::ServerConfig>,
-        conn_guard: ConnCountGuard,
+        conn_guard: Charge,
     ) -> Result<Rc<TlsShared>, rustls::Error> {
         /// rustls's outgoing-buffer limit: what one `writer().write()` accepts, and
         /// so how much ciphertext one encrypt-and-send turn carries.
@@ -131,7 +100,7 @@ impl TlsShared {
 
         // `ServerConnection::new` runs first: on failure the moved-in `fd` and
         // `conn_guard` drop here as this frame unwinds — closing the socket and
-        // decrementing the count; on success both live in the returned `TlsShared`.
+        // refunding the count; on success both live in the returned `TlsShared`.
         let mut sess = rustls::ServerConnection::new(cfg)?;
         sess.set_buffer_limit(Some(SEND_BUFFER_BYTES));
         set_socket_options(fd.as_raw_fd());
@@ -240,16 +209,6 @@ impl RecvFilter for TlsIngress {
             self.tls.notify_flusher();
         }
         result
-    }
-}
-
-impl Drop for TlsIngress {
-    fn drop(&mut self) {
-        // Shut the socket down so a writer parked on a full sndbuf errors out and
-        // releases `send_lock`, rather than wedging teardown behind it.
-        self.tls.conn.shutdown();
-        self.tls.closed.set(true);
-        self.tls.notify_flusher();
     }
 }
 

@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{established, framed, make_socketpair, make_transport_pair, raw_send};
+use gnitz_foundation::posix_io::set_sockopt_int;
 use std::os::fd::AsRawFd;
 
 fn set_nonblocking(fd: &OwnedFd) {
@@ -59,7 +60,7 @@ fn spawn_reader(mut t: ClientTransport, count: usize) -> std::thread::JoinHandle
 
 #[test]
 fn test_send_empty_frame_returns_invalid_input() {
-    // An empty payload would collide with the close sentinel.
+    // Zero is never a legal length prefix, so no empty frame can be sent.
     let (mut a, _b) = make_transport_pair();
     let r = a.send_frame(Vec::new(), None);
     assert!(matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
@@ -147,7 +148,7 @@ fn test_queue_partial_writes_small_sndbuf_nonblocking() {
     // repeatedly across EAGAIN; the cursor resumes mid-frame each time and
     // every frame arrives intact and in order.
     let (mut a, b) = make_transport_pair();
-    set_sockopt_int(a.as_raw_fd(), libc::SO_SNDBUF, 4096);
+    set_sockopt_int(a.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
     let n = 500usize;
     let expected: Vec<Vec<u8>> = (0..n)
         .map(|i| {
@@ -177,7 +178,7 @@ fn test_send_timeout_leaves_cursor_and_resumes_mid_frame() {
     // clean refusal from a torn frame, so the assertion is on what the peer
     // parses — that frame and the one sent after it, both intact.
     let (mut a, b) = make_transport_pair();
-    set_sockopt_int(a.as_raw_fd(), libc::SO_SNDBUF, 4096);
+    set_sockopt_int(a.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
     let big: Vec<u8> = (0u8..=255).cycle().take(300 * 1024).collect();
     a.enqueue(big.to_vec()).unwrap();
     let r = a.flush_blocking(deadline(Duration::from_millis(100)));
@@ -208,7 +209,7 @@ fn test_send_frame_timeout_keeps_the_tail_queued() {
     // The one-frame blocking send under an expiring deadline: the unwritten
     // tail stays queue state, and the next send finishes it first.
     let (mut a, b) = make_transport_pair();
-    set_sockopt_int(a.as_raw_fd(), libc::SO_SNDBUF, 4096);
+    set_sockopt_int(a.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
     let big: Vec<u8> = (0u8..=255).cycle().take(200 * 1024).collect();
     let r = a.send_frame(big.clone(), deadline(Duration::from_millis(100)));
     assert!(matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock));
@@ -231,7 +232,7 @@ fn test_send_timeout_peer_never_drains_parses_no_torn_frame() {
     // of one frame: once it does drain it parses zero complete frames and
     // then EOF, never a frame whose length swallowed a later one.
     let (mut a, b) = make_transport_pair();
-    set_sockopt_int(a.as_raw_fd(), libc::SO_SNDBUF, 4096);
+    set_sockopt_int(a.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
     let big: Vec<u8> = vec![7u8; 400 * 1024];
     a.enqueue(big.to_vec()).unwrap();
     assert!(a.flush_blocking(deadline(Duration::from_millis(50))).is_err());
@@ -244,28 +245,13 @@ fn test_send_timeout_peer_never_drains_parses_no_torn_frame() {
 }
 
 #[test]
-fn test_hello_handshake_clamps_server_limit() {
-    // A server advertising an oversized limit (u32::MAX) must not raise the
-    // client's negotiated ceiling above MAX_FRAME_PAYLOAD_CLIENT.
+fn test_hello_handshake_establishes_the_frame_ceiling() {
     let (a, b) = make_socketpair();
-    let ack = gnitz_wire::encode_hello_ack(u32::MAX, 0);
-    raw_send(&b, &ack);
+    raw_send(&b, &gnitz_wire::encode_hello_ack(7));
     let mut t = ClientTransport::from_unix_fd(a);
     assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
-    hello_handshake(&mut t, None).unwrap();
-    assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
-}
-
-#[test]
-fn test_hello_handshake_preserves_smaller_limit() {
-    // A server limit below the client ceiling passes through unchanged.
-    let (a, b) = make_socketpair();
-    let small: u32 = 16 * 1024 * 1024;
-    let ack = gnitz_wire::encode_hello_ack(small, 7);
-    raw_send(&b, &ack);
-    let mut t = ClientTransport::from_unix_fd(a);
     let lsn = hello_handshake(&mut t, None).unwrap();
-    assert_eq!(t.max_payload_len(), small as usize);
+    assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD);
     assert_eq!(lsn, 7, "the ACK's published_lsn seeds the client basis");
 }
 
@@ -345,7 +331,7 @@ fn reader_large_payload_is_one_exact_allocation() {
     // A payload larger than the scratch lands in one Vec of exactly
     // payload_len capacity, filled by reads straight into it.
     let (peer, mut t) = make_socketpair_established();
-    set_sockopt_int(peer.as_raw_fd(), libc::SO_SNDBUF, 64 * 1024);
+    set_sockopt_int(peer.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 64 * 1024);
     let big: Vec<u8> = (0u8..=255).cycle().take(3 * SCRATCH_BYTES + 12345).collect();
     let stream = framed(&big);
     let writer = std::thread::spawn(move || raw_send(&peer, &stream));
@@ -388,7 +374,7 @@ fn reader_delivers_frame_before_eof_when_read_fills_scratch_exactly() {
     // reader reads again and sees the 0; the frame must come out first and
     // the EOF on the call after.
     let (peer, mut t) = make_socketpair_established();
-    set_sockopt_int(peer.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
+    set_sockopt_int(peer.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 256 * 1024);
     let payload: Vec<u8> = vec![9u8; SCRATCH_BYTES - 4];
     raw_send(&peer, &framed(&payload));
     drop(peer);

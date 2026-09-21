@@ -1,17 +1,14 @@
 use super::super::fixtures::{test_dispatcher, test_dispatcher_with_writers};
 use crate::catalog::{CatalogEngine, SysFamily};
 use crate::runtime::sal::{GroupTargets, WorkerSet};
+use crate::runtime::test_support::fork_child;
 use gnitz_foundation::posix_io::retry_eintr;
 
 /// Fork a child that exits immediately and block until it is a zombie *without*
 /// reaping it, so the probe's own `waitpid(WNOHANG)` is guaranteed to find it on
 /// the first call. `waitpid` rejects `WNOWAIT`, hence `waitid`.
 fn spawn_zombie() -> i32 {
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork failed");
-    if pid == 0 {
-        unsafe { libc::_exit(0) };
-    }
+    let pid = unsafe { fork_child(|| {}) };
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     retry_eintr(|| unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) })
         .expect("waitid pre-sync");
@@ -35,15 +32,11 @@ fn spawn_and_reap_dead() -> i32 {
 fn check_workers_keeps_reporting_a_dead_worker() {
     // `PR_SET_PDEATHSIG` on the forking thread: a panicking test unwinds off
     // this thread and takes the paused child with it, rather than orphaning it.
-    let live = unsafe { libc::fork() };
-    assert!(live >= 0, "fork failed");
-    if live == 0 {
-        unsafe {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-            libc::pause();
-            libc::_exit(0);
-        }
-    }
+    let child = || unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+        libc::pause();
+    };
+    let live = unsafe { fork_child(child) };
     let (zombie, reaped) = (spawn_zombie(), spawn_and_reap_dead());
 
     let disp = test_dispatcher(vec![live, zombie, reaped], std::ptr::null_mut());

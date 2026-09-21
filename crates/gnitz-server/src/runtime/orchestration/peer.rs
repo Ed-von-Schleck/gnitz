@@ -36,7 +36,7 @@ enum Transport {
 impl Peer {
     pub fn unix(fd: OwnedFd, reactor: Rc<Reactor>) -> Peer {
         let conn = reactor.client_conn(fd);
-        reactor.register_conn(&conn, Box::new(Plain));
+        reactor.register_conn(&conn, Box::new(Plain::new()));
         Peer {
             conn,
             transport: Transport::Unix(reactor),
@@ -138,15 +138,16 @@ impl Peer {
         r
     }
 
-    /// Elevate the per-connection inbound frame ceiling after HELLO.
-    pub fn set_max_payload_len(&self, limit: usize) {
-        self.conn.set_max_payload_len(limit);
+    /// Raise the inbound frame ceiling to the established one, after HELLO.
+    pub fn mark_established(&self) {
+        self.conn.mark_established();
     }
 
-    /// Idempotent on both transports.
+    /// Discard what is queued and close the transport. Idempotent.
     pub fn close(&self) {
+        self.conn.abort();
         match &self.transport {
-            Transport::Unix(_) => self.conn.close(),
+            Transport::Unix(_) => self.conn.shutdown(),
             Transport::Tls(t) => t.close(),
         }
     }

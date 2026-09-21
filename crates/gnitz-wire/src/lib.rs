@@ -86,6 +86,7 @@ macro_rules! wire_enum {
 mod catalog;
 mod circuit;
 mod codec;
+mod deframe;
 mod flags;
 mod german_string;
 mod handshake;
@@ -110,6 +111,7 @@ pub use circuit::*;
 // The cursor itself, for the one payload this crate frames but never reads:
 // `gnitz-expr`'s program blob.
 pub use codec::{Reader, Writer};
+pub use deframe::*;
 pub use flags::*;
 pub use german_string::*;
 pub use handshake::*;
