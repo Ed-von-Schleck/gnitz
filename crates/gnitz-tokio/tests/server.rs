@@ -110,7 +110,7 @@ fn an_idle_connection_consumes_no_cpu() {
     );
 
     drop(client);
-    rt.block_on(driver).unwrap().unwrap();
+    rt.block_on(driver).unwrap();
 }
 
 /// N operations on cloned handles across tasks, each to its own result; the
@@ -161,7 +161,7 @@ fn cloned_handles_across_tasks_each_get_their_own_result() {
     assert!(rt.block_on(client.resolve(&sn, "nope")).unwrap().is_none());
 
     drop(client);
-    rt.block_on(driver).unwrap().unwrap();
+    rt.block_on(driver).unwrap();
 }
 
 // ── Syscalls per burst ────────────────────────────────────────────────────
@@ -196,8 +196,7 @@ fn syscall_count_child() {
             }
             // The last handle goes, which is what lets the driver finish.
         };
-        let (driven, ()) = tokio::join!(conn, work);
-        driven.unwrap();
+        tokio::join!(conn, work);
     });
 }
 
@@ -413,5 +412,5 @@ fn an_async_handle_mirrors_through_a_blocking_client() {
         .expect("close it again");
 
     drop(client);
-    rt.block_on(driver).unwrap().unwrap();
+    rt.block_on(driver).unwrap();
 }

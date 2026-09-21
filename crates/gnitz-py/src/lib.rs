@@ -47,7 +47,7 @@ pyo3::create_exception!(_native, GnitzNotFoundError, GnitzError);
 pyo3::create_exception!(_native, GnitzIntegrityError, GnitzError);
 
 /// Wrap any `Display` error as a `GnitzError` PyErr. For the handful of
-/// failures that carry no retryability verdict (handshake, waker setup).
+/// failures that carry no retryability verdict (handshake).
 pub(crate) fn gnitz_err(e: impl std::fmt::Display) -> PyErr {
     GnitzError::new_err(e.to_string())
 }

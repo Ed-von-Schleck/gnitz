@@ -67,7 +67,7 @@ fn drive_all(s: &mut Session, want: usize) -> (HashMap<SlotId, Result<Reply, gni
     let mut ready = Interest::WRITE;
     let mut both_armed = false;
     while done.len() < want {
-        for (id, r) in s.step(ready).expect("step") {
+        for (id, r) in s.step(ready) {
             assert!(done.insert(id, r).is_none(), "a slot completes exactly once");
         }
         if done.len() == want {
@@ -176,7 +176,7 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     let batch = rows(0, 10);
     // Submit a push and never wait for it: the driver walks away.
     let abandoned = s.submit(push_req(tid, &schema, &batch)).unwrap();
-    s.step(Interest::WRITE).unwrap();
+    s.step(Interest::WRITE);
     // The next request's reply arrives behind the abandoned one's; the head
     // accumulator consumes that train first, so this one decodes correctly.
     let scan = s.submit(Request::scan(tid)).unwrap();
@@ -188,9 +188,14 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     assert_eq!(data.batch.len(), 10);
 
     // Now close with work pending.
-    s.submit(Request::scan(tid)).unwrap();
-    s.submit(Request::scan(tid)).unwrap();
-    s.close();
+    let a = s.submit(Request::scan(tid)).unwrap();
+    let b = s.submit(Request::scan(tid)).unwrap();
+    let done = s.close();
+    let ids: Vec<_> = done.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![a, b]);
+    assert!(done
+        .iter()
+        .all(|(_, r)| matches!(r, Err(gnitz_core::ClientError::Closed))));
     assert_eq!(s.interest(), Interest::NONE);
     assert!(matches!(
         s.submit(Request::scan(tid)),
@@ -285,14 +290,17 @@ fn three_syscalls_per_push_tls() {
 }
 
 #[test]
-fn blocking_client_survives_server_restart_with_a_closed_verdict() {
+fn blocking_client_survives_server_restart_with_a_lost_verdict() {
     // A dead peer produces readability; the step that follows reads the EOF
-    // and the blocking client reports the connection closed thereafter.
+    // and the blocking client reports the connection lost thereafter.
     let mut srv = ServerHandle::start_with_env(1, &[]);
     let (mut client, tid, _schema) = table(srv.sock_path());
     srv.restart();
     let t0 = std::time::Instant::now();
     assert!(client.scan(tid).is_err());
     assert!(t0.elapsed() < Duration::from_secs(5));
-    assert!(matches!(client.scan(tid), Err(gnitz_core::ClientError::Closed)));
+    assert!(matches!(
+        client.scan(tid),
+        Err(gnitz_core::ClientError::ConnectionLost(_))
+    ));
 }

@@ -1,6 +1,7 @@
 use crate::mirror::MirrorError;
 use crate::protocol::ProtocolError;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -9,10 +10,11 @@ pub enum ClientError {
     /// `WireStatus::Error` the server returned, or a client-side validation the
     /// request never got past.
     ServerError(String),
-    /// The session is closed and accepts no further work: a driver aborted it
-    /// after a transport or protocol failure, or the request never reached the
-    /// wire because the connection was already gone.
+    /// The session's owner closed it; it accepts no further work.
     Closed,
+    /// The connection failed: every request outstanding on it, and every later
+    /// one, carries this one cause.
+    ConnectionLost(Arc<ClientError>),
     /// A mirror verb on a client that never attached a store. The message names
     /// no method — each binding spells the attach differently.
     NoMirrorStore,
@@ -91,6 +93,7 @@ impl fmt::Display for ClientError {
             ClientError::Protocol(e) => write!(f, "protocol error: {e}"),
             ClientError::ServerError(s) => write!(f, "server error: {s}"),
             ClientError::Closed => write!(f, "connection closed"),
+            ClientError::ConnectionLost(cause) => write!(f, "connection lost: {cause}"),
             ClientError::NoMirrorStore => {
                 write!(f, "this client mirrors nothing; attach a store before mirroring a view")
             }

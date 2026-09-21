@@ -288,20 +288,23 @@ impl MirrorState {
 /// One poll's per-view outcomes, `(view id, that view's own result)`.
 type ViewPollResults = Vec<(u64, Result<PollResult, ClientError>)>;
 
-/// A whole request failed: fail every view it never answered — the cause to the
-/// first, `Closed` to the rest, which is what a request each would have got.
-/// Recorded here rather than stashed, because by the time a request is known to
-/// have failed no further reply of it can arrive.
+/// A whole request failed: its first unanswered view gets `cause`, each later
+/// one a copy of it.
 fn fail_range(
     applied: &mut ViewPollResults,
     views: &[(u64, DeltaCursor, Arc<ReplySchema>)],
     unanswered: Range<usize>,
     cause: ClientError,
 ) {
-    let mut cause = Some(cause);
-    for i in unanswered {
-        applied.push((views[i].0, Err(cause.take().unwrap_or(ClientError::Closed))));
-    }
+    let share = |c: &ClientError| match c {
+        ClientError::ConnectionLost(lost) => ClientError::ConnectionLost(Arc::clone(lost)),
+        other => ClientError::ServerError(other.to_string()),
+    };
+    let mut ids = unanswered.map(|i| views[i].0);
+    let Some(first) = ids.next() else { return };
+    let later: Vec<_> = ids.map(|tid| (tid, Err(share(&cause)))).collect();
+    applied.push((first, Err(cause)));
+    applied.extend(later);
 }
 
 impl GnitzClient {
@@ -646,7 +649,7 @@ impl GnitzClient {
 
         let mut ready = Interest::WRITE;
         while !open.is_empty() {
-            let stepped = {
+            let done = {
                 // Addressed by slot, so a train an earlier call abandoned is
                 // recognised rather than matched onto a live view of the same id.
                 let mut sink = |slot: SlotId, result: PolledView| {
@@ -660,29 +663,14 @@ impl GnitzClient {
                 };
                 session.step_polling(ready, Some(&mut sink))
             };
-            match stepped {
-                // Every view of a rejected request it had yet to answer fails
-                // with it.
-                Ok(done) => {
-                    for (slot, result) in done {
-                        let Some(at) = open.iter().position(|(s, _)| *s == slot) else {
-                            continue; // an earlier call's abandoned train
-                        };
-                        let (_, range) = open.remove(at);
-                        if let Err(e) = result {
-                            fail_range(&mut applied, views, range, e);
-                        }
-                    }
-                }
-                // The framing is no longer trustworthy, so the connection goes
-                // and every request still open goes with it.
-                Err(e) => {
-                    session.close();
-                    let mut cause = Some(e);
-                    for (_, range) in std::mem::take(&mut open) {
-                        let e = cause.take().unwrap_or(ClientError::Closed);
-                        fail_range(&mut applied, views, range, e);
-                    }
+            // Every view of a rejected request it had yet to answer fails with it.
+            for (slot, result) in done {
+                let Some(at) = open.iter().position(|(s, _)| *s == slot) else {
+                    continue; // an earlier call's abandoned train
+                };
+                let (_, range) = open.remove(at);
+                if let Err(e) = result {
+                    fail_range(&mut applied, views, range, e);
                 }
             }
             if !open.is_empty() {
@@ -703,8 +691,7 @@ impl GnitzClient {
     /// recovery may not run inside phase one.
     ///
     /// `Err` is reserved for the failures that are the call's rather than a
-    /// view's: no store attached, a poisoned store, a transport failure that ends
-    /// the connection, and an interrupt, which ends the call because one Ctrl-C
+    /// view's: no store attached, a poisoned store, and an interrupt, which ends the call because one Ctrl-C
     /// must. Everything else is that view's [`PollResult::Failed`] entry,
     /// carrying the id [`Self::forget_view`] takes — so a per-view failure is
     /// quiet unless the caller reads the vector, which a correct subscriber does

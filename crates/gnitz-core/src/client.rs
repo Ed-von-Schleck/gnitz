@@ -391,17 +391,9 @@ impl GnitzClient {
     fn await_slot(&mut self, slot: SlotId, mut sink: Option<&mut PollSink<'_>>) -> Result<Reply, ClientError> {
         let mut ready = Interest::WRITE;
         loop {
-            match self.session.step_polling(ready, sink.as_deref_mut()) {
-                Ok(mut done) => {
-                    if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
-                        return done.swap_remove(i).1;
-                    }
-                }
-                Err(e) => {
-                    // The framing is lost.
-                    self.session.close();
-                    return Err(e);
-                }
+            let mut done = self.session.step_polling(ready, sink.as_deref_mut());
+            if let Some(i) = done.iter().position(|(s, _)| *s == slot) {
+                return done.swap_remove(i).1;
             }
             ready = park(&self.session, &mut self.park_hook)?;
         }
@@ -1754,9 +1746,7 @@ impl GnitzClient {
 /// Wait for the session's interest, running `hook` on every `EINTR`.
 pub(crate) fn park(session: &Session, hook: &mut Option<ParkHook>) -> Result<Interest, ClientError> {
     let interest = session.interest();
-    if interest.is_empty() {
-        return Err(ClientError::Closed);
-    }
+    assert!(!interest.is_empty(), "park with nothing outstanding");
     loop {
         match poll_fd(session.as_raw_fd(), interest.poll_events(), None, false) {
             Ok(revents) => return Ok(Interest::from_revents(revents)),

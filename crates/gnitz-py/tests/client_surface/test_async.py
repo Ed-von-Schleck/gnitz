@@ -8,6 +8,7 @@ so a value- or row-level claim belongs to the coordinate that owns it —
 """
 
 import asyncio
+import os
 import shutil
 import subprocess
 import sys
@@ -57,8 +58,8 @@ async def test_pipeline_mixes_operation_kinds(client, schema_name, aconn):
     group. The server handles one request per connection at a time and replies
     in request order, so each future must resolve to *its own* operation's
     result — a swap between two kinds would hand a scan's rows to a push's
-    future, or one relation's rows to another's. The empty push is answered
-    without a server round trip, and still must not shift the replies behind it.
+    future, or one relation's rows to another's. The empty push is a round trip
+    answered with LSN 0, and must not shift the replies behind it.
     Run at W>1: replies leave the workers out of order and only the master's
     serialisation puts them back."""
     a = client.create_table(schema_name, "ta", PK_VAL_COLS)
@@ -155,10 +156,11 @@ async def test_an_error_surfaces_from_a_gather_and_the_connection_survives(aconn
 async def test_connection_loss_resolves_every_queued_request(disposable_server):
     """Losing the connection must fail every submitted request.
 
-    All 3000 are submitted before the loop gets a turn, so each holds a future
-    and a queued frame. The step that meets the dead peer must resolve all of
-    them: a future nobody resolves is a hang, not an error, and the `wait_for`
-    is what turns that into a failure.
+    All 3000 are submitted before the loop gets a turn. The first flushes at
+    submit and meets the dead peer, which ends the session; the rest are
+    refused at submit. Every one must still be a future that resolves: a future
+    nobody resolves is a hang, not an error, and the `wait_for` is what turns
+    that into a failure.
     """
     target, proc = disposable_server
     conn = await aio.connect(target)
@@ -170,6 +172,9 @@ async def test_connection_loss_resolves_every_queued_request(disposable_server):
         asyncio.gather(*futs, return_exceptions=True), timeout=30)
     resolved_ok = [r for r in results if not isinstance(r, BaseException)]
     assert not resolved_ok, f"{len(resolved_ok)}/{len(results)} succeeded against a dead server"
+    # Including the ones refused at submit, once the loss was known.
+    lost = [r for r in results if not str(r).startswith("connection lost:")]
+    assert not lost, f"{len(lost)}/{len(results)} failed otherwise, e.g. {lost[0]!r}"
 
     # A request submitted after the failure was observed must resolve too.
     with pytest.raises(gnitz.GnitzError):
@@ -194,8 +199,37 @@ async def test_connect_shapes_close_and_refuse(server):
 
     await conn.aclose()
     await conn.aclose()          # idempotent
+    fut = conn.scan(gnitz.SCHEMA_TAB)   # refused through its future
     with pytest.raises(gnitz.GnitzError, match="connection closed"):
-        await conn.scan(gnitz.SCHEMA_TAB)
+        await fut
+
+
+def _open_sockets():
+    n = 0
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            n += os.readlink(f"/proc/self/fd/{fd}").startswith("socket:")
+        except OSError:
+            pass            # the listing's own fd, closed by now
+    return n
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_connection_frees_its_socket(server):
+    """A connection dropped without `aclose` frees its socket on a live loop:
+    at once when idle, and once its last operation resolves otherwise."""
+    before = _open_sockets()      # the loop's self-pipe already exists
+
+    conn = await aio.connect(server)
+    assert len(await conn.scan(gnitz.SCHEMA_TAB)) > 0
+    del conn
+    await asyncio.sleep(0)
+    assert _open_sockets() == before
+
+    fut = (await aio.connect(server)).scan(gnitz.SCHEMA_TAB)
+    assert len(await fut) > 0
+    await asyncio.sleep(0)
+    assert _open_sockets() == before
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +317,7 @@ asyncio.run(main())
 '''
 
 _COUNTED = ("writev", "write", "sendto", "sendmsg", "recvfrom", "read", "recvmsg",
-            "epoll_wait", "epoll_pwait", "futex", "poll", "ppoll")
+            "epoll_wait", "epoll_pwait", "epoll_ctl", "futex", "poll", "ppoll")
 
 
 def _strace_counts(script, target, tid, n, mode):
@@ -305,10 +339,11 @@ def test_syscalls_per_operation(server, client, schema_name, tmp_path):
     run subtracted so startup and connect are out. One baseline for both modes:
     at n=0 the child's two branches do byte-identical work.
 
-    `await` in a loop costs 5 syscalls per operation — writev, recvfrom, one
-    blocking epoll_wait, and the two zero-timeout epoll_waits asyncio spends on
-    the two handles each operation schedules (the deferred flush, and the wake
-    `Future.set_result` posts).
+    `await` in a loop costs 4 syscalls per operation — writev, recvfrom, one
+    blocking epoll_wait, and the zero-timeout epoll_wait asyncio spends on the
+    wake `Future.set_result` posts — and no epoll_ctl: a lone operation flushes
+    at submit, so no writer is armed. A gathered burst's first frame leaves at
+    submit and the rest in one writev on the next loop turn.
 
     `gather`'s bill is not a per-operation constant: it is set by how many ACKs
     the server has queued when a read runs. What is the client's, and is pinned
@@ -331,8 +366,8 @@ def test_syscalls_per_operation(server, client, schema_name, tmp_path):
         assert measured[mode]["sendto"] <= 0, f"{mode} still writes a self-pipe: {measured}"
 
     loop_total = sum(max(v, 0) for v in measured["loop"].values())
-    assert loop_total <= 5 * n + 8, (
-        f"await-in-a-loop: {loop_total / n:.2f}/op over a 5/op budget\n{measured}")
+    assert loop_total <= 4 * n + 8, (
+        f"await-in-a-loop: {loop_total / n:.2f}/op over a 4/op budget\n{measured}")
 
     g = measured["gather"]
     assert g["writev"] <= 8, f"a gathered burst must leave in one writev, not {g['writev']}"

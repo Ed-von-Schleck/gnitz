@@ -663,3 +663,24 @@ fn a_dead_connection_fails_each_view_rather_than_the_call() {
         "and both copies still answer at the round they reached",
     );
 }
+
+/// A poll after an earlier verb lost the connection returns, every view failed
+/// with the loss, instead of parking forever.
+#[test]
+fn a_poll_after_the_connection_was_lost_fails_every_view() {
+    let (mut client, peer, _log) = fixture(&[(7, "a", 4), (8, "b", 4)]);
+    drop(peer);
+    let r = client.scan(1);
+    assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
+
+    let report = client.poll_mirror().expect("a lost connection fails each view");
+    let mut ids: Vec<u64> = report.iter().map(|o| o.view_id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![7, 8], "one entry per view: {report:?}");
+    assert!(
+        report
+            .iter()
+            .all(|o| matches!(o.result, PollResult::Failed(ClientError::ConnectionLost(_)))),
+        "each view carries the loss: {report:?}",
+    );
+}

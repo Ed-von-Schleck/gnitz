@@ -61,9 +61,8 @@ pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatc
 /// twice. `sink` must have been built from `schema`; a mismatch is refused
 /// before anything is appended.
 ///
-/// A decode error partway through leaves `sink` half-appended. Every driver
-/// closes the session on a `step` error, and `Session::close` resets the
-/// accumulator, so no torn batch is read back.
+/// A decode error partway through leaves `sink` half-appended. A `step` error
+/// ends the session, which resets the accumulator, so no torn batch is read back.
 pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
     let mut regions = gnitz_wire::region::Regions::new();
     let count = gnitz_wire::wal::validate_and_parse(data, &mut regions)

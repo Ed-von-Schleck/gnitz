@@ -24,6 +24,9 @@ connection at a time and replies in request order, so positional correlation
 is always correct — pushes, scans, seeks and ``scan_many`` may be gathered
 together, and each future resolves to its own operation's result.
 
+Past the connection's in-flight caps (requests in flight, bytes unsent), a
+verb's future fails at once; await some before starting more.
+
 Three limitations are choices, not oversights:
 
 * **Connect is synchronous** — connect + HELLO run on the calling thread, so a
@@ -41,8 +44,6 @@ Three limitations are choices, not oversights:
   still commits it; only the future stops being waited on.
 """
 
-import asyncio
-
 from gnitz._native import AsyncTransport
 
 
@@ -52,7 +53,7 @@ def connect(target):
     Usable as both ``conn = await connect(target)``
     and ``async with connect(target) as conn:``.
     """
-    return AsyncConnection(target)
+    return AsyncConnection(AsyncTransport.connect(target))
 
 
 async def _immediate_return(value):
@@ -76,11 +77,12 @@ class AsyncConnection:
 
     __slots__ = ("_transport",)
 
-    def __init__(self, target):
-        self._transport = AsyncTransport(target, asyncio.get_running_loop())
-        # Two steps: binding the loop callbacks needs the transport object,
-        # which its constructor cannot hand itself.
-        self._transport.install()
+    def __init__(self, transport):
+        self._transport = transport
+
+    def __del__(self):
+        # The loop holds the transport until it is released.
+        self._transport.release()
 
     # -- verbs -------------------------------------------------------------
 

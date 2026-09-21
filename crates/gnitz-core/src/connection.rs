@@ -436,6 +436,21 @@ pub(crate) type PolledView = Result<(Vec<RawBlock>, DeltaCursor), ClientError>;
 /// matched onto a live view of the same id.
 pub(crate) type PollSink<'a> = dyn FnMut(SlotId, PolledView) + 'a;
 
+/// Why a session refuses work.
+enum Ended {
+    Closed,
+    Lost(Arc<ClientError>),
+}
+
+impl Ended {
+    fn error(&self) -> ClientError {
+        match self {
+            Ended::Closed => ClientError::Closed,
+            Ended::Lost(cause) => ClientError::ConnectionLost(Arc::clone(cause)),
+        }
+    }
+}
+
 /// A protocol session: the transport plus all per-connection protocol state
 /// (the schema LRU, the pending queue and reply accumulator, and
 /// the warm/cold packing, continuation reassembly, cache absorption, and
@@ -449,7 +464,8 @@ pub struct Session {
     pending: VecDeque<Slot>,
     next_slot: u64,
     accum: Accumulator,
-    closed: bool,
+    /// Why this session refuses work; `None` while it is open.
+    ended: Option<Ended>,
 }
 
 impl Session {
@@ -474,7 +490,7 @@ impl Session {
             pending: VecDeque::new(),
             next_slot: 1,
             accum: Accumulator::default(),
-            closed: false,
+            ended: None,
         }
     }
 
@@ -511,9 +527,7 @@ impl Session {
     /// Raises past the in-flight cap. `Request` borrows its inputs; the borrow
     /// ends here, because encoding is what `submit` does.
     pub fn submit(&mut self, req: Request<'_>) -> Result<SlotId, ClientError> {
-        if self.closed {
-            return Err(ClientError::Closed);
-        }
+        self.check_open()?;
         // The predicate a driver reads for back-pressure, so the two can never
         // disagree; only the message re-derives which cap was hit.
         if self.at_capacity() {
@@ -648,6 +662,7 @@ impl Session {
     /// DELTA_POLL: one train per item, in order, delivered to the [`PollSink`] of a
     /// [`Self::step_polling`] drain — without which they are dropped, hence no [`Request`].
     pub(crate) fn submit_delta_poll(&mut self, views: &[txn_frame::DeltaPollItem<'_>]) -> Result<SlotId, ClientError> {
+        self.check_open()?;
         txn_frame::validate_item_ids("DELTA_POLL", views, |v| v.view_id)?;
         self.enqueue_slot(
             txn_frame::encode_delta_poll(views),
@@ -655,6 +670,10 @@ impl Session {
                 views: views.iter().map(|v| v.view_id).collect(),
             },
         )
+    }
+
+    fn check_open(&self) -> Result<(), ClientError> {
+        self.ended.as_ref().map_or(Ok(()), |e| Err(e.error()))
     }
 
     /// Queue an encoded request and open its slot. A frame past the ceiling is
@@ -680,40 +699,57 @@ impl Session {
     /// a driver may park on `interest()`: nothing buffered can advance, and
     /// bytes still queued are ones the fd refused.
     ///
-    /// An `Err` from `step` itself means the framing is lost; `close`.
-    pub fn step(&mut self, ready: Interest) -> Result<Completions, ClientError> {
+    /// A failure ends the session: every slot still pending comes back
+    /// [`ClientError::ConnectionLost`], after those that completed.
+    pub fn step(&mut self, ready: Interest) -> Completions {
         self.step_polling(ready, None)
     }
 
     /// [`Self::step`] for a drain that takes a delta poll's per-view results.
-    pub(crate) fn step_polling(
-        &mut self,
-        ready: Interest,
-        mut sink: Option<&mut PollSink<'_>>,
-    ) -> Result<Completions, ClientError> {
+    pub(crate) fn step_polling(&mut self, ready: Interest, mut sink: Option<&mut PollSink<'_>>) -> Completions {
         let mut done: Completions = Vec::new();
-        if self.closed {
-            return Ok(done);
+        if self.ended.is_some() {
+            return done;
         }
         if ready.read {
             self.transport.begin_read();
         }
-        while let Next::Frame(buf) = self.transport.next_frame(ready.read)? {
+        let mut result = self.read_frames(ready.read, sink.as_deref_mut(), &mut done);
+        // Last, so the ciphertext a read queues goes out with this flush.
+        if result.is_ok() && ready.write {
+            if let Err(e) = self.transport.flush() {
+                // A peer gone after answering is still readable.
+                self.transport.begin_read();
+                let _ = self.read_frames(true, sink, &mut done);
+                result = Err(e.into());
+            }
+        }
+        if let Err(e) = result {
+            self.end(Ended::Lost(Arc::new(e)), &mut done);
+        }
+        done
+    }
+
+    /// Feed every frame the transport can complete, reading the fd only when
+    /// `may_read`.
+    fn read_frames(
+        &mut self,
+        may_read: bool,
+        mut sink: Option<&mut PollSink<'_>>,
+        done: &mut Completions,
+    ) -> Result<(), ClientError> {
+        while let Next::Frame(buf) = self.transport.next_frame(may_read)? {
             // The sink runs after `feed` has returned, so an unwind out of the
             // caller's code finds the session consistent. No sink is an
             // abandoned poll — an interrupt, or an unwind past its driver — and
             // the position is dropped, which is what its caller being gone wants.
-            if let Some((slot, result)) = self.feed(buf, &mut done)? {
+            if let Some((slot, result)) = self.feed(buf, done)? {
                 if let Some(f) = sink.as_deref_mut() {
                     f(slot, result);
                 }
             }
         }
-        // Last, so the ciphertext a read queues goes out with this flush.
-        if ready.write {
-            self.transport.flush()?;
-        }
-        Ok(done)
+        Ok(())
     }
 
     /// Frame bytes queued and not yet written, against [`MAX_QUEUED_BYTES`].
@@ -730,23 +766,50 @@ impl Session {
     }
 
     /// `READ` while any slot is outstanding; `WRITE` while bytes remain queued
-    /// or rustls has ciphertext to ship.
+    /// or rustls has ciphertext to ship. Nothing once the session has ended.
     pub fn interest(&self) -> Interest {
+        if self.ended.is_some() {
+            return Interest::NONE;
+        }
         Interest {
             read: !self.pending.is_empty(),
             write: self.transport.wants_write(),
         }
     }
 
-    /// Abandon every pending slot and refuse further work; the outbound queue
-    /// and the accumulator go with them, so `interest()` reports nothing
-    /// afterwards. A driver fails its own outstanding futures — it registered
-    /// them, so it already knows which they are.
-    pub fn close(&mut self) {
-        self.closed = true;
+    /// Whether this session refuses work: closed by its owner, or lost.
+    pub fn is_closed(&self) -> bool {
+        self.ended.is_some()
+    }
+
+    /// Fail every pending slot with `how`'s error and refuse further work. The
+    /// shutdown shows the server EOF now rather than when the session drops.
+    fn end(&mut self, how: Ended, done: &mut Completions) {
+        if self.ended.is_some() {
+            return;
+        }
+        self.transport.shutdown();
         self.transport.clear_queue();
         self.accum = Accumulator::default();
-        self.pending.clear();
+        done.extend(self.pending.drain(..).map(|s| (s.id, Err(how.error()))));
+        self.ended = Some(how);
+    }
+
+    /// Close the session; returns every slot it abandoned, failed `Closed`.
+    #[must_use]
+    pub fn close(&mut self) -> Completions {
+        let mut done = Vec::new();
+        self.end(Ended::Closed, &mut done);
+        done
+    }
+
+    /// Fail the session with `cause`, met outside `step`; returns every slot it
+    /// abandoned, failed `ConnectionLost(cause)`.
+    #[must_use]
+    pub fn abort(&mut self, cause: ClientError) -> Completions {
+        let mut done = Vec::new();
+        self.end(Ended::Lost(Arc::new(cause)), &mut done);
+        done
     }
 
     /// One reply frame for the head slot. A non-OK frame ends the whole request, so

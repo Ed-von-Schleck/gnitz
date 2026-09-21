@@ -317,6 +317,13 @@ impl ClientTransport {
         self.queue.clear();
     }
 
+    /// Shut the socket down so the peer sees EOF. The fd stays open until the
+    /// transport drops, since a reactor may still have it registered.
+    pub(crate) fn shutdown(&self) {
+        // SAFETY: `as_raw_fd` is this transport's own open socket.
+        let _ = unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+
     /// The next complete frame, reading the fd only when `may_read`. Returns
     /// `Pending` once the source is proven drained (or would block) and no
     /// frame can be completed from what is buffered.

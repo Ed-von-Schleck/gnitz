@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 
+use gnitz_core::ClientError;
 use gnitz_tokio::{AsyncClient, Connection};
 use tokio::runtime::Runtime;
 
@@ -89,14 +90,19 @@ fn a_connection_error_fails_every_outstanding_operation() {
     drop(peer);
 
     for op in ops {
+        let r = rt.block_on(op).unwrap();
         assert!(
-            rt.block_on(op).unwrap().is_err(),
-            "every operation resolves, none is left awaiting"
+            matches!(r, Err(ClientError::ConnectionLost(_))),
+            "every operation resolves with the loss, none is left awaiting: {r:?}"
         );
     }
-    assert!(rt.block_on(driver).unwrap().is_err(), "the driver reports the cause");
     // Further work is refused rather than queued onto a dead connection.
-    assert!(rt.block_on(client.scan(1)).is_err());
+    let r = rt.block_on(client.scan(1));
+    assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
+    drop(client);
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), driver).await })
+        .expect("the driver completes once no handle is left")
+        .unwrap();
 }
 
 /// Dropping every handle closes the channel; the driver quiesces and completes.
@@ -108,41 +114,37 @@ fn dropping_every_handle_ends_the_connection() {
     let driver = rt.spawn(conn);
     drop(client);
     let done = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), driver).await });
-    assert!(
-        done.expect("the driver completes once no handle is left")
-            .unwrap()
-            .is_ok(),
-        "a quiesced connection with no handle left completes cleanly"
-    );
+    done.expect("the driver completes once no handle is left").unwrap();
 }
 
-/// `abort` must resolve a waiter whose request never reached the wire. The
-/// `Connection` is kept alive past its own completion — what a `select!` on
-/// `&mut conn` leaves — so nothing drops the channel receiver on its behalf.
+/// A verb submitted after the loss resolves with it, and the driver still
+/// completes once every handle is gone.
 #[test]
 fn a_verb_submitted_after_the_connection_died_still_resolves() {
     let rt = Runtime::new().unwrap();
-    let (client, mut conn, peer) = connect_to_peer(&rt);
-    // The driver's first step reads EOF and aborts.
+    let (client, conn, peer) = connect_to_peer(&rt);
+    // The driver's first step reads EOF and ends the session.
     drop(peer);
 
+    let driver = rt.spawn(conn);
     let outstanding = rt.spawn({
         let c = client.clone();
         async move { c.scan(1).await }
     });
-    let driven = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut conn).await });
-    assert!(
-        driven.expect("the driver reaches its failure").is_err(),
-        "the driver reports the peer's death"
-    );
-    assert!(
-        rt.block_on(outstanding).unwrap().is_err(),
-        "the outstanding verb resolves"
-    );
+    let r = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), outstanding).await });
+    let r = r.expect("the outstanding verb resolves").unwrap();
+    assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
 
     let late = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), client.scan(2)).await });
     match late {
-        Ok(r) => assert!(r.is_err(), "a verb submitted onto a dead connection must fail"),
-        Err(_) => panic!("a verb submitted after the driver aborted must resolve, not hang"),
+        Ok(r) => assert!(
+            matches!(r, Err(ClientError::ConnectionLost(_))),
+            "a verb submitted onto a dead connection must fail with the loss: {r:?}"
+        ),
+        Err(_) => panic!("a verb submitted after the loss must resolve, not hang"),
     }
+    drop(client);
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), driver).await })
+        .expect("dropping the handles completes the driver")
+        .unwrap();
 }

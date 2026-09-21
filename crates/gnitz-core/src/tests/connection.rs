@@ -161,7 +161,7 @@ mod spine_tests {
     /// the precondition for a push that encodes schema-less.
     fn warm(s: &mut Session, peer: &Peer, tid: u64, version: u16, schema: &Schema) {
         let slot = s.submit(Request::scan(tid)).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         peer.drain_request();
         peer.send(&reply_cold(tid, version, schema, &ZSetBatch::new(schema), 0, false));
         drive(s, slot).unwrap();
@@ -172,7 +172,7 @@ mod spine_tests {
     fn drive(s: &mut Session, slot: SlotId) -> Result<Reply, ClientError> {
         let mut ready = Interest::WRITE;
         loop {
-            let mut done = s.step(ready)?;
+            let mut done = s.step(ready);
             if let Some(i) = done.iter().position(|(id, _)| *id == slot) {
                 return done.swap_remove(i).1;
             }
@@ -195,17 +195,17 @@ mod spine_tests {
         let schema = schema_a();
         let slot = s.submit(Request::scan(7)).unwrap();
         assert_eq!(s.interest(), Interest::BOTH);
-        assert!(s.step(Interest::WRITE).unwrap().is_empty());
+        assert!(s.step(Interest::WRITE).is_empty());
         assert_eq!(s.interest(), Interest::READ);
         peer.drain_request();
 
         // Three frames, one per step: nothing completes until the terminal.
         peer.send(&reply_cold(7, 3, &schema, &batch_a(&[1, 2]), 0, true));
-        assert!(s.step(Interest::READ).unwrap().is_empty());
+        assert!(s.step(Interest::READ).is_empty());
         peer.send(&reply_warm(7, 3, &batch_a(&[3]), true));
-        assert!(s.step(Interest::READ).unwrap().is_empty());
+        assert!(s.step(Interest::READ).is_empty());
         peer.send(&reply_warm(7, 3, &batch_a(&[4, 5]), false));
-        let mut done = s.step(Interest::READ).unwrap();
+        let mut done = s.step(Interest::READ);
         assert_eq!(done.len(), 1);
         let (id, reply) = done.pop().unwrap();
         assert_eq!(id, slot);
@@ -214,7 +214,7 @@ mod spine_tests {
         assert_eq!(*r.schema, schema_a(), "the block the train carried");
         // Absorbed into the cache under version 3.
         assert_eq!(stamped(&mut s, 7), 3);
-        assert!(s.step(Interest::READ).unwrap().is_empty());
+        assert!(s.step(Interest::READ).is_empty());
         assert_eq!(s.interest(), Interest::NONE);
     }
 
@@ -229,10 +229,10 @@ mod spine_tests {
         // Now the multi: both trains reply warm, and each must decode under its
         // own relation's schema — a two-frame train for relation 2 included.
         let slot = s.submit(Request::ScanMulti(&[1, 2])).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         peer.drain_request();
         peer.send(&reply_warm(1, 1, &batch_a(&[10, 11]), false));
-        assert!(s.step(Interest::READ).unwrap().is_empty(), "one of two trains");
+        assert!(s.step(Interest::READ).is_empty(), "one of two trains");
         peer.send(&reply_warm(2, 1, &batch_b(&[20]), true));
         peer.send(&reply_warm(2, 1, &batch_b(&[21]), false));
         let Reply::Multi(replies) = drive(&mut s, slot).unwrap() else {
@@ -274,7 +274,7 @@ mod spine_tests {
             s.submit(Request::scan(k)).unwrap();
         }
         let slot = s.submit(Request::scan(t)).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         for _ in 0..=others.len() {
             peer.drain_request();
         }
@@ -291,24 +291,26 @@ mod spine_tests {
     }
 
     /// A hint-only frame stamped at another version would decode under a schema
-    /// the server is no longer speaking, so the step fails instead.
+    /// the server is no longer speaking, so the slot fails and the session ends.
     #[test]
-    fn a_hint_only_frame_at_the_wrong_version_fails_the_step() {
+    fn a_hint_only_frame_at_the_wrong_version_fails_the_slot_and_ends_the_session() {
         let (mut s, peer) = pair();
         let sa = schema_a();
         let t = 1000;
         warm(&mut s, &peer, t, 7, &sa);
 
         let slot = s.submit(Request::scan(t)).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         peer.drain_request();
         peer.send(&reply_warm(t, 8, &batch_a(&[5]), false));
         let e = drive(&mut s, slot).expect_err("a stale stamp is a decode error");
         assert!(
-            matches!(&e, ClientError::Protocol(ProtocolError::DecodeError(m))
-                if m == "schema version mismatch: expected 7, server 8"),
+            matches!(&e, ClientError::ConnectionLost(c) if matches!(&**c,
+                ClientError::Protocol(ProtocolError::DecodeError(m))
+                    if m == "schema version mismatch: expected 7, server 8")),
             "{e:?}"
         );
+        assert!(s.is_closed());
     }
 
     #[test]
@@ -316,7 +318,7 @@ mod spine_tests {
         let (mut s, peer) = pair();
         let sa = schema_a();
         let slot = s.submit(Request::ScanMulti(&[1, 2, 3])).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         peer.drain_request();
         peer.send(&reply_cold(1, 1, &sa, &batch_a(&[1]), 0, false));
         // The second train is replaced by one error frame and nothing follows.
@@ -327,7 +329,7 @@ mod spine_tests {
 
         // The next request on the same connection completes normally.
         let slot = s.submit(Request::scan(3)).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         peer.drain_request();
         peer.send(&reply_cold(3, 1, &sa, &batch_a(&[5]), 42, false));
         let Reply::Scan(r) = drive(&mut s, slot).unwrap() else {
@@ -341,14 +343,14 @@ mod spine_tests {
         let (mut s, peer) = pair();
         let s1 = s.submit(Request::scan(1)).unwrap();
         let s2 = s.submit(Request::scan(2)).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         peer.drain_request();
         peer.drain_request();
         let empty = ZSetBatch::new(&schema_a());
         let mut both = framed(&reply_cold(1, 1, &schema_a(), &empty, 11, false));
         both.extend(framed(&reply_cold(2, 1, &schema_a(), &empty, 22, false)));
         raw_send(&peer.0, &both);
-        let done = s.step(Interest::READ).unwrap();
+        let done = s.step(Interest::READ);
         let ids: Vec<SlotId> = done.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![s1, s2], "in request order");
         for (id, r) in done {
@@ -365,7 +367,7 @@ mod spine_tests {
         // and carries the frame's `arg0` into the error it hands back.
         let (mut s, peer) = pair();
         let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         peer.drain_request();
         peer.send(&reply_status(WireStatus::TxnConflict, "", 77));
         let r = drive(&mut s, slot);
@@ -373,31 +375,87 @@ mod spine_tests {
             matches!(r, Err(ClientError::TxnConflict { fresh_basis: 77 })),
             "the basis rides the frame: {r:?}"
         );
-        assert!(!s.closed);
+        assert!(!s.is_closed());
         assert_eq!(s.interest(), Interest::NONE, "nothing left pending");
     }
 
     #[test]
-    fn out_of_order_reply_is_a_step_error_and_closes_the_blocking_client() {
+    fn out_of_order_reply_fails_the_slot_and_ends_the_session() {
         let (s, peer) = pair();
         let mut c = GnitzClient::from_session(s);
         // The peer answers a scan of 5 with a frame naming 6.
         peer.send(&reply_ctrl(6, 1));
         let r = c.scan(5);
-        assert!(matches!(r, Err(ClientError::Protocol(_))), "{r:?}");
+        assert!(
+            matches!(&r, Err(ClientError::ConnectionLost(e)) if matches!(**e, ClientError::Protocol(_))),
+            "{r:?}"
+        );
         assert_eq!(c.session.interest(), Interest::NONE);
-        // The next call reports the connection closed instead of submitting.
+        // The next call reports the loss instead of submitting.
         let r = c.scan(5);
-        assert!(matches!(r, Err(ClientError::Closed)));
-        assert!(matches!(c.session.submit(Request::scan(1)), Err(ClientError::Closed)));
-        assert!(c.session.step(Interest::READ).unwrap().is_empty());
+        assert!(matches!(r, Err(ClientError::ConnectionLost(_))), "{r:?}");
+        assert!(matches!(
+            c.session.submit(Request::scan(1)),
+            Err(ClientError::ConnectionLost(_))
+        ));
+        assert!(c.session.step(Interest::READ).is_empty());
+    }
+
+    /// A reply that decoded ahead of the frame that broke the framing reaches
+    /// its slot; only the slot the bad frame was for, and any behind it, fail.
+    #[test]
+    fn replies_completed_before_a_fatal_frame_are_delivered() {
+        let (mut s, peer) = pair();
+        let a = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
+        let b = s.submit(Request::scan(5)).unwrap();
+        assert!(s.step(Interest::WRITE).is_empty());
+        peer.drain_request();
+        peer.drain_request();
+        let mut both = framed(&reply_ctrl(0, 11));
+        both.extend(framed(&reply_ctrl(6, 1)));
+        raw_send(&peer.0, &both);
+        let done = s.step(Interest::READ);
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0].0, a);
+        assert!(matches!(done[0].1, Ok(Reply::Lsn(11))), "{:?}", done[0].1);
+        assert_eq!(done[1].0, b);
+        assert!(
+            matches!(&done[1].1, Err(ClientError::ConnectionLost(e)) if matches!(**e, ClientError::Protocol(_))),
+            "{:?}",
+            done[1].1
+        );
+        assert!(s.is_closed());
+    }
+
+    /// A peer that answered and then went is still readable after the write
+    /// that finds it gone: the answer is delivered, the unanswered slot fails.
+    #[test]
+    fn a_reply_readable_behind_a_failed_flush_is_delivered() {
+        let (mut s, peer) = pair();
+        let a = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
+        assert!(s.step(Interest::WRITE).is_empty());
+        peer.drain_request();
+        peer.send(&reply_ctrl(0, 11));
+        drop(peer);
+        let b = s.submit(Request::scan(5)).unwrap();
+        let done = s.step(Interest::WRITE);
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert_eq!(done[0].0, a);
+        assert!(matches!(done[0].1, Ok(Reply::Lsn(11))), "{:?}", done[0].1);
+        assert_eq!(done[1].0, b);
+        assert!(
+            matches!(&done[1].1, Err(ClientError::ConnectionLost(e))
+                if matches!(**e, ClientError::Protocol(ProtocolError::IoError(_)))),
+            "{:?}",
+            done[1].1
+        );
     }
 
     #[test]
     fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
         let (mut s, peer) = pair();
-        s.submit(Request::scan(5)).unwrap();
-        s.step(Interest::WRITE).unwrap();
+        let slot = s.submit(Request::scan(5)).unwrap();
+        s.step(Interest::WRITE);
         // The request is on the wire and unread, so dropping the peer draws a
         // reset. A hangup folds into read readiness, so the waiting driver wakes.
         drop(peer);
@@ -409,23 +467,30 @@ mod spine_tests {
         )
         .expect("poll");
         assert!(Interest::from_revents(rev).read, "a hangup wakes a read park");
-        let r = s.step(Interest::READ);
+        let done = s.step(Interest::READ);
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert_eq!(done[0].0, slot);
         assert!(
-            matches!(r, Err(ClientError::Protocol(ProtocolError::IoError(_)))),
-            "{r:?}"
+            matches!(&done[0].1, Err(ClientError::ConnectionLost(e))
+                if matches!(**e, ClientError::Protocol(ProtocolError::IoError(_)))),
+            "{:?}",
+            done[0].1
         );
     }
 
     #[test]
     fn close_abandons_every_pending_slot_and_refuses_further_work() {
         let (mut s, _peer) = pair();
-        s.submit(Request::scan(1)).unwrap();
-        s.submit(Request::scan(2)).unwrap();
+        let a = s.submit(Request::scan(1)).unwrap();
+        let b = s.submit(Request::scan(2)).unwrap();
         assert_eq!(s.interest(), Interest::BOTH);
-        s.close();
+        let done = s.close();
+        let ids: Vec<SlotId> = done.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![a, b], "in submit order");
+        assert!(done.iter().all(|(_, r)| matches!(r, Err(ClientError::Closed))));
         assert_eq!(s.interest(), Interest::NONE);
         assert!(matches!(s.submit(Request::scan(3)), Err(ClientError::Closed)));
-        assert!(s.step(Interest::BOTH).unwrap().is_empty());
+        assert!(s.step(Interest::BOTH).is_empty());
     }
 
     /// The in-flight count bounds no memory on its own, so the byte cap is what
@@ -466,7 +531,7 @@ mod spine_tests {
         // Writing gives the budget back — the counter tracks the write cursor,
         // not just the pushes.
         let queued = s.queued_bytes();
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         assert!(s.queued_bytes() < queued, "a flush releases what it wrote");
     }
 
@@ -613,23 +678,23 @@ mod spine_tests {
             .unwrap()
         };
         let (a, c) = (push(&mut s), push(&mut s));
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         let warm_len = peer.drain_request().len();
         assert_eq!(peer.drain_request().len(), warm_len, "both encoded at the stale stamp");
 
         // The first mismatch fails its own slot and evicts the entry.
         peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
-        let mut done = s.step(Interest::READ).unwrap();
+        let mut done = s.step(Interest::READ);
         assert_eq!(done.len(), 1);
         let (id, r) = done.pop().unwrap();
         assert_eq!(id, a);
         assert!(matches!(r, Err(ClientError::SchemaMismatch)));
-        assert!(!s.closed, "a per-slot error leaves the connection usable");
+        assert!(!s.is_closed(), "a per-slot error leaves the connection usable");
         assert_eq!(stamped(&mut s, 4), 0, "the entry is gone");
 
         // Submitted after the eviction: cold, longer by the schema block.
         let cold = push(&mut s);
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         let cold_len = peer.drain_request().len();
         assert_eq!(
             cold_len - warm_len,
@@ -640,7 +705,7 @@ mod spine_tests {
 
         // The second stale push fails too — every push encoded at the stale stamp does.
         peer.send(&reply_status(WireStatus::SchemaMismatch, "", 0));
-        let mut done = s.step(Interest::READ).unwrap();
+        let mut done = s.step(Interest::READ);
         assert_eq!(done.len(), 1);
         let (id, r) = done.pop().unwrap();
         assert_eq!(id, c);
@@ -655,7 +720,7 @@ mod spine_tests {
         assert_eq!(lsn, 999);
         assert_eq!(stamped(&mut s, 4), 5);
         push(&mut s);
-        s.step(Interest::WRITE).unwrap();
+        s.step(Interest::WRITE);
         assert_eq!(peer.drain_request().len(), warm_len, "warm again");
     }
 }

@@ -171,12 +171,12 @@ fn loopback_one_record_two_frames_one_step_completes_both_slots() {
     let req = reply_ctrl(0, 0);
     let a = s.submit(Request::RawFrame(req.clone())).unwrap();
     let b = s.submit(Request::RawFrame(req)).unwrap();
-    assert!(s.step(Interest::WRITE).unwrap().is_empty());
+    assert!(s.step(Interest::WRITE).is_empty());
     assert!(s.interest().read && !s.interest().write);
     // Park once; the one readable wakeup must complete both.
     let done = loop {
         poll_fd(s.as_raw_fd(), libc::POLLIN, None, true).unwrap();
-        let d = s.step(Interest::READ).unwrap();
+        let d = s.step(Interest::READ);
         if !d.is_empty() {
             break d;
         }
@@ -208,11 +208,11 @@ fn loopback_two_back_to_back_records_come_out_of_one_step() {
     let req = reply_ctrl(0, 0);
     s.submit(Request::RawFrame(req.clone())).unwrap();
     s.submit(Request::RawFrame(req)).unwrap();
-    s.step(Interest::WRITE).unwrap();
+    s.step(Interest::WRITE);
     // Let both records land before the one step reads.
     std::thread::sleep(Duration::from_millis(100));
     poll_fd(s.as_raw_fd(), libc::POLLIN, None, true).unwrap();
-    let done = s.step(Interest::READ).unwrap();
+    let done = s.step(Interest::READ);
     assert_eq!(done.len(), 2, "both frames from one step");
     assert_eq!(s.interest(), Interest::NONE);
     lb.join();
@@ -248,7 +248,7 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
     set_sockopt_int(t.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 * 1024);
     let mut s = Session::from_transport(t);
     let slot = s.submit(Request::RawFrame(frame)).unwrap();
-    assert!(s.step(Interest::WRITE).unwrap().is_empty());
+    assert!(s.step(Interest::WRITE).is_empty());
     assert_eq!(s.queued_bytes(), 0, "rustls took the whole frame");
     assert!(
         s.interest().write,
@@ -257,7 +257,7 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
     tx.send(()).unwrap();
     let mut ready = Interest::WRITE;
     let reply = loop {
-        let mut d = s.step(ready).unwrap();
+        let mut d = s.step(ready);
         if let Some(i) = d.iter().position(|(id, _)| *id == slot) {
             break d.swap_remove(i).1.unwrap();
         }
@@ -393,7 +393,7 @@ fn loopback_bytes_after_close_notify_surface_eof() {
 #[test]
 fn loopback_reply_and_close_notify_in_one_read_complete_the_slot() {
     // A reply and the close_notify behind it arrive in one socket read: the
-    // step must hand out the reply's completion, and the close surfaces later.
+    // step must hand out the reply's completion, whatever the close does.
     let lb = Loopback::start(|mut end| {
         read_frame(&mut end);
         write_frame(&mut end, &reply_ctrl(0, 7));
@@ -402,12 +402,10 @@ fn loopback_reply_and_close_notify_in_one_read_complete_the_slot() {
     });
     let mut s = Session::from_transport(lb.connect());
     let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
-    assert!(s.step(Interest::WRITE).unwrap().is_empty());
+    assert!(s.step(Interest::WRITE).is_empty());
     std::thread::sleep(Duration::from_millis(200));
     poll_fd(s.as_raw_fd(), libc::POLLIN, None, true).unwrap();
-    let mut done = s
-        .step(Interest::READ)
-        .expect("the reply completes before the close surfaces");
+    let mut done = s.step(Interest::READ);
     assert_eq!(done.len(), 1);
     let (id, reply) = done.swap_remove(0);
     assert_eq!(id, slot);

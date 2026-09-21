@@ -204,8 +204,11 @@ impl AsyncClient {
 
 /// Owns the connection, its `AsyncFd` and the request channel; drains, steps,
 /// resolves. Poll it to completion — as a spawned task, or joined beside the
-/// work that feeds it. It completes with `Ok(())` once every [`AsyncClient`] is
-/// dropped **and** the connection has quiesced.
+/// work that feeds it. It completes once every [`AsyncClient`] is dropped
+/// **and** the connection has quiesced.
+///
+/// A lost connection does not end it: every verb, outstanding or later,
+/// resolves [`ClientError::ConnectionLost`].
 ///
 /// Dropping a verb's future is not cancellation: the frame is written and the
 /// server commits it; the driver just drops a result nobody is left to receive.
@@ -246,20 +249,6 @@ impl Connection {
             }
         }
     }
-
-    /// Fail every waiter, sent or not, with `Closed`; `cause` is the driver's
-    /// own result.
-    fn abort(&mut self, cause: ClientError) -> ClientError {
-        self.session.close();
-        for (_, reply) in self.pending.drain(..) {
-            let _ = reply.send(Err(ClientError::Closed));
-        }
-        self.rx.close();
-        while let Ok(sub) = self.rx.try_recv() {
-            let _ = sub.reply.send(Err(ClientError::Closed));
-        }
-        cause
-    }
 }
 
 /// The read and write readiness guards of one poll.
@@ -297,7 +286,7 @@ fn fired(
 }
 
 impl Future for Connection {
-    type Output = Result<(), ClientError>;
+    type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -308,50 +297,38 @@ impl Future for Connection {
             if want.is_empty() {
                 // Quiesced: either no handle is left and this is done, or the
                 // drain above registered the channel's waker.
-                return if handles_gone {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                };
+                return if handles_gone { Poll::Ready(()) } else { Poll::Pending };
             }
 
-            let (read, write) = match poll_ready(&this.fd, want, cx) {
-                Ok(guards) => guards,
-                Err(e) => return Poll::Ready(Err(this.abort(e.into()))),
-            };
-            let ready = Interest {
-                read: read.is_some(),
-                write: write.is_some(),
-            };
-            if ready.is_empty() {
-                return Poll::Pending;
-            }
-
-            let stepped = this.session.step(ready);
-            // `AsyncFd` is edge-triggered: giving back readiness the step did
-            // not spend waits for an edge that never comes. A read is always
-            // spent — `step` reads until the source is drained — and a write is
-            // spent exactly when the fd left bytes queued.
-            let write_spent = this.session.interest().write;
-            if let Some(mut g) = read {
-                g.clear_ready();
-            }
-            if let (Some(mut g), true) = (write, write_spent) {
-                g.clear_ready();
-            }
-
-            match stepped {
-                Ok(done) => {
-                    for (id, result) in done {
-                        let (want, reply) = this.pending.pop_front().expect("a completion for an unregistered slot");
-                        assert_eq!(want, id, "the spine completes slots in submit order");
-                        // A slot whose receiver is gone — its verb's future was
-                        // dropped — resolves to nothing.
-                        let _ = reply.send(result);
+            let done = match poll_ready(&this.fd, want, cx) {
+                Err(e) => this.session.abort(e.into()),
+                Ok((read, write)) => {
+                    let ready = Interest {
+                        read: read.is_some(),
+                        write: write.is_some(),
+                    };
+                    if ready.is_empty() {
+                        return Poll::Pending;
                     }
+                    let done = this.session.step(ready);
+                    // `AsyncFd` is edge-triggered, so clear only what the step
+                    // spent: every read, and a write that left bytes queued.
+                    let write_spent = this.session.interest().write;
+                    if let Some(mut g) = read {
+                        g.clear_ready();
+                    }
+                    if let (Some(mut g), true) = (write, write_spent) {
+                        g.clear_ready();
+                    }
+                    done
                 }
-                // The byte stream's framing is no longer trustworthy.
-                Err(e) => return Poll::Ready(Err(this.abort(e))),
+            };
+
+            for (id, result) in done {
+                let (want, reply) = this.pending.pop_front().expect("a completion for an unregistered slot");
+                assert_eq!(want, id, "the spine completes slots in submit order");
+                // A dropped verb future's result goes nowhere.
+                let _ = reply.send(result);
             }
         }
     }
