@@ -156,9 +156,6 @@ fn recover_from_sal(
         let Some(schema) = catalog.registry.relation(tid).map(Relation::schema) else {
             continue;
         };
-        // Each group's own slot count, off the header in hand and inside its
-        // digest. A tail-wide probe would read one header for all of them, and a
-        // torn one picks the wrong mode — losing every slot above this rank.
         let (wanted, reslice) = replay_slots(msg.slots(), slot, schema.placement().is_replicated());
         if reslice {
             resliced_from = Some(msg.slots());
@@ -378,7 +375,7 @@ fn run_worker_child(
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
-    let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.epoch());
+    let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.live_epoch());
     let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer, pending_deltas);
     let rc = worker.run(BOOT_READY_REQUEST_ID);
 
@@ -452,7 +449,7 @@ fn fork_workers(
 
 /// The master's half of recovery once the workers are alive, ending in the
 /// checkpoint a clean restart resumes from.
-fn master_post_fork_recovery(disp: &MasterDispatcher, tail_epoch: u32, swept_bases: &[i64]) -> Result<(), String> {
+fn master_post_fork_recovery(disp: &MasterDispatcher, live_epoch: u32, swept_bases: &[i64]) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
     // Before any drain: a drain drops frames no lease routes.
     let ready = disp.reactor().lease_acks(1, WorkerSet::ALL);
@@ -465,9 +462,7 @@ fn master_post_fork_recovery(disp: &MasterDispatcher, tail_epoch: u32, swept_bas
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
     drop(ready);
 
-    // Reset the SAL for fresh use, now that every worker has recovered, above the
-    // same tail epoch the workers were launched with.
-    disp.sal().lock_exclusive().boot_rewind(tail_epoch);
+    disp.sal().lock_exclusive().boot_rewind(live_epoch);
 
     inject_recovery_panic("reset");
 
@@ -561,7 +556,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
         reactor,
     ));
 
-    master_post_fork_recovery(&dispatcher, tail.epoch(), &swept_bases)?;
+    master_post_fork_recovery(&dispatcher, tail.live_epoch(), &swept_bases)?;
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);

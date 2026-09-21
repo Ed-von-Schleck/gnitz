@@ -1,22 +1,17 @@
-use super::fixtures::{group_and_next, group_at, TestLog};
+use super::fixtures::{group_at, group_in, TestLog};
 use super::{
     effective_max, epoch_word, group_header_size, stamp_digest, DirectGroup, EpochGate, GroupData, GroupTargets,
-    SalMessageKind, SalReader, SalStep, WorkerSet, CHECKPOINT_RESERVE, FLAG_IN_REQUEST_ORDER, FLAG_ZONE_END,
-    MIN_SAL_BYTES, OFF_FLAGS, OFF_KIND, OFF_LSN, PREFIX_BYTES,
+    SalMessageKind, SalReader, SalStep, WorkerSet, CHECKPOINT_RESERVE, DIR_CHECKSUM_AT, DIR_ENTRY_BYTES,
+    FLAG_IN_REQUEST_ORDER, FLAG_ZONE_END, MIN_SAL_BYTES, OFF_FLAGS, OFF_KIND, OFF_LSN, PREFIX_BYTES, PRESENT,
 };
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once};
 use crate::runtime::w2m::fixtures::sal_wake_seq;
 use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
-use crate::test_support::{make_batch_raw, sweep_bit_flips};
+use crate::runtime::wire::WireMsg;
+use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::MAX_WORKERS;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// The publication prefix word at offset 0.
-fn prefix_word(log: &TestLog) -> u64 {
-    unsafe { AtomicU64::from_ptr(log.ptr().cast()).load(Ordering::Acquire) }
-}
 
 #[test]
 fn sal_round_trip() {
@@ -25,10 +20,10 @@ fn sal_round_trip() {
     let payloads: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
     log.write(42, 100, SalMessageKind::Scan, &payloads);
 
-    let (msg, next) = group_and_next(log.log(), 0, 1);
+    let msg = group_in(log.log(), 0, 1);
     assert_eq!(msg.lsn, 100);
     assert_eq!(msg.target_id, 42);
-    assert_eq!(next, log.cursor());
+    assert_eq!(msg.end, log.cursor());
     for (w, buf) in bufs.iter().enumerate() {
         let slot = msg.slot(w as u32);
         if buf.is_empty() {
@@ -47,15 +42,13 @@ fn sal_multiple_groups() {
         log.write(g as u32, g * 10, SalMessageKind::Scan, &[&buf, &[]]);
     }
 
-    let mut rc = 0u64;
-    for g in 0..3u64 {
-        let (msg, next) = group_and_next(log.log(), rc, 1);
+    let groups: Vec<_> = log.log().walk(1).collect();
+    assert_eq!(groups.len(), 3);
+    for (g, msg) in (0..3u64).zip(&groups) {
         assert_eq!(msg.lsn, g * 10);
         assert_eq!(msg.target_id, g as u32);
         assert_eq!(msg.slot(0).expect("data slot"), vec![(g + 1) as u8; 64].as_slice());
-        rc = next;
     }
-    assert!(matches!(log.log().read_at(rc, EpochGate::Walk(1)), SalStep::Absent));
 }
 
 #[test]
@@ -72,18 +65,19 @@ fn sal_full_error() {
     );
 }
 
+/// A reset anchors the next epoch at cursor 0, over the last epoch's leftover.
 #[test]
 fn sal_checkpoint_reset() {
-    // Small: the whole region is zeroed below, and that memset is the test.
-    let log = TestLog::new(128 << 10, 1, 1);
+    let log = TestLog::new(1 << 20, 1, 1);
     log.write(0, 0, SalMessageKind::Scan, &[&[0x11u8; 32]]);
 
-    unsafe { std::ptr::write_bytes(log.ptr(), 0, log.size) };
-    log.seek(0, 2);
-    log.write(0, 0, SalMessageKind::Scan, &[&[0x22u8; 32]]);
-
-    let msg = group_at(log.log(), 0);
+    log.writer.lock_exclusive().checkpoint_reset();
     assert_eq!(log.log().anchor(), Ok((2, 0)));
+    assert_eq!(log.cursor(), 0);
+    assert!(matches!(log.log().read_at(0, EpochGate::Walk(2)), SalStep::Absent));
+
+    log.write(0, 0, SalMessageKind::Scan, &[&[0x22u8; 32]]);
+    let msg = group_at(log.log(), 0);
     assert_eq!(msg.slot(0).expect("data slot"), vec![0x22u8; 32].as_slice());
 }
 
@@ -187,8 +181,8 @@ fn sal_epoch_fence() {
     log.write(0, 0, SalMessageKind::Scan, &[&buf]);
 
     let view = log.log();
-    group_and_next(view, 0, 5);
-    group_and_next(view, second, 6);
+    group_in(view, 0, 5);
+    group_in(view, second, 6);
     assert!(matches!(view.read_at(second, EpochGate::Walk(5)), SalStep::Absent));
 }
 
@@ -196,7 +190,6 @@ fn sal_epoch_fence() {
 /// `ZONE_END`, and an unzoned group between them at LSN 0.
 #[test]
 fn a_scopes_zone_ends_at_its_last_member() {
-    use crate::runtime::wire::WireMsg;
     let log = TestLog::new(1 << 20, 4, 1);
     let group = |target: u64| DirectGroup {
         template: WireMsg { target_id: target, ..Default::default() },
@@ -240,7 +233,7 @@ fn sal_cross_process_checkpoint() {
     let buf2 = vec![0xBBu8; 64];
 
     let child = || {
-        let reader = SalReader::new(log.log(), 0, 0);
+        let reader = SalReader::new(log.log(), 0, 1);
         let writer = W2mWriter::new(ring);
         for _ in 0..2 {
             let (msg, slot) = loop {
@@ -322,7 +315,7 @@ fn a_leased_group_writes_only_its_set_on_one_id() {
         .expect("group fits");
 
     for w in 0..4u32 {
-        let reader = SalReader::new(log.log(), w, 0);
+        let reader = SalReader::new(log.log(), w, 1);
         let mut read = std::iter::from_fn(|| reader.next().map(|(m, _)| (m.request_id, m.in_request_order)));
         if w == 1 || w == 3 {
             assert_eq!(read.next(), Some((40, true)), "worker {w} reads the leased group");
@@ -381,7 +374,7 @@ fn lock_exclusive_panics_while_a_task_holds_the_writer() {
 #[test]
 fn a_reader_is_empty_only_while_no_group_is_readable_at_its_cursor() {
     let log = TestLog::new(1 << 20, 2, 1);
-    let reader = SalReader::new(log.log(), 0, 0);
+    let reader = SalReader::new(log.log(), 0, 1);
     assert!(reader.is_empty(), "an unwritten log");
 
     log.write(0, 0, SalMessageKind::Scan, &[&[], &[0u8; 32]]);
@@ -397,12 +390,12 @@ fn a_reader_is_empty_only_while_no_group_is_readable_at_its_cursor() {
     let leftover = TestLog::new(1 << 20, 1, 1);
     leftover.write(0, 0, SalMessageKind::Scan, &[&[0u8; 32]]);
     assert!(
-        SalReader::new(leftover.log(), 0, 1).is_empty(),
+        SalReader::new(leftover.log(), 0, 2).is_empty(),
         "an older epoch's group at the cursor"
     );
 }
 
-/// The live drain's epoch gate reads the group's `(epoch << 32 | payload_size)`
+/// The live drain's epoch gate reads the group's `(epoch << 32 | PRESENT)`
 /// prefix BEFORE any header byte. A mismatched expectation parks the reader; a
 /// matching one reads the group normally.
 #[test]
@@ -415,38 +408,34 @@ fn sal_prefix_epoch_gate() {
         matches!(view.read_at(0, EpochGate::Live(2)), SalStep::Absent),
         "an epoch-mismatched slot must park the reader"
     );
-    let SalStep::Group(msg, cursor) = view.read_at(0, EpochGate::Live(1)) else {
+    let SalStep::Group(msg) = view.read_at(0, EpochGate::Live(1)) else {
         panic!("a matching epoch reads the group");
     };
     assert_eq!((msg.lsn, msg.target_id), (11, 7));
-    assert_eq!(cursor, log.cursor());
+    assert_eq!(msg.end, log.cursor());
 }
 
-/// The `(epoch << 32 | payload_size)` prefix word must round-trip at the
-/// boundaries: a one-slot group with no data (payload_size == its header size)
-/// at epoch `u32::MAX`, and a multi-MiB group at epoch 1.
+/// The `(epoch << 32 | PRESENT)` prefix word must round-trip at the boundaries:
+/// a one-slot group with no data at epoch `u32::MAX`, and a multi-MiB group at
+/// epoch 1.
 #[test]
 fn sal_prefix_packing_boundaries() {
     // The multi-MiB group below plus the reserve; nothing here needs more.
     let log = TestLog::new(2 << 20, 1, u32::MAX);
 
     log.write(0, 0, SalMessageKind::Scan, &[&[]]);
-    assert_eq!(prefix_word(&log), epoch_word(u32::MAX, group_header_size(1) as u64));
-    let (_, next) = group_and_next(log.log(), 0, u32::MAX);
-    assert_eq!(next, (PREFIX_BYTES + group_header_size(1)) as u64);
-    assert_eq!(next, log.cursor());
+    assert_eq!(log.log().prefix_word(0), epoch_word(u32::MAX, PRESENT));
+    let msg = group_in(log.log(), 0, u32::MAX);
+    assert_eq!(msg.end, (PREFIX_BYTES + group_header_size(1)) as u64);
+    assert_eq!(msg.end, log.cursor());
 
-    // A payload past 2^20, epoch 1: the low half of the prefix word is the one
-    // that would truncate. Only the first group's bytes need clearing — the one
-    // written over them is strictly larger.
-    unsafe { std::ptr::write_bytes(log.ptr(), 0, PREFIX_BYTES + group_header_size(1)) };
     log.seek(0, 1);
     let big = vec![0xEEu8; 1 << 20];
     log.write(0, 0, SalMessageKind::Scan, &[&big]);
     let expected_payload = group_header_size(1) + (1 << 20); // already 8-aligned
-    assert_eq!(prefix_word(&log), epoch_word(1, expected_payload as u64));
-    let (msg, next) = group_and_next(log.log(), 0, 1);
-    assert_eq!(next, (PREFIX_BYTES + expected_payload) as u64);
+    assert_eq!(log.log().prefix_word(0), epoch_word(1, PRESENT));
+    let msg = group_in(log.log(), 0, 1);
+    assert_eq!(msg.end, (PREFIX_BYTES + expected_payload) as u64);
     assert_eq!(msg.slot(0).expect("data slot").len(), 1 << 20);
 }
 
@@ -476,19 +465,13 @@ fn every_group_header_size_is_8_aligned() {
     assert_eq!(log.cursor() % 8, 0);
 }
 
-/// The stride the reader derives from the authenticated directory must equal the
-/// `payload_size` the writer put in the prefix, at every width — including one
-/// with empty slots interleaved among non-empty ones, where `align8(0) = 0` is
-/// what makes the derivation exact.
+/// The stride the reader derives from the directory equals the size the writer
+/// laid out, at every width, empty slots interleaved.
 #[test]
-fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
+fn the_derived_stride_equals_the_writers_group_size_at_every_width() {
     let log = TestLog::new(128 << 10, 1, 1);
-    // Every iteration writes at offset 0, so only the widest group's bytes can be
-    // left over from the one before it.
-    let widest = PREFIX_BYTES + group_header_size(MAX_WORKERS) + MAX_WORKERS * align8(100);
     let buf = vec![0x33u8; 100];
     for &slots in &[1usize, 2, 3, 4, MAX_WORKERS] {
-        unsafe { std::ptr::write_bytes(log.ptr(), 0, widest) };
         log.seek(0, 1);
         // Every other slot empty from slot 1 on, so the widths past 1 all carry
         // the interleaved shape.
@@ -497,20 +480,69 @@ fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
             .collect();
         log.write(7, 9, SalMessageKind::Scan, &payloads);
 
-        let (msg, next) = group_and_next(log.log(), 0, 1);
+        let msg = group_in(log.log(), 0, 1);
         assert_eq!(msg.slots() as usize, slots);
         let expected = group_header_size(slots) + payloads.iter().filter(|p| !p.is_empty()).count() * align8(100);
         assert_eq!(
-            prefix_word(&log),
-            epoch_word(1, expected as u64),
-            "group_header_size disagrees at {slots} slots"
-        );
-        assert_eq!(
-            next as usize,
+            msg.end as usize,
             PREFIX_BYTES + expected,
-            "the derived stride must equal the prefix's payload_size at {slots} slots"
+            "the derived stride must equal the group's size at {slots} slots"
         );
-        assert_eq!(next, log.cursor(), "and the writer's own cursor advance");
+        assert_eq!(msg.end, log.cursor(), "and the writer's own cursor advance");
+    }
+}
+
+/// Every bit of a zoned push group's slot is covered by that slot's directory
+/// checksum, and by no other slot's.
+#[test]
+fn every_bit_of_a_zoned_slot_is_covered_by_its_own_checksum() {
+    let sal = TestLog::new(1 << 20, 2, 1);
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+    let mut excl = sal.writer.lock_exclusive();
+    let scope = excl.begin(5, "test");
+    sal.push_group(16, schema, &batch, |g| scope.write(g, true));
+    assert!(scope.commit(), "the zone was open");
+    drop(excl);
+
+    let msg = group_at(sal.log(), 0);
+    let slots: Vec<(u32, Vec<u8>)> = msg.slots_written().map(|(w, b)| (w, b.to_vec())).collect();
+    assert_eq!(slots.len(), 2, "both slots are written");
+    for (w, bytes) in &slots {
+        assert!(msg.slot_intact(*w, bytes), "clean slot {w} verifies");
+    }
+
+    let (victim, clean) = &slots[0];
+    let mut buf = clean.clone();
+    sweep_bit_flips(&mut buf, 0..clean.len(), |byte, bit, buf| {
+        assert!(
+            !msg.slot_intact(*victim, buf),
+            "slot {victim} byte {byte} bit {bit} must fail its checksum"
+        );
+        for (w, bytes) in &slots[1..] {
+            assert!(
+                msg.slot_intact(*w, bytes),
+                "slot {w} is untouched by slot {victim}'s damage"
+            );
+        }
+    });
+}
+
+/// An unzoned group's directory entries hold checksum 0.
+#[test]
+fn an_unzoned_groups_entries_hold_checksum_0() {
+    let sal = TestLog::new(1 << 20, 2, 1);
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+    sal.push_group(16, schema, &batch, |g| sal.writer.lock_exclusive().write(g));
+
+    let msg = group_at(sal.log(), 0);
+    for w in 0..msg.slots() as usize {
+        assert_eq!(
+            gnitz_wire::read_u64_le(msg.dir, w * DIR_ENTRY_BYTES + DIR_CHECKSUM_AT),
+            0,
+            "slot {w}"
+        );
     }
 }
 
@@ -526,24 +558,31 @@ fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
 fn a_rolled_back_transaction_publishes_nothing() {
     // Sized so the first family fits under the ordinary cap and the second
     // does not.
-    let payload = 4096usize;
-    let log = TestLog::new(PREFIX_BYTES + CHECKPOINT_RESERVE + payload + 512, 1, 1);
-    let buf = vec![0xD1u8; payload];
+    let buf = vec![0xD1u8; 4096];
+    let family = |target_id| DirectGroup {
+        template: WireMsg {
+            target_id,
+            blob: &buf,
+            ..Default::default()
+        },
+        ..DirectGroup::new(SalMessageKind::DdlSync)
+    };
+    let head = [0u8; 64];
+    let need = TestLog::new(1 << 20, 1, 1).writer.footprint(&family(2));
+    let head_size = PREFIX_BYTES + group_header_size(1) + align8(head.len());
+    let log = TestLog::new(PREFIX_BYTES + CHECKPOINT_RESERVE + head_size + need + need / 2, 1, 1);
 
     // A committed group ahead of the transaction, so the rollback must restore a
     // non-zero cursor and must not disturb what came before it.
-    log.write(1, 1, SalMessageKind::Push, &[&[0u8; 64]]);
+    log.write(1, 1, SalMessageKind::Push, &[&head]);
     let before_cursor = log.cursor();
+    assert_eq!(before_cursor as usize, head_size);
 
     let scope = log.writer.begin(2, "test");
     let savepoint = scope.savepoint();
     let zone_start = log.cursor();
-    log.try_write_in(&scope, 2, SalMessageKind::Push, &[&buf])
-        .expect("the first family fits");
-    assert!(
-        log.try_write_in(&scope, 3, SalMessageKind::Push, &[&buf]).is_err(),
-        "the second family must not fit"
-    );
+    scope.write(&family(2), true).expect("the first family fits");
+    assert!(scope.write(&family(3), true).is_err(), "the second family must not fit");
     scope.roll_back(savepoint);
     drop(scope);
 
@@ -561,12 +600,18 @@ fn a_rolled_back_transaction_publishes_nothing() {
 #[test]
 fn a_scoped_group_is_invisible_until_the_scope_commits() {
     let log = TestLog::new(1 << 20, 1, 1);
+    let group = |target_id| DirectGroup {
+        template: WireMsg {
+            target_id,
+            blob: &[0u8; 32],
+            ..Default::default()
+        },
+        ..DirectGroup::new(SalMessageKind::DdlSync)
+    };
     let scope = log.writer.begin(1, "test");
-    log.try_write_in(&scope, 1, SalMessageKind::Push, &[&[0u8; 32]])
-        .expect("group fits");
+    scope.write(&group(1), true).expect("group fits");
     let second = log.cursor();
-    log.try_write_in(&scope, 2, SalMessageKind::Push, &[&[0u8; 32]])
-        .expect("group fits");
+    scope.write(&group(2), true).expect("group fits");
 
     assert!(matches!(log.log().read_at(0, EpochGate::Live(1)), SalStep::Absent));
     assert!(matches!(log.log().read_at(second, EpochGate::Live(1)), SalStep::Absent));
@@ -586,8 +631,15 @@ fn an_uncommitted_scope_publishes_nothing() {
     let before = log.cursor();
     {
         let scope = log.writer.begin(9, "test");
-        log.try_write_in(&scope, 2, SalMessageKind::Push, &[&[0u8; 32]])
-            .expect("group fits");
+        let g = DirectGroup {
+            template: WireMsg {
+                target_id: 2,
+                blob: &[0u8; 32],
+                ..Default::default()
+            },
+            ..DirectGroup::new(SalMessageKind::DdlSync)
+        };
+        scope.write(&g, true).expect("group fits");
     }
     assert_eq!(log.cursor(), before, "the cursor is back where the scope opened");
     assert!(matches!(log.log().read_at(before, EpochGate::Live(1)), SalStep::Absent));
@@ -856,7 +908,7 @@ fn every_single_bit_flip_in_a_group_header_is_rejected() {
     let hdr = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(PREFIX_BYTES), hdr_len) };
     sweep_bit_flips(hdr, 0..hdr_len, |byte, bit, _| {
         assert!(
-            matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+            matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
             "header byte {byte} bit {bit} must fail the digest"
         );
     });
@@ -881,7 +933,7 @@ fn a_header_only_verifies_at_the_offset_it_was_published_at() {
         std::ptr::copy_nonoverlapping(b_hdr.as_ptr(), log.ptr().add(PREFIX_BYTES), hdr_len);
     }
     assert!(
-        matches!(log.log().read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+        matches!(log.log().read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
         "a header published elsewhere must not verify here"
     );
 }
@@ -902,7 +954,7 @@ fn a_probe_never_reads_past_the_end_of_the_mapping() {
     assert!(
         matches!(
             view.read_at((size - PREFIX_BYTES) as u64, EpochGate::Walk(1)),
-            SalStep::Corrupt(_)
+            SalStep::Corrupt
         ),
         "a candidate 8 bytes from the end must be rejected before the slot-count read"
     );
@@ -912,7 +964,7 @@ fn a_probe_never_reads_past_the_end_of_the_mapping() {
     let hdr = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(base + PREFIX_BYTES), group_header_size(0)) };
     gnitz_wire::write_u32_le(hdr, 16, MAX_WORKERS as u32);
     assert!(
-        matches!(view.read_at(base as u64, EpochGate::Walk(1)), SalStep::Corrupt(_)),
+        matches!(view.read_at(base as u64, EpochGate::Walk(1)), SalStep::Corrupt),
         "a MAX_WORKERS directory that overruns the mapping must be rejected before the digest read"
     );
 }
@@ -1000,7 +1052,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
         .expect("fewer than 256 kinds");
     restamp_header(&log, |hdr| hdr[OFF_KIND] = unknown);
     assert!(
-        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
         "an unknown kind ordinal must read as corruption"
     );
 
@@ -1012,7 +1064,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
 
     restamp_header(&log, |hdr| gnitz_wire::write_u64_le(hdr, OFF_LSN, 0));
     assert!(
-        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
         "a zone end outside every zone must read as corruption"
     );
 
@@ -1021,7 +1073,7 @@ fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
         hdr[OFF_FLAGS] = 4;
     });
     assert!(
-        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
         "an unknown flag bit must read as corruption"
     );
 }
@@ -1045,7 +1097,7 @@ fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
         let word = log.ptr() as *mut u64;
         *word = (*word & 0xFFFF_FFFF) | (2u64 << 32);
     }
-    let reader = SalReader::new(log.log(), 0, 1);
+    let reader = SalReader::new(log.log(), 0, 2);
     assert!(
         reader.next().is_none(),
         "a previous epoch's group must park, whatever its prefix claims"
@@ -1067,7 +1119,7 @@ fn the_live_path_aborts_on_a_damaged_header() {
     );
     // The code alone would be satisfied by any other fatal abort reached first.
     assert!(
-        stderr.contains("SAL group header failed its digest"),
+        stderr.contains("is corrupt — the log is damaged"),
         "{name} aborted for the wrong reason\nstderr:\n{stderr}"
     );
 }
@@ -1082,11 +1134,11 @@ fn the_live_path_aborts_on_a_damaged_header_internal() {
     let log = TestLog::new(1 << 20, 1, 1);
     log.write(7, 11, SalMessageKind::Scan, &[&[0u8; 32]]);
     // A sanity read before the damage, so the abort below is the damage.
-    let reader = SalReader::new(log.log(), 0, 0);
+    let reader = SalReader::new(log.log(), 0, 1);
     assert!(reader.next().is_some());
     unsafe { *log.ptr().add(PREFIX_BYTES) ^= 1 };
 
-    let reader = SalReader::new(log.log(), 0, 0);
+    let reader = SalReader::new(log.log(), 0, 1);
     let _ = reader.next();
     unreachable!("a damaged header on the live path must fail-stop, not park");
 }

@@ -409,10 +409,10 @@ def test_a_recovered_view_still_ticks_from_every_source(own_server):
 
 def test_a_backfill_that_reclaims_the_sal_every_round_still_rebuilds_exactly(own_server):
     """The worst-case relay — a pure range join, which broadcasts because it has
-    no eq prefix to scatter on — with the reclaim seam forcing a checkpoint and
-    SAL reset on every backfill round. Workers must re-epoch inline as they
-    consume each relay and the master must reset its write side at the next round
-    barrier; if any of that is wrong the backfill deadlocks or the view is short.
+    no eq prefix to scatter on — with the reclaim seam forcing a base round and
+    SAL reset before every non-pad backfill round. Workers must flush inline in
+    their exchange wait and find the relay at cursor 0 of the new epoch; if any
+    of that is wrong the backfill deadlocks or the view is short.
     """
     own_server.extra_env.update({"GNITZ_SCAN_CHUNK_ROWS": "3",
                                  "GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW": "1"})
@@ -428,6 +428,37 @@ def test_a_backfill_that_reclaims_the_sal_every_round_still_rebuilds_exactly(own
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
         vid, _ = conn.resolve_table("rr", "rv")
+        assert bag(conn.scan(vid), "x", "y") == sh["want"]["rv"]
+
+
+def test_a_live_backfill_reclaim_keeps_every_acked_write_across_a_crash(own_server):
+    """Every write ACKed before a live backfill's SAL reclaim survives a crash:
+    the view's sources, a bystander table, and the view's own DDL."""
+    own_server.extra_env.update({"GNITZ_SCAN_CHUNK_ROWS": "3",
+                                 "GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW": "1",
+                                 "GNITZ_LOG_LEVEL": "normal"})
+    own_server.start(workers=_MULTI)
+    sh = _SHAPES["range_join"]
+    tables, view = sh["ddl"][:2], sh["ddl"][2]
+    bystander = [(pk, pk * 3) for pk in range(10)]
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.create_schema("lr")
+        for stmt in tables + sh["rows"] + [
+                "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+                f"INSERT INTO u VALUES {values(bystander)}"]:
+            conn.execute_sql(stmt, schema_name="lr")
+        before = own_server.sal_checkpoints()
+        conn.execute_sql(view, schema_name="lr")
+        assert own_server.sal_checkpoints() > before, "the backfill must have reclaimed"
+
+    own_server.restart()
+    with gnitz.connect(own_server.sock_path) as conn:
+        for name, cols, rows in [("ra", ("id", "x"), _RA),
+                                 ("rb", ("id", "y"), _RA),
+                                 ("u", ("pk", "v"), bystander)]:
+            tid, _ = conn.resolve_table("lr", name)
+            assert bag(conn.scan(tid), *cols) == {r: 1 for r in rows}, name
+        vid, _ = conn.resolve_table("lr", "rv")
         assert bag(conn.scan(vid), "x", "y") == sh["want"]["rv"]
 
 

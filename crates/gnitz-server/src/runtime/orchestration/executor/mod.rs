@@ -611,7 +611,7 @@ async fn watchdog(shared: Rc<Shared>) {
             //    so the sequence's drain is what gets it into the views.
             await_barrier(&shared, BarrierKind::Shutdown).await;
 
-            // 3. Workers flush + _exit, then stop the reactor. The reactor/W2M
+            // 3. Shut the workers down, then stop the reactor. The reactor/W2M
             //    receiver stays live throughout, so no `w2m()` handle dangles.
             shared.disp().shutdown_workers().await;
             shared.disp().reactor().request_shutdown();

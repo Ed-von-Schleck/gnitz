@@ -131,11 +131,8 @@ struct DagExchangeCtx<'a> {
     /// This worker's source partition is already drained, so its rounds are
     /// empty pads. The master ANDs it across workers. Only a backfill pads.
     pad: bool,
-    /// The drive's collective verdict, `None` exactly when it issued no exchange
-    /// — a view with no barrier, which `handle_backfill` terminates on local
-    /// drain exhaustion instead. Every round yields the same verdict, so writing
-    /// it per round is a restatement, not a race. The master stamps `Stop` and
-    /// `Checkpoint` onto a backfill round alone, so a tick's is always `Continue`.
+    /// The last exchange round's backfill verdict; `None` when the drive issued
+    /// no exchange.
     verdict: Option<BackfillDecision>,
 }
 
@@ -147,11 +144,6 @@ impl DriveHost for DagExchangeCtx<'_> {
 
     fn exchange(&mut self, view_id: i64, batch: Batch, key: i64) -> Batch {
         let (batch, decision) = self.worker.do_exchange_wait(view_id, batch, key, self.pad);
-        // The master writes the next round at cursor 0 of a new epoch. Not the
-        // flush path: its ACK would read as this worker's terminal ACK.
-        if decision == BackfillDecision::Checkpoint {
-            self.worker.sal_reader.rewind();
-        }
         self.verdict = Some(decision);
         batch
     }
@@ -444,7 +436,7 @@ impl WorkerProcess {
         let batch = decoded.data_batch;
 
         match kind {
-            SalMessageKind::Shutdown => self.shutdown(),
+            SalMessageKind::Shutdown => unsafe { libc::_exit(0) },
 
             SalMessageKind::Flush => {
                 self.sal_reader.rewind();
@@ -924,29 +916,11 @@ impl WorkerProcess {
         verdict
     }
 
-    /// Publish and exit. The publish is not optional — a mid-backfill
-    /// `checkpoint_reset` can have discarded the SAL entries that are these rows'
-    /// only other durable copy — but there may be no master left to bump the
-    /// generation ahead of it, since the watchdog's crashed-worker path
-    /// broadcasts `Shutdown` with no barrier behind it. So the worker
-    /// invalidates its own derived state instead, and unlinks before publishing
-    /// so a crash between the two errs toward a rebuild.
-    ///
-    /// A graceful stop already ran a full sequence, so the base cut has not
-    /// advanced and only the flush runs — which is what lets it still resume.
-    fn shutdown(&mut self) -> ! {
-        if self.cat().registry.base_advanced_since_publish() {
-            self.cat().unlink_derived_manifests();
-        }
-        let _ = self.handle_flush_all();
-        unsafe { libc::_exit(0) }
-    }
-
-    /// Unrecoverable worker fault: log, flush, `_exit`. The master's
-    /// watchdog turns the dead worker into a cluster abort.
+    /// Unrecoverable worker fault. The master's watchdog turns the dead worker
+    /// into a cluster abort.
     fn fatal_shutdown(&mut self, msg: &str) -> ! {
         gnitz_warn!("FATAL: {}. Shutting down.", msg);
-        self.shutdown()
+        unsafe { libc::_exit(0) }
     }
 }
 

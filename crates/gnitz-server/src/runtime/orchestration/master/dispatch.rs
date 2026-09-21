@@ -90,6 +90,7 @@ impl MasterDispatcher {
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
             last_ephemeral_gen: Cell::new(last_ephemeral_gen),
+            unflushed_pushes: Cell::new(false),
             tick_round: Cell::new(1),
             last_delta_round: RefCell::new(FxHashMap::default()),
             boot_nonce: boot_nonce(),
@@ -158,50 +159,26 @@ impl MasterDispatcher {
 
     /// Block until `lease`'s ids have answered, relaying each round inline;
     /// nothing else on the reactor runs. Fails on a worker's error ACK or death.
-    ///
-    /// `checkpoint_allowed`: a backfill may stamp CHECKPOINT to reclaim SAL
-    /// space mid-stream (workers re-epoch inline). A drain TICK must NOT —
-    /// it carries no backfill pad, so a CHECKPOINT would advance the master
-    /// epoch while workers stay on the old one and wedge the cluster.
-    ///
-    /// `ctx` names the phase in a worker-fault or dead-worker error.
-    pub(crate) fn collect_exclusive(
-        &self,
-        lease: &Lease,
-        ctx: &str,
-        checkpoint_allowed: bool,
-    ) -> Result<(), WireFault> {
+    /// With `reclaim_allowed`, a relay that does not fit runs [`Self::reclaim_base`]
+    /// first. `ctx` names the phase in a worker-fault or dead-worker error.
+    pub(crate) fn collect_exclusive(&self, lease: &Lease, ctx: &str, reclaim_allowed: bool) -> Result<(), WireFault> {
         self.reactor.block_on_exclusive(async {
             let collect = async {
                 let mut acc = ExchangeAccumulator::new(self.num_workers());
-                // Set when a round is stamped CHECKPOINT; the reset lands at the next
-                // round barrier, after every worker consumed that relay — so the next
-                // round is written at cursor 0 of the epoch the workers already
-                // expect. A bare `checkpoint_reset`, never `checkpoint_post_ack`: a
-                // mid-backfill flush would orphan unconsumed backfill groups.
-                let mut pending_reset = false;
                 while let Some(relay) = self.next_relay(lease, ctx, &mut acc).await? {
                     let mut excl = self.sal.lock_exclusive();
-                    if std::mem::take(&mut pending_reset) {
-                        excl.checkpoint_reset();
-                    }
-                    // Stop takes precedence: an all-pad round ends the backfill, and its
-                    // leftover SAL is reclaimed by the post-backfill checkpoint. A
-                    // CHECKPOINT verdict cannot rescue this round — it is written at the
-                    // current cursor either way.
-                    let all_pad = relay.all_pad;
-                    let prep = self.prepare_relay(relay, ctx);
-                    let decision = if all_pad {
+                    let decision = if relay.all_pad {
                         BackfillDecision::Stop
-                    } else if checkpoint_allowed
-                        && (prep.with_group(BackfillDecision::Continue, |g| self.sal.fit_relay(g)) != SalFit::Fits
-                            || BACKFILL_RELAY_SPACE_LOW.armed())
-                    {
-                        pending_reset = true;
-                        BackfillDecision::Checkpoint
                     } else {
                         BackfillDecision::Continue
                     };
+                    let prep = self.prepare_relay(relay, ctx);
+                    if reclaim_allowed
+                        && (prep.with_group(decision, |g| self.sal.fit_relay(g)) != SalFit::Fits
+                            || BACKFILL_RELAY_SPACE_LOW.armed())
+                    {
+                        self.reclaim_base(&mut excl).await?;
+                    }
                     self.emit_relay(&excl, &prep, decision);
                 }
                 Ok::<(), WireFault>(())
@@ -233,12 +210,12 @@ impl MasterDispatcher {
     fn exclusive_round(
         &self,
         ctx: &str,
-        checkpoint_allowed: bool,
+        reclaim_allowed: bool,
         write: impl FnOnce(&SalExcl<'_>, GroupTargets) -> Result<(), WireFault>,
     ) -> Result<(), WireFault> {
         let lease = self.reactor.lease_acks(1, WorkerSet::ALL);
         write(&self.sal.lock_exclusive(), GroupTargets::all(lease.id(0)))?;
-        self.collect_exclusive(&lease, ctx, checkpoint_allowed)
+        self.collect_exclusive(&lease, ctx, reclaim_allowed)
     }
 
     // -----------------------------------------------------------------------
@@ -252,43 +229,24 @@ impl MasterDispatcher {
         self.cat().durable_generation() > self.last_ephemeral_gen.get()
     }
 
-    /// Invariant: the caller must own SAL checkpoint exclusivity — an exclusive
-    /// round at boot, or in a DDL window under the catalog write lock with the
-    /// committer proven idle. The *async* fan-out / tick / steady-state DDL
-    /// paths must NOT call this: a concurrent Flush races the committer's own and
-    /// orphans SAL writes straddling `sal.checkpoint_reset`.
-    ///
-    /// Publish every base table's shards and reset the SAL, invalidating
-    /// checkpointed derived state first. The bump is not optional: this path
-    /// makes a newer base cut durable and then discards the SAL entries that
-    /// carried the difference, while every checkpointed view and index manifest
-    /// still names the older cut — left generation-valid, the next boot would
-    /// resume derived state behind its base with no tail left to close the gap.
-    /// Durable *before* the flush round (`bump_checkpoint_generation` flushes the
-    /// system tables), so a crash below leaves that state invalid rather than
-    /// silently stale — the same ordering step 0 of `run_checkpoint_sequence`
-    /// uses.
-    ///
-    /// Half a checkpoint on its own: it must be paired with `restamp_derived` in
-    /// the same exclusive window.
-    fn reclaim_base(&self) -> Result<(), WireFault> {
-        self.cat().bump_checkpoint_generation()?;
-        self.sync_round(FlushRound::Base)
+    /// Half a checkpoint: a generation bump, then a base round. Returns the new
+    /// generation.
+    pub(crate) async fn reclaim_base(&self, excl: &mut SalExcl<'_>) -> Result<u64, WireFault> {
+        debug_assert!(
+            !self.cat().has_uncommitted_families(),
+            "a checkpoint's system-table flush would make an uncommitted DDL durable"
+        );
+        let generation = self.cat().bump_checkpoint_generation()?;
+        self.checkpoint_round(excl, FlushRound::Base).await?;
+        Ok(generation)
     }
 
-    /// Re-stamp the derived state a `reclaim_base` invalidated, inside the
-    /// caller's exclusive window: tick every source carrying buffered deltas
-    /// up to the published base cut, then persist every view trace, view output
-    /// and index at the durable generation.
-    ///
-    /// The tick is not optional — a base round leaves `pending_deltas` in worker
-    /// RAM (`handle_flush_all`), and the reclaim reset the SAL out from under
-    /// them, so stamping first would mark views durable at a cut their input has
-    /// not reached.
-    ///
-    /// `pending` is the master's set of tables with un-ticked deltas — what the
-    /// committer's `Drain` covers.
+    /// Re-stamp derived state at the durable generation. `pending`: the tables
+    /// with un-ticked deltas.
     pub(crate) fn restamp_derived(&self, pending: &[i64]) -> Result<(), WireFault> {
+        if self.unflushed_pushes.get() {
+            self.sync_round(FlushRound::Base)?;
+        }
         for &tid in pending {
             self.drain_tick_blocking(tid)?;
         }
@@ -325,22 +283,18 @@ impl MasterDispatcher {
         self.checkpoint_post_ack(excl)
     }
 
-    /// Check one emitted round against the ordering every base publish depends
-    /// on: **no durable base-shard advance without a prior durable generation
-    /// bump**, and no second base round once an ephemeral round has re-stamped
-    /// derived state at the current generation.
-    ///
-    /// Checked on the one path that emits a round rather than left as an
-    /// obligation on each call site. The committer's reclaim-only base round
-    /// inside `await_servicing` rides step 0's bump without one of its own — that
-    /// is the "no intervening ephemeral round" clause, encoded rather than
-    /// excepted.
+    /// Record `round`, asserting the checkpoint ordering.
     fn note_flush_round(&self, round: FlushRound) {
         let durable = self.cat().durable_generation();
         if let FlushRound::Ephemeral { generation } = round {
             debug_assert_eq!(generation, durable, "ephemeral round must stamp the durable generation");
+            debug_assert!(
+                !self.unflushed_pushes.get(),
+                "an ephemeral round's reset would discard pushes no base round flushed"
+            );
             self.last_ephemeral_gen.set(generation);
         } else {
+            self.unflushed_pushes.set(false);
             debug_assert!(
                 durable > self.last_ephemeral_gen.get(),
                 "base round at generation {} publishes past the last ephemeral round ({}): \
@@ -435,22 +389,7 @@ impl MasterDispatcher {
     /// rebuild next to resumed siblings) that a closure re-drive would
     /// double-count.
     ///
-    /// Reclaims SAL space before a large source; the exclusive round may further
-    /// CHECKPOINT mid-stream. Both are safe on the SAL-exclusive,
-    /// no-concurrent-relay paths this runs on (boot; a DDL window's exclusive
-    /// rounds). A reclaim here bumps the generation, leaving every checkpointed
-    /// view and index invalid until an ephemeral round re-stamps them — so a
-    /// caller must run `restamp_derived` before its window closes whenever
-    /// [`Self::derived_needs_restamp`] answers true afterwards.
     fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), WireFault> {
-        // A backfill round cannot reclaim mid-flight — the reset reaches the
-        // workers stamped on the *previous* round's relay — so round one gets
-        // whatever the cursor leaves, and reclaiming first is the only lever.
-        // Neither test implies the other: `GNITZ_CHECKPOINT_BYTES` is unclamped
-        // and may sit below the margin.
-        if self.sal.past_backfill_reclaim_threshold() || self.sal.needs_checkpoint() {
-            self.reclaim_base()?;
-        }
         // Dataless, but it still carries a schema block: that block is what
         // stamps `Batch.schema` on the worker side.
         let source = wire::WireSchema::encoded(source_id, self.schema_desc_for(source_id));
@@ -498,8 +437,8 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Tick `source_id` in an exclusive round, relaying its exchange rounds inline.
-    /// No mid-round checkpoint: a tick carries no backfill pad to re-epoch on.
+    /// Tick `source_id` in an exclusive round, relaying its exchange rounds inline
+    /// without reclaiming.
     pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), WireFault> {
         self.exclusive_round("view tick drain", false, |excl, t| {
             self.write_tick_group(excl, source_id, t)
@@ -638,8 +577,7 @@ impl MasterDispatcher {
         None
     }
 
-    /// Broadcast `Shutdown` (each worker flushes + `_exit`s) and reap the
-    /// worker processes, blocking on each.
+    /// Broadcast `Shutdown` and reap the worker processes, blocking on each.
     pub(crate) async fn shutdown_workers(&self) {
         // No schema block: the worker's `Shutdown` arm takes no arguments. A
         // refusal would hang the `waitpid` below, so it must not vanish.
@@ -666,6 +604,9 @@ impl MasterDispatcher {
         request_id: u32,
         recoverable: bool,
     ) -> Result<(), WireFault> {
+        if recoverable {
+            self.unflushed_pushes.set(true);
+        }
         let relation = self.wire_schema(target_id);
         let group = DirectGroup {
             targets: GroupTargets::all(request_id),

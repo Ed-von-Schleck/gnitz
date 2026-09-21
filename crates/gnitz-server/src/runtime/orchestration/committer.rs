@@ -227,26 +227,18 @@ async fn flush_round(shared: &Rc<Shared>, round: FlushRound) {
 ///
 /// Must not run inside a DDL window: the drain below would never complete
 /// against the parked tick loop (see `TickGate`).
-///
-/// `MasterDispatcher::reclaim_base` states the exclusivity every SAL checkpoint
-/// driver must own.
 async fn run_checkpoint_sequence(
     rx: &mut chan::Receiver<CommitRequest>,
     shared: &Rc<Shared>,
     batch: &mut PendingBatch,
 ) {
-    // Step 0: gen bump. From this instant every existing rederived manifest is
-    // stale; a crash below rebuilds views instead of silently staleifying them.
-    let gen = match shared.disp().cat().bump_checkpoint_generation() {
-        Ok(g) => g,
-        // Continuing would publish a base cut no view manifest is invalidated
-        // against. Aborting leaves the SAL un-reset, so restart replays it.
-        Err(e) => gnitz_fatal_abort!("checkpoint generation bump failed: {}", e),
+    let gen = {
+        let disp = shared.disp();
+        let mut excl = disp.sal().lock().await;
+        disp.reclaim_base(&mut excl)
+            .await
+            .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"))
     };
-
-    // Step 1: base round. A failure inside it is unrecoverable in-process and
-    // aborts there; see `flush_round`.
-    flush_round(shared, FlushRound::Base).await;
 
     // Release the reclaim barriers now: step 1's reset already reclaimed space, and
     // a tick waiting on one must finish before the tick loop can take the drain

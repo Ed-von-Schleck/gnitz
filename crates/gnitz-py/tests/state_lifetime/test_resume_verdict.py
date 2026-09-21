@@ -194,38 +194,18 @@ def test_a_changed_worker_count_rebuilds_the_cut_plus_tail_exactly(own_server):
             (k, k * 10): 1 for k in range(1, 11)}
 
 
-# At the 16 MiB floor the backfill reclaims past 1/8 (2 MiB) and the committer
-# checkpoints past 3/4 (12 MiB). The push below is sized into that gap, so the
-# backfill's reclaim is the only one that fires. Byte volume is all that counts,
-# hence wide rows. `GNITZ_LOG_LEVEL=normal` is what logs "SAL checkpoint epoch=";
-# the server defaults to quiet.
-_RECLAIM_ENV = {"GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_LOG_LEVEL": "normal"}
-_RECLAIM_ROWS = 400
-_RECLAIM_PAD = "x" * 8000
+_ROWS = 40
 
 
 def test_a_backfill_reclaim_restamps_the_state_it_invalidated(own_server):
-    """A CREATE VIEW whose pre-backfill reclaim fires publishes every base table's
-    shards and resets the SAL, so the rows it made durable exist in the base and
-    nowhere else — and the generation bump inside `reclaim_base` invalidates every
-    checkpointed view and index. The window must finish that checkpoint itself,
-    re-stamping the derived state before it returns.
-
-    Deferring the re-stamp to the committer needs something to wake it, and on a
-    server that goes idle after the CREATE nothing does: the watchdog's reclaim
-    barrier is gated on low SAL space, which the reclaim just freed. So nothing
-    happens after the CREATE — a push or a scan would mask the bug — before the
-    SIGKILL. Without the inline finish the restart rebuilds every view and index
-    from base, and without the bump it resumes a view that is silently short with
-    no SAL tail left to close the gap."""
+    """A CREATE VIEW whose backfill reclaims the SAL invalidates every
+    checkpointed view and index; the window re-stamps them before it returns, so
+    an idle server killed right after resumes all of them."""
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-            gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-            gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)]
+            gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
     schema = gnitz.Schema(cols)
-    own_server.extra_env.update(_RECLAIM_ENV)
+    own_server.extra_env["GNITZ_LOG_LEVEL"] = "normal"
 
-    # Phase 1: table, index and view, then a graceful stop so all three are
-    # checkpointed at the generation the reclaim below will move past.
     own_server.start()
     with gnitz.connect(own_server.sock_path) as conn:
         conn.create_schema("stale")
@@ -234,19 +214,16 @@ def test_a_backfill_reclaim_restamps_the_state_it_invalidated(own_server):
         conn.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name="stale")
     own_server.stop_graceful()
 
-    # Phase 2: push into the (2, 12) MiB gap, then CREATE a second view whose
-    # backfill reclaims. Nothing after it.
-    own_server.start()
+    own_server.start(extra_env={"GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW": "1"})
     with gnitz.connect(own_server.sock_path) as conn:
         batch = gnitz.ZSetBatch(schema)
-        for i in range(_RECLAIM_ROWS):
-            batch.append(pk=i, val=i * 10, pad=_RECLAIM_PAD)
+        for i in range(_ROWS):
+            batch.append(pk=i, val=i * 10)
         conn.push(tid, batch)
         before = own_server.sal_checkpoints()
-        conn.execute_sql("CREATE VIEW v2 AS SELECT pk FROM t", schema_name="stale")
-    assert own_server.sal_checkpoints() > before, (
-        "the CREATE VIEW backfill must have reclaimed the SAL — otherwise the "
-        "un-checkpointed tail survives and this test proves nothing")
+        conn.execute_sql("CREATE VIEW v2 AS SELECT val, COUNT(*) AS c FROM t GROUP BY val",
+                         schema_name="stale")
+    assert own_server.sal_checkpoints() > before, "the backfill must have reclaimed"
 
     own_server.stop()
     own_server.start()
@@ -258,7 +235,7 @@ def test_a_backfill_reclaim_restamps_the_state_it_invalidated(own_server):
 
     with gnitz.connect(own_server.sock_path) as conn:
         assert bag(scanned(conn, "stale", "v"), "pk", "val") == {
-            (i, i * 10): 1 for i in range(_RECLAIM_ROWS)}, (
+            (i, i * 10): 1 for i in range(_ROWS)}, (
             "the resumed view must hold every base row exactly once")
 
 

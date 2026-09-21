@@ -1,5 +1,6 @@
 use super::*;
 use crate::catalog::PUBLIC_SCHEMA_ID;
+use crate::runtime::sal::fixtures::bare_message;
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema};
 use gnitz_store::relation::Relation;
@@ -72,22 +73,6 @@ fn fifo_route(target_id: u64, request_id: u32) -> ReplyRoute {
     }
 }
 
-/// A payload-less SAL group outside every zone; its slot bytes travel beside
-/// it.
-fn sal_msg(kind: SalMessageKind, target_id: u32) -> SalMessage {
-    SalMessage {
-        lsn: 0,
-        kind,
-        zone_end: false,
-        target_id,
-        request_id: 0,
-        in_request_order: false,
-        base: 0,
-        payload: &[],
-        dir: &[],
-    }
-}
-
 /// A bare control block, as every command verb's slot carries, stamped with the
 /// `target_id` a dispatcher reads it from. The write path builds header and slot
 /// off one template, so a fixture must not let them disagree.
@@ -132,7 +117,7 @@ fn tick_defers_inside_exchange() {
     let mut wp = make_worker_for_matrix();
     assert!(wp.exchange.deferred_replay.is_empty());
     assert!(wp
-        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::Tick, 999), tick_frame(999, 7))
+        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::Tick, 999), tick_frame(999, 7))
         .is_none());
     assert_eq!(wp.exchange.deferred_replay.len(), 1);
     let parked = &wp.exchange.deferred_replay[0];
@@ -169,10 +154,10 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
     );
     // A tick first, so the shared FIFO's insertion order is observable.
     assert!(wp
-        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::Tick, 999), tick_frame(999, 3))
+        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::Tick, 999), tick_frame(999, 3))
         .is_none());
     assert!(wp
-        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::DeltaRead, 77), frame)
+        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::DeltaRead, 77), frame)
         .is_none());
     assert_eq!(wp.exchange.deferred_replay.len(), 2, "one queue, in SAL order");
     assert_eq!(wp.exchange.deferred_replay[0].kind, SalMessageKind::Tick);
@@ -225,7 +210,7 @@ fn exchange_relay_inside_exchange() {
     // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
     let frame = encode_relay_frame(200, 0, &schema);
     assert!(wp
-        .dispatch_in_eval(want_key, &sal_msg(SalMessageKind::ExchangeRelay, 200), frame)
+        .dispatch_in_eval(want_key, &bare_message(SalMessageKind::ExchangeRelay, 200), frame)
         .is_none());
     assert!(
         wp.exchange.pending_relays.contains_key(&(200, 0)),
@@ -235,7 +220,7 @@ fn exchange_relay_inside_exchange() {
     // Matching key (target_id=100, source_id=0 == want_key): returns the batch.
     let frame = encode_relay_frame(100, 0, &schema);
     assert!(
-        wp.dispatch_in_eval(want_key, &sal_msg(SalMessageKind::ExchangeRelay, 100), frame)
+        wp.dispatch_in_eval(want_key, &bare_message(SalMessageKind::ExchangeRelay, 100), frame)
             .is_some(),
         "a key-matching relay must short-circuit out of the dispatcher with its batch"
     );
@@ -248,7 +233,7 @@ fn exchange_relay_inside_exchange() {
 fn exchange_relay_top_level_warns_and_continues() {
     let mut wp = make_worker_for_matrix();
     let frame = encode_relay_frame(100, 0, &make_schema_u64_i64());
-    wp.dispatch_top_level(&sal_msg(SalMessageKind::ExchangeRelay, 100), frame);
+    wp.dispatch_top_level(&bare_message(SalMessageKind::ExchangeRelay, 100), frame);
     assert!(
         wp.exchange.pending_relays.is_empty(),
         "TopLevel must NOT park relays — they belong to do_exchange_wait"
@@ -267,7 +252,7 @@ fn ddl_sync_defers_inside_exchange() {
 
     let frame = encode_data_frame(42, &schema, &make_batch_raw(&schema, &[(1, 1, 10)]));
     assert!(wp
-        .dispatch_in_eval((0, 0), &sal_msg(SalMessageKind::DdlSync, 42), frame)
+        .dispatch_in_eval((0, 0), &bare_message(SalMessageKind::DdlSync, 42), frame)
         .is_none());
     assert_eq!(
         wp.exchange.deferred.len(),
@@ -299,14 +284,14 @@ fn flush_and_push_run_inline_inside_exchange() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(&mut engine, writer);
-    wp.sal_reader = SalReader::new(sal.log(), 0, 0);
+    wp.sal_reader = SalReader::new(sal.log(), 0, 1);
 
     // Target 7 is a system id, which a Push may not name — but a control-only
     // slot carries no rows, so the arm ACKs without reaching the store. What is
     // under test is the disposition, not the ingest.
     for kind in [SalMessageKind::Flush, SalMessageKind::Push] {
         assert!(wp
-            .dispatch_in_eval((100, 5), &sal_msg(kind, 7), control_frame(7))
+            .dispatch_in_eval((100, 5), &bare_message(kind, 7), control_frame(7))
             .is_none());
         assert!(
             wp.exchange.deferred.is_empty() && wp.exchange.deferred_replay.is_empty(),
@@ -349,7 +334,7 @@ fn the_sal_reader_gates_on_the_epoch() {
     write(44, 102, SalMessageKind::Push, 2);
 
     let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
-    wp.sal_reader = SalReader::new(sal.log(), 0, 0);
+    wp.sal_reader = SalReader::new(sal.log(), 0, 1);
 
     let next = |wp: &mut WorkerProcess| wp.sal_reader.next().map(|(m, _)| (m.kind, m.target_id));
     assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 42)));

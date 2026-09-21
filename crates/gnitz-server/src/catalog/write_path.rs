@@ -110,6 +110,11 @@ impl CatalogEngine {
         }
     }
 
+    /// Catalog families are applied in memory but not yet committed to the SAL.
+    pub(crate) fn has_uncommitted_families(&self) -> bool {
+        !self.pending_broadcasts.is_empty()
+    }
+
     /// Drain the pending-broadcast queue. Taken by `emit_zone_to_sal` on success and
     /// by `compensate_stage_a` on failure.
     pub(crate) fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch)> {

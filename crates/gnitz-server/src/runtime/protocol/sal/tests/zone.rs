@@ -1,6 +1,8 @@
 use super::*;
 use crate::runtime::sal::fixtures::{group_at, TestLog};
-use crate::runtime::sal::{group_header_size, DirectGroup, SalMessageKind, ANCHOR_BYTES, FLAG_ZONE_END, PREFIX_BYTES};
+use crate::runtime::sal::{
+    group_header_size, DirectGroup, EpochGate, SalMessageKind, SalStep, ANCHOR_BYTES, FLAG_ZONE_END, PREFIX_BYTES,
+};
 use crate::runtime::wire::WireMsg;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 
@@ -19,17 +21,11 @@ fn committed(log: SalLog) -> Result<Vec<u64>, String> {
 /// the walk stops on, if any.
 fn walk(log: SalLog) -> (Vec<(u64, u32)>, Option<u64>) {
     let epoch = log.anchor().expect("the anchor verifies").0;
-    let (mut groups, mut at) = (Vec::new(), 0);
-    loop {
-        match log.read_at(at, EpochGate::Walk(epoch)) {
-            SalStep::Group(m, next) => {
-                groups.push((m.lsn, m.target_id));
-                at = next;
-            }
-            SalStep::Corrupt(off) => return (groups, Some(off)),
-            SalStep::Absent => return (groups, None),
-        }
-    }
+    let msgs: Vec<SalMessage> = log.walk(epoch).collect();
+    let stop = msgs.last().map_or(0, |m| m.end);
+    let groups = msgs.iter().map(|m| (m.lsn, m.target_id)).collect();
+    let corrupt = matches!(log.read_at(stop, EpochGate::Walk(epoch)), SalStep::Corrupt).then_some(stop);
+    (groups, corrupt)
 }
 
 /// Unsynced, damage at `stop` commits exactly `before`; once the log is
@@ -70,33 +66,26 @@ fn the_whole_prefix_word_is_neutralised() {
     });
 }
 
-/// Presence is the whole prefix word: a small `payload_size` alone is zeroable
-/// by one bit flip.
+/// No single flip zeroes a published prefix, even at epoch 1.
 #[test]
 fn a_closing_members_prefix_is_not_single_bit_zeroable() {
     let mut log = TestLog::new(SIZE, 1, 1);
     let closing = log.zone(7, &[11])[0];
     log.group(33, 0, SalMessageKind::Tick, 0);
-    // A 2-slot empty group, whose payload is 64, a single set bit.
-    let empty2 = log
-        .try_write(44, 0, SalMessageKind::Tick, 0, &[&[], &[]])
-        .expect("group fits");
 
     let view = log.log();
     let clean = walk(view);
-    assert_eq!(clean.0.len(), 3, "the zone's one member, a tick, a 2-slot empty group");
+    assert_eq!(clean.0.len(), 2, "the zone's one member, a tick");
     assert_eq!(committed(view).unwrap(), vec![7]);
 
-    for &base in &[closing, empty2] {
-        sweep_bit_flips(log.prefix_bytes(base), 0..PREFIX_BYTES, |byte, bit, _| {
-            assert_eq!(walk(view), clean, "prefix {base}+{byte} bit {bit} changed the walk");
-            assert_eq!(
-                committed(view).unwrap(),
-                vec![7],
-                "prefix {base}+{byte} bit {bit} lost the zone"
-            );
-        });
-    }
+    sweep_bit_flips(log.prefix_bytes(closing), 0..PREFIX_BYTES, |byte, bit, _| {
+        assert_eq!(walk(view), clean, "prefix byte {byte} bit {bit} changed the walk");
+        assert_eq!(
+            committed(view).unwrap(),
+            vec![7],
+            "prefix byte {byte} bit {bit} lost the zone"
+        );
+    });
 }
 
 // -----------------------------------------------------------------------
@@ -111,7 +100,7 @@ fn a_fresh_file_anchors_epoch_0() {
     let view = log.log();
     assert_eq!(view.anchor(), Ok((0, 0)));
     let tail = CommittedTail::read(view).unwrap();
-    assert_eq!((tail.epoch(), tail.groups().count()), (0, 0));
+    assert_eq!((tail.live_epoch(), tail.groups().count()), (1, 0));
 }
 
 /// A damaged anchor fails the boot.

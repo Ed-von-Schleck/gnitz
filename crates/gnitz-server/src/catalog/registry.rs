@@ -219,12 +219,6 @@ impl CatalogEngine {
         Ok(self.registry.checkpoint_ephemeral(self.dag.ephemeral_states())?)
     }
 
-    /// Unlink the manifest of every store [`Self::flush_ephemeral_round`]
-    /// publishes, so the next open erases those stores instead of resuming them.
-    pub(crate) fn unlink_derived_manifests(&mut self) {
-        self.registry.unlink_ephemeral_manifests(self.dag.ephemeral_states());
-    }
-
     /// Record the launched topology and latch the registry's resume verdict from
     /// it. Durable at the next system flush.
     pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), String> {

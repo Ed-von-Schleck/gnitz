@@ -93,9 +93,7 @@ const fn group_header_size(slots: usize) -> usize {
     OFF_DIRECTORY + align8(slots * DIR_ENTRY_BYTES)
 }
 
-// Every group base is `PREFIX_BYTES`-aligned, because `payload_size` is a
-// multiple of it and bases start at 0. Lose that and the publication prefix's
-// atomic store becomes an unaligned — hence non-atomic, hence UB — store.
+// Group bases stay aligned for the publication prefix's atomic store.
 const _: () = {
     let mut slots = 0;
     while slots <= MAX_WORKERS {
@@ -121,20 +119,10 @@ fn slot_spans(sizes: impl Iterator<Item = u32>) -> impl Iterator<Item = (usize, 
     })
 }
 
-/// A group's payload bytes: header + directory + `align8`-padded slots — where
-/// [`slot_spans`] would leave off. The publication prefix in front is NOT
-/// included; [`group_total_size`] is the footprint with it.
-///
-/// The header width is derived from `slots` rather than passed beside it, so a
-/// caller cannot size a directory for one slot count and pad slots for another.
-fn group_payload_size(slots: usize, sizes: impl Iterator<Item = u32>) -> usize {
-    group_header_size(slots) + sizes.map(|sz| align8(sz as usize)).sum::<usize>()
-}
-
-/// The SAL bytes a group occupies: prefix, header, directory and padded slots —
-/// what the write cursor advances by.
+/// The SAL bytes a group occupies: prefix, header, directory and `align8`-padded
+/// slots — what the write cursor advances by, and where [`slot_spans`] leaves off.
 fn group_total_size(slots: usize, sizes: impl Iterator<Item = u32>) -> usize {
-    PREFIX_BYTES + group_payload_size(slots, sizes)
+    PREFIX_BYTES + group_header_size(slots) + sizes.map(|sz| align8(sz as usize)).sum::<usize>()
 }
 
 /// A group's directory bytes read back as slot sizes.
@@ -442,10 +430,6 @@ pub(in crate::runtime) fn sal_mmap_size() -> usize {
 /// eighth. How much must be **free**.
 const RECLAIM_FRACTION_SHIFT: u32 = 3;
 
-/// The fraction past which a backfill reclaims first: how much must already be
-/// **written**, against [`RECLAIM_FRACTION_SHIFT`]'s **free**.
-const BACKFILL_RECLAIM_SHIFT: u32 = 3;
-
 // ---------------------------------------------------------------------------
 // Group kinds
 // ---------------------------------------------------------------------------
@@ -509,15 +493,18 @@ impl SalMessageKind {
     }
 }
 
-/// `(epoch << 32) | low`: a publication prefix word (`low` = payload size) and
-/// the anchor word (`low` = synced offset).
+/// `(epoch << 32) | low`: `low` = [`PRESENT`] for a prefix, the synced offset
+/// for the anchor.
 #[inline]
 const fn epoch_word(epoch: u32, low: u64) -> u64 {
     (epoch as u64) << 32 | low
 }
 
-/// The epoch half of an [`epoch_word`]. A prefix's other half has no accessor:
-/// the stride comes from the authenticated directory, never from that copy.
+/// The low half of every publication prefix word: a presence marker, so zeroing a
+/// published word takes at least 33 bit flips.
+const PRESENT: u64 = u32::MAX as u64;
+
+/// The epoch half of an [`epoch_word`].
 #[inline]
 const fn word_epoch(word: u64) -> u32 {
     (word >> 32) as u32
@@ -555,29 +542,30 @@ pub(crate) struct SalMessage {
     pub(crate) lsn: u64,
     pub(crate) kind: SalMessageKind,
     /// Whether this group is its zone's last member, the one that closes it.
-    pub(crate) zone_end: bool,
+    zone_end: bool,
     pub(crate) target_id: u32,
     /// The group's byte offset in the ring — what a recovery error names.
     pub(crate) base: u64,
+    /// The offset past the group.
+    end: u64,
     /// `0` = unaddressed.
     pub(crate) request_id: u32,
     pub(crate) in_request_order: bool,
     /// The group's slot bytes, from slot 0's offset to the end of the group.
-    pub(crate) payload: &'static [u8],
+    payload: &'static [u8],
     /// The directory: one `DIR_ENTRY_BYTES` entry per slot, which is also what
     /// says how many slots the group has.
-    pub(crate) dir: &'static [u8],
+    dir: &'static [u8],
 }
 
 impl SalMessage {
-    /// Whether every slot is what the writer checksummed. Only a zone member
-    /// carries checksums.
-    pub(crate) fn intact(&self) -> bool {
-        self.lsn == 0 || self.slots_written().all(|(w, b)| self.slot_intact(w, b))
+    /// Whether every slot is what the writer checksummed; only a zone member's are.
+    fn intact(&self) -> bool {
+        self.slots_written().all(|(w, b)| self.slot_intact(w, b))
     }
 
     /// Whether `bytes` are what the writer checksummed for zone member slot `w`.
-    pub(crate) fn slot_intact(&self, w: u32, bytes: &[u8]) -> bool {
+    fn slot_intact(&self, w: u32, bytes: &[u8]) -> bool {
         debug_assert!(self.lsn != 0, "only a zone member's slots carry checksums");
         gnitz_wire::checksum(bytes) == read_u64_le(self.dir, w as usize * DIR_ENTRY_BYTES + DIR_CHECKSUM_AT)
     }
@@ -602,8 +590,7 @@ impl SalMessage {
     }
 }
 
-/// What the bytes at an offset are. `Group` carries the message and the cursor
-/// past it.
+/// What the bytes at an offset are.
 enum SalStep {
     /// Nothing published here, the group's own stride runs past this mapping
     /// (the log was written under a larger `GNITZ_SAL_BYTES`), or a verified
@@ -612,8 +599,8 @@ enum SalStep {
     Absent,
     /// A published header at this offset that fails its digest, or does not
     /// decode.
-    Corrupt(u64),
-    Group(SalMessage, u64),
+    Corrupt,
+    Group(SalMessage),
 }
 
 /// How a reader treats the epoch a group is stamped with.
@@ -662,11 +649,6 @@ impl GroupHeader {
     fn total_size(&self) -> usize {
         group_total_size(self.slots(), dir_sizes(self.dir))
     }
-
-    /// The publication prefix word this group publishes with.
-    fn prefix_word(&self) -> u64 {
-        epoch_word(self.epoch, (self.total_size() - PREFIX_BYTES) as u64)
-    }
 }
 
 /// The anchor's bytes: its [`epoch_word`], then that word's checksum.
@@ -699,7 +681,7 @@ impl SalLog {
 
     /// The walk epoch, and the ring offset a completed `fdatasync` covers.
     /// All-zero is a fresh file.
-    pub(crate) fn anchor(&self) -> Result<(u32, u64), String> {
+    fn anchor(&self) -> Result<(u32, u64), String> {
         // SAFETY: the anchor page is mapped ahead of the ring.
         let a = unsafe { &*self.anchor_record() };
         let (word, sum) = (read_u64_le(a, 0), read_u64_le(a, 8));
@@ -718,11 +700,6 @@ impl SalLog {
     /// there — which is also the answer for a `base` the mapping cannot hold.
     /// Acquire-loaded, so a group whose prefix is visible has its whole header
     /// visible too (the publishing store lands last).
-    ///
-    /// The **whole word** is the presence test, not its `payload_size` half:
-    /// every published group has `epoch >= 1`, so a zero word means "nothing
-    /// here", while a small `payload_size` is zeroable by a bit flip and would end
-    /// a walk before that zone's closing member.
     #[inline]
     fn prefix_word(&self, base: u64) -> u64 {
         if base as usize + PREFIX_BYTES > self.ring_len {
@@ -788,15 +765,12 @@ impl SalLog {
         }
 
         let Some(hdr) = self.probe_header(cursor) else {
-            return SalStep::Corrupt(cursor);
+            return SalStep::Corrupt;
         };
         if hdr.epoch != gate.epoch() {
             return SalStep::Absent;
         }
 
-        // The stride comes from the authenticated directory, not from the
-        // prefix's `payload_size` copy, so a flipped `payload_size` changes no
-        // verdict.
         let end = cursor as usize + hdr.total_size();
         if end > self.ring_len {
             return SalStep::Absent;
@@ -806,20 +780,30 @@ impl SalLog {
         // to the group's end.
         let payload_off = cursor as usize + PREFIX_BYTES + group_header_size(hdr.slots());
         let payload = unsafe { std::slice::from_raw_parts(self.ring.add(payload_off), end - payload_off) };
-        SalStep::Group(
-            SalMessage {
-                lsn: hdr.lsn,
-                kind: hdr.kind,
-                zone_end: hdr.flags & FLAG_ZONE_END != 0,
-                target_id: hdr.target_id,
-                request_id: hdr.request_id,
-                in_request_order: hdr.flags & FLAG_IN_REQUEST_ORDER != 0,
-                base: cursor,
-                payload,
-                dir: hdr.dir,
-            },
-            end as u64,
-        )
+        SalStep::Group(SalMessage {
+            lsn: hdr.lsn,
+            kind: hdr.kind,
+            zone_end: hdr.flags & FLAG_ZONE_END != 0,
+            target_id: hdr.target_id,
+            request_id: hdr.request_id,
+            in_request_order: hdr.flags & FLAG_IN_REQUEST_ORDER != 0,
+            base: cursor,
+            end: end as u64,
+            payload,
+            dir: hdr.dir,
+        })
+    }
+
+    /// Every group readable from offset 0 at `epoch`, up to the first that is not.
+    fn walk(self, epoch: u32) -> impl Iterator<Item = SalMessage> {
+        let mut at = 0;
+        std::iter::from_fn(move || match self.read_at(at, EpochGate::Walk(epoch)) {
+            SalStep::Group(msg) => {
+                at = msg.end;
+                Some(msg)
+            }
+            SalStep::Absent | SalStep::Corrupt => None,
+        })
     }
 }
 
@@ -934,12 +918,6 @@ impl SalWriter {
         )
     }
 
-    /// Whether enough is already written that a backfill should reclaim before
-    /// it starts: more than [`BACKFILL_RECLAIM_SHIFT`] of the mapping.
-    pub(crate) fn past_backfill_reclaim_threshold(&self) -> bool {
-        self.write_cursor.get() as usize > (self.log.ring_len >> BACKFILL_RECLAIM_SHIFT)
-    }
-
     /// Less than the reclaim margin is free, so a relay-sized group would be
     /// refused.
     pub(crate) fn below_reclaim_margin(&self) -> bool {
@@ -955,8 +933,8 @@ impl SalWriter {
     }
 
     /// Lay one group out at the write cursor, `fill(worker, slot)` per non-empty
-    /// slot, and return `(base, prefix word)` — the group is complete on the log
-    /// but not yet published, which [`Self::publish`] does. A refused group
+    /// slot, and return its base — the group is complete on the log but not yet
+    /// published, which [`Self::publish`] does. A refused group
     /// leaves the log untouched. A zone member (`lsn != 0`) checksums every slot.
     #[allow(clippy::too_many_arguments)]
     fn write_slots(
@@ -968,7 +946,7 @@ impl SalWriter {
         request_id: u32,
         sizes: &[u32],
         mut fill: impl FnMut(usize, &mut [u8]),
-    ) -> Result<(usize, u64), SalFit> {
+    ) -> Result<usize, SalFit> {
         assert!(
             sizes.len() <= MAX_WORKERS,
             "a SAL group cannot carry more than MAX_WORKERS slots"
@@ -979,11 +957,8 @@ impl SalWriter {
             "SAL group epoch must be >= 1 — epoch 0 is indistinguishable from the empty prefix"
         );
 
-        // The header size is a multiple of 8 and every slot contributes
-        // align8(sz), so `payload_size` is always a multiple of 8.
         let hdr_size = group_header_size(sizes.len());
-        let payload_size = group_payload_size(sizes.len(), sizes.iter().copied());
-        let total = PREFIX_BYTES + payload_size;
+        let total = group_total_size(sizes.len(), sizes.iter().copied());
         let fit = self.fit_within(effective_max(kind, self.log.ring_len), total);
         if fit != SalFit::Fits {
             // On the writer, not on the scope: the group did not fit whether or
@@ -1028,7 +1003,7 @@ impl SalWriter {
         hdr[OFF_DIRECTORY + sizes.len() * DIR_ENTRY_BYTES..].fill(0);
 
         for (w, off, sz) in slot_spans(sizes.iter().copied()) {
-            // SAFETY: `off + sz <= payload_size - hdr_size`, inside the mapped
+            // SAFETY: `off + sz <= total - PREFIX_BYTES - hdr_size`, inside the mapped
             // span, and the spans are disjoint.
             let slot = unsafe { std::slice::from_raw_parts_mut(self.log.ring.add(hdr_off + hdr_size + off), sz) };
             fill(w, &mut *slot);
@@ -1046,11 +1021,13 @@ impl SalWriter {
         stamp_digest(base as u64, hdr);
 
         self.write_cursor.set(end as u64);
-        Ok((base, epoch_word(epoch, payload_size as u64)))
+        Ok(base)
     }
 
     /// The Release store that makes one laid-out group visible.
-    fn publish(&self, base: usize, word: u64) {
+    fn publish(&self, base: usize) {
+        debug_assert_eq!(self.laid_out(base as u64).epoch, self.epoch.get());
+        let word = epoch_word(self.epoch.get(), PRESENT);
         unsafe { prefix_atomic(self.log.ring, base).store(word, Ordering::Release) };
     }
 
@@ -1061,24 +1038,17 @@ impl SalWriter {
             .expect("a group laid out in this scope verifies at its own offset")
     }
 
-    /// Publish the group laid out at `base` off its own digested header, and
-    /// return its end.
+    /// Publish the group laid out at `base` and return its end.
     fn publish_at(&self, base: u64) -> u64 {
-        let hdr = self.laid_out(base);
-        self.publish(base as usize, hdr.prefix_word());
-        base + hdr.total_size() as u64
+        self.publish(base as usize);
+        base + self.laid_out(base).total_size() as u64
     }
 
-    /// Publish every group laid out in `[from, end)` in layout order, stepping
-    /// over `hold` unpublished.
-    fn publish_range(&self, from: u64, end: u64, hold: Option<u64>) {
+    /// Publish every group laid out in `[from, end)` in layout order.
+    fn publish_range(&self, from: u64, end: u64) {
         let mut off = from;
         while off < end {
-            off = if Some(off) == hold {
-                off + self.laid_out(off).total_size() as u64
-            } else {
-                self.publish_at(off)
-            };
+            off = self.publish_at(off);
         }
     }
 
@@ -1111,14 +1081,14 @@ impl SalWriter {
     /// Encode a group's per-worker wire messages directly into the SAL mmap and
     /// publish it, outside every zone.
     fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
-        let (base, word) = self.lay_out(g, 0)?;
-        self.publish(base, word);
+        let base = self.lay_out(g, 0)?;
+        self.publish(base);
         Ok(())
     }
 
     /// Lay `g` out at the write cursor, unpublished, stamped with `lsn`. The one
     /// encode path, for both writers above.
-    fn lay_out(&self, g: &DirectGroup, lsn: u64) -> Result<(usize, u64), WireFault> {
+    fn lay_out(&self, g: &DirectGroup, lsn: u64) -> Result<usize, WireFault> {
         let nw = self.num_workers;
         if let GroupData::PerWorker(d) = g.data {
             assert_eq!(d.len(), nw, "worker_data.len()={} != num_workers={}", d.len(), nw);
@@ -1199,17 +1169,6 @@ impl SalWriter {
         }
     }
 
-    /// Rewind into the next epoch — the checkpoint's reclaim.
-    fn checkpoint_reset(&self) {
-        self.rewind(next_epoch(self.epoch.get()));
-    }
-
-    /// The boot rewind, above the recovered tail's epoch — the same epoch
-    /// [`SalReader::new`] derives for every worker from that same value.
-    fn boot_rewind(&self, tail_epoch: u32) {
-        self.rewind(next_epoch(tail_epoch));
-    }
-
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch.get()
     }
@@ -1251,12 +1210,12 @@ impl<'a> SalExcl<'a> {
 
     /// Rewind into the next epoch — the checkpoint's reclaim.
     pub(crate) fn checkpoint_reset(&mut self) {
-        self.writer.checkpoint_reset();
+        self.writer.rewind(next_epoch(self.writer.epoch.get()));
     }
 
-    /// The boot rewind, above the recovered tail's epoch.
-    pub(crate) fn boot_rewind(&mut self, tail_epoch: u32) {
-        self.writer.boot_rewind(tail_epoch);
+    /// The boot rewind, to the live epoch the recovered tail names.
+    pub(crate) fn boot_rewind(&mut self, live_epoch: u32) {
+        self.writer.rewind(live_epoch);
     }
 
     /// Wake every worker a group written since the last wake reached.
@@ -1295,7 +1254,7 @@ impl SalScope<'_> {
     /// Lay `g` out inside the scope, unpublished. `zoned` puts it in the
     /// scope's atomic zone at the scope's LSN; otherwise it is written at LSN 0.
     pub(crate) fn write(&self, g: &DirectGroup, zoned: bool) -> Result<(), WireFault> {
-        let (base, _) = self.writer.lay_out(g, if zoned { self.lsn } else { 0 })?;
+        let base = self.writer.lay_out(g, if zoned { self.lsn } else { 0 })?;
         if zoned {
             self.last_member.set(Some(base as u64));
         }
@@ -1318,23 +1277,22 @@ impl SalScope<'_> {
         self.last_member.set(sp.last_member);
     }
 
-    /// Publish the span, the zone's closing member last. Answers whether a zone
-    /// closed.
+    /// Publish the span in layout order. Answers whether a zone closed.
     pub(crate) fn commit(mut self) -> bool {
         self.committed = true;
         let end = self.writer.write_cursor.get();
         let Some(last) = self.last_member.get() else {
-            self.writer.publish_range(self.from, end, None);
+            self.writer.publish_range(self.from, end);
             return false;
         };
         self.writer.mark_zone_end(last);
-        self.writer.publish_range(self.from, end, Some(last));
+        self.writer.publish_range(self.from, last);
         if ZONE_PANIC.at(self.tag) {
             // SAFETY: `libc::abort` is the whole reason this block is unsafe; it
             // takes no argument and cannot violate an invariant.
             unsafe { libc::abort() };
         }
-        self.writer.publish_at(last);
+        self.writer.publish_range(last, end);
         true
     }
 }
@@ -1364,14 +1322,13 @@ pub(crate) struct SalReader {
 }
 
 impl SalReader {
-    /// The live drain accepts the epoch above the recovered tail's epoch — the
-    /// one `SalWriter::boot_rewind` starts the master at from that same value.
-    pub(crate) fn new(log: SalLog, worker_id: u32, tail_epoch: u32) -> Self {
+    /// A live drain from cursor 0 of `live_epoch`.
+    pub(crate) fn new(log: SalLog, worker_id: u32, live_epoch: u32) -> Self {
         SalReader {
             log,
             worker_id,
             read_cursor: Cell::new(0),
-            expected_epoch: Cell::new(next_epoch(tail_epoch)),
+            expected_epoch: Cell::new(live_epoch),
         }
     }
 
@@ -1384,21 +1341,21 @@ impl SalReader {
         loop {
             let cursor = self.read_cursor.get();
             match self.log.read_at(cursor, EpochGate::Live(self.expected_epoch.get())) {
-                SalStep::Group(msg, new_cursor) => {
-                    self.read_cursor.set(new_cursor);
+                SalStep::Group(msg) => {
+                    self.read_cursor.set(msg.end);
                     if let Some(slot) = msg.slot(self.worker_id) {
                         return Some((msg, slot));
                     }
                 }
-                SalStep::Corrupt(at) => {
-                    gnitz_fatal_abort!("SAL group header failed its digest at offset={at} — the log is damaged")
+                SalStep::Corrupt => {
+                    gnitz_fatal_abort!("SAL group header at offset={cursor} is corrupt — the log is damaged")
                 }
                 SalStep::Absent => return None,
             }
         }
     }
 
-    /// No group is readable at the cursor.
+    /// No group is readable or corrupt at the cursor.
     pub(crate) fn is_empty(&self) -> bool {
         matches!(
             self.log
@@ -1407,18 +1364,15 @@ impl SalReader {
         )
     }
 
-    /// Rewind to the start of the next epoch, mirroring the writer's
-    /// `SalWriter::checkpoint_reset` on the read side. Groups the master writes
-    /// post-reset (at `write_cursor == 0`, in the bumped epoch) are then
-    /// accepted, and any pre-reset group parks.
+    /// Rewind to the start of the next epoch, mirroring
+    /// [`SalExcl::checkpoint_reset`].
     pub(crate) fn rewind(&self) {
         self.read_cursor.set(0);
         self.expected_epoch.set(next_epoch(self.expected_epoch.get()));
     }
 }
 
-/// The SAL fixture, shared by `sal`'s own suites and by the `runtime` tests
-/// that need a real log to drain or to corrupt.
+/// The SAL fixture.
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 pub(crate) mod fixtures;

@@ -217,15 +217,6 @@ impl RelationRegistry {
             .collect()
     }
 
-    /// True when a base round would publish a cut newer than the last one.
-    /// Asked of the same table set the round flushes, so the two cannot drift
-    /// on which stores publish.
-    pub fn base_advanced_since_publish(&mut self) -> bool {
-        self.collect_base_flush_tables()
-            .into_iter()
-            .any(|t| t.base_round_advances_publish())
-    }
-
     /// The rederived stores the ephemeral round force-persists. A compiled view's
     /// operator-trace tables are the DBSP layer's half of the round and go durable
     /// first, so an output manifest at a generation implies its traces are too.
@@ -264,23 +255,5 @@ impl RelationRegistry {
         crate::storage::flush_barrier(traces, round).map_err(|e| StoreError::storage("ephemeral trace flush", e))?;
         crate::storage::flush_barrier(self.collect_ephemeral_output_tables(), round)
             .map_err(|e| StoreError::storage("ephemeral output flush", e))
-    }
-
-    /// Unlink the manifest of every store [`Self::checkpoint_ephemeral`]
-    /// publishes, so the next open reads `None` and erases those shards instead
-    /// of resuming them. Its inverse, over the same two collections.
-    pub fn unlink_ephemeral_manifests<'s>(
-        &mut self,
-        state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
-    ) {
-        let unlink = |t: &mut Table| {
-            if let Err(e) = t.unlink_manifest() {
-                gnitz_warn!("unlink of a derived manifest failed: {}", e);
-            }
-        };
-        for s in state {
-            s.tables_mut().for_each(unlink);
-        }
-        self.collect_ephemeral_output_tables().into_iter().for_each(unlink);
     }
 }

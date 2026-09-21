@@ -173,14 +173,12 @@ wire_enum! {
 
 wire_enum! {
     /// A distributed backfill round's verdict, stamped on every relay of the round.
-    /// `Checkpoint` continues and has each worker rewind its SAL reader inline;
     /// `Stop` ends every worker's loop on the same all-pad round.
     #[derive(Default)]
     pub enum BackfillDecision: u8 {
         #[default]
         Continue = 0,
         Stop = 1,
-        Checkpoint = 2,
     }
 }
 

@@ -2,8 +2,7 @@
 //! production writer, plus the reader every assertion goes through.
 //!
 //! A child of `sal`, so it reaches `write_slots` and the cursor directly and
-//! no test-only writer path has to exist in production. `pub(crate)` because
-//! the worker drain and the block-integrity suite need a real SAL too.
+//! no test-only writer path has to exist in production.
 
 use super::*;
 use crate::runtime::master::scatter::{with_commit_indices, with_group};
@@ -23,8 +22,6 @@ pub(crate) struct TestLog {
     /// The whole file, anchor page included.
     file: SharedRegion,
     pub(crate) writer: SalWriter,
-    /// The ring's length, the anchor page excluded.
-    pub(crate) size: usize,
     /// One W2M ring per worker, carrying the park the writer's wakes land on.
     /// Leaked, as the `'static` wakes require.
     rings: Vec<*mut u8>,
@@ -47,7 +44,7 @@ impl TestLog {
             workers,
             wakes,
         );
-        let log = TestLog { file, writer, size, rings };
+        let log = TestLog { file, writer, rings };
         log.seek(0, epoch);
         log
     }
@@ -102,29 +99,13 @@ impl TestLog {
         flags: u8,
         payloads: &[&[u8]],
     ) -> Result<u64, SalFit> {
-        let base = self.cursor();
-        let (at, word) = self.lay_out(target, lsn, kind, flags, payloads)?;
-        self.writer.publish(at, word);
-        Ok(base)
+        let base = self.lay_out(target, lsn, kind, flags, payloads)?;
+        self.writer.publish(base);
+        Ok(base as u64)
     }
 
-    /// A zone member of `scope` whose slots are `payloads` verbatim, unpublished
-    /// until the scope commits.
-    pub(crate) fn try_write_in(
-        &self,
-        scope: &SalScope,
-        target: u32,
-        kind: SalMessageKind,
-        payloads: &[&[u8]],
-    ) -> Result<u64, SalFit> {
-        let base = self.cursor();
-        self.lay_out(target, scope.lsn, kind, 0, payloads)?;
-        scope.last_member.set(Some(base));
-        Ok(base)
-    }
-
-    /// Lay one group of verbatim slot payloads out, unpublished: `(base, prefix
-    /// word)`, the shape [`SalWriter::write_slots`] answers with.
+    /// Lay one group of verbatim slot payloads out, unpublished, and return its
+    /// base, as [`SalWriter::write_slots`] does.
     fn lay_out(
         &self,
         target: u32,
@@ -132,7 +113,7 @@ impl TestLog {
         kind: SalMessageKind,
         flags: u8,
         payloads: &[&[u8]],
-    ) -> Result<(usize, u64), SalFit> {
+    ) -> Result<usize, SalFit> {
         let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
         self.writer.write_slots(target, lsn, kind, flags, 0, &sizes, |w, slot| {
             slot.copy_from_slice(payloads[w])
@@ -163,15 +144,31 @@ impl TestLog {
     }
 }
 
-/// The group at `base` under `epoch`, and the cursor past it.
-pub(crate) fn group_and_next(log: SalLog, base: u64, epoch: u32) -> (SalMessage, u64) {
+/// The group at `base` under `epoch`.
+pub(crate) fn group_in(log: SalLog, base: u64, epoch: u32) -> SalMessage {
     match log.read_at(base, EpochGate::Walk(epoch)) {
-        SalStep::Group(msg, next) => (msg, next),
+        SalStep::Group(msg) => msg,
         _ => panic!("a group is published at offset {base}"),
     }
 }
 
 /// The group published at `base`, walked at the anchor's epoch.
 pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
-    group_and_next(log, base, log.anchor().expect("the anchor verifies").0).0
+    group_in(log, base, log.anchor().expect("the anchor verifies").0)
+}
+
+/// A payload-less group outside every zone.
+pub(crate) fn bare_message(kind: SalMessageKind, target_id: u32) -> SalMessage {
+    SalMessage {
+        lsn: 0,
+        kind,
+        zone_end: false,
+        target_id,
+        base: 0,
+        end: 0,
+        request_id: 0,
+        in_request_order: false,
+        payload: &[],
+        dir: &[],
+    }
 }

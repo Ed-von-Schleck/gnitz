@@ -22,10 +22,7 @@ fn wire_flags_roundtrip() {
         WireFlags { continuation: true, ..base },
         WireFlags { batch_consolidated: true, ..base },
         WireFlags { scan_last: true, ..base },
-        WireFlags {
-            backfill: BackfillDecision::Checkpoint,
-            ..base
-        },
+        WireFlags { backfill: BackfillDecision::Stop, ..base },
         WireFlags { backfill_pad: true, ..base },
     ]);
     cases.push(WireFlags {
@@ -36,7 +33,7 @@ fn wire_flags_roundtrip() {
         batch_consolidated: true,
         scan_last: true,
         probe_mode: WireProbeMode::Project,
-        backfill: BackfillDecision::Checkpoint,
+        backfill: BackfillDecision::Stop,
         backfill_pad: true,
     });
     for f in cases {

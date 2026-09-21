@@ -90,6 +90,8 @@ pub struct MasterDispatcher {
     /// The generation the last ephemeral round stamped. Set unconditionally, so
     /// `derived_needs_restamp` reads it in release builds too.
     last_ephemeral_gen: Cell<u64>,
+    /// A push group was written since the last base round.
+    unflushed_pushes: Cell<bool>,
 
     /// The last tick round allocated, one per tick group. Starts at 1, which is
     /// never emitted, so `after_tick = 0` names no round.

@@ -287,17 +287,6 @@ impl Table {
         self.recovery_source
     }
 
-    /// True when the base round would publish this store at a cut newer than its
-    /// last manifest: that round publishes it at all, and it holds rows in a heap
-    /// tier or shards a spill wrote that no manifest references yet. False right
-    /// after a publish, which folds both tiers into one synced shard and
-    /// re-stamps the manifest over them.
-    pub(crate) fn base_round_advances_publish(&self) -> bool {
-        !self.is_rederived()
-            && (self.ram_tiers().iter().any(|s| s.row_count() > 0)
-                || self.shard_index.unsynced_paths().next().is_some())
-    }
-
     /// Whether this open reloaded checkpointed state rather than starting empty.
     pub(crate) fn resumed_from_checkpoint(&self) -> bool {
         self.resumed_from_checkpoint

@@ -2,10 +2,9 @@
 //! first defect, unless that defect lies below the anchored `synced` offset —
 //! a hole in the durable log, which fails the boot.
 
-use super::{EpochGate, SalLog, SalMessage, SalStep};
+use super::{next_epoch, SalLog, SalMessage};
 
-/// The committed part of the un-checkpointed tail. `Copy`: built once by the
-/// master before the fork.
+/// The committed part of the un-checkpointed tail.
 #[derive(Clone, Copy)]
 pub(crate) struct CommittedTail {
     log: SalLog,
@@ -19,17 +18,17 @@ impl CommittedTail {
     pub(crate) fn read(log: SalLog) -> Result<Self, String> {
         let (epoch, synced) = log.anchor()?;
         let (mut at, mut end, mut open) = (0u64, 0u64, None);
-        for (msg, next) in log.walk(epoch) {
-            if !msg.intact() || (msg.lsn != 0 && open.is_some_and(|zone| zone != msg.lsn)) {
-                break;
-            }
+        for msg in log.walk(epoch) {
             if msg.lsn != 0 {
+                if !msg.intact() || open.is_some_and(|zone| zone != msg.lsn) {
+                    break;
+                }
                 open = (!msg.zone_end).then_some(msg.lsn);
+                if msg.zone_end {
+                    end = msg.end;
+                }
             }
-            if msg.zone_end {
-                end = next;
-            }
-            at = next;
+            at = msg.end;
         }
         if at < synced {
             return Err(format!(
@@ -40,33 +39,17 @@ impl CommittedTail {
         Ok(CommittedTail { log, epoch, end })
     }
 
-    /// The epoch the tail was written at; the next boot writes above it.
-    pub(crate) fn epoch(&self) -> u32 {
-        self.epoch
+    /// The epoch this boot writes and drains at: one above the tail's.
+    pub(crate) fn live_epoch(&self) -> u32 {
+        next_epoch(self.epoch)
     }
 
     /// Every zone member below the committed end, in log order, undecoded.
     pub(crate) fn groups(self) -> impl Iterator<Item = SalMessage> {
         self.log
             .walk(self.epoch)
-            .take_while(move |&(_, next)| next <= self.end)
-            .map(|(msg, _)| msg)
-            .filter(|msg| msg.lsn != 0)
-    }
-}
-
-impl SalLog {
-    /// Every group readable from offset 0 at `epoch`, with the offset past it,
-    /// up to the first that is not.
-    fn walk(self, epoch: u32) -> impl Iterator<Item = (SalMessage, u64)> {
-        let mut at = 0;
-        std::iter::from_fn(move || match self.read_at(at, EpochGate::Walk(epoch)) {
-            SalStep::Group(msg, next) => {
-                at = next;
-                Some((msg, next))
-            }
-            SalStep::Absent | SalStep::Corrupt(_) => None,
-        })
+            .take_while(move |m| m.end <= self.end)
+            .filter(|m| m.lsn != 0)
     }
 }
 

@@ -18,6 +18,7 @@ import os
 import pytest
 import gnitz
 from _read import bag, scanned
+from _sql import values
 from _uid import uid
 
 _ROWS = "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)"
@@ -115,6 +116,31 @@ def test_an_empty_index_projection_reports_no_write(own_server):
         assert bag(scanned(conn, "nullidx", "t"), "pk", "val") == {(1, None): 1, (2, None): 1}
     assert own_server.proc.poll() is None, \
         "no index ingest ran, so the seam must not have fired"
+
+
+def test_a_restamp_owed_by_a_failed_drain_keeps_later_pushes_across_a_crash(own_server):
+    """Pushes committed behind a checkpoint whose drain failed survive the
+    restamp the next DDL owes, and a crash after it."""
+    own_server.start(workers=4, extra_env={"GNITZ_CHECKPOINT_BYTES": "65536",
+                                           "GNITZ_INJECT_TICK_EMIT_ERROR": "1"})
+    pad = "x" * 64
+    rows = [(pk, pad) for pk in range(2003)]
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.create_schema("ro")
+        conn.execute_sql("CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v TEXT NOT NULL)",
+                         schema_name="ro")
+        conn.execute_sql("CREATE VIEW f AS SELECT pk, v FROM t WHERE pk % 2 = 0",
+                         schema_name="ro")
+        conn.execute_sql(f"INSERT INTO t VALUES {values(rows[:2000])}", schema_name="ro")
+        conn.execute_sql(f"INSERT INTO t VALUES {values(rows[2000:])}", schema_name="ro")
+        assert "checkpoint drain failed, skipping the ephemeral round" in own_server.log_text(), \
+            "the checkpoint's drain must have failed, or no restamp is owed"
+        conn.execute_sql("CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY)", schema_name="ro")
+
+    own_server.restart()
+    with gnitz.connect(own_server.sock_path) as conn:
+        assert bag(scanned(conn, "ro", "t"), "pk", "v") == {r: 1 for r in rows}
+        assert bag(scanned(conn, "ro", "f"), "pk", "v") == {r: 1 for r in rows if r[0] % 2 == 0}
 
 
 def test_a_failed_tick_reports_and_requeues(tick_emit_fault_server):
