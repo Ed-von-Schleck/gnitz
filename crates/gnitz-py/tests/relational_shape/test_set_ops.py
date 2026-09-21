@@ -7,10 +7,7 @@ weight, never a row set. An `ALL` branch overlap legitimately carries weight 2,
 and a tuple that should net to 0 surviving at weight 1 is invisible to a row
 count, so every assertion here is a weighted bag.
 
-Two branches that resolve to one source cannot be driven by the clamp algebra
-in one epoch, so the planner wraps the repeat in a pass-through under a fresh id
-and one push becomes two cascade epochs. The discriminator is source-id
-equality: two distinct views over one base are neither wrapped nor refused.
+Leaves over one source, however many, are driven by one push in one epoch.
 
 Run with GNITZ_WORKERS=4: each side is repartitioned by its content hash, so
 both branches of a tuple land on one worker only if the hash is a pure function
@@ -44,9 +41,11 @@ _OPS = {
 }
 # Unprojected, so identity is the whole (pk, val) row rather than the PK.
 _STAR_OPS = {"sx": "EXCEPT", "si": "INTERSECT", "sua": "UNION ALL"}
-# Over one source: INTERSECT ALL / EXCEPT ALL route through the same wrapper as
-# the deduplicating pair.
-_ONE_SOURCE_OPS = {"ex": "EXCEPT", "in": "INTERSECT", "ua": "UNION ALL", "u": "UNION"}
+# Over one source, every operator in both quantifiers.
+_ONE_SOURCE_OPS = {
+    "ex": "EXCEPT", "in": "INTERSECT", "ua": "UNION ALL", "u": "UNION",
+    "ea": "EXCEPT ALL", "ia": "INTERSECT ALL",
+}
 
 _DEL = object()
 
@@ -84,9 +83,8 @@ def test_every_operator_tracks_its_weight_algebra_through_churn(client, schema_n
     """Each operator equals its Z-set definition after every epoch, and `mc`
     associates `(a UNION b) MINUS c` left to right. The right branch is populated
     first, so every left delta meets a non-empty right trace — an incremental
-    circuit's fixpoint cannot depend on which source ticked first. Over one
-    source, identical branches, two filters of one table and one view read twice
-    are each wrapped, while `av` against `aw` is two sources and is not."""
+    circuit's fixpoint cannot depend on which source ticked first. `tri`'s outer
+    UNION ALL keeps a second copy of `a` beside the inner UNION."""
     sn = schema_name
     client.execute_sql(
         "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
@@ -105,7 +103,8 @@ def test_every_operator_tracks_its_weight_algebra_through_churn(client, schema_n
                     f"CREATE VIEW view_{n} AS SELECT val FROM av {op} SELECT val FROM av; "
                     f"CREATE VIEW views_{n} AS SELECT val FROM av {op} SELECT val FROM aw"
                     for n, op in _ONE_SOURCE_OPS.items()) + "; "
-        "CREATE VIEW mc AS SELECT val FROM a UNION SELECT val FROM b MINUS SELECT val FROM c",
+        "CREATE VIEW mc AS SELECT val FROM a UNION SELECT val FROM b MINUS SELECT val FROM c; "
+        "CREATE VIEW tri AS SELECT val FROM a UNION SELECT val FROM b UNION ALL SELECT val FROM a",
         schema_name=sn)
 
     a, b = {}, {}
@@ -125,6 +124,8 @@ def test_every_operator_tracks_its_weight_algebra_through_churn(client, schema_n
                 _setop(op, Counter(a.items()), Counter(b.items())), (sql, name)
         assert bag(scanned(client, sn, "mc"), "val") == \
             _setop("EXCEPT", Counter(_setop("UNION", *vals)), Counter({(30,): 1})), sql
+        assert bag(scanned(client, sn, "tri"), "val") == \
+            _setop("UNION ALL", Counter(_setop("UNION", *vals)), vals[0]), sql
 
         def of_a(keep):
             return Counter((v,) for v in a.values() if keep(v))
@@ -136,6 +137,31 @@ def test_every_operator_tracks_its_weight_algebra_through_churn(client, schema_n
             for shape, (left, right) in branches.items():
                 assert bag(scanned(client, sn, f"{shape}_{n}"), "val") == \
                     _setop(op, left, right), (sql, shape, n)
+
+
+def test_one_source_views_backfill_every_side(client, schema_name):
+    """A view over one source, created once the source holds rows, backfills
+    every side."""
+    sn = schema_name
+    rows = {1: 10, 2: 10, 3: 10, 4: 20, 5: 30, 6: 50, 7: 50, 8: 60}
+    client.execute_sql(
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL); "
+        "INSERT INTO a VALUES " + ", ".join(f"({k}, {v})" for k, v in rows.items()) + "; "
+        + "; ".join(f"CREATE VIEW same_{n} AS SELECT val FROM a {op} SELECT val FROM a; "
+                    f"CREATE VIEW split_{n} AS SELECT val FROM a WHERE val > 15 {op} "
+                    f"SELECT val FROM a WHERE val < 55"
+                    for n, op in _ONE_SOURCE_OPS.items()),
+        schema_name=sn)
+
+    def of_a(keep):
+        return Counter((v,) for v in rows.values() if keep(v))
+
+    everything = of_a(lambda v: True)
+    for n, op in _ONE_SOURCE_OPS.items():
+        assert bag(scanned(client, sn, f"same_{n}"), "val") == \
+            _setop(op, everything, everything), n
+        assert bag(scanned(client, sn, f"split_{n}"), "val") == \
+            _setop(op, of_a(lambda v: v > 15), of_a(lambda v: v < 55)), n
 
 
 def test_a_distinct_tuple_lives_exactly_while_a_row_carries_it(client, schema_name):

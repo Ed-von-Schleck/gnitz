@@ -12,10 +12,9 @@
 
 use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
-use crate::schema::key::{locate_key_col, ReindexPacker};
+use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
 use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, SchemaFacts};
 use crate::storage::Batch;
-use gnitz_wire::RowHasher;
 
 /// One verbatim column move: `(source locator, output payload slot, destination
 /// write width)`, as `gnitz-expr` resolved it.
@@ -62,9 +61,8 @@ pub enum PkSource {
     /// `_join_pk` of an equijoin / GROUP BY repartition. The output stride
     /// legitimately differs from the input's (U64 input → U128 synthetic PK).
     Pack(ReindexPacker),
-    /// Hash the full output row (every payload column) into each PK, giving
-    /// EXCEPT/INTERSECT/DISTINCT their full-row set identity.
-    HashRow { branch_id: u8 },
+    /// Hash the full output row (every payload column) into each PK.
+    HashRow,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,20 +229,10 @@ pub struct MapPlan {
     out_schema: SchemaDescriptor,
 }
 
-/// Set every row's PK to a hash of its full payload content. Identical row
-/// content (including null pattern and string/blob bytes) yields an identical
-/// 128-bit PK; any difference yields a distinct PK. This implements full-row
-/// set membership for EXCEPT/INTERSECT/DISTINCT.
-///
-/// Per payload column in order: a 1-byte null marker, then the column's content
-/// — raw little-endian for fixed-width, length-prefixed for STRING/BLOB. That is
-/// independent of inline-vs-heap string layout, so equal logical rows hash
-/// equally.
-///
-/// Set membership is keyed on the hash alone, so a ~2^-64 birthday collision
-/// silently coalesces two distinct elements. An accepted tradeoff, not a checked
-/// error.
-fn reindex_hash_row(output: &mut Batch, branch_id: u8) {
+/// Set every row's PK to the [`FoldCols`] digest of its payload columns, so equal
+/// rows share a PK. Two distinct rows whose 128-bit digests collide become one
+/// element; accepted, not checked.
+fn reindex_hash_row(output: &mut Batch) {
     let n = output.count;
     // The PK *is* the digest, so the OPK region is its big-endian bytes.
     const KEY_BYTES: usize = std::mem::size_of::<u128>();
@@ -253,46 +241,20 @@ fn reindex_hash_row(output: &mut Batch, branch_id: u8) {
         KEY_BYTES,
         "a hash-row PK is one U128 column"
     );
-    // Hashing borrows the batch immutably and the write-back needs it mutably, so
-    // the two cannot interleave per row. Buffering a chunk of keys on the stack
-    // keeps both passes in cache and costs no allocation, whatever `n` is.
+    // Hashing borrows `output` and the write-back mutates it, so keys are staged
+    // per chunk.
     const CHUNK: usize = 256;
     let mut keys = [0u128; CHUNK];
+    let fold = FoldCols::new(output.schema().payload_locators());
     let mut start = 0;
     while start < n {
         let end = (start + CHUNK).min(n);
         {
             let mb = output.as_mem_batch();
-            // Stack-allocated streaming hasher; `reset()` between rows costs
-            // only a handful of word stores, and fixed-width columns are fed
-            // straight from the column slot with no intermediate copy.
-            let mut hasher = RowHasher::new();
             for row in start..end {
-                hasher.reset();
-                // Branch discriminator: distinguishes identical payloads arriving
-                // on the left vs right side of a UNION ALL so they do not collide
-                // to a single PK (which would collapse their +2 weight to +1).
-                hasher.update(&[branch_id]);
-                let null_word = mb.get_null_word(row);
-                for (pi, col) in output.schema().payload_columns() {
-                    let is_null = gnitz_wire::null_word_get(null_word, pi);
-                    hasher.update(&[is_null as u8]);
-                    if is_null {
-                        continue;
-                    }
-                    if gnitz_wire::is_german_string(col.type_code) {
-                        let sb = mb.get_col_ptr(row, pi, 16);
-                        crate::schema::key::hash_german_string_content(&mut hasher, sb, mb.blob);
-                    } else {
-                        let cs = col.size() as usize;
-                        hasher.update(mb.get_col_ptr(row, pi, cs));
-                    }
-                }
-                keys[row - start] = hasher.digest128();
+                keys[row - start] = fold.key_row(&mb, row, mb.get_null_word(row));
             }
         }
-        // Straight into the PK region, hoisted once per chunk: the borrow dance
-        // above is what forces the chunking, not a per-row accessor.
         let pk = &mut output.pk_data_mut()[start * KEY_BYTES..end * KEY_BYTES];
         for (key, dst) in keys.iter().zip(pk.as_chunks_mut::<KEY_BYTES>().0) {
             *dst = key.to_be_bytes();
@@ -320,17 +282,9 @@ fn compute_map_output_schema(
     Ok(b.finish())
 }
 
-/// Output schema of a HashRow (set-op full-row identity) Map: a synthetic U128
-/// PK at slot 0, then the projected payload columns, each promoted to its
-/// carried target but keeping THIS SIDE's nullability. Per-side, not the
-/// operator-merged view nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed
-/// before the tuple-tightening combine, so its row comparator must classify by
-/// what this side can actually emit.
-///
-/// An absent target keeps the SOURCE type — not `gnitz_wire::resolve_reindex_type`,
-/// which would derive a *key* type and land a payload column on U128. Typing the
-/// output column at the target is what puts the promotion in front of
-/// `check_copy_types`, inside `from_map`.
+/// Output schema of a HashRow Map: a U128 PK, then each projected column at its
+/// target type (the source's when absent) and its source nullability. Typed at
+/// the target, the promotion is what `from_map`'s `check_copy_types` screens.
 fn hashrow_output_schema(
     in_schema: &SchemaDescriptor,
     cols: &[gnitz_wire::ReindexSlot],
@@ -372,14 +326,10 @@ impl MapPlan {
                 (out_schema, LogicalProgram::copy_cols(keep), PkSource::Pack(packer))
             }
 
-            gnitz_wire::MapKind::HashRow { cols, branch_id } => {
+            gnitz_wire::MapKind::HashRow { cols } => {
                 let out_schema = hashrow_output_schema(in_schema, cols)?;
                 let proj: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
-                (
-                    out_schema,
-                    LogicalProgram::copy_cols(&proj),
-                    PkSource::HashRow { branch_id: *branch_id },
-                )
+                (out_schema, LogicalProgram::copy_cols(&proj), PkSource::HashRow)
             }
 
             gnitz_wire::MapKind::Projection(cols) => {
@@ -501,8 +451,8 @@ impl MapPlan {
         }
         self.map_ranges_into(in_batch, &mut output, &[(0, n)]);
         // The one source that keys on the finished output row.
-        if let PkSource::HashRow { branch_id } = &self.pk_source {
-            reindex_hash_row(&mut output, *branch_id);
+        if let PkSource::HashRow = self.pk_source {
+            reindex_hash_row(&mut output);
         }
         output
     }
@@ -612,7 +562,7 @@ impl MapPlan {
             }
             // Hashes the finished output row, so `evaluate_map_batch` stamps it
             // once the payload below is written.
-            PkSource::HashRow { .. } => {}
+            PkSource::HashRow => {}
         }
         output.weight_data_mut()[dst_base * 8..(dst_base + n) * 8]
             .copy_from_slice(&in_batch.weight_data()[src_start * 8..(src_start + n) * 8]);

@@ -8,7 +8,7 @@
 
 use gnitz_core::{CatalogSnapshot, OpNode, TypeCode};
 use gnitz_sql::PlannedChain;
-use gnitz_wire::{JoinKind, MapKind, ReadBound};
+use gnitz_wire::{JoinKind, ReadBound};
 
 mod pure;
 use pure::*;
@@ -186,10 +186,20 @@ const SHAPES: &[Row] = &[
     ("SELECT DISTINCT g FROM t", 1, &[&[0]], &[(Distinct, 1)]),
     ("SELECT g FROM t UNION SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 1)]),
     ("SELECT g FROM t UNION ALL SELECT g FROM u", 1, &[&[0], &[0]], &[]),
-    ("SELECT g FROM t EXCEPT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 2), (PositivePart, 1)]),
-    ("SELECT g FROM t INTERSECT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 2), (PositivePart, 1)]),
+    // Only the left side is clamped: the right's weights are never negative.
+    ("SELECT g FROM t EXCEPT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 1), (PositivePart, 1)]),
+    ("SELECT g FROM t INTERSECT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 1), (PositivePart, 1)]),
     ("SELECT g FROM t EXCEPT ALL SELECT g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
     ("SELECT g FROM t INTERSECT ALL SELECT g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
+    // A side that is already a set needs no clamp: EXCEPT's left, either of
+    // INTERSECT's; a DISTINCT over one is the input itself.
+    ("SELECT id, g FROM t EXCEPT SELECT id, g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
+    ("SELECT g FROM t INTERSECT SELECT id FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
+    ("SELECT DISTINCT id, g FROM t", 1, &[], &[]),
+    // A tree of directly nested set operations is one circuit, one exchange per
+    // leaf; a UNION DISTINCT clamps once over all of its leaves.
+    ("SELECT g FROM t UNION SELECT g FROM u UNION SELECT v FROM a", 1, &[&[0], &[0], &[0]], &[(Distinct, 1)]),
+    ("SELECT g FROM t UNION ALL SELECT g FROM u INTERSECT SELECT v FROM a", 1, &[&[0], &[0], &[0]], &[(Distinct, 1), (PositivePart, 1)]),
     // Segments: a non-trivial CTE and a subquery cut; a derived table over one
     // relation, a computed group key and a projection over a join do not.
     ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1), (NullExtend, 1)]),
@@ -205,7 +215,7 @@ const SHAPES: &[Row] = &[
     ("SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v HAVING SUM(g * v) > 3", 1, &[&[1]], &[(Reduce, 1), (Filter, 1)]),
     ("SELECT k, COUNT(*) AS n FROM (SELECT id, g AS k FROM t) d GROUP BY k", 1, &[&[1]], &[(Reduce, 1)]),
     ("SELECT DISTINCT g + 1 AS g1, v FROM t", 1, &[&[0]], &[(Distinct, 1)]),
-    ("SELECT v * 2 AS x FROM t EXCEPT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 2), (PositivePart, 1)]),
+    ("SELECT v * 2 AS x FROM t EXCEPT SELECT g FROM u", 1, &[&[0], &[0]], &[(Distinct, 1), (PositivePart, 1)]),
 ];
 
 #[test]
@@ -260,31 +270,6 @@ fn a_keyless_step_keys_its_output_by_the_hidden_pair_pk() {
             shown("bid")
         ]
     );
-}
-
-/// `UNION ALL` keeps the two sides apart by branch id so identical rows add up;
-/// the deduplicating set operations hash both sides identically.
-#[test]
-fn union_all_tags_its_branches() {
-    let cat = cat();
-    for (body, want) in [
-        ("SELECT g FROM t UNION ALL SELECT g FROM u", vec![0u8, 1]),
-        ("SELECT g FROM t UNION SELECT g FROM u", vec![0, 0]),
-        ("SELECT g FROM t EXCEPT SELECT g FROM u", vec![0, 0]),
-    ] {
-        let chain = view(&cat, body);
-        let mut branches: Vec<u8> = chain
-            .views
-            .iter()
-            .flat_map(|pv| pv.circuit.nodes().iter().map(|n| &n.op))
-            .filter_map(|op| match op {
-                OpNode::Map(MapKind::HashRow { branch_id, .. }) => Some(*branch_id),
-                _ => None,
-            })
-            .collect();
-        branches.sort_unstable();
-        assert_eq!(branches, want, "`{body}`");
-    }
 }
 
 /// `t(pk, g, ind, other)` with `u(pk, val)`; `indexes` lists `t`'s secondary

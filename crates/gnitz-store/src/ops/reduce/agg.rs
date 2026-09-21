@@ -290,7 +290,7 @@ impl Accumulator {
         self.acc = sum.to_bits() as i64;
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn step_from_batch(&mut self, mb: &impl RowSource, row: usize, weight: i64) {
         self.apply(self.kind, self.src, mb, row, weight);
     }

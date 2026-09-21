@@ -190,9 +190,8 @@ reaches the two join inputs in two *separate* epochs and trace cursors are
 rebuilt each epoch, so the later epoch joins against a trace that already
 absorbed the earlier delta — the asymmetric form realized across epochs, with the
 cross-term emitted exactly once. The one shape that would put two deltas in one
-epoch, the same source feeding both inputs, is rejected by the planner (self-join
-and same-relation INTERSECT/EXCEPT guards; the discriminator is source-id
-equality, not base-table overlap).
+epoch, the same source feeding both inputs, is rejected by the planner (the self-join
+guard; the discriminator is source-id equality, not base-table overlap).
 
 **Join output schema** is `[key, left_payload..., right_payload...]` over the
 **SQL sides**, not the delta/trace ports — so both terms of the symmetric form
@@ -266,8 +265,7 @@ at weight −1, the new at +1.
 each is a linear combination of `{union, negate}` plus the weight-clamp primitive
 (`distinct = clamp[-1,1]`, `positive_part = clamp[0,i64::MAX]`) over
 content-hashed leaves — EXCEPT DISTINCT = `positive_part(distinct(A) −
-distinct(B))`, INTERSECT DISTINCT = `distinct(A) − positive_part(distinct(A) −
-distinct(B))`. There is **no anti-join operator**: these, the outer-join
+B)`, INTERSECT DISTINCT = `distinct(A) − positive_part(distinct(A) − B)`. There is **no anti-join operator**: these, the outer-join
 null-fills over a non-unique side, and band EXISTS/IN are the only
 `positive_part` users.
 

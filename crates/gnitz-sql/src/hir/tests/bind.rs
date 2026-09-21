@@ -264,6 +264,11 @@ fn an_inert_distinct_on_min_max_is_dropped() {
     ] {
         assert_eq!(reduce_over_distinct(sql), None, "{sql} should need no distinct set");
     }
+    // A projection keeping `t`'s PK is already a set, so it is reduced in place.
+    assert_eq!(
+        reduce_over_distinct("SELECT a, COUNT(DISTINCT id) FROM t GROUP BY a"),
+        None
+    );
     // The qualified and unqualified spellings are one aggregate, not two.
     assert_eq!(
         shape("SELECT a, MAX(DISTINCT b) AS m1, MAX(b) AS m2 FROM t GROUP BY a"),

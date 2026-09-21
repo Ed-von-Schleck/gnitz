@@ -34,9 +34,6 @@ pub(super) use load::{load_circuit, read_circuit_node_row};
 pub(super) use routing::ViewMeta;
 pub(crate) use routing::{RelayRoute, OUTPUT_RELAY};
 
-/// The most `ExchangeShard`s, hence sides, one view's circuit may hold.
-pub(in crate::query) const MAX_SIDES: usize = 2;
-
 /// The most nodes one view's circuit may hold.
 pub(crate) const MAX_CIRCUIT_NODES: usize = 16_384;
 // Registers — up to three per node, plus the seeds — and child stores — up to
@@ -157,15 +154,9 @@ struct Carve<'a> {
 impl LoadedCircuit {
     fn carve(&self) -> Result<Carve<'_>, String> {
         let shards: Vec<(NodeId, &[u32])> = self.exchange_shards().collect();
-        // No planner path emits more: set-ops are binary, GROUP BY/DISTINCT unary.
-        if shards.len() > MAX_SIDES {
-            return Err(format!("more than {MAX_SIDES} exchange nodes"));
-        }
-        // The view routes a pair's output by one key.
-        if let [(_, a), (_, b)] = shards[..] {
-            if a != b {
-                return Err("exchange sides shard on different keys".into());
-            }
+        // The view routes every side's output by one key.
+        if !shards.windows(2).all(|w| w[0].1 == w[1].1) {
+            return Err("exchange sides shard on different keys".into());
         }
         let mut claimed = vec![false; self.len()];
         let mut sides = Vec::with_capacity(shards.len());

@@ -251,8 +251,8 @@ fn wildcard_modifiers_rewrite_the_expansion() {
             &[0],
         ),
         (
-            "SELECT DISTINCT * EXCEPT (x) FROM sa",
-            sh(&[("_distinct_pk", true, false), ("id", false, false), ("y", false, false)]),
+            "SELECT DISTINCT y FROM sa",
+            sh(&[("_distinct_pk", true, false), ("y", false, false)]),
             &[0],
         ),
     ];
@@ -843,12 +843,9 @@ fn a_collision_segment_keeps_only_its_live_columns() {
     let wrapper: Vec<&str> = chain.views[0].output_columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(wrapper, ["id", "nm"]);
 
-    // `t EXCEPT t`: the wrapper carries the set identity alone, plus the source PK
-    // the linear projection pins in front.
+    // `t EXCEPT t` cuts nothing: a set operation reads one source on both sides.
     let chain = view(&base(), "SELECT g FROM t EXCEPT SELECT g FROM t");
-    assert_eq!(chain.views.len(), 2);
-    let wrapper: Vec<&str> = chain.views[0].output_columns.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(wrapper, ["id", "g"]);
+    assert_eq!(chain.views.len(), 1);
 }
 
 /// `register` mirrors what the server records: a bounded view registers as

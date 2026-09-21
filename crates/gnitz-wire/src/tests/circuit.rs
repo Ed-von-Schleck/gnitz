@@ -54,7 +54,6 @@ fn sample(op: Opcode) -> OpNode {
         })),
         Opcode::MapHashRow => OpNode::Map(MapKind::HashRow {
             cols: vec![(1, None), (2, Some(TypeCode::I32))],
-            branch_id: 0,
         }),
         Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::PositivePart => OpNode::PositivePart,
@@ -98,7 +97,7 @@ fn every_op_node_variant_roundtrips() {
         OpNode::ScanDelta { source: 7, bound: crate::ReadBound::None },
         OpNode::Map(MapKind::Projection(vec![])),
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
-        OpNode::Map(MapKind::HashRow { cols: vec![(3, None)], branch_id: 1 }),
+        OpNode::Map(MapKind::HashRow { cols: vec![(3, None)] }),
         OpNode::Reduce {
             group_cols: vec![],
             agg: vec![agg(AggFunc::Count, 0)],
@@ -230,8 +229,7 @@ fn decode_rejects_an_out_of_domain_reindex_target() {
         w
     };
     let hash_row = |tc: u8| {
-        let mut w = vec![0u8]; // branch id
-        w.extend(1u16.to_le_bytes());
+        let mut w = 1u16.to_le_bytes().to_vec();
         w.extend(3u32.to_le_bytes());
         w.push(tc);
         w

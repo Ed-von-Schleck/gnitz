@@ -375,9 +375,9 @@ fn placement_is_transitive_down_a_view_chain_multiworker() {
     // union of a replicated and a partitioned side keeps both branches through a
     // linear hop; a join of two partitioned sides and its hop stay key-placed.
     assert_eq!(view_rows(&mut client, &sn, "rv", &["id", "nm"]), at_weight_one(&d));
-    let bag: Vec<Vec<i64>> = fids.iter().cloned().chain((1..=10i64).map(|id| vec![id])).collect();
-    assert_eq!(view_rows(&mut client, &sn, "ua", &["id"]), at_weight_one(&bag));
-    assert_eq!(view_rows(&mut client, &sn, "uav", &["id"]), at_weight_one(&bag));
+    let bag: Vec<Vec<i64>> = (1..=100i64).map(|id| vec![id, if id <= 10 { 2 } else { 1 }]).collect();
+    assert_eq!(view_rows(&mut client, &sn, "ua", &["id"]), bag);
+    assert_eq!(view_rows(&mut client, &sn, "uav", &["id"]), bag);
     assert_eq!(view_rows(&mut client, &sn, "pj", &["fid", "q"]), at_weight_one(&p));
     assert_eq!(view_rows(&mut client, &sn, "pjv", &["fid", "q"]), at_weight_one(&p));
     for id in [1i64, 37, 100] {
@@ -503,13 +503,10 @@ fn replicated_chain_weights_multiworker() {
         assert_eq!(view_rows(&mut client, &sn, view, &["g", "s"]), gs, "{view}");
     }
     assert_eq!(view_rows(&mut client, &sn, "vsum", &["s"]), vec![vec![35, 1]]);
-    // A bag union keeps the two sides as separate rows under a per-branch key.
-    let side = [vec![1, 10], vec![2, 20], vec![3, 5]];
-    let both_sides: Vec<Vec<i64>> = side.iter().chain(&side).cloned().collect();
     assert_eq!(
         view_rows(&mut client, &sn, "vunion", &["id", "x"]),
-        at_weight_one(&both_sides),
-        "one row per side, not one per worker per side",
+        vec![vec![1, 10, 2], vec![2, 20, 2], vec![3, 5, 2]],
+        "weight 2, one per side, not one per worker per side",
     );
     assert_eq!(
         view_rows(&mut client, &sn, "vjoin", &["fid", "x"]),

@@ -327,15 +327,15 @@ pub(crate) enum RelExpr {
         input: Rc<RelExpr>,
         cols: Vec<HirCol>,
     },
-    /// A set operation (UNION / INTERSECT / EXCEPT, ALL or distinct). `out` pairs
-    /// each left/right column positionally with the promoted common type and the
+    /// A set operation (UNION / INTERSECT / EXCEPT, ALL or distinct). `out[i]` is
+    /// the promoted common type of each side's `i`-th column, under the
     /// per-operator output nullability.
     SetOp {
         op: SetOpKind,
         all: bool,
         left: Rc<RelExpr>,
         right: Rc<RelExpr>,
-        out: Vec<SetOpCol>,
+        out: Vec<HirCol>,
     },
     /// Per-partition top-N: the rows of `input` filling weight slots
     /// `offset .. offset + limit` of each `partition` value in `order` (then the
@@ -481,23 +481,6 @@ pub(crate) enum SetOpKind {
     Union,
     Intersect,
     Except,
-}
-
-/// One output column of a set operation: the paired left/right source `ColId`s,
-/// the promoted output column (common type + per-operator nullability), and each
-/// side's content-hash widening target.
-///
-/// A target is `None` when that side already carries the promoted type (hash it
-/// as it lies), else the promoted type — so both sides hash one physical
-/// representation. Stamped here rather than at lowering, where `lower_sides`
-/// would have to hand two more values back.
-#[derive(Clone)]
-pub(crate) struct SetOpCol {
-    pub left: ColId,
-    pub right: ColId,
-    pub out: HirCol,
-    pub left_target: Option<TypeCode>,
-    pub right_target: Option<TypeCode>,
 }
 
 /// Which side(s) of a join survive unmatched: the driver of null-fill emission
@@ -755,10 +738,15 @@ impl RelExpr {
         Rc::new(RelExpr::Reduce { input, group_cols, aggs })
     }
 
-    /// A DISTINCT over its input's visible columns. The one home of the float
-    /// rule for a DISTINCT row identity, which the lowering keys on a hash of.
+    /// A DISTINCT over every column of its input, or the input itself when it is
+    /// already a set. The one home of the float rule for a DISTINCT row identity,
+    /// which the lowering keys on a hash of.
     pub(crate) fn distinct(input: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
         crate::validate::reject_float_keys(input.cols().iter().map(|c| &c.def), "SELECT DISTINCT")?;
+        // Already a set: nothing to deduplicate.
+        if input.unique_key().is_some() {
+            return Ok(input);
+        }
         Ok(Rc::new(RelExpr::Distinct { input }))
     }
 
@@ -809,7 +797,7 @@ impl RelExpr {
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
-            RelExpr::SetOp { out, .. } => Some(out.iter().map(|c| c.out.id).collect()),
+            RelExpr::SetOp { out, .. } => Some(out.iter().map(|c| c.id).collect()),
             // A subset of its input's rows under its input's identities.
             RelExpr::TopN { input, .. } => input.row_key(),
             RelExpr::Join { left, right, kind, on } => match kind {
@@ -829,8 +817,9 @@ impl RelExpr {
     }
 
     /// Columns no two live rows share a value of, where that is enforced rather than
-    /// inferred: a base table's PK and a reduce's group columns, through filters,
-    /// pass-through projections and aliases.
+    /// inferred: a base table's PK, a reduce's group columns, and every column of a
+    /// DISTINCT or a deduplicating set operation, whose clamp holds each row at
+    /// weight 1 — through filters, pass-through projections and aliases.
     pub(crate) fn unique_key(&self) -> Option<Vec<ColId>> {
         if let Some(mapped) = self.key_through(RelExpr::unique_key) {
             return mapped;
@@ -844,6 +833,8 @@ impl RelExpr {
                 Some(schema.pk_cols.iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
+            RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
+            RelExpr::SetOp { all: false, out, .. } => Some(out.iter().map(|c| c.id).collect()),
             _ => None,
         }
     }
@@ -911,16 +902,9 @@ impl RelExpr {
             let mut def = l.def.clone();
             def.set_ty(ty);
             def.is_nullable = is_nullable;
-            let target = |src: TypeCode| (src != ty.tc).then_some(ty.tc);
-            out.push(SetOpCol {
-                left: l.id,
-                right: r.id,
-                left_target: target(l.def.type_code),
-                right_target: target(r.def.type_code),
-                out: HirCol::new(ids.next(), def),
-            });
+            out.push(HirCol::new(ids.next(), def));
         }
-        crate::validate::reject_float_keys(out.iter().map(|c| &c.out.def), "set operation")?;
+        crate::validate::reject_float_keys(out.iter().map(|c| &c.def), "set operation")?;
         Ok(Rc::new(RelExpr::SetOp { op, all, left, right, out }))
     }
 
@@ -963,7 +947,7 @@ impl RelExpr {
             }
             RelExpr::Distinct { input } | RelExpr::TopN { input, .. } => input.cols(),
             RelExpr::Alias { cols, .. } => cols.clone(),
-            RelExpr::SetOp { out, .. } => out.iter().map(|c| c.out.clone()).collect(),
+            RelExpr::SetOp { out, .. } => out.clone(),
         }
     }
 }

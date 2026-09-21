@@ -2,7 +2,7 @@
 //! compiled shape runs through, and the DAG evaluation driver.
 
 use super::*;
-use crate::query::compiler::{MAX_SIDES, OUTPUT_RELAY};
+use crate::query::compiler::OUTPUT_RELAY;
 use gnitz_store::storage::StoreError;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
@@ -90,9 +90,6 @@ fn run_view_epoch(host: &mut impl DriveHost, view_id: i64, input: Batch, src_id:
     run_plan(host, &relay, input, src_id).map_err(|e| e.to_string())
 }
 
-// `run_plan` matches on at most two scanning sides.
-const _: () = assert!(MAX_SIDES == 2);
-
 /// Run every side that scans `src_id` over its delta, then the post combine.
 fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: i64) -> Result<Batch, StoreError> {
     let code = &plan_of(host, relay.view_id).code;
@@ -100,18 +97,18 @@ fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: i64)
         let seed = sub_seed(&code.post, input, src_id);
         return run_post(host, relay.view_id, [seed]);
     }
-    let mut scanning = (0..code.sides.len()).filter(|&i| code.sides[i].plan.source_reg_map.contains_key(&src_id));
-    let seeds = match [scanning.next(), scanning.next(), scanning.next()] {
-        // `a UNION a` scans the source on both sides.
-        [Some(a), Some(b), None] => [
-            Some(run_side(host, relay, a, input.clone_batch(), src_id)?),
-            Some(run_side(host, relay, b, input, src_id)?),
-        ],
-        [Some(a), None, None] => [Some(run_side(host, relay, a, input, src_id)?), None],
-        [None, None, None] => [None, None],
-        _ => unreachable!("more than {MAX_SIDES} sides"),
-    };
-    run_post(host, relay.view_id, seeds.into_iter().flatten())
+    // `a UNION a` scans the source on more than one side.
+    let scanning: Vec<usize> = (0..code.sides.len())
+        .filter(|&i| code.sides[i].plan.source_reg_map.contains_key(&src_id))
+        .collect();
+    let mut seeds = Vec::with_capacity(scanning.len());
+    if let Some((&last, rest)) = scanning.split_last() {
+        for &i in rest {
+            seeds.push(run_side(host, relay, i, input.clone_batch(), src_id)?);
+        }
+        seeds.push(run_side(host, relay, last, input, src_id)?);
+    }
+    run_post(host, relay.view_id, seeds)
 }
 
 /// The post phase over the seeds the sides produced.

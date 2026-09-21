@@ -302,7 +302,7 @@ fn lower_body(chain: &mut ViewChain, memo: &mut CutMemo, rel: &Rc<RelExpr>) -> R
             }
         }
         RelExpr::Distinct { input } => setop::lower_distinct(chain, memo, input),
-        RelExpr::SetOp { .. } => setop::lower_setop(chain, memo, rel),
+        RelExpr::SetOp { out, .. } => setop::lower_setop(chain, memo, rel, out),
         RelExpr::TopN { .. } => topn::lower_topn(chain, memo, rel),
         _ => Err(GnitzSqlError::Internal(
             "HIR lowering has no body arm for this node".into(),
@@ -473,7 +473,13 @@ pub(crate) fn emit_join_inputs(
         live
     };
     let (live_l, live_r) = (live(true), live(false));
-    let [mut l, mut r] = spine::open_pair(chain, memo, [left, right], [&live_l, &live_r], true)?;
+    let mut l = spine::open(chain, memo, left, &live_l)?;
+    let mut r = spine::open(chain, memo, right, &live_r)?;
+    // A join reads two distinct sources, one delta per epoch: a right side over the
+    // left's source is re-read as a second relation.
+    if l.tid() == r.tid() {
+        r = spine::Spine::segment(materialize(chain, memo, right, &live_r)?);
+    }
     // A key the spine computes (`ON x.s = u.k` over `SELECT a + 1 AS s`) is no
     // column of the scanned relation, so nothing over that relation can state
     // where its delta scatters. Cut to a segment, the computed column is one.

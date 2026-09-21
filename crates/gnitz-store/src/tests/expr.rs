@@ -552,16 +552,14 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         0,
         &[type_code::U128, type_code::I64, type_code::STRING, type_code::BLOB],
     );
-    let plan = |branch_id| {
-        MapPlan::from_map(
-            LogicalProgram::copy_cols(&[1, 2, 3]),
-            &in_schema,
-            &out_schema,
-            PkSource::HashRow { branch_id },
-        )
-        .unwrap()
-    };
-    let out = plan(0).evaluate_map_batch(&batch);
+    let plan = MapPlan::from_map(
+        LogicalProgram::copy_cols(&[1, 2, 3]),
+        &in_schema,
+        &out_schema,
+        PkSource::HashRow,
+    )
+    .unwrap();
+    let out = plan.evaluate_map_batch(&batch);
     assert_eq!(out.count, rows.len());
     let pk = |row: usize| out.get_pk(row);
 
@@ -583,10 +581,6 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         assert_ne!(pk(a), pk(b), "{what} must move the PK");
     }
 
-    // The branch discriminator: the same row on the other side of a UNION ALL
-    // must not collide, or the two would consolidate to one element.
-    let other = plan(1).evaluate_map_batch(&batch);
-    assert_ne!(pk(0), other.get_pk(0), "the branch id must reach the digest");
     // An in-place PK rewrite drops the layout claim.
     assert!(!out.is_consolidated(), "a stamped PK must not be marked consolidated");
 }
@@ -665,7 +659,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
 // -----------------------------------------------------------------------
 
 /// The whole `Instr::Map` body — the copy loop plus the PK stamp — over a
-/// reindex map and a string-emitting map. `reindex_pack_bench` covers the
+/// reindex map, a string-emitting map and hash-row maps. `reindex_pack_bench` covers the
 /// packer alone, and neither `make bench` nor the `scan_spec` benches
 /// resolve this loop.
 ///
@@ -735,7 +729,52 @@ fn map_ranges_bench() {
     )
     .unwrap();
 
-    for (name, plan, src) in [("reindex", &rx_plan, &rx_batch), ("str_emit", &se_plan, &se_batch)] {
+    // --- Hash-row maps: [U64 PK, payload...] -> [U128 hash PK, payload...], the
+    // set-op / DISTINCT leaf. Fixed-width shapes on both sides of the fold's
+    // stack arm, and heap-backed strings beside integers.
+    let hash_row = |name: &'static str, payload: &[u8]| {
+        let mut in_tcs = vec![type_code::U64];
+        in_tcs.extend_from_slice(payload);
+        let mut out_tcs = vec![type_code::U128];
+        out_tcs.extend_from_slice(payload);
+        let in_schema = make_schema(0, &in_tcs);
+        let mut batch = Batch::with_capacity(&in_schema, N);
+        for i in 0..N as u64 {
+            batch.extend_pk(i as u128);
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            for (pi, &tc) in payload.iter().enumerate() {
+                if tc == type_code::STRING {
+                    batch.extend_col_blob(pi, format!("row-{i:012}-payload").as_bytes());
+                } else {
+                    batch.extend_col(pi, &i.wrapping_mul(2_654_435_761 + pi as u64).to_le_bytes());
+                }
+            }
+            batch.count += 1;
+        }
+        let cols: Vec<u32> = (1..=payload.len() as u32).collect();
+        let plan = MapPlan::from_map(
+            LogicalProgram::copy_cols(&cols),
+            &in_schema,
+            &make_schema(0, &out_tcs),
+            PkSource::HashRow,
+        )
+        .unwrap();
+        (name, plan, batch)
+    };
+    const I64: u8 = type_code::I64;
+    const STR: u8 = type_code::STRING;
+    let hash_rows = [
+        hash_row("hash_row[i64x2]", &[I64, I64]),
+        hash_row("hash_row[i64x10]", &[I64; 10]),
+        hash_row("hash_row[i64,str]", &[I64, STR]),
+        hash_row("hash_row[i64x3,str]", &[I64, I64, I64, STR]),
+    ];
+
+    let arms = [("reindex", &rx_plan, &rx_batch), ("str_emit", &se_plan, &se_batch)]
+        .into_iter()
+        .chain(hash_rows.iter().map(|(name, plan, batch)| (*name, plan, batch)));
+    for (name, plan, src) in arms {
         let t0 = Instant::now();
         let mut acc = 0usize;
         for _ in 0..ITERS {
@@ -843,7 +882,6 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
 fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
     let hash_row = |cols: Vec<u32>, tcs: Vec<Option<gnitz_wire::TypeCode>>| gnitz_wire::MapKind::HashRow {
         cols: cols.into_iter().zip(tcs).collect(),
-        branch_id: 0,
     };
     let s = SchemaDescriptor::new(
         &[

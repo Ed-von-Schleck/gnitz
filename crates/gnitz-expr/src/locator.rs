@@ -214,12 +214,7 @@ pub fn order_locators(order: &[gnitz_wire::OrderKey], schema: &dyn SchemaFacts) 
 fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &dyn SchemaFacts) {
     let asc = |loc| OrderLocator { loc, desc: false, nulls_first: true };
     keys.extend(schema.pk_cols().iter().map(|&c| asc(schema.locate(c as usize))));
-    keys.extend(
-        (0..schema.num_columns())
-            .map(|ci| schema.locate(ci))
-            .filter(|l| matches!(l, ColumnLocator::Payload { .. }))
-            .map(asc),
-    );
+    keys.extend(schema.payload_locators().into_iter().map(asc));
 }
 
 /// Lexicographic over `keys`.

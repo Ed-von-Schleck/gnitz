@@ -738,12 +738,9 @@ fn test_german_string_promote_key_empty_is_zero() {
 // FoldCols::key_row — the one-shot and the streaming form are one digest
 // -----------------------------------------------------------------------
 
-/// The one-shot fold assembles into a stack scratch exactly what the streaming
-/// fold pushes through `RowHasher`. Nothing else would catch them diverging: the
-/// digest feeds group keys, output PKs and AVI buckets, all self-consistent
-/// under either spelling.
+/// The fold's stack and scratch arms hash the same bytes.
 #[test]
-fn hash_fold_one_shot_matches_the_streaming_form() {
+fn hash_fold_stack_arm_matches_the_scratch_arm() {
     /// The same columns folded the other way — the arm `FoldCols::new` did not pick.
     fn flipped(f: &FoldCols) -> FoldCols {
         FoldCols {
@@ -793,16 +790,16 @@ fn hash_fold_one_shot_matches_the_streaming_form() {
         }
     }
 
-    // The two shapes that must keep streaming: variable-length content, and a
-    // group set wider than the stack scratch.
+    // The two shapes that must take the scratch: variable-length content, and a
+    // group set wider than the stack buffer.
     let gs = make_schema_pk_u64_payload_string();
     assert!(
         !FoldCols::new(vec![gs.locate(1)]).inline,
-        "a German-string column streams"
+        "a German-string column takes the scratch"
     );
     assert!(
         !FoldCols::new(vec![all[1]; FOLD_INLINE_COLS + 1]).inline,
-        "a group set past the scratch streams"
+        "a group set past the stack buffer takes the scratch"
     );
 }
 

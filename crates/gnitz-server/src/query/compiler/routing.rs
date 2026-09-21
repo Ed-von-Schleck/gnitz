@@ -39,7 +39,7 @@ pub(crate) struct ViewMeta {
     /// move already sits on the worker owning its distribution key.
     pub(in crate::query) skips_exchange: bool,
     /// source table id → the bound its backfill scan narrows by. Absent for a
-    /// source scanned twice, whose one backfill cursor feeds both scans.
+    /// source scanned more than once, whose one backfill cursor feeds every scan.
     source_bounds: FxHashMap<i64, ReadBound>,
 }
 
@@ -273,7 +273,7 @@ struct SourceUse {
     /// The scatter key it states, in the source relation's own column indices.
     key: Option<ReindexKey>,
     /// Its backfill scan's bound: `None` until a `ScanDelta` names the source,
-    /// and `ReadBound::None` once two do — one cursor feeds both scans.
+    /// and `ReadBound::None` once a second does — one cursor feeds every scan.
     bound: Option<ReadBound>,
     /// Every direct reader of every `ScatterKey` Map naming this source is a
     /// `WorkerFilter`, which keeps only rows already on their PK's owner.

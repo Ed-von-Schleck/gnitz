@@ -12,37 +12,7 @@ fn carve_rejection(nodes: Vec<(NodeId, OpNode)>, edges: Vec<(NodeId, NodeId, usi
     rejection(loaded_for_test(nodes, edges).carve().map(drop))
 }
 
-#[test]
-fn more_than_two_exchange_shards_are_rejected() {
-    assert_eq!(
-        carve_rejection(
-            vec![
-                (0, scan_delta(10)),
-                (1, scan_delta(11)),
-                (2, scan_delta(12)),
-                (3, OpNode::ExchangeShard { shard_cols: vec![0] }),
-                (4, OpNode::ExchangeShard { shard_cols: vec![0] }),
-                (5, OpNode::ExchangeShard { shard_cols: vec![0] }),
-                (6, OpNode::Union),
-                (7, OpNode::Union),
-                (8, OpNode::IntegrateSink),
-            ],
-            vec![
-                (0, 3, SLOT_IN),
-                (1, 4, SLOT_IN),
-                (2, 5, SLOT_IN),
-                (3, 6, SLOT_IN),
-                (4, 6, SLOT_B),
-                (6, 7, SLOT_IN),
-                (5, 7, SLOT_B),
-                (7, 8, SLOT_IN),
-            ],
-        ),
-        format!("more than {MAX_SIDES} exchange nodes")
-    );
-}
-
-/// A pair side relays under its source, routed by the view's one shard key, so
+/// A side relays under its source, routed by the view's one shard key, so
 /// two sides keyed differently would bounds-check one side by the other's key.
 #[test]
 fn exchange_sides_sharding_on_different_keys_are_rejected() {

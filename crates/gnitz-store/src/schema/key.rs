@@ -15,10 +15,11 @@
 //! The per-column codec and tuple encoders are `gnitz_wire::pk`'s, shared with the
 //! client; this module composes schema-typed and row-sourced keys from them.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 
 use gnitz_expr::RowSource;
-use gnitz_wire::{Cut, RangeDescriptor, RowHasher, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{
     type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts,
@@ -684,24 +685,6 @@ impl SchemaDescriptor {
 // encode can produce: a string column's content and the group key's fold slot.
 // ---------------------------------------------------------------------------
 
-/// Feed a German-string column's content into `hasher` as a length-prefixed
-/// byte run: a 4-byte LE length, then the content (following the heap pointer
-/// for long strings). The length prefix keeps "ab"+"c" from aliasing "a"+"bc"
-/// across adjacent columns.
-///
-/// Shared by the group-key fold below and the set-op row-identity hash
-/// (`reindex_hash_row`) so a string column contributes the same bytes to both.
-/// The two *digests* still differ by construction and are meant to: the group
-/// fold streams each column's `opk_image` under a `1`/`0` null marker,
-/// the row hash streams raw native cell bytes under the inverted marker and a
-/// leading branch discriminator. Only this per-column body is shared.
-#[inline]
-pub(crate) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &[u8], blob: &[u8]) {
-    let content = gnitz_wire::german_string_content(struct_bytes, blob);
-    hasher.update(&(content.len() as u32).to_le_bytes());
-    hasher.update(content);
-}
-
 /// Column `c` of `schema` as a key column, `what` naming the key in a refusal.
 /// A float has none: `+0.0` and `-0.0` differ byte-wise but compare equal.
 pub(crate) fn locate_key_col(schema: &SchemaDescriptor, c: u32, what: &str) -> Result<ColumnLocator, OpBuildErr> {
@@ -716,42 +699,42 @@ pub(crate) fn locate_key_col(schema: &SchemaDescriptor, c: u32, what: &str) -> R
     Ok(loc)
 }
 
-/// Hash one group column into the streaming fold — the single per-column body
-/// [`FoldCols::key_row`] streams.
-///
-/// Reads the null bit unconditionally: a NOT NULL column never carries one, so
-/// masking it off would cost a per-row AND to change nothing.
+/// Append one column's key bytes to `buf`: a null marker, then a German string's
+/// content behind its 4-byte LE length — which keeps "ab"+"c" from aliasing
+/// "a"+"bc" — or the value's `opk_image`, so a payload FK keys like the same
+/// value stored as a PK column.
 #[inline]
-fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, null_word: u64, loc: ColumnLocator) {
-    // A PK column is never null, so this is the payload-only NULL gate.
+fn push_col_key<R: RowSource>(buf: &mut Vec<u8>, src: &R, row: usize, null_word: u64, loc: ColumnLocator) {
     if loc.is_null_word(null_word) {
-        hasher.update(&[0u8]); // null marker
+        buf.push(0);
         return;
     }
-    hasher.update(&[1u8]); // non-null marker
+    buf.push(1);
     match loc {
-        // Length-prefixed content, matching reindex_hash_row. BLOB comes here too:
-        // it shares the 16-byte struct, so hashing that would key on a heap pointer.
         ColumnLocator::Payload { slot, size, type_code } if gnitz_wire::is_german_string(type_code) => {
-            hash_german_string_content(hasher, src.get_col_ptr(row, slot as usize, size as usize), src.blob());
+            let content =
+                gnitz_wire::german_string_content(src.get_col_ptr(row, slot as usize, size as usize), src.blob());
+            buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            buf.extend_from_slice(content);
         }
-        // The value's image, so a payload FK hashes like the same value stored
-        // as a PK column.
-        _ => hasher.update(&loc.opk_image(src, row).to_le_bytes()),
+        _ => buf.extend_from_slice(&loc.opk_image(src, row).to_le_bytes()),
     }
 }
 
-/// Group columns a one-shot fold assembles on the stack. Sized by the PK arity —
-/// the shape every real group set has; a wider one is legal SQL and streams.
+thread_local! {
+    /// `key_row`'s buffer for a fold its stack buffer cannot hold.
+    static FOLD_SCRATCH: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
+
+/// Columns a fold assembles on the stack: the PK arity, which every real group
+/// set fits.
 const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
 
-/// The columns one 128-bit key folds, and how — one value rather than a list
-/// plus a flag, so a fold cannot run under a verdict taken over other columns.
-/// Both engine folds hold one, so neither can drift from the other.
+/// The columns one 128-bit row digest folds, and whether their key bytes fit
+/// the stack buffer.
 pub(crate) struct FoldCols {
     locs: Vec<ColumnLocator>,
-    /// Every column contributes a fixed 17 bytes and they fit the stack scratch.
-    /// A German string streams variable-length content instead.
+    /// Every column is fixed-width, and there are at most `FOLD_INLINE_COLS`.
     inline: bool,
 }
 
@@ -773,32 +756,42 @@ impl FoldCols {
         self.locs.is_empty()
     }
 
-    /// The 128-bit XXH3 fold of these columns over `row`. The two arms write the
-    /// same bytes and XXH3's one-shot and streaming forms agree at every length,
-    /// so they are one digest — pinned by
-    /// `hash_fold_one_shot_matches_the_streaming_form`.
+    /// The 128-bit XXH3 digest of these columns' key bytes over `row`.
     #[inline]
     pub(crate) fn key_row<R: RowSource>(&self, src: &R, row: usize, null_word: u64) -> u128 {
         if self.inline {
+            // `push_col_key`'s bytes, written to the stack.
             let mut buf = [0u8; 17 * FOLD_INLINE_COLS];
             let mut n = 0usize;
             for &loc in &self.locs {
                 if loc.is_null_word(null_word) {
-                    buf[n] = 0; // null marker
+                    buf[n] = 0;
                     n += 1;
                     continue;
                 }
-                buf[n] = 1; // non-null marker
+                buf[n] = 1;
                 buf[n + 1..n + 17].copy_from_slice(&loc.opk_image(src, row).to_le_bytes());
                 n += 17;
             }
             return gnitz_wire::checksum_128(&buf[..n]);
         }
-        let mut hasher = RowHasher::new();
-        for &loc in &self.locs {
-            hash_group_col(&mut hasher, src, row, null_word, loc);
-        }
-        hasher.digest128()
+        self.key_row_scratch(src, row, null_word)
+    }
+
+    /// [`Self::key_row`] through the thread-local scratch, out of line so the
+    /// stack arm stays small enough to inline into its callers.
+    #[inline(never)]
+    fn key_row_scratch<R: RowSource>(&self, src: &R, row: usize, null_word: u64) -> u128 {
+        FOLD_SCRATCH.with(|cell| {
+            let mut buf = cell.take();
+            buf.clear();
+            for &loc in &self.locs {
+                push_col_key(&mut buf, src, row, null_word, loc);
+            }
+            let key = gnitz_wire::checksum_128(&buf);
+            cell.set(buf);
+            key
+        })
     }
 }
 

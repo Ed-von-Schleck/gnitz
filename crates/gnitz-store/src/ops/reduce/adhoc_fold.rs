@@ -21,7 +21,7 @@ use super::agg::{Accumulator, BulkStep};
 
 use super::emit::emit_reduce_row;
 use super::plan::{build_reduce_output_schema, ReduceShape};
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::{SchemaDescriptor, SchemaFacts};
 use crate::storage::{Batch, StoreError};
 
 /// The request-scoped fold state.
@@ -140,9 +140,7 @@ impl AdhocFold {
     pub(crate) fn finish(self) -> Batch {
         let n_aggs = self.shape.acc_template.len();
         let gs = self.groups.schema();
-        let carried: Vec<ColumnLocator> = (0..gs.num_payload_cols())
-            .map(|pi| gs.locate(gs.payload_col_idx(pi)))
-            .collect();
+        let carried = gs.payload_locators();
         let mut output = Batch::with_capacity(&self.shape.output_schema, self.groups.count);
         let groups_mb = self.groups.as_mem_batch();
         for ord in 0..self.groups.count {

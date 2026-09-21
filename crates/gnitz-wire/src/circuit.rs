@@ -327,19 +327,10 @@ pub enum MapKind {
         key: Vec<ReindexSlot>,
         role: ReindexRole,
     },
-    /// Full-row-identity reindex. Like `Projection` (keep the listed columns as
-    /// payload, in order), but the synthetic PK is set to a hash of the kept
-    /// payload bytes. Used by EXCEPT/INTERSECT/DISTINCT so set membership is
-    /// decided by the projected row content, not by the source PK.
-    ///
-    /// Each column carries the promoted payload type the widening projection
-    /// coerces it into (`None` = keep the source type; always a ≤8-byte integer),
-    /// so a cross-width pair like `I32 UNION I64` hashes one physical layout.
-    ///
-    /// `branch_id` is mixed into the hash so identical payloads on the two sides
-    /// of a `UNION ALL` get distinct PKs and accumulate weight +2 rather than
-    /// collapsing: 0 and 1 there, 0 on both sides of a deduplicating set-op.
-    HashRow { cols: Vec<ReindexSlot>, branch_id: u8 },
+    /// A projection of `cols`, each widened to its target (`None` keeps the
+    /// source type), keyed by a hash of the row's content instead of the source
+    /// PK — so a row's identity is its projected content.
+    HashRow { cols: Vec<ReindexSlot> },
 }
 
 /// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>` and decoded
@@ -603,10 +594,15 @@ impl Circuit {
         self.add(op, NodeInputs::Unary(input))
     }
 
-    /// [`MapKind::HashRow`].
-    pub fn map_hash_row(&mut self, input: NodeId, cols: &[ReindexSlot], branch_id: u8) -> NodeId {
-        let op = OpNode::Map(MapKind::HashRow { cols: cols.to_vec(), branch_id });
-        self.add(op, NodeInputs::Unary(input))
+    /// [`MapKind::HashRow`] behind an [`OpNode::ExchangeShard`] on the hash. The key
+    /// is computed in-circuit, so nothing upstream can have partitioned by it; the
+    /// exchange puts equal rows on one worker.
+    pub fn map_hash_row(&mut self, input: NodeId, cols: &[ReindexSlot]) -> NodeId {
+        let map = self.add(
+            OpNode::Map(MapKind::HashRow { cols: cols.to_vec() }),
+            NodeInputs::Unary(input),
+        );
+        self.shard(map, &[0])
     }
 
     /// [`MapKind::Projection`].
@@ -959,8 +955,7 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             write_cols(&mut w, keep);
             (Opcode::MapReindex, None, Some(w.into_vec()))
         }
-        OpNode::Map(MapKind::HashRow { cols, branch_id }) => {
-            w.u8(*branch_id);
+        OpNode::Map(MapKind::HashRow { cols }) => {
             write_cols_with_tcs(&mut w, cols);
             (Opcode::MapHashRow, None, Some(w.into_vec()))
         }
@@ -1064,7 +1059,6 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             OpNode::Map(MapKind::Reindex { keep: read_cols(&mut r)?, key, role })
         }
         Opcode::MapHashRow => {
-            let branch_id = r.u8()?;
             // No target-domain gate here: `MapPlan::from_wire` types the output
             // column at the target, so `check_copy_types` sees the promotion.
             let cols = read_cols_with_tcs(&mut r)?;
@@ -1073,7 +1067,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             if cols.is_empty() {
                 return Err("MAP_HASH_ROW names no columns".to_string());
             }
-            OpNode::Map(MapKind::HashRow { cols, branch_id })
+            OpNode::Map(MapKind::HashRow { cols })
         }
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,

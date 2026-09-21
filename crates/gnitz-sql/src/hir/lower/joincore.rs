@@ -318,17 +318,17 @@ impl RangePrologue<'_> {
         let want_max = matches!(self.op, RangeRel::Lt | RangeRel::Le);
         let agg_func = if want_max { WireAggFunc::Max } else { WireAggFunc::Min };
 
-        // Decodes the OPK key into a native payload value, so MIN/MAX order values.
-        let mbh = cb.map_hash_row(self.reindex_b, &[(0, None)], 0);
+        // B's range keys alone: rows sharing one consolidate before the MIN/MAX reads it.
+        let keys = cb.map(self.reindex_b, &[]);
         // Local over the broadcast B, so every worker holds the same extremum. No
         // ground row: a `m = NULL` seed would break `A − 0 = A` over an empty B.
         // The COUNT is the cardinality gate every reduce carries; the reindex
         // below keeps no payload, so it goes no further.
         let specs = [
-            AggDescriptor { agg_op: agg_func, col_idx: 1 },
+            AggDescriptor { agg_op: agg_func, col_idx: 0 },
             AggDescriptor::COUNT_STAR,
         ];
-        let red = cb.reduce_multi_local(mbh, &[], &specs, false); // [_group_pk:U128, m:Tc, count]
+        let red = cb.reduce_multi_local(keys, &[], &specs, false); // [_group_pk:U128, m:Tc, count]
         let reindex_m = cb.map_reindex(red, &self_derived_key(&[1]), &[], ReindexRole::Auxiliary);
         let trace_m = cb.integrate_trace(reindex_m);
 

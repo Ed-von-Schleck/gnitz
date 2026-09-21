@@ -5,8 +5,7 @@ use super::super::chain::{admit, EmitPieces, ViewChain};
 use super::super::physical::{self, Frame};
 use super::super::{as_col, ColId, HirExpr, ProjEntry, RelExpr};
 use super::{
-    collect_live_cols, cut_segment, filter, lowered_whole, materialize, project_front, resolve_in_place, CutMemo,
-    SegInput,
+    collect_live_cols, cut_segment, filter, lowered_whole, project_front, resolve_in_place, CutMemo, SegInput,
 };
 use crate::access::candidates;
 use crate::error::GnitzSqlError;
@@ -156,23 +155,6 @@ pub(crate) fn open<'a>(
         })
         .collect();
     Ok(Spine { seg, levels })
-}
-
-/// Two inputs opened side by side; under `distinct_sources` a right input reading
-/// the left's source is re-read as a second relation.
-pub(crate) fn open_pair<'a>(
-    chain: &mut ViewChain,
-    memo: &mut CutMemo,
-    [left, right]: [&'a Rc<RelExpr>; 2],
-    [live_l, live_r]: [&HashSet<ColId>; 2],
-    distinct_sources: bool,
-) -> Result<[Spine<'a>; 2], GnitzSqlError> {
-    let l = open(chain, memo, left, live_l)?;
-    let r = open(chain, memo, right, live_r)?;
-    if distinct_sources && l.tid() == r.tid() {
-        return Ok([l, Spine::segment(materialize(chain, memo, right, live_r)?)]);
-    }
-    Ok([l, r])
 }
 
 impl Spine<'_> {

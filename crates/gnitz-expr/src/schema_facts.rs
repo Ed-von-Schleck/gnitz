@@ -68,6 +68,12 @@ pub trait SchemaFacts: ColumnTable {
         assert!(pi < self.num_payload_cols(), "payload_col_idx: pi {pi} out of range");
         gnitz_wire::payload_col_idx(self.pk_cols(), pi)
     }
+    /// Every payload column's locator, in slot order.
+    fn payload_locators(&self) -> Vec<ColumnLocator> {
+        (0..self.num_payload_cols())
+            .map(|pi| self.locate(self.payload_col_idx(pi)))
+            .collect()
+    }
     /// Number of non-PK columns.
     fn num_payload_cols(&self) -> usize {
         self.num_columns() - self.pk_cols().len()
