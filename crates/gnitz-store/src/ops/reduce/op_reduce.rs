@@ -52,7 +52,6 @@ pub fn op_reduce(
         let cursor = history.expect("a value-indexed reduce is handed a cursor over the index its plan describes");
         (bake, cursor)
     });
-    let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
     for run in runs.iter() {
         let first = runs.row(run.start);
         let out_pk = shape.key.out_pk(&mb, first);
@@ -89,10 +88,7 @@ pub fn op_reduce(
         }
         if probe {
             if let Some((bake, cursor)) = &mut avi {
-                bake.pack_group(&mut gk, &mb, first);
-                for (j, k) in bake.acc_indices().enumerate() {
-                    bake.seed_extreme(cursor, &mut gk, j, &mut accs[k]);
-                }
+                bake.seed_extremes(cursor, &mb, first, &mut accs);
             }
         }
 

@@ -694,9 +694,7 @@ pub const fn is_valid_type_code(tc: u8) -> bool {
 /// A temporal or decimal code also maps to itself: the register holds the
 /// 8-byte integer while the declared column keeps its name. A `DATE` slot is
 /// narrower than that register, so a sink into one is admitted only behind a
-/// cast that range-checks the value into that width (`check_emit_slot`), and a
-/// consumer that wants the accumulator's width rather than the declaration's —
-/// `agg_output_type` — reads through [`storage_type_code`].
+/// cast that range-checks the value into that width (`check_emit_slot`).
 #[inline]
 pub(crate) const fn register_image_type(tc: u8) -> u8 {
     if is_float(tc) {
@@ -959,27 +957,33 @@ impl ScalarKind {
 }
 
 /// The column types outside [`ScalarKind`] that MIN/MAX still select over: the
-/// 16-byte integers and the German-string pair. A `const` assert holds every
-/// `TypeCode` to exactly one of a `ScalarKind` and a `WideKind`.
+/// 16-byte integers and the German-string pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WideKind {
     Fixed(TypeCode),
     Bytes,
 }
 
-impl WideKind {
-    /// Reads the same two allow-lists [`TypeCode::is_wide_int`] and
-    /// [`TypeCode::is_german_string`] define, so the wide set has one spelling.
-    pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
-        if tc.is_wide_int() {
-            Some(Self::Fixed(tc))
-        } else if tc.is_german_string() {
-            Some(Self::Bytes)
-        } else {
-            None
+/// How a column's value is held and ordered: as its [`ScalarKind`] register
+/// image, or as the native bytes of a [`WideKind`] value too wide for one.
+/// Every type has exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Scalar(ScalarKind),
+    Wide(WideKind),
+}
+
+impl ImageKind {
+    pub const fn of(tc: TypeCode) -> Self {
+        match ScalarKind::from_type_code(tc) {
+            Some(kind) => Self::Scalar(kind),
+            None if tc.is_german_string() => Self::Wide(WideKind::Bytes),
+            None => Self::Wide(WideKind::Fixed(tc)),
         }
     }
+}
 
+impl WideKind {
     /// Order two values by their **native** bytes — a string's content, already
     /// resolved out of its blob heap, not its 16-byte cell.
     #[inline(always)]
@@ -1049,8 +1053,8 @@ const _: () = {
         let tc = TypeCode::ALL[i];
         let kind = ScalarKind::from_type_code(tc);
         assert!(
-            kind.is_some() != WideKind::from_type_code(tc).is_some(),
-            "every type has exactly one of a scalar and a wide kind"
+            kind.is_some() != (tc.is_wide_int() || tc.is_german_string()),
+            "a type is wide iff it has no scalar image"
         );
         match FixedInt::from_type_code(tc) {
             Some(fi) => {

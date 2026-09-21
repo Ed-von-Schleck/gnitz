@@ -37,7 +37,7 @@ fn f64_acc(agg_op: AggFunc) -> Accumulator {
     accs.swap_remove(0)
 }
 
-// Item 19: a NaN seen first must not poison MIN. A subsequent finite value
+// A NaN seen first must not poison MIN. A subsequent finite value
 // is smaller under the total order and must replace it.
 #[test]
 fn min_nan_first_does_not_poison() {
@@ -50,7 +50,7 @@ fn min_nan_first_does_not_poison() {
     assert_eq!(got, 5.0, "finite value must displace a leading NaN in MIN");
 }
 
-// Item 19 mirror: MAX must use the total order consistently. Under
+// MAX must use the total order consistently. Under
 // total_cmp a quiet (positive) NaN is the greatest value, so once seen it
 // is retained as the max regardless of arrival order.
 #[test]

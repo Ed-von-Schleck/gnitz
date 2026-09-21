@@ -19,31 +19,36 @@ fn check_cols(schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDes
     )
 }
 
-/// Build the reduce output schema from `out_key`. `Err` with the bound the
-/// columns overflowed.
+/// Build the reduce output schema from `out_key`. `Err` for an aggregate its
+/// column's type does not admit, and for columns overflowing a schema bound.
 pub(super) fn build_reduce_output_schema(
     input: &SchemaDescriptor,
     group_cols: &[u32],
     agg_descs: &[AggDescriptor],
     out_key: ReduceOutKey,
-) -> Result<SchemaDescriptor, SchemaBound> {
+) -> Result<SchemaDescriptor, OpBuildErr> {
+    let over = |e: SchemaBound| OpBuildErr::shape(format!("reduce: output {e}"));
     let mut b = DerivedSchema::new();
     for slot in out_key.output_layout(input.pk_indices(), group_cols, group_cols.iter().copied()) {
         match slot {
-            gnitz_wire::ReduceOutSlot::SyntheticKey => b.push_pk(super::super::group_key::GROUP_PK_COL)?,
-            gnitz_wire::ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize])?,
-            gnitz_wire::ReduceOutSlot::Carried(c) => b.push(input.columns[c as usize])?,
+            gnitz_wire::ReduceOutSlot::SyntheticKey => b.push_pk(super::super::group_key::GROUP_PK_COL),
+            gnitz_wire::ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize]),
+            gnitz_wire::ReduceOutSlot::Carried(c) => b.push(input.columns[c as usize]),
         }
+        .map_err(over)?;
     }
     // Nullability covers what `emit_agg_col` writes.
     let ungrouped = group_cols.is_empty();
     for ad in agg_descs {
         let src = input.columns[ad.col_idx as usize];
+        let tc = gnitz_wire::agg_output_type(ad.agg_op, src.type_code).ok_or_else(|| {
+            OpBuildErr::shape(format!(
+                "reduce: {:?} is not defined over type code {}",
+                ad.agg_op, src.type_code
+            ))
+        })?;
         let nullable = ad.agg_op.raw_output_nullable(src.nullable != 0, ungrouped);
-        b.push(SchemaColumn::new(
-            gnitz_wire::agg_output_type(ad.agg_op, src.type_code),
-            nullable as u8,
-        ))?;
+        b.push(SchemaColumn::new(tc, nullable as u8)).map_err(over)?;
     }
     Ok(b.finish())
 }
@@ -54,7 +59,7 @@ pub struct ReduceShape {
     pub output_schema: SchemaDescriptor,
     pub(super) key: GroupOutKey,
     /// The accumulator set in its empty-group state, cloned per use.
-    pub acc_template: Vec<Accumulator>,
+    pub(super) acc_template: Vec<Accumulator>,
 }
 
 impl ReduceShape {
@@ -79,19 +84,18 @@ impl ReduceShape {
         self.key.group.cols.is_empty()
     }
 
-    /// `Err` for an output wider than the schema array, an unaggregatable column
-    /// type, and a group column the group key refuses.
+    /// `Err` for an output [`build_reduce_output_schema`] refuses and a group
+    /// column the group key refuses.
     fn build(
         input: &SchemaDescriptor,
         group_cols: &[u32],
         aggs: &[AggDescriptor],
         out_key: ReduceOutKey,
     ) -> Result<Self, OpBuildErr> {
-        let output_schema = build_reduce_output_schema(input, group_cols, aggs, out_key)
-            .map_err(|e| OpBuildErr::shape(format!("reduce: output {e}")))?;
+        let output_schema = build_reduce_output_schema(input, group_cols, aggs, out_key)?;
         // The aggregates are the trailing output columns.
         let cbase = output_schema.num_columns() - aggs.len();
-        let acc_template: Vec<Accumulator> = aggs
+        let acc_template = aggs
             .iter()
             .enumerate()
             .map(|(k, d)| {
@@ -101,8 +105,7 @@ impl ReduceShape {
                     output_schema.locate(cbase + k),
                 )
             })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| OpBuildErr::shape("reduce: summed column type has no scalar register image"))?;
+            .collect();
         let key = GroupOutKey::new(input, group_cols, out_key, &output_schema)?;
         Ok(ReduceShape { output_schema, key, acc_template })
     }
@@ -148,10 +151,7 @@ impl ReducePlan {
             .iter()
             .position(|d| d.agg_op == AggFunc::Count)
             .ok_or_else(|| OpBuildErr::shape("reduce: a circuit reduce needs a COUNT(*)"))?;
-        let avi = match shape.acc_template.iter().any(|a| !a.is_linear()) {
-            true => Some(AviBake::new(input_schema, group_by_cols, &shape.acc_template)?),
-            false => None,
-        };
+        let avi = AviBake::new(input_schema, group_by_cols, &shape.acc_template)?;
         Ok(ReducePlan {
             shape,
             seeds_ground: global_ground && i_am_owner,

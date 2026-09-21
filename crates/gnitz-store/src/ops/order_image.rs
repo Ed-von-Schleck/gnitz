@@ -4,28 +4,18 @@
 //! order). One encoder, so the two indexes cannot disagree on what "smaller"
 //! means for any type.
 
-use crate::schema::ColumnLocator;
+use crate::schema::{type_code, ColumnLocator, SchemaColumn};
 use gnitz_expr::RowSource;
-use gnitz_wire::{ScalarKind, WideKind};
+use gnitz_wire::{ImageKind, ScalarKind, WideKind};
 
-/// How an ordered column's value is held and ordered: as its 8-byte order
-/// image, or as the native bytes of a value too wide for one.
-#[derive(Clone, Copy)]
-pub(crate) enum ImageKind {
-    Scalar(ScalarKind),
-    Wide(WideKind),
+/// The index PK column [`write_image_slot`] fills with an image's leading bytes:
+/// a scalar image whole, a wide one's first 16 bytes.
+pub(crate) const fn image_slot_col(wide: bool) -> SchemaColumn {
+    SchemaColumn::new(if wide { type_code::U128 } else { type_code::U64 }, 0)
 }
 
-impl ImageKind {
-    /// Every column type has an image: the scalar one where a register holds
-    /// it, the wide one otherwise. `None` only for a type that is neither.
-    pub(crate) fn of(tc: crate::schema::TypeCode) -> Option<Self> {
-        match ScalarKind::from_type_code(tc) {
-            Some(kind) => Some(ImageKind::Scalar(kind)),
-            None => WideKind::from_type_code(tc).map(ImageKind::Wide),
-        }
-    }
-}
+/// A whole image as a payload column: a BLOB orders by content.
+pub(crate) const IMAGE_COL: SchemaColumn = SchemaColumn::new(type_code::BLOB, 0);
 
 /// The native bytes of the wide column at `loc` in `row`: a string's content,
 /// or the 16-byte little-endian integer.
@@ -81,8 +71,6 @@ pub(crate) fn write_image_slot(slot: &mut [u8], image: &[u8]) {
 }
 
 /// [`append_wide_image`]'s inverse: the native bytes back out of an index image.
-/// Only the wide arm needs one — a scalar image is a `u64` the reader decodes in
-/// place.
 pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -> Vec<u8> {
     let mut v = image.to_vec();
     if invert {
@@ -129,6 +117,13 @@ pub(crate) fn scalar_image(
     } else {
         v
     }
+}
+
+/// [`scalar_image`]'s inverse: the value's own little-endian bits back out of
+/// an image.
+#[inline(always)]
+pub(crate) fn scalar_native_of_image(kind: ScalarKind, invert: bool, image: u64) -> u64 {
+    kind.order_inverse(if invert { !image } else { image })
 }
 
 /// Append the order image of the column at `loc` in `row`, **known non-NULL**:

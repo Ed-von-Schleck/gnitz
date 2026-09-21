@@ -172,7 +172,8 @@ fn opk_image_agrees_across_regions() {
 }
 
 /// `order_bits`' integer half is the value's index key (`encode_pk_natives` at
-/// `index_key_type`), on both arms.
+/// `index_key_type`), on both arms, and `ScalarKind::order_inverse` recovers the
+/// value from it.
 #[test]
 fn order_bits_matches_the_opk_promotion_on_both_arms() {
     fn oracle(native: u64, type_code: u8) -> u64 {
@@ -226,6 +227,11 @@ fn order_bits_matches_the_opk_promotion_on_both_arms() {
                 from_payload.order_bits(&v, row, kind),
                 want,
                 "{fi:?} payload arm, value {x:#x}",
+            );
+            assert_eq!(
+                kind.order_inverse(want).to_le_bytes()[..w],
+                x.to_le_bytes()[..w],
+                "{fi:?} order_inverse, value {x:#x}",
             );
         }
     }

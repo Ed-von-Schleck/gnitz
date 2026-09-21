@@ -108,24 +108,10 @@ pub(crate) fn temporal_literal(tc: TypeCode, s: &str) -> Result<i64, GnitzSqlErr
     v.ok_or_else(|| GnitzSqlError::Bind(format!("invalid {} literal: {s:?}", tc.wire_name())))
 }
 
-/// Whether a value of this type fits the expression VM's 8-byte *scalar*
-/// register — [`gnitz_core::ScalarKind`], the same classification the engine's
-/// reduce kernel resolves a summed column through, so the binder cannot admit a
-/// SUM the engine then refuses.
-///
-/// Not the same question as `register_image`, which is total over *both*
-/// register classes and maps STRING to itself.
-pub(crate) fn has_scalar_register(tc: TypeCode) -> bool {
-    gnitz_core::ScalarKind::from_type_code(tc).is_some()
-}
-
-/// Whether `CAST(… AS tc)` has a form the VM can compute. STRING joins the
-/// scalar-register types because the VM has a string register class of its own;
-/// BLOB does not, and is not expressible anyway — `sql_col_type`
-/// produces `TypeCode::Blob` for no SQL type. This is the codebase's only
-/// cast-target gate.
+/// Whether `CAST(… AS tc)` has a form the VM can compute: a type with a scalar
+/// register image, or STRING, which has a register class of its own.
 pub(crate) fn is_cast_target(tc: TypeCode) -> bool {
-    has_scalar_register(tc) || tc == TypeCode::String
+    gnitz_core::ScalarKind::from_type_code(tc).is_some() || tc == TypeCode::String
 }
 
 #[cfg(test)]

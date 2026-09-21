@@ -16,23 +16,13 @@
 //! row-by-row equal-PK arm, exactly as the AVI's value column does.
 
 use crate::schema::key::ReindexPacker;
-use crate::schema::{type_code, ColumnLocator, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
-use gnitz_wire::OrderKey;
+use gnitz_wire::{ImageKind, OrderKey};
 
 use super::super::group_key::push_group_index_key;
-use super::super::order_image::{append_image, write_image_slot, ImageKind};
-
-/// The PK column carrying `image_0`, and the reservation the group key is packed
-/// inside.
-const LEAD_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
-/// [`LEAD_COL`] for a wide `image_0`.
-const WIDE_LEAD_COL: SchemaColumn = SchemaColumn::new(type_code::U128, 0);
-const SUFFIX: [SchemaColumn; 1] = [LEAD_COL];
-const WIDE_SUFFIX: [SchemaColumn; 1] = [WIDE_LEAD_COL];
-/// One image column: content-ordered, never NULL (a NULL value has an image).
-const IMAGE_COL: SchemaColumn = SchemaColumn::new(type_code::BLOB, 0);
+use super::super::order_image::{append_image, image_slot_col, write_image_slot, IMAGE_COL};
 
 /// One ORDER BY key, resolved against the input: the same `(loc, desc,
 /// nulls_first)` [`OrderLocator`] the read path's comparator reads, plus the
@@ -85,22 +75,20 @@ impl TopNIndex {
         if order.is_empty() {
             return Err(OpBuildErr::shape("top-n: no order keys"));
         }
-        let order = order
+        let order: Vec<OrderSpec> = order
             .iter()
             .map(|key| {
                 let loc = input.locate(key.col as usize);
-                let kind = ImageKind::of(TypeCode::from_validated_u8(loc.type_code()))
-                    .ok_or_else(|| OpBuildErr::shape(format!("top-n: order column {} has no order image", key.col)))?;
-                Ok(OrderSpec { key: OrderLocator::of(loc, key), kind })
+                OrderSpec {
+                    key: OrderLocator::of(loc, key),
+                    kind: ImageKind::of(TypeCode::from_validated_u8(loc.type_code())),
+                }
             })
-            .collect::<Result<Vec<_>, OpBuildErr>>()?;
-        let suffix = match order[0].kind {
-            ImageKind::Wide(_) => &WIDE_SUFFIX,
-            ImageKind::Scalar(_) => &SUFFIX,
-        };
-        let key_packer = ReindexPacker::new_group_key(input, group_cols, suffix)?;
+            .collect();
+        let suffix = [image_slot_col(matches!(order[0].kind, ImageKind::Wide(_)))];
+        let key_packer = ReindexPacker::new_group_key(input, group_cols, &suffix)?;
         let mut b = crate::schema::DerivedSchema::new();
-        push_group_index_key(&mut b, &key_packer, suffix);
+        push_group_index_key(&mut b, &key_packer, &suffix);
         let over = |e| OpBuildErr::shape(format!("top-n: index {e}"));
         for _ in &order {
             b.push(IMAGE_COL).map_err(over)?;

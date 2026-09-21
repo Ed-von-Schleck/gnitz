@@ -1,26 +1,17 @@
 //! Ad-hoc aggregation hash-fold — the stateless per-worker sink behind a
 //! fold-sink `ReadSpec` (single-relation GROUP BY / global aggregate / DISTINCT
-//! over the committed base). No DBSP circuit, no operator-trace tables, no
-//! exchange: each surviving scan chunk folds into per-group accumulators in
-//! bounded RAM, then one partial reduce-output batch is emitted after full
-//! accumulation.
+//! over the committed base). No circuit, no operator traces, no exchange: each
+//! surviving scan chunk folds into per-group accumulators in bounded RAM, then
+//! one partial reduce-output batch is emitted.
 //!
-//! Semantics parity with a CREATE VIEW of the same statement is **structural**,
-//! not reimplemented: the accumulation kernel (`Accumulator::step_from_batch`),
-//! the group key (`GroupKeyCols`, whose 128-bit key is a group's identity here
-//! as in a view), and the emission path (`emit_reduce_row` driven by a
-//! `ReduceShape`) are the exact shared code a view's reduce runs, so partial agg
-//! columns are byte-identical to a view's reduce output.
+//! It runs the same accumulators, group key and `emit_reduce_row` as a view's
+//! reduce, so its partial aggregate columns are byte-identical to a view's
+//! reduce output.
 //!
-//! Exactness over the committed base: the scan cursor delivers consolidated,
-//! positive-net-weight rows (ghosts excluded, base tables DML-forced
-//! non-negative), so with no history there is no retraction arithmetic — the
-//! accumulator over such rows *is* the aggregate. The fold has no `should_emit`
-//! gate: a grouped fold emits one partial per present group (over positive
-//! weights a present group always has net cardinality > 0, matching the view),
-//! and a global fold its one row, over no input included. It carries no COUNT(*)
-//! cardinality companion — that is a `should_emit` signal the stateless fold does
-//! not need.
+//! The scan cursor delivers consolidated, positive-weight rows, so there is no
+//! retraction arithmetic and every present group has a positive cardinality:
+//! a grouped fold emits one partial per present group, a global fold its one
+//! row even over no input, and neither needs a COUNT(*) emission gate.
 
 use rustc_hash::FxHashMap;
 
@@ -36,20 +27,14 @@ use crate::storage::{Batch, StoreError};
 /// The request-scoped fold state.
 pub(crate) struct AdhocFold {
     shape: ReduceShape,
-    /// Grouped folds only: one representative source row per group, in
-    /// group-discovery order; the row index IS the group ordinal (and
-    /// `rep_rows.count` the group count).
-    /// `emit_reduce_row` reads the group columns from it, and the group key is
-    /// re-derived from it at `finish` (a pure function of the group columns).
+    /// Grouped folds only: row `ord` is group `ord`'s exemplar source row.
     rep_rows: Batch,
-    /// Flat accumulator matrix: group `ord` owns
-    /// `accs[ord * n_aggs .. (ord + 1) * n_aggs]`.
+    /// Group `ord` owns `accs[ord * n_aggs .. (ord + 1) * n_aggs]`; a global
+    /// fold's one group is ordinal 0.
     accs: Vec<Accumulator>,
     /// Group key → group ordinal.
     by_key: FxHashMap<u128, u32>,
-    /// Same-group memo: the previous row's `(key, ordinal)`. Consecutive rows
-    /// of one group — per cluster, when the scan is ordered by the group
-    /// column — resolve without a map probe.
+    /// The previous row's `(key, ordinal)`, so a run of one group skips the map.
     last: Option<(u128, u32)>,
     group_cap: usize,
 }
@@ -79,14 +64,8 @@ impl AdhocFold {
         &self.shape.output_schema
     }
 
-    /// Fold every `[start, end)` row range of one source chunk into the group
-    /// state — the caller passes the filter's surviving row ranges directly, so
-    /// no survivor batch is materialized. `Err` on exceeding the per-worker group
-    /// cap.
-    ///
-    /// The whole list rather than one range: a fragmented survivor list would
-    /// otherwise repay the per-call setup — the state destructure, the keyer and
-    /// the batch view — once per range instead of once per chunk.
+    /// Fold the surviving `[start, end)` row ranges of one source chunk into the
+    /// group state. `Err` past the per-worker group cap.
     pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), StoreError> {
         let Self {
             shape,
@@ -97,61 +76,38 @@ impl AdhocFold {
             group_cap,
         } = self;
         let n_aggs = shape.acc_template.len();
+        let global = shape.is_global();
         let mb = chunk.as_mem_batch();
-        if shape.is_global() {
-            // Global aggregate: its one group's accumulators exist from `new` — no
-            // per-row key hash, memo, or map probe.
-            for row in ranges.iter().flat_map(|&(s, e)| s..e) {
-                let w = mb.get_weight(row);
-                debug_assert!(w > 0, "adhoc fold: scan cursor must deliver positive weights");
-                if w <= 0 {
-                    continue;
-                }
-                for acc in &mut accs[..n_aggs] {
-                    acc.step_from_batch(&mb, row, w);
-                }
-            }
-            return Ok(());
-        }
         for row in ranges.iter().flat_map(|&(s, e)| s..e) {
             let w = mb.get_weight(row);
-            // The scan cursor delivers consolidated, positive-net-weight rows
-            // (ghosts excluded); the kernel's extreme arm asserts the same.
             debug_assert!(w > 0, "adhoc fold: scan cursor must deliver positive weights");
-            if w <= 0 {
-                continue;
-            }
-            let key = shape.key.group.key_row(&mb, row);
-            let ord = match *last {
-                Some((k, ord)) if k == key => ord,
-                _ => {
-                    let ord = match by_key.entry(key) {
-                        std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            // A new group. The cap is per-worker (a worker sees
-                            // a subset of the global groups), so it never fires
-                            // when the global group count ≤ cap; firing is a
-                            // stated resource-exhaustion abort, not silent
-                            // degradation.
-                            let ord = rep_rows.count;
-                            if ord >= *group_cap {
-                                return Err(StoreError::rejected(format!(
-                                    "GROUP BY exceeds {group_cap} distinct groups for ad-hoc execution; \
-                                     CREATE VIEW to maintain this aggregation incrementally"
-                                )));
+            let ord = if global {
+                0
+            } else {
+                let key = shape.key.group.key_row(&mb, row);
+                match *last {
+                    Some((k, ord)) if k == key => ord,
+                    _ => {
+                        let ord = match by_key.entry(key) {
+                            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                let ord = rep_rows.count;
+                                if ord >= *group_cap {
+                                    return Err(StoreError::rejected(format!(
+                                        "GROUP BY exceeds {group_cap} distinct groups for ad-hoc execution; \
+                                         CREATE VIEW to maintain this aggregation incrementally"
+                                    )));
+                                }
+                                rep_rows.append_batch(chunk, row, row + 1);
+                                accs.extend_from_slice(&shape.acc_template);
+                                *e.insert(ord as u32)
                             }
-                            // Append onto the flat matrix, never a fresh `Vec` per
-                            // group: the tail grows amortized.
-                            rep_rows.append_batch(chunk, row, row + 1);
-                            accs.extend_from_slice(&shape.acc_template);
-                            *e.insert(ord as u32)
-                        }
-                    };
-                    *last = Some((key, ord));
-                    ord
+                        };
+                        *last = Some((key, ord));
+                        ord
+                    }
                 }
-            };
-            let ord = ord as usize;
+            } as usize;
             for acc in &mut accs[ord * n_aggs..(ord + 1) * n_aggs] {
                 acc.step_from_batch(&mb, row, w);
             }

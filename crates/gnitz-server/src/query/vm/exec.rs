@@ -188,10 +188,9 @@ fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StoreError
                     };
 
                     gnitz_debug!(
-                        "vm: REDUCE in_count={} avi={} aggs={}",
+                        "vm: REDUCE in_count={} avi={}",
                         batches[in_reg.at()].len(),
-                        avi_cursor.is_some(),
-                        plan.plan.shape.acc_template.len()
+                        avi_cursor.is_some()
                     );
 
                     let mut to_cursor = state.cursor(*out_trace);

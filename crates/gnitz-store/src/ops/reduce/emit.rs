@@ -6,19 +6,12 @@ use gnitz_wire::WideKind;
 use super::agg::{Accumulator, AggValue};
 use super::plan::ReduceShape;
 
-/// Emit one aggregate column: the value truncated to the column width, or the
-/// empty-render when no row contributed — so `COUNT(col)` over an all-NULL group
-/// renders `0`, not NULL.
+/// Emit one aggregate column: the value truncated to the column width, or NULL.
 #[inline]
 fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, null_word: &mut u64) {
     let cs = acc.out_size();
     let Some(value) = acc.value() else {
-        // Zero bytes either way. The zero-identity family (COUNT family /
-        // SumZero) leaves the null bit clear so it renders a concrete `0`;
-        // SUM/MIN/MAX flag NULL.
-        if !acc.empty_renders_zero() {
-            gnitz_wire::null_word_set(null_word, out_pi, true);
-        }
+        gnitz_wire::null_word_set(null_word, out_pi, true);
         output.fill_col_zero(out_pi, cs);
         return;
     };

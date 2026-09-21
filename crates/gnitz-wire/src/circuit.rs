@@ -73,19 +73,14 @@ wire_enum! {
         Min = 3,
         Max = 4,
         CountNonNull = 5,
-        /// `Sum`'s fold (`acc += value × weight`) with `Count`'s `0` identity
-        /// (grounds to `0`, renders `0` when untouched). The two-phase
-        /// global-aggregate combine sums per-worker partial COUNT/COUNT_NON_NULL
-        /// columns with this — a plain `Sum` would render their empty value as
-        /// NULL instead of `0`.
+        /// `Sum` whose empty value is `0`: what merges partial counts.
         SumZero = 6,
     }
 }
 
 impl AggFunc {
-    /// True iff the aggregate folds a delta with no history replay
-    /// (`Agg(A + B) == Agg(A) + Agg(B)`). The complement retracts its extremum
-    /// from the aggregate-value index, which is then the value's source of truth.
+    /// True iff `Agg(A + B) == Agg(A) + Agg(B)`, so a delta folds with no
+    /// history replay.
     pub const fn is_linear(self) -> bool {
         match self {
             AggFunc::Count | AggFunc::Sum | AggFunc::CountNonNull | AggFunc::SumZero => true,
@@ -93,11 +88,7 @@ impl AggFunc {
         }
     }
 
-    /// True iff an untouched accumulator renders a concrete `0` rather than
-    /// NULL — the zero-identity family. COUNT / COUNT_NON_NULL count rows
-    /// (empty = 0); SumZero is Sum's fold under Count's `0` identity (the
-    /// two-phase partial-count combine). SUM / MIN / MAX have a NULL empty
-    /// value.
+    /// True iff the aggregate of no rows is `0` rather than NULL.
     pub const fn empty_renders_zero(self) -> bool {
         match self {
             AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => true,
@@ -105,28 +96,15 @@ impl AggFunc {
         }
     }
 
-    /// True iff a reduce's **raw** output column for this aggregate can render
-    /// NULL, and must therefore be declared nullable — the declaration half of
-    /// the null-bit rule `emit_agg_col` writes.
-    ///
-    /// A row carries an untouched accumulator only when the aggregate's source
-    /// column is nullable (the null gate is the group walk's one skip) or when
-    /// the group set is empty, where the ground row stands in for a
-    /// never-populated / fully-retracted source. A surviving *group* is never
-    /// null-filled from emptiness — it is retracted instead.
-    ///
-    /// Read by `build_reduce_output_schema` and by the planner's
-    /// `agg_col_def`; a NOT NULL declaration puts the row on a null-blind
-    /// comparator that would rank a NULL cell as a real `0`.
+    /// True iff a reduce's raw output column for this aggregate can hold NULL.
+    /// An aggregate over no rows is emitted only when every source value is
+    /// NULL, or as the ground row of an empty group set: an emptied group is
+    /// retracted, not emitted.
     pub const fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
         !self.empty_renders_zero() && (src_nullable || ungrouped)
     }
 
-    /// The aggregate that merges this aggregate's per-worker **partials**, read
-    /// by the planner's two-phase combine reduce and by the ad-hoc fold's
-    /// client-side combiner. COUNT/COUNT_NON_NULL partials sum with `SumZero` (a
-    /// count's empty value is 0, not NULL); SUM partials sum with plain `Sum`
-    /// (NULL ground); MIN/MAX partials merge by re-applying themselves.
+    /// The aggregate that merges this aggregate's partial values.
     pub fn merge_func(self) -> AggFunc {
         match self {
             AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => AggFunc::SumZero,
@@ -164,32 +142,24 @@ pub struct ComputeMap {
     pub out_cols: Vec<(u8, bool)>,
 }
 
-/// Output type code of an aggregate over a source column of type `src_tc` — the
-/// one typing rule both the planner's declared view schema and the engine's
-/// emitted batch read, so neither can scramble the other's column widths.
+/// Output type code of an aggregate over a source column of type `src_tc`, or
+/// `None` when that type does not admit it — the one rule both the planner's
+/// declared schema and the engine's emitted batch read.
 ///
-/// MIN/MAX *select* an existing row, so the extremum is itself a value of the
-/// source type: `MIN(INT)` is `INT`, `MAX(TEXT)` is `TEXT`, `MIN(REAL)` is `REAL`.
-///
-/// SUM over a U64 source is typed **U64**: the i64 `wrapping_add` accumulator's
-/// bit pattern already *is* the true sum mod 2^64 at the same width, so the label
-/// is the only choice, and it lets a downstream unsigned compare re-seed
-/// correctly. A narrow unsigned source still widens to I64 (its sum stays
-/// < 2^63). SumZero folds as SUM does and is typed as SUM is. AVG is
-/// planner-lowered before the wire and never reaches this rule.
-pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
-    use crate::types::type_code;
+/// A sum is typed as its 8-byte register image, so SUM over U64 is U64: the
+/// wrapping i64 accumulator's bits are the true sum mod 2^64.
+pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> Option<u8> {
+    use crate::types::{type_code, ScalarKind, TypeCode};
     match func {
-        AggFunc::Count | AggFunc::CountNonNull => type_code::I64,
-        // Exactly the 8-byte register image the accumulator holds. A temporal
-        // image names a narrower slot than that image, and a sum of calendar
-        // values is not one — the planner rejects SUM over a temporal column
-        // before it gets here, so this is what a forged circuit lands on.
-        AggFunc::Sum | AggFunc::SumZero => match crate::types::register_image_type(src_tc) {
-            t if crate::is_temporal(t) => type_code::I64,
-            t => t,
+        AggFunc::Count | AggFunc::CountNonNull => Some(type_code::I64),
+        // Adding two calendar values is meaningless.
+        AggFunc::Sum | AggFunc::SumZero => match TypeCode::try_from_u8(src_tc) {
+            Some(tc) if ScalarKind::from_type_code(tc).is_some() && !tc.is_temporal() => {
+                Some(crate::types::register_image_type(src_tc))
+            }
+            _ => None,
         },
-        AggFunc::Min | AggFunc::Max => src_tc,
+        AggFunc::Min | AggFunc::Max => Some(src_tc),
     }
 }
 

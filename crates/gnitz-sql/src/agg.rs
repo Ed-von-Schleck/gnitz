@@ -4,7 +4,6 @@
 use crate::ast_util::agg_func_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp};
-use crate::types::has_scalar_register;
 use gnitz_core::{ColType, ColumnDef, Schema, TypeCode};
 use gnitz_wire::AggFunc as WireAggFunc;
 
@@ -29,12 +28,23 @@ pub(crate) fn agg_ops(
             "{func:?} reached agg_ops without an argument column"
         )));
     }
-    // A summing aggregate adds its argument in a scalar register, which excludes
-    // the wide integers, the german-string pair, and a calendar value (adding two
-    // dates is meaningless). MIN/MAX select a row and take any type.
+    let nullable = arg.is_some_and(|c| c.is_nullable);
+    // Over a NOT NULL argument, a count is COUNT(*).
+    let count = if nullable {
+        WireAggFunc::CountNonNull
+    } else {
+        WireAggFunc::Count
+    };
+    let ops = match func {
+        AggFunc::Count => (count, None),
+        AggFunc::Min => (WireAggFunc::Min, None),
+        AggFunc::Max => (WireAggFunc::Max, None),
+        // A raw SUM reads 0, not NULL, once its last non-null row retracts.
+        AggFunc::Sum => (WireAggFunc::Sum, nullable.then_some(WireAggFunc::CountNonNull)),
+        AggFunc::Avg => (WireAggFunc::Sum, Some(count)),
+    };
     if let Some(c) = arg {
-        let summing = matches!(func, AggFunc::Sum | AggFunc::Avg);
-        if summing && (!has_scalar_register(c.type_code) || c.type_code.is_temporal()) {
+        if gnitz_core::agg_output_type(ops.0, c.type_code as u8).is_none() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "{}: not supported on {:?} column '{}'",
                 agg_func_name(func).to_ascii_uppercase(),
@@ -43,27 +53,14 @@ pub(crate) fn agg_ops(
             )));
         }
     }
-    let nullable = arg.is_some_and(|c| c.is_nullable);
-    // Over a NOT NULL argument, a count is COUNT(*).
-    let count = if nullable {
-        WireAggFunc::CountNonNull
-    } else {
-        WireAggFunc::Count
-    };
-    Ok(match func {
-        AggFunc::Count => (count, None),
-        AggFunc::Min => (WireAggFunc::Min, None),
-        AggFunc::Max => (WireAggFunc::Max, None),
-        // A raw SUM reads 0, not NULL, once its last non-null row retracts.
-        AggFunc::Sum => (WireAggFunc::Sum, nullable.then_some(WireAggFunc::CountNonNull)),
-        AggFunc::Avg => (WireAggFunc::Sum, Some(count)),
-    })
+    Ok(ops)
 }
 
 /// The raw reduce column `op` over `src` produces, as the engine declares it.
 pub(crate) fn agg_col_def(op: WireAggFunc, src: Option<&ColumnDef>, ungrouped: bool) -> ColumnDef {
     let src_ty = src.map_or(ColType::of(TypeCode::I64), ColumnDef::ty);
-    let tc = TypeCode::from_validated_u8(gnitz_core::agg_output_type(op, src_ty.tc as u8));
+    let tc = gnitz_core::agg_output_type(op, src_ty.tc as u8).expect("agg_ops admitted this aggregate");
+    let tc = TypeCode::from_validated_u8(tc);
     let ty = ColType {
         tc,
         scale: if tc == TypeCode::Decimal { src_ty.scale } else { 0 },

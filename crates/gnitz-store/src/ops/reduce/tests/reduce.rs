@@ -1458,8 +1458,8 @@ fn test_group_key_includes_pk_pki0() {
 
 #[test]
 fn test_group_key_includes_pk_pki1() {
-    // GROUP BY [other, pk] with pk_index=1: previously read the wrong
-    // payload column when c_idx == pki for non-zero pk_index.
+    // GROUP BY [other, pk] with pk_index=1: the PK column is read from the PK
+    // region, not a payload slot.
     let schema = make_schema_pk1_i64_u64();
     let batch = build_pk_other(&schema, &[(10, 100), (20, 100), (10, 200)]);
     let mb = batch.as_mem_batch();
@@ -2105,7 +2105,7 @@ fn test_reduce_max_u64_incremental() {
 #[test]
 fn test_avi_seed_u64_high_bit() {
     // The AVI fast path seeds an Accumulator with a U64 order image via
-    // `seed_encoded_extreme`, then folds in delta rows via `step_from_batch`.
+    // `seed_from_index`, then folds in delta rows via `step_from_batch`.
     // Validates that the U64 bit pattern preserved by the AVI seed
     // compares correctly under unsigned semantics against incoming
     // delta rows.
@@ -2116,7 +2116,7 @@ fn test_avi_seed_u64_high_bit() {
 
     // AVI seeds the accumulator with 1u64<<63 (high bit set); a U64's order
     // image is the value itself.
-    acc.seed_encoded_extreme(1u64 << 63);
+    acc.seed_from_index(&(1u64 << 63).to_be_bytes());
     assert_eq!(acc.value_bits(), 1u64 << 63);
 
     // Build a batch with a single row val=10u64, pk=1.
@@ -3527,18 +3527,15 @@ fn avi_wide_retraction_returns_next_extremum() {
 }
 
 // =======================================================================
-// Reduce-path correctness regressions: a value-independent aggregate (COUNT)
-// must not read a wide PK source column; the AVI order-encoded value must be
-// byte-ordered so incremental MIN/MAX reads the true extremal; an F32 AVI seed
-// must promote to F64 bits; and the group-by-PK path must handle a compound PK
-// of any width.
+// A value-independent aggregate (COUNT) must not read a wide PK source column;
+// the AVI order-encoded value must be byte-ordered so incremental MIN/MAX reads
+// the true extremal; an F32 AVI seed must render the source's F32 bits; and the
+// group-by-PK path must handle a compound PK of any width.
 // =======================================================================
 
-// Bug 1: COUNT(*) is compiled with a placeholder arg column index 0. When
-// column 0 is a 16-byte UUID PK, the old step_from_batch decoded the PK column
-// into an 8-byte scratch buffer before the per-op match — `pk_le_buf[..16]` was
-// out of range and the worker crashed. COUNT is value-independent and must
-// return before touching the column.
+// COUNT(*) is compiled with a placeholder arg column index 0, which may be a
+// 16-byte UUID PK. COUNT is value-independent and must count without reading
+// the column.
 #[test]
 fn count_accumulator_over_uuid_pk_does_not_panic() {
     let schema = SchemaDescriptor::new(
@@ -3568,11 +3565,9 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
     );
 }
 
-// Populate a fresh ephemeral AVI table from `deltas` through the production
-// `avi_batch` + ingest, then read the extreme of delta[0]-row-0's group back
-// through the production `AviBake::seed_extreme` seek. `col_idx` is the
-// aggregate source column (PK or payload). Shared by the AVI full-path tests
-// below.
+/// The extreme of `deltas[0]`-row-0's group, read back out of an AVI populated
+/// from `deltas` through the production path. `col_idx` is the aggregate source
+/// column (PK or payload).
 fn avi_read_extreme(
     in_schema: &SchemaDescriptor,
     group_by: &[u32],
@@ -3580,32 +3575,14 @@ fn avi_read_extreme(
     deltas: &[&Batch],
     for_max: bool,
 ) -> i64 {
-    // The aggregate's type is the source column's type.
-    let avi_schema = avi_schema(in_schema, group_by);
-    let tmp = tempfile::tempdir().unwrap();
-    let mut avi_t = scratch_table(tmp.path().to_str().unwrap(), avi_schema);
     let agg = AggDescriptor {
         col_idx,
         agg_op: if for_max { AggFunc::Max } else { AggFunc::Min },
     };
-    let bake = make_bake(in_schema, group_by, &[agg, AggDescriptor::COUNT_STAR]);
-
-    // Each avi_batch ingest is a separate AVI ingest; the cursor's
-    // two-tier consolidation sums weights across ingests, so a retracted extreme
-    // (net-zero) is skipped by seek_first_positive_with_prefix.
-    for d in deltas {
-        use super::avi::avi_batch;
-        avi_t.ingest_owned_batch(avi_batch(d, &bake)).unwrap();
-    }
-
-    let mut ch = avi_t.open_cursor();
-    let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
-    bake.pack_group(&mut gk, &deltas[0].as_mem_batch(), 0);
-    let mut acc = make_acc(in_schema, group_by, agg);
-    // Ordinal 0: the single aggregate.
-    bake.seed_extreme(&mut ch, &mut gk, 0, &mut acc);
-    assert!(!acc.is_untouched(), "AVI seek must find the probed group");
-    acc.value_bits() as i64
+    let mut avi = Avi::new(in_schema, group_by, &[agg, AggDescriptor::COUNT_STAR], deltas);
+    probe_indexed(in_schema, group_by, agg, deltas[0], 0, &mut avi.cursor())
+        .expect("AVI seek must find the probed group")
+        .value_bits() as i64
 }
 
 /// The extreme `op_reduce`'s AVI probe reads for `row`'s group, or `None` when
@@ -3619,14 +3596,12 @@ fn probe_indexed(
     avi: &mut ReadCursor,
 ) -> Option<Accumulator> {
     let bake = make_bake(in_schema, group_by, &[agg, AggDescriptor::COUNT_STAR]);
-    let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
-    bake.pack_group(&mut gk, &delta.as_mem_batch(), row);
     let mut acc = make_acc(in_schema, group_by, agg);
-    bake.seed_extreme(avi, &mut gk, 0, &mut acc);
-    (!acc.is_untouched()).then_some(acc)
+    bake.seed_extremes(avi, &delta.as_mem_batch(), row, std::slice::from_mut(&mut acc));
+    acc.value().is_some().then_some(acc)
 }
 
-// Bug 3: the order-encoded aggregate value must be serialized big-endian so the
+// The order-encoded aggregate value must be serialized big-endian so the
 // index's lexicographic byte ordering matches numeric order. With three values
 // in one group whose extremes differ above the low byte ({101, 111, -5}), a
 // little-endian serialization sorts 101 first and reports it as the MIN; -5 is
@@ -3767,7 +3742,7 @@ fn avi_f32_seed_renders_f32_bits() {
     let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     for v in [1.5f32, -2.25, 0.0, -0.0, 1.0e30] {
         let mut acc = make_acc(&in_schema, &[0], desc);
-        acc.seed_encoded_extreme(gnitz_wire::ieee_order_bits_f32(v.to_bits()));
+        acc.seed_from_index(&gnitz_wire::ieee_order_bits_f32(v.to_bits()).to_be_bytes());
         assert_eq!(
             acc.value_bits(),
             v.to_bits() as u64,
@@ -4863,9 +4838,8 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
     let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::SumZero };
     let mut acc = make_acc(&schema, &[0], desc);
 
-    // Fresh: untouched, and renders 0 (Count's identity) rather than NULL (Sum's).
-    assert!(acc.is_untouched(), "fresh SumZero is untouched");
-    assert!(acc.empty_renders_zero(), "an untouched SumZero renders 0, not NULL");
+    // Fresh: renders 0 (Count's identity) rather than NULL (Sum's).
+    assert_eq!(acc.value_bits(), 0, "an untouched SumZero renders 0, not NULL");
 
     // Folds values with weight, exactly like Sum: 5·(+1) + 10·(+1) + 7·(−1) = 8.
     let batch = g_delta(&[(1, 1, 5), (2, 1, 10), (3, -1, 7)]);
@@ -4873,7 +4847,6 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
     for row in 0..batch.count {
         acc.step_from_batch(&mb, row, mb.get_weight(row));
     }
-    assert!(!acc.is_untouched(), "SumZero with input is touched");
     assert_eq!(
         acc.value_bits() as i64,
         8,
@@ -4910,7 +4883,6 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     for row in 0..batch.count {
         accs[0].step_from_batch(&mb, row, mb.get_weight(row));
     }
-    assert!(accs[0].is_untouched(), "all-NULL group leaves CountNonNull untouched");
 
     // Emit the group row. Natural-PK grouping on the U64 PK col: output is
     // [U64 pk, I64 count_non_null, I64 count], no group-exemplar column.
@@ -5445,7 +5417,7 @@ fn reduce_multi_avi_retract_to_all_null() {
     assert_eq!(out3.get_weight(0), -1);
 }
 
-/// `MIN(a), MAX(a)` over the SAME column: two ordinals (opposite `for_max`) in
+/// `MIN(a), MAX(a)` over the SAME column: two ordinals (opposite directions) in
 /// one combined index. The ordinal byte keeps them from colliding.
 #[test]
 fn reduce_multi_avi_same_col_min_max() {
@@ -6690,70 +6662,62 @@ fn avi_skip_global_aggregate() {
 
 #[test]
 fn test_agg_output_type() {
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Count, type_code::I64),
-        type_code::I64
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Sum, type_code::F64),
-        type_code::F64
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Sum, type_code::I32),
-        type_code::I64
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::SumZero, type_code::F32),
-        type_code::F64
-    );
-    // MIN/MAX select an existing row, so they preserve the source type: a float
-    // and every ≤8-byte integer keep their own type (no widening).
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Max, type_code::F32),
-        type_code::F32
-    );
-    assert_eq!(gnitz_wire::agg_output_type(AggFunc::Min, type_code::I8), type_code::I8);
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Max, type_code::I16),
-        type_code::I16
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Min, type_code::I32),
-        type_code::I32
-    );
-    assert_eq!(gnitz_wire::agg_output_type(AggFunc::Max, type_code::U8), type_code::U8);
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Min, type_code::U16),
-        type_code::U16
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Max, type_code::U32),
-        type_code::U32
-    );
-    // U64 folds into the general rule (the source type *is* U64); SUM over a
-    // U64 source is also typed U64 (the i64 accumulator bit pattern is the
-    // correct unsigned sum), so a downstream unsigned compare re-seeds right.
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Min, type_code::U64),
-        type_code::U64
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Max, type_code::U64),
-        type_code::U64
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Sum, type_code::U64),
-        type_code::U64
-    );
-    // A wide source keeps its type: MIN/MAX select one of its rows.
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Max, type_code::STRING),
-        type_code::STRING
-    );
-    assert_eq!(
-        gnitz_wire::agg_output_type(AggFunc::Min, type_code::U128),
-        type_code::U128
-    );
+    use type_code::*;
+    let cases = [
+        (AggFunc::Count, I64, Some(I64)),
+        (AggFunc::Sum, F64, Some(F64)),
+        (AggFunc::Sum, I32, Some(I64)),
+        (AggFunc::SumZero, F32, Some(F64)),
+        // SUM over a U64 source is typed U64: the i64 accumulator's bit pattern
+        // is the correct unsigned sum, so a downstream unsigned compare re-seeds
+        // right.
+        (AggFunc::Sum, U64, Some(U64)),
+        // MIN/MAX select an existing row, so they keep the source type, wide
+        // types included.
+        (AggFunc::Max, F32, Some(F32)),
+        (AggFunc::Min, I8, Some(I8)),
+        (AggFunc::Max, I16, Some(I16)),
+        (AggFunc::Min, I32, Some(I32)),
+        (AggFunc::Max, U8, Some(U8)),
+        (AggFunc::Min, U16, Some(U16)),
+        (AggFunc::Max, U32, Some(U32)),
+        (AggFunc::Min, U64, Some(U64)),
+        (AggFunc::Max, STRING, Some(STRING)),
+        (AggFunc::Min, U128, Some(U128)),
+        // A sum needs a scalar register, and a calendar value does not add.
+        (AggFunc::Sum, STRING, None),
+        (AggFunc::SumZero, U128, None),
+        (AggFunc::Sum, DATE, None),
+        (AggFunc::Sum, TIMESTAMP, None),
+    ];
+    for (f, src, want) in cases {
+        assert_eq!(gnitz_wire::agg_output_type(f, src), want, "{f:?} over {src}");
+    }
+}
+
+/// A partial's merge aggregate keeps the partial's type, so a stored value is
+/// read back at the width it was written.
+#[test]
+fn agg_merge_preserves_output_type() {
+    for f in [
+        AggFunc::Count,
+        AggFunc::CountNonNull,
+        AggFunc::Sum,
+        AggFunc::SumZero,
+        AggFunc::Min,
+        AggFunc::Max,
+    ] {
+        for tc in TypeCode::ALL {
+            let Some(out) = gnitz_wire::agg_output_type(f, tc as u8) else {
+                continue;
+            };
+            assert_eq!(
+                gnitz_wire::agg_output_type(f.merge_func(), out),
+                Some(out),
+                "{f:?} over {tc:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -6940,18 +6904,21 @@ fn agg_over(tc: u8) -> SchemaDescriptor {
     SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0])
 }
 
-/// A summing aggregate adds its argument in a scalar register (`ScalarKind`) —
-/// the ≤8-byte int/float set — so a wide column has no accumulator for it.
-/// Covers the path a hand-built circuit reaches, bypassing the SQL binder.
+/// A hand-built circuit bypasses the SQL binder, and the engine still refuses
+/// a sum over a wide or a calendar column.
 #[test]
 fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
     for agg_op in [AggFunc::Sum, AggFunc::SumZero] {
         let aggs = [AggDescriptor { agg_op, col_idx: 1 }];
-        for tc in [type_code::U128, type_code::STRING] {
+        for tc in [
+            type_code::U128,
+            type_code::STRING,
+            type_code::DATE,
+            type_code::TIMESTAMP,
+        ] {
             assert_eq!(
                 plan_rejection(&agg_over(tc), &[0], &aggs),
-                "reduce: summed column type has no scalar register image",
-                "{agg_op:?} over type code {tc}",
+                format!("reduce: {agg_op:?} is not defined over type code {tc}"),
             );
         }
     }

@@ -206,8 +206,7 @@ fn wide_src_schema() -> SchemaDescriptor {
     )
 }
 
-/// The spec is a trust boundary and the accumulator is not defensive: SUM over
-/// a STRING or a U128 has no scalar register image to add in.
+/// The spec is a trust boundary: SUM over a STRING or a U128 is refused.
 #[test]
 fn fold_rejects_a_sum_with_no_encoding() {
     let src = wide_src_schema();
@@ -216,7 +215,7 @@ fn fold_rejects_a_sum_with_no_encoding() {
         let Err(err) = AdhocFold::new(&src, &spec, 1000) else {
             panic!("SUM over column {col} must be rejected");
         };
-        assert!(err.to_string().contains("no scalar register image"), "{err}");
+        assert!(err.to_string().contains("Sum is not defined over"), "{err}");
     }
 }
 
