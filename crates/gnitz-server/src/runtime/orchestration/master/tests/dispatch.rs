@@ -185,7 +185,7 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
         "the ephemeral round re-validates the derived state at the durable generation"
     );
 
-    disp.boot_checkpoint(1).unwrap();
+    disp.boot_checkpoint().unwrap();
     assert_eq!(
         disp.cat().durable_generation(),
         gen + 1,

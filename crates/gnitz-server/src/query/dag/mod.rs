@@ -5,8 +5,7 @@
 //!
 //! Which relations exist, and the stores behind them, are the `relation` rung's
 //! — a sibling, not a field. Every method here that reaches a relation takes the
-//! registry as a parameter; `CatalogEngine` splits the borrow by destructuring
-//! itself.
+//! registry as a parameter.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -82,19 +81,6 @@ impl DagEngine {
     pub(crate) fn unregister_table(&mut self, registry: &mut RelationRegistry, table_id: i64) {
         registry.unregister(table_id);
         self.invalidate(table_id);
-    }
-
-    /// Empty `view_id`'s output store and drop the plan compiled against it. The
-    /// two halves are one call because the next backfill must recompile against
-    /// the freshly-emptied store, not against the plan still holding the old one.
-    pub(crate) fn reset_view_for_rebuild(
-        &mut self,
-        registry: &mut RelationRegistry,
-        view_id: i64,
-    ) -> Result<(), String> {
-        registry.reset_view(view_id)?;
-        self.invalidate(view_id);
-        Ok(())
     }
 
     /// [`RelationRegistry::swap_schema`] under the RESTRICT check, which

@@ -33,7 +33,7 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
     engine
-        .registry_mut()
+        .registry
         .register(RelationSpec {
             id: tid,
             kind: RelationKind::BaseTable,
@@ -42,14 +42,11 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
             props: ViewProps::default(),
         })
         .unwrap();
-    engine.registry_mut().add_index(tid, tid + 1, &[3], true).unwrap();
+    engine.registry.add_index(tid, tid + 1, &[3], true).unwrap();
     // The registry projects the index itself, from the same `key_spec` and index
     // schema a hand-written projection would use.
-    engine
-        .registry_mut()
-        .ingest(tid, wide_val_batch(&schema, base_rows))
-        .unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.ingest(tid, wide_val_batch(&schema, base_rows)).unwrap();
+    engine.registry.checkpoint_base().unwrap();
 }
 
 // ── index_circuit_for_col existence + uniqueness lookup ────────────────
@@ -65,20 +62,20 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
 
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
     let ic = engine
-        .registry()
+        .registry
         .relation(tid)
         .and_then(|r| r.index_on(&[3]))
         .expect("indexed column must resolve");
     assert!(ic.is_unique(), "col 3 was created UNIQUE");
     // An unindexed column resolves to nothing …
     assert!(
-        engine.registry().relation(tid).and_then(|r| r.index_on(&[0])).is_none(),
+        engine.registry.relation(tid).and_then(|r| r.index_on(&[0])).is_none(),
         "unindexed column has no circuit"
     );
     // … and so does an unknown table.
     assert!(
         engine
-            .registry()
+            .registry
             .relation(tid + 9999)
             .and_then(|r| r.index_on(&[3]))
             .is_none(),
@@ -102,7 +99,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
     let parent_pk = pk24(100, 200, 300);
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
     engine
-        .registry_mut()
+        .registry
         .register(RelationSpec {
             id: parent_tid,
             kind: RelationKind::BaseTable,
@@ -111,8 +108,8 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
             props: ViewProps::default(),
         })
         .unwrap();
-    engine.registry_mut().ingest(parent_tid, pb).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.ingest(parent_tid, pb).unwrap();
+    engine.registry.checkpoint_base().unwrap();
 
     // A point read resolves the committed parent row by full PK bytes.
     let seen = pk_group(&mut engine, parent_tid, &parent_pk);
@@ -138,7 +135,7 @@ fn native_and_byte_point_reads_agree_narrow() {
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for i in 1..=3u64 {
@@ -147,7 +144,7 @@ fn native_and_byte_point_reads_agree_narrow() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.checkpoint_base().unwrap();
 
     // Retract key 2 so it is present-but-dead.
     let mut del = BatchBuilder::new(schema);
@@ -155,7 +152,7 @@ fn native_and_byte_point_reads_agree_narrow() {
     del.put_u64(20);
     del.end_row();
     engine.ingest_to_family(tid, &del.finish()).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.checkpoint_base().unwrap();
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.
     for key in [1u64, 2, 3, 99] {

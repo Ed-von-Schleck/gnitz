@@ -164,7 +164,7 @@ fn peek_rejects_a_blob_past_the_frame() {
 #[test]
 fn peek_rejects_an_unknown_status() {
     let mut buf = encode(&probe_header(), b"");
-    buf[OFF_STATUS..OFF_STATUS + 4].copy_from_slice(&7u32.to_le_bytes());
+    buf[OFF_STATUS..OFF_STATUS + 4].copy_from_slice(&8u32.to_le_bytes());
     assert_eq!(peek_control_block(&buf).err(), Some("control header names no status"));
 }
 

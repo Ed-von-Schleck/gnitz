@@ -93,7 +93,7 @@ fn i64_reply(n_payload: usize) -> SchemaDescriptor {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn scan_spec_sinks_bench() {
     let (mut e, tid) = numeric_fixture("ss_bench", NUMERIC_ROWS);
-    let src = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let src = e.registry.relation(tid).map(Relation::schema).unwrap();
     let n = NUMERIC_ROWS;
     // `c0 < 50` → contiguous 50-row runs; `cf < 1` → single-row ranges.
     let (contiguous, fragmented) = (pred_lt_blob(1, 50), pred_lt_blob(2, 1));
@@ -154,7 +154,7 @@ fn scan_spec_sinks_bench() {
     // walked are one chunk; rating it over the 100 returned rows would report a
     // meaningless ~0.01 M/s.
     let spec = rows_spec(contiguous.clone(), gather3.clone(), vec![], 100);
-    let chunk = e.registry().scan_chunk_rows() as u64;
+    let chunk = e.registry.scan_chunk_rows() as u64;
     cell("rows, LIMIT 100 (early stop, 1 chunk)", chunk, || {
         e.scan_spec(tid, spec.clone(), &reply3).unwrap()
     });

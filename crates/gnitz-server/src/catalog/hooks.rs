@@ -199,8 +199,9 @@ impl CatalogEngine {
         // Stamping the fold is what makes placement transitive:
         // `hook_relation_register` registers this view after its sources, so a view
         // over it reads the answer back off one value.
-        let CatalogEngine { registry, dag, .. } = self;
-        let placement = dag.view_placement(registry, vid, &source_ids, pk.as_slice().len());
+        let placement = self
+            .dag
+            .view_placement(&self.registry, vid, &source_ids, pk.as_slice().len());
         Ok(RelationRegistration {
             kind: RelationKind::View,
             id: vid,
@@ -230,8 +231,7 @@ impl CatalogEngine {
                     build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_indices(), cur.placement())
                         .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
                 if rebuilt != cur {
-                    let CatalogEngine { registry, dag, .. } = self;
-                    dag.swap_schema(registry, owner, rebuilt)?;
+                    self.dag.swap_schema(&mut self.registry, owner, rebuilt)?;
                 }
                 rebuilt
             } else {

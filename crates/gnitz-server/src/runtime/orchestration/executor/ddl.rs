@@ -281,7 +281,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
     // `max_system_lsn` — the zone must dominate every system family's counter
     // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
     // the zone on recovery).
-    let zone_lsn = shared.lsn_alloc.reserve(shared.cat().registry().max_system_lsn());
+    let zone_lsn = shared.lsn_alloc.reserve(shared.cat().registry.max_system_lsn());
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
@@ -317,8 +317,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
             if view_create && !drained_sources && family.topo_priority() >= view_prio {
                 let sources = {
                     let cat = shared.cat();
-                    cat.dag()
-                        .base_tables_reachable_from(cat.registry(), new_view_ids.clone())
+                    cat.dag.base_tables_reachable_from(&cat.registry, new_view_ids.clone())
                 };
                 for src in sources {
                     shared.disp().drain_tick_blocking(src)?;
@@ -467,7 +466,7 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         let zone_lsn = shared.lsn_alloc.reserve(
             shared
                 .cat()
-                .registry()
+                .registry
                 .relation(SysFamily::Sequence.id())
                 .map_or(0, Relation::current_lsn),
         );

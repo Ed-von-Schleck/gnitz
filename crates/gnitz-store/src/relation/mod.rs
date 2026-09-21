@@ -6,7 +6,7 @@
 //! delta store.
 
 use gnitz_foundation::env::env_num;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::key::{key_range_between_cuts, KeyCut, PkBuf};
 use crate::schema::SchemaDescriptor;
@@ -51,6 +51,8 @@ pub struct SecondaryIndex {
     /// `set_index_unique`); consumers filter on the live flag.
     key_spec: crate::schema::IndexKeySpec,
     is_unique: bool,
+    /// Whether `cols` covers the owner's PK, so the index can never collide.
+    covers_pk: bool,
 }
 
 impl SecondaryIndex {
@@ -307,10 +309,7 @@ impl Relation {
     /// The unique secondary indexes a write must still check: one covering the
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {
-        let schema = self.schema();
-        self.indexes
-            .iter()
-            .filter(move |ic| ic.is_unique() && !schema.covers_pk(ic.cols().as_slice()))
+        self.indexes.iter().filter(|ic| ic.is_unique && !ic.covers_pk)
     }
 
     /// What the client is told this relation is.
@@ -480,6 +479,7 @@ pub struct RelationRegistry {
     /// See [`RelationRegistry::set_resume_enabled`]. `false` until a host says
     /// otherwise, so one that never answers rebuilds.
     pub(crate) resume_enabled: bool,
+    pub(crate) non_resumable: FxHashSet<i64>,
 }
 
 impl RelationRegistry {
@@ -497,6 +497,7 @@ impl RelationRegistry {
             children_reconciled: false,
             resume_generation: 0,
             resume_enabled: false,
+            non_resumable: FxHashSet::default(),
         }
     }
 
@@ -558,6 +559,7 @@ impl RelationRegistry {
                 store,
                 key_spec,
                 is_unique,
+                covers_pk: owner_schema.covers_pk(cols),
             });
         Ok(())
     }
@@ -733,6 +735,22 @@ impl RelationRegistry {
     /// what invalidates it.
     pub fn set_resume_enabled(&mut self, enabled: bool) {
         self.resume_enabled = enabled;
+    }
+
+    /// Replace the set of views whose persisted state must not be resumed: their
+    /// stores open empty.
+    pub fn set_non_resumable(&mut self, ids: &[i64]) {
+        self.non_resumable = ids.iter().copied().collect();
+    }
+
+    /// Whether `id` is marked by [`Self::set_non_resumable`] and not yet cleared.
+    pub fn is_non_resumable(&self, id: i64) -> bool {
+        self.non_resumable.contains(&id)
+    }
+
+    /// Every id [`Self::is_non_resumable`] holds for, in no defined order.
+    pub fn non_resumable_ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.non_resumable.iter().copied()
     }
 
     /// The generation a manifest must carry to be resumed from.

@@ -187,7 +187,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
     let old_dir = engine
-        .registry()
+        .registry
         .relation_or_err(old_vid)
         .unwrap()
         .directory()
@@ -207,12 +207,12 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
     let new_dir = engine
-        .registry()
+        .registry
         .relation_or_err(new_vid)
         .unwrap()
         .directory()
         .to_string();
-    assert!(!engine.registry().has_id(old_vid), "the bundle retires the incumbent");
+    assert!(!engine.registry.has_id(old_vid), "the bundle retires the incumbent");
 
     // The pre-flight rejects the replacement's circuit — the bundle fails after
     // VIEW_TAB was applied, exactly where the handler compensates.
@@ -220,17 +220,14 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     engine.reclaim_orphan_dirs();
 
     assert!(
-        engine.registry().has_id(old_vid),
+        engine.registry.has_id(old_vid),
         "the incumbent must be registered again"
     );
     assert!(
         std::path::Path::new(&old_dir).exists(),
         "the incumbent's data directory must survive: {old_dir}"
     );
-    assert!(
-        !engine.registry().has_id(new_vid),
-        "the replacement must be unregistered"
-    );
+    assert!(!engine.registry.has_id(new_vid), "the replacement must be unregistered");
     assert!(
         !std::path::Path::new(&new_dir).exists(),
         "the sweep must reclaim the replacement's directory: {new_dir}"

@@ -16,13 +16,13 @@ use super::*;
 
 use super::scatter::{with_group, with_worker_indices};
 use super::train::drain_index_scan;
-use crate::catalog::FkEdge;
+use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::IndexKeySpec;
 use gnitz_store::storage::MemBatch;
-use gnitz_wire::{WireConflictMode, WireProbeMode};
+use gnitz_wire::{WireConflictMode, WireProbeMode, WireStatus};
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -175,14 +175,46 @@ struct PkFold {
 /// batch's PK region — the families outlive every bundle built over them.
 type Fold<'a> = FxHashMap<&'a [u8], PkFold>;
 
-/// The verb for the RESTRICT rejection on referenced value `v`: how the bundled
-/// parent write removed it. Both removals are a "cannot do this to the row"
-/// rejection, so anything but a surviving row holding a new value reads as a
-/// delete.
-fn restrict_verb(retired: &FxHashMap<u128, RetireVerb>, v: u128) -> &'static str {
-    match retired.get(&v) {
-        Some(RetireVerb::Update) => "update",
-        _ => "delete from",
+/// What a key collided with.
+#[derive(Clone, Copy)]
+enum Clash {
+    /// Another row of the same write.
+    InBatch,
+    /// A committed row.
+    Committed,
+}
+
+/// The PG-style PK-uniqueness rejection for the key `pk_bytes` of `schema`.
+fn pk_violation_err(
+    cat: &CatalogEngine,
+    tid: i64,
+    schema: &SchemaDescriptor,
+    pk_bytes: &[u8],
+    clash: Clash,
+) -> WireFault {
+    let key_str = schema.format_pk_bytes(pk_bytes);
+    let (sn, tn) = cat.qualified_name_or_unknown(tid);
+    let cols = cat.column_names(tid, schema.pk_indices());
+    let what = match clash {
+        Clash::InBatch => format!("Batch contains multiple rows with key ({cols})=({key_str})"),
+        Clash::Committed => format!("Key ({cols})=({key_str}) already exists"),
+    };
+    WireFault {
+        status: WireStatus::IntegrityViolation,
+        text: format!("duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": {what}"),
+    }
+}
+
+/// The rejection of a write colliding on the unique index over `col_indices`.
+fn unique_violation_err(cat: &CatalogEngine, tid: i64, col_indices: &[u32], clash: Clash) -> WireFault {
+    let (name, cols) = (cat.qualified_name(tid), cat.column_names(tid, col_indices));
+    let text = match clash {
+        Clash::InBatch => format!("Unique index violation on '{name}' column '{cols}': duplicate in batch"),
+        Clash::Committed => format!("Unique index violation on '{name}' column '{cols}'"),
+    };
+    WireFault {
+        status: WireStatus::IntegrityViolation,
+        text,
     }
 }
 
@@ -212,16 +244,14 @@ fn delta_key(e: &FkEdge) -> (i64, usize) {
 }
 
 /// One table of the bundle: its families in frame order, its catalog schema,
-/// and its fold.
+/// its constraints, and its fold.
 struct TxnTable<'a> {
     tid: i64,
     schema: SchemaDescriptor,
     /// Indices into the bundle's family list, in frame order.
     family_indices: Vec<usize>,
-    /// `Some` exactly when the table has an Error family or a row constraint —
-    /// the tables the rules read. A plain `INSERT` into a table with neither
-    /// skips the O(rows) walk, and the `Option` is what makes reading a fold
-    /// that was never built a compile-time obligation rather than an empty map.
+    cons: RowConstraints,
+    /// `None` for a table with no Error family and no constraint: no rule reads it.
     fold: Option<Fold<'a>>,
 }
 
@@ -244,8 +274,9 @@ impl<'a> TxnBundle<'a> {
                 Some(t) => t.family_indices.push(fi),
                 None => tables.push(TxnTable {
                     tid: fam.tid,
-                    schema: disp.cat().registry().relation_or_err(fam.tid)?.schema(),
+                    schema: disp.cat().registry.relation_or_err(fam.tid)?.schema(),
                     family_indices: vec![fi],
+                    cons: disp.cat().row_constraints(fam.tid),
                     fold: None,
                 }),
             }
@@ -259,7 +290,7 @@ impl<'a> TxnBundle<'a> {
                 .family_indices
                 .iter()
                 .any(|&fi| matches!(families[fi].mode, WireConflictMode::Error));
-            if !error_mode && !disp.cat().has_row_constraints(t.tid) {
+            if !error_mode && t.cons.is_empty() {
                 continue;
             }
             let (tid, schema) = (t.tid, t.schema);
@@ -271,7 +302,7 @@ impl<'a> TxnBundle<'a> {
                     return Ok(());
                 }
                 if e.dups > 1 {
-                    return Err(disp.cat().pk_violation_err(tid, &schema, pk, true).into());
+                    return Err(pk_violation_err(disp.cat(), tid, &schema, pk, Clash::InBatch));
                 }
                 if e.net > 0 {
                     match e.before {
@@ -504,25 +535,28 @@ impl MasterDispatcher {
         // bursts: nothing consumes a filter until U-SEC's elision test, and a
         // warm one returns before awaiting anything.
         for t in &b.tables {
-            if t.fold.is_some() && b.surviving(t.tid).next().is_some() {
-                self.ensure_unique_filters_warm(t.tid).await?;
+            if !t.cons.uniques.is_empty() && b.surviving(t.tid).next().is_some() {
+                self.ensure_unique_filters_warm(t.tid, &t.cons.uniques).await?;
             }
         }
 
         // Every FK whose child is bundled (F1 checks those rows' values exist),
         // and every FK whose parent is bundled (F2 checks the values it removes
         // are unreferenced).
-        let mut constraints: Vec<FkEdge> = Vec::new();
-        let mut children: Vec<FkEdge> = Vec::new();
-        for t in &b.tables {
-            let cat = self.cat();
-            constraints.extend(cat.fk_constraints_of(t.tid).iter().copied());
-            children.extend(cat.fk_children_of(t.tid).iter().copied());
-        }
+        let constraints: Vec<FkEdge> = b
+            .tables
+            .iter()
+            .flat_map(|t| t.cons.fks_as_child.iter().copied())
+            .collect();
+        let children: Vec<FkEdge> = b
+            .tables
+            .iter()
+            .flat_map(|t| t.cons.fks_as_parent.iter().copied())
+            .collect();
 
         // ── Burst 1 ──────────────────────────────────────────────────────
         let mut checks: Vec<PipelinedCheck> = Vec::new();
-        let pk_tids = plan_pk_checks(self, &b, &mut checks);
+        let pk_tids = plan_pk_checks(&b, &mut checks);
         let n_pk = checks.len();
         let uniq_plans = plan_unique_checks(self, &b, &mut checks)?;
         let n_uniq = checks.len();
@@ -549,7 +583,7 @@ impl MasterDispatcher {
                         && unique_entry_violates(&b, plan, &checks[i], rows.get_pk_bytes(j), &mut hspan)
                     {
                         let cols = plan.col_indices.as_slice();
-                        unique_violation = Some(self.cat().unique_violation_err(plan.tid, cols, false).into());
+                        unique_violation = Some(unique_violation_err(self.cat(), plan.tid, cols, Clash::Committed));
                     }
                 }
             } else {
@@ -585,7 +619,7 @@ impl MasterDispatcher {
 /// The in-batch duplicate rule needs no probe, so the fold fires it — before the
 /// round trip, and before any existence check on the table, which is what makes
 /// "duplicate in batch" win over "already exists" rather than race it.
-fn plan_pk_checks(disp: &MasterDispatcher, b: &TxnBundle<'_>, checks: &mut Vec<PipelinedCheck>) -> Vec<i64> {
+fn plan_pk_checks(b: &TxnBundle<'_>, checks: &mut Vec<PipelinedCheck>) -> Vec<i64> {
     let mut probed: Vec<i64> = Vec::new();
     for t in &b.tables {
         let Some(fold) = t.fold.as_ref() else {
@@ -595,7 +629,7 @@ fn plan_pk_checks(disp: &MasterDispatcher, b: &TxnBundle<'_>, checks: &mut Vec<P
         // decides which have an old referenced value from exactly this answer,
         // and a deleted one retires its referenced value just as an overwritten
         // one does. For Error mode alone only the keys committed state decides.
-        let fk_parent = !disp.cat().fk_children_of(t.tid).is_empty();
+        let fk_parent = !t.cons.fks_as_parent.is_empty();
         let keys: Vec<&[u8]> = fold
             .iter()
             .filter(|(_, e)| fk_parent || e.needs_probe)
@@ -628,7 +662,7 @@ fn pk_verdict(disp: &MasterDispatcher, b: &TxnBundle<'_>) -> Result<(), WireFaul
             .iter()
             .find(|(_, e)| e.exists_in_bundle || (e.needs_probe && e.committed))
         {
-            return Err(disp.cat().pk_violation_err(t.tid, &t.schema, pk, false).into());
+            return Err(pk_violation_err(disp.cat(), t.tid, &t.schema, pk, Clash::Committed));
         }
     }
     Ok(())
@@ -648,21 +682,10 @@ fn plan_unique_checks<'a>(
     let mut plans: Vec<UniquePlan<'a>> = Vec::new();
     for t in &b.tables {
         let tid = t.tid;
-        // Copied out of the catalog in one walk: `disp.cat()` hands out
-        // `&mut CatalogEngine` from `&self`, so the borrow must end before the
-        // dispatcher calls below. It comes first because a table with nothing to
-        // check may have no fold for `surviving` to walk.
-        let uniques: Vec<(PkColList, SchemaDescriptor, IndexKeySpec)> = match disp.cat().registry().relation(tid) {
-            Some(r) => r
-                .unique_indexes_to_check()
-                .map(|ic| (ic.cols(), ic.schema(), ic.key_spec()))
-                .collect(),
-            None => Vec::new(),
-        };
-        if uniques.is_empty() || b.surviving(tid).next().is_none() {
+        if t.cons.uniques.is_empty() || b.surviving(tid).next().is_none() {
             continue;
         }
-        for (col_indices, idx_schema, spec) in uniques {
+        for &(col_indices, idx_schema, spec) in &t.cons.uniques {
             let cols = col_indices.as_slice();
             let stride = idx_schema.pk_stride();
 
@@ -699,7 +722,7 @@ fn plan_unique_checks<'a>(
             // must fire whatever committed state holds, so it stays above the
             // filter elision below.
             if order.windows(2).any(|w| span(w[0]) == span(w[1])) {
-                return Err(disp.cat().unique_violation_err(tid, cols, true).into());
+                return Err(unique_violation_err(disp.cat(), tid, cols, Clash::InBatch));
             }
 
             // Every planned span provably absent ⇒ the probe would answer "none
@@ -782,14 +805,14 @@ fn plan_fk_existence(
         // PK; otherwise probe the parent's UNIQUE index, which the keyspace
         // selector routes by broadcast since index entries are distributed
         // independently of the PK.
-        let parent_schema = disp.cat().registry().relation_or_err(parent_tid)?.schema();
+        let parent_schema = disp.cat().registry.relation_or_err(parent_tid)?.schema();
         let ref_tc = loc.type_code();
         let (key_schema, keyspace) = if parent_schema.is_lone_pk_col(parent_col) {
             (probe_schema(&parent_schema), Keyspace::OwnPk)
         } else {
             let idx_schema = disp
                 .cat()
-                .registry()
+                .registry
                 .relation(parent_tid)
                 .and_then(|r| r.index_on(&[parent_col as u32]))
                 .map(|ic| ic.schema())
@@ -824,10 +847,15 @@ fn fk_existence_verdict(
             if (in_committed && !retired.contains_key(v)) || added.contains(v) {
                 continue;
             }
-            return Err(disp
-                .cat()
-                .fk_missing_err(plan.edge.child_tid, plan.edge.parent_tid)
-                .into());
+            let cat = disp.cat();
+            return Err(WireFault {
+                status: WireStatus::IntegrityViolation,
+                text: format!(
+                    "Foreign Key violation in '{}': value not found in target '{}'",
+                    cat.qualified_name(plan.edge.child_tid),
+                    cat.qualified_name(plan.edge.parent_tid),
+                ),
+            });
         }
     }
     Ok(())
@@ -1023,7 +1051,7 @@ async fn txn_check_fk_restrict(
         }
         let (idx_schema, spec) = disp
             .cat()
-            .registry()
+            .registry
             .relation(child_tid)
             .and_then(|r| r.index_on(&[fk_col as u32]))
             .map(|ic| (ic.schema(), ic.key_spec()))
@@ -1071,11 +1099,20 @@ async fn txn_check_fk_restrict(
             if plan.bundled && b.retires(plan.edge.child_tid, &plan.spec, holder, span, &mut hspan) {
                 continue;
             }
-            let verb = restrict_verb(retired, v);
-            return Err(disp
-                .cat()
-                .fk_restrict_err(plan.edge.parent_tid, plan.edge.child_tid, verb)
-                .into());
+            // Anything but a surviving row holding a new value reads as a delete.
+            let verb = match retired.get(&v) {
+                Some(RetireVerb::Update) => "update",
+                _ => "delete from",
+            };
+            let cat = disp.cat();
+            return Err(WireFault {
+                status: WireStatus::IntegrityViolation,
+                text: format!(
+                    "Foreign Key violation: cannot {verb} '{}', row still referenced by '{}'",
+                    cat.qualified_name(plan.edge.parent_tid),
+                    cat.qualified_name(plan.edge.child_tid),
+                ),
+            });
         }
         Ok(())
     })

@@ -223,7 +223,7 @@ impl MasterDispatcher {
     ) -> Result<Option<UniqueFilter>, WireFault> {
         let (idx_schema, packed) = {
             let cat = self.cat();
-            let Some(owner_schema) = cat.registry().relation(owner_id).map(Relation::schema) else {
+            let Some(owner_schema) = cat.registry.relation(owner_id).map(Relation::schema) else {
                 // Created in this same bundle, so empty: seed it and spare the
                 // first INSERT a warm-up scan.
                 return Ok(Some(UniqueFilter::new()));
@@ -268,7 +268,15 @@ impl MasterDispatcher {
 
         let merged = merge_index_scan(&lease, &frame_schema).await?;
         if merged.duplicate {
-            return Err(self.cat().unique_create_dup_err(owner_id, col_indices).into());
+            let cat = self.cat();
+            return Err(WireFault {
+                status: gnitz_wire::WireStatus::IntegrityViolation,
+                text: format!(
+                    "cannot create unique index on '{}' column '{}': column contains duplicate values",
+                    cat.qualified_name(owner_id),
+                    cat.column_names(owner_id, col_indices),
+                ),
+            });
         }
         Ok(Some(merged.into_seed()))
     }

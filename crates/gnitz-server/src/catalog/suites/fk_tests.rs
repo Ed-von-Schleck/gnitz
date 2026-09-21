@@ -81,7 +81,7 @@ fn test_fk_drop_protections() {
     // The FK column carries a derived circuit, id = its column index.
     let fk_circuit = |engine: &CatalogEngine| {
         engine
-            .registry()
+            .registry
             .relation(child_tid)
             .and_then(|e| e.index_on(&[1]))
             .map(SecondaryIndex::id)
@@ -184,8 +184,8 @@ fn creating_a_child_of_a_parent_the_same_delta_drops_is_refused() {
         .submit(SysFamily::Table, batch)
         .expect_err("a child of a parent this delta drops must be refused");
     assert!(err.contains("which this transaction drops"), "{err}");
-    assert!(engine.registry().has_id(parent_tid));
-    assert!(!engine.registry().has_id(child_tid));
+    assert!(engine.registry.has_id(parent_tid));
+    assert!(!engine.registry.has_id(child_tid));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -443,7 +443,7 @@ fn test_fk_auto_index_skips_non_leading_pk_column() {
     let child_cols = vec![col_def("a", type_code::U64), fk_col("pid_fk"), fk_col("plain_fk")];
     let child_tid = engine.create_table("public.child", &child_cols, &[0, 1]).unwrap();
 
-    let child = engine.registry().relation(child_tid).unwrap();
+    let child = engine.registry.relation(child_tid).unwrap();
     assert!(
         child.index_on(&[1]).is_none(),
         "an FK at a non-leading PK position is covered by the PK region — no circuit",

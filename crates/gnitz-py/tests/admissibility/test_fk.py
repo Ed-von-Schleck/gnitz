@@ -83,7 +83,7 @@ def test_a_reference_lands_only_on_a_live_target(client, schema_name, ddl, seed,
     _seed(client, sn, ddl, seed)
     assert _held(client, sn, seed) == _want(seed)
     table, row = dangling
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+    with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)foreign key"):
         insert(client, sn, table, [row])
     assert _held(client, sn, seed) == _want(seed)
 
@@ -193,7 +193,7 @@ def test_a_statement_lands_only_if_every_reference_survives_its_fold(
     sn = schema_name
     _seed(client, sn, ddl, seed)
     if after is None:
-        with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+        with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)foreign key"):
             client.execute_sql(stmts, schema_name=sn)
         after = seed
     else:
@@ -250,7 +250,7 @@ def test_a_binary_write_lands_only_if_every_reference_survives_its_fold(
             client.delete(tid, schema, payload)
 
     if after is None:
-        with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+        with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)foreign key"):
             run()
         after = seed
     else:
@@ -272,7 +272,7 @@ def test_restrict_over_more_values_than_one_write_carries(client, schema_name):
     seed = {"parent": [(i, i * 7) for i in range(n)], "child": [(i, i) for i in range(n)]}
     _seed(client, sn, _FK_PAIR, seed)
 
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+    with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)foreign key"):
         client.execute_sql(
             "BEGIN; DELETE FROM child WHERE cid <> 777; DELETE FROM parent; COMMIT", schema_name=sn)
     assert _held(client, sn, seed) == _want(seed)
@@ -349,6 +349,6 @@ def test_restrict_survives_dropping_a_unique_index_on_the_fk_column(client, sche
     insert(client, sn, "parent", [(1, 100)])
     insert(client, sn, "child", [(10, 1)])
     client.execute_sql(f"DROP INDEX {sn}__child__idx_pid", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+    with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)foreign key"):
         client.execute_sql("DELETE FROM parent WHERE id = 1", schema_name=sn)
     client.execute_sql("DROP TABLE child; DROP TABLE parent", schema_name=sn)

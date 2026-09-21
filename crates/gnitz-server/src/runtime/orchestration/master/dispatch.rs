@@ -375,9 +375,9 @@ impl MasterDispatcher {
         let sources: Vec<&Batch> = payloads.iter().flatten().filter(|b| !b.is_empty()).collect();
         let num_workers = self.num_workers();
 
-        let (dag, registry) = cat.dag_and_registry_mut();
-        let meta = dag
-            .view_meta(registry, view_id)
+        let meta = cat
+            .dag
+            .view_meta(&cat.registry, view_id)
             .map_err(|e| format!("view {view_id}: {e}"))?;
         // `prepare_relay` turns this `Err` into a cluster abort, taken over
         // scattering under a key the rows were never stored under.
@@ -487,7 +487,7 @@ impl MasterDispatcher {
         ordered.dedup();
         for vid in ordered {
             // Owned: the loop body calls `cat()` again.
-            let sources = self.cat().dag().sources_of(vid).to_vec();
+            let sources = self.cat().dag.sources_of(vid).to_vec();
             for src in sources {
                 self.fan_out_backfill(vid, src).map_err(|e| WireFault {
                     status: e.status,
@@ -558,13 +558,13 @@ impl MasterDispatcher {
     /// gate answer "nothing changed" over a round whose rows are already in flight.
     fn record_delta_round(&self, tid: i64, round: u64) {
         let cat = self.cat();
-        if !cat.registry().any_delta_feed() {
+        if !cat.registry.any_delta_feed() {
             return;
         }
-        let reached = cat.dag().dependent_closure(vec![tid]);
+        let reached = cat.dag.dependent_closure(vec![tid]);
         let mut map = self.last_delta_round.borrow_mut();
         for vid in reached {
-            if cat.registry().relation(vid).is_some_and(Relation::has_delta_feed) {
+            if cat.registry.relation(vid).is_some_and(Relation::has_delta_feed) {
                 map.insert(vid, round);
             }
         }
@@ -707,8 +707,9 @@ impl MasterDispatcher {
     /// Boot-end checkpoint: record the launched topology, then restamp every view
     /// and index at the generation reserved pre-fork. The workers published their
     /// base stores during recovery, and no push is admitted yet.
-    pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), WireFault> {
-        self.cat().record_topology(worker_count)?;
+    pub(crate) fn boot_checkpoint(&self) -> Result<(), WireFault> {
+        let cat = self.cat();
+        cat.record_topology(cat.registry.slot().of)?;
         self.restamp_derived(&[])
     }
 
@@ -717,7 +718,7 @@ impl MasterDispatcher {
     /// writers take, so a miss is broken lock discipline, not a bad client id.
     pub(crate) fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
         self.cat()
-            .registry()
+            .registry
             .relation(target_id)
             .map(Relation::schema)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))

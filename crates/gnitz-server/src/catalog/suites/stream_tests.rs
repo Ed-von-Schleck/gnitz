@@ -15,7 +15,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
     let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
-    let entry = engine.registry().relation_or_err(sid).expect("stream registered");
+    let entry = engine.registry.relation_or_err(sid).expect("stream registered");
     assert_eq!(entry.kind(), RelationKind::Stream);
     // No directory is what says it holds no store: `build_relation_store`
     // creates one for every kind that opens one.
@@ -30,7 +30,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
 
     // The same word with the bit clear is still an ordinary base table with a
     // directory, so the assertions above are about the flag and not the fixture.
-    let base = engine.registry().relation_or_err(tid).expect("table registered");
+    let base = engine.registry.relation_or_err(tid).expect("table registered");
     assert_eq!(base.kind(), RelationKind::BaseTable);
     assert!(std::path::Path::new(base.directory()).exists());
 
@@ -47,7 +47,7 @@ fn a_stream_is_not_a_replayed_base_table() {
     let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
-    let bases = engine.registry().base_table_ids();
+    let bases = engine.registry.base_table_ids();
     assert!(!bases.contains(&sid), "a stream must not enter the map at all");
     assert!(bases.contains(&tid), "the base table beside it still must");
 
@@ -147,13 +147,16 @@ fn stream_fed_views_are_invalid_at_boot() {
     // generation — a completed checkpoint.
     engine.record_topology(1).unwrap();
     engine.bump_checkpoint_generation().unwrap();
-    engine.registry_mut().checkpoint_ephemeral([]).unwrap();
+    engine.registry.checkpoint_ephemeral([]).unwrap();
 
     engine.compute_invalid_views();
-    assert!(engine.view_is_invalid(direct), "a direct stream source invalidates");
-    assert!(engine.view_is_invalid(downstream), "and the verdict cascades");
     assert!(
-        !engine.view_is_invalid(over_table),
+        engine.registry.is_non_resumable(direct),
+        "a direct stream source invalidates"
+    );
+    assert!(engine.registry.is_non_resumable(downstream), "and the verdict cascades");
+    assert!(
+        !engine.registry.is_non_resumable(over_table),
         "a checkpointed view over a base table resumes, so the rejection is about the stream"
     );
 

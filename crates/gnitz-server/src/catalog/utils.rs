@@ -1,3 +1,6 @@
+//! Storage-level reads and retractions over the system tables, and the
+//! pre-flight directory name.
+
 use super::*;
 
 /// `<base_dir>/_relations/_preflight_<vid>` — where the master's CREATE VIEW
@@ -29,6 +32,19 @@ impl CatalogEngine {
         (0..scan.len())
             .filter(|&i| ids.contains(&(payload_u64(&*scan, i, pay) as i64)))
             .map(|i| scan.get_pk(i) as i64)
+            .collect()
+    }
+
+    /// `(index_id, is_unique)` of every live `sys_indices` row on exactly
+    /// `(owner_id, cols)`, read from storage.
+    pub(in crate::catalog) fn indices_on_cols(&self, owner_id: i64, cols: &[u32]) -> Vec<(i64, bool)> {
+        let scan = self.sys_relation(SysFamily::Index).full_scan();
+        (0..scan.len())
+            .filter_map(|i| {
+                // A malformed word matches no column list; the register hook refuses such a row.
+                let (row_owner, row_cols, props) = read_idx_tab_row(&*scan, i).ok()?;
+                (row_owner == owner_id && row_cols.as_slice() == cols).then(|| (scan.get_pk(i) as i64, props.is_unique))
+            })
             .collect()
     }
 

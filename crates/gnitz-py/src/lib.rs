@@ -43,6 +43,8 @@ pyo3::create_exception!(_native, GnitzSalFullError, GnitzError);
 pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
 // A named relation, index or schema the catalog does not hold.
 pyo3::create_exception!(_native, GnitzNotFoundError, GnitzError);
+// WireStatus::IntegrityViolation: a PK, unique-index or foreign-key violation.
+pyo3::create_exception!(_native, GnitzIntegrityError, GnitzError);
 
 /// Wrap any `Display` error as a `GnitzError` PyErr. For the handful of
 /// failures that carry no retryability verdict (handshake, waker setup).
@@ -63,6 +65,7 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
         ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
         ClientError::SalFull(_) => GnitzSalFullError::new_err(e.to_string()),
         ClientError::NotFound { .. } => GnitzNotFoundError::new_err(e.to_string()),
+        ClientError::IntegrityViolation(_) => GnitzIntegrityError::new_err(e.to_string()),
         ClientError::Mirror(MirrorError::Poisoned(_)) => GnitzMirrorPoisonedError::new_err(e.to_string()),
         other => gnitz_err(other),
     }
@@ -150,6 +153,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<GnitzMirrorPoisonedError>(),
     )?;
     m.add("GnitzNotFoundError", m.py().get_type::<GnitzNotFoundError>())?;
+    m.add("GnitzIntegrityError", m.py().get_type::<GnitzIntegrityError>())?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
     // a re-typed copy), as is the table behind `type_codes()`.
     // Only the ids something addresses a relation by are exported.

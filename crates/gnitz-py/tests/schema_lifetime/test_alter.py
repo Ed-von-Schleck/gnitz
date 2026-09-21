@@ -39,7 +39,7 @@ def test_rename_column_keeps_the_index_and_the_fk_bound_to_it(client, schema_nam
 
     # A live reference is accepted and a dangling one refused.
     client.execute_sql("INSERT INTO child2 VALUES (2, 1)", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match="Foreign Key violation"):
+    with pytest.raises(gnitz.GnitzIntegrityError, match="Foreign Key violation"):
         client.execute_sql("INSERT INTO child2 VALUES (3, 999)", schema_name=schema_name)
 
 

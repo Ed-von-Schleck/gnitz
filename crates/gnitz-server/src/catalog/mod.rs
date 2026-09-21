@@ -25,9 +25,9 @@
 
 mod bootstrap;
 mod cache;
+mod constraints;
 mod hooks;
 mod index_backfill;
-mod metadata;
 mod precheck;
 mod registry;
 mod schema_block;
@@ -52,6 +52,7 @@ use gnitz_wire::ViewProps;
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
+pub(crate) use constraints::RowConstraints;
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
@@ -95,15 +96,12 @@ pub(crate) struct CatalogEngine {
     /// Which relations exist, and the stores behind them. A **sibling** of
     /// [`DagEngine`], not a field of it: a mirror drives one with no compiler
     /// and no VM at all, which is what the split exists for.
-    pub(in crate::catalog) registry: RelationRegistry,
-    pub(in crate::catalog) dag: DagEngine,
+    pub(crate) registry: RelationRegistry,
+    pub(crate) dag: DagEngine,
     pub(in crate::catalog) base_dir: String,
 
-    /// The `flock`ed handle on `base_dir`'s lock file, dropped with the engine —
-    /// at process teardown, or by `close` in the crash-semantics tests. Dropping
-    /// it releases the lock, so it is held until then: a second writer would
-    /// reseed `current_lsn` from `max_lsn + 1` and mint shard names the first
-    /// writer is already using.
+    /// The `flock` keeping a second writer off `base_dir`. Declared after
+    /// `registry`, so it is released only once every store is closed.
     _dir_lock: fs::File,
 
     /// Every derived lookup the catalog maintains from system-table deltas and
@@ -113,15 +111,6 @@ pub(crate) struct CatalogEngine {
     /// The next catalog object id (schema, relation or index) `allocate_ids`
     /// hands out. Every applied id-bearing row raises it past its own id.
     pub(in crate::catalog) next_id: i64,
-    /// View ids whose checkpointed state — output stores and operator traces
-    /// alike — was rejected at boot (generation mismatch, topology change, or a
-    /// transitively-invalid source view) and must
-    /// be reset-and-rebuilt rather than resumed. Computed pre-fork by
-    /// `compute_invalid_views`, COW-inherited by every worker, and consumed by
-    /// the master's boot rebuild sweep and the per-worker output reset. Empty on
-    /// a clean same-topology restart (every view resumes).
-    pub(in crate::catalog) invalid_views: rustc_hash::FxHashSet<i64>,
-
     /// The master's applied families in apply order, each queued before its ingest:
     /// the zone's broadcast and the undo log `compensate_stage_a` replays.
     /// `ddl_sync` never enqueues.

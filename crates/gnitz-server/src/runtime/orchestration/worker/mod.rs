@@ -8,12 +8,11 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
-use crate::query::{DagEngine, Drive, ExchangeCallback};
+use crate::query::{Drive, ExchangeCallback};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
@@ -351,7 +350,7 @@ impl WorkerProcess {
         // it — and so a later CREATE INDEX in this process gates its resume on
         // the same value.
         if msg.kind == SalMessageKind::FlushEph {
-            self.cat().registry_mut().set_resume_generation(msg.lsn);
+            self.cat().registry.set_resume_generation(msg.lsn);
         }
         Some((msg, wire))
     }
@@ -500,7 +499,7 @@ impl WorkerProcess {
                         // Raw reborrow: `self.cat()` would borrow all of self and
                         // conflict with the `pending_deltas` field borrow.
                         let cat = unsafe { &*self.catalog };
-                        self.pending_deltas.retain(|tid, _| cat.registry().has_id(*tid));
+                        self.pending_deltas.retain(|tid, _| cat.registry.has_id(*tid));
                         gnitz_debug!("ddl_sync tid={}", target_id);
                     }
                 }
@@ -521,7 +520,7 @@ impl WorkerProcess {
                 let lookup = match gnitz_wire::probe_key_columns(hdr.arg1) {
                     None => HasPkLookup::PrimaryKey,
                     Some(packed) => HasPkLookup::SecondaryIndex {
-                        cols: self.cat().registry().index_cols(target_id, packed, "has_pk")?,
+                        cols: self.cat().registry.index_cols(target_id, packed, "has_pk")?,
                     },
                 };
                 self.handle_has_pk(route, batch, lookup, hdr.flags.probe_mode, hdr.arg0 as usize)
@@ -561,7 +560,7 @@ impl WorkerProcess {
                 // the master's merge expects (send_fault in handle_request).
                 let cols = self
                     .cat()
-                    .registry()
+                    .registry
                     .index_cols(target_id, hdr.arg1, "unique pre-flight")?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
@@ -595,7 +594,7 @@ impl WorkerProcess {
         }
         // A view is the other non-ingestion-point, and the master already
         // rejects one client-facing.
-        let kind = self.cat().registry().relation_or_err(target_id)?.kind();
+        let kind = self.cat().registry.relation_or_err(target_id)?.kind();
         if !kind.is_ingestion_point() {
             return Err(format!(
                 "a Push group named relation {target_id}, which is a {}; \
@@ -605,7 +604,7 @@ impl WorkerProcess {
         }
         // A storage fault leaves an ACKed push unapplied. Only a restart replays
         // it; a fault reply would let the next checkpoint discard it.
-        let effective = match self.cat().registry_mut().ingest_returning(target_id, batch) {
+        let effective = match self.cat().registry.ingest_returning(target_id, batch) {
             Ok(b) => b,
             // An ingest never produces `DeltaExpired`; the or-pattern is what
             // keeps the match total without a third arm.
@@ -629,10 +628,10 @@ impl WorkerProcess {
         let delta = if let Some(d) = self.pending_deltas.remove(&target_id) {
             d
         } else {
-            if !self.cat().registry().has_id(target_id) {
+            if !self.cat().registry.has_id(target_id) {
                 return Ok(());
             }
-            let schema = self.cat().registry().relation_or_err(target_id)?.schema();
+            let schema = self.cat().registry.relation_or_err(target_id)?.schema();
             Batch::empty_with_schema(&schema)
         };
         self.drive_dag(Drive::Tick { source: target_id, round }, delta, false);
@@ -695,27 +694,16 @@ impl WorkerProcess {
     /// double-count. A view backfill runs stop-the-world (the DDL parks the
     /// reactor), so it never yields to live traffic between chunks.
     fn handle_backfill(&mut self, source_tid: i64, view_id: i64) -> Result<(), String> {
-        // Recovery step-4: the FIRST backfill command for an invalid view resets
-        // its output store + operator scratch on THIS worker before any fill,
-        // so the rebuild starts from an empty, well-formed store (the tick sweep
-        // may have polluted its tentatively-loaded state). Gated on the
-        // COW-inherited `invalid_views` set and self-clearing, so a multi-source
-        // join resets once (on its first source) and the remaining sources fill
-        // the just-reset store.
-        if self.cat().view_is_invalid(view_id) {
-            let (dag, registry) = self.cat().dag_and_registry_mut();
-            dag.reset_view_for_rebuild(registry, view_id)?;
-            self.cat().clear_invalid_view(view_id);
-        }
+        self.cat().registry.begin_rebuild(view_id)?;
         // Compiled before the first chunk: a failure here is an error reply, where the
         // same failure inside a chunk's epoch is a fatal abort mid-round.
-        let (dag, registry) = self.cat().dag_and_registry_mut();
-        dag.compile_view(registry, view_id)?;
-        let chunk_rows = self.cat().registry().scan_chunk_rows();
+        let cat = self.cat();
+        cat.dag.compile_view(&cat.registry, view_id)?;
+        let chunk_rows = self.cat().registry.scan_chunk_rows();
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
         // the source has diverged from the catalog.
-        let schema = self.cat().registry().relation_or_err(source_tid)?.schema();
+        let schema = self.cat().registry.relation_or_err(source_tid)?.schema();
         let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
 
         loop {
@@ -735,8 +723,8 @@ impl WorkerProcess {
 
         // A spill fault leaves the view store unbounded, so the process cannot
         // continue; the watchdog turns this into a cluster abort.
-        let (dag, registry) = self.cat().dag_and_registry_mut();
-        if let Err(e) = dag.finish_backfill(registry, view_id) {
+        let cat = self.cat();
+        if let Err(e) = cat.dag.finish_backfill(&mut cat.registry, view_id) {
             gnitz_fatal_abort!(
                 "worker: {} — view state cannot be bounded; aborting for restart+re-derive",
                 e,
@@ -772,7 +760,7 @@ impl WorkerProcess {
         }
         // One resolve for all three — the cursor owns its sources by `Rc`, so it
         // outlives the entry borrow and pins the snapshot the DDL section froze.
-        let e = self.cat().registry().relation_or_err(owner_id)?;
+        let e = self.cat().registry.relation_or_err(owner_id)?;
         let (schema, dir, mut handle) = (e.schema(), e.directory().to_string(), e.cursor());
         // The index circuit is not registered until this pre-flight succeeds, so
         // the key spec is built from the owner schema + column list — the same
@@ -782,7 +770,7 @@ impl WorkerProcess {
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         let stride = spec.key_size();
-        let chunk_rows = self.cat().registry().scan_chunk_rows();
+        let chunk_rows = self.cat().registry.scan_chunk_rows();
 
         // Stream the partition chunk-wise, projecting each row to its span and
         // feeding it to the external sort. Peak RAM is the spill budget, not the
@@ -850,7 +838,7 @@ impl WorkerProcess {
             for i in 0..n {
                 keys.extend_from_slice(batch.get_pk_bytes(i));
             }
-            let result = self.cat().registry().gather_bytes(target_id, keys, ref_col)?;
+            let result = self.cat().registry.gather_bytes(target_id, keys, ref_col)?;
             self.send_scan_response(route, result, None, 0);
             return Ok(());
         }
@@ -861,7 +849,7 @@ impl WorkerProcess {
                     // the index table and the span width.
                     let ic = self
                         .cat()
-                        .registry()
+                        .registry
                         .relation(target_id)
                         .and_then(|r| r.index_on(cols.as_slice()))
                         .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
@@ -908,7 +896,7 @@ impl WorkerProcess {
                 Ok(())
             }
             HasPkLookup::PrimaryKey => {
-                let relation = self.cat().registry().relation(target_id);
+                let relation = self.cat().registry.relation(target_id);
                 // Grown on demand — see the index arm above.
                 let mut result = Batch::empty_with_schema(batch.schema());
                 for i in 0..n {
@@ -935,15 +923,18 @@ impl WorkerProcess {
         // by the next auto-tick or the scan barrier. Live entries drain on the
         // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
         // GC'd in the DdlSync arm (retain(has_id)).
-        Ok(self.cat().registry_mut().checkpoint_base()?)
+        Ok(self.cat().registry.checkpoint_base()?)
     }
 
     /// Run one DAG drive with the exchange context, returning the collective
     /// backfill verdict its rounds carried. `pad` marks this worker's source
     /// partition already drained, which only a backfill chunk sets.
     fn drive_dag(&mut self, what: Drive, delta: Batch, pad: bool) -> Option<BackfillDecision> {
-        let (dag, reg) = self.cat().dag_and_registry_mut();
-        let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
+        let cat = self.catalog;
+        // SAFETY: the exchange wait re-enters the dispatch loop through `ctx`, and
+        // `in_eval` defers `DdlSync`, the one message that (un)registers a
+        // relation, until `drive` returns.
+        let (dag, reg) = unsafe { (&raw mut (*cat).dag, &raw mut (*cat).registry) };
         let mut ctx = DagExchangeCtx { worker: self, pad, verdict: None };
         let res = unsafe { &mut *dag }.drive(unsafe { &mut *reg }, what, delta, &mut ctx);
         let verdict = ctx.verdict;
@@ -972,7 +963,7 @@ impl WorkerProcess {
     /// A graceful stop already ran a full sequence, so the base cut has not
     /// advanced and only the flush runs — which is what lets it still resume.
     fn shutdown(&mut self) -> ! {
-        if self.cat().registry_mut().base_advanced_since_publish() {
+        if self.cat().registry.base_advanced_since_publish() {
             self.cat().unlink_derived_manifests();
         }
         let _ = self.handle_flush_all();

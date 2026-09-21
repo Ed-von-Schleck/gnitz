@@ -30,8 +30,6 @@ _AB_PK = ("CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NUL
 _RAW_COLS = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
              gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 
-# `metadata.rs` is the single source of both messages, so pinning them costs
-# nothing and stops an unrelated failure satisfying a bare `raises`.
 _CREATE_DUP = "contains duplicate values"
 _VIOLATION = "[Uu]nique index violation"
 
@@ -121,7 +119,7 @@ def test_create_over_present_rows_admits_exactly_a_duplicate_free_seed(
     insert(client, sn, "t", seed)
     create = f"CREATE UNIQUE INDEX ON t({cols})"
     if fresh is None:
-        with pytest.raises(gnitz.GnitzError, match=_CREATE_DUP) as exc:
+        with pytest.raises(gnitz.GnitzIntegrityError, match=_CREATE_DUP) as exc:
             client.execute_sql(create, schema_name=sn)
         # The qualified table is what tells the author what to change.
         assert f"{sn}.t" in str(exc.value), exc.value
@@ -132,7 +130,7 @@ def test_create_over_present_rows_admits_exactly_a_duplicate_free_seed(
         client.execute_sql(create, schema_name=sn)
         insert(client, sn, "t", [fresh])
         if claim is not None:
-            with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+            with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
                 insert(client, sn, "t", [claim])
         landed = fresh
     # Every worker still answers, and nothing a verdict refused landed.
@@ -171,7 +169,7 @@ def test_concurrent_inserts_during_create(client, server, schema_name):
         assert not errors, f"streaming inserts errored: {errors}"
 
         # The index enforces a seeded value, and a brand-new one still inserts.
-        with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+        with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
             client.execute_sql("INSERT INTO t VALUES (888888, 1)", schema_name=schema_name)
         client.execute_sql("INSERT INTO t VALUES (888888, 888888)", schema_name=schema_name)
 
@@ -184,14 +182,14 @@ def test_multi_frame_key_train(unique_preflight_frame_server):
     srv.execute_sql(_T, schema_name=sn)
     insert(srv, sn, "t", [(pk, pk * 7) for pk in range(1, 201)])
     srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         insert(srv, sn, "t", [(201, 7)])
     srv.execute_sql("DROP INDEX ix", schema_name=sn)
 
     # One duplicate pair on far-apart PKs: the equal keys are adjacent in the
     # merged stream however the frames are cut.
     insert(srv, sn, "t", [(1000, 700)])
-    with pytest.raises(gnitz.GnitzError, match=_CREATE_DUP):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_CREATE_DUP):
         srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)", schema_name=sn)
     assert not _has_index(srv, sn)
 
@@ -209,7 +207,7 @@ def test_unique_index_over_a_long_text_table_past_one_frame(reply_frame_budget_s
     insert(srv, sn, "t", [(i, i, f"row-{i}-" + "z" * 200) for i in range(n)])
 
     srv.execute_sql("CREATE UNIQUE INDEX ON t(u)", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         srv.execute_sql("INSERT INTO t VALUES (99999, 7, 'dup')", schema_name=sn)
     srv.execute_sql(f"INSERT INTO t VALUES (99999, {n}, 'new')", schema_name=sn)
     assert bag(read_rows(srv, sn, "SELECT pk, u FROM t WHERE u = 17")) == {(17, 17): 1}
@@ -254,13 +252,13 @@ def test_preflight_spill_is_bounded_and_exact(unique_preflight_spill_server):
     # budget → many spilled runs.
     insert(srv, sn, "t", [(i * 7 + 1, i) for i in range(n)])
     srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         insert(srv, sn, "t", [(n * 10, 5)])
     srv.execute_sql("DROP INDEX ix", schema_name=sn)
 
     # Repeats the first row's val on a far-away PK.
     insert(srv, sn, "t", [(n * 10 + 3, 0)])
-    with pytest.raises(gnitz.GnitzError, match=_CREATE_DUP):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_CREATE_DUP):
         srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)", schema_name=sn)
     assert not _has_index(srv, sn)
 
@@ -280,10 +278,10 @@ def test_every_declaration_entry_point_enforces(client, schema_name, ddl):
     client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=schema_name)
     # A second holder is refused whichever partition it would land on.
     for pk in (2, 1000000):
-        with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+        with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
             client.execute_sql(f"INSERT INTO t VALUES ({pk}, 42)", schema_name=schema_name)
     # And so is a pair colliding inside one statement.
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql("INSERT INTO t VALUES (3, 7), (4, 7)", schema_name=schema_name)
 
 
@@ -320,7 +318,7 @@ def test_a_claim_is_admitted_only_if_it_ends_up_held_once(client, indexed, stmt,
     committed = [(1, 42), (2, 99)]
     insert(client, indexed, "t", committed)
     if final is None:
-        with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+        with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
             client.execute_sql(stmt, schema_name=indexed)
         final = committed
     else:
@@ -333,9 +331,9 @@ def test_two_indices_on_one_table_are_both_enforced(client, schema_name):
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "CREATE UNIQUE INDEX ON t(a); CREATE UNIQUE INDEX ON t(b)", schema_name=schema_name)
     client.execute_sql("INSERT INTO t VALUES (1, 10, 20), (2, 11, 21)", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql("INSERT INTO t VALUES (3, 10, 22)", schema_name=schema_name)
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql("INSERT INTO t VALUES (4, 12, 20)", schema_name=schema_name)
 
 
@@ -351,7 +349,7 @@ def test_anticorrelated_multi_source_index_merge(client, indexed):
         client.execute_sql(f"INSERT INTO t VALUES ({i + 1}, {val})", schema_name=indexed)
     # Including the smallest values, which a u128 merge would mask.
     for j, val in enumerate(vals):
-        with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+        with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
             client.execute_sql(f"INSERT INTO t VALUES ({1000 + j}, {val})", schema_name=indexed)
 
 
@@ -416,7 +414,7 @@ def test_a_write_is_validated_against_its_fold(client, schema_name, via, committ
                     txn.push(tid, b)
 
     if final is None:
-        with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+        with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
             run()
         final = committed
     else:
@@ -433,7 +431,7 @@ def test_bulk_colliding_fresh_pks_rejected(client, schema_name):
     n = 2000
     committed = [(i, i) for i in range(n)]
     client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": p, "val": v} for p, v in committed]))
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": n + i, "val": i} for i in range(n)]))
     assert bag(client.scan(tid)) == dict.fromkeys(committed, 1)
 
@@ -469,9 +467,9 @@ def test_a_wide_pk_behind_the_index_is_compared_whole(client, schema_name):
         " c BIGINT UNSIGNED NOT NULL, val BIGINT UNSIGNED NOT NULL, PRIMARY KEY (a, b, c)); "
         "CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
     insert(client, sn, "t", [(7, 7, 100, 10), (7, 7, 200, 42)])
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql("INSERT INTO t VALUES (2, 2, 2, 42)", schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql("UPDATE t SET val = 42 WHERE a = 7 AND b = 7 AND c = 100", schema_name=sn)
     client.execute_sql("UPDATE t SET val = 10 WHERE a = 7 AND b = 7 AND c = 100", schema_name=sn)
     assert bag(scanned(client, sn, "t")) == {(7, 7, 100, 10): 1, (7, 7, 200, 42): 1}
@@ -529,7 +527,7 @@ def test_the_constraint_holds_under_the_same_null_flood(client, schema_name):
     _holder_table(client, sn, "BIGINT UNSIGNED")
     committed = [(_HOLDER_PK, 0), (other, 77)] + _NULLS
     insert(client, sn, "t", committed)
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql(f"INSERT INTO t VALUES ({other}, 88), ({fresh}, 0)" + _UPSERT_A, schema_name=sn)
     assert bag(scanned(client, sn, "t")) == dict.fromkeys(committed, 1)
 
@@ -548,7 +546,7 @@ def test_a_value_moved_across_the_drop_index_window(client, schema_name):
 
     _, schema = client.resolve_table(sn, "t")
     assert bag(client.seek_by_index(tid, schema, [1], [7])) == {(moved, 7): 1}
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql(f"INSERT INTO t VALUES ({other}, 88), ({fresh}, 7)" + _UPSERT_A, schema_name=sn)
     assert bag(scanned(client, sn, "t")) == {(moved, 7): 1, (other, 77): 1}
 
@@ -561,7 +559,7 @@ def test_composite_unique_holder_split(client, schema_name):
         "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL); "
         "CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
     insert(client, sn, "t", [(1, 1, 1), (2, 2, 2)])
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql(
             f"INSERT INTO t VALUES (2, 3, 3), ({_HOLDER_PK}, 1, 1)"
             " ON CONFLICT (pk) DO UPDATE SET a = EXCLUDED.a, b = EXCLUDED.b", schema_name=sn)
@@ -581,7 +579,7 @@ def test_replicated_owner_holder_is_deduped_and_decisive(client, schema_name):
     insert(client, sn, "t", [(1, 42), (2, 77)])
 
     # pk=1 keeps 42 → the fresh claim collides.
-    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+    with pytest.raises(gnitz.GnitzIntegrityError, match=_VIOLATION):
         client.execute_sql(f"INSERT INTO t VALUES (2, 88), ({_HOLDER_PK}, 42)" + _UPSERT_A, schema_name=sn)
     assert bag(scanned(client, sn, "t")) == {(1, 42): 1, (2, 77): 1}
 

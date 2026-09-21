@@ -830,7 +830,7 @@ fn a_reader_held_reply_carries_no_block_at_version_0() {
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tproj", &cols, &[0])
         .unwrap();
-    let table_schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let table_schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let projected = gnitz_store::schema::project_schema(&table_schema, &[1]).unwrap();
 
     let (region, writer) = ring_and_writer();

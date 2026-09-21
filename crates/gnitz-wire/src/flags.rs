@@ -223,6 +223,9 @@ wire_enum! {
         SalFull = 5,
         /// The named relation does not exist.
         NotFound = 6,
+        /// The write would break a PK, unique-index or foreign-key constraint.
+        /// Nothing was written.
+        IntegrityViolation = 7,
     }
 }
 

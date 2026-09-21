@@ -90,13 +90,13 @@ fn gc_reclaims_orphan_table_dir() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(10);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.checkpoint_base().unwrap();
     let live_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
     assert!(Path::new(&live_dir).exists());
 
@@ -190,13 +190,13 @@ fn gc_leaves_live_entities_untouched() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let t1 = engine.create_table("public.flushed", &cols, &[0]).unwrap();
-    let schema = engine.registry().relation(t1).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(t1).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(7);
     bb.end_row();
     engine.ingest_to_family(t1, &bb.finish()).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.checkpoint_base().unwrap();
     let i1 = engine.create_index("public.flushed", &["val"], false).unwrap();
 
     let t2 = engine.create_table("public.empty", &cols, &[0]).unwrap();
@@ -269,14 +269,14 @@ fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i6
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
 
-    let rel_dir = engine.registry().relation_or_err(rt).unwrap().directory().to_string();
-    let mut bb = BatchBuilder::new(engine.registry().relation(rt).map(Relation::schema).unwrap());
+    let rel_dir = engine.registry.relation_or_err(rt).unwrap().directory().to_string();
+    let mut bb = BatchBuilder::new(engine.registry.relation(rt).map(Relation::schema).unwrap());
     bb.begin_row(1u128, 1);
     bb.put_int(7);
     bb.end_row();
     engine.ingest_to_family(rt, &bb.finish()).unwrap();
     if flush {
-        engine.registry_mut().checkpoint_base().unwrap();
+        engine.registry.checkpoint_base().unwrap();
     }
     (rt, rel_dir)
 }
@@ -405,7 +405,7 @@ fn retired_children_are_reclaimed() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
     engine.close();
 
     // A set laid out for another count, and a scratch dir from a rank that no
@@ -449,7 +449,7 @@ fn replicated_table_is_relinked_at_a_new_worker_count() {
     let dir = temp_dir("repartition_replicated");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let (rt, rel) = replicated_table_with_a_shard(&mut engine, true);
-    let schema = engine.registry().relation(rt).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(rt).map(Relation::schema).unwrap();
     let source_files = file_names(&child_path(&rel, 0, 1));
     assert!(source_files.contains(&"manifest.bin".to_string()));
     engine.close();
@@ -489,8 +489,8 @@ fn keyed_table_round_trips_across_worker_counts() {
 
         let mut engine = CatalogEngine::open(&dir, w_old).unwrap();
         let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-        let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+        let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+        let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..N).map(|id| (id, id as i64 * 10)).collect();
@@ -526,8 +526,8 @@ fn repartition_handles_a_relation_with_empty_children() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     // CLUSTER BY (a): every row shares `a = 1`, so all of them hash alike.
     let tid = create_flagged_table(&mut engine, "cb", &cols, &[0, 1], clustered_flags(1));
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     // `opk_key` reads the packed native value in PK-list order, so PK column 0
@@ -564,8 +564,8 @@ fn two_complete_sets_left_by_a_crash_relay_either() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
@@ -596,8 +596,8 @@ fn a_partial_target_is_cleared_rather_than_merged() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
@@ -626,8 +626,8 @@ fn a_torn_set_at_the_launched_count_is_not_a_relayout() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..60u128).map(|id| (id, id as i64)).collect();
@@ -655,7 +655,7 @@ fn repartition_refuses_an_unreadable_child_grammar() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
     engine.close();
 
     fabricate_dir(&format!("{rel}/part_7"), "manifest.bin");
@@ -675,8 +675,8 @@ fn a_torn_foreign_set_moves_nothing() {
         let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
         let mut engine = CatalogEngine::open(&dir, 4).unwrap();
         let tid = create_flagged_table(&mut engine, "t", &cols, &[0], flags);
-        let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+        let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+        let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
@@ -710,8 +710,8 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
-    let rel = engine.registry().relation_or_err(rt).unwrap().directory().to_string();
-    let schema = engine.registry().relation(rt).map(Relation::schema).unwrap();
+    let rel = engine.registry.relation_or_err(rt).unwrap().directory().to_string();
+    let schema = engine.registry.relation(rt).map(Relation::schema).unwrap();
     engine.close();
 
     // A 2-set relayed to 4.
@@ -747,8 +747,8 @@ fn repartition_is_not_run_on_an_unchanged_restart() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let rel = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     seed_set(

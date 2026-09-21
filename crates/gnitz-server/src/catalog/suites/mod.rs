@@ -30,7 +30,7 @@ use std::fs;
 /// Every live row of `opk`'s PK group, read as a one-key `PkSet`.
 fn pk_group(engine: &mut CatalogEngine, tid: i64, opk: &[u8]) -> std::rc::Rc<gnitz_store::storage::Batch> {
     let schema = engine
-        .registry()
+        .registry
         .relation(tid)
         .map(gnitz_store::relation::Relation::schema)
         .expect("a registered relation");
@@ -42,7 +42,7 @@ fn pk_group(engine: &mut CatalogEngine, tid: i64, opk: &[u8]) -> std::rc::Rc<gni
 /// [`pk_group`] by a narrow native key.
 fn pk_group_native(engine: &mut CatalogEngine, tid: i64, key: u128) -> std::rc::Rc<gnitz_store::storage::Batch> {
     let schema = engine
-        .registry()
+        .registry
         .relation(tid)
         .map(gnitz_store::relation::Relation::schema)
         .expect("a registered relation");
@@ -202,7 +202,7 @@ fn ingest_fixture(
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
     let (mut engine, tid, _dir) = table_fixture(name, cols);
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     for round in 0..rounds {
         let mut bb = BatchBuilder::new(schema);
         let mut id = round;

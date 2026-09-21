@@ -134,7 +134,7 @@ impl MasterDispatcher {
     /// `table_id`. A filter that is not yet warm is ingested into too, so a span
     /// committed during a warm-up window is not lost.
     pub(crate) fn unique_filter_ingest_batch(&self, table_id: i64, batch: &Batch) {
-        let Some(relation) = self.cat().registry().relation(table_id) else {
+        let Some(relation) = self.cat().registry.relation(table_id) else {
             return;
         };
         let mb = batch.as_mem_batch();
@@ -164,19 +164,20 @@ impl MasterDispatcher {
         self.unique_filters.borrow_mut().insert((table_id, cols), filter);
     }
 
-    /// Warm every not-yet-warm unique filter on `table_id` from a scan of the
-    /// table, one reply frame at a time.
-    pub(super) async fn ensure_unique_filters_warm(&self, table_id: i64) -> Result<(), WireFault> {
+    /// Warm every not-yet-warm filter of `uniques`, the unique indexes a write
+    /// to `table_id` checks, from a scan of the table, one reply frame at a time.
+    pub(super) async fn ensure_unique_filters_warm(
+        &self,
+        table_id: i64,
+        uniques: &[(PkColList, SchemaDescriptor, IndexKeySpec)],
+    ) -> Result<(), WireFault> {
         let missing: Vec<(PkColList, IndexKeySpec)> = {
             let mut filters = self.unique_filters.borrow_mut();
-            let missing: Vec<(PkColList, IndexKeySpec)> = match self.cat().registry().relation(table_id) {
-                Some(r) => r
-                    .unique_indexes_to_check()
-                    .filter(|ic| !filters.get(&(table_id, ic.cols())).is_some_and(UniqueFilter::is_warm))
-                    .map(|ic| (ic.cols(), ic.key_spec()))
-                    .collect(),
-                None => Vec::new(),
-            };
+            let missing: Vec<(PkColList, IndexKeySpec)> = uniques
+                .iter()
+                .filter(|(cols, ..)| !filters.get(&(table_id, *cols)).is_some_and(UniqueFilter::is_warm))
+                .map(|&(cols, _, spec)| (cols, spec))
+                .collect();
             for &(cols, _) in &missing {
                 filters.entry((table_id, cols)).or_insert_with(UniqueFilter::new);
             }
@@ -187,7 +188,7 @@ impl MasterDispatcher {
         }
         let schema = self.schema_desc_for(table_id);
         // The reader holds the table's current schema, so no worker ships a block.
-        let schema_version = self.cat().get_schema_version(table_id);
+        let schema_version = self.cat().schema_version_of(table_id);
 
         let lease = self
             .scan(DirectGroup {

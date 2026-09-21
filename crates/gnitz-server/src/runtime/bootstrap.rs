@@ -50,7 +50,7 @@ fn decode_group_slot(msg: &SalMessage, w: u32, data: &[u8]) -> Result<ipc::Decod
 
 /// Master pre-fork replay of every committed DdlSync group.
 fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut CatalogEngine) -> Result<(), String> {
-    let family_lsns = catalog.registry().system_flushed_lsns();
+    let family_lsns = catalog.registry.system_flushed_lsns();
     let tail = CommittedTail::open(log, epoch, SalMessageKind::DdlSync, &family_lsns)?;
 
     let mut replayed: u32 = 0;
@@ -99,14 +99,12 @@ fn inject_recovery_panic(stage: &str) {
 /// the boot checkpoint publishes traces only for compiled views.
 fn swept_base_tables(catalog: &CatalogEngine) -> Vec<i64> {
     let keeps_state: Vec<i64> = catalog
-        .registry()
+        .registry
         .view_ids()
         .into_iter()
-        .filter(|&vid| !catalog.view_is_invalid(vid))
+        .filter(|&vid| !catalog.registry.is_non_resumable(vid))
         .collect();
-    catalog
-        .dag()
-        .base_tables_reachable_from(catalog.registry(), keeps_state)
+    catalog.dag.base_tables_reachable_from(&catalog.registry, keeps_state)
 }
 
 /// Which of a group's slots `slot` replays, and whether what it reads is still
@@ -141,7 +139,7 @@ fn recover_from_sal(
     // Floor 0: `enforce_unique_pk` makes re-applying a group the shards already
     // hold a no-op.
     let family_lsns: HashMap<i64, u64> = catalog
-        .registry()
+        .registry
         .base_table_ids()
         .into_iter()
         .map(|id| (id, 0))
@@ -161,7 +159,7 @@ fn recover_from_sal(
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
         // this holds no borrow on `catalog` across the `&mut` ingest.
         let schema = catalog
-            .registry()
+            .registry
             .relation(tid)
             .map(Relation::schema)
             .ok_or_else(|| format!("SAL replay: no schema for table_id={tid} (lsn={})", msg.lsn))?;
@@ -196,7 +194,7 @@ fn recover_from_sal(
             if owned.is_empty() {
                 continue;
             }
-            let effective = catalog.registry_mut().ingest_returning(tid, owned).map_err(|e| {
+            let effective = catalog.registry.ingest_returning(tid, owned).map_err(|e| {
                 format!(
                     "SAL replay apply failed (table_id={}, lsn={}): {e}",
                     msg.target_id, msg.lsn
@@ -240,11 +238,11 @@ fn worker_boot_recovery(
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
-        catalog.durable_generation() > catalog.registry().resume_generation(),
+        catalog.durable_generation() > catalog.registry.resume_generation(),
         "boot base flush without the pre-fork generation advance ahead of it",
     );
     catalog
-        .registry_mut()
+        .registry
         .checkpoint_base()
         .map_err(|e| format!("boot flush failed: {e}"))?;
     if BOOT_FLUSH_ERROR.armed() {
@@ -441,7 +439,7 @@ fn master_pre_fork_recovery(
     // Relay each base table onto this boot's worker count and drop the children
     // it no longer owns, before any worker opens a store.
     catalog
-        .registry_mut()
+        .registry
         .reconcile_child_dirs()
         .map_err(|e| format!("child-dir sweep failed: {e}"))?;
 
@@ -449,7 +447,7 @@ fn master_pre_fork_recovery(
     // workers that do not exist yet.
     catalog.compute_invalid_views();
 
-    let lsn_seed = catalog.registry().max_system_lsn();
+    let lsn_seed = catalog.registry.max_system_lsn();
     Ok((swept_base_tables(catalog), lsn_seed))
 }
 
@@ -485,12 +483,7 @@ fn fork_workers(
 
 /// The master's half of recovery once the workers are alive, ending in the
 /// checkpoint a clean restart resumes from.
-fn master_post_fork_recovery(
-    disp: &MasterDispatcher,
-    walk_epoch: u32,
-    num_workers: u32,
-    swept_bases: &[i64],
-) -> Result<(), String> {
+fn master_post_fork_recovery(disp: &MasterDispatcher, walk_epoch: u32, swept_bases: &[i64]) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
     // Before any drain: a drain drops frames no lease routes.
     let ready = disp.reactor().lease_acks(1, WorkerSet::ALL);
@@ -519,10 +512,9 @@ fn master_post_fork_recovery(
 
     inject_recovery_panic("sweep");
 
-    // Rebuild only the views the boot verdict rejected, through the driver a live
-    // CREATE VIEW uses. Each was resumed from stale shards at open, so its
-    // rebuild starts by emptying the output store it loaded them into.
-    let invalid: Vec<i64> = disp.cat().invalid_views().collect();
+    // Rebuild the views the boot verdict rejected, through the driver a live
+    // CREATE VIEW uses; they opened empty and the sweep above skipped them.
+    let invalid: Vec<i64> = disp.cat().registry.non_resumable_ids().collect();
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
@@ -534,7 +526,7 @@ fn master_post_fork_recovery(
     // A full checkpoint before the socket opens, so a clean restart resumes from
     // it. No drain — recovery already drained everything and no pushes are
     // admitted yet.
-    disp.boot_checkpoint(num_workers)
+    disp.boot_checkpoint()
         .map_err(|e| format!("boot checkpoint failed: {e}"))?;
     Ok(())
 }
@@ -606,7 +598,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
         reactor,
     ));
 
-    master_post_fork_recovery(&dispatcher, walk_epoch, num_workers, &swept_bases)?;
+    master_post_fork_recovery(&dispatcher, walk_epoch, &swept_bases)?;
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);
@@ -630,7 +622,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     };
     gnitz_note!("GnitzDB ready");
 
-    Ok(ServerExecutor::run(dispatcher, server_fd, tls_init, lsn_seed))
+    Ok(ServerExecutor::run(dispatcher, data_dir, server_fd, tls_init, lsn_seed))
 }
 
 #[cfg(test)]

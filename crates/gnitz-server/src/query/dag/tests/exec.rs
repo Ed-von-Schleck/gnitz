@@ -42,7 +42,7 @@ fn engine_with_fanout(name: &str) -> (CatalogEngine, i64, i64, i64, i64) {
 /// `(pk, weight, payload)` rows in `tid`'s own registered schema.
 fn delta_for(engine: &CatalogEngine, tid: i64, rows: &[(u64, i64, i64)]) -> Batch {
     let schema = engine
-        .registry()
+        .registry
         .relation(tid)
         .map(Relation::schema)
         .expect("a registered relation");
@@ -53,7 +53,7 @@ fn delta_for(engine: &CatalogEngine, tid: i64, rows: &[(u64, i64, i64)]) -> Batc
 fn live_weight(engine: &CatalogEngine, tid: i64) -> i64 {
     sum_weights(
         engine
-            .registry()
+            .registry
             .relation(tid)
             .map(|r| r.cursor())
             .expect("an owned store"),
@@ -70,18 +70,21 @@ fn the_schedule_names_every_edge_of_the_closure_in_id_order() {
     let (engine, base, a, b, deep) = engine_with_fanout("schedule");
     let step = |view, producer| Step { view, producer };
 
-    let dag = engine.dag();
+    let (dag, registry) = (&engine.dag, &engine.registry);
     assert_eq!(
-        dag.tick_schedule(base),
+        dag.tick_schedule(registry, base),
         vec![step(a, base), step(b, base), step(deep, a)],
         "every edge of the closure, producers first",
     );
     assert_eq!(
-        dag.tick_schedule(a),
+        dag.tick_schedule(registry, a),
         vec![step(deep, a)],
         "a tick of an intermediate view runs only what it reaches",
     );
-    assert!(dag.tick_schedule(deep).is_empty(), "a terminal view reaches nothing");
+    assert!(
+        dag.tick_schedule(registry, deep).is_empty(),
+        "a terminal view reaches nothing"
+    );
 }
 
 // ── The drivers ─────────────────────────────────────────────────────────────
@@ -94,8 +97,14 @@ fn a_tick_drives_the_whole_closure() {
     let (mut engine, base, a, b, deep) = engine_with_fanout("evaluate");
 
     let delta = delta_for(&engine, base, &[(1, 1, 10), (2, 1, 20)]);
-    let (dag, registry) = engine.dag_and_registry_mut();
-    dag.drive(registry, Drive::Tick { source: base, round: 1 }, delta, &mut NoExchange)
+    engine
+        .dag
+        .drive(
+            &mut engine.registry,
+            Drive::Tick { source: base, round: 1 },
+            delta,
+            &mut NoExchange,
+        )
         .unwrap();
 
     assert_eq!(live_weight(&engine, a), 2);
@@ -115,10 +124,16 @@ fn an_empty_tick_produces_nothing() {
     let (mut engine, base) = engine_with_base("empty_tick");
     let a = register_identity_view(&mut engine, base, "va", &view_cols());
 
-    let schema = engine.registry().relation(base).map(Relation::schema).unwrap();
-    let (dag, registry) = engine.dag_and_registry_mut();
+    let schema = engine.registry.relation(base).map(Relation::schema).unwrap();
     let tick = Drive::Tick { source: base, round: 1 };
-    dag.drive(registry, tick, Batch::empty_with_schema(&schema), &mut NoExchange)
+    engine
+        .dag
+        .drive(
+            &mut engine.registry,
+            tick,
+            Batch::empty_with_schema(&schema),
+            &mut NoExchange,
+        )
         .unwrap();
 
     assert_eq!(live_weight(&engine, a), 0);
@@ -141,8 +156,14 @@ fn a_two_producer_view_feeds_its_reader_the_union() {
     let d = register_identity_view(&mut engine, u, "vd", &cols);
 
     let delta = delta_for(&engine, base, &[(1, 1, 10), (2, 1, 20)]);
-    let (dag, registry) = engine.dag_and_registry_mut();
-    dag.drive(registry, Drive::Tick { source: base, round: 1 }, delta, &mut NoExchange)
+    engine
+        .dag
+        .drive(
+            &mut engine.registry,
+            Drive::Tick { source: base, round: 1 },
+            delta,
+            &mut NoExchange,
+        )
         .unwrap();
 
     assert_eq!(live_weight(&engine, u), 4, "both producers' epochs land");
@@ -160,8 +181,10 @@ fn backfill_chunk_runs_only_the_named_view() {
     let backfill = |view| Drive::Backfill { view, source: base };
 
     let chunk = delta_for(&engine, base, &[(1, 1, 10)]);
-    let (dag, registry) = engine.dag_and_registry_mut();
-    dag.drive(registry, backfill(a), chunk, &mut NoExchange).unwrap();
+    engine
+        .dag
+        .drive(&mut engine.registry, backfill(a), chunk, &mut NoExchange)
+        .unwrap();
     assert_eq!(live_weight(&engine, a), 1);
     assert_eq!(
         live_weight(&engine, b),
@@ -169,15 +192,19 @@ fn backfill_chunk_runs_only_the_named_view() {
         "the source's other dependents are untouched"
     );
 
-    let empty = Batch::empty_with_schema(&engine.registry().relation(base).map(Relation::schema).unwrap());
-    let (dag, registry) = engine.dag_and_registry_mut();
-    dag.drive(registry, backfill(a), empty, &mut NoExchange).unwrap();
+    let empty = Batch::empty_with_schema(&engine.registry.relation(base).map(Relation::schema).unwrap());
+    engine
+        .dag
+        .drive(&mut engine.registry, backfill(a), empty, &mut NoExchange)
+        .unwrap();
     assert_eq!(live_weight(&engine, a), 1, "a chunk with no rows adds none");
 
     // A view the registry no longer holds is a fail-stop, not a silent skip.
-    let (dag, registry) = engine.dag_and_registry_mut();
-    let empty = Batch::empty_with_schema(&registry.relation(base).map(Relation::schema).unwrap());
-    assert!(dag.drive(registry, backfill(999_999), empty, &mut NoExchange).is_err());
+    let empty = Batch::empty_with_schema(&engine.registry.relation(base).map(Relation::schema).unwrap());
+    assert!(engine
+        .dag
+        .drive(&mut engine.registry, backfill(999_999), empty, &mut NoExchange)
+        .is_err());
 }
 
 // ── The relay's single-sourcing ─────────────────────────────────────────────
@@ -214,13 +241,13 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
         );
         engine.submit(crate::catalog::SysFamily::Table, bb.finish()).unwrap();
         let keyed = engine.create_table("public.kt", &cols, &[0]).unwrap();
-        engine.registry_mut().reconcile_child_dirs().unwrap();
+        engine.registry.reconcile_child_dirs().unwrap();
         engine
             .open_stores(rank, gnitz_store::relation::Residency::Worker)
             .unwrap();
 
         let delta = delta_for(&engine, replicated, &[(1, 1, 10), (2, 1, 20)]);
-        let registry = engine.registry();
+        let registry = &engine.registry;
         let mut sent = Recorder(Vec::new());
         // One relay per source: muting is bound at construction.
         Relay::new(&mut sent, registry, 99, replicated, false).send(delta.clone_batch(), replicated, true);

@@ -17,7 +17,6 @@ impl CatalogEngine {
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
             next_id: FIRST_ALLOCATED_ID,
-            invalid_views: rustc_hash::FxHashSet::default(),
             pending_broadcasts: Vec::new(),
         };
 

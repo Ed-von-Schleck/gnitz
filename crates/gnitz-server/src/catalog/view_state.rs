@@ -1,7 +1,7 @@
 //! What the catalog owns above the registry because it needs both rungs: the
 //! boot resume verdict, the source cursor a circuit backfill drives, and the read
 //! wrappers that add what a caller cannot — the hydrator, or a delta read's expiry
-//! status. Every other registry name is spelled `registry()` at its site.
+//! status.
 
 use super::*;
 use gnitz_store::storage::SourceCursor;
@@ -13,8 +13,7 @@ impl CatalogEngine {
     /// [`RelationRegistry::scan`] with this engine's own circuit layer as
     /// the hydrator.
     pub(crate) fn scan(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
-        let (dag, registry) = self.dag_and_registry_mut();
-        Ok(registry.scan(table_id, Some(dag))?)
+        Ok(self.registry.scan(table_id, Some(&mut self.dag))?)
     }
 
     /// [`RelationRegistry::scan_spec`], hydrating.
@@ -24,9 +23,8 @@ impl CatalogEngine {
         spec: ReadSpec,
         reply_schema: &SchemaDescriptor,
     ) -> Result<Rc<Batch>, WireFault> {
-        let (dag, registry) = self.dag_and_registry_mut();
-        registry
-            .scan_spec(target_id, spec, reply_schema, Some(dag))
+        self.registry
+            .scan_spec(target_id, spec, reply_schema, Some(&mut self.dag))
             .map_err(|e| WireFault::from(e.to_string()))
     }
 
@@ -51,9 +49,8 @@ impl CatalogEngine {
             })
     }
 
-    /// Compute the set of view ids whose checkpointed state — output stores and
-    /// operator traces alike — must be rejected at boot and rebuilt, rather than
-    /// resumed from its manifests.
+    /// Mark non-resumable every view whose checkpointed state — output stores
+    /// and operator traces alike — must be rebuilt rather than resumed.
     ///
     /// A view is **valid** (resumed) iff:
     ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
@@ -79,7 +76,7 @@ impl CatalogEngine {
         // A worker-count or STATE_FORMAT change re-shapes every keyed store, so no
         // view resumes and nothing below need be read.
         if !topo_valid {
-            self.invalid_views = view_ids.into_iter().collect();
+            self.registry.set_non_resumable(&view_ids);
             return;
         }
 
@@ -111,7 +108,8 @@ impl CatalogEngine {
         let seeds = invalid.iter().copied().collect();
         let reached = self.dag.dependent_closure(seeds);
         invalid.extend(reached.into_iter().filter(|v| view_set.contains(v)));
-        self.invalid_views = invalid;
+        self.registry
+            .set_non_resumable(&invalid.into_iter().collect::<Vec<_>>());
     }
 
     /// The cursor driving `source` through `view_id`'s circuit, under the bound the
@@ -124,9 +122,8 @@ impl CatalogEngine {
             self.registry.residency().owns_stores(),
             "source cursor in a process owning no base store (view {view_id}, source {source})",
         );
-        let CatalogEngine { registry, dag, .. } = self;
-        let bound = dag.source_scan_bound(registry, view_id, source);
-        registry
+        let bound = self.dag.source_scan_bound(&self.registry, view_id, source);
+        self.registry
             .open_bound(source, bound)
             .map(|(cursor, _walk)| cursor)
             .map_err(String::from)

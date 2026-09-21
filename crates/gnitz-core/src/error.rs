@@ -25,6 +25,9 @@ pub enum ClientError {
         name: String,
     },
     SchemaMismatch, // WireStatus::SchemaMismatch: server rejected schema-less PUSH
+    /// `WireStatus::IntegrityViolation`: the write would break a PK,
+    /// unique-index or foreign-key constraint, which the message names.
+    IntegrityViolation(String),
     /// WireStatus::TxnConflict: a user-table TXN failed its OCC precondition — a table
     /// it read was written since its basis. `fresh_basis` is the server's current
     /// watermark, which the autocommit RMW retry adopts before re-reading. The
@@ -93,6 +96,7 @@ impl fmt::Display for ClientError {
             }
             ClientError::NotFound { noun, name } => write!(f, "{noun} '{name}' not found"),
             ClientError::SchemaMismatch => write!(f, "schema version mismatch"),
+            ClientError::IntegrityViolation(s) => write!(f, "{s}"),
             ClientError::TxnConflict { fresh_basis } => {
                 write!(f, "transaction conflict (fresh basis {fresh_basis}); retry")
             }

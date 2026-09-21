@@ -160,13 +160,15 @@ impl DagEngine {
     // ── DAG traversal driver ────────────────────────────────────────────
 
     /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
-    /// execution order. A pure function of the dep map, which is
-    /// worker-identical — what keeps the workers in lockstep.
-    fn tick_schedule(&self, source_id: i64) -> Vec<Step> {
+    /// execution order, skipping non-resumable views: their backfill fills them.
+    /// Worker-identical, which keeps the workers in lockstep.
+    fn tick_schedule(&self, registry: &RelationRegistry, source_id: i64) -> Vec<Step> {
         let mut schedule: Vec<Step> = Vec::new();
         for producer in std::iter::once(source_id).chain(self.dependent_closure(vec![source_id])) {
             for &view in self.dependents_of(producer) {
-                schedule.push(Step { view, producer });
+                if !registry.is_non_resumable(view) {
+                    schedule.push(Step { view, producer });
+                }
             }
         }
         schedule.sort_unstable();
@@ -182,7 +184,7 @@ impl DagEngine {
         exchange: &mut dyn ExchangeCallback,
     ) -> Result<(), String> {
         let (source, schedule, round) = match what {
-            Drive::Tick { source, round } => (source, self.tick_schedule(source), Some(round)),
+            Drive::Tick { source, round } => (source, self.tick_schedule(registry, source), Some(round)),
             Drive::Backfill { view, source } => (source, vec![Step { view, producer: source }], None),
         };
         // How many steps still read each producer's output.

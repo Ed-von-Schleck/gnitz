@@ -246,9 +246,9 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
         let site = ViewSite {
             dir: &dir,
             id: vid as u64,
-            registry: engine.registry(),
+            registry: &engine.registry,
         };
-        let loaded = load_circuit(engine.registry(), vid as u64)?;
+        let loaded = load_circuit(&engine.registry, vid as u64)?;
         compile_view(&loaded, site, view_schema, false).map(drop)
     };
     assert!(against(&view_schema, v_u64_only).is_ok(), "an equal pair compiles");
@@ -297,9 +297,9 @@ fn a_float_shard_column_is_rejected() {
         let site = ViewSite {
             dir: &dir,
             id: vid as u64,
-            registry: engine.registry(),
+            registry: &engine.registry,
         };
-        let loaded = load_circuit(engine.registry(), vid as u64)?;
+        let loaded = load_circuit(&engine.registry, vid as u64)?;
         compile_view(&loaded, site, &view_schema, false).map(drop)
     };
     assert!(compile(&mut engine, 0).is_ok(), "an integer shard column compiles");

@@ -56,7 +56,18 @@ pub(in crate::catalog) fn encode_named_schema_block(schema: &SchemaDescriptor, d
     gnitz_wire::schema_block::encode(&schema_block_cols(schema, Some(defs)), schema.pk_indices())
 }
 
+/// The schema version reported for an id no registered relation holds.
+const UNREGISTERED_SCHEMA_VERSION: u16 = 1;
+
 impl CatalogEngine {
+    /// The current schema version of `table_id`.
+    pub(crate) fn schema_version_of(&self, table_id: i64) -> u16 {
+        self.caches
+            .relations
+            .get(&table_id)
+            .map_or(UNREGISTERED_SCHEMA_VERSION, |e| e.schema_version.get())
+    }
+
     /// `tid`'s named schema record; `None` for an unregistered id.
     pub(crate) fn schema_block(&self, tid: i64) -> Option<Rc<Vec<u8>>> {
         self.caches.relations.get(&tid).map(|e| e.schema_block.clone())
@@ -66,7 +77,7 @@ impl CatalogEngine {
     /// version its flags report.
     pub(crate) fn negotiated_schema_block(&self, tid: i64, client_version: u16) -> (Option<Rc<Vec<u8>>>, u16) {
         let Some(entry) = self.caches.relations.get(&tid) else {
-            return (None, 1);
+            return (None, UNREGISTERED_SCHEMA_VERSION);
         };
         let version = entry.schema_version.get();
         let block = (client_version != version).then(|| entry.schema_block.clone());

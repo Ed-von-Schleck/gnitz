@@ -77,7 +77,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();
 
     // The registration survives, so its directory is live.
-    assert!(engine.registry().has_id(tid), "rename must not unregister the table");
+    assert!(engine.registry.has_id(tid), "rename must not unregister the table");
     assert!(Path::new(&table_path).exists(), "rename must not delete the table dir");
     // Caches reflect the new name; no persistent ghost row.
     assert!(engine.caches.entity_by_qname.contains_key("public.renamed"));
@@ -103,13 +103,13 @@ fn rename_then_reopen_resolves_flushed_data() {
         let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
-        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+        let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(7u128, 1);
         bb.put_u64(70);
         bb.end_row();
         engine.ingest_to_family(tid, &bb.finish()).unwrap();
-        engine.registry_mut().checkpoint_base().unwrap();
+        engine.registry.checkpoint_base().unwrap();
 
         let pair = table_rename_pair(&engine, tid, "renamed");
         engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();
@@ -266,7 +266,7 @@ fn system_range_mutations_rejected() {
 
     // Nothing was torn down or aliased on the way to the reject.
     for family in SysFamily::ALL {
-        assert!(engine.registry().has_id(family.id()), "{} unregistered", family.name());
+        assert!(engine.registry.has_id(family.id()), "{} unregistered", family.name());
     }
     assert_eq!(
         engine.qualified_name_or_unknown(IDX_TAB_ID),
@@ -586,7 +586,7 @@ fn insert_first_rename_pair_lands_the_new_name() {
         "the catalog must name the table by its new name"
     );
     assert!(
-        engine.registry().has_id(tid),
+        engine.registry.has_id(tid),
         "a rename must not unregister the table, whatever the row order"
     );
     assert_eq!(live_rows_for(&engine, tid), 1, "a rename leaves exactly one live row");

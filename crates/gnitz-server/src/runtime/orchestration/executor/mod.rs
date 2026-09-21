@@ -90,9 +90,9 @@ async fn park_until(shared: &Shared, polls: u32, what: &str, ready: impl Fn() ->
 /// goes stale in, which production reaches when that read parks behind a queued
 /// `ALTER TABLE` writer.
 async fn hold_push_for_ddl(shared: &Shared, target_id: i64) {
-    let seen = shared.cat().get_schema_version(target_id);
+    let seen = shared.cat().schema_version_of(target_id);
     park_until(shared, PUSH_HOLD_MAX_POLLS, "push hold", || {
-        shared.cat().get_schema_version(target_id) != seen
+        shared.cat().schema_version_of(target_id) != seen
     })
     .await
 }
@@ -204,6 +204,8 @@ pub struct Shared {
     /// watchdog is detached and its `Output` discarded, so this is how the
     /// verdict reaches `ServerExecutor::run`.
     worker_crashed: Cell<bool>,
+    /// The data directory, where each worker's log lives.
+    data_dir: String,
 }
 
 impl Shared {
@@ -334,7 +336,7 @@ impl Shared {
         out.extend(
             rows.drain()
                 .map(|(tid, _)| tid)
-                .filter(|&tid| self.cat().registry().has_id(tid)),
+                .filter(|&tid| self.cat().registry.has_id(tid)),
         );
     }
 
@@ -362,7 +364,13 @@ impl ServerExecutor {
     /// `tls` is the optional TLS listener bootstrap from `server_main`:
     /// the bound TCP listen fd, the rustls server configuration, and the
     /// global live-connection cap.
-    pub fn run(dispatcher: Rc<MasterDispatcher>, server_fd: i32, tls: Option<TlsListener>, lsn_seed: u64) -> i32 {
+    pub fn run(
+        dispatcher: Rc<MasterDispatcher>,
+        data_dir: &str,
+        server_fd: i32,
+        tls: Option<TlsListener>,
+        lsn_seed: u64,
+    ) -> i32 {
         let reactor = Rc::clone(dispatcher.reactor());
 
         // Every zone LSN this boot allocates exceeds `lsn_seed`; the boot
@@ -385,6 +393,7 @@ impl ServerExecutor {
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed: initial_lsn,
             worker_crashed: Cell::new(false),
+            data_dir: data_dir.to_string(),
         });
 
         // Catch SIGTERM/SIGINT so the watchdog can drive a final checkpoint
@@ -617,8 +626,8 @@ async fn watchdog(shared: Rc<Shared>) {
         }
 
         if let Some(crashed) = shared.disp().check_workers() {
-            let base_dir = shared.cat().base_dir().to_string();
-            gnitz_error!("Worker {crashed} crashed (log: {base_dir}/worker_{crashed}.log), shutting down");
+            let data_dir = &shared.data_dir;
+            gnitz_error!("Worker {crashed} crashed (log: {data_dir}/worker_{crashed}.log), shutting down");
             shared.worker_crashed.set(true);
             shared.disp().shutdown_workers().await;
             shared.disp().reactor().request_shutdown();
@@ -936,13 +945,13 @@ fn decode_push_frame(
         if client_version == 0 {
             return Err(PushReject::Error("a data block without a schema block".to_string()));
         }
-        if client_version != shared.cat().get_schema_version(target_id) {
+        if client_version != shared.cat().schema_version_of(target_id) {
             return Err(PushReject::SchemaMismatch);
         }
         Some(
             shared
                 .cat()
-                .registry()
+                .registry
                 .relation(target_id)
                 .map(Relation::schema)
                 .ok_or(PushReject::SchemaMismatch)?,
@@ -1293,7 +1302,7 @@ async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) 
 fn validate_client_schema(shared: &Shared, tid: i64, client: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
     let expected = shared
         .cat()
-        .registry()
+        .registry
         .relation(tid)
         .map(Relation::schema)
         .ok_or_else(|| format!("table {tid} has no registered schema"))?;
@@ -1368,7 +1377,7 @@ enum Access {
 /// ([`WireStatus::NotFound`]): the arms below name a relation that exists, which a
 /// client must not recover from the way it recovers from a vanished one.
 fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<RelationKind, WireFault> {
-    let Some(kind) = shared.cat().registry().relation(target_id).map(Relation::kind) else {
+    let Some(kind) = shared.cat().registry.relation(target_id).map(Relation::kind) else {
         return Err(WireFault {
             status: WireStatus::NotFound,
             text: format!("table {target_id} not found"),
@@ -1440,7 +1449,7 @@ fn resolve_request_target(
     // The registry lookup supplies kind and class, and is the gate a by-id tid passes.
     Ok(shared
         .cat()
-        .registry()
+        .registry
         .relation(candidate)
         .map(|e| (candidate, e.kind(), e.class())))
 }
@@ -1466,12 +1475,8 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
     // re-plan an aggregate over a view on a second authority. A misreport either way
     // is a silent W-fold overcount: a replicated relation read as non-replicated has
     // every worker holding a full copy *and* its partials summed.
-    let replicated = kind.is_ingestion_point()
-        && shared
-            .cat()
-            .registry()
-            .relation(tid)
-            .is_some_and(Relation::is_replicated);
+    let replicated =
+        kind.is_ingestion_point() && shared.cat().registry.relation(tid).is_some_and(Relation::is_replicated);
 
     let fks: Vec<gnitz_wire::RelFk> = shared
         .cat()
@@ -1485,7 +1490,7 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
         .collect();
     let indexes: Vec<gnitz_wire::RelIndex> = shared
         .cat()
-        .registry()
+        .registry
         .relation(tid)
         .map_or(&[][..], Relation::indexes)
         .iter()
@@ -1495,7 +1500,7 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
         })
         .collect();
     // Reported for every class, unlike `replicated` above.
-    let pk_repeats = class == gnitz_wire::RelClass::Stream || shared.cat().pk_repeats_of(tid);
+    let pk_repeats = shared.cat().pk_repeats_of(tid);
     let blob = gnitz_wire::RelDescriptorBlob {
         class,
         replicated,
@@ -1539,7 +1544,7 @@ fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_bl
 fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
     if !shared
         .cat()
-        .registry()
+        .registry
         .relation(target)
         .map(Relation::kind)
         .is_some_and(|k| k.is_view())
@@ -1549,7 +1554,7 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
     let ticked = shared.last_tick_lsn.get();
     shared
         .cat()
-        .dag()
+        .dag
         .source_closure(vec![target])
         .into_iter()
         .all(|s| shared.commit_lsn_of(s) <= ticked)
@@ -1794,7 +1799,7 @@ fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
     after_tick > 0
         && shared
             .cat()
-            .registry()
+            .registry
             .relation(target_id)
             .is_some_and(Relation::has_delta_feed)
         && after_tick >= shared.disp().last_delta_round(target_id)

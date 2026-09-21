@@ -12,7 +12,7 @@ fn test_enforce_unique_pk() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);
@@ -22,7 +22,7 @@ fn test_enforce_unique_pk() {
         bb.finish()
     };
     let live = |engine: &mut CatalogEngine| -> usize {
-        engine.registry_mut().checkpoint_base().unwrap();
+        engine.registry.checkpoint_base().unwrap();
         engine.scan(tid).unwrap().len()
     };
 
@@ -226,10 +226,10 @@ fn test_boot_generation_advance_monotonic() {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation(), 2);
         assert_eq!(engine.advance_durable_generation().unwrap(), 3);
-        assert_eq!(engine.registry().resume_generation(), 2);
+        assert_eq!(engine.registry.resume_generation(), 2);
         assert_eq!(engine.sequence_value(SEQ_ID_CHECKPOINT_GEN), Some(3));
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 4);
-        assert_eq!(engine.registry().resume_generation(), 4);
+        assert_eq!(engine.registry.resume_generation(), 4);
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -261,7 +261,7 @@ fn test_raised_counter_survives_drop_and_flush() {
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine.registry().has_id(tid));
+    assert!(!engine.registry.has_id(tid));
     assert!(engine.next_id > tid, "next_id {} must stay past {tid}", engine.next_id);
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -317,7 +317,7 @@ fn test_ingest_scan_seek_family() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     // Ingest via CatalogEngine (user table path)
     let mut bb = BatchBuilder::new(schema);
@@ -331,7 +331,7 @@ fn test_ingest_scan_seek_family() {
     bb.put_u64(300);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.checkpoint_base().unwrap();
 
     // Scan
     let scan_batch = engine.scan(tid).unwrap();
@@ -379,7 +379,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
     // Insert row with PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
@@ -387,7 +387,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.checkpoint_base().unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
     let mut bb = BatchBuilder::new(schema);
@@ -395,7 +395,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(200);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().checkpoint_base().unwrap();
+    engine.registry.checkpoint_base().unwrap();
 
     // Scan — should have exactly 1 row with val=200
     let scan = engine.scan(tid).unwrap();
@@ -445,7 +445,7 @@ fn zone_pins_survive_a_flush_and_reopen() {
     let dir = temp_dir("catalog_zone_lsn");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let current =
-        |engine: &CatalogEngine, id: i64| engine.registry().relation_or_err(id).map_or(0, Relation::current_lsn);
+        |engine: &CatalogEngine, id: i64| engine.registry.relation_or_err(id).map_or(0, Relation::current_lsn);
 
     // Zone 5: create a schema. SCHEMA_TAB pinned to lsn=5.
     let _ = engine.drain_pending_broadcasts();
@@ -475,21 +475,21 @@ fn zone_pins_survive_a_flush_and_reopen() {
     assert_eq!(current(&engine, COL_TAB_ID), 9);
 
     // system_flushed_lsns covers every system table, and only those.
-    let map = engine.registry().system_flushed_lsns();
+    let map = engine.registry.system_flushed_lsns();
     assert_eq!(map.get(&SCHEMA_TAB_ID), Some(&5));
     assert_eq!(map.get(&TABLE_TAB_ID), Some(&9));
     assert_eq!(map.get(&COL_TAB_ID), Some(&9));
     assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
     // The Push walk replays both created tables.
-    let bases = engine.registry().base_table_ids();
+    let bases = engine.registry.base_table_ids();
     assert!(bases.contains(&tid) && bases.contains(&tid2));
 
     // max_system_lsn is at least the highest zone LSN observed.
-    assert!(engine.registry().max_system_lsn() >= 9);
+    assert!(engine.registry.max_system_lsn() >= 9);
 
     engine.close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let map = engine.registry().system_flushed_lsns();
+    let map = engine.registry.system_flushed_lsns();
     assert!(map[&TABLE_TAB_ID] >= 9, "TABLE_TAB's flush must carry zone 9: {map:?}");
     assert!(
         map[&SCHEMA_TAB_ID] >= 5,
@@ -518,7 +518,7 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
 
     engine.close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let flushed = engine.registry().system_flushed_lsns()[&SCHEMA_TAB_ID];
+    let flushed = engine.registry.system_flushed_lsns()[&SCHEMA_TAB_ID];
     assert!(
         flushed >= 500,
         "the flushed SCHEMA_TAB must dedup the group at lsn 500, got {flushed}"
@@ -540,8 +540,8 @@ fn test_master_holds_no_user_store() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    assert!(!engine.registry().residency().owns_stores());
-    let entry = engine.registry().relation_or_err(tid).unwrap();
+    assert!(!engine.registry.residency().owns_stores());
+    let entry = engine.registry.relation_or_err(tid).unwrap();
     assert!(!entry.cursor().valid, "the master's copy of a user store reads empty");
     assert_eq!(entry.current_lsn(), 0);
     for family in [SysFamily::Schema, SysFamily::Table, SysFamily::Column] {
@@ -582,15 +582,15 @@ fn test_fk_index_metadata_queries() {
     let _iid = engine.create_index("public.parent", &["val"], false).unwrap();
 
     assert!(!engine
-        .registry()
+        .registry
         .relation(tid)
         .map_or(&[][..], Relation::indexes)
         .is_empty());
-    let ic_cols = engine.registry().relation(tid).map_or(&[][..], Relation::indexes)[0].cols();
+    let ic_cols = engine.registry.relation(tid).map_or(&[][..], Relation::indexes)[0].cols();
     assert_eq!(ic_cols.as_slice(), [1]); // val is column 1
 
     // The index circuit resolves, so its store is reachable.
-    assert!(engine.registry().relation(tid).and_then(|r| r.index_on(&[1])).is_some());
+    assert!(engine.registry.relation(tid).and_then(|r| r.index_on(&[1])).is_some());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

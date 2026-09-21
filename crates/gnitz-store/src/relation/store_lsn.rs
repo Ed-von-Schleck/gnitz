@@ -1,6 +1,6 @@
 //! Per-process store lifecycle across the fork — the store open, the boot
-//! relayout and child-dir reclamation, invalid-view reset — and the flushed-LSN
-//! bookkeeping that recovery and the DDL zone allocator read.
+//! relayout and child-dir reclamation, view reset and rebuild start — and the
+//! flushed-LSN bookkeeping that recovery and the DDL zone allocator read.
 
 use super::{RelationKind, RelationRegistry, Residency, Store};
 use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError};
@@ -109,35 +109,35 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Reset a relation's store and per-worker operator scratch to an empty,
-    /// well-formed state, before an invalid view is rebuilt. The caller drops the
-    /// cached plan.
-    ///
-    /// The manifest is unlinked first so the rebuild's `Rederive` open reads
-    /// `None` and *erases* the stale shards — without which a transitively-invalid
-    /// view whose own manifests are still at the resume generation would reload
-    /// them.
+    /// Empty a view's output store: without its manifest, the reopen erases the
+    /// shards instead of resuming them.
     pub fn reset_view(&mut self, vid: i64) -> Result<(), StoreError> {
-        let entry = self.relation_mut_or_err(vid).map_err(|e| e.in_context("reset_view"))?;
-        let dir = entry.directory().to_string();
-        entry
+        self.relation_mut_or_err(vid)
+            .map_err(|e| e.in_context("reset_view"))?
             .store
             .unlink_manifest()
             .map_err(|e| StoreError::storage(format!("reset_view: unlink manifest of {vid}"), e))?;
+        self.rebuild_relation_store(vid, "reset view output")
+    }
 
+    /// Start rebuilding `vid` if it is non-resumable: remove the operator traces
+    /// a previous compile left on this worker, and unmark it.
+    pub fn begin_rebuild(&mut self, vid: i64) -> Result<(), StoreError> {
+        if !self.non_resumable.contains(&vid) {
+            return Ok(());
+        }
+        let dir = self
+            .relation_or_err(vid)
+            .map_err(|e| e.in_context("begin_rebuild"))?
+            .directory();
         let rank = self.slot.rank;
-
-        // Rebuild empty. `Table::new` erases the stale shards (manifest now
-        // absent → `Rederive` reads `None`).
-        self.rebuild_relation_store(vid, "reset view output")?;
-
-        // Remove this worker's per-view operator scratch dirs (rank-stamped).
-        let scratch_err = |e| StoreError::storage(format!("reset_view: scratch of {vid}"), e);
-        for name in subdir_names(&dir).map_err(scratch_err)? {
+        let scratch_err = |e| StoreError::storage(format!("begin_rebuild: scratch of {vid}"), e);
+        for name in subdir_names(dir).map_err(scratch_err)? {
             if matches!(ChildAddr::parse(&name), Some(ChildAddr::Scratch { rank: r, .. }) if r == rank) {
                 remove_child(&format!("{dir}/{name}")).map_err(scratch_err)?;
             }
         }
+        self.non_resumable.remove(&vid);
         Ok(())
     }
 

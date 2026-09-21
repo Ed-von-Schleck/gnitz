@@ -3,6 +3,7 @@
 //! checkpoint generation, topology word) and user SERIAL ranges.
 
 use super::*;
+use gnitz_expr::payload_str;
 
 /// Operator-state format version. Bump on any change to an operator-state
 /// schema; a mismatch marks every Rederive view invalid at boot. Shard and
@@ -71,19 +72,46 @@ impl CatalogEngine {
         Ok(base)
     }
 
-    /// The qualified `(schema, name)` of `table_id`, or `("?", "?")` when the
-    /// catalog has no entry.
-    pub(in crate::catalog) fn qualified_name_or_unknown(&self, table_id: i64) -> (String, String) {
-        let Some(row) = self
+    /// `table_id`'s live `sys_tables` or `sys_views` row and the name of the
+    /// schema it sits in (`"?"` for none).
+    fn relation_name_row(&self, table_id: i64) -> Option<(StoredRow, &str)> {
+        let row = self
             .live_sys_row(SysFamily::Table, table_id)
-            .or_else(|| self.live_sys_row(SysFamily::View, table_id))
-        else {
-            return ("?".into(), "?".into());
-        };
+            .or_else(|| self.live_sys_row(SysFamily::View, table_id))?;
         let (src, ri) = row.source();
         let sid = payload_u64(src, ri, gnitz_wire::RELTAB_PAY_SCHEMA_ID) as i64;
         let schema = self.caches.schema_by_id.get(&sid).map_or("?", String::as_str);
+        Some((row, schema))
+    }
+
+    /// The qualified `(schema, name)` of `table_id`, or `("?", "?")` when the
+    /// catalog has no entry.
+    pub(crate) fn qualified_name_or_unknown(&self, table_id: i64) -> (String, String) {
+        let Some((row, schema)) = self.relation_name_row(table_id) else {
+            return ("?".into(), "?".into());
+        };
+        let (src, ri) = row.source();
         (schema.to_string(), payload_string(src, ri, gnitz_wire::RELTAB_PAY_NAME))
+    }
+
+    /// `table_id` as `schema.name`, or `?.?` when the catalog has no entry.
+    pub(crate) fn qualified_name(&self, table_id: i64) -> String {
+        let Some((row, schema)) = self.relation_name_row(table_id) else {
+            return gnitz_wire::qualified_key("?", "?");
+        };
+        let (src, ri) = row.source();
+        gnitz_wire::qualified_key(schema, payload_str(src, ri, gnitz_wire::RELTAB_PAY_NAME))
+    }
+
+    /// `table_id`'s column names at `col_indices`, `, `-joined; `?` for one the
+    /// catalog does not hold.
+    pub(crate) fn column_names(&self, table_id: i64, col_indices: &[u32]) -> String {
+        let defs = self.read_column_defs(table_id);
+        col_indices
+            .iter()
+            .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.name.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// The entity id registered under a canonical `"schema.relation"` key.
@@ -92,6 +120,16 @@ impl CatalogEngine {
     }
 
     // -- `_sequences` -------------------------------------------------------
+
+    /// Whether persisted derived state was written under this boot's topology.
+    pub(in crate::catalog) fn topology_matches(&self) -> bool {
+        self.sequence_value(SEQ_ID_TOPOLOGY) == Some(topology_word(self.registry.slot().of))
+    }
+
+    /// The checkpoint generation, `0` on a fresh database.
+    pub(crate) fn durable_generation(&self) -> u64 {
+        self.sequence_value(SEQ_ID_CHECKPOINT_GEN).unwrap_or(0)
+    }
 
     /// The live value of `_sequences` row `seq_id`, if one is stored.
     pub(crate) fn sequence_value(&self, seq_id: i64) -> Option<u64> {
@@ -176,16 +214,14 @@ impl CatalogEngine {
     /// The ephemeral checkpoint round: persist every view's operator traces and
     /// output stores, and every index, at the registry's resume generation.
     pub(crate) fn flush_ephemeral_round(&mut self) -> Result<(), String> {
-        let CatalogEngine { registry, dag, .. } = self;
-        Ok(registry.checkpoint_ephemeral(dag.collect_ephemeral_state())?)
+        Ok(self.registry.checkpoint_ephemeral(self.dag.collect_ephemeral_state())?)
     }
 
     /// Unlink the manifest of every store [`Self::flush_ephemeral_round`]
     /// publishes, so the next open erases those stores instead of resuming them.
     pub(crate) fn unlink_derived_manifests(&mut self) {
-        let CatalogEngine { registry, dag, .. } = self;
-        let state = dag.collect_ephemeral_state();
-        registry.unlink_ephemeral_manifests(state);
+        self.registry
+            .unlink_ephemeral_manifests(self.dag.collect_ephemeral_state());
     }
 
     /// Record the launched topology and latch the registry's resume verdict from

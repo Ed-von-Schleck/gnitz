@@ -548,14 +548,10 @@ impl CatalogEngine {
         if blockers.is_empty() {
             return Ok(());
         }
-        let name = |id: i64| {
-            let (sn, en) = self.qualified_name_or_unknown(id);
-            format!("{sn}.{en}")
-        };
-        let named: Vec<String> = blockers.iter().map(|id| name(*id)).collect();
+        let named: Vec<String> = blockers.iter().map(|&id| self.qualified_name(id)).collect();
         Err(format!(
             "cannot {op} on '{}': it has dependent views ({}) — drop them first",
-            name(owner_id),
+            self.qualified_name(owner_id),
             named.join(", ")
         ))
     }
@@ -679,17 +675,17 @@ impl CatalogEngine {
                 continue;
             };
             if e.is_bounded() {
-                let (sn, tn) = self.qualified_name_or_unknown(src);
                 return Err(format!(
-                    "view '{name}' (vid={vid}) reads '{sn}.{tn}', which is a \
-                     capacity-bounded view; views cannot be created over one"
+                    "view '{name}' (vid={vid}) reads '{}', which is a \
+                     capacity-bounded view; views cannot be created over one",
+                    self.qualified_name(src),
                 ));
             }
             if matches!(props, gnitz_wire::ViewProps::Bounded { .. }) && e.kind() == RelationKind::Stream {
-                let (sn, tn) = self.qualified_name_or_unknown(src);
                 return Err(format!(
-                    "view '{name}' (vid={vid}) reads '{sn}.{tn}', which is a stream; \
-                     a capacity-bounded view cannot be created over one"
+                    "view '{name}' (vid={vid}) reads '{}', which is a stream; \
+                     a capacity-bounded view cannot be created over one",
+                    self.qualified_name(src),
                 ));
             }
         }
@@ -921,8 +917,8 @@ impl CatalogEngine {
                     .iter()
                     .find(|r| net_dead.binary_search(&r.child_tid).is_err());
                 if let Some(r) = blocking {
-                    let (sn, tn) = self.qualified_name_or_unknown(r.child_tid);
-                    return Err(format!("Integrity violation: table referenced by '{sn}.{tn}'"));
+                    let child = self.qualified_name(r.child_tid);
+                    return Err(format!("Integrity violation: table referenced by '{child}'"));
                 }
             }
         }
@@ -937,8 +933,7 @@ impl CatalogEngine {
                 .iter()
                 .any(|&dep_id| net_dead.binary_search(&dep_id).is_err());
             if still_active {
-                let (sn, tn) = self.qualified_name_or_unknown(id);
-                return Err(format!("View dependency: entity '{sn}.{tn}'"));
+                return Err(format!("View dependency: entity '{}'", self.qualified_name(id)));
             }
         }
         Ok(())
@@ -1024,10 +1019,10 @@ impl CatalogEngine {
                 .iter()
                 .any(|&(id, u)| u && net_dead.binary_search(&id).is_err());
             if !unique_remains {
-                let (sn, tn) = self.qualified_name_or_unknown(owner_id);
                 return Err(format!(
-                    "Integrity violation: index on '{sn}.{tn}' is referenced by a \
-                     foreign key and no unique index would remain on the column"
+                    "Integrity violation: index on '{}' is referenced by a \
+                     foreign key and no unique index would remain on the column",
+                    self.qualified_name(owner_id),
                 ));
             }
         }

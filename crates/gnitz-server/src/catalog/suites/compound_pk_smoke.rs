@@ -22,7 +22,7 @@ fn schema_roundtrip_catalog_preserves_pk_order() {
     {
         let engine = CatalogEngine::open(&dir, 1).unwrap();
         let tid = engine.get_by_name("public", "cpk_order").unwrap();
-        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+        let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         assert_eq!(
             schema.pk_indices(),
             &[2, 1],

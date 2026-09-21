@@ -203,7 +203,7 @@ fn test_ddl() {
     // Table creation
     let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let tid = engine.create_table("sales.orders", &cols, &[0]).unwrap();
-    assert!(engine.registry().has_id(tid));
+    assert!(engine.registry.has_id(tid));
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Table).cursor()),
         init_tables + 1
@@ -215,7 +215,7 @@ fn test_ddl() {
 
     // Drop table (retractions)
     engine.drop_table("sales.orders").unwrap();
-    assert!(!engine.registry().has_id(tid));
+    assert!(!engine.registry.has_id(tid));
     assert_eq!(
         count_records(engine.sys_relation(SysFamily::Table).cursor()),
         init_tables
@@ -315,7 +315,7 @@ fn test_edge_cases() {
             &[0],
         )
         .unwrap();
-    let s15 = engine.registry().relation(tid15).map(Relation::schema).unwrap();
+    let s15 = engine.registry.relation(tid15).map(Relation::schema).unwrap();
     assert_eq!(s15.columns[0].type_code, type_code::U128);
     engine.drop_table("public.u128t").unwrap();
 
@@ -417,7 +417,7 @@ fn test_restart_full() {
         assert!(engine.get_by_name("trash", "items").is_none());
         // Schema layout rebuilt correctly
         let tid = engine.get_by_name("marketing", "products").unwrap();
-        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+        let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
         assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
         let new_tid = engine.create_table("marketing.other", &cols, &[0]).unwrap();
@@ -475,10 +475,10 @@ fn test_edge_cases_extended() {
 
     // #20. has_id / get_schema for valid and invalid IDs
     let tid = engine.create_table("public.reg_test", &cols, &[0]).unwrap();
-    assert!(engine.registry().has_id(tid));
-    assert!(engine.registry().relation(tid).map(Relation::schema).is_some());
-    assert!(!engine.registry().has_id(999999));
-    assert!(engine.registry().relation(999999).map(Relation::schema).is_none());
+    assert!(engine.registry.has_id(tid));
+    assert!(engine.registry.relation(tid).map(Relation::schema).is_some());
+    assert!(!engine.registry.has_id(999999));
+    assert!(engine.registry.relation(999999).map(Relation::schema).is_none());
     engine.drop_table("public.reg_test").unwrap();
 
     // #26. A relation in a schema the catalog does not hold is rejected. The
@@ -582,7 +582,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     assert_eq!(
         engine
-            .registry()
+            .registry
             .relation(tid)
             .map(Relation::schema)
             .unwrap()
@@ -593,7 +593,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
     let tid2 = engine.create_table("public.t", &cols, &[1]).unwrap();
     assert_eq!(
         engine
-            .registry()
+            .registry
             .relation(tid2)
             .map(Relation::schema)
             .unwrap()
@@ -611,7 +611,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
         let tid = engine.create_table(&name, &wide, &pk_cols).unwrap();
         assert_eq!(
             engine
-                .registry()
+                .registry
                 .relation(tid)
                 .map(Relation::schema)
                 .unwrap()
@@ -650,7 +650,7 @@ fn test_drop_view_removes_directory() {
 
     // The register hook created the physical view directory on disk.
     let view_dir = engine
-        .registry()
+        .registry
         .relation_or_err(vid)
         .expect("view registered in dag")
         .directory()
@@ -1071,7 +1071,7 @@ fn set_based_table_drop_queues_one_batch_per_family() {
 
     let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
     assert_eq!(families, [SysFamily::Index, SysFamily::Table, SysFamily::Column]);
-    assert!(tids.iter().all(|&t| !engine.registry().has_id(t)));
+    assert!(tids.iter().all(|&t| !engine.registry.has_id(t)));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1119,7 +1119,7 @@ fn view_drop_retracts_its_segments() {
     let families: Vec<SysFamily> = engine.drain_pending_broadcasts().into_iter().map(|(f, _)| f).collect();
     assert_eq!(families, [SysFamily::View, SysFamily::CircuitNodes, SysFamily::Column]);
     for id in [v, s] {
-        assert!(!engine.registry().has_id(id));
+        assert!(!engine.registry.has_id(id));
         assert_eq!(band_rows(&engine, SysFamily::CircuitNodes, id), 0);
         assert_eq!(band_rows(&engine, SysFamily::Column, id), 0);
     }
@@ -1137,7 +1137,7 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
     let drop = engine.retract_pk_list(SysFamily::View, vec![v as u128, s as u128]);
     engine.submit(SysFamily::View, drop).unwrap();
 
-    assert!(!engine.registry().has_id(v) && !engine.registry().has_id(s));
+    assert!(!engine.registry.has_id(v) && !engine.registry.has_id(s));
     assert_eq!(
         count_negative_records(engine.sys_relation(SysFamily::View).cursor()),
         0,
@@ -1161,10 +1161,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
         .submit(SysFamily::View, build_view_tab_row(tid, "v"))
         .expect_err("a view create at a table's id must be refused");
     assert!(err.contains(&format!("relation id {tid} already exists")), "{err}");
-    assert!(engine
-        .registry()
-        .relation(tid)
-        .is_some_and(|r| r.kind().is_base_table()));
+    assert!(engine.registry.relation(tid).is_some_and(|r| r.kind().is_base_table()));
     let _ = engine.drain_pending_broadcasts();
 
     // In the same bundle as the TABLE_TAB create.
@@ -1178,7 +1175,7 @@ fn a_view_create_at_a_registered_table_id_is_refused() {
         .expect_err("one bundle may not create one id as a table and a view");
     assert!(err.contains(&format!("relation id {both} already exists")), "{err}");
     engine.compensate_stage_a().unwrap();
-    assert!(!engine.registry().has_id(both));
+    assert!(!engine.registry.has_id(both));
     assert_eq!(
         engine.qualified_name_or_unknown(both),
         ("?".to_string(), "?".to_string())

@@ -108,6 +108,7 @@ fn check_response(ctrl: &DecodedControl) -> Result<(), ClientError> {
             name: ctrl.hdr.target_id.to_string(),
         }),
         WireStatus::SalFull => Err(ClientError::SalFull(text)),
+        WireStatus::IntegrityViolation => Err(ClientError::IntegrityViolation(text)),
         WireStatus::TxnConflict => Err(ClientError::TxnConflict { fresh_basis: ctrl.hdr.arg0 }),
         WireStatus::Error if text.is_empty() => Err(ClientError::ServerError("unknown server error".into())),
         WireStatus::Error => Err(ClientError::ServerError(text)),

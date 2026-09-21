@@ -46,7 +46,7 @@ def test_duplicate_pk_rejects_the_whole_statement(client, schema_name, ddl, comm
     if committed:
         insert(client, schema_name, "t", committed)
     for stmt in refused:
-        with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
+        with pytest.raises(gnitz.GnitzIntegrityError, match="(?i)duplicate key"):
             client.execute_sql(stmt, schema_name=schema_name)
     assert bag(scanned(client, schema_name, "t")) == dict.fromkeys(committed, 1)
 

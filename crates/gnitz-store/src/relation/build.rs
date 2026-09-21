@@ -57,6 +57,7 @@ impl RelationRegistry {
             RelationKind::Stream => return Ok((Store::detached(schema), None)),
             // A view's output store and its operator traces resume from the
             // manifest the ephemeral checkpoint round stamped, or are rebuilt.
+            RelationKind::View if self.non_resumable.contains(&id) => RecoverySource::Rederive { resume_at: None },
             RelationKind::View => self.rederive_source(),
             RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
         };

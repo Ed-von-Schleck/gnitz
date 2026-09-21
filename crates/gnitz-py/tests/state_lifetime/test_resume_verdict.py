@@ -67,6 +67,43 @@ def test_a_checkpoint_cut_resumes_live_and_replays_only_the_tail(own_server):
     _assert_doubled(own_server, "ct", range(1, 11), "cut + tail, each row once")
 
 
+def test_a_stream_fed_view_rebuilds_alone_and_counts_the_tail_once(own_server):
+    """A view over a stream is rejected on every boot, while its sibling over the
+    table alone resumes. The rejected view's store opens empty and the recovery
+    sweep must leave it alone: a tail ticked into it and then backfilled again
+    would hold every tail row at weight 2."""
+    sn = "sf"
+    own_server.start()
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.create_schema(sn)
+        conn.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn)
+        conn.execute_sql(
+            "CREATE TABLE s (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (stream = true)", schema_name=sn)
+        conn.execute_sql("CREATE VIEW ok AS SELECT id, val FROM t", schema_name=sn)
+        conn.execute_sql(
+            "CREATE VIEW mixed AS SELECT id FROM t UNION ALL SELECT id FROM s",
+            schema_name=sn)
+        conn.execute_sql(
+            "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in range(1, 6)),
+            schema_name=sn)
+    own_server.restart(graceful=True)
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.execute_sql(
+            "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in range(6, 11)),
+            schema_name=sn)
+
+    own_server.restart()
+    assert own_server.rebuilt_view_count() == 1, "the stream-fed view alone rebuilds"
+    with gnitz.connect(own_server.sock_path) as conn:
+        assert bag(scanned(conn, sn, "mixed"), "id") == {(k,): 1 for k in range(1, 11)}, \
+            "cut + tail, each row once"
+        assert bag(scanned(conn, sn, "ok"), "id", "val") == {
+            (k, k * 10): 1 for k in range(1, 11)}
+
+
 def test_a_stateful_view_resumes_from_its_operator_traces(own_server):
     """A GROUP BY view holds operator traces in `scratch_*` children of its own,
     where a projection holds none — so it is the only shape whose resume verdict

@@ -31,7 +31,7 @@ fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> 
 
     let vid = register_identity_view(&mut engine, tid, "v_weighted", &cols);
 
-    let mut bb = BatchBuilder::new(engine.registry().relation(vid).map(Relation::schema).unwrap());
+    let mut bb = BatchBuilder::new(engine.registry.relation(vid).map(Relation::schema).unwrap());
     for (id, val, w) in rows {
         bb.begin_row(id as u128, w);
         bb.put_u64(val as u64);
@@ -61,14 +61,14 @@ fn identity_spec(bound: ReadBound, order: Vec<OrderKey>, limit_k: u64) -> ReadSp
 }
 
 fn run(engine: &mut CatalogEngine, tid: i64, spec: &ReadSpec) -> Vec<(u128, i64, i64)> {
-    let reply_schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
+    let reply_schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let keeper = engine.scan_spec(tid, spec.clone(), &reply_schema).unwrap();
     triples(&keeper)
 }
 
 /// A `pk IN (…)` bound naming `keys` (native values) as `id`'s own OPK images.
 fn pk_set(engine: &CatalogEngine, id: i64, keys: impl IntoIterator<Item = u128>) -> ReadBound {
-    let schema = engine.registry().relation(id).map(Relation::schema).unwrap();
+    let schema = engine.registry.relation(id).map(Relation::schema).unwrap();
     let opk: Vec<_> = keys.into_iter().map(|k| opk_pk(&schema, &[k])).collect();
     ReadBound::PkSet(PkKeys::from_keys(schema.pk_stride(), opk.iter().map(Vec::as_slice)))
 }
@@ -134,7 +134,7 @@ fn pk_set_gathers_named_keys() {
 #[test]
 fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
-    let sys_schema = e.registry().relation(TABLE_TAB_ID).map(Relation::schema).unwrap();
+    let sys_schema = e.registry.relation(TABLE_TAB_ID).map(Relation::schema).unwrap();
     let spec = identity_spec(pk_set(&e, TABLE_TAB_ID, [tid as u128]), vec![], 0);
     let keeper = e.scan_spec(TABLE_TAB_ID, spec, &sys_schema).unwrap();
     assert_eq!(
@@ -152,7 +152,7 @@ fn pk_set_rejects_a_key_stride_other_than_the_relations() {
     let (mut e, tid) = fixture("ss_pkset_stride", 10, |i| i as i64);
     let keys = PkKeys::from_keys(16, [&[0u8; 16][..]]);
     let spec = identity_spec(ReadBound::PkSet(keys), vec![], 0);
-    let reply_schema = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let reply_schema = e.registry.relation(tid).map(Relation::schema).unwrap();
     let Err(err) = e.scan_spec(tid, spec, &reply_schema) else {
         panic!("a PkSet at the wrong stride must be rejected");
     };
@@ -172,7 +172,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     let cols = id_val_cols();
     let tid = create_flagged_table(&mut e, "rep", &cols, &[0], replicated_flags());
     assert!(
-        e.registry()
+        e.registry
             .relation(tid)
             .map(Relation::schema)
             .unwrap()
@@ -181,7 +181,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
         "REPLICATED must stamp a replicated placement"
     );
 
-    let schema = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = e.registry.relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for id in 0..N {
         bb.begin_row(id, 1);
@@ -206,7 +206,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
         .map(|id| gnitz_store::schema::key::opk_key(&schema, &id.to_le_bytes()))
         .collect();
     let gathered = e
-        .registry()
+        .registry
         .gather_bytes(tid, pks.iter().flat_map(|p| p.pk_bytes()).copied().collect(), 1)
         .unwrap();
     assert_eq!(gathered.len(), N as usize, "every parent key must dereference");
@@ -231,7 +231,7 @@ fn keyed_reads_over_a_view_return_the_whole_pk_group() {
     let rows = [(7u64, 50i64, 1i64), (7, 100, 1), (7, 200, 1), (7, 300, 1), (9, 900, 1)];
     let (mut e, vid) = weighted_fixture("ss_view_group", rows.into_iter());
     // Retract (7, 50) in a second ingest: it folds to net zero at read time.
-    let mut bb = BatchBuilder::new(e.registry().relation(vid).map(Relation::schema).unwrap());
+    let mut bb = BatchBuilder::new(e.registry.relation(vid).map(Relation::schema).unwrap());
     bb.begin_row(7, -1);
     bb.put_u64(50);
     bb.end_row();
@@ -282,7 +282,7 @@ fn pk_set_drains_a_group_larger_than_the_chunk_budget() {
             .map(|i| (1u64, i as i64, 1i64))
             .chain(std::iter::once((2u64, 99i64, 1i64))),
     );
-    e.registry_mut().set_scan_chunk_rows(4);
+    e.registry.set_scan_chunk_rows(4);
     let got = run_pk_set(&mut e, vid, [1, 2]);
     let want: Vec<_> = (0..10i64)
         .map(|v| (1u128, v, 1i64))
@@ -309,7 +309,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     ];
     // CLUSTER BY a: distribution prefix = the first of the two PK columns.
     let tid = create_flagged_table(&mut e, "clus", &cols, &[0, 1], clustered_flags(1));
-    let schema = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let schema = e.registry.relation(tid).map(Relation::schema).unwrap();
     assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ an 8-byte prefix");
 
     let mut bb = BatchBuilder::new(schema);
@@ -393,7 +393,7 @@ fn order_key_column_out_of_range_is_rejected() {
         vec![OrderKey { col: 99, desc: false, nulls_first: false }],
         0,
     );
-    let reply_schema = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let reply_schema = e.registry.relation(tid).map(Relation::schema).unwrap();
     assert!(e.scan_spec(tid, spec, &reply_schema).is_err());
 }
 
@@ -454,7 +454,7 @@ fn huge_limit_does_not_truncate_the_early_stop() {
     // wrong answer at a trust boundary.
     let (mut e, tid) = fixture("ss_huge_limit", 40, |i| i as i64);
     // Five chunks, so a wrapped window cuts the scan after the first one.
-    e.registry_mut().set_scan_chunk_rows(8);
+    e.registry.set_scan_chunk_rows(8);
     for limit_k in [1u64 << 63, u64::MAX] {
         let mut got = run(&mut e, tid, &identity_spec(ReadBound::None, vec![], limit_k));
         got.sort();
@@ -479,7 +479,7 @@ fn proj_fixture(
     put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
     let (mut engine, tid) = ingest_fixture(name, cols, n, 1, put_row);
-    engine.registry_mut().set_scan_chunk_rows(chunk_rows);
+    engine.registry.set_scan_chunk_rows(chunk_rows);
     (engine, tid)
 }
 
@@ -498,7 +498,7 @@ fn gather_of_64_payload_columns_covers_every_slot() {
     });
     // Identity-order gather of every payload column: src col k+1 → out slot k.
     let copies: Vec<(u32, u32)> = (0..P as u32).map(|k| (k + 1, k)).collect();
-    let reply = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let reply = e.registry.relation(tid).map(Relation::schema).unwrap();
     let spec = rows_spec(vec![], map_of(proj_blob(&copies), &reply), vec![], 0);
     let got = e.scan_spec(tid, spec, &reply).unwrap();
     assert_eq!(got.len(), 40);
@@ -702,9 +702,9 @@ fn projection_missing_an_output_slot_errs() {
 #[test]
 fn gather_top_k_keeps_boundary_row_whole() {
     let (mut e, tid) = weighted_fixture("ss_gather_topk", (0..40u64).map(|id| (id, id as i64, 3i64)));
-    e.registry_mut().set_scan_chunk_rows(8);
+    e.registry.set_scan_chunk_rows(8);
     // Reply: id U64 PK | val I64 — a gather of the single payload column.
-    let reply = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let reply = e.registry.relation(tid).map(Relation::schema).unwrap();
     let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
     let spec = rows_spec(vec![], map_of(proj_blob(&[(1, 0)]), &reply), order, 2);
     let got = e.scan_spec(tid, spec, &reply).unwrap();
@@ -727,7 +727,7 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
     let (mut e, tid) = proj_fixture("ss_gather_earlystop", &cols, 500, 256, |bb, id| {
         bb.put_u64(id % 2);
     });
-    let reply = e.registry().relation(tid).map(Relation::schema).unwrap();
+    let reply = e.registry.relation(tid).map(Relation::schema).unwrap();
     let spec = rows_spec(pred_lt_blob(1, 1), map_of(proj_blob(&[(1, 0)]), &reply), vec![], 5);
     let got = e.scan_spec(tid, spec, &reply).unwrap();
     let total: i64 = (0..got.len()).map(|r| got.get_weight(r)).sum();

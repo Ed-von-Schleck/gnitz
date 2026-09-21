@@ -100,7 +100,7 @@ impl CatalogEngine {
         let members = self.schema_members(sid);
         let (views, tables): (Vec<i64>, Vec<i64>) = members
             .into_iter()
-            .partition(|id| self.registry().relation(*id).is_some_and(|e| e.kind().is_view()));
+            .partition(|id| self.registry.relation(*id).is_some_and(|e| e.kind().is_view()));
         for vid in views {
             // Clears the plan caches only — the view stays registered, so the
             // drop cascade's the registry guard still resolves it.

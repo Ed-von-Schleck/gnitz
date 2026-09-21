@@ -214,7 +214,7 @@ pub fn seek_by_index_range(
     range: gnitz_wire::RangeDescriptor,
 ) -> Result<(Option<std::rc::Rc<Batch>>, gnitz_store::schema::SchemaDescriptor), gnitz_wire::WireFault> {
     let schema = engine
-        .registry()
+        .registry
         .relation_or_err(tid)
         .map_err(|e| gnitz_wire::WireFault::from(e.to_string()))?
         .schema();
