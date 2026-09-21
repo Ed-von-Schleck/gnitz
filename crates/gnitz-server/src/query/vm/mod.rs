@@ -211,15 +211,11 @@ impl Instr {
     }
 }
 
-/// A compiled program with the registers and child stores it runs over.
+/// A compiled program with the registers it runs over.
 pub(in crate::query) struct VmHandle {
     pub(in crate::query) program: Program,
     /// One batch per delta register.
     batches: Vec<Batch>,
-    /// The child stores created during compilation, in the index space
-    /// [`StateIdx`] names. Here and not on the immutable `Program` so the
-    /// dispatch can hold `&Program` and `&mut CircuitState` at once.
-    pub(in crate::query) state: CircuitState,
     /// No epoch has been dispatched yet and the program carries a global-ground
     /// `Reduce` this worker owns — the one reason an all-empty epoch is worth
     /// dispatching.
@@ -241,7 +237,7 @@ impl VmHandle {
 // ---------------------------------------------------------------------------
 
 /// A compiled DBSP program: immutable once built, owning every resource its
-/// instructions name except the mutable child stores ([`VmHandle`]).
+/// instructions name except the mutable child stores ([`CircuitState`]).
 pub(in crate::query) struct Program {
     instructions: Vec<Instr>,
     /// Run after the whole instruction range — and not at all by a replay, which

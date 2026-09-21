@@ -125,15 +125,6 @@ impl CatalogEngine {
         }
     }
 
-    /// Compile a just-registered view's circuit and throw the result away, so a
-    /// circuit the engine cannot run is rejected while the DDL is still undoable.
-    pub(crate) fn preflight_view_compile(&self, vid: i64) -> Result<(), String> {
-        let root = preflight_dir(&self.base_dir, vid);
-        let verdict = self.dag.preflight_compile(&self.registry, vid, &root);
-        let _ = std::fs::remove_dir_all(&root);
-        verdict
-    }
-
     // -----------------------------------------------------------------------
     // Stage-A compensation (DDL rollback)
     // -----------------------------------------------------------------------

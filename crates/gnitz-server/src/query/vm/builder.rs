@@ -18,7 +18,6 @@ pub(in crate::query) fn build(
     mut instructions: Vec<Instr>,
     integrates: Vec<(DeltaReg, StateIdx)>,
     delta_schemas: Vec<SchemaDescriptor>,
-    state: CircuitState,
     out_reg: DeltaReg,
 ) -> Box<VmHandle> {
     // Destructive-register liveness, over the EMITTED instructions — so an
@@ -78,7 +77,6 @@ pub(in crate::query) fn build(
             delta_schemas: shrunk(delta_schemas),
             out_reg,
         },
-        state,
         pending_ground_row,
     })
 }

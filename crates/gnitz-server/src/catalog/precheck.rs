@@ -2,7 +2,7 @@
 //! system-table deltas — and the registration guards `hooks.rs` re-runs for the
 //! paths whose rows are not a client's.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use super::*;
 use gnitz_expr::{cmp_order_keys, OrderLocator, RowSource, SchemaFacts};
@@ -235,28 +235,17 @@ fn check_col_narrowings(batch: &Batch, row: usize) -> Result<(), String> {
 
 /// A circuit `+1` may only name a view this same transaction creates — one under
 /// a foreign `view_id` would pin its source table's drop or rewrite a running
-/// circuit — and no view may exceed the node cap.
-///
-/// Checked on the write side too: a circuit only `LoadedCircuit::new` refused
-/// would be durable and permanently unloadable.
+/// circuit.
 fn check_circuit_rows(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
     // Sorted once: this runs per row of a client-supplied block bounded only by
     // the 64 MB frame.
     let mut created: Vec<i64> = new_view_ids.to_vec();
     created.sort_unstable();
-    let mut per_view: FxHashMap<i64, usize> = FxHashMap::default();
     for i in batch.live_rows() {
         let view_id = SysFamily::CircuitNodes.leading_id(batch.get_pk(i));
         if created.binary_search(&view_id).is_err() {
             return Err(format!(
                 "circuit row names view {view_id}, which this transaction does not create"
-            ));
-        }
-        let n = per_view.entry(view_id).or_default();
-        *n += 1;
-        if *n > MAX_CIRCUIT_NODES {
-            return Err(format!(
-                "view {view_id} exceeds the {MAX_CIRCUIT_NODES}-node circuit limit"
             ));
         }
     }
@@ -541,7 +530,7 @@ impl CatalogEngine {
     /// compiled circuit's `ScanDelta` register schema is baked from the base
     /// descriptor and its operator traces hold re-keyed base rows at the old
     /// shape.
-    fn reject_if_dependent_views(&self, owner_id: i64, op: &str) -> Result<(), String> {
+    pub(in crate::catalog) fn reject_if_dependent_views(&self, owner_id: i64, op: &str) -> Result<(), String> {
         // Name the table and one blocking view: the recovery is to drop that
         // view, which a bare id leaves the author to go and look up.
         let blockers = self.dag.dependents_of(owner_id);

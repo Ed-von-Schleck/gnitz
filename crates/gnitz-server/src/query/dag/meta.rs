@@ -1,8 +1,6 @@
 //! The view-dependency graph, the closures over it, and the placement fold.
 
 use super::*;
-use gnitz_store::relation::Relation;
-use std::collections::hash_map::Entry;
 
 /// The bidirectional view-dependency index, kept current by every `CircuitNodes` delta.
 /// A `forward` / `reverse` entry exists only while it holds an id.
@@ -80,10 +78,6 @@ impl DagEngine {
     /// Every relation reachable from `seeds` by following `view → sources` edges
     /// — through view sources, down to the bases — with the seeds themselves
     /// excluded.
-    ///
-    /// Applies no `tables` kind filter, so a source absent from `tables` is still
-    /// reported: the read-freshness test that drives this must not narrow its own
-    /// input, or a dropped source would vanish from the closure and read as fresh.
     pub(crate) fn source_closure(&self, seeds: Vec<i64>) -> FxHashSet<i64> {
         DepMap::closure(&self.dep.reverse, seeds)
     }
@@ -95,19 +89,8 @@ impl DagEngine {
         DepMap::closure(&self.dep.forward, seeds)
     }
 
-    /// Transitive base-table sources of `seeds` (views), deduplicated and
-    /// sorted: walk each seed's source chain — recursing through view sources —
-    /// down to the base tables. The live CREATE-VIEW drain ticks exactly these
-    /// (so every base feeding the new view, directly or through an existing view
-    /// source, has its `pending_deltas` delivered to its existing dependents
-    /// before the new view backfills); boot's recovery tick sweep drives every
-    /// base reachable from *all* views through `drain_tick_blocking`. Sorted for a
-    /// reproducible drive order.
-    ///
-    /// The `is_base_table` filter excludes a stream, so a new view over one is not
-    /// preceded by a drain: it backfills from the stream's empty store and starts
-    /// accumulating from its own registration. Whether a row pushed just before the
-    /// CREATE lands in it therefore depends on whether its tick had already fired.
+    /// The base tables — not streams — that `seeds`' source chains reach through
+    /// view sources, sorted.
     pub(crate) fn base_tables_reachable_from(&self, registry: &RelationRegistry, seeds: Vec<i64>) -> Vec<i64> {
         let mut bases: Vec<i64> = self
             .source_closure(seeds)
@@ -124,9 +107,7 @@ impl DagEngine {
     }
 
     /// Where a view's rows live — the value `Relation` stamps — folded from
-    /// its `sources`' **stamped** placements. `pk_arity` is the view's own
-    /// declared PK column count (it is not registered yet, so the arity cannot
-    /// be read back off the registry).
+    /// its sources' **stamped** placements and its freshly derived `meta`.
     ///
     /// Reading the sources' stamped placement rather than re-deriving "has a
     /// replicated source" from the direct sources is what makes the property
@@ -135,13 +116,14 @@ impl DagEngine {
     ///
     /// `Local` is safe whatever the circuit did — a read of a `Local` relation
     /// gathers every worker — where `Keyed` unicasts to the one its key names.
-    pub(crate) fn view_placement(
-        &mut self,
+    pub(super) fn placement_of(
+        &self,
         registry: &RelationRegistry,
         view_id: i64,
-        sources: &[i64],
+        meta: &ViewMeta,
         pk_arity: usize,
     ) -> Placement {
+        let sources = self.sources_of(view_id);
         // An unregistered source proves nothing, so it reads as the keyed default.
         let placed = |t: &i64| {
             registry
@@ -167,11 +149,12 @@ impl DagEngine {
             return Placement::KEYED_DEFAULT;
         };
         let (source_placement, source_pk_arity) = placed(src);
-        // Last, because it can cost a circuit load where the tests above are map lookups.
-        match self.view_meta(registry, view_id) {
-            Ok(m) if m.places_rows_by_own_key() => Placement::KEYED_DEFAULT,
-            Ok(m) if m.pk_source == Some(*src) && source_pk_arity == pk_arity => source_placement,
-            _ => Placement::Local,
+        if meta.places_rows_by_own_key() {
+            Placement::KEYED_DEFAULT
+        } else if meta.pk_source == Some(*src) && source_pk_arity == pk_arity {
+            source_placement
+        } else {
+            Placement::Local
         }
     }
 }

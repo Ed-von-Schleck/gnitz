@@ -1,15 +1,12 @@
 //! L5 query core — the circuit compiler, the DBSP bytecode VM, and the DAG
-//! scheduler, behind one facade.
-//!
-//! `dag` is the de-facto facade: it owns the per-view memo and the epoch
-//! evaluator, and is the single inbound target catalog + runtime reach for.
-//! `compiler` (view → circuit → VM program) and `vm` (program execution) are
-//! query-internal — only `dag` and each other call into them. `RelayRoute`, the
-//! enum the master relay matches on, is the one name that leaves.
+//! scheduler. `dag` is the facade the catalog and the runtime reach for;
+//! `compiler` and `vm` are internal to it.
 
 mod compiler;
 mod dag;
 mod vm;
 
-pub(crate) use compiler::{RelayRoute, MAX_CIRCUIT_NODES, OUTPUT_RELAY};
-pub(crate) use dag::{DagEngine, Drive, ExchangeCallback};
+#[cfg(test)]
+pub(crate) use compiler::MAX_CIRCUIT_NODES;
+pub(crate) use compiler::{RelayRoute, OUTPUT_RELAY};
+pub(crate) use dag::{drive, preflight_compile, DagEngine, Drive, DriveHost};

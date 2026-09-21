@@ -1,19 +1,8 @@
-//! Thread-local cost counters, for the claims in this suite that are about cost
-//! rather than about answers: instructions retired, and voluntary context
-//! switches — one per park, so a removed round trip shows up as one fewer.
-//!
-//! Wall clock is not evidence here: the number that would falsify "the round
-//! trip is gone" is retired instructions, which is immune to the frequency and
-//! scheduling noise a wall-clock comparison folds in.
-//!
-//! It counts **this thread**, kernel time included where the kernel allows it —
-//! which is the right scope for the claim, because what a mirror removes from a
-//! caller is the caller's own syscall, socket and wakeup work. The server
-//! processes' work is outside it by construction and is not the caller's cost.
-//!
-//! `perf_event_attr`'s first 64 bytes are its version-0 layout, and the kernel
-//! reads `min(size, its own sizeof)` — so a struct of exactly those fields, with
-//! `size` set to match, is the whole ABI this needs.
+//! Cost probes for benchmarks and cost-claim tests, immune to the frequency and
+//! scheduling noise in wall clock: instructions retired and voluntary context
+//! switches on the calling thread, and this process's resident set.
+
+/// `perf_event_attr`'s version-0 layout; the kernel reads `size` bytes of it.
 #[repr(C)]
 #[derive(Default)]
 struct PerfEventAttr {
@@ -30,6 +19,8 @@ struct PerfEventAttr {
     config1: u64,
 }
 
+const _: () = assert!(std::mem::size_of::<PerfEventAttr>() == 64);
+
 const PERF_TYPE_HARDWARE: u32 = 0;
 const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
 const FLAG_DISABLED: u64 = 1 << 0;
@@ -42,17 +33,13 @@ const IOC_RESET: libc::c_ulong = 0x2403;
 /// An open counter for the calling thread.
 pub struct Instructions {
     fd: libc::c_int,
-    /// Whether kernel-mode instructions are counted. They are what a served
-    /// read's syscall, socket and wakeup path spend on the caller's behalf — the
-    /// cost a local read removes — so the counter asks for them and only falls
-    /// back to user-only where `perf_event_paranoid` refuses.
+    /// Whether kernel-mode instructions are counted; `perf_event_paranoid` can
+    /// refuse them.
     pub counts_kernel: bool,
 }
 
 impl Instructions {
-    /// `None` where the kernel refuses the counter outright —
-    /// `perf_event_paranoid` at its strictest, a container without the
-    /// capability — so a caller skips rather than fails.
+    /// `None` where the kernel refuses the counter outright.
     pub fn open() -> Option<Self> {
         Self::open_with(false)
             .map(|fd| Instructions { fd, counts_kernel: true })
@@ -103,4 +90,34 @@ pub fn voluntary_ctx_switches() -> i64 {
         libc::getrusage(libc::RUSAGE_THREAD, &mut ru);
         ru.ru_nvcsw
     }
+}
+
+/// Bytes of `field` (`VmRSS`, `VmHWM`, …) in `/proc/self/status`. `0` where
+/// `/proc` does not answer.
+fn status_bytes(field: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        })
+        .map_or(0, |kb| kb * 1024)
+}
+
+/// This process's resident set, in bytes. `0` where `/proc` does not answer.
+pub fn rss_bytes() -> u64 {
+    status_bytes("VmRSS")
+}
+
+/// This process's peak resident set since it started or since the last
+/// [`reset_peak_rss`], in bytes. `0` where `/proc` does not answer.
+pub fn peak_rss_bytes() -> u64 {
+    status_bytes("VmHWM")
+}
+
+/// Reset [`peak_rss_bytes`] to the current resident set, so a peak measures one
+/// region. A no-op where `/proc/self/clear_refs` is not writable.
+pub fn reset_peak_rss() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
 }

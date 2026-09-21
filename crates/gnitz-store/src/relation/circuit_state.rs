@@ -1,95 +1,62 @@
-//! The rederived operator state of one compiled circuit: the stores its
-//! stateful operators read and write, owned by the plan that compiled them.
+//! The rederived operator state of one compiled circuit: the children its
+//! compile declares, and the stores it opens for them.
 
 use super::RelationRegistry;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{
-    create_child, remove_child, Batch, ChildAddr, ReadCursor, RecoverySource, StorageError, StoreError, Table,
-};
-
-/// The policy `view_id`'s **output store** was opened under, frozen at that open
-/// — so a view's operator traces cannot look for a different manifest generation
-/// than the output they feed, which the registry's *current* verdict would give.
-fn output_store_recovery(reg: &RelationRegistry, view_id: i64) -> RecoverySource {
-    reg.relation(view_id)
-        .map_or(RecoverySource::Rederive { resume_at: None }, |r| {
-            r.store().recovery_source()
-        })
-}
+use crate::storage::{Batch, ChildAddr, ReadCursor, StorageError, StoreError, Table};
 
 /// A `u16` index into one [`CircuitState`], minted only by
-/// [`CircuitState::open_child`].
+/// [`StateLayout::declare`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StateIdx(u16);
 
+/// The children one compiled circuit declares, in [`StateIdx`] order.
+#[derive(Default)]
+pub struct StateLayout {
+    children: Vec<(String, SchemaDescriptor)>,
+}
+
+impl StateLayout {
+    /// Declare one rederived child store named `child`.
+    pub fn declare(&mut self, child: String, schema: SchemaDescriptor) -> StateIdx {
+        let idx =
+            StateIdx(u16::try_from(self.children.len()).expect("a circuit declares far fewer than 65536 children"));
+        self.children.push((child, schema));
+        idx
+    }
+
+    /// The schema of the child `idx` names.
+    pub fn schema_of(&self, idx: StateIdx) -> &SchemaDescriptor {
+        &self.children[idx.0 as usize].1
+    }
+}
+
 /// The rederived operator state of one compiled circuit: the stores its stateful
-/// operators read and write, addressed by [`StateIdx`]. Owned by the plan that
-/// compiled them, so a compile that keeps nothing closes its stores when the
-/// plan drops.
-///
-/// **Drop removes every directory this state created** and [`Self::commit`] has
-/// not released — never one that was already there, which would silently strip a
-/// checkpointed trace out of the next boot's resume verdict.
+/// operators read and write, addressed by [`StateIdx`].
 #[derive(Default)]
 pub struct CircuitState {
     tables: Vec<Table>,
-    created: Vec<String>,
-}
-
-impl Drop for CircuitState {
-    fn drop(&mut self) {
-        // Close every store before its directory goes. A committed state drained
-        // `created` at the commit, so this removes nothing.
-        self.tables.clear();
-        for dir in self.created.drain(..) {
-            let _ = remove_child(&dir);
-        }
-    }
 }
 
 impl CircuitState {
-    pub fn new() -> Self {
-        CircuitState::default()
-    }
-
-    /// Create and open one rederived child store of `view_id`, named `child` at
-    /// this registry's own rank under `root` — the view's own directory, or a
-    /// throwaway root for a compile that keeps nothing.
-    ///
-    /// The budgets are the registry's unbounded ones: a bounded view's skeleton
-    /// rows are recomputed from these traces, so a capacity here would let the
-    /// sweep skeletonize what the hydration reads back.
-    pub fn open_child(
-        &mut self,
-        reg: &RelationRegistry,
-        view_id: i64,
-        root: &str,
-        child: &str,
-        schema: SchemaDescriptor,
-    ) -> Result<StateIdx, StoreError> {
-        let recovery = output_store_recovery(reg, view_id);
-        let dir = ChildAddr::Scratch { child, rank: reg.slot().rank }.dir(root);
-        if create_child(&dir).map_err(|e| StoreError::storage(format!("create child store '{dir}'"), e))? {
-            self.created.push(dir.clone());
-        }
-        let table = Table::new(&dir, schema, recovery, reg.store_budgets())
-            .map_err(|e| StoreError::storage(format!("open child store '{dir}'"), e))?;
-        let idx = StateIdx(u16::try_from(self.tables.len()).expect("a plan holds far fewer than 65536 child stores"));
-        self.tables.push(table);
-        Ok(idx)
-    }
-
-    /// Keep what this state created: release the paths, so drop removes none of
-    /// them. Freed rather than flagged, because a committed state lives as long
-    /// as the cached plan that owns it and never reads them again.
-    pub fn commit(&mut self) {
-        self.created = Vec::new();
-    }
-
-    /// The schema of the store `idx` names — how a compiler types an operand it
-    /// reaches only through its table.
-    pub fn schema_of(&self, idx: StateIdx) -> &SchemaDescriptor {
-        self.at(idx).schema()
+    /// Open every child `layout` declares, in registered view `view_id`'s
+    /// directory at this registry's rank.
+    pub fn open(reg: &RelationRegistry, view_id: i64, layout: StateLayout) -> Result<Self, StoreError> {
+        let view = reg.relation_or_err(view_id)?;
+        // The output store's policy, not the registry's current one: the traces
+        // must resume from the generation the output they feed resumed from.
+        let recovery = view.store().recovery_source();
+        let tables = layout
+            .children
+            .into_iter()
+            .map(|(child, schema)| {
+                let dir = ChildAddr::Scratch { child: &child, rank: reg.slot().rank }.dir(view.directory());
+                // Unbounded: a bounded view's hydration reads these traces back.
+                Table::new(&dir, schema, recovery, reg.store_budgets())
+                    .map_err(|e| StoreError::storage(format!("open child store '{dir}'"), e))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(CircuitState { tables })
     }
 
     pub fn cursor(&self, idx: StateIdx) -> ReadCursor {

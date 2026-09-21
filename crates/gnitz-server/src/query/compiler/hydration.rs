@@ -37,21 +37,15 @@ pub(in crate::query) enum HydrationSeed {
 fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, String> {
     use gnitz_wire::{JoinKind, OpNode};
 
-    // 1. From the sink's input, walk back through single-input Filter/Map nodes.
-    let mut cur = loaded.inputs(loaded.sink()?).unary();
-    loop {
-        match loaded.op(cur) {
-            // The linear shape: the whole program replays over the source store,
-            // seeded at this `ScanDelta`'s own register.
-            OpNode::ScanDelta { source, .. } => {
-                return Ok(HydrationNodes::Relation { nid: cur, source: *source as i64 })
-            }
-            OpNode::Union => break,
-            op if keeps_rows_and_pk_region(op) => cur = loaded.inputs(cur).unary(),
-            _ => return Err("bounded view: unsupported circuit shape".into()),
-        }
+    // 1. From the sink's input, walk back through the row-local Filter/Map nodes.
+    let (union, _) = row_local_origin(loaded, loaded.inputs(loaded.sink()?).unary());
+    match loaded.op(union) {
+        // The linear shape: the whole program replays over the source store,
+        // seeded at this `ScanDelta`'s own register.
+        OpNode::ScanDelta { source, .. } => return Ok(HydrationNodes::Relation { nid: union, source: *source as i64 }),
+        OpNode::Union => {}
+        _ => return Err("bounded view: unsupported circuit shape".into()),
     }
-    let union = cur;
 
     // 2. Both `Union` inputs must be `Join(Equi)`: each term writes its own side
     //    order, so neither branch carries a reordering `Map`.

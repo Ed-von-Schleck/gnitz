@@ -10,7 +10,7 @@
 use super::*;
 use crate::query::vm::{BakedReduce, BakedTopN, Instr, Op};
 use gnitz_store::ops::{ClampPreset, JoinPlan};
-use gnitz_store::relation::CircuitState;
+use gnitz_store::relation::StateLayout;
 
 // ---------------------------------------------------------------------------
 // EmitCtx — the per-plan build state every emit arm works against
@@ -24,8 +24,10 @@ pub(super) struct EmitCtx<'a> {
     /// nothing (the trim would drop rows it legitimately owns a copy of), and
     /// `emit_reduce` makes it the owner of the global-aggregate seed.
     self_contained: bool,
-    site: super::ViewSite<'a>,
-    state: CircuitState,
+    /// Answers the schemas and the slot.
+    registry: &'a RelationRegistry,
+    /// Every child the view's sub-plans declare, in one index space.
+    layout: &'a mut StateLayout,
     instructions: Vec<Instr>,
     integrates: Vec<(DeltaReg, StateIdx)>,
     delta_schemas: Vec<SchemaDescriptor>,
@@ -58,18 +60,10 @@ impl OutReg {
 }
 
 impl EmitCtx<'_> {
-    /// Open one child store of this plan's operator state. The returned
-    /// [`StateIdx`] is the only way to reach it.
-    fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<StateIdx, String> {
-        self.state
-            .open_child(
-                self.site.registry,
-                self.site.id as i64,
-                self.site.dir,
-                child_name,
-                schema,
-            )
-            .map_err(|e| format!("child table create failed: {e}"))
+    /// Declare one child store of the view's operator state, named after `kind`
+    /// and the node. The returned [`StateIdx`] is the only way to reach it.
+    fn declare_child(&mut self, kind: &str, nid: NodeId, schema: SchemaDescriptor) -> StateIdx {
+        self.layout.declare(format!("{kind}_{nid}"), schema)
     }
 
     fn push(&mut self, in_reg: DeltaReg, out_reg: DeltaReg, op: Op) {
@@ -136,7 +130,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             // A circuit scanning an unknown table is corrupt: the planner
             // registers every source before shipping the circuit.
             let schema = ctx
-                .site
                 .registry
                 .relation(*tid as i64)
                 .map(Relation::schema)
@@ -189,11 +182,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             let plan =
                 gnitz_store::ops::TopNPlan::from_wire(&ctx.reg_schema(in_reg), group_cols, order, *limit, *offset)?;
             let out_schema = plan.output_schema;
-            let out_trace = ctx.create_child_table(&format!("_topn_{}_{nid}", ctx.site.id), out_schema)?;
+            let out_trace = ctx.declare_child("topn", nid, out_schema);
             let out_reg = ctx.push_delta_reg(out_schema);
-            // The ordered index of every input row — the operator's whole
-            // history, so a failed create fails the compile as a reduce's does.
-            let index_table = ctx.create_child_table(&format!("_topnidx_{}_{nid}", ctx.site.id), plan.index.schema)?;
+            // The ordered index of every input row — the operator's whole history.
+            let index_table = ctx.declare_child("topnidx", nid, plan.index.schema);
             let baked = Box::new(BakedTopN { plan, index_table });
             ctx.push(in_reg, out_reg, Op::TopN { out_trace, plan: baked });
             ctx.integrates.push((out_reg, out_trace));
@@ -207,7 +199,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
                 *kind,
                 *delta_is_right,
                 &ctx.reg_schema(delta_reg),
-                ctx.state.schema_of(trace),
+                ctx.layout.schema_of(trace),
             )?;
             let out_reg = ctx.push_delta_reg(plan.out_schema);
             ctx.push(delta_reg, out_reg, Op::JoinDT { trace, probe: plan.probe });
@@ -223,10 +215,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
         gnitz_wire::OpNode::IntegrateTrace => {
             let in_reg = ctx.unary_delta_in(nid)?;
             let in_reg_schema = ctx.reg_schema(in_reg);
-            // Must fail the compile on a table-open error: emitting the view without
-            // the Integrate would compile a view that never persists its differential
-            // state, leaving its output permanently empty.
-            let trace = ctx.create_child_table(&format!("_int_{}_{nid}", ctx.site.id), in_reg_schema)?;
+            let trace = ctx.declare_child("int", nid, in_reg_schema);
             ctx.integrates.push((in_reg, trace));
             Ok(OutReg::Trace(trace))
         }
@@ -239,7 +228,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
             // Drops the rows this worker does not own before they reach
             // `integrate_trace`, by the compile-time slot.
             let in_reg = ctx.unary_delta_in(nid)?;
-            let slot = ctx.site.registry.slot();
+            let slot = ctx.registry.slot();
             // A replicated view runs correct-local over the full broadcast, and at
             // one worker every partition is owned here — the filter is the identity
             // either way, and executing it would clone the whole delta each epoch.
@@ -277,7 +266,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: NodeId, op: &gnitz_wire::OpNode)
 fn emit_clamp(ctx: &mut EmitCtx, nid: NodeId, preset: ClampPreset) -> Result<OutReg, String> {
     let in_reg = ctx.unary_delta_in(nid)?;
     let schema = ctx.reg_schema(in_reg);
-    let hist = ctx.create_child_table(&format!("_hist_{}_{nid}", ctx.site.id), schema)?;
+    let hist = ctx.declare_child("hist", nid, schema);
     let out_reg = ctx.push_delta_reg(schema);
     ctx.push(in_reg, out_reg, Op::WeightClamp { hist, preset });
     Ok(OutReg::Delta(out_reg))
@@ -336,7 +325,7 @@ fn emit_reduce(
         return Err("reduce: a global aggregate under a keyed exchange shard".into());
     }
     let unsharded = shard_cols.is_none();
-    let slot = ctx.site.registry.slot();
+    let slot = ctx.registry.slot();
     let i_am_owner = ctx.self_contained
         || unsharded
         || slot.rank as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), slot.of as usize);
@@ -344,18 +333,16 @@ fn emit_reduce(
     let plan = gnitz_store::ops::ReducePlan::from_wire(&in_reg_schema, group_cols, agg, global_ground, i_am_owner)?;
     let reduce_out_schema = plan.shape.output_schema;
 
-    let out_trace = ctx.create_child_table(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema)?;
+    let out_trace = ctx.declare_child("reduce", nid, reduce_out_schema);
     let out_reg = ctx.push_delta_reg(reduce_out_schema);
 
     // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
     // share a table_id, scratch dir and compaction namespace and cannot collide on
-    // a memory-pressure flush. `?`, not a swallowed failure: a non-linear reduce
-    // has no other history, and would otherwise compute MIN/MAX from the delta
-    // alone while still retracting the old row.
-    let avi_table = match &plan.avi {
-        Some(bake) => Some(ctx.create_child_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema)?),
-        None => None,
-    };
+    // a memory-pressure flush.
+    let avi_table = plan
+        .avi
+        .as_ref()
+        .map(|bake| ctx.declare_child("avidx", nid, bake.schema));
 
     let baked = Box::new(BakedReduce::new(plan, avi_table));
     ctx.push(in_reg_id, out_reg, Op::Reduce { out_trace, plan: baked });
@@ -373,7 +360,8 @@ fn emit_reduce(
 pub(super) fn build_plan(
     loaded: &LoadedCircuit,
     ordered: &[NodeId],
-    site: super::ViewSite<'_>,
+    registry: &RelationRegistry,
+    layout: &mut StateLayout,
     self_contained: bool,
     seeds: &[(NodeId, SchemaDescriptor)],
     out: NodeId,
@@ -381,8 +369,8 @@ pub(super) fn build_plan(
     let mut ctx = EmitCtx {
         loaded,
         self_contained,
-        site,
-        state: CircuitState::new(),
+        registry,
+        layout,
         instructions: Vec::with_capacity(16),
         integrates: Vec::new(),
         delta_schemas: Vec::new(),
@@ -402,13 +390,12 @@ pub(super) fn build_plan(
         instructions,
         integrates,
         delta_schemas,
-        state,
         source_reg_map,
         out_reg_of,
         ..
     } = ctx;
     let plan = SubPlan {
-        vm: crate::query::vm::build(instructions, integrates, delta_schemas, state, out_reg),
+        vm: crate::query::vm::build(instructions, integrates, delta_schemas, out_reg),
         source_reg_map,
     };
     Ok((plan, out_reg_of))

@@ -24,7 +24,7 @@ mod store;
 mod store_lsn;
 mod unique_pk;
 
-pub use circuit_state::{CircuitState, StateIdx};
+pub use circuit_state::{CircuitState, StateIdx, StateLayout};
 pub use dirs::{ensure_dir, lock_data_dir, relation_dir, relations_dir, staged_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store::Store;
 

@@ -1,11 +1,6 @@
-//! DagEngine: one memo per view — its routing metadata and its compiled plan —
-//! and the compilation entry point. Epoch execution lives in `exec`, per-key
-//! hydration in `hydrate`, and the dependency map and the placement fold in
-//! `meta`.
-//!
-//! Which relations exist, and the stores behind them, are the `relation` rung's
-//! — a sibling, not a field. Every method here that reaches a relation takes the
-//! registry as a parameter.
+//! DagEngine: every registered view's routing metadata and the compiled plans
+//! of the views this process runs. Epoch execution lives in `exec`, per-key
+//! hydration in `hydrate`, the dependency map and the placement fold in `meta`.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -18,106 +13,93 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::query::compiler::{self, CompileOutput, SubPlan, ViewMeta};
 use crate::query::vm;
 use gnitz_store::ops;
-use gnitz_store::relation::{CircuitState, Relation, RelationRegistry};
-use gnitz_store::schema::{Placement, SchemaDescriptor};
+use gnitz_store::relation::{CircuitState, Relation, RelationRegistry, StateLayout};
+use gnitz_store::schema::Placement;
 use gnitz_store::storage::Batch;
 
 mod exec;
 mod hydrate;
 mod meta;
 
-pub(crate) use exec::Drive;
+pub(crate) use exec::{drive, Drive};
 
 use meta::DepMap;
 
-// ---------------------------------------------------------------------------
-// ExchangeCallback — trait for multi-worker exchange IPC
-// ---------------------------------------------------------------------------
-
-/// How a multi-worker operator reaches the other workers.
-///
-/// Given this worker's pre-exchange output for `view_id`, return the batch this
-/// worker owns once every worker's output has been repartitioned. The transport
-/// is entirely the implementor's: this crate computes, and never names a channel.
-///
-/// That is what lets the whole exchange path sit below the process model:
-/// `gnitz-server` realizes it by sending to the master over W2M and receiving
-/// the relay over the SAL, and this rung names neither.
-pub(crate) trait ExchangeCallback {
-    fn do_exchange(&mut self, view_id: i64, batch: Batch, source_id: i64) -> Batch;
+/// What a drive needs from the process running it: the engine it drives, and
+/// the other workers.
+pub(crate) trait DriveHost {
+    fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry);
+    /// This worker's `batch` for `view_id`, repartitioned under `key`: the rows
+    /// it owns.
+    fn exchange(&mut self, view_id: i64, batch: Batch, key: i64) -> Batch;
 }
 
 // ---------------------------------------------------------------------------
 // DagEngine
 // ---------------------------------------------------------------------------
 
-/// One view's memo: the routing metadata any process may ask for, and the
-/// compiled plan the worker executing it adds on first epoch.
-struct ViewEntry {
-    meta: ViewMeta,
-    plan: Option<CompileOutput>,
+/// One view's compiled plan and the operator state its sub-plans share.
+pub(super) struct ViewPlan {
+    pub(super) code: CompileOutput,
+    pub(super) state: CircuitState,
 }
 
 pub(crate) struct DagEngine {
     dep: DepMap,
-    /// Boxed because an epoch holds `&mut CompileOutput` across its exchange
-    /// waits, and a read served inside one can insert another entry.
-    views: FxHashMap<i64, Box<ViewEntry>>,
+    /// Every registered view's routing metadata, from its registration to its drop.
+    metas: FxHashMap<i64, ViewMeta>,
+    /// A view's compiled plan and the operator state it opened, from the view's
+    /// first epoch, backfill or hydration to its drop.
+    plans: FxHashMap<i64, ViewPlan>,
 }
 
 impl DagEngine {
     pub(crate) fn new() -> Self {
         DagEngine {
             dep: DepMap::default(),
-            views: FxHashMap::default(),
+            metas: FxHashMap::default(),
+            plans: FxHashMap::default(),
         }
     }
 
-    // ── Registry-coupled operations ─────────────────────────────────────
+    // ── Registration ────────────────────────────────────────────────────
 
-    /// Drop `table_id` from the registry and, with it, everything the DBSP layer
-    /// memoized about it. The two halves are one call because a plan left behind
-    /// would hold the removed relation's stores open.
-    pub(crate) fn unregister_table(&mut self, registry: &mut RelationRegistry, table_id: i64) {
-        registry.unregister(table_id);
-        self.invalidate(table_id);
-    }
-
-    /// [`RelationRegistry::swap_schema`] under the RESTRICT check, which
-    /// needs the dependency map this layer owns and is what lets the swap leave
-    /// the memos alone.
-    ///
-    /// A real check, not a `debug_assert!`: `ddl_sync` and SAL replay reach the
-    /// alter hook with the precheck bypassed, and a violation there leaves a
-    /// cached VM scanning a store whose region count moved under it. Boot never
-    /// trips it, so the `Err` is a fail-stop taken over serving wrong reads.
-    pub(crate) fn swap_schema(
+    /// Derive `view_id`'s routing metadata, keep it until [`Self::forget`], and
+    /// answer the placement its store registers under.
+    pub(crate) fn register_view(
         &mut self,
-        registry: &mut RelationRegistry,
-        table_id: i64,
-        schema: SchemaDescriptor,
-    ) -> Result<(), String> {
-        if !self.dependents_of(table_id).is_empty() {
-            return Err(format!(
-                "swap_schema: table {table_id} has dependent views; RESTRICT should have rejected the ALTER"
-            ));
-        }
-        registry.swap_schema(table_id, schema).map_err(String::from)
+        registry: &RelationRegistry,
+        view_id: i64,
+        pk_arity: usize,
+    ) -> Result<Placement, String> {
+        let meta = derive_meta(registry, view_id)?;
+        let placement = self.placement_of(registry, view_id, &meta, pk_arity);
+        self.metas.insert(view_id, meta);
+        Ok(placement)
     }
 
-    // ── Memo management ─────────────────────────────────────────────────
-
-    /// Drop one view's memo, leaving it registered. The recovery output reset
-    /// needs this: the next backfill must recompile the view against its
-    /// freshly-emptied store and scratch, not against the plan that still holds
-    /// the old ones open.
-    pub(crate) fn invalidate(&mut self, view_id: i64) {
-        self.views.remove(&view_id);
+    /// Drop everything this layer holds for relation `id`.
+    pub(crate) fn forget(&mut self, id: i64) {
+        self.metas.remove(&id);
+        self.plans.remove(&id);
     }
 
-    /// Apply one `CircuitNodes` delta to the dependency map.
-    pub(crate) fn apply_circuit_delta(&mut self, batch: &Batch) {
+    /// Apply one `CircuitNodes` delta: the dependency map, and the metadata and
+    /// plan of every registered view whose circuit it adds rows to.
+    pub(crate) fn apply_circuit_delta(&mut self, registry: &RelationRegistry, batch: &Batch) -> Result<(), String> {
         self.dep.apply(batch);
+        let mut views: Vec<i64> = batch
+            .live_rows()
+            .map(|i| compiler::read_circuit_node_row(batch, i).view_id as i64)
+            .filter(|v| self.metas.contains_key(v))
+            .collect();
+        views.sort_unstable();
+        views.dedup();
+        for view_id in views {
+            self.metas.insert(view_id, derive_meta(registry, view_id)?);
+            self.plans.remove(&view_id);
+        }
+        Ok(())
     }
 
     // ── Compilation ─────────────────────────────────────────────────────
@@ -128,139 +110,74 @@ impl DagEngine {
         self.ensure_compiled(registry, view_id).map(drop)
     }
 
-    /// The memoized per-view routing metadata, computed on first touch. Cheaper
-    /// than full compilation: no code emission. An unreadable or unroutable
-    /// circuit is not memoized, so a later touch retries.
-    pub(crate) fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<&ViewMeta, String> {
-        if !self.views.contains_key(&view_id) {
-            let loaded = compiler::load_circuit(registry, view_id as u64)?;
-            self.memoize_meta(registry, view_id, &loaded)?;
-        }
-        Ok(&self.views.get(&view_id).expect("memoized above").meta)
+    /// The routing metadata derived when `view_id` registered. `Err` for an id
+    /// that is not a registered view.
+    pub(crate) fn view_meta(&self, view_id: i64) -> Result<&ViewMeta, String> {
+        registered(&self.metas, view_id)
     }
 
-    /// Memoize `loaded`'s routing metadata under `view_id`. Skipped when a memo
-    /// exists: a live view's circuit rows never change.
-    fn memoize_meta(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        loaded: &compiler::LoadedCircuit,
-    ) -> Result<(), String> {
-        if let Entry::Vacant(slot) = self.views.entry(view_id) {
-            slot.insert(Box::new(ViewEntry {
-                meta: ViewMeta::derive(loaded, registry)?,
-                plan: None,
-            }));
-        }
-        Ok(())
-    }
-
-    /// This view's memo, with its plan compiled. `Err` when `view_id` is not a
-    /// registered relation, or when a registered view did not compile.
-    ///
-    /// Nothing re-pre-flights the circuit here, and this compile opens resumed
-    /// operator state the pre-flight's throwaway root never had. An `Err` is
-    /// therefore unrecoverable for a server — the alternative to aborting is a
-    /// view that has stopped integrating while still answering reads.
+    /// This view's metadata and its compiled plan, compiling and opening its
+    /// operator state on a miss.
     pub(in crate::query) fn ensure_compiled(
         &mut self,
         registry: &RelationRegistry,
         view_id: i64,
-    ) -> Result<(&ViewMeta, &mut CompileOutput), String> {
-        if self.views.get(&view_id).is_none_or(|e| e.plan.is_none()) {
-            let relation = registry.relation_or_err(view_id)?;
-            let loaded = compiler::load_circuit(registry, view_id as u64)?;
-            self.memoize_meta(registry, view_id, &loaded)?;
-            let output =
-                compile_circuit(&loaded, registry, view_id, relation.directory(), relation).map_err(|err| {
+    ) -> Result<(&ViewMeta, &mut ViewPlan), String> {
+        let meta = registered(&self.metas, view_id)?;
+        let plan = match self.plans.entry(view_id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(slot) => {
+                let view = registry.relation_or_err(view_id)?;
+                let (code, layout) = compile(registry, view).map_err(|err| {
                     format!(
                         "view_id={view_id} does not compile from its durable circuit — this build no \
-                         longer accepts that circuit or its expr blobs, its derived state is \
-                         corrupt or unreadable, or resources are exhausted: {err}"
+                         longer accepts that circuit or its expr blobs: {err}"
                     )
                 })?;
-            gnitz_debug!("dag: compiled view_id={}", view_id);
-            self.views.get_mut(&view_id).expect("filled above").plan = Some(output);
-        }
-        let entry = self.views.get_mut(&view_id).expect("compiled above");
-        Ok((&entry.meta, entry.plan.as_mut().expect("compiled above")))
-    }
-
-    /// The backfill-scan bound for `source` under `view_id`: `ReadBound::None` unless
-    /// its circuit carries one.
-    pub(crate) fn source_scan_bound(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        source: i64,
-    ) -> gnitz_wire::ReadBound {
-        self.view_meta(registry, view_id)
-            .ok()
-            .and_then(|m| m.source_bounds.get(&source).cloned())
-            .unwrap_or(gnitz_wire::ReadBound::None)
-    }
-
-    /// Decide whether a just-registered view's circuit compiles, keeping nothing.
-    /// Called on the master inside the DDL, before the bundle reaches the SAL, so
-    /// a rejection takes the ordinary ingest failure path and reaches the client
-    /// with the view never created. The worker-side compile that follows happens
-    /// after the DDL is durable and has no channel back to the waiting client.
-    ///
-    /// `root` is a throwaway directory the caller creates the path for and
-    /// removes again — see `catalog::utils::preflight_dir` for why it is not the
-    /// view's own. The plan is dropped here, so the child stores it opened under
-    /// `root` are closed — and their directories removed — before this returns.
-    ///
-    /// The verdict is worker-independent: it compiles under the master's slot,
-    /// `root` overrides the one path component the slot contributes, and no
-    /// rejection reads it.
-    pub(crate) fn preflight_compile(
-        &self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        root: &str,
-    ) -> Result<(), String> {
-        // `hook_relation_register` ran earlier in this bundle's ingest loop, so a
-        // registered `+1` VIEW_TAB row is always in the registry; a miss is an
-        // engine bug, surfaced as a DDL rejection rather than an unchecked compile.
-        let entry = registry
-            .relation_or_err(view_id)
-            .map_err(|e| format!("pre-flight: {e}"))?;
-        let loaded = compiler::load_circuit(registry, view_id as u64)?;
-        // `map(drop)` closes the plan — and the child stores it opened under
-        // `root` — before the caller removes the directory.
-        compile_circuit(&loaded, registry, view_id, root, entry).map(drop)
-    }
-
-    /// Every compiled view plan's operator state, for the ephemeral checkpoint
-    /// round to force-persist ahead of the registry's own output stores. Only a
-    /// view has circuit rows, so only a view's memo can hold a plan.
-    pub(crate) fn collect_ephemeral_state(&mut self) -> Vec<&mut CircuitState> {
-        let mut state: Vec<&mut CircuitState> = Vec::new();
-        for plan in self.views.values_mut().filter_map(|e| e.plan.as_mut()) {
-            for sub in plan.sub_plans_mut() {
-                state.push(&mut sub.vm.state);
+                let state = CircuitState::open(registry, view_id, layout).map_err(|e| {
+                    format!(
+                        "view_id={view_id}: its derived state is corrupt or unreadable, or resources are \
+                         exhausted: {e}"
+                    )
+                })?;
+                gnitz_debug!("dag: compiled view_id={}", view_id);
+                slot.insert(ViewPlan { code, state })
             }
-        }
-        state
+        };
+        Ok((meta, plan))
+    }
+
+    /// Every compiled view's operator state.
+    pub(crate) fn ephemeral_states(&mut self) -> impl Iterator<Item = &mut CircuitState> {
+        self.plans.values_mut().map(|p| &mut p.state)
     }
 }
 
-/// Compile `view_id`'s loaded circuit, homing every scratch child under `dir`.
-/// The directory is a parameter and not read off `entry` because the pre-flight
-/// compiles into a throwaway root.
-fn compile_circuit(
-    loaded: &compiler::LoadedCircuit,
-    registry: &RelationRegistry,
-    view_id: i64,
-    dir: &str,
-    entry: &Relation,
-) -> Result<CompileOutput, String> {
-    let site = compiler::ViewSite { dir, id: view_id as u64, registry };
-    // The compiler layer sees only the circuit system table, never `VIEW_TAB`,
-    // so it cannot derive whether the view is capacity-bounded.
-    compiler::compile_view(loaded, site, &entry.schema(), entry.is_bounded())
+/// `view_id`'s entry in `metas`.
+fn registered(metas: &FxHashMap<i64, ViewMeta>, view_id: i64) -> Result<&ViewMeta, String> {
+    metas
+        .get(&view_id)
+        .ok_or_else(|| format!("view {view_id} is not registered"))
+}
+
+/// Load `view_id`'s circuit and derive its routing metadata.
+fn derive_meta(registry: &RelationRegistry, view_id: i64) -> Result<ViewMeta, String> {
+    ViewMeta::derive(&compiler::load_circuit(registry, view_id)?, registry)
+}
+
+/// Load and compile `view`'s circuit. Opens nothing.
+fn compile(registry: &RelationRegistry, view: &Relation) -> Result<(CompileOutput, StateLayout), String> {
+    let loaded = compiler::load_circuit(registry, view.id())?;
+    compiler::compile_view(&loaded, registry, &view.schema(), view.is_bounded())
+}
+
+/// Whether registered view `view_id`'s circuit compiles. Keeps and opens
+/// nothing, so the master can ask before a DDL is durable.
+pub(crate) fn preflight_compile(registry: &RelationRegistry, view_id: i64) -> Result<(), String> {
+    let view = registry
+        .relation_or_err(view_id)
+        .map_err(|e| format!("pre-flight: {e}"))?;
+    compile(registry, view).map(drop)
 }
 
 // ---------------------------------------------------------------------------

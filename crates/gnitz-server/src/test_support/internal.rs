@@ -86,6 +86,56 @@ pub fn identity_circuit(source_tid: i64, bound: gnitz_wire::ReadBound) -> Circui
     circuit
 }
 
+/// `ScanDelta(source)` then `n - 1` `Negate`s: an `n`-node circuit.
+pub fn negate_chain(source: i64, n: usize) -> Circuit {
+    let mut circuit = Circuit::default();
+    let mut tip = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
+    for _ in 1..n {
+        tip = circuit.negate(tip);
+    }
+    circuit
+}
+
+/// An equi-join of `a` and `b` on their column 1, each side stating its scatter
+/// key where `keyed` says so.
+pub fn equi_join_circuit(a: i64, b: i64, keyed: [bool; 2]) -> Circuit {
+    let mut circuit = Circuit::default();
+    let key = [(1, None)];
+    let [ka, kb] = [(a, keyed[0]), (b, keyed[1])].map(|(source, keyed)| {
+        let scan = circuit.input_delta(source as u64, gnitz_wire::ReadBound::None);
+        let role = gnitz_wire::ReindexRole::ScatterKey {
+            source: source as u64,
+            source_key: key.to_vec(),
+        };
+        match keyed {
+            true => circuit.map_reindex(scan, &key, &[0], role),
+            false => scan,
+        }
+    });
+    let tb = circuit.integrate_trace(kb);
+    let joined = circuit.join(ka, tb, gnitz_wire::JoinKind::Equi, false);
+    circuit.sink(joined);
+    circuit
+}
+
+/// A drive host for circuits that exchange nothing.
+pub struct LocalDrive<'a>(pub &'a mut CatalogEngine);
+
+impl crate::query::DriveHost for LocalDrive<'_> {
+    fn parts(
+        &mut self,
+    ) -> (
+        &mut crate::query::DagEngine,
+        &mut gnitz_store::relation::RelationRegistry,
+    ) {
+        (&mut self.0.dag, &mut self.0.registry)
+    }
+
+    fn exchange(&mut self, view_id: i64, _batch: Batch, _key: i64) -> Batch {
+        panic!("view {view_id} relayed: this host serves exchange-free circuits only");
+    }
+}
+
 /// [`identity_circuit`] written as `vid`'s circuit.
 pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: i64, bound: gnitz_wire::ReadBound) {
     write_circuit(engine, vid, identity_circuit(source_tid, bound));

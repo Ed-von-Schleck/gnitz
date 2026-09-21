@@ -122,7 +122,7 @@ impl CatalogEngine {
             self.registry.residency().owns_stores(),
             "source cursor in a process owning no base store (view {view_id}, source {source})",
         );
-        let bound = self.dag.source_scan_bound(&self.registry, view_id, source);
+        let bound = self.dag.view_meta(view_id)?.source_bound(source);
         self.registry
             .open_bound(source, bound)
             .map(|(cursor, _walk)| cursor)

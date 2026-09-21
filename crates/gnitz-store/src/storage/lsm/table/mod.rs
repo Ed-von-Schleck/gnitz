@@ -208,8 +208,7 @@ impl Table {
         budgets: StoreBudgets,
     ) -> Result<Self, StorageError> {
         // First, so an unusable directory fails the open rather than the first
-        // flush: this is the master's CREATE VIEW pre-flight, where a client is
-        // still waiting.
+        // flush.
         ensure_table_dir(dir)?;
 
         // `skip_pk_filter` is exactly "is rederived": only a `SalReplay` store is
@@ -315,11 +314,6 @@ impl Table {
     pub(crate) fn append_terminal_run(&mut self, run: &Batch) -> Result<(), StorageError> {
         self.cached_full_scan.set(None);
         self.shard_index.append_terminal_run(run)
-    }
-
-    /// This store's schema.
-    pub(crate) fn schema(&self) -> &SchemaDescriptor {
-        &self.shard_index.schema
     }
 
     /// Verify every shard's body.

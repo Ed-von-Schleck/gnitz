@@ -28,9 +28,7 @@ impl CatalogEngine {
             }
             // `_sequences` rows drive no cache.
             SysFamily::Sequence => {}
-            // The dependency map is maintained from circuit-row deltas; the circuit itself is
-            // read by `load_circuit` when a view compiles.
-            SysFamily::CircuitNodes => self.dag.apply_circuit_delta(batch),
+            SysFamily::CircuitNodes => self.dag.apply_circuit_delta(&self.registry, batch)?,
         }
         Ok(())
     }
@@ -123,10 +121,12 @@ impl CatalogEngine {
     /// the rows that dropped it (see `submit`), never from here; its directory is
     /// left to the orphan sweep.
     fn unregister_relation(&mut self, id: i64) {
+        // The DAG can hold a view whose store failed to register.
+        self.dag.forget(id);
         if !self.registry.has_id(id) {
             return;
         }
-        self.dag.unregister_table(&mut self.registry, id);
+        self.registry.unregister(id);
         self.caches.fk_by_parent.remove(&id);
         if let Some(entry) = self.caches.relations.remove(&id) {
             for e in entry.fks {
@@ -191,17 +191,16 @@ impl CatalogEngine {
             owner_view_id,
             pk_repeats,
         } = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={vid})"))?;
-        // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
-        // so the sources resolve here. Re-check for the paths that skip the
-        // precheck (boot replay, worker `ddl_sync`).
-        let source_ids = self.dag.sources_of(vid).to_vec();
-        self.validate_view_options(vid, name, props, owner_view_id, &source_ids)?;
+        // Re-checked for the paths that skip the precheck: boot replay, a
+        // worker's `ddl_sync`.
+        self.validate_view_options(vid, name, props, owner_view_id, self.dag.sources_of(vid))?;
         // Stamping the fold is what makes placement transitive:
         // `hook_relation_register` registers this view after its sources, so a view
         // over it reads the answer back off one value.
         let placement = self
             .dag
-            .view_placement(&self.registry, vid, &source_ids, pk.as_slice().len());
+            .register_view(&self.registry, vid, pk.as_slice().len())
+            .map_err(|e| format!("{e} (vid={vid})"))?;
         Ok(RelationRegistration {
             kind: RelationKind::View,
             id: vid,
@@ -231,7 +230,8 @@ impl CatalogEngine {
                     build_schema_from_col_defs(RelationKind::BaseTable, &defs, cur.pk_indices(), cur.placement())
                         .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
                 if rebuilt != cur {
-                    self.dag.swap_schema(&mut self.registry, owner, rebuilt)?;
+                    self.reject_if_dependent_views(owner, "column ALTER")?;
+                    self.registry.swap_schema(owner, rebuilt)?;
                 }
                 rebuilt
             } else {

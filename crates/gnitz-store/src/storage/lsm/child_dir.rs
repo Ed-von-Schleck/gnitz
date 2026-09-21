@@ -189,25 +189,6 @@ fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
     s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse().ok())?
 }
 
-/// Create a child directory, answering whether **this call** created it. A child
-/// that was already there carries checkpointed state, whose loss
-/// [`state_child_dirs`] cannot see: it enumerates the scratch children, so
-/// the survivors alone answer the resume verdict.
-#[must_use = "only a child this call created may be removed again"]
-pub(crate) fn create_child(dir: &str) -> Result<bool, StorageError> {
-    match fs::create_dir(dir) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        // A missing ancestor — the compile's throwaway pre-flight root. Retried
-        // whole so a non-directory in the path still reports its own ENOTDIR.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(dir)?;
-            Ok(true)
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// Retire a child: once this returns `Ok`, no crash brings its manifest back.
 pub(crate) fn remove_child(dir: &str) -> Result<(), StorageError> {
     manifest::unlink(dir)?;

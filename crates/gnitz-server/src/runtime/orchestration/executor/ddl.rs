@@ -334,7 +334,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
         // after the DDL is durable, where it can be nothing but a log line and a
         // view that returns no rows forever.
         for &vid in &new_view_ids {
-            shared.cat_mut().preflight_view_compile(vid)?;
+            crate::query::preflight_compile(&shared.cat().registry, vid)?;
         }
         Ok::<_, WireFault>(())
     });

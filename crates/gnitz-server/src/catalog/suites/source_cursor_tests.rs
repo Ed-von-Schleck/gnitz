@@ -488,23 +488,6 @@ fn unregistered_source_is_err() {
     engine.close();
 }
 
-/// `open_source_cursor` reads the bound off the view's circuit, so a cold plan
-/// cache — what a freshly reset view looks like when `handle_backfill` opens its
-/// cursor — still finds it.
-#[test]
-fn cold_plan_cache_still_finds_the_bound() {
-    let (mut engine, tid, vid) = fixture("srccur_cold", Some(val_bound(Cut::Before(500), Cut::Before(600))));
-    // Exactly what a freshly-created view looks like at the moment
-    // `handle_backfill` opens its source cursor.
-    engine.dag.invalidate(vid);
-    let cur = engine.open_source_cursor(vid, tid).unwrap();
-    assert!(
-        matches!(cur, SourceCursor::Bounded(_)),
-        "a cold plan cache must still find the bound"
-    );
-    engine.close();
-}
-
 /// An unbounded plan takes the full scan — the pre-change behaviour, unchanged.
 #[test]
 fn unbounded_plan_full_scans() {

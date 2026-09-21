@@ -433,6 +433,47 @@ fn test_ddl_sync() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── a_view_registered_before_its_circuit_derives_its_routes_from_it ──
+
+/// Crash recovery can apply a view's VIEW_TAB row before its circuit rows, since
+/// the system families publish their manifests one at a time.
+#[test]
+fn a_view_registered_before_its_circuit_derives_its_routes_from_it() {
+    let dir = temp_dir("catalog_view_before_circuit");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let a = engine.create_table("public.a", &cols, &[0]).unwrap();
+    let b = engine.create_table("public.b", &cols, &[0]).unwrap();
+    let created = try_register_view(&mut engine, equi_join_circuit(a, b, [true; 2]), "created", &cols, 0, 0).unwrap();
+
+    let vid = engine.allocate_ids(1).unwrap();
+    engine.write_column_records(vid, &cols).unwrap();
+    let mut view_tab = BatchBuilder::new(*SysFamily::View.schema());
+    push_view_tab_row(&mut view_tab, 1, vid, "recovered", 0, 0, 0);
+    let mut nodes = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
+    gnitz_wire::sys_rows::write_circuit_rows(&mut nodes, vid as u64, &equi_join_circuit(a, b, [true; 2]));
+    engine.ddl_sync(SysFamily::View.id(), 0, view_tab.finish()).unwrap();
+    engine
+        .ddl_sync(SysFamily::CircuitNodes.id(), 0, nodes.finish())
+        .unwrap();
+
+    let route = |view, source| engine.dag.view_meta(view).unwrap().source_route(source);
+    for source in [a, b] {
+        assert!(
+            route(vid, source).is_some(),
+            "source {source} scatters into the recovered view"
+        );
+        assert_eq!(
+            route(vid, source),
+            route(created, source),
+            "as it does into a created one"
+        );
+    }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── zone_pins_survive_a_flush_and_reopen ─────────────────────────────
 
 #[test]

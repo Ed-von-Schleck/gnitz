@@ -378,10 +378,7 @@ impl MasterDispatcher {
         let sources: Vec<&Batch> = payloads.iter().flatten().filter(|b| !b.is_empty()).collect();
         let num_workers = self.num_workers();
 
-        let meta = cat
-            .dag
-            .view_meta(&cat.registry, view_id)
-            .map_err(|e| format!("view {view_id}: {e}"))?;
+        let meta = cat.dag.view_meta(view_id).map_err(|e| format!("view {view_id}: {e}"))?;
         // `prepare_relay` turns this `Err` into a cluster abort, taken over
         // scattering under a key the rows were never stored under.
         let dest = match source_id {

@@ -928,7 +928,7 @@ fn blocking_fsync_fallback_child() {
 fn round_trip_cost_bench() {
     let _g = serial();
     let mut fx = Fixture::start();
-    let Some(counter) = support::perf::Instructions::open() else {
+    let Some(counter) = gnitz_foundation::perf::Instructions::open() else {
         println!("perf_event_open refused; skipping the instruction count");
         return;
     };
@@ -968,7 +968,7 @@ fn idle_poll_client_cost_bench() {
 
     let _g = serial();
     let mut fx = Fixture::start();
-    let Some(counter) = support::perf::Instructions::open() else {
+    let Some(counter) = gnitz_foundation::perf::Instructions::open() else {
         println!("perf_event_open refused; skipping the instruction count");
         return;
     };
@@ -978,13 +978,13 @@ fn idle_poll_client_cost_bench() {
     // Poll once more after the drain, so the measured run is wholly idle.
     fx.mirror().poll_mirror().expect("poll");
 
-    let before = support::perf::voluntary_ctx_switches();
+    let before = gnitz_foundation::perf::voluntary_ctx_switches();
     let (_, insns) = counter.measure(|| {
         for _ in 0..K {
             fx.mirror().poll_mirror().expect("poll");
         }
     });
-    let switches = support::perf::voluntary_ctx_switches() - before;
+    let switches = gnitz_foundation::perf::voluntary_ctx_switches() - before;
 
     println!(
         "idle poll over M={M} K={K}: {:.0} instr/poll ({}), {:.2} voluntary ctx switches/poll",
@@ -2112,7 +2112,7 @@ fn resident_footprint_child() {
     }
     let _ = query(&mut direct, "s", "SELECT * FROM v_keyed");
 
-    let base = rss_bytes();
+    let base = gnitz_foundation::perf::rss_bytes();
     let mut mirror = mirroring_client(&sock, &dir);
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
     mirror.checkpoint_mirror().expect("checkpoint");
@@ -2120,7 +2120,7 @@ fn resident_footprint_child() {
         .1
         .weights
         .len();
-    let held = rss_bytes();
+    let held = gnitz_foundation::perf::rss_bytes();
     let on_disk = dir_bytes(std::path::Path::new(&dir));
     println!(
         "copy of view {tid}: {on_disk} bytes on disk, host RSS {base} -> {held} \
@@ -2128,18 +2128,6 @@ fn resident_footprint_child() {
         held.saturating_sub(base),
     );
     println!("{CHILD_OK}");
-}
-
-/// This process's resident set, in bytes. `0` where `/proc` does not answer.
-fn rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("VmRSS:"))
-                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
-        })
-        .map_or(0, |kb| kb * 1024)
 }
 
 /// Every byte under `dir`, recursively.

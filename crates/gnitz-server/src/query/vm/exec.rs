@@ -15,6 +15,7 @@ fn ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StoreError {
 /// register's batch, empty when the epoch produced nothing.
 pub(in crate::query) fn execute_epoch_multi(
     vm: &mut VmHandle,
+    state: &mut CircuitState,
     inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
 ) -> Result<Batch, StoreError> {
     let all_empty = seed_inputs(vm, inputs);
@@ -24,8 +25,8 @@ pub(in crate::query) fn execute_epoch_multi(
     if all_empty && !ground_pending {
         return Ok(Batch::empty_with_schema(vm.program.out_schema()));
     }
-    run_instructions(vm, 0)?;
-    run_integrates(vm)?;
+    run_instructions(vm, state, 0)?;
+    run_integrates(vm, state)?;
     Ok(take_output(vm))
 }
 
@@ -35,11 +36,12 @@ pub(in crate::query) fn execute_epoch_multi(
 /// `reject_state_writers`'s to enforce.
 pub(in crate::query) fn replay_chunk(
     vm: &mut VmHandle,
+    state: &mut CircuitState,
     start_pc: usize,
     seed: (DeltaReg, Batch),
 ) -> Result<Batch, StoreError> {
     seed_inputs(vm, std::iter::once(seed));
-    run_instructions(vm, start_pc)?;
+    run_instructions(vm, state, start_pc)?;
     Ok(take_output(vm))
 }
 
@@ -81,11 +83,8 @@ fn take_or_clone(batches: &mut [Batch], reg: DeltaReg, take: bool) -> Batch {
 }
 
 /// Run the instruction stream from `start_pc`.
-fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StoreError> {
-    // Destructured because the three are disjoint fields: that is what lets an
-    // operator hold a batch and a cursor (or a table) at once, with no interior
-    // mutability and no raw pointer.
-    let VmHandle { program, batches, state, .. } = vm;
+fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize) -> Result<(), StoreError> {
+    let VmHandle { program, batches, .. } = vm;
 
     gnitz_debug!(
         "vm: dispatch out_reg={} instrs={}",
@@ -225,8 +224,8 @@ fn run_instructions(vm: &mut VmHandle, start_pc: usize) -> Result<(), StoreError
 
 /// Accumulate each delta into its trace, after the whole instruction range — so
 /// no cursor opened in that range can observe this tick's integration.
-fn run_integrates(vm: &mut VmHandle) -> Result<(), StoreError> {
-    let VmHandle { program, batches, state, .. } = vm;
+fn run_integrates(vm: &mut VmHandle, state: &mut CircuitState) -> Result<(), StoreError> {
+    let VmHandle { program, batches, .. } = vm;
     for &Integrate { reg, trace, take } in &program.integrates {
         gnitz_debug!("vm: INTEGRATE in_count={}", batches[reg.at()].len());
         // Not `take_or_clone`: for a `Raw` register its clone arm would cost a

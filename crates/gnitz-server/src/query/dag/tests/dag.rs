@@ -1,19 +1,20 @@
-use super::*;
+use crate::catalog::CatalogEngine;
+use crate::test_support::{col_def, register_identity_view, scratch_dir};
+use gnitz_wire::type_code;
 
-/// A plan-less memo, the shape `view_meta` leaves behind.
-fn memo() -> Box<ViewEntry> {
-    Box::new(ViewEntry { meta: ViewMeta::empty(), plan: None })
-}
-
-/// Wiring: the production table/view-drop path drops the memo with the relation.
+/// Wiring: the drop path forgets the view's metadata and its plan together, so
+/// no plan outlives its relation holding stores open.
 #[test]
-fn unregister_table_evicts_the_dropped_relations_memo() {
-    let mut registry = gnitz_store::relation::RelationRegistry::new(
-        gnitz_store::storage::Slot::SOLO,
-        gnitz_store::relation::StoreConfig::default(),
-    );
-    let mut dag = DagEngine::new();
-    dag.views.insert(43, memo());
-    dag.unregister_table(&mut registry, 43);
-    assert!(!dag.views.contains_key(&43), "unregister_table must evict");
+fn forget_evicts_the_metadata_and_the_plan() {
+    let mut engine = CatalogEngine::open(&scratch_dir("dag", "forget"), 1).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let base = engine.create_table("public.base", &cols, &[0]).unwrap();
+    let view = register_identity_view(&mut engine, base, "v", &cols);
+    engine.dag.compile_view(&engine.registry, view).unwrap();
+    assert!(engine.dag.metas.contains_key(&view) && engine.dag.plans.contains_key(&view));
+
+    engine.dag.forget(view);
+    assert!(engine.dag.view_meta(view).is_err(), "the metadata is gone");
+    assert!(!engine.dag.plans.contains_key(&view), "and so is the plan");
+    engine.close();
 }

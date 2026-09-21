@@ -392,9 +392,8 @@ fn view_traces_resume_with_their_output_store() {
     // round would publish and the integral this view reads through. `resumed()`
     // answers `false` for a state holding no child, so this also proves the
     // fixture's view creates one.
-    let state = engine.dag.collect_ephemeral_state();
     assert!(
-        state.iter().all(|s| s.resumed()),
+        engine.dag.ephemeral_states().all(|s| s.resumed()),
         "a trace opened against a generation its manifest never carried is erased"
     );
 

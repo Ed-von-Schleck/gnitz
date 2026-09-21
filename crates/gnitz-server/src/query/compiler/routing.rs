@@ -6,6 +6,7 @@ use super::*;
 use gnitz_wire::ReadBound;
 
 /// How the master relay routes one source's delta into a view.
+#[derive(Debug, PartialEq)]
 pub(crate) enum RelayRoute {
     /// Pure range join (`n_eq == 0`) or cross join: the matches are spread over
     /// the whole other side, so every worker needs the full delta and trims to
@@ -44,23 +45,10 @@ pub(crate) struct ViewMeta {
     exchanges: bool,
     /// source table id → the bound its backfill scan narrows by. Absent for a
     /// source scanned twice, whose one backfill cursor feeds both scans.
-    pub(in crate::query) source_bounds: FxHashMap<i64, ReadBound>,
+    source_bounds: FxHashMap<i64, ReadBound>,
 }
 
 impl ViewMeta {
-    /// An empty fixture, enough to occupy a memo entry.
-    #[cfg(test)]
-    pub(in crate::query) fn empty() -> ViewMeta {
-        ViewMeta {
-            source_routes: FxHashMap::default(),
-            output_shard_cols: Box::default(),
-            skips_exchange: false,
-            pk_source: None,
-            exchanges: false,
-            source_bounds: FxHashMap::default(),
-        }
-    }
-
     /// Derive `loaded`'s routing metadata. `registry` supplies what the circuit
     /// alone cannot: co-partitioning and the output-shard elision both test a
     /// shard key against a *source relation's* distribution prefix.
@@ -157,6 +145,12 @@ impl ViewMeta {
     /// needs them, and a route would name a key they were never stored under.
     pub(crate) fn source_route(&self, source_id: i64) -> Option<&RelayRoute> {
         self.source_routes.get(&source_id)
+    }
+
+    /// The bound `source`'s backfill scan narrows by: `ReadBound::None` unless the
+    /// circuit carries one.
+    pub(crate) fn source_bound(&self, source: i64) -> ReadBound {
+        self.source_bounds.get(&source).cloned().unwrap_or(ReadBound::None)
     }
 
     /// The columns a side's relayed output is routed by, under the null-distinct
@@ -329,24 +323,13 @@ fn source_uses(loaded: &LoadedCircuit) -> Result<(FxHashMap<i64, SourceUse>, Opt
     Ok((uses, circuit_relay))
 }
 
-/// Walk back from `enid` through nodes that keep rows on their worker and the PK
-/// region verbatim, to its `ScanDelta`: `(table id, whether a map was crossed)`.
-/// Every input names an earlier node, so no visited guard.
+/// The `ScanDelta` the row-local walk back from `enid`'s input ends at: `(table
+/// id, whether a Map was crossed)`.
 fn scan_through_row_local(loaded: &LoadedCircuit, enid: NodeId) -> Option<(i64, bool)> {
-    let (mut cur, mut mapped) = (enid, false);
-    loop {
-        // Bail on a fan-in: a multi-input node (Union, set op) draws from more
-        // than one source, so no single table's distribution prefix governs the
-        // shard key and it can never co-partition.
-        let NodeInputs::Unary(src_nid) = *loaded.inputs(cur) else {
-            return None;
-        };
-        match loaded.op(src_nid) {
-            gnitz_wire::OpNode::ScanDelta { source: t, .. } => return Some((*t as i64, mapped)),
-            op if keeps_rows_and_pk_region(op) => mapped |= matches!(op, gnitz_wire::OpNode::Map(_)),
-            _ => return None,
-        }
-        cur = src_nid;
+    let (origin, mapped) = row_local_origin(loaded, loaded.inputs(enid).unary());
+    match loaded.op(origin) {
+        gnitz_wire::OpNode::ScanDelta { source, .. } => Some((*source as i64, mapped)),
+        _ => None,
     }
 }
 

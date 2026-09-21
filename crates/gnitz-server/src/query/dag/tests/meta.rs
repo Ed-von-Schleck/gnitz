@@ -1,5 +1,14 @@
 use super::*;
 
+/// A registry holding nothing: no view holds metadata in these tests, so a
+/// circuit delta re-derives nothing and reads no relation.
+fn empty_registry() -> RelationRegistry {
+    RelationRegistry::new(
+        gnitz_store::storage::Slot::SOLO,
+        gnitz_store::relation::StoreConfig::default(),
+    )
+}
+
 /// Install `edges` (source → view) into the dep map, the same entries
 /// `DepMap::apply` writes per `ScanDelta` node.
 fn dag_with_deps(edges: &[(i64, i64)]) -> DagEngine {
@@ -49,18 +58,19 @@ fn the_dep_map_follows_circuit_deltas_idempotently() {
     let mut minus = plus.clone();
     minus.map_weights(i64::wrapping_neg);
 
+    let registry = empty_registry();
     let mut dag = DagEngine::new();
-    dag.apply_circuit_delta(&minus);
+    dag.apply_circuit_delta(&registry, &minus).unwrap();
     assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
 
     for _ in 0..2 {
-        dag.apply_circuit_delta(&plus);
+        dag.apply_circuit_delta(&registry, &plus).unwrap();
         assert_eq!(dag.dep.reverse[&5], [1, 2]);
         assert_eq!(dag.dep.forward[&1], [5]);
         assert_eq!(dag.dep.forward[&2], [5]);
     }
     for _ in 0..2 {
-        dag.apply_circuit_delta(&minus);
+        dag.apply_circuit_delta(&registry, &minus).unwrap();
         assert!(dag.dep.forward.is_empty() && dag.dep.reverse.is_empty());
     }
 }
@@ -81,12 +91,13 @@ fn a_retraction_unlinks_only_its_own_view() {
     let mut drop_five = five.clone();
     drop_five.map_weights(i64::wrapping_neg);
 
+    let registry = empty_registry();
     let mut dag = DagEngine::new();
-    dag.apply_circuit_delta(&five);
-    dag.apply_circuit_delta(&six);
+    dag.apply_circuit_delta(&registry, &five).unwrap();
+    dag.apply_circuit_delta(&registry, &six).unwrap();
     assert_eq!(dag.dependents_of(1), &[5i64, 6][..]);
 
-    dag.apply_circuit_delta(&drop_five);
+    dag.apply_circuit_delta(&registry, &drop_five).unwrap();
     assert_eq!(dag.dependents_of(1), &[6i64][..]);
     assert!(dag.sources_of(5).is_empty());
     assert_eq!(dag.sources_of(6), &[1i64][..]);

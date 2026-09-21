@@ -1460,6 +1460,27 @@ impl Batch {
         self.append_ranges(&src.as_mem_batch(), &[(start, end)]);
     }
 
+    /// All of `next`, every key of which sorts above every key of this batch.
+    /// Consolidated if both were.
+    pub fn append_above(&mut self, next: Batch) {
+        if self.count == 0 {
+            *self = next;
+            return;
+        }
+        if next.count > 0 {
+            let order = crate::schema::key::compare_pk_bytes(self.get_pk_bytes(self.count - 1), next.get_pk_bytes(0));
+            assert!(
+                order.is_lt(),
+                "append_above: the appended keys do not sort above this batch's"
+            );
+        }
+        let consolidated = self.is_consolidated() && next.is_consolidated();
+        self.append_batch(&next, 0, next.count);
+        if consolidated {
+            self.layout = Layout::Consolidated;
+        }
+    }
+
     /// Gather every `[start, end)` row range of `src`, in list order, into a fresh
     /// batch — a filter pass's survivor list, or one slice of a RAM-tier run.
     ///

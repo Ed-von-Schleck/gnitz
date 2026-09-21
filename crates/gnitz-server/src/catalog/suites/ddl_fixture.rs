@@ -102,9 +102,6 @@ impl CatalogEngine {
             .into_iter()
             .partition(|id| self.registry.relation(*id).is_some_and(|e| e.kind().is_view()));
         for vid in views {
-            // Clears the plan caches only — the view stays registered, so the
-            // drop cascade's the registry guard still resolves it.
-            self.dag.invalidate(vid);
             self.submit_retraction(SysFamily::View, vid as u128)?;
         }
         for tid in tables {
@@ -189,10 +186,6 @@ impl CatalogEngine {
             .entity_by_qname
             .get(&qualified)
             .ok_or_else(|| format!("View does not exist: {qualified}"))?;
-
-        // Clears the plan caches only — the view stays registered, so the
-        // cascade's the registry guard still resolves it.
-        self.dag.invalidate(vid);
 
         self.submit_retraction(SysFamily::View, vid as u128)
     }

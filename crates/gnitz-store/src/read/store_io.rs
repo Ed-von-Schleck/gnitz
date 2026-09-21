@@ -75,10 +75,11 @@ impl RelationRegistry {
             return Ok(entry.full_scan());
         }
         let mut rows = LiveSource::new(self, id, SourceCursor::Full(Box::new(entry.cursor())), hydrator);
-        let batch = rows.next_chunk(usize::MAX)?;
-        Ok(Rc::new(
-            batch.unwrap_or_else(|| Batch::empty_with_schema(&entry.schema())),
-        ))
+        let mut out = Batch::empty_with_schema(&entry.schema());
+        while let Some(chunk) = rows.next_chunk(self.config.scan_chunk_rows)? {
+            out.append_above(chunk);
+        }
+        Ok(Rc::new(out))
     }
 
     /// The FK parent probe: every live row of `keys` (flat OPK images, strictly ascending) at

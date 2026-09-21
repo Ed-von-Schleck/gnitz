@@ -1,7 +1,5 @@
 //! Fixtures shared by the mirror's integration tests.
 
-pub mod perf;
-
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 

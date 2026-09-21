@@ -10,6 +10,8 @@
 //!     including the anonymous and reserved mappings the server builds its SAL
 //!     and W2M rings on. The socket tier is not here; it lives beside the
 //!     reactor that owns the fds, in `gnitz-server`
+//!   - `perf`       — cost probes: instructions retired, context switches and
+//!     resident-set bytes, for benchmarks and cost-claim tests
 //!
 //! This crate names no other gnitz crate, which is what lets any of them name
 //! it. Hashing is deliberately not here: it is one owner in `gnitz-wire`,
@@ -23,4 +25,5 @@ pub mod env;
 pub mod fault;
 pub mod host;
 pub mod log;
+pub mod perf;
 pub mod posix_io;

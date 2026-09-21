@@ -2,20 +2,11 @@
 
 use super::*;
 use crate::catalog::{CatalogEngine, ColumnDef};
-use crate::test_support::{col_def, make_batch, register_identity_view, scratch_dir, sum_weights, try_register_view};
+use crate::test_support::{
+    col_def, make_batch, register_identity_view, scratch_dir, sum_weights, try_register_view, LocalDrive,
+};
 use gnitz_store::relation::Relation;
 use gnitz_wire::type_code;
-
-/// The exchange transport of the driver tests below. They register only identity
-/// circuits, which repartition nothing — a call here means the premise changed,
-/// and the new case needs a double that applies the view's `RelayRoute`.
-struct NoExchange;
-
-impl ExchangeCallback for NoExchange {
-    fn do_exchange(&mut self, view_id: i64, _batch: Batch, _source_id: i64) -> Batch {
-        panic!("view {view_id} relayed: these tests cover the non-exchanged path only");
-    }
-}
 
 fn view_cols() -> Vec<ColumnDef> {
     vec![col_def("id", type_code::U64), col_def("v", type_code::I64)]
@@ -97,15 +88,12 @@ fn a_tick_drives_the_whole_closure() {
     let (mut engine, base, a, b, deep) = engine_with_fanout("evaluate");
 
     let delta = delta_for(&engine, base, &[(1, 1, 10), (2, 1, 20)]);
-    engine
-        .dag
-        .drive(
-            &mut engine.registry,
-            Drive::Tick { source: base, round: 1 },
-            delta,
-            &mut NoExchange,
-        )
-        .unwrap();
+    drive(
+        &mut LocalDrive(&mut engine),
+        Drive::Tick { source: base, round: 1 },
+        delta,
+    )
+    .unwrap();
 
     assert_eq!(live_weight(&engine, a), 2);
     assert_eq!(live_weight(&engine, b), 2);
@@ -114,29 +102,6 @@ fn a_tick_drives_the_whole_closure() {
         2,
         "the second rung sees its producer's output, exactly once"
     );
-}
-
-/// A tick carrying no rows reaches the view's epoch and leaves it empty. Not a
-/// test that every step ran: with identity circuits and no relay, an early
-/// return would be indistinguishable here.
-#[test]
-fn an_empty_tick_produces_nothing() {
-    let (mut engine, base) = engine_with_base("empty_tick");
-    let a = register_identity_view(&mut engine, base, "va", &view_cols());
-
-    let schema = engine.registry.relation(base).map(Relation::schema).unwrap();
-    let tick = Drive::Tick { source: base, round: 1 };
-    engine
-        .dag
-        .drive(
-            &mut engine.registry,
-            tick,
-            Batch::empty_with_schema(&schema),
-            &mut NoExchange,
-        )
-        .unwrap();
-
-    assert_eq!(live_weight(&engine, a), 0);
 }
 
 /// A view two producers feed runs one epoch per producer, and the view reading
@@ -156,15 +121,12 @@ fn a_two_producer_view_feeds_its_reader_the_union() {
     let d = register_identity_view(&mut engine, u, "vd", &cols);
 
     let delta = delta_for(&engine, base, &[(1, 1, 10), (2, 1, 20)]);
-    engine
-        .dag
-        .drive(
-            &mut engine.registry,
-            Drive::Tick { source: base, round: 1 },
-            delta,
-            &mut NoExchange,
-        )
-        .unwrap();
+    drive(
+        &mut LocalDrive(&mut engine),
+        Drive::Tick { source: base, round: 1 },
+        delta,
+    )
+    .unwrap();
 
     assert_eq!(live_weight(&engine, u), 4, "both producers' epochs land");
     assert_eq!(live_weight(&engine, d), 4, "its reader sees both, once each");
@@ -181,10 +143,7 @@ fn backfill_chunk_runs_only_the_named_view() {
     let backfill = |view| Drive::Backfill { view, source: base };
 
     let chunk = delta_for(&engine, base, &[(1, 1, 10)]);
-    engine
-        .dag
-        .drive(&mut engine.registry, backfill(a), chunk, &mut NoExchange)
-        .unwrap();
+    drive(&mut LocalDrive(&mut engine), backfill(a), chunk).unwrap();
     assert_eq!(live_weight(&engine, a), 1);
     assert_eq!(
         live_weight(&engine, b),
@@ -193,28 +152,29 @@ fn backfill_chunk_runs_only_the_named_view() {
     );
 
     let empty = Batch::empty_with_schema(&engine.registry.relation(base).map(Relation::schema).unwrap());
-    engine
-        .dag
-        .drive(&mut engine.registry, backfill(a), empty, &mut NoExchange)
-        .unwrap();
+    drive(&mut LocalDrive(&mut engine), backfill(a), empty).unwrap();
     assert_eq!(live_weight(&engine, a), 1, "a chunk with no rows adds none");
 
     // A view the registry no longer holds is a fail-stop, not a silent skip.
     let empty = Batch::empty_with_schema(&engine.registry.relation(base).map(Relation::schema).unwrap());
-    assert!(engine
-        .dag
-        .drive(&mut engine.registry, backfill(999_999), empty, &mut NoExchange)
-        .is_err());
+    assert!(drive(&mut LocalDrive(&mut engine), backfill(999_999), empty).is_err());
 }
 
 // ── The relay's single-sourcing ─────────────────────────────────────────────
 
 /// Records the row count of every batch a relay sends, and relays it back.
-struct Recorder(Vec<usize>);
+struct Recorder<'a> {
+    cat: &'a mut CatalogEngine,
+    sent: Vec<usize>,
+}
 
-impl ExchangeCallback for Recorder {
-    fn do_exchange(&mut self, _view_id: i64, batch: Batch, _source_id: i64) -> Batch {
-        self.0.push(batch.len());
+impl DriveHost for Recorder<'_> {
+    fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
+        (&mut self.cat.dag, &mut self.cat.registry)
+    }
+
+    fn exchange(&mut self, _view_id: i64, batch: Batch, _key: i64) -> Batch {
+        self.sent.push(batch.len());
         batch
     }
 }
@@ -247,15 +207,114 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
             .unwrap();
 
         let delta = delta_for(&engine, replicated, &[(1, 1, 10), (2, 1, 20)]);
-        let registry = &engine.registry;
-        let mut sent = Recorder(Vec::new());
         // One relay per source: muting is bound at construction.
-        Relay::new(&mut sent, registry, 99, replicated, false).send(delta.clone_batch(), replicated, true);
-        Relay::new(&mut sent, registry, 99, keyed, false).send(delta.clone_batch(), keyed, true);
+        let over_replicated = Relay::new(&engine.registry, 99, replicated, false);
+        let over_keyed = Relay::new(&engine.registry, 99, keyed, false);
+        let mut host = Recorder { cat: &mut engine, sent: Vec::new() };
+        over_replicated.send(&mut host, delta.clone_batch(), replicated, true);
+        over_keyed.send(&mut host, delta.clone_batch(), keyed, true);
         // A single-side round is not single-sourced, so it is sent by every rank.
-        Relay::new(&mut sent, registry, 99, replicated, false).round(delta, false);
+        over_replicated.round(&mut host, delta, false);
 
         let replicated_rows = if rank == 0 { 2 } else { 0 };
-        assert_eq!(sent.0, vec![replicated_rows, 2, 2], "rank {rank}");
+        assert_eq!(host.sent, vec![replicated_rows, 2, 2], "rank {rank}");
     }
+}
+
+// ── Per-epoch cost ──────────────────────────────────────────────────────────
+
+/// One-row ticks per cost cell, and rows in the wide tick.
+const BENCH_TICKS: u64 = 10_000;
+
+/// Column records for a view whose output is `schema`.
+fn cols_of(schema: &gnitz_store::schema::SchemaDescriptor) -> Vec<ColumnDef> {
+    (0..schema.num_columns())
+        .map(|ci| {
+            let c = schema.column(ci).expect("in range");
+            ColumnDef {
+                is_nullable: c.nullable != 0,
+                ..col_def(&format!("c{ci}"), c.type_code)
+            }
+        })
+        .collect()
+}
+
+/// [`engine_with_fanout`] plus a `Unary` plan (GROUP BY) and a `Pair` plan
+/// (UNION ALL of two exchanged scans) over the base.
+fn engine_with_every_plan_shape(name: &str) -> (CatalogEngine, i64, i64) {
+    let (mut engine, base, a, ..) = engine_with_fanout(name);
+    let base_schema = engine.registry.relation(base).map(Relation::schema).unwrap();
+
+    let (group, aggs) = ([1u32], [gnitz_wire::AggDescriptor::COUNT_STAR]);
+    let grouped = gnitz_store::ops::ReducePlan::from_wire(&base_schema, &group, &aggs, false, true)
+        .unwrap()
+        .shape
+        .output_schema;
+    let mut circuit = gnitz_wire::Circuit::default();
+    let scan = circuit.input_delta(base as u64, gnitz_wire::ReadBound::None);
+    let reduced = circuit.reduce_multi(scan, &group, &aggs, false);
+    circuit.sink(reduced);
+    try_register_view(&mut engine, circuit, "vgroup", &cols_of(&grouped), 0, 0).unwrap();
+
+    let mut circuit = gnitz_wire::Circuit::default();
+    let sides = [0, 1].map(|_| {
+        let scan = circuit.input_delta(base as u64, gnitz_wire::ReadBound::None);
+        circuit.shard(scan, &[0])
+    });
+    let merged = circuit.union(sides[0], sides[1]);
+    circuit.sink(merged);
+    try_register_view(&mut engine, circuit, "vunion", &view_cols(), 0, 0).unwrap();
+    (engine, base, a)
+}
+
+/// One tick of `source` over `delta`.
+fn tick(engine: &mut CatalogEngine, source: i64, round: u64, delta: Batch) {
+    drive(&mut LocalDrive(engine), Drive::Tick { source, round }, delta).unwrap();
+}
+
+/// Instructions per one-row tick through every plan shape, and per wide tick
+/// into eight readers beside its seven batch copies.
+///
+/// ```text
+/// cd crates && cargo test -p gnitz-server --release drive_tick_bench \
+///     -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn drive_tick_bench() {
+    let counter = gnitz_foundation::perf::Instructions::open().expect("instructions counter");
+
+    let (mut engine, base, a) = engine_with_every_plan_shape("tick_bench_shapes");
+    // Compiles every plan outside the measurement.
+    let warm = delta_for(&engine, base, &[(0, 1, 0)]);
+    tick(&mut engine, base, 1, warm);
+    let deltas: Vec<Batch> = (1..=BENCH_TICKS)
+        .map(|i| delta_for(&engine, base, &[(i, 1, i as i64)]))
+        .collect();
+    let ((), instr) = counter.measure(|| {
+        for (i, delta) in deltas.into_iter().enumerate() {
+            tick(&mut engine, base, i as u64 + 2, delta);
+        }
+    });
+    assert_eq!(live_weight(&engine, a) as u64, BENCH_TICKS + 1, "every tick landed");
+    println!(
+        "one-row ticks, every plan shape  {:>10} instr/tick",
+        instr / BENCH_TICKS
+    );
+
+    let (mut engine, base) = engine_with_base("tick_bench_fanout");
+    let cols = view_cols();
+    for r in 0..8 {
+        register_identity_view(&mut engine, base, &format!("v{r}"), &cols);
+    }
+    let warm = delta_for(&engine, base, &[(0, 1, 0)]);
+    tick(&mut engine, base, 1, warm);
+    let rows: Vec<(u64, i64, i64)> = (1..=BENCH_TICKS).map(|i| (i, 1, i as i64)).collect();
+    let delta = delta_for(&engine, base, &rows);
+    let (copies, clone_instr) = counter.measure(|| (0..7).map(|_| delta.clone_batch()).collect::<Vec<_>>());
+    drop(copies);
+    let ((), instr) = counter.measure(|| tick(&mut engine, base, 2, delta));
+    let last = engine.dag.dependents_of(base).last().copied().unwrap();
+    assert_eq!(live_weight(&engine, last) as u64, BENCH_TICKS + 1, "the tick landed");
+    println!("{BENCH_TICKS}-row tick, 8 readers        {instr:>10} instr, of which 7 copies {clone_instr}");
 }

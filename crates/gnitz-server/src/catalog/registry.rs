@@ -8,7 +8,7 @@ use gnitz_expr::payload_str;
 /// Operator-state format version. Bump on any change to an operator-state
 /// schema; a mismatch marks every Rederive view invalid at boot. Shard and
 /// manifest layout carry their own version words.
-const STATE_FORMAT: u32 = 10;
+const STATE_FORMAT: u32 = 11;
 
 /// The durable topology word recorded in `_sequences` ([`SEQ_ID_TOPOLOGY`]):
 /// `(worker_count << 32) | STATE_FORMAT`. One packer, shared by the boot-time
@@ -216,14 +216,13 @@ impl CatalogEngine {
     /// published after it is stamped with too.
     pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
         self.registry.set_resume_generation(generation);
-        Ok(self.registry.checkpoint_ephemeral(self.dag.collect_ephemeral_state())?)
+        Ok(self.registry.checkpoint_ephemeral(self.dag.ephemeral_states())?)
     }
 
     /// Unlink the manifest of every store [`Self::flush_ephemeral_round`]
     /// publishes, so the next open erases those stores instead of resuming them.
     pub(crate) fn unlink_derived_manifests(&mut self) {
-        self.registry
-            .unlink_ephemeral_manifests(self.dag.collect_ephemeral_state());
+        self.registry.unlink_ephemeral_manifests(self.dag.ephemeral_states());
     }
 
     /// Record the launched topology and latch the registry's resume verdict from

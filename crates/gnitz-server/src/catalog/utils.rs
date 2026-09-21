@@ -1,14 +1,6 @@
-//! Storage-level reads and retractions over the system tables, and the
-//! pre-flight directory name.
+//! Storage-level reads and retractions over the system tables.
 
 use super::*;
-
-/// `<base_dir>/_relations/_preflight_<vid>` — where the master's CREATE VIEW
-/// pre-flight compiles. Not the view's own directory, whose rank-0 children are
-/// worker 0's; under the relation root, so the sweep reclaims one a crash leaves.
-pub(in crate::catalog) fn preflight_dir(base_dir: &str, vid: i64) -> String {
-    format!("{}/_preflight_{vid}", relations_dir(base_dir))
-}
 
 // ---------------------------------------------------------------------------
 // Copy/retract helpers

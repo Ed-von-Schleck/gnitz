@@ -99,7 +99,7 @@ impl CircuitTables {
     /// Loaded straight off the registry the engine loads through, so the fixture
     /// exercises the same lookup production does.
     fn load(&mut self) -> Result<LoadedCircuit, String> {
-        load_circuit(&self.registry, Self::VIEW_ID)
+        load_circuit(&self.registry, Self::VIEW_ID as i64)
     }
 }
 

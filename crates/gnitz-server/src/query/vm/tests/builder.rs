@@ -12,16 +12,16 @@ fn an_integrate_takes_its_register_unless_it_is_the_sink() {
     let schema = make_schema_u128_i64();
     let mut p = TestPlan::default();
 
-    let t0 = p.table(&registry, dir.path(), "t0", schema);
-    let t1 = p.table(&registry, dir.path(), "t1", schema);
-    let t2 = p.table(&registry, dir.path(), "t2", schema);
+    let t0 = p.table("t0", schema);
+    let t1 = p.table("t1", schema);
+    let t2 = p.table("t2", schema);
     p.push(0, 1, Op::Negate);
     p.push(1, 2, Op::Negate);
     p.integrate(0, t0);
     p.integrate(1, t1);
     p.integrate(2, t2);
 
-    let vm = p.build(vec![schema; 3], 2);
+    let vm = p.build_in(&registry, vec![schema; 3], 2);
     let takes: Vec<bool> = vm.program.integrates.iter().map(|i| i.take).collect();
     assert_eq!(
         takes,
@@ -45,10 +45,10 @@ fn a_folded_register_is_folded_by_its_first_reader() {
     let schema = make_schema_u128_i64();
     let mut p = TestPlan::default();
 
-    let hist = p.table(&registry, dir.path(), "hist", schema);
-    let join_trace = p.table(&registry, dir.path(), "jt", schema);
-    let red_trace = p.table(&registry, dir.path(), "rt", schema);
-    let lin_trace = p.table(&registry, dir.path(), "lt", schema);
+    let hist = p.table("hist", schema);
+    let join_trace = p.table("jt", schema);
+    let red_trace = p.table("rt", schema);
+    let lin_trace = p.table("lt", schema);
 
     // MIN carries a value index, so `op_reduce` consolidates; COUNT alone does
     // not.
@@ -64,7 +64,7 @@ fn a_folded_register_is_folded_by_its_first_reader() {
     )
     .unwrap();
     assert!(avi_plan.consolidates_input());
-    let avi_table = p.table(&registry, dir.path(), "avi", avi_plan.avi.as_ref().unwrap().schema);
+    let avi_table = p.table("avi", avi_plan.avi.as_ref().unwrap().schema);
 
     let linear_plan =
         gnitz_store::ops::ReducePlan::from_wire(&schema, &[], &[AggDescriptor::COUNT_STAR], false, true).unwrap();
@@ -107,7 +107,7 @@ fn a_folded_register_is_folded_by_its_first_reader() {
         },
     );
 
-    let vm = p.build(vec![schema; 12], 11);
+    let vm = p.build_in(&registry, vec![schema; 12], 11);
     // `(register, pc)` for every operand the dispatch folds.
     let marked: Vec<(usize, usize)> = vm
         .program

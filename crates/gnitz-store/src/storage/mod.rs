@@ -75,7 +75,7 @@ pub(crate) use seek::{pk_group_end, pk_prefix_group_end};
 pub(crate) use lsm::child_dir::children_at_generation;
 pub use lsm::child_dir::fsync_dir;
 pub(crate) use lsm::child_dir::reclaim_retired_children;
-pub(crate) use lsm::child_dir::{create_child, remove_child};
+pub(crate) use lsm::child_dir::remove_child;
 // `ChildAddr` and `Slot` are *names*, not stores: the crash-fixture and relayout
 // tests assert on the on-disk shape through them.
 pub(crate) use lsm::child_dir::subdir_names;

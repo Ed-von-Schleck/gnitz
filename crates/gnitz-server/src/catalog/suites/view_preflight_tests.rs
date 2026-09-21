@@ -23,11 +23,6 @@ fn over_cap_pred_blob() -> Vec<u8> {
 
 /// `ScanDelta(base_tid) → Filter(pred) → Distinct → Integrate` for `vid`. The
 /// filter blob is what decides whether the view compiles.
-///
-/// The `Distinct` is what makes the compile home a scratch child (its clamp
-/// history) under the compile directory, so the residue assertions below have
-/// something to catch on the accepting path, and the I/O rejection something to
-/// fail on.
 fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, pred: &[u8]) {
     let mut circuit = gnitz_wire::Circuit::default();
     let scan = circuit.input_delta(base_tid as u64, gnitz_wire::ReadBound::None);
@@ -51,81 +46,71 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
     vid
 }
 
-/// Names of the entries directly under the relation root — where the pre-flight's
-/// throwaway root lives.
-fn relation_root_entries(dir: &str) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(relations_dir(dir))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
-}
-
 // ── The pre-flight verdict ──────────────────────────────────────────────────
 
 /// A circuit the engine cannot compile must come back as an error while the DDL
-/// is still undoable, and a compilable one must come back clean. Either way it
-/// keeps nothing — the throwaway root exists only for the duration of the
-/// compile, so a rejected `CREATE VIEW` leaves no directory behind and a later
-/// valid view of the same name is unobstructed.
+/// is still undoable, and a compilable one must come back clean.
 #[test]
-fn test_preflight_compile_verdict_and_no_residue() {
+fn test_preflight_compile_verdict() {
     let dir = temp_dir("preflight_verdict");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
-    let before = relation_root_entries(&dir);
-
     // A compilable circuit: a well-formed predicate over the base's own columns.
     let ok_vid = register_filtered_view(&mut engine, base_tid, "vok", &pred_lt_blob(1, 100));
     assert!(
-        engine.preflight_view_compile(ok_vid).is_ok(),
+        crate::query::preflight_compile(&engine.registry, ok_vid).is_ok(),
         "a well-formed circuit must pass the pre-flight"
     );
-
-    // The compile really does home its scratch children under `preflight_dir`:
-    // occupy that exact path with a plain file and the same circuit can no
-    // longer create them, so it is rejected. Without this the residue assertions
-    // below would hold vacuously. It also covers the I/O rejection case — a
-    // child table that cannot be created fails the compile instead of yielding a
-    // view that never persists its differential state.
-    let root = preflight_dir(&dir, ok_vid);
-    fs::write(&root, b"").unwrap();
-    let io_msg = engine
-        .preflight_view_compile(ok_vid)
-        .expect_err("an unusable compile directory must fail the pre-flight");
-    // `create_dir_all` hits a plain file where a directory belongs (ENOTDIR);
-    // the errno must reach the client's string, not flatten to "io error".
-    let want = gnitz_store::storage::StorageError::Io(libc::ENOTDIR).to_string();
-    assert!(
-        io_msg.contains("child table create failed") && io_msg.contains(&want),
-        "the rejection must name the failing step and its errno, got: {io_msg}"
-    );
-    fs::remove_file(&root).unwrap();
 
     // An over-cap predicate: the register file exceeds MAX_REGS, so the filter's
     // program is rejected, and the message names the limit it exceeded.
     let bad_vid = register_filtered_view(&mut engine, base_tid, "vbad", &over_cap_pred_blob());
-    let msg = engine
-        .preflight_view_compile(bad_vid)
+    let msg = crate::query::preflight_compile(&engine.registry, bad_vid)
         .expect_err("an over-cap predicate must fail the pre-flight");
     assert!(
         msg.contains("registers") && msg.contains(&gnitz_expr::MAX_REGS.to_string()),
         "the rejection must state the register limit, got: {msg}"
     );
 
-    // Neither compile left a `_preflight_*` root; the only new entries are the
-    // two views' own directories, created by the register hook.
-    let after = relation_root_entries(&dir);
-    let new: Vec<&String> = after.iter().filter(|n| !before.contains(n)).collect();
-    assert!(
-        new.iter().all(|n| !n.starts_with("_preflight")),
-        "the pre-flight root must be removed on both paths, found: {new:?}"
-    );
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A circuit whose routing or size the engine refuses is rejected before the
+/// DDL is durable.
+#[test]
+fn a_view_whose_circuit_is_unroutable_or_over_cap_is_rejected_before_the_sal() {
+    let dir = temp_dir("preflight_routing");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let a = engine.create_table("public.a", &cols, &[0]).unwrap();
+    let b = engine.create_table("public.b", &cols, &[0]).unwrap();
+
+    for (circuit, want) in [
+        (
+            equi_join_circuit(a, b, [false, true]),
+            format!("source {a} feeds a join and states no scatter key"),
+        ),
+        (
+            negate_chain(a, crate::query::MAX_CIRCUIT_NODES + 1),
+            "circuit exceeds the node limit".to_string(),
+        ),
+    ] {
+        // The setup is not part of the bundle being compensated.
+        let _ = engine.drain_pending_broadcasts();
+        let vid = engine.next_id;
+        let err = try_register_view(&mut engine, circuit, "v", &cols, 0, 0)
+            .expect_err("the register hook refuses the circuit");
+        assert!(err.contains(&want), "got: {err}");
+        engine.compensate_stage_a().unwrap();
+        assert!(!engine.registry.has_id(vid), "the view is not registered");
+        assert!(
+            engine.live_sys_row(SysFamily::View, vid).is_none(),
+            "no VIEW_TAB row of it is live"
+        );
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

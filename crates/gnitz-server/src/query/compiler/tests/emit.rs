@@ -1,11 +1,9 @@
 use super::*;
 use crate::query::compiler::fixtures::*;
-use crate::test_support::{make_batch, make_schema_u64_i64, pk_only_schema, pk_payload_schema, sum_weights};
-use gnitz_store::relation::{CircuitState, RelationKind, RelationSpec, StoreConfig};
+use crate::test_support::{make_schema_u64_i64, pk_only_schema, pk_payload_schema};
+use gnitz_store::relation::StateLayout;
 use gnitz_store::schema::SchemaColumn;
-use gnitz_store::storage::Slot;
 use gnitz_wire::type_code;
-use gnitz_wire::ViewProps;
 use std::collections::HashMap;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -18,17 +16,11 @@ const SELF_CONTAINED: bool = true;
 /// one field of `mid`.
 struct MidCircuit {
     in_schema: SchemaDescriptor,
-    /// Homes the mid node's scratch children, and outlives every plan `build`
-    /// returns — a plan holds `Table`s under this directory.
-    tmp: tempfile::TempDir,
 }
 
 impl MidCircuit {
     fn new(in_schema: SchemaDescriptor) -> Self {
-        MidCircuit {
-            in_schema,
-            tmp: tempfile::tempdir().unwrap(),
-        }
+        MidCircuit { in_schema }
     }
 
     fn build(&self, mid: gnitz_wire::OpNode) -> Result<(SubPlan, Vec<Option<OutReg>>), String> {
@@ -36,10 +28,10 @@ impl MidCircuit {
             [(0, scan_delta(10)), (1, mid), (2, gnitz_wire::OpNode::IntegrateSink)],
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         );
-        build_plan(
+        build(
             &loaded,
             &subgraph_ordered(&loaded, 1),
-            home(self.tmp.path().to_str().unwrap(), 1, [(10, self.in_schema)]).site(),
+            &sources([(10, self.in_schema)]),
             SELF_CONTAINED,
             &[],
             1,
@@ -52,50 +44,24 @@ impl MidCircuit {
     }
 }
 
-/// Where one test's compile is homed: the throwaway root its scratch children
-/// live under, and the registry they are opened through. A `ViewSite` borrows
-/// both, so a `Home` temporary lives as long as the build it feeds.
-struct Home {
-    dir: String,
-    id: u64,
-    registry: RelationRegistry,
-}
-
-impl Home {
-    fn site(&self) -> ViewSite<'_> {
-        ViewSite {
-            dir: &self.dir,
-            id: self.id,
-            registry: &self.registry,
-        }
-    }
-}
-
-/// A home whose view is registered under `dir`, beside the source `rows` its circuit
-/// scans, so children open at the policy production gives them.
-fn home(dir: &str, id: u64, rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>) -> Home {
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
-    register_sources(&mut registry, rows);
-    registry
-        .register(RelationSpec {
-            id: id as i64,
-            kind: RelationKind::View,
-            schema: make_schema_u64_i64(),
-            directory: dir.to_string(),
-            props: ViewProps::default(),
-        })
-        .unwrap();
-    Home { dir: dir.to_string(), id, registry }
-}
-
-/// A home with no view registered and no root, holding only the source `rows` — what a
-/// guard rejected before any child opens needs.
-fn bare_home(id: u64, rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>) -> Home {
-    Home {
-        dir: String::new(),
-        id,
-        registry: sources(rows),
-    }
+/// [`build_plan`] into a fresh layout: one sub-plan, compiled over `registry`.
+fn build(
+    loaded: &LoadedCircuit,
+    ordered: &[NodeId],
+    registry: &RelationRegistry,
+    self_contained: bool,
+    seeds: &[(NodeId, SchemaDescriptor)],
+    out: NodeId,
+) -> Result<(SubPlan, Vec<Option<OutReg>>), String> {
+    build_plan(
+        loaded,
+        ordered,
+        registry,
+        &mut StateLayout::default(),
+        self_contained,
+        seeds,
+        out,
+    )
 }
 
 // ── The plan's output ───────────────────────────────────────────────────
@@ -112,10 +78,10 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
     let plan = |ordered: &[NodeId]| {
-        build_plan(
+        build(
             &loaded,
             ordered,
-            bare_home(1, [(10, pk_only_schema(&[type_code::U64]))]).site(),
+            &sources([(10, pk_only_schema(&[type_code::U64]))]),
             SELF_CONTAINED,
             &[],
             1,
@@ -138,7 +104,6 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
 /// that takes a delta refuses one.
 #[test]
 fn an_integral_reaching_a_delta_port_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
     let one = make_schema_u64_i64();
     // `ScanDelta(10) → IntegrateTrace → consumer`, planned as a subgraph ending
     // at the consumer. The consumer is the only thing that varies.
@@ -151,10 +116,10 @@ fn an_integral_reaching_a_delta_port_is_rejected() {
             ],
             edges,
         );
-        build_plan(
+        build(
             &loaded,
             &loaded.ordered_where(|_| true),
-            home(dir.path().to_str().unwrap(), 1, [(10, one)]).site(),
+            &sources([(10, one)]),
             SELF_CONTAINED,
             &[],
             2,
@@ -186,11 +151,10 @@ fn a_plan_whose_output_is_an_integral_is_rejected() {
         [(0, scan_delta(10)), (1, gnitz_wire::OpNode::IntegrateTrace)],
         vec![(0, 1, SLOT_IN)],
     );
-    let dir = tempfile::tempdir().unwrap();
-    let result = build_plan(
+    let result = build(
         &loaded,
         &loaded.ordered_where(|_| true),
-        home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
+        &sources([(10, make_schema_u64_i64())]),
         SELF_CONTAINED,
         &[],
         1,
@@ -227,11 +191,10 @@ fn a_global_aggregate_under_a_keyed_shard_is_rejected() {
         );
         // The post phase: the shard is a seed register, exactly as `compile_view`
         // hands it over.
-        let dir = tempfile::tempdir().unwrap();
-        build_plan(
+        build(
             &loaded,
             &loaded.ordered_where(|n| n >= 2),
-            home(dir.path().to_str().unwrap(), 1, [(10, schema)]).site(),
+            &sources([(10, schema)]),
             SELF_CONTAINED,
             &[(1, schema)],
             3,
@@ -361,7 +324,6 @@ fn plan_two_source_join(
     trace_schema: SchemaDescriptor,
 ) -> Result<(), String> {
     use gnitz_wire::OpNode;
-    let dir = tempfile::tempdir().unwrap();
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),
@@ -372,15 +334,10 @@ fn plan_two_source_join(
         ],
         vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_B), (3, 4, SLOT_IN)],
     );
-    build_plan(
+    build(
         &loaded,
         &subgraph_ordered(&loaded, 3),
-        home(
-            dir.path().to_str().unwrap(),
-            1,
-            [(10, delta_schema), (11, trace_schema)],
-        )
-        .site(),
+        &sources([(10, delta_schema), (11, trace_schema)]),
         SELF_CONTAINED,
         &[],
         3,
@@ -394,7 +351,6 @@ fn plan_two_source_join(
 /// difference between the two builds is which node feeds `SLOT_B`.
 #[test]
 fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
     let two_col = make_schema_u64_i64();
     // Node 2 is the integral of scan 11; node 1 is that scan's own register,
     // which carries a delta and no table.
@@ -414,10 +370,10 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
             ],
             vec![(1, 2, SLOT_IN), (0, 3, SLOT_IN), (trace_src, 3, SLOT_B)],
         );
-        build_plan(
+        build(
             &loaded,
             &loaded.ordered_where(|_| true),
-            home(dir.path().to_str().unwrap(), 1, [(10, two_col), (11, two_col)]).site(),
+            &sources([(10, two_col), (11, two_col)]),
             SELF_CONTAINED,
             &[],
             3,
@@ -432,7 +388,6 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
 #[test]
 fn a_wide_pk_join_compiles() {
     let schema = crate::test_support::pk_only_schema(&[type_code::U64; 3]);
-    let dir = tempfile::tempdir().unwrap();
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),
@@ -449,60 +404,15 @@ fn a_wide_pk_join_compiles() {
         ],
         vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_B), (3, 4, SLOT_IN)],
     );
-    // The plan owns scratch dirs under `dir`, so it must drop first: build it
-    // inside the assert rather than binding it past `dir`'s scope.
-    assert!(build_plan(
+    assert!(build(
         &loaded,
         &subgraph_ordered(&loaded, 3),
-        home(dir.path().to_str().unwrap(), 1, [(10, schema), (20, schema)]).site(),
+        &sources([(10, schema), (20, schema)]),
         SELF_CONTAINED,
         &[],
         3
     )
     .is_ok());
-}
-
-/// A failing node after one that already created scratch: an uncommitted
-/// `CircuitState`'s drop must remove the directory. The failing node comes
-/// *after* the scratch-creating one, or the assertion holds vacuously.
-#[test]
-fn a_failed_compile_removes_the_scratch_dirs_it_created() {
-    let dir = tempfile::tempdir().unwrap();
-    let view_dir = dir.path();
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(10)),
-            // `Distinct`, not `IntegrateTrace`: it creates a scratch child too,
-            // and its output is a delta the failing Map can take as its input.
-            (1, gnitz_wire::OpNode::Distinct),
-            (2, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![200]))),
-            (3, gnitz_wire::OpNode::IntegrateSink),
-        ],
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN)],
-    );
-    let result = build_plan(
-        &loaded,
-        &subgraph_ordered(&loaded, 2),
-        home(view_dir.to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
-        SELF_CONTAINED,
-        &[],
-        2,
-    );
-    assert_eq!(
-        rejection(result),
-        "projection map: column 200 is not a payload column of a 2-column schema"
-    );
-
-    let leftover: Vec<String> = std::fs::read_dir(view_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("scratch_"))
-        .collect();
-    assert!(
-        leftover.is_empty(),
-        "scratch dirs must be removed on compile failure, found: {leftover:?}",
-    );
 }
 
 // ── Weight-clamp presets ────────────────────────────────────────────────
@@ -564,7 +474,6 @@ fn consume_flags(plan: &SubPlan) -> Vec<(&'static str, bool)> {
 /// aliasing and would no longer read the register at runtime.)
 #[test]
 fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
-    let dir = tempfile::tempdir().unwrap();
     let flags = |distinct_id: NodeId, reader_id: NodeId| {
         let loaded = loaded_for_test(
             [
@@ -574,10 +483,10 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
             ],
             vec![(0, distinct_id, SLOT_IN), (0, reader_id, SLOT_IN)],
         );
-        let plan = build_plan(
+        let plan = build(
             &loaded,
             &loaded.ordered_where(|_| true),
-            home(dir.path().to_str().unwrap(), 1, [(10, make_schema_u64_i64())]).site(),
+            &sources([(10, make_schema_u64_i64())]),
             SELF_CONTAINED,
             &[],
             distinct_id,
@@ -608,10 +517,10 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
     let two_col = make_schema_u64_i64();
     let flags = |nodes: HashMap<NodeId, gnitz_wire::OpNode>, edges: Vec<(NodeId, NodeId, usize)>, out: NodeId| {
         let loaded = loaded_for_test(nodes, edges);
-        let plan = build_plan(
+        let plan = build(
             &loaded,
             &loaded.ordered_where(|_| true),
-            bare_home(1, [(10, two_col), (11, two_col)]).site(),
+            &sources([(10, two_col), (11, two_col)]),
             SELF_CONTAINED,
             &[],
             out,
@@ -647,84 +556,6 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
     );
 }
 
-// ── Scratch cleanup ─────────────────────────────────────────────────────
-
-/// A compile that fails after reopening a checkpointed operator trace must leave
-/// it intact: the boot verdict cannot see the loss, so the view would resume with
-/// that operator's history emptied.
-#[test]
-fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
-    const G: u64 = 7;
-    const VIEW_ID: u64 = 1;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_str().unwrap();
-    let schema = make_schema_u64_i64();
-    // The name `emit_node`'s `Distinct` arm derives for node 1 of view 1.
-    const CHILD: &str = "_hist_1_1";
-
-    // Set *before* the view is registered, so its output store opens at
-    // `Rederive { resume_at: Some(G) }` and `open_child` inherits that policy.
-    // Under `None` the open erases the store anyway and the test passes for the
-    // wrong reason.
-    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
-    registry.set_resume_generation(G);
-    registry.set_resume_enabled(true);
-    registry
-        .register(RelationSpec {
-            id: VIEW_ID as i64,
-            kind: RelationKind::View,
-            schema,
-            directory: dir.to_string(),
-            props: ViewProps::default(),
-        })
-        .unwrap();
-    register_sources(&mut registry, [(10, schema)]);
-
-    // A checkpointed operator trace: one row, published at generation G.
-    let mut committed = CircuitState::new();
-    let idx = committed
-        .open_child(&registry, VIEW_ID as i64, dir, CHILD, schema)
-        .unwrap();
-    committed.ingest_owned(idx, make_batch(&schema, &[(1, 1, 5)])).unwrap();
-    registry.checkpoint_ephemeral([&mut committed]).unwrap();
-    committed.commit();
-    drop(committed);
-
-    // Node 1 reopens that child; node 2 then fails the compile.
-    let loaded = loaded_for_test(
-        [
-            (0, scan_delta(10)),
-            (1, gnitz_wire::OpNode::Distinct),
-            (2, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![200]))),
-        ],
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
-    );
-    let site = ViewSite { dir, id: VIEW_ID, registry: &registry };
-    assert_eq!(
-        rejection(build_plan(
-            &loaded,
-            &subgraph_ordered(&loaded, 2),
-            site,
-            SELF_CONTAINED,
-            &[],
-            2,
-        )),
-        "projection map: column 200 is not a payload column of a 2-column schema"
-    );
-
-    let mut reopened = CircuitState::new();
-    let idx = reopened
-        .open_child(&registry, VIEW_ID as i64, dir, CHILD, schema)
-        .unwrap();
-    assert_eq!(
-        sum_weights(reopened.cursor(idx)),
-        1,
-        "the committed trace row must survive a failed compile"
-    );
-    reopened.commit();
-}
-
 // ── Replica sides ───────────────────────────────────────────────────────
 
 /// A muted relay round drops a side's rows, so it must fire exactly when every
@@ -733,16 +564,15 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
 #[test]
 fn a_side_emits_a_replica_only_over_replicated_sources_it_does_not_trim() {
     use gnitz_store::schema::Placement;
-    let tmp = tempfile::tempdir().unwrap();
     let replica_of = |schema: SchemaDescriptor, mid: gnitz_wire::OpNode| {
         let loaded = loaded_for_test(
             [(0, scan_delta(10)), (1, mid), (2, gnitz_wire::OpNode::IntegrateSink)],
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         );
-        let h = home(tmp.path().to_str().unwrap(), 1, [(10, schema)]);
+        let registry = sources([(10, schema)]);
         let (plan, _) =
-            build_plan(&loaded, &subgraph_ordered(&loaded, 1), h.site(), false, &[], 1).expect("the fixture compiles");
-        emits_replica(&plan, &h.registry)
+            build(&loaded, &subgraph_ordered(&loaded, 1), &registry, false, &[], 1).expect("the fixture compiles");
+        emits_replica(&plan, &registry)
     };
     let replicated = make_schema_u64_i64().with_placement(Placement::Replicated);
     assert!(replica_of(replicated, gnitz_wire::OpNode::Negate));

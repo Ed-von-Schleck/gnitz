@@ -21,45 +21,23 @@ use gnitz_store::read::SkeletonHydrator;
 use gnitz_store::storage::{PkSetGather, StoreError};
 
 /// Recompute the output rows of the capacity-bounded view `view_id` for `keys`
-/// — the flat concatenation of the OPK images, ascending. One consolidated batch
-/// in the view's own schema.
-///
-/// `keys` is taken by value because the gather below owns its key list; the
-/// caller built the buffer for this call and has no further use for it.
-///
-/// The registry's `scan_chunk_rows` bounds the seed batch only; `JoinDT`'s equi
-/// walk accepts multi-key deltas, so the chunking costs nothing but peak
-/// memory.
+/// — the flat concatenation of the OPK images, ascending — replaying at most
+/// `scan_chunk_rows` seed rows at a time.
 impl SkeletonHydrator for DagEngine {
     fn hydrate_keys(&mut self, registry: &RelationRegistry, view_id: i64, keys: Vec<u8>) -> Result<Batch, StoreError> {
         let view_schema = registry
             .relation_or_err(view_id)
             .map_err(|e| e.in_context(&format!("hydrate: view {view_id}")))?
             .schema();
-        // The plan is memoized lazily and is dropped on every rebuild, so a read
-        // arriving before the view's first tick would otherwise find nothing.
-        let (_, plan) = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;
-        let Sides::Unexchanged { hydration: Some(hydration) } = &plan.sides else {
+        let (_, ViewPlan { code, state }) = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;
+        let Sides::Unexchanged { hydration: Some(hydration) } = code.sides else {
             return Err(StoreError::rejected(format!(
                 "hydrate: view {view_id} was not compiled as capacity-bounded"
             )));
         };
-        let hydration = *hydration;
 
-        let mut out = Batch::empty_with_schema(&view_schema);
-
-        // The seed cursor and the register the replay feeds it to. A linear body
-        // seeds the source relation's store at the program's start; a join seeds
-        // one branch's trace mid-program, because the join key is not the source
-        // PK and a key-restricted feed at the `ScanDelta` register would mean
-        // scanning the whole source.
-        //
-        // The ranged cursor open takes `&self` and the cursor owns its runs via
-        // `Rc`, so both borrows of the registry end here and the VM is free to
-        // run below.
-        let sub = &mut plan.post;
+        let sub = &mut code.post;
         let seed_schema = *sub.vm.program.schema_of(hydration.in_reg);
-        // The gather opens over the range its own key list spans.
         let mut gather = match hydration.seed {
             HydrationSeed::Relation(source) => {
                 let entry = registry
@@ -71,23 +49,20 @@ impl SkeletonHydrator for DagEngine {
                 PkSetGather::open(keys, seed_schema, |s, e| entry.cursor_in_range(s, e))
             }
             HydrationSeed::Trace(seed_table) => {
-                let state = &sub.vm.state;
+                let state = &*state;
                 PkSetGather::open(keys, seed_schema, |s, e| state.cursor_in_range(seed_table, s, e))
             }
         };
+        let mut out = Batch::empty_with_schema(&view_schema);
         while let Some(seed) = gather.next_chunk(registry.scan_chunk_rows()) {
-            let produced = vm::replay_chunk(&mut sub.vm, hydration.start_pc, (hydration.in_reg, seed))
+            let produced = vm::replay_chunk(&mut sub.vm, state, hydration.start_pc, (hydration.in_reg, seed))
                 .map_err(|e| StoreError::rejected(format!("hydrate: view {view_id} replay failed: {e}")))?;
             debug_assert!(
                 produced.schema().same_physical_layout(&view_schema),
                 "hydration produced a batch that is not in the view's schema",
             );
-            out.append_batch(&produced, 0, produced.len());
+            out.append_above(produced.into_consolidated(&view_schema));
         }
-
-        // Drops the seed cursor's merge tree before the consolidate below
-        // allocates a second full arena.
-        drop(gather);
-        Ok(out.into_consolidated(&view_schema))
+        Ok(out)
     }
 }

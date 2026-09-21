@@ -8,11 +8,12 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
-use crate::query::{Drive, ExchangeCallback};
+use crate::query::{DagEngine, Drive, DriveHost};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc};
 use gnitz_foundation::fault::Seam;
+use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
@@ -124,10 +125,7 @@ struct WorkerExchangeHandler {
     pending_relays: HashMap<(i64, i64), (Batch, BackfillDecision)>,
 }
 
-/// Bridges the DAG's `ExchangeCallback` requirement to `WorkerProcess`. Holds a
-/// mutable reference to the worker so `do_exchange` can re-enter the worker's
-/// handlers (`handle_push`, `handle_flush_all`) inline when those messages
-/// arrive mid-wait.
+/// The worker as a drive's [`DriveHost`].
 struct DagExchangeCtx<'a> {
     worker: &'a mut WorkerProcess,
     /// This worker's source partition is already drained, so its rounds are
@@ -141,9 +139,14 @@ struct DagExchangeCtx<'a> {
     verdict: Option<BackfillDecision>,
 }
 
-impl ExchangeCallback for DagExchangeCtx<'_> {
-    fn do_exchange(&mut self, view_id: i64, batch: Batch, source_id: i64) -> Batch {
-        let (batch, decision) = self.worker.do_exchange_wait(view_id, batch, source_id, self.pad);
+impl DriveHost for DagExchangeCtx<'_> {
+    fn parts(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
+        let cat = self.worker.cat();
+        (&mut cat.dag, &mut cat.registry)
+    }
+
+    fn exchange(&mut self, view_id: i64, batch: Batch, key: i64) -> Batch {
+        let (batch, decision) = self.worker.do_exchange_wait(view_id, batch, key, self.pad);
         // The master writes the next round at cursor 0 of a new epoch. Not the
         // flush path: its ACK would read as this worker's terminal ACK.
         if decision == BackfillDecision::Checkpoint {
@@ -904,13 +907,8 @@ impl WorkerProcess {
     /// backfill verdict its rounds carried. `pad` marks this worker's source
     /// partition already drained, which only a backfill chunk sets.
     fn drive_dag(&mut self, what: Drive, delta: Batch, pad: bool) -> Option<BackfillDecision> {
-        let cat = self.catalog;
-        // SAFETY: the exchange wait re-enters the dispatch loop through `ctx`, and
-        // `in_eval` defers `DdlSync`, the one message that (un)registers a
-        // relation, until `drive` returns.
-        let (dag, reg) = unsafe { (&raw mut (*cat).dag, &raw mut (*cat).registry) };
         let mut ctx = DagExchangeCtx { worker: self, pad, verdict: None };
-        let res = unsafe { &mut *dag }.drive(unsafe { &mut *reg }, what, delta, &mut ctx);
+        let res = crate::query::drive(&mut ctx, what, delta);
         let verdict = ctx.verdict;
         // DDL_SYNC messages deferred during exchange waits land before the ACK.
         self.dispatch_deferred();

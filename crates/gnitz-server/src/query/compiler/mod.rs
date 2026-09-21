@@ -11,7 +11,7 @@ use crate::query::vm::{DeltaReg, VmHandle};
 use gnitz_expr::LogicalProgram;
 use gnitz_store::expr::MapPlan;
 use gnitz_store::ops::ScatterSpec;
-use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
+use gnitz_store::relation::{Relation, RelationRegistry, StateIdx, StateLayout};
 use gnitz_store::schema::{OpBuildErr, SchemaDescriptor};
 use gnitz_wire::{AggDescriptor, NodeId, NodeInputs};
 
@@ -34,14 +34,12 @@ pub(super) use load::{load_circuit, read_circuit_node_row};
 pub(super) use routing::ViewMeta;
 pub(crate) use routing::{RelayRoute, OUTPUT_RELAY};
 
-/// The most nodes one view's circuit may hold. A real circuit is 15–40 nodes;
-/// the headroom is what makes the `u16` register ids safe under any future node
-/// kind minting up to three per node (`3 × 16_384 + 2 < u16::MAX`). Child-store
-/// ids are bounded independently, by `CircuitState::open_child`.
-///
-/// The catalog precheck rejects an over-cap bundle, so a stored circuit always
-/// loads; this constructor re-checks for the rows no precheck saw.
+/// The most nodes one view's circuit may hold; a real circuit is 15–40.
 pub(crate) const MAX_CIRCUIT_NODES: usize = 16_384;
+// Registers — up to three per node, plus the seeds — and child stores — up to
+// two per node — are `u16` ids.
+const _: () = assert!(3 * MAX_CIRCUIT_NODES + 2 < u16::MAX as usize);
+const _: () = assert!(2 * MAX_CIRCUIT_NODES <= u16::MAX as usize);
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -113,15 +111,24 @@ impl LoadedCircuit {
 }
 
 /// True iff `op` carries every row through on its own worker with the PK region
-/// intact — the one definition of where the shard-skip back-walk and a bounded
-/// view's hydration seed may cross. A `Reindex` or `HashRow` Map replaces the PK
-/// region; a `WorkerFilter` drops rows.
+/// intact.
 fn keeps_rows_and_pk_region(op: &gnitz_wire::OpNode) -> bool {
     use gnitz_wire::{MapKind, OpNode};
     matches!(
         op,
         OpNode::Filter(_) | OpNode::Map(MapKind::Projection(_) | MapKind::Compute(_))
     )
+}
+
+/// Walk back from `from` through nodes that keep rows and the PK region, to the
+/// first node that does not: `(that node, whether a Map was crossed)`.
+fn row_local_origin(loaded: &LoadedCircuit, mut from: NodeId) -> (NodeId, bool) {
+    let mut mapped = false;
+    while keeps_rows_and_pk_region(loaded.op(from)) {
+        mapped |= matches!(loaded.op(from), gnitz_wire::OpNode::Map(_));
+        from = loaded.inputs(from).unary();
+    }
+    (from, mapped)
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +169,7 @@ impl LoadedCircuit {
         for (shard, cols) in shards {
             let ancestors = self.ancestors_inclusive(shard);
             // A node in two sides — a shared ancestor, or a shard upstream of
-            // another shard — would open one scratch child twice.
+            // another shard — would declare one scratch child twice.
             if ancestors.iter().zip(&claimed).any(|(&a, &c)| a && c) {
                 return Err("exchange sides share a node".into());
             }
@@ -244,7 +251,7 @@ pub(super) enum Sides {
 }
 
 impl Sides {
-    fn sides_mut(&mut self) -> &mut [Side] {
+    pub(in crate::query) fn sides_mut(&mut self) -> &mut [Side] {
         match self {
             Sides::Unexchanged { .. } => &mut [],
             Sides::Unary(side) => std::slice::from_mut(side),
@@ -256,8 +263,8 @@ impl Sides {
 /// Output from `compile_view`, consumed directly by DagEngine as the cached
 /// plan.
 ///
-/// It carries no routing: that lives once on the memoized `ViewMeta`, which the
-/// worker dispatch and the master relay both read.
+/// It carries no routing: that lives once on the `ViewMeta` derived at the
+/// view's registration, which the worker dispatch and the master relay both read.
 pub(super) struct CompileOutput {
     /// What the circuit repartitions through, ahead of `post`.
     pub(in crate::query) sides: Sides,
@@ -271,8 +278,7 @@ pub(super) struct CompileOutput {
 }
 
 impl CompileOutput {
-    /// Every sub-plan of the view, for whole-plan sweeps (register clears,
-    /// checkpoint table collection).
+    /// Every sub-plan of the view, for whole-plan register clears.
     pub(super) fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
         let Self { sides, post, .. } = self;
         sides
@@ -283,41 +289,42 @@ impl CompileOutput {
     }
 }
 
-/// Where a view's rederived children are created, and under what policy.
-#[derive(Clone, Copy)]
-pub(super) struct ViewSite<'a> {
-    pub(in crate::query) dir: &'a str,
-    pub(in crate::query) id: u64,
-    /// Answers the schemas, the circuit and the slot, and opens every scratch child.
-    pub(in crate::query) registry: &'a RelationRegistry,
-}
-
 /// Compile one view's already-loaded circuit: carve it at its exchanges, then
-/// `build_plan` each side and the post phase.
+/// `build_plan` each side and the post phase. Opens nothing: the returned
+/// layout declares every child store the plan's operators address.
 pub(super) fn compile_view(
     loaded: &LoadedCircuit,
-    site: ViewSite<'_>,
+    registry: &RelationRegistry,
     view_schema: &SchemaDescriptor,
     bounded: bool,
-) -> Result<CompileOutput, String> {
+) -> Result<(CompileOutput, StateLayout), String> {
     let carve = loaded.carve()?;
     // A per-key replay of an exchanged plan would need the exchange to run too.
     if bounded && !carve.sides.is_empty() {
         return Err("bounded view: only a linear body and an inner equi-join are supported".into());
     }
-    let self_contained = view_schema.placement().is_replicated() || site.registry.slot().of <= 1;
+    let self_contained = view_schema.placement().is_replicated() || registry.slot().of <= 1;
+    let mut layout = StateLayout::default();
     let mut side_plans = Vec::with_capacity(carve.sides.len());
     let mut seeds = Vec::with_capacity(carve.sides.len());
     for side in &carve.sides {
         let ex_in = loaded.inputs(side.shard).unary();
-        let (plan, _) = build_plan(loaded, &side.nodes, site, self_contained, &[], ex_in)?;
+        let (plan, _) = build_plan(loaded, &side.nodes, registry, &mut layout, self_contained, &[], ex_in)?;
         let schema = *plan.vm.program.out_schema();
         // The relay routes by this spec mid-round, where a refusal aborts the master.
         ScatterSpec::GroupKey(side.cols).check(&schema)?;
         seeds.push((side.shard, schema));
         side_plans.push(plan);
     }
-    let (post, post_regs) = build_plan(loaded, &carve.post, site, self_contained, &seeds, loaded.sink()?)?;
+    let (post, post_regs) = build_plan(
+        loaded,
+        &carve.post,
+        registry,
+        &mut layout,
+        self_contained,
+        &seeds,
+        loaded.sink()?,
+    )?;
     // Column count alone is not enough: equal counts with mismatched types would
     // let the client read a string descriptor out of integer storage.
     if !post.vm.program.out_schema().same_physical_layout(view_schema) {
@@ -328,7 +335,7 @@ pub(super) fn compile_view(
         .zip(&carve.sides)
         .map(|(plan, c)| {
             Ok(Side {
-                emits_replica: emits_replica(&plan, site.registry),
+                emits_replica: emits_replica(&plan, registry),
                 plan,
                 seed_reg: post_regs[c.shard]
                     .ok_or("an exchange side seeds no register of the post phase")?
@@ -345,13 +352,7 @@ pub(super) fn compile_view(
         1 => Sides::Unary(sides.pop().expect("one side")),
         _ => Sides::Pair(sides.try_into().ok().expect("carve admits at most two sides")),
     };
-    let mut output = CompileOutput { sides, post, self_contained };
-    // Past every fallible step: from here the plan owns its child stores. Every
-    // other exit leaves each sub-plan's state armed, so it erases what it opened.
-    for sub in output.sub_plans_mut() {
-        sub.vm.state.commit();
-    }
-    Ok(output)
+    Ok((CompileOutput { sides, post, self_contained }, layout))
 }
 
 #[cfg(test)]
