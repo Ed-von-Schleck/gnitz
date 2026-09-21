@@ -41,9 +41,7 @@ enum HasPkLookup {
 /// already carries it.
 struct Request {
     kind: SalMessageKind,
-    /// The header's `lsn`: the `Tick` arm's round, a `FlushEph`'s checkpoint
-    /// generation. Travels with the message, so a replayed tick stamps the round
-    /// that produced its delta rather than whatever a counter has reached.
+    /// The zone LSN a `DdlSync` applies at; `0` outside every zone.
     lsn: u64,
     /// The group's request id, which every reply answers on.
     request_id: u32,
@@ -95,8 +93,8 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         | SalMessageKind::UniquePreflight
         | SalMessageKind::Backfill
         | SalMessageKind::Shutdown => InEval::Inline,
-        // Consumed above the split, and slotless: both die at `dispatch_inner`.
-        SalMessageKind::ExchangeRelay | SalMessageKind::ZoneCommit => InEval::Inline,
+        // Consumed above the split: dies at `dispatch_inner`.
+        SalMessageKind::ExchangeRelay => InEval::Inline,
     }
 }
 
@@ -312,7 +310,7 @@ impl WorkerProcess {
         if !self.pending_streams.is_empty() {
             self.emit_pending_scan_chunk();
         }
-        while let Some((msg, wire)) = self.next_sal_message() {
+        while let Some((msg, wire)) = self.sal_reader.next() {
             self.dispatch_top_level(&msg, wire);
             // Replay whatever an exchange wait deferred — a tick or a delta read
             // — now that the outer tick's ACK has been sent.
@@ -332,27 +330,6 @@ impl WorkerProcess {
                 self.handle_request(req);
             }
         }
-    }
-
-    /// The next SAL group to dispatch, with this worker's slot of it. The single
-    /// SAL-read choke point — both the top-level loop and the inside-exchange-wait
-    /// loop funnel through here.
-    ///
-    /// The group header's `lsn` stays on the message rather than being latched
-    /// into the catalog the way `FlushEph`'s generation is: that latch is correct
-    /// for a generation that governs the whole round, and wrong for a tick round
-    /// one deferred message must carry to its replay.
-    fn next_sal_message(&mut self) -> Option<(SalMessage, &'static [u8])> {
-        let (msg, wire) = self.sal_reader.next()?;
-        // The ephemeral flush round carries the checkpoint generation in the
-        // group header's `lsn` field. Latch it before dispatch so
-        // `manifest_header` stamps every view manifest this round publishes with
-        // it — and so a later CREATE INDEX in this process gates its resume on
-        // the same value.
-        if msg.kind == SalMessageKind::FlushEph {
-            self.cat().registry.set_resume_generation(msg.lsn);
-        }
-        Some((msg, wire))
     }
 
     /// Decode one SAL group's slot into an owned [`Request`]. The single decode
@@ -473,12 +450,9 @@ impl WorkerProcess {
                 Ok(())
             }
 
-            // Ephemeral-state flush round: persist every view's operator-trace
-            // tables and output stores, stamped with the checkpoint generation this
-            // round's header already latched into the catalog at the classify site.
             SalMessageKind::FlushEph => {
                 self.sal_reader.rewind();
-                self.cat().flush_ephemeral_round()?;
+                self.cat().flush_ephemeral_round(hdr.arg0)?;
                 self.send_ack(0, request_id);
                 Ok(())
             }
@@ -537,7 +511,7 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Tick => {
-                self.handle_tick(target_id, lsn)?;
+                self.handle_tick(target_id, hdr.arg0)?;
                 self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
@@ -567,8 +541,8 @@ impl WorkerProcess {
             }
 
             // `dispatch` consumes ExchangeRelay itself in both contexts and
-            // never routes it here; the sentinel never reaches `dispatch` at all.
-            SalMessageKind::ExchangeRelay | SalMessageKind::ZoneCommit => {
+            // never routes it here.
+            SalMessageKind::ExchangeRelay => {
                 unreachable!("{kind:?} never reaches dispatch_inner")
             }
         }

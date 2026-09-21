@@ -45,7 +45,7 @@ pub enum CommitRequest {
     /// Buffer one batch for group commit.
     Push(PendingPush),
     /// An atomic user-table transaction: N families emitted as N `Push`
-    /// groups inside one zone under one sentinel, with a single `done` for the
+    /// groups inside one zone, with a single `done` for the
     /// whole bundle. Validated and lock-guarded by the executor before it
     /// reaches here.
     Txn(PendingTxn),
@@ -59,7 +59,7 @@ pub enum CommitRequest {
 
 /// One buffered atomic transaction awaiting commit: its families in frame order
 /// and one `done` resolving `Ok(zone_lsn)` for the whole bundle (or the first family
-/// error on a pre-sentinel abort). Every family is `recoverable` — the executor
+/// error on an abort before the zone commits). Every family is `recoverable` — the executor
 /// refuses a stream target — so a transaction always opens a zone.
 pub struct PendingTxn {
     pub families: Vec<TxnFamily>,
@@ -98,7 +98,7 @@ pub struct PendingPush {
     pub tid: i64,
     pub batch: Batch,
     /// Whether these rows are something a restart must recover, i.e. whether this
-    /// group may open the zone the sentinel and fdatasync close. False only for a
+    /// group may join the zone the commit and fdatasync close. False only for a
     /// stream. Decided by the executor, which has already resolved the target's kind,
     /// so the committer never asks the catalog what a relation *is*.
     pub recoverable: bool,
@@ -354,7 +354,7 @@ enum Outcome {
     /// worker error downgrades that group's verdict.
     Pushes(Vec<oneshot::Sender<Result<u64, WireFault>>>),
     /// One transaction. Its contract is "Err ⇒ nothing committed", so once the
-    /// sentinel is durable a worker error must never turn `Ok` into `Err`.
+    /// zone is durable a worker error must never turn `Ok` into `Err`.
     /// `commit_pushes` aborts instead — the DDL tick quiesce and the catalog read
     /// lock held through the ACK are what make that arm unreachable, and it
     /// fail-stops rather than diverge if they ever do not.
@@ -484,13 +484,10 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // ------------------------------------------------------------------
     // Phase B (under the SAL writer): emit SAL groups, submit fsync SQE.
     //
-    // All groups in this batch share one zone_lsn. A batch with a recoverable group
-    // opens a zone and closes it with the commit sentinel after all groups, which
-    // lets recovery treat it atomically: either every group applies or none do. Its
-    // zone LSN is published once, after fsync (Phase D), so clients only see durable
-    // LSNs. A batch of nothing but stream groups writes no zone at all.
+    // The batch's recoverable groups form one zone, whose LSN publishes only
+    // after its fsync (Phase D).
     // ------------------------------------------------------------------
-    let (zone_lsn, fsync_fut) = {
+    let (zone_lsn, synced) = {
         let disp = shared.disp();
         let mut excl = disp.sal().lock().await;
 
@@ -499,12 +496,12 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
 
         // Nothing laid out inside the scope is visible until it commits, so a
         // transaction that runs out of SAL space part-way can take its earlier
-        // families back. Every write, the sentinel and the fsync submit are in
+        // families back. Every write, the commit and the fsync submit are in
         // this one synchronous block, so no reader ever observes the gap.
         let scope = excl.begin(zone_lsn, "commit");
 
         // Emit every unit into the zone, in unit order (transactions first). The
-        // scope opens the zone on the first recoverable group it admits.
+        // first recoverable group the scope admits opens the zone.
         //
         // A unit is all-or-nothing: a family that does not fit rolls the bundle
         // back to where it started, and the families before it were never
@@ -521,16 +518,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
             }
         }
 
-        // Publishes every laid-out group, then closes the zone. A failure here
-        // is fatal: the alternative is telling a client `Ok` about a zone
-        // recovery will silently drop.
-        let closed = scope
-            .commit()
-            .unwrap_or_else(|e| gnitz_fatal_abort!("commit zone failed, durability lost: {}", e.text));
-        // A stream-only batch — or one every group of which was refused — opened
-        // no zone: nothing to sync.
-        let fsync_fut = closed.then(|| disp.reactor().fsync(disp.sal().sal_fd()));
-        (zone_lsn, fsync_fut)
+        let synced = scope.commit().then(|| excl.sync(disp.reactor(), "committer"));
+        (zone_lsn, synced)
     };
 
     // ------------------------------------------------------------------
@@ -581,11 +570,8 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     // after fsync so the client sees only durable data. A batch of nothing but
     // stream groups opened no zone: no fsync to await, and no LSN to publish.
     // ------------------------------------------------------------------
-    if let Some(fsync_fut) = fsync_fut {
-        let fsync_rc = fsync_fut.await;
-        if fsync_rc < 0 {
-            gnitz_fatal_abort!("SAL fdatasync (committer) failed rc={}", fsync_rc);
-        }
+    if let Some(synced) = synced {
+        synced.await;
         // Publish the zone LSN exactly once, after fsync confirms durability.
         // Pipelined pushes batched together share one zone_lsn, so clients may see
         // duplicate LSNs — only non-decreasing monotonicity is guaranteed.

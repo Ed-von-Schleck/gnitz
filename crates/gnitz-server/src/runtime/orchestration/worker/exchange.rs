@@ -45,7 +45,7 @@ impl WorkerProcess {
 
         loop {
             self.w2m_writer.sal_park().park(|| self.sal_reader.is_empty());
-            while let Some((msg, wire)) = self.next_sal_message() {
+            while let Some((msg, wire)) = self.sal_reader.next() {
                 if let Some(hit) = self.dispatch_in_eval(want_key, &msg, wire) {
                     return (hit.batch, hit.decision);
                 }

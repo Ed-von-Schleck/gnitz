@@ -17,11 +17,13 @@ const RING_BYTES: usize = 64 * 1024;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 
-/// A SAL over its own shared region. Every group's framing, digest and cursor
-/// advance come from the code under test rather than from a reimplementation.
+/// A SAL over its own file. Every group's framing, digest and cursor advance
+/// come from the code under test rather than from a reimplementation.
 pub(crate) struct TestLog {
-    region: SharedRegion,
+    /// The whole file, anchor page included.
+    file: SharedRegion,
     pub(crate) writer: SalWriter,
+    /// The ring's length, the anchor page excluded.
     pub(crate) size: usize,
     /// One W2M ring per worker, carrying the park the writer's wakes land on.
     /// Leaked, as the `'static` wakes require.
@@ -29,18 +31,25 @@ pub(crate) struct TestLog {
 }
 
 impl TestLog {
-    /// A log of `size` bytes whose groups carry `workers` slots, positioned at
-    /// cursor 0 in `epoch`.
+    /// A log with a `size`-byte ring whose groups carry `workers` slots,
+    /// positioned at cursor 0 in `epoch`, which the anchor records.
     pub(crate) fn new(size: usize, workers: usize, epoch: u32) -> TestLog {
-        let region = SharedRegion::new(size);
+        let file = SharedRegion::new(ANCHOR_BYTES + size);
         let rings: Vec<*mut u8> = (0..workers)
             .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(RING_BYTES) }.leak())
             .collect();
         // SAFETY: every ring is initialized above and leaked.
         let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
-        let writer = SalWriter::new(region.ptr(), -1, size, workers, wakes);
-        writer.epoch.set(epoch);
-        TestLog { region, writer, size, rings }
+        // SAFETY: the region outlives the writer.
+        let writer = SalWriter::new(
+            unsafe { SalLog::new(file.ptr(), file.size()) },
+            file.fd(),
+            workers,
+            wakes,
+        );
+        let log = TestLog { file, writer, size, rings };
+        log.seek(0, epoch);
+        log
     }
 
     /// Worker `w`'s W2M ring.
@@ -48,65 +57,69 @@ impl TestLog {
         self.rings[w]
     }
 
+    /// The ring's first byte — offset 0 of every group base.
     pub(crate) fn ptr(&self) -> *mut u8 {
-        self.region.ptr()
+        self.writer.log.ring
+    }
+
+    /// The anchor page's first byte.
+    pub(crate) fn anchor_ptr(&self) -> *mut u8 {
+        self.file.ptr()
     }
 
     pub(crate) fn log(&self) -> SalLog {
-        unsafe { SalLog::new(self.region.ptr() as *const u8, self.size) }
+        self.writer.log
     }
 
     pub(crate) fn cursor(&self) -> u64 {
         self.writer.write_cursor.get()
     }
 
-    /// Place the cursor and epoch by hand — the shapes no `rewind` produces:
-    /// two groups at consecutive offsets under different epochs, a cursor
-    /// parked just under a cap, or a shorter later epoch laid over an earlier
-    /// one's groups so they stand past its frontier.
+    /// Place the cursor and epoch by hand, anchoring the epoch.
     pub(crate) fn seek(&self, cursor: u64, epoch: u32) {
         self.writer.write_cursor.set(cursor);
         self.writer.epoch.set(epoch);
+        self.writer.write_anchor(epoch, self.writer.synced.get());
+    }
+
+    /// Anchor `offset` as covered by a completed `fdatasync` in the live epoch.
+    pub(crate) fn synced_through(&self, offset: u64) {
+        self.writer.mark_synced(self.writer.epoch(), offset);
     }
 
     /// Append one group whose slots are `payloads` verbatim; returns its base.
     pub(crate) fn write(&self, target: u32, lsn: u64, kind: SalMessageKind, payloads: &[&[u8]]) -> u64 {
-        self.try_write(target, lsn, kind, false, payloads).expect("group fits")
+        self.try_write(target, lsn, kind, 0, payloads).expect("group fits")
     }
 
-    /// Same, with the zone-start byte spelled by the caller and the writer's
-    /// verdict reported — below the zone-state layer, so a shape the production
-    /// writer never lays down (a start with no commit, a sentinel with no zone
-    /// open) can be.
+    /// [`Self::write`] with the flag byte given and the writer's verdict
+    /// reported.
     pub(crate) fn try_write(
         &self,
         target: u32,
         lsn: u64,
         kind: SalMessageKind,
-        zone_start: bool,
+        flags: u8,
         payloads: &[&[u8]],
     ) -> Result<u64, SalFit> {
         let base = self.cursor();
-        let (at, word) = self.lay_out(target, lsn, kind, zone_start, payloads)?;
+        let (at, word) = self.lay_out(target, lsn, kind, flags, payloads)?;
         self.writer.publish(at, word);
         Ok(base)
     }
 
-    /// [`Self::try_write`] into `scope`, so the group stays unpublished until
-    /// the scope commits. `zone_start` is spelled by the caller, as there.
+    /// A zone member of `scope` whose slots are `payloads` verbatim, unpublished
+    /// until the scope commits.
     pub(crate) fn try_write_in(
         &self,
         scope: &SalScope,
         target: u32,
         kind: SalMessageKind,
-        zone_start: bool,
         payloads: &[&[u8]],
     ) -> Result<u64, SalFit> {
         let base = self.cursor();
-        self.lay_out(target, scope.lsn, kind, zone_start, payloads)?;
-        if zone_start {
-            scope.zone_open.set(true);
-        }
+        self.lay_out(target, scope.lsn, kind, 0, payloads)?;
+        scope.last_member.set(Some(base));
         Ok(base)
     }
 
@@ -117,21 +130,13 @@ impl TestLog {
         target: u32,
         lsn: u64,
         kind: SalMessageKind,
-        zone_start: bool,
+        flags: u8,
         payloads: &[&[u8]],
     ) -> Result<(usize, u64), SalFit> {
         let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
-        self.writer
-            .write_slots(target, lsn, kind, zone_start, 0, false, true, &sizes, |w, slot| {
-                slot.copy_from_slice(payloads[w])
-            })
-    }
-
-    /// A raw commit sentinel at `lsn` — a slotless group — whatever zone state
-    /// the writer holds. Returns its base.
-    pub(crate) fn sentinel(&self, lsn: u64) -> u64 {
-        self.try_write(0, lsn, SalMessageKind::ZoneCommit, false, &[])
-            .expect("sentinel fits")
+        self.writer.write_slots(target, lsn, kind, flags, 0, &sizes, |w, slot| {
+            slot.copy_from_slice(payloads[w])
+        })
     }
 
     /// One scattered `Push` group of `batch` over this log's slots: rows
@@ -139,7 +144,6 @@ impl TestLog {
     /// where it goes — the writer's publishes, a scope's defers. Returns its base.
     pub(crate) fn push_group(
         &self,
-        lsn: u64,
         tid: u32,
         schema: SchemaDescriptor,
         batch: &Batch,
@@ -150,7 +154,6 @@ impl TestLog {
         let relation = ipc::WireSchema::encoded(tid as i64, schema);
         let group = DirectGroup {
             targets: GroupTargets::all(0),
-            lsn,
             ..DirectGroup::new(SalMessageKind::Push)
         };
         with_commit_indices(batch, &schema, nw, |wi| {
@@ -168,7 +171,7 @@ pub(crate) fn group_and_next(log: SalLog, base: u64, epoch: u32) -> (SalMessage,
     }
 }
 
-/// The group published at `base`, walked at the log's current epoch.
+/// The group published at `base`, walked at the anchor's epoch.
 pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
-    group_and_next(log, base, log.walk_epoch()).0
+    group_and_next(log, base, log.anchor().expect("the anchor verifies").0).0
 }

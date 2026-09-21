@@ -1173,7 +1173,7 @@ enum PushTxnOutcome {
 /// Handle an atomic user-table transaction (`PUSH_TXN`): decode + validate
 /// the bundle as a unit under the union of the involved table locks, run the OCC
 /// precondition check under those locks, then emit it as N `Push` groups
-/// inside one zone under one sentinel. Mirrors the plain-push arm's lock order
+/// inside one zone. Mirrors the plain-push arm's lock order
 /// (catalog read lock, then the per-table lock union ascending) and its late
 /// late drain check; both locks are held through the committer ACK. Every
 /// rejection is pre-SAL, so an `Err` reply — and a `Conflict` outcome — mean

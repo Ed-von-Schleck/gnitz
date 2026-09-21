@@ -72,14 +72,13 @@ fn fifo_route(target_id: u64, request_id: u32) -> ReplyRoute {
     }
 }
 
-/// One SAL group as the matrix tests hand it to `dispatch`: a kind, a
-/// target and a round. The slot bytes travel beside it, so the message itself
-/// carries no payload.
-fn sal_msg(kind: SalMessageKind, target_id: u32, lsn: u64) -> SalMessage {
+/// A payload-less SAL group outside every zone; its slot bytes travel beside
+/// it.
+fn sal_msg(kind: SalMessageKind, target_id: u32) -> SalMessage {
     SalMessage {
-        lsn,
+        lsn: 0,
         kind,
-        zone_start: false,
+        zone_end: false,
         target_id,
         request_id: 0,
         in_request_order: false,
@@ -97,6 +96,20 @@ fn control_frame(target_id: u64) -> &'static [u8] {
         ipc::WireMsg { target_id, ..Default::default() }
             .encode_to_vec()
             .into_boxed_slice(),
+    )
+}
+
+/// A tick's control block: `target_id` and its round in `arg0`, as
+/// `write_tick_group` stamps them.
+fn tick_frame(target_id: u64, round: u64) -> &'static [u8] {
+    Box::leak(
+        ipc::WireMsg {
+            target_id,
+            arg0: round,
+            ..Default::default()
+        }
+        .encode_to_vec()
+        .into_boxed_slice(),
     )
 }
 
@@ -119,12 +132,16 @@ fn tick_defers_inside_exchange() {
     let mut wp = make_worker_for_matrix();
     assert!(wp.exchange.deferred_replay.is_empty());
     assert!(wp
-        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::Tick, 999, 7), control_frame(999))
+        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::Tick, 999), tick_frame(999, 7))
         .is_none());
     assert_eq!(wp.exchange.deferred_replay.len(), 1);
     let parked = &wp.exchange.deferred_replay[0];
     assert_eq!(
-        (parked.kind, parked.wire.control.hdr.target_id, parked.lsn),
+        (
+            parked.kind,
+            parked.wire.control.hdr.target_id,
+            parked.wire.control.hdr.arg0
+        ),
         (SalMessageKind::Tick, 999, 7),
         "the Tick's target and its round must both be carried into the replay queue"
     );
@@ -152,10 +169,10 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
     );
     // A tick first, so the shared FIFO's insertion order is observable.
     assert!(wp
-        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::Tick, 999, 3), control_frame(999))
+        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::Tick, 999), tick_frame(999, 3))
         .is_none());
     assert!(wp
-        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::DeltaRead, 77, 0), frame)
+        .dispatch_in_eval((100, 5), &sal_msg(SalMessageKind::DeltaRead, 77), frame)
         .is_none());
     assert_eq!(wp.exchange.deferred_replay.len(), 2, "one queue, in SAL order");
     assert_eq!(wp.exchange.deferred_replay[0].kind, SalMessageKind::Tick);
@@ -208,7 +225,7 @@ fn exchange_relay_inside_exchange() {
     // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
     let frame = encode_relay_frame(200, 0, &schema);
     assert!(wp
-        .dispatch_in_eval(want_key, &sal_msg(SalMessageKind::ExchangeRelay, 200, 0), frame)
+        .dispatch_in_eval(want_key, &sal_msg(SalMessageKind::ExchangeRelay, 200), frame)
         .is_none());
     assert!(
         wp.exchange.pending_relays.contains_key(&(200, 0)),
@@ -218,7 +235,7 @@ fn exchange_relay_inside_exchange() {
     // Matching key (target_id=100, source_id=0 == want_key): returns the batch.
     let frame = encode_relay_frame(100, 0, &schema);
     assert!(
-        wp.dispatch_in_eval(want_key, &sal_msg(SalMessageKind::ExchangeRelay, 100, 0), frame)
+        wp.dispatch_in_eval(want_key, &sal_msg(SalMessageKind::ExchangeRelay, 100), frame)
             .is_some(),
         "a key-matching relay must short-circuit out of the dispatcher with its batch"
     );
@@ -231,7 +248,7 @@ fn exchange_relay_inside_exchange() {
 fn exchange_relay_top_level_warns_and_continues() {
     let mut wp = make_worker_for_matrix();
     let frame = encode_relay_frame(100, 0, &make_schema_u64_i64());
-    wp.dispatch_top_level(&sal_msg(SalMessageKind::ExchangeRelay, 100, 0), frame);
+    wp.dispatch_top_level(&sal_msg(SalMessageKind::ExchangeRelay, 100), frame);
     assert!(
         wp.exchange.pending_relays.is_empty(),
         "TopLevel must NOT park relays — they belong to do_exchange_wait"
@@ -250,7 +267,7 @@ fn ddl_sync_defers_inside_exchange() {
 
     let frame = encode_data_frame(42, &schema, &make_batch_raw(&schema, &[(1, 1, 10)]));
     assert!(wp
-        .dispatch_in_eval((0, 0), &sal_msg(SalMessageKind::DdlSync, 42, 0), frame)
+        .dispatch_in_eval((0, 0), &sal_msg(SalMessageKind::DdlSync, 42), frame)
         .is_none());
     assert_eq!(
         wp.exchange.deferred.len(),
@@ -289,7 +306,7 @@ fn flush_and_push_run_inline_inside_exchange() {
     // under test is the disposition, not the ingest.
     for kind in [SalMessageKind::Flush, SalMessageKind::Push] {
         assert!(wp
-            .dispatch_in_eval((100, 5), &sal_msg(kind, 7, 0), control_frame(7))
+            .dispatch_in_eval((100, 5), &sal_msg(kind, 7), control_frame(7))
             .is_none());
         assert!(
             wp.exchange.deferred.is_empty() && wp.exchange.deferred_replay.is_empty(),
@@ -304,9 +321,9 @@ fn flush_and_push_run_inline_inside_exchange() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// -- next_sal_message invariant tests -------------------------------------
+// -- SAL read gate tests ---------------------------------------------------
 
-/// The SAL read gate, driven through `next_sal_message`:
+/// The SAL read gate, driven through the worker's own reader:
 ///
 /// 1. Groups in the expected epoch are consumed in order.
 /// 2. A group from a *later* epoch is rejected and stays parked — repeatedly,
@@ -314,7 +331,7 @@ fn flush_and_push_run_inline_inside_exchange() {
 /// 3. `SalReader::rewind` moves to cursor 0 in the next epoch, which is
 ///    exactly where the master writes after its own reset.
 #[test]
-fn next_sal_message_gates_on_the_epoch() {
+fn the_sal_reader_gates_on_the_epoch() {
     use crate::runtime::sal::fixtures::TestLog;
     use crate::runtime::sal::SalReader;
 
@@ -334,14 +351,14 @@ fn next_sal_message_gates_on_the_epoch() {
     let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
     wp.sal_reader = SalReader::new(sal.log(), 0, 0);
 
-    let next = |wp: &mut WorkerProcess| wp.next_sal_message().map(|(m, _)| (m.kind, m.target_id));
+    let next = |wp: &mut WorkerProcess| wp.sal_reader.next().map(|(m, _)| (m.kind, m.target_id));
     assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 42)));
     assert_eq!(next(&mut wp), Some((SalMessageKind::DdlSync, 43)));
 
     // The epoch-2 group parks: rejected now, and still rejected on a retry —
     // the cursor did not slip past it.
-    assert!(wp.next_sal_message().is_none(), "an epoch-ahead group must park");
-    assert!(wp.next_sal_message().is_none(), "and stay parked");
+    assert!(wp.sal_reader.next().is_none(), "an epoch-ahead group must park");
+    assert!(wp.sal_reader.next().is_none(), "and stay parked");
 
     // After the rewind the reader is at cursor 0 in epoch 2, where the master
     // writes its first post-checkpoint group.

@@ -33,8 +33,8 @@ impl FlushRound {
         }
     }
 
-    /// The group header's `lsn`: the generation workers stamp their manifests with.
-    fn lsn(self) -> u64 {
+    /// The group's `arg0`: the generation workers stamp their manifests with.
+    fn generation(self) -> u64 {
         match self {
             FlushRound::Base => 0,
             FlushRound::Ephemeral { generation } => generation,
@@ -309,7 +309,10 @@ impl MasterDispatcher {
         let lease = self.reactor.lease_acks(1, WorkerSet::ALL);
         self.note_flush_round(round);
         excl.write(&DirectGroup {
-            lsn: round.lsn(),
+            template: wire::WireMsg {
+                arg0: round.generation(),
+                ..Default::default()
+            },
             targets: GroupTargets::all(lease.id(0)),
             ..DirectGroup::new(round.kind())
         })?;
@@ -527,8 +530,8 @@ impl MasterDispatcher {
     // Tick group writer (used by the async tick task in executor.rs)
     // -----------------------------------------------------------------------
 
-    /// Write a Tick group for `tid` at the next tick round, in the header's `lsn`.
-    /// A refused write burns its round.
+    /// Write a Tick group for `tid` at the next tick round, in `arg0`. A refused
+    /// write burns its round.
     pub(crate) fn write_tick_group(
         &self,
         excl: &SalExcl<'_>,
@@ -541,9 +544,9 @@ impl MasterDispatcher {
         excl.write(&DirectGroup {
             template: wire::WireMsg {
                 target_id: tid as u64,
+                arg0: round,
                 ..Default::default()
             },
-            lsn: round,
             targets,
             ..DirectGroup::new(SalMessageKind::Tick)
         })

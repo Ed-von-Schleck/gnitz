@@ -347,11 +347,10 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
     shared.cat_mut().pin_queued_to_zone(zone_lsn);
 
     // SAL emission window: broadcast each queued family under the shared
-    // zone_lsn, close the zone with the commit sentinel, then fsync. A failure
-    // here is unrecoverable — workers already applied the DdlSync groups in
-    // real time — so abort.
-    let fsync_fut = emit_zone_to_sal(shared, &mut shared.disp().sal().lock().await, "DDL", zone_lsn);
-    publish_after_fsync(&shared.lsn_alloc, "DDL", zone_lsn, fsync_fut).await;
+    // zone_lsn, commit the zone, then fsync. A failure here is unrecoverable —
+    // workers already applied the DdlSync groups in real time — so abort.
+    let synced = emit_zone_to_sal(shared, &mut shared.disp().sal().lock().await, "DDL", zone_lsn);
+    publish_after_fsync(&shared.lsn_alloc, zone_lsn, synced).await;
 
     // Relation ids are never reissued within a boot, so these entries are dead.
     for &id in tables.drops.iter().chain(&views.drops) {
@@ -397,17 +396,14 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
     Ok((zone_lsn, family_count))
 }
 
-/// Emit a closed catalog zone to the SAL: drain the queued family broadcasts,
-/// write each under `zone_lsn`, close with the commit sentinel, and submit the
-/// fdatasync SQE. Draining here rather than at each caller is what stops a queued
-/// broadcast riding the *next* zone's LSN.
-/// Aborts on failure: the catalog is already mutated in memory.
-fn emit_zone_to_sal(
+/// Emit every queued family broadcast as one zone at `zone_lsn` and submit its
+/// fdatasync. Aborts on failure: the catalog is already mutated in memory.
+fn emit_zone_to_sal<'w>(
     shared: &Shared,
-    excl: &mut SalExcl<'_>,
+    excl: &mut SalExcl<'w>,
     op: &'static str,
     zone_lsn: u64,
-) -> impl Future<Output = i32> {
+) -> impl Future<Output = ()> + 'w {
     let disp = shared.disp();
     let drained = shared.cat_mut().drain_pending_broadcasts();
     // Nothing inside the scope is visible until it commits, so a refused group
@@ -425,23 +421,17 @@ fn emit_zone_to_sal(
     if let Err(e) = emitted {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
     }
-    // An empty bundle (`submit` queues no empty batch) opened no
-    // zone, so this closes nothing: every sentinel follows an ordinary group,
-    // which keeps a run of them out of the checkpoint reserve.
-    if let Err(e) = scope.commit() {
-        gnitz_fatal_abort!("{} commit sentinel was refused, so its zone never published: {}", op, e);
-    }
-    disp.reactor().fsync(disp.sal().sal_fd())
+    // Synced even when no zone opened: publishing `zone_lsn` vouches for every
+    // LSN below it.
+    scope.commit();
+    excl.sync(disp.reactor(), op)
 }
 
-/// Await `fsync`, then publish `zone`. Paired for the same reason
+/// Await `synced`, then publish `zone`. Paired for the same reason
 /// `ZoneLsnAllocator` pairs reserve and publish: no caller can publish an LSN
 /// whose bytes are not yet on disk.
-async fn publish_after_fsync(alloc: &ZoneLsnAllocator, op: &'static str, zone: u64, fsync: impl Future<Output = i32>) {
-    let rc = fsync.await;
-    if rc < 0 {
-        gnitz_fatal_abort!("SAL fdatasync ({}) failed rc={}", op, rc);
-    }
+async fn publish_after_fsync(alloc: &ZoneLsnAllocator, zone: u64, synced: impl Future<Output = ()>) {
+    synced.await;
     alloc.publish(zone);
 }
 
@@ -454,7 +444,7 @@ async fn publish_after_fsync(alloc: &ZoneLsnAllocator, op: &'static str, zone: u
 /// `handle_ddl_txn` holds its write guard past the fsync instead, needing it for
 /// its post-fsync catalog cleanup and the backfill.
 pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: u64) -> Result<i64, String> {
-    let (base, zone_lsn, fsync_fut) = {
+    let (base, zone_lsn, synced) = {
         // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under
         // catalog.write cannot deadlock. Both guards drop at the end of this block.
         let _write = shared.catalog_rwlock.write().await;
@@ -482,10 +472,10 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         // SAL emission under the still-held `SalExcl`; the fdatasync SQE is
         // submitted synchronously. Both guards drop as this block ends, before
         // the await below.
-        let fsync_fut = emit_zone_to_sal(shared, &mut excl, "serial-range", zone_lsn);
-        (base, zone_lsn, fsync_fut)
+        let synced = emit_zone_to_sal(shared, &mut excl, "serial-range", zone_lsn);
+        (base, zone_lsn, synced)
     };
 
-    publish_after_fsync(&shared.lsn_alloc, "serial range", zone_lsn, fsync_fut).await;
+    publish_after_fsync(&shared.lsn_alloc, zone_lsn, synced).await;
     Ok(base)
 }

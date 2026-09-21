@@ -212,8 +212,10 @@ impl CatalogEngine {
     }
 
     /// The ephemeral checkpoint round: persist every view's operator traces and
-    /// output stores, and every index, at the registry's resume generation.
-    pub(crate) fn flush_ephemeral_round(&mut self) -> Result<(), String> {
+    /// output stores, and every index, at `generation` — which every manifest
+    /// published after it is stamped with too.
+    pub(crate) fn flush_ephemeral_round(&mut self, generation: u64) -> Result<(), String> {
+        self.registry.set_resume_generation(generation);
         Ok(self.registry.checkpoint_ephemeral(self.dag.collect_ephemeral_state())?)
     }
 

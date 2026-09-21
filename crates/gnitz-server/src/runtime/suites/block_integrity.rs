@@ -123,8 +123,8 @@ fn every_bit_of_a_zoned_slot_is_covered_by_its_own_checksum() {
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
     let mut excl = sal.writer.lock_exclusive();
     let scope = excl.begin(5, "test");
-    sal.push_group(5, 16, schema, &batch, |g| scope.write(g, true));
-    scope.commit().expect("sentinel fits");
+    sal.push_group(16, schema, &batch, |g| scope.write(g, true));
+    assert!(scope.commit(), "the zone was open");
     drop(excl);
 
     let msg = group_at(sal.log(), 0);
@@ -159,7 +159,7 @@ fn an_unzoned_groups_entries_hold_checksum_0() {
     let sal = TestLog::new(1 << 20, 2, 1);
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    sal.push_group(5, 16, schema, &batch, |g| sal.writer.lock_exclusive().write(g));
+    sal.push_group(16, schema, &batch, |g| sal.writer.lock_exclusive().write(g));
 
     let msg = group_at(sal.log(), 0);
     let entry = msg.dir.len() / msg.slots() as usize;

@@ -37,23 +37,6 @@ fn stream_flag_registers_storeless_with_no_directory() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// A stream must stay out of the Push walk's map: present, a torn stream group
-/// would demote the zone its coalesced base push rides in.
-#[test]
-fn a_stream_is_not_a_replayed_base_table() {
-    let dir = temp_dir("stream_absent_from_dedup_map");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("amount", type_code::I64)];
-    let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
-    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
-
-    let bases = engine.registry.base_table_ids();
-    assert!(!bases.contains(&sid), "a stream must not enter the map at all");
-    assert!(bases.contains(&tid), "the base table beside it still must");
-
-    fs::remove_dir_all(&dir).ok();
-}
-
 /// A stream is not a push-conflict target and not an FK parent, so the two
 /// predicates that gate the master preflight must stay false for one.
 #[test]

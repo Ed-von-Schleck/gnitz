@@ -457,7 +457,7 @@ fn zone_pins_survive_a_flush_and_reopen() {
     // SCHEMA_TAB stays at 5 (untouched in this zone).
     let _ = engine.drain_pending_broadcasts();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let tid = engine.create_table("z.t", &cols, &[0]).unwrap();
+    engine.create_table("z.t", &cols, &[0]).unwrap();
     engine.pin_queued_to_zone(7);
     assert_eq!(current(&engine, TABLE_TAB_ID), 7);
     assert_eq!(current(&engine, COL_TAB_ID), 7);
@@ -469,7 +469,7 @@ fn zone_pins_survive_a_flush_and_reopen() {
 
     // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
     let _ = engine.drain_pending_broadcasts();
-    let tid2 = engine.create_table("z.t2", &cols, &[0]).unwrap();
+    engine.create_table("z.t2", &cols, &[0]).unwrap();
     engine.pin_queued_to_zone(9);
     assert_eq!(current(&engine, TABLE_TAB_ID), 9);
     assert_eq!(current(&engine, COL_TAB_ID), 9);
@@ -480,10 +480,6 @@ fn zone_pins_survive_a_flush_and_reopen() {
     assert_eq!(map.get(&TABLE_TAB_ID), Some(&9));
     assert_eq!(map.get(&COL_TAB_ID), Some(&9));
     assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
-    // The Push walk replays both created tables.
-    let bases = engine.registry.base_table_ids();
-    assert!(bases.contains(&tid) && bases.contains(&tid2));
-
     // max_system_lsn is at least the highest zone LSN observed.
     assert!(engine.registry.max_system_lsn() >= 9);
 

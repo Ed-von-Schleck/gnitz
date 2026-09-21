@@ -32,32 +32,34 @@ use gnitz_store::storage::{Batch, Slot};
 // and differ only in which groups are theirs and what they do with the bytes.
 // ---------------------------------------------------------------------------
 
-/// Decode one committed group slot, failing the boot rather than skipping it:
-/// pass 1 demoted the last zone if it was torn, so a block that fails here has a
-/// durable committed zone behind it, and skipping it would lose an ACKed write.
-fn decode_group_slot(msg: &SalMessage, w: u32, data: &[u8]) -> Result<ipc::DecodedWire, String> {
-    let corrupt = |e: &str| {
+/// Decode one committed group slot; one that does not decode fails the boot.
+fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, String> {
+    ipc::decode_sal_slot(data).map_err(|e| {
         format!(
             "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
             msg.base, msg.lsn, msg.target_id
         )
-    };
-    if !msg.slot_intact(w, data) {
-        return Err(corrupt("slot checksum mismatch"));
-    }
-    ipc::decode_sal_slot(data).map_err(|e| corrupt(&e))
+    })
 }
 
-/// Master pre-fork replay of every committed DdlSync group.
-fn recover_system_tables_from_sal(log: SalLog, epoch: u32, catalog: &mut CatalogEngine) -> Result<(), String> {
+/// Master pre-fork replay of every committed DdlSync group above its family's
+/// flushed LSN.
+fn recover_system_tables_from_sal(tail: CommittedTail, catalog: &mut CatalogEngine) -> Result<(), String> {
     let family_lsns = catalog.registry.system_flushed_lsns();
-    let tail = CommittedTail::open(log, epoch, SalMessageKind::DdlSync, &family_lsns)?;
+    let mine = |msg: &SalMessage| {
+        msg.kind == SalMessageKind::DdlSync && family_lsns.get(&(msg.target_id as i64)).is_some_and(|&f| msg.lsn > f)
+    };
 
     let mut replayed: u32 = 0;
-    for msg in tail.groups() {
-        // A system family broadcasts, so slot 0 carries the whole batch.
-        let Some(data) = msg.slot(0) else { continue };
-        let decoded = decode_group_slot(&msg, 0, data)?;
+    for msg in tail.groups().filter(mine) {
+        // A system family broadcasts: slot 0 carries the whole batch.
+        let Some(data) = msg.slot(0) else {
+            return Err(format!(
+                "SAL replay: DdlSync group at offset={} (lsn={}) carries no slot 0",
+                msg.base, msg.lsn
+            ));
+        };
+        let decoded = decode_group_slot(&msg, data)?;
         let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
             continue;
         };
@@ -129,23 +131,15 @@ fn replay_slots(written: u32, slot: Slot, replicated: bool) -> (Range<u32>, bool
 /// through `ingest_returning` — the exact call `handle_push` makes, so
 /// retractions cancel correctly. The returned map seeds the worker's
 /// `pending_deltas` for the master's tick sweep to drain into the views.
+///
+/// No LSN floor: `enforce_unique_pk` makes re-applying a group the shards
+/// already hold a no-op.
 fn recover_from_sal(
-    log: SalLog,
+    tail: CommittedTail,
     slot: Slot,
-    walk_epoch: u32,
     swept_bases: &[i64],
     catalog: &mut CatalogEngine,
 ) -> Result<HashMap<i64, Batch>, String> {
-    // Floor 0: `enforce_unique_pk` makes re-applying a group the shards already
-    // hold a no-op.
-    let family_lsns: HashMap<i64, u64> = catalog
-        .registry
-        .base_table_ids()
-        .into_iter()
-        .map(|id| (id, 0))
-        .collect();
-    let tail = CommittedTail::open(log, walk_epoch, SalMessageKind::Push, &family_lsns)?;
-
     let mut pending: HashMap<i64, Batch> = HashMap::new();
     // Groups that applied at least one slot, and the width a re-sliced tail was
     // written at — the boot record's re-slice marker. No boot writes at a
@@ -153,16 +147,15 @@ fn recover_from_sal(
     let mut replayed: u32 = 0;
     let mut resliced_from: Option<u32> = None;
     let mut rows: Vec<Vec<u32>> = Vec::new();
-    for msg in tail.groups() {
+    for msg in tail.groups().filter(|m| m.kind == SalMessageKind::Push) {
         let tid = msg.target_id as i64;
         // The catalog's schema, not the wire's: only the catalog stamps the
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
-        // this holds no borrow on `catalog` across the `&mut` ingest.
-        let schema = catalog
-            .registry
-            .relation(tid)
-            .map(Relation::schema)
-            .ok_or_else(|| format!("SAL replay: no schema for table_id={tid} (lsn={})", msg.lsn))?;
+        // this holds no borrow on `catalog` across the `&mut` ingest. A table
+        // dropped later in the tail has none, and nothing to recover into.
+        let Some(schema) = catalog.registry.relation(tid).map(Relation::schema) else {
+            continue;
+        };
         // Each group's own slot count, off the header in hand and inside its
         // digest. A tail-wide probe would read one header for all of them, and a
         // torn one picks the wrong mode — losing every slot above this rank.
@@ -171,20 +164,15 @@ fn recover_from_sal(
             resliced_from = Some(msg.slots());
         }
         let mut applied = false;
-        for (w, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
-            let decoded = decode_group_slot(&msg, w, data)?;
-            let Some(mut batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
+        for (_, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
+            let decoded = decode_group_slot(&msg, data)?;
+            let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
                 continue;
             };
-            // Above both arms because both need it: the re-cut reads `schema`'s
-            // payload columns off the batch, and the ingest rejects a
-            // payload-count mismatch outright.
-            if batch.schema().num_payload_cols() < schema.num_payload_cols() {
-                batch = batch.widened_with_nulls(&schema, false);
-            }
-            let owned = if reslice {
+            let mut owned = if reslice {
                 // The write path's own router, so what survives is exactly what the master
-                // would have written to this rank's slot.
+                // would have written to this rank's slot. It reads only weights and PK
+                // bytes, so it cuts before the widening below.
                 let slots =
                     gnitz_store::storage::route_rows_by_pk(&batch.as_mem_batch(), &schema, &mut rows, slot.of as usize);
                 batch.ascending_subset(&slots[slot.rank as usize])
@@ -193,6 +181,10 @@ fn recover_from_sal(
             };
             if owned.is_empty() {
                 continue;
+            }
+            // The ingest rejects a payload-count mismatch outright.
+            if owned.schema().num_payload_cols() < schema.num_payload_cols() {
+                owned = owned.widened_with_nulls(&schema, false);
             }
             let effective = catalog.registry.ingest_returning(tid, owned).map_err(|e| {
                 format!(
@@ -223,9 +215,8 @@ fn recover_from_sal(
 /// the replayed rows' only durable copy.
 fn worker_boot_recovery(
     catalog: &mut CatalogEngine,
-    log: SalLog,
+    tail: CommittedTail,
     slot: Slot,
-    walk_epoch: u32,
     swept_bases: &[i64],
 ) -> Result<HashMap<i64, Batch>, String> {
     // Before any other catalog work, and before the replay below, which
@@ -234,7 +225,7 @@ fn worker_boot_recovery(
     // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
     // every index resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {rebuilt} index(es)");
-    let pending_deltas = recover_from_sal(log, slot, walk_epoch, swept_bases, catalog)?;
+    let pending_deltas = recover_from_sal(tail, slot, swept_bases, catalog)?;
     // Before the master's boot rewind puts the write cursor back to 0: these rows
     // still live only in SAL entries a second crash would then overwrite.
     debug_assert!(
@@ -277,24 +268,11 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli:
 /// exit the process, which returns all of it to the kernel.
 struct SharedIpc {
     sal_fd: i32,
-    sal_ptr: *mut u8,
-    /// The mapped SAL's length — the one this boot passed to `map_file_reserved`,
-    /// so every reader and the writer wrap on the bytes that actually exist.
-    sal_len: usize,
-    /// The epoch every reader of this mapping walks, and the floor for the next
-    /// writer epoch. Derived once with the mapping: on a damaged offset-0 header
-    /// it costs a full-ring sweep, and every reader must anchor on one answer.
-    walk_epoch: u32,
+    sal: SalLog,
+    /// The committed tail every recovery replays, and the epoch the next writer
+    /// epoch starts above. Read once with the mapping, before the fork.
+    tail: CommittedTail,
     w2m_ptrs: Vec<*mut u8>,
-}
-
-impl SharedIpc {
-    /// The mapped SAL as a reader sees it — pointer and length from the one
-    /// mapping this boot made, so no consumer re-derives the size.
-    fn sal_log(&self) -> SalLog {
-        // SAFETY: `sal_ptr` maps `sal_len` bytes and outlives the process.
-        unsafe { SalLog::new(self.sal_ptr, self.sal_len) }
-    }
 }
 
 /// Open and map the SAL, and one W2M ring per worker.
@@ -320,19 +298,14 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     let sal_ptr = posix_io::map_file_reserved(sal_fd, sal_len)
         .map_err(|e| format!("failed to map SAL ({sal_len} bytes): {e}"))?;
     // SAFETY: the mapping above is `sal_len` bytes and outlives the process.
-    let walk_epoch = unsafe { SalLog::new(sal_ptr, sal_len) }.walk_epoch();
+    let sal = unsafe { SalLog::new(sal_ptr, sal_len) };
+    let tail = CommittedTail::read(sal)?;
 
     let w2m_ptrs = (0..nw)
         .map(|w| w2m::create_region().map_err(|e| format!("failed to map W2M region for W{w}: {e}")))
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(SharedIpc {
-        sal_fd,
-        sal_ptr,
-        sal_len,
-        walk_epoch,
-        w2m_ptrs,
-    })
+    Ok(SharedIpc { sal_fd, sal, tail, w2m_ptrs })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -392,7 +365,7 @@ fn run_worker_child(
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
     let catalog_ptr: *mut CatalogEngine = catalog;
 
-    let pending_deltas = match worker_boot_recovery(catalog, ipc.sal_log(), slot, ipc.walk_epoch, swept_bases) {
+    let pending_deltas = match worker_boot_recovery(catalog, ipc.tail, slot, swept_bases) {
         Ok(pd) => pd,
         Err(e) => {
             // The master reads this frame off the shared ring, which outlives the
@@ -405,7 +378,7 @@ fn run_worker_child(
 
     gnitz_note!("Worker {} (pid {}) of {}", w, unsafe { libc::getpid() }, slot.of);
 
-    let sal_reader = SalReader::new(ipc.sal_log(), slot.rank, ipc.walk_epoch);
+    let sal_reader = SalReader::new(ipc.sal, slot.rank, ipc.tail.epoch());
     let mut worker = WorkerProcess::new(catalog_ptr, sal_reader, w2m_writer, pending_deltas);
     let rc = worker.run(BOOT_READY_REQUEST_ID);
 
@@ -416,12 +389,8 @@ fn run_worker_child(
 
 /// The master's half of recovery before any worker exists: the sweep set every
 /// worker inherits, and a zone-LSN seed above every system-family counter.
-fn master_pre_fork_recovery(
-    catalog: &mut CatalogEngine,
-    log: SalLog,
-    walk_epoch: u32,
-) -> Result<(Vec<i64>, u64), String> {
-    recover_system_tables_from_sal(log, walk_epoch, catalog)?;
+fn master_pre_fork_recovery(catalog: &mut CatalogEngine, tail: CommittedTail) -> Result<(Vec<i64>, u64), String> {
+    recover_system_tables_from_sal(tail, catalog)?;
 
     // G → G+1, the resume generation left at G: until `boot_checkpoint`
     // restamps at G+1, a crash rebuilds every view instead of resuming it.
@@ -483,7 +452,7 @@ fn fork_workers(
 
 /// The master's half of recovery once the workers are alive, ending in the
 /// checkpoint a clean restart resumes from.
-fn master_post_fork_recovery(disp: &MasterDispatcher, walk_epoch: u32, swept_bases: &[i64]) -> Result<(), String> {
+fn master_post_fork_recovery(disp: &MasterDispatcher, tail_epoch: u32, swept_bases: &[i64]) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
     // Before any drain: a drain drops frames no lease routes.
     let ready = disp.reactor().lease_acks(1, WorkerSet::ALL);
@@ -497,8 +466,8 @@ fn master_post_fork_recovery(disp: &MasterDispatcher, walk_epoch: u32, swept_bas
     drop(ready);
 
     // Reset the SAL for fresh use, now that every worker has recovered, above the
-    // same `walk_epoch` the workers were launched with.
-    disp.sal().lock_exclusive().boot_rewind(walk_epoch);
+    // same tail epoch the workers were launched with.
+    disp.sal().lock_exclusive().boot_rewind(tail_epoch);
 
     inject_recovery_panic("reset");
 
@@ -567,18 +536,12 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     // Leaked: the dispatcher and reactor borrow it for the life of the process.
     let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
 
-    let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog, ipc.sal_log(), ipc.walk_epoch)?;
+    let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog, ipc.tail)?;
 
     let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, placement.as_ref())?;
 
     // --- Parent process ---
-    let SharedIpc {
-        sal_fd,
-        sal_ptr,
-        sal_len,
-        walk_epoch,
-        w2m_ptrs,
-    } = ipc;
+    let SharedIpc { sal_fd, sal, tail, w2m_ptrs } = ipc;
 
     // Pre-fork recovery has already advanced the generation, so this is the floor
     // every base round must publish past.
@@ -594,11 +557,11 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
         worker_pids,
         catalog,
         boot_generation,
-        SalWriter::new(sal_ptr, sal_fd, sal_len, nw, wakes),
+        SalWriter::new(sal, sal_fd, nw, wakes),
         reactor,
     ));
 
-    master_post_fork_recovery(&dispatcher, walk_epoch, &swept_bases)?;
+    master_post_fork_recovery(&dispatcher, tail.epoch(), &swept_bases)?;
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);

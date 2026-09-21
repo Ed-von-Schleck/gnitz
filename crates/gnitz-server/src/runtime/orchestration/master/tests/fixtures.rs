@@ -7,7 +7,7 @@ use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::type_code;
 
 use super::MasterDispatcher;
-use crate::runtime::sal::SalWriter;
+use crate::runtime::sal::{SalLog, SalWriter, ANCHOR_BYTES};
 use crate::runtime::test_support::SharedRegion;
 use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
 
@@ -62,14 +62,16 @@ fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> (Mast
     // SAFETY: every ring is initialized above and leaked.
     let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
     let reactor = crate::runtime::test_support::make_reactor_over(Rc::new(W2mReceiver::new(rings)));
-    // A real SAL page: `rewind`/`checkpoint_reset` store through the base
-    // pointer, so it must not be null.
-    let sal = SharedRegion::new(SAL_SIZE).leak();
+    let region = SharedRegion::new(ANCHOR_BYTES + SAL_SIZE);
+    // SAFETY: leaked below, so mapped for the rest of the process.
+    let sal = unsafe { SalLog::new(region.ptr(), region.size()) };
+    let fd = region.fd();
+    region.leak();
     let disp = MasterDispatcher::new(
         worker_pids,
         catalog,
         0,
-        SalWriter::new(sal, -1, SAL_SIZE, nw, wakes),
+        SalWriter::new(sal, fd, nw, wakes),
         Rc::new(reactor),
     );
     (disp, writers)

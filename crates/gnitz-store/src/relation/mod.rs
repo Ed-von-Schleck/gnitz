@@ -681,15 +681,6 @@ impl RelationRegistry {
         self.tables.values().any(Relation::has_delta_feed)
     }
 
-    /// Every registered base table id; streams and views are not base tables.
-    pub fn base_table_ids(&self) -> Vec<i64> {
-        self.tables
-            .iter()
-            .filter(|(_, e)| e.kind.is_base_table())
-            .map(|(&id, _)| id)
-            .collect()
-    }
-
     /// Every registered view id.
     pub fn view_ids(&self) -> Vec<i64> {
         self.tables

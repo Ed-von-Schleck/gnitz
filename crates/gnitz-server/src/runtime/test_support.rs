@@ -79,21 +79,33 @@ pub(crate) fn try_poll_once<T>(fut: impl std::future::Future<Output = T>) -> Opt
     }
 }
 
-/// Anonymous `MAP_SHARED` region for IPC-shaped tests; unmapped on drop. A
-/// child that `_exit`s never runs drops, so only the parent unmaps.
+/// A `memfd` mapped `MAP_SHARED` for IPC-shaped tests — a real fd, so a writer
+/// can `fdatasync` it; unmapped and closed on drop. A child that `_exit`s never
+/// runs drops, so only the parent does.
 pub(crate) struct SharedRegion {
+    fd: i32,
     ptr: *mut u8,
     size: usize,
 }
 
 impl SharedRegion {
     pub(crate) fn new(size: usize) -> Self {
-        let ptr = gnitz_foundation::posix_io::map_anon_shared(size).expect("SharedRegion mmap failed");
-        SharedRegion { ptr, size }
+        let fd = unsafe { libc::memfd_create(c"shared_region".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create failed: {}", std::io::Error::last_os_error());
+        let ptr = gnitz_foundation::posix_io::map_file_reserved(fd, size).expect("SharedRegion mmap failed");
+        SharedRegion { fd, ptr, size }
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
         self.ptr
+    }
+
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.size
     }
 
     /// The region's base pointer, mapped for the rest of the process. For the
@@ -111,6 +123,7 @@ impl Drop for SharedRegion {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.size);
+            libc::close(self.fd);
         }
     }
 }

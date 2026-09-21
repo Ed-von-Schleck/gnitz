@@ -1,9 +1,9 @@
-"""A DDL zone that aborts before its commit sentinel leaves no durable trace,
-and a committed DROP's directory is reclaimed at boot.
+"""A DDL zone that aborts before its closing member publishes leaves no durable
+trace, and a committed DROP's directory is reclaimed at boot.
 
 The abort is injected with `GNITZ_INJECT_SAL_ZONE_PANIC=ddl`: the SAL's zone
-scope fires it between publishing the zone and writing its commit sentinel, and
-the tag picks the DDL scope so a push's zone is not the one that aborts. Recovery
+scope fires it between publishing the zone and publishing its closing member,
+and the tag picks the DDL scope so a push's zone is not the one that aborts. Recovery
 treats such a zone as uncommitted, so the writes that already reached the SAL are
 never replayed and no table_id survives without its TABLE_TAB row.
 

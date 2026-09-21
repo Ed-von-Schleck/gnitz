@@ -360,7 +360,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
 
     engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
-    engine.flush_ephemeral_round().unwrap();
+    engine.flush_ephemeral_round(g).unwrap();
     assert_eq!(engine.registry.resume_generation(), g);
 
     engine.close();
@@ -416,7 +416,7 @@ fn uncompiled_view_traces_invalidate_the_view() {
     // a view no tick sweep reaches.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let g2 = engine.bump_checkpoint_generation().unwrap();
-    engine.flush_ephemeral_round().unwrap();
+    engine.flush_ephemeral_round(g2).unwrap();
     assert_eq!(engine.registry.resume_generation(), g2);
     engine.close();
 
