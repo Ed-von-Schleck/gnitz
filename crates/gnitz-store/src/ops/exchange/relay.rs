@@ -21,12 +21,7 @@ fn worker_rows_to_batches(
     let total_rows: usize = worker_rows.iter().map(|v| v.len()).sum();
     worker_rows
         .iter()
-        .map(|rows| {
-            if rows.is_empty() {
-                return Batch::empty_with_schema(schema);
-            }
-            set.materialize(schema, rows, prorated_blob_cap(total_blob, total_rows, rows.len()))
-        })
+        .map(|rows| set.materialize(schema, rows, prorated_blob_cap(total_blob, total_rows, rows.len())))
         .collect()
 }
 

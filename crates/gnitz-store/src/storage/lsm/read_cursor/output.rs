@@ -1,10 +1,4 @@
-//! Output / drain — turning the merge stream into owned `Batch`es.
-//!
-//! `materialize`/`drain_chunk` collect the merge order into the cursor's own
-//! scratch buffer, then column-scatter it through `repr::scatter`. The
-//! `impl ReadCursor` here is a continuation of the merge-engine impl in the parent
-//! module; it reads `ReadCursor`'s private fields directly (this submodule is a
-//! descendant) and drives the cursor via the parent's private advance helpers.
+//! Draining the merge into owned batches.
 
 use std::rc::Rc;
 
@@ -17,47 +11,18 @@ use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use gnitz_expr::RowSource;
 
 impl ReadCursor {
-    /// Copy the current row into `batch` with an explicit weight, downgrading
-    /// `batch`'s layout to `Raw` (the shared appender does this — any append can
-    /// break order/folding).
-    ///
-    /// This is `Batch::append_row_from_source_bytes` applied at the cursor's
-    /// current position: the shared appender does the null/payload write,
-    /// German-string relocation included. The byte-form PK is correct at every
-    /// width.
-    ///
-    /// Cold catalog-builder callers re-fold downstream; the operator caller
-    /// (`op_reduce`) wants `Raw` anyway — it emits retract/insert pairs in emit
-    /// order, an unconsolidated delta.
+    /// Copy the current row into `batch` at `weight`, downgrading `batch` to `Raw`.
     pub fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
-        // `current_pk_bytes()` and the appender both index the positioned source,
-        // which panics on an unpositioned cursor (empty `sources`). Keep the
-        // no-op-on-`!valid` contract.
-        if !self.valid {
-            return;
-        }
-        // A skeleton row's payload columns do not exist on disk; the appender
-        // would copy `ZERO_CELL` for each and relocate a zero-length blob for
-        // each German string, producing a row that is not the view's. Its key
-        // has to be hydrated instead.
+        debug_assert!(self.valid, "copy_current_row_into on an invalid cursor");
         debug_assert!(
             !self.current_is_skeleton(),
-            "copy_current_row_into on a skeleton row: hydrate the key instead",
+            "a skeleton row has no payload to copy; hydrate its key"
         );
-        batch.append_row_from_source_bytes(
-            self.current_pk_bytes(),
-            weight,
-            &self.sources[self.current_entry_idx],
-            self.current_row,
-            None,
-        );
+        batch.append_row_from_source(weight, &self.sources[self.current_entry_idx], self.current_row, None);
     }
 
-    /// Drain up to `max_rows` net rows in merge order into an owned `Batch`
-    /// (sorted + consolidated); `None` once the cursor is exhausted. A chunk
-    /// boundary cannot split a (PK, payload) group — each drained entry is one
-    /// fully-folded merge group — so a DDL backfill or uniqueness scan loops on
-    /// this instead of `materialize` and keeps peak memory O(chunk).
+    /// Up to `max_rows` rows in merge order, consolidated, each a whole (PK, payload)
+    /// group; `None` once the cursor is exhausted.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         let mut skeletons = SkeletonKeys::default();
         let chunk = self.drain_live_chunk(max_rows, &mut skeletons);
@@ -66,28 +31,18 @@ impl ReadCursor {
     }
 
     /// [`Self::drain_chunk`], with each skeleton row's key pushed to `skeletons` instead of
-    /// copied. A chunk of skeleton rows alone is `Some` and empty.
+    /// copied; a chunk of skeleton rows alone is `Some` and empty.
     pub(crate) fn drain_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
-        // Without it a zero-row drain would copy nothing, return an empty batch and
-        // still advance, consuming a row.
-        if max_rows == 0 || !self.valid {
+        assert!(max_rows > 0, "drain_live_chunk: max_rows must be positive");
+        if !self.valid {
             return None;
         }
-        if let Some(batch) = self.drain_single_source(max_rows, skeletons) {
-            return Some(batch);
+        if let Some(i) = self.mode {
+            return Some(self.drain_single(i, max_rows, skeletons));
         }
-        // Read before the drain, which shrinks `estimated_length`. The proration's
-        // denominator is the whole source set, so the per-row density it implies
-        // stays constant across a chunked drain (pinned by
-        // `drain_chunk_blob_reservation_stays_o_chunk`).
-        let rows_ahead = self.estimated_length();
-        let src_rows: usize = self.sources.iter().map(Run::row_count).sum();
-        let blob_cap = prorated_blob_cap(self.total_blob_len(), src_rows, max_rows.min(rows_ahead));
-
         let mut order = std::mem::take(&mut self.merge_order);
-        self.drain_sorted_into(max_rows, rows_ahead, &mut order);
+        self.drain_sorted_into(max_rows, &mut order);
         if self.any_skeleton {
-            // Under coarsening a skeleton PK is one merge group, hence one entry.
             let sources = &self.sources;
             order.retain(|&(e, r, w)| {
                 let src = &sources[e as usize];
@@ -97,36 +52,21 @@ impl ReadCursor {
                 !src.is_skeleton()
             });
         }
-        let drained = if order.is_empty() {
-            Batch::empty_with_schema(&self.schema)
-        } else {
-            let mut batch = UnifiedSet::of(&self.sources, &self.schema).materialize(&self.schema, &order, blob_cap);
-            // The merge walk emits in (PK, payload) order with consolidated
-            // weights, which the materialize does not claim on its own.
-            batch.certify_layout(Layout::Consolidated);
-            batch
-        };
+        let src_rows: usize = self.sources.iter().map(Run::row_count).sum();
+        let src_blob: usize = self.sources.iter().map(|s| s.blob().len()).sum();
+        let blob_cap = prorated_blob_cap(src_blob, src_rows, order.len());
+        let mut batch = UnifiedSet::of(&self.sources, &self.schema).materialize(&self.schema, &order, blob_cap);
+        batch.certify_layout(Layout::Consolidated);
         self.merge_order = order;
-        Some(drained)
+        Some(batch)
     }
 
-    /// Materialize all non-zero-weight rows in merge order into an owned
-    /// `Rc<Batch>`.
+    /// Every remaining row in merge order, consolidated.
     pub fn materialize(mut self) -> Rc<Batch> {
-        // Sharing the backing `Rc` requires the whole source: no second source to
-        // have skipped rows, nothing consumed at the front, and no range seek
-        // clamping the back.
-        if self.sources.len() == 1
-            && self.valid
-            && self.current_row == 0
-            && self.states[0].count == self.sources[0].row_count()
-        {
-            if let Run::Mem(rc) = &self.sources[0] {
-                // Non-verifying, deliberately: `RunSet::push` verified this run
-                // on the way in, and re-walking it per drain buys nothing.
-                if rc.is_consolidated() {
-                    return Rc::clone(rc);
-                }
+        if let [Run::Mem(rc)] = &self.sources[..] {
+            let whole = self.valid && self.current_row == 0 && self.states[0].count == rc.count;
+            if whole {
+                return Rc::clone(rc);
             }
         }
         self.drain_chunk(usize::MAX)
@@ -134,96 +74,50 @@ impl ReadCursor {
             .unwrap_or_else(|| Rc::new(Batch::empty_with_schema(&self.schema)))
     }
 
-    /// Bulk-drain a cursor with exactly one live source into a Batch, bypassing
-    /// per-row iteration. Returns `None` when two or more sources can still
-    /// contribute, signaling the caller to fall back to row-at-a-time.
-    ///
-    /// Keys on the drive mode, not on `sources.len() == 1`: every other source's
-    /// window is empty, which is the precondition this bulk copy actually needs.
-    /// Never empty unless the source is a skeleton run, whose windowed rows go to
-    /// `skeletons` — `max_rows >= 1` and the committed row is still undrained.
-    pub(super) fn drain_single_source(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
-        let i = self.mode?;
-        // The undrained window starts at the committed row: the advance that
-        // emitted it already stepped `position` past it.
+    /// Up to `max_rows` rows of `i`, the one live source, as one slice copy.
+    fn drain_single(&mut self, i: usize, max_rows: usize, skeletons: &mut SkeletonKeys) -> Batch {
+        // `position` is already past the committed row.
         let start = self.current_row;
-        let remaining = self.states[i].count - start;
-        let row_count = remaining.min(max_rows);
-        let schema = &self.schema;
-
+        let row_count = (self.states[i].count - start).min(max_rows);
         let src = &self.sources[i];
         let batch = if src.is_skeleton() {
             for r in start..start + row_count {
                 skeletons.push(src.get_pk_bytes(r), src.get_weight(r));
             }
-            Batch::empty_with_schema(schema)
+            Batch::empty_with_schema(&self.schema)
         } else {
-            // A verbatim slice copy — neither sorts nor consolidates — so it carries
-            // whatever the backing can claim.
-            src.slice_to_owned_batch(start, row_count, schema)
+            src.slice_to_owned_batch(start, row_count, &self.schema)
         };
-
-        // Advance position past the drained rows
         self.states[i].position = start + row_count;
-        self.advance();
-        Some(batch)
+        self.advance_single(i);
+        batch
     }
 
-    /// Sum of blob arena sizes across every source. Tight upper bound on the
-    /// blob bytes a full drain can produce; callers use this to size the
-    /// output blob arena.
-    fn total_blob_len(&self) -> usize {
-        self.sources.iter().map(|s| s.blob().len()).sum()
-    }
-
-    /// Fill `out` with `(entry_idx, row_idx, net_weight)` for up to `max_rows`
-    /// merge groups, clearing it first; `rows_ahead` pre-sizes it. The weight is
-    /// the merge's **net**, not the exemplar source's stored contribution. On
-    /// return `current_*` holds the first undrained group, or the cursor is
-    /// invalid.
-    fn drain_sorted_into(&mut self, max_rows: usize, rows_ahead: usize, out: &mut Vec<(u32, u32, i64)>) {
-        with_payload_cmp!(
-            self.schema,
-            Self::drain_sorted_into_with,
-            self,
-            max_rows,
-            rows_ahead,
-            out
-        );
-    }
-
-    /// One `merge::drive` for the whole chunk: re-entering it per emitted group
-    /// rebuilt the comparator closures each time, ~39 instructions per row.
-    #[inline]
-    fn drain_sorted_into_with<P: PayloadOrder>(
-        &mut self,
-        max_rows: usize,
-        rows_ahead: usize,
-        out: &mut Vec<(u32, u32, i64)>,
-        payload: P,
-    ) {
+    /// Replace `out` with up to `max_rows` merge groups as `(source, row, net weight)`,
+    /// in merge order.
+    fn drain_sorted_into(&mut self, max_rows: usize, out: &mut Vec<(u32, u32, i64)>) {
         out.clear();
-        out.reserve(max_rows.min(rows_ahead));
-        // The committed row is an earlier drive's, not yet drained — and the
-        // drive emits only non-zero groups, so it needs no weight gate.
-        // `u32` because a partitioned-table cursor can exceed 256 entries.
+        out.reserve(max_rows.min(self.estimated_length()));
+        with_payload_cmp!(self.schema, Self::drain_sorted_with, self, max_rows, out);
+    }
+
+    #[inline]
+    fn drain_sorted_with<P: PayloadOrder>(&mut self, max_rows: usize, out: &mut Vec<(u32, u32, i64)>, payload: P) {
         out.push((
             self.current_entry_idx as u32,
             self.current_row as u32,
             self.current_weight,
         ));
-
-        // The group that did not fit, which the next drain resumes from.
-        let mut last: Option<(usize, usize, i64)> = None;
+        let mut first_undrained = None;
         self.drive(payload, |gs, gr, nw| {
             if out.len() == max_rows {
-                last = Some((gs, gr, nw));
+                first_undrained = Some((gs, gr, nw));
                 std::ops::ControlFlow::Break(())
             } else {
                 out.push((gs as u32, gr as u32, nw));
                 std::ops::ControlFlow::Continue(())
             }
         });
-        self.commit_emitted(last);
+        self.commit_emitted(first_undrained);
     }
 }

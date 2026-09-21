@@ -525,6 +525,25 @@ fn a_skeleton_store_hydrates_chunk_by_chunk() {
     assert_eq!(rows_of(&got), ingested(|i| [1, 4, 102].contains(&i)));
 }
 
+/// A bounded join view's PK is not unique, so a scan chunk can end inside a PK group
+/// of live rows; the chunks still concatenate.
+#[test]
+fn a_scan_chunk_boundary_inside_a_pk_group() {
+    let mut r = dehydrated_fixture("skeleton_split_group", 0..2, 100..102);
+    let mut bb = BatchBuilder::new(id_val_schema());
+    bb.begin_row(100, 1);
+    bb.put_u64(7);
+    bb.end_row();
+    r.ingest(TID, bb.finish()).unwrap();
+    // Groups: skeleton 0, skeleton 1, (100, 7) | (100, 100), (101, 101).
+    r.set_scan_chunk_rows(3);
+    let got = r.scan(TID, Some(&mut Recompute::default())).unwrap();
+    assert_eq!(
+        rows_of(&got),
+        vec![(0, 0, 1), (1, 1, 1), (100, 7, 1), (100, 100, 1), (101, 101, 1)]
+    );
+}
+
 /// A LIMIT cuts at the row, not at the hydrated group: key 2 hydrates to two rows,
 /// and `LIMIT 1` ships one.
 #[test]

@@ -67,21 +67,14 @@ pub struct ReadCursor {
     /// changes — and re-played in place by each reposition. Idle while `mode` is
     /// `Some`.
     tree: LoserTree,
-    /// The one source live at the last absolute reposition, read directly; `None`
-    /// drives `tree`, whose dead sources are sentinel leaves. Worth its own path:
-    /// it gates `drain_single_source`'s bulk memcpy at 1.5 instructions per row
-    /// against 474. Only re-derived on reposition, so a pessimistic `None` is
-    /// possible and safe.
+    /// The one source live at the last absolute reposition, walked without `tree`.
+    /// `None` drives `tree`, and may be pessimistic: only a reposition re-derives it.
     mode: Option<usize>,
     pub(crate) schema: SchemaDescriptor,
     /// At least one source is a capacity-bounded view's skeleton shard, so the
-    /// merge runs with payload coarsening on (see [`merge::merge_less`]). Derived
-    /// once at open, but not constant-folded away: `merge_less` stays
-    /// out-of-line, so every relation re-tests it on each PK tie and each group
-    /// boundary.
+    /// merge runs with payload coarsening on (see [`merge::merge_less`]).
     any_skeleton: bool,
-    /// The drain's merge-order scratch. A chunked drain loop runs one cursor to
-    /// exhaustion, so one buffer serves the whole scan.
+    /// The drain's merge-order scratch, reused across chunks.
     merge_order: Vec<(u32, u32, i64)>,
     /// Whether an ascending sweep has positioned this cursor — see
     /// [`Self::seek_pk_group_ascending`]. Cleared by every absolute reposition.
@@ -97,14 +90,6 @@ pub struct ReadCursor {
 }
 
 impl ReadCursor {
-    /// True when a run this walk merges is a skeleton shard, so a consumer that
-    /// cannot read a skeleton row must hydrate first. Per-run over the runs the
-    /// open selected — a strict subset of the store-level
-    /// [`Table::has_skeleton_rows`](super::table::Table::has_skeleton_rows).
-    pub(crate) fn any_skeleton(&self) -> bool {
-        self.any_skeleton
-    }
-
     /// A cursor over already-materialized batches, skipping empty ones — what a
     /// caller with rows in hand uses when it needs the cursor interface, with no
     /// backing `Table` and no scratch dir. Keeps [`Run`] inside the LSM layer.
@@ -157,9 +142,7 @@ impl ReadCursor {
     }
 
     /// Re-derive the drive mode after the per-source positions moved, then advance
-    /// to the first live row. The mode is settled *before* the payload comparator
-    /// is selected, so a single-source reposition skips the `with_payload_cmp!`
-    /// dispatch it never uses — 35 instructions per probe on an ascending sweep.
+    /// to the first live row.
     fn rebuild_and_advance(&mut self) {
         self.mode = Self::live_single(&self.states);
         match self.mode {

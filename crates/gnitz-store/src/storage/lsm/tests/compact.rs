@@ -809,16 +809,13 @@ fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
         .collect()
 }
 
-/// Row-at-a-time oracle: merge survivors materialized one
-/// `(row, column)` at a time via `append_row_from_source_bytes`. The oracle
-/// the columnar path is checked against.
+/// Row-at-a-time oracle for the columnar compaction path.
 fn oracle_compact_row_at_a_time(input_files: &[&CStr], output_file: &CStr, schema: &SchemaDescriptor) {
     let shards = open_inputs(input_files, schema);
     let mut batch = Batch::with_capacity(schema, 1024);
     let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
     run_merge(&shards, schema, |src, row, w| {
-        let pk_bytes = shards[src].get_pk_bytes(row);
-        batch.append_row_from_source_bytes(pk_bytes, w, &shards[src], row, blob_cache.get_mut());
+        batch.append_row_from_source(w, &shards[src], row, blob_cache.get_mut());
     });
     batch.write_as_shard(output_file, ShardWriteOpts::COMPACTION).unwrap();
 }
@@ -933,7 +930,7 @@ fn oracle_merge_and_route_row_at_a_time(
     run_merge(&shards, schema, |src, row, w| {
         let pk = shards[src].get_pk_bytes(row);
         let g = guard_slot(guard_keys, pk, PkBuf::pk_bytes);
-        batches[g].append_row_from_source_bytes(pk, w, &shards[src], row, blob_caches[g].get_mut());
+        batches[g].append_row_from_source(w, &shards[src], row, blob_caches[g].get_mut());
     });
     (0..n)
         .map(|g| {

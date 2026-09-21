@@ -38,6 +38,18 @@ pub(super) const fn compute_payload_cmp(
     PayloadCmpKind::FixedIntNonnull
 }
 
+/// Compare two rows in the full (PK, payload) order.
+pub(crate) fn compare_full_rows<A: RowSource, B: RowSource>(
+    schema: &SchemaDescriptor,
+    src_a: &A,
+    row_a: usize,
+    src_b: &B,
+    row_b: usize,
+) -> Ordering {
+    super::key::compare_pk_bytes(src_a.get_pk_bytes(row_a), src_b.get_pk_bytes(row_b))
+        .then_with(|| compare_rows(schema, src_a, row_a, src_b, row_b))
+}
+
 /// Compare two rows from any [`RowSource`] implementations by payload columns.
 ///
 /// Null words are read once per row outside the column loop.

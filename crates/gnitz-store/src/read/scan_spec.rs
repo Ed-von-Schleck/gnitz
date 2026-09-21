@@ -12,7 +12,7 @@ use crate::expr::MapPlan;
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, SourceCursor, StoreError};
+use crate::storage::{Batch, StoreError};
 use gnitz_expr::{cmp_order_keys, order_locators, Evaluator, LogicalProgram, OrderLocator, RangeMembership};
 
 /// The sink a request resolved to, ahead of any walk.
@@ -106,45 +106,27 @@ impl RelationRegistry {
                  create the view WITH (delta = '<size>') to subscribe to it"
             )));
         }
-        // Everything after round 0 is the output store itself. A fresh cursor: the
-        // cached snapshot would pin a second copy of the view until its next ingest.
-        if after_tick == 0 {
-            if !reply_schema.same_physical_layout(&entry.schema()) {
-                return Err(layout_mismatch());
+        let (cursor, schema) = if after_tick == 0 {
+            (entry.cursor(), entry.schema())
+        } else {
+            let feed = entry.delta_or_err()?;
+            let dropped_through = feed.dropped_through();
+            if delta_cursor_expired(after_tick, dropped_through) {
+                return Err(StoreError::DeltaExpired(format!(
+                    "delta cursor {after_tick} of relation {id} is below the \
+                     retained floor {dropped_through}; re-read at 0"
+                )));
             }
-            // A fed view carries no capacity, so no skeleton row needs hydrating.
-            return Ok(entry.cursor().materialize());
-        }
-        let feed = entry.delta_or_err()?;
-        let dropped_through = feed.dropped_through();
-        if delta_cursor_expired(after_tick, dropped_through) {
-            return Err(StoreError::DeltaExpired(format!(
-                "delta cursor {after_tick} of relation {id} is below the \
-                 retained floor {dropped_through}; re-read at 0"
-            )));
-        }
-        let schema = feed.schema();
+            let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
+            (
+                feed.pk_range_cursor(&desc).map_err(StoreError::rejected)?,
+                feed.schema(),
+            )
+        };
         if !reply_schema.same_physical_layout(&schema) {
             return Err(layout_mismatch());
         }
-        // Both ends `Cut::After`: no arithmetic on the client's `after_tick`,
-        // where `after_tick + 1` at `u64::MAX` would wrap.
-        let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
-        let cursor = feed.pk_range_cursor(&desc).map_err(StoreError::rejected)?;
-        let mut rows = Survivors {
-            source: LiveSource::new(self, id, SourceCursor::Full(Box::new(cursor)), None),
-            predicate: None,
-            membership: None,
-            ranges: Vec::new(),
-            walk_words: Vec::new(),
-        };
-        Ok(Rc::new(stream_rows(
-            &mut rows,
-            self.config.scan_chunk_rows,
-            None,
-            &schema,
-            0,
-        )?))
+        Ok(cursor.materialize())
     }
 }
 
@@ -188,17 +170,11 @@ impl Survivors<'_, '_> {
         self.predicate.is_none() && self.membership.is_none()
     }
 
-    /// The next non-empty source chunk and its surviving row ranges — the whole
-    /// chunk when there is no predicate and no membership — or `None` once the source
-    /// is exhausted.
+    /// The next source chunk and its surviving row ranges; `None` once the source is
+    /// exhausted.
     fn next(&mut self, max_rows: usize) -> Result<Option<SurvivorChunk<'_>>, StoreError> {
-        let chunk = loop {
-            let Some(chunk) = self.source.next_chunk(max_rows)? else {
-                return Ok(None);
-            };
-            if chunk.count > 0 {
-                break chunk;
-            }
+        let Some(chunk) = self.source.next_chunk(max_rows)? else {
+            return Ok(None);
         };
         let mb = chunk.as_mem_batch();
         match (&self.predicate, &self.membership) {

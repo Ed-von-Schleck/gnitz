@@ -633,18 +633,6 @@ fn drain_chunk_multi_source_matches_single_source() {
     }
 }
 
-/// `copy_current_row_into` on an invalid cursor must be a no-op; the
-/// byte-form PK write would otherwise index empty `sources` and panic.
-#[test]
-fn copy_current_row_into_invalid_is_noop() {
-    let schema = make_schema_u128_i64();
-    let cursor = create_read_cursor(&[], &[], schema);
-    assert!(!cursor.valid);
-    let mut out = Batch::with_capacity(&schema, 1);
-    cursor.copy_current_row_into(&mut out, 1);
-    assert_eq!(out.count, 0, "invalid cursor copy must not write a row");
-}
-
 // -- PK-group iteration -------------------------------------------------
 
 /// `for_each_pk_group_row` visits one entry per non-ghost (PK, payload)
@@ -931,13 +919,10 @@ fn mode_follows_the_live_source_set() {
     assert_advance_to_matches_seek_oracle(schema, &b, &[0, 105, 250, 305, 120, 341, 220]);
 }
 
-/// A full drain of an untouched cursor reserves every source's heap — what the
-/// blob proration collapses to when the row bound is the whole source set. The
-/// fixture must sum past `POOL_BYPASS_BYTES` (2 MiB) so the reservation allocates
-/// at its exact size, cancel nearly every row so the survivor is smaller, and keep
-/// the FIRST key alive so the open's own drive stops there.
+/// The blob reservation follows the rows that survive the merge, not the rows it read:
+/// a drain whose inputs nearly all cancel reserves for the survivor alone.
 #[test]
-fn materialize_reserves_the_whole_blob_arena() {
+fn materialize_reserves_for_the_survivors() {
     let schema = make_schema_pk_u64_payload_string();
     const ROWS: u64 = 4096;
     let text = |pk: u64| format!("{pk:0>512}");
@@ -953,15 +938,15 @@ fn materialize_reserves_the_whole_blob_arena() {
     // Same keys and payloads at opposite weights, but for key 0.
     let inserts = run(0, 1);
     let retracts = run(1, -1);
-    let reserved = inserts.blob.len() + retracts.blob.len();
-    assert!(reserved > 2 * 1024 * 1024, "must exceed POOL_BYPASS_BYTES: {reserved}");
+    let heap = inserts.blob.len() + retracts.blob.len();
+    assert!(heap > 2 * 1024 * 1024, "must exceed POOL_BYPASS_BYTES: {heap}");
 
     let batch = create_read_cursor(&[inserts, retracts], &[], schema).materialize();
     assert_eq!(batch.count, 1, "all but the first key cancels");
     assert_eq!(batch.blob.len(), 512, "one surviving string");
     assert!(
-        batch.blob.capacity() >= reserved,
-        "a full drain reserves every source's heap: {} < {reserved}",
+        batch.blob.capacity() <= 2 * 1024 * 1024,
+        "the reservation must not cover the cancelled rows: {}",
         batch.blob.capacity(),
     );
 }

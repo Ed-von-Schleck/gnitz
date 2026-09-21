@@ -81,7 +81,7 @@ impl PkSetGather {
     /// The budget is tested before each key and each group is visited whole, so the count
     /// can overshoot to `max_rows - 1 + |largest group|`. `0` means the list is exhausted.
     pub fn for_each_live_row(&mut self, max_rows: usize, mut f: impl FnMut(&ReadCursor)) -> usize {
-        debug_assert!(max_rows > 0, "a zero row budget would never consume a key");
+        assert!(max_rows > 0, "for_each_live_row: max_rows must be positive");
         let stride = self.cursor.schema.pk_stride();
         let mut visited = 0;
         while visited < max_rows && self.next * stride < self.keys.len() {
@@ -105,7 +105,7 @@ impl PkSetGather {
     /// The next chunk with skeleton rows split out, as [`ReadCursor::drain_live_chunk`].
     pub(crate) fn next_live_chunk(&mut self, max_rows: usize, skeletons: &mut SkeletonKeys) -> Option<Batch> {
         let mut out = Batch::with_capacity(&self.cursor.schema, self.remaining_keys().min(max_rows));
-        let split = self.cursor.any_skeleton();
+        let split = self.cursor.any_skeleton;
         let visited = self.for_each_live_row(max_rows, |c| {
             if split && c.current_is_skeleton() {
                 skeletons.push(c.current_pk_bytes(), c.current_weight);
@@ -113,8 +113,6 @@ impl PkSetGather {
                 c.copy_current_row_into(&mut out, c.current_weight);
             }
         });
-        // Ascending keys, each group in (PK, payload) order at positive net weights.
-        // Certifying it spares an ingest tail an O(chunk log chunk) re-sort.
         out.certify_layout(Layout::Consolidated);
         (visited > 0).then_some(out)
     }

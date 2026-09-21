@@ -67,6 +67,7 @@ fn val_bound(start: Cut, end: Cut) -> IndexBound {
 fn drain_all(cur: &mut SourceCursor, chunk: usize) -> Vec<(u128, i64)> {
     let mut out = Vec::new();
     while let Some(b) = cur.drain_chunk(chunk) {
+        assert!(!b.is_empty(), "drain_chunk yielded an empty chunk");
         for i in 0..b.len() {
             out.push((b.get_pk(i), b.get_weight(i)));
         }
@@ -372,15 +373,10 @@ fn degenerate_point_range_returns_one_key_group() {
     engine.close();
 }
 
-/// An in-range index entry whose base row is absent resolves to nothing. Its chunk
-/// must yield `Some(empty)`, NOT `None`: both drivers read `None` as exhaustion, so
-/// an escaping `None` would silently truncate the view mid-range.
-///
-/// The orphan is written straight into the index table — the projection path
-/// retracts an index entry with its source row, so an orphan is unreachable
-/// through it, and the point here is precisely that the walk does not assume so.
+/// An in-range index entry whose base row is absent does not end the walk. The
+/// orphan is written straight into the index table; DML never leaves one.
 #[test]
-fn orphaned_index_entry_yields_empty_not_exhaustion() {
+fn an_orphaned_index_entry_does_not_end_the_walk() {
     let (mut engine, tid, vid) = fixture("srccur_orphan", Some(val_bound(Cut::Before(500), Cut::Before(600))));
 
     // Clone a live in-range entry's key (val=550 ⇒ id=55) and swap its source-PK
@@ -419,8 +415,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
         .ingest_owned_batch(ob)
         .unwrap();
 
-    // Chunk of 1 puts the orphan in a chunk of its own: were its `None` to escape,
-    // the drain would stop there and lose every later id.
+    // A chunk of 1 gives the orphan an index window of its own.
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     let got = drain_all(&mut cur, 1);

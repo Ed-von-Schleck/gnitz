@@ -15,7 +15,7 @@ use crate::storage::{Batch, BlobCacheGuard, MemBatch, Table};
 /// Retract input row `prev_pos`. The literal `-1` is exact because the ±1 clamp
 /// below runs before the walk, so a live `last_insert` row weighs exactly `+1`.
 fn retract(effective: &mut Batch, src: &MemBatch, prev_pos: usize, guard: &mut BlobCacheGuard) {
-    effective.append_row_from_source_bytes(src.get_pk_bytes(prev_pos), -1, src, prev_pos, guard.get_mut());
+    effective.append_row_from_source(-1, src, prev_pos, guard.get_mut());
 }
 
 /// Bulk-copy the verbatim run `[kept_from, end)` into the effective batch,
@@ -114,7 +114,7 @@ pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut ba
 
         let eff = cut(&mut effective, schema, &batch, kept_from, row);
         if let Some(stored_row) = stored {
-            eff.append_row_from_source_bytes(pkb, -1, &stored_row.run, stored_row.row, guard.get_mut());
+            eff.append_row_from_source(-1, &stored_row.run, stored_row.row, guard.get_mut());
         }
         if let Some(prev_pos) = last_insert {
             retract(eff, &mb, prev_pos, &mut guard);

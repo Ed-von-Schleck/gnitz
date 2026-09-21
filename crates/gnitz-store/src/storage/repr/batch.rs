@@ -234,37 +234,22 @@ impl Batch {
         std::mem::replace(self, empty)
     }
 
-    /// An empty batch with schema, pre-allocated for `rows` rows. The arena is
-    /// **not zero-filled** — the batch invariant is *every counted row writes
-    /// every region*, so nothing may read a byte it has not written. Every
-    /// writer upholds it (a NULL cell takes `fill_col_zero`, not a skip) and
-    /// every reader is `count`-bounded; [`Self::reserve_rows`] grows into an
-    /// uninitialized arena too, so the invariant is not optional.
-    ///
-    /// Publishing `count` before filling is fine — `MapPlan::map_ranges_into`
-    /// bulk-publishes the whole window, then writes it. Leaving a counted cell
-    /// unwritten is not: it holds recycled bytes, poisoned in debug builds (see
-    /// [`debug_poison`]). A writer that wants a cell to read zero writes the
-    /// zero.
+    /// An empty batch with room for `rows` rows. The arena is uninitialized
+    /// (poisoned in debug builds): every counted row must have every region written.
     pub fn with_capacity(schema: &SchemaDescriptor, rows: usize) -> Self {
-        let cap = rows.max(1);
         let (strides, nr) = strides_from_schema(schema);
-        // The offsets land in the batch's own array rather than a stack temp the
-        // constructor would then copy in — see [`compute_offsets_into`].
         let mut b = Batch {
             data: Vec::new(),
-            // No head start: every writer grows the heap on demand, so a fixed
-            // reservation charges every string-free batch a malloc.
             blob: Vec::new(),
             offsets: [0usize; MAX_BATCH_REGIONS],
             strides,
-            capacity: cap,
+            capacity: rows,
             count: 0,
             layout: Layout::Raw,
             schema: *schema,
             blob_id: next_blob_id(),
         };
-        let total_size = compute_offsets_into(&strides, nr as usize, cap, &mut b.offsets);
+        let total_size = compute_offsets_into(&strides, nr as usize, rows, &mut b.offsets);
         b.data = acquire_arena(total_size, Fill::Uninit);
         b
     }
@@ -980,8 +965,7 @@ impl<'d> AppendSession<'d> {
     /// Append one row of `src` at an explicit weight, under the session's own
     /// blob dedup cache. A zero weight appends nothing.
     pub(crate) fn push_row(&mut self, src: &MemBatch<'_>, row: usize, weight: i64) {
-        self.dst
-            .append_row_from_source_bytes(src.get_pk_bytes(row), weight, src, row, self.guard.get_mut());
+        self.dst.append_row_from_source(weight, src, row, self.guard.get_mut());
     }
 }
 
@@ -1162,16 +1146,6 @@ impl Batch {
     /// eliminated, §2).
     #[cfg(debug_assertions)]
     pub(crate) fn debug_verify_consolidated(&self, schema: &SchemaDescriptor) {
-        crate::schema::payload_order::with_payload_cmp!(schema, Self::debug_verify_consolidated_body, self, schema)
-    }
-
-    #[cfg(debug_assertions)]
-    fn debug_verify_consolidated_body<P: crate::schema::payload_order::PayloadOrder>(
-        &self,
-        schema: &SchemaDescriptor,
-        payload: P,
-    ) {
-        use crate::schema::key::compare_pk_bytes;
         for i in 0..self.count {
             debug_assert_ne!(
                 self.get_weight(i),
@@ -1179,8 +1153,7 @@ impl Batch {
                 "batch flagged consolidated, but row {i} has weight 0 (ghost not eliminated)"
             );
             if i + 1 < self.count {
-                let ord = compare_pk_bytes(self.get_pk_bytes(i), self.get_pk_bytes(i + 1))
-                    .then_with(|| payload.compare(schema, self, i, self, i + 1));
+                let ord = crate::schema::payload_order::compare_full_rows(schema, self, i, self, i + 1);
                 debug_assert_eq!(
                     ord,
                     std::cmp::Ordering::Less,
@@ -1204,16 +1177,9 @@ impl Batch {
         total
     }
 
-    /// Scatter-copy selected rows from a MemBatch into a new Batch, each carrying
-    /// its own weight. A caller emitting *different* weights follows with
-    /// `overwrite_weights` — one sequential blit,
-    /// against a per-(row, column) dispatch in the scatter.
-    ///
-    /// `indices` must name no weight-0 row (debug-asserted in the scatter).
+    /// The rows `indices` names, in that order, at their own weights; none may be
+    /// weight 0.
     pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
-        if indices.is_empty() {
-            return Self::empty_with_schema(schema);
-        }
         let blob_cap = merge::prorated_blob_cap(batch.blob.len(), batch.count, indices.len());
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
             super::scatter::scatter_copy(batch, indices, writer);
@@ -1314,10 +1280,6 @@ impl Batch {
         let stamp_bytes = DELTA_TICK_COL.size() as usize;
         debug_assert_eq!(out_stride, in_stride + stamp_bytes);
         debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
-        if self.count == 0 {
-            return Self::empty_with_schema(out_schema);
-        }
-
         let mut output = self.shell_for(in_schema, out_schema, 0);
         output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
 
@@ -1349,9 +1311,6 @@ impl Batch {
         let out_npc = out_schema.num_payload_cols();
         debug_assert!(out_npc >= in_npc);
         let n = self.count;
-        if n == 0 {
-            return Self::empty_with_schema(out_schema);
-        }
         let n_new = out_npc - in_npc;
 
         let first_slot = if nulls_first { n_new } else { 0 };
@@ -1460,18 +1419,18 @@ impl Batch {
         self.append_ranges(&src.as_mem_batch(), &[(start, end)]);
     }
 
-    /// All of `next`, every key of which sorts above every key of this batch.
-    /// Consolidated if both were.
+    /// All of `next`, every row of which sorts above every row of this batch in
+    /// (PK, payload) order. Consolidated if both were.
     pub fn append_above(&mut self, next: Batch) {
         if self.count == 0 {
             *self = next;
             return;
         }
         if next.count > 0 {
-            let order = crate::schema::key::compare_pk_bytes(self.get_pk_bytes(self.count - 1), next.get_pk_bytes(0));
+            let order = crate::schema::payload_order::compare_full_rows(&self.schema, &*self, self.count - 1, &next, 0);
             assert!(
                 order.is_lt(),
-                "append_above: the appended keys do not sort above this batch's"
+                "append_above: the appended rows do not sort above this batch's"
             );
         }
         let consolidated = self.is_consolidated() && next.is_consolidated();
@@ -1481,45 +1440,29 @@ impl Batch {
         }
     }
 
-    /// Gather every `[start, end)` row range of `src`, in list order, into a fresh
-    /// batch — a filter pass's survivor list, or one slice of a RAM-tier run.
-    ///
-    /// Disjoint ascending ranges (debug-checked) make the result a subset *in source
-    /// order*, which is what lets it inherit `src`'s layout tag; an overlap would
-    /// repeat a row and break the distinctness half of a `Consolidated` claim. The
-    /// blob arm is [`merge::should_relocate_blob`]'s call.
+    /// The rows of `src`'s disjoint ascending `[start, end)` ranges, inheriting its
+    /// layout.
     pub(crate) fn from_ranges(src: &Batch, ranges: &[(usize, usize)], schema: &SchemaDescriptor) -> Batch {
         debug_assert!(
             ranges.windows(2).all(|w| w[0].1 <= w[1].0),
             "from_ranges: ranges must be disjoint and ascending",
         );
         let rows = range_rows(ranges);
-        if rows == 0 {
-            // Not `with_capacity(_, 0)`, which rounds up to a 1-row arena. The `Raw`
-            // tag needs no repair: both layout readers short-circuit on `count == 0`.
-            return Batch::empty_with_schema(schema);
-        }
         let mut out = Batch::with_capacity(schema, rows);
         if !merge::should_relocate_blob(src.blob.len(), src.count, rows) {
             out.share_blob_from(src);
         }
         out.append_ranges(&src.as_mem_batch(), ranges);
-        // `append_ranges` downgraded `out` to `Raw` first.
         out.inherit_layout(src);
         out
     }
 
-    /// Every source's rows, in order, in one fresh batch, sized for the whole
-    /// run in rows *and* blob bytes up front. Claims no layout: a concatenation
-    /// can break (PK, payload) order. An empty run allocates nothing.
+    /// Every source's rows, in order, in one fresh `Raw` batch.
     pub fn concat<'s>(schema: &SchemaDescriptor, sources: impl Iterator<Item = &'s Batch> + Clone) -> Batch {
         let (mut rows, mut blob) = (0usize, 0usize);
         for src in sources.clone() {
             rows += src.count;
             blob += src.blob.len();
-        }
-        if rows == 0 {
-            return Batch::empty_with_schema(schema);
         }
         let mut out = Batch::with_capacity_blob(schema, rows, blob);
         for src in sources {
@@ -1622,17 +1565,10 @@ impl Batch {
         &self.strides[..self.arena_regions()]
     }
 
-    /// Append `source[row]` under a raw-OPK-bytes key, with blob deduplication.
-    ///
-    /// Pass `None` for `blob_cache` when the schema has no STRING columns or when
-    /// cross-row dedup isn't worth the bookkeeping; `Some(..)` dedups repeated
-    /// source long-string spans into one destination copy. `pk_bytes` must be
-    /// exactly `pk_stride` bytes (asserted by `extend_pk_bytes`). Also valid for
-    /// narrow PKs — the only difference from the `u128` entry point is how the
-    /// PK region is written.
-    pub(crate) fn append_row_from_source_bytes<S: RowSource>(
+    /// Append `source[row]` at `weight`; a `blob_cache` dedups repeated long-string
+    /// spans.
+    pub(crate) fn append_row_from_source<S: RowSource>(
         &mut self,
-        pk_bytes: &[u8],
         weight: i64,
         source: &S,
         row: usize,
@@ -1641,15 +1577,8 @@ impl Batch {
         if weight == 0 {
             return;
         }
-        self.begin_row(pk_bytes, weight);
+        self.begin_row(source.get_pk_bytes(row), weight);
         let null_word = source.get_null_word(row);
-
-        // Walks this batch's own schema by index, re-reading the 4-byte
-        // `SchemaColumn` per column, rather than calling the shared
-        // `append_payload_cols`: that takes the schema by reference, which the
-        // `&mut self` cell writes below would alias, and copying the descriptor
-        // out to dodge that puts a 360-byte `memcpy` on this per-row path. The
-        // cell body is still the shared `append_payload_cell`.
         let src_blob = source.blob();
         let num_payload = self.schema.num_payload_cols();
         for pi in 0..num_payload {
@@ -1867,34 +1796,24 @@ impl RowSource for Batch {
     }
 }
 
-/// Allocate a single contiguous arena, run a merge/copy operation via
-/// DirectWriter, and return the arena as a Batch — zero copy-out.
-///
-/// In steady state the arena is recycled from the thread-local buffer pool.
-///
-/// The arena is **uninitialized** ([`Batch::with_capacity`]'s contract): every
-/// [`merge::DirectWriter`] entry point writes each live byte of each row it
-/// counts, and every reader — accessor, `region_at`, `total_bytes` — bounds
-/// the batch to `count`, so the `[count, capacity)` tail and the inter-region
-/// alignment padding are never read and never serialized.
+/// A batch of up to `max_rows` rows, written in place by `write_fn` through a
+/// [`merge::DirectWriter`] over its uninitialized arena.
 pub(crate) fn write_to_batch(
     schema: &SchemaDescriptor,
     max_rows: usize,
     max_blob: usize,
     write_fn: impl FnOnce(&mut merge::DirectWriter),
 ) -> Batch {
+    if max_rows == 0 {
+        return Batch::empty_with_schema(schema);
+    }
     let mut b = Batch::with_capacity_blob(schema, max_rows, max_blob);
     let rows = {
-        // `b.capacity`, not `max_rows`: the writer must carve at the offsets the
-        // batch will read back through.
         let mut writer = merge::DirectWriter::over_arena(&mut b.data, &b.schema, b.capacity, &mut b.blob);
         write_fn(&mut writer);
         writer.count
     };
     b.count = rows;
-    // Nothing was written: return the buffer rather than park it in a batch whose
-    // `total_bytes` cannot see it. `max_blob` is only an estimate — an all-short
-    // STRING column leaves the heap empty.
     if b.blob.is_empty() {
         super::batch_pool::recycle_buf(std::mem::take(&mut b.blob));
     }

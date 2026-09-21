@@ -254,15 +254,15 @@ fn pk_seeks_agree_with_a_linear_scan() {
     }
 }
 
-/// `append_row_from_source_bytes` copies the PK verbatim and carries the
+/// `append_row_from_source` copies the PK verbatim and carries the
 /// caller's weight, not the source row's.
 #[test]
-fn append_row_from_source_bytes_copies_pk_weight_and_payload() {
+fn append_row_from_source_copies_pk_weight_and_payload() {
     let schema = pk_payload_schema(&[type_code::U64]);
     let src = crate::test_support::make_batch_opk(&schema, &[(&0xDEAD_BEEFu64.to_be_bytes(), 1, 0x4242)]);
 
     let mut dst = Batch::with_capacity(&schema, 1);
-    dst.append_row_from_source_bytes(src.get_pk_bytes(0), -1, &src, 0, None);
+    dst.append_row_from_source(-1, &src, 0, None);
 
     assert_eq!(dst.count, 1);
     assert_eq!(dst.get_pk_bytes(0), &0xDEAD_BEEFu64.to_be_bytes());

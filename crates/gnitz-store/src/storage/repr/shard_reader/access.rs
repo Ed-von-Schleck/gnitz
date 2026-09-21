@@ -115,19 +115,10 @@ impl MappedShard {
         schema: &SchemaDescriptor,
         relocate: bool,
     ) -> Batch {
-        // A skeleton shard has no payload bytes to materialize: this path
-        // force-NULLs every absent column, dereferences every German-string cell,
-        // and certifies the result against `schema`'s NOT NULL bits. A bounded
-        // view's store must be read row-at-a-time through the cursor instead, so
-        // its skeleton keys can be hydrated rather than handed out as NULL rows.
-        debug_assert!(
+        assert!(
             !self.skeleton,
-            "slice_to_owned_batch_with on a skeleton shard: a bounded view's store must be read row-at-a-time",
+            "a skeleton shard has no payload to slice; hydrate its keys"
         );
-
-        if row_count == 0 {
-            return Batch::empty_with_schema(schema);
-        }
         assert!(start + row_count <= self.count, "slice out of range");
 
         let pk_stride = self.pk_stride;
@@ -191,8 +182,6 @@ impl MappedShard {
             }
             w.count = row_count;
         });
-        // Shards are written consolidated; a contiguous slice stays (PK, payload)-
-        // sorted and ghost-free.
         batch.certify_layout(Layout::Consolidated);
         batch
     }

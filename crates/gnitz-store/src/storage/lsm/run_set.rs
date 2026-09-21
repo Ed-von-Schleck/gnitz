@@ -228,27 +228,11 @@ fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
 
 /// Merge N sorted MemBatch views into a single consolidated Batch.
 fn consolidate_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
-    if batches.is_empty() {
-        return Batch::empty_with_schema(schema);
-    }
-
     let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
-
-    // Consolidate and count survivors first, so the output arena — whose
-    // allocation dominates the flush provision cost — is sized to the
-    // post-cancellation row count, not the Σ-input upper bound. Aggregation
-    // trace folds cancel heavily (retract + insert per re-aggregated group), so
-    // `survivors.len()` is routinely a fraction of the input row count. The blob
-    // bound stays `total_blob` (survivors' blobs are a subset; blob is reserved,
-    // not zeroed, so an over-estimate costs nothing).
-    // `src`/`row` originate as `u32` fields of `HeapNode`, so the casts are lossless.
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
     merge::run_merge(batches, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w))
     });
-    if survivors.is_empty() {
-        return Batch::empty_with_schema(schema);
-    }
     let mut result = UnifiedSet::of(batches, schema).materialize(schema, &survivors, total_blob);
     result.certify_layout(Layout::Consolidated);
     result

@@ -77,6 +77,7 @@ fn test_relocate_german_string_vec_cache_hit_dedups() {
 use super::super::batch::{Batch, Layout};
 use super::*;
 use crate::schema::key::compare_pk_bytes;
+use crate::schema::payload_order::compare_full_rows;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_u128_i64, pk_payload_schema, pk_u64_two_i64_schema};
 
@@ -970,7 +971,7 @@ mod merge_materialize_vs_reference {
     }
 
     /// The independent oracle: concatenate the runs into one batch, argsort it by
-    /// `compare_pk_bytes` then `compare_rows`, fold equal (PK, payload) groups and
+    /// `compare_full_rows`, fold equal (PK, payload) groups and
     /// drop the net-zero ones — the same reference shape `consolidate_reference`
     /// uses, decoded to this module's three-payload-column rows.
     fn reference_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<Row> {
@@ -981,22 +982,14 @@ mod merge_materialize_vs_reference {
         let mb = all.as_mem_batch();
         let n = mb.count;
         let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(
-            |&x, &y| match compare_pk_bytes(mb.get_pk_bytes(x), mb.get_pk_bytes(y)) {
-                Ordering::Equal => crate::schema::payload_order::compare_rows(schema, &mb, x, &mb, y),
-                ord => ord,
-            },
-        );
+        idx.sort_by(|&x, &y| compare_full_rows(schema, &mb, x, &mb, y));
         let mut out = Vec::new();
         let mut i = 0;
         while i < n {
             let head = idx[i];
             let mut w = mb.get_weight(head);
             i += 1;
-            while i < n
-                && compare_pk_bytes(mb.get_pk_bytes(head), mb.get_pk_bytes(idx[i])) == Ordering::Equal
-                && crate::schema::payload_order::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
-            {
+            while i < n && compare_full_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal {
                 w += mb.get_weight(idx[i]);
                 i += 1;
             }
@@ -1209,28 +1202,20 @@ mod merge_materialize_vs_reference {
 // signed, compound, and wide PK shapes the sort key covers.
 // -----------------------------------------------------------------------
 
-/// Independent reference: argsort by `compare_pk_bytes` then `compare_rows`,
+/// Independent reference: argsort by `compare_full_rows`,
 /// fold consecutive equal `(PK, payload)` groups, drop net-zero ghosts.
 fn consolidate_reference(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
     let mb = b.as_mem_batch();
     let n = mb.count;
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(
-        |&x, &y| match compare_pk_bytes(mb.get_pk_bytes(x), mb.get_pk_bytes(y)) {
-            Ordering::Equal => crate::schema::payload_order::compare_rows(schema, &mb, x, &mb, y),
-            ord => ord,
-        },
-    );
+    idx.sort_by(|&x, &y| compare_full_rows(schema, &mb, x, &mb, y));
     let mut out = Vec::new();
     let mut i = 0;
     while i < n {
         let head = idx[i];
         let mut w = mb.get_weight(head);
         i += 1;
-        while i < n
-            && compare_pk_bytes(mb.get_pk_bytes(head), mb.get_pk_bytes(idx[i])) == Ordering::Equal
-            && crate::schema::payload_order::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
-        {
+        while i < n && compare_full_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal {
             w += mb.get_weight(idx[i]);
             i += 1;
         }
