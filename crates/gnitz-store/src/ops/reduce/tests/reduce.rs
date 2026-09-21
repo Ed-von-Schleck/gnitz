@@ -480,7 +480,7 @@ fn linear_sum_only_new_all_null_group_present() {
     // grp → fin payload 0; sum / (cnn != 0) → fin payload 1, NULL when cnn is 0.
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 3 }, // r0 = cnn
-        LogicalInstr::LoadConst { val: 0 },
+        LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = (cnn != 0)
         LogicalInstr::LoadColInt { col: 2 },                       // r3 = sum
         LogicalInstr::IntArith {
@@ -654,7 +654,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     // div-by-zero (cnn == 0) marks the SUM NULL; div-by-1 (cnn > 0) is exact.
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 4 },                       // r0 = cnn (col 4)
-        LogicalInstr::LoadConst { val: 0 },                        // r1 = 0
+        LogicalInstr::LoadConst { val: 0, unsigned: false },       // r1 = 0
         LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = (cnn != 0) → 1/0
         LogicalInstr::LoadColInt { col: 3 },                       // r3 = sum (col 3)
         LogicalInstr::IntArith {

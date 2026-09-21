@@ -7,7 +7,7 @@
 //! structural rules (register limit, operand order, const-pool bounds) are
 //! decided there, so a caller emits first and is told what is unsupported once.
 
-use crate::{ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Output, Reg, Sink, MAX_REGS};
+use crate::{CalendarOp, ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Output, Reg, Sink, MAX_REGS};
 
 /// Accumulates the instructions, sinks and constants of one expression program.
 #[derive(Default)]
@@ -40,8 +40,21 @@ impl ExprBuilder {
         let instr = match instr {
             // `get`, not an index: an out-of-range operand is `build`'s to reject.
             LogicalInstr::IntToFloat { a } => match self.instrs.get(a.0 as usize) {
-                Some(&LogicalInstr::LoadConst { val }) => LogicalInstr::LoadConst {
-                    val: crate::batch::encode_f64(val as f64),
+                Some(&LogicalInstr::LoadConst { val, unsigned }) => LogicalInstr::LoadConst {
+                    val: crate::batch::encode_f64(if unsigned { val as u64 as f64 } else { val as f64 }),
+                    unsigned: false,
+                },
+                _ => instr,
+            },
+            // An overflowing day count stays the kernel, which makes it NULL.
+            LogicalInstr::Calendar {
+                op: CalendarOp::ToMicros,
+                a,
+                micros: false,
+            } => match self.instrs.get(a.0 as usize) {
+                Some(&LogicalInstr::LoadConst { val, unsigned: false }) => match crate::calendar::days_to_micros(val) {
+                    (val, false) => LogicalInstr::LoadConst { val, unsigned: false },
+                    (_, true) => instr,
                 },
                 _ => instr,
             },
@@ -96,7 +109,10 @@ impl ExprBuilder {
     /// so a caller must never write `v as i64` — which compiles and is silently
     /// a different number.
     pub fn const_f64(&mut self, v: f64) -> Reg {
-        self.emit(LogicalInstr::LoadConst { val: crate::batch::encode_f64(v) })
+        self.emit(LogicalInstr::LoadConst {
+            val: crate::batch::encode_f64(v),
+            unsigned: false,
+        })
     }
 
     /// Push an i64 value pool for `IntInSet`, packed as `N × 8-byte LE`, and

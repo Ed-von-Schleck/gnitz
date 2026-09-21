@@ -266,3 +266,113 @@ def test_an_index_key_grows_with_its_sources_key_and_stays_exact(
     assert bag(rows(client, sn, q)) == {keys[0]: 1, keys[1]: 1}
     assert bag(rows(client, sn, f"SELECT {cols} FROM src WHERE payload = 200")) == \
         {keys[2]: 1}
+
+
+# ---------------------------------------------------------------------------
+# A literal against a key: the walk and the filter agree
+#
+# A key column's predicate is served by a walk over its OPK bytes, the same
+# predicate on a non-key column by the filter program. A literal outside the
+# column's type, or between two of its values, must mean the same on both.
+# ---------------------------------------------------------------------------
+
+_U64_KEYS = [0, 1, 2**63, U64_MAX]
+_OPS = [("=", lambda a, b: a == b), ("<>", lambda a, b: a != b), ("<", lambda a, b: a < b),
+        ("<=", lambda a, b: a <= b), (">", lambda a, b: a > b), (">=", lambda a, b: a >= b)]
+
+
+def test_a_u64_key_and_a_u64_column_agree_on_any_integer_literal(client, schema_name):
+    sn = schema_name
+    _seed(client, sn,
+          "CREATE TABLE t (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NOT NULL, "
+          "v BIGINT NOT NULL)",
+          ", ".join(f"({k}, {k}, {i})" for i, k in enumerate(_U64_KEYS)))
+    assert access(client, sn, "SELECT v FROM t WHERE k < -1") != "access: full scan"
+    for lit in [-5, -1, 0, U64_MAX, U64_MAX + 1]:
+        for op, holds in _OPS:
+            want = {(i,): 1 for i, k in enumerate(_U64_KEYS) if holds(k, lit)}
+            for col in ("k", "u"):
+                q = f"SELECT v FROM t WHERE {col} {op} {lit}"
+                assert bag(rows(client, sn, q)) == want, q
+
+
+def test_a_view_over_a_negative_bound_does_not_depend_on_backfill(client, schema_name):
+    """A view's backfill is bounded by the walk and its deltas pass the filter,
+    so a view created before the rows and one created after must agree."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (k BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql("CREATE VIEW none_before AS SELECT k FROM t WHERE k <= -1", schema_name=sn)
+    client.execute_sql("CREATE VIEW all_before AS SELECT k FROM t WHERE k > -1", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(f"({k}, {i})" for i, k in enumerate(_U64_KEYS)),
+        schema_name=sn)
+    client.execute_sql("CREATE VIEW none_after AS SELECT k FROM t WHERE k <= -1", schema_name=sn)
+    client.execute_sql("CREATE VIEW all_after AS SELECT k FROM t WHERE k > -1", schema_name=sn)
+    every = {(k,): 1 for k in _U64_KEYS}
+    assert bag(scanned(client, sn, "none_before")) == {}
+    assert bag(scanned(client, sn, "none_after")) == {}
+    assert bag(scanned(client, sn, "all_before")) == every
+    assert bag(scanned(client, sn, "all_after")) == every
+
+
+def test_a_date_literal_is_a_timestamp_keys_midnight(client, schema_name):
+    sn = schema_name
+    client.execute_sql("CREATE TABLE t (ts TIMESTAMP NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+                       schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (DATE '2020-01-02', 1)", schema_name=sn)
+    by_date = rows(client, sn, "SELECT ts, v FROM t WHERE ts = DATE '2020-01-02'")
+    by_ts = rows(client, sn, "SELECT ts, v FROM t WHERE ts = TIMESTAMP '2020-01-02 00:00:00'")
+    assert bag(by_date) == bag(by_ts) and len(by_date) == 1
+
+
+def test_a_fraction_bounds_an_integer_key_as_the_filter_does(client, schema_name):
+    sn = schema_name
+    keys = [-2, -1, 0, 1, 2, 3]
+    _seed(client, sn,
+          "CREATE TABLE t (k BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL)",
+          ", ".join(f"({k}, {k})" for k in keys))
+    assert access(client, sn, "SELECT k FROM t WHERE k < 1.5") != "access: full scan"
+    for pred, holds in [("< 1.5", lambda x: x < 1.5), ("> -1.5", lambda x: x > -1.5),
+                        ("= 1.5", lambda x: False), ("<> 1.5", lambda x: True)]:
+        want = {(k,): 1 for k in keys if holds(k)}
+        for col in ("k", "i"):
+            q = f"SELECT k FROM t WHERE {col} {pred}"
+            assert bag(rows(client, sn, q)) == want, q
+
+
+def test_a_decimal_column_reads_a_string_literal_at_its_scale(client, schema_name):
+    sn = schema_name
+    _seed(client, sn,
+          "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, d DECIMAL(10, 2) NOT NULL)",
+          "(1, 1.5), (2, 2.5)")
+    assert bag(rows(client, sn, "SELECT id FROM t WHERE d = '1.50'")) == {(1,): 1}
+
+
+def test_a_u64_column_and_a_signed_column_compare_by_value(client, schema_name):
+    sn = schema_name
+    pairs = [(U64_MAX, -1), (0, -1), (5, 5), (2**63, 2**63 - 1), (3, 7)]
+    _seed(client, sn,
+          "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NOT NULL, "
+          "i BIGINT NOT NULL)",
+          ", ".join(f"({n}, {u}, {i})" for n, (u, i) in enumerate(pairs)))
+    for op, holds in _OPS:
+        want = {(n,): 1 for n, (u, i) in enumerate(pairs) if holds(u, i)}
+        assert bag(rows(client, sn, f"SELECT id FROM t WHERE u {op} i")) == want, op
+
+
+def test_a_date_and_a_timestamp_meet_in_microseconds(client, schema_name):
+    sn = schema_name
+    _seed(client, sn,
+          "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, d DATE NOT NULL, "
+          "ts TIMESTAMP NOT NULL)",
+          "(1, 1, DATE '2020-01-02', TIMESTAMP '2020-01-02 00:00:00'), "
+          "(2, 0, DATE '2020-01-02', TIMESTAMP '2020-01-01 12:00:00'), "
+          "(3, 1, DATE '2020-01-02', TIMESTAMP '2020-01-02 12:00:00')")
+    assert bag(rows(client, sn, "SELECT id FROM t WHERE d > ts")) == {(2,): 1}
+    assert bag(rows(client, sn, "SELECT id FROM t WHERE d = ts")) == {(1,): 1}
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT id, CASE WHEN k = 1 THEN d ELSE ts END AS t FROM t", schema_name=sn)
+    want = rows(client, sn,
+                "SELECT id, CASE WHEN k = 1 THEN CAST(d AS TIMESTAMP) ELSE ts END AS t FROM t")
+    assert bag(scanned(client, sn, "v")) == bag(want)

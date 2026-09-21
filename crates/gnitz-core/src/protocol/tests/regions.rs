@@ -272,7 +272,7 @@ fn filter_over_the_region_path() {
     let ev = LogicalProgram::new(
         vec![
             LogicalInstr::LoadColInt { col: 2 },
-            LogicalInstr::LoadConst { val: 0 },
+            LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Output::Result(Reg(2)),

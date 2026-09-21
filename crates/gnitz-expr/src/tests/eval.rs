@@ -47,7 +47,10 @@ fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
         ],
         &[0],
     );
-    let instrs = vec![LogicalInstr::LoadConst { val: 7 }, LogicalInstr::LoadColStr { col: 2 }];
+    let instrs = vec![
+        LogicalInstr::LoadConst { val: 7, unsigned: false },
+        LogicalInstr::LoadColStr { col: 2 },
+    ];
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(0)), Sink::Reg(Reg(1))];
     let ev = map_prog(&in_schema, &out_schema, instrs, sinks, vec![]);
 
@@ -86,7 +89,7 @@ fn filter_ranges_collects_into_a_reused_buffer() {
         &schema,
         vec![
             LogicalInstr::LoadColInt { col: 1 },
-            LogicalInstr::LoadConst { val: 0 },
+            LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Reg(2),
@@ -112,7 +115,7 @@ fn filter_agrees_with_the_row_read() {
     // Pass iff col[1] > 15.
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },                       // r0 = col[1] (payload[0])
-        LogicalInstr::LoadConst { val: 15 },                       // r1 = 15
+        LogicalInstr::LoadConst { val: 15, unsigned: false },      // r1 = 15
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }, // r2 = r0 > r1
     ];
     let (ev, row_reader) = filter_and_scalar(&schema, instrs, Reg(2), vec![]);
@@ -139,7 +142,7 @@ fn filter_ranges_refuses_a_scalar_resolved_evaluator() {
     let mb = make_int_view(&schema, &[(1, 0, &[25])]);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 15 },
+        LogicalInstr::LoadConst { val: 15, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
     let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
@@ -153,7 +156,7 @@ fn eval_all_refuses_a_filter_resolved_evaluator() {
     let mb = make_int_view(&schema, &[(1, 0, &[25])]);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 15 },
+        LogicalInstr::LoadConst { val: 15, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
     let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
@@ -232,7 +235,7 @@ fn filter_range_case(schema: TestSchema) {
     );
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 0 },
+        LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
     let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
@@ -304,10 +307,10 @@ fn three_and_chain_boundary_sweep() {
     for (label, k0, value, null_at) in arrangements {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: 1 },                             // r0 = col0
-            LogicalInstr::LoadConst { val: k0 },                             // r1 = k0
+            LogicalInstr::LoadConst { val: k0, unsigned: false },            // r1 = k0
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },       // r2 = col0 > k0
             LogicalInstr::LoadColInt { col: 2 },                             // r3 = col1
-            LogicalInstr::LoadConst { val: 1 },                              // r4 = 1
+            LogicalInstr::LoadConst { val: 1, unsigned: false },             // r4 = 1
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(4) },       // r5 = col1 > 1
             LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(5) }, // r6 = r2 AND r5
             LogicalInstr::LoadColInt { col: 3 },                             // r7 = col2
@@ -355,7 +358,7 @@ fn bit_only_not_3vl_truth_table() {
         // Filter: NOT(col1 != 0). result_reg = NOT result (bit_only eligible).
         let instrs = vec![
             LogicalInstr::LoadColInt { col: 1 },                       // r0 = col1
-            LogicalInstr::LoadConst { val: 0 },                        // r1 = 0
+            LogicalInstr::LoadConst { val: 0, unsigned: false },       // r1 = 0
             LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = bool(col1)
             LogicalInstr::BoolNot { a: Reg(2) },                       // r3 = NOT r2
         ];
@@ -447,7 +450,7 @@ fn bool_not_tail_mask() {
         let mb = make_n_col_view(&schema, n, |row, _| (row % 3) as i64 - 1, |row, _| row % 5 == 0);
         let instrs = vec![
             LogicalInstr::LoadColInt { col: 1 },
-            LogicalInstr::LoadConst { val: 0 },
+            LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Ge, a: Reg(0), b: Reg(1) },
             LogicalInstr::BoolNot { a: Reg(2) },
         ];
@@ -550,8 +553,8 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
             (
                 vec![
                     is_null_op(1),
-                    LogicalInstr::LoadConst { val: 1 },
-                    LogicalInstr::LoadConst { val: 0 },
+                    LogicalInstr::LoadConst { val: 1, unsigned: false },
+                    LogicalInstr::LoadConst { val: 0, unsigned: false },
                     LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
                 ],
                 Reg(3),
@@ -704,7 +707,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             (
                 vec![
                     LogicalInstr::LoadColInt { col: 1 },
-                    LogicalInstr::LoadConst { val: 0 },
+                    LogicalInstr::LoadConst { val: 0, unsigned: false },
                     LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
                 ],
                 Reg(2),
@@ -716,7 +719,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             (
                 vec![
                     LogicalInstr::LoadColFloat { col: 2 },
-                    LogicalInstr::LoadConst { val: 3 },
+                    LogicalInstr::LoadConst { val: 3, unsigned: false },
                     LogicalInstr::IntToFloat { a: Reg(1) },
                     LogicalInstr::FCmp { op: CmpOp::Gt, a: Reg(0), b: Reg(2) },
                 ],
@@ -956,7 +959,7 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
     let mb = make_n_col_view(&schema, n, |_, col| if col == 0 { 10 } else { 0 }, |_, col| col == 0);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 5 },
+        LogicalInstr::LoadConst { val: 5, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
@@ -993,7 +996,7 @@ fn and_chain_null_and_false_per_row() {
     let mb = make_n_col_view(&schema, 2, value, |row, col| row == 0 && col == 1);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 0 },
+        LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
@@ -1031,10 +1034,10 @@ fn and_chain_survivors_agree_across_arms() {
     // col0 = -1 AND col1 > 0 AND col2 > 0  (const regs: -1 and 0)
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: -1 },
+        LogicalInstr::LoadConst { val: -1, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
-        LogicalInstr::LoadConst { val: 0 },
+        LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(4) },
         LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(5) },
         LogicalInstr::LoadColInt { col: 3 },
@@ -1227,8 +1230,8 @@ fn eval_all_reports_one_result_per_row_in_its_own_class() {
 }
 
 /// `result_is_u64` reports the result register's resolve-time U64 tracking: a
-/// U64 load and arithmetic over one are unsigned; a signed load, a comparison and
-/// a cast to a signed type are not.
+/// U64 load, an unsigned constant and arithmetic over one are unsigned; a signed
+/// load or constant, a comparison and a cast to a signed type are not.
 #[test]
 fn result_is_u64_follows_the_result_register() {
     use gnitz_wire::FixedInt;
@@ -1239,7 +1242,7 @@ fn result_is_u64_follows_the_result_register() {
     let u64_plus_one = |last: LogicalInstr| {
         vec![
             LogicalInstr::LoadColInt { col: 1 },
-            LogicalInstr::LoadConst { val: 1 },
+            LogicalInstr::LoadConst { val: 1, unsigned: false },
             last,
         ]
     };
@@ -1256,6 +1259,18 @@ fn result_is_u64_follows_the_result_register() {
             true,
         ),
         ("i64 load", vec![LogicalInstr::LoadColInt { col: 2 }], Reg(0), false),
+        (
+            "unsigned constant",
+            vec![LogicalInstr::LoadConst { val: -1, unsigned: true }],
+            Reg(0),
+            true,
+        ),
+        (
+            "signed constant",
+            vec![LogicalInstr::LoadConst { val: -1, unsigned: false }],
+            Reg(0),
+            false,
+        ),
         (
             "u64 > 1",
             u64_plus_one(LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }),

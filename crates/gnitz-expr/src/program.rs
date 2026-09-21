@@ -326,6 +326,19 @@ gnitz_wire::wire_enum! {
     }
 }
 
+impl CmpOp {
+    /// `x OP y` ⟺ `y OP.converse() x`.
+    pub fn converse(self) -> CmpOp {
+        match self {
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Ge => CmpOp::Le,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Eq | CmpOp::Ne => self,
+        }
+    }
+}
+
 gnitz_wire::wire_enum! {
     /// Pure float unary transform: its operand's IEEE result, propagating the
     /// operand's null bit and producing no NULL of its own — `SQRT(-1)` is NaN
@@ -518,8 +531,10 @@ pub enum LogicalInstr {
     LoadColFloat {
         col: u32,
     },
+    /// `unsigned`: `val`'s bits are a `u64`, and the register is U64-tracked.
     LoadConst {
         val: i64,
+        unsigned: bool,
     },
     IntArith {
         op: IntArithOp,
@@ -790,10 +805,20 @@ pub enum LogicalInstr {
 // Instr — the resolved/evaluable form (physical payload/PK indices)
 // ---------------------------------------------------------------------------
 
+/// How a `Cmp` reads its two registers' bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntOrder {
+    Signed,
+    Unsigned,
+    /// `a` is unsigned and `b` signed; resolve swaps a signed/unsigned pair into
+    /// this orientation.
+    UnsignedSigned,
+}
+
 /// One resolved, evaluable instruction. `signed` flags carry the result of the
 /// per-register U64 type tracking: `signed: false` selects the unsigned path on
-/// `Cmp`, on `IntArith`'s `Div` and `Mod`, and on `IntToFloat`, reinterpreting
-/// the i64 register as u64.
+/// `IntArith`'s `Div` and `Mod` and on `IntToFloat`, reinterpreting the i64
+/// register as u64; `Cmp` carries the pair's [`IntOrder`].
 ///
 /// Operands and null behaviour are classified on [`LogicalInstr`], by
 /// [`operands`]. A variant here with no 1:1 logical counterpart therefore
@@ -837,7 +862,7 @@ pub(crate) enum Instr {
         dst: u16,
         a: u16,
         b: u16,
-        signed: bool,
+        order: IntOrder,
     },
     FCmp {
         op: CmpOp,
@@ -1113,9 +1138,9 @@ impl LogicalInstr {
         match self {
             L::LoadColInt { col: c } => col(ExprOp::LoadColInt, 0, c),
             L::LoadColFloat { col: c } => col(ExprOp::LoadColFloat, 0, c),
-            L::LoadConst { val } => {
+            L::LoadConst { val, unsigned } => {
                 let (lo, hi) = encode_load_const(val);
-                [ExprOp::LoadConst.as_wire(), 0, lo, hi, 0]
+                [ExprOp::LoadConst.as_wire(), unsigned as u32, lo, hi, 0]
             }
             L::IntArith { op, a, b } => bin(ExprOp::IntArith, op.as_wire(), a, b),
             L::FloatArith { op, a, b } => bin(ExprOp::FloatArith, op.as_wire(), a, b),
@@ -1514,7 +1539,10 @@ impl LogicalProgram {
         Ok(match op {
             ExprOp::LoadColInt => no_sel(L::LoadColInt { col: w(2) })?,
             ExprOp::LoadColFloat => no_sel(L::LoadColFloat { col: w(2) })?,
-            ExprOp::LoadConst => no_sel(L::LoadConst { val: decode_load_const(w(2), w(3)) })?,
+            ExprOp::LoadConst => L::LoadConst {
+                val: decode_load_const(w(2), w(3)),
+                unsigned: flag(opw, sel)?,
+            },
             ExprOp::IntArith => L::IntArith {
                 op: IntArithOp::from_wire(sel).ok_or_else(bad_sel)?,
                 a,
@@ -1767,7 +1795,7 @@ impl LogicalProgram {
                         other => unreachable!("validated LoadColFloat names F32/F64, got {other}"),
                     }
                 }
-                L::LoadConst { val } => {
+                L::LoadConst { val, .. } => {
                     const_regs.push((dst, val));
                     continue;
                 }
@@ -1776,12 +1804,26 @@ impl LogicalProgram {
                 // tracking.
                 L::IntArith { op, a: Reg(a), b: Reg(b) } => I::IntArith { op, dst, a, b, signed: !is_u64(dst) },
                 L::FloatArith { op, a: Reg(a), b: Reg(b) } => I::FloatArith { op, dst, a, b },
-                L::Cmp { op, a: Reg(a), b: Reg(b) } => {
-                    // EQ/NE are bit-identical signed/unsigned; ordered compares
-                    // pick the unsigned form when either operand is U64.
-                    let signed = matches!(op, CmpOp::Eq | CmpOp::Ne) || !(is_u64(a) || is_u64(b));
-                    I::Cmp { op, dst, a, b, signed }
-                }
+                // Each operand is read with its own signedness, so a U64 value past
+                // 2^63 never equals or orders against a negative one.
+                L::Cmp { op, a: Reg(a), b: Reg(b) } => match (is_u64(a), is_u64(b)) {
+                    (false, false) => I::Cmp { op, dst, a, b, order: IntOrder::Signed },
+                    (true, true) => I::Cmp { op, dst, a, b, order: IntOrder::Unsigned },
+                    (true, false) => I::Cmp {
+                        op,
+                        dst,
+                        a,
+                        b,
+                        order: IntOrder::UnsignedSigned,
+                    },
+                    (false, true) => I::Cmp {
+                        op: op.converse(),
+                        dst,
+                        a: b,
+                        b: a,
+                        order: IntOrder::UnsignedSigned,
+                    },
+                },
                 L::FCmp { op, a: Reg(a), b: Reg(b) } => I::FCmp { op, dst, a, b },
                 L::FloatUnary { op, a: Reg(a) } => I::FloatUnary { op, dst, a },
                 L::IntUnary { op, a: Reg(a) } => I::IntUnary { op, dst, a, signed: !is_u64(a) },
@@ -2189,7 +2231,8 @@ enum WriteAs {
 enum U64Rule {
     /// The verdict the opcode already knows: `false` for a float image or an
     /// integer the opcode itself bounds below 2^63 (a length, a parse of a
-    /// signed target), and for a cast, whether its target names U64.
+    /// signed target); for a cast, whether its target names U64; for a
+    /// constant, its own flag.
     Fixed(bool),
     /// U64 iff any [`ReadAs::Value`] operand is. `ReadAs::Bool` operands are
     /// excluded — SELECT's condition is a truth bit, not part of its result.
@@ -2367,7 +2410,7 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::IntInSet { value_reg, set_idx } => writes(WBool)
             .reading(value_reg, RVal)
             .with_extra(Extra::IntSet(set_idx)),
-        L::LoadConst { val: _ } => writes(WVal(Fixed(false))),
+        L::LoadConst { val: _, unsigned } => writes(WVal(Fixed(unsigned))),
         // A NULL on every row.
         L::LoadNull => writes(WVal(Fixed(false))).may_null(),
 

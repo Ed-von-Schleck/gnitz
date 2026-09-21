@@ -138,7 +138,7 @@ fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
     let mut eb = gnitz_expr::ExprBuilder::new();
     let (a, b) = (
         eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: col as u32 }),
-        eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lit }),
+        eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lit, unsigned: false }),
     );
     let r = eb.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Lt, a, b });
     eb.build(Some(r)).expect("a well-formed program").to_blob_bytes()

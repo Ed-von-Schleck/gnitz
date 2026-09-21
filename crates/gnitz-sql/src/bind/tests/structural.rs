@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::NumLit;
 use crate::test_support::parse_expr_sql;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 

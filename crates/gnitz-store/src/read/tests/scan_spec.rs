@@ -651,8 +651,8 @@ fn survivors_membership_bench() {
         "predicate" => {
             let mut eb = ExprBuilder::new();
             let v = eb.emit(LogicalInstr::LoadColInt { col: 1 });
-            let lo_c = eb.emit(LogicalInstr::LoadConst { val: 0 });
-            let hi_c = eb.emit(LogicalInstr::LoadConst { val: hi });
+            let lo_c = eb.emit(LogicalInstr::LoadConst { val: 0, unsigned: false });
+            let hi_c = eb.emit(LogicalInstr::LoadConst { val: hi, unsigned: false });
             let ge = eb.emit(LogicalInstr::Cmp { op: CmpOp::Ge, a: v, b: lo_c });
             let lt = eb.emit(LogicalInstr::Cmp { op: CmpOp::Lt, a: v, b: hi_c });
             let both = eb.emit(LogicalInstr::BoolBinary { a: ge, b: lt, is_or: false });

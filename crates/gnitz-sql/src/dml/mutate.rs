@@ -7,20 +7,18 @@
 //! compiles each value, [`apply_set`] rewrites a batch — is shared with INSERT's
 //! `ON CONFLICT DO UPDATE`.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
-use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_ident, Constant, FromShape};
+use crate::ast_util::{classify_from, extract_table_name_and_alias, single_part_ident, FromShape};
 use crate::bind::{bind_single_table, find_unique_column};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
-use crate::codec::pk_codec::pack_num;
 use crate::codec::project_schema::key_reply;
 use crate::dml::overlay::resolve_where_matches;
 use crate::dml::plan::{bind_where, bound_and_predicate};
 use crate::dml::rmw::commit_rmw_or_buffer;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::ir::{BExpr, BoundExpr, NumLit};
+use crate::ir::BoundExpr;
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses, require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
@@ -190,9 +188,9 @@ pub(crate) fn classify_set_rhs(
 ) -> Result<SetRhs, GnitzSqlError> {
     let col = &schema.columns[target];
     let ty = col.ty();
-    if let Some(c) = literal_constant(expr) {
+    if expr.is_literal() {
         let (mut cell, mut spill) = (Vec::new(), Vec::new());
-        append_value_to_col(&mut cell, &mut spill, ty, &c)?;
+        append_value_to_col(&mut cell, &mut spill, col, expr)?;
         return Ok(SetRhs::Const {
             cell,
             spill,
@@ -243,27 +241,6 @@ pub(crate) fn classify_set_rhs(
         )));
     }
     Ok(SetRhs::Expr { scope, ev: Box::new(ev) })
-}
-
-/// `expr` as the constant an INSERT cell binds. A `Constant` carries a wide
-/// literal's sign in `negated`; the binder folds it into the `NumLit`, so it is
-/// split back out.
-fn literal_constant(expr: &BoundExpr) -> Option<Constant> {
-    Some(match expr {
-        BoundExpr::LitWide(n) => Constant {
-            lit: BExpr::LitWide(NumLit { mag: n.mag, neg: false }),
-            negated: n.neg,
-        },
-        BoundExpr::LitInt(_)
-        | BoundExpr::LitFloat { .. }
-        | BoundExpr::LitStr(_)
-        | BoundExpr::LitTemporal { .. }
-        | BoundExpr::LitNull => Constant {
-            lit: expr.try_rebuild::<Infallible, ()>(&mut |_| Err(())).ok()?,
-            negated: false,
-        },
-        _ => return None,
-    })
 }
 
 /// `rows` with every assigned column rewritten and every row at weight +1. Every
@@ -320,14 +297,18 @@ pub(crate) fn apply_set(
                 match ev.eval_all(scoped(*scope)) {
                     ExprResults::Scalar(vals) => {
                         let unsigned = ev.result_is_u64();
+                        let fi = FixedInt::from_type_code(tc)
+                            .expect("classify_set_rhs admits a scalar only into a FixedInt column");
+                        let (min, max) = fi.range();
                         for (w, v) in nulls.iter_mut().zip(vals) {
                             set_null(w, pi, v.is_none(), def)?;
                             let v = v.map_or(0, |x| if unsigned { i128::from(x as u64) } else { i128::from(x) });
-                            let packed = pack_num(tc, NumLit::of_i128(v))
-                                .ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {v}")))?;
+                            if !(min..=max).contains(&v) {
+                                return Err(GnitzSqlError::Bind(format!("{tc:?} value out of range: {v}")));
+                            }
                             payload[pi]
                                 .bytes
-                                .extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
+                                .extend_from_slice(&fi.pack(v).to_le_bytes()[..fi.width()]);
                         }
                     }
                     ExprResults::Str { bytes, spans } => {

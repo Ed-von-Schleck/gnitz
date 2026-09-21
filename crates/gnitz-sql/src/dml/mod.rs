@@ -33,6 +33,8 @@ mod select;
 pub(crate) use explain::execute_explain;
 pub use explain::explain_lines;
 pub(crate) use insert::execute_insert;
+#[cfg(test)]
+pub(crate) use insert::PkPlan;
 pub(crate) use mutate::{execute_delete, execute_update};
 pub(crate) use select::execute_select;
 pub use select::{plan_read, ReadPlan};

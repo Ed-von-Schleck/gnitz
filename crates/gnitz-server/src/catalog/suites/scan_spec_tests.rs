@@ -640,7 +640,7 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
         let mut eb = gnitz_expr::ExprBuilder::new();
         let (v, two) = (
             eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 1 }),
-            eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: 2 }),
+            eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: 2, unsigned: false }),
         );
         let doubled = eb.emit(gnitz_expr::LogicalInstr::IntArith {
             op: gnitz_expr::IntArithOp::Mul,

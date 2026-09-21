@@ -204,7 +204,7 @@ fn filter_keeps_exactly_the_matching_rows() {
     ];
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 10 },
+        LogicalInstr::LoadConst { val: 10, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
     let func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
@@ -222,7 +222,7 @@ fn filter_keeps_exactly_the_matching_rows() {
     let all_pass = LogicalProgram::new(
         vec![
             LogicalInstr::LoadColInt { col: 1 },
-            LogicalInstr::LoadConst { val: -1 },
+            LogicalInstr::LoadConst { val: -1, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Output::Result(Reg(2)),

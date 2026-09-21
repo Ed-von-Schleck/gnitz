@@ -772,38 +772,53 @@ fn in_list_non_literal_item_falls_back_to_or_chain() {
     );
 }
 
-/// A float-literal item forces the OR-chain even for an int operand
-/// (`a IN (1, 2.5)`).
+/// A fractional item names no integer, so it drops out of the set; a literal
+/// that places nowhere (`1e400`, past every decimal) keeps the OR chain.
 #[test]
-fn in_list_float_literal_item_falls_back_to_or_chain() {
+fn in_list_places_its_items_among_the_operand_values() {
     let schema = two_int_schema();
     let prog = compile_bound_expr_to_program(
-        &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), lit("2.5")]),
+        &in_list(BoundExpr::ColRef(1), vec![lit("1.5"), BoundExpr::LitInt(2)]),
         &schema.columns,
     )
     .unwrap();
-    assert!(
-        !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
-        "a float-literal item must not emit IntInSet"
-    );
+    assert!(has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })));
+    assert_eq!(prog.const_strings(), [gnitz_wire::as_le_bytes(&[2i64]).to_vec()]);
+
+    let prog = compile_bound_expr_to_program(
+        &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), lit("1e400")]),
+        &schema.columns,
+    )
+    .unwrap();
+    assert!(!has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })));
 }
 
-/// A surviving `LitWide` literal (an un-servable wide comparison, e.g.
-/// `non_indexed_u64 = 18446744073709551615`) rejects at the compile boundary,
-/// naming the literal and the places it is usable.
+/// A wide literal against a 64-bit column is decided by where it falls; one
+/// that no register holds is refused anywhere else, naming where it is usable.
 #[test]
-fn lit_wide_rejects_at_compile_boundary() {
+fn lit_wide_is_placed_or_rejected_at_compile_boundary() {
     let schema = two_int_schema(); // (pk U64, a I64, b I64)
     let expr = BoundExpr::bin(
         BoundExpr::ColRef(1),
         BinOp::Eq,
         BoundExpr::LitWide(NumLit { mag: u64::MAX.into(), neg: false }),
     );
+    let prog = compile_bound_expr_to_program(&expr, &schema.columns).unwrap();
+    assert!(matches!(
+        prog.instrs(),
+        [L::LoadColInt { col: 1 }, L::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(0) }]
+    ));
+
+    let expr = BoundExpr::bin(
+        BoundExpr::ColRef(1),
+        BinOp::Add,
+        BoundExpr::LitWide(NumLit { mag: 1 << 64, neg: false }),
+    );
     let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err("wide literal must not compile");
     match err {
         GnitzSqlError::Unsupported(msg) => {
             assert!(msg.contains("does not fit a 64-bit register"), "message: {msg}");
-            assert!(msg.contains("18446744073709551615"), "message names the literal: {msg}");
+            assert!(msg.contains("18446744073709551616"), "message names the literal: {msg}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -1252,7 +1267,7 @@ fn power_lifts_both_operands_to_float() {
     assert!(
         has(
             &instrs,
-            |i| matches!(i, &L::LoadConst { val } if f64::from_bits(val as u64) == 2.0)
+            |i| matches!(i, &L::LoadConst { val, unsigned: false } if f64::from_bits(val as u64) == 2.0)
         ),
         "{instrs:?}"
     );
@@ -1387,7 +1402,10 @@ fn filter_program_drops_true_constant_conjuncts_in_any_position() {
     assert_eq!(instrs(&[&t, &gt, &t]), Some(alone));
     assert_eq!(instrs(&[&t, &t]), None);
     assert_eq!(instrs(&[]), None);
-    assert!(matches!(instrs(&[&f]).as_deref(), Some([L::LoadConst { val: 0 }])));
+    assert!(matches!(
+        instrs(&[&f]).as_deref(),
+        Some([L::LoadConst { val: 0, unsigned: false }])
+    ));
 }
 
 /// A conjunct its connectives settle true over literals is dropped; one they
@@ -1651,10 +1669,263 @@ fn a_comparison_against_a_finer_literal_is_exact() {
             instrs[..],
             [
                 L::LoadColInt { .. },
-                L::LoadConst { val: 101 },
+                L::LoadConst { val: 101, unsigned: false },
                 L::Cmp { op: CmpOp::Lt, .. }
             ]
         ),
         "{instrs:?}"
     );
+}
+
+// ------------------------------------------------------------------
+// Comparisons against a literal, and mixed-type operands, against the exact
+// answer
+// ------------------------------------------------------------------
+
+/// `(pk U64, c1, c2, …)` with the payload columns of types `tcs`, all nullable.
+fn typed_schema(tcs: &[TypeCode]) -> Schema {
+    let mut columns = vec![ColumnDef::new("pk", TypeCode::U64, false)];
+    columns.extend(tcs.iter().enumerate().map(|(i, tc)| col(&format!("c{}", i + 1), *tc)));
+    Schema { columns, pk_cols: vec![0] }
+}
+
+/// `sql` bound over [`typed_schema`] and evaluated on each row, given as the
+/// payload columns' values (`None` is NULL).
+fn eval_sql_rows(sql: &str, tcs: &[TypeCode], rows: &[Vec<Option<i128>>]) -> Vec<Option<i64>> {
+    let schema = typed_schema(tcs);
+    let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t")
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut batch = gnitz_core::ZSetBatch::new(&schema);
+    for (r, row) in rows.iter().enumerate() {
+        batch.pks.push_u128(&schema, r as u128);
+        batch.weights.push(1);
+        let mut nulls = 0u64;
+        for (pi, (v, tc)) in row.iter().zip(tcs).enumerate() {
+            let fi = FixedInt::from_type_code(*tc).expect("an integer-stored column");
+            match v {
+                Some(v) => batch.payload[pi]
+                    .bytes
+                    .extend_from_slice(&fi.pack(*v).to_le_bytes()[..fi.width()]),
+                None => {
+                    batch.payload[pi].push_zero();
+                    gnitz_wire::null_word_set(&mut nulls, pi, true);
+                }
+            }
+        }
+        batch.nulls.push(nulls);
+    }
+    let ev = compile_scalar_evaluator(&expr, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    match ev.eval_all(&batch) {
+        gnitz_expr::ExprResults::Scalar(vals) => vals,
+        gnitz_expr::ExprResults::Str { .. } => panic!("a scalar expression"),
+    }
+}
+
+const CMP_SQL: [(&str, &str); 6] = [
+    ("=", "="),
+    ("<>", "<>"),
+    ("<", ">"),
+    ("<=", ">="),
+    (">", "<"),
+    (">=", "<="),
+];
+
+fn holds(op: &str, a: i128, b: i128) -> bool {
+    match op {
+        "=" => a == b,
+        "<>" => a != b,
+        "<" => a < b,
+        "<=" => a <= b,
+        ">" => a > b,
+        _ => a >= b,
+    }
+}
+
+/// Every operator in both operand orders, `c1` against each literal, on each
+/// row: the VM's answer is the exact one, and a NULL row stays NULL.
+fn assert_literal_compares_exact(tc: TypeCode, lits: &[&str], rows: &[Option<i128>]) {
+    let table: Vec<Vec<Option<i128>>> = rows.iter().map(|v| vec![*v]).collect();
+    for text in lits {
+        let (mag, s) = gnitz_wire::decimal::decimal_of_number_text(text.trim_start_matches('-')).expect(text);
+        let v = if text.starts_with('-') { -mag } else { mag };
+        let scale = 10i128.pow(u32::from(s));
+        for (op, conv) in CMP_SQL {
+            let want: Vec<Option<i64>> = rows
+                .iter()
+                .map(|x| x.map(|x| i64::from(holds(op, x * scale, v))))
+                .collect();
+            for sql in [format!("c1 {op} {text}"), format!("{text} {conv} c1")] {
+                assert_eq!(eval_sql_rows(&sql, &[tc], &table), want, "{tc:?}: {sql}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_u64_column_against_a_literal_outside_its_range_is_exact() {
+    let top = i128::from(u64::MAX);
+    assert_literal_compares_exact(
+        TypeCode::U64,
+        &[
+            "-5",
+            "-1",
+            "0",
+            "1",
+            "9223372036854775808",
+            "18446744073709551615",
+            "18446744073709551616",
+        ],
+        &[Some(0), Some(1), Some(1 << 63), Some((1 << 63) - 1), Some(top), None],
+    );
+}
+
+#[test]
+fn an_i8_column_against_its_edges_is_exact() {
+    assert_literal_compares_exact(
+        TypeCode::I8,
+        &["-129", "-128", "127", "128"],
+        &[Some(-128), Some(-1), Some(0), Some(127), None],
+    );
+}
+
+#[test]
+fn a_bigint_column_against_a_fraction_is_exact() {
+    let p53 = 1i128 << 53;
+    assert_literal_compares_exact(
+        TypeCode::I64,
+        &[
+            "1.5",
+            "-1.5",
+            "2.5",
+            "-2.5",
+            "9007199254740993.5",
+            "-9007199254740992.5",
+        ],
+        &[
+            Some(-3),
+            Some(-2),
+            Some(-1),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(p53),
+            Some(p53 + 1),
+            Some(p53 + 2),
+            Some(-p53 - 1),
+            None,
+        ],
+    );
+}
+
+/// The shapes where one side's type or range cannot be read off the literal.
+#[test]
+fn a_literal_comparison_reads_the_operand_it_meets() {
+    let one = |sql: &str, tcs: &[TypeCode], row: Vec<Option<i128>>| eval_sql_rows(sql, tcs, &[row])[0];
+    // The elided cast keeps its U64 tracking, so the constant compares unsigned.
+    assert_eq!(
+        one(
+            "CAST(5 AS BIGINT UNSIGNED) < 18446744073709551615",
+            &[TypeCode::I64],
+            vec![Some(0)]
+        ),
+        Some(1)
+    );
+    // A computed DATE is an unchecked i64 register, so no range is assumed.
+    assert_eq!(
+        one("COALESCE(c1, 3000000000) = 3000000000", &[TypeCode::Date], vec![None]),
+        Some(1)
+    );
+    // Two literals: the typed one is the operand.
+    assert_eq!(
+        one("'2020-01-01' = DATE '2020-01-01'", &[TypeCode::I64], vec![Some(0)]),
+        Some(1)
+    );
+}
+
+/// A U64 and a signed operand each read with their own signedness.
+#[test]
+fn a_u64_and_a_signed_column_compare_exactly() {
+    let top = i128::from(u64::MAX);
+    let pairs = [(top, -1), (0, -1), (1, 1), (1 << 63, i128::from(i64::MAX)), (5, 7)];
+    let rows: Vec<Vec<Option<i128>>> = pairs.iter().map(|&(u, i)| vec![Some(u), Some(i)]).collect();
+    for (op, _) in CMP_SQL {
+        let want: Vec<Option<i64>> = pairs.iter().map(|&(u, i)| Some(i64::from(holds(op, u, i)))).collect();
+        let sql = format!("c1 {op} c2");
+        assert_eq!(
+            eval_sql_rows(&sql, &[TypeCode::U64, TypeCode::I64], &rows),
+            want,
+            "{sql}"
+        );
+    }
+}
+
+/// An unsigned constant lifts to the float it is.
+#[test]
+fn a_float_compare_lifts_a_u64_literal_unsigned() {
+    let schema = typed_schema(&[TypeCode::F64]);
+    let expr = crate::bind::bind_single_table(
+        &crate::test_support::parse_expr_sql("c1 < 18446744073709551615"),
+        &schema,
+        "t",
+    )
+    .unwrap();
+    let instrs = lower_instrs(&expr, &schema);
+    assert!(has(
+        &instrs,
+        |i| matches!(i, L::LoadConst { val, .. } if f64::from_bits(*val as u64) == 1.8446744073709552e19)
+    ));
+}
+
+/// A U64 value is range-cast to the i64 a DECIMAL is before it is scaled, so a
+/// negation of the product reads signed.
+#[test]
+fn a_u64_operand_of_a_decimal_is_signed() {
+    assert_eq!(
+        eval_sql_rows("-(c1 * 1.5) < 0", &[TypeCode::U64], &[vec![Some(2)]]),
+        vec![Some(1)]
+    );
+}
+
+/// DATE and TIMESTAMP meet at TIMESTAMP: a comparison and a difference read
+/// both in microseconds, and a CASE mixing them is a TIMESTAMP.
+#[test]
+fn a_date_meets_a_timestamp_in_microseconds() {
+    let day = i128::from(gnitz_expr::calendar::MICROS_PER_DAY);
+    let tcs = [TypeCode::Date, TypeCode::Timestamp, TypeCode::I64];
+    // d = day 10; ts = day 10 at midnight, and at noon.
+    let rows = vec![
+        vec![Some(10), Some(10 * day), Some(1)],
+        vec![Some(10), Some(10 * day + day / 2), Some(0)],
+    ];
+    assert_eq!(eval_sql_rows("c1 = c2", &tcs, &rows), vec![Some(1), Some(0)]);
+    assert_eq!(eval_sql_rows("c1 > c2", &tcs, &rows), vec![Some(0), Some(0)]);
+    assert_eq!(eval_sql_rows("c1 < c2", &tcs, &rows), vec![Some(0), Some(1)]);
+    let half = (day / 2) as i64;
+    assert_eq!(eval_sql_rows("c2 - c1", &tcs, &rows), vec![Some(0), Some(half)]);
+    let case = "CASE WHEN c3 = 1 THEN c1 ELSE c2 END";
+    assert_eq!(
+        eval_sql_rows(case, &tcs, &rows),
+        vec![Some((10 * day) as i64), Some((10 * day + day / 2) as i64)]
+    );
+    let schema = typed_schema(&tcs);
+    let bound = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(case), &schema, "t").unwrap();
+    assert_eq!(bound.infer_ty(&schema.columns).tc, TypeCode::Timestamp);
+}
+
+/// Arithmetic with no temporal meaning, and a temporal value blended with a
+/// non-temporal type, are refused.
+#[test]
+fn temporal_arithmetic_outside_the_allow_list_is_refused() {
+    let schema = typed_schema(&[TypeCode::Date, TypeCode::Timestamp, TypeCode::I64]);
+    for (sql, needle) in [
+        ("c1 * 2", "not supported on a DATE/TIMESTAMP operand"),
+        ("c2 / 1000000", "not supported on a DATE/TIMESTAMP operand"),
+        ("5 - c1", "not supported on a DATE/TIMESTAMP operand"),
+        ("c1 + c1", "not supported on a DATE/TIMESTAMP operand"),
+        ("CASE WHEN c3 = 1 THEN c1 ELSE 1.5 END", "cannot mix DATE with F64"),
+    ] {
+        let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t").unwrap();
+        let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err(sql);
+        assert!(err.to_string().contains(needle), "{sql}: {err}");
+    }
 }

@@ -6,12 +6,13 @@
 //! like an `UPDATE ... SET`.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 
-use crate::ast_util::{bind_constant, extract_object_name, single_part_ident, Constant};
+use crate::ast_util::{extract_object_name, single_part_ident};
+use crate::bind::structural::bind_constant;
 use crate::bind::{bind_single_table, find_unique_column};
-use crate::codec::colwrite::{append_value_to_col, check_not_null};
-use crate::codec::pk_codec::PkPlan;
+use crate::codec::colwrite::{append_value_to_col, check_not_null, native_value};
 use crate::dml::mutate::{apply_set, bind_set_list, classify_set_rhs, Scope, SetCol, SetRhs};
 use crate::dml::overlay::{Conflict, KeyProbe};
 use crate::dml::plan::{rows_reply, RowsReply};
@@ -21,7 +22,7 @@ use crate::exec::client_map::ClientMap;
 use crate::ir::{BExpr, BoundExpr};
 use crate::validate::{reject_unhonored_insert_clauses, require_class, ClassWant};
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, RelClass, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{FixedInt, GnitzClient, PkColumn, RelClass, Schema, TypeCode, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
     ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query, SetExpr,
     TableObject, Values,
@@ -212,16 +213,16 @@ pub(crate) fn execute_insert(
     // One bound cell per VALUES slot, reused across rows and read by both
     // consumers below, so a row's PK slot and payload slot cannot disagree on
     // what a written constant is.
-    let mut cells: Vec<Constant> = Vec::new();
+    let mut cells: Vec<BExpr<Infallible>> = Vec::new();
     // The row count is known here, so a SERIAL statement's ids come from one
     // durable advance and each row stamps `base + i`. A row failing the arity
     // guard below abandons the rest — a wider gap of the same intentional kind.
     let pk_plan = match serial_ci {
         Some(ci) => PkPlan::serial(
-            schema,
             client.reserve_serial_ids(tid, n as u64)?,
+            n,
             schema.columns[ci].type_code,
-        ),
+        )?,
         None => PkPlan::written(&slot_of, schema)?,
     };
 
@@ -230,7 +231,7 @@ pub(crate) fn execute_insert(
         // count, in either direction — too few values, or excess trailing ones.
         // This guard makes every per-column index below in-bounds.
         if row.len() != expected {
-            let hint = if pk_plan.is_serial() {
+            let hint = if serial_ci.is_some() {
                 " (its SERIAL primary key is auto-assigned)"
             } else {
                 ""
@@ -247,7 +248,7 @@ pub(crate) fn execute_insert(
         for e in row.iter() {
             cells.push(bind_constant(e)?);
         }
-        pk_plan.push(row_i, &cells, &mut batch.pks)?;
+        pk_plan.push(schema, row_i, &cells, &mut batch.pks)?;
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
@@ -262,7 +263,7 @@ pub(crate) fn execute_insert(
             // Read off the *bound* constant, so `+NULL` is the NULL it spells;
             // a column the list left out is NULL too.
             let cell = slot_of[ci].map(|s| &cells[s]);
-            let is_null = cell.is_none_or(|c| matches!(c.lit, BExpr::LitNull));
+            let is_null = cell.is_none_or(|c| matches!(c, BExpr::LitNull));
             // The check is here for the *conflicting* row of an ON CONFLICT DO
             // UPDATE: its incoming NULL is consumed into the merged row and is
             // never pushed, so the wire boundary's own check never sees it.
@@ -272,7 +273,7 @@ pub(crate) fn execute_insert(
             }
             let ZSetBatch { payload: cols, blob, .. } = &mut batch;
             match cell {
-                Some(c) => append_value_to_col(&mut cols[payload_idx].bytes, blob, col_def.ty(), c)?,
+                Some(c) => append_value_to_col(&mut cols[payload_idx].bytes, blob, col_def, c)?,
                 // `append_value_to_col` encodes a written NULL as exactly this.
                 None => cols[payload_idx].push_zero(),
             }
@@ -461,6 +462,72 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
         _ => Err(GnitzSqlError::Unsupported(
             "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string(),
         )),
+    }
+}
+
+/// Where each INSERT row's PK comes from, resolved once per statement.
+pub(crate) enum PkPlan {
+    /// SERIAL: row `i` takes `base + i`; exhaustion is checked once, at construction.
+    Serial { base: u64 },
+    /// Written: per PK column in pk-list order, the VALUES slot it reads.
+    Written { slots: Vec<usize> },
+}
+
+impl PkPlan {
+    /// `n` rows drawn from `base`, refused when the last exceeds the type `tc`.
+    pub(crate) fn serial(base: u64, n: usize, tc: TypeCode) -> Result<Self, GnitzSqlError> {
+        let max = FixedInt::from_type_code(tc)
+            .expect("SERIAL underlying is a fixed int")
+            .range()
+            .1;
+        if i128::from(base) + n as i128 - 1 > max {
+            let next = i128::from(base).max(max + 1);
+            return Err(GnitzSqlError::Bind(format!(
+                "SERIAL primary key exhausted: next value {next} exceeds the column type maximum {max}"
+            )));
+        }
+        Ok(PkPlan::Serial { base })
+    }
+
+    /// `slot_of` is the INSERT's physical-column → VALUES-slot map, `None` where
+    /// a column takes no user value.
+    pub(crate) fn written(slot_of: &[Option<usize>], schema: &Schema) -> Result<Self, GnitzSqlError> {
+        let slots = schema
+            .pk_cols
+            .iter()
+            .map(|&pi| {
+                slot_of.get(pi as usize).copied().flatten().ok_or_else(|| {
+                    GnitzSqlError::Bind(format!(
+                        "PK column '{}' missing from INSERT row",
+                        schema.columns[pi as usize].name
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(PkPlan::Written { slots })
+    }
+
+    /// Append row `row_i`'s primary key to `dst`.
+    pub(crate) fn push(
+        &self,
+        schema: &Schema,
+        row_i: usize,
+        cells: &[BExpr<Infallible>],
+        dst: &mut PkColumn,
+    ) -> Result<(), GnitzSqlError> {
+        match self {
+            PkPlan::Serial { base } => dst.push_natives(schema, &[u128::from(base + row_i as u64)]),
+            PkPlan::Written { slots } => {
+                let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
+                for (k, (&pi, &slot)) in schema.pk_cols.iter().zip(slots).enumerate() {
+                    let def = &schema.columns[pi as usize];
+                    check_not_null(def, matches!(cells[slot], BExpr::LitNull))?;
+                    natives[k] = native_value(&cells[slot], def)?;
+                }
+                dst.push_natives(schema, &natives[..slots.len()]);
+            }
+        }
+        Ok(())
     }
 }
 

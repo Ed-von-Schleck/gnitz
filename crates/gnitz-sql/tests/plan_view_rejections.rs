@@ -11,7 +11,7 @@ use pure::*;
 /// `m` (integer and float payloads for grouped bodies), `p3` (a three-column
 /// PK), `wide_a`/`wide_b` (one join key past the arity cap), `wl`/`wr` (33
 /// columns each), `st` (a stream), `x` (a DATE and two DECIMAL columns beside an
-/// integer, a float and a string), and two join views over duplicated names —
+/// integer, a float and a string), `tt` (a TIMESTAMP), and two join views over duplicated names —
 /// `jv`, where `id` and `v` each appear twice, and `ju`, where only `v` does.
 fn cat() -> CatalogSnapshot {
     let i = TypeCode::I64;
@@ -89,6 +89,10 @@ fn cat() -> CatalogSnapshot {
                 ],
                 vec![0],
             ),
+        ),
+        (
+            "tt",
+            table(52, vec![col("id", i), ncol("ts", TypeCode::Timestamp)], vec![0]),
         ),
     ] {
         cat.insert(SN, name, Some(desc));
@@ -443,6 +447,32 @@ fn grouped_body_rules() {
     );
 }
 
+/// DATE counts days and TIMESTAMP microseconds: a key copy cannot convert one to
+/// the other, so neither a join key nor a set-op column pairs them.
+#[test]
+fn a_date_never_pairs_with_a_timestamp_key() {
+    let cat = cat();
+    view(
+        &cat,
+        "SELECT id, CAST(d AS TIMESTAMP) AS t FROM x UNION ALL SELECT id, ts FROM tt",
+    );
+    rejects(
+        &cat,
+        &[
+            (
+                "SELECT x.id FROM x JOIN tt ON x.d = tt.ts",
+                "Unsupported",
+                "differ in unit (days vs microseconds)",
+            ),
+            (
+                "SELECT id, d FROM x UNION ALL SELECT id, ts FROM tt",
+                "Plan",
+                "column 1 type mismatch",
+            ),
+        ],
+    );
+}
+
 #[test]
 fn set_op_and_distinct_rules() {
     let cat = cat();
@@ -605,11 +635,11 @@ fn scalar_expression_rules() {
         ("DATE '2024-02-30'", "Bind", "invalid DATE literal"),
         ("CAST(i AS UUID)", "Unsupported", "UUID"),
         ("CAST(i AS BOOLEAN)", "Unsupported", "BOOLEAN"),
-        // A wide integer literal has no register slot at all.
+        // An integer literal past `u64::MAX` has no register slot at all.
         (
-            "CAST(18446744073709551615 AS BIGINT UNSIGNED)",
+            "CAST(18446744073709551616 AS BIGINT UNSIGNED)",
             "Unsupported",
-            "18446744073709551615",
+            "18446744073709551616",
         ),
         ("CAST('abc' AS DECIMAL(5, 2))", "Bind", "invalid DECIMAL literal"),
         // Each product adds its operands' scales, so a chain of them runs past

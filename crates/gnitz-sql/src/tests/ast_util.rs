@@ -1,4 +1,5 @@
 use super::*;
+use crate::bind::structural::bind_constant;
 use crate::error::GnitzSqlError;
 use crate::test_support::{lit, parse_expr_sql};
 use gnitz_core::TypeCode;
@@ -181,8 +182,7 @@ fn bind_literal_accepts_fractional_and_exponent_floats() {
 #[test]
 fn bind_constant_binds_a_date_to_its_temporal_literal() {
     let c = bind_constant(&parse_expr_sql("DATE '2020-01-01'")).expect("a constant");
-    assert!(matches!(c.lit, BExpr::LitTemporal { tc: TypeCode::Date, v: 18262 }));
-    assert!(!c.negated);
+    assert!(matches!(c, BExpr::LitTemporal { tc: TypeCode::Date, v: 18262 }));
 }
 
 #[test]
@@ -190,59 +190,57 @@ fn bind_literal_accepts_in_range_integer() {
     assert!(matches!(lit("42"), BExpr::LitInt(42)));
 }
 
-/// A constant position peels parentheses and one sign, in either order, and
-/// hands the magnitude back separately from the sign.
+/// A constant position peels parentheses and signs, in any order, into the
+/// signed literal.
 #[test]
-fn bind_constant_peels_parens_and_one_sign() {
-    for (src, want_neg) in [
-        ("5", false),
-        ("+5", false),
-        ("-5", true),
-        ("((-5))", true),
-        ("(-(5))", true),
+fn bind_constant_folds_parens_and_signs() {
+    for (src, want) in [
+        ("5", 5),
+        ("+5", 5),
+        ("-5", -5),
+        ("((-5))", -5),
+        ("(-(5))", -5),
+        ("-(-5)", 5),
+        ("-(+5)", -5),
+        ("-0", 0),
     ] {
         let c = bind_constant(&parse_expr_sql(src)).unwrap_or_else(|e| panic!("{src}: {e}"));
-        assert!(matches!(c.lit, BExpr::LitInt(5)), "{src}: {:?}", c.lit);
-        assert_eq!(c.negated, want_neg, "{src}");
+        assert_eq!(c, BExpr::LitInt(want), "{src}");
     }
 }
 
-/// A written sign implies a numeric literal or NULL — the invariant every
-/// consumer rests on, enforced in the one constructor. Either sign over a
-/// string used to be discarded silently.
+/// A sign over a string is refused. Either sign used to be discarded silently.
 #[test]
 fn bind_constant_refuses_a_sign_on_a_string() {
     assert!(bind_constant(&parse_expr_sql("-'abc'")).is_err());
     assert!(bind_constant(&parse_expr_sql("+'abc'")).is_err());
     assert!(matches!(
-        bind_constant(&parse_expr_sql("'abc'")).unwrap().lit,
+        bind_constant(&parse_expr_sql("'abc'")).unwrap(),
         BExpr::LitStr(_)
     ));
     // A sign over NULL is the NULL it spells, which is what an INSERT cell reads.
     for src in ["+NULL", "-NULL", "NULL"] {
         assert!(
-            matches!(bind_constant(&parse_expr_sql(src)).unwrap().lit, BExpr::LitNull),
+            matches!(bind_constant(&parse_expr_sql(src)).unwrap(), BExpr::LitNull),
             "{src}"
         );
     }
 }
 
+/// Anything but a literal is refused, including shapes the binder folds to one.
 #[test]
 fn bind_constant_rejects_a_non_constant() {
-    for src in ["a", "1 + 1", "-(a)", "ABS(1)"] {
+    for src in [
+        "a",
+        "1 + 1",
+        "-(a)",
+        "ABS(1)",
+        "COALESCE(2, x)",
+        "NULL IS NULL",
+        "CAST(5 AS INT)",
+    ] {
         assert!(bind_constant(&parse_expr_sql(src)).is_err(), "{src}");
     }
-}
-
-/// The sign travels beside the magnitude so `-0` survives; folding it in would
-/// make the two indistinguishable.
-#[test]
-fn bind_constant_keeps_negative_zero_distinguishable() {
-    let neg = bind_constant(&parse_expr_sql("-0")).unwrap();
-    let pos = bind_constant(&parse_expr_sql("0")).unwrap();
-    assert_eq!(neg.lit, pos.lit);
-    assert!(neg.negated && !pos.negated);
-    assert_eq!(neg.to_string(), "-0");
 }
 
 /// LIMIT/OFFSET read the same decoder, so `(10)` and `+10` are counts; a

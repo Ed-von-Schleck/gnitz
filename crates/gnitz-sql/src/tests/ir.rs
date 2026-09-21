@@ -25,6 +25,43 @@ fn unify_blend_type_rule() {
     // Else I64 — narrow unsigned stays I64 (its value stays < 2^63).
     assert_eq!(unify_blend_type(I64.into(), I64.into()), I64.into());
     assert_eq!(unify_blend_type(U32.into(), U16.into()), I64.into());
+    // A temporal type absorbs I64, and DATE with TIMESTAMP meets at TIMESTAMP.
+    assert_eq!(unify_blend_type(Date.into(), I64.into()), Date.into());
+    assert_eq!(unify_blend_type(Date.into(), Timestamp.into()), Timestamp.into());
+    assert_eq!(unify_blend_type(Timestamp.into(), Date.into()), Timestamp.into());
+}
+
+/// Arithmetic with a temporal operand: a shift keeps the type, a difference is
+/// an integer, and nothing else is typed.
+#[test]
+fn temporal_arithmetic_is_an_allow_list() {
+    use TypeCode::*;
+    let t = |op, l: TypeCode, r: TypeCode| temporal_arith_type(op, l.into(), r.into());
+    assert_eq!(t(BinOp::Add, Date, I64), Some(Date.into()));
+    assert_eq!(t(BinOp::Sub, Timestamp, I32), Some(Timestamp.into()));
+    assert_eq!(t(BinOp::Add, I64, Date), Some(Date.into()));
+    assert_eq!(t(BinOp::Sub, Date, Date), Some(I64.into()));
+    assert_eq!(t(BinOp::Sub, Timestamp, Date), Some(I64.into()));
+    for (op, l, r) in [
+        (BinOp::Mul, Date, I64),
+        (BinOp::Div, Timestamp, I64),
+        (BinOp::Mod, Timestamp, I64),
+        (BinOp::Sub, I64, Date),
+        (BinOp::Add, Date, Date),
+        (BinOp::Add, Date, F64),
+    ] {
+        assert_eq!(t(op, l, r), None, "{op:?} {l:?} {r:?}");
+    }
+}
+
+/// A wide literal a U64 register holds types as U64.
+#[test]
+fn a_wide_literal_up_to_u64_max_is_u64() {
+    let s = schema(&[TypeCode::U64]);
+    let wide = |mag, neg| BoundExpr::LitWide(NumLit { mag, neg }).infer_ty(&s.columns).tc;
+    assert_eq!(wide(u64::MAX.into(), false), TypeCode::U64);
+    assert_eq!(wide(1 << 64, false), TypeCode::I64);
+    assert_eq!(wide(1 << 64, true), TypeCode::I64);
 }
 
 #[test]

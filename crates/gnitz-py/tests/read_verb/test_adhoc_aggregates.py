@@ -348,9 +348,9 @@ def test_a_grouped_guard_fires_on_both_paths(client, gg, query):
     # ad-hoc in a payload slot. Also pins the unsigned comparison.
     ("SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > 9223372036854775807",
      "u", [9223372036854775808, 18446744073709551615]),
-    # A negative literal against a U64 column reads as u64::MAX on both paths, so
-    # the predicate is always false.
-    ("SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > -1", "u", []),
+    # Every U64 value is above a negative literal, on both paths.
+    ("SELECT u, COUNT(*) AS c FROM hg GROUP BY u HAVING u > -1", "u",
+     [5, 9223372036854775808, 18446744073709551615]),
     # A NOT NULL aggregate source, grouped: the two sides declare its
     # nullability differently, so they take different evaluation arms.
     ("SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING SUM(nn) > 0", "cat", [1, 2, 3]),

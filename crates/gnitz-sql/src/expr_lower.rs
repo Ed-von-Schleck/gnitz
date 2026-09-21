@@ -6,10 +6,11 @@
 //! projection expression it emits.
 
 use crate::bind::structural::str_func_name;
+use crate::codec::literal::{place, Placed};
 use crate::error::GnitzSqlError;
 use crate::ir::{
-    blend_type, decimal_compute_type, operand_ty_pair, operand_tys, BinOp, BoundExpr, NumFunc, StrArg, StrFunc,
-    TrimMode,
+    blend_type, decimal_compute_type, operand_ty_pair, operand_tys, temporal_arith_type, BExpr, BinOp, BoundExpr,
+    NumFunc, StrArg, StrFunc, TrimMode,
 };
 use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
@@ -115,20 +116,25 @@ impl OpcodeBackend<'_> {
     fn lower(&mut self, expr: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
         match expr {
             BoundExpr::ColRef(c) => self.col_ref(*c),
-            BoundExpr::LitInt(v) => Ok((self.eb.emit(L::LoadConst { val: *v }), ExprKind::Int)),
+            BoundExpr::LitInt(v) => Ok((self.eb.emit(L::LoadConst { val: *v, unsigned: false }), ExprKind::Int)),
             BoundExpr::LitFloat { v, .. } => Ok((self.eb.const_f64(*v), ExprKind::Float)),
-            BoundExpr::LitTemporal { v, .. } => Ok((self.eb.emit(L::LoadConst { val: *v }), ExprKind::Int)),
+            BoundExpr::LitTemporal { v, .. } => {
+                Ok((self.eb.emit(L::LoadConst { val: *v, unsigned: false }), ExprKind::Int))
+            }
             BoundExpr::LitStr(s) => {
                 let idx = self.eb.add_const_string(s);
                 Ok((self.eb.emit(L::LoadConstStr { const_idx: idx }), ExprKind::Str))
             }
-            // The register file is 8 bytes wide, so a wide literal has no slot.
-            // A *servable* wide seek is consumed into a PK/index bound by the
-            // access-path recognizer and never gets here.
-            BoundExpr::LitWide(lit) => Err(GnitzSqlError::Unsupported(format!(
-                "integer literal {lit} does not fit a 64-bit register; it is usable only as an indexed \
-                 equality/range key, an INSERT value or an UPDATE SET value"
-            ))),
+            BoundExpr::LitWide(lit) => match lit.to_u64() {
+                Some(v) => Ok((
+                    self.eb.emit(L::LoadConst { val: v as i64, unsigned: true }),
+                    ExprKind::Int,
+                )),
+                None => Err(GnitzSqlError::Unsupported(format!(
+                    "integer literal {lit} does not fit a 64-bit register; it is usable only in a comparison \
+                     or IN list against an integer column, an INSERT value or an UPDATE SET value"
+                ))),
+            },
             BoundExpr::LitNull => Ok((self.eb.emit(L::LoadNull), ExprKind::Int)),
             BoundExpr::BinOp(l, op, r) => self.binop(l, *op, r),
             BoundExpr::Not(inner) => {
@@ -239,7 +245,7 @@ impl OpcodeBackend<'_> {
         if by == 0 {
             return r;
         }
-        let m = self.eb.emit(L::LoadConst { val: pow10(by) });
+        let m = self.eb.emit(L::LoadConst { val: pow10(by), unsigned: false });
         self.eb.emit(L::IntArith { op: IntArithOp::Mul, a: r, b: m })
     }
 
@@ -251,10 +257,10 @@ impl OpcodeBackend<'_> {
         }
         let q = pow10(by);
         let sign = self.eb.emit(L::IntUnary { op: IntUnaryOp::Sign, a: r });
-        let half = self.eb.emit(L::LoadConst { val: q / 2 });
+        let half = self.eb.emit(L::LoadConst { val: q / 2, unsigned: false });
         let bias = self.eb.emit(L::IntArith { op: IntArithOp::Mul, a: sign, b: half });
         let v = self.eb.emit(L::IntArith { op: IntArithOp::Add, a: r, b: bias });
-        let q = self.eb.emit(L::LoadConst { val: q });
+        let q = self.eb.emit(L::LoadConst { val: q, unsigned: false });
         self.eb.emit(L::IntArith { op: IntArithOp::Div, a: v, b: q })
     }
 
@@ -262,10 +268,10 @@ impl OpcodeBackend<'_> {
     /// quotient, moved one off it where a remainder's sign says truncation went
     /// the other way.
     fn floor_ceil_div(&mut self, r: Reg, by: u8, is_ceil: bool) -> Reg {
-        let q = self.eb.emit(L::LoadConst { val: pow10(by) });
+        let q = self.eb.emit(L::LoadConst { val: pow10(by), unsigned: false });
         let t = self.eb.emit(L::IntArith { op: IntArithOp::Div, a: r, b: q });
         let m = self.eb.emit(L::IntArith { op: IntArithOp::Mod, a: r, b: q });
-        let zero = self.eb.emit(L::LoadConst { val: 0 });
+        let zero = self.eb.emit(L::LoadConst { val: 0, unsigned: false });
         let (cmp, fix) = if is_ceil {
             (CmpOp::Gt, IntArithOp::Add)
         } else {
@@ -284,15 +290,35 @@ impl OpcodeBackend<'_> {
             let val = rescale(v, s, to).ok_or_else(|| {
                 GnitzSqlError::Bind(format!("{} does not fit a DECIMAL of scale {to}", format_decimal(v, s)))
             })?;
-            return Ok(self.eb.emit(L::LoadConst { val }));
+            return Ok(self.eb.emit(L::LoadConst { val, unsigned: false }));
         }
-        let (r, kind) = self.lower_num(e)?;
+        let (mut r, kind) = self.lower_num(e)?;
+        // A DECIMAL is an i64, so a U64 value at or above 2^63 has none: the
+        // range cast makes it NULL, and the scaling below then runs signed.
+        if kind == ExprKind::Int && e.infer_ty(self.cols).register_image().tc == TypeCode::U64 {
+            r = self.eb.emit(L::IntCast { a: r, fi: FixedInt::I64 });
+        }
         Ok(self.as_decimal(r, kind, to))
     }
 
     /// Lower `e` into the register class of `target` — the blend a CASE, a
     /// GREATEST or an IN list settled on — so every branch lands in one class.
     fn lower_to(&mut self, e: &BoundExpr, target: ColType) -> Result<Reg, GnitzSqlError> {
+        let src = e.infer_ty(self.cols).tc;
+        if src.is_temporal() && src != target.tc {
+            if (src, target.tc) != (TypeCode::Date, TypeCode::Timestamp) {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "cannot mix {} with {target} in one CASE/COALESCE/GREATEST/LEAST",
+                    src.wire_name()
+                )));
+            }
+            let (a, _) = self.lower_num(e)?;
+            return Ok(self.eb.emit(L::Calendar {
+                op: CalendarOp::ToMicros,
+                a,
+                micros: false,
+            }));
+        }
         match ExprKind::of(target) {
             ExprKind::Str => self.str_operand(e, false),
             ExprKind::Dec(s) => self.lower_dec(e, s),
@@ -379,7 +405,7 @@ impl OpcodeBackend<'_> {
                 NumFunc::Unary(F::Floor) => self.floor_ceil_div(r, by, false),
                 NumFunc::Unary(F::Ceil) => self.floor_ceil_div(r, by, true),
                 NumFunc::Unary(F::Trunc) => {
-                    let q = self.eb.emit(L::LoadConst { val: pow10(by) });
+                    let q = self.eb.emit(L::LoadConst { val: pow10(by), unsigned: false });
                     self.eb.emit(L::IntArith { op: IntArithOp::Div, a: r, b: q })
                 }
                 NumFunc::Unary(F::Sqrt | F::Ln | F::Log10 | F::Exp) => unreachable!("typed as F64 above"),
@@ -410,21 +436,6 @@ impl OpcodeBackend<'_> {
         let v = self.eb.emit(L::FloatArith { op: first, a, b: scale });
         let v = self.eb.emit(L::FloatUnary { op: FloatUnaryOp::Round, a: v });
         self.eb.emit(L::FloatArith { op: undo, a: v, b: scale })
-    }
-
-    /// The typed literal of `other`'s temporal type that `e` spells, when `e` is
-    /// a string literal and `other` a DATE/TIMESTAMP; `None` when the pair is
-    /// anything else, which is every comparison that needs no coercion.
-    fn temporal_str_lit(&self, e: &BoundExpr, other: &BoundExpr) -> Result<Option<BoundExpr>, GnitzSqlError> {
-        let BoundExpr::LitStr(s) = e else { return Ok(None) };
-        let tc = other.infer_ty(self.cols).tc;
-        match tc.is_temporal() {
-            true => Ok(Some(BoundExpr::LitTemporal {
-                tc,
-                v: crate::types::temporal_literal(tc, s)?,
-            })),
-            false => Ok(None),
-        }
     }
 
     fn calendar(&mut self, op: CalendarOp, arg: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
@@ -624,7 +635,7 @@ impl OpcodeBackend<'_> {
                 };
                 let elide = to == expr.infer_ty(self.cols).tc.register_image()
                     || matches!(expr, BoundExpr::ColRef(i) if self.cols[*i].type_code == to)
-                    || matches!(expr, BoundExpr::LitInt(v) if in_range(*v));
+                    || matches!(expr, BoundExpr::LitInt(v) if in_range(*v) && to != TypeCode::U64);
                 if elide {
                     r
                 } else {
@@ -651,7 +662,7 @@ impl OpcodeBackend<'_> {
                 check_decimal_scale(scale)?;
                 let val = parse_decimal(text, scale)
                     .ok_or_else(|| GnitzSqlError::Bind(format!("invalid DECIMAL literal: {text:?}")))?;
-                self.eb.emit(L::LoadConst { val })
+                self.eb.emit(L::LoadConst { val, unsigned: false })
             }
             _ => self.lower_dec(expr, scale)?,
         };
@@ -694,24 +705,35 @@ impl OpcodeBackend<'_> {
         Ok((acc, ExprKind::of(case_ty)))
     }
 
-    /// `inner IN (items…)`. A ≤8-byte-integer operand with all-integer-literal
-    /// items is one `IntInSet` — a DECIMAL operand with literals that are exact
-    /// at its scale likewise; anything else is the `inner = item` OR chain.
-    /// `self.cols` is the schema `inner` was bound against, so the gate holds
-    /// for a HAVING over the reduce output as much as for a table filter.
+    /// `inner IN (items…)`. An operand stored as a ≤8-byte integer whose items
+    /// all place among its values is one `IntInSet` of the items it holds;
+    /// anything else is the `inner = item` OR chain. `self.cols` is the schema
+    /// `inner` was bound against, so the gate holds for a HAVING over the reduce
+    /// output as much as for a table filter.
     fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let ty = inner.infer_ty(self.cols);
-        let literal = |e: &BoundExpr| match ty.is_decimal() {
-            true => e.exact_decimal(ty.scale),
-            false => e.int_literal(),
-        };
-        if gnitz_wire::is_fixed_int(ty.tc as u8) {
-            if let Some(mut values) = items.iter().map(literal).collect::<Option<Vec<i64>>>() {
+        if let Some(fi) = FixedInt::from_type_code(ty.tc) {
+            let placed = items
+                .iter()
+                .map(|i| place(i, ty))
+                .collect::<Option<Vec<Placed>>>()
+                .filter(|ps| self.range_is_register(inner, fi) || ps.iter().all(|p| !p.is_outside()));
+            if let Some(placed) = placed {
+                let mut values: Vec<i64> = placed
+                    .iter()
+                    .filter_map(|p| match p {
+                        Placed::At(v) => Some(fi.decode_le_i64(&v.to_le_bytes())),
+                        _ => None,
+                    })
+                    .collect();
                 values.sort_unstable();
                 values.dedup();
-                let value_reg = self.lower_num(inner)?.0;
+                let c = self.lower_int_operand(inner, ty)?;
+                if values.is_empty() {
+                    return Ok((self.eb.emit(L::Cmp { op: CmpOp::Ne, a: c, b: c }), ExprKind::Int));
+                }
                 let set_idx = self.eb.add_const_int_set(&values);
-                return Ok((self.eb.emit(L::IntInSet { value_reg, set_idx }), ExprKind::Int));
+                return Ok((self.eb.emit(L::IntInSet { value_reg: c, set_idx }), ExprKind::Int));
             }
         }
         // Each term lowers the operand again; the builder folds the identical
@@ -724,6 +746,76 @@ impl OpcodeBackend<'_> {
         Ok((acc, ExprKind::Int))
     }
 
+    /// Whether `e`'s register holds only values of `fi`: a column or a CAST is
+    /// range-checked, and an 8-byte type spans the register. A computed DATE
+    /// (`d + 1`) does not.
+    fn range_is_register(&self, e: &BoundExpr, fi: FixedInt) -> bool {
+        matches!(e, BoundExpr::ColRef(_) | BoundExpr::Cast { .. }) || fi.width() == 8
+    }
+
+    /// `e`, of a type stored as an integer, as the register its values compare
+    /// in: a DECIMAL at its own scale.
+    fn lower_int_operand(&mut self, e: &BoundExpr, ty: ColType) -> Result<Reg, GnitzSqlError> {
+        match ty.is_decimal() {
+            true => self.lower_dec(e, ty.scale),
+            false => Ok(self.lower_num(e)?.0),
+        }
+    }
+
+    /// `other CMP lit` where `other` is stored as a ≤8-byte integer: the literal
+    /// is placed among `other`'s values, the rule seek keys and written cells
+    /// take. `None` leaves the comparison to the general path.
+    fn cmp_placed(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Option<Reg>, GnitzSqlError> {
+        // Either side may be the literal. When both are, the operand is the side
+        // with an integer-stored type (`'2020-01-01' = DATE '2020-01-01'`).
+        let typed = |other: &BoundExpr, lit: &BoundExpr| -> Option<(ColType, FixedInt)> {
+            if !lit.is_literal() || matches!(other, BExpr::LitStr(_)) {
+                return None;
+            }
+            let ty = other.infer_ty(self.cols);
+            Some((ty, FixedInt::from_type_code(ty.tc)?))
+        };
+        let (other, lit, op, (ty, fi)) = if let Some(t) = typed(left, right) {
+            (left, right, op, t)
+        } else if let Some(t) = typed(right, left) {
+            (right, left, op.converse(), t)
+        } else {
+            return Ok(None);
+        };
+        let Some(cmp) = op.as_cmp() else { return Ok(None) };
+        let Some(p) = place(lit, ty) else {
+            // A string against a DATE/TIMESTAMP is that type's spelling, so text
+            // that spells no value is an error.
+            return match lit {
+                BExpr::LitStr(s) if ty.tc.is_temporal() => Err(crate::types::temporal_literal(ty.tc, s)
+                    .expect_err("`place` reads every temporal spelling `temporal_literal` parses")),
+                _ => Ok(None),
+            };
+        };
+        if p.is_outside() && !self.range_is_register(other, fi) {
+            return Ok(None);
+        }
+        let c = self.lower_int_operand(other, ty)?;
+        let int = |v: u128| fi.decode_le_i64(&v.to_le_bytes());
+        // `c = c` / `c <> c`: true / false on every row, NULL on a NULL one.
+        let always = |holds: bool| (if holds { CmpOp::Eq } else { CmpOp::Ne }, None);
+        let (op, k) = match p {
+            Placed::At(v) => (cmp, Some(int(v))),
+            Placed::Between { lo, hi, .. } => match cmp {
+                CmpOp::Eq | CmpOp::Ne => always(cmp == CmpOp::Ne),
+                CmpOp::Lt | CmpOp::Ge => (cmp, Some(int(hi))),
+                CmpOp::Gt | CmpOp::Le => (cmp, Some(int(lo))),
+            },
+            Placed::Below { .. } => always(matches!(cmp, CmpOp::Ne | CmpOp::Gt | CmpOp::Ge)),
+            Placed::Above { .. } => always(matches!(cmp, CmpOp::Ne | CmpOp::Lt | CmpOp::Le)),
+        };
+        let b = match k {
+            Some(val) => self.eb.emit(L::LoadConst { val, unsigned: fi == FixedInt::U64 }),
+            None => c,
+        };
+        Ok(Some(self.eb.emit(L::Cmp { op, a: c, b })))
+    }
+
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
         if let BinOp::And | BinOp::Or = op {
             let (a, _) = self.lower_num(left)?;
@@ -733,14 +825,9 @@ impl OpcodeBackend<'_> {
                 ExprKind::Int,
             ));
         }
-        // `d < '2024-01-01'`: a string literal compared against a temporal
-        // operand is that operand's literal, as it is in a seek key or a
-        // written cell.
-        let (lo, ro) = match op.as_cmp() {
-            Some(_) => (self.temporal_str_lit(left, right)?, self.temporal_str_lit(right, left)?),
-            None => (None, None),
-        };
-        let (left, right) = (lo.as_ref().unwrap_or(left), ro.as_ref().unwrap_or(right));
+        if let Some(reg) = self.cmp_placed(left, op, right)? {
+            return Ok((reg, ExprKind::Int));
+        }
         if let Some(reg) = try_compile_string_cmp(left, op, right, self.cols, self.eb) {
             return Ok((reg, ExprKind::Int));
         }
@@ -753,6 +840,20 @@ impl OpcodeBackend<'_> {
             return Ok((self.eb.emit(L::StrConcat { a, b, skip_null: false }), ExprKind::Str));
         }
         let (lt, rt) = operand_ty_pair(left, right, &|i: &usize| self.cols[*i].ty());
+        if lt.tc.is_temporal() || rt.tc.is_temporal() {
+            if op.as_cmp().is_none() && temporal_arith_type(op, lt, rt).is_none() {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "operator {op:?} is not supported on a DATE/TIMESTAMP operand"
+                )));
+            }
+            // Days meet microseconds at TIMESTAMP.
+            if lt.tc.is_temporal() && rt.tc.is_temporal() && lt.tc != rt.tc {
+                let ts = ColType::of(TypeCode::Timestamp);
+                let l = self.lower_to(left, ts)?;
+                let r = self.lower_to(right, ts)?;
+                return self.emit_scalar_binop(l, op, r, ExprKind::Int);
+            }
+        }
         if lt.is_decimal() || rt.is_decimal() {
             return self.decimal_binop(left, op, right, lt, rt);
         }
@@ -788,21 +889,6 @@ impl OpcodeBackend<'_> {
         lt: ColType,
         rt: ColType,
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        if let Some(cmp) = op.as_cmp() {
-            let lit = match (left.decimal_literal(), right.decimal_literal()) {
-                (None, Some(l)) if lt.is_decimal() && l.1 > lt.scale => Some((left, lt.scale, l, cmp)),
-                (Some(l), None) if rt.is_decimal() && l.1 > rt.scale => Some((
-                    right,
-                    rt.scale,
-                    l,
-                    op.converse().as_cmp().expect("a comparison's converse is one"),
-                )),
-                _ => None,
-            };
-            if let Some((other, scale, (v, s), cmp)) = lit {
-                return self.cmp_finer_literal(other, scale, v, s, cmp);
-            }
-        }
         let out = decimal_compute_type(op, lt, rt);
         if out.tc == TypeCode::String {
             return Err(GnitzSqlError::Unsupported(format!(
@@ -824,36 +910,6 @@ impl OpcodeBackend<'_> {
         let l = self.lower_dec(left, ls)?;
         let r = self.lower_dec(right, rs)?;
         self.emit_scalar_binop(l, op, r, ExprKind::Dec(out.scale))
-    }
-
-    /// `other CMP v·10^-s` where `s` exceeds `other`'s scale, so no value of
-    /// `other` equals the literal: an ordering compares against the neighbour on
-    /// its side, and `=` / `<>` are `other <> other` / `other = other` — false /
-    /// true on every row, NULL on a NULL one.
-    fn cmp_finer_literal(
-        &mut self,
-        other: &BoundExpr,
-        scale: u8,
-        v: i128,
-        s: u8,
-        cmp: CmpOp,
-    ) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let c = self.lower_dec(other, scale)?;
-        let floor = v.div_euclid(10i128.pow(u32::from(s - scale)));
-        let bound = match cmp {
-            CmpOp::Eq => return Ok((self.eb.emit(L::Cmp { op: CmpOp::Ne, a: c, b: c }), ExprKind::Int)),
-            CmpOp::Ne => return Ok((self.eb.emit(L::Cmp { op: CmpOp::Eq, a: c, b: c }), ExprKind::Int)),
-            CmpOp::Lt | CmpOp::Ge => floor + 1,
-            CmpOp::Gt | CmpOp::Le => floor,
-        };
-        let val = i64::try_from(bound).map_err(|_| {
-            GnitzSqlError::Bind(format!(
-                "{} does not fit a DECIMAL of scale {scale}",
-                format_decimal(v, s)
-            ))
-        })?;
-        let k = self.eb.emit(L::LoadConst { val });
-        Ok((self.eb.emit(L::Cmp { op: cmp, a: c, b: k }), ExprKind::Int))
     }
 
     /// The comparison-or-arithmetic tail both binop paths end in: `out` is the

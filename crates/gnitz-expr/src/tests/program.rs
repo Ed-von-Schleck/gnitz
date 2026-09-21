@@ -9,8 +9,8 @@ use std::num::NonZeroU8;
 // `tests/program.rs` is `#[path]`-attached to `program.rs`, so `super` is that
 // module — one import line rather than three spellings of it.
 use super::{
-    ColKind, ExprOp, FloatUnaryOp, IntUnaryOp, ProgramFacts, Role, TrimMode, INSTR_BYTES, INSTR_WORDS, MAP_OUTPUT,
-    MAX_CONST_POOL, SINK_WORDS,
+    ColKind, ExprOp, FloatUnaryOp, IntOrder, IntUnaryOp, ProgramFacts, Role, TrimMode, INSTR_BYTES, INSTR_WORDS,
+    MAP_OUTPUT, MAX_CONST_POOL, SINK_WORDS,
 };
 use crate::batch::{decode_f64, encode_f64};
 use crate::test_support::{
@@ -113,6 +113,7 @@ fn load_const_carries_a_full_width_i64() {
     // Wire form: lo 32 bits = 2, hi 32 bits = 1.
     let instrs = vec![LogicalInstr::LoadConst {
         val: ((1i64) << 32) | (2i64 & 0xFFFF_FFFF),
+        unsigned: false,
     }];
     let prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
     let val = row_value(&prog, &mb, 0).expect("not NULL");
@@ -120,7 +121,7 @@ fn load_const_carries_a_full_width_i64() {
 
     // Test negative constant: -1 (the wire low/high split is reconstructed by
     // `from_blob`; the typed instruction carries the full i64 value directly).
-    let instrs = vec![LogicalInstr::LoadConst { val: -1 }];
+    let instrs = vec![LogicalInstr::LoadConst { val: -1, unsigned: false }];
     let prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
     let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(val, -1);
@@ -157,7 +158,7 @@ fn a_u64_column_selects_the_unsigned_arm_of_div_mod_and_the_float_cast() {
         row_value(&scalar_prog(&schema, instrs, Reg(result), vec![]), &mb, 0).expect("not NULL")
     };
     let load = LogicalInstr::LoadColInt { col: 1 };
-    let two = LogicalInstr::LoadConst { val: 2 };
+    let two = LogicalInstr::LoadConst { val: 2, unsigned: false };
 
     assert_eq!(
         run(
@@ -228,7 +229,7 @@ fn emit_writes_each_named_output_slot() {
 fn conjunction_over_two_cols() -> Vec<LogicalInstr> {
     vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 1 },
+        LogicalInstr::LoadConst { val: 1, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
@@ -272,7 +273,7 @@ fn emit_of_a_null_result_sets_the_slot_bit_and_stores_zero() {
     let mb = make_int_view(&schema, &[(1, 0, &[10, 3])]);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 0 },
+        LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::IntArith {
             op: IntArithOp::Div,
             a: Reg(0),
@@ -422,9 +423,9 @@ fn str_col_const_is_classified_never_null() {
 fn load_null_else_branch_eval() {
     let schema = schema_pk_ints(1, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 }, // cond
-        LogicalInstr::LoadConst { val: 42 }, // a
-        LogicalInstr::LoadNull,              // else NULL
+        LogicalInstr::LoadColInt { col: 1 },                  // cond
+        LogicalInstr::LoadConst { val: 42, unsigned: false }, // a
+        LogicalInstr::LoadNull,                               // else NULL
         LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
@@ -490,19 +491,19 @@ fn select_propagates_u64_tracking_to_its_reader() {
         LogicalInstr::LoadColInt { col: 1 }, // a (U64)
         LogicalInstr::LoadColInt { col: 2 }, // b (i64)
         LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
-        LogicalInstr::LoadConst { val: 100 },
+        LogicalInstr::LoadConst { val: 100, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(4) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(5), vec![]);
     // Found by shape, not by position: which index resolution lands the compare
     // at is an internal detail, and three sibling tests already read it this way.
     let cmp = prog.prog.instrs.iter().find_map(|i| match i {
-        Instr::Cmp { op, signed, .. } => Some((*op, *signed)),
+        Instr::Cmp { op, order, .. } => Some((*op, *order)),
         _ => None,
     });
     assert_eq!(
         cmp,
-        Some((CmpOp::Gt, false)),
+        Some((CmpOp::Gt, IntOrder::UnsignedSigned)),
         "Select carrying a U64 branch must make the downstream compare unsigned"
     );
 }
@@ -544,8 +545,8 @@ fn a_select_result_reads_back_as_a_value() {
     let mb = make_int_view(&schema, &[(1, 0, &[1])]);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 }, // cond, truthy
-        LogicalInstr::LoadConst { val: 5 },
-        LogicalInstr::LoadConst { val: 7 },
+        LogicalInstr::LoadConst { val: 5, unsigned: false },
+        LogicalInstr::LoadConst { val: 7, unsigned: false },
         LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
@@ -1593,7 +1594,7 @@ fn int_cast_reseeds_u64_tracking_from_its_target() {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: src_col },
             LogicalInstr::IntCast { a: Reg(0), fi },
-            LogicalInstr::LoadConst { val: 0 },
+            LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(1), b: Reg(2) },
         ];
         let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
@@ -1601,7 +1602,7 @@ fn int_cast_reseeds_u64_tracking_from_its_target() {
             .instrs
             .iter()
             .find_map(|i| match i {
-                Instr::Cmp { signed, .. } => Some(*signed),
+                Instr::Cmp { order, .. } => Some(*order == IntOrder::Signed),
                 _ => None,
             })
             .expect("the compare survives")
@@ -1915,7 +1916,7 @@ fn string_nullability_classification() {
     // CONCAT's overflow NULL, and SPLIT_PART has its zero field index.
     assert!(no_nulls(vec![LogicalInstr::StrReverse { a: Reg(0) }]));
     assert!(no_nulls(vec![
-        LogicalInstr::LoadConst { val: 1 },
+        LogicalInstr::LoadConst { val: 1, unsigned: false },
         LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: true }
     ]));
     assert!(!no_nulls(vec![LogicalInstr::StrReplace {
@@ -1924,7 +1925,7 @@ fn string_nullability_classification() {
         to: Reg(0)
     }]));
     assert!(!no_nulls(vec![
-        LogicalInstr::LoadConst { val: 1 },
+        LogicalInstr::LoadConst { val: 1, unsigned: false },
         LogicalInstr::StrPad {
             s: Reg(0),
             n_reg: Reg(1),
@@ -1933,7 +1934,7 @@ fn string_nullability_classification() {
         }
     ]));
     assert!(!no_nulls(vec![
-        LogicalInstr::LoadConst { val: 1 },
+        LogicalInstr::LoadConst { val: 1, unsigned: false },
         LogicalInstr::StrSplitPart { s: Reg(0), delim: Reg(0), n_reg: Reg(1) }
     ]));
     assert!(!no_nulls(vec![LogicalInstr::StrToInt { a: Reg(0), fi: FixedInt::I64 }]));
@@ -1941,9 +1942,9 @@ fn string_nullability_classification() {
     // differently: with a FOR clause it can produce one, without it cannot. The
     // window itself is total either way.
     let substr = |len_reg: Option<Reg>| {
-        let mut tail = vec![LogicalInstr::LoadConst { val: 1 }];
+        let mut tail = vec![LogicalInstr::LoadConst { val: 1, unsigned: false }];
         if len_reg.is_some() {
-            tail.push(LogicalInstr::LoadConst { val: 3 });
+            tail.push(LogicalInstr::LoadConst { val: 3, unsigned: false });
         }
         tail.push(LogicalInstr::StrSubstr { src: Reg(0), start_reg: Reg(1), len_reg });
         no_nulls(tail)
@@ -2035,7 +2036,8 @@ fn every_variant() -> Vec<LogicalInstr> {
     let mut v = vec![
         L::LoadColInt { col: 2 },
         L::LoadColFloat { col: 4 },
-        L::LoadConst { val: -1_234_567_890_123 },
+        L::LoadConst { val: -1_234_567_890_123, unsigned: false },
+        L::LoadConst { val: i64::MIN, unsigned: true },
         L::IntArith {
             op: IntArithOp::Add,
             a: Reg(7),

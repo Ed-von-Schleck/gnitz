@@ -17,7 +17,7 @@ use super::*;
 /// circuit can carry one — which is the input the pre-flight exists to catch.
 fn over_cap_pred_blob() -> Vec<u8> {
     let n = gnitz_expr::MAX_REGS as u32 + 1;
-    let code = (0..n).map(|dst| gnitz_expr::LogicalInstr::LoadConst { val: dst as i64 }.to_wire());
+    let code = (0..n).map(|dst| gnitz_expr::LogicalInstr::LoadConst { val: dst as i64, unsigned: false }.to_wire());
     gnitz_expr::encode_expr_blob(n - 1, code, std::iter::empty(), &[])
 }
 

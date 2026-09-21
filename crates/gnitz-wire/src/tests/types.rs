@@ -169,7 +169,6 @@ fn join_key_common_type_accepts_ladders() {
         (DATE, I32, I32),
         (DATE, I64, I64),
         (TIMESTAMP, I64, I64),
-        (DATE, TIMESTAMP, I64),
         // signed ladder → wider signed
         (I8, I16, I16),
         (I8, I32, I32),
@@ -253,6 +252,15 @@ fn join_key_common_type_over_cross_sign_pairs() {
             "cross-sign is symmetric for ({u},{s})"
         );
     }
+}
+
+/// DATE and TIMESTAMP are integers in different units, so no key copy
+/// co-partitions them.
+#[test]
+fn join_key_common_type_refuses_date_with_timestamp() {
+    use type_code::*;
+    assert_eq!(join_key_common_type(DATE, TIMESTAMP), None);
+    assert_eq!(join_key_common_type(TIMESTAMP, DATE), None);
 }
 
 /// `TypeCode::carried_reindex_tc` and `resolve_reindex_type` are inverses: a

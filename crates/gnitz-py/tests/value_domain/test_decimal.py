@@ -67,7 +67,7 @@ def test_the_declared_scale_reaches_the_catalog_and_the_wire(client, priced):
 
 
 @pytest.mark.parametrize("value,message", [
-    ("'abc'", "invalid DECIMAL literal"),
+    ("'abc'", "invalid DECIMAL"),
     ("99999999999999999999", "out of range"),
 ], ids=["not-a-number", "past-the-scaled-i64"])
 def test_a_literal_the_scale_cannot_hold_is_refused(client, priced, value, message):
@@ -114,7 +114,7 @@ def test_a_decimal_key_routes_and_seeks_on_its_stored_integer(client, schema_nam
         (a.quantize(Decimal("0.01")), i + (100 if a > 1 else 0)): 1
         for i, a in enumerate(amts) if i != 3}
 
-    with pytest.raises(gnitz.GnitzError, match="not a valid DECIMAL"):
+    with pytest.raises(gnitz.GnitzError, match="invalid DECIMAL"):
         client.execute_sql("INSERT INTO p VALUES ('x', 1)", schema_name=sn)
 
 

@@ -131,8 +131,8 @@ def test_a_set_right_hand_side_computes_over_every_column_it_can_read(client, sc
 
 
 def test_a_wide_literal_is_checked_against_its_target_before_any_row(client, schema_name):
-    """An integer past `i64` has no register slot, so a residual naming one
-    cannot be compiled at all, and an assignment out of the target's range is
+    """An integer past `u64` has no register slot, so a residual computing with
+    one cannot be compiled at all, and an assignment out of the target's range is
     refused at plan time — even when the statement would touch no row, since
     deferring the check would make it succeed silently on an empty match and
     wrap two's-complement on a non-empty one. Nothing is written: no wrapped
@@ -147,12 +147,15 @@ def test_a_wide_literal_is_checked_against_its_target_before_any_row(client, sch
         "v BIGINT UNSIGNED NOT NULL)", schema_name=sn)
     client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
 
-    for stmt in (f"DELETE FROM t WHERE v = {U64_MAX}",
+    for stmt in (f"DELETE FROM t WHERE v + {U64_MAX + 1} = 0",
                  f"UPDATE t SET v = {U64_MAX + 1} WHERE pk = 999",
                  "UPDATE t SET v = -1 WHERE pk = 999",
                  f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX + 1}"):
         with pytest.raises(gnitz.GnitzError):
             client.execute_sql(stmt, schema_name=sn)
+    assert bag(scanned(client, sn, "t")) == {(1, 100): 1}
+    # The top of the unsigned range is a comparison operand like any other.
+    client.execute_sql(f"DELETE FROM t WHERE v = {U64_MAX}", schema_name=sn)
     assert bag(scanned(client, sn, "t")) == {(1, 100): 1}
 
     client.execute_sql(

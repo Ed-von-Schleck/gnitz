@@ -848,11 +848,9 @@ impl FixedInt {
     }
 
     /// The representable `(min, max)` of this integer type, widened to `i128`
-    /// so one pair covers signed and unsigned variants. The SQL layer
-    /// classifies literals against this — declining an out-of-range
-    /// PK/equality literal, saturating an out-of-range range bound to the
-    /// type-edge cut (`Cut::type_edges`) — instead of wrapping it into a
-    /// different in-range value.
+    /// so one pair covers signed and unsigned variants. The SQL layer places a
+    /// literal among these values instead of wrapping it into a different
+    /// in-range one.
     pub const fn range(self) -> (i128, i128) {
         match self {
             Self::U8 => (0, u8::MAX as i128),
@@ -1116,10 +1114,14 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     if is_german_string(l) && is_german_string(r) {
         return Some(type_code::U128);
     }
+    // DATE counts days and TIMESTAMP microseconds: a key copy moves bytes and
+    // cannot convert one unit to the other.
+    if is_temporal(l) && is_temporal(r) {
+        return None;
+    }
     // Both signed integers of at most 8 bytes → the wider signed type. Read
-    // through the storage type: an unequal pair with a temporal side
-    // co-partitions as the integer both sides really are, never under one
-    // side's calendar name.
+    // through the storage type: a pair with one temporal side co-partitions as
+    // the integer both sides really are, never under the calendar name.
     if is_signed_int(l) && is_signed_int(r) {
         let (l, r) = (storage_type_code(l), storage_type_code(r));
         return Some(if wire_stride(l) >= wire_stride(r) { l } else { r });

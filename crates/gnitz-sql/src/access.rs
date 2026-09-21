@@ -1,35 +1,28 @@
 //! Access-path recognition over bound conjuncts, shared by the DML planners and the
 //! view compiler: [`candidates`] lists every bound a WHERE admits, best first.
 //!
-//! An **AST-free leaf** — `ir`, `codec::pk_codec` and `gnitz-core`, nothing else.
+//! An **AST-free leaf** — `ir`, `codec::literal` and `gnitz-core`, nothing else.
 
-use crate::codec::pk_codec::{bound_key_literal, col_key_literal, BoundLit, KeyLitError};
+use crate::codec::literal::{place, Placed};
 use crate::ir::{BExpr, BinOp, BoundExpr};
 use gnitz_core::{Cut, IndexMeta, RangeDescriptor, Schema, TypeCode, PK_LIST_MAX_COLS};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{key_image, IndexBound, PkKeys, ReadBound};
 use std::cmp::Reverse;
 
-/// Classify a bound binary op as `col OP literal`, the `ColRef` on either side.
-/// The returned operator always reads `col OP lit` — a literal on the left is
-/// mirrored through [`BinOp::converse`] here — so no caller handles sides. The
-/// literal is read as a key of that column (`col_key_literal`), so a DECIMAL
-/// column's literal arrives already at the column's scale.
-fn bound_col_vs_literal<'e>(expr: &'e BoundExpr, schema: &Schema) -> Option<(usize, BoundLit<'e>, BinOp)> {
+/// Classify a bound binary op as `col OP literal`, the `ColRef` on either side,
+/// with the literal placed among the column's values. The returned operator
+/// always reads `col OP lit`.
+fn bound_col_vs_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, Placed, BinOp)> {
     let BExpr::BinOp(left, op, right) = expr else {
         return None;
     };
-    if let BExpr::ColRef(idx) = left.as_ref() {
-        if let Some(l) = col_key_literal(right, &schema.columns[*idx]) {
-            return Some((*idx, l, *op));
-        }
+    let placed = |idx: usize, lit: &BoundExpr| place(lit, schema.columns[idx].ty());
+    match (left.as_ref(), right.as_ref()) {
+        (BExpr::ColRef(idx), lit) => Some((*idx, placed(*idx, lit)?, *op)),
+        (lit, BExpr::ColRef(idx)) => Some((*idx, placed(*idx, lit)?, op.converse())),
+        _ => None,
     }
-    if let BExpr::ColRef(idx) = right.as_ref() {
-        if let Some(l) = col_key_literal(left, &schema.columns[*idx]) {
-            return Some((*idx, l, op.converse()));
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -62,39 +55,53 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
             return None;
         }
         let c = &schema.columns[*col];
-        let mut keys: Vec<u128> = items
-            .iter()
-            .map(|i| bound_key_literal(col_key_literal(i, c)?, c.type_code).ok())
-            .collect::<Option<_>>()?;
+        // A NULL member never makes the conjunct true, and a placement other
+        // than `At` names no row.
+        let mut keys = Vec::with_capacity(items.len());
+        for item in items.iter().filter(|i| !matches!(i, BExpr::LitNull)) {
+            if let Placed::At(v) = place(item, c.ty())? {
+                keys.push(v);
+            }
+        }
+        if keys.is_empty() {
+            return Some((*col, empty_pin(c.type_code)?));
+        }
         // In key order, so the key set crosses the lists already sorted. The binder
         // keeps a list as written; a repeat is no second key.
         keys.sort_unstable_by_key(|&v| key_image(c.type_code as u8, v));
         keys.dedup();
         return Some((*col, Pin::In(keys)));
     }
-    let (col, lit, op) = bound_col_vs_literal(conjunct, schema)?;
+    let (col, p, op) = bound_col_vs_literal(conjunct, schema)?;
     let tc = schema.columns[col].type_code;
-    let pin = match op {
-        BinOp::Eq => Pin::Eq(bound_key_literal(lit, tc).ok()?),
-        BinOp::Gt => Pin::Start(range_cut(lit, tc, Cut::After)?),
-        BinOp::Ge => Pin::Start(range_cut(lit, tc, Cut::Before)?),
-        BinOp::Lt => Pin::End(range_cut(lit, tc, Cut::Before)?),
-        BinOp::Le => Pin::End(range_cut(lit, tc, Cut::After)?),
+    let pin = match (op, p) {
+        (BinOp::Eq, Placed::At(v)) => Pin::Eq(v),
+        (BinOp::Eq, _) => empty_pin(tc)?,
+        (BinOp::Gt, p) => Pin::Start(range_cut(p, tc, Cut::After)?),
+        (BinOp::Ge, p) => Pin::Start(range_cut(p, tc, Cut::Before)?),
+        (BinOp::Lt, p) => Pin::End(range_cut(p, tc, Cut::Before)?),
+        (BinOp::Le, p) => Pin::End(range_cut(p, tc, Cut::After)?),
         _ => return None,
     };
     Some((col, pin))
 }
 
-/// A range-end literal's cut: the key rule's value when the column holds it, else
-/// the type edge on the literal's side. `None` for a type with no ordered range.
-fn range_cut(lit: BoundLit, tc: TypeCode, mk: fn(u128) -> Cut) -> Option<Cut> {
+/// The pin that admits no value: an interval ending before the type's first.
+fn empty_pin(tc: TypeCode) -> Option<Pin> {
+    Some(Pin::End(Cut::type_edges(tc)?.0))
+}
+
+/// A range-end literal's cut. A literal between two values cuts after the lower
+/// one whichever the operator: `x > lit` is `x ≥ lo + 1` and `x < lit` is
+/// `x ≤ lo`. `None` for a type with no ordered range.
+fn range_cut(p: Placed, tc: TypeCode, mk: fn(u128) -> Cut) -> Option<Cut> {
     let (below, above) = Cut::type_edges(tc)?;
-    let negative = matches!(lit, BoundLit::Num(n) if n.is_negative());
-    match bound_key_literal(lit, tc) {
-        Ok(v) => Some(mk(v)),
-        Err(KeyLitError::NegativeIntoUnsigned | KeyLitError::OutOfRange) => Some(if negative { below } else { above }),
-        Err(KeyLitError::NotOfType | KeyLitError::NotNumeric) => None,
-    }
+    Some(match p {
+        Placed::At(v) => mk(v),
+        Placed::Between { lo, .. } => Cut::After(lo),
+        Placed::Below { .. } => below,
+        Placed::Above { .. } => above,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -231,28 +238,17 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
     if n > longest.max(MAX_CROSS_PRODUCT_KEYS) {
         return None;
     }
-    // Each position's values as that column's OPK bytes, once. Every list is in key
-    // order, so varying the last position fastest emits strictly ascending tuples.
-    let encoded: Vec<(usize, Vec<u8>)> = schema
-        .pk_cols
-        .iter()
-        .zip(&slices)
-        .map(|(&col, s)| {
-            let tc = schema.columns[col as usize].type_code as u8;
-            let bytes: Vec<u8> = s
-                .iter()
-                .flat_map(|&v| gnitz_wire::encode_pk_natives([(tc, tc)], [v]).pk_bytes().to_vec())
-                .collect();
-            (gnitz_wire::wire_stride(tc), bytes)
-        })
-        .collect();
+    // Every list is in key order, so varying the last position fastest emits
+    // strictly ascending tuples.
     let stride = schema.pk_stride();
     let mut bytes = Vec::with_capacity(n * stride);
     let mut at = [0usize; PK_LIST_MAX_COLS];
+    let mut tuple = [0u128; PK_LIST_MAX_COLS];
     for _ in 0..n {
-        for (k, (w, b)) in encoded.iter().enumerate() {
-            bytes.extend_from_slice(&b[at[k] * w..(at[k] + 1) * w]);
+        for (k, s) in slices.iter().enumerate() {
+            tuple[k] = s[at[k]];
         }
+        bytes.extend_from_slice(schema.opk_key_cols(&tuple[..pk_count]).pk_bytes());
         for k in (0..pk_count).rev() {
             at[k] += 1;
             if at[k] < slices[k].len() {

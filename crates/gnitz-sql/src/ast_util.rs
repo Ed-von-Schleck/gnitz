@@ -2,17 +2,13 @@
 //! more surfaces must agree on it, so its doc states the rule it enforces —
 //! never who calls it, which rots the moment a caller moves.
 
-use std::convert::Infallible;
-
 use crate::agg::AggFunc;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{BExpr, NumLit};
 use crate::validate::{first_duplicate, validate_user_name};
 use gnitz_core::{ColumnDef, TypeCode};
 use gnitz_wire::decimal::decimal_of_number_text;
-use sqlparser::ast::{
-    ExcludeSelectItem, Expr, RenameSelectItem, SelectItem, UnaryOperator, Value, WildcardAdditionalOptions,
-};
+use sqlparser::ast::{ExcludeSelectItem, Expr, RenameSelectItem, SelectItem, Value, WildcardAdditionalOptions};
 
 /// The identifier of an `ObjectName`'s last part, or `None` when that part is
 /// not a plain identifier.
@@ -170,78 +166,16 @@ pub(crate) fn temporal_constant(e: &Expr) -> Result<Option<(TypeCode, i64)>, Gni
     }
 }
 
-/// A constant as written: the literal's magnitude, and its sign kept apart from
-/// it — folding the sign in would destroy `-0`, whose sign a float column keeps.
-/// A *written* sign implies a numeric literal or NULL; [`bind_constant`] is the
-/// sole constructor and refuses one on anything else.
-#[derive(Debug)]
-pub(crate) struct Constant {
-    /// `Infallible` is uninhabited, so this has no `ColRef` inhabitant: the type
-    /// states that no column reference can occur.
-    pub(crate) lit: BExpr<Infallible>,
-    pub(crate) negated: bool,
-}
-
-impl std::fmt::Display for Constant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sign = if self.negated { "-" } else { "" };
-        match &self.lit {
-            BExpr::LitInt(v) => write!(f, "{sign}{v}"),
-            BExpr::LitFloat { v, .. } => write!(f, "{sign}{v}"),
-            BExpr::LitWide(n) => write!(f, "{sign}{n}"),
-            BExpr::LitTemporal { v, .. } => write!(f, "{v}"),
-            BExpr::LitStr(s) => write!(f, "'{s}'"),
-            _ => write!(f, "NULL"),
-        }
-    }
-}
-
-/// The one decoder for a constant position, so no two of them can disagree on
-/// what a written constant is: parentheses peeled, one optional sign, a literal.
-pub(crate) fn bind_constant(e: &Expr) -> Result<Constant, GnitzSqlError> {
-    // sqlparser lexes a literal's sign as a separate unary operator, so `+5` and
-    // `-5` are both `UnaryOp`, never a bare `Value::Number`. `sign` is `None`
-    // when none was written — which `negated` alone cannot say, and `+'abc'`
-    // needs it said: either sign over a string used to be discarded silently.
-    let (inner, sign) = match peel_nested(e) {
-        Expr::UnaryOp {
-            op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
-            expr,
-        } => (peel_nested(expr), Some(matches!(op, UnaryOperator::Minus))),
-        e => (e, None),
-    };
-    // A temporal literal is already the integer its column stores; a sign over
-    // one is refused below like a sign over a string.
-    if let (None, Some((tc, v))) = (sign, temporal_constant(inner)?) {
-        return Ok(Constant {
-            lit: BExpr::LitTemporal { tc, v },
-            negated: false,
-        });
-    }
-    let Expr::Value(vws) = inner else {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "expected a constant, got the expression: {e}"
-        )));
-    };
-    let lit = bind_literal(&vws.value)?;
-    if let (Some(_), BExpr::LitStr(s)) = (sign, &lit) {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "a sign does not apply to the string literal '{s}'"
-        )));
-    }
-    Ok(Constant { lit, negated: sign == Some(true) })
-}
-
 /// Parse `e` as a non-negative integer literal, or error — silently degrading a
 /// LIMIT returns every row. `what` names the clause for the message.
 pub(crate) fn expr_usize_literal(e: &Expr, what: &str) -> Result<usize, GnitzSqlError> {
     let not_a_literal = || GnitzSqlError::Unsupported(format!("{what} must be an integer literal, not an expression"));
-    let c = bind_constant(e).map_err(|_| not_a_literal())?;
-    match &c.lit {
-        // `bind_literal` yields the magnitude, so an unnegated `LitInt` is ≥ 0.
-        BExpr::LitInt(n) if !c.negated => Ok(*n as usize),
+    let c = crate::bind::structural::bind_constant(e).map_err(|_| not_a_literal())?;
+    match c {
+        BExpr::LitInt(n) if n >= 0 => Ok(n as usize),
         BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) => Err(GnitzSqlError::Unsupported(format!(
-            "{what} must be a non-negative integer literal, got '{c}'"
+            "{what} must be a non-negative integer literal, got '{}'",
+            c.literal_text()
         ))),
         _ => Err(not_a_literal()),
     }
@@ -601,7 +535,8 @@ pub(crate) fn group_by_exprs(select: &sqlparser::ast::Select) -> Result<&[sqlpar
 /// [`expr_usize_literal`] directly, since a literal is the only form legal there.
 ///
 /// The gate is a *bare* `Value::Number`, deliberately narrower than
-/// [`bind_constant`]: `ORDER BY (1)` and `ORDER BY +1` are expressions.
+/// [`bind_constant`](crate::bind::structural::bind_constant): `ORDER BY (1)` and
+/// `ORDER BY +1` are expressions.
 pub(crate) fn clause_position(e: &Expr, what: &str) -> Result<Option<usize>, GnitzSqlError> {
     match e {
         Expr::Value(v) if matches!(v.value, Value::Number(..)) => Ok(Some(expr_usize_literal(e, what)?)),

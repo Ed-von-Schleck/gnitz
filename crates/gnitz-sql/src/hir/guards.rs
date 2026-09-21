@@ -72,6 +72,16 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
             right.ty()
         )));
     }
+    let (lt, rt) = (left.type_code, right.type_code);
+    if lt.is_temporal() && rt.is_temporal() && lt != rt {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ in unit (days vs microseconds)",
+            left.name,
+            lt.wire_name(),
+            right.name,
+            rt.wire_name()
+        )));
+    }
     // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
     // 16-byte native value. Both collapse to the U128 output type, so
     // `join_key_common_type` cannot tell them apart — but a content hash never

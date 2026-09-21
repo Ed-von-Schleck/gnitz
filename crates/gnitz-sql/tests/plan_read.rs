@@ -162,8 +162,7 @@ fn explain_names_every_decision() {
                 "order/limit: none",
             ],
         ),
-        // A literal past the VM's i64 constant has no compiled form; the walk
-        // applies it.
+        // A literal past `i64::MAX` is a key like any other.
         (
             "SELECT w FROM t WHERE v = 18446744073709551615",
             [
@@ -220,17 +219,18 @@ fn explain_names_every_decision() {
                 "order/limit: none",
             ],
         ),
-        // A non-integral literal and a top-level OR both keep the full scan.
+        // A non-integral literal names no key: the empty range walk.
         (
             "SELECT v FROM t WHERE id = 3.5",
             [
                 "read table t",
-                "access: full scan",
-                "predicate: server-side",
+                "access: pk range walk",
+                "predicate: none",
                 "projection: 1 columns",
                 "order/limit: none",
             ],
         ),
+        // A top-level OR keeps the full scan.
         (
             "SELECT v FROM t WHERE id = 1 OR v = 5",
             [

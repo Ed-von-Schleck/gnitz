@@ -104,7 +104,7 @@ fn test_filter_negate_pipeline() {
     use gnitz_expr::Reg;
     let pred_instrs = vec![
         gnitz_expr::LogicalInstr::LoadColInt { col: 1 }, // r0 = col[1]
-        gnitz_expr::LogicalInstr::LoadConst { val: 0 },  // r1 = 0
+        gnitz_expr::LogicalInstr::LoadConst { val: 0, unsigned: false }, // r1 = 0
         gnitz_expr::LogicalInstr::Cmp {
             op: gnitz_expr::CmpOp::Gt,
             a: Reg(0),

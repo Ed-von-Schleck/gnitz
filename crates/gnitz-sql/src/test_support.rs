@@ -3,8 +3,9 @@
 //! single source of truth so the canonical schemas (PK widths, UUID columns,
 //! compound PKs) and the literal-expression shapes can't drift between modules.
 
+use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColumnDef, PkBuf, PkColumn, Schema, TypeCode, ZSetBatch};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value};
 
 pub(crate) fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
@@ -172,4 +173,17 @@ pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> Vec<gnitz_core:
             is_unique: *is_unique,
         })
         .collect()
+}
+
+/// The primary key of a VALUES row of written expressions, through the INSERT
+/// path's [`PkPlan`](crate::dml::PkPlan) with the identity slot map.
+pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkBuf, GnitzSqlError> {
+    let slot_of: Vec<Option<usize>> = (0..row.len()).map(Some).collect();
+    let cells = row
+        .iter()
+        .map(crate::bind::structural::bind_constant)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut pks = PkColumn::empty_for_schema(schema);
+    crate::dml::PkPlan::written(&slot_of, schema)?.push(schema, 0, &cells, &mut pks)?;
+    Ok(pks.get_tuple(0))
 }

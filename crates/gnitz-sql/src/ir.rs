@@ -1,6 +1,6 @@
 use gnitz_core::{ColType, ColumnDef, TypeCode};
 use gnitz_expr::CalendarOp;
-use gnitz_wire::decimal::{rescale, MAX_DECIMAL_SCALE};
+use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
@@ -10,7 +10,7 @@ pub(crate) use gnitz_expr::{FloatUnaryOp, TrimMode};
 /// `ColRef` carries. `R` has three instantiations: `usize` (the [`BoundExpr`]
 /// alias), a resolved column index into a batch schema; `ColId`, the view
 /// path's column identity that survives every tree the binder builds; and
-/// `Infallible`, in a written `Constant`, where no column can occur.
+/// `Infallible`, in a written constant, where no column can occur.
 /// `PartialEq` is structural equality over the *bound* form — what makes "the same
 /// expression written twice" decidable after names resolve, so `t.a + b` and
 /// `a + b` are one expression. Not `Eq`, because `LitFloat` compares by `f64`.
@@ -27,8 +27,8 @@ pub(crate) enum BExpr<R> {
     },
     LitStr(String),
     /// An integer literal whose value does not fit `i64` (that is a `LitInt`),
-    /// sign folded in. No register holds one, so lowering refuses it; a seek key,
-    /// an INSERT cell and an UPDATE SET value read it against their column's type.
+    /// sign folded in. A register holds one up to `u64::MAX`, as a U64 value;
+    /// past that only a placement against a column's type reads it.
     LitWide(NumLit),
     /// A `DATE '…'` / `TIMESTAMP '…'` literal: its storage integer, typed as its
     /// temporal type — a difference of two dates is an integer, a date shifted by
@@ -65,8 +65,8 @@ pub(crate) enum BExpr<R> {
         else_: Option<Box<BExpr<R>>>,
     },
     /// `inner IN (items…)` bound faithfully (un-desugared): lowering decides the
-    /// form — a `≤8-byte-integer` operand with all-integer-literal items compiles to
-    /// one `IntInSet`; anything else falls back to the
+    /// form — an operand stored as a ≤8-byte integer whose items are all literals
+    /// of its type compiles to one `IntInSet`; anything else falls back to the
     /// `inner = i0 OR inner = i1 OR …` chain. `NOT IN` is the outer
     /// `Not(InList)`. `items` always holds two or more entries: the binder
     /// rejects `IN ()` and folds `IN (l)` to `Eq`, so the recognizers over bound
@@ -280,6 +280,10 @@ impl NumLit {
         self.neg && self.mag != 0
     }
 
+    pub(crate) fn to_u64(self) -> Option<u64> {
+        (!self.is_negative()).then(|| u64::try_from(self.mag).ok()).flatten()
+    }
+
     pub(crate) fn to_i128(self) -> Option<i128> {
         match self.neg {
             true => (self.mag <= i128::MIN.unsigned_abs()).then(|| (self.mag as i128).wrapping_neg()),
@@ -310,11 +314,9 @@ impl std::fmt::Display for NumLit {
 pub(crate) fn unify_blend_type(a: ColType, b: ColType) -> ColType {
     // Per-operand this is exactly `register_image`; unifying a pair is the
     // String > F64 > DECIMAL > U64 > I64 join of the two images. Past the
-    // String, F64, DECIMAL and U64 arms only {I64, DATE, TIMESTAMP} are left,
-    // so the two below read: a
-    // temporal image absorbs the neutral I64, an equal pair is itself (which is
-    // reachable for a temporal pair alone), and DATE with TIMESTAMP falls to the
-    // integer both of them are.
+    // String, F64, DECIMAL and U64 arms only {I64, DATE, TIMESTAMP} are left:
+    // a temporal image absorbs the neutral I64, an equal pair is itself, and
+    // DATE with TIMESTAMP meets at TIMESTAMP, the finer unit.
     let (a, b) = (a.register_image(), b.register_image());
     match (a.tc, b.tc) {
         (TypeCode::String, _) | (_, TypeCode::String) => ColType::of(TypeCode::String),
@@ -325,20 +327,21 @@ pub(crate) fn unify_blend_type(a: ColType, b: ColType) -> ColType {
         (TypeCode::U64, _) | (_, TypeCode::U64) => ColType::of(TypeCode::U64),
         (x, TypeCode::I64) | (TypeCode::I64, x) => ColType::of(x),
         (x, y) if x == y => ColType::of(x),
-        _ => ColType::of(TypeCode::I64),
+        _ => ColType::of(TypeCode::Timestamp),
     }
 }
 
-/// `+` / `-` with a temporal operand: a date or timestamp shifted by an integer
-/// keeps its type, the difference of two of the same type is an integer, and
-/// anything else takes the plain blend.
-fn temporal_arith_type(op: BinOp, lt: ColType, rt: ColType) -> ColType {
+/// Arithmetic with a temporal operand: a date or timestamp shifted by an
+/// integer keeps its type, and the difference of two is an integer — in
+/// microseconds when one of them is a TIMESTAMP. `None` for every other
+/// arithmetic, which has no temporal meaning.
+pub(crate) fn temporal_arith_type(op: BinOp, lt: ColType, rt: ColType) -> Option<ColType> {
     let is_int = |t: ColType| matches!(t.register_image().tc, TypeCode::I64 | TypeCode::U64);
     match (lt.tc.is_temporal(), rt.tc.is_temporal(), op) {
-        (true, true, BinOp::Sub) if lt == rt => ColType::of(TypeCode::I64),
-        (true, false, BinOp::Add | BinOp::Sub) if is_int(rt) => lt,
-        (false, true, BinOp::Add) if is_int(lt) => rt,
-        _ => unify_blend_type(lt, rt),
+        (true, true, BinOp::Sub) => Some(ColType::of(TypeCode::I64)),
+        (true, false, BinOp::Add | BinOp::Sub) if is_int(rt) => Some(lt),
+        (false, true, BinOp::Add) if is_int(lt) => Some(rt),
+        _ => None,
     }
 }
 
@@ -440,8 +443,7 @@ impl<R> BExpr<R> {
     }
 
     /// The integer a literal spells: a `LitInt`, or a temporal literal's storage
-    /// integer — which is why the seek and IN-set recognizers read literals
-    /// through here.
+    /// integer.
     pub(crate) fn int_literal(&self) -> Option<i64> {
         match self {
             BExpr::LitInt(v) | BExpr::LitTemporal { v, .. } => Some(*v),
@@ -462,13 +464,53 @@ impl<R> BExpr<R> {
         }
     }
 
-    /// The `i64` this literal is at DECIMAL scale `scale` when it is exactly
-    /// representable there — an integer, or a fractional literal with no more
-    /// fractional digits than the scale holds. A longer literal is not rounded:
-    /// a key or a membership test against it must not match a neighbour.
-    pub(crate) fn exact_decimal(&self, scale: u8) -> Option<i64> {
-        let (v, s) = self.decimal_literal()?;
-        (s <= scale).then(|| rescale(v, s, scale)).flatten()
+    /// Whether this is a literal, NULL included.
+    pub(crate) fn is_literal(&self) -> bool {
+        matches!(
+            self,
+            BExpr::LitInt(_)
+                | BExpr::LitWide(_)
+                | BExpr::LitFloat { .. }
+                | BExpr::LitStr(_)
+                | BExpr::LitTemporal { .. }
+                | BExpr::LitNull
+        )
+    }
+
+    /// A literal as an error message quotes it.
+    pub(crate) fn literal_text(&self) -> String {
+        match self {
+            BExpr::LitInt(v) => v.to_string(),
+            BExpr::LitFloat { v, .. } => v.to_string(),
+            BExpr::LitWide(n) => n.to_string(),
+            BExpr::LitTemporal { v, .. } => v.to_string(),
+            BExpr::LitStr(s) => format!("'{s}'"),
+            _ => "NULL".to_string(),
+        }
+    }
+
+    /// `-self` when `self` is a numeric literal or NULL; `Err(self)` otherwise.
+    pub(crate) fn negate_literal(self) -> Result<Self, Self> {
+        Ok(match self {
+            BExpr::LitInt(v) => v
+                .checked_neg()
+                .map_or(BExpr::LitWide(NumLit { mag: 1 << 63, neg: false }), BExpr::LitInt),
+            BExpr::LitFloat { v, dec } => BExpr::LitFloat { v: -v, dec: dec.map(|(u, s)| (-u, s)) },
+            BExpr::LitWide(n) => BExpr::LitWide(NumLit { mag: n.mag, neg: !n.neg }).fit_wide(),
+            BExpr::LitNull => BExpr::LitNull,
+            other => return Err(other),
+        })
+    }
+
+    /// A `LitWide` whose value fits `i64` as the `LitInt` it is.
+    fn fit_wide(self) -> Self {
+        match self {
+            BExpr::LitWide(n) => match n.to_i128().and_then(|v| i64::try_from(v).ok()) {
+                Some(v) => BExpr::LitInt(v),
+                None => self,
+            },
+            other => other,
+        }
     }
 
     /// The type of the value this node computes, parameterized over how a leaf
@@ -480,6 +522,7 @@ impl<R> BExpr<R> {
         let int = ColType::of(TypeCode::I64);
         match self {
             BExpr::ColRef(r) => leaf_ty(r),
+            BExpr::LitWide(n) if n.to_u64().is_some() => ColType::of(TypeCode::U64),
             BExpr::LitInt(_) | BExpr::LitWide(_) | BExpr::LitNull => int,
             BExpr::LitFloat { .. } => ColType::of(TypeCode::F64),
             BExpr::LitStr(_) => ColType::of(TypeCode::String),
@@ -492,9 +535,8 @@ impl<R> BExpr<R> {
                     BinOp::And | BinOp::Or => int,
                     BinOp::Concat => ColType::of(TypeCode::String),
                     BinOp::Pow => ColType::of(TypeCode::F64),
-                    BinOp::Add | BinOp::Sub if lt.tc.is_temporal() || rt.tc.is_temporal() => {
-                        temporal_arith_type(*op, lt, rt)
-                    }
+                    // A pair this does not type is refused by lowering.
+                    _ if lt.tc.is_temporal() || rt.tc.is_temporal() => temporal_arith_type(*op, lt, rt).unwrap_or(int),
                     _ if lt.is_decimal() || rt.is_decimal() => decimal_compute_type(*op, lt, rt),
                     // Arithmetic preserves U64 (and floats), mirroring the engine's
                     // `reg_u64`: a materialized `u64 + u64` column must stay

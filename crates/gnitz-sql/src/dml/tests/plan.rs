@@ -50,9 +50,9 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         // the unbounded scan. An arithmetic WHERE has no `col OP literal` conjunct.
         (Some("v = 7"), "IndexRange", 0, 0),
         (Some("id + v = 7"), "None", 1, 0),
-        // A non-integral literal pins no key, and a top-level OR pins nothing
-        // at all: both stay a predicate over the whole table.
-        (Some("id = 3.5"), "None", 1, 0),
+        // A non-integral literal names no key, so the bound is the empty range;
+        // a top-level OR pins nothing and stays a predicate over the whole table.
+        (Some("id = 3.5"), "PkRange", 0, 0),
         (Some("v = 5 OR id = 1"), "None", 1, 0),
     ] {
         let bound_where = sql.map(|s| bind_where(s, &schema)).unwrap_or_default();

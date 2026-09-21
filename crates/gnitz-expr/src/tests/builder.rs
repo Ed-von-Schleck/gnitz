@@ -7,7 +7,7 @@ use crate::{CmpOp, IntArithOp, LogicalInstr as L, LogicalProgram};
 #[test]
 fn the_blob_round_trips_through_the_wire_decoder() {
     let mut b = ExprBuilder::new();
-    let c = b.emit(L::LoadConst { val: 1_234_567_890_123 });
+    let c = b.emit(L::LoadConst { val: 1_234_567_890_123, unsigned: false });
     let col = b.emit(L::LoadColInt { col: 0 });
     let cond = b.emit(L::Cmp { op: CmpOp::Gt, a: col, b: c });
     let s_idx = b.add_const_string("längre sträng");
@@ -47,12 +47,12 @@ fn the_builder_folds_identical_instructions_and_pool_entries() {
 #[test]
 fn a_lift_over_a_constant_folds_to_a_float_constant() {
     let mut b = ExprBuilder::new();
-    let c = b.emit(L::LoadConst { val: -7 });
+    let c = b.emit(L::LoadConst { val: -7, unsigned: false });
     let lifted = b.emit(L::IntToFloat { a: c });
     let prog = b.build(Some(lifted)).expect("a well-formed program");
     assert!(matches!(
         prog.instrs(),
-        [L::LoadConst { val: -7 }, L::LoadConst { val }] if f64::from_bits(*val as u64) == -7.0
+        [L::LoadConst { val: -7, unsigned: false }, L::LoadConst { val, unsigned: false }] if f64::from_bits(*val as u64) == -7.0
     ));
 
     // A lift over a computed register is untouched.
@@ -77,4 +77,38 @@ fn a_range_check_over_the_same_range_check_folds() {
     assert_ne!(narrower, narrow);
     let prog = b.build(Some(narrower)).expect("a well-formed program");
     assert_eq!(prog.instrs().len(), 3);
+}
+
+/// An unsigned constant lifts as the `u64` its bits are.
+#[test]
+fn a_lift_over_an_unsigned_constant_reads_it_unsigned() {
+    let mut b = ExprBuilder::new();
+    let c = b.emit(L::LoadConst { val: -1, unsigned: true });
+    let lifted = b.emit(L::IntToFloat { a: c });
+    let prog = b.build(Some(lifted)).expect("a well-formed program");
+    assert!(matches!(
+        prog.instrs(),
+        [_, L::LoadConst { val, unsigned: false }] if f64::from_bits(*val as u64) == 1.8446744073709552e19
+    ));
+}
+
+/// A day count widened to microseconds folds to its product, and an overflowing
+/// one stays the kernel that makes it NULL.
+#[test]
+fn a_to_micros_over_a_constant_folds_unless_it_overflows() {
+    let to_micros = |days: i64| {
+        let mut b = ExprBuilder::new();
+        let c = b.emit(L::LoadConst { val: days, unsigned: false });
+        let r = b.emit(L::Calendar {
+            op: crate::CalendarOp::ToMicros,
+            a: c,
+            micros: false,
+        });
+        b.build(Some(r)).expect("a well-formed program").instrs().to_vec()
+    };
+    assert!(matches!(
+        to_micros(2)[..],
+        [_, L::LoadConst { val: 172_800_000_000, unsigned: false }]
+    ));
+    assert!(matches!(to_micros(i64::MAX)[..], [_, L::Calendar { .. }]));
 }

@@ -107,13 +107,15 @@ fn a_constant_set_value_is_range_checked_at_bind() {
     assert!(matches!(&set[0].rhs, SetRhs::Const { cell, .. } if cell == &[255]));
 }
 
+/// A fraction into an integer column rounds as a DECIMAL→integer CAST does; a
+/// string that spells no integer is refused, naming it.
 #[test]
-fn a_float_or_string_literal_into_an_integer_column_names_the_literal() {
+fn a_float_or_string_literal_into_an_integer_column() {
     let schema = table(vec![col_def("i", TypeCode::I64, true)]);
-    let m = bind_err(compile("i = 1.5", &schema));
-    assert!(m.contains("1.5 is not a"), "{m}");
+    let set = compile("i = 1.5", &schema).unwrap();
+    assert!(matches!(&set[0].rhs, SetRhs::Const { cell, .. } if cell == &2i64.to_le_bytes()));
     let m = bind_err(compile("i = 'abc'", &schema));
-    assert!(m.contains("string literal for non-string column"), "{m}");
+    assert!(m.contains("column 'i': invalid I64 literal: 'abc'"), "{m}");
 }
 
 #[test]

@@ -192,7 +192,7 @@ fn filter_kernel_bench() {
         &pk_schema,
         vec![
             LogicalInstr::LoadColInt { col: 0 },
-            LogicalInstr::LoadConst { val: (n / 2) as i64 },
+            LogicalInstr::LoadConst { val: (n / 2) as i64, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Reg(2),
@@ -216,10 +216,10 @@ fn filter_kernel_bench() {
                 op: crate::program::IntUnaryOp::Neg,
                 a: Reg(0),
             },
-            LogicalInstr::LoadConst { val: 0 },
+            LogicalInstr::LoadConst { val: 0, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(1), b: Reg(2) },
             LogicalInstr::LoadColInt { col: 2 },
-            LogicalInstr::LoadConst { val: 80 },
+            LogicalInstr::LoadConst { val: 80, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Lt, a: Reg(4), b: Reg(5) },
             LogicalInstr::BoolBinary { is_or: false, a: Reg(3), b: Reg(6) },
         ],
@@ -245,7 +245,7 @@ fn filter_kernel_bench() {
         // `BoolBinary` pushes make that index no function of the loop counter —
         // so each one is read off the stream immediately before its push.
         let k = lit_instrs.len() as u16;
-        lit_instrs.push(LogicalInstr::LoadConst { val });
+        lit_instrs.push(LogicalInstr::LoadConst { val, unsigned: false });
         let c = lit_instrs.len() as u16;
         lit_instrs.push(LogicalInstr::Cmp { op, a: Reg(0), b: Reg(k) });
         acc_reg = Some(match acc_reg {
@@ -297,7 +297,7 @@ fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
         // cost a register write per morsel and blunt the bare shape's figure.
         return (instrs, Reg(0));
     }
-    instrs.push(LogicalInstr::LoadConst { val: k });
+    instrs.push(LogicalInstr::LoadConst { val: k, unsigned: false });
     let mut acc = 0u16;
     for i in 0..n_cmp {
         let base = 2 + i * 3;
@@ -552,7 +552,7 @@ fn expr_kernel_bench() {
         &ints,
         vec![
             load2(1),
-            LogicalInstr::LoadConst { val: 7 },
+            LogicalInstr::LoadConst { val: 7, unsigned: false },
             LogicalInstr::IntArith {
                 op: IntArithOp::Div,
                 a: Reg(0),
@@ -617,8 +617,8 @@ fn expr_kernel_bench() {
         &strs,
         vec![
             load_str(1),
-            LogicalInstr::LoadConst { val: 2 },
-            LogicalInstr::LoadConst { val: 6 },
+            LogicalInstr::LoadConst { val: 2, unsigned: false },
+            LogicalInstr::LoadConst { val: 6, unsigned: false },
             LogicalInstr::StrSubstr {
                 src: Reg(0),
                 start_reg: Reg(1),
@@ -671,7 +671,7 @@ fn expr_kernel_bench() {
         &str1,
         vec![
             load_str(1),
-            LogicalInstr::LoadConst { val: 10 },
+            LogicalInstr::LoadConst { val: 10, unsigned: false },
             LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: false },
         ],
         Reg(2),

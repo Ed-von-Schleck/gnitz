@@ -1,10 +1,9 @@
 use super::*;
 use crate::bind::bind_single_table;
-use crate::codec::pk_codec::extract_pk_value;
-use crate::ir::NumLit;
 use crate::test_support::{
-    bind_conjunct, bind_where, col_def, compound_schema_u64_u64, eq_expr, idx_metas, idx_metas_flagged, in_list_expr,
-    neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
+    bind_conjunct, bind_where, col_def, compound_schema_u64_u64, eq_expr, extract_pk_value, idx_metas,
+    idx_metas_flagged, in_list_expr, neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload,
+    uuid_schema_pk,
 };
 use gnitz_core::PkBuf;
 use gnitz_expr::SchemaFacts;
@@ -515,7 +514,7 @@ fn one_key_in_list_takes_an_index_bound() {
 fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     let schema = pk_schema(pk_tc);
 
-    // 1. extract_pk_value (INSERT row) — pk_codec, AST-based.
+    // 1. extract_pk_value (INSERT row), AST-based.
     let row = vec![literal.clone(), num_expr("0")];
     let got_insert: PkBuf =
         extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
@@ -566,40 +565,34 @@ fn every_pk_type_routes_to_one_packed_key() {
 #[test]
 fn range_cut_saturates() {
     use Cut::{After, Before};
-    let ck = |tc, s: &str, neg, mk: fn(u128) -> Cut| {
-        range_cut(
-            BoundLit::Num(NumLit {
-                mag: s.parse().expect("a digit run"),
-                neg,
-            }),
-            tc,
-            mk,
-        )
+    let ck = |tc, src: &str, mk: fn(u128) -> Cut| {
+        let lit = crate::bind::structural::bind_constant(&parse_expr_sql(src)).expect("a constant");
+        range_cut(place(&lit, gnitz_core::ColType::of(tc))?, tc, mk)
     };
-    assert_eq!(ck(TypeCode::I32, "5", false, Before), Some(Before(5)));
-    assert_eq!(ck(TypeCode::I32, "5", false, After), Some(After(5)));
-    assert_eq!(
-        ck(TypeCode::I32, "5", true, Before),
-        Some(Before((-5i32 as u32) as u128))
-    );
+    assert_eq!(ck(TypeCode::I32, "5", Before), Some(Before(5)));
+    assert_eq!(ck(TypeCode::I32, "5", After), Some(After(5)));
+    assert_eq!(ck(TypeCode::I32, "-5", Before), Some(Before((-5i32 as u32) as u128)));
     let (min, max) = ((i32::MIN as u32) as u128, i32::MAX as u128);
-    assert_eq!(ck(TypeCode::I32, "3000000000", false, Before), Some(After(max)));
-    assert_eq!(ck(TypeCode::I32, "3000000000", false, After), Some(After(max)));
-    assert_eq!(ck(TypeCode::I32, "3000000000", true, Before), Some(Before(min)));
-    assert_eq!(ck(TypeCode::I32, "3000000000", true, After), Some(Before(min)));
+    assert_eq!(ck(TypeCode::I32, "3000000000", Before), Some(After(max)));
+    assert_eq!(ck(TypeCode::I32, "3000000000", After), Some(After(max)));
+    assert_eq!(ck(TypeCode::I32, "-3000000000", Before), Some(Before(min)));
+    assert_eq!(ck(TypeCode::I32, "-3000000000", After), Some(Before(min)));
     // A magnitude past `i128` saturates on its sign too.
     assert_eq!(
-        ck(TypeCode::I32, "340282366920938463463374607431768211455", true, After),
+        ck(TypeCode::I32, "-340282366920938463463374607431768211455", After),
         Some(Before(min))
     );
-    assert_eq!(ck(TypeCode::U8, "300", false, Before), Some(After(255)));
-    assert_eq!(ck(TypeCode::String, "5", false, Before), None);
+    assert_eq!(ck(TypeCode::U8, "300", Before), Some(After(255)));
+    // A fraction cuts after the value below it, whichever the operator.
+    assert_eq!(ck(TypeCode::I32, "1.5", Before), Some(After(1)));
+    assert_eq!(ck(TypeCode::I32, "1.5", After), Some(After(1)));
+    assert_eq!(range_cut(Placed::At(5), TypeCode::String, Before), None);
     // U128 takes the full unsigned range, and a negative saturates to its floor.
     assert_eq!(
-        ck(TypeCode::U128, "340282366920938463463374607431768211455", false, Before),
+        ck(TypeCode::U128, "340282366920938463463374607431768211455", Before),
         Some(Before(u128::MAX))
     );
-    assert_eq!(ck(TypeCode::U128, "5", true, Before), Some(Before(0)));
+    assert_eq!(ck(TypeCode::U128, "-5", Before), Some(Before(0)));
 }
 
 #[test]
@@ -970,4 +963,69 @@ fn a_pk_range_bounding_nothing_falls_behind_every_index() {
     let sch = two_col(TypeCode::U64);
     let expr = bind_where("pk >= 0 AND val = 7", &sch);
     assert_eq!(kinds(&expr, &sch, &[(&[1], false)]), ["IndexRange", "PkRange"]);
+}
+
+// ------------------------------------------------------------------
+// Literals outside or between a column's values
+// ------------------------------------------------------------------
+
+/// The PK range `where_sql` walks, and whether it consumed every conjunct.
+fn pk_range_of(where_sql: &str, schema: &Schema) -> (RangeDescriptor, bool) {
+    let conjuncts = bind_where(where_sql, schema);
+    candidates(&conjuncts, schema, &[])
+        .into_iter()
+        .find_map(|c| match c.bound {
+            ReadBound::PkRange(desc) => Some((desc, c.consumed.len() == conjuncts.len())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{where_sql}: a PK range"))
+}
+
+/// A literal below every U64 value bounds the walk to nothing on the side it
+/// excludes, and to everything on the side it admits — the answer the filter
+/// gives the same predicate.
+#[test]
+fn a_u64_pk_against_a_negative_literal() {
+    use Cut::{After, Before};
+    let schema = pk_schema(TypeCode::U64);
+    let top = u128::from(u64::MAX);
+    assert_eq!(
+        pk_range_of("id < -1", &schema),
+        (RangeDescriptor::new(&[], Before(0), Before(0)), true)
+    );
+    assert_eq!(
+        pk_range_of("id = -1", &schema),
+        (RangeDescriptor::new(&[], Before(0), Before(0)), true)
+    );
+    assert_eq!(
+        pk_range_of("id > -5", &schema),
+        (RangeDescriptor::new(&[], Before(0), After(top)), true)
+    );
+}
+
+/// A DECIMAL literal finer than the column's scale cuts after the value below it.
+#[test]
+fn a_decimal_pk_against_a_finer_literal() {
+    use Cut::{After, Before};
+    let schema = Schema {
+        columns: vec![
+            gnitz_core::ColumnDef::typed("d", gnitz_core::ColType::decimal(2), false),
+            col_def("v", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let min = gnitz_core::FixedInt::I64.pack(i128::from(i64::MIN));
+    assert_eq!(
+        pk_range_of("d < 1.005", &schema),
+        (RangeDescriptor::new(&[], Before(min), After(100)), true)
+    );
+}
+
+/// A NULL member of a key list admits no row, and a member between two values
+/// names none.
+#[test]
+fn a_key_list_keeps_only_the_members_it_holds() {
+    let schema = pk_schema(TypeCode::I64);
+    let conjuncts = bind_where("id IN (1, NULL, 1.5)", &schema);
+    assert_eq!(set_keys_of(&conjuncts, &schema), Some(vec![1]));
 }

@@ -46,6 +46,21 @@ fn join_key_pair_rejects_incompatible() {
     assert!(bad(TypeCode::String, TypeCode::I64));
 }
 
+/// DATE counts days and TIMESTAMP microseconds, so neither an equality nor a
+/// range key pairs them.
+#[test]
+fn join_key_pair_rejects_date_with_timestamp() {
+    let (d, ts) = (col("d", TypeCode::Date), col("ts", TypeCode::Timestamp));
+    for err in [validate_join_key_pair(&d, &ts), validate_range_join_key_pair(&ts, &d)] {
+        let m = err.unwrap_err().to_string();
+        assert!(m.contains("differ in unit (days vs microseconds)"), "{m}");
+    }
+    assert_eq!(
+        validate_join_key_pair(&d, &col("i", TypeCode::I32)).unwrap(),
+        TypeCode::I32
+    );
+}
+
 /// A range bound must be order-preserving, so a string/blob content hash is
 /// rejected even though it is a legal *equality* key.
 #[test]

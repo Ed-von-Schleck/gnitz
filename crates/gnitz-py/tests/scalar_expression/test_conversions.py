@@ -108,10 +108,8 @@ def test_an_unsigned_value_keeps_its_domain_through_a_view_chain(client, schema_
     argument order and a SUM alike, and has to survive being written to one
     view's column and read back by the next.
 
-    Eliding a `u32 -> BIGINT UNSIGNED` cast because the value already fits would
-    leave the register signed while the column reads U64, and `> -1` would then
-    answer TRUE for the elided source and FALSE for the native one. Both must
-    read -1 as 2^64-1 and admit nothing."""
+    An elided `u32 -> BIGINT UNSIGNED` cast and a native one must agree: every
+    unsigned value is above -1, so `> -1` admits every row of both."""
     sn = schema_name
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
@@ -145,9 +143,7 @@ def test_an_unsigned_value_keeps_its_domain_through_a_view_chain(client, schema_
         (3, 0, 0, 0, 1, 1): 1,
     }
     assert bag(scanned(client, sn, "s2")) == {(1,): 1}
-    assert bag(scanned(client, sn, "reseeded")) == {}
-    assert bag(scanned(client, sn, "native")) == {}
-    # Control: the same predicate against 0 does match, so the empty results
-    # above are the compare domain and not a broken view.
-    assert bag(rows(client, sn, "SELECT id FROM t WHERE CAST(w AS BIGINT UNSIGNED) > 0")) \
-        == {(1,): 1, (2,): 1, (3,): 1}
+    every = {(1,): 1, (2,): 1, (3,): 1}
+    assert bag(scanned(client, sn, "reseeded")) == every
+    assert bag(scanned(client, sn, "native")) == every
+    assert bag(rows(client, sn, "SELECT id FROM t WHERE CAST(w AS BIGINT UNSIGNED) > 0")) == every

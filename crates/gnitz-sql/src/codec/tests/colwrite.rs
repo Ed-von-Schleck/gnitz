@@ -1,6 +1,6 @@
 use super::*;
-use crate::ast_util::bind_constant;
-use crate::test_support::{num_expr, uuid_schema_payload, uuid_str_expr};
+use crate::bind::structural::bind_constant;
+use crate::test_support::{col_def, num_expr, uuid_schema_payload, uuid_str_expr};
 use sqlparser::ast::Expr;
 
 /// The lone UUID cell of a column region, from its 16 LE bytes.
@@ -11,7 +11,7 @@ fn uuid_cell(col: &[u8]) -> u128 {
 /// Encode one written constant into a fresh column region, the way INSERT does.
 fn encoded(tc: TypeCode, e: &Expr) -> Result<Vec<u8>, GnitzSqlError> {
     let mut col = Vec::new();
-    append_value_to_col(&mut col, &mut Vec::new(), ColType::of(tc), &bind_constant(e)?)?;
+    append_value_to_col(&mut col, &mut Vec::new(), &col_def("c", tc, true), &bind_constant(e)?)?;
     Ok(col)
 }
 
@@ -36,7 +36,7 @@ fn a_null_cell_is_a_zeroed_cell_of_the_type_stride() {
         append_value_to_col(
             &mut col,
             &mut blob,
-            ColType::of(tc),
+            &col_def("c", tc, true),
             &bind_constant(&expr("NULL")).unwrap(),
         )
         .unwrap();
@@ -85,7 +85,7 @@ fn test_uuid_non_pk_string_literal_accepted() {
     // col 1 is UUID
     let c = bind_constant(&uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")).unwrap();
     let gnitz_core::ZSetBatch { payload, blob, .. } = &mut batch;
-    append_value_to_col(&mut payload[0].bytes, blob, ColType::of(TypeCode::UUID), &c).unwrap();
+    append_value_to_col(&mut payload[0].bytes, blob, &schema.columns[1], &c).unwrap();
     assert_eq!(
         uuid_cell(&batch.payload[0].bytes),
         0x550e8400_e29b_41d4_a716_446655440000_u128
@@ -151,21 +151,29 @@ fn a_float_column_takes_every_numeric_spelling() {
     assert_eq!(f32_of(&encoded(TypeCode::F32, &expr("0.1")).unwrap()), 0.1f64 as f32);
 }
 
-/// `-0` into a float column keeps its sign — which is why the sign travels
-/// beside the magnitude instead of being folded into it.
+/// `-0` is the integer zero, so a float column stores `+0.0`; `-0.0` is the
+/// float negative zero and keeps its sign.
 #[test]
-fn negative_zero_into_a_float_column_keeps_its_sign() {
-    for (tc, bits) in [
-        (TypeCode::F64, (-0.0f64).to_le_bytes().to_vec()),
-        (TypeCode::F32, (-0.0f32).to_le_bytes().to_vec()),
+fn only_a_float_negative_zero_keeps_its_sign() {
+    for (tc, pos, neg) in [
+        (
+            TypeCode::F64,
+            0.0f64.to_le_bytes().to_vec(),
+            (-0.0f64).to_le_bytes().to_vec(),
+        ),
+        (
+            TypeCode::F32,
+            0.0f32.to_le_bytes().to_vec(),
+            (-0.0f32).to_le_bytes().to_vec(),
+        ),
     ] {
-        assert_eq!(encoded(tc, &expr("-0")).unwrap(), bits, "{tc:?}");
+        assert_eq!(encoded(tc, &expr("-0")).unwrap(), pos, "{tc:?}");
+        assert_eq!(encoded(tc, &expr("-0.0")).unwrap(), neg, "{tc:?}");
     }
 }
 
-/// The two kind rejections: a number into a String column, and a string into a
-/// column that is neither String nor UUID — a BLOB included, whose values are
-/// bytes, not text.
+/// The kind rejections: a number into a String column, a string into a float or
+/// BLOB column, and a string that spells no value of an integer column.
 #[test]
 fn a_literal_of_the_wrong_kind_is_rejected_by_the_column_type() {
     let e = encoded(TypeCode::String, &expr("5")).unwrap_err();
@@ -173,28 +181,50 @@ fn a_literal_of_the_wrong_kind_is_rejected_by_the_column_type() {
         format!("{e:?}").contains("number literal for string column"),
         "got {e:?}"
     );
-    for tc in [TypeCode::U32, TypeCode::F64, TypeCode::Blob] {
+    for tc in [TypeCode::F64, TypeCode::Blob] {
         let e = encoded(tc, &expr("'5'")).unwrap_err();
         assert!(
-            format!("{e:?}").contains("string literal for non-string column"),
+            format!("{e:?}").contains("column 'c': string literal for non-string column"),
             "{tc:?}: got {e:?}"
         );
     }
+    let e = encoded(TypeCode::U32, &expr("'5'")).unwrap_err();
+    assert!(format!("{e:?}").contains("invalid U32 literal: '5'"), "got {e:?}");
 }
 
-/// A non-integral literal into an integer column names the literal it refused.
+/// A fraction into an integer column rounds half away from zero, as a
+/// DECIMAL→integer CAST does; an exponent spelling of an integer is that integer.
 #[test]
-fn a_float_literal_into_an_integer_column_names_the_literal() {
-    let e = encoded(TypeCode::I64, &expr("1.5")).unwrap_err();
-    assert!(format!("{e:?}").contains("1.5 is not a"), "got {e:?}");
+fn a_fraction_into_an_integer_column_rounds() {
+    assert_eq!(encoded(TypeCode::I64, &expr("2.5")).unwrap(), 3i64.to_le_bytes());
+    assert_eq!(encoded(TypeCode::I64, &expr("-2.5")).unwrap(), (-3i64).to_le_bytes());
+    assert_eq!(encoded(TypeCode::I64, &expr("1e3")).unwrap(), 1000i64.to_le_bytes());
+    // Rounding lands on the type's edge from just past it, and not from further.
+    assert_eq!(encoded(TypeCode::I8, &expr("127.4")).unwrap(), 127i8.to_le_bytes());
+    assert!(encoded(TypeCode::I8, &expr("127.5")).is_err());
 }
 
-/// A sign on a string is not a value: either sign used to write `abc`. Refused
-/// by the decoder, so no column type can be reached with one.
+/// A literal a column type has no value for names the literal it refused.
+#[test]
+fn a_fraction_into_a_date_column_names_the_literal() {
+    let e = encoded(TypeCode::Date, &expr("1.5")).unwrap_err();
+    assert!(format!("{e:?}").contains("1.5 is not a DATE value"), "got {e:?}");
+}
+
+/// A DATE literal into a TIMESTAMP column is its midnight.
+#[test]
+fn a_date_literal_into_a_timestamp_column_is_its_midnight() {
+    let days = crate::types::temporal_literal(TypeCode::Date, "2020-01-02").unwrap();
+    assert_eq!(
+        encoded(TypeCode::Timestamp, &expr("DATE '2020-01-02'")).unwrap(),
+        (days * gnitz_expr::calendar::MICROS_PER_DAY).to_le_bytes()
+    );
+}
+
+/// A sign on a string is not a value: either sign used to write `abc`.
 #[test]
 fn a_signed_string_literal_is_rejected() {
     for src in ["-'abc'", "+'abc'"] {
-        let e = bind_constant(&expr(src)).unwrap_err();
-        assert!(format!("{e:?}").contains("sign"), "{src}: got {e:?}");
+        assert!(bind_constant(&expr(src)).is_err(), "{src}");
     }
 }

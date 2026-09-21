@@ -11,7 +11,7 @@ use std::fmt::{self, Write as _};
 
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
 use crate::like::{fields, find};
-use crate::program::{FloatUnaryOp, IntArithOp, IntReg, IntUnaryOp};
+use crate::program::{FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
     compare_german_strings, german_string_heap, german_string_inline, low_bits_mask, null_word_get, read_u64_le,
@@ -1997,19 +1997,49 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer comparisons
             // ----------------------------------------------------------------
-            // `signed: false` compares the raw bits as u64 so values >= 2^63 order
-            // correctly. Branch on op/signed outside the per-row loop.
-            Instr::Cmp { op, dst, a, b, signed } => match op {
-                CmpOp::Eq => bin_op(scratch, &mo, dst, a, b, |x, y| (x == y) as i64),
-                CmpOp::Ne => bin_op(scratch, &mo, dst, a, b, |x, y| (x != y) as i64),
-                CmpOp::Gt if signed => bin_op(scratch, &mo, dst, a, b, |x, y| (x > y) as i64),
-                CmpOp::Gt => bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) > (y as u64)) as i64),
-                CmpOp::Ge if signed => bin_op(scratch, &mo, dst, a, b, |x, y| (x >= y) as i64),
-                CmpOp::Ge => bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) >= (y as u64)) as i64),
-                CmpOp::Lt if signed => bin_op(scratch, &mo, dst, a, b, |x, y| (x < y) as i64),
-                CmpOp::Lt => bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) < (y as u64)) as i64),
-                CmpOp::Le if signed => bin_op(scratch, &mo, dst, a, b, |x, y| (x <= y) as i64),
-                CmpOp::Le => bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) <= (y as u64)) as i64),
+            // One arm per (op, order), so the per-row loop carries no branch.
+            // `UnsignedSigned` decides a negative `y` by its sign alone.
+            Instr::Cmp { op, dst, a, b, order } => match (op, order) {
+                (CmpOp::Eq, IntOrder::Signed | IntOrder::Unsigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| (x == y) as i64)
+                }
+                (CmpOp::Ne, IntOrder::Signed | IntOrder::Unsigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| (x != y) as i64)
+                }
+                (CmpOp::Gt, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x > y) as i64),
+                (CmpOp::Ge, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x >= y) as i64),
+                (CmpOp::Lt, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x < y) as i64),
+                (CmpOp::Le, IntOrder::Signed) => bin_op(scratch, &mo, dst, a, b, |x, y| (x <= y) as i64),
+                (CmpOp::Gt, IntOrder::Unsigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) > (y as u64)) as i64)
+                }
+                (CmpOp::Ge, IntOrder::Unsigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) >= (y as u64)) as i64)
+                }
+                (CmpOp::Lt, IntOrder::Unsigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) < (y as u64)) as i64)
+                }
+                (CmpOp::Le, IntOrder::Unsigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| ((x as u64) <= (y as u64)) as i64)
+                }
+                (CmpOp::Eq, IntOrder::UnsignedSigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| (y >= 0 && x == y) as i64)
+                }
+                (CmpOp::Ne, IntOrder::UnsignedSigned) => {
+                    bin_op(scratch, &mo, dst, a, b, |x, y| (y < 0 || x != y) as i64)
+                }
+                (CmpOp::Lt, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                    (y >= 0 && (x as u64) < (y as u64)) as i64
+                }),
+                (CmpOp::Le, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                    (y >= 0 && (x as u64) <= (y as u64)) as i64
+                }),
+                (CmpOp::Gt, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                    (y < 0 || (x as u64) > (y as u64)) as i64
+                }),
+                (CmpOp::Ge, IntOrder::UnsignedSigned) => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                    (y < 0 || (x as u64) >= (y as u64)) as i64
+                }),
             },
 
             // ----------------------------------------------------------------

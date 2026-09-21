@@ -2,11 +2,11 @@ use std::convert::Infallible;
 
 use super::resolve::require_column;
 use crate::ast_util::{
-    bind_constant, bind_literal, classify_agg_call, col_ref_parts, function_positional_args, single_fn_name,
-    temporal_constant, Constant,
+    bind_literal, classify_agg_call, col_ref_parts, function_positional_args, peel_nested, single_fn_name,
+    temporal_constant,
 };
 use crate::error::GnitzSqlError;
-use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, NumLit, StrArg, StrFunc, TrimMode};
+use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode};
 use crate::types::{is_cast_target, sql_col_type};
 use gnitz_core::{ColumnDef, Schema};
 use gnitz_expr::CalendarOp;
@@ -320,30 +320,19 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         }
         Expr::UnaryOp { op, expr } => {
             let inner = bind_structural(expr, leaf)?;
-            // A negated literal leaves here as the literal `-1`, the one shape
-            // every consumer reads a constant by; the folds keep `LitWide`'s
-            // invariant that its value does not fit `i64`. Unary `+` folds over a
-            // numeric literal and nothing else, as in PostgreSQL: a total identity
-            // would newly accept `+'abc'` and `+(a > 1)`.
+            // A negated literal leaves here as the literal `-1`. Unary `+` folds
+            // over a numeric literal or NULL and nothing else, as in PostgreSQL:
+            // a total identity would accept `+'abc'` and `+(a > 1)`.
             match (op, inner) {
-                (UnaryOperator::Minus, BExpr::LitInt(v)) => Ok(v
-                    .checked_neg()
-                    .map_or(BExpr::LitWide(NumLit { mag: 1 << 63, neg: false }), BExpr::LitInt)),
-                (UnaryOperator::Minus, BExpr::LitFloat { v, dec }) => {
-                    Ok(BExpr::LitFloat { v: -v, dec: dec.map(|(u, s)| (-u, s)) })
-                }
-                (UnaryOperator::Minus, BExpr::LitWide(n)) => Ok(match n {
-                    NumLit { mag, neg: false } if mag == 1 << 63 => BExpr::LitInt(i64::MIN),
-                    NumLit { mag, neg } => BExpr::LitWide(NumLit { mag, neg: !neg }),
-                }),
-                (UnaryOperator::Minus, inner) => Ok(BExpr::Func {
+                (UnaryOperator::Minus, inner) => Ok(inner.negate_literal().unwrap_or_else(|inner| BExpr::Func {
                     f: NumFunc::Unary(FloatUnaryOp::Neg),
                     arg: Box::new(inner),
-                }),
+                })),
                 (UnaryOperator::Not, inner) => Ok(BExpr::Not(Box::new(inner))),
-                (UnaryOperator::Plus, inner @ (BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_))) => {
-                    Ok(inner)
-                }
+                (
+                    UnaryOperator::Plus,
+                    inner @ (BExpr::LitInt(_) | BExpr::LitFloat { .. } | BExpr::LitWide(_) | BExpr::LitNull),
+                ) => Ok(inner),
                 (o, _) => Err(GnitzSqlError::Unsupported(format!(
                     "unary operator {o:?} not supported"
                 ))),
@@ -419,12 +408,50 @@ pub(crate) fn maybe_negate<R>(node: BExpr<R>, negated: bool) -> BExpr<R> {
 
 /// The string a compile-time-data position (TRIM's byte set, LIKE's pattern)
 /// spells, read through [`bind_constant`] so `TRIM(s, ('ab'))` reads like
-/// `TRIM(s, 'ab')` and accepts the spellings every other literal position does.
-/// `None` for anything else — a NULL or numeric literal is a non-`LitStr`.
+/// `TRIM(s, 'ab')`. `None` for anything else.
 fn literal_expr_string(e: &Expr) -> Option<String> {
     match bind_constant(e) {
-        Ok(Constant { lit: BExpr::LitStr(s), .. }) => Some(s),
+        Ok(BExpr::LitStr(s)) => Some(s),
         _ => None,
+    }
+}
+
+/// The one decoder for a constant position: a literal, parenthesized and signed
+/// as written, bound by the expression binder, so a VALUES cell and a WHERE
+/// operand cannot disagree on one.
+pub(crate) fn bind_constant(e: &Expr) -> Result<BExpr<Infallible>, GnitzSqlError> {
+    let not_constant = || GnitzSqlError::Unsupported(format!("expected a constant, got the expression: {e}"));
+    // Checked on the AST first: the binder folds `COALESCE(2, x)` and `NULL IS
+    // NULL` to literals without binding the rest.
+    if !literal_shaped(e) {
+        return Err(not_constant());
+    }
+    let lit = bind_structural(e, &NoColumns)?;
+    lit.is_literal().then_some(lit).ok_or_else(not_constant)
+}
+
+/// Parentheses and `+`/`-` around a `Value`, a typed string, or a cast of a `Value`.
+fn literal_shaped(e: &Expr) -> bool {
+    match peel_nested(e) {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => literal_shaped(expr),
+        Expr::Value(_) | Expr::TypedString(_) => true,
+        Expr::Cast { expr, .. } => matches!(peel_nested(expr), Expr::Value(_)),
+        _ => false,
+    }
+}
+
+/// A constant position names no column.
+struct NoColumns;
+
+impl LeafBinder<Infallible> for NoColumns {
+    fn bind_column(&self, _: &Expr) -> Result<BExpr<Infallible>, GnitzSqlError> {
+        unreachable!("`literal_shaped` admits no identifier")
+    }
+    fn is_nullable(&self, r: &Infallible) -> bool {
+        match *r {}
     }
 }
 
@@ -754,9 +781,9 @@ fn round_scale(e: &Expr) -> Result<i8, GnitzSqlError> {
     // Every failure here reports the one `Plan` error, which names the range as
     // well as the shape; `LitInt` is what rejects a fractional scale.
     let bad = || GnitzSqlError::Plan("ROUND: scale must be an integer literal in -15..=15".to_string());
-    let c = bind_constant(e).map_err(|_| bad())?;
-    let BExpr::LitInt(mag) = c.lit else { return Err(bad()) };
-    let n = if c.negated { -mag } else { mag };
+    let BExpr::LitInt(n) = bind_constant(e).map_err(|_| bad())? else {
+        return Err(bad());
+    };
     i8::try_from(n).ok().filter(|n| (-15..=15).contains(n)).ok_or_else(bad)
 }
 

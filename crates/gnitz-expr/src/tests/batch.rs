@@ -175,12 +175,12 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
 
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },                             // r0 = col1
-        LogicalInstr::LoadConst { val: 1 },                              // r1 = 1
+        LogicalInstr::LoadConst { val: 1, unsigned: false },             // r1 = 1
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },       // r2 = col1 > 1
         LogicalInstr::LoadColInt { col: 2 },                             // r3 = col2
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },       // r4 = col2 > 1
         LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(4) }, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
-        LogicalInstr::LoadConst { val: 0 },                              // r6 = 0
+        LogicalInstr::LoadConst { val: 0, unsigned: false },             // r6 = 0
         LogicalInstr::IntArith {
             op: IntArithOp::Add,
             a: Reg(5),
@@ -352,7 +352,19 @@ fn run_binary_rows(
     b_null: &[bool],
     mk: impl Fn(Reg, Reg) -> LogicalInstr,
 ) -> Vec<(i64, bool)> {
-    let schema = TestSchema::new(&[(type_code::U64, false), (payload_tc, true), (payload_tc, true)], &[0]);
+    run_binary_rows_typed((payload_tc, payload_tc), a, b, a_null, b_null, mk)
+}
+
+/// [`run_binary_rows`] with `a` and `b` in columns of their own types.
+fn run_binary_rows_typed(
+    (a_tc, b_tc): (u8, u8),
+    a: &[i64],
+    b: &[i64],
+    a_null: &[bool],
+    b_null: &[bool],
+    mk: impl Fn(Reg, Reg) -> LogicalInstr,
+) -> Vec<(i64, bool)> {
+    let schema = TestSchema::new(&[(type_code::U64, false), (a_tc, true), (b_tc, true)], &[0]);
     let n = a.len();
     let view = make_n_col_view(
         &schema,
@@ -577,7 +589,7 @@ fn division_nulls_the_row_on_a_zero_or_null_divisor() {
 }
 
 /// Every arm of the integer and float compare kernels, against the Rust
-/// operator on the same values. `Instr::Cmp` branches on `(op, signed)` and
+/// operator on the same values. `Instr::Cmp` branches on `(op, order)` and
 /// `Instr::FCmp` on `op`, so the axes are swept rather than sampled: a
 /// hand-picked pair per operator leaves the arms that only differ on extreme
 /// values — the unsigned ones above `2^63`, and every float comparison against
@@ -597,24 +609,35 @@ fn cmp_want(op: CmpOp, ord: std::cmp::Ordering, eq: bool) -> i64 {
 }
 
 #[test]
-fn int_compare_agrees_with_the_rust_operator_at_both_signednesses() {
-    // Every ordered pair of a corpus straddling the sign boundary, so each
-    // operator sees both orders of every pair. `u64::MAX` is `-1` as `i64`:
-    // it sorts top unsigned and bottom signed, which is the whole difference
-    // between the two kernel arms.
-    let corpus = [0i64, 1, -1, 42, i64::MIN, i64::MAX];
+fn int_compare_reads_each_operand_with_its_own_signedness() {
+    // Every ordered pair of a corpus straddling the sign boundary, in all four
+    // column-type pairs: `-1` is `u64::MAX` read unsigned, so a mixed pair is
+    // where one shared signedness would answer wrongly.
+    let corpus = [i64::MIN, -5, -1, 0, 1, 1 << 62, i64::MAX];
     let pairs: Vec<(i64, i64)> = corpus.iter().flat_map(|&x| corpus.map(|y| (x, y))).collect();
     let a: Vec<i64> = pairs.iter().map(|p| p.0).collect();
     let b: Vec<i64> = pairs.iter().map(|p| p.1).collect();
     let no = vec![false; pairs.len()];
+    let value = |tc: u8, bits: i64| {
+        if tc == type_code::U64 {
+            i128::from(bits as u64)
+        } else {
+            i128::from(bits)
+        }
+    };
 
-    for (payload_tc, signed) in [(type_code::I64, true), (type_code::U64, false)] {
+    for (a_tc, b_tc) in [
+        (type_code::I64, type_code::I64),
+        (type_code::U64, type_code::U64),
+        (type_code::U64, type_code::I64),
+        (type_code::I64, type_code::U64),
+    ] {
         for op in CMP_OPS {
-            let got = run_binary_rows(payload_tc, &a, &b, &no, &no, |a, b| LogicalInstr::Cmp { op, a, b });
+            let got = run_binary_rows_typed((a_tc, b_tc), &a, &b, &no, &no, |a, b| LogicalInstr::Cmp { op, a, b });
             for (i, &(x, y)) in pairs.iter().enumerate() {
-                let ord = if signed { x.cmp(&y) } else { (x as u64).cmp(&(y as u64)) };
-                let want = cmp_want(op, ord, x == y);
-                assert_eq!(got[i], (want, false), "{op:?} signed={signed} ({x}, {y})");
+                let (x, y) = (value(a_tc, x), value(b_tc, y));
+                let want = cmp_want(op, x.cmp(&y), x == y);
+                assert_eq!(got[i], (want, false), "{op:?} ({a_tc}, {b_tc}) ({x}, {y})");
             }
         }
     }
@@ -926,9 +949,9 @@ fn length_of_null_is_null() {
 #[test]
 fn substring_window_matches_postgres_and_is_total() {
     let subst = |start: i64, len: Option<i64>| {
-        let mut instrs = vec![LogicalInstr::LoadConst { val: start }];
+        let mut instrs = vec![LogicalInstr::LoadConst { val: start, unsigned: false }];
         let len_reg = len.map(|l| {
-            instrs.push(LogicalInstr::LoadConst { val: l });
+            instrs.push(LogicalInstr::LoadConst { val: l, unsigned: false });
             Reg(2)
         });
         instrs.push(LogicalInstr::StrSubstr { src: Reg(0), start_reg: Reg(1), len_reg });
@@ -980,9 +1003,9 @@ fn substring_window_matches_postgres_and_is_total() {
 }
 
 /// `StrSubstr` reads its `start` and `len` through `IntReg`, whose arm is chosen
-/// by the register's U64 tracking. Every other substring test
-/// drives the bounds from `LoadConst`, which is always signed-tracked, so the
-/// unsigned arm is only reachable from a `U64` column — `SUBSTRING(s FROM ucol)`.
+/// by the register's U64 tracking. Every other substring test drives the bounds
+/// from a signed `LoadConst`; here the unsigned arm is reached from a `U64`
+/// column — `SUBSTRING(s FROM ucol)`.
 #[test]
 fn substring_bounds_read_an_unsigned_register_as_unsigned() {
     let schema = TestSchema::new(
@@ -1028,8 +1051,8 @@ fn substring_of_a_computed_string_is_a_sub_view_of_the_arena() {
     let got = run_str_rows(&[b"abcdefghijklmnop"], &[false], |a| {
         vec![
             LogicalInstr::StrCase { a, upper: true },
-            LogicalInstr::LoadConst { val: 3 },
-            LogicalInstr::LoadConst { val: 4 },
+            LogicalInstr::LoadConst { val: 3, unsigned: false },
+            LogicalInstr::LoadConst { val: 4, unsigned: false },
             LogicalInstr::StrSubstr {
                 src: Reg(1),
                 start_reg: Reg(2),
@@ -1471,7 +1494,7 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
             vec![
                 LogicalInstr::LoadColStr { col: 1 },
                 LogicalInstr::StrToInt { a: Reg(0), fi },
-                LogicalInstr::LoadConst { val: 5 },
+                LogicalInstr::LoadConst { val: 5, unsigned: false },
                 LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(1), b: Reg(2) },
             ],
             Reg(3),
@@ -1584,7 +1607,7 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
         &schema,
         vec![
             LogicalInstr::LoadColInt { col: 0 },
-            LogicalInstr::LoadConst { val: 2 },
+            LogicalInstr::LoadConst { val: 2, unsigned: false },
             LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) },
             LogicalInstr::LoadColStr { col: 1 },
             LogicalInstr::LoadColStr { col: 2 },
@@ -1826,7 +1849,7 @@ fn right_is_infallible_and_agrees_across_the_arms() {
     let view = make_string_view(&schema, &rows);
     let instrs = vec![
         LogicalInstr::LoadColStr { col: 1 },
-        LogicalInstr::LoadConst { val: 2 },
+        LogicalInstr::LoadConst { val: 2, unsigned: false },
         LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: false },
     ];
     let (fast, nullable) = both_arms("str_side", || scalar_prog(&schema, instrs.clone(), Reg(2), vec![]));
