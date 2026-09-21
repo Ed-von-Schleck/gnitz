@@ -248,3 +248,14 @@ pub(crate) fn scratch_table(dir: &str, schema: SchemaDescriptor) -> Table {
     )
     .unwrap()
 }
+
+/// Flip the low bit of `path`'s last byte with a `pwrite`, which a live mapping
+/// of the file sees; a truncating rewrite would fault that mapping instead.
+pub(crate) fn flip_last_byte_in_place(path: &std::path::Path) {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let last = file.metadata().unwrap().len() - 1;
+    let mut byte = [0u8; 1];
+    file.read_exact_at(&mut byte, last).unwrap();
+    file.write_all_at(&[byte[0] ^ 0x01], last).unwrap();
+}

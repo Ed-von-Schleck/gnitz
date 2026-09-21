@@ -598,7 +598,7 @@ impl RelationRegistry {
 
     /// Publish a new column schema for a registered base table in place (any
     /// column ALTER): update the registry copy and push the same value down into
-    /// the owned `Table`, which re-opens its shards if the region count grew.
+    /// the owned `Table`, which rebinds its shards if the region count grew.
     pub fn swap_schema(&mut self, id: i64, schema: SchemaDescriptor) -> Result<(), StoreError> {
         let entry = self.relation_mut_or_err(id)?;
         // Checked, not asserted: what a stale `key_spec` produces is a silently
@@ -612,7 +612,7 @@ impl RelationRegistry {
         entry
             .store
             .swap_schema(schema)
-            .map_err(|e| StoreError::storage(format!("ALTER on table {id}: reopening shards"), e))
+            .map_err(|e| StoreError::storage(format!("ALTER on table {id}: rebinding shards"), e))
     }
 
     // ── Registry reads ──────────────────────────────────────────────────

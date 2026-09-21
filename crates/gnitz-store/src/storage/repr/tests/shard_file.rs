@@ -2,7 +2,7 @@ use super::super::merge::ColumnarSource;
 use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::test_support::{make_schema_u64_i64, pk_only_schema};
+use crate::test_support::make_schema_u64_i64;
 use gnitz_expr::RowSource;
 use gnitz_wire::read_u64_le;
 use xorf::Filter;
@@ -40,12 +40,14 @@ fn write_open_roundtrip() {
 
     let image = std::fs::read(&path).unwrap();
     assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), n as u64);
-    assert!(read_u64_le(&image, OFF_SHARD_FILTER_OFFSET) > 0);
-    assert!(read_u64_le(&image, OFF_SHARD_FILTER_SIZE) > 0);
+    // The filter is the trailing directory entry.
+    let (filter_size, filter_encoding) = region_dir(&image, gnitz_wire::region::num_regions(1));
+    assert!(filter_size > 0);
+    assert_eq!(filter_encoding, ENCODING_RAW);
 
     // `open` itself rejects a bad magic or version, so a successful open is
     // what pins those; the rest is the row data.
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+    let shard = MappedShard::open(&cpath, &schema).unwrap();
     assert_eq!(shard.count, n);
     assert!(shard.has_shard_filter());
     for (i, (&pk, &val)) in pks.iter().zip(&vals).enumerate() {
@@ -57,21 +59,6 @@ fn write_open_roundtrip() {
             "the PK filter must contain PK {pk}"
         );
     }
-}
-
-#[test]
-fn empty_shard() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("empty.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-
-    // All-PK single-column schema (num_payload_cols = 0) → 4 regions.
-    let schema = pk_only_schema(&[type_code::U64]);
-    write_i64_shard(&cpath, &schema, &[], &[], ShardWriteOpts::default());
-
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-    assert_eq!(shard.count, 0);
-    assert!(!shard.has_shard_filter());
 }
 
 /// No false negatives through the real write → `open` → probe path, at a
@@ -101,7 +88,7 @@ fn no_false_negatives_through_write_open_probe() {
     let schema = make_schema_u64_i64();
     let rows = u64_rows(&members, &vec![1; n], &vec![0; n], &[vals]);
     write_i64_shard(&cpath, &schema, &rows, &[], ShardWriteOpts::default());
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+    let shard = MappedShard::open(&cpath, &schema).unwrap();
     assert!(shard.has_shard_filter());
 
     for &pk in &members {

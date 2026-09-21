@@ -2,14 +2,11 @@
 //!
 //! Used by compaction (`compact`) and query-time reads (`read_cursor`).
 //! Split into the cold open/validation path ([`open`]) and the hot per-row
-//! accessors ([`access`]); the type definitions, the `mmap` RAII handle and the
-//! FoR decoder live here, so both sub-modules read the (otherwise private)
-//! fields directly.
-//!
-//! `open` resolves every fixed-width region to a [`ColPtr`], so the accessors
-//! address every encoding the same way.
+//! accessors ([`access`]); the type definitions and the FoR decoder live here,
+//! so both sub-modules read the (otherwise private) fields directly.
 
 use std::cell::OnceCell;
+use std::rc::Rc;
 
 mod access;
 mod open;
@@ -35,10 +32,8 @@ pub(crate) enum PayloadRegion {
 /// German-string struct).
 static ZERO_CELL: [u8; 16] = [0; 16];
 
-/// FoR + byte-width-truncated integer payload region (`ENCODING_FOR`).
-/// `decoded` lazily holds the full `count × elem_width` little-endian image,
-/// populated at most once per shard open (`packed_bytes`); its content address
-/// is stable for the shard's lifetime, which the raw-pointer accessors rely on.
+/// An `ENCODING_FOR` payload region at `offset` in the mapping, and its decoded
+/// image once a read has needed it.
 pub(crate) struct PackedRegion {
     offset: usize,
     bw: usize,
@@ -50,42 +45,38 @@ pub(crate) struct PackedRegion {
 /// that variant is unrepresentable elsewhere rather than rejected per accessor.
 pub(crate) enum WeightRegion {
     Mapped(ColPtr),
-    /// Exactly two distinct weights, selected per row by `bitvec_off`.
+    /// Exactly two distinct weights, selected per row by the `count`-bit
+    /// vector at `bitvec`.
     TwoValue {
         value_a: i64,
         value_b: i64,
-        bitvec_off: usize,
+        bitvec: *const u8,
     },
 }
 
 pub(crate) struct MappedShard {
-    /// Owning RAII handle for the mmap.  Dropped last, so `as_slice()` /
-    /// raw pointers derived from it remain valid for the entire lifetime
-    /// of the `MappedShard`.
-    mmap: Mmap,
+    /// The mapping every pointer below points into, shared by every handle
+    /// [`rebind`](Self::rebind) derives from this one.
+    mmap: Rc<Mmap>,
     pub(crate) count: usize,
     pk: ColPtr,
     weight: WeightRegion,
     null_bmp: ColPtr,
     /// Non-PK column regions indexed by payload position, always one per payload
     /// column of the reader's schema, a column the file predates included.
-    pub(crate) col_regions: Vec<PayloadRegion>,
+    col_regions: Vec<PayloadRegion>,
     /// Null-word bits for the payload columns this file predates. OR'd into
     /// every null word the readers hand out, so a column the file has no bytes
     /// for reads NULL rather than as a non-null zero. `0` for a full-width shard.
-    pub(crate) null_pad_mask: u64,
-    pub(crate) blob_off: usize,
-    pub(crate) blob_len: usize,
-    /// PK membership filter over this file's own filter region, or `None` when
-    /// the file carries none.
-    shard_filter: Option<super::shard_filter::ShardFilter>,
+    null_pad_mask: u64,
+    blob: *const u8,
+    blob_len: usize,
+    /// The PK filter and its region, or `None` when the file carries none.
+    shard_filter: Option<(super::shard_filter::ShardFilter, *const u8)>,
     /// Encoded OPK width per row: the sum of the PK columns' widths.
-    pub(crate) pk_stride: usize,
-    /// `SHARD_FLAG_SKELETON`: this file's rows are (PK, coarse weight) pairs
-    /// with no payload — a capacity-bounded view's dehydrated shard. Every
-    /// payload column is one the file predates, and the read path folds a PK
-    /// group holding one of these rows to a single coarse row rather than to
-    /// (PK, payload) groups.
+    pk_stride: usize,
+    /// `SHARD_FLAG_SKELETON`: the read path folds a PK group holding one of
+    /// these rows to a single coarse row.
     skeleton: bool,
 }
 

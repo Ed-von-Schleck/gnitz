@@ -59,7 +59,7 @@ impl ShardIndex {
                     self.l0.push(entry);
                 } else {
                     let Some(level) = (e.level as usize).checked_sub(1).and_then(|i| self.levels.get_mut(i)) else {
-                        return Err(StorageError::InvalidVersion);
+                        return Err(StorageError::Corrupt("manifest level"));
                     };
                     level.get_or_create_guard(e.guard_key).entries.push(entry);
                 }

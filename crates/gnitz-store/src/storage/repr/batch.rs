@@ -21,8 +21,8 @@ fn next_blob_id() -> u64 {
 
 /// Max regions **including** the trailing blob region — the bound for the
 /// WAL/wire region-directory arrays (ptrs / sizes / offsets / positions).
-/// Owned by `gnitz_wire::wal` (the framer's directory cap); the two in-memory
-/// caps below derive from it.
+/// Owned by `gnitz_wire::region` (the framer's directory cap); the in-memory
+/// cap below derives from it.
 pub(crate) use gnitz_wire::MAX_WIRE_REGIONS;
 
 /// Regions tracked in the `offsets`/`strides` arrays: 3 fixed (pk, weight,
@@ -30,18 +30,12 @@ pub(crate) use gnitz_wire::MAX_WIRE_REGIONS;
 /// `self.blob` — so this is the wire cap less that slot.
 pub const MAX_BATCH_REGIONS: usize = MAX_WIRE_REGIONS - 1;
 
-/// How many payload columns the region array can hold — the writer's own cap.
-/// Deliberately looser than the semantic cap a real table hits first (64, from
-/// `MAX_COLUMNS` with at least one PK column), so a change to the PK rules
-/// cannot turn a valid shard into an error.
-pub(in crate::storage) const MAX_PAYLOAD_REGIONS: usize = MAX_BATCH_REGIONS - REG_PAYLOAD_START;
-
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
 // Three fixed regions (PK is `pk_stride` bytes/row; weight and null_bmp are
 // 8 bytes/row); payload columns start at `REG_PAYLOAD_START` and continue for
 // `num_payload_cols()` slots. Use these constants instead of bare numeric
-// literals. Owned by `gnitz_wire::wal` (the client, the wire codec, and the
+// literals. Owned by `gnitz_wire::region` (the client, the wire codec, and the
 // engine all encode the same convention), same as `MAX_WIRE_REGIONS`.
 pub(in crate::storage) use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 /// Stride (in bytes) of the weight and null_bmp fixed regions.

@@ -858,7 +858,7 @@ impl WorkerProcess {
                     let schema = *batch.schema();
                     // Index layout: PK = (indexed-key span, src_pk_cols). Any
                     // positive-weight match means the value is already in the
-                    // index. `open_cursor` keeps a compaction Io/InvalidShard
+                    // index. `open_cursor` keeps a compaction Io/Corrupt
                     // failure from silently turning a present key into "absent".
                     let mut cursor = ic.cursor();
                     // Prefix-match the WHOLE indexed-value span: OPK puts the

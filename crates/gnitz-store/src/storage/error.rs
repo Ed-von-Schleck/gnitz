@@ -1,10 +1,5 @@
 //! Domain-specific error type for the storage subsystem.
 //!
-//! Replaces the historical `Result<_, i32>` / negative-i32 sentinel pattern
-//! that several modules (wal, manifest, shard_file, shard_reader, run_set,
-//! table, shard_index, compact) used to share —
-//! sometimes with overlapping `-1`/`-2`/`-3` meanings.
-//!
 //! The mapping is intentionally coarse: the engine treats almost all
 //! storage failures as fatal (it `unwrap`s or `let _ =`s them), so the value
 //! of the type is in being *unambiguous and grep-able*, not in carrying rich
@@ -19,16 +14,8 @@ pub enum StorageError {
     /// a full disk from an exhausted fd table. `0` when the failure was
     /// synthesized rather than reported by a syscall.
     Io(i32),
-    /// File or buffer is shorter than the on-disk header / payload requires.
-    Truncated,
-    /// File magic number didn't match (wrong file type or corruption).
-    InvalidMagic,
-    /// On-disk format version is not supported by this build.
-    InvalidVersion,
-    /// xxh3 checksum did not match the stored value.
-    ChecksumMismatch,
-    /// Shard directory entry / encoding byte / region offset failed validation.
-    InvalidShard,
+    /// An on-disk image failed a check; the reason names which one.
+    Corrupt(&'static str),
     /// CString conversion failed (path contained an interior NUL).
     InvalidPath,
 }
@@ -47,11 +34,7 @@ impl fmt::Display for StorageError {
             // Not `from_raw_os_error(0)`: that renders "Success".
             StorageError::Io(0) => f.write_str("io error"),
             StorageError::Io(e) => write!(f, "io error: {}", std::io::Error::from_raw_os_error(*e)),
-            StorageError::Truncated => f.write_str("truncated"),
-            StorageError::InvalidMagic => f.write_str("invalid magic"),
-            StorageError::InvalidVersion => f.write_str("invalid version"),
-            StorageError::ChecksumMismatch => f.write_str("checksum mismatch"),
-            StorageError::InvalidShard => f.write_str("invalid shard layout"),
+            StorageError::Corrupt(reason) => write!(f, "corrupt: {reason}"),
             StorageError::InvalidPath => f.write_str("invalid path"),
         }
     }

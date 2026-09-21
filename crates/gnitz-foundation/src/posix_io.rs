@@ -205,16 +205,6 @@ pub fn map_file_reserved(fd: c_int, size: usize) -> std::io::Result<*mut u8> {
     Ok(ptr as *mut u8)
 }
 
-/// How a mapping will be read. `MADV_SEQUENTIAL` sets `VM_SEQ_READ`, so every
-/// fault issues a full forward window instead of faulting around: right for a
-/// single front-to-back pass, wasted I/O for a mapping probed at unpredictable
-/// offsets.
-#[derive(Clone, Copy)]
-pub enum Advice {
-    Sequential,
-    Default,
-}
-
 /// RAII handle for a read-only mmap'd file region, so the unmap path lives in
 /// exactly one place — no consumer's error return or Drop repeats the `munmap`.
 pub struct Mmap {
@@ -226,29 +216,31 @@ impl Mmap {
     /// mmap `[0, len)` of `fd` read-only. `len` must be `> 0`. The mapping holds
     /// its own reference to the inode, so the caller may close `fd` immediately
     /// after.
-    pub fn from_fd(fd: c_int, len: usize, advice: Advice) -> std::io::Result<Self> {
+    pub fn from_fd(fd: c_int, len: usize) -> std::io::Result<Self> {
         debug_assert!(len > 0);
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
         if raw == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
-        if matches!(advice, Advice::Sequential) {
-            // Best-effort read-ahead hint; errors are ignored.
-            unsafe {
-                libc::madvise(raw, len, libc::MADV_SEQUENTIAL);
-            }
-        }
         Ok(Mmap { ptr: raw as *mut u8, len })
     }
 
+    /// Hint that the mapping will be read front to back (`MADV_SEQUENTIAL`).
+    /// Best-effort: an error is ignored.
+    pub fn advise_sequential(&self) {
+        unsafe {
+            libc::madvise(self.ptr as *mut libc::c_void, self.len, libc::MADV_SEQUENTIAL);
+        }
+    }
+
     /// Open `path` read-only and mmap the whole (non-empty) file.
-    pub fn open_ro(path: &std::ffi::CStr, advice: Advice) -> std::io::Result<Self> {
+    pub fn open_ro(path: &std::ffi::CStr) -> std::io::Result<Self> {
         let fd = open_owned(path, libc::O_RDONLY)?;
         let len = fd_size(std::os::fd::AsRawFd::as_raw_fd(&fd))?;
         if len == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
         }
-        let map = Self::from_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), len, advice)?;
+        let map = Self::from_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), len)?;
         madvise_hugepage(map.ptr, map.len);
         Ok(map)
     }

@@ -73,3 +73,40 @@ fn a_relayout_writes_filtered_terminal_runs() {
         "the source set is removed"
     );
 }
+
+#[test]
+fn a_corrupt_source_body_fails_the_relayout_and_keeps_the_source_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let rel = dir.path().join("rel");
+    let rel = rel.to_str().unwrap();
+    seed_set(rel, &(0..100u128).map(|id| (id, id as i64)).collect::<Vec<_>>());
+
+    let source = ChildAddr::Worker { rank: 0, of: 1 }.dir(rel);
+    let shards: Vec<_> = std::fs::read_dir(&source)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(super::super::naming::SHARD_PREFIX)
+        })
+        .collect();
+    assert_eq!(shards.len(), 1, "the seeded set flushed one shard");
+    crate::test_support::flip_last_byte_in_place(&shards[0]);
+
+    assert!(matches!(
+        repartition_relation(rel, &schema(), 2, 4096, 64),
+        Err(StoreError::Storage {
+            err: StorageError::Corrupt("body checksum"),
+            ..
+        })
+    ));
+    assert!(shards[0].exists(), "the source shard survives");
+    assert_eq!(
+        open_child(rel, 0, 1).full_scan().count,
+        100,
+        "the source set still reads whole"
+    );
+}

@@ -57,18 +57,18 @@ fn decode_rejects_a_malformed_identity() {
         (
             "bad magic",
             forged_identity(0xDEADBEEF, VERSION),
-            StorageError::InvalidMagic,
+            StorageError::Corrupt("manifest magic"),
         ),
         // Any non-current version is rejected outright — there is no legacy reader.
         (
             "old version",
             forged_identity(MAGIC, VERSION - 1),
-            StorageError::InvalidVersion,
+            StorageError::Corrupt("manifest version"),
         ),
         (
             "short buffer",
             forged_identity(MAGIC, VERSION)[..IDENTITY + 7].to_vec(),
-            StorageError::Truncated,
+            StorageError::Corrupt("manifest truncated"),
         ),
     ];
     for (name, buf, want) in cases {
@@ -80,7 +80,7 @@ fn decode_rejects_a_malformed_identity() {
 fn trailing_bytes_report_checksum_mismatch() {
     let mut buf = encode(&sample(2));
     buf.extend_from_slice(&[0u8; 16]);
-    assert_eq!(decode(&buf).unwrap_err(), StorageError::ChecksumMismatch);
+    assert_eq!(decode(&buf).unwrap_err(), StorageError::Corrupt("manifest checksum"));
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn every_byte_past_the_identity_is_inside_the_digest() {
     sweep_bit_flips(&mut buf, span, |byte, bit, buf| {
         assert_eq!(
             decode(buf).unwrap_err(),
-            StorageError::ChecksumMismatch,
+            StorageError::Corrupt("manifest checksum"),
             "byte {byte} bit {bit}"
         );
     });

@@ -315,7 +315,7 @@ pub fn decode_mem_batch_from_wal_block<'a>(
 ) -> Result<MemBatch<'a>, &'static str> {
     // The writer↔reader region contract: `strides` is each fixed region's
     // per-row width, `nr` the trailing blob region's index — the same
-    // derivation the shard writer and `MappedShard::open` share.
+    // derivation the shard writer and the shard reader's bind share.
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
 

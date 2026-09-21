@@ -13,7 +13,7 @@ fn build_u128(pks: &[u128]) -> Option<BinaryFuse8> {
 /// [`ShardFilter`] parsed back out of them.
 fn through_the_region(pks: &[u128]) -> (Vec<u8>, ShardFilter) {
     let region = serialize(&build_u128(pks).unwrap());
-    let filter = ShardFilter::parse(&region, 0).expect("a freshly built filter parses back");
+    let filter = ShardFilter::parse(&region).expect("a freshly built filter parses back");
     (region, filter)
 }
 
@@ -33,8 +33,12 @@ fn no_key_set_produces_a_false_negative_through_its_region() {
     ] {
         let built = build_u128(&pks).unwrap();
         let region = serialize(&built);
-        let filter = ShardFilter::parse(&region, 0).expect("a freshly built filter parses back");
-        assert_eq!(filter.fingerprints_len, built.fingerprints.len(), "{what}");
+        let filter = ShardFilter::parse(&region).expect("a freshly built filter parses back");
+        assert_eq!(
+            filter.region_len,
+            Descriptor::DMA_LEN + built.fingerprints.len(),
+            "{what}"
+        );
         for &pk in &pks {
             assert!(filter.may_contain(&region, key_u128(pk)), "{what}: {pk:#034x}");
         }
@@ -52,28 +56,10 @@ fn false_positive_rate() {
     assert!(fp < 200, "FPR too high: {fp}/10000");
 }
 
-/// The fingerprints are addressed by file offset, so a region that does not
-/// start at 0 must probe identically.
-#[test]
-fn a_region_at_a_nonzero_offset_probes_the_same_bytes() {
-    let pks: Vec<u128> = (0u128..500).collect();
-    let region = serialize(&build_u128(&pks).unwrap());
-    let mut file = vec![0xABu8; 137];
-    let off = file.len();
-    file.extend_from_slice(&region);
-    let filter = ShardFilter::parse(&region, off).unwrap();
-    for &pk in &pks {
-        assert!(
-            filter.may_contain(&file, key_u128(pk)),
-            "false negative at region offset {off} for key {pk:#034x}",
-        );
-    }
-}
-
 #[test]
 fn parse_rejects_a_region_shorter_than_the_descriptor() {
-    assert!(ShardFilter::parse(&[], 0).is_none());
-    assert!(ShardFilter::parse(&[0u8; Descriptor::DMA_LEN - 1], 0).is_none());
+    assert!(ShardFilter::parse(&[]).is_none());
+    assert!(ShardFilter::parse(&[0u8; Descriptor::DMA_LEN - 1]).is_none());
 }
 
 /// Every rule, one forged descriptor each. `{sl:4, mask:3, scl:5}` is the
@@ -139,4 +125,11 @@ fn validate_rejects_each_way_a_descriptor_can_be_wrong() {
     for (name, d, len) in cases {
         assert!(validate(&d, len).is_none(), "{name} must be rejected");
     }
+}
+
+#[test]
+#[should_panic(expected = "a filter probes the region it was parsed from")]
+fn a_filter_refuses_a_region_of_another_length() {
+    let (region, filter) = through_the_region(&[1, 2, 3]);
+    filter.may_contain(&region[..region.len() - 1], key_u128(1));
 }

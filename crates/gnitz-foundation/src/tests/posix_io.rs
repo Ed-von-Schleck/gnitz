@@ -31,7 +31,7 @@ fn test_open_tmpfile_is_anonymous_and_round_trips() {
     assert_eq!(st.st_nlink, 0, "O_TMPFILE inode must have no directory entry");
     assert_eq!(st.st_size as usize, data.len(), "written size");
 
-    let mapped = Mmap::from_fd(fd, data.len(), Advice::Sequential).expect("map the anonymous file back");
+    let mapped = Mmap::from_fd(fd, data.len()).expect("map the anonymous file back");
     assert_eq!(mapped.as_slice(), data, "round-trip through the anonymous file");
 }
 

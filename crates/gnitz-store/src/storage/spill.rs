@@ -36,7 +36,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use super::error::StoreError;
 use super::repr::heap::{HeapNode, LoserTree};
 use crate::schema::key::compare_pk_bytes;
-use gnitz_foundation::posix_io::{self, Advice, Mmap};
+use gnitz_foundation::posix_io::{self, Mmap};
 
 /// Sort `idx` (rebuilt as `0..flat.len()/stride`) by the byte order of the
 /// fixed-`stride` records of `flat` — the OPK order every merge reads a PK
@@ -172,8 +172,9 @@ impl SpillSort {
         let stride = self.stride;
         let total: usize = self.runs.iter().sum();
         let fd = self.spill.as_ref().expect("spill fd after >= 1 run").as_raw_fd();
-        let map = Mmap::from_fd(fd, total * stride, Advice::Sequential)
+        let map = Mmap::from_fd(fd, total * stride)
             .map_err(|e| StoreError::storage("external sort: mmap spill file failed", e.into()))?;
+        map.advise_sequential();
 
         // Per-run geometry: byte offset of each run's first record and its
         // record count. Runs are non-empty, so every source primes at row 0.

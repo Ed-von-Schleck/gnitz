@@ -57,19 +57,20 @@ pub(crate) fn encode(m: &Manifest) -> Vec<u8> {
 }
 
 fn decode(buf: &[u8]) -> Result<Manifest, StorageError> {
-    let truncated = |_| StorageError::Truncated;
-    let (covered, digest) = buf.split_last_chunk::<8>().ok_or(StorageError::Truncated)?;
+    const TRUNCATED: StorageError = StorageError::Corrupt("manifest truncated");
+    let truncated = |_| TRUNCATED;
+    let (covered, digest) = buf.split_last_chunk::<8>().ok_or(TRUNCATED)?;
     let mut r = Reader::new(covered, "manifest");
     if r.u64().map_err(truncated)? != MAGIC {
-        return Err(StorageError::InvalidMagic);
+        return Err(StorageError::Corrupt("manifest magic"));
     }
     if r.u64().map_err(truncated)? != VERSION {
-        return Err(StorageError::InvalidVersion);
+        return Err(StorageError::Corrupt("manifest version"));
     }
     if gnitz_wire::checksum(covered) != u64::from_le_bytes(*digest) {
-        return Err(StorageError::ChecksumMismatch);
+        return Err(StorageError::Corrupt("manifest checksum"));
     }
-    decode_body(&mut r).map_err(truncated)
+    decode_body(&mut r).map_err(|_| StorageError::Corrupt("manifest body"))
 }
 
 fn decode_body(r: &mut Reader) -> Result<Manifest, String> {

@@ -11,19 +11,18 @@ use gnitz_expr::RowSource;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
 impl MappedShard {
-    /// `inline(always)` rather than the plain hint: the blob, the TwoValue
-    /// weight, the filter probe and the FoR image read through this, and the
-    /// plain hint is a no-op at `opt-level=0` — the debug binary the E2E suite
-    /// runs would pay a frame per such read.
-    #[inline(always)]
-    pub(crate) fn data(&self) -> &[u8] {
+    pub(super) fn data(&self) -> &[u8] {
         self.mmap.as_slice()
     }
 
-    /// Materialize a [`PackedRegion`] (FoR payload) to its full
-    /// `count × elem_width` little-endian raw image, decoding once per shard
-    /// open and caching it in the region's `OnceCell`; its content address is
-    /// stable for the shard's lifetime.
+    /// The TwoValue weight's bit vector at `bitvec`, one bit per row.
+    #[inline(always)]
+    fn two_value_bits(&self, bitvec: *const u8) -> &[u8] {
+        // SAFETY: bind checked the region holds `count.div_ceil(8)` bytes past `bitvec`.
+        unsafe { std::slice::from_raw_parts(bitvec, self.count.div_ceil(8)) }
+    }
+
+    /// A [`PackedRegion`]'s raw `count × elem_width` image, decoded on first use.
     fn packed_bytes<'a>(&'a self, region: &'a PackedRegion) -> &'a [u8] {
         region.decoded.get_or_init(|| {
             let mut out = vec![0u8; self.count * region.elem_width].into_boxed_slice();
@@ -69,7 +68,13 @@ impl MappedShard {
     /// A shard carrying no filter admits every key.
     pub(crate) fn shard_filter_may_contain(&self, probe_key: u64) -> bool {
         match &self.shard_filter {
-            Some(filter) => filter.may_contain(self.data(), probe_key),
+            Some((filter, region)) => {
+                // SAFETY: bind parsed `filter` from `region_len` bytes of the mapping at `region`.
+                filter.may_contain(
+                    unsafe { std::slice::from_raw_parts(*region, filter.region_len()) },
+                    probe_key,
+                )
+            }
             None => true,
         }
     }
@@ -151,8 +156,8 @@ impl MappedShard {
             copy_rows(self.pk, pk_stride, w.pk);
             match &self.weight {
                 WeightRegion::Mapped(cp) => copy_rows(*cp, FIXED_REGION_BYTES, w.weight),
-                WeightRegion::TwoValue { value_a, value_b, bitvec_off } => {
-                    let bitvec = &self.data()[*bitvec_off..];
+                WeightRegion::TwoValue { value_a, value_b, bitvec } => {
+                    let bitvec = self.two_value_bits(*bitvec);
                     for (i, cell) in w.weight.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                         let v = if two_value_bit(bitvec, start + i) {
                             value_b
@@ -217,7 +222,8 @@ impl RowSource for MappedShard {
 
     #[inline(always)]
     fn blob(&self) -> &[u8] {
-        &self.data()[self.blob_off..][..self.blob_len]
+        // SAFETY: bound from one span of the mapping `self` owns.
+        unsafe { std::slice::from_raw_parts(self.blob, self.blob_len) }
     }
 
     #[inline(always)]
@@ -228,7 +234,7 @@ impl RowSource for MappedShard {
 
 impl ColumnarSource for MappedShard {
     /// A packed column is decoded here if no read has decoded it yet. `schema`
-    /// is ignored: `open` already widened this shard's directory to it.
+    /// is ignored: binding already widened this shard's directory to it.
     fn to_unified(&self, _schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource<'_> {
         let cols_off = cols.len();
         cols.extend((0..self.col_regions.len()).map(|pi| self.payload_col(pi)));
@@ -246,8 +252,8 @@ impl ColumnarSource for MappedShard {
         debug_assert!(row < self.count);
         match &self.weight {
             WeightRegion::Mapped(cp) => read_i64_le(unsafe { cp.row(row, 8) }, 0),
-            WeightRegion::TwoValue { value_a, value_b, bitvec_off } => {
-                if two_value_bit(&self.data()[*bitvec_off..], row) {
+            WeightRegion::TwoValue { value_a, value_b, bitvec } => {
+                if two_value_bit(self.two_value_bits(*bitvec), row) {
                     *value_b
                 } else {
                     *value_a

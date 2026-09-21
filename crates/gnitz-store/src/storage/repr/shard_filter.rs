@@ -4,13 +4,11 @@
 //!
 //! The region is `[descriptor: DMA_LEN][fingerprints]` — the byte pair
 //! [`DmaSerializable`] exists to produce. `Descriptor::DMA_LEN` is a
-//! compile-time constant, so the split point needs no framing; the shard
-//! header's `OFF_SHARD_FILTER_OFFSET` / `_SIZE` pair bounds the region.
+//! compile-time constant, so the split point needs no framing; the shard's
+//! trailing directory entry bounds the region.
 //!
-//! Reading is zero-copy: [`ShardFilter`] keeps the descriptor bytes and the
-//! fingerprints' file offset, and probes through [`BinaryFuse8Ref`] against the
-//! shard's own mmap — the same `(offset, stride)` addressing every other region
-//! of the file uses. Only the write side owns a [`BinaryFuse8`].
+//! Reading is zero-copy: a probe reads the region in place through
+//! [`BinaryFuse8Ref`]. Only the write side owns a [`BinaryFuse8`].
 //!
 //! The crate parses a descriptor without validating it, and `contains` indexes
 //! the fingerprints from descriptor-derived values, so a corrupt descriptor
@@ -80,19 +78,16 @@ fn validate(d: &Descriptor, fingerprints_len: usize) -> Option<()> {
         .then_some(())
 }
 
-/// A shard's PK filter as it sits in the file: the descriptor bytes, and where
-/// the fingerprints start. Probing borrows them from the shard's mmap, so an
-/// open costs no copy of an array that grows with the shard's key count.
+/// A filter region's descriptor, validated for the region length it was parsed at.
 pub(crate) struct ShardFilter {
     descriptor: [u8; Descriptor::DMA_LEN],
-    fingerprints_off: usize,
-    fingerprints_len: usize,
+    region_len: usize,
 }
 
 impl ShardFilter {
-    /// Parse the filter region at `region_off` in the file. `None` when the
-    /// region is structurally invalid; the caller fails the open on it.
-    pub(crate) fn parse(region: &[u8], region_off: usize) -> Option<ShardFilter> {
+    /// Parse a filter region. `None` when the region is structurally invalid;
+    /// the caller fails the open on it.
+    pub(crate) fn parse(region: &[u8]) -> Option<ShardFilter> {
         let d: [u8; Descriptor::DMA_LEN] = region.get(..Descriptor::DMA_LEN)?.try_into().ok()?;
         // Field order is the LE layout the write side's `dma_copy_descriptor_to`
         // produces and `BinaryFuse8Ref::from_dma` reads back;
@@ -106,18 +101,22 @@ impl ShardFilter {
             },
             region.len() - Descriptor::DMA_LEN,
         )?;
-        Some(ShardFilter {
-            descriptor: d,
-            fingerprints_off: region_off + Descriptor::DMA_LEN,
-            fingerprints_len: region.len() - Descriptor::DMA_LEN,
-        })
+        Some(ShardFilter { descriptor: d, region_len: region.len() })
     }
 
-    /// Whether a [`crate::schema::key::probe_key`] may be present. `file` is the
-    /// shard image [`parse`](Self::parse) read its region from.
-    pub(crate) fn may_contain(&self, file: &[u8], probe_key: u64) -> bool {
-        let fingerprints = &file[self.fingerprints_off..self.fingerprints_off + self.fingerprints_len];
-        BinaryFuse8Ref::from_dma(&self.descriptor, fingerprints).contains(&probe_key)
+    pub(crate) fn region_len(&self) -> usize {
+        self.region_len
+    }
+
+    /// Whether a [`crate::schema::key::probe_key`] may be present in `region`,
+    /// the one this filter was parsed from.
+    pub(crate) fn may_contain(&self, region: &[u8], probe_key: u64) -> bool {
+        assert_eq!(
+            region.len(),
+            self.region_len,
+            "a filter probes the region it was parsed from"
+        );
+        BinaryFuse8Ref::from_dma(&self.descriptor, &region[Descriptor::DMA_LEN..]).contains(&probe_key)
     }
 }
 

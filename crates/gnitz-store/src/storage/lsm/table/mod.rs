@@ -322,6 +322,11 @@ impl Table {
         &self.shard_index.schema
     }
 
+    /// Verify every shard's body.
+    pub(crate) fn verify_shards(&self) -> Result<(), StorageError> {
+        self.shard_index.verify_shards()
+    }
+
     /// Publish `schema` across this store (any column ALTER). All-or-nothing:
     /// only the shard index's swap can fail, and it runs first.
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {

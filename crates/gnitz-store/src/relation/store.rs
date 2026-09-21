@@ -37,7 +37,7 @@ impl Store {
     }
 
     /// Publish a new schema for this store: here, and down into the `Table`,
-    /// which re-opens its shards if the region count grew.
+    /// which rebinds its shards if the region count grew.
     pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         if let Some(t) = self.table.as_mut() {
             t.swap_schema(schema)?;

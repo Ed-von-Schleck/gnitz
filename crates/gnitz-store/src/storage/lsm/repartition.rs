@@ -137,6 +137,9 @@ fn rewrite_targets(
             .collect::<Result<Vec<Table>, _>>()
     };
     let sources = open(source)?;
+    for t in &sources {
+        t.verify_shards()?;
+    }
     let mut cursor = read_cursor::from_runs(sources.iter().flat_map(Table::runs), *schema, 0);
     let mut targets = open(launched)?;
     let mut buffers: Vec<Batch> = targets.iter().map(|_| Batch::empty_with_schema(schema)).collect();

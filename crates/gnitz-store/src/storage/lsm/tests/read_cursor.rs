@@ -695,7 +695,7 @@ pub(super) fn write_test_shard(
         &rows,
         super::super::shard_file::ShardWriteOpts::default(),
     );
-    Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
+    Rc::new(MappedShard::open(&cpath, schema).unwrap())
 }
 
 /// A `Multi` merge over several *shard* sources folds cross-source weights:
@@ -1114,10 +1114,10 @@ fn bounded_string_read_carries_only_its_own_rows() {
             bb.finish()
                 .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
                 .unwrap();
-            Rc::new(MappedShard::open(&cpath, &schema, false).unwrap())
+            Rc::new(MappedShard::open(&cpath, &schema).unwrap())
         })
         .collect();
-    assert_eq!(shards[1].blob_len as u64, PER_SHARD * 40);
+    assert_eq!(shards[1].blob().len() as u64, PER_SHARD * 40);
 
     let mut c = create_read_cursor(&[], &shards, schema);
     c.seek_range_bytes(&10_001u64.to_be_bytes(), Some(&10_004u64.to_be_bytes()));
@@ -1163,7 +1163,7 @@ fn write_skeleton_shard(
     )
     .unwrap();
     // Opened under the *view* schema, which is how every reader sees it.
-    MappedShard::open(&cpath, schema, false).unwrap()
+    MappedShard::open(&cpath, schema).unwrap()
 }
 
 /// `(U64 PK | nullable STRING)` — a `PayloadCmpKind::Generic` schema whose
@@ -1200,15 +1200,14 @@ fn skeleton_shard_opens_under_the_view_schema() {
     let shard = write_skeleton_shard(dir.path(), "sk.db", &schema, &rows);
 
     assert!(shard.is_skeleton());
-    // The low bits are the writer's own arity — zero — so the ALTER-widening
-    // decode reads every schema payload column as one the file predates and
-    // pads it NULL.
+    // The writer's own arity is zero, so the ALTER-widening decode reads every
+    // schema payload column as one the file predates and pads it NULL.
     let raw = std::fs::read(dir.path().join("sk.db")).unwrap();
+    assert_eq!(gnitz_wire::read_u64_le(&raw, super::super::layout::OFF_FILE_NPC), 0);
     assert_eq!(
-        gnitz_wire::read_u64_le(&raw, super::super::layout::OFF_FILE_NPC),
+        gnitz_wire::read_u64_le(&raw, super::super::layout::OFF_FLAGS),
         super::super::layout::SHARD_FLAG_SKELETON,
     );
-    assert_eq!(shard.null_pad_mask, 1);
     for (r, &(_, w)) in rows.iter().enumerate() {
         assert!(
             gnitz_wire::null_word_get(shard.get_null_word(r), 0),
@@ -1219,60 +1218,6 @@ fn skeleton_shard_opens_under_the_view_schema() {
     assert!(
         shard.file_len() > 0 && shard.file_len() < 1024,
         "skeleton files are tiny"
-    );
-}
-
-/// Forging the flag bit onto a hydrated shard fails the descriptive digest — the
-/// bit sits inside `desc_digest`'s span, so it is as unforgeable as any other
-/// descriptive byte. Re-stamping the digest instead lets the forged word reach
-/// the structural check, where an arity above `MAX_PAYLOAD_REGIONS` is still
-/// rejected with the flag masked off.
-#[test]
-fn skeleton_flag_is_covered_by_the_digest_and_masked_before_the_bound() {
-    use super::super::layout::{OFF_DESC_CHECKSUM, OFF_FILE_NPC, SHARD_FLAG_SKELETON};
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1);
-    bb.put_int(42);
-    bb.end_row();
-    let path = dir.path().join("h.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    bb.finish()
-        .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
-        .unwrap();
-    let base = std::fs::read(&path).unwrap();
-
-    let patched = |patch: &dyn Fn(&mut Vec<u8>), restamp: bool| {
-        let mut d = base.clone();
-        patch(&mut d);
-        if restamp {
-            let nr = crate::storage::lsm::batch::strides_from_schema(&schema).1 as usize + 1;
-            let cs = super::super::layout::desc_digest(super::super::layout::shard_basename(cpath.to_bytes()), &d, nr);
-            gnitz_wire::write_u64_le(&mut d, OFF_DESC_CHECKSUM, cs);
-        }
-        std::fs::write(&path, &d).unwrap();
-        MappedShard::open(&cpath, &schema, false)
-    };
-
-    // Bare forgery: the digest rejects it.
-    assert_eq!(
-        patched(
-            &|d| gnitz_wire::write_u64_le(d, OFF_FILE_NPC, SHARD_FLAG_SKELETON | 1),
-            false
-        )
-        .err(),
-        Some(super::super::error::StorageError::ChecksumMismatch),
-    );
-    // Re-stamped, with an out-of-range arity under the flag: the bound still
-    // fires, so the flag cannot smuggle a count past it.
-    assert_eq!(
-        patched(
-            &|d| gnitz_wire::write_u64_le(d, OFF_FILE_NPC, SHARD_FLAG_SKELETON | 66),
-            true
-        )
-        .err(),
-        Some(super::super::error::StorageError::InvalidShard),
     );
 }
 

@@ -27,10 +27,10 @@ from _feedviews import JOIN, LINEAR, _base_tables, _churn
 from _read import bag, rows
 from _uid import uid as _uid
 
-# A skeleton shard stamps the high bit of its header's npc word. Nothing on the
+# A skeleton shard sets bit 0 of its header's flags word. Nothing on the
 # wire reports dehydration, so this is the one way to prove a sweep happened.
-_OFF_FILE_NPC = 32
-_SHARD_FLAG_SKELETON = 1 << 63
+_OFF_FLAGS = 40
+_SHARD_FLAG_SKELETON = 1
 
 # An inner equi-join whose right input is a filtered derived table, which fuses
 # into the join's own circuit rather than cutting a segment.
@@ -58,7 +58,7 @@ def _shard_files(data_dir, view_id):
 def _any_skeleton(data_dir, view_id):
     def is_skeleton(path):
         with open(path, "rb") as fh:
-            fh.seek(_OFF_FILE_NPC)
+            fh.seek(_OFF_FLAGS)
             return bool(struct.unpack("<Q", fh.read(8))[0] & _SHARD_FLAG_SKELETON)
 
     return any(is_skeleton(p) for p in _shard_files(data_dir, view_id))

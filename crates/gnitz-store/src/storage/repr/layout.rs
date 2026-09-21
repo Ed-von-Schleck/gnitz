@@ -1,9 +1,13 @@
 //! Shared shard file format constants, and the digest over the bytes that
 //! decide how the rest of a shard is read.
 
+use std::ffi::CStr;
+
+use super::super::error::StorageError;
+
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for a header/region layout change.
-pub(crate) const SHARD_EPOCH: u64 = 19;
+pub(crate) const SHARD_EPOCH: u64 = 20;
 
 /// Shard file format version, written into the header and compared for equality
 /// at open. A shard records only its payload-column count (`OFF_FILE_NPC`) and
@@ -11,36 +15,25 @@ pub(crate) const SHARD_EPOCH: u64 = 19;
 /// change reinterprets an existing file rather than failing to parse it — hence
 /// the digest. Compared, never parsed, so any mixing function does.
 pub(crate) const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
-pub(crate) const HEADER_SIZE: usize = 64;
-pub(crate) const DIR_ENTRY_SIZE: usize = 32;
+pub(crate) const HEADER_SIZE: usize = 56;
+pub(crate) const DIR_ENTRY_SIZE: usize = 16;
 pub(crate) const ALIGNMENT: usize = 64;
 
 pub(crate) const OFF_MAGIC: usize = 0;
 pub(crate) const OFF_VERSION: usize = 8;
+/// The row count (u64 LE), at least 1: every writer skips an empty output.
 pub(crate) const OFF_ROW_COUNT: usize = 16;
 pub(crate) const OFF_DESC_CHECKSUM: usize = 24;
-/// The writer's `schema.num_payload_cols()` (u64 LE) — the file's own arity,
-/// which fixes its region count and blob-region index. A reader whose schema is
-/// wider (post-`ALTER TABLE … ADD COLUMN`) walks the directory by this count and
-/// pads the columns past it to NULL.
+/// The writer's payload-column count (u64 LE), which fixes the file's region count.
 pub(crate) const OFF_FILE_NPC: usize = 32;
+/// Flag bits (u64 LE); see [`SHARD_FLAG_SKELETON`].
+pub(crate) const OFF_FLAGS: usize = 40;
+/// XXH3-64 over every region image, in directory order.
+pub(crate) const OFF_BODY_CHECKSUM: usize = 48;
 
-/// High bit of [`OFF_FILE_NPC`]: the file's payload columns are absent *by
-/// design* — it is a capacity-bounded view's skeleton shard, whose rows are one
-/// (PK, coarse weight) pair each. The low bits stay the writer's payload-column
-/// count (0 for a skeleton), which the reader bounds against
-/// `MAX_PAYLOAD_REGIONS`; this bit is masked off before that check.
-///
-/// A bare `file_npc == 0` would not say this: an all-PK base table widened by
-/// `ALTER TABLE … ADD COLUMN` produces the identical region shape with genuine
-/// NULL semantics, and the read path's coarsening comparators must not treat
-/// that table's cross-tier retract/insert pairs as one key. Bits 8..63 of the
-/// word are otherwise unused and already inside [`desc_digest`]'s span, so the
-/// bit is as unforgeable as any other descriptive byte.
-pub(crate) const SHARD_FLAG_SKELETON: u64 = 1 << 63;
-pub(crate) const OFF_SHARD_FILTER_OFFSET: usize = 40;
-pub(crate) const OFF_SHARD_FILTER_SIZE: usize = 48;
-pub(crate) const OFF_SHARD_FILTER_CHECKSUM: usize = 56;
+/// [`OFF_FLAGS`] bit: a capacity-bounded view's skeleton shard, one (PK, coarse
+/// weight) row per key.
+pub(crate) const SHARD_FLAG_SKELETON: u64 = 1;
 
 /// The shard filter's region is `[descriptor: DMA_LEN][fingerprints]`, split at
 /// a constant rather than at a framed length — so the dependency's descriptor
@@ -59,14 +52,9 @@ pub(crate) const fn dir_entry_off(i: usize) -> usize {
     HEADER_SIZE + i * DIR_ENTRY_SIZE
 }
 
-/// One region's directory entry: `offset` ‖ `size` ‖ `checksum` (u64 LE each),
-/// the encoding byte at +24, the rest reserved (and covered by [`desc_digest`]).
-/// The writer, the open-time validation and the format tests all go through this
-/// pair, so neither side can drift on the field order.
+/// A directory entry as stored: no offset, which [`region_spans`] derives.
 pub(crate) struct DirEntry {
-    pub offset: usize,
     pub size: usize,
-    pub checksum: u64,
     pub encoding: u8,
 }
 
@@ -74,20 +62,59 @@ impl DirEntry {
     pub(crate) fn read(image: &[u8], i: usize) -> Self {
         let d = dir_entry_off(i);
         DirEntry {
-            offset: gnitz_wire::read_u64_le(image, d) as usize,
-            size: gnitz_wire::read_u64_le(image, d + 8) as usize,
-            checksum: gnitz_wire::read_u64_le(image, d + 16),
-            encoding: image[d + 24],
+            size: gnitz_wire::read_u64_le(image, d) as usize,
+            encoding: image[d + 8],
         }
     }
 
     pub(crate) fn write(&self, image: &mut [u8], i: usize) {
         let d = dir_entry_off(i);
-        gnitz_wire::write_u64_le(image, d, self.offset as u64);
-        gnitz_wire::write_u64_le(image, d + 8, self.size as u64);
-        gnitz_wire::write_u64_le(image, d + 16, self.checksum);
-        image[d + 24] = self.encoding;
+        gnitz_wire::write_u64_le(image, d, self.size as u64);
+        image[d + 8] = self.encoding;
     }
+}
+
+/// Where the next region of a file starts, once the one before it ended at `end`.
+pub(crate) const fn region_start(end: usize) -> usize {
+    end.next_multiple_of(ALIGNMENT)
+}
+
+/// A directory entry placed in its file.
+pub(crate) struct Span {
+    pub off: usize,
+    pub size: usize,
+    pub encoding: u8,
+}
+
+impl Span {
+    pub(crate) fn bytes<'a>(&self, image: &'a [u8]) -> &'a [u8] {
+        &image[self.off..self.off + self.size]
+    }
+}
+
+/// Every directory entry of `image` placed in it: the batch regions
+/// `[pk, weight, null, payload…, blob]`, then the PK filter.
+pub(crate) fn region_spans(image: &[u8], file_npc: usize) -> Result<Vec<Span>, StorageError> {
+    let file_size = image.len();
+    let mut end = desc_len(file_npc);
+    if end > file_size {
+        return Err(StorageError::Corrupt("shorter than its directory"));
+    }
+    let spans = (0..=gnitz_wire::region::num_regions(file_npc))
+        .map(|i| {
+            let DirEntry { size, encoding } = DirEntry::read(image, i);
+            let off = region_start(end);
+            if off > file_size || size > file_size - off {
+                return Err(StorageError::Corrupt("region past the end"));
+            }
+            end = off + size;
+            Ok(Span { off, size, encoding })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if end != file_size {
+        return Err(StorageError::Corrupt("directory does not span the file"));
+    }
+    Ok(spans)
 }
 
 /// A `TwoValue` region's image: `value_a` LE ‖ `value_b` LE ‖ a `count`-bit
@@ -120,17 +147,16 @@ pub(crate) const fn for_image_len(count: usize, bw: usize) -> usize {
     FOR_HEADER + count * bw
 }
 
-/// The offset width an image of `size` bytes holds for `count` rows, or `None`
-/// unless some `bw` in `1..elem_width` gives exactly that size.
+/// The offset width an image of `size` bytes holds for `count ≥ 1` rows, or
+/// `None` unless some `bw` in `1..elem_width` gives exactly that size.
 pub(crate) fn for_image_bw(size: usize, count: usize, elem_width: usize) -> Option<usize> {
-    let bw = size.checked_sub(FOR_HEADER)?.checked_div(count)?;
+    let bw = size.checked_sub(FOR_HEADER)? / count;
     ((1..elem_width).contains(&bw) && size == for_image_len(count, bw)).then_some(bw)
 }
 
-/// Length of the descriptive prefix — header plus one directory entry per
-/// region — which is exactly the span [`desc_digest`] covers.
-pub(crate) const fn desc_len(num_regions: usize) -> usize {
-    dir_entry_off(num_regions)
+/// Header plus directory, by the file's own payload arity.
+pub(crate) const fn desc_len(file_npc: usize) -> usize {
+    dir_entry_off(gnitz_wire::region::num_regions(file_npc) + 1)
 }
 
 /// XXH3-64 over a shard's descriptive prefix (header + directory), its own eight
@@ -141,8 +167,8 @@ pub(crate) const fn desc_len(num_regions: usize) -> usize {
 /// same-shaped neighbour's first sector — fails to validate. It separates names,
 /// not directories: the naming grammar has no directory component, so a spill
 /// name repeats across sibling partition directories and seeds identically.
-pub(crate) fn desc_digest(basename: &[u8], data: &[u8], num_regions: usize) -> u64 {
-    gnitz_wire::digest_with_hole(basename, &data[..desc_len(num_regions)], OFF_DESC_CHECKSUM)
+pub(crate) fn desc_digest(path: &CStr, prefix: &[u8]) -> u64 {
+    gnitz_wire::digest_with_hole(shard_basename(path.to_bytes()), prefix, OFF_DESC_CHECKSUM)
 }
 
 /// A shard's manifest identity: the last component of its path. Every writer and

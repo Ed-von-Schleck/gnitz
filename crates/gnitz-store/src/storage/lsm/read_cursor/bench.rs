@@ -46,8 +46,7 @@ fn shard_merge_scan_bench() {
     // merge/consolidation work.
     const OFFSET: u64 = 100_000;
 
-    // Construction + open outside the timed region (validate_checksums = false,
-    // the query-time read path's flag).
+    // Construction + open outside the timed region.
     let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u64)
         .map(|s| {
             let mut bb = BatchBuilder::new(schema);
@@ -69,7 +68,7 @@ fn shard_merge_scan_bench() {
             batch
                 .write_as_shard(&cpath, super::super::shard_file::ShardWriteOpts::default())
                 .unwrap();
-            Rc::new(MappedShard::open(&cpath, &schema, false).unwrap())
+            Rc::new(MappedShard::open(&cpath, &schema).unwrap())
         })
         .collect();
 
@@ -327,7 +326,7 @@ fn adv_write_shard(
         &rows,
         super::super::shard_file::ShardWriteOpts::default(),
     );
-    Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
+    Rc::new(MappedShard::open(&cpath, schema).unwrap())
 }
 
 /// `n` shards whose keys interleave `[0, total)` round-robin (shard `s` owns keys

@@ -166,7 +166,8 @@ pub(super) fn guard_slot<T>(guards: &[T], key: &[u8], gk: impl Fn(&T) -> &[u8]) 
 /// One compaction's input set, as [`ShardIndex::compaction_inputs`] gathers it.
 #[derive(Default)]
 pub(super) struct CompactionInputs {
-    files: Vec<String>,
+    /// This compaction's own handles on the inputs' mappings.
+    shards: Vec<MappedShard>,
     max_lsn: u64,
     /// Registered bytes of the inputs — the amplification bench's read side,
     /// taken from the entries rather than re-`stat`ed off the paths.
@@ -185,23 +186,13 @@ pub(super) struct ShardEntry {
 }
 
 impl ShardEntry {
-    /// The one mapping call: [`open`](Self::open) builds a fresh entry around it,
-    /// [`ShardIndex::swap_schema`] swaps it into an existing one.
-    fn map(path: &str, schema: &SchemaDescriptor) -> Result<Rc<MappedShard>, StorageError> {
-        Ok(Rc::new(MappedShard::open(&super::super::cstr(path)?, schema, false)?))
-    }
-
     pub(crate) fn open(
         path: &str,
         schema: &SchemaDescriptor,
         max_lsn: u64,
         published: bool,
     ) -> Result<Self, StorageError> {
-        let shard = Self::map(path, schema)?;
-        // Every writer skips an empty output, so a zero-row file is damage.
-        if shard.count == 0 {
-            return Err(StorageError::InvalidShard);
-        }
+        let shard = Rc::new(MappedShard::open(&super::super::cstr(path)?, schema)?);
         let pk_min = PkBuf::from_bytes(shard.get_pk_bytes(0));
         let pk_max = PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1));
         Ok(ShardEntry {
@@ -457,21 +448,25 @@ impl ShardIndex {
         self.dropped_max
     }
 
-    /// Publish `schema`, re-mapping every registered shard when its payload arity
-    /// changed — a mapping's column regions are fixed at open. A failure on any
-    /// file leaves the index on the old schema.
+    /// Publish `schema`, rebinding every registered shard when its payload arity
+    /// changed. A failure on any shard leaves the index on the old schema.
     pub(super) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         if schema.num_payload_cols() != self.schema.num_payload_cols() {
-            let remapped: Vec<Rc<MappedShard>> = self
+            let rebound: Vec<Rc<MappedShard>> = self
                 .all_entries()
-                .map(|e| ShardEntry::map(&e.filename, &schema))
+                .map(|e| e.shard.rebind(&schema).map(Rc::new))
                 .collect::<Result<_, _>>()?;
-            for (e, shard) in self.all_entries_mut().zip(remapped) {
+            for (e, shard) in self.all_entries_mut().zip(rebound) {
                 e.shard = shard;
             }
         }
         self.schema = schema;
         Ok(())
+    }
+
+    /// Verify every registered shard's body.
+    pub(crate) fn verify_shards(&self) -> Result<(), StorageError> {
+        self.all_entries().try_for_each(|e| e.shard.verify_body())
     }
 }
 

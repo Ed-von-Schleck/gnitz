@@ -495,10 +495,11 @@ fn reload_and_widen_owe_no_sweep() {
     );
     idx.swap_schema(wide).unwrap();
     assert!(
-        idx.all_entries().all(|e| e.shard.col_regions.len() == 2),
-        "a payload widen re-maps every shard"
+        idx.all_entries()
+            .all(|e| gnitz_wire::null_word_get(e.shard.get_null_word(0), 1)),
+        "a payload widen rebinds every shard: the appended column reads NULL"
     );
-    assert!(idx.unsynced_paths().next().is_none(), "a re-mmap moves no durability");
+    assert!(idx.unsynced_paths().next().is_none(), "a rebind moves no durability");
 }
 
 #[test]
@@ -851,19 +852,6 @@ fn test_single_pk_probe_golden() {
     assert!(probe(&e_lo, &20u64.to_be_bytes()).is_some());
     assert!(probe(&e_lo, &25u64.to_be_bytes()).is_none(), "25 outside [10,20]");
     assert!(probe(&e_hi, &5u64.to_be_bytes()).is_none(), "5 below [30,40]");
-}
-
-/// Every shard writer skips an empty output, so a zero-row file can only be
-/// damage, and the open refuses it rather than register an entry with no
-/// bounds.
-#[test]
-fn a_zero_row_shard_is_refused_at_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let p = write_test_shard(dir.path(), "empty.db", &[], &[]);
-    assert!(matches!(
-        ShardEntry::open(&p, &make_schema_u64_i64(), 0, true),
-        Err(StorageError::InvalidShard)
-    ));
 }
 
 /// Compound range-prune correctness: pk_min is numerically greater

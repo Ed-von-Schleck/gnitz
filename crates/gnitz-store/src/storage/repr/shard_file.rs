@@ -24,7 +24,7 @@ fn encode_region<'a>(
     blob: usize,
     pack_ints: bool,
 ) -> (u8, Cow<'a, [u8]>) {
-    if n == 0 || i == blob {
+    if i == blob {
         return (ENCODING_RAW, Cow::Borrowed(src));
     }
     let width = src.len() / n;
@@ -153,11 +153,6 @@ pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
 }
 
 fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<BinaryFuse8> {
-    // `chunks_exact(0)` panics, and a non-empty region does not exclude a zero
-    // stride.
-    if pk_bytes.is_empty() || stride == 0 {
-        return None;
-    }
     // One hashed key per distinct PK. The PK region is sorted, so rows that
     // share a PK but differ in payload (valid under (PK, payload) element
     // identity) are adjacent — skipping chunks byte-equal to their predecessor
@@ -258,13 +253,15 @@ impl Batch {
     pub(crate) fn write_as_shard(&self, path: &CStr, opts: ShardWriteOpts) -> Result<(), StorageError> {
         let schema = self.schema();
         let n = self.count;
+        assert!(n > 0, "every writer skips an empty output");
         let mut regions = gnitz_wire::region::Regions::new();
         self.wire_regions(&mut regions);
         let num_regions = regions.len();
+        let npc = schema.num_payload_cols();
         #[cfg(debug_assertions)]
         self.debug_verify_consolidated(schema);
         debug_assert!(
-            !opts.skeleton || schema.num_payload_cols() == 0,
+            !opts.skeleton || npc == 0,
             "a skeleton shard must be written under the PK-only projection of its relation's schema",
         );
         // A store nothing point-probes writes no filter.
@@ -272,50 +269,40 @@ impl Batch {
             .then(|| build_shard_filter_from_pk_region(regions[REG_PK], schema.pk_stride()))
             .flatten()
             .map(|f| shard_filter::serialize(&f));
+        let images = regions
+            .iter()
+            .enumerate()
+            .map(|(i, &src)| encode_region(schema, i, src, n, num_regions - 1, opts.pack_ints))
+            .chain(std::iter::once((
+                ENCODING_RAW,
+                Cow::Borrowed(filter.as_deref().unwrap_or(&[])),
+            )));
 
         let staged = StagedFile::create(path)?;
         let file = staged.file();
-        let mut header = vec![0u8; desc_len(num_regions)];
+        let mut header = vec![0u8; desc_len(npc)];
+        let mut body = gnitz_wire::RowHasher::default();
         let mut end = header.len();
-        for (i, &src) in regions.iter().enumerate() {
-            let (encoding, image) = encode_region(schema, i, src, n, num_regions - 1, opts.pack_ints);
-            let offset = end.next_multiple_of(ALIGNMENT);
+        for (i, (encoding, image)) in images.enumerate() {
+            let offset = region_start(end);
+            body.update(&image);
             file.write_all_at(&image, offset as u64)?;
-            DirEntry {
-                offset,
-                size: image.len(),
-                checksum: gnitz_wire::checksum(&image),
-                encoding,
-            }
-            .write(&mut header, i);
+            DirEntry { size: image.len(), encoding }.write(&mut header, i);
             end = offset + image.len();
         }
-        let (filter_offset, filter_size, filter_checksum) = match &filter {
-            Some(f) => {
-                let offset = end.next_multiple_of(ALIGNMENT);
-                file.write_all_at(f, offset as u64)?;
-                end = offset + f.len();
-                (offset, f.len(), gnitz_wire::checksum(f))
-            }
-            None => (0, 0, 0),
-        };
-        // An empty trailing region sits past the last byte written.
         file.set_len(end as u64)?;
 
         write_u64_le(&mut header, OFF_MAGIC, SHARD_MAGIC);
         write_u64_le(&mut header, OFF_VERSION, SHARD_VERSION);
         write_u64_le(&mut header, OFF_ROW_COUNT, n as u64);
+        write_u64_le(&mut header, OFF_FILE_NPC, npc as u64);
         write_u64_le(
             &mut header,
-            OFF_FILE_NPC,
-            schema.num_payload_cols() as u64 | if opts.skeleton { SHARD_FLAG_SKELETON } else { 0 },
+            OFF_FLAGS,
+            if opts.skeleton { SHARD_FLAG_SKELETON } else { 0 },
         );
-        write_u64_le(&mut header, OFF_SHARD_FILTER_OFFSET, filter_offset as u64);
-        write_u64_le(&mut header, OFF_SHARD_FILTER_SIZE, filter_size as u64);
-        // Inside the digest below, so a forged filter cannot be re-stamped to match.
-        write_u64_le(&mut header, OFF_SHARD_FILTER_CHECKSUM, filter_checksum);
-        // Last, over every other field, seeded with the final name's basename.
-        let desc = desc_digest(shard_basename(path.to_bytes()), &header, num_regions);
+        write_u64_le(&mut header, OFF_BODY_CHECKSUM, body.digest());
+        let desc = desc_digest(path, &header);
         write_u64_le(&mut header, OFF_DESC_CHECKSUM, desc);
         file.write_all_at(&header, 0)?;
         staged.commit()
