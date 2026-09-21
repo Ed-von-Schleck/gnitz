@@ -1,18 +1,51 @@
 use super::*;
 
+/// A master catalog with only its system families registered, their stores open.
+/// [`Self::replay`] registers the rest.
+pub(crate) struct UnreplayedCatalog(CatalogEngine);
+
+impl UnreplayedCatalog {
+    /// Each system family's flushed LSN.
+    pub(crate) fn system_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
+        self.0.registry.system_flushed_lsns()
+    }
+
+    /// Ingest one recovered DdlSync group into `table_id`'s store and pin the
+    /// family to `lsn`, firing no hook.
+    pub(crate) fn stage(&mut self, table_id: i64, lsn: u64, batch: Batch) -> Result<(), String> {
+        let family = SysFamily::from_id(table_id).ok_or_else(|| format!("{table_id} is not a system table"))?;
+        let engine = &mut self.0;
+        engine.raise_next_id(family, &batch, 0..batch.len());
+        engine
+            .registry
+            .ingest(table_id, batch)
+            .map_err(|e| format!("sys-table ingest failed (family={table_id}): {e}"))?;
+        engine.registry.pin_lsn(table_id, lsn);
+        Ok(())
+    }
+
+    /// Load the sequence scalars and fire every family's hooks over its rows.
+    pub(crate) fn replay(self) -> Result<CatalogEngine, String> {
+        let mut engine = self.0;
+        engine.load_sequence_scalars();
+        engine.replay_catalog()?;
+        Ok(engine)
+    }
+}
+
 impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
 
     /// Opens or creates the database at `base_dir`, laid out for `num_workers`
-    /// workers, as the master: registers every relation, opens only the system
-    /// families' stores.
-    pub(crate) fn open_master(base_dir: &str, num_workers: u32) -> Result<Self, String> {
+    /// workers, as the master: registers the system families and opens their
+    /// stores.
+    pub(crate) fn open_master(base_dir: &str, num_workers: u32) -> Result<UnreplayedCatalog, String> {
         // Before any store opens.
         let dir_lock = lock_data_dir(base_dir, DIR_LOCK_RETRY_FOR)?;
 
         let mut engine = CatalogEngine {
             registry: RelationRegistry::master(num_workers, StoreConfig::from_env("GNITZ_")),
-            dag: DagEngine::new(),
+            dag: DagEngine::default(),
             base_dir: base_dir.to_string(),
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
@@ -41,9 +74,7 @@ impl CatalogEngine {
         }
 
         engine.seed_system_tables()?;
-        engine.load_sequence_scalars();
-        engine.replay_catalog()?;
-        Ok(engine)
+        Ok(UnreplayedCatalog(engine))
     }
 
     /// Take rank `rank` as `residency`: open this process's stores and rebuild
@@ -53,11 +84,11 @@ impl CatalogEngine {
         self.backfill_all_indexes()
     }
 
-    /// [`Self::open_master`], then the rest of a store-owning boot, as a
-    /// standalone host at rank 0.
+    /// [`Self::open_master`] and its replay, then the rest of a store-owning
+    /// boot, as a standalone host at rank 0.
     #[cfg(test)]
     pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
-        let mut engine = Self::open_master(base_dir, num_workers)?;
+        let mut engine = Self::open_master(base_dir, num_workers)?.replay()?;
         engine.registry.reconcile_child_dirs()?;
         engine.open_stores(0, Residency::Origin)?;
         Ok(engine)

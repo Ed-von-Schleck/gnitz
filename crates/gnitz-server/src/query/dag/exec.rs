@@ -2,7 +2,7 @@
 //! compiled shape runs through, and the DAG evaluation driver.
 
 use super::*;
-use crate::query::compiler::{Side, Sides, OUTPUT_RELAY};
+use crate::query::compiler::{MAX_SIDES, OUTPUT_RELAY};
 use gnitz_store::storage::StoreError;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`. Field order
@@ -64,12 +64,8 @@ impl Relay {
 }
 
 /// `view_id`'s compiled plan, which its epoch compiled on entry.
-fn plan_of(host: &mut impl DriveHost, view_id: i64) -> Result<&mut ViewPlan, StoreError> {
-    host.parts()
-        .0
-        .plans
-        .get_mut(&view_id)
-        .ok_or_else(|| StoreError::rejected(format!("view {view_id}: its plan was dropped mid-epoch")))
+fn plan_of(host: &mut impl DriveHost, view_id: i64) -> &mut ViewPlan {
+    host.parts().0.plan_mut(view_id).expect("compiled on the epoch's entry")
 }
 
 // ── Epoch execution ─────────────────────────────────────────────────────
@@ -94,54 +90,37 @@ fn run_view_epoch(host: &mut impl DriveHost, view_id: i64, input: Batch, src_id:
     run_plan(host, &relay, input, src_id).map_err(|e| e.to_string())
 }
 
-/// Seed every phase of a compiled plan and run its post combine. The sides run
-/// follow from the plan and `src_id` alone, so every worker relays alike.
+// `run_plan` matches on at most two scanning sides.
+const _: () = assert!(MAX_SIDES == 2);
+
+/// Run every side that scans `src_id` over its delta, then the post combine.
 fn run_plan(host: &mut impl DriveHost, relay: &Relay, input: Batch, src_id: i64) -> Result<Batch, StoreError> {
-    enum Shape {
-        Unexchanged,
-        Unary,
-        /// Whether each side scans the source.
-        Pair(bool, bool),
+    let code = &plan_of(host, relay.view_id).code;
+    if code.sides.is_empty() {
+        let seed = sub_seed(&code.post, input, src_id);
+        return run_post(host, relay.view_id, [seed]);
     }
-    let takes = |s: &Side| s.plan.source_reg_map.contains_key(&src_id);
-    let shape = match &plan_of(host, relay.view_id)?.code.sides {
-        Sides::Unexchanged { .. } => Shape::Unexchanged,
-        Sides::Unary(_) => Shape::Unary,
-        Sides::Pair([a, b]) => Shape::Pair(takes(a), takes(b)),
+    let mut scanning = (0..code.sides.len()).filter(|&i| code.sides[i].plan.source_reg_map.contains_key(&src_id));
+    let seeds = match [scanning.next(), scanning.next(), scanning.next()] {
+        // `a UNION a` scans the source on both sides.
+        [Some(a), Some(b), None] => [
+            Some(run_side(host, relay, a, input.clone_batch(), src_id)?),
+            Some(run_side(host, relay, b, input, src_id)?),
+        ],
+        [Some(a), None, None] => [Some(run_side(host, relay, a, input, src_id)?), None],
+        [None, None, None] => [None, None],
+        _ => unreachable!("more than {MAX_SIDES} sides"),
     };
-    match shape {
-        Shape::Unexchanged => {
-            let seed = sub_seed(&plan_of(host, relay.view_id)?.code.post, input, src_id);
-            run_post(host, relay.view_id, [seed])
-        }
-        Shape::Unary => {
-            let seed = run_side(host, relay, 0, Some(input), src_id)?;
-            run_post(host, relay.view_id, [seed])
-        }
-        Shape::Pair(ta, tb) => {
-            // `a UNION a` scans the source on both sides, so both take the delta.
-            let (da, db) = match (ta, tb) {
-                (true, true) => (Some(input.clone_batch()), Some(input)),
-                (true, false) => (Some(input), None),
-                (false, true) => (None, Some(input)),
-                (false, false) => (None, None),
-            };
-            let seeds = [
-                run_side(host, relay, 0, da, src_id)?,
-                run_side(host, relay, 1, db, src_id)?,
-            ];
-            run_post(host, relay.view_id, seeds)
-        }
-    }
+    run_post(host, relay.view_id, seeds.into_iter().flatten())
 }
 
-/// The post phase over the seeds every side produced.
-fn run_post<const N: usize>(
+/// The post phase over the seeds the sides produced.
+fn run_post(
     host: &mut impl DriveHost,
     view_id: i64,
-    seeds: [(vm::DeltaReg, Batch); N],
+    seeds: impl IntoIterator<Item = (vm::DeltaReg, Batch)>,
 ) -> Result<Batch, StoreError> {
-    let ViewPlan { code, state } = plan_of(host, view_id)?;
+    let ViewPlan { code, state } = plan_of(host, view_id);
     vm::execute_epoch_multi(&mut code.post.vm, state, seeds)
 }
 
@@ -151,17 +130,14 @@ fn run_side(
     host: &mut impl DriveHost,
     relay: &Relay,
     i: usize,
-    delta: Option<Batch>,
+    delta: Batch,
     src_id: i64,
 ) -> Result<(vm::DeltaReg, Batch), StoreError> {
     let (pre, seed_reg, emits_replica, schema) = {
-        let ViewPlan { code, state } = plan_of(host, relay.view_id)?;
-        let side = &mut code.sides.sides_mut()[i];
+        let ViewPlan { code, state } = plan_of(host, relay.view_id);
+        let side = &mut code.sides[i];
         // The pre-exchange schema, never the view's combine-widened one.
         let schema = *side.plan.vm.program.out_schema();
-        let Some(delta) = delta else {
-            return Ok((side.seed_reg, Batch::empty_with_schema(&schema)));
-        };
         let seed = sub_seed(&side.plan, delta, src_id);
         let pre = vm::execute_epoch_multi(&mut side.plan.vm, state, [seed])?;
         (pre, side.seed_reg, side.emits_replica, schema)
@@ -197,7 +173,7 @@ impl DagEngine {
     /// the view's memtable into its RAM tier once — so the view's first reads open
     /// over fewer sources, at one fold per backfill rather than one per chunk.
     pub(crate) fn finish_backfill(&mut self, registry: &mut RelationRegistry, view_id: i64) -> Result<(), String> {
-        if let Some(plan) = self.plans.get_mut(&view_id) {
+        if let Some(plan) = self.plan_mut(view_id) {
             for sub in plan.code.sub_plans_mut() {
                 sub.vm.release();
             }

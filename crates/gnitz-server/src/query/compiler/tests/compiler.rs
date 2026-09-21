@@ -38,7 +38,7 @@ fn more_than_two_exchange_shards_are_rejected() {
                 (7, 8, SLOT_IN),
             ],
         ),
-        "more than two exchange nodes"
+        format!("more than {MAX_SIDES} exchange nodes")
     );
 }
 

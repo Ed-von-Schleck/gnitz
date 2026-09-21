@@ -63,6 +63,22 @@ impl CatalogEngine {
         ids
     }
 
+    /// Raise the id counter past the id leading each of `batch`'s `rows`, when
+    /// `family` allocates ids.
+    pub(in crate::catalog) fn raise_next_id(
+        &mut self,
+        family: SysFamily,
+        batch: &Batch,
+        rows: impl Iterator<Item = usize>,
+    ) {
+        if family.allocates_ids() {
+            for i in rows {
+                let id = family.leading_id(batch.get_pk(i));
+                self.next_id = self.next_id.max(id.saturating_add(1));
+            }
+        }
+    }
+
     /// Allocate `count` contiguous catalog object ids and return the first.
     pub(crate) fn allocate_ids(&mut self, count: u64) -> Result<i64, String> {
         let base = self.next_id;
@@ -185,7 +201,7 @@ impl CatalogEngine {
     /// resume verdict and generation from the checkpoint rows beside it.
     pub(in crate::catalog) fn load_sequence_scalars(&mut self) {
         if let Some(v) = self.sequence_value(SEQ_ID_NEXT_ID) {
-            self.next_id = v as i64;
+            self.next_id = self.next_id.max(v as i64);
         }
         self.registry.set_resume_enabled(self.topology_matches());
         self.registry.set_resume_generation(self.durable_generation());

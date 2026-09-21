@@ -34,7 +34,10 @@ pub(super) use load::{load_circuit, read_circuit_node_row};
 pub(super) use routing::ViewMeta;
 pub(crate) use routing::{RelayRoute, OUTPUT_RELAY};
 
-/// The most nodes one view's circuit may hold; a real circuit is 15–40.
+/// The most `ExchangeShard`s, hence sides, one view's circuit may hold.
+pub(in crate::query) const MAX_SIDES: usize = 2;
+
+/// The most nodes one view's circuit may hold.
 pub(crate) const MAX_CIRCUIT_NODES: usize = 16_384;
 // Registers — up to three per node, plus the seeds — and child stores — up to
 // two per node — are `u16` ids.
@@ -155,8 +158,8 @@ impl LoadedCircuit {
     fn carve(&self) -> Result<Carve<'_>, String> {
         let shards: Vec<(NodeId, &[u32])> = self.exchange_shards().collect();
         // No planner path emits more: set-ops are binary, GROUP BY/DISTINCT unary.
-        if shards.len() > 2 {
-            return Err("more than two exchange nodes".into());
+        if shards.len() > MAX_SIDES {
+            return Err(format!("more than {MAX_SIDES} exchange nodes"));
         }
         // The view routes a pair's output by one key.
         if let [(_, a), (_, b)] = shards[..] {
@@ -237,43 +240,21 @@ fn emits_replica(plan: &SubPlan, registry: &RelationRegistry) -> bool {
         && !plan.vm.program.trims_per_worker()
 }
 
-/// What a compiled view repartitions through: one sub-pipeline per
-/// `ExchangeShard` in its circuit, each computing up to that shard, relayed, and
-/// seeding the post-combine phase.
-pub(super) enum Sides {
-    /// No `ExchangeShard`: `post` is the whole plan. `hydration` is `Some` iff the
-    /// view is capacity-bounded, which requires this shape.
-    Unexchanged { hydration: Option<Hydration> },
-    /// GROUP BY / SELECT DISTINCT / PK redistribution / range join.
-    Unary(Side),
-    /// A binary set-op.
-    Pair([Side; 2]),
-}
-
-impl Sides {
-    pub(in crate::query) fn sides_mut(&mut self) -> &mut [Side] {
-        match self {
-            Sides::Unexchanged { .. } => &mut [],
-            Sides::Unary(side) => std::slice::from_mut(side),
-            Sides::Pair(pair) => pair,
-        }
-    }
-}
-
 /// Output from `compile_view`, consumed directly by DagEngine as the cached
 /// plan.
 ///
 /// It carries no routing: that lives once on the `ViewMeta` derived at the
 /// view's registration, which the worker dispatch and the master relay both read.
 pub(super) struct CompileOutput {
-    /// What the circuit repartitions through, ahead of `post`.
-    pub(in crate::query) sides: Sides,
+    /// One per `ExchangeShard`, in circuit order, each relayed into `post`.
+    pub(in crate::query) sides: Vec<Side>,
     /// The combine phase every side's relayed batch seeds — and, for a circuit
     /// with no `ExchangeShard`, the whole plan.
     pub(in crate::query) post: SubPlan,
+    /// `Some` iff the view is capacity-bounded.
+    pub(in crate::query) hydration: Option<Hydration>,
     /// This worker computes the view's whole result locally: it is replicated, or
-    /// this process is the only worker. Not on [`ViewMeta`], which the master
-    /// derives under its own slot.
+    /// this process is the only worker.
     pub(in crate::query) self_contained: bool,
 }
 
@@ -281,11 +262,7 @@ impl CompileOutput {
     /// Every sub-plan of the view, for whole-plan register clears.
     pub(super) fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
         let Self { sides, post, .. } = self;
-        sides
-            .sides_mut()
-            .iter_mut()
-            .map(|s| &mut s.plan)
-            .chain(std::iter::once(post))
+        sides.iter_mut().map(|s| &mut s.plan).chain(std::iter::once(post))
     }
 }
 
@@ -330,7 +307,7 @@ pub(super) fn compile_view(
     if !post.vm.program.out_schema().same_physical_layout(view_schema) {
         return Err("sink schema does not match view output schema".into());
     }
-    let mut sides = side_plans
+    let sides = side_plans
         .into_iter()
         .zip(&carve.sides)
         .map(|(plan, c)| {
@@ -343,16 +320,10 @@ pub(super) fn compile_view(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let sides = match sides.len() {
-        0 => Sides::Unexchanged {
-            hydration: bounded
-                .then(|| derive_hydration(loaded, &post, &post_regs))
-                .transpose()?,
-        },
-        1 => Sides::Unary(sides.pop().expect("one side")),
-        _ => Sides::Pair(sides.try_into().ok().expect("carve admits at most two sides")),
-    };
-    Ok((CompileOutput { sides, post, self_contained }, layout))
+    let hydration = bounded
+        .then(|| derive_hydration(loaded, &post, &post_regs))
+        .transpose()?;
+    Ok((CompileOutput { sides, post, hydration, self_contained }, layout))
 }
 
 #[cfg(test)]

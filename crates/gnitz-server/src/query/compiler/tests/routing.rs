@@ -6,6 +6,18 @@ use gnitz_wire::type_code;
 use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
 use std::collections::HashMap;
 
+/// `derive`'s routing metadata, placed as a one-column-PK view.
+fn derive(loaded: &LoadedCircuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
+    ViewMeta::derive(loaded, registry, 1).map(|(meta, _)| meta)
+}
+
+/// A U64 PK and five I64 payload columns: every key a fixture names is payload.
+fn wide_schema() -> SchemaDescriptor {
+    let mut cols = vec![gnitz_store::schema::SchemaColumn::new(type_code::U64, 0)];
+    cols.extend((0..5).map(|_| gnitz_store::schema::SchemaColumn::new(type_code::I64, 0)));
+    SchemaDescriptor::new(&cols, &[0])
+}
+
 /// 3-column compound PK `(U32, U64, U64)` + one payload, so a `CLUSTER BY`
 /// prefix has more than one proper-prefix width to be tested at.
 fn three_col_pk_schema(dist_k: u8) -> SchemaDescriptor {
@@ -23,9 +35,7 @@ fn the_output_exchange_skip_reads_the_shard_key_in_the_sources_columns() {
             [(0, scan_delta(7)), (1, OpNode::ExchangeShard { shard_cols })],
             vec![(0, 1, SLOT_IN)],
         );
-        ViewMeta::derive(&loaded, &sources([(7, schema)]))
-            .unwrap()
-            .skips_exchange
+        derive(&loaded, &sources([(7, schema)])).unwrap().skips_exchange
     };
     assert!(
         skips(three_col_pk_schema(1), vec![0]),
@@ -53,9 +63,7 @@ fn the_output_exchange_skip_reads_the_shard_key_in_the_sources_columns() {
             ],
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         );
-        ViewMeta::derive(&loaded, &sources([(7, schema)]))
-            .unwrap()
-            .skips_exchange
+        derive(&loaded, &sources([(7, schema)])).unwrap().skips_exchange
     };
     assert!(behind_a_map(vec![0]), "the map's slot 0 is the source PK");
     assert!(
@@ -156,7 +164,7 @@ fn a_replicated_delta_feeding_more_than_its_join_scatters_every_source() {
             (7, make_schema_u64_i64().with_placement(Placement::Replicated)),
             (8, make_schema_u64_i64()),
         ]);
-        let meta = ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).unwrap();
+        let meta = derive(&loaded_for_test(nodes, edges), &ext).unwrap();
         (meta.source_route(7).is_some(), meta.source_route(8).is_some())
     };
     assert_eq!(scatters(false), (false, false), "join terms alone: both skip");
@@ -205,7 +213,7 @@ fn an_owner_trimmed_source_is_refused_the_replicated_partner_skip() {
         (7, make_schema_u64_i64()),
         (9, make_schema_u64_i64().with_placement(Placement::Replicated)),
     ]);
-    let meta = ViewMeta::derive(&loaded, &ext).unwrap();
+    let meta = derive(&loaded, &ext).unwrap();
     assert_eq!(
         join_cols(meta.source_route(7)),
         Some(vec![1]),
@@ -246,7 +254,7 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
                 (4, 5, SLOT_IN),
             ],
         );
-        ViewMeta::derive(&loaded, &sources([]))
+        derive(&loaded, &sources([(10, wide_schema())]))
     };
 
     let agreed = two_scans(&[1], &[1]).expect("one key reached twice routes by that key");
@@ -288,7 +296,7 @@ fn a_source_outside_every_join_states_no_route() {
             (5, 6, SLOT_IN),
         ],
     );
-    let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
+    let meta = derive(&loaded, &sources([(10, wide_schema()), (20, wide_schema())])).unwrap();
     assert_eq!(join_cols(meta.source_route(10)), Some(vec![2]));
     assert!(
         meta.source_route(20).is_none(),
@@ -329,7 +337,7 @@ fn a_join_operand_whose_source_states_no_route_is_rejected() {
         ],
     );
     assert!(
-        rejection(ViewMeta::derive(&loaded, &sources([]))).contains("states no scatter key"),
+        rejection(derive(&loaded, &sources([(10, wide_schema())]))).contains("states no scatter key"),
         "an auxiliary-only join operand must fail the compile"
     );
 }
@@ -368,7 +376,7 @@ fn the_route_is_the_stated_one_not_the_reindex_nodes_own_key() {
             (4, 5, SLOT_IN),
         ],
     );
-    let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
+    let meta = derive(&loaded, &sources([(7, wide_schema())])).unwrap();
     assert_eq!(join_cols(meta.source_route(7)), Some(vec![5]));
 }
 
@@ -399,10 +407,8 @@ fn a_stated_route_the_relation_cannot_route_by_is_rejected() {
             (3, 4, SLOT_IN),
         ],
     );
-    // Unknown to the registry, the key cannot be checked at all; known, it is.
-    assert!(ViewMeta::derive(&loaded, &sources([])).is_ok());
     assert!(
-        rejection(ViewMeta::derive(&loaded, &sources([(7, make_schema_u64_i64())]))).contains("source 7 scatter key"),
+        rejection(derive(&loaded, &sources([(7, make_schema_u64_i64())]))).contains("source 7 scatter key"),
         "a key naming a column the relation has not got must fail the compile"
     );
 }
@@ -435,7 +441,10 @@ fn a_band_join_whose_n_eq_overruns_the_reindex_key_is_rejected() {
         (4, 5, SLOT_IN),
     ];
     assert_eq!(
-        rejection(ViewMeta::derive(&loaded_for_test(nodes, edges), &sources([]))),
+        rejection(derive(
+            &loaded_for_test(nodes, edges),
+            &sources([(7, wide_schema()), (9, wide_schema())])
+        )),
         "band join: n_eq does not match the source's reindex key arity",
     );
 }
@@ -474,12 +483,17 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], distinct: [bool; 2], ext: Rela
     let sink = nodes.len();
     nodes.push((sink, OpNode::IntegrateSink));
     edges.push((shard, sink, SLOT_IN));
-    ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).expect("fixture routes")
+    derive(&loaded_for_test(nodes, edges), &ext).expect("fixture routes")
 }
 
-/// [`join_meta_in`] against a host that knows no schema, so nothing skips.
+/// [`join_meta_in`] over sources whose keys are all payload, so nothing skips.
 fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
-    join_meta_in(kind, key_cols, [false; 2], sources([]))
+    join_meta_in(
+        kind,
+        key_cols,
+        [false; 2],
+        sources([(7, wide_schema()), (9, wide_schema())]),
+    )
 }
 
 fn pure_range(n_eq: u8) -> JoinKind {
@@ -566,7 +580,7 @@ fn a_band_join_skips_beside_a_replicated_partner() {
 #[test]
 fn a_broadcast_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip() {
     let keyed_by_pk = |kind| {
-        let ext = sources([(7i64, make_schema_u64_i64())]);
+        let ext = sources([(7i64, make_schema_u64_i64()), (9, make_schema_u64_i64())]);
         join_meta_in(kind, &[0], [false; 2], ext).source_route(7).is_some()
     };
     assert!(!keyed_by_pk(JoinKind::Equi), "the equi join skips the relay");
@@ -610,7 +624,7 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
                 (6, 7, SLOT_IN),
             ],
         );
-        ViewMeta::derive(&loaded, &sources([(7, schema), (9, make_schema_u64_i64())])).unwrap()
+        derive(&loaded, &sources([(7, schema), (9, make_schema_u64_i64())])).unwrap()
     };
     let keyed = meta(make_schema_u64_i64());
     assert!(keyed.source_route(7).is_none(), "already on its PK's owner");
@@ -629,11 +643,7 @@ fn an_owner_trimmed_source_routes_by_its_pk_under_a_broadcast_join() {
 /// a re-keying `Map` with neither — is asserted on a circuit carrying it ALONE.
 #[test]
 fn pk_source_names_only_the_relation_whose_pk_region_survives_to_the_sink() {
-    let pk_source_of = |nodes, edges| {
-        ViewMeta::derive(&loaded_for_test(nodes, edges), &sources([]))
-            .unwrap()
-            .pk_source
-    };
+    let pk_source_of = |nodes, edges| pk_source(&loaded_for_test(nodes, edges));
     assert_eq!(
         pk_source_of(
             HashMap::from([(0, scan_delta(7)), (1, OpNode::IntegrateSink)]),
@@ -792,7 +802,7 @@ fn joins_calling_for_different_relays_are_rejected() {
         "circuit joins need different relays"
     );
     assert_eq!(
-        rejection(ViewMeta::derive(&two_joins(JoinKind::Cross), &sources([])).map(drop)),
+        rejection(derive(&two_joins(JoinKind::Cross), &sources([])).map(drop)),
         "circuit joins need different relays",
         "the compile is refused"
     );
@@ -903,7 +913,7 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
             [(0, a), (1, b), (2, OpNode::Union), (3, OpNode::IntegrateSink)],
             vec![(0, 2, SLOT_IN), (1, 2, SLOT_B), (2, 3, SLOT_IN)],
         );
-        let meta = ViewMeta::derive(&loaded, &sources([])).unwrap();
+        let meta = derive(&loaded, &sources([(10, wide_schema()), (11, wide_schema())])).unwrap();
         let mut got: Vec<(i64, Vec<u32>)> = meta
             .source_bounds
             .iter()
@@ -929,5 +939,38 @@ fn a_source_scanned_once_keeps_its_backfill_bound() {
         bounds_of(scan(10, None), scan(11, None)),
         vec![],
         "an unbounded scan has none"
+    );
+}
+
+#[test]
+fn a_scatter_key_over_an_unscanned_source_is_rejected() {
+    let loaded = loaded_for_test(
+        [
+            (0, scan_delta(7)),
+            (1, scatter_reindex(9, &[1])),
+            (2, OpNode::IntegrateSink),
+        ],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
+    );
+    assert_eq!(
+        rejection(derive(&loaded, &sources([(7, wide_schema()), (9, wide_schema())]))),
+        "source 9 states a scatter key but is not scanned"
+    );
+}
+
+#[test]
+fn a_scan_of_an_unregistered_relation_is_rejected() {
+    let loaded = loaded_for_test(
+        [
+            (0, scan_delta(7)),
+            (1, scan_delta(8)),
+            (2, OpNode::Union),
+            (3, OpNode::IntegrateSink),
+        ],
+        vec![(0, 2, SLOT_IN), (1, 2, SLOT_B), (2, 3, SLOT_IN)],
+    );
+    assert_eq!(
+        rejection(derive(&loaded, &sources([(7, wide_schema())]))),
+        "source 8 is not a registered relation"
     );
 }

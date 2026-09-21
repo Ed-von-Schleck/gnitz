@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::catalog::CatalogEngine;
+use crate::catalog::{CatalogEngine, UnreplayedCatalog};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 
@@ -42,10 +42,10 @@ fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, 
     })
 }
 
-/// Master pre-fork replay of every committed DdlSync group above its family's
-/// flushed LSN.
-fn recover_system_tables_from_sal(tail: CommittedTail, catalog: &mut CatalogEngine) -> Result<(), String> {
-    let family_lsns = catalog.registry.system_flushed_lsns();
+/// Stage every committed DdlSync group above its family's flushed LSN into the
+/// system stores.
+fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
+    let family_lsns = catalog.system_flushed_lsns();
     let mine = |msg: &SalMessage| {
         msg.kind == SalMessageKind::DdlSync && family_lsns.get(&(msg.target_id as i64)).is_some_and(|&f| msg.lsn > f)
     };
@@ -63,8 +63,8 @@ fn recover_system_tables_from_sal(tail: CommittedTail, catalog: &mut CatalogEngi
         let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
             continue;
         };
-        // `ddl_sync`: master-validated rows that already carry a drop's children.
-        catalog.ddl_sync(msg.target_id as i64, msg.lsn, batch).map_err(|e| {
+        // Master-validated rows that already carry a drop's children.
+        catalog.stage(msg.target_id as i64, msg.lsn, batch).map_err(|e| {
             format!(
                 "SAL system-table recovery apply failed (table_id={}, lsn={}): {e}",
                 msg.target_id, msg.lsn
@@ -386,9 +386,7 @@ fn run_worker_child(
 
 /// The master's half of recovery before any worker exists: the sweep set every
 /// worker inherits, and a zone-LSN seed above every system-family counter.
-fn master_pre_fork_recovery(catalog: &mut CatalogEngine, tail: CommittedTail) -> Result<(Vec<i64>, u64), String> {
-    recover_system_tables_from_sal(tail, catalog)?;
-
+fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<i64>, u64), String> {
     // G → G+1, the resume generation left at G: until `boot_checkpoint`
     // restamps at G+1, a crash rebuilds every view instead of resuming it.
     catalog.advance_durable_generation()?;
@@ -397,7 +395,7 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine, tail: CommittedTail) ->
     }
     inject_recovery_panic("genbump");
 
-    // Reclaim every directory a committed DROP left behind. After both replays,
+    // Reclaim every directory a committed DROP left behind. After the replay,
     // so a committed-but-unflushed CREATE is not mistaken for an orphan, and
     // before the fork, so no worker is applying a DdlSync the master emitted.
     catalog.reclaim_orphan_dirs();
@@ -519,7 +517,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
 
     gnitz_info!("Opening database at {}", data_dir);
 
-    let catalog =
+    let mut opened =
         CatalogEngine::open_master(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
 
     gnitz_note!("Starting {num_workers} workers");
@@ -528,10 +526,13 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     let ipc = acquire_shared_ipc(data_dir, nw)?;
     gnitz_debug!("SAL fd={}", ipc.sal_fd);
 
+    stage_system_tail(ipc.tail, &mut opened)?;
+    let catalog = opened.replay().map_err(|e| format!("failed to replay catalog: {e}"))?;
+
     // Leaked: the dispatcher and reactor borrow it for the life of the process.
     let catalog: &'static mut CatalogEngine = Box::leak(Box::new(catalog));
 
-    let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog, ipc.tail)?;
+    let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog)?;
 
     let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, placement.as_ref())?;
 

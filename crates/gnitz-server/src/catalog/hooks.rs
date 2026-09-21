@@ -9,12 +9,7 @@ impl CatalogEngine {
     // when its register hook runs: live DDL applies ascending `topo_priority`, and
     // boot replay opens every sys store first.
     pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        if family.allocates_ids() {
-            for i in batch.live_rows() {
-                let id = family.leading_id(batch.get_pk(i));
-                self.next_id = self.next_id.max(id.saturating_add(1));
-            }
-        }
+        self.raise_next_id(family, batch, batch.live_rows());
         match family {
             SysFamily::Schema => self.apply_schema_caches(batch),
             SysFamily::Table | SysFamily::View => {
@@ -28,7 +23,7 @@ impl CatalogEngine {
             }
             // `_sequences` rows drive no cache.
             SysFamily::Sequence => {}
-            SysFamily::CircuitNodes => self.dag.apply_circuit_delta(&self.registry, batch)?,
+            SysFamily::CircuitNodes => self.dag.apply_circuit_delta(batch),
         }
         Ok(())
     }
@@ -193,10 +188,7 @@ impl CatalogEngine {
         } = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={vid})"))?;
         // Re-checked for the paths that skip the precheck: boot replay, a
         // worker's `ddl_sync`.
-        self.validate_view_options(vid, name, props, owner_view_id, self.dag.sources_of(vid))?;
-        // Stamping the fold is what makes placement transitive:
-        // `hook_relation_register` registers this view after its sources, so a view
-        // over it reads the answer back off one value.
+        self.validate_view_options(vid, name, props, owner_view_id)?;
         let placement = self
             .dag
             .register_view(&self.registry, vid, pk.as_slice().len())

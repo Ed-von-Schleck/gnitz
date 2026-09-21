@@ -169,6 +169,13 @@ pub fn push_table_tab_row(
     );
 }
 
+/// `defs` as `owner_id`'s COL_TAB batch at `weight`, numbered by position.
+pub fn col_tab_batch(owner_id: i64, defs: &[ColumnDef], weight: i64) -> Batch {
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+    crate::catalog::write_col_tab_rows(&mut bb, owner_id, defs, weight);
+    bb.finish()
+}
+
 /// The one-row IDX_TAB batch at `weight`. A `-1` must reproduce its `+1`'s
 /// payload exactly — the retraction CAS rejects a mismatch.
 pub fn idx_tab_batch(

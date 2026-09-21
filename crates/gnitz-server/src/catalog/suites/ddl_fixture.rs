@@ -8,7 +8,7 @@
 //! without a server.
 
 use super::super::*;
-use crate::test_support::{idx_tab_batch, push_table_tab_row};
+use crate::test_support::{col_tab_batch, idx_tab_batch, push_table_tab_row};
 use gnitz_wire::pack_pk_cols;
 use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 
@@ -258,14 +258,8 @@ impl CatalogEngine {
 
     // -- Write helpers for system tables -----------------------------------
 
-    pub(in crate::catalog) fn build_col_batch(&self, owner_id: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
-        let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-        write_col_tab_rows(&mut bb, owner_id, col_defs, weight);
-        bb.finish()
-    }
-
     pub(crate) fn write_column_records(&mut self, owner_id: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
-        let batch = self.build_col_batch(owner_id, col_defs, 1);
+        let batch = col_tab_batch(owner_id, col_defs, 1);
         self.submit(SysFamily::Column, batch)
     }
 
@@ -295,7 +289,7 @@ impl CatalogEngine {
         cols: &[ColumnDef],
         pk: &[u32],
     ) -> Result<(), String> {
-        let col_batch = self.build_col_batch(tid, cols, 1);
+        let col_batch = col_tab_batch(tid, cols, 1);
         self.ddl_sync(SysFamily::Column.id(), 0, col_batch)?;
 
         let mut bb = BatchBuilder::new(*SysFamily::Table.schema());

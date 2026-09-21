@@ -1,6 +1,7 @@
-//! The view-dependency graph, the closures over it, and the placement fold.
+//! The view-dependency graph and the closures over it.
 
 use super::*;
+use std::collections::hash_map::Entry;
 
 /// The bidirectional view-dependency index, kept current by every `CircuitNodes` delta.
 /// A `forward` / `reverse` entry exists only while it holds an id.
@@ -104,58 +105,6 @@ impl DagEngine {
             .collect();
         bases.sort_unstable();
         bases
-    }
-
-    /// Where a view's rows live — the value `Relation` stamps — folded from
-    /// its sources' **stamped** placements and its freshly derived `meta`.
-    ///
-    /// Reading the sources' stamped placement rather than re-deriving "has a
-    /// replicated source" from the direct sources is what makes the property
-    /// transitive: `hook_relation_register` registers a view after every view it
-    /// scans, so each source's answer is already stamped when this runs.
-    ///
-    /// `Local` is safe whatever the circuit did — a read of a `Local` relation
-    /// gathers every worker — where `Keyed` unicasts to the one its key names.
-    pub(super) fn placement_of(
-        &self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        meta: &ViewMeta,
-        pk_arity: usize,
-    ) -> Placement {
-        let sources = self.sources_of(view_id);
-        // An unregistered source proves nothing, so it reads as the keyed default.
-        let placed = |t: &i64| {
-            registry
-                .relation(*t)
-                .map(Relation::schema)
-                .map_or((Placement::KEYED_DEFAULT, 0), |s| (s.placement(), s.pk_indices().len()))
-        };
-        if sources.is_empty() {
-            return Placement::KEYED_DEFAULT;
-        }
-        // Every source in full on every worker ⇒ the view computes its whole
-        // result locally on every worker and the read single-sources worker 0.
-        if sources.iter().all(|t| placed(t).0.is_replicated()) {
-            return Placement::Replicated;
-        }
-        // Any source that is not key-routed places this view's rows on the worker
-        // that produced them, not on the one its key names.
-        if sources.iter().any(|t| !placed(t).0.is_key_routed()) {
-            return Placement::Local;
-        }
-
-        let [src] = sources else {
-            return Placement::KEYED_DEFAULT;
-        };
-        let (source_placement, source_pk_arity) = placed(src);
-        if meta.places_rows_by_own_key() {
-            Placement::KEYED_DEFAULT
-        } else if meta.pk_source == Some(*src) && source_pk_arity == pk_arity {
-            source_placement
-        } else {
-            Placement::Local
-        }
     }
 }
 

@@ -184,8 +184,10 @@ impl DriveHost for Recorder<'_> {
 fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
     let cols = view_cols();
     for rank in [0u32, 1] {
-        let mut engine =
-            CatalogEngine::open_master(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2).unwrap();
+        let mut engine = CatalogEngine::open_master(&scratch_dir("dag_exec", &format!("relay_trim_{rank}")), 2)
+            .unwrap()
+            .replay()
+            .unwrap();
         let replicated = engine.allocate_ids(1).unwrap();
         engine.write_column_records(replicated, &cols).unwrap();
         let mut bb = gnitz_store::storage::BatchBuilder::new(*crate::catalog::SysFamily::Table.schema());

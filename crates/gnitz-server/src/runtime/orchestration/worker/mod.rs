@@ -597,11 +597,10 @@ impl WorkerProcess {
         let delta = if let Some(d) = self.pending_deltas.remove(&target_id) {
             d
         } else {
-            if !self.cat().registry.has_id(target_id) {
-                return Ok(());
+            match self.cat().registry.relation(target_id) {
+                Some(r) => Batch::empty_with_schema(&r.schema()),
+                None => return Ok(()),
             }
-            let schema = self.cat().registry.relation_or_err(target_id)?.schema();
-            Batch::empty_with_schema(&schema)
         };
         self.drive_dag(Drive::Tick { source: target_id, round }, delta, false);
         Ok(())
@@ -667,7 +666,7 @@ impl WorkerProcess {
         // Compiled before the first chunk: a failure here is an error reply, where the
         // same failure inside a chunk's epoch is a fatal abort mid-round.
         let cat = self.cat();
-        cat.dag.compile_view(&cat.registry, view_id)?;
+        cat.dag.open_plan(&cat.registry, view_id)?;
         let chunk_rows = self.cat().registry.scan_chunk_rows();
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see

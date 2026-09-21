@@ -52,7 +52,10 @@ use gnitz_wire::ViewProps;
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
+pub(crate) use bootstrap::UnreplayedCatalog;
 pub(crate) use constraints::RowConstraints;
+#[cfg(test)]
+pub(crate) use sys_tables::write_col_tab_rows;
 #[cfg(test)]
 pub(crate) use sys_tables::PUBLIC_SCHEMA_ID;
 pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};

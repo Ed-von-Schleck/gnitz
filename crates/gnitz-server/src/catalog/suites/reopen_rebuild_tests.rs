@@ -354,7 +354,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
         .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced"))
         .unwrap();
     assert!(
-        engine.dag.compile_view(&engine.registry, vid).is_ok(),
+        engine.dag.open_plan(&engine.registry, vid).is_ok(),
         "the fixture view must compile"
     );
 
@@ -386,7 +386,7 @@ fn view_traces_resume_with_their_output_store() {
         "the fixture must leave a resumable output store"
     );
     engine.bump_checkpoint_generation().unwrap();
-    assert!(engine.dag.compile_view(&engine.registry, vid).is_ok());
+    assert!(engine.dag.open_plan(&engine.registry, vid).is_ok());
 
     // The compiled plan's own operator state — both the set the next ephemeral
     // round would publish and the integral this view reads through. `resumed()`

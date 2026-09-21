@@ -626,8 +626,7 @@ impl CatalogEngine {
     }
 
     /// The shared VIEW_TAB registration guards: what a `WITH (…)` option may be
-    /// declared on, and what a bounded view may read. `source_ids` is the view's
-    /// resolved `ScanDelta` sources.
+    /// declared on, and what a bounded view may read.
     ///
     /// Run from the precheck and again from `view_registration`. A within-bundle
     /// internal segment never carries a `WITH` option, which is what keeps the
@@ -638,7 +637,6 @@ impl CatalogEngine {
         name: &str,
         props: gnitz_wire::ViewProps,
         owner_view_id: i64,
-        source_ids: &[i64],
     ) -> Result<(), String> {
         // An internal chain segment is a relation the planner mints, never
         // something an option clause may name.
@@ -649,9 +647,8 @@ impl CatalogEngine {
         }
         // Both rules trace to skeleton rows being recomputed from the *source*
         // store: a bounded view's own store is skeletonized, and a stream's holds
-        // nothing to recompute from. `ScanDelta` is the only external-source
-        // opcode, so `source_ids` covers every circuit's every source.
-        for &src in source_ids {
+        // nothing to recompute from.
+        for &src in self.dag.sources_of(vid) {
             // Ids come from one ascending counter and a source exists before its view, so
             // ascending id order is a dependency order — which tick scheduling, backfill and
             // view registration sort by.
@@ -854,7 +851,7 @@ impl CatalogEngine {
                 // creating bundle, so the view's sources resolve here; an
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
                 // row to validate.
-                self.validate_view_options(id, v.name, v.props, v.owner_view_id, self.dag.sources_of(id))?;
+                self.validate_view_options(id, v.name, v.props, v.owner_view_id)?;
                 self.validate_view_owner(id, v.name, v.owner_view_id, &view_creates)?;
                 (v.schema_id, v.name, v.pk, RelationKind::View)
             };

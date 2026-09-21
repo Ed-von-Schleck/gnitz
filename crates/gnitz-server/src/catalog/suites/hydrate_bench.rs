@@ -50,7 +50,7 @@ fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, i64) {
 
     let circuit = crate::test_support::identity_circuit(base, ReadBound::None);
     let view = try_register_view(&mut engine, circuit, "bounded", &cols, capacity, 0).unwrap();
-    engine.dag.compile_view(&engine.registry, view).unwrap();
+    engine.dag.open_plan(&engine.registry, view).unwrap();
     let chunk_rows = engine.registry.scan_chunk_rows();
     let mut source = engine.open_source_cursor(view, base).unwrap();
     while let Some(chunk) = source.drain_chunk(chunk_rows) {

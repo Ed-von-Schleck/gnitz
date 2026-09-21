@@ -40,7 +40,7 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
 }
 
 /// Write one column record at an arbitrary `col_idx` — the gap and
-/// out-of-order shapes `build_col_batch`, which numbers columns by position,
+/// out-of-order shapes `col_tab_batch`, which numbers columns by position,
 /// cannot produce.
 fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
@@ -603,7 +603,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     let new_tid = engine.allocate_ids(1).unwrap();
     // Ascending topo: COL_TAB(1) applied first.
-    let col_batch = engine.build_col_batch(new_tid, &cols, 1);
+    let col_batch = col_tab_batch(new_tid, &cols, 1);
     engine.submit(SysFamily::Column, col_batch).unwrap();
 
     // TABLE_TAB(6): precheck fails (duplicate name), so nothing of it is queued
@@ -648,7 +648,7 @@ fn ddl_txn_hook_failure_is_compensated() {
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
     let new_tid = engine.allocate_ids(1).unwrap();
-    let col_batch = engine.build_col_batch(new_tid, &cols, 1);
+    let col_batch = col_tab_batch(new_tid, &cols, 1);
     engine.submit(SysFamily::Column, col_batch).unwrap();
 
     let blocker = relation_dir(&dir, RelationKind::BaseTable, new_tid);
@@ -912,7 +912,7 @@ fn compensated_create_table_leaves_no_trace() {
         col_def("val", type_code::I64),
     ];
     for (family, batch) in [
-        (SysFamily::Column, engine.build_col_batch(tid, &cols, 1)),
+        (SysFamily::Column, col_tab_batch(tid, &cols, 1)),
         (SysFamily::Table, build_table_tab_row(tid, pack_pk_cols(&[0]), "child")),
     ] {
         engine.submit(family, batch).unwrap();

@@ -52,10 +52,10 @@ fn pk_group_native(engine: &mut CatalogEngine, tid: i64, key: u128) -> std::rc::
 }
 
 use crate::test_support::{
-    col_def, equi_join_circuit, fk_def, idx_tab_batch, negate_chain, nullable_def, opk_pk, pk_payload_schema,
-    push_table_tab_row, push_view_tab_row, register_identity_view, scratch_dir, seek_by_index, seek_by_index_range,
-    sum_weights, try_register_identity_view, try_register_view, uuid_def, write_circuit, write_identity_circuit,
-    LocalDrive,
+    col_def, col_tab_batch, equi_join_circuit, fk_def, idx_tab_batch, negate_chain, nullable_def, opk_pk,
+    pk_payload_schema, push_table_tab_row, push_view_tab_row, register_identity_view, scratch_dir, seek_by_index,
+    seek_by_index_range, sum_weights, try_register_identity_view, try_register_view, uuid_def, write_circuit,
+    write_identity_circuit, LocalDrive,
 };
 use gnitz_wire::sys_rows::write_col_tab_row;
 

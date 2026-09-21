@@ -221,7 +221,7 @@ impl ColumnDef {
 }
 
 /// `defs` as `owner_id`'s COL_TAB rows, keyed by position, at `weight`.
-pub(super) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: i64, defs: &[ColumnDef], weight: i64) {
+pub(crate) fn write_col_tab_rows(bb: &mut BatchBuilder, owner_id: i64, defs: &[ColumnDef], weight: i64) {
     for (i, cd) in defs.iter().enumerate() {
         write_col_tab_row(bb, &cd.col_tab_row(owner_id, i), weight);
     }

@@ -16,7 +16,7 @@
 //! product, which is what a replay over the two trace integrals computes.
 
 use super::*;
-use crate::query::compiler::{HydrationSeed, Sides};
+use crate::query::compiler::HydrationSeed;
 use gnitz_store::read::SkeletonHydrator;
 use gnitz_store::storage::{PkSetGather, StoreError};
 
@@ -30,7 +30,7 @@ impl SkeletonHydrator for DagEngine {
             .map_err(|e| e.in_context(&format!("hydrate: view {view_id}")))?
             .schema();
         let (_, ViewPlan { code, state }) = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;
-        let Sides::Unexchanged { hydration: Some(hydration) } = code.sides else {
+        let Some(hydration) = code.hydration else {
             return Err(StoreError::rejected(format!(
                 "hydrate: view {view_id} was not compiled as capacity-bounded"
             )));

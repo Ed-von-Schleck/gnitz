@@ -136,9 +136,11 @@ def test_every_ddl_kind_survives_a_crash(own_server):
             "CREATE TABLE gone (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
             schema_name="dur")
         conn.execute_sql("INSERT INTO gone VALUES (1, 1)", schema_name="dur")
+        dropped_ids = [conn.resolve_table("dur", "gone")[0]]
         conn.execute_sql("DROP TABLE dur.gone", schema_name="dur")
         conn.execute_sql("CREATE VIEW vgone AS SELECT pk, val FROM t1",
                          schema_name="dur")
+        dropped_ids.append(conn.resolve_table("dur", "vgone")[0])
         conn.execute_sql("DROP VIEW dur.vgone", schema_name="dur")
 
     own_server.restart()
@@ -147,8 +149,10 @@ def test_every_ddl_kind_survives_a_crash(own_server):
         sid2 = conn.create_schema("dur2")
         conn.execute_sql("CREATE TABLE fresh (pk BIGINT NOT NULL PRIMARY KEY)",
                          schema_name="dur2")
-        assert conn.resolve_table("dur2", "fresh")[0] > max(ids.values()), \
-            "table_id reissued across the crash"
+        fresh = conn.resolve_table("dur2", "fresh")[0]
+        assert fresh > max(ids.values()), "table_id reissued across the crash"
+        assert fresh > max(dropped_ids), \
+            "an id created and dropped before the crash was reissued"
         assert sid2 > sid, "schema_id reissued across the crash"
 
         for dropped in ("gone", "vgone"):

@@ -81,8 +81,8 @@ impl CatalogEngine {
         self.fire_hooks(family, &applied)
     }
 
-    /// Apply one DdlSync group — a worker's broadcast or the master's pre-fork SAL
-    /// recovery — and pin its family to the group's zone LSN. Never queues.
+    /// Apply one DdlSync group and pin its family to the group's zone LSN. Never
+    /// queues.
     pub(crate) fn ddl_sync(&mut self, table_id: i64, zone_lsn: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
         self.apply_family(family, batch)?;

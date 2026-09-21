@@ -1,8 +1,10 @@
 //! The plan-free facts of a view's circuit: how each source's delta is routed
-//! into it, and the shape facts the worker dispatch, the placement query and the
-//! backfill cursor read. Nothing here emits, so the master can ask without compiling.
+//! into it, the placement its store registers under, and the shape facts the
+//! worker dispatch and the backfill cursor read. Nothing here emits, so the
+//! master can ask without compiling.
 
 use super::*;
+use gnitz_store::schema::Placement;
 use gnitz_wire::ReadBound;
 
 /// How the master relay routes one source's delta into a view.
@@ -36,27 +38,21 @@ pub(crate) struct ViewMeta {
     /// The circuit's one `ExchangeShard` is a proven no-op: every row it would
     /// move already sits on the worker owning its distribution key.
     pub(in crate::query) skips_exchange: bool,
-    /// The relation whose PK region this view's output PK region is, byte for
-    /// byte. `None` unless a walk back from the sink proves it.
-    pub(in crate::query) pk_source: Option<i64>,
-    /// The circuit moves rows off the worker that produced them: it carries an
-    /// output `ExchangeShard`, or a `Join`, whose inputs the runtime join-shard
-    /// scatter repartitions without an `ExchangeShard` node.
-    exchanges: bool,
     /// source table id → the bound its backfill scan narrows by. Absent for a
     /// source scanned twice, whose one backfill cursor feeds both scans.
     source_bounds: FxHashMap<i64, ReadBound>,
 }
 
 impl ViewMeta {
-    /// Derive `loaded`'s routing metadata. `registry` supplies what the circuit
-    /// alone cannot: co-partitioning and the output-shard elision both test a
-    /// shard key against a *source relation's* distribution prefix.
-    ///
-    /// `Err` rather than a default route: a key nothing was stored under would
-    /// scatter a delta away from the traces it must meet.
-    pub(in crate::query) fn derive(loaded: &LoadedCircuit, registry: &RelationRegistry) -> Result<ViewMeta, String> {
+    /// Derive `loaded`'s routing metadata, and the placement a view of `pk_arity`
+    /// PK columns over it registers under.
+    pub(in crate::query) fn derive(
+        loaded: &LoadedCircuit,
+        registry: &RelationRegistry,
+        pk_arity: usize,
+    ) -> Result<(ViewMeta, Placement), String> {
         let (uses, circuit_relay) = source_uses(loaded)?;
+        let schemas = scanned_schemas(&uses, registry)?;
         // The lowest offender, so every process reports the same one.
         if let Some(tid) = uses
             .iter()
@@ -73,19 +69,19 @@ impl ViewMeta {
             .collect();
 
         let shards: Vec<(NodeId, &[u32])> = loaded.exchange_shards().collect();
-        let exchanges = !shards.is_empty() || circuit_relay.is_some();
-        let pk_source = loaded
-            .sink()
-            .ok()
-            .and_then(|sink| scan_through_row_local(loaded, sink))
-            .map(|(tid, _)| tid);
+        let rows = match pk_source(loaded) {
+            Some(tid) => RowHome::SourcePk(tid),
+            None if !shards.is_empty() || circuit_relay.is_some() => RowHome::OwnKey,
+            None => RowHome::Producer,
+        };
+        let placement = placement(&schemas, rows, pk_arity);
         let (skips_exchange, output_shard_cols): (bool, Box<[u32]>) = match shards[..] {
             [] => (false, Box::default()),
-            [(enid, cols)] => (skips_output_exchange(loaded, enid, cols, registry), Box::from(cols)),
+            [(enid, cols)] => (skips_output_exchange(loaded, enid, cols, &schemas), Box::from(cols)),
             [.., (_, cols)] => (false, Box::from(cols)),
         };
 
-        let replicated = |tid: i64| registry.relation(tid).is_some_and(Relation::is_replicated);
+        let replicated = |tid: i64| schemas[&tid].placement().is_replicated();
         let keyed = || uses.iter().filter_map(|(&tid, u)| Some((tid, u, u.key.as_deref()?)));
         // A replicated partner holds every row on every worker, so each match is
         // made once, on the other side's own worker — unless the circuit also
@@ -103,18 +99,17 @@ impl ViewMeta {
                 false => circuit_relay.unwrap_or(JoinRelay::WholeKey),
             };
             let route = join_route(key, relay)?;
-            let schema = registry.relation(tid).map(Relation::schema);
+            let schema = schemas[&tid];
             let partner_makes_every_match = has_replicated_partner
                 // An owner filter drops every row the relay did not place.
                 && !use_.owner_trimmed
                 // A clamp over one worker's slice admits the key once per worker.
                 && (replicated(tid) || !use_.set_fed);
-            let skips = match (&route, &schema) {
-                // A broadcast's matches spread over the whole other side, and an
-                // unregistered relation has no placement to already be at.
-                (RelayRoute::Broadcast, _) | (_, None) => false,
-                (RelayRoute::JoinKey(k), Some(schema)) => {
-                    ScatterSpec::JoinKey(k).routes_to_native_owner(schema) || partner_makes_every_match
+            let skips = match &route {
+                // A broadcast's matches spread over the whole other side.
+                RelayRoute::Broadcast => false,
+                RelayRoute::JoinKey(k) => {
+                    ScatterSpec::JoinKey(k).routes_to_native_owner(&schema) || partner_makes_every_match
                 }
             };
             if skips {
@@ -122,22 +117,21 @@ impl ViewMeta {
             }
             // The relay scatters by this key mid-round, where a refusal aborts
             // the master.
-            if let (RelayRoute::JoinKey(slots), Some(schema)) = (&route, &schema) {
+            if let RelayRoute::JoinKey(slots) = &route {
                 ScatterSpec::JoinKey(slots)
-                    .check(schema)
+                    .check(&schema)
                     .map_err(|e| format!("source {tid} scatter key: {e}"))?;
             }
             source_routes.insert(tid, route);
         }
 
-        Ok(ViewMeta {
+        let meta = ViewMeta {
             source_routes,
             output_shard_cols,
             skips_exchange,
-            pk_source,
-            exchanges,
             source_bounds,
-        })
+        };
+        Ok((meta, placement))
     }
 
     /// How the master relay routes `source_id`'s delta into this view, `None`
@@ -158,11 +152,71 @@ impl ViewMeta {
     pub(crate) fn output_shard_cols(&self) -> &[u32] {
         &self.output_shard_cols
     }
+}
 
-    /// The rows land where the circuit's own exchange put them, rather than
-    /// where a source's PK region did.
-    pub(in crate::query) fn places_rows_by_own_key(&self) -> bool {
-        self.pk_source.is_none() && self.exchanges
+/// The relation whose PK region the view's output PK region is, byte for byte.
+/// `None` unless a walk back from the sink proves it.
+fn pk_source(loaded: &LoadedCircuit) -> Option<i64> {
+    loaded
+        .sink()
+        .ok()
+        .and_then(|sink| scan_through_row_local(loaded, sink))
+        .map(|(tid, _)| tid)
+}
+
+/// The key whose owner a view's rows sit on.
+enum RowHome {
+    /// The PK region of this source, byte for byte.
+    SourcePk(i64),
+    /// The view's own key.
+    OwnKey,
+    /// None: they stay on the worker that produced them.
+    Producer,
+}
+
+/// The schema of each source `uses` names: every one a scanned, registered
+/// relation.
+fn scanned_schemas(
+    uses: &FxHashMap<i64, SourceUse>,
+    registry: &RelationRegistry,
+) -> Result<FxHashMap<i64, SchemaDescriptor>, String> {
+    let mut ids: Vec<i64> = uses.keys().copied().collect();
+    // Ascending, so every process reports the same offender.
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|tid| {
+            if uses[&tid].bound.is_none() {
+                return Err(format!("source {tid} states a scatter key but is not scanned"));
+            }
+            let relation = registry
+                .relation(tid)
+                .ok_or_else(|| format!("source {tid} is not a registered relation"))?;
+            Ok((tid, relation.schema()))
+        })
+        .collect()
+}
+
+/// Where a view's rows live, folded from its sources' placements and where its
+/// circuit leaves its `rows`.
+fn placement(sources: &FxHashMap<i64, SchemaDescriptor>, rows: RowHome, pk_arity: usize) -> Placement {
+    if sources.is_empty() {
+        return Placement::KEYED_DEFAULT;
+    }
+    // Every worker computes the whole result from its own full copies.
+    if sources.values().all(|s| s.placement().is_replicated()) {
+        return Placement::Replicated;
+    }
+    if sources.values().any(|s| !s.placement().is_key_routed()) {
+        return Placement::Local;
+    }
+    let mut only = sources.iter();
+    let (Some((&src, schema)), None) = (only.next(), only.next()) else {
+        return Placement::KEYED_DEFAULT;
+    };
+    match rows {
+        RowHome::OwnKey => Placement::KEYED_DEFAULT,
+        RowHome::SourcePk(tid) if tid == src && schema.pk_indices().len() == pk_arity => schema.placement(),
+        RowHome::SourcePk(_) | RowHome::Producer => Placement::Local,
     }
 }
 
@@ -187,22 +241,21 @@ fn skips_output_exchange(
     loaded: &LoadedCircuit,
     enid: NodeId,
     shard_cols: &[u32],
-    registry: &RelationRegistry,
+    schemas: &FxHashMap<i64, SchemaDescriptor>,
 ) -> bool {
     let Some((tid, mapped)) = scan_through_row_local(loaded, enid) else {
         return false;
     };
-    registry.relation(tid).map(Relation::schema).is_some_and(|schema| {
-        // Behind a map, shard column `c` is source PK column `c`, or a payload slot.
-        let source_cols: Option<Vec<u32>> = match mapped {
-            false => Some(shard_cols.to_vec()),
-            true => shard_cols
-                .iter()
-                .map(|&c| schema.pk_indices().get(c as usize).copied())
-                .collect(),
-        };
-        source_cols.is_some_and(|cols| ScatterSpec::GroupKey(&cols).routes_to_native_owner(&schema))
-    })
+    let schema = schemas[&tid];
+    // Behind a map, shard column `c` is source PK column `c`, or a payload slot.
+    let source_cols: Option<Vec<u32>> = match mapped {
+        false => Some(shard_cols.to_vec()),
+        true => shard_cols
+            .iter()
+            .map(|&c| schema.pk_indices().get(c as usize).copied())
+            .collect(),
+    };
+    source_cols.is_some_and(|cols| ScatterSpec::GroupKey(&cols).routes_to_native_owner(&schema))
 }
 
 // ---------------------------------------------------------------------------

@@ -144,6 +144,24 @@ impl TestLog {
     }
 }
 
+impl TestLog {
+    /// One committed, synced zone at `lsn` of whole-batch DdlSync groups.
+    pub(crate) fn ddl_zone(&self, lsn: u64, groups: &[(i64, SchemaDescriptor, &Batch)]) {
+        let scope = self.writer.begin(lsn, "test");
+        for &(tid, schema, batch) in groups {
+            let relation = ipc::WireSchema::encoded(tid, schema);
+            let group = DirectGroup {
+                template: relation.frame(WireMsg::default()),
+                data: GroupData::Same(WireData::Whole(batch)),
+                ..DirectGroup::new(SalMessageKind::DdlSync)
+            };
+            scope.write(&group, true).expect("group fits");
+        }
+        scope.commit();
+        self.synced_through(self.cursor());
+    }
+}
+
 /// The group at `base` under `epoch`.
 pub(crate) fn group_in(log: SalLog, base: u64, epoch: u32) -> SalMessage {
     match log.read_at(base, EpochGate::Walk(epoch)) {
