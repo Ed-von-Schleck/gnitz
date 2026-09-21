@@ -215,89 +215,47 @@ fn oversized_reply(sz: usize) -> gnitz_wire::WireFault {
     gnitz_wire::WireFault::from(crate::runtime::wire::oversized_frame_message(sz))
 }
 
-/// What one pre-flight frame spends on everything that is not a key: the control
-/// header and the data block's header at zero rows. Charged against the budget
-/// before it is divided into keys, or the frame runs over.
-pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor) -> usize {
-    let framing = reply_frame(ReplyRoute::default(), None, 0, true).size();
-    framing + gnitz_store::storage::schema_block_terms(frame_schema).0
-}
-
-/// The data block's growth for one key — the per-row term of the affine size
-/// [`preflight_keys_per_frame`] divides the row budget by.
-pub(crate) fn preflight_per_key(frame_schema: &SchemaDescriptor) -> usize {
-    gnitz_store::storage::schema_block_terms(frame_schema).1
-}
-
-/// Keys one pre-flight frame may carry: [`unique_preflight_keys_per_frame`]
-/// clamped so the whole frame — `overhead` included — stays inside `budget`.
-/// Unclamped, that test-only override builds a frame the W2M ring cannot hold,
-/// which `w2m::try_reserve` asserts against and which aborts in release.
-///
-/// Charging every key the same width is exact, since a block's size is affine
-/// in its row count; `send_unique_preflight_keys` asserts the frame it builds.
-pub(crate) fn preflight_keys_per_frame(frame_schema: &SchemaDescriptor, budget: usize, overhead: usize) -> usize {
-    let per_key = preflight_per_key(frame_schema);
-    unique_preflight_keys_per_frame()
-        .min(budget.saturating_sub(overhead) / per_key.max(1))
-        .max(1)
-}
-
-/// Stream the sorted OPK leading-key spans `keys` lends to the master as a train
-/// over `frame_schema` (`unique_preflight_wire_schema`, whose PK region is
-/// exactly one span), with no schema block. An empty producer emits one empty terminal
-/// frame so the master's drain still sees the train end.
-///
-/// Deliberately NOT `send_scan_response`: that path materializes the reply as
-/// one `Batch`, which is what `keys` exists to avoid — this refills one chunk
-/// batch per frame.
-///
-/// It also emits the whole train synchronously, which `pending_streams` forbids
-/// inside an exchange wait. Safe here alone: this runs under the catalog WRITE
-/// lock, which excludes `handle_scan` — the only thing that could be holding the
-/// ring slots a blocked `send_msg` would wait behind.
+/// Stream `keys` to the master as a train over `frame_schema`, one span per
+/// row's PK region, `chunk_rows` spans in RAM at a time. An empty producer
+/// still sends the one terminal frame the master's drain waits for. Sends
+/// synchronously, so the caller must hold no queued train.
 pub(crate) fn send_unique_preflight_keys(
     w2m_writer: &W2mWriter,
     target_id: u64,
     frame_schema: &SchemaDescriptor,
     request_id: u32,
     budget: usize,
+    chunk_rows: usize,
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {
-    // The assertion in the loop is what says the charged overhead and the
-    // emitted frame agree.
-    let keys_per_frame = preflight_keys_per_frame(frame_schema, budget, preflight_frame_overhead(frame_schema));
-
-    // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
-    // front to exactly one frame's fill.
-    let mut chunk = Batch::with_capacity(frame_schema, keys.remaining().min(keys_per_frame));
+    let route = ReplyRoute { target_id, request_id, fifo: false };
+    // The synthetic schema has no version.
+    let frame = |last| reply_frame(route, None, 0, last);
+    let overhead = frame(false).size();
+    let mut chunk = Batch::with_capacity(frame_schema, keys.remaining().min(chunk_rows));
     loop {
         chunk.clear();
-        let n = keys.remaining().min(keys_per_frame);
-        for _ in 0..n {
-            let k = keys.next().expect("producer lends `remaining` spans");
-            // The span is already OPK and `len == pk_stride`, so it lands in
-            // the PK region unchanged; `merge_index_scan` states what that
-            // buys.
-            chunk.push_key_row(k, 1);
+        for _ in 0..keys.remaining().min(chunk_rows) {
+            chunk.push_key_row(keys.next().expect("producer lends `remaining` spans"), 1);
         }
-        let is_last = keys.remaining() == 0;
-        // The synthetic schema has no version.
-        let msg = WireMsg {
-            target_id,
-            flags: WireFlags::train_frame(0, is_last),
-            data: WireData::Whole(&chunk),
-            ..Default::default()
-        };
-        // Over `budget` only at the one-key floor, where there is nothing left
-        // to narrow — the same rule `PendingScan::emit_next` states.
-        debug_assert!(
-            msg.size() <= budget || n <= 1,
-            "a pre-flight frame of {n} keys is {} bytes over its {budget}-byte budget",
-            msg.size().saturating_sub(budget),
-        );
-        w2m_writer.send_msg(request_id, &msg);
-        if is_last {
+        let drained = keys.remaining() == 0;
+        let mut start = 0;
+        loop {
+            let (cut, _) = chunk.wire_chunk_within(start, overhead, budget);
+            let end = start + cut.rows();
+            w2m_writer.send_msg(
+                request_id,
+                &WireMsg {
+                    data: WireData::of_chunk(&chunk, start, &cut),
+                    ..frame(drained && end == chunk.len())
+                },
+            );
+            start = end;
+            if start == chunk.len() {
+                break;
+            }
+        }
+        if drained {
             break;
         }
     }

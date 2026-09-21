@@ -456,15 +456,6 @@ def tiny_ddl_chunk_server(seamed_server):
 
 
 @pytest.fixture
-def unique_preflight_frame_server(seamed_server):
-    """Server whose CREATE UNIQUE INDEX pre-flight streams tiny (7-key) frames
-    so a small table already produces multi-frame continuation trains per
-    worker. Any per-worker frame count is safe: `InFlightState` grows with the
-    parked depth, so the W2M ring back-pressures by bytes, not a frame count."""
-    return seamed_server({"GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME": "7"})
-
-
-@pytest.fixture
 def reply_frame_budget_server(seamed_server):
     """Server whose workers chunk reply trains past a tiny 16 KiB frame budget, so
     modest tables already produce multi-frame seek / range / gather / scan reply

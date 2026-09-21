@@ -22,30 +22,6 @@ pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<c_int> {
     }
 }
 
-/// Write all bytes to a raw `fd`, handling partial writes and EINTR — the
-/// `File::write_all` of a descriptor nobody owns (stdout, a socketpair end).
-pub fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
-    let mut done: usize = 0;
-    while done < data.len() {
-        let ret = unsafe { libc::write(fd, data.as_ptr().add(done) as *const libc::c_void, data.len() - done) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(err);
-        }
-        if ret == 0 {
-            // POSIX guarantees regular files never return 0 for a non-zero
-            // count, but some device types can — without this guard the loop
-            // would spin forever at 100% CPU. Treat it as an error.
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        done += ret as usize;
-    }
-    Ok(())
-}
-
 /// `libc::openat` returning an `OwnedFd`.
 pub fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, 0o644 as libc::mode_t) };
@@ -98,30 +74,6 @@ pub fn set_sockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) {
             std::mem::size_of::<c_int>() as libc::socklen_t,
         );
     }
-}
-
-/// Create an anonymous temporary file (`O_TMPFILE`) on the filesystem backing
-/// `dir`.
-///
-/// The file has NO directory entry: the kernel reclaims its inode and blocks
-/// the instant the last fd (or mapping) referencing it goes away — on a normal
-/// close, on process exit, and on every abnormal exit (`panic = "abort"`,
-/// `SIGKILL`, OOM-kill) — so it can never leak onto disk, with no unlink
-/// bookkeeping at all.
-///
-/// Opened `O_RDWR` so the caller can write the file and later `mmap` it
-/// `PROT_READ`. `dir` must be a real directory on a filesystem that supports
-/// `O_TMPFILE` (ext4 / xfs / btrfs / tmpfs — every filesystem gnitz stores data
-/// on). `O_TMPFILE` already implies `O_DIRECTORY`, so the path is validated as a
-/// directory by the kernel.
-pub fn open_tmpfile(dir: &str) -> std::io::Result<OwnedFd> {
-    let dir_c = std::ffi::CString::new(dir).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let fd = unsafe { libc::open(dir_c.as_ptr(), libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: fresh descriptor from `open`; the `OwnedFd` is the sole closer.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Ask btrfs to overwrite `fd` in place instead of copying (`FS_NOCOW_FL`).

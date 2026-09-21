@@ -1,173 +1,89 @@
 use super::*;
+use proptest::prelude::*;
 
-/// 8-byte big-endian record of `v` — a single promoted-U64 index key.
-fn rec(v: u64) -> [u8; 8] {
-    v.to_be_bytes()
-}
-
-/// Drain a producer to a Vec of the `u64`s its 8-byte records encode,
-/// checking `remaining` stays exact along the way.
-fn drain(mut p: KeyProducer) -> Vec<u64> {
-    let mut out = Vec::new();
-    let mut left = p.remaining();
-    while let Some(k) = p.next() {
-        out.push(u64::from_be_bytes(k.try_into().unwrap()));
-        left -= 1;
-        assert_eq!(p.remaining(), left, "remaining must track next() exactly");
-    }
-    assert_eq!(left, 0);
-    out
-}
-
-/// Reference: every pushed record, sorted, multiplicity intact.
-fn reference_sorted(vals: &[u64]) -> Vec<u64> {
-    let mut v = vals.to_vec();
-    v.sort_unstable();
-    v
-}
-
-#[test]
-fn fast_path_no_spill_sorts_in_ram() {
+fn run_case(stride: usize, recs: &[(u8, u8)], budget: Option<usize>) {
     let dir = tempfile::tempdir().unwrap();
-    // Budget far above the data: nothing spills.
-    let mut s = SpillSort::new(dir.path().to_str().unwrap(), 8, 1 << 20);
-    let vals = [5u64, 1, 9, 1, 3, 7, 2];
-    for &v in &vals {
-        s.push(&rec(v)).unwrap();
+    let mut s = SpillSort::new(dir.path().to_str().unwrap(), stride, budget.unwrap_or(usize::MAX));
+    let mut reference: Vec<Vec<u8>> = Vec::new();
+    for &(a, b) in recs {
+        // First and last byte vary: duplicates, and records differing only at the end.
+        let mut r = vec![0u8; stride];
+        r[0] = a;
+        r[stride - 1] = b;
+        s.push(&r).unwrap();
+        reference.push(r);
     }
-    let p = s.finish().unwrap();
-    assert!(matches!(p, KeyProducer::Fast(_)), "no spill ⇒ fast path");
-    assert_eq!(drain(p), reference_sorted(&vals));
-}
-
-#[test]
-fn empty_input_yields_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = SpillSort::new(dir.path().to_str().unwrap(), 8, 1 << 20);
-    let p = s.finish().unwrap();
-    assert!(matches!(p, KeyProducer::Fast(_)));
-    assert_eq!(p.remaining(), 0);
-    assert!(drain(p).is_empty());
-}
-
-#[test]
-fn multi_run_merge_equals_reference_with_duplicates() {
-    let dir = tempfile::tempdir().unwrap();
-    // Budget = 4 records (32 bytes) ⇒ a spill every 4 pushed records,
-    // forcing many runs. Include duplicates (weight-style pairs and repeats).
-    let mut s = SpillSort::new(dir.path().to_str().unwrap(), 8, 32);
-    let vals: Vec<u64> = vec![
-        50, 3, 3, 40, 12, 7, 40, 1, 99, 2, 2, 2, 60, 61, 40, 0, 100, 5, 5, 30, 31, 32, 33, 34, 35,
-    ];
-    for &v in &vals {
-        s.push(&rec(v)).unwrap();
-    }
-    let p = s.finish().unwrap();
-    assert!(matches!(p, KeyProducer::Merge(_)), "over budget ⇒ merge path");
-    assert_eq!(
-        drain(p),
-        reference_sorted(&vals),
-        "k-way merge must equal the sorted reference (order and multiplicity)",
-    );
-}
-
-#[test]
-fn duplicate_straddling_runs_is_adjacent_after_merge() {
-    let dir = tempfile::tempdir().unwrap();
-    // Push value X first, many distinct values to force several spills, then
-    // X again — the two Xs are guaranteed to land in different runs, and the
-    // merge must still bring them adjacent (what a duplicate check needs).
-    let mut s = SpillSort::new(dir.path().to_str().unwrap(), 8, 32); // 4 records/run
-    const X: u64 = 500_000;
-    s.push(&rec(X)).unwrap();
-    for v in 0..40u64 {
-        s.push(&rec(v)).unwrap();
-    }
-    s.push(&rec(X)).unwrap();
-    let out = drain(s.finish().unwrap());
-    // Two Xs, and they are adjacent (X is the max here, so they trail).
-    let first = out.iter().position(|&v| v == X).unwrap();
-    assert_eq!(out.iter().filter(|&&v| v == X).count(), 2);
-    assert_eq!(out[first], X);
-    assert_eq!(out[first + 1], X, "the straddling duplicate merges adjacently");
-    // And the whole stream is globally sorted with multiplicity intact.
-    let mut expected: Vec<u64> = (0..40).collect();
-    expected.push(X);
-    expected.push(X);
-    assert_eq!(out, expected);
-}
-
-#[test]
-fn wide_composite_record_round_trips_through_spill() {
-    let dir = tempfile::tempdir().unwrap();
-    // 16-byte composite records (two u64 columns), tiny budget forces spills.
-    let stride = 16usize;
-    let mut s = SpillSort::new(dir.path().to_str().unwrap(), stride, 48); // 3 records/run
-    let mk = |a: u64, b: u64| {
-        let mut buf = [0u8; 16];
-        buf[..8].copy_from_slice(&a.to_be_bytes());
-        buf[8..].copy_from_slice(&b.to_be_bytes());
-        buf
-    };
-    // Rows sharing the leading column but differing in the trailing one are
-    // distinct composites — the merge must order by the full 16 bytes.
-    let rows = [(7, 3), (7, 1), (2, 9), (7, 2), (2, 9), (5, 5), (1, 1), (9, 0)];
-    for &(a, b) in &rows {
-        s.push(&mk(a, b)).unwrap();
-    }
+    let spills = budget.is_some_and(|b| recs.len() >= b.div_ceil(stride).max(1));
+    assert_eq!(s.spill.is_some(), spills);
+    reference.sort_unstable();
     let mut p = s.finish().unwrap();
-    assert!(matches!(p, KeyProducer::Merge(_)));
-    let mut got: Vec<(u64, u64)> = Vec::new();
+    let mut left = p.remaining();
+    assert_eq!(left, recs.len());
+    let mut out = Vec::new();
     while let Some(k) = p.next() {
-        assert_eq!(k.len(), 16, "composite record keeps full width through spill");
-        let a = u64::from_be_bytes(k[..8].try_into().unwrap());
-        let b = u64::from_be_bytes(k[8..].try_into().unwrap());
-        got.push((a, b));
+        out.push(k.to_vec());
+        left -= 1;
+        assert_eq!(p.remaining(), left);
     }
-    let mut expected = rows.to_vec();
-    expected.sort_unstable();
-    assert_eq!(got, expected);
+    assert_eq!(out, reference);
+}
+
+proptest! {
+    #[test]
+    fn spill_sort_equals_reference(
+        w in 1usize..=10,
+        recs in proptest::collection::vec((0u8..4, 0u8..4), 0..300),
+        budget in proptest::option::of(0usize..=720),
+    ) {
+        run_case(w * 8, &recs, budget);
+    }
+}
+
+#[test]
+fn spill_file_is_anonymous() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = SpillSort::new(dir.path().to_str().unwrap(), 8, 8);
+    s.push(&[1u8; 8]).unwrap();
+    assert_eq!(s.spill.as_ref().unwrap().metadata().unwrap().nlink(), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 // ---------------------------------------------------------------------------
 // Micro-benchmark
 // ---------------------------------------------------------------------------
 
-/// The indirect sort under every spill run. Sweeps the OPK strides its callers
-/// reach, at a chunk-sized `n` and a run-sized one.
+/// The whole pipeline — push 128 MiB of random records, `finish`, drain — at
+/// every stride class the pre-flight reaches, with the data in one RAM run, in
+/// 4 spilled runs and in 32.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --release --ignored --nocapture"]
-fn sort_indices_bench() {
+fn spill_sort_bench() {
     use crate::test_rng::Rng;
-    use crate::test_support::bench_time_each;
 
-    const ITERS: usize = 3;
-    for &n in &[65_536usize, 4 << 20] {
-        for &stride in &[4usize, 8, 12, 16, 24, 40] {
-            for seq in [true, false] {
-                let mut rng = Rng::new(0x5EED_0000 + n as u64 + stride as u64);
-                let mut flat = vec![0u8; n * stride];
-                for (i, rec) in flat.chunks_mut(stride).enumerate() {
-                    for chunk in rec.chunks_mut(8) {
-                        let bytes = rng.next_u64().to_be_bytes();
-                        chunk.copy_from_slice(&bytes[..chunk.len()]);
-                    }
-                    // Distinct ids in the leading bytes: neighbours share a prefix.
-                    if seq {
-                        let id = (i as u64).wrapping_mul(0x9E37_79B9) % n as u64;
-                        let be = id.to_be_bytes();
-                        let w = stride.min(8);
-                        rec[..w].copy_from_slice(&be[8 - w..]);
-                    }
-                }
-                let elapsed = bench_time_each(ITERS, Vec::new, |mut idx| {
-                    sort_indices(&flat, stride, &mut idx);
-                    std::hint::black_box(&idx);
-                });
-                let ns = elapsed.as_secs_f64() * 1e9 / (ITERS as f64 * n as f64);
-                let shape = if seq { "id" } else { "rnd" };
-                println!("  n={n:<8} stride={stride:<3} {shape:<3} {ns:7.2} ns/record");
+    const DATA: usize = 128 << 20;
+    for &stride in &[8usize, 16, 24, 40, 64, 80] {
+        let n = DATA / stride;
+        let mut rng = Rng::new(0x5EED_0000 + stride as u64);
+        let mut flat = vec![0u8; n * stride];
+        for word in flat.chunks_exact_mut(8) {
+            word.copy_from_slice(&rng.next_u64().to_be_bytes());
+        }
+        for (runs, budget) in [(1, usize::MAX), (4, DATA / 4), (32, DATA / 32)] {
+            let dir = tempfile::tempdir().unwrap();
+            let start = std::time::Instant::now();
+            let mut s = SpillSort::new(dir.path().to_str().unwrap(), stride, budget);
+            for r in flat.chunks_exact(stride) {
+                s.push(r).unwrap();
             }
+            let mut p = s.finish().unwrap();
+            let mut sink = 0u64;
+            while let Some(k) = p.next() {
+                sink = sink.wrapping_add(u64::from(k[0] ^ k[stride - 1]));
+            }
+            std::hint::black_box(sink);
+            let ns = start.elapsed().as_secs_f64() * 1e9 / n as f64;
+            println!("  stride={stride:<3} runs={runs:<3} {ns:7.2} ns/record");
         }
     }
 }

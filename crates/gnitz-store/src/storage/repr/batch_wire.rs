@@ -22,12 +22,6 @@ fn block_terms(strides: &[u8]) -> (usize, usize) {
     )
 }
 
-/// [`block_terms`] where the caller holds a schema rather than a batch.
-pub fn schema_block_terms(schema: &SchemaDescriptor) -> (usize, usize) {
-    let (strides, nr) = strides_from_schema(schema);
-    block_terms(&strides[..nr as usize])
-}
-
 /// Each fixed region's offset from the block start, given where the first one
 /// begins: they pack end to end from there.
 fn wire_offsets(strides: &[u8], nr: usize, rows: usize, start: usize, offsets: &mut [usize; MAX_BATCH_REGIONS]) {

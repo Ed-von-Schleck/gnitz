@@ -45,6 +45,20 @@ pub(crate) fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
 }
 
+/// Sort `idx` into the order of `flat`'s `stride`-byte records, which stay in
+/// place.
+pub fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
+    let n = flat.len() / stride;
+    assert!(n <= u32::MAX as usize, "record count exceeds u32");
+    idx.clear();
+    idx.extend(0..n as u32);
+    idx.sort_unstable_by(|&a, &b| {
+        let a = a as usize * stride;
+        let b = b as usize * stride;
+        compare_pk_bytes(&flat[a..a + stride], &flat[b..b + stride])
+    });
+}
+
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
 /// comparator the N-way merge and the read-cursor loser tree read through their
 /// sources. Returns the same `Ordering` as [`compare_pk_bytes`] at every width,
@@ -498,14 +512,8 @@ impl IndexKeySpec {
         true
     }
 
-    /// [`Self::write_span`] plus the source-PK OPK suffix: one row's full index
-    /// entry key `[span ‖ src_pk]` in `dst[..key_size() + pk_stride]`. The single
-    /// definition of "this row's index entry", shared by the write-side
-    /// projection (`Batch::project_index`) and the in-batch uniqueness validator,
-    /// so the two agree byte-for-byte by construction. Returns `false` (row not
-    /// indexed — NULL in an indexed column; `dst` partially written) exactly as
-    /// `write_span` does. Full-arity specs only: a prefix spec would place the
-    /// suffix over the uncovered columns' bytes.
+    /// One row's index entry `[span ‖ src_pk]` in `dst[..key_size() + pk_stride]`,
+    /// or `false` where [`Self::write_span`] returns `false`.
     pub fn write_entry(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         if !self.write_span(mb, row, dst) {
             return false;

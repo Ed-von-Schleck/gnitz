@@ -1208,6 +1208,11 @@ impl Batch {
     /// NULL-distinctness skip.
     pub fn project_index(&self, spec: &crate::schema::IndexKeySpec, idx_schema: &SchemaDescriptor) -> Batch {
         let idx_stride = idx_schema.pk_stride();
+        assert_eq!(
+            idx_stride,
+            spec.key_size() + self.schema.pk_stride(),
+            "index schema of another spec"
+        );
 
         let mut out = Batch::with_capacity(idx_schema, self.count);
         // `SchemaDescriptor::new` bounds every index `pk_stride` by `MAX_PK_BYTES`.

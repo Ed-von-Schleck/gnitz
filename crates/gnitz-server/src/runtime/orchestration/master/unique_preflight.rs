@@ -13,7 +13,6 @@ use super::unique_filter::UNIQUE_FILTER_CAP;
 use crate::runtime::w2m::W2mSlot;
 use gnitz_store::relation::Relation;
 use gnitz_store::schema::key::PkBuf;
-use gnitz_store::schema::make_index_schema;
 use gnitz_store::storage::MAX_BATCH_REGIONS;
 use gnitz_wire::control::DecodedControl;
 
@@ -228,19 +227,13 @@ impl MasterDispatcher {
                 // first INSERT a warm-up scan.
                 return Ok(Some(UniqueFilter::new()));
             };
+            // What the IDX_TAB precheck refuses is refused before any scan.
+            let idx_schema = cat.validate_index_create(owner_id, col_indices)?;
             // A PK-covering index skips the scan, and every check it would ever plan.
             if owner_schema.covers_pk(col_indices) {
                 return Ok(None);
             }
-            // Build the index schema (the circuit is not registered until this
-            // pre-flight succeeds) for the merge's reply-frame layout and the
-            // promoted per-column widths. Identical inputs to each worker's own
-            // build, so the frame schema agrees by construction. `packed` is
-            // the column list the worker resolves the seek by.
-            (
-                make_index_schema(col_indices, &owner_schema)?,
-                gnitz_wire::pack_pk_cols(col_indices),
-            )
+            (idx_schema, gnitz_wire::pack_pk_cols(col_indices))
         };
         let frame_schema = wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 

@@ -925,6 +925,26 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// The owner and column rules of a CREATE INDEX on `owner_id`, and the
+    /// index schema they admit.
+    pub(crate) fn validate_index_create(&self, owner_id: i64, cols: &[u32]) -> Result<SchemaDescriptor, String> {
+        let entry = self.validate_index_registration(owner_id)?;
+        let idx_schema = make_index_schema(cols, &entry.schema()).map_err(|e| {
+            format!(
+                "{e} for table '{}' (tid={owner_id})",
+                self.qualified_name_or_unknown(owner_id).1
+            )
+        })?;
+        let defs = self.read_column_defs(owner_id);
+        if let Some(&c) = cols
+            .iter()
+            .find(|&&c| defs.get(c as usize).is_some_and(|d| d.is_hidden))
+        {
+            return Err(format!("Index: column {c} of table {owner_id} is dropped"));
+        }
+        Ok(idx_schema)
+    }
+
     /// IDX_TAB: a CREATE must name a base-table owner with an admissible column
     /// list and a free index name; a DROP must not strip the uniqueness an FK
     /// depends on. The drop guards read the batch row rather than probing: the
@@ -942,25 +962,7 @@ impl CatalogEngine {
                 read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
             let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
-            let entry = self.validate_index_registration(owner_id)?;
-
-            // Bounds, per-column eligibility (STRING/BLOB/float), and
-            // arity/stride limits, identical to what registration will enforce —
-            // only the table-name context is added here.
-            make_index_schema(cols.as_slice(), &entry.schema()).map_err(|e| {
-                format!(
-                    "{e} for table '{}' (tid={owner_id})",
-                    self.qualified_name_or_unknown(owner_id).1
-                )
-            })?;
-            let defs = self.read_column_defs(owner_id);
-            if let Some(&c) = cols
-                .as_slice()
-                .iter()
-                .find(|&&c| defs.get(c as usize).is_some_and(|d| d.is_hidden))
-            {
-                return Err(format!("Index: column {c} of table {owner_id} is dropped"));
-            }
+            self.validate_index_create(owner_id, cols.as_slice())?;
 
             // Only live indices are mapped, and a `+1` on one already failed the
             // net bound — so any hit is a different index.

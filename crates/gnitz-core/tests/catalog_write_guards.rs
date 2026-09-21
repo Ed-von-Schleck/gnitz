@@ -87,8 +87,8 @@ fn col_tab_row(
 }
 
 /// One IDX_TAB batch of `(index_id, weight)` rows, all naming `owner_id`'s
-/// column 1.
-fn index_rows(owner_id: u64, rows: &[(u64, i64)]) -> ZSetBatch {
+/// column 1 under index `flags`.
+fn index_rows(owner_id: u64, flags: u64, rows: &[(u64, i64)]) -> ZSetBatch {
     let s = sys_schema(IDX_TAB);
     let mut b = ZSetBatch::new(s);
     let mut a = BatchAppender::new(&mut b, s);
@@ -100,7 +100,7 @@ fn index_rows(owner_id: u64, rows: &[(u64, i64)]) -> ZSetBatch {
                 owner_id,
                 source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
                 name: "ix",
-                flags: 0,
+                flags,
             },
             weight,
         );
@@ -567,7 +567,7 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
     let iid = s.alloc_id().unwrap();
     let err = format!(
         "{:?}",
-        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, &[(iid, -1), (iid, 1)]))])
+        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, 0, &[(iid, -1), (iid, 1)]))])
             .unwrap_err()
     );
     assert!(err.contains("more than one row for index"), "{err}");
@@ -599,7 +599,7 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
 
     let err = format!(
         "{:?}",
-        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, &[(gnitz_wire::CATALOG_ID_CEILING, 1)]))])
+        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, 0, &[(gnitz_wire::CATALOG_ID_CEILING, 1)]))])
             .unwrap_err()
     );
     assert!(err.contains("id ceiling"), "{err}");
@@ -645,4 +645,64 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
     write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1);
     write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, true), 1);
     s.push_ddl_txn(&[(COL_TAB, dropped)]).unwrap();
+}
+
+/// Push rows `(1, 5)` and `(2, 5)` into `a_table`'s table `tid`: column 1 holds
+/// a duplicate a unique pre-flight would report.
+fn push_equal_values(client: &mut GnitzClient, tid: u64) {
+    let schema = gnitz_core::protocol::Schema {
+        columns: vec![
+            ColumnDef::new("id", TypeCode::U64, false),
+            ColumnDef::new("v", TypeCode::I64, false),
+        ],
+        pk_cols: vec![0],
+    };
+    let mut batch = ZSetBatch::new(&schema);
+    let mut app = BatchAppender::new(&mut batch, &schema);
+    app.add_row(1, 1).i64_val(5);
+    app.add_row(2, 1).i64_val(5);
+    client.push(tid, &schema, &batch).unwrap();
+}
+
+/// An index the owner rule refuses is refused as such, not scanned for duplicates.
+#[test]
+fn a_unique_index_on_a_view_is_refused_for_its_owner() {
+    let srv = ServerHandle::start();
+    let mut client = session(&srv);
+    let tid = a_table(&mut client, "vown");
+    push_equal_values(&mut client, tid);
+    let cols = [
+        ColumnDef::new("id", TypeCode::U64, false),
+        ColumnDef::new("v", TypeCode::I64, false),
+    ];
+    // The backfill copies both rows into the view.
+    let vid = client.create_view("vown", "v", tid, &cols).unwrap();
+    let iid = client.alloc_id().unwrap();
+    let unique = gnitz_wire::IndexProps { is_unique: true }.pack();
+    let err = format!(
+        "{:?}",
+        client
+            .push_ddl_txn(&[(IDX_TAB, index_rows(vid, unique, &[(iid, 1)]))])
+            .unwrap_err()
+    );
+    assert!(err.contains("only a base table can be indexed"), "{err}");
+}
+
+/// As above, for the dropped-column rule.
+#[test]
+fn a_unique_index_on_a_dropped_column_is_refused_as_dropped() {
+    let srv = ServerHandle::start();
+    let mut client = session(&srv);
+    let tid = a_table(&mut client, "dcol");
+    push_equal_values(&mut client, tid);
+    client.alter_drop_column(tid, 1).unwrap();
+    let iid = client.alloc_id().unwrap();
+    let unique = gnitz_wire::IndexProps { is_unique: true }.pack();
+    let err = format!(
+        "{:?}",
+        client
+            .push_ddl_txn(&[(IDX_TAB, index_rows(tid, unique, &[(iid, 1)]))])
+            .unwrap_err()
+    );
+    assert!(err.contains("is dropped"), "{err}");
 }

@@ -2,6 +2,7 @@
 //! deadline, and how a connection's recv side ends and its socket closes.
 
 use std::io::Read;
+use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -179,7 +180,7 @@ fn a_refused_recv_discards_its_queue_and_shuts_down() {
 
     let mut wire = framed(&[0x42u8; 100]);
     wire.extend_from_slice(&((gnitz_wire::MAX_FRAME_PAYLOAD + 1) as u32).to_le_bytes());
-    gnitz_foundation::posix_io::write_all_fd(partner.as_raw_fd(), &wire).expect("write");
+    (&partner).write_all(&wire).expect("write");
 
     assert!(
         poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd)),
@@ -509,7 +510,7 @@ fn one_recv_completion_queues_a_whole_pipelined_run() {
 
     const N: usize = 12;
     let wire: Vec<u8> = (0..N).flat_map(|i| framed(&vec![i as u8; 600])).collect();
-    gnitz_foundation::posix_io::write_all_fd(partner.as_raw_fd(), &wire).expect("write");
+    (&partner).write_all(&wire).expect("write");
 
     let mut got = Vec::new();
     assert!(

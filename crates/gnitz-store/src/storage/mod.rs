@@ -24,8 +24,7 @@
 // L3 LSM lives under `lsm/`. The leaves that belong to no layer stay at storage
 // level: the `StorageError` type, and `spill` — a bounded external merge sort of
 // fixed-stride byte records that touches no batch, schema or shard. `SpillSort`
-// serves the server's CREATE UNIQUE INDEX pre-flight; its `sort_indices` is the
-// shared indirect sort of a flat record buffer.
+// serves the server's CREATE UNIQUE INDEX pre-flight.
 mod error;
 mod lsm;
 mod spill;
@@ -63,7 +62,6 @@ pub use scatter::{reset_slots, route_rows_by_pk};
 // ── Operator hot-path types ──────────────────────────────────────────────────
 pub use batch::Layout;
 pub use batch_builder::BatchBuilder;
-pub use batch_wire::schema_block_terms;
 pub use batch_wire::WireChunk;
 // `ColumnarSource` stays inside storage: everything out of it reads rows
 // through `gnitz_expr::RowSource`.
@@ -89,7 +87,7 @@ pub(crate) use lsm::repartition::repartition_relation;
 pub use lsm::run::StoredRow;
 pub(crate) use merge::BlobCacheGuard;
 pub(crate) use merge::{prorated_blob_cap, relocate_german_string_vec, run_merge, BlobCache};
-pub use spill::{sort_indices, KeyProducer, SpillSort};
+pub use spill::{KeyProducer, SpillSort};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to
 /// `InvalidPath` — the one conversion every storage path takes.

@@ -716,7 +716,7 @@ fn plan_unique_checks<'a>(
             // Also the order the check batch is emitted in: the worker probes
             // it with one cursor, and `advance_to` gallops in place only on a
             // strictly greater key.
-            gnitz_store::storage::sort_indices(&spans, stride, &mut order);
+            gnitz_store::schema::key::sort_indices(&spans, stride, &mut order);
             // `surviving` yields each PK once, so an adjacent-equal pair comes
             // from two different rows: this IS the in-bundle duplicate rule. It
             // must fire whatever committed state holds, so it stays above the

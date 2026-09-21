@@ -4,8 +4,8 @@
 
 use super::batch::Batch;
 use super::read_cursor::{PkSetGather, ReadCursor, SkeletonKeys};
+use crate::schema::key::sort_indices;
 use crate::schema::IndexKeySpec;
-use crate::storage::spill::sort_indices;
 
 /// A chunked walk of one secondary-index key range, gathering each in-range live
 /// entry's source row from the base table, over one snapshot of each.

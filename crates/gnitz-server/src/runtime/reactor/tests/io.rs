@@ -1,7 +1,8 @@
 //! Client ingress: `Plain`'s reads over the deframer, and the global
 //! inbound-memory budget every `RecvBuf` is charged against.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 
 use super::super::test_support::*;
@@ -30,7 +31,7 @@ fn assert_refused(cap: usize, established: bool, wire: &[u8], why: &str) {
     let r = capped_reactor(cap);
     let (conn, partner) = registered(&r, established);
     let fd = conn.fd();
-    gnitz_foundation::posix_io::write_all_fd(partner.as_raw_fd(), wire).expect("write");
+    (&partner).write_all(wire).expect("write");
 
     assert!(
         poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&fd)),
@@ -92,7 +93,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     let mut hdr_and_part = Vec::new();
     hdr_and_part.extend_from_slice(&10_000u32.to_le_bytes());
     hdr_and_part.extend_from_slice(&[0x11u8; 100]);
-    gnitz_foundation::posix_io::write_all_fd(partner1.as_raw_fd(), &hdr_and_part).expect("write");
+    (&partner1).write_all(&hdr_and_part).expect("write");
 
     let counted = poll_until(&r, 10_000, || r.inner.inbound.held() == 10_000);
     assert!(counted, "in-flight buffer was not accounted");
@@ -104,7 +105,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     // Second connection whose first frame would breach the now-full cap.
     let (conn2, partner2) = registered(&r, true);
     let fd2 = conn2.fd();
-    gnitz_foundation::posix_io::write_all_fd(partner2.as_raw_fd(), &framed(&[0x22u8; 100])).expect("write");
+    (&partner2).write_all(&framed(&[0x22u8; 100])).expect("write");
 
     let refused = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&fd2));
     assert!(refused, "over-cap second connection was not closed");
@@ -130,7 +131,7 @@ fn inbound_cap_accounting_balances_on_consume() {
         for _ in 0..10 {
             wire.extend_from_slice(&framed(&payload));
         }
-        gnitz_foundation::posix_io::write_all_fd(partner.as_raw_fd(), &wire).expect("write");
+        (&partner).write_all(&wire).expect("write");
         let c = Rc::clone(&conn);
         r.block_on(async move {
             for _ in 0..10 {

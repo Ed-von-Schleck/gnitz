@@ -1,304 +1,195 @@
-//! Bounded external merge sort of fixed-stride OPK byte records.
-//!
-//! Callers that must stream a large record set **globally sorted** (e.g. the
-//! CREATE UNIQUE INDEX pre-flight, whose master-side duplicate check needs
-//! equal keys adjacent) cannot materialise it in RAM — a whole-partition
-//! in-RAM sort OOM-kills the worker on a large table. [`SpillSort`] bounds
-//! that memory: records accumulate in a flat byte buffer, and past a byte
-//! budget the buffer is sorted and spilled as one run to a single anonymous
-//! spill file; [`SpillSort::finish`] then k-way merges the runs via the shared
-//! [`LoserTree`] kernel, lending the globally-sorted records one at a time.
-//! Peak RAM is the budget plus the sort index and one reorder buffer —
-//! independent of input size.
-//!
-//! Design choices that keep it simple and leak-free:
-//! - **Flat `Vec<u8>` accumulation.** Records are fixed `stride` bytes, so a
-//!   flat buffer of contiguous records with an index-permutation sort is both
-//!   the honest memory accounting (the buffer length IS the budget check) and
-//!   the natural layout to spill. Fatter per-record types (e.g. an 80-byte
-//!   `PkBuf` for an 8-byte key) would let the accumulator hold ~10× more RAM
-//!   than the budget names.
-//! - **One `O_TMPFILE` spill file, `mmap`'d for the merge.** The anonymous
-//!   inode is reclaimed by the kernel on close and on any process death — a
-//!   `SIGKILL` or a `panic = "abort"` (the release profile) leaves nothing on
-//!   disk, which a named temp file + RAII `unlinkat` cannot guarantee (Drop
-//!   never runs on abort). One file holds all runs back-to-back; `mmap`-ing it
-//!   once means the merge holds no fd and reads records straight from mapped
-//!   memory, so run count never pressures the fd limit and no read syscall
-//!   (hence no fallible read) happens mid-stream — every fallible spill write
-//!   is front-loaded into `push` / `finish`.
-//! - **`String` errors, not `StorageError`.** The consumers surface these
-//!   messages verbatim to the client (a failed DDL), so they carry the path
-//!   and OS error instead of collapsing into an opaque `Io` variant.
+//! Bounded external sort of fixed-stride byte records: peak RAM is about one
+//! run, whatever the input size. The spill file is `O_TMPFILE`, so no exit
+//! leaves it on disk.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::cmp::Ordering;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 
 use super::error::StoreError;
 use super::repr::heap::{HeapNode, LoserTree};
-use crate::schema::key::compare_pk_bytes;
-use gnitz_foundation::posix_io::{self, Mmap};
+use gnitz_foundation::posix_io::Mmap;
+use gnitz_wire::MAX_PK_BYTES;
 
-/// Sort `idx` (rebuilt as `0..flat.len()/stride`) by the byte order of the
-/// fixed-`stride` records of `flat` — the OPK order every merge reads a PK
-/// region in. Indirect, so the records themselves never move.
-///
-/// `compare_pk_bytes`, not the merge's `compare_pk_ordering`: same order, but at
-/// a runtime stride it measures slower here — see `sort_indices_bench`.
-pub fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
-    let n = flat.len() / stride;
-    assert!(n <= u32::MAX as usize, "spill run exceeds u32 records");
-    idx.clear();
-    idx.extend(0..n as u32);
-    idx.sort_unstable_by(|&a, &b| {
-        let a = a as usize * stride;
-        let b = b as usize * stride;
-        compare_pk_bytes(&flat[a..a + stride], &flat[b..b + stride])
-    });
+/// Unsigned byte order of two records, compared a big-endian word at a time.
+#[inline(always)]
+fn cmp_records(a: &[u8], b: &[u8]) -> Ordering {
+    for (x, y) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0) {
+        let (x, y) = (u64::from_be_bytes(*x), u64::from_be_bytes(*y));
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    Ordering::Equal
 }
 
-/// Bounded external merge sort of fixed-width records (see the module doc).
-///
-/// Push records in any order; past the byte budget the buffer is sorted and
-/// appended to the spill file as one sorted run. `finish` returns either the
-/// in-RAM sorted records (nothing ever spilled — the fast path) or a streaming
-/// k-way merge over the spilled runs. Every record is exactly `stride` bytes,
-/// so runs are unframed fixed-stride records with no per-record length prefix.
+fn sort_records(flat: &mut [u8], stride: usize) {
+    macro_rules! by_width {
+        ($($w:literal)*) => {
+            match stride {
+                $($w => flat.as_chunks_mut::<$w>().0.sort_unstable_by(|a, b| cmp_records(a, b)),)*
+                _ => unreachable!("SpillSort::new admits multiples of 8 up to MAX_PK_BYTES"),
+            }
+        };
+    }
+    by_width!(8 16 24 32 40 48 56 64 72 80)
+}
+const _: () = assert!(MAX_PK_BYTES == 80); // the arm list above is total
+
 pub struct SpillSort {
     stride: usize,
-    budget: usize,
+    run_len: usize,
     dir: String,
-    /// Accumulated records, `stride` bytes each; its length is the live byte
-    /// count checked against `budget`.
     flat: Vec<u8>,
-    /// Reused index permutation for the indirect sort of `flat`.
-    idx: Vec<u32>,
-    /// Reused reorder buffer: `flat`'s records copied out in sorted order,
-    /// then written to the spill file in one call.
-    scratch: Vec<u8>,
-    /// The spill file, opened lazily on the first spill (the fast path never
-    /// creates it). `O_TMPFILE`: dropping the fd reclaims the anonymous inode.
-    spill: Option<OwnedFd>,
-    /// Record count of each spilled run, in spill order. Empty ⇒ fast path.
-    runs: Vec<usize>,
+    spill: Option<File>,
+    spilled_bytes: usize,
 }
 
 impl SpillSort {
-    /// `dir` anchors the `O_TMPFILE` spill on a specific filesystem (the fast
-    /// path never touches it). `stride` is the fixed record width; `budget`
-    /// the in-RAM byte ceiling before a run spills.
+    /// `dir` names the filesystem the spill file goes on; a run is `budget`
+    /// bytes of records, rounded up to whole records.
     pub fn new(dir: &str, stride: usize, budget: usize) -> Self {
-        debug_assert!(stride > 0);
+        assert!(
+            stride.is_multiple_of(8) && (8..=MAX_PK_BYTES).contains(&stride),
+            "record stride {stride}"
+        );
         SpillSort {
             stride,
-            budget,
+            // `HeapNode::row` indexes a run with a `u32`.
+            run_len: budget.div_ceil(stride).clamp(1, u32::MAX as usize),
             dir: dir.to_string(),
             flat: Vec::new(),
-            idx: Vec::new(),
-            scratch: Vec::new(),
             spill: None,
-            runs: Vec::new(),
+            spilled_bytes: 0,
         }
     }
 
-    /// Append one `stride`-byte record; spill a sorted run once the buffer
-    /// reaches the byte budget. Duplicates are preserved at full multiplicity;
-    /// copies split across runs are still merged adjacently by `finish`.
     pub fn push(&mut self, record: &[u8]) -> Result<(), StoreError> {
         debug_assert_eq!(record.len(), self.stride);
         self.flat.extend_from_slice(record);
-        if self.flat.len() >= self.budget {
+        if self.flat.len() == self.run_len * self.stride {
             self.spill_run()?;
         }
         Ok(())
     }
 
-    /// Lazily open the anonymous spill file in `dir`, returning its raw fd.
-    fn ensure_spill_fd(&mut self) -> Result<i32, StoreError> {
-        if self.spill.is_none() {
-            let fd = posix_io::open_tmpfile(&self.dir).map_err(|e| {
-                StoreError::storage(
-                    format!("external sort: cannot create spill file in {}", self.dir),
-                    e.into(),
-                )
-            })?;
-            self.spill = Some(fd);
-        }
-        Ok(self.spill.as_ref().unwrap().as_raw_fd())
-    }
-
-    /// Sort the accumulated buffer and append it to the spill file as one run.
-    /// No-op on an empty buffer, so a run in `runs` always has `>= 1` record.
     fn spill_run(&mut self) -> Result<(), StoreError> {
-        let n = self.flat.len() / self.stride;
-        if n == 0 {
-            return Ok(());
-        }
-        sort_indices(&self.flat, self.stride, &mut self.idx);
-        self.scratch.clear();
-        self.scratch.reserve(n * self.stride);
-        for &i in &self.idx {
-            let o = i as usize * self.stride;
-            self.scratch.extend_from_slice(&self.flat[o..o + self.stride]);
-        }
-        let fd = self.ensure_spill_fd()?;
-        // `write_all_fd` fully writes or returns an error, so a short/ENOSPC
-        // write becomes an `Err` here and the sort aborts before the merge —
-        // a truncated (misaligned) run can never reach it.
-        posix_io::write_all_fd(fd, &self.scratch)
+        sort_records(&mut self.flat, self.stride);
+        let file = match &mut self.spill {
+            Some(f) => f,
+            None => self.spill.insert(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_TMPFILE)
+                    .open(&self.dir)
+                    .map_err(|e| {
+                        StoreError::storage(
+                            format!("external sort: cannot create spill file in {}", self.dir),
+                            e.into(),
+                        )
+                    })?,
+            ),
+        };
+        file.write_all(&self.flat)
             .map_err(|e| StoreError::storage("external sort: spill write failed", e.into()))?;
-        self.runs.push(n);
+        self.spilled_bytes += self.flat.len();
         self.flat.clear();
         Ok(())
     }
 
-    /// Finish accumulation and yield the sorted-record producer. On the fast
-    /// path (nothing spilled) it sorts the in-RAM buffer; otherwise it spills
-    /// the final partial run, `mmap`s the spill file, and primes the k-way
-    /// merge. The last fallible I/O happens here — the producer is infallible.
     pub fn finish(mut self) -> Result<KeyProducer, StoreError> {
-        if self.runs.is_empty() {
-            let mut idx = Vec::new();
-            sort_indices(&self.flat, self.stride, &mut idx);
-            return Ok(KeyProducer::Fast(FastProducer {
-                flat: self.flat,
-                idx,
-                stride: self.stride,
-                pos: 0,
-            }));
-        }
-
-        // Spill the final partial buffer so the merge is uniform over disk runs.
-        self.spill_run()?;
-        let stride = self.stride;
-        let total: usize = self.runs.iter().sum();
-        let fd = self.spill.as_ref().expect("spill fd after >= 1 run").as_raw_fd();
-        let map = Mmap::from_fd(fd, total * stride)
-            .map_err(|e| StoreError::storage("external sort: mmap spill file failed", e.into()))?;
-        map.advise_sequential();
-
-        // Per-run geometry: byte offset of each run's first record and its
-        // record count. Runs are non-empty, so every source primes at row 0.
-        let mut run_starts = Vec::with_capacity(self.runs.len());
-        let mut run_lens = Vec::with_capacity(self.runs.len());
-        let mut off = 0usize;
-        for &records in &self.runs {
-            run_starts.push(off);
-            run_lens.push(records as u32);
-            off += records * stride;
-        }
-        let tree = {
-            let bytes = map.as_slice();
-            let less = record_less(bytes, &run_starts, stride);
-            LoserTree::build(self.runs.len(), |_| Some(0u32), less)
+        let records = if self.spill.is_none() {
+            sort_records(&mut self.flat, self.stride);
+            Records::Ram(self.flat)
+        } else {
+            // The last run goes to disk too, so `flat` is freed before the merge.
+            self.spill_run()?;
+            let file = self.spill.take().expect("spilled");
+            // The mapping keeps the inode alive after `file` closes.
+            let map = Mmap::from_fd(file.as_raw_fd(), self.spilled_bytes)
+                .map_err(|e| StoreError::storage("external sort: mmap spill file failed", e.into()))?;
+            map.advise_sequential();
+            Records::Mapped(map)
         };
-        // `self` (and its `spill` OwnedFd) drop on return, closing the fd; the
-        // mapping keeps the inode alive until the producer drops.
-        Ok(KeyProducer::Merge(MergeProducer {
-            map,
-            stride,
-            run_starts,
-            run_lens,
-            tree,
-            remaining: total,
-        }))
+        Ok(KeyProducer::new(records, self.stride, self.run_len))
     }
 }
 
-/// The record at `(src, row)` of the mapped spill file.
-#[inline]
-fn record_at<'a>(bytes: &'a [u8], run_starts: &[usize], stride: usize, src: usize, row: u32) -> &'a [u8] {
-    let off = run_starts[src] + row as usize * stride;
-    &bytes[off..off + stride]
+/// The sorted runs, back to back.
+enum Records {
+    Ram(Vec<u8>),
+    Mapped(Mmap),
 }
 
-/// The keyless `LoserTree` comparator: byte order of the records the nodes
-/// point at, read straight from the mapped file.
-fn record_less<'a>(
-    bytes: &'a [u8],
-    run_starts: &'a [usize],
-    stride: usize,
-) -> impl Fn(&HeapNode, &HeapNode) -> bool + 'a {
-    move |a, b| {
-        compare_pk_bytes(
-            record_at(bytes, run_starts, stride, a.source_idx as usize, a.row),
-            record_at(bytes, run_starts, stride, b.source_idx as usize, b.row),
-        )
-        .is_lt()
+impl Records {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Records::Ram(v) => v,
+            Records::Mapped(m) => m.as_slice(),
+        }
     }
 }
 
-/// Fast-path producer: the in-RAM flat buffer lent out in sorted-index order.
-pub struct FastProducer {
-    flat: Vec<u8>,
-    idx: Vec<u32>,
-    stride: usize,
-    pos: usize,
+/// The record index of `n`'s row: every run but the last holds `run_len` records.
+fn record_index(n: &HeapNode, run_len: usize) -> usize {
+    n.source_idx as usize * run_len + n.row as usize
 }
 
-impl FastProducer {
-    fn next(&mut self) -> Option<&[u8]> {
-        let &i = self.idx.get(self.pos)?;
-        self.pos += 1;
-        let o = i as usize * self.stride;
-        Some(&self.flat[o..o + self.stride])
-    }
+fn less(bytes: &[u8], stride: usize, run_len: usize) -> impl Fn(&HeapNode, &HeapNode) -> bool + '_ {
+    let rec = move |n: &HeapNode| &bytes[record_index(n, run_len) * stride..][..stride];
+    move |a, b| cmp_records(rec(a), rec(b)).is_lt()
 }
 
-/// Merge-path producer: a streaming k-way merge over the mapped spill runs.
-pub struct MergeProducer {
-    map: Mmap,
+/// The records in sorted order, merged across runs.
+pub struct KeyProducer {
+    records: Records,
     stride: usize,
-    run_starts: Vec<usize>,
-    run_lens: Vec<u32>,
-    tree: LoserTree,
+    run_len: usize,
+    total: usize,
     remaining: usize,
-}
-
-impl MergeProducer {
-    fn next(&mut self) -> Option<&[u8]> {
-        let HeapNode { source_idx: src, row } = self.tree.peek()?;
-        let src = src as usize;
-        let bytes = self.map.as_slice();
-        let less = record_less(bytes, &self.run_starts, self.stride);
-        self.tree
-            .step_top((row + 1 < self.run_lens[src]).then_some(row + 1), &less);
-        self.remaining -= 1;
-        Some(record_at(bytes, &self.run_starts, self.stride, src, row))
-    }
-}
-
-/// The globally-sorted record stream `finish` yields, lending one
-/// `stride`-byte record per `next` call (no per-record copy or allocation).
-/// Infallible: with an `mmap`'d merge there is no read syscall to fail
-/// mid-stream (an I/O fault on a mapped page is a SIGBUS that kills the
-/// process — never a silently truncated stream), and all spill writes already
-/// completed in `push` / `finish`.
-pub enum KeyProducer {
-    Fast(FastProducer),
-    Merge(MergeProducer),
+    tree: LoserTree,
 }
 
 impl KeyProducer {
-    /// Lend the next sorted record, or `None` when drained.
+    fn new(records: Records, stride: usize, run_len: usize) -> Self {
+        let total = records.as_slice().len() / stride;
+        let tree = LoserTree::build(
+            total.div_ceil(run_len),
+            |_| Some(0),
+            less(records.as_slice(), stride, run_len),
+        );
+        KeyProducer {
+            records,
+            stride,
+            run_len,
+            total,
+            remaining: total,
+            tree,
+        }
+    }
+
     // Not `Iterator::next`: the record is lent out of `self`, so the returned
     // borrow outlives no second call — a shape `Iterator` cannot express.
     #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> Option<&[u8]> {
-        match self {
-            KeyProducer::Fast(p) => p.next(),
-            KeyProducer::Merge(p) => p.next(),
-        }
+        let top = self.tree.peek()?;
+        let g = record_index(&top, self.run_len);
+        let more = (top.row as usize + 1) < self.run_len && g + 1 < self.total;
+        let bytes = self.records.as_slice();
+        self.tree
+            .step_top(more.then_some(top.row + 1), &less(bytes, self.stride, self.run_len));
+        self.remaining -= 1;
+        Some(&bytes[g * self.stride..][..self.stride])
     }
 
-    /// Records not yet yielded. Exact — lets consumers size buffers and place
-    /// end-of-stream markers without lookahead.
     #[inline]
     pub fn remaining(&self) -> usize {
-        match self {
-            KeyProducer::Fast(p) => p.idx.len() - p.pos,
-            KeyProducer::Merge(p) => p.remaining,
-        }
+        self.remaining
     }
 }
 

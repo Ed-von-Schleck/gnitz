@@ -174,11 +174,11 @@ def test_concurrent_inserts_during_create(client, server, schema_name):
         client.execute_sql("INSERT INTO t VALUES (888888, 888888)", schema_name=schema_name)
 
 
-def test_multi_frame_key_train(unique_preflight_frame_server):
-    """With frames shrunk to 7 keys, every worker streams a multi-frame
-    continuation train; the merge must stay exact across frame boundaries — on
-    both verdicts, wherever the boundaries happen to fall."""
-    srv, sn = unique_preflight_frame_server, "public"
+def test_multi_frame_key_train(tiny_ddl_chunk_server):
+    """With 3-row scan chunks, every worker streams its spans in 3-key frames,
+    a multi-frame continuation train; the merge must stay exact across frame
+    boundaries — on both verdicts, wherever the boundaries happen to fall."""
+    srv, sn = tiny_ddl_chunk_server, "public"
     srv.execute_sql(_T, schema_name=sn)
     insert(srv, sn, "t", [(pk, pk * 7) for pk in range(1, 201)])
     srv.execute_sql("CREATE UNIQUE INDEX ix ON t(val)", schema_name=sn)

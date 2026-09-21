@@ -1698,3 +1698,42 @@ fn confined_worker_declines_a_multi_key_range_and_an_unkeyed_relation() {
         );
     }
 }
+
+/// The indirect sort of a flat record buffer. Sweeps OPK strides at a
+/// chunk-sized `n` and a large one.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --release --ignored --nocapture"]
+fn sort_indices_bench() {
+    use crate::test_rng::Rng;
+    use crate::test_support::bench_time_each;
+
+    const ITERS: usize = 3;
+    for &n in &[65_536usize, 4 << 20] {
+        for &stride in &[4usize, 8, 12, 16, 24, 40] {
+            for seq in [true, false] {
+                let mut rng = Rng::new(0x5EED_0000 + n as u64 + stride as u64);
+                let mut flat = vec![0u8; n * stride];
+                for (i, rec) in flat.chunks_mut(stride).enumerate() {
+                    for chunk in rec.chunks_mut(8) {
+                        let bytes = rng.next_u64().to_be_bytes();
+                        chunk.copy_from_slice(&bytes[..chunk.len()]);
+                    }
+                    // Distinct ids in the leading bytes: neighbours share a prefix.
+                    if seq {
+                        let id = (i as u64).wrapping_mul(0x9E37_79B9) % n as u64;
+                        let be = id.to_be_bytes();
+                        let w = stride.min(8);
+                        rec[..w].copy_from_slice(&be[8 - w..]);
+                    }
+                }
+                let elapsed = bench_time_each(ITERS, Vec::new, |mut idx| {
+                    sort_indices(&flat, stride, &mut idx);
+                    std::hint::black_box(&idx);
+                });
+                let ns = elapsed.as_secs_f64() * 1e9 / (ITERS as f64 * n as f64);
+                let shape = if seq { "id" } else { "rnd" };
+                println!("  n={n:<8} stride={stride:<3} {shape:<3} {ns:7.2} ns/record");
+            }
+        }
+    }
+}

@@ -206,11 +206,6 @@ mod reply;
 
 pub(crate) use reply::send_unique_preflight_keys;
 use reply::PendingScan;
-/// The two halves of the pre-flight frame budget, reached only by
-/// `runtime::suites::unique_preflight` — production goes through
-/// `send_unique_preflight_keys`, which applies both itself.
-#[cfg(test)]
-pub(crate) use reply::{preflight_frame_overhead, preflight_keys_per_frame, preflight_per_key};
 
 /// `GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR`: fail the pre-flight on every worker so
 /// tests can assert the master surfaces the fault, drains the fan-out, and
@@ -522,11 +517,6 @@ impl WorkerProcess {
             SalMessageKind::DeltaRead => self.answer_delta_read(route, hdr.arg1, hdr.arg0, &blob, client_version),
 
             SalMessageKind::UniquePreflight => {
-                // CREATE UNIQUE INDEX global pre-flight: project this worker's
-                // committed partition of `target_id` to OPK leading-key spans,
-                // sort them, and stream the sorted spans back for the master's
-                // k-way merge. An error here surfaces as the terminal fault frame
-                // the master's merge expects (send_fault in handle_request).
                 let cols = self
                     .cat()
                     .registry
@@ -701,27 +691,10 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// CREATE UNIQUE INDEX pre-flight, worker side: project every
-    /// positive-weight, non-null row of this worker's committed partition of
-    /// `owner_id` to the OPK leading-key span of `col_indices` (the same
-    /// `IndexKeySpec::key_bytes` contract the master's filter warmup and merge use),
-    /// and stream the spans back byte-lexicographically sorted. A consolidated
-    /// row at weight ≥ 2 emits its span twice — it IS that many live instances of
-    /// the key, and the duplicate must be visible to the merge as an adjacent
-    /// pair. No local dedup and no within-partition duplicate check: the master's
-    /// adjacent-equal merge subsumes both.
-    ///
-    /// Sorting is the bounded external merge sort (`storage::SpillSort`), so
-    /// peak RAM is the spill budget, not the partition size — a
-    /// whole-partition in-RAM sort OOM-kills the worker on a large table. All
-    /// fallible spill I/O completes before the first frame is sent, so a fault
-    /// returns `Err` (surfaced to the master as a clean pre-flight fault by
-    /// `handle_request`), never a truncated train.
-    ///
-    /// MUST observe the same snapshot `backfill_index` will later project:
-    /// the master sends this command inside the DDL critical section
-    /// (committer barrier drained, catalog write lock held), before the
-    /// IDX_TAB +1 broadcast, so no concurrent INSERT can interleave.
+    /// CREATE UNIQUE INDEX pre-flight, worker side: stream the sorted index
+    /// key spans of every non-NULL row of this worker's committed partition of
+    /// `owner_id` to the master, whose merge finds the duplicates. A spill
+    /// fault is an `Err` before the first frame.
     fn handle_unique_preflight(&mut self, owner_id: i64, col_indices: &[u32], request_id: u32) -> Result<(), String> {
         if UNIQUE_PREFLIGHT_ERROR.armed() {
             return Err("injected unique pre-flight fault".to_string());
@@ -730,54 +703,33 @@ impl WorkerProcess {
         // outlives the entry borrow and pins the snapshot the DDL section froze.
         let e = self.cat().registry.relation_or_err(owner_id)?;
         let (schema, dir, mut handle) = (e.schema(), e.directory().to_string(), e.cursor());
-        // The index circuit is not registered until this pre-flight succeeds, so
-        // the key spec is built from the owner schema + column list — the same
-        // inputs the master builds from, so the reply frame layout agrees. It
-        // also bounds-checks the columns: a protocol mismatch, not a user error.
         let (spec, idx_schema) = gnitz_store::schema::index_spec_and_schema(col_indices, &schema)?;
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         let stride = spec.key_size();
         let chunk_rows = self.cat().registry.scan_chunk_rows();
 
-        // Stream the partition chunk-wise, projecting each row to its span and
-        // feeding it to the external sort. Peak RAM is the spill budget, not the
-        // partition. `key_bytes` keeps the single column→span definition shared
-        // with the filter warmup and the master merge. The spill file is an
-        // anonymous inode on the owner table's own data disk, so it never leaks
-        // and shares the table's filesystem.
         let mut sorter = gnitz_store::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
         let mut keybuf = PkBuf::zeroed(0);
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
             let mb = chunk.as_mem_batch();
             for row in 0..chunk.len() {
-                let w = chunk.get_weight(row);
-                if w <= 0 {
-                    continue;
-                }
-                if !spec.key_bytes(&mb, row, &mut keybuf) {
-                    continue;
-                }
-                sorter.push(keybuf.pk_bytes())?;
-                // Chunks are consolidated: weight ≥ 2 is the same row w
-                // times; one extra copy suffices to put an adjacent equal
-                // pair in the sorted stream for the master's merge.
-                if w > 1 {
+                debug_assert_eq!(chunk.get_weight(row), 1, "a base table's consolidated row");
+                if spec.key_bytes(&mb, row, &mut keybuf) {
                     sorter.push(keybuf.pk_bytes())?;
                 }
             }
         }
 
-        // `finish` runs the final spill + merge setup (the last fallible I/O);
-        // the returned producer then lends the globally-sorted spans
-        // infallibly, one at a time, into the frame train.
         let mut producer = sorter.finish()?;
+        debug_assert!(self.pending_streams.is_empty(), "pre-flight train behind a scan train");
         send_unique_preflight_keys(
             &self.w2m_writer,
             owner_id as u64,
             &frame_schema,
             request_id,
             self.reply_frame_budget,
+            chunk_rows,
             &mut producer,
         );
         Ok(())
@@ -927,32 +879,10 @@ impl WorkerProcess {
 // Unique pre-flight key stream
 // ---------------------------------------------------------------------------
 
-/// Keys per W2M frame for the unique pre-flight stream, before
-/// `preflight_keys_per_frame` clamps it to what the reply frame budget leaves
-/// after the frame's own overhead. A key costs
-/// `idx_key_size + 16` on the wire (the OPK span, the weight and the null word),
-/// so a full frame at this count is 24 MiB for a single 8-byte column and would
-/// be ~96 MiB for an 80-byte composite — which is where the clamp binds.
-///
-/// A throughput/memory knob with no correctness floor: `InFlightState` grows
-/// with however many frames a ring holds.
-const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
-
-/// [`UNIQUE_PREFLIGHT_KEYS_PER_FRAME`], overridable via
-/// `GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME` so tests exercise multi-frame trains
-/// with small tables. Read only through `preflight_keys_per_frame`.
-fn unique_preflight_keys_per_frame() -> usize {
-    gnitz_foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME", UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
-}
-
-/// Default in-RAM key-byte budget before the pre-flight sort spills a run (128 MiB).
 const UNIQUE_PREFLIGHT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 
-/// Byte budget of accumulated key spans before the pre-flight's external sort
-/// spills a sorted run to disk. Read from `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES`
-/// (a production memory lever, honoured in every build), default 128 MiB. Peak
-/// worker RAM during the pre-flight is roughly this budget plus the sort index
-/// and one reorder buffer — bounded regardless of partition size.
+/// The pre-flight sort's run size in bytes: `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES`,
+/// in every build.
 fn unique_preflight_spill_bytes() -> usize {
     gnitz_foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
 }

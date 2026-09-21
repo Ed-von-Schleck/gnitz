@@ -1,23 +1,18 @@
 //! Unit tests for the CREATE UNIQUE INDEX pre-flight building blocks: the
-//! worker's sorted-span frame train (`send_unique_preflight_keys`), the
-//! per-row span projection, and the master's per-span merge accounting. The
-//! full distributed path (fan-out, k-way merge over live W2M trains, DDL
-//! integration) is covered by the multi-worker E2E suite.
+//! worker's sorted-span frame train (`send_unique_preflight_keys`) and the
+//! master's per-span merge accounting.
 //!
 //! Every key is the OPK leading-key span (`PkBuf`) — equality-correct and
 //! byte-orderable at any width.
 
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::wire::{self, unique_preflight_wire_schema};
-use crate::runtime::worker::{
-    preflight_frame_overhead, preflight_keys_per_frame, preflight_per_key, send_unique_preflight_keys,
-};
+use crate::runtime::wire::{self, unique_preflight_wire_schema, FRAME_CAP};
+use crate::runtime::worker::send_unique_preflight_keys;
 use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
-use gnitz_store::schema::make_index_schema;
-use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, KeyProducer, SpillSort};
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::{KeyProducer, SpillSort};
 use gnitz_wire::control::peek_control_block;
 use gnitz_wire::type_code;
 use gnitz_wire::WireStatus;
@@ -32,27 +27,11 @@ fn span_u128(v: u128) -> PkBuf {
     PkBuf::from_bytes(&v.to_be_bytes())
 }
 
-/// OPK leading-key span of a single promoted-I64 value (order-preserving
-/// big-endian with the sign bit flipped) — what an I64 indexed column projects.
-fn span_i64(v: i64) -> PkBuf {
-    let mut b = [0u8; 8];
-    gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut b);
-    PkBuf::from_bytes(&b)
-}
-
 /// Frame schema of a single-U128-span pre-flight reply (one U128 PK column),
 /// so the round-trip tests ship a 16-byte PK span per row. Index columns are
 /// all non-nullable, which is what makes it an all-PK schema.
 fn u128_frame_schema() -> SchemaDescriptor {
     pk_only_schema(&[type_code::U128])
-}
-
-/// A reply budget that admits exactly `n` keys per pre-flight frame: the
-/// frame's own overhead — control block, empty data block — plus `n` rows'
-/// worth of data. Written through the production accounting, so a test cannot
-/// pin a per-frame key count the emitter would not itself choose.
-fn budget_for(frame_schema: &SchemaDescriptor, n: usize) -> usize {
-    preflight_frame_overhead(frame_schema) + n * preflight_per_key(frame_schema)
 }
 
 /// Build the real sorted-span producer over pre-sorted `keys` via
@@ -85,9 +64,11 @@ fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
 /// Drain every frame of one pre-flight train from the ring, asserting the
 /// flag/schema discipline the master's merge relies on, and return the spans
 /// decoded the way the merge decodes them: the whole PK region of each row
-/// (`get_pk_bytes` → `PkBuf`), every frame against `frame_schema`.
-fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected_req_id: u64) -> Vec<PkBuf> {
+/// (`get_pk_bytes` → `PkBuf`), every frame against `frame_schema`, with the
+/// train's frame count.
+fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected_req_id: u64) -> (Vec<PkBuf>, usize) {
     let mut keys = Vec::new();
+    let mut frames = 0;
     loop {
         let slot = receiver.try_read_slot(0).expect("frame missing from train");
         assert_eq!(
@@ -113,14 +94,15 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
             }
         }
         drop(slot);
+        frames += 1;
         if last {
             break;
         }
     }
-    keys
+    (keys, frames)
 }
 
-/// Multi-frame train: spans split across frames at `keys_per_frame`, the
+/// Multi-frame train: spans split across frames at `chunk_rows`, the
 /// terminal frame tagged `scan_last`, and every span — including extreme
 /// u128s — round-trips through the wire to the exact byte span.
 #[test]
@@ -141,36 +123,24 @@ fn preflight_train_multi_frame_key_roundtrip() {
     .collect();
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(
-            writer,
-            77,
-            &frame_schema,
-            9001,
-            budget_for(&frame_schema, 4),
-            &mut producer_of(&keys),
-        );
-        let got = drain_train(receiver, &frame_schema, 9001);
+        send_unique_preflight_keys(writer, 77, &frame_schema, 9001, FRAME_CAP, 4, &mut producer_of(&keys));
+        let (got, frames) = drain_train(receiver, &frame_schema, 9001);
+        assert_eq!(frames, 3, "9 keys at 4 per chunk");
         assert_eq!(got, keys);
         assert!(receiver.try_read_slot(0).is_none(), "no frames after terminal");
     });
 }
 
-/// A train whose span count is an exact multiple of the frame size must not
+/// A train whose span count is an exact multiple of `chunk_rows` must not
 /// emit a trailing empty frame: the last full frame is the terminal one.
 #[test]
 fn preflight_train_exact_frame_boundary() {
     let keys: Vec<PkBuf> = (0..8u128).map(span_u128).collect();
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(
-            writer,
-            77,
-            &frame_schema,
-            42,
-            budget_for(&frame_schema, 4),
-            &mut producer_of(&keys),
-        );
-        let got = drain_train(receiver, &frame_schema, 42);
+        send_unique_preflight_keys(writer, 77, &frame_schema, 42, FRAME_CAP, 4, &mut producer_of(&keys));
+        let (got, frames) = drain_train(receiver, &frame_schema, 42);
+        assert_eq!(frames, 2, "no trailing empty frame");
         assert_eq!(got, keys);
         assert!(receiver.try_read_slot(0).is_none());
     });
@@ -182,14 +152,7 @@ fn preflight_train_exact_frame_boundary() {
 fn preflight_train_empty_partition_single_terminal_frame() {
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(
-            writer,
-            77,
-            &frame_schema,
-            7,
-            budget_for(&frame_schema, 4),
-            &mut producer_of(&[]),
-        );
+        send_unique_preflight_keys(writer, 77, &frame_schema, 7, FRAME_CAP, 4, &mut producer_of(&[]));
         let slot = receiver.try_read_slot(0).expect("terminal frame");
         let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
         assert_eq!(ctrl.hdr.status, WireStatus::Ok);
@@ -200,44 +163,17 @@ fn preflight_train_empty_partition_single_terminal_frame() {
     });
 }
 
-/// The byte clamp, not the key count, is what bounds a pre-flight frame: at a
-/// small reply budget `preflight_keys_per_frame` cuts the configured count down
-/// to what fits, and the train it produces spans several frames.
-///
-/// The budget charges the frame's own overhead on top of the eight keys — a
-/// budget of eight keys' *rows* alone would leave room for none of them, which
-/// is exactly the shortfall this accounting closes.
+/// `budget`, not `chunk_rows`, cuts this train into frames.
 #[test]
 fn preflight_frames_are_cut_by_the_byte_budget() {
     let frame_schema = u128_frame_schema();
-    // 16 B span + 8 B weight + 8 B null word per key.
-    assert_eq!(preflight_per_key(&frame_schema), 32);
-    let overhead = preflight_frame_overhead(&frame_schema);
-    let budget = overhead + 8 * 32;
-    assert_eq!(
-        preflight_keys_per_frame(&frame_schema, budget, overhead),
-        8,
-        "the budget, not the configured 1<<20 count, must decide the frame's keys"
-    );
-
     let keys: Vec<PkBuf> = (0..24u128).map(span_u128).collect();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 77, &frame_schema, 11, budget, &mut producer_of(&keys));
-        let got = drain_train(receiver, &frame_schema, 11);
-        assert_eq!(got, keys, "the clamped train still carries every span in order");
+        send_unique_preflight_keys(writer, 77, &frame_schema, 11, 400, 1024, &mut producer_of(&keys));
+        let (got, frames) = drain_train(receiver, &frame_schema, 11);
+        assert!(frames > 1, "the budget, not the chunk, cut this train");
+        assert_eq!(got, keys);
     });
-}
-
-/// The frame overhead must be charged, not assumed away: eight keys' rows fit
-/// only beside it, and a budget the overhead alone fills leaves room for no key,
-/// so the clamp floors at one rather than emitting an over-budget frame.
-#[test]
-fn preflight_keys_per_frame_charges_the_frame_overhead() {
-    let frame_schema = u128_frame_schema();
-    let overhead = preflight_frame_overhead(&frame_schema);
-    assert!(overhead > 0, "a frame's control and data block headers cost bytes");
-    assert!(preflight_keys_per_frame(&frame_schema, 8 * 32, overhead) < 8);
-    assert_eq!(preflight_keys_per_frame(&frame_schema, overhead, overhead), 1);
 }
 
 /// A composite two-column span round-trips through the wire frame: the reply
@@ -260,176 +196,11 @@ fn preflight_train_composite_wide_span_roundtrip() {
     };
     let keys = vec![span(7, 1), span(7, 2), span(9, 1)];
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(
-            writer,
-            5,
-            &frame_schema,
-            3,
-            budget_for(&frame_schema, 2),
-            &mut producer_of(&keys),
-        );
-        let got = drain_train(receiver, &frame_schema, 3);
+        send_unique_preflight_keys(writer, 5, &frame_schema, 3, FRAME_CAP, 2, &mut producer_of(&keys));
+        let (got, _) = drain_train(receiver, &frame_schema, 3);
         assert_eq!(got, keys);
         assert_eq!(got[0].pk_bytes().len(), 16, "composite span is the full 16 bytes");
     });
-}
-
-// ---------------------------------------------------------------------------
-// Worker projection: IndexKeySpec::key_bytes feeding the train
-// ---------------------------------------------------------------------------
-
-/// Mirror of the worker's per-chunk projection loop: build each positive-weight
-/// row's OPK span via `IndexKeySpec::key_bytes`, emitting it once per unit of
-/// weight (capped at a pair), skipping any-NULL rows. Returns the SORTED spans.
-fn project_sorted(batch: &Batch, owner: &SchemaDescriptor, cols: &[u32]) -> Vec<PkBuf> {
-    let spec = IndexKeySpec::new(cols, owner).unwrap();
-    let mb = batch.as_mem_batch();
-    let mut keys: Vec<PkBuf> = Vec::new();
-    let mut keybuf = PkBuf::zeroed(0);
-    for row in 0..batch.len() {
-        let w = batch.get_weight(row);
-        if w <= 0 {
-            continue;
-        }
-        if !spec.key_bytes(&mb, row, &mut keybuf) {
-            continue;
-        }
-        keys.push(keybuf);
-        if w > 1 {
-            keys.push(keybuf);
-        }
-    }
-    keys.sort_unstable();
-    keys
-}
-
-/// The worker projection (`IndexKeySpec::key_bytes` on the owner schema) and the wire
-/// round-trip compose to preserve spans end-to-end for a signed payload column:
-/// equal signed values (including negatives) produce equal spans on the master
-/// side, and retractions and NULLs never enter the stream.
-#[test]
-fn preflight_signed_payload_projection_roundtrip() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-    // (pk, val, weight): two rows share val=-5 (the duplicate the pre-flight
-    // exists to catch), one NULL, one retracted row.
-    let rows: [(u128, Option<i64>, i64); 6] = [
-        (1, Some(-5), 1),
-        (2, Some(300), 1),
-        (3, Some(-5), 1),
-        (4, None, 1),     // NULL val: skipped
-        (5, Some(7), -1), // retracted: skipped
-        (6, Some(i64::MIN), 1),
-    ];
-    let mut bb = BatchBuilder::new(schema);
-    for &(pk, val, weight) in &rows {
-        bb.begin_row(pk, weight);
-        match val {
-            Some(v) => bb.put_int(v as u128),
-            None => bb.put_null(),
-        }
-        bb.end_row();
-    }
-    let batch = bb.finish();
-
-    let keys = project_sorted(&batch, &schema, &[1]);
-
-    // Expected spans: the signed I64-promoted OPK of the four non-NULL,
-    // non-retracted values, sorted byte-lex. The signed promotion makes
-    // negatives sort below non-negatives — i64::MIN first, 300 last.
-    let expected: Vec<PkBuf> = {
-        let mut v: Vec<PkBuf> = [-5i64, 300, -5, i64::MIN].iter().map(|&x| span_i64(x)).collect();
-        v.sort_unstable();
-        v
-    };
-    assert_eq!(keys, expected, "projection must be the order-preserving signed I64 OPK");
-
-    let frame_schema = unique_preflight_wire_schema(&make_index_schema(&[1], &schema).unwrap(), 1);
-    with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(
-            writer,
-            5,
-            &frame_schema,
-            11,
-            budget_for(&frame_schema, 3),
-            &mut producer_of(&keys),
-        );
-        let got = drain_train(receiver, &frame_schema, 11);
-        assert_eq!(got, keys);
-        // The duplicate pair is adjacent in the sorted stream — exactly what the
-        // master's prev == popped check rejects.
-        let dup = span_i64(-5);
-        assert_eq!(got.iter().filter(|&&k| k == dup).count(), 2);
-    });
-}
-
-/// A consolidated row at weight 2 is the same (PK, payload) twice: the worker
-/// collection contract (one span per unit of weight, capped at a pair) makes
-/// the multiplicity visible to the merge as an adjacent equal pair, and the
-/// accumulator's verdict is duplicate.
-#[test]
-fn preflight_weight2_row_emits_adjacent_pair() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-    let rows: [(u128, i64, i64); 3] = [
-        (1, 7, 1),
-        (2, 9, 2), // consolidated duplicate: weight 2
-        (3, 11, 1),
-    ];
-    let mut bb = BatchBuilder::new(schema);
-    for &(pk, val, weight) in &rows {
-        bb.begin_row(pk, weight);
-        bb.put_int(val as u128);
-        bb.end_row();
-    }
-    let batch = bb.finish();
-
-    let keys = project_sorted(&batch, &schema, &[1]);
-    assert_eq!(
-        keys,
-        vec![span_i64(7), span_i64(9), span_i64(9), span_i64(11)],
-        "weight-2 row must emit its span twice"
-    );
-}
-
-/// A composite `UNIQUE (a, b)` span packs both columns, so two rows that share
-/// column `a` and differ in `b` produce distinct spans and are both admitted.
-#[test]
-fn preflight_composite_projection_distinguishes_trailing_column() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0), // pk
-            SchemaColumn::new(type_code::U64, 0), // a
-            SchemaColumn::new(type_code::U64, 0), // b
-        ],
-        &[0],
-    );
-    // (pk, a, b): (10,7,1) and (11,7,2) share a=7 but differ in b → distinct.
-    let mut bb = BatchBuilder::new(schema);
-    for &(pk, a, b) in &[(10u128, 7u128, 1u128), (11, 7, 2)] {
-        bb.begin_row(pk, 1);
-        bb.put_int(a);
-        bb.put_int(b);
-        bb.end_row();
-    }
-    let batch = bb.finish();
-    let keys = project_sorted(&batch, &schema, &[1, 2]);
-    assert_eq!(keys.len(), 2);
-    assert_ne!(
-        keys[0], keys[1],
-        "rows differing only in the trailing column are distinct"
-    );
-    assert_eq!(keys[0].pk_bytes().len(), 16, "composite span spans both columns");
 }
 
 // ---------------------------------------------------------------------------
