@@ -49,19 +49,17 @@ impl Reactor {
 
     /// Drive `fut` to completion without polling any task: CQEs are dispatched, W2M
     /// frames routed and deadlines fired as in `tick`, so their wakes land for the
-    /// tasks to run afterwards. `fut` may await only leases, the exchange queue and
-    /// timers. No train lease may be live: a routed train frame no task consumes pins
-    /// its ring's release, and a worker parked for ring space never answers.
+    /// tasks to run afterwards. `fut` may await only ACK leases, the exchange queue
+    /// and timers.
     ///
     /// Callable from inside a task's poll: the reactor holds no borrow of its own
     /// state across a task poll, and a CQE handler only wakes or spawns.
     pub(crate) fn block_on_exclusive<T>(&self, fut: impl Future<Output = T>) -> T {
-        debug_assert!(!self
-            .inner
-            .routes
-            .borrow()
-            .values()
-            .any(|r| matches!(r, Route::Train(_))));
+        debug_assert!(
+            self.inner.trains.borrow().is_empty(),
+            "a live train lease: a frame no task consumes pins its ring, and a worker \
+             parked for ring space never answers"
+        );
         let mut fut = std::pin::pin!(fut);
         let mut cx = Context::from_waker(Waker::noop());
         loop {
@@ -162,7 +160,12 @@ impl Reactor {
                 self.inner.futex_waitv_armed.set(false);
                 self.inner.w2m.clear_waitv();
             }
-            KIND_OP => self.inner.ops.complete(id, cqe.res),
+            KIND_OP => {
+                let op = self.inner.ops.borrow_mut().remove(&id);
+                if let Some(PendingOp { done, carry }) = op {
+                    done.send((cqe.res, carry));
+                }
+            }
             KIND_ACCEPT => self.handle_accept_cqe(id as usize, cqe.res, cqe.flags),
             KIND_RECV => self.handle_recv_cqe(id as i32, cqe.res),
             _ => gnitz_error!(

@@ -35,7 +35,7 @@ use crate::runtime::master::{
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{chan, oneshot, select2, AsyncRwLock, Either, ReadGuard, RecvBuf, WriteGuard};
-use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind, WorkerSet};
+use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match};
 use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::key::seek_opk_bytes;
@@ -724,7 +724,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
         return Ok(());
     }
 
-    let mut req_ids = shared.disp().reactor().lease_acks(tids.len(), WorkerSet::ALL);
+    let mut req_ids = shared.disp().reactor().lease_acks(tids.len(), "tick");
 
     let _cat_read = shared.catalog_rwlock.read().await;
     let excl = shared.disp().sal().lock().await;
@@ -758,7 +758,7 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
     shared.requeue_tick_tids(&tids[n..]);
 
     let worker_err = loop {
-        match shared.disp().next_relay(&req_ids, "tick", acc).await {
+        match shared.disp().next_relay(&req_ids, acc).await {
             Ok(Some(relay)) => relay_steady(shared, relay).await,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),

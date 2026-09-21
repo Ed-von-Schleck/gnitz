@@ -19,7 +19,7 @@ use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::reactor::{Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter, WorkerSet};
+use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
 use crate::runtime::w2m::{self, SalWake, W2mReceiver, W2mWriter, BOOT_READY_REQUEST_ID};
 use crate::runtime::wire as ipc;
@@ -450,13 +450,13 @@ fn fork_workers(
 fn master_post_fork_recovery(disp: &MasterDispatcher, live_epoch: u32, swept_bases: &[i64]) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
     // Before any drain: a drain drops frames no lease routes.
-    let ready = disp.reactor().lease_acks(1, WorkerSet::ALL);
+    let ready = disp.reactor().lease_acks(1, "recovery sync");
     assert_eq!(
         ready.id(0),
         BOOT_READY_REQUEST_ID,
         "the ready ACKs name the reactor's first lease"
     );
-    disp.collect_exclusive(&ready, "recovery sync", false)
+    disp.collect_exclusive(&ready, false)
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
     drop(ready);
 

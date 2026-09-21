@@ -22,7 +22,7 @@ struct DrainFixture {
     /// ticks.
     peer: Peer,
     /// The scan lease the drains under test read, one reply id per worker.
-    lease: Lease,
+    lease: TrainLease,
 }
 
 impl DrainFixture {
@@ -59,7 +59,7 @@ impl DrainFixture {
 
     /// The request id every worker's train answers on.
     fn req(&self) -> u32 {
-        self.lease.id(0)
+        self.lease.id()
     }
 }
 
@@ -125,7 +125,7 @@ fn poll_once<T>(fut: impl std::future::Future<Output = T>) -> T {
 
 /// A frame must still be routed for worker `i` — the drain returned without
 /// consuming it. Consumes the frame itself, so it is a terminal check.
-fn assert_frame_still_parked(lease: &Lease, i: usize) {
+fn assert_frame_still_parked(lease: &TrainLease, i: usize) {
     assert!(
         try_poll_once(lease.next_frame(i)).is_some(),
         "expected an undrained parked frame — the drain consumed frames \

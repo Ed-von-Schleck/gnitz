@@ -159,12 +159,16 @@ impl PreflightAccumulator {
 /// Returns on the FIRST error and on the first duplicate without draining the
 /// rest — the caller's scan lease drop discards the undrained trains at the
 /// ring boundary, as it does for `drain_index_scan`.
-async fn merge_index_scan(scan: &Lease, frame_schema: &SchemaDescriptor) -> Result<PreflightAccumulator, WireFault> {
+async fn merge_index_scan(
+    scan: &TrainLease,
+    frame_schema: &SchemaDescriptor,
+) -> Result<PreflightAccumulator, WireFault> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
     let mut streams: Vec<PreflightKeyStream> = scan
         .workers()
+        .iter()
         .map(|w| PreflightKeyStream::new(Train::new(scan, w, OP_UNIQUE_PREFLIGHT)))
         .collect();
 

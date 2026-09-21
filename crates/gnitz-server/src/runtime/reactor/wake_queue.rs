@@ -30,18 +30,13 @@ impl<T> WakeQueue<T> {
 
     /// Hand the next value to the awaiter, or park it.
     pub(super) fn poll(&mut self, cx: &Context<'_>) -> Poll<T> {
-        match self.take() {
+        match self.pop() {
             Some(v) => Poll::Ready(v),
             None => {
-                self.park(cx);
+                park_waker(&mut self.waker, cx.waker());
                 Poll::Pending
             }
         }
-    }
-
-    /// Register `cx`'s waker for the next push or wake, without taking a value.
-    pub(super) fn park(&mut self, cx: &Context<'_>) {
-        park_waker(&mut self.waker, cx.waker());
     }
 
     /// Wake the parked awaiter without queueing a value, so it re-reads whatever
@@ -54,20 +49,16 @@ impl<T> WakeQueue<T> {
 
     /// Take the next value without parking. For a caller that must not await.
     pub(super) fn pop(&mut self) -> Option<T> {
-        self.take()
-    }
-
-    /// Drop every queued value and the capacity they held.
-    pub(super) fn clear(&mut self) {
-        self.queue = VecDeque::new();
-    }
-
-    fn take(&mut self) -> Option<T> {
         let v = self.queue.pop_front();
         if self.queue.is_empty() && self.queue.capacity() > RETAINED_SLOTS {
             self.queue.shrink_to(RETAINED_SLOTS);
         }
         v
+    }
+
+    /// Drop every queued value and the capacity they held.
+    pub(super) fn clear(&mut self) {
+        self.queue = VecDeque::new();
     }
 
     #[cfg(test)]

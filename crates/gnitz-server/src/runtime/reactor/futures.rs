@@ -1,149 +1,283 @@
-//! Reactor futures: W2M routes and their [`Lease`], and the futures woken by a
-//! CQE, a routed frame or a passed deadline.
+//! Reactor futures: the W2M routes of [`AckLease`] and [`TrainLease`], and the
+//! futures woken by a routed frame or a passed deadline.
 
-use std::ops::Range;
-
-use gnitz_wire::control::DecodedControl;
 use gnitz_wire::WireFault;
 
 use super::*;
 use crate::runtime::sal::WorkerSet;
 
-/// Worker `w`'s reply as a fault, keeping its status, or `None` when it succeeded.
-pub(crate) fn worker_error(w: usize, op: &str, ctrl: &DecodedControl) -> Option<WireFault> {
-    ctrl.fault().map(|f| WireFault {
+/// Worker `w`'s fault `f`, its text naming the worker and `op`.
+pub(crate) fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
+    WireFault {
         text: format!("worker {w}: {op}: {}", f.text),
         ..f
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Routes + Lease
-// ---------------------------------------------------------------------------
-
-/// A route's key: `(request id, worker)`.
-pub(super) type RouteKey = (u32, u32);
-
-/// Where one worker's frames on a leased request id go.
-pub(super) enum Route {
-    /// An ACK: one control-only frame, read on arrival (so its ring slot is freed
-    /// at once) and kept until the lease drops.
-    Ack {
-        ack: Option<DecodedControl>,
-        waker: Option<Waker>,
-    },
-    /// A scan's frames, undecoded; each pins its ring space until dropped.
-    Train(WakeQueue<W2mSlot>),
-}
-
-/// The train queue routed at `key`.
-fn train(routes: &mut FxHashMap<RouteKey, Route>, key: RouteKey) -> &mut WakeQueue<W2mSlot> {
-    match routes.get_mut(&key).expect("a leased id is routed") {
-        Route::Train(q) => q,
-        Route::Ack { .. } => unreachable!("a frame awaited on an ACK lease"),
     }
 }
 
-/// `len` consecutive request ids, each answered by every worker in `set`, routed
-/// while it lives, so a frame beating its awaiter is kept. Dropping it releases
-/// every frame its routes hold or later get.
-pub(crate) struct Lease {
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+/// What the workers have answered on one [`AckLease`] id.
+pub(super) struct AckRoute {
+    pub(super) answered: WorkerSet,
+    /// The fault of the lowest-numbered worker that failed.
+    pub(super) fault: Option<(usize, WireFault)>,
+    /// The `acks` awaiter parked on this id.
+    pub(super) waker: Option<Waker>,
+}
+
+impl AckRoute {
+    /// Record worker `w`'s answer.
+    fn record(&mut self, w: usize, fault: Option<WireFault>) {
+        debug_assert!(!self.answered.contains(w), "worker {w} answered one request id twice");
+        self.answered = self.answered.with(w);
+        if let Some(f) = fault {
+            if self.fault.as_ref().is_none_or(|&(fw, _)| w < fw) {
+                self.fault = Some((w, f));
+            }
+        }
+    }
+}
+
+/// The undecoded frames of one [`TrainLease`]; each pins its ring space until
+/// dropped.
+pub(super) struct TrainRoute {
+    /// The workers the scan was written to.
+    set: WorkerSet,
+    /// One queue per worker of `set`, ascending.
+    queues: Box<[WakeQueue<W2mSlot>]>,
+}
+
+impl TrainRoute {
+    /// Worker `w`'s frame queue, `None` when the scan was not written to `w`.
+    fn queue(&mut self, w: usize) -> Option<&mut WakeQueue<W2mSlot>> {
+        self.set.contains(w).then(|| &mut self.queues[self.set.rank(w)])
+    }
+}
+
+impl ReactorShared {
+    /// Hand worker `w`'s slot to the lease its request id names. A slot no lease
+    /// takes drops here undecoded, releasing its ring space.
+    pub(super) fn route(&self, w: usize, slot: W2mSlot) {
+        let id = slot.internal_req_id;
+        if let Some(t) = self.trains.borrow_mut().get_mut(&id) {
+            if let Some(q) = t.queue(w) {
+                q.push(slot);
+            }
+            return;
+        }
+        let waker = {
+            let mut acks = self.acks.borrow_mut();
+            let Some(r) = acks.get_mut(&id) else {
+                return;
+            };
+            r.record(w, slot.control().fault());
+            if !r.answered.covers(self.w2m.num_workers()) {
+                return;
+            }
+            r.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl Reactor {
+    /// `n` consecutive request ids no live lease holds, none of them 0
+    /// (`GroupTargets::Unaddressed`'s id) or [`W2M_EXCHANGE_RING_ID`].
+    fn alloc_request_ids(&self, n: u32) -> u32 {
+        let acks = self.inner.acks.borrow();
+        let trains = self.inner.trains.borrow();
+        let mut base = self.inner.next_request_id.get();
+        loop {
+            if base == 0 || n > W2M_EXCHANGE_RING_ID - base {
+                base = 1;
+            }
+            match (base..base + n).find(|id| acks.contains_key(id) || trains.contains_key(id)) {
+                Some(taken) => base = taken + 1,
+                None => break,
+            }
+        }
+        self.inner.next_request_id.set(base + n);
+        base
+    }
+
+    /// `n` consecutive request ids, each answered by one ACK from every worker,
+    /// awaited under the label `ctx`. See [`AckLease`].
+    pub(crate) fn lease_acks(&self, n: usize, ctx: &'static str) -> AckLease {
+        let len = n as u32;
+        let base = self.alloc_request_ids(len);
+        self.inner.acks.borrow_mut().extend((base..base + len).map(|id| {
+            (
+                id,
+                AckRoute {
+                    answered: WorkerSet::EMPTY,
+                    fault: None,
+                    waker: None,
+                },
+            )
+        }));
+        AckLease {
+            inner: Rc::clone(&self.inner),
+            base,
+            len,
+            ctx,
+        }
+    }
+
+    /// One request id, answered by a train of frames from every worker in `set`.
+    /// See [`TrainLease`].
+    pub(crate) fn lease_train(&self, set: WorkerSet) -> TrainLease {
+        let set = set.within(self.inner.w2m.num_workers());
+        let id = self.alloc_request_ids(1);
+        let queues = (0..set.len()).map(|_| WakeQueue::default()).collect();
+        self.inner.trains.borrow_mut().insert(id, TrainRoute { set, queues });
+        TrainLease {
+            inner: Rc::clone(&self.inner),
+            id,
+            workers: set,
+        }
+    }
+
+    /// Resolves once no train lease is live.
+    pub(crate) fn trains_idle(&self) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(|cx| {
+            if self.inner.trains.borrow().is_empty() {
+                return Poll::Ready(());
+            }
+            let prev = self.inner.trains_idle.replace(Some(cx.waker().clone()));
+            debug_assert!(
+                prev.is_none_or(|p| p.will_wake(cx.waker())),
+                "a second task awaits `trains_idle`, whose one waker slot would lose a wake"
+            );
+            Poll::Pending
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AckLease
+// ---------------------------------------------------------------------------
+
+/// `len` consecutive request ids, each answered by one ACK from every worker,
+/// routed while it lives, so an ACK beating its awaiter is kept.
+pub(crate) struct AckLease {
     inner: Rc<ReactorShared>,
     base: u32,
     len: u32,
-    set: WorkerSet,
+    /// What the ACKs answer, named in every fault the lease reports.
+    ctx: &'static str,
 }
 
-impl Lease {
-    pub(super) fn new(inner: Rc<ReactorShared>, base: u32, len: u32, set: WorkerSet) -> Self {
-        Lease { inner, base, len, set }
-    }
-
+impl AckLease {
     /// Request id `i`.
     pub(crate) fn id(&self, i: usize) -> u32 {
         debug_assert!(i < self.len as usize, "id {i} of a {}-id lease", self.len);
         self.base + i as u32
     }
 
-    /// The workers answering each id, ascending.
-    pub(crate) fn workers(&self) -> impl Iterator<Item = usize> {
-        self.set.within(self.inner.w2m.num_workers()).iter()
-    }
-
-    /// The routes of the first `n` ids, id then worker.
-    fn keys(&self, n: usize) -> impl Iterator<Item = RouteKey> + '_ {
-        (self.base..self.base + n as u32).flat_map(move |id| self.workers().map(move |w| (id, w as u32)))
+    /// What the ACKs answer.
+    pub(crate) fn ctx(&self) -> &'static str {
+        self.ctx
     }
 
     /// Once every worker has ACKed each of the lease's ids, the first failed ACK
-    /// in id-then-worker order as `Err`, its text naming `ctx`.
-    pub(crate) async fn acks(&self, ctx: &str) -> Result<(), WireFault> {
-        // Every key before the peeked one is answered; only its route holds a waker.
-        let mut pending = self.keys(self.len as usize).peekable();
+    /// in id order as `Err`.
+    pub(crate) async fn acks(&self) -> Result<(), WireFault> {
+        let nw = self.inner.w2m.num_workers();
+        // Every id before `next` is answered; only its route holds a waker.
+        let mut next = self.base;
         std::future::poll_fn(|cx| {
-            let mut routes = self.inner.routes.borrow_mut();
-            while let Some(key) = pending.peek() {
-                match routes.get_mut(key).expect("a leased id is routed") {
-                    Route::Ack { ack: Some(_), .. } => {
-                        pending.next();
-                    }
-                    Route::Ack { ack: None, waker } => {
-                        park_waker(waker, cx.waker());
-                        return Poll::Pending;
-                    }
-                    Route::Train(_) => unreachable!("ACKs awaited on a train lease"),
+            let mut acks = self.inner.acks.borrow_mut();
+            while next < self.base + self.len {
+                let r = acks.get_mut(&next).expect("a leased id is routed");
+                if !r.answered.covers(nw) {
+                    park_waker(&mut r.waker, cx.waker());
+                    return Poll::Pending;
                 }
+                next += 1;
             }
-            drop(routes);
-            Poll::Ready(self.first_error(ctx).map_or(Ok(()), Err))
+            drop(acks);
+            Poll::Ready(self.first_error().map_or(Ok(()), Err))
         })
         .await
     }
 
-    /// The first failed ACK among the lease's ids that have arrived, in
-    /// id-then-worker order, its text naming `ctx`.
-    pub(crate) fn first_error(&self, ctx: &str) -> Option<WireFault> {
-        let routes = self.inner.routes.borrow();
-        // By reference: the verdict stays in the route until the lease drops.
-        self.keys(self.len as usize).find_map(|key| match routes.get(&key) {
-            Some(Route::Ack { ack: Some(ctrl), .. }) => worker_error(key.1 as usize, ctx, ctrl),
-            _ => None,
+    /// The first failed ACK among the lease's ids that have arrived, in id order.
+    pub(crate) fn first_error(&self) -> Option<WireFault> {
+        let acks = self.inner.acks.borrow();
+        (self.base..self.base + self.len).find_map(|id| {
+            let (w, f) = acks[&id].fault.as_ref()?;
+            Some(worker_fault(*w, self.ctx, f.clone()))
         })
     }
 
     /// Release every id past the first `n`.
     pub(crate) fn truncate(&mut self, n: usize) {
         debug_assert!(n <= self.len as usize);
-        self.release(self.base + n as u32..self.base + self.len);
+        let mut acks = self.inner.acks.borrow_mut();
+        for id in self.base + n as u32..self.base + self.len {
+            acks.remove(&id);
+        }
         self.len = n as u32;
-    }
-
-    /// Remove `ids`' routes, then wake the `trains_idle` awaiter.
-    fn release(&self, ids: Range<u32>) {
-        {
-            let mut routes = self.inner.routes.borrow_mut();
-            for id in ids {
-                for w in self.workers() {
-                    routes.remove(&(id, w as u32));
-                }
-            }
-        }
-        // Every lease, not only a train: the waiter re-checks the routes itself.
-        if let Some(w) = self.inner.trains_idle.take() {
-            w.wake();
-        }
-    }
-
-    /// Worker `w`'s next frame on the lease's first id.
-    pub(crate) async fn next_frame(&self, w: usize) -> W2mSlot {
-        let key = (self.base, w as u32);
-        std::future::poll_fn(|cx| train(&mut self.inner.routes.borrow_mut(), key).poll(cx)).await
     }
 }
 
-impl Drop for Lease {
+impl Drop for AckLease {
     fn drop(&mut self) {
-        self.release(self.base..self.base + self.len);
+        self.truncate(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TrainLease
+// ---------------------------------------------------------------------------
+
+/// One request id, answered by a train of frames from each worker of its set,
+/// routed while it lives. Dropping it releases every frame the route holds.
+pub(crate) struct TrainLease {
+    inner: Rc<ReactorShared>,
+    id: u32,
+    /// Its route's `set`.
+    workers: WorkerSet,
+}
+
+impl TrainLease {
+    /// The request id.
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// The workers answering, each launched.
+    pub(crate) fn workers(&self) -> WorkerSet {
+        self.workers
+    }
+
+    /// Worker `w`'s next frame.
+    pub(crate) async fn next_frame(&self, w: usize) -> W2mSlot {
+        std::future::poll_fn(|cx| {
+            let mut trains = self.inner.trains.borrow_mut();
+            let route = trains.get_mut(&self.id).expect("a leased id is routed");
+            route.queue(w).expect("the train was written to `w`").poll(cx)
+        })
+        .await
+    }
+}
+
+impl Drop for TrainLease {
+    fn drop(&mut self) {
+        let idle = {
+            let mut trains = self.inner.trains.borrow_mut();
+            trains.remove(&self.id);
+            trains.is_empty()
+        };
+        if idle {
+            if let Some(w) = self.inner.trains_idle.take() {
+                w.wake();
+            }
+        }
     }
 }
 
@@ -183,30 +317,6 @@ impl Future for TimerFuture {
 impl Drop for TimerFuture {
     fn drop(&mut self) {
         self.inner.deadlines.borrow_mut().remove(&(self.deadline, self.id));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OpFuture
-// ---------------------------------------------------------------------------
-
-/// One submitted op awaiting its CQE: the result and what the op carried.
-/// Dropped early, it abandons the slot, which keeps the carry until the CQE.
-pub(super) struct OpFuture {
-    pub(super) id: u64,
-    pub(super) inner: Rc<ReactorShared>,
-}
-
-impl Future for OpFuture {
-    type Output = (i32, Option<SendBody>);
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<(i32, Option<SendBody>)> {
-        self.inner.ops.poll(self.id, cx)
-    }
-}
-
-impl Drop for OpFuture {
-    fn drop(&mut self) {
-        self.inner.ops.abandon(self.id);
     }
 }
 

@@ -1,7 +1,7 @@
 //! Single-threaded io_uring reactor: the master process's one event loop. A task's
-//! waker is its key (see `waker_wake`); one-CQE awaiters park in a
-//! [`park::ParkMap`], next-of-many awaiters in a [`wake_queue::WakeQueue`], and
-//! every deadline sits in one deadline map.
+//! waker is its key (see `waker_wake`); one-CQE awaiters hold a [`oneshot`],
+//! next-of-many awaiters park in a [`wake_queue::WakeQueue`], and every deadline
+//! sits in one deadline map.
 
 use std::cell::{Cell, RefCell};
 use std::collections::btree_map::Entry;
@@ -18,14 +18,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 
-use crate::runtime::sal::WorkerSet;
-use crate::runtime::w2m::{W2mReceiver, W2mSlot, W2M_EXCHANGE_RING_ID};
+use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID, W2M_EXCHANGE_RING_ID};
 use crate::runtime::wire::DecodedWire;
 
 mod conn;
 mod futures;
 mod io;
-mod park;
 mod runloop;
 mod sync;
 #[cfg(test)]
@@ -35,9 +33,8 @@ mod wake_queue;
 
 pub(crate) use conn::{PeerGone, SendBody};
 
-pub(crate) use futures::{worker_error, Lease};
-use futures::{OpFuture, Route, RouteKey, TimerFuture};
-use park::ParkMap;
+pub(crate) use futures::{worker_fault, AckLease, TrainLease};
+use futures::{AckRoute, TimerFuture, TrainRoute};
 use runloop::{RunQueue, REACTOR_RUN_QUEUE};
 use wake_queue::WakeQueue;
 
@@ -143,17 +140,17 @@ struct ReactorShared {
     /// poll schedule for the next tick instead of re-entering this one. Kept
     /// here (rather than rebuilt per tick) to reuse the one allocation.
     tick_scratch: Cell<Vec<usize>>,
-    /// Every leased `(request id, worker)` and where its frames go. An entry
-    /// lives exactly as long as the [`Lease`] that created it.
-    routes: RefCell<FxHashMap<RouteKey, Route>>,
-    /// The one [`Reactor::trains_idle`] awaiter, woken by every lease drop.
+    /// Every live [`AckLease`] id and what its workers have answered.
+    acks: RefCell<FxHashMap<u32, AckRoute>>,
+    /// Every live [`TrainLease`] id and its workers' frame queues.
+    trains: RefCell<FxHashMap<u32, TrainRoute>>,
+    /// The one [`Reactor::trains_idle`] awaiter, woken when the last train lease
+    /// drops.
     trains_idle: Cell<Option<Waker>>,
-    /// The next request id a lease starts from. Never 0 (`Unaddressed`) and
-    /// never [`W2M_EXCHANGE_RING_ID`]; see [`Reactor::lease`].
+    /// The next request id a lease starts from.
     next_request_id: Cell<u32>,
-    /// In-flight one-shot ops, each holding what the kernel may still read until
-    /// its CQE.
-    ops: ParkMap,
+    /// In-flight one-shot ops, by op id.
+    ops: RefCell<FxHashMap<u64, PendingOp>>,
     /// The array the `FUTEX_WAITV` SQE is prepped over, one entry per worker
     /// ring. The kernel copies it at submit, so it need not outlive the SQE.
     futex_waitv: RefCell<Box<[FutexWaitV]>>,
@@ -180,8 +177,19 @@ struct ReactorShared {
     /// queue exists from `Reactor::new`, so a frame published before the driver
     /// awaits is delivered rather than dropped.
     exchanges: RefCell<WakeQueue<(usize, DecodedWire)>>,
-    /// Last: every `W2mSlot` an earlier field holds releases through it on drop.
+    /// Last: every `W2mSlot` the reactor holds, in a field or in a task, releases
+    /// through it on drop.
     w2m: Rc<W2mReceiver>,
+}
+
+/// A one-shot op's CQE `res` and what it carried.
+type OpResult = (i32, Option<SendBody>);
+
+/// A submitted op awaiting its CQE.
+struct PendingOp {
+    done: oneshot::Sender<OpResult>,
+    /// Memory the kernel may read until the CQE.
+    carry: Option<SendBody>,
 }
 
 impl ReactorShared {
@@ -211,10 +219,11 @@ impl Reactor {
             next_task_key: Cell::new(0),
             run_queue: RefCell::new(RunQueue::new()),
             tick_scratch: Cell::new(Vec::with_capacity(16)),
-            routes: RefCell::new(FxHashMap::default()),
+            acks: RefCell::new(FxHashMap::default()),
+            trains: RefCell::new(FxHashMap::default()),
             trains_idle: Cell::new(None),
-            next_request_id: Cell::new(1),
-            ops: ParkMap::default(),
+            next_request_id: Cell::new(BOOT_READY_REQUEST_ID),
+            ops: RefCell::new(FxHashMap::default()),
             futex_waitv: RefCell::new(futex_waitv),
             futex_waitv_armed: Cell::new(false),
             deadlines: RefCell::new(BTreeMap::new()),
@@ -246,64 +255,6 @@ impl Reactor {
         self.inner.shutdown.set(true);
     }
 
-    /// `n` consecutive request ids, each answered by one ACK from every worker in
-    /// `set`. See [`Lease`].
-    pub(crate) fn lease_acks(&self, n: usize, set: WorkerSet) -> Lease {
-        self.lease(n, set, || Route::Ack { ack: None, waker: None })
-    }
-
-    /// One request id, answered by a train of frames from every worker in `set`.
-    /// See [`Lease`].
-    pub(crate) fn lease_train(&self, set: WorkerSet) -> Lease {
-        self.lease(1, set, || Route::Train(WakeQueue::default()))
-    }
-
-    fn lease(&self, n: usize, set: WorkerSet, route: fn() -> Route) -> Lease {
-        let n = n as u32;
-        let workers = set.within(self.inner.w2m.num_workers());
-        let mut routes = self.inner.routes.borrow_mut();
-        let mut base = self.inner.next_request_id.get();
-        loop {
-            // 0 is `GroupTargets::Unaddressed`'s id. The ids are `base..base + n`,
-            // exclusive, and `base + n` fits a `u32`, so `u32::MAX` — the exchange id —
-            // is never handed out.
-            if base == 0 || base.checked_add(n).is_none() {
-                base = 1;
-            }
-            // Never re-lease a route a live lease still holds: after a wrap a
-            // long-held scan would otherwise have its route overwritten.
-            let taken = (base..base + n).find(|&id| workers.iter().any(|w| routes.contains_key(&(id, w as u32))));
-            match taken {
-                Some(taken) => base = taken + 1,
-                None => break,
-            }
-        }
-        for id in base..base + n {
-            routes.extend(workers.iter().map(|w| ((id, w as u32), route())));
-        }
-        self.inner.next_request_id.set(base + n);
-        Lease::new(Rc::clone(&self.inner), base, n, set)
-    }
-
-    /// Resolves once no train lease is live. One awaiter at a time.
-    pub(crate) fn trains_idle(&self) -> impl Future<Output = ()> + '_ {
-        std::future::poll_fn(|cx| {
-            if !self
-                .inner
-                .routes
-                .borrow()
-                .values()
-                .any(|r| matches!(r, Route::Train(_)))
-            {
-                return Poll::Ready(());
-            }
-            let mut slot = self.inner.trains_idle.take();
-            park_waker(&mut slot, cx.waker());
-            self.inner.trains_idle.set(slot);
-            Poll::Pending
-        })
-    }
-
     /// Future that completes at `deadline`.
     pub fn timer(&self, deadline: Instant) -> impl Future<Output = ()> {
         TimerFuture::new(deadline, Rc::clone(&self.inner))
@@ -329,21 +280,7 @@ impl Reactor {
                     self.inner.exchanges.borrow_mut().push((w, frame));
                     continue;
                 }
-                match self.inner.routes.borrow_mut().get_mut(&(id, w as u32)) {
-                    // No live lease: the request or scan was abandoned. Dropping the
-                    // slot undecoded releases its ring space.
-                    None => {}
-                    Some(Route::Train(q)) => q.push(slot),
-                    Some(Route::Ack { ack, waker }) => {
-                        // A worker answers each request id once.
-                        debug_assert!(ack.is_none(), "worker {w} answered request id {id} twice");
-                        *ack = Some(slot.control());
-                        drop(slot);
-                        if let Some(waker) = waker.take() {
-                            waker.wake();
-                        }
-                    }
-                }
+                self.inner.route(w, slot);
             }
         }
         routed
@@ -378,23 +315,23 @@ impl Reactor {
         }
     }
 
-    /// Queue one op SQE, prepped by `prep` under its `user_data`, holding `carry`
-    /// until its CQE.
-    fn submit_op(&self, prep: impl FnOnce(&mut IoUringRing, u64), carry: Option<SendBody>) -> OpFuture {
+    /// Queue one op SQE, prepped by `prep` under its `user_data`. `carry` lives
+    /// until the CQE, which resolves the receiver with it.
+    fn submit_op(
+        &self,
+        prep: impl FnOnce(&mut IoUringRing, u64),
+        carry: Option<SendBody>,
+    ) -> oneshot::Receiver<OpResult> {
         let id = self.inner.alloc_op_id();
         prep(&mut self.inner.ring.borrow_mut(), udata(KIND_OP, id));
-        self.inner.ops.open(id, carry);
-        OpFuture { id, inner: Rc::clone(&self.inner) }
+        let (done, rx) = oneshot::channel();
+        self.inner.ops.borrow_mut().insert(id, PendingOp { done, carry });
+        rx
     }
 
-    /// Submit an fdatasync and await its completion. Returns the CQE `res`
-    /// (0 on success, negative errno on failure). The SQE is flushed to the
-    /// kernel immediately so the fsync can overlap with subsequent CPU work —
-    /// `commit_pushes` awaits its worker ACKs and fires the tick between the
-    /// submit and the CQE, and depends on it.
+    /// Submit an fdatasync and flush it to the kernel now, so it runs while the
+    /// caller works on. The future yields the CQE `res`: 0, or a negative errno.
     pub fn fsync(&self, fd: i32) -> impl Future<Output = i32> {
-        // Built outside the async block, so dropping the result unpolled still
-        // abandons the op.
         let op = self.submit_op(|ring, u| ring.prep_fsync(fd, u), None);
         if let Err(e) = self.inner.ring.borrow_mut().submit() {
             gnitz_error!(

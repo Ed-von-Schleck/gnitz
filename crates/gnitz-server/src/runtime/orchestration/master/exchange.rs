@@ -104,7 +104,7 @@ impl ExchangeAccumulator {
         round.all_pad &= decoded.control.hdr.flags.backfill_pad;
         round.reported = round.reported.with(w);
 
-        if round.reported != WorkerSet::ALL.within(nw) {
+        if !round.reported.covers(nw) {
             return None;
         }
         let round = self.rounds.remove(&key).unwrap();

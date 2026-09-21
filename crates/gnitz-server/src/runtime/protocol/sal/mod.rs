@@ -161,6 +161,16 @@ impl WorkerSet {
         self.0.count_ones() as usize
     }
 
+    /// Whether the set holds every one of the `nw` launched workers.
+    pub(crate) const fn covers(self, nw: usize) -> bool {
+        self.0 & low_bits_mask(nw) == low_bits_mask(nw)
+    }
+
+    /// How many members of the set are below `w`: `w`'s position among them.
+    pub(crate) const fn rank(self, w: usize) -> usize {
+        (self.0 & low_bits_mask(w)).count_ones() as usize
+    }
+
     pub(crate) fn iter(self) -> BitIter {
         BitIter(self.0)
     }

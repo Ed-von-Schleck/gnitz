@@ -21,7 +21,7 @@ pub(super) struct Listener {
     accepted: chan::Sender<OwnedFd>,
 }
 
-/// An owned client-bound payload. It rides the send's park slot while the kernel
+/// An owned client-bound payload. It rides the send op while the kernel
 /// may read it; the send loop takes it back between short sends.
 pub(crate) enum SendBody {
     Pooled(PooledSendBuf),
@@ -195,8 +195,8 @@ impl Reactor {
                         conn.fd(),
                         self.inner.limits.client_send_timeout
                     );
-                    // The abandoned send completes only once the socket errors, and
-                    // its park slot holds the body until it does.
+                    // The abandoned send completes only once the socket errors; its
+                    // `ops` entry holds the body until then.
                     conn.shutdown();
                     return Err(PeerGone);
                 }

@@ -23,7 +23,7 @@ use std::rc::Rc;
 use rustc_hash::FxHashMap;
 
 use crate::catalog::CatalogEngine;
-use crate::runtime::reactor::{Lease, Reactor};
+use crate::runtime::reactor::{AckLease, Reactor, TrainLease};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalExcl, SalMessageKind, SalWriter, WorkerSet};
 use crate::runtime::wire;
 use gnitz_store::schema::{Placement, SchemaDescriptor};
@@ -156,7 +156,7 @@ pub(crate) struct ScanCut<'d> {
     disp: &'d MasterDispatcher,
     excl: SalExcl<'d>,
     in_request_order: bool,
-    scans: Vec<Lease>,
+    scans: Vec<TrainLease>,
 }
 
 impl<'d> ScanCut<'d> {
@@ -166,14 +166,13 @@ impl<'d> ScanCut<'d> {
         set: WorkerSet,
         write: impl FnOnce(&SalExcl<'d>, GroupTargets) -> Result<(), WireFault>,
     ) -> Result<(), WireFault> {
-        let set = set.within(self.disp.num_workers());
-        debug_assert!(set.len() > 0, "every read owes at least one reply");
         let lease = self.disp.reactor.lease_train(set);
+        debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
         write(
             &self.excl,
             GroupTargets::Leased {
-                set,
-                request_id: lease.id(0),
+                set: lease.workers(),
+                request_id: lease.id(),
                 in_request_order: self.in_request_order,
             },
         )?;
@@ -204,7 +203,7 @@ impl MasterDispatcher {
         &self,
         n: usize,
         build: impl FnOnce(&mut ScanCut<'_>) -> Result<(), WireFault>,
-    ) -> Result<Vec<Lease>, WireFault> {
+    ) -> Result<Vec<TrainLease>, WireFault> {
         let mut cut = ScanCut {
             disp: self,
             excl: self.sal.lock().await,
@@ -217,7 +216,7 @@ impl MasterDispatcher {
     }
 
     /// One scan-shaped read under its own SAL hold.
-    pub(crate) async fn scan(&self, group: DirectGroup<'_>) -> Result<Lease, WireFault> {
+    pub(crate) async fn scan(&self, group: DirectGroup<'_>) -> Result<TrainLease, WireFault> {
         let mut leases = self.scan_cut(1, |cut| cut.read(group)).await?;
         Ok(leases.pop().expect("one read, one lease"))
     }

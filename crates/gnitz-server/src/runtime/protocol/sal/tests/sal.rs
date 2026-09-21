@@ -291,6 +291,20 @@ fn a_worker_set_bounds_to_the_launched_workers() {
     assert_eq!(WorkerSet::ALL.within(MAX_WORKERS), WorkerSet::ALL);
     assert_eq!(WorkerSet::ALL.within(MAX_WORKERS).len(), MAX_WORKERS);
     assert_eq!(WorkerSet::EMPTY.len(), 0);
+
+    assert!(WorkerSet::one(0).with(1).covers(2) && !WorkerSet::one(1).covers(2));
+    assert!(WorkerSet::ALL.covers(4) && WorkerSet::ALL.covers(MAX_WORKERS));
+    assert!(WorkerSet::EMPTY.covers(0) && !WorkerSet::EMPTY.covers(1));
+}
+
+/// A worker's rank is its position among the set's members.
+#[test]
+fn a_worker_set_ranks_its_members_in_worker_order() {
+    let s = WorkerSet::one(1).with(3).with(6);
+    assert_eq!([1, 3, 6].map(|w| s.rank(w)), [0, 1, 2]);
+    assert_eq!(WorkerSet::ALL.rank(5), 5);
+    assert_eq!(WorkerSet::ALL.rank(MAX_WORKERS - 1), MAX_WORKERS - 1);
+    assert_eq!(WorkerSet::EMPTY.rank(7), 0);
 }
 
 /// A group leased to 2 of 4 workers writes only those slots, both answering on

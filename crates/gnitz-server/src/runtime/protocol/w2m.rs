@@ -874,8 +874,7 @@ impl W2mSlot {
         }
     }
 
-    /// The slot's control header alone, aborting on failure as `decode` does — for
-    /// an ACK, whose only content is its status and error text.
+    /// The slot's control header alone, aborting on failure as `decode` does.
     pub(crate) fn control(&self) -> DecodedControl {
         match peek_control_block(self.bytes()) {
             Ok(ctrl) => ctrl,

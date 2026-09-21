@@ -4,10 +4,10 @@
 use super::*;
 
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::worker_error;
+use crate::runtime::reactor::worker_fault;
 use crate::runtime::w2m::W2mSlot;
 use gnitz_store::storage::{MemBatch, MAX_BATCH_REGIONS};
-use gnitz_wire::control::{peek_control_block, DecodedControl};
+use gnitz_wire::control::DecodedControl;
 
 /// A decode failure on one frame of a reply train, named after the verb `what`.
 fn decode_err(slot: &W2mSlot, what: &str, e: &str) -> WireFault {
@@ -16,27 +16,27 @@ fn decode_err(slot: &W2mSlot, what: &str, e: &str) -> WireFault {
 
 /// One worker's frames on a lease, in order, ending at the one flagged `scan_last`.
 pub(super) struct Train<'l> {
-    lease: &'l Lease,
+    lease: &'l TrainLease,
     worker: usize,
     what: &'l str,
     done: bool,
 }
 
 impl<'l> Train<'l> {
-    pub(super) fn new(lease: &'l Lease, worker: usize, what: &'l str) -> Self {
+    pub(super) fn new(lease: &'l TrainLease, worker: usize, what: &'l str) -> Self {
         Train { lease, worker, what, done: false }
     }
 
     /// The next frame and its header, `None` past the terminal one; `Err` on a
-    /// fault frame or a corrupt header. Dropping the lease discards the rest.
+    /// fault frame. Dropping the lease discards the rest.
     pub(super) async fn next(&mut self) -> Result<Option<(W2mSlot, DecodedControl)>, WireFault> {
         if self.done {
             return Ok(None);
         }
         let slot = self.lease.next_frame(self.worker).await;
-        let ctrl = peek_control_block(slot.bytes()).map_err(|e| decode_err(&slot, self.what, e))?;
-        if let Some(e) = worker_error(slot.worker as usize, self.what, &ctrl) {
-            return Err(e);
+        let ctrl = slot.control();
+        if let Some(f) = ctrl.fault() {
+            return Err(worker_fault(self.worker, self.what, f));
         }
         self.done = ctrl.hdr.flags.scan_last;
         Ok(Some((slot, ctrl)))
@@ -58,12 +58,12 @@ impl<'l> Train<'l> {
 /// non-empty frame's rows. A block-less frame decodes against `expected`; a frame
 /// whose own block disagrees with it — a worker lagging a DDL — is an error.
 pub(super) async fn drain_index_scan(
-    lease: &Lease,
+    lease: &TrainLease,
     what: &str,
     expected: &SchemaDescriptor,
     mut on_batch: impl FnMut(&MemBatch<'_>) -> Result<(), WireFault>,
 ) -> Result<(), WireFault> {
-    for w in lease.workers() {
+    for w in lease.workers().iter() {
         let mut train = Train::new(lease, w, what);
         while let Some((slot, ctrl)) = train.next().await? {
             let mut offsets = [0usize; MAX_BATCH_REGIONS];
@@ -81,8 +81,8 @@ pub(super) async fn drain_index_scan(
 /// Forward every reply train of `lease` to `peer` in reply order, skipping frames
 /// that carry nothing the client reads. Stops at the first failed send, which
 /// closes the peer; `Err` on the first worker fault, leaving the rest undrained.
-pub(crate) async fn forward_scan(peer: &Peer, lease: &Lease) -> Result<(), WireFault> {
-    for w in lease.workers() {
+pub(crate) async fn forward_scan(peer: &Peer, lease: &TrainLease) -> Result<(), WireFault> {
+    for w in lease.workers().iter() {
         let mut train = Train::new(lease, w, "scan");
         while let Some((slot, ctrl)) = train.next().await? {
             if (ctrl.data.is_some() || ctrl.schema.is_some()) && peer.send(slot).await.is_err() {

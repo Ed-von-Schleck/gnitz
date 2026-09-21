@@ -54,20 +54,20 @@ fn ring_slot(pad: usize) -> (W2mReceiver, W2mSlot) {
 //   (a) partial-send handling in `send_owned` (OP_SEND on a stream
 //       socket can return rc < len); treating one CQE as "done"
 //       truncated the scan response at ~208 KB and hung the client;
-//   (b) the send's park slot holding its body so the kernel's
+//   (b) the send's `ops` entry holding its body so the kernel's
 //       in-flight pointer stays valid after cancellation.
 // ─────────────────────────────────────────────────────────────────
 
 #[test]
 fn send_cqe_wakes_its_waker_and_returns_the_body() {
     let r = make_reactor();
-    r.inner.ops.open(77, Some(SendBody::Pooled(pooled(&[0xAB; 16]))));
-    let mut fut = std::pin::pin!(OpFuture { id: 77, inner: Rc::clone(&r.inner) });
+    let (id, mut fut) = bare_op(&r, Some(SendBody::Pooled(pooled(&[0xAB; 16]))));
+    let mut fut = Pin::new(&mut fut);
     let waker = make_waker(11);
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
 
-    cqe(&r, KIND_OP, 77, 16);
+    cqe(&r, KIND_OP, id, 16);
     assert!(
         r.inner.run_queue.borrow().is_queued(11),
         "KIND_OP must wake the op future"
@@ -83,7 +83,7 @@ fn send_cqe_wakes_its_waker_and_returns_the_body() {
         }
         Poll::Pending => panic!("a completed send must resolve"),
     }
-    assert_eq!(r.inner.ops.len(), 0, "a resolved send must retire its slot");
+    assert_eq!(r.inner.ops.borrow().len(), 0, "a resolved send must retire its entry");
 }
 
 /// A dropped send keeps its body until the late CQE — a ring slot here, whose
@@ -94,20 +94,20 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
     let held = receiver.release_cursor(0);
 
     let r = make_reactor();
-    r.inner.ops.open(88, Some(SendBody::Slot(slot)));
-    {
-        let mut fut = Box::pin(OpFuture { id: 88, inner: Rc::clone(&r.inner) });
-        assert!(fut.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
-    }
-    assert!(r.inner.ops.is_abandoned(88), "drop must abandon the slot");
+    let (id, mut fut) = bare_op(&r, Some(SendBody::Slot(slot)));
+    assert!(Pin::new(&mut fut)
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    drop(fut);
+    assert_eq!(r.inner.ops.borrow().len(), 1, "drop must leave the entry to its CQE");
     assert_eq!(
         receiver.release_cursor(0),
         held,
         "the kernel may still read the body — it must outlive the future"
     );
 
-    cqe(&r, KIND_OP, 88, 64);
-    assert_eq!(r.inner.ops.len(), 0, "the late CQE must retire the abandoned slot");
+    cqe(&r, KIND_OP, id, 64);
+    assert_eq!(r.inner.ops.borrow().len(), 0, "the late CQE must retire the entry");
     assert!(receiver.release_cursor(0) > held, "and free the body");
 }
 

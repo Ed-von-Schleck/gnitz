@@ -140,11 +140,10 @@ impl MasterDispatcher {
     /// single waker.
     pub(crate) async fn next_relay(
         &self,
-        lease: &Lease,
-        ctx: &str,
+        lease: &AckLease,
         acc: &mut ExchangeAccumulator,
     ) -> Result<Option<PendingRelay>, WireFault> {
-        let mut acks = std::pin::pin!(lease.acks(ctx));
+        let mut acks = std::pin::pin!(lease.acks());
         loop {
             match select2(acks.as_mut(), self.reactor.next_exchange()).await {
                 Either::A(r) => return r.map(|()| None),
@@ -160,19 +159,19 @@ impl MasterDispatcher {
     /// Block until `lease`'s ids have answered, relaying each round inline;
     /// nothing else on the reactor runs. Fails on a worker's error ACK or death.
     /// With `reclaim_allowed`, a relay that does not fit runs [`Self::reclaim_base`]
-    /// first. `ctx` names the phase in a worker-fault or dead-worker error.
-    pub(crate) fn collect_exclusive(&self, lease: &Lease, ctx: &str, reclaim_allowed: bool) -> Result<(), WireFault> {
+    /// first.
+    pub(crate) fn collect_exclusive(&self, lease: &AckLease, reclaim_allowed: bool) -> Result<(), WireFault> {
         self.reactor.block_on_exclusive(async {
             let collect = async {
                 let mut acc = ExchangeAccumulator::new(self.num_workers());
-                while let Some(relay) = self.next_relay(lease, ctx, &mut acc).await? {
+                while let Some(relay) = self.next_relay(lease, &mut acc).await? {
                     let mut excl = self.sal.lock_exclusive();
                     let decision = if relay.all_pad {
                         BackfillDecision::Stop
                     } else {
                         BackfillDecision::Continue
                     };
-                    let prep = self.prepare_relay(relay, ctx);
+                    let prep = self.prepare_relay(relay, lease.ctx());
                     if reclaim_allowed
                         && (prep.with_group(decision, |g| self.sal.fit_relay(g)) != SalFit::Fits
                             || BACKFILL_RELAY_SPACE_LOW.armed())
@@ -183,7 +182,7 @@ impl MasterDispatcher {
                 }
                 Ok::<(), WireFault>(())
             };
-            match select2(collect, self.round_failure(lease, ctx)).await {
+            match select2(collect, self.round_failure(lease)).await {
                 Either::A(r) => r,
                 Either::B(e) => Err(e),
             }
@@ -193,14 +192,14 @@ impl MasterDispatcher {
     /// Resolves once a worker has answered `lease` with an error or has died, probing
     /// every `WORKER_WATCH`. A worker failing before it joins a round leaves the others
     /// in their exchange wait, so an error must end the round without the other ACKs.
-    async fn round_failure(&self, lease: &Lease, ctx: &str) -> WireFault {
+    async fn round_failure(&self, lease: &AckLease) -> WireFault {
         loop {
             self.reactor.timer(Instant::now() + WORKER_WATCH).await;
-            if let Some(e) = lease.first_error(ctx) {
+            if let Some(e) = lease.first_error() {
                 return e;
             }
             if let Some(w) = self.check_workers() {
-                return format!("worker {w} exited during {ctx}").into();
+                return format!("worker {w} exited during {}", lease.ctx()).into();
             }
         }
     }
@@ -209,13 +208,13 @@ impl MasterDispatcher {
     /// A refused write fails before any worker is woken, keeping its status.
     fn exclusive_round(
         &self,
-        ctx: &str,
+        ctx: &'static str,
         reclaim_allowed: bool,
         write: impl FnOnce(&SalExcl<'_>, GroupTargets) -> Result<(), WireFault>,
     ) -> Result<(), WireFault> {
-        let lease = self.reactor.lease_acks(1, WorkerSet::ALL);
+        let lease = self.reactor.lease_acks(1, ctx);
         write(&self.sal.lock_exclusive(), GroupTargets::all(lease.id(0)))?;
-        self.collect_exclusive(&lease, ctx, reclaim_allowed)
+        self.collect_exclusive(&lease, reclaim_allowed)
     }
 
     // -----------------------------------------------------------------------
@@ -263,8 +262,7 @@ impl MasterDispatcher {
 
     /// Write `round`'s flush group, wait for every worker's ACK, finalize.
     pub(crate) async fn checkpoint_round(&self, excl: &mut SalExcl<'_>, round: FlushRound) -> Result<(), WireFault> {
-        let ctx = round.phase();
-        let lease = self.reactor.lease_acks(1, WorkerSet::ALL);
+        let lease = self.reactor.lease_acks(1, round.phase());
         self.note_flush_round(round);
         excl.write(&DirectGroup {
             template: wire::WireMsg {
@@ -276,7 +274,7 @@ impl MasterDispatcher {
         })?;
         // `excl` is held through the ACKs, so its drop would wake too late.
         excl.wake();
-        match select2(lease.acks(ctx), self.round_failure(&lease, ctx)).await {
+        match select2(lease.acks(), self.round_failure(&lease)).await {
             Either::A(r) => r?,
             Either::B(e) => return Err(e),
         }

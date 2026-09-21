@@ -92,6 +92,13 @@ pub(super) fn within(limit: std::time::Duration, f: impl FnOnce() + Send + 'stat
     }
 }
 
+/// An op installed with no SQE behind it, so its CQE is whatever a test feeds
+/// through [`cqe`]: its id and its awaiter.
+pub(super) fn bare_op(r: &Reactor, carry: Option<SendBody>) -> (u64, oneshot::Receiver<OpResult>) {
+    let rx = r.submit_op(|_, _| {}, carry);
+    (r.inner.next_op_id.get() - 1, rx)
+}
+
 /// Drive `dispatch_cqe` with a synthetic completion tagged `kind`/`id`,
 /// carrying `rc` — the ring completions a test cannot make the kernel produce.
 pub(super) fn cqe(r: &Reactor, kind: u64, id: u64, rc: i32) {

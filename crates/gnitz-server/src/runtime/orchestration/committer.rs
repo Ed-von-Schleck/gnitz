@@ -28,8 +28,8 @@ use super::executor::{request_drain, request_quiesce, Shared};
 use super::guard_panic;
 use super::TxnFamily;
 use crate::runtime::master::FlushRound;
-use crate::runtime::reactor::{chan, oneshot, select2, Either, Lease};
-use crate::runtime::sal::{SalScope, WorkerSet};
+use crate::runtime::reactor::{chan, oneshot, select2, AckLease, Either};
+use crate::runtime::sal::SalScope;
 use gnitz_store::storage::Batch;
 use gnitz_wire::WireFault;
 use std::rc::Rc;
@@ -325,7 +325,7 @@ struct GroupInfo {
     /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
     /// `tid`, so one flag per group is exact.
     recoverable: bool,
-    req_ids: Lease,
+    req_ids: AckLease,
     merged: Batch,
     write_err: Option<WireFault>,
 }
@@ -394,7 +394,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
     pushes.sort_by_key(|p| p.tid);
 
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
-    let alloc_req_ids = || shared.disp().reactor().lease_acks(1, WorkerSet::ALL);
+    let alloc_req_ids = || shared.disp().reactor().lease_acks(1, "commit");
 
     // ------------------------------------------------------------------
     // Phase A (no lock): build merged batches + req_id allocations.
@@ -528,7 +528,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         for unit in &mut units {
             let downgrade = matches!(unit.outcome, Outcome::Pushes(_));
             for g in unit.live_mut() {
-                let Err(e) = g.req_ids.acks("commit").await else {
+                let Err(e) = g.req_ids.acks().await else {
                     continue;
                 };
                 if downgrade {

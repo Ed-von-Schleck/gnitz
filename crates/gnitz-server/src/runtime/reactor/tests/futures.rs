@@ -1,5 +1,5 @@
 //! The reactor's futures: timers, fsync, a train lease's frame stream, and the
-//! park slot every op future waits in.
+//! `ops` entry every one-CQE op waits on.
 
 use std::time::Duration;
 
@@ -109,7 +109,7 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
             target_id: 100 + i as u64,
             ..Default::default()
         };
-        writers[0].send_msg(lease.id(0), &msg);
+        writers[0].send_msg(lease.id(), &msg);
     }
     r.drain_all_w2m();
 
@@ -130,20 +130,20 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
 fn a_dropped_lease_releases_held_and_late_frames() {
     let (r, writers) = reactor_with_rings(1);
     let lease = r.lease_train(WorkerSet::ALL);
-    let id = lease.id(0);
+    let id = lease.id();
     writers[0].send_msg(id, &Default::default());
     r.drain_all_w2m();
 
     let held = r.inner.w2m.release_cursor(0);
     drop(lease);
-    assert!(r.inner.routes.borrow().is_empty());
+    assert!(r.inner.trains.borrow().is_empty());
     assert!(r.inner.w2m.release_cursor(0) > held, "the held frame is released");
 
     writers[0].send_msg(id, &Default::default());
     let late = r.inner.w2m.release_cursor(0);
     r.drain_all_w2m();
     assert!(r.inner.w2m.release_cursor(0) > late, "the late frame is released");
-    assert!(r.inner.routes.borrow().is_empty(), "and routes nothing");
+    assert!(r.inner.trains.borrow().is_empty(), "and routes nothing");
 }
 
 /// Dropping a lease mid-train releases its held and later frames, so a writer
@@ -162,7 +162,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
 
     let r = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
     let lease = r.lease_train(WorkerSet::ALL);
-    let id = lease.id(0);
+    let id = lease.id();
     let writer = W2mWriter::new(ptr);
 
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -174,10 +174,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     });
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    let queued = |r: &Reactor| match &r.inner.routes.borrow()[&(id, 0)] {
-        Route::Train(q) => q.len(),
-        Route::Ack { .. } => unreachable!(),
-    };
+    let queued = |r: &Reactor| r.inner.trains.borrow()[&id].queues[0].len();
     while queued(&r) < 2 {
         assert!(Instant::now() < deadline, "writer never produced the first 2 frames");
         r.drain_all_w2m();
@@ -210,46 +207,50 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     );
 }
 
-/// The three ways a park slot ends. The slot is opened by hand so the
-/// completion's timing relative to the drop is exact; `Reactor::fsync`'s own CQE
-/// is not.
+/// The three ways an op ends.
 #[test]
-fn a_park_slot_ends_by_completion_abandonment_or_reclaim() {
+fn an_op_ends_by_completion_early_drop_or_collection() {
     let r = make_reactor();
     let mut cx = Context::from_waker(Waker::noop());
-    let op_future = |id| Box::pin(OpFuture { id, inner: Rc::clone(&r.inner) });
 
-    // 1. Dropped while pending: the slot is abandoned, so the late CQE retires
-    //    it rather than parking a result nobody will collect.
-    r.inner.ops.open(1, None);
-    {
-        let mut fut = op_future(1);
-        assert!(fut.as_mut().poll(&mut cx).is_pending(), "no result yet");
-        assert!(r.inner.ops.has_waker(1), "the poll registers a waker");
-    }
-    assert!(r.inner.ops.is_abandoned(1), "drop while pending must abandon");
-    assert!(!r.inner.ops.has_waker(1), "and withdraw the waker");
-    cqe(&r, KIND_OP, 1, 0);
-    assert_eq!(r.inner.ops.len(), 0, "the late CQE must retire the slot");
+    // 1. Dropped while pending: the entry stays until the late CQE retires it.
+    let (id, mut rx) = bare_op(&r, None);
+    assert!(Pin::new(&mut rx).poll(&mut cx).is_pending(), "no result yet");
+    drop(rx);
+    assert_eq!(r.inner.ops.borrow().len(), 1, "the kernel still owes the CQE");
+    cqe(&r, KIND_OP, id, 0);
+    assert_eq!(r.inner.ops.borrow().len(), 0, "the late CQE must retire the entry");
 
-    // 2. Completion beats the drop: `Drop` reclaims the orphaned result. This
-    //    is the case a tombstone set grew one entry per durable commit for.
-    r.inner.ops.open(2, None);
-    let mut fut = op_future(2);
-    assert!(fut.as_mut().poll(&mut cx).is_pending());
-    cqe(&r, KIND_OP, 2, 0);
-    drop(fut);
-    assert_eq!(r.inner.ops.len(), 0, "drop must reclaim the orphaned result");
+    // 2. Completion beats the drop: the CQE alone retires the entry.
+    let (id, mut rx) = bare_op(&r, None);
+    assert!(Pin::new(&mut rx).poll(&mut cx).is_pending());
+    cqe(&r, KIND_OP, id, 0);
+    assert_eq!(r.inner.ops.borrow().len(), 0, "a completed op is gone before its poll");
+    drop(rx);
 
-    // 3. Collected: `poll` retires the slot, leaving `Drop` nothing to do — and
-    //    delivers the CQE `res` verbatim, which the caller's `rc < 0` fatal
-    //    branch depends on.
+    // 3. Collected: the CQE `res` arrives verbatim.
     for rc in [0, -libc::EBADF] {
-        r.inner.ops.open(3, None);
-        let mut fut = op_future(3);
-        cqe(&r, KIND_OP, 3, rc);
-        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready((got, None)) if got == rc));
-        drop(fut);
-        assert_eq!(r.inner.ops.len(), 0, "a resolved slot is already retired");
+        let (id, mut rx) = bare_op(&r, None);
+        cqe(&r, KIND_OP, id, rc);
+        assert!(matches!(Pin::new(&mut rx).poll(&mut cx), Poll::Ready((got, None)) if got == rc));
     }
+}
+
+/// Instructions retired per op round trip: submit, pending poll, CQE, ready poll.
+/// Run under `perf stat -e instructions:u`.
+#[test]
+#[ignore]
+fn op_park_roundtrip_bench() {
+    const N: u64 = 1_000_000;
+    let r = make_reactor();
+    let mut cx = Context::from_waker(Waker::noop());
+    let start = Instant::now();
+    for _ in 0..N {
+        let (id, mut rx) = bare_op(&r, None);
+        assert!(Pin::new(&mut rx).poll(&mut cx).is_pending());
+        cqe(&r, KIND_OP, id, 0);
+        assert!(std::hint::black_box(Pin::new(&mut rx).poll(&mut cx)).is_ready());
+    }
+    let ns = start.elapsed().as_nanos() as f64 / N as f64;
+    println!("op_park_roundtrip_bench: {N} ops, {ns:.1} ns/op");
 }
