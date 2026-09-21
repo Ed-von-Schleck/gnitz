@@ -171,7 +171,7 @@ fn ground_rows_are_the_merge_identity() {
     let partial = partial_schema(&[], &specs);
     let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
     let v0 = gnitz_wire::global_group_key();
-    let ground: &[Cell] = &[Int(0), Null, Null, Null];
+    let ground: &[Cell] = &[Int(0), Int(0), Null, Null];
 
     let got = f.combine(batch(
         &partial,
@@ -191,7 +191,8 @@ fn ground_rows_are_the_merge_identity() {
     let got = f.combine(batch(&partial, &[(v0, ground), (v0, ground)]));
     assert_eq!(got.len(), 1);
     assert_eq!(ints(&got, 0), [0]);
-    assert_eq!(got.nulls, [0b1110]);
+    assert_eq!(ints(&got, 1), [0]);
+    assert_eq!(got.nulls, [0b1100]);
 }
 
 /// A winner replaces the held value by its own type's order — signed at a
@@ -237,7 +238,7 @@ fn sums_wrap_and_floats_add() {
         &[
             (v0, &[Int(i64::MAX), F64(1.5)]),
             (v0, &[Int(1), F64(2.25)]),
-            (v0, &[Null, Null]),
+            (v0, &[Int(0), F64(0.0)]),
         ],
     ));
 

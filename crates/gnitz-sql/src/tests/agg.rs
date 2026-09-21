@@ -17,7 +17,7 @@ fn schema() -> Schema {
 
 fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<(), GnitzSqlError> {
     let s = schema();
-    agg_ops(func, arg_col.map(|c| &s.columns[c])).map(|_| ())
+    agg_ops(func, arg_col.map(|c| &s.columns[c]), false).map(|_| ())
 }
 
 #[test]
@@ -52,13 +52,17 @@ fn agg_ops_shares_the_row_count_over_a_not_null_argument() {
     use WireAggFunc as W;
     let nullable = col_def("x", TypeCode::I64, true);
     let not_null = col_def("y", TypeCode::I64, false);
-    let ops = |f, c| agg_ops(f, Some(c)).unwrap();
+    let ops = |f, c| agg_ops(f, Some(c), false).unwrap();
     assert_eq!(ops(AggFunc::Count, &nullable), (W::CountNonNull, None));
     assert_eq!(ops(AggFunc::Count, &not_null), (W::Count, None));
     assert_eq!(ops(AggFunc::Avg, &not_null), (W::Sum, Some(W::Count)));
     assert_eq!(ops(AggFunc::Avg, &nullable), (W::Sum, Some(W::CountNonNull)));
     assert_eq!(ops(AggFunc::Sum, &nullable), (W::Sum, Some(W::CountNonNull)));
     assert_eq!(ops(AggFunc::Sum, &not_null), (W::Sum, None));
+    let global = |f, c| agg_ops(f, Some(c), true).unwrap();
+    assert_eq!(global(AggFunc::Sum, &not_null), (W::Sum, Some(W::Count)));
+    assert_eq!(global(AggFunc::Sum, &nullable), (W::Sum, Some(W::CountNonNull)));
+    assert_eq!(global(AggFunc::Min, &not_null), (W::Min, None));
 }
 
 /// SUM over a U64 source is typed U64 (bit pattern is the correct unsigned
@@ -80,7 +84,7 @@ fn agg_result_type_sum_preserves_u64() {
     // `HirAgg::view_type` is what renders that.
     let rt = |f, i: usize| {
         let c = Some(&s.columns[i]);
-        agg_col_def(agg_ops(f, c).unwrap().0, c, false).ty()
+        agg_col_def(agg_ops(f, c, false).unwrap().0, c, false).ty()
     };
     assert_eq!(rt(AggFunc::Sum, 1), TypeCode::U64.into()); // SUM(u64) → U64
     assert_eq!(rt(AggFunc::Sum, 2), TypeCode::I64.into()); // SUM(u32) → I64
@@ -108,19 +112,14 @@ fn default_agg_name_renders_pinned_view_column_names() {
 #[test]
 fn raw_output_nullable_matches_emit_semantics() {
     use WireAggFunc as W;
-    // COUNT / COUNT_NON_NULL / SumZero: always a concrete integer.
-    for f in [W::Count, W::CountNonNull, W::SumZero] {
+    for f in [W::Count, W::CountNonNull, W::Sum] {
         for src_nullable in [false, true] {
             for ungrouped in [false, true] {
                 assert!(!f.raw_output_nullable(src_nullable, ungrouped), "{f:?}");
             }
         }
     }
-    // SUM / MIN / MAX: NULL over an empty group set (the ground row stands in
-    // for a never-populated source), or grouped over a nullable source (an
-    // all-NULL group). Grouped over a non-nullable source never renders NULL —
-    // that is what keeps such a reduce on the null-blind fixed-int comparator.
-    for f in [W::Sum, W::Min, W::Max] {
+    for f in [W::Min, W::Max] {
         assert!(!f.raw_output_nullable(false, false), "{f:?} grouped, non-nullable");
         assert!(f.raw_output_nullable(true, false), "{f:?} grouped, nullable");
         assert!(f.raw_output_nullable(false, true), "{f:?} global, non-nullable");

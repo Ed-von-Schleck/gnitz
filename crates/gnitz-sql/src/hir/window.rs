@@ -440,7 +440,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             return Ok((ColType::of(TypeCode::I64), false));
         };
         let arg_def = arg.map(|e| ColumnDef::typed("_arg", e.infer_ty_with(&|r| self.type_of(r)), !self.never_null(e)));
-        let (op, _) = crate::agg::agg_ops(agg, arg_def.as_ref())?;
+        let (op, _) = crate::agg::agg_ops(agg, arg_def.as_ref(), false)?;
         let raw = crate::agg::agg_col_def(op, arg_def.as_ref(), false).ty();
         let nullable = match agg {
             AggFunc::Count => false,

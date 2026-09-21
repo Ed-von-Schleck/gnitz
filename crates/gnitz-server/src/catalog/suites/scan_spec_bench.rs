@@ -256,3 +256,35 @@ fn scan_spec_string_gather_bench() {
         e.scan_spec(tid, spec.clone(), &reply).unwrap()
     });
 }
+
+/// A global `SUM` over a NOT NULL column, with the COUNT(*) it is gated on.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn scan_spec_global_sum_bench() {
+    let (mut e, tid) = numeric_fixture("ss_bench_gsum", NUMERIC_ROWS);
+    let spec = ReadSpec {
+        bound: ReadBound::None,
+        predicate: Vec::new(),
+        sink: ReadSink {
+            map: None,
+            kind: SinkKind::Fold(AggReadSpec {
+                group_cols: vec![],
+                aggs: vec![
+                    AggDescriptor { agg_op: AggFunc::Sum, col_idx: 3 },
+                    AggDescriptor::COUNT_STAR,
+                ],
+            }),
+        },
+    };
+    let reply = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    cell("fold, global SUM(c2) + its COUNT(*)", NUMERIC_ROWS, || {
+        e.scan_spec(tid, spec.clone(), &reply).unwrap()
+    });
+}

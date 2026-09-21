@@ -1,8 +1,10 @@
 //! Aggregate descriptors and accumulator state.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use crate::schema::{ColumnLocator, TypeCode};
+use crate::storage::MemBatch;
 use gnitz_expr::RowSource;
 use gnitz_wire::{AggFunc, ImageKind, ScalarKind, WideKind};
 
@@ -30,16 +32,14 @@ pub(super) struct Accumulator {
     acc: i64,
     /// A wide extreme's native bytes.
     wide: Box<[u8]>,
-    has_value: bool,
-    /// [`AggFunc::empty_renders_zero`]: an untouched slot renders `acc`'s `0`.
-    renders_zero: bool,
+    has_extreme: bool,
     /// The aggregated column in an input row.
     src: ColumnLocator,
     /// This aggregate's column in an output row.
     out: ColumnLocator,
     /// What an input row's `src` does to the slot.
     kind: StepKind,
-    /// What an output row's `out` does to the slot: [`AggFunc::merge_func`].
+    /// What an output row's `out` does to the slot.
     merge: StepKind,
 }
 
@@ -63,7 +63,7 @@ impl StepKind {
         Some(match op {
             AggFunc::Count => StepKind::Count,
             AggFunc::CountNonNull => StepKind::CountNonNull,
-            AggFunc::Sum | AggFunc::SumZero => StepKind::Sum(ScalarKind::from_type_code(tc)?),
+            AggFunc::Sum => StepKind::Sum(ScalarKind::from_type_code(tc)?),
             AggFunc::Min | AggFunc::Max => StepKind::Extreme {
                 max: op == AggFunc::Max,
                 kind: ImageKind::of(tc),
@@ -86,19 +86,18 @@ impl Accumulator {
         Accumulator {
             acc: 0,
             wide: Box::default(),
-            has_value: false,
-            renders_zero: op.empty_renders_zero(),
+            has_extreme: false,
             src,
             out,
             kind: step(op, src),
-            merge: step(op.merge_func(), out),
+            merge: step(if op.is_linear() { AggFunc::Sum } else { op }, out),
         }
     }
 
     #[inline(always)]
     pub(super) fn reset(&mut self) {
         self.acc = 0;
-        self.has_value = false;
+        self.has_extreme = false;
     }
 
     #[inline(always)]
@@ -130,10 +129,8 @@ impl Accumulator {
 
     /// The emitted value; `None` renders NULL.
     pub(super) fn value(&self) -> Option<AggValue<'_>> {
-        if !self.has_value && !self.renders_zero {
-            return None;
-        }
         Some(match self.kind {
+            StepKind::Extreme { .. } if !self.has_extreme => return None,
             StepKind::Extreme { kind: ImageKind::Wide(kind), .. } => AggValue::Wide(kind, &self.wide),
             StepKind::Extreme { kind: ImageKind::Scalar(kind), max } => {
                 AggValue::Bits(scalar_native_of_image(kind, max, self.acc as u64))
@@ -145,17 +142,10 @@ impl Accumulator {
     /// [`Self::value`]'s scalar half.
     #[cfg(test)]
     pub(super) fn value_bits(&self) -> u64 {
-        match self.value() {
-            Some(AggValue::Bits(b)) => b,
-            v => panic!(
-                "value_bits over {}",
-                if v.is_none() {
-                    "an untouched accumulator"
-                } else {
-                    "a wide extreme"
-                }
-            ),
-        }
+        let Some(AggValue::Bits(b)) = self.value() else {
+            panic!("value_bits over a NULL or wide accumulator")
+        };
+        b
     }
 
     /// Seed a MIN/MAX with the extreme image the value index holds for it.
@@ -166,7 +156,7 @@ impl Accumulator {
         match kind {
             ImageKind::Scalar(_) => {
                 self.acc = u64::from_be_bytes(image[..8].try_into().unwrap()) as i64;
-                self.has_value = true;
+                self.has_extreme = true;
             }
             ImageKind::Wide(kind) => self.store_wide(&wide_native_of_image(kind, max, image)),
         }
@@ -179,7 +169,7 @@ impl Accumulator {
         } else {
             self.wide = v.into();
         }
-        self.has_value = true;
+        self.has_extreme = true;
     }
 
     #[inline(always)]
@@ -193,7 +183,6 @@ impl Accumulator {
                 self.acc = self
                     .acc
                     .wrapping_add(loc.decode_i64(rows, row, fi).wrapping_mul(weight));
-                self.has_value = true;
             }
             StepKind::Sum(ScalarKind::F32) => self.add_float(
                 f32::from_le_bytes(loc.bytes(rows, row).try_into().unwrap()) as f64,
@@ -207,19 +196,34 @@ impl Accumulator {
                 match kind {
                     ImageKind::Scalar(kind) => {
                         let image = scalar_image(&loc, kind, max, rows, row);
-                        if !self.has_value || image < self.acc as u64 {
+                        if !self.has_extreme || image < self.acc as u64 {
                             self.acc = image as i64;
-                            self.has_value = true;
+                            self.has_extreme = true;
                         }
                     }
                     ImageKind::Wide(kind) => {
                         let mut scratch = [0u8; 16];
                         let v = wide_native(&loc, kind, rows, row, &mut scratch);
                         let wins = if max { Ordering::Greater } else { Ordering::Less };
-                        if !self.has_value || kind.cmp_native(v, &self.wide) == wins {
+                        if !self.has_extreme || kind.cmp_native(v, &self.wide) == wins {
                             self.store_wide(v);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// [`Self::step_from_batch`] over each of `rows` at its own weight.
+    #[inline]
+    pub(super) fn step_rows(&mut self, mb: &MemBatch, rows: Range<usize>) {
+        match self.kind {
+            StepKind::Count => {
+                self.acc = rows.fold(self.acc, |acc, row| acc.wrapping_add(mb.get_weight(row)));
+            }
+            kind => {
+                for row in rows {
+                    self.apply(kind, self.src, mb, row, mb.get_weight(row));
                 }
             }
         }
@@ -239,7 +243,6 @@ impl Accumulator {
     fn add_float(&mut self, v: f64, weight: i64) {
         let cur = f64::from_bits(self.acc as u64);
         self.acc = f64::to_bits(cur + v * weight as f64) as i64;
-        self.has_value = true;
     }
 }
 

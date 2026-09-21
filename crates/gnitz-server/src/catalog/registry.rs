@@ -8,7 +8,7 @@ use gnitz_expr::payload_str;
 /// Operator-state format version. Bump on any change to an operator-state
 /// schema; a mismatch marks every Rederive view invalid at boot. Shard and
 /// manifest layout carry their own version words.
-const STATE_FORMAT: u32 = 11;
+const STATE_FORMAT: u32 = 12;
 
 /// The durable topology word recorded in `_sequences` ([`SEQ_ID_TOPOLOGY`]):
 /// `(worker_count << 32) | STATE_FORMAT`. One packer, shared by the boot-time

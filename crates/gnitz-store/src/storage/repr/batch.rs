@@ -692,7 +692,7 @@ impl Batch {
     /// Grows *before* it writes, and `count` moves only at `commit_row`, so
     /// within one row only the first region write can grow — which is why no
     /// appender pre-reserves and why a grow cannot strand a half-written row.
-    #[inline]
+    #[inline(always)]
     fn extend_region(&mut self, r: usize, src: &[u8]) {
         debug_assert_eq!(
             src.len(),
@@ -792,7 +792,7 @@ impl Batch {
     /// Append one row whose payload carries no value: the PK region from `pk`
     /// (exactly `pk_stride` OPK bytes), `weight`, `null_word`, then every payload
     /// column zero-filled. The payload-free case is [`Self::push_key_row`].
-    #[inline]
+    #[inline(always)]
     pub fn push_zero_filled_row(&mut self, pk: &[u8], weight: i64, null_word: u64) {
         self.begin_row(pk, weight);
         for pi in 0..self.num_payload_cols() {

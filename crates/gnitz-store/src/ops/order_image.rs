@@ -6,7 +6,7 @@
 
 use crate::schema::{type_code, ColumnLocator, SchemaColumn};
 use gnitz_expr::RowSource;
-use gnitz_wire::{ImageKind, ScalarKind, WideKind};
+use gnitz_wire::{ImageKind, ScalarKind, TypeCode, WideKind};
 
 /// The index PK column [`write_image_slot`] fills with an image's leading bytes:
 /// a scalar image whole, a wide one's first 16 bytes.
@@ -38,13 +38,10 @@ pub(crate) fn wide_native<'a>(
 /// `0x00 0xFF`, `0x00 0x00` appended). Prefix-freeness is what lets `invert`
 /// reverse the order exactly and a truncated [`write_image_slot`] window still
 /// order.
-pub(crate) fn append_wide_image(kind: WideKind, invert: bool, native: &[u8], out: &mut Vec<u8>) {
+fn append_wide_image(kind: WideKind, invert: bool, native: &[u8], out: &mut Vec<u8>) {
     let start = out.len();
     match kind {
-        WideKind::Fixed(tc) => {
-            out.resize(start + 16, 0);
-            gnitz_wire::encode_pk_column(native, tc as u8, &mut out[start..]);
-        }
+        WideKind::Fixed(tc) => return out.extend_from_slice(&int16_image_of(tc, invert, native)),
         WideKind::Bytes => {
             for &b in native {
                 out.push(b);
@@ -58,6 +55,35 @@ pub(crate) fn append_wide_image(kind: WideKind, invert: bool, native: &[u8], out
     if invert {
         out[start..].iter_mut().for_each(|b| *b = !*b);
     }
+}
+
+/// The order image of a 16-byte integer column at `loc` in `row`, **known
+/// non-NULL**: its OPK bytes, complemented when `invert`.
+#[inline(always)]
+pub(crate) fn int16_image(
+    loc: &ColumnLocator,
+    tc: TypeCode,
+    invert: bool,
+    src: &impl RowSource,
+    row: usize,
+) -> [u8; 16] {
+    let mut scratch = [0u8; 16];
+    int16_image_of(tc, invert, loc.native_le_bytes(src, row, &mut scratch))
+}
+
+#[inline(always)]
+fn int16_image_of(tc: TypeCode, invert: bool, native: &[u8]) -> [u8; 16] {
+    let mut image = [0u8; 16];
+    gnitz_wire::encode_pk_column(native, tc as u8, &mut image);
+    if invert {
+        image.iter_mut().for_each(|b| *b = !*b);
+    }
+    image
+}
+
+/// Whether `kind`'s image has a fixed width: every kind's but a byte string's.
+pub(crate) fn has_fixed_image(kind: ImageKind) -> bool {
+    kind != ImageKind::Wide(WideKind::Bytes)
 }
 
 /// Write `image` into an index key slot, zero-padding or truncating to its

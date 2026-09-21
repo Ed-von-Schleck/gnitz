@@ -4,7 +4,7 @@
 //! (gnitz-server) must agree on: the constants and codecs, the typed forms of
 //! the wire payloads (`OpNode`, `MapKind`, `IndexBound`, `ReadSpec`), and the
 //! semantic rules both sides compute with (`agg_output_type`,
-//! `raw_output_nullable`, `merge_func`, `join_key_common_type`,
+//! `raw_output_nullable`, `join_key_common_type`,
 //! `is_natural_reduce_key`, `worker_for_key`). It is the only common ancestor of
 //! gnitz-sql, gnitz-store and gnitz-core, so a rule that lands anywhere else can
 //! drift.

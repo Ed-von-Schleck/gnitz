@@ -82,10 +82,9 @@ _SWEEPS = [
     ("wide_group_key", range(60, 65),
      lambda n: "SELECT " + ", ".join(f"c{i}" for i in range(n)) + ", SUM(c63) FROM w GROUP BY "
                + ", ".join(f"c{i}" for i in range(n)), 2),
-    # N ungrouped SUMs. This breaks one aggregate earlier than the grouped form
-    # because the two-phase combine reduce appends a COUNT-of-partials existence
-    # gate the declared reduce schema does not model.
-    ("ungrouped_wide_aggregate", range(60, 65),
+    # N ungrouped SUMs, each gated on the shared COUNT(*): the finalize's
+    # register cap.
+    ("ungrouped_wide_aggregate", range(28, 34),
      lambda n: "SELECT " + ", ".join(f"SUM(c{i})" for i in range(n)) + " FROM w", 1),
 ]
 

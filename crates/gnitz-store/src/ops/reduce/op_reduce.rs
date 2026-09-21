@@ -36,7 +36,13 @@ pub fn op_reduce(
             let v0 = shape.key.ground_pk();
             if !trace_out_cursor.seek_pk_group_ascending(v0.bytes()) {
                 let mut out = Batch::with_capacity(output_schema, 1);
-                emit_reduce_row(&mut out, None, v0.bytes(), &shape.acc_template, shape);
+                emit_reduce_row(
+                    &mut out,
+                    None,
+                    shape.key.exemplar_locs(),
+                    v0.bytes(),
+                    &shape.acc_template,
+                );
                 return out;
             }
         }
@@ -97,11 +103,23 @@ pub fn op_reduce(
             "reduce input must be bag-positive: negative group cardinality",
         );
         if accs[plan.cardinality].count_value() > 0 {
-            emit_reduce_row(&mut out, Some((&mb, first)), out_pk_bytes, &accs, shape);
+            emit_reduce_row(
+                &mut out,
+                Some((&mb, first)),
+                shape.key.exemplar_locs(),
+                out_pk_bytes,
+                &accs,
+            );
         } else if plan.seeds_ground {
             // An emptied global aggregate still publishes one row. The empty-key
             // scatter sends every row of a ground reduce to V₀'s owner.
-            emit_reduce_row(&mut out, None, out_pk_bytes, &shape.acc_template, shape);
+            emit_reduce_row(
+                &mut out,
+                None,
+                shape.key.exemplar_locs(),
+                out_pk_bytes,
+                &shape.acc_template,
+            );
         }
         consolidate_group(&mut out, output_schema, mark);
     }

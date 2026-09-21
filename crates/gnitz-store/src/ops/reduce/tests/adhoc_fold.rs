@@ -70,7 +70,7 @@ fn by_group(out: &Batch, n_aggs: usize) -> std::collections::HashMap<i64, (i64, 
 fn fold_grouped_multi_agg_with_nulls() {
     // group 10: 100, 200, NULL  → COUNT*=3, COUNT(val)=2, SUM=300, MIN=100, MAX=200
     // group 20: 50 at weight 2   → COUNT*=2, COUNT(val)=2, SUM=100, MIN=50,  MAX=50
-    // group 30: NULL             → COUNT*=1, COUNT(val)=0, SUM/MIN/MAX = NULL
+    // group 30: NULL             → COUNT*=1, COUNT(val)=0, SUM=0, MIN/MAX = NULL
     let batch = build(&[
         (1, 1, 10, Some(100)),
         (2, 1, 10, Some(200)),
@@ -95,7 +95,7 @@ fn fold_grouped_multi_agg_with_nulls() {
     assert_eq!(g.len(), 3);
     assert_eq!(g[&10], (1, vec![Some(3), Some(2), Some(300), Some(100), Some(200)]));
     assert_eq!(g[&20], (1, vec![Some(2), Some(2), Some(100), Some(50), Some(50)]));
-    assert_eq!(g[&30], (1, vec![Some(1), Some(0), None, None, None]));
+    assert_eq!(g[&30], (1, vec![Some(1), Some(0), Some(0), None, None]));
 }
 
 #[test]

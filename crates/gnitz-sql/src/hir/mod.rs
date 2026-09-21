@@ -410,7 +410,7 @@ impl HirAgg {
         prior: &[HirAgg],
     ) -> Result<Self, GnitzSqlError> {
         let arg_def = arg.map(|id| &hircol_of(env, id).def);
-        let (value, count) = crate::agg::agg_ops(func, arg_def)?;
+        let (value, count) = crate::agg::agg_ops(func, arg_def, is_global)?;
         let col = |op: WireAggFunc| {
             // COUNT(*) reads no column, whatever argument the aggregate names.
             let arg = arg.filter(|_| op != WireAggFunc::Count);
@@ -454,8 +454,7 @@ impl HirAgg {
         crate::agg::agg_view_type(self.func, self.out.col.def.ty())
     }
 
-    /// A companion carries the null-ness (the finalize renders NULL by
-    /// div-by-zero); otherwise the raw column's own.
+    /// A companion carries the null-ness; otherwise the raw column's own.
     pub(crate) fn view_nullable(&self) -> bool {
         self.companion.is_some() || self.out.col.def.is_nullable
     }

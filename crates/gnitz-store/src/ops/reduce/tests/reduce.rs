@@ -442,7 +442,7 @@ fn linear_sum_only_emptied_group_eliminated() {
 /// column is NULL must surface the group (SQL: `SUM = NULL`), not drop it. With
 /// the appended Count companion the null-blind row count is 1, so the gate emits
 /// the group; the SUM/CountNonNull accumulators stay untouched, so the raw SUM
-/// bit is NULL and the NullfillSum finalize renders SUM = NULL.
+/// is `0` and the finalize, gated on the count companion, renders SUM = NULL.
 #[test]
 fn linear_sum_only_new_all_null_group_present() {
     use crate::schema::{type_code, SchemaColumn};
@@ -457,14 +457,12 @@ fn linear_sum_only_new_all_null_group_present() {
         ],
         &[0],
     );
-    // Raw reduce output: _group_pk | grp | sum (nullable) | cnn | count.
-    // agg order mirrors agg_descs = [Sum, CountNonNull, Count] — the nullable-SUM
-    // NullfillSum pair plus the trailing appended cardinality companion.
+    // Raw reduce output: _group_pk | grp | sum | cnn | count.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0), // _group_pk
             SchemaColumn::new(type_code::I64, 0),  // grp
-            SchemaColumn::new(type_code::I64, 1),  // sum (nullable)
+            SchemaColumn::new(type_code::I64, 0),  // sum
             SchemaColumn::new(type_code::I64, 0),  // cnn
             SchemaColumn::new(type_code::I64, 0),  // count (companion)
         ],
@@ -479,8 +477,7 @@ fn linear_sum_only_new_all_null_group_present() {
         ],
         &[0],
     );
-    // NullfillSum: grp → fin payload 0; sum(col 2) / (cnn(col 3) != 0) → fin
-    // payload 1 (div-by-zero marks SUM NULL when the non-null count is 0).
+    // grp → fin payload 0; sum / (cnn != 0) → fin payload 1, NULL when cnn is 0.
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 3 }, // r0 = cnn
         LogicalInstr::LoadConst { val: 0 },
@@ -529,6 +526,16 @@ fn linear_sum_only_new_all_null_group_present() {
     assert_eq!(
         raw.count, 1,
         "new all-NULL group is present (cardinality 1), not dropped"
+    );
+    assert_eq!(
+        (raw.get_null_word(0) >> 1) & 1,
+        0,
+        "the raw SUM of an all-NULL group is present"
+    );
+    assert_eq!(
+        read_i64_le(raw.col_data(1), 0),
+        0,
+        "the raw SUM of an all-NULL group is 0"
     );
     assert_eq!(fin.count, 1);
     assert_eq!(fin.get_weight(0), 1, "one +1 row");
@@ -624,7 +631,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
             SchemaColumn::new(type_code::U128, 0), // _group_pk
             SchemaColumn::new(type_code::I64, 0),  // grp
             SchemaColumn::new(type_code::I64, 0),  // count
-            SchemaColumn::new(type_code::I64, 1),  // sum (nullable)
+            SchemaColumn::new(type_code::I64, 0),  // sum
             SchemaColumn::new(type_code::I64, 0),  // cnn (companion)
         ],
         &[0],
@@ -835,14 +842,8 @@ fn null_min_retraction_re_emits_null() {
     );
 }
 
-/// A linear SUM whose group stays all-NULL across a fold must keep the new
-/// output row's raw SUM bit NULL: folding a previously-NULL SUM's zero bytes
-/// would saturate `has_value` and decode NULL as 0. Pins the linear-fold null
-/// gate that skips a NULL old aggregate. This is the raw SUM bit only — a
-/// nullable SUM's user-visible null-ness rides the NullfillSum companion, which
-/// `test_reduce_nullable_sum_retraction_becomes_null` covers.
 #[test]
-fn null_sum_fold_stays_null() {
+fn all_null_sum_is_zero_whatever_the_history() {
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -851,56 +852,50 @@ fn null_sum_fold_stays_null() {
         ],
         &[0],
     );
-    let out_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
     let aggs = [
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Count },
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
     ];
-    let sum_null_bit = 1u64 << 2;
-    let null_row = |pk: u128| {
-        let mut b = Batch::with_capacity(&in_schema, 1);
-        b.extend_pk(pk);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val NULL
-        b.extend_col(0, &10i64.to_le_bytes());
-        b.extend_col(1, &0i64.to_le_bytes());
-        b.count += 1;
+    let out_schema = out_schema_for(&in_schema, &[1], &aggs);
+    assert_eq!(out_schema.columns[3].nullable, 0, "a raw SUM is NOT NULL");
+    // `(pk, val, weight)` rows of group 10.
+    let delta = |rows: &[(u128, Option<i64>, i64)]| {
+        let mut b = Batch::with_capacity(&in_schema, rows.len());
+        for &(pk, val, w) in rows {
+            b.extend_pk(pk);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&(u64::from(val.is_none()) << 1).to_le_bytes());
+            b.extend_col(0, &10i64.to_le_bytes());
+            b.extend_col(1, &val.unwrap_or(0).to_le_bytes());
+            b.count += 1;
+        }
         b.set_layout_unchecked(Layout::Consolidated);
         b
     };
+    let reduce = |d: &Batch, trace: &Batch| {
+        let mut cur = trace_cursor(trace.clone(), out_schema);
+        op_reduce(d, &mut cur, &in_schema, &[1u32], &aggs, None, false, false)
+    };
+    // The inserted row's `(null word, SUM)`.
+    let new_sum = |out: &Batch| {
+        let row = (0..out.count).find(|&i| out.get_weight(i) > 0).expect("an insert row");
+        (out.get_null_word(row), read_i64_le(out.col_data(2), row * 8))
+    };
+    let empty = Batch::empty_with_schema(&out_schema);
 
-    let mut to_ch = empty_trace(out_schema);
-    let out1 = op_reduce(&null_row(1), &mut to_ch, &in_schema, &[1u32], &aggs, None, false, false);
-    assert!(
-        out1.as_mem_batch().get_null_word(0) & sum_null_bit != 0,
-        "tick1 SUM NULL"
-    );
+    let fresh = reduce(&delta(&[(1, None, 1)]), &empty);
+    assert_eq!(new_sum(&fresh), (0, 0), "an all-NULL SUM is 0, null bit clear");
 
-    let mut to_ch2 = trace_cursor(out1, out_schema);
-    let out2 = op_reduce(
-        &null_row(2),
-        &mut to_ch2,
-        &in_schema,
-        &[1u32],
-        &aggs,
-        None,
-        false,
-        false,
-    );
-    let mb2 = out2.as_mem_batch();
-    let new_row = (0..out2.count).find(|&i| out2.get_weight(i) > 0).expect("insert row");
-    assert!(
-        mb2.get_null_word(new_row) & sum_null_bit != 0,
-        "SUM of a still-all-NULL group must stay NULL (null_word={:#x})",
-        mb2.get_null_word(new_row)
+    let folded = reduce(&delta(&[(2, None, 1)]), &fresh);
+    assert_eq!(new_sum(&folded), (0, 0), "a fold of an all-NULL SUM stays 0");
+
+    let both = reduce(&delta(&[(1, None, 1), (2, Some(5), 1)]), &empty);
+    assert_eq!(new_sum(&both), (0, 5));
+    let retracted = reduce(&delta(&[(2, Some(5), -1)]), &both);
+    assert_eq!(
+        new_sum(&retracted),
+        new_sum(&fresh),
+        "retracting the last non-null row renders the fresh reduce of the final state"
     );
 }
 
@@ -914,13 +909,13 @@ fn reduce_trace_seek_wide_pk() {
 
     // Wide PK: 3×U64 (stride 24) + I64 val. GROUP BY the full PK.
     let in_schema = wide_pk_3xu64_schema();
-    // Output: natural wide PK (3×U64) + SUM(I64, nullable) + count companion.
+    // Output: natural wide PK (3×U64) + SUM(I64) + count companion.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
         &[0, 1, 2],
@@ -1610,7 +1605,13 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
     let plan = make_plan(&in_schema, &[0u32, 1u32], std::slice::from_ref(&agg), false, false);
     let accs = plan.shape.acc_template.clone();
-    emit_reduce_row(&mut output, Some((&mb, 0)), mb.get_pk_bytes(0), &accs, &plan.shape);
+    emit_reduce_row(
+        &mut output,
+        Some((&mb, 0)),
+        plan.shape.key.exemplar_locs(),
+        mb.get_pk_bytes(0),
+        &accs,
+    );
 
     assert_eq!(output.count, 1);
     // Source PK region is OPK (big-endian); the verbatim copy preserves it.
@@ -4409,7 +4410,7 @@ fn german_string_min_max_recede_through_the_value_index() {
 //
 // A no-`GROUP BY` aggregate is one logical group with an empty group-column set;
 // the output PK is the synthetic constant V₀. `op_reduce` must emit exactly one
-// row at V₀ over an empty/fully-retracted source (COUNT=0, SUM/MIN/MAX=NULL).
+// row at V₀ over an empty/fully-retracted source (COUNT=SUM=0, MIN/MAX=NULL).
 // ---------------------------------------------------------------------------
 
 /// Source for the global-aggregate tests: `[pk:U64, val:I64(nullable)]`.
@@ -4463,7 +4464,7 @@ fn g_reduce(
     )
 }
 
-/// Seed over an empty source emits exactly one ground row at V₀: COUNT=0, SUM=NULL.
+/// Seed over an empty source emits exactly one ground row at V₀: COUNT=0, SUM=0.
 #[test]
 fn global_seed_over_empty_emits_one_ground_row() {
     let out_schema = out_schema_for(
@@ -4484,7 +4485,16 @@ fn global_seed_over_empty_emits_one_ground_row() {
     assert_eq!(raw.count, 1, "empty-source global aggregate must emit one ground row");
     assert_eq!(raw.get_weight(0), 1, "ground row weight +1");
     assert_eq!(raw.get_pk(0), gnitz_wire::global_group_key(), "ground PK must be V₀");
-    assert_eq!(raw.get_null_word(0) & 1, 1, "SUM must be NULL over empty source");
+    assert_eq!(
+        raw.get_null_word(0) & 1,
+        0,
+        "the raw SUM is present over an empty source"
+    );
+    assert_eq!(
+        read_i64_le(raw.col_data(0), 0),
+        0,
+        "the raw SUM is 0 over an empty source"
+    );
     assert_eq!(
         read_i64_le(raw.col_data(1), 0),
         0,
@@ -4567,7 +4577,7 @@ fn global_create_over_nonempty_emits_computed_no_ground() {
 }
 
 /// Fully retracting an all-linear global aggregate sheds the computed row and the
-/// ground branch supplies one NULL/zero row in its place (net = one ground row).
+/// ground branch supplies one zero row in its place (net = one ground row).
 #[test]
 fn global_emptied_by_delete_emits_ground() {
     let out_schema = out_schema_for(
@@ -4599,7 +4609,8 @@ fn global_emptied_by_delete_emits_ground() {
     assert_eq!(raw2.count, 2, "retraction of old + ground insert");
     let mb = raw2.as_mem_batch();
     let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
-    assert_eq!(raw2.get_null_word(pos) & 1, 1, "ground SUM=NULL");
+    assert_eq!(raw2.get_null_word(pos) & 1, 0, "ground SUM present");
+    assert_eq!(read_i64_le(raw2.col_data(0), pos * 8), 0, "ground SUM=0");
     assert_eq!(read_i64_le(raw2.col_data(1), pos * 8), 0, "ground COUNT=0");
 }
 
@@ -4673,10 +4684,9 @@ fn global_value_change_emits_no_ground() {
     assert_eq!(raw2.count, 2, "retract old computed + emit new computed");
     let mb = raw2.as_mem_batch();
     let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
-    // The +1 row is the new computed value, never a NULL ground.
+    // The +1 row is the new computed value, never the ground.
     assert_eq!(read_i64_le(raw2.col_data(0), pos * 8), 8, "new SUM=8");
     assert_eq!(read_i64_le(raw2.col_data(1), pos * 8), 1, "COUNT stays 1");
-    assert_eq!(raw2.get_null_word(pos) & 1, 0, "no NULL ground delta on a value change");
 }
 
 /// Mixed non-linear `[COUNT(*), MIN(x)]` fully emptied → one ground row
@@ -4820,39 +4830,8 @@ fn global_lone_min_avi_empty_prefix() {
 }
 
 // ---------------------------------------------------------------------------
-// SumZero aggregate + two-phase global-aggregate combine
-//
-// SumZero = Sum's fold with Count's `0` identity: it sums its source column like
-// SUM but renders an untouched accumulator as a concrete `0` (null bit clear),
-// not NULL. The two-phase global-aggregate combine uses it to sum per-worker
-// partial COUNT/COUNT_NON_NULL columns (a COUNT's empty value is `0`, not NULL).
+// Two-phase global-aggregate combine
 // ---------------------------------------------------------------------------
-
-/// SumZero folds values exactly like Sum, is linear (keeps the combine on the
-/// linear fast path), and an untouched accumulator renders `0`, not NULL.
-#[test]
-fn sumzero_folds_like_sum_and_empty_renders_zero() {
-    assert!(AggFunc::SumZero.is_linear(), "SumZero must be linear");
-
-    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
-    let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::SumZero };
-    let mut acc = make_acc(&schema, &[0], desc);
-
-    // Fresh: renders 0 (Count's identity) rather than NULL (Sum's).
-    assert_eq!(acc.value_bits(), 0, "an untouched SumZero renders 0, not NULL");
-
-    // Folds values with weight, exactly like Sum: 5·(+1) + 10·(+1) + 7·(−1) = 8.
-    let batch = g_delta(&[(1, 1, 5), (2, 1, 10), (3, -1, 7)]);
-    let mb = batch.as_mem_batch();
-    for row in 0..batch.count {
-        acc.step_from_batch(&mb, row, mb.get_weight(row));
-    }
-    assert_eq!(
-        acc.value_bits() as i64,
-        8,
-        "SumZero sums its source values (5 + 10 − 7)"
-    );
-}
 
 /// `COUNT(col)` over an all-NULL group renders a concrete `0` with the null bit
 /// **clear**, never NULL. Every row hits `step_from_batch`'s null gate, so the
@@ -4895,7 +4874,13 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
         &[0],
     );
     let mut output = Batch::with_capacity(&out_schema, 1);
-    emit_reduce_row(&mut output, Some((&mb, 0)), mb.get_pk_bytes(0), &accs, &plan.shape);
+    emit_reduce_row(
+        &mut output,
+        Some((&mb, 0)),
+        plan.shape.key.exemplar_locs(),
+        mb.get_pk_bytes(0),
+        &accs,
+    );
 
     assert_eq!(output.count, 1);
     let out_mb = output.as_mem_batch();
@@ -4912,7 +4897,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
 }
 
 /// The ground row renders the COUNT family as a concrete `0` with the null bit
-/// clear: untouched accumulators render via `empty_renders_zero`. Both COUNT(*)
+/// clear: an untouched linear accumulator renders `0`. Both COUNT(*)
 /// and COUNT(col) ground columns.
 #[test]
 fn ground_row_renders_count_family_zero_null_clear() {
@@ -4936,7 +4921,13 @@ fn ground_row_renders_count_family_zero_null_clear() {
     let mut raw_output = Batch::with_capacity(&out_schema, 1);
     let v0 = [0u8; 16]; // U128 ground PK (V₀)
     let plan = make_plan(&in_schema, &[], &descs, true, true);
-    emit_reduce_row(&mut raw_output, None, &v0, &plan.shape.acc_template, &plan.shape);
+    emit_reduce_row(
+        &mut raw_output,
+        None,
+        plan.shape.key.exemplar_locs(),
+        &v0,
+        &plan.shape.acc_template,
+    );
 
     assert_eq!(raw_output.count, 1, "ground row emitted");
     let out_mb = raw_output.as_mem_batch();
@@ -4994,9 +4985,9 @@ fn combine_partials(rows: &[(i64, Option<i64>)]) -> Batch {
     b
 }
 
-// SumZero merges the partial counts; a trailing Count counts partial rows (the
+// Sum merges the partial counts; a trailing Count counts partial rows (the
 // existence gate `op_reduce` finds via the lone AggFunc::Count).
-const C_SUMZERO: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::SumZero };
+const C_SUM: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum };
 const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor::COUNT_STAR;
 
 /// The phase-3 combine `op_reduce` over hand-built partials (empty group cols →
@@ -5008,7 +4999,7 @@ fn combine_reduce(delta: &Batch, trace_out: &mut crate::storage::ReadCursor) -> 
         trace_out,
         &in_schema,
         &[], // empty group cols ⇒ one global group at V₀
-        &[C_SUMZERO, C_COUNT_PARTIALS],
+        &[C_SUM, C_COUNT_PARTIALS],
         None,
         true, // global_ground
         true, // i_am_owner (V₀'s owner)
@@ -5019,7 +5010,7 @@ fn combine_reduce(delta: &Batch, trace_out: &mut crate::storage::ReadCursor) -> 
 /// partials (2). Consolidation of identical partials nets by weight.
 #[test]
 fn combine_sums_partial_counts_not_partial_rows() {
-    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUMZERO, C_COUNT_PARTIALS]);
+    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUM, C_COUNT_PARTIALS]);
     let mut to_ch = empty_trace(out_schema);
 
     // Two workers' partials: counts 3 and 5.
@@ -5029,7 +5020,7 @@ fn combine_sums_partial_counts_not_partial_rows() {
     assert_eq!(
         read_i64_le(out.col_data(0), 0),
         8,
-        "SumZero sums partial counts (3 + 5), not the partial count (#partials = 2)"
+        "Sum sums partial counts (3 + 5), not the partial count (#partials = 2)"
     );
     assert_eq!(read_i64_le(out.col_data(1), 0), 2, "COUNT-of-partials gate = 2");
 }
@@ -5038,10 +5029,10 @@ fn combine_sums_partial_counts_not_partial_rows() {
 /// column) combine to a concrete `0` with the null bit clear, never NULL.
 #[test]
 fn combine_all_null_partials_render_zero_not_null() {
-    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUMZERO, C_COUNT_PARTIALS]);
+    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUM, C_COUNT_PARTIALS]);
     let mut to_ch = empty_trace(out_schema);
 
-    // Two non-empty workers, each with a NULL partial count → SumZero untouched.
+    // Two non-empty workers, each with a NULL partial count → the Sum untouched.
     let out = combine_reduce(&combine_partials(&[(1, None), (1, None)]), &mut to_ch);
     assert_eq!(out.count, 1, "non-empty global (2 partials) emits one combined row");
     assert_eq!(read_i64_le(out.col_data(0), 0), 0, "all-NULL COUNT(col) combines to 0");
@@ -5058,10 +5049,10 @@ fn combine_all_null_partials_render_zero_not_null() {
 }
 
 /// Full retraction nets the COUNT-of-partials to 0; the gate sheds the computed
-/// row and the combine emits the ground (combined = 0 via SumZero, null clear).
+/// row and the combine emits the ground (combined = 0, null clear).
 #[test]
 fn combine_full_retraction_sheds_to_ground() {
-    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUMZERO, C_COUNT_PARTIALS]);
+    let out_schema = out_schema_for(&combine_partial_schema(), &[], &[C_SUM, C_COUNT_PARTIALS]);
     let mut to_ch = empty_trace(out_schema);
 
     let out1 = combine_reduce(&combine_partials(&[(1, Some(5))]), &mut to_ch);
@@ -5076,12 +5067,12 @@ fn combine_full_retraction_sheds_to_ground() {
     assert_eq!(
         read_i64_le(out2.col_data(0), pos * 8),
         0,
-        "ground combined count = 0 (SumZero's `0` identity)"
+        "ground combined count = 0 (a linear aggregate's `0` identity)"
     );
     assert_eq!(
         out2.get_null_word(pos) & 1,
         0,
-        "combined count present (SumZero grounds to 0, not NULL)"
+        "combined count present (the Sum grounds to 0, not NULL)"
     );
 }
 
@@ -5533,10 +5524,8 @@ fn reduce_multi_avi_compound_group_key() {
     }
 }
 
-/// Global `MIN(a), SUM(b)` (no GROUP BY) served by the combined index, fully
-/// retracted: the emptied source emits the ground row (MIN=NULL, SUM=NULL,
-/// COUNT=0) — NOT a phantom SUM=0. Guards the global-ground arm that replaces a
-/// row the cardinality gate shed.
+/// Global `MIN(a), SUM(b)` over the combined index, fully retracted, emits the
+/// ground row.
 #[test]
 fn reduce_multi_avi_global_emptied() {
     // [pk:U64, a:I64, b:I64]; global aggregate.
@@ -5548,12 +5537,12 @@ fn reduce_multi_avi_global_emptied() {
         ],
         &[0],
     );
-    // Output: [_group_pk:U128, min:I64?, sum:I64?, count:I64].
+    // Output: [_group_pk:U128, min:I64?, sum:I64, count:I64].
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
@@ -5591,7 +5580,7 @@ fn reduce_multi_avi_global_emptied() {
     assert_eq!(read_i64_le(out1.col_data(0), 0), 3, "MIN=3");
     assert_eq!(read_i64_le(out1.col_data(1), 0), 30, "SUM=30");
 
-    // Tick 2: retract everything → ground row (MIN=NULL, SUM=NULL, COUNT=0).
+    // Tick 2: retract everything → ground row (MIN=NULL, SUM=0, COUNT=0).
     let d2 = mk(&[(1, -1, 5, 10), (2, -1, 3, 20)]);
     let mut to2 = trace_cursor(out1, out_schema);
     let out2 = run(&[&d1, &d2], &d2, &mut to2);
@@ -5600,11 +5589,8 @@ fn reduce_multi_avi_global_emptied() {
         .find(|&i| mb.get_weight(i) == 1)
         .expect("a +1 ground row");
     assert_ne!(out2.get_null_word(ins) & (1 << 0), 0, "ground MIN = NULL");
-    assert_ne!(
-        out2.get_null_word(ins) & (1 << 1),
-        0,
-        "ground SUM = NULL (not a phantom 0)"
-    );
+    assert_eq!(out2.get_null_word(ins) & (1 << 1), 0, "ground SUM present");
+    assert_eq!(read_i64_le(out2.col_data(1), ins * 8), 0, "ground SUM = 0");
     assert_eq!(read_i64_le(out2.col_data(2), ins * 8), 0, "ground COUNT = 0");
 }
 
@@ -5624,14 +5610,14 @@ fn reduce_multi_avi_global_emptied() {
 type GrpValRow = (u64, Option<i64>, i64, i64);
 
 /// Output schema for a synthetic-U128-PK `SUM/COUNT` reduce:
-/// `[U128 pk, <grp>, I64 sum(nullable), I64 count]`. The trailing count is the
+/// `[U128 pk, <grp>, I64 sum, I64 count]`. The trailing count is the
 /// cardinality companion every all-linear reduce carries.
 fn sum_count_out_synthetic(grp_col: SchemaColumn) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
             grp_col,
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
@@ -5800,11 +5786,11 @@ fn reduce_monotone_probe_payload_u64_group() {
         ],
         &[0],
     );
-    // Natural U64 output PK: [U64 pk(=grp), I64 sum(nullable), I64 count].
+    // Natural U64 output PK: [U64 pk(=grp), I64 sum, I64 count].
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
@@ -6667,7 +6653,7 @@ fn test_agg_output_type() {
         (AggFunc::Count, I64, Some(I64)),
         (AggFunc::Sum, F64, Some(F64)),
         (AggFunc::Sum, I32, Some(I64)),
-        (AggFunc::SumZero, F32, Some(F64)),
+        (AggFunc::Sum, F32, Some(F64)),
         // SUM over a U64 source is typed U64: the i64 accumulator's bit pattern
         // is the correct unsigned sum, so a downstream unsigned compare re-seeds
         // right.
@@ -6686,7 +6672,7 @@ fn test_agg_output_type() {
         (AggFunc::Min, U128, Some(U128)),
         // A sum needs a scalar register, and a calendar value does not add.
         (AggFunc::Sum, STRING, None),
-        (AggFunc::SumZero, U128, None),
+        (AggFunc::Sum, U128, None),
         (AggFunc::Sum, DATE, None),
         (AggFunc::Sum, TIMESTAMP, None),
     ];
@@ -6695,27 +6681,22 @@ fn test_agg_output_type() {
     }
 }
 
-/// A partial's merge aggregate keeps the partial's type, so a stored value is
-/// read back at the width it was written.
+/// A partial's merge aggregate keeps the partial's type.
 #[test]
 fn agg_merge_preserves_output_type() {
     for f in [
         AggFunc::Count,
         AggFunc::CountNonNull,
         AggFunc::Sum,
-        AggFunc::SumZero,
         AggFunc::Min,
         AggFunc::Max,
     ] {
+        let merge = if f.is_linear() { AggFunc::Sum } else { f };
         for tc in TypeCode::ALL {
             let Some(out) = gnitz_wire::agg_output_type(f, tc as u8) else {
                 continue;
             };
-            assert_eq!(
-                gnitz_wire::agg_output_type(f.merge_func(), out),
-                Some(out),
-                "{f:?} over {tc:?}"
-            );
+            assert_eq!(gnitz_wire::agg_output_type(merge, out), Some(out), "{f:?} over {tc:?}");
         }
     }
 }
@@ -6798,15 +6779,8 @@ fn test_build_reduce_output_schema_synthetic_pk() {
     assert_eq!(out.columns[2].type_code, type_code::I64);
 }
 
-/// The reduce output schema must declare each aggregate column nullable exactly
-/// when `emit_agg_col` can set its null bit: an untouched SUM/MIN/MAX, which a
-/// NULL source value or an empty group set produces. The zero-identity family
-/// (COUNT / COUNT_NON_NULL / SumZero) renders a concrete `0` and stays NOT NULL,
-/// which is what keeps a COUNT-only or NOT-NULL-source grouped reduce on the
-/// null-blind fixed-int comparator. This pins the schema builder's *application*
-/// of the shared `AggFunc::raw_output_nullable`; the rule itself is pinned in
-/// `gnitz-wire`. The `group_cols = &[]` arm is also the range-join threshold
-/// reduce's shape (group-less MIN over a NOT NULL column).
+/// Only an extreme's raw output column is nullable: over a nullable source, or
+/// with no group columns.
 #[test]
 fn build_reduce_output_schema_agg_nullability_matrix() {
     for src_nullable in [false, true] {
@@ -6816,7 +6790,6 @@ fn build_reduce_output_schema_agg_nullability_matrix() {
         for agg_op in [
             AggFunc::Count,
             AggFunc::CountNonNull,
-            AggFunc::SumZero,
             AggFunc::Sum,
             AggFunc::Min,
             AggFunc::Max,
@@ -6828,8 +6801,8 @@ fn build_reduce_output_schema_agg_nullability_matrix() {
                 // Aggregates are the trailing output columns.
                 let got = out.columns[out.num_columns() - 1].nullable != 0;
                 let want = match agg_op {
-                    AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => false,
-                    AggFunc::Sum | AggFunc::Min | AggFunc::Max => src_nullable || group_cols.is_empty(),
+                    AggFunc::Count | AggFunc::CountNonNull | AggFunc::Sum => false,
+                    AggFunc::Min | AggFunc::Max => src_nullable || group_cols.is_empty(),
                 };
                 assert_eq!(
                     got, want,
@@ -6908,19 +6881,17 @@ fn agg_over(tc: u8) -> SchemaDescriptor {
 /// a sum over a wide or a calendar column.
 #[test]
 fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
-    for agg_op in [AggFunc::Sum, AggFunc::SumZero] {
-        let aggs = [AggDescriptor { agg_op, col_idx: 1 }];
-        for tc in [
-            type_code::U128,
-            type_code::STRING,
-            type_code::DATE,
-            type_code::TIMESTAMP,
-        ] {
-            assert_eq!(
-                plan_rejection(&agg_over(tc), &[0], &aggs),
-                format!("reduce: {agg_op:?} is not defined over type code {tc}"),
-            );
-        }
+    let aggs = [AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 }];
+    for tc in [
+        type_code::U128,
+        type_code::STRING,
+        type_code::DATE,
+        type_code::TIMESTAMP,
+    ] {
+        assert_eq!(
+            plan_rejection(&agg_over(tc), &[0], &aggs),
+            format!("reduce: Sum is not defined over type code {tc}"),
+        );
     }
 }
 

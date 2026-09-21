@@ -147,7 +147,7 @@ fn projection_line(schema: &Schema, unprojected: bool) -> String {
 
 /// What the worker folds: the PHYSICAL aggregate list, which is why an AVG shows
 /// as its SUM and a count and why the match below is over the *wire*
-/// enum — the one carrying `SumZero` and no `Avg`.
+/// enum — the one carrying no `Avg`.
 fn fold_line(agg: &AggReadSpec, reduce_schema: &Schema, has_having: bool, is_distinct: bool) -> String {
     // Named against the reduce input, not the source: with a pre-map the reduce
     // groups and aggregates columns the source does not have, and the hidden
@@ -169,7 +169,6 @@ fn fold_line(agg: &AggReadSpec, reduce_schema: &Schema, has_having: bool, is_dis
                 AggFunc::Min => "MIN",
                 AggFunc::Max => "MAX",
                 AggFunc::CountNonNull => "COUNT_NON_NULL",
-                AggFunc::SumZero => "SUM_ZERO",
             };
             format!("{op}({})", reduce_schema.columns[s.col_idx as usize].name)
         })

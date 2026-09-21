@@ -371,9 +371,8 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
         "fold: global aggregate: ; HAVING applied client-side"
     );
 
-    // View: every reduce groups on nothing, one seeds the ground row, and the
-    // only aggregates are the cardinality COUNT and the SUM_ZERO its combine
-    // folds that COUNT with — no user aggregate.
+    // View: every reduce groups on nothing, one seeds the ground row, and none
+    // carries a user aggregate.
     let chain = view(&cat, BODY);
     let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = chain
         .views
@@ -393,7 +392,7 @@ fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
         assert!(group_cols.is_empty(), "{reduces:?}");
         for op in ops {
             assert!(
-                matches!(op, gnitz_wire::AggFunc::Count | gnitz_wire::AggFunc::SumZero),
+                matches!(op, gnitz_wire::AggFunc::Count | gnitz_wire::AggFunc::Sum),
                 "{reduces:?}"
             );
         }

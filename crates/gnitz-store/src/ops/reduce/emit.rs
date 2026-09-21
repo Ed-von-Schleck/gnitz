@@ -1,10 +1,10 @@
 //! The reduce output row emitter.
 
+use crate::schema::ColumnLocator;
 use crate::storage::{Batch, MemBatch};
 use gnitz_wire::WideKind;
 
 use super::agg::{Accumulator, AggValue};
-use super::plan::ReduceShape;
 
 /// Emit one aggregate column: the value truncated to the column width, or NULL.
 #[inline]
@@ -26,16 +26,15 @@ fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, null_word:
 }
 
 /// Emit one `[key…, group columns…, aggregates…]` row at weight +1: a group's
-/// new value, copying its group columns from `exemplar`, or the ground row,
-/// which has none.
+/// new value, copying its group columns from `exemplar` at `exemplar_locs`, or
+/// the ground row, which has none.
 pub(super) fn emit_reduce_row(
     output: &mut Batch,
     exemplar: Option<(&MemBatch, usize)>,
+    exemplar_locs: &[ColumnLocator],
     out_pk_bytes: &[u8],
     accs: &[Accumulator],
-    shape: &ReduceShape,
 ) {
-    let exemplar_locs = shape.key.exemplar_locs();
     debug_assert!(
         exemplar.is_some() || exemplar_locs.is_empty(),
         "only an exemplar-free layout emits without an exemplar row"

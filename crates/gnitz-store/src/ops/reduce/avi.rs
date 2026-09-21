@@ -3,21 +3,21 @@
 //!
 //! ```text
 //! PK      = group key ‖ ordinal ‖ value image (8 bytes; 16 when any ordinal is wide)
-//! payload = the whole wide image (BLOB), only when an ordinal is wide
+//! payload = the whole image (BLOB), only when an ordinal is a string
 //! ```
 //!
 //! The ordinal names the aggregate, so `MIN(a)` and `MAX(a)` never collide, and
 //! a MAX image is complemented, so each ordinal's first entry is its extreme.
 
 use crate::schema::key::ReindexPacker;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
-use crate::storage::{Batch, ReadCursor};
+use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
+use crate::storage::{Batch, MemBatch, ReadCursor};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
-use gnitz_wire::ImageKind;
+use gnitz_wire::{ImageKind, WideKind};
 
 use super::super::order_image::{
-    append_wide_image, image_slot_col, scalar_image, wide_native, write_image_slot, IMAGE_COL,
+    append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, IMAGE_COL,
 };
 use super::agg::{Accumulator, ExtremeSpec};
 
@@ -27,7 +27,7 @@ use super::agg::{Accumulator, ExtremeSpec};
 
 const ORDINAL_COL: SchemaColumn = SchemaColumn::new(type_code::U8, 0);
 /// [`IMAGE_COL`] is the only payload column.
-const WIDE_SLOT: usize = 0;
+const IMAGE_SLOT: usize = 0;
 const ORDINAL_BYTES: usize = ORDINAL_COL.size() as usize;
 // [`AviBake::prefix`] stores the ordinal as one bare byte.
 const _: () = assert!(ORDINAL_BYTES == 1);
@@ -51,6 +51,7 @@ pub struct AviBake {
     aggs: Vec<AviAgg>,
     /// Width of the value slot, shared by every ordinal.
     value_bytes: usize,
+    has_wide: bool,
 }
 
 impl AviBake {
@@ -72,21 +73,23 @@ impl AviBake {
             return Ok(None);
         }
         let has_wide = aggs.iter().any(|a| matches!(a.spec.kind, ImageKind::Wide(_)));
+        let has_payload = aggs.iter().any(|a| !has_fixed_image(a.spec.kind));
         let suffix = [ORDINAL_COL, image_slot_col(has_wide)];
         let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &suffix)?;
         let mut b = crate::schema::DerivedSchema::new();
         super::super::group_key::push_group_index_key(&mut b, &key_packer, &suffix);
-        if has_wide {
+        if has_payload {
             b.push(IMAGE_COL)
                 .expect("one payload column fits behind a PK-only schema");
         }
         let schema = b.finish();
-        debug_assert!(!has_wide || schema.try_payload_idx(schema.num_columns() - 1) == Some(WIDE_SLOT));
+        debug_assert!(!has_payload || schema.try_payload_idx(schema.num_columns() - 1) == Some(IMAGE_SLOT));
         Ok(Some(AviBake {
             schema,
             key_packer,
             aggs,
             value_bytes: suffix[1].size() as usize,
+            has_wide,
         }))
     }
 
@@ -123,13 +126,13 @@ impl AviBake {
                 acc.reset();
                 continue;
             }
-            match a.spec.kind {
-                ImageKind::Scalar(_) => acc.seed_from_index(&cur.current_pk_bytes()[prefix_len..]),
-                ImageKind::Wide(_) => {
-                    let (src, row) = cur.current_row_source();
-                    acc.seed_from_index(payload_bytes(src, row, WIDE_SLOT));
-                }
-            }
+            let image = if has_fixed_image(a.spec.kind) {
+                &cur.current_pk_bytes()[prefix_len..]
+            } else {
+                let (src, row) = cur.current_row_source();
+                payload_bytes(src, row, IMAGE_SLOT)
+            };
+            acc.seed_from_index(image);
         }
     }
 }
@@ -140,11 +143,20 @@ impl AviBake {
 
 /// The index entries `delta` contributes, each at its row's weight, unsorted.
 pub fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
+    if bake.has_wide {
+        avi_entries::<true>(delta, bake)
+    } else {
+        avi_entries::<false>(delta, bake)
+    }
+}
+
+/// Without wide ordinals, the (never-taken) wide arm stays out of the loop.
+fn avi_entries<const HAS_WIDE: bool>(delta: &Batch, bake: &AviBake) -> Batch {
     let mb = delta.as_mem_batch();
     let mut out = Batch::with_capacity(&bake.schema, (delta.count * bake.aggs.len()).max(1));
 
     let mut key = [0u8; MAX_PK_BYTES];
-    let (mut image, mut scratch) = (Vec::new(), [0u8; 16]);
+    let mut image = Vec::new();
     for row in 0..delta.count {
         let weight = mb.get_weight(row);
         if weight == 0 {
@@ -152,27 +164,83 @@ pub fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
         }
         bake.key_packer.pack_prefix(&mut key, &mb, row);
         for (j, a) in bake.aggs.iter().enumerate() {
+            let ExtremeSpec { loc, kind, max } = a.spec;
             // A NULL has no image: MIN/MAX skips it.
-            if a.spec.loc.is_null(&mb, row) {
+            if loc.is_null(&mb, row) {
                 continue;
             }
-            let ExtremeSpec { loc, kind, max } = a.spec;
             match kind {
                 ImageKind::Scalar(kind) => {
-                    let av = scalar_image(&loc, kind, max, &mb, row).to_be_bytes();
-                    out.push_zero_filled_row(bake.entry(&mut key, j as u8, &av), weight, 0);
+                    let image = scalar_image(&loc, kind, max, &mb, row).to_be_bytes();
+                    out.push_zero_filled_row(bake.entry(&mut key, j as u8, &image), weight, 0);
                 }
                 ImageKind::Wide(kind) => {
-                    image.clear();
-                    append_wide_image(kind, max, wide_native(&loc, kind, &mb, row, &mut scratch), &mut image);
-                    out.begin_row(bake.entry(&mut key, j as u8, &image), weight);
-                    out.extend_col_blob(WIDE_SLOT, &image);
-                    out.commit_row(0);
+                    let entry = WideEntry {
+                        bake,
+                        ord: j as u8,
+                        loc: &loc,
+                        kind,
+                        max,
+                        mb: &mb,
+                        row,
+                        weight,
+                    };
+                    if HAS_WIDE {
+                        entry.push(&mut out, &mut key, &mut image);
+                    } else {
+                        entry.push_outlined(&mut out, &mut key, &mut image);
+                    }
                 }
             }
         }
     }
     out
+}
+
+/// One wide ordinal's index entry for one row.
+struct WideEntry<'a> {
+    bake: &'a AviBake,
+    ord: u8,
+    loc: &'a ColumnLocator,
+    kind: WideKind,
+    max: bool,
+    mb: &'a MemBatch<'a>,
+    row: usize,
+    weight: i64,
+}
+
+impl WideEntry<'_> {
+    #[inline(always)]
+    fn push(&self, out: &mut Batch, key: &mut [u8], image: &mut Vec<u8>) {
+        let Self {
+            bake,
+            ord,
+            loc,
+            kind,
+            max,
+            mb,
+            row,
+            weight,
+        } = *self;
+        match kind {
+            WideKind::Fixed(tc) => {
+                let image = int16_image(loc, tc, max, mb, row);
+                out.push_zero_filled_row(bake.entry(key, ord, &image), weight, 0);
+            }
+            WideKind::Bytes => {
+                image.clear();
+                append_image(loc, ImageKind::Wide(kind), max, mb, row, image);
+                out.begin_row(bake.entry(key, ord, image), weight);
+                out.extend_col_blob(IMAGE_SLOT, image);
+                out.commit_row(0);
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn push_outlined(&self, out: &mut Batch, key: &mut [u8], image: &mut Vec<u8>) {
+        self.push(out, key, image)
+    }
 }
 
 #[cfg(test)]

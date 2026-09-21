@@ -4,9 +4,8 @@
 //! The workers return one concatenated `ZSetBatch` of per-worker partial reduce
 //! rows in the SyntheticFold layout the fold lowering declares:
 //! `[_group_pk U128 (hidden PK) | group cols | one partial per physical agg spec]`.
-//! [`FoldFinish::combine`] folds them into one row per group in place, by the
-//! partial-merge rule the view path's two-phase combine ships
-//! (`gnitz_wire::AggFunc::merge_func`). [`FoldFinish::apply`] then runs the two
+//! [`FoldFinish::combine`] folds them into one row per group in place.
+//! [`FoldFinish::apply`] then runs the two
 //! operators a grouped view runs over its reduce output — the HAVING filter and
 //! the finalize map, compiled as a view's are. Every output row keeps the
 //! engine's `_group_pk`, which makes a tied ORDER BY / LIMIT a function of the
@@ -53,7 +52,7 @@ impl FoldFinish {
     ) -> Result<FoldFinish, GnitzSqlError> {
         let merge = ops
             .into_iter()
-            .map(|op| match op.merge_func() {
+            .map(|op| match op {
                 WireAggFunc::Min => Some(Ordering::Less),
                 WireAggFunc::Max => Some(Ordering::Greater),
                 _ => None,

@@ -155,14 +155,24 @@ impl GroupOutKey {
         if self.kind == ReduceOutKey::PkPermutation {
             OutPk::Borrowed(mb.get_pk_bytes(row))
         } else {
-            OutPk::Narrow(NarrowPkOpk::new(self.group.key_row(mb, row), self.out_stride))
+            OutPk::Narrow(self.narrow_pk(self.group.key_row(mb, row)))
         }
+    }
+
+    /// The output PK of the group keyed `key`.
+    #[inline]
+    pub(super) fn narrow_pk(&self, key: u128) -> NarrowPkOpk {
+        debug_assert!(
+            self.kind != ReduceOutKey::PkPermutation,
+            "a permuted PK is the source's own"
+        );
+        NarrowPkOpk::new(key, self.out_stride)
     }
 
     /// `V₀`, the output PK of the empty group set's one group.
     #[inline]
     pub(super) fn ground_pk(&self) -> NarrowPkOpk {
-        NarrowPkOpk::new(gnitz_wire::global_group_key(), self.out_stride)
+        self.narrow_pk(gnitz_wire::global_group_key())
     }
 
     /// The group columns the output carries as its leading payload. Only a
@@ -174,6 +184,13 @@ impl GroupOutKey {
         } else {
             &[]
         }
+    }
+
+    /// [`Self::exemplar_locs`]' columns in an `output` row.
+    pub(super) fn carried_locs(&self, output: &SchemaDescriptor) -> Vec<ColumnLocator> {
+        (0..self.exemplar_locs().len())
+            .map(|pi| output.locate(output.payload_col_idx(pi)))
+            .collect()
     }
 
     /// `batch`'s groups as runs in ascending output-PK order.

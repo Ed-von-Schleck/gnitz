@@ -62,10 +62,8 @@ pub(super) fn lower_reduce(
     let reduced = if two_phase {
         // Each worker folds a partial; V₀'s owner merges them and seeds the ground row.
         let partials = cb.reduce_multi_local(node, &[], &specs, false);
-        let mut merge: Vec<AggDescriptor> = specs
-            .iter()
-            .zip(1..)
-            .map(|(d, col_idx)| AggDescriptor { agg_op: d.agg_op.merge_func(), col_idx })
+        let mut merge: Vec<AggDescriptor> = (1..=specs.len() as u32)
+            .map(|col_idx| AggDescriptor { agg_op: WireAggFunc::Sum, col_idx })
             .collect();
         merge.push(AggDescriptor::COUNT_STAR);
         cols.push((ColId::NONE, agg_col_def(WireAggFunc::Count, None, true)));

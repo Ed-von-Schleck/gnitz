@@ -21,6 +21,7 @@ pub(crate) enum AggFunc {
 pub(crate) fn agg_ops(
     func: AggFunc,
     arg: Option<&ColumnDef>,
+    ungrouped: bool,
 ) -> Result<(WireAggFunc, Option<WireAggFunc>), GnitzSqlError> {
     // `classify_agg_call` admits a wildcard only for COUNT(*).
     if func != AggFunc::Count && arg.is_none() {
@@ -39,8 +40,8 @@ pub(crate) fn agg_ops(
         AggFunc::Count => (count, None),
         AggFunc::Min => (WireAggFunc::Min, None),
         AggFunc::Max => (WireAggFunc::Max, None),
-        // A raw SUM reads 0, not NULL, once its last non-null row retracts.
-        AggFunc::Sum => (WireAggFunc::Sum, nullable.then_some(WireAggFunc::CountNonNull)),
+        // A raw SUM is 0 over no non-null row: its count says whether there was one.
+        AggFunc::Sum => (WireAggFunc::Sum, (nullable || ungrouped).then_some(count)),
         AggFunc::Avg => (WireAggFunc::Sum, Some(count)),
     };
     if let Some(c) = arg {

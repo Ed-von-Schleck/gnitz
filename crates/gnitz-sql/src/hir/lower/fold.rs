@@ -35,7 +35,7 @@ pub(crate) struct FoldPieces {
     pub(crate) having: Vec<BoundExpr>,
     /// The finalize projection in SELECT order: an expression over
     /// `partial_schema` and the output column it lands in. An aggregate's
-    /// finalize composite (AVG's divide, a nullable SUM's null gate) is *in* the
+    /// finalize composite (AVG's divide, a SUM's null gate) is *in* the
     /// expression, exactly as it is in the view path's finalize map — so the
     /// client finisher has no per-aggregate shape switch to keep in step.
     pub(crate) finalize: Vec<(BoundExpr, ColumnDef)>,

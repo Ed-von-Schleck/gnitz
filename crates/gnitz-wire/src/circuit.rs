@@ -58,7 +58,7 @@ wire_enum! {
 /// The `params` blob layout, folded into [`crate::SYS_SCHEMA_DIGEST`] rather
 /// than written into the blob: the digest is what refuses a stored
 /// `CIRCUIT_NODES` blob decoded under a new layout.
-pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 5;
+pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 6;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -73,45 +73,19 @@ wire_enum! {
         Min = 3,
         Max = 4,
         CountNonNull = 5,
-        /// `Sum` whose empty value is `0`: what merges partial counts.
-        SumZero = 6,
     }
 }
 
 impl AggFunc {
-    /// True iff `Agg(A + B) == Agg(A) + Agg(B)`, so a delta folds with no
-    /// history replay.
+    /// True iff `Agg(A + B) == Agg(A) + Agg(B)`: a delta folds with no history
+    /// replay, and the value over no rows is `0`.
     pub const fn is_linear(self) -> bool {
-        match self {
-            AggFunc::Count | AggFunc::Sum | AggFunc::CountNonNull | AggFunc::SumZero => true,
-            AggFunc::Min | AggFunc::Max => false,
-        }
-    }
-
-    /// True iff the aggregate of no rows is `0` rather than NULL.
-    pub const fn empty_renders_zero(self) -> bool {
-        match self {
-            AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => true,
-            AggFunc::Sum | AggFunc::Min | AggFunc::Max => false,
-        }
+        !matches!(self, AggFunc::Min | AggFunc::Max)
     }
 
     /// True iff a reduce's raw output column for this aggregate can hold NULL.
-    /// An aggregate over no rows is emitted only when every source value is
-    /// NULL, or as the ground row of an empty group set: an emptied group is
-    /// retracted, not emitted.
     pub const fn raw_output_nullable(self, src_nullable: bool, ungrouped: bool) -> bool {
-        !self.empty_renders_zero() && (src_nullable || ungrouped)
-    }
-
-    /// The aggregate that merges this aggregate's partial values.
-    pub fn merge_func(self) -> AggFunc {
-        match self {
-            AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => AggFunc::SumZero,
-            AggFunc::Sum => AggFunc::Sum,
-            AggFunc::Min => AggFunc::Min,
-            AggFunc::Max => AggFunc::Max,
-        }
+        !self.is_linear() && (src_nullable || ungrouped)
     }
 }
 
@@ -153,7 +127,7 @@ pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> Option<u8> {
     match func {
         AggFunc::Count | AggFunc::CountNonNull => Some(type_code::I64),
         // Adding two calendar values is meaningless.
-        AggFunc::Sum | AggFunc::SumZero => match TypeCode::try_from_u8(src_tc) {
+        AggFunc::Sum => match TypeCode::try_from_u8(src_tc) {
             Some(tc) if ScalarKind::from_type_code(tc).is_some() && !tc.is_temporal() => {
                 Some(crate::types::register_image_type(src_tc))
             }
