@@ -1,12 +1,6 @@
-//! Reopen-rebuild idempotency for derived relations.
-//!
-//! A secondary index is populated exactly once when the engine reopens, by
-//! whichever of the two paths applies: its shards reload when the manifest
-//! carries the committed checkpoint generation, and otherwise they are erased and
-//! the backfill re-derives them from the owner. Doing both would sum the loaded
-//! shards and the recompute, doubling every weight — so these tests read net
-//! weights, and the resume tests at the end read the rebuild *count* too, since
-//! a silent rebuild produces the same rows.
+//! Reopen idempotency for derived relations. A reopened index holds exactly one
+//! materialisation — reloaded from its checkpoint or refilled from its owner,
+//! never both — so these tests read net weights, not row sets.
 //!
 //! Views are *not* rebuilt at catalog open. `hook_relation_register` registers a
 //! view empty and never fills it, so a `CatalogEngine::open` in isolation
@@ -39,7 +33,7 @@ fn seed_base(engine: &mut CatalogEngine, name: &str) -> (i64, Vec<ColumnDef>) {
 }
 
 /// `public.base` seeded and flushed to shards, plus one non-unique secondary
-/// index on `val` that the live CREATE backfills. Returns the table id.
+/// index on `val`. Returns the table id.
 fn base_with_index(engine: &mut CatalogEngine) -> i64 {
     let (tid, _) = seed_base(engine, "public.base");
     engine.registry.checkpoint_base().unwrap();
@@ -76,7 +70,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
-    // Secondary index on val (backfills the N committed rows).
+    // Secondary index on val, filled from the N committed rows.
     engine.create_index("public.base", &["val"], false).unwrap();
 
     // Identity view over base. The circuit rows precede the VIEW_TAB row, the
@@ -97,7 +91,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     assert_eq!(
         sum_weights(base_entry.indexes()[0].cursor()),
         N,
-        "live CREATE INDEX must backfill the base rows exactly once"
+        "live CREATE INDEX must fill from the base rows exactly once"
     );
 
     engine.close();
@@ -190,52 +184,17 @@ fn index_rebuilds_across_chunk_boundary() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── backfill_all_indexes_rebuilds_exactly_once ──────────────────────────
-// The boot rebuild leaves a filled store alone: repeated calls never double a
-// weight, and every key still resolves to its source PK.
-#[test]
-fn backfill_all_indexes_rebuilds_exactly_once() {
-    let dir = temp_dir("backfill_all_indexes_once");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let tid = base_with_index(&mut engine);
-
-    // Reference invariant: every key resolves to its PK, total index weight == N
-    // (a doubled rebuild would sum to 2N with an identical row set).
-    let assert_index_intact = |engine: &mut CatalogEngine| {
-        for i in 0..N as u64 {
-            let hit = seek_by_index(engine, tid, &[1], &[(i * 10) as u128]).unwrap().0;
-            let row = hit.unwrap_or_else(|| panic!("val {} must resolve by index", i * 10));
-            assert_eq!(row.len(), 1, "one source row per distinct val");
-            assert_eq!(row.get_pk(0), i as u128, "val {} must resolve to PK {}", i * 10, i);
-        }
-        assert_eq!(
-            index_weight(engine, tid),
-            N,
-            "index must hold exactly one materialisation, not an additive rebuild"
-        );
-    };
-
-    assert_index_intact(&mut engine);
-
-    // The open's fill is in the store, so the rebuild has nothing to add.
-    engine.backfill_all_indexes().unwrap();
-    assert_index_intact(&mut engine);
-
-    // Idempotent across repeated calls.
-    engine.backfill_all_indexes().unwrap();
-    assert_index_intact(&mut engine);
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── Index checkpoint resume ─────────────────────────────────────────────
-// An index is derived state like a view's output store: the checkpoint's
-// ephemeral round publishes it with a generation-stamped manifest, and the next
-// open reloads it instead of re-deriving it from a full scan of the owner. The
-// verdict has two halves — the generation AND the topology — and both are pinned
-// below, by the rebuild *count* rather than the row set (see
-// `Table::resumed_from_checkpoint`).
+
+/// Whether `tid`'s index on `val` came back from its checkpoint.
+fn index_resumed(engine: &CatalogEngine, tid: i64) -> bool {
+    engine
+        .registry
+        .relation(tid)
+        .and_then(|r| r.index_on(&[1]))
+        .unwrap()
+        .resumed()
+}
 
 /// `base_with_index`, plus the state a completed checkpoint leaves behind:
 /// the recorded topology — at `recorded_workers` workers — and generation the
@@ -258,10 +217,6 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (i64, u64)
 }
 
 // ── index_rebuild_is_skipped_after_resume ───────────────────────────────
-// An index whose manifest carries the committed generation reloads its shards,
-// so the boot rebuild may not re-derive it — the full-slice scan this mechanism
-// exists to remove. A rebuild that ran anyway would show up twice over: in the
-// returned count, and (on top of the loaded shards) in doubled weights.
 #[test]
 fn index_rebuild_is_skipped_after_resume() {
     let dir = temp_dir("index_resume_skips_rebuild");
@@ -272,9 +227,8 @@ fn index_rebuild_is_skipped_after_resume() {
         engine.topology_matches() && engine.registry.resume_generation() == g,
         "a matching topology leaves the recovered generation as the whole verdict"
     );
-    assert_eq!(
-        engine.backfill_all_indexes().unwrap(),
-        0,
+    assert!(
+        index_resumed(&engine, tid),
         "a generation-valid index must resume from its checkpoint, not rebuild"
     );
     assert_eq!(
@@ -288,9 +242,8 @@ fn index_rebuild_is_skipped_after_resume() {
 }
 
 // ── index_rebuild_forced_by_topology_change ─────────────────────────────
-// The other half of the verdict: the checkpoint recorded four workers and this
-// boot launches one, so the generation still matches the manifest but the
-// topology does not, so the open erases the store and its rebuild fills it.
+// The checkpoint recorded four workers and this boot launches one: the
+// generation matches, the topology does not.
 #[test]
 fn index_rebuild_forced_by_topology_change() {
     let dir = temp_dir("index_resume_topology_change");
@@ -302,23 +255,13 @@ fn index_rebuild_forced_by_topology_change() {
         "a foreign topology must refuse every manifest"
     );
     assert!(
-        !engine
-            .registry
-            .relation(tid)
-            .and_then(|r| r.index_on(&[1]))
-            .unwrap()
-            .resumed(),
+        !index_resumed(&engine, tid),
         "a topology change must erase the index despite a matching generation"
     );
     assert_eq!(
         index_weight(&mut engine, tid),
         N,
         "the open's rebuild replaces the erased state, never adds to it"
-    );
-    assert_eq!(
-        engine.backfill_all_indexes().unwrap(),
-        0,
-        "the open already filled the store, so a second rebuild has nothing to do"
     );
 
     engine.close();

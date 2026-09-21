@@ -218,7 +218,7 @@ fn worker_boot_recovery(
 ) -> Result<HashMap<i64, Batch>, String> {
     // Before any other catalog work, and before the replay below, which
     // projects the tail into each index exactly once.
-    let rebuilt = catalog.open_stores(slot.rank, Residency::Worker)?;
+    let rebuilt = catalog.registry.open_stores(slot.rank, Residency::Worker)?;
     // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
     // every index resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {rebuilt} index(es)");

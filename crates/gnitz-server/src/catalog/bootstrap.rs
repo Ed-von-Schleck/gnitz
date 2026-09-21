@@ -77,20 +77,15 @@ impl CatalogEngine {
         Ok(UnreplayedCatalog(engine))
     }
 
-    /// Take rank `rank` as `residency`: open this process's stores and rebuild
-    /// every index that did not resume. Returns how many were rebuilt.
-    pub(crate) fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, String> {
-        self.registry.open_stores(rank, residency)?;
-        self.backfill_all_indexes()
-    }
-
     /// [`Self::open_master`] and its replay, then the rest of a store-owning
     /// boot, as a standalone host at rank 0.
     #[cfg(test)]
     pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
         let mut engine = Self::open_master(base_dir, num_workers)?.replay()?;
         engine.registry.reconcile_child_dirs()?;
-        engine.open_stores(0, Residency::Origin)?;
+        engine
+            .registry
+            .open_stores(0, gnitz_store::relation::Residency::Origin)?;
         Ok(engine)
     }
 

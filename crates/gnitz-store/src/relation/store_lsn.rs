@@ -2,15 +2,16 @@
 //! relayout and child-dir reclamation, view reset and rebuild start — and the
 //! flushed-LSN bookkeeping that recovery and the DDL zone allocator read.
 
-use super::{RelationKind, RelationRegistry, Residency, Store};
+use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex, Store};
 use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError};
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
 
-    /// Take rank `rank` of the launched count as `residency`, and open this
-    /// process's store for every relation and index.
-    pub fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<(), StoreError> {
+    /// Take rank `rank` of the launched count as `residency`, open this process's
+    /// store for every relation and index, and fill each index that did not resume.
+    /// Returns how many were filled.
+    pub fn open_stores(&mut self, rank: u32, residency: Residency) -> Result<usize, StoreError> {
         assert_eq!(
             self.residency,
             Residency::Master,
@@ -31,6 +32,8 @@ impl RelationRegistry {
             self.rebuild_relation_store(tid, "open store")?;
         }
         let (recovery, budgets) = (self.rederive_source(), self.store_budgets());
+        let chunk_rows = self.config.scan_chunk_rows;
+        let mut filled = 0usize;
         for entry in self.tables.values_mut() {
             let owner_dir = entry.directory().to_string();
             for ix in &mut entry.indexes {
@@ -47,6 +50,10 @@ impl RelationRegistry {
                     schema,
                 );
             }
+            let owner_id = entry.id();
+            let mut targets: Vec<&mut SecondaryIndex> = entry.indexes.iter_mut().filter(|ix| !ix.resumed()).collect();
+            filled += targets.len();
+            super::ingest::fill_indexes(&entry.store, chunk_rows, owner_id, &mut targets)?;
         }
         // A worker applies the same catalog deltas as the master, but only the
         // master writes `_sys/` shards.
@@ -57,7 +64,7 @@ impl RelationRegistry {
                 }
             }
         }
-        Ok(())
+        Ok(filled)
     }
 
     /// Rebuild `tid`'s store handle from its registered spec and install it, homed

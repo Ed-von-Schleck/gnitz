@@ -678,29 +678,6 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// The shared IDX_TAB registration guard: a base-table owner, returned for
-    /// the callers' schema/context reads.
-    ///
-    /// Only base tables can own a secondary index. The SQL binder rejects this
-    /// by name resolution; this rejects a raw wire push before the row is
-    /// persisted or broadcast.
-    pub(in crate::catalog) fn validate_index_registration(
-        &self,
-        owner_id: i64,
-    ) -> Result<&gnitz_store::relation::Relation, String> {
-        let entry = self
-            .registry
-            .relation(owner_id)
-            .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
-        if !entry.kind().is_base_table() {
-            return Err(format!(
-                "Index: owner {owner_id} is a {}; only a base table can be indexed",
-                entry.kind().noun()
-            ));
-        }
-        Ok(entry)
-    }
-
     /// Validate one family of a `DDL_TXN` before any of it is applied, so a
     /// rejection needs no compensation. Returns the sorted ids the delta drops.
     ///
@@ -928,7 +905,7 @@ impl CatalogEngine {
     /// The owner and column rules of a CREATE INDEX on `owner_id`, and the
     /// index schema they admit.
     pub(crate) fn validate_index_create(&self, owner_id: i64, cols: &[u32]) -> Result<SchemaDescriptor, String> {
-        let entry = self.validate_index_registration(owner_id)?;
+        let entry = self.registry.index_owner(owner_id)?;
         let idx_schema = make_index_schema(cols, &entry.schema()).map_err(|e| {
             format!(
                 "{e} for table '{}' (tid={owner_id})",

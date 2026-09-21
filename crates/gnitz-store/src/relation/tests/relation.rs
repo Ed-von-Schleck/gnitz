@@ -65,6 +65,19 @@ fn test_add_remove_index_circuit() {
     assert_eq!(registry.relation(50).unwrap().indexes().len(), 0);
 }
 
+#[test]
+fn a_master_creates_the_index_directory_it_opens_no_store_in() {
+    let mut registry = RelationRegistry::master(1, StoreConfig::default());
+    let schema = SchemaDescriptor::new(
+        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 2],
+        &[0],
+    );
+    let owner_dir = relation_test_dir("idx_master_dir");
+    register_entry(&mut registry, 50, schema, RelationKind::BaseTable, owner_dir.clone());
+    registry.add_index(50, 999, &[1], false).unwrap();
+    assert!(std::path::Path::new(&ChildAddr::Index { id: 999 }.dir(&owner_dir)).is_dir());
+}
+
 /// `UniquePreflight` hands `index_cols` its `arg1` raw, where `HasPk` would
 /// have read `0` through `probe_key_columns` as the relation's own PK store.
 /// Neither `0` nor a garbage non-zero word names a column list.

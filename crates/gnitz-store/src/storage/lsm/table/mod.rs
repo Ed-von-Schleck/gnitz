@@ -165,10 +165,7 @@ pub(crate) struct Table {
     current_lsn: u64,
 
     /// True when this open reloaded a generation-matching checkpointed manifest
-    /// instead of starting empty. The boot index rebuild skips a table that
-    /// reports true. Emptiness is not a substitute: a row with NULL in an
-    /// indexed column is not indexed at all, so an all-NULL slice yields a
-    /// legitimately empty index over a large owner.
+    /// instead of starting empty.
     resumed_from_checkpoint: bool,
 
     /// Set by [`Self::hold_in_ram`]: the RAM tier folds past its budget but never

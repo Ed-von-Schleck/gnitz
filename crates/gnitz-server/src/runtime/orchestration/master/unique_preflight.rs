@@ -196,29 +196,17 @@ async fn merge_index_scan(
 
 impl MasterDispatcher {
     /// Pre-flight global uniqueness check for CREATE UNIQUE INDEX, distributed:
-    /// each worker projects its committed partition to the indexed columns' OPK
-    /// leading-key spans, sorts them locally (byte-lexicographic), and streams
-    /// the SORTED spans back; the master runs a streaming k-way merge
-    /// (`merge_index_scan`) whose single adjacent-equal check catches both
-    /// within-partition and cross-partition duplicates. It is the ONLY
-    /// uniqueness check: `backfill_index` runs no local one — a partition-local
-    /// check cannot see a cross-partition duplicate, and its only way to reject
-    /// would be to fatally `_exit` the worker. Master memory is
-    /// `O(num_workers)` plus the (≤ cap) filter seed — never the table's
-    /// distinct-key cardinality.
-    ///
-    /// On success the index is safe to commit and broadcast and the returned
-    /// filter, when there is one, seeds the master's unique-filter cache; on
-    /// failure the caller returns a client error and never broadcasts, so no
-    /// worker reaches the fatal `DdlSync` backfill path.
+    /// each worker streams its committed partition's indexed-column OPK spans
+    /// back sorted, and the master's streaming k-way merge (`merge_index_scan`)
+    /// finds any adjacent equal pair, within or across partitions — which no
+    /// worker's own slice can show. Master memory is `O(num_workers)` plus the (≤ cap) filter seed.
     ///
     /// MUST run inside the DDL critical section (committer barrier drained,
-    /// catalog write lock held) and BEFORE the IDX_TAB +1 is appended/broadcast,
-    /// so the scanned snapshot is exactly the data each worker will later
-    /// backfill and no concurrent INSERT can be ordered between the snapshot and
-    /// the backfill.
+    /// catalog write lock held) and BEFORE the IDX_TAB +1 is appended, so the
+    /// scanned snapshot is exactly what each worker fills the index from.
     ///
-    /// `None` when the index covers the owner's PK and so can never collide.
+    /// `Some(filter)` seeds the master's unique-filter cache; `None` when the
+    /// index covers the owner's PK and so can never collide.
     pub async fn validate_unique_index_create(
         &self,
         owner_id: i64,

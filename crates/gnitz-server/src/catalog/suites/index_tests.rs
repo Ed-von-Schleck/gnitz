@@ -2,11 +2,11 @@ use super::*;
 use gnitz_store::schema::{make_index_schema, IndexKeySpec};
 use gnitz_wire::MAX_PK_BYTES;
 
-// ── test_index_creation_and_backfill ────────────────────────────────────
+// ── test_index_creation_and_fill ────────────────────────────────────────
 
 #[test]
-fn test_index_creation_and_backfill() {
-    let dir = temp_dir("index_backfill");
+fn test_index_creation_and_fill() {
+    let dir = temp_dir("index_fill");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
@@ -57,7 +57,7 @@ fn test_index_live_fanout() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
 
-    // Create index — should backfill 5 rows
+    // Create index — fills from the 5 rows
     engine.create_index("public.tfanout", &["val"], false).unwrap();
 
     // Live fan-out: ingest 1 more row via ingest_to_family (which does index projection)
@@ -102,69 +102,67 @@ fn test_create_index_duplicate_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A failed index registration must NOT enqueue a negative-weight IDX_TAB
-/// broadcast: the `+1` was never broadcast, so a `-1` would orphan a row on the
-/// workers. The failure is injected — a seam reads its variable once per
-/// process, hence the re-exec'd child.
+/// A CREATE INDEX whose hook fails leaves nothing behind, and broadcasts no `-1`
+/// for the `+1` it never sent.
 #[test]
-fn test_index_registration_failure_no_broadcast_poisoning() {
-    let out = crate::test_support::run_test_in_child(
-        module_path!(),
-        "test_index_registration_failure_no_broadcast_poisoning_internal",
-        &[("GNITZ_INJECT_INDEX_BACKFILL_ERROR", "1")],
-    );
-    crate::test_support::assert_child_ok(&out, "the injected backfill fault must roll back cleanly");
-}
-
-#[test]
-fn test_index_registration_failure_no_broadcast_poisoning_internal() {
-    if !crate::test_support::in_child_test() {
-        return;
-    }
+fn test_failed_create_index_rolls_back() {
     let (mut engine, tid, dir) = table_fixture(
-        "idx_broadcast_poison",
+        "failed_create_index_rollback",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry.checkpoint_base().unwrap();
-
-    // Clear broadcasts accumulated by table/column creation + ingest.
     let _ = engine.drain_pending_broadcasts();
 
     // The id `create_index` is about to allocate.
     let failed_idx_id = engine.next_id;
+    // A file where the index directory goes.
+    let blocker = ChildAddr::Index { id: failed_idx_id }.dir(&relation_dir(&dir, RelationKind::BaseTable, tid));
+    fs::write(&blocker, b"not a directory").unwrap();
+    let idx_name = make_secondary_index_name("public", "t", "val");
+
     assert!(
         engine.create_index("public.t", &["val"], true).is_err(),
-        "the injected backfill fault must fail the create"
+        "a blocked index directory must fail the create"
+    );
+    assert!(
+        std::path::Path::new(&blocker).is_file(),
+        "a path the create did not make survives its rollback"
+    );
+    assert!(
+        engine.registry.relation(tid).unwrap().indexes().is_empty(),
+        "no half-built index may stay registered"
+    );
+    assert!(
+        !engine.caches.index_by_name.contains_key(idx_name.as_str()),
+        "index_by_name must not retain a ghost entry"
     );
     assert_eq!(
         idx_weights_for(&engine, failed_idx_id),
         Vec::<i64>::new(),
-        "a failed registration must leave no stored weight under its id"
+        "a failed create must leave no stored weight under its id"
     );
-
-    // No IDX_TAB broadcast may carry a negative weight for the failed index.
-    let broadcasts = engine.drain_pending_broadcasts();
-    for (family, batch) in &broadcasts {
+    for (family, batch) in &engine.drain_pending_broadcasts() {
         if *family == SysFamily::Index {
-            for i in 0..batch.len() {
-                assert!(
-                    batch.get_weight(i) >= 0,
-                    "no negative-weight IDX_TAB broadcast may be enqueued on rollback"
-                );
-            }
+            assert!(
+                (0..batch.len()).all(|i| batch.get_weight(i) >= 0),
+                "no negative-weight IDX_TAB broadcast may be enqueued on rollback"
+            );
         }
     }
 
+    // The failed attempt does not block a later index on the same column.
+    fs::remove_file(&blocker).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+    assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
+
     engine.close();
     let _ = fs::remove_dir_all(&dir);
-    println!("{}", crate::test_support::CHILD_OK);
 }
 
 // ── seek_by_index tests ──────────────────────────────────────────
@@ -658,78 +656,6 @@ fn test_compound_pk_secondary_index_retract() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// `apply_index_caches` runs before `hook_index_register`, so a hook failure
-/// leaves the name cache already mutated. The rollback must reverse it, or the
-/// cache points at a ghost index.
-#[test]
-fn test_failed_index_registration_rolls_back_cleanly() {
-    let out = crate::test_support::run_test_in_child(
-        module_path!(),
-        "test_failed_index_registration_rolls_back_cleanly_internal",
-        &[("GNITZ_INJECT_INDEX_BACKFILL_ERROR", "1")],
-    );
-    crate::test_support::assert_child_ok(&out, "a failed registration must leave no ghost cache entry");
-}
-
-#[test]
-fn test_failed_index_registration_rolls_back_cleanly_internal() {
-    if !crate::test_support::in_child_test() {
-        return;
-    }
-    let (mut engine, tid, dir) = table_fixture(
-        "unique_idx_rollback",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
-    );
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(42);
-    bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry.checkpoint_base().unwrap();
-
-    let idx_name = make_secondary_index_name("public", "t", "val");
-    // The id `create_index` is about to allocate.
-    let failed_idx_id = engine.next_id;
-
-    let result = engine.create_index("public.t", &["val"], true);
-    assert!(result.is_err(), "the injected backfill fault must fail the create");
-
-    // All catalog-visible state must have reverted: the ghost name/id
-    // entries created by apply_index_by_{name,id} are the thing the
-    // rollback is responsible for sweeping up.
-    assert!(
-        !engine.caches.index_by_name.contains_key(idx_name.as_str()),
-        "index_by_name must not retain a ghost entry after rollback"
-    );
-    assert!(
-        !engine
-            .registry
-            .relation_or_err(tid)
-            .ok()
-            .unwrap()
-            .indexes()
-            .iter()
-            .any(|ic| ic.cols().as_slice() == [1]),
-        "DAG must not retain a half-built index circuit"
-    );
-    assert_eq!(
-        idx_weights_for(&engine, failed_idx_id),
-        Vec::<i64>::new(),
-        "sys_indices must net out to zero after rollback"
-    );
-
-    // The failed attempt must not block a later successful, non-unique index
-    // on the same column.
-    engine.create_index("public.t", &["val"], false).unwrap();
-    assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-    println!("{}", crate::test_support::CHILD_OK);
-}
-
 // ── seek_by_index orphaned-entry infinite-loop guard ─────────────────────
 //
 // An orphaned index entry (positive weight, no matching source row) must
@@ -856,17 +782,6 @@ fn circuit_unique(engine: &CatalogEngine, tid: i64, col: u32) -> Option<bool> {
         .map(SecondaryIndex::is_unique)
 }
 
-/// Count `idx_*` sub-directories under a table directory.
-fn count_idx_dirs(tbl_dir: &str) -> usize {
-    std::fs::read_dir(tbl_dir)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("idx_"))
-                .count()
-        })
-        .unwrap_or(0)
-}
-
 /// Registered through `ddl_sync`, an FK column's circuit has no IDX_TAB row and
 /// outlives the UNIQUE index that promoted it.
 #[test]
@@ -973,55 +888,6 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A create_index whose hook fails must drain the pre-staged index directory,
-/// leaving no orphan `idx_*` dir on disk.
-#[test]
-fn test_failed_create_index_leaves_no_directory() {
-    let out = crate::test_support::run_test_in_child(
-        module_path!(),
-        "test_failed_create_index_leaves_no_directory_internal",
-        &[("GNITZ_INJECT_INDEX_BACKFILL_ERROR", "1")],
-    );
-    crate::test_support::assert_child_ok(&out, "a failed create_index must leave no index directory");
-}
-
-#[test]
-fn test_failed_create_index_leaves_no_directory_internal() {
-    if !crate::test_support::in_child_test() {
-        return;
-    }
-    let (mut engine, tid, dir) = table_fixture(
-        "failed_create_index_dir",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
-    );
-    let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(9);
-    bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry.checkpoint_base().unwrap();
-
-    let tbl_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
-    // The id `create_index` is about to allocate.
-    let failed_idx_id = engine.next_id;
-    assert!(engine.create_index("public.t", &["val"], true).is_err());
-    assert_eq!(
-        count_idx_dirs(&tbl_dir),
-        0,
-        "a failed create_index must leave no index directory behind"
-    );
-    assert_eq!(
-        idx_weights_for(&engine, failed_idx_id),
-        Vec::<i64>::new(),
-        "a failed create_index must leave no stored weight under its id"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-    println!("{}", crate::test_support::CHILD_OK);
-}
-
 #[test]
 fn test_drop_index_permitted_on_lone_pk_target() {
     // A redundant unique index on a lone-PK column that is an FK target may be
@@ -1083,14 +949,12 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── chunked index backfill ────────────────────────────────────────────────
+// ── chunked index fill ───────────────────────────────────────────────────
 //
-// The index backfill scans the owner chunk-wise (`drain_chunk`); shrink
-// `scan_chunk_rows` so a handful of rows spans several chunks. Duplicate
-// rejection belongs to the master's pre-flight, which no in-process engine runs.
+// A small `scan_chunk_rows` spreads a handful of rows over several chunks.
 
 #[test]
-fn test_unique_index_chunked_backfill_distinct_succeeds() {
+fn test_unique_index_chunked_fill_distinct_succeeds() {
     // Every row must be projected exactly once across several chunks.
     let (mut engine, tid, dir) = table_fixture(
         "unique_idx_chunked_ok",
@@ -1115,7 +979,7 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
     assert_eq!(
         count_records(entry.indexes()[0].cursor()),
         10,
-        "chunked backfill must project every row exactly once"
+        "a chunked fill must project every row exactly once"
     );
 
     engine.close();

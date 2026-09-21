@@ -247,62 +247,13 @@ impl CatalogEngine {
             let (owner_id, cols, props) =
                 read_idx_tab_row(batch, i).map_err(|rule| format!("index {idx_id}: column list {rule}"))?;
             if batch.get_weight(i) > 0 {
-                self.register_index(idx_id, owner_id, &cols, props.is_unique)?;
+                self.registry
+                    .add_index(owner_id, idx_id, cols.as_slice(), props.is_unique)?;
             } else {
                 self.unregister_index(owner_id, cols.as_slice());
             }
         }
         Ok(())
-    }
-
-    /// Enter an index circuit for a `+1` IDX_TAB row — which opens this
-    /// process's store — and fill it: the `+1` half of
-    /// [`Self::hook_index_register`].
-    ///
-    /// One circuit per column list (dedup by ordered list). An incumbent circuit
-    /// means no second store is opened, but a UNIQUE newcomer over a non-unique
-    /// incumbent promotes it. Promotion is order-independent — the circuit is
-    /// unique iff ANY index on the column list is unique — so replay reconstructs
-    /// an identical result whatever order the index ids arrive in.
-    fn register_index(&mut self, idx_id: i64, owner_id: i64, cols: &PkColList, is_unique: bool) -> Result<(), String> {
-        // Boot replay and worker ddl_sync reach this hook without
-        // `precheck_family`, so re-run the shared registration guards here (see
-        // `validate_index_registration`). Resolve the owner entry once for
-        // everything below.
-        let entry = self.validate_index_registration(owner_id)?;
-
-        if let Some(was_unique) = entry.index_on(cols.as_slice()).map(|ic| ic.is_unique()) {
-            // No second store: the index schema does not depend on `is_unique`,
-            // and the duplicate check is the master's pre-flight, already run.
-            if is_unique && !was_unique {
-                self.registry.set_index_unique(owner_id, cols.as_slice(), true);
-            }
-            return Ok(());
-        }
-
-        let idx_dir = self
-            .registry
-            .index_dir(owner_id, idx_id)
-            .expect("the owner resolved above");
-        let cols = *cols;
-
-        // `add_index` bounds-checks every column: a crafted wire row could name an
-        // out-of-range or ineligible one.
-        staged_dir(&idx_dir, || {
-            self.registry.add_index(owner_id, idx_id, cols.as_slice(), is_unique)?;
-            // A store-owning process fills the index from its own base slice; the
-            // master holds neither.
-            if self.registry.residency().owns_stores() {
-                if let Err(e) = self.backfill_index(owner_id, cols.as_slice()) {
-                    // The circuit was entered before the backfill so the
-                    // projection could ingest through it; a failed CREATE INDEX
-                    // leaves no circuit. `staged_dir` reclaims its directory.
-                    self.registry.remove_index(owner_id, cols.as_slice());
-                    return Err(e);
-                }
-            }
-            Ok(())
-        })
     }
 
     /// Demote or destroy `owner_id`'s circuit on `cols` after a `-1` IDX_TAB row. It

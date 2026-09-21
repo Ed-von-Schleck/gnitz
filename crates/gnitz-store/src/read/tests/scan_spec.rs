@@ -179,8 +179,7 @@ fn an_out_of_range_index_column_is_rejected_without_an_index() {
 /// decline: it names no range column, so it is refused.
 #[test]
 fn a_malformed_range_on_an_index_walk_is_rejected() {
-    let mut r = rows_fixture("index_malformed", 4, 1);
-    r.add_index(TID, TID + 1, &[1], false).unwrap();
+    let mut r = walk_fixture("index_malformed", true);
     let spec = ReadSpec {
         bound: ReadBound::IndexRange(IndexBound {
             idx_cols: PkColList::from_slice(&[1]),
@@ -225,7 +224,7 @@ fn walk_fixture(name: &str, indexed: bool) -> RelationRegistry {
     registry
         .register(RelationSpec {
             id: TID,
-            kind: RelationKind::View,
+            kind: RelationKind::BaseTable,
             schema,
             directory: crate::test_support::scratch_dir("read", name),
             props: ViewProps::default(),

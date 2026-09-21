@@ -27,7 +27,6 @@ mod bootstrap;
 mod cache;
 mod constraints;
 mod hooks;
-mod index_backfill;
 mod precheck;
 mod registry;
 mod schema_block;
@@ -44,7 +43,7 @@ use std::fs;
 use std::rc::Rc;
 
 use crate::query::DagEngine;
-use gnitz_store::relation::{Relation, RelationKind, RelationRegistry, RelationSpec, Residency, StoreConfig};
+use gnitz_store::relation::{Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig};
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, ReadCursor, StoreError, StoredRow};
 use gnitz_wire::ViewProps;
@@ -80,7 +79,7 @@ pub(in crate::catalog) use gnitz_store::storage::ChildAddr;
 // The relation rung's directory primitives; the catalog only consumes them.
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_store::relation::relations_dir;
-pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, relation_dir, staged_dir, DIR_LOCK_RETRY_FOR};
+pub(in crate::catalog) use gnitz_store::relation::{lock_data_dir, relation_dir, DIR_LOCK_RETRY_FOR};
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
 pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;

@@ -32,7 +32,7 @@ pub fn relation_dir(base_dir: &str, kind: RelationKind, id: i64) -> String {
 /// only when `f` is what created it, which is observed rather than declared. A
 /// directory that was already there holds an existing relation's rows, and a
 /// caller that creates none neither cleans up nor syncs.
-pub fn staged_dir<T, E>(dir: &str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+pub(crate) fn staged_dir<T, E>(dir: &str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     let existed = std::path::Path::new(dir).exists();
     let out = f();
     if existed || !std::path::Path::new(dir).exists() {
@@ -47,7 +47,7 @@ pub fn staged_dir<T, E>(dir: &str, f: impl FnOnce() -> Result<T, E>) -> Result<T
     out
 }
 
-pub fn ensure_dir(path: &str) -> Result<(), StoreError> {
+pub(crate) fn ensure_dir(path: &str) -> Result<(), StoreError> {
     // `create_dir_all` already succeeds on an existing directory; the only
     // `AlreadyExists` it reports is a non-directory blocking the path, which is
     // a genuine failure.
@@ -106,17 +106,6 @@ pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::F
 }
 
 impl RelationRegistry {
-    /// `<owner's directory>/idx_<index_id>` — the one name this registry gives an
-    /// index's directory. `None` for an unregistered owner.
-    ///
-    /// By id and not by column list, because the directory is named before the
-    /// index it belongs to is entered — and because a promoted index outlives the
-    /// row that named it, so only the *creating* id spells the path on disk.
-    pub fn index_dir(&self, owner: i64, index_id: i64) -> Option<String> {
-        self.relation(owner)
-            .map(|e| ChildAddr::Index { id: index_id }.dir(e.directory()))
-    }
-
     /// Drop `id`'s entry and erase this process's store directory for it.
     pub fn unregister_and_erase(&mut self, id: i64) {
         let Some(dir) = self.relation(id).map(|e| e.directory().to_string()) else {
@@ -164,3 +153,7 @@ impl RelationRegistry {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/dirs.rs"]
+mod tests;

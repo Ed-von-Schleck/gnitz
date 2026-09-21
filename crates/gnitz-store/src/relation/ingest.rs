@@ -1,10 +1,9 @@
 //! The ingestion pipeline: unique-PK enforcement, store + secondary-index
 //! application, delta capture, and the flush / checkpoint table collection.
 
-use super::{Relation, RelationKind, RelationRegistry};
+use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StorageError, StoreError, Table};
-use gnitz_wire::PkColList;
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
@@ -19,6 +18,35 @@ fn inject_ingest_apply_error(which: &str, kind: RelationKind, r: Result<(), Stor
         return Err(StorageError::Io(libc::EIO));
     }
     r
+}
+
+/// Fill each of `targets`, all empty, from one chunked scan of `owner`, `owner_id`'s store.
+pub(super) fn fill_indexes(
+    owner: &Store,
+    chunk_rows: usize,
+    owner_id: i64,
+    targets: &mut [&mut SecondaryIndex],
+) -> Result<(), StoreError> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    for ix in targets.iter() {
+        assert_eq!(
+            ix.store.estimated_rows(),
+            0,
+            "index {} of relation {owner_id} is already populated",
+            ix.index_id
+        );
+    }
+    let mut source = owner.cursor();
+    while let Some(chunk) = source.drain_chunk(chunk_rows) {
+        for ix in targets.iter_mut() {
+            let index_id = ix.index_id;
+            ix.project_and_ingest(&chunk)
+                .map_err(|e| StoreError::storage(format!("fill index {index_id} of relation {owner_id}"), e))?;
+        }
+    }
+    Ok(())
 }
 
 impl RelationRegistry {
@@ -146,33 +174,6 @@ impl RelationRegistry {
             );
         }
         Ok(echo)
-    }
-
-    /// One chunked scan of `owner_id`'s own slice, each chunk projected into
-    /// every index on `targets` and ingested through it. Peak memory is
-    /// O(chunk × row_width).
-    ///
-    /// No seam: this fills an index that holds no rows yet, where the push
-    /// path's fault reporting would abort a boot rebuild.
-    pub fn project_into_indexes(&mut self, owner_id: i64, targets: &[PkColList]) -> Result<(), StoreError> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-        let chunk_rows = self.config.scan_chunk_rows;
-        // The cursor owns its runs by `Rc`, so the entry is resolved once below
-        // rather than per chunk.
-        let Some(mut handle) = self.relation(owner_id).map(Relation::cursor) else {
-            return Ok(());
-        };
-        let entry = self.relation_mut_or_err(owner_id)?;
-        while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-            for ix in entry.indexes.iter_mut().filter(|ix| targets.contains(&ix.cols)) {
-                let index_id = ix.index_id;
-                ix.project_and_ingest(&chunk)
-                    .map_err(|e| StoreError::storage(format!("fill index {index_id} of relation {owner_id}"), e))?;
-            }
-        }
-        Ok(())
     }
 
     // ── Flush / checkpoint collection ───────────────────────────────────

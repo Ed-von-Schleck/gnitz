@@ -247,14 +247,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, data: &[u8]) -
     }
 
     // Pre-flight global uniqueness for every unique secondary index in this
-    // bundle BEFORE reserving the zone LSN or mutating the catalog, so a
-    // violation needs no rollback — it just surfaces to the client. This runs
-    // before the ingest loop, so for a table created in the same bundle the owner
-    // is not yet in the registry and `validate_unique_index_create`
-    // short-circuits to an empty filter (sound: the new table is empty, and
-    // hook_index_register's own owner-check still succeeds later in the loop). The
-    // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
-    // `create_index` and read identically by `hook_index_register`.
+    // bundle before reserving the zone LSN or mutating the catalog, so a
+    // violation needs no rollback.
     let mut filter_seeds: Vec<(i64, PkColList, UniqueFilter)> = Vec::new();
     for (owner_id, cols) in indices
         .creates

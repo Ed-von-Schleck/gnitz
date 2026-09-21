@@ -25,7 +25,8 @@ mod store_lsn;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
-pub use dirs::{ensure_dir, lock_data_dir, relation_dir, relations_dir, staged_dir, DIR_LOCK_RETRY_FOR};
+pub(crate) use dirs::{ensure_dir, staged_dir};
+pub use dirs::{lock_data_dir, relation_dir, relations_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store::Store;
 
 // ---------------------------------------------------------------------------
@@ -47,8 +48,7 @@ pub struct SecondaryIndex {
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
     /// the owner — [`RelationRegistry::swap_schema`] rejects any descriptor that
     /// would not leave it valid.
-    /// Deliberately does NOT bake in `is_unique` (live promotion/demotion via
-    /// `set_index_unique`); consumers filter on the live flag.
+    /// Excludes `is_unique`, which changes while the index lives.
     key_spec: crate::schema::IndexKeySpec,
     is_unique: bool,
     /// Whether `cols` covers the owner's PK, so the index can never collide.
@@ -111,11 +111,6 @@ impl SecondaryIndex {
     /// manifest at its open.
     pub fn resumed(&self) -> bool {
         self.store.resumed_from_checkpoint()
-    }
-
-    /// Rows this process's store estimates it holds; `0` where it holds none.
-    pub fn estimated_rows(&self) -> usize {
-        self.store.estimated_rows()
     }
 }
 
@@ -517,51 +512,52 @@ impl RelationRegistry {
         self.tables.remove(&id);
     }
 
-    /// Enter a secondary index on `owner` over `cols` and open this process's
-    /// store for it under `<owner dir>/idx_<index_id>/w{rank}of{n}`. The index
-    /// directory is created on every process, so the master — which opens no
-    /// user store — still owns the path a later DROP removes.
+    /// Enter a secondary index on `owner` over `cols`, filled from this process's
+    /// slice of the owner, or promote the one already on `cols` to unique. On
+    /// `Err` nothing is entered. `is_unique` is trusted: a duplicate can straddle
+    /// two workers' slices, so only the caller can check it.
     pub fn add_index(&mut self, owner: i64, index_id: i64, cols: &[u32], is_unique: bool) -> Result<(), StoreError> {
         let (owner_schema, owner_dir) = {
-            let e = self.relation_or_err(owner)?;
-            if e.index_on(cols).is_some() {
-                return Err(StoreError::rejected(format!(
-                    "table {owner} already carries an index on {cols:?}"
-                )));
-            }
+            let e = self.index_owner(owner)?;
             (e.schema(), e.directory.clone())
         };
+        if let Some(ix) = self.relation_mut(owner).and_then(|e| e.index_on_mut(cols)) {
+            ix.is_unique |= is_unique;
+            return Ok(());
+        }
         let (key_spec, index_schema) =
             crate::schema::index_spec_and_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
         let idx_dir = ChildAddr::Index { id: index_id }.dir(&owner_dir);
-        ensure_dir(&idx_dir)?;
-        let store = match self.residency.owns_stores() {
-            false => Store::detached(index_schema),
-            true => Store::owned(
-                Self::open_index_table(
-                    self.slot,
-                    self.rederive_source(),
-                    self.store_budgets(),
-                    &idx_dir,
-                    index_id,
+        let chunk_rows = self.config.scan_chunk_rows;
+        staged_dir(&idx_dir, || {
+            ensure_dir(&idx_dir)?;
+            let store = match self.residency.owns_stores() {
+                false => Store::detached(index_schema),
+                true => Store::owned(
+                    Self::open_index_table(
+                        self.slot,
+                        RecoverySource::Rederive { resume_at: None },
+                        self.store_budgets(),
+                        &idx_dir,
+                        index_id,
+                        index_schema,
+                    )?,
                     index_schema,
-                )?,
-                index_schema,
-            ),
-        };
-        self.tables
-            .get_mut(&owner)
-            .expect("resolved above")
-            .indexes
-            .push(SecondaryIndex {
+                ),
+            };
+            let mut ix = SecondaryIndex {
                 cols: PkColList::from_slice(cols),
                 index_id,
                 store,
                 key_spec,
                 is_unique,
                 covers_pk: owner_schema.covers_pk(cols),
-            });
-        Ok(())
+            };
+            let entry = self.tables.get_mut(&owner).expect("resolved above");
+            ingest::fill_indexes(&entry.store, chunk_rows, owner, &mut [&mut ix])?;
+            entry.indexes.push(ix);
+            Ok(())
+        })
     }
 
     /// This process's store of one index: at `slot`'s child of `idx_dir`, under
@@ -658,6 +654,18 @@ impl RelationRegistry {
     /// client reads.
     pub fn relation_or_err(&self, id: i64) -> Result<&Relation, StoreError> {
         self.relation(id).ok_or_else(|| Self::unregistered(id))
+    }
+
+    /// `owner`, if it may carry a secondary index: only a base table can.
+    pub fn index_owner(&self, owner: i64) -> Result<&Relation, StoreError> {
+        let e = self.relation_or_err(owner)?;
+        if !e.kind().is_base_table() {
+            return Err(StoreError::rejected(format!(
+                "Index: owner {owner} is a {}; only a base table can be indexed",
+                e.kind().noun()
+            )));
+        }
+        Ok(e)
     }
 
     /// [`Self::relation_or_err`] as `&mut`.

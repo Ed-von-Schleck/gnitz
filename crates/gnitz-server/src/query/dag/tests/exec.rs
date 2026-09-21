@@ -205,6 +205,7 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
         let keyed = engine.create_table("public.kt", &cols, &[0]).unwrap();
         engine.registry.reconcile_child_dirs().unwrap();
         engine
+            .registry
             .open_stores(rank, gnitz_store::relation::Residency::Worker)
             .unwrap();
 
