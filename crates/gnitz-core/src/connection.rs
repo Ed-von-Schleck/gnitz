@@ -17,12 +17,12 @@ use crate::protocol::transport::{Next, CONNECT_TIMEOUT};
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
-    encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, ClientTransport, ClientVerb, FkTarget,
-    ProtocolError, PushFamily, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
+    encode_ddl_txn, encode_frame, encode_push_txn, hello_handshake, ClientTransport, ClientVerb, ProtocolError,
+    PushFamily, Schema, WireConflictMode, WireFlags, WireStatus, ZSetBatch,
 };
 use gnitz_wire::control::{peek_control_block, ControlHeader, DecodedControl};
 use gnitz_wire::txn_frame;
-use gnitz_wire::{RelClass, RelDescriptorBlob, WireFault};
+use gnitz_wire::{RelClass, RelDescriptorBlob, RelIndex, WireFault};
 use lru::LruCache;
 
 /// Per-connection schema LRU capacity. Sized to comfortably hold a session's
@@ -60,7 +60,7 @@ pub struct RelDescriptor {
     /// A stream, or a view whose planner set [`gnitz_wire::VIEW_FLAG_PK_REPEATS`].
     pub pk_repeats: bool,
     pub schema: Arc<Schema>,
-    pub indexes: Vec<gnitz_wire::RelIndex>,
+    pub indexes: Vec<RelIndex>,
 }
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
@@ -250,8 +250,7 @@ pub enum Reply {
     Multi(Vec<ScanReply>),
     /// A PUSH or transaction ACK's LSN.
     Lsn(u64),
-    /// A RESOLVE: the descriptor, its schema FK-complete, or `None` when no such
-    /// relation exists.
+    /// A RESOLVE: the descriptor, or `None` when no such relation exists.
     Resolve(Option<Arc<RelDescriptor>>),
     /// An id allocation's base id.
     Id(u64),
@@ -1017,28 +1016,16 @@ fn complete_head(
     done.push((slot.id, result));
 }
 
-/// A RESOLVE train, as its terminal frame and the schema block it carried, as
-/// the descriptor, or `None` when no such relation exists.
-/// The descriptor's foreign keys are merged into the schema here:
-/// `batch_to_schema` rebuilds every column-layout fact but leaves the FK fields
-/// at 0, because a reference to *another* relation rides the descriptor.
-/// `decode` bounded every `col_idx` against this schema's column count.
+/// A RESOLVE train as its descriptor; `None` when the reply names no relation.
 fn resolve_descriptor(
     ctrl: DecodedControl,
     schema: Option<Arc<Schema>>,
 ) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
-    let ncols = schema.as_ref().map_or(0, |s| s.columns.len());
-    let Some(desc) = RelDescriptorBlob::decode(&ctrl.blob, ncols)? else {
+    if ctrl.hdr.target_id == 0 {
         return Ok(None);
-    };
-    let mut schema =
-        schema.ok_or_else(|| ClientError::ServerError("resolve reply carried no schema block".to_string()))?;
-    if !desc.fks.is_empty() {
-        let cols = &mut Arc::make_mut(&mut schema).columns;
-        for fk in &desc.fks {
-            cols[fk.col_idx as usize].fk = Some(FkTarget::Table { id: fk.fk_table_id, col: fk.fk_col_idx });
-        }
     }
+    let schema = schema.ok_or_else(|| ClientError::ServerError("resolve reply carried no schema block".to_string()))?;
+    let desc = RelDescriptorBlob::decode(&ctrl.blob)?;
     Ok(Some(Arc::new(RelDescriptor {
         tid: ctrl.hdr.target_id,
         class: desc.class,

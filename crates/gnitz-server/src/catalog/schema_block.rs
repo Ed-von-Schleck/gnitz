@@ -10,9 +10,10 @@
 //! join it there without forking the column projection.
 
 use super::{CatalogEngine, ColumnDef};
+use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
-use gnitz_wire::ColType;
+use gnitz_wire::{ColType, RelClass, RelDescriptorBlob, RelIndex};
 use std::rc::Rc;
 
 /// One [`SchemaBlockCol`] per column: the physical shape from `schema`, and the
@@ -85,5 +86,30 @@ impl CatalogEngine {
         let version = entry.schema_version.get();
         let block = (client_version != version).then(|| entry.schema_block.clone());
         (block, version)
+    }
+
+    /// What a RESOLVE of `tid` answers: its descriptor, and its named schema block with
+    /// that block's version. `None` for an unregistered id.
+    pub(crate) fn resolve_answer(&self, tid: i64) -> Option<(RelDescriptorBlob, Rc<Vec<u8>>, u16)> {
+        let rel = self.registry.relation(tid)?;
+        let entry = self.caches.relations.get(&tid)?;
+        let class = match rel.kind() {
+            RelationKind::Stream => RelClass::Stream,
+            RelationKind::View(props) => props.into(),
+            RelationKind::BaseTable | RelationKind::SystemCatalog => RelClass::Table,
+        };
+        let desc = RelDescriptorBlob {
+            class,
+            pk_repeats: entry.pk_repeats,
+            indexes: rel
+                .indexes()
+                .iter()
+                .map(|ic| RelIndex {
+                    cols: ic.cols(),
+                    is_unique: ic.is_unique(),
+                })
+                .collect(),
+        };
+        Some((desc, entry.schema_block.clone(), entry.schema_version.get()))
     }
 }

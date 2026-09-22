@@ -123,17 +123,17 @@ pub enum RelationKind {
     /// System catalog table: durable, single-partition, never rebuilt from
     /// upstream sources (it has none; recovery is LSN-gated SAL replay).
     SystemCatalog,
-    /// User base table: durable, partitioned, never rebuilt from upstream
+    /// User base table: durable, never rebuilt from upstream
     /// sources; owns a DML-enforced PK, so `enforce_unique_pk` runs on every
     /// ingest and its accumulated per-PK weight is always in {0, 1}.
     BaseTable,
-    /// Materialised view: ephemeral, resumed from a generation-stamped manifest
-    /// when the ephemeral checkpoint round left one. Partitioned.
+    /// Materialised view, with its `WITH (…)` options: ephemeral, resumed from a
+    /// generation-stamped manifest when the ephemeral checkpoint round left one.
     ///
     /// Not necessarily *rebuilt* from its sources: a mirror registers its fed
     /// copies under this kind too.
-    View,
-    /// Ingestion point: storeless, partitioned, append-only. Pushed rows exist
+    View(ViewProps),
+    /// Ingestion point: storeless, append-only. Pushed rows exist
     /// only as the deltas they produce; nothing is retained, so there is nothing
     /// to recover and no store to read.
     Stream,
@@ -145,7 +145,7 @@ impl RelationKind {
     pub fn noun(self) -> &'static str {
         match self {
             RelationKind::SystemCatalog | RelationKind::BaseTable => "table",
-            RelationKind::View => "view",
+            RelationKind::View(_) => "view",
             RelationKind::Stream => "stream",
         }
     }
@@ -166,7 +166,7 @@ impl RelationKind {
     /// True iff this is a materialised view.
     #[inline]
     pub fn is_view(self) -> bool {
-        matches!(self, RelationKind::View)
+        matches!(self, RelationKind::View(_))
     }
 }
 
@@ -209,9 +209,8 @@ pub struct Relation {
     /// threaded in beside it to log or to phrase an error.
     id: i64,
     store: Store,
-    /// The delta store, on the ranks that serve this view's feed — `props` is
-    /// what says a feed *exists*. `Box` because it embeds a second
-    /// `SchemaDescriptor` (360 bytes), which every relation would pay inline.
+    /// The delta store, on the ranks that serve this view's feed. Boxed: it embeds
+    /// a second `SchemaDescriptor`.
     delta: Option<Box<Store>>,
     indexes: Vec<SecondaryIndex>,
     kind: RelationKind,
@@ -219,9 +218,6 @@ pub struct Relation {
     /// exists once the relation is created, so it anchors an `O_TMPFILE` spill
     /// onto the same disk as the relation's data.
     directory: String,
-    /// The `WITH (…)` options this relation was registered with, which a rebuild
-    /// reopens its stores from.
-    props: ViewProps,
 }
 
 impl Relation {
@@ -263,21 +259,16 @@ impl Relation {
         &self.directory
     }
 
-    pub fn props(&self) -> ViewProps {
-        self.props
-    }
-
-    /// Whether this relation retains its recent deltas for a feed reader. The
-    /// budget is what says a feed *exists*; whether this process holds the store
-    /// for it is a separate question, [`Self::delta_or_err`]'s.
+    /// Whether this relation keeps a delta feed, whether or not this process holds
+    /// its store.
     pub fn has_delta_feed(&self) -> bool {
-        matches!(self.props, ViewProps::Fed { .. })
+        matches!(self.kind, RelationKind::View(ViewProps::Fed { .. }))
     }
 
     /// Whether a capacity bounds this relation's registered shard bytes, so its
     /// sweep may leave skeleton rows behind.
     pub fn is_bounded(&self) -> bool {
-        matches!(self.props, ViewProps::Bounded { .. })
+        matches!(self.kind, RelationKind::View(ViewProps::Bounded { .. }))
     }
 
     /// Whether every worker holds the whole relation rather than a partition of
@@ -290,18 +281,6 @@ impl Relation {
     /// PK cannot collide, so it is not among them.
     pub fn unique_indexes_to_check(&self) -> impl Iterator<Item = &SecondaryIndex> + '_ {
         self.indexes.iter().filter(|ic| ic.is_unique && !ic.covers_pk)
-    }
-
-    /// What the client is told this relation is.
-    pub fn class(&self) -> gnitz_wire::RelClass {
-        use gnitz_wire::RelClass;
-        match (self.kind, self.props) {
-            (RelationKind::Stream, _) => RelClass::Stream,
-            (RelationKind::View, ViewProps::Plain) => RelClass::View,
-            (RelationKind::View, ViewProps::Bounded { .. }) => RelClass::BoundedView,
-            (RelationKind::View, ViewProps::Fed { .. }) => RelClass::FedView,
-            (RelationKind::BaseTable | RelationKind::SystemCatalog, _) => RelClass::Table,
-        }
     }
 
     /// Non-compacting cursor over this relation's store.
@@ -381,7 +360,6 @@ pub struct RelationSpec {
     pub id: i64,
     pub kind: RelationKind,
     pub schema: SchemaDescriptor,
-    pub props: ViewProps,
 }
 
 // ---------------------------------------------------------------------------

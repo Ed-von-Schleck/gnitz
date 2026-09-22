@@ -40,9 +40,8 @@ fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
     registry
         .register(RelationSpec {
             id: TID,
-            kind: RelationKind::View,
+            kind: RelationKind::View(ViewProps::Plain),
             schema,
-            props: ViewProps::default(),
         })
         .unwrap();
     let mut bb = BatchBuilder::new(schema);
@@ -226,7 +225,6 @@ fn walk_fixture(name: &str, indexed: bool) -> RelationRegistry {
             id: TID,
             kind: RelationKind::BaseTable,
             schema,
-            props: ViewProps::default(),
         })
         .unwrap();
     if indexed {
@@ -342,9 +340,8 @@ fn a_walk_over_an_unindexable_column_is_refused() {
     );
     r.register(RelationSpec {
         id: TID,
-        kind: RelationKind::View,
+        kind: RelationKind::View(ViewProps::Plain),
         schema,
-        props: ViewProps::default(),
     })
     .unwrap();
     let spec = index_walk(1, Cut::Before(0), Cut::After(9), Vec::new(), 0);
@@ -367,9 +364,8 @@ fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::op
     registry
         .register(RelationSpec {
             id: TID,
-            kind: RelationKind::View,
+            kind: RelationKind::View(ViewProps::Bounded { capacity_bytes: 1 }),
             schema,
-            props: ViewProps::Bounded { capacity_bytes: 1 },
         })
         .unwrap();
     ingest(&mut registry, on_disk);

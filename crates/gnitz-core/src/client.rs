@@ -5,7 +5,7 @@ use crate::connection::{
 use crate::error::ClientError;
 use crate::protocol::transport::poll_fd;
 use crate::protocol::{
-    BatchAppender, ColumnDef, PkBuf, PkColumn, ProtocolError, PushFamily, ReplySchema, Schema, TypeCode,
+    BatchAppender, ColumnDef, FkTarget, PkBuf, PkColumn, ProtocolError, PushFamily, ReplySchema, Schema, TypeCode,
     WireConflictMode, ZSetBatch,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -76,22 +76,19 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
 
 // --- GnitzClient ---
 
-/// A secondary-index descriptor: the declared column list (the unique key — the
-/// circuit list is deduped by column list) and the system's operative
-/// uniqueness truth. This is the wire type verbatim, so a resolved descriptor's
-/// index list moves into the client.
-pub use gnitz_wire::RelIndex as IndexMeta;
-
-/// One inline `UNIQUE` constraint to fold into a `CREATE TABLE`'s atomic DDL
-/// bundle. `col_indices` are the constrained columns (a 1-element list for a
-/// single-column UNIQUE); `name` is the resolved catalog index name that
-/// `DROP INDEX` will match. Column types are derived from the table's columns,
-/// so a UNIQUE+FK column's parent-rewritten (integer) type is picked up
-/// automatically.
+/// One inline `UNIQUE` constraint of a `CREATE TABLE`. `name` is the catalog
+/// index name `DROP INDEX` matches.
 #[derive(Clone, Copy, Debug)]
 pub struct InlineUniqueIndex<'a> {
     pub col_indices: &'a [u32],
     pub name: &'a str,
+}
+
+/// One FOREIGN KEY column of a `CREATE TABLE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineForeignKey {
+    pub col_idx: u32,
+    pub target: FkTarget,
 }
 
 /// A cached half-open range `[next, end)` of unissued SERIAL ids for one table,
@@ -1174,17 +1171,15 @@ impl GnitzClient {
         self.push_ddl_txn(&families)
     }
 
-    /// `unique_indexes` are the table's inline `UNIQUE` constraints, folded into
-    /// the same atomic DDL bundle as `[COL_TAB, TABLE_TAB, IDX_TAB]` so a failure
-    /// rolls the whole `CREATE` back — never a table left missing its unique
-    /// constraint. Pass an empty slice for a table with no inline UNIQUE. A
-    /// stream owns no index: an IDX_TAB row naming one is refused by the engine's
-    /// index owner check, and the whole bundle with it.
+    /// Register a table, its FOREIGN KEY columns and its inline UNIQUE indexes as
+    /// one DDL bundle.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_table(
         &mut self,
         schema_name: &str,
         table_name: &str,
         columns: &[ColumnDef],
+        fks: &[InlineForeignKey],
         pk_cols: &[u32],
         props: TableProps,
         unique_indexes: &[InlineUniqueIndex],
@@ -1234,7 +1229,7 @@ impl GnitzClient {
         // ingests columns before the TABLE_TAB register hook that reads them.
         let col_s = sys_schema(COL_TAB);
         let mut col_batch = ZSetBatch::new(col_s);
-        append_col_rows(&mut BatchAppender::new(&mut col_batch, col_s), new_tid, columns);
+        append_col_rows(&mut BatchAppender::new(&mut col_batch, col_s), new_tid, columns, fks);
 
         // TABLE_TAB family.
         let tbl_schema = sys_schema(TABLE_TAB);
@@ -1428,10 +1423,7 @@ impl GnitzClient {
                 };
 
                 // 1. Column records. A foreign key constrains a base table, not a view.
-                for cd in &mut pv.output_columns {
-                    cd.fk = None;
-                }
-                append_col_rows(&mut col_a, vid, &pv.output_columns);
+                append_col_rows(&mut col_a, vid, &pv.output_columns, &[]);
 
                 // 2. Circuit node rows.
                 gnitz_wire::sys_rows::write_circuit_rows(&mut nodes_a, vid, &pv.circuit);
@@ -1622,7 +1614,7 @@ impl GnitzClient {
         let mut cb = ZSetBatch::new(col_s);
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, col_idx), 1);
+            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, col_idx, None), 1);
         }
         self.push_ddl_txn(&[(COL_TAB, cb)])?;
         Ok(())
@@ -1928,9 +1920,10 @@ fn checked_sys_rows(family: u64, reply: ScanReply) -> Result<ZSetBatch, ClientEr
 }
 
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`.
-fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, columns: &[ColumnDef]) {
+fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, columns: &[ColumnDef], fks: &[InlineForeignKey]) {
     for (i, cd) in columns.iter().enumerate() {
-        gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, i), 1);
+        let fk = fks.iter().find(|fk| fk.col_idx as usize == i).map(|fk| fk.target);
+        gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, i, fk), 1);
     }
 }
 

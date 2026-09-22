@@ -37,7 +37,6 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, base_rows: &[([u8; 24
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
-            props: ViewProps::default(),
         })
         .unwrap();
     engine.registry.add_index(tid, tid + 1, &[3], true).unwrap();
@@ -102,7 +101,6 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
             id: parent_tid,
             kind: RelationKind::BaseTable,
             schema: parent_schema,
-            props: ViewProps::default(),
         })
         .unwrap();
     engine.registry.ingest(parent_tid, pb).unwrap();

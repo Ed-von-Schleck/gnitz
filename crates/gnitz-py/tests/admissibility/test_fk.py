@@ -284,12 +284,6 @@ def test_restrict_over_more_values_than_one_write_carries(client, schema_name):
 # ── What a declaration registers and what it gates ───────────────────────────
 
 def test_only_a_base_table_registers_an_fk_and_a_self_reference_names_itself(client, schema_name):
-    """The planner cannot name the id of the table being created, so it ships a
-    marker the COL_TAB writer rewrites to the owner id — and `0` is also the
-    engine's encoding for "no FK", so only the catalog row shows the constraint
-    was not lost. A view's columns are clones of the projected source defs, so a
-    projected FK column would carry the source's FK id and make the view an FK
-    child with no auto-index, failing every parent delete."""
     sn = schema_name
     client.execute_sql(_TREE + "; CREATE VIEW tree_v AS SELECT id, parent_id FROM tree", schema_name=sn)
     tid, _ = client.resolve_table(sn, "tree")

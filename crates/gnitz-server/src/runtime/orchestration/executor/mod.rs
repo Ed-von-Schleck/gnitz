@@ -1362,20 +1362,9 @@ async fn target_kind_or_reject(shared: &Shared, peer: &Peer, target_id: i64, acc
     }
 }
 
-/// The relation a RESOLVE names, with its wire class — or `None` when it names
-/// none. `Err` is the one hard failure a resolve has: an unusable
-/// request blob, or a schema that does not exist.
-///
-/// The registry lookup is the gate that makes the id safe to describe. The class
-/// comes back off it, so the caller consumes that proof instead of re-resolving.
-fn resolve_request_target(
-    shared: &Rc<Shared>,
-    target_id: i64,
-    name_blob: &[u8],
-) -> Result<Option<(i64, gnitz_wire::RelClass)>, String> {
-    // By-id: the tid is the client's, unvalidated until the gate below. By-name:
-    // the blob is the canonical `"schema_name.relation_name"`, which is exactly
-    // the `entity_by_qname` key.
+/// The relation id a RESOLVE names, unvalidated when the client sent an id; `None`
+/// when its qualified name names none. `Err` when the name's schema does not exist.
+fn resolve_request_target(shared: &Rc<Shared>, target_id: i64, name_blob: &[u8]) -> Result<Option<i64>, String> {
     let candidate = if name_blob.is_empty() {
         target_id
     } else {
@@ -1383,11 +1372,6 @@ fn resolve_request_target(
         match shared.cat().entity_id_by_qname(qname) {
             Some(tid) => tid,
             None => {
-                // Distinguish "no such schema" from "no such relation in it"
-                // only here — a qname hit already implies its schema exists.
-                // Split at the first `.`: that is where `qualified_name` joined
-                // the two halves, and a name a validating front end would have
-                // rejected can only misreport which half was missing.
                 let (schema_name, _) = qname
                     .split_once('.')
                     .ok_or_else(|| format!("RESOLVE: '{qname}' is not a qualified relation name"))?;
@@ -1398,66 +1382,28 @@ fn resolve_request_target(
             }
         }
     };
-    // The registry lookup supplies the class, and is the gate a by-id tid passes.
-    Ok(shared
-        .cat()
-        .registry
-        .relation(candidate)
-        .map(|e| (candidate, e.class())))
+    Ok(Some(candidate))
 }
 
-/// Build the RESOLVE reply: the schema block plus the [`gnitz_wire::RelDescriptorBlob`]
-/// carrying what the block cannot (kind, foreign keys, secondary indexes). Served
-/// entirely from the typed caches the master already maintains; it writes no SAL
-/// group and wakes no worker.
+/// Answer a RESOLVE with the relation's schema block and descriptor.
 fn build_resolve_reply(shared: &Rc<Shared>, peer: &Peer, target_id: i64, name_blob: &[u8]) -> Result<(), String> {
-    let Some((tid, class)) = resolve_request_target(shared, target_id, name_blob)? else {
-        // Relation absent is a successful answer, not an error: the client owes a
-        // different wording per entry point ("Table …", "Table or view …",
-        // `Ok(None)`), so it renders it itself. An empty descriptor blob says so,
-        // and `target_id = 0` names no relation.
+    let answer = resolve_request_target(shared, target_id, name_blob)?
+        .and_then(|tid| shared.cat().resolve_answer(tid).map(|a| (tid, a)));
+    let Some((tid, (desc, schema_block, version))) = answer else {
+        // No such relation: a successful reply naming none.
         send_msg(peer, ipc::WireMsg::default());
         return Ok(());
-    };
-
-    let fks: Vec<gnitz_wire::RelFk> = shared
-        .cat()
-        .fk_constraints_of(tid)
-        .iter()
-        .map(|e| gnitz_wire::RelFk {
-            col_idx: e.fk_col as u32,
-            fk_col_idx: e.parent_col as u32,
-            fk_table_id: e.parent_tid as u64,
-        })
-        .collect();
-    let indexes: Vec<gnitz_wire::RelIndex> = shared
-        .cat()
-        .registry
-        .relation(tid)
-        .map_or(&[][..], Relation::indexes)
-        .iter()
-        .map(|ic| gnitz_wire::RelIndex {
-            cols: ic.cols(),
-            is_unique: ic.is_unique(),
-        })
-        .collect();
-    let pk_repeats = shared.cat().pk_repeats_of(tid);
-    let blob = gnitz_wire::RelDescriptorBlob { class, pk_repeats, fks, indexes }.encode();
-
-    // Negotiated as a client holding no schema: a resolving client has none to validate.
-    let (Some(schema_block), server_version) = shared.cat().negotiated_schema_block(tid, 0) else {
-        return Err(format!("table {tid} not found"));
     };
     send_msg(
         peer,
         ipc::WireMsg {
             target_id: tid as u64,
             flags: WireFlags {
-                schema_version: server_version,
+                schema_version: version,
                 ..Default::default()
             },
             schema_block: Some(schema_block.as_slice()),
-            blob: &blob,
+            blob: &desc.encode(),
             ..Default::default()
         },
     );

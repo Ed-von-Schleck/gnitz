@@ -146,13 +146,8 @@ impl Mirror {
         self.registry
             .register(RelationSpec {
                 id: tid as i64,
-                // `View` maps to `Rederive`, and gives the `v_` directory
-                // prefix and the `RelClass::View` a copy reports.
-                kind: RelationKind::View,
+                kind: RelationKind::View(ViewProps::Plain),
                 schema,
-                // No skeleton row is ever written, so nothing can ask this
-                // store to hydrate; and the store maintains no feed of its own.
-                props: ViewProps::default(),
             })
             .map_err(engine)?;
         self.records.insert(tid, rec);

@@ -161,7 +161,7 @@ impl PyGnitzClient {
     ) -> PyResult<u64> {
         let (cols, pk) = (&columns.columns, &columns.pk_cols);
         self.call(py, move |c| {
-            c.create_table(schema_name, table_name, cols, pk, TableProps::default(), &[])
+            c.create_table(schema_name, table_name, cols, &[], pk, TableProps::default(), &[])
         })
     }
 

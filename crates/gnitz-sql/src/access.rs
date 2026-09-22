@@ -5,7 +5,7 @@
 
 use crate::codec::literal::{place, Placed};
 use crate::ir::{BExpr, BinOp, BoundExpr};
-use gnitz_core::{Cut, IndexMeta, RangeDescriptor, Schema, TypeCode, PK_LIST_MAX_COLS};
+use gnitz_core::{Cut, RangeDescriptor, RelIndex, Schema, TypeCode, PK_LIST_MAX_COLS};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::{key_image, IndexBound, PkKeys, ReadBound};
 use std::cmp::Reverse;
@@ -295,7 +295,7 @@ enum Tier {
 
 /// Every bound `conjuncts` admit, best first. A list, because a candidate whose
 /// residual does not compile gives way to the next.
-pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[IndexMeta]) -> Vec<Candidate> {
+pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[RelIndex]) -> Vec<Candidate> {
     let terms: Vec<Term> = conjuncts
         .iter()
         .enumerate()

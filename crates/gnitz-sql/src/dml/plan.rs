@@ -10,7 +10,7 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use crate::tail::{order_exprs, parse_order_by, wire_keys};
-use gnitz_core::{ColumnDef, IndexMeta, Schema};
+use gnitz_core::{ColumnDef, RelIndex, Schema};
 use gnitz_expr::LogicalProgram;
 use gnitz_wire::{OrderKey, ReadBound};
 use sqlparser::ast::{OrderBy, SelectItem};
@@ -53,7 +53,7 @@ pub(crate) fn bind_where(
 pub(crate) fn bound_and_predicate(
     schema: &Schema,
     conjuncts: &[BoundExpr],
-    indexes: &[IndexMeta],
+    indexes: &[RelIndex],
 ) -> Result<AccessPlan, GnitzSqlError> {
     let mut blocked = None;
     for Candidate { bound, consumed } in candidates(conjuncts, schema, indexes) {

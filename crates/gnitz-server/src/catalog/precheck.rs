@@ -784,7 +784,7 @@ impl CatalogEngine {
                 // row to validate.
                 self.validate_view_options(id, v.name, v.props, v.owner_view_id)?;
                 self.validate_view_owner(id, v.name, v.owner_view_id, &view_creates)?;
-                (v.schema_id, v.name, v.pk, RelationKind::View)
+                (v.schema_id, v.name, v.pk, RelationKind::View(v.props))
             };
             check_col_defs(kind, &col_defs)
                 .and_then(|()| validate_pk_against_cols(&col_defs, pk.as_slice()))

@@ -129,7 +129,7 @@ fn gc_reclaims_orphan_view_dir() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let live_dir = relation_dir(&dir, RelationKind::BaseTable, tid);
 
-    let ghost = relation_dir(&dir, RelationKind::View, 4242);
+    let ghost = relation_dir(&dir, RelationKind::View(gnitz_wire::ViewProps::Plain), 4242);
     std::fs::create_dir_all(&ghost).unwrap();
 
     let _ = engine.drain_pending_broadcasts();
@@ -328,7 +328,6 @@ fn child_registry(dir: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
-            props: ViewProps::default(),
         })
         .unwrap();
     registry

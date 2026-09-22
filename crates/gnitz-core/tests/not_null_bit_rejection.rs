@@ -61,7 +61,7 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
         ColumnDef::new("w", TypeCode::I64, true),
     ];
     client
-        .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
+        .create_table(&sn, "t", &cols, &[], &[0], TableProps::default(), &[])
         .unwrap();
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
 

@@ -83,26 +83,27 @@ def test_a_read_of_a_replicated_table_returns_one_copy(client, dim, where, keep)
 @pytest.mark.parametrize("options", ["replicated = true", "stream = true, replicated = true"],
                          ids=["table", "stream"])
 def test_an_aggregate_over_a_replicated_source_counts_one_copy(client, schema_name, options):
-    """Every worker reduces its own whole copy, so a reduce that exchanged or
-    combined across workers would multiply COUNT and SUM by W, and a global
-    aggregate over the empty source would ground once per worker instead of once.
-    A replicated stream holds no copy to read but must be placed the same way."""
+    """Every worker holds the whole relation, so a view that combined the copies
+    would count each row W times."""
     sn = schema_name
     client.execute_sql(
         "CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
         f"amount BIGINT NOT NULL) WITH ({options}); "
         "CREATE VIEW per_grp AS SELECT grp, COUNT(*) AS cnt, SUM(amount) AS total "
         "FROM src GROUP BY grp; "
-        "CREATE VIEW overall AS SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM src",
+        "CREATE VIEW overall AS SELECT COUNT(*) AS cnt, SUM(amount) AS total FROM src; "
+        "CREATE VIEW top2 AS SELECT id, amount FROM src ORDER BY amount DESC LIMIT 2",
         schema_name=sn)
 
     assert bag(scanned(client, sn, "per_grp"), "grp", "cnt", "total") == {}
     assert bag(scanned(client, sn, "overall"), "cnt", "total") == {(0, None): 1}
+    assert bag(scanned(client, sn, "top2"), "id", "amount") == {}
     client.execute_sql("INSERT INTO src VALUES (1, 10, 100), (2, 10, 200), (3, 20, 350)",
                        schema_name=sn)
     assert bag(scanned(client, sn, "per_grp"), "grp", "cnt", "total") == {
         (10, 2, 300): 1, (20, 1, 350): 1}
     assert bag(scanned(client, sn, "overall"), "cnt", "total") == {(3, 650): 1}
+    assert bag(scanned(client, sn, "top2"), "id", "amount") == {(3, 350): 1, (2, 200): 1}
 
 
 # ── Writes reach every copy ──────────────────────────────────────────────────

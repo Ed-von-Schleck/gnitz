@@ -91,9 +91,8 @@ fn a_long_relation_name_round_trips() {
 
 // ── The descriptor's contents ────────────────────────────────────────────
 
-/// The markers that are not column-layout facts — SERIAL, the FK target, a
-/// dropped column's hidden slot at its physical position — all reach the
-/// resolved schema.
+/// The markers that are not column-layout facts — SERIAL, a dropped column's
+/// hidden slot at its physical position — all reach the resolved schema.
 #[test]
 fn descriptor_fields_round_trip() {
     let (_srv, mut client, sn) = boot(1);
@@ -103,7 +102,7 @@ fn descriptor_fields_round_trip() {
         "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, other BIGINT NOT NULL UNIQUE, gone BIGINT NOT NULL)",
     );
     exec(&mut client, &sn, "ALTER TABLE p DROP COLUMN gone");
-    let (p_tid, p) = client.resolve_table_or_view_id(&sn, "p").unwrap();
+    let (_, p) = client.resolve_table_or_view_id(&sn, "p").unwrap();
     assert_eq!(p.columns.len(), 3, "the dropped column is still physically present");
     assert!(p.columns[2].is_hidden);
     assert!(!p.columns[1].is_hidden);
@@ -118,10 +117,6 @@ fn descriptor_fields_round_trip() {
     let (_, c) = client.resolve_table_or_view_id(&sn, "c").unwrap();
     assert!(c.columns[0].is_serial);
     assert!(!c.columns[1].is_serial);
-    use gnitz_core::FkTarget;
-    assert_eq!(c.columns[0].fk, None, "the PK carries no FK");
-    assert_eq!(c.columns[1].fk, Some(FkTarget::Table { id: p_tid, col: 0 }));
-    assert_eq!(c.columns[2].fk, Some(FkTarget::Table { id: p_tid, col: 1 }));
 }
 
 /// The index list is exact — an empty list means "no index", never "unchanged".

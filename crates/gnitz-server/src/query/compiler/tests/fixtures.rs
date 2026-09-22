@@ -5,7 +5,6 @@
 use super::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::storage::Slot;
-use gnitz_wire::ViewProps;
 
 // Input slots reach the compiler only in hand-written fixtures; every production
 // read of an operand goes through `NodeInputs`. Slot 0 is a unary operator's
@@ -89,12 +88,7 @@ pub(in crate::query) fn register_sources(
     rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>,
 ) {
     for (id, schema) in rows {
-        let spec = RelationSpec {
-            id,
-            kind: RelationKind::Stream,
-            schema,
-            props: ViewProps::default(),
-        };
+        let spec = RelationSpec { id, kind: RelationKind::Stream, schema };
         registry.register(spec).expect("a stream registers without a store");
     }
 }

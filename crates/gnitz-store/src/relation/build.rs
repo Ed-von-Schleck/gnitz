@@ -12,9 +12,9 @@ static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS"
 impl RelationRegistry {
     /// Enter a relation and open its stores.
     pub fn register(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
-        let RelationSpec { id, kind, schema, props } = spec;
+        let RelationSpec { id, kind, schema } = spec;
         let directory = relation_dir(&self.base_dir, kind, id);
-        let (store, delta) = self.build_relation_store(kind, &directory, id, schema, props)?;
+        let (store, delta) = self.build_relation_store(kind, &directory, id, schema)?;
         let relation = Relation {
             id,
             store,
@@ -22,7 +22,6 @@ impl RelationRegistry {
             indexes: Vec::new(),
             kind,
             directory,
-            props,
         };
         self.tables.insert(id, relation);
         Ok(())
@@ -35,8 +34,11 @@ impl RelationRegistry {
         directory: &str,
         id: i64,
         schema: SchemaDescriptor,
-        props: ViewProps,
     ) -> Result<(Store, Option<Box<Store>>), StoreError> {
+        let props = match kind {
+            RelationKind::View(p) => p,
+            _ => ViewProps::Plain,
+        };
         // On every process, the master included: a limit first noticed on a
         // worker would abort after the CREATE was acknowledged.
         let delta = props
@@ -54,8 +56,8 @@ impl RelationRegistry {
             RelationKind::Stream => return Ok((Store::detached(schema), None)),
             // A view's output store and its operator traces resume from the
             // manifest the ephemeral checkpoint round stamped, or are rebuilt.
-            RelationKind::View if self.non_resumable.contains(&id) => RecoverySource::Rederive { resume_at: None },
-            RelationKind::View => self.rederive_source(),
+            RelationKind::View(_) if self.non_resumable.contains(&id) => RecoverySource::Rederive { resume_at: None },
+            RelationKind::View(_) => self.rederive_source(),
             RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
         };
         ensure_dir(directory)?;

@@ -12,7 +12,10 @@ use crate::validate::{
     require_class, ClassWant, ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineUniqueIndex, TableProps, TypeCode};
+use gnitz_core::{
+    CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineForeignKey, InlineUniqueIndex, TableProps,
+    TypeCode,
+};
 use gnitz_expr::SchemaFacts;
 use gnitz_wire::TableDistribution;
 use sqlparser::ast::{
@@ -484,6 +487,7 @@ pub enum TablePlan {
     Create {
         name: String,
         cols: Vec<ColumnDef>,
+        fks: Vec<InlineForeignKey>,
         pk_indices: Vec<u32>,
         props: TableProps,
         /// Each inline UNIQUE constraint's columns and the catalog name its index
@@ -545,15 +549,16 @@ pub fn plan_create_table(
 
     // A self-FK resolves against the whole PK, and each resolve REWRITES its child
     // column's type to the parent's — so this runs after collection, not inside it.
+    let mut fks: Vec<InlineForeignKey> = Vec::with_capacity(fk_sites.len());
     for site in &fk_sites {
-        if cols[site.col_idx].fk.is_some() {
+        if fks.iter().any(|fk| fk.col_idx as usize == site.col_idx) {
             return Err(GnitzSqlError::Plan(format!(
                 "column '{}' carries more than one FOREIGN KEY",
                 cols[site.col_idx].name
             )));
         }
         let (fk, parent_pk_type) = resolve_fk_target(cat, schema_name, site, &table_name, &cols, &pk_indices)?;
-        cols[site.col_idx].fk = Some(fk);
+        fks.push(InlineForeignKey { col_idx: site.col_idx as u32, target: fk });
         cols[site.col_idx].ty = parent_pk_type;
     }
 
@@ -642,6 +647,7 @@ pub fn plan_create_table(
     Ok(TablePlan::Create {
         name: table_name,
         cols,
+        fks,
         pk_indices,
         props,
         unique_indexes,
@@ -655,15 +661,16 @@ pub(crate) fn execute_create_table(
     schema_name: &str,
     plan: TablePlan,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let (name, cols, pk_indices, props, unique_indexes) = match plan {
+    let (name, cols, fks, pk_indices, props, unique_indexes) = match plan {
         TablePlan::Skip { existing_id } => return Ok(SqlResult::TableCreated { table_id: existing_id }),
         TablePlan::Create {
             name,
             cols,
+            fks,
             pk_indices,
             props,
             unique_indexes,
-        } => (name, cols, pk_indices, props, unique_indexes),
+        } => (name, cols, fks, pk_indices, props, unique_indexes),
     };
     let unique_indexes: Vec<InlineUniqueIndex> = unique_indexes
         .iter()
@@ -672,7 +679,7 @@ pub(crate) fn execute_create_table(
             name: name.as_str(),
         })
         .collect();
-    let tid = client.create_table(schema_name, &name, &cols, &pk_indices, props, &unique_indexes)?;
+    let tid = client.create_table(schema_name, &name, &cols, &fks, &pk_indices, props, &unique_indexes)?;
     Ok(SqlResult::TableCreated { table_id: tid })
 }
 

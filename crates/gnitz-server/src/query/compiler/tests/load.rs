@@ -3,7 +3,6 @@ use crate::query::compiler::fixtures::*;
 use gnitz_store::relation::{RelationKind, RelationSpec, StoreConfig};
 use gnitz_store::storage::Slot;
 use gnitz_wire::OpNode;
-use gnitz_wire::ViewProps;
 
 // ── load_circuit against the real system tables ─────────────────────────
 
@@ -33,7 +32,6 @@ impl CircuitTables {
                 id: gnitz_wire::CIRCUIT_NODES_TAB as i64,
                 kind: RelationKind::SystemCatalog,
                 schema: Self::schema(),
-                props: ViewProps::default(),
             })
             .unwrap();
         Self { registry, _tmp: tmp }

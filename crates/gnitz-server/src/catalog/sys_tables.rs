@@ -96,7 +96,6 @@ pub(super) struct RelationRegistration<'a> {
     pub(super) name: &'a str,
     pub(super) pk: PkColList,
     pub(super) placement: Placement,
-    pub(super) props: ViewProps,
     pub(super) pk_repeats: bool,
 }
 
@@ -131,7 +130,6 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
             TableDistribution::Replicated => Placement::Replicated,
             TableDistribution::Keyed { prefix_len } => Placement::Keyed { prefix_len },
         },
-        props: ViewProps::default(),
         // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
         pk_repeats: props.stream,
     })

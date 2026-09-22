@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use gnitz_core::{
-    CatalogSnapshot, Circuit, ColumnDef, IndexMeta, OpNode, PkColList, PlannedView, RelClass, RelDescriptor, Schema,
-    TypeCode, ViewProps,
+    CatalogSnapshot, Circuit, ColumnDef, OpNode, PkColList, PlannedView, RelClass, RelDescriptor, RelIndex, Schema,
+    TypeCode,
 };
 use gnitz_sql::sqlparser::ast::Statement;
 use gnitz_sql::sqlparser::dialect::GenericDialect;
@@ -93,7 +93,7 @@ pub fn rel_with(
         schema: Arc::new(Schema { columns, pk_cols }),
         indexes: indexes
             .iter()
-            .map(|&(cols, is_unique)| IndexMeta {
+            .map(|&(cols, is_unique)| RelIndex {
                 cols: PkColList::from_slice(cols),
                 is_unique,
             })
@@ -220,13 +220,20 @@ pub fn view(cat: &CatalogSnapshot, body: &str) -> PlannedChain {
 /// server would after `CREATE VIEW`.
 pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &PlannedChain) {
     let fv = final_view(chain);
-    let class = match chain.props {
-        ViewProps::Plain => RelClass::View,
-        ViewProps::Bounded { .. } => RelClass::BoundedView,
-        ViewProps::Fed { .. } => RelClass::FedView,
-    };
-    let pk_cols = fv.pk_cols.clone();
-    cat.insert(SN, name, Some(rel(tid, class, fv.output_columns.clone(), pk_cols, &[])));
+    cat.insert(
+        SN,
+        name,
+        Some(Arc::new(RelDescriptor {
+            tid,
+            class: chain.props.into(),
+            pk_repeats: fv.pk_repeats,
+            schema: Arc::new(Schema {
+                columns: fv.output_columns.clone(),
+                pk_cols: fv.pk_cols.clone(),
+            }),
+            indexes: Vec::new(),
+        })),
+    );
 }
 
 /// The final view's output columns as `(name, hidden, nullable)`.

@@ -42,7 +42,6 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            props,
             pk_repeats,
         } = reg;
         let col_defs = self.read_column_defs(id);
@@ -55,7 +54,7 @@ impl CatalogEngine {
             id,
             self.registry.slot().of
         );
-        self.registry.register(RelationSpec { id, kind, schema, props })?;
+        self.registry.register(RelationSpec { id, kind, schema })?;
         self.enter_relation(id, kind, &schema, &col_defs, pk_repeats);
         // Derived, not stored: every process builds the same FK circuits from the same
         // column records.
@@ -191,13 +190,12 @@ impl CatalogEngine {
             .register_view(&self.registry, vid, pk.as_slice().len())
             .map_err(|e| format!("{e} (vid={vid})"))?;
         Ok(RelationRegistration {
-            kind: RelationKind::View,
+            kind: RelationKind::View(props),
             id: vid,
             schema_id,
             name,
             pk,
             placement,
-            props,
             pk_repeats,
         })
     }

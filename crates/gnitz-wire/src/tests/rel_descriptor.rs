@@ -1,48 +1,14 @@
 use super::*;
 
-fn roundtrip(d: &RelDescriptorBlob, num_columns: usize) -> RelDescriptorBlob {
-    RelDescriptorBlob::decode(&d.encode(), num_columns)
-        .expect("decode")
-        .expect("present")
-}
-
-/// An empty blob is the absent answer, and a present one always encodes to
-/// more than that — so the two can never be confused. Both ride inline in
-/// the control block's German-string cell, costing a control-only frame.
-#[test]
-fn absence_is_the_empty_blob() {
-    assert_eq!(RelDescriptorBlob::decode(&[], 0), Ok(None));
-    let present = RelDescriptorBlob::default().encode();
-    assert_eq!(present.len(), HEADER_LEN);
-    assert!(
-        present.len() <= crate::SHORT_STRING_THRESHOLD,
-        "the blob must ride inline"
-    );
+fn roundtrip(d: &RelDescriptorBlob) -> RelDescriptorBlob {
+    RelDescriptorBlob::decode(&d.encode()).expect("decode")
 }
 
 #[test]
-fn empty_lists_roundtrip() {
-    let d = RelDescriptorBlob::default();
-    assert_eq!(roundtrip(&d, 3), d);
-}
-
-#[test]
-fn multi_column_index_and_multi_fk_roundtrip() {
+fn multi_column_index_roundtrip() {
     let d = RelDescriptorBlob {
         class: RelClass::BoundedView,
         pk_repeats: true,
-        fks: vec![
-            RelFk {
-                col_idx: 0,
-                fk_col_idx: 0,
-                fk_table_id: 16,
-            },
-            RelFk {
-                col_idx: 2,
-                fk_col_idx: 1,
-                fk_table_id: 99,
-            },
-        ],
         indexes: vec![
             RelIndex {
                 cols: PkColList::from_slice(&[1]),
@@ -54,32 +20,21 @@ fn multi_column_index_and_multi_fk_roundtrip() {
             },
         ],
     };
-    assert_eq!(roundtrip(&d, 3), d);
+    assert_eq!(roundtrip(&d), d);
 }
 
-/// Every class survives a roundtrip alongside `pk_repeats`, which is orthogonal
-/// to all of them.
 #[test]
-fn every_class_roundtrips_with_pk_repeats() {
-    for class in [
-        RelClass::Table,
-        RelClass::Stream,
-        RelClass::View,
-        RelClass::BoundedView,
-        RelClass::FedView,
-    ] {
-        for &pk_repeats in &[false, true] {
+fn every_class_roundtrips() {
+    for &class in RelClass::ALL {
+        for pk_repeats in [false, true] {
             let d = RelDescriptorBlob { class, pk_repeats, ..Default::default() };
-            let back = roundtrip(&d, 2);
-            assert_eq!(back, d, "{class:?} pk_repeats={pk_repeats}");
+            assert_eq!(roundtrip(&d), d, "{class:?} pk_repeats={pk_repeats}");
         }
     }
 }
 
-/// Every non-empty prefix short of the whole must be an error — only the
-/// fully-empty blob means "absent".
 #[test]
-fn truncated_blob_is_an_error() {
+fn every_proper_prefix_is_an_error() {
     let d = RelDescriptorBlob {
         indexes: vec![RelIndex {
             cols: PkColList::from_slice(&[0]),
@@ -88,8 +43,8 @@ fn truncated_blob_is_an_error() {
         ..Default::default()
     };
     let bytes = d.encode();
-    for cut in 1..bytes.len() {
-        let err = RelDescriptorBlob::decode(&bytes[..cut], 4).unwrap_err();
+    for cut in 0..bytes.len() {
+        let err = RelDescriptorBlob::decode(&bytes[..cut]).unwrap_err();
         assert!(
             err.starts_with("rel descriptor:"),
             "a {cut}-byte prefix must fail as a rel descriptor, got: {err}"
@@ -97,25 +52,16 @@ fn truncated_blob_is_an_error() {
     }
 }
 
-/// Every decode guard, against the forgery that trips it. The message is what
-/// separates them: reading an unknown flag bit as "not a view" would let a
-/// client INSERT into one, and a malformed packed column count read as a
-/// silently truncated `PkColList` would name the wrong index.
 #[test]
 fn each_decode_guard_rejects_its_own_forgery() {
-    let flags = |bad: u8| {
+    let with_byte = |at: usize, v: u8| {
         let mut bytes = RelDescriptorBlob::default().encode();
-        bytes[1] = bad;
+        bytes[at] = v;
         bytes
     };
     let trailing = {
         let mut bytes = RelDescriptorBlob::default().encode();
         bytes.push(0);
-        bytes
-    };
-    let bad_version = {
-        let mut bytes = RelDescriptorBlob::default().encode();
-        bytes[0] = VERSION + 1;
         bytes
     };
     let bad_index_count = {
@@ -127,61 +73,25 @@ fn each_decode_guard_rejects_its_own_forgery() {
             ..Default::default()
         }
         .encode();
-        // Overwrite the packed column list with a word whose count field (bits
-        // [0..4)) is past `PK_LIST_MAX_COLS`.
+        // A column-count field (bits [0..4)) past `PK_LIST_MAX_COLS`.
+        let first_entry = RelDescriptorBlob::default().encode().len();
         crate::write_u64_le(
             &mut bytes,
-            HEADER_LEN,
+            first_entry,
             (crate::pack_pk_cols(&[0, 1, 2, 3]) & !0xF) | 0xF,
         );
         bytes
     };
-    // An FK naming a column past the schema's column count: admissible at 6
-    // columns, out of range at 5, so no consumer can index with it.
-    let fk_col_5 = RelDescriptorBlob {
-        fks: vec![RelFk {
-            col_idx: 5,
-            fk_col_idx: 0,
-            fk_table_id: 16,
-        }],
-        ..Default::default()
-    }
-    .encode();
-    assert!(RelDescriptorBlob::decode(&fk_col_5, 6).is_ok(), "in range at 6 columns");
 
-    // (what, blob, the consumer's column count, the message that must name it)
-    let cases: &[(&str, Vec<u8>, usize, &str)] = &[
-        ("bounded without view", flags(DESC_FLAG_BOUNDED), 4, "no relation class"),
-        (
-            "two class bits",
-            flags(DESC_FLAG_VIEW | DESC_FLAG_STREAM),
-            4,
-            "no relation class",
-        ),
-        ("every class bit", flags(DESC_FLAG_CLASS), 4, "no relation class"),
-        (
-            "bounded and fed",
-            flags(DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_DELTA),
-            4,
-            "no relation class",
-        ),
-        ("fed without view", flags(DESC_FLAG_DELTA), 4, "no relation class"),
-        (
-            "fed stream",
-            flags(DESC_FLAG_STREAM | DESC_FLAG_DELTA),
-            4,
-            "no relation class",
-        ),
-        // Bit 6: the lowest bit above the flags that exist, so this names no
-        // flag rather than setting one that does.
-        ("unknown flag bit", flags(1 << 6), 0, "unknown flag bits"),
-        ("trailing byte", trailing, 0, "trailing"),
-        ("unknown version", bad_version, 0, "rel descriptor"),
-        ("index column count", bad_index_count, 4, "out of range"),
-        ("out-of-range FK column", fk_col_5, 5, "foreign key names column 5"),
+    // (what, blob, the message that must name it)
+    let cases: &[(&str, Vec<u8>, &str)] = &[
+        ("unknown class", with_byte(0, 5), "unknown relation class 5"),
+        ("pk_repeats byte 2", with_byte(1, 2), "neither 0 nor 1"),
+        ("trailing byte", trailing, "trailing"),
+        ("index column count", bad_index_count, "out of range"),
     ];
-    for (what, bytes, num_columns, want) in cases {
-        let err = RelDescriptorBlob::decode(bytes, *num_columns).expect_err(what);
+    for (what, bytes, want) in cases {
+        let err = RelDescriptorBlob::decode(bytes).expect_err(what);
         assert!(err.contains(want), "{what}: {err:?} does not name {want:?}");
     }
 }

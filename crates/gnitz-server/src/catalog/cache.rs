@@ -72,11 +72,6 @@ fn apply_map_delta<K: Eq + Hash, V>(map: &mut FxHashMap<K, V>, batch: &Batch, ro
 }
 
 impl CatalogEngine {
-    /// [`RelationEntry::pk_repeats`] of `id`. A stream always reports `true`.
-    pub(crate) fn pk_repeats_of(&self, id: i64) -> bool {
-        self.caches.relations.get(&id).is_some_and(|e| e.pk_repeats)
-    }
-
     pub(in crate::catalog) fn apply_schema_caches(&mut self, batch: &Batch) {
         let name = |i| payload_string(batch, i, SCHEMATAB_PAY_NAME);
         let sid = |i| batch.get_pk(i) as i64;

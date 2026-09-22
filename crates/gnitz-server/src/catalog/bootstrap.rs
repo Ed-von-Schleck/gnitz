@@ -59,7 +59,6 @@ impl CatalogEngine {
                     id: family.id(),
                     kind: RelationKind::SystemCatalog,
                     schema: *family.schema(),
-                    props: ViewProps::default(),
                 })
                 .map_err(|e| format!("Failed to create system table '{}': error {e}", family.name()))?;
             engine.enter_relation(

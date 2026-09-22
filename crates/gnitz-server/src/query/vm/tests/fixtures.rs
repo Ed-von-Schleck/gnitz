@@ -18,9 +18,8 @@ pub(in crate::query) fn vm_registry(dir: &std::path::Path) -> RelationRegistry {
     registry
         .register(RelationSpec {
             id: VIEW_ID,
-            kind: RelationKind::View,
+            kind: RelationKind::View(ViewProps::Plain),
             schema: crate::test_support::make_schema_u128_i64(),
-            props: ViewProps::default(),
         })
         .unwrap();
     registry

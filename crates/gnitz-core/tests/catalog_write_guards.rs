@@ -56,7 +56,7 @@ fn two_columns(owner_id: u64) -> ZSetBatch {
     .iter()
     .enumerate()
     {
-        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, i), 1);
+        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, i, None), 1);
     }
     b
 }
@@ -118,6 +118,7 @@ fn a_table(client: &mut GnitzClient, schema: &str) -> u64 {
                 ColumnDef::new("id", TypeCode::U64, false),
                 ColumnDef::new("v", TypeCode::I64, false),
             ],
+            &[],
             &[0],
             TableProps::default(),
             &[],
@@ -227,6 +228,7 @@ fn two_indexes_under_one_name_in_one_bundle_are_refused() {
                 "dupidx",
                 "t",
                 &cols,
+                &[],
                 &[0],
                 TableProps::default(),
                 &[
@@ -258,6 +260,7 @@ fn a_three_family_create_table_bundle_still_commits() {
             "ok",
             "t",
             &cols,
+            &[],
             &[0],
             TableProps::default(),
             &[gnitz_core::InlineUniqueIndex { col_indices: &[1], name: "u_b" }],
@@ -311,7 +314,7 @@ fn drop_schema_retires_a_view_its_table_and_the_schema_in_one_bundle() {
         ColumnDef::new("v", TypeCode::I64, false),
     ];
     let tid = client
-        .create_table("teardown", "t", &cols, &[0], TableProps::default(), &[])
+        .create_table("teardown", "t", &cols, &[], &[0], TableProps::default(), &[])
         .unwrap();
     client.create_view("teardown", "v", tid, &cols).unwrap();
 
@@ -338,7 +341,7 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
         ColumnDef::new("v", TypeCode::I64, false),
     ];
     let tid = client
-        .create_table("ren", "t", &cols, &[0], TableProps::default(), &[])
+        .create_table("ren", "t", &cols, &[], &[0], TableProps::default(), &[])
         .unwrap();
     let vid = client.create_view("ren", "v", tid, &cols).unwrap();
 
@@ -375,7 +378,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
         ColumnDef::new("v", TypeCode::I64, false),
     ];
     let tid = client
-        .create_table("mixed", "t", &cols, &[0], TableProps::default(), &[])
+        .create_table("mixed", "t", &cols, &[], &[0], TableProps::default(), &[])
         .unwrap();
     let first = client.create_view("mixed", "v", tid, &cols).unwrap();
 

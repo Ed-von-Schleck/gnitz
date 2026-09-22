@@ -26,7 +26,7 @@ fn table(target: &str) -> (GnitzClient, u64, std::sync::Arc<Schema>) {
     let sn = unique_schema("spine");
     client.create_schema(&sn).unwrap();
     client
-        .create_table(&sn, "t", &cols(), &[0], TableProps::default(), &[])
+        .create_table(&sn, "t", &cols(), &[], &[0], TableProps::default(), &[])
         .unwrap();
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     (client, tid, schema)

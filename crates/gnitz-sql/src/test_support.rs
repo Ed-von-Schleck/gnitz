@@ -158,17 +158,17 @@ pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
     }
 }
 
-/// Non-unique `IndexMeta` list from raw column-index lists.
-pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> Vec<gnitz_core::IndexMeta> {
+/// Non-unique `RelIndex` list from raw column-index lists.
+pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> Vec<gnitz_core::RelIndex> {
     let flagged: Vec<(&[u32], bool)> = col_lists.iter().map(|cols| (*cols, false)).collect();
     idx_metas_flagged(&flagged)
 }
 
-/// `IndexMeta` list from raw column-index lists, each with its `is_unique` flag.
-pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> Vec<gnitz_core::IndexMeta> {
+/// `RelIndex` list from raw column-index lists, each with its `is_unique` flag.
+pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> Vec<gnitz_core::RelIndex> {
     col_lists
         .iter()
-        .map(|(cols, is_unique)| gnitz_core::IndexMeta {
+        .map(|(cols, is_unique)| gnitz_core::RelIndex {
             cols: gnitz_core::PkColList::from_slice(cols),
             is_unique: *is_unique,
         })

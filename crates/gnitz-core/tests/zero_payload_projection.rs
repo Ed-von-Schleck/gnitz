@@ -79,7 +79,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
         ColumnDef::new("s", TypeCode::String, false),
     ];
     client
-        .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
+        .create_table(&sn, "t", &cols, &[], &[0], TableProps::default(), &[])
         .unwrap();
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
 
@@ -133,7 +133,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         ColumnDef::new("c3", TypeCode::I64, false),
     ];
     client
-        .create_table(&sn, "t", &cols, &[3, 0], TableProps::default(), &[])
+        .create_table(&sn, "t", &cols, &[], &[3, 0], TableProps::default(), &[])
         .unwrap();
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     assert_eq!(schema.pk_stride(), 12, "I64 then U32, tightly packed");

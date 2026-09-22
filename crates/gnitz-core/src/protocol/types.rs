@@ -3,10 +3,8 @@ use gnitz_expr::{ColumnTable, SchemaFacts};
 pub use gnitz_wire::{ColType, FixedInt, PkBuf, ReduceOutKey, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 
-/// The relation and column a FOREIGN KEY column references. `SelfTable` is the
-/// binding `CREATE TABLE` must defer — the id exists only once the table does —
-/// which [`ColumnDef::col_tab_row`] resolves to the owner; a schema that came
-/// back from a resolve always carries `Table`.
+/// The relation and column a FOREIGN KEY column references. `SelfTable` names the
+/// table being created, which has no id yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FkTarget {
     Table { id: u64, col: u32 },
@@ -16,38 +14,17 @@ pub enum FkTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
     pub name: std::string::String,
-    /// The column's logical type. A DECIMAL's scale — the power of ten its
-    /// stored `I64` is multiplied by — round-trips through the wire meta-schema
-    /// and `COL_TAB.scale`; the engine stores it and never branches on it.
+    /// The column's logical type, a DECIMAL's scale included.
     pub ty: ColType,
     pub is_nullable: bool,
-    /// The FOREIGN KEY this column carries, if any.
-    pub fk: Option<FkTarget>,
-    /// True for a Postgres-style SERIAL/BIGSERIAL/SMALLSERIAL primary key: an
-    /// auto-assigned, client-stamped id the user may not supply. Round-trips
-    /// through the wire meta-schema (`ColMeta::serial`) and `COL_TAB`, so a
-    /// connection that only resolved the relation can still distinguish it from
-    /// a user-supplied non-null integer PK. The engine stores the marker but has
-    /// no SERIAL awareness.
+    /// A SERIAL primary key: an id the client assigns and the user may not supply.
     pub is_serial: bool,
-    /// True for a hidden key slot — a physical schema column carrying a real
-    /// PK/routing value (a synthetic view key like `_join_pk`/`_group_pk`, or an
-    /// unprojected passthrough source PK) that no presentation surface exposes.
-    /// Round-trips through the wire meta-schema (`ColMeta::hidden`) and
-    /// `COL_TAB`. Presentation layers (wildcard expansion, name resolution,
-    /// duplicate-name checks, client rows) skip it; physical layout, routing,
-    /// sort, and consolidation are unaffected. A base-table column becomes hidden
-    /// only via `ALTER TABLE … DROP COLUMN` (a logical drop): it stays physically
-    /// present and zero-filled NOT NULL, and is excluded from every name-facing
-    /// surface.
+    /// A physical column no name the user writes can reach.
     pub is_hidden: bool,
 }
 
 impl ColumnDef {
-    /// A non-FK, non-SERIAL column — the common case. Client-side schema builders
-    /// (the SQL planner, the Python driver) synthesize columns through here; the
-    /// planner's FK path fills `fk` once the referenced table resolves, and a
-    /// SERIAL column chains [`ColumnDef::serial`].
+    /// A visible, non-SERIAL column.
     pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
         Self::typed(name, ColType::of(type_code), is_nullable)
     }
@@ -59,20 +36,20 @@ impl ColumnDef {
             name: name.into(),
             ty,
             is_nullable,
-            fk: None,
             is_serial: false,
             is_hidden: false,
         }
     }
 
     /// This column as the `COL_TAB` row recording it: column `col_idx` of
-    /// `owner_id`.
-    ///
-    /// The FK is resolved against the owner rather than taken verbatim:
-    /// [`FkTarget::SelfTable`] becomes `owner_id`. The wire's `0` = "no FK"
-    /// convention starts here.
-    pub fn col_tab_row(&self, owner_id: u64, col_idx: usize) -> gnitz_wire::sys_rows::ColTabRow<'_> {
-        let (fk_table_id, fk_col_idx) = match self.fk {
+    /// `owner_id`, referencing `fk`.
+    pub fn col_tab_row(
+        &self,
+        owner_id: u64,
+        col_idx: usize,
+        fk: Option<FkTarget>,
+    ) -> gnitz_wire::sys_rows::ColTabRow<'_> {
+        let (fk_table_id, fk_col_idx) = match fk {
             None => (0, 0),
             Some(FkTarget::SelfTable { col }) => (owner_id, col as u64),
             Some(FkTarget::Table { id, col }) => (id, col as u64),
@@ -90,17 +67,13 @@ impl ColumnDef {
         }
     }
 
-    /// Mark this column a SERIAL primary key — an auto-assigned, client-stamped
-    /// id. Chains onto [`ColumnDef::new`]; the CREATE TABLE planner is the only
-    /// builder of SERIAL columns.
+    /// Mark this column a SERIAL primary key.
     pub fn serial(mut self) -> Self {
         self.is_serial = true;
         self
     }
 
-    /// Mark this column hidden (see [`ColumnDef::is_hidden`]) — a slot the planner
-    /// fabricated, which no name the user wrote may reach. Chains onto
-    /// [`ColumnDef::new`].
+    /// Mark this column hidden.
     pub fn hidden(mut self) -> Self {
         self.is_hidden = true;
         self

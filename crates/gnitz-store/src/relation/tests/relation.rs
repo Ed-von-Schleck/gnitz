@@ -15,12 +15,7 @@ fn relation_test_dir(name: &str) -> String {
 /// Enter `id` and open its store; returns its relation directory, which
 /// `add_index` also opens its index children under.
 fn register_entry(registry: &mut RelationRegistry, id: i64, schema: SchemaDescriptor, kind: RelationKind) -> String {
-    let spec = RelationSpec {
-        id,
-        kind,
-        schema,
-        props: ViewProps::default(),
-    };
+    let spec = RelationSpec { id, kind, schema };
     registry.register(spec).unwrap();
     registry.relation(id).unwrap().directory().to_string()
 }
@@ -149,9 +144,8 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     registry
         .register(RelationSpec {
             id: vid,
-            kind: RelationKind::View,
+            kind: RelationKind::View(ViewProps::Fed { delta_bytes: 1 << 20 }),
             schema,
-            props: ViewProps::Fed { delta_bytes: 1 << 20 },
         })
         .unwrap();
 
@@ -219,7 +213,7 @@ fn ingest_apply_error_returned_internal() {
     let mut registry = solo_registry("seam_abort");
     let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
     let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-    register_entry(&mut registry, tid, schema, RelationKind::View);
+    register_entry(&mut registry, tid, schema, RelationKind::View(ViewProps::Plain));
     let mut batch = Batch::with_capacity(&schema, 1);
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());

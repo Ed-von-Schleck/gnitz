@@ -2286,7 +2286,6 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             id: tid,
             kind: RelationKind::BaseTable,
             schema,
-            props: ViewProps::default(),
         })
         .unwrap();
     engine.registry.add_index(tid, tid + 1, &[3], false).unwrap();

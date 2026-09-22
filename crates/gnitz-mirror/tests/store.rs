@@ -17,7 +17,7 @@ use gnitz_store::storage::{Batch, ChildAddr, ChildKind, Slot};
 use gnitz_store_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
-use gnitz_wire::{ReadBound, ReadSpec};
+use gnitz_wire::{ReadBound, ReadSpec, ViewProps};
 
 /// Every test in this binary takes this lock: `cargo test` runs a target's tests
 /// as threads of one process, and a store open touches process-wide state — the
@@ -113,7 +113,7 @@ fn whole_copy(store: &mut Mirror, tid: u64) -> Result<ZSetBatch, MirrorError> {
 
 /// One copy's directory, through the engine's own path grammar.
 fn copy_dir(base_dir: &str, tid: u64) -> String {
-    relation_dir(base_dir, RelationKind::View, tid as i64)
+    relation_dir(base_dir, RelationKind::View(ViewProps::Plain), tid as i64)
 }
 
 /// Whether `tid`'s copy currently has a published manifest — the on-disk

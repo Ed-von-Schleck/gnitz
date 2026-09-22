@@ -195,7 +195,13 @@ fn fk_child_adopts_the_parent_pk_type() {
     let s = client.resolve_table_or_view_id(&sn, "child").unwrap().1;
     let fk = &s.columns[col_idx(&s, "p_id")];
     assert_eq!(fk.ty.tc, TypeCode::I64);
-    assert!(matches!(fk.fk, Some(gnitz_core::FkTarget::Table { .. })));
+    let err = try_exec(&mut client, &sn, "INSERT INTO child VALUES (1, 99)").unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("foreign key"),
+        "an orphan child row is refused: {err}"
+    );
+    exec(&mut client, &sn, "INSERT INTO parent VALUES (99, 'p')");
+    exec(&mut client, &sn, "INSERT INTO child VALUES (1, 99)");
 
     assert_rejects_variant(
         &mut client,

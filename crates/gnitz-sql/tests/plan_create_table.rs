@@ -2,7 +2,7 @@
 //! precedence between the passes, the constraint spellings that are rejected,
 //! and the bundle a plan carries.
 
-use gnitz_core::{FkTarget, RelClass, TypeCode};
+use gnitz_core::{FkTarget, InlineForeignKey, RelClass, TypeCode};
 
 mod pure;
 use pure::*;
@@ -20,6 +20,7 @@ fn plan_table(cat: &gnitz_core::CatalogSnapshot, sql: &str) -> Result<TablePlan,
 /// The `Create` payload of a plan expected to succeed.
 struct Created {
     cols: Vec<gnitz_core::ColumnDef>,
+    fks: Vec<InlineForeignKey>,
     pk_indices: Vec<u32>,
     props: gnitz_core::TableProps,
     unique_indexes: Vec<(Vec<u32>, String)>,
@@ -28,8 +29,19 @@ struct Created {
 fn created(cat: &gnitz_core::CatalogSnapshot, sql: &str) -> Created {
     match plan_table(cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}")) {
         TablePlan::Create {
-            cols, pk_indices, props, unique_indexes, ..
-        } => Created { cols, pk_indices, props, unique_indexes },
+            cols,
+            fks,
+            pk_indices,
+            props,
+            unique_indexes,
+            ..
+        } => Created {
+            cols,
+            fks,
+            pk_indices,
+            props,
+            unique_indexes,
+        },
         TablePlan::Skip { .. } => panic!("`{sql}` planned a skip"),
     }
 }
@@ -89,7 +101,13 @@ fn primary_key_precedence() {
         "CREATE TABLE sref (refc BIGINT REFERENCES sref(id), id BIGINT PRIMARY KEY)",
     );
     assert_eq!(c.pk_indices, vec![1]);
-    assert_eq!(c.cols[0].fk, Some(FkTarget::SelfTable { col: 1 }));
+    assert_eq!(
+        c.fks,
+        vec![InlineForeignKey {
+            col_idx: 0,
+            target: FkTarget::SelfTable { col: 1 }
+        }]
+    );
 }
 
 // ── the constraint spellings that are rejected ───────────────────────────────
@@ -309,7 +327,13 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         "CREATE TABLE c (id BIGINT PRIMARY KEY, r INT UNIQUE REFERENCES p(id))",
     );
     assert_eq!(c.cols[1].ty.tc, TypeCode::I64, "widened to the parent's type");
-    assert_eq!(c.cols[1].fk, Some(FkTarget::Table { id: 41, col: 0 }));
+    assert_eq!(
+        c.fks,
+        vec![InlineForeignKey {
+            col_idx: 1,
+            target: FkTarget::Table { id: 41, col: 0 }
+        }]
+    );
     assert_eq!(c.unique_indexes, vec![(vec![1], format!("{SN}__c__idx_r"))]);
 
     // A non-PK parent column is a legal target only with a single-column UNIQUE

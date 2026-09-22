@@ -23,7 +23,7 @@ pub mod types;
 // shortening".
 pub use client::{
     delta_reply_schema, not_found, qualified_name, retraction_batch, segment_id, CatalogSnapshot, DeltaCursor,
-    GnitzClient, IndexMeta, InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
+    GnitzClient, InlineForeignKey, InlineUniqueIndex, ParkHook, PlannedView, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
     Completions, IdRun, Interest, RawBlock, RelDescriptor, RelTarget, Reply, Request, ScanReply, Session, SlotId,
@@ -33,8 +33,8 @@ pub use error::ClientError;
 pub use gnitz_expr::{ColumnTable, SchemaFacts};
 pub use gnitz_wire::{agg_output_type, Circuit, MapKind, Node, NodeId, NodeInputs, OpNode, RangeRel, ReindexRole};
 pub use gnitz_wire::{
-    validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, ReindexSlot, RelClass, TableProps,
-    ViewProps, FIRST_USER_TABLE_ID, TABLE_TAB,
+    validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, ReindexSlot, RelClass, RelIndex,
+    TableProps, ViewProps, FIRST_USER_TABLE_ID, TABLE_TAB,
 };
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult};
 pub use protocol::{

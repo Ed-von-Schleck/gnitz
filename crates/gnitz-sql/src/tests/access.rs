@@ -41,7 +41,7 @@ fn terms_of(conjuncts: &[BoundExpr], sch: &Schema) -> Vec<Term> {
 fn first_index(
     conjuncts: &[BoundExpr],
     sch: &Schema,
-    metas: &[IndexMeta],
+    metas: &[RelIndex],
 ) -> Option<(Vec<u32>, RangeDescriptor, usize)> {
     candidates(conjuncts, sch, metas)
         .into_iter()

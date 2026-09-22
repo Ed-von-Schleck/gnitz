@@ -24,6 +24,7 @@ use gnitz_store::relation::{relation_dir, RelationKind};
 use gnitz_store::storage::{ChildAddr, ChildKind, Slot};
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
+use gnitz_wire::ViewProps;
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
 
 /// Four workers, because that is the only count that exercises the fan-out.
@@ -1182,7 +1183,7 @@ fn has_manifest(base_dir: &str, view_id: u64) -> bool {
 /// The directory one mirrored copy lives in, through the engine's own path
 /// grammar — the same reason [`has_manifest`] builds its path that way.
 fn copy_dir(base_dir: &str, view_id: u64) -> String {
-    relation_dir(base_dir, RelationKind::View, view_id as i64)
+    relation_dir(base_dir, RelationKind::View(ViewProps::Plain), view_id as i64)
 }
 
 /// A server restart erases the copy: the stored cursor tag no longer matches the
@@ -1396,7 +1397,7 @@ fn nullable_payloads_of_every_width_survive_the_copy() {
         gnitz_core::ColumnDef::new("b", gnitz_core::TypeCode::Blob, true),
     ];
     fx.direct
-        .create_table("nl", "blb", &cols, &[0], gnitz_core::TableProps::default(), &[])
+        .create_table("nl", "blb", &cols, &[], &[0], gnitz_core::TableProps::default(), &[])
         .expect("a BLOB column is admissible through the binary API");
     let (blb_tid, blb_schema) = fx.direct.resolve_table_or_view_id("nl", "blb").unwrap();
     let mut batch = gnitz_core::ZSetBatch::new(&blb_schema);
