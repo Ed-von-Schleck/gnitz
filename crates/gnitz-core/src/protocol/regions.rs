@@ -5,8 +5,8 @@
 
 use super::types::ZSetBatch;
 use gnitz_wire::as_le_bytes;
-use gnitz_wire::region::Regions;
 use gnitz_wire::wal::WalBlock;
+use gnitz_wire::Regions;
 
 impl ZSetBatch {
     /// This batch as the §6 canonical region list. Panics unless every payload

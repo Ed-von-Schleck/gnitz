@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use super::{op_join_delta_trace, JoinPlan};
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout, ReadCursor};
 use crate::test_support::bench_time;
 use gnitz_wire::{JoinKind, RangeRel};
@@ -70,13 +70,13 @@ impl Payload {
 /// `pk_types` PK columns followed by `p`'s payload columns. Column 0 of the
 /// payload is always the non-nullable I64 the fixtures order rows by, so
 /// `(PK, payload)` order is decided by it alone in every payload shape.
-fn schema_for(pk_types: &[u8], p: Payload) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = pk_types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
-    cols.push(SchemaColumn::new(type_code::I64, 0));
+fn schema_for(pk_types: &[TypeCode], p: Payload) -> SchemaDescriptor {
+    let mut cols: Vec<SchemaColumn> = pk_types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
+    cols.push(SchemaColumn::new(TypeCode::I64, false));
     match p {
         Payload::Int => {}
-        Payload::Nullable => cols.push(SchemaColumn::new(type_code::I64, 1)),
-        Payload::Str => cols.push(SchemaColumn::new(type_code::STRING, 0)),
+        Payload::Nullable => cols.push(SchemaColumn::new(TypeCode::I64, true)),
+        Payload::Str => cols.push(SchemaColumn::new(TypeCode::String, false)),
     }
     let pk: Vec<u32> = (0..pk_types.len() as u32).collect();
     SchemaDescriptor::new(&cols, &pk)
@@ -238,7 +238,7 @@ fn equi_rows(shape: &EquiShape) -> (Vec<Row>, Vec<Row>) {
 fn join_equi_dt_bench() {
     println!("\n=== equi delta-trace join ({ITERS} iters) ===");
     for p in [Payload::Int, Payload::Nullable, Payload::Str] {
-        let schema = schema_for(&[type_code::U64], p);
+        let schema = schema_for(&[TypeCode::U64], p);
         for shape in &EQUI_SHAPES {
             let (delta_rows, trace_rows) = equi_rows(shape);
             let delta = build(&schema, p, &delta_rows);
@@ -273,7 +273,7 @@ fn join_cross_dt_bench() {
     println!("\n=== cross delta-trace join ({ITERS} iters) ===");
     let rows = |n: usize| -> Vec<Row> { (0..n as u128).map(|k| (vec![k], k as i64)).collect() };
     for p in [Payload::Int, Payload::Nullable, Payload::Str] {
-        let schema = schema_for(&[type_code::U64], p);
+        let schema = schema_for(&[TypeCode::U64], p);
         for (name, d, t) in CROSS_SHAPES {
             let delta = build(&schema, p, &rows(d));
             for srcs in SOURCE_COUNTS {
@@ -302,7 +302,7 @@ fn join_cross_dt_bench() {
 struct RangeShape {
     name: &'static str,
     /// PK column type codes; the last is the range slot, the rest the eq prefix.
-    pk_types: &'static [u8],
+    pk_types: &'static [TypeCode],
     /// Delta slot values are drawn from the low `span_num / span_den` of the
     /// slot space for the upward rels — so `Gt`/`Ge` cover a wide span and
     /// `Lt`/`Le` a narrow one, and the pair of entries below covers both.
@@ -319,7 +319,7 @@ struct RangeShape {
 const RANGE_SHAPES: [RangeShape; 6] = [
     RangeShape {
         name: "n_eq=0 stride=8 wide-span",
-        pk_types: &[type_code::U64],
+        pk_types: &[TypeCode::U64],
         span_num: 1,
         span_den: 16,
         miss_stride: 1,
@@ -327,7 +327,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
     },
     RangeShape {
         name: "n_eq=0 stride=8 narrow-span",
-        pk_types: &[type_code::U64],
+        pk_types: &[TypeCode::U64],
         span_num: 15,
         span_den: 16,
         miss_stride: 1,
@@ -335,7 +335,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
     },
     RangeShape {
         name: "n_eq=1 stride=8 wide-span",
-        pk_types: &[type_code::U32, type_code::U32],
+        pk_types: &[TypeCode::U32, TypeCode::U32],
         span_num: 1,
         span_den: 16,
         miss_stride: 1,
@@ -343,7 +343,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
     },
     RangeShape {
         name: "n_eq=1 stride=12 wide-span",
-        pk_types: &[type_code::U32, type_code::U64],
+        pk_types: &[TypeCode::U32, TypeCode::U64],
         span_num: 1,
         span_den: 16,
         miss_stride: 1,
@@ -351,7 +351,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
     },
     RangeShape {
         name: "n_eq=1 stride=12 mostly-unmatched",
-        pk_types: &[type_code::U32, type_code::U64],
+        pk_types: &[TypeCode::U32, TypeCode::U64],
         span_num: 1,
         span_den: 16,
         miss_stride: 16,
@@ -361,7 +361,7 @@ const RANGE_SHAPES: [RangeShape; 6] = [
     // sweeps, where the shapes above skip at most 15 rows.
     RangeShape {
         name: "n_eq=1 stride=12 sparse-groups",
-        pk_types: &[type_code::U32, type_code::U64],
+        pk_types: &[TypeCode::U32, TypeCode::U64],
         span_num: 1,
         span_den: 16,
         miss_stride: 128,

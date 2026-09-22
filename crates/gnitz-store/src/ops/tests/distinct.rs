@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::payload_order::PayloadCmpKind;
-use crate::schema::{type_code, SchemaColumn};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_opk, make_schema_pk_u64_payload_blob, make_schema_u128_i64,
     make_schema_u64_i64, opk_pk, pk_payload_schema, trace_cursor, u64_pk_schema,
@@ -150,15 +150,15 @@ type ProbeCase<'a> = (&'a [(&'a [u8], i64, i64)], &'a [(&'a [u8], i64)]);
 #[test]
 fn distinct_probes_the_trace_by_whole_opk_keys_at_every_pk_shape() {
     let shapes: [(&str, SchemaDescriptor, &[u128], &[u128]); 5] = [
-        ("u64", pk_payload_schema(&[type_code::U64]), &[2], &[1]),
-        ("2xu64", pk_payload_schema(&[type_code::U64; 2]), &[2, 3], &[1, 5]),
+        ("u64", pk_payload_schema(&[TypeCode::U64]), &[2], &[1]),
+        ("2xu64", pk_payload_schema(&[TypeCode::U64; 2]), &[2, 3], &[1, 5]),
         (
             "3xu64",
-            pk_payload_schema(&[type_code::U64; 3]),
+            pk_payload_schema(&[TypeCode::U64; 3]),
             &[1, 1, 1 << 56],
             &[1, 1, 2],
         ),
-        ("i64", pk_payload_schema(&[type_code::I64]), &[2], &[-1i64 as u128]),
+        ("i64", pk_payload_schema(&[TypeCode::I64]), &[2], &[-1i64 as u128]),
         ("u128", make_schema_u128_i64(), &[u128::MAX], &[0]),
     ];
     for (name, schema, held, absent) in shapes {
@@ -203,7 +203,7 @@ fn assert_payload_dispatch(schema: &SchemaDescriptor, mk: impl Fn(bool) -> Batch
 /// rather than through the fixed-width path.
 #[test]
 fn distinct_compares_payloads_through_the_schema_selected_comparator() {
-    let narrow = u64_pk_schema(SchemaColumn::new(type_code::I32, 0));
+    let narrow = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
     let blob = make_schema_pk_u64_payload_blob();
     assert_eq!(narrow.payload_cmp, PayloadCmpKind::FixedIntNonnull);
     assert_eq!(blob.payload_cmp, PayloadCmpKind::Generic);

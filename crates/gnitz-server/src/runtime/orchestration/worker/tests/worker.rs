@@ -5,7 +5,7 @@ use crate::test_support::{make_batch_raw, make_schema_u64_i64, u64_pk_schema};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::BatchBuilder;
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 /// `buffer_pending_delta` appends into an existing entry rather than
 /// replacing it — the shape the live push path and boot SAL replay share.
@@ -390,7 +390,7 @@ fn ring_and_writer() -> (crate::runtime::test_support::SharedRegion, W2mWriter) 
 /// A U64 PK with a stride-4 payload column: the shape whose wire block pads
 /// between regions, so its size is monotone in the row count but not affine.
 fn padded_schema() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(type_code::U32, 0))
+    u64_pk_schema(SchemaColumn::new(TypeCode::U32, false))
 }
 
 /// `n` rows of `schema`, PK and payload both counting from 0.
@@ -411,7 +411,7 @@ fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
 /// A U64 PK with one STRING payload column — the shape whose batches carry a
 /// live blob heap, so every frame of a train over one must compact it.
 fn string_schema() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(type_code::STRING, 0))
+    u64_pk_schema(SchemaColumn::new(TypeCode::String, false))
 }
 
 /// `(pk, string)` rows over [`string_schema`] at weight 1. Values past
@@ -606,9 +606,9 @@ fn pending_streams_drain_two_trains_fifo() {
     // B's schema has 3 columns so its frames are distinguishable from A's.
     let schema_b = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );

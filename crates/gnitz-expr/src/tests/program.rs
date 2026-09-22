@@ -2,7 +2,7 @@
 // of PI meant to be replaced with std::f64::consts::PI.
 #![allow(clippy::approx_constant)]
 
-use gnitz_wire::{type_code, FixedInt};
+use gnitz_wire::{FixedInt, TypeCode};
 use std::collections::BTreeSet;
 
 // `tests/program.rs` is `#[path]`-attached to `program.rs`, so `super` is that
@@ -81,7 +81,7 @@ fn int_add_and_negate() {
 
 #[test]
 fn float_add() {
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::F64, type_code::F64]);
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::F64, TypeCode::F64]);
     // Store floats as i64 bits
     let a_bits = encode_f64(3.14);
     let b_bits = encode_f64(2.0);
@@ -150,7 +150,7 @@ fn int_to_float_widens_the_register() {
 /// operator, by `int_compare_agrees_with_the_rust_operator_at_both_signednesses`.
 #[test]
 fn a_u64_column_selects_the_unsigned_arm_of_div_mod_and_the_float_cast() {
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64]);
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::U64]);
     // u64::MAX is -1 as i64, so every signed reading below is a different number.
     let mb = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64])]);
     let run = |instrs: Vec<LogicalInstr>, result: u16| {
@@ -323,18 +323,24 @@ fn a_register_free_program_is_rejected() {
 fn a_column_index_resolves_to_the_pk_or_to_its_dense_payload_slot() {
     // (PK column index, column types, PK value, payload values, and per logical
     // column its expected payload slot — `None` for the PK — and the value read)
-    type Case = (usize, &'static [u8], u64, &'static [i64], &'static [(Option<u8>, i64)]);
+    type Case = (
+        usize,
+        &'static [TypeCode],
+        u64,
+        &'static [i64],
+        &'static [(Option<u8>, i64)],
+    );
     let cases: [Case; 2] = [
         (
             0,
-            &[type_code::U64, type_code::I64, type_code::I64],
+            &[TypeCode::U64, TypeCode::I64, TypeCode::I64],
             42,
             &[10, 20],
             &[(None, 42), (Some(0), 10), (Some(1), 20)],
         ),
         (
             1,
-            &[type_code::I64, type_code::U64, type_code::I64],
+            &[TypeCode::I64, TypeCode::U64, TypeCode::I64],
             99,
             &[5, 7],
             &[(Some(0), 5), (None, 99), (Some(1), 7)],
@@ -484,7 +490,7 @@ fn select_is_non_nullable_when_both_branches_are() {
 #[test]
 fn select_propagates_u64_tracking_to_its_reader() {
     // Schema: pk(u64), u64col(U64), i64col(I64).
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64, type_code::I64]);
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::U64, TypeCode::I64]);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 2 }, // cond (i64)
         LogicalInstr::LoadColInt { col: 1 }, // a (U64)
@@ -841,14 +847,14 @@ fn validate_err_display_names_the_register_limit() {
     // The type half of the requirement. The region half is its own variant, and
     // its own sentence below — a PK column is exactly what a client is likely to
     // have named.
-    let mismatch = |want| ExprValidateErr::ColKindMismatch { col: 2, type_code: type_code::U64, want }.to_string();
+    let mismatch = |want| ExprValidateErr::ColKindMismatch { col: 2, type_code: TypeCode::U64, want }.to_string();
     assert_eq!(
         mismatch(type_phrase(ColKind::FixedIntCol)),
-        "column 2 (type code 8) cannot be used here; this operator needs a fixed-width integer column"
+        "column 2 (type code U64) cannot be used here; this operator needs a fixed-width integer column"
     );
     assert_eq!(
         mismatch(type_phrase(ColKind::FloatPayload)),
-        "column 2 (type code 8) cannot be used here; this operator needs a floating-point column"
+        "column 2 (type code U64) cannot be used here; this operator needs a floating-point column"
     );
     assert_eq!(
         ExprValidateErr::ColNotPayload { col: 0 }.to_string(),
@@ -955,13 +961,13 @@ fn validate_rejects_a_pk_column_for_a_payload_only_opcode() {
 fn validate_rejects_a_wide_column_register_load() {
     // LOAD_COL_INT on a 16-byte U128 column: a register holds 8 bytes, so the
     // load is rejected at validation rather than silently truncating.
-    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::U128, true)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::U128, true)], &[0]);
     let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], None, vec![]).unwrap();
     assert_eq!(
         prog.validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
-            type_code: type_code::U128,
+            type_code: TypeCode::U128,
             want: type_phrase(ColKind::FixedIntCol),
         })
     );
@@ -970,11 +976,11 @@ fn validate_rejects_a_wide_column_register_load() {
 /// `LoadColInt`'s kernel decodes little-endian integer bytes; a width test alone
 /// let two shapes through that it cannot decode — a float column (whose bit
 /// pattern would become an integer; both widths take different kernel arms) and
-/// an unknown type code, which `wire_stride` maps to 8 by design.
+/// a string cell.
 #[test]
 fn load_col_int_requires_a_fixed_int_column() {
-    for tc in [type_code::F64, type_code::F32, 200, type_code::STRING] {
-        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
+    for tc in [TypeCode::F64, TypeCode::F32, TypeCode::String] {
+        let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
         let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], None, vec![]).unwrap();
         assert_eq!(
             prog.validate(&schema, None),
@@ -988,16 +994,16 @@ fn load_col_int_requires_a_fixed_int_column() {
     }
     // Every fixed-width integer is loadable, PK column included.
     for tc in [
-        type_code::U8,
-        type_code::I8,
-        type_code::U16,
-        type_code::I16,
-        type_code::U32,
-        type_code::I32,
-        type_code::U64,
-        type_code::I64,
+        TypeCode::U8,
+        TypeCode::I8,
+        TypeCode::U16,
+        TypeCode::I16,
+        TypeCode::U32,
+        TypeCode::I32,
+        TypeCode::U64,
+        TypeCode::I64,
     ] {
-        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
+        let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
         let prog = from_regions(&one(ExprOp::LoadColInt, 0, &[1]), &[], None, vec![]).unwrap();
         assert_eq!(prog.validate(&schema, None), Ok(()), "type code {tc}");
     }
@@ -1008,13 +1014,13 @@ fn load_col_int_requires_a_fixed_int_column() {
 /// and every other non-float width is silent garbage.
 #[test]
 fn load_col_float_requires_a_float_column() {
-    let case = |tc: u8| {
-        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
+    let case = |tc: TypeCode| {
+        let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
         from_regions(&one(ExprOp::LoadColFloat, 0, &[1]), &[], None, vec![])
             .unwrap()
             .validate(&schema, None)
     };
-    for tc in [type_code::U16, type_code::U64, type_code::STRING] {
+    for tc in [TypeCode::U16, TypeCode::U64, TypeCode::String] {
         assert_eq!(
             case(tc),
             Err(ExprValidateErr::ColKindMismatch {
@@ -1025,17 +1031,17 @@ fn load_col_float_requires_a_float_column() {
             "LOAD_COL_FLOAT must reject type code {tc}"
         );
     }
-    assert_eq!(case(type_code::F32), Ok(()));
-    assert_eq!(case(type_code::F64), Ok(()));
+    assert_eq!(case(TypeCode::F32), Ok(()));
+    assert_eq!(case(TypeCode::F64), Ok(()));
 }
 
 /// The string compares read 16-byte German-string cells with `col_data(pi, 16)`,
 /// which over-reads (and eventually runs off) a narrower column's region.
 #[test]
 fn str_opcodes_require_a_german_string_column() {
-    let schema = |a: u8, b: u8| TestSchema::with_pk_at(0, &[type_code::U64, a, b]);
+    let schema = |a: TypeCode, b: TypeCode| TestSchema::with_pk_at(0, &[TypeCode::U64, a, b]);
     // STR_COL_CONST col=1.
-    let vs_const = |a: u8| {
+    let vs_const = |a: TypeCode| {
         from_regions(
             &one(ExprOp::StrColConst, CmpOp::Eq.as_wire(), &[1, 0]),
             &[],
@@ -1043,42 +1049,42 @@ fn str_opcodes_require_a_german_string_column() {
             vec![b"x".to_vec()],
         )
         .unwrap()
-        .validate(&schema(a, type_code::STRING), None)
+        .validate(&schema(a, TypeCode::String), None)
     };
     assert_eq!(
-        vs_const(type_code::U64),
+        vs_const(TypeCode::U64),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
-            type_code: type_code::U64,
+            type_code: TypeCode::U64,
             want: type_phrase(ColKind::StringPayload),
         })
     );
-    assert_eq!(vs_const(type_code::STRING), Ok(()));
-    assert_eq!(vs_const(type_code::BLOB), Ok(()));
+    assert_eq!(vs_const(TypeCode::String), Ok(()));
+    assert_eq!(vs_const(TypeCode::Blob), Ok(()));
 
     // STR_COL_COL col_a=1 col_b=2 — both operands are checked.
-    let vs_col = |a: u8, b: u8| {
+    let vs_col = |a: TypeCode, b: TypeCode| {
         from_regions(&one(ExprOp::StrColCol, CmpOp::Eq.as_wire(), &[1, 2]), &[], None, vec![])
             .unwrap()
             .validate(&schema(a, b), None)
     };
     assert_eq!(
-        vs_col(type_code::U64, type_code::STRING),
+        vs_col(TypeCode::U64, TypeCode::String),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
-            type_code: type_code::U64,
+            type_code: TypeCode::U64,
             want: type_phrase(ColKind::StringPayload),
         })
     );
     assert_eq!(
-        vs_col(type_code::STRING, type_code::U64),
+        vs_col(TypeCode::String, TypeCode::U64),
         Err(ExprValidateErr::ColKindMismatch {
             col: 2,
-            type_code: type_code::U64,
+            type_code: TypeCode::U64,
             want: type_phrase(ColKind::StringPayload),
         })
     );
-    assert_eq!(vs_col(type_code::STRING, type_code::BLOB), Ok(()));
+    assert_eq!(vs_col(TypeCode::String, TypeCode::Blob), Ok(()));
 }
 
 /// `IsNull`/`IsNotNull` read the NULL bitmap and nothing else, so any payload
@@ -1086,8 +1092,8 @@ fn str_opcodes_require_a_german_string_column() {
 /// not have narrowed them to a type class.
 #[test]
 fn null_tests_accept_any_payload_column() {
-    for tc in [type_code::U128, type_code::STRING, type_code::F32] {
-        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
+    for tc in [TypeCode::U128, TypeCode::String, TypeCode::F32] {
+        let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
         for invert in [0u32, 1] {
             let prog = from_regions(&one(ExprOp::IsNull, invert, &[1]), &[], None, vec![]).unwrap();
             assert_eq!(prog.validate(&schema, None), Ok(()), "invert {invert} type {tc}");
@@ -1101,30 +1107,30 @@ fn null_tests_accept_any_payload_column() {
 #[test]
 fn copy_col_admits_only_a_widening_destination() {
     // in: [U64 PK, <src>]; out: [U64 PK, <dst>] — one payload slot each.
-    let pair = |src: u8, dst: u8| {
-        let in_schema = TestSchema::with_pk_at(0, &[type_code::U64, src]);
-        let out_schema = TestSchema::with_pk_at(0, &[type_code::U64, dst]);
+    let pair = |src: TypeCode, dst: TypeCode| {
+        let in_schema = TestSchema::with_pk_at(0, &[TypeCode::U64, src]);
+        let out_schema = TestSchema::with_pk_at(0, &[TypeCode::U64, dst]);
         LogicalProgram::copy_cols(&[1]).validate(&in_schema, Some(&out_schema))
     };
     for (src, dst) in [
-        (type_code::I64, type_code::I64),
-        (type_code::STRING, type_code::STRING),
-        (type_code::BLOB, type_code::BLOB),
-        (type_code::U128, type_code::U128),
-        (type_code::F64, type_code::F64),
-        (type_code::U32, type_code::U64),
-        (type_code::U32, type_code::I64),
-        (type_code::U8, type_code::I16),
+        (TypeCode::I64, TypeCode::I64),
+        (TypeCode::String, TypeCode::String),
+        (TypeCode::Blob, TypeCode::Blob),
+        (TypeCode::U128, TypeCode::U128),
+        (TypeCode::F64, TypeCode::F64),
+        (TypeCode::U32, TypeCode::U64),
+        (TypeCode::U32, TypeCode::I64),
+        (TypeCode::U8, TypeCode::I16),
     ] {
         assert_eq!(pair(src, dst), Ok(()), "{src} -> {dst} must be accepted");
     }
     for (src, dst) in [
-        (type_code::STRING, type_code::U64),
-        (type_code::U64, type_code::STRING),
-        (type_code::U128, type_code::U64),
-        (type_code::U64, type_code::F64),
-        (type_code::F32, type_code::F64),
-        (type_code::U64, type_code::I64),
+        (TypeCode::String, TypeCode::U64),
+        (TypeCode::U64, TypeCode::String),
+        (TypeCode::U128, TypeCode::U64),
+        (TypeCode::U64, TypeCode::F64),
+        (TypeCode::F32, TypeCode::F64),
+        (TypeCode::U64, TypeCode::I64),
     ] {
         assert_eq!(
             pair(src, dst),
@@ -1133,8 +1139,8 @@ fn copy_col_admits_only_a_widening_destination() {
         );
     }
     // A PK source into a payload slot of the same type is a copy, not a promotion.
-    let in_pk = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
-    let out_pk = TestSchema::with_pk_at(0, &[type_code::I64, type_code::U64]);
+    let in_pk = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::I64]);
+    let out_pk = TestSchema::with_pk_at(0, &[TypeCode::I64, TypeCode::U64]);
     let prog = LogicalProgram::copy_cols(&[0]);
     assert_eq!(prog.validate(&in_pk, Some(&out_pk)), Ok(()));
     // Both output-side checks are inert for a filter (`out_schema = None`).
@@ -1147,17 +1153,17 @@ fn copy_col_admits_only_a_widening_destination() {
 #[test]
 fn a_register_sink_slot_must_be_eight_bytes() {
     // out: [U64 PK, <slot>] — one payload slot, written by the single sink.
-    let case = |tc: u8| {
-        let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
+    let case = |tc: TypeCode| {
+        let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, tc]);
         // LOAD_CONST into reg 0, stored into output slot 0.
         from_regions(&one(ExprOp::LoadConst, 0, &[0]), &[[1, 0]], None, vec![])
             .unwrap()
             .validate(&schema, Some(&schema))
     };
-    for tc in [type_code::I64, type_code::U64, type_code::F64] {
+    for tc in [TypeCode::I64, TypeCode::U64, TypeCode::F64] {
         assert_eq!(case(tc), Ok(()), "type code {tc}");
     }
-    for tc in [type_code::U128, type_code::F32] {
+    for tc in [TypeCode::U128, TypeCode::F32] {
         assert_eq!(
             case(tc),
             Err(ExprValidateErr::EmitSlotWidth { out: 0, type_code: tc }),
@@ -1166,7 +1172,7 @@ fn a_register_sink_slot_must_be_eight_bytes() {
     }
     // A German-string slot is refused on class, before the stride rule: the
     // source register is scalar, and the two errors name different faults.
-    for tc in [type_code::STRING, type_code::BLOB] {
+    for tc in [TypeCode::String, TypeCode::Blob] {
         assert_eq!(
             case(tc),
             Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: tc }),
@@ -1220,8 +1226,8 @@ fn new_panics_on_a_forward_register_reference() {
 
 /// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
 /// `col1 IN (…)`. `col_tc` picks col1's type (I64 / U64 / …).
-fn in_set_prog(col_tc: u8, set: &[i64]) -> (TestSchema, Evaluator) {
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, col_tc]);
+fn in_set_prog(col_tc: TypeCode, set: &[i64]) -> (TestSchema, Evaluator) {
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, col_tc]);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
@@ -1243,17 +1249,17 @@ fn in_set_prog(col_tc: u8, set: &[i64]) -> (TestSchema, Evaluator) {
 fn int_in_set_membership_over_every_pool_shape() {
     // (column type, pool, [(value, expected membership)]) — aliased because the
     // inline tuple trips `clippy::type_complexity`.
-    type Case<'a> = (u8, &'a [i64], &'a [(i64, i64)]);
+    type Case<'a> = (TypeCode, &'a [i64], &'a [(i64, i64)]);
     let big: Vec<i64> = (0..1000).collect();
     let cases: [Case<'_>; 4] = [
         (
-            type_code::I64,
+            TypeCode::I64,
             &[-5, -1, 0, 3],
             &[(-5, 1), (-1, 1), (0, 1), (3, 1), (2, 0), (100, 0)],
         ),
-        (type_code::U64, &[-1], &[(u64::MAX as i64, 1), (7, 0)]),
-        (type_code::I64, &[], &[(42, 0)]),
-        (type_code::I64, &big, &[(0, 1), (777, 1), (999, 1), (1000, 0), (-1, 0)]),
+        (TypeCode::U64, &[-1], &[(u64::MAX as i64, 1), (7, 0)]),
+        (TypeCode::I64, &[], &[(42, 0)]),
+        (TypeCode::I64, &big, &[(0, 1), (777, 1), (999, 1), (1000, 0), (-1, 0)]),
     ];
 
     for (col_tc, pool, values) in cases {
@@ -1307,7 +1313,7 @@ fn not_in_set_excludes_a_null_operand() {
 /// binary-searches it and the only sort otherwise happens in the client planner.
 #[test]
 fn an_unsorted_in_set_pool_is_sorted_at_resolve() {
-    let (schema, prog) = in_set_prog(type_code::I64, &[42, -1, 7, 3]);
+    let (schema, prog) = in_set_prog(TypeCode::I64, &[42, -1, 7, 3]);
     assert_eq!(prog.prog.int_sets[0], vec![-1, 3, 7, 42]);
     // A binary search over the raw descending-ish order would miss 7 (it sits
     // past the first probe's `42 > 7` left turn).
@@ -1389,15 +1395,15 @@ fn decode_rejects_a_forged_cast_target() {
     for op in [ExprOp::IntCast, ExprOp::FloatToInt] {
         for tc in [
             0u32,
-            type_code::STRING as u32,
-            type_code::U128 as u32,
-            type_code::F64 as u32,
+            TypeCode::String.as_wire() as u32,
+            TypeCode::U128.as_wire() as u32,
+            TypeCode::F64.as_wire() as u32,
             255,
             // A `>= 255` word must not be truncated into a valid code on the
             // way in: the full u32 has to reach the narrowing, or these would
             // pass as I64.
-            0x100u32 | type_code::I64 as u32,
-            0x1_0000u32 | type_code::I64 as u32,
+            0x100u32 | TypeCode::I64.as_wire() as u32,
+            0x1_0000u32 | TypeCode::I64.as_wire() as u32,
         ] {
             let c = code(&[(ExprOp::LoadColInt, 0, &[1]), (op, tc, &[0])]);
             assert_eq!(
@@ -1408,14 +1414,14 @@ fn decode_rejects_a_forged_cast_target() {
         }
         // Control: every fixed-int target is accepted.
         for tc in [
-            type_code::I8,
-            type_code::U8,
-            type_code::I16,
-            type_code::U16,
-            type_code::I32,
-            type_code::U32,
-            type_code::I64,
-            type_code::U64,
+            TypeCode::I8,
+            TypeCode::U8,
+            TypeCode::I16,
+            TypeCode::U16,
+            TypeCode::I32,
+            TypeCode::U32,
+            TypeCode::I64,
+            TypeCode::U64,
         ] {
             let c = code(&[(ExprOp::LoadColInt, 0, &[1]), (op, tc as u32, &[0])]);
             assert!(
@@ -1528,7 +1534,7 @@ fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
 /// is what makes the guard's absence observable.
 #[test]
 fn a_nullable_pk_column_load_keeps_no_nulls() {
-    let schema = TestSchema::new(&[(type_code::U64, true), (type_code::I64, false)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U64, true), (TypeCode::I64, false)], &[0]);
     let instrs = vec![LogicalInstr::LoadColInt { col: 0 }];
     assert!(scalar_prog(&schema, instrs, Reg(0), vec![]).prog.no_nulls);
 }
@@ -1541,7 +1547,7 @@ fn a_nullable_pk_column_load_keeps_no_nulls() {
 #[test]
 fn a_float_column_load_carries_its_null_bit() {
     let no_nulls_over = |nullable: bool| {
-        let schema = TestSchema::new(&[(type_code::U64, false), (type_code::F64, nullable)], &[0]);
+        let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::F64, nullable)], &[0]);
         let instrs = vec![LogicalInstr::LoadColFloat { col: 1 }];
         scalar_prog(&schema, instrs, Reg(0), vec![]).prog.no_nulls
     };
@@ -1555,7 +1561,7 @@ fn a_float_column_load_carries_its_null_bit() {
 #[test]
 fn min_max2_compare_domain_and_u64_propagation() {
     // pk(U64), col1 = U64, col2 = I64.
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64, type_code::I64]);
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::U64, TypeCode::I64]);
     let signed_of = |a_col: u32, b_col: u32| {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: a_col },
@@ -1588,7 +1594,7 @@ fn min_max2_compare_domain_and_u64_propagation() {
 #[test]
 fn int_cast_reseeds_u64_tracking_from_its_target() {
     // pk(U64), col1 = I64 (signed-tracked), col2 = U64.
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64, type_code::U64]);
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::I64, TypeCode::U64]);
     let cmp_signed_after = |fi: FixedInt, src_col: u32| {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: src_col },
@@ -1618,7 +1624,7 @@ fn int_cast_reseeds_u64_tracking_from_its_target() {
 /// it is what decides whether the range check reads the register as i64 or u64.
 #[test]
 fn int_cast_records_the_source_signedness() {
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64, type_code::U64]);
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::I64, TypeCode::U64]);
     let src_signed_of = |src_col: u32| {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: src_col },
@@ -1749,21 +1755,21 @@ fn a_sink_only_program_names_no_registers() {
 #[test]
 fn a_register_sink_must_match_its_destination_column() {
     // out: [U64 PK, STRING].
-    let str_out = TestSchema::with_pk_at(0, &[type_code::U64, type_code::STRING]);
-    let int_out = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
-    let in_str = TestSchema::with_pk_at(0, &[type_code::U64, type_code::STRING]);
+    let str_out = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::String]);
+    let int_out = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::I64]);
+    let in_str = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::String]);
     let store_r0: &[[u32; SINK_WORDS]] = &[[1, 0]]; // Sink::Reg(0)
 
     let scalar_src = from_regions(&one(ExprOp::LoadConst, 0, &[7]), store_r0, None, vec![]).unwrap();
     assert_eq!(
         scalar_src.validate(&in_str, Some(&str_out)),
-        Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: type_code::STRING })
+        Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: TypeCode::String })
     );
 
     let str_src = from_regions(&one(ExprOp::LoadColStr, 0, &[1]), store_r0, None, vec![]).unwrap();
     assert_eq!(
         str_src.validate(&in_str, Some(&int_out)),
-        Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: type_code::I64 })
+        Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: TypeCode::I64 })
     );
     // The matching pairing is accepted, and the class mask the check read holds
     // reg 0 to be a string for one program and a scalar for the other.
@@ -1789,14 +1795,14 @@ fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
 
 #[test]
 fn load_col_str_requires_a_german_string_column() {
-    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
+    let schema = TestSchema::with_pk_at(0, &[TypeCode::U64, TypeCode::I64]);
     assert_eq!(
         from_regions(&one(ExprOp::LoadColStr, 0, &[1]), &[], None, vec![])
             .unwrap()
             .validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
-            type_code: type_code::I64,
+            type_code: TypeCode::I64,
             want: type_phrase(ColKind::StringPayload),
         })
     );
@@ -2433,7 +2439,7 @@ fn sequential_copy_projection() {
 #[test]
 fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
     let schema = TestSchema::new(
-        &[(type_code::U64, false), (type_code::I64, true), (type_code::I64, false)],
+        &[(TypeCode::U64, false), (TypeCode::I64, true), (TypeCode::I64, false)],
         &[0],
     );
     assert!(LogicalProgram::copy_cols(&[1, 2]).is_identity_map(&schema, &schema));
@@ -2448,7 +2454,7 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
     );
     assert!(!computed.is_identity_map(&schema, &schema), "computed sink");
     let other_payload = TestSchema::new(
-        &[(type_code::U64, false), (type_code::I64, true), (type_code::I32, false)],
+        &[(TypeCode::U64, false), (TypeCode::I64, true), (TypeCode::I32, false)],
         &[0],
     );
     assert!(
@@ -2456,11 +2462,7 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
         "different payload type"
     );
     let other_pk = TestSchema::new(
-        &[
-            (type_code::U64, false),
-            (type_code::I64, false),
-            (type_code::I64, false),
-        ],
+        &[(TypeCode::U64, false), (TypeCode::I64, false), (TypeCode::I64, false)],
         &[1],
     );
     assert!(
@@ -2473,11 +2475,11 @@ fn is_identity_map_requires_an_in_order_copy_over_one_layout() {
 /// writes. A source that cannot carry a set bit contributes no pair.
 #[test]
 fn null_perm_collapses_a_copy_list_to_three_shapes() {
-    let payload = |slot: u8| ColumnLocator::Payload { slot, size: 8, type_code: type_code::I64 };
+    let payload = |slot: u8| ColumnLocator::Payload { slot, size: 8, type_code: TypeCode::I64 };
     let pk = ColumnLocator::Pk {
         byte_off: 0,
         size: 8,
-        type_code: type_code::U64,
+        type_code: TypeCode::U64,
     };
     // Payload slots 0 and 2 admit NULL; slot 1 is NOT NULL.
     let nullable = 0b101;

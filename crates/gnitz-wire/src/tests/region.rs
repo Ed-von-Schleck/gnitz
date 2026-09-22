@@ -40,25 +40,6 @@ fn null_word_get_set_roundtrip() {
     assert_eq!(w, 0b100000);
 }
 
-/// `npc == 64` is the row-major cap, where the naive `(1 << npc) - 1` would
-/// shift by the word width.
-#[test]
-fn all_payload_null_mask_covers_the_full_word() {
-    assert_eq!(all_payload_null_mask(0), 0);
-    assert_eq!(all_payload_null_mask(1), 0b1);
-    assert_eq!(all_payload_null_mask(63), u64::MAX >> 1);
-    assert_eq!(all_payload_null_mask(64), u64::MAX);
-}
-
-/// `left_npc == 64` is the row-major cap, where the naive
-/// `left | (right << left_npc)` would shift by the word width. It is
-/// reachable only with an empty right side, so dropping the shift is exact.
-#[test]
-fn merge_null_words_at_the_full_left_width() {
-    assert_eq!(merge_null_words(0b1011, 0, 64), 0b1011);
-    assert_eq!(merge_null_words(u64::MAX, 0, 64), u64::MAX);
-}
-
 #[test]
 fn first_not_null_violation_names_the_first_row_and_its_lowest_offending_slot() {
     let words: [u64; 4] = [0b0001, 0b0000, 0b1100, 0b0100];

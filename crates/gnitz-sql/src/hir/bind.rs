@@ -483,7 +483,7 @@ pub(crate) trait ItemLeaf: LeafBinder<ColId> {
     /// (a window placeholder, a subquery's column) answers for those; everything
     /// else is the env's.
     fn type_of(&self, id: &ColId) -> ColType {
-        hircol_of(self.env(), *id).def.ty()
+        hircol_of(self.env(), *id).def.ty
     }
     /// The projection of `items` over `source`. The subquery-binding leaf joins in
     /// the subqueries its items and `source`'s filter read.
@@ -574,7 +574,7 @@ fn bind_proj_expr<L: ItemLeaf>(
         Some(d) if !d.is_hidden => aliased_def(d, alias),
         Some(d) => ColumnDef::typed(
             alias.unwrap_or_else(|| crate::validate::computed_column_name(idx)),
-            d.ty(),
+            d.ty,
             d.is_nullable,
         ),
         None => crate::validate::computed_column(alias, idx, bound.infer_ty_with(&|r| leaf.type_of(r))),
@@ -634,7 +634,7 @@ impl ItemLeaf for ScopeLeaf<'_> {
         match self.recorded(*id) {
             Some(SubqueryKind::Exists { .. }) => ColType::of(TypeCode::I64),
             Some(SubqueryKind::Scalar { ty, .. }) => ty,
-            None => hircol_of(self.env(), *id).def.ty(),
+            None => hircol_of(self.env(), *id).def.ty,
         }
     }
     fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
@@ -1332,7 +1332,7 @@ impl<'a> PreMap<'a> {
         if let Some(id) = find_bound(&self.extra, &bound) {
             return Ok(id);
         }
-        let ty = bound.infer_ty_with(&|id: &ColId| hircol_of(&self.env, *id).def.ty());
+        let ty = bound.infer_ty_with(&|id: &ColId| hircol_of(&self.env, *id).def.ty);
         // Declared nullable unconditionally (a computed value can be NULL: `a / 0`),
         // so an aggregate over one takes the null-skipping shape. Hidden because
         // only the expression that minted it may reach it.

@@ -3,7 +3,7 @@ use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_only_schema, pk_payload_schema};
 use gnitz_store::relation::StateLayout;
 use gnitz_store::schema::SchemaColumn;
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 use std::collections::HashMap;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ fn a_plan_outputs_the_named_node_which_its_node_list_must_hold() {
         build(
             &loaded,
             ordered,
-            &sources([(10, pk_only_schema(&[type_code::U64]))]),
+            &sources([(10, pk_only_schema(&[TypeCode::U64]))]),
             SELF_CONTAINED,
             &[],
             1,
@@ -221,7 +221,7 @@ fn a_global_aggregate_under_a_keyed_shard_is_rejected() {
 #[test]
 fn a_corrupt_expression_blob_aborts_the_compile() {
     use gnitz_wire::{MapKind, OpNode};
-    let fixture = MidCircuit::new(pk_only_schema(&[type_code::U64]));
+    let fixture = MidCircuit::new(pk_only_schema(&[TypeCode::U64]));
     for blob in [vec![0xFFu8; 16], Vec::new()] {
         assert!(
             fixture
@@ -255,9 +255,9 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
         plan_two_source_join(JoinKind::Range { n_eq, rel: RangeRel::Lt }, delta_schema, trace_schema)
     };
     // The shape the reindex packer produces: `[eq slot, range slot]` PK, then payload.
-    let band = |eq_tc: u8| pk_payload_schema(&[eq_tc, type_code::U64]);
-    let wide = band(type_code::U64); // pk_stride 16
-    let narrow = band(type_code::U32); // pk_stride 12
+    let band = |eq_tc: TypeCode| pk_payload_schema(&[eq_tc, TypeCode::U64]);
+    let wide = band(TypeCode::U64); // pk_stride 16
+    let narrow = band(TypeCode::U32); // pk_stride 12
     assert!(
         plan(wide, wide, 1).is_ok(),
         "a matched pair at the common promoted type must compile"
@@ -274,9 +274,9 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
     // range slot keeps the other 4.
     let pk_last = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::U32, false),
         ],
         &[1, 2],
     );
@@ -292,9 +292,9 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
 fn equi_join_pk_type_mismatches_are_rejected_at_compile_time() {
     let plan =
         |delta_schema, trace_schema| plan_two_source_join(gnitz_wire::JoinKind::Equi, delta_schema, trace_schema);
-    let signed = pk_payload_schema(&[type_code::I64]);
-    let unsigned = pk_payload_schema(&[type_code::U64]);
-    let narrow = pk_payload_schema(&[type_code::U32]);
+    let signed = pk_payload_schema(&[TypeCode::I64]);
+    let unsigned = pk_payload_schema(&[TypeCode::U64]);
+    let narrow = pk_payload_schema(&[TypeCode::U32]);
     assert!(plan(signed, signed).is_ok(), "a matched pair compiles");
     assert_eq!(rejection(plan(signed, unsigned)), TYPES, "same stride, opposite sign");
     assert_eq!(rejection(plan(unsigned, narrow)), TYPES, "different strides");
@@ -308,8 +308,8 @@ const TYPES: &str = "join: delta and trace PK column types differ (both sides mu
 /// join.
 #[test]
 fn a_cross_join_accepts_sides_of_different_pk_strides() {
-    let narrow = pk_payload_schema(&[type_code::U32]);
-    let wide = pk_payload_schema(&[type_code::U64, type_code::U64]);
+    let narrow = pk_payload_schema(&[TypeCode::U32]);
+    let wide = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
     let plan = plan_two_source_join(gnitz_wire::JoinKind::Cross, narrow, wide);
     assert!(plan.is_ok(), "{:?}", plan.err());
 }
@@ -387,7 +387,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
 /// A wide (24-byte, 3 × U64) PK carries through the join's byte-keyed probe.
 #[test]
 fn a_wide_pk_join_compiles() {
-    let schema = crate::test_support::pk_only_schema(&[type_code::U64; 3]);
+    let schema = crate::test_support::pk_only_schema(&[TypeCode::U64; 3]);
     let loaded = loaded_for_test(
         [
             (0, scan_delta(10)),

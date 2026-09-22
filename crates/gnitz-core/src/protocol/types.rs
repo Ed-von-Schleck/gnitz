@@ -1,17 +1,7 @@
-use super::error::ProtocolError;
 use gnitz_expr::{ColumnTable, SchemaFacts};
 
 pub use gnitz_wire::{ColType, FixedInt, PkBuf, ReduceOutKey, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
-
-/// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
-/// Use at wire/network boundaries; internal data should use `TypeCode::from_validated_u8`.
-pub fn type_code_from_u64(v: u64) -> Result<TypeCode, ProtocolError> {
-    if v > u8::MAX as u64 {
-        return Err(ProtocolError::UnknownTypeCode(v));
-    }
-    TypeCode::try_from_u8(v as u8).ok_or(ProtocolError::UnknownTypeCode(v))
-}
 
 /// The relation and column a FOREIGN KEY column references. `SelfTable` is the
 /// binding `CREATE TABLE` must defer — the id exists only once the table does —
@@ -26,7 +16,10 @@ pub enum FkTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
     pub name: std::string::String,
-    pub type_code: TypeCode,
+    /// The column's logical type. A DECIMAL's scale — the power of ten its
+    /// stored `I64` is multiplied by — round-trips through the wire meta-schema
+    /// and `COL_TAB.scale`; the engine stores it and never branches on it.
+    pub ty: ColType,
     pub is_nullable: bool,
     /// The FOREIGN KEY this column carries, if any.
     pub fk: Option<FkTarget>,
@@ -48,11 +41,6 @@ pub struct ColumnDef {
     /// present and zero-filled NOT NULL, and is excluded from every name-facing
     /// surface.
     pub is_hidden: bool,
-    /// A DECIMAL column's scale — the power of ten its stored `I64` is
-    /// multiplied by — and zero for every other type. Round-trips through the
-    /// wire meta-schema's scale bits and `COL_TAB.scale`; the engine stores it
-    /// and never branches on it.
-    pub scale: u8,
 }
 
 impl ColumnDef {
@@ -69,24 +57,12 @@ impl ColumnDef {
     pub fn typed(name: impl Into<String>, ty: ColType, is_nullable: bool) -> Self {
         Self {
             name: name.into(),
-            type_code: ty.tc,
+            ty,
             is_nullable,
             fk: None,
             is_serial: false,
             is_hidden: false,
-            scale: ty.scale,
         }
-    }
-
-    /// The column's logical type: its code and scale together.
-    pub fn ty(&self) -> ColType {
-        ColType { tc: self.type_code, scale: self.scale }
-    }
-
-    /// Retype a column in place, keeping every other fact about it.
-    pub fn set_ty(&mut self, ty: ColType) {
-        self.type_code = ty.tc;
-        self.scale = ty.scale;
     }
 
     /// This column as the `COL_TAB` row recording it: column `col_idx` of
@@ -105,13 +81,12 @@ impl ColumnDef {
             owner_id,
             col_idx: col_idx as u64,
             name: &self.name,
-            type_code: self.type_code as u64,
+            ty: self.ty,
             is_nullable: self.is_nullable,
             fk_table_id,
             fk_col_idx,
             is_serial: self.is_serial,
             is_hidden: self.is_hidden,
-            scale: self.scale,
         }
     }
 
@@ -232,18 +207,15 @@ impl Schema {
                 columns.len()
             ));
         }
-        if let Some(cd) = columns
-            .iter()
-            .find(|cd| !gnitz_wire::decimal::scale_admissible(cd.type_code as u8, cd.scale))
-        {
+        if let Some(cd) = columns.iter().find(|cd| !cd.ty.is_admissible()) {
             return Err(format!(
                 "column '{}' ({:?}) carries scale {}",
-                cd.name, cd.type_code, cd.scale
+                cd.name, cd.ty.tc, cd.ty.scale
             ));
         }
         gnitz_wire::validate_pk_tuple(pk_cols, columns.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
             let cd = &columns[c as usize];
-            (cd.type_code as u8, cd.is_nullable)
+            (cd.ty.tc, cd.is_nullable)
         })
         .map(|_stride| ())
         .map_err(|r| r.to_string())
@@ -269,7 +241,7 @@ impl Schema {
                 .columns
                 .iter()
                 .zip(&other.columns)
-                .all(|(a, b)| a.type_code == b.type_code && a.is_nullable == b.is_nullable)
+                .all(|(a, b)| a.ty.tc == b.ty.tc && a.is_nullable == b.is_nullable)
     }
 }
 
@@ -282,8 +254,8 @@ impl ColumnTable for Schema {
         self.columns.len()
     }
 
-    fn col_type_code(&self, ci: usize) -> u8 {
-        self.columns[ci].type_code as u8
+    fn col_type_code(&self, ci: usize) -> TypeCode {
+        self.columns[ci].ty.tc
     }
 
     fn col_nullable(&self, ci: usize) -> bool {
@@ -504,7 +476,7 @@ impl ZSetBatch {
             nulls: vec![],
             payload: schema
                 .payload_columns()
-                .map(|(_, _, c)| PayloadColumn::new(c.type_code))
+                .map(|(_, _, c)| PayloadColumn::new(c.ty.tc))
                 .collect(),
             blob: vec![],
         }
@@ -516,7 +488,7 @@ impl ZSetBatch {
     pub(crate) fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
         schema
             .payload_columns()
-            .map(|(_, _, c)| PayloadColumn::zeroed(c.type_code, count))
+            .map(|(_, _, c)| PayloadColumn::zeroed(c.ty.tc, count))
             .collect()
     }
 
@@ -529,7 +501,7 @@ impl ZSetBatch {
         debug_assert_eq!(self.payload[dst_pi].tc(), tc, "push_cell_from: slot type mismatch");
         let w = tc.wire_stride();
         let cell = &col.bytes[i * w..(i + 1) * w];
-        if gnitz_wire::is_german_string(tc as u8) {
+        if tc.is_german_string() {
             let content = gnitz_wire::german_string_content(cell, &src.blob);
             let moved = gnitz_wire::encode_german_string(content, &mut self.blob);
             self.payload[dst_pi].bytes.extend_from_slice(&moved);
@@ -631,7 +603,7 @@ impl ZSetBatch {
         for (dst, src) in self.payload.iter_mut().zip(&mut other.payload) {
             let at = dst.bytes.len();
             dst.bytes.append(&mut src.bytes);
-            if gnitz_wire::is_german_string(dst.tc() as u8) && delta != 0 {
+            if dst.tc().is_german_string() && delta != 0 {
                 for cell in dst.bytes[at..].as_chunks_mut::<16>().0 {
                     gnitz_wire::shift_german_string_heap(cell, delta);
                 }
@@ -685,7 +657,7 @@ impl ZSetBatch {
     /// rule for a batch that never went through the push path.
     pub(crate) fn check_columns(&self) -> Result<(), std::string::String> {
         let n = self.len();
-        let regions = gnitz_wire::region::num_regions(self.payload.len());
+        let regions = gnitz_wire::num_regions(self.payload.len());
         if regions > gnitz_wire::MAX_WIRE_REGIONS {
             return Err(format!(
                 "{regions} regions exceeds the {} a block directory holds",
@@ -719,12 +691,12 @@ impl ZSetBatch {
             ));
         }
         for ((pi, _, def), col) in schema.payload_columns().zip(&self.payload) {
-            if col.tc() != def.type_code {
+            if col.tc() != def.ty.tc {
                 return Err(format!(
                     "payload slot {pi} ('{}'): type {:?} != schema type {:?}",
                     def.name,
                     col.tc(),
-                    def.type_code
+                    def.ty.tc
                 ));
             }
         }
@@ -794,7 +766,7 @@ impl ZSetBatch {
             .map(|src| {
                 let s = src.stride();
                 let mut bytes = Vec::with_capacity(n * s);
-                if !whole && gnitz_wire::is_german_string(src.tc as u8) {
+                if !whole && src.tc.is_german_string() {
                     for &(r, _) in rows {
                         let content = gnitz_wire::german_string_content(&src.bytes[r * s..(r + 1) * s], &self.blob);
                         bytes.extend_from_slice(&gnitz_wire::encode_german_string(content, &mut blob));
@@ -920,7 +892,7 @@ impl<'a> BatchAppender<'a> {
         let col = &mut self.batch.payload[pi];
         let tc = col.tc();
         assert!(
-            !gnitz_wire::is_german_string(tc as u8),
+            !tc.is_german_string(),
             "BatchAppender: a fixed-width value cannot be written to the {tc:?} column at payload slot {pi}",
         );
         assert_eq!(
@@ -972,7 +944,7 @@ impl<'a> BatchAppender<'a> {
         let pi = self.col_index();
         let tc = self.batch.payload[pi].tc();
         assert!(
-            gnitz_wire::is_german_string(tc as u8),
+            tc.is_german_string(),
             "BatchAppender: a string/blob value cannot be written to the {tc:?} column at payload slot {pi}",
         );
         let cell = gnitz_wire::encode_german_string(b, &mut self.batch.blob);

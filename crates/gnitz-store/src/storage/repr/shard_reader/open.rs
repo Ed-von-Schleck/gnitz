@@ -19,7 +19,7 @@ use super::super::shard_filter::ShardFilter;
 use super::{MappedShard, PackedRegion, PayloadRegion, WeightRegion, ZERO_CELL};
 use crate::schema::SchemaDescriptor;
 use gnitz_foundation::posix_io::Mmap;
-use gnitz_wire::region::num_regions;
+use gnitz_wire::num_regions;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
 use StorageError::Corrupt;
@@ -129,8 +129,8 @@ impl MappedShard {
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
         let schema_npc = schema.num_payload_cols();
-        let null_pad_mask = gnitz_wire::all_payload_null_mask(schema_npc)
-            & !gnitz_wire::all_payload_null_mask(file_npc.min(schema_npc));
+        let null_pad_mask =
+            gnitz_wire::low_bits_mask(schema_npc) & !gnitz_wire::low_bits_mask(file_npc.min(schema_npc));
 
         let blob = &spans[num_regions(file_npc) - 1];
         let filter = &spans[num_regions(file_npc)];

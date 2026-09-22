@@ -71,7 +71,7 @@ pub trait BatchView: RowSource {
 /// One PK-column expectation for [`assert_batchview_consistent`]: type code,
 /// OPK byte offset, and the column's **native** value per row, sign-extended
 /// into a `u128` so one element type states it at any width or signedness.
-pub type PkColExpect<'a> = (u8, usize, &'a [u128]);
+pub type PkColExpect<'a> = (gnitz_wire::TypeCode, usize, &'a [u128]);
 
 /// Assert the region/per-row contract on [`BatchView`] for `rows` rows, the
 /// given `(payload_col, col_size)` pairs and the given PK columns. Every
@@ -113,7 +113,7 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
         );
     }
     for &(type_code, byte_off, vals) in pk {
-        let size = gnitz_wire::wire_stride(type_code);
+        let size = type_code.wire_stride();
         assert_eq!(
             vals.len(),
             rows,

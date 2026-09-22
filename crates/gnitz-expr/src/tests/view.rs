@@ -1,7 +1,7 @@
 //! The [`BatchView`] region/per-row contract, checked against a batch the
 //! kernels were not written for — the shape a client-side adapter must satisfy.
 
-use gnitz_wire::type_code as tc;
+use gnitz_wire::TypeCode;
 
 use crate::test_support::{locator_fixture as fixture, TestView};
 use crate::{assert_batchview_consistent, BatchView, RowSource};
@@ -18,7 +18,7 @@ fn test_view_satisfies_the_region_per_row_contract() {
         &v,
         3,
         &[(0, 4), (1, 16), (2, 8)],
-        &[(tc::U32, 0, &k0), (tc::I64, 4, &k1)],
+        &[(TypeCode::U32, 0, &k0), (TypeCode::I64, 4, &k1)],
     );
 }
 

@@ -78,7 +78,7 @@ use super::super::batch::{Batch, Layout};
 use super::*;
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::payload_order::compare_full_rows;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_schema_u128_i64, pk_payload_schema, pk_u64_two_i64_schema};
 
 /// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`
@@ -101,10 +101,10 @@ fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
 fn batchview_row_matches_region() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),  // PK
-            SchemaColumn::new(type_code::I32, 0),  // payload slot 0, 4 bytes
-            SchemaColumn::new(type_code::U128, 0), // payload slot 1, 16 bytes
-            SchemaColumn::new(type_code::I64, 1),  // payload slot 2, 8 bytes, nullable
+            SchemaColumn::new(TypeCode::U64, false),  // PK
+            SchemaColumn::new(TypeCode::I32, false),  // payload slot 0, 4 bytes
+            SchemaColumn::new(TypeCode::U128, false), // payload slot 1, 16 bytes
+            SchemaColumn::new(TypeCode::I64, true),   // payload slot 2, 8 bytes, nullable
         ],
         &[0],
     );
@@ -128,7 +128,7 @@ fn batchview_row_matches_region() {
         &b.as_mem_batch(),
         ROWS,
         &[(0, 4), (1, 16), (2, 8)],
-        &[(type_code::U64, 0, &pk_vals)],
+        &[(TypeCode::U64, 0, &pk_vals)],
     );
 }
 
@@ -163,8 +163,8 @@ fn run_merge_dup_pk_bench() {
     const ITERS: usize = 20;
     let s8 = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -192,10 +192,10 @@ fn run_merge_dup_pk_bench() {
 fn bench_generic_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     )
@@ -221,7 +221,7 @@ fn bench_sorted_generic_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -
 
 /// [`run_merge_dup_pk_bench`] over the `Generic` payload comparator, which the
 /// benches above never reach: their non-nullable `I64` payload takes the
-/// fixed-int fast path instead of `cmp_typed_le`.
+/// fixed-int fast path instead of `cmp_col_window`.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn run_merge_dup_pk_generic_bench() {
@@ -428,7 +428,7 @@ fn consolidate_groups_folds_the_zset() {
 /// OPK-encode a single PK column's native little-endian bytes. The PK region is
 /// OPK at rest, so a fixture must store OPK bytes for the merge/sort path to
 /// order it the way an ingested row would be ordered.
-fn opk_pk(le: &[u8], tc: u8) -> Vec<u8> {
+fn opk_pk(le: &[u8], tc: TypeCode) -> Vec<u8> {
     let mut out = vec![0u8; le.len()];
     gnitz_wire::encode_pk_column(le, tc, &mut out);
     out
@@ -461,26 +461,23 @@ fn every_pk_width_orders_by_opk_bytes() {
     let s64 = |v: i64| (v as u64) as u128;
 
     // (PK column types, PK column values in strictly ascending OPK order).
-    let cases: Vec<(&[u8], Vec<Vec<u128>>)> = vec![
-        (
-            &[type_code::U8],
-            vec![vec![0], vec![1], vec![127], vec![128], vec![255]],
-        ),
+    let cases: Vec<(&[TypeCode], Vec<Vec<u128>>)> = vec![
+        (&[TypeCode::U8], vec![vec![0], vec![1], vec![127], vec![128], vec![255]]),
         // The sign flip is the only reason negatives sort first.
         (
-            &[type_code::I8],
+            &[TypeCode::I8],
             vec![vec![s8(-128)], vec![s8(-1)], vec![0], vec![1], vec![s8(127)]],
         ),
         (
-            &[type_code::U16],
+            &[TypeCode::U16],
             vec![vec![0], vec![1], vec![256], vec![32768], vec![65535]],
         ),
         (
-            &[type_code::U32],
+            &[TypeCode::U32],
             vec![vec![0], vec![1], vec![1 << 16], vec![1 << 31], vec![u32::MAX as u128]],
         ),
         (
-            &[type_code::I64],
+            &[TypeCode::I64],
             vec![
                 vec![s64(i64::MIN)],
                 vec![s64(-1)],
@@ -491,18 +488,18 @@ fn every_pk_width_orders_by_opk_bytes() {
         ),
         // Compound, stride 8: the leading column dominates.
         (
-            &[type_code::U32, type_code::U32],
+            &[TypeCode::U32, TypeCode::U32],
             vec![vec![1, 9], vec![1, 10], vec![2, 0]],
         ),
         // Stride 11 — a width that is neither a power of two nor a register size.
         (
-            &[type_code::U64, type_code::U16, type_code::U8],
+            &[TypeCode::U64, TypeCode::U16, TypeCode::U8],
             vec![vec![1, 2, 2], vec![1, 2, 3], vec![1, 3, 0], vec![2, 0, 0]],
         ),
         // Stride 16: col0 must dominate. A regression to a plain numeric compare
         // over the packed u128 would order col1-major and disagree here.
         (
-            &[type_code::U64, type_code::U64],
+            &[TypeCode::U64, TypeCode::U64],
             vec![vec![1, 256], vec![1, 257], vec![256, 1], vec![256, 2]],
         ),
         // Past 16 bytes the leading-prefix compare ties and the byte tiebreak
@@ -563,14 +560,14 @@ fn every_pk_width_orders_by_opk_bytes() {
 
 // `MAX_PK_COLUMNS == 5`, so the 64/80-byte strides use U128 PK columns
 // rather than 8/10 U64 columns.
-const WIDE_24: &[u8] = &[type_code::U64, type_code::U64, type_code::U64];
-const WIDE_64: &[u8] = &[type_code::U128, type_code::U128, type_code::U128, type_code::U128];
-const WIDE_80: &[u8] = &[
-    type_code::U128,
-    type_code::U128,
-    type_code::U128,
-    type_code::U128,
-    type_code::U128,
+const WIDE_24: &[TypeCode] = &[TypeCode::U64, TypeCode::U64, TypeCode::U64];
+const WIDE_64: &[TypeCode] = &[TypeCode::U128, TypeCode::U128, TypeCode::U128, TypeCode::U128];
+const WIDE_80: &[TypeCode] = &[
+    TypeCode::U128,
+    TypeCode::U128,
+    TypeCode::U128,
+    TypeCode::U128,
+    TypeCode::U128,
 ];
 
 /// OPK PK bytes: col0 = `lead`, last col = `tail`, all middle columns 0.
@@ -580,7 +577,7 @@ const WIDE_80: &[u8] = &[
 /// differing in `tail` collide in the prefix yet are distinct under
 /// `compare_pk_bytes` (which orders col0 → … → last). Holds for every
 /// stride here.
-fn wpk(tcs: &[u8], lead: u128, tail: u128) -> Vec<u8> {
+fn wpk(tcs: &[TypeCode], lead: u128, tail: u128) -> Vec<u8> {
     let last = tcs.len() - 1;
     let mut v = Vec::new();
     for (i, &tc) in tcs.iter().enumerate() {
@@ -591,7 +588,7 @@ fn wpk(tcs: &[u8], lead: u128, tail: u128) -> Vec<u8> {
         } else {
             0
         };
-        let cw = gnitz_wire::wire_stride(tc);
+        let cw = tc.wire_stride();
         // Big-endian = OPK for an unsigned column: take the low `cw` bytes
         // of the BE u128 representation (the value fits within `cw` here).
         v.extend_from_slice(&val.to_be_bytes()[16 - cw..]);
@@ -946,7 +943,7 @@ mod merge_materialize_vs_reference {
                 let cs = col.size() as usize;
                 if gnitz_wire::null_word_get(nw, pi) {
                     CellVal::Null
-                } else if gnitz_wire::is_german_string(col.type_code) {
+                } else if col.type_code.is_german_string() {
                     let st: [u8; 16] = cell(pi, 16).try_into().unwrap();
                     CellVal::Str(gnitz_wire::try_decode_german_string(&st, blob).expect("valid string"))
                 } else {
@@ -1125,10 +1122,10 @@ mod merge_materialize_vs_reference {
     fn schema_simple() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(type_code::STRING, 1),
-                SchemaColumn::new(type_code::BLOB, 1),
-                SchemaColumn::new(type_code::I64, 1),
+                SchemaColumn::new(TypeCode::U128, false),
+                SchemaColumn::new(TypeCode::String, true),
+                SchemaColumn::new(TypeCode::Blob, true),
+                SchemaColumn::new(TypeCode::I64, true),
             ],
             &[0],
         )
@@ -1137,12 +1134,12 @@ mod merge_materialize_vs_reference {
     fn schema_compound() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::STRING, 1),
-                SchemaColumn::new(type_code::BLOB, 1),
-                SchemaColumn::new(type_code::I64, 1),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::String, true),
+                SchemaColumn::new(TypeCode::Blob, true),
+                SchemaColumn::new(TypeCode::I64, true),
             ],
             &[0, 1, 2],
         )
@@ -1246,13 +1243,13 @@ fn assert_consolidate_matches_reference(schema: &SchemaDescriptor, rows: &[(Vec<
 
 /// OPK bytes for a single I64 PK column (BE with the sign bit flipped).
 fn i64_pk(v: i64) -> Vec<u8> {
-    opk_pk(&v.to_le_bytes(), type_code::I64)
+    opk_pk(&v.to_le_bytes(), TypeCode::I64)
 }
 
 /// Decode a single-column OPK PK back to its native I64 value.
 #[test]
 fn opk_single_signed_i64_negatives() {
-    let s = pk_payload_schema(&[type_code::I64]);
+    let s = pk_payload_schema(&[TypeCode::I64]);
     // Unsorted, spanning negatives and extremes, with a fold and a ghost.
     let rows = vec![
         (i64_pk(5), 1, 50),
@@ -1273,7 +1270,7 @@ fn opk_single_signed_i64_negatives() {
 
 #[test]
 fn opk_compound_unsigned_first_column_dominates() {
-    let s = pk_payload_schema(&[type_code::U32, type_code::U64]);
+    let s = pk_payload_schema(&[TypeCode::U32, TypeCode::U64]);
     // OPK: each unsigned column big-endian, concatenated in pk-list order.
     let mk = |a: u32, b: u64| {
         let mut v = Vec::with_capacity(12);
@@ -1294,12 +1291,12 @@ fn opk_compound_unsigned_first_column_dominates() {
 
 #[test]
 fn opk_compound_mixed_signed_negative_second_column() {
-    let s = pk_payload_schema(&[type_code::U64, type_code::I32]);
+    let s = pk_payload_schema(&[TypeCode::U64, TypeCode::I32]);
     // OPK per column: U64 big-endian, I32 big-endian with sign bit flipped.
     let mk = |a: u64, b: i32| {
         let mut v = Vec::with_capacity(12);
         v.extend_from_slice(&a.to_be_bytes());
-        v.extend_from_slice(&opk_pk(&b.to_le_bytes(), type_code::I32));
+        v.extend_from_slice(&opk_pk(&b.to_le_bytes(), TypeCode::I32));
         v
     };
     let rows = vec![
@@ -1338,12 +1335,12 @@ mod opk_consolidate_proptest {
     /// `17..=32` and the `>32` byte fallback.
     fn schemas() -> Vec<SchemaDescriptor> {
         vec![
-            pk_payload_schema(&[type_code::U8]),
-            pk_payload_schema(&[type_code::I64]),
-            pk_payload_schema(&[type_code::I32]),
-            pk_payload_schema(&[type_code::U32, type_code::U64]),
-            pk_payload_schema(&[type_code::U64, type_code::I32]),
-            pk_payload_schema(&[type_code::U64, type_code::U64, type_code::U64]),
+            pk_payload_schema(&[TypeCode::U8]),
+            pk_payload_schema(&[TypeCode::I64]),
+            pk_payload_schema(&[TypeCode::I32]),
+            pk_payload_schema(&[TypeCode::U32, TypeCode::U64]),
+            pk_payload_schema(&[TypeCode::U64, TypeCode::I32]),
+            pk_payload_schema(&[TypeCode::U64, TypeCode::U64, TypeCode::U64]),
             pk_payload_schema(WIDE_80),
         ]
     }

@@ -62,17 +62,14 @@ pub(crate) fn reject_join_shape(kind: JoinType, shape: JoinShape) -> Result<(), 
 /// [`TypeCode::join_key_common_type`].
 pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     reject_float_keys([left, right], "JOIN ON")?;
-    if !left.ty().decimal_domains_match(right.ty()) {
+    if !left.ty.decimal_domains_match(right.ty) {
         return Err(GnitzSqlError::Unsupported(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ; a DECIMAL joins only a \
              DECIMAL of the same scale",
-            left.name,
-            left.ty(),
-            right.name,
-            right.ty()
+            left.name, left.ty, right.name, right.ty
         )));
     }
-    let (lt, rt) = (left.type_code, right.type_code);
+    let (lt, rt) = (left.ty.tc, right.ty.tc);
     if lt.is_temporal() && rt.is_temporal() && lt != rt {
         return Err(GnitzSqlError::Unsupported(format!(
             "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ in unit (days vs microseconds)",
@@ -86,19 +83,19 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
     // 16-byte native value. Both collapse to the U128 output type, so
     // `join_key_common_type` cannot tell them apart — but a content hash never
     // equals a native integer, so the join would silently match nothing.
-    if left.type_code.is_german_string() != right.type_code.is_german_string() {
+    if left.ty.tc.is_german_string() != right.ty.tc.is_german_string() {
         return Err(GnitzSqlError::Unsupported(format!(
             "JOIN ON: cannot equijoin string/blob column '{}' ({:?}) with non-string \
              column '{}' ({:?}); a string content hash never matches a native key",
-            left.name, left.type_code, right.name, right.type_code
+            left.name, left.ty.tc, right.name, right.ty.tc
         )));
     }
-    left.type_code.join_key_common_type(right.type_code).ok_or_else(|| {
+    left.ty.tc.join_key_common_type(right.ty.tc).ok_or_else(|| {
         GnitzSqlError::Unsupported(format!(
             "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) cannot co-partition; \
              a cross-sign pair whose unsigned side is 128-bit (e.g. DECIMAL(38,0)/UUID \
              joined with a signed integer) needs a signed-256 type that does not exist",
-            left.name, left.type_code, right.name, right.type_code
+            left.name, left.ty.tc, right.name, right.ty.tc
         ))
     })
 }
@@ -109,11 +106,11 @@ pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Res
 /// they are rejected here (they remain legal in the equality prefix).
 pub(crate) fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     for col in [left, right] {
-        if col.type_code.is_german_string() {
+        if col.ty.tc.is_german_string() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "range join key column '{}' ({:?}): a string/blob content hash is not \
                  order-preserving and cannot bound a range conjunct",
-                col.name, col.type_code
+                col.name, col.ty.tc
             )));
         }
     }

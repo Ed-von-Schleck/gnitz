@@ -13,7 +13,7 @@
 use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
 use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
-use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, SchemaFacts};
+use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::Batch;
 
 /// One verbatim column move: `(source locator, output payload slot, destination
@@ -152,7 +152,7 @@ fn copy_column(
         ColumnLocator::Payload { slot, size, type_code } => {
             let in_pi = slot as usize;
             let src_stride = size as usize; // source read width
-            if let (true, BlobMode::Relocate(cache)) = (gnitz_wire::is_german_string(type_code), blob) {
+            if let (true, BlobMode::Relocate(cache)) = (type_code.is_german_string(), blob) {
                 // STRING and BLOB share the 16-byte German-string struct, whose
                 // heap-offset field points into the source batch's blob.
                 // Asserted, not assumed: the loop below reads and writes at that
@@ -271,13 +271,13 @@ fn reindex_hash_row(output: &mut Batch) {
 /// `MapPlan::from_map` is what catches a program disagreeing with them.
 fn compute_map_output_schema(
     in_schema: &SchemaDescriptor,
-    out_cols: &[(u8, bool)],
+    out_cols: &[(TypeCode, bool)],
 ) -> Result<SchemaDescriptor, OpBuildErr> {
     let over = |e| OpBuildErr::shape(format!("compute map: output {e}"));
     let mut b = DerivedSchema::new();
     b.push_pk_of(in_schema).map_err(over)?;
     for &(tc, nullable) in out_cols {
-        b.push(SchemaColumn::new(tc, nullable as u8)).map_err(over)?;
+        b.push(SchemaColumn::new(tc, nullable)).map_err(over)?;
     }
     Ok(b.finish())
 }
@@ -291,7 +291,7 @@ fn hashrow_output_schema(
 ) -> Result<SchemaDescriptor, OpBuildErr> {
     let over = |e| OpBuildErr::shape(format!("hash-row map: output {e}"));
     let mut b = DerivedSchema::new();
-    b.push_pk(SchemaColumn::new(crate::schema::type_code::U128, 0))
+    b.push_pk(SchemaColumn::new(crate::schema::TypeCode::U128, false))
         .map_err(over)?;
     for &(c, tgt) in cols {
         // A key column, not merely an in-range one — the screen the reindex and
@@ -300,7 +300,7 @@ fn hashrow_output_schema(
         let src = in_schema
             .column(c as usize)
             .ok_or_else(|| OpBuildErr::oob_col("hash-row map: column", c, in_schema))?;
-        b.push(SchemaColumn::new(tgt.map_or(src.type_code, |t| t as u8), src.nullable))
+        b.push(SchemaColumn::new(tgt.unwrap_or(src.type_code), src.nullable))
             .map_err(over)?;
     }
     Ok(b.finish())
@@ -386,10 +386,7 @@ impl MapPlan {
         // `Inherit`: a reindex or hash-row overwrites every row's PK.
         let is_identity = matches!(pk_source, PkSource::Inherit) && logical.is_identity_map(in_schema, out_schema);
         let ev = logical.resolve_map(in_schema, out_schema)?;
-        let copies_a_string = ev
-            .copies()
-            .iter()
-            .any(|c| gnitz_wire::is_german_string(c.0.type_code()));
+        let copies_a_string = ev.copies().iter().any(|c| c.0.type_code().is_german_string());
         // A copy's source locator is exactly what `locate` gives for its column.
         let is_copied = |ci| {
             let loc = in_schema.locate(ci);
@@ -397,7 +394,7 @@ impl MapPlan {
         };
         let keeps_every_string = in_schema.has_german_string()
             && (0..in_schema.num_columns())
-                .filter(|&ci| gnitz_wire::is_german_string(in_schema.columns[ci].type_code))
+                .filter(|&ci| in_schema.columns[ci].type_code.is_german_string())
                 .all(is_copied);
 
         Ok(MapPlan {

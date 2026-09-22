@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{pk_payload_schema, u64_pk_schema, wide_pk_3xu64_schema};
 use gnitz_expr::payload_string;
 
@@ -13,7 +13,7 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
     let rows: [(u128, i64, i64); 3] = [(1, 1, 30), (2, 1, 10), (3, 1, 20)];
     // U8/U16/U32 = strides 1/2/4 (the buggy non-8-aligned cases at 3 rows);
     // U64 = stride 8 (always aligned) as a control.
-    for tc in [type_code::U8, type_code::U16, type_code::U32, type_code::U64] {
+    for tc in [TypeCode::U8, TypeCode::U16, TypeCode::U32, TypeCode::U64] {
         let schema = crate::test_support::pk_payload_schema(&[tc]);
         let stride = schema.pk_stride();
 
@@ -86,7 +86,7 @@ fn build_corrupt_batch(schema: &SchemaDescriptor) -> Batch {
 /// corrupt data is rejected by the debug consumer-side verifier.
 #[test]
 fn into_consolidated_strip_forces_real_consolidation() {
-    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
+    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     // `build_corrupt_batch` yields a `Raw` batch (the constructor default), so
     // `into_consolidated` runs a real sort+fold — the strip's mechanism.
     let clean = build_corrupt_batch(&schema);
@@ -109,18 +109,18 @@ fn into_consolidated_strip_forces_real_consolidation() {
 fn extend_pk_round_trips_at_every_narrow_stride() {
     // (PK column types, expected stride, keys). Every key must fit its stride;
     // `extend_pk` debug-asserts that nothing is set above the window.
-    let cases: &[(&[u8], usize, &[u128])] = &[
-        (&[type_code::U8], 1, &[0, 1, 200, 255]),
-        (&[type_code::U16], 2, &[0, 1, u16::MAX as u128]),
-        (&[type_code::U32], 4, &[0, 1, u32::MAX as u128]),
-        (&[type_code::U64], 8, &[0, 1, 1 << 32, u64::MAX as u128]),
+    let cases: &[(&[TypeCode], usize, &[u128])] = &[
+        (&[TypeCode::U8], 1, &[0, 1, 200, 255]),
+        (&[TypeCode::U16], 2, &[0, 1, u16::MAX as u128]),
+        (&[TypeCode::U32], 4, &[0, 1, u32::MAX as u128]),
+        (&[TypeCode::U64], 8, &[0, 1, 1 << 32, u64::MAX as u128]),
         (
-            &[type_code::U64, type_code::U32],
+            &[TypeCode::U64, TypeCode::U32],
             12,
             &[1, 1 | ((u32::MAX as u128) << 64), 7 | (7 << 64)],
         ),
         (
-            &[type_code::U128],
+            &[TypeCode::U128],
             16,
             &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX],
         ),
@@ -152,9 +152,9 @@ fn extend_pk_round_trips_at_every_narrow_stride() {
 #[test]
 fn extend_pk_bytes_stores_the_key_verbatim() {
     for (tcs, stride) in [
-        (&[type_code::U64][..], 8usize),
-        (&[type_code::U128], 16),
-        (&[type_code::U64, type_code::U64, type_code::U64], 24),
+        (&[TypeCode::U64][..], 8usize),
+        (&[TypeCode::U128], 16),
+        (&[TypeCode::U64, TypeCode::U64, TypeCode::U64], 24),
     ] {
         let schema = pk_payload_schema(tcs);
         assert_eq!(schema.pk_stride(), stride);
@@ -234,7 +234,7 @@ fn pk_seeks_agree_with_a_linear_scan() {
     ];
 
     for (schema, keys, probes) in [
-        (pk_payload_schema(&[type_code::U64]), narrow, narrow_probes),
+        (pk_payload_schema(&[TypeCode::U64]), narrow, narrow_probes),
         (wide_pk_3xu64_schema(), wide_keys, wide_probes),
     ] {
         let rows: Vec<(&[u8], i64, i64)> = keys.iter().map(|k| (&k[..], 1i64, 0i64)).collect();
@@ -258,7 +258,7 @@ fn pk_seeks_agree_with_a_linear_scan() {
 /// caller's weight, not the source row's.
 #[test]
 fn append_row_from_source_copies_pk_weight_and_payload() {
-    let schema = pk_payload_schema(&[type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64]);
     let src = crate::test_support::make_batch_opk(&schema, &[(&0xDEAD_BEEFu64.to_be_bytes(), 1, 0x4242)]);
 
     let mut dst = Batch::with_capacity(&schema, 1);
@@ -323,7 +323,7 @@ fn honest_sorted_consolidated_batch_passes_verifiers() {
 // resets to `Raw`.
 #[test]
 fn layout_lifecycle_default_raise_and_lower() {
-    let schema = crate::test_support::pk_payload_schema(&[type_code::U64]);
+    let schema = crate::test_support::pk_payload_schema(&[TypeCode::U64]);
     let mut b = Batch::with_capacity(&schema, 4);
     assert_eq!(b.layout(), Layout::Raw, "constructor defaults Raw");
     append_test_row(&mut b, 1, 1, 10, 0);
@@ -351,7 +351,7 @@ fn layout_lifecycle_default_raise_and_lower() {
 // consolidated for the same reason: no pair of rows can violate the claim.
 #[test]
 fn empty_and_single_row_batches_read_consolidated() {
-    let schema = crate::test_support::pk_payload_schema(&[type_code::U64]);
+    let schema = crate::test_support::pk_payload_schema(&[TypeCode::U64]);
     let b = Batch::with_capacity(&schema, 4);
     assert_eq!(b.count, 0);
     assert_eq!(b.layout(), Layout::Raw);
@@ -539,9 +539,9 @@ fn widened_with_nulls_places_the_fill_on_either_side() {
     b.certify_layout(Layout::Consolidated);
 
     let cols = |first: bool| -> SchemaDescriptor {
-        let pk = SchemaColumn::new(type_code::U64, 0);
-        let s = SchemaColumn::new(type_code::STRING, 0);
-        let fill = SchemaColumn::new(type_code::I64, 1);
+        let pk = SchemaColumn::new(TypeCode::U64, false);
+        let s = SchemaColumn::new(TypeCode::String, false);
+        let fill = SchemaColumn::new(TypeCode::I64, true);
         let cols = match first {
             true => [pk, fill, s],
             false => [pk, s, fill],
@@ -617,7 +617,7 @@ fn empty_batch_drop_is_noop() {
     use crate::storage::batch_pool::acquire_buf;
     while acquire_buf().capacity() > 0 {}
 
-    let batch = Batch::empty_with_schema(&crate::test_support::pk_only_schema(&[type_code::U64]));
+    let batch = Batch::empty_with_schema(&crate::test_support::pk_only_schema(&[TypeCode::U64]));
     assert_eq!(batch.data_capacity(), 0);
     drop(batch);
 
@@ -631,8 +631,8 @@ fn empty_batch_drop_is_noop() {
 fn read_payload_string_out_of_bounds_offset_returns_empty() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );
@@ -658,7 +658,7 @@ fn read_payload_string_out_of_bounds_offset_returns_empty() {
 fn batch_release_bench() {
     use std::time::Instant;
     const ITERS: usize = 2_000_000;
-    let schema = pk_payload_schema(&[type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64]);
 
     let mut regs: Vec<Batch> = (0..64).map(|_| Batch::empty_with_schema(&schema)).collect();
     let t = Instant::now();
@@ -693,8 +693,8 @@ fn project_index_drops_ghosts_and_carries_each_weight() {
 
     let owner = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );

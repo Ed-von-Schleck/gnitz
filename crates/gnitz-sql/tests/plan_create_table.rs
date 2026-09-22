@@ -315,7 +315,7 @@ fn an_fk_child_adopts_the_parent_type_before_the_index_is_checked() {
         &cat,
         "CREATE TABLE c (id BIGINT PRIMARY KEY, r INT UNIQUE REFERENCES p(id))",
     );
-    assert_eq!(c.cols[1].type_code, TypeCode::I64, "widened to the parent's type");
+    assert_eq!(c.cols[1].ty.tc, TypeCode::I64, "widened to the parent's type");
     assert_eq!(c.cols[1].fk, Some(FkTarget::Table { id: 41, col: 0 }));
     assert_eq!(c.unique_indexes, vec![(vec![1], format!("{SN}__c__idx_r"))]);
 

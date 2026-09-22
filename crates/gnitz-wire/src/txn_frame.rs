@@ -17,8 +17,8 @@
 
 use crate::codec::{Reader, Writer};
 use crate::control::{encode_frame_head, ControlHeader, CTRL_HEADER_SIZE};
-use crate::wal::WalBlock;
-use crate::{read_u32_le, ClientVerb, WireConflictMode, WireFlags, WAL_OFF_TID};
+use crate::wal::{block_tid, WalBlock};
+use crate::{ClientVerb, WireConflictMode, WireFlags};
 
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
@@ -73,7 +73,7 @@ pub struct PushTxnItem<'a, D> {
 impl PushTxnItem<'_, &[u8]> {
     /// The target relation, read from the data block's `WAL_OFF_TID`.
     pub fn tid(&self) -> u32 {
-        read_u32_le(self.data, WAL_OFF_TID)
+        block_tid(self.data)
     }
 }
 
@@ -155,7 +155,7 @@ fn items<'a, T>(
 pub fn decode_ddl_txn(body: &[u8]) -> Result<Vec<(u32, &[u8])>, String> {
     items(body, "DDL_TXN", usize::MAX, |r| {
         let b = r.block()?;
-        Ok((read_u32_le(b, WAL_OFF_TID), b))
+        Ok((block_tid(b), b))
     })
 }
 
@@ -165,11 +165,7 @@ pub fn decode_push_txn(body: &[u8]) -> Result<Vec<PushTxnItem<'_, &[u8]>>, Strin
     items(body, "PUSH_TXN", usize::MAX, |r| {
         let mode =
             WireConflictMode::from_wire(r.u8()?).ok_or_else(|| "PUSH_TXN: unknown family conflict mode".to_string())?;
-        let reads = match r.u8()? {
-            0 => false,
-            1 => true,
-            b => return Err(format!("PUSH_TXN: reads flag {b} is neither 0 nor 1")),
-        };
+        let reads = r.bool()?;
         Ok(PushTxnItem {
             mode,
             reads,

@@ -443,16 +443,14 @@ impl MorselOut<'_> {
         let base = reg * NULL_WORDS_PER_REG;
         let words = self.m.div_ceil(64);
         for w in 0..words {
-            let mut word = self.null_bits[base + w];
+            let word = self.null_bits[base + w];
             debug_assert!(
                 w + 1 < words || self.m.is_multiple_of(64) || (word >> (self.m % 64)) == 0,
                 "null_bits tail word has bits set beyond m={}",
                 self.m,
             );
             let lo = w * 64;
-            while word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                word &= word - 1;
+            for bit in gnitz_wire::BitIter(word) {
                 f(lo + bit);
             }
         }
@@ -905,10 +903,7 @@ pub(crate) fn with_str_bufs(prog: &ResolvedProgram, mb: &dyn BatchView, f: impl 
     // empty column mask is not "no blob reader".
     let blob = mb.blob();
     let mut cols: [&[u8]; STR_COL_BUFS] = [&[]; STR_COL_BUFS];
-    let mut mask = prog.str_cols;
-    while mask != 0 {
-        let pi = mask.trailing_zeros() as usize;
-        mask &= mask - 1;
+    for pi in gnitz_wire::BitIter(prog.str_cols) {
         cols[pi] = mb.col_data(pi, 16);
     }
     f(StrBufs { blob, cols: &cols })

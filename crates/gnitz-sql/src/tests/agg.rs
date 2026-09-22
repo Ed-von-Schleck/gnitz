@@ -84,7 +84,7 @@ fn agg_result_type_sum_preserves_u64() {
     // `HirAgg::view_type` is what renders that.
     let rt = |f, i: usize| {
         let c = Some(&s.columns[i]);
-        agg_col_def(agg_ops(f, c, false).unwrap().0, c, false).ty()
+        agg_col_def(agg_ops(f, c, false).unwrap().0, c, false).ty
     };
     assert_eq!(rt(AggFunc::Sum, 1), TypeCode::U64.into()); // SUM(u64) → U64
     assert_eq!(rt(AggFunc::Sum, 2), TypeCode::I64.into()); // SUM(u32) → I64

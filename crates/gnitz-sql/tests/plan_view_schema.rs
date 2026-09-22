@@ -21,7 +21,7 @@ fn pk(chain: &gnitz_sql::PlannedChain) -> Vec<u32> {
 
 /// The final view's output type codes.
 fn types(chain: &gnitz_sql::PlannedChain) -> Vec<TypeCode> {
-    final_view(chain).output_columns.iter().map(|c| c.type_code).collect()
+    final_view(chain).output_columns.iter().map(|c| c.ty.tc).collect()
 }
 
 // ── linear projection ────────────────────────────────────────────────────────

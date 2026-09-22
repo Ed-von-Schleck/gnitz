@@ -10,7 +10,7 @@
 
 use super::tests::{adv_assert_cursor_oracle, adv_key, write_test_shard};
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::Layout;
 use crate::test_support::{make_schema_u128_i64, make_schema_u64_i64, wide_pk_3xu64_schema};
 use std::rc::Rc;
@@ -31,10 +31,10 @@ fn shard_merge_scan_bench() {
 
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),    // PK
-            SchemaColumn::new(type_code::I64, 0),    // I64 payload
-            SchemaColumn::new(type_code::I64, 1),    // nullable I64
-            SchemaColumn::new(type_code::STRING, 0), // long-string payload
+            SchemaColumn::new(TypeCode::U64, false),    // PK
+            SchemaColumn::new(TypeCode::I64, false),    // I64 payload
+            SchemaColumn::new(TypeCode::I64, true),     // nullable I64
+            SchemaColumn::new(TypeCode::String, false), // long-string payload
         ],
         &[0],
     );
@@ -220,12 +220,12 @@ const ADV_SCRATCH_BYTES: usize = 32 << 20;
 fn adv_schema_5xu64() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1, 2, 3, 4],
     )
@@ -253,9 +253,9 @@ fn adv_bench_schema(stride: usize) -> SchemaDescriptor {
 fn adv_schema_u64_u32() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     )
@@ -266,10 +266,10 @@ fn adv_schema_u64_u32() -> SchemaDescriptor {
 fn adv_schema_u64_u32_u8() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U8, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::U8, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1, 2],
     )

@@ -10,7 +10,7 @@ use super::*;
 fn test_enforce_unique_pk() {
     let dir = temp_dir("enforce_upk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
@@ -115,7 +115,7 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     let dir = temp_dir("reserve_user_seq");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let seq_id = engine
-        .create_table("public.t", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
 
     let (base1, delta1) = engine.reserve_user_sequence(seq_id, 64).unwrap();
@@ -144,7 +144,7 @@ fn test_reserve_user_sequence_rejects_exhausted_range() {
     let dir = temp_dir("reserve_user_seq_exhausted");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = [col_def("id", type_code::U64)];
+    let cols = [col_def("id", TypeCode::U64)];
     let full = engine.create_table("public.full", &cols, &[0]).unwrap();
     engine
         .ingest_to_family(SEQ_TAB_ID, &engine.sequence_delta(full, (i64::MAX - 1) as u64))
@@ -174,7 +174,7 @@ fn test_user_sequence_durable_roundtrip() {
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         user_seq = engine
-            .create_table("public.t", &[col_def("id", type_code::U64)], &[0])
+            .create_table("public.t", &[col_def("id", TypeCode::U64)], &[0])
             .unwrap();
         let (base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
         assert_eq!(base, 1);
@@ -243,7 +243,7 @@ fn test_boot_generation_advance_monotonic() {
 #[test]
 fn test_raised_counter_survives_drop_and_flush() {
     let dir = temp_dir("raised_counter_survives_drop");
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid;
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -272,7 +272,7 @@ fn test_raised_counter_survives_drop_and_flush() {
 #[test]
 fn test_sequence_gap_recovery() {
     let dir = temp_dir("seq_gap");
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
 
     // First open: create a table, then inject a table record with high ID 250
     {
@@ -290,7 +290,7 @@ fn test_sequence_gap_recovery() {
 
         // Inject column record for tid=250
         let mut cbb = BatchBuilder::new(*SysFamily::Column.schema());
-        write_col_tab_row(&mut cbb, &col_def("id", type_code::U64).col_tab_row(250, 0), 1);
+        write_col_tab_row(&mut cbb, &col_def("id", TypeCode::U64).col_tab_row(250, 0), 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
         let _ = engine.registry.checkpoint_system();
@@ -315,7 +315,7 @@ fn test_sequence_gap_recovery() {
 fn test_ingest_scan_seek_family() {
     let dir = temp_dir("catalog_ingest_scan_seek");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
@@ -357,7 +357,7 @@ fn test_ingest_scan_seek_family() {
 fn point_read_resolves_system_table_row() {
     let dir = temp_dir("catalog_seek_system_table");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     assert_eq!(
@@ -377,7 +377,7 @@ fn point_read_resolves_system_table_row() {
 fn test_ingest_pk_enforced_through_the_store() {
     let dir = temp_dir("catalog_pk_enforced_store");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
@@ -456,7 +456,7 @@ fn zone_pins_survive_a_flush_and_reopen() {
     // Zone 7: create a table. TABLE_TAB and COL_TAB pinned to lsn=7;
     // SCHEMA_TAB stays at 5 (untouched in this zone).
     let _ = engine.drain_pending_broadcasts();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     engine.create_table("z.t", &cols, &[0]).unwrap();
     engine.pin_queued_to_zone(7);
     assert_eq!(current(&engine, TABLE_TAB_ID), 7);
@@ -533,7 +533,7 @@ fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
 fn test_master_holds_no_user_store() {
     let dir = temp_dir("catalog_master_no_user_store");
     let mut engine = CatalogEngine::open_master(&dir, 1).unwrap().replay().unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     assert!(!engine.registry.residency().owns_stores());
@@ -559,13 +559,13 @@ fn test_fk_index_metadata_queries() {
     let dir = temp_dir("catalog_fk_idx_meta");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.parent", &cols, &[0]).unwrap();
 
     // Create child table with FK to parent
     let child_cols = vec![
-        col_def("id", type_code::U64),
-        fk_def("parent_id", gnitz_wire::type_code::U64, tid, 0),
+        col_def("id", TypeCode::U64),
+        fk_def("parent_id", gnitz_wire::TypeCode::U64, tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -683,7 +683,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     let dir = temp_dir("dep_map_retired");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let v1 = register_identity_view(&mut engine, tid, "v1", &cols);
@@ -718,7 +718,7 @@ fn test_dependent_view_restricts_fire_from_circuit_rows() {
     let dir = temp_dir("dep_map_restrict");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     register_identity_view(&mut engine, tid, "v", &cols);

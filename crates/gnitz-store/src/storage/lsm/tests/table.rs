@@ -10,7 +10,7 @@ use gnitz_expr::RowSource;
 fn row_val(fr: &StoredRow) -> i64 {
     i64::from_le_bytes(RowSource::get_col_ptr(&fr.run, fr.row, 0, 8).try_into().unwrap())
 }
-use crate::schema::{type_code, SchemaDescriptor, SchemaFacts};
+use crate::schema::{SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::test_support::{
     make_batch_opk, make_batch_raw, make_schema_u64_i64, opk_pk, pk_payload_schema, wide_pk_3xu64_schema, wide_row,
 };
@@ -463,7 +463,7 @@ fn wide_pk_membership_and_retract_resolve_twins_in_every_tier() {
 #[test]
 fn signed_compound_pk_keeps_opk_order_in_every_tier() {
     // (I64, U64, U64) PK [stride 24, wide] + I64 payload used as an order marker.
-    let schema = pk_payload_schema(&[type_code::I64, type_code::U64, type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::I64, TypeCode::U64, TypeCode::U64]);
     assert_eq!(schema.pk_stride(), 24);
     let key = |a: i64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
 

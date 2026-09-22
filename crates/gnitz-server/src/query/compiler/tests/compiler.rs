@@ -3,7 +3,7 @@ use super::*;
 use crate::catalog::CatalogEngine;
 use crate::test_support::{col_def, pk_only_schema, scratch_dir, write_circuit, write_identity_circuit};
 use gnitz_store::schema::SchemaColumn;
-use gnitz_wire::{type_code, OpNode};
+use gnitz_wire::{OpNode, TypeCode};
 
 // ── carve: the exchange shape, decided on the graph ─────────────────────
 
@@ -176,19 +176,19 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
     let dir = scratch_dir("compiler", "sink_schema");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let u64_only = engine
-        .create_table("public.u64_only", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.u64_only", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let u64_i64 = engine
         .create_table(
             "public.u64_i64",
-            &[col_def("id", type_code::U64), col_def("v", type_code::I64)],
+            &[col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)],
             &[0],
         )
         .unwrap();
     let u64_str = engine
         .create_table(
             "public.u64_str",
-            &[col_def("id", type_code::U64), col_def("s", type_code::STRING)],
+            &[col_def("id", TypeCode::U64), col_def("s", TypeCode::String)],
             &[0],
         )
         .unwrap();
@@ -204,11 +204,11 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
         view_over(&mut engine, u64_str),
     );
 
-    let view_schema = pk_only_schema(&[type_code::U64]);
+    let view_schema = pk_only_schema(&[TypeCode::U64]);
     let string_payload = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );
@@ -241,14 +241,14 @@ fn a_float_shard_column_is_rejected() {
     let source = engine
         .create_table(
             "public.u64_f64",
-            &[col_def("id", type_code::U64), col_def("v", type_code::F64)],
+            &[col_def("id", TypeCode::U64), col_def("v", TypeCode::F64)],
             &[0],
         )
         .unwrap();
     let view_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
         ],
         &[0],
     );

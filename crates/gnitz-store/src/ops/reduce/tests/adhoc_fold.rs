@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{type_code, SchemaColumn};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::Layout;
 use gnitz_wire::{read_i64_le, AggDescriptor, AggFunc};
 
@@ -8,9 +8,9 @@ use gnitz_wire::{read_i64_le, AggDescriptor, AggFunc};
 fn src_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     )
@@ -198,9 +198,9 @@ fn fold_group_cap_aborts() {
 fn wide_src_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0],
     )

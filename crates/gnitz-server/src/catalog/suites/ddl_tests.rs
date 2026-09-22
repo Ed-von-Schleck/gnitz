@@ -201,7 +201,7 @@ fn test_ddl() {
     assert!(engine.create_schema("sales").is_err()); // duplicate
 
     // Table creation
-    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
     let tid = engine.create_table("sales.orders", &cols, &[0]).unwrap();
     assert!(engine.registry.has_id(tid));
     assert_eq!(
@@ -243,7 +243,7 @@ fn test_ddl() {
 fn test_edge_cases() {
     let dir = temp_dir("edge_cases");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
 
     // 1. Drop non-existent schema
     assert!(engine.drop_schema("nonexistent").is_err());
@@ -278,11 +278,11 @@ fn test_edge_cases() {
 
     // 9. Invalid PK type (STRING)
     assert!(engine
-        .create_table("public.bad_pk", &[col_def("id", type_code::STRING)], &[0])
+        .create_table("public.bad_pk", &[col_def("id", TypeCode::String)], &[0])
         .is_err());
 
     // 10. Too many columns (> MAX_COLUMNS = 65)
-    let many: Vec<ColumnDef> = (0..66).map(|i| col_def(&format!("c{i}"), type_code::U64)).collect();
+    let many: Vec<ColumnDef> = (0..66).map(|i| col_def(&format!("c{i}"), TypeCode::U64)).collect();
     assert!(engine.create_table("public.too_many", &many, &[0]).is_err());
 
     // 11. Drop system schema
@@ -311,12 +311,12 @@ fn test_edge_cases() {
     let tid15 = engine
         .create_table(
             "public.u128t",
-            &[col_def("uuid_pk", type_code::U128), col_def("data", type_code::STRING)],
+            &[col_def("uuid_pk", TypeCode::U128), col_def("data", TypeCode::String)],
             &[0],
         )
         .unwrap();
     let s15 = engine.registry.relation(tid15).map(Relation::schema).unwrap();
-    assert_eq!(s15.columns[0].type_code, type_code::U128);
+    assert_eq!(s15.columns[0].type_code, TypeCode::U128);
     engine.drop_table("public.u128t").unwrap();
 
     // 18. schema_is_empty
@@ -358,7 +358,7 @@ fn test_nonempty_schema_drop_rejected() {
 
     engine.create_schema("s").unwrap();
     let tid = engine
-        .create_table("s.t", &[col_def("id", type_code::U64)], &[0])
+        .create_table("s.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let sid = engine.schema_id("s").expect("the schema exists");
     assert!(!engine.schema_is_empty("s"), "precondition: schema has a member");
@@ -391,7 +391,7 @@ fn test_nonempty_schema_drop_rejected() {
 #[test]
 fn test_restart_full() {
     let dir = temp_dir("restart_full");
-    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
     let first_tid;
 
     {
@@ -442,7 +442,7 @@ fn test_restart_long_strings() {
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.create_schema("longtest").unwrap();
-        let cols = vec![col_def("id", type_code::U64), col_def(long_name, type_code::STRING)];
+        let cols = vec![col_def("id", TypeCode::U64), col_def(long_name, TypeCode::String)];
         engine.create_table("longtest.tbl", &cols, &[0]).unwrap();
         engine.close();
     }
@@ -465,7 +465,7 @@ fn test_restart_long_strings() {
 fn test_edge_cases_extended() {
     let dir = temp_dir("edge_ext");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
 
     // #16. Multiple dots in qualified name — second part contains dot
     assert!(engine.create_table("public.schema.tbl", &cols, &[0]).is_err());
@@ -500,12 +500,12 @@ fn test_nullable_pk_rejected() {
     let dir = temp_dir("nullable_pk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![nullable_def("id", type_code::U64), col_def("name", type_code::STRING)];
+    let cols = vec![nullable_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
     let err = engine.create_table("public.bad_pk_null", &cols, &[0]).unwrap_err();
     assert!(err.contains("nullable"), "expected nullable-PK error, got: {err}");
 
     // Sanity: same shape with is_nullable=false succeeds.
-    let cols_ok = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
+    let cols_ok = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
     engine.create_table("public.ok_pk", &cols_ok, &[0]).unwrap();
 
     engine.close();
@@ -526,10 +526,10 @@ fn test_hook_relation_register_rejects_malformed_pk() {
 
     // Columns: [c0 U64 non-null, c1 STRING non-null, c2 U64 nullable, c3 F32 non-null].
     let col_defs = vec![
-        col_def("c0", type_code::U64),
-        col_def("c1", type_code::STRING),
-        nullable_def("c2", type_code::U64),
-        col_def("c3", type_code::F32),
+        col_def("c0", TypeCode::U64),
+        col_def("c1", TypeCode::String),
+        nullable_def("c2", TypeCode::U64),
+        col_def("c3", TypeCode::F32),
     ];
     let tid = engine.allocate_ids(1).unwrap();
     engine.write_column_records(tid, &col_defs).unwrap();
@@ -575,7 +575,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
     let dir = temp_dir("pk_list_roundtrip");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("a", type_code::U64), col_def("b", type_code::U64)];
+    let cols = vec![col_def("a", TypeCode::U64), col_def("b", TypeCode::U64)];
 
     // Single-column PK, and a recreate under a different PK column: the
     // reconstructed schema reflects the new list, not the old one.
@@ -602,7 +602,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
     );
 
     // Compound PK lists round-trip in full.
-    let wide: Vec<_> = (0..8).map(|i| col_def(&format!("c{i}"), type_code::U64)).collect();
+    let wide: Vec<_> = (0..8).map(|i| col_def(&format!("c{i}"), TypeCode::U64)).collect();
     for (n, pk_cols) in [vec![0u32, 1], vec![0u32, 3, 5], vec![1u32, 2, 7]]
         .into_iter()
         .enumerate()
@@ -636,13 +636,13 @@ fn test_drop_view_removes_directory() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // A view needs a base table to reference.
-    let base_cols = vec![col_def("id", type_code::U64)];
+    let base_cols = vec![col_def("id", TypeCode::U64)];
     engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // Register a view via the raw system-table path (create_view was removed).
     // Column records must precede the VIEW_TAB row (hook invariant).
     let vid = engine.next_id;
-    let view_cols = vec![col_def("id", type_code::U64)];
+    let view_cols = vec![col_def("id", TypeCode::U64)];
     engine.write_column_records(vid, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "myview");
@@ -688,7 +688,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let base_tid = engine
-        .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
 
     // Baseline: system + base-table column rows; no circuit rows yet.
@@ -697,7 +697,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 
     // Register a view (column and circuit records precede the VIEW_TAB row).
     let vid = engine.next_id;
-    let view_cols = vec![col_def("id", type_code::U64)];
+    let view_cols = vec![col_def("id", TypeCode::U64)];
     write_identity_circuit(&mut engine, vid, base_tid, gnitz_wire::ReadBound::None);
     engine.write_column_records(vid, &view_cols).unwrap();
 
@@ -760,7 +760,7 @@ fn drop_table_retracts_its_serial_sequence_row() {
     let dir = temp_dir("drop_table_serial_row");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let (_base, delta) = engine.reserve_user_sequence(tid, 64).unwrap();
     engine.submit(SysFamily::Sequence, delta).unwrap();
@@ -781,7 +781,7 @@ fn drop_cascade_broadcasts_index_owner_columns_in_order() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Table with one (non-unique) secondary index.
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     engine.create_index("public.t", &["val"], false).unwrap();
 
@@ -819,7 +819,7 @@ fn dropped_name_resolves_to_its_recreation() {
     let dir = temp_dir("dropped_name_recreate");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
 
     // Create, then drop, a table named `public.t`.
     let tid1 = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -867,7 +867,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let dir = temp_dir("replicated_bit_transitive");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("x", TypeCode::I64)];
 
     // A REPLICATED base table.
     let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
@@ -946,8 +946,8 @@ fn a_view_declaring_both_capacity_and_delta_is_rejected() {
     let dir = temp_dir("capacity_and_delta_together");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
-        crate::test_support::col_def("id", gnitz_wire::type_code::U64),
-        crate::test_support::col_def("v", gnitz_wire::type_code::I64),
+        crate::test_support::col_def("id", gnitz_wire::TypeCode::U64),
+        crate::test_support::col_def("v", gnitz_wire::TypeCode::I64),
     ];
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
@@ -969,8 +969,8 @@ fn a_bounded_view_source_is_named() {
     let dir = temp_dir("refused_view_source_named");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
-        crate::test_support::col_def("id", gnitz_wire::type_code::U64),
-        crate::test_support::col_def("v", gnitz_wire::type_code::I64),
+        crate::test_support::col_def("id", gnitz_wire::TypeCode::U64),
+        crate::test_support::col_def("v", gnitz_wire::TypeCode::I64),
     ];
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
     let bv = try_register_identity_view(&mut engine, tid, "bv", &cols, 4 << 20, 0).expect("a bounded view");
@@ -994,7 +994,7 @@ fn a_view_at_the_column_limit_cannot_carry_a_feed() {
     let dir = temp_dir("fed_view_at_the_column_limit");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols: Vec<ColumnDef> = (0..gnitz_wire::MAX_COLUMNS)
-        .map(|i| crate::test_support::col_def(&format!("c{i}"), gnitz_wire::type_code::U64))
+        .map(|i| crate::test_support::col_def(&format!("c{i}"), gnitz_wire::TypeCode::U64))
         .collect();
     let tid = create_flagged_table(&mut engine, "wide", &cols, &[0], 0);
 
@@ -1020,10 +1020,10 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
 
     for (name, flags) in [("dup_table", 0), ("dup_stream", stream_flags())] {
         let col_defs = vec![
-            col_def("id", type_code::U64),
-            col_def("a", type_code::I64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::I64),
             // The catalog folds names, so a case difference is the same name.
-            col_def("A", type_code::I64),
+            col_def("A", TypeCode::I64),
         ];
         let tid = engine.allocate_ids(1).unwrap();
         engine.write_column_records(tid, &col_defs).unwrap();
@@ -1036,11 +1036,11 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
 
     // A hidden column repeating a visible name still registers.
     let col_defs = vec![
-        col_def("id", type_code::U64),
-        col_def("a", type_code::I64),
+        col_def("id", TypeCode::U64),
+        col_def("a", TypeCode::I64),
         ColumnDef {
             is_hidden: true,
-            ..col_def("a", type_code::I64)
+            ..col_def("a", TypeCode::I64)
         },
     ];
     let tid = engine.allocate_ids(1).unwrap();
@@ -1058,7 +1058,7 @@ fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
 fn set_based_table_drop_queues_one_batch_per_family() {
     let dir = temp_dir("set_based_table_drop");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let mut tids = Vec::new();
     for name in ["a", "b", "c"] {
         tids.push(engine.create_table(&format!("public.{name}"), &cols, &[0]).unwrap());
@@ -1083,9 +1083,9 @@ fn set_based_table_drop_queues_one_batch_per_family() {
 /// row names `V` as its owner. Returns `(V, S)`.
 fn view_with_segment(engine: &mut CatalogEngine) -> (i64, i64) {
     let base = engine
-        .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let register = |engine: &mut CatalogEngine, name: &str, owner: i64| {
         let vid = engine.next_id;
         write_identity_circuit(engine, vid, base, gnitz_wire::ReadBound::None);
@@ -1153,7 +1153,7 @@ fn dropping_a_view_with_its_segment_retracts_the_segment_once() {
 fn a_view_create_at_a_registered_table_id_is_refused() {
     let dir = temp_dir("view_at_table_id");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
 
     // In its own bundle, against a committed table.
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();

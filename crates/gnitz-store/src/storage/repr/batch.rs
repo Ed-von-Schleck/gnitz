@@ -11,7 +11,7 @@ use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, 
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts, DELTA_TICK_COL};
 use gnitz_expr::RowSource;
-use gnitz_wire::{align8, read_i64_le, read_u64_le};
+use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
 #[inline(always)]
@@ -69,7 +69,7 @@ pub(in crate::storage) fn compute_offsets_into(
     // offsets on receive, so offsets never cross a process boundary.
     let mut off = 0usize;
     for i in 0..num_regions {
-        off = align8(off);
+        off = off.next_multiple_of(8);
         offsets[i] = off;
         off += capacity * strides[i] as usize;
     }
@@ -907,7 +907,7 @@ pub(super) fn string_mask(dst: &Batch) -> u64 {
         if pi >= npc {
             break;
         }
-        if gnitz_wire::is_german_string(col.type_code) {
+        if col.type_code.is_german_string() {
             mask |= 1 << pi;
         }
     }
@@ -1305,12 +1305,12 @@ impl Batch {
         for pi in new_slots {
             output.col_data_mut(pi).fill(0);
         }
-        let new_null_bits = gnitz_wire::all_payload_null_mask(n_new);
+        let new_null_bits = gnitz_wire::low_bits_mask(n_new);
         for row in 0..n {
             let in_null = self.get_null_word(row);
             let out_null = match nulls_first {
-                true => gnitz_wire::merge_null_words(new_null_bits, in_null, n_new),
-                false => gnitz_wire::merge_null_words(in_null, new_null_bits, in_npc),
+                true => new_null_bits | gnitz_wire::null_word_at(in_null, n_new),
+                false => in_null | gnitz_wire::null_word_at(new_null_bits, in_npc),
             };
             output.set_null_word(row, out_null);
         }
@@ -1612,7 +1612,7 @@ impl Batch {
     pub(crate) fn append_payload_cell(
         &mut self,
         out_pi: usize,
-        type_code: u8,
+        type_code: TypeCode,
         size: usize,
         src_cell: Option<&[u8]>,
         src_blob: &[u8],
@@ -1620,7 +1620,7 @@ impl Batch {
     ) {
         match src_cell {
             None => self.fill_col_zero(out_pi, size),
-            Some(cell) if gnitz_wire::is_german_string(type_code) => {
+            Some(cell) if type_code.is_german_string() => {
                 let dest = relocate_german_string_vec(cell, src_blob, &mut self.blob, blob_cache);
                 self.extend_col(out_pi, &dest);
             }

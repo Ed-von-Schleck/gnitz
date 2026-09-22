@@ -104,8 +104,8 @@ fn hashed_side(
         .into_iter()
         .zip(out)
         .map(|(s, o)| {
-            let tc = o.def.type_code;
-            (s as u32, (frame.schema.columns[s].type_code != tc).then_some(tc))
+            let tc = o.def.ty.tc;
+            (s as u32, (frame.schema.columns[s].ty.tc != tc).then_some(tc))
         })
         .collect();
     Ok(cb.map_hash_row(node, &key))

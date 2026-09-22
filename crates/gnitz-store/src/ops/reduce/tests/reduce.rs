@@ -3,7 +3,7 @@
 
 use crate::expr::PkSource;
 use crate::ops::op_negate;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
+use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use crate::test_support::{
     make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, pk_payload_schema, scratch_table,
@@ -160,7 +160,7 @@ fn assert_runs_are_groups(
     batch: &Batch,
     group_of: impl Fn(usize) -> u128,
 ) -> Vec<usize> {
-    let output = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0]);
+    let output = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U128, false)], &[0]);
     let key = GroupOutKey::new(schema, cols, ReduceOutKey::SyntheticFold, &output).unwrap();
     let runs = key.runs(batch);
     let mut seen: Vec<u128> = Vec::new();
@@ -302,14 +302,14 @@ fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
 
 #[test]
 fn test_reduce_sum_retraction() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
 
     // Input: pk(U64), grp(I64), val(I64)
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -319,10 +319,10 @@ fn test_reduce_sum_retraction() {
     // emission on it (and asserts its presence).
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -382,24 +382,24 @@ fn test_reduce_sum_retraction() {
 /// exactly as SQL (and the Z-set model) require.
 #[test]
 fn linear_sum_only_emptied_group_eliminated() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
 
     // Input: pk(U64), grp(I64), val(I64). Output (synthetic GROUP BY grp):
     // _group_pk(U128), grp(I64), sum(I64 nullable), count(I64 companion).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -445,35 +445,35 @@ fn linear_sum_only_emptied_group_eliminated() {
 /// is `0` and the finalize, gated on the count companion, renders SUM = NULL.
 #[test]
 fn linear_sum_only_new_all_null_group_present() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
     use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, Sink};
 
     // Input: pk(U64), grp(I64), val(I64 nullable).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
     // Raw reduce output: _group_pk | grp | sum | cnn | count.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0), // _group_pk
-            SchemaColumn::new(type_code::I64, 0),  // grp
-            SchemaColumn::new(type_code::I64, 0),  // sum
-            SchemaColumn::new(type_code::I64, 0),  // cnn
-            SchemaColumn::new(type_code::I64, 0),  // count (companion)
+            SchemaColumn::new(TypeCode::U128, false), // _group_pk
+            SchemaColumn::new(TypeCode::I64, false),  // grp
+            SchemaColumn::new(TypeCode::I64, false),  // sum
+            SchemaColumn::new(TypeCode::I64, false),  // cnn
+            SchemaColumn::new(TypeCode::I64, false),  // count (companion)
         ],
         &[0],
     );
     // Finalize projects [pk, grp, sum]; cnn and the count companion are stripped.
     let fin_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1), // sum (nullable)
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true), // sum (nullable)
         ],
         &[0],
     );
@@ -552,22 +552,22 @@ fn linear_sum_only_new_all_null_group_present() {
 /// appended), so the gate suppresses the +1 once the count nets to 0.
 #[test]
 fn count_star_only_emptied_group_eliminated() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
 
     // Input: pk(U64), grp(I64). Output (synthetic GROUP BY grp):
     // _group_pk(U128), grp(I64), count(I64).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -611,15 +611,15 @@ fn count_star_only_emptied_group_eliminated() {
 /// is exactly the defect the companion fixes.
 #[test]
 fn test_reduce_nullable_sum_retraction_becomes_null() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
     use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, Sink};
 
     // Input: pk(U64), grp(I64), val(I64, NULLABLE).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1), // nullable source
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true), // nullable source
         ],
         &[0],
     );
@@ -628,11 +628,11 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     // The aggregate column order mirrors agg_descs = [Count, Sum, CountNonNull].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0), // _group_pk
-            SchemaColumn::new(type_code::I64, 0),  // grp
-            SchemaColumn::new(type_code::I64, 0),  // count
-            SchemaColumn::new(type_code::I64, 0),  // sum
-            SchemaColumn::new(type_code::I64, 0),  // cnn (companion)
+            SchemaColumn::new(TypeCode::U128, false), // _group_pk
+            SchemaColumn::new(TypeCode::I64, false),  // grp
+            SchemaColumn::new(TypeCode::I64, false),  // count
+            SchemaColumn::new(TypeCode::I64, false),  // sum
+            SchemaColumn::new(TypeCode::I64, false),  // cnn (companion)
         ],
         &[0],
     );
@@ -640,10 +640,10 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     // Finalized output projects [pk, grp, count, sum] — companion stripped.
     let fin_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0), // _group_pk
-            SchemaColumn::new(type_code::I64, 0),  // grp
-            SchemaColumn::new(type_code::I64, 0),  // count
-            SchemaColumn::new(type_code::I64, 1),  // sum (nullable)
+            SchemaColumn::new(TypeCode::U128, false), // _group_pk
+            SchemaColumn::new(TypeCode::I64, false),  // grp
+            SchemaColumn::new(TypeCode::I64, false),  // count
+            SchemaColumn::new(TypeCode::I64, true),   // sum (nullable)
         ],
         &[0],
     );
@@ -775,18 +775,18 @@ fn null_min_retraction_re_emits_null() {
     // pk(U128), grp(I64), count(I64), min(I64 nullable). min is payload index 2.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -846,9 +846,9 @@ fn null_min_retraction_re_emits_null() {
 fn all_null_sum_is_zero_whatever_the_history() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -857,7 +857,7 @@ fn all_null_sum_is_zero_whatever_the_history() {
         AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
     ];
     let out_schema = out_schema_for(&in_schema, &[1], &aggs);
-    assert_eq!(out_schema.columns[3].nullable, 0, "a raw SUM is NOT NULL");
+    assert!(!out_schema.columns[3].nullable, "a raw SUM is NOT NULL");
     // `(pk, val, weight)` rows of group 10.
     let delta = |rows: &[(u128, Option<i64>, i64)]| {
         let mut b = Batch::with_capacity(&in_schema, rows.len());
@@ -904,7 +904,7 @@ fn all_null_sum_is_zero_whatever_the_history() {
 /// `seek` cannot carry a stride-24 key.
 #[test]
 fn reduce_trace_seek_wide_pk() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
     use crate::test_support::{opk_pk, wide_pk_3xu64_schema};
 
     // Wide PK: 3×U64 (stride 24) + I64 val. GROUP BY the full PK.
@@ -912,11 +912,11 @@ fn reduce_trace_seek_wide_pk() {
     // Output: natural wide PK (3×U64) + SUM(I64) + count companion.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1, 2],
     );
@@ -979,23 +979,23 @@ fn reduce_trace_seek_wide_pk() {
 /// go by bytes (storage order) to land on the group and retract the old SUM.
 #[test]
 fn reduce_trace_seek_compound_pk() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
     use crate::test_support::opk_pk;
 
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     );
@@ -1058,20 +1058,20 @@ fn reduce_trace_seek_compound_pk() {
 /// u128), dropping the retraction.
 #[test]
 fn reduce_trace_seek_signed_pk() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
 
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -1128,7 +1128,7 @@ fn reduce_trace_seek_signed_pk() {
 
 #[test]
 fn test_reduce_count() {
-    use crate::schema::type_code;
+    use crate::schema::TypeCode;
 
     // Input: pk(U64), val(I64)
     let in_schema = make_schema_u64_i64();
@@ -1136,8 +1136,8 @@ fn test_reduce_count() {
     // Output: the input's PK region verbatim, then count(I64).
     let out_schema = SchemaDescriptor::new(
         &[
-            crate::schema::SchemaColumn::new(type_code::U64, 0),
-            crate::schema::SchemaColumn::new(type_code::I64, 1),
+            crate::schema::SchemaColumn::new(TypeCode::U64, false),
+            crate::schema::SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -1180,14 +1180,14 @@ fn make_batch_typed(schema: &SchemaDescriptor, rows: &[(u64, i64, i128)]) -> Bat
 
 #[test]
 fn test_reduce_sum_i32() {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I32, 0));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::I32, false));
 
     // Output: the input's PK region, sum(I64), count(I64) — trailing companion.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -1213,11 +1213,11 @@ fn test_reduce_sum_i32() {
 
 #[test]
 fn test_reduce_min_f32() {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::F32, 0));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::F32, false));
     let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     // MIN selects an existing row, so the output column keeps the F32 source type.
     let out_schema = out_schema_for(&in_schema, &[0u32], &[agg, AggDescriptor::COUNT_STAR]);
-    assert_eq!(out_schema.columns[1].type_code, type_code::F32);
+    assert_eq!(out_schema.columns[1].type_code, TypeCode::F32);
     let mut to_ch = empty_trace(out_schema);
 
     // pk(U64), val(F32), GROUP BY pk. Rows in (PK, payload) order so the
@@ -1249,7 +1249,7 @@ fn test_reduce_min_f32() {
 
 #[test]
 fn test_reduce_max_i16() {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I16, 0));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::I16, false));
 
     let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Max };
     // MIN/MAX select an existing row, so the output column keeps the I16 source
@@ -1285,9 +1285,9 @@ fn test_reduce_max_i16() {
 fn make_schema_u64_uuid_i64() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::UUID, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::UUID, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -1350,7 +1350,7 @@ fn uuid_min_max_recede_through_the_value_index() {
 fn test_group_runs_uuid_group() {
     // A non-nullable UUID group column is a canonical key, so it takes the
     // `u128` route-key arm — order-preserving, so the sort is by UUID value.
-    let schema = u64_pk_schema(SchemaColumn::new(type_code::UUID, 0));
+    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::UUID, false));
     let uuid_a: u128 = 0x1000_0000_0000_0000_0000_0000_0000_0001u128;
     let uuid_b: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0002u128;
     // uuid_b < uuid_a (lower high byte)
@@ -1399,8 +1399,8 @@ fn test_group_key_uuid_multi_col() {
 fn make_schema_pk0_u64_i64() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -1410,8 +1410,8 @@ fn make_schema_pk0_u64_i64() -> SchemaDescriptor {
 fn make_schema_pk1_i64_u64() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[1],
     )
@@ -1507,7 +1507,7 @@ fn build_pk_null_i64(schema: &SchemaDescriptor, rows: &[(u64, Option<i64>)]) -> 
 
 #[test]
 fn test_group_key_null_distinct_from_zero() {
-    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
+    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let batch = build_pk_null_i64(&schema, &[(1, None), (2, Some(0)), (3, Some(7)), (4, None)]);
     let mb = batch.as_mem_batch();
 
@@ -1527,7 +1527,7 @@ fn test_group_runs_nullable_group_col() {
     // A nullable group column is not canonical, so the key is the fold, which
     // streams a null marker: NULL is one group, distinct from the integer 0 it
     // shares its stored bytes with, and its rows must be adjacent.
-    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
+    let schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let batch = build_pk_null_i64(&schema, &[(1, Some(0)), (2, None), (3, Some(5)), (4, None)]);
     let mb = batch.as_mem_batch();
     let is_null = |i: usize| mb.get_null_word(i) & 1 != 0;
@@ -1581,16 +1581,16 @@ fn make_batch_compound_2xu64(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, 
 /// must be copied verbatim from the source row, not packed from group_key.
 #[test]
 fn test_emit_reduce_row_compound_pk_bytes() {
-    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
+    let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
 
     // Output schema matches what build_reduce_output_schema would produce
     // for a PkPermutation grouping on this input with a COUNT aggregate:
     // 2 PK cols (U64,U64) followed by I64 count.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     );
@@ -1630,16 +1630,16 @@ fn test_emit_reduce_row_compound_pk_bytes() {
 /// region to u128 (which would yield column 0).
 #[test]
 fn test_reduce_min_pk_col_compound_pk() {
-    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
+    let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
 
     // Output: full natural compound PK + I64 agg, matching the
     // build_reduce_output_schema layout for PkPermutation.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0, 1],
     );
@@ -1682,9 +1682,9 @@ fn test_reduce_min_pk_col_single_pk_u64() {
     let in_schema = make_schema_u64_i64();
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -1717,12 +1717,12 @@ fn test_reduce_min_pk_col_single_pk_u64() {
 /// fast path skips the sort and passes row order through).
 #[test]
 fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
-    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
+    let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0, 1],
     );
@@ -1778,7 +1778,7 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
 /// different groups.
 #[test]
 fn test_group_key_single_pk_col_compound_subset() {
-    let schema = pk_payload_schema(&[type_code::U64; 2]);
+    let schema = pk_payload_schema(&[TypeCode::U64; 2]);
     let batch = make_batch_compound_2xu64(&schema, &[(10, 50, 1, 0), (10, 99, 1, 0), (20, 50, 1, 0)]);
     let mb = batch.as_mem_batch();
 
@@ -1812,13 +1812,13 @@ fn test_group_key_single_pk_col_single_pk_bit_identical() {
 /// its own group; the fix collapses rows sharing pk_col_0.
 #[test]
 fn test_op_reduce_compound_pk_group_by_subset_count() {
-    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
+    let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
     // GROUP BY a single U64 column → use_natural_pk via
     // SingleNaturalCol. Output: U64 pk + I64 count.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -1866,9 +1866,9 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
 fn make_schema_u64pk_i64grp_u64val() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     )
@@ -1900,9 +1900,9 @@ fn make_batch_u64pk_i64grp_u64val(
 fn u64pk_i64grp_i64val(val_nullable: bool) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, u8::from(val_nullable)),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, val_nullable),
         ],
         &[0],
     )
@@ -2109,7 +2109,7 @@ fn test_avi_seed_u64_high_bit() {
     // Validates that the U64 bit pattern preserved by the AVI seed
     // compares correctly under unsigned semantics against incoming
     // delta rows.
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::U64, 0));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::U64, false));
 
     let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     let mut acc = make_acc(&in_schema, &[0], desc);
@@ -2319,12 +2319,12 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
 
 #[test]
 fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
-    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
+    let in_schema = pk_payload_schema(&[TypeCode::U64; 2]);
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0, 1],
     );
@@ -2375,9 +2375,9 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
     // trailing I64 is the cardinality companion every all-linear reduce carries.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -2536,7 +2536,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
 /// the AVI key packer does: the column's **OPK** image at its declared width. The
 /// AVI schema declares each group column a PK column, so its region holds
 /// order-preserving big-endian bytes (sign-flipped when signed), not native LE.
-fn avi_gcol(dst: &mut [u8], native_le: &[u8], tc: u8) {
+fn avi_gcol(dst: &mut [u8], native_le: &[u8], tc: TypeCode) {
     gnitz_wire::encode_pk_column(native_le, tc, dst);
 }
 
@@ -2545,10 +2545,10 @@ fn avi_two_groups_distinct_byte_form_keys() {
     // Input: pk(U64), a(U32), b(U32), val(I64); GROUP BY (a, b), MIN(val).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -2577,8 +2577,8 @@ fn avi_two_groups_distinct_byte_form_keys() {
         let mut b = Batch::with_capacity(&avi_schema, 2);
         for (a, bb, min) in [(1u32, 1u32, 10i64), (2, 2, 20)] {
             let mut key = [0u8; 17];
-            avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
-            avi_gcol(&mut key[4..8], &bb.to_le_bytes(), type_code::U32);
+            avi_gcol(&mut key[0..4], &a.to_le_bytes(), TypeCode::U32);
+            avi_gcol(&mut key[4..8], &bb.to_le_bytes(), TypeCode::U32);
             let av = i64_av(min);
             key[8] = 0; // ordinal 0 (single MIN aggregate)
             key[9..17].copy_from_slice(&av.to_be_bytes());
@@ -2619,18 +2619,18 @@ fn avi_retraction_returns_next_extremum() {
     // Input: pk(U64), a(U32), val(I64); GROUP BY a, MIN(val).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -2658,7 +2658,7 @@ fn avi_retraction_returns_next_extremum() {
         let mut b = Batch::with_capacity(&avi_schema, 2);
         for min in [10i64, 20] {
             let mut key = [0u8; 13];
-            avi_gcol(&mut key[0..4], &1u32.to_le_bytes(), type_code::U32);
+            avi_gcol(&mut key[0..4], &1u32.to_le_bytes(), TypeCode::U32);
             let av = i64_av(min);
             key[4] = 0; // ordinal 0 (single MIN aggregate)
             key[5..13].copy_from_slice(&av.to_be_bytes());
@@ -2731,12 +2731,12 @@ fn avi_retraction_returns_next_extremum() {
 
 #[test]
 fn avi_non_power_of_two_stride_drives_cursor() {
-    for (gtc, gsize, stride) in [(type_code::U16, 2usize, 11usize), (type_code::U32, 4, 13)] {
+    for (gtc, gsize, stride) in [(TypeCode::U16, 2usize, 11usize), (TypeCode::U32, 4, 13)] {
         let in_schema = SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(gtc, 0),
-                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(gtc, false),
+                SchemaColumn::new(TypeCode::I64, false),
             ],
             &[0],
         );
@@ -2795,18 +2795,18 @@ fn min_tie_retract_one_copy_keeps_min() {
     // Input: pk(U64), g(I64), val(I64); GROUP BY g, MIN(val).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -2898,18 +2898,18 @@ fn min_ignores_null_values() {
     // val is nullable.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -2965,20 +2965,20 @@ fn avi_multi_col_retraction_returns_next_extremum() {
     // Input: pk(U64), a(U32), b(U32), val(I64); GROUP BY (a, b), MIN(val).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -3007,8 +3007,8 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         let mut b = Batch::with_capacity(&avi_schema, 2);
         let put = |b: &mut Batch, a: u32, bb: u32, min: i64| {
             let mut key = [0u8; 17];
-            avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
-            avi_gcol(&mut key[4..8], &bb.to_le_bytes(), type_code::U32);
+            avi_gcol(&mut key[0..4], &a.to_le_bytes(), TypeCode::U32);
+            avi_gcol(&mut key[4..8], &bb.to_le_bytes(), TypeCode::U32);
             let av = i64_av(min);
             key[8] = 0; // ordinal 0 (single MIN aggregate)
             key[9..17].copy_from_slice(&av.to_be_bytes());
@@ -3085,10 +3085,10 @@ fn avi_wide_two_u64_groups_match_reference() {
 
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // pk
-            SchemaColumn::new(type_code::U64, 0), // a (group)
-            SchemaColumn::new(type_code::U64, 0), // b (group)
-            SchemaColumn::new(type_code::I64, 0), // val
+            SchemaColumn::new(TypeCode::U64, false), // pk
+            SchemaColumn::new(TypeCode::U64, false), // a (group)
+            SchemaColumn::new(TypeCode::U64, false), // b (group)
+            SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
@@ -3132,8 +3132,8 @@ fn avi_wide_two_u64_groups_match_reference() {
             .iter()
             .map(|(&(a, b), &m)| {
                 let mut key = [0u8; 25];
-                avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
-                avi_gcol(&mut key[8..16], &b.to_le_bytes(), type_code::U64);
+                avi_gcol(&mut key[0..8], &a.to_le_bytes(), TypeCode::U64);
+                avi_gcol(&mut key[8..16], &b.to_le_bytes(), TypeCode::U64);
                 let av = i64_av(m);
                 key[16] = 0; // ordinal 0 (single MIN aggregate)
                 key[17..25].copy_from_slice(&av.to_be_bytes());
@@ -3197,9 +3197,9 @@ fn avi_wide_two_u64_groups_match_reference() {
 fn avi_wide_single_u128_group_distinct() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),  // pk
-            SchemaColumn::new(type_code::U128, 0), // g (group)
-            SchemaColumn::new(type_code::I64, 0),  // val
+            SchemaColumn::new(TypeCode::U64, false),  // pk
+            SchemaColumn::new(TypeCode::U128, false), // g (group)
+            SchemaColumn::new(TypeCode::I64, false),  // val
         ],
         &[0],
     );
@@ -3230,7 +3230,7 @@ fn avi_wide_single_u128_group_distinct() {
         // sorted ascending by g (both share high bytes; g1 < g2 by low byte).
         for &(g, m) in &groups {
             let mut key = [0u8; 25];
-            avi_gcol(&mut key[0..16], &g.to_le_bytes(), type_code::U128);
+            avi_gcol(&mut key[0..16], &g.to_le_bytes(), TypeCode::U128);
             let av = i64_av(m);
             key[16] = 0; // ordinal 0 (single MIN aggregate)
             key[17..25].copy_from_slice(&av.to_be_bytes());
@@ -3265,10 +3265,10 @@ fn avi_wide_single_u128_group_distinct() {
 fn avi_wide_mixed_signed_unsigned_key() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // pk
-            SchemaColumn::new(type_code::I64, 0), // a (signed group)
-            SchemaColumn::new(type_code::U64, 0), // b (group)
-            SchemaColumn::new(type_code::I64, 0), // val
+            SchemaColumn::new(TypeCode::U64, false), // pk
+            SchemaColumn::new(TypeCode::I64, false), // a (signed group)
+            SchemaColumn::new(TypeCode::U64, false), // b (group)
+            SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
@@ -3302,8 +3302,8 @@ fn avi_wide_mixed_signed_unsigned_key() {
             .iter()
             .map(|&(a, bb, m)| {
                 let mut key = [0u8; 25];
-                avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::I64);
-                avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
+                avi_gcol(&mut key[0..8], &a.to_le_bytes(), TypeCode::I64);
+                avi_gcol(&mut key[8..16], &bb.to_le_bytes(), TypeCode::U64);
                 let av = i64_av(m);
                 key[16] = 0; // ordinal 0 (single MIN aggregate)
                 key[17..25].copy_from_slice(&av.to_be_bytes());
@@ -3344,11 +3344,11 @@ fn avi_wide_mixed_signed_unsigned_key() {
 fn avi_wide_prefix_collision_distinct_groups() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // pk
-            SchemaColumn::new(type_code::U64, 0), // a
-            SchemaColumn::new(type_code::U64, 0), // b
-            SchemaColumn::new(type_code::U64, 0), // c
-            SchemaColumn::new(type_code::I64, 0), // val
+            SchemaColumn::new(TypeCode::U64, false), // pk
+            SchemaColumn::new(TypeCode::U64, false), // a
+            SchemaColumn::new(TypeCode::U64, false), // b
+            SchemaColumn::new(TypeCode::U64, false), // c
+            SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
@@ -3378,9 +3378,9 @@ fn avi_wide_prefix_collision_distinct_groups() {
         // sorted by (a,b,c): (1,2,3) before (1,2,4).
         for &(a, bb, c, m) in &groups {
             let mut key = [0u8; 33];
-            avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
-            avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
-            avi_gcol(&mut key[16..24], &c.to_le_bytes(), type_code::U64);
+            avi_gcol(&mut key[0..8], &a.to_le_bytes(), TypeCode::U64);
+            avi_gcol(&mut key[8..16], &bb.to_le_bytes(), TypeCode::U64);
+            avi_gcol(&mut key[16..24], &c.to_le_bytes(), TypeCode::U64);
             let av = i64_av(m);
             key[24] = 0; // ordinal 0 (single MIN aggregate)
             key[25..33].copy_from_slice(&av.to_be_bytes());
@@ -3414,20 +3414,20 @@ fn avi_wide_retraction_returns_next_extremum() {
     // GROUP BY (a U64, b U64); composite a(8)++b(8)++av(8) = 24 bytes.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -3459,8 +3459,8 @@ fn avi_wide_retraction_returns_next_extremum() {
         let mut b = Batch::with_capacity(&avi_schema, 3);
         let put = |b: &mut Batch, a: u64, bb: u64, m: i64| {
             let mut key = [0u8; 25];
-            avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
-            avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
+            avi_gcol(&mut key[0..8], &a.to_le_bytes(), TypeCode::U64);
+            avi_gcol(&mut key[8..16], &bb.to_le_bytes(), TypeCode::U64);
             let av = i64_av(m);
             key[16] = 0; // ordinal 0 (single MIN aggregate)
             key[17..25].copy_from_slice(&av.to_be_bytes());
@@ -3540,8 +3540,8 @@ fn avi_wide_retraction_returns_next_extremum() {
 fn count_accumulator_over_uuid_pk_does_not_panic() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::UUID, 0), // 16-byte PK
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::UUID, false), // 16-byte PK
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -3610,9 +3610,9 @@ fn probe_indexed(
 fn avi_full_path_min_max_across_high_byte() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // pk
-            SchemaColumn::new(type_code::U64, 0), // g (group)
-            SchemaColumn::new(type_code::I64, 0), // val (agg)
+            SchemaColumn::new(TypeCode::U64, false), // pk
+            SchemaColumn::new(TypeCode::U64, false), // g (group)
+            SchemaColumn::new(TypeCode::I64, false), // val (agg)
         ],
         &[0],
     );
@@ -3666,8 +3666,8 @@ fn pk_ab_delta(schema: &SchemaDescriptor, rows: &[(i128, i64)]) -> Batch {
 fn avi_full_path_pk_source_signed_min_max() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     );
@@ -3707,8 +3707,8 @@ fn avi_full_path_pk_source_signed_min_max() {
 fn avi_full_path_pk_source_unsigned_high_byte() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0, 1],
     );
@@ -3738,7 +3738,7 @@ fn avi_full_path_pk_source_unsigned_high_byte() {
 // must invert back to the source's own 32-bit IEEE bits.
 #[test]
 fn avi_f32_seed_renders_f32_bits() {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::F32, 0));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::F32, false));
     let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     for v in [1.5f32, -2.25, 0.0, -0.0, 1.0e30] {
         let mut acc = make_acc(&in_schema, &[0], desc);
@@ -3758,8 +3758,8 @@ fn avi_f32_seed_renders_f32_bits() {
 fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0), // pk col 0
-            SchemaColumn::new(type_code::U128, 0), // pk col 1
+            SchemaColumn::new(TypeCode::U128, false), // pk col 0
+            SchemaColumn::new(TypeCode::U128, false), // pk col 1
         ],
         &[0, 1],
     );
@@ -3767,9 +3767,9 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
 
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1), // COUNT
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true), // COUNT
         ],
         &[0, 1],
     );
@@ -3864,18 +3864,18 @@ fn run_nullable_grp_min_i64(
 ) {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1), // nullable grp
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true), // nullable grp
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1), // nullable grp (carried through)
-            SchemaColumn::new(type_code::I64, 1), // nullable min
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true), // nullable grp (carried through)
+            SchemaColumn::new(TypeCode::I64, true), // nullable min
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -4015,21 +4015,21 @@ fn min_multi_col_group_resolves_per_group() {
     // Schema: U64 pk | I64 c1 | I64 c2 | I64 val. Group by [c1, c2].
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     // Output: U128 pk | I64 c1 | I64 c2 | I64 min (nullable).
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -4133,9 +4133,9 @@ fn min_multi_col_group_resolves_per_group() {
 fn make_schema_u64_i64_str() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     )
@@ -4215,9 +4215,9 @@ fn test_group_key_128bit_collision_resistance() {
 fn make_schema_u64_blob_grp_i64() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::BLOB, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::Blob, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -4271,10 +4271,10 @@ fn test_reduce_max_blob_group_retraction() {
     // Output: synthetic U128 _group_pk | BLOB grp | I64 max (nullable).
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::BLOB, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::Blob, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -4413,9 +4413,9 @@ fn german_string_min_max_recede_through_the_value_index() {
 // ---------------------------------------------------------------------------
 
 /// Source for the global-aggregate tests: `[pk:U64, val:I64(nullable)]`.
-/// Build a delta over `u64_pk_schema(SchemaColumn::new(type_code::I64, 1))` from `(pk, weight, val)` rows.
+/// Build a delta over `u64_pk_schema(SchemaColumn::new(TypeCode::I64, true))` from `(pk, weight, val)` rows.
 fn g_delta(rows: &[(u64, i64, i64)]) -> Batch {
-    make_batch(&u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), rows)
+    make_batch(&u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)), rows)
 }
 
 const G_SUM: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum };
@@ -4426,15 +4426,15 @@ const G_MIN: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
 fn g_out_count_min() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     )
 }
 
-/// `op_reduce` over `u64_pk_schema(SchemaColumn::new(type_code::I64, 1))` with empty group cols (the global-aggregate path).
+/// `op_reduce` over `u64_pk_schema(SchemaColumn::new(TypeCode::I64, true))` with empty group cols (the global-aggregate path).
 ///
 /// `history` is the input the value index has absorbed, this delta included —
 /// empty for an all-linear aggregate set, which carries no index.
@@ -4445,7 +4445,7 @@ fn g_reduce(
     aggs: &[AggDescriptor],
     i_am_owner: bool,
 ) -> Batch {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let mut avi = aggs
         .iter()
         .any(|d| !d.agg_op.is_linear())
@@ -4467,7 +4467,7 @@ fn g_reduce(
 #[test]
 fn global_seed_over_empty_emits_one_ground_row() {
     let out_schema = out_schema_for(
-        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)),
         &[],
         &[G_SUM, AggDescriptor::COUNT_STAR],
     );
@@ -4507,7 +4507,7 @@ fn global_seed_over_empty_emits_one_ground_row() {
 #[test]
 fn global_seed_idempotent_across_two_empty_pads() {
     let out_schema = out_schema_for(
-        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)),
         &[],
         &[G_SUM, AggDescriptor::COUNT_STAR],
     );
@@ -4538,7 +4538,7 @@ fn global_seed_idempotent_across_two_empty_pads() {
 #[test]
 fn global_non_owner_empty_pad_emits_zero_rows() {
     let out_schema = out_schema_for(
-        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)),
         &[],
         &[G_SUM, AggDescriptor::COUNT_STAR],
     );
@@ -4557,7 +4557,7 @@ fn global_non_owner_empty_pad_emits_zero_rows() {
 #[test]
 fn global_create_over_nonempty_emits_computed_no_ground() {
     let out_schema = out_schema_for(
-        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)),
         &[],
         &[G_SUM, AggDescriptor::COUNT_STAR],
     );
@@ -4580,7 +4580,7 @@ fn global_create_over_nonempty_emits_computed_no_ground() {
 #[test]
 fn global_emptied_by_delete_emits_ground() {
     let out_schema = out_schema_for(
-        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)),
         &[],
         &[G_SUM, AggDescriptor::COUNT_STAR],
     );
@@ -4618,7 +4618,7 @@ fn global_emptied_by_delete_emits_ground() {
 #[test]
 fn global_ground_to_computed_on_first_insert() {
     let out_schema = out_schema_for(
-        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)),
         &[],
         &[G_SUM, AggDescriptor::COUNT_STAR],
     );
@@ -4657,7 +4657,7 @@ fn global_ground_to_computed_on_first_insert() {
 #[test]
 fn global_value_change_emits_no_ground() {
     let out_schema = out_schema_for(
-        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)),
         &[],
         &[G_SUM, AggDescriptor::COUNT_STAR],
     );
@@ -4723,9 +4723,9 @@ fn global_lone_min_retract_to_next_best() {
     // Output `[_group_pk:U128, min:I64(nullable)]`, agg `[MIN]` (no companion).
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -4755,12 +4755,12 @@ fn global_lone_min_retract_to_next_best() {
 /// order — and a retraction advances to the next-best AVI post-state.
 #[test]
 fn global_lone_min_avi_empty_prefix() {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -4839,7 +4839,7 @@ fn global_lone_min_avi_empty_prefix() {
 /// way). Regression guard for the COUNT-family-renders-NULL emitter bug.
 #[test]
 fn count_non_null_all_null_group_renders_zero_null_clear() {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1)); // [U64 pk, I64 payload(nullable)]
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)); // [U64 pk, I64 payload(nullable)]
     let desc = AggDescriptor {
         col_idx: 1,
         agg_op: AggFunc::CountNonNull,
@@ -4848,7 +4848,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     let mut accs = plan.shape.acc_template.clone();
 
     // Two rows whose payload column (payload slot 0) is NULL.
-    let mut batch = Batch::with_capacity(&u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), 2);
+    let mut batch = Batch::with_capacity(&u64_pk_schema(SchemaColumn::new(TypeCode::I64, true)), 2);
     for pk in [1u128, 2u128] {
         batch.extend_pk(pk);
         batch.extend_weight(&1i64.to_le_bytes());
@@ -4866,9 +4866,9 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     // [U64 pk, I64 count_non_null, I64 count], no group-exemplar column.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -4899,13 +4899,13 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
 /// and COUNT(col) ground columns.
 #[test]
 fn ground_row_renders_count_family_zero_null_clear() {
-    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
+    let in_schema = u64_pk_schema(SchemaColumn::new(TypeCode::I64, true));
     // Global-aggregate output: [_group_pk:U128, count_star:I64, count_col:I64].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -4946,8 +4946,8 @@ fn ground_row_renders_count_family_zero_null_clear() {
 fn combine_partial_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     )
@@ -5101,10 +5101,10 @@ fn build_combined_avi(
 fn cg_src() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -5137,11 +5137,11 @@ fn reduce_multi_avi_foreign_group() {
     // Output: [_group_pk:U128, g:I32, min_a:I64(nullable), max_b:I64(nullable), count:I64].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -5202,9 +5202,9 @@ fn reduce_multi_avi_foreign_group() {
 fn cg3_src() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     )
@@ -5212,10 +5212,10 @@ fn cg3_src() -> SchemaDescriptor {
 fn cg3_out() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -5404,11 +5404,11 @@ fn reduce_multi_avi_same_col_min_max() {
     // Output: [_group_pk:U128, g:I32, min:I64?, max:I64?, count:I64].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -5449,21 +5449,21 @@ fn reduce_multi_avi_same_col_min_max() {
 fn reduce_multi_avi_compound_group_key() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     // Synthetic group (g1, g2): [_group_pk:U128, g1:I32, g2:I32, min:I64?, count:I64].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -5519,19 +5519,19 @@ fn reduce_multi_avi_global_emptied() {
     // [pk:U64, a:I64, b:I64]; global aggregate.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     // Output: [_group_pk:U128, min:I64?, sum:I64, count:I64].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -5603,10 +5603,10 @@ type GrpValRow = (u64, Option<i64>, i64, i64);
 fn sum_count_out_synthetic(grp_col: SchemaColumn) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U128, false),
             grp_col,
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -5713,13 +5713,13 @@ fn readback_synthetic_i64(batch: &Batch) -> std::collections::BTreeMap<Option<i6
 fn reduce_monotone_probe_payload_i64_group() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0), // grp (non-nullable payload) — Payload arm
-            SchemaColumn::new(type_code::I64, 0), // val
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false), // grp (non-nullable payload) — Payload arm
+            SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
-    let out_schema = sum_count_out_synthetic(SchemaColumn::new(type_code::I64, 0));
+    let out_schema = sum_count_out_synthetic(SchemaColumn::new(TypeCode::I64, false));
     let aggs = sum_count_aggs(2);
 
     let epoch_rows: [&[GrpValRow]; 2] = [
@@ -5768,18 +5768,18 @@ fn reduce_monotone_probe_payload_i64_group() {
 fn reduce_monotone_probe_payload_u64_group() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0), // grp (non-nullable payload) — natural PK
-            SchemaColumn::new(type_code::I64, 0), // val
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false), // grp (non-nullable payload) — natural PK
+            SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
     // Natural U64 output PK: [U64 pk(=grp), I64 sum, I64 count].
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -5836,13 +5836,13 @@ fn reduce_monotone_probe_payload_u64_group() {
 fn reduce_nullable_group_takes_the_hash_arm() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1), // grp NULLABLE ⇒ hash arm
-            SchemaColumn::new(type_code::I64, 0), // val
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),  // grp NULLABLE ⇒ hash arm
+            SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
-    let out_schema = sum_count_out_synthetic(SchemaColumn::new(type_code::I64, 1)); // grp nullable
+    let out_schema = sum_count_out_synthetic(SchemaColumn::new(TypeCode::I64, true)); // grp nullable
     let aggs = sum_count_aggs(2);
 
     let epoch_rows: [&[GrpValRow]; 2] = [
@@ -5884,12 +5884,12 @@ fn reduce_nullable_group_takes_the_hash_arm() {
 #[test]
 fn single_col_canonical_group_key_predicate() {
     use super::super::group_key::single_col_canonical_group_key;
-    let u64c = SchemaColumn::new(type_code::U64, 0);
-    let i64c = SchemaColumn::new(type_code::I64, 0);
-    let i64_null = SchemaColumn::new(type_code::I64, 1);
-    let strc = SchemaColumn::new(type_code::STRING, 0);
-    let f64c = SchemaColumn::new(type_code::F64, 0);
-    let u128c = SchemaColumn::new(type_code::U128, 0);
+    let u64c = SchemaColumn::new(TypeCode::U64, false);
+    let i64c = SchemaColumn::new(TypeCode::I64, false);
+    let i64_null = SchemaColumn::new(TypeCode::I64, true);
+    let strc = SchemaColumn::new(TypeCode::String, false);
+    let f64c = SchemaColumn::new(TypeCode::F64, false);
+    let u128c = SchemaColumn::new(TypeCode::U128, false);
 
     let check = |cols: &[SchemaColumn], pk: &[u32], gb: &[u32], expected: bool, label: &str| {
         let schema = SchemaDescriptor::new(cols, pk);
@@ -5918,13 +5918,13 @@ fn single_col_canonical_group_key_predicate() {
 fn reduce_monotone_probe_many_groups_multi_source() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0), // grp — Payload arm
-            SchemaColumn::new(type_code::I64, 0), // val
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false), // grp — Payload arm
+            SchemaColumn::new(TypeCode::I64, false), // val
         ],
         &[0],
     );
-    let out_schema = sum_count_out_synthetic(SchemaColumn::new(type_code::I64, 0));
+    let out_schema = sum_count_out_synthetic(SchemaColumn::new(TypeCode::I64, false));
     let aggs = sum_count_aggs(2);
 
     let groups: Vec<i64> = (-100..100).collect();
@@ -6328,20 +6328,20 @@ fn avi_skip_cap_force_probes() {
 fn avi_skip_mixed_int_min_float_max() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0), // grp
-            SchemaColumn::new(type_code::I64, 0), // ival (integer MIN, skips)
-            SchemaColumn::new(type_code::F64, 0), // fval (float MAX)
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false), // grp
+            SchemaColumn::new(TypeCode::I64, false), // ival (integer MIN, skips)
+            SchemaColumn::new(TypeCode::F64, false), // fval (float MAX)
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1), // min(ival)
-            SchemaColumn::new(type_code::F64, 1), // max(fval)
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true), // min(ival)
+            SchemaColumn::new(TypeCode::F64, true), // max(fval)
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -6393,9 +6393,9 @@ fn avi_skip_mixed_int_min_float_max() {
 fn check_float_minmax_against_oracle(val_tc: TypeCode, epochs_rows: &[Vec<(u64, i64, f64, i64)>]) {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(val_tc as u8, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(val_tc, false),
         ],
         &[0],
     );
@@ -6496,20 +6496,20 @@ fn avi_float_f32_minmax_matches_reference() {
 /// second PK column.
 fn check_pk_source_max(b_signed: bool) {
     use std::collections::BTreeMap;
-    let b_tc = if b_signed { type_code::I64 } else { type_code::U64 };
+    let b_tc = if b_signed { TypeCode::I64 } else { TypeCode::U64 };
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // a (pk, group)
-            SchemaColumn::new(b_tc, 0),           // b (pk, aggregated by MAX)
-            SchemaColumn::new(type_code::I64, 0), // pad (payload)
+            SchemaColumn::new(TypeCode::U64, false), // a (pk, group)
+            SchemaColumn::new(b_tc, false),          // b (pk, aggregated by MAX)
+            SchemaColumn::new(TypeCode::I64, false), // pad (payload)
         ],
         &[0, 1],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // a (natural PK)
-            SchemaColumn::new(b_tc, 1),           // max(b) (nullable)
-            SchemaColumn::new(type_code::I64, 0), // count
+            SchemaColumn::new(TypeCode::U64, false), // a (natural PK)
+            SchemaColumn::new(b_tc, true),           // max(b) (nullable)
+            SchemaColumn::new(TypeCode::I64, false), // count
         ],
         &[0],
     );
@@ -6576,17 +6576,17 @@ fn avi_skip_pk_source_max_unsigned() {
 fn avi_skip_global_aggregate() {
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -6636,7 +6636,7 @@ fn avi_skip_global_aggregate() {
 
 #[test]
 fn test_agg_output_type() {
-    use type_code::*;
+    use TypeCode::*;
     let cases = [
         (AggFunc::Count, I64, Some(I64)),
         (AggFunc::Sum, F64, Some(F64)),
@@ -6656,13 +6656,13 @@ fn test_agg_output_type() {
         (AggFunc::Min, U16, Some(U16)),
         (AggFunc::Max, U32, Some(U32)),
         (AggFunc::Min, U64, Some(U64)),
-        (AggFunc::Max, STRING, Some(STRING)),
+        (AggFunc::Max, String, Some(String)),
         (AggFunc::Min, U128, Some(U128)),
         // A sum needs a scalar register, and a calendar value does not add.
-        (AggFunc::Sum, STRING, None),
+        (AggFunc::Sum, String, None),
         (AggFunc::Sum, U128, None),
-        (AggFunc::Sum, DATE, None),
-        (AggFunc::Sum, TIMESTAMP, None),
+        (AggFunc::Sum, Date, None),
+        (AggFunc::Sum, Timestamp, None),
     ];
     for (f, src, want) in cases {
         assert_eq!(gnitz_wire::agg_output_type(f, src), want, "{f:?} over {src}");
@@ -6680,8 +6680,8 @@ fn agg_merge_preserves_output_type() {
         AggFunc::Max,
     ] {
         let merge = if f.is_linear() { AggFunc::Sum } else { f };
-        for tc in TypeCode::ALL {
-            let Some(out) = gnitz_wire::agg_output_type(f, tc as u8) else {
+        for &tc in TypeCode::ALL {
+            let Some(out) = gnitz_wire::agg_output_type(f, tc) else {
                 continue;
             };
             assert_eq!(gnitz_wire::agg_output_type(merge, out), Some(out), "{f:?} over {tc:?}");
@@ -6693,9 +6693,9 @@ fn agg_merge_preserves_output_type() {
 fn test_build_reduce_output_schema_natural_pk() {
     let input = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U64, 0), // group col
-            SchemaColumn::new(type_code::I64, 0), // agg col
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::U64, false), // group col
+            SchemaColumn::new(TypeCode::I64, false), // agg col
         ],
         &[0],
     );
@@ -6703,8 +6703,8 @@ fn test_build_reduce_output_schema_natural_pk() {
     let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SingleNaturalCol).unwrap();
     // Natural PK (single U64 group col) → [U64_PK, I64_agg]
     assert_eq!(out.num_columns(), 2);
-    assert_eq!(out.columns[0].type_code, type_code::U64);
-    assert_eq!(out.columns[1].type_code, type_code::I64);
+    assert_eq!(out.columns[0].type_code, TypeCode::U64);
+    assert_eq!(out.columns[1].type_code, TypeCode::I64);
 }
 
 #[test]
@@ -6712,9 +6712,9 @@ fn test_build_reduce_output_schema_compound_natural_pk() {
     // Input: pk_indices = [0, 1] (compound 2×U64), payload I64.
     let input = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     );
@@ -6724,9 +6724,9 @@ fn test_build_reduce_output_schema_compound_natural_pk() {
     // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
     assert_eq!(out.num_columns(), 3);
     assert_eq!(out.pk_indices(), &[0, 1]);
-    assert_eq!(out.columns[0].type_code, type_code::U64);
-    assert_eq!(out.columns[1].type_code, type_code::U64);
-    assert_eq!(out.columns[2].type_code, type_code::I64);
+    assert_eq!(out.columns[0].type_code, TypeCode::U64);
+    assert_eq!(out.columns[1].type_code, TypeCode::U64);
+    assert_eq!(out.columns[2].type_code, TypeCode::I64);
 }
 
 #[test]
@@ -6735,8 +6735,8 @@ fn test_build_reduce_output_schema_single_pk_group_by_pk() {
     // natural-PK shape (one PK col + agg).
     let input = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -6744,17 +6744,17 @@ fn test_build_reduce_output_schema_single_pk_group_by_pk() {
     let out = build_reduce_output_schema(&input, &[0], &aggs, crate::schema::ReduceOutKey::PkPermutation).unwrap();
     assert_eq!(out.num_columns(), 2);
     assert_eq!(out.pk_indices(), &[0]);
-    assert_eq!(out.columns[0].type_code, type_code::U64);
-    assert_eq!(out.columns[1].type_code, type_code::I64);
+    assert_eq!(out.columns[0].type_code, TypeCode::U64);
+    assert_eq!(out.columns[1].type_code, TypeCode::I64);
 }
 
 #[test]
 fn test_build_reduce_output_schema_synthetic_pk() {
     let input = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0), // group col
-            SchemaColumn::new(type_code::I64, 0),    // agg col
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::String, false), // group col
+            SchemaColumn::new(TypeCode::I64, false),    // agg col
         ],
         &[0],
     );
@@ -6762,9 +6762,9 @@ fn test_build_reduce_output_schema_synthetic_pk() {
     let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SyntheticFold).unwrap();
     // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
     assert_eq!(out.num_columns(), 3);
-    assert_eq!(out.columns[0].type_code, type_code::U128);
-    assert_eq!(out.columns[1].type_code, type_code::STRING);
-    assert_eq!(out.columns[2].type_code, type_code::I64);
+    assert_eq!(out.columns[0].type_code, TypeCode::U128);
+    assert_eq!(out.columns[1].type_code, TypeCode::String);
+    assert_eq!(out.columns[2].type_code, TypeCode::I64);
 }
 
 /// Only an extreme's raw output column is nullable: over a nullable source, or
@@ -6787,7 +6787,7 @@ fn build_reduce_output_schema_agg_nullability_matrix() {
                 let out_key = input.reduce_out_key(group_cols);
                 let out = build_reduce_output_schema(&input, group_cols, &aggs, out_key).unwrap();
                 // Aggregates are the trailing output columns.
-                let got = out.columns[out.num_columns() - 1].nullable != 0;
+                let got = out.columns[out.num_columns() - 1].nullable;
                 let want = match agg_op {
                     AggFunc::Count | AggFunc::CountNonNull | AggFunc::Sum => false,
                     AggFunc::Min | AggFunc::Max => src_nullable || group_cols.is_empty(),
@@ -6844,7 +6844,7 @@ fn a_reduce_without_a_count_is_rejected() {
 /// exemplar slots short: a ground-seeding reduce groups on nothing.
 #[test]
 fn a_global_ground_over_a_group_set_is_rejected() {
-    let schema = agg_over(type_code::I64);
+    let schema = agg_over(TypeCode::I64);
     let aggs = [AggDescriptor::COUNT_STAR];
     assert!(
         ReducePlan::from_wire(&schema, &[], &aggs, true, true).is_ok(),
@@ -6861,8 +6861,11 @@ fn a_global_ground_over_a_group_set_is_rejected() {
 
 /// col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
 /// aggregate column, whose type is the only thing the two tests below vary.
-fn agg_over(tc: u8) -> SchemaDescriptor {
-    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0])
+fn agg_over(tc: TypeCode) -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
+        &[0],
+    )
 }
 
 /// A hand-built circuit bypasses the SQL binder, and the engine still refuses
@@ -6870,12 +6873,7 @@ fn agg_over(tc: u8) -> SchemaDescriptor {
 #[test]
 fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
     let aggs = [AggDescriptor { agg_op: AggFunc::Sum, col_idx: 1 }];
-    for tc in [
-        type_code::U128,
-        type_code::STRING,
-        type_code::DATE,
-        type_code::TIMESTAMP,
-    ] {
+    for tc in [TypeCode::U128, TypeCode::String, TypeCode::Date, TypeCode::Timestamp] {
         assert_eq!(
             plan_rejection(&agg_over(tc), &[0], &aggs),
             format!("reduce: Sum is not defined over type code {tc}"),
@@ -6890,7 +6888,7 @@ fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
 fn a_row_selecting_aggregate_takes_every_column_type() {
     for agg_op in [AggFunc::Count, AggFunc::Min, AggFunc::Max] {
         let aggs = [AggDescriptor { agg_op, col_idx: 1 }, AggDescriptor::COUNT_STAR];
-        for tc in [type_code::I64, type_code::U128, type_code::UUID, type_code::STRING] {
+        for tc in [TypeCode::I64, TypeCode::U128, TypeCode::UUID, TypeCode::String] {
             assert!(
                 ReducePlan::from_wire(&agg_over(tc), &[0], &aggs, false, false).is_ok(),
                 "{agg_op:?} over type code {tc}"
@@ -6910,8 +6908,8 @@ fn op_reduce_bench() {
     let only = std::env::var("OP_REDUCE_BENCH_SHAPE").ok();
     let mix = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let grp_val = u64pk_i64grp_i64val(false);
-    let single_pk = pk_payload_schema(&[type_code::U64]);
-    let compound_pk = pk_payload_schema(&[type_code::U64, type_code::U64]);
+    let single_pk = pk_payload_schema(&[TypeCode::U64]);
+    let compound_pk = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
     let agg = |col_idx: u32, agg_op: AggFunc| [AggDescriptor { col_idx, agg_op }, AggDescriptor::COUNT_STAR];
 
     // `[U64 pk, I64 grp, I64 val]` rows, raw.

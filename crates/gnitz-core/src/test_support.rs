@@ -112,7 +112,7 @@ pub(crate) fn payload_of(
         .payload_columns()
         .zip(regions)
         .map(|((_, _, c), bytes)| {
-            let mut col = crate::protocol::PayloadColumn::new(c.type_code);
+            let mut col = crate::protocol::PayloadColumn::new(c.ty.tc);
             col.bytes = bytes;
             col
         })

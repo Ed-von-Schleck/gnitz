@@ -1,6 +1,6 @@
 use super::super::batch::{REG_PAYLOAD_START, REG_WEIGHT};
 use super::*;
-use crate::schema::{type_code, SchemaDescriptor};
+use crate::schema::{SchemaDescriptor, TypeCode};
 use crate::test_support::{make_batch_raw, pk_payload_schema};
 
 /// A one-row batch encoded to a WAL block, ready to have its directory forged.
@@ -56,7 +56,7 @@ fn a_foreign_decode_refuses_a_non_canonical_string_cell() {
 /// rule is the only thing left to reject them.
 #[test]
 fn decode_from_wal_block_rejects_mismatched_region_sizes() {
-    let schema = pk_payload_schema(&[type_code::U64]); // every region is 8B/row
+    let schema = pk_payload_schema(&[TypeCode::U64]); // every region is 8B/row
     for (grown, shrunk) in [(REG_PK, REG_WEIGHT), (REG_WEIGHT, REG_PK)] {
         let mut buf = encoded_block(&schema);
         gnitz_wire::write_u32_le(&mut buf, wal::dir_entry_offset(grown), 16);
@@ -72,7 +72,7 @@ fn decode_from_wal_block_rejects_mismatched_region_sizes() {
 /// `count == 0` with regions to match decodes.
 #[test]
 fn decode_from_wal_block_rejects_header_count_forgeries() {
-    let schema = pk_payload_schema(&[type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64]);
     let clean = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec(7);
     for forged in [0u32, 2, 1000] {
         let mut buf = clean.clone();
@@ -116,7 +116,7 @@ fn a_zero_row_block_carrying_heap_bytes_decodes_to_an_empty_heap() {
 /// of resolving strings against a heap that is not there.
 #[test]
 fn decode_mem_batch_rejects_blob_region_past_block() {
-    let schema = pk_payload_schema(&[type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64]);
     let mut buf = encoded_block(&schema);
     gnitz_wire::write_u32_le(
         &mut buf,
@@ -141,7 +141,7 @@ fn chunk_rows(b: &Batch, start: usize, overhead: usize, budget: usize) -> usize 
 /// A U64 PK with one STRING payload column, and `(pk, value)` rows at weight 1
 /// over it. Values past `SHORT_STRING_THRESHOLD` live in the heap.
 fn string_rows(rows: &[(u64, &str)]) -> (SchemaDescriptor, Batch) {
-    let schema = crate::test_support::u64_pk_schema(crate::schema::SchemaColumn::new(type_code::STRING, 0));
+    let schema = crate::test_support::u64_pk_schema(crate::schema::SchemaColumn::new(TypeCode::String, false));
     let mut b = super::super::batch_builder::BatchBuilder::new(schema);
     for &(pk, v) in rows {
         b.begin_row(pk as u128, 1);

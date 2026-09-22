@@ -3,7 +3,7 @@ use super::super::naming;
 use super::super::shard_file;
 use super::*;
 use crate::schema::key::probe_key;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SchemaFacts};
+use crate::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, opk_pk, pk_payload_schema};
 
 /// Test-only adapters: production budgets a store at construction and reads its
@@ -41,7 +41,7 @@ fn probe(e: &ShardEntry, key: &[u8]) -> Option<(Rc<MappedShard>, usize)> {
 /// payload. 16-byte PK region, but the column-aware comparison
 /// differs from a u128 numerical compare of the concatenation.
 fn compound_schema() -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::U64, type_code::U64])
+    pk_payload_schema(&[TypeCode::U64, TypeCode::U64])
 }
 
 /// LE concatenation of a (U64, U64) compound key, as the u128 the
@@ -487,9 +487,9 @@ fn reload_and_widen_owe_no_sweep() {
 
     let wide = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -1013,10 +1013,10 @@ fn a_wide_pk_sharing_its_leading_sixteen_bytes_still_splits() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1, 2],
     );
@@ -1047,7 +1047,7 @@ fn a_wide_pk_sharing_its_leading_sixteen_bytes_still_splits() {
 /// A `pk_cols`×U64 PK plus an I64 payload — strides 8, 24 and 32, so a guard key
 /// is narrow, wide, and wide-with-a-16-byte-boundary in turn.
 fn stride_schema(pk_cols: usize) -> SchemaDescriptor {
-    pk_payload_schema(&vec![type_code::U64; pk_cols])
+    pk_payload_schema(&vec![TypeCode::U64; pk_cols])
 }
 
 /// Row `i`'s key over `stride_schema(pk_cols)`: ascending in the **last** PK

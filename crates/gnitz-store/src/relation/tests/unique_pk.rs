@@ -1,5 +1,5 @@
 use super::enforce_unique_pk;
-use crate::schema::type_code;
+use crate::schema::TypeCode;
 use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
 use crate::test_support::{make_batch_opk, opk_pk, pk_payload_schema, wide_row};
 use gnitz_expr::RowSource;
@@ -27,7 +27,7 @@ use gnitz_expr::RowSource;
 fn enforce_unique_pk_holds_at_every_pk_shape() {
     struct Case {
         name: &'static str,
-        pk_types: &'static [u8],
+        pk_types: &'static [TypeCode],
         /// Native PK column values for the two keys the script uses.
         k1: &'static [u128],
         k2: &'static [u128],
@@ -37,26 +37,26 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
     let cases = [
         Case {
             name: "u64",
-            pk_types: &[type_code::U64],
+            pk_types: &[TypeCode::U64],
             k1: &[1],
             k2: &[7],
         },
         // A negative leading value: OPK sign-flips it, and nothing may flip twice.
         Case {
             name: "signed i64",
-            pk_types: &[type_code::I64],
+            pk_types: &[TypeCode::I64],
             k1: &[NEG5],
             k2: &[7],
         },
         Case {
             name: "narrow u8",
-            pk_types: &[type_code::U8],
+            pk_types: &[TypeCode::U8],
             k1: &[1],
             k2: &[7],
         },
         Case {
             name: "wide 3xu64",
-            pk_types: &[type_code::U64; 3],
+            pk_types: &[TypeCode::U64; 3],
             k1: &[1, 2, 3],
             k2: &[7, 8, 9],
         },
@@ -121,7 +121,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
 /// diverges nowhere, at row 0, or in the middle all come out identical.
 #[test]
 fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
-    let schema = pk_payload_schema(&[type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64]);
     let key = |v: u128| opk_pk(&schema, &[v]);
 
     /// The old shape: every surviving row appended one at a time.

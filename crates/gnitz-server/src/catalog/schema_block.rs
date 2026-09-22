@@ -12,6 +12,7 @@
 use super::{CatalogEngine, ColumnDef};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
+use gnitz_wire::ColType;
 use std::rc::Rc;
 
 /// One [`SchemaBlockCol`] per column: the physical shape from `schema`, and the
@@ -30,12 +31,14 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
             let col = &schema.columns[ci];
             let def = defs.map(|d| &d[ci]);
             SchemaBlockCol {
-                type_code: col.type_code,
+                ty: ColType {
+                    tc: col.type_code,
+                    scale: def.map_or(0, |d| d.ty.scale),
+                },
                 meta: ColMeta {
-                    nullable: col.nullable != 0,
+                    nullable: col.nullable,
                     hidden: def.is_some_and(|d| d.is_hidden),
                     serial: def.is_some_and(|d| d.is_serial),
-                    scale: def.map_or(0, |d| d.scale),
                 },
                 name: def.map_or(&b""[..], |d| d.name.as_bytes()),
             }

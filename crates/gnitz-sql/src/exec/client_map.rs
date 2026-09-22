@@ -25,7 +25,7 @@ impl ClientMap {
         let key = |s: &Schema| {
             s.pk_cols
                 .iter()
-                .map(|&c| s.columns[c as usize].type_code)
+                .map(|&c| s.columns[c as usize].ty.tc)
                 .collect::<Vec<_>>()
         };
         if key(src) != key(&out_schema) {

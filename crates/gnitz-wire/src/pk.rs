@@ -9,6 +9,8 @@
 //! rejected at DDL), so the transform is a fixed-width bijection: unsigned types
 //! map to big-endian, signed types map to big-endian with the sign bit flipped.
 
+use crate::TypeCode;
+
 /// Order-preserving big-endian encoding of one PK column.
 ///
 /// `src` and `dst` are both exactly the column's width (1/2/4/8/16). Native
@@ -23,9 +25,9 @@
 /// would be a read-modify-write of bytes just written. [`decode_pk_column`] is
 /// the exact mirror, `#[inline(always)]` for the reason stated there.
 #[inline(always)]
-pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
+pub fn encode_pk_column(src: &[u8], tc: TypeCode, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    let flip = crate::is_signed_int(tc);
+    let flip = tc.is_signed_int();
     match dst.len() {
         16 => {
             let v = u128::from_le_bytes(src.try_into().unwrap()) ^ ((flip as u128) << 127);
@@ -49,9 +51,9 @@ pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
 }
 
 /// OPK-encode a PK tuple from its native little-endian image. `cols` are the PK
-/// columns' `(width, type_code)` in PK-list order, the order the key compares in.
+/// columns' `(width, type)` in PK-list order, the order the key compares in.
 #[inline(always)]
-pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8]) -> PkBuf {
+pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, TypeCode)>, src: &[u8]) -> PkBuf {
     let mut out = PkBuf::zeroed(0);
     let mut off = 0;
     for (cs, tc) in cols {
@@ -64,11 +66,14 @@ pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8]) 
 
 /// OPK-encode one native value per `(src_tc, target_tc)` column, each promoted to
 /// `target_tc` and packed in order.
-pub fn encode_pk_natives(cols: impl IntoIterator<Item = (u8, u8)>, natives: impl IntoIterator<Item = u128>) -> PkBuf {
+pub fn encode_pk_natives(
+    cols: impl IntoIterator<Item = (TypeCode, TypeCode)>,
+    natives: impl IntoIterator<Item = u128>,
+) -> PkBuf {
     let mut out = PkBuf::zeroed(0);
     for ((src_tc, target_tc), native) in cols.into_iter().zip(natives) {
-        let src_w = crate::wire_stride(src_tc);
-        out.append(crate::wire_stride(target_tc), |dst| {
+        let src_w = src_tc.wire_stride();
+        out.append(target_tc.wire_stride(), |dst| {
             store_opk_image(key_image(src_tc, native), src_tc, src_w, target_tc, dst)
         });
     }
@@ -78,8 +83,8 @@ pub fn encode_pk_natives(cols: impl IntoIterator<Item = (u8, u8)>, natives: impl
 /// A native value's image in its column's key order: masked to the type's width, sign bit
 /// flipped for a signed type — the OPK bytes read as a big-endian integer.
 #[inline(always)]
-pub fn key_image(tc: u8, native: u128) -> u128 {
-    let w = crate::wire_stride(tc);
+pub fn key_image(tc: TypeCode, native: u128) -> u128 {
+    let w = tc.wire_stride();
     let low = if w == 16 {
         native
     } else {
@@ -92,14 +97,14 @@ pub fn key_image(tc: u8, native: u128) -> u128 {
 /// signed, else 0. A value's image — its OPK bytes as a big-endian integer — is
 /// `value + opk_bias`.
 #[inline(always)]
-pub fn opk_bias(tc: u8, width: usize) -> u128 {
-    (crate::is_signed_int(tc) as u128) << (width * 8 - 1)
+pub fn opk_bias(tc: TypeCode, width: usize) -> u128 {
+    (tc.is_signed_int() as u128) << (width * 8 - 1)
 }
 
 /// Write into `dst` the OPK bytes at `target_tc` of the value whose image at `src_tc`
 /// (width `src_w`) is `image`. `target_tc` must hold every `src_tc` value.
 #[inline(always)]
-pub fn store_opk_image(image: u128, src_tc: u8, src_w: usize, target_tc: u8, dst: &mut [u8]) {
+pub fn store_opk_image(image: u128, src_tc: TypeCode, src_w: usize, target_tc: TypeCode, dst: &mut [u8]) {
     // Skipping the re-bias at identity measured −19% instructions on `reindex_pack_bench`.
     let v = if src_tc == target_tc {
         image
@@ -139,9 +144,9 @@ pub fn store_opk_image(image: u128, src_tc: u8, src_w: usize, target_tc: u8, dst
 /// a caller's row loop an indirect branch and a `call memcpy`. In the type the
 /// width propagates and the store is one instruction.
 #[inline(always)]
-pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
+pub fn decode_pk_column(src: &[u8], tc: TypeCode, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    let flip = crate::is_signed_int(tc);
+    let flip = tc.is_signed_int();
     macro_rules! decode {
         ($ty:ty, $sign_bit:expr) => {{
             const W: usize = std::mem::size_of::<$ty>();
@@ -163,12 +168,12 @@ pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
 /// Sign- or zero-extend a native-LE integer of type `src_tc` into the wider slot
 /// `dst`, as `copy_column` widens a payload cell.
 #[inline]
-pub fn widen_native_le(src: &[u8], src_tc: u8, dst: &mut [u8]) {
+pub fn widen_native_le(src: &[u8], src_tc: TypeCode, dst: &mut [u8]) {
     let src_width = src.len();
     debug_assert!(dst.len() >= src_width);
     // Native LE: the sign bit is the high bit of the most-significant (last)
     // byte; the extension bytes are appended at the high LE indices.
-    let is_neg = crate::is_signed_int(src_tc) && src_width > 0 && (src[src_width - 1] & 0x80) != 0;
+    let is_neg = src_tc.is_signed_int() && src_width > 0 && (src[src_width - 1] & 0x80) != 0;
     dst[..src_width].copy_from_slice(src);
     dst[src_width..].fill(if is_neg { 0xFF } else { 0x00 });
 }
@@ -278,14 +283,20 @@ pub fn worker_for_key(pk: u128, num_workers: usize) -> usize {
 
 /// Route an OPK PK region to a worker: a narrow one by its image, which
 /// `ColumnLocator::opk_image` equals for a payload column so both join sides agree,
-/// a wide one by its xxh3.
-#[inline]
+/// a wide one by its xxh3. The narrow arm inlines into the per-row routing
+/// loops; the wide arm stays out of line.
+#[inline(always)]
 pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
     if bytes.len() <= NARROW_PK_MAX_BYTES {
         worker_for_key(widen_pk_be(bytes), num_workers)
     } else {
-        bucket(crate::checksum(bytes), num_workers)
+        worker_for_wide_pk(bytes, num_workers)
     }
+}
+
+#[inline(never)]
+fn worker_for_wide_pk(bytes: &[u8], num_workers: usize) -> usize {
+    bucket(crate::checksum(bytes), num_workers)
 }
 
 // ---------------------------------------------------------------------------

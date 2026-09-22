@@ -28,6 +28,12 @@ pub const WAL_OFF_SIZE: usize = 8;
 pub const WAL_OFF_VERSION: usize = 12;
 pub const WAL_OFF_NUM_REGIONS: usize = 16;
 
+/// The relation id a framed block carries.
+#[inline]
+pub fn block_tid(block: &[u8]) -> u32 {
+    read_u32_le(block, WAL_OFF_TID)
+}
+
 /// Byte offset of region `r`'s directory entry.
 #[inline]
 pub const fn dir_entry_offset(r: usize) -> usize {

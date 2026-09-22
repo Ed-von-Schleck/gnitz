@@ -60,7 +60,7 @@ fn push_pk_col(native: &mut Vec<u8>, schema: &Schema, ci: usize, v: &Bound<'_, P
     if v.is_none() {
         return Err(not_nullable_err(&col.name));
     }
-    push_fixed_le(native, col.ty(), v)
+    push_fixed_le(native, col.ty, v)
 }
 
 /// Stores batch data in Rust Vecs with a cached Schema. `append` / `extend`
@@ -255,7 +255,7 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
             return Err(missing_pk_err(schema, ci));
         };
         consumed[i] = true;
-        pks.push(PkPlan { pos: i, ci, ty: schema.columns[ci].ty() });
+        pks.push(PkPlan { pos: i, ci, ty: schema.columns[ci].ty });
     }
     let mut payload = Vec::with_capacity(names.len());
     for (_, ci, col) in schema.payload_columns() {
@@ -269,7 +269,7 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
         };
         payload.push(PayloadPlan {
             ci,
-            ty: col.ty(),
+            ty: col.ty,
             nullable: col.is_nullable,
             src,
         });

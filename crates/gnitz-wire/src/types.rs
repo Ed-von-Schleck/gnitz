@@ -1,91 +1,41 @@
-//! Column type codes and the typed `TypeCode` enum.
+//! Column types: the typed `TypeCode` enum and the scale-carrying `ColType`.
 
 use core::cmp::Ordering;
 
-pub mod type_code {
-    pub const U8: u8 = 1;
-    pub const I8: u8 = 2;
-    pub const U16: u8 = 3;
-    pub const I16: u8 = 4;
-    pub const U32: u8 = 5;
-    pub const I32: u8 = 6;
-    pub const F32: u8 = 7;
-    pub const U64: u8 = 8;
-    pub const I64: u8 = 9;
-    pub const F64: u8 = 10;
-    pub const STRING: u8 = 11;
-    pub const U128: u8 = 12;
-    pub const UUID: u8 = 13;
-    pub const BLOB: u8 = 14;
-    pub const I128: u8 = 15;
-    pub const DATE: u8 = 16;
-    pub const TIMESTAMP: u8 = 17;
-    pub const DECIMAL: u8 = 18;
-}
-
-/// Typed column type code enum, mirroring the `type_code::*` constants.
-///
-/// `#[repr(u8)]` — discriminants equal the corresponding `type_code::*` constant.
-/// Stored as `u8` on disk (`SchemaColumn.type_code`); use `from_validated_u8` to
-/// convert in-memory data that has already passed DDL validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TypeCode {
-    U8 = type_code::U8,
-    I8 = type_code::I8,
-    U16 = type_code::U16,
-    I16 = type_code::I16,
-    U32 = type_code::U32,
-    I32 = type_code::I32,
-    F32 = type_code::F32,
-    U64 = type_code::U64,
-    I64 = type_code::I64,
-    F64 = type_code::F64,
-    String = type_code::STRING,
-    U128 = type_code::U128,
-    UUID = type_code::UUID,
-    Blob = type_code::BLOB,
-    I128 = type_code::I128,
-    /// Days since 1970-01-01, physically an `I32`.
-    Date = type_code::DATE,
-    /// Microseconds since 1970-01-01T00:00:00, physically an `I64`.
-    Timestamp = type_code::TIMESTAMP,
-    /// A fixed-point number: physically an `I64` holding the value times
-    /// `10^scale`. The scale is a per-column fact carried beside the code
-    /// ([`ColType`], `META_FLAG` scale bits, `COL_TAB.scale`); storage, ordering,
-    /// routing and the VM see the integer alone.
-    Decimal = type_code::DECIMAL,
+crate::wire_enum! {
+    /// A column's type code. The discriminant is the wire byte, and
+    /// [`Self::from_wire`] decodes one.
+    pub enum TypeCode: u8 {
+        U8 = 1,
+        I8 = 2,
+        U16 = 3,
+        I16 = 4,
+        U32 = 5,
+        I32 = 6,
+        F32 = 7,
+        U64 = 8,
+        I64 = 9,
+        F64 = 10,
+        String = 11,
+        U128 = 12,
+        UUID = 13,
+        Blob = 14,
+        I128 = 15,
+        /// Days since 1970-01-01, physically an `I32`.
+        Date = 16,
+        /// Microseconds since 1970-01-01T00:00:00, physically an `I64`.
+        Timestamp = 17,
+        /// A fixed-point number: physically an `I64` holding the value times
+        /// `10^scale`. The scale is a per-column fact carried beside the code
+        /// ([`ColType`], `META_FLAG` scale bits, `COL_TAB.scale`); storage, ordering,
+        /// routing and the VM see the integer alone.
+        Decimal = 18,
+    }
 }
 
 impl TypeCode {
-    /// Every variant, in wire-code order — the one enumeration of the type
-    /// table. Clients that must reproduce the table (the Python `TypeCode`
-    /// IntEnum) build it from here rather than re-typing the constants, so a
-    /// new variant reaches them without an edit on their side.
-    pub const ALL: [TypeCode; 18] = [
-        TypeCode::U8,
-        TypeCode::I8,
-        TypeCode::U16,
-        TypeCode::I16,
-        TypeCode::U32,
-        TypeCode::I32,
-        TypeCode::F32,
-        TypeCode::U64,
-        TypeCode::I64,
-        TypeCode::F64,
-        TypeCode::String,
-        TypeCode::U128,
-        TypeCode::UUID,
-        TypeCode::Blob,
-        TypeCode::I128,
-        TypeCode::Date,
-        TypeCode::Timestamp,
-        TypeCode::Decimal,
-    ];
-
-    /// The type's name in the wire vocabulary — the spelling the
-    /// `type_code::*` constants use, which is what the client bindings expose.
-    /// Exhaustive on purpose: a new variant fails to compile until named.
+    /// The type's name in the wire vocabulary, which is what the client bindings
+    /// expose. Exhaustive on purpose: a new variant fails to compile until named.
     pub const fn wire_name(self) -> &'static str {
         match self {
             TypeCode::U8 => "U8",
@@ -109,99 +59,118 @@ impl TypeCode {
         }
     }
 
-    /// Convert a wire u8 that has already passed DDL validation. Panics on unknown codes.
-    #[inline]
-    pub fn from_validated_u8(v: u8) -> Self {
-        Self::try_from_u8(v).unwrap_or_else(|| panic!("invalid type_code {v} in validated schema"))
-    }
-
-    /// Convert a raw u8 wire value. Returns `None` for unknown codes.
-    #[inline]
-    pub const fn try_from_u8(v: u8) -> Option<Self> {
-        use type_code as tc;
-        match v {
-            tc::U8 => Some(TypeCode::U8),
-            tc::I8 => Some(TypeCode::I8),
-            tc::U16 => Some(TypeCode::U16),
-            tc::I16 => Some(TypeCode::I16),
-            tc::U32 => Some(TypeCode::U32),
-            tc::I32 => Some(TypeCode::I32),
-            tc::F32 => Some(TypeCode::F32),
-            tc::U64 => Some(TypeCode::U64),
-            tc::I64 => Some(TypeCode::I64),
-            tc::F64 => Some(TypeCode::F64),
-            tc::STRING => Some(TypeCode::String),
-            tc::U128 => Some(TypeCode::U128),
-            tc::UUID => Some(TypeCode::UUID),
-            tc::BLOB => Some(TypeCode::Blob),
-            tc::I128 => Some(TypeCode::I128),
-            tc::DATE => Some(TypeCode::Date),
-            tc::TIMESTAMP => Some(TypeCode::Timestamp),
-            tc::DECIMAL => Some(TypeCode::Decimal),
-            _ => None,
-        }
-    }
-
     /// The two calendar types. Each is an integer of a fixed width under a
     /// different name: every storage, ordering and VM path treats it as
     /// [`Self::storage_type`], and only the SQL surface and the clients see the
-    /// name. Typed counterpart of the free [`is_temporal`].
+    /// name.
+    #[inline(always)]
     pub const fn is_temporal(self) -> bool {
-        is_temporal(self as u8)
+        matches!(self, TypeCode::Date | TypeCode::Timestamp)
     }
 
-    /// The integer type a value of this type is stored and computed as:
+    /// The integer type a value of this type is stored, ordered and computed as:
     /// `I32` for `Date`, `I64` for `Timestamp` and `Decimal`, and the type
-    /// itself otherwise.
-    /// Typed counterpart of the free [`storage_type_code`], which owns the map.
+    /// itself otherwise. The one place that map is written: the predicates such a
+    /// type must answer like its storage type ([`Self::is_signed_int`],
+    /// [`Self::is_fixed_int`]) and the promotions it must follow
+    /// ([`index_key_type`], [`Self::join_key_common_type`]) all read it, so a
+    /// further named integer needs no arm of its own in any of them.
+    #[inline(always)]
     pub const fn storage_type(self) -> TypeCode {
-        match TypeCode::try_from_u8(storage_type_code(self as u8)) {
-            Some(t) => t,
-            None => self,
+        match self {
+            TypeCode::Date => TypeCode::I32,
+            TypeCode::Timestamp | TypeCode::Decimal => TypeCode::I64,
+            t => t,
         }
     }
 
-    /// Whether this type is one of the two IEEE-754 column types. Typed
-    /// counterpart of the free [`is_float`].
+    /// Whether this type is one of the two IEEE-754 column types.
+    #[inline(always)]
     pub const fn is_float(self) -> bool {
-        is_float(self as u8)
+        matches!(self, TypeCode::F32 | TypeCode::F64)
     }
 
-    /// The type of the 8-byte register image the engine materializes for a
-    /// computed value of this source type. Typed counterpart of the free
-    /// [`register_image_type`].
+    /// The type of the register image the engine materializes for a computed
+    /// value of this source type: any float lands as `F64` (`LOAD_COL_FLOAT`
+    /// widens `F32` on load), `U64` stays unsigned so a downstream compare
+    /// re-seeds the unsigned variant, and every other integer normalizes to
+    /// `I64`. A register sink stores that image whole, so a computed column typed
+    /// any narrower would ship the low half of an `f64` or wrap a negative value
+    /// into an unsigned slot.
+    ///
+    /// `STRING` maps to itself — the VM has a string register class beside the
+    /// scalar one — which is what makes the rule total enough for expression
+    /// typing to read it unconditionally; `BLOB` has a register of neither class
+    /// and falls in with the rest.
+    ///
+    /// A temporal or decimal type also maps to itself: the register holds the
+    /// 8-byte integer while the declared column keeps its name. A `DATE` slot is
+    /// narrower than that register, so a sink into one is admitted only behind a
+    /// cast that range-checks the value into that width (`check_emit_slot`).
     #[inline]
-    pub fn register_image(self) -> TypeCode {
-        TypeCode::from_validated_u8(register_image_type(self as u8))
+    pub const fn register_image(self) -> TypeCode {
+        match self {
+            TypeCode::F32 | TypeCode::F64 => TypeCode::F64,
+            TypeCode::U64 | TypeCode::String | TypeCode::Date | TypeCode::Timestamp | TypeCode::Decimal => self,
+            _ => TypeCode::I64,
+        }
     }
 
     /// The 16-byte integer-ish types (U128, UUID, I128), which have no i64 slot in
     /// the expression VM.
+    #[inline(always)]
     pub const fn is_wide_int(self) -> bool {
-        is_wide_int(self as u8)
+        matches!(self, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
     }
 
     /// Whether this type uses the 16-byte "German string" layout (a 4-byte
     /// length, a 4-byte inline prefix, and an inline-or-out-of-line tail).
     /// STRING and BLOB share this representation; both must compare, relocate,
     /// and copy via the german-string paths (`compare_german_strings`, the blob
-    /// heap), never via fixed-width byte ops. Allow-list so new variants are
-    /// excluded until explicitly vetted.
+    /// heap), never via fixed-width byte ops.
+    #[inline(always)]
     pub const fn is_german_string(self) -> bool {
-        is_german_string(self as u8)
+        matches!(self, TypeCode::String | TypeCode::Blob)
     }
 
-    /// Whether this type is a signed integer (I8/I16/I32/I64/I128). Typed
-    /// counterpart of the free [`is_signed_int`]: the order-preserving encoders
-    /// flip the sign bit for these so two's-complement negatives sort below
-    /// non-negatives. Unsigned, float, and string types are not signed.
+    /// Whether this type is a signed integer (I8/I16/I32/I64/I128, and the
+    /// types stored as one): the order-preserving encoders flip the sign bit for
+    /// these so two's-complement negatives sort below non-negatives. Unsigned,
+    /// float, and string types are not signed.
+    #[inline(always)]
     pub const fn is_signed_int(self) -> bool {
-        is_signed_int(self as u8)
+        matches!(
+            self.storage_type(),
+            TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 | TypeCode::I128
+        )
     }
 
-    /// Typed counterpart of the free [`is_pk_eligible`], which owns the rule.
+    /// Whether this type is a fixed-width integer of ≤ 8 bytes, any sign — the
+    /// domain of [`FixedInt`], which answers through the storage type. These are
+    /// exactly the payload columns the fixed-int fast-path row comparator can
+    /// compare via a single `u64` load.
+    #[inline(always)]
+    pub const fn is_fixed_int(self) -> bool {
+        FixedInt::from_type_code(self).is_some()
+    }
+
+    /// Whether this type is an **integer** of any width or sign —
+    /// [`Self::is_fixed_int`]'s domain plus the 128-bit pair. UUID shares U128's
+    /// width and is not one. The domain [`Self::int_domain_fits`] is defined on,
+    /// where `is_fixed_int`'s ≤ 8-byte scope would silently exclude a 128-bit
+    /// column.
+    #[inline(always)]
+    const fn is_int(self) -> bool {
+        self.is_fixed_int() || matches!(self, TypeCode::U128 | TypeCode::I128)
+    }
+
+    /// Whether this type may be a PRIMARY KEY column: the integer scalars of
+    /// every width, and nothing else. A PK region is compared as raw bytes, which
+    /// String/Blob heap offsets and IEEE-754 floats (±0.0 differ byte-wise but
+    /// compare equal) do not survive.
+    #[inline(always)]
     pub const fn is_pk_eligible(self) -> bool {
-        is_pk_eligible(self as u8)
+        self.is_fixed_int() || self.is_wide_int()
     }
 
     /// Whether a single non-nullable column of this type may serve as a reduce's
@@ -215,7 +184,7 @@ impl TypeCode {
     }
 
     /// Byte stride (width) of this type in a column payload. The single width
-    /// table for the enum; the free [`wire_stride`] delegates here.
+    /// table.
     #[inline(always)]
     pub const fn wire_stride(self) -> usize {
         match self {
@@ -227,26 +196,128 @@ impl TypeCode {
         }
     }
 
+    /// True iff every value of integer type `self` is representable in `target`.
+    /// Crossing into signed needs strictly more width, an equal-width signed type
+    /// not holding the unsigned range; `UUID` is in no domain, U128's width
+    /// notwithstanding. The *value* domain — [`Self::join_key_common_type`]
+    /// answers the same-looking question for a reindex key, whose codomain
+    /// collapses onto U128.
+    pub const fn int_domain_fits(self, target: TypeCode) -> bool {
+        if !self.is_int() || !target.is_int() {
+            return false;
+        }
+        if self.is_signed_int() == target.is_signed_int() {
+            target.wire_stride() >= self.wire_stride()
+        } else {
+            target.is_signed_int() && target.wire_stride() > self.wire_stride()
+        }
+    }
+
+    /// True iff `target` is a value-preserving *widening promotion* of `self` —
+    /// the only type change a column copy performs (`widen_native_le`
+    /// sign/zero-extends a narrower integer into a wider slot; there is no
+    /// narrowing and no representation change). The `is_fixed_int(target)` gate
+    /// is this caller's own scope, not a screen on the rule: a column copy only
+    /// ever widens into a ≤8-byte slot. The expression validator's
+    /// `check_copy_types` asks it of every column sink, and the SQL planner asks
+    /// it of a set-op pair's promotion target so the two agree on what a copy may
+    /// do.
+    #[inline]
+    pub const fn is_widening_promotion(self, target: TypeCode) -> bool {
+        target.is_fixed_int() && self.int_domain_fits(target)
+    }
+
     /// Output PK type for an equijoin synthetic reindex key built from a key
     /// column of this type: a ≤8-byte integer key keeps its native width (stride
-    /// 8 for U64); everything wider or non-integer — U128/UUID, the STRING/BLOB
-    /// 128-bit content hash, and PK-ineligible floats — collapses to the 16-byte
-    /// U128 key. Single source of truth for the reindex / `_join_pk` PK width:
-    /// the engine compiler (reindex Map output schema) and the SQL planner
-    /// (`_join_pk` stamp) both derive their col-0 stride from this, and they MUST
-    /// agree or every cross-process consumer re-derives a mismatched stride and
-    /// the exchange wire decode hard-rejects the block.
+    /// 8 for U64), as does the signed-128 key; everything wider or non-integer —
+    /// U128/UUID, the STRING/BLOB 128-bit content hash, and PK-ineligible floats —
+    /// collapses to the unsigned 16-byte U128 key. Single source of truth for the
+    /// reindex / `_join_pk` PK width: the engine compiler (reindex Map output
+    /// schema) and the SQL planner (`_join_pk` stamp) both derive their col-0
+    /// stride from this, and they MUST agree or every cross-process consumer
+    /// re-derives a mismatched stride and the exchange wire decode hard-rejects
+    /// the block.
     #[inline]
-    pub fn reindex_output_type(self) -> TypeCode {
-        TypeCode::from_validated_u8(reindex_output_type_code(self as u8))
+    pub const fn reindex_output_type(self) -> TypeCode {
+        if self.is_fixed_int() || matches!(self, TypeCode::I128) {
+            self
+        } else {
+            TypeCode::U128
+        }
     }
 
     /// Common reindex output type for an equijoin key pair, or `None` if the pair
-    /// cannot co-partition under an existing type code. Typed counterpart of the
-    /// free [`join_key_common_type`]; see it for the promotion ladder.
-    #[inline]
-    pub fn join_key_common_type(self, other: TypeCode) -> Option<TypeCode> {
-        join_key_common_type(self as u8, other as u8).map(TypeCode::from_validated_u8)
+    /// cannot co-partition under an existing type code. The returned type is the
+    /// reindex OUTPUT type directly (the promoted integer type with its true sign
+    /// for ≤8-byte ints; U128 for the unsigned-16B and german-string cases), so it
+    /// is exactly what the slot type, the `ColPromoter`, and the `_join_pk` stamp
+    /// all need.
+    pub const fn join_key_common_type(self, other: TypeCode) -> Option<TypeCode> {
+        let (l, r) = (self, other);
+        // Equal types: the reindex output type (identity for fixed ints; U128 for
+        // U128/UUID and STRING/BLOB content hashes). A float pair is the one equal
+        // pair that co-partitions under none: `±0.0` are byte-unequal but compare equal.
+        if l.as_wire() == r.as_wire() {
+            return if l.is_pk_eligible() || l.is_german_string() {
+                Some(l.reindex_output_type())
+            } else {
+                None
+            };
+        }
+        // Both german strings: a 16-byte XXH3 content hash (U128 slot). A one-sided
+        // string pair is rejected in validate_join_key_pair and never reaches here.
+        if l.is_german_string() && r.is_german_string() {
+            return Some(TypeCode::U128);
+        }
+        // DATE counts days and TIMESTAMP microseconds: a key copy moves bytes and
+        // cannot convert one unit to the other.
+        if l.is_temporal() && r.is_temporal() {
+            return None;
+        }
+        // Both signed integers of at most 8 bytes → the wider signed type. Read
+        // through the storage type: a pair with one temporal side co-partitions as
+        // the integer both sides really are, never under the calendar name.
+        if l.is_signed_int() && r.is_signed_int() {
+            let (l, r) = (l.storage_type(), r.storage_type());
+            return Some(if l.wire_stride() >= r.wire_stride() { l } else { r });
+        }
+        // Both unsigned (U8..U64 and the 16-byte U128/UUID) → the wider unsigned
+        // type; a 16-byte operand carries the pair to U128. `is_pk_eligible` is the
+        // integer-scalar set; minus the signed ones leaves the unsigned ones.
+        let l_unsigned = l.is_pk_eligible() && !l.is_signed_int();
+        let r_unsigned = r.is_pk_eligible() && !r.is_signed_int();
+        if l_unsigned && r_unsigned {
+            let wider = if l.wire_stride() >= r.wire_stride() { l } else { r };
+            return Some(if wider.wire_stride() == 16 {
+                TypeCode::U128
+            } else {
+                wider
+            });
+        }
+        // Cross-sign integer keys: one side signed, the other unsigned. (Equal,
+        // both-signed, and both-unsigned pairs all returned above, so any remaining
+        // integer-scalar pair is opposite-sign.) The common type must be a SIGNED type
+        // (a) strictly wider than the unsigned operand — a signed type of equal width
+        // cannot represent the unsigned operand's full range, so distinct values
+        // would alias — and (b) at least as wide as the signed operand. The unsigned
+        // side zero-extends and the signed side sign-extends into it
+        // (`store_opk_image`), so equal numeric values pack byte-identically.
+        // wu ∈ {1,2,4,8,16}; only a U128/UUID unsigned operand (wu == 16) needs a
+        // signed-256 type that does not exist → None.
+        if l.is_pk_eligible() && r.is_pk_eligible() {
+            let (s, u) = if l.is_signed_int() { (l, r) } else { (r, l) };
+            let uw = u.wire_stride() * 2;
+            let common_w = if uw > s.wire_stride() { uw } else { s.wire_stride() };
+            return match common_w {
+                2 => Some(TypeCode::I16),
+                4 => Some(TypeCode::I32),
+                8 => Some(TypeCode::I64),
+                16 => Some(TypeCode::I128),
+                // wu == 16 (U128/UUID) ⇒ common_w == 32: a signed-256 type, none exists.
+                _ => None,
+            };
+        }
+        None
     }
 
     /// Inverse of [`resolve_reindex_type`]: the target to persist for a key
@@ -254,7 +325,13 @@ impl TypeCode {
     /// where this column already self-derives to it.
     #[inline]
     pub fn carried_reindex_tc(self, common: TypeCode) -> Option<TypeCode> {
-        (reindex_output_type_code(self as u8) != common as u8).then_some(common)
+        (self.reindex_output_type() != common).then_some(common)
+    }
+}
+
+impl core::fmt::Display for TypeCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.wire_name())
     }
 }
 
@@ -281,6 +358,20 @@ impl ColType {
         matches!(self.tc, TypeCode::Decimal)
     }
 
+    /// Whether this is a type a column may have: a scale only on a DECIMAL, and
+    /// never past [`crate::decimal::MAX_DECIMAL_SCALE`].
+    pub const fn is_admissible(self) -> bool {
+        self.scale <= crate::decimal::MAX_DECIMAL_SCALE && (self.scale == 0 || self.is_decimal())
+    }
+
+    /// Decode a column type from its wire code and scale bytes, or `None` for an
+    /// unknown code or an inadmissible scale.
+    pub fn from_wire(code: u8, scale: u8) -> Option<ColType> {
+        TypeCode::from_wire(code)
+            .map(|tc| ColType { tc, scale })
+            .filter(|t| t.is_admissible())
+    }
+
     /// Whether a DECIMAL may be matched with `other` across relations. Only the
     /// identical DECIMAL: the stored integers of two scales never mean the same
     /// number.
@@ -288,7 +379,7 @@ impl ColType {
         if !self.is_decimal() && !other.is_decimal() {
             return true;
         }
-        self.tc as u8 == other.tc as u8 && self.scale == other.scale
+        self.tc.as_wire() == other.tc.as_wire() && self.scale == other.scale
     }
 
     /// [`TypeCode::register_image`] with the scale kept: a computed DECIMAL is
@@ -314,100 +405,72 @@ impl core::fmt::Display for ColType {
             // was declared with: a DECIMAL's value is bounded by the integer
             // behind its scale, and `ColType` carries no declared precision.
             TypeCode::Decimal => write!(f, "DECIMAL({}, {})", crate::decimal::MAX_DECIMAL_SCALE, self.scale),
-            tc => f.write_str(tc.wire_name()),
+            tc => write!(f, "{tc}"),
         }
     }
 }
 
-/// Compare two equal-length little-endian byte windows of a fixed-width column
-/// under the given raw `u8` type code: unsigned magnitude for U8–U64/U128/UUID,
-/// signed two's-complement for I8–I64/I128 (the `_ =>` default, covering any
-/// unknown code), and `total_cmp` for F32/F64. STRING/BLOB are not handled here
-/// — callers must dispatch German strings to content comparison first; a
-/// mis-routed 16-byte string window hits the width `unreachable!` rather than
-/// silently mis-comparing.
-#[inline]
-pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
-    // Deliberately not `debug_assert_eq!`: that takes both lengths by reference
-    // and spills them, on a per-row path.
-    debug_assert!(a.len() == b.len(), "cmp_typed_le: windows must be equal length");
-    // Pin `b` to `a`'s width once. Without it every arm below dispatches on
-    // `b.len()` a second time, since the debug assert above is gone in release.
-    let b = &b[..a.len()];
-    match tc {
-        type_code::U128 | type_code::UUID => {
-            u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
-        }
-        type_code::I128 => i128::from_le_bytes(a.try_into().unwrap()).cmp(&i128::from_le_bytes(b.try_into().unwrap())),
-        type_code::F64 => {
-            f64::from_le_bytes(a.try_into().unwrap()).total_cmp(&f64::from_le_bytes(b.try_into().unwrap()))
-        }
-        type_code::F32 => {
-            f32::from_le_bytes(a.try_into().unwrap()).total_cmp(&f32::from_le_bytes(b.try_into().unwrap()))
-        }
-        // The windows ARE the columns (equal length, asserted above), so the
-        // exact form applies and no sub-slice bound is paid per comparison.
-        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => {
-            crate::read_unsigned_exact(a).cmp(&crate::read_unsigned_exact(b))
-        }
-        _ => crate::read_signed_exact(a).cmp(&crate::read_signed_exact(b)), // I8/I16/I32/I64
-    }
-}
-
-/// Compare two equal-width column windows of the given raw `u8` type code:
-/// German strings (STRING/BLOB) by content through their backing blob arenas,
-/// every fixed-width type through [`cmp_typed_le`]. The blob slices back each
-/// side's heap payload, and are ignored for non-string columns.
+/// Compare two equal-width column windows of type `tc`: German strings
+/// (STRING/BLOB) by content through their backing blob arenas, every
+/// fixed-width type by its value — unsigned magnitude, signed two's complement,
+/// or `total_cmp` for a float. The blob slices back each side's heap payload,
+/// and are ignored for non-string columns.
 ///
-/// The single home for "STRING and BLOB share the 16-byte layout, so they must
-/// be compared by content before the fixed-width dispatch" — a missed site would
-/// mis-order a BLOB key. In `gnitz-wire` because the client-side comparators are
-/// held to the same order as the engine's.
+/// In `gnitz-wire` because the client-side comparators are held to the same
+/// order as the engine's.
 ///
 /// `#[inline(always)]`: one payload comparison of a sort, monomorphised into
 /// crates that build at opt-level 0, where a plain hint inlines nothing.
 #[inline(always)]
-pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_code: u8) -> Ordering {
-    if is_german_string(type_code) {
-        crate::compare_german_strings(a, a_blob, b, b_blob)
-    } else {
-        cmp_typed_le(a, b, type_code)
+pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: TypeCode) -> Ordering {
+    // Deliberately not `debug_assert_eq!`: that takes both lengths by reference
+    // and spills them, on a per-row path.
+    debug_assert!(a.len() == b.len(), "cmp_col_window: windows must be equal length");
+    #[inline(always)]
+    fn arr<const N: usize>(s: &[u8]) -> [u8; N] {
+        s.try_into().unwrap()
     }
-}
-
-/// Whether a raw wire type code may be a PRIMARY KEY column: the integer
-/// scalars of every width, and nothing else. A PK region is compared as raw
-/// bytes, which String/Blob heap offsets and IEEE-754 floats (±0.0 differ
-/// byte-wise but compare equal) do not survive. Both operands are allow-lists,
-/// so an unknown code is ineligible.
-#[inline(always)]
-pub const fn is_pk_eligible(tc: u8) -> bool {
-    is_fixed_int(tc) || is_wide_int(tc)
+    use TypeCode as T;
+    match tc {
+        T::U8 => a[0].cmp(&b[0]),
+        T::I8 => (a[0] as i8).cmp(&(b[0] as i8)),
+        T::U16 => u16::from_le_bytes(arr(a)).cmp(&u16::from_le_bytes(arr(b))),
+        T::I16 => i16::from_le_bytes(arr(a)).cmp(&i16::from_le_bytes(arr(b))),
+        T::U32 => u32::from_le_bytes(arr(a)).cmp(&u32::from_le_bytes(arr(b))),
+        T::I32 | T::Date => i32::from_le_bytes(arr(a)).cmp(&i32::from_le_bytes(arr(b))),
+        T::U64 => u64::from_le_bytes(arr(a)).cmp(&u64::from_le_bytes(arr(b))),
+        T::I64 | T::Timestamp | T::Decimal => i64::from_le_bytes(arr(a)).cmp(&i64::from_le_bytes(arr(b))),
+        T::U128 | T::UUID => u128::from_le_bytes(arr(a)).cmp(&u128::from_le_bytes(arr(b))),
+        T::I128 => i128::from_le_bytes(arr(a)).cmp(&i128::from_le_bytes(arr(b))),
+        T::F32 => f32::from_le_bytes(arr(a)).total_cmp(&f32::from_le_bytes(arr(b))),
+        T::F64 => f64::from_le_bytes(arr(a)).total_cmp(&f64::from_le_bytes(arr(b))),
+        T::String | T::Blob => crate::compare_german_strings(a, a_blob, b, b_blob),
+    }
 }
 
 /// Promote a base-table column's type to the leading-key type its secondary
 /// index stores: an unsigned ≤8-byte integer (U8..U64) promotes to `U64`, a
-/// signed ≤8-byte integer (I8..I64) to `I64`, and a temporal or decimal code as
+/// signed ≤8-byte integer (I8..I64) to `I64`, and a temporal or decimal type as
 /// its storage integer does — so a `DATE` index key is the exercised 8-byte
-/// signed one, not the only 4-byte key in the system; `U128`/`UUID` keep their 16-byte width; STRING/BLOB/float (and any unknown code) are index-ineligible and
-/// return `Err`. Signed columns keep a *signed* promoted code so the OPK leading
-/// key is order-preserving (`encode_pk_column` sign-flips only signed codes);
+/// signed one, not the only 4-byte key in the system; `U128`/`UUID` keep their
+/// 16-byte width; STRING/BLOB/float/I128 are index-ineligible and return `Err`.
+/// Signed columns keep a *signed* promoted type so the OPK leading key is
+/// order-preserving (`encode_pk_column` sign-flips only signed types);
 /// `wire_stride(I64) == wire_stride(U64) == 8`, so the sign the promotion picks
-/// never moves the index record's arity or stride. The single source of
-/// truth for index-key promotion, shared by the engine's `make_index_schema` and
-/// the SQL planner's CREATE INDEX limit pre-check so the nice SQL error and the
+/// never moves the index record's arity or stride. The single source of truth
+/// for index-key promotion, shared by the engine's `make_index_schema` and the
+/// SQL planner's CREATE INDEX limit pre-check so the nice SQL error and the
 /// engine backstop can never disagree on a column's promoted width.
-pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
-    use type_code as tc;
-    match storage_type_code(field_type_code) {
-        tc::U128 => Ok(tc::U128),
-        tc::UUID => Ok(tc::UUID),
-        tc::U64 | tc::U32 | tc::U16 | tc::U8 => Ok(tc::U64),
-        tc::I64 | tc::I32 | tc::I16 | tc::I8 => Ok(tc::I64),
-        tc::F32 | tc::F64 | tc::STRING | tc::BLOB => Err(format!(
-            "Secondary index on column type {field_type_code} not supported"
-        )),
-        _ => Err(format!("Unknown column type code: {field_type_code}")),
+pub fn index_key_type(field_type: TypeCode) -> Result<TypeCode, String> {
+    use TypeCode as T;
+    match field_type.storage_type() {
+        T::U128 => Ok(T::U128),
+        T::UUID => Ok(T::UUID),
+        T::U64 | T::U32 | T::U16 | T::U8 => Ok(T::U64),
+        T::I64 | T::I32 | T::I16 | T::I8 => Ok(T::I64),
+        T::F32 | T::F64 | T::String | T::Blob | T::I128 | T::Date | T::Timestamp | T::Decimal => {
+            Err(format!("Secondary index on column type {field_type} not supported"))
+        }
     }
 }
 
@@ -420,8 +483,12 @@ pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
 /// shared by the SQL planner's CREATE INDEX pre-check and the engine's
 /// `make_index_schema`, so the friendly planner error and the engine backstop
 /// can never disagree on a column's promoted width or the limits.
-pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usize) -> Result<Vec<u8>, IndexKeyRule> {
-    let mut promoted: Vec<u8> = Vec::with_capacity(col_types.len());
+pub fn index_key_types(
+    col_types: &[TypeCode],
+    src_pk_count: usize,
+    src_pk_stride: usize,
+) -> Result<Vec<TypeCode>, IndexKeyRule> {
+    let mut promoted: Vec<TypeCode> = Vec::with_capacity(col_types.len());
     for (col, &t) in col_types.iter().enumerate() {
         // Indexed by position, so the layer above can name the SQL column that
         // failed; `index_key_type`'s own string says only the type code.
@@ -432,7 +499,7 @@ pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usi
     if n + src_pk_count > crate::MAX_PK_COLUMNS {
         return Err(IndexKeyRule::ArityOutOfRange { n, src_pk_count });
     }
-    let stride: usize = promoted.iter().map(|&t| wire_stride(t)).sum::<usize>() + src_pk_stride;
+    let stride: usize = promoted.iter().map(|t| t.wire_stride()).sum::<usize>() + src_pk_stride;
     if stride > crate::MAX_PK_BYTES {
         return Err(IndexKeyRule::StrideOutOfRange { stride });
     }
@@ -445,9 +512,9 @@ pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usi
 /// only the indexed columns are promoted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKeyRule {
-    /// STRING/BLOB/float (or an unknown code) has no order-preserving
+    /// STRING/BLOB/float/I128 has no order-preserving
     /// fixed-width index key to promote to.
-    NotEligible { col: usize, type_code: u8 },
+    NotEligible { col: usize, type_code: TypeCode },
     /// The index record is the indexed columns plus the source PK, and every one
     /// of them is a PK column, so their total arity is capped by
     /// [`crate::MAX_PK_COLUMNS`].
@@ -500,7 +567,7 @@ pub enum PkRule {
     Duplicate { col: u32 },
     /// STRING/BLOB (an unrelocatable heap offset) or a float (IEEE-754 breaks
     /// the byte-equal key contract the OPK encoder rests on).
-    NotEligible { col: u32, type_code: u8 },
+    NotEligible { col: u32, type_code: TypeCode },
     /// The PK region carries no null bitmap, so a NULL has nowhere to live.
     Nullable { col: u32 },
     /// The packed PK region must fit [`MAX_PK_BYTES`].
@@ -590,17 +657,17 @@ pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize, max_pk: usize) -> Resu
 /// The typed half of [`validate_pk_tuple`], which runs the structural half
 /// first, so `col` may assume its index is in range. Returns the validated
 /// `pk_stride`. Base-table counterpart of [`index_key_types`].
-fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (u8, bool)) -> Result<usize, PkRule> {
+fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (TypeCode, bool)) -> Result<usize, PkRule> {
     let mut stride = 0usize;
     for &c in pk_cols {
         let (type_code, nullable) = col(c);
-        if !is_pk_eligible(type_code) {
+        if !type_code.is_pk_eligible() {
             return Err(PkRule::NotEligible { col: c, type_code });
         }
         if nullable {
             return Err(PkRule::Nullable { col: c });
         }
-        stride += wire_stride(type_code);
+        stride += type_code.wire_stride();
     }
     // `stride == 0` is unreachable once every column passed `is_pk_eligible`
     // (each eligible type is ≥ 1 byte); rejected explicitly so an empty list
@@ -617,163 +684,10 @@ pub fn validate_pk_tuple(
     pk_cols: &[u32],
     ncols: usize,
     max_pk: usize,
-    col: impl Fn(u32) -> (u8, bool),
+    col: impl Fn(u32) -> (TypeCode, bool),
 ) -> Result<usize, PkRule> {
     validate_pk_indices(pk_cols, ncols, max_pk)?;
     validate_pk_column_types(pk_cols, col)
-}
-
-/// Whether a raw wire type code uses the 16-byte German-string layout. u8-based
-/// counterpart to [`TypeCode::is_german_string`] for callers holding a raw
-/// `type_code` (mirrors the free `wire_stride`/`is_pk_eligible`). Unknown codes
-/// are not german strings.
-#[inline(always)]
-pub const fn is_german_string(tc: u8) -> bool {
-    tc == type_code::STRING || tc == type_code::BLOB
-}
-
-/// True iff `tc` is one of the two IEEE-754 column types. The `u8` counterpart
-/// of [`TypeCode::is_float`], for the raw-type-code paths.
-#[inline(always)]
-pub const fn is_float(tc: u8) -> bool {
-    matches!(tc, type_code::F32 | type_code::F64)
-}
-
-/// True iff `tc` is one of the two calendar types. The `u8` counterpart of
-/// [`TypeCode::is_temporal`], for the raw-type-code paths.
-#[inline(always)]
-pub const fn is_temporal(tc: u8) -> bool {
-    matches!(tc, type_code::DATE | type_code::TIMESTAMP)
-}
-
-/// The integer type code a value of type `tc` is stored, ordered and computed
-/// as — `I32` for `DATE`, `I64` for `TIMESTAMP` and `DECIMAL`, `tc` itself for
-/// everything else. The one place that map is written: the predicates such a
-/// code must answer like its storage type ([`is_signed_int`], [`is_fixed_int`])
-/// and the promotions it must follow ([`index_key_type`],
-/// [`join_key_common_type`]) all read it, so a further named integer needs no
-/// arm of its own in any of them.
-#[inline(always)]
-pub const fn storage_type_code(tc: u8) -> u8 {
-    match tc {
-        type_code::DATE => type_code::I32,
-        type_code::TIMESTAMP | type_code::DECIMAL => type_code::I64,
-        t => t,
-    }
-}
-
-/// True iff `tc` is a 16-byte integer type (U128/UUID/I128). The `u8`
-/// counterpart of [`TypeCode::is_wide_int`], for the raw-type-code paths.
-#[inline(always)]
-pub const fn is_wide_int(tc: u8) -> bool {
-    matches!(tc, type_code::U128 | type_code::UUID | type_code::I128)
-}
-
-/// True iff `tc` decodes to a known [`TypeCode`]. The one predicate every
-/// trust boundary that turns raw client type-code bytes into a schema column
-/// asks: an unknown code is not inert — [`wire_stride`] reports 8 for it (so a
-/// width test passes it through) and [`TypeCode::from_validated_u8`] panics on
-/// it at every downstream consumer.
-#[inline(always)]
-pub const fn is_valid_type_code(tc: u8) -> bool {
-    TypeCode::try_from_u8(tc).is_some()
-}
-
-/// The type of the register image the engine materializes for a computed value
-/// of source type `tc`: any float lands as `F64` (`LOAD_COL_FLOAT` widens `F32`
-/// on load), `U64` stays unsigned so a downstream compare re-seeds the unsigned
-/// variant, and every other integer normalizes to `I64`. A register sink stores that image
-/// whole, so a computed column typed any narrower would ship the low half of an
-/// `f64` or wrap a negative value into an unsigned slot.
-///
-/// `STRING` maps to itself — the VM has a string register class beside the
-/// scalar one — which is what makes the rule total enough for expression typing
-/// to read it unconditionally; `BLOB` has a register of neither class and falls
-/// in with the rest.
-///
-/// A temporal or decimal code also maps to itself: the register holds the
-/// 8-byte integer while the declared column keeps its name. A `DATE` slot is
-/// narrower than that register, so a sink into one is admitted only behind a
-/// cast that range-checks the value into that width (`check_emit_slot`).
-#[inline]
-pub(crate) const fn register_image_type(tc: u8) -> u8 {
-    if is_float(tc) {
-        type_code::F64
-    } else if tc == type_code::U64 {
-        type_code::U64
-    } else if tc == type_code::STRING || is_temporal(tc) || tc == type_code::DECIMAL {
-        tc
-    } else {
-        type_code::I64
-    }
-}
-
-/// True iff every value of integer type `src` is representable in `target`.
-/// Crossing into signed needs strictly more width, an equal-width signed type
-/// not holding the unsigned range; `UUID` is in no domain, U128's width
-/// notwithstanding. The *value* domain — [`join_key_common_type`] answers the
-/// same-looking question for a reindex key, whose codomain collapses onto U128.
-pub const fn int_domain_fits(src: u8, target: u8) -> bool {
-    if !is_int(src) || !is_int(target) {
-        return false;
-    }
-    if is_signed_int(src) == is_signed_int(target) {
-        wire_stride(target) >= wire_stride(src)
-    } else {
-        is_signed_int(target) && wire_stride(target) > wire_stride(src)
-    }
-}
-
-/// True iff `target` is a value-preserving *widening promotion* of `src` — the
-/// only type change a column copy performs (`widen_native_le` sign/zero-extends
-/// a narrower integer into a wider slot; there is no narrowing and no
-/// representation change). The `is_fixed_int(target)` gate is this caller's own
-/// scope, not a screen on the rule: a column copy only ever widens into a
-/// ≤8-byte slot. The expression validator's `check_copy_types` asks it of every
-/// column sink, and the SQL planner asks it of a set-op pair's promotion target
-/// so the two agree on what a copy may do.
-#[inline]
-pub fn is_widening_promotion(src: u8, target: u8) -> bool {
-    is_fixed_int(target) && int_domain_fits(src, target)
-}
-
-/// Whether a raw wire type code is a *signed* fixed-width integer
-/// (I8/I16/I32/I64/I128). The order-preserving encoders/comparators flip the
-/// sign bit for these so two's-complement negatives sort below non-negatives.
-/// Unsigned, float, string, and unknown codes are not signed.
-#[inline(always)]
-pub const fn is_signed_int(tc: u8) -> bool {
-    matches!(
-        storage_type_code(tc),
-        type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 | type_code::I128
-    )
-}
-
-/// Whether a raw wire type code is a fixed-width integer of ≤ 8 bytes
-/// (U8/I8/U16/I16/U32/I32/U64/I64, any sign). Excludes U128/UUID (16 bytes) and
-/// all float/string/blob types — these are exactly the payload columns the
-/// fixed-int fast-path row comparator can compare via a single `u64` load.
-#[inline(always)]
-pub const fn is_fixed_int(tc: u8) -> bool {
-    matches!(
-        storage_type_code(tc),
-        type_code::U8
-            | type_code::I8
-            | type_code::U16
-            | type_code::I16
-            | type_code::U32
-            | type_code::I32
-            | type_code::U64
-            | type_code::I64
-    )
-}
-
-/// Whether a raw wire type code is an **integer** of any width or sign —
-/// [`is_fixed_int`]'s eight codes plus the 128-bit pair. UUID shares U128's
-/// width and is not one. The domain [`int_domain_fits`] is defined on, where
-/// `is_fixed_int`'s ≤ 8-byte scope would silently exclude a 128-bit column.
-pub(crate) const fn is_int(tc: u8) -> bool {
-    is_fixed_int(tc) || tc == type_code::U128 || tc == type_code::I128
 }
 
 /// A fixed-width integer column type — ≤ 8 bytes, any sign. This is the exact
@@ -873,6 +787,18 @@ impl FixedInt {
     pub const fn pack(self, v: i128) -> u128 {
         debug_assert!(self.range().0 <= v && v <= self.range().1);
         (v as u128) & (u128::MAX >> (128 - 8 * self.width()))
+    }
+
+    /// Inverse of [`Self::pack`]: `v`'s low `width()` bytes read as this type,
+    /// sign- or zero-extended into `i64` — what `decode_le_i64(&v.to_le_bytes())`
+    /// answers, without the bytes.
+    pub const fn unpack(self, v: u128) -> i64 {
+        let shift = 128 - 8 * self.width() as u32;
+        if self.is_signed() {
+            ((v << shift) as i128 >> shift) as i64
+        } else {
+            ((v << shift) >> shift) as i64
+        }
     }
 
     /// Whether this integer type is signed. The order-preserving encoders flip
@@ -987,7 +913,7 @@ impl WideKind {
     #[inline(always)]
     pub fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
         match self {
-            Self::Fixed(tc) => cmp_typed_le(a, b, tc as u8),
+            Self::Fixed(tc) => cmp_col_window(a, &[], b, &[], tc),
             Self::Bytes => a.cmp(b),
         }
     }
@@ -1054,22 +980,33 @@ const _: () = {
             kind.is_some() != (tc.is_wide_int() || tc.is_german_string()),
             "a type is wide iff it has no scalar image"
         );
+        // A temporal or decimal type is its storage integer under another name,
+        // so the two must lay out identically — `wire_stride` spells the width
+        // table separately from `storage_type`'s map.
+        assert!(
+            tc.wire_stride() == tc.storage_type().wire_stride(),
+            "a type must have its storage type's width"
+        );
+        assert!(
+            tc.is_signed_int() == tc.storage_type().is_signed_int(),
+            "a type must have its storage type's sign"
+        );
         match FixedInt::from_type_code(tc) {
             Some(fi) => {
                 assert!(matches!(kind, Some(ScalarKind::Int(_))), "a FixedInt has an Int image");
                 assert!(
-                    fi.type_code() as u8 == tc.storage_type() as u8,
+                    fi.type_code().as_wire() == tc.storage_type().as_wire(),
                     "FixedInt::type_code must invert from_type_code up to the storage type"
                 );
                 assert!(
-                    fi.is_signed() == is_signed_int(tc as u8),
-                    "FixedInt::is_signed must match the raw-code predicate"
+                    fi.is_signed() == tc.is_signed_int(),
+                    "FixedInt::is_signed must match the type's sign"
                 );
                 // `FixedInt::width` restates the table `wire_stride` owns, and
                 // `encode_pk_column` dispatches on the destination slice's
                 // length — so a typo writes the wrong width silently in release.
                 assert!(
-                    fi.width() == wire_stride(tc as u8),
+                    fi.width() == tc.wire_stride(),
                     "FixedInt::width must be the type's wire stride"
                 );
             }
@@ -1082,166 +1019,17 @@ const _: () = {
     }
 };
 
-/// The width policy behind [`TypeCode::reindex_output_type`] and
-/// [`resolve_reindex_type`], which are what every external consumer calls. See
-/// that method for the policy and the engine ↔ planner lockstep it anchors.
-pub const fn reindex_output_type_code(tc: u8) -> u8 {
-    // ≤8-byte ints and the signed-128 join key keep their own width-and-sign slot;
-    // every other wide/non-int type (U128/UUID, the STRING/BLOB hash, floats)
-    // collapses to the unsigned 16-byte U128 key.
-    if is_fixed_int(tc) || tc == type_code::I128 {
-        tc
-    } else {
-        type_code::U128
-    }
-}
-
-/// Common reindex output type code for an equijoin key pair, or `None` if the
-/// pair cannot co-partition under an existing type code. The returned code is the
-/// reindex OUTPUT type directly (the promoted integer type with its true sign for
-/// ≤8-byte ints; U128 for the unsigned-16B and german-string cases), so it is
-/// exactly what the slot type, the `ColPromoter`, and the `_join_pk` stamp all
-/// need.
-pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
-    // Equal types: the reindex output type (identity for fixed ints; U128 for
-    // U128/UUID and STRING/BLOB content hashes). A float pair is the one equal
-    // pair that co-partitions under none: `±0.0` are byte-unequal but compare equal.
-    if l == r {
-        return (is_pk_eligible(l) || is_german_string(l)).then(|| reindex_output_type_code(l));
-    }
-    // Both german strings: a 16-byte XXH3 content hash (U128 slot). A one-sided
-    // string pair is rejected in validate_join_key_pair and never reaches here.
-    if is_german_string(l) && is_german_string(r) {
-        return Some(type_code::U128);
-    }
-    // DATE counts days and TIMESTAMP microseconds: a key copy moves bytes and
-    // cannot convert one unit to the other.
-    if is_temporal(l) && is_temporal(r) {
-        return None;
-    }
-    // Both signed integers of at most 8 bytes → the wider signed type. Read
-    // through the storage type: a pair with one temporal side co-partitions as
-    // the integer both sides really are, never under the calendar name.
-    if is_signed_int(l) && is_signed_int(r) {
-        let (l, r) = (storage_type_code(l), storage_type_code(r));
-        return Some(if wire_stride(l) >= wire_stride(r) { l } else { r });
-    }
-    // Both unsigned (U8..U64 and the 16-byte U128/UUID) → the wider unsigned
-    // type; a 16-byte operand carries the pair to U128. `is_pk_eligible` is the
-    // integer-scalar set; minus the signed ones leaves the unsigned ones.
-    let is_unsigned_int = |tc: u8| is_pk_eligible(tc) && !is_signed_int(tc);
-    if is_unsigned_int(l) && is_unsigned_int(r) {
-        let wider = if wire_stride(l) >= wire_stride(r) { l } else { r };
-        return Some(if wire_stride(wider) == 16 {
-            type_code::U128
-        } else {
-            wider
-        });
-    }
-    // Cross-sign integer keys: one side signed, the other unsigned. (Equal,
-    // both-signed, and both-unsigned pairs all returned above, so any remaining
-    // integer-scalar pair is opposite-sign.) The common type must be a SIGNED type
-    // (a) strictly wider than the unsigned operand — a signed type of equal width
-    // cannot represent the unsigned operand's full range, so distinct values
-    // would alias — and (b) at least as wide as the signed operand. The unsigned
-    // side zero-extends and the signed side sign-extends into it
-    // (`store_opk_image`), so equal numeric values pack byte-identically.
-    // wu ∈ {1,2,4,8,16}; only a U128/UUID unsigned operand (wu == 16) needs a
-    // signed-256 type that does not exist → None.
-    if is_pk_eligible(l) && is_pk_eligible(r) {
-        let (s, u) = if is_signed_int(l) { (l, r) } else { (r, l) };
-        let common_w = (wire_stride(u) * 2).max(wire_stride(s));
-        return match common_w {
-            2 => Some(type_code::I16),
-            4 => Some(type_code::I32),
-            8 => Some(type_code::I64),
-            16 => Some(type_code::I128),
-            // wu == 16 (U128/UUID) ⇒ common_w == 32: a signed-256 type, none exists.
-            _ => None,
-        };
-    }
-    None
-}
-
-/// Final reindex slot type code for a key column: the carried promotion target
-/// when the planner disagreed with the per-column default policy, else that
-/// policy. The single home of the "carried-or-derive" rule, so the reindex Map's
-/// output schema and the `ReindexPacker` cannot derive divergent slot widths.
+/// Final reindex slot type for a key column: the carried promotion target when
+/// the planner disagreed with the per-column default policy, else that policy.
+/// The single home of the "carried-or-derive" rule, so the reindex Map's output
+/// schema and the `ReindexPacker` cannot derive divergent slot widths.
 #[inline]
-pub const fn resolve_reindex_type(src_tc: u8, carried: Option<TypeCode>) -> u8 {
+pub const fn resolve_reindex_type(src_tc: TypeCode, carried: Option<TypeCode>) -> TypeCode {
     match carried {
-        Some(t) => t as u8,
-        None => reindex_output_type_code(src_tc),
+        Some(t) => t,
+        None => src_tc.reindex_output_type(),
     }
 }
-
-/// Wire stride (byte width) for a column type code. Delegates to the single
-/// width source [`TypeCode::wire_stride`]; an unknown code returns 8, the
-/// survival width `SchemaColumn::new` — the one caller that can pass one —
-/// documents its need for.
-#[inline(always)]
-pub const fn wire_stride(tc: u8) -> usize {
-    match TypeCode::try_from_u8(tc) {
-        Some(t) => t.wire_stride(),
-        None => 8,
-    }
-}
-
-// Pin the discriminant↔code round-trip: a `try_from_u8` typo (e.g. mapping a
-// code to the wrong-discriminant variant) would otherwise silently mis-stride a
-// column via `wire_stride`.
-const _: () = {
-    let mut v: u16 = 0; // u16 so `v += 1` cannot overflow at 255
-    while v <= 255 {
-        // `ALL` is the one enumeration of the type table — the Python `TypeCode`
-        // IntEnum is built from it — so it must agree with `try_from_u8` on
-        // membership in *both* directions. A code `try_from_u8` accepts but
-        // `ALL` omits is invisible to a client-side list of names.
-        let mut in_all = false;
-        let mut k = 0;
-        while k < TypeCode::ALL.len() {
-            if TypeCode::ALL[k] as u8 == v as u8 {
-                assert!(!in_all, "duplicate code in TypeCode::ALL");
-                in_all = true;
-            }
-            k += 1;
-        }
-        if let Some(t) = TypeCode::try_from_u8(v as u8) {
-            assert!(
-                t as u8 == v as u8,
-                "TypeCode discriminant must round-trip through try_from_u8"
-            );
-            assert!(in_all, "try_from_u8 accepts a code TypeCode::ALL omits");
-        } else {
-            assert!(!in_all, "TypeCode::ALL carries a code try_from_u8 rejects");
-        }
-        // `is_fixed_int` is the domain of `read_{signed,unsigned}_exact` and of
-        // the engine's fixed-int fast-path row comparator, whose branchless
-        // sign-flip shifts by `size*8 - 1` into a u64 — so widening the
-        // predicate past 8 bytes must fail here rather than there.
-        let w = wire_stride(v as u8);
-        assert!(
-            !is_fixed_int(v as u8) || (w == 1 || w == 2 || w == 4 || w == 8),
-            "is_fixed_int must imply a 1/2/4/8-byte width"
-        );
-        // A temporal or decimal code is its storage integer under another name,
-        // so the two must lay out identically — `wire_stride` and `is_signed_int` spell the
-        // width and sign tables separately from `storage_type_code`'s map.
-        assert!(
-            w == wire_stride(storage_type_code(v as u8)),
-            "a type must have its storage type's width"
-        );
-        assert!(
-            is_signed_int(v as u8) == is_signed_int(storage_type_code(v as u8)),
-            "a type must have its storage type's sign"
-        );
-        v += 1;
-    }
-    assert!(
-        wire_stride(0) == 8 && wire_stride(200) == 8,
-        "an unknown code must get a non-zero survival width, not a colliding 0"
-    );
-};
 
 #[cfg(test)]
 #[path = "tests/types.rs"]

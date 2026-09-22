@@ -14,7 +14,7 @@ use gnitz_wire::{Cut, OrderKey, PkKeys, RangeDescriptor, ReadBound, ReadSpec};
 
 /// The `(id U64 PK | val I64)` schema both bases below use.
 fn id_val_cols() -> Vec<ColumnDef> {
-    vec![col_def("id", type_code::U64), col_def("val", type_code::I64)]
+    vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)]
 }
 
 /// An `id_val_cols` base of `n` rows, `val = val_of(id)`, each at weight 1.
@@ -302,9 +302,9 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     let dir = temp_dir("ss_clustered");
     let mut e = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
-        col_def("a", type_code::U64),
-        col_def("b", type_code::U64),
-        col_def("val", type_code::I64),
+        col_def("a", TypeCode::U64),
+        col_def("b", TypeCode::U64),
+        col_def("val", TypeCode::I64),
     ];
     // CLUSTER BY a: distribution prefix = the first of the two PK columns.
     let tid = create_flagged_table(&mut e, "clus", &cols, &[0, 1], clustered_flags(1));
@@ -488,8 +488,8 @@ fn proj_fixture(
 #[test]
 fn gather_of_64_payload_columns_covers_every_slot() {
     const P: usize = 64;
-    let mut cols = vec![col_def("id", type_code::U64)];
-    cols.extend((0..P).map(|k| col_def(&format!("c{k}"), type_code::I64)));
+    let mut cols = vec![col_def("id", TypeCode::U64)];
+    cols.extend((0..P).map(|k| col_def(&format!("c{k}"), TypeCode::I64)));
     let (mut e, tid) = proj_fixture("ss_gather64", &cols, 40, 16, |bb, id| {
         for k in 0..P {
             bb.put_u64(id * 100 + k as u64);
@@ -516,15 +516,15 @@ fn gather_of_64_payload_columns_covers_every_slot() {
 /// would surface here and nowhere else.
 #[test]
 fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let (mut e, tid) = proj_fixture("ss_pkonly_proj", &cols, 300, 32, |bb, id| {
         bb.put_u64(id * 7);
     });
     // Reply: id U64 PK + one U64 payload copied FROM the PK column.
     let reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -550,9 +550,9 @@ fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
 #[test]
 fn permuted_gather_with_string_and_nullable_across_chunks() {
     let cols = vec![
-        col_def("id", type_code::U64),
-        nullable_def("nv", type_code::I64),
-        col_def("s", type_code::STRING),
+        col_def("id", TypeCode::U64),
+        nullable_def("nv", TypeCode::I64),
+        col_def("s", TypeCode::String),
     ];
     const N: u64 = 200;
     let (mut e, tid) = proj_fixture("ss_permuted_str", &cols, N, 24, |bb, id| {
@@ -572,10 +572,10 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
     // (slot 2, nullable) — a permutation that also relocates a PK column.
     let reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -615,9 +615,9 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
 #[test]
 fn compute_projection_writes_at_keeper_tail_across_chunks() {
     let cols = vec![
-        col_def("id", type_code::U64),
-        nullable_def("nv", type_code::I64),
-        col_def("keep", type_code::I64),
+        col_def("id", TypeCode::U64),
+        nullable_def("nv", TypeCode::I64),
+        col_def("keep", TypeCode::I64),
     ];
     const N: u64 = 300;
     let (mut e, tid) = proj_fixture("ss_compute_proj", &cols, N, 32, |bb, id| {
@@ -630,9 +630,9 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
     // Reply: id U64 PK | nv*2 I64 (slot 0, nullable) | keep I64 (slot 1).
     let reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -684,9 +684,9 @@ fn projection_missing_an_output_slot_errs() {
     // Reply wants two payload slots; the projection writes only slot 0.
     let reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -722,7 +722,7 @@ fn gather_top_k_keeps_boundary_row_whole() {
 /// them. A single all-passing range would legitimately append the whole chunk.
 #[test]
 fn gather_limit_cuts_the_range_list_mid_chunk() {
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let (mut e, tid) = proj_fixture("ss_gather_earlystop", &cols, 500, 256, |bb, id| {
         bb.put_u64(id % 2);
     });
@@ -744,8 +744,8 @@ fn reply_pk_stride_mismatch_errs() {
     // A reply schema with a narrower (U32) PK than the source's U64.
     let bad = gnitz_store::schema::SchemaDescriptor::new(
         &[
-            gnitz_store::schema::SchemaColumn::new(type_code::U32, 0),
-            gnitz_store::schema::SchemaColumn::new(type_code::I64, 0),
+            gnitz_store::schema::SchemaColumn::new(TypeCode::U32, false),
+            gnitz_store::schema::SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );

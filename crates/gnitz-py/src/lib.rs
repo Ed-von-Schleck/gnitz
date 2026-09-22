@@ -121,7 +121,7 @@ fn delta_reply_schema(
 /// `_types.py` builds its `TypeCode` IntEnum from.
 #[pyfunction]
 fn type_codes() -> Vec<(&'static str, u8)> {
-    TypeCode::ALL.iter().map(|&tc| (tc.wire_name(), tc as u8)).collect()
+    TypeCode::ALL.iter().map(|&tc| (tc.wire_name(), tc.as_wire())).collect()
 }
 
 // ---------------------------------------------------------------------------

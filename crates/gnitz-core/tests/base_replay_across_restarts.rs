@@ -13,7 +13,7 @@ fn keys_on_worker_one(n: usize) -> Vec<u64> {
     (0u64..)
         .filter(|k| {
             let mut opk = [0u8; 8];
-            gnitz_wire::encode_pk_column(&k.to_le_bytes(), gnitz_wire::type_code::U64, &mut opk);
+            gnitz_wire::encode_pk_column(&k.to_le_bytes(), gnitz_wire::TypeCode::U64, &mut opk);
             gnitz_wire::worker_for_pk_bytes(&opk, WORKERS) == 1
         })
         .take(n)

@@ -5,7 +5,7 @@ use gnitz_wire::WireFlags;
 
 /// The one-U64-PK, zero-payload fixture every batch here is built over.
 fn u64_pk_only() -> SchemaDescriptor {
-    crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U64])
+    crate::test_support::pk_only_schema(&[gnitz_wire::TypeCode::U64])
 }
 
 /// An exchange frame's control header, as a worker stamps it.

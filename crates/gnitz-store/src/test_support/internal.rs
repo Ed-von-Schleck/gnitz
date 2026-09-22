@@ -12,14 +12,14 @@ use proptest::prelude::*;
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor, RecoverySource, StoreBudgets, Table};
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 use super::shared::{arb_type_code, pk_payload_schema, u64_pk_schema};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, wide) with a single I64 payload column.
 pub fn wide_pk_3xu64_schema() -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::U64; 3])
+    pk_payload_schema(&[TypeCode::U64; 3])
 }
 
 /// U64 pk + two I64 payload columns — the flush/merge fixtures' shape, where a
@@ -27,9 +27,9 @@ pub fn wide_pk_3xu64_schema() -> SchemaDescriptor {
 pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -107,7 +107,7 @@ pub fn read_pk_opk(region: &[u8], i: usize, stride: usize) -> u128 {
 /// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
 pub fn opk_pk_i64(opk_bytes: &[u8]) -> i64 {
     let mut le = [0u8; 8];
-    gnitz_wire::decode_pk_column(&opk_bytes[..8], type_code::I64, &mut le);
+    gnitz_wire::decode_pk_column(&opk_bytes[..8], TypeCode::I64, &mut le);
     i64::from_le_bytes(le)
 }
 
@@ -125,7 +125,7 @@ pub fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::I64])
+    pk_payload_schema(&[TypeCode::I64])
 }
 
 /// Build a sorted, consolidated batch with an I64 PK and a single I64 payload
@@ -146,12 +146,12 @@ pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> 
 
 /// U64 pk + a single STRING payload column.
 pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(type_code::STRING, 0))
+    u64_pk_schema(SchemaColumn::new(TypeCode::String, false))
 }
 
 /// U64 pk + a single BLOB payload column.
 pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(type_code::BLOB, 0))
+    u64_pk_schema(SchemaColumn::new(TypeCode::Blob, false))
 }
 
 /// Build a sorted, consolidated batch for a `(U64 pk, STRING|BLOB payload)` schema
@@ -177,8 +177,8 @@ pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -
 /// set can never drift from the predicate the schema layer enforces (fixed-width
 /// integer scalars: U8..U64, I8..I64, U128, I128, UUID — STRING / BLOB / float
 /// are rejected by `SchemaDescriptor::new`).
-pub fn arb_pk_type() -> impl Strategy<Value = u8> {
-    arb_type_code().prop_filter("type code must be PK-eligible", |&tc| gnitz_wire::is_pk_eligible(tc))
+pub fn arb_pk_type() -> impl Strategy<Value = TypeCode> {
+    arb_type_code().prop_filter("type code must be PK-eligible", |&tc| tc.is_pk_eligible())
 }
 
 // ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{KeyProducer, SpillSort};
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 use gnitz_wire::WireStatus;
 
 // ---------------------------------------------------------------------------
@@ -30,7 +30,7 @@ fn span_u128(v: u128) -> PkBuf {
 /// so the round-trip tests ship a 16-byte PK span per row. Index columns are
 /// all non-nullable, which is what makes it an all-PK schema.
 fn u128_frame_schema() -> SchemaDescriptor {
-    pk_only_schema(&[type_code::U128])
+    pk_only_schema(&[TypeCode::U128])
 }
 
 /// Build the real sorted-span producer over pre-sorted `keys` via
@@ -184,7 +184,7 @@ fn preflight_frames_are_cut_by_the_byte_budget() {
 fn preflight_train_composite_wide_span_roundtrip() {
     // Two U64 index columns → a 16-byte composite leading span, plus a U64
     // source PK; the frame schema is derived exactly as both endpoints do.
-    let idx_schema = pk_only_schema(&[type_code::U64; 3]);
+    let idx_schema = pk_only_schema(&[TypeCode::U64; 3]);
     let frame_schema = unique_preflight_wire_schema(&idx_schema, 2);
     // Spans are (a_be ++ b_be), 16 bytes. Two of them share their leading 8
     // bytes and differ only in the trailing column, so the span must carry both

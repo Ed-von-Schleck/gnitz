@@ -131,7 +131,7 @@ fn pk_admission_matrix() {
         assert_eq!(s.pk_stride(), stride, "{table}");
         for ((&pi, &tc), &name) in pk_indices.iter().zip(tcs).zip(names) {
             let c = &s.columns[pi as usize];
-            assert_eq!(c.type_code, tc, "{table}.{name}");
+            assert_eq!(c.ty.tc, tc, "{table}.{name}");
             assert!(c.name.eq_ignore_ascii_case(name), "{table}: {} != {name}", c.name);
             assert!(!c.is_nullable, "{table}.{name} must be NOT NULL");
         }
@@ -194,7 +194,7 @@ fn fk_child_adopts_the_parent_pk_type() {
     );
     let s = client.resolve_table_or_view_id(&sn, "child").unwrap().1;
     let fk = &s.columns[col_idx(&s, "p_id")];
-    assert_eq!(fk.type_code, TypeCode::I64);
+    assert_eq!(fk.ty.tc, TypeCode::I64);
     assert!(matches!(fk.fk, Some(gnitz_core::FkTarget::Table { .. })));
 
     assert_rejects_variant(

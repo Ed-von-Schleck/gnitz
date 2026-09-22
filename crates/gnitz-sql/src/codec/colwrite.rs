@@ -18,7 +18,7 @@ pub(crate) fn append_value_to_col<R>(
     def: &ColumnDef,
     lit: &BExpr<R>,
 ) -> Result<(), GnitzSqlError> {
-    let tc = def.type_code;
+    let tc = def.ty.tc;
     let refuse = |m: &str| Err(GnitzSqlError::Bind(format!("column '{}': {m}", def.name)));
     // NULL is the one value every column type encodes alike: a zeroed cell of
     // the type's own stride, with the null bit set by the caller.
@@ -62,7 +62,7 @@ pub(crate) fn append_value_to_col<R>(
 
 /// A literal as the native image of a column stored as an integer.
 pub(crate) fn native_value<R>(lit: &BExpr<R>, def: &ColumnDef) -> Result<u128, GnitzSqlError> {
-    let ty = def.ty();
+    let ty = def.ty;
     let text = || lit.literal_text();
     match place(lit, ty) {
         Some(

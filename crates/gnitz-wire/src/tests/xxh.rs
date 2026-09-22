@@ -44,3 +44,20 @@ fn digest_with_hole_ignores_the_hole_and_separates_seeds() {
     assert_eq!(digest_with_hole(b"a.db", &buf, 24), base, "the hole is excluded");
     assert_ne!(digest_with_hole(b"b.db", &buf, 24), base, "the seed is included");
 }
+
+/// `checksum` must agree byte-for-byte with the C/Python `XXH3_64bits` the
+/// other end of the wire runs — the interop contract this crate defines.
+#[test]
+fn checksum_matches_c_xxh3_64bits() {
+    let body_hex = "9800000008000000a000000008000000a800000008000000b000000008000000b800000008000000c000000008000000c800000008000000d000000008000000d800000008000000e000000008000000e800000008000000f00000001000000000010000000000000000000000000000000000000000000001000000000000008000000000000000000000000000000001000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    let body: Vec<u8> = (0..body_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&body_hex[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(body.len(), 208);
+    let computed = checksum(&body);
+    assert_eq!(
+        computed, 0x741C9E0BA1D8A9FD_u64,
+        "xxhash-rust and C XXH3_64bits disagree: got 0x{computed:016X}"
+    );
+}

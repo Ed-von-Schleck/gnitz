@@ -16,7 +16,7 @@
 //! The record carries no length of its own; every carrier length-prefixes it.
 
 use crate::codec::{Reader, Writer};
-use crate::{is_valid_type_code, MAX_COLUMNS, MAX_PK_COLUMNS};
+use crate::{ColType, MAX_COLUMNS, MAX_PK_COLUMNS};
 
 const CTX: &str = "schema record";
 
@@ -25,7 +25,7 @@ const CTX: &str = "schema record";
 /// anonymous records that describe physical shape only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaBlockCol<'a> {
-    pub type_code: u8,
+    pub ty: ColType,
     pub meta: ColMeta,
     pub name: &'a [u8],
 }
@@ -40,8 +40,6 @@ pub struct ColMeta {
     pub hidden: bool,
     /// Values are assigned from a server-side sequence (SQL `SERIAL`).
     pub serial: bool,
-    /// A DECIMAL column's scale; 0 for every other type.
-    pub scale: u8,
 }
 
 const NULLABLE: u8 = 1 << 0;
@@ -56,12 +54,11 @@ impl ColMeta {
             | (if self.serial { SERIAL } else { 0 })
     }
 
-    fn from_parts(flags: u8, scale: u8) -> ColMeta {
+    fn from_flags(flags: u8) -> ColMeta {
         ColMeta {
             nullable: flags & NULLABLE != 0,
             hidden: flags & HIDDEN != 0,
             serial: flags & SERIAL != 0,
-            scale,
         }
     }
 }
@@ -83,19 +80,14 @@ const _: () = assert!(
 
 /// One column, read forward.
 fn take_col<'a>(r: &mut Reader<'a>) -> Result<SchemaBlockCol<'a>, String> {
-    let type_code = r.u8()?;
-    if !is_valid_type_code(type_code) {
-        return Err(format!("{CTX}: invalid type code {type_code}"));
-    }
-    let flags = r.u8()?;
-    if flags & !DEFINED_FLAGS != 0 {
-        return Err(format!("{CTX}: unknown column meta bits {flags:#x}"));
-    }
+    let code = r.u8()?;
+    let flags = r.flags(DEFINED_FLAGS)?;
     let scale = r.u8()?;
+    let ty = ColType::from_wire(code, scale).ok_or_else(|| format!("{CTX}: invalid column type {code}/{scale}"))?;
     let name = r.bytes32()?;
     Ok(SchemaBlockCol {
-        type_code,
-        meta: ColMeta::from_parts(flags, scale),
+        ty,
+        meta: ColMeta::from_flags(flags),
         name,
     })
 }
@@ -111,7 +103,10 @@ pub fn encode(cols: &[SchemaBlockCol], pk_cols: &[u32]) -> Vec<u8> {
         w.u8(u8::try_from(c).unwrap_or(PK_FIELD_OVERFLOW));
     }
     for c in cols {
-        w.u8(c.type_code).u8(c.meta.flags()).u8(c.meta.scale).bytes32(c.name);
+        w.u8(c.ty.tc.as_wire())
+            .u8(c.meta.flags())
+            .u8(c.ty.scale)
+            .bytes32(c.name);
     }
     w.into_vec()
 }

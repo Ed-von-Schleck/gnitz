@@ -22,7 +22,7 @@ use crate::runtime::wire::{WireData, WireMsg};
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::control::frame_head_size;
-use gnitz_wire::{align8, low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
+use gnitz_wire::{low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
 use gnitz_wire::{WireFault, WireStatus, MAX_WORKERS};
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
@@ -50,7 +50,7 @@ const PREFIX_BYTES: usize = std::mem::size_of::<AtomicU64>();
 //   [24,32) DIGEST
 //   [32,36) REQUEST_ID
 //   [36,40) 0
-//   [40,..) DIRECTORY, align8-padded
+//   [40,..) DIRECTORY, 8-byte-padded
 
 /// The zone LSN of a zone member, `0` outside every zone.
 const OFF_LSN: usize = 0;
@@ -90,7 +90,7 @@ const HDR_PREFIX: usize = OFF_DIRECTORY;
 /// reader that slot 5 of a 2-slot group is empty rather than a leftover.
 #[inline]
 const fn group_header_size(slots: usize) -> usize {
-    OFF_DIRECTORY + align8(slots * DIR_ENTRY_BYTES)
+    OFF_DIRECTORY + (slots * DIR_ENTRY_BYTES).next_multiple_of(8)
 }
 
 // Group bases stay aligned for the publication prefix's atomic store.
@@ -107,22 +107,22 @@ const _: () = {
 
 /// Each **written** slot as `(worker, payload-relative offset, size)`, in
 /// directory order. The offset is a pure function of the sizes before it — slot
-/// `w` starts where the `align8`-padded slots ahead of it end — so the directory
+/// `w` starts where the 8-byte-padded slots ahead of it end — so the directory
 /// stores sizes alone and an inconsistent offset is unrepresentable.
 fn slot_spans(sizes: impl Iterator<Item = u32>) -> impl Iterator<Item = (usize, usize, usize)> {
     let mut off = 0;
     sizes.enumerate().filter_map(move |(w, sz)| {
         let sz = sz as usize;
         let at = off;
-        off += align8(sz);
+        off += sz.next_multiple_of(8);
         (sz > 0).then_some((w, at, sz))
     })
 }
 
-/// The SAL bytes a group occupies: prefix, header, directory and `align8`-padded
+/// The SAL bytes a group occupies: prefix, header, directory and 8-byte-padded
 /// slots — what the write cursor advances by, and where [`slot_spans`] leaves off.
 fn group_total_size(slots: usize, sizes: impl Iterator<Item = u32>) -> usize {
-    PREFIX_BYTES + group_header_size(slots) + sizes.map(|sz| align8(sz as usize)).sum::<usize>()
+    PREFIX_BYTES + group_header_size(slots) + sizes.map(|sz| (sz as usize).next_multiple_of(8)).sum::<usize>()
 }
 
 /// A group's directory bytes read back as slot sizes.
@@ -366,7 +366,8 @@ const fn next_epoch(epoch: u32) -> u32 {
 const CHECKPOINT_RESERVE: usize = 64 << 10;
 
 const _: () = {
-    let terminal = PREFIX_BYTES + group_header_size(MAX_WORKERS) + MAX_WORKERS * align8(frame_head_size(0, None));
+    let terminal =
+        PREFIX_BYTES + group_header_size(MAX_WORKERS) + MAX_WORKERS * frame_head_size(0, None).next_multiple_of(8);
     assert!(
         CHECKPOINT_RESERVE >= 2 * terminal,
         "the checkpoint band must hold two control-only MAX_WORKERS groups"
@@ -1005,7 +1006,7 @@ impl SalWriter {
         write_u32_le(hdr, OFF_EPOCH, epoch);
         write_u32_le(hdr, OFF_REQUEST_ID, request_id);
         write_u32_le(hdr, OFF_REQUEST_ID + 4, 0);
-        // Every entry is written, empty ones included, and the `align8` pad
+        // Every entry is written, empty ones included, and the 8-byte pad
         // behind them zeroed: `wal.sal` is never truncated, so an unwritten byte
         // inside the digested span would read as whatever group last occupied
         // this offset.

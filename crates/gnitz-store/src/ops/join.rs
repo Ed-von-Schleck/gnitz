@@ -16,7 +16,7 @@ use crate::schema::{DerivedSchema, OpBuildErr, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::{pk_group_end, pk_prefix_group_end, Batch, BlobCacheGuard, ReadCursor};
 
 use gnitz_expr::RowSource;
-use gnitz_wire::{null_word_at, JoinKind, RangeRel};
+use gnitz_wire::{null_word_at, JoinKind, RangeRel, TypeCode};
 
 // ---------------------------------------------------------------------------
 // The plan
@@ -136,7 +136,7 @@ impl JoinPlan {
 /// A keyed walk reads one side's PK region as the other's, so the two key
 /// layouts must be identical down to the OPK encoding each column type implies.
 fn same_pk_types(delta: &SchemaDescriptor, trace: &SchemaDescriptor) -> Result<(), OpBuildErr> {
-    fn types(s: &SchemaDescriptor) -> impl Iterator<Item = u8> + '_ {
+    fn types(s: &SchemaDescriptor) -> impl Iterator<Item = TypeCode> + '_ {
         s.pk_columns().map(|(_, c)| c.type_code)
     }
     if types(delta).eq(types(trace)) {

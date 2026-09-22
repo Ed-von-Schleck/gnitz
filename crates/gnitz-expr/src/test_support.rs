@@ -7,7 +7,7 @@
 //! addressing paths hold for the client-side adapter that will read the same
 //! expressions, and [`TestView`] is that adapter's seed.
 
-use gnitz_wire::type_code as tc;
+use gnitz_wire::TypeCode;
 
 use crate::{
     BatchView, ColumnLocator, ColumnTable, Evaluator, ExprResults, LogicalInstr, LogicalProgram, Output, Reg,
@@ -47,7 +47,7 @@ impl TestView {
 
     /// OPK-encode `native` (native-LE bytes of type `type_code`) into the PK
     /// region of `row` at `byte_off`.
-    pub fn set_pk_col(&mut self, row: usize, byte_off: usize, native: &[u8], type_code: u8) {
+    pub fn set_pk_col(&mut self, row: usize, byte_off: usize, native: &[u8], type_code: TypeCode) {
         let base = row * self.pk_stride + byte_off;
         gnitz_wire::encode_pk_column(native, type_code, &mut self.pk[base..base + native.len()]);
     }
@@ -117,19 +117,19 @@ impl BatchView for TestView {
 /// A [`ColumnTable`] over a `(type_code, nullable)` column table and a PK list.
 /// Type codes are reported verbatim, undecodable ones included.
 pub struct TestSchema {
-    cols: Vec<(u8, bool)>,
+    cols: Vec<(TypeCode, bool)>,
     pk: Vec<u32>,
 }
 
 impl TestSchema {
-    pub fn new(cols: &[(u8, bool)], pk: &[u32]) -> Self {
+    pub fn new(cols: &[(TypeCode, bool)], pk: &[u32]) -> Self {
         TestSchema { cols: cols.to_vec(), pk: pk.to_vec() }
     }
 
     /// As [`TestSchema::new`], with the PK at `pk_index` and every other column
     /// of `col_types` a nullable payload.
-    pub fn with_pk_at(pk_index: usize, col_types: &[u8]) -> Self {
-        let cols: Vec<(u8, bool)> = col_types.iter().enumerate().map(|(i, &t)| (t, i != pk_index)).collect();
+    pub fn with_pk_at(pk_index: usize, col_types: &[TypeCode]) -> Self {
+        let cols: Vec<(TypeCode, bool)> = col_types.iter().enumerate().map(|(i, &t)| (t, i != pk_index)).collect();
         TestSchema::new(&cols, &[pk_index as u32])
     }
 }
@@ -141,7 +141,7 @@ impl ColumnTable for TestSchema {
     fn num_columns(&self) -> usize {
         self.cols.len()
     }
-    fn col_type_code(&self, ci: usize) -> u8 {
+    fn col_type_code(&self, ci: usize) -> TypeCode {
         self.cols[ci].0
     }
     fn col_nullable(&self, ci: usize) -> bool {
@@ -213,16 +213,16 @@ pub fn make_string_view(schema: &TestSchema, rows: &[&[&[u8]]]) -> TestView {
 /// A `U64` PK plus `n` `I64` payload columns, all `nullable` or all not — the
 /// shape almost every kernel test wants.
 pub fn schema_pk_ints(n: usize, nullable: bool) -> TestSchema {
-    schema_pk_cols(tc::I64, n, nullable)
+    schema_pk_cols(TypeCode::I64, n, nullable)
 }
 
 /// A `U64` PK plus `n` `STRING` payload columns.
 pub fn schema_pk_strings(n: usize, nullable: bool) -> TestSchema {
-    schema_pk_cols(tc::STRING, n, nullable)
+    schema_pk_cols(TypeCode::String, n, nullable)
 }
 
-fn schema_pk_cols(payload_tc: u8, n: usize, nullable: bool) -> TestSchema {
-    let mut cols = vec![(tc::U64, false)];
+fn schema_pk_cols(payload_tc: TypeCode, n: usize, nullable: bool) -> TestSchema {
+    let mut cols = vec![(TypeCode::U64, false)];
     cols.extend(std::iter::repeat_n((payload_tc, nullable), n));
     TestSchema::new(&cols, &[0])
 }
@@ -373,8 +373,8 @@ pub fn locator_fixture() -> TestView {
     assert_eq!(v.push_col(16), 1);
     assert_eq!(v.push_col(8), 2);
     for (row, (a, b)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN)].into_iter().enumerate() {
-        v.set_pk_col(row, 0, &a.to_le_bytes(), tc::U32);
-        v.set_pk_col(row, 4, &b.to_le_bytes(), tc::I64);
+        v.set_pk_col(row, 0, &a.to_le_bytes(), TypeCode::U32);
+        v.set_pk_col(row, 4, &b.to_le_bytes(), TypeCode::I64);
         v.set_payload(row, 0, &(-3i32).to_le_bytes());
         v.set_payload(row, 1, &(1u128 << 100).to_le_bytes());
         v.set_payload(row, 2, &(row as u64).to_le_bytes());

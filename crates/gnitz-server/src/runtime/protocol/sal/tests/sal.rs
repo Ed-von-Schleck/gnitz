@@ -9,7 +9,6 @@ use crate::runtime::w2m::fixtures::sal_wake_seq;
 use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
 use crate::runtime::wire::WireMsg;
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, sweep_bit_flips};
-use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::MAX_WORKERS;
 
@@ -496,7 +495,8 @@ fn the_derived_stride_equals_the_writers_group_size_at_every_width() {
 
         let msg = group_in(log.log(), 0, 1);
         assert_eq!(msg.slots() as usize, slots);
-        let expected = group_header_size(slots) + payloads.iter().filter(|p| !p.is_empty()).count() * align8(100);
+        let expected =
+            group_header_size(slots) + payloads.iter().filter(|p| !p.is_empty()).count() * 100usize.next_multiple_of(8);
         assert_eq!(
             msg.end as usize,
             PREFIX_BYTES + expected,
@@ -583,7 +583,7 @@ fn a_rolled_back_transaction_publishes_nothing() {
     };
     let head = [0u8; 64];
     let need = TestLog::new(1 << 20, 1, 1).writer.footprint(&family(2));
-    let head_size = PREFIX_BYTES + group_header_size(1) + align8(head.len());
+    let head_size = PREFIX_BYTES + group_header_size(1) + head.len().next_multiple_of(8);
     let log = TestLog::new(PREFIX_BYTES + CHECKPOINT_RESERVE + head_size + need + need / 2, 1, 1);
 
     // A committed group ahead of the transaction, so the rollback must restore a
@@ -757,12 +757,12 @@ fn a_group_with_per_worker_extras_writes_each_slot_its_own_blob() {
 fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
     use crate::runtime::wire::WireData;
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code;
+    use gnitz_wire::TypeCode;
 
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I32, 0),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I32, false),
         ],
         &[0],
     );
@@ -791,13 +791,13 @@ fn a_replicated_push_sends_every_worker_the_live_rows() {
     use crate::runtime::wire::{decode_sal_slot, WireData};
     use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
     use gnitz_store::storage::BatchBuilder;
-    use gnitz_wire::type_code;
+    use gnitz_wire::TypeCode;
 
     let nw = 4;
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     )

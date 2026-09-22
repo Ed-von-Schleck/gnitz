@@ -29,7 +29,7 @@ fn join_key_slots(class: &JoinClass, side: &JoinSide, is_left: bool) -> Result<V
 fn side_reindex_key(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {
     cols.iter()
         .zip(slot_tcs)
-        .map(|(&c, &t)| (c as u32, coldefs[c].type_code.carried_reindex_tc(t)))
+        .map(|(&c, &t)| (c as u32, coldefs[c].ty.tc.carried_reindex_tc(t)))
         .collect()
 }
 
@@ -123,7 +123,7 @@ impl<'a> EquiTerms<'a> {
     }
 
     /// The type codes of that side's kept payload.
-    pub(crate) fn kept_type_codes(&self, is_left: bool) -> Vec<u8> {
+    pub(crate) fn kept_type_codes(&self, is_left: bool) -> Vec<TypeCode> {
         self.side(is_left).side.kept_type_codes()
     }
 
@@ -186,7 +186,7 @@ fn rekey_pk_coldefs<'a>(
         .enumerate()
         .map(|(slot, (schema, c))| {
             let src = &schema.columns[c as usize];
-            ColumnDef::new(name(slot, src), src.type_code.reindex_output_type(), false).hidden()
+            ColumnDef::new(name(slot, src), src.ty.tc.reindex_output_type(), false).hidden()
         })
         .collect()
 }

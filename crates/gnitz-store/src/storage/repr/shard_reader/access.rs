@@ -169,7 +169,7 @@ impl MappedShard {
             }
             for (pi, col) in schema.payload_columns() {
                 let cp = self.payload_col(pi);
-                if relocate && gnitz_wire::is_german_string(col.type_code) {
+                if relocate && col.type_code.is_german_string() {
                     for i in 0..row_count {
                         w.write_string_cell(pi, unsafe { cp.row(start + i, 16) }, self.blob(), i);
                     }

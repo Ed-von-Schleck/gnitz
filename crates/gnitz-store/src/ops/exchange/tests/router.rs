@@ -1,6 +1,6 @@
 use super::*;
 use crate::ops::group_key::GroupKeyCols;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_raw, make_schema_pk_u64_payload_string, make_schema_u64_i64,
 };
@@ -64,8 +64,8 @@ fn test_scatter_key_packed_matches_image_routing() {
     {
         let schema = SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 1),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::I64, true),
             ],
             &[0],
         );
@@ -92,8 +92,8 @@ fn test_scatter_key_packed_matches_image_routing() {
     {
         let schema = SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::STRING, 1),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::String, true),
             ],
             &[0],
         );
@@ -124,8 +124,8 @@ fn test_scatter_key_packed_matches_image_routing() {
     {
         let schema = SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::U128, false),
             ],
             &[0],
         );
@@ -145,16 +145,16 @@ fn test_scatter_key_packed_matches_image_routing() {
     {
         let schema = SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U32, 0),
-                SchemaColumn::new(type_code::I32, 0),
-                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(TypeCode::U32, false),
+                SchemaColumn::new(TypeCode::I32, false),
+                SchemaColumn::new(TypeCode::I64, false),
             ],
             &[0, 1],
         );
         let mut b = Batch::with_capacity(&schema, 1);
         let mut pk = [0u8; 8];
-        gnitz_wire::encode_pk_column(&7u32.to_le_bytes(), type_code::U32, &mut pk[0..4]);
-        gnitz_wire::encode_pk_column(&(-9i32).to_le_bytes(), type_code::I32, &mut pk[4..8]);
+        gnitz_wire::encode_pk_column(&7u32.to_le_bytes(), TypeCode::U32, &mut pk[0..4]);
+        gnitz_wire::encode_pk_column(&(-9i32).to_le_bytes(), TypeCode::I32, &mut pk[4..8]);
         b.extend_pk_bytes(&pk);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -174,8 +174,8 @@ fn test_scatter_key_packed_matches_image_routing() {
 fn scatter_key_refuses_a_key_this_schema_cannot_route() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, true),
         ],
         &[0],
     );
@@ -256,7 +256,7 @@ fn a_payload_group_key_routes_by_the_values_opk_image() {
 
     for (row, &v) in vals.iter().enumerate() {
         let mut opk = [0u8; 8];
-        gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut opk);
+        gnitz_wire::encode_pk_column(&v.to_le_bytes(), TypeCode::I64, &mut opk);
         assert_eq!(
             group_worker(&schema, &[1], &b, row, nw),
             worker_for_pk_bytes(&opk, nw),
@@ -308,10 +308,10 @@ fn route_into_agrees_with_worker_on_every_scatter_kind() {
 fn three_col_schema(placement: Placement) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1, 2],
     )
@@ -323,9 +323,9 @@ fn three_col_batch(schema: &SchemaDescriptor, n: usize) -> Batch {
     let mut b = Batch::with_capacity(schema, n);
     for i in 0..n as u32 {
         let mut pk = [0u8; 16];
-        gnitz_wire::encode_pk_column(&(i % 5 + 1).to_le_bytes(), type_code::U32, &mut pk[0..4]);
-        gnitz_wire::encode_pk_column(&(-(i as i32) * 3).to_le_bytes(), type_code::I32, &mut pk[4..8]);
-        gnitz_wire::encode_pk_column(&(u64::from(i) * 31 + 7).to_le_bytes(), type_code::U64, &mut pk[8..16]);
+        gnitz_wire::encode_pk_column(&(i % 5 + 1).to_le_bytes(), TypeCode::U32, &mut pk[0..4]);
+        gnitz_wire::encode_pk_column(&(-(i as i32) * 3).to_le_bytes(), TypeCode::I32, &mut pk[4..8]);
+        gnitz_wire::encode_pk_column(&(u64::from(i) * 31 + 7).to_le_bytes(), TypeCode::U64, &mut pk[8..16]);
         b.extend_pk_bytes(&pk);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());

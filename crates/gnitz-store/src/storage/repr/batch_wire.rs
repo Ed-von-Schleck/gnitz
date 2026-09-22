@@ -10,8 +10,8 @@
 use super::batch::{strides_from_schema, string_mask, Batch, MAX_BATCH_REGIONS, REG_PK};
 use super::merge::{blob_span_key, BlobCache, BlobCacheGuard, DirectWriter, MemBatch};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::region::{num_regions, Regions};
 use gnitz_wire::wal;
+use gnitz_wire::{num_regions, Regions};
 
 /// A block's size is affine in its row count: `base + rows · per_row`, plus the
 /// heap.
@@ -142,10 +142,7 @@ impl Batch {
     /// Heap bytes row `row` adds to a chunk whose spans are already in `seen`.
     fn row_heap_cost(&self, row: usize, slots: u64, seen: &mut BlobCache) -> usize {
         let mut cost = 0;
-        let mut rest = slots;
-        while rest != 0 {
-            let pi = rest.trailing_zeros() as usize;
-            rest &= rest - 1;
+        for pi in gnitz_wire::BitIter(slots) {
             let cell = self.get_col_ptr(row, pi, 16);
             let length = gnitz_wire::read_u32_le(cell, 0) as usize;
             if length <= gnitz_wire::SHORT_STRING_THRESHOLD {
@@ -282,7 +279,7 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
         return Ok(());
     }
     for (pi, col) in schema.payload_columns() {
-        if !gnitz_wire::is_german_string(col.type_code) {
+        if !col.type_code.is_german_string() {
             continue;
         }
         for cell in mb.col_data(pi, 16).as_chunks::<16>().0 {

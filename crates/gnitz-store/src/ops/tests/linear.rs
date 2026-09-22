@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, opk_pk, pk_payload_schema,
@@ -14,17 +14,11 @@ type Rows = &'static [(usize, i64, i64)];
 /// eight key values a case row's index selects. Only the last PK column varies —
 /// the leading ones stay zero — so the key order is the index order at every
 /// stride, and the signed shape puts negatives below zero.
-const SHAPES: [(&[u8], [i128; 8]); 4] = [
-    (&[type_code::U64], [0, 1, 2, 3, 4, 5, 6, 7]),
-    (
-        &[type_code::U64, type_code::U64, type_code::U64],
-        [0, 1, 2, 3, 4, 5, 6, 7],
-    ),
-    (
-        &[type_code::U64, type_code::U16, type_code::U8],
-        [0, 1, 2, 3, 4, 5, 6, 7],
-    ),
-    (&[type_code::I64], [-4, -3, -2, -1, 0, 1, 2, 3]),
+const SHAPES: [(&[TypeCode], [i128; 8]); 4] = [
+    (&[TypeCode::U64], [0, 1, 2, 3, 4, 5, 6, 7]),
+    (&[TypeCode::U64, TypeCode::U64, TypeCode::U64], [0, 1, 2, 3, 4, 5, 6, 7]),
+    (&[TypeCode::U64, TypeCode::U16, TypeCode::U8], [0, 1, 2, 3, 4, 5, 6, 7]),
+    (&[TypeCode::I64], [-4, -3, -2, -1, 0, 1, 2, 3]),
 ];
 
 /// The OPK key a case row's index names: `keys[i]` in the schema's last PK
@@ -323,23 +317,27 @@ fn union_merge_bench() {
 #[test]
 fn union_merges_nullability_and_reclassifies_the_comparator() {
     use crate::schema::payload_order::PayloadCmpKind;
-    let nonnull = pk_payload_schema(&[type_code::U128]);
+    let nonnull = pk_payload_schema(&[TypeCode::U128]);
     let nullable = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
 
     // Both non-nullable stays on the fast path; either side nullable forces
     // `Generic`, and the OR is symmetric.
-    for (a, b, want_nullable) in [(nonnull, nonnull, 0u8), (nonnull, nullable, 1), (nullable, nonnull, 1)] {
+    for (a, b, want_nullable) in [
+        (nonnull, nonnull, false),
+        (nonnull, nullable, true),
+        (nullable, nonnull, true),
+    ] {
         let m = union_nullability_merge(&a, &b).expect("shared layout");
         assert_eq!(m.columns[1].nullable, want_nullable);
         assert_eq!(
             m.payload_cmp,
-            if want_nullable == 1 {
+            if want_nullable {
                 PayloadCmpKind::Generic
             } else {
                 PayloadCmpKind::FixedIntNonnull
@@ -353,7 +351,7 @@ fn union_merges_nullability_and_reclassifies_the_comparator() {
 /// through it.
 #[test]
 fn union_of_mismatched_input_layouts_is_rejected() {
-    let a = pk_payload_schema(&[type_code::U128]);
+    let a = pk_payload_schema(&[TypeCode::U128]);
     assert_eq!(
         union_nullability_merge(&a, &make_schema_u64_i64())
             .expect_err("mismatched layouts")
@@ -370,11 +368,11 @@ fn the_null_extend_schema_and_the_widened_rows_agree_on_both_sides() {
     let in_schema = make_schema_u64_i64();
     let input = crate::test_support::make_batch(&in_schema, &[(1, 1, 42)]);
     for nulls_first in [false, true] {
-        let out_schema = null_extend_output_schema(&in_schema, &[type_code::I64, type_code::STRING], nulls_first)
+        let out_schema = null_extend_output_schema(&in_schema, &[TypeCode::I64, TypeCode::String], nulls_first)
             .expect("two fill columns extend cleanly");
         let out = input.widened_with_nulls(&out_schema, nulls_first);
 
-        let declared: Vec<bool> = out_schema.payload_columns().map(|(_, c)| c.nullable == 1).collect();
+        let declared: Vec<bool> = out_schema.payload_columns().map(|(_, c)| c.nullable).collect();
         let written: Vec<bool> = (0..out_schema.num_payload_cols())
             .map(|pi| gnitz_wire::null_word_get(out.get_null_word(0), pi))
             .collect();
@@ -391,11 +389,11 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
         "null-extend: merged schema exceeds MAX_COLUMNS ({})",
         crate::schema::MAX_COLUMNS
     );
-    let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![type_code::I64; n], false);
+    let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![TypeCode::I64; n], false);
     let narrow = make_schema_u64_i64();
     let out = extend(&narrow, 1).expect("a short type_codes list extends cleanly");
     assert_eq!(out.num_columns(), narrow.num_columns() + 1);
-    assert_eq!(out.columns[out.num_columns() - 1].nullable, 1);
+    assert!(out.columns[out.num_columns() - 1].nullable);
     // MAX_COLUMNS type_codes overflow the fixed schema array on their own.
     assert_eq!(
         extend(&narrow, crate::schema::MAX_COLUMNS)
@@ -405,8 +403,8 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     );
     // 64 + 2 > 65: the merged width, which a bound on the list length misses.
     let wide = {
-        let mut cols = [SchemaColumn::new(type_code::I64, 0); 64];
-        cols[0] = SchemaColumn::new(type_code::U64, 0);
+        let mut cols = [SchemaColumn::new(TypeCode::I64, false); 64];
+        cols[0] = SchemaColumn::new(TypeCode::U64, false);
         SchemaDescriptor::new(&cols, &[0])
     };
     assert_eq!(extend(&wide, 2).expect_err("overflow").to_string(), guard);

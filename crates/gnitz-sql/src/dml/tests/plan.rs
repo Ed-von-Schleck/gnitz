@@ -121,7 +121,7 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
     }
 
     // A descriptor pinning any PK column keeps the PK walk, unique point on
-    // offer or not — the client cannot see `dist_prefix_len`, so the ladder
+    // offer or not — the client cannot see the distribution prefix, so the ladder
     // bets on the `CLUSTER BY` unicast rather than measuring it.
     let compound = Schema {
         columns: vec![

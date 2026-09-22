@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 
 use super::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use gnitz_expr::RowSource;
-use gnitz_wire::{cmp_col_window, is_fixed_int, null_word_get, read_unsigned_exact};
+use gnitz_wire::{cmp_col_window, null_word_get, read_unsigned_exact};
 
 /// Which comparator orders a schema's payload columns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,7 +30,7 @@ pub(super) const fn compute_payload_cmp(
     let mut pi = 0;
     while pi < num_payload {
         let col = cols[payload_to_ci[pi] as usize];
-        if !(col.nullable == 0 && is_fixed_int(col.type_code)) {
+        if col.nullable || !col.type_code.is_fixed_int() {
             return PayloadCmpKind::Generic;
         }
         pi += 1;

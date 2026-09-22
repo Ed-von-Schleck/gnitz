@@ -38,7 +38,7 @@ fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, p
 fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str, pred: &[u8]) -> i64 {
     let vid = engine.next_id;
     write_filtered_circuit(engine, vid, base_tid, pred);
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(vid, &cols).unwrap();
     engine
         .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, name))
@@ -54,7 +54,7 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
 fn test_preflight_compile_verdict() {
     let dir = temp_dir("preflight_verdict");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
     // A compilable circuit: a well-formed predicate over the base's own columns.
@@ -84,7 +84,7 @@ fn test_preflight_compile_verdict() {
 fn a_view_whose_circuit_is_unroutable_or_over_cap_is_rejected_before_the_sal() {
     let dir = temp_dir("preflight_routing");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let a = engine.create_table("public.a", &cols, &[0]).unwrap();
     let b = engine.create_table("public.b", &cols, &[0]).unwrap();
 
@@ -128,14 +128,14 @@ fn a_view_whose_circuit_is_unroutable_or_over_cap_is_rejected_before_the_sal() {
 fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let dir = temp_dir("preflight_qname");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
 
     // The replacement's own rows must exist before its VIEW_TAB row is checked.
     let new_vid = engine.next_id;
     write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(new_vid, &cols).unwrap();
 
     // Reusing the live name without retiring the incumbent is still a collision.
@@ -168,7 +168,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
 fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let dir = temp_dir("preflight_rollback");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let base_cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
     let old_dir = engine
@@ -185,7 +185,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     // carrying the incumbent's `-1` and the replacement's `+1`.
     let new_vid = engine.next_id;
     write_filtered_circuit(&mut engine, new_vid, base_tid, &pred_lt_blob(1, 50));
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)];
     engine.write_column_records(new_vid, &cols).unwrap();
     let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);

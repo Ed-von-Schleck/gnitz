@@ -20,22 +20,22 @@ use proptest::prelude::*;
 
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor, SchemaFacts};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout};
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
 /// I64 payload column — the generic PK-shape builder for the merge/sort/OPK
 /// tests, parameterized by the whole key rather than by one named shape.
 /// [`pk_only_schema`] is the no-payload counterpart.
-pub fn pk_payload_schema(tcs: &[u8]) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
-    cols.push(SchemaColumn::new(type_code::I64, 0));
+pub fn pk_payload_schema(tcs: &[TypeCode]) -> SchemaDescriptor {
+    let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, false)).collect();
+    cols.push(SchemaColumn::new(TypeCode::I64, false));
     let pk: Vec<u32> = (0..tcs.len() as u32).collect();
     SchemaDescriptor::new(&cols, &pk)
 }
 
 /// The canonical narrow test schema: U64 pk + a single I64 payload column.
 pub fn make_schema_u64_i64() -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::U64])
+    pk_payload_schema(&[TypeCode::U64])
 }
 
 /// Build a batch over [`make_schema_u64_i64`]-shaped schemas from native
@@ -67,32 +67,32 @@ pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Ba
 /// to [`pk_payload_schema`], parameterized by the payload column rather than only its
 /// type, so a nullable payload needs no second builder.
 pub fn u64_pk_schema(payload: SchemaColumn) -> SchemaDescriptor {
-    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), payload], &[0])
+    SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false), payload], &[0])
 }
 
 /// Every wire `TypeCode`. The single source of truth for the schema-generating
 /// proptests across the crate; since any column type is a valid payload, this
 /// doubles as the arbitrary-payload-type strategy.
-pub fn arb_type_code() -> impl Strategy<Value = u8> {
+pub fn arb_type_code() -> impl Strategy<Value = TypeCode> {
     prop_oneof![
-        Just(type_code::U8),
-        Just(type_code::I8),
-        Just(type_code::U16),
-        Just(type_code::I16),
-        Just(type_code::U32),
-        Just(type_code::I32),
-        Just(type_code::U64),
-        Just(type_code::I64),
-        Just(type_code::U128),
-        Just(type_code::I128),
-        Just(type_code::DATE),
-        Just(type_code::TIMESTAMP),
-        Just(type_code::DECIMAL),
-        Just(type_code::UUID),
-        Just(type_code::F32),
-        Just(type_code::F64),
-        Just(type_code::STRING),
-        Just(type_code::BLOB),
+        Just(TypeCode::U8),
+        Just(TypeCode::I8),
+        Just(TypeCode::U16),
+        Just(TypeCode::I16),
+        Just(TypeCode::U32),
+        Just(TypeCode::I32),
+        Just(TypeCode::U64),
+        Just(TypeCode::I64),
+        Just(TypeCode::U128),
+        Just(TypeCode::I128),
+        Just(TypeCode::Date),
+        Just(TypeCode::Timestamp),
+        Just(TypeCode::Decimal),
+        Just(TypeCode::UUID),
+        Just(TypeCode::F32),
+        Just(TypeCode::F64),
+        Just(TypeCode::String),
+        Just(TypeCode::Blob),
     ]
 }
 
@@ -203,7 +203,7 @@ pub fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
             }
             let cs = col.size() as usize;
             let raw = batch.get_col_ptr(row, pi, cs);
-            Some(if gnitz_wire::is_german_string(col.type_code) {
+            Some(if col.type_code.is_german_string() {
                 let st: [u8; 16] = raw.try_into().unwrap();
                 gnitz_wire::try_decode_german_string(&st, &batch.blob).unwrap()
             } else {
@@ -223,8 +223,8 @@ pub fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
 /// An all-PK schema: one column per type code in `types`, every column a PK
 /// column (`pk_indices = 0..n`) and no payload — the generic PK-shape builder
 /// for the OPK encode/compare/route tests.
-pub fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
-    let cols: Vec<SchemaColumn> = types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+pub fn pk_only_schema(types: &[TypeCode]) -> SchemaDescriptor {
+    let cols: Vec<SchemaColumn> = types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
     let pk: Vec<u32> = (0..types.len() as u32).collect();
     SchemaDescriptor::new(&cols, &pk)
 }
@@ -276,7 +276,7 @@ pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> 
 /// U128 pk + a single I64 payload column — the 16-byte-PK sibling of
 /// [`make_schema_u64_i64`].
 pub fn make_schema_u128_i64() -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::U128])
+    pk_payload_schema(&[TypeCode::U128])
 }
 
 /// The batch as the Z-Set it denotes: `Σ weight` per logical row identity, with

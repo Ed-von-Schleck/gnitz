@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 // The routing-symmetry tests (master `compute_worker_indices` vs worker
 // `worker_for_pk_bytes`) live next to the code they exercise, in
@@ -8,9 +8,9 @@ use gnitz_wire::type_code;
 #[test]
 fn schema_roundtrip_catalog_preserves_pk_order() {
     let cols = vec![
-        col_def("payload", type_code::U64),
-        col_def("a", type_code::U64),
-        col_def("b", type_code::U64),
+        col_def("payload", TypeCode::U64),
+        col_def("a", TypeCode::U64),
+        col_def("b", TypeCode::U64),
     ];
     let dir = temp_dir("cpk_pk_order_roundtrip");
 

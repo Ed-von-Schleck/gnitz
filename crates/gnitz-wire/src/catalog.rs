@@ -140,7 +140,7 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     // `ColMeta::hidden`; the engine never branches on it.
     col("is_hidden", TypeCode::U64, false),
     // A DECIMAL column's scale, else 0. Echoed into a reply schema block's
-    // `ColMeta::scale`; the engine never branches on it.
+    // column type; the engine never branches on it.
     col("scale", TypeCode::U64, false),
 ];
 
@@ -363,7 +363,7 @@ const _: () = {
         let mut i = 0;
         while i < pk.len() {
             assert!(
-                cols[pk[i] as usize].type_code as u8 == TypeCode::U64 as u8,
+                matches!(cols[pk[i] as usize].type_code, TypeCode::U64),
                 "a system family's key column is not U64"
             );
             i += 1;
@@ -754,31 +754,28 @@ pub fn unpack_pk_cols(packed: u64) -> Result<PkColList, crate::PkRule> {
 //
 //   bit 0        replicated (TABLE_FLAG_REPLICATED) — full copy on every worker
 //   bit 1        stream (TABLE_FLAG_STREAM) — storeless append-only ingestion point
-//   bits [2..8)  reserved for future boolean flags
 //   bits [8..16) distribution prefix length k (0 = default = full PK)
 //
-// `k` is byte-aligned so the boolean flag bits stay free for future flags
-// without colliding with it. `replicated` and a non-default `k` are mutually
-// exclusive (a CLUSTER BY prefix is meaningless when every worker holds the
-// full copy); the packing cannot represent that constraint, so
-// [`TableProps::validate`] carries it instead, and every layer that builds a
-// `TableProps` calls it.
+// Every other bit is refused on decode. `replicated` and a non-default `k` are
+// mutually exclusive (a CLUSTER BY prefix is meaningless when every worker
+// holds the full copy): [`TableDistribution`] cannot represent both, and
+// [`TableProps::from_flags`] refuses a word that carries both.
 // ---------------------------------------------------------------------------
 
 /// Bit 0: the table is **replicated** — every worker holds an identical full
-/// copy (writes broadcast, reads single-source). Mutually exclusive with a
-/// non-default `dist_prefix_len` — see [`TableProps::validate`], since this
-/// packing cannot represent the constraint.
+/// copy (writes broadcast, reads single-source).
 const TABLE_FLAG_REPLICATED: u64 = 1;
 /// Bit 1: the table is a **stream** — a storeless, append-only ingestion point.
-/// Independent of every other bit: a stream may be replicated or CLUSTER BY'd.
+/// Independent of the distribution: a stream may be replicated or CLUSTER BY'd.
 const TABLE_FLAG_STREAM: u64 = 1 << 1;
 /// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`.
 const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
-/// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte; the full
-/// byte is deliberate headroom.
+/// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte.
 const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
+/// Every bit a `TABLE_TAB.flags` word may carry.
+const TABLE_FLAGS_DEFINED: u64 =
+    TABLE_FLAG_REPLICATED | TABLE_FLAG_STREAM | (TABLE_FLAG_DIST_MASK << TABLE_FLAG_DIST_SHIFT);
 
 /// `VIEW_TAB.flags` bit 0: two of the view's rows may carry the same PK, so its
 /// PK region identifies no row — a view over a stream, one keyed on a join key or
@@ -806,84 +803,101 @@ impl IndexProps {
         }
     }
 
-    /// Decode a persisted `IDX_TAB.flags` u64. Reserved bits are ignored, so a
-    /// word a later version widened still decodes the fields defined here.
-    #[inline]
-    pub fn from_flags(flags: u64) -> IndexProps {
-        IndexProps {
-            is_unique: flags & INDEX_FLAG_UNIQUE != 0,
+    /// Decode a persisted `IDX_TAB.flags` u64; a bit outside the defined set is
+    /// refused.
+    pub fn from_flags(flags: u64) -> Result<IndexProps, String> {
+        if flags & !INDEX_FLAG_UNIQUE != 0 {
+            return Err(format!("index flags {flags:#x} carry unknown bits"));
         }
+        Ok(IndexProps {
+            is_unique: flags & INDEX_FLAG_UNIQUE != 0,
+        })
+    }
+}
+
+/// How a table's rows are spread over the workers.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TableDistribution {
+    /// Hash-distributed by the first `prefix_len` PK columns; `0` = the full PK.
+    Keyed { prefix_len: u8 },
+    /// A full copy on every worker.
+    Replicated,
+}
+
+/// Hash-distributed by the full PK.
+impl Default for TableDistribution {
+    fn default() -> Self {
+        TableDistribution::Keyed { prefix_len: 0 }
     }
 }
 
 /// The logical content of `TABLE_TAB.flags` — equivalently, the non-column
 /// properties of a `CREATE TABLE`. A struct rather than positional arguments
-/// because `replicated` and `stream` are independent booleans that a transposed
-/// call would silently swap, and swapping them turns a durable table into one
-/// whose rows a restart discards.
+/// because `stream` and the distribution are independent, and a transposed
+/// call that turned a durable table into a stream would discard its rows on
+/// restart.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
 pub struct TableProps {
-    /// Keep a full copy on every worker: writes broadcast, reads single-source.
-    pub replicated: bool,
     /// A storeless, append-only ingestion point rather than a table: it holds no
     /// rows and nothing it ingests survives a restart.
     pub stream: bool,
-    /// Hash-distribution prefix length `k`: rows are partitioned by the first `k`
-    /// PK columns (`CLUSTER BY` the PK's leading prefix). `0` — the default —
-    /// partitions by the full PK, and the schema constructor normalizes it to
-    /// `k = |PK|`. The SQL planner validates `k` against the PK before packing.
-    pub dist_prefix_len: usize,
+    /// Where the rows live. A `Keyed` prefix is `CLUSTER BY` the PK's leading
+    /// prefix; the SQL planner validates it against the PK before packing, and
+    /// the schema constructor normalizes the default `0` to `|PK|`.
+    pub distribution: TableDistribution,
 }
 
 impl TableProps {
     /// Pack the persisted `TABLE_TAB.flags` u64. Inverse of [`Self::from_flags`].
     #[inline]
     pub fn pack(self) -> u64 {
-        (((self.dist_prefix_len as u64) & TABLE_FLAG_DIST_MASK) << TABLE_FLAG_DIST_SHIFT)
-            | if self.replicated { TABLE_FLAG_REPLICATED } else { 0 }
-            | if self.stream { TABLE_FLAG_STREAM } else { 0 }
+        let dist = match self.distribution {
+            TableDistribution::Keyed { prefix_len } => (prefix_len as u64) << TABLE_FLAG_DIST_SHIFT,
+            TableDistribution::Replicated => TABLE_FLAG_REPLICATED,
+        };
+        dist | if self.stream { TABLE_FLAG_STREAM } else { 0 }
     }
 
-    /// Decode a persisted `TABLE_TAB.flags` u64. Reserved bits are ignored, so a
-    /// word a later version widened still decodes the fields defined here.
-    #[inline]
-    pub fn from_flags(flags: u64) -> TableProps {
-        TableProps {
-            replicated: flags & TABLE_FLAG_REPLICATED != 0,
+    /// Decode a persisted `TABLE_TAB.flags` u64, refusing a bit outside the
+    /// defined set and a replicated table that also carries a prefix.
+    pub fn from_flags(flags: u64) -> Result<TableProps, String> {
+        if flags & !TABLE_FLAGS_DEFINED != 0 {
+            return Err(format!("table flags {flags:#x} carry unknown bits"));
+        }
+        let prefix_len = ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as u8;
+        let distribution = if flags & TABLE_FLAG_REPLICATED == 0 {
+            TableDistribution::Keyed { prefix_len }
+        } else if prefix_len == 0 {
+            TableDistribution::Replicated
+        } else {
+            return Err(replicated_with_prefix(prefix_len));
+        };
+        Ok(TableProps {
             stream: flags & TABLE_FLAG_STREAM != 0,
-            dist_prefix_len: ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as usize,
-        }
+            distribution,
+        })
     }
 
-    /// The one rule the flags packing cannot make unrepresentable: `replicated`
-    /// and a non-default `dist_prefix_len` are mutually exclusive. Beside the
-    /// packing, so every layer holding a `TableProps` shares it, and
-    /// `Result<_, String>` like [`validate_dist_prefix`], so each layer decorates
-    /// the sentence rather than re-wording the rule.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.replicated && self.dist_prefix_len != 0 {
-            return Err(format!(
-                "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
-                 a full copy on every worker, so a hash-distribution prefix (k={}) is meaningless",
-                self.dist_prefix_len
-            ));
-        }
-        Ok(())
-    }
-
-    /// The second rule the flags packing cannot make unrepresentable:
-    /// `dist_prefix_len` is a *leading PK prefix* length, so it cannot exceed
-    /// `pk_len`. `TABLE_FLAG_DIST_MASK` is `0xFF`, so a forged flags word can
-    /// carry 255. `0` is the persisted "default distribution" sentinel.
+    /// The rule the flags packing cannot make unrepresentable: a `Keyed` prefix
+    /// is a *leading PK prefix* length, so it cannot exceed `pk_len`.
+    /// `TABLE_FLAG_DIST_MASK` is `0xFF`, so a forged flags word can carry 255.
+    /// `0` is the persisted "default distribution" sentinel.
     pub fn validate_against_pk(&self, pk_len: usize) -> Result<(), String> {
-        if self.dist_prefix_len > pk_len {
-            return Err(format!(
-                "distribution prefix length {} exceeds PK column count {pk_len}",
-                self.dist_prefix_len
-            ));
+        match self.distribution {
+            TableDistribution::Keyed { prefix_len } if prefix_len as usize > pk_len => Err(format!(
+                "distribution prefix length {prefix_len} exceeds PK column count {pk_len}"
+            )),
+            _ => Ok(()),
         }
-        Ok(())
     }
+}
+
+/// The refusal for a table that is both replicated and `CLUSTER BY`'d.
+pub fn replicated_with_prefix(prefix_len: u8) -> String {
+    format!(
+        "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
+         a full copy on every worker, so a hash-distribution prefix (k={prefix_len}) is meaningless"
+    )
 }
 
 /// The `WITH (…)` options of one user-named view.

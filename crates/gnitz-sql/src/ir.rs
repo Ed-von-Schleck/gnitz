@@ -701,7 +701,7 @@ impl BExpr<usize> {
     /// The runtime entry point: type a `ColRef(idx)` leaf as the schema column's
     /// declared type (`cols[idx].ty()`, panicking on an out-of-bounds index).
     pub(crate) fn infer_ty(&self, cols: &[ColumnDef]) -> ColType {
-        self.infer_ty_with(&|idx: &usize| cols[*idx].ty())
+        self.infer_ty_with(&|idx: &usize| cols[*idx].ty)
     }
 }
 

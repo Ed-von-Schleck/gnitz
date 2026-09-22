@@ -10,8 +10,6 @@
 
 use std::borrow::Cow;
 
-use gnitz_wire::is_signed_int;
-
 /// Why a store-side operator constructor refused the parameters it was handed —
 /// one vocabulary for all of them, so the constructor rather than each caller
 /// owns the wording of its own trust boundary.
@@ -35,7 +33,7 @@ impl OpBuildErr {
 
     /// A client-supplied column index out of range for the schema it indexes;
     /// `what` names the list it came from. The bound is always `num_columns()`,
-    /// never `MAX_COLUMNS`: the slots between read back as an undecodable
+    /// never `MAX_COLUMNS`: the slots between read back as
     /// [`SchemaColumn::EMPTY`].
     pub fn oob_col(what: &str, c: u32, schema: &SchemaDescriptor) -> Self {
         OpBuildErr::shape(format!("{what} {c} out of range ({} cols)", schema.num_columns()))
@@ -59,7 +57,6 @@ impl From<OpBuildErr> for String {
     }
 }
 
-pub(crate) use gnitz_wire::type_code;
 pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;
 pub(crate) use gnitz_wire::MAX_COLUMNS;
@@ -102,7 +99,7 @@ pub(crate) enum SchemaBound {
     PkColumns,
     PkBytes,
     /// A key column whose type has no order-preserving encoding.
-    PkType(u8),
+    PkType(TypeCode),
     PkNullable,
 }
 
@@ -176,10 +173,10 @@ impl DerivedSchema {
         if self.pk_bytes + col.size() as usize > MAX_PK_BYTES {
             return Err(SchemaBound::PkBytes);
         }
-        if !gnitz_wire::is_pk_eligible(col.type_code) {
+        if !col.type_code.is_pk_eligible() {
             return Err(SchemaBound::PkType(col.type_code));
         }
-        if col.nullable != 0 {
+        if col.nullable {
             return Err(SchemaBound::PkNullable);
         }
         self.push(col)?;
@@ -210,41 +207,29 @@ impl DerivedSchema {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SchemaColumn {
-    pub type_code: u8,
+    pub type_code: TypeCode,
     size: u8,
-    pub nullable: u8,
+    pub nullable: bool,
     is_signed: u8,
 }
 
 impl SchemaColumn {
     /// The unused-slot filler for the fixed `[SchemaColumn; MAX_COLUMNS]` arrays
-    /// every schema and schema builder carries. Spelled out rather than built
-    /// through [`Self::new`], whose assert rejects the undecodable type code `0`
-    /// that marks a slot as padding.
+    /// every schema and schema builder carries. Padding: `size == 0`; nothing
+    /// reads past `num_columns()`.
     pub const EMPTY: SchemaColumn = SchemaColumn {
-        type_code: 0,
+        type_code: TypeCode::U8,
         size: 0,
-        nullable: 0,
+        nullable: false,
         is_signed: 0,
     };
 
-    /// A real column of type `type_code`, which must decode (see
-    /// [`gnitz_wire::is_valid_type_code`] for why an unknown one is not inert).
-    /// Client-supplied codes are screened at their decode boundary; the assert is
-    /// the tripwire for a path that forgets to. Debug-only — the release engine
-    /// must still *survive* a corrupt code, which is what the expression
-    /// validator's `check_col` and the catalog's `check_col_defs` are for, and
-    /// what `wire_stride`'s 8-byte fallback gives such a code here.
-    pub const fn new(type_code: u8, nullable: u8) -> Self {
-        debug_assert!(gnitz_wire::is_valid_type_code(type_code), "invalid column type code");
-        // A flag, not a count: the two parameters are bare integers, so a caller
-        // passing a column ordinal here otherwise builds a silently nullable column.
-        debug_assert!(nullable <= 1, "column nullable flag must be 0 or 1");
+    pub const fn new(type_code: TypeCode, nullable: bool) -> Self {
         SchemaColumn {
             type_code,
-            size: gnitz_wire::wire_stride(type_code) as u8,
+            size: type_code.wire_stride() as u8,
             nullable,
-            is_signed: is_signed_int(type_code) as u8,
+            is_signed: type_code.is_signed_int() as u8,
         }
     }
 
@@ -268,7 +253,7 @@ impl SchemaColumn {
     /// the one rule the shard writer packs FoR by and the reader accepts it by.
     #[inline]
     pub(crate) fn fixed_int(&self) -> Option<gnitz_wire::FixedInt> {
-        gnitz_wire::FixedInt::from_type_code(gnitz_wire::TypeCode::from_validated_u8(self.type_code))
+        gnitz_wire::FixedInt::from_type_code(self.type_code)
     }
 }
 
@@ -406,7 +391,7 @@ impl SchemaDescriptor {
         }
         gnitz_wire::validate_pk_tuple(pk_indices, cols.len(), MAX_PK_COLUMNS, |c| {
             let col = &cols[c as usize];
-            (col.type_code, col.nullable != 0)
+            (col.type_code, col.nullable)
         })
         .map_err(|rule| rule.to_string())?;
         Ok(Self::new(cols, pk_indices))
@@ -473,14 +458,14 @@ impl SchemaDescriptor {
             // relocate; IEEE-754 floats break the byte-equal key contract that
             // `compare_pk_bytes` and the order-preserving encoder rest on.
             assert!(
-                gnitz_wire::is_pk_eligible(cols[pk_indices[k] as usize].type_code),
+                (cols[pk_indices[k] as usize].type_code).is_pk_eligible(),
                 "new: only integer scalar columns can be PK columns \
                  (the PK region is compared and bulk-copied as raw bytes)",
             );
             // `compare_pk_bytes` reads PK bytes with no null-bit handling; a
             // nullable PK would silently corrupt the merge comparison.
             assert!(
-                cols[pk_indices[k] as usize].nullable == 0,
+                !cols[pk_indices[k] as usize].nullable,
                 "new: PK columns must be non-nullable",
             );
             pk_arr[k] = pk_indices[k];
@@ -511,7 +496,7 @@ impl SchemaDescriptor {
             while i < cols.len() {
                 // No PK column can be one: `is_pk_eligible`, asserted above on
                 // every PK column, admits only integer scalars.
-                if gnitz_wire::is_german_string(cols[i].type_code) {
+                if cols[i].type_code.is_german_string() {
                     found = true;
                 }
                 i += 1;
@@ -652,11 +637,11 @@ impl SchemaDescriptor {
             let le = &le[..size];
             // Through the storage type: a calendar column renders as the signed
             // integer it is, not as the unsigned fallthrough.
-            parts.push(match gnitz_wire::storage_type_code(col.type_code) {
-                type_code::UUID => gnitz_wire::format_uuid(u128::from_le_bytes(le.try_into().unwrap())),
-                type_code::U128 => format!("{}", u128::from_le_bytes(le.try_into().unwrap())),
-                type_code::I128 => format!("{}", i128::from_le_bytes(le.try_into().unwrap())),
-                t if gnitz_wire::is_signed_int(t) => format!("{}", gnitz_wire::read_signed_exact(le)),
+            parts.push(match col.type_code.storage_type() {
+                TypeCode::UUID => gnitz_wire::format_uuid(u128::from_le_bytes(le.try_into().unwrap())),
+                TypeCode::U128 => format!("{}", u128::from_le_bytes(le.try_into().unwrap())),
+                TypeCode::I128 => format!("{}", i128::from_le_bytes(le.try_into().unwrap())),
+                t if t.is_signed_int() => format!("{}", gnitz_wire::read_signed_exact(le)),
                 _ => format!("{}", gnitz_wire::read_unsigned_exact(le)),
             });
             off += size;
@@ -752,12 +737,12 @@ impl ColumnTable for SchemaDescriptor {
         self.num_columns as usize
     }
 
-    fn col_type_code(&self, ci: usize) -> u8 {
+    fn col_type_code(&self, ci: usize) -> TypeCode {
         self.columns[ci].type_code
     }
 
     fn col_nullable(&self, ci: usize) -> bool {
-        self.columns[ci].nullable != 0
+        self.columns[ci].nullable
     }
 }
 
@@ -772,11 +757,8 @@ impl std::fmt::Debug for SchemaDescriptor {
                 write!(f, ", ")?;
             }
             let col = self.columns[ci];
-            match TypeCode::try_from_u8(col.type_code) {
-                Some(t) => write!(f, "{t:?}")?,
-                None => write!(f, "type({})", col.type_code)?,
-            }
-            if col.nullable != 0 {
+            write!(f, "{:?}", col.type_code)?;
+            if col.nullable {
                 write!(f, "?")?;
             }
             if self.is_pk_col(ci) {
@@ -849,7 +831,7 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
     let sb = gnitz_wire::schema_block::decode(data)?;
     let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (col, c) in cols[..sb.num_columns()].iter_mut().zip(sb.columns()) {
-        *col = SchemaColumn::new(c.type_code, c.meta.nullable as u8);
+        *col = SchemaColumn::new(c.ty.tc, c.meta.nullable);
     }
     SchemaDescriptor::try_new(&cols[..sb.num_columns()], sb.pk_indices())
 }
@@ -857,7 +839,7 @@ pub fn decode_schema_block(data: &[u8]) -> Result<SchemaDescriptor, String> {
 /// The delta store's stamp column: the `_tick` round number, leading the delta
 /// schema's PK. Named so its width is read off the column rather than written as
 /// a literal at each offset.
-pub(crate) const DELTA_TICK_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
+pub(crate) const DELTA_TICK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U64, false);
 // `stamped_with_pk_prefix` writes the stamp as a `u64`'s big-endian image, which
 // is this column's OPK image only at this width.
 const _: () = assert!(DELTA_TICK_COL.size() as usize == 8);

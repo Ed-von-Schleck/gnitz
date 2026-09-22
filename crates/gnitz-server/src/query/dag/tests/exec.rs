@@ -6,10 +6,10 @@ use crate::test_support::{
     col_def, make_batch, register_identity_view, scratch_dir, sum_weights, try_register_view, LocalDrive,
 };
 use gnitz_store::relation::Relation;
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 fn view_cols() -> Vec<ColumnDef> {
-    vec![col_def("id", type_code::U64), col_def("v", type_code::I64)]
+    vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
 }
 
 /// A base table `(id U64 PK, v I64)` in a fresh catalog.
@@ -191,7 +191,11 @@ fn a_replicated_sources_relay_is_sent_by_worker_0_alone() {
         let replicated = engine.allocate_ids(1).unwrap();
         engine.write_column_records(replicated, &cols).unwrap();
         let mut bb = gnitz_store::storage::BatchBuilder::new(*crate::catalog::SysFamily::Table.schema());
-        let flags = gnitz_wire::TableProps { replicated: true, ..Default::default() }.pack();
+        let flags = gnitz_wire::TableProps {
+            distribution: gnitz_wire::TableDistribution::Replicated,
+            ..Default::default()
+        }
+        .pack();
         crate::test_support::push_table_tab_row(
             &mut bb,
             replicated,
@@ -235,7 +239,7 @@ fn cols_of(schema: &gnitz_store::schema::SchemaDescriptor) -> Vec<ColumnDef> {
         .map(|ci| {
             let c = schema.column(ci).expect("in range");
             ColumnDef {
-                is_nullable: c.nullable != 0,
+                is_nullable: c.nullable,
                 ..col_def(&format!("c{ci}"), c.type_code)
             }
         })

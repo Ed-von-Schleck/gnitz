@@ -16,8 +16,8 @@ use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{
     write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, TableTabRow,
 };
-use gnitz_wire::ViewProps;
 use gnitz_wire::MAX_COLUMNS;
+use gnitz_wire::{ColType, TableDistribution, ViewProps};
 use gnitz_wire::{
     COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
     COLTAB_PAY_NAME, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID,
@@ -104,18 +104,16 @@ pub(super) struct RelationRegistration<'a> {
 /// row's own PK included. The raw `flags` word does not escape, so the
 /// rejections below hold on the paths that bypass the precheck too.
 pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRegistration<'_>, String> {
-    let props = gnitz_wire::TableProps::from_flags(payload_u64(batch, row, TABTAB_PAY_FLAGS));
+    let name = payload_str(batch, row, RELTAB_PAY_NAME);
+    let props = gnitz_wire::TableProps::from_flags(payload_u64(batch, row, TABTAB_PAY_FLAGS))
+        .map_err(|e| format!("catalog invariant violated: relation '{name}' {e}"))?;
     let kind = if props.stream {
         RelationKind::Stream
     } else {
         RelationKind::BaseTable
     };
     let noun = kind.noun();
-    let name = payload_str(batch, row, RELTAB_PAY_NAME);
-    props
-        .validate()
-        .map_err(|e| format!("catalog invariant violated: {noun} '{name}' {e}"))?;
-    // The PK list is decoded before the placement is built: `dist_prefix_len` is
+    // The PK list is decoded before the placement is built: a `Keyed` prefix is
     // a leading-prefix length into it, and nothing downstream re-checks it —
     // `Placement::resolve` normalizes only the `0` sentinel.
     let pk = unpack_pk_cols(payload_u64(batch, row, TABTAB_PAY_PK_COL_IDX))
@@ -129,10 +127,9 @@ pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRe
         schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
-        placement: if props.replicated {
-            Placement::Replicated
-        } else {
-            Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
+        placement: match props.distribution {
+            TableDistribution::Replicated => Placement::Replicated,
+            TableDistribution::Keyed { prefix_len } => Placement::Keyed { prefix_len },
         },
         props: ViewProps::default(),
         // A base table's PK is unique by `enforce_unique_pk`; a stream's is not.
@@ -164,13 +161,19 @@ pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistr
         payload_u64(batch, row, VIEWTAB_PAY_DELTA),
     )
     .map_err(|e| format!("view '{name}': {e}"))?;
+    let flags = payload_u64(batch, row, VIEWTAB_PAY_FLAGS);
+    if flags & !gnitz_wire::VIEW_FLAG_PK_REPEATS != 0 {
+        return Err(format!(
+            "catalog invariant violated: view '{name}' flags {flags:#x} carry unknown bits"
+        ));
+    }
     Ok(ViewRegistration {
         schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
         props,
         owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
-        pk_repeats: payload_u64(batch, row, VIEWTAB_PAY_FLAGS) & gnitz_wire::VIEW_FLAG_PK_REPEATS != 0,
+        pk_repeats: flags & gnitz_wire::VIEW_FLAG_PK_REPEATS != 0,
     })
 }
 
@@ -179,26 +182,42 @@ pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistr
 pub(super) fn read_idx_tab_row<S: RowSource>(
     src: &S,
     row: usize,
-) -> Result<(i64, PkColList, gnitz_wire::IndexProps), gnitz_wire::PkRule> {
+) -> Result<(i64, PkColList, gnitz_wire::IndexProps), String> {
     Ok((
         payload_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
-        unpack_pk_cols(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS))?,
-        gnitz_wire::IndexProps::from_flags(payload_u64(src, row, IDXTAB_PAY_FLAGS)),
+        unpack_pk_cols(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS)).map_err(|rule| format!("column list {rule}"))?,
+        gnitz_wire::IndexProps::from_flags(payload_u64(src, row, IDXTAB_PAY_FLAGS))?,
     ))
 }
 
-/// Decode COL_TAB `row` into the `ColumnDef` the schema builder consumes.
-pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
-    ColumnDef {
+/// Decode COL_TAB `row` into the `ColumnDef` the schema builder consumes. Every
+/// word must fit the width it is stored at and decode to a value
+/// `write_col_tab_row` could emit: an overflowing one would leave a stored row no
+/// client can reproduce, and so no later `-1` can retract.
+pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> Result<ColumnDef, String> {
+    let word = |field: &str, pi: usize, max: u64| {
+        let w = payload_u64(src, row, pi);
+        if w > max {
+            return Err(format!(
+                "column record carries {field} = {w}, past the {max} its stored width holds"
+            ));
+        }
+        Ok(w)
+    };
+    let flag = |field: &str, pi: usize| word(field, pi, 1).map(|w| w == 1);
+    let code = word("type_code", COLTAB_PAY_TYPE_CODE, u8::MAX as u64)? as u8;
+    let scale = word("scale", COLTAB_PAY_SCALE, u8::MAX as u64)? as u8;
+    let ty = ColType::from_wire(code, scale)
+        .ok_or_else(|| format!("column record carries an invalid column type {code}/{scale}"))?;
+    Ok(ColumnDef {
         name: payload_string(src, row, COLTAB_PAY_NAME),
-        type_code: payload_u64(src, row, COLTAB_PAY_TYPE_CODE) as u8,
-        is_nullable: payload_u64(src, row, COLTAB_PAY_IS_NULLABLE) != 0,
+        ty,
+        is_nullable: flag("is_nullable", COLTAB_PAY_IS_NULLABLE)?,
         fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
-        fk_col_idx: payload_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
-        is_serial: payload_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
-        is_hidden: payload_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
-        scale: payload_u64(src, row, COLTAB_PAY_SCALE) as u8,
-    }
+        fk_col_idx: word("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64)? as u32,
+        is_serial: flag("is_serial", COLTAB_PAY_IS_SERIAL)?,
+        is_hidden: flag("is_hidden", COLTAB_PAY_IS_HIDDEN)?,
+    })
 }
 
 impl ColumnDef {
@@ -209,13 +228,12 @@ impl ColumnDef {
             owner_id: owner_id as u64,
             col_idx: col_idx as u64,
             name: &self.name,
-            type_code: self.type_code as u64,
+            ty: self.ty,
             is_nullable: self.is_nullable,
             fk_table_id: self.fk_table_id as u64,
             fk_col_idx: self.fk_col_idx as u64,
             is_serial: self.is_serial,
             is_hidden: self.is_hidden,
-            scale: self.scale,
         }
     }
 }
@@ -361,7 +379,7 @@ const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> 
     let mut buf = [SchemaColumn::EMPTY; MAX_COLUMNS];
     let mut i = 0;
     while i < cols.len() {
-        buf[i] = SchemaColumn::new(cols[i].type_code as u8, if cols[i].nullable { 1 } else { 0 });
+        buf[i] = SchemaColumn::new(cols[i].type_code, cols[i].nullable);
         i += 1;
     }
     let (head, _) = buf.split_at(cols.len());
@@ -466,10 +484,8 @@ impl SysFamily {
             .cols
             .iter()
             .map(|c| ColumnDef {
-                name: c.name.to_string(),
-                type_code: c.type_code as u8,
                 is_nullable: c.nullable,
-                ..Default::default()
+                ..ColumnDef::new(c.name, ColType::of(c.type_code))
             })
             .collect()
     }

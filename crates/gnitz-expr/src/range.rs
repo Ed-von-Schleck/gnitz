@@ -69,7 +69,7 @@ impl RangeMembership {
         }
         words.resize(n / 64, u64::MAX);
         if !n.is_multiple_of(64) {
-            words.push((1 << (n % 64)) - 1);
+            words.push(gnitz_wire::low_bits_mask(n % 64));
         }
         if self.null_mask != 0 {
             let mask = self.null_mask;

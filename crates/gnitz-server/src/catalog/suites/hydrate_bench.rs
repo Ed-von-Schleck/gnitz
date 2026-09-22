@@ -38,8 +38,8 @@ impl SkeletonHydrator for Counting<'_> {
 /// An identity view over a `ROWS`-row base, bounded at `capacity` bytes and
 /// checkpointed, so the sweep has skeletonized it.
 fn bounded_fixture(name: &str, capacity: u64) -> (CatalogEngine, i64) {
-    let mut cols = vec![col_def("id", type_code::U64)];
-    cols.extend((0..PAYLOAD_COLS).map(|c| col_def(&format!("v{c}"), type_code::I64)));
+    let mut cols = vec![col_def("id", TypeCode::U64)];
+    cols.extend((0..PAYLOAD_COLS).map(|c| col_def(&format!("v{c}"), TypeCode::I64)));
     std::env::set_var("GNITZ_RAM_TIER_BYTES", RAM_TIER_BYTES.to_string());
     let (mut engine, base) = ingest_fixture(name, &cols, ROWS, 1, |bb, id| {
         for c in 0..PAYLOAD_COLS {

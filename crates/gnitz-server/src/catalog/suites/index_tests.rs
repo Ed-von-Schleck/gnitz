@@ -9,7 +9,7 @@ fn test_index_creation_and_fill() {
     let dir = temp_dir("index_fill");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
 
     // Ingest 5 rows
@@ -43,7 +43,7 @@ fn test_index_live_fanout() {
     let dir = temp_dir("idx_fanout");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
@@ -84,7 +84,7 @@ fn test_create_index_duplicate_rejected() {
     // than silently orphaning the first index circuit.
     let (mut engine, _tid, dir) = table_fixture(
         "idx_dup_create",
-        &[col_def("id", type_code::U64), col_def("val", type_code::I64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
     );
 
     let first = engine.create_index("public.t", &["val"], false);
@@ -108,7 +108,7 @@ fn test_create_index_duplicate_rejected() {
 fn test_failed_create_index_rolls_back() {
     let (mut engine, tid, dir) = table_fixture(
         "failed_create_index_rollback",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
@@ -175,7 +175,7 @@ fn test_failed_create_index_rolls_back() {
 fn test_seek_by_index_found() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_seekidx_found",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -208,7 +208,7 @@ fn test_seek_by_index_found() {
 fn test_seek_by_index_not_found() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_seekidx_miss",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -234,7 +234,7 @@ fn test_seek_by_index_not_found() {
 fn test_seek_by_index_negative_i64() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_seekidx_neg_i64",
-        &[col_def("id", type_code::U64), col_def("score", type_code::I64)],
+        &[col_def("id", TypeCode::U64), col_def("score", TypeCode::I64)],
     );
     engine.create_index("public.t", &["score"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -284,7 +284,7 @@ fn test_seek_by_index_negative_i64() {
 fn test_seek_by_index_negative_i32() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_seekidx_neg_i32",
-        &[col_def("id", type_code::U64), col_def("score", type_code::I32)],
+        &[col_def("id", TypeCode::U64), col_def("score", TypeCode::I32)],
     );
     engine.create_index("public.t", &["score"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -331,7 +331,7 @@ fn test_seek_by_index_negative_i32() {
 fn test_seek_by_index_u8_column() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_seekidx_u8",
-        &[col_def("id", type_code::U64), col_def("tag", type_code::U8)],
+        &[col_def("id", TypeCode::U64), col_def("tag", TypeCode::U8)],
     );
     engine.create_index("public.t", &["tag"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -362,7 +362,7 @@ fn test_seek_by_index_u8_column() {
 fn test_seek_by_index_u16_column() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_seekidx_u16",
-        &[col_def("id", type_code::U64), col_def("port", type_code::U16)],
+        &[col_def("id", TypeCode::U64), col_def("port", TypeCode::U16)],
     );
     engine.create_index("public.t", &["port"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -390,7 +390,7 @@ fn test_drop_table_cleans_up_indices() {
     let dir = temp_dir("drop_table_idx");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("pk", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.idx_tbl", &cols, &[0]).unwrap();
     engine.create_index("public.idx_tbl", &["val"], true).unwrap();
 
@@ -420,7 +420,7 @@ fn test_drop_table_cascades_secondary_index() {
     let dir = temp_dir("drop_table_cascade_sec");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("pk", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.cascade_tbl", &cols, &[0]).unwrap();
     engine.create_index("public.cascade_tbl", &["val"], false).unwrap();
 
@@ -457,12 +457,12 @@ fn test_drop_table_cascades_fk_index() {
     let dir = temp_dir("drop_table_cascade_fk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let parent_cols = vec![col_def("pk", type_code::U64), col_def("name", type_code::U64)];
+    let parent_cols = vec![col_def("pk", TypeCode::U64), col_def("name", TypeCode::U64)];
     let parent_tid = engine.create_table("public.parent", &parent_cols, &[0]).unwrap();
 
     let child_cols = vec![
-        col_def("pk", type_code::U64),
-        fk_def("parent_ref", type_code::U64, parent_tid, 0),
+        col_def("pk", TypeCode::U64),
+        fk_def("parent_ref", TypeCode::U64, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -499,9 +499,9 @@ fn test_drop_table_cascades_multiple_indices() {
     let (mut engine, tid, dir) = table_fixture(
         "cascade_multi_idx",
         &[
-            col_def("id", type_code::U64),
-            col_def("val1", type_code::I64),
-            col_def("val2", type_code::I64),
+            col_def("id", TypeCode::U64),
+            col_def("val1", TypeCode::I64),
+            col_def("val2", TypeCode::I64),
         ],
     );
 
@@ -573,9 +573,9 @@ fn test_compound_pk_secondary_index_seek() {
     // Source PK stride = 8 → index PK stride = 8 (promoted U64) + 8 = 16,
     // which keeps the index cursor on the narrow-PK fast path.
     let cols = vec![
-        col_def("a", type_code::U32),
-        col_def("b", type_code::U32),
-        col_def("val", type_code::U64),
+        col_def("a", TypeCode::U32),
+        col_def("b", TypeCode::U32),
+        col_def("val", TypeCode::U64),
     ];
     let tid = engine.create_table("public.cpk_t", &cols, &[0, 1]).unwrap();
     engine.create_index("public.cpk_t", &["val"], false).unwrap();
@@ -624,9 +624,9 @@ fn test_compound_pk_secondary_index_retract() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![
-        col_def("a", type_code::U32),
-        col_def("b", type_code::U32),
-        col_def("val", type_code::U64),
+        col_def("a", TypeCode::U32),
+        col_def("b", TypeCode::U32),
+        col_def("val", TypeCode::U64),
     ];
     let tid = engine.create_table("public.cpk_r", &cols, &[0, 1]).unwrap();
     engine.create_index("public.cpk_r", &["val"], false).unwrap();
@@ -671,7 +671,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
     let dir = temp_dir("seek_by_index_orphan");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.orphan_t", &cols, &[0]).unwrap();
     engine.create_index("public.orphan_t", &["val"], false).unwrap();
 
@@ -717,12 +717,12 @@ fn test_seek_by_index_orphan_entry_terminates() {
 fn drop_table_removes_the_relation_entry() {
     let (mut engine, tid, dir) = table_fixture(
         "drop_removes_relation_entry",
-        &[col_def("id", type_code::U64), col_def("val", type_code::I64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
 
     // A column rename bumps the registered table's version.
-    let rename = col_alter_pair(tid, 1, &col_def("val", type_code::I64), |c| c.name = "val2".into());
+    let rename = col_alter_pair(tid, 1, &col_def("val", TypeCode::I64), |c| c.name = "val2".into());
     engine.submit(SysFamily::Column, rename).unwrap();
 
     assert!(
@@ -747,10 +747,10 @@ fn drop_table_removes_the_relation_entry() {
 fn test_create_unique_index_on_string_blob_rejected() {
     let dir = temp_dir("uidx_string_reject");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let blob_col = col_def("data", type_code::BLOB);
+    let blob_col = col_def("data", TypeCode::Blob);
     let cols = vec![
-        col_def("id", type_code::U64),
-        col_def("name", type_code::STRING),
+        col_def("id", TypeCode::U64),
+        col_def("name", TypeCode::String),
         blob_col,
     ];
     engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -793,14 +793,14 @@ fn test_fk_circuit_is_derived_and_survives_its_unique_index() {
     let dir = temp_dir("fk_circuit_derived");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let idx_rows_before = count_records(engine.sys_relation(SysFamily::Index).cursor());
 
     let child_tid = engine.next_id;
     let cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("refc", type_code::U64, parent_tid, 0),
+        col_def("cid", TypeCode::U64),
+        fk_def("refc", TypeCode::U64, parent_tid, 0),
     ];
     engine
         .register_table(child_tid, PUBLIC_SCHEMA_ID, "child", &cols, &[0])
@@ -833,11 +833,11 @@ fn test_promote_unique_index_over_fk_column_empty() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("refc", type_code::U64, parent_tid, 0),
+        col_def("cid", TypeCode::U64),
+        fk_def("refc", TypeCode::U64, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -865,11 +865,11 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("refc", type_code::U64, parent_tid, 0),
+        col_def("cid", TypeCode::U64),
+        fk_def("refc", TypeCode::U64, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -900,12 +900,9 @@ fn test_drop_index_permitted_on_lone_pk_target() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.parent", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("p", type_code::U64, parent_tid, 0),
-    ];
+    let child_cols = vec![col_def("cid", TypeCode::U64), fk_def("p", TypeCode::U64, parent_tid, 0)];
     engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Redundant unique index on the parent's lone PK column.
@@ -927,15 +924,12 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Parent (id PK, email) with a UNIQUE index on the non-PK `email` column.
-    let parent_cols = vec![col_def("id", type_code::U64), col_def("email", type_code::U64)];
+    let parent_cols = vec![col_def("id", TypeCode::U64), col_def("email", TypeCode::U64)];
     let parent_tid = engine.create_table("public.parent", &parent_cols, &[0]).unwrap();
     engine.create_index("public.parent", &["email"], true).unwrap();
 
     // Child references parent.email (col 1), legal because email is unique.
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("e", type_code::U64, parent_tid, 1),
-    ];
+    let child_cols = vec![col_def("cid", TypeCode::U64), fk_def("e", TypeCode::U64, parent_tid, 1)];
     engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     let idx = make_secondary_index_name("public", "parent", "email");
@@ -962,7 +956,7 @@ fn test_unique_index_chunked_fill_distinct_succeeds() {
     // Every row must be projected exactly once across several chunks.
     let (mut engine, tid, dir) = table_fixture(
         "unique_idx_chunked_ok",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 
@@ -997,9 +991,9 @@ fn test_composite_index_full_key_seek() {
     let (mut engine, tid, dir) = table_fixture(
         "composite_full_key",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -1040,9 +1034,9 @@ fn test_composite_index_leading_prefix_seek() {
     let (mut engine, tid, dir) = table_fixture(
         "composite_prefix",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -1083,10 +1077,10 @@ fn test_composite_index_signed_unsigned_u128_mix() {
     let (mut engine, tid, dir) = table_fixture(
         "composite_mix",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::I32),
-            col_def("b", type_code::U64),
-            col_def("c", type_code::U128),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::I32),
+            col_def("b", TypeCode::U64),
+            col_def("c", TypeCode::U128),
         ],
     );
     engine.create_index("public.t", &["a", "b", "c"], false).unwrap();
@@ -1127,9 +1121,9 @@ fn test_composite_index_null_in_any_key_skipped() {
     let (mut engine, tid, dir) = table_fixture(
         "composite_null",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            nullable_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            nullable_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -1164,9 +1158,9 @@ fn test_composite_index_drop_exact_list() {
     let (mut engine, tid, dir) = table_fixture(
         "composite_drop",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a"], false).unwrap();
@@ -1207,9 +1201,9 @@ fn test_composite_unique_index_registers_unique_circuit() {
     let (mut engine, tid, dir) = table_fixture(
         "composite_unique_ok",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
 
@@ -1235,13 +1229,13 @@ fn test_composite_unique_index_registers_unique_circuit() {
 #[test]
 fn test_make_index_schema_composite_layout() {
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code as tc;
+    use gnitz_wire::TypeCode;
     // Source: PK = (id: U64); payload a: U32, b: U128.
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::U32, 0),
-            SchemaColumn::new(tc::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0],
     );
@@ -1250,26 +1244,26 @@ fn test_make_index_schema_composite_layout() {
     let idx = make_index_schema(&[1, 2], &src).unwrap();
     assert_eq!(idx.num_columns(), 3); // 2 promoted + 1 src pk
     assert_eq!(idx.pk_indices(), &[0, 1, 2]); // every column in the PK
-    assert_eq!(idx.columns[0].type_code, tc::U64);
-    assert_eq!(idx.columns[1].type_code, tc::U128);
-    assert_eq!(idx.columns[2].type_code, tc::U64); // src pk column type
+    assert_eq!(idx.columns[0].type_code, TypeCode::U64);
+    assert_eq!(idx.columns[1].type_code, TypeCode::U128);
+    assert_eq!(idx.columns[2].type_code, TypeCode::U64); // src pk column type
     assert_eq!(idx.pk_stride(), 8 + 16 + 8);
 }
 
 #[test]
 fn test_make_index_schema_over_limit_errs_not_panics() {
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code as tc;
+    use gnitz_wire::TypeCode;
     // Source with a 2-column PK (id0, id1). A 4-column index → arity 4 + 2 = 6 >
     // MAX_PK_COLUMNS (5): must return Err, never abort via SchemaDescriptor::new.
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0, 1],
     );
@@ -1286,12 +1280,12 @@ fn test_seek_prefix_matches_projection() {
     // same native values — that equality is what makes every composite seek find
     // the projected entry.
     use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code as tc;
+    use gnitz_wire::TypeCode;
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::I32, 0),
-            SchemaColumn::new(tc::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -1330,13 +1324,13 @@ fn test_seek_prefix_matches_projection() {
 fn index_key_spec_equals_projected_leading_span() {
     use gnitz_store::schema::key::PkBuf;
     use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code as tc;
+    use gnitz_wire::TypeCode;
     // Owner: PK id U64; a I64 (signed payload), b U128 (payload).
     let owner = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::I64, 0),
-            SchemaColumn::new(tc::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0],
     );
@@ -1404,11 +1398,19 @@ fn signed_index_width_ladder_promotes_to_i64_and_orders() {
     // Every signed width promotes to the 8-byte I64 index key, and its spans sort
     // numerically — negatives below non-negatives.
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code as tc;
-    for &(t, sz) in &[(tc::I8, 1usize), (tc::I16, 2), (tc::I32, 4), (tc::I64, 8)] {
-        let src = SchemaDescriptor::new(&[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(t, 0)], &[0]);
+    use gnitz_wire::TypeCode;
+    for &(t, sz) in &[
+        (TypeCode::I8, 1usize),
+        (TypeCode::I16, 2),
+        (TypeCode::I32, 4),
+        (TypeCode::I64, 8),
+    ] {
+        let src = SchemaDescriptor::new(
+            &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(t, false)],
+            &[0],
+        );
         let idx = make_index_schema(&[1], &src).unwrap();
-        assert_eq!(idx.columns[0].type_code, tc::I64, "tc={t} must promote to I64");
+        assert_eq!(idx.columns[0].type_code, TypeCode::I64, "tc={t} must promote to I64");
         assert_eq!(idx.columns[0].size(), 8, "promoted signed key keeps the 8-byte width");
 
         let lo = if sz == 8 { i64::MIN } else { -(1i64 << (sz * 8 - 1)) };
@@ -1464,9 +1466,9 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
     // NON-ZERO byte offset — the coordinate the verbatim arm slices with.
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I32, 1), // nullable payload
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I32, true), // nullable payload
         ],
         &[0, 1],
     );
@@ -1525,28 +1527,34 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
     // The projected span must byte-equal `seek_prefix` for the same value at every
     // type, or `WHERE col = v` seeks miss.
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code as tc;
-    let cases: &[(u8, usize, &[i64])] = &[
-        (tc::I8, 1, &[-128, -1, 0, 1, 127]),
-        (tc::I16, 2, &[-32768, -1, 0, 1, 32767]),
-        (tc::U16, 2, &[0, 1, 42, 65535]),
-        (tc::I32, 4, &[i32::MIN as i64, -42, -1, 0, 1, 42, i32::MAX as i64]),
-        (tc::I64, 8, &[i64::MIN, -42, -1, 0, 1, 42, i64::MAX]),
-        (tc::U8, 1, &[0, 1, 200, 255]),
-        (tc::U32, 4, &[0, 1, 42, u32::MAX as i64]),
-        (tc::U64, 8, &[0, 1, 42, -1 /* = u64::MAX bits */]),
-        (tc::U128, 16, &[0, 1, 42, -1]),
-        (tc::UUID, 16, &[0, 1, 42, -1]),
+    use gnitz_wire::TypeCode;
+    let cases: &[(TypeCode, usize, &[i64])] = &[
+        (TypeCode::I8, 1, &[-128, -1, 0, 1, 127]),
+        (TypeCode::I16, 2, &[-32768, -1, 0, 1, 32767]),
+        (TypeCode::U16, 2, &[0, 1, 42, 65535]),
+        (TypeCode::I32, 4, &[i32::MIN as i64, -42, -1, 0, 1, 42, i32::MAX as i64]),
+        (TypeCode::I64, 8, &[i64::MIN, -42, -1, 0, 1, 42, i64::MAX]),
+        (TypeCode::U8, 1, &[0, 1, 200, 255]),
+        (TypeCode::U32, 4, &[0, 1, 42, u32::MAX as i64]),
+        (TypeCode::U64, 8, &[0, 1, 42, -1 /* = u64::MAX bits */]),
+        (TypeCode::U128, 16, &[0, 1, 42, -1]),
+        (TypeCode::UUID, 16, &[0, 1, 42, -1]),
     ];
     for &(t, sz, values) in cases {
-        let src = SchemaDescriptor::new(&[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(t, 0)], &[0]);
+        let src = SchemaDescriptor::new(
+            &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(t, false)],
+            &[0],
+        );
         let idx = make_index_schema(&[1], &src).unwrap();
         let idx_type = idx.columns[0].type_code;
         let idx_size = idx.columns[0].size() as usize;
         // The same column as the table's PK — the source shape that reaches
         // `write_span`'s PK arm (verbatim copy when unpromoted, decode+encode
         // otherwise). The payload source alone cannot exercise it.
-        let pk_src = SchemaDescriptor::new(&[SchemaColumn::new(t, 0), SchemaColumn::new(tc::U64, 0)], &[0]);
+        let pk_src = SchemaDescriptor::new(
+            &[SchemaColumn::new(t, false), SchemaColumn::new(TypeCode::U64, false)],
+            &[0],
+        );
         let pk_idx = make_index_schema(&[0], &pk_src).unwrap();
         assert_eq!(pk_idx.columns[0].type_code, idx_type);
         let pk_spec = IndexKeySpec::new(&[0], &pk_src).unwrap();
@@ -1583,12 +1591,12 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
     // numerically (negatives below non-negatives) and the unsigned column breaks
     // ties. Asserts the full composite span sorts in tuple-numeric order.
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::type_code as tc;
+    use gnitz_wire::TypeCode;
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(tc::U64, 0),
-            SchemaColumn::new(tc::I32, 0),
-            SchemaColumn::new(tc::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -1653,7 +1661,7 @@ fn range_pks(engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128], st
 fn test_seek_by_index_range_unsigned_pure_range() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_unsigned",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -1696,7 +1704,7 @@ fn test_seek_by_index_range_unsigned_pure_range() {
 fn test_seek_by_index_range_signed_between() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_signed",
-        &[col_def("id", type_code::U64), col_def("x", type_code::I32)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::I32)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -1740,9 +1748,9 @@ fn test_seek_by_index_range_composite_eq_prefix() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_composite",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -1781,7 +1789,7 @@ fn test_seek_by_index_range_composite_eq_prefix() {
 fn test_seek_by_index_range_open_ended() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_open",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -1814,7 +1822,7 @@ fn test_seek_by_index_range_open_ended() {
 fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_dupgroup",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -1857,7 +1865,7 @@ fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
 fn test_seek_by_index_range_retraction() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_retract",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -1893,7 +1901,7 @@ fn test_seek_by_index_range_retraction() {
 fn test_seek_by_index_range_null_excluded() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_null",
-        &[col_def("id", type_code::U64), nullable_def("x", type_code::I64)],
+        &[col_def("id", TypeCode::U64), nullable_def("x", TypeCode::I64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -1928,7 +1936,7 @@ fn test_seek_by_index_range_null_excluded() {
 fn test_seek_by_index_range_no_range_column_errs() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_arity",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
 
@@ -1954,7 +1962,7 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
     // provably empty. `x >= u64::MAX` starts Before(MAX) and keeps the group.
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_excl_lower_max",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -1989,7 +1997,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
     // the table end (every row, including the MAX one).
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_incl_upper_max",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -2022,9 +2030,9 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_carry_eq",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -2095,7 +2103,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     // one group must drop that row at net weight 0.
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_multigroup",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -2151,9 +2159,9 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_prefix_multigroup",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -2205,7 +2213,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
     // exercise this path.)
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_empty_interval",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -2317,7 +2325,7 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
     // ascending PK order (3,6,9) — the gather's storage-order sweep.
     let (mut engine, tid, dir) = table_fixture(
         "catalog_full_arity_skip",
-        &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("x", TypeCode::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -2381,9 +2389,9 @@ fn test_seek_by_index_composite_prefix_null_gate() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_composite_prefix_null",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            nullable_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            nullable_def("b", TypeCode::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -2421,7 +2429,7 @@ fn test_seek_by_index_multi_value_regression() {
     // both return exactly the expected rows at weight 1.
     let (mut engine, tid, dir) = table_fixture(
         "catalog_multi_value_regression",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -2454,7 +2462,7 @@ fn test_seek_by_index_multi_value_regression() {
 fn compensated_drop_index_refills_the_restored_circuit() {
     let (mut engine, tid, dir) = table_fixture(
         "compensated_drop_index_refills",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);

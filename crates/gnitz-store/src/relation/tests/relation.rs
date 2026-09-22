@@ -28,7 +28,7 @@ fn register_entry(registry: &mut RelationRegistry, id: i64, schema: SchemaDescri
 #[test]
 fn test_register_unregister_table() {
     let mut registry = solo_registry("reg_unreg");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
     register_entry(&mut registry, 100, schema, RelationKind::BaseTable);
     assert!(registry.has_id(100));
 
@@ -42,7 +42,7 @@ fn test_add_remove_index_circuit() {
     // A real 3-column owner schema: registration precomputes the circuit's
     // `key_spec` from it, which locates indexed column 2.
     let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
+        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
         &[0],
     );
     register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
@@ -57,7 +57,7 @@ fn test_add_remove_index_circuit() {
 fn a_master_creates_no_index_directory() {
     let mut registry = RelationRegistry::master(&relation_test_dir("idx_master_dir"), 1, StoreConfig::default());
     let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 2],
+        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 2],
         &[0],
     );
     let owner_dir = register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
@@ -76,7 +76,7 @@ fn a_master_creates_no_index_directory() {
 fn a_flag_clear_arg1_names_no_index() {
     let mut registry = solo_registry("arg1_zero_owner");
     let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
+        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
         &[0],
     );
     register_entry(&mut registry, 50, schema, RelationKind::BaseTable);
@@ -101,7 +101,7 @@ fn ephemeral_flush_includes_index_circuits() {
     // A real 2-column owner schema: registration precomputes the circuit's
     // `key_spec` from it, which locates indexed column 1.
     let parent_schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 2],
+        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 2],
         &[0],
     );
     let owner_dir = register_entry(&mut registry, 70, parent_schema, RelationKind::BaseTable);
@@ -144,7 +144,7 @@ fn ephemeral_flush_includes_index_circuits() {
 #[test]
 fn a_fed_view_retains_each_round_at_its_own_weight() {
     let mut registry = solo_registry("fed_view_delta");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
     let vid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     registry
         .register(RelationSpec {
@@ -217,7 +217,7 @@ fn ingest_apply_error_returned_internal() {
         return;
     }
     let mut registry = solo_registry("seam_abort");
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::TypeCode::U64]);
     let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     register_entry(&mut registry, tid, schema, RelationKind::View);
     let mut batch = Batch::with_capacity(&schema, 1);
@@ -243,7 +243,7 @@ fn ingest_apply_error_returned_internal() {
 fn a_unique_index_covering_the_pk_has_nothing_left_to_check() {
     let mut registry = solo_registry("unique_to_check");
     let schema = SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
+        &[crate::schema::SchemaColumn::new(crate::schema::TypeCode::U64, false); 3],
         &[0],
     );
     register_entry(&mut registry, 60, schema, RelationKind::BaseTable);

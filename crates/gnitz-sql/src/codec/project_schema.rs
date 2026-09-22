@@ -59,7 +59,7 @@ pub(crate) fn payload_map(
 pub(crate) fn compute_map(program: LogicalProgram, cols: &[ColumnDef]) -> ComputeMap {
     ComputeMap {
         program: program.to_blob_bytes(),
-        out_cols: cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect(),
+        out_cols: cols.iter().map(|c| (c.ty.tc, c.is_nullable)).collect(),
     }
 }
 
@@ -85,7 +85,7 @@ fn compile_projection_map(
                 // from, so the value is range-checked into those low bytes
                 // first. The width comes from the declaration this program is
                 // paired with, never re-inferred: the two must not drift.
-                if let Some(fi) = FixedInt::from_type_code(col.type_code).filter(|fi| fi.width() < 8) {
+                if let Some(fi) = FixedInt::from_type_code(col.ty.tc).filter(|fi| fi.width() < 8) {
                     reg = eb.emit(LogicalInstr::IntCast { a: reg, fi });
                 }
                 eb.sink(Sink::Reg(reg));

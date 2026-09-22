@@ -4,10 +4,10 @@ use super::super::layout::*;
 use super::super::merge::ColumnarSource;
 use super::super::shard_file::{region_dir, write_i64_shard, ShardWriteOpts};
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
 use gnitz_expr::RowSource;
-use gnitz_wire::region::num_regions;
+use gnitz_wire::num_regions;
 use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 
 /// Build a shard through `write_as_shard` (uses encoding selection).
@@ -144,12 +144,12 @@ fn pk_and_payload_addressing() {
 
 /// `(U64 PK, I64, <tail>)` where `tail` is nullable — the shape an
 /// `ADD COLUMN` leaves behind. `make_schema_u64_i64` is its narrow twin.
-fn schema_with_appended(tail: u8) -> SchemaDescriptor {
+fn schema_with_appended(tail: TypeCode) -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(tail, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(tail, true),
         ],
         &[0],
     )
@@ -157,7 +157,7 @@ fn schema_with_appended(tail: u8) -> SchemaDescriptor {
 
 /// Open a narrow shard (one I64 payload column) under a schema that has
 /// since grown a trailing nullable column.
-fn open_widened(dir: &std::path::Path, name: &str, rows: &[(u64, i64)], tail: u8) -> MappedShard {
+fn open_widened(dir: &std::path::Path, name: &str, rows: &[(u64, i64)], tail: TypeCode) -> MappedShard {
     let pks: Vec<u64> = rows.iter().map(|&(pk, _)| pk).collect();
     let wts: Vec<i64> = rows.iter().map(|_| 1i64).collect();
     let vals: Vec<i64> = rows.iter().map(|&(_, v)| v).collect();
@@ -185,7 +185,7 @@ fn file_npc_header_roundtrip() {
 fn padded_shard_pads_the_appended_column() {
     let dir = tempfile::tempdir().unwrap();
     let rows: Vec<(u64, i64)> = (1..=5).map(|i| (i, i as i64 * 100)).collect();
-    let shard = open_widened(dir.path(), "pad.db", &rows, type_code::I64);
+    let shard = open_widened(dir.path(), "pad.db", &rows, TypeCode::I64);
 
     // The walk is driven by the file's own arity: one mapped column, and the
     // appended one reads `ZERO_CELL` rather than a mis-read directory entry (a
@@ -212,8 +212,8 @@ fn padded_shard_pads_the_appended_column() {
 fn padded_shard_slice_to_owned_batch_pads() {
     let dir = tempfile::tempdir().unwrap();
     let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
-    let shard = open_widened(dir.path(), "pad_slice.db", &rows, type_code::I64);
-    let schema = schema_with_appended(type_code::I64);
+    let shard = open_widened(dir.path(), "pad_slice.db", &rows, TypeCode::I64);
+    let schema = schema_with_appended(TypeCode::I64);
 
     // Reader 2: the bulk materializer.
     let batch = shard.slice_to_owned_batch(0, 4, &schema);
@@ -232,12 +232,12 @@ fn padded_shard_slice_to_owned_batch_pads() {
 fn padded_shard_to_unified_pads() {
     let dir = tempfile::tempdir().unwrap();
     let rows: Vec<(u64, i64)> = (1..=3).map(|i| (i, i as i64)).collect();
-    let shard = open_widened(dir.path(), "pad_unified.db", &rows, type_code::I64);
+    let shard = open_widened(dir.path(), "pad_unified.db", &rows, TypeCode::I64);
 
     // Reader 3: the shared column-first scatter reads `null_pad_mask` off the
     // view rather than the shard, so the view must carry it.
     let mut cols = Vec::new();
-    let unified = shard.to_unified(&schema_with_appended(type_code::I64), &mut cols);
+    let unified = shard.to_unified(&schema_with_appended(TypeCode::I64), &mut cols);
     assert_eq!(unified.null_pad_mask, 1 << 1);
     // The absent column reads one shared `'static` zero cell for every row —
     // the same `stride == 0` shape a Constant region uses, so the gather has
@@ -252,8 +252,8 @@ fn padded_shard_to_unified_pads() {
 fn padded_shard_with_appended_string_column() {
     let dir = tempfile::tempdir().unwrap();
     let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
-    let shard = open_widened(dir.path(), "pad_str.db", &rows, type_code::STRING);
-    let schema = schema_with_appended(type_code::STRING);
+    let shard = open_widened(dir.path(), "pad_str.db", &rows, TypeCode::String);
+    let schema = schema_with_appended(TypeCode::String);
 
     // Both blob arms: the relocating one walks *schema* payload columns and
     // reaches the appended STRING with the zero cell, which decodes as length
@@ -279,7 +279,7 @@ fn shard_wider_than_reader_schema_opens() {
     // make the database unbootable, so the reader narrows instead.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wide.db");
-    let wide = schema_with_appended(type_code::I64);
+    let wide = schema_with_appended(TypeCode::I64);
     let rows: Vec<_> = (1u64..=3)
         .map(|p| (p.to_be_bytes().to_vec(), 1, 0, vec![p as i64 * 10, p as i64 * 11]))
         .collect();
@@ -326,11 +326,11 @@ fn forged_file_npc_is_rejected() {
 #[test]
 fn a_widened_all_pk_shard_is_not_a_skeleton() {
     let dir = tempfile::tempdir().unwrap();
-    let all_pk = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+    let all_pk = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
     let widened = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -381,7 +381,7 @@ fn rebind_matches_a_fresh_open() {
     // Decode the packed column on the narrow handle first.
     assert_eq!(read_i64_le(narrow.get_col_ptr(0, 0, 8), 0), vals[0]);
 
-    let wide = schema_with_appended(type_code::I64);
+    let wide = schema_with_appended(TypeCode::I64);
     let rebound = narrow.rebind(&wide).unwrap();
     let fresh = MappedShard::open(&cpath, &wide).unwrap();
     assert!(std::rc::Rc::ptr_eq(&narrow.mmap, &rebound.mmap));
@@ -740,8 +740,8 @@ fn u64_pk_slice_to_owned_batch() {
 fn u128_pk_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -807,9 +807,9 @@ fn find_lower_bound_bytes_wide_pk_distinct() {
     let dir = tempfile::tempdir().unwrap();
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0, 1, 2],
     );
@@ -956,8 +956,8 @@ fn packed_i32_mid_shard_slice() {
     let dir = tempfile::tempdir().unwrap();
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
         ],
         &[0],
     );
@@ -992,8 +992,8 @@ fn packed_i32_mid_shard_slice() {
 fn slice_constant_regions_mid_shard_odd_length() {
     let dir = tempfile::tempdir().unwrap();
     let rows: Vec<(u64, i64)> = (1..=40).map(|i| (i, i as i64 * 7)).collect();
-    let shard = open_widened(dir.path(), "const_slice.db", &rows, type_code::I64);
-    let schema = schema_with_appended(type_code::I64);
+    let shard = open_widened(dir.path(), "const_slice.db", &rows, TypeCode::I64);
+    let schema = schema_with_appended(TypeCode::I64);
     assert!(
         matches!(shard.weight, WeightRegion::Mapped(cp) if cp.stride == 0),
         "weight is Constant"
@@ -1407,7 +1407,7 @@ fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescr
     let seq: Vec<u64> = (1..=n as u64).collect();
     // All-PK (no payload column), so 4 regions rather than 5 — the arity the
     // reader derives from the schema and checks the prefix length against.
-    let all_pk = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+    let all_pk = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false)], &[0]);
     let pk_only: Vec<_> = seq.iter().map(|&p| (p.to_be_bytes().to_vec(), 1, 0, vec![])).collect();
     let cpath = std::ffi::CString::new(dir.join("sw_pkonly.db").to_str().unwrap()).unwrap();
     write_i64_shard(&cpath, &all_pk, &pk_only, &[], ShardWriteOpts::default());

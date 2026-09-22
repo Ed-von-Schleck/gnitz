@@ -9,7 +9,6 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString};
 
-use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_core::{ColType, ColumnDef, Schema, SchemaFacts};
 
 use crate::build_pylist;
@@ -68,16 +67,14 @@ impl PyColumnDef {
 
 fn py_col_to_rust(py: Python<'_>, c: &PyColumnDef) -> PyResult<ColumnDef> {
     let name = c.name.bind(py).to_cow()?.into_owned();
-    type_code_from_u64(c.type_code as u64)
-        .map(|tc| {
-            let cd = ColumnDef::typed(name, ColType { tc, scale: c.scale }, c.is_nullable);
-            if c.is_hidden {
-                cd.hidden()
-            } else {
-                cd
-            }
-        })
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    let ty = u8::try_from(c.type_code)
+        .ok()
+        .and_then(|tc| ColType::from_wire(tc, c.scale))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown type code: {} (scale {})", c.type_code, c.scale))
+        })?;
+    let cd = ColumnDef::typed(name, ty, c.is_nullable);
+    Ok(if c.is_hidden { cd.hidden() } else { cd })
 }
 
 fn rust_col_to_py(py: Python<'_>, c: &ColumnDef, primary_key: bool) -> PyResult<Py<PyAny>> {
@@ -85,11 +82,11 @@ fn rust_col_to_py(py: Python<'_>, c: &ColumnDef, primary_key: bool) -> PyResult<
         py,
         PyColumnDef {
             name: PyString::intern(py, &c.name).unbind(),
-            type_code: c.type_code as u32,
+            type_code: c.ty.tc.as_wire() as u32,
             is_nullable: c.is_nullable,
             primary_key,
             is_hidden: c.is_hidden,
-            scale: c.scale,
+            scale: c.ty.scale,
         },
     )?
     .into_any())

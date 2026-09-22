@@ -878,7 +878,7 @@ impl GnitzClient {
         // need the source relation's PK, which this raw-binary entry point would
         // have to fetch and which `precheck_index_family` enforces anyway.
         for &ct in col_types {
-            gnitz_wire::index_key_type(ct as u8)?;
+            gnitz_wire::index_key_type(ct)?;
         }
 
         // No client-side name probe: the engine rejects a duplicate against both
@@ -916,7 +916,7 @@ impl GnitzClient {
     pub fn drop_unique_constraint(&mut self, tid: u64, name: &str, if_exists: bool) -> Result<(), ClientError> {
         self.drop_index_rows(&[name], "constraint", if_exists, |b, i| {
             payload_u64(b, i, IDXTAB_PAY_OWNER_ID) == tid
-                && gnitz_wire::IndexProps::from_flags(payload_u64(b, i, IDXTAB_PAY_FLAGS)).is_unique
+                && gnitz_wire::IndexProps::from_flags(payload_u64(b, i, IDXTAB_PAY_FLAGS)).is_ok_and(|p| p.is_unique)
         })
     }
 
@@ -1200,12 +1200,7 @@ impl GnitzClient {
         // any id allocation instead of relying on the server-side reject (and
         // `pack_pk_cols` below can never panic).
         Schema::validate_parts(pk_cols, columns).map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
-        // The rule the flags packing cannot represent, shared with the planner
-        // and the engine's own decoder.
-        props
-            .validate()
-            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
-        // `dist_prefix_len` is a leading-PK-prefix length (0 = default = full PK).
+        // The `Keyed` prefix is a leading-PK-prefix length (0 = default = full PK).
         // Shared with the engine's own TABLE_TAB decoder, which re-checks it: this
         // one catches the caller's mistake before any id is allocated.
         props
@@ -1222,7 +1217,7 @@ impl GnitzClient {
                 ClientError::ServerError(format!("create_table: unique index '{}': {msg}", spec.name))
             })?;
             for &c in spec.col_indices {
-                gnitz_wire::index_key_type(columns[c as usize].type_code as u8)?;
+                gnitz_wire::index_key_type(columns[c as usize].ty.tc)?;
             }
         }
 

@@ -9,36 +9,32 @@ use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
     write_circuit_rows, write_idx_tab_row, write_table_tab_row, IdxTabRow, SysRowSink, TableTabRow,
 };
-use gnitz_wire::type_code;
 use gnitz_wire::Circuit;
+use gnitz_wire::{ColType, TypeCode};
 
 // ── Catalog ColumnDef fixtures ────────────────────────────────────────────
 //
-// `ColumnDef: Default` is the plain column, so each builder names only what it
+// `ColumnDef::new` is the plain column, so each builder names only what it
 // varies and a new field costs no construction site anything.
 
 /// A plain non-nullable, non-FK, non-hidden column of the given type.
-pub fn col_def(name: &str, type_code: u8) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code,
-        ..Default::default()
-    }
+pub fn col_def(name: &str, type_code: TypeCode) -> ColumnDef {
+    ColumnDef::new(name, ColType::of(type_code))
 }
 
 /// Column defs carrying just the names, for a test that needs a *named* schema
 /// block. Type and nullability come off the descriptor, so only `name` matters.
 pub fn named_col_defs<S: AsRef<str>>(names: &[S]) -> Vec<ColumnDef> {
-    names.iter().map(|n| col_def(n.as_ref(), 0)).collect()
+    names.iter().map(|n| col_def(n.as_ref(), TypeCode::U64)).collect()
 }
 
 /// A plain non-nullable UUID column.
 pub fn uuid_def(name: &str) -> ColumnDef {
-    col_def(name, type_code::UUID)
+    col_def(name, TypeCode::UUID)
 }
 
 /// A nullable column of the given type.
-pub fn nullable_def(name: &str, type_code: u8) -> ColumnDef {
+pub fn nullable_def(name: &str, type_code: TypeCode) -> ColumnDef {
     ColumnDef {
         is_nullable: true,
         ..col_def(name, type_code)
@@ -46,7 +42,7 @@ pub fn nullable_def(name: &str, type_code: u8) -> ColumnDef {
 }
 
 /// A column of `type_code` carrying an FK onto `(parent_tid, parent_col)`.
-pub fn fk_def(name: &str, type_code: u8, parent_tid: i64, parent_col: u32) -> ColumnDef {
+pub fn fk_def(name: &str, type_code: TypeCode, parent_tid: i64, parent_col: u32) -> ColumnDef {
     ColumnDef {
         fk_table_id: parent_tid,
         fk_col_idx: parent_col,

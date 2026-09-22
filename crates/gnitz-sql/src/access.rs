@@ -17,7 +17,7 @@ fn bound_col_vs_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, Pla
     let BExpr::BinOp(left, op, right) = expr else {
         return None;
     };
-    let placed = |idx: usize, lit: &BoundExpr| place(lit, schema.columns[idx].ty());
+    let placed = |idx: usize, lit: &BoundExpr| place(lit, schema.columns[idx].ty);
     match (left.as_ref(), right.as_ref()) {
         (BExpr::ColRef(idx), lit) => Some((*idx, placed(*idx, lit)?, *op)),
         (lit, BExpr::ColRef(idx)) => Some((*idx, placed(*idx, lit)?, op.converse())),
@@ -59,21 +59,21 @@ fn term(conjunct: &BoundExpr, schema: &Schema) -> Option<(usize, Pin)> {
         // than `At` names no row.
         let mut keys = Vec::with_capacity(items.len());
         for item in items.iter().filter(|i| !matches!(i, BExpr::LitNull)) {
-            if let Placed::At(v) = place(item, c.ty())? {
+            if let Placed::At(v) = place(item, c.ty)? {
                 keys.push(v);
             }
         }
         if keys.is_empty() {
-            return Some((*col, empty_pin(c.type_code)?));
+            return Some((*col, empty_pin(c.ty.tc)?));
         }
         // In key order, so the key set crosses the lists already sorted. The binder
         // keeps a list as written; a repeat is no second key.
-        keys.sort_unstable_by_key(|&v| key_image(c.type_code as u8, v));
+        keys.sort_unstable_by_key(|&v| key_image(c.ty.tc, v));
         keys.dedup();
         return Some((*col, Pin::In(keys)));
     }
     let (col, p, op) = bound_col_vs_literal(conjunct, schema)?;
-    let tc = schema.columns[col].type_code;
+    let tc = schema.columns[col].ty.tc;
     let pin = match (op, p) {
         (BinOp::Eq, Placed::At(v)) => Pin::Eq(v),
         (BinOp::Eq, _) => empty_pin(tc)?,
@@ -128,7 +128,7 @@ impl Folded {
 
 /// Cut order on a column of type `tc`: value in key order, then `Before` below `After`.
 fn cut_key(c: Cut, tc: TypeCode) -> (u128, bool) {
-    (key_image(tc as u8, c.value()), matches!(c, Cut::After(_)))
+    (key_image(tc, c.value()), matches!(c, Cut::After(_)))
 }
 
 /// Every `Eq`/`Start`/`End` pin on `col` intersected; `Eq(v)` is the interval
@@ -165,7 +165,7 @@ fn bound_column_list(cols: &[u32], terms: &[Term], schema: &Schema) -> Option<(R
     let mut consumed = Vec::new();
     let mut next = None;
     for &col in cols {
-        let tc = schema.columns[col as usize].type_code;
+        let tc = schema.columns[col as usize].ty.tc;
         let Some(f) = fold(col, terms, tc) else {
             break;
         };
@@ -211,7 +211,7 @@ fn pk_key_set(terms: &[Term], schema: &Schema) -> Option<(PkKeys, Vec<usize>)> {
     let mut lists: [Option<&[u128]>; PK_LIST_MAX_COLS] = [None; PK_LIST_MAX_COLS];
     let mut consumed = Vec::new();
     for (k, &col) in schema.pk_cols.iter().enumerate() {
-        let tc = schema.columns[col as usize].type_code;
+        let tc = schema.columns[col as usize].ty.tc;
         if let Some(f) = fold(col, terms, tc) {
             if let Some(v) = f.point() {
                 points[k] = v;
@@ -313,7 +313,7 @@ pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[In
     // A range pinning every PK column is the key set's one key.
     let pk_range = bound_column_list(&schema.pk_cols, &terms, schema).filter(|(d, _)| !d.pins_all(schema.pk_count()));
     if let Some((desc, consumed)) = pk_range {
-        let tc = schema.columns[schema.pk_cols[0] as usize].type_code;
+        let tc = schema.columns[schema.pk_cols[0] as usize].ty.tc;
         let tier = if !desc.pins_none() {
             Tier::PinnedPkRange
         } else if bounded_sides(&desc, tc) > 0 {
@@ -341,7 +341,7 @@ pub(crate) fn candidates(conjuncts: &[BoundExpr], schema: &Schema, indexes: &[In
         } else {
             Tier::Index
         };
-        let tc = schema.columns[cols[desc.eq_vals().len()] as usize].type_code;
+        let tc = schema.columns[cols[desc.eq_vals().len()] as usize].ty.tc;
         let rank = IndexRank {
             pinned: desc.eq_vals().len() + desc.is_point() as usize,
             bounded_sides: bounded_sides(&desc, tc),

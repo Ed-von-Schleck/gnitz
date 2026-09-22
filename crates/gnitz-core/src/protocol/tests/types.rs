@@ -32,7 +32,7 @@ fn schema_column_table() {
         assert_eq!(ColumnTable::num_columns(&s), cols.len(), "{pk:?}");
         assert_eq!(ColumnTable::pk_cols(&s), pk, "{pk:?}");
         for (ci, &(tc, n)) in cols.iter().enumerate() {
-            assert_eq!(ColumnTable::col_type_code(&s, ci), tc as u8, "{pk:?}: col {ci}");
+            assert_eq!(ColumnTable::col_type_code(&s, ci), tc, "{pk:?}: col {ci}");
             assert_eq!(ColumnTable::col_nullable(&s, ci), n, "{pk:?}: col {ci}");
         }
         assert_eq!(s.not_null_payload_slots(), not_null, "{pk:?}: not_null_payload_slots");

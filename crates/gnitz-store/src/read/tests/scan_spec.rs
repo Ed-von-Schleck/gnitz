@@ -1,6 +1,6 @@
 use super::*;
 use crate::relation::{RelationKind, RelationSpec, StoreConfig};
-use crate::schema::{type_code, SchemaColumn};
+use crate::schema::{SchemaColumn, TypeCode};
 use crate::storage::{BatchBuilder, Slot, StoreError};
 use gnitz_wire::ViewProps;
 use gnitz_wire::{AggDescriptor, AggReadSpec, IndexBound, OrderKey, PkColList, ReadSink};
@@ -18,8 +18,8 @@ const TID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 fn id_val_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -129,8 +129,8 @@ fn a_whole_relation_spec_is_served_off_the_cached_snapshot() {
     assert!(Rc::ptr_eq(&run(&mut r, &rows_spec(Vec::new(), 0)).unwrap(), &snapshot));
     let mismatched = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
         ],
         &[0],
     );
@@ -195,9 +195,9 @@ fn a_malformed_range_on_an_index_walk_is_rejected() {
 fn walk_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::U128, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::U128, true),
         ],
         &[0],
     )
@@ -330,8 +330,8 @@ fn a_limit_over_a_traded_walk_stays_inside_it() {
 fn a_walk_over_an_unindexable_column_is_refused() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
         ],
         &[0],
     );
@@ -586,20 +586,20 @@ fn a_fold_reply_schema_not_matching_its_partial_layout_is_rejected() {
             }),
         },
     };
-    let partial = |last: Option<u8>| {
+    let partial = |last: Option<TypeCode>| {
         let mut cols = vec![
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ];
-        cols.extend(last.map(|tc| SchemaColumn::new(tc, 0)));
+        cols.extend(last.map(|tc| SchemaColumn::new(tc, false)));
         SchemaDescriptor::new(&cols, &[0])
     };
     // The derived partial itself is accepted, which is what makes the two
     // refusals below about the layout rather than about the spec.
     assert!(r
-        .scan_spec(TID, spec.clone(), &partial(Some(type_code::I64)), None)
+        .scan_spec(TID, spec.clone(), &partial(Some(TypeCode::I64)), None)
         .is_ok());
-    for bad in [partial(None), partial(Some(type_code::F64))] {
+    for bad in [partial(None), partial(Some(TypeCode::F64))] {
         let Err(err) = r.scan_spec(TID, spec.clone(), &bad, None) else {
             panic!("a reply schema off the partial layout must be rejected");
         };

@@ -100,7 +100,7 @@ pub(crate) fn region_spans(image: &[u8], file_npc: usize) -> Result<Vec<Span>, S
     if end > file_size {
         return Err(StorageError::Corrupt("shorter than its directory"));
     }
-    let spans = (0..=gnitz_wire::region::num_regions(file_npc))
+    let spans = (0..=gnitz_wire::num_regions(file_npc))
         .map(|i| {
             let DirEntry { size, encoding } = DirEntry::read(image, i);
             let off = region_start(end);
@@ -156,7 +156,7 @@ pub(crate) fn for_image_bw(size: usize, count: usize, elem_width: usize) -> Opti
 
 /// Header plus directory, by the file's own payload arity.
 pub(crate) const fn desc_len(file_npc: usize) -> usize {
-    dir_entry_off(gnitz_wire::region::num_regions(file_npc) + 1)
+    dir_entry_off(gnitz_wire::num_regions(file_npc) + 1)
 }
 
 /// XXH3-64 over a shard's descriptive prefix (header + directory), its own eight

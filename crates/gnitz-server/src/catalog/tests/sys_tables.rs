@@ -66,13 +66,12 @@ fn a_column_records_at_rest_pk_leads_with_the_owner() {
             owner_id: 0x1122,
             col_idx: 0xAABB,
             name: "c",
-            type_code: 0,
+            ty: gnitz_wire::ColType::of(gnitz_wire::TypeCode::U64),
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
             is_serial: false,
             is_hidden: false,
-            scale: 0,
         },
         1,
     );
@@ -82,4 +81,39 @@ fn a_column_records_at_rest_pk_leads_with_the_owner() {
         [0, 0, 0, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB],
     );
     assert_eq!(gnitz_wire::unpack_pair_pk(batch.get_pk(0)), (0x1122, 0xAABB));
+}
+
+/// Every COL_TAB word must fit the width it is stored at and decode to a value
+/// `write_col_tab_row` could emit.
+#[test]
+fn read_col_tab_row_refuses_forged_words() {
+    use gnitz_wire::sys_rows::SysRowSink;
+    // `[type_code, is_nullable, fk_table_id, fk_col_idx, is_serial, is_hidden, scale]`.
+    const SOUND: [u64; 7] = [gnitz_wire::TypeCode::I64.as_wire() as u64, 0, 0, 0, 0, 0, 0];
+    let row = |words: [u64; 7]| {
+        let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
+        SysRowSink::begin_row(&mut bb, &[16, 0], 1);
+        SysRowSink::put_string(&mut bb, "c");
+        for w in words {
+            SysRowSink::put_u64(&mut bb, w);
+        }
+        SysRowSink::end_row(&mut bb);
+        bb.finish()
+    };
+    assert!(read_col_tab_row(&row(SOUND), 0).is_ok());
+    let forge = |slot: usize, w: u64| {
+        let mut words = SOUND;
+        words[slot] = w;
+        words
+    };
+    for (what, words) in [
+        ("type_code past a byte", forge(0, 0x104)),
+        ("unknown type_code", forge(0, 99)),
+        ("is_nullable past a flag", forge(1, 2)),
+        ("fk_col_idx past a u32", forge(3, 1 << 32)),
+        ("scale past a byte", forge(6, 256)),
+        ("scale on an I64 column", forge(6, 3)),
+    ] {
+        assert!(read_col_tab_row(&row(words), 0).is_err(), "{what}");
+    }
 }

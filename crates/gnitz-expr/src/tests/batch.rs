@@ -6,7 +6,7 @@
 use std::ops::Neg;
 
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
-use gnitz_wire::{type_code, FixedInt};
+use gnitz_wire::{FixedInt, TypeCode};
 
 use super::{decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use crate::program::{FloatUnaryOp, IntUnaryOp};
@@ -216,7 +216,7 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
 #[test]
 fn not_null_load_clears_stale_null_bits() {
     let schema = TestSchema::new(
-        &[(type_code::U64, false), (type_code::I64, true), (type_code::I64, false)],
+        &[(TypeCode::U64, false), (TypeCode::I64, true), (TypeCode::I64, false)],
         &[0],
     );
     let m = 128;
@@ -250,16 +250,16 @@ fn int_loads_cover_every_width_and_both_pk_signednesses() {
     // ci0 = I32 PK, ci1 = U16 PK, in PK-list order [1, 0] — so the U16 sits at
     // OPK byte 0 and the I32 at byte 2, and column order does not decide either.
     let cols = [
-        (type_code::I32, false),
-        (type_code::U16, false),
-        (type_code::U8, true),
-        (type_code::I8, true),
-        (type_code::U16, true),
-        (type_code::I16, true),
-        (type_code::U32, true),
-        (type_code::I32, true),
-        (type_code::U64, true),
-        (type_code::I64, true),
+        (TypeCode::I32, false),
+        (TypeCode::U16, false),
+        (TypeCode::U8, true),
+        (TypeCode::I8, true),
+        (TypeCode::U16, true),
+        (TypeCode::I16, true),
+        (TypeCode::U32, true),
+        (TypeCode::I32, true),
+        (TypeCode::U64, true),
+        (TypeCode::I64, true),
     ];
     let schema = TestSchema::new(&cols, &[1, 0]);
 
@@ -321,8 +321,13 @@ fn int_loads_cover_every_width_and_both_pk_signednesses() {
 /// The type is a parameter for the same reason it is one on [`run_binary_rows`]:
 /// it is what `resolve` reads the register's signedness off, and `IntCast` /
 /// `IntToFloat` carry a `signed` flag that selects a different kernel arm.
-fn run_unary_rows(payload_tc: u8, vals: &[i64], nulls: &[bool], mk: impl Fn(Reg) -> LogicalInstr) -> Vec<(i64, bool)> {
-    let schema = TestSchema::new(&[(type_code::U64, false), (payload_tc, true)], &[0]);
+fn run_unary_rows(
+    payload_tc: TypeCode,
+    vals: &[i64],
+    nulls: &[bool],
+    mk: impl Fn(Reg) -> LogicalInstr,
+) -> Vec<(i64, bool)> {
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (payload_tc, true)], &[0]);
     let n = vals.len();
     let view = make_n_col_view(&schema, n, |row, _| vals[row], |row, _| nulls[row]);
     let instrs = vec![LogicalInstr::LoadColInt { col: 1 }, mk(Reg(0))];
@@ -344,7 +349,7 @@ fn run_unary_rows(payload_tc: u8, vals: &[i64], nulls: &[bool], mk: impl Fn(Reg)
 /// one unsigned, so the same instruction reaches a different kernel arm.
 /// Float values ride an 8-byte column as their `encode_f64` bit pattern.
 fn run_binary_rows(
-    payload_tc: u8,
+    payload_tc: TypeCode,
     a: &[i64],
     b: &[i64],
     a_null: &[bool],
@@ -356,14 +361,14 @@ fn run_binary_rows(
 
 /// [`run_binary_rows`] with `a` and `b` in columns of their own types.
 fn run_binary_rows_typed(
-    (a_tc, b_tc): (u8, u8),
+    (a_tc, b_tc): (TypeCode, TypeCode),
     a: &[i64],
     b: &[i64],
     a_null: &[bool],
     b_null: &[bool],
     mk: impl Fn(Reg, Reg) -> LogicalInstr,
 ) -> Vec<(i64, bool)> {
-    let schema = TestSchema::new(&[(type_code::U64, false), (a_tc, true), (b_tc, true)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (a_tc, true), (b_tc, true)], &[0]);
     let n = a.len();
     let view = make_n_col_view(
         &schema,
@@ -396,7 +401,7 @@ fn fu(op: FloatUnaryOp) -> impl Fn(Reg) -> LogicalInstr {
 fn int_abs_wraps_at_min_and_propagates_null() {
     let vals = [5i64, -5, 0, i64::MIN, 7];
     let nulls = [false, false, false, false, true];
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::IntUnary {
+    let out = run_unary_rows(TypeCode::I64, &vals, &nulls, |a| LogicalInstr::IntUnary {
         op: IntUnaryOp::Abs,
         a,
     });
@@ -428,7 +433,7 @@ fn float_unary_ops_match_ieee() {
         (FloatUnaryOp::Round, f64::round_ties_even),
         (FloatUnaryOp::Trunc, f64::trunc),
     ] {
-        let out = run_unary_rows(type_code::I64, &vals, &nulls, fu(op));
+        let out = run_unary_rows(TypeCode::I64, &vals, &nulls, fu(op));
         for (i, &x) in inputs.iter().enumerate() {
             let (got, want) = (decode_f64(out[i].0), reference(x));
             assert!(!out[i].1, "{op:?}({x}) must not be NULL");
@@ -455,7 +460,7 @@ fn float_to_f32_nulls_only_on_finite_overflow() {
         .map(|&f| encode_f64(f))
         .collect();
     let nulls = vec![false; vals.len()];
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::FloatToF32 { a });
+    let out = run_unary_rows(TypeCode::I64, &vals, &nulls, |a| LogicalInstr::FloatToF32 { a });
     let get = |i: usize| decode_f64(out[i].0);
 
     assert_eq!(get(0), 0.1f32 as f64, "rounded through f32 precision");
@@ -470,7 +475,7 @@ fn float_to_f32_nulls_only_on_finite_overflow() {
     // The values just above f32::MAX that round DOWN to it must not be NULLed.
     let just_over = f32::MAX as f64 + 2.0f64.powi(102);
     let v = vec![encode_f64(just_over)];
-    let out = run_unary_rows(type_code::I64, &v, &[false], |a| LogicalInstr::FloatToF32 { a });
+    let out = run_unary_rows(TypeCode::I64, &v, &[false], |a| LogicalInstr::FloatToF32 { a });
     assert!(!out[0].1, "rounds down to f32::MAX, so not an overflow");
     assert_eq!(decode_f64(out[0].0), f32::MAX as f64);
 }
@@ -481,7 +486,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
     let nulls = vec![false; vals.len()];
 
     // Signed source -> I8: only -128..=127 survive.
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::IntCast {
+    let out = run_unary_rows(TypeCode::I64, &vals, &nulls, |a| LogicalInstr::IntCast {
         a,
         fi: FixedInt::I8,
     });
@@ -492,7 +497,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
     assert!(out[4].1);
 
     // Signed source -> U64: the check degenerates to "not negative".
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::IntCast {
+    let out = run_unary_rows(TypeCode::I64, &vals, &nulls, |a| LogicalInstr::IntCast {
         a,
         fi: FixedInt::U64,
     });
@@ -502,7 +507,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
 
     // Unsigned source -> I64: values >= 2^63 fail. The U64 taint comes from the
     // column's own type, which is what makes `src_signed` false.
-    let out = run_unary_rows(type_code::U64, &[5, i64::MIN], &[false, false], |a| {
+    let out = run_unary_rows(TypeCode::U64, &[5, i64::MIN], &[false, false], |a| {
         LogicalInstr::IntCast { a, fi: FixedInt::I64 }
     });
     assert_eq!(out[0], (5, false), "5 fits I64");
@@ -524,7 +529,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
     .map(|&f| encode_f64(f))
     .collect();
     let nulls = vec![false; vals.len()];
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::FloatToInt {
+    let out = run_unary_rows(TypeCode::I64, &vals, &nulls, |a| LogicalInstr::FloatToInt {
         a,
         fi: FixedInt::I64,
     });
@@ -541,7 +546,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
         .iter()
         .map(|&f| encode_f64(f))
         .collect();
-    let out = run_unary_rows(type_code::I64, &vals, &[false; 4], |a| LogicalInstr::FloatToInt {
+    let out = run_unary_rows(TypeCode::I64, &vals, &[false; 4], |a| LogicalInstr::FloatToInt {
         a,
         fi: FixedInt::I8,
     });
@@ -564,14 +569,14 @@ fn division_nulls_the_row_on_a_zero_or_null_divisor() {
 
     // Only the null flag is asserted on rows 1 and 2: a NULL row's value half is
     // deliberately undefined, which is why a result is read back as an `Option`.
-    let quot = run_binary_rows(type_code::I64, &a, &b, &no, &b_null, |a, b| LogicalInstr::IntArith {
+    let quot = run_binary_rows(TypeCode::I64, &a, &b, &no, &b_null, |a, b| LogicalInstr::IntArith {
         op: IntArithOp::Div,
         a,
         b,
     });
     assert_eq!((quot[0], quot[1].1, quot[2].1), ((3, false), true, true));
 
-    let rem = run_binary_rows(type_code::I64, &a, &b, &no, &b_null, |a, b| LogicalInstr::IntArith {
+    let rem = run_binary_rows(TypeCode::I64, &a, &b, &no, &b_null, |a, b| LogicalInstr::IntArith {
         op: IntArithOp::Mod,
         a,
         b,
@@ -580,8 +585,10 @@ fn division_nulls_the_row_on_a_zero_or_null_divisor() {
 
     let fa = a.map(|x| encode_f64(x as f64));
     let fb = b.map(|x| encode_f64(x as f64));
-    let fdiv = run_binary_rows(type_code::I64, &fa, &fb, &no, &b_null, |a, b| {
-        LogicalInstr::FloatArith { op: FloatArithOp::Div, a, b }
+    let fdiv = run_binary_rows(TypeCode::I64, &fa, &fb, &no, &b_null, |a, b| LogicalInstr::FloatArith {
+        op: FloatArithOp::Div,
+        a,
+        b,
     });
     assert_eq!(decode_f64(fdiv[0].0), 10.0 / 3.0);
     assert!(fdiv[1].1 && fdiv[2].1, "a zero and a NULL divisor both null the row");
@@ -617,8 +624,8 @@ fn int_compare_reads_each_operand_with_its_own_signedness() {
     let a: Vec<i64> = pairs.iter().map(|p| p.0).collect();
     let b: Vec<i64> = pairs.iter().map(|p| p.1).collect();
     let no = vec![false; pairs.len()];
-    let value = |tc: u8, bits: i64| {
-        if tc == type_code::U64 {
+    let value = |tc: TypeCode, bits: i64| {
+        if tc == TypeCode::U64 {
             i128::from(bits as u64)
         } else {
             i128::from(bits)
@@ -626,10 +633,10 @@ fn int_compare_reads_each_operand_with_its_own_signedness() {
     };
 
     for (a_tc, b_tc) in [
-        (type_code::I64, type_code::I64),
-        (type_code::U64, type_code::U64),
-        (type_code::U64, type_code::I64),
-        (type_code::I64, type_code::U64),
+        (TypeCode::I64, TypeCode::I64),
+        (TypeCode::U64, TypeCode::U64),
+        (TypeCode::U64, TypeCode::I64),
+        (TypeCode::I64, TypeCode::U64),
     ] {
         for op in CMP_OPS {
             let got = run_binary_rows_typed((a_tc, b_tc), &a, &b, &no, &no, |a, b| LogicalInstr::Cmp { op, a, b });
@@ -654,7 +661,7 @@ fn float_compare_is_ieee_so_every_nan_comparison_is_false() {
     let no = vec![false; pairs.len()];
 
     for op in CMP_OPS {
-        let got = run_binary_rows(type_code::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FCmp { op, a, b });
+        let got = run_binary_rows(TypeCode::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FCmp { op, a, b });
         for (i, &(x, y)) in pairs.iter().enumerate() {
             let want = match x.partial_cmp(&y) {
                 Some(ord) => cmp_want(op, ord, x == y),
@@ -673,7 +680,7 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     let an = [false, false, false, true, true];
     let bn = [false, false, true, false, true];
 
-    let max = run_binary_rows(type_code::I64, &a, &b, &an, &bn, |a, b| LogicalInstr::IntMinMax2 {
+    let max = run_binary_rows(TypeCode::I64, &a, &b, &an, &bn, |a, b| LogicalInstr::IntMinMax2 {
         a,
         b,
         is_max: true,
@@ -684,7 +691,7 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     assert_eq!(max[3], (7, false), "a NULL -> b");
     assert!(max[4].1, "both NULL -> NULL");
 
-    let min = run_binary_rows(type_code::I64, &a, &b, &an, &bn, |a, b| LogicalInstr::IntMinMax2 {
+    let min = run_binary_rows(TypeCode::I64, &a, &b, &an, &bn, |a, b| LogicalInstr::IntMinMax2 {
         a,
         b,
         is_max: false,
@@ -698,12 +705,16 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     // would come out the minimum. Only the column's type selects the arm.
     let (big, no) = ([u64::MAX as i64, u64::MAX as i64], [false, false]);
     let small = [1i64, 1];
-    let umax = run_binary_rows(type_code::U64, &big, &small, &no, &no, |a, b| {
-        LogicalInstr::IntMinMax2 { a, b, is_max: true }
+    let umax = run_binary_rows(TypeCode::U64, &big, &small, &no, &no, |a, b| LogicalInstr::IntMinMax2 {
+        a,
+        b,
+        is_max: true,
     });
     assert_eq!(umax[0], (u64::MAX as i64, false), "unsigned MAX(u64::MAX, 1)");
-    let umin = run_binary_rows(type_code::U64, &big, &small, &no, &no, |a, b| {
-        LogicalInstr::IntMinMax2 { a, b, is_max: false }
+    let umin = run_binary_rows(TypeCode::U64, &big, &small, &no, &no, |a, b| LogicalInstr::IntMinMax2 {
+        a,
+        b,
+        is_max: false,
     });
     assert_eq!(umin[0], (1, false), "unsigned MIN(u64::MAX, 1)");
 }
@@ -715,7 +726,7 @@ fn float_minmax2_uses_total_cmp_order() {
     let b = [f(f64::NAN), f(2.0), f(0.0), f(f64::NAN)];
     let no = [false; 4];
 
-    let max = run_binary_rows(type_code::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FloatMinMax2 {
+    let max = run_binary_rows(TypeCode::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FloatMinMax2 {
         a,
         b,
         is_max: true,
@@ -728,7 +739,7 @@ fn float_minmax2_uses_total_cmp_order() {
     );
     assert!(decode_f64(max[3].0).is_nan(), "NaN outranks +inf");
 
-    let min = run_binary_rows(type_code::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FloatMinMax2 {
+    let min = run_binary_rows(TypeCode::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FloatMinMax2 {
         a,
         b,
         is_max: false,
@@ -769,9 +780,9 @@ fn mixed_prog(
     mk: impl Fn(&[Reg]) -> Vec<LogicalInstr>,
 ) -> (Evaluator, TestView) {
     let rows = strs.first().map_or_else(|| ints[0].len(), |c| c.len());
-    let mut cols = vec![(type_code::U64, false)];
-    cols.extend(strs.iter().map(|_| (type_code::STRING, true)));
-    cols.extend(ints.iter().map(|_| (type_code::I64, true)));
+    let mut cols = vec![(TypeCode::U64, false)];
+    cols.extend(strs.iter().map(|_| (TypeCode::String, true)));
+    cols.extend(ints.iter().map(|_| (TypeCode::I64, true)));
     let schema = TestSchema::new(&cols, &[0]);
     let mut view = TestView::new(rows, schema.pk_stride());
     push_payload_cols(&mut view, &schema);
@@ -1009,9 +1020,9 @@ fn substring_window_matches_postgres_and_is_total() {
 fn substring_bounds_read_an_unsigned_register_as_unsigned() {
     let schema = TestSchema::new(
         &[
-            (type_code::U64, false),
-            (type_code::STRING, false),
-            (type_code::U64, false),
+            (TypeCode::U64, false),
+            (TypeCode::String, false),
+            (TypeCode::U64, false),
         ],
         &[0],
     );
@@ -1357,7 +1368,7 @@ fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
     // A U64 column above i64::MAX has a negative i64 bit pattern, so the
     // resolve-time tracking is the only thing that keeps the text unsigned.
     let schema = TestSchema::new(
-        &[(type_code::U64, false), (type_code::U64, true), (type_code::I64, true)],
+        &[(TypeCode::U64, false), (TypeCode::U64, true), (TypeCode::I64, true)],
         &[0],
     );
     // Row 1 pins the digit loop's own edges: zero is the one magnitude with no
@@ -1383,7 +1394,7 @@ fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
 /// back through the parse.
 #[test]
 fn float_to_text_is_bounded_and_round_trips() {
-    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::F64, true)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::F64, true)], &[0]);
     let vals = [
         0.0,
         -0.0,
@@ -1628,7 +1639,7 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
 fn payload_loads_agree_with_the_wire_le_decoder() {
     for (tc, fi) in PK_WIDTH_MATRIX {
         // PK column 0 keeps the schema well-formed; column 1 is the subject.
-        let schema = TestSchema::new(&[(type_code::U64, false), (tc, false)], &[0]);
+        let schema = TestSchema::new(&[(TypeCode::U64, false), (tc, false)], &[0]);
         let vals: [i64; 6] = [0, 1, -1, i64::MIN, i64::MAX, 0x0123_4567_89ab_cdef];
         let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|v| (0u64, 0u64, std::slice::from_ref(v))).collect();
         let view = make_int_view(&schema, &rows);
@@ -1646,15 +1657,15 @@ fn payload_loads_agree_with_the_wire_le_decoder() {
 }
 
 /// Every `(type_code, FixedInt)` pair the two load kernels must cover.
-const PK_WIDTH_MATRIX: [(u8, FixedInt); 8] = [
-    (type_code::U8, FixedInt::U8),
-    (type_code::I8, FixedInt::I8),
-    (type_code::U16, FixedInt::U16),
-    (type_code::I16, FixedInt::I16),
-    (type_code::U32, FixedInt::U32),
-    (type_code::I32, FixedInt::I32),
-    (type_code::U64, FixedInt::U64),
-    (type_code::I64, FixedInt::I64),
+const PK_WIDTH_MATRIX: [(TypeCode, FixedInt); 8] = [
+    (TypeCode::U8, FixedInt::U8),
+    (TypeCode::I8, FixedInt::I8),
+    (TypeCode::U16, FixedInt::U16),
+    (TypeCode::I16, FixedInt::I16),
+    (TypeCode::U32, FixedInt::U32),
+    (TypeCode::I32, FixedInt::I32),
+    (TypeCode::U64, FixedInt::U64),
+    (TypeCode::I64, FixedInt::I64),
 ];
 
 /// `LoadPk`'s kernel is a fourth spelling of the OPK→i64 inverse: it reads
@@ -1669,7 +1680,7 @@ fn pk_loads_agree_with_the_wire_opk_decoder() {
     for (tc, fi) in PK_WIDTH_MATRIX {
         // A single-column PK of this type, plus one payload column so the schema
         // has a slot; the values sweep both sign extremes and the midpoint.
-        let schema = TestSchema::new(&[(tc, false), (type_code::I64, false)], &[0]);
+        let schema = TestSchema::new(&[(tc, false), (TypeCode::I64, false)], &[0]);
         let vals: [u64; 6] = [0, 1, u64::MAX, 1 << 63, (1 << 63) - 1, 0x0123_4567_89ab_cdef];
         let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|&v| (v, 0u64, &[0i64][..])).collect();
         let view = make_int_view(&schema, &rows);
@@ -1692,7 +1703,7 @@ fn pk_loads_agree_with_the_wire_opk_decoder() {
 #[test]
 fn is_null_reg_reads_the_null_lane_of_either_class() {
     for invert in [false, true] {
-        let got = run_unary_rows(type_code::I64, &[5, 0], &[false, true], |a| LogicalInstr::IsNullReg {
+        let got = run_unary_rows(TypeCode::I64, &[5, 0], &[false, true], |a| LogicalInstr::IsNullReg {
             a,
             invert,
         });
@@ -1713,7 +1724,7 @@ fn is_null_reg_reads_the_null_lane_of_either_class() {
 /// constant, read off the value lane the kernel filled.
 #[test]
 fn is_null_reg_on_the_no_nulls_arm_is_the_constant() {
-    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::I64, false)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I64, false)], &[0]);
     let view = make_n_col_view(&schema, 3, |row, _| row as i64, |_, _| false);
     for invert in [false, true] {
         let prog = resolved(
@@ -1739,11 +1750,11 @@ fn is_null_reg_on_the_no_nulls_arm_is_the_constant() {
 /// flag the resolve-time tracking sets — and over a float keeps the domain.
 #[test]
 fn sign_reads_its_operand_signedness_and_keeps_the_float_domain() {
-    let signed = run_unary_rows(type_code::I64, &[-5, 0, 7, i64::MIN], &[false; 4], |a| {
+    let signed = run_unary_rows(TypeCode::I64, &[-5, 0, 7, i64::MIN], &[false; 4], |a| {
         LogicalInstr::IntUnary { op: IntUnaryOp::Sign, a }
     });
     assert_eq!(signed, [(-1, false), (0, false), (1, false), (-1, false)]);
-    let unsigned = run_unary_rows(type_code::U64, &[u64::MAX as i64, 0], &[false; 2], |a| {
+    let unsigned = run_unary_rows(TypeCode::U64, &[u64::MAX as i64, 0], &[false; 2], |a| {
         LogicalInstr::IntUnary { op: IntUnaryOp::Sign, a }
     });
     assert_eq!(unsigned, [(1, false), (0, false)]);
@@ -1751,7 +1762,7 @@ fn sign_reads_its_operand_signedness_and_keeps_the_float_domain() {
         .iter()
         .map(|&f| encode_f64(f))
         .collect();
-    let got = run_unary_rows(type_code::I64, &vals, &[false; 5], |a| LogicalInstr::FloatUnary {
+    let got = run_unary_rows(TypeCode::I64, &vals, &[false; 5], |a| LogicalInstr::FloatUnary {
         op: FloatUnaryOp::Sign,
         a,
     });
@@ -1766,7 +1777,7 @@ fn sign_reads_its_operand_signedness_and_keeps_the_float_domain() {
 #[test]
 fn transcendentals_and_power_are_the_ieee_result() {
     let f = |op: FloatUnaryOp, x: f64| -> (f64, bool) {
-        let [(v, null)] = run_unary_rows(type_code::I64, &[encode_f64(x)], &[false], |a| {
+        let [(v, null)] = run_unary_rows(TypeCode::I64, &[encode_f64(x)], &[false], |a| {
             LogicalInstr::FloatUnary { op, a }
         })[..] else {
             unreachable!()
@@ -1780,7 +1791,7 @@ fn transcendentals_and_power_are_the_ieee_result() {
     assert_eq!(f(FloatUnaryOp::Log10, 1000.0), (3.0, false));
     assert_eq!(f(FloatUnaryOp::Exp, 0.0), (1.0, false));
     let got = run_binary_rows(
-        type_code::I64,
+        TypeCode::I64,
         &[encode_f64(2.0), encode_f64(0.0)],
         &[encode_f64(10.0), encode_f64(-1.0)],
         &[false; 2],
@@ -1988,7 +1999,7 @@ fn string_producers_propagate_a_null_operand_of_either_class() {
 /// though nothing else reads the register.
 #[test]
 fn a_word_level_boolean_scalar_result_is_unpacked() {
-    let got = run_unary_rows(type_code::I64, &[5, 0, 3], &[false, false, true], |a| {
+    let got = run_unary_rows(TypeCode::I64, &[5, 0, 3], &[false, false, true], |a| {
         LogicalInstr::BoolNot { a }
     });
     assert_eq!(got, [(0, false), (1, false), (0, true)]);

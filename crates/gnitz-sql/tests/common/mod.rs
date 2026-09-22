@@ -95,7 +95,7 @@ pub fn col_idx(schema: &Schema, name: &str) -> usize {
 /// Integer column `ci` of `row`, at its own width and signedness, from
 /// whichever region it lives in.
 pub fn cell_i64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
-    let fi = gnitz_wire::FixedInt::from_type_code(schema.columns[ci].type_code).expect("an integer column");
+    let fi = gnitz_wire::FixedInt::from_type_code(schema.columns[ci].ty.tc).expect("an integer column");
     gnitz_expr::SchemaFacts::locate(schema, ci).decode_i64(batch, row, fi)
 }
 

@@ -218,11 +218,7 @@ pub(crate) fn execute_insert(
     // durable advance and each row stamps `base + i`. A row failing the arity
     // guard below abandons the rest — a wider gap of the same intentional kind.
     let pk_plan = match serial_ci {
-        Some(ci) => PkPlan::serial(
-            client.reserve_serial_ids(tid, n as u64)?,
-            n,
-            schema.columns[ci].type_code,
-        )?,
+        Some(ci) => PkPlan::serial(client.reserve_serial_ids(tid, n as u64)?, n, schema.columns[ci].ty.tc)?,
         None => PkPlan::written(&slot_of, schema)?,
     };
 

@@ -4,7 +4,7 @@
 //! encode a different one.
 
 use super::error::ProtocolError;
-use super::types::{type_code_from_u64, ColType, ColumnDef, Schema};
+use super::types::{ColumnDef, Schema};
 use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
 use std::sync::Arc;
 
@@ -18,12 +18,11 @@ pub fn encode_schema_block(schema: &Schema) -> Vec<u8> {
         .columns
         .iter()
         .map(|col| SchemaBlockCol {
-            type_code: col.type_code as u8,
+            ty: col.ty,
             meta: ColMeta {
                 nullable: col.is_nullable,
                 hidden: col.is_hidden,
                 serial: col.is_serial,
-                scale: col.scale,
             },
             name: col.name.as_bytes(),
         })
@@ -66,13 +65,7 @@ pub fn schema_from_block(block: &[u8]) -> Result<Schema, ProtocolError> {
     for c in sb.columns() {
         let name =
             std::str::from_utf8(c.name).map_err(|e| ProtocolError::DecodeError(format!("utf8 in column name: {e}")))?;
-        // The shared decoder already rejected an unknown code; this re-reads it
-        // as the client's typed `TypeCode` rather than trusting a cast.
-        let ty = ColType {
-            tc: type_code_from_u64(c.type_code as u64)?,
-            scale: c.meta.scale,
-        };
-        let mut col = ColumnDef::typed(name, ty, c.meta.nullable);
+        let mut col = ColumnDef::typed(name, c.ty, c.meta.nullable);
         if c.meta.hidden {
             col = col.hidden();
         }

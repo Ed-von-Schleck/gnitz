@@ -80,8 +80,7 @@ impl Accumulator {
     /// `op` over input column `src`, emitting into output column `out`.
     pub(super) fn new(op: AggFunc, src: ColumnLocator, out: ColumnLocator) -> Self {
         let step = |op: AggFunc, loc: ColumnLocator| {
-            StepKind::of(op, TypeCode::from_validated_u8(loc.type_code()))
-                .expect("agg_output_type admits a sum only over a scalar register image")
+            StepKind::of(op, loc.type_code()).expect("agg_output_type admits a sum only over a scalar register image")
         };
         Accumulator {
             acc: 0,

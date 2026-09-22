@@ -6,12 +6,6 @@
 /// The largest scale a column may declare: `i64` holds 18 full decimal digits.
 pub const MAX_DECIMAL_SCALE: u8 = 18;
 
-/// Whether a column of `type_code` may declare `scale`: only a `DECIMAL` carries
-/// one, and at most [`MAX_DECIMAL_SCALE`].
-pub fn scale_admissible(type_code: u8, scale: u8) -> bool {
-    scale <= MAX_DECIMAL_SCALE && (scale == 0 || type_code == crate::type_code::DECIMAL)
-}
-
 /// `10^scale`, for `scale <= MAX_DECIMAL_SCALE`.
 #[inline]
 pub const fn pow10(scale: u8) -> i64 {

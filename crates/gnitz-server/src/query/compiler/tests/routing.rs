@@ -2,7 +2,7 @@ use super::*;
 use crate::query::compiler::fixtures::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema};
 use gnitz_store::schema::Placement;
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
 use std::collections::HashMap;
 
@@ -13,15 +13,15 @@ fn derive(loaded: &LoadedCircuit, registry: &RelationRegistry) -> Result<ViewMet
 
 /// A U64 PK and five I64 payload columns: every key a fixture names is payload.
 fn wide_schema() -> SchemaDescriptor {
-    let mut cols = vec![gnitz_store::schema::SchemaColumn::new(type_code::U64, 0)];
-    cols.extend((0..5).map(|_| gnitz_store::schema::SchemaColumn::new(type_code::I64, 0)));
+    let mut cols = vec![gnitz_store::schema::SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend((0..5).map(|_| gnitz_store::schema::SchemaColumn::new(TypeCode::I64, false)));
     SchemaDescriptor::new(&cols, &[0])
 }
 
 /// 3-column compound PK `(U32, U64, U64)` + one payload, so a `CLUSTER BY`
 /// prefix has more than one proper-prefix width to be tested at.
 fn three_col_pk_schema(dist_k: u8) -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::U32, type_code::U64, type_code::U64])
+    pk_payload_schema(&[TypeCode::U32, TypeCode::U64, TypeCode::U64])
         .with_placement(Placement::Keyed { prefix_len: dist_k })
 }
 
@@ -48,9 +48,9 @@ fn the_output_exchange_skip_reads_the_shard_key_in_the_sources_columns() {
     let behind_a_map = |shard_cols: Vec<u32>| {
         let schema = SchemaDescriptor::new(
             &[
-                gnitz_store::schema::SchemaColumn::new(type_code::I64, 0),
-                gnitz_store::schema::SchemaColumn::new(type_code::I64, 0),
-                gnitz_store::schema::SchemaColumn::new(type_code::U64, 0),
+                gnitz_store::schema::SchemaColumn::new(TypeCode::I64, false),
+                gnitz_store::schema::SchemaColumn::new(TypeCode::I64, false),
+                gnitz_store::schema::SchemaColumn::new(TypeCode::U64, false),
             ],
             &[2],
         )
@@ -77,7 +77,7 @@ fn the_output_exchange_skip_reads_the_shard_key_in_the_sources_columns() {
 #[test]
 fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // Compound PK (a, b) at columns 0, 1; column 2 is payload.
-    let compound = || pk_payload_schema(&[type_code::U64; 2]);
+    let compound = || pk_payload_schema(&[TypeCode::U64; 2]);
     let both = |key: &[u32], ext: RelationRegistry| {
         let meta = join_meta_in(JoinKind::Equi, key, [false; 2], ext);
         (meta.source_route(7).is_none(), meta.source_route(9).is_none())
@@ -550,7 +550,7 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
 #[test]
 fn a_band_join_skips_the_relay_where_its_equality_prefix_is_the_distribution_key() {
     let skips = |dist_k: u8| {
-        let schema = pk_payload_schema(&[type_code::U64; 2]).with_placement(Placement::Keyed { prefix_len: dist_k });
+        let schema = pk_payload_schema(&[TypeCode::U64; 2]).with_placement(Placement::Keyed { prefix_len: dist_k });
         join_meta_in(pure_range(1), &[0, 1], [false; 2], sources([(7, schema), (9, schema)]))
             .source_route(7)
             .is_none()
@@ -566,7 +566,7 @@ fn a_band_join_skips_the_relay_where_its_equality_prefix_is_the_distribution_key
 /// whole on every worker, so the range probe finds every match locally.
 #[test]
 fn a_band_join_skips_beside_a_replicated_partner() {
-    let base = || pk_payload_schema(&[type_code::U64; 2]);
+    let base = || pk_payload_schema(&[TypeCode::U64; 2]);
     let ext = sources([(7, base().with_placement(Placement::Replicated)), (9, base())]);
     let meta = join_meta_in(pure_range(1), &[0, 1], [false; 2], ext);
     assert!(meta.source_route(7).is_none(), "the replicated side");

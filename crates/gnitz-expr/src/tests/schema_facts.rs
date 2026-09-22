@@ -2,67 +2,82 @@
 
 use crate::test_support::TestSchema;
 use crate::{ColumnLocator, ColumnTable, SchemaFacts};
-use gnitz_wire::type_code as tc;
+use gnitz_wire::TypeCode;
 
 /// One case: a column table as `(type_code, nullable)`, and its PK list in
 /// PK-LIST order.
-type Case = (&'static [(u8, bool)], &'static [u32]);
+type Case = (&'static [(TypeCode, bool)], &'static [u32]);
 
 const CASES: &[Case] = &[
     // Single unsigned PK at column 0; U64/F64/STRING/U128 payload, one nullable.
     (
         &[
-            (tc::U64, false),
-            (tc::U64, false),
-            (tc::F64, true),
-            (tc::STRING, false),
-            (tc::U128, false),
+            (TypeCode::U64, false),
+            (TypeCode::U64, false),
+            (TypeCode::F64, true),
+            (TypeCode::String, false),
+            (TypeCode::U128, false),
         ],
         &[0],
     ),
     // Single signed PK NOT at column 0 — the payload slots renumber around it,
     // so the `ci - 1` closed form does not hold.
     (
-        &[(tc::STRING, true), (tc::I64, false), (tc::U64, false), (tc::F32, true)],
+        &[
+            (TypeCode::String, true),
+            (TypeCode::I64, false),
+            (TypeCode::U64, false),
+            (TypeCode::F32, true),
+        ],
         &[1],
     ),
     // Compound two-column PK (signed + unsigned, mixed widths).
     (
-        &[(tc::I32, false), (tc::U16, false), (tc::F64, false), (tc::BLOB, true)],
+        &[
+            (TypeCode::I32, false),
+            (TypeCode::U16, false),
+            (TypeCode::F64, false),
+            (TypeCode::Blob, true),
+        ],
         &[0, 1],
     ),
     // PK-list order reverses column order, with a column in between: OPK
     // offsets follow the PK list.
     (
-        &[(tc::U32, false), (tc::STRING, true), (tc::F64, false), (tc::I64, false)],
+        &[
+            (TypeCode::U32, false),
+            (TypeCode::String, true),
+            (TypeCode::F64, false),
+            (TypeCode::I64, false),
+        ],
         &[3, 0],
     ),
     // Every fixed width 1/2/4/8 as a PK column, plus a 16-byte payload column.
     (
         &[
-            (tc::I8, false),
-            (tc::U16, false),
-            (tc::I32, false),
-            (tc::U64, false),
-            (tc::I128, true),
-            (tc::UUID, false),
+            (TypeCode::I8, false),
+            (TypeCode::U16, false),
+            (TypeCode::I32, false),
+            (TypeCode::U64, false),
+            (TypeCode::I128, true),
+            (TypeCode::UUID, false),
         ],
         &[0, 1, 2, 3],
     ),
     // Every fixed width as a payload column, all nullable.
     (
         &[
-            (tc::U64, false),
-            (tc::U8, true),
-            (tc::I16, true),
-            (tc::U32, true),
-            (tc::I64, true),
-            (tc::U128, true),
+            (TypeCode::U64, false),
+            (TypeCode::U8, true),
+            (TypeCode::I16, true),
+            (TypeCode::U32, true),
+            (TypeCode::I64, true),
+            (TypeCode::U128, true),
         ],
         &[0],
     ),
     // PK-only: no payload columns at all.
-    (&[(tc::U32, false)], &[0]),
+    (&[(TypeCode::U32, false)], &[0]),
 ];
 
 #[test]
@@ -74,7 +89,7 @@ fn schema_facts_match_the_column_table() {
         assert_eq!(s.pk_cols(), pk, "{ctx}: pk_cols()");
         assert_eq!(s.num_columns(), cols.len(), "{ctx}: num_columns()");
         assert_eq!(s.num_payload_cols(), cols.len() - pk.len(), "{ctx}: num_payload_cols()");
-        let want_stride: usize = pk.iter().map(|&p| gnitz_wire::wire_stride(cols[p as usize].0)).sum();
+        let want_stride: usize = pk.iter().map(|&p| cols[p as usize].0.wire_stride()).sum();
         assert_eq!(s.pk_stride(), want_stride, "{ctx}: pk_stride()");
 
         // Expected OPK byte offset per PK column: the running sum in PK-list order.
@@ -82,7 +97,7 @@ fn schema_facts_match_the_column_table() {
         let mut running = 0usize;
         for &p in pk {
             pk_off[p as usize] = running;
-            running += gnitz_wire::wire_stride(cols[p as usize].0);
+            running += cols[p as usize].0.wire_stride();
         }
 
         // Expected payload slots: non-PK columns numbered left to right.
@@ -94,11 +109,7 @@ fn schema_facts_match_the_column_table() {
 
             let loc = s.locate(ci);
             assert_eq!(loc.type_code(), want_tc, "{ctx}: locate({ci}).type_code()");
-            assert_eq!(
-                loc.size(),
-                gnitz_wire::wire_stride(want_tc),
-                "{ctx}: locate({ci}).size()"
-            );
+            assert_eq!(loc.size(), want_tc.wire_stride(), "{ctx}: locate({ci}).size()");
             match loc {
                 ColumnLocator::Pk { byte_off, .. } => {
                     assert!(want_pk, "{ctx}: locate({ci}) is Pk for a payload column");

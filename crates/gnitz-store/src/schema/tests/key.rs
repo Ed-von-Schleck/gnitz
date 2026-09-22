@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{type_code, IndexKeySpec, Placement, SchemaColumn, SchemaDescriptor};
+use crate::schema::{IndexKeySpec, Placement, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::BatchBuilder;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::{read_signed_exact, read_unsigned_exact};
@@ -12,17 +12,17 @@ fn typed_cmp_pk_le(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) -> Ordering {
     for (_ord, col) in schema.pk_columns() {
         let cs = col.size() as usize;
         let ord = match col.type_code {
-            type_code::U128 | type_code::UUID => {
+            TypeCode::U128 | TypeCode::UUID => {
                 let va = u128::from_le_bytes(a[off..off + 16].try_into().unwrap());
                 let vb = u128::from_le_bytes(b[off..off + 16].try_into().unwrap());
                 va.cmp(&vb)
             }
-            type_code::I128 => {
+            TypeCode::I128 => {
                 let va = i128::from_le_bytes(a[off..off + 16].try_into().unwrap());
                 let vb = i128::from_le_bytes(b[off..off + 16].try_into().unwrap());
                 va.cmp(&vb)
             }
-            type_code::U64 | type_code::U32 | type_code::U16 | type_code::U8 => {
+            TypeCode::U64 | TypeCode::U32 | TypeCode::U16 | TypeCode::U8 => {
                 read_unsigned_exact(&a[off..off + cs]).cmp(&read_unsigned_exact(&b[off..off + cs]))
             }
             _ => read_signed_exact(&a[off..off + cs]).cmp(&read_signed_exact(&b[off..off + cs])),
@@ -56,7 +56,7 @@ fn assert_opk_equivalence(schema: &SchemaDescriptor, a: &[u8], b: &[u8]) {
 /// independent of the in-file `typed_cmp_pk_le` — and must also agree with
 /// `typed_cmp_pk_le` over the same bytes. The `i == j` diagonal is the
 /// equal-buffer case.
-fn assert_single_col_order<T: Ord + Copy + std::fmt::Debug>(tc: u8, vals: &[T], le: impl Fn(T) -> Vec<u8>) {
+fn assert_single_col_order<T: Ord + Copy + std::fmt::Debug>(tc: TypeCode, vals: &[T], le: impl Fn(T) -> Vec<u8>) {
     let s = pk_only_schema(&[tc]);
     for &a in vals {
         for &b in vals {
@@ -73,34 +73,30 @@ fn assert_single_col_order<T: Ord + Copy + std::fmt::Debug>(tc: u8, vals: &[T], 
 /// U64 image from an I64 one.
 #[test]
 fn opk_order_matches_native_order_per_type() {
-    assert_single_col_order(type_code::U8, &[0u8, 1, 0x7F, 0x80, 0xFF], |v| vec![v]);
-    assert_single_col_order(type_code::I8, &[i8::MIN, -1, 0, 1, i8::MAX], |v| vec![v as u8]);
+    assert_single_col_order(TypeCode::U8, &[0u8, 1, 0x7F, 0x80, 0xFF], |v| vec![v]);
+    assert_single_col_order(TypeCode::I8, &[i8::MIN, -1, 0, 1, i8::MAX], |v| vec![v as u8]);
     let le16 = |v: u16| v.to_le_bytes().to_vec();
-    assert_single_col_order(type_code::U16, &[0u16, 1, 0x0100, 0x8000, 0xFFFE, u16::MAX], le16);
-    assert_single_col_order(type_code::I16, &[i16::MIN, -1, 0, 1, i16::MAX], |v: i16| {
+    assert_single_col_order(TypeCode::U16, &[0u16, 1, 0x0100, 0x8000, 0xFFFE, u16::MAX], le16);
+    assert_single_col_order(TypeCode::I16, &[i16::MIN, -1, 0, 1, i16::MAX], |v: i16| {
         v.to_le_bytes().to_vec()
     });
     let le32 = |v: u32| v.to_le_bytes().to_vec();
-    assert_single_col_order(
-        type_code::U32,
-        &[0u32, 1, 256, 0x8000_0000, 0xFFFF_FFFE, u32::MAX],
-        le32,
-    );
-    assert_single_col_order(type_code::I32, &[i32::MIN, -1, 0, 1, i32::MAX], |v: i32| {
+    assert_single_col_order(TypeCode::U32, &[0u32, 1, 256, 0x8000_0000, 0xFFFF_FFFE, u32::MAX], le32);
+    assert_single_col_order(TypeCode::I32, &[i32::MIN, -1, 0, 1, i32::MAX], |v: i32| {
         v.to_le_bytes().to_vec()
     });
-    assert_single_col_order(type_code::U64, &[0u64, 1, 2, 256, 1 << 63, u64::MAX], |v: u64| {
+    assert_single_col_order(TypeCode::U64, &[0u64, 1, 2, 256, 1 << 63, u64::MAX], |v: u64| {
         v.to_le_bytes().to_vec()
     });
-    assert_single_col_order(type_code::I64, &[i64::MIN, -1, 0, 1, i64::MAX], |v: i64| {
+    assert_single_col_order(TypeCode::I64, &[i64::MIN, -1, 0, 1, i64::MAX], |v: i64| {
         v.to_le_bytes().to_vec()
     });
     let le128 = |v: u128| v.to_le_bytes().to_vec();
     let wide = [0u128, 1, u64::MAX as u128, u64::MAX as u128 + 1, 1 << 127, u128::MAX];
-    assert_single_col_order(type_code::U128, &wide, le128);
-    assert_single_col_order(type_code::UUID, &wide, le128);
+    assert_single_col_order(TypeCode::U128, &wide, le128);
+    assert_single_col_order(TypeCode::UUID, &wide, le128);
     assert_single_col_order(
-        type_code::I128,
+        TypeCode::I128,
         &[i128::MIN, -1, 0, 1, 1i128 << 63, 1i128 << 64, i128::MAX],
         |v: i128| v.to_le_bytes().to_vec(),
     );
@@ -108,7 +104,7 @@ fn opk_order_matches_native_order_per_type() {
 
 #[test]
 fn compare_pk_bytes_compound_u64_u64() {
-    let s = pk_only_schema(&[type_code::U64, type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let mk = |a: u64, b: u64| {
         let mut v = Vec::with_capacity(16);
         v.extend_from_slice(&a.to_le_bytes());
@@ -133,7 +129,7 @@ fn compare_pk_bytes_compound_u64_u64() {
 
 #[test]
 fn compare_pk_bytes_compound_mixed() {
-    let s = pk_only_schema(&[type_code::U64, type_code::I32]);
+    let s = pk_only_schema(&[TypeCode::U64, TypeCode::I32]);
     let mk = |a: u64, b: i32| {
         let mut v = Vec::with_capacity(12);
         v.extend_from_slice(&a.to_le_bytes());
@@ -155,8 +151,8 @@ fn compare_pk_bytes_pk_indices_order_not_schema_order() {
     // first 8 bytes correspond to column 1.
     let s = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[1, 0],
     );
@@ -265,9 +261,9 @@ mod opk_proptest {
     /// `(column type codes, pk_indices permutation, a_bytes, b_bytes)`.
     /// The permutation exercises non-identity `pk_indices` (e.g. `[1, 0]`),
     /// and 1..=4 columns spans both narrow (≤16) and wide (>16) strides.
-    fn arb_pk_case() -> impl Strategy<Value = (Vec<u8>, Vec<u32>, Vec<u8>, Vec<u8>)> {
+    fn arb_pk_case() -> impl Strategy<Value = (Vec<TypeCode>, Vec<u32>, Vec<u8>, Vec<u8>)> {
         prop::collection::vec(arb_pk_type(), 1..=4).prop_flat_map(|types| {
-            let stride: usize = types.iter().map(|&t| gnitz_wire::wire_stride(t)).sum();
+            let stride: usize = types.iter().map(|&t| t.wire_stride()).sum();
             let n = types.len();
             (
                 Just(types),
@@ -285,7 +281,7 @@ mod opk_proptest {
         #[test]
         fn opk_matches_compare_pk_bytes((types, perm, a, b) in arb_pk_case()) {
             let cols: Vec<SchemaColumn> =
-                types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+                types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
             let s = SchemaDescriptor::new(&cols, &perm);
             assert_opk_equivalence(&s, &a, &b);
         }
@@ -300,7 +296,7 @@ mod opk_proptest {
         #[test]
         fn compare_pk_ordering_matches_byte_compare((types, perm, a, b) in arb_pk_case()) {
             let cols: Vec<SchemaColumn> =
-                types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+                types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
             let s = SchemaDescriptor::new(&cols, &perm);
             let (oa, ob) = (s.opk_key(&a), s.opk_key(&b));
             let (oa, ob) = (oa.pk_bytes(), ob.pk_bytes());
@@ -319,7 +315,7 @@ mod opk_proptest {
         #[test]
         fn pk_bytes_eq_matches_byte_equality((types, perm, a, b) in arb_pk_case()) {
             let cols: Vec<SchemaColumn> =
-                types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+                types.iter().map(|&tc| SchemaColumn::new(tc, false)).collect();
             let s = SchemaDescriptor::new(&cols, &perm);
             let (oa, ob) = (s.opk_key(&a), s.opk_key(&b));
             let (oa, ob) = (oa.pk_bytes(), ob.pk_bytes());
@@ -335,16 +331,16 @@ mod opk_proptest {
 fn seek_opk_bytes_narrow_matches_opk_key() {
     // A 16-byte word against a narrower stride reads only the stride.
     let cases = [
-        pk_only_schema(&[type_code::U8]),  // stride 1
-        pk_only_schema(&[type_code::U32]), // stride 4
-        pk_only_schema(&[type_code::U64]), // stride 8
-        pk_only_schema(&[type_code::I64]), // stride 8, signed → OPK flips the sign bit
+        pk_only_schema(&[TypeCode::U8]),  // stride 1
+        pk_only_schema(&[TypeCode::U32]), // stride 4
+        pk_only_schema(&[TypeCode::U64]), // stride 8
+        pk_only_schema(&[TypeCode::I64]), // stride 8, signed → OPK flips the sign bit
         // Compound (U32, U32) with a *permuted* PK list [1, 0]: stride 8,
         // exercises the multi-column pk-list walk in the encoder.
         SchemaDescriptor::new(
             &[
-                SchemaColumn::new(type_code::U32, 0),
-                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(TypeCode::U32, false),
+                SchemaColumn::new(TypeCode::U32, false),
             ],
             &[1, 0],
         ),
@@ -361,14 +357,14 @@ fn seek_opk_bytes_narrow_matches_opk_key() {
 #[test]
 fn seek_opk_bytes_wide_keys_roundtrip() {
     // All-unsigned, so the OPK is each column's big-endian image.
-    let s = pk_only_schema(&[type_code::U64; 3]);
+    let s = pk_only_schema(&[TypeCode::U64; 3]);
     let cols: [u64; 3] = [0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 0x0102_0304_0506_0708];
     let key: Vec<u8> = cols.iter().flat_map(|v| v.to_le_bytes()).collect();
     let opk = seek_opk_bytes(&s, &key).expect("24-byte key encodes");
     let want: Vec<u8> = cols.iter().flat_map(|v| v.to_be_bytes()).collect();
     assert_eq!(opk.pk_bytes(), want.as_slice());
 
-    let s = pk_only_schema(&[type_code::U128; 4]);
+    let s = pk_only_schema(&[TypeCode::U128; 4]);
     let cols: [u128; 4] = [
         0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
         0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
@@ -384,10 +380,10 @@ fn seek_opk_bytes_wide_keys_roundtrip() {
 #[test]
 fn seek_opk_bytes_short_key_errs() {
     for (tc, stride) in [
-        (type_code::U8, 1),
-        (type_code::U32, 4),
-        (type_code::U64, 8),
-        (type_code::U128, 16),
+        (TypeCode::U8, 1),
+        (TypeCode::U32, 4),
+        (TypeCode::U64, 8),
+        (TypeCode::U128, 16),
     ] {
         let s = pk_only_schema(&[tc]);
         assert!(seek_opk_bytes(&s, &vec![0u8; stride - 1]).is_err(), "stride {stride}");
@@ -534,9 +530,9 @@ fn pkbuf_byte_order_is_lexicographic() {
 fn index_key_spec_skips_any_null_column() {
     let owner = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 1), // a: nullable payload
-            SchemaColumn::new(type_code::U64, 1), // b: nullable payload
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, true), // a: nullable payload
+            SchemaColumn::new(TypeCode::U64, true), // b: nullable payload
         ],
         &[0],
     );
@@ -585,9 +581,9 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
     // Owner: PK U64; two non-null U64 payload columns.
     let owner = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -751,11 +747,11 @@ fn hash_fold_stack_arm_matches_the_scratch_arm() {
 
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),  // 0: PK
-            SchemaColumn::new(type_code::I32, 0),  // 1: NOT NULL payload  (slot 0)
-            SchemaColumn::new(type_code::U64, 1),  // 2: nullable payload  (slot 1)
-            SchemaColumn::new(type_code::U128, 0), // 3: wide payload      (slot 2)
-            SchemaColumn::new(type_code::U16, 1),  // 4: nullable payload  (slot 3)
+            SchemaColumn::new(TypeCode::U64, false),  // 0: PK
+            SchemaColumn::new(TypeCode::I32, false),  // 1: NOT NULL payload  (slot 0)
+            SchemaColumn::new(TypeCode::U64, true),   // 2: nullable payload  (slot 1)
+            SchemaColumn::new(TypeCode::U128, false), // 3: wide payload      (slot 2)
+            SchemaColumn::new(TypeCode::U16, true),   // 4: nullable payload  (slot 3)
         ],
         &[0],
     );
@@ -811,19 +807,22 @@ fn hash_fold_stack_arm_matches_the_scratch_arm() {
 fn packer_output_schema_pk_width_policy() {
     // (key column type, expected output PK type, expected pk_stride)
     let cases = [
-        (type_code::U64, type_code::U64, 8usize),
-        (type_code::I32, type_code::I32, 4),
-        (type_code::U16, type_code::U16, 2),
-        (type_code::STRING, type_code::U128, 16),
-        (type_code::BLOB, type_code::U128, 16),
-        (type_code::U128, type_code::U128, 16),
-        (type_code::UUID, type_code::U128, 16),
+        (TypeCode::U64, TypeCode::U64, 8usize),
+        (TypeCode::I32, TypeCode::I32, 4),
+        (TypeCode::U16, TypeCode::U16, 2),
+        (TypeCode::String, TypeCode::U128, 16),
+        (TypeCode::Blob, TypeCode::U128, 16),
+        (TypeCode::U128, TypeCode::U128, 16),
+        (TypeCode::UUID, TypeCode::U128, 16),
     ];
     for (key_tc, want_tc, want_stride) in cases {
         // in_schema: [U64 PK, <key col>]; reindex on the payload col so the
         // PK-ineligible key types (STRING/BLOB/float) are exercisable as keys.
         let in_schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
+            &[
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(key_tc, false),
+            ],
             &[0],
         );
         let node_schema = ReindexPacker::new(&in_schema, &[(1, None)])
@@ -836,9 +835,12 @@ fn packer_output_schema_pk_width_policy() {
     // No float slot exists: the raw bits are equality-incorrect (±0.0) and the
     // `order_bits` image is not what a self-derived key would land in, so the
     // packer refuses one outright rather than picking either.
-    for float_tc in [type_code::F32, type_code::F64] {
+    for float_tc in [TypeCode::F32, TypeCode::F64] {
         let in_schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(float_tc, 0)],
+            &[
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(float_tc, false),
+            ],
             &[0],
         );
         assert!(
@@ -857,9 +859,9 @@ fn packer_output_schema_compound() {
     // in_schema: [U64 pk, I32, U128]; reindex on (col1 I32, col2 U128).
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0],
     );
@@ -868,14 +870,14 @@ fn packer_output_schema_compound() {
         .output_schema(&in_schema, &[0, 1, 2])
         .unwrap();
     assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
-    assert_eq!(out.columns[0].type_code, type_code::I32, "slot0 keeps I32 native width");
-    assert_eq!(out.columns[1].type_code, type_code::U128, "slot1 U128");
+    assert_eq!(out.columns[0].type_code, TypeCode::I32, "slot0 keeps I32 native width");
+    assert_eq!(out.columns[1].type_code, TypeCode::U128, "slot1 U128");
     assert_eq!(out.pk_stride(), 4 + 16, "compound stride = Σ slot widths");
     // Input columns follow the synthetic PK slots.
     assert_eq!(out.num_columns(), 2 + 3);
-    assert_eq!(out.columns[2].type_code, type_code::U64);
-    assert_eq!(out.columns[3].type_code, type_code::I32);
-    assert_eq!(out.columns[4].type_code, type_code::U128);
+    assert_eq!(out.columns[2].type_code, TypeCode::U64);
+    assert_eq!(out.columns[3].type_code, TypeCode::I32);
+    assert_eq!(out.columns[4].type_code, TypeCode::U128);
 }
 
 #[test]
@@ -884,9 +886,9 @@ fn packer_output_schema_cross_width_promotes() {
     // slot 0 promoted to I64 (carried) and slot 1 self-deriving.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -894,8 +896,8 @@ fn packer_output_schema_cross_width_promotes() {
         .unwrap()
         .output_schema(&in_schema, &[0, 1, 2])
         .unwrap();
-    assert_eq!(out.columns[0].type_code, type_code::I64, "slot0 carried T = I64");
-    assert_eq!(out.columns[1].type_code, type_code::I64, "slot1 self-derives I64");
+    assert_eq!(out.columns[0].type_code, TypeCode::I64, "slot0 carried T = I64");
+    assert_eq!(out.columns[1].type_code, TypeCode::I64, "slot1 self-derives I64");
     assert_eq!(out.pk_stride(), 8 + 8, "both slots 8 bytes after promotion");
 }
 
@@ -904,10 +906,10 @@ fn packer_output_schema_payload_prune() {
     // in_schema: [U64 pk, I32, U128, I16]; reindex on col1; keep payload {0, 3}.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I16, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I16, false),
         ],
         &[0],
     );
@@ -916,11 +918,11 @@ fn packer_output_schema_payload_prune() {
         .output_schema(&in_schema, &[0, 3])
         .unwrap();
     assert_eq!(out.pk_indices(), &[0], "single synthetic PK slot");
-    assert_eq!(out.columns[0].type_code, type_code::I32, "PK slot = reindex col1 (I32)");
+    assert_eq!(out.columns[0].type_code, TypeCode::I32, "PK slot = reindex col1 (I32)");
     // Only the two kept payload columns follow — not all four input columns.
     assert_eq!(out.num_columns(), 1 + 2, "1 PK + 2 kept payload");
-    assert_eq!(out.columns[1].type_code, type_code::U64, "kept payload col 0");
-    assert_eq!(out.columns[2].type_code, type_code::I16, "kept payload col 3");
+    assert_eq!(out.columns[1].type_code, TypeCode::U64, "kept payload col 0");
+    assert_eq!(out.columns[2].type_code, TypeCode::I16, "kept payload col 3");
 }
 
 // -----------------------------------------------------------------------
@@ -933,10 +935,10 @@ fn test_reindex_packer_multi_column_bytes() {
     // 8), a sign-flipped I32 payload, and a 16-byte U128 payload.
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0, 1],
     );
@@ -965,7 +967,7 @@ fn test_reindex_packer_multi_column_bytes() {
     let mut want = Vec::new();
     want.extend_from_slice(&pk1.to_be_bytes()); // col1 Pk: BE(pk1) verbatim
     let mut i32_opk = [0u8; 4];
-    gnitz_wire::encode_pk_column(&iv.to_le_bytes(), type_code::I32, &mut i32_opk);
+    gnitz_wire::encode_pk_column(&iv.to_le_bytes(), TypeCode::I32, &mut i32_opk);
     want.extend_from_slice(&i32_opk); // col2: sign-aware OPK
     assert_eq!(i32_opk[0], 0x7F, "I32 -3 OPK leading byte is sign-flipped (0x7F)");
     want.extend_from_slice(&uv.to_be_bytes()); // col3 Wide: BE(u128)
@@ -992,7 +994,7 @@ fn test_reindex_packer_arity1_byte_identity() {
         }
         let mb = b.as_mem_batch();
 
-        let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0]);
+        let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U128, false)], &[0]);
         let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
         assert_eq!(packer.out_stride, 16, "a content-hash key is a 16-byte U128 slot");
         let mut out = Batch::zeroed(&out_schema, 3);
@@ -1022,9 +1024,9 @@ fn test_reindex_packer_copartition_contract() {
     // so the delta scatter and the reindexed trace land on the same partition.
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -1051,8 +1053,8 @@ fn test_reindex_packer_copartition_contract() {
     let packer = ReindexPacker::new(&schema, &key).unwrap();
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // col2 → U64
-            SchemaColumn::new(type_code::I32, 0), // col1 → I32
+            SchemaColumn::new(TypeCode::U64, false), // col2 → U64
+            SchemaColumn::new(TypeCode::I32, false), // col1 → I32
         ],
         &[0, 1],
     );
@@ -1083,10 +1085,10 @@ fn test_reindex_packer_copartition_contract_wide() {
     // the wide routing arm, which byte-equality alone cannot.
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // PK (not part of the key)
-            SchemaColumn::new(type_code::U64, 0), // c1 payload → key slot 0
-            SchemaColumn::new(type_code::U64, 0), // c2 payload → key slot 1
-            SchemaColumn::new(type_code::U64, 0), // c3 payload → key slot 2
+            SchemaColumn::new(TypeCode::U64, false), // PK (not part of the key)
+            SchemaColumn::new(TypeCode::U64, false), // c1 payload → key slot 0
+            SchemaColumn::new(TypeCode::U64, false), // c2 payload → key slot 1
+            SchemaColumn::new(TypeCode::U64, false), // c3 payload → key slot 2
         ],
         &[0],
     );
@@ -1112,9 +1114,9 @@ fn test_reindex_packer_copartition_contract_wide() {
     // minus the trailing payload.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0, 1, 2],
     );
@@ -1166,8 +1168,8 @@ fn test_reindex_packer_null_key_determinism() {
     // column must pack that slot identically (all-zero for an unsigned key).
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 1), // nullable U32 key
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, true), // nullable U32 key
         ],
         &[0],
     );
@@ -1207,9 +1209,9 @@ fn test_group_key_bitmap_bit_positions() {
     // where every wrong position still lands on bit 0.
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0), // A: NOT NULL   → packed slot 0
-            SchemaColumn::new(type_code::U32, 1), // B: nullable   → packed slot 1
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false), // A: NOT NULL   → packed slot 0
+            SchemaColumn::new(TypeCode::U32, true),  // B: nullable   → packed slot 1
         ],
         &[0],
     );
@@ -1261,18 +1263,18 @@ mod pack_proptest {
     /// A legal carried promotion target: the widest slot of the source's own
     /// signedness. For the already-widest codes that is the self-derived type,
     /// so the two passes below are always legal, not always distinct.
-    fn carried_target(tc: u8) -> gnitz_wire::TypeCode {
+    fn carried_target(tc: TypeCode) -> gnitz_wire::TypeCode {
         use gnitz_wire::TypeCode as T;
         match tc {
-            type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => T::U64,
-            type_code::I8
-            | type_code::I16
-            | type_code::I32
-            | type_code::I64
-            | type_code::DATE
-            | type_code::TIMESTAMP
-            | type_code::DECIMAL => T::I64,
-            type_code::I128 => T::I128,
+            TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => T::U64,
+            TypeCode::I8
+            | TypeCode::I16
+            | TypeCode::I32
+            | TypeCode::I64
+            | TypeCode::Date
+            | TypeCode::Timestamp
+            | TypeCode::Decimal => T::I64,
+            TypeCode::I128 => T::I128,
             _ => T::U128, // U128, UUID
         }
     }
@@ -1280,11 +1282,11 @@ mod pack_proptest {
     /// `(column type codes, one native-LE value per column)`. 1..=MAX_PK_COLUMNS
     /// columns over every PK-eligible code, at every width combination — the
     /// surface the running-sum slot offsets live on.
-    fn arb_key_case() -> impl Strategy<Value = (Vec<u8>, Vec<Vec<u8>>)> {
+    fn arb_key_case() -> impl Strategy<Value = (Vec<TypeCode>, Vec<Vec<u8>>)> {
         prop::collection::vec(arb_pk_type(), 1..=crate::schema::MAX_PK_COLUMNS).prop_flat_map(|types| {
             let vals: Vec<_> = types
                 .iter()
-                .map(|&t| prop::collection::vec(any::<u8>(), gnitz_wire::wire_stride(t)))
+                .map(|&t| prop::collection::vec(any::<u8>(), t.wire_stride()))
                 .collect();
             (Just(types), vals)
         })
@@ -1300,8 +1302,8 @@ mod pack_proptest {
         #[test]
         fn reindex_pack_matches_wire_encoders((types, vals) in arb_key_case()) {
             // Payload placement: [U64 PK, c0 .. cn-1], key = the payload columns.
-            let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
-            cols.extend(types.iter().map(|&tc| SchemaColumn::new(tc, 0)));
+            let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+            cols.extend(types.iter().map(|&tc| SchemaColumn::new(tc, false)));
             let pay_schema = SchemaDescriptor::new(&cols, &[0]);
             let mut pb = Batch::with_capacity(&pay_schema, 1);
             pb.extend_pk(1u128);
@@ -1348,8 +1350,8 @@ mod pack_proptest {
                 let mut off = 0usize;
                 for (i, &tc) in types.iter().enumerate() {
                     let out_tc = gnitz_wire::resolve_reindex_type(tc, target(tc));
-                    let w = gnitz_wire::wire_stride(out_tc);
-                    let src_w = gnitz_wire::wire_stride(tc);
+                    let w = out_tc.wire_stride();
+                    let src_w = tc.wire_stride();
 
                     let mut native = [0u8; 16];
                     native[..src_w].copy_from_slice(&vals[i]);
@@ -1384,10 +1386,10 @@ fn reindex_pack_bench() {
     // --- 3-column join key: [U64 PK, U64, U64, U64], reindex on (1, 2, 3).
     let join_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -1408,9 +1410,9 @@ fn reindex_pack_bench() {
     // --- Nullable 2-column group key: [U64 PK, I64, U32 NULL], group on (1, 2).
     let grp_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U32, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U32, true),
         ],
         &[0],
     );
@@ -1483,7 +1485,7 @@ fn opk_u64(v: u64) -> Vec<u8> {
 /// `prefix_len == pk_stride`, an unbounded upper edge.
 #[test]
 fn pk_range_ge_unbounded_above() {
-    let s = pk_only_schema(&[type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64]);
     let d = RangeDescriptor::new(&[], Cut::Before(5), Cut::After(u64::MAX as u128));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(5));
@@ -1493,7 +1495,7 @@ fn pk_range_ge_unbounded_above() {
 /// `pk > 5` → `[OPK(6), +∞)` — the degenerate no-pad `succ` on the whole key.
 #[test]
 fn pk_range_gt_increments_whole_key() {
-    let s = pk_only_schema(&[type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64]);
     let d = RangeDescriptor::new(&[], Cut::After(5), Cut::After(u64::MAX as u128));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(6));
@@ -1503,7 +1505,7 @@ fn pk_range_gt_increments_whole_key() {
 /// `pk < 10` → `[OPK(0), OPK(10))`.
 #[test]
 fn pk_range_lt() {
-    let s = pk_only_schema(&[type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64]);
     let d = RangeDescriptor::new(&[], Cut::Before(0), Cut::Before(10));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(0));
@@ -1513,7 +1515,7 @@ fn pk_range_lt() {
 /// Full-PK point lookup `pk = 5` → `[OPK(5), OPK(6))` (degenerate cuts).
 #[test]
 fn pk_range_point_lookup() {
-    let s = pk_only_schema(&[type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64]);
     let d = RangeDescriptor::new(&[], Cut::Before(5), Cut::After(5));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
     assert_eq!(start.pk_bytes(), opk_u64(5));
@@ -1523,7 +1525,7 @@ fn pk_range_point_lookup() {
 /// An inverted interval (`pk > 10 AND pk < 3`) drains to zero rows.
 #[test]
 fn pk_range_inverted_is_empty() {
-    let s = pk_only_schema(&[type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64]);
     let d = RangeDescriptor::new(&[], Cut::After(10), Cut::Before(3));
     assert_eq!(pk_range_keys(&s, &d).unwrap(), None);
 }
@@ -1532,7 +1534,7 @@ fn pk_range_inverted_is_empty() {
 /// overflows `succ` → unbounded above.
 #[test]
 fn pk_range_signed_i64() {
-    let s = pk_only_schema(&[type_code::I64]);
+    let s = pk_only_schema(&[TypeCode::I64]);
     let neg1 = (-1i64 as u64) as u128;
     let d = RangeDescriptor::new(&[], Cut::After(neg1), Cut::After((i64::MAX as u64) as u128));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
@@ -1544,7 +1546,7 @@ fn pk_range_signed_i64() {
 /// `start` seeks past `(5, 3)` and stays within the `a == 5` group.
 #[test]
 fn pk_range_compound_prefix_eq() {
-    let s = pk_only_schema(&[type_code::U64, type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let d = RangeDescriptor::new(&[5], Cut::After(3), Cut::After(u64::MAX as u128));
     let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
     // start = OPK(5,4) — the prefix `(5,3)` incremented on b.
@@ -1568,7 +1570,7 @@ fn pk_range_compound_prefix_eq() {
 /// `n_eq` at the PK arity leaves no range column — a trust-boundary reject.
 #[test]
 fn pk_range_no_range_column_errs() {
-    let s = pk_only_schema(&[type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64]);
     let d = RangeDescriptor::new(&[5], Cut::Before(0), Cut::After(0));
     assert!(pk_range_keys(&s, &d).is_err());
 }
@@ -1582,20 +1584,20 @@ fn pk_range_no_range_column_errs() {
 /// columns through `eq_vals` and points at the last).
 #[test]
 fn confined_worker_confines_a_full_point() {
-    let u64s = pk_only_schema(&[type_code::U64]);
+    let u64s = pk_only_schema(&[TypeCode::U64]);
     assert_eq!(
         u64s.confined_worker(&RangeDescriptor::new(&[], Cut::Before(42), Cut::After(42)), NW),
         Some(u64s.worker_for_pk(&opk_pk(&u64s, &[42]), NW))
     );
 
-    let u128s = pk_only_schema(&[type_code::U128]);
+    let u128s = pk_only_schema(&[TypeCode::U128]);
     let wide = (1u128 << 100) | 7;
     assert_eq!(
         u128s.confined_worker(&RangeDescriptor::new(&[], Cut::Before(wide), Cut::After(wide)), NW),
         Some(u128s.worker_for_pk(&opk_pk(&u128s, &[wide]), NW))
     );
 
-    let comp = pk_only_schema(&[type_code::U32, type_code::U64]);
+    let comp = pk_only_schema(&[TypeCode::U32, TypeCode::U64]);
     assert_eq!(
         comp.confined_worker(&RangeDescriptor::new(&[9], Cut::Before(4), Cut::After(4)), NW),
         Some(comp.worker_for_pk(&opk_pk(&comp, &[9, 4]), NW))
@@ -1609,8 +1611,8 @@ fn confined_worker_confines_a_full_point() {
 #[test]
 fn confined_worker_follows_the_distribution_prefix() {
     let cols = [
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 0),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, false),
     ];
     let prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
     // `a = 7 AND b > 3` — a whole trailing-column range inside one `a` group.
@@ -1638,9 +1640,9 @@ fn confined_worker_follows_the_distribution_prefix() {
 /// signed maximum's OPK is all-`0xFF` too (sign-flip).
 #[test]
 fn confined_worker_confines_a_maximal_point() {
-    for tc in [type_code::U64, type_code::I64] {
+    for tc in [TypeCode::U64, TypeCode::I64] {
         let s = pk_only_schema(&[tc]);
-        let max = if tc == type_code::U64 {
+        let max = if tc == TypeCode::U64 {
             u64::MAX as u128
         } else {
             i64::MAX as u128
@@ -1664,7 +1666,7 @@ fn confined_worker_confines_a_maximal_point() {
 /// neither is a relation whose rows no key places.
 #[test]
 fn confined_worker_declines_a_multi_key_range_and_an_unkeyed_relation() {
-    let s = pk_only_schema(&[type_code::U64]);
+    let s = pk_only_schema(&[TypeCode::U64]);
     assert_eq!(
         s.confined_worker(&RangeDescriptor::new(&[], Cut::Before(0), Cut::After(1000)), NW),
         None
@@ -1687,7 +1689,7 @@ fn confined_worker_declines_a_multi_key_range_and_an_unkeyed_relation() {
     // key-placed.
     let point = RangeDescriptor::new(&[], Cut::Before(42), Cut::After(42));
     assert!(s.confined_worker(&point, NW).is_some());
-    let cols = [SchemaColumn::new(type_code::U64, 0)];
+    let cols = [SchemaColumn::new(TypeCode::U64, false)];
     for p in [Placement::Replicated, Placement::Local] {
         assert_eq!(
             SchemaDescriptor::new_with_placement(&cols, &[0], p).confined_worker(&point, NW),

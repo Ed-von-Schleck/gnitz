@@ -68,7 +68,7 @@ fn live_rows_for(engine: &CatalogEngine, tid: i64) -> usize {
 fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     let dir = temp_dir("alter_no_cascade");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
     let table_path = relation_dir(&dir, RelationKind::BaseTable, tid);
     assert!(Path::new(&table_path).exists());
@@ -100,7 +100,7 @@ fn rename_then_reopen_resolves_flushed_data() {
     let tid;
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+        let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
         let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
@@ -142,7 +142,7 @@ fn valid_long_name_rename_accepted() {
     // compares German-string content, so a valid rename to a long name is accepted.
     let dir = temp_dir("alter_long_ok");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     let pair = table_rename_pair(&engine, tid, "renamed_to_a_long_name");
     engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();
@@ -158,7 +158,7 @@ fn valid_long_name_rename_accepted() {
 fn stale_snapshot_rename_rejected_long_name() {
     let dir = temp_dir("alter_stale");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     // The `-1` carries a stale (wrong) old name > 12 bytes that does not match the
     // live row — the CAS must reject it.
@@ -183,7 +183,7 @@ fn stale_snapshot_rename_rejected_long_name() {
 fn duplicate_live_head_rejected() {
     let dir = temp_dir("alter_dup_head");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     // A bare `+1` re-ingest of the live row → net weight 2 (a duplicate live head).
     let row = live_table_row(&engine, tid);
@@ -308,8 +308,8 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
     let dir = temp_dir("alter_col");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
-        col_def("id", type_code::U64),
-        col_def("original_column_name", type_code::U64),
+        col_def("id", TypeCode::U64),
+        col_def("original_column_name", TypeCode::U64),
     ];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let col_idx: i64 = 1;
@@ -320,7 +320,7 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
     for (weight, name) in [(-1i64, "stale_wrong_column_x"), (1i64, "new_column_name_here")] {
         write_col_tab_row(
             &mut bb,
-            &col_def(name, type_code::U64).col_tab_row(tid, col_idx as usize),
+            &col_def(name, TypeCode::U64).col_tab_row(tid, col_idx as usize),
             weight,
         );
     }
@@ -358,7 +358,7 @@ fn column_rename_on_non_base_owner_rejected() {
     let dir = temp_dir("alter_col_owner");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let vid = register_identity_view(&mut engine, tid, "v", &cols);
 
@@ -391,7 +391,7 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
     let dir = temp_dir("alter_col_rename_ok");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let vid = register_identity_view(&mut engine, tid, "v", &cols);
     assert_eq!(
@@ -429,9 +429,9 @@ fn hiding_a_foreign_key_column_rejected() {
     let dir = temp_dir("alter_hide_fk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let ptid = engine
-        .create_table("public.p", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.p", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
-    let cols = vec![col_def("id", type_code::U64), fk_def("r", type_code::U64, ptid, 0)];
+    let cols = vec![col_def("id", TypeCode::U64), fk_def("r", TypeCode::U64, ptid, 0)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let err = engine
@@ -445,7 +445,7 @@ fn hiding_a_foreign_key_column_rejected() {
 
 #[test]
 fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
-    let cols = vec![col_def("id", type_code::U64), col_def("c", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("c", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_hide_indexed", &cols);
     engine.create_index("public.t", &["c"], false).unwrap();
 
@@ -463,7 +463,7 @@ fn hiding_an_indexed_column_rejected_but_unnulling_it_accepted() {
 
 #[test]
 fn hiding_or_unnulling_a_pk_column_rejected() {
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_pk_col", &cols);
 
     for mutate in [hide as fn(&mut ColumnDef), unnull] {
@@ -485,12 +485,12 @@ fn a_serial_column_must_be_the_lone_pk() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let serial = |name: &str| ColumnDef {
         is_serial: true,
-        ..col_def(name, type_code::I64)
+        ..col_def(name, TypeCode::I64)
     };
 
     for (i, (cols, pk)) in [
-        (vec![col_def("id", type_code::U64), serial("s")], vec![0u32]),
-        (vec![serial("a"), col_def("b", type_code::U64)], vec![0, 1]),
+        (vec![col_def("id", TypeCode::U64), serial("s")], vec![0u32]),
+        (vec![serial("a"), col_def("b", TypeCode::U64)], vec![0, 1]),
         (vec![serial("id"), serial("s")], vec![0]),
     ]
     .into_iter()
@@ -500,7 +500,7 @@ fn a_serial_column_must_be_the_lone_pk() {
         assert!(err.contains("must be the table's only SERIAL column"), "{err}");
     }
     engine
-        .create_table("public.ok", &[serial("id"), col_def("v", type_code::U64)], &[0])
+        .create_table("public.ok", &[serial("id"), col_def("v", TypeCode::U64)], &[0])
         .expect("a lone SERIAL PK is legal");
 
     engine.close();
@@ -511,12 +511,12 @@ fn a_serial_column_must_be_the_lone_pk() {
 /// dependent view.
 #[test]
 fn a_duplicate_add_column_is_named_before_dependent_views() {
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_add_dup_dep", &cols);
     register_identity_view(&mut engine, tid, "vw", &cols);
 
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &nullable_def("v", type_code::U64).col_tab_row(tid, 2), 1);
+    write_col_tab_row(&mut bb, &nullable_def("v", TypeCode::U64).col_tab_row(tid, 2), 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(err.contains("duplicate column name"), "{err}");
 
@@ -528,7 +528,7 @@ fn a_duplicate_add_column_is_named_before_dependent_views() {
 /// index may name it.
 #[test]
 fn a_dropped_column_cannot_be_renamed_or_indexed() {
-    let cols = vec![col_def("id", type_code::U64), col_def("a", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("a", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("alter_dropped_col", &cols);
     engine
         .ingest_to_family(COL_TAB_ID, &col_alter_pair(tid, 1, &cols[1], hide))
@@ -562,7 +562,7 @@ fn a_dropped_column_cannot_be_renamed_or_indexed() {
 fn insert_first_rename_pair_lands_the_new_name() {
     let dir = temp_dir("alter_insert_first_pair");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
 
     let row = live_table_row(&engine, tid);
@@ -601,17 +601,17 @@ fn insert_first_rename_pair_lands_the_new_name() {
 fn a_column_alter_must_be_its_bundles_only_change() {
     let (mut engine, tid, dir) = table_fixture(
         "alter_confined_to_bundle",
-        &[col_def("id", type_code::U64), col_def("v", type_code::I64)],
+        &[col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)],
     );
     let other = engine
         .create_table(
             "public.u",
-            &[col_def("id", type_code::U64), col_def("v", type_code::I64)],
+            &[col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)],
             &[0],
         )
         .unwrap();
     let append = |owner: i64, bb: &mut BatchBuilder| {
-        write_col_tab_row(bb, &nullable_def("w", type_code::I64).col_tab_row(owner, 2), 1);
+        write_col_tab_row(bb, &nullable_def("w", TypeCode::I64).col_tab_row(owner, 2), 1);
     };
 
     // An append bundled with an index family.

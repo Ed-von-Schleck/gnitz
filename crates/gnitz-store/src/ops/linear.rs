@@ -6,7 +6,7 @@
 
 use gnitz_expr::Evaluator;
 
-use crate::schema::{DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor};
+use crate::schema::{DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout};
 
 // ---------------------------------------------------------------------------
@@ -58,11 +58,10 @@ pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Re
 
 /// Output schema of an outer-join NULL_EXTEND ([`Batch::widened_with_nulls`]):
 /// the input's PK region unchanged, then its payload and one nullable column per
-/// `type_codes` entry, in the order `nulls_first` selects. `decode_op_node`
-/// rejects an undecodable type code, so every entry is a real column type.
+/// `type_codes` entry, in the order `nulls_first` selects.
 pub fn null_extend_output_schema(
     in_schema: &SchemaDescriptor,
-    type_codes: &[u8],
+    type_codes: &[TypeCode],
     nulls_first: bool,
 ) -> Result<SchemaDescriptor, OpBuildErr> {
     let mut b = DerivedSchema::new();
@@ -71,7 +70,7 @@ pub fn null_extend_output_schema(
     let nulls = |b: &mut DerivedSchema| {
         type_codes
             .iter()
-            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, 1)).map_err(over))
+            .try_for_each(|&tc| b.push(SchemaColumn::new(tc, true)).map_err(over))
     };
     if nulls_first {
         nulls(&mut b)?;

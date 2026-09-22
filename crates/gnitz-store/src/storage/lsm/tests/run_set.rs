@@ -151,14 +151,14 @@ fn cleared_flags_unsorted_run_consolidates_ok() {
 /// tick's aggregate may survive the fold.
 #[test]
 fn reduce_output_folds_to_the_latest_aggregate() {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
 
     // U128 PK + I64 group_val + I64 agg_val.
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );

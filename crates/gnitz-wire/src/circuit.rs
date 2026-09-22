@@ -58,7 +58,7 @@ wire_enum! {
 /// The `params` blob layout, folded into [`crate::SYS_SCHEMA_DIGEST`] rather
 /// than written into the blob: the digest is what refuses a stored
 /// `CIRCUIT_NODES` blob decoded under a new layout.
-pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 6;
+pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 7;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -116,7 +116,7 @@ impl AggDescriptor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComputeMap {
     pub program: Vec<u8>,
-    pub out_cols: Vec<(u8, bool)>,
+    pub out_cols: Vec<(TypeCode, bool)>,
 }
 
 /// Output type code of an aggregate over a source column of type `src_tc`, or
@@ -125,17 +125,17 @@ pub struct ComputeMap {
 ///
 /// A sum is typed as its 8-byte register image, so SUM over U64 is U64: the
 /// wrapping i64 accumulator's bits are the true sum mod 2^64.
-pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> Option<u8> {
-    use crate::types::{type_code, ScalarKind, TypeCode};
+pub const fn agg_output_type(func: AggFunc, src_tc: TypeCode) -> Option<TypeCode> {
     match func {
-        AggFunc::Count | AggFunc::CountNonNull => Some(type_code::I64),
+        AggFunc::Count | AggFunc::CountNonNull => Some(TypeCode::I64),
         // Adding two calendar values is meaningless.
-        AggFunc::Sum => match TypeCode::try_from_u8(src_tc) {
-            Some(tc) if ScalarKind::from_type_code(tc).is_some() && !tc.is_temporal() => {
-                Some(crate::types::register_image_type(src_tc))
+        AggFunc::Sum => {
+            if crate::ScalarKind::from_type_code(src_tc).is_some() && !src_tc.is_temporal() {
+                Some(src_tc.register_image())
+            } else {
+                None
             }
-            _ => None,
-        },
+        }
         AggFunc::Min | AggFunc::Max => Some(src_tc),
     }
 }
@@ -187,7 +187,7 @@ impl ReduceOutKey {
     /// The one precedence chain (eq-PK ▷ single-natural ▷ synthetic), from the
     /// facts both sides already hold: the source's PK column list, the GROUP BY
     /// column list, and a `(type_code, nullable)` reader for a group column.
-    pub fn for_group_cols(pk_cols: &[u32], group_cols: &[u32], col: impl Fn(u32) -> (u8, bool)) -> Self {
+    pub fn for_group_cols(pk_cols: &[u32], group_cols: &[u32], col: impl Fn(u32) -> (TypeCode, bool)) -> Self {
         // A permutation, not a prefix: the SQL may list PK columns in any order.
         let eq_pk = group_cols.len() == pk_cols.len() && pk_cols.iter().all(|p| group_cols.contains(p));
         let single_natural = match *group_cols {
@@ -195,7 +195,7 @@ impl ReduceOutKey {
                 let (type_code, nullable) = col(c);
                 // A nullable column can never key the output: the PK region
                 // carries no null bitmap.
-                !nullable && crate::TypeCode::try_from_u8(type_code).is_some_and(|t| t.is_natural_reduce_key())
+                !nullable && type_code.is_natural_reduce_key()
             }
             _ => false,
         };
@@ -392,7 +392,7 @@ pub enum OpNode {
     /// payload under `nulls_first` and behind it otherwise — the side order an
     /// outer join's null-fill needs.
     NullExtend {
-        type_codes: Vec<u8>,
+        type_codes: Vec<TypeCode>,
         nulls_first: bool,
     },
     /// Keep only rows whose packed-PK partition is owned by this worker (**pure**
@@ -737,7 +737,7 @@ impl Circuit {
 
     /// [`OpNode::NullExtend`]. `nulls_first` places the NULL columns ahead of the
     /// input's payload.
-    pub fn null_extend(&mut self, input: NodeId, type_codes: &[u8], nulls_first: bool) -> NodeId {
+    pub fn null_extend(&mut self, input: NodeId, type_codes: &[TypeCode], nulls_first: bool) -> NodeId {
         let op = OpNode::NullExtend {
             type_codes: type_codes.to_vec(),
             nulls_first,
@@ -799,7 +799,7 @@ pub(crate) fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
 }
 
 /// A counted `(source column, promoted target type)` list; `0` on the wire is
-/// "no target". `TypeCode::try_from_u8` is the whole domain check here — which
+/// "no target". `TypeCode::from_wire` is the whole domain check here — which
 /// targets a particular node admits is that arm's own business.
 fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
     let n = read_count(r, "slot list")?;
@@ -808,7 +808,7 @@ fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
         let col = r.u32()?;
         let target = match r.u8()? {
             0 => None,
-            tc => Some(TypeCode::try_from_u8(tc).ok_or_else(|| format!("unknown promotion type code {tc}"))?),
+            tc => Some(TypeCode::from_wire(tc).ok_or_else(|| format!("unknown promotion type code {tc}"))?),
         };
         out.push((col, target));
     }
@@ -818,14 +818,14 @@ fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
 fn write_cols_with_tcs(w: &mut Writer, slots: &[ReindexSlot]) {
     write_count(w, slots.len());
     for &(col, tc) in slots {
-        w.u32(col).u8(tc.map_or(0, |t| t as u8));
+        w.u32(col).u8(tc.map_or(0, TypeCode::as_wire));
     }
 }
 
 const ORDER_DESC: u8 = 1 << 0;
 const ORDER_NULLS_FIRST: u8 = 1 << 1;
 
-/// One order key's four wire bytes: column, flags, one reserved byte.
+/// One order key's three wire bytes: column, flags.
 fn write_order_key(w: &mut Writer, key: &crate::OrderKey) {
     let mut flags = 0u8;
     if key.desc {
@@ -834,17 +834,13 @@ fn write_order_key(w: &mut Writer, key: &crate::OrderKey) {
     if key.nulls_first {
         flags |= ORDER_NULLS_FIRST;
     }
-    w.u16(key.col).u8(flags).u8(0);
+    w.u16(key.col).u8(flags);
 }
 
 /// [`write_order_key`]'s inverse; an unknown flag bit is a refusal.
 fn read_order_key(r: &mut Reader) -> Result<crate::OrderKey, String> {
     let col = r.u16()?;
-    let flags = r.u8()?;
-    if flags & !(ORDER_DESC | ORDER_NULLS_FIRST) != 0 {
-        return Err(format!("order key has unknown flag bits {flags:#04x}"));
-    }
-    let _rsv = r.u8()?;
+    let flags = r.flags(ORDER_DESC | ORDER_NULLS_FIRST)?;
     Ok(crate::OrderKey {
         col,
         desc: flags & ORDER_DESC != 0,
@@ -890,10 +886,10 @@ pub(crate) fn read_aggs(r: &mut Reader) -> Result<Vec<AggDescriptor>, String> {
 /// The declared payload slots, then the program. Taken as parts rather than as a
 /// `&ComputeMap` because the `ReadSpec` fold spells "no pre-map" as an empty
 /// program and holds no struct to borrow.
-pub(crate) fn write_compute_map(w: &mut Writer, out_cols: &[(u8, bool)], program: &[u8]) {
+pub(crate) fn write_compute_map(w: &mut Writer, out_cols: &[(TypeCode, bool)], program: &[u8]) {
     write_count(w, out_cols.len());
     for &(tc, nullable) in out_cols {
-        w.u8(tc).u8(nullable as u8);
+        w.u8(tc.as_wire()).u8(nullable as u8);
     }
     w.bytes32(program);
 }
@@ -902,16 +898,8 @@ pub(crate) fn read_compute_map(r: &mut Reader) -> Result<ComputeMap, String> {
     let n = read_count(r, "compute map")?;
     let mut out_cols = Vec::with_capacity(n);
     for _ in 0..n {
-        // These become schema columns verbatim (`is_valid_type_code`).
-        let tc = r.u8()?;
-        if !crate::is_valid_type_code(tc) {
-            return Err(format!("compute map output column type code {tc} is invalid"));
-        }
-        let nullable = r.u8()?;
-        if nullable > 1 {
-            return Err(format!("compute map output column nullable flag is {nullable}"));
-        }
-        out_cols.push((tc, nullable == 1));
+        let tc = r.type_code()?;
+        out_cols.push((tc, r.bool()?));
     }
     Ok(ComputeMap { program: r.bytes32()?.to_vec(), out_cols })
 }
@@ -992,7 +980,7 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             w.u8(*nulls_first as u8);
             write_count(&mut w, type_codes.len());
             for tc in type_codes {
-                w.u8(*tc);
+                w.u8(tc.as_wire());
             }
             (Opcode::NullExtend, None, Some(w.into_vec()))
         }
@@ -1074,17 +1062,17 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
         Opcode::Distinct => OpNode::Distinct,
         Opcode::PositivePart => OpNode::PositivePart,
         Opcode::Reduce => {
-            let global_ground = r.u8()? != 0;
+            let global_ground = r.bool()?;
             let group_cols = read_cols(&mut r)?;
             let agg = read_aggs(&mut r)?;
             OpNode::Reduce { group_cols, agg, global_ground }
         }
         Opcode::JoinEqui => OpNode::Join {
             kind: JoinKind::Equi,
-            delta_is_right: r.u8()? != 0,
+            delta_is_right: r.bool()?,
         },
         Opcode::JoinRange => {
-            let delta_is_right = r.u8()? != 0;
+            let delta_is_right = r.bool()?;
             let n_eq = r.u8()?;
             let rel_byte = r.u8()?;
             let rel = RangeRel::from_wire(rel_byte).ok_or_else(|| format!("JOIN unknown rel {rel_byte}"))?;
@@ -1095,23 +1083,15 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
         }
         Opcode::JoinCross => OpNode::Join {
             kind: JoinKind::Cross,
-            delta_is_right: r.u8()? != 0,
+            delta_is_right: r.bool()?,
         },
         Opcode::IntegrateSink => OpNode::IntegrateSink,
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: read_cols(&mut r)? },
         Opcode::NullExtend => {
-            let nulls_first = r.u8()? != 0;
+            let nulls_first = r.bool()?;
             let n = read_count(&mut r, "NULL_EXTEND")?;
-            let mut type_codes = Vec::with_capacity(n);
-            for _ in 0..n {
-                // These become schema columns verbatim (`is_valid_type_code`).
-                let tc = r.u8()?;
-                if !crate::is_valid_type_code(tc) {
-                    return Err(format!("NULL_EXTEND: invalid column type code {tc}"));
-                }
-                type_codes.push(tc);
-            }
+            let type_codes = (0..n).map(|_| r.type_code()).collect::<Result<_, _>>()?;
             OpNode::NullExtend { type_codes, nulls_first }
         }
         Opcode::WorkerFilter => OpNode::WorkerFilter,

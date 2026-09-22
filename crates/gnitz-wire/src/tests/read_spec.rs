@@ -48,11 +48,7 @@ fn roundtrips_every_bound_against_every_sink() {
         None,
         Some(ComputeMap {
             program: vec![4, 1, 5, 9, 2, 6],
-            out_cols: vec![
-                (TypeCode::I64 as u8, false),
-                (TypeCode::I64 as u8, true),
-                (TypeCode::F64 as u8, true),
-            ],
+            out_cols: vec![(TypeCode::I64, false), (TypeCode::I64, true), (TypeCode::F64, true)],
         }),
         // A keys-only map: a program that declares no slot.
         Some(ComputeMap { program: vec![7], out_cols: vec![] }),
@@ -251,7 +247,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
     let cases: &[(&str, Vec<u8>, &str)] = &[
         ("bound kind", poke(4, 9), "bound kind"),
         ("sink tag", poke(10, 9), "sink tag"),
-        ("map presence", poke(9, 2), "map presence byte"),
+        ("map presence", poke(9, 2), "boolean byte 2"),
         (
             "order key cap",
             poke(19, (MAX_ORDER_KEYS + 1) as u8),
@@ -329,7 +325,7 @@ fn a_pk_set_with_fewer_keys_decodes_to_the_same_spec() {
         None,
         Some(ComputeMap {
             program: vec![4, 1, 5],
-            out_cols: vec![(TypeCode::I64 as u8, true)],
+            out_cols: vec![(TypeCode::I64, true)],
         }),
     ];
     let kinds = [

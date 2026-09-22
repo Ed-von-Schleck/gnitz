@@ -140,7 +140,7 @@ fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, wins: Opti
             let col = &mut b.payload[pi].bytes;
             let cell = |r: usize| <[u8; 8]>::try_from(&col[r * 8..(r + 1) * 8]).unwrap();
             let (acc, add) = (cell(first), cell(row));
-            let sum = if gnitz_wire::is_float(loc.type_code()) {
+            let sum = if loc.type_code().is_float() {
                 (f64::from_le_bytes(acc) + f64::from_le_bytes(add)).to_le_bytes()
             } else {
                 i64::from_le_bytes(acc)

@@ -19,7 +19,7 @@ use gnitz_core::{DeltaCursor, MirrorError};
 use gnitz_expr::{payload_bytes, payload_is_null, payload_string, payload_u64};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder};
-use gnitz_wire::{read_u64_le, type_code, write_u64_le};
+use gnitz_wire::{read_u64_le, write_u64_le, TypeCode};
 
 /// `<base_dir>/mirror_state` — the file this module owns.
 const STATE_FILENAME: &str = "mirror_state";
@@ -28,12 +28,12 @@ const STATE_FILENAME: &str = "mirror_state";
 /// with no feed position.
 const STATE_SCHEMA: SchemaDescriptor = SchemaDescriptor::new(
     &[
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 1),
-        SchemaColumn::new(type_code::U64, 1),
-        SchemaColumn::new(type_code::STRING, 0),
-        SchemaColumn::new(type_code::STRING, 0),
-        SchemaColumn::new(type_code::BLOB, 0),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, true),
+        SchemaColumn::new(TypeCode::U64, true),
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::String, false),
+        SchemaColumn::new(TypeCode::Blob, false),
     ],
     &[0],
 );

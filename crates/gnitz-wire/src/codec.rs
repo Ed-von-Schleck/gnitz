@@ -1,15 +1,20 @@
 //! The little-endian byte cursor pair every variable-length codec encodes and
 //! decodes through — this crate's, and the `gnitz-expr` program blob it carries
-//! opaquely. `wal` is the exception: it frames in place, so a scatter can fill
-//! the region slices it hands back. [`Writer`] appends, [`Reader`] consumes, and the two are field-for-field
+//! opaquely. A fixed-offset frame does not go through it: `wal` frames in
+//! place, so a scatter can fill the region slices it hands back.
+//! [`Writer`] appends, [`Reader`] consumes, and the two are field-for-field
 //! inverses — a format is written and parsed against one shared definition of
-//! what each width means, so no codec hand-rolls its own offset arithmetic or
-//! `to_le_bytes` chain.
+//! what each width means, so no `Reader`/`Writer` format hand-rolls its own
+//! offset arithmetic or `to_le_bytes` chain.
 //!
 //! Every [`Reader`] access is bounds-checked and reports a truncated blob as an
 //! `Err` naming the format it was reading (`Reader::new`'s `ctx`), never a panic.
+//! A primitive with fewer legal values than its byte has is read strictly, by
+//! the one `Reader` method for it.
 //!
 //! Both types are `pub`; a method is `pub` only where that framing needs it.
+
+use crate::TypeCode;
 
 /// A little-endian forward writer — the inverse of [`Reader`].
 pub struct Writer(Vec<u8>);
@@ -110,6 +115,30 @@ impl<'a> Reader<'a> {
     }
     pub(crate) fn u128(&mut self) -> Result<u128, String> {
         Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
+
+    /// A boolean byte: `0` or `1`, and nothing else.
+    pub(crate) fn bool(&mut self) -> Result<bool, String> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            b => Err(format!("{}: boolean byte {b} is neither 0 nor 1", self.ctx)),
+        }
+    }
+
+    /// A flag byte whose bits all lie within `defined`.
+    pub(crate) fn flags(&mut self, defined: u8) -> Result<u8, String> {
+        let f = self.u8()?;
+        if f & !defined != 0 {
+            return Err(format!("{}: unknown flag bits {f:#04x}", self.ctx));
+        }
+        Ok(f)
+    }
+
+    /// A column type code byte naming a known [`TypeCode`].
+    pub(crate) fn type_code(&mut self) -> Result<TypeCode, String> {
+        let v = self.u8()?;
+        TypeCode::from_wire(v).ok_or_else(|| format!("{}: invalid type code {v}", self.ctx))
     }
 
     /// A `u32`-length-prefixed byte section — the inverse of [`Writer::bytes32`].

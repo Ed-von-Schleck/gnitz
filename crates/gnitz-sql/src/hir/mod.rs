@@ -451,7 +451,7 @@ impl HirAgg {
 
     /// The type this aggregate renders where a view reads it.
     pub(crate) fn view_type(&self) -> ColType {
-        crate::agg::agg_view_type(self.func, self.out.col.def.ty())
+        crate::agg::agg_view_type(self.func, self.out.col.def.ty)
     }
 
     /// A companion carries the null-ness; otherwise the raw column's own.
@@ -687,7 +687,7 @@ fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
         return None;
     }
     let t = l.tc.join_key_common_type(r.tc)?;
-    let widens = |src: TypeCode| gnitz_wire::is_widening_promotion(src as u8, t as u8);
+    let widens = |src: TypeCode| src.is_widening_promotion(t);
     (widens(l.tc) && widens(r.tc)).then_some(ColType::of(t))
 }
 
@@ -884,12 +884,10 @@ impl RelExpr {
         }
         let mut out = Vec::with_capacity(lcols.len());
         for (i, (l, r)) in lcols.iter().zip(&rcols).enumerate() {
-            let ty = set_op_common_type(l.def.ty(), r.def.ty()).ok_or_else(|| {
+            let ty = set_op_common_type(l.def.ty, r.def.ty).ok_or_else(|| {
                 GnitzSqlError::Plan(format!(
                     "set operation: column {} type mismatch ({} vs {})",
-                    i,
-                    l.def.ty(),
-                    r.def.ty()
+                    i, l.def.ty, r.def.ty
                 ))
             })?;
             // Output name comes from the left side (SQL takes output names from
@@ -900,7 +898,7 @@ impl RelExpr {
                 SetOpKind::Union => l.def.is_nullable || r.def.is_nullable,
             };
             let mut def = l.def.clone();
-            def.set_ty(ty);
+            def.ty = ty;
             def.is_nullable = is_nullable;
             out.push(HirCol::new(ids.next(), def));
         }

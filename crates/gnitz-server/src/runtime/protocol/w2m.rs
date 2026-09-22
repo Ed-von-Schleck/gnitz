@@ -43,7 +43,6 @@ use io_uring::types::FutexWaitV;
 
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg, FRAME_CAP};
 use gnitz_foundation::posix_io;
-use gnitz_wire::align8;
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 
 /// The ring id every worker exchange frame rides. The master's request-id
@@ -110,7 +109,7 @@ const RING_PREFIX_BYTES: u64 = 8;
 /// payload padded to the prefix's alignment.
 #[inline]
 const fn slot_stride(sz: usize) -> u64 {
-    RING_PREFIX_BYTES + align8(sz) as u64
+    RING_PREFIX_BYTES + sz.next_multiple_of(8) as u64
 }
 
 /// The 8-byte prefix stamped in front of every slot: `sz` in the high half,

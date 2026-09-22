@@ -2,7 +2,7 @@
 
 use crate::test_support::{TestSchema, TestView};
 use crate::{RangeMembership, SchemaFacts};
-use gnitz_wire::type_code as tc;
+use gnitz_wire::TypeCode;
 use gnitz_wire::{Cut, FixedInt, RangeDescriptor};
 
 /// The rows of `v` the walk `desc` over `cols` admits.
@@ -17,7 +17,7 @@ fn admitted(cols: &[u32], desc: RangeDescriptor, schema: &TestSchema, v: &TestVi
 /// A signed payload column: `[-3, 3)` straddles zero, and the cut kinds decide the edges.
 #[test]
 fn signed_cuts_admit_across_zero() {
-    let schema = TestSchema::new(&[(tc::U64, false), (tc::I64, true)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I64, true)], &[0]);
     let vals = [-4i64, -3, -1, 0, 2, 3, i64::MIN, i64::MAX];
     let mut v = TestView::new(vals.len(), 8);
     v.push_col(8);
@@ -43,12 +43,12 @@ fn signed_cuts_admit_across_zero() {
 /// column 0.
 #[test]
 fn a_compound_prefix_pins_then_bounds() {
-    let schema = TestSchema::new(&[(tc::U32, false), (tc::I16, false)], &[1, 0]);
+    let schema = TestSchema::new(&[(TypeCode::U32, false), (TypeCode::I16, false)], &[1, 0]);
     let rows: [(i16, u32); 5] = [(-1, 5), (-1, 9), (2, 5), (-1, 10), (-1, 4)];
     let mut v = TestView::new(rows.len(), schema.pk_stride());
     for (r, &(a, b)) in rows.iter().enumerate() {
-        v.set_pk_col(r, 0, &a.to_le_bytes(), tc::I16);
-        v.set_pk_col(r, 2, &b.to_le_bytes(), tc::U32);
+        v.set_pk_col(r, 0, &a.to_le_bytes(), TypeCode::I16);
+        v.set_pk_col(r, 2, &b.to_le_bytes(), TypeCode::U32);
     }
     let desc = RangeDescriptor::new(&[FixedInt::I16.pack(-1)], Cut::Before(5), Cut::After(9));
     assert_eq!(admitted(&[1, 0], desc, &schema, &v), vec![0, 1]);
@@ -57,7 +57,10 @@ fn a_compound_prefix_pins_then_bounds() {
 /// An index holds no row with a NULL in any of its columns, the trailing ones included.
 #[test]
 fn a_null_in_any_indexed_column_is_outside_the_walk() {
-    let schema = TestSchema::new(&[(tc::U64, false), (tc::U64, true), (tc::U64, true)], &[0]);
+    let schema = TestSchema::new(
+        &[(TypeCode::U64, false), (TypeCode::U64, true), (TypeCode::U64, true)],
+        &[0],
+    );
     let mut v = TestView::new(3, 8);
     v.push_col(8);
     v.push_col(8);
@@ -73,7 +76,7 @@ fn a_null_in_any_indexed_column_is_outside_the_walk() {
 /// key encoder masks it.
 #[test]
 fn an_over_wide_value_is_masked_to_the_column() {
-    let schema = TestSchema::new(&[(tc::U64, false), (tc::U8, true)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U64, false), (TypeCode::U8, true)], &[0]);
     let mut v = TestView::new(2, 8);
     v.push_col(1);
     v.set_payload(0, 0, &[7]);
@@ -87,13 +90,13 @@ fn an_over_wide_value_is_masked_to_the_column() {
 /// A U128 column orders unsigned over its whole width, across more than one filter word.
 #[test]
 fn a_u128_column_orders_over_its_full_width() {
-    let schema = TestSchema::new(&[(tc::U128, false)], &[0]);
+    let schema = TestSchema::new(&[(TypeCode::U128, false)], &[0]);
     let vals: Vec<u128> = (0..130)
         .map(|i| if i % 2 == 0 { 5 } else { (i as u128) << 100 })
         .collect();
     let mut v = TestView::new(vals.len(), 16);
     for (r, x) in vals.iter().enumerate() {
-        v.set_pk_col(r, 0, &x.to_le_bytes(), tc::U128);
+        v.set_pk_col(r, 0, &x.to_le_bytes(), TypeCode::U128);
     }
     let desc = RangeDescriptor::new(&[], Cut::After(5), Cut::After(u128::MAX));
     assert_eq!(
@@ -105,7 +108,10 @@ fn a_u128_column_orders_over_its_full_width() {
 /// A walk exists only over key-ordered columns and with a range column left.
 #[test]
 fn a_malformed_walk_is_refused() {
-    let schema = TestSchema::new(&[(tc::U64, false), (tc::F64, true), (tc::U64, true)], &[0]);
+    let schema = TestSchema::new(
+        &[(TypeCode::U64, false), (TypeCode::F64, true), (TypeCode::U64, true)],
+        &[0],
+    );
     assert!(RangeMembership::new(&[1], RangeDescriptor::point(&[], 0), &schema).is_err());
     assert!(RangeMembership::new(&[2], RangeDescriptor::new(&[3], Cut::Before(0), Cut::After(9)), &schema).is_err());
 }

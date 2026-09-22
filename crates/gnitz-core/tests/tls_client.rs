@@ -259,7 +259,7 @@ fn unix_and_tls_clients_share_a_table() {
 fn wire_version_mismatch_hello_gets_status_error() {
     let srv = ServerHandle::start_tls(1);
     let mut t = ClientTransport::connect(&srv.tls_target(), None).unwrap();
-    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION.wrapping_add(1));
+    let payload = gnitz_wire::encode_hello_payload(gnitz_wire::wal::WAL_FORMAT_VERSION.wrapping_add(1));
     t.send_frame(payload.to_vec(), None).unwrap();
     let buf = t.recv_framed(None).unwrap();
     let ctrl = peek_control_block(&buf).unwrap();

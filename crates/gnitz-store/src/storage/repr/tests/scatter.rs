@@ -123,11 +123,11 @@ fn scatter_unified_sources_addresses_each_sources_own_columns() {
 /// elements and are dropped.
 #[test]
 fn route_rows_by_pk_follows_the_distribution_prefix() {
-    use crate::schema::{type_code, Placement, SchemaColumn};
+    use crate::schema::{Placement, SchemaColumn, TypeCode};
     use crate::test_support::opk_pk;
     const NW: usize = 4;
 
-    let cols = [SchemaColumn::new(type_code::U64, 0); 2];
+    let cols = [SchemaColumn::new(TypeCode::U64, false); 2];
     let by_prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
     let by_full = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 2 });
 
@@ -169,12 +169,12 @@ fn route_rows_by_pk_follows_the_distribution_prefix() {
 
 /// U64 pk + two nullable I64 payload columns; slot 1 stands for an appended one.
 fn two_nullable_payloads() -> SchemaDescriptor {
-    use crate::schema::{type_code, SchemaColumn};
+    use crate::schema::{SchemaColumn, TypeCode};
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     )

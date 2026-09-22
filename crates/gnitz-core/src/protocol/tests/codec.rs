@@ -60,7 +60,7 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
     let n = PK_LIST_MAX_COLS + 1;
     let cols: Vec<SchemaBlockCol> = (0..n)
         .map(|_| SchemaBlockCol {
-            type_code: TypeCode::U64 as u8,
+            ty: gnitz_wire::ColType::of(TypeCode::U64),
             meta: ColMeta::default(),
             name: b"k",
         })
@@ -77,7 +77,7 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
 fn an_empty_out_of_range_or_duplicate_pk_is_rejected() {
     let cols: Vec<SchemaBlockCol> = (0..3)
         .map(|_| SchemaBlockCol {
-            type_code: TypeCode::U64 as u8,
+            ty: gnitz_wire::ColType::of(TypeCode::U64),
             meta: ColMeta::default(),
             name: b"k",
         })
@@ -105,26 +105,4 @@ fn a_truncated_record_is_a_decode_error_not_a_panic() {
     for cut in [0, 8, block.len() / 2, block.len() - 1] {
         assert!(schema_from_block(&block[..cut]).is_err(), "cut at {cut}");
     }
-}
-
-// ── type_code_from_u64 error paths ──────────────────────────────────────
-
-#[test]
-fn test_unknown_type_code_zero() {
-    assert!(matches!(type_code_from_u64(0), Err(ProtocolError::UnknownTypeCode(0))));
-}
-
-#[test]
-fn test_unknown_type_code_after_last() {
-    let next = TypeCode::ALL.len() as u64 + 1;
-    assert!(!TypeCode::ALL.iter().any(|&tc| tc as u64 == next));
-    assert!(matches!(type_code_from_u64(next), Err(ProtocolError::UnknownTypeCode(n)) if n == next));
-}
-
-#[test]
-fn test_unknown_type_code_max() {
-    assert!(matches!(
-        type_code_from_u64(u64::MAX),
-        Err(ProtocolError::UnknownTypeCode(_))
-    ));
 }

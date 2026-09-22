@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::key::{compare_pk_bytes, ReindexPacker};
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     make_batch, make_batch_i64pk, make_batch_opk, make_batch_raw, make_batch_u128, make_schema_i64pk_i64,
     make_schema_u128_i64, make_schema_u64_i64, make_wide_batch, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
@@ -47,7 +47,7 @@ fn pk_routed_scatter_routes_and_claims_by_the_gate() {
     let u64_s = make_schema_u64_i64();
     let u128_s = make_schema_u128_i64();
     let i64_s = make_schema_i64pk_i64();
-    let comp_s = pk_payload_schema(&[type_code::U64; 2]);
+    let comp_s = pk_payload_schema(&[TypeCode::U64; 2]);
     let wide_s = wide_pk_3xu64_schema();
     assert!(
         comp_s.pk_indices().len() > 1 && comp_s.pk_stride() == 16,
@@ -322,9 +322,9 @@ fn check_copartition(
 fn make_join_key_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),  // col0: PK
-            SchemaColumn::new(type_code::I64, 0),  // col1: signed join key part
-            SchemaColumn::new(type_code::U128, 0), // col2: wide join key part
+            SchemaColumn::new(TypeCode::U64, false),  // col0: PK
+            SchemaColumn::new(TypeCode::I64, false),  // col1: signed join key part
+            SchemaColumn::new(TypeCode::U128, false), // col2: wide join key part
         ],
         &[0],
     )
@@ -390,8 +390,8 @@ fn promoted_single_join_key_scatter_copartitions() {
     // ---- (1) Payload key: [U64 PK, I32 payload], reindex col1 → I64. ----
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
         ],
         &[0],
     );
@@ -414,8 +414,8 @@ fn promoted_single_join_key_scatter_copartitions() {
     // ---- (2) PK key: [I32 PK, U64 payload], reindex col0 → I64. ----
     let pk_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -424,7 +424,7 @@ fn promoted_single_join_key_scatter_copartitions() {
     let mut pb = Batch::with_capacity(&pk_schema, pk_rows.len());
     for &(pk, v) in pk_rows {
         let mut opk = [0u8; 4];
-        gnitz_wire::encode_pk_column(&pk.to_le_bytes(), type_code::I32, &mut opk);
+        gnitz_wire::encode_pk_column(&pk.to_le_bytes(), TypeCode::I32, &mut opk);
         pb.extend_pk_bytes(&opk);
         pb.extend_weight(&1i64.to_le_bytes());
         pb.extend_null_bmp(&0u64.to_le_bytes());

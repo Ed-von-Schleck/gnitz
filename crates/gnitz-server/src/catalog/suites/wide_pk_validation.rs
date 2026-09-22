@@ -130,7 +130,7 @@ fn native_and_byte_point_reads_agree_narrow() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Plain narrow U64-PK table created through the normal path.
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
 

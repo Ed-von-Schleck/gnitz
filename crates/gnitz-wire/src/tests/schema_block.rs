@@ -1,9 +1,9 @@
 use super::*;
-use crate::TypeCode;
+use crate::{ColType, TypeCode};
 
 fn col(tc: TypeCode, name: &str, nullable: bool) -> SchemaBlockCol<'_> {
     SchemaBlockCol {
-        type_code: tc as u8,
+        ty: ColType::of(tc),
         meta: ColMeta { nullable, ..Default::default() },
         name: name.as_bytes(),
     }
@@ -42,19 +42,20 @@ fn roundtrips_shape_names_and_pk_order() {
     assert_eq!(sb.pk_indices(), &[1, 0]);
 }
 
-/// Every `ColMeta` field survives the record, `scale` included.
+/// Every `ColMeta` field and the column type's scale survive the record.
 #[test]
 fn column_meta_survives_the_record() {
     let mut cols = Vec::new();
     for nullable in [false, true] {
         for hidden in [false, true] {
             for serial in [false, true] {
-                // Scale 0 is every non-DECIMAL column, and `u8::MAX` fills the
-                // byte — so neither edge may bleed into a neighbour.
-                for scale in [0u8, 7, u8::MAX] {
+                // Scale 0 is every non-DECIMAL column, and `MAX_DECIMAL_SCALE`
+                // the widest a DECIMAL admits — so neither edge may bleed into
+                // a neighbour.
+                for scale in [0u8, 7, crate::decimal::MAX_DECIMAL_SCALE] {
                     cols.push(SchemaBlockCol {
-                        type_code: TypeCode::Decimal as u8,
-                        meta: ColMeta { nullable, hidden, serial, scale },
+                        ty: ColType::decimal(scale),
+                        meta: ColMeta { nullable, hidden, serial },
                         name: b"c",
                     });
                 }
@@ -120,12 +121,13 @@ fn each_column_guard_rejects_its_own_forgery() {
     // The column section opens right after `column_count`, `pk_count` and the
     // one PK index byte.
     const COL0: usize = 4 + 1 + 1;
-    let cases: [(&str, usize, u8); 2] = [
-        // No valid type code, so the decoder cannot fall back on
-        // `wire_stride`'s 8-byte default for an unknown one.
-        ("schema record: invalid type code 0", COL0, 0),
+    let cases: [(&str, usize, u8); 3] = [
+        // No valid type code.
+        ("schema record: invalid column type 0/0", COL0, 0),
         // A flags byte outside the three defined bits.
-        ("schema record: unknown column meta bits 0x8", COL0 + 1, 1 << 3),
+        ("schema record: unknown flag bits 0x08", COL0 + 1, 1 << 3),
+        // A scale on a type that carries none.
+        ("schema record: invalid column type 8/3", COL0 + 2, 3),
     ];
     for (want, off, byte) in cases {
         let mut record = simple();
@@ -174,12 +176,11 @@ fn the_record_layout_is_fixed() {
         col(TypeCode::U64, "b", false),
         col(TypeCode::I32, "a", false),
         SchemaBlockCol {
-            type_code: TypeCode::Decimal as u8,
+            ty: ColType::decimal(9),
             meta: ColMeta {
                 nullable: true,
                 hidden: true,
                 serial: true,
-                scale: 9,
             },
             name: long.as_bytes(),
         },

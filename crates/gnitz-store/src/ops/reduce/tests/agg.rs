@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::Batch;
 use gnitz_wire::AggDescriptor;
 
@@ -7,8 +7,8 @@ use gnitz_wire::AggDescriptor;
 fn f64_batch(val: f64) -> Batch {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
         ],
         &[0],
     );
@@ -24,8 +24,8 @@ fn f64_batch(val: f64) -> Batch {
 fn f64_acc(agg_op: AggFunc) -> Accumulator {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
         ],
         &[0],
     );
@@ -71,19 +71,19 @@ fn max_uses_total_order_for_nan() {
 fn bulk_step_matches_step_from_batch() {
     const N: usize = 97;
     let tcs = [
-        type_code::U8,
-        type_code::I8,
-        type_code::U16,
-        type_code::I16,
-        type_code::U32,
-        type_code::I32,
-        type_code::U64,
-        type_code::I64,
-        type_code::F32,
-        type_code::F64,
+        TypeCode::U8,
+        TypeCode::I8,
+        TypeCode::U16,
+        TypeCode::I16,
+        TypeCode::U32,
+        TypeCode::I32,
+        TypeCode::U64,
+        TypeCode::I64,
+        TypeCode::F32,
+        TypeCode::F64,
     ];
-    let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
-    cols.extend(tcs.iter().map(|&tc| SchemaColumn::new(tc, 1)));
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend(tcs.iter().map(|&tc| SchemaColumn::new(tc, true)));
     let schema = SchemaDescriptor::new(&cols, &[0]);
     let mut rng = crate::test_rng::Rng::new(0x5eed);
     let mut b = Batch::with_capacity(&schema, N);
@@ -95,8 +95,8 @@ fn bulk_step_matches_step_from_batch() {
         for (pi, &tc) in tcs.iter().enumerate() {
             let v = rng.next_u64();
             let bytes = match tc {
-                type_code::F32 => ((v as i32) as f32 / 7.0).to_le_bytes().to_vec(),
-                type_code::F64 => ((v as i64) as f64 / 7.0).to_le_bytes().to_vec(),
+                TypeCode::F32 => ((v as i32) as f32 / 7.0).to_le_bytes().to_vec(),
+                TypeCode::F64 => ((v as i64) as f64 / 7.0).to_le_bytes().to_vec(),
                 _ => v.to_le_bytes()[..schema.columns[pi + 1].size() as usize].to_vec(),
             };
             b.extend_col(pi, &bytes);

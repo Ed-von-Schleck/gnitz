@@ -78,7 +78,7 @@ pub fn canonical_rows(batch: &ZSetBatch) -> Vec<(Row, i64)> {
                 }
                 let w = col.stride();
                 let cell = &col.bytes[row * w..(row + 1) * w];
-                Some(if gnitz_wire::is_german_string(col.tc() as u8) {
+                Some(if col.tc().is_german_string() {
                     gnitz_wire::german_string_content(cell, &batch.blob).to_vec()
                 } else {
                     cell.to_vec()

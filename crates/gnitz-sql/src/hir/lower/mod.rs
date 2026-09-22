@@ -546,8 +546,8 @@ impl JoinSide {
 
     /// The type codes of the kept payload columns — what `null_extend` needs to
     /// synthesize this side's NULL region.
-    pub(crate) fn kept_type_codes(&self) -> Vec<u8> {
-        self.coldefs.iter().map(|c| c.type_code as u8).collect()
+    pub(crate) fn kept_type_codes(&self) -> Vec<gnitz_core::TypeCode> {
+        self.coldefs.iter().map(|c| c.ty.tc).collect()
     }
 }
 

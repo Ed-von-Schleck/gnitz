@@ -65,7 +65,7 @@ fn passthrough_all(partial: &Schema) -> Vec<(BoundExpr, ColumnDef)> {
             let c = &partial.columns[ci];
             (
                 BExpr::ColRef(ci),
-                ColumnDef::new(format!("c{ci}"), c.type_code, c.is_nullable),
+                ColumnDef::new(format!("c{ci}"), c.ty.tc, c.is_nullable),
             )
         })
         .collect()

@@ -9,7 +9,7 @@ use crate::catalog::schema_block::encode_named_schema_block;
 use crate::test_support::{arb_type_code, named_col_defs};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
-use gnitz_wire::{is_pk_eligible, type_code, MAX_PK_COLUMNS};
+use gnitz_wire::{TypeCode, MAX_PK_COLUMNS};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -42,12 +42,12 @@ fn arb_schema(max_pk: usize) -> impl Strategy<Value = SchemaDescriptor> {
                     let is_pk = pk_indices.contains(&(i as u32));
                     // PK columns must be PK-eligible and non-nullable; remap
                     // ineligible draws to U64 so `new()` accepts the schema.
-                    let tc = if is_pk && !is_pk_eligible(types[i]) {
-                        type_code::U64
+                    let tc = if is_pk && !types[i].is_pk_eligible() {
+                        TypeCode::U64
                     } else {
                         types[i]
                     };
-                    let nullable = if is_pk { 0 } else { nullables[i] as u8 };
+                    let nullable = !is_pk && nullables[i];
                     SchemaColumn::new(tc, nullable)
                 })
                 .collect();
@@ -82,16 +82,11 @@ fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<()
 
 /// SchemaDescriptor → owned client Schema, with synthetic `c{i}` names.
 fn descriptor_to_client_schema(sd: &SchemaDescriptor) -> gnitz_core::protocol::types::Schema {
-    use gnitz_core::protocol::types::{ColumnDef, Schema, TypeCode};
+    use gnitz_core::protocol::types::{ColumnDef, Schema};
     let columns = (0..sd.num_columns())
         .map(|i| {
             let col = &sd.columns[i];
-            // arb_schema only emits valid codes, so unwrap is total.
-            ColumnDef::new(
-                format!("c{i}"),
-                TypeCode::try_from_u8(col.type_code).unwrap(),
-                col.nullable != 0,
-            )
+            ColumnDef::new(format!("c{i}"), col.type_code, col.nullable)
         })
         .collect();
     let pk_cols = sd.pk_indices().to_vec();

@@ -88,7 +88,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
 
     let tid = engine.allocate_ids(1).unwrap();
     // STRING column is not pk-eligible.
-    let cols = vec![col_def("label", type_code::STRING)];
+    let cols = vec![col_def("label", TypeCode::String)];
     engine.write_column_records(tid, &cols).unwrap();
 
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badpktable");
@@ -113,7 +113,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     let dir = temp_dir("atomicity_dup_name");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let orig_tid = engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
@@ -159,8 +159,8 @@ fn test_table_tab_col_contiguity_gap_rejected() {
 
     let tid = engine.allocate_ids(1).unwrap();
     // Insert columns at indices 0 and 2 — index 1 is absent (gap).
-    write_col_at_index(&mut engine, tid, 0, &col_def("id", type_code::U64)).unwrap();
-    write_col_at_index(&mut engine, tid, 2, &col_def("gapped", type_code::U64)).unwrap();
+    write_col_at_index(&mut engine, tid, 0, &col_def("id", TypeCode::U64)).unwrap();
+    write_col_at_index(&mut engine, tid, 2, &col_def("gapped", TypeCode::U64)).unwrap();
 
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "gaptable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
@@ -212,7 +212,7 @@ fn test_view_tab_too_many_cols_rejected() {
     let vid = engine.allocate_ids(1).unwrap();
     // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
     for i in 0..(gnitz_wire::MAX_COLUMNS as i64 + 1) {
-        write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), type_code::U64)).unwrap();
+        write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), TypeCode::U64)).unwrap();
     }
     let batch = build_view_tab_row(vid, "wideview");
     let err = engine
@@ -277,14 +277,14 @@ fn test_idx_tab_view_owner_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     engine
-        .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
+        .create_table("public.base", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
 
     // Register a view via the raw system-table path (no circuit needed — the
     // precheck must fire before any backfill).
     let vid = engine.allocate_ids(1).unwrap();
     engine
-        .write_column_records(vid, &[col_def("id", type_code::U64)])
+        .write_column_records(vid, &[col_def("id", TypeCode::U64)])
         .unwrap();
     let batch = build_view_tab_row(vid, "vowner");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
@@ -335,9 +335,9 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![
-        col_def("id", type_code::U64),
-        col_def("val", type_code::I64),
-        col_def("ts", type_code::I64),
+        col_def("id", TypeCode::U64),
+        col_def("val", TypeCode::I64),
+        col_def("ts", TypeCode::I64),
     ];
     let tid = engine.create_table("public.idxtest", &cols, &[0]).unwrap();
     let orig_idx_id = engine.create_index("public.idxtest", &["val"], false).unwrap();
@@ -388,7 +388,7 @@ fn test_next_id_advances_on_index_register() {
     let dir = temp_dir("atomicity_idx_seq");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.seqsync", &cols, &[0]).unwrap();
 
     // An index id far ahead of the local counter.
@@ -446,7 +446,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     // Table T (in schema `owner`) with a dependent view V → dep_map[T] = [V].
     engine.create_schema("owner").unwrap();
     let tid = engine
-        .create_table("owner.t", &[col_def("id", type_code::U64)], &[0])
+        .create_table("owner.t", &[col_def("id", TypeCode::U64)], &[0])
         .unwrap();
     let vid = engine.allocate_ids(1).unwrap();
     write_identity_circuit(&mut engine, vid, tid, gnitz_wire::ReadBound::None);
@@ -525,7 +525,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let dir = temp_dir("ddl_txn_precheck_ghost");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     // Occupy the qualified name "public.dupname".
     engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
@@ -575,7 +575,7 @@ fn ddl_txn_hook_failure_is_compensated() {
     let dir = temp_dir("ddl_txn_hook_rollback");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
     let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
@@ -632,7 +632,7 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let (a, b) = (engine.allocate_ids(1).unwrap(), engine.allocate_ids(1).unwrap());
     engine.write_column_records(a, &cols).unwrap();
     engine.write_column_records(b, &cols).unwrap();
@@ -667,7 +667,7 @@ fn sequence_advances_leave_no_negative_ghost() {
     // First use of every master scalar: the next id, the checkpoint generation
     // and the topology word are all seeded on demand.
     engine.create_schema("s").unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     engine.create_table("s.t", &cols, &[0]).unwrap();
     engine.create_index("s.t", &["val"], false).unwrap();
     engine.record_topology(1).unwrap();
@@ -694,7 +694,7 @@ fn sequence_advances_leave_no_negative_ghost() {
 
 #[test]
 fn precheck_rejected_create_index_writes_no_ghost() {
-    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("name", TypeCode::String)];
     let (mut engine, _tid, dir) = table_fixture("atomicity_idx_precheck_ghost", &cols);
     let init_rows = count_records(engine.sys_relation(SysFamily::Index).cursor());
 
@@ -728,7 +728,7 @@ fn precheck_rejected_create_index_writes_no_ghost() {
 
 #[test]
 fn compensating_a_drop_keeps_the_restored_relation_directory() {
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("compensate_drop_keeps_dir", &cols);
     let reldir = engine.registry.relation_or_err(tid).unwrap().directory().to_string();
     // The fixture's own CREATE is a committed DDL; only the bundle below is the
@@ -781,7 +781,7 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
 
 #[test]
 fn zero_weight_catalog_row_rejected() {
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     let (mut engine, tid, dir) = table_fixture("zero_weight_row", &cols);
     let sid = engine.schema_id("public").unwrap();
 
@@ -820,7 +820,7 @@ fn compensated_create_table_leaves_no_trace() {
     let dir = temp_dir("compensated_create_table");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let parent = engine
-        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
+        .create_table("public.parent", &[col_def("pid", TypeCode::U64)], &[0])
         .unwrap();
     let _ = engine.drain_pending_broadcasts();
     let counts = |engine: &CatalogEngine| -> Vec<(usize, usize)> {
@@ -839,9 +839,9 @@ fn compensated_create_table_leaves_no_trace() {
     let before = counts(&engine);
 
     let cols = vec![
-        col_def("id", type_code::U64),
-        fk_def("pid", type_code::U64, parent, 0),
-        col_def("val", type_code::I64),
+        col_def("id", TypeCode::U64),
+        fk_def("pid", TypeCode::U64, parent, 0),
+        col_def("val", TypeCode::I64),
     ];
     for (family, batch) in [
         (SysFamily::Column, col_tab_batch(tid, &cols, 1)),

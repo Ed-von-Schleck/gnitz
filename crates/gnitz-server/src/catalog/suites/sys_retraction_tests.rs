@@ -65,7 +65,7 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
     // the net check the live schema's name is unmapped.
     let dir = temp_dir("sysretract_stale_schema");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
 
     engine.create_schema("s").unwrap();
     let old_sid = engine.schema_id("s").expect("the schema exists");
@@ -103,7 +103,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
     // members of the retracted (empty) id, not of the named schema.
     let dir = temp_dir("sysretract_schema_mismatch");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
 
     engine.create_schema("a").unwrap();
     engine.create_schema("b").unwrap();
@@ -139,7 +139,7 @@ fn create_then_drop_unique_index_cancels_to_empty() {
     let dir = temp_dir("idx_create_drop_cancels");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("pk", TypeCode::U64), col_def("val", TypeCode::I64)];
     engine.create_table("public.cancels", &cols, &[0]).unwrap();
     let idx_id = engine.create_index("public.cancels", &["val"], true).unwrap();
     assert_eq!(
@@ -164,7 +164,7 @@ fn create_then_drop_unique_index_cancels_to_empty() {
 fn stale_index_retraction_leaves_no_ghost_row() {
     let (mut engine, _tid, dir) = table_fixture(
         "sysretract_stale_index",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let idx = engine.create_index("public.t", &["val"], false).unwrap();
     let row = live_index_row(&engine, idx);
@@ -194,7 +194,7 @@ fn stale_index_retraction_after_recreate_keeps_the_live_index_nameable() {
     // and freeing that name for a third row.
     let (mut engine, _tid, dir) = table_fixture(
         "sysretract_index_recreate",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let idx1 = engine.create_index("public.t", &["val"], false).unwrap();
     let row1 = live_index_row(&engine, idx1);
@@ -230,9 +230,9 @@ fn index_retraction_under_another_indexs_name_rejected() {
     let (mut engine, _tid, dir) = table_fixture(
         "sysretract_index_mismatch",
         &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
+            col_def("id", TypeCode::U64),
+            col_def("a", TypeCode::U64),
+            col_def("b", TypeCode::U64),
         ],
     );
     let i1 = engine.create_index("public.t", &["a"], false).unwrap();
@@ -267,7 +267,7 @@ fn duplicate_live_head_rejected_for_index_and_schema() {
     // re-ingested `+1` from leaving two live heads under one PK.
     let (mut engine, _tid, dir) = table_fixture(
         "sysretract_dup_head",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
+        &[col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)],
     );
     let idx = engine.create_index("public.t", &["val"], false).unwrap();
     let row = live_index_row(&engine, idx);

@@ -4,7 +4,7 @@ use crate::catalog::CatalogEngine;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder};
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 use super::MasterDispatcher;
 use crate::runtime::sal::{SalLog, SalWriter, ANCHOR_BYTES};
@@ -20,7 +20,7 @@ pub(super) fn span_uint(v: u128, width: usize) -> PkBuf {
 
 /// PK U64 at index 0, one **nullable** payload U64 at index 1.
 pub(super) fn two_col_schema() -> SchemaDescriptor {
-    crate::test_support::u64_pk_schema(SchemaColumn::new(type_code::U64, 1))
+    crate::test_support::u64_pk_schema(SchemaColumn::new(TypeCode::U64, true))
 }
 
 /// Rows are `(pk, weight, payload)`; `None` writes a NULL payload cell.

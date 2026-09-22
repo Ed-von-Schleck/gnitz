@@ -64,11 +64,11 @@ fn cell(label: &str, scanned: u64, mut f: impl FnMut() -> Rc<Batch>) {
 /// is the contiguous-run selectivity dial, `cf = id % 2` the fragmenting one.
 fn numeric_fixture(name: &str, n: u64) -> (CatalogEngine, i64) {
     let cols = vec![
-        col_def("id", type_code::U64),
-        col_def("c0", type_code::I64),
-        col_def("cf", type_code::I64),
-        col_def("c2", type_code::I64),
-        col_def("c3", type_code::I64),
+        col_def("id", TypeCode::U64),
+        col_def("c0", TypeCode::I64),
+        col_def("cf", TypeCode::I64),
+        col_def("c2", TypeCode::I64),
+        col_def("c3", TypeCode::I64),
     ];
     ingest_fixture(name, &cols, n, INGEST_ROUNDS, |bb, id| {
         bb.put_u64(id % 100);
@@ -80,8 +80,8 @@ fn numeric_fixture(name: &str, n: u64) -> (CatalogEngine, i64) {
 
 /// `id U64 PK` + `n_payload` I64 payload columns.
 fn i64_reply(n_payload: usize) -> SchemaDescriptor {
-    let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
-    cols.extend((0..n_payload).map(|_| SchemaColumn::new(type_code::I64, 0)));
+    let mut cols = vec![SchemaColumn::new(TypeCode::U64, false)];
+    cols.extend((0..n_payload).map(|_| SchemaColumn::new(TypeCode::I64, false)));
     SchemaDescriptor::new(&cols, &[0])
 }
 
@@ -171,10 +171,10 @@ fn scan_spec_sinks_bench() {
     // per aggregate.
     let fold_reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -207,9 +207,9 @@ fn scan_spec_sinks_bench() {
     };
     let many_reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
         ],
         &[0],
     );
@@ -226,9 +226,9 @@ fn scan_spec_sinks_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn scan_spec_string_gather_bench() {
     let cols = vec![
-        col_def("id", type_code::U64),
-        col_def("s", type_code::STRING),
-        col_def("cf", type_code::I64),
+        col_def("id", TypeCode::U64),
+        col_def("s", TypeCode::String),
+        col_def("cf", TypeCode::I64),
     ];
     let (mut e, tid) = ingest_fixture("ss_bench_str", &cols, STRING_ROWS, INGEST_ROUNDS, |bb, id| {
         match id.is_multiple_of(2) {
@@ -240,9 +240,9 @@ fn scan_spec_string_gather_bench() {
 
     let reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -278,9 +278,9 @@ fn scan_spec_global_sum_bench() {
     };
     let reply = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );

@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::key::compare_pk_bytes;
-use crate::schema::{type_code, SchemaColumn, SchemaFacts};
+use crate::schema::{SchemaColumn, SchemaFacts, TypeCode};
 use crate::storage::Batch;
 use crate::test_support::{batch_of_pk_bytes, pk_payload_schema, wide_pk_3xu64_schema};
 
@@ -17,8 +17,8 @@ use crate::test_support::{batch_of_pk_bytes, pk_payload_schema, wide_pk_3xu64_sc
 fn single_col_group_key_is_the_opk_image_from_either_side() {
     // The group key of the value `le` held in column 1 of `[U64 pk, <tc>]`,
     // with column 1 either a second PK column or the sole payload column.
-    let key = |tc: u8, le: &[u8], col1_is_pk: bool| -> u128 {
-        let cols = [SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)];
+    let key = |tc: TypeCode, le: &[u8], col1_is_pk: bool| -> u128 {
+        let cols = [SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)];
         let schema = SchemaDescriptor::new(&cols, if col1_is_pk { &[0, 1] } else { &[0] });
         let mut b = Batch::with_capacity(&schema, 1);
         if col1_is_pk {
@@ -38,17 +38,17 @@ fn single_col_group_key_is_the_opk_image_from_either_side() {
     };
 
     for (tc, vals) in [
-        (type_code::I32, vec![1i128, -1, 100, i32::MIN as i128, i32::MAX as i128]),
-        (type_code::I64, vec![0, -1, i64::MIN as i128, i64::MAX as i128]),
-        (type_code::U16, vec![0, 1, 0xBEEF, u16::MAX as i128]),
-        (type_code::U64, vec![0, 1, u64::MAX as i128]),
+        (TypeCode::I32, vec![1i128, -1, 100, i32::MIN as i128, i32::MAX as i128]),
+        (TypeCode::I64, vec![0, -1, i64::MIN as i128, i64::MAX as i128]),
+        (TypeCode::U16, vec![0, 1, 0xBEEF, u16::MAX as i128]),
+        (TypeCode::U64, vec![0, 1, u64::MAX as i128]),
     ] {
-        let width = SchemaColumn::new(tc, 0).size() as usize;
+        let width = SchemaColumn::new(tc, false).size() as usize;
         for v in vals {
             let le = &(v as u128).to_le_bytes()[..width];
             // Signed columns are sign-flipped into the OPK image; unsigned ones
             // pass through, so the OPK image is the native value.
-            let want = if gnitz_wire::is_signed_int(tc) {
+            let want = if tc.is_signed_int() {
                 (v + (1i128 << (8 * width - 1))) as u128
             } else {
                 v as u128
@@ -63,14 +63,17 @@ fn single_col_group_key_is_the_opk_image_from_either_side() {
 /// `-0.0` into two groups.
 #[test]
 fn group_key_refuses_a_float_column() {
-    for tc in [type_code::F32, type_code::F64] {
-        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0]);
+    for tc in [TypeCode::F32, TypeCode::F64] {
+        let schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
+            &[0],
+        );
         let err = GroupKeyCols::new(&schema, &[1])
             .err()
             .expect("a float group column is refused");
         assert!(err.to_string().contains("float"), "{err}");
     }
-    let schema = pk_payload_schema(&[type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64]);
     assert!(
         GroupKeyCols::new(&schema, &[2]).is_err(),
         "an out-of-range column is refused"
@@ -122,7 +125,7 @@ fn pk_runs_u64_arm_full_and_subwidth() {
     // stride 8 (u64 arm): high-bit / signed-OPK byte shapes must order by raw
     // unsigned byte compare (the OPK sign-flip lives in the bytes).
     assert_canonical_order(
-        &pk_payload_schema(&[type_code::U64]),
+        &pk_payload_schema(&[TypeCode::U64]),
         &[
             vec![0x80, 0, 0, 0, 0, 0, 0, 1],
             vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd],
@@ -133,7 +136,7 @@ fn pk_runs_u64_arm_full_and_subwidth() {
     );
     // stride 4 (u64 arm, sub-width): left-align into the high bytes preserves order.
     assert_canonical_order(
-        &pk_payload_schema(&[type_code::U32]),
+        &pk_payload_schema(&[TypeCode::U32]),
         &[
             vec![0xff, 0, 0, 1],
             vec![0, 0, 0, 9],
@@ -152,7 +155,7 @@ fn pk_runs_u128_arm() {
         v
     };
     assert_canonical_order(
-        &pk_payload_schema(&[type_code::U128]),
+        &pk_payload_schema(&[TypeCode::U128]),
         &[mk(0xff, 2), mk(0, 9), mk(0x80, 1), mk(0, 1), mk(0xff, 1)],
     );
 }
@@ -191,7 +194,7 @@ fn pk_runs_u128x2_arm_with_leading16_collision() {
 #[test]
 fn pk_runs_wide_arm() {
     // stride 40 (> 32): the byte-slice fallback, whose `Ord` is `compare_pk_bytes`.
-    let schema = pk_payload_schema(&[type_code::U64; 5]);
+    let schema = pk_payload_schema(&[TypeCode::U64; 5]);
     let mk = |lead: u8, tail: u8| {
         let mut v = vec![0u8; 40];
         v[0] = lead;
@@ -221,7 +224,7 @@ fn sorted_runs_break_ties_on_source_index() {
 /// order: the runs visit positions in place and end where the column changes.
 #[test]
 fn leading_pk_column_runs_in_place_over_a_consolidated_batch() {
-    let schema = pk_payload_schema(&[type_code::U64, type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64, TypeCode::U64]);
     let pk = |a: u64, b: u64| [a.to_be_bytes(), b.to_be_bytes()].concat();
     let raw = batch_of_pk_bytes(&schema, &[pk(1, 1), pk(1, 5), pk(2, 0), pk(7, 3), pk(7, 4), pk(7, 9)]);
     let mut consolidated = raw.clone_batch();
@@ -237,7 +240,7 @@ fn leading_pk_column_runs_in_place_over_a_consolidated_batch() {
 /// The empty group set is one run over the whole batch, in place.
 #[test]
 fn empty_group_set_is_one_run() {
-    let schema = pk_payload_schema(&[type_code::U64]);
+    let schema = pk_payload_schema(&[TypeCode::U64]);
     let batch = batch_of_pk_bytes(&schema, &[3u64.to_be_bytes(), 1u64.to_be_bytes(), 2u64.to_be_bytes()]);
     let runs = out_key(&schema, &[], ReduceOutKey::SyntheticFold).runs(&batch);
     assert_eq!(visit_order(&runs, 3), vec![0, 1, 2]);
@@ -271,8 +274,8 @@ fn reduce_sort_argsort_bench() {
     let n = 1_000_000usize;
     for &stride in &[8usize, 16, 24] {
         let schema = match stride {
-            8 => pk_payload_schema(&[type_code::U64]),
-            16 => pk_payload_schema(&[type_code::U128]),
+            8 => pk_payload_schema(&[TypeCode::U64]),
+            16 => pk_payload_schema(&[TypeCode::U128]),
             _ => wide_pk_3xu64_schema(),
         };
         let batch = batch_of_pk_bytes(&schema, &bench_rows(n, stride));
@@ -297,8 +300,8 @@ fn reduce_sort_argsort_bench() {
 fn reduce_sort_argsort_delta_bench() {
     let n = 1_000_000usize;
     // (label, schema, group cols) — the three arms.
-    let narrow = pk_payload_schema(&[type_code::U64]);
-    let wide = pk_payload_schema(&[type_code::U128]);
+    let narrow = pk_payload_schema(&[TypeCode::U64]);
+    let wide = pk_payload_schema(&[TypeCode::U128]);
     let multi = wide_pk_3xu64_schema();
     for (label, schema, group_cols) in [
         ("canonical u64", &narrow, &[0u32][..]),

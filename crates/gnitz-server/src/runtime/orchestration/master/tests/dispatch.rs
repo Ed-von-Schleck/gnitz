@@ -118,7 +118,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         user_seq = engine
             .create_table(
                 "public.t",
-                &[crate::test_support::col_def("id", gnitz_wire::type_code::U64)],
+                &[crate::test_support::col_def("id", gnitz_wire::TypeCode::U64)],
                 &[0],
             )
             .unwrap();
@@ -199,7 +199,7 @@ fn read_route_reaches_the_owners_a_bound_names() {
     use gnitz_wire::{Cut, PkKeys, RangeDescriptor, ReadBound, ReadSpec};
 
     const NW: usize = 4;
-    let keyed = crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U64]);
+    let keyed = crate::test_support::pk_only_schema(&[gnitz_wire::TypeCode::U64]);
     let block = crate::catalog::encode_schema_block(&keyed);
     let key = |k: u64| k.to_be_bytes();
     let set_blob = |keys: &[u64]| {
@@ -263,7 +263,7 @@ fn read_route_reaches_the_owners_a_bound_names() {
         WorkerSet::ALL,
         "Local"
     );
-    let wide = crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U128]);
+    let wide = crate::test_support::pk_only_schema(&[gnitz_wire::TypeCode::U128]);
     assert_eq!(
         route_read(&wide, Some(&set_blob(&[a, b])), NW).set,
         WorkerSet::ALL,

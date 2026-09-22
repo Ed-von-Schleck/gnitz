@@ -241,8 +241,7 @@ impl CatalogEngine {
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as i64;
-            let (owner_id, cols, props) =
-                read_idx_tab_row(batch, i).map_err(|rule| format!("index {idx_id}: column list {rule}"))?;
+            let (owner_id, cols, props) = read_idx_tab_row(batch, i).map_err(|e| format!("index {idx_id}: {e}"))?;
             if batch.get_weight(i) > 0 {
                 self.registry
                     .add_index(owner_id, idx_id, cols.as_slice(), props.is_unique)?;

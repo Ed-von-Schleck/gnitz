@@ -4,19 +4,18 @@
 //! (gnitz-server) must agree on: the constants and codecs, the typed forms of
 //! the wire payloads (`OpNode`, `MapKind`, `IndexBound`, `ReadSpec`), and the
 //! semantic rules both sides compute with (`agg_output_type`,
-//! `raw_output_nullable`, `join_key_common_type`,
-//! `is_natural_reduce_key`, `worker_for_key`). It is the only common ancestor of
-//! gnitz-sql, gnitz-store and gnitz-core, so a rule that lands anywhere else can
-//! drift.
+//! `raw_output_nullable`, `TypeCode::join_key_common_type`,
+//! `ReduceOutKey::for_group_cols`, `worker_for_key`). It is the lowest crate
+//! every consumer of a rule links, so a rule that lands anywhere else can drift.
 //!
 //! So this is the shared **model**, not only a byte format: a rule both sides
 //! compute belongs here even when it crosses no wire, as `ReduceOutKey` does.
 //!
-//! The crate is organized into topic modules, and most items are re-exported
-//! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which
-//! module a symbol lives in. `control`, `region`, `schema_block`, `sys_rows`,
-//! `txn_frame` and `wal` stay named modules and are referenced by path
-//! (`gnitz_wire::wal::WalBlock`).
+//! The crate is organized into topic modules under one export rule: a private
+//! module is glob-re-exported flat at the crate root (`gnitz_wire::FOO`), so
+//! callers need not track which module a symbol lives in; a module whose item
+//! names read relative to the module is public and referenced by path
+//! (`gnitz_wire::wal::WalBlock`). No item is reachable at two paths.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -31,11 +30,6 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 /// `ALL`, `as_wire` and `from_wire` are all generated from the one variant list,
 /// so a decode table cannot disagree with the discriminants it mirrors and a new
 /// variant is covered without a second edit.
-///
-/// `TypeCode` stays hand-written: it carries extra per-variant data
-/// (`wire_name`), and its `ALL` is a fixed-size array — the shape `gnitz-py`
-/// builds its `TypeCode` IntEnum from — where this macro emits a slice. Moving
-/// it would rewrite call sites in three other crates to buy nothing.
 #[macro_export]
 macro_rules! wire_enum {
     (
@@ -93,6 +87,7 @@ mod handshake;
 mod pk;
 mod range;
 mod read_spec;
+mod region;
 mod rel_descriptor;
 mod types;
 mod uuid;
@@ -100,7 +95,6 @@ mod xxh;
 
 pub mod control;
 pub mod decimal;
-pub mod region;
 pub mod schema_block;
 pub mod sys_rows;
 pub mod txn_frame;
@@ -108,8 +102,7 @@ pub mod wal;
 
 pub use catalog::*;
 pub use circuit::*;
-// The cursor itself, for the one payload this crate frames but never reads:
-// `gnitz-expr`'s program blob.
+// The cursor itself, for the payloads other crates encode through it.
 pub use codec::{Reader, Writer};
 pub use deframe::*;
 pub use flags::*;
@@ -118,17 +111,11 @@ pub use handshake::*;
 pub use pk::*;
 pub use range::*;
 pub use read_spec::*;
+pub use region::*;
 pub use rel_descriptor::*;
 pub use types::*;
 pub use uuid::*;
 pub use xxh::*;
-// Flat-export what production reaches for pervasively; the framer items and the
-// rest of the header offsets stay module-qualified.
-pub use region::{
-    all_payload_null_mask, first_not_null_violation, merge_null_words, null_word_at, null_word_get, null_word_set,
-    MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
-};
-pub use wal::{WAL_FORMAT_VERSION, WAL_OFF_TID};
 
 // ---------------------------------------------------------------------------
 // Low-level byte primitives.
@@ -147,13 +134,7 @@ pub use wal::{WAL_FORMAT_VERSION, WAL_OFF_TID};
 // items below do not restate this.
 // ---------------------------------------------------------------------------
 
-/// Align `n` up to an 8-byte boundary.
 #[inline(always)]
-pub const fn align8(n: usize) -> usize {
-    (n + 7) & !7
-}
-
-#[inline]
 pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
@@ -168,23 +149,24 @@ pub fn read_i64_le(buf: &[u8], off: usize) -> i64 {
     i64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
 
-/// Padding-free little-endian scalars a region may be reinterpreted as. A sealed
-/// bound rather than `T: Copy`, which also admits padded types whose padding
-/// bytes are never initialized — reading those as `u8` is UB, and a safe fn must
-/// not carry an unenforced precondition.
-pub trait LeScalar: Copy {}
-macro_rules! le_scalar {
-    ($($t:ty),*) => { $(impl LeScalar for $t {})* };
+mod sealed {
+    pub trait Sealed {}
 }
-le_scalar!(u8, i8, u16, i16, u32, i32, u64, i64, u128, i128);
+
+/// Padding-free little-endian scalars whose every byte pattern is a valid
+/// value — the types a region may be reinterpreted as. Sealed: a padded type's
+/// padding bytes are never initialized, reading them as `u8` is UB, and a safe
+/// fn must not carry an unenforced precondition.
+pub trait LeScalar: Copy + sealed::Sealed {}
+macro_rules! le_scalar {
+    ($($t:ty),*) => { $(impl sealed::Sealed for $t {} impl LeScalar for $t {})* };
+}
+le_scalar!(u32, u64, i64);
 
 /// Reinterpret a `&[T]` of LE scalars as the region bytes it already is. On the
 /// little-endian target the native layout *is* the wire/shard layout, so this is
-/// the zero-copy way to hand a typed column (weights, null words, `u128` cells)
-/// to the byte-oriented region APIs.
-/// `#[inline(always)]`: `gnitz-wire` has no dev opt-level override, and the
-/// per-morsel callers in gnitz-expr are themselves `#[inline(always)]` for
-/// opt-0 consumers, where only the always-inline pass runs.
+/// the zero-copy way to hand a typed column (weights, null words) to the
+/// byte-oriented region APIs.
 #[inline(always)]
 pub fn as_le_bytes<T: LeScalar>(v: &[T]) -> &[u8] {
     // SAFETY: `size_of_val(v)` initialized bytes borrowed from `v`, consumed as
@@ -202,8 +184,7 @@ pub fn as_le_bytes_mut<T: LeScalar>(v: &mut [T]) -> &mut [u8] {
 
 /// Read a whole 1/2/4/8-byte little-endian **signed** cell, sign-extended to
 /// i64 — the native-LE payload/decoded-PK read. `bytes.len()` IS the column
-/// width. Sibling of [`read_unsigned_exact`]; the two are the one pair every
-/// fixed-int value read goes through.
+/// width. Sibling of [`read_unsigned_exact`].
 #[inline(always)]
 pub fn read_signed_exact(bytes: &[u8]) -> i64 {
     match bytes.len() {
@@ -211,9 +192,6 @@ pub fn read_signed_exact(bytes: &[u8]) -> i64 {
         2 => i16::from_le_bytes(bytes.try_into().unwrap()) as i64,
         4 => i32::from_le_bytes(bytes.try_into().unwrap()) as i64,
         8 => i64::from_le_bytes(bytes.try_into().unwrap()),
-        // Static message on purpose: this body is `#[inline(always)]` and lands
-        // at every per-row read site, and a formatted one duplicates its
-        // `Arguments` block into each.
         _ => unreachable!("read_signed_exact: unexpected column width"),
     }
 }
@@ -235,7 +213,7 @@ pub fn read_unsigned_exact(bytes: &[u8]) -> u64 {
 /// undefined, so `n >= 64` answers all-ones directly. The one place that guard
 /// lives, whatever the bits mean — a caller whose `n` is provably below 64 needs
 /// no guard and says so where it proves it.
-#[inline]
+#[inline(always)]
 pub const fn low_bits_mask(n: usize) -> u64 {
     if n < 64 {
         (1u64 << n) - 1
@@ -244,14 +222,13 @@ pub const fn low_bits_mask(n: usize) -> u64 {
     }
 }
 
-/// Yields the set bit positions of a mask, lowest first — the iterator form of
-/// [`low_bits_mask`]'s bits.
+/// Yields the set bit positions of a mask, lowest first.
 pub struct BitIter(pub u64);
 
 impl Iterator for BitIter {
     type Item = usize;
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<usize> {
         if self.0 == 0 {
             return None;
@@ -262,7 +239,7 @@ impl Iterator for BitIter {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
 }

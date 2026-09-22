@@ -142,10 +142,10 @@ fn fixture_b_batch() -> ZSetBatch {
 
 /// Fixture A's PK columns as the harness wants them, at their PK-list
 /// offsets: ci3 (I64) first, ci0 (U32) second.
-fn a_pk_expect() -> [(Vec<u128>, u8, usize); 2] {
+fn a_pk_expect() -> [(Vec<u128>, TypeCode, usize); 2] {
     [
-        (PK3.iter().map(|&v| v as u128).collect(), TypeCode::I64 as u8, 0),
-        (PK0.iter().map(|&v| v as u128).collect(), TypeCode::U32 as u8, 8),
+        (PK3.iter().map(|&v| v as u128).collect(), TypeCode::I64, 0),
+        (PK0.iter().map(|&v| v as u128).collect(), TypeCode::U32, 8),
     ]
 }
 
@@ -317,7 +317,7 @@ fn the_region_list_rejects_a_region_whose_length_contradicts_its_type() {
     // The region list's own guard, for a batch that never went through
     // `ZSetBatch::validate` — which states the same rule for the push path.
     batch.payload[2].bytes.truncate(16);
-    batch.regions(&mut gnitz_wire::region::Regions::new());
+    batch.regions(&mut gnitz_wire::Regions::new());
 }
 
 // ── The encode path shares the builder ───────────────────────────────────

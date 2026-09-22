@@ -2,7 +2,7 @@ use super::super::batch::REG_PK;
 use super::super::layout::ENCODING_CONSTANT;
 use super::super::shard_file::region_dir;
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{
     make_batch_u128, make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64,
@@ -18,7 +18,7 @@ fn make_batch(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
 
 /// PK = (col0:U64, col1:U64); payload = I64. Stored first-column-major.
 fn make_schema_compound_u64() -> SchemaDescriptor {
-    pk_payload_schema(&[type_code::U64, type_code::U64])
+    pk_payload_schema(&[TypeCode::U64, TypeCode::U64])
 }
 
 /// OPK bytes of a `(U64, U64)` compound key. Encoded through the production
@@ -512,7 +512,7 @@ fn wide_pk_prefix_collision_not_consolidated() {
 /// Zero-padding the suffix (the bug) decodes to 0 and skips negatives.
 #[test]
 fn seek_first_positive_with_prefix_includes_negative_suffix() {
-    let schema = pk_payload_schema(&[type_code::U64, type_code::I64]);
+    let schema = pk_payload_schema(&[TypeCode::U64, TypeCode::I64]);
     assert_eq!(schema.pk_stride(), 16);
     let mk = |a: u64, b: i64| -> [u8; 16] {
         opk_pk(&schema, &[a as u128, b as u128])
@@ -730,8 +730,8 @@ fn multi_shard_merge_folds_cross_source_weights() {
 fn a_long_string_whose_offset_overruns_the_blob_reads_back_empty() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );
@@ -1156,8 +1156,8 @@ fn write_skeleton_shard(
 fn nullable_string_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 1),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, true),
         ],
         &[0],
     )

@@ -77,7 +77,7 @@ pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorE
     let cols: Vec<SchemaColumn> = schema
         .columns
         .iter()
-        .map(|c| SchemaColumn::new(c.type_code as u8, c.is_nullable as u8))
+        .map(|c| SchemaColumn::new(c.ty.tc, c.is_nullable))
         .collect();
     SchemaDescriptor::try_new(&cols, &schema.pk_cols).map_err(|e| MirrorError::Engine(format!("mirror: schema: {e}")))
 }

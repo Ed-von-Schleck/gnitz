@@ -252,7 +252,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             .calls
             .iter()
             .find(|c| c.out.id == *id)
-            .map(|c| (c.out.def.ty(), c.out.def.is_nullable))
+            .map(|c| (c.out.def.ty, c.out.def.is_nullable))
     }
 
     /// The function the call behind placeholder `id` computes.
@@ -441,7 +441,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         };
         let arg_def = arg.map(|e| ColumnDef::typed("_arg", e.infer_ty_with(&|r| self.type_of(r)), !self.never_null(e)));
         let (op, _) = crate::agg::agg_ops(agg, arg_def.as_ref(), false)?;
-        let raw = crate::agg::agg_col_def(op, arg_def.as_ref(), false).ty();
+        let raw = crate::agg::agg_col_def(op, arg_def.as_ref(), false).ty;
         let nullable = match agg {
             AggFunc::Count => false,
             _ => arg_def.is_some_and(|d| d.is_nullable),
@@ -530,7 +530,7 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
                 Some(WinFunc::Agg(agg)) => default_agg_name(agg, idx),
                 _ => format!("_{}{idx}", single_fn_name(f).unwrap_or("window").to_ascii_lowercase()),
             });
-            let def = ColumnDef::typed(name, out.def.ty(), out.def.is_nullable);
+            let def = ColumnDef::typed(name, out.def.ty, out.def.is_nullable);
             (BExpr::ColRef(out.id), def)
         }))
     }
@@ -849,10 +849,7 @@ fn present(
         .enumerate()
         .map(|(i, &k)| {
             let def = &col_by_id(&in_cols, k).expect("a reduce carries its group keys").def;
-            let out = HirCol::new(
-                ids.next(),
-                ColumnDef::typed(format!("_k{i}"), def.ty(), def.is_nullable),
-            );
+            let out = HirCol::new(ids.next(), ColumnDef::typed(format!("_k{i}"), def.ty, def.is_nullable));
             let id = out.id;
             items.push(ProjEntry { expr: BExpr::ColRef(k), out });
             id

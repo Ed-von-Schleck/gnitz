@@ -1,7 +1,7 @@
 use super::super::merge::ColumnarSource;
 use super::super::shard_reader::MappedShard;
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::make_schema_u64_i64;
 use gnitz_expr::RowSource;
 use gnitz_wire::read_u64_le;
@@ -41,7 +41,7 @@ fn write_open_roundtrip() {
     let image = std::fs::read(&path).unwrap();
     assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), n as u64);
     // The filter is the trailing directory entry.
-    let (filter_size, filter_encoding) = region_dir(&image, gnitz_wire::region::num_regions(1));
+    let (filter_size, filter_encoding) = region_dir(&image, gnitz_wire::num_regions(1));
     assert!(filter_size > 0);
     assert_eq!(filter_encoding, ENCODING_RAW);
 
@@ -121,9 +121,9 @@ fn encoding_selection_pins_all_roles() {
     // one constant + one varying payload column, non-empty blob. ---
     let schema_a = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0), // PK
-            SchemaColumn::new(type_code::I64, 0), // constant payload
-            SchemaColumn::new(type_code::I64, 0), // varying payload
+            SchemaColumn::new(TypeCode::U64, false), // PK
+            SchemaColumn::new(TypeCode::I64, false), // constant payload
+            SchemaColumn::new(TypeCode::I64, false), // varying payload
         ],
         &[0],
     );
@@ -152,8 +152,8 @@ fn encoding_selection_pins_all_roles() {
     // ≥2 distinct null-words. ---
     let schema_b = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1), // nullable
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true), // nullable
         ],
         &[0],
     );
@@ -176,8 +176,8 @@ fn encoding_selection_pins_all_roles() {
     // --- Shard C (Raw weight): ≥3 distinct weight values. ---
     let schema_c = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );

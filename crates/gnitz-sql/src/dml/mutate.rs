@@ -23,9 +23,7 @@ use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_c
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{Evaluator, ExprResults, SchemaFacts};
-use gnitz_wire::{
-    encode_german_string, german_string_content, is_german_string, null_word_get, null_word_set, ReadSink, ReadSpec,
-};
+use gnitz_wire::{encode_german_string, german_string_content, null_word_get, null_word_set, ReadSink, ReadSpec};
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
 
 // ---------------------------------------------------------------------------
@@ -187,7 +185,7 @@ pub(crate) fn classify_set_rhs(
     schema: &Schema,
 ) -> Result<SetRhs, GnitzSqlError> {
     let col = &schema.columns[target];
-    let ty = col.ty();
+    let ty = col.ty;
     if expr.is_literal() {
         let (mut cell, mut spill) = (Vec::new(), Vec::new());
         append_value_to_col(&mut cell, &mut spill, col, expr)?;
@@ -228,16 +226,16 @@ pub(crate) fn classify_set_rhs(
     let ev = compile_scalar_evaluator(&expr, schema)?;
     let str_valued = ev.result_is_str();
     let admits = if str_valued {
-        col.type_code == TypeCode::String
+        col.ty.tc == TypeCode::String
     } else {
-        FixedInt::from_type_code(col.type_code).is_some()
+        FixedInt::from_type_code(col.ty.tc).is_some()
     };
     if !admits {
         return Err(GnitzSqlError::Bind(format!(
             "cannot assign {} value to column '{}' ({:?})",
             if str_valued { "a string" } else { "an integer" },
             col.name,
-            col.type_code,
+            col.ty.tc,
         )));
     }
     Ok(SetRhs::Expr { scope, ev: Box::new(ev) })
@@ -257,15 +255,13 @@ pub(crate) fn apply_set(
     schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let n = rows.len();
-    let rebuild = set
-        .iter()
-        .any(|a| is_german_string(schema.columns[a.ci].type_code as u8));
+    let rebuild = set.iter().any(|a| (schema.columns[a.ci].ty.tc).is_german_string());
     let mut new = ZSetBatch::new(schema);
     let mut nulls = rows.nulls.clone();
     for a in set {
         let def = &schema.columns[a.ci];
         let pi = schema.payload_slot(a.ci).expect("a SET target is a payload column");
-        let tc = def.type_code;
+        let tc = def.ty.tc;
         let scoped = |s: Scope| match s {
             Scope::Existing => &rows,
             Scope::Excluded => excluded.expect("only ON CONFLICT DO UPDATE binds EXCLUDED"),
@@ -275,7 +271,7 @@ pub(crate) fn apply_set(
             SetRhs::Const { cell, spill, null } => {
                 let ZSetBatch { payload, blob, .. } = &mut new;
                 // One spill for every row's cell.
-                let cell = if is_german_string(tc as u8) {
+                let cell = if tc.is_german_string() {
                     encode_german_string(german_string_content(cell, spill), blob).to_vec()
                 } else {
                     cell.clone()
@@ -326,7 +322,7 @@ pub(crate) fn apply_set(
     }
     if rebuild {
         for (pi, ci, def) in schema.payload_columns() {
-            if is_german_string(def.type_code as u8) && !set.iter().any(|a| a.ci == ci) {
+            if def.ty.tc.is_german_string() && !set.iter().any(|a| a.ci == ci) {
                 for r in 0..n {
                     new.push_cell_from(pi, &rows, pi, r);
                 }
@@ -335,7 +331,7 @@ pub(crate) fn apply_set(
         rows.blob = std::mem::take(&mut new.blob);
     }
     for (pi, ci, def) in schema.payload_columns() {
-        if set.iter().any(|a| a.ci == ci) || (rebuild && is_german_string(def.type_code as u8)) {
+        if set.iter().any(|a| a.ci == ci) || (rebuild && def.ty.tc.is_german_string()) {
             std::mem::swap(&mut rows.payload[pi], &mut new.payload[pi]);
         }
     }

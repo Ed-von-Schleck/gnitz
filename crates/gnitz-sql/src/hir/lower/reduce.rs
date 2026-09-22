@@ -58,7 +58,7 @@ pub(super) fn lower_reduce(
         && specs
             .iter()
             .zip(&cols)
-            .all(|(d, (_, c))| d.agg_op.is_linear() && !(d.agg_op == WireAggFunc::Sum && c.type_code.is_float()));
+            .all(|(d, (_, c))| d.agg_op.is_linear() && !(d.agg_op == WireAggFunc::Sum && c.ty.tc.is_float()));
     let reduced = if two_phase {
         // Each worker folds a partial; V₀'s owner merges them and seeds the ground row.
         let partials = cb.reduce_multi_local(node, &[], &specs, false);

@@ -46,7 +46,7 @@ fn try_compile_string_cmp(
     cols: &[ColumnDef],
     eb: &mut ExprBuilder,
 ) -> Option<Reg> {
-    let is_str_col = |e: &BoundExpr| matches!(e, BoundExpr::ColRef(i) if cols[*i].type_code.is_german_string());
+    let is_str_col = |e: &BoundExpr| matches!(e, BoundExpr::ColRef(i) if cols[*i].ty.tc.is_german_string());
     // The opcode pins the constant on the right, so a literal-on-left pair is
     // read as its converse: `'A' < col` is `col > 'A'`.
     let (col, s, cmp) = match (left, right) {
@@ -156,7 +156,7 @@ impl OpcodeBackend<'_> {
     }
 
     fn col_ref(&mut self, idx: usize) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let tc = self.cols[idx].type_code;
+        let tc = self.cols[idx].ty.tc;
         let col = idx as u32;
         // Both rejections exist for their wording: the engine's validator refuses
         // a wide column on the integer load too, but names it by position only.
@@ -176,7 +176,7 @@ impl OpcodeBackend<'_> {
             }
             TypeCode::String => (self.eb.emit(L::LoadColStr { col }), ExprKind::Str),
             _ if tc.is_float() => (self.eb.emit(L::LoadColFloat { col }), ExprKind::Float),
-            _ => (self.eb.emit(L::LoadColInt { col }), ExprKind::of(self.cols[idx].ty())),
+            _ => (self.eb.emit(L::LoadColInt { col }), ExprKind::of(self.cols[idx].ty)),
         })
     }
 
@@ -515,7 +515,7 @@ impl OpcodeBackend<'_> {
 
     /// GREATEST/LEAST as a left fold of 2-ary extremum opcodes.
     fn min_max_n(&mut self, is_max: bool, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let types = operand_tys(&args.iter().collect::<Vec<_>>(), &|i: &usize| self.cols[*i].ty());
+        let types = operand_tys(&args.iter().collect::<Vec<_>>(), &|i: &usize| self.cols[*i].ty);
         let ty = blend_type(&types);
         // Every argument is a numeric operand: a string one is refused by the
         // numeric read, which names the column where the blend cannot.
@@ -625,7 +625,7 @@ impl OpcodeBackend<'_> {
                     (lo..=hi).contains(&(v as i128))
                 };
                 let elide = to == expr.infer_ty(self.cols).tc.register_image()
-                    || matches!(expr, BoundExpr::ColRef(i) if self.cols[*i].type_code == to)
+                    || matches!(expr, BoundExpr::ColRef(i) if self.cols[*i].ty.tc == to)
                     || matches!(expr, BoundExpr::LitInt(v) if in_range(*v) && to != TypeCode::U64);
                 if elide {
                     r
@@ -673,7 +673,7 @@ impl OpcodeBackend<'_> {
         else_: Option<&BoundExpr>,
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let results: Vec<&BoundExpr> = branches.iter().map(|(_, r)| r).chain(else_).collect();
-        let case_ty = blend_type(&operand_tys(&results, &|idx: &usize| self.cols[*idx].ty()));
+        let case_ty = blend_type(&operand_tys(&results, &|idx: &usize| self.cols[*idx].ty));
         let is_str = case_ty.tc == TypeCode::String;
         let mut conds = Vec::with_capacity(branches.len());
         let mut results = Vec::with_capacity(branches.len());
@@ -713,7 +713,7 @@ impl OpcodeBackend<'_> {
                 let mut values: Vec<i64> = placed
                     .iter()
                     .filter_map(|p| match p {
-                        Placed::At(v) => Some(fi.decode_le_i64(&v.to_le_bytes())),
+                        Placed::At(v) => Some(fi.unpack(*v)),
                         _ => None,
                     })
                     .collect();
@@ -787,7 +787,7 @@ impl OpcodeBackend<'_> {
             return Ok(None);
         }
         let c = self.lower_int_operand(other, ty)?;
-        let int = |v: u128| fi.decode_le_i64(&v.to_le_bytes());
+        let int = |v: u128| fi.unpack(v);
         // `c = c` / `c <> c`: true / false on every row, NULL on a NULL one.
         let always = |holds: bool| (if holds { CmpOp::Eq } else { CmpOp::Ne }, None);
         let (op, k) = match p {
@@ -830,7 +830,7 @@ impl OpcodeBackend<'_> {
             let b = self.str_operand(right, false)?;
             return Ok((self.eb.emit(L::StrConcat { a, b, skip_null: false }), ExprKind::Str));
         }
-        let (lt, rt) = operand_ty_pair(left, right, &|i: &usize| self.cols[*i].ty());
+        let (lt, rt) = operand_ty_pair(left, right, &|i: &usize| self.cols[*i].ty);
         if lt.tc.is_temporal() || rt.tc.is_temporal() {
             if op.as_cmp().is_none() && temporal_arith_type(op, lt, rt).is_none() {
                 return Err(GnitzSqlError::Unsupported(format!(

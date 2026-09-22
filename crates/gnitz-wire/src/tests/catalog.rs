@@ -11,7 +11,7 @@ fn system_table_keys_are_valid_for_their_columns() {
         assert!(cols.len() <= MAX_COLUMNS, "{name}: too many columns");
         crate::validate_pk_tuple(pk, cols.len(), PK_LIST_MAX_COLS, |c| {
             let col = &cols[c as usize];
-            (col.type_code as u8, col.nullable)
+            (col.type_code, col.nullable)
         })
         .unwrap_or_else(|rule| panic!("{name}: invalid primary key: {rule}"));
     }
@@ -108,31 +108,49 @@ fn validate_dist_prefix_accepts_leading_rejects_rest() {
 fn table_flags_roundtrip() {
     // Default (not replicated, not a stream, k = 0 = full PK) is all-clear.
     assert_eq!(TableProps::default().pack(), 0);
+    let keyed = |stream, prefix_len| TableProps {
+        stream,
+        distribution: TableDistribution::Keyed { prefix_len },
+    };
+    let replicated = |stream| TableProps {
+        stream,
+        distribution: TableDistribution::Replicated,
+    };
     // Every field combination survives, and k rides in byte 1 clear of the bits.
-    for &replicated in &[false, true] {
-        for &stream in &[false, true] {
-            for dist_prefix_len in 0..=PK_LIST_MAX_COLS {
-                let p = TableProps { replicated, stream, dist_prefix_len };
-                assert_eq!(TableProps::from_flags(p.pack()), p);
-            }
+    for &stream in &[false, true] {
+        assert_eq!(
+            TableProps::from_flags(replicated(stream).pack()).unwrap(),
+            replicated(stream)
+        );
+        for prefix_len in 0..=PK_LIST_MAX_COLS as u8 {
+            let p = keyed(stream, prefix_len);
+            assert_eq!(TableProps::from_flags(p.pack()).unwrap(), p);
         }
     }
     // `TABLE_TAB.flags` is persisted, so the bit *positions* are a wire
     // contract: pinned as literals, since comparing against the constants the
     // packer is written from would hold for any value it gave them.
-    let props = |replicated, stream, dist_prefix_len| TableProps { replicated, stream, dist_prefix_len };
-    assert_eq!(props(true, false, 0).pack(), 0b01);
-    assert_eq!(props(false, true, 0).pack(), 0b10);
-    assert_eq!(props(false, false, 2).pack(), 2 << 8);
-    assert_eq!(props(true, true, 2).pack(), 0b11 | (2 << 8));
+    assert_eq!(replicated(false).pack(), 0b01);
+    assert_eq!(keyed(true, 0).pack(), 0b10);
+    assert_eq!(keyed(false, 2).pack(), 2 << 8);
+    assert_eq!(replicated(true).pack(), 0b11);
+    assert_eq!(keyed(true, 2).pack(), 0b10 | (2 << 8));
+}
 
-    // Reserved bits are ignored on decode, so a word a later version widened
-    // still yields the fields defined today.
-    let reserved = 0b1111_1100u64 | (0xFFu64 << 16);
-    assert_eq!(
-        TableProps::from_flags(props(true, true, 2).pack() | reserved),
-        props(true, true, 2),
-    );
+/// A bit outside the defined set is refused, not ignored.
+#[test]
+fn table_flags_refuse_reserved_bits() {
+    for reserved in [1u64 << 2, 1 << 7, 1 << 16, 1 << 63] {
+        assert!(TableProps::from_flags(reserved).is_err(), "bit {reserved:#x}");
+    }
+}
+
+/// A replicated table carrying a distribution prefix is the one state the
+/// packing can hold and `TableProps` cannot.
+#[test]
+fn table_flags_refuse_replicated_with_a_prefix() {
+    let err = TableProps::from_flags(0b01 | (2 << 8)).unwrap_err();
+    assert!(err.contains("mutually exclusive"), "{err}");
 }
 
 /// Every PK list of up to 4 distinct indices, in every order, over 1..=6

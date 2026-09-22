@@ -12,7 +12,7 @@
 //! to the one shape named rather than to their sum. [`selected`] is what makes a
 //! misspelled selector fail loudly instead of differencing to a 0 % effect.
 
-use gnitz_wire::{type_code, FixedInt};
+use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::batch::MORSEL;
 use crate::test_support::{
@@ -319,8 +319,8 @@ fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
 /// nullable column would hold the program on the nullable arm through its own
 /// load, whatever the null test is classified as.
 fn is_null_bench_schema() -> TestSchema {
-    let mut cols = vec![(type_code::U64, false), (type_code::I64, true)];
-    cols.extend(std::iter::repeat_n((type_code::I64, false), 4));
+    let mut cols = vec![(TypeCode::U64, false), (TypeCode::I64, true)];
+    cols.extend(std::iter::repeat_n((TypeCode::I64, false), 4));
     TestSchema::new(&cols, &[0])
 }
 

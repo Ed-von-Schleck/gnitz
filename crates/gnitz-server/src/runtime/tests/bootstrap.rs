@@ -48,14 +48,14 @@ mod staging {
     use gnitz_store::schema::Placement;
     use gnitz_store::storage::BatchBuilder;
     use gnitz_wire::sys_rows::write_circuit_rows;
-    use gnitz_wire::type_code;
+    use gnitz_wire::TypeCode;
 
     const SAL_SIZE: usize = 1 << 20;
     /// Above every family's flushed LSN after a one-DDL session.
     const ZONE_LSN: u64 = 1_000;
 
     fn cols() -> Vec<crate::catalog::ColumnDef> {
-        vec![col_def("id", type_code::U64), col_def("v", type_code::I64)]
+        vec![col_def("id", TypeCode::U64), col_def("v", TypeCode::I64)]
     }
 
     fn col_tab(owner: i64, weight: i64) -> Batch {
@@ -86,7 +86,10 @@ mod staging {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let r = engine.allocate_ids(1).unwrap();
         engine.write_column_records(r, &cols()).unwrap();
-        let replicated = gnitz_wire::TableProps { replicated: true, ..Default::default() };
+        let replicated = gnitz_wire::TableProps {
+            distribution: gnitz_wire::TableDistribution::Replicated,
+            ..Default::default()
+        };
         engine
             .submit(SysFamily::Table, table_tab(r, "r", replicated, 1))
             .unwrap();

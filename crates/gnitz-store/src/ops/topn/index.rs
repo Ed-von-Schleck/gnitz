@@ -16,7 +16,7 @@
 //! row-by-row equal-PK arm, exactly as the AVI's value column does.
 
 use crate::schema::key::ReindexPacker;
-use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::{ImageKind, OrderKey};
@@ -81,7 +81,7 @@ impl TopNIndex {
                 let loc = input.locate(key.col as usize);
                 OrderSpec {
                     key: OrderLocator::of(loc, key),
-                    kind: ImageKind::of(TypeCode::from_validated_u8(loc.type_code())),
+                    kind: ImageKind::of(loc.type_code()),
                 }
             })
             .collect();

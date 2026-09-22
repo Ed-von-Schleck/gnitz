@@ -8,13 +8,13 @@ use super::super::shard_index::guard_slot;
 use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::key::PkBuf;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::{make_schema_u64_i64, opk_pk, pk_payload_schema};
 use gnitz_expr::RowSource;
 use gnitz_wire::read_i64_le;
 use std::ffi::CStr;
 use std::fs;
-use type_code::{I64 as TYPE_I64, STRING as TYPE_STRING, U64 as TYPE_U64};
+use TypeCode::{String as TYPE_STRING, I64 as TYPE_I64, U64 as TYPE_U64};
 
 /// A probed store's `Output` — the shape every test here compacts into.
 fn out(dir: &str, compact_seq: u64) -> Output<'_> {
@@ -345,9 +345,9 @@ fn test_merge_and_route_cleanup_on_partial_finalize_failure() {
 fn make_3col_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TYPE_U64, 0),
-            SchemaColumn::new(TYPE_I64, 0),
-            SchemaColumn::new(TYPE_I64, 0),
+            SchemaColumn::new(TYPE_U64, false),
+            SchemaColumn::new(TYPE_I64, false),
+            SchemaColumn::new(TYPE_I64, false),
         ],
         &[0],
     )
@@ -610,7 +610,7 @@ fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
     type Row = (Vec<u128>, i64, i64);
     struct Case {
         name: &'static str,
-        pk_types: &'static [u8],
+        pk_types: &'static [TypeCode],
         stride: usize,
         shards: Vec<Vec<Row>>,
         /// Surviving rows' PK column values, in the order they must come back.
@@ -654,7 +654,7 @@ fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
         },
         Case {
             name: "narrow U8",
-            pk_types: &[type_code::U8],
+            pk_types: &[TypeCode::U8],
             stride: 1,
             shards: vec![
                 vec![(vec![200], 1, 1), (vec![255], 1, 2)],
@@ -665,7 +665,7 @@ fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
         Case {
             // A stride that is neither 8 nor 16, so no fast width arm applies.
             name: "mixed-width (U64, U16, U8)",
-            pk_types: &[TYPE_U64, type_code::U16, type_code::U8],
+            pk_types: &[TYPE_U64, TypeCode::U16, TypeCode::U8],
             stride: 11,
             shards: vec![
                 vec![(vec![1, 2, 3], 1, 10), (vec![1, 2, 9], 1, 20)],
@@ -731,10 +731,10 @@ type DecodedRow = (Vec<u8>, i64, u64, Vec<DiffCell>);
 fn diff_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(TYPE_U64, 0),
-            SchemaColumn::new(TYPE_STRING, 0),
-            SchemaColumn::new(TYPE_STRING, 0),
-            SchemaColumn::new(TYPE_I64, 1),
+            SchemaColumn::new(TYPE_U64, false),
+            SchemaColumn::new(TYPE_STRING, false),
+            SchemaColumn::new(TYPE_STRING, false),
+            SchemaColumn::new(TYPE_I64, true),
         ],
         &[0],
     )
@@ -796,7 +796,7 @@ fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
                     let cs = col.size() as usize;
                     if gnitz_wire::null_word_get(nw, pi) {
                         DiffCell::Null
-                    } else if gnitz_wire::is_german_string(col.type_code) {
+                    } else if col.type_code.is_german_string() {
                         let st: [u8; 16] = shard.get_col_ptr(i, pi, 16).try_into().unwrap();
                         DiffCell::Str(gnitz_wire::try_decode_german_string(&st, blob).expect("valid string"))
                     } else {

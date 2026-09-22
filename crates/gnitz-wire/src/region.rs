@@ -77,12 +77,6 @@ pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
     }
 }
 
-/// All `npc` payload columns are null.
-#[inline]
-pub fn all_payload_null_mask(npc: usize) -> u64 {
-    crate::low_bits_mask(npc)
-}
-
 /// The first `(row, payload slot)` whose little-endian `u64` null word in
 /// `null_bmp` sets a bit in `not_null`.
 pub fn first_not_null_violation(not_null: u64, null_bmp: &[u8]) -> Option<(usize, usize)> {
@@ -99,19 +93,13 @@ pub fn first_not_null_violation(not_null: u64, null_bmp: &[u8]) -> Option<(usize
 
 /// A row's null word rebased onto output payload slot `at`; slot 64 and beyond
 /// hold no bit.
-#[inline]
+#[inline(always)]
 pub fn null_word_at(word: u64, at: usize) -> u64 {
     if at < 64 {
         word << at
     } else {
         0
     }
-}
-
-/// Two rows' null words for an output laid out as `[left payload…, right payload…]`.
-#[inline]
-pub fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
-    left | null_word_at(right, left_npc)
 }
 
 #[cfg(test)]

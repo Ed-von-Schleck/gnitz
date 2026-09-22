@@ -1,18 +1,18 @@
 //! Order images: the byte strings whose plain lexicographic order *is* a
 //! column's typed order, the keys of the indexes that walk a column in order.
 
-use crate::schema::{type_code, ColumnLocator, SchemaColumn};
+use crate::schema::{ColumnLocator, SchemaColumn, TypeCode};
 use gnitz_expr::RowSource;
 use gnitz_wire::{ImageKind, ScalarKind, WideKind};
 
 /// The index PK column [`write_image_slot`] fills with an image's leading bytes:
 /// a scalar image whole, a wide one's first 16 bytes.
 pub(crate) const fn image_slot_col(wide: bool) -> SchemaColumn {
-    SchemaColumn::new(if wide { type_code::U128 } else { type_code::U64 }, 0)
+    SchemaColumn::new(if wide { TypeCode::U128 } else { TypeCode::U64 }, false)
 }
 
 /// A whole image as a payload column: a BLOB orders by content.
-pub(crate) const IMAGE_COL: SchemaColumn = SchemaColumn::new(type_code::BLOB, 0);
+pub(crate) const IMAGE_COL: SchemaColumn = SchemaColumn::new(TypeCode::Blob, false);
 
 /// The native bytes of the wide column at `loc` in `row`: a string's content,
 /// or the 16-byte little-endian integer.
@@ -77,7 +77,7 @@ pub(crate) fn wide_native_of_image(kind: WideKind, invert: bool, image: &[u8]) -
     match kind {
         WideKind::Fixed(tc) => {
             let (n, mut native) = (v.len(), [0u8; 16]);
-            gnitz_wire::decode_pk_column(&v, tc as u8, &mut native[..n]);
+            gnitz_wire::decode_pk_column(&v, tc, &mut native[..n]);
             v.copy_from_slice(&native[..n]);
             v
         }

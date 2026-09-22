@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Table};
 use crate::test_support::scratch_table;
 use gnitz_expr::{payload_is_null, payload_string};
@@ -17,10 +17,10 @@ use super::plan::TopNPlan;
 fn schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     )
@@ -214,8 +214,8 @@ fn from_wire_rejects_what_it_cannot_run() {
     assert!(TopNPlan::from_wire(&s, &[], &[key(2, false, false)], 0, 0).is_err());
     let float = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::F64, false),
         ],
         &[0],
     );

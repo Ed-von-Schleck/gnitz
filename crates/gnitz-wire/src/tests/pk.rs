@@ -1,6 +1,5 @@
 use super::*;
-use crate::type_code;
-use crate::{cmp_typed_le, FixedInt, TypeCode};
+use crate::{cmp_col_window, FixedInt, TypeCode};
 
 /// Bit patterns every width-parameterized sweep below truncates to its type's
 /// width: both sign boundaries, the all-ones edges, and the 2^63 / 2^64 / 2^127
@@ -23,21 +22,21 @@ const PATTERNS: &[u128] = &[
 ];
 
 /// The OPK contract: unsigned byte comparison over an encoded key IS the typed
-/// order of the value it encodes, at every PK-eligible width. `cmp_typed_le` is
+/// order of the value it encodes, at every PK-eligible width. `cmp_col_window` is
 /// the crate's own definition of that typed order over native LE bytes, and it
 /// is tested independently. Every ordered pair is checked, so a wrong sign flip
 /// at any width fails here rather than as silently mis-summed weights
 /// downstream.
 #[test]
 fn opk_byte_order_is_typed_order() {
-    for tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
-        let (raw, sz) = (*tc as u8, tc.wire_stride());
+    for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let sz = tc.wire_stride();
         let imgs: Vec<[u8; 16]> = PATTERNS.iter().map(|p| p.to_le_bytes()).collect();
         let keys: Vec<Vec<u8>> = imgs
             .iter()
             .map(|le| {
                 let mut o = vec![0u8; sz];
-                encode_pk_column(&le[..sz], raw, &mut o);
+                encode_pk_column(&le[..sz], tc, &mut o);
                 o
             })
             .collect();
@@ -45,8 +44,8 @@ fn opk_byte_order_is_typed_order() {
             for (j, b) in imgs.iter().enumerate() {
                 assert_eq!(
                     keys[i].cmp(&keys[j]),
-                    cmp_typed_le(&a[..sz], &b[..sz], raw),
-                    "tc={raw} sz={sz}: pattern {i} vs {j}",
+                    cmp_col_window(&a[..sz], &[], &b[..sz], &[], tc),
+                    "tc={tc} sz={sz}: pattern {i} vs {j}",
                 );
             }
         }
@@ -59,15 +58,15 @@ fn opk_byte_order_is_typed_order() {
 /// both without an edit.
 #[test]
 fn decode_pk_column_roundtrips_every_pk_type() {
-    for tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
-        let (raw, sz) = (*tc as u8, tc.wire_stride());
+    for &tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let sz = tc.wire_stride();
         for p in PATTERNS {
             let le = p.to_le_bytes();
             let mut opk = vec![0u8; sz];
-            encode_pk_column(&le[..sz], raw, &mut opk);
+            encode_pk_column(&le[..sz], tc, &mut opk);
             let mut back = vec![0u8; sz];
-            decode_pk_column(&opk, raw, &mut back);
-            assert_eq!(back, &le[..sz], "decode(encode(v)) != v for tc={raw} p={p:#x}");
+            decode_pk_column(&opk, tc, &mut back);
+            assert_eq!(back, &le[..sz], "decode(encode(v)) != v for tc={tc} p={p:#x}");
         }
     }
 }
@@ -78,14 +77,14 @@ fn decode_pk_column_roundtrips_every_pk_type() {
 #[test]
 fn decode_opk_i64_recovers_the_encoded_value() {
     for &(fi, tc) in &[
-        (FixedInt::U8, type_code::U8),
-        (FixedInt::I8, type_code::I8),
-        (FixedInt::U16, type_code::U16),
-        (FixedInt::I16, type_code::I16),
-        (FixedInt::U32, type_code::U32),
-        (FixedInt::I32, type_code::I32),
-        (FixedInt::U64, type_code::U64),
-        (FixedInt::I64, type_code::I64),
+        (FixedInt::U8, TypeCode::U8),
+        (FixedInt::I8, TypeCode::I8),
+        (FixedInt::U16, TypeCode::U16),
+        (FixedInt::I16, TypeCode::I16),
+        (FixedInt::U32, TypeCode::U32),
+        (FixedInt::I32, TypeCode::I32),
+        (FixedInt::U64, TypeCode::U64),
+        (FixedInt::I64, TypeCode::I64),
     ] {
         let sz = fi.width();
         let (lo, hi) = fi.range();
@@ -101,7 +100,7 @@ fn decode_opk_i64_recovers_the_encoded_value() {
     // The one edge the range walk cannot state: `U64`'s maximum does not fit an
     // `i64`, and the register holds the bit pattern, so it reads back as `-1`.
     let mut opk = [0u8; 8];
-    encode_pk_column(&u64::MAX.to_le_bytes(), type_code::U64, &mut opk);
+    encode_pk_column(&u64::MAX.to_le_bytes(), TypeCode::U64, &mut opk);
     assert_eq!(decode_opk_i64(&opk, FixedInt::U64), -1i64);
 }
 
@@ -109,22 +108,18 @@ fn decode_opk_i64_recovers_the_encoded_value() {
 /// promotion the engine performs.
 #[test]
 fn store_opk_image_matches_decode_widen_encode() {
-    let pk_types: Vec<u8> = TypeCode::ALL
-        .iter()
-        .filter(|t| t.is_pk_eligible())
-        .map(|t| *t as u8)
-        .collect();
-    let mut pairs: Vec<(u8, u8)> = Vec::new();
+    let pk_types: Vec<TypeCode> = TypeCode::ALL.iter().copied().filter(|t| t.is_pk_eligible()).collect();
+    let mut pairs: Vec<(TypeCode, TypeCode)> = Vec::new();
     for &src in &pk_types {
         for &target in &pk_types {
-            if src == target || crate::int_domain_fits(src, target) {
+            if src == target || src.int_domain_fits(target) {
                 pairs.push((src, target));
             }
         }
     }
-    pairs.push((type_code::UUID, type_code::U128));
+    pairs.push((TypeCode::UUID, TypeCode::U128));
     for (src, target) in pairs {
-        let (sw, tw) = (crate::wire_stride(src), crate::wire_stride(target));
+        let (sw, tw) = (src.wire_stride(), target.wire_stride());
         for p in PATTERNS {
             let le = p.to_le_bytes();
             let native = &le[..sw];
@@ -217,14 +212,14 @@ fn router_spreads_structured_keys_evenly() {
 #[test]
 fn worker_for_pk_bytes_reads_a_whole_wide_region() {
     let mut head = [0u8; 16];
-    encode_pk_column(&7u64.to_le_bytes(), type_code::U64, &mut head[..8]);
-    encode_pk_column(&9u64.to_le_bytes(), type_code::U64, &mut head[8..]);
+    encode_pk_column(&7u64.to_le_bytes(), TypeCode::U64, &mut head[..8]);
+    encode_pk_column(&9u64.to_le_bytes(), TypeCode::U64, &mut head[8..]);
 
     let mut seen = std::collections::HashSet::new();
     for tail in 0..64u64 {
         let mut opk = [0u8; 24];
         opk[..16].copy_from_slice(&head);
-        encode_pk_column(&tail.to_le_bytes(), type_code::U64, &mut opk[16..]);
+        encode_pk_column(&tail.to_le_bytes(), TypeCode::U64, &mut opk[16..]);
         assert!(opk.len() > NARROW_PK_MAX_BYTES);
         for nw in [1usize, 2, 3, 7, MAX_WORKERS] {
             assert!(worker_for_pk_bytes(&opk, nw) < nw, "route out of range at nw={nw}");
@@ -267,15 +262,15 @@ fn router_spreads_random_keys_evenly() {
 #[test]
 fn worker_for_pk_bytes_matches_widened_key() {
     for &(tc, sz) in &[
-        (type_code::U8, 1usize),
-        (type_code::I8, 1),
-        (type_code::U16, 2),
-        (type_code::I16, 2),
-        (type_code::U32, 4),
-        (type_code::I32, 4),
-        (type_code::U64, 8),
-        (type_code::I64, 8),
-        (type_code::U128, 16),
+        (TypeCode::U8, 1usize),
+        (TypeCode::I8, 1),
+        (TypeCode::U16, 2),
+        (TypeCode::I16, 2),
+        (TypeCode::U32, 4),
+        (TypeCode::I32, 4),
+        (TypeCode::U64, 8),
+        (TypeCode::I64, 8),
+        (TypeCode::U128, 16),
     ] {
         for v in [0i128, 1, -1, 7, -7, 127, -128, 1000, -1000, i32::MAX as i128] {
             let le = (v as u128).to_le_bytes();
@@ -295,15 +290,15 @@ fn worker_for_pk_bytes_matches_widened_key() {
 // ── Co-partition property: both join sides pack equal values identically.
 
 /// `v`, read at source type `tc`, OPK-encoded into a `target`-width slot.
-fn promote(v: i128, tc: u8, target: u8) -> [u8; 16] {
+fn promote(v: i128, tc: TypeCode, target: TypeCode) -> [u8; 16] {
     let key = encode_pk_natives([(tc, target)], [v as u128]);
     let mut out = [0u8; 16];
     out[..key.width()].copy_from_slice(key.pk_bytes());
     out
 }
 
-fn assert_copartition(v: i128, l: u8, r: u8, t: u8) {
-    let tw = crate::wire_stride(t);
+fn assert_copartition(v: i128, l: TypeCode, r: TypeCode, t: TypeCode) {
+    let tw = t.wire_stride();
     let (bl, br) = (promote(v, l, t), promote(v, r, t));
     assert_eq!(&bl[..tw], &br[..tw], "byte-identity failed: v={v} L={l} R={r} T={t}");
     assert_eq!(
@@ -315,13 +310,13 @@ fn assert_copartition(v: i128, l: u8, r: u8, t: u8) {
 
 /// The representable `(min, max)` of a ≤8-byte integer type code, read from the
 /// crate's own [`FixedInt::range`] rather than re-derived from the width.
-fn range_of(tc: u8) -> (i128, i128) {
-    FixedInt::from_type_code(TypeCode::from_validated_u8(tc))
+fn range_of(tc: TypeCode) -> (i128, i128) {
+    FixedInt::from_type_code(tc)
         .expect("a fixed-width ≤8-byte integer type code")
         .range()
 }
-fn narrower(l: u8, r: u8) -> u8 {
-    if crate::wire_stride(l) <= crate::wire_stride(r) {
+fn narrower(l: TypeCode, r: TypeCode) -> TypeCode {
+    if l.wire_stride() <= r.wire_stride() {
         l
     } else {
         r
@@ -330,7 +325,7 @@ fn narrower(l: u8, r: u8) -> u8 {
 
 #[test]
 fn signed_ladder_copartitions() {
-    use type_code::{I16, I32, I64, I8};
+    use TypeCode::{I16, I32, I64, I8};
     for (l, r, t) in [
         (I8, I16, I16),
         (I8, I32, I32),
@@ -348,7 +343,7 @@ fn signed_ladder_copartitions() {
 
 #[test]
 fn unsigned_ladder_copartitions() {
-    use type_code::{U128, U16, U32, U64, U8, UUID};
+    use TypeCode::{U128, U16, U32, U64, U8, UUID};
     for (l, r, t) in [
         (U8, U16, U16),
         (U8, U32, U32),
@@ -369,7 +364,7 @@ fn unsigned_ladder_copartitions() {
 
 #[test]
 fn cross_sign_copartitions() {
-    use type_code::{I128, I16, I32, I64, I8, U16, U32, U64, U8};
+    use TypeCode::{I128, I16, I32, I64, I8, U16, U32, U64, U8};
     // (unsigned ≤8B, signed, promoted T) — the full in-scope acceptance table.
     // The U64 rows exercise the new signed-128 target at 16-byte width.
     let cases = [
@@ -405,8 +400,8 @@ fn cross_sign_copartitions() {
         // native bytes; U8 200 and I8 -56 share byte 0xC8) — two promoted
         // T-keys are byte-equal IFF the logical values are equal. No distinct
         // values ever collide; no equal values ever diverge.
-        let tw = crate::wire_stride(t);
-        let probes: &[(i128, u8)] = &[
+        let tw = t.wire_stride();
+        let probes: &[(i128, TypeCode)] = &[
             (u_lo, u),
             (1, u),
             (127, u),

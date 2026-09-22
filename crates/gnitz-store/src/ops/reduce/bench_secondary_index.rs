@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use super::avi::{avi_batch, AviBake};
 use super::plan::ReducePlan;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
 use crate::test_support::{bench_time, bench_time_each};
 use gnitz_wire::AggDescriptor;
@@ -46,9 +46,9 @@ fn memtable_budget() -> usize {
 fn src_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -70,9 +70,9 @@ fn build_input(schema: &SchemaDescriptor) -> Batch {
 fn wide_src_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0],
     )
@@ -220,8 +220,8 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
 fn secondary_index_single_u64_pk_sort_bench() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -276,8 +276,8 @@ fn index_write_span_bench() {
 fn secondary_index_single_i64_pk_sort_bench() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );

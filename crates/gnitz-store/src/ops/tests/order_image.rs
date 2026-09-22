@@ -11,9 +11,9 @@ use gnitz_wire::WideKind;
 /// PK column of a batch, or its sole payload column.
 fn int16_batch(tc: TypeCode, vals: &[i128], as_pk: bool) -> Batch {
     let schema = if as_pk {
-        pk_payload_schema(&[tc as u8])
+        pk_payload_schema(&[tc])
     } else {
-        u64_pk_schema(SchemaColumn::new(tc as u8, 0))
+        u64_pk_schema(SchemaColumn::new(tc, false))
     };
     let mut b = BatchBuilder::new(schema);
     for (i, &v) in vals.iter().enumerate() {

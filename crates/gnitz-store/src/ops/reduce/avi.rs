@@ -10,7 +10,7 @@
 //! a MAX image is complemented, so each ordinal's first entry is its extreme.
 
 use crate::schema::key::ReindexPacker;
-use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, MAX_PK_BYTES};
+use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
@@ -25,7 +25,7 @@ use super::agg::{Accumulator, ExtremeSpec};
 // Key layout
 // ---------------------------------------------------------------------------
 
-const ORDINAL_COL: SchemaColumn = SchemaColumn::new(type_code::U8, 0);
+const ORDINAL_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
 /// [`IMAGE_COL`] is the only payload column.
 const IMAGE_SLOT: usize = 0;
 const ORDINAL_BYTES: usize = ORDINAL_COL.size() as usize;

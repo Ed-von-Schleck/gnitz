@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::test_support::pk_only_schema;
 
 /// Two rows both NULL in an `I64` payload column, carrying DIFFERENT bytes under
@@ -10,9 +10,9 @@ use crate::test_support::pk_only_schema;
 fn null_equality_separates_the_two_payload_comparators() {
     use crate::storage::Batch;
 
-    let pk = SchemaColumn::new(type_code::U128, 0);
-    let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
-    let non_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+    let pk = SchemaColumn::new(TypeCode::U128, false);
+    let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, true)], &[0]);
+    let non_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, false)], &[0]);
 
     // Same PK, both NULL, different bytes under the null bit.
     let mut pair = Batch::with_capacity(&nullable, 2);
@@ -67,9 +67,9 @@ impl RowSource for TestBatch {
 fn make_schema_nullable_float() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, true),
+            SchemaColumn::new(TypeCode::F64, false),
         ],
         &[0],
     )
@@ -119,18 +119,18 @@ fn compare_rows_orders_every_payload_type() {
     let f = |v: f64| v.to_bits().to_le_bytes().to_vec();
 
     // (what, payload type, row 0 cell, row 1 cell, row 0 vs row 1)
-    type Case<'a> = (&'a str, u8, Vec<u8>, Vec<u8>, Ordering);
+    type Case<'a> = (&'a str, TypeCode, Vec<u8>, Vec<u8>, Ordering);
     let cases: &[Case] = &[
         (
             "signed reads two's complement",
-            type_code::I64,
+            TypeCode::I64,
             le(-42, 8),
             le(42, 8),
             Ordering::Less,
         ),
         (
             "u128 orders across the limb",
-            type_code::U128,
+            TypeCode::U128,
             le(1, 16),
             le(1 << 64, 16),
             Ordering::Less,
@@ -139,7 +139,7 @@ fn compare_rows_orders_every_payload_type() {
         // -1 (all bits set) would sort above 0.
         (
             "i128 is signed, not u128",
-            type_code::I128,
+            TypeCode::I128,
             le(-1, 16),
             le(0, 16),
             Ordering::Less,
@@ -148,22 +148,22 @@ fn compare_rows_orders_every_payload_type() {
         // silently drop rows in consolidation.
         (
             "distinct UUIDs do not collapse",
-            type_code::UUID,
+            TypeCode::UUID,
             le(1, 16),
             le(1 << 64, 16),
             Ordering::Less,
         ),
-        ("f64 by sign", type_code::F64, f(-5.0), f(5.0), Ordering::Less),
+        ("f64 by sign", TypeCode::F64, f(-5.0), f(5.0), Ordering::Less),
         (
             "total_cmp puts NaN above every finite",
-            type_code::F64,
+            TypeCode::F64,
             f(f64::NAN),
             f(1.0),
             Ordering::Greater,
         ),
         (
             "NaN ties with itself",
-            type_code::F64,
+            TypeCode::F64,
             f(f64::NAN),
             f(f64::NAN),
             Ordering::Equal,
@@ -171,28 +171,28 @@ fn compare_rows_orders_every_payload_type() {
         // An unsigned high bit read as a sign would reverse the order.
         (
             "u64 high bit is not a sign",
-            type_code::U64,
+            TypeCode::U64,
             le(0, 8),
             le(u64::MAX as i128, 8),
             Ordering::Less,
         ),
         (
             "u32 high bit is not a sign",
-            type_code::U32,
+            TypeCode::U32,
             le(0, 4),
             le(u32::MAX as i128, 4),
             Ordering::Less,
         ),
         (
             "u16 high bit is not a sign",
-            type_code::U16,
+            TypeCode::U16,
             le(0, 2),
             le(u16::MAX as i128, 2),
             Ordering::Less,
         ),
         (
             "u8 high bit is not a sign",
-            type_code::U8,
+            TypeCode::U8,
             le(0, 1),
             le(u8::MAX as i128, 1),
             Ordering::Less,
@@ -200,7 +200,7 @@ fn compare_rows_orders_every_payload_type() {
     ];
 
     for (what, tc, a, b, want) in cases {
-        let schema = make_schema(&[(*tc, 0)]);
+        let schema = make_schema(&[(*tc, false)]);
         let batch = single_col_batch(&[0, 0], [a.clone(), b.clone()].concat());
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), *want, "{what}");
         assert_eq!(
@@ -229,7 +229,7 @@ fn null_orders_below_non_null_and_ties_to_the_next_column() {
 /// shape that catches a swapped pair.
 #[test]
 fn compare_rows_resolves_each_source_against_its_own_blob() {
-    let schema = make_schema(&[(type_code::STRING, 0)]);
+    let schema = make_schema(&[(TypeCode::String, false)]);
     let one_long_string = |s: &[u8]| {
         let mut blob = Vec::new();
         let cell = gnitz_wire::encode_german_string(s, &mut blob);
@@ -249,10 +249,10 @@ fn compare_rows_resolves_each_source_against_its_own_blob() {
 // Fast path: PayloadCmpKind / FixedIntNonnull
 // -----------------------------------------------------------------------
 
-fn make_schema(cols: &[(u8, u8)]) -> SchemaDescriptor {
+fn make_schema(cols: &[(TypeCode, bool)]) -> SchemaDescriptor {
     // First column is PK (U64); subsequent are payload columns.
     let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
-    columns[0] = SchemaColumn::new(type_code::U64, 0);
+    columns[0] = SchemaColumn::new(TypeCode::U64, false);
     for (i, &(tc, nullable)) in cols.iter().enumerate() {
         columns[i + 1] = SchemaColumn::new(tc, nullable);
     }
@@ -269,44 +269,44 @@ fn payload_cmp_kind_bounds() {
 
     // All-signed, non-nullable → fast
     assert!(fast(&make_schema(&[
-        (type_code::I8, 0),
-        (type_code::I16, 0),
-        (type_code::I32, 0),
-        (type_code::I64, 0),
+        (TypeCode::I8, false),
+        (TypeCode::I16, false),
+        (TypeCode::I32, false),
+        (TypeCode::I64, false),
     ])));
     // All-unsigned, non-nullable → fast
     assert!(fast(&make_schema(&[
-        (type_code::U8, 0),
-        (type_code::U16, 0),
-        (type_code::U32, 0),
-        (type_code::U64, 0),
+        (TypeCode::U8, false),
+        (TypeCode::U16, false),
+        (TypeCode::U32, false),
+        (TypeCode::U64, false),
     ])));
     // Mixed signed/unsigned, non-nullable → fast
-    assert!(fast(&make_schema(&[(type_code::I64, 0), (type_code::U32, 0)])));
+    assert!(fast(&make_schema(&[(TypeCode::I64, false), (TypeCode::U32, false)])));
     // Empty payload (all-PK) → vacuously fast
-    assert!(fast(&pk_only_schema(&[type_code::U64])));
+    assert!(fast(&pk_only_schema(&[TypeCode::U64])));
 
     // Nullable fixed int → generic
-    assert!(!fast(&make_schema(&[(type_code::I32, 1)])));
-    assert!(!fast(&make_schema(&[(type_code::U32, 1)])));
+    assert!(!fast(&make_schema(&[(TypeCode::I32, true)])));
+    assert!(!fast(&make_schema(&[(TypeCode::U32, true)])));
 
     // Each non-fixed-int type → generic (U128/UUID exceed 8 bytes; floats/strings/blobs)
     for tc in [
-        type_code::U128,
-        type_code::UUID,
-        type_code::F32,
-        type_code::F64,
-        type_code::STRING,
-        type_code::BLOB,
+        TypeCode::U128,
+        TypeCode::UUID,
+        TypeCode::F32,
+        TypeCode::F64,
+        TypeCode::String,
+        TypeCode::Blob,
     ] {
         assert!(
-            !fast(&make_schema(&[(tc, 0)])),
+            !fast(&make_schema(&[(tc, false)])),
             "expected schema with type_code={tc} to be rejected",
         );
     }
 
     // A single disqualifier among valid columns kills it.
-    assert!(!fast(&make_schema(&[(type_code::I64, 0), (type_code::U128, 0)])));
+    assert!(!fast(&make_schema(&[(TypeCode::I64, false), (TypeCode::U128, false)])));
 }
 
 // -----------------------------------------------------------------------
@@ -317,16 +317,16 @@ mod fixedint_proptest {
     use super::*;
     use proptest::prelude::*;
 
-    fn arb_fixedint_type() -> impl Strategy<Value = u8> {
+    fn arb_fixedint_type() -> impl Strategy<Value = TypeCode> {
         prop_oneof![
-            Just(type_code::I8),
-            Just(type_code::U8),
-            Just(type_code::I16),
-            Just(type_code::U16),
-            Just(type_code::I32),
-            Just(type_code::U32),
-            Just(type_code::I64),
-            Just(type_code::U64),
+            Just(TypeCode::I8),
+            Just(TypeCode::U8),
+            Just(TypeCode::I16),
+            Just(TypeCode::U16),
+            Just(TypeCode::I32),
+            Just(TypeCode::U32),
+            Just(TypeCode::I64),
+            Just(TypeCode::U64),
         ]
     }
 
@@ -334,12 +334,12 @@ mod fixedint_proptest {
     /// columns over all eight fixed-int types spans every sign combination
     /// including mixed; random bytes frequently set the high bit, so a
     /// signedness bug surfaces as a fast-vs-generic disagreement.
-    fn arb_case() -> impl Strategy<Value = (Vec<u8>, usize, Vec<Vec<u8>>)> {
+    fn arb_case() -> impl Strategy<Value = (Vec<TypeCode>, usize, Vec<Vec<u8>>)> {
         (prop::collection::vec(arb_fixedint_type(), 1..=4), 2usize..=6usize).prop_flat_map(|(types, n)| {
             let cols: Vec<_> = types
                 .iter()
                 .map(|&t| {
-                    let cs = gnitz_wire::wire_stride(t);
+                    let cs = t.wire_stride();
                     prop::collection::vec(any::<u8>(), n * cs)
                 })
                 .collect();
@@ -353,7 +353,7 @@ mod fixedint_proptest {
         /// across all widths {1,2,4,8} and every signed/unsigned mix.
         #[test]
         fn fixedint_matches_generic((types, n, col_data) in arb_case()) {
-            let payload: Vec<(u8, u8)> = types.iter().map(|&t| (t, 0)).collect();
+            let payload: Vec<(TypeCode, bool)> = types.iter().map(|&t| (t, false)).collect();
             let schema = make_schema(&payload);
             prop_assert_eq!(schema.payload_cmp, PayloadCmpKind::FixedIntNonnull);
 

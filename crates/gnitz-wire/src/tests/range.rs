@@ -62,7 +62,7 @@ fn decode_rejects_malformed() {
 /// could saturate a literal against.
 #[test]
 fn type_edges_are_the_representable_ends_of_an_orderable_column() {
-    for tc in TypeCode::ALL {
+    for &tc in TypeCode::ALL {
         let edges = Cut::type_edges(tc);
         let Some(fi) = FixedInt::from_type_code(tc) else {
             let want = matches!(tc, TypeCode::U128).then_some((Before(0), After(u128::MAX)));

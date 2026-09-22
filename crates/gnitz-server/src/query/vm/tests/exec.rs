@@ -5,9 +5,9 @@ use super::*;
 use crate::test_support::{make_batch_u128, make_batch_u128_raw, make_schema_u128_i64, opk_pk, zset_of};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, StoreError};
-use gnitz_wire::type_code;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
+use gnitz_wire::TypeCode;
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
@@ -38,11 +38,11 @@ fn push_reduce(
 /// A U128 PK plus `col_types` as payload columns — the 2- and 3-payload shapes
 /// the multi-column tests need. The one-payload shape is
 /// [`make_schema_u128_i64`].
-fn make_schema(col_types: &[u8]) -> SchemaDescriptor {
+fn make_schema(col_types: &[TypeCode]) -> SchemaDescriptor {
     let mut columns = [SchemaColumn::EMPTY; gnitz_wire::MAX_COLUMNS];
-    columns[0] = SchemaColumn::new(type_code::U128, 0);
+    columns[0] = SchemaColumn::new(TypeCode::U128, false);
     for (i, &tc) in col_types.iter().enumerate() {
-        columns[i + 1] = SchemaColumn::new(tc, 0);
+        columns[i + 1] = SchemaColumn::new(tc, false);
     }
     let n = col_types.len() + 1;
     SchemaDescriptor::new(&columns[..n], &[0])
@@ -78,9 +78,9 @@ fn extract_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
 /// one is the OR the emit layer's `union_nullability_merge` produces, which
 /// for this pair is the right side's.
 fn union_nullability_schemas() -> (SchemaDescriptor, SchemaDescriptor, SchemaDescriptor) {
-    let pk = SchemaColumn::new(type_code::U128, 0);
-    let not_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
-    let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+    let pk = SchemaColumn::new(TypeCode::U128, false);
+    let not_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, false)], &[0]);
+    let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(TypeCode::I64, true)], &[0]);
     (not_null, nullable, nullable)
 }
 
@@ -296,7 +296,7 @@ fn test_delta_isolation_across_ticks() {
 #[test]
 fn test_map_operator() {
     // MAP projection: reorder/select columns.
-    let in_schema = make_schema(&[type_code::I64, type_code::I64]);
+    let in_schema = make_schema(&[TypeCode::I64, TypeCode::I64]);
     let out_schema = make_schema_u128_i64();
 
     let mut p = TestPlan::default();
@@ -359,7 +359,7 @@ fn test_distinct_multi_tick() {
 fn test_join_delta_trace() {
     let left_schema = make_schema_u128_i64();
     let right_schema = make_schema_u128_i64();
-    let join_schema = make_schema(&[type_code::I64, type_code::I64]);
+    let join_schema = make_schema(&[TypeCode::I64, TypeCode::I64]);
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
@@ -397,11 +397,11 @@ fn test_join_delta_trace() {
 #[test]
 fn test_reduce_groups_by_a_payload_column() {
     let in_schema = make_schema(&[
-        type_code::I64, // group col (payload col 0)
-        type_code::I64, // agg col (payload col 1)
+        TypeCode::I64, // group col (payload col 0)
+        TypeCode::I64, // agg col (payload col 1)
     ]);
     // [U128 PK, I64 group_col, I64 sum_col, I64 count companion]
-    let out_schema = make_schema(&[type_code::I64, type_code::I64, type_code::I64]);
+    let out_schema = make_schema(&[TypeCode::I64, TypeCode::I64, TypeCode::I64]);
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());
@@ -434,7 +434,7 @@ fn test_reduce_multi_agg() {
     // Input: U128 pk, val(I64). All rows in the same group (pk=1).
     let in_schema = make_schema_u128_i64();
     // Output: pk, count(I64), sum(I64) — GROUP BY pk → natural PK.
-    let out_schema = make_schema(&[type_code::I64, type_code::I64]);
+    let out_schema = make_schema(&[TypeCode::I64, TypeCode::I64]);
 
     let dir = tempfile::tempdir().unwrap();
     let registry = vm_registry(dir.path());

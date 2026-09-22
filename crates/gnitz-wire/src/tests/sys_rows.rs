@@ -71,13 +71,13 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     assert_eq!(rec.weight, weight);
     let v = rec.row(COL_TAB_COLS, 2); // compound PK: two key columns
     assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.name.into()));
-    assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.type_code));
+    assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.ty.tc.as_wire() as u64));
     assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.is_nullable as u64));
     assert_eq!(v[COLTAB_PAY_FK_TABLE_ID], Val::U64(r.fk_table_id));
     assert_eq!(v[COLTAB_PAY_FK_COL_IDX], Val::U64(r.fk_col_idx));
     assert_eq!(v[COLTAB_PAY_IS_SERIAL], Val::U64(r.is_serial as u64));
     assert_eq!(v[COLTAB_PAY_IS_HIDDEN], Val::U64(r.is_hidden as u64));
-    assert_eq!(v[COLTAB_PAY_SCALE], Val::U64(r.scale as u64));
+    assert_eq!(v[COLTAB_PAY_SCALE], Val::U64(r.ty.scale as u64));
 }
 
 /// Each value must land in the payload slot the readers look for it in.
@@ -88,13 +88,12 @@ fn values_land_in_their_named_payload_slots() {
         owner_id: 16,
         col_idx: 2,
         name: "score",
-        type_code: 10,
+        ty: crate::ColType::decimal(5),
         is_nullable: true,
         fk_table_id: 17,
         fk_col_idx: 3,
         is_serial: true,
         is_hidden: false,
-        scale: 5,
     };
     assert_col_tab_slots(&witness, -1);
     // A second row for the booleans alone: one row cannot separate three

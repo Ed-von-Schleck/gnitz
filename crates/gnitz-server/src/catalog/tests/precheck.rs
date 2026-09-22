@@ -9,7 +9,7 @@ use gnitz_wire::pack_pk_cols;
 use gnitz_wire::sys_rows::write_col_tab_row;
 use gnitz_wire::sys_rows::{write_circuit_node_row, write_idx_tab_row, write_schema_tab_row};
 use gnitz_wire::sys_rows::{CircuitNodeRow, IdxTabRow, SchemaTabRow};
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 use std::fs;
 
 // ── The name rules ──────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ fn a_system_row_may_only_be_written_at_weight_one() {
 #[test]
 fn a_repeated_sign_on_one_pk_is_rejected_for_a_pair_capable_family() {
     let (mut engine, dir) = open("precheck_repeat_sign");
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
@@ -221,7 +221,7 @@ fn a_row_retracted_only_with_its_owner_refuses_an_unpaired_retraction() {
     assert!(err.contains("view 20 node 0"), "{err}");
 
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &col_def("v", type_code::U64).col_tab_row(300, 1), -1);
+    write_col_tab_row(&mut bb, &col_def("v", TypeCode::U64).col_tab_row(300, 1), -1);
     let err = contract_err(&engine, SysFamily::Column, &bb.finish());
     assert!(err.contains("retracted only with its owner"), "{err}");
     assert!(err.contains("column 1 of owner 300"), "{err}");
@@ -262,7 +262,7 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
     // COL_TAB packs the owner into its PK, so its floor is the packed word —
     // and the message renders both halves rather than that word.
     let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
-    write_col_tab_row(&mut bb, &col_def("id", type_code::U64).col_tab_row(IDX_TAB_ID, 0), 1);
+    write_col_tab_row(&mut bb, &col_def("id", TypeCode::U64).col_tab_row(IDX_TAB_ID, 0), 1);
     let err = contract_err(&engine, SysFamily::Column, &bb.finish());
     assert!(err.contains("a system column"), "{err}");
     assert!(err.contains(&format!("column 0 of owner {IDX_TAB_ID}")), "{err}");
@@ -336,7 +336,7 @@ fn a_write_may_not_leave_a_pk_outside_net_weight_zero_or_one() {
 #[test]
 fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
     let (mut engine, dir) = open("precheck_pair_mask");
-    let cols = vec![col_def("id", type_code::U64)];
+    let cols = vec![col_def("id", TypeCode::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     // A rename is the whole of TABLE_TAB's mask, so it passes.

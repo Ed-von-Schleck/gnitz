@@ -10,12 +10,12 @@ use gnitz_wire::wal::{WAL_HEADER_SIZE, WAL_OFF_TID};
 /// A schema record for a 4-column schema, keyed by its first column.
 fn schema_record_4col() -> Vec<u8> {
     use gnitz_store::schema::SchemaColumn;
-    use gnitz_wire::type_code;
+    use gnitz_wire::TypeCode;
     let cols = [
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::I64, 0),
-        SchemaColumn::new(type_code::I64, 1),
-        SchemaColumn::new(type_code::F64, 1),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::I64, true),
+        SchemaColumn::new(TypeCode::F64, true),
     ];
     let schema = SchemaDescriptor::new(&cols, &[0]);
     crate::catalog::encode_schema_block(&schema)

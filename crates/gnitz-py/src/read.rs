@@ -300,7 +300,7 @@ fn present(
     };
     let cols = shown
         .iter()
-        .map(|&ci| (SchemaFacts::locate(schema.as_ref(), ci), schema.columns[ci].ty()))
+        .map(|&ci| (SchemaFacts::locate(schema.as_ref(), ci), schema.columns[ci].ty))
         .collect();
     // Interned: `field_pos` settles on a pointer compare, and the tuple's own
     // hash reads each element's cached one.

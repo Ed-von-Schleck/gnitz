@@ -254,7 +254,7 @@ impl Batch {
         let schema = self.schema();
         let n = self.count;
         assert!(n > 0, "every writer skips an empty output");
-        let mut regions = gnitz_wire::region::Regions::new();
+        let mut regions = gnitz_wire::Regions::new();
         self.wire_regions(&mut regions);
         let num_regions = regions.len();
         let npc = schema.num_payload_cols();

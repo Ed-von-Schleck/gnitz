@@ -609,7 +609,7 @@ fn decoding_regions_equals_decoding_the_framed_block() {
     b.payload[0].bytes = german_col(&vals, &mut blob);
     b.blob = blob;
 
-    let mut regions = gnitz_wire::region::Regions::new();
+    let mut regions = gnitz_wire::Regions::new();
     b.regions(&mut regions);
     let mut local = ZSetBatch::new(&schema);
     decode_regions_into(&mut local, &regions, b.len(), &schema).unwrap();

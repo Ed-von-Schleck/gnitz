@@ -415,7 +415,7 @@ fn crossed_keys_ascend_in_pk_list_order() {
             _ => None,
         })
         .expect("both PK columns carry a list");
-    let (i32_tc, u16_tc) = (TypeCode::I32 as u8, TypeCode::U16 as u8);
+    let (i32_tc, u16_tc) = (TypeCode::I32, TypeCode::U16);
     let mut want = Vec::new();
     for b in [1u128, 5] {
         for a in [-3i128, -1, 2] {

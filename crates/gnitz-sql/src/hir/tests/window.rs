@@ -74,7 +74,7 @@ fn plan_in(cat: &CatalogSnapshot, sql: &str) -> Result<(usize, PlannedView), Gni
 fn visible(cols: &[ColumnDef]) -> Vec<(String, TypeCode, bool)> {
     cols.iter()
         .filter(|c| !c.is_hidden)
-        .map(|c| (c.name.clone(), c.type_code, c.is_nullable))
+        .map(|c| (c.name.clone(), c.ty.tc, c.is_nullable))
         .collect()
 }
 

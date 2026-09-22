@@ -107,7 +107,7 @@ fn push_txn_refuses_a_reads_byte_that_is_not_a_flag() {
     let mut frame = encode_push_txn(0, &[family(WireConflictMode::Update, true, &s, wal_block(16))]);
     frame[CTRL_HEADER_SIZE + 1] = 2;
     let err = peeked(&frame, decode_push_txn).err().expect("a reads byte of 2");
-    assert!(err.contains("reads flag"), "{err:?}");
+    assert!(err.contains("neither 0 nor 1"), "{err:?}");
 }
 
 #[test]

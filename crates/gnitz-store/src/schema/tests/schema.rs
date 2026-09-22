@@ -7,10 +7,10 @@ fn test_project_schema_compound_pk() {
     // Compound-PK input: 4 columns, PK = (col1, col2). Project [0, 3].
     let input = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[1, 2],
     );
@@ -22,8 +22,8 @@ fn test_project_schema_compound_pk() {
     // Single-PK input collapses back to pk_indices = [0].
     let input_single = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -40,15 +40,15 @@ fn test_project_schema_compound_pk() {
 fn test_identity_map_detection() {
     let a = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let b = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -56,8 +56,8 @@ fn test_identity_map_detection() {
 
     let c = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );
@@ -73,8 +73,8 @@ fn test_identity_map_detection() {
 fn nullable_group_col_is_not_natural_reduce_key() {
     let nullable = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 1),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, true),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[1],
     );
@@ -82,8 +82,8 @@ fn nullable_group_col_is_not_natural_reduce_key() {
 
     let non_nullable = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -102,10 +102,10 @@ fn three_col_pk_schema(dist_k: u8) -> SchemaDescriptor {
 fn three_col_placed(placement: Placement) -> SchemaDescriptor {
     SchemaDescriptor::new_with_placement(
         &[
-            SchemaColumn::new(type_code::U32, 0), // col 0: 4 bytes
-            SchemaColumn::new(type_code::U64, 0), // col 1: 8 bytes
-            SchemaColumn::new(type_code::U64, 0), // col 2: 8 bytes
-            SchemaColumn::new(type_code::I64, 0), // payload
+            SchemaColumn::new(TypeCode::U32, false), // col 0: 4 bytes
+            SchemaColumn::new(TypeCode::U64, false), // col 1: 8 bytes
+            SchemaColumn::new(TypeCode::U64, false), // col 2: 8 bytes
+            SchemaColumn::new(TypeCode::I64, false), // payload
         ],
         &[0, 1, 2],
         placement,
@@ -123,10 +123,10 @@ fn default_dist_is_full_pk() {
         SchemaDescriptor::new(
             // bare `new`
             &[
-                SchemaColumn::new(type_code::U32, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(TypeCode::U32, false),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::U64, false),
+                SchemaColumn::new(TypeCode::I64, false),
             ],
             &[0, 1, 2],
         ),
@@ -155,9 +155,8 @@ fn dist_prefix_out_of_range_is_rejected_at_the_decode_boundary() {
     // and is refused where that row can be named — not silently normalized to
     // the full PK here, which would route a corrupt row as if it were sound.
     let props = gnitz_wire::TableProps {
-        replicated: false,
         stream: false,
-        dist_prefix_len: 99,
+        distribution: gnitz_wire::TableDistribution::Keyed { prefix_len: 99 },
     };
     assert!(props.validate_against_pk(3).is_err(), "k=99 over a 3-column PK");
     assert!(props.validate_against_pk(99).is_ok(), "k == |PK| is the full-PK route");
@@ -188,28 +187,31 @@ fn test_schema_column_layout_and_is_signed() {
 
     // `is_signed` is derived from `type_code` in `new()`: true for I8..I64,
     // false for every unsigned / float / string / blob type.
-    for tc in [type_code::I8, type_code::I16, type_code::I32, type_code::I64] {
-        assert!(SchemaColumn::new(tc, 0).is_signed(), "type_code {tc} must be signed");
+    for tc in [TypeCode::I8, TypeCode::I16, TypeCode::I32, TypeCode::I64] {
+        assert!(
+            SchemaColumn::new(tc, false).is_signed(),
+            "type_code {tc} must be signed"
+        );
         // Nullability does not change signedness.
         assert!(
-            SchemaColumn::new(tc, 1).is_signed(),
+            SchemaColumn::new(tc, true).is_signed(),
             "nullable type_code {tc} must be signed"
         );
     }
     for tc in [
-        type_code::U8,
-        type_code::U16,
-        type_code::U32,
-        type_code::U64,
-        type_code::U128,
-        type_code::UUID,
-        type_code::F32,
-        type_code::F64,
-        type_code::STRING,
-        type_code::BLOB,
+        TypeCode::U8,
+        TypeCode::U16,
+        TypeCode::U32,
+        TypeCode::U64,
+        TypeCode::U128,
+        TypeCode::UUID,
+        TypeCode::F32,
+        TypeCode::F64,
+        TypeCode::String,
+        TypeCode::Blob,
     ] {
         assert!(
-            !SchemaColumn::new(tc, 0).is_signed(),
+            !SchemaColumn::new(tc, false).is_signed(),
             "type_code {tc} must not be signed"
         );
     }
@@ -218,20 +220,19 @@ fn test_schema_column_layout_and_is_signed() {
 #[test]
 fn test_new_constructs_schema() {
     let cols = [
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::I64, 0),
-        SchemaColumn::new(type_code::STRING, 1),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::String, true),
     ];
     let s = SchemaDescriptor::new(&cols, &[0]);
     assert_eq!(s.num_columns(), 3);
     assert_eq!(s.pk_indices(), &[0]);
-    assert_eq!(s.columns[0].type_code, type_code::U64);
-    assert_eq!(s.columns[1].type_code, type_code::I64);
-    assert_eq!(s.columns[2].type_code, type_code::STRING);
+    assert_eq!(s.columns[0].type_code, TypeCode::U64);
+    assert_eq!(s.columns[1].type_code, TypeCode::I64);
+    assert_eq!(s.columns[2].type_code, TypeCode::String);
 
-    // Trailing slots are `SchemaColumn::EMPTY` — the padding type code
-    // nothing reads.
-    assert_eq!(s.columns[3].type_code, 0);
+    // Trailing slots are `SchemaColumn::EMPTY` — padding nothing reads.
+    assert_eq!(s.columns[3].size(), 0);
 
     // payload_columns() walks non-PK indices in logical order.
     let payload: Vec<usize> = s.payload_columns().map(|(pi, _)| s.payload_col_idx(pi)).collect();
@@ -252,9 +253,9 @@ fn test_payload_slot_around_pk() {
     // the PK column (1) has no payload slot.
     let s = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[1],
     );
@@ -268,9 +269,9 @@ fn test_payload_slot_around_pk() {
 fn test_locate_out_of_bounds_panics() {
     let s = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
         ],
         &[0],
     );
@@ -284,16 +285,13 @@ fn test_locate_out_of_bounds_panics() {
 /// it exists.
 #[test]
 fn test_pk_eligibility_matches_the_wire_allow_list() {
-    for tc in 0u8..=255 {
-        let Some(size) = TypeCode::try_from_u8(tc).map(|t| t.wire_stride()) else {
-            continue;
-        };
-        assert!(size > 0, "type_code {tc} has no width");
-        let cols = [SchemaColumn::new(tc, 0)];
+    for &tc in TypeCode::ALL {
+        assert!(tc.wire_stride() > 0, "type_code {tc} has no width");
+        let cols = [SchemaColumn::new(tc, false)];
         let built = std::panic::catch_unwind(|| SchemaDescriptor::new(&cols, &[0])).is_ok();
         assert_eq!(
             built,
-            gnitz_wire::is_pk_eligible(tc),
+            tc.is_pk_eligible(),
             "type_code {tc}: descriptor and wire allow-list disagree on PK eligibility",
         );
     }
@@ -303,7 +301,7 @@ fn test_pk_eligibility_matches_the_wire_allow_list() {
 /// pk-list order — at both arities, and at a PK index that is not 0.
 #[test]
 fn test_pk_stride_and_pk_columns() {
-    let pk_cols = |s: &SchemaDescriptor| -> Vec<(usize, usize, u8)> {
+    let pk_cols = |s: &SchemaDescriptor| -> Vec<(usize, usize, TypeCode)> {
         s.pk_columns()
             .enumerate()
             .map(|(ord, (ci, c))| (ord, ci, c.type_code))
@@ -313,33 +311,33 @@ fn test_pk_stride_and_pk_columns() {
     // Compound: [U64, U32], both PK. Stride = 8 + 4.
     let compound = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
         ],
         &[0, 1],
     );
     assert_eq!(compound.pk_stride(), 12);
-    assert_eq!(pk_cols(&compound), vec![(0, 0, type_code::U64), (1, 1, type_code::U32)]);
+    assert_eq!(pk_cols(&compound), vec![(0, 0, TypeCode::U64), (1, 1, TypeCode::U32)]);
 
     // Single PK at column 1, so the pk-list position and the column index
     // differ.
     let single = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[1],
     );
     assert_eq!(single.pk_stride(), 8);
-    assert_eq!(pk_cols(&single), vec![(0, 1, type_code::I64)]);
+    assert_eq!(pk_cols(&single), vec![(0, 1, TypeCode::I64)]);
 }
 
 #[test]
 fn test_max_pk_columns_boundary() {
     // Construct exactly MAX_PK_COLUMNS PK columns so a future bump
     // of the constant keeps exercising the boundary case.
-    let cols = [SchemaColumn::new(type_code::U64, 0); MAX_PK_COLUMNS];
+    let cols = [SchemaColumn::new(TypeCode::U64, false); MAX_PK_COLUMNS];
     let pks: Vec<u32> = (0..MAX_PK_COLUMNS as u32).collect();
     let s = SchemaDescriptor::new(&cols, &pks);
     assert_eq!(s.pk_indices().len(), MAX_PK_COLUMNS);
@@ -355,8 +353,8 @@ fn test_duplicate_pk_guard_panics_in_release() {
     // No cfg(debug_assertions) gate — guard is a hard assert! and
     // must fire in release too.
     let cols = [
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 0),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, false),
     ];
     let _ = SchemaDescriptor::new(&cols, &[0, 0]);
 }
@@ -367,15 +365,19 @@ fn test_duplicate_pk_guard_panics_in_release() {
 /// cached `pk_stride` is the derived one.
 #[test]
 fn schema_descriptor_column_table() {
-    use type_code::{F64, I32, STRING, U64};
+    use TypeCode::{String, F64, I32, U64};
     // (columns as (type_code, nullable), pk list, not_null_payload_slots)
-    type Shape = (&'static [(u8, u8)], &'static [u32], u64);
+    type Shape = (&'static [(TypeCode, bool)], &'static [u32], u64);
     let shapes: &[Shape] = &[
-        (&[(U64, 0), (I32, 0), (STRING, 1)], &[0], 0b01),
-        (&[(STRING, 1), (U64, 0), (F64, 0)], &[1], 0b10),
-        (&[(I32, 0), (U64, 0), (F64, 1), (I32, 0)], &[0, 1], 0b10),
-        (&[(U64, 0), (STRING, 1), (F64, 0), (I32, 0)], &[3, 0], 0b10),
-        (&[(U64, 0), (I32, 0)], &[0, 1], 0),
+        (&[(U64, false), (I32, false), (String, true)], &[0], 0b01),
+        (&[(String, true), (U64, false), (F64, false)], &[1], 0b10),
+        (&[(I32, false), (U64, false), (F64, true), (I32, false)], &[0, 1], 0b10),
+        (
+            &[(U64, false), (String, true), (F64, false), (I32, false)],
+            &[3, 0],
+            0b10,
+        ),
+        (&[(U64, false), (I32, false)], &[0, 1], 0),
     ];
     for &(cols, pk, not_null) in shapes {
         let scols: Vec<SchemaColumn> = cols.iter().map(|&(tc, n)| SchemaColumn::new(tc, n)).collect();
@@ -384,7 +386,7 @@ fn schema_descriptor_column_table() {
         assert_eq!(ColumnTable::pk_cols(&s), pk, "{pk:?}");
         for (ci, &(tc, n)) in cols.iter().enumerate() {
             assert_eq!(ColumnTable::col_type_code(&s, ci), tc, "{pk:?}: col {ci}");
-            assert_eq!(ColumnTable::col_nullable(&s, ci), n != 0, "{pk:?}: col {ci}");
+            assert_eq!(ColumnTable::col_nullable(&s, ci), n, "{pk:?}: col {ci}");
         }
         assert_eq!(s.not_null_payload_slots(), not_null, "{pk:?}: not_null_payload_slots");
         assert_eq!(s.pk_stride(), SchemaFacts::pk_stride(&s), "{pk:?}: cached pk_stride");
@@ -402,21 +404,21 @@ fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
     use crate::test_support::shared::opk_pk;
 
     for (tc, v, want) in [
-        (type_code::I8, -5i128, "-5"),
-        (type_code::I16, -300, "-300"),
-        (type_code::I32, -70_000, "-70000"),
-        (type_code::I64, i64::MIN as i128, "-9223372036854775808"),
-        (type_code::U8, 200, "200"),
-        (type_code::U64, u64::MAX as i128, "18446744073709551615"),
+        (TypeCode::I8, -5i128, "-5"),
+        (TypeCode::I16, -300, "-300"),
+        (TypeCode::I32, -70_000, "-70000"),
+        (TypeCode::I64, i64::MIN as i128, "-9223372036854775808"),
+        (TypeCode::U8, 200, "200"),
+        (TypeCode::U64, u64::MAX as i128, "18446744073709551615"),
         (
-            type_code::U128,
+            TypeCode::U128,
             u128::MAX as i128,
             "340282366920938463463374607431768211455",
         ),
-        (type_code::I128, -1, "-1"),
-        (type_code::I128, i128::MIN, "-170141183460469231731687303715884105728"),
+        (TypeCode::I128, -1, "-1"),
+        (TypeCode::I128, i128::MIN, "-170141183460469231731687303715884105728"),
     ] {
-        let schema = SchemaDescriptor::new(&[SchemaColumn::new(tc, 0)], &[0]);
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(tc, false)], &[0]);
         assert_eq!(
             schema.format_pk_bytes(&opk_pk(&schema, &[v as u128])),
             want,
@@ -424,7 +426,7 @@ fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
         );
     }
 
-    let uuid = SchemaDescriptor::new(&[SchemaColumn::new(type_code::UUID, 0)], &[0]);
+    let uuid = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::UUID, false)], &[0]);
     let v = 0x550e8400_e29b_41d4_a716_446655440000u128;
     assert_eq!(
         uuid.format_pk_bytes(&opk_pk(&uuid, &[v])),
@@ -433,7 +435,7 @@ fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
     );
 
     // 24-byte compound PK: every column read at its own offset.
-    let wide = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 3], &[0, 1, 2]);
+    let wide = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 3], &[0, 1, 2]);
     assert!(wide.pk_stride() > 16);
     assert_eq!(wide.format_pk_bytes(&opk_pk(&wide, &[7, 8, 9])), "7, 8, 9");
 }
@@ -443,7 +445,7 @@ fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
 /// `covers_pk` asks containment, not equality: any order, and any extra column.
 #[test]
 fn covers_pk_accepts_any_superset_of_the_pk_columns() {
-    let col = SchemaColumn::new(type_code::U64, 0);
+    let col = SchemaColumn::new(TypeCode::U64, false);
 
     let compound = SchemaDescriptor::new(&[col; 4], &[1, 2]);
     assert!(compound.covers_pk(&[1, 2]));
@@ -463,7 +465,7 @@ fn covers_pk_accepts_any_superset_of_the_pk_columns() {
 /// Every rule `new_with_placement` would abort the process on is an `Err` here.
 #[test]
 fn try_new_rejects_what_the_panicking_constructor_aborts_on() {
-    let key = SchemaColumn::new(type_code::U64, 0);
+    let key = SchemaColumn::new(TypeCode::U64, false);
     let wide_pk: Vec<u32> = (0..=MAX_PK_COLUMNS as u32).collect();
 
     assert!(SchemaDescriptor::try_new(&[key, key], &[0]).is_ok());
@@ -477,11 +479,11 @@ fn try_new_rejects_what_the_panicking_constructor_aborts_on() {
         "the same column twice"
     );
     assert!(
-        SchemaDescriptor::try_new(&[SchemaColumn::new(type_code::U64, 1)], &[0]).is_err(),
+        SchemaDescriptor::try_new(&[SchemaColumn::new(TypeCode::U64, true)], &[0]).is_err(),
         "nullable PK column"
     );
     assert!(
-        SchemaDescriptor::try_new(&[SchemaColumn::new(type_code::F64, 0)], &[0]).is_err(),
+        SchemaDescriptor::try_new(&[SchemaColumn::new(TypeCode::F64, false)], &[0]).is_err(),
         "PK-ineligible column type"
     );
     assert!(
@@ -503,11 +505,11 @@ fn decode_schema_block_rejects_a_nullable_or_ineligible_pk_column() {
     use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
 
     let col = |tc, nullable| SchemaBlockCol {
-        type_code: tc,
+        ty: gnitz_wire::ColType::of(tc),
         meta: ColMeta { nullable, ..Default::default() },
         name: b"k",
     };
-    for bad in [col(type_code::U64, true), col(type_code::F64, false)] {
+    for bad in [col(TypeCode::U64, true), col(TypeCode::F64, false)] {
         let record = gnitz_wire::schema_block::encode(&[bad], &[0]);
         assert!(
             gnitz_wire::schema_block::decode(&record).is_ok(),
@@ -524,7 +526,7 @@ fn decode_schema_block_rejects_an_empty_out_of_range_or_duplicate_pk() {
     use gnitz_wire::schema_block::{ColMeta, SchemaBlockCol};
 
     let col = SchemaBlockCol {
-        type_code: type_code::U64,
+        ty: gnitz_wire::ColType::of(TypeCode::U64),
         meta: ColMeta::default(),
         name: b"k",
     };

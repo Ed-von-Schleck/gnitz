@@ -14,6 +14,7 @@ use crate::validate::{
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineUniqueIndex, TableProps, TypeCode};
 use gnitz_expr::SchemaFacts;
+use gnitz_wire::TableDistribution;
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
@@ -49,10 +50,9 @@ fn disambiguate_index_name(base: String, taken: &HashSet<String>) -> String {
 /// equal it or hold a domain that fits inside it, and under DECIMAL adopting
 /// another scale would restate its values.
 fn check_fk_type_compat(fk_col: &ColumnDef, parent_col: &ColumnDef) -> Result<(), GnitzSqlError> {
-    let (fk_col_type, parent_col_type) = (fk_col.ty(), parent_col.ty());
+    let (fk_col_type, parent_col_type) = (fk_col.ty, parent_col.ty);
     let fits = fk_col_type.decimal_domains_match(parent_col_type)
-        && (fk_col_type.tc == parent_col_type.tc
-            || gnitz_wire::int_domain_fits(fk_col_type.tc as u8, parent_col_type.tc as u8));
+        && (fk_col_type.tc == parent_col_type.tc || fk_col_type.tc.int_domain_fits(parent_col_type.tc));
     if !fits {
         return Err(GnitzSqlError::Bind(format!(
             "FK type mismatch: column type {fk_col_type} cannot reference column type \
@@ -160,7 +160,7 @@ fn resolve_fk_target_inline(
     check_fk_type_compat(&current_cols[site.col_idx], &current_cols[ref_col_idx])?;
     Ok((
         FkTarget::SelfTable { col: ref_col_idx as u32 },
-        current_cols[ref_col_idx].ty(),
+        current_cols[ref_col_idx].ty,
     ))
 }
 
@@ -218,12 +218,12 @@ fn resolve_fk_target(
 
     Ok((
         FkTarget::Table { id: ref_tid, col: ref_col_idx as u32 },
-        ref_schema.columns[ref_col_idx].ty(),
+        ref_schema.columns[ref_col_idx].ty,
     ))
 }
 
-/// The boolean properties of `CREATE TABLE … WITH (…)`. `dist_prefix_len` is left
-/// at its default; the CLUSTER BY phase fills it.
+/// The boolean properties of `CREATE TABLE … WITH (…)`. A `Keyed` distribution's
+/// prefix is left at its default; the CLUSTER BY phase fills it.
 fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps, GnitzSqlError> {
     let [replicated, stream] = kv_options(table_options, "CREATE TABLE", ["replicated", "stream"])?;
     let flag = |key: &str, value: Option<&Expr>| match value {
@@ -233,10 +233,13 @@ fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps,
             "WITH ({key} = …) expects a boolean (true/false)"
         ))),
     };
+    let distribution = match flag("replicated", replicated)? {
+        true => TableDistribution::Replicated,
+        false => TableDistribution::default(),
+    };
     Ok(TableProps {
-        replicated: flag("replicated", replicated)?,
         stream: flag("stream", stream)?,
-        ..TableProps::default()
+        distribution,
     })
 }
 
@@ -504,7 +507,8 @@ pub fn plan_create_table(
     let table_name = extract_object_name(&create.name, schema_name, "CREATE TABLE")?;
 
     // The `WITH (…)` keys and values are decidable from the statement's own text.
-    // `dist_prefix_len` is the other half of `props`, and needs CLUSTER BY.
+    // A `Keyed` distribution's prefix is the other half of `props`, and needs
+    // CLUSTER BY.
     let mut props = parse_table_options(&create.table_options)?;
 
     // `IF NOT EXISTS` tests the NAME, not the definition — no dialect compares the
@@ -550,7 +554,7 @@ pub fn plan_create_table(
         }
         let (fk, parent_pk_type) = resolve_fk_target(cat, schema_name, site, &table_name, &cols, &pk_indices)?;
         cols[site.col_idx].fk = Some(fk);
-        cols[site.col_idx].set_ty(parent_pk_type);
+        cols[site.col_idx].ty = parent_pk_type;
     }
 
     // The null bitmap excludes the PK region, so a nullable PK has no place to
@@ -564,7 +568,7 @@ pub fn plan_create_table(
     // column, which the engine cannot.
     let pk_stride = gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
         let cd = &cols[c as usize];
-        (cd.type_code as u8, cd.is_nullable)
+        (cd.ty.tc, cd.is_nullable)
     })
     .map_err(|rule| match rule {
         gnitz_wire::PkRule::Empty => {
@@ -576,7 +580,7 @@ pub fn plan_create_table(
         )),
         gnitz_wire::PkRule::NotEligible { col, .. } => {
             let cd = &cols[col as usize];
-            non_key_eligible_error(&cd.name, cd.type_code, "PRIMARY KEY")
+            non_key_eligible_error(&cd.name, cd.ty.tc, "PRIMARY KEY")
         }
         gnitz_wire::PkRule::StrideOutOfRange { stride } => GnitzSqlError::Unsupported(format!(
             "PRIMARY KEY total stride must be 1..={} bytes, got {stride}",
@@ -606,7 +610,7 @@ pub fn plan_create_table(
     // offending column — which the engine's id-only message cannot.
     for u in &unique {
         let names: Vec<&str> = u.cols.iter().map(|&c| cols[c as usize].name.as_str()).collect();
-        let types: Vec<TypeCode> = u.cols.iter().map(|&c| cols[c as usize].type_code).collect();
+        let types: Vec<TypeCode> = u.cols.iter().map(|&c| cols[c as usize].ty.tc).collect();
         reject_unbuildable_index_key(&names, &types, pk_indices.len(), pk_stride, "UNIQUE")?;
     }
 
@@ -614,7 +618,7 @@ pub fn plan_create_table(
     // leading prefix in PK order; the prefix length `k` is persisted in
     // `TABLE_TAB.flags` and drives write-side routing and co-partition detection.
     // No clause ⇒ `k = 0` ⇒ default full-PK distribution.
-    props.dist_prefix_len = if let Some(cluster) = &create.cluster_by {
+    if let Some(cluster) = &create.cluster_by {
         let (WrappedCollection::NoWrapping(exprs) | WrappedCollection::Parentheses(exprs)) = cluster;
         let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());
         for expr in exprs {
@@ -623,12 +627,16 @@ pub fn plan_create_table(
                 .ok_or_else(|| GnitzSqlError::Bind(format!("CLUSTER BY column '{col_name}' not found")))?;
             cluster_indices.push(idx as u32);
         }
-        gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Plan)?
-    } else {
-        0
-    };
-    // The one rule the flags packing cannot represent rides on `TableProps`.
-    props.validate().map_err(GnitzSqlError::Plan)?;
+        let prefix_len =
+            gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Plan)?;
+        // `validate_dist_prefix` bounded the prefix by the PK arity, so the `u8`
+        // is lossless.
+        let prefix_len = prefix_len as u8;
+        if props.distribution == TableDistribution::Replicated {
+            return Err(GnitzSqlError::Plan(gnitz_wire::replicated_with_prefix(prefix_len)));
+        }
+        props.distribution = TableDistribution::Keyed { prefix_len };
+    }
 
     let unique_indexes = name_unique_indexes(unique, &cols, schema_name, &table_name)?;
     Ok(TablePlan::Create {
@@ -797,10 +805,7 @@ pub(crate) fn create_index_core(
 
     // The same rule the engine applies, run here for the message: it names the
     // offending column, which the engine cannot.
-    let col_types: Vec<TypeCode> = col_indices
-        .iter()
-        .map(|&c| schema.columns[c as usize].type_code)
-        .collect();
+    let col_types: Vec<TypeCode> = col_indices.iter().map(|&c| schema.columns[c as usize].ty.tc).collect();
     reject_unbuildable_index_key(&col_names, &col_types, schema.pk_count(), schema.pk_stride(), ctx)?;
 
     let index_name = match explicit_name {

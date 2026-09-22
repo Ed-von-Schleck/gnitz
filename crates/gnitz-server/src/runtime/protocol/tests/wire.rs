@@ -5,21 +5,21 @@ use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::try_decode_german_string;
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 use gnitz_wire::{ClientVerb, WireFlags, WireStatus};
 
 /// The narrow frame schema every fixture here uses: `(u64 pk, u64 val)`.
 fn simple_schema() -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(type_code::U64, 0))
+    u64_pk_schema(SchemaColumn::new(TypeCode::U64, false))
 }
 
 /// U64 pk, a U64 payload and a STRING payload.
 fn string_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     )
@@ -52,8 +52,8 @@ fn encode_decode_roundtrip_with_schema() {
     let s = decoded.schema.unwrap();
     assert_eq!(s.num_columns(), 2);
     assert_eq!(s.pk_indices(), &[0]);
-    assert_eq!(s.columns[0].type_code, type_code::U64);
-    assert_eq!(s.columns[1].type_code, type_code::U64);
+    assert_eq!(s.columns[0].type_code, TypeCode::U64);
+    assert_eq!(s.columns[1].type_code, TypeCode::U64);
     assert!(decoded.data_batch.is_none());
 }
 
@@ -89,8 +89,8 @@ fn encode_decode_roundtrip_with_data() {
 /// the catalog API.
 #[test]
 fn schema_roundtrip_wire_preserves_pk_order() {
-    let u64c = SchemaColumn::new(type_code::U64, 0);
-    let u32c = SchemaColumn::new(type_code::U32, 0);
+    let u64c = SchemaColumn::new(TypeCode::U64, false);
+    let u32c = SchemaColumn::new(TypeCode::U32, false);
     let cases: &[(&[SchemaColumn], &[u32])] = &[
         (&[u64c, u64c], &[0, 1]),
         (&[u64c, u64c], &[1, 0]),
@@ -387,7 +387,7 @@ fn schemaless_command_slot_is_a_bare_control_block() {
 /// answer `is_consolidated()` structurally either way.
 #[test]
 fn decode_applies_batch_flags() {
-    let schema = two_col_schema(0);
+    let schema = two_col_schema(false);
     let batch = make_batch(&schema, &[(1, 1, 42)]);
 
     let blk = encode_schema_block(&schema);
@@ -404,8 +404,8 @@ fn decode_applies_batch_flags() {
     assert_eq!(b.layout(), Layout::Consolidated, "decoder applies batch_consolidated");
 }
 
-fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
-    u64_pk_schema(SchemaColumn::new(type_code::I64, col1_nullable))
+fn two_col_schema(col1_nullable: bool) -> SchemaDescriptor {
+    u64_pk_schema(SchemaColumn::new(TypeCode::I64, col1_nullable))
 }
 
 /// Each mismatch family is rejected, and each names itself distinctly.
@@ -418,7 +418,7 @@ fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
 #[test]
 fn validate_schema_match_names_each_mismatch_distinctly() {
     let col = |tc, n| SchemaColumn::new(tc, n);
-    let expected = two_col_schema(0);
+    let expected = two_col_schema(false);
     assert!(
         validate_schema_match(&expected, &expected).is_ok(),
         "a schema matches itself"
@@ -426,20 +426,20 @@ fn validate_schema_match_names_each_mismatch_distinctly() {
     let cases = [
         (
             "count",
-            SchemaDescriptor::new(&[col(type_code::U64, 0)], &[0]),
+            SchemaDescriptor::new(&[col(TypeCode::U64, false)], &[0]),
             expected,
         ),
         (
             "pk",
-            SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::I64, 0)], &[1]),
+            SchemaDescriptor::new(&[col(TypeCode::U64, false), col(TypeCode::I64, false)], &[1]),
             expected,
         ),
         (
             "type",
-            SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::F64, 0)], &[0]),
+            SchemaDescriptor::new(&[col(TypeCode::U64, false), col(TypeCode::F64, false)], &[0]),
             expected,
         ),
-        ("nullable", two_col_schema(0), two_col_schema(1)),
+        ("nullable", two_col_schema(false), two_col_schema(true)),
     ];
     let msgs: Vec<String> = cases
         .iter()
@@ -464,9 +464,9 @@ fn validate_schema_match_names_each_mismatch_distinctly() {
 fn scattered_roundtrips_over_a_padded_schema() {
     let sd = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I16, 0),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I16, false),
         ],
         &[0],
     );

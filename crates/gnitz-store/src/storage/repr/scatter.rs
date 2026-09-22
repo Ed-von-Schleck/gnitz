@@ -9,7 +9,6 @@
 use super::batch::{write_to_batch, Batch, FIXED_REGION_BYTES};
 use super::merge::{ColPtr, ColumnarSource, DirectWriter, MemBatch, UnifiedSource};
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::is_german_string;
 
 /// Instantiate `$f` at the const width matching `$w`, which is also passed on.
 /// The literal width keeps the per-row copy a load/store instead of a `memcpy`
@@ -89,7 +88,7 @@ pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut Direc
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
-        if is_german_string(col.type_code) {
+        if col.type_code.is_german_string() {
             // Blob relocation is sequential per-row; no way to batch.
             for (out, &idx) in indices.iter().enumerate() {
                 let row = idx as usize;
@@ -187,7 +186,7 @@ pub(crate) fn scatter_unified_sources(
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
         let cs = col.size() as usize;
-        if is_german_string(col.type_code) {
+        if col.type_code.is_german_string() {
             // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };

@@ -6,9 +6,7 @@
 use std::ops::Range;
 
 use crate::schema::key::{locate_key_col, pk_width_dispatch, FoldCols, NarrowPkOpk, PkSortKey, ReindexPacker};
-use crate::schema::{
-    type_code, ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor,
-};
+use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, MemBatch};
 use gnitz_expr::RowSource;
 
@@ -18,7 +16,7 @@ use gnitz_expr::RowSource;
 #[inline]
 pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> bool {
     matches!(*group_by_cols, [c] if schema.column(c as usize)
-        .is_some_and(|col| col.nullable == 0 && gnitz_wire::is_pk_eligible(col.type_code)))
+        .is_some_and(|col| !col.nullable && col.type_code.is_pk_eligible()))
 }
 
 /// The 128-bit group key of a row: the single group column's OPK image where
@@ -74,7 +72,7 @@ impl GroupKeyCols {
 /// The synthetic `_group_pk` key — the whole PK region of an output whose group
 /// set has no natural key. One definition, so every operator keyed like a reduce
 /// keys its output at the same width.
-pub(super) const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(type_code::U128, 0);
+pub(super) const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 
 /// Push a group-keyed secondary index's PK region — the packed group key, then
 /// the `suffix` columns the packer reserved room for — onto `b`. Infallible by

@@ -3,6 +3,8 @@
 
 use std::cmp::Ordering;
 
+use gnitz_wire::TypeCode;
+
 use crate::{RowSource, SchemaFacts};
 
 /// Where a logical column's value physically lives in a row, resolved once from
@@ -10,9 +12,13 @@ use crate::{RowSource, SchemaFacts};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnLocator {
     /// In the OPK-encoded PK region at `byte_off`; never NULL.
-    Pk { byte_off: u8, size: u8, type_code: u8 },
+    Pk {
+        byte_off: u8,
+        size: u8,
+        type_code: TypeCode,
+    },
     /// Native little-endian in payload slot `slot`, which is also its null bit.
-    Payload { slot: u8, size: u8, type_code: u8 },
+    Payload { slot: u8, size: u8, type_code: TypeCode },
 }
 
 const _: () = assert!(
@@ -30,7 +36,11 @@ const _: () = assert!(
 
 impl ColumnLocator {
     /// Padding for fixed-size locator arrays; names no real column.
-    pub const EMPTY: ColumnLocator = ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 };
+    pub const EMPTY: ColumnLocator = ColumnLocator::Pk {
+        byte_off: 0,
+        size: 0,
+        type_code: TypeCode::U8,
+    };
 
     #[inline(always)]
     pub fn size(&self) -> usize {
@@ -40,14 +50,10 @@ impl ColumnLocator {
     }
 
     #[inline(always)]
-    pub fn type_code(&self) -> u8 {
+    pub fn type_code(&self) -> TypeCode {
         match *self {
             ColumnLocator::Pk { type_code, .. } | ColumnLocator::Payload { type_code, .. } => type_code,
         }
-    }
-
-    fn type_code_enum(&self) -> Option<gnitz_wire::TypeCode> {
-        gnitz_wire::TypeCode::try_from_u8(self.type_code())
     }
 
     /// True iff this column is NULL in `row`.
@@ -105,10 +111,7 @@ impl ColumnLocator {
     /// column's own type.
     #[inline(always)]
     pub fn decode_i64(&self, mb: &impl RowSource, row: usize, fi: gnitz_wire::FixedInt) -> i64 {
-        debug_assert_eq!(
-            self.type_code_enum().and_then(gnitz_wire::FixedInt::from_type_code),
-            Some(fi)
-        );
+        debug_assert_eq!(gnitz_wire::FixedInt::from_type_code(self.type_code()), Some(fi));
         match *self {
             ColumnLocator::Pk { .. } => gnitz_wire::decode_opk_i64(self.bytes(mb, row), fi),
             ColumnLocator::Payload { .. } => fi.decode_le_i64(self.bytes(mb, row)),
@@ -120,10 +123,7 @@ impl ColumnLocator {
     /// own.
     #[inline(always)]
     pub fn order_bits(&self, mb: &impl RowSource, row: usize, kind: gnitz_wire::ScalarKind) -> u64 {
-        debug_assert_eq!(
-            self.type_code_enum().and_then(gnitz_wire::ScalarKind::from_type_code),
-            Some(kind)
-        );
+        debug_assert_eq!(gnitz_wire::ScalarKind::from_type_code(self.type_code()), Some(kind));
         match kind {
             gnitz_wire::ScalarKind::Int(fi) => (self.decode_i64(mb, row, fi) as u64) ^ ((fi.is_signed() as u64) << 63),
             // A float is never a PK column, so `bytes` is already the native image.
@@ -151,7 +151,7 @@ impl ColumnLocator {
     /// Write this column's value in `row` as `out_tc`'s OPK bytes into `dst`;
     /// `out_tc` must hold every value of this column's type.
     #[inline(always)]
-    pub fn encode_opk_promoted(&self, mb: &impl RowSource, row: usize, out_tc: u8, dst: &mut [u8]) {
+    pub fn encode_opk_promoted(&self, mb: &impl RowSource, row: usize, out_tc: TypeCode, dst: &mut [u8]) {
         gnitz_wire::store_opk_image(self.opk_image(mb, row), self.type_code(), self.size(), out_tc, dst);
     }
 
@@ -164,7 +164,7 @@ impl ColumnLocator {
             ColumnLocator::Pk { .. } => gnitz_wire::widen_pk_be(cell),
             ColumnLocator::Payload { size, type_code, .. } => {
                 // Biased at the cell's width; the `u128` form measured slower.
-                let signed = gnitz_wire::is_signed_int(type_code);
+                let signed = type_code.is_signed_int();
                 if size == 16 {
                     u128::from_le_bytes(cell.try_into().unwrap()) ^ ((signed as u128) << 127)
                 } else {

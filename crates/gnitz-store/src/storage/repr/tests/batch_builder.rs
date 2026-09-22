@@ -1,9 +1,9 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 
 /// The column list `(type_code, nullable)` pairs describe, with `pk_index` the
 /// single PK column — the shape every builder case below is written against.
-fn make_schema_cols(cols: &[(u8, u8)], pk_index: u32) -> SchemaDescriptor {
+fn make_schema_cols(cols: &[(TypeCode, bool)], pk_index: u32) -> SchemaDescriptor {
     let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
     for (i, &(tc, nullable)) in cols.iter().enumerate() {
         columns[i] = SchemaColumn::new(tc, nullable);
@@ -18,10 +18,10 @@ fn make_schema_cols(cols: &[(u8, u8)], pk_index: u32) -> SchemaDescriptor {
 #[test]
 fn batch_builder_physical_col_idx_compound_pk() {
     let cols = [
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 0),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, false),
     ];
     let schema = SchemaDescriptor::new(&cols, &[1, 2]);
     let mut bb = BatchBuilder::new(schema);
@@ -37,7 +37,11 @@ fn batch_builder_physical_col_idx_compound_pk() {
 #[test]
 fn batch_builder_writes_string_cells_and_nulls() {
     let schema = make_schema_cols(
-        &[(type_code::U64, 0), (type_code::STRING, 1), (type_code::STRING, 1)],
+        &[
+            (TypeCode::U64, false),
+            (TypeCode::String, true),
+            (TypeCode::String, true),
+        ],
         0,
     );
 
@@ -95,19 +99,19 @@ fn batch_builder_writes_every_payload_type_at_its_own_width() {
     // U64 pk, then one of each remaining type at payload index 0..=11.
     let schema = make_schema_cols(
         &[
-            (type_code::U64, 0),    // pk
-            (type_code::U8, 0),     // pi 0
-            (type_code::I8, 0),     // pi 1
-            (type_code::U16, 0),    // pi 2
-            (type_code::I16, 0),    // pi 3
-            (type_code::U32, 0),    // pi 4
-            (type_code::I32, 0),    // pi 5
-            (type_code::F32, 0),    // pi 6
-            (type_code::U64, 0),    // pi 7
-            (type_code::I64, 0),    // pi 8
-            (type_code::F64, 0),    // pi 9
-            (type_code::STRING, 0), // pi 10
-            (type_code::I128, 0),   // pi 11
+            (TypeCode::U64, false),    // pk
+            (TypeCode::U8, false),     // pi 0
+            (TypeCode::I8, false),     // pi 1
+            (TypeCode::U16, false),    // pi 2
+            (TypeCode::I16, false),    // pi 3
+            (TypeCode::U32, false),    // pi 4
+            (TypeCode::I32, false),    // pi 5
+            (TypeCode::F32, false),    // pi 6
+            (TypeCode::U64, false),    // pi 7
+            (TypeCode::I64, false),    // pi 8
+            (TypeCode::F64, false),    // pi 9
+            (TypeCode::String, false), // pi 10
+            (TypeCode::I128, false),   // pi 11
         ],
         0,
     );

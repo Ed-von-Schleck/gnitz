@@ -1,7 +1,7 @@
 use gnitz_expr::{ExprValidateErr, LogicalProgram, Output, Reg, Sink};
 
 use super::{MapPlan, PkSource};
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_COLUMNS};
 use crate::storage::Batch;
 
 /// Build a `Batch` of `(pk, weight, null_word, payload i64 cells)` rows against
@@ -23,10 +23,10 @@ fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -
     batch
 }
 
-fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
+fn make_schema(pk_index: u32, col_types: &[TypeCode]) -> SchemaDescriptor {
     let mut columns = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (i, &tc) in col_types.iter().enumerate() {
-        let nullable = if i == pk_index as usize { 0 } else { 1 };
+        let nullable = i != pk_index as usize;
         columns[i] = SchemaColumn::new(tc, nullable);
     }
     SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
@@ -34,8 +34,8 @@ fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
 
 #[test]
 fn test_projection_batch() {
-    let in_schema = make_schema(0, &[8, 9, 9]);
-    let out_schema = make_schema(0, &[8, 9, 9]);
+    let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
+    let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20]), (2, 1, 0, &[30, 40])]);
 
     let prog = LogicalProgram::copy_cols(&[2, 1]);
@@ -51,8 +51,8 @@ fn test_projection_batch() {
 
 #[test]
 fn test_map_copy_and_emit() {
-    let in_schema = make_schema(0, &[8, 9, 9]);
-    let out_schema = make_schema(0, &[8, 9, 9]);
+    let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
+    let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
 
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20])]);
 
@@ -81,7 +81,7 @@ fn test_map_copy_and_emit() {
 
 #[test]
 fn test_empty_batch() {
-    let schema = make_schema(0, &[8, 9]);
+    let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
     let batch = Batch::empty_with_schema(&schema);
 
     let func = MapPlan::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema, PkSource::Inherit).unwrap();
@@ -112,13 +112,13 @@ fn test_map_blob_passthrough_and_fallback() {
         b
     }
 
-    let in_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
+    let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::String, TypeCode::String]);
 
     // (A) Keep BOTH string columns (reordered) → passthrough fires; the shared
     // blob keeps every long string's heap offset valid through the verbatim copy.
     {
         let batch = build(&in_schema);
-        let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
+        let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::String, TypeCode::String]);
         let prog = LogicalProgram::copy_cols(&[2, 1]);
         let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
         let out = func.evaluate_map_batch(&batch);
@@ -140,7 +140,7 @@ fn test_map_blob_passthrough_and_fallback() {
     // output blob carries only the referenced (here empty, short-inline) spans.
     {
         let batch = build(&in_schema);
-        let out_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
+        let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::String]);
         let prog = LogicalProgram::copy_cols(&[1]);
         let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
         let out = func.evaluate_map_batch(&batch);
@@ -166,9 +166,9 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
     // PK = (U128 c0, I64 c1); payload = I64 c2.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     );
@@ -176,11 +176,11 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
     // the payload passthrough.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U128, 0), // payload 0 ← PK col 0
-            SchemaColumn::new(type_code::I64, 0),  // payload 1 ← PK col 1
-            SchemaColumn::new(type_code::I64, 0),  // payload 2 ← payload col 2
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U128, false), // payload 0 ← PK col 0
+            SchemaColumn::new(TypeCode::I64, false),  // payload 1 ← PK col 1
+            SchemaColumn::new(TypeCode::I64, false),  // payload 2 ← payload col 2
         ],
         &[0, 1],
     );
@@ -229,22 +229,22 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     // PK = (U16 c0, I16 c1); payload = I8 c2 (negative), U8 c3.
     let in_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U16, 0),
-            SchemaColumn::new(type_code::I16, 0),
-            SchemaColumn::new(type_code::I8, 0),
-            SchemaColumn::new(type_code::U8, 0),
+            SchemaColumn::new(TypeCode::U16, false),
+            SchemaColumn::new(TypeCode::I16, false),
+            SchemaColumn::new(TypeCode::I8, false),
+            SchemaColumn::new(TypeCode::U8, false),
         ],
         &[0, 1],
     );
     // Every copied column lands in an I64 slot — 4 distinct narrow→wide widens.
     let out_schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U16, 0),
-            SchemaColumn::new(type_code::I16, 0),
-            SchemaColumn::new(type_code::I64, 0), // ← U16 PK  (zero-extend)
-            SchemaColumn::new(type_code::I64, 0), // ← I16 PK  (sign-extend)
-            SchemaColumn::new(type_code::I64, 0), // ← I8 payload (sign-extend)
-            SchemaColumn::new(type_code::I64, 0), // ← U8 payload (zero-extend)
+            SchemaColumn::new(TypeCode::U16, false),
+            SchemaColumn::new(TypeCode::I16, false),
+            SchemaColumn::new(TypeCode::I64, false), // ← U16 PK  (zero-extend)
+            SchemaColumn::new(TypeCode::I64, false), // ← I16 PK  (sign-extend)
+            SchemaColumn::new(TypeCode::I64, false), // ← I8 payload (sign-extend)
+            SchemaColumn::new(TypeCode::I64, false), // ← U8 payload (zero-extend)
         ],
         &[0, 1],
     );
@@ -282,7 +282,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
 /// filter matching nothing (which a client would read as an empty table).
 #[test]
 fn test_register_free_predicate_is_rejected() {
-    let schema = make_schema(0, &[8, 9]);
+    let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
     let prog = LogicalProgram::copy_cols(&[]);
     assert_eq!(
         prog.resolve_filter(&schema).err(),
@@ -298,7 +298,7 @@ fn test_register_free_predicate_is_rejected() {
 fn test_from_predicate_filter_ranges_over_a_batch() {
     use gnitz_expr::{CmpOp, LogicalInstr};
 
-    let schema = make_schema(0, &[type_code::U64, type_code::I64]);
+    let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
     // Rows 1..=6 with col1 = 5, 20, 30, 0, 40, 50 → `col1 > 15` keeps
     // {1, 2} and {4, 5}: two runs, so a PK-only or per-row answer would differ.
     let rows: Vec<(u64, i64, u64, &[i64])> = vec![
@@ -355,8 +355,8 @@ fn make_string_batch(schema: &SchemaDescriptor, rows: &[&[&[u8]]]) -> Batch {
 fn map_whose_only_computed_column_is_a_string_still_runs_the_kernel() {
     use gnitz_expr::LogicalInstr;
     // [U64 pk, STRING name] -> [U64 pk, U64 id_copy, STRING upper_name].
-    let in_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
-    let out_schema = make_schema(0, &[type_code::U64, type_code::U64, type_code::STRING]);
+    let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::String]);
+    let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::U64, TypeCode::String]);
     let mut batch = make_string_batch(&in_schema, &[&[b"abc"], &[b"a-long-value-past-twelve"]]);
     // The copied column is the PK, which `PkSource::Inherit` carries verbatim; give
     // the output's first payload slot something to hold.
@@ -391,8 +391,8 @@ fn map_whose_only_computed_column_is_a_string_still_runs_the_kernel() {
 fn string_emit_composes_with_blob_passthrough() {
     use gnitz_expr::LogicalInstr;
     // [U64 pk, STRING s] -> [U64 pk, STRING s_copy, STRING s_upper].
-    let in_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
-    let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
+    let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::String]);
+    let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::String, TypeCode::String]);
     let batch = make_string_batch(&in_schema, &[&[b"a-long-value-past-twelve"], &[b"short"]]);
 
     let instrs = vec![
@@ -431,8 +431,8 @@ fn string_emit_composes_with_blob_passthrough() {
 #[test]
 fn null_string_emit_zeroes_the_cell_and_sets_the_bit() {
     use gnitz_expr::LogicalInstr;
-    let in_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
-    let out_schema = make_schema(0, &[type_code::U64, type_code::U64, type_code::STRING]);
+    let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::String]);
+    let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::U64, TypeCode::String]);
     let mut batch = make_string_batch(&in_schema, &[&[b"abc"], &[b"def"]]);
     // Row 1's source string is NULL.
     gnitz_wire::write_u64_le(batch.null_bmp_data_mut(), 8, 1);
@@ -533,7 +533,7 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         (5, false, b"cd", b"ab"),
     ];
 
-    let in_schema = make_schema(0, &[type_code::U64, type_code::I64, type_code::STRING, type_code::BLOB]);
+    let in_schema = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::String, TypeCode::Blob]);
     let mut batch = Batch::with_capacity(&in_schema, rows.len());
     for (row, &(v, is_null, s, b)) in rows.iter().enumerate() {
         batch.extend_pk(row as u128);
@@ -548,10 +548,7 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
     }
 
     // The hash-row output schema: one synthetic U128 PK, then the payload.
-    let out_schema = make_schema(
-        0,
-        &[type_code::U128, type_code::I64, type_code::STRING, type_code::BLOB],
-    );
+    let out_schema = make_schema(0, &[TypeCode::U128, TypeCode::I64, TypeCode::String, TypeCode::Blob]);
     let plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[1, 2, 3]),
         &in_schema,
@@ -592,11 +589,11 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
 #[test]
 fn a_compound_permuted_pk_decodes_at_every_width() {
     let pk_types = [
-        type_code::I8,
-        type_code::U16,
-        type_code::I32,
-        type_code::U64,
-        type_code::I128,
+        TypeCode::I8,
+        TypeCode::U16,
+        TypeCode::I32,
+        TypeCode::U64,
+        TypeCode::I128,
     ];
     // PK-list order, deliberately not column order: each column's OPK byte
     // offset comes from this list, so a width mixed up here would be caught as
@@ -605,7 +602,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
 
     let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
     for (i, &t) in pk_types.iter().enumerate() {
-        cols[i] = SchemaColumn::new(t, 0);
+        cols[i] = SchemaColumn::new(t, false);
     }
     let in_schema = SchemaDescriptor::new(&cols[..5], &pk_order);
     // The output inherits the PK and adds one payload column per PK column, at
@@ -613,7 +610,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
     // are exactly what the decode produced.
     let mut out_cols = cols;
     for (i, &t) in pk_types.iter().enumerate() {
-        out_cols[5 + i] = SchemaColumn::new(t, 1);
+        out_cols[5 + i] = SchemaColumn::new(t, true);
     }
     let out_schema = SchemaDescriptor::new(&out_cols[..10], &pk_order);
 
@@ -644,7 +641,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
     assert_eq!(out.count, rows.len());
     for (row, vals) in rows.iter().enumerate() {
         for (pi, (&v, &t)) in vals.iter().zip(&pk_types).enumerate() {
-            let w = gnitz_wire::wire_stride(t);
+            let w = t.wire_stride();
             assert_eq!(
                 &out.col_data(pi)[row * w..row * w + w],
                 &(v as u128).to_le_bytes()[..w],
@@ -679,7 +676,7 @@ fn map_ranges_bench() {
     // both payload columns kept — the equijoin / GROUP BY repartition shape.
     // Column 0 is what puts a `ColumnLocator::Pk` copy in the loop; the keep-set
     // rules retain the source PK on every one of those.
-    let rx_in = make_schema(0, &[type_code::U64, type_code::I64, type_code::I64]);
+    let rx_in = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64]);
     let mut rx_batch = Batch::with_capacity(&rx_in, N);
     for i in 0..N as u64 {
         rx_batch.extend_pk(i as u128);
@@ -701,8 +698,8 @@ fn map_ranges_bench() {
 
     // --- String-emitting map: [U64 PK, STRING] -> [U64 PK, STRING upper],
     // the shape whose STRING output comes only from `str_emits`.
-    let se_in = make_schema(0, &[type_code::U64, type_code::STRING]);
-    let se_out = make_schema(0, &[type_code::U64, type_code::STRING]);
+    let se_in = make_schema(0, &[TypeCode::U64, TypeCode::String]);
+    let se_out = make_schema(0, &[TypeCode::U64, TypeCode::String]);
     let mut se_batch = Batch::with_capacity(&se_in, N);
     for i in 0..N {
         se_batch.extend_pk(i as u128);
@@ -732,10 +729,10 @@ fn map_ranges_bench() {
     // --- Hash-row maps: [U64 PK, payload...] -> [U128 hash PK, payload...], the
     // set-op / DISTINCT leaf. Fixed-width shapes on both sides of the fold's
     // stack arm, and heap-backed strings beside integers.
-    let hash_row = |name: &'static str, payload: &[u8]| {
-        let mut in_tcs = vec![type_code::U64];
+    let hash_row = |name: &'static str, payload: &[TypeCode]| {
+        let mut in_tcs = vec![TypeCode::U64];
         in_tcs.extend_from_slice(payload);
-        let mut out_tcs = vec![type_code::U128];
+        let mut out_tcs = vec![TypeCode::U128];
         out_tcs.extend_from_slice(payload);
         let in_schema = make_schema(0, &in_tcs);
         let mut batch = Batch::with_capacity(&in_schema, N);
@@ -744,7 +741,7 @@ fn map_ranges_bench() {
             batch.extend_weight(&1i64.to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
             for (pi, &tc) in payload.iter().enumerate() {
-                if tc == type_code::STRING {
+                if tc == TypeCode::String {
                     batch.extend_col_blob(pi, format!("row-{i:012}-payload").as_bytes());
                 } else {
                     batch.extend_col(pi, &i.wrapping_mul(2_654_435_761 + pi as u64).to_le_bytes());
@@ -762,8 +759,8 @@ fn map_ranges_bench() {
         .unwrap();
         (name, plan, batch)
     };
-    const I64: u8 = type_code::I64;
-    const STR: u8 = type_code::STRING;
+    const I64: TypeCode = TypeCode::I64;
+    const STR: TypeCode = TypeCode::String;
     let hash_rows = [
         hash_row("hash_row[i64x2]", &[I64, I64]),
         hash_row("hash_row[i64x10]", &[I64; 10]),
@@ -808,8 +805,8 @@ fn wire_rejection(in_schema: &SchemaDescriptor, mk: gnitz_wire::MapKind) -> Stri
 fn u64_i64() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     )
@@ -844,9 +841,9 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
     };
     let three = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -868,7 +865,7 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
     );
     // A key longer than MAX_PK_COLUMNS overflows the output schema's fixed PK array.
     let n = crate::schema::MAX_PK_COLUMNS + 1;
-    let wide = SchemaDescriptor::new(&vec![SchemaColumn::new(type_code::U64, 0); n], &[0]);
+    let wide = SchemaDescriptor::new(&vec![SchemaColumn::new(TypeCode::U64, false); n], &[0]);
     assert_eq!(
         wire_rejection(&wide, reindex(vec![0], (0..n as u32).collect())),
         format!("reindex key: {n} columns exceeds the {}-column PK limit", n - 1)
@@ -885,8 +882,8 @@ fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
     };
     let s = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U32, false),
         ],
         &[0],
     );
@@ -916,7 +913,7 @@ fn a_corrupt_compute_map_program_is_rejected() {
     let s = u64_i64();
     let mk = gnitz_wire::MapKind::Compute(gnitz_wire::ComputeMap {
         program: vec![0xff; 8],
-        out_cols: vec![(type_code::I64, false)],
+        out_cols: vec![(TypeCode::I64, false)],
     });
     assert!(wire_rejection(&s, mk).starts_with("map: invalid program"));
 }
@@ -925,10 +922,10 @@ fn a_corrupt_compute_map_program_is_rejected() {
 /// reaching `SchemaDescriptor::new`'s release-active `assert!`.
 #[test]
 fn compute_map_refuses_an_over_wide_declaration() {
-    let schema = make_schema(0, &[type_code::U64, type_code::I64]);
+    let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
     let map = gnitz_wire::ComputeMap {
         program: vec![1, 2, 3],
-        out_cols: (0..MAX_COLUMNS).map(|_| (type_code::I64, false)).collect(),
+        out_cols: (0..MAX_COLUMNS).map(|_| (TypeCode::I64, false)).collect(),
     };
     let Err(err) = MapPlan::from_compute_map(&schema, &map) else {
         panic!("an over-wide compute map must be refused");
@@ -943,10 +940,10 @@ fn compute_map_refuses_an_over_wide_declaration() {
 /// plan that maps garbage.
 #[test]
 fn compute_map_refuses_a_corrupt_program() {
-    let schema = make_schema(0, &[type_code::U64, type_code::I64]);
+    let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
     let map = gnitz_wire::ComputeMap {
         program: vec![0xff; 8],
-        out_cols: vec![(type_code::I64, false)],
+        out_cols: vec![(TypeCode::I64, false)],
     };
     let Err(err) = MapPlan::from_compute_map(&schema, &map) else {
         panic!("a corrupt compute map program must be refused");

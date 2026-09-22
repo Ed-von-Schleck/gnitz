@@ -24,7 +24,7 @@ use super::sys_tables::*;
 use super::*;
 use gnitz_store::relation::SecondaryIndex;
 use gnitz_store::storage::Slot;
-use gnitz_wire::{pack_pk_cols, type_code, PK_LIST_PACKED_FLAG};
+use gnitz_wire::{pack_pk_cols, TypeCode, PK_LIST_PACKED_FLAG};
 
 use std::fs;
 
@@ -118,14 +118,14 @@ const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
 /// A non-nullable U64 schema column — the building block of the compound-PK
 /// fixtures below.
 fn u64c() -> gnitz_store::schema::SchemaColumn {
-    gnitz_store::schema::SchemaColumn::new(type_code::U64, 0)
+    gnitz_store::schema::SchemaColumn::new(TypeCode::U64, false)
 }
 
 /// The OPK image of a three-column U64 compound PK (`pk_stride` = 24, wide).
 /// Encoded through the production encoder, so a broken encoder fails the test
 /// rather than agreeing with a second spelling of the rule here.
 fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
-    let schema = pk_payload_schema(&[type_code::U64; 3]);
+    let schema = pk_payload_schema(&[TypeCode::U64; 3]);
     opk_pk(&schema, &[a as u128, b as u128, c as u128])
         .try_into()
         .expect("three U64 PK columns encode to 24 bytes")
@@ -159,7 +159,7 @@ fn proj_blob(copies: &[(u32, u32)]) -> Vec<u8> {
 fn map_of(program: Vec<u8>, reply: &gnitz_store::schema::SchemaDescriptor) -> Option<gnitz_wire::ComputeMap> {
     let out_cols = reply
         .payload_columns()
-        .map(|(_, c)| (c.type_code, c.nullable != 0))
+        .map(|(_, c)| (c.type_code, c.nullable))
         .collect();
     Some(gnitz_wire::ComputeMap { program, out_cols })
 }
@@ -256,12 +256,20 @@ fn create_flagged_table(
 /// The three non-default `TABLE_TAB.flags` words the fixtures use, so a test reads
 /// as the property under test rather than as a bit pattern.
 fn replicated_flags() -> u64 {
-    gnitz_wire::TableProps { replicated: true, ..Default::default() }.pack()
+    gnitz_wire::TableProps {
+        distribution: gnitz_wire::TableDistribution::Replicated,
+        ..Default::default()
+    }
+    .pack()
 }
 
 /// CLUSTER BY the PK's leading `k` columns.
 fn clustered_flags(k: usize) -> u64 {
-    gnitz_wire::TableProps { dist_prefix_len: k, ..Default::default() }.pack()
+    gnitz_wire::TableProps {
+        distribution: gnitz_wire::TableDistribution::Keyed { prefix_len: k as u8 },
+        ..Default::default()
+    }
+    .pack()
 }
 
 fn stream_flags() -> u64 {

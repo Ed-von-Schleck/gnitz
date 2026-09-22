@@ -10,8 +10,8 @@ pub trait ColumnTable {
     fn pk_cols(&self) -> &[u32];
     /// Number of logical columns (PK + payload).
     fn num_columns(&self) -> usize;
-    /// Column `ci`'s wire type code.
-    fn col_type_code(&self, ci: usize) -> u8;
+    /// Column `ci`'s type code.
+    fn col_type_code(&self, ci: usize) -> gnitz_wire::TypeCode;
     /// True iff column `ci` admits NULL.
     fn col_nullable(&self, ci: usize) -> bool;
 }
@@ -26,7 +26,7 @@ pub trait SchemaFacts: ColumnTable {
             return None;
         }
         let type_code = self.col_type_code(ci);
-        let size = gnitz_wire::wire_stride(type_code) as u8;
+        let size = type_code.wire_stride() as u8;
         Some(match gnitz_wire::payload_slot(self.pk_cols(), ci) {
             Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
             None => ColumnLocator::Pk {
@@ -34,7 +34,7 @@ pub trait SchemaFacts: ColumnTable {
                     .pk_cols()
                     .iter()
                     .take_while(|&&p| p as usize != ci)
-                    .map(|&p| gnitz_wire::wire_stride(self.col_type_code(p as usize)))
+                    .map(|&p| self.col_type_code(p as usize).wire_stride())
                     .sum::<usize>() as u8,
                 size,
                 type_code,
@@ -82,7 +82,7 @@ pub trait SchemaFacts: ColumnTable {
     fn pk_stride(&self) -> usize {
         self.pk_cols()
             .iter()
-            .map(|&p| gnitz_wire::wire_stride(self.col_type_code(p as usize)))
+            .map(|&p| self.col_type_code(p as usize).wire_stride())
             .sum()
     }
 
@@ -97,7 +97,7 @@ pub trait SchemaFacts: ColumnTable {
     /// The null bits a conforming batch never sets: every payload slot's but
     /// the nullable ones'.
     fn not_null_payload_slots(&self) -> u64 {
-        gnitz_wire::all_payload_null_mask(self.num_payload_cols()) & !self.nullable_payload_slots()
+        gnitz_wire::low_bits_mask(self.num_payload_cols()) & !self.nullable_payload_slots()
     }
 
     /// The output-key kind a reduce grouped by `group` over this schema warrants.
@@ -120,7 +120,7 @@ pub trait SchemaFacts: ColumnTable {
         gnitz_wire::encode_pk_tuple(
             self.pk_cols().iter().map(|&p| {
                 let tc = self.col_type_code(p as usize);
-                (gnitz_wire::wire_stride(tc), tc)
+                (tc.wire_stride(), tc)
             }),
             &native_le[..stride],
         )
@@ -149,7 +149,7 @@ pub trait SchemaFacts: ColumnTable {
         let mut off = 0;
         for &p in self.pk_cols() {
             let tc = self.col_type_code(p as usize);
-            let w = gnitz_wire::wire_stride(tc);
+            let w = tc.wire_stride();
             gnitz_wire::decode_pk_column(&key[off..off + w], tc, &mut buf[off..off + w]);
             off += w;
         }

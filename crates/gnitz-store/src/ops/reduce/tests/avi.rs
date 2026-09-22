@@ -15,7 +15,7 @@ use gnitz_wire::{AggDescriptor, AggFunc, ScalarKind};
 /// value image is read through the same accessor the AVI's write side uses.
 fn payload_row(tc: TypeCode, le: &[u8]) -> (Batch, ColumnLocator) {
     let schema = SchemaDescriptor::new(
-        &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc as u8, 0)],
+        &[SchemaColumn::new(TypeCode::U64, false), SchemaColumn::new(tc, false)],
         &[0],
     );
     let mut b = Batch::with_capacity(&schema, 1);
@@ -49,10 +49,10 @@ fn a_mixed_scalar_and_wide_bake_reads_both_ordinals_back() {
     // `[pk:U64, g:I32, a:I64, b:U128]`, GROUP BY g, with MIN(a) and MAX(b).
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::I64, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0],
     );
@@ -117,9 +117,9 @@ fn one_group_delta(src: &SchemaDescriptor, n: u64, mut put: impl FnMut(&mut Batc
 fn a_sixteen_byte_only_bake_keeps_its_image_in_the_key() {
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U128, false),
         ],
         &[0],
     );
@@ -146,10 +146,10 @@ fn a_sixteen_byte_only_bake_keeps_its_image_in_the_key() {
 fn a_sixteen_byte_and_string_bake_reads_both_ordinals_back() {
     let src = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I32, false),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );

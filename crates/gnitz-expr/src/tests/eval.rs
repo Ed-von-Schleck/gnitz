@@ -4,7 +4,7 @@
 //! a resolved program through.
 
 use crate::{ConstIdx, Reg, Sink};
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 use crate::batch::MORSEL;
 use crate::test_support::{
@@ -31,19 +31,15 @@ fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
     // in:  pk U64, 0: I64 nullable, 1: STRING nullable
     // out: pk U64, 0: I64 (copied verbatim), 1: I64 (computed), 2: STRING (computed)
     let in_schema = TestSchema::new(
-        &[
-            (type_code::U64, false),
-            (type_code::I64, true),
-            (type_code::STRING, true),
-        ],
+        &[(TypeCode::U64, false), (TypeCode::I64, true), (TypeCode::String, true)],
         &[0],
     );
     let out_schema = TestSchema::new(
         &[
-            (type_code::U64, false),
-            (type_code::I64, true),
-            (type_code::I64, false),
-            (type_code::STRING, true),
+            (TypeCode::U64, false),
+            (TypeCode::I64, true),
+            (TypeCode::I64, false),
+            (TypeCode::String, true),
         ],
         &[0],
     );
@@ -70,7 +66,7 @@ fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
     // output — the property `emits_anything` exists to let a caller skip it.
     let projection = map_prog(
         &in_schema,
-        &TestSchema::new(&[(type_code::U64, false), (type_code::I64, true)], &[0]),
+        &TestSchema::new(&[(TypeCode::U64, false), (TypeCode::I64, true)], &[0]),
         Vec::new(),
         vec![Sink::Col(1)],
         vec![],
@@ -669,11 +665,11 @@ fn is_null_into_a_register_sink_reads_back_per_row() {
 fn not_null_load_schema() -> TestSchema {
     TestSchema::new(
         &[
-            (type_code::U64, false),
-            (type_code::I64, false),
-            (type_code::F32, false),
-            (type_code::STRING, false),
-            (type_code::STRING, false),
+            (TypeCode::U64, false),
+            (TypeCode::I64, false),
+            (TypeCode::F32, false),
+            (TypeCode::String, false),
+            (TypeCode::String, false),
         ],
         &[0],
     )
@@ -780,8 +776,8 @@ fn not_null_load_arms_agree_and_report_no_null() {
     const LOAD_REG: u16 = 0;
 
     for (name, (instrs, result_reg), is_str) in not_null_load_shapes() {
-        let out_tc = if is_str { type_code::STRING } else { type_code::I64 };
-        let out_schema = TestSchema::new(&[(type_code::U64, false), (out_tc, false)], &[0]);
+        let out_tc = if is_str { TypeCode::String } else { TypeCode::I64 };
+        let out_schema = TestSchema::new(&[(TypeCode::U64, false), (out_tc, false)], &[0]);
 
         let (fast_filter, nullable_filter) =
             both_arms(name, || filter_prog(&schema, instrs.clone(), result_reg, consts()));
@@ -845,13 +841,13 @@ fn not_null_load_arms_agree_and_report_no_null() {
 fn nullable_and_not_null_columns_side_by_side() {
     let schema = TestSchema::new(
         &[
-            (type_code::U64, false),    // 0: pk
-            (type_code::I64, true),     // 1: payload slot 0
-            (type_code::I64, false),    // 2: payload slot 1
-            (type_code::STRING, true),  // 3: payload slot 2
-            (type_code::STRING, false), // 4: payload slot 3
-            (type_code::F32, true),     // 5: payload slot 4
-            (type_code::F32, false),    // 6: payload slot 5
+            (TypeCode::U64, false),    // 0: pk
+            (TypeCode::I64, true),     // 1: payload slot 0
+            (TypeCode::I64, false),    // 2: payload slot 1
+            (TypeCode::String, true),  // 3: payload slot 2
+            (TypeCode::String, false), // 4: payload slot 3
+            (TypeCode::F32, true),     // 5: payload slot 4
+            (TypeCode::F32, false),    // 6: payload slot 5
         ],
         &[0],
     );
@@ -1236,7 +1232,7 @@ fn eval_all_reports_one_result_per_row_in_its_own_class() {
 fn result_is_u64_follows_the_result_register() {
     use gnitz_wire::FixedInt;
     let schema = TestSchema::new(
-        &[(type_code::U64, false), (type_code::U64, true), (type_code::I64, true)],
+        &[(TypeCode::U64, false), (TypeCode::U64, true), (TypeCode::I64, true)],
         &[0],
     );
     let u64_plus_one = |last: LogicalInstr| {

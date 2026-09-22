@@ -76,13 +76,12 @@ fn col_tab_row(
         owner_id,
         col_idx,
         name,
-        type_code: type_code as u64,
+        ty: gnitz_wire::ColType::of(type_code),
         is_nullable,
         fk_table_id: 0,
         fk_col_idx: 0,
         is_serial: false,
         is_hidden,
-        scale: 0,
     }
 }
 

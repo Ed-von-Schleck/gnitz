@@ -49,8 +49,8 @@ pub(super) fn build_reduce_output_schema(
                 ad.agg_op, src.type_code
             ))
         })?;
-        let nullable = ad.agg_op.raw_output_nullable(src.nullable != 0, ungrouped);
-        b.push(SchemaColumn::new(tc, nullable as u8)).map_err(over)?;
+        let nullable = ad.agg_op.raw_output_nullable(src.nullable, ungrouped);
+        b.push(SchemaColumn::new(tc, nullable)).map_err(over)?;
     }
     Ok(b.finish())
 }

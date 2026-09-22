@@ -15,7 +15,7 @@
 
 use proptest::prelude::*;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES, MAX_PK_COLUMNS};
 use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
 use crate::test_support::{arb_pk_type, arb_type_code, row_key, zset_of};
 
@@ -36,11 +36,11 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
     let pk = prop::collection::vec(arb_pk_type(), 1..=MAX_PK_COLUMNS);
     // Any of the 15 type codes is a valid payload column (incl. F32/F64 and the
     // German-string STRING/BLOB), so payloads draw from the full type set.
-    let payload = prop::collection::vec((arb_type_code(), 0u8..=1), 0..=4);
+    let payload = prop::collection::vec((arb_type_code(), any::<bool>()), 0..=4);
     (pk, payload)
         // (type_code, nullable, is_pk); PK columns are non-nullable.
         .prop_map(|(pk_types, payloads)| {
-            let mut specs: Vec<(u8, u8, bool)> = pk_types.into_iter().map(|tc| (tc, 0u8, true)).collect();
+            let mut specs: Vec<(TypeCode, bool, bool)> = pk_types.into_iter().map(|tc| (tc, false, true)).collect();
             specs.extend(payloads.into_iter().map(|(tc, n)| (tc, n, false)));
             specs
         })
@@ -49,7 +49,7 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
             specs
                 .iter()
                 .filter(|&&(_, _, is_pk)| is_pk)
-                .map(|&(tc, _, _)| gnitz_wire::wire_stride(tc))
+                .map(|&(tc, _, _)| tc.wire_stride())
                 .sum::<usize>()
                 <= MAX_PK_BYTES
         })
@@ -101,7 +101,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         // Null bitmap: a null bit only where the column is nullable.
         let mut nw: u64 = 0;
         for (pi, col) in schema.payload_columns() {
-            if col.nullable != 0 && rng.gen_range(2) == 0 {
+            if col.nullable && rng.gen_range(2) == 0 {
                 gnitz_wire::null_word_set(&mut nw, pi, true);
             }
         }
@@ -110,7 +110,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
             let cs = col.size() as usize;
             if gnitz_wire::null_word_get(nw, pi) {
                 batch.fill_col_zero(pi, cs); // null cell; zset_of won't read it
-            } else if gnitz_wire::is_german_string(col.type_code) {
+            } else if col.type_code.is_german_string() {
                 batch.extend_col_blob(pi, &arb_string(&mut rng));
             } else {
                 let v = rng.gen_u128();

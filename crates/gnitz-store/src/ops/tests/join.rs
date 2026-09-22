@@ -4,7 +4,7 @@ use std::rc::Rc;
 use proptest::prelude::*;
 
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout};
 use crate::test_support::{
     make_batch, make_batch_i64pk as make_signed_batch, make_batch_opk, make_schema_i64pk_i64 as make_schema_signed,
@@ -57,41 +57,41 @@ fn probe_eq_size(probe: &JoinProbe) -> usize {
 fn the_output_lays_out_the_key_then_both_payloads() {
     let left = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
     let right = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(TypeCode::U128, false),
+            SchemaColumn::new(TypeCode::String, false),
         ],
         &[0],
     );
     let joined = plan(JoinKind::Equi, false, &left, &right).out_schema;
     assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
-    assert_eq!(joined.columns[0].type_code, type_code::U128);
-    assert_eq!(joined.columns[1].type_code, type_code::I64);
-    assert_eq!(joined.columns[2].type_code, type_code::STRING);
+    assert_eq!(joined.columns[0].type_code, TypeCode::U128);
+    assert_eq!(joined.columns[1].type_code, TypeCode::I64);
+    assert_eq!(joined.columns[2].type_code, TypeCode::String);
 
     // A keyless join takes no part in either key, so it mints the pair.
     let crossed = plan(JoinKind::Cross, false, &left, &right).out_schema;
     assert_eq!(crossed.pk_indices(), &[0, 1]);
     assert_eq!(crossed.num_columns(), 4);
-    assert_eq!(crossed.columns[2].type_code, type_code::I64);
-    assert_eq!(crossed.columns[3].type_code, type_code::STRING);
+    assert_eq!(crossed.columns[2].type_code, TypeCode::I64);
+    assert_eq!(crossed.columns[3].type_code, TypeCode::String);
 }
 
 #[test]
 fn the_output_carries_a_compound_pk_into_the_key_region() {
     // A keyed join takes one shared key, so both sides' PK columns match.
-    let left = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 4], &[1, 2]);
+    let left = SchemaDescriptor::new(&[SchemaColumn::new(TypeCode::U64, false); 4], &[1, 2]);
     let right = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0, 1],
     );
@@ -99,14 +99,14 @@ fn the_output_carries_a_compound_pk_into_the_key_region() {
     // Two PK columns up front, then left payload (2), then right payload (1) = 5.
     assert_eq!(joined.num_columns(), 5);
     assert_eq!(joined.pk_indices(), &[0, 1]);
-    assert_eq!(joined.columns[0].type_code, type_code::U64);
-    assert_eq!(joined.columns[1].type_code, type_code::U64);
+    assert_eq!(joined.columns[0].type_code, TypeCode::U64);
+    assert_eq!(joined.columns[1].type_code, TypeCode::U64);
 
     // A single-PK pair collapses back to pk_indices = [0].
     let single = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(TypeCode::U64, false),
+            SchemaColumn::new(TypeCode::I64, false),
         ],
         &[0],
     );
@@ -119,9 +119,9 @@ fn the_output_carries_a_compound_pk_into_the_key_region() {
 /// the sign flip.
 #[test]
 fn a_keyed_join_refuses_mismatched_pk_types() {
-    let signed = pk_payload_schema(&[type_code::I64]);
-    let unsigned = pk_payload_schema(&[type_code::U64]);
-    let narrow = pk_payload_schema(&[type_code::U32]);
+    let signed = pk_payload_schema(&[TypeCode::I64]);
+    let unsigned = pk_payload_schema(&[TypeCode::U64]);
+    let narrow = pk_payload_schema(&[TypeCode::U32]);
     for kind in [JoinKind::Equi, JoinKind::Range { n_eq: 0, rel: RangeRel::Lt }] {
         for (a, b) in [(&signed, &unsigned), (&unsigned, &narrow)] {
             let err = JoinPlan::from_wire(kind, false, a, b)
@@ -149,11 +149,11 @@ fn a_keyed_join_refuses_mismatched_pk_types() {
 #[test]
 fn equi_join_products_the_trace_group_at_every_pk_shape() {
     let shapes: [(&str, SchemaDescriptor, &[u128], &[u128]); 3] = [
-        ("i32", pk_payload_schema(&[type_code::I32]), &[-7i64 as u128], &[1]),
-        ("u64", pk_payload_schema(&[type_code::U64]), &[1], &[2]),
+        ("i32", pk_payload_schema(&[TypeCode::I32]), &[-7i64 as u128], &[1]),
+        ("u64", pk_payload_schema(&[TypeCode::U64]), &[1], &[2]),
         (
             "3xu64",
-            pk_payload_schema(&[type_code::U64; 3]),
+            pk_payload_schema(&[TypeCode::U64; 3]),
             &[1, 1, 2],
             &[1, 1, 1 << 56],
         ),
@@ -334,8 +334,8 @@ fn equi_merge_walk_self_positions_a_stale_cursor() {
 /// still yields the product.
 #[test]
 fn cross_join_products_every_delta_row_with_every_trace_row() {
-    let left = pk_payload_schema(&[type_code::U64]);
-    let right = pk_payload_schema(&[type_code::U64; 3]);
+    let left = pk_payload_schema(&[TypeCode::U64]);
+    let right = pk_payload_schema(&[TypeCode::U64; 3]);
     let (l1, l2) = (opk_pk(&left, &[1]), opk_pk(&left, &[2]));
     let (r1, r2, r3) = (
         opk_pk(&right, &[1, 1, 1]),
@@ -707,11 +707,11 @@ const FIXTURE_STRINGS: [&[u8]; 4] = [
 /// and a STRING, the columns a null-merge or blob-relocation bug in the emit
 /// loop would show up in.
 fn make_range_schema(n_eq: usize, wide: bool) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = (0..n_eq + 1).map(|_| SchemaColumn::new(type_code::U64, 0)).collect();
-    cols.push(SchemaColumn::new(type_code::I64, 0)); // payload
+    let mut cols: Vec<SchemaColumn> = (0..n_eq + 1).map(|_| SchemaColumn::new(TypeCode::U64, false)).collect();
+    cols.push(SchemaColumn::new(TypeCode::I64, false)); // payload
     if wide {
-        cols.push(SchemaColumn::new(type_code::I64, 1));
-        cols.push(SchemaColumn::new(type_code::STRING, 0));
+        cols.push(SchemaColumn::new(TypeCode::I64, true));
+        cols.push(SchemaColumn::new(TypeCode::String, false));
     }
     let pk: Vec<u32> = (0..n_eq as u32 + 1).collect();
     SchemaDescriptor::new(&cols, &pk)
@@ -885,7 +885,7 @@ fn assert_matches_reference(
 fn cuts(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     let mut pk = eq.to_vec();
     pk.extend_from_slice(d);
-    let schema = pk_only_schema(&vec![type_code::U8; pk.len()]);
+    let schema = pk_only_schema(&vec![TypeCode::U8; pk.len()]);
     RangeProbe::new(&schema, eq.len() as u8, rel, true)
         .expect("u8-slot fixture is a well-formed range key")
         .cut_points(&pk)

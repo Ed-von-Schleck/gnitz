@@ -118,10 +118,10 @@ fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
 /// A PK-sorted check batch whose row `j` carries `keys[j]` — an image at type
 /// `ref_tc` — in the leading key column of `schema`'s PK, the rest of each key
 /// zero. Sorts `keys` first: an image orders as its OPK bytes do.
-fn build_check_batch(schema: &SchemaDescriptor, keys: &mut [u128], ref_tc: u8) -> Batch {
+fn build_check_batch(schema: &SchemaDescriptor, keys: &mut [u128], ref_tc: gnitz_wire::TypeCode) -> Batch {
     keys.sort_unstable();
     let key_tc = schema.columns[schema.pk_indices()[0] as usize].type_code;
-    let (ref_w, key_w) = (gnitz_wire::wire_stride(ref_tc), gnitz_wire::wire_stride(key_tc));
+    let (ref_w, key_w) = (ref_tc.wire_stride(), key_tc.wire_stride());
     let mut key = [0u8; gnitz_wire::MAX_PK_BYTES];
     let mut batch = Batch::with_capacity(schema, keys.len());
     for &k in keys.iter() {

@@ -43,14 +43,14 @@ fn sample(op: Opcode) -> OpNode {
         },
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: vec![0, 2] },
         Opcode::NullExtend => OpNode::NullExtend {
-            type_codes: vec![crate::type_code::I64, crate::type_code::STRING],
+            type_codes: vec![crate::TypeCode::I64, crate::TypeCode::String],
             nulls_first: true,
         },
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
         Opcode::MapProj => OpNode::Map(MapKind::Projection(vec![4, 0, 9])),
         Opcode::MapExpr => OpNode::Map(MapKind::Compute(ComputeMap {
             program: vec![7],
-            out_cols: vec![(crate::type_code::I64, false), (crate::type_code::STRING, true)],
+            out_cols: vec![(crate::TypeCode::I64, false), (crate::TypeCode::String, true)],
         })),
         Opcode::MapHashRow => OpNode::Map(MapKind::HashRow {
             cols: vec![(1, None), (2, Some(TypeCode::I32))],
@@ -149,7 +149,7 @@ fn every_op_node_variant_roundtrips() {
             });
         }
         nodes.push(OpNode::NullExtend {
-            type_codes: vec![crate::type_code::I64],
+            type_codes: vec![crate::TypeCode::I64],
             nulls_first: delta_is_right,
         });
     }
@@ -238,7 +238,7 @@ fn decode_rejects_an_out_of_domain_reindex_target() {
         decode_op_node(
             Opcode::MapHashRow.as_wire(),
             None,
-            Some(&hash_row(crate::type_code::U128)),
+            Some(&hash_row(crate::TypeCode::U128.as_wire())),
         )
         .is_ok(),
         "a hash-row target's domain is the copy kernel's, not this decode's",
@@ -251,16 +251,15 @@ fn decode_rejects_an_out_of_domain_reindex_target() {
     }
 }
 
-/// A NULL_EXTEND type code becomes a schema column verbatim. An undecodable
-/// one is not inert — `wire_stride` reports 8 for it, so it clears any width
-/// test, and the schema it lands in becomes every downstream node's input.
+/// A NULL_EXTEND type code becomes a schema column verbatim, so an undecodable
+/// one is refused at decode.
 #[test]
 fn decode_rejects_invalid_null_extend_type_code() {
     let mut params = vec![0u8]; // nulls_first
     params.extend(1u16.to_le_bytes());
     params.push(200);
     let err = decode_op_node(Opcode::NullExtend.as_wire(), None, Some(&params)).unwrap_err();
-    assert!(err.contains("invalid column type code"), "got: {err}");
+    assert!(err.contains("invalid type code"), "got: {err}");
 }
 
 /// A `MAP_REINDEX` whose role cannot be read decides nothing about routing, so
@@ -408,13 +407,13 @@ fn a_malformed_scan_bound_is_rejected() {
 fn for_group_cols_picks_the_output_key() {
     use ReduceOutKey::*;
     let (u64, u128, uuid, i64) = (
-        crate::TypeCode::U64 as u8,
-        crate::TypeCode::U128 as u8,
-        crate::TypeCode::UUID as u8,
-        crate::TypeCode::I64 as u8,
+        crate::TypeCode::U64,
+        crate::TypeCode::U128,
+        crate::TypeCode::UUID,
+        crate::TypeCode::I64,
     );
     // (pk, group, (type code, nullable), key)
-    let rows: &[(&[u32], &[u32], (u8, bool), ReduceOutKey)] = &[
+    let rows: &[(&[u32], &[u32], (TypeCode, bool), ReduceOutKey)] = &[
         (&[0], &[1], (u64, true), SyntheticFold),
         (&[0], &[1], (u64, false), SingleNaturalCol),
         (&[0], &[1], (uuid, false), SingleNaturalCol),

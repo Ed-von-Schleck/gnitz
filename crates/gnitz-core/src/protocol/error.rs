@@ -2,7 +2,6 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum ProtocolError {
-    UnknownTypeCode(u64),
     DecodeError(String),
     IoError(std::io::Error),
     /// The peer refused the connection itself and said why — the HELLO reject.
@@ -14,7 +13,6 @@ pub enum ProtocolError {
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProtocolError::UnknownTypeCode(code) => write!(f, "unknown type code: {code}"),
             ProtocolError::DecodeError(msg) => write!(f, "decode error: {msg}"),
             ProtocolError::IoError(e) => write!(f, "io error: {e}"),
             ProtocolError::ServerRejected(msg) => write!(f, "server rejected: {msg}"),

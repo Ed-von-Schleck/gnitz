@@ -17,7 +17,7 @@ const NBASE: u64 = 200;
 fn fixture_with(name: &str, bound: Option<IndexBound>, val_of: impl Fn(u64) -> u64) -> (CatalogEngine, i64, i64) {
     let dir = temp_dir(name);
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
 
     let schema = engine.registry.relation(tid).map(Relation::schema).unwrap();

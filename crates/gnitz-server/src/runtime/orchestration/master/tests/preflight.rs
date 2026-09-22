@@ -1,21 +1,21 @@
 use super::*;
 use gnitz_store::schema::SchemaColumn;
-use gnitz_wire::type_code;
+use gnitz_wire::TypeCode;
 
 /// An I32 `-1` image lands as the I64 `-1` an index key holds, source-PK suffix zero.
 #[test]
 fn build_check_batch_promotes_the_key_image_into_the_leading_column() {
     let cols = vec![
-        SchemaColumn::new(type_code::I64, 0),
-        SchemaColumn::new(type_code::U64, 0),
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::U64, false),
     ];
     let idx = SchemaDescriptor::new(&cols, &[0, 1]);
 
-    let batch = build_check_batch(&idx, &mut [0x7FFF_FFFFu128], type_code::I32);
+    let batch = build_check_batch(&idx, &mut [0x7FFF_FFFFu128], TypeCode::I32);
 
     assert_eq!(batch.len(), 1);
     let mut expected = [0u8; 8];
-    gnitz_wire::encode_pk_column(&(-1i64).to_le_bytes(), type_code::I64, &mut expected);
+    gnitz_wire::encode_pk_column(&(-1i64).to_le_bytes(), TypeCode::I64, &mut expected);
     let key = batch.get_pk_bytes(0);
     assert_eq!(&key[..8], &expected[..], "the leading column holds the promoted value");
     assert_eq!(&key[8..], &[0u8; 8], "the source-PK suffix stays zero");
@@ -29,9 +29,9 @@ fn build_check_batch_promotes_the_key_image_into_the_leading_column() {
 #[test]
 fn probe_schema_keeps_the_key_and_drops_every_payload_column() {
     let cols = vec![
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::I64, 0),
-        SchemaColumn::new(type_code::STRING, 1),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::I64, false),
+        SchemaColumn::new(TypeCode::String, true),
     ];
     let schema = SchemaDescriptor::new(&cols, &[0]);
     let pk_only = probe_schema(&schema);
@@ -40,10 +40,10 @@ fn probe_schema_keeps_the_key_and_drops_every_payload_column() {
     assert_eq!(pk_only.pk_stride(), schema.pk_stride());
     assert_eq!(pk_only.pk_indices(), &[0]);
 
-    let batch = build_check_batch(&pk_only, &mut [42u128], type_code::U64);
+    let batch = build_check_batch(&pk_only, &mut [42u128], TypeCode::U64);
     assert_eq!(batch.len(), 1);
     let mut expected = [0u8; 8];
-    gnitz_wire::encode_pk_column(&42u64.to_le_bytes(), type_code::U64, &mut expected);
+    gnitz_wire::encode_pk_column(&42u64.to_le_bytes(), TypeCode::U64, &mut expected);
     assert_eq!(batch.get_pk_bytes(0), &expected[..]);
 }
 
@@ -56,9 +56,9 @@ fn probe_schema_keeps_the_key_and_drops_every_payload_column() {
 #[test]
 fn probe_schema_carries_the_source_placement() {
     let cols = vec![
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::I64, 0),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::I64, false),
     ];
     let clustered =
         SchemaDescriptor::new(&cols, &[0, 1]).with_placement(gnitz_store::schema::Placement::Keyed { prefix_len: 1 });
@@ -97,8 +97,8 @@ fn check_batch_build_bench() {
     const ROUNDS: usize = 2_000;
 
     let cols = vec![
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::I64, 0),
+        SchemaColumn::new(TypeCode::U64, false),
+        SchemaColumn::new(TypeCode::I64, false),
     ];
     let schema = probe_schema(&SchemaDescriptor::new(&cols, &[0]));
     let keys: Vec<[u8; 8]> = (0..ROWS as u64).map(|i| i.to_be_bytes()).collect();
@@ -118,7 +118,7 @@ fn check_batch_build_bench() {
 
 #[test]
 fn rows_of_names_every_row_a_key_prefixes() {
-    let schema = crate::test_support::pk_only_schema(&[type_code::U64, type_code::U64]);
+    let schema = crate::test_support::pk_only_schema(&[TypeCode::U64, TypeCode::U64]);
     let key = |a: u64, b: u64| [a.to_be_bytes(), b.to_be_bytes()].concat();
     let keys = [key(1, 0), key(3, 1), key(3, 1), key(3, 9), key(7, 0)];
     let check = PipelinedCheck {

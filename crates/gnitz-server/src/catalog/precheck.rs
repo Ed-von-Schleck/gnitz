@@ -8,10 +8,7 @@ use super::*;
 use gnitz_expr::{RowSource, SchemaFacts};
 use gnitz_store::schema::make_index_schema;
 use gnitz_wire::MAX_COLUMNS;
-use gnitz_wire::{
-    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_SCALE,
-    COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
-};
+use gnitz_wire::{low_bits_mask, BitIter, TypeCode, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
 /// `[A-Za-z0-9_]` and already canonical (every cache key here is compared
@@ -56,18 +53,6 @@ fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), Stri
     if col_defs.len() > MAX_COLUMNS {
         return Err(format!("has {} columns (max {})", col_defs.len(), MAX_COLUMNS));
     }
-    if let Some(cd) = col_defs.iter().find(|cd| !gnitz_wire::is_valid_type_code(cd.type_code)) {
-        return Err(format!("column '{}' has invalid type code {}", cd.name, cd.type_code));
-    }
-    if let Some(cd) = col_defs
-        .iter()
-        .find(|cd| !gnitz_wire::decimal::scale_admissible(cd.type_code, cd.scale))
-    {
-        return Err(format!(
-            "column '{}' has type code {} and cannot carry scale {}",
-            cd.name, cd.type_code, cd.scale
-        ));
-    }
     if kind.is_ingestion_point() {
         let mut seen = FxHashSet::default();
         if let Some(cd) = col_defs
@@ -85,7 +70,7 @@ fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), Stri
 fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(), String> {
     gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), gnitz_wire::PK_LIST_MAX_COLS, |c| {
         let cd = &col_defs[c as usize];
-        (cd.type_code, cd.is_nullable)
+        (cd.ty.tc, cd.is_nullable)
     })
     .map(|_stride| ())
     .map_err(|rule| rule.to_string())
@@ -103,7 +88,7 @@ pub(in crate::catalog) fn build_schema_from_col_defs(
     validate_pk_against_cols(col_defs, pk_cols)?;
     let cols: Vec<SchemaColumn> = col_defs
         .iter()
-        .map(|cd| SchemaColumn::new(cd.type_code, cd.is_nullable as u8))
+        .map(|cd| SchemaColumn::new(cd.ty.tc, cd.is_nullable))
         .collect();
     Ok(SchemaDescriptor::new_with_placement(&cols, pk_cols, placement))
 }
@@ -178,15 +163,13 @@ fn payload_differs(
     b: &impl RowSource,
     rb: usize,
 ) -> bool {
-    (0..schema.num_payload_cols())
-        .filter(|&pi| (mask >> pi) & 1 == 0)
-        .any(|pi| {
-            let loc = schema.locate(schema.payload_col_idx(pi));
-            match (loc.is_null(a, ra), loc.is_null(b, rb)) {
-                (false, false) => loc.cmp_non_null(a, ra, b, rb).is_ne(),
-                (na, nb) => na != nb,
-            }
-        })
+    BitIter(low_bits_mask(schema.num_payload_cols()) & !mask).any(|pi| {
+        let loc = schema.locate(schema.payload_col_idx(pi));
+        match (loc.is_null(a, ra), loc.is_null(b, rb)) {
+            (false, false) => loc.cmp_non_null(a, ra, b, rb).is_ne(),
+            (na, nb) => na != nb,
+        }
+    })
 }
 
 /// A rewrite pair's `+1` may differ from its `-1` only in the family's declared
@@ -205,30 +188,6 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
             family.row_noun(),
             family.pk_label(sig.pk)
         ));
-    }
-    Ok(())
-}
-
-/// Every COL_TAB word `read_col_tab_row` narrows, against the width it narrows
-/// to. One that overflows decodes to something `write_col_tab_row` could never
-/// emit (`type_code` `0x104` → `4`), leaving a stored row no client can
-/// reproduce and so no later `-1` can retract. It also bounds the booleans to
-/// `{0, 1}` for the ALTER direction test below.
-fn check_col_narrowings(batch: &Batch, row: usize) -> Result<(), String> {
-    for (field, pi, max) in [
-        ("type_code", COLTAB_PAY_TYPE_CODE, u8::MAX as u64),
-        ("is_nullable", COLTAB_PAY_IS_NULLABLE, 1),
-        ("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64),
-        ("is_serial", COLTAB_PAY_IS_SERIAL, 1),
-        ("is_hidden", COLTAB_PAY_IS_HIDDEN, 1),
-        ("scale", COLTAB_PAY_SCALE, u8::MAX as u64),
-    ] {
-        let w = payload_u64(batch, row, pi);
-        if w > max {
-            return Err(format!(
-                "column record carries {field} = {w}, past the {max} its stored width holds"
-            ));
-        }
     }
     Ok(())
 }
@@ -264,7 +223,7 @@ impl CatalogEngine {
         pk: &[u32],
         net_dead: &[i64],
     ) -> Result<(), String> {
-        let self_pk_type = col_defs[pk[0] as usize].type_code;
+        let self_pk_type = col_defs[pk[0] as usize].ty.tc;
         for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
             self.validate_fk_column(cd, tid, pk, self_pk_type, net_dead)?;
         }
@@ -276,7 +235,7 @@ impl CatalogEngine {
         col: &ColumnDef,
         self_table_id: i64,
         self_pk: &[u32],
-        self_pk_type: u8,
+        self_pk_type: TypeCode,
         net_dead: &[i64],
     ) -> Result<(), String> {
         // `col.fk_col_idx` here is the PARENT's referenced column index (the
@@ -328,10 +287,10 @@ impl CatalogEngine {
         // The preflight compares child and parent values as the referenced
         // column's key image, so both columns carry one type; SQL adopts the
         // parent's type before the engine sees the column.
-        if col.type_code != target_type {
+        if col.ty.tc != target_type {
             return Err(format!(
                 "FK type mismatch: child type code {} cannot reference target type code {target_type}",
-                col.type_code
+                col.ty.tc
             ));
         }
         Ok(())
@@ -446,9 +405,8 @@ impl CatalogEngine {
         for sig in sigs {
             // COL_TAB PK = `(owner_id, col_idx)`.
             let (owner_id, col_idx) = (sig.leading, sig.pk as u64);
-            for row in [sig.neg, sig.pos].into_iter().flatten() {
-                check_col_narrowings(batch, row)?;
-            }
+            let old = sig.neg.map(|r| read_col_tab_row(batch, r)).transpose()?;
+            let new = sig.pos.map(|r| read_col_tab_row(batch, r)).transpose()?;
 
             let Some((is_base, owner_schema)) = self
                 .registry
@@ -471,13 +429,11 @@ impl CatalogEngine {
                 return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
             }
 
-            let Some(pj) = sig.pos else {
+            let Some(new) = new else {
                 unreachable!("the contract refuses a column PK with no `+1`");
             };
-            match sig.neg {
-                Some(nj) => {
-                    // `check_col_narrowings` bounded these booleans to `{0, 1}`.
-                    let (old, new) = (read_col_tab_row(batch, nj), read_col_tab_row(batch, pj));
+            match old {
+                Some(old) => {
                     // A dropped column is gone from every surface: nothing may
                     // rename, re-show or re-null it.
                     if old.is_hidden {
@@ -520,7 +476,7 @@ impl CatalogEngine {
                     }
                     self.reject_if_dependent_views(owner_id, op)?;
                 }
-                None => self.precheck_column_append(batch, pj, owner_id, col_idx, &owner_schema)?,
+                None => self.precheck_column_append(new, owner_id, col_idx, &owner_schema)?,
             }
         }
         Ok(())
@@ -561,8 +517,7 @@ impl CatalogEngine {
     /// column to registered base table `owner_id`.
     fn precheck_column_append(
         &mut self,
-        batch: &Batch,
-        pj: usize,
+        appended: ColumnDef,
         owner_id: i64,
         col_idx: u64,
         owner_schema: &SchemaDescriptor,
@@ -579,7 +534,6 @@ impl CatalogEngine {
                 owner_schema.num_columns()
             ));
         }
-        let appended = read_col_tab_row(batch, pj);
         // The PK rules are not re-run: a trailing non-PK append cannot invalidate
         // an already-valid PK list.
         let prospective = self.col_defs_with(owner_id, col_idx, appended.clone());
@@ -935,8 +889,7 @@ impl CatalogEngine {
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         let noun = SysFamily::Index.row_noun();
         for i in batch.live_rows() {
-            let (owner_id, cols, _) =
-                read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
+            let (owner_id, cols, _) = read_idx_tab_row(batch, i).map_err(|e| format!("Index: {e}"))?;
             let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
             self.validate_index_create(owner_id, cols.as_slice())?;
@@ -954,8 +907,7 @@ impl CatalogEngine {
         for i in batch.retracted_rows() {
             // The row, not `net_dead`: this needs `cols`, which a list of ids
             // does not carry.
-            let (owner_id, cols, _) =
-                read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
+            let (owner_id, cols, _) = read_idx_tab_row(batch, i).map_err(|e| format!("Index: {e}"))?;
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.

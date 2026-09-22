@@ -62,13 +62,12 @@ pub struct ColTabRow<'a> {
     pub owner_id: u64,
     pub col_idx: u64,
     pub name: &'a str,
-    pub type_code: u64,
+    pub ty: crate::ColType,
     pub is_nullable: bool,
     pub fk_table_id: u64,
     pub fk_col_idx: u64,
     pub is_serial: bool,
     pub is_hidden: bool,
-    pub scale: u8,
 }
 
 /// Write one `COL_TAB` row, keyed by the compound `(owner_id, col_idx)` — the
@@ -76,13 +75,13 @@ pub struct ColTabRow<'a> {
 pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64) {
     sink.begin_row(&[r.owner_id as u128, r.col_idx as u128], weight);
     sink.put_string(r.name);
-    sink.put_u64(r.type_code);
+    sink.put_u64(r.ty.tc.as_wire() as u64);
     sink.put_u64(r.is_nullable as u64);
     sink.put_u64(r.fk_table_id);
     sink.put_u64(r.fk_col_idx);
     sink.put_u64(r.is_serial as u64);
     sink.put_u64(r.is_hidden as u64);
-    sink.put_u64(r.scale as u64);
+    sink.put_u64(r.ty.scale as u64);
     sink.end_row();
 }
 

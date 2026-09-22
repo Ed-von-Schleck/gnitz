@@ -77,22 +77,22 @@ pub enum ExprValidateErr {
     },
     ColKindMismatch {
         col: u32,
-        type_code: u8,
+        type_code: TypeCode,
         want: &'static str,
     },
     CopyTypeMismatch {
         col: u32,
-        src_tc: u8,
+        src_tc: TypeCode,
         out: u32,
-        out_tc: u8,
+        out_tc: TypeCode,
     },
     EmitSlotWidth {
         out: u32,
-        type_code: u8,
+        type_code: TypeCode,
     },
     EmitClassMismatch {
         out: u32,
-        type_code: u8,
+        type_code: TypeCode,
     },
     OutputSlotCountMismatch {
         sinks: usize,
@@ -154,7 +154,7 @@ impl fmt::Display for ExprValidateErr {
 /// A column-type predicate paired with the phrase a `ColKindMismatch` renders
 /// for it — the two halves of one requirement, so neither can be widened without
 /// the other.
-type ColTypeTest = (fn(u8) -> bool, &'static str);
+type ColTypeTest = (fn(TypeCode) -> bool, &'static str);
 
 /// What an opcode's kernel requires of a column operand. A `Col` name admits a
 /// PK column; a `Payload` name does not — the kernels behind those address a
@@ -180,9 +180,9 @@ impl ColKind {
     fn type_test(self) -> Option<ColTypeTest> {
         match self {
             Self::AnyCol => None,
-            Self::FixedIntCol => Some((gnitz_wire::is_fixed_int, "a fixed-width integer column")),
-            Self::FloatPayload => Some((gnitz_wire::is_float, "a floating-point column")),
-            Self::StringPayload => Some((gnitz_wire::is_german_string, "a string or blob column")),
+            Self::FixedIntCol => Some((TypeCode::is_fixed_int, "a fixed-width integer column")),
+            Self::FloatPayload => Some((TypeCode::is_float, "a floating-point column")),
+            Self::StringPayload => Some((TypeCode::is_german_string, "a string or blob column")),
         }
     }
 
@@ -1142,8 +1142,8 @@ impl LogicalInstr {
             L::FloatUnary { op, a } => un(ExprOp::FloatUnary, op.as_wire(), a),
             L::IntUnary { op, a } => un(ExprOp::IntUnary, op.as_wire(), a),
             L::Calendar { op, a, micros } => [ExprOp::Calendar.as_wire(), op.as_wire(), a.0 as u32, micros as u32, 0],
-            L::FloatToInt { a, fi } => un(ExprOp::FloatToInt, fi.type_code() as u32, a),
-            L::IntCast { a, fi } => un(ExprOp::IntCast, fi.type_code() as u32, a),
+            L::FloatToInt { a, fi } => un(ExprOp::FloatToInt, fi.type_code().as_wire() as u32, a),
+            L::IntCast { a, fi } => un(ExprOp::IntCast, fi.type_code().as_wire() as u32, a),
             L::FloatToF32 { a } => un(ExprOp::FloatToF32, 0, a),
             L::IntMinMax2 { a, b, is_max } => bin(ExprOp::IntMinMax2, is_max as u32, a, b),
             L::FloatMinMax2 { a, b, is_max } => bin(ExprOp::FloatMinMax2, is_max as u32, a, b),
@@ -1178,7 +1178,7 @@ impl LogicalInstr {
             L::StrConcat { a, b, skip_null } => bin(ExprOp::StrConcat, skip_null as u32, a, b),
             L::IntToStr { a } => un(ExprOp::IntToStr, 0, a),
             L::FloatToStr { a } => un(ExprOp::FloatToStr, 0, a),
-            L::StrToInt { a, fi } => un(ExprOp::StrToInt, fi.type_code() as u32, a),
+            L::StrToInt { a, fi } => un(ExprOp::StrToInt, fi.type_code().as_wire() as u32, a),
             L::StrToFloat { a } => un(ExprOp::StrToFloat, 0, a),
             L::StrSide { src, n_reg, left } => bin(ExprOp::StrSide, left as u32, src, n_reg),
             L::StrPos { hay, needle } => bin(ExprOp::StrPos, 0, hay, needle),
@@ -1656,7 +1656,7 @@ impl LogicalProgram {
     /// Every "decoded once" below means **once per compile**, never per row.
     pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, role: Role<'_>) -> ResolvedProgram {
         let out_schema = role.out_schema();
-        use gnitz_wire::type_code;
+        use gnitz_wire::TypeCode;
         use Instr as I;
         use LogicalInstr as L;
 
@@ -1754,12 +1754,12 @@ impl LogicalProgram {
                     let loc = schema.locate(col as usize);
                     // Total on a validated program: `validate` runs
                     // `check_col(.., ColKind::FixedIntCol)` on every `LoadColInt`,
-                    // and that predicate is `gnitz_wire::is_fixed_int` — the same
+                    // and that predicate is `TypeCode::is_fixed_int` — the same
                     // eight codes `from_type_code` answers `Some` for. It covers
                     // the PK arm too (`ColKind::FixedIntCol` is not payload-only, so
                     // a U128/UUID PK is rejected as `ColKindMismatch`), which is
                     // what makes the kernel's wide-column wildcard unnecessary.
-                    let fi = FixedInt::from_type_code(TypeCode::from_validated_u8(loc.type_code()))
+                    let fi = FixedInt::from_type_code(loc.type_code())
                         .expect("validated LoadColInt names a fixed-int column");
                     match loc {
                         ColumnLocator::Pk { byte_off, .. } => I::LoadPk { dst, off: byte_off, fi },
@@ -1772,8 +1772,8 @@ impl LogicalProgram {
                     // reading 8 bytes out of a 4-byte region.
                     let pi = payload_slot(col as usize);
                     match schema.col_type_code(col as usize) {
-                        type_code::F64 => I::LoadPayloadInt { dst, pi, fi: FixedInt::I64 },
-                        type_code::F32 => I::LoadPayloadF32 { dst, pi },
+                        TypeCode::F64 => I::LoadPayloadInt { dst, pi, fi: FixedInt::I64 },
+                        TypeCode::F32 => I::LoadPayloadF32 { dst, pi },
                         other => unreachable!("validated LoadColFloat names F32/F64, got {other}"),
                     }
                 }
@@ -2485,7 +2485,7 @@ fn operands(li: &LogicalInstr) -> Operands {
 fn cast_target(op: u32, selector: u32) -> Result<FixedInt, ExprValidateErr> {
     u8::try_from(selector)
         .ok()
-        .and_then(TypeCode::try_from_u8)
+        .and_then(TypeCode::from_wire)
         // A temporal code names no cast target of its own: the encoder spells
         // the storage type, so a decoded selector must be one too.
         .and_then(|tc| FixedInt::from_type_code(tc).filter(|fi| fi.type_code() == tc))
@@ -2539,7 +2539,7 @@ fn check_copy_types(
 ) -> Result<(), ExprValidateErr> {
     let src_tc = in_schema.col_type_code(src_col as usize);
     let out_tc = slot_type_code(out_schema, out);
-    let ok = src_tc == out_tc || gnitz_wire::is_widening_promotion(src_tc, out_tc);
+    let ok = src_tc == out_tc || src_tc.is_widening_promotion(out_tc);
     if ok {
         Ok(())
     } else {
@@ -2555,10 +2555,7 @@ fn check_copy_types(
 /// `I64`, `U64` and `F64` are all legal targets, and widening (which runs off
 /// the end of `to_le_bytes()`) is never admitted. Narrowing is admitted for one
 /// shape only: a fixed-int slot whose source register is a range-checking cast
-/// to exactly that width, so the low bytes stored are the whole value. Both
-/// scalar tests are needed and their order does not matter: `wire_stride`
-/// reports 8 for an undecodable type code, so the width test alone would admit
-/// one.
+/// to exactly that width, so the low bytes stored are the whole value.
 fn check_emit_slot(
     out_schema: &dyn SchemaFacts,
     out: u32,
@@ -2566,31 +2563,31 @@ fn check_emit_slot(
     src: &LogicalInstr,
 ) -> Result<(), ExprValidateErr> {
     let type_code = slot_type_code(out_schema, out);
-    if is_str != gnitz_wire::is_german_string(type_code) {
+    if is_str != type_code.is_german_string() {
         return Err(ExprValidateErr::EmitClassMismatch { out, type_code });
     }
     if is_str {
         return Ok(());
     }
-    let stride = gnitz_wire::wire_stride(type_code);
+    let stride = type_code.wire_stride();
     // A narrower slot takes the register's low bytes, which are the whole value
     // exactly when the producer range-checked it to that width and the slot
     // holds an integer — a float or a wide code would be sheared.
-    let narrowed = gnitz_wire::is_fixed_int(type_code) && src.range_checked_width() == Some(stride);
-    if !gnitz_wire::is_valid_type_code(type_code) || (stride != 8 && !narrowed) {
+    let narrowed = type_code.is_fixed_int() && src.range_checked_width() == Some(stride);
+    if stride != 8 && !narrowed {
         return Err(ExprValidateErr::EmitSlotWidth { out, type_code });
     }
     Ok(())
 }
 
 /// The type code of output payload slot `out`.
-fn slot_type_code(os: &dyn SchemaFacts, out: u32) -> u8 {
+fn slot_type_code(os: &dyn SchemaFacts, out: u32) -> TypeCode {
     os.col_type_code(os.payload_col_idx(out as usize))
 }
 
 /// The byte width output payload slot `out` is written at.
 fn slot_stride(os: &dyn SchemaFacts, out: u32) -> u8 {
-    gnitz_wire::wire_stride(slot_type_code(os, out)) as u8
+    slot_type_code(os, out).wire_stride() as u8
 }
 
 /// The `ExprOp::IntInSet` const-pool layout, `N × 8-byte LE`, stated once for
@@ -2868,7 +2865,7 @@ fn u64_verdict(rule: U64Rule, ops: &Operands, schema: &dyn SchemaFacts, so_far: 
             .cols
             .iter()
             .flatten()
-            .any(|&(col, _)| schema.col_type_code(col as usize) == gnitz_wire::type_code::U64),
+            .any(|&(col, _)| schema.col_type_code(col as usize) == gnitz_wire::TypeCode::U64),
     }
 }
 

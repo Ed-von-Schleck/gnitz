@@ -146,7 +146,7 @@ pub(crate) fn reject_float_key_of(what: &str, role: &str) -> GnitzSqlError {
 /// A hidden slot carries no name the user wrote — it is a synthetic key a
 /// pre-map minted — so it is described rather than named.
 pub(crate) fn reject_float_key(col: &ColumnDef, role: &str) -> Result<(), GnitzSqlError> {
-    if col.type_code.is_float() {
+    if col.ty.tc.is_float() {
         let what = if col.is_hidden {
             "a float-valued expression".to_string()
         } else {
@@ -177,8 +177,7 @@ pub(crate) fn reject_unbuildable_index_key(
     src_pk_stride: usize,
     role: &str,
 ) -> Result<(), GnitzSqlError> {
-    let raw: Vec<u8> = types.iter().map(|&tc| tc as u8).collect();
-    gnitz_wire::index_key_types(&raw, src_pk_count, src_pk_stride).map_err(|rule| match rule {
+    gnitz_wire::index_key_types(types, src_pk_count, src_pk_stride).map_err(|rule| match rule {
         gnitz_wire::IndexKeyRule::NotEligible { col, .. } => non_key_eligible_error(names[col], types[col], role),
         arity_or_stride => GnitzSqlError::Unsupported(arity_or_stride.to_string()),
     })?;

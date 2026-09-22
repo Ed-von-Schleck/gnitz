@@ -51,24 +51,27 @@ const DESC_FLAG_DELTA: u8 = 1 << 4;
 const DESC_FLAG_PK_REPEATS: u8 = 1 << 5;
 const DESC_FLAG_CLASS: u8 = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_STREAM | DESC_FLAG_DELTA;
 
-/// What a relation *is* — the one vocabulary the client and the engine share for
-/// this. A single value rather than three independent booleans, so the impossible
-/// combinations (a bounded non-view, a view that is also a stream) cannot be built
-/// on either side or arrive off the wire.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
-pub enum RelClass {
-    #[default]
-    Table,
-    /// A storeless, append-only ingestion point. It holds no rows, so it may be
-    /// written but not read — except inside a view body, which is what it is for.
-    Stream,
-    View,
-    /// A view created `WITH (capacity = …)`. Views may not be created over one (the
-    /// leaf rule) and `ALTER VIEW … AS` may not retarget one.
-    BoundedView,
-    /// A view created `WITH (delta = …)`: it keeps its recent deltas in a store of
-    /// its own and answers a DELTA_POLL. `ALTER VIEW … AS` may not retarget one.
-    FedView,
+wire_enum! {
+    /// What a relation *is* — the one vocabulary the client and the engine share for
+    /// this. A single value rather than three independent booleans, so the impossible
+    /// combinations (a bounded non-view, a view that is also a stream) cannot be built
+    /// on either side or arrive off the wire. The wire value is the descriptor's
+    /// class flag bits.
+    #[derive(Default)]
+    pub enum RelClass: u8 {
+        #[default]
+        Table = 0,
+        /// A storeless, append-only ingestion point. It holds no rows, so it may be
+        /// written but not read — except inside a view body, which is what it is for.
+        Stream = DESC_FLAG_STREAM,
+        View = DESC_FLAG_VIEW,
+        /// A view created `WITH (capacity = …)`. Views may not be created over one (the
+        /// leaf rule) and `ALTER VIEW … AS` may not retarget one.
+        BoundedView = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED,
+        /// A view created `WITH (delta = …)`: it keeps its recent deltas in a store of
+        /// its own and answers a DELTA_POLL. `ALTER VIEW … AS` may not retarget one.
+        FedView = DESC_FLAG_VIEW | DESC_FLAG_DELTA,
+    }
 }
 
 impl RelClass {
@@ -85,27 +88,6 @@ impl RelClass {
     /// True for every view class.
     pub fn is_view(self) -> bool {
         matches!(self, RelClass::View | RelClass::BoundedView | RelClass::FedView)
-    }
-
-    fn to_flags(self) -> u8 {
-        match self {
-            RelClass::Table => 0,
-            RelClass::Stream => DESC_FLAG_STREAM,
-            RelClass::View => DESC_FLAG_VIEW,
-            RelClass::BoundedView => DESC_FLAG_VIEW | DESC_FLAG_BOUNDED,
-            RelClass::FedView => DESC_FLAG_VIEW | DESC_FLAG_DELTA,
-        }
-    }
-
-    fn from_flags(flags: u8) -> Result<RelClass, String> {
-        match flags & DESC_FLAG_CLASS {
-            0 => Ok(RelClass::Table),
-            DESC_FLAG_STREAM => Ok(RelClass::Stream),
-            DESC_FLAG_VIEW => Ok(RelClass::View),
-            f if f == DESC_FLAG_VIEW | DESC_FLAG_BOUNDED => Ok(RelClass::BoundedView),
-            f if f == DESC_FLAG_VIEW | DESC_FLAG_DELTA => Ok(RelClass::FedView),
-            f => Err(format!("rel descriptor: no relation class for flag bits {f:#04x}")),
-        }
     }
 }
 
@@ -153,7 +135,7 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(self.fks.len() <= u16::MAX as usize && self.indexes.len() <= u16::MAX as usize);
         let mut w = Writer::with_capacity(HEADER_LEN + 16 * (self.fks.len() + self.indexes.len()));
-        let flags = self.class.to_flags()
+        let flags = self.class.as_wire()
             | if self.replicated { DESC_FLAG_REPLICATED } else { 0 }
             | if self.pk_repeats { DESC_FLAG_PK_REPEATS } else { 0 };
         w.u8(VERSION)
@@ -186,11 +168,13 @@ impl RelDescriptorBlob {
         if version != VERSION {
             return Err(format!("rel descriptor: unknown version {version}"));
         }
-        let flags = r.u8()?;
-        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_PK_REPEATS | DESC_FLAG_CLASS) != 0 {
-            return Err(format!("rel descriptor: unknown flag bits {flags:#04x}"));
-        }
-        let class = RelClass::from_flags(flags)?;
+        let flags = r.flags(DESC_FLAG_REPLICATED | DESC_FLAG_PK_REPEATS | DESC_FLAG_CLASS)?;
+        let class = RelClass::from_wire(flags & DESC_FLAG_CLASS).ok_or_else(|| {
+            format!(
+                "rel descriptor: no relation class for flag bits {:#04x}",
+                flags & DESC_FLAG_CLASS
+            )
+        })?;
         let fk_count = r.u16()? as usize;
         let index_count = r.u16()? as usize;
 
@@ -217,7 +201,9 @@ impl RelDescriptorBlob {
             let entry_flags = r.u64()?;
             indexes.push(RelIndex {
                 cols,
-                is_unique: crate::IndexProps::from_flags(entry_flags).is_unique,
+                is_unique: crate::IndexProps::from_flags(entry_flags)
+                    .map_err(|e| format!("rel descriptor: {e}"))?
+                    .is_unique,
             });
         }
 

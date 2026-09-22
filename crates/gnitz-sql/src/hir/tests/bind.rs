@@ -67,7 +67,7 @@ fn shape(sql: &str) -> Vec<(String, TypeCode, bool)> {
     bound_cols(sql)
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
         .iter()
-        .map(|c| (c.def.name.clone(), c.def.type_code, c.def.is_nullable))
+        .map(|c| (c.def.name.clone(), c.def.ty.tc, c.def.is_nullable))
         .collect()
 }
 

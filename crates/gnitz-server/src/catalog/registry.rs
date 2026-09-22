@@ -45,7 +45,7 @@ impl CatalogEngine {
         let mut defs = Vec::new();
         self.for_each_row_under(SysFamily::Column, owner_id, |c| {
             let (src, row) = c.current_row_source();
-            defs.push(read_col_tab_row(src, row));
+            defs.push(read_col_tab_row(src, row).expect("a stored COL_TAB row passed precheck_column_family"));
         });
         defs
     }

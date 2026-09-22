@@ -171,15 +171,12 @@ impl RangeDescriptor {
     pub(crate) fn decode(buf: &[u8]) -> Result<Self, String> {
         let mut r = Reader::new(buf, "range descriptor");
         let n_eq = r.u8()? as usize;
-        let flags = r.u8()?;
+        let flags = r.flags(START_AFTER | END_AFTER)?;
         if n_eq >= PK_LIST_MAX_COLS {
             return Err(format!(
                 "range descriptor n_eq {n_eq} leaves no range column within \
                  the {PK_LIST_MAX_COLS}-column arity cap"
             ));
-        }
-        if flags & !(START_AFTER | END_AFTER) != 0 {
-            return Err(format!("range descriptor has unknown flag bits {flags:#04x}"));
         }
         let mut eq = [0u128; PK_LIST_MAX_COLS];
         for slot in eq.iter_mut().take(n_eq) {

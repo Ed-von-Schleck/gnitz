@@ -22,7 +22,7 @@ use gnitz_expr::RowSource;
 use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
 
 use crate::schema::{
-    type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts,
+    ColumnLocator, DerivedSchema, OpBuildErr, SchemaBound, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode,
     MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
 
@@ -394,7 +394,7 @@ impl IndexKeySpec {
                 cols.len(),
             ));
         }
-        let mut col_types: Vec<u8> = Vec::with_capacity(cols.len());
+        let mut col_types: Vec<TypeCode> = Vec::with_capacity(cols.len());
         for &c in cols {
             if c as usize >= owner.num_columns() {
                 return Err(format!(
@@ -412,7 +412,7 @@ impl IndexKeySpec {
             cols: [IndexKeyCol::EMPTY; MAX_PK_COLUMNS],
         };
         for (i, (&c, &t)) in cols.iter().zip(&promoted).enumerate() {
-            let out = SchemaColumn::new(t, 0);
+            let out = SchemaColumn::new(t, false);
             spec.cols[i] = IndexKeyCol::new(owner.locate(c as usize), out);
             spec.key_size += out.size();
         }
@@ -691,7 +691,7 @@ pub(crate) fn locate_key_col(schema: &SchemaDescriptor, c: u32, what: &str) -> R
     let loc = schema
         .try_locate(c as usize)
         .ok_or_else(|| OpBuildErr::oob_col(&format!("{what}: column"), c, schema))?;
-    if gnitz_wire::is_float(loc.type_code()) {
+    if loc.type_code().is_float() {
         return Err(OpBuildErr::shape(format!(
             "{what}: column {c} is a float, which has no order-preserving key image"
         )));
@@ -711,7 +711,7 @@ fn push_col_key<R: RowSource>(buf: &mut Vec<u8>, src: &R, row: usize, null_word:
     }
     buf.push(1);
     match loc {
-        ColumnLocator::Payload { slot, size, type_code } if gnitz_wire::is_german_string(type_code) => {
+        ColumnLocator::Payload { slot, size, type_code } if type_code.is_german_string() => {
             let content =
                 gnitz_wire::german_string_content(src.get_col_ptr(row, slot as usize, size as usize), src.blob());
             buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
@@ -740,8 +740,7 @@ pub(crate) struct FoldCols {
 
 impl FoldCols {
     pub(crate) fn new(locs: Vec<ColumnLocator>) -> Self {
-        let inline =
-            locs.len() <= FOLD_INLINE_COLS && !locs.iter().any(|l| gnitz_wire::is_german_string(l.type_code()));
+        let inline = locs.len() <= FOLD_INLINE_COLS && !locs.iter().any(|l| l.type_code().is_german_string());
         FoldCols { locs, inline }
     }
 
@@ -824,8 +823,8 @@ pub(crate) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u12
 /// The two slots a packed group key carries besides its columns: a leading
 /// presence bitmap and a trailing overflow fold. Every width below is read back
 /// off these, so the schema, the stride and the pack offsets cannot disagree.
-const BITMAP_COL: SchemaColumn = SchemaColumn::new(type_code::U8, 0);
-const FOLD_COL: SchemaColumn = SchemaColumn::new(type_code::U128, 0);
+const BITMAP_COL: SchemaColumn = SchemaColumn::new(TypeCode::U8, false);
+const FOLD_COL: SchemaColumn = SchemaColumn::new(TypeCode::U128, false);
 const BITMAP_BYTES: usize = BITMAP_COL.size() as usize;
 const FOLD_BYTES: usize = FOLD_COL.size() as usize;
 // `pack_into` writes the bitmap as one bare byte and the fold as a `u128`'s
@@ -855,7 +854,7 @@ fn classify_promote(loc: ColumnLocator) -> PromoteKind {
         // BLOB shares the 16-byte German-string struct layout with STRING, so it
         // takes the same hash path rather than a raw cell encode. Neither can be
         // a PK column, so only the payload arm needs the test.
-        ColumnLocator::Payload { type_code, .. } if gnitz_wire::is_german_string(type_code) => PromoteKind::String(loc),
+        ColumnLocator::Payload { type_code, .. } if type_code.is_german_string() => PromoteKind::String(loc),
         _ => PromoteKind::Col(loc),
     }
 }
@@ -888,9 +887,9 @@ impl ColPromoter {
     /// A slot packing into a `out_tc` output PK column. The one place the output
     /// column is spelled, because it is never nullable while `nullable` — the
     /// *source* column's — routinely is.
-    pub(crate) fn new(out_tc: u8, nullable: bool, kind: PromoteKind) -> Self {
+    pub(crate) fn new(out_tc: TypeCode, nullable: bool, kind: PromoteKind) -> Self {
         ColPromoter {
-            out_col: SchemaColumn::new(out_tc, 0),
+            out_col: SchemaColumn::new(out_tc, false),
             nullable,
             kind,
         }
@@ -927,7 +926,7 @@ impl ReindexPacker {
     ///
     /// A carried target's domain is `join_key_common_type`'s codomain — the
     /// *key* domain, whose collapse to U128 is what a `_join_pk` slot does to a
-    /// UUID pair, not the value domain `gnitz_wire::int_domain_fits` answers.
+    /// UUID pair, not the value domain `TypeCode::int_domain_fits` answers.
     pub(crate) fn new(schema: &SchemaDescriptor, key: &[gnitz_wire::ReindexSlot]) -> Result<Self, OpBuildErr> {
         if key.len() > MAX_PK_COLUMNS {
             return Err(OpBuildErr::shape(format!(
@@ -939,7 +938,7 @@ impl ReindexPacker {
         let mut stride = 0usize;
         for (i, &(c, carried)) in key.iter().enumerate() {
             let loc = locate_key_col(schema, c, "reindex key")?;
-            if carried.is_some_and(|t| gnitz_wire::join_key_common_type(loc.type_code(), t as u8) != Some(t as u8)) {
+            if carried.is_some_and(|t| loc.type_code().join_key_common_type(t) != Some(t)) {
                 return Err(OpBuildErr::shape(format!(
                     "reindex key: column {c} does not promote to the carried target"
                 )));
@@ -953,7 +952,7 @@ impl ReindexPacker {
             // source would truncate it. `resolve_reindex_type` never derives that;
             // debug-only because it is a type-system invariant, not input.
             debug_assert!(
-                cp.out_col.size() as usize >= gnitz_wire::wire_stride(loc.type_code())
+                cp.out_col.size() as usize >= loc.type_code().wire_stride()
                     || !matches!(kind, PromoteKind::Col(ColumnLocator::Payload { .. }))
             );
             stride += cp.out_col.size() as usize;
@@ -1043,7 +1042,7 @@ impl ReindexPacker {
         for &c in group_cols {
             locate_key_col(schema, c, "group key")?;
         }
-        let has_bitmap = group_cols.iter().any(|&c| schema.columns[c as usize].nullable != 0);
+        let has_bitmap = group_cols.iter().any(|&c| schema.columns[c as usize].nullable);
 
         // The bitmap occupies one leading slot, so both budgets start spent by it.
         let lead = usize::from(has_bitmap);
@@ -1054,8 +1053,8 @@ impl ReindexPacker {
             let col = schema.columns[c as usize];
             // A group column takes the same slot a join key's would; the float
             // arm the two policies would differ on returned above.
-            let out_tc = gnitz_wire::reindex_output_type_code(col.type_code);
-            let w = gnitz_wire::wire_stride(out_tc);
+            let out_tc = col.type_code.reindex_output_type();
+            let w = out_tc.wire_stride();
             // Room this column needs, plus the fold slot the columns behind it
             // would still require. Reserving it here is what keeps the greedy
             // walk from packing a column it would have to give back.
@@ -1063,7 +1062,7 @@ impl ReindexPacker {
             if lead + n_packed + 1 + tail_cols > max_cols || stride + w + tail_cols * FOLD_BYTES > max_bytes {
                 break;
             }
-            cols[n_packed] = ColPromoter::new(out_tc, col.nullable != 0, classify_promote(schema.locate(c as usize)));
+            cols[n_packed] = ColPromoter::new(out_tc, col.nullable, classify_promote(schema.locate(c as usize)));
             stride += w;
             n_packed += 1;
         }

@@ -233,10 +233,10 @@ impl ReadSpec {
 
         let predicate = r.bytes32()?.to_vec();
 
-        let map = match r.u8()? {
-            0 => None,
-            1 => Some(read_compute_map(&mut r).map_err(|e| format!("read_spec: {e}"))?),
-            other => return Err(format!("read_spec: map presence byte {other} is not 0 or 1")),
+        let map = if r.bool()? {
+            Some(read_compute_map(&mut r).map_err(|e| format!("read_spec: {e}"))?)
+        } else {
+            None
         };
 
         let kind = match r.u8()? {
