@@ -6,7 +6,7 @@
 //! bounds-checked byte cursor its blob framing reads through), so both
 //! the server and the client-side planner can link it without pulling in
 //! storage, the catalog, or the runtime. Its one external crate, `memchr`, is
-//! `no_std` and dependency-free and supplies the substring scan behind LIKE.
+//! `no_std` and dependency-free and supplies the substring scan.
 //! Whatever the engine computes for an expression, the client computes
 //! bit-for-bit, because it is the same code.
 //!
@@ -70,6 +70,7 @@ mod locator;
 mod program;
 mod range;
 mod schema_facts;
+mod search;
 mod view;
 
 pub use batch::MorselOut;

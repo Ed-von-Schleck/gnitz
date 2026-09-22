@@ -212,8 +212,7 @@ fn never_null_follows_the_engine_null_table() {
         (
             |x| E::Like {
                 s: Box::new(x),
-                pattern: "a%".into(),
-                escape: None,
+                pattern: gnitz_expr::LikePattern::encode("a%", None).unwrap(),
                 ci: false,
             },
             true,

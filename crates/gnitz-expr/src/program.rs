@@ -14,7 +14,6 @@ use crate::like::LikeMatcher;
 use crate::{ColumnLocator, SchemaFacts};
 use gnitz_wire::{encode_german_string, FixedInt, Reader, TypeCode, Writer};
 use std::fmt;
-use std::num::NonZeroU8;
 
 /// The register file is capped at 64: the `BoolBinary` 3VL paths, the
 /// null-bit propagation, and every register-indexed mask address registers by
@@ -113,9 +112,6 @@ pub enum ExprValidateErr {
         selector: u32,
     },
     BadSinkKind(u32),
-    BadLikeEscape {
-        escape: u32,
-    },
 }
 
 /// The client-facing rendering. Lives on the type so the planner's `Unsupported`
@@ -716,14 +712,10 @@ pub enum LogicalInstr {
         mode: TrimMode,
         set_idx: ConstIdx,
     },
-    /// SQL LIKE writing a boolean into a *scalar* register — a definite 0/1,
-    /// so the operand's own null bit is the only one. `pat_idx` is a const-pool
-    /// index naming the raw pattern bytes and `escape` the escape character,
-    /// `None` where escaping is disabled; `ci` is ILIKE's ASCII-only case
-    /// folding. The matcher is compiled at resolve, never per row.
+    /// SQL LIKE into a scalar register, a definite 0/1. `pat_idx` names a
+    /// [`crate::LikePattern`]'s bytes; `ci` is ILIKE.
     StrLike {
         src: Reg,
-        escape: Option<NonZeroU8>,
         pat_idx: ConstIdx,
         ci: bool,
     },
@@ -1031,8 +1023,8 @@ pub(crate) enum Instr {
         mode: TrimMode,
         set_idx: u32,
     },
-    /// `matcher_idx` indexes `ResolvedProgram::like_matchers` — the pattern
-    /// compiled once at resolve — not the const pool.
+    /// `matcher_idx` indexes `ResolvedProgram::like_matchers`, not the const
+    /// pool.
     StrLike {
         dst: u16,
         src: u16,
@@ -1182,13 +1174,7 @@ impl LogicalInstr {
                 len_reg.map_or(u32::MAX, |r| r.0 as u32),
             ],
             L::StrTrim { a, mode, set_idx } => [ExprOp::StrTrim.as_wire(), mode.as_wire(), a.0 as u32, set_idx.0, 0],
-            L::StrLike { src, escape, pat_idx, ci } => [
-                ExprOp::StrLike.as_wire(),
-                ci as u32,
-                src.0 as u32,
-                escape.map_or(0, NonZeroU8::get) as u32,
-                pat_idx.0,
-            ],
+            L::StrLike { src, pat_idx, ci } => [ExprOp::StrLike.as_wire(), ci as u32, src.0 as u32, pat_idx.0, 0],
             L::StrConcat { a, b, skip_null } => bin(ExprOp::StrConcat, skip_null as u32, a, b),
             L::IntToStr { a } => un(ExprOp::IntToStr, 0, a),
             L::FloatToStr { a } => un(ExprOp::FloatToStr, 0, a),
@@ -1611,8 +1597,7 @@ impl LogicalProgram {
             // `ci` lives in the selector, so nothing downstream re-derives it.
             ExprOp::StrLike => L::StrLike {
                 src: a,
-                escape: like_escape(w(3))?,
-                pat_idx: ConstIdx(w(4)),
+                pat_idx: ConstIdx(w(3)),
                 ci: flag(opw, sel)?,
             },
             ExprOp::StrConcat => L::StrConcat { a, b, skip_null: flag(opw, sel)? },
@@ -1696,9 +1681,6 @@ impl LogicalProgram {
         // decoded into, so two TRIMs over one set share a table.
         let mut trim_sets: Vec<[u64; 4]> = Vec::new();
         let mut trim_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
-        // LIKE patterns compiled into matchers once here, never per row. One per
-        // instruction, the `int_sets` shape rather than TRIM's slot table above:
-        // a matcher depends on `(pat_idx, escape, ci)`, not on `pat_idx` alone.
         let mut like_matchers: Vec<LikeMatcher> = Vec::new();
         // The one pool of constant bytes both string channels resolve against.
         // Each `LoadConstStr` bakes its span in, so a const view is an ordinary
@@ -1956,13 +1938,12 @@ impl LogicalProgram {
                 }
                 L::StrLike {
                     src: Reg(src),
-                    escape,
                     pat_idx: ConstIdx(pat_idx),
                     ci,
                 } => {
                     let pattern = &self.const_strings[pat_idx as usize];
                     let matcher_idx = like_matchers.len() as u32;
-                    like_matchers.push(LikeMatcher::compile(pattern, escape.map(NonZeroU8::get), ci));
+                    like_matchers.push(LikeMatcher::compile(pattern, ci));
                     I::StrLike { dst, src, matcher_idx }
                 }
                 L::StrConcat { a: Reg(a), b: Reg(b), skip_null } => I::StrConcat { dst, a, b, skip_null },
@@ -2451,12 +2432,7 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::StrToFloat { a } => writes(WVal(Fixed(false))).reading(a, RStr).may_null(),
         L::StrToInt { a, fi } => writes(WVal(Fixed(fi == FixedInt::U64))).reading(a, RStr).may_null(),
         L::StrCmp { op: _, a, b } => writes(WBool).reading(a, RStr).reading(b, RStr),
-        // One string operand plus compile-time pattern data. The verdict is a
-        // definite 0/1 — LIKE introduces no NULL of its own, so the operand's
-        // null bit is the only one.
-        L::StrLike { src, escape: _, pat_idx, ci: _ } => {
-            writes(WBool).reading(src, RStr).with_extra(Extra::ConstIdx(pat_idx))
-        }
+        L::StrLike { src, pat_idx, ci: _ } => writes(WBool).reading(src, RStr).with_extra(Extra::ConstIdx(pat_idx)),
         L::StrCase { a, upper: _ } => writes(WStr).reading(a, RStr),
         L::StrTrim { a, mode: _, set_idx } => writes(WStr).reading(a, RStr).with_extra(Extra::ConstIdx(set_idx)),
         // A combined length above `u32::MAX` yields NULL, which is easy to miss
@@ -2524,18 +2500,6 @@ fn flag(op: u32, selector: u32) -> Result<bool, ExprValidateErr> {
         1 => Ok(true),
         _ => Err(ExprValidateErr::BadSelector { op, selector }),
     }
-}
-
-/// `StrLike`'s escape word as the escape character it names, `None` for the 0
-/// that disables escaping. The escape shares a word with the source register, so
-/// the half above a byte must be clear. `NonZeroU8` because 0 *is* the absence:
-/// a `Some(0)` would encode back as `None`, so the round trip is only the
-/// identity while the type cannot hold one.
-fn like_escape(escape: u32) -> Result<Option<NonZeroU8>, ExprValidateErr> {
-    if escape > u8::MAX as u32 {
-        return Err(ExprValidateErr::BadLikeEscape { escape });
-    }
-    Ok(NonZeroU8::new(escape as u8))
 }
 
 /// The one column-operand check: range, then payload-ness, then the type class
@@ -2776,10 +2740,8 @@ pub(crate) struct ResolvedProgram {
     /// resolved `set_idx`. Held here rather than inlined into `Instr` — 32 bytes
     /// would dominate the enum.
     pub(crate) trim_sets: Vec<[u64; 4]>,
-    /// LIKE / ILIKE patterns compiled into matchers at resolve, indexed by the
-    /// resolved `matcher_idx`. One entry per `StrLike` instruction: the escape
-    /// and the case folding are baked in, so two instructions over one pool
-    /// index still get a matcher each.
+    /// One per `StrLike` instruction, at its `matcher_idx`: `ci` is compiled
+    /// in, so two instructions over one pattern get one each.
     pub(crate) like_matchers: Vec<LikeMatcher>,
     /// Every constant byte the program needs at run time: the spans a
     /// `LoadConstStr` bakes in, and the heap half of each long `const_cells`

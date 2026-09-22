@@ -89,7 +89,7 @@ impl ExprBuilder {
     /// The const-pool index of `bytes`, shared with an earlier equal entry. The
     /// pool is byte-transparent — german-string cells and packed i64 sets share
     /// it, each read by the opcode that indexes it. Only a miss allocates.
-    fn add_const_bytes(&mut self, bytes: &[u8]) -> ConstIdx {
+    pub fn add_const_bytes(&mut self, bytes: &[u8]) -> ConstIdx {
         if self.within_reg_cap() {
             if let Some(i) = self.const_strings.iter().position(|c| c.as_slice() == bytes) {
                 return ConstIdx(i as u32);
@@ -98,10 +98,6 @@ impl ExprBuilder {
         let idx = ConstIdx(self.const_strings.len() as u32);
         self.const_strings.push(bytes.to_vec());
         idx
-    }
-
-    pub fn add_const_string(&mut self, s: &str) -> ConstIdx {
-        self.add_const_bytes(s.as_bytes())
     }
 
     /// The register holding `v`'s f64 image. A float register *is* an i64 slot

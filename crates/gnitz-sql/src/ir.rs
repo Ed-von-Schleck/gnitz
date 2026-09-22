@@ -98,15 +98,11 @@ pub(crate) enum BExpr<R> {
         mode: TrimMode,
         set: String,
     },
-    /// `s [NOT] LIKE/ILIKE 'pattern' [ESCAPE c]`. Like `TrimCall`, one expression
-    /// operand plus compile-time data: the pattern and its escape (`None` =
-    /// escaping disabled) are literals the binder has already checked, which the
-    /// engine tokenizes once per program. `ci` is ILIKE's ASCII-only case
-    /// folding. `NOT LIKE` is the outer `Not(Like)`.
+    /// `s [NOT] LIKE/ILIKE 'pattern' [ESCAPE c]`; `ci` is ILIKE, `NOT LIKE` the
+    /// outer `Not(Like)`.
     Like {
         s: Box<BExpr<R>>,
-        pattern: String,
-        escape: Option<u8>,
+        pattern: gnitz_expr::LikePattern,
         ci: bool,
     },
     /// `CONCAT(args…)` with PostgreSQL's semantics — a NULL argument is the
@@ -648,10 +644,9 @@ impl<R> BExpr<R> {
                 mode: *mode,
                 set: set.clone(),
             },
-            BExpr::Like { s, pattern, escape, ci } => BExpr::Like {
+            BExpr::Like { s, pattern, ci } => BExpr::Like {
                 s: Box::new(go(s)?),
                 pattern: pattern.clone(),
-                escape: *escape,
                 ci: *ci,
             },
             BExpr::ConcatN { args } => BExpr::ConcatN {

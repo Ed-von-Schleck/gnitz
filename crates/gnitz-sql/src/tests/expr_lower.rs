@@ -1128,42 +1128,35 @@ fn cast_to_text_emits_the_numeric_to_text_opcode_for_its_source_domain() {
     assert_str_program(&to_text(1), &schema);
 }
 
-fn like_of(s: BoundExpr, pattern: &str, escape: Option<u8>, ci: bool) -> BoundExpr {
+fn like_of(s: BoundExpr, pattern: &str, ci: bool) -> BoundExpr {
     BoundExpr::Like {
         s: Box::new(s),
-        pattern: pattern.to_string(),
-        escape,
+        pattern: gnitz_expr::LikePattern::encode(pattern, None).unwrap(),
         ci,
     }
 }
 
-/// The pattern is a plain pool entry and the escape is carried by the LIKE
-/// instruction itself, not by a second opcode.
+/// The pattern is a plain pool entry holding the encoded bytes, and `ci` rides
+/// on the LIKE instruction itself, not on a second opcode.
 #[test]
-fn like_lowers_to_one_opcode_carrying_its_escape() {
+fn like_lowers_to_one_opcode_over_its_pattern() {
     let schema = str_schema();
-    let prog =
-        |escape, ci| compile_bound_expr_to_program(&like_of(str_col(1), "a%", escape, ci), &schema.columns).unwrap();
-    // The escape rides on the LIKE instruction itself.
-    let escape_of = |p: &LogicalProgram| match p.instrs()[1] {
-        LogicalInstr::StrLike { escape, .. } => escape,
-        ref other => panic!("expected a LIKE instruction, got {other:?}"),
-    };
+    let prog = |ci| compile_bound_expr_to_program(&like_of(str_col(1), "a%", ci), &schema.columns).unwrap();
 
-    let p = prog(Some(b'\\'), false);
+    let p = prog(false);
     assert!(matches!(
         p.instrs(),
         [L::LoadColStr { .. }, L::StrLike { ci: false, .. }]
     ));
-    assert_eq!(p.const_strings()[0], b"a%");
-    assert_eq!(escape_of(&p), std::num::NonZeroU8::new(b'\\'));
-    // ILIKE is the same shape, `ci` set …
+    assert_eq!(
+        p.const_strings()[0],
+        gnitz_expr::LikePattern::encode("a%", None).unwrap().as_bytes()
+    );
+    // ILIKE is the same shape, `ci` set.
     assert!(matches!(
-        prog(Some(b'\\'), true).instrs(),
+        prog(true).instrs(),
         [L::LoadColStr { .. }, L::StrLike { ci: true, .. }]
     ));
-    // … and `ESCAPE ''` is the absence of an escape.
-    assert_eq!(escape_of(&prog(None, false)), None);
 }
 
 /// The subject is an ordinary string operand: any expression the string
@@ -1176,15 +1169,15 @@ fn like_takes_a_computed_subject_and_propagates_a_null_literal() {
         args: vec![str_col(1)],
     };
     assert!(matches!(
-        lower_instrs(&like_of(upper, "A%", Some(b'\\'), false), &schema)[..],
+        lower_instrs(&like_of(upper, "A%", false), &schema)[..],
         [L::LoadColStr { .. }, L::StrCase { upper: true, .. }, L::StrLike { .. }]
     ));
     assert!(matches!(
-        lower_instrs(&like_of(BoundExpr::LitNull, "a", Some(b'\\'), false), &schema)[..],
+        lower_instrs(&like_of(BoundExpr::LitNull, "a", false), &schema)[..],
         [L::LoadNullStr, L::StrLike { .. }]
     ));
     // The verdict is a boolean, so `NOT LIKE` reads it like any other.
-    let negated = BoundExpr::Not(Box::new(like_of(str_col(1), "a", Some(b'\\'), false)));
+    let negated = BoundExpr::Not(Box::new(like_of(str_col(1), "a", false)));
     assert!(matches!(
         lower_instrs(&negated, &schema)[..],
         [L::LoadColStr { .. }, L::StrLike { .. }, L::BoolNot { .. }]
@@ -1196,7 +1189,7 @@ fn like_takes_a_computed_subject_and_propagates_a_null_literal() {
 #[test]
 fn like_over_a_numeric_operand_is_a_typed_error() {
     let schema = case_schema(); // col1 = i (I64)
-    let err = compile_bound_expr_to_program(&like_of(BoundExpr::ColRef(1), "a", Some(b'\\'), false), &schema.columns)
+    let err = compile_bound_expr_to_program(&like_of(BoundExpr::ColRef(1), "a", false), &schema.columns)
         .expect_err("a numeric subject has no string channel");
     let GnitzSqlError::Unsupported(msg) = &err else {
         panic!("expected Unsupported, got {err:?}")

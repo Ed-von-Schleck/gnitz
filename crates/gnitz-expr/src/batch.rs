@@ -10,8 +10,8 @@ use std::cmp::Ordering;
 use std::fmt::{self, Write as _};
 
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
-use crate::like::{fields, find};
 use crate::program::{FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp};
+use crate::search::{fields, find};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
     compare_german_strings, german_string_heap, german_string_inline, low_bits_mask, null_word_get, read_u64_le,
@@ -1152,7 +1152,7 @@ fn str_to_scalar(
     bufs: StrBufs<'_>,
     dst: u16,
     a: u16,
-    f: impl Fn(&[u8]) -> i64,
+    mut f: impl FnMut(&[u8]) -> i64,
 ) {
     let (d, ai) = (dst as usize, a as usize);
     {
@@ -2266,7 +2266,8 @@ pub(crate) fn eval_batch(
 
             Instr::StrLike { dst, src, matcher_idx } => {
                 let matcher = &prog.like_matchers[matcher_idx as usize];
-                str_to_scalar(scratch, &mo, bufs, dst, src, |s| matcher.matches(s) as i64);
+                let mut folded = Vec::new();
+                str_to_scalar(scratch, &mo, bufs, dst, src, |s| matcher.matches(s, &mut folded) as i64);
             }
 
             Instr::StrConcat { dst, a, b, skip_null } => eval_str_concat(scratch, &mo, bufs, dst, a, b, skip_null),
@@ -2307,7 +2308,7 @@ pub(crate) fn eval_batch(
                 });
             }
             Instr::StrPos { dst, hay, needle } => {
-                str2_to_scalar(scratch, &mo, bufs, dst, hay, needle, |h, n| match find(h, n, false) {
+                str2_to_scalar(scratch, &mo, bufs, dst, hay, needle, |h, n| match find(h, n) {
                     Some(off) => char_count(&h[..off]) as i64 + 1,
                     None => 0,
                 })

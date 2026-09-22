@@ -14,8 +14,8 @@ use crate::ir::{
 };
 use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
-    CalendarOp, CmpOp, Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LogicalInstr as L,
-    LogicalProgram, Reg,
+    CalendarOp, CmpOp, Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern,
+    LogicalInstr as L, LogicalProgram, Reg,
 };
 use gnitz_wire::decimal::{format_decimal, parse_decimal, pow10, rescale, MAX_DECIMAL_SCALE};
 
@@ -61,7 +61,7 @@ fn try_compile_string_cmp(
         }
         _ => return None,
     };
-    let const_idx = eb.add_const_string(s);
+    let const_idx = eb.add_const_bytes(s.as_bytes());
     Some(eb.emit(L::StrColConst { op: cmp, col: col as u32, const_idx }))
 }
 
@@ -122,7 +122,7 @@ impl OpcodeBackend<'_> {
                 Ok((self.eb.emit(L::LoadConst { val: *v, unsigned: false }), ExprKind::Int))
             }
             BoundExpr::LitStr(s) => {
-                let idx = self.eb.add_const_string(s);
+                let idx = self.eb.add_const_bytes(s.as_bytes());
                 Ok((self.eb.emit(L::LoadConstStr { const_idx: idx }), ExprKind::Str))
             }
             BoundExpr::LitWide(lit) => match lit.to_u64() {
@@ -150,7 +150,7 @@ impl OpcodeBackend<'_> {
             BoundExpr::Cast { expr, to } => self.cast(expr, *to),
             BoundExpr::StrCall { f, args } => self.str_call(*f, args),
             BoundExpr::TrimCall { s, mode, set } => self.trim_call(s, *mode, set),
-            BoundExpr::Like { s, pattern, escape, ci } => self.like(s, pattern, *escape, *ci),
+            BoundExpr::Like { s, pattern, ci } => self.like(s, pattern, *ci),
             BoundExpr::ConcatN { args } => self.concat_n(args),
         }
     }
@@ -486,25 +486,16 @@ impl OpcodeBackend<'_> {
 
     fn trim_call(&mut self, s: &BoundExpr, mode: TrimMode, set: &str) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let src = self.str_operand(s, false)?;
-        let set_idx = self.eb.add_const_string(set);
+        let set_idx = self.eb.add_const_bytes(set.as_bytes());
         Ok((self.eb.emit(L::StrTrim { a: src, mode, set_idx }), ExprKind::Str))
     }
 
     /// `s [I]LIKE 'pattern'`. The result is a boolean, so `NOT LIKE` reads it
     /// like any other.
-    fn like(
-        &mut self,
-        s: &BoundExpr,
-        pattern: &str,
-        escape: Option<u8>,
-        ci: bool,
-    ) -> Result<(Reg, ExprKind), GnitzSqlError> {
+    fn like(&mut self, s: &BoundExpr, pattern: &LikePattern, ci: bool) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let src = self.str_operand(s, false)?;
-        let pat_idx = self.eb.add_const_string(pattern);
-        // A NUL escape is `ESCAPE ''` — no escape at all — which the binder has
-        // already rejected as a literal, so nothing is lost by the narrowing.
-        let escape = escape.and_then(std::num::NonZeroU8::new);
-        Ok((self.eb.emit(L::StrLike { src, escape, pat_idx, ci }), ExprKind::Int))
+        let pat_idx = self.eb.add_const_bytes(pattern.as_bytes());
+        Ok((self.eb.emit(L::StrLike { src, pat_idx, ci }), ExprKind::Int))
     }
 
     /// `CONCAT(args…)`, a strictly left fold seeded with the empty string, so
@@ -513,7 +504,7 @@ impl OpcodeBackend<'_> {
     /// string; only the accumulator's own NULL (from `str_concat_nn`)
     /// propagates.
     fn concat_n(&mut self, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let empty = self.eb.add_const_string("");
+        let empty = self.eb.add_const_bytes(b"");
         let mut acc = self.eb.emit(L::LoadConstStr { const_idx: empty });
         for a in args {
             let r = self.str_operand(a, true)?;

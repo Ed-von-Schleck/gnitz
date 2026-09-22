@@ -7,7 +7,6 @@ use std::ops::Neg;
 
 use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
 use gnitz_wire::{type_code, FixedInt};
-use std::num::NonZeroU8;
 
 use super::{decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use crate::program::{FloatUnaryOp, IntUnaryOp};
@@ -1095,14 +1094,12 @@ fn like_over_inline_and_heap_cells_with_a_null_row() {
     let vals: &[&[u8]] = &[b"abc", b"abcdefghijklm", b"xyz", b"abc"];
     let nulls = [false, false, false, true];
     let run = |pattern: &str, ci: bool| {
-        let (ev, view) = str_prog(vals, &nulls, vec![pattern.as_bytes().to_vec()], |a| {
-            vec![LogicalInstr::StrLike {
-                src: a,
-                escape: NonZeroU8::new(b'\\'),
-                pat_idx: ConstIdx(0),
-                ci,
-            }]
-        });
+        let (ev, view) = str_prog(
+            vals,
+            &nulls,
+            vec![crate::LikePattern::encode(pattern, None).unwrap().as_bytes().to_vec()],
+            |a| vec![LogicalInstr::StrLike { src: a, pat_idx: ConstIdx(0), ci }],
+        );
         (0..vals.len()).map(|i| row_value(&ev, &view, i)).collect::<Vec<_>>()
     };
     let null_row = None;

@@ -35,12 +35,14 @@ _PATTERNS = {
     # is admitted by neither direction.
     "s NOT LIKE 'ab%'": {3, 4, 5, 6, 7},
     "s NOT ILIKE 'A%'": {3, 4, 6, 7},
-    # The ESCAPE clause reaches the tokenizer: the default makes `\%` a literal
+    # The ESCAPE clause reaches the pattern encoder: the default makes `\%` a literal
     # percent, an empty ESCAPE turns the backslash back into an ordinary byte and
-    # leaves `%` a wildcard, and an alternate escape character works the same.
+    # leaves `%` a wildcard, and an alternate escape character works the same,
+    # a multi-byte one included.
     r"s LIKE '100\%'": {6},
     r"s LIKE '100\%' ESCAPE ''": {7},
     "s LIKE '100!%' ESCAPE '!'": {6},
+    "s LIKE '100é%' ESCAPE 'é'": {6},
     # The subject is any string expression, not only a column.
     "UPPER(s) LIKE 'AB%'": {1, 2},
     "TRIM(s) LIKE '%mid%'": {3},

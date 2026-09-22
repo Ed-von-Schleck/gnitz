@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 gnitz-wire = { path = "../gnitz-wire" }
-# The substring scan behind LIKE's `%x%`, STRPOS, REPLACE and SPLIT_PART.
+# The substring scan.
 # `no_std` and itself dependency-free, so it pulls nothing into this leaf crate.
 memchr = "2"
 

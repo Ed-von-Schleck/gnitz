@@ -20,7 +20,8 @@ use crate::test_support::{
     schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape, TestSchema, TestView,
 };
 use crate::{
-    CmpOp, ConstIdx, Evaluator, ExprBuilder, IntArithOp, LogicalInstr, LogicalProgram, Reg, SchemaFacts, Sink,
+    CmpOp, ConstIdx, Evaluator, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram, Reg, SchemaFacts,
+    Sink,
 };
 
 /// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
@@ -464,18 +465,17 @@ fn is_null_arm_bench() {
     selected("GNITZ_BENCH_SHAPE", &only, n_selected);
 }
 
-/// One `len`-byte haystack per row in the single STRING payload slot, matching
-/// neither `%needle%` nor `%a%b%`: a fixed length is what makes a per-byte slope
-/// readable, where [`str_bench_view`]'s alternating widths average two regimes.
-/// Every row differs, so no matcher can be hoisted out of the row loop.
-fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize) -> TestView {
+/// One `len`-byte haystack per row in the single STRING payload slot: `unit`
+/// repeated, with one byte per row overwritten by a digit so every row differs
+/// and no matcher can be hoisted out of the row loop. A fixed length is what
+/// makes a per-byte slope readable, where [`str_bench_view`]'s alternating
+/// widths average two regimes.
+fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize, unit: &[u8]) -> TestView {
     let mut v = TestView::new(n, schema.pk_stride());
     push_payload_cols(&mut v, schema);
     for row in 0..n {
         set_row_pk(&mut v, schema, row, row as u64 + 1);
-        // `x` and the digits hold neither literal, so every scan runs to the end
-        // — the non-matching haystack the slope is measured on.
-        let mut s = vec![b'x'; len];
+        let mut s: Vec<u8> = unit.iter().copied().cycle().take(len).collect();
         s[row % len] = b'0' + (row % 10) as u8;
         v.set_string(row, 0, &s);
     }
@@ -510,6 +510,10 @@ fn str_bench_view(schema: &TestSchema, n: usize, cols: usize) -> TestView {
 ///            str_concat int_to_str map \
 ///            str_contains_12 str_contains_128 str_contains_512 \
 ///            str_generic_12 str_generic_128 str_generic_512 \
+///            str_contains_freq_128 str_contains_freq_512 \
+///            str_icontains_12 str_icontains_512 str_iprefix_128 \
+///            str_generic_resume_128 str_generic_resume_512 \
+///            str_strpos_128 str_strpos_512 \
 ///            str_side_64 str_side_512; do
 ///     for p in 1 501; do \
 ///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
@@ -523,6 +527,9 @@ fn str_bench_view(schema: &TestSchema, n: usize, cols: usize) -> TestView {
 /// slope in it, not a constant: `Contains` and `Generic` scan the value, and
 /// `RIGHT` walks it. `str_like`'s own `%boundary` pattern specializes to
 /// `Suffix`, which answers off the tail alone and enters neither scan.
+///
+/// `_freq`, `_resume` and `strpos` meet a false candidate every few bytes
+/// (`xxxxxxxn`, `nexn`); the `i` shapes are ILIKE over `xxxNxxxn`.
 #[test]
 #[ignore]
 fn expr_kernel_bench() {
@@ -605,13 +612,12 @@ fn expr_kernel_bench() {
             load_str(1),
             LogicalInstr::StrLike {
                 src: Reg(0),
-                escape: None,
                 pat_idx: ConstIdx(0),
                 ci: false,
             },
         ],
         Reg(1),
-        vec![b"%boundary".to_vec()],
+        vec![LikePattern::encode("%boundary", None).unwrap().as_bytes().to_vec()],
     );
     let str_substr = scalar_prog(
         &strs,
@@ -639,34 +645,59 @@ fn expr_kernel_bench() {
         vec![],
     );
 
-    // --- LIKE shapes whose cost is a slope in the haystack: `Contains` runs
-    //     `find`'s scan, `Generic` the anchor slide. One STRING column, so the
-    //     view is the fixture and the pattern is the shape.
+    // --- LIKE shapes whose cost is a slope in the haystack. One STRING column,
+    //     so the view is the fixture and the pattern is the shape.
     let str1 = schema_pk_strings(1, false);
     let like_lens = [12usize, 128, 512];
-    let like_views: Vec<TestView> = like_lens.iter().map(|&l| fixed_len_str_view(&str1, n, l)).collect();
-    let like_prog = |pat: &[u8]| {
+    let like_views: Vec<TestView> = like_lens
+        .iter()
+        .map(|&l| fixed_len_str_view(&str1, n, l, b"x"))
+        .collect();
+    let like_prog = |pat: &str, ci: bool| {
         scalar_prog(
             &str1,
             vec![
                 load_str(1),
-                LogicalInstr::StrLike {
-                    src: Reg(0),
-                    escape: None,
-                    pat_idx: ConstIdx(0),
-                    ci: false,
-                },
+                LogicalInstr::StrLike { src: Reg(0), pat_idx: ConstIdx(0), ci },
             ],
             Reg(1),
-            vec![pat.to_vec()],
+            vec![LikePattern::encode(pat, None).unwrap().as_bytes().to_vec()],
         )
     };
-    let contains = like_prog(b"%needle%");
-    let generic = like_prog(b"%a%b%");
+    let contains = like_prog("%needle%", false);
+    let generic = like_prog("%a%b%", false);
+    let icontains = like_prog("%NeedLe%", true);
+    let iprefix = like_prog("NeedLe%", true);
+    let resume = like_prog("%n_q%", false);
+    let strpos = scalar_prog(
+        &str1,
+        vec![
+            load_str(1),
+            LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
+            LogicalInstr::StrPos { hay: Reg(0), needle: Reg(1) },
+        ],
+        Reg(2),
+        vec![b"needle".to_vec()],
+    );
+    let freq_views: Vec<TestView> = [128, 512]
+        .iter()
+        .map(|&l| fixed_len_str_view(&str1, n, l, b"xxxxxxxn"))
+        .collect();
+    let mixed_views: Vec<TestView> = [12, 128, 512]
+        .iter()
+        .map(|&l| fixed_len_str_view(&str1, n, l, b"xxxNxxxn"))
+        .collect();
+    let dense_views: Vec<TestView> = [128, 512]
+        .iter()
+        .map(|&l| fixed_len_str_view(&str1, n, l, b"nexn"))
+        .collect();
 
     // --- `RIGHT(c, 10)`: the one kernel whose walk is from the far end.
     let side_lens = [64usize, 512];
-    let side_views: Vec<TestView> = side_lens.iter().map(|&l| fixed_len_str_view(&str1, n, l)).collect();
+    let side_views: Vec<TestView> = side_lens
+        .iter()
+        .map(|&l| fixed_len_str_view(&str1, n, l, b"x"))
+        .collect();
     let str_side = scalar_prog(
         &str1,
         vec![
@@ -734,6 +765,17 @@ fn expr_kernel_bench() {
     {
         scalar_shapes.push((name, &generic, &like_views[k], 1));
     }
+    scalar_shapes.extend([
+        ("str_contains_freq_128", &contains, &freq_views[0], 1),
+        ("str_contains_freq_512", &contains, &freq_views[1], 1),
+        ("str_icontains_12", &icontains, &mixed_views[0], 1),
+        ("str_icontains_512", &icontains, &mixed_views[2], 1),
+        ("str_iprefix_128", &iprefix, &mixed_views[1], 1),
+        ("str_generic_resume_128", &resume, &dense_views[0], 1),
+        ("str_generic_resume_512", &resume, &dense_views[1], 1),
+        ("str_strpos_128", &strpos, &freq_views[0], 2),
+        ("str_strpos_512", &strpos, &freq_views[1], 2),
+    ]);
     for (name, ev, view, reg) in scalar_shapes {
         if !driven(name) {
             continue;

@@ -4,7 +4,6 @@
 
 use gnitz_wire::{type_code, FixedInt};
 use std::collections::BTreeSet;
-use std::num::NonZeroU8;
 
 // `tests/program.rs` is `#[path]`-attached to `program.rs`, so `super` is that
 // module — one import line rather than three spellings of it.
@@ -1835,36 +1834,26 @@ fn trim_mode_and_cast_target_are_narrowed_at_decode() {
 }
 
 #[test]
-fn like_rejects_a_forged_escape_or_operand() {
-    // LOAD_COL_STR into reg 0, then LIKE of it into reg 1, with the escape
-    // packed above the source register.
-    let load_like = |ci: u32, escape: u32, pat_idx: u32| {
-        code(&[
-            (ExprOp::LoadColStr, 0, &[1]),
-            (ExprOp::StrLike, ci, &[0, escape, pat_idx]),
-        ])
-    };
-    let pool = || vec![b"a%".to_vec()];
+fn like_rejects_a_forged_operand() {
+    // LOAD_COL_STR into reg 0, then LIKE of it into reg 1.
+    let load_like =
+        |ci: u32, pat_idx: u32| code(&[(ExprOp::LoadColStr, 0, &[1]), (ExprOp::StrLike, ci, &[0, pat_idx])]);
+    let pool = || vec![b"a\xFF".to_vec()];
     let decode = |c: Vec<[u32; INSTR_WORDS]>, pool: Vec<Vec<u8>>| from_regions(&c, &[], None, pool).map(|_| ());
 
-    assert!(decode(load_like(0, b'\\' as u32, 0), pool()).is_ok());
-    // Escape 0 disables escaping, and an empty pool entry is the legal `LIKE ''`.
-    assert!(decode(load_like(1, 0, 0), pool()).is_ok());
-    assert!(decode(load_like(0, 0, 0), vec![Vec::new()]).is_ok());
+    assert!(decode(load_like(0, 0), pool()).is_ok());
+    assert!(decode(load_like(1, 0), pool()).is_ok());
+    // An empty pool entry is the legal `LIKE ''`.
+    assert!(decode(load_like(0, 0), vec![Vec::new()]).is_ok());
 
     assert_eq!(
-        decode(load_like(0, b'\\' as u32, 9), pool()),
+        decode(load_like(0, 9), pool()),
         Err(ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 })
-    );
-    // The escape is one byte, so everything above it must be clear.
-    assert_eq!(
-        decode(load_like(0, 0x1_5C, 0), pool()),
-        Err(ExprValidateErr::BadLikeEscape { escape: 0x1_5C })
     );
     // The source must be a string register.
     assert_eq!(
         decode(
-            code(&[(ExprOp::LoadColInt, 0, &[1]), (ExprOp::StrLike, 0, &[0, 0, 0])]),
+            code(&[(ExprOp::LoadColInt, 0, &[1]), (ExprOp::StrLike, 0, &[0, 0])]),
             pool()
         ),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
@@ -1876,12 +1865,7 @@ fn like_rejects_a_forged_escape_or_operand() {
 #[test]
 fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     let schema = schema_pk_strings(1, false);
-    let like = |ci| LogicalInstr::StrLike {
-        src: Reg(0),
-        escape: NonZeroU8::new(b'\\'),
-        pat_idx: ConstIdx(0),
-        ci,
-    };
+    let like = |ci| LogicalInstr::StrLike { src: Reg(0), pat_idx: ConstIdx(0), ci };
     let instrs = vec![LogicalInstr::LoadColStr { col: 1 }, like(false), like(true)];
     let ev = scalar_prog(&schema, instrs, Reg(1), vec![b"abc".to_vec()]);
     assert_eq!(ev.prog.like_matchers.len(), 2);
@@ -2115,23 +2099,13 @@ fn every_variant() -> Vec<LogicalInstr> {
         },
         L::StrLike {
             src: Reg(81),
-            escape: NonZeroU8::new(b'!'),
             pat_idx: ConstIdx(82),
             ci: false,
         },
         L::StrLike {
             src: Reg(84),
-            escape: None,
             pat_idx: ConstIdx(85),
             ci: true,
-        },
-        // Escape byte 1: the smallest escape the type admits, distinguishable
-        // from `None` only because it cannot be 0.
-        L::StrLike {
-            src: Reg(86),
-            escape: NonZeroU8::new(1),
-            pat_idx: ConstIdx(88),
-            ci: false,
         },
         L::IntToStr { a: Reg(87) },
         L::FloatToStr { a: Reg(89) },

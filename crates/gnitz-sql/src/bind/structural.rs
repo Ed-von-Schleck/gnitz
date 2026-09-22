@@ -9,7 +9,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrArg, StrFunc, TrimMode};
 use crate::types::{is_cast_target, sql_col_type};
 use gnitz_core::{ColumnDef, Schema};
-use gnitz_expr::CalendarOp;
+use gnitz_expr::{CalendarOp, LikePattern};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, TrimWhereField, UnaryOperator,
     ValueWithSpan,
@@ -248,11 +248,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 else_: Some(Box::new(cmp)),
             })
         }
-        // LIKE and ILIKE differ only in case folding, so one arm binds both and
-        // takes `ci` from the node it matched. Only the subject is an operand:
-        // the pattern and the escape are compile-time data (`like_pattern` /
-        // `like_escape`), which is also what lets the trailing-escape rule be
-        // decided here rather than per row.
+        // LIKE and ILIKE differ only in `ci`.
         Expr::Like {
             negated,
             any,
@@ -274,7 +270,6 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             let node = BExpr::Like {
                 s: Box::new(bind_structural(subject, leaf)?),
                 pattern: like_pattern(pattern, escape)?,
-                escape,
                 ci: matches!(expr, Expr::ILike { .. }),
             };
             Ok(maybe_negate(node, *negated))
@@ -455,45 +450,28 @@ impl LeafBinder<Infallible> for NoColumns {
     }
 }
 
-/// The pattern of a LIKE: a string literal, and not one ending in a live escape
-/// character.
-///
-/// A non-literal pattern is rejected for `trim_set`'s reason — it is
-/// compile-time data the engine tokenizes once per program, not a per-row
-/// operand. `s LIKE NULL` falls out as a non-`LitStr` and is rejected, where
-/// PostgreSQL evaluates it to NULL — the deviation `btrim(s, NULL)` already
-/// carries.
-fn like_pattern(pattern: &Expr, escape: Option<u8>) -> Result<String, GnitzSqlError> {
+/// A string literal only, so `s LIKE NULL` is rejected where PostgreSQL
+/// evaluates it to NULL.
+fn like_pattern(pattern: &Expr, escape: Option<char>) -> Result<LikePattern, GnitzSqlError> {
     let bad = || GnitzSqlError::Unsupported("LIKE pattern must be a string literal".into());
     let s = literal_expr_string(pattern).ok_or_else(bad)?;
-    // The engine's own tokenizer answers, so the binder's rule and the matcher's
-    // cannot drift.
-    if gnitz_expr::like_pattern_ends_with_live_escape(s.as_bytes(), escape) {
-        return Err(GnitzSqlError::Plan(
-            "LIKE pattern must not end with escape character".to_string(),
-        ));
-    }
-    Ok(s)
+    LikePattern::encode(&s, escape)
+        .ok_or_else(|| GnitzSqlError::Plan("LIKE pattern must not end with escape character".to_string()))
 }
 
-/// The escape character of a LIKE: `\` by default (PostgreSQL's and MySQL's
-/// choice; the standard specifies none), a single ASCII non-NUL character from
-/// `ESCAPE 'c'`, or `None` — escaping disabled — from `ESCAPE ''`.
-///
-/// Two deviations from PostgreSQL, which takes any single character of the
-/// database encoding: the escape is one byte on the wire, so `ESCAPE 'é'` is an
-/// error, and byte 0 encodes "escaping disabled", so `ESCAPE '<NUL>'` is one too.
-fn like_escape(escape_char: Option<&ValueWithSpan>) -> Result<Option<u8>, GnitzSqlError> {
-    let Some(v) = escape_char else { return Ok(Some(b'\\')) };
-    let bad = || GnitzSqlError::Unsupported("LIKE: ESCAPE must be a single non-NUL ASCII character or ''".into());
+/// `\` by default, as in PostgreSQL and MySQL; `None` for `ESCAPE ''`.
+fn like_escape(escape_char: Option<&ValueWithSpan>) -> Result<Option<char>, GnitzSqlError> {
+    let Some(v) = escape_char else { return Ok(Some('\\')) };
+    let bad = || GnitzSqlError::Unsupported("LIKE: ESCAPE must be a single character or ''".into());
     // A `ValueWithSpan`, not an `Expr`: the parser puts the escape in its own
     // slot, so there is no sign or parenthesis for `bind_constant` to peel.
     let Ok(BExpr::LitStr(s)) = bind_literal::<Infallible>(&v.value) else {
         return Err(bad());
     };
-    match s.as_bytes() {
-        [] => Ok(None),
-        &[b] if b != 0 => Ok(Some(b)),
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => Ok(None),
+        (Some(c), None) => Ok(Some(c)),
         _ => Err(bad()),
     }
 }

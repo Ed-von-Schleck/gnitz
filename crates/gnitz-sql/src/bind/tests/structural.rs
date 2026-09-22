@@ -619,43 +619,44 @@ fn bind_str(src: &str) -> Result<BoundExpr, GnitzSqlError> {
     bind1(&parse_expr_sql(src), &schema_with_val(TypeCode::String))
 }
 
-/// The `(pattern, escape, ci)` a LIKE bound to, unwrapping a `NOT` if one is
+/// The `(pattern, ci, negated)` a LIKE bound to, unwrapping a `NOT` if one is
 /// there.
-fn like_parts(src: &str) -> (String, Option<u8>, bool, bool) {
+fn like_parts(src: &str) -> (LikePattern, bool, bool) {
     let (e, negated) = match bind_str(src).unwrap() {
         BoundExpr::Not(inner) => (*inner, true),
         other => (other, false),
     };
     match e {
-        BoundExpr::Like { pattern, escape, ci, .. } => (pattern, escape, ci, negated),
+        BoundExpr::Like { pattern, ci, .. } => (pattern, ci, negated),
         other => panic!("expected Like, got {other:?}"),
     }
 }
 
+/// The pattern bytes a LIKE bound to.
+fn like_bytes(src: &str) -> Vec<u8> {
+    like_parts(src).0.as_bytes().to_vec()
+}
+
 #[test]
 fn like_binds_its_pattern_escape_and_case_folding() {
-    assert_eq!(like_parts("c LIKE 'a%'"), ("a%".to_string(), Some(b'\\'), false, false));
-    assert_eq!(like_parts("c ILIKE 'a%'"), ("a%".to_string(), Some(b'\\'), true, false));
+    let a = || LikePattern::encode("a%", None).unwrap();
+    assert_eq!(like_parts("c LIKE 'a%'"), (a(), false, false));
+    assert_eq!(like_parts("c ILIKE 'a%'"), (a(), true, false));
+    assert_eq!(like_parts("c NOT LIKE 'a%'"), (a(), false, true));
+    assert_eq!(like_parts("c NOT ILIKE 'a%'"), (a(), true, true));
+    // The default escape is `\`, `ESCAPE ''` disables escaping, and any other
+    // single character overrides it — a multi-byte one or NUL included.
+    assert_eq!(like_bytes(r"c LIKE 'a\%'"), b"a%");
     assert_eq!(
-        like_parts("c NOT LIKE 'a%'"),
-        ("a%".to_string(), Some(b'\\'), false, true)
+        like_parts(r"c LIKE 'a\%' ESCAPE ''").0,
+        LikePattern::encode(r"a\%", None).unwrap()
     );
-    assert_eq!(
-        like_parts("c NOT ILIKE 'a%'"),
-        ("a%".to_string(), Some(b'\\'), true, true)
-    );
-    // `ESCAPE ''` disables escaping; any other single ASCII byte overrides.
-    assert_eq!(
-        like_parts(r"c LIKE 'a\%' ESCAPE ''"),
-        (r"a\%".to_string(), None, false, false)
-    );
-    assert_eq!(
-        like_parts("c LIKE 'a!%' ESCAPE '!'"),
-        ("a!%".to_string(), Some(b'!'), false, false)
-    );
+    assert_eq!(like_bytes("c LIKE 'a!%' ESCAPE '!'"), b"a%");
+    assert_eq!(like_bytes("c LIKE 'aé%b' ESCAPE 'é'"), b"a%b");
+    assert_eq!(like_bytes("c LIKE 'a\0%' ESCAPE '\0'"), b"a%");
     // Parentheses around the literal are peeled, as they are in an operand
     // position.
-    assert_eq!(like_parts("c LIKE ('a%')").0, "a%");
+    assert_eq!(like_parts("c LIKE ('a%')").0, a());
 }
 
 #[test]
@@ -664,24 +665,22 @@ fn like_rejects_what_it_cannot_bake_in() {
     assert_unsupported(bind_str("c LIKE NULL"), "LIKE pattern must be a string literal");
     assert_unsupported(bind_str("c LIKE 1"), "LIKE pattern must be a string literal");
     assert_unsupported(bind_str("c LIKE ANY ('a%')"), "LIKE ANY is not supported");
-    // Two characters, non-ASCII, and NUL are all rejected escapes.
-    for esc in ["'ab'", "'é'", "'\0'", "1"] {
+    // Two characters and a non-string are rejected escapes.
+    for esc in ["'ab'", "1"] {
         assert_unsupported(bind_str(&format!("c LIKE 'a' ESCAPE {esc}")), "ESCAPE must be a single");
     }
 }
 
-/// A pattern ending in a *live* escape is rejected; one whose trailing
-/// escape is itself escaped is legal, and only the tokenizer walk tells
-/// them apart.
+/// A pattern ending in a *live* escape is rejected; one whose trailing escape
+/// is itself escaped is legal.
 #[test]
 fn like_rejects_a_pattern_ending_in_a_live_escape() {
     match bind_str(r"c LIKE 'ab\'").unwrap_err() {
         GnitzSqlError::Plan(msg) => assert_eq!(msg, "LIKE pattern must not end with escape character"),
         e => panic!("expected Plan, got {e:?}"),
     }
-    assert_eq!(like_parts(r"c LIKE 'ab\\'").0, r"ab\\");
-    // With escaping disabled the byte is ordinary.
-    assert_eq!(like_parts(r"c LIKE 'ab\' ESCAPE ''").0, r"ab\");
+    assert_eq!(like_bytes(r"c LIKE 'ab\\'"), br"ab\");
+    assert_eq!(like_bytes(r"c LIKE 'ab\' ESCAPE ''"), br"ab\");
 }
 
 /// Every string function name reaches the same IR node, whichever of its
