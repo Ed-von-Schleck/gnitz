@@ -45,10 +45,7 @@ fn a_dropped_timer_leaves_no_deadline() {
 
     std::thread::sleep(Duration::from_millis(2));
     r.tick(false);
-    assert!(
-        !r.inner.run_queue.borrow().is_queued(999),
-        "a dropped timer must not wake its original waker"
-    );
+    assert!(!is_queued(999), "a dropped timer must not wake its original waker");
 }
 
 /// Submitting fdatasync on an fd that is not in the process's fd
@@ -160,7 +157,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     let region = unsafe { make_ring(ipc::WireMsg::default().size(), 2, 8) };
     let ptr = region.ptr();
 
-    let r = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
+    let r = make_reactor_over(W2mReceiver::new(vec![ptr]));
     let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
     let id = lease.id();
     let writer = W2mWriter::new(ptr);

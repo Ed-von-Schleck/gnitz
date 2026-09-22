@@ -17,14 +17,14 @@
 //!   single-request workloads. See `drain_ready_batch`.
 //! - **Checkpoint.**  When the batch warrants one the committer runs the full
 //!   three-step sequence (`run_checkpoint_sequence`: gen bump → base round →
-//!   drain/quiesce → ephemeral round), then proceeds with the push batch.
+//!   drain → tick gate → ephemeral round), then proceeds with the push batch.
 //!   `checkpoint_warranted` is the one statement of when.
 //! - **Barrier.**  A `Barrier` request flushes any in-flight batch and
 //!   signals via a oneshot — used by DDL to drain the committer before
 //!   catalog mutation, by a tick's relay to reclaim SAL space, and by the
 //!   graceful-shutdown watchdog (see `BarrierKind`).
 
-use super::executor::{request_drain, request_quiesce, Shared};
+use super::executor::{request_drain, Shared};
 use super::guard_panic;
 use super::TxnFamily;
 use crate::runtime::master::FlushRound;
@@ -32,6 +32,7 @@ use crate::runtime::reactor::{chan, oneshot, select2, AckLease, Either};
 use crate::runtime::sal::SalScope;
 use gnitz_store::storage::Batch;
 use gnitz_wire::WireFault;
+use std::future::Future;
 use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
@@ -140,16 +141,7 @@ pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
 /// Whether this batch warrants the full checkpoint sequence — barrier-only
 /// batches included, since a tick relay's low-space barrier arrives precisely to
 /// reclaim SAL space.
-///
-/// Never inside a DDL window, where the sequence cannot run. Refusing rather
-/// than waiting is safe: no tick relay can be mid-retry once the Quiesce is
-/// acked (the tick loop is serial and relays inside its tick), the
-/// watchdog's barrier re-fires in 100 ms, and a DDL's own `Ddl` barrier reaches
-/// this decision before its window opens.
 fn checkpoint_warranted(shared: &Shared, batch: &PendingBatch) -> bool {
-    if shared.ddl_window.get() != 0 {
-        return false;
-    }
     let forced = batch
         .barriers
         .iter()
@@ -212,33 +204,34 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
 /// One checkpoint round. Aborts on failure: the workers are re-epoched against an
 /// un-reset SAL, which only a restart's replay repairs.
 async fn flush_round(shared: &Rc<Shared>, round: FlushRound) {
-    let disp = shared.disp();
-    let mut excl = disp.sal().lock().await;
-    disp.checkpoint_round(&mut excl, round)
+    shared
+        .disp()
+        .flush(round)
         .await
         .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
 }
 
 /// The full steady-state checkpoint sequence: gen bump → base round → drain →
-/// quiesce → ephemeral round. Signals the reclaim barriers right after step 1,
+/// tick gate → ephemeral round. Signals the reclaim barriers right after step 1,
 /// and leaves `batch` holding the pushes it held across the sequence — folded
 /// with any that arrived mid-drain — plus the deferred DDL/Shutdown barriers,
 /// for the caller to commit and signal.
-///
-/// Must not run inside a DDL window: the drain below would never complete
-/// against the parked tick loop (see `TickGate`).
 async fn run_checkpoint_sequence(
     rx: &mut chan::Receiver<CommitRequest>,
     shared: &Rc<Shared>,
     batch: &mut PendingBatch,
 ) {
-    let gen = {
+    // A DDL holding the tick gate has uncommitted families step 1 must not flush.
+    if shared.tick_gate.is_write_held() {
+        drop(shared.tick_gate.read().await);
+    }
+    {
         let disp = shared.disp();
         let mut excl = disp.sal().lock().await;
         disp.reclaim_base(&mut excl)
             .await
-            .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"))
-    };
+            .unwrap_or_else(|e| gnitz_fatal_abort!("{e}"));
+    }
 
     // Release the reclaim barriers now: step 1's reset already reclaimed space, and
     // a tick waiting on one must finish before the tick loop can take the drain
@@ -256,29 +249,24 @@ async fn run_checkpoint_sequence(
     // source's full dependent closure with inline exchange rounds, and pushes are
     // held so the pending-tick counts cannot grow. Mirrors the SCAN drain.
     let drained = await_servicing(request_drain(shared), rx, batch, shared).await;
-    // Step 3 would stamp every view manifest at `gen` while the views are missing
-    // the deltas this drain failed to tick — durable, generation-valid loss. Skip
-    // it: step 0's bump is already durable and the manifests are still at
-    // `gen - 1`, so `compute_invalid_views` rebuilds them from the base tables on
-    // the next boot. Aborting would be equally safe, but this path also runs on
-    // the Shutdown barrier, so it would turn any tick error during the final
-    // drain into `_exit(134)`.
+    // Stamping now would make the views' missing deltas generation-valid; left
+    // behind step 1's generation, they are rebuilt at the next boot. Not an
+    // abort: this path also serves the Shutdown barrier.
     if let Err(e) = drained {
         gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
         return;
     }
 
-    // Quiesce so no tick runs during the ephemeral flush. The park guard lives to
-    // the end of this function, so the tick loop resumes only past the round.
-    let _park = await_servicing(request_quiesce(shared), rx, batch, shared).await;
-
-    // Step 3 — EPHEMERAL ROUND. Stamp the step-0 generation (no re-bump happens
-    // mid-drain, so no re-read is needed).
-    flush_round(shared, FlushRound::Ephemeral { generation: gen }).await;
+    // Step 3 — EPHEMERAL ROUND, with no tick running. A DDL since step 1 may
+    // have restamped already.
+    let _park = await_servicing(shared.tick_gate.write(), rx, batch, shared).await;
+    if shared.disp().derived_needs_restamp() {
+        flush_round(shared, FlushRound::Ephemeral).await;
+    }
 }
 
-/// Await `target_rx` (a Drain `done` or a Quiesce ack) while keeping the
-/// committer responsive: a reclaim barrier is serviced by a reclaim-only base
+/// Await `target` (a Drain `done` or the tick gate's write guard) while keeping
+/// the committer responsive: a reclaim barrier is serviced by a reclaim-only base
 /// round (so a draining tick's relay gets SAL space), DDL/Shutdown barriers are
 /// deferred to sequence end, and pushes are held for the folded commit. The
 /// target is re-polled after each serviced request, so no wakeup is lost.
@@ -286,27 +274,25 @@ async fn run_checkpoint_sequence(
 /// Returns the target's payload. The Drain target carries the tick's verdict,
 /// which decides whether the sequence's ephemeral round may run.
 async fn await_servicing<T>(
-    target_rx: oneshot::Receiver<T>,
+    mut target: impl Future<Output = T> + Unpin,
     rx: &mut chan::Receiver<CommitRequest>,
     batch: &mut PendingBatch,
     shared: &Rc<Shared>,
 ) -> T {
-    // `oneshot::Receiver` is `Unpin`, so `&mut target` is itself a Future.
-    let mut target = target_rx;
     loop {
+        // `target` is `Unpin`, so `&mut target` is itself a Future.
         match select2(&mut target, rx.recv()).await {
-            // Target fired: drain done, or the quiesce ack carrying its park token.
+            // Target fired: drain done, or the tick gate's write guard.
             Either::A(v) => return v,
             Either::B(CommitRequest::Barrier {
                 kind: BarrierKind::Reclaim { forced },
                 done,
             }) => {
-                // Reclaim-only base round: no gen re-bump, no re-staleing of view
-                // manifests. Gated on the margin test alone — a reclaim barrier
-                // asks for space, not for a checkpoint — because step 1 already
-                // reset the SAL and the watchdog fires these on a timer, so an
-                // ungated round would cost a full broadcast for nothing.
-                if forced || shared.disp().sal().below_reclaim_margin() {
+                // Reclaim-only base round: no gen re-bump. Only for want of space,
+                // since step 1 already reset the SAL, and never under a DDL's tick
+                // gate, whose uncommitted families it would flush.
+                let ddl_inside = shared.tick_gate.is_write_held();
+                if !ddl_inside && (forced || shared.disp().sal().below_reclaim_margin()) {
                     flush_round(shared, FlushRound::Base).await;
                 }
                 done.send(());
@@ -347,7 +333,7 @@ enum Outcome {
     Pushes(Vec<oneshot::Sender<Result<u64, WireFault>>>),
     /// One transaction. Its contract is "Err ⇒ nothing committed", so once the
     /// zone is durable a worker error must never turn `Ok` into `Err`.
-    /// `commit_pushes` aborts instead — the DDL tick quiesce and the catalog read
+    /// `commit_pushes` aborts instead — the DDL's tick gate and the catalog read
     /// lock held through the ACK are what make that arm unreachable, and it
     /// fail-stops rather than diverge if they ever do not.
     Txn(oneshot::Sender<Result<u64, WireFault>>),

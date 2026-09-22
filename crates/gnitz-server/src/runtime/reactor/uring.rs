@@ -15,9 +15,6 @@ pub(super) struct Cqe {
     pub(super) flags: u32,
 }
 
-/// io_uring CQE flag: more completions coming (multishot).
-pub(super) const CQE_F_MORE: u32 = 1 << 1;
-
 /// The reactor's io_uring submission/completion interface.
 ///
 /// All `prep_*` methods are **infallible** — if the SQ is full, the

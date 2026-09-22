@@ -49,21 +49,40 @@ pub(crate) fn make_reactor() -> crate::runtime::reactor::Reactor {
 
 /// [`make_reactor`] built with `limits`.
 pub(crate) fn make_reactor_with(limits: crate::runtime::reactor::Limits) -> crate::runtime::reactor::Reactor {
-    build_reactor(limits, crate::runtime::w2m::W2mReceiver::new(vec![]).into())
+    build_reactor(limits, crate::runtime::w2m::W2mReceiver::new(vec![]))
 }
 
 /// A test reactor reading the rings `w2m` covers.
-pub(crate) fn make_reactor_over(
-    w2m: std::rc::Rc<crate::runtime::w2m::W2mReceiver>,
-) -> crate::runtime::reactor::Reactor {
+pub(crate) fn make_reactor_over(w2m: crate::runtime::w2m::W2mReceiver) -> crate::runtime::reactor::Reactor {
     build_reactor(crate::runtime::reactor::Limits::TEST, w2m)
 }
 
 fn build_reactor(
     limits: crate::runtime::reactor::Limits,
-    w2m: std::rc::Rc<crate::runtime::w2m::W2mReceiver>,
+    w2m: crate::runtime::w2m::W2mReceiver,
 ) -> crate::runtime::reactor::Reactor {
     crate::runtime::reactor::Reactor::new(16, limits, w2m).expect("reactor")
+}
+
+/// Run `f` on its own thread and fail if it has not returned within `limit`, so
+/// a tick that sleeps when it must not fails the test instead of wedging the
+/// run. A timed-out thread is left blocked; the harness exits past it.
+pub(crate) fn within(limit: std::time::Duration, f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(()) => handle.join().expect("test thread panicked"),
+        // The sender dropped without sending: `f` panicked.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("did not finish within {limit:?}"),
+    }
 }
 
 /// Poll a future exactly once with a noop waker; `None` if it is still pending.

@@ -892,17 +892,6 @@ impl SalWriter {
         }
     }
 
-    /// For a caller that polls no other task: panics if a task holds the writer.
-    pub(crate) fn lock_exclusive(&self) -> SalExcl<'_> {
-        SalExcl {
-            writer: self,
-            _guard: self
-                .excl
-                .try_write()
-                .expect("an exclusive SAL write found a task holding the writer"),
-        }
-    }
-
     /// Slots per group — the log's framing.
     pub(crate) fn num_workers(&self) -> usize {
         self.num_workers

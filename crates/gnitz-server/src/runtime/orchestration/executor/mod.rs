@@ -99,8 +99,8 @@ async fn hold_push_for_ddl(shared: &Shared, target_id: i64) {
 
 use gnitz_wire::ClientVerb;
 
-/// One tick request to `tick_loop`. Minted only by `request_drain`,
-/// `request_quiesce` and [`Shared::note_commit_rows`].
+/// One tick request to `tick_loop`. Minted only by `request_drain` and
+/// [`Shared::note_commit_rows`].
 enum TickTrigger {
     /// Fire-and-forget trigger from INSERT when a tid crosses the row
     /// coalesce threshold.  Tids come from `tick_rows`.
@@ -112,24 +112,6 @@ enum TickTrigger {
     Drain {
         done: oneshot::Sender<Result<(), WireFault>>,
     },
-    /// Pause the tick subsystem. On dequeue the loop sends a [`TickPark`] on
-    /// `acked` — proving no tick is in flight (the loop is serial) and none will
-    /// start — then blocks until that token is dropped. The ack therefore also
-    /// means any in-flight exchange tick has drained, which is what
-    /// `handle_ddl_txn` waits on.
-    Quiesce { acked: oneshot::Sender<TickPark> },
-}
-
-/// Holding one parks the tick loop; dropping it is the release, so no path can
-/// forget to send one.
-pub(super) struct TickPark(Option<oneshot::Sender<()>>);
-
-impl Drop for TickPark {
-    fn drop(&mut self) {
-        if let Some(release) = self.0.take() {
-            release.send(());
-        }
-    }
 }
 
 /// Ask the tick loop to tick everything pending and report the tick's verdict.
@@ -139,19 +121,12 @@ pub(super) fn request_drain(shared: &Shared) -> oneshot::Receiver<Result<(), Wir
     rx
 }
 
-/// Ask the tick loop to park. The reply carries the token whose drop releases
-/// it.
-pub(super) fn request_quiesce(shared: &Shared) -> oneshot::Receiver<TickPark> {
-    let (acked, rx) = oneshot::channel();
-    shared.tick_tx.send(TickTrigger::Quiesce { acked });
+/// Send the committer a barrier of `kind`; the receiver resolves once it is
+/// serviced.
+fn request_barrier(shared: &Shared, kind: BarrierKind) -> oneshot::Receiver<()> {
+    let (done, rx) = oneshot::channel();
+    shared.committer_tx.send(CommitRequest::Barrier { kind, done });
     rx
-}
-
-/// Send a committer barrier of `kind` and wait for it to resolve.
-async fn await_barrier(shared: &Shared, kind: BarrierKind) {
-    let (tx, rx) = oneshot::channel::<()>();
-    shared.committer_tx.send(CommitRequest::Barrier { kind, done: tx });
-    rx.await;
 }
 
 /// Shared executor state held by every task.
@@ -159,9 +134,12 @@ pub struct Shared {
     dispatcher: Rc<MasterDispatcher>,
     committer_tx: chan::Sender<CommitRequest>,
     catalog_rwlock: AsyncRwLock,
-    /// Tick trigger sender. Reached only through `request_drain`,
-    /// `request_quiesce` and [`Shared::note_commit_rows`], so every trigger this
-    /// process sends is minted in one place.
+    /// Held shared by every tick, so a writer runs with no tick in flight. Lock
+    /// order: catalog, then this, then the SAL writer.
+    pub(super) tick_gate: AsyncRwLock,
+    /// Tick trigger sender. Reached only through `request_drain` and
+    /// [`Shared::note_commit_rows`], so every trigger this process sends is minted
+    /// in one place.
     tick_tx: chan::Sender<TickTrigger>,
     /// Zone-LSN allocation high-water + durability watermark, read by the
     /// committer so the read handlers report the same LSN it assigns.
@@ -179,10 +157,6 @@ pub struct Shared {
     /// Shutdown barrier. Read only by [`Shared::enqueue_commit`], which is what
     /// makes the test and the send one step.
     draining: Cell<bool>,
-    /// Nesting depth of the DDL windows in which the tick loop is parked; see
-    /// `TickGate`. Read by the committer (no checkpoint round while non-zero)
-    /// and by the watchdog (a SIGTERM waits the window out).
-    pub(super) ddl_window: Cell<usize>,
     /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
     /// this boot rode`. That LSN is published for a durable write; for a stream it is
     /// a reservation the batch never published, which is what makes
@@ -266,16 +240,21 @@ impl Shared {
         }
     }
 
-    /// Enqueue a commit request unless a graceful shutdown has begun. Synchronous,
-    /// so the test and the send are one step: a request that saw a live server is
-    /// queued ahead of the watchdog's Shutdown barrier, and none commits after the
-    /// final checkpoint's view flush.
-    fn enqueue_commit(&self, req: CommitRequest) -> Result<(), &'static str> {
+    /// Commit `req` unless a graceful shutdown has begun, and await its verdict
+    /// under the caller's catalog read guard. No await separates the test from the
+    /// send: a request that saw a live server is queued ahead of the watchdog's
+    /// Shutdown barrier.
+    async fn commit(
+        &self,
+        _catalog: &ReadGuard,
+        req: impl FnOnce(oneshot::Sender<Result<u64, WireFault>>) -> CommitRequest,
+    ) -> Result<u64, WireFault> {
         if self.draining.get() {
-            return Err("server shutting down");
+            return Err("server shutting down".to_string().into());
         }
-        self.committer_tx.send(req);
-        Ok(())
+        let (done, rx) = oneshot::channel();
+        self.committer_tx.send(req(done));
+        rx.await
     }
 
     /// The zone LSN of `tid`'s last committed write this boot, or `boot_seed` for
@@ -383,13 +362,13 @@ impl ServerExecutor {
             dispatcher,
             committer_tx,
             catalog_rwlock: AsyncRwLock::default(),
+            tick_gate: AsyncRwLock::default(),
             tick_tx,
             lsn_alloc: ZoneLsnAllocator::new(initial_lsn),
             last_tick_lsn: Cell::new(initial_lsn),
             tick_rows: RefCell::new(FxHashMap::default()),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Cell::new(false),
-            ddl_window: Cell::new(0),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed: initial_lsn,
             worker_crashed: Cell::new(false),
@@ -584,13 +563,6 @@ async fn watchdog(shared: Rc<Shared>) {
         shared.disp().reactor().timer(Instant::now() + WORKER_WATCH).await;
 
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-            // Let a quiescing DDL finish first. Its tick loop is parked, so the
-            // Shutdown barrier would resolve without a checkpoint and
-            // `shutdown_workers()` would then kill the workers under the DDL's
-            // exclusive rounds, whose worker probe fails the DDL fatally.
-            if shared.ddl_window.get() != 0 {
-                continue;
-            }
             gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
 
             // 1. Stop admitting new pushes (none may commit after the final
@@ -603,7 +575,7 @@ async fn watchdog(shared: Rc<Shared>) {
             //    rounds complete. A just-pushed delta may still sit in
             //    `pending_deltas` (below the row threshold, so no `Auto` fired),
             //    so the sequence's drain is what gets it into the views.
-            await_barrier(&shared, BarrierKind::Shutdown).await;
+            request_barrier(&shared, BarrierKind::Shutdown).await;
 
             // 3. Shut the workers down, then stop the reactor. The reactor/W2M
             //    receiver stays live throughout, so no `w2m()` handle dangles.
@@ -616,22 +588,15 @@ async fn watchdog(shared: Rc<Shared>) {
             let data_dir = &shared.data_dir;
             gnitz_error!("Worker {crashed} crashed (log: {data_dir}/worker_{crashed}.log), shutting down");
             shared.worker_crashed.set(true);
-            shared.disp().shutdown_workers().await;
+            shared.disp().kill_workers();
             shared.disp().reactor().request_shutdown();
             return;
         }
 
         // The only reclaim trigger on a workload with no writes, whose reads
         // still write SAL groups. Not awaited: the next tick re-sends.
-        if shared.ddl_window.get() == 0 && shared.disp().sal().below_reclaim_margin() {
-            let (done_tx, done_rx) = oneshot::channel();
-            shared.committer_tx.send(CommitRequest::Barrier {
-                kind: BarrierKind::Reclaim { forced: false },
-                done: done_tx,
-            });
-            // Fire-and-forget: dropping the receiver is the whole point, not an
-            // RAII hold.
-            drop(done_rx);
+        if shared.disp().sal().below_reclaim_margin() {
+            drop(request_barrier(&shared, BarrierKind::Reclaim { forced: false }));
         }
     }
 }
@@ -644,8 +609,8 @@ async fn watchdog(shared: Rc<Shared>) {
 /// queued, then issue one batched tick for the union of pending tids.
 ///
 /// Coalescing is the *sender's* job — the committer sends `Auto` only once a tid
-/// crosses `TICK_COALESCE_ROWS`, and `Drain`/`Quiesce` senders are parked on the
-/// answer — so this loop never delays a tick to gather more.
+/// crosses `TICK_COALESCE_ROWS`, and `Drain` senders are parked on the answer —
+/// so this loop never delays a tick to gather more.
 ///
 /// A failure in one trigger fails only that trigger; SAL emission is further
 /// guarded by `guard_panic` inside `run_tick`.
@@ -668,22 +633,15 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
             triggers.push(more);
         }
 
-        // A `Quiesce` is acked here — no tick is in flight, the loop being
-        // serial — and blocks until the DDL releases the gate, so no tick runs
-        // while the DDL holds the catalog write lock. The batch's `Drain`s are
-        // answered after the tick below.
+        // The batch's `Drain`s are answered after the tick below.
         for trigger in triggers.drain(..) {
             match trigger {
-                TickTrigger::Quiesce { acked } => {
-                    let (release_tx, release_rx) = oneshot::channel();
-                    acked.send(TickPark(Some(release_tx)));
-                    release_rx.await;
-                }
                 TickTrigger::Drain { done } => dones.push(done),
                 TickTrigger::Auto => {}
             }
         }
 
+        let _ticking = shared.tick_gate.read().await;
         shared.drain_live_tick_rows_into(&mut tids_scratch);
 
         // Run the tick. Errors are reported in logs AND handed to every Drain
@@ -712,15 +670,13 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
         // before it publishes that commit's zone LSN. The watermark still
         // advances — `read_is_fresh` reads it, and a reader whose source
         // committed between a tick's dequeue and its publish would otherwise
-        // never see its drain take effect. Skips two uncontended lock
-        // acquisitions the rest of the body would take for a no-op.
+        // never see its drain take effect.
         shared.last_tick_lsn.set(snapshot_lsn);
         return Ok(());
     }
 
     let mut req_ids = shared.disp().reactor().lease_acks(tids.len(), "tick");
 
-    let _cat_read = shared.catalog_rwlock.read().await;
     let excl = shared.disp().sal().lock().await;
 
     // Written by the closure as it goes, so the re-queue and reply-await below
@@ -741,7 +697,6 @@ async fn run_tick(shared: &Rc<Shared>, tids: &[i64], acc: &mut ExchangeAccumulat
     // Whatever was written is published: the drop wakes its workers, and its
     // replies are awaited below rather than left in flight.
     drop(excl);
-    drop(_cat_read);
 
     let n = emitted.get();
     req_ids.truncate(n);
@@ -778,11 +733,8 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
         hold_relay_for_ddl(shared).await;
     }
 
-    // Phase 1: CPU work + catalog read only — no SAL hold.
-    let prep = {
-        let _cat = shared.catalog_rwlock.read().await;
-        shared.disp().prepare_relay(relay, "steady relay")
-    };
+    // Phase 1: CPU work — no SAL hold.
+    let prep = shared.disp().prepare_relay(relay, "steady relay");
 
     // Phase 2: fit and emit under one SAL hold.
     let mut reclaimed = false;
@@ -824,7 +776,7 @@ async fn relay_steady(shared: &Shared, relay: PendingRelay) {
         gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
         // `forced`: this relay's own byte count says it does not fit, which
         // the committer's ambient space test cannot see.
-        await_barrier(shared, BarrierKind::Reclaim { forced: true }).await;
+        request_barrier(shared, BarrierKind::Reclaim { forced: true }).await;
         reclaimed = true;
     }
 }
@@ -980,7 +932,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: gnitz
     if PUSH_HOLD_FOR_DDL.take_once() {
         hold_push_for_ddl(shared, target_id).await;
     }
-    let _cat = shared.catalog_rwlock.read().await;
+    let catalog = shared.catalog_rwlock.read().await;
     let Some(kind) = target_kind_or_reject(shared, peer, target_id, Access::Write).await else {
         return;
     };
@@ -990,7 +942,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: gnitz
     let batch = match decoded.data_batch {
         Some(b) if !b.is_empty() => b,
         _ => {
-            drop(_cat);
+            drop(catalog);
             send_ok_response(shared, peer, target_id, None, 0, client_version);
             return;
         }
@@ -998,7 +950,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: gnitz
 
     // `batch.schema()` was resolved before this guard; a DDL may have replaced it since.
     if let Err(e) = validate_client_schema(shared, target_id, batch.schema()) {
-        drop(_cat);
+        drop(catalog);
         // A cold frame authored its schema, so it gets the mismatch in words;
         // a warm one is told to evict its cache entry and retry cold, where
         // that wording is reachable.
@@ -1049,22 +1001,18 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, buf: RecvBuf, ctrl: gnitz
     }
     let TxnFamily { batch, .. } = family;
 
-    // Route through the committer and wait for commit ACK. A graceful shutdown
-    // in flight refuses the enqueue; the client sees a clean error and can retry
-    // against the restarted server.
-    let (tx, rx) = oneshot::channel::<Result<u64, WireFault>>();
     let is_stream = kind == RelationKind::Stream;
-    let queued = shared.enqueue_commit(CommitRequest::Push(PendingPush {
-        tid: target_id,
-        batch,
-        recoverable: !is_stream,
-        done: tx,
-    }));
-    if let Err(e) = queued {
-        send_error(peer, target_id, e.as_bytes());
-        return;
-    }
-    match rx.await {
+    let committed = shared
+        .commit(&catalog, |done| {
+            CommitRequest::Push(PendingPush {
+                tid: target_id,
+                batch,
+                recoverable: !is_stream,
+                done,
+            })
+        })
+        .await;
+    match committed {
         Ok(zone_lsn) => {
             // Record the commit LSN for OCC while the table-lock guard is still
             // held (a concurrent precondition check reads it under the write guard
@@ -1182,7 +1130,7 @@ async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, buf: RecvBuf)
 
     // 2. Catalog read lock (excludes a concurrent DROP/DDL), then the
     //    catalog-dependent rules per family.
-    let _cat = shared.catalog_rwlock.read().await;
+    let catalog = shared.catalog_rwlock.read().await;
     for fam in &families {
         let tid = fam.tid;
         // The plain-push arm's gate. Refusing a stream keeps every family
@@ -1214,9 +1162,9 @@ async fn push_txn_body(shared: &Rc<Shared>, ctrl: &DecodedControl, buf: RecvBuf)
     shared.disp().validate_txn_distributed(&families).await?;
 
     // 5. Commit.
-    let (tx, rx) = oneshot::channel::<Result<u64, WireFault>>();
-    shared.enqueue_commit(CommitRequest::Txn(PendingTxn { families, done: tx }))?;
-    let lsn = rx.await?;
+    let lsn = shared
+        .commit(&catalog, |done| CommitRequest::Txn(PendingTxn { families, done }))
+        .await?;
 
     // 6. Bump while `_tlocks` still holds every family tid.
     shared.record_commit_lsn(family_tids.iter().copied(), lsn);
@@ -1435,9 +1383,7 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
 }
 
 /// Drop the caller's read guard, tick everything pending, and hand back a fresh
-/// guard. Taking the guard by value is the deadlock precondition made structural:
-/// the drain parks on the tick loop's reply, and this writer-preferring guard held
-/// across that park would block DDL writers and `tick_loop`'s own read.
+/// guard, so a DDL queued on the lock does not wait out the drain.
 ///
 /// The trigger goes out even when nothing looks pending — the tick loop is serial,
 /// so awaiting `done` also serializes behind a concurrent `Auto`, without which a

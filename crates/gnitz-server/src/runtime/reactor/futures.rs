@@ -24,9 +24,9 @@ fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
 
 /// What the workers have answered on one [`AckLease`] id.
 pub(super) struct AckRoute {
-    pub(super) answered: WorkerSet,
+    answered: WorkerSet,
     /// The fault of the lowest-numbered worker that failed.
-    pub(super) fault: Option<(usize, WireFault)>,
+    fault: Option<(usize, WireFault)>,
     /// The `acks` awaiter parked on this id.
     pub(super) waker: Option<Waker>,
 }
@@ -61,10 +61,16 @@ impl TrainRoute {
 }
 
 impl ReactorShared {
-    /// Hand worker `w`'s slot to the lease its request id names. A slot no lease
-    /// takes drops here undecoded, releasing its ring space.
+    /// Hand worker `w`'s slot to what its ring id names: the exchange queue, or a
+    /// lease. A slot no lease takes drops here undecoded, releasing its ring space.
     pub(super) fn route(&self, w: usize, slot: W2mSlot) {
         let id = slot.internal_req_id;
+        if id == W2M_EXCHANGE_RING_ID {
+            let frame = slot.decode();
+            drop(slot); // free the ring space before the round driver runs
+            self.exchanges.borrow_mut().push((w, frame));
+            return;
+        }
         if let Some(t) = self.trains.borrow_mut().get_mut(&id) {
             if let Some(q) = t.queue(w) {
                 q.push(slot);
@@ -145,21 +151,6 @@ impl Reactor {
             left: Cell::new(set),
             kind,
         }
-    }
-
-    /// Resolves once no train lease is live.
-    pub(crate) fn trains_idle(&self) -> impl Future<Output = ()> + '_ {
-        std::future::poll_fn(|cx| {
-            if self.inner.trains.borrow().is_empty() {
-                return Poll::Ready(());
-            }
-            let prev = self.inner.trains_idle.replace(Some(cx.waker().clone()));
-            debug_assert!(
-                prev.is_none_or(|p| p.will_wake(cx.waker())),
-                "a second task awaits `trains_idle`, whose one waker slot would lose a wake"
-            );
-            Poll::Pending
-        })
     }
 }
 
@@ -334,16 +325,7 @@ impl TrainLease {
 
 impl Drop for TrainLease {
     fn drop(&mut self) {
-        let idle = {
-            let mut trains = self.inner.trains.borrow_mut();
-            trains.remove(&self.id);
-            trains.is_empty()
-        };
-        if idle {
-            if let Some(w) = self.inner.trains_idle.take() {
-                w.wake();
-            }
-        }
+        self.inner.trains.borrow_mut().remove(&self.id);
     }
 }
 

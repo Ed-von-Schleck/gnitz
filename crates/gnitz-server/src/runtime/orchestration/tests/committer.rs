@@ -6,18 +6,9 @@
 
 use super::*;
 use crate::runtime::reactor::Reactor;
-use crate::runtime::test_support::make_reactor;
+use crate::runtime::test_support::{make_reactor, try_poll_once};
 use crate::test_support::make_schema_u64_i64;
 use gnitz_wire::{WireConflictMode, WireStatus};
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-
-/// One non-blocking poll: `Ready(v)` once resolved, `Pending` while the verdict is
-/// still owed.
-fn poll_once<T>(rx: &mut oneshot::Receiver<T>) -> Poll<T> {
-    Pin::new(rx).poll(&mut Context::from_waker(Waker::noop()))
-}
 
 fn fault(text: &str) -> WireFault {
     WireFault {
@@ -161,10 +152,10 @@ fn every_coalesced_client_of_a_push_unit_resolves_exactly_once() {
     .resolve(42);
 
     for rx in [&mut rx0, &mut rx1] {
-        assert!(matches!(poll_once(rx), Poll::Ready(Ok(42))));
+        assert!(matches!(try_poll_once(&mut *rx), Some(Ok(42))));
         // `send` consumes the sender and the poll took its value, so a second poll
         // parks — one verdict per client, never two.
-        assert!(matches!(poll_once(rx), Poll::Pending));
+        assert!(try_poll_once(&mut *rx).is_none());
     }
 }
 
@@ -180,8 +171,8 @@ fn a_push_units_group_error_reaches_every_client() {
     .resolve(42);
 
     for rx in [&mut rx0, &mut rx1] {
-        match poll_once(rx) {
-            Poll::Ready(Err(e)) => assert_eq!(e.text, "SAL full"),
+        match try_poll_once(&mut *rx) {
+            Some(Err(e)) => assert_eq!(e.text, "SAL full"),
             _ => panic!("every coalesced client is owed the group's error"),
         }
     }
@@ -197,7 +188,7 @@ fn a_transaction_resolves_ok_only_when_every_family_committed() {
         outcome: Outcome::Txn(done),
     }
     .resolve(9);
-    assert!(matches!(poll_once(&mut rx), Poll::Ready(Ok(9))));
+    assert!(matches!(try_poll_once(&mut rx), Some(Ok(9))));
 
     // One failed family fails the bundle, and the first error wins — the group
     // order, not the last one seen.
@@ -211,8 +202,8 @@ fn a_transaction_resolves_ok_only_when_every_family_committed() {
         outcome: Outcome::Txn(done),
     }
     .resolve(9);
-    match poll_once(&mut rx) {
-        Poll::Ready(Err(e)) => assert_eq!(e.text, "second family"),
+    match try_poll_once(&mut rx) {
+        Some(Err(e)) => assert_eq!(e.text, "second family"),
         _ => panic!("a transaction with a failed family resolves Err"),
     }
 }

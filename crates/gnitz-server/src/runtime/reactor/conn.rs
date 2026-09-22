@@ -87,7 +87,7 @@ impl Reactor {
             }
             listener.fd
         };
-        if flags & CQE_F_MORE != 0 {
+        if io_uring::cqueue::more(flags) {
             return;
         }
         if res != -libc::EMFILE && res != -libc::ENFILE {
@@ -97,10 +97,10 @@ impl Reactor {
         // Out of fds: back off before re-arming so closing connections get a
         // window to free fds. One task per cancelled listener — exhaustion is
         // global, so both can cancel at once and each is owed a full backoff.
+        let backoff = self.timer(Instant::now() + self.inner.limits.accept_rearm_backoff);
         let inner = Rc::clone(&self.inner);
         self.spawn(async move {
-            let deadline = Instant::now() + inner.limits.accept_rearm_backoff;
-            TimerFuture::new(deadline, Rc::clone(&inner)).await;
+            backoff.await;
             arm_accept(&mut inner.ring.borrow_mut(), fd, id);
         });
     }
@@ -181,9 +181,8 @@ impl Reactor {
                 |ring, u| ring.prep_send(conn.fd(), unsafe { ptr.add(sent) }, (len - sent) as u32, u),
                 Some(body),
             );
-            let mut op = std::pin::pin!(op);
             let deadline = Instant::now() + self.inner.limits.client_send_timeout;
-            let rc = match select2(op.as_mut(), self.timer(deadline)).await {
+            let rc = match select2(op, self.timer(deadline)).await {
                 Either::A((rc, back)) => {
                     body = back.expect("a send carries its body");
                     rc

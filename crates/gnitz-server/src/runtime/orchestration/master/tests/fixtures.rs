@@ -61,7 +61,7 @@ fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> (Mast
     let writers = rings.iter().map(|&p| W2mWriter::new(p)).collect();
     // SAFETY: every ring is initialized above and leaked.
     let wakes = rings.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
-    let reactor = crate::runtime::test_support::make_reactor_over(Rc::new(W2mReceiver::new(rings)));
+    let reactor = crate::runtime::test_support::make_reactor_over(W2mReceiver::new(rings));
     let region = SharedRegion::new(ANCHOR_BYTES + SAL_SIZE);
     // SAFETY: leaked below, so mapped for the rest of the process.
     let sal = unsafe { SalLog::new(region.ptr(), region.size()) };

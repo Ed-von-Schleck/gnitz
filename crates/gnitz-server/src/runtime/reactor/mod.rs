@@ -8,7 +8,6 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::ptr;
 use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
@@ -16,7 +15,7 @@ use std::time::Instant;
 use io_uring::types::FutexWaitV;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
+use self::uring::{Cqe, IoUringRing};
 
 use crate::runtime::w2m::{W2mReceiver, W2mSlot, BOOT_READY_REQUEST_ID, W2M_EXCHANGE_RING_ID};
 use crate::runtime::wire::DecodedWire;
@@ -37,7 +36,7 @@ pub(crate) use conn::{PeerGone, SendBody};
 
 pub(crate) use futures::{AckLease, TrainFrame, TrainLease};
 use futures::{AckRoute, TimerFuture, TrainRoute};
-use runloop::{RunQueue, REACTOR_RUN_QUEUE};
+use runloop::run_queue_is_empty;
 use wake_queue::WakeQueue;
 
 pub(crate) use io::{Budget, Charge, ClientConn, Plain, RecvBuf, RecvEnd, RecvFilter, RecvQueue};
@@ -134,21 +133,10 @@ struct ReactorShared {
     /// it back at the same key rather than holding a borrow across the poll.
     tasks: RefCell<FxHashMap<usize, Task>>,
     next_task_key: Cell<usize>,
-    /// Tasks whose wakers fired; the reactor's main loop polls them on
-    /// the next tick. The waker vtable reaches this through a
-    /// thread-local raw pointer (`REACTOR_RUN_QUEUE`) — see `waker_wake`.
-    run_queue: RefCell<RunQueue>,
-    /// Scratch buffer `tick` swaps the run queue into, so wakes issued during a
-    /// poll schedule for the next tick instead of re-entering this one. Kept
-    /// here (rather than rebuilt per tick) to reuse the one allocation.
-    tick_scratch: Cell<Vec<usize>>,
     /// Every live [`AckLease`] id and what its workers have answered.
     acks: RefCell<FxHashMap<u32, AckRoute>>,
     /// Every live [`TrainLease`] id and its workers' frame queues.
     trains: RefCell<FxHashMap<u32, TrainRoute>>,
-    /// The one [`Reactor::trains_idle`] awaiter, woken when the last train lease
-    /// drops.
-    trains_idle: Cell<Option<Waker>>,
     /// The next request id a lease starts from.
     next_request_id: Cell<u32>,
     /// In-flight one-shot ops, by op id.
@@ -181,7 +169,7 @@ struct ReactorShared {
     exchanges: RefCell<WakeQueue<(usize, DecodedWire)>>,
     /// Last: every `W2mSlot` the reactor holds, in a field or in a task, releases
     /// through it on drop.
-    w2m: Rc<W2mReceiver>,
+    w2m: W2mReceiver,
 }
 
 /// A one-shot op's CQE `res` and what it carried.
@@ -204,26 +192,22 @@ impl ReactorShared {
     }
 }
 
-/// Shared, clonable handle to the reactor. All futures created by the
-/// reactor capture an `Rc<ReactorShared>` so they can submit ops and
-/// register wakers without borrowing the `Reactor` mutably.
+/// The reactor. The futures it creates capture an `Rc<ReactorShared>`, since
+/// they must be `'static`.
 pub struct Reactor {
     inner: Rc<ReactorShared>,
 }
 
 impl Reactor {
-    pub fn new(ring_capacity: u32, limits: Limits, w2m: Rc<W2mReceiver>) -> std::io::Result<Self> {
+    pub fn new(ring_capacity: u32, limits: Limits, w2m: W2mReceiver) -> std::io::Result<Self> {
         let ring = IoUringRing::new(ring_capacity)?;
         let futex_waitv = (0..w2m.num_workers()).map(|_| FutexWaitV::new()).collect();
         let inner = Rc::new(ReactorShared {
             ring: RefCell::new(ring),
             tasks: RefCell::new(FxHashMap::default()),
             next_task_key: Cell::new(0),
-            run_queue: RefCell::new(RunQueue::new()),
-            tick_scratch: Cell::new(Vec::with_capacity(16)),
             acks: RefCell::new(FxHashMap::default()),
             trains: RefCell::new(FxHashMap::default()),
-            trains_idle: Cell::new(None),
             next_request_id: Cell::new(BOOT_READY_REQUEST_ID),
             ops: RefCell::new(FxHashMap::default()),
             futex_waitv: RefCell::new(futex_waitv),
@@ -238,16 +222,7 @@ impl Reactor {
             exchanges: RefCell::new(WakeQueue::default()),
             w2m,
         });
-        // Publish the run-queue pointer for the waker vtable. `ReactorShared`
-        // lives behind `Rc`, so the address is stable for the reactor's life;
-        // `Drop for Reactor` clears it.
-        REACTOR_RUN_QUEUE.with(|p| {
-            assert!(
-                p.get().is_null(),
-                "a second reactor on this thread would orphan the first's wakes"
-            );
-            p.set(&inner.run_queue as *const RefCell<RunQueue>);
-        });
+        runloop::claim_thread();
         Ok(Reactor { inner })
     }
 
@@ -263,41 +238,43 @@ impl Reactor {
     }
 
     /// The next exchange frame a worker published, as `(worker, frame)`. Rounds
-    /// are orchestration policy, assembled by the consumer.
+    /// are orchestration policy, assembled by the consumer. One awaiter at a time.
     pub async fn next_exchange(&self) -> (usize, DecodedWire) {
-        std::future::poll_fn(|cx| self.inner.exchanges.borrow_mut().poll(cx)).await
+        struct Unpark<'a>(&'a RefCell<WakeQueue<(usize, DecodedWire)>>);
+        impl Drop for Unpark<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().unpark();
+            }
+        }
+        let _unpark = Unpark(&self.inner.exchanges);
+        std::future::poll_fn(|cx| {
+            let mut q = self.inner.exchanges.borrow_mut();
+            debug_assert!(!q.parked_elsewhere(cx.waker()), "two tasks await the exchange queue");
+            q.poll(cx)
+        })
+        .await
     }
 
-    /// Route every unread slot of every worker's ring on its ring id, before
-    /// anything decodes it. True when any slot was taken.
-    fn drain_all_w2m(&self) -> bool {
-        let mut routed = false;
+    /// Route every unread slot of every worker's ring.
+    fn drain_all_w2m(&self) {
         for w in 0..self.inner.w2m.num_workers() {
             while let Some(slot) = self.inner.w2m.try_read_slot(w) {
-                routed = true;
-                let id = slot.internal_req_id;
-                if id == W2M_EXCHANGE_RING_ID {
-                    let frame = slot.decode();
-                    drop(slot); // free the ring space before the round driver runs
-                    self.inner.exchanges.borrow_mut().push((w, frame));
-                    continue;
-                }
                 self.inner.route(w, slot);
             }
         }
-        routed
     }
 
-    /// Arm the W2M park for a sleep. False, arming nothing, when `found` reports
-    /// work turned up by the drain run first.
-    fn arm_futex_waitv(&self, found: &impl Fn(bool) -> bool) -> bool {
+    /// Arm the W2M park for a sleep. False, arming nothing, when the drain run
+    /// first woke a task.
+    fn arm_futex_waitv(&self) -> bool {
         let w2m = &self.inner.w2m;
         if w2m.num_workers() == 0 {
             return true; // nothing to watch, and a zero-length FUTEX_WAITV is -EINVAL
         }
         let mut waitv = self.inner.futex_waitv.borrow_mut();
         loop {
-            if found(self.drain_all_w2m()) {
+            self.drain_all_w2m();
+            if !run_queue_is_empty() {
                 return false;
             }
             if let Some(armed) = w2m.arm_waitv(&mut waitv) {

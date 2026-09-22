@@ -4,36 +4,14 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
 pub(super) use super::runloop::make_waker;
+use super::runloop::RUN_QUEUE;
 use super::*;
-pub(super) use crate::runtime::test_support::{make_reactor, make_reactor_over, make_reactor_with};
+pub(super) use crate::runtime::test_support::{make_reactor, make_reactor_over, make_reactor_with, within};
 use crate::runtime::w2m::W2mWriter;
 
 /// The drivers every reactor suite runs on. An inherent impl here rather than in
 /// `runloop`/`mod`, so the production files carry no test-only method.
 impl Reactor {
-    /// Drive `fut` to completion. Single-threaded, blocking. Spawns the
-    /// future as a task internally and returns its output via a shared cell.
-    pub(super) fn block_on<F, T>(&self, fut: F) -> T
-    where
-        F: Future<Output = T> + 'static,
-        T: 'static,
-    {
-        let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
-        let out_capture = Rc::clone(&out);
-        self.spawn(async move {
-            let v = fut.await;
-            *out_capture.borrow_mut() = Some(v);
-        });
-
-        // Drive the reactor until the root task has produced its output.
-        loop {
-            self.tick(true);
-            if let Some(v) = out.borrow_mut().take() {
-                return v;
-            }
-        }
-    }
-
     /// Bounded: the tests that use this are the ones guarding against lost
     /// wakes and lock deadlocks, and an unbounded loop would turn each of those
     /// regressions into a wedged test run rather than a failure. Ticks
@@ -69,29 +47,18 @@ pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
         .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) }.leak())
         .collect();
     let writers = ptrs.iter().map(|&p| W2mWriter::new(p)).collect();
-    let r = make_reactor_over(Rc::new(W2mReceiver::new(ptrs)));
+    let r = make_reactor_over(W2mReceiver::new(ptrs));
     (r, writers)
 }
 
-/// Run `f` on its own thread and fail if it has not returned within `limit`, so
-/// a tick that sleeps when it must not fails the test instead of wedging the
-/// run. A timed-out thread is left blocked; the harness exits past it.
-pub(super) fn within(limit: std::time::Duration, f: impl FnOnce() + Send + 'static) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        f();
-        let _ = tx.send(());
-    });
-    match rx.recv_timeout(limit) {
-        Ok(()) => handle.join().expect("test thread panicked"),
-        // The sender dropped without sending: `f` panicked.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            if let Err(panic) = handle.join() {
-                std::panic::resume_unwind(panic);
-            }
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("did not finish within {limit:?}"),
-    }
+/// Task `key` is in this thread's run queue.
+pub(super) fn is_queued(key: usize) -> bool {
+    RUN_QUEUE.with(|q| q.borrow().is_queued(key))
+}
+
+/// How many tasks this thread's run queue holds.
+pub(super) fn run_queue_len() -> usize {
+    RUN_QUEUE.with(|q| q.borrow().len())
 }
 
 /// An op installed with no SQE behind it, so its CQE is whatever a test feeds

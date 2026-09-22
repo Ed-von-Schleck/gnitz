@@ -45,8 +45,8 @@ struct ExchangeRound {
 }
 
 /// One completed exchange ready for relay. The relay driver owns this: the
-/// steady relay prepares under the catalog read lock and emits under a separate
-/// SAL hold; `collect_exclusive` does both inside its exclusive hold.
+/// steady relay prepares with no SAL hold and emits under one; `collect_round`
+/// does both under one hold.
 pub struct PendingRelay {
     pub view_id: i64,
     pub payloads: Vec<Vec<Batch>>,

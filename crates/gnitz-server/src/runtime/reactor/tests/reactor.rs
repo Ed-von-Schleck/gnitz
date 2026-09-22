@@ -74,10 +74,7 @@ fn acks_resolve_on_the_last_ack_and_name_the_faulting_ring() {
 
     writers[0].send_status(0, lease.id(0), WireStatus::Ok, &[]);
     r.drain_all_w2m();
-    assert!(
-        r.inner.run_queue.borrow().is_queued(0),
-        "the last ACK wakes the awaiter"
-    );
+    assert!(is_queued(0), "the last ACK wakes the awaiter");
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(Err(e)) => {
             assert!(e.text.contains("worker 1"), "the fault names its ring: {e}");
@@ -141,56 +138,17 @@ fn acks_parks_only_on_the_first_unanswered_id() {
 
     writers[0].send_status(0, lease.id(1), WireStatus::Ok, &[]);
     r.drain_all_w2m();
-    assert!(
-        !r.inner.run_queue.borrow().is_queued(7),
-        "an ACK behind the first gap wakes nothing"
-    );
+    assert!(!is_queued(7), "an ACK behind the first gap wakes nothing");
 
     writers[0].send_status(0, lease.id(0), WireStatus::Ok, &[]);
     r.drain_all_w2m();
-    assert!(
-        r.inner.run_queue.borrow().is_queued(7),
-        "filling the gap wakes the awaiter"
-    );
+    assert!(is_queued(7), "filling the gap wakes the awaiter");
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(parked(2), "the park moves past every answered id");
 
     writers[0].send_status(0, lease.id(2), WireStatus::Ok, &[]);
     r.drain_all_w2m();
     assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
-}
-
-/// `trains_idle` stays pending while any train lease lives — an ACK lease is not
-/// one — and only the last train lease's drop wakes it.
-#[test]
-fn trains_idle_waits_for_the_last_train_lease() {
-    let (r, _writers) = reactor_with_rings(1);
-    let (first, second, acks) = (
-        r.lease_train(WorkerSet::ALL, SalMessageKind::Scan),
-        r.lease_train(WorkerSet::ALL, SalMessageKind::Scan),
-        r.lease_acks(1, "test"),
-    );
-    let mut idle = std::pin::pin!(r.trains_idle());
-    let waker = make_waker(9);
-    let mut cx = Context::from_waker(&waker);
-    assert!(idle.as_mut().poll(&mut cx).is_pending());
-
-    drop(acks);
-    assert!(
-        !r.inner.run_queue.borrow().is_queued(9),
-        "an ACK lease drop wakes nothing"
-    );
-
-    drop(first);
-    assert!(!r.inner.run_queue.borrow().is_queued(9), "one train is still live");
-    assert!(idle.as_mut().poll(&mut cx).is_pending());
-
-    drop(second);
-    assert!(
-        r.inner.run_queue.borrow().is_queued(9),
-        "the last train's drop wakes the waiter"
-    );
-    assert!(idle.as_mut().poll(&mut cx).is_ready(), "no train lease is live");
 }
 
 /// Lease ids wrap to 1 before they could reach the exchange id, and a lease
@@ -237,7 +195,7 @@ fn a_tick_whose_arm_drain_wakes_a_task_does_not_arm() {
         });
         r.tick(true);
         assert!(!r.inner.futex_waitv_armed.get(), "the woken tick must not arm");
-        assert!(!r.inner.run_queue.borrow().is_empty(), "the drain woke the task");
+        assert!(run_queue_len() > 0, "the drain woke the task");
         r.tick(false);
         assert!(done.get());
     });
@@ -312,7 +270,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
 
     let pid = unsafe { fork_child(child) };
 
-    let reactor = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
+    let reactor = make_reactor_over(W2mReceiver::new(vec![ptr]));
     // A fresh reactor's first lease is 1..=N, which is what the child publishes.
     let lease = Rc::new(reactor.lease_acks(N_MESSAGES as usize, "stress"));
     let outcome: Rc<RefCell<Option<Result<(), WireFault>>>> = Rc::new(RefCell::new(None));

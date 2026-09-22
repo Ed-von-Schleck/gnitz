@@ -70,7 +70,9 @@ fn sal_checkpoint_reset() {
     let log = TestLog::new(1 << 20, 1, 1);
     log.write(0, 0, SalMessageKind::Scan, &[&[0x11u8; 32]]);
 
-    log.writer.lock_exclusive().checkpoint_reset();
+    try_poll_once(log.writer.lock())
+        .expect("uncontended")
+        .checkpoint_reset();
     assert_eq!(log.log().anchor(), Ok((2, 0)));
     assert_eq!(log.cursor(), 0);
     assert!(matches!(log.log().read_at(0, EpochGate::Walk(2)), SalStep::Absent));
@@ -353,11 +355,11 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
         ..DirectGroup::new(SalMessageKind::Scan)
     };
 
-    drop(log.writer.lock_exclusive());
+    drop(try_poll_once(log.writer.lock()).expect("uncontended"));
     assert_eq!(seqs(), [0, 0, 0, 0], "nothing written, nothing woken");
 
     {
-        let excl = log.writer.lock_exclusive();
+        let excl = try_poll_once(log.writer.lock()).expect("uncontended");
         excl.write(&leased(WorkerSet::one(2))).expect("group fits");
         excl.write(&leased(WorkerSet::one(2).with(0))).expect("group fits");
         assert_eq!(seqs(), [0, 0, 0, 0], "no wake before the drop");
@@ -365,7 +367,7 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
     assert_eq!(seqs(), [1, 0, 1, 0], "a worker reached twice is woken once");
 
     {
-        let excl = log.writer.lock_exclusive();
+        let excl = try_poll_once(log.writer.lock()).expect("uncontended");
         excl.write(&DirectGroup::new(SalMessageKind::Shutdown))
             .expect("group fits");
     }
@@ -374,14 +376,6 @@ fn dropping_a_sal_excl_wakes_exactly_the_workers_it_reached() {
         [2, 1, 2, 1],
         "an unaddressed group reaches every launched worker"
     );
-}
-
-#[test]
-#[should_panic(expected = "task holding the writer")]
-fn lock_exclusive_panics_while_a_task_holds_the_writer() {
-    let log = TestLog::new(1 << 20, 1, 1);
-    let _held = try_poll_once(log.writer.lock()).expect("an uncontended writer is taken at once");
-    let _ = log.writer.lock_exclusive();
 }
 
 #[test]
@@ -513,7 +507,7 @@ fn every_bit_of_a_zoned_slot_is_covered_by_its_own_checksum() {
     let sal = TestLog::new(1 << 20, 2, 1);
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    let mut excl = sal.writer.lock_exclusive();
+    let mut excl = try_poll_once(sal.writer.lock()).expect("uncontended");
     let scope = excl.begin(5, "test");
     sal.push_group(16, schema, &batch, |g| scope.write(g, true));
     assert!(scope.commit(), "the zone was open");
@@ -548,7 +542,9 @@ fn an_unzoned_groups_entries_hold_checksum_0() {
     let sal = TestLog::new(1 << 20, 2, 1);
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    sal.push_group(16, schema, &batch, |g| sal.writer.lock_exclusive().write(g));
+    sal.push_group(16, schema, &batch, |g| {
+        try_poll_once(sal.writer.lock()).expect("uncontended").write(g)
+    });
 
     let msg = group_at(sal.log(), 0);
     for w in 0..msg.slots() as usize {

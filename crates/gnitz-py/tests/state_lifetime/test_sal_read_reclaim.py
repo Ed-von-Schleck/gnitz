@@ -138,13 +138,11 @@ def test_concurrent_read_only_clients_survive_reclaim(tiny_sal_server):
 
 def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
     """Two CREATE VIEWs while the read loops hold the SAL past the watchdog's
-    line. The watchdog's barrier must not start a checkpoint sequence inside a
-    DDL's quiesce window — the drain would land in a tick loop the DDL parked,
+    line. The watchdog's barrier must not start a checkpoint sequence while a
+    DDL holds the tick gate — the drain would wait on a tick the DDL keeps out,
     against a barrier that resolves only at sequence end.
 
-    Two of them, not one: a boolean latch rather than a depth passes the
-    single-DDL shape and hangs here, the first DDL clearing the window the second
-    is still inside.
+    Two of them, not one: the second DDL queues on the gate the first holds.
     """
     target, proc = tiny_sal_server
     with gnitz.connect(target) as client:
@@ -180,7 +178,7 @@ def test_a_ddl_concurrent_with_reclaim_does_not_deadlock(tiny_sal_server):
             for t in ddls:
                 t.start()
             join_or_fail(
-                "CREATE VIEW hung — a checkpoint ran inside the DDL's quiesce window",
+                "CREATE VIEW hung — a checkpoint ran while a DDL held the tick gate",
                 *ddls)
             assert not ddl_errors, f"CREATE VIEW failed: {ddl_errors}"
         finally:

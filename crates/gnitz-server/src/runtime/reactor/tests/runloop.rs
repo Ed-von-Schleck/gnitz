@@ -38,17 +38,16 @@ fn panic_in_spawned_task_propagates_not_swallowed() {
 /// and drop a no-op, but the behaviour must still be observable.
 #[test]
 fn waker_clone_outlives_original() {
-    let r = make_reactor();
+    let _r = make_reactor();
     let original = make_waker(123);
     let cloned = original.clone();
     drop(original);
     cloned.wake();
-    assert!(r.inner.run_queue.borrow().is_queued(123));
+    assert!(is_queued(123));
 }
 
-/// `RunQueue::push` dedups by task key, so the N wakes one drain can deliver to
-/// a single task — `drain_all_w2m` completes one reply per worker, all waking
-/// the same tick task — cost one poll, not N.
+/// `RunQueue::push` dedups by task key, so N wakes before a task's next poll cost
+/// one poll, not N.
 #[test]
 fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
     /// Counts its polls and never completes, so every wake is one more poll. Keeps
@@ -75,7 +74,7 @@ fn repeated_wakes_for_one_key_collapse_to_a_single_poll() {
         waker.wake_by_ref();
     }
     assert_eq!(
-        r.inner.run_queue.borrow().len(),
+        run_queue_len(),
         1,
         "16 wakes for one key must leave one run-queue entry"
     );

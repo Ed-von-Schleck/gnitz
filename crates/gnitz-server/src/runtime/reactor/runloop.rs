@@ -1,6 +1,8 @@
 //! The reactor's loop: `spawn` task scheduling, the `tick` drain-then-poll body,
-//! the exclusive driver beside it, the CQE dispatch table both run, and the run
-//! queue and waker vtable the wakes land in.
+//! the `block_on` driver over it, the CQE dispatch table, and the run queue and
+//! waker vtable the wakes land in.
+
+use std::collections::VecDeque;
 
 use super::*;
 
@@ -11,76 +13,62 @@ impl Reactor {
         self.inner.next_task_key.set(key + 1);
         self.inner.tasks.borrow_mut().insert(key, Box::pin(fut));
         // Schedule immediate first poll.
-        self.inner.run_queue.borrow_mut().push(key);
+        RUN_QUEUE.with(|q| q.borrow_mut().push(key));
+    }
+
+    /// Drive `fut` to completion as a task among the others, ticking until its
+    /// output lands. A top-level driver, outside any task.
+    pub(crate) fn block_on<F, T>(&self, fut: F) -> T
+    where
+        F: Future<Output = T> + 'static,
+        T: 'static,
+    {
+        let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
+        let out_capture = Rc::clone(&out);
+        self.spawn(async move {
+            let v = fut.await;
+            *out_capture.borrow_mut() = Some(v);
+        });
+        loop {
+            self.tick(true);
+            if let Some(v) = out.borrow_mut().take() {
+                return v;
+            }
+        }
     }
 
     /// Single iteration of the event loop:
-    ///   1. drain CQEs and every W2M ring, then fire every passed deadline
-    ///   2. poll all tasks in the run queue (each polled at most once)
+    ///   1. drain CQEs and every W2M ring, then fire every passed deadline — ahead
+    ///      of the poll, so what landed since the last tick is served in this one;
+    ///   2. poll each task queued on entry, once; a task woken during this step
+    ///      (or spawned by it) runs next tick;
     ///   3. submit pending SQEs; if `block` and the run queue is now empty, arm
-    ///      the W2M park and sleep until the next CQE or the earliest deadline.
+    ///      the W2M park and sleep until the next CQE, W2M publish or earliest
+    ///      deadline. The park is armed only on a tick that sleeps: a set park
+    ///      flag costs each worker publish a cross-process `FUTEX_WAKE`.
     pub(super) fn tick(&self, block: bool) {
-        // 1. CQEs, every W2M ring, then passed deadlines — ahead of the poll, so what
-        // landed since the last tick is served in this one.
         self.drain_cqes_into_wakers();
         self.drain_all_w2m();
         self.fire_deadlines();
 
-        // 2. Drain the run queue. Swap into the scratch buffer so wakes during
-        // poll schedule for the *next* tick rather than re-entering this one.
-        // `Cell::take` releases any borrow before poll_task runs so waker_wake
-        // can push freely.
-        let mut buf = self.inner.tick_scratch.take();
-        self.inner.run_queue.borrow_mut().swap_into(&mut buf);
-        for key in buf.drain(..) {
+        for _ in 0..RUN_QUEUE.with(|q| q.borrow().len()) {
+            let key = RUN_QUEUE.with(|q| q.borrow_mut().pop());
             self.poll_task(key);
         }
-        self.inner.tick_scratch.set(buf);
 
-        // 3. Sleep only when nothing is runnable. The W2M park is armed only on a
-        //    tick that sleeps: a set park flag costs each worker publish a
-        //    cross-process `FUTEX_WAKE`.
-        let may_sleep = block
-            && !self.inner.shutdown.get()
-            && !self.inner.tasks.borrow().is_empty()
-            && self.inner.run_queue.borrow().is_empty();
-        self.submit_or_sleep(may_sleep, |_| !self.inner.run_queue.borrow().is_empty());
-    }
-
-    /// Drive `fut` to completion without polling any task: CQEs are dispatched, W2M
-    /// frames routed and deadlines fired as in `tick`, so their wakes land for the
-    /// tasks to run afterwards. `fut` may await only ACK leases, the exchange queue
-    /// and timers.
-    ///
-    /// Callable from inside a task's poll: the reactor holds no borrow of its own
-    /// state across a task poll, and a CQE handler only wakes or spawns.
-    pub(crate) fn block_on_exclusive<T>(&self, fut: impl Future<Output = T>) -> T {
-        debug_assert!(
-            self.inner.trains.borrow().is_empty(),
-            "a live train lease: a frame no task consumes pins its ring, and a worker \
-             parked for ring space never answers"
-        );
-        let mut fut = std::pin::pin!(fut);
-        let mut cx = Context::from_waker(Waker::noop());
-        loop {
-            self.drain_cqes_into_wakers();
-            self.drain_all_w2m();
-            self.fire_deadlines();
-            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-                return v;
-            }
-            self.submit_or_sleep(true, |routed| routed);
-        }
+        let may_sleep =
+            block && !self.inner.shutdown.get() && !self.inner.tasks.borrow().is_empty() && run_queue_is_empty();
+        self.submit_or_sleep(may_sleep);
     }
 
     /// Submit queued SQEs. When `may_sleep`, wait for the next CQE, W2M publish or
-    /// earliest deadline instead — unless a deadline has passed or `found(routed)`
-    /// reports work turned up by the drain run before arming the W2M park.
-    fn submit_or_sleep(&self, may_sleep: bool, found: impl Fn(bool) -> bool) {
+    /// earliest deadline instead — unless a deadline has passed or the drain run
+    /// before arming the W2M park woke a task.
+    fn submit_or_sleep(&self, may_sleep: bool) {
         let until = self.inner.deadlines.borrow().first_key_value().map(|(&(at, _), _)| at);
         let sleep = may_sleep
             && until.is_none_or(|at| at > Instant::now())
-            && (self.inner.futex_waitv_armed.get() || self.arm_futex_waitv(&found));
+            && (self.inner.futex_waitv_armed.get() || self.arm_futex_waitv());
         let rc = if sleep {
             // Measured after the arm, whose drain takes time of its own.
             let timeout = until.map(|at| at.saturating_duration_since(Instant::now()));
@@ -181,39 +169,37 @@ impl Reactor {
 // Run queue + waker vtable
 // ---------------------------------------------------------------------------
 
-/// The keys of tasks whose wakers have fired since the last tick, in wake
-/// order. `queued` makes the dedup O(1): one drain completes an ACK per worker,
-/// all waking the same tick task, and that must cost one poll.
+/// The keys of tasks whose wakers have fired, in wake order. A task woken several
+/// times before its poll is queued once; `queued` makes that test O(1).
 pub(super) struct RunQueue {
-    queue: Vec<usize>,
+    queue: VecDeque<usize>,
     queued: FxHashSet<usize>,
 }
 
 impl RunQueue {
-    pub(super) fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            queue: Vec::with_capacity(16),
-            queued: FxHashSet::default(),
+            queue: VecDeque::new(),
+            queued: FxHashSet::with_hasher(rustc_hash::FxBuildHasher),
         }
     }
 
     /// Enqueue `key` unless it is already pending.
-    pub(super) fn push(&mut self, key: usize) {
+    fn push(&mut self, key: usize) {
         if self.queued.insert(key) {
-            self.queue.push(key);
+            self.queue.push_back(key);
         }
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+    /// The oldest queued key. A wake of it from here on queues it again.
+    fn pop(&mut self) -> usize {
+        let key = self.queue.pop_front().expect("pop on an empty run queue");
+        self.queued.remove(&key);
+        key
     }
 
-    /// O(1) swap of the backing allocation into `out`. Clearing `queued` in the
-    /// same borrow is what keeps the semantics exact: a task woken during its
-    /// own poll inserts into the emptied set and lands in the fresh queue.
-    fn swap_into(&mut self, out: &mut Vec<usize>) {
-        std::mem::swap(out, &mut self.queue);
-        self.queued.clear();
+    pub(super) fn len(&self) -> usize {
+        self.queue.len()
     }
 
     #[cfg(test)]
@@ -221,27 +207,37 @@ impl RunQueue {
         self.queued.contains(&key)
     }
 
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.queue.len()
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.queued.clear();
     }
 }
 
 thread_local! {
-    /// The run queue of the reactor on this thread, for the waker vtable to
-    /// reach without per-wake `Arc` traffic. Set in `Reactor::new` (which
-    /// refuses to overwrite a live one), cleared in `Reactor::drop`.
-    pub(super) static REACTOR_RUN_QUEUE: Cell<*const RefCell<RunQueue>> =
-        const { Cell::new(ptr::null()) };
+    /// The run queue of the reactor on this thread, for the waker vtable to reach
+    /// without per-wake `Rc` traffic. A wake with no reactor live lands here
+    /// harmlessly; `claim_thread` clears what a dropped reactor left.
+    pub(super) static RUN_QUEUE: RefCell<RunQueue> = const { RefCell::new(RunQueue::new()) };
+    /// A reactor is live on this thread.
+    static REACTOR_LIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn run_queue_is_empty() -> bool {
+    RUN_QUEUE.with(|q| q.borrow().len() == 0)
+}
+
+/// Claim this thread for a new reactor, starting it on an empty run queue.
+pub(super) fn claim_thread() {
+    assert!(
+        !REACTOR_LIVE.replace(true),
+        "a second reactor on this thread would orphan the first's wakes"
+    );
+    RUN_QUEUE.with(|q| q.borrow_mut().clear());
 }
 
 impl Drop for Reactor {
     fn drop(&mut self) {
-        // Clear before `ReactorShared` (and any pending tasks/futures) is
-        // freed: drop chains in `sync.rs` may call `Waker::wake`, and
-        // those calls must observe a null pointer rather than a dangling
-        // one. Wakes after this point are silent no-ops.
-        REACTOR_RUN_QUEUE.with(|p| p.set(ptr::null()));
+        REACTOR_LIVE.set(false);
     }
 }
 
@@ -250,38 +246,18 @@ unsafe fn waker_clone(data: *const ()) -> RawWaker {
 }
 
 unsafe fn waker_wake(data: *const ()) {
-    let key = data as usize;
-    REACTOR_RUN_QUEUE.with(|p| {
-        let ptr = p.get();
-        if ptr.is_null() {
-            // Reactor torn down; the wake has nowhere to land. This is
-            // reached when `sync.rs` Drop chains (WriteGuard / ReadGuard)
-            // fire `waker.wake()` while the reactor is being dropped. Silent
-            // no-op.
-            return;
-        }
-        // SAFETY: invariant: the reactor that published this pointer is
-        // still alive (cleared in `Drop for Reactor`). RefCell enforces
-        // borrow rules, so a double-borrow panics rather than UB.
-        unsafe {
-            (*ptr).borrow_mut().push(key);
-        }
-    });
-}
-
-unsafe fn waker_wake_by_ref(data: *const ()) {
-    unsafe {
-        waker_wake(data);
-    }
+    // `try_with`: a wake from a TLS destructor that runs after the queue's own is
+    // a no-op.
+    let _ = RUN_QUEUE.try_with(|q| q.borrow_mut().push(data as usize));
 }
 
 unsafe fn waker_drop(_data: *const ()) {}
 
-const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
+const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake, waker_wake, waker_drop);
 
 /// The waker for task `key`: the key itself *is* the waker's data pointer, so
-/// clone is a bitwise copy and drop is a no-op. Waking reads the thread-local
-/// run-queue pointer and pushes the key.
+/// clone is a bitwise copy and drop is a no-op. Waking pushes the key onto the
+/// thread-local run queue.
 pub(super) fn make_waker(key: usize) -> Waker {
     let raw = RawWaker::new(key as *const (), &WAKER_VTABLE);
     unsafe { Waker::from_raw(raw) }

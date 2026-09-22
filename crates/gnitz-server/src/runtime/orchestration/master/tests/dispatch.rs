@@ -1,8 +1,13 @@
+use std::rc::Rc;
+use std::time::Duration;
+
 use super::super::fixtures::{test_dispatcher, test_dispatcher_with_writers};
 use crate::catalog::{CatalogEngine, SysFamily};
+use crate::runtime::reactor::oneshot;
 use crate::runtime::sal::{GroupTargets, WorkerSet};
-use crate::runtime::test_support::fork_child;
+use crate::runtime::test_support::{fork_child, try_poll_once, within};
 use gnitz_foundation::posix_io::retry_eintr;
+use gnitz_wire::WireStatus;
 
 /// Fork a child that exits immediately and block until it is a zombie *without*
 /// reaping it, so the probe's own `waitpid(WNOHANG)` is guaranteed to find it on
@@ -57,14 +62,16 @@ fn check_workers_keeps_reporting_a_dead_worker() {
     }
 }
 
-/// An exclusive round no worker answers must surface a dead worker as a clean
-/// error naming the worker and the caller's own phase — not wait on the ACK.
+/// A round no worker answers must surface a dead worker as a clean error naming
+/// the worker and the caller's own phase — not wait on the ACK.
 #[test]
 fn ack_collection_errors_when_a_worker_is_dead() {
     for ctx in ["checkpoint base round", "backfill relay"] {
-        let disp = test_dispatcher(vec![spawn_and_reap_dead()], std::ptr::null_mut());
+        let disp = Rc::new(test_dispatcher(vec![spawn_and_reap_dead()], std::ptr::null_mut()));
+        let d = Rc::clone(&disp);
         let err = disp
-            .exclusive_round(ctx, false, |_, _| Ok(()))
+            .reactor()
+            .block_on(async move { d.broadcast_round(ctx, false, |_, _| Ok(())).await })
             .expect_err("a dead worker must fail ack collection");
         assert!(err.text.contains("worker 0") && err.text.contains(ctx), "{err}");
     }
@@ -73,15 +80,21 @@ fn ack_collection_errors_when_a_worker_is_dead() {
 /// A worker that fails before it joins a round leaves the others in their
 /// exchange wait, never ACKing: the error ends the round without their ACKs.
 #[test]
-fn an_exclusive_round_fails_on_a_worker_error_without_the_other_acks() {
+fn a_round_fails_on_a_worker_error_without_the_other_acks() {
     let (disp, writers) = test_dispatcher_with_writers(vec![0, 0]);
+    let disp = Rc::new(disp);
+    let d = Rc::clone(&disp);
     let err = disp
-        .exclusive_round("backfill relay", false, |_, targets| {
-            let GroupTargets::Leased { request_id, .. } = targets else {
-                unreachable!("an exclusive round broadcasts")
-            };
-            writers[0].send_status(0, request_id, gnitz_wire::WireStatus::Error, b"boom");
-            Ok(())
+        .reactor()
+        .block_on(async move {
+            d.broadcast_round("backfill relay", false, |_, targets| {
+                let GroupTargets::Leased { request_id, .. } = targets else {
+                    unreachable!("a round broadcasts")
+                };
+                writers[0].send_status(0, request_id, WireStatus::Error, b"boom");
+                Ok(())
+            })
+            .await
         })
         .expect_err("a worker's error ACK must fail the round");
     assert!(err.text.contains("worker 0") && err.text.contains("boom"), "{err}");
@@ -91,17 +104,53 @@ fn an_exclusive_round_fails_on_a_worker_error_without_the_other_acks() {
 /// status: a full SAL reaches the caller as the retryable `SalFull`, not as a
 /// flattened error.
 #[test]
-fn an_exclusive_round_keeps_its_write_refusals_status() {
+fn a_round_keeps_its_write_refusals_status() {
     let (disp, _writers) = test_dispatcher_with_writers(vec![0]);
+    let disp = Rc::new(disp);
+    let d = Rc::clone(&disp);
     let err = disp
-        .exclusive_round("view tick drain", false, |_, _| {
-            Err(gnitz_wire::WireFault {
-                status: gnitz_wire::WireStatus::SalFull,
-                text: "SAL full".into(),
+        .reactor()
+        .block_on(async move {
+            d.broadcast_round("view tick drain", false, |_, _| {
+                Err(gnitz_wire::WireFault {
+                    status: WireStatus::SalFull,
+                    text: "SAL full".into(),
+                })
             })
+            .await
         })
         .expect_err("a refused write must fail the round");
-    assert_eq!(err.status, gnitz_wire::WireStatus::SalFull, "{err}");
+    assert_eq!(err.status, WireStatus::SalFull, "{err}");
+}
+
+/// Other tasks run while a round is pending: the round's one ACK comes from a
+/// separately spawned task, which learns the request id only once the round has
+/// written its group.
+#[test]
+fn a_round_lets_other_tasks_run() {
+    within(Duration::from_secs(30), || {
+        let (disp, mut writers) = test_dispatcher_with_writers(vec![0]);
+        let disp = Rc::new(disp);
+        let writer = writers.pop().expect("one ring");
+        let (id_tx, id_rx) = oneshot::channel::<u32>();
+        disp.reactor().spawn(async move {
+            let id = id_rx.await;
+            writer.send_status(0, id, WireStatus::Ok, &[]);
+        });
+        let d = Rc::clone(&disp);
+        disp.reactor()
+            .block_on(async move {
+                d.broadcast_round("view tick drain", false, |_, targets| {
+                    let GroupTargets::Leased { request_id, .. } = targets else {
+                        unreachable!("a round broadcasts")
+                    };
+                    id_tx.send(request_id);
+                    Ok(())
+                })
+                .await
+            })
+            .expect("the other task's ACK completes the round");
+    });
 }
 
 /// The checkpoint finalizer flushes system tables before resetting the SAL. A
@@ -126,9 +175,12 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         // advance lands ONLY in the sys_sequences MemTable.
         let (_base, delta) = engine.reserve_user_sequence(user_seq, 64).unwrap();
         engine.submit(SysFamily::Sequence, delta).unwrap();
+        // As the serial path's emit does: the broadcast leaves, the rows stay.
+        engine.drain_pending_broadcasts();
 
         let disp = test_dispatcher(Vec::new(), &mut engine);
-        disp.checkpoint_post_ack(&mut disp.sal().lock_exclusive()).unwrap();
+        disp.checkpoint_post_ack(&mut try_poll_once(disp.sal().lock()).expect("uncontended"))
+            .unwrap();
         drop(disp);
 
         // Crash semantics: no `engine.close()`, and no Drop impl — only what the
@@ -154,14 +206,15 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     let tmp = tempfile::tempdir().unwrap();
     let mut engine = CatalogEngine::open(tmp.path().to_str().unwrap(), 1).unwrap();
 
-    let disp = test_dispatcher(Vec::new(), &mut engine);
+    let disp = Rc::new(test_dispatcher(Vec::new(), &mut engine));
     // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
     // before any group is written — what `server_main` does after worker ACKs.
-    disp.sal().lock_exclusive().boot_rewind(1);
+    try_poll_once(disp.sal().lock()).expect("uncontended").boot_rewind(1);
 
     let gen = disp.cat().durable_generation();
+    let d = Rc::clone(&disp);
     disp.reactor()
-        .block_on_exclusive(async { disp.reclaim_base(&mut disp.sal().lock_exclusive()).await })
+        .block_on(async move { d.reclaim_base(&mut d.sal().lock().await).await })
         .unwrap();
     assert_eq!(
         disp.cat().durable_generation(),
@@ -174,13 +227,19 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     );
 
     // Empty drain set: zero workers hold no pending deltas.
-    disp.restamp_derived(&[]).unwrap();
+    let d = Rc::clone(&disp);
+    disp.reactor()
+        .block_on(async move { d.restamp_derived(&[]).await })
+        .unwrap();
     assert!(
         !disp.derived_needs_restamp(),
         "the ephemeral round re-validates the derived state at the durable generation"
     );
 
-    disp.boot_checkpoint().unwrap();
+    let d = Rc::clone(&disp);
+    disp.reactor()
+        .block_on(async move { d.boot_checkpoint().await })
+        .unwrap();
     assert_eq!(
         disp.cat().durable_generation(),
         gen + 1,

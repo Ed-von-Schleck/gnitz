@@ -9,6 +9,9 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
+use std::future::Future;
+use std::task::Poll;
+
 use gnitz_store::storage::Batch;
 use gnitz_wire::WireConflictMode;
 
@@ -47,8 +50,22 @@ pub(super) mod worker;
 /// Debug and test builds only: release is `panic = "abort"` (`crates/Cargo.toml`),
 /// where the process dies at the panic and no `Err` arm below ever runs.
 pub(crate) fn guard_panic<T, E: From<String>>(op: &'static str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(r) => r,
-        Err(_) => Err(format!("internal server error (panic in {op})").into()),
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err(panicked(op)))
+}
+
+/// [`guard_panic`] over a future: a panic in any poll ends it as `Err`.
+pub(crate) async fn guard_panic_async<T, E: From<String>>(
+    op: &'static str,
+    fut: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.as_mut().poll(cx)))
+            .unwrap_or_else(|_| Poll::Ready(Err(panicked(op))))
+    })
+    .await
+}
+
+fn panicked<E: From<String>>(op: &str) -> E {
+    format!("internal server error (panic in {op})").into()
 }

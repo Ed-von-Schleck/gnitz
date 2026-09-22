@@ -68,10 +68,7 @@ fn send_cqe_wakes_its_waker_and_returns_the_body() {
     assert!(fut.as_mut().poll(&mut cx).is_pending());
 
     cqe(&r, KIND_OP, id, 16);
-    assert!(
-        r.inner.run_queue.borrow().is_queued(11),
-        "KIND_OP must wake the op future"
-    );
+    assert!(is_queued(11), "KIND_OP must wake the op future");
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready((rc, body)) => {
             assert_eq!(rc, 16, "KIND_OP must deliver the CQE rc verbatim");
@@ -95,9 +92,7 @@ fn dropped_send_future_keeps_its_body_until_the_cqe() {
 
     let r = make_reactor();
     let (id, mut fut) = bare_op(&r, Some(SendBody::Slot(slot)));
-    assert!(Pin::new(&mut fut)
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_pending());
+    assert!(try_poll_once(&mut fut).is_none());
     drop(fut);
     assert_eq!(r.inner.ops.borrow().len(), 1, "drop must leave the entry to its CQE");
     assert_eq!(
@@ -352,7 +347,7 @@ fn dispatch_accept_queues_successes_and_wakes_the_awaiter() {
     assert!(fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
 
     cqe(&r, KIND_ACCEPT, 0, -libc::ECONNABORTED);
-    assert!(!r.inner.run_queue.borrow().is_queued(42), "res<0 must wake nobody");
+    assert!(!is_queued(42), "res<0 must wake nobody");
     assert!(
         fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending(),
         "nor queue anything for the awaiter"
@@ -360,10 +355,7 @@ fn dispatch_accept_queues_successes_and_wakes_the_awaiter() {
 
     let accepted = fake_listener();
     cqe(&r, KIND_ACCEPT, 0, accepted);
-    assert!(
-        r.inner.run_queue.borrow().is_queued(42),
-        "res>=0 must wake the parked accept future"
-    );
+    assert!(is_queued(42), "res>=0 must wake the parked accept future");
     match fut.as_mut().poll(&mut Context::from_waker(&waker)) {
         Poll::Ready(fd) => assert_eq!(fd.as_raw_fd(), accepted, "carrying the accepted fd"),
         Poll::Pending => panic!("a queued fd must resolve"),

@@ -4,9 +4,9 @@
 //! LSN, mutate the catalog, pin the families it wrote, [`emit_zone_to_sal`] and
 //! [`publish_after_fsync`].
 //!
-//! A DDL bundle additionally runs inside a `TickGate`. The serial path needs none
-//! of that: a `sys_sequences` advance has no DAG evaluation and no rollback path,
-//! and the row it broadcasts is one no worker reads.
+//! A DDL bundle additionally runs under [`DdlLocks`]. The serial path needs none of that: a `sys_sequences`
+//! advance has no DAG evaluation and no rollback path, and the row it broadcasts
+//! is one no worker reads.
 //!
 //! A child of `executor`, so it reads that module's private items — `Shared` and
 //! its accessors included — with no visibility widened, and the DDL seams sit
@@ -17,15 +17,14 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{
-    await_barrier, decode_client_batch, guard_panic, park_until, request_quiesce, send_fault, send_msg, Shared,
-    TickPark,
-};
+use super::{decode_client_batch, guard_panic, park_until, request_barrier, send_fault, send_msg, Shared};
 use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::UniqueFilter;
+use crate::runtime::orchestration::guard_panic_async;
 use crate::runtime::peer::Peer;
+use crate::runtime::reactor::WriteGuard;
 use crate::runtime::sal::SalExcl;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
@@ -36,64 +35,47 @@ use gnitz_wire::{PkColList, WireFault};
 /// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
 pub(super) static RELAY_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_RELAY_HOLD_FOR_DDL");
 
-/// DDL tick-quiesce requests the tick loop has not yet acked, counted while
-/// [`RELAY_HOLD_FOR_DDL`] is armed — its only reader, so this folds away in
-/// release. A level, not a running total: a request made before the held relay
-/// arrived still reads as waiting, where a delta against a snapshot taken at the
-/// hold would miss it.
-static DDL_QUIESCE_PENDING: AtomicU64 = AtomicU64::new(0);
+/// DDLs waiting for the tick gate, counted only while [`RELAY_HOLD_FOR_DDL`] is
+/// armed: its one reader.
+static DDL_GATE_WAITERS: AtomicU64 = AtomicU64::new(0);
 
-/// The window every DDL bundle runs inside: the tick loop is parked and
-/// `Shared::ddl_window` raised for exactly as long as the gate lives, so the
-/// window ends on every exit path of `handle_ddl_txn`.
-///
-/// While the depth is non-zero no checkpoint round may run: its drain would
-/// never complete against a parked tick loop.
-struct TickGate {
-    /// See [`TickPark`]: dropping it releases the tick loop.
-    _release: TickPark,
-    shared: Rc<Shared>,
+/// What a DDL body runs under: the catalog write, and the tick gate's write, so
+/// no tick is in flight and every broadcast DdlSync lands between epochs.
+struct DdlLocks {
+    catalog: WriteGuard,
+    _ticks: WriteGuard,
 }
 
-impl TickGate {
-    /// Park the tick loop and enter a DDL window. Returns once the loop has
-    /// acked — no tick is in flight and none will start until this gate drops.
-    async fn enter(shared: &Rc<Shared>) -> Self {
-        let acked_rx = request_quiesce(shared);
-        let counted = RELAY_HOLD_FOR_DDL.armed();
-        if counted {
-            DDL_QUIESCE_PENDING.fetch_add(1, Ordering::Relaxed);
-        }
-        let park = acked_rx.await;
-        if counted {
-            DDL_QUIESCE_PENDING.fetch_sub(1, Ordering::Relaxed);
-        }
-        shared.ddl_window.set(shared.ddl_window.get() + 1);
-        TickGate {
-            _release: park,
-            shared: Rc::clone(shared),
-        }
+/// Take [`DdlLocks`]. The committer barrier comes first, holding no lock: a
+/// checkpoint sequence it is deferred behind drains ticks the gate would stop,
+/// and a low SAL gets its checkpoint there. Past the gate, wait out a committer
+/// round in flight; the committer starts none under the gate.
+async fn enter_ddl(shared: &Shared) -> DdlLocks {
+    request_barrier(shared, BarrierKind::Ddl).await;
+    let catalog = shared.catalog_rwlock.write().await;
+    let counted = RELAY_HOLD_FOR_DDL.armed();
+    if counted {
+        DDL_GATE_WAITERS.fetch_add(1, Ordering::Relaxed);
     }
-}
-
-impl Drop for TickGate {
-    fn drop(&mut self) {
-        let depth = &self.shared.ddl_window;
-        depth.set(depth.get() - 1);
+    let ticks = shared.tick_gate.write().await;
+    if counted {
+        DDL_GATE_WAITERS.fetch_sub(1, Ordering::Relaxed);
     }
+    drop(shared.disp().sal().lock().await);
+    DdlLocks { catalog, _ticks: ticks }
 }
 
 /// Poll bound for [`RELAY_HOLD_FOR_DDL`], in 1 ms ticks.
 const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
 
 /// Hold the FIRST steady-state exchange relay until a DDL is waiting on the tick
-/// loop to quiesce, keeping every worker parked in `do_exchange_wait` while that
+/// gate, keeping every worker parked in `do_exchange_wait` while that
 /// DDL is already issued — so the DDL provably lands on a mid-epoch tick, whether
 /// its request came before or after this relay. One-shot: the rest of the run
 /// relays at full speed.
 pub(super) async fn hold_relay_for_ddl(shared: &Shared) {
     park_until(shared, HOLD_RELAY_MAX_POLLS, "relay hold", || {
-        DDL_QUIESCE_PENDING.load(Ordering::Relaxed) > 0
+        DDL_GATE_WAITERS.load(Ordering::Relaxed) > 0
     })
     .await
 }
@@ -129,7 +111,7 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
 /// The ACK is a header-only frame carrying the zone LSN in `arg0`, sent after
 /// [`ddl_txn_body`] returns — outside the catalog write guard, so a client stalled
 /// on its `GNITZ_CLIENT_SEND_TIMEOUT_MS` deadline cannot block every other reader
-/// for the length of the window. Sound outside the tick gate too: the quiesce
+/// for the length of the window. Sound outside the tick gate too: the gate
 /// exists to keep a worker from being mid-epoch at *broadcast* time, and the body
 /// returns only after the broadcast, its wake and the fsync.
 ///
@@ -185,34 +167,10 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
         .map(idx_tab_partition)
         .unwrap_or_default();
 
-    // A CREATE VIEW is a stop-the-world op (source drain + distributed backfill,
-    // as exclusive rounds). The VIEW_TAB family's +1 rows, if any, are the new views;
-    // they alone need the lock-held barrier and the in-loop source drain below.
     let new_view_ids = views.creates;
     let view_create = !new_view_ids.is_empty();
 
-    // Drain the committer barrier BEFORE acquiring the catalog write lock. The
-    // barrier flushes user-table WAL and waits for worker ACKs (tens of ms under
-    // load); holding the write lock across that wait would block every concurrent
-    // SCAN/SEEK read for no reason — no catalog mutation happens until after the
-    // barrier returns.
-    //
-    // It is also where this bundle's SAL space comes from: the committer answers
-    // this barrier with a full checkpoint whenever the SAL is low, and no
-    // checkpoint can run once the window below is open.
-    await_barrier(shared, BarrierKind::Ddl).await;
-
-    // Quiesce the ticks before the write lock (run_tick takes the read lock, so a
-    // write-lock-held quiesce would deadlock) and after the barrier
-    // (a Quiesce queued ahead of the checkpoint sequence's own Drain parks the
-    // tick loop on a release this handler sends only once that barrier returns).
-    //
-    // Every bundle, not just the stop-the-world ones: a worker parked mid-epoch
-    // defers the broadcast DdlSync while still serving reads and pushes inline,
-    // so quiescing first is what makes a mutation reach every worker between
-    // epochs rather than behind one.
-    let _gate = TickGate::enter(shared).await;
-    let catalog_write = shared.catalog_rwlock.write().await;
+    let locks = enter_ddl(shared).await;
 
     // The cross-family guards, before anything is reserved or applied: a
     // rejection here returns having written nothing, so it needs no
@@ -220,23 +178,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
     // make a check that needs no applied state indistinguishable from a
     // post-apply failure.
     shared.cat().precheck_bundle(&families, &new_view_ids)?;
-
-    if view_create {
-        // Lock-held committer barrier: a push could have committed between the
-        // pre-lock barrier and the write lock; flush it so every straggler is
-        // resident in pending_deltas before the in-loop source drain. The
-        // committer stays idle for the rest of the handler (the write lock blocks
-        // new pushes).
-        await_barrier(shared, BarrierKind::Ddl).await;
-    }
-
-    // Exclusive rounds follow: the view's source drain and backfill, or the restamp a
-    // failed checkpoint drain left owed. No train may be live for them, and none can
-    // start under the write lock. A live train's client egress (each send bounded by
-    // `client_send_timeout`) holds this DDL, and every reader behind it, until it ends.
-    if view_create || shared.disp().derived_needs_restamp() {
-        shared.disp().reactor().trains_idle().await;
-    }
 
     // Pre-flight global uniqueness for every unique secondary index in this
     // bundle before reserving the zone LSN or mutating the catalog, so a
@@ -298,7 +239,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
     }
     let view_prio = SysFamily::View.topo_priority();
     let mut drained_sources = false;
-    let ingest_res = guard_panic("DDL", || {
+    let ingest_res = guard_panic_async("DDL", async {
         for (family, fbatch) in ordered {
             if view_create && !drained_sources && family.topo_priority() >= view_prio {
                 let sources = {
@@ -306,7 +247,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
                     cat.dag.base_tables_reachable_from(&cat.registry, new_view_ids.clone())
                 };
                 for src in sources {
-                    shared.disp().drain_tick_blocking(src)?;
+                    shared.disp().drain_tick(src).await?;
                 }
                 drained_sources = true;
             }
@@ -323,7 +264,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
             crate::query::preflight_compile(&shared.cat().registry, vid)?;
         }
         Ok::<_, WireFault>(())
-    });
+    })
+    .await;
     if let Err(e) = &ingest_res {
         guard_panic("DDL-compensate", || shared.cat_mut().compensate_stage_a()).unwrap_or_else(|ce| {
             gnitz_fatal_abort!("Stage-A DDL compensation failed after DDL error '{}': {}", e, ce);
@@ -340,7 +282,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
 
     // Relation ids are never reissued within a boot, so these entries are dead.
     for &id in tables.drops.iter().chain(&views.drops) {
-        shared.forget_relation(&catalog_write, id);
+        shared.forget_relation(&locks.catalog, id);
     }
     // Keying by the whole column list means dropping `(a, b)` never clears a
     // distinct single-column filter on `a`.
@@ -358,9 +300,11 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
     // is durable), so abort — restart's boot rebuild refills it.
-    guard_panic("view-backfill", || {
-        shared.disp().backfill_views_in_dep_order(&new_view_ids)
-    })
+    guard_panic_async(
+        "view-backfill",
+        shared.disp().backfill_views_in_dep_order(&new_view_ids),
+    )
+    .await
     .unwrap_or_else(|e| {
         gnitz_fatal_abort!(
             "live CREATE VIEW backfill failed after the CREATE was made durable: {}",
@@ -368,15 +312,17 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
         );
     });
 
-    // Finish the checkpoint here, while the tick loop is still quiesced, rather
-    // than leaving the database rebuild-on-boot until
-    // something wakes the committer.
+    // A backfill reclaim leaves the derived state behind the durable generation:
+    // restamp it now rather than leave it rebuild-on-boot until the next
+    // checkpoint.
     if shared.disp().derived_needs_restamp() {
         let mut pending = Vec::new();
         shared.drain_live_tick_rows_into(&mut pending);
-        guard_panic("view-restamp", || shared.disp().restamp_derived(&pending)).unwrap_or_else(|e| {
-            gnitz_fatal_abort!("re-stamping derived state after a CREATE VIEW reclaim failed: {}", e);
-        });
+        guard_panic_async("view-restamp", shared.disp().restamp_derived(&pending))
+            .await
+            .unwrap_or_else(|e| {
+                gnitz_fatal_abort!("re-stamping derived state after a CREATE VIEW reclaim failed: {}", e);
+            });
     }
 
     Ok((zone_lsn, family_count))

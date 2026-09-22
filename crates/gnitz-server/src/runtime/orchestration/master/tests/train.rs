@@ -62,16 +62,6 @@ fn send_frame(
     msg.size() + gnitz_wire::FRAME_LEN_PREFIX_BYTES
 }
 
-/// Drive a future to completion in exactly one poll, panicking on Pending.
-fn poll_once<T>(fut: impl std::future::Future<Output = T>) -> T {
-    try_poll_once(fut).unwrap_or_else(|| {
-        panic!(
-            "future did not complete in one poll: the drain awaited a \
-         frame that is not (and will never be) parked"
-        )
-    })
-}
-
 /// A frame carrying rows must still be routed for worker `i` — the drain
 /// returned without consuming it. Consumes the frame itself, so it is a terminal
 /// check.
@@ -98,7 +88,7 @@ fn drain_rows_errs_immediately_on_fault_frame() {
 
     fx.reactor.route_w2m_for_test();
 
-    let result = poll_once(drain_rows(&fx.lease, &schema, |_| Ok(())));
+    let result = try_poll_once(drain_rows(&fx.lease, &schema, |_| Ok(()))).expect("completes in one poll");
     let err = result.expect_err("worker fault must surface as Err");
     assert!(
         err.text.contains("worker 0: Scan:"),
@@ -131,12 +121,13 @@ fn drain_rows_merges_chunked_and_single_frame_trains() {
     fx.reactor.route_w2m_for_test();
 
     let mut rows: Vec<(u128, i64)> = Vec::new();
-    let result = poll_once(drain_rows(&fx.lease, &schema, |mb| {
+    let result = try_poll_once(drain_rows(&fx.lease, &schema, |mb| {
         for i in 0..mb.len() {
             rows.push((gnitz_wire::widen_pk_be(mb.get_pk_bytes(i)), mb.get_weight(i)));
         }
         Ok(())
-    }));
+    }))
+    .expect("completes in one poll");
     result.expect("healthy trains must drain cleanly");
     assert_eq!(
         rows,
@@ -159,9 +150,10 @@ fn drain_rows_sink_error_aborts_drain() {
 
     fx.reactor.route_w2m_for_test();
 
-    let result = poll_once(drain_rows(&fx.lease, &schema, |_| {
+    let result = try_poll_once(drain_rows(&fx.lease, &schema, |_| {
         Err("gather: result exceeds the reply cap".into())
-    }));
+    }))
+    .expect("completes in one poll");
     let err = result.expect_err("sink error must abort the drain");
     assert!(err.text.contains("reply cap"), "sink error surfaces verbatim: {err}");
 
@@ -188,13 +180,19 @@ fn next_yields_only_row_frames_and_ends_at_each_terminal() {
 
     let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
     for (w, pk) in [(0u32, 1u128), (1, 2)] {
-        let f = poll_once(fx.lease.next()).expect("no fault").expect("a row frame");
+        let f = try_poll_once(fx.lease.next())
+            .expect("completes in one poll")
+            .expect("no fault")
+            .expect("a row frame");
         assert_eq!(f.slot.worker, w, "frames arrive in worker order");
         let mb = f.rows(&schema, &mut offsets);
         assert_eq!(gnitz_wire::widen_pk_be(mb.get_pk_bytes(0)), pk);
     }
     assert!(
-        poll_once(fx.lease.next()).expect("no fault").is_none(),
+        try_poll_once(fx.lease.next())
+            .expect("completes in one poll")
+            .expect("no fault")
+            .is_none(),
         "every train has ended"
     );
 }
@@ -211,7 +209,9 @@ fn forward_scan_drops_a_row_less_frame() {
     fx.reactor.route_w2m_for_test();
 
     let before = fx.reactor.release_cursor_for_test(0);
-    poll_once(forward_scan(&fx.peer, &fx.lease)).expect("healthy train");
+    try_poll_once(forward_scan(&fx.peer, &fx.lease))
+        .expect("completes in one poll")
+        .expect("healthy train");
     assert!(
         fx.reactor.release_cursor_for_test(0) > before,
         "the dropped slot was released at the ring"

@@ -17,7 +17,7 @@ use gnitz_foundation::posix_io;
 use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::reactor::{Limits, Reactor};
+use crate::runtime::reactor::{AckLease, Limits, Reactor};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
@@ -442,29 +442,30 @@ fn fork_workers(
 }
 
 /// The master's half of recovery once the workers are alive, ending in the
-/// checkpoint a clean restart resumes from.
-fn master_post_fork_recovery(disp: &MasterDispatcher, live_epoch: u32, swept_bases: &[i64]) -> Result<(), String> {
+/// checkpoint a clean restart resumes from. `ready` is the lease the workers'
+/// ready ACKs answer.
+async fn master_post_fork_recovery(
+    disp: Rc<MasterDispatcher>,
+    ready: AckLease,
+    live_epoch: u32,
+    swept_bases: Vec<i64>,
+) -> Result<(), String> {
     // Wait for all workers to complete recovery and signal readiness.
-    // Before any drain: a drain drops frames no lease routes.
-    let ready = disp.reactor().lease_acks(1, "recovery sync");
-    assert_eq!(
-        ready.id(0),
-        BOOT_READY_REQUEST_ID,
-        "the ready ACKs name the reactor's first lease"
-    );
-    disp.collect_exclusive(&ready, false)
+    disp.collect_round(&ready, false)
+        .await
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
     drop(ready);
 
-    disp.sal().lock_exclusive().boot_rewind(live_epoch);
+    disp.sal().lock().await.boot_rewind(live_epoch);
 
     inject_recovery_panic("reset");
 
     // Drive the tail each worker buffered during replay into the views, one
     // blocking tick per swept base. An empty source ticks too, so exchange views
     // stay in lockstep and every view this reaches is compiled.
-    for &src in swept_bases {
-        disp.drain_tick_blocking(src)
+    for &src in &swept_bases {
+        disp.drain_tick(src)
+            .await
             .map_err(|e| format!("recovery tick sweep failed: {e}"))?;
     }
 
@@ -477,6 +478,7 @@ fn master_post_fork_recovery(disp: &MasterDispatcher, live_epoch: u32, swept_bas
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     gnitz_note!("recovery: rebuilding {} invalid view(s)", invalid.len());
     disp.backfill_views_in_dep_order(&invalid)
+        .await
         .map_err(|e| format!("invalid-view rebuild failed: {e}"))?;
 
     inject_recovery_panic("backfill");
@@ -485,6 +487,7 @@ fn master_post_fork_recovery(disp: &MasterDispatcher, live_epoch: u32, swept_bas
     // it. No drain — recovery already drained everything and no pushes are
     // admitted yet.
     disp.boot_checkpoint()
+        .await
         .map_err(|e| format!("boot checkpoint failed: {e}"))?;
     Ok(())
 }
@@ -528,7 +531,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     let wakes = w2m_ptrs.iter().map(|&p| unsafe { SalWake::new(p) }).collect();
     // 256 SQEs sets submit batching, not depth: a full SQ is flushed.
     let reactor = Rc::new(
-        Reactor::new(256, Limits::from_env(), Rc::new(W2mReceiver::new(w2m_ptrs)))
+        Reactor::new(256, Limits::from_env(), W2mReceiver::new(w2m_ptrs))
             .map_err(|e| format!("io_uring init failed: {e}"))?,
     );
     let dispatcher = Rc::new(MasterDispatcher::new(
@@ -539,7 +542,20 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
         reactor,
     ));
 
-    master_post_fork_recovery(&dispatcher, tail.live_epoch(), &swept_bases)?;
+    // The workers' ready ACKs. Leased before the first tick, which drops every
+    // W2M frame no lease routes.
+    let ready = dispatcher.reactor().lease_acks(1, "recovery sync");
+    assert_eq!(
+        ready.id(0),
+        BOOT_READY_REQUEST_ID,
+        "the ready ACKs name the reactor's first lease"
+    );
+    dispatcher.reactor().block_on(master_post_fork_recovery(
+        Rc::clone(&dispatcher),
+        ready,
+        tail.live_epoch(),
+        swept_bases,
+    ))?;
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);

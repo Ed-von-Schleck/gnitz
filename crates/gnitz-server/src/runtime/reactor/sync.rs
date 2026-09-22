@@ -162,15 +162,9 @@ impl AsyncRwLock {
         WriteFuture { lock: self.clone(), waiter: None }
     }
 
-    /// The write guard iff nobody holds the lock in either mode. A parked writer
-    /// does not refuse it.
-    pub fn try_write(&self) -> Option<WriteGuard> {
-        let mut s = self.0.borrow_mut();
-        if !s.write_ok() {
-            return None;
-        }
-        s.has_writer = true;
-        Some(WriteGuard { lock: self.clone() })
+    /// A writer holds the lock.
+    pub fn is_write_held(&self) -> bool {
+        self.0.borrow().has_writer
     }
 
     /// Admit whoever the state now allows: the first parked writer, or every

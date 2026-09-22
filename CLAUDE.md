@@ -308,7 +308,7 @@ pk_index else ci - 1`; with a **compound PK** the columns are renumbered around
 
 ## Prerequisites
 
-Linux with an io_uring kernel (≥ 5.x); stable Rust; `uv` (drives Python + `maturin`). Nothing is version-pinned.
+Linux with an io_uring kernel (≥ 6.7: `IORING_OP_FUTEX_WAITV`); stable Rust; `uv` (drives Python + `maturin`). Nothing is version-pinned.
 
 ## Build targets
 
