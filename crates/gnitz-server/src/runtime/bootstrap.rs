@@ -314,7 +314,6 @@ fn run_worker_child(
     catalog: &mut CatalogEngine,
     ipc: &SharedIpc,
     swept_bases: &[i64],
-    placement: Option<&affinity::Placement>,
 ) -> ! {
     let w = slot.rank as usize;
 
@@ -349,14 +348,6 @@ fn run_worker_child(
     // recovery below emits carries `W{w}` rather than the inherited master tag.
     // Only the tag: the level is a process-wide static the fork already copied.
     gnitz_foundation::log::set_tag(format!("W{w}").as_bytes());
-
-    // Pin after the log re-tag, so a failed pin is recorded in this worker's own
-    // `worker_N.log` rather than the master's stdout, and before every
-    // allocation below — trim, store open, index rebuild, SAL replay, backfill —
-    // whose first touch decides which node its memory lands on.
-    if let Some(p) = placement {
-        p.pin_worker(w);
-    }
 
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
     let catalog_ptr: *mut CatalogEngine = catalog;
@@ -422,11 +413,15 @@ fn fork_workers(
     num_workers: u32,
     ipc: &SharedIpc,
     swept_bases: &[i64],
-    placement: Option<&affinity::Placement>,
+    pinning: Option<&affinity::Pinning>,
 ) -> Result<Vec<i32>, String> {
     let master_pid = unsafe { libc::getpid() };
     let mut worker_pids: Vec<i32> = Vec::with_capacity(num_workers as usize);
     for w in 0..num_workers {
+        // The child inherits this mask, so it is pinned from its first instruction.
+        if let Some(p) = pinning {
+            p.enter_worker(w as usize)?;
+        }
         match unsafe { libc::fork() } {
             -1 => return Err("fork failed".to_string()),
             0 => run_worker_child(
@@ -436,10 +431,12 @@ fn fork_workers(
                 catalog,
                 ipc,
                 swept_bases,
-                placement,
             ),
             pid => worker_pids.push(pid),
         }
+    }
+    if let Some(p) = pinning {
+        p.enter_master()?;
     }
     Ok(worker_pids)
 }
@@ -496,23 +493,9 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
     // Child directories + shard files.
     posix_io::raise_fd_limit(65536);
 
-    // Pin the master before the catalog opens: the first system-table flush
-    // creates the master's first io_uring ring, and an io-wq pool
-    // keeps the mask its ring's creating thread held. Each forked child then
-    // inherits this mask until its own pin narrows it. See `runtime::affinity`
-    // for the placement itself and what it assumes about the host.
+    // Before any io_uring worker thread exists: each keeps the mask it starts with.
     let nw = num_workers as usize;
-    let placement = match affinity::plan(nw) {
-        Ok(p) => {
-            p.log_placement();
-            p.pin_master();
-            Some(p)
-        }
-        Err(why) => {
-            gnitz_note!("affinity: not applied ({why})");
-            None
-        }
-    };
+    let pinning = affinity::pin_master(nw)?;
 
     gnitz_info!("Opening database at {}", data_dir);
 
@@ -533,7 +516,7 @@ fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls_cli: Opti
 
     let (swept_bases, lsn_seed) = master_pre_fork_recovery(catalog)?;
 
-    let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, placement.as_ref())?;
+    let worker_pids = fork_workers(catalog, data_dir, num_workers, &ipc, &swept_bases, pinning.as_ref())?;
 
     // --- Parent process ---
     let SharedIpc { sal_fd, sal, tail, w2m_ptrs } = ipc;

@@ -1,13 +1,8 @@
 use super::*;
 
-fn nodes(shape: &[&[&[u32]]]) -> Vec<Vec<Core>> {
-    shape.iter().map(|n| n.iter().map(|c| c.to_vec()).collect()).collect()
-}
-
-fn all(shape: &[Vec<Core>]) -> Vec<u32> {
-    let mut v: Vec<u32> = shape.iter().flatten().flatten().copied().collect();
-    v.sort_unstable();
-    v
+/// No SMT: every CPU is its own core.
+fn no_smt(c: u32) -> Vec<u32> {
+    vec![c]
 }
 
 #[test]
@@ -24,37 +19,46 @@ fn cpu_list_parses_ranges_singletons_and_mixes() {
     );
 }
 
-/// 6 cores x 2 SMT threads, one node, 4 workers: a whole core each, and the
-/// master holds every CPU none of them took.
+#[test]
+fn cpu_list_formats_in_the_spelling_it_parses() {
+    for (cpus, s) in [
+        (vec![0, 1, 2, 3, 8, 10, 11], "0-3,8,10-11"),
+        (vec![5], "5"),
+        (vec![], ""),
+    ] {
+        assert_eq!(fmt_cpu_list(&cpus), s);
+        assert_eq!(parse_cpu_list(s), cpus);
+    }
+}
+
+/// Adjacent-numbered SMT pairs: `{0, 1}`, `{2, 3}`, …
+fn smt_pairs(c: u32) -> Vec<u32> {
+    vec![c & !1, c | 1]
+}
+
 #[test]
 fn each_worker_gets_a_core_and_the_master_gets_the_rest() {
-    let n = nodes(&[&[&[0, 1], &[2, 3], &[4, 5], &[6, 7], &[8, 9], &[10, 11]]]);
-    let p = assign(&n, &all(&n), 4).unwrap();
+    let allowed: Vec<u32> = (0..12).collect();
+    let order = handout_order(&allowed, std::slice::from_ref(&allowed), smt_pairs);
+    let p = assign(order, 4).unwrap();
     assert_eq!(p.workers, vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]);
     assert_eq!(p.master, vec![8, 9, 10, 11], "master takes both leftover cores");
 }
 
-/// No fallback tier: workers that would consume every core leave the master
-/// nothing, so nothing is pinned at all.
 #[test]
 fn no_placement_when_the_master_would_be_left_no_core() {
-    let n = nodes(&[&[&[0, 1], &[2, 3], &[4, 5], &[6, 7]]]);
-    assert_eq!(
-        assign(&n, &all(&n), 4).unwrap_err(),
-        4,
-        "4 workers cannot take all 4 cores"
-    );
-    assert_eq!(
-        assign(&n, &all(&n), 9).unwrap_err(),
-        4,
-        "and never by splitting siblings"
-    );
+    let allowed: Vec<u32> = (0..8).collect();
+    let order = || handout_order(&allowed, std::slice::from_ref(&allowed), smt_pairs);
+    assert_eq!(order().len(), 4);
+    assert!(assign(order(), 4).is_none(), "4 workers cannot take all 4 cores");
+    assert!(assign(order(), 9).is_none(), "and never by splitting siblings");
 }
 
 #[test]
 fn cores_alternate_across_nodes() {
-    let n = nodes(&[&[&[0], &[2], &[4]], &[&[1], &[3], &[5]]]);
-    let p = assign(&n, &all(&n), 4).unwrap();
+    let allowed: Vec<u32> = (0..6).collect();
+    let order = handout_order(&allowed, &[vec![0, 2, 4], vec![1, 3, 5]], no_smt);
+    let p = assign(order, 4).unwrap();
     assert_eq!(
         p.workers,
         vec![vec![0], vec![1], vec![2], vec![3]],
@@ -63,26 +67,37 @@ fn cores_alternate_across_nodes() {
     assert_eq!(p.master, vec![4, 5]);
 }
 
-/// An allowed CPU that no online node names is in no core, yet it is still
-/// this server's to use — so it lands in the master's mask. This is why
-/// `assign` takes `allowed` instead of deriving it from the cores.
 #[test]
-fn an_allowed_cpu_named_by_no_node_still_reaches_the_master() {
-    let n = nodes(&[&[&[0, 1], &[2, 3]]]);
-    let p = assign(&n, &[0, 1, 2, 3, 20, 21], 1).unwrap();
-    assert_eq!(p.workers, vec![vec![0, 1]]);
-    assert_eq!(p.master, vec![2, 3, 20, 21]);
+fn an_unreadable_node_list_puts_every_core_in_one_node() {
+    let allowed: Vec<u32> = (0..6).collect();
+    assert_eq!(
+        handout_order(&allowed, &[], smt_pairs),
+        vec![vec![0, 1], vec![2, 3], vec![4, 5]]
+    );
 }
 
-/// The sysfs walk against this machine's real shape. Two node cpulists that
-/// both name a core's first CPU would bucket that core twice, which is the one
-/// way the walk can hand `assign` a CPU claimed by two cores.
+#[test]
+fn an_inconsistent_topology_still_yields_disjoint_cores_covering_allowed() {
+    let allowed: Vec<u32> = (0..6).collect();
+    let siblings = |c: u32| match c {
+        0 => vec![0, 2],
+        1 => vec![1, 2], // claims 2, yet files only itself
+        2 => vec![0, 2],
+        3 => vec![], // unreadable
+        4 => vec![4],
+        5 => vec![3, 5], // claims 3, yet files only itself
+        _ => unreachable!(),
+    };
+    // Nodes both name 0 and 3; neither names 4 or 5.
+    let order = handout_order(&allowed, &[vec![0, 1, 2, 3], vec![0, 3]], siblings);
+    assert_eq!(order, vec![vec![0, 2], vec![5], vec![1], vec![4], vec![3]]);
+}
+
 #[test]
 fn this_machine_reads_back_a_consistent_topology() {
     let allowed = allowed_cpus();
     assert!(!allowed.is_empty(), "sched_getaffinity must report at least one CPU");
-    let seen = all(&cores_by_node(&allowed));
-    let mut uniq = seen.clone();
-    uniq.dedup();
-    assert_eq!(uniq, seen, "no CPU is claimed by two cores");
+    let mut seen: Vec<u32> = read_order(&allowed).into_iter().flatten().collect();
+    seen.sort_unstable();
+    assert_eq!(seen, allowed, "every allowed CPU is in exactly one core");
 }

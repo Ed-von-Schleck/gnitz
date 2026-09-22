@@ -56,7 +56,7 @@ Arguments:
   <socket_path>   Path for the Unix domain socket to listen on
 
 Options:
-  --workers=N          Number of worker processes (default: 1, single-process)
+  --workers=N          Number of worker processes (default: 1)
   --log-level=LEVEL    Set log verbosity: quiet, normal, verbose (default: quiet)
   --tls-listen=IP:PORT Additionally listen for TLS 1.3 clients on this TCP
                        address (port 0 = ephemeral). The bound address is
