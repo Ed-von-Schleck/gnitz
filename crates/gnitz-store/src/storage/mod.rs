@@ -131,7 +131,7 @@ impl Drop for StagedFile {
     }
 }
 
-/// Durably publish `bytes` as `<dir>/<filename>`, through a [`StagedFile`].
+/// Durably publish `bytes` as `<dir>/<filename>`, through a `StagedFile`.
 pub fn publish_file_sync(dir: &str, filename: &str, bytes: &[u8]) -> Result<(), StorageError> {
     let (staged, file) = StagedFile::create(&format!("{dir}/{filename}"))?;
     file.write_all_at(bytes, 0)?;

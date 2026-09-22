@@ -128,7 +128,7 @@ impl ExprBuilder {
     /// wire round trip to be validated.
     ///
     /// `result_reg` is `None` for a map, which reads its output off the sinks.
-    /// The two are exclusive, and [`Output::new`] is where a caller that named
+    /// The two are exclusive, and `Output::new` is where a caller that named
     /// both is told so.
     pub fn build(self, result_reg: Option<Reg>) -> Result<LogicalProgram, ExprValidateErr> {
         let output = Output::new(result_reg, self.sinks)?;

@@ -118,24 +118,6 @@ impl ColumnLocator {
         }
     }
 
-    /// The column's value in `row` as a `u64` whose unsigned order is the
-    /// column's typed order (`total_cmp`'s for floats). `kind` is the column's
-    /// own.
-    #[inline(always)]
-    pub fn order_bits(&self, mb: &impl RowSource, row: usize, kind: gnitz_wire::ScalarKind) -> u64 {
-        debug_assert_eq!(gnitz_wire::ScalarKind::from_type_code(self.type_code()), Some(kind));
-        match kind {
-            gnitz_wire::ScalarKind::Int(fi) => (self.decode_i64(mb, row, fi) as u64) ^ ((fi.is_signed() as u64) << 63),
-            // A float is never a PK column, so `bytes` is already the native image.
-            gnitz_wire::ScalarKind::F32 => {
-                gnitz_wire::ieee_order_bits_f32(u32::from_le_bytes(self.bytes(mb, row).try_into().unwrap()))
-            }
-            gnitz_wire::ScalarKind::F64 => {
-                gnitz_wire::ieee_order_bits(u64::from_le_bytes(self.bytes(mb, row).try_into().unwrap()))
-            }
-        }
-    }
-
     /// Order two rows on this column, **both known non-NULL**: a PK window by
     /// its OPK bytes, a payload window by typed value (STRING/BLOB by content).
     #[inline(always)]

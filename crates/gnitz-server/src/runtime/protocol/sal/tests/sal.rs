@@ -2,7 +2,8 @@ use super::fixtures::{group_at, group_in, TestLog};
 use super::{
     effective_max, epoch_word, group_header_size, stamp_digest, DirectGroup, EpochGate, GroupData, GroupTargets,
     SalMessageKind, SalReader, SalStep, WorkerSet, CHECKPOINT_RESERVE, DIR_CHECKSUM_AT, DIR_ENTRY_BYTES,
-    FLAG_IN_REQUEST_ORDER, FLAG_ZONE_END, MIN_SAL_BYTES, OFF_FLAGS, OFF_KIND, OFF_LSN, PREFIX_BYTES, PRESENT,
+    FLAG_IN_REQUEST_ORDER, FLAG_ZONE_END, MAX_WORKERS, MIN_SAL_BYTES, OFF_FLAGS, OFF_KIND, OFF_LSN, PREFIX_BYTES,
+    PRESENT,
 };
 use crate::runtime::test_support::{assert_child_exited_ok, fork_child, try_poll_once};
 use crate::runtime::w2m::fixtures::sal_wake_seq;
@@ -10,7 +11,6 @@ use crate::runtime::w2m::{SalWake, W2mReceiver, W2mWriter};
 use crate::runtime::wire::WireMsg;
 use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_wire::control::CTRL_HEADER_SIZE;
-use gnitz_wire::MAX_WORKERS;
 
 #[test]
 fn sal_round_trip() {

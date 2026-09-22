@@ -167,9 +167,7 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
 
 /// One row's fixed 8-byte payload slot `pi`, little-endian.
 pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
-    let cell = src.get_col_ptr(row, pi, 8);
-    // Exactly 8 bytes by construction — `get_col_ptr` returns the width asked for.
-    u64::from_le_bytes(cell.try_into().expect("an 8-byte payload cell"))
+    gnitz_wire::read_u64_le(src.get_col_ptr(row, pi, 8), 0)
 }
 
 /// One row's German-string (STRING or BLOB) payload slot `pi`, resolved through

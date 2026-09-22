@@ -44,6 +44,12 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
     }
+    pub(crate) fn bool(&mut self, v: bool) -> &mut Self {
+        self.u8(v as u8)
+    }
+    pub(crate) fn type_code(&mut self, tc: TypeCode) -> &mut Self {
+        self.u8(tc.as_wire())
+    }
 
     /// Raw bytes, no length prefix — for a section whose length the format
     /// already pins (a fixed-width sub-blob, or one preceded by its own count).

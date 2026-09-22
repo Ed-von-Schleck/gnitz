@@ -39,7 +39,7 @@ pub fn op_filter(batch: &Batch, pred: &mut RowFilter, schema: &SchemaDescriptor)
 /// the null-blind `FixedIntNonnull` one, which would fail to coalesce two
 /// logically-NULL rows carrying different bytes under the null bit.
 ///
-/// Not [`DerivedSchema`], which forces `pk_indices = 0..pk_len`: a `Union`
+/// Not `DerivedSchema`, which forces `pk_indices = 0..pk_len`: a `Union`
 /// input's PK need not be a column prefix. `SchemaDescriptor::new`'s asserts fire
 /// in release but cannot here — matched layouts leave every PK column untouched.
 pub fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<SchemaDescriptor, OpBuildErr> {

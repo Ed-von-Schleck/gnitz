@@ -1,11 +1,12 @@
 use super::*;
 use crate::schema::key::{compare_pk_bytes, ReindexPacker};
+use crate::schema::{ground_owner, worker_for_pk_bytes};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
     make_batch, make_batch_i64pk, make_batch_opk, make_batch_raw, make_batch_u128, make_schema_i64pk_i64,
     make_schema_u128_i64, make_schema_u64_i64, make_wide_batch, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
 };
-use gnitz_wire::{worker_for_pk_bytes, TypeCode};
+use gnitz_wire::TypeCode;
 use std::cmp::Ordering;
 
 fn scatter(sources: &[&Batch], spec: ScatterSpec<'_>, schema: &SchemaDescriptor, num_workers: usize) -> Vec<Batch> {
@@ -233,6 +234,20 @@ fn the_linear_arm_drops_weight_zero_rows_and_claims_nothing() {
     }
     keys.sort();
     assert_eq!(keys, vec![1, 2, 5, 9]);
+}
+
+/// A scatter keyed by no columns sends every row to [`ground_owner`] — the
+/// worker the compiler lets seed a global aggregate's ground row.
+#[test]
+fn a_keyless_group_scatter_routes_every_row_to_the_ground_owner() {
+    let schema = make_schema_u64_i64();
+    let b = make_batch_raw(&schema, &[(5, 1, 50), (1, 1, 10), (9, -1, 90)]);
+    for nw in [1, 2, 3, 4, 7, 16, 64] {
+        let out = scatter(&[&b], ScatterSpec::GroupKey(&[]), &schema, nw);
+        let owner = ground_owner(nw);
+        assert_eq!(out[owner].count, 3, "nw={nw}: every row reaches worker {owner}");
+        assert_eq!(total_rows(&out), 3, "nw={nw}: no row reaches another worker");
+    }
 }
 
 /// An empty round still yields one batch per worker, and still refuses a spec

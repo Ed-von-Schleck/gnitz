@@ -577,7 +577,8 @@ impl From<FrameLenError> for ProtocolError {
     }
 }
 
-/// Encode a frame's length prefix, refusing zero and anything past `u32::MAX`. The one enforcement point for every framed send.
+/// Encode a frame's length prefix, refusing zero and anything past `u32::MAX`: where
+/// every framed send of this client is checked.
 pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], ProtocolError> {
     if len == 0 {
         return Err(ProtocolError::IoError(std::io::Error::new(
@@ -602,13 +603,10 @@ pub fn hello_handshake(t: &mut ClientTransport, until: Option<Instant>) -> Resul
     t.send_frame(payload.to_vec(), until)?;
 
     let buf = t.recv_framed(until)?;
-    if buf.len() == gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize {
-        let ack = gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
-        if ack.magic != gnitz_wire::HELLO_MAGIC {
-            return Err(ProtocolError::DecodeError("HELLO ACK magic mismatch".into()));
-        }
+    if buf.len() == gnitz_wire::HELLO_ACK_PAYLOAD_LEN {
+        let published_lsn = gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
         t.mark_established();
-        return Ok(ack.published_lsn);
+        return Ok(published_lsn);
     }
 
     // Not an ACK — the server sent a `WireStatus::Error` control block. The frame is

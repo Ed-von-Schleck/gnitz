@@ -9,17 +9,16 @@
 //! The ordinal names the aggregate, so `MIN(a)` and `MAX(a)` never collide, and
 //! a MAX image is complemented, so each ordinal's first entry is its extreme.
 
+use super::super::order_image::{
+    append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, ImageKind, WideKind,
+    IMAGE_COL,
+};
+use super::agg::{Accumulator, ExtremeSpec};
 use crate::schema::key::ReindexPacker;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 use gnitz_expr::payload_bytes;
 use gnitz_expr::RowSource;
-use gnitz_wire::{ImageKind, WideKind};
-
-use super::super::order_image::{
-    append_image, has_fixed_image, image_slot_col, int16_image, scalar_image, write_image_slot, IMAGE_COL,
-};
-use super::agg::{Accumulator, ExtremeSpec};
 
 // ---------------------------------------------------------------------------
 // Key layout

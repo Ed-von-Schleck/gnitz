@@ -5,7 +5,7 @@
 use std::ops::Range;
 
 use crate::flags::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
-use crate::{read_u32_le, read_u64_le, ClientVerb, WireFault, WireFlags, WireStatus};
+use crate::{read_u32_le, read_u64_le, write_u32_le, write_u64_le, ClientVerb, WireFault, WireFlags, WireStatus};
 
 // Layout (all little-endian):
 //   [0,4)   STATUS     u32   `WireStatus`
@@ -106,19 +106,16 @@ pub fn encode_frame_head(
     let flags = hdr.flags.pack()
         | if schema_block.is_some() { FLAG_HAS_SCHEMA } else { 0 }
         | if has_data { FLAG_HAS_DATA } else { 0 };
-    // A local array stored whole: const offsets carry no bounds checks.
-    let mut h = [0u8; CTRL_HEADER_SIZE];
-    h[OFF_STATUS..OFF_STATUS + 4].copy_from_slice(&hdr.status.as_wire().to_le_bytes());
-    h[OFF_BLOB_LEN..OFF_BLOB_LEN + 4].copy_from_slice(&(blob.len() as u32).to_le_bytes());
-    h[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&flags.to_le_bytes());
-    h[OFF_TARGET_ID..OFF_TARGET_ID + 8].copy_from_slice(&hdr.target_id.to_le_bytes());
-    h[OFF_ARG0..OFF_ARG0 + 8].copy_from_slice(&hdr.arg0.to_le_bytes());
-    h[OFF_ARG1..OFF_ARG1 + 8].copy_from_slice(&hdr.arg1.to_le_bytes());
-    *head = h;
+    write_u32_le(head, OFF_STATUS, hdr.status.as_wire());
+    write_u32_le(head, OFF_BLOB_LEN, blob.len() as u32);
+    write_u64_le(head, OFF_FLAGS, flags);
+    write_u64_le(head, OFF_TARGET_ID, hdr.target_id);
+    write_u64_le(head, OFF_ARG0, hdr.arg0);
+    write_u64_le(head, OFF_ARG1, hdr.arg1);
     tail[..blob.len()].copy_from_slice(blob);
     let mut pos = CTRL_HEADER_SIZE + blob.len();
     if let Some(sb) = schema_block {
-        out[pos..pos + 4].copy_from_slice(&(sb.len() as u32).to_le_bytes());
+        write_u32_le(out, pos, sb.len() as u32);
         pos += 4;
         out[pos..pos + sb.len()].copy_from_slice(sb);
         pos += sb.len();

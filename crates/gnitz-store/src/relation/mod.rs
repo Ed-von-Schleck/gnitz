@@ -289,7 +289,7 @@ impl Relation {
     }
 
     /// This relation's rows over `[start, end]` only — see
-    /// [`Table::open_cursor_in_range`](crate::storage::Table::open_cursor_in_range).
+    /// `Table::open_cursor_in_range`.
     pub fn cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
         self.store.cursor_in_range(start, end)
     }

@@ -135,9 +135,7 @@ impl PayloadOrder for FixedIntNonnull {
             // a no-op; for signed ones it flips the MSB, putting two's-complement
             // negatives below non-negatives.
             let sign_flip = (col.is_signed() as u64) << (cs * 8 - 1);
-            // Exact-width: `get_col_ptr` returns exactly `cs` bytes, where the
-            // width form's `bytes[..cs]` bound is an out-of-line call at
-            // `opt-level=0`, twice per comparison.
+            // `get_col_ptr` returns exactly `cs` bytes.
             let av = read_unsigned_exact(a.get_col_ptr(ra, payload_col, cs)) ^ sign_flip;
             let bv = read_unsigned_exact(b.get_col_ptr(rb, payload_col, cs)) ^ sign_flip;
             let ord = av.cmp(&bv);

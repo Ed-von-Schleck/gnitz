@@ -11,7 +11,7 @@ use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, 
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ColumnLocator, SchemaDescriptor, SchemaFacts, DELTA_TICK_COL};
 use gnitz_expr::RowSource;
-use gnitz_wire::{read_i64_le, read_u64_le, TypeCode};
+use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le, TypeCode};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
 #[inline(always)]
@@ -517,7 +517,7 @@ impl Batch {
     }
     #[inline(always)]
     pub fn get_weight(&self, row: usize) -> i64 {
-        read_i64_le(&self.data[self.offsets[REG_WEIGHT]..], row * FIXED_REGION_BYTES)
+        read_i64_le(&self.data, self.offsets[REG_WEIGHT] + row * FIXED_REGION_BYTES)
     }
     /// Indices of the live rows — those at positive weight, the elements the
     /// batch asserts. Twin of `ZSetBatch::live_rows` in `gnitz-core`.
@@ -547,16 +547,7 @@ impl Batch {
     /// Overwrite every row's weight with `weights`, one per row in row order.
     /// Arbitrary weights can mint ghosts, so the layout claim is dropped.
     pub(crate) fn overwrite_weights(&mut self, weights: &[i64]) {
-        debug_assert_eq!(weights.len(), self.count, "overwrite_weights: one weight per row");
-        for (dst, w) in self
-            .weight_data_mut()
-            .as_chunks_mut::<FIXED_REGION_BYTES>()
-            .0
-            .iter_mut()
-            .zip(weights)
-        {
-            *dst = w.to_le_bytes();
-        }
+        self.weight_data_mut().copy_from_slice(gnitz_wire::as_le_bytes(weights));
         self.downgrade();
     }
     /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
@@ -573,13 +564,13 @@ impl Batch {
     }
     #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(&self.data[self.offsets[REG_NULL_BMP]..], row * FIXED_REGION_BYTES)
+        read_u64_le(&self.data, self.offsets[REG_NULL_BMP] + row * FIXED_REGION_BYTES)
     }
     /// Overwrite `row`'s null-bitmap word (bit N = payload slot N is NULL).
     #[inline]
     fn set_null_word(&mut self, row: usize, word: u64) {
         let off = self.offsets[REG_NULL_BMP] + row * FIXED_REGION_BYTES;
-        self.data[off..off + FIXED_REGION_BYTES].copy_from_slice(&word.to_le_bytes());
+        write_u64_le(&mut self.data, off, word);
     }
     #[inline(always)]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
@@ -1466,7 +1457,7 @@ impl Batch {
     }
 
     /// Reset to empty and return both buffers to the pool, in place. Leaves what
-    /// [`Self::empty_like`] would build, without `take`'s two moves of a 1 KiB
+    /// `Self::empty_like` would build, without `take`'s two moves of a 1 KiB
     /// struct — and returns immediately when the batch is already free, which is
     /// what the VM's per-epoch register clear mostly does (`batch_release_bench`).
     pub fn release_buffers(&mut self) {

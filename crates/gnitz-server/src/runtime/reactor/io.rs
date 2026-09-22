@@ -13,7 +13,7 @@ use super::wake_queue::WakeQueue;
 
 /// A new connection's frame ceiling, until [`ClientConn::mark_established`] raises
 /// it: an unauthenticated first frame sizes no allocation past a HELLO.
-const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
+const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN;
 
 /// Lower/upper bounds on the global inbound-memory cap (see
 /// [`resolve_inbound_cap`]). The floor guarantees even a tiny memory budget

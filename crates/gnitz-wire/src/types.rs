@@ -418,9 +418,6 @@ impl core::fmt::Display for ColType {
 ///
 /// In `gnitz-wire` because the client-side comparators are held to the same
 /// order as the engine's.
-///
-/// `#[inline(always)]`: one payload comparison of a sort, monomorphised into
-/// crates that build at opt-level 0, where a plain hint inlines nothing.
 #[inline(always)]
 pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: TypeCode) -> Ordering {
     // Deliberately not `debug_assert_eq!`: that takes both lengths by reference
@@ -570,7 +567,7 @@ pub enum PkRule {
     NotEligible { col: u32, type_code: TypeCode },
     /// The PK region carries no null bitmap, so a NULL has nowhere to live.
     Nullable { col: u32 },
-    /// The packed PK region must fit [`MAX_PK_BYTES`].
+    /// The packed PK region must fit [`crate::MAX_PK_BYTES`].
     StrideOutOfRange { stride: usize },
 }
 
@@ -578,7 +575,7 @@ pub enum PkRule {
 /// rules are equally a secondary index's column-list rules, so only the noun
 /// differs. Not a `&str`, which a call site could spell wrong unnoticed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkListRole {
+pub(crate) enum PkListRole {
     PrimaryKey,
     ColumnList,
 }
@@ -595,7 +592,7 @@ impl PkListRole {
 
 impl PkRule {
     /// This rule's message, worded for the list it is about.
-    pub fn for_role(&self, role: PkListRole) -> String {
+    pub(crate) fn for_role(&self, role: PkListRole) -> String {
         let what = role.noun();
         match *self {
             PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
@@ -709,6 +706,7 @@ pub enum FixedInt {
 impl FixedInt {
     /// Exhaustive over `TypeCode` (no `_` arm): a new `TypeCode` variant is a
     /// compile error here until someone decides whether it is a narrow integer.
+    #[inline(always)]
     pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
         match tc {
             TypeCode::U8 => Some(Self::U8),
@@ -747,10 +745,6 @@ impl FixedInt {
     }
 
     /// Byte width (1/2/4/8).
-    ///
-    /// `#[inline(always)]`: a `const fn` returning one of four constants, on the
-    /// evaluator's per-instruction PK-load path. Without the attribute it is an
-    /// out-of-line cross-crate call at `-O0` — the profile the E2E suite runs.
     #[inline(always)]
     pub const fn width(self) -> usize {
         match self {
@@ -801,9 +795,7 @@ impl FixedInt {
         }
     }
 
-    /// Whether this integer type is signed. The order-preserving encoders flip
-    /// the top bit for these, so two's-complement negatives sort below
-    /// non-negatives; [`ScalarKind::order_inverse`] flips it back.
+    /// Whether this integer type is signed.
     #[inline(always)]
     pub const fn is_signed(self) -> bool {
         matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
@@ -840,23 +832,13 @@ pub enum ScalarKind {
 }
 
 impl ScalarKind {
-    /// Exhaustive over `TypeCode` (no `_` arm), so a new variant is a compile
-    /// error here until someone decides whether it has a scalar image.
+    /// A narrow integer's [`FixedInt`], else a float's own kind.
     pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
-        match tc {
-            TypeCode::F32 => Some(Self::F32),
-            TypeCode::F64 => Some(Self::F64),
-            TypeCode::U8 => Some(Self::Int(FixedInt::U8)),
-            TypeCode::I8 => Some(Self::Int(FixedInt::I8)),
-            TypeCode::U16 => Some(Self::Int(FixedInt::U16)),
-            TypeCode::I16 => Some(Self::Int(FixedInt::I16)),
-            TypeCode::U32 => Some(Self::Int(FixedInt::U32)),
-            TypeCode::I32 => Some(Self::Int(FixedInt::I32)),
-            TypeCode::U64 => Some(Self::Int(FixedInt::U64)),
-            TypeCode::I64 => Some(Self::Int(FixedInt::I64)),
-            TypeCode::Date => Some(Self::Int(FixedInt::I32)),
-            TypeCode::Timestamp | TypeCode::Decimal => Some(Self::Int(FixedInt::I64)),
-            TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => None,
+        match (tc, FixedInt::from_type_code(tc)) {
+            (_, Some(fi)) => Some(Self::Int(fi)),
+            (TypeCode::F32, None) => Some(Self::F32),
+            (TypeCode::F64, None) => Some(Self::F64),
+            _ => None,
         }
     }
 
@@ -864,113 +846,11 @@ impl ScalarKind {
     pub const fn is_float(self) -> bool {
         matches!(self, Self::F32 | Self::F64)
     }
-
-    /// Inverse of `ColumnLocator::order_bits`: the value's own little-endian bits
-    /// back out of the order image — IEEE bits at the source's own width for a
-    /// float, the sign- or zero-extended integer otherwise.
-    #[inline(always)]
-    pub fn order_inverse(self, e: u64) -> u64 {
-        match self {
-            // The forward direction xors the same bit, so signed round-trips and
-            // unsigned is the identity.
-            Self::Int(fi) => e ^ ((fi.is_signed() as u64) << 63),
-            Self::F32 => ieee_order_bits_f32_reverse(e) as u64,
-            Self::F64 => ieee_order_bits_reverse(e),
-        }
-    }
 }
 
-/// The column types outside [`ScalarKind`] that MIN/MAX still select over: the
-/// 16-byte integers and the German-string pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WideKind {
-    Fixed(TypeCode),
-    Bytes,
-}
-
-/// How a column's value is held and ordered: as its [`ScalarKind`] register
-/// image, or as the native bytes of a [`WideKind`] value too wide for one.
-/// Every type has exactly one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageKind {
-    Scalar(ScalarKind),
-    Wide(WideKind),
-}
-
-impl ImageKind {
-    pub const fn of(tc: TypeCode) -> Self {
-        match ScalarKind::from_type_code(tc) {
-            Some(kind) => Self::Scalar(kind),
-            None if tc.is_german_string() => Self::Wide(WideKind::Bytes),
-            None => Self::Wide(WideKind::Fixed(tc)),
-        }
-    }
-}
-
-impl WideKind {
-    /// Order two values by their **native** bytes — a string's content, already
-    /// resolved out of its blob heap, not its 16-byte cell.
-    #[inline(always)]
-    pub fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
-        match self {
-            Self::Fixed(tc) => cmp_col_window(a, &[], b, &[], tc),
-            Self::Bytes => a.cmp(b),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Order-preserving float image: `ColumnLocator::order_bits` encodes a float
-// through the forward half, `ScalarKind::order_inverse` undoes it with the reverse.
-// ---------------------------------------------------------------------------
-
-/// IEEE 754 order-preserving encoding of an `f64`'s raw bits: negatives invert
-/// wholly, non-negatives flip the sign bit, so plain unsigned order over the
-/// result is `total_cmp` order.
-#[inline(always)]
-pub fn ieee_order_bits(raw_bits: u64) -> u64 {
-    if raw_bits >> 63 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u64 << 63)
-    }
-}
-
-/// [`ieee_order_bits`] for 32-bit floats, returning u64. Checks the F32 sign bit
-/// (bit 31), not bit 63.
-#[inline(always)]
-pub fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u32 << 31)
-    }) as u64
-}
-
-/// Reverse of [`ieee_order_bits`].
-#[inline(always)]
-fn ieee_order_bits_reverse(encoded: u64) -> u64 {
-    if encoded >> 63 != 0 {
-        encoded ^ (1u64 << 63)
-    } else {
-        !encoded
-    }
-}
-
-/// Reverse of [`ieee_order_bits_f32`].
-#[inline(always)]
-fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
-    let e = encoded as u32;
-    if e >> 31 != 0 {
-        e ^ (1u32 << 31)
-    } else {
-        !e
-    }
-}
-
-// `ScalarKind` and `FixedInt` each spell their own exhaustive `TypeCode` match,
-// so a new variant must be classified in both — this holds their answers equal
-// rather than leaving it to whoever adds one.
+// A new `TypeCode` is classified by `FixedInt::from_type_code`'s exhaustive
+// match; these hold the scalar/wide split and `FixedInt`'s width and sign
+// tables to the type's own.
 const _: () = {
     let mut i = 0;
     while i < TypeCode::ALL.len() {
@@ -991,29 +871,19 @@ const _: () = {
             tc.is_signed_int() == tc.storage_type().is_signed_int(),
             "a type must have its storage type's sign"
         );
-        match FixedInt::from_type_code(tc) {
-            Some(fi) => {
-                assert!(matches!(kind, Some(ScalarKind::Int(_))), "a FixedInt has an Int image");
-                assert!(
-                    fi.type_code().as_wire() == tc.storage_type().as_wire(),
-                    "FixedInt::type_code must invert from_type_code up to the storage type"
-                );
-                assert!(
-                    fi.is_signed() == tc.is_signed_int(),
-                    "FixedInt::is_signed must match the type's sign"
-                );
-                // `FixedInt::width` restates the table `wire_stride` owns, and
-                // `encode_pk_column` dispatches on the destination slice's
-                // length — so a typo writes the wrong width silently in release.
-                assert!(
-                    fi.width() == tc.wire_stride(),
-                    "FixedInt::width must be the type's wire stride"
-                );
-            }
-            None => assert!(
-                kind.is_some() == tc.is_float(),
-                "a non-FixedInt has a scalar image iff it is a float"
-            ),
+        if let Some(fi) = FixedInt::from_type_code(tc) {
+            assert!(
+                fi.type_code().as_wire() == tc.storage_type().as_wire(),
+                "FixedInt::type_code must invert from_type_code up to the storage type"
+            );
+            assert!(
+                fi.is_signed() == tc.is_signed_int(),
+                "FixedInt::is_signed must match the type's sign"
+            );
+            assert!(
+                fi.width() == tc.wire_stride(),
+                "FixedInt::width must be the type's wire stride"
+            );
         }
         i += 1;
     }

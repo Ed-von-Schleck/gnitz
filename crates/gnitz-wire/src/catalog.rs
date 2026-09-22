@@ -170,7 +170,7 @@ pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[
 // without the `params` codec. `input_0`/`input_1` are
 // port-indexed, so the column name *is* the port; keeping them out of `params`
 // leaves a parameterless node with no blob cell at all.
-pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
+pub(crate) const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
     col("view_id", TypeCode::U64, false),
     col("node_id", TypeCode::U64, false),
     col("opcode", TypeCode::U64, false),
@@ -930,7 +930,7 @@ impl ViewProps {
     }
 
     /// The `(capacity, delta)` `VIEW_TAB` words.
-    pub fn row_words(self) -> (u64, u64) {
+    pub(crate) fn row_words(self) -> (u64, u64) {
         (self.capacity_bytes().unwrap_or(0), self.delta_bytes().unwrap_or(0))
     }
 

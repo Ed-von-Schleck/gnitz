@@ -86,7 +86,7 @@ const _: () = assert!(
 // `arm_waitv` builds a `futex_waitv` word list of `num_workers` entries. The
 // kernel's `FUTEX_WAITV_MAX` is 128; past it the wait fails with EINVAL. Make a
 // `MAX_WORKERS` bump that outgrows it a build error.
-const _: () = assert!(gnitz_wire::MAX_WORKERS <= 128);
+const _: () = assert!(super::sal::MAX_WORKERS <= 128);
 
 /// Bytes of the 8-byte slot prefix that carry the client's frame length prefix.
 const SLOT_LEN_PREFIX_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;

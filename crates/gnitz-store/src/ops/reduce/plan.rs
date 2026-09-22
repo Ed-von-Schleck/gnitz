@@ -143,7 +143,7 @@ impl ReducePlan {
         self.shape.acc_template.iter().any(Accumulator::sums_float)
     }
 
-    /// `Err` for a shape [`ReduceShape`] refuses, a ground row over a group set,
+    /// `Err` for a shape `ReduceShape` refuses, a ground row over a group set,
     /// and a reduce without a COUNT(*).
     pub fn from_wire(
         input_schema: &SchemaDescriptor,

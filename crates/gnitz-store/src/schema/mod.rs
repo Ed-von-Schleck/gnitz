@@ -88,6 +88,10 @@ pub(crate) mod payload_order;
 /// schemas, so call sites keep naming `crate::schema::IndexKeySpec`.
 pub use key::IndexKeySpec;
 
+mod route;
+pub(crate) use route::worker_for_key;
+pub use route::{ground_owner, worker_for_pk_bytes};
+
 /// Which fixed bound a [`DerivedSchema`] push hit. Callers prefix it with what
 /// they were building.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -610,7 +614,7 @@ impl SchemaDescriptor {
     /// directly (their key is the whole region, never a table prefix).
     #[inline]
     pub fn worker_for_pk(&self, key: &[u8], num_workers: usize) -> usize {
-        gnitz_wire::worker_for_pk_bytes(&key[..self.dist_stride()], num_workers)
+        worker_for_pk_bytes(&key[..self.dist_stride()], num_workers)
     }
 
     /// Where this relation's rows live — the one value every placement decision

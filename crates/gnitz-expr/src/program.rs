@@ -1120,7 +1120,7 @@ impl LogicalInstr {
     }
 
     /// Serialise to the wire instruction `[op, selector, a1, a2, a3]`, the exact
-    /// inverse of [`LogicalProgram::decode_instr`] — the two are the only
+    /// inverse of `LogicalProgram::decode_instr` — the two are the only
     /// statements of the word layout, held together by the round-trip test.
     /// Unused words are 0, matching what the decoder ignores.
     pub fn to_wire(self) -> [u32; INSTR_WORDS] {
@@ -1291,7 +1291,7 @@ pub struct LogicalProgram {
 impl LogicalProgram {
     /// Build from typed instructions. The compiler and test builders trust their
     /// own construction, so a structural failure here is a compiler bug, not
-    /// client input — [`Self::from_instrs`] panics rather than returns.
+    /// client input — `Self::from_instrs` panics rather than returns.
     pub fn new(instrs: Vec<LogicalInstr>, output: Output, const_strings: Vec<Vec<u8>>) -> Self {
         Self::from_instrs(instrs, output, const_strings)
             .unwrap_or_else(|e| panic!("compiler-built LogicalProgram is invalid: {e:?}"))
@@ -2515,12 +2515,9 @@ fn int_set_len_ok(len: usize) -> bool {
 
 fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
     debug_assert!(int_set_len_ok(bytes.len()), "construction rejects a misaligned pool");
-    bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| i64::from_le_bytes(*c))
-        .collect()
+    let mut v = Vec::new();
+    gnitz_wire::extend_from_le_bytes(&mut v, bytes);
+    v
 }
 
 // ---------------------------------------------------------------------------

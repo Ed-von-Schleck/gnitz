@@ -15,11 +15,10 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::runtime::sal::WorkerSet;
+use crate::runtime::sal::{WorkerSet, MAX_WORKERS};
 use crate::runtime::wire::DecodedWire;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
-use gnitz_wire::MAX_WORKERS;
 
 /// Per-view accumulator for exchange frames, keyed by `(view_id, source_id)`.
 ///

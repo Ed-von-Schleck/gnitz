@@ -65,8 +65,8 @@ fn two_value_image(src: &[u8]) -> Option<Vec<u8>> {
         match &mut second {
             None => {
                 let mut image = vec![0u8; two_value_image_len(n)];
-                image[..8].copy_from_slice(&first.to_le_bytes());
-                image[8..TWO_VALUE_HEADER].copy_from_slice(&v.to_le_bytes());
+                write_u64_le(&mut image, 0, first as u64);
+                write_u64_le(&mut image, 8, v as u64);
                 two_value_set_bit(&mut image[TWO_VALUE_HEADER..], i);
                 second = Some((v, image));
             }
@@ -133,10 +133,10 @@ fn for_image_of<const W: usize, const SIGNED: bool>(src: &[u8]) -> Option<Vec<u8
         return None;
     }
     let mut image = vec![0u8; for_image_len(n, bw) + (8 - bw)];
-    image[..FOR_HEADER].copy_from_slice(&reference.to_le_bytes());
+    write_u64_le(&mut image, 0, reference);
     for (row, cell) in cells.iter().enumerate() {
         let at = FOR_HEADER + row * bw;
-        image[at..at + 8].copy_from_slice(&widen(cell).wrapping_sub(reference).to_le_bytes());
+        write_u64_le(&mut image, at, widen(cell).wrapping_sub(reference));
     }
     image.truncate(for_image_len(n, bw));
     Some(image)

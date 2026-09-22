@@ -315,7 +315,7 @@ fn owns_ground(ctx: &EmitCtx, nid: NodeId) -> Result<bool, String> {
         }
         _ if ctx.self_contained => Ok(true),
         gnitz_wire::OpNode::ExchangeShard { .. } => {
-            Ok(slot.rank as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), slot.of as usize))
+            Ok(slot.rank as usize == gnitz_store::schema::ground_owner(slot.of as usize))
         }
         _ => Err("reduce: a global aggregate over a partitioned input with no exchange".into()),
     }

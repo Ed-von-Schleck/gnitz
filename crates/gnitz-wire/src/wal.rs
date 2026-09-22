@@ -15,7 +15,7 @@ pub const WAL_HEADER_SIZE: usize = 20;
 
 /// Bumped by hand for a block-layout change or a change to any payload the client and
 /// the engine both decode.
-pub const WAL_EPOCH: u32 = 27;
+pub(crate) const WAL_EPOCH: u32 = 27;
 
 /// WAL/SAL block format version, and the client↔server HELLO version — the
 /// only thing that rejects a stale SAL frame or an old client's catalog write.
@@ -25,7 +25,7 @@ pub const WAL_FORMAT_VERSION: u32 = WAL_EPOCH ^ ((SYS_SCHEMA_DIGEST ^ (SYS_SCHEM
 pub const WAL_OFF_TID: usize = 0;
 pub const WAL_OFF_COUNT: usize = 4;
 /// Total block size: header, directory and every region.
-pub const WAL_OFF_SIZE: usize = 8;
+pub(crate) const WAL_OFF_SIZE: usize = 8;
 pub const WAL_OFF_VERSION: usize = 12;
 pub const WAL_OFF_NUM_REGIONS: usize = 16;
 

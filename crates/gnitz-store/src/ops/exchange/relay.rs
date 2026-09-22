@@ -29,7 +29,7 @@ fn worker_rows_to_batches(
 /// across the sources, restricted to each worker's routing slice. A slice
 /// claims `Consolidated` iff every source did.
 ///
-/// Refused when `spec` does not route against `schema` — see [`ScatterKey::new`],
+/// Refused when `spec` does not route against `schema` — see `ScatterKey::new`,
 /// which owns the reason.
 pub fn op_relay_scatter(
     sources: &[&Batch],

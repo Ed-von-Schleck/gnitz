@@ -1,10 +1,9 @@
 //! The reduce output row emitter.
 
+use super::super::order_image::WideKind;
+use super::agg::{Accumulator, AggValue};
 use crate::schema::ColumnLocator;
 use crate::storage::{Batch, MemBatch};
-use gnitz_wire::WideKind;
-
-use super::agg::{Accumulator, AggValue};
 
 /// Emit one aggregate column: the value truncated to the column width, or NULL.
 #[inline]

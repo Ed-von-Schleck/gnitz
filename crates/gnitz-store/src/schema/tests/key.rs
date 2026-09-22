@@ -1067,8 +1067,8 @@ fn test_reindex_packer_copartition_contract() {
         // Trace side (stored _join_pk) == scatter side (scratch buffer).
         assert_eq!(out.get_pk_bytes(row), &buf[..packer.out_stride], "row {row} key bytes");
         assert_eq!(
-            gnitz_wire::worker_for_pk_bytes(out.get_pk_bytes(row), NW),
-            gnitz_wire::worker_for_pk_bytes(&buf[..packer.out_stride], NW),
+            crate::schema::worker_for_pk_bytes(out.get_pk_bytes(row), NW),
+            crate::schema::worker_for_pk_bytes(&buf[..packer.out_stride], NW),
             "row {row} co-partition",
         );
     }
@@ -1145,9 +1145,9 @@ fn test_reindex_packer_copartition_contract_wide() {
 
     // (2) CO-PARTITION teeth: producer and consumer route to the same worker
     // through the WIDE arm of worker_for_pk_bytes.
-    let p_consumer = gnitz_wire::worker_for_pk_bytes(consumer, NW);
-    let p_producer = gnitz_wire::worker_for_pk_bytes(producer, NW);
-    let p_oracle = gnitz_wire::worker_for_pk_bytes(oracle.as_slice(), NW);
+    let p_consumer = crate::schema::worker_for_pk_bytes(consumer, NW);
+    let p_producer = crate::schema::worker_for_pk_bytes(producer, NW);
+    let p_oracle = crate::schema::worker_for_pk_bytes(oracle.as_slice(), NW);
     assert_eq!(p_producer, p_consumer, "producer/consumer co-partition (wide)");
     assert_eq!(p_consumer, p_oracle, "trace store / ingest co-partition (wide)");
 

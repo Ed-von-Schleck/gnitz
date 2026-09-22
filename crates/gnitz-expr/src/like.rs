@@ -13,8 +13,8 @@ use crate::search::{find_lit, lit_eq};
 pub(crate) const ANY_MANY: u8 = 0xFF;
 pub(crate) const ANY_ONE: u8 = 0xFE;
 
-/// A LIKE pattern as a program carries it: bytes where [`ANY_MANY`] is `%`,
-/// [`ANY_ONE`] is `_`, and every other byte is a literal. Neither byte occurs in
+/// A LIKE pattern as a program carries it: bytes where `ANY_MANY` is `%`,
+/// `ANY_ONE` is `_`, and every other byte is a literal. Neither byte occurs in
 /// UTF-8 text, so the encoding needs no escape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LikePattern(Vec<u8>);

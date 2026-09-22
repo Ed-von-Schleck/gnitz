@@ -23,7 +23,7 @@ use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io;
 use gnitz_wire::control::frame_head_size;
 use gnitz_wire::{low_bits_mask, read_u32_le, read_u64_le, write_u32_le, write_u64_le, BitIter};
-use gnitz_wire::{WireFault, WireStatus, MAX_WORKERS};
+use gnitz_wire::{WireFault, WireStatus};
 
 /// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
 /// groups publishing and its closing member. The tag (`"ddl"` / `"commit"`)
@@ -129,6 +129,9 @@ fn group_total_size(slots: usize, sizes: impl Iterator<Item = u32>) -> usize {
 fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = u32> + '_ {
     dir.as_chunks::<DIR_ENTRY_BYTES>().0.iter().map(|c| read_u32_le(c, 0))
 }
+
+/// The most workers a cluster runs: [`WorkerSet`] holds one bit per worker.
+pub(crate) const MAX_WORKERS: usize = 64;
 
 /// A subset of the workers. `ALL` is unbounded; every other set holds only
 /// launched workers.
@@ -1124,10 +1127,7 @@ impl SalWriter {
                 flags,
                 request_id,
                 &sizes[..nw],
-                |w, slot| {
-                    let written = g.msg(w).encode(slot);
-                    debug_assert_eq!(written, slot.len());
-                },
+                |w, slot| g.msg(w).encode(slot),
             )
             .map_err(|fit| fit.refusal(g.kind))?;
         self.reached.set(self.reached.get() | g.targets.set().0);

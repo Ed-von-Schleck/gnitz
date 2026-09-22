@@ -6,9 +6,11 @@ use std::ops::Range;
 use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::MemBatch;
 use gnitz_expr::RowSource;
-use gnitz_wire::{AggFunc, FixedInt, ImageKind, ScalarKind, WideKind};
+use gnitz_wire::{AggFunc, FixedInt, ScalarKind};
 
-use super::super::order_image::{scalar_image, scalar_native_of_image, wide_native, wide_native_of_image};
+use super::super::order_image::{
+    scalar_image, scalar_native_of_image, wide_native, wide_native_of_image, ImageKind, WideKind,
+};
 
 /// The value-index parameters of one MIN/MAX aggregate: the column the index
 /// reads, how to encode it, and which end of the order the index puts first.
@@ -333,10 +335,12 @@ fn fold_col<const N: usize, T>(
     let (slot, Range { start, end }) = (slot as usize, rows);
     let weights = mb.weight()[start * 8..end * 8].as_chunks::<8>().0;
     let nulls = mb.null_bmp()[start * 8..end * 8].as_chunks::<8>().0;
-    let rows = weights
-        .iter()
-        .zip(nulls)
-        .map(|(w, nw)| (i64::from_le_bytes(*w), (u64::from_le_bytes(*nw) >> slot) & 1 == 1));
+    let rows = weights.iter().zip(nulls).map(|(w, nw)| {
+        (
+            i64::from_le_bytes(*w),
+            gnitz_wire::null_word_get(u64::from_le_bytes(*nw), slot),
+        )
+    });
     if N == 0 {
         return rows.fold(init, |a, (w, null)| f(a, [0; N], w, null));
     }

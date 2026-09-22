@@ -201,11 +201,11 @@ impl ReadSpec {
 
         match &self.sink.map {
             Some(m) => {
-                w.u8(1);
+                w.bool(true);
                 write_compute_map(&mut w, &m.out_cols, &m.program);
             }
             None => {
-                w.u8(0);
+                w.bool(false);
             }
         }
 

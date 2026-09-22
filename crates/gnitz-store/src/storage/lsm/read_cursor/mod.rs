@@ -218,7 +218,7 @@ impl ReadCursor {
     /// width and signedness — the search and the tree both order by the raw OPK
     /// bytes.
     ///
-    /// [`Self::advance_to`] lands identically and is never slower, so prefer it;
+    /// `Self::advance_to` lands identically and is never slower, so prefer it;
     /// this one's landing owes nothing to where the cursor stood, which is what
     /// makes it the tests' and benches' independent oracle.
     pub fn seek_bytes(&mut self, key: &[u8]) {
@@ -318,7 +318,7 @@ impl ReadCursor {
     /// emits ascending, and a group that folded to net zero folds to zero again.
     ///
     /// Keys must strictly increase until something repositions the cursor, which
-    /// [`Self::note_sweep_key`] enforces.
+    /// `Self::note_sweep_key` enforces.
     pub fn seek_pk_group_ascending(&mut self, key: &[u8]) -> bool {
         if !self.note_sweep_key(key) {
             self.reposition_to(key);

@@ -33,6 +33,7 @@ use orchestration::{committer, executor, lsn, master, peer, worker};
 use protocol::{sal, w2m, wire};
 
 pub(crate) use bootstrap::server_main;
+pub(crate) use sal::MAX_WORKERS;
 pub(crate) use tls::TlsCli;
 
 #[cfg(test)]

@@ -138,7 +138,7 @@ fn make_acc(in_schema: &SchemaDescriptor, group_cols: &[u32], desc: AggDescripto
 }
 
 /// The AVI value image of an I64 aggregate value, spelled out rather than taken
-/// from the code under test: `ColumnLocator::order_bits`' signed-integer half is
+/// from the code under test: `order_bits`' signed-integer half is
 /// the sign-bit flip that puts two's-complement negatives below non-negatives.
 fn i64_av(v: i64) -> u64 {
     (v as u64) ^ (1u64 << 63)
@@ -3742,7 +3742,7 @@ fn avi_f32_seed_renders_f32_bits() {
     let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     for v in [1.5f32, -2.25, 0.0, -0.0, 1.0e30] {
         let mut acc = make_acc(&in_schema, &[0], desc);
-        acc.seed_from_index(&gnitz_wire::ieee_order_bits_f32(v.to_bits()).to_be_bytes());
+        acc.seed_from_index(&crate::ops::order_image::ieee_order_bits_f32(v.to_bits()).to_be_bytes());
         assert_eq!(
             acc.value_bits(),
             v.to_bits() as u64,

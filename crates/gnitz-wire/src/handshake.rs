@@ -24,33 +24,25 @@ pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
 // ---------------------------------------------------------------------------
 // HELLO handshake
 //
-// Both payloads carry the standard 4-byte LE u32 length prefix, and that prefix
-// alone discriminates them from a control block, which is far larger; the magic
-// stays as defence-in-depth. The ACK carries no status — it *is* the success
-// reply, and a version/auth failure is a `WireStatus::Error` control block instead.
-// The `*_OFF_*` constants below ARE the field layout: encoder and decoder both
-// address through them, so neither can drift from the other.
+// A payload's length alone tells HELLO and ACK apart from a control block. The
+// ACK is the success reply; a refusal is a `WireStatus::Error` control block.
 // ---------------------------------------------------------------------------
 
-/// Magic value carried in HELLO and ACK frames. ASCII "GNTZ" interpreted
-/// as a little-endian u32. Defence-in-depth on top of the length-prefix
-/// discriminant; a peer sending a control block first cannot collide because
-/// such a block is far larger than the 8/12-byte HELLO/ACK frames.
-pub const HELLO_MAGIC: u32 = u32::from_le_bytes(*b"GNTZ");
+/// Magic carried in HELLO and ACK payloads: ASCII "GNTZ" as a little-endian u32.
+pub(crate) const HELLO_MAGIC: u32 = u32::from_le_bytes(*b"GNTZ");
 
 /// ALPN protocol both sides of the TLS transport pin; a mismatch fails the
-/// handshake. One definition — a silent client/engine drift would brick
-/// every TLS connect.
+/// handshake.
 pub const ALPN_GNITZ: &[u8] = b"gnitz/1";
 
 /// HELLO payload length in bytes (excluding the 4-byte length prefix).
-pub const HELLO_PAYLOAD_LEN: u32 = 8;
+pub const HELLO_PAYLOAD_LEN: usize = 8;
 
 /// ACK payload length in bytes (excluding the 4-byte length prefix).
-pub const HELLO_ACK_PAYLOAD_LEN: u32 = 12;
+pub const HELLO_ACK_PAYLOAD_LEN: usize = 12;
 
 /// Total wire size of an ACK frame (length prefix + payload).
-pub(crate) const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
+pub(crate) const HELLO_ACK_FRAME_SIZE: usize = FRAME_LEN_PREFIX_BYTES + HELLO_ACK_PAYLOAD_LEN;
 
 /// HELLO payload fields.
 const HELLO_OFF_MAGIC: usize = 0;
@@ -59,30 +51,23 @@ const HELLO_OFF_VERSION: usize = 4;
 /// Build a HELLO payload (the bytes after the length prefix). Every sender
 /// frames it through its transport's standard framed send, which derives
 /// the identical 4-byte prefix.
-pub fn encode_hello_payload(version: u32) -> [u8; HELLO_PAYLOAD_LEN as usize] {
-    let mut out = [0u8; HELLO_PAYLOAD_LEN as usize];
+pub fn encode_hello_payload(version: u32) -> [u8; HELLO_PAYLOAD_LEN] {
+    let mut out = [0u8; HELLO_PAYLOAD_LEN];
     crate::write_u32_le(&mut out, HELLO_OFF_MAGIC, HELLO_MAGIC);
     crate::write_u32_le(&mut out, HELLO_OFF_VERSION, version);
     out
 }
 
-/// Parsed HELLO payload (the 8 bytes following the length prefix).
-#[derive(Debug, Clone, Copy)]
-pub struct HelloHeader {
-    pub magic: u32,
-    pub version: u32,
-}
-
-/// Decode a HELLO payload. The caller must have already consumed the
-/// 4-byte length prefix and verified that it equalled `HELLO_PAYLOAD_LEN`.
-pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str> {
-    if payload.len() != HELLO_PAYLOAD_LEN as usize {
+/// Decode a HELLO payload (the bytes following the length prefix) to the
+/// client's protocol version, rejecting a wrong size or magic.
+pub fn decode_hello_payload(payload: &[u8]) -> Result<u32, &'static str> {
+    if payload.len() != HELLO_PAYLOAD_LEN {
         return Err("hello payload wrong size");
     }
-    Ok(HelloHeader {
-        magic: crate::read_u32_le(payload, HELLO_OFF_MAGIC),
-        version: crate::read_u32_le(payload, HELLO_OFF_VERSION),
-    })
+    if crate::read_u32_le(payload, HELLO_OFF_MAGIC) != HELLO_MAGIC {
+        return Err("hello magic mismatch");
+    }
+    Ok(crate::read_u32_le(payload, HELLO_OFF_VERSION))
 }
 
 /// ACK payload fields, relative to the payload (past the length prefix).
@@ -94,31 +79,24 @@ const ACK_OFF_LSN: usize = 4;
 /// client's OCC basis, so a connection needs no separate watermark read.
 pub fn encode_hello_ack(published_lsn: u64) -> [u8; HELLO_ACK_FRAME_SIZE] {
     let mut out = [0u8; HELLO_ACK_FRAME_SIZE];
-    crate::write_u32_le(&mut out, 0, HELLO_ACK_PAYLOAD_LEN);
+    crate::write_u32_le(&mut out, 0, HELLO_ACK_PAYLOAD_LEN as u32);
     let payload = &mut out[FRAME_LEN_PREFIX_BYTES..];
     crate::write_u32_le(payload, ACK_OFF_MAGIC, HELLO_MAGIC);
     crate::write_u64_le(payload, ACK_OFF_LSN, published_lsn);
     out
 }
 
-/// Parsed ACK payload (the 12 bytes following the length prefix).
-#[derive(Debug, Clone, Copy)]
-pub struct HelloAck {
-    pub magic: u32,
-    /// Server durability watermark at connect — the client's initial OCC basis.
-    pub published_lsn: u64,
-}
-
-/// Decode an ACK payload. The caller must have already consumed the
-/// 4-byte length prefix and verified that it equalled `HELLO_ACK_PAYLOAD_LEN`.
-pub fn decode_hello_ack(payload: &[u8]) -> Result<HelloAck, &'static str> {
-    if payload.len() != HELLO_ACK_PAYLOAD_LEN as usize {
+/// Decode an ACK payload (the bytes following the length prefix) to the
+/// server's durability watermark at connect — the client's initial OCC basis —
+/// rejecting a wrong size or magic.
+pub fn decode_hello_ack(payload: &[u8]) -> Result<u64, &'static str> {
+    if payload.len() != HELLO_ACK_PAYLOAD_LEN {
         return Err("hello ack payload wrong size");
     }
-    Ok(HelloAck {
-        magic: crate::read_u32_le(payload, ACK_OFF_MAGIC),
-        published_lsn: crate::read_u64_le(payload, ACK_OFF_LSN),
-    })
+    if crate::read_u32_le(payload, ACK_OFF_MAGIC) != HELLO_MAGIC {
+        return Err("hello magic mismatch");
+    }
+    Ok(crate::read_u64_le(payload, ACK_OFF_LSN))
 }
 
 #[cfg(test)]

@@ -144,15 +144,12 @@ impl Batch {
         let mut cost = 0;
         for pi in gnitz_wire::BitIter(slots) {
             let cell = self.get_col_ptr(row, pi, 16);
-            let length = gnitz_wire::read_u32_le(cell, 0) as usize;
-            if length <= gnitz_wire::SHORT_STRING_THRESHOLD {
-                continue;
-            }
             let Some(span) = gnitz_wire::german_string_heap(cell, self.blob.len()) else {
                 continue;
             };
-            if seen.insert(blob_span_key(&self.blob, span.start, length), 0).is_none() {
-                cost += span.len();
+            let len = span.end - span.start;
+            if seen.insert(blob_span_key(&self.blob, span.start, len), 0).is_none() {
+                cost += len;
             }
         }
         cost
@@ -258,7 +255,7 @@ impl Batch {
     ///
     /// The refusal lands on the borrowed view, so a corrupt block costs neither
     /// the region copy nor the heap copy `from_mem_batch` would pay. `out_schema`
-    /// is what the rows land in — see [`Batch::from_mem_batch`] for what the two
+    /// is what the rows land in — see `Batch::from_mem_batch` for what the two
     /// schemas may differ in; a reader that wants the block as it stands passes
     /// `in_schema` twice.
     pub fn decode_foreign_wal_block(

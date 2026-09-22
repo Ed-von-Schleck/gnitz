@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use gnitz_core::{ColumnDef, Schema, ZSetBatch};
 use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
-use gnitz_wire::AggFunc as WireAggFunc;
+use gnitz_wire::{read_u64_le, write_u64_le, AggFunc as WireAggFunc};
 use rustc_hash::FxHashMap;
 
 use crate::agg::group_pk_def;
@@ -141,16 +141,13 @@ fn merge_cell(b: &mut ZSetBatch, first: usize, row: usize, pi: usize, wins: Opti
         // 8-byte cells: F64, or the sum mod 2^64, wrapping as the engine accumulator does.
         None => {
             let col = &mut b.payload[pi].bytes;
-            let cell = |r: usize| <[u8; 8]>::try_from(&col[r * 8..(r + 1) * 8]).unwrap();
-            let (acc, add) = (cell(first), cell(row));
+            let (acc, add) = (read_u64_le(col, first * 8), read_u64_le(col, row * 8));
             let sum = if loc.type_code().is_float() {
-                (f64::from_le_bytes(acc) + f64::from_le_bytes(add)).to_le_bytes()
+                (f64::from_bits(acc) + f64::from_bits(add)).to_bits()
             } else {
-                i64::from_le_bytes(acc)
-                    .wrapping_add(i64::from_le_bytes(add))
-                    .to_le_bytes()
+                acc.wrapping_add(add)
             };
-            col[first * 8..(first + 1) * 8].copy_from_slice(&sum);
+            write_u64_le(col, first * 8, sum);
             false
         }
     };

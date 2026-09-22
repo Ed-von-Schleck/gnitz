@@ -20,7 +20,7 @@ use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, Pk
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
-use gnitz_wire::read_u64_le;
+use gnitz_wire::{read_u64_le, write_u64_le};
 use rustc_hash::FxHashMap;
 
 // ---------------------------------------------------------------------------
@@ -177,24 +177,10 @@ pub(crate) fn should_relocate_blob(src_blob: usize, src_rows: usize, out_rows: u
     src_rows > 0 && src_blob > out_rows.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob / src_rows)
 }
 
-/// Copy a 16-byte German string cell and (for long strings) migrate the
-/// out-of-line payload from `src_blob` into `dst_blob`.
-///
-/// The returned cell is ready to write into the output column buffer and is
-/// always **canonical** (`german_string_cell_ok`): pad bytes past the content
-/// are rebuilt as zero rather than copied through, so a skewed cell that
-/// reached memory some other way cannot propagate a compare-visible pad — the
-/// divergence where two rows hash equal but order unequal and never
-/// consolidate. Short strings resolve entirely inline; `src_blob` is unused.
-///
-/// When `cache` is `Some`, the appended blob data is deduplicated by
-/// `(src_blob.as_ptr(), old_offset, length)` — i.e. the same source span is
-/// only copied once per merge.
-///
-/// **Malformed-input fallback:** a long header declaring a region that overruns
-/// `src_blob` yields the canonical empty string rather than an out-of-bounds
-/// read, keeping trusted in-memory callers panic-free on data that slipped past
-/// validation.
+/// `src_cell` rebased onto `dst_blob`: a short cell with its pad zeroed, a long
+/// one with its content appended to `dst_blob` — once per source span when
+/// `cache` is `Some`. A long cell overrunning `src_blob` becomes the empty
+/// string.
 #[inline]
 pub(crate) fn relocate_german_string_vec(
     src_cell: &[u8],
@@ -202,39 +188,29 @@ pub(crate) fn relocate_german_string_vec(
     dst_blob: &mut Vec<u8>,
     cache: Option<&mut BlobCache>,
 ) -> [u8; 16] {
-    // One bounds check for the whole relocation: every read below is a constant
-    // index into a proven 16-byte cell.
     let src: &[u8; 16] = src_cell[..16]
         .try_into()
         .expect("relocate_german_string_vec: src must be a 16-byte German string cell");
-    if gnitz_wire::read_u32_le(src, 0) as usize <= gnitz_wire::SHORT_STRING_THRESHOLD {
-        return gnitz_wire::canonical_short_cell(src);
+    if let Some(cell) = gnitz_wire::canonical_short_cell(src) {
+        return cell;
     }
     relocate_long_german_string(src, src_blob, dst_blob, cache)
 }
 
-/// The out-of-line half of `relocate_german_string_vec` — kept separate so the
-/// short path stays a branchless inline sequence with no call and no frame.
-///
-/// Deliberately reads the cell layout directly rather than through
-/// `gnitz_wire::german_string_inline` / `german_string_heap`: that split is what
-/// keeps the short arm branchless, and this runs per row on every compaction, so
-/// re-routing it needs a retired-instruction measurement.
+/// The long arm of `relocate_german_string_vec`, out of line so the short arm
+/// inlines alone.
 fn relocate_long_german_string(
     src: &[u8; 16],
     src_blob: &[u8],
     dst_blob: &mut Vec<u8>,
     cache: Option<&mut BlobCache>,
 ) -> [u8; 16] {
-    let length = gnitz_wire::read_u32_le(src, 0) as usize;
-    let old_offset = gnitz_wire::read_u64_le(src, 8);
     let mut dest = [0u8; 16];
-    let Some(span) = gnitz_wire::blob_extent(src_blob.len(), old_offset, length) else {
-        // Malformed: the all-zero cell is the canonical empty string, and
-        // `dst_blob` is left untouched.
+    let Some(span) = gnitz_wire::german_string_heap(src, src_blob.len()) else {
         return dest;
     };
-    // `length > SHORT_STRING_THRESHOLD ≥ 4`, so all four prefix bytes are content.
+    let length = span.end - span.start;
+    // A long cell's length and prefix carry through; only its offset moves.
     dest[0..8].copy_from_slice(&src[0..8]);
     let new_offset = dst_blob.len();
     let off = match cache {
@@ -250,7 +226,7 @@ fn relocate_long_german_string(
             new_offset
         }
     };
-    dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
+    write_u64_le(&mut dest, 8, off as u64);
     dest
 }
 

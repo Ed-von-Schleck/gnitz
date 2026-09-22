@@ -19,10 +19,10 @@ use crate::schema::key::ReindexPacker;
 use crate::schema::{ColumnLocator, OpBuildErr, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
-use gnitz_wire::{ImageKind, OrderKey};
+use gnitz_wire::OrderKey;
 
 use super::super::group_key::push_group_index_key;
-use super::super::order_image::{append_image, image_slot_col, write_image_slot, IMAGE_COL};
+use super::super::order_image::{append_image, image_slot_col, write_image_slot, ImageKind, IMAGE_COL};
 
 /// One ORDER BY key, resolved against the input: the same `(loc, desc,
 /// nulls_first)` [`OrderLocator`] the read path's comparator reads, plus the

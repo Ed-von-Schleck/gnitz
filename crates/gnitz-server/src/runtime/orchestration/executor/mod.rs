@@ -525,19 +525,13 @@ async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline
 /// Validate a HELLO frame, cork the ACK, and raise the connection to the
 /// established frame ceiling. `false` = refused.
 fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> bool {
-    let Ok(hello) = gnitz_wire::decode_hello_payload(data) else {
+    let Ok(version) = gnitz_wire::decode_hello_payload(data) else {
         return false;
     };
-    if hello.magic != gnitz_wire::HELLO_MAGIC {
-        return false;
-    }
 
     let server_version = gnitz_wire::wal::WAL_FORMAT_VERSION;
-    if hello.version != server_version {
-        let msg = format!(
-            "unsupported wire version: peer={}, server={}",
-            hello.version, server_version,
-        );
+    if version != server_version {
+        let msg = format!("unsupported wire version: peer={version}, server={server_version}");
         send_error(peer, 0, msg.as_bytes());
         return false;
     }
@@ -1818,10 +1812,8 @@ fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
     unsafe {
         out.set_len(total);
     }
-    out[base..base + PFX].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = msg.encode(&mut out[base + PFX..total]);
-    debug_assert_eq!(written, sz);
-    out.truncate(base + PFX + written);
+    gnitz_wire::write_u32_le(out, base, sz as u32);
+    msg.encode(&mut out[base + PFX..total]);
 }
 
 /// Cork `msg` for the client — and the one place a master-authored reply meets

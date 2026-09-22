@@ -7,8 +7,9 @@
 //! into a sort key, carry a width-tagged PK byte buffer, and derive the
 //! half-open key range a `RangeDescriptor`'s cut pair denotes — and compose the
 //! two multi-column OPK keys: a secondary index's leading span
-//! ([`IndexKeySpec`]) and a reindex's synthetic PK ([`ReindexPacker`]). None of
-//! them reaches up into storage — the dependency runs `storage → schema::key`,
+//! ([`IndexKeySpec`]) and a reindex's synthetic PK
+//! ([`ReindexPacker`](crate::schema::key::ReindexPacker)). None of them reaches
+//! up into storage — the dependency runs `storage → schema::key`,
 //! the legitimate downward direction. This module is the one import path: every
 //! caller, storage included, names `crate::schema::key::X`.
 //!
@@ -362,7 +363,7 @@ impl IndexKeyCol {
 /// The single definition of "what key do these columns map to": byte-equal ⟺
 /// value-equal at any width, byte-lexicographic order is the seek/merge order.
 /// Built once per circuit, `Copy`, so the row paths allocate nothing.
-/// [`Self::new`] is a secondary index's span, [`Self::for_pk`] a base table's
+/// [`Self::new`] is a secondary index's span, `Self::for_pk` a base table's
 /// own PK under the identity promotion.
 #[derive(Clone, Copy)]
 pub struct IndexKeySpec {
@@ -376,7 +377,7 @@ pub struct IndexKeySpec {
 
 impl IndexKeySpec {
     /// The span of a secondary index on `cols` of `owner`, and the **one**
-    /// promotion of an indexed column's type — [`Self::output_schema`] reads the
+    /// promotion of an indexed column's type — `Self::output_schema` reads the
     /// promoted columns back off this spec, so the entry bytes and the schema
     /// they land in are one derivation.
     ///
@@ -454,7 +455,7 @@ impl IndexKeySpec {
     }
 
     /// Write one row's leading-key span into `dst[..key_size()]` — the bytes
-    /// [`Self::seek_prefix`] and [`ReindexPacker::pack_into`] produce for the same values.
+    /// [`Self::seek_prefix`] and `ReindexPacker::pack_into` produce for the same values.
     /// `false` when any indexed column is NULL: the row is unindexed, `dst` partly written.
     pub fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
@@ -666,7 +667,7 @@ impl SchemaDescriptor {
     ///
     /// An owner is a hash of `key[..dist_stride]` and so not monotone in key
     /// order, so the range is confined iff every key in it shares that prefix —
-    /// which [`range_shares_prefix`] decides from its first and last keys alone.
+    /// which `range_shares_prefix` decides from its first and last keys alone.
     pub fn confined_worker(&self, range: &RangeDescriptor, num_workers: usize) -> Option<usize> {
         if !self.placement().is_key_routed() {
             return None;

@@ -512,7 +512,7 @@ impl ZSetBatch {
 
     /// Overwrite the 8-byte fixed-width cell at `(row, pi)` with `v`, little-endian.
     pub fn set_u64_cell(&mut self, row: usize, pi: usize, v: u64) {
-        self.payload[pi].bytes[row * 8..(row + 1) * 8].copy_from_slice(&v.to_le_bytes());
+        gnitz_wire::write_u64_le(&mut self.payload[pi].bytes, row * 8, v);
     }
 
     /// An empty batch with every growth stream sized for `n` rows: the PK

@@ -178,9 +178,8 @@ impl<'a> WireMsg<'a> {
         total
     }
 
-    /// Encode into the front of `out`, returning bytes written; panics if `out` is
-    /// shorter than [`size`](WireMsg::size).
-    pub fn encode(&self, out: &mut [u8]) -> usize {
+    /// Encode into `out`, which must be exactly [`size`](WireMsg::size) bytes.
+    pub fn encode(&self, out: &mut [u8]) {
         let has_data = self.has_data();
 
         let wire_flags = WireFlags {
@@ -215,7 +214,7 @@ impl<'a> WireMsg<'a> {
             };
         }
 
-        pos
+        assert_eq!(pos, out.len(), "WireMsg::size and encode disagree");
     }
 }
 

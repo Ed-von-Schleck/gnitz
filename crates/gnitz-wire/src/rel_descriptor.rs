@@ -63,7 +63,7 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         let index_count = u16::try_from(self.indexes.len()).expect("a relation's index count fits a u16");
         let mut w = Writer::with_capacity(1 + 1 + 2 + 16 * self.indexes.len());
-        w.u8(self.class.as_wire()).u8(self.pk_repeats as u8).u16(index_count);
+        w.u8(self.class.as_wire()).bool(self.pk_repeats).u16(index_count);
         for ix in &self.indexes {
             w.u64(crate::pack_pk_cols(ix.cols.as_slice()))
                 .u64(IndexProps { is_unique: ix.is_unique }.pack());

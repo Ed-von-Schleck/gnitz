@@ -188,8 +188,7 @@ fn every_truncation_of_a_frame_is_rejected() {
 
 /// `encode` must write exactly the byte count `size` predicted, for every shape
 /// a slot can take — the relation every caller sizing a SAL slot depends on.
-/// Comparing `size()` against a `Vec` that `size()` itself allocated would
-/// compare it to itself, so the observable here is `encode`'s own return value.
+/// `encode` asserts it, so encoding each shape is the check.
 #[test]
 fn encode_writes_exactly_the_predicted_size() {
     let sd = simple_schema();
@@ -224,10 +223,8 @@ fn encode_writes_exactly_the_predicted_size() {
             ..Default::default()
         },
     ];
-    for (i, msg) in msgs.iter().enumerate() {
-        let sz = msg.size();
-        let mut buf = vec![0u8; sz];
-        assert_eq!(msg.encode(&mut buf), sz, "shape {i}: encode wrote != size()");
+    for msg in &msgs {
+        msg.encode_to_vec();
     }
 }
 
@@ -313,9 +310,7 @@ fn a_range_chunk_frames_identically_to_the_same_rows_whole() {
         data: WireData::of_chunk(&batch, 2, &chunk),
         ..Default::default()
     };
-    let sz = msg.size();
-    let mut buf = vec![0u8; sz];
-    assert_eq!(msg.encode(&mut buf), sz);
+    let buf = msg.encode_to_vec();
 
     // The same rows as a batch of their own, framed the long way round.
     let mut owned = Batch::with_capacity(&sd, 3);
@@ -489,9 +484,7 @@ fn scattered_roundtrips_over_a_padded_schema() {
             data: WireData::Scattered { batch: &batch, indices: &indices },
             ..Default::default()
         };
-        let sz = msg.size();
-        let mut buf = vec![0u8; sz];
-        assert_eq!(msg.encode(&mut buf), sz, "{count} rows: size must size its encode");
+        let buf = msg.encode_to_vec();
 
         let decoded = decode_sal_slot(&buf).expect("a scattered block decodes");
         let got = decoded.data_batch.expect("it carries rows");

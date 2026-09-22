@@ -485,7 +485,7 @@ impl NodeInputs {
     }
 
     /// [`Self::from_slots`]'s inverse.
-    pub fn to_slots(self) -> [Option<u64>; 2] {
+    pub(crate) fn to_slots(self) -> [Option<u64>; 2] {
         match self {
             NodeInputs::Source => [None, None],
             NodeInputs::Unary(src) => [Some(src as u64), None],
@@ -881,7 +881,7 @@ pub(crate) fn read_aggs(r: &mut Reader) -> Result<Vec<AggDescriptor>, String> {
 pub(crate) fn write_compute_map(w: &mut Writer, out_cols: &[(TypeCode, bool)], program: &[u8]) {
     write_count(w, out_cols.len());
     for &(tc, nullable) in out_cols {
-        w.u8(tc.as_wire()).u8(nullable as u8);
+        w.type_code(tc).bool(nullable);
     }
     w.bytes32(program);
 }
@@ -944,14 +944,14 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
         OpNode::Distinct => (Opcode::Distinct, None, None),
         OpNode::PositivePart => (Opcode::PositivePart, None, None),
         OpNode::Reduce { group_cols, agg, global_ground } => {
-            w.u8(*global_ground as u8);
+            w.bool(*global_ground);
             write_cols(&mut w, group_cols);
             write_aggs(&mut w, agg);
             (Opcode::Reduce, None, Some(w.into_vec()))
         }
         // The side flag leads every join's params, so all three opcodes carry one.
         OpNode::Join { kind, delta_is_right } => {
-            w.u8(*delta_is_right as u8);
+            w.bool(*delta_is_right);
             let opcode = match kind {
                 JoinKind::Equi => Opcode::JoinEqui,
                 JoinKind::Range { n_eq, rel } => {
@@ -969,10 +969,10 @@ pub fn encode_op_node(op: &OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             (Opcode::ExchangeShard, None, Some(w.into_vec()))
         }
         OpNode::NullExtend { type_codes, nulls_first } => {
-            w.u8(*nulls_first as u8);
+            w.bool(*nulls_first);
             write_count(&mut w, type_codes.len());
-            for tc in type_codes {
-                w.u8(tc.as_wire());
+            for &tc in type_codes {
+                w.type_code(tc);
             }
             (Opcode::NullExtend, None, Some(w.into_vec()))
         }

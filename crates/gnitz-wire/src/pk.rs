@@ -200,12 +200,8 @@ pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
         4 => u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128,
         2 => u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128,
         1 => pk_bytes[0] as u128,
-        // 9..=15: two overlapping big-endian loads instead of a runtime-length
-        // `copy_from_slice`, which lowers to an out-of-line `memcpy` per key. With
-        // `m = stride - 8`, the low `m` bytes of the tail load are exactly
-        // `pk_bytes[8..stride]`, since `stride - m == 8`. This is the routing hash
-        // under `worker_for_pk_bytes` — per row on the exchange scatter and the
-        // bloom build — and a compound `(U32, U64)` PK lands here at 12.
+        // 9..=15: two overlapping loads; the tail load's low `m` bytes are
+        // `pk_bytes[8..stride]`.
         9..=15 => {
             let m = stride - 8;
             let hi = u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128;
@@ -247,63 +243,9 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
     }
 }
 
-/// Widest PK region that still fits in a packed `u128` word, the boundary where
-/// a key stops fitting one register. At or below it [`widen_pk_be`] recovers the
-/// exact key as a `u128` (wider regions must be read as bytes) and
-/// [`worker_for_pk_bytes`] routes through that value; above it a key is
-/// ordered and hashed as raw bytes.
+/// Widest PK region [`widen_pk_be`] packs into a `u128`; a wider key is ordered
+/// and hashed as raw bytes.
 pub const NARROW_PK_MAX_BYTES: usize = 16;
-
-/// Map a 64-bit hash onto `0..num_workers` — a multiply-shift, no divide and no
-/// branch, uniform over the range at every count. The one spelling both routing
-/// arms below use.
-#[inline(always)]
-fn bucket(h: u64, num_workers: usize) -> usize {
-    debug_assert!(num_workers >= 1, "worker routing: num_workers must be >= 1");
-    ((h as u128 * num_workers as u128) >> 64) as usize
-}
-
-/// Upper bound on a cluster's worker count: it bounds `--workers`, sizes the
-/// SAL's per-worker group slot arrays, and caps the exchange accumulator's
-/// worker count.
-pub const MAX_WORKERS: usize = 64;
-
-/// Which worker owns `key`.
-///
-/// Multiplicative hash: two Fibonacci multipliers XOR'd together, then
-/// [`bucket`]. XXH3 is reserved for filters (the shard PK filter, bloom) where collision
-/// quality matters.
-///
-/// The count is a parameter: every producer and consumer of a row must route it
-/// against the same cluster shape, so it travels with the call rather than being
-/// read from anywhere ambient.
-#[inline(always)]
-pub fn worker_for_key(pk: u128, num_workers: usize) -> usize {
-    let lo = pk as u64;
-    let hi = (pk >> 64) as u64;
-    bucket(
-        lo.wrapping_mul(0x9e3779b97f4a7c15_u64) ^ hi.wrapping_mul(0x6c62272e07bb0142_u64),
-        num_workers,
-    )
-}
-
-/// Route an OPK PK region to a worker: a narrow one by its image, which
-/// `ColumnLocator::opk_image` equals for a payload column so both join sides agree,
-/// a wide one by its xxh3. The narrow arm inlines into the per-row routing
-/// loops; the wide arm stays out of line.
-#[inline(always)]
-pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
-    if bytes.len() <= NARROW_PK_MAX_BYTES {
-        worker_for_key(widen_pk_be(bytes), num_workers)
-    } else {
-        worker_for_wide_pk(bytes, num_workers)
-    }
-}
-
-#[inline(never)]
-fn worker_for_wide_pk(bytes: &[u8], num_workers: usize) -> usize {
-    bucket(crate::checksum(bytes), num_workers)
-}
 
 // ---------------------------------------------------------------------------
 // Width-tagged PK byte buffer

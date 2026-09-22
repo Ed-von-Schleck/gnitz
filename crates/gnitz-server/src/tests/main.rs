@@ -1,5 +1,5 @@
 use super::parse_workers;
-use gnitz_wire::MAX_WORKERS;
+use crate::runtime::MAX_WORKERS;
 
 #[test]
 fn parse_workers_accepts_the_valid_range_and_nothing_else() {

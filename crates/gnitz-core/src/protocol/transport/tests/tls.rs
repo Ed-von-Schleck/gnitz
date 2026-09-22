@@ -97,7 +97,7 @@ impl Loopback {
             }
             if peer == Peer::AckHello {
                 let hello = read_frame(&mut end);
-                assert_eq!(hello.len(), gnitz_wire::HELLO_PAYLOAD_LEN as usize);
+                assert_eq!(hello.len(), gnitz_wire::HELLO_PAYLOAD_LEN);
                 // `encode_hello_ack` frames the ACK itself.
                 let ack = gnitz_wire::encode_hello_ack(0);
                 end.write_all(&ack).unwrap();

@@ -23,7 +23,7 @@ use crate::{ClientVerb, WireConflictMode, WireFlags};
 /// Maximum relations in one `SCAN_MULTI`. The master holds one scan lease and
 /// one reply train of bookkeeping per relation; a handful of related tables
 /// covers a realistic consistent snapshot.
-pub const SCAN_MULTI_MAX_RELATIONS: usize = 16;
+pub(crate) const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 
 /// Maximum views in one `DELTA_POLL`: the ceiling on the leases and reply
 /// trains one poll puts on the master. A mirroring host holds tens of views, and
@@ -88,7 +88,7 @@ pub fn encode_push_txn(basis: u64, items: &[PushTxnItem<'_, WalBlock<'_>>]) -> V
     let mut w = prologue(ClientVerb::PushTxn, basis, body);
     for f in items {
         w.u8(f.mode.as_wire())
-            .u8(f.reads as u8)
+            .bool(f.reads)
             .bytes32(f.schema_block)
             .block(&f.data);
     }

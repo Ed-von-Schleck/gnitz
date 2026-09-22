@@ -7,8 +7,7 @@ use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 // ── Region read helpers ───────────────────────────────────────────────────────
 
-/// Append a region of LE scalars to `dst` via bulk memcpy. Correct on
-/// little-endian.
+/// Append a region of exactly `count` LE scalars to `dst`.
 fn read_region_into<T: gnitz_wire::LeScalar>(
     dst: &mut Vec<T>,
     src: &[u8],
@@ -22,16 +21,7 @@ fn read_region_into<T: gnitz_wire::LeScalar>(
             src.len()
         )));
     }
-    let base = dst.len();
-    dst.reserve(count);
-    // SAFETY: src is `expected` bytes (checked above); `reserve` leaves room for
-    // `count` more Ts = `expected` bytes past `base`. Both are valid,
-    // non-overlapping regions, and the copy initializes every element `set_len`
-    // then publishes; `T: LeScalar` makes every byte pattern a valid `T`.
-    unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(base) as *mut u8, expected);
-        dst.set_len(base + count);
-    }
+    gnitz_wire::extend_from_le_bytes(dst, src);
     Ok(())
 }
 

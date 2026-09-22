@@ -1,9 +1,9 @@
 //! Exchange worker routing: `ScatterSpec`, `ScatterKey`, and the per-row
 //! routing-key helpers.
 
+use crate::schema::{worker_for_key, worker_for_pk_bytes};
 use crate::schema::{OpBuildErr, Placement, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch, Slot};
-use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
 use super::super::group_key::{single_col_canonical_group_key, GroupKeyCols};
 use crate::schema::key::ReindexPacker;
@@ -42,13 +42,13 @@ pub enum ScatterSpec<'a> {
 }
 
 impl ScatterSpec<'_> {
-    /// Refused exactly where [`ScatterKey::new`] would refuse it.
+    /// Refused exactly where `ScatterKey::new` would refuse it.
     pub fn check(self, schema: &SchemaDescriptor) -> Result<(), OpBuildErr> {
         ScatterKey::new(self, schema, 1).map(drop)
     }
 
     /// True iff the exchange this spec describes would move nothing: its columns
-    /// are exactly `schema`'s distribution prefix, and its [`ScatterKind`] hashes
+    /// are exactly `schema`'s distribution prefix, and its `ScatterKind` hashes
     /// them to the bytes `worker_for_pk` already placed the rows by.
     pub fn routes_to_native_owner(self, schema: &SchemaDescriptor) -> bool {
         let Placement::Keyed { prefix_len } = schema.placement() else {

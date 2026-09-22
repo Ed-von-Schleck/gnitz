@@ -16,6 +16,7 @@ rustls.workspace = true
 webpki-roots = "1"
 
 [dev-dependencies]
+gnitz-store = { path = "../gnitz-store" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 # The loopback TLS peer the framing tests drive a real `connect_tls` against.
 rcgen.workspace = true
