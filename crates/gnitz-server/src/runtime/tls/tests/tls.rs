@@ -145,6 +145,22 @@ fn a_public_bind_without_client_authentication_needs_the_escape_hatch() {
     assert!(hatch.resolve().is_ok(), "the escape hatch admits it");
 }
 
+/// The dev certificate names loopback only, so it is refused on an address no
+/// loopback client reaches, whatever authenticates the client.
+#[test]
+fn a_specific_public_bind_needs_an_operator_certificate() {
+    for public in ["192.0.2.1:0", "[2001:db8::1]:0"] {
+        let args = TlsArgs {
+            allow_unauthenticated: true,
+            ..TlsArgs::on(public)
+        };
+        let Err(e) = args.resolve() else {
+            panic!("{public} is refused")
+        };
+        assert!(e.contains("--tls-cert") && e.contains("::1"), "{e}");
+    }
+}
+
 /// Every unusable PEM file is refused, and the error names it.
 #[test]
 fn an_unusable_pem_file_is_refused_naming_it() {

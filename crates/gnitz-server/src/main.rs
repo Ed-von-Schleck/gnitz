@@ -25,7 +25,11 @@
 #[macro_use]
 extern crate gnitz_foundation;
 
+// Neither rung below `runtime` ends the process; `tests/rungs.rs` covers the
+// spellings this lint does not.
+#[deny(clippy::exit)]
 mod catalog;
+#[deny(clippy::exit)]
 mod query;
 mod runtime;
 
@@ -50,12 +54,14 @@ Options:
   --tls-listen=IP:PORT Additionally listen for TLS 1.3 clients on this TCP
                        address (port 0 = ephemeral). The bound address is
                        written to <data_dir>/tls_endpoint. A NON-LOOPBACK bind
-                       REQUIRES --tls-client-ca or --allow-unauthenticated —
-                       boot aborts otherwise. A loopback bind is turnkey.
+                       REQUIRES --tls-client-ca or --allow-unauthenticated.
+                       A loopback bind is turnkey.
   --tls-cert=PEM       Server certificate chain (requires --tls-key and
                        --tls-listen). Without cert+key a self-signed dev
                        certificate for localhost/127.0.0.1/::1 is minted and
-                       its public PEM written to <data_dir>/tls_dev_cert.pem.
+                       its public PEM written to <data_dir>/tls_dev_cert.pem;
+                       a bind to one non-loopback address therefore REQUIRES
+                       cert+key.
   --tls-key=PEM        Server private key (see --tls-cert)
   --tls-client-ca=PEM  Enable REQUIRED mTLS: clients must present an X.509
                        certificate chaining to this CA (chain) to complete the
@@ -77,7 +83,13 @@ Options:
                        live server.
   --help, -h           Show this help message and exit
 
+Every option is --flag=VALUE: a space-separated value is not accepted, and an
+unrecognised argument is an error.
+
 Environment:
+  A variable that is set to a value it cannot be read as stops the server;
+  unset takes the default.
+
   GNITZ_LOG_LEVEL          Same as --log-level; CLI flag takes precedence
   GNITZ_CHECKPOINT_BYTES   SAL checkpoint threshold in bytes (default: 75% of SAL size)
   GNITZ_CPU_AFFINITY       Pin the master and each worker to CPUs (default: on; 0 disables).
@@ -87,7 +99,18 @@ Environment:
   GNITZ_HELLO_TIMEOUT_MS   How long a connection may take from accept to its HELLO, TLS
                            handshake included, before it is closed (default: longer
                            than a client waits for its own connect).
+
+Exit codes:
+  0    clean shutdown
+  64   the arguments above are refused; nothing was created, and a restart
+       with the same arguments is refused again
+  1    boot or runtime failure
+  134  fail-stop abort (128 + SIGABRT)
 ";
+
+/// `sysexits.h`'s `EX_USAGE`: argv was refused, before anything was created. A
+/// boot failure exits 1, so a supervisor can tell the two apart.
+const EX_USAGE: i32 = 64;
 
 fn parse_level(s: &str) -> Result<Level, String> {
     match s {
@@ -119,7 +142,10 @@ struct Args {
 
 /// Parse argv (program name excluded), with `GNITZ_LOG_LEVEL` as `env_level`.
 fn parse_args(args: &[String], env_level: Option<&str>) -> Result<Args, String> {
-    let mut level = env_level.map(parse_level).transpose()?.unwrap_or(Level::Quiet);
+    let mut level = match env_level {
+        Some(v) => parse_level(v).map_err(|e| format!("GNITZ_LOG_LEVEL: {e}"))?,
+        None => Level::Quiet,
+    };
     let mut workers = 1;
     let (mut tls_listen, mut cert, mut key, mut client_ca) = (None, None, None, None);
     let mut allow_unauthenticated = false;
@@ -215,17 +241,25 @@ fn main() {
         }
     }
     let env_level = env::var("GNITZ_LOG_LEVEL").ok();
-    let args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| {
+    let refuse = |e: String| -> ! {
         eprintln!("Error: {e}");
         eprintln!("Try 'gnitz-server --help' for usage information");
-        process::exit(1);
-    });
+        process::exit(EX_USAGE);
+    };
+    let args = parse_args(&args, env_level.as_deref()).unwrap_or_else(|e| refuse(e));
     gnitz_foundation::log::init(args.level, gnitz_foundation::log::Tag::Master);
+    // Here and not in the boot: a bind the policy refuses and a PEM file that
+    // does not load are refusals of argv.
+    let tls = args
+        .tls
+        .map(runtime::TlsArgs::resolve)
+        .transpose()
+        .unwrap_or_else(|e| refuse(e));
     process::exit(runtime::server_main(
         &args.data_dir,
         &args.socket_path,
         args.workers,
-        args.tls,
+        tls,
     ));
 }
 

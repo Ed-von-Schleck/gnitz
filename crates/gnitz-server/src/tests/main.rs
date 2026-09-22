@@ -17,7 +17,11 @@ fn every_refusal_names_what_it_refuses() {
         ("/data", None, "<socket_path>"),
         ("", None, "<data_dir>"),
         ("--log-level=loud /data /sock", None, "loud"),
-        ("/data /sock", Some("loud"), "loud"),
+        (
+            "/data /sock",
+            Some("loud"),
+            "GNITZ_LOG_LEVEL: invalid log level \"loud\"",
+        ),
         ("--workers=0 /data /sock", None, "--workers"),
         (too_many.as_str(), None, "--workers"),
         ("--workers=abc /data /sock", None, "--workers"),

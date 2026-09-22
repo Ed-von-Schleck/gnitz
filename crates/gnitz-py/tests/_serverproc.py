@@ -254,7 +254,7 @@ class ServerProc:
 
     # ── spawning ─────────────────────────────────────────────────────────────
 
-    def _popen(self, spawn_env):
+    def _popen(self, spawn_env, extra_args=()):
         env = server_env()
         env.update(self.extra_env)     # config of this server, every boot
         env.update(spawn_env or {})    # this boot only
@@ -275,7 +275,7 @@ class ServerProc:
         try:
             return subprocess.Popen(
                 [server_binary(), self.data_dir, self.sock_path, f"--workers={self.workers}",
-                 "--tls-listen=127.0.0.1:0"],
+                 "--tls-listen=127.0.0.1:0", *extra_args],
                 stdout=log, stderr=log, env=env,
                 start_new_session=True, preexec_fn=server_preexec,
             )
@@ -302,12 +302,13 @@ class ServerProc:
         self.tls_target = f"tls://127.0.0.1:{port}?ca={self.data_dir}/tls_dev_cert.pem"
         return self
 
-    def start_expecting_exit(self, *, workers=None, extra_env=None, timeout=20.0):
+    def start_expecting_exit(self, *, workers=None, extra_env=None, extra_args=(), timeout=20.0):
         """Spawn a server expected to die during boot. Returns its non-zero exit
-        code, having confirmed it never became ready."""
+        code, having confirmed it never became ready. `extra_args` follow the
+        arguments every boot gets, so a flag given there replaces its default."""
         if workers is not None:
             self.workers = workers
-        self.proc = self._popen(extra_env)
+        self.proc = self._popen(extra_env, extra_args)
         deadline = time.time() + timeout
         while time.time() < deadline:
             rc = self.proc.poll()

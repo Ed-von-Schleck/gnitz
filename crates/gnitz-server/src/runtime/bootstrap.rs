@@ -21,7 +21,7 @@ use crate::runtime::park::{WorkerPark, WorkerParks};
 use crate::runtime::reactor::{select2, AckLease, Either, Limits, Reactor, BOOT_READY_REQUEST_ID};
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
-use crate::runtime::tls::TlsArgs;
+use crate::runtime::tls::TlsConfig;
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::worker::WorkerProcess;
 use gnitz_store::relation::{Residency, StoreConfig};
@@ -217,7 +217,7 @@ fn worker_boot_recovery(
 /// enters the executor event loop.
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> i32 {
+pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsConfig>) -> i32 {
     match run_server(data_dir, socket_path, num_workers, tls) {
         Ok(rc) => rc,
         Err(e) => {
@@ -445,9 +445,7 @@ fn raise_fd_limit(target: u64) {
     }
 }
 
-fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsArgs>) -> Result<i32, String> {
-    let tls = tls.map(TlsArgs::resolve).transpose()?;
-
+fn run_server(data_dir: &str, socket_path: &str, num_workers: u32, tls: Option<TlsConfig>) -> Result<i32, String> {
     let limits = Limits::from_env();
     // Client connections are the one descriptor demand that grows: a shard is
     // held by its mapping, and an fsync batch opens a bounded chunk.

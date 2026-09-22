@@ -417,6 +417,10 @@ Note that when piping `make e2e` or any other command through `| tail ...`, do n
 
 The knobs a session usually reaches for. This is not the full set — every
 `GNITZ_*` override is declared next to the value it overrides, with its default.
+Unset means that default; a **present but unparseable value stops the boot**,
+rather than silently selecting a value nobody asked for. The same rule binds the
+CLI: an unrecognised argument is an error, and a refused command line exits 64
+before anything is created.
 
 | Var | Effect |
 |-----|--------|

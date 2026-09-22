@@ -40,10 +40,10 @@ impl Seam {
         }
     }
 
-    /// True while the seam is set, under `env`'s flag rule: `0` or the empty
-    /// string leaves it disarmed.
+    /// True while the seam is set to anything `env`'s flag rule does not read as
+    /// off, so a seam carrying a stage or a count is armed too.
     pub fn armed(&self) -> bool {
-        self.setting().is_some_and(crate::env::flag)
+        self.setting().is_some_and(|v| crate::env::flag(v) != Some(false))
     }
 
     /// True while the seam names this stage — for seams that pick one of several

@@ -1,7 +1,11 @@
 //! Numeric and boolean `GNITZ_*` overrides. The parse rules are pure functions
-//! of the raw value, shared with `fault`'s seams; the readers fall back to the
-//! `default` they name when the variable is unset or the rule rejects it.
-//! Call-site-specific clamps and `OnceLock` caching stay local to the consumer.
+//! of the raw value, shared with `fault`'s seams. A reader returns the `default`
+//! it names only for an unset variable; a value its rule rejects panics, so no
+//! reader selects a value the operator did not ask for.
+//!
+//! A panic and not an exit: clients and `gnitz-mirror` link this too, and a
+//! library does not end its host. Call-site-specific clamps and `OnceLock`
+//! caching stay local to the consumer.
 
 /// A positive number, or `None` for a zero or unparseable value: an override
 /// never zeroes a knob.
@@ -9,20 +13,41 @@ pub(crate) fn positive<T: std::str::FromStr + Default + PartialOrd>(v: &str) -> 
     v.parse::<T>().ok().filter(|n| *n > T::default())
 }
 
-/// `0` or the empty string is off, any other value on.
-pub(crate) fn flag(v: &str) -> bool {
-    !v.is_empty() && v != "0"
+/// `0`, `false`, `no` or the empty string is off, `1`, `true` or `yes` on, in
+/// any case; `None` for anything else.
+pub(crate) fn flag(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" => Some(false),
+        "1" | "true" | "yes" => Some(true),
+        _ => None,
+    }
 }
 
-/// A positive-integer env override: unset, 0 or unparseable falls back to
-/// `default`.
+/// `name`'s override: `default` when unset, else `raw` as `rule` reads it.
+///
+/// # Panics
+///
+/// On a value `rule` rejects, naming the variable, the value and `what` it
+/// should have been.
+fn read<T>(name: &str, raw: Option<&str>, default: T, rule: impl Fn(&str) -> Option<T>, what: &str) -> T {
+    match raw {
+        None => default,
+        Some(raw) => rule(raw).unwrap_or_else(|| panic!("{name}={raw:?} is not {what}")),
+    }
+}
+
+/// A positive-integer env override; unset reads as `default`, and a zero or
+/// unparseable value panics.
 pub fn env_num<T: std::str::FromStr + Default + PartialOrd>(name: &str, default: T) -> T {
-    std::env::var(name).ok().and_then(|v| positive(&v)).unwrap_or(default)
+    let raw = std::env::var(name).ok();
+    read(name, raw.as_deref(), default, positive, "a positive integer")
 }
 
-/// A boolean env override under [`flag`]'s rule; unset falls back to `default`.
+/// A boolean env override under [`flag`]'s rule; unset reads as `default`, and
+/// a value the rule does not read panics.
 pub fn env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name).map_or(default, |v| flag(&v))
+    let raw = std::env::var(name).ok();
+    read(name, raw.as_deref(), default, flag, "a boolean (0|1|true|false|yes|no)")
 }
 
 #[cfg(test)]
