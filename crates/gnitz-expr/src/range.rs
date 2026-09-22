@@ -4,11 +4,10 @@
 
 use gnitz_wire::{key_image, Cut, RangeDescriptor};
 
-use crate::batch::scan_filter_bits;
-use crate::{BatchView, ColumnLocator, SchemaFacts};
+use crate::{BatchView, ColumnLocator, ExprValidateErr, SchemaFacts};
 
 /// A range walk over a column list, as a batch filter.
-pub struct RangeMembership {
+pub(crate) struct RangeMembership {
     /// The null-word bits of the list's payload columns: no index entry holds a NULL.
     null_mask: u64,
     /// Per bounded column, its admitted key images `lo ..= lo + span`: an equality
@@ -17,16 +16,21 @@ pub struct RangeMembership {
 }
 
 impl RangeMembership {
-    /// The walk `desc` names over `cols`; `Err` when `desc` leaves no range column in
-    /// `cols`, or a column's type has no key order.
-    pub fn new(cols: &[u32], desc: RangeDescriptor, schema: &dyn SchemaFacts) -> Result<Self, String> {
+    /// The walk `desc` names over `cols`; `Err` when a column is out of range or its
+    /// type has no key order, or `desc` leaves no range column in `cols`.
+    pub(crate) fn new(cols: &[u32], desc: RangeDescriptor, schema: &dyn SchemaFacts) -> Result<Self, ExprValidateErr> {
+        let bad = |e: String| ExprValidateErr::BadWalk(format!("range walk: {e}"));
+        let n = schema.num_columns();
+        if let Some(&c) = cols.iter().find(|&&c| c as usize >= n) {
+            return Err(bad(format!("column {c} is out of range for a {n}-column schema")));
+        }
         let locs: Vec<ColumnLocator> = cols.iter().map(|&c| schema.locate(c as usize)).collect();
         for l in &locs {
-            gnitz_wire::index_key_type(l.type_code())?;
+            gnitz_wire::index_key_type(l.type_code()).map_err(bad)?;
         }
         let range_col = *locs
             .get(desc.eq_vals().len())
-            .ok_or("range walk: the equality prefix leaves no range column")?;
+            .ok_or_else(|| bad("the equality prefix leaves no range column".into()))?;
         let null_mask = locs.iter().fold(0, |m, l| match *l {
             ColumnLocator::Payload { slot, .. } => m | 1 << slot,
             ColumnLocator::Pk { .. } => m,
@@ -52,24 +56,12 @@ impl RangeMembership {
         Ok(RangeMembership { null_mask, bounds })
     }
 
-    /// The rows of `mb` in the walk, as maximal runs into `out`; `words` is scratch.
-    pub fn filter_ranges(&self, mb: &dyn BatchView, words: &mut Vec<u64>, out: &mut Vec<(usize, usize)>) {
-        self.filter_words(mb, words);
-        out.clear();
-        scan_filter_bits(words, mb.row_count(), out);
-    }
-
-    /// One bit per row of `mb`, set when the row lies in the walk, into `words`.
-    pub fn filter_words(&self, mb: &dyn BatchView, words: &mut Vec<u64>) {
-        let n = mb.row_count();
-        words.clear();
+    /// Clear the bit of every row of `mb` outside the walk in `words`, one bit per row.
+    pub(crate) fn and_into(&self, mb: &dyn BatchView, words: &mut [u64]) {
+        debug_assert_eq!(words.len(), mb.row_count().div_ceil(64), "and_into: one bit per row");
         if self.bounds.is_empty() {
-            words.resize(n.div_ceil(64), 0);
+            words.fill(0);
             return;
-        }
-        words.resize(n / 64, u64::MAX);
-        if !n.is_multiple_of(64) {
-            words.push(gnitz_wire::low_bits_mask(n % 64));
         }
         if self.null_mask != 0 {
             let mask = self.null_mask;

@@ -1,17 +1,21 @@
 //! Range membership over key images, driven through [`TestView`].
 
 use crate::test_support::{TestSchema, TestView};
-use crate::{RangeMembership, SchemaFacts};
+use crate::{RangeMembership, RowSource, SchemaFacts};
 use gnitz_wire::TypeCode;
 use gnitz_wire::{Cut, FixedInt, RangeDescriptor};
 
-/// The rows of `v` the walk `desc` over `cols` admits.
+/// The rows of `v` the walk `desc` over `cols` admits, ANDed into all-ones words.
 fn admitted(cols: &[u32], desc: RangeDescriptor, schema: &TestSchema, v: &TestView) -> Vec<usize> {
-    let (mut words, mut ranges) = (Vec::new(), Vec::new());
+    let n = v.row_count();
+    let mut words = vec![u64::MAX; n.div_ceil(64)];
+    if !n.is_multiple_of(64) {
+        words[n / 64] = gnitz_wire::low_bits_mask(n % 64);
+    }
     RangeMembership::new(cols, desc, schema)
         .unwrap()
-        .filter_ranges(v, &mut words, &mut ranges);
-    ranges.into_iter().flat_map(|(s, e)| s..e).collect()
+        .and_into(v, &mut words);
+    (0..n).filter(|&r| (words[r / 64] >> (r % 64)) & 1 != 0).collect()
 }
 
 /// A signed payload column: `[-3, 3)` straddles zero, and the cut kinds decide the edges.
@@ -105,7 +109,8 @@ fn a_u128_column_orders_over_its_full_width() {
     );
 }
 
-/// A walk exists only over key-ordered columns and with a range column left.
+/// A walk exists only over in-range, key-ordered columns and with a range
+/// column left.
 #[test]
 fn a_malformed_walk_is_refused() {
     let schema = TestSchema::new(
@@ -114,4 +119,8 @@ fn a_malformed_walk_is_refused() {
     );
     assert!(RangeMembership::new(&[1], RangeDescriptor::point(&[], 0), &schema).is_err());
     assert!(RangeMembership::new(&[2], RangeDescriptor::new(&[3], Cut::Before(0), Cut::After(9)), &schema).is_err());
+    assert!(matches!(
+        RangeMembership::new(&[3], RangeDescriptor::point(&[], 0), &schema),
+        Err(crate::ExprValidateErr::BadWalk(_))
+    ));
 }

@@ -54,7 +54,7 @@ pub(in crate::query) struct Instr {
 
 /// The operators, each boxing whatever the emitter baked for it.
 pub(in crate::query) enum Op {
-    Filter(Box<gnitz_expr::Evaluator>),
+    Filter(Box<gnitz_expr::RowFilter>),
     Map(Box<MapPlan>),
     Negate,
     /// The one operator with a second delta operand.
@@ -235,8 +235,8 @@ impl VmHandle {
 // Program
 // ---------------------------------------------------------------------------
 
-/// A compiled DBSP program: immutable once built, owning every resource its
-/// instructions name except the mutable child stores ([`CircuitState`]).
+/// A compiled DBSP program, owning every resource its instructions name except
+/// the child stores ([`CircuitState`]).
 pub(in crate::query) struct Program {
     instructions: Vec<Instr>,
     /// Run after the whole instruction range — and not at all by a replay, which

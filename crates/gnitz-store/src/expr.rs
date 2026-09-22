@@ -1,24 +1,20 @@
 //! [`MapPlan`] — the columnar driver behind every DBSP map and projection.
 //!
 //! A filter needs nothing on top of the resolved program and is a bare
-//! `gnitz_expr::Evaluator` wherever one is held; a map is this plan, which
-//! separates the columnar work (column moves, null permutation) from the
-//! per-row expression kernel the evaluator runs.
+//! `gnitz_expr::RowFilter` wherever one is held; a map is this plan, which adds
+//! the PK, weight and column moves around the computed columns
+//! `gnitz_expr::MapEval` writes.
 //!
 //! The evaluator itself lives in `gnitz-expr`; this module is a consumer of that
 //! crate, not its home, so `LogicalProgram`, the instruction model and the
 //! resolved form are named `gnitz_expr::` at each call site rather than
 //! re-exported here.
 
-use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
+use gnitz_expr::{ColCopy, ExprValidateErr, LogicalProgram, MapEval};
 
 use crate::schema::key::{locate_key_col, FoldCols, ReindexPacker};
 use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, SchemaFacts, TypeCode};
 use crate::storage::Batch;
-
-/// One verbatim column move: `(source locator, output payload slot, destination
-/// write width)`, as `gnitz-expr` resolved it.
-type ColCopy = (ColumnLocator, u32, u8);
 
 /// One map step's row window: source rows `[src, src + n)` onto destination rows
 /// `[dst, dst + n)`. The three travel together through every columnar body
@@ -45,10 +41,10 @@ enum BlobMode<'a> {
     Relocate(Option<&'a mut crate::storage::BlobCache>),
 }
 
-/// Average survivor-run length below which [`MapPlan::append_map_ranges`]
-/// compacts a fragmented range list before running the compute kernel — see the
-/// break-even argument there.
-const COMPACT_RUN_LEN: usize = 16;
+/// Average survivor-run length below which a computing map copies its survivors
+/// into one range first: below it, the copy costs less than the kernel's setup
+/// per range.
+const COMPACT_RUN_LEN: usize = 128;
 
 /// Where a map's output PK region comes from. Owned by the plan rather than
 /// passed per call, so the region cannot be left unwritten between two
@@ -71,13 +67,16 @@ pub enum PkSource {
 
 /// Copy a single column from `in_batch` to `output` over `w`, moving any
 /// German-string cell per `blob` (a map never widens a string column, so both
-/// strides are 16). The source is read at its own type's width; when the
-/// destination slot (`dst_stride`, from the output schema) is wider — a promoted
-/// integer column — the copy sign/zero-extends the value into it.
+/// strides are 16). The source is read at its own type's width and
+/// sign/zero-extended into a wider (promoted) destination slot.
 fn copy_column(
     in_batch: &Batch,
     output: &mut Batch,
-    &(src_loc, dst_payload, dst_stride): &ColCopy,
+    &ColCopy {
+        src: src_loc,
+        slot: dst_payload,
+        width: stride,
+    }: &ColCopy,
     blob: &mut BlobMode<'_>,
     w: RowWindow,
 ) {
@@ -87,8 +86,6 @@ fn copy_column(
         // source span is expressed off row `n - 1`.
         return;
     }
-    let dst_payload = dst_payload as usize;
-    let stride = dst_stride as usize; // destination write width
 
     // Destructured ONCE before the row loops, so the per-row bodies below carry
     // no locator dispatch (and no `native_le_bytes` by-value [u8; 16]).
@@ -107,24 +104,20 @@ fn copy_column(
             // row. Each read is the source column's OWN width — the wider
             // destination stride would over-read into the next PK column.
             if src_stride == stride {
-                // The width is unswitched out too, so `decode_pk_column` takes
-                // fixed-size arrays and its own width match folds away.
+                let signed = type_code.is_signed_int();
+                let rows = pk[src_start * pk_stride..(src_start + n) * pk_stride].chunks_exact(pk_stride);
+                // A constant width, so `decode_pk_cell`'s own width match folds away.
                 macro_rules! decode_rows {
                     ($w:expr) => {{
                         const W: usize = $w;
-                        // Both windows cut once, as `Instr::LoadPk`'s row loop
-                        // does: three bounds checks per row the loop drops.
-                        let base = src_start * pk_stride + pk_off;
-                        let cells = &pk[base..base + (n - 1) * pk_stride + W];
+                        assert!(pk_off + W <= pk_stride, "a PK column lies inside the PK");
                         let out = &mut dst[dst_base * W..(dst_base + n) * W];
-                        for (d, k) in out.chunks_exact_mut(W).zip((0..n).map(|i| i * pk_stride)) {
-                            let s: &[u8; W] = cells[k..k + W].try_into().unwrap();
-                            gnitz_wire::decode_pk_column(s, type_code, d.try_into().unwrap());
+                        for (d, row) in out.as_chunks_mut::<W>().0.iter_mut().zip(rows) {
+                            let s: &[u8; W] = row[pk_off..pk_off + W].try_into().unwrap();
+                            gnitz_wire::decode_pk_cell(s, signed, d);
                         }
                     }};
                 }
-                // `decode_pk_column`'s own domain: a PK column is 1, 2, 4, 8 or
-                // 16 bytes, and it says so itself on anything else.
                 match stride {
                     1 => decode_rows!(1),
                     2 => decode_rows!(2),
@@ -212,10 +205,7 @@ fn copy_column(
 /// the null permutation, where the output PK comes from, and the output schema
 /// it stamps.
 pub struct MapPlan {
-    /// The resolved program: the copy list, the two emit lists and the per-row
-    /// kernel all read through it. Kept even for a pure projection, whose
-    /// register file is empty — it has no registers to size.
-    ev: Evaluator,
+    ev: MapEval,
     /// Where the output PK region comes from.
     pk_source: PkSource,
     /// Some copy carries a German-string column, so a cell can be relocated.
@@ -223,9 +213,6 @@ pub struct MapPlan {
     /// The input has German-string columns and every one is carried by a copy,
     /// so its heap holds no bytes the output would adopt dead.
     keeps_every_string: bool,
-    /// This map reproduces its input row unchanged, so a caller holding the input
-    /// can hand it on instead of running the plan.
-    is_identity: bool,
     out_schema: SchemaDescriptor,
 }
 
@@ -382,15 +369,12 @@ impl MapPlan {
         out_schema: &SchemaDescriptor,
         pk_source: PkSource,
     ) -> Result<Self, ExprValidateErr> {
-        // Read before `resolve_map` consumes the logical form. Only under
-        // `Inherit`: a reindex or hash-row overwrites every row's PK.
-        let is_identity = matches!(pk_source, PkSource::Inherit) && logical.is_identity_map(in_schema, out_schema);
         let ev = logical.resolve_map(in_schema, out_schema)?;
-        let copies_a_string = ev.copies().iter().any(|c| c.0.type_code().is_german_string());
+        let copies_a_string = ev.copies().iter().any(|c| c.src.type_code().is_german_string());
         // A copy's source locator is exactly what `locate` gives for its column.
         let is_copied = |ci| {
             let loc = in_schema.locate(ci);
-            ev.copies().iter().any(|c| c.0 == loc)
+            ev.copies().iter().any(|c| c.src == loc)
         };
         let keeps_every_string = in_schema.has_german_string()
             && (0..in_schema.num_columns())
@@ -402,7 +386,6 @@ impl MapPlan {
             pk_source,
             copies_a_string,
             keeps_every_string,
-            is_identity,
             out_schema: *out_schema,
         })
     }
@@ -415,12 +398,12 @@ impl MapPlan {
     /// True iff running this map would reproduce its input batch. A compiler
     /// elides such a node entirely and lets its consumers read the input.
     pub fn is_identity(&self) -> bool {
-        self.is_identity
+        matches!(self.pk_source, PkSource::Inherit) && self.ev.is_identity()
     }
 
     /// Map every `[start, end)` range of `src`, in order, onto `keeper`'s tail;
     /// `keeper` is in this plan's output schema.
-    pub(crate) fn append_map_ranges(&self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
+    pub(crate) fn append_map_ranges(&mut self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
         debug_assert!(
             matches!(self.pk_source, PkSource::Inherit),
             "append_map_ranges: any other source leaves the keeper's PK region unwritten",
@@ -432,7 +415,7 @@ impl MapPlan {
     /// instruction's whole body. The result is `Raw`: a payload-reordering
     /// projection over a duplicate-PK input can break (PK, payload) order (the
     /// D1 fail-safe).
-    pub fn evaluate_map_batch(&self, in_batch: &Batch) -> Batch {
+    pub fn evaluate_map_batch(&mut self, in_batch: &Batch) -> Batch {
         let n = in_batch.count;
         if n == 0 {
             return Batch::empty_with_schema(&self.out_schema);
@@ -454,38 +437,17 @@ impl MapPlan {
         output
     }
 
-    /// The one map driver: provision `out`'s tail for the ranges, pick the
-    /// [`BlobMode`] off [`Batch::shares_blob_with`] (the same rule
-    /// `Batch::append_ranges_inner` reads), and run [`Self::map_rows_into`] per
-    /// range. The dedup cache spans the call and never outlives it: every range
-    /// reads the same live `src`, while a later chunk's recycled blob buffer can
-    /// reuse an address this one saw.
-    ///
-    /// Why [`COMPACT_RUN_LEN`] and not `MORSEL` bounds the compaction below:
-    /// compaction buys a full extra copy of every survivor (~1.5–15 ns/row) to
-    /// save the *per-range* kernel setup — one eval prologue, one scratch borrow
-    /// — a few hundred cycles. Runs longer than that already amortize it,
-    /// whatever the morsel width.
-    fn map_ranges_into(&self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
+    /// Map `ranges` of `src` onto `out`'s tail.
+    fn map_ranges_into(&mut self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)]) {
         let total = crate::storage::range_rows(ranges);
         if total == 0 {
             return;
         }
-        // Compact a kernel-starving list into one contiguous range: the kernel
-        // evaluates one morsel *per range*, so a list of 1-row ranges would
-        // collapse it to row-at-a-time. A pure gather copies range-wise anyway.
-        //
-        // A *relocating* gather, not `Batch::from_ranges`: that one shares the
-        // source heap wholesale, dead bytes included, and this arm fires exactly
-        // on the selective-predicate-plus-string shape where most of it is dead.
+        let blob_cap = crate::storage::prorated_blob_cap(src.blob.len(), src.count, total);
         let starves_kernel = self.ev.emits_anything() && ranges.len() > 1 && total < ranges.len() * COMPACT_RUN_LEN;
         let compacted;
         let (src, ranges) = if starves_kernel {
-            compacted = {
-                let mut c = Batch::with_capacity(src.schema(), total);
-                c.append_ranges(&src.as_mem_batch(), ranges);
-                c
-            };
+            compacted = Batch::from_ranges(src, ranges, src.schema());
             (&compacted, &[(0, total)][..])
         } else {
             (src, ranges)
@@ -503,12 +465,9 @@ impl MapPlan {
             true => crate::storage::BlobCacheGuard::acquire(out.schema(), total),
             false => crate::storage::BlobCacheGuard::empty(),
         };
-        // A different question: does this plan grow the output heap at all — a
-        // string emit does, with no cache entry to its name. This is the only
-        // presize `out.blob` ever gets, so dropping it trades one malloc for
-        // geometric regrowth.
-        if out.schema().has_german_string() && !shares_blob && !src.blob.is_empty() {
-            out.reserve_blob(crate::storage::prorated_blob_cap(src.blob.len(), src.count, total));
+        // For relocated copies and string emits alike.
+        if out.schema().has_german_string() && !shares_blob && blob_cap != 0 {
+            out.reserve_blob(blob_cap);
         }
         let mut dst = old;
         for &(start, end) in ranges {
@@ -527,10 +486,10 @@ impl MapPlan {
         out.downgrade();
     }
 
-    /// Map one row window: PK, weight, null permutation, column moves, then the
-    /// compute kernel. `out.count` must already cover the destination window —
+    /// Map one row window: PK, weight, column moves, then the null words and
+    /// computed columns. `out.count` must already cover the destination window —
     /// every `*_mut` accessor is `count`-bounded.
-    fn map_rows_into(&self, in_batch: &Batch, output: &mut Batch, w: RowWindow, mut blob: BlobMode<'_>) {
+    fn map_rows_into(&mut self, in_batch: &Batch, output: &mut Batch, w: RowWindow, mut blob: BlobMode<'_>) {
         let RowWindow { src: src_start, dst: dst_base, n } = w;
         // Both PK sources that read the *input* row, so both belong to the
         // window rather than to a pass over the finished batch.
@@ -564,50 +523,11 @@ impl MapPlan {
         output.weight_data_mut()[dst_base * 8..(dst_base + n) * 8]
             .copy_from_slice(&in_batch.weight_data()[src_start * 8..(src_start + n) * 8]);
 
-        // Null bitmap, written before the compute kernel: an emit merges its null
-        // bits into the word with a read-modify-write `|=`. Split-borrow:
-        // `in_batch` and `output` are distinct allocations.
-        {
-            let in_nb = in_batch.null_bmp_data();
-            self.ev
-                .null_perm()
-                .write_rows(in_nb, src_start, output.null_bmp_data_mut(), dst_base, n);
-        }
-
         for c in self.ev.copies() {
             copy_column(in_batch, output, c, &mut blob, w);
         }
-
-        // Compute kernel
-        if self.ev.emits_anything() {
-            let in_mb = in_batch.as_mem_batch();
-            self.ev.eval_morsels(&in_mb, src_start, n, |morsel_start, out| {
-                // Emits: write each computed register to its output column. One
-                // `Iterator::next` per emit, against a `copy_from_slice` of up
-                // to 2 KiB — unlike `NullPerm`'s per-row loop, where the call
-                // would land per (row × pair).
-                let row0 = dst_base + morsel_start;
-                for &(reg, out_payload, stride) in self.ev.scalar_emits() {
-                    let (reg, out_payload) = (reg as usize, out_payload as usize);
-                    // One split borrow: the value slots and this column's bit in
-                    // the row-major NULL bitmap are written in the same pass over
-                    // the null rows.
-                    let (col, nb, _) = output.col_null_and_blob_mut(out_payload);
-                    out.emit_scalar_cells(reg, col, nb, row0, out_payload, stride as usize);
-                }
-
-                // String emits. Two passes inside the emit rather than a per-row
-                // nullness branch, because under `no_nulls` there is no
-                // `null_bits` to index at all. Both passes live on `MorselOut`,
-                // so the per-row loops run at gnitz-expr's opt-level rather than
-                // this crate's.
-                for &(reg, out_payload) in self.ev.str_emits() {
-                    let (reg, out_payload) = (reg as usize, out_payload as usize);
-                    let (col, nb, blob) = output.col_null_and_blob_mut(out_payload);
-                    out.emit_str_cells(reg, col, nb, blob, row0, out_payload);
-                }
-            });
-        }
+        self.ev
+            .write_computed(&in_batch.as_mem_batch(), src_start, n, output, dst_base);
     }
 }
 

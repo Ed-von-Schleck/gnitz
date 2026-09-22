@@ -14,7 +14,7 @@
 /// Static dispatch only wherever a *cell* is read per row: a `&dyn RowSource`
 /// there would put an indirect call on every [`crate::ColumnLocator`] read.
 /// A whole-batch consumer that resolves the regions once per morsel is not one
-/// of those, and [`crate::Evaluator`]'s kernels take `&dyn BatchView`.
+/// of those, and the evaluator's kernels take `&dyn BatchView`.
 /// (Convention: the trait is dyn-compatible, nothing enforces this.)
 ///
 /// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
@@ -33,7 +33,7 @@ pub trait RowSource {
     /// The variable-length string/blob heap the German-string cells point into.
     fn blob(&self) -> &[u8];
     /// Rows in this source. The bound every whole-source walk reads — the
-    /// evaluator's [`crate::Evaluator::filter_ranges`], the engine's N-way merge
+    /// evaluator's [`crate::RowFilter::ranges`], the engine's N-way merge
     /// — so that a caller can never drive a view past its own end with a count it
     /// carried alongside. `#[inline(always)]` on every implementor: the per-row
     /// and per-morsel callers live in gnitz-store, at opt-level 0.
@@ -66,6 +66,14 @@ pub trait BatchView: RowSource {
     /// region pays one call to obtain both, matching the single `col_data` call
     /// its payload counterpart makes.
     fn pk_region(&self) -> (&[u8], usize);
+}
+
+/// The batch a map writes its computed columns into.
+pub trait MapTarget {
+    /// The row-major null bitmap, 8 bytes per row.
+    fn null_bmp_mut(&mut self) -> &mut [u8];
+    /// Payload slot `pi`'s cell region, the null bitmap, and the blob heap a string cell spills into.
+    fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>);
 }
 
 /// One PK-column expectation for [`assert_batchview_consistent`]: type code,

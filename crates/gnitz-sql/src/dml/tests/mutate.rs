@@ -24,7 +24,7 @@ fn compile(set: &str, schema: &Schema) -> Result<Vec<SetCol>, GnitzSqlError> {
 /// the test.
 fn run(set: &str, schema: &Schema, rows: ZSetBatch) -> Result<ZSetBatch, GnitzSqlError> {
     apply_set(
-        &compile(set, schema).expect("test SET list must compile"),
+        &mut compile(set, schema).expect("test SET list must compile"),
         rows,
         None,
         schema,
@@ -213,9 +213,9 @@ fn a_copy_from_a_null_source_sets_the_null_bit() {
     let rows = rows_of(&schema, 1, |a, _| {
         a.i64_val(5).null();
     });
-    let set = compile("a = b", &schema).unwrap();
+    let mut set = compile("a = b", &schema).unwrap();
     assert!(matches!(set[0].rhs, SetRhs::Copy { src: 1, .. }));
-    let out = apply_set(&set, rows, None, &schema).unwrap();
+    let out = apply_set(&mut set, rows, None, &schema).unwrap();
     assert!(is_null(&out, 0, 0), "a takes b's NULL");
     assert!(is_null(&out, 1, 0), "b stays null");
 }
@@ -346,12 +346,15 @@ fn set_int_column_from_float_expression_rejects() {
 #[test]
 fn a_computed_string_evaluates_to_a_string() {
     let schema = table(vec![col_def("val", TypeCode::String, true)]);
-    let set = compile("val = UPPER(val)", &schema).unwrap();
+    let mut set = compile("val = UPPER(val)", &schema).unwrap();
     assert!(matches!(&set[0].rhs, SetRhs::Expr { ev, .. } if ev.result_is_str()));
     let rows = rows_of(&schema, 1, |a, _| {
         a.str_val("hello");
     });
-    assert_eq!(str_at(&apply_set(&set, rows, None, &schema).unwrap(), 0, 0), b"HELLO");
+    assert_eq!(
+        str_at(&apply_set(&mut set, rows, None, &schema).unwrap(), 0, 0),
+        b"HELLO"
+    );
 }
 
 #[test]

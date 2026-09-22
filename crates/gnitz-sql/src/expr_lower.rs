@@ -1,5 +1,5 @@
 //! Expression lowering: a bound `BoundExpr` → the VM's opcode program, as a
-//! `LogicalProgram`, a resolved `Evaluator`, or raw predicate bytes.
+//! `LogicalProgram`, a resolved `ScalarEval`, or raw predicate bytes.
 //!
 //! This is the *scalar* half of lowering. `hir::lower` is the *relational* half
 //! (`RelExpr` → DBSP circuit) and calls into this one for every filter, map and
@@ -14,8 +14,8 @@ use crate::ir::{
 };
 use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
-    CalendarOp, CmpOp, Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern,
-    LogicalInstr as L, LogicalProgram, Reg,
+    CalendarOp, CmpOp, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LikePattern, LogicalInstr as L,
+    LogicalProgram, Reg, ScalarEval,
 };
 use gnitz_wire::decimal::{format_decimal, parse_decimal, pow10, rescale, MAX_DECIMAL_SCALE};
 
@@ -996,11 +996,8 @@ fn constant_truth(e: &BoundExpr) -> Option<bool> {
     }
 }
 
-/// Compile the AND of `conjuncts` as a filter program. A constant-true conjunct
-/// tests nothing and is dropped wherever it sits; `None` is the
-/// statically-true verdict once nothing is left, on which the caller keeps every
-/// row rather than paying a per-row evaluation. A false constant keeps its
-/// program: it must still drop every row.
+/// The AND of `conjuncts` as a filter program, less its constant-true
+/// conjuncts; `None` when none is left.
 pub(crate) fn compile_filter_program<'a>(
     conjuncts: impl IntoIterator<Item = &'a BoundExpr>,
     cols: &[ColumnDef],
@@ -1032,23 +1029,8 @@ pub(crate) fn compile_wire_conjuncts<'a>(
         .unwrap_or_default())
 }
 
-/// The AND of `conjuncts` as a resolved filter evaluator; `None` when
-/// statically true. `resolve_filter` gives a bare non-boolean predicate
-/// (`HAVING COUNT(*)`) the `bool_bits` bit [`Evaluator::filter_ranges`] reads.
-pub(crate) fn compile_conjuncts_evaluator<'a>(
-    conjuncts: impl IntoIterator<Item = &'a BoundExpr>,
-    schema: &Schema,
-) -> Result<Option<Evaluator>, GnitzSqlError> {
-    Ok(compile_filter_program(conjuncts, &schema.columns)?
-        .map(|p| p.resolve_filter(schema))
-        .transpose()?)
-}
-
-/// A scalar (non-predicate) expression — a SET value, a grouped SELECT's
-/// finalize item — as a resolved evaluator read a row at a time. Whether the
-/// result is a string, and so which read-back applies, the caller asks the
-/// evaluator (`Evaluator::result_is_str`).
-pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Result<Evaluator, GnitzSqlError> {
+/// A scalar (non-predicate) expression as a resolved evaluator.
+pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Result<ScalarEval, GnitzSqlError> {
     Ok(compile_bound_expr_to_program(expr, &schema.columns)?.resolve_scalar(schema)?)
 }
 

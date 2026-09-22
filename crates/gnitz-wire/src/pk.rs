@@ -145,8 +145,14 @@ pub fn store_opk_image(image: u128, src_tc: TypeCode, src_w: usize, target_tc: T
 /// width propagates and the store is one instruction.
 #[inline(always)]
 pub fn decode_pk_column(src: &[u8], tc: TypeCode, dst: &mut [u8]) {
+    decode_pk_cell(src, tc.is_signed_int(), dst)
+}
+
+/// [`decode_pk_column`] with the column's signedness decided by the caller, so a
+/// row loop tests the type once.
+#[inline(always)]
+pub fn decode_pk_cell(src: &[u8], flip: bool, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
-    let flip = tc.is_signed_int();
     macro_rules! decode {
         ($ty:ty, $sign_bit:expr) => {{
             const W: usize = std::mem::size_of::<$ty>();

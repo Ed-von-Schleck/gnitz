@@ -1,26 +1,23 @@
-//! [`Evaluator`] — a resolved program plus the register file it runs in, and the
-//! ways to drive it: one private morsel loop ([`Evaluator::drive`]) under one
-//! read-back per result class — a filter's ranges, an [`ExprResults`], or the
-//! raw registers through [`MorselOut`]. There is no single-row arity; a caller
-//! that wants one row drives its batch and indexes the result.
-//!
-//! The evaluator owns its register file so that no caller can size the scratch
-//! for one nullability arm and then read the other: a `no_nulls` register read
-//! out of a nullable-sized scratch reads a register that arm never unpacked.
+//! The evaluator: a resolved program and its register file ([`Evaluator`]),
+//! wrapped in one public type per consumer — [`RowFilter`], [`MapEval`],
+//! [`ScalarEval`] — each exposing only its own read-back.
 //!
 //! Row ranges are half-open everywhere in this file: `end` is EXCLUSIVE.
 
-use std::cell::RefCell;
+use gnitz_wire::ReadBound;
 
-use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, StrBufs, MORSEL};
-use crate::program::Role;
-use crate::{BatchView, ColumnLocator, ExprValidateErr, LogicalProgram, NullPerm, ResolvedProgram, SchemaFacts};
+use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
+use crate::program::{ColCopy, MapSinks, ReadAs};
+use crate::{
+    BatchView, ExprValidateErr, LogicalProgram, MapTarget, Output, RangeMembership, ResolvedProgram, SchemaFacts,
+};
 
 /// One program's result for every row of a batch, in the shape its result
-/// register's class fixes. A consumer reads the class off the value it was
-/// handed, so it never asks the program and never carries the answer alongside.
+/// register's class fixes.
 pub enum ExprResults {
-    Scalar(Vec<Option<i64>>),
+    /// Every row's integer value, `None` for SQL NULL. A float result is its
+    /// `f64` bit pattern.
+    Int(Vec<Option<i128>>),
     /// Every row's bytes concatenated, addressed by `(offset, length)`; `None`
     /// for SQL NULL, which contributes no bytes.
     Str {
@@ -29,213 +26,238 @@ pub enum ExprResults {
     },
 }
 
-/// A resolved expression program together with the register file it evaluates
-/// into: the runnable form the [`LogicalProgram`] constructors below produce,
-/// and the whole surface a caller outside this crate needs.
-///
-/// The scratch is a `RefCell` because every entry point takes `&self` — a plan
-/// node is reached through a shared handle while its evaluator mutates
-/// registers. Single-threaded by construction: an evaluator is owned by one
-/// operator on one worker, and the drive methods are **not re-entrant** —
-/// calling one from inside [`Self::eval_morsels`]'s callback panics on the live
-/// borrow.
-pub struct Evaluator {
+/// A resolved program and the register file it evaluates into.
+pub(crate) struct Evaluator {
     pub(crate) prog: ResolvedProgram,
-    scratch: RefCell<EvalScratch>,
+    scratch: EvalScratch,
 }
 
-/// Validating constructors — the only way to obtain an [`Evaluator`].
-///
-/// There is no unvalidated public `resolve`: resolution bakes in payload slots,
-/// PK byte offsets, type codes and the nullability verdict, so a program
-/// resolved against a schema it was never checked against addresses columns that
-/// may not exist — the kernels would trip an assertion, or in release read a
-/// neighbouring slot. Pairing each validation rule with the resolution it guards
-/// makes "this program was checked against the schema it runs on" a property of
-/// the type rather than a convention every consuming crate has to remember.
-///
-/// The three differ only in the [`Role`] they name, which fixes both the extra
-/// rules and the resolution.
+/// The only way to obtain an evaluator: each constructor validates the program
+/// against the schemas it will run on, then resolves it against them.
 impl LogicalProgram {
-    /// A filter predicate: checked against the schema it reads, and required to
-    /// own a non-string result register. Resolved with `result_reg` eligible for
-    /// the bit_only path, which [`Evaluator::filter_ranges`] reads as packed
-    /// bits.
-    pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        self.into_evaluator(schema, Role::Filter)
+    /// A filter predicate; its result must not be a string.
+    pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<RowFilter, ExprValidateErr> {
+        let Output::Result(r) = self.output else {
+            return Err(ExprValidateErr::OutputRoleMismatch);
+        };
+        if (self.str_class >> r.0) & 1 != 0 {
+            return Err(ExprValidateErr::RegClassMismatch { reg: r.0 });
+        }
+        self.validate(schema, None)?;
+        let (prog, _) = self.resolve_program(schema, Some(ReadAs::Bool));
+        let pred = FilterEval {
+            ev: Evaluator::new(prog),
+            result_reg: r.0 as usize,
+        };
+        Ok(RowFilter {
+            pred: Some(pred),
+            walk: None,
+            words: Vec::new(),
+        })
     }
 
-    /// A map: checked against both the schema it reads and the one it writes,
-    /// so every declared output payload slot is covered exactly once.
+    /// A scalar expression, one value per row.
+    pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<ScalarEval, ExprValidateErr> {
+        let Output::Result(r) = self.output else {
+            return Err(ExprValidateErr::OutputRoleMismatch);
+        };
+        self.validate(schema, None)?;
+        let is_str = (self.str_class >> r.0) & 1 != 0;
+        let (prog, reg_u64) = self.resolve_program(schema, Some(ReadAs::Value));
+        let class = match (is_str, (reg_u64 >> r.0) & 1 != 0) {
+            (true, _) => ResultClass::Str,
+            (false, true) => ResultClass::Unsigned,
+            (false, false) => ResultClass::Signed,
+        };
+        Ok(ScalarEval {
+            ev: Evaluator::new(prog),
+            result_reg: r.0 as usize,
+            class,
+        })
+    }
+
+    /// A map from `in_schema` to `out_schema`, covering every output payload slot
+    /// exactly once.
     pub fn resolve_map(
         self,
         in_schema: &dyn SchemaFacts,
         out_schema: &dyn SchemaFacts,
-    ) -> Result<Evaluator, ExprValidateErr> {
-        self.into_evaluator(in_schema, Role::Map(out_schema))
-    }
-
-    /// A scalar expression read back through [`Evaluator::eval_all`] — a DML SET
-    /// right-hand side. Same checks as a map minus the output plan, plus the
-    /// filter's rule that the program must own a result register, which is what
-    /// the result is read out of.
-    ///
-    /// `result_reg` is not marked as a filter's, so it is excluded from
-    /// `bool_input` and a bare non-boolean result has no `bool_bits` bit — which
-    /// is why a predicate must go through [`Self::resolve_filter`] instead, and
-    /// why [`Evaluator::filter_ranges`] refuses an evaluator resolved here. A
-    /// boolean-valued RHS (`SET flag = a AND b`) reads back off the `regs` lane
-    /// like any other: `analyze` puts a non-filter `result_reg` in
-    /// `non_bool_read`, so it is never bit_only and its producer unpacks.
-    pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        self.into_evaluator(schema, Role::Scalar)
-    }
-
-    fn into_evaluator(self, schema: &dyn SchemaFacts, role: Role<'_>) -> Result<Evaluator, ExprValidateErr> {
-        self.validate_for(schema, role)?;
-        let prog = self.resolve_program(schema, role);
-        let scratch = RefCell::new(EvalScratch::new(&prog));
-        Ok(Evaluator { prog, scratch })
+    ) -> Result<MapEval, ExprValidateErr> {
+        let Output::Slots(_) = self.output else {
+            return Err(ExprValidateErr::OutputRoleMismatch);
+        };
+        self.validate(in_schema, Some(out_schema))?;
+        let is_identity = self.is_identity_map(in_schema, out_schema);
+        let sinks = self.map_sinks(in_schema, out_schema);
+        let (prog, _) = self.resolve_program(in_schema, None);
+        Ok(MapEval {
+            ev: Evaluator::new(prog),
+            sinks,
+            is_identity,
+        })
     }
 }
 
 impl Evaluator {
-    /// The one morsel-chunking loop, behind every drive method below: evaluate
-    /// `start..start + n` a morsel at a time, calling `per_morsel(scratch, bufs,
-    /// rel_start, m)` after each — `rel_start` is the offset from `start`.
-    ///
-    /// The scratch is dereferenced once and the string column regions resolved
-    /// once, rather than per morsel: at opt-level=0 each `&mut scratch` through
-    /// the `RefCell` guard is an out-of-line `RefMut::deref_mut` call.
-    fn drive(
-        &self,
+    fn new(prog: ResolvedProgram) -> Self {
+        let scratch = EvalScratch::new(&prog);
+        Evaluator { prog, scratch }
+    }
+
+    /// Evaluate rows `start..start + n` a morsel at a time, handing
+    /// `f(rel_start, out)` each morsel's registers; `rel_start` counts from `start`.
+    pub(crate) fn eval_morsels(
+        &mut self,
         mb: &dyn BatchView,
         start: usize,
         n: usize,
-        mut per_morsel: impl FnMut(&mut EvalScratch, StrBufs<'_>, usize, usize),
+        mut f: impl FnMut(usize, &MorselOut<'_>),
     ) {
         debug_assert!(
             start + n <= mb.row_count(),
-            "drive window {start}..{} is past the batch's end",
+            "eval window {start}..{} is past the batch's end",
             start + n,
         );
-        let scratch = &mut *self.scratch.borrow_mut();
-        with_str_bufs(&self.prog, mb, |bufs| {
+        let Evaluator { prog, scratch } = self;
+        with_str_bufs(prog, mb, |bufs| {
             for rel_start in (0..n).step_by(MORSEL) {
                 let m = MORSEL.min(n - rel_start);
-                eval_batch(&self.prog, mb, bufs, start + rel_start, m, scratch);
-                per_morsel(scratch, bufs, rel_start, m);
+                eval_batch(prog, mb, bufs, start + rel_start, m, scratch);
+                f(rel_start, &scratch.morsel_out(prog, bufs, m));
             }
         });
     }
 
-    /// Drive `n` rows starting at `start`, one morsel at a time, calling
-    /// `f(rel_start, out)` per morsel, where `out` reads the morsel's results
-    /// out of the register file. One closure call per *morsel*, not per row.
-    ///
-    /// `f` stays an `impl FnMut` where the batch is a `&dyn`: a `&mut dyn FnMut`
-    /// would force the `MorselOut` to materialise and stop the emit lists
-    /// hoisting out of the morsel loop.
-    pub fn eval_morsels(&self, mb: &dyn BatchView, start: usize, n: usize, mut f: impl FnMut(usize, &MorselOut<'_>)) {
-        self.drive(mb, start, n, |scratch, bufs, rel_start, m| {
-            f(rel_start, &scratch.morsel_out(bufs, m))
-        });
+    /// Test hook: run this program on the nullable arm.
+    #[cfg(test)]
+    pub(crate) fn force_nullable_arm(&mut self) {
+        self.prog.no_nulls = false;
+        self.scratch = EvalScratch::new(&self.prog);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RowFilter
+// ---------------------------------------------------------------------------
+
+/// A predicate's evaluator and the register its verdict lands in.
+pub(crate) struct FilterEval {
+    ev: Evaluator,
+    result_reg: usize,
+}
+
+/// Which rows of a batch survive a predicate and a range walk, either optional.
+pub struct RowFilter {
+    pred: Option<FilterEval>,
+    walk: Option<RangeMembership>,
+    /// One bit per row of the batch being filtered.
+    words: Vec<u64>,
+}
+
+impl RowFilter {
+    /// A read's filter: its wire predicate (empty for none), and the part of its
+    /// bound the source did not apply.
+    pub fn for_read(
+        predicate: &[u8],
+        unapplied: &ReadBound,
+        schema: &dyn SchemaFacts,
+    ) -> Result<Self, ExprValidateErr> {
+        let mut f = match predicate.is_empty() {
+            true => RowFilter {
+                pred: None,
+                walk: None,
+                words: Vec::new(),
+            },
+            false => LogicalProgram::from_blob(predicate, "filter")?.resolve_filter(schema)?,
+        };
+        f.walk = match unapplied {
+            ReadBound::PkRange(desc) => Some(RangeMembership::new(schema.pk_cols(), *desc, schema)?),
+            ReadBound::IndexRange(b) => Some(RangeMembership::new(b.idx_cols.as_slice(), b.desc, schema)?),
+            ReadBound::None | ReadBound::PkSet(_) => None,
+        };
+        Ok(f)
     }
 
-    /// The verbatim column moves a map materializes columnar-side, as
-    /// `(source locator, output payload slot, destination write width)`. A slice
-    /// rather than an iterator: at `opt-level=0` the iterator's `next` would be
-    /// an out-of-line call per (range × move).
-    pub fn copies(&self) -> &[(ColumnLocator, u32, u8)] {
-        &self.prog.copies
+    pub fn keeps_every_row(&self) -> bool {
+        self.pred.is_none() && self.walk.is_none()
     }
 
-    /// The scalar-register emits: one bulk copy of the register image each,
-    /// or its low bytes into a narrower slot.
-    pub fn scalar_emits(&self) -> &[(u16, u32, u8)] {
-        &self.prog.scalar_emits
-    }
-
-    /// The string-register emits: a German-string cell encoded per row each.
-    pub fn str_emits(&self) -> &[(u16, u32)] {
-        &self.prog.str_emits
-    }
-
-    /// True iff the program writes any output slot out of the register file, so
-    /// driving the kernel can change the output. A pure projection emits
-    /// nothing.
-    pub fn emits_anything(&self) -> bool {
-        !self.scalar_emits().is_empty() || !self.str_emits().is_empty()
-    }
-
-    /// How a map moves a copied column's null bit — the copy list and the
-    /// schema's nullable slots, resolved into one permutation.
-    pub fn null_perm(&self) -> &NullPerm {
-        &self.prog.null_perm
-    }
-
-    /// Run as a filter over all of `mb`'s rows, collecting each maximal
-    /// contiguous run of passing rows into `out` (cleared first, and reusable
-    /// across chunks). The bitmap stays inside the scratch. `[(0, n)]` is the
-    /// agreed spelling of "no predicate".
-    pub fn filter_ranges(&self, mb: &dyn BatchView, out: &mut Vec<(usize, usize)>) {
-        self.filter_ranges_over(mb, None, out);
-    }
-
-    /// [`Self::filter_ranges`], keeping only the rows whose bit is also set in `mask`
-    /// (one bit per row of `mb`).
-    pub fn filter_ranges_within(&self, mb: &dyn BatchView, mask: &[u64], out: &mut Vec<(usize, usize)>) {
-        self.filter_ranges_over(mb, Some(mask), out);
-    }
-
-    fn filter_ranges_over(&self, mb: &dyn BatchView, mask: Option<&[u64]>, out: &mut Vec<(usize, usize)>) {
-        assert!(
-            self.prog.is_filter(),
-            "filter_ranges on an evaluator that did not resolve as a filter: only \
-             `resolve_filter` forces the result register into `bool_pack`, so no \
-             `bool_bits` word is written for it and every row would read as failing",
-        );
+    /// The surviving rows of `mb` as maximal runs into `out` (cleared first).
+    pub fn ranges(&mut self, mb: &dyn BatchView, out: &mut Vec<(usize, usize)>) {
         out.clear();
         let n = mb.row_count();
-        self.scratch.borrow_mut().ensure_filter_words(n);
-        self.drive(mb, 0, n, |scratch, _, morsel_start, m| {
-            scratch.write_filter_words(&self.prog, morsel_start, m)
-        });
-        let mut scratch = self.scratch.borrow_mut();
-        let words = scratch.filter_words_mut(n);
-        if let Some(mask) = mask {
-            assert_eq!(mask.len(), words.len(), "filter_ranges_within: one mask bit per row");
-            words.iter_mut().zip(mask).for_each(|(w, m)| *w &= m);
+        if self.keeps_every_row() {
+            if n > 0 {
+                out.push((0, n));
+            }
+            return;
+        }
+        self.words.resize(n.div_ceil(64), 0);
+        let words = &mut self.words[..];
+        match &mut self.pred {
+            Some(FilterEval { ev, result_reg }) => ev.eval_morsels(mb, 0, n, |rel_start, out| {
+                let first = rel_start / 64;
+                out.filter_words(*result_reg, &mut words[first..first + out.rows().div_ceil(64)]);
+            }),
+            None => {
+                words.fill(u64::MAX);
+                if !n.is_multiple_of(64) {
+                    words[n / 64] = gnitz_wire::low_bits_mask(n % 64);
+                }
+            }
+        }
+        if let Some(w) = &self.walk {
+            w.and_into(mb, words);
         }
         scan_filter_bits(words, n, out);
     }
+}
 
-    /// Evaluate every row of `mb` in one morsel-at-a-time pass, where
-    /// `row_count()` single-row drives would each pay `eval_batch`'s
-    /// straight-line prologue for one row.
-    pub fn eval_all(&self, mb: &dyn BatchView) -> ExprResults {
-        assert!(
-            !self.prog.is_filter(),
-            "eval_all on a filter-resolved evaluator: its result register may be bit_only, \
-             whose producer skips the unpack, so the `regs` lane holds no value to read back",
-        );
-        let n = mb.row_count();
-        if !self.prog.result_is_str() {
-            let mut vals = Vec::with_capacity(n);
-            self.drive(mb, 0, n, |scratch, _, _, m| {
-                scratch.append_result_values(&self.prog, m, &mut vals)
-            });
-            return ExprResults::Scalar(vals);
-        }
-        let r = self.prog.result_reg as usize;
-        let (mut bytes, mut spans) = (Vec::new(), Vec::with_capacity(n));
-        self.drive(mb, 0, n, |scratch, bufs, _, m| {
-            let out = scratch.morsel_out(bufs, m);
-            // Copy every row, then blank the NULL ones — the two-pass shape every
-            // emit uses, since a per-row nullness branch would need a `null_bits`
-            // that the `no_nulls` arm does not allocate.
+// ---------------------------------------------------------------------------
+// ScalarEval
+// ---------------------------------------------------------------------------
+
+/// How a scalar's result register reads back.
+#[derive(Clone, Copy)]
+enum ResultClass {
+    Signed,
+    Unsigned,
+    Str,
+}
+
+/// A scalar expression: one value per row.
+pub struct ScalarEval {
+    ev: Evaluator,
+    result_reg: usize,
+    class: ResultClass,
+}
+
+impl ScalarEval {
+    pub fn eval_all(&mut self, mb: &dyn BatchView) -> ExprResults {
+        let unsigned = match self.class {
+            ResultClass::Str => return self.eval_all_str(mb),
+            ResultClass::Signed => false,
+            ResultClass::Unsigned => true,
+        };
+        let r = self.result_reg;
+        let mut vals = Vec::with_capacity(mb.row_count());
+        self.ev.eval_morsels(mb, 0, mb.row_count(), |_, out| {
+            let first = vals.len();
+            vals.extend(out.reg_values(r).iter().map(|&x| match unsigned {
+                true => Some(i128::from(x as u64)),
+                false => Some(i128::from(x)),
+            }));
+            out.for_each_null_row(r, |i| vals[first + i] = None);
+        });
+        ExprResults::Int(vals)
+    }
+
+    fn eval_all_str(&mut self, mb: &dyn BatchView) -> ExprResults {
+        let r = self.result_reg;
+        let (mut bytes, mut spans) = (Vec::new(), Vec::with_capacity(mb.row_count()));
+        self.ev.eval_morsels(mb, 0, mb.row_count(), |_, out| {
             let first = spans.len();
-            for i in 0..m {
+            for i in 0..out.rows() {
                 let b = out.str_bytes(r, i);
                 spans.push(Some((bytes.len(), b.len())));
                 bytes.extend_from_slice(b);
@@ -245,26 +267,129 @@ impl Evaluator {
         ExprResults::Str { bytes, spans }
     }
 
-    /// Whether the result register holds a string, i.e. which arm
-    /// [`Self::eval_all`] will hand back. Resolution knows the answer, so a
-    /// caller deciding what a program may be assigned to never re-derives it.
+    /// Whether [`Self::eval_all`] hands back [`ExprResults::Str`].
     pub fn result_is_str(&self) -> bool {
-        self.prog.result_is_str()
+        matches!(self.class, ResultClass::Str)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MapEval
+// ---------------------------------------------------------------------------
+
+/// A map: column moves the caller runs, and the computed columns
+/// [`Self::write_computed`] writes.
+pub struct MapEval {
+    ev: Evaluator,
+    sinks: MapSinks,
+    is_identity: bool,
+}
+
+impl MapEval {
+    pub fn copies(&self) -> &[ColCopy] {
+        &self.sinks.copies
     }
 
-    /// Whether a [`ExprResults::Scalar`] value is a `u64` bit pattern rather than
-    /// an `i64`: the resolve-time U64 tracking of the result register.
-    pub fn result_is_u64(&self) -> bool {
-        self.prog.result_is_u64()
+    /// True iff some output slot is computed rather than copied.
+    pub fn emits_anything(&self) -> bool {
+        !self.sinks.scalar_emits.is_empty() || !self.sinks.str_emits.is_empty()
     }
 
-    /// Move this evaluator onto the nullable arm, rebuilding the scratch — which
-    /// [`EvalScratch::new`] sizes for one arm, so flipping the flag alone would
-    /// leave the null buffers unallocated. Behind `test_support::both_arms`.
-    #[cfg(test)]
-    pub(crate) fn force_nullable_arm(&mut self) {
-        self.prog.no_nulls = false;
-        *self.scratch.get_mut() = EvalScratch::new(&self.prog);
+    /// True iff the map reproduces its input, given the input's PK carried through.
+    pub fn is_identity(&self) -> bool {
+        self.is_identity
+    }
+
+    /// Write the null words and computed columns of source rows
+    /// `src_start..src_start + n` into `dst` rows from `dst_start`.
+    pub fn write_computed<T: MapTarget + ?Sized>(
+        &mut self,
+        src: &dyn BatchView,
+        src_start: usize,
+        n: usize,
+        dst: &mut T,
+        dst_start: usize,
+    ) {
+        let emits = self.emits_anything();
+        let MapEval { ev, sinks, .. } = self;
+        sinks
+            .null_perm
+            .write_rows(src.null_bmp(), src_start, dst.null_bmp_mut(), dst_start, n);
+        if !emits {
+            return;
+        }
+        ev.eval_morsels(src, src_start, n, |rel_start, out| {
+            let row0 = dst_start + rel_start;
+            for e in &sinks.scalar_emits {
+                out.emit_scalar(e, dst.slot_mut(e.slot), row0);
+            }
+            for e in &sinks.str_emits {
+                out.emit_str(e, dst.slot_mut(e.slot), row0);
+            }
+        });
+    }
+}
+
+/// The evaluator behind each public type, for tests that drive its registers
+/// directly.
+#[cfg(test)]
+pub(crate) trait Resolved {
+    fn ev(&mut self) -> &mut Evaluator;
+    fn prog(&self) -> &ResolvedProgram;
+    fn into_prog(self) -> ResolvedProgram;
+
+    fn eval_morsels(&mut self, mb: &dyn BatchView, start: usize, n: usize, f: impl FnMut(usize, &MorselOut<'_>)) {
+        self.ev().eval_morsels(mb, start, n, f)
+    }
+
+    fn force_nullable_arm(&mut self) {
+        self.ev().force_nullable_arm()
+    }
+}
+
+#[cfg(test)]
+impl Resolved for RowFilter {
+    fn ev(&mut self) -> &mut Evaluator {
+        &mut self.pred.as_mut().expect("a RowFilter with a predicate").ev
+    }
+    fn prog(&self) -> &ResolvedProgram {
+        &self.pred.as_ref().expect("a RowFilter with a predicate").ev.prog
+    }
+    fn into_prog(self) -> ResolvedProgram {
+        self.pred.expect("a RowFilter with a predicate").ev.prog
+    }
+}
+
+#[cfg(test)]
+impl Resolved for ScalarEval {
+    fn ev(&mut self) -> &mut Evaluator {
+        &mut self.ev
+    }
+    fn prog(&self) -> &ResolvedProgram {
+        &self.ev.prog
+    }
+    fn into_prog(self) -> ResolvedProgram {
+        self.ev.prog
+    }
+}
+
+#[cfg(test)]
+impl Resolved for MapEval {
+    fn ev(&mut self) -> &mut Evaluator {
+        &mut self.ev
+    }
+    fn prog(&self) -> &ResolvedProgram {
+        &self.ev.prog
+    }
+    fn into_prog(self) -> ResolvedProgram {
+        self.ev.prog
+    }
+}
+
+#[cfg(test)]
+impl MapEval {
+    pub(crate) fn sinks(&self) -> &MapSinks {
+        &self.sinks
     }
 }
 

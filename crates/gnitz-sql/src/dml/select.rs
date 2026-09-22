@@ -247,7 +247,7 @@ fn plan_query(cat: &CatalogSnapshot, query: &Query, schema_name: &str) -> Result
 /// The WHERE → access step: the bound and the compiled predicate.
 fn plan_access(desc: &RelDescriptor, alias: &str, select: &Select) -> Result<(ReadBound, Vec<u8>), GnitzSqlError> {
     let bound_where = bind_where(&desc.schema, alias, select.selection.as_ref())?;
-    let (bound, predicate, _) = bound_and_predicate(&desc.schema, &bound_where, &desc.indexes)?.into_parts();
+    let (bound, predicate) = bound_and_predicate(&desc.schema, &bound_where, &desc.indexes)?.into_parts();
     Ok((bound, predicate))
 }
 
@@ -329,7 +329,7 @@ fn plan_constant(query: &Query, select: &Select) -> Result<(Arc<Schema>, ZSetBat
             }
         }
     }
-    let finish = FoldFinish::new(ground, [], &[], items)?;
+    let mut finish = FoldFinish::new(ground, [], &[], items)?;
     let mut ground_row = ZSetBatch::with_capacity(&finish.partial_schema, 1);
     BatchAppender::new(&mut ground_row, &finish.partial_schema).add_row(gnitz_wire::global_group_key(), 1);
     Ok((Arc::clone(&finish.out_schema), finish.apply(ground_row)))
@@ -354,7 +354,7 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             let batch = client.scan_spec_local_first(read.desc.tid, read.spec, &reply_schema)?;
             (reply_schema, batch)
         }
-        ReadCase::Fold { read, finish, .. } => {
+        ReadCase::Fold { read, mut finish, .. } => {
             // A wire error (the per-worker group cap included) is hard: the fold is
             // mid-flight on the workers and cannot fall back.
             let partial = client.scan_spec_local_first(read.desc.tid, read.spec, &finish.partial_schema)?;

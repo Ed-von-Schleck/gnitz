@@ -4,7 +4,7 @@
 //! `crate::expr::MapPlan::evaluate_map_batch`, null-extend
 //! `Batch::widened_with_nulls`.
 
-use gnitz_expr::Evaluator;
+use gnitz_expr::RowFilter;
 
 use crate::schema::{DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout};
@@ -18,17 +18,16 @@ use crate::storage::{Batch, Layout};
 /// through instead of paying `from_ranges` a whole-batch copy, blob heap
 /// included. An index-bounded backfill takes that path on every chunk: the
 /// access path already satisfies the predicate the circuit still carries.
-pub fn op_filter(batch: &Batch, pred: &Evaluator, schema: &SchemaDescriptor) -> Option<Batch> {
-    // The DAG pushes an empty placeholder every epoch, and `filter_ranges` takes
-    // its scratch borrow and sizes it before the morsel loop.
+pub fn op_filter(batch: &Batch, pred: &mut RowFilter, schema: &SchemaDescriptor) -> Option<Batch> {
+    // The DAG pushes an empty placeholder every epoch; nothing to evaluate.
     if batch.count == 0 {
         return Some(Batch::empty_with_schema(schema));
     }
 
-    // A per-call `Vec`: measured against a reused one it is a wash. `filter_ranges`
+    // A per-call `Vec`: measured against a reused one it is a wash. `ranges`
     // lends `out` so a *chunked* scan can carry one list; this caller has one batch.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    pred.filter_ranges(&batch.as_mem_batch(), &mut ranges);
+    pred.ranges(&batch.as_mem_batch(), &mut ranges);
     if ranges == [(0, batch.count)] {
         return None;
     }

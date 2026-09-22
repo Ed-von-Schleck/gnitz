@@ -92,7 +92,8 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
         program.instructions.len()
     );
 
-    for instr in &program.instructions[start_pc..] {
+    let Program { instructions, delta_schemas, .. } = program;
+    for instr in &mut instructions[start_pc..] {
         let (in_reg, out_reg) = (instr.in_reg, instr.out_reg);
 
         // Fold in place what this instruction is the first reader of: the raw
@@ -100,18 +101,18 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
         // kernel's own fold would allocate a copy beside it.
         for (i, r) in instr.operands() {
             if instr.folds[i] {
-                batches[r.at()].consolidate_in_place(program.schema_of(r));
+                batches[r.at()].consolidate_in_place(&delta_schemas[r.at()]);
             }
         }
 
         let all_empty = instr.operands().all(|(_, r)| batches[r.at()].is_empty());
         // The kernel would return exactly this, so skip it and its trace cursor.
         let out = if instr.inert_on_empty && all_empty {
-            Batch::empty_with_schema(program.schema_of(out_reg))
+            Batch::empty_with_schema(&delta_schemas[out_reg.at()])
         } else {
-            match &instr.op {
+            match &mut instr.op {
                 Op::Filter(pred) => {
-                    let schema = program.schema_of(in_reg);
+                    let schema = &delta_schemas[in_reg.at()];
                     match ops::op_filter(&batches[in_reg.at()], pred, schema) {
                         Some(kept) => kept,
                         None => take_or_clone(batches, in_reg, instr.takes[0]),
@@ -141,13 +142,13 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
                         ops::op_union(
                             take_or_clone(batches, in_reg, instr.takes[0]),
                             &batches[in_b.at()],
-                            program.schema_of(out_reg),
+                            &delta_schemas[out_reg.at()],
                         )
                     }
                 }
 
                 Op::WeightClamp { hist, preset } => {
-                    let schema = program.schema_of(in_reg);
+                    let schema = &delta_schemas[in_reg.at()];
                     let delta = take_or_clone(batches, in_reg, instr.takes[0]);
                     // Opened before the ingest below: the clamp reads `z⁻¹(I)`.
                     let mut cursor = state.cursor(*hist);
@@ -162,14 +163,14 @@ fn run_instructions(vm: &mut VmHandle, state: &mut CircuitState, start_pc: usize
                 Op::JoinDT { trace, probe } => ops::op_join_delta_trace(
                     &batches[in_reg.at()],
                     &mut state.cursor(*trace),
-                    program.schema_of(out_reg),
+                    &delta_schemas[out_reg.at()],
                     *probe,
                 ),
 
                 Op::WorkerFilter { slot } => ops::op_worker_filter(&batches[in_reg.at()], *slot),
 
                 Op::NullExtend { nulls_first } => {
-                    batches[in_reg.at()].widened_with_nulls(program.schema_of(out_reg), *nulls_first)
+                    batches[in_reg.at()].widened_with_nulls(&delta_schemas[out_reg.at()], *nulls_first)
                 }
 
                 Op::Reduce { out_trace, plan } => {

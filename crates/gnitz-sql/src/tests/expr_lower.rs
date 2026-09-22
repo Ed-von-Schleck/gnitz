@@ -1444,7 +1444,7 @@ fn decimal_schema() -> Schema {
 
 /// Evaluate `expr` over one row `(p, q, i)` of the decimal schema, as the
 /// stored integers; `p` may be NULL.
-fn eval_decimal_row(expr: &BoundExpr, p: impl Into<Option<i64>>, q: i64, i: i64) -> Option<i64> {
+fn eval_decimal_row(expr: &BoundExpr, p: impl Into<Option<i64>>, q: i64, i: i64) -> Option<i128> {
     let schema = decimal_schema();
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
     let mut row = gnitz_core::BatchAppender::new(&mut batch, &schema);
@@ -1455,9 +1455,9 @@ fn eval_decimal_row(expr: &BoundExpr, p: impl Into<Option<i64>>, q: i64, i: i64)
     }
     .i64_val(q)
     .i64_val(i);
-    let ev = compile_scalar_evaluator(expr, &schema).expect("lowers");
+    let mut ev = compile_scalar_evaluator(expr, &schema).expect("lowers");
     match ev.eval_all(&batch) {
-        gnitz_expr::ExprResults::Scalar(vals) => vals[0],
+        gnitz_expr::ExprResults::Int(vals) => vals[0],
         gnitz_expr::ExprResults::Str { .. } => panic!("a scalar expression"),
     }
 }
@@ -1641,7 +1641,7 @@ fn a_comparison_against_a_finer_literal_is_exact() {
                         BinOp::Gt => a > b,
                         _ => a >= b,
                     };
-                    i64::from(holds)
+                    i128::from(holds)
                 });
                 let col_left = BoundExpr::bin(BoundExpr::ColRef(1), op, lit(text));
                 assert_eq!(eval_decimal_row(&col_left, p, 0, 0), want, "{p:?} {op:?} {text}");
@@ -1684,7 +1684,7 @@ fn typed_schema(tcs: &[TypeCode]) -> Schema {
 
 /// `sql` bound over [`typed_schema`] and evaluated on each row, given as the
 /// payload columns' values (`None` is NULL).
-fn eval_sql_rows(sql: &str, tcs: &[TypeCode], rows: &[Vec<Option<i128>>]) -> Vec<Option<i64>> {
+fn eval_sql_rows(sql: &str, tcs: &[TypeCode], rows: &[Vec<Option<i128>>]) -> Vec<Option<i128>> {
     let schema = typed_schema(tcs);
     let expr = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(sql), &schema, "t")
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -1707,9 +1707,9 @@ fn eval_sql_rows(sql: &str, tcs: &[TypeCode], rows: &[Vec<Option<i128>>]) -> Vec
         }
         batch.nulls.push(nulls);
     }
-    let ev = compile_scalar_evaluator(&expr, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut ev = compile_scalar_evaluator(&expr, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
     match ev.eval_all(&batch) {
-        gnitz_expr::ExprResults::Scalar(vals) => vals,
+        gnitz_expr::ExprResults::Int(vals) => vals,
         gnitz_expr::ExprResults::Str { .. } => panic!("a scalar expression"),
     }
 }
@@ -1743,9 +1743,9 @@ fn assert_literal_compares_exact(tc: TypeCode, lits: &[&str], rows: &[Option<i12
         let v = if text.starts_with('-') { -mag } else { mag };
         let scale = 10i128.pow(u32::from(s));
         for (op, conv) in CMP_SQL {
-            let want: Vec<Option<i64>> = rows
+            let want: Vec<Option<i128>> = rows
                 .iter()
-                .map(|x| x.map(|x| i64::from(holds(op, x * scale, v))))
+                .map(|x| x.map(|x| i128::from(holds(op, x * scale, v))))
                 .collect();
             for sql in [format!("c1 {op} {text}"), format!("{text} {conv} c1")] {
                 assert_eq!(eval_sql_rows(&sql, &[tc], &table), want, "{tc:?}: {sql}");
@@ -1842,7 +1842,7 @@ fn a_u64_and_a_signed_column_compare_exactly() {
     let pairs = [(top, -1), (0, -1), (1, 1), (1 << 63, i128::from(i64::MAX)), (5, 7)];
     let rows: Vec<Vec<Option<i128>>> = pairs.iter().map(|&(u, i)| vec![Some(u), Some(i)]).collect();
     for (op, _) in CMP_SQL {
-        let want: Vec<Option<i64>> = pairs.iter().map(|&(u, i)| Some(i64::from(holds(op, u, i)))).collect();
+        let want: Vec<Option<i128>> = pairs.iter().map(|&(u, i)| Some(i128::from(holds(op, u, i)))).collect();
         let sql = format!("c1 {op} c2");
         assert_eq!(
             eval_sql_rows(&sql, &[TypeCode::U64, TypeCode::I64], &rows),
@@ -1893,12 +1893,11 @@ fn a_date_meets_a_timestamp_in_microseconds() {
     assert_eq!(eval_sql_rows("c1 = c2", &tcs, &rows), vec![Some(1), Some(0)]);
     assert_eq!(eval_sql_rows("c1 > c2", &tcs, &rows), vec![Some(0), Some(0)]);
     assert_eq!(eval_sql_rows("c1 < c2", &tcs, &rows), vec![Some(0), Some(1)]);
-    let half = (day / 2) as i64;
-    assert_eq!(eval_sql_rows("c2 - c1", &tcs, &rows), vec![Some(0), Some(half)]);
+    assert_eq!(eval_sql_rows("c2 - c1", &tcs, &rows), vec![Some(0), Some(day / 2)]);
     let case = "CASE WHEN c3 = 1 THEN c1 ELSE c2 END";
     assert_eq!(
         eval_sql_rows(case, &tcs, &rows),
-        vec![Some((10 * day) as i64), Some((10 * day + day / 2) as i64)]
+        vec![Some(10 * day), Some(10 * day + day / 2)]
     );
     let schema = typed_schema(&tcs);
     let bound = crate::bind::bind_single_table(&crate::test_support::parse_expr_sql(case), &schema, "t").unwrap();
@@ -1921,4 +1920,170 @@ fn temporal_arithmetic_outside_the_allow_list_is_refused() {
         let err = compile_bound_expr_to_program(&expr, &schema.columns).expect_err(sql);
         assert!(err.to_string().contains(needle), "{sql}: {err}");
     }
+}
+
+// ------------------------------------------------------------------
+// A DML residual over the transaction's buffered rows
+// ------------------------------------------------------------------
+
+/// Which rows of `batch` inside `bound` pass every conjunct, through the wire blob
+/// a read ships.
+fn residual_rows(
+    conjuncts: &[&BoundExpr],
+    bound: &gnitz_wire::ReadBound,
+    batch: &gnitz_core::ZSetBatch,
+    schema: &Schema,
+) -> Vec<usize> {
+    let blob = compile_wire_conjuncts(conjuncts.iter().copied(), &schema.columns).expect("residual must compile");
+    let mut filter = gnitz_expr::RowFilter::for_read(&blob, bound, schema).expect("the blob resolves");
+    let mut ranges = Vec::new();
+    filter.ranges(batch, &mut ranges);
+    ranges.into_iter().flat_map(|(s, e)| s..e).collect()
+}
+
+/// Which rows `pred` alone selects, under no bound.
+fn residual_matches(pred: &BoundExpr, batch: &gnitz_core::ZSetBatch, schema: &Schema) -> Vec<usize> {
+    residual_rows(&[pred], &gnitz_wire::ReadBound::None, batch, schema)
+}
+
+fn col_eq(col: usize, v: i64) -> BoundExpr {
+    BoundExpr::bin(BoundExpr::ColRef(col), BinOp::Eq, BoundExpr::LitInt(v))
+}
+
+/// One row: PK `pk`, a single zero payload cell. The shape every PK-addressing
+/// test wants — the payload exists only because the schema declares it.
+fn pk_row(schema: &Schema, pk: u128) -> gnitz_core::ZSetBatch {
+    let mut batch = gnitz_core::ZSetBatch::new(schema);
+    gnitz_core::BatchAppender::new(&mut batch, schema)
+        .add_row(pk, 1)
+        .i64_val(0);
+    batch
+}
+
+#[test]
+fn a_null_residual_col_excludes_the_row_bare_and_compared() {
+    // `WHERE val` and `WHERE val = 0` must both miss a NULL row.
+    let schema = crate::test_support::two_col(TypeCode::I64);
+    let batch = crate::test_support::batch_2col(vec![0u8; 8], TypeCode::I64, 0b1);
+    assert!(residual_matches(&BoundExpr::ColRef(1), &batch, &schema).is_empty());
+    assert!(residual_matches(&col_eq(1, 0), &batch, &schema).is_empty());
+}
+
+/// A NULL conjunct excludes the row whether the other side is TRUE or FALSE.
+#[test]
+fn a_residual_and_fold_null_conjunct_excludes_either_way() {
+    let schema = crate::test_support::two_col(TypeCode::I64);
+    let batch = crate::test_support::batch_2col(vec![0u8; 8], TypeCode::I64, 0b1); // val is NULL
+    let val_null = col_eq(1, 0); // NULL = 0 → UNKNOWN
+                                 // pk = 1 → TRUE, pk = 2 → FALSE
+    for other in [col_eq(0, 1), col_eq(0, 2)] {
+        assert!(
+            residual_rows(&[&other, &val_null], &gnitz_wire::ReadBound::None, &batch, &schema).is_empty(),
+            "a NULL conjunct must exclude the row"
+        );
+    }
+}
+
+/// A signed PK round-trips through the client batch's OPK encode and the
+/// kernel's decode.
+#[test]
+fn a_signed_pk_residual_reads_back_through_the_opk_region() {
+    let schema = crate::test_support::pk_schema(TypeCode::I64);
+    let batch = pk_row(&schema, ((-1i64) as u64) as u128);
+    assert_eq!(residual_matches(&col_eq(0, -1), &batch, &schema), vec![0]);
+}
+
+#[test]
+fn a_compound_pk_residual_reads_each_column_at_its_offset() {
+    let schema = crate::test_support::compound_schema_u64_u64();
+    let mut batch = gnitz_core::ZSetBatch::new(&schema);
+    let mut pk_bytes = [0u8; 16];
+    pk_bytes[..8].copy_from_slice(&7u64.to_le_bytes());
+    pk_bytes[8..16].copy_from_slice(&9u64.to_le_bytes());
+    // Not `BatchAppender::add_row`: its scalar `u128` PK would sign-extend
+    // across the second column of a compound key.
+    batch.pks.push_bytes(&schema, &pk_bytes);
+    batch.weights.push(1);
+    batch.nulls.push(0);
+    gnitz_core::BatchAppender::new(&mut batch, &schema).i64_val(42);
+    let none = gnitz_wire::ReadBound::None;
+    // Both PK columns and the payload, as one three-conjunct AND chain.
+    let (a, b, v) = (col_eq(0, 7), col_eq(1, 9), col_eq(2, 42));
+    assert_eq!(residual_rows(&[&a, &b, &v], &none, &batch, &schema), vec![0]);
+    // The second PK column is addressed at its own OPK byte offset, not the
+    // first one's.
+    assert!(residual_rows(&[&col_eq(1, 7)], &none, &batch, &schema).is_empty());
+}
+
+/// The lowering refuses a 128-bit column, naming the type.
+#[test]
+fn a_wide_residual_column_is_rejected() {
+    let wide_pk = crate::test_support::pk_schema(TypeCode::U128);
+    let err = compile_wire_conjuncts([&col_eq(0, 1)], &wide_pk.columns).expect_err("U128 PK must be rejected");
+    assert!(err.to_string().contains("U128"), "error must name the type: {err}");
+    let uuid = crate::test_support::uuid_schema_payload();
+    let err = compile_wire_conjuncts([&BoundExpr::ColRef(1)], &uuid.columns).expect_err("UUID column must be rejected");
+    assert!(err.to_string().contains("UUID"), "error should mention UUID: {err}");
+}
+
+/// F32 and F64 both filter.
+#[test]
+fn a_float_residual_filters() {
+    for (tc, bytes) in [
+        (TypeCode::F32, 1.0f32.to_le_bytes().to_vec()),
+        (TypeCode::F64, 1.0f64.to_le_bytes().to_vec()),
+    ] {
+        let schema = crate::test_support::two_col(tc);
+        let batch = crate::test_support::batch_2col(bytes, tc, 0);
+        let gt = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, lit("0.5"));
+        assert_eq!(residual_matches(&gt, &batch, &schema), vec![0], "{tc:?} > 0.5");
+        let lt = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Lt, lit("0.5"));
+        assert!(residual_matches(&lt, &batch, &schema).is_empty(), "{tc:?} < 0.5");
+    }
+}
+
+/// A string residual reads the batch's German cells against its blob arena.
+#[test]
+fn a_string_residual_filters() {
+    let schema = crate::test_support::two_col(TypeCode::String);
+    let mut batch = gnitz_core::ZSetBatch::new(&schema);
+    let mut app = gnitz_core::BatchAppender::new(&mut batch, &schema);
+    for (i, s) in ["alpha", "beta"].iter().enumerate() {
+        app.add_row(i as u128 + 1, 1).str_val(s);
+    }
+    let pred = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Eq, BoundExpr::LitStr("beta".to_string()));
+    assert_eq!(residual_matches(&pred, &batch, &schema), vec![1]);
+}
+
+/// No conjuncts, and a conjunct the binder folded to true, ship no blob and keep
+/// every row; one folded to false drops every row.
+#[test]
+fn the_residual_keep_every_row_exits() {
+    let schema = crate::test_support::two_col(TypeCode::I64);
+    let batch = crate::test_support::batch_2col(7i64.to_le_bytes().to_vec(), TypeCode::I64, 0);
+    let none = gnitz_wire::ReadBound::None;
+    assert!(compile_wire_conjuncts([&BoundExpr::LitInt(1)], &schema.columns)
+        .unwrap()
+        .is_empty());
+    assert_eq!(residual_rows(&[], &none, &batch, &schema), vec![0]);
+    assert_eq!(residual_matches(&BoundExpr::LitInt(1), &batch, &schema), vec![0]);
+    assert!(residual_matches(&BoundExpr::LitInt(0), &batch, &schema).is_empty());
+}
+
+/// A walk narrows the rows before the residual tests them, alone or beside one.
+#[test]
+fn a_walk_and_a_residual_both_apply() {
+    let schema = crate::test_support::two_col(TypeCode::I64);
+    let mut batch = gnitz_core::ZSetBatch::new(&schema);
+    {
+        let mut a = gnitz_core::BatchAppender::new(&mut batch, &schema);
+        for (pk, v) in [(1u128, 10i64), (5, 50), (6, 0), (9, 90)] {
+            a.add_row(pk, 1).i64_val(v);
+        }
+    }
+    let desc = gnitz_wire::RangeDescriptor::new(&[], gnitz_wire::Cut::After(1), gnitz_wire::Cut::Before(9));
+    let walk = gnitz_wire::ReadBound::PkRange(desc);
+    assert_eq!(residual_rows(&[], &walk, &batch, &schema), vec![1, 2]);
+    let positive = BoundExpr::bin(BoundExpr::ColRef(1), BinOp::Gt, BoundExpr::LitInt(0));
+    assert_eq!(residual_rows(&[&positive], &walk, &batch, &schema), vec![1]);
 }

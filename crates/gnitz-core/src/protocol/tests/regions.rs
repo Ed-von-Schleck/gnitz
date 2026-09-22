@@ -2,15 +2,14 @@ use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::{decode_wal_block, encode_wal_block};
 use crate::test_support::payload_of;
 use gnitz_expr::{
-    BatchView, CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, SchemaFacts,
+    BatchView, CmpOp, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, ScalarEval, SchemaFacts,
 };
 
-/// One row's scalar result. `Evaluator` drives whole batches, and these tests
-/// assert a row at a time.
-fn row_value(ev: &Evaluator, mb: &dyn BatchView, row: usize) -> Option<i64> {
+/// Every row's integer result of a scalar program.
+fn row_values(ev: &mut ScalarEval, mb: &dyn BatchView) -> Vec<Option<i128>> {
     match ev.eval_all(mb) {
-        ExprResults::Scalar(vals) => vals[row],
-        ExprResults::Str { .. } => panic!("row_value over a string-valued program"),
+        ExprResults::Int(vals) => vals,
+        ExprResults::Str { .. } => panic!("row_values over a string-valued program"),
     }
 }
 
@@ -210,7 +209,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
     // ci3 is a PK column: `LoadColInt` accepts one (`ColKind::FixedIntCol` is
     // not payload-only) and lowers to `Instr::LoadPk`, so this exercises
     // `locate`'s PK arm, its payload arm and the region addressing together.
-    let ev = LogicalProgram::new(
+    let mut ev = LogicalProgram::new(
         vec![
             LogicalInstr::LoadColInt { col: 3 },
             LogicalInstr::LoadColInt { col: 1 },
@@ -227,8 +226,8 @@ fn the_shared_evaluator_reads_a_client_batch() {
     .expect("program resolves against the client schema");
 
     for row in 0..3 {
-        let v = row_value(&ev, &batch, row).expect("row {row} must not be null");
-        assert_eq!(v, PK3[row] + C1[row] as i64, "row {row}");
+        let v = row_values(&mut ev, &batch)[row].expect("row {row} must not be null");
+        assert_eq!(v, i128::from(PK3[row] + C1[row] as i64), "row {row}");
         // The program names only non-nullable slots, so `no_nulls` is on.
     }
 }
@@ -241,7 +240,7 @@ fn nullable_payload_null_bits_reach_the_evaluator() {
     // A different program from the one above: `analyze` tests only the
     // slots the instructions name, so naming ci2 (payload
     // slot 1, nullable) is what forces `no_nulls` off.
-    let ev = LogicalProgram::new(
+    let mut ev = LogicalProgram::new(
         vec![
             LogicalInstr::LoadColInt { col: 3 },
             LogicalInstr::LoadColInt { col: 2 },
@@ -257,9 +256,12 @@ fn nullable_payload_null_bits_reach_the_evaluator() {
     .resolve_scalar(&schema)
     .expect("program resolves against the client schema");
 
-    assert_eq!(row_value(&ev, &batch, 0), Some(PK3[0] + C2[0]));
-    assert!(row_value(&ev, &batch, 1).is_none(), "row 1 nulls the nullable column");
-    assert_eq!(row_value(&ev, &batch, 2), Some(PK3[2] + C2[2]));
+    assert_eq!(row_values(&mut ev, &batch)[0], Some(i128::from(PK3[0] + C2[0])));
+    assert!(
+        row_values(&mut ev, &batch)[1].is_none(),
+        "row 1 nulls the nullable column"
+    );
+    assert_eq!(row_values(&mut ev, &batch)[2], Some(i128::from(PK3[2] + C2[2])));
 }
 
 #[test]
@@ -269,7 +271,7 @@ fn filter_over_the_region_path() {
 
     // ci2 > 0: row 0 passes (1000), row 1 is NULL (dropped by
     // `bool_bits & !null_bits`), row 2 fails (-3000).
-    let ev = LogicalProgram::new(
+    let mut ev = LogicalProgram::new(
         vec![
             LogicalInstr::LoadColInt { col: 2 },
             LogicalInstr::LoadConst { val: 0, unsigned: false },
@@ -282,7 +284,7 @@ fn filter_over_the_region_path() {
     .expect("predicate resolves against the client schema");
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    ev.filter_ranges(&batch, &mut ranges);
+    ev.ranges(&batch, &mut ranges);
     assert_eq!(ranges, vec![(0, 1)]);
 }
 
@@ -292,7 +294,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     let batch = fixture_a_batch();
 
     // STRING (ci4) vs BLOB (ci5): both pass `check_col(GermanString)`.
-    let ev = LogicalProgram::new(
+    let mut ev = LogicalProgram::new(
         vec![LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 4, col_b: 5 }],
         Output::Result(Reg(0)),
         vec![],
@@ -304,10 +306,13 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     // would share a heap offset and the comparison would read the wrong
     // bytes (and come out equal, not less-than).
     for row in 0..2 {
-        let want = (C4[row].as_bytes() < C5[row]) as i64;
-        assert_eq!(row_value(&ev, &batch, row), Some(want), "row {row}");
+        let want = i128::from(C4[row].as_bytes() < C5[row]);
+        assert_eq!(row_values(&mut ev, &batch)[row], Some(want), "row {row}");
     }
-    assert!(row_value(&ev, &batch, 2).is_none(), "row 2 nulls both string columns");
+    assert!(
+        row_values(&mut ev, &batch)[2].is_none(),
+        "row 2 nulls both string columns"
+    );
 }
 
 #[test]

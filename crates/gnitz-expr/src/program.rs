@@ -112,6 +112,9 @@ pub enum ExprValidateErr {
         selector: u32,
     },
     BadSinkKind(u32),
+    /// A range walk that names no walkable key: a column out of range or of a
+    /// type with no key order, or an equality prefix covering every column.
+    BadWalk(String),
 }
 
 /// The client-facing rendering. Lives on the type so the planner's `Unsupported`
@@ -145,7 +148,7 @@ impl fmt::Display for ExprValidateErr {
             }
             // Already a sentence naming the format and the fault; `Debug` would
             // quote and escape it inside `CorruptBlob("…")`.
-            ExprValidateErr::CorruptBlob(msg) => write!(f, "{msg}"),
+            ExprValidateErr::CorruptBlob(msg) | ExprValidateErr::BadWalk(msg) => write!(f, "{msg}"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -498,7 +501,7 @@ impl Output {
 
     /// The output slots — empty for a result register, so every walk over a
     /// program's sinks reads one accessor rather than matching.
-    fn slots(&self) -> &[Sink] {
+    pub(crate) fn slots(&self) -> &[Sink] {
         match self {
             Output::Result(_) => &[],
             Output::Slots(s) => s,
@@ -1268,38 +1271,13 @@ pub fn encode_expr_blob(
 // LogicalProgram — pre-resolve container
 // ---------------------------------------------------------------------------
 
-/// Which resolver a program came through — one variant per entry point in
-/// `eval.rs`, with the output schema on the one role that writes output slots.
-///
-/// Resolution reads one further bit of it: only a **filter** forces `result_reg`
-/// into `bool_input`, because
-/// [`Evaluator::filter_ranges`](crate::Evaluator::filter_ranges)'s nullable arm
-/// consumes the verdict as a packed bit whatever opcode produced it.
-#[derive(Clone, Copy)]
-pub(crate) enum Role<'a> {
-    Filter,
-    Map(&'a dyn SchemaFacts),
-    Scalar,
-}
-
-impl<'a> Role<'a> {
-    /// The schema a map writes its sinks into — `None` for the two roles that
-    /// write none, and so resolve no copy destination widths.
-    fn out_schema(self) -> Option<&'a dyn SchemaFacts> {
-        match self {
-            Role::Map(os) => Some(os),
-            Role::Filter | Role::Scalar => None,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct LogicalProgram {
     /// The compute instructions. Instruction `i` writes register `i`, so this is
     /// the register file too, and its length is the register count.
     instrs: Vec<LogicalInstr>,
     /// Where the result goes: one register, or the output slots — never both.
-    output: Output,
+    pub(crate) output: Output,
     const_strings: Vec<Vec<u8>>,
     /// Bit `r` set iff register `r` holds a string rather than a scalar, as
     /// [`Self::from_instrs`] finished it.
@@ -1307,7 +1285,7 @@ pub struct LogicalProgram {
     /// **Position-independent**, which is what lets every later pass read the
     /// finished mask instead of rebuilding one in step: a register's one writer
     /// is the instruction at its own index, ahead of every reader.
-    str_class: u64,
+    pub(crate) str_class: u64,
 }
 
 impl LogicalProgram {
@@ -1623,7 +1601,7 @@ impl LogicalProgram {
     /// column copies `src = [base, base+1, …]`, return `Some(base)`: the leading
     /// columns the program skips (the PK region a finalize / identity MAP
     /// inherits verbatim rather than copying). Otherwise `None`.
-    pub fn sequential_copy_base(&self) -> Option<usize> {
+    fn sequential_copy_base(&self) -> Option<usize> {
         if !self.instrs.is_empty() {
             return None;
         }
@@ -1641,21 +1619,18 @@ impl LogicalProgram {
     /// Whether this program, run as a map from `in_schema` to `out_schema` with the input PK carried
     /// through, reproduces its input: every column locates identically, and the program copies each
     /// payload column into its own slot and computes nothing.
-    pub fn is_identity_map(&self, in_schema: &dyn SchemaFacts, out_schema: &dyn SchemaFacts) -> bool {
+    pub(crate) fn is_identity_map(&self, in_schema: &dyn SchemaFacts, out_schema: &dyn SchemaFacts) -> bool {
         let n = in_schema.num_columns();
         n == out_schema.num_columns()
             && (0..n).all(|ci| in_schema.locate(ci) == out_schema.locate(ci))
             && self.sequential_copy_base() == Some(in_schema.pk_cols().len())
     }
 
-    /// Lower to the resolved form under one [`Role`], running the one-shot
-    /// analysis (nullability, register roles, U64 tracking) over the instruction
-    /// stream. [`Role::Map`]'s output schema fixes each copy's destination width
-    /// here, where `check_copy_types` has just approved the widening.
+    /// Lower to the resolved form, with `result_as` how the result register is
+    /// read (`None` for a map); also returns the per-register U64 mask.
     ///
     /// Every "decoded once" below means **once per compile**, never per row.
-    pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, role: Role<'_>) -> ResolvedProgram {
-        let out_schema = role.out_schema();
+    pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, result_as: Option<ReadAs>) -> (ResolvedProgram, u64) {
         use gnitz_wire::TypeCode;
         use Instr as I;
         use LogicalInstr as L;
@@ -1694,23 +1669,15 @@ impl LogicalProgram {
         // const-pool index to the cell it was encoded into.
         let mut const_cells: Vec<[u8; 16]> = Vec::new();
         let mut cell_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
-        let mut copies: Vec<(ColumnLocator, u32, u8)> = Vec::with_capacity(self.output.slots().len());
-        // Split where the class is in hand, so nothing later re-tests it.
-        let mut scalar_emits: Vec<(u16, u32, u8)> = Vec::new();
-        let mut str_emits: Vec<(u16, u32)> = Vec::new();
-        // Off the instruction stream for the reason `copies` is: a constant
-        // register names no computation, and each stream entry would cost the
-        // per-morsel dispatch a no-op arm.
+        // Off the instruction stream: a constant register names no computation,
+        // and each stream entry would cost the per-morsel dispatch a no-op arm.
         let mut const_regs: Vec<(u16, i64)> = Vec::new();
         let mut const_str_regs: Vec<(u16, u32, u32)> = Vec::new();
-        // Bit `pi` per string column some `LoadColStr` loads; the drive resolves
+        // Bit `pi` per string column some `LoadColStr` loads; `with_str_bufs` resolves
         // one column region per set bit.
         let mut str_cols: u64 = 0;
-        // Resolution is 1:1 on every instruction and carries each register
-        // operand through by name, so masks taken off the logical stream apply
-        // unchanged to the resolved one; the sinks are a separate list, and name
-        // no register a mask covers.
-        let ProgramFacts { bit_only, bool_pack, no_nulls, reg_u64 } = self.analyze(schema, role);
+        // Resolution keeps every register's number, so the masks carry over.
+        let ProgramFacts { bit_only, bool_pack, no_nulls, reg_u64 } = self.analyze(schema, result_as);
         // Answered once per register by `analyze`, off each opcode's `U64Rule`,
         // so no arm below restates the rule.
         let is_u64 = |r: u16| (reg_u64 >> r) & 1 != 0;
@@ -1723,26 +1690,6 @@ impl LogicalProgram {
         // Read out before `self.instrs` is consumed below: a register file is
         // exactly one entry per instruction.
         let num_regs = self.instrs.len() as u32;
-        // Sinks name an output slot, not a computation, and the map materializes
-        // them columnar-side off `copies`/`emits`, so they never reach the
-        // kernel dispatch. Slot order is their position.
-        for (out, sink) in self.output.slots().iter().enumerate() {
-            let out = out as u32;
-            match *sink {
-                Sink::Col(src_col) => {
-                    // The same destination type code `check_copy_types` approved
-                    // the widening against; its `wire_stride` is the copy width.
-                    // No output schema means no copy runs, so the width is unread.
-                    let stride = out_schema.map_or(0, |os| slot_stride(os, out));
-                    copies.push((schema.locate(src_col as usize), out, stride));
-                }
-                Sink::Reg(r) => match (str_class >> r.0) & 1 != 0 {
-                    true => str_emits.push((r.0, out)),
-                    // The register image's own width, absent a schema to narrow it.
-                    false => scalar_emits.push((r.0, out, out_schema.map_or(8, |os| slot_stride(os, out)))),
-                },
-            }
-        }
         for (i, li) in self.instrs.into_iter().enumerate() {
             // A register is the index of the instruction that writes it.
             let dst = i as u16;
@@ -1964,11 +1911,7 @@ impl LogicalProgram {
             };
             instrs.push(resolved);
         }
-        ResolvedProgram {
-            null_perm: NullPerm::new(&copies, nullable_slots),
-            copies,
-            scalar_emits,
-            str_emits,
+        let prog = ResolvedProgram {
             no_nulls,
             nullable_slots,
             bit_only_mask: bit_only,
@@ -1977,7 +1920,6 @@ impl LogicalProgram {
             const_regs,
             const_str_regs,
             num_regs,
-            result_reg: self.output.result().map_or(0, |r| r.0 as u32),
             const_cells,
             int_sets,
             trim_sets,
@@ -1993,36 +1935,15 @@ impl LogicalProgram {
                 .find(|&r| (str_class >> r) & 1 == 0)
                 .map_or(0, |r| r + 1),
             str_cols,
-            result_is_str: self.output.result().is_some_and(|r| (str_class >> r.0) & 1 != 0),
-            result_is_u64: self.output.result().is_some_and(|r| (reg_u64 >> r.0) & 1 != 0),
-            is_filter: matches!(role, Role::Filter),
-        }
-    }
-
-    /// [`Self::validate`] plus the rule the [`Role`] fixes: the output must be
-    /// the shape this consumer reads, and a filter's result register must not be
-    /// a string one — a filter reads the verdict as a packed truth bit, where
-    /// `resolve_scalar` wants the string back.
-    pub(crate) fn validate_for(&self, schema: &dyn SchemaFacts, role: Role<'_>) -> Result<(), ExprValidateErr> {
-        self.validate(schema, role.out_schema())?;
-        match (role, &self.output) {
-            (Role::Map(_), Output::Slots(_)) => Ok(()),
-            (Role::Filter, Output::Result(r)) if (self.str_class >> r.0) & 1 != 0 => {
-                Err(ExprValidateErr::RegClassMismatch { reg: r.0 })
-            }
-            (Role::Filter | Role::Scalar, Output::Result(_)) => Ok(()),
-            // A filter or scalar handed output slots, or a map handed a result
-            // register. Both directions matter: a zero-payload map is the one
-            // `validate`'s slot-count check cannot separate from a predicate.
-            _ => Err(ExprValidateErr::OutputRoleMismatch),
-        }
+        };
+        (prog, reg_u64)
     }
 
     /// Hold every column and sink to the schema the program will run against,
     /// over the same per-opcode operand table [`Self::from_instrs`] walks — so a
     /// new opcode cannot silently bypass a bound here either.
     ///
-    /// `out_schema` is `None` for the roles that write no output slots — a
+    /// `out_schema` is `None` for the consumers that write no output slots — a
     /// filter and a scalar, whose sink list is empty. With one, this also
     /// decides **output coverage**: sink `i` writes slot `i`, so covering every
     /// declared payload slot is a count.
@@ -2071,8 +1992,8 @@ impl LogicalProgram {
     /// pass over the one operand table:
     ///
     /// * **Register roles** — which registers are produced as booleans, and which
-    ///   are read as something other than a truth bit. A map has no result register
-    ///   to force; a bare scalar's may legitimately stay `bit_only`.
+    ///   are read as something other than a truth bit. `result_as` classifies the
+    ///   result register's read; a map has none.
     /// * **Strict non-nullability**, against the schema the program is about to be
     ///   resolved against, the only schema for which the answer means anything. A PK
     ///   column operand never contributes: the null bitmap is payload-indexed, so the
@@ -2080,7 +2001,7 @@ impl LogicalProgram {
     ///
     /// Every `1u64 << reg` below is in range: `from_instrs` caps the instruction
     /// count at `MAX_REGS` and bounds every register operand by it.
-    fn analyze(&self, schema: &dyn SchemaFacts, role: Role<'_>) -> ProgramFacts {
+    fn analyze(&self, schema: &dyn SchemaFacts, result_as: Option<ReadAs>) -> ProgramFacts {
         let (mut bool_produced, mut non_bool_read, mut bool_input) = (0u64, 0u64, 0u64);
         let mut no_nulls = true;
         let mut reg_u64 = 0u64;
@@ -2117,15 +2038,14 @@ impl LogicalProgram {
         for reg in self.output.slots().iter().filter_map(|s| s.reg()) {
             non_bool_read |= 1u64 << reg.0;
         }
-        // A filter's `result_reg` is forced to be a bool input: the filter's
+        // A filter's result register is forced to be a bool input: the filter's
         // nullable arm consumes the result as packed bits, so its producer must
         // populate `bool_bits` whatever opcode it is. A scalar's is read as a value
         // (`reg_values`), so a boolean producer there must unpack into the lane.
-        if let Some(r) = self.output.result() {
-            if matches!(role, Role::Filter) {
-                bool_input |= 1u64 << r.0;
-            } else {
-                non_bool_read |= 1u64 << r.0;
+        if let (Some(r), Some(read)) = (self.output.result(), result_as) {
+            match read {
+                ReadAs::Bool => bool_input |= 1u64 << r.0,
+                _ => non_bool_read |= 1u64 << r.0,
             }
         }
         ProgramFacts {
@@ -2169,7 +2089,7 @@ fn check_const_idx(const_idx: u32, n: usize) -> Result<(), ExprValidateErr> {
 
 /// How a kernel consumes a register operand.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ReadAs {
+pub(crate) enum ReadAs {
     /// The register's i64 / f64 image out of `regs`.
     Value,
     /// A German-string view out of `str_views`.
@@ -2585,11 +2505,6 @@ fn slot_type_code(os: &dyn SchemaFacts, out: u32) -> TypeCode {
     os.col_type_code(os.payload_col_idx(out as usize))
 }
 
-/// The byte width output payload slot `out` is written at.
-fn slot_stride(os: &dyn SchemaFacts, out: u32) -> u8 {
-    slot_type_code(os, out).wire_stride() as u8
-}
-
 /// The `ExprOp::IntInSet` const-pool layout, `N × 8-byte LE`, stated once for
 /// [`LogicalProgram::from_instrs`] and the decoder below.
 /// [`ExprOp::IntInSet`] owns the wire contract; the emitter writes it
@@ -2614,7 +2529,7 @@ fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
 
 /// How a map derives each output row's null word from its input row's — the
 /// three shapes the `(source slot, destination slot)` pair list collapses to.
-pub enum NullPerm {
+pub(crate) enum NullPerm {
     /// No copied source can carry a set bit, so every output word is zero.
     Zero,
     /// Every pair moves a bit to the slot it already occupies, so the whole
@@ -2629,13 +2544,13 @@ impl NullPerm {
     /// Build from the column moves. A source contributes a pair only if it can
     /// carry a set bit: a PK source has none, and a `NOT NULL` payload source is
     /// masked out by `nullable`.
-    pub(crate) fn new(copies: &[(ColumnLocator, u32, u8)], nullable: u64) -> Self {
+    pub(crate) fn new(copies: &[ColCopy], nullable: u64) -> Self {
         let pairs: Vec<(u8, u8)> = copies
             .iter()
-            .filter_map(|&(src, dst_payload, _)| match src {
+            .filter_map(|c| match c.src {
                 ColumnLocator::Pk { .. } => None,
                 ColumnLocator::Payload { slot, .. } => {
-                    gnitz_wire::null_word_get(nullable, slot as usize).then_some((slot, dst_payload as u8))
+                    gnitz_wire::null_word_get(nullable, slot as usize).then_some((slot, c.slot as u8))
                 }
             })
             .collect();
@@ -2648,38 +2563,132 @@ impl NullPerm {
         NullPerm::Permute(pairs)
     }
 
-    #[inline]
-    fn permute(pairs: &[(u8, u8)], in_null: u64) -> u64 {
-        let mut out: u64 = 0;
-        for &(src, dst) in pairs {
-            out |= (gnitz_wire::null_word_get(in_null, src as usize) as u64) << dst;
-        }
-        out
-    }
-
     /// Derive the null words of `out` rows `[dst_base, dst_base + n)` from
     /// source rows `[src_start, src_start + n)`, one u64 per row. Every arm
     /// writes the whole window: the destination may be an uninitialized tail.
-    pub fn write_rows(&self, in_null_bmp: &[u8], src_start: usize, out: &mut [u8], dst_base: usize, n: usize) {
+    pub(crate) fn write_rows(&self, in_null_bmp: &[u8], src_start: usize, out: &mut [u8], dst_base: usize, n: usize) {
         let dst = &mut out[dst_base * 8..(dst_base + n) * 8];
-        let pairs = match self {
-            NullPerm::Zero => {
-                dst.fill(0);
-                return;
-            }
+        let src = in_null_bmp[src_start * 8..(src_start + n) * 8].as_chunks::<8>().0;
+        let word = |w: &[u8; 8]| u64::from_le_bytes(*w);
+        match self {
+            NullPerm::Zero => dst.fill(0),
             NullPerm::Mask(mask) => {
-                for row in 0..n {
-                    let in_null = gnitz_wire::read_u64_le(in_null_bmp, (src_start + row) * 8);
-                    gnitz_wire::write_u64_le(dst, row * 8, in_null & mask);
+                for (d, s) in dst.as_chunks_mut::<8>().0.iter_mut().zip(src) {
+                    *d = (word(s) & mask).to_le_bytes();
                 }
-                return;
             }
-            NullPerm::Permute(pairs) => pairs.as_slice(),
-        };
-        for row in 0..n {
-            let in_null = gnitz_wire::read_u64_le(in_null_bmp, (src_start + row) * 8);
-            gnitz_wire::write_u64_le(dst, row * 8, Self::permute(pairs, in_null));
+            // A pair at a time over an L1-sized block: each pass is one uniform shift.
+            NullPerm::Permute(pairs) => {
+                let bit = |s: &[u8; 8], (from, to): (u8, u8)| ((word(s) >> from) & 1) << to;
+                let (&first, rest) = pairs.split_first().expect("a permutation moves a bit");
+                for (d, s) in dst.as_chunks_mut::<8>().0.chunks_mut(256).zip(src.chunks(256)) {
+                    for (d, s) in d.iter_mut().zip(s) {
+                        *d = bit(s, first).to_le_bytes();
+                    }
+                    for &pair in rest {
+                        for (d, s) in d.iter_mut().zip(s) {
+                            *d = (word(d) | bit(s, pair)).to_le_bytes();
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+/// A column copied verbatim into a map's output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColCopy {
+    pub src: ColumnLocator,
+    /// The output payload slot.
+    pub slot: usize,
+    /// The output slot's width: wider than the source only for a promoted integer.
+    pub width: usize,
+}
+
+/// A computed output slot written from a scalar register.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ScalarEmit {
+    pub(crate) reg: usize,
+    pub(crate) slot: usize,
+    pub(crate) width: EmitWidth,
+}
+
+/// The byte width of a scalar emit's output slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum EmitWidth {
+    W1,
+    W2,
+    W4,
+    W8,
+}
+
+impl EmitWidth {
+    fn of(bytes: usize) -> Self {
+        match bytes {
+            1 => EmitWidth::W1,
+            2 => EmitWidth::W2,
+            4 => EmitWidth::W4,
+            8 => EmitWidth::W8,
+            _ => unreachable!("`check_emit_slot` admits no {bytes}-byte scalar slot"),
+        }
+    }
+
+    pub(crate) fn bytes(self) -> usize {
+        match self {
+            EmitWidth::W1 => 1,
+            EmitWidth::W2 => 2,
+            EmitWidth::W4 => 4,
+            EmitWidth::W8 => 8,
+        }
+    }
+}
+
+/// A computed output slot written from a string register.
+#[derive(Debug, PartialEq)]
+pub(crate) struct StrEmit {
+    pub(crate) reg: usize,
+    pub(crate) slot: usize,
+}
+
+/// Where each of a map's output slots comes from.
+pub(crate) struct MapSinks {
+    pub(crate) copies: Vec<ColCopy>,
+    /// How the copies move the input's null bits.
+    pub(crate) null_perm: NullPerm,
+    pub(crate) scalar_emits: Vec<ScalarEmit>,
+    pub(crate) str_emits: Vec<StrEmit>,
+}
+
+impl LogicalProgram {
+    /// This map's sinks, against the schemas `validate` checked them against.
+    pub(crate) fn map_sinks(&self, in_schema: &dyn SchemaFacts, out_schema: &dyn SchemaFacts) -> MapSinks {
+        let mut sinks = MapSinks {
+            copies: Vec::new(),
+            null_perm: NullPerm::Zero,
+            scalar_emits: Vec::new(),
+            str_emits: Vec::new(),
+        };
+        for (slot, sink) in self.output.slots().iter().enumerate() {
+            let width = slot_type_code(out_schema, slot as u32).wire_stride();
+            match *sink {
+                Sink::Col(c) => sinks.copies.push(ColCopy {
+                    src: in_schema.locate(c as usize),
+                    slot,
+                    width,
+                }),
+                Sink::Reg(r) if (self.str_class >> r.0) & 1 != 0 => {
+                    sinks.str_emits.push(StrEmit { reg: r.0 as usize, slot })
+                }
+                Sink::Reg(r) => sinks.scalar_emits.push(ScalarEmit {
+                    reg: r.0 as usize,
+                    slot,
+                    width: EmitWidth::of(width),
+                }),
+            }
+        }
+        sinks.null_perm = NullPerm::new(&sinks.copies, in_schema.nullable_payload_slots());
+        sinks
     }
 }
 
@@ -2689,38 +2698,13 @@ impl NullPerm {
 
 pub(crate) struct ResolvedProgram {
     pub(crate) instrs: Vec<Instr>,
-    /// A map's verbatim column moves, as `(source locator, output payload slot,
-    /// destination write width)`. Off the instruction stream, not in it: they
-    /// name a destination rather than a computation, so keeping them in the
-    /// stream would give the per-morsel dispatch up to one no-op arm per
-    /// projected column.
-    ///
-    /// The width is the *output* column's, wider than the source's only for a
-    /// promoted integer column — the widening `check_copy_types` approved.
-    pub(crate) copies: Vec<(ColumnLocator, u32, u8)>,
-    /// [`Self::copies`] and [`Self::nullable_slots`] resolved into the null-word
-    /// permutation a map drives, so no consumer rebuilds it.
-    pub(crate) null_perm: NullPerm,
-    /// A map's computed columns whose source register holds a scalar, as
-    /// `(source register, output payload slot, slot stride)`.
-    pub(crate) scalar_emits: Vec<(u16, u32, u8)>,
-    /// The same for the string-register sinks. Two lists rather than one plus a
-    /// seam: the class is in hand where the sinks are walked, and each writer
-    /// wants only its own half.
-    pub(crate) str_emits: Vec<(u16, u32)>,
-    /// The scalar constant registers, as `(destination, value)`. Off the
-    /// instruction stream for the reason [`Self::copies`] is, and installed once
-    /// per evaluator: a register's one writer is the instruction at its own
-    /// index, so a constant lane is written before any morsel runs.
+    /// The scalar constant registers, as `(destination, value)`: written once per
+    /// evaluator, not per morsel.
     pub(crate) const_regs: Vec<(u16, i64)>,
     /// The string constant registers, as `(destination, `[`Self::const_arena`]
     /// `offset, length)` — the same treatment, over the lane array.
     pub(crate) const_str_regs: Vec<(u16, u32, u32)>,
     pub(crate) num_regs: u32,
-    /// The register holding the filter verdict, or the scalar result. A map has
-    /// none and this reads 0, which nothing consults: a map's result leaves
-    /// through [`Self::emits`].
-    pub(crate) result_reg: u32,
     /// The 16-byte German-string cells, indexed by the resolved `cell_idx`,
     /// with any heap half in `const_arena`. Only the constants a `StrColConst`
     /// names get one — encoded once at resolve, compared by
@@ -2763,19 +2747,6 @@ pub(crate) struct ResolvedProgram {
     /// (its opcodes write `str_views`) nor readable (every i64 reader is held to
     /// a scalar operand), so [`Self::num_regs`] would reserve 2 KiB for nothing.
     pub(crate) scalar_lanes: u32,
-    /// True iff [`Self::result_reg`] holds a string. Decided at resolve, where
-    /// the logical program still says whether there *is* a result register: a
-    /// map has none, so this is false for one without a second test of what the
-    /// program is for.
-    result_is_str: bool,
-    /// True iff [`Self::result_reg`]'s i64 image is a `u64`, per the resolve-time
-    /// U64 tracking. False for a program with no result register.
-    result_is_u64: bool,
-    /// True iff this program resolved as [`Role::Filter`], which is what forces
-    /// `result_reg` into `bool_input`. The two read-back paths are not
-    /// interchangeable either way — a filter's result register may hold no `regs`
-    /// lane, a scalar's no `bool_bits` word — so each asserts on this.
-    is_filter: bool,
     /// True iff no instruction can produce a NULL against the schema this program
     /// was resolved against, so the evaluator skips null-bit tracking entirely.
     /// Resolved once — the answer is only meaningful for that one schema, since
@@ -2796,7 +2767,7 @@ pub(crate) struct ResolvedProgram {
     /// other boolean producers go through `bin_op`/`un_op` and write it anyway.
     bit_only_mask: u64,
     /// Bit `r` set iff `r`'s producer must write `bool_bits[r]`: some downstream
-    /// consumer reads it as a truth bit. A filter's `result_reg` is covered
+    /// consumer reads it as a truth bit. A filter's result register is covered
     /// because `analyze` forces it into that set, whatever opcode writes it.
     bool_pack_mask: u64,
 }
@@ -2812,25 +2783,6 @@ impl ResolvedProgram {
     pub(crate) fn needs_bool_pack(&self, reg: usize) -> bool {
         (self.bool_pack_mask >> reg) & 1 != 0
     }
-
-    /// True iff this program resolved as a filter — the guard on both read-back
-    /// entry points, which are not interchangeable in either direction.
-    pub(crate) fn is_filter(&self) -> bool {
-        self.is_filter
-    }
-
-    /// True iff [`crate::Evaluator::eval_all`] must hand the result back as
-    /// [`crate::ExprResults::Str`] rather than as values. Only a scalar can
-    /// answer true: a map has no result register, and [`Role::Filter`]'s extra
-    /// rule in `validate_for` rejects a string-valued filter.
-    pub(crate) fn result_is_str(&self) -> bool {
-        self.result_is_str
-    }
-
-    /// True iff the scalar result is to be read as a `u64`.
-    pub(crate) fn result_is_u64(&self) -> bool {
-        self.result_is_u64
-    }
 }
 
 /// What [`analyze`] derives in its one pass over the instruction stream.
@@ -2839,7 +2791,7 @@ struct ProgramFacts {
     /// `regs[r]`. [`ResolvedProgram::bit_only_mask`] states what it permits.
     bit_only: u64,
     /// Bit `r` set iff `r`'s producer must write `bool_bits[r]`: some downstream
-    /// consumer reads it as a truth bit, a filter's `result_reg` included.
+    /// consumer reads it as a truth bit, a filter's result register included.
     bool_pack: u64,
     /// True iff no instruction can produce a NULL against the schema, so the
     /// evaluator skips null-bit tracking entirely.

@@ -482,10 +482,8 @@ impl ZSetBatch {
         }
     }
 
-    /// One region per payload slot, zero-filled for `count` rows. The client's
-    /// `delete` uses these as inert payload filler for retraction rows, which
-    /// the server's `retract_pk` matches by PK alone.
-    pub(crate) fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
+    /// One region per payload slot, zero-filled for `count` rows.
+    pub fn filler_columns(schema: &Schema, count: usize) -> Vec<PayloadColumn> {
         schema
             .payload_columns()
             .map(|(_, _, c)| PayloadColumn::zeroed(c.ty.tc, count))
@@ -1038,6 +1036,22 @@ impl gnitz_expr::BatchView for ZSetBatch {
     #[inline(always)]
     fn pk_region(&self) -> (&[u8], usize) {
         (&self.pks.buf, self.pks.stride as usize)
+    }
+}
+
+impl gnitz_expr::MapTarget for ZSetBatch {
+    #[inline(always)]
+    fn null_bmp_mut(&mut self) -> &mut [u8] {
+        gnitz_wire::as_le_bytes_mut(&mut self.nulls)
+    }
+
+    #[inline(always)]
+    fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
+        (
+            &mut self.payload[pi].bytes,
+            gnitz_wire::as_le_bytes_mut(&mut self.nulls),
+            &mut self.blob,
+        )
     }
 }
 

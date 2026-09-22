@@ -40,7 +40,7 @@ fn a_key_copy_decodes_and_a_payload_copy_moves() {
         b.payload[0].bytes.extend_from_slice(&v.unwrap_or(0).to_le_bytes());
     }
     let pks = b.pks.region().to_vec();
-    let map = v_then_k(&src);
+    let mut map = v_then_k(&src);
     let out = map.apply(b);
     assert_eq!(out.pks.region(), &pks[..]);
     assert_eq!(out.weights, vec![1, 2]);

@@ -39,7 +39,7 @@ fn test_projection_batch() {
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20]), (2, 1, 0, &[30, 40])]);
 
     let prog = LogicalProgram::copy_cols(&[2, 1]);
-    let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
+    let mut func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
     let result = func.evaluate_map_batch(&batch);
     assert_eq!(result.count, 2);
 
@@ -69,7 +69,7 @@ fn test_map_copy_and_emit() {
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(2))];
     let prog = LogicalProgram::new(instrs, Output::Slots(sinks), vec![]);
 
-    let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
+    let mut func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
     let result = func.evaluate_map_batch(&batch);
     assert_eq!(result.count, 1);
 
@@ -84,7 +84,7 @@ fn test_empty_batch() {
     let schema = make_schema(0, &[TypeCode::U64, TypeCode::I64]);
     let batch = Batch::empty_with_schema(&schema);
 
-    let func = MapPlan::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema, PkSource::Inherit).unwrap();
+    let mut func = MapPlan::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema, PkSource::Inherit).unwrap();
     let result = func.evaluate_map_batch(&batch);
     assert_eq!(result.count, 0);
 }
@@ -120,7 +120,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::String, TypeCode::String]);
         let prog = LogicalProgram::copy_cols(&[2, 1]);
-        let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
+        let mut func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
         let out = func.evaluate_map_batch(&batch);
         assert_eq!(out.count, 2);
         assert_eq!(
@@ -142,7 +142,7 @@ fn test_map_blob_passthrough_and_fallback() {
         let batch = build(&in_schema);
         let out_schema = make_schema(0, &[TypeCode::U64, TypeCode::String]);
         let prog = LogicalProgram::copy_cols(&[1]);
-        let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
+        let mut func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
         let out = func.evaluate_map_batch(&batch);
         assert_eq!(out.count, 2);
         assert_eq!(crate::test_support::read_german_string(&out, 0, 0), b"ab");
@@ -316,17 +316,17 @@ fn test_from_predicate_filter_ranges_over_a_batch() {
         LogicalInstr::LoadConst { val: 15, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
-    let func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
+    let mut func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
         .resolve_filter(&schema)
         .unwrap();
 
     let mut ranges = Vec::new();
-    func.filter_ranges(&batch.as_mem_batch(), &mut ranges);
+    func.ranges(&batch.as_mem_batch(), &mut ranges);
     assert_eq!(ranges, vec![(1, 3), (4, 6)]);
 
     // `out` is cleared, not appended to, so a reused buffer cannot leak a
     // previous chunk's ranges into this one.
-    func.filter_ranges(&batch.as_mem_batch(), &mut ranges);
+    func.ranges(&batch.as_mem_batch(), &mut ranges);
     assert_eq!(ranges, vec![(1, 3), (4, 6)]);
 }
 
@@ -367,7 +367,7 @@ fn map_whose_only_computed_column_is_a_string_still_runs_the_kernel() {
         LogicalInstr::StrCase { a: Reg(0), upper: true },
     ];
     let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
-    let func = MapPlan::from_map(
+    let mut func = MapPlan::from_map(
         LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &in_schema,
         &out_schema,
@@ -400,7 +400,7 @@ fn string_emit_composes_with_blob_passthrough() {
         LogicalInstr::StrCase { a: Reg(0), upper: true },
     ];
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(1))];
-    let func = MapPlan::from_map(
+    let mut func = MapPlan::from_map(
         LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &in_schema,
         &out_schema,
@@ -442,7 +442,7 @@ fn null_string_emit_zeroes_the_cell_and_sets_the_bit() {
         LogicalInstr::StrCase { a: Reg(0), upper: true },
     ];
     let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
-    let func = MapPlan::from_map(
+    let mut func = MapPlan::from_map(
         LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &in_schema,
         &out_schema,
@@ -476,7 +476,7 @@ fn map_with_pack_pk_source_promotes_payload_to_pk() {
 
     // Projection plan: output keeps the same single payload column.
     let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
-    let plan = MapPlan::from_map(
+    let mut plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[1]),
         &schema,
         &schema,
@@ -549,7 +549,7 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
 
     // The hash-row output schema: one synthetic U128 PK, then the payload.
     let out_schema = make_schema(0, &[TypeCode::U128, TypeCode::I64, TypeCode::String, TypeCode::Blob]);
-    let plan = MapPlan::from_map(
+    let mut plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[1, 2, 3]),
         &in_schema,
         &out_schema,
@@ -630,7 +630,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
         batch.count += 1;
     }
 
-    let plan = MapPlan::from_map(
+    let mut plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[0, 1, 2, 3, 4]),
         &in_schema,
         &out_schema,
@@ -655,22 +655,30 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
 // Benchmark
 // -----------------------------------------------------------------------
 
-/// The whole `Instr::Map` body — the copy loop plus the PK stamp — over a
-/// reindex map, a string-emitting map and hash-row maps. `reindex_pack_bench` covers the
-/// packer alone, and neither `make bench` nor the `scan_spec` benches
-/// resolve this loop.
+/// Retired instructions of the map driver: `evaluate_map_batch` over whole
+/// batches, and `append_map_ranges` over one range (`*_whole`) and over `R`-row
+/// runs with 16-row gaps (`*_r{R}`), where `COMPACT_RUN_LEN` decides.
+/// Difference two pass counts, one shape per process:
 ///
-/// `cd crates && cargo test -p gnitz-store --release map_ranges_bench -- --ignored --nocapture --test-threads=1`
+///   cargo build -p gnitz-store --release --tests
+///   for s in reindex permute int3_whole int3_r16 upper_r16; do for p in 1 21; do \
+///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
+///     cargo test -p gnitz-store --release map_ranges_bench -- --ignored --nocapture
+///   done; done
 #[test]
 #[ignore]
 fn map_ranges_bench() {
     use crate::schema::key::ReindexPacker;
-    use gnitz_expr::LogicalInstr;
+    use gnitz_expr::{IntArithOp, LogicalInstr};
     use std::hint::black_box;
-    use std::time::Instant;
 
-    const N: usize = 200_000;
-    const ITERS: usize = 20;
+    const N: usize = 262_144;
+    const GAP: usize = 16;
+    let passes: usize = std::env::var("GNITZ_BENCH_PASSES").map_or(1, |v| v.parse().unwrap());
+    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
+    let driven = |name: &str| only == "all" || only == name;
+    let mut n_selected = 0usize;
+    let mut acc = 0usize;
 
     // --- Reindex map: [U64 PK, I64, I64] reindexed on col 1, the source PK and
     // both payload columns kept — the equijoin / GROUP BY repartition shape.
@@ -688,7 +696,7 @@ fn map_ranges_bench() {
     }
     let rx_packer = ReindexPacker::new(&rx_in, &[(1, None)]).unwrap();
     let rx_out = rx_packer.output_schema(&rx_in, &[0, 1, 2]).unwrap();
-    let rx_plan = MapPlan::from_map(
+    let mut rx_plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[0, 1, 2]),
         &rx_in,
         &rx_out,
@@ -696,32 +704,74 @@ fn map_ranges_bench() {
     )
     .unwrap();
 
-    // --- String-emitting map: [U64 PK, STRING] -> [U64 PK, STRING upper],
-    // the shape whose STRING output comes only from `str_emits`.
-    let se_in = make_schema(0, &[TypeCode::U64, TypeCode::String]);
-    let se_out = make_schema(0, &[TypeCode::U64, TypeCode::String]);
-    let mut se_batch = Batch::with_capacity(&se_in, N);
+    // --- String source: [U64 PK, STRING], every cell past the inline threshold
+    // so every one is heap-backed and an emit grows the output blob.
+    let str_in = make_schema(0, &[TypeCode::U64, TypeCode::String]);
+    let mut str_batch = Batch::with_capacity(&str_in, N);
     for i in 0..N {
-        se_batch.extend_pk(i as u128);
-        se_batch.extend_weight(&1i64.to_le_bytes());
-        se_batch.extend_null_bmp(&0u64.to_le_bytes());
-        // Past SHORT_STRING_THRESHOLD, so every cell is heap-backed and the
-        // emit grows the output blob.
-        let v = format!("row-{i:012}-payload");
-        se_batch.extend_col_blob(0, v.as_bytes());
-        se_batch.count += 1;
+        str_batch.extend_pk(i as u128);
+        str_batch.extend_weight(&1i64.to_le_bytes());
+        str_batch.extend_null_bmp(&0u64.to_le_bytes());
+        str_batch.extend_col_blob(0, format!("row-{i:012}-payload").as_bytes());
+        str_batch.count += 1;
     }
-    let se_plan = MapPlan::from_map(
-        LogicalProgram::new(
-            vec![
-                LogicalInstr::LoadColStr { col: 1 },
-                LogicalInstr::StrCase { a: Reg(0), upper: true },
-            ],
-            Output::Slots(vec![Sink::Reg(Reg(1))]),
-            vec![],
-        ),
-        &se_in,
-        &se_out,
+    let upper = || {
+        MapPlan::from_map(
+            LogicalProgram::new(
+                vec![
+                    LogicalInstr::LoadColStr { col: 1 },
+                    LogicalInstr::StrCase { a: Reg(0), upper: true },
+                ],
+                Output::Slots(vec![Sink::Reg(Reg(1))]),
+                vec![],
+            ),
+            &str_in,
+            &str_in,
+            PkSource::Inherit,
+        )
+        .unwrap()
+    };
+    let mut se_plan = upper();
+
+    // --- Integer source: [U64 PK, I64, I64, I64], and a map computing three
+    // columns out of it.
+    let int_in = make_schema(0, &[TypeCode::U64, TypeCode::I64, TypeCode::I64, TypeCode::I64]);
+    let mut int_batch = Batch::with_capacity(&int_in, N);
+    for i in 0..N as u64 {
+        int_batch.extend_pk(i as u128);
+        int_batch.extend_weight(&1i64.to_le_bytes());
+        int_batch.extend_null_bmp(&0u64.to_le_bytes());
+        for pi in 0..3u64 {
+            int_batch.extend_col(pi as usize, &(i.wrapping_mul(2_654_435_761 + pi) % 1000).to_le_bytes());
+        }
+        int_batch.count += 1;
+    }
+    let arith = |op, a, b| LogicalInstr::IntArith { op, a: Reg(a), b: Reg(b) };
+    let int3 = || {
+        MapPlan::from_map(
+            LogicalProgram::new(
+                vec![
+                    LogicalInstr::LoadColInt { col: 1 },
+                    LogicalInstr::LoadColInt { col: 2 },
+                    LogicalInstr::LoadColInt { col: 3 },
+                    arith(IntArithOp::Add, 0, 1),
+                    arith(IntArithOp::Mul, 1, 2),
+                    arith(IntArithOp::Sub, 2, 0),
+                ],
+                Output::Slots(vec![Sink::Reg(Reg(3)), Sink::Reg(Reg(4)), Sink::Reg(Reg(5))]),
+                vec![],
+            ),
+            &int_in,
+            &int_in,
+            PkSource::Inherit,
+        )
+        .unwrap()
+    };
+    // A pure projection that moves every payload column to another slot.
+    let mut permute = MapPlan::from_map(
+        LogicalProgram::copy_cols(&[3, 1, 2]),
+        &int_in,
+        &int_in,
         PkSource::Inherit,
     )
     .unwrap();
@@ -761,30 +811,62 @@ fn map_ranges_bench() {
     };
     const I64: TypeCode = TypeCode::I64;
     const STR: TypeCode = TypeCode::String;
-    let hash_rows = [
+    let mut hash_rows = [
         hash_row("hash_row[i64x2]", &[I64, I64]),
         hash_row("hash_row[i64x10]", &[I64; 10]),
         hash_row("hash_row[i64,str]", &[I64, STR]),
         hash_row("hash_row[i64x3,str]", &[I64, I64, I64, STR]),
     ];
 
-    let arms = [("reindex", &rx_plan, &rx_batch), ("str_emit", &se_plan, &se_batch)]
-        .into_iter()
-        .chain(hash_rows.iter().map(|(name, plan, batch)| (*name, plan, batch)));
-    for (name, plan, src) in arms {
-        let t0 = Instant::now();
-        let mut acc = 0usize;
-        for _ in 0..ITERS {
+    // Whole-batch shapes, through `evaluate_map_batch`.
+    let whole = [
+        ("reindex", &mut rx_plan, &rx_batch),
+        ("str_emit", &mut se_plan, &str_batch),
+        ("permute", &mut permute, &int_batch),
+    ]
+    .into_iter()
+    .chain(hash_rows.iter_mut().map(|(name, plan, batch)| (*name, plan, &*batch)));
+    for (name, plan, src) in whole {
+        if !driven(name) {
+            continue;
+        }
+        n_selected += 1;
+        for _ in 0..passes {
             let out = plan.evaluate_map_batch(black_box(src));
             acc = acc.wrapping_add(out.count).wrapping_add(out.blob.len());
             black_box(&out);
         }
-        let secs = t0.elapsed().as_secs_f64();
-        println!(
-            "map_ranges_bench[{name}]: {:.1} Mrows/s ({N} rows x {ITERS} iters in {secs:.3}s, checksum {acc})",
-            (N * ITERS) as f64 / secs / 1e6,
-        );
     }
+
+    // Range shapes, through `append_map_ranges`: one range, and `r`-row runs with
+    // `GAP`-row gaps.
+    let runs = |r: usize| -> Vec<(usize, usize)> { (0..N).step_by(r + GAP).map(|s| (s, (s + r).min(N))).collect() };
+    let mut shapes: Vec<(String, Vec<(usize, usize)>)> = vec![("whole".to_string(), vec![(0, N)])];
+    shapes.extend([4usize, 16, 64, 128, 256].map(|r| (format!("r{r}"), runs(r))));
+    for (family, mut plan, src) in [("int3", int3(), &int_batch), ("upper", upper(), &str_batch)] {
+        let mut keeper = Batch::empty_with_schema(plan.out_schema());
+        for (suffix, ranges) in &shapes {
+            if !driven(&format!("{family}_{suffix}")) {
+                continue;
+            }
+            n_selected += 1;
+            for _ in 0..passes {
+                keeper.clear();
+                plan.append_map_ranges(black_box(src), &mut keeper, ranges);
+                acc = acc.wrapping_add(keeper.count).wrapping_add(keeper.blob.len());
+            }
+            let survivors: usize = ranges.iter().map(|&(s, e)| e - s).sum();
+            println!(
+                "map_ranges_bench {family}_{suffix}: {} ranges, {survivors} survivors",
+                ranges.len()
+            );
+        }
+    }
+    println!(
+        "map_ranges_bench shape={only} passes={passes} n={N} acc={}",
+        black_box(acc)
+    );
+    assert!(n_selected > 0, "GNITZ_BENCH_SHAPE matched nothing: {only:?}");
 }
 
 // ── MapPlan::from_wire — the circuit-node trust boundary ────────────────
@@ -830,6 +912,20 @@ fn a_projection_must_name_payload_columns_that_fit_one_schema() {
     // Exactly MAX_COLUMNS payload sources already overflow — the output also
     // carries the input's PK column, which a length-only bound misses.
     assert_eq!(proj(vec![1; MAX_COLUMNS]), "projection map: output exceeds MAX_COLUMNS");
+}
+
+/// A hash-row map over a `(U128 PK, I64)` input carries its payload column into
+/// an identical layout, yet rewrites every PK: the program alone reads as an
+/// identity, and only the PK source rules it out.
+#[test]
+fn a_hash_row_map_carrying_every_column_is_not_an_identity() {
+    let s = make_schema(0, &[TypeCode::U128, TypeCode::I64]);
+    let plan = MapPlan::from_wire(&s, &gnitz_wire::MapKind::HashRow { cols: vec![(1, None)] })
+        .expect("a well-formed hash-row map");
+    assert_eq!(plan.out_schema(), &s, "the output layout is the input's");
+    assert!(!plan.is_identity(), "a hash-row map is never an identity");
+    let inherit = MapPlan::from_map(LogicalProgram::copy_cols(&[1]), &s, &s, PkSource::Inherit).unwrap();
+    assert!(inherit.is_identity(), "the same copy under the inherited PK is one");
 }
 
 #[test]

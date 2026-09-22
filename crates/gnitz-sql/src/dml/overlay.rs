@@ -20,10 +20,8 @@ use std::sync::Arc;
 
 use crate::codec::project_schema::key_reply;
 use crate::error::GnitzSqlError;
-use crate::exec::residual::matching_indices;
-use crate::ir::BoundExpr;
 use gnitz_core::{GnitzClient, PkBuf, PkColumn, Schema, ZSetBatch};
-use gnitz_expr::RangeMembership;
+use gnitz_expr::RowFilter;
 use gnitz_wire::{PkKeys, ReadBound, ReadSink, ReadSpec};
 use std::collections::{HashMap, HashSet};
 
@@ -49,14 +47,12 @@ pub(crate) enum Conflict {
 
 /// The rows `spec` matches in the transaction's effective state: the committed reply
 /// under `reply_schema` without the PKs the transaction has written, and the
-/// transaction's own rows under `schema` inside `spec`'s bound that pass `residual`,
-/// the conjuncts the bound does not apply.
+/// transaction's own rows under `schema` that `spec`'s bound and predicate keep.
 pub(crate) fn resolve_where_matches(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
     spec: &ReadSpec,
-    residual: &[&BoundExpr],
     reply_schema: &Arc<Schema>,
 ) -> Result<(ZSetBatch, ZSetBatch), GnitzSqlError> {
     // A DML target is a base table, which is never mirrored.
@@ -71,22 +67,15 @@ pub(crate) fn resolve_where_matches(
         .map(|i| (i, committed.weights[i]))
         .collect();
     let present = present_rows(&net, schema);
-    let walk = range_walk(&spec.bound, schema)?;
-    let matched: Vec<(usize, i64)> = matching_indices(residual, &present, schema, walk.as_ref())?
-        .into_iter()
+    let mut ranges = Vec::new();
+    RowFilter::for_read(&spec.predicate, &spec.bound, schema.as_ref())?.ranges(&present, &mut ranges);
+    // `gather` compacts the string arena these rows carry.
+    let matched: Vec<(usize, i64)> = ranges
+        .iter()
+        .flat_map(|&(s, e)| s..e)
         .map(|i| (i, present.weights[i]))
         .collect();
     Ok((committed.gather(&keep), present.gather(&matched)))
-}
-
-/// The walk a range `bound` names, as a row filter; a `PkSet` or no bound names none.
-fn range_walk(bound: &ReadBound, schema: &Schema) -> Result<Option<RangeMembership>, GnitzSqlError> {
-    let walk = match *bound {
-        ReadBound::PkRange(desc) => RangeMembership::new(&schema.pk_cols, desc, schema),
-        ReadBound::IndexRange(b) => RangeMembership::new(b.idx_cols.as_slice(), b.desc, schema),
-        ReadBound::None | ReadBound::PkSet(_) => return Ok(None),
-    };
-    walk.map(Some).map_err(GnitzSqlError::Internal)
 }
 
 /// A read of the rows a batch's keys already hold: one `PkSet` gather of them.
@@ -128,7 +117,7 @@ impl<'a> KeyProbe<'a> {
         tid: u64,
         schema: &Arc<Schema>,
     ) -> Result<(ZSetBatch, ZSetBatch, Vec<Conflict>), GnitzSqlError> {
-        let (committed, buffered) = resolve_where_matches(client, tid, schema, &self.spec, &[], &self.reply)?;
+        let (committed, buffered) = resolve_where_matches(client, tid, schema, &self.spec, &self.reply)?;
         let held: HashSet<&[u8]> = (0..committed.len())
             .map(|r| committed.pks.get_bytes(r))
             .chain((0..buffered.len()).map(|r| buffered.pks.get_bytes(r)))

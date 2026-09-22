@@ -49,12 +49,9 @@
 //! So moving a body out of a generic function into a non-generic one *improves*
 //! the debug build, and the reverse costs. `nm -C` on the rlibs is what shows
 //! which: a generic body appears as a local (`t`) symbol in each consuming
-//! crate's. `&dyn BatchView` on [`Evaluator`]'s drive methods shrinks that set
-//! but does not empty it: `Evaluator::drive`, its closure,
-//! [`Evaluator::eval_morsels`] and `batch::with_str_bufs` are all defined in
-//! `libgnitz_store` at its opt-level 0. Anything reached per row from another
-//! crate is `#[inline(always)]` regardless — [`ColumnLocator`]'s methods and
-//! [`MorselOut`]'s, and `RowSource::row_count`.
+//! crate's. Anything a generic entry point reaches per row is
+//! `#[inline(always)]` regardless, as are [`ColumnLocator`]'s methods and
+//! `RowSource::row_count`.
 //!
 //! Judge an inlining or kernel change on retired instructions
 //! (`perf stat -e instructions:u`), never on wall-clock: timings on the
@@ -73,14 +70,13 @@ mod schema_facts;
 mod search;
 mod view;
 
-pub use batch::MorselOut;
 pub use builder::*;
 pub use calendar::CalendarOp;
 pub use eval::*;
 pub use like::*;
 pub use locator::*;
 pub use program::*;
-pub use range::*;
+pub(crate) use range::RangeMembership;
 pub use schema_facts::*;
 pub use view::*;
 

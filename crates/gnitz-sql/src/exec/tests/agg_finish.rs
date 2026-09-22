@@ -141,7 +141,7 @@ fn gt(ci: usize, v: i64) -> BoundExpr {
 fn the_output_row_carries_the_engine_group_key() {
     let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
     let partial = partial_schema(&[1], &specs);
-    let f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
+    let mut f = finish_of(&partial, &specs, &[], passthrough_all(&partial));
     let reply = batch(
         &partial,
         &[
@@ -268,7 +268,7 @@ fn a_reply_sharing_no_group_is_returned_whole() {
 fn having_compacts_before_an_identity_finalize() {
     let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
     let partial = partial_schema(&[1], &specs);
-    let f = finish_of(&partial, &specs, &[gt(2, 1)], passthrough_all(&partial));
+    let mut f = finish_of(&partial, &specs, &[gt(2, 1)], passthrough_all(&partial));
     assert!(f.finalize.is_identity());
 
     let got = f.apply(batch(
@@ -294,7 +294,7 @@ fn a_projecting_finalize_runs_the_map() {
     let specs = [spec(WireAggFunc::Count, 0, TypeCode::I64)];
     let partial = partial_schema(&[2], &specs);
     let plus_one = BExpr::bin(BExpr::ColRef(2), BinOp::Add, BExpr::LitInt(1));
-    let f = finish_of(
+    let mut f = finish_of(
         &partial,
         &specs,
         &[gt(2, 1)],
@@ -340,7 +340,7 @@ fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
     ];
     let partial = partial_over(&src, &[], &specs);
     // No group columns: the SUM lands at partial column 1, its companion at 2.
-    let f = finish_of(
+    let mut f = finish_of(
         &partial,
         &specs,
         &[],

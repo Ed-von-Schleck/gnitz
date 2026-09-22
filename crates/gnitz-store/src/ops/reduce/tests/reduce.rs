@@ -491,7 +491,7 @@ fn linear_sum_only_new_all_null_group_present() {
     ];
     // fin payload 0 = grp; fin payload 1 = the gated sum.
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(4))];
-    let fin_func = crate::expr::MapPlan::from_map(
+    let mut fin_func = crate::expr::MapPlan::from_map(
         LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &out_schema,
         &fin_schema,
@@ -665,7 +665,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     ];
     // fin payload 0 = grp, 1 = count, 2 = the gated sum.
     let sinks = vec![Sink::Col(1), Sink::Col(2), Sink::Reg(Reg(4))];
-    let fin_func = crate::expr::MapPlan::from_map(
+    let mut fin_func = crate::expr::MapPlan::from_map(
         LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &out_schema,
         &fin_schema,

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use gnitz_core::{PayloadColumn, Schema, ZSetBatch};
-use gnitz_expr::{ColumnLocator, Evaluator, LogicalProgram};
+use gnitz_expr::{ColumnLocator, LogicalProgram, MapEval};
 
 use crate::error::GnitzSqlError;
 
@@ -12,12 +12,9 @@ use crate::error::GnitzSqlError;
 /// the source's key, then what the program writes.
 pub(crate) struct ClientMap {
     out_schema: Arc<Schema>,
-    ev: Evaluator,
-    /// The map's verbatim column copies as `(output payload slot, source column)`: a payload
-    /// column moves its region whole, a PK column is decoded row by row.
-    copies: Vec<(usize, ColumnLocator)>,
-    /// The map reproduces its input.
-    identity: bool,
+    ev: MapEval,
+    /// Some computed slot is a German string, whose cell may spill into the output heap.
+    computes_a_string: bool,
 }
 
 impl ClientMap {
@@ -33,20 +30,14 @@ impl ClientMap {
                 "a client map must keep its source's key".into(),
             ));
         }
-        let identity = program.is_identity_map(src, out_schema.as_ref());
         let ev = program.resolve_map(src, out_schema.as_ref())?;
-        let copies = ev
-            .copies()
-            .iter()
-            .map(|&(loc, out, width)| {
-                if loc.size() == width as usize {
-                    Ok((out as usize, loc))
-                } else {
-                    Err(GnitzSqlError::Internal("a projection copies a promoted column".into()))
-                }
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(ClientMap { out_schema, ev, copies, identity })
+        if ev.copies().iter().any(|c| c.src.size() != c.width) {
+            return Err(GnitzSqlError::Internal("a projection copies a promoted column".into()));
+        }
+        let computes_a_string = out_schema
+            .payload_columns()
+            .any(|(pi, _, c)| c.ty.tc.is_german_string() && !ev.copies().iter().any(|k| k.slot == pi));
+        Ok(ClientMap { out_schema, ev, computes_a_string })
     }
 
     pub(crate) fn out_schema(&self) -> &Arc<Schema> {
@@ -56,77 +47,42 @@ impl ClientMap {
     /// Whether the map reproduces its input, so [`Self::apply`] hands the batch back.
     #[cfg(test)]
     pub(crate) fn is_identity(&self) -> bool {
-        self.identity
+        self.ev.is_identity()
     }
 
     /// The map over every row of `src`, each row keeping its PK and weight.
-    pub(crate) fn apply(&self, src: ZSetBatch) -> ZSetBatch {
-        if self.identity {
+    pub(crate) fn apply(&mut self, src: ZSetBatch) -> ZSetBatch {
+        if self.ev.is_identity() {
             return src;
         }
-        let (ev, n) = (&self.ev, src.len());
+        let n = src.len();
         let mut out = ZSetBatch::new(&self.out_schema);
         out.nulls = vec![0; n];
-        let str_emits = !ev.str_emits().is_empty();
-        if str_emits {
+        out.payload = ZSetBatch::filler_columns(&self.out_schema, n);
+        if self.computes_a_string {
             // Appended to, so copied: a copied German cell keeps its offset into it.
             out.blob = src.blob.clone();
         }
-        for &(_, pi, stride) in ev.scalar_emits() {
-            out.payload[pi as usize].bytes = vec![0; n * stride as usize];
-        }
-        for &(_, pi) in ev.str_emits() {
-            out.payload[pi as usize].bytes = vec![0; n * 16];
-        }
-        {
-            let ZSetBatch { nulls, payload, blob, .. } = &mut out;
-            let nb = gnitz_wire::as_le_bytes_mut(nulls);
-            ev.null_perm()
-                .write_rows(gnitz_wire::as_le_bytes(&src.nulls), 0, nb, 0, n);
-            if ev.emits_anything() {
-                ev.eval_morsels(&src, 0, n, |row0, mo| {
-                    for &(reg, pi, stride) in ev.scalar_emits() {
-                        mo.emit_scalar_cells(
-                            reg as usize,
-                            &mut payload[pi as usize].bytes,
-                            nb,
-                            row0,
-                            pi as usize,
-                            stride as usize,
-                        );
-                    }
-                    for &(reg, pi) in ev.str_emits() {
-                        mo.emit_str_cells(
-                            reg as usize,
-                            &mut payload[pi as usize].bytes,
-                            nb,
-                            blob,
-                            row0,
-                            pi as usize,
-                        );
-                    }
-                });
-            }
-        }
+        self.ev.write_computed(&src, 0, n, &mut out, 0);
         // A key column's copy decodes it out of the key region; a key is never NULL.
-        let mut moves = Vec::with_capacity(self.copies.len());
-        for &(to, loc) in &self.copies {
-            match loc {
-                ColumnLocator::Payload { slot, .. } => moves.push((to, slot as usize)),
+        let mut moves = Vec::new();
+        for c in self.ev.copies() {
+            match c.src {
+                ColumnLocator::Payload { slot, .. } => moves.push((c.slot, slot as usize)),
                 ColumnLocator::Pk { .. } => {
-                    let mut bytes = Vec::with_capacity(n * loc.size());
+                    let mut bytes = Vec::with_capacity(n * c.width);
                     let mut scratch = [0u8; 16];
                     for r in 0..n {
-                        bytes.extend_from_slice(loc.native_le_bytes(&src, r, &mut scratch));
+                        bytes.extend_from_slice(c.src.native_le_bytes(&src, r, &mut scratch));
                     }
-                    out.payload[to].bytes = bytes;
+                    out.payload[c.slot].bytes = bytes;
                 }
             }
         }
         // The evaluator is done with `src`; its parts move into the output.
         let ZSetBatch { pks, weights, mut payload, blob, .. } = src;
         move_payload(&mut out.payload, &mut payload, &moves);
-        if !str_emits {
+        if !self.computes_a_string {
             out.blob = blob;
         }
         out.pks = pks;

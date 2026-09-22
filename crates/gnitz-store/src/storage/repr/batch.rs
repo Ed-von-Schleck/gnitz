@@ -843,15 +843,18 @@ impl Batch {
         string_mask: u64,
         mut cache: Option<&mut BlobCache>,
     ) {
-        for &(start, end) in ranges {
-            assert!(start <= end, "append_ranges_inner: start ({start}) > end ({end})");
-            assert!(
-                end <= src.count,
-                "append_ranges_inner: end ({end}) > src.count ({})",
-                src.count
-            );
-        }
-        let total = range_rows(ranges);
+        let total: usize = ranges
+            .iter()
+            .map(|&(start, end)| {
+                assert!(start <= end, "append_ranges_inner: start ({start}) > end ({end})");
+                assert!(
+                    end <= src.count,
+                    "append_ranges_inner: end ({end}) > src.count ({})",
+                    src.count
+                );
+                end - start
+            })
+            .sum();
         if total == 0 {
             return;
         }
@@ -1376,7 +1379,11 @@ impl Batch {
     /// (see `append_ranges_inner`); it is a pure optimization, correct either
     /// way.
     pub(crate) fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
-        let rows = range_rows(ranges);
+        self.append_counted_ranges(src, ranges, range_rows(ranges));
+    }
+
+    /// [`Self::append_ranges`] with the ranges' row count already in hand.
+    fn append_counted_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)], rows: usize) {
         // Before the session, which derives a payload string mask and takes a
         // pooled blob cache to copy nothing. An all-DELETE push emits one empty
         // range per row.
@@ -1430,7 +1437,7 @@ impl Batch {
         if !merge::should_relocate_blob(src.blob.len(), src.count, rows) {
             out.share_blob_from(src);
         }
-        out.append_ranges(&src.as_mem_batch(), ranges);
+        out.append_counted_ranges(&src.as_mem_batch(), ranges, rows);
         out.inherit_layout(src);
         out
     }
@@ -1771,6 +1778,17 @@ impl RowSource for Batch {
     #[inline(always)]
     fn row_count(&self) -> usize {
         Batch::len(self)
+    }
+}
+
+impl gnitz_expr::MapTarget for Batch {
+    #[inline(always)]
+    fn null_bmp_mut(&mut self) -> &mut [u8] {
+        self.null_bmp_data_mut()
+    }
+    #[inline(always)]
+    fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
+        self.col_null_and_blob_mut(pi)
     }
 }
 

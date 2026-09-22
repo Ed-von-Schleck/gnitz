@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::fmt::{self, Write as _};
 
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
-use crate::program::{FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp};
+use crate::program::{EmitWidth, FloatUnaryOp, IntArithOp, IntOrder, IntReg, IntUnaryOp, ScalarEmit, StrEmit};
 use crate::search::{fields, find};
 use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
@@ -37,7 +37,8 @@ fn float_to_int_bounds(fi: FixedInt) -> (f64, f64) {
 }
 
 pub(crate) const MORSEL: usize = 256;
-const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
+const _: () = assert!(MORSEL.is_multiple_of(64), "a morsel owns whole bitmap words");
+const NULL_WORDS_PER_REG: usize = MORSEL / 64;
 
 /// Live bits of the last of `m.div_ceil(64)` words: all-ones when the morsel
 /// fills it, so a tail mask is written unconditionally.
@@ -63,22 +64,17 @@ pub(crate) struct EvalScratch {
     /// consumers on the nullable arm without per-row repack from `regs`.
     /// Empty (capacity 0) when `no_nulls` is true.
     bool_bits: Vec<u64>,
-    /// Per-row filter bitmask; written only by the filter path, and the one
-    /// buffer whose width follows the batch rather than the program.
-    filter_bits: Vec<u64>,
     /// String register lanes, register-major like [`Self::regs`]:
     /// `str_views[reg * MORSEL + row]`. Empty (capacity 0) unless the program
     /// has string instructions; a zero-length default view reads as `""`.
     str_views: Vec<StrView>,
     /// Computed string bytes — case folds, concatenations, numeric text —
     /// behind the program's string constants, which occupy a prefix the
-    /// per-morsel reset does not clear. Views never outlive their morsel plus
-    /// its emit phase, and the borrow checker enforces that ordering:
-    /// `MorselOut` borrows the scratch immutably while the next `eval_batch`
-    /// needs it mutably.
+    /// per-morsel reset does not clear. A view lives as long as the
+    /// [`MorselOut`] borrowing it.
     ///
     /// The constant prefix is written once by [`EvalScratch::new`], so a scratch
-    /// is tied to the one program it was built for. An `Evaluator` owns both, so
+    /// is tied to the one program it was built for. The evaluator owns both, so
     /// that pairing holds by construction.
     str_arena: Vec<u8>,
 }
@@ -117,8 +113,8 @@ fn split_windows<T, const N: usize>(
 
 impl EvalScratch {
     /// The whole register file for `prog`, sized and seeded once — every buffer
-    /// but [`Self::filter_bits`] is a function of the program alone, and a
-    /// scratch belongs to exactly one [`crate::Evaluator`], hence to one program.
+    /// is a function of the program alone, and a scratch belongs to exactly one
+    /// evaluator, hence to one program.
     /// A zero capacity is how a buffer stays unallocated for a program that never
     /// touches it.
     pub(crate) fn new(prog: &ResolvedProgram) -> Self {
@@ -134,7 +130,6 @@ impl EvalScratch {
             regs: vec![0; prog.scalar_lanes as usize * MORSEL],
             null_bits: vec![0; null_cap],
             bool_bits: vec![0; null_cap],
-            filter_bits: Vec::new(),
             str_views: vec![StrView::default(); prog.str_lanes as usize * MORSEL],
             str_arena: prog.const_arena.clone(),
         };
@@ -163,22 +158,6 @@ impl EvalScratch {
         }
     }
 
-    /// Ensure the filter bitmap holds `(n + 63) / 64` words — the one buffer
-    /// [`Self::new`] cannot size, since it follows the batch. Does not shrink.
-    pub(crate) fn ensure_filter_words(&mut self, n: usize) {
-        let words = n.div_ceil(64);
-        if self.filter_bits.len() < words {
-            self.grow_filter_words(words);
-        }
-    }
-
-    /// The growth half of [`Self::ensure_filter_words`], taken once per widest
-    /// batch an evaluator is driven over.
-    #[cold]
-    fn grow_filter_words(&mut self, words: usize) {
-        self.filter_bits.resize(words, 0);
-    }
-
     fn reg_mut(&mut self, reg: u16, m: usize) -> &mut [i64] {
         let base = reg as usize * MORSEL;
         &mut self.regs[base..base + m]
@@ -204,71 +183,15 @@ impl EvalScratch {
         )
     }
 
-    /// Pack this morsel's filter verdict into `filter_bits`, at the word run
-    /// morsel `morsel_start` owns. `MORSEL` is 64-aligned, so that run is whole
-    /// words: every word is written in full, sparing both the read-modify-write
-    /// and the up-front zero-fill.
-    ///
-    /// Not `#[inline(always)]`: non-generic, so its body lives in this crate's
-    /// opt-1 rlib rather than in `filter`'s opt-0 monomorphization.
-    pub(crate) fn write_filter_words(&mut self, prog: &ResolvedProgram, morsel_start: usize, m: usize) {
-        let r = prog.result_reg as usize;
-        let base_w = morsel_start / 64;
-        let words = m.div_ceil(64);
-        if prog.no_nulls {
-            // `no_nulls` allocates no `bool_bits`, so the verdict is in `regs`.
-            let base_r = r * MORSEL;
-            pack_truthy(
-                &self.regs[base_r..base_r + m],
-                &mut self.filter_bits[base_w..base_w + words],
-            );
-            return;
-        }
-        // Word-level merge: filter bit = truthy & !null.
-        let base = r * NULL_WORDS_PER_REG;
-        for w in 0..words {
-            self.filter_bits[base_w + w] = self.bool_bits[base + w] & !self.null_bits[base + w];
-        }
-        // Every nullable-arm boolean producer writes whole words, so the last one
-        // carries 1s past the morsel's last row. Masked once here rather than by
-        // each of them: unmasked they append the degenerate range `(n, n)`,
-        // breaking the maximal-non-empty-run contract `filter` documents.
-        self.filter_bits[base_w + words - 1] &= tail_mask(m);
-    }
-
-    /// The filter bitmap covering `n` rows. No bit past `n` is set — both arms
-    /// of [`Self::write_filter_words`] see to that.
-    pub(crate) fn filter_words_mut(&mut self, n: usize) -> &mut [u64] {
-        &mut self.filter_bits[..n.div_ceil(64)]
-    }
-
-    /// The result register's value at row `i` of the morsel just evaluated, or
-    /// `None` for a NULL row — the **one** statement of how a result is read
-    /// back, whatever arity the caller drives at. Reads the `regs` lane, which
-    /// a bit_only register has none of — [`crate::Evaluator::eval_all`]'s role
-    /// guard is what keeps those out.
-    pub(crate) fn result_value(&self, prog: &ResolvedProgram, i: usize) -> Option<i64> {
-        let r = prog.result_reg as usize;
-        let (word, bit) = (r * NULL_WORDS_PER_REG + i / 64, i % 64);
-        if !prog.no_nulls && (self.null_bits[word] >> bit) & 1 != 0 {
-            return None;
-        }
-        Some(self.regs[r * MORSEL + i])
-    }
-
-    /// [`Self::result_value`] for every row of the morsel, appended to `out`.
-    pub(crate) fn append_result_values(&self, prog: &ResolvedProgram, m: usize, out: &mut Vec<Option<i64>>) {
-        out.extend((0..m).map(|i| self.result_value(prog, i)));
-    }
-
-    /// This morsel's registers, as the shape [`crate::Evaluator::eval_morsels`]
-    /// hands out. `#[inline(always)]` — it returns a couple of hundred bytes by
-    /// value into an opt-0 caller, once per morsel.
+    /// This morsel's registers.
     #[inline(always)]
-    pub(crate) fn morsel_out<'a>(&'a self, bufs: StrBufs<'a>, m: usize) -> MorselOut<'a> {
+    pub(crate) fn morsel_out<'a>(&'a self, prog: &ResolvedProgram, bufs: StrBufs<'a>, m: usize) -> MorselOut<'a> {
         MorselOut {
             regs: &self.regs,
-            null_bits: &self.null_bits,
+            nulls: (!prog.no_nulls).then_some(NullLanes {
+                null_bits: &self.null_bits,
+                bool_bits: &self.bool_bits,
+            }),
             str_views: &self.str_views,
             str_arena: &self.str_arena,
             bufs,
@@ -286,131 +209,103 @@ impl EvalScratch {
     }
 }
 
-/// One morsel's results, read out of the register file. Handed to
-/// [`crate::eval::Evaluator::eval_morsels`]'s callback for the lifetime of that call.
-pub struct MorselOut<'a> {
+/// One morsel's results, read out of the register file.
+pub(crate) struct MorselOut<'a> {
     regs: &'a [i64],
-    /// Empty exactly when the program resolved `no_nulls`, which is the one
-    /// record of the arm here: `analyze` starts the verdict at `true` and only
-    /// ANDs, so a nullable program has at least one register and a non-empty
-    /// window.
-    null_bits: &'a [u64],
+    /// `None` on the `no_nulls` arm, which tracks no null or truth bits.
+    nulls: Option<NullLanes<'a>>,
     str_views: &'a [StrView],
     str_arena: &'a [u8],
     bufs: StrBufs<'a>,
     m: usize,
 }
 
+#[derive(Clone, Copy)]
+struct NullLanes<'a> {
+    null_bits: &'a [u64],
+    bool_bits: &'a [u64],
+}
+
 impl MorselOut<'_> {
-    /// How many rows this morsel covers (always ≥ 1) — the one thing an
-    /// [`crate::Evaluator::eval_morsels`] callback needs that the emits below,
-    /// which cut their own windows, do not hand it.
+    /// How many rows this morsel covers (always ≥ 1).
     #[inline(always)]
-    pub fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         self.m
     }
 
-    /// Register `reg`'s values for this morsel's rows, in row order. Crate-local:
-    /// consumers outside this crate read the same lanes as bytes, through
-    /// [`Self::reg_bytes`], which is what an 8-byte output slot stores.
+    /// Register `reg` as a filter verdict, one bit per row into `out`: set where
+    /// the value is true and not NULL.
+    pub(crate) fn filter_words(&self, reg: usize, out: &mut [u64]) {
+        debug_assert_eq!(out.len(), self.m.div_ceil(64), "one bit per row");
+        let Some(NullLanes { null_bits, bool_bits }) = self.nulls else {
+            return pack_truthy(self.reg_values(reg), out);
+        };
+        let base = reg * NULL_WORDS_PER_REG;
+        for (w, word) in out.iter_mut().enumerate() {
+            *word = bool_bits[base + w] & !null_bits[base + w];
+        }
+        // Boolean producers on this arm write whole words.
+        out[out.len() - 1] &= tail_mask(self.m);
+    }
+
+    /// Register `reg`'s values for this morsel's rows, in row order.
     #[inline(always)]
     pub(crate) fn reg_values(&self, reg: usize) -> &[i64] {
         let base = reg * MORSEL;
         &self.regs[base..base + self.m]
     }
 
-    /// The same values as their little-endian byte image, 8 bytes per row —
-    /// what an 8-byte output slot stores. `check_emit_slot` holds every register sink
-    /// destination to such a slot, so [`Self::emit_scalar_cells`] blits this
-    /// straight into one.
-    ///
-    /// Only a *scalar* register has a lane here (`ResolvedProgram::scalar_lanes`
-    /// sizes the buffer); a string one panics on the index.
+    /// The same values as their little-endian byte image.
     #[inline(always)]
     pub(crate) fn reg_bytes(&self, reg: usize) -> &[u8] {
         gnitz_wire::as_le_bytes(self.reg_values(reg))
     }
 
-    /// Emit scalar register `reg` into output payload column `col`, whose rows
-    /// start at `row0`: the register image blitted in at `stride` 8, or its low
-    /// `stride` bytes per row into a narrower slot (`check_emit_slot` admits one
-    /// only behind a cast to that width), then each NULL row's slot zeroed and
-    /// its bit set at `out_payload` in the row-major bitmap `nb`.
-    ///
-    /// The narrow widths are unswitched rather than written once against a
-    /// runtime `stride`: a runtime width makes each row's store an indirect
-    /// `memcpy` call, where a constant one is a move the loop vectorizes.
-    pub fn emit_scalar_cells(
-        &self,
-        reg: usize,
-        col: &mut [u8],
-        nb: &mut [u8],
-        row0: usize,
-        out_payload: usize,
-        stride: usize,
-    ) {
-        let win = &mut col[row0 * stride..(row0 + self.m) * stride];
-        // `stride` is `wire_stride` of a slot `check_emit_slot` passed, so it is
-        // a fixed-int width; a 16-byte string slot goes to `emit_str_cells`.
-        match stride {
-            8 => win.copy_from_slice(self.reg_bytes(reg)),
-            4 => Self::narrow_cells(win, self.reg_values(reg), |v| (v as u32).to_le_bytes()),
-            2 => Self::narrow_cells(win, self.reg_values(reg), |v| (v as u16).to_le_bytes()),
-            1 => Self::narrow_cells(win, self.reg_values(reg), |v| (v as u8).to_le_bytes()),
-            _ => unreachable!("a scalar emit slot is 1, 2, 4 or 8 bytes, not {stride}"),
+    /// Write scalar emit `e` for this morsel's rows into its slot from `row0`:
+    /// each value's low bytes, NULL rows zeroed with their bit set in `nb`.
+    pub(crate) fn emit_scalar(&self, e: &ScalarEmit, (col, nb, _): (&mut [u8], &mut [u8], &mut Vec<u8>), row0: usize) {
+        let w = e.width.bytes();
+        let win = &mut col[row0 * w..(row0 + self.m) * w];
+        let vals = self.reg_values(e.reg);
+        match e.width {
+            EmitWidth::W8 => win.copy_from_slice(self.reg_bytes(e.reg)),
+            EmitWidth::W4 => Self::narrow_cells(win, vals, |v| (v as u32).to_le_bytes()),
+            EmitWidth::W2 => Self::narrow_cells(win, vals, |v| (v as u16).to_le_bytes()),
+            EmitWidth::W1 => Self::narrow_cells(win, vals, |v| (v as u8).to_le_bytes()),
         }
-        self.write_null_rows(reg, win, stride, nb, row0, out_payload);
+        self.write_null_rows(e.reg, win, w, nb, row0, e.slot);
     }
 
-    /// [`MorselOut::emit_scalar_cells`]'s narrow half: each value's low `W`
-    /// bytes, as `to_bytes` truncates them, into its own slot.
+    /// Each value's low `W` bytes, as `to_bytes` truncates them, into its own cell.
     fn narrow_cells<const W: usize>(win: &mut [u8], vals: &[i64], to_bytes: impl Fn(i64) -> [u8; W]) {
         for (dst, v) in win.as_chunks_mut::<W>().0.iter_mut().zip(vals) {
             *dst = to_bytes(*v);
         }
     }
 
-    /// [`Self::emit_scalar_cells`] over a string register: one German-string
-    /// cell per row, long bodies appended to `blob`, then the NULL rows blanked.
-    pub fn emit_str_cells(
-        &self,
-        reg: usize,
-        col: &mut [u8],
-        nb: &mut [u8],
-        blob: &mut Vec<u8>,
-        row0: usize,
-        out_payload: usize,
-    ) {
+    /// Write string emit `e` for this morsel's rows into its slot from `row0`:
+    /// one German-string cell per row, long bodies appended to the slot's heap.
+    pub(crate) fn emit_str(&self, e: &StrEmit, (col, nb, blob): (&mut [u8], &mut [u8], &mut Vec<u8>), row0: usize) {
         let win = &mut col[row0 * 16..(row0 + self.m) * 16];
-        self.write_str_cells(reg, win, blob);
-        self.write_null_rows(reg, win, 16, nb, row0, out_payload);
+        self.write_str_cells(e.reg, win, blob);
+        self.write_null_rows(e.reg, win, 16, nb, row0, e.slot);
+    }
+
+    fn write_str_cells(&self, reg: usize, win: &mut [u8], blob: &mut Vec<u8>) {
+        for (i, cell) in win.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            *cell = gnitz_wire::encode_german_string(self.str_bytes(reg, i), blob);
+        }
     }
 
     /// String register `reg`'s bytes for row `i` of this morsel.
-    ///
-    /// Unlike [`Self::reg_values`], which returns a slice already cut to `m`,
-    /// this is a random-access getter and carries its own bound: an
-    /// out-of-morsel read would otherwise hand back another value's bytes.
     #[inline(always)]
     pub(crate) fn str_bytes(&self, reg: usize, i: usize) -> &[u8] {
         debug_assert!(i < self.m, "str_bytes row {i} is outside the morsel's {} rows", self.m);
         view_bytes(self.str_views[reg * MORSEL + i], self.str_arena, self.bufs)
     }
 
-    /// Encode string register `reg` into `win`, one German-string cell per row,
-    /// long bodies appended to `blob`. Writes every row, NULL ones included;
-    /// [`Self::write_null_rows`] zeroes those after.
-    fn write_str_cells(&self, reg: usize, win: &mut [u8], blob: &mut Vec<u8>) {
-        debug_assert_eq!(win.len(), self.m * 16, "a string emit window is 16 bytes per row");
-        for (i, cell) in win.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-            *cell = gnitz_wire::encode_german_string(self.str_bytes(reg, i), blob);
-        }
-    }
-
-    /// The NULL half of an emit: zero a NULL row's `stride`-byte cell in `win`
-    /// and set its bit at `out_payload` in the row-major output bitmap `nb`,
-    /// whose rows start at `row0`. The bit merge is a read-modify-write, which
-    /// is what lets two emits compose.
+    /// Zero each NULL row's `stride`-byte cell in `win` and set its bit
+    /// `out_payload` in the row-major bitmap `nb`, whose rows start at `row0`.
     fn write_null_rows(
         &self,
         reg: usize,
@@ -430,20 +325,15 @@ impl MorselOut<'_> {
     }
 
     /// Call `f(i)` for each of the morsel's rows where register `reg` is NULL.
-    /// NULL rows are the exception, so consumers bit-scan rather than branch per
-    /// row — a per-row branch would de-vectorize the surrounding value store.
-    ///
-    /// Every producer writes only rows `0..m`, so bits at index >= m are zero and
-    /// the bit-scan stays in the morsel — no tail re-masking needed.
     #[inline(always)]
     pub(crate) fn for_each_null_row(&self, reg: usize, mut f: impl FnMut(usize)) {
-        if self.null_bits.is_empty() {
+        let Some(NullLanes { null_bits, .. }) = self.nulls else {
             return;
-        }
+        };
         let base = reg * NULL_WORDS_PER_REG;
         let words = self.m.div_ceil(64);
         for w in 0..words {
-            let word = self.null_bits[base + w];
+            let word = null_bits[base + w];
             debug_assert!(
                 w + 1 < words || self.m.is_multiple_of(64) || (word >> (self.m % 64)) == 0,
                 "null_bits tail word has bits set beyond m={}",
@@ -679,8 +569,7 @@ fn is_null_packed(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: usiz
     }
     for w in 0..words {
         scratch.bool_bits[base + w] ^= flip;
-        // Whole words: `for_each_null_row` asserts a clean tail here, and the
-        // 1s `flip` leaves in `bool_bits` are `write_filter_words`' to mask.
+        // Whole words; a verdict's reader masks past the last row.
         scratch.null_bits[base + w] = 0;
     }
     maybe_unpack_bool_to_regs(scratch, mo, dst);
@@ -885,8 +774,8 @@ impl<'a> StrBufs<'a> {
 }
 
 /// Resolve the string column regions `prog` holds views into and run `f` over
-/// the buffer table. Once per drive call, never per morsel: every region spans
-/// the whole batch.
+/// the buffer table. Once per batch, never per morsel: every region spans the
+/// whole batch.
 ///
 /// A scope function because the table is a fixed-width stack array whose borrow
 /// has to outlive both [`eval_batch`] and the [`MorselOut`] built after it —
@@ -1730,6 +1619,43 @@ fn str_cmp(scratch: &mut EvalScratch, mo: &Morsel<'_>, op: CmpOp, d: u16, a: Str
 // eval_batch — single morsel
 // ---------------------------------------------------------------------------
 
+/// Decode PK column `fi` at byte `off` of each of the morsel's rows into register
+/// `dst`, undoing the OPK encoding. Unswitched on `fi`, so each width reads a
+/// fixed-size array: one load and a byte swap per row.
+fn load_pk(
+    scratch: &mut EvalScratch,
+    mo: &Morsel<'_>,
+    dst: u16,
+    (pk, stride): (&[u8], usize),
+    off: usize,
+    fi: FixedInt,
+) {
+    let rows = &pk[mo.start * stride..(mo.start + mo.m) * stride];
+    let dst_reg = scratch.reg_mut(dst, mo.m);
+    macro_rules! load {
+        ($w:expr, |$c:ident| $body:expr) => {{
+            const W: usize = $w;
+            assert!(off + W <= stride, "a PK column lies inside the PK");
+            for (r, row) in dst_reg.iter_mut().zip(rows.chunks_exact(stride)) {
+                let $c: &[u8; W] = row[off..off + W].try_into().unwrap();
+                *r = $body;
+            }
+        }};
+    }
+    match fi {
+        FixedInt::U8 => load!(1, |c| c[0] as i64),
+        FixedInt::I8 => load!(1, |c| (c[0] ^ 0x80) as i8 as i64),
+        FixedInt::U16 => load!(2, |c| u16::from_be_bytes(*c) as i64),
+        FixedInt::I16 => load!(2, |c| (u16::from_be_bytes(*c) ^ 0x8000) as i16 as i64),
+        FixedInt::U32 => load!(4, |c| u32::from_be_bytes(*c) as i64),
+        FixedInt::I32 => load!(4, |c| (u32::from_be_bytes(*c) ^ 0x8000_0000) as i32 as i64),
+        FixedInt::U64 => load!(8, |c| u64::from_be_bytes(*c) as i64),
+        FixedInt::I64 => load!(8, |c| (u64::from_be_bytes(*c) ^ (1u64 << 63)) as i64),
+    }
+    scratch.clear_null_reg(mo, dst);
+    maybe_pack_bool_bits(scratch, mo, dst);
+}
+
 /// Evaluate `prog` over one morsel of `mb` (`morsel_start..morsel_start+m`).
 /// Results land in `scratch.regs`; null bits in `scratch.null_bits`.
 ///
@@ -1753,10 +1679,7 @@ pub(crate) fn eval_batch(
         start: morsel_start,
         m,
     };
-    // Reset the string arena to the constant prefix `EvalScratch::new` installed.
-    // Every view a previous morsel produced dies here, which is sound because the
-    // emit phase runs inside `eval_morsels`' per-morsel callback, before the next
-    // call reaches this line.
+    // Back to the constant prefix: the previous morsel's views die here.
     scratch.str_arena.truncate(prog.const_arena.len());
 
     for instr in &prog.instrs {
@@ -1819,37 +1742,7 @@ pub(crate) fn eval_batch(
                 maybe_pack_bool_bits(scratch, &mo, dst);
             }
 
-            // PK-region load: undo the OPK encoding (big-endian, sign flipped).
-            // Unswitched on `fi` so each width reads a fixed-size array and
-            // becomes one load plus a byte swap; `decode_opk_i64` takes the width
-            // as a slice length, which keeps it a per-row byte reconstruction.
-            Instr::LoadPk { dst, off, fi } => {
-                let (pk, stride) = (pk_region, pk_stride);
-                let start = morsel_start * stride + off as usize;
-                let dst_reg = scratch.reg_mut(dst, m);
-                macro_rules! load_pk {
-                    ($w:expr, |$c:ident| $body:expr) => {{
-                        const W: usize = $w;
-                        let cells = &pk[start..start + (m - 1) * stride + W];
-                        for (r, k) in dst_reg.iter_mut().zip((0..m).map(|i| i * stride)) {
-                            let $c: &[u8; W] = cells[k..k + W].try_into().unwrap();
-                            *r = $body;
-                        }
-                    }};
-                }
-                match fi {
-                    FixedInt::U8 => load_pk!(1, |c| c[0] as i64),
-                    FixedInt::I8 => load_pk!(1, |c| (c[0] ^ 0x80) as i8 as i64),
-                    FixedInt::U16 => load_pk!(2, |c| u16::from_be_bytes(*c) as i64),
-                    FixedInt::I16 => load_pk!(2, |c| (u16::from_be_bytes(*c) ^ 0x8000) as i16 as i64),
-                    FixedInt::U32 => load_pk!(4, |c| u32::from_be_bytes(*c) as i64),
-                    FixedInt::I32 => load_pk!(4, |c| (u32::from_be_bytes(*c) ^ 0x8000_0000) as i32 as i64),
-                    FixedInt::U64 => load_pk!(8, |c| u64::from_be_bytes(*c) as i64),
-                    FixedInt::I64 => load_pk!(8, |c| (u64::from_be_bytes(*c) ^ (1u64 << 63)) as i64),
-                }
-                scratch.clear_null_reg(&mo, dst);
-                maybe_pack_bool_bits(scratch, &mo, dst);
-            }
+            Instr::LoadPk { dst, off, fi } => load_pk(scratch, &mo, dst, (pk_region, pk_stride), off as usize, fi),
 
             // ----------------------------------------------------------------
             // Integer arithmetic

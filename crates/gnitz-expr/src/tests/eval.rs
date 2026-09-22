@@ -1,31 +1,26 @@
-//! Driving a resolved program through [`crate::Evaluator`]: the filter over a
-//! whole batch, the m=1 row read, the 3VL / bit_only / AND-chain behaviour
-//! visible at that surface, and the map-side accessors an engine consumer reads
-//! a resolved program through.
+//! The evaluator types' read-backs, and the 3VL / bit_only / AND-chain behaviour
+//! visible through them.
 
 use crate::{ConstIdx, Reg, Sink};
 use gnitz_wire::TypeCode;
 
 use crate::batch::MORSEL;
+use crate::eval::Resolved;
+use crate::program::{EmitWidth, NullPerm, ScalarEmit, StrEmit};
 use crate::test_support::{
     both_arms, filter_and_scalar, filter_prog, is_not_null_op, is_null_op, make_int_view, make_n_col_view, map_prog,
-    passing_ranges, passing_rows, push_payload_cols, row_value, scalar_prog, schema_pk_ints, schema_pk_strings,
+    passing_ranges, passing_rows, push_payload_cols, row_values, scalar_prog, schema_pk_ints, schema_pk_strings,
     set_row_pk, FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, NullPerm, SchemaFacts};
+use crate::{CmpOp, ExprResults, IntArithOp, LogicalInstr, MapEval, ScalarEval, SchemaFacts};
 
-/// True iff `ev`'s predicate passes for `row`, read back as a value. `ev` must be
-/// the *scalar* resolution: `eval_all` refuses a filter-resolved evaluator.
-fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
-    row_value(ev, mb, row).is_some_and(|val| val != 0)
+/// True iff `ev`'s predicate passes for `row`, read back as a value.
+fn passes(ev: &mut ScalarEval, mb: &TestView, row: usize) -> bool {
+    row_values(ev, mb)[row].is_some_and(|val| val != 0)
 }
 
-/// The map-side surface an engine consumer reads a resolved program through:
-/// which columns are copied verbatim, which are written out of the register
-/// file, and how a copied column's null bit moves. Every one of these is read by
-/// the engine's columnar map, so a wrong answer here is a wrong output
-/// column there — but none of them is visible through the three drive methods
-/// the rest of this file exercises.
+/// A resolved map's sinks: which columns are copied verbatim, which are written
+/// out of the register file, and how a copied column's null bit moves.
 #[test]
 fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
     // in:  pk U64, 0: I64 nullable, 1: STRING nullable
@@ -52,15 +47,23 @@ fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
 
     assert!(ev.emits_anything(), "this map writes two slots out of the registers");
     // The scalar and string emits are two halves of one list, split by class.
-    assert_eq!(ev.scalar_emits(), &[(0, 1, 8)]);
-    assert_eq!(ev.str_emits(), &[(1, 2)]);
+    assert_eq!(
+        ev.sinks().scalar_emits,
+        &[ScalarEmit { reg: 0, slot: 1, width: EmitWidth::W8 }]
+    );
+    assert_eq!(ev.sinks().str_emits, &[StrEmit { reg: 1, slot: 2 }]);
     // One verbatim move: input column 1 into output slot 0, at the output width.
-    let copies: Vec<(u32, u8)> = ev.copies().iter().map(|&(_, out, w)| (out, w)).collect();
-    assert_eq!(copies, vec![(0, 8)]);
+    assert_eq!(
+        ev.copies(),
+        &[crate::ColCopy {
+            src: in_schema.locate(1),
+            slot: 0,
+            width: 8
+        }]
+    );
     // The one copy moves nullable *input* slot 0 onto output slot 0, so the null
     // word passes through one AND; the uncopied string column adds no bit.
-    assert!(matches!(ev.null_perm(), NullPerm::Mask(0b1)));
-    assert!(!ev.result_is_str(), "a map's result register is meaningless");
+    assert!(matches!(ev.sinks().null_perm, NullPerm::Mask(0b1)));
 
     // A pure projection emits nothing, so driving its kernel cannot change the
     // output — the property `emits_anything` exists to let a caller skip it.
@@ -72,16 +75,16 @@ fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
         vec![],
     );
     assert!(!projection.emits_anything());
-    assert!(projection.scalar_emits().is_empty() && projection.str_emits().is_empty());
+    assert!(projection.sinks().scalar_emits.is_empty() && projection.sinks().str_emits.is_empty());
 }
 
-/// `[(0, n)]` is the agreed spelling of "no predicate", and `filter_ranges`
-/// must clear the caller's buffer, which is reused across chunks.
+/// `RowFilter::ranges` must clear the caller's buffer, which is reused across
+/// chunks.
 #[test]
-fn filter_ranges_collects_into_a_reused_buffer() {
+fn row_filter_ranges_clear_a_reused_buffer() {
     let schema = schema_pk_ints(1, true);
     let mb = make_n_col_view(&schema, 8, |row, _| i64::from(row < 3 || row == 7), |_, _| false);
-    let ev = filter_prog(
+    let mut ev = filter_prog(
         &schema,
         vec![
             LogicalInstr::LoadColInt { col: 1 },
@@ -93,17 +96,17 @@ fn filter_ranges_collects_into_a_reused_buffer() {
     );
 
     let mut out = vec![(99, 99)];
-    ev.filter_ranges(&mb, &mut out);
+    ev.ranges(&mb, &mut out);
     assert_eq!(out, vec![(0, 3), (7, 8)], "the stale entry must be cleared");
-    assert_eq!(out, passing_ranges(&ev, &mb), "both readers report one run list");
+    assert_eq!(out, passing_ranges(&mut ev, &mb), "both readers report one run list");
 
     // An all-pass predicate is the single range covering the batch.
     let all = make_n_col_view(&schema, 8, |_, _| 1, |_, _| false);
-    ev.filter_ranges(&all, &mut out);
+    ev.ranges(&all, &mut out);
     assert_eq!(out, vec![(0, 8)]);
 }
 
-/// The batch filter and the m=1 row read are the two read-backs of one
+/// The batch filter and the value read are the two read-backs of one
 /// instruction stream and must agree row for row.
 #[test]
 fn filter_agrees_with_the_row_read() {
@@ -114,49 +117,17 @@ fn filter_agrees_with_the_row_read() {
         LogicalInstr::LoadConst { val: 15, unsigned: false },      // r1 = 15
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }, // r2 = r0 > r1
     ];
-    let (ev, row_reader) = filter_and_scalar(&schema, instrs, Reg(2), vec![]);
+    let (mut ev, mut row_reader) = filter_and_scalar(&schema, instrs, Reg(2), vec![]);
 
     let rows: &[(u64, u64, &[i64])] = &[(1, 0, &[5]), (2, 0, &[15]), (3, 0, &[25]), (4, 0, &[0])];
     let mb = make_int_view(&schema, rows);
 
-    let passing = passing_rows(&ev, &mb);
+    let passing = passing_rows(&mut ev, &mb);
 
     for (i, &(_, _, vals)) in rows.iter().enumerate() {
-        assert_eq!(passing[i], passes(&row_reader, &mb, i), "row {i}: val={}", vals[0]);
+        assert_eq!(passing[i], passes(&mut row_reader, &mb, i), "row {i}: val={}", vals[0]);
     }
     assert_eq!(passing, vec![false, false, true, false]);
-}
-
-/// The two read-backs are guarded apart by role, in both directions: a scalar
-/// resolution writes no `bool_bits` word for its result register (so the filter
-/// would report that nothing passes), and a filter's may be bit_only (so the
-/// value read would find an unwritten lane). Neither may answer wrongly.
-#[test]
-#[should_panic(expected = "filter_ranges on an evaluator that did not resolve as a filter")]
-fn filter_ranges_refuses_a_scalar_resolved_evaluator() {
-    let schema = schema_pk_ints(1, false);
-    let mb = make_int_view(&schema, &[(1, 0, &[25])]);
-    let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 15, unsigned: false },
-        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-    ];
-    let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
-    ev.filter_ranges(&mb, &mut Vec::new());
-}
-
-#[test]
-#[should_panic(expected = "eval_all on a filter-resolved evaluator")]
-fn eval_all_refuses_a_filter_resolved_evaluator() {
-    let schema = schema_pk_ints(1, false);
-    let mb = make_int_view(&schema, &[(1, 0, &[25])]);
-    let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::LoadConst { val: 15, unsigned: false },
-        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
-    ];
-    let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
-    ev.eval_all(&mb);
 }
 
 /// A fused string compare against a nullable column keeps the program on the
@@ -184,13 +155,13 @@ fn a_fused_string_compare_never_passes_a_null_row() {
         col: 1,
         const_idx: ConstIdx(0),
     }];
-    let (kind, row_reader) = filter_and_scalar(&schema, instrs, Reg(0), vec![b"foo".to_vec()]);
+    let (mut kind, mut row_reader) = filter_and_scalar(&schema, instrs, Reg(0), vec![b"foo".to_vec()]);
 
     // Drive the (multi-morsel) batch path through the filter and compare to
-    // the m=1 read.
-    let passing = passing_rows(&kind, &mb);
+    // the value read.
+    let passing = passing_rows(&mut kind, &mb);
     for (row, &batch_pass) in passing.iter().enumerate() {
-        let row_pass = passes(&row_reader, &mb, row);
+        let row_pass = passes(&mut row_reader, &mb, row);
         assert_eq!(batch_pass, row_pass, "row {row}: batch={batch_pass} per-row={row_pass}",);
         // Stronger invariant: a null column value can never satisfy `=`.
         let null_word = crate::RowSource::get_null_word(&mb, row);
@@ -234,27 +205,27 @@ fn filter_range_case(schema: TestSchema) {
         LogicalInstr::LoadConst { val: 0, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
-    let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
+    let mut ev = filter_prog(&schema, instrs, Reg(2), vec![]);
 
-    assert_eq!(passing_ranges(&ev, &mb), vec![(1, 3), (4, MORSEL - 1), (MORSEL, n)]);
+    assert_eq!(passing_ranges(&mut ev, &mb), vec![(1, 3), (4, MORSEL - 1), (MORSEL, n)]);
 
     // An all-pass batch is one range covering everything, not one per morsel.
     let all = make_n_col_view(&schema, n, |_, _| 1, |_, _| false);
-    assert_eq!(passing_ranges(&ev, &all), vec![(0, n)]);
+    assert_eq!(passing_ranges(&mut ev, &all), vec![(0, n)]);
 
     // An all-fail batch reports zero runs.
     let none = make_n_col_view(&schema, n, |_, _| 0, |_, _| false);
-    assert_eq!(passing_ranges(&ev, &none), vec![]);
+    assert_eq!(passing_ranges(&mut ev, &none), vec![]);
 
     // A run ending exactly on a 64-bit word boundary, with the next word all
     // zero: the run has to be closed at the boundary by the empty word itself,
     // since a bitmap walk driven off the set bits never visits it.
     let boundary = make_n_col_view(&schema, n, |row, _| i64::from(row < 64), |_, _| false);
-    assert_eq!(passing_ranges(&ev, &boundary), vec![(0, 64)]);
+    assert_eq!(passing_ranges(&mut ev, &boundary), vec![(0, 64)]);
 
     // The same, two words on: the gap word is interior rather than trailing.
     let gap = make_n_col_view(&schema, n, |row, _| i64::from(!(64..192).contains(&row)), |_, _| false);
-    assert_eq!(passing_ranges(&ev, &gap), vec![(0, 64), (192, n)]);
+    assert_eq!(passing_ranges(&mut ev, &gap), vec![(0, 64), (192, n)]);
 }
 
 /// Differential test: the left-deep chain `col0 > k AND col1 > 1 AND col2 > 1`
@@ -316,9 +287,9 @@ fn three_and_chain_boundary_sweep() {
 
         for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
             let mb = make_n_col_view(&schema, n, value, null_at);
-            let ev = filter_prog(&schema, instrs.clone(), Reg(9), vec![]);
+            let mut ev = filter_prog(&schema, instrs.clone(), Reg(9), vec![]);
 
-            for (row, &got) in passing_rows(&ev, &mb).iter().enumerate() {
+            for (row, &got) in passing_rows(&mut ev, &mb).iter().enumerate() {
                 // NULL column → unknown clause; otherwise the compare's verdict.
                 let clause = |col: usize| {
                     let k = if col == 0 { k0 } else { 1 };
@@ -358,8 +329,8 @@ fn bit_only_not_3vl_truth_table() {
             LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = bool(col1)
             LogicalInstr::BoolNot { a: Reg(2) },                       // r3 = NOT r2
         ];
-        let kind = filter_prog(&schema, instrs, Reg(3), vec![]);
-        let passed = !passing_ranges(&kind, &mb).is_empty();
+        let mut kind = filter_prog(&schema, instrs, Reg(3), vec![]);
+        let passed = !passing_ranges(&mut kind, &mb).is_empty();
         // NOT TRUE=FALSE, NOT FALSE=TRUE, NOT NULL=NULL (filter fails on NULL)
         let expected = matches!(src_truthy, Some(false));
         assert_eq!(
@@ -378,13 +349,13 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
     let schema = schema_pk_ints(1, true);
     // Predicate: WHERE col1 (treat int as truthy).
     let instrs = vec![LogicalInstr::LoadColInt { col: 1 }];
-    let kind = filter_prog(&schema, instrs, Reg(0), vec![]);
+    let mut kind = filter_prog(&schema, instrs, Reg(0), vec![]);
 
     // Build 4 rows: non-null 1, non-null 0, null, non-null -5.
     let rows: &[(i64, bool)] = &[(1, false), (0, false), (0, true), (-5, false)];
     let mb = make_n_col_view(&schema, rows.len(), |row, _| rows[row].0, |row, _| rows[row].1);
 
-    let passed = passing_rows(&kind, &mb);
+    let passed = passing_rows(&mut kind, &mb);
     // val=1 → pass, val=0 → fail, null → fail, val=-5 → pass.
     assert_eq!(
         passed,
@@ -412,9 +383,9 @@ fn is_not_null_and_over_partial_word() {
         is_not_null_op(2),
         LogicalInstr::BoolBinary { is_or: false, a: Reg(0), b: Reg(1) },
     ];
-    let kind = filter_prog(&schema, instrs, Reg(2), vec![]);
+    let mut kind = filter_prog(&schema, instrs, Reg(2), vec![]);
 
-    for (row, &got) in passing_rows(&kind, &mb).iter().enumerate() {
+    for (row, &got) in passing_rows(&mut kind, &mb).iter().enumerate() {
         let nn1 = row % 2 != 0;
         let nn2 = row % 3 != 0;
         let expected = nn1 && nn2;
@@ -450,14 +421,14 @@ fn bool_not_tail_mask() {
             LogicalInstr::Cmp { op: CmpOp::Ge, a: Reg(0), b: Reg(1) },
             LogicalInstr::BoolNot { a: Reg(2) },
         ];
-        let ev = filter_prog(&schema, instrs, Reg(3), vec![]);
+        let mut ev = filter_prog(&schema, instrs, Reg(3), vec![]);
         assert!(
-            !ev.prog.no_nulls,
+            !ev.prog().no_nulls,
             "the nullable column load must keep this on the nullable arm"
         );
 
         let mut passed = vec![false; n];
-        for (s, e) in passing_ranges(&ev, &mb) {
+        for (s, e) in passing_ranges(&mut ev, &mb) {
             assert!(
                 s < e && e <= n,
                 "n={n}: run ({s}, {e}) is not a non-empty run of 0..{n}"
@@ -577,14 +548,14 @@ fn is_null_arms_agree() {
         // One evaluator per arm for the whole sweep: the register file is sized
         // once at construction and the filter bitmap never shrinks, so reusing
         // them across row counts is also how the engine drives an evaluator.
-        let (fast, nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), result_reg, vec![]));
+        let (mut fast, mut nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), result_reg, vec![]));
 
         for &n in &ARM_SWEEP_ROWS {
             for (arrangement, null_pred) in ARM_SWEEP_NULLS {
                 let mb = make_n_col_view(&schema, n, |row, col| ((row + col) % 5) as i64, null_pred);
                 assert_eq!(
-                    passing_rows(&fast, &mb),
-                    passing_rows(&nullable, &mb),
+                    passing_rows(&mut fast, &mb),
+                    passing_rows(&mut nullable, &mb),
                     "{name}/{arrangement}: arms disagree at n={n}",
                 );
             }
@@ -600,7 +571,7 @@ fn is_null_map_arms_agree() {
     let in_schema = schema_pk_ints(1, true);
     let out_schema = schema_pk_ints(1, false);
     let instrs = vec![is_null_op(1)];
-    let (fast, nullable) = both_arms("map", || {
+    let (mut fast, mut nullable) = both_arms("map", || {
         map_prog(&in_schema, &out_schema, instrs.clone(), vec![Sink::Reg(Reg(0))], vec![])
     });
 
@@ -608,7 +579,7 @@ fn is_null_map_arms_agree() {
     // the fast arm has none to begin with, so a NULL row here is a stale bit on
     // either arm — asserted directly rather than compared, which would pass on
     // two identically-stale arms.
-    let drive = |ev: &Evaluator, mb: &TestView, n: usize| {
+    let drive = |ev: &mut MapEval, mb: &TestView, n: usize| {
         let mut vals = Vec::with_capacity(n);
         ev.eval_morsels(mb, 0, n, |_, out| {
             vals.extend_from_slice(out.reg_values(0));
@@ -621,8 +592,8 @@ fn is_null_map_arms_agree() {
         for (arrangement, null_pred) in ARM_SWEEP_NULLS {
             let mb = make_n_col_view(&in_schema, n, |row, _| row as i64, null_pred);
             assert_eq!(
-                drive(&fast, &mb, n),
-                drive(&nullable, &mb, n),
+                drive(&mut fast, &mb, n),
+                drive(&mut nullable, &mb, n),
                 "{arrangement}: map arms disagree at n={n}",
             );
         }
@@ -643,11 +614,11 @@ fn is_null_into_a_register_sink_reads_back_per_row() {
     let mb = make_n_col_view(&in_schema, n, |row, _| row as i64, |row, _| row % 8 == 3);
     for invert in [false, true] {
         let instrs = vec![LogicalInstr::IsNull { col: 1, invert }];
-        let (fast, nullable) = both_arms("map", || {
+        let (mut fast, mut nullable) = both_arms("map", || {
             map_prog(&in_schema, &out_schema, instrs.clone(), vec![Sink::Reg(Reg(0))], vec![])
         });
         let want: Vec<i64> = (0..n).map(|row| i64::from((row % 8 == 3) ^ invert)).collect();
-        for (label, ev) in [("fast", &fast), ("nullable", &nullable)] {
+        for (label, ev) in [("fast", &mut fast), ("nullable", &mut nullable)] {
             let mut vals = Vec::with_capacity(n);
             let mut nulls = vec![false; n];
             ev.eval_morsels(&mb, 0, n, |rel, out| {
@@ -779,9 +750,9 @@ fn not_null_load_arms_agree_and_report_no_null() {
         let out_tc = if is_str { TypeCode::String } else { TypeCode::I64 };
         let out_schema = TestSchema::new(&[(TypeCode::U64, false), (out_tc, false)], &[0]);
 
-        let (fast_filter, nullable_filter) =
+        let (mut fast_filter, mut nullable_filter) =
             both_arms(name, || filter_prog(&schema, instrs.clone(), result_reg, consts()));
-        let (fast_map, nullable_map) = both_arms(name, || {
+        let (mut fast_map, mut nullable_map) = both_arms(name, || {
             map_prog(
                 &schema,
                 &out_schema,
@@ -794,7 +765,7 @@ fn not_null_load_arms_agree_and_report_no_null() {
         // The emitted value per row, plus the direct assertion that no row
         // reports NULL — comparing the arms alone would pass on two identically
         // stale ones.
-        let drive_map = |ev: &Evaluator, mb: &TestView, n: usize| {
+        let drive_map = |ev: &mut MapEval, mb: &TestView, n: usize| {
             let reg = LOAD_REG as usize;
             let mut vals: Vec<Vec<u8>> = Vec::with_capacity(n);
             ev.eval_morsels(mb, 0, n, |_, out| {
@@ -814,13 +785,13 @@ fn not_null_load_arms_agree_and_report_no_null() {
             for (bitmap, null_word) in [("clean", 0u64), ("forged", 0b1111u64)] {
                 let mb = not_null_load_view(n, null_word);
                 assert_eq!(
-                    passing_rows(&fast_filter, &mb),
-                    passing_rows(&nullable_filter, &mb),
+                    passing_rows(&mut fast_filter, &mb),
+                    passing_rows(&mut nullable_filter, &mb),
                     "{name}/{bitmap}: filter arms disagree at n={n}",
                 );
                 assert_eq!(
-                    drive_map(&fast_map, &mb, n),
-                    drive_map(&nullable_map, &mb, n),
+                    drive_map(&mut fast_map, &mb, n),
+                    drive_map(&mut nullable_map, &mb, n),
                     "{name}/{bitmap}: map arms disagree at n={n}",
                 );
             }
@@ -894,9 +865,9 @@ fn nullable_and_not_null_columns_side_by_side() {
         },
         LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 3, col_b: 4 },
     ];
-    let ev = scalar_prog(&schema, instrs, Reg(0), vec![b"m".to_vec()]);
+    let mut ev = scalar_prog(&schema, instrs, Reg(0), vec![b"m".to_vec()]);
     assert!(
-        !ev.prog.no_nulls,
+        !ev.prog().no_nulls,
         "a nullable column load must keep the program on the nullable arm",
     );
 
@@ -934,7 +905,7 @@ fn is_null_and_is_not_null_are_complementary() {
     let null_row = |row: usize| row % 7 < 3;
     let n = 300;
     let mb = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| null_row(row));
-    let run = |instr| passing_rows(&filter_prog(&schema, vec![instr], Reg(0), vec![]), &mb);
+    let run = |instr| passing_rows(&mut filter_prog(&schema, vec![instr], Reg(0), vec![]), &mb);
     let is_null = run(is_null_op(1));
     let is_not_null = run(is_not_null_op(1));
     for row in 0..n {
@@ -961,9 +932,9 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
         LogicalInstr::BoolBinary { is_or: true, a: Reg(2), b: Reg(4) },
     ];
-    let ev = filter_prog(&schema, instrs, Reg(5), vec![]);
+    let mut ev = filter_prog(&schema, instrs, Reg(5), vec![]);
     assert_eq!(
-        passing_rows(&ev, &mb),
+        passing_rows(&mut ev, &mb),
         vec![false],
         "NULL OR FALSE is NULL, which the filter drops"
     );
@@ -1001,11 +972,11 @@ fn and_chain_null_and_false_per_row() {
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(6), b: Reg(1) },
         LogicalInstr::BoolBinary { is_or: false, a: Reg(5), b: Reg(7) },
     ];
-    let ev = scalar_prog(&schema, instrs, Reg(8), vec![]);
+    let mut ev = scalar_prog(&schema, instrs, Reg(8), vec![]);
 
-    assert_eq!(row_value(&ev, &mb, 0), None, "TRUE AND NULL AND TRUE is NULL");
+    assert_eq!(row_values(&mut ev, &mb)[0], None, "TRUE AND NULL AND TRUE is NULL");
     assert_eq!(
-        row_value(&ev, &mb, 1),
+        row_values(&mut ev, &mb)[1],
         Some(0),
         "a definite-FALSE chain is FALSE, not the previous drive's NULL"
     );
@@ -1058,13 +1029,14 @@ fn and_chain_survivors_agree_across_arms() {
                 },
                 |row, col| nullable && col == 0 && !survives(row),
             );
-            let ev = filter_prog(&schema, instrs.clone(), Reg(9), vec![]);
+            let mut ev = filter_prog(&schema, instrs.clone(), Reg(9), vec![]);
             assert_eq!(
-                ev.prog.no_nulls, !nullable,
+                ev.prog().no_nulls,
+                !nullable,
                 "{label}: wrong arm — the drive proves nothing"
             );
             assert_eq!(
-                passing_rows(&ev, &mb),
+                passing_rows(&mut ev, &mb),
                 (0..n).map(survives).collect::<Vec<_>>(),
                 "{label}: n={n}"
             );
@@ -1076,11 +1048,11 @@ fn and_chain_survivors_agree_across_arms() {
     // word-at-a-time 3VL loop can treat differently from a mixed one, and it must
     // still reject every row.
     let schema = schema_pk_ints(3, true);
-    let ev = filter_prog(&schema, instrs, Reg(9), vec![]);
+    let mut ev = filter_prog(&schema, instrs, Reg(9), vec![]);
     for &n in &[64, 128, 257] {
         let mb = make_n_col_view(&schema, n, |_, _| 0, |_, _| true);
         assert!(
-            passing_rows(&ev, &mb).iter().all(|&p| !p),
+            passing_rows(&mut ev, &mb).iter().all(|&p| !p),
             "an all-NULL batch has no survivors at n={n}"
         );
     }
@@ -1144,20 +1116,22 @@ fn bool_and_or_cover_the_whole_three_valued_table() {
             LogicalInstr::LoadColInt { col: 2 },
             mk(Reg(0), Reg(1)),
         ];
-        let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
+        let mut ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
         for (row, &(a, b)) in cells.iter().enumerate() {
             let (want_val, want_null) = reference(a, b);
             let want = (!want_null).then_some(i64::from(want_val));
-            assert_eq!(row_value(&ev, &mb, row), want, "{name}: {a:?}, {b:?}");
+            assert_eq!(
+                row_values(&mut ev, &mb)[row].map(|v| v as i64),
+                want,
+                "{name}: {a:?}, {b:?}"
+            );
         }
     }
 }
 
-/// `eval_all` returns the arm its program's result class fixes, and its string
-/// arm addresses one shared arena — so the per-morsel span arithmetic has to
-/// stay in step with the rows across a morsel boundary. The scalar arm reads
-/// back through the same `result_value` the single-row form does, so only its
-/// length and the class dispatch are at stake here.
+/// `eval_all` returns the arm its program's result class fixes, one entry per
+/// row across a morsel boundary — the NULL blanking offset by the morsel's
+/// first row, and the string arm's spans into one shared arena.
 #[test]
 fn eval_all_reports_one_result_per_row_in_its_own_class() {
     let schema = schema_pk_ints(2, true);
@@ -1170,7 +1144,7 @@ fn eval_all_reports_one_result_per_row_in_its_own_class() {
     );
     // A divide, so a zero divisor makes NULLs the operands' own nullability
     // does not.
-    let div = scalar_prog(
+    let mut div = scalar_prog(
         &schema,
         vec![
             LogicalInstr::LoadColInt { col: 1 },
@@ -1184,10 +1158,16 @@ fn eval_all_reports_one_result_per_row_in_its_own_class() {
         Reg(2),
         vec![],
     );
-    let ExprResults::Scalar(vals) = div.eval_all(&mb) else {
+    let ExprResults::Int(vals) = div.eval_all(&mb) else {
         panic!("a scalar program must evaluate to the scalar arm");
     };
-    assert_eq!(vals, (0..n).map(|i| row_value(&div, &mb, i)).collect::<Vec<_>>());
+    let want: Vec<Option<i128>> = (0..n)
+        .map(|row| {
+            let (a, b) = ((row * 7 % 5) as i128, ((row * 7 + 1) % 5) as i128);
+            (!row.is_multiple_of(11) && b != 0).then(|| a / b)
+        })
+        .collect();
+    assert_eq!(vals, want);
 
     let str_schema = schema_pk_strings(1, true);
     let mut sv = TestView::new(n, str_schema.pk_stride());
@@ -1202,7 +1182,7 @@ fn eval_all_reports_one_result_per_row_in_its_own_class() {
             sv.set_string(row, 0, format!("r{row}-{}", "x".repeat(row % 20)).as_bytes());
         }
     }
-    let upper = scalar_prog(
+    let mut upper = scalar_prog(
         &str_schema,
         vec![
             LogicalInstr::LoadColStr { col: 1 },
@@ -1225,11 +1205,11 @@ fn eval_all_reports_one_result_per_row_in_its_own_class() {
     }
 }
 
-/// `result_is_u64` reports the result register's resolve-time U64 tracking: a
-/// U64 load, an unsigned constant and arithmetic over one are unsigned; a signed
-/// load or constant, a comparison and a cast to a signed type are not.
+/// An integer result widens by the result register's resolve-time U64 tracking:
+/// a U64 load, an unsigned constant and arithmetic over one read back unsigned;
+/// a signed load or constant, a comparison and a cast to a signed type do not.
 #[test]
-fn result_is_u64_follows_the_result_register() {
+fn int_results_widen_by_the_result_registers_signedness() {
     use gnitz_wire::FixedInt;
     let schema = TestSchema::new(
         &[(TypeCode::U64, false), (TypeCode::U64, true), (TypeCode::I64, true)],
@@ -1242,8 +1222,16 @@ fn result_is_u64_follows_the_result_register() {
             last,
         ]
     };
+    // Bit 63 set, so an unsigned and a signed reading differ.
+    let big = (1u64 << 63) | 6;
+    let mb = make_int_view(&schema, &[(1, 0, &[big as i64, -1])]);
     for (label, instrs, result, want) in [
-        ("u64 load", vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0), true),
+        (
+            "u64 load",
+            vec![LogicalInstr::LoadColInt { col: 1 }],
+            Reg(0),
+            Some(i128::from(big)),
+        ),
         (
             "u64 + 1",
             u64_plus_one(LogicalInstr::IntArith {
@@ -1252,26 +1240,26 @@ fn result_is_u64_follows_the_result_register() {
                 b: Reg(1),
             }),
             Reg(2),
-            true,
+            Some(i128::from(big + 1)),
         ),
-        ("i64 load", vec![LogicalInstr::LoadColInt { col: 2 }], Reg(0), false),
+        ("i64 load", vec![LogicalInstr::LoadColInt { col: 2 }], Reg(0), Some(-1)),
         (
             "unsigned constant",
             vec![LogicalInstr::LoadConst { val: -1, unsigned: true }],
             Reg(0),
-            true,
+            Some(i128::from(u64::MAX)),
         ),
         (
             "signed constant",
             vec![LogicalInstr::LoadConst { val: -1, unsigned: false }],
             Reg(0),
-            false,
+            Some(-1),
         ),
         (
             "u64 > 1",
             u64_plus_one(LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }),
             Reg(2),
-            false,
+            Some(1),
         ),
         (
             "CAST(u64 AS BIGINT)",
@@ -1280,13 +1268,126 @@ fn result_is_u64_follows_the_result_register() {
                 LogicalInstr::IntCast { a: Reg(0), fi: FixedInt::I64 },
             ],
             Reg(1),
-            false,
+            None,
         ),
     ] {
         assert_eq!(
-            scalar_prog(&schema, instrs, result, vec![]).result_is_u64(),
+            row_values(&mut scalar_prog(&schema, instrs, result, vec![]), &mb)[0],
             want,
             "{label}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// RowFilter: predicate × range walk
+// ---------------------------------------------------------------------------
+
+/// `pk U64, v I64 nullable` over `n` rows: `pk = row + 1`, `v = row`, NULL on
+/// every fifth row. Spans two words so a run crosses a word boundary.
+fn row_filter_fixture(n: usize) -> (TestSchema, TestView) {
+    let schema = schema_pk_ints(1, true);
+    let v = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| row.is_multiple_of(5));
+    (schema, v)
+}
+
+/// `v > 3` as the wire blob a read ships.
+fn v_gt_3_blob() -> Vec<u8> {
+    crate::LogicalProgram::new(
+        vec![
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadConst { val: 3, unsigned: false },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+        ],
+        crate::Output::Result(Reg(2)),
+        vec![],
+    )
+    .to_blob_bytes()
+}
+
+/// `pk` in `[lo, hi]`, as the bound a PK range read carries.
+fn pk_between(lo: i128, hi: i128) -> gnitz_wire::ReadBound {
+    use gnitz_wire::{Cut, FixedInt, RangeDescriptor};
+    let p = |x| FixedInt::U64.pack(x);
+    gnitz_wire::ReadBound::PkRange(RangeDescriptor::new(&[], Cut::Before(p(lo)), Cut::After(p(hi))))
+}
+
+/// The surviving rows of `mb` under `f`, flattened.
+fn surviving(f: &mut crate::RowFilter, mb: &TestView) -> Vec<usize> {
+    let mut ranges = vec![(7, 7)];
+    f.ranges(mb, &mut ranges);
+    ranges.into_iter().flat_map(|(s, e)| s..e).collect()
+}
+
+/// Each arm of the predicate × walk product, over a two-word batch and an empty
+/// one — the survivors of both are the intersection of each alone.
+#[test]
+fn row_filter_intersects_its_predicate_and_its_walk() {
+    let n = 100;
+    let (schema, mb) = row_filter_fixture(n);
+    let (_, empty) = row_filter_fixture(0);
+    let none = gnitz_wire::ReadBound::None;
+    let walk = pk_between(3, 80);
+    let passes_pred = |row: usize| row > 3 && !row.is_multiple_of(5);
+    let in_walk = |row: usize| (2..80).contains(&row);
+    for (arm, pred, bound, keep) in [
+        ("none", Vec::new(), &none, &(|_| true) as &dyn Fn(usize) -> bool),
+        ("predicate", v_gt_3_blob(), &none, &passes_pred),
+        ("walk", Vec::new(), &walk, &in_walk),
+        ("both", v_gt_3_blob(), &walk, &|row| passes_pred(row) && in_walk(row)),
+    ] {
+        let mut f = crate::RowFilter::for_read(&pred, bound, &schema).unwrap();
+        assert_eq!(f.keeps_every_row(), arm == "none", "{arm}");
+        assert_eq!(
+            surviving(&mut f, &mb),
+            (0..n).filter(|&r| keep(r)).collect::<Vec<_>>(),
+            "{arm}"
+        );
+        assert!(
+            surviving(&mut f, &empty).is_empty(),
+            "{arm}: an empty batch keeps nothing"
+        );
+        // Reused across a narrower batch: no bit of the wider one survives.
+        let (_, short) = row_filter_fixture(10);
+        assert_eq!(
+            surviving(&mut f, &short),
+            (0..10).filter(|&r| keep(r)).collect::<Vec<_>>(),
+            "{arm}"
+        );
+    }
+}
+
+/// `for_read` walks a PK range over the PK columns, an index range over its own
+/// columns, and nothing for a full scan or a key set.
+#[test]
+fn row_filter_for_read_walks_each_bound_variant() {
+    use gnitz_wire::{Cut, FixedInt, IndexBound, PkColList, PkKeys, RangeDescriptor, ReadBound};
+    let n = 20;
+    let (schema, mb) = row_filter_fixture(n);
+    let p = |x| FixedInt::I64.pack(x);
+    let index = ReadBound::IndexRange(IndexBound {
+        idx_cols: PkColList::from_slice(&[1]),
+        desc: RangeDescriptor::new(&[], Cut::Before(p(6)), Cut::Before(p(12))),
+    });
+    let key = 5u64.to_be_bytes();
+    let set = ReadBound::PkSet(PkKeys::from_keys(8, [&key[..]]));
+    for (label, bound, want) in [
+        ("None", ReadBound::None, (0..n).collect::<Vec<_>>()),
+        ("PkRange", pk_between(3, 7), (2..7).collect()),
+        // The index holds no NULL, so the walk drops row 10's.
+        ("IndexRange", index, vec![6, 7, 8, 9, 11]),
+        ("PkSet", set, (0..n).collect()),
+    ] {
+        let mut f = crate::RowFilter::for_read(&[], &bound, &schema).unwrap();
+        assert_eq!(surviving(&mut f, &mb), want, "{label}");
+    }
+    // A walk over a column the schema lacks is a rejected request, not a panic.
+    let bad = ReadBound::IndexRange(IndexBound {
+        idx_cols: PkColList::from_slice(&[9]),
+        desc: RangeDescriptor::new(&[], Cut::Before(p(0)), Cut::Before(p(1))),
+    });
+    assert!(matches!(
+        crate::RowFilter::for_read(&[], &bad, &schema),
+        Err(crate::ExprValidateErr::BadWalk(_))
+    ));
 }

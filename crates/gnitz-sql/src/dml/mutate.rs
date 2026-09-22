@@ -22,7 +22,7 @@ use crate::ir::BoundExpr;
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses, require_class, ClassWant};
 use crate::SqlResult;
 use gnitz_core::{retraction_batch, ColType, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode, ZSetBatch};
-use gnitz_expr::{Evaluator, ExprResults, SchemaFacts};
+use gnitz_expr::{ExprResults, ScalarEval, SchemaFacts};
 use gnitz_wire::{encode_german_string, german_string_content, null_word_get, null_word_set, ReadSink, ReadSpec};
 use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableWithJoins, Update};
 
@@ -78,7 +78,7 @@ fn execute_mutation(
     require_class(&target, &table_name, ClassWant::BaseTable, verb)?;
     let (tid, schema) = (target.tid, &target.schema);
     // Before the read, so a bad SET list errors whether or not a row matches.
-    let set = set
+    let mut set = set
         .map(|raw| {
             bind_set_list(raw, schema, "UPDATE SET", |e, ci| {
                 classify_set_rhs(&bind_single_table(e, schema, &alias)?, Scope::Existing, ci, schema)
@@ -86,7 +86,7 @@ fn execute_mutation(
         })
         .transpose()?;
     let where_expr = bind_where(schema, &alias, selection)?;
-    let (bound, predicate, residual) = bound_and_predicate(schema, &where_expr, &target.indexes)?.into_parts();
+    let (bound, predicate) = bound_and_predicate(schema, &where_expr, &target.indexes)?.into_parts();
     // UPDATE reads whole rows; DELETE the source PK alone, with no blob heap.
     let (reply_schema, sink) = if set.is_some() {
         (Arc::clone(schema), ReadSink::all_rows())
@@ -99,8 +99,8 @@ fn execute_mutation(
     // writes are built under the catalog schema, so an in-transaction DELETE
     // buffers in the layout an INSERT does.
     let count = commit_rmw_or_buffer(client, &table_name, tid, schema, |client| {
-        let (mut rows, buffered) = resolve_where_matches(client, tid, schema, &spec, &residual, &reply_schema)?;
-        Ok(match &set {
+        let (mut rows, buffered) = resolve_where_matches(client, tid, schema, &spec, &reply_schema)?;
+        Ok(match &mut set {
             Some(set) => {
                 rows.extend_from_owned(buffered);
                 apply_set(set, rows, None, schema)?
@@ -139,7 +139,7 @@ pub(crate) enum SetRhs {
     /// Payload slot `src` of the scope's row, of exactly the target's column type.
     Copy { scope: Scope, src: usize },
     /// A computed value.
-    Expr { scope: Scope, ev: Box<Evaluator> },
+    Expr { scope: Scope, ev: Box<ScalarEval> },
 }
 
 /// Each target is one plain identifier naming a non-PK column not already
@@ -249,7 +249,7 @@ pub(crate) fn classify_set_rhs(
 /// also rebuilds every other string column into `new`, whose arena then replaces
 /// `rows`'; otherwise nothing is encoded and `rows`' arena is kept.
 pub(crate) fn apply_set(
-    set: &[SetCol],
+    set: &mut [SetCol],
     mut rows: ZSetBatch,
     excluded: Option<&ZSetBatch>,
     schema: &Schema,
@@ -258,7 +258,7 @@ pub(crate) fn apply_set(
     let rebuild = set.iter().any(|a| (schema.columns[a.ci].ty.tc).is_german_string());
     let mut new = ZSetBatch::new(schema);
     let mut nulls = rows.nulls.clone();
-    for a in set {
+    for a in set.iter_mut() {
         let def = &schema.columns[a.ci];
         let pi = schema.payload_slot(a.ci).expect("a SET target is a payload column");
         let tc = def.ty.tc;
@@ -267,7 +267,7 @@ pub(crate) fn apply_set(
             Scope::Excluded => excluded.expect("only ON CONFLICT DO UPDATE binds EXCLUDED"),
         };
         new.payload[pi].bytes.reserve_exact(n * tc.wire_stride());
-        match &a.rhs {
+        match &mut a.rhs {
             SetRhs::Const { cell, spill, null } => {
                 let ZSetBatch { payload, blob, .. } = &mut new;
                 // One spill for every row's cell.
@@ -291,14 +291,13 @@ pub(crate) fn apply_set(
             SetRhs::Expr { scope, ev } => {
                 let ZSetBatch { payload, blob, .. } = &mut new;
                 match ev.eval_all(scoped(*scope)) {
-                    ExprResults::Scalar(vals) => {
-                        let unsigned = ev.result_is_u64();
+                    ExprResults::Int(vals) => {
                         let fi = FixedInt::from_type_code(tc)
                             .expect("classify_set_rhs admits a scalar only into a FixedInt column");
                         let (min, max) = fi.range();
                         for (w, v) in nulls.iter_mut().zip(vals) {
                             set_null(w, pi, v.is_none(), def)?;
-                            let v = v.map_or(0, |x| if unsigned { i128::from(x as u64) } else { i128::from(x) });
+                            let v = v.unwrap_or(0);
                             if !(min..=max).contains(&v) {
                                 return Err(GnitzSqlError::Bind(format!("{tc:?} value out of range: {v}")));
                             }

@@ -19,7 +19,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use gnitz_core::{ColumnDef, Schema, ZSetBatch};
-use gnitz_expr::{ColumnLocator, Evaluator, SchemaFacts};
+use gnitz_expr::{ColumnLocator, RowFilter, SchemaFacts};
 use gnitz_wire::AggFunc as WireAggFunc;
 use rustc_hash::FxHashMap;
 
@@ -27,7 +27,7 @@ use crate::agg::group_pk_def;
 use crate::codec::project_schema::{reply_program, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::exec::client_map::ClientMap;
-use crate::expr_lower::compile_conjuncts_evaluator;
+use crate::expr_lower::compile_filter_program;
 use crate::ir::BoundExpr;
 
 /// An ad-hoc fold's reply, or a FROM-less SELECT's ground row, to its result: combine the
@@ -40,7 +40,7 @@ pub(crate) struct FoldFinish {
     /// Per physical agg spec, in partial order: the ordering by which a partial replaces the
     /// held value, `None` for a summing merge.
     merge: Vec<Option<Ordering>>,
-    pub(crate) having: Option<Evaluator>,
+    pub(crate) having: Option<RowFilter>,
     finalize: ClientMap,
 }
 
@@ -59,7 +59,9 @@ impl FoldFinish {
                 WireAggFunc::Max => Some(Ordering::Greater),
             })
             .collect();
-        let having = compile_conjuncts_evaluator(having, &partial_schema)?;
+        let having = compile_filter_program(having, &partial_schema.columns)?
+            .map(|p| p.resolve_filter(&partial_schema))
+            .transpose()?;
         let mut items = vec![ProjItem::PassThrough { src_col: 0 }];
         let mut cols = vec![group_pk_def()];
         for (expr, def) in finalize {
@@ -115,10 +117,10 @@ impl FoldFinish {
     }
 
     /// HAVING, then finalize, over `groups` (in `partial_schema`).
-    pub(crate) fn apply(&self, mut groups: ZSetBatch) -> ZSetBatch {
-        if let Some(ev) = &self.having {
+    pub(crate) fn apply(&mut self, mut groups: ZSetBatch) -> ZSetBatch {
+        if let Some(ev) = &mut self.having {
             let mut ranges = Vec::new();
-            ev.filter_ranges(&groups, &mut ranges);
+            ev.ranges(&groups, &mut ranges);
             groups.retain_ranges(&ranges);
         }
         self.finalize.apply(groups)

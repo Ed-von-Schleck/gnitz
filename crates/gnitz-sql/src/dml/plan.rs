@@ -19,18 +19,17 @@ use sqlparser::ast::{OrderBy, SelectItem};
 // The access-path ladder
 // ---------------------------------------------------------------------------
 
-/// A WHERE as a pushed-down [`ReadBound`], the conjuncts it does not apply, and their
-/// compiled server-side predicate.
-pub(crate) struct AccessPlan<'e> {
+/// A WHERE as a pushed-down [`ReadBound`] and the compiled server-side predicate of
+/// the conjuncts it does not apply.
+pub(crate) struct AccessPlan {
     bound: ReadBound,
     predicate: Vec<u8>,
-    residual: Vec<&'e BoundExpr>,
 }
 
-impl<'e> AccessPlan<'e> {
-    /// The bound, the compiled predicate, and the residual it compiles.
-    pub(crate) fn into_parts(self) -> (ReadBound, Vec<u8>, Vec<&'e BoundExpr>) {
-        (self.bound, self.predicate, self.residual)
+impl AccessPlan {
+    /// The bound and the compiled predicate.
+    pub(crate) fn into_parts(self) -> (ReadBound, Vec<u8>) {
+        (self.bound, self.predicate)
     }
 }
 
@@ -51,16 +50,16 @@ pub(crate) fn bind_where(
 /// Bind-once WHERE → the access plan that serves it: the first of [`candidates`]
 /// whose residual compiles, else an unbounded scan under the whole WHERE.
 /// `indexes` is the relation's declared secondary-index list.
-pub(crate) fn bound_and_predicate<'e>(
+pub(crate) fn bound_and_predicate(
     schema: &Schema,
-    conjuncts: &'e [BoundExpr],
+    conjuncts: &[BoundExpr],
     indexes: &[IndexMeta],
-) -> Result<AccessPlan<'e>, GnitzSqlError> {
+) -> Result<AccessPlan, GnitzSqlError> {
     let mut blocked = None;
     for Candidate { bound, consumed } in candidates(conjuncts, schema, indexes) {
         let residual = residual(conjuncts, &consumed);
         match compile_wire_conjuncts(residual.iter().copied(), &schema.columns) {
-            Ok(predicate) => return Ok(AccessPlan { bound, predicate, residual }),
+            Ok(predicate) => return Ok(AccessPlan { bound, predicate }),
             // A conjunct the VM cannot carry; a later candidate may consume it.
             Err(e @ GnitzSqlError::Unsupported(_)) => {
                 blocked.get_or_insert(e);
@@ -72,11 +71,9 @@ pub(crate) fn bound_and_predicate<'e>(
     if let Some(e) = blocked {
         return Err(e);
     }
-    let all: Vec<&BoundExpr> = conjuncts.iter().collect();
     Ok(AccessPlan {
         bound: ReadBound::None,
-        predicate: compile_wire_conjuncts(all.iter().copied(), &schema.columns)?,
-        residual: all,
+        predicate: compile_wire_conjuncts(conjuncts, &schema.columns)?,
     })
 }
 

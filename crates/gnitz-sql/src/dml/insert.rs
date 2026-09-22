@@ -308,7 +308,7 @@ pub(crate) fn execute_insert(
                     Ok(SqlResult::Rows {
                         schema: schema_out,
                         batch: match map {
-                            Some(m) => m.apply(batch),
+                            Some(mut m) => m.apply(batch),
                             None => batch,
                         },
                     })
@@ -329,13 +329,13 @@ pub(crate) fn execute_insert(
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
-        ConflictPlan::DoUpdate { set } => {
+        ConflictPlan::DoUpdate { mut set } => {
             // Re-merged per RMW retry, so `SET x = x + 1` reads the freshest `x`.
             // Every row rides at +1 and the worker's `enforce_unique_pk` turns a
             // merged one into the retract-and-insert.
             let probe = KeyProbe::rows(schema, &batch.pks);
             let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
-                client_side_merge_do_update(client, tid, schema, &probe, &batch, &set)
+                client_side_merge_do_update(client, tid, schema, &probe, &batch, &mut set)
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
@@ -418,7 +418,7 @@ fn client_side_merge_do_update(
     schema: &Arc<Schema>,
     probe: &KeyProbe,
     batch: &ZSetBatch,
-    set: &[SetCol],
+    set: &mut [SetCol],
 ) -> Result<ZSetBatch, GnitzSqlError> {
     // `rows` is the `Existing` scope, so `SET x = x + 1` reads the row a
     // transaction buffered.

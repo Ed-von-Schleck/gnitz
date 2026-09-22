@@ -617,11 +617,12 @@ fn a_delta_cursor_expires_below_the_floor_and_not_at_it() {
 
 /// 1M rows narrowed to `val ∈ [0, sel% · N)` by an index walk's membership
 /// (`GNITZ_BENCH_SHAPE=membership`) or by the VM predicate `val >= lo AND val < hi`
-/// (`predicate`); the difference prices the narrowing alone.
+/// (`predicate`), or by both (`both`, the predicate keeping the walk's upper half).
+/// Difference two pass counts, one shape per process:
 ///
 ///   cargo build -p gnitz-store --release --tests
-///   for s in membership predicate; do for p in 10 50; do \
-///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_SEL=$p perf stat -e instructions:u \
+///   for s in membership predicate both; do for p in 1 21; do \
+///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_SEL=10 GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
 ///     cargo test -p gnitz-store --release survivors_membership_bench -- --ignored --nocapture
 ///   done; done
 #[test]
@@ -629,43 +630,56 @@ fn a_delta_cursor_expires_below_the_floor_and_not_at_it() {
 fn survivors_membership_bench() {
     use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr};
     use std::hint::black_box;
-    use std::time::Instant;
 
     const N: u64 = 1_000_000;
     let shape = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "membership".to_string());
     let sel: u64 = std::env::var("GNITZ_BENCH_SEL").map_or(10, |s| s.parse().unwrap());
+    let passes: usize = std::env::var("GNITZ_BENCH_PASSES").map_or(1, |s| s.parse().unwrap());
     let hi = (N * sel / 100) as i64;
     let mut r = rows_fixture("survivors_bench", N, 1);
-    let spec = match shape.as_str() {
-        "membership" => ReadSpec {
-            bound: ReadBound::IndexRange(IndexBound {
-                idx_cols: PkColList::from_slice(&[1]),
-                desc: RangeDescriptor::new(
-                    &[],
-                    Cut::Before(0),
-                    Cut::Before(gnitz_wire::FixedInt::I64.pack(hi as i128)),
-                ),
-            }),
-            ..rows_spec(Vec::new(), 0)
-        },
-        "predicate" => {
-            let mut eb = ExprBuilder::new();
-            let v = eb.emit(LogicalInstr::LoadColInt { col: 1 });
-            let lo_c = eb.emit(LogicalInstr::LoadConst { val: 0, unsigned: false });
+    let walk = ReadBound::IndexRange(IndexBound {
+        idx_cols: PkColList::from_slice(&[1]),
+        desc: RangeDescriptor::new(
+            &[],
+            Cut::Before(0),
+            Cut::Before(gnitz_wire::FixedInt::I64.pack(hi as i128)),
+        ),
+    });
+    // `lo <= val < hi` as the wire predicate; `hi = None` leaves the top open.
+    let between = |lo: i64, hi: Option<i64>| {
+        let mut eb = ExprBuilder::new();
+        let v = eb.emit(LogicalInstr::LoadColInt { col: 1 });
+        let lo_c = eb.emit(LogicalInstr::LoadConst { val: lo, unsigned: false });
+        let mut keep = eb.emit(LogicalInstr::Cmp { op: CmpOp::Ge, a: v, b: lo_c });
+        if let Some(hi) = hi {
             let hi_c = eb.emit(LogicalInstr::LoadConst { val: hi, unsigned: false });
-            let ge = eb.emit(LogicalInstr::Cmp { op: CmpOp::Ge, a: v, b: lo_c });
             let lt = eb.emit(LogicalInstr::Cmp { op: CmpOp::Lt, a: v, b: hi_c });
-            let both = eb.emit(LogicalInstr::BoolBinary { a: ge, b: lt, is_or: false });
-            let program = eb.build(Some(both)).unwrap();
-            ReadSpec {
-                predicate: program.to_blob_bytes(),
-                ..rows_spec(Vec::new(), 0)
-            }
+            keep = eb.emit(LogicalInstr::BoolBinary { a: keep, b: lt, is_or: false });
         }
-        other => panic!("GNITZ_BENCH_SHAPE={other}: membership or predicate"),
+        eb.build(Some(keep)).unwrap().to_blob_bytes()
     };
-    let t = Instant::now();
-    let got = black_box(run(&mut r, &spec).unwrap());
-    assert_eq!(got.count as i64, hi);
-    println!("survivors {shape} sel {sel}%: {:?}", t.elapsed());
+    let (spec, want) = match shape.as_str() {
+        "membership" => (ReadSpec { bound: walk, ..rows_spec(Vec::new(), 0) }, hi),
+        "predicate" => (
+            ReadSpec {
+                predicate: between(0, Some(hi)),
+                ..rows_spec(Vec::new(), 0)
+            },
+            hi,
+        ),
+        "both" => (
+            ReadSpec {
+                bound: walk,
+                predicate: between(hi / 2, None),
+                ..rows_spec(Vec::new(), 0)
+            },
+            hi - hi / 2,
+        ),
+        other => panic!("GNITZ_BENCH_SHAPE={other}: membership, predicate or both"),
+    };
+    for _ in 0..passes {
+        let got = black_box(run(&mut r, &spec).unwrap());
+        assert_eq!(got.count as i64, want);
+    }
+    println!("survivors {shape} sel {sel}% passes {passes}");
 }

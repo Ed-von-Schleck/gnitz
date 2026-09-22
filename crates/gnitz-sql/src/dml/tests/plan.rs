@@ -1,14 +1,21 @@
 use super::*;
+use crate::expr_lower::compile_wire_conjuncts;
 use crate::test_support::{bind_where, col_def, idx_metas_flagged, pk_schema, two_col};
 use gnitz_core::TypeCode;
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
-fn plan_of<'e>(conjuncts: &'e [BoundExpr], schema: &Schema, lists: &[(&[u32], bool)]) -> AccessPlan<'e> {
+fn plan_of(conjuncts: &[BoundExpr], schema: &Schema, lists: &[(&[u32], bool)]) -> AccessPlan {
     bound_and_predicate(schema, conjuncts, &idx_metas_flagged(lists)).expect("the WHERE must plan")
 }
 
+/// The predicate the conjuncts of `residual` compile to; empty for none.
+fn predicate_of(residual: Option<&str>, schema: &Schema) -> Vec<u8> {
+    let conjuncts = residual.map(|s| bind_where(s, schema)).unwrap_or_default();
+    compile_wire_conjuncts(&conjuncts, &schema.columns).expect("the residual compiles")
+}
+
 /// How many keys `plan`'s bound pins; `None` when it pins none.
-fn pinned_keys(plan: &AccessPlan<'_>) -> Option<usize> {
+fn pinned_keys(plan: &AccessPlan) -> Option<usize> {
     match &plan.bound {
         ReadBound::PkSet(keys) => Some(keys.len()),
         _ => None,
@@ -26,7 +33,7 @@ fn shape(bound: &ReadBound) -> &'static str {
     }
 }
 
-/// Every WHERE shape, one ladder: which bound it takes, how much of it stays
+/// Every WHERE shape, one ladder: which bound it takes, which of it stays
 /// residual, and how many keys the bound pins. The schema is `(id U64 pk, v
 /// I64)` with an index on `v`, so every rung is reachable from one table.
 #[test]
@@ -35,35 +42,34 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
     let idx: &[(&[u32], bool)] = &[(&[1], false)];
     for (sql, want_shape, want_residual, want_keys) in [
         // No WHERE: nothing to walk, nothing to re-impose.
-        (None, "None", 0, 0),
+        (None, "None", None, 0),
         // A `pk IN (…)` gather, and the point a one-key list folds to at bind.
-        (Some("id IN (7, 9)"), "PkSet", 0, 2),
-        (Some("id IN (7)"), "PkSet", 0, 1),
-        (Some("id = 7"), "PkSet", 0, 1),
+        (Some("id IN (7, 9)"), "PkSet", None, 2),
+        (Some("id IN (7)"), "PkSet", None, 1),
+        (Some("id = 7"), "PkSet", None, 1),
         // `NOT IN` binds to `Not(…)`, which no PK recognizer matches.
-        (Some("id NOT IN (7, 9)"), "None", 1, 0),
+        (Some("id NOT IN (7, 9)"), "None", Some("id NOT IN (7, 9)"), 0),
         // A companion conjunct rides the residual of a key-pinning bound: the
         // key restriction supplies the consumed PK conjunct, the residual the rest.
-        (Some("id IN (7, 9) AND v > 5"), "PkSet", 1, 2),
-        (Some("id = 7 AND v > 5"), "PkSet", 1, 1),
+        (Some("id IN (7, 9) AND v > 5"), "PkSet", Some("v > 5"), 2),
+        (Some("id = 7 AND v > 5"), "PkSet", Some("v > 5"), 1),
         // No PK conjunct: the index rung, which applies its conjunct exactly, then
         // the unbounded scan. An arithmetic WHERE has no `col OP literal` conjunct.
-        (Some("v = 7"), "IndexRange", 0, 0),
-        (Some("id + v = 7"), "None", 1, 0),
+        (Some("v = 7"), "IndexRange", None, 0),
+        (Some("id + v = 7"), "None", Some("id + v = 7"), 0),
         // A non-integral literal names no key, so the bound is the empty range;
         // a top-level OR pins nothing and stays a predicate over the whole table.
-        (Some("id = 3.5"), "PkRange", 0, 0),
-        (Some("v = 5 OR id = 1"), "None", 1, 0),
+        (Some("id = 3.5"), "PkRange", None, 0),
+        (Some("v = 5 OR id = 1"), "None", Some("v = 5 OR id = 1"), 0),
     ] {
         let bound_where = sql.map(|s| bind_where(s, &schema)).unwrap_or_default();
         let plan = plan_of(&bound_where, &schema, idx);
         let label = sql.unwrap_or("<no WHERE>");
         assert_eq!(shape(&plan.bound), want_shape, "{label}");
-        assert_eq!(plan.residual.len(), want_residual, "{label}: residual");
         assert_eq!(pinned_keys(&plan).unwrap_or(0), want_keys, "{label}: pinned keys");
         assert_eq!(
-            plan.predicate.is_empty(),
-            want_residual == 0,
+            plan.predicate,
+            predicate_of(want_residual, &schema),
             "{label}: the residual is what ships as a predicate"
         );
     }
@@ -161,17 +167,16 @@ fn an_index_walk_ships_only_its_residual() {
     let wide = two_col(TypeCode::U128); // `val` is U128
     let idx: &[(&[u32], bool)] = &[(&[1], false)];
     for (schema, sql, want_residual) in [
-        (&narrow, "v = 5", 0),
-        (&narrow, "v = 5 AND w = 9", 1),
-        (&narrow, "v = 18446744073709551615", 0),
-        (&wide, "val = 7", 0),
-        (&wide, "val > 7", 0),
+        (&narrow, "v = 5", None),
+        (&narrow, "v = 5 AND w = 9", Some("w = 9")),
+        (&narrow, "v = 18446744073709551615", None),
+        (&wide, "val = 7", None),
+        (&wide, "val > 7", None),
     ] {
         let where_expr = bind_where(sql, schema);
         let plan = plan_of(&where_expr, schema, idx);
         assert_eq!(shape(&plan.bound), "IndexRange", "{sql}");
-        assert_eq!(plan.residual.len(), want_residual, "{sql}: residual");
-        assert_eq!(plan.predicate.is_empty(), want_residual == 0, "{sql}: predicate");
+        assert_eq!(plan.predicate, predicate_of(want_residual, schema), "{sql}: predicate");
     }
 }
 
@@ -181,11 +186,18 @@ fn an_index_walk_ships_only_its_residual() {
 #[test]
 fn an_uncompilable_pk_residual_falls_through_to_the_index() {
     let schema = two_col(TypeCode::U128);
-    for sql in ["pk > 5 AND val = 7", "pk IN (1, 2) AND val = 7"] {
+    for (sql, pk_conjunct) in [
+        ("pk > 5 AND val = 7", "pk > 5"),
+        ("pk IN (1, 2) AND val = 7", "pk IN (1, 2)"),
+    ] {
         let where_expr = bind_where(sql, &schema);
         let plan = plan_of(&where_expr, &schema, &[(&[1], false)]);
         assert_eq!(shape(&plan.bound), "IndexRange", "{sql}");
-        assert_eq!(plan.residual.len(), 1, "{sql}: the PK conjunct stays residual");
+        assert_eq!(
+            plan.predicate,
+            predicate_of(Some(pk_conjunct), &schema),
+            "{sql}: the PK conjunct stays residual"
+        );
     }
 }
 

@@ -79,8 +79,8 @@ panic = "unwind"
 # instead of annotating each helper `#[inline(always)]`. `debug-assertions` and
 # `overflow-checks` are independent of `opt-level` and stay on.
 #
-# It does not reach across the crate boundary: `ColumnLocator` and `MorselOut`
-# are called per row from gnitz-store, which is still opt-level 0, so those
-# methods keep their `#[inline(always)]`.
+# It does not reach across the crate boundary: `ColumnLocator` is called per row
+# from gnitz-store, which is still opt-level 0, so its methods keep their
+# `#[inline(always)]`.
 [profile.dev.package.gnitz-expr]
 opt-level = 1

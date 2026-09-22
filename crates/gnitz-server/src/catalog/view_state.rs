@@ -125,7 +125,7 @@ impl CatalogEngine {
         let bound = self.dag.view_meta(view_id)?.source_bound(source);
         self.registry
             .open_bound(source, bound)
-            .map(|(cursor, _walk)| cursor)
+            .map(|(cursor, _unapplied)| cursor)
             .map_err(String::from)
     }
 }

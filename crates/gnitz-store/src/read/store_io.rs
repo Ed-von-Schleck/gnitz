@@ -11,7 +11,6 @@ use crate::relation::RelationRegistry;
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::{project_schema, ColumnLocator};
 use crate::storage::{Batch, BoundedIndexCursor, PkSetGather, SkeletonKeys, SourceCursor, StoreError};
-use gnitz_expr::RangeMembership;
 use gnitz_wire::{IndexBound, ReadBound};
 
 const INDEX_SCAN_RATIO: usize = 16;
@@ -106,9 +105,9 @@ impl RelationRegistry {
         Ok(out)
     }
 
-    /// Open `bound`'s source over `id`, without walking it. An index walk served by a
-    /// full scan comes with the membership that narrows the scan to the walk's rows.
-    pub fn open_bound(&self, id: i64, bound: ReadBound) -> Result<(SourceCursor, Option<RangeMembership>), StoreError> {
+    /// Open `bound`'s source over `id`, without walking it, and the part of `bound`
+    /// the source does not apply.
+    pub fn open_bound(&self, id: i64, bound: ReadBound) -> Result<(SourceCursor, ReadBound), StoreError> {
         let entry = self.relation_or_err(id)?;
         let cursor = match bound {
             ReadBound::None => SourceCursor::Full(Box::new(entry.cursor())),
@@ -130,16 +129,13 @@ impl RelationRegistry {
             }
             ReadBound::IndexRange(bound) => return self.open_index_walk(id, bound),
         };
-        Ok((cursor, None))
+        Ok((cursor, ReadBound::None))
     }
 
     /// The index walk `bound` names over `id`: through its index while the range covers at
-    /// most `1/INDEX_SCAN_RATIO` of the local slice, else a full scan and its membership.
-    fn open_index_walk(
-        &self,
-        id: i64,
-        bound: IndexBound,
-    ) -> Result<(SourceCursor, Option<RangeMembership>), StoreError> {
+    /// most `1/INDEX_SCAN_RATIO` of the local slice, else a full scan and the walk it
+    /// leaves unapplied.
+    fn open_index_walk(&self, id: i64, bound: IndexBound) -> Result<(SourceCursor, ReadBound), StoreError> {
         let entry = self.relation_or_err(id)?;
         let cols = self.bound_cols_against(id, bound.idx_cols, "open_bound")?;
         if let Some(ic) = entry.index_on(cols.as_slice()) {
@@ -151,12 +147,11 @@ impl RelationRegistry {
             if matches <= entry.store().estimated_rows() / INDEX_SCAN_RATIO {
                 let rows = matches.min(self.config.scan_chunk_rows);
                 let walk = BoundedIndexCursor::new(idx, entry.cursor(), spec, rows);
-                return Ok((SourceCursor::Bounded(Box::new(walk)), None));
+                return Ok((SourceCursor::Bounded(Box::new(walk)), ReadBound::None));
             }
         }
-        let walk = RangeMembership::new(cols.as_slice(), bound.desc, &entry.schema())
-            .map_err(|e| StoreError::rejected(format!("open_bound: {e} (table {id})")))?;
-        Ok((SourceCursor::Full(Box::new(entry.cursor())), Some(walk)))
+        let unapplied = ReadBound::IndexRange(IndexBound { idx_cols: cols, desc: bound.desc });
+        Ok((SourceCursor::Full(Box::new(entry.cursor())), unapplied))
     }
 }
 

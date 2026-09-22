@@ -201,11 +201,11 @@ fn filter_keeps_exactly_the_matching_rows() {
         LogicalInstr::LoadConst { val: 10, unsigned: false },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
-    let func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
+    let mut func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
         .resolve_filter(&schema)
         .unwrap();
 
-    let out = op_filter(&make_batch(&schema, rows), &func, &schema).expect("a selective filter copies");
+    let out = op_filter(&make_batch(&schema, rows), &mut func, &schema).expect("a selective filter copies");
     let got: Vec<u64> = (0..out.count).map(|r| out.get_pk(r) as u64).collect();
     let want: Vec<u64> = rows.iter().filter(|&&(_, _, v)| v > 10).map(|&(pk, ..)| pk).collect();
     assert_eq!(got, want);
@@ -213,7 +213,7 @@ fn filter_keeps_exactly_the_matching_rows() {
 
     // Every row passing is answered with `None`, so the caller hands its own
     // input through rather than paying a whole-batch copy for a no-op.
-    let all_pass = LogicalProgram::new(
+    let mut all_pass = LogicalProgram::new(
         vec![
             LogicalInstr::LoadColInt { col: 1 },
             LogicalInstr::LoadConst { val: -1, unsigned: false },
@@ -224,7 +224,7 @@ fn filter_keeps_exactly_the_matching_rows() {
     )
     .resolve_filter(&schema)
     .unwrap();
-    assert!(op_filter(&make_batch(&schema, rows), &all_pass, &schema).is_none());
+    assert!(op_filter(&make_batch(&schema, rows), &mut all_pass, &schema).is_none());
 }
 
 /// Negate is the Z-Set group inverse: every weight flips sign and nothing else

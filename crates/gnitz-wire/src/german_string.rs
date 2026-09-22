@@ -31,20 +31,14 @@ pub(crate) fn encode_german_string_cell(s: &[u8], heap_off: usize) -> ([u8; 16],
     );
     let mut st = [0u8; 16];
     st[0..4].copy_from_slice(&(len as u32).to_le_bytes());
-    if len == 0 {
-        return (st, &[]);
-    }
-    let pfx = len.min(4);
-    st[4..4 + pfx].copy_from_slice(&s[..pfx]);
-    if len <= SHORT_STRING_THRESHOLD {
-        if len > 4 {
-            st[8..8 + (len - 4)].copy_from_slice(&s[4..len]);
-        }
-        (st, &[])
-    } else {
+    if len > SHORT_STRING_THRESHOLD {
+        st[4..8].copy_from_slice(&s[..4]);
         st[8..16].copy_from_slice(&(heap_off as u64).to_le_bytes());
-        (st, s)
+        return (st, s);
     }
+    // Prefix and suffix are one run: the whole value, inline.
+    st[4..4 + len].copy_from_slice(s);
+    (st, &[])
 }
 
 /// [`encode_german_string_cell`] against a growable arena: the spill, if any,

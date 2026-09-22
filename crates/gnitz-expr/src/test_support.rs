@@ -9,9 +9,10 @@
 
 use gnitz_wire::TypeCode;
 
+use crate::eval::Resolved;
 use crate::{
-    BatchView, ColumnLocator, ColumnTable, Evaluator, ExprResults, LogicalInstr, LogicalProgram, Output, Reg,
-    RowSource, SchemaFacts, Sink,
+    BatchView, ColumnLocator, ColumnTable, ExprResults, LogicalInstr, LogicalProgram, MapEval, MapTarget, Output, Reg,
+    RowFilter, RowSource, ScalarEval, SchemaFacts, Sink,
 };
 
 /// A [`BatchView`] over owned buffers, laid out region-wise like the physical
@@ -258,7 +259,7 @@ pub fn scalar_prog(
     instrs: Vec<LogicalInstr>,
     result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
-) -> Evaluator {
+) -> ScalarEval {
     LogicalProgram::new(instrs, Output::Result(result_reg), const_strings)
         .resolve_scalar(schema)
         .expect("test program must validate")
@@ -274,21 +275,19 @@ pub fn filter_prog(
     instrs: Vec<LogicalInstr>,
     result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
-) -> Evaluator {
+) -> RowFilter {
     LogicalProgram::new(instrs, Output::Result(result_reg), const_strings)
         .resolve_filter(schema)
         .expect("test predicate must validate")
 }
 
-/// One predicate resolved both ways: as a filter, read back as packed bits, and
-/// as a scalar, read back as the register's value. The two read-backs are guarded
-/// apart by role, so a test wanting both needs two evaluators.
+/// One predicate resolved as a filter and as a scalar.
 pub fn filter_and_scalar(
     schema: &TestSchema,
     instrs: Vec<LogicalInstr>,
     result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
-) -> (Evaluator, Evaluator) {
+) -> (RowFilter, ScalarEval) {
     (
         filter_prog(schema, instrs.clone(), result_reg, const_strings.clone()),
         scalar_prog(schema, instrs, result_reg, const_strings),
@@ -303,36 +302,31 @@ pub fn map_prog(
     instrs: Vec<LogicalInstr>,
     sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,
-) -> Evaluator {
+) -> MapEval {
     LogicalProgram::new(instrs, Output::Slots(sinks), const_strings)
         .resolve_map(in_schema, out_schema)
         .expect("test map must validate")
 }
 
-/// One row's scalar result. The production surface drives whole batches — every
-/// consumer wants a column of results — so the single-row arity lives here,
-/// where the tests that assert on one row want it.
-pub fn row_value(ev: &Evaluator, mb: &dyn BatchView, row: usize) -> Option<i64> {
+/// Every row's integer result of a scalar program.
+pub fn row_values(ev: &mut ScalarEval, mb: &dyn BatchView) -> Vec<Option<i128>> {
     match ev.eval_all(mb) {
-        ExprResults::Scalar(vals) => vals[row],
-        ExprResults::Str { .. } => panic!("row_value over a string-valued program; use row_str"),
+        ExprResults::Int(vals) => vals,
+        ExprResults::Str { .. } => panic!("row_values over a string-valued program; use row_strs"),
     }
 }
 
-/// One row's string result as `(bytes, is_null)`.
-pub fn row_str(ev: &Evaluator, mb: &dyn BatchView, row: usize) -> (Vec<u8>, bool) {
+/// Every row's string result of a scalar program, `None` for NULL.
+pub fn row_strs(ev: &mut ScalarEval, mb: &dyn BatchView) -> Vec<Option<Vec<u8>>> {
     match ev.eval_all(mb) {
-        ExprResults::Str { bytes, spans } => match spans[row] {
-            Some((o, l)) => (bytes[o..o + l].to_vec(), false),
-            None => (Vec::new(), true),
-        },
-        ExprResults::Scalar(_) => panic!("row_str over a scalar program; use row_value"),
+        ExprResults::Str { bytes, spans } => spans.iter().map(|s| s.map(|(o, l)| bytes[o..o + l].to_vec())).collect(),
+        ExprResults::Int(_) => panic!("row_strs over a scalar program; use row_values"),
     }
 }
 
 /// Run `ev` as a filter and report a per-row verdict — the shape almost every
-/// filter test wants, since `filter_ranges` reports runs rather than rows.
-pub fn passing_rows(ev: &Evaluator, mb: &TestView) -> Vec<bool> {
+/// filter test wants, since `RowFilter::ranges` reports runs rather than rows.
+pub fn passing_rows(ev: &mut RowFilter, mb: &TestView) -> Vec<bool> {
     let mut passed = vec![false; mb.row_count()];
     for (s, e) in passing_ranges(ev, mb) {
         passed[s..e].fill(true);
@@ -342,27 +336,49 @@ pub fn passing_rows(ev: &Evaluator, mb: &TestView) -> Vec<bool> {
 
 /// The runs `ev` reports, verbatim. For tests whose subject is the range
 /// stitching itself rather than which rows pass.
-pub fn passing_ranges(ev: &Evaluator, mb: &TestView) -> Vec<(usize, usize)> {
+pub fn passing_ranges(ev: &mut RowFilter, mb: &TestView) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    ev.filter_ranges(mb, &mut ranges);
+    ev.ranges(mb, &mut ranges);
     ranges
 }
 
-/// Resolve one program twice: once as classification decides, once forced onto
-/// the nullable arm through `Evaluator::force_nullable_arm`, which rebuilds the
-/// scratch for the arm it moves to. The forced side is a faithful baseline — the
-/// bit_only / bool_pack masks are computed independently of the arm — so it
-/// really runs the kernels the fast side skips.
-///
-/// The point is differential testing of programs that, after classification, can
-/// no longer reach the nullable arm by construction. `label` names the subject in
-/// the assertion that the A side is in fact the fast arm.
-pub fn both_arms(label: &str, build: impl Fn() -> Evaluator) -> (Evaluator, Evaluator) {
+/// `build()` twice: as resolved, which must be the `no_nulls` arm, and forced
+/// onto the nullable arm — a differential baseline running the kernels the fast
+/// arm skips.
+pub fn both_arms<E: Resolved>(label: &str, build: impl Fn() -> E) -> (E, E) {
     let fast = build();
-    assert!(fast.prog.no_nulls, "{label}: the fast side must resolve no_nulls");
+    assert!(fast.prog().no_nulls, "{label}: the fast side must resolve no_nulls");
     let mut nullable = build();
     nullable.force_nullable_arm();
     (fast, nullable)
+}
+
+/// A [`MapTarget`] over owned buffers: one null word per row, one buffer per
+/// output payload slot, and the heap a string cell spills into.
+pub struct TestOut {
+    pub nulls: Vec<u8>,
+    pub cols: Vec<Vec<u8>>,
+    pub blob: Vec<u8>,
+}
+
+impl TestOut {
+    /// `rows` rows of output slots `strides[pi]` bytes wide.
+    pub fn new(rows: usize, strides: &[usize]) -> Self {
+        TestOut {
+            nulls: vec![0; rows * 8],
+            cols: strides.iter().map(|&w| vec![0; rows * w]).collect(),
+            blob: Vec::new(),
+        }
+    }
+}
+
+impl MapTarget for TestOut {
+    fn null_bmp_mut(&mut self) -> &mut [u8] {
+        &mut self.nulls
+    }
+    fn slot_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
+        (&mut self.cols[pi], &mut self.nulls, &mut self.blob)
+    }
 }
 
 /// A three-row view with a compound `(U32, I64)` PK and payload slots

@@ -9,24 +9,25 @@ use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
 use gnitz_wire::{FixedInt, TypeCode};
 
 use super::{decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
+use crate::eval::Resolved;
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
-    both_arms, filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols, row_str,
-    row_value, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
+    both_arms, filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols,
+    row_strs, row_values, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, LogicalInstr, ResolvedProgram, RowSource, SchemaFacts};
+use crate::{CmpOp, LogicalInstr, ResolvedProgram, RowSource, ScalarEval, SchemaFacts};
 
-/// `eval_batch` with the string-buffer table the drive methods assemble. These
-/// tests sit below `Evaluator`, so they build the same preamble it does.
+/// `eval_batch` with the string-buffer table `eval_morsels` assembles. These
+/// tests sit below the evaluator, so they build the same preamble it does.
 fn drive(prog: &ResolvedProgram, mb: &dyn crate::BatchView, start: usize, m: usize, scratch: &mut EvalScratch) {
     with_str_bufs(prog, mb, |bufs| eval_batch(prog, mb, bufs, start, m, scratch));
 }
 
 /// Resolve a test program down to the raw evaluable form the kernel tests drive
-/// `eval_batch` with. The `Evaluator` wrapper is the *caller's* surface; these
-/// tests are below it.
+/// `eval_batch` with. The evaluator types are the *caller's* surface; these
+/// tests are below them.
 fn resolved(schema: &TestSchema, instrs: Vec<LogicalInstr>, result_reg: Reg) -> ResolvedProgram {
-    scalar_prog(schema, instrs, result_reg, vec![]).prog
+    scalar_prog(schema, instrs, result_reg, vec![]).into_prog()
 }
 
 /// A PK column is the one operand that reaches arithmetic through `LoadPk`
@@ -209,7 +210,7 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
 /// phantom NULL. This is the test that fails if the clear is ever turned into a
 /// skip.
 ///
-/// At the `eval_batch` level because an `Evaluator` owns its scratch privately,
+/// At the `eval_batch` level because an evaluator owns its scratch privately,
 /// and the null words are dirtied by writing them directly: a scratch is sized
 /// and seeded for exactly one program, so no drive can leave another program's
 /// bits in this one's register file.
@@ -759,7 +760,7 @@ fn str_prog(
     nulls: &[bool],
     consts: Vec<Vec<u8>>,
     mk: impl Fn(Reg) -> Vec<LogicalInstr>,
-) -> (Evaluator, TestView) {
+) -> (ScalarEval, TestView) {
     let (ev, mut view) = mixed_prog(&[vals], &[], consts, |r| mk(r[0]));
     for (row, &is_null) in nulls.iter().enumerate() {
         if is_null {
@@ -778,7 +779,7 @@ fn mixed_prog(
     ints: &[&[i64]],
     consts: Vec<Vec<u8>>,
     mk: impl Fn(&[Reg]) -> Vec<LogicalInstr>,
-) -> (Evaluator, TestView) {
+) -> (ScalarEval, TestView) {
     let rows = strs.first().map_or_else(|| ints[0].len(), |c| c.len());
     let mut cols = vec![(TypeCode::U64, false)];
     cols.extend(strs.iter().map(|_| (TypeCode::String, true)));
@@ -805,21 +806,27 @@ fn mixed_prog(
     (scalar_prog(&schema, instrs, result, consts), view)
 }
 
-/// Every row's *string* register, read back.
-fn str_rows(ev: &Evaluator, view: &TestView, n: usize) -> Vec<(Vec<u8>, bool)> {
-    (0..n).map(|i| row_str(ev, view, i)).collect()
+/// Every row's *string* register, read back as `(bytes, is_null)`.
+fn str_rows(ev: &mut ScalarEval, view: &TestView) -> Vec<(Vec<u8>, bool)> {
+    row_strs(ev, view)
+        .into_iter()
+        .map(|s| (s.clone().unwrap_or_default(), s.is_none()))
+        .collect()
 }
 
 fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<LogicalInstr>) -> Vec<(Vec<u8>, bool)> {
-    let (ev, view) = str_prog(vals, nulls, vec![], mk);
-    str_rows(&ev, &view, vals.len())
+    let (mut ev, view) = str_prog(vals, nulls, vec![], mk);
+    str_rows(&mut ev, &view)
 }
 
 /// The same, but reading a *scalar* register — LENGTH, LIKE, the compares, the
 /// text→number parses.
 fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
-    let (ev, view) = str_prog(vals, nulls, vec![], mk);
-    (0..vals.len()).map(|i| row_value(&ev, &view, i)).collect()
+    let (mut ev, view) = str_prog(vals, nulls, vec![], mk);
+    row_values(&mut ev, &view)
+        .into_iter()
+        .map(|v| v.map(|x| x as i64))
+        .collect()
 }
 
 /// Far more distinct string columns than a program is likely to name: every one
@@ -856,18 +863,18 @@ fn every_string_column_addresses_its_own_region_in_place() {
         });
         acc = dst;
     }
-    let ev = scalar_prog(&schema, instrs, acc, vec![]);
+    let mut ev = scalar_prog(&schema, instrs, acc, vec![]);
 
     assert_eq!(
-        ev.prog.str_cols,
+        ev.prog().str_cols,
         (1u64 << N) - 1,
         "every string column the program loads is registered at its own slot",
     );
     // Drive the loads alone and read back which buffer each lane resolved
     // against — the claim the concatenation below cannot make, since its own
     // result always lands in the arena.
-    let mut scratch = EvalScratch::new(&ev.prog);
-    drive(&ev.prog, &view, 0, 1, &mut scratch);
+    let mut scratch = EvalScratch::new(ev.prog());
+    drive(ev.prog(), &view, 0, 1, &mut scratch);
     for (c, val) in vals.iter().enumerate() {
         let want = match gnitz_wire::german_string_inline(crate::BatchView::col_data(&view, c, 16)) {
             Some(_) => super::SRC_COL_BASE + c as u32,
@@ -881,7 +888,7 @@ fn every_string_column_addresses_its_own_region_in_place() {
         );
     }
 
-    assert_eq!(row_str(&ev, &view, 0).0, vals.concat());
+    assert_eq!(row_strs(&mut ev, &view)[0].clone().unwrap_or_default(), vals.concat());
 }
 
 /// Values crossing the 12-byte inline/heap boundary, so every kernel is driven
@@ -1047,10 +1054,10 @@ fn substring_bounds_read_an_unsigned_register_as_unsigned() {
             len_reg: None,
         },
     ];
-    let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
-    assert_eq!(row_str(&ev, &view, 0).0, b"cdef");
+    let mut ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
+    assert_eq!(row_strs(&mut ev, &view)[0].clone().unwrap_or_default(), b"cdef");
     assert_eq!(
-        row_str(&ev, &view, 1).0,
+        row_strs(&mut ev, &view)[1].clone().unwrap_or_default(),
         b"",
         "an unsigned bound past the end yields the empty string, not a prefix"
     );
@@ -1078,10 +1085,12 @@ fn trim_strips_the_selected_ends_only() {
     let set = b"xy".to_vec();
     let vals: &[&[u8]] = &[b"xyaxybyx", b"xyxy", b"", b"abc"];
     let run = |mode: TrimMode| {
-        let (ev, view) = str_prog(vals, &[false; 4], vec![set.clone()], |a| {
+        let (mut ev, view) = str_prog(vals, &[false; 4], vec![set.clone()], |a| {
             vec![LogicalInstr::StrTrim { a, mode, set_idx: ConstIdx(0) }]
         });
-        (0..vals.len()).map(|i| row_str(&ev, &view, i).0).collect::<Vec<_>>()
+        (0..vals.len())
+            .map(|i| row_strs(&mut ev, &view)[i].clone().unwrap_or_default())
+            .collect::<Vec<_>>()
     };
     let (both, leading, trailing) = (run(TrimMode::Both), run(TrimMode::Leading), run(TrimMode::Trailing));
     assert_eq!(leading, [b"axybyx".to_vec(), b"".into(), b"".into(), b"abc".into()]);
@@ -1105,13 +1114,15 @@ fn like_over_inline_and_heap_cells_with_a_null_row() {
     let vals: &[&[u8]] = &[b"abc", b"abcdefghijklm", b"xyz", b"abc"];
     let nulls = [false, false, false, true];
     let run = |pattern: &str, ci: bool| {
-        let (ev, view) = str_prog(
+        let (mut ev, view) = str_prog(
             vals,
             &nulls,
             vec![crate::LikePattern::encode(pattern, None).unwrap().as_bytes().to_vec()],
             |a| vec![LogicalInstr::StrLike { src: a, pat_idx: ConstIdx(0), ci }],
         );
-        (0..vals.len()).map(|i| row_value(&ev, &view, i)).collect::<Vec<_>>()
+        (0..vals.len())
+            .map(|i| row_values(&mut ev, &view)[i])
+            .collect::<Vec<_>>()
     };
     let null_row = None;
     assert_eq!(run("abc", false), [Some(1), Some(0), Some(0), null_row]);
@@ -1139,8 +1150,7 @@ fn concat_null_rules_differ_by_operand_side() {
             LogicalInstr::LoadColStr { col: 2 },
             LogicalInstr::StrConcat { a: Reg(0), b: Reg(1), skip_null },
         ];
-        let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
-        (0..3).map(|i| row_str(&ev, &view, i)).collect::<Vec<_>>()
+        str_rows(&mut scalar_prog(&schema, instrs, Reg(2), vec![]), &view)
     };
 
     let prop = run(false);
@@ -1169,7 +1179,7 @@ fn concat_is_classified_null_producing_so_the_no_nulls_arm_cannot_take_it() {
         Reg(2),
         vec![],
     );
-    assert!(!concat.prog.no_nulls);
+    assert!(!concat.prog().no_nulls);
 
     let upper = scalar_prog(
         &schema,
@@ -1180,7 +1190,7 @@ fn concat_is_classified_null_producing_so_the_no_nulls_arm_cannot_take_it() {
         Reg(1),
         vec![],
     );
-    assert!(upper.prog.no_nulls, "a pure transform keeps the no_nulls arm");
+    assert!(upper.prog().no_nulls, "a pure transform keeps the no_nulls arm");
 }
 
 /// All three string-compare channels must agree with `compare_german_strings`,
@@ -1228,7 +1238,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
         let schema = schema_pk_strings(2, nullable);
         // The two column-addressed channels depend only on the operator, so they are
         // built once and driven over every pair rather than rebuilt inside the loop.
-        let regs = OPS.map(|op| {
+        let mut regs = OPS.map(|op| {
             scalar_prog(
                 &schema,
                 vec![
@@ -1240,7 +1250,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                 vec![],
             )
         });
-        let col_col = OPS.map(|op| {
+        let mut col_col = OPS.map(|op| {
             scalar_prog(
                 &schema,
                 vec![LogicalInstr::StrColCol { op, col_a: 1, col_b: 2 }],
@@ -1252,7 +1262,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
         for (j, b) in corpus.iter().enumerate() {
             // The constant is baked into the program, so this channel alone is
             // rebuilt per right-hand value.
-            let col_const = OPS.map(|op| {
+            let mut col_const = OPS.map(|op| {
                 scalar_prog(
                     &schema,
                     vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }],
@@ -1271,10 +1281,14 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                     want.is_lt() as i64,
                     want.is_le() as i64,
                 ];
-                for (channel, evs) in [("StrCmp", &regs), ("StrColCol", &col_col), ("StrColConst", &col_const)] {
+                for (channel, evs) in [
+                    ("StrCmp", &mut regs),
+                    ("StrColCol", &mut col_col),
+                    ("StrColConst", &mut col_const),
+                ] {
                     let got: Vec<i64> = evs
-                        .iter()
-                        .map(|ev| row_value(ev, &view, 0).expect("not NULL"))
+                        .iter_mut()
+                        .map(|ev| row_values(ev, &view)[0].expect("not NULL") as i64)
                         .collect();
                     assert_eq!(got, want, "nullable={nullable} {channel}: {a:?} vs {b:?}");
                 }
@@ -1302,7 +1316,7 @@ fn heap_backed_constants_at_two_arena_offsets() {
     ];
     let rows: Vec<&[&[u8]]> = vals.iter().map(|r| &r[..]).collect();
     let view = make_string_view(&schema, &rows);
-    let ev = filter_prog(
+    let mut ev = filter_prog(
         &schema,
         vec![
             LogicalInstr::StrColConst {
@@ -1320,7 +1334,7 @@ fn heap_backed_constants_at_two_arena_offsets() {
         Reg(2),
         vec![a.to_vec(), b.to_vec()],
     );
-    assert_eq!(passing_rows(&ev, &view), vec![false, true, false, false]);
+    assert_eq!(passing_rows(&mut ev, &view), vec![false, true, false, false]);
 }
 
 /// A cell index is not a const-pool index. `resolve` encodes a cell only for
@@ -1339,7 +1353,7 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
     let rows: Vec<&[&[u8]]> = vals.iter().map(|r| &r[..]).collect();
     let view = make_string_view(&schema, &rows);
     let set: Vec<u8> = [2i64, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
-    let ev = filter_prog(
+    let mut ev = filter_prog(
         &schema,
         vec![
             LogicalInstr::LoadColInt { col: 0 },
@@ -1360,7 +1374,7 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
         Reg(5),
         vec![set, a.to_vec(), b.to_vec()],
     );
-    assert_eq!(passing_rows(&ev, &view), vec![false, true, false, false]);
+    assert_eq!(passing_rows(&mut ev, &view), vec![false, true, false, false]);
 }
 
 #[test]
@@ -1375,13 +1389,13 @@ fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
     // significant digit, and -7 is the one-digit negative.
     let view = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64, i64::MIN]), (2, 0, &[0, -7])]);
     let text = |col: u32, row: usize| {
-        let ev = scalar_prog(
+        let mut ev = scalar_prog(
             &schema,
             vec![LogicalInstr::LoadColInt { col }, LogicalInstr::IntToStr { a: Reg(0) }],
             Reg(1),
             vec![],
         );
-        row_str(&ev, &view, row).0
+        row_strs(&mut ev, &view)[row].clone().unwrap_or_default()
     };
     assert_eq!(text(1, 0), u64::MAX.to_string().as_bytes());
     assert_eq!(text(2, 0), i64::MIN.to_string().as_bytes());
@@ -1421,7 +1435,7 @@ fn float_to_text_is_bounded_and_round_trips() {
     let row_refs: Vec<(u64, u64, &[i64])> = rows.iter().map(|(p, n, v)| (*p, *n, v.as_slice())).collect();
     let view = make_int_view(&schema, &row_refs);
 
-    let ev = scalar_prog(
+    let mut ev = scalar_prog(
         &schema,
         vec![
             LogicalInstr::LoadColFloat { col: 1 },
@@ -1431,7 +1445,8 @@ fn float_to_text_is_bounded_and_round_trips() {
         vec![],
     );
     for (i, &f) in vals.iter().enumerate() {
-        let text = String::from_utf8(row_str(&ev, &view, i).0).expect("decimal text is ASCII");
+        let text =
+            String::from_utf8(row_strs(&mut ev, &view)[i].clone().unwrap_or_default()).expect("decimal text is ASCII");
         assert!(text.len() <= 24, "{f} rendered {} bytes: {text}", text.len());
         // PostgreSQL's spelling for the non-finite values, not Rust's `inf`.
         match f {
@@ -1446,7 +1461,7 @@ fn float_to_text_is_bounded_and_round_trips() {
         }
     }
     // The sign of zero survives, which is what keeps a retraction cancelling.
-    assert_eq!(row_str(&ev, &view, 1).0, b"-0");
+    assert_eq!(row_strs(&mut ev, &view)[1].clone().unwrap_or_default(), b"-0");
 }
 
 #[test]
@@ -1497,7 +1512,7 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
     let schema = schema_pk_strings(1, true);
     let view = make_string_view(&schema, &[&[u64::MAX.to_string().as_bytes()]]);
     let cmp = |fi: FixedInt| {
-        let ev = scalar_prog(
+        let mut ev = scalar_prog(
             &schema,
             vec![
                 LogicalInstr::LoadColStr { col: 1 },
@@ -1508,7 +1523,7 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
             Reg(3),
             vec![],
         );
-        row_value(&ev, &view, 0)
+        row_values(&mut ev, &view)[0]
     };
     assert_eq!(cmp(FixedInt::U64), Some(1), "u64::MAX > 5 under unsigned order");
     // The same text does not fit I64 at all, so the parse itself NULLs the row —
@@ -1555,7 +1570,7 @@ fn computed_strings_do_not_leak_across_morsels() {
     let rows: Vec<&[&[u8]]> = cells.iter().map(std::slice::from_ref).collect();
     let view = make_string_view(&schema, &rows);
 
-    let ev = scalar_prog(
+    let mut ev = scalar_prog(
         &schema,
         vec![
             LogicalInstr::LoadColStr { col: 1 },
@@ -1583,7 +1598,7 @@ fn string_constants_survive_the_per_morsel_arena_reset() {
     let n = MORSEL + 3;
     let schema = schema_pk_strings(1, false);
     let view = make_string_view(&schema, &vec![&[b"x".as_slice()][..]; n]);
-    let ev = scalar_prog(
+    let mut ev = scalar_prog(
         &schema,
         vec![LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) }],
         Reg(0),
@@ -1611,7 +1626,7 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
     view.set_null(2, 1); // row 2: the untaken branch (`b`) is NULL
 
     // cond = (pk != 2): rows 0 and 2 take `a`, row 1 takes `b`.
-    let ev = scalar_prog(
+    let mut ev = scalar_prog(
         &schema,
         vec![
             LogicalInstr::LoadColInt { col: 0 },
@@ -1624,7 +1639,7 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
         Reg(5),
         vec![],
     );
-    let got: Vec<(Vec<u8>, bool)> = (0..3).map(|i| row_str(&ev, &view, i)).collect();
+    let got = str_rows(&mut ev, &view);
     assert!(got[0].1, "row 0 takes the NULL branch");
     assert_eq!(got[1].0, b"no", "row 1 takes the else branch");
     assert!(!got[1].1);
@@ -1644,9 +1659,10 @@ fn payload_loads_agree_with_the_wire_le_decoder() {
         let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|v| (0u64, 0u64, std::slice::from_ref(v))).collect();
         let view = make_int_view(&schema, &rows);
 
-        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0), vec![]);
+        let mut ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0), vec![]);
         for row in 0..vals.len() {
-            let got = row_value(&ev, &view, row).expect("a non-nullable column is never null");
+            // The register's i64 image, which a U64 column widens past.
+            let got = row_values(&mut ev, &view)[row].expect("a non-nullable column is never null") as i64;
             let want = fi.decode_le_i64(view.get_col_ptr(row, 0, fi.width()));
             assert_eq!(
                 got, want,
@@ -1685,9 +1701,9 @@ fn pk_loads_agree_with_the_wire_opk_decoder() {
         let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|&v| (v, 0u64, &[0i64][..])).collect();
         let view = make_int_view(&schema, &rows);
 
-        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 0 }], Reg(0), vec![]);
+        let mut ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 0 }], Reg(0), vec![]);
         for row in 0..vals.len() {
-            let got = row_value(&ev, &view, row).expect("a PK column is never null");
+            let got = row_values(&mut ev, &view)[row].expect("a PK column is never null") as i64;
             let want = gnitz_wire::decode_opk_i64(&view.get_pk_bytes(row)[..fi.width()], fi);
             assert_eq!(got, want, "type {tc}, row {row}: LoadPk disagrees with decode_opk_i64");
         }
@@ -1815,13 +1831,10 @@ fn left_and_right_count_characters_from_either_end() {
     let s: &[&[u8]] = &["héllo".as_bytes(); 5];
     let n: &[i64] = &[2, -1, 10, 0, -10];
     let run = |vals: &[&[u8]], counts: &[i64], left: bool| {
-        let (ev, view) = mixed_prog(&[vals], &[counts], vec![], |r| {
+        let (mut ev, view) = mixed_prog(&[vals], &[counts], vec![], |r| {
             vec![LogicalInstr::StrSide { src: r[0], n_reg: r[1], left }]
         });
-        str_rows(&ev, &view, vals.len())
-            .into_iter()
-            .map(|(v, _)| v)
-            .collect::<Vec<_>>()
+        str_rows(&mut ev, &view).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
     };
     let want = |ss: [&str; 5]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
     assert_eq!(run(s, n, true), want(["hé", "héll", "héllo", "", ""]));
@@ -1860,10 +1873,10 @@ fn right_is_infallible_and_agrees_across_the_arms() {
         LogicalInstr::LoadConst { val: 2, unsigned: false },
         LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: false },
     ];
-    let (fast, nullable) = both_arms("str_side", || scalar_prog(&schema, instrs.clone(), Reg(2), vec![]));
-    let read = |ev: &Evaluator| str_rows(ev, &view, vals.len());
-    let got = read(&fast);
-    assert_eq!(got, read(&nullable), "the arms disagree");
+    let (mut fast, mut nullable) = both_arms("str_side", || scalar_prog(&schema, instrs.clone(), Reg(2), vec![]));
+    let read = |ev: &mut ScalarEval| str_rows(ev, &view);
+    let got = read(&mut fast);
+    assert_eq!(got, read(&mut nullable), "the arms disagree");
     assert!(!got.iter().any(|&(_, is_null)| is_null), "RIGHT never makes a NULL");
     // The last fixture leads with a continuation byte, which begins no
     // character of its own: the value is the two characters `0xFF` and `z`, so
@@ -1877,11 +1890,10 @@ fn right_is_infallible_and_agrees_across_the_arms() {
 fn strpos_is_a_character_index() {
     let hay: &[&[u8]] = &["héllo".as_bytes(); 4];
     let needle: &[&[u8]] = &[b"l", b"", b"z", "éll".as_bytes()];
-    let (ev, view) = mixed_prog(&[hay, needle], &[], vec![], |r| {
+    let (mut ev, view) = mixed_prog(&[hay, needle], &[], vec![], |r| {
         vec![LogicalInstr::StrPos { hay: r[0], needle: r[1] }]
     });
-    let got: Vec<Option<i64>> = (0..4).map(|i| row_value(&ev, &view, i)).collect();
-    assert_eq!(got, [Some(3), Some(1), Some(0), Some(2)]);
+    assert_eq!(row_values(&mut ev, &view), [Some(3), Some(1), Some(0), Some(2)]);
 }
 
 /// REVERSE reverses characters, so a multibyte sequence stays intact.
@@ -1902,10 +1914,10 @@ fn replace_rewrites_every_occurrence_left_to_right() {
     let s: &[&[u8]] = &[b"aXbXc", b"abc", b"aaa", b"abc", b"XX"];
     let from: &[&[u8]] = &[b"X", b"", b"aa", b"z", b"X"];
     let to: &[&[u8]] = &[b"--", b"z", b"b", b"q", b""];
-    let (ev, view) = mixed_prog(&[s, from, to], &[], vec![], |r| {
+    let (mut ev, view) = mixed_prog(&[s, from, to], &[], vec![], |r| {
         vec![LogicalInstr::StrReplace { s: r[0], from: r[1], to: r[2] }]
     });
-    let got: Vec<Vec<u8>> = str_rows(&ev, &view, 5).into_iter().map(|(v, _)| v).collect();
+    let got: Vec<Vec<u8>> = str_rows(&mut ev, &view).into_iter().map(|(v, _)| v).collect();
     assert_eq!(
         got,
         [
@@ -1925,14 +1937,14 @@ fn replace_over_arena_operands_rewrites_correctly() {
     let s: &[&[u8]] = &[b"axbxc"];
     let from: &[&[u8]] = &[b"X"];
     let to: &[&[u8]] = &[b"yy"];
-    let (ev, view) = mixed_prog(&[s, from, to], &[], vec![], |r| {
+    let (mut ev, view) = mixed_prog(&[s, from, to], &[], vec![], |r| {
         vec![
             LogicalInstr::StrCase { a: r[0], upper: true },
             LogicalInstr::StrCase { a: r[2], upper: true },
             LogicalInstr::StrReplace { s: Reg(3), from: r[1], to: Reg(4) },
         ]
     });
-    assert_eq!(row_str(&ev, &view, 0).0, b"AYYBYYC");
+    assert_eq!(row_strs(&mut ev, &view)[0].clone().unwrap_or_default(), b"AYYBYYC");
 }
 
 /// LPAD/RPAD measure in characters, cycle the fill, truncate a longer subject
@@ -1943,10 +1955,10 @@ fn pad_measures_characters_and_truncates_a_long_subject() {
     let n: &[i64] = &[5, 5, 3, 0, 3, -2];
     let fill: &[&[u8]] = &[b"xy", "éx".as_bytes(), b"x", b"x", b"", b"x"];
     let run = |left: bool| {
-        let (ev, view) = mixed_prog(&[s, fill], &[n], vec![], |r| {
+        let (mut ev, view) = mixed_prog(&[s, fill], &[n], vec![], |r| {
             vec![LogicalInstr::StrPad { s: r[0], n_reg: r[2], fill: r[1], left }]
         });
-        str_rows(&ev, &view, 6).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
+        str_rows(&mut ev, &view).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
     };
     let want = |ss: [&str; 6]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
     assert_eq!(run(true), want(["xyxhé", "éxéhé", "hel", "", "a", ""]));
@@ -1960,10 +1972,10 @@ fn split_part_indexes_fields_from_either_end_and_nulls_on_zero() {
     let s: &[&[u8]] = &[b"a,b,c".as_slice(); 8];
     let d: &[&[u8]] = &[b",", b",", b",", b",", b",", b"", b"", b","];
     let n: &[i64] = &[2, -1, 5, -5, 1, 1, 2, 0];
-    let (ev, view) = mixed_prog(&[s, d], &[n], vec![], |r| {
+    let (mut ev, view) = mixed_prog(&[s, d], &[n], vec![], |r| {
         vec![LogicalInstr::StrSplitPart { s: r[0], delim: r[1], n_reg: r[2] }]
     });
-    let got = str_rows(&ev, &view, 8);
+    let got = str_rows(&mut ev, &view);
     let want: Vec<(Vec<u8>, bool)> = [
         (b"b".to_vec(), false),
         (b"c".to_vec(), false),
@@ -1985,13 +1997,13 @@ fn split_part_indexes_fields_from_either_end_and_nulls_on_zero() {
 fn string_producers_propagate_a_null_operand_of_either_class() {
     let s: &[&[u8]] = &[b"abc", b"abc"];
     let n: &[i64] = &[1, 1];
-    let (ev, mut view) = mixed_prog(&[s], &[n], vec![], |r| {
+    let (mut ev, mut view) = mixed_prog(&[s], &[n], vec![], |r| {
         vec![LogicalInstr::StrSide { src: r[0], n_reg: r[1], left: true }]
     });
     view.set_null(0, 0);
     view.set_null(1, 1);
-    assert!(row_str(&ev, &view, 0).1, "NULL subject");
-    assert!(row_str(&ev, &view, 1).1, "NULL count");
+    assert!(row_strs(&mut ev, &view)[0].is_none(), "NULL subject");
+    assert!(row_strs(&mut ev, &view)[1].is_none(), "NULL count");
 }
 
 /// A scalar program's result register is read as a value, so a word-level

@@ -15,13 +15,16 @@
 use gnitz_wire::{FixedInt, TypeCode};
 
 use crate::batch::MORSEL;
+use std::cell::RefCell;
+
+use crate::eval::Resolved;
 use crate::test_support::{
     both_arms, filter_prog, is_null_op, make_n_col_view, map_prog, passing_rows, push_payload_cols, scalar_prog,
-    schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape, TestSchema, TestView,
+    schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape, TestOut, TestSchema, TestView,
 };
 use crate::{
-    CmpOp, ConstIdx, Evaluator, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram, Reg, SchemaFacts,
-    Sink,
+    CmpOp, ConstIdx, ExprBuilder, IntArithOp, LikePattern, LogicalInstr, LogicalProgram, MapEval, Reg, RowFilter,
+    ScalarEval, SchemaFacts, Sink,
 };
 
 /// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
@@ -111,13 +114,13 @@ fn str_const_filter_bench() {
 
         for (name, op) in [("eq", CmpOp::Eq), ("lt", CmpOp::Lt)] {
             let consts = vec![constant.as_bytes().to_vec()];
-            let fused = filter_prog(
+            let mut fused = filter_prog(
                 &schema,
                 vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }],
                 Reg(0),
                 consts.clone(),
             );
-            let regs = filter_prog(
+            let mut regs = filter_prog(
                 &schema,
                 vec![
                     LogicalInstr::LoadColStr { col: 1 },
@@ -130,24 +133,24 @@ fn str_const_filter_bench() {
 
             // Also the warm-up, and outside the driven region — so both channels
             // are still built and compared even when only one is driven.
-            let count = |f: &Evaluator| {
+            let count = |f: &mut RowFilter| {
                 let mut ranges = Vec::new();
-                f.filter_ranges(&mb, &mut ranges);
+                f.ranges(&mb, &mut ranges);
                 ranges.iter().map(|&(s, e)| e - s).sum::<usize>()
             };
-            let hits = count(&fused);
-            assert_eq!(hits, count(&regs), "{domain}/{name}: the channels disagree");
+            let hits = count(&mut fused);
+            assert_eq!(hits, count(&mut regs), "{domain}/{name}: the channels disagree");
 
-            let run = |f: &Evaluator| {
+            let run = |f: &mut RowFilter| {
                 let mut ranges = Vec::new();
                 let mut h = 0usize;
                 for _ in 0..passes {
-                    f.filter_ranges(&mb, &mut ranges);
+                    f.ranges(&mb, &mut ranges);
                     h += ranges.len();
                 }
                 std::hint::black_box(h);
             };
-            for (want, ev) in [(run_fused, &fused), (run_regs, &regs)] {
+            for (want, ev) in [(run_fused, &mut fused), (run_regs, &mut regs)] {
                 if want && (only == "all" || only == domain) {
                     n_selected += 1;
                     run(ev);
@@ -189,7 +192,7 @@ fn filter_kernel_bench() {
     // `pk > n/2` — the PK-region load.
     let pk_schema = schema_pk_ints(1, false);
     let pk_view = make_n_col_view(&pk_schema, n, |_, _| 1, |_, _| false);
-    let pk_filter = filter_prog(
+    let mut pk_filter = filter_prog(
         &pk_schema,
         vec![
             LogicalInstr::LoadColInt { col: 0 },
@@ -209,7 +212,7 @@ fn filter_kernel_bench() {
         |row, col| ((row * 7 + col) % 100) as i64,
         |row, _| row % 32 == 0,
     );
-    let nn_filter = filter_prog(
+    let mut nn_filter = filter_prog(
         &nn_schema,
         vec![
             LogicalInstr::LoadColInt { col: 1 },
@@ -259,22 +262,22 @@ fn filter_kernel_bench() {
         });
     }
     let lit_result = acc_reg.expect("the literal chain has at least one compare");
-    let lit_filter = filter_prog(&lit_schema, lit_instrs, Reg(lit_result), vec![]);
+    let mut lit_filter = filter_prog(&lit_schema, lit_instrs, Reg(lit_result), vec![]);
 
     let mut hits = 0usize;
     let mut n_selected = 0usize;
     let mut ranges = Vec::new();
     for (name, ev, view) in [
-        ("pk", &pk_filter, &pk_view),
-        ("nullable", &nn_filter, &nn_view),
-        ("literals", &lit_filter, &lit_view),
+        ("pk", &mut pk_filter, &pk_view),
+        ("nullable", &mut nn_filter, &nn_view),
+        ("literals", &mut lit_filter, &lit_view),
     ] {
         if !driven(name) {
             continue;
         }
         n_selected += 1;
         for _ in 0..passes {
-            ev.filter_ranges(view, &mut ranges);
+            ev.ranges(view, &mut ranges);
             hits += ranges.len();
         }
     }
@@ -403,22 +406,22 @@ fn is_null_arm_bench() {
 
     let mut n_selected = 0usize;
     for (name, view, (instrs, result_reg)) in &shapes {
-        let (fast, nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), *result_reg, vec![]));
+        let (mut fast, mut nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), *result_reg, vec![]));
         // Also the warm-up, and outside the driven region.
-        let passed = passing_rows(&fast, view);
-        assert_eq!(passed, passing_rows(&nullable, view), "{name}: the arms disagree");
+        let passed = passing_rows(&mut fast, view);
+        assert_eq!(passed, passing_rows(&mut nullable, view), "{name}: the arms disagree");
         let hits = passed.iter().filter(|&&p| p).count();
 
-        let run = |ev: &Evaluator| {
+        let run = |ev: &mut RowFilter| {
             let mut ranges = Vec::new();
             let mut h = 0usize;
             for _ in 0..passes {
-                ev.filter_ranges(*view, &mut ranges);
+                ev.ranges(*view, &mut ranges);
                 h += ranges.len();
             }
             std::hint::black_box(h);
         };
-        for (want, ev) in [(run_fast, &fast), (run_nullable, &nullable)] {
+        for (want, ev) in [(run_fast, &mut fast), (run_nullable, &mut nullable)] {
             if driven(name, want) {
                 n_selected += 1;
                 run(ev);
@@ -430,7 +433,7 @@ fn is_null_arm_bench() {
     // The map drive, which leaves through a register sink rather than a bitmap.
     let out_schema = schema_pk_ints(1, false);
     let map_instrs = vec![is_null_op(1)];
-    let (fast, nullable) = both_arms("map", || {
+    let (mut fast, mut nullable) = both_arms("map", || {
         map_prog(
             &schema,
             &out_schema,
@@ -440,20 +443,20 @@ fn is_null_arm_bench() {
         )
     });
     // The warm-up doubles as the agreement check, as it does per filter shape.
-    let emitted = |ev: &Evaluator| {
+    let emitted = |ev: &mut MapEval| {
         let mut vals = Vec::with_capacity(n);
         ev.eval_morsels(&spread, 0, n, |_, out| vals.extend_from_slice(out.reg_values(0)));
         vals
     };
-    assert_eq!(emitted(&fast), emitted(&nullable), "map: the arms disagree");
-    let run = |ev: &Evaluator| {
+    assert_eq!(emitted(&mut fast), emitted(&mut nullable), "map: the arms disagree");
+    let run = |ev: &mut MapEval| {
         let mut acc = 0i64;
         for _ in 0..passes {
             ev.eval_morsels(&spread, 0, n, |_, out| acc += out.reg_values(0).iter().sum::<i64>());
         }
         std::hint::black_box(acc);
     };
-    for (want, ev) in [(run_fast, &fast), (run_nullable, &nullable)] {
+    for (want, ev) in [(run_fast, &mut fast), (run_nullable, &mut nullable)] {
         if driven("map", want) {
             n_selected += 1;
             run(ev);
@@ -710,11 +713,11 @@ fn expr_kernel_bench() {
     );
 
     // --- a real map: six compute opcodes plus two register sinks, driven through
-    //     `eval_morsels` the way a maintained view's projection is ---
+    //     `write_computed` the way a maintained view's projection is ---
     let map_in = schema_pk_ints(3, false);
     let map_out = schema_pk_ints(2, false);
     let map_view = make_n_col_view(&map_in, n, |row, col| ((row * 7 + col) % 1000) as i64, |_, _| false);
-    let map = map_prog(
+    let mut map = map_prog(
         &map_in,
         &map_out,
         vec![
@@ -742,15 +745,27 @@ fn expr_kernel_bench() {
     );
 
     let mut acc = 0i64;
+    if driven("map") {
+        n_selected += 1;
+        let mut out = TestOut::new(n, &[8, 8]);
+        for _ in 0..passes {
+            map.write_computed(&map_view, 0, n, &mut out, 0);
+            acc += out.cols[0][0] as i64;
+        }
+    }
+    // Several shapes share one evaluator over different views.
+    let [int_cast, int_div, select, str_len, str_like, contains, generic, icontains, iprefix, resume, strpos] = [
+        int_cast, int_div, select, str_len, str_like, contains, generic, icontains, iprefix, resume, strpos,
+    ]
+    .map(RefCell::new);
     // Scalar-result shapes: sum the result register, as a register sink into an 8-byte
     // slot would read it.
-    let mut scalar_shapes: Vec<(&str, &Evaluator, &TestView, usize)> = vec![
+    let mut scalar_shapes: Vec<(&str, &RefCell<ScalarEval>, &TestView, usize)> = vec![
         ("int_cast", &int_cast, &int_view, 1usize),
         ("int_div", &int_div, &int_view, 2),
         ("select", &select, &int_view, 3),
         ("str_len", &str_len, &str_view, 1),
         ("str_like", &str_like, &str_view, 1),
-        ("map", &map, &map_view, 5),
     ];
     // Named per length, so one `perf` pair reads one point of the slope.
     for (k, name) in ["str_contains_12", "str_contains_128", "str_contains_512"]
@@ -782,11 +797,14 @@ fn expr_kernel_bench() {
         }
         n_selected += 1;
         for _ in 0..passes {
-            ev.eval_morsels(view, 0, n, |_, out| acc += out.reg_values(reg).iter().sum::<i64>());
+            ev.borrow_mut()
+                .eval_morsels(view, 0, n, |_, out| acc += out.reg_values(reg).iter().sum::<i64>());
         }
     }
+    let [int_to_str, str_upper, str_substr, str_concat, str_side] =
+        [int_to_str, str_upper, str_substr, str_concat, str_side].map(RefCell::new);
     // String-result shapes: resolve every view, as a string sink does.
-    let mut str_shapes: Vec<(&str, &Evaluator, &TestView, usize)> = vec![
+    let mut str_shapes: Vec<(&str, &RefCell<ScalarEval>, &TestView, usize)> = vec![
         ("int_to_str", &int_to_str, &int_view, 1usize),
         ("str_upper", &str_upper, &str_view, 1),
         ("str_substr", &str_substr, &str_view, 3),
@@ -801,7 +819,7 @@ fn expr_kernel_bench() {
         }
         n_selected += 1;
         for _ in 0..passes {
-            ev.eval_morsels(view, 0, n, |_, out| {
+            ev.borrow_mut().eval_morsels(view, 0, n, |_, out| {
                 for i in 0..out.rows() {
                     acc += out.str_bytes(reg, i).len() as i64;
                 }
@@ -871,7 +889,7 @@ fn from_blob_bench() {
     let mut acc = 0usize;
     for _ in 0..passes {
         let prog = LogicalProgram::from_blob(std::hint::black_box(&blob), "bench").expect("decodes");
-        acc += prog.resolve_filter(&schema).expect("resolves").prog.int_sets[0].len();
+        acc += prog.resolve_filter(&schema).expect("resolves").prog().int_sets[0].len();
     }
     println!(
         "from_blob_bench shape={shape} passes={passes} n={n} acc={}",

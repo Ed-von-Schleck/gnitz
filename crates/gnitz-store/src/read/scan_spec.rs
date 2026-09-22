@@ -13,7 +13,7 @@ use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
-use gnitz_expr::{cmp_order_keys, order_locators, Evaluator, LogicalProgram, OrderLocator, RangeMembership};
+use gnitz_expr::{cmp_order_keys, order_locators, OrderLocator, RowFilter};
 
 impl RelationRegistry {
     /// Execute `spec` on this worker's slice, replying in `reply_schema`'s layout.
@@ -34,11 +34,12 @@ impl RelationRegistry {
             check_layout(reply_schema, &src_schema)?;
             return self.scan(target_id, hydrator);
         }
-        let (source, membership) = self.open_bound(target_id, bound)?;
-        let predicate = (!predicate.is_empty())
-            .then(|| compile_predicate(&predicate, &src_schema))
-            .transpose()?;
-        let map = sink
+        let (source, unapplied) = self.open_bound(target_id, bound)?;
+        // A bad predicate and a bad walk are both a corrupt request: the client
+        // pre-compiled the identical program at plan time.
+        let filter = RowFilter::for_read(&predicate, &unapplied, &src_schema)
+            .map_err(|e| StoreError::rejected(format!("scan_spec: {e}")))?;
+        let mut map = sink
             .map
             .as_ref()
             .map(|m| MapPlan::from_compute_map(&src_schema, m))
@@ -47,23 +48,21 @@ impl RelationRegistry {
         let sink_in = map.as_ref().map_or(src_schema, |m| *m.out_schema());
         let mut rows = Survivors {
             source: LiveSource::new(self, target_id, source, hydrator),
-            predicate,
-            membership,
+            filter,
             ranges: Vec::new(),
-            walk_words: Vec::new(),
         };
         let chunk_rows = self.config.scan_chunk_rows;
         Ok(Rc::new(match &sink.kind {
             SinkKind::Fold(agg) => {
                 let fold = AdhocFold::new(&sink_in, agg, self.config.adhoc_group_cap)?;
                 check_layout(reply_schema, fold.output_schema())?;
-                run_fold_sink(&mut rows, chunk_rows, map.as_ref(), fold)?
+                run_fold_sink(&mut rows, chunk_rows, map.as_mut(), fold)?
             }
             SinkKind::Rows { order, limit_k } => {
                 check_layout(reply_schema, &sink_in)?;
                 let window = saturated_window(*limit_k);
                 if order.is_empty() {
-                    stream_rows(&mut rows, chunk_rows, map.as_ref(), &sink_in, window)?
+                    stream_rows(&mut rows, chunk_rows, map.as_mut(), &sink_in, window)?
                 } else {
                     debug_assert!(window > 0, "decode admits an order only under a cut");
                     sink_in
@@ -72,7 +71,7 @@ impl RelationRegistry {
                     topk_rows(
                         &mut rows,
                         chunk_rows,
-                        map.as_ref(),
+                        map.as_mut(),
                         &sink_in,
                         &order_locators(order, &sink_in),
                         window,
@@ -148,19 +147,16 @@ type SurvivorChunk<'r> = (Batch, &'r mut Vec<(usize, usize)>);
 /// the one input every sink reads.
 struct Survivors<'a, 'h> {
     source: LiveSource<'a, 'h>,
-    predicate: Option<Evaluator>,
-    /// The walk an index bound names, when the source is a full scan standing in for it.
-    membership: Option<RangeMembership>,
+    /// The predicate, and the part of the bound the source did not apply.
+    filter: RowFilter,
     /// The current chunk's surviving row ranges; scratch reused across chunks.
     ranges: Vec<(usize, usize)>,
-    /// The current chunk's `membership` bits; scratch reused across chunks.
-    walk_words: Vec<u64>,
 }
 
 impl Survivors<'_, '_> {
     /// Whether every source row survives: nothing filters it.
     fn keeps_every_row(&self) -> bool {
-        self.predicate.is_none() && self.membership.is_none()
+        self.filter.keeps_every_row()
     }
 
     /// The next source chunk and its surviving row ranges; `None` once the source is
@@ -169,19 +165,7 @@ impl Survivors<'_, '_> {
         let Some(chunk) = self.source.next_chunk(max_rows)? else {
             return Ok(None);
         };
-        let mb = chunk.as_mem_batch();
-        match (&self.predicate, &self.membership) {
-            (None, None) => {
-                self.ranges.clear();
-                self.ranges.push((0, chunk.count));
-            }
-            (Some(f), None) => f.filter_ranges(&mb, &mut self.ranges),
-            (None, Some(m)) => m.filter_ranges(&mb, &mut self.walk_words, &mut self.ranges),
-            (Some(f), Some(m)) => {
-                m.filter_words(&mb, &mut self.walk_words);
-                f.filter_ranges_within(&mb, &self.walk_words, &mut self.ranges);
-            }
-        }
+        self.filter.ranges(&chunk.as_mem_batch(), &mut self.ranges);
         Ok(Some((chunk, &mut self.ranges)))
     }
 }
@@ -191,11 +175,14 @@ impl Survivors<'_, '_> {
 fn run_fold_sink(
     rows: &mut Survivors,
     chunk_rows: usize,
-    map: Option<&MapPlan>,
+    map: Option<&mut MapPlan>,
     mut fold: AdhocFold,
 ) -> Result<Batch, StoreError> {
     // One mapped batch for the whole scan: `clear` keeps its buffers.
-    let mut map = map.map(|p| (p, Batch::empty_with_schema(p.out_schema())));
+    let mut map = map.map(|p| {
+        let dst = Batch::empty_with_schema(p.out_schema());
+        (p, dst)
+    });
     while let Some((chunk, ranges)) = rows.next(chunk_rows)? {
         match &mut map {
             Some((plan, dst)) => {
@@ -213,7 +200,7 @@ fn run_fold_sink(
 
 /// Append one chunk's survivor ranges onto the keeper — straight, or through the
 /// map. There is no intermediate survivor batch and no mapped batch.
-fn append_survivors(map: Option<&MapPlan>, chunk: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
+fn append_survivors(map: Option<&mut MapPlan>, chunk: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
     match map {
         None => keeper.append_ranges(&chunk.as_mem_batch(), ranges),
         Some(p) => p.append_map_ranges(chunk, keeper, ranges),
@@ -225,7 +212,7 @@ fn append_survivors(map: Option<&MapPlan>, chunk: &Batch, keeper: &mut Batch, ra
 fn stream_rows(
     rows: &mut Survivors,
     chunk_rows: usize,
-    map: Option<&MapPlan>,
+    mut map: Option<&mut MapPlan>,
     keeper_schema: &SchemaDescriptor,
     window: i64,
 ) -> Result<Batch, StoreError> {
@@ -262,7 +249,7 @@ fn stream_rows(
                 break;
             }
         }
-        append_survivors(map, &chunk, &mut keeper, ranges);
+        append_survivors(map.as_deref_mut(), &chunk, &mut keeper, ranges);
         if early_stop && summed >= window {
             break;
         }
@@ -275,7 +262,7 @@ fn stream_rows(
 fn topk_rows(
     rows: &mut Survivors,
     chunk_rows: usize,
-    map: Option<&MapPlan>,
+    mut map: Option<&mut MapPlan>,
     keeper_schema: &SchemaDescriptor,
     order: &[OrderLocator],
     window: i64,
@@ -296,7 +283,7 @@ fn topk_rows(
         summed = ranges
             .iter()
             .fold(summed, |a, &(s, e)| a.wrapping_add(mb.sum_weights(s, e)));
-        append_survivors(map, &chunk, &mut keeper, ranges);
+        append_survivors(map.as_deref_mut(), &chunk, &mut keeper, ranges);
         if summed > residency_cap {
             (keeper, summed) = topk_keep(keeper, order, window);
         }
@@ -346,15 +333,6 @@ fn topk_keep(keeper: Batch, order: &[OrderLocator], window: i64) -> (Batch, i64)
         Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm, keeper.schema()),
         acc,
     )
-}
-
-/// Decode + validate a client predicate blob against `schema`, then build its
-/// predicate `Evaluator` — the same path the circuit compiler runs. Any failure
-/// is a corrupt frame (the client pre-compiled the identical program at plan time).
-fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<Evaluator, StoreError> {
-    LogicalProgram::from_blob(blob, "scan_spec predicate")
-        .and_then(|p| p.resolve_filter(schema))
-        .map_err(|e| StoreError::rejected(format!("scan_spec: invalid predicate program: {e}")))
 }
 
 #[cfg(test)]
