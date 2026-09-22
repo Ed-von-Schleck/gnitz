@@ -13,9 +13,9 @@ use std::fs;
 use super::batch::{Batch, Layout};
 use super::child_dir::{cluster_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot};
 use super::error::{StorageError, StoreError};
-use super::flush_barrier::flush_barrier;
 use super::manifest;
 use super::read_cursor;
+use super::table::flush_barrier;
 use super::table::{RecoverySource, StoreBudgets, Table};
 use crate::schema::SchemaDescriptor;
 use crate::storage::fsync_dir;
@@ -115,7 +115,8 @@ fn link_targets(rel_dir: &str, source: u32, launched: u32) -> Result<(), Storage
         let dir = target.dir(rel_dir);
         crate::storage::create_dir(&dir)?;
         for e in &m.entries {
-            fs::hard_link(format!("{source_dir}/{}", e.name), format!("{dir}/{}", e.name))?;
+            let shard = |dir: &str| super::naming::shard_path(dir, e.seq);
+            fs::hard_link(shard(&source_dir), shard(&dir))?;
         }
         // The shards are durable before a manifest names them.
         fsync_dir(&dir)?;
@@ -168,7 +169,7 @@ fn rewrite_targets(
             write_run(target, buffer)?;
         }
     }
-    flush_barrier(targets.iter_mut(), 0)
+    flush_barrier(targets.iter_mut(), Default::default())
 }
 
 /// `run` is ascending subsets of one consolidated cursor, appended in cursor

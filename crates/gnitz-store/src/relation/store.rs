@@ -47,7 +47,7 @@ impl Store {
     }
 
     /// This process's `Table`, or `None` when it holds none.
-    fn table(&self) -> Option<&Table> {
+    pub(in crate::relation) fn table(&self) -> Option<&Table> {
         self.table.as_deref()
     }
 
@@ -182,25 +182,13 @@ impl Store {
         }
     }
 
-    /// Dispatched [`Table::flush_to_ram`] — the fold, spill, compaction and
+    /// Dispatched [`Table::fold_to_ram`] — the fold, spill, compaction and
     /// capacity sweep, with no manifest publish and no barrier.
-    pub(crate) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn fold_to_ram(&mut self) -> Result<(), StorageError> {
         match self.table_mut() {
-            Some(t) => t.flush_to_ram(),
+            Some(t) => t.fold_to_ram(),
             None => Ok(()),
         }
-    }
-
-    /// Dispatched [`Table::pin_lsn`]; inert where this process holds no store.
-    pub(crate) fn pin_lsn(&mut self, lsn: u64) {
-        if let Some(t) = self.table_mut() {
-            t.pin_lsn(lsn);
-        }
-    }
-
-    /// The store's LSN counter; `0` where this process holds no store.
-    pub(crate) fn current_lsn(&self) -> u64 {
-        self.table().map_or(0, Table::current_lsn)
     }
 
     /// Whether this process's store came back from a checkpoint manifest at its

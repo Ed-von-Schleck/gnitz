@@ -26,19 +26,9 @@ impl ZoneLsnAllocator {
         }
     }
 
-    /// Reserve the next zone LSN, stepping past `floor` when a family counter
-    /// has drifted above the high-water: un-pinned sys-table ingests auto-bump
-    /// family counters, and a checkpoint persists drifted counters as recovery
-    /// dedup watermarks — a zone LSN at or below such a watermark would have
-    /// its committed-but-unflushed deltas deduped away on recovery. The
-    /// committer passes 0 (a user-table push pins no system-family counter);
-    /// SERIAL and DDL pass the counters of the families their zone writes.
-    /// Strictly monotone: no two zones ever collide, and a failed zone's
-    /// reserved LSN (never published) is not reused. No `.await` between load
-    /// and store, so the read-modify-write is atomic on the single-threaded
-    /// reactor.
-    pub fn reserve(&self, floor: u64) -> u64 {
-        let zone = self.reserved.get().max(floor) + 1;
+    /// Reserve the next zone LSN. A failed zone's LSN is never reused.
+    pub fn reserve(&self) -> u64 {
+        let zone = self.reserved.get() + 1;
         self.reserved.set(zone);
         zone
     }

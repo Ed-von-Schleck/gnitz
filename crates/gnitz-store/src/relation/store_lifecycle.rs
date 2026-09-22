@@ -1,6 +1,6 @@
 //! Per-process store lifecycle across the fork — the store open, the boot
 //! relayout and child-dir reclamation, view reset and rebuild start — and the
-//! flushed-LSN bookkeeping that recovery and the DDL zone allocator read.
+//! system families' replay floors recovery reads.
 
 use super::{RelationKind, RelationRegistry, Residency, SecondaryIndex, Store};
 use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, ChildKind, Slot, StoreError};
@@ -153,29 +153,13 @@ impl RelationRegistry {
         })
     }
 
-    /// Raise `id`'s store LSN counter to at least `lsn`; a no-op for an unregistered
-    /// id or a detached store.
-    pub fn pin_lsn(&mut self, id: i64, lsn: u64) {
-        if let Some(entry) = self.tables.get_mut(&id) {
-            entry.store.pin_lsn(lsn);
-        }
-    }
-
-    /// The system families' `table id → LSN counter`: the replay floors of the
-    /// master's pre-fork SAL walk.
-    pub fn system_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
-        self.system_lsns().collect()
-    }
-
-    /// The highest system-family LSN counter.
-    pub fn max_system_lsn(&self) -> u64 {
-        self.system_lsns().map(|(_, lsn)| lsn).max().unwrap_or(0)
-    }
-
-    fn system_lsns(&self) -> impl Iterator<Item = (i64, u64)> + '_ {
+    /// The system families' `table id → replay floor` their stores opened with:
+    /// the floors of the master's pre-fork SAL walk.
+    pub fn system_replay_floors(&self) -> std::collections::HashMap<i64, u64> {
         self.tables
             .iter()
             .filter(|(_, entry)| entry.kind() == RelationKind::SystemCatalog)
-            .map(|(&tid, entry)| (tid, entry.current_lsn()))
+            .map(|(&tid, entry)| (tid, entry.store.table().map_or(0, crate::storage::Table::replay_floor)))
+            .collect()
     }
 }

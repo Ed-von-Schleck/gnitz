@@ -5686,7 +5686,7 @@ fn run_reduce_trace_epochs(
         };
         trace.ingest_owned_batch(out).unwrap();
         if flush_after_first && i == 0 {
-            trace.flush_to_ram().unwrap();
+            trace.fold_to_ram().unwrap();
         }
     }
     (trace.full_scan(), max_sources)

@@ -1,7 +1,7 @@
 //! End-to-end microbenchmark for the RAM-tier drain path at production
 //! thresholds: `fold_memtable_into_ram_tier`, the tier's own fold at
 //! `FOLD_THRESHOLD` (window re-merge + re-materialize) and the ceiling spill in
-//! `flush_to_ram`.
+//! `fold_to_ram`.
 //!
 //! This is the bench a compaction-policy change must move, and the one whose
 //! `perf` profile must reproduce the e2e worker hot-symbol shape. As a child
@@ -14,9 +14,6 @@ use super::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 use crate::schema::SchemaDescriptor;
 use crate::test_support::pk_u64_two_i64_schema;
 
-/// The view-output-store shape of `v_rev`: one hidden U64 group key + two
-/// non-null I64 aggregates, 40 B/row, `FixedIntNonnull` payload comparator —
-/// the dominant shape in the profiled flush workload.
 /// Append one row `(pk, payload, payload, weight)` to `b` (both I64 payload
 /// columns carry the same value so a retraction is an exact (PK,payload) match
 /// of its insert).
@@ -92,10 +89,6 @@ enum Gen {
     Churn(usize, usize),
 }
 
-/// The emptied scratch directory both compaction sweeps write into — a real
-/// filesystem when `GNITZ_BENCH_DIR` names one, because shard bytes are what
-/// they count and a tmpfs prices them differently. `tmp` owns the fallback root
-/// and so must outlive the returned path.
 /// The default budgets with `GNITZ_RAM_TIER_BYTES` applied: these benches
 /// measure RAM-tier fold and compaction behaviour, so the tier is what a run
 /// shrinks to reach the disk regime.
@@ -106,6 +99,10 @@ fn bench_budgets() -> StoreBudgets {
     ))
 }
 
+/// The emptied scratch directory both compaction sweeps write into — a real
+/// filesystem when `GNITZ_BENCH_DIR` names one, because shard bytes are what
+/// they count and a tmpfs prices them differently. `tmp` owns the fallback root
+/// and so must outlive the returned path.
 fn bench_dir(tmp: &tempfile::TempDir, name: String) -> std::path::PathBuf {
     let root = std::env::var("GNITZ_BENCH_DIR").unwrap_or_else(|_| tmp.path().to_str().unwrap().to_string());
     let dir = std::path::Path::new(&root).join(name);
@@ -124,7 +121,7 @@ fn start_compaction_sweep() -> crate::test_rng::Rng {
 
 /// The drain-cadence cost at production thresholds. See the module doc.
 ///
-/// `GNITZ_BENCH_FLUSH=0` drops the per-tick `flush_to_ram()` and lets the memtable
+/// `GNITZ_BENCH_FLUSH=0` drops the per-tick `fold_to_ram()` and lets the memtable
 /// drain on its own budget — the two arms price one cadence against the other.
 ///
 /// ```text
@@ -154,7 +151,7 @@ fn flush_cadence_amplification_bench() {
         for batch in gen_distinct(&schema, 4, 50) {
             table.ingest_owned_batch(batch).unwrap();
             if per_tick_flush {
-                table.flush_to_ram().unwrap();
+                table.fold_to_ram().unwrap();
             }
         }
     }
@@ -190,7 +187,7 @@ fn flush_cadence_amplification_bench() {
             let runs_before = table.ram_tier.len();
             table.ingest_owned_batch(batch).unwrap();
             if per_tick_flush {
-                table.flush_to_ram().unwrap();
+                table.fold_to_ram().unwrap();
             }
             // Only a fold shrinks the set, and it re-materializes the whole window
             // — so the post-fold row count is what that merge wrote.
@@ -268,7 +265,7 @@ fn compaction_amplification_bench() {
             false => scatter_tick(&schema, &mut rng, ROWS_PER_TICK, keyspace),
         };
         table.ingest_owned_batch(batch).unwrap();
-        table.flush_to_ram().unwrap();
+        table.fold_to_ram().unwrap();
     }
 
     let phases = cstats::dump();

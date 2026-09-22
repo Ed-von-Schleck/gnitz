@@ -2,9 +2,9 @@ use super::super::batch::{Batch, REG_PAYLOAD_START};
 use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
 use super::super::merge::ColumnarSource;
 use super::super::merge::{run_merge, BlobCacheGuard};
-use super::super::naming;
 use super::super::shard_file::{self, region_dir, ShardWriteOpts};
 use super::super::shard_index::guard_slot;
+use super::super::shard_index::{ShardBudget, ShardIndex};
 use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::key::PkBuf;
@@ -15,9 +15,39 @@ use gnitz_wire::read_i64_le;
 use std::fs;
 use TypeCode::{String as TYPE_STRING, I64 as TYPE_I64, U64 as TYPE_U64};
 
-/// A probed store's `Output` — the shape every test here compacts into.
-fn out(dir: &str, compact_seq: u64) -> Output<'_> {
-    Output { dir, compact_seq, skip_pk_filter: false }
+/// Every `(guard_key, batch, skeleton)` [`merge_and_route`] emits, in order.
+fn route(
+    shards: &[MappedShard],
+    guards: &[(PkBuf, bool)],
+    schema: &SchemaDescriptor,
+) -> Result<Vec<(PkBuf, Batch, bool)>, StorageError> {
+    let mut out = Vec::new();
+    merge_and_route(shards, guards, schema, |&(gk, skeleton), batch| {
+        out.push((gk, batch, skeleton));
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// [`route`], each batch written as a compaction output to `dir/{tag}_{n}.db`.
+fn route_to_files(
+    dir: &std::path::Path,
+    tag: &str,
+    shards: &[MappedShard],
+    guards: &[(PkBuf, bool)],
+    schema: &SchemaDescriptor,
+) -> Vec<(PkBuf, String)> {
+    route(shards, guards, schema)
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .map(|(n, (gk, batch, skeleton))| {
+            let path = dir.join(format!("{tag}_{n}.db")).to_str().unwrap().to_owned();
+            let opts = ShardWriteOpts { skeleton, ..ShardWriteOpts::COMPACTION };
+            batch.write_as_shard(&path, opts).unwrap();
+            (gk, path)
+        })
+        .collect()
 }
 
 /// A one-payload-column shard of `pks` at `weights` (payload = pk), written to
@@ -41,13 +71,13 @@ fn open_inputs(paths: &[&str], schema: &SchemaDescriptor) -> Vec<MappedShard> {
 /// shard's path, or `None` when every row cancelled (no shard is written).
 fn compact_one_opt(dir: &std::path::Path, inputs: &[&str], schema: &SchemaDescriptor, seq: u64) -> Option<String> {
     let anchor = PkBuf::zeroed(schema.pk_stride());
-    let outs = merge_and_route(
+    let outs = route_to_files(
+        dir,
+        &format!("out{seq}"),
         &open_inputs(inputs, schema),
         &[(anchor, false)],
         schema,
-        out(dir.to_str().unwrap(), seq),
-    )
-    .unwrap();
+    );
     outs.first().map(|(_, p)| p.clone())
 }
 
@@ -188,17 +218,16 @@ fn compaction_merges_inputs_and_drops_cancelled_rows() {
 
 #[test]
 fn a_corrupt_input_body_fails_the_compaction() {
-    use super::super::shard_index::{ShardBudget, ShardIndex};
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(dir.to_str().unwrap(), schema, ShardBudget::Unbounded, false);
-    let mut paths = Vec::new();
     for i in 0..5u64 {
-        let pks: Vec<u64> = (0..20).map(|j| i * 100 + j).collect();
-        let path = write_shard(dir, &format!("s{i}.db"), &pks, &vec![1; pks.len()], &schema);
-        idx.add_unsynced_shard(&path, i + 1).unwrap();
-        paths.push(path);
+        let rows: Vec<(Vec<u8>, i64, i64)> = (0..20)
+            .map(|j| i * 100 + j)
+            .map(|p| (opk_pk(&schema, &[p as u128]), 1, p as i64))
+            .collect();
+        idx.append_l0_run(&shard_file::test_batch(&schema, &rows)).unwrap();
     }
     let listing = || {
         let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -207,7 +236,8 @@ fn a_corrupt_input_body_fails_the_compaction() {
     };
     let before = listing();
 
-    crate::test_support::flip_last_byte_in_place(std::path::Path::new(&paths[2]));
+    let third = idx.unsynced_paths().nth(2).unwrap().to_owned();
+    crate::test_support::flip_last_byte_in_place(std::path::Path::new(&third));
 
     assert_eq!(idx.run_compact(), Err(StorageError::Corrupt("body checksum")));
     assert_eq!(idx.shard_count(), 5, "every input stays registered");
@@ -249,7 +279,7 @@ fn test_merge_and_route_rejects_empty_guards() {
     // loudly up front.
     let schema = make_schema_u64_i64();
     let guards: [(PkBuf, bool); 0] = [];
-    let _ = merge_and_route(&[], &guards, &schema, out("/tmp", 0));
+    let _ = route(&[], &guards, &schema);
 }
 
 #[test]
@@ -270,61 +300,20 @@ fn test_merge_and_route_basic() {
         (PkBuf::from_bytes(&0u64.to_be_bytes()), false),
         (PkBuf::from_bytes(&100u64.to_be_bytes()), false),
     ];
-    let guard_outputs = merge_and_route(
-        &open_inputs(&inputs, &schema),
-        &guards,
-        &schema,
-        out(dir.to_str().unwrap(), 99),
-    )
-    .unwrap();
+    let guard_outputs = route(&open_inputs(&inputs, &schema), &guards, &schema).unwrap();
     assert_eq!(guard_outputs.len(), 2); // both guards should have rows
 
     // Guard 0 should have keys 10, 50
-    let cfn0 = guard_outputs[0].1.clone();
-    let g0 = MappedShard::open(&cfn0, &schema).unwrap();
+    let g0 = &guard_outputs[0].1;
     assert_eq!(g0.count, 2);
     assert_eq!(g0.get_pk(0), 10);
     assert_eq!(g0.get_pk(1), 50);
 
     // Guard 1 should have keys 150, 250
-    let cfn1 = guard_outputs[1].1.clone();
-    let g1 = MappedShard::open(&cfn1, &schema).unwrap();
+    let g1 = &guard_outputs[1].1;
     assert_eq!(g1.count, 2);
     assert_eq!(g1.get_pk(0), 150);
     assert_eq!(g1.get_pk(1), 250);
-}
-
-#[test]
-fn test_merge_and_route_cleanup_on_partial_finalize_failure() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_schema_u64_i64();
-
-    let cs1 = write_shard(&dir, "in1.db", &[10, 50], &[1, 1], &schema);
-    let cs2 = write_shard(&dir, "in2.db", &[150, 250], &[1, 1], &schema);
-    let inputs = [cs1.as_str(), cs2.as_str()];
-    let guards: [(PkBuf, bool); 2] = [
-        (PkBuf::from_bytes(&0u64.to_be_bytes()), false),
-        (PkBuf::from_bytes(&100u64.to_be_bytes()), false),
-    ];
-
-    // compact_seq=99 → the second output is shard_99_P1.db, named by its part
-    // index within the compaction.
-    // Block it with a directory so finalize fails for that guard.
-    let blocker = dir.join(naming::compact_shard_name(99, 1));
-    fs::create_dir_all(&blocker).unwrap();
-
-    let rc = merge_and_route(
-        &open_inputs(&inputs, &schema),
-        &guards,
-        &schema,
-        out(dir.to_str().unwrap(), 99),
-    );
-
-    assert!(rc.is_err(), "expected failure, got {rc:?}");
-    let guard0_file = dir.join(naming::compact_shard_name(99, 0));
-    assert!(!guard0_file.exists(), "guard 0 output should have been cleaned up");
 }
 
 // -- 3-column helpers for reduce-output-pattern tests --------------------
@@ -544,13 +533,7 @@ fn test_merge_and_route_keys_below_first_guard() {
 
     // A single guard keyed at 200: everything below it is guard 0's tail.
     let guards = [(PkBuf::from_bytes(&200u64.to_be_bytes()), false)];
-    let guard_outputs = merge_and_route(
-        &open_inputs(&inputs, &schema),
-        &guards,
-        &schema,
-        out(dir.to_str().unwrap(), 1),
-    )
-    .unwrap();
+    let guard_outputs = route_to_files(&dir, "out", &open_inputs(&inputs, &schema), &guards, &schema);
     assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
     let shard_path = guard_outputs[0].1.clone();
@@ -966,16 +949,8 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
         .map(|&b| PkBuf::from_bytes(&b.to_be_bytes()))
         .collect();
 
-    // compact_seq=42 → routed shards are named by their part index within the
-    // compaction: shard_42_P{g}.db.
     let dests: Vec<(PkBuf, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
-    let routed = merge_and_route(
-        &open_inputs(&inputs, &schema),
-        &dests,
-        &schema,
-        out(dir.to_str().unwrap(), 42),
-    )
-    .unwrap();
+    let routed = route_to_files(&dir, "routed", &open_inputs(&inputs, &schema), &dests, &schema);
     let oracle = oracle_merge_and_route_row_at_a_time(&inputs, &dir, &guard_keys, &schema);
 
     // Only the populated guards (0 and 3) produce output, in increasing-g order.
@@ -983,16 +958,19 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
     assert_eq!(routed[0].0, guard_keys[0]);
     assert_eq!(routed[1].0, guard_keys[3]);
 
+    let routed_path = |g: usize| {
+        routed
+            .iter()
+            .find(|(k, _)| *k == guard_keys[g])
+            .map(|(_, p)| p.as_str())
+    };
     for (g, oracle_entry) in oracle.iter().enumerate() {
-        let routed_path = dir.join(super::super::naming::compact_shard_name(42, g));
-        match oracle_entry {
-            None => assert!(
-                !routed_path.exists(),
-                "guard {g} has no survivors — routed must write no shard"
-            ),
-            Some(oracle_path) => {
-                assert!(routed_path.exists(), "guard {g} has survivors — routed shard missing");
-                let rows_new = decode_diff_shard(routed_path.to_str().unwrap(), &schema);
+        match (oracle_entry, routed_path(g)) {
+            (None, None) => {}
+            (None, Some(_)) => panic!("guard {g} has no survivors — routed must emit nothing"),
+            (Some(_), None) => panic!("guard {g} has survivors — routed shard missing"),
+            (Some(oracle_path), Some(path)) => {
+                let rows_new = decode_diff_shard(path, &schema);
                 let rows_old = decode_diff_shard(oracle_path, &schema);
                 assert_eq!(rows_new, rows_old, "guard {g} routed vs row-at-a-time rows diverged");
             }
@@ -1000,8 +978,7 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
     }
 
     // Concrete per-guard pins beyond oracle agreement.
-    let g0_name = super::super::naming::compact_shard_name(42, 0);
-    let g0_rows = decode_diff_shard(dir.join(&g0_name).to_str().unwrap(), &schema);
+    let g0_rows = decode_diff_shard(routed_path(0).unwrap(), &schema);
     let pk10 = 10u64.to_be_bytes().to_vec();
     let folded = g0_rows
         .iter()
@@ -1014,8 +991,7 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
         "guard 0: pk=10 (×2 payloads) + pk=50, got {g0_rows:?}"
     );
 
-    let g3_name = super::super::naming::compact_shard_name(42, 3);
-    let g3_rows = decode_diff_shard(dir.join(&g3_name).to_str().unwrap(), &schema);
+    let g3_rows = decode_diff_shard(routed_path(3).unwrap(), &schema);
     assert_eq!(g3_rows.len(), 3, "guard 3: pk=310,320,330, got {g3_rows:?}");
 }
 
@@ -1048,28 +1024,21 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
             .map(|&b| PkBuf::from_bytes(&key(b)))
             .collect();
         let dests: Vec<(PkBuf, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
-        let routed = merge_and_route(
-            &open_inputs(&[path.as_str()], &schema),
-            &dests,
-            &schema,
-            out(dir.to_str().unwrap(), 7),
-        )
-        .unwrap();
+        let routed = route(&open_inputs(&[path.as_str()], &schema), &dests, &schema).unwrap();
 
-        // Every written shard's rows must be exactly the ones `guard_slot` sends
-        // to that part, and an unwritten part must be one `guard_slot` sends
+        // Every emitted batch's rows must be exactly the ones `guard_slot` sends
+        // to that part, and an unemitted part must be one `guard_slot` sends
         // nothing to.
         for (g, &gkey) in guard_keys.iter().enumerate() {
             let want: Vec<u64> = (0..400u64)
                 .filter(|&i| guard_slot(&guard_keys, &key(i), PkBuf::pk_bytes) == g)
                 .collect();
-            let hit = routed.iter().find(|(k, _)| *k == gkey);
+            let hit = routed.iter().find(|(k, _, _)| *k == gkey);
             match (hit, want.is_empty()) {
                 (None, true) => {}
-                (None, false) => panic!("stride {}: part {g} wrote no shard but owns {want:?}", pk_cols * 8),
-                (Some((_, path)), _) => {
-                    let shard = MappedShard::open(path, &schema).unwrap();
-                    let got: Vec<Vec<u8>> = (0..shard.count).map(|r| shard.get_pk_bytes(r).to_vec()).collect();
+                (None, false) => panic!("stride {}: part {g} emitted nothing but owns {want:?}", pk_cols * 8),
+                (Some((_, batch, _)), _) => {
+                    let got: Vec<Vec<u8>> = (0..batch.count).map(|r| batch.get_pk_bytes(r).to_vec()).collect();
                     assert_eq!(
                         got,
                         want.iter().map(|&i| key(i)).collect::<Vec<_>>(),
@@ -1137,13 +1106,13 @@ mod skeleton_tests {
         );
         let b = write_shard(&dir.join("b.db"), &[(1, 3, 50), (3, -4, 40)], &schema);
 
-        let outs = merge_and_route(
+        let outs = super::route_to_files(
+            dir,
+            "out",
             &super::open_inputs(&[a.as_str(), b.as_str()], &schema),
             &[(crate::schema::key::PkBuf::zeroed(schema.pk_stride()), true)],
             &schema,
-            super::out(dir.to_str().unwrap(), 1),
-        )
-        .unwrap();
+        );
         assert_eq!(outs.len(), 1);
         let path = &outs[0].1;
 
@@ -1169,27 +1138,27 @@ mod skeleton_tests {
         let g0 = crate::schema::key::PkBuf::zeroed(schema.pk_stride());
         let g1 = crate::schema::key::PkBuf::from_bytes(&100u64.to_be_bytes());
 
-        let mixed = merge_and_route(
+        let mixed = super::route_to_files(
+            dir,
+            "mixed",
             &super::open_inputs(&[src.as_str()], &schema),
             &[(g0, true), (g1, false)],
             &schema,
-            super::out(dir.to_str().unwrap(), 1),
-        )
-        .unwrap();
-        let all_hydrated = merge_and_route(
+        );
+        let all_hydrated = super::route_to_files(
+            dir,
+            "hydrated",
             &super::open_inputs(&[src.as_str()], &schema),
             &[(g0, false), (g1, false)],
             &schema,
-            super::out(dir.to_str().unwrap(), 2),
-        )
-        .unwrap();
+        );
 
         assert_eq!(mixed.len(), 2);
         // Guard 0 dehydrated: its two payloads for PK 1 fold to one coarse row.
         assert_eq!(read_rows(&mixed[0].1, &schema), vec![(1, 3)]);
         assert!(MappedShard::open(mixed[0].1.as_str(), &schema).unwrap().is_skeleton());
         // Guard 1 hydrated: identical bytes to the all-hydrated run, modulo the
-        // compaction sequence in the filename.
+        // filename.
         let hy = std::fs::read(&mixed[1].1).unwrap();
         let ref_ = std::fs::read(&all_hydrated[1].1).unwrap();
         assert_eq!(hy.len(), ref_.len());

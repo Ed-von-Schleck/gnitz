@@ -290,7 +290,7 @@ impl CatalogEngine {
         pk: &[u32],
     ) -> Result<(), String> {
         let col_batch = col_tab_batch(tid, cols, 1);
-        self.ddl_sync(SysFamily::Column.id(), 0, col_batch)?;
+        self.ddl_sync(SysFamily::Column.id(), col_batch)?;
 
         let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         push_table_tab_row(
@@ -302,6 +302,6 @@ impl CatalogEngine {
             gnitz_wire::TableProps::default().pack(),
             1,
         );
-        self.ddl_sync(SysFamily::Table.id(), 0, bb.finish())
+        self.ddl_sync(SysFamily::Table.id(), bb.finish())
     }
 }

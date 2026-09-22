@@ -24,9 +24,8 @@ fn stream_flag_registers_storeless_with_no_directory() {
         "a stream gets no directory: {}",
         entry.directory()
     );
-    // Its reads are empty rather than erroring, and its LSN never advances.
+    // Its reads are empty rather than erroring.
     assert_eq!(entry.full_scan().len(), 0);
-    assert_eq!(entry.current_lsn(), 0);
 
     // The same word with the bit clear is still an ordinary base table with a
     // directory, so the assertions above are about the flag and not the fixture.

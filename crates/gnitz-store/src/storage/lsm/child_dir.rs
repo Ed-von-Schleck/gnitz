@@ -113,7 +113,7 @@ pub(crate) fn children_at_generation(rel_dir: &str, num_workers: u32, generation
     cluster_children(num_workers)
         .map(|c| c.dir(rel_dir))
         .chain(scratch.map(|n| format!("{rel_dir}/{n}")))
-        .all(|d| matches!(manifest::read(&d), Ok(Some(m)) if m.checkpoint_gen == generation))
+        .all(|d| matches!(manifest::read(&d), Ok(Some(m)) if m.stamp.checkpoint_gen == generation))
 }
 
 /// Immediate sub-directory names of `path`, none if it is missing. Collected

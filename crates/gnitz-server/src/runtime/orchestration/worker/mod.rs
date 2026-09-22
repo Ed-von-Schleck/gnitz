@@ -42,8 +42,6 @@ enum HasPkLookup {
 /// already carries it.
 struct Request {
     kind: SalMessageKind,
-    /// The zone LSN a `DdlSync` applies at; `0` outside every zone.
-    lsn: u64,
     /// The group's request id, which every reply answers on.
     request_id: u32,
     /// Whether each reply must reach the ring in request order.
@@ -288,7 +286,6 @@ impl WorkerProcess {
         match ipc::decode_sal_slot(wire) {
             Ok(w) => Request {
                 kind: msg.kind,
-                lsn: msg.lsn,
                 request_id: msg.request_id,
                 fifo: msg.in_request_order,
                 wire: w,
@@ -372,7 +369,6 @@ impl WorkerProcess {
     fn dispatch_inner(&mut self, req: Request) -> Result<(), gnitz_wire::WireFault> {
         let Request {
             kind,
-            lsn,
             request_id,
             fifo,
             wire: mut decoded,
@@ -412,7 +408,7 @@ impl WorkerProcess {
                 }
                 if let Some(batch) = batch {
                     if !batch.is_empty() {
-                        self.cat().ddl_sync(target_id, lsn, batch)?;
+                        self.cat().ddl_sync(target_id, batch)?;
                         // A DROP retracts the table/view's catalog row, so its id is
                         // no longer live. If a push landed between its last tick and
                         // the drop, its pending_deltas entry would never tick again

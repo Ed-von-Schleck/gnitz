@@ -5,13 +5,12 @@ use super::*;
 pub(crate) struct UnreplayedCatalog(CatalogEngine);
 
 impl UnreplayedCatalog {
-    /// Each system family's flushed LSN.
-    pub(crate) fn system_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
-        self.0.registry.system_flushed_lsns()
+    /// Each system family's replay floor.
+    pub(crate) fn system_replay_floors(&self) -> std::collections::HashMap<i64, u64> {
+        self.0.registry.system_replay_floors()
     }
 
-    /// Ingest one recovered DdlSync group into `table_id`'s store and pin the
-    /// family to `lsn`, firing no hook.
+    /// Ingest one recovered DdlSync group into `table_id`'s store, firing no hook.
     pub(crate) fn stage(&mut self, table_id: i64, lsn: u64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| format!("{table_id} is not a system table"))?;
         let engine = &mut self.0;
@@ -20,7 +19,7 @@ impl UnreplayedCatalog {
             .registry
             .ingest(table_id, batch)
             .map_err(|e| format!("sys-table ingest failed (family={table_id}): {e}"))?;
-        engine.registry.pin_lsn(table_id, lsn);
+        engine.mark_zone_applied(lsn);
         Ok(())
     }
 
@@ -50,6 +49,7 @@ impl CatalogEngine {
             caches: CatalogCacheSet::default(),
             next_id: FIRST_ALLOCATED_ID,
             pending_broadcasts: Vec::new(),
+            system_zone: 0,
         };
 
         for family in SysFamily::ALL {
@@ -70,6 +70,7 @@ impl CatalogEngine {
             );
         }
 
+        engine.system_zone = engine.registry.system_replay_floors().into_values().max().unwrap_or(0);
         engine.seed_system_tables()?;
         Ok(UnreplayedCatalog(engine))
     }

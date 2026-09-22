@@ -141,10 +141,6 @@ fn arb_string(rng: &mut crate::test_rng::Rng) -> Vec<u8> {
 // Tests
 // ---------------------------------------------------------------------------
 
-// `Table::new(dir, schema, table_id, recovery, budgets)`. The numeric is
-// table_id = 1, not a row capacity. The constructor creates the not-yet-
-// existing sub-dir. all_shard_arcs returns `Vec<Rc<MappedShard>>`
-// (single-threaded — Rc, not Arc).
 fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> Table {
     let p = if durable {
         RecoverySource::SalReplay
@@ -169,7 +165,7 @@ proptest! {
         let (original, _) = arb_batch(&schema, rows, seed);
 
         table.ingest_owned_batch(original.clone_batch()).unwrap();
-        if durable { table.flush() } else { table.flush_to_ram() }.unwrap();
+        if durable { table.flush() } else { table.fold_to_ram() }.unwrap();
 
         let expected = zset_of(&original, &schema);
 
@@ -288,13 +284,11 @@ proptest! {
             table.flush().unwrap();
         }
         // Registering the WAVES'th shard crosses `l0.len() > 4`, so the flush
-        // loop itself compacted. A compaction output carries the `_P` part
-        // marker; the count is not fixed (L0 -> L1 emits one shard per guard).
-        let compacted = std::fs::read_dir(dir.path().join("cp")).unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains("_P"))
-            .count();
-        prop_assert!(compacted > 0, "WAVES flushes must have driven an L0->L1 compaction");
+        // loop itself compacted into guards below L0.
+        prop_assert!(
+            table.level_shape().1.iter().sum::<usize>() > 0,
+            "WAVES flushes must have driven an L0->L1 compaction"
+        );
 
         let expected = zset_of(&original, &schema);
         prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));

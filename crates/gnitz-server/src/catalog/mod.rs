@@ -112,4 +112,7 @@ pub(crate) struct CatalogEngine {
     /// the zone's broadcast and the undo log `compensate_stage_a` replays.
     /// `ddl_sync` never enqueues.
     pub(in crate::catalog) pending_broadcasts: Vec<(SysFamily, Batch)>,
+    /// The newest SAL zone applied to the system families; every system flush
+    /// records it as its replay floor.
+    pub(in crate::catalog) system_zone: u64,
 }

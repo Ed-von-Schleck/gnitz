@@ -24,8 +24,8 @@ use std::time::Duration;
 use super::avi::{avi_batch, AviBake};
 use super::plan::ReducePlan;
 use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
-use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
-use crate::test_support::{bench_time, bench_time_each};
+use crate::storage::Batch;
+use crate::test_support::{bench_time, bench_time_each, scratch_table};
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
@@ -170,13 +170,7 @@ fn decompose(label: &str, bake: AviBake, input: Batch) {
     let full = bench_time_each(
         ITERS,
         || {
-            let mut t = Table::new(
-                tmp.path().to_str().unwrap(),
-                avi_schema,
-                RecoverySource::Rederive { resume_at: None },
-                StoreBudgets::default(),
-            )
-            .unwrap();
+            let mut t = scratch_table(tmp.path().to_str().unwrap(), avi_schema);
             t.set_memtable_budget(memtable_budget());
             t
         },

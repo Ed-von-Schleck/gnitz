@@ -174,7 +174,7 @@ def test_an_acked_create_index_survives_a_crash(own_server):
     """A CREATE INDEX acknowledged after a checkpoint of FK-heavy tables still
     serves after a crash."""
     # A tiny threshold so the DDL broadcasts below make the first INSERT's
-    # committer cycle run a checkpoint, persisting the drifted watermark.
+    # committer cycle run a checkpoint.
     own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "1024"})
     with gnitz.connect(own_server.sock_path) as conn:
         conn.create_schema("idxcrash")

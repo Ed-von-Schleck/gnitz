@@ -42,12 +42,12 @@ fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, 
     })
 }
 
-/// Stage every committed DdlSync group above its family's flushed LSN into the
+/// Stage every committed DdlSync group above its family's replay floor into the
 /// system stores.
 fn stage_system_tail(tail: CommittedTail, catalog: &mut UnreplayedCatalog) -> Result<(), String> {
-    let family_lsns = catalog.system_flushed_lsns();
+    let floors = catalog.system_replay_floors();
     let mine = |msg: &SalMessage| {
-        msg.kind == SalMessageKind::DdlSync && family_lsns.get(&(msg.target_id as i64)).is_some_and(|&f| msg.lsn > f)
+        msg.kind == SalMessageKind::DdlSync && floors.get(&(msg.target_id as i64)).is_some_and(|&f| msg.lsn > f)
     };
 
     let mut replayed: u32 = 0;
@@ -375,7 +375,7 @@ fn run_worker_child(
 }
 
 /// The master's half of recovery before any worker exists: the sweep set every
-/// worker inherits, and a zone-LSN seed above every system-family counter.
+/// worker inherits, and the zone-LSN seed: the newest zone the system families hold.
 fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<i64>, u64), String> {
     // G → G+1, the resume generation left at G: until `boot_checkpoint`
     // restamps at G+1, a crash rebuilds every view instead of resuming it.
@@ -401,7 +401,7 @@ fn master_pre_fork_recovery(catalog: &mut CatalogEngine) -> Result<(Vec<i64>, u6
     // workers that do not exist yet.
     catalog.compute_invalid_views();
 
-    let lsn_seed = catalog.registry.max_system_lsn();
+    let lsn_seed = catalog.system_zone();
     Ok((swept_base_tables(catalog), lsn_seed))
 }
 

@@ -185,7 +185,7 @@ pub(crate) struct ShardWriteOpts {
 impl ShardWriteOpts {
     /// The compaction write policy: FoR-packed integer payload regions. The
     /// differential-test oracles reuse it so they cannot drift from the
-    /// production write; compaction itself overrides `skip_pk_filter` per call.
+    /// production write; the shard index overrides `skip_pk_filter` per store.
     pub(crate) const COMPACTION: Self = ShardWriteOpts {
         pack_ints: true,
         skeleton: false,
@@ -193,10 +193,28 @@ impl ShardWriteOpts {
     };
 }
 
-/// The single-payload-column test shard writer: build a `Batch` through the typed
-/// row API and hand it to the production [`Batch::write_as_shard`], so region
-/// *order* has a single owner. Rows are `(opk_bytes, weight, i64_payload)`.
-/// Several I64 payload columns go through [`write_i64_shard`].
+/// The single-payload-column test batch: built through the typed row API, so
+/// region *order* has a single owner. Rows are `(opk_bytes, weight, i64_payload)`.
+#[cfg(test)]
+pub(in crate::storage) fn test_batch(schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, i64)]) -> Batch {
+    // One payload column is written, so a wider schema would leave later regions
+    // short of `count` and produce a shard the reader cannot make sense of.
+    debug_assert_eq!(
+        schema.num_payload_cols(),
+        1,
+        "test_batch fills exactly one payload column"
+    );
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    for (pk, w, v) in rows {
+        b.begin_row(pk, *w);
+        b.extend_col(0, &v.to_le_bytes());
+        b.commit_row(0);
+    }
+    b
+}
+
+/// [`test_batch`] handed to the production [`Batch::write_as_shard`]. Several I64
+/// payload columns go through [`write_i64_shard`].
 #[cfg(test)]
 pub(in crate::storage) fn write_test_shard(
     path: &std::path::Path,
@@ -204,21 +222,8 @@ pub(in crate::storage) fn write_test_shard(
     rows: &[(Vec<u8>, i64, i64)],
     opts: ShardWriteOpts,
 ) -> String {
-    // One payload column is written, so a wider schema would leave later regions
-    // short of `count` and produce a shard the reader cannot make sense of.
-    debug_assert_eq!(
-        schema.num_payload_cols(),
-        1,
-        "write_test_shard fills exactly one payload column"
-    );
-    let mut b = super::batch::Batch::with_capacity(schema, rows.len().max(1));
-    for (pk, w, v) in rows {
-        b.begin_row(pk, *w);
-        b.extend_col(0, &v.to_le_bytes());
-        b.commit_row(0);
-    }
     let path = path.to_str().unwrap().to_owned();
-    b.write_as_shard(&path, opts).unwrap();
+    test_batch(schema, rows).write_as_shard(&path, opts).unwrap();
     path
 }
 

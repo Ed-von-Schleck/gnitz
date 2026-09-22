@@ -9,9 +9,8 @@
 //! accumulator cap.
 
 use super::super::batch::Batch;
-use super::{RecoverySource, StoreBudgets, Table};
 use crate::schema::SchemaDescriptor;
-use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, scratch_table};
 
 /// One delta of `n` rows at consecutive PKs from `base`, all weight +1. Raw, not
 /// `Consolidated`: certifying it would short-circuit `into_consolidated` and the
@@ -33,13 +32,7 @@ fn delta_ingest_bench() {
     // Untimed warmup: thread-local batch pool + arena.
     {
         let dir = tempfile::tempdir().unwrap();
-        let mut t = Table::new(
-            dir.path().join("warm").to_str().unwrap(),
-            schema,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap();
+        let mut t = scratch_table(dir.path().join("warm").to_str().unwrap(), schema);
         for k in 0..8 {
             t.ingest_owned_batch(make_delta(&schema, k * 1000, 1000)).unwrap();
         }
@@ -74,19 +67,13 @@ fn delta_ingest_bench() {
 
         // Phase B — the store ingest, into a table that grows across the run.
         let dir = tempfile::tempdir().unwrap();
-        let mut table = Table::new(
-            dir.path().join(format!("ingest{id}")).to_str().unwrap(),
-            schema,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap();
+        let mut table = scratch_table(dir.path().join(format!("ingest{id}")).to_str().unwrap(), schema);
         let t1 = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
             // Drain per tick, so this measures the RAM-tier fold rather than the
             // memtable absorbing the whole run. Not what the worker does.
-            table.flush_to_ram().unwrap();
+            table.fold_to_ram().unwrap();
         }
         let ingest_ns = t1.elapsed().as_nanos() as f64;
         let runs = table.ram_tier.len();
@@ -123,17 +110,11 @@ fn delta_ingest_bench() {
             batches.push(make_delta(&schema, (j * n) as u64, n));
         }
         let dir = tempfile::tempdir().unwrap();
-        let mut table = Table::new(
-            dir.path().join(format!("q{id}")).to_str().unwrap(),
-            schema,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap();
+        let mut table = scratch_table(dir.path().join(format!("q{id}")).to_str().unwrap(), schema);
         let t = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
-            table.flush_to_ram().unwrap();
+            table.fold_to_ram().unwrap();
         }
         let ns = t.elapsed().as_nanos() as f64;
         black_box(&table);
@@ -181,17 +162,11 @@ fn delta_ingest_bench() {
             batches.push(make_batch_raw(&schema, &rows));
         }
         let dir = tempfile::tempdir().unwrap();
-        let mut table = Table::new(
-            dir.path().join(format!("c{id}")).to_str().unwrap(),
-            schema,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap();
+        let mut table = scratch_table(dir.path().join(format!("c{id}")).to_str().unwrap(), schema);
         let t = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
-            table.flush_to_ram().unwrap();
+            table.fold_to_ram().unwrap();
         }
         let ns = t.elapsed().as_nanos() as f64;
         black_box(&table);

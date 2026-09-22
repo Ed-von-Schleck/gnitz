@@ -1,7 +1,8 @@
 //! In-memory FLSM index state + the compaction trigger/orchestration for
-//! [`ShardIndex`]: shard insertion, PK probes, the `should_compact`
-//! trigger, and `run_compact` — the L0→L1 fold, the byte targets every level's
-//! guard partition is held at, and the vertical drain into the terminal level.
+//! [`ShardIndex`]: the one shard writer, PK probes, the post-spill upkeep
+//! (`maintain`), and `run_compact` — the L0→L1 fold, the byte targets every
+//! level's guard partition is held at, and the vertical drain into the terminal
+//! level.
 
 use std::fs;
 use std::rc::Rc;
@@ -10,6 +11,7 @@ use super::super::batch::Batch;
 use super::super::compact;
 use super::super::error::StorageError;
 use super::super::merge::ColumnarSource;
+use super::super::naming;
 use super::super::shard_file::ShardWriteOpts;
 use super::super::shard_reader::MappedShard;
 use super::{
@@ -39,12 +41,42 @@ impl ShardIndex {
         )
     }
 
-    /// Open `path` and append it to the L0 tier. The entry registers unpublished,
-    /// so it is in the next barrier's fdatasync sweep by construction.
-    pub(crate) fn add_unsynced_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
-        let entry = ShardEntry::open(path, &self.schema, max_lsn, false)?;
+    /// Write `batch` as an unpublished shard named by a fresh seq. `newest`
+    /// defaults to that seq.
+    pub(super) fn write_shard(
+        &mut self,
+        batch: &Batch,
+        opts: ShardWriteOpts,
+        newest: Option<u64>,
+    ) -> Result<ShardEntry, StorageError> {
+        self.shard_seq += 1;
+        let seq = self.shard_seq;
+        let path = naming::shard_path(&self.output_dir, seq);
+        batch.write_as_shard(
+            &path,
+            ShardWriteOpts {
+                skip_pk_filter: self.skip_pk_filter,
+                ..opts
+            },
+        )?;
+        ShardEntry::open(&path, &self.schema, seq, newest.unwrap_or(seq), false).inspect_err(|_| {
+            let _ = fs::remove_file(&path);
+        })
+    }
+
+    /// Append `run` to L0 as one unpublished shard: the spill.
+    pub(crate) fn append_l0_run(&mut self, run: &Batch) -> Result<(), StorageError> {
+        let entry = self.write_shard(run, ShardWriteOpts::default(), None)?;
         self.l0.push(entry);
         Ok(())
+    }
+
+    /// The disk tier's upkeep after a spill.
+    pub(crate) fn maintain(&mut self) -> Result<(), StorageError> {
+        if self.l0.len() > L0_COMPACT_THRESHOLD {
+            self.run_compact()?;
+        }
+        self.enforce_capacity()
     }
 
     /// Write `run` as one unpublished shard at the terminal level, under a new
@@ -60,29 +92,12 @@ impl ShardIndex {
             terminal.guards.last().is_none_or(|g| g.key_extent().1 < first),
             "a terminal run ascends past every key its level holds"
         );
-        self.compact_seq += 1;
-        let name = super::super::naming::compact_shard_name(self.compact_seq, 0);
-        let path = format!("{}/{name}", self.output_dir);
-        run.write_as_shard(
-            &path,
-            ShardWriteOpts {
-                skip_pk_filter: self.skip_pk_filter,
-                ..ShardWriteOpts::COMPACTION
-            },
-        )?;
-        let entry = ShardEntry::open(&path, &self.schema, 0, false).inspect_err(|_| {
-            let _ = fs::remove_file(&path);
-        })?;
+        let entry = self.write_shard(run, ShardWriteOpts::COMPACTION, None)?;
         self.l0_run_bytes = self.l0_run_bytes.max(entry.shard.file_len());
         self.levels[TERMINAL_LEVEL_IDX]
             .guards
             .push(LevelGuard { guard_key: first, entries: vec![entry] });
         Ok(())
-    }
-
-    /// Derived, not cached: the L0 tier crossed its compaction threshold.
-    pub(crate) fn should_compact(&self) -> bool {
-        self.l0.len() > L0_COMPACT_THRESHOLD
     }
 
     /// Every live shard no published manifest names yet.
@@ -175,42 +190,8 @@ impl ShardIndex {
         }
     }
 
-    pub(crate) fn max_lsn(&self) -> u64 {
-        self.all_entries().map(|e| e.max_lsn).max().unwrap_or(0)
-    }
-
-    /// Open every just-compacted output shard. On any failure, unlink all
-    /// outputs so a failed compaction leaves no orphan on disk for the running
-    /// session; callers mutate index state only after every open succeeded.
-    fn open_outputs(
-        &self,
-        outputs: &[(PkBuf, String)],
-        max_lsn: u64,
-    ) -> Result<Vec<(PkBuf, ShardEntry)>, StorageError> {
-        let mut opened = Vec::with_capacity(outputs.len());
-        for (gk, filename) in outputs {
-            // Unswept, like any other new shard: a crash before the sweep leaves
-            // the last-published manifest on the still-present inputs, so an
-            // unswept output is only ever an orphan.
-            match ShardEntry::open(filename, &self.schema, max_lsn, false) {
-                Ok(entry) => opened.push((*gk, entry)),
-                Err(e) => {
-                    for (_, f) in outputs {
-                        let _ = fs::remove_file(f);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        Ok(opened)
-    }
-
     /// One compaction's input set: a handle on each entry's mapping under
-    /// `schema`, their LSN watermark, and their registered bytes.
-    ///
-    /// The watermark is one derivation because `Table::new` seeds
-    /// `current_lsn = max_lsn() + 1`: a watermark below an input's would let a
-    /// later spill reuse a live shard's name.
+    /// `schema`, their newest stamp, and their registered bytes.
     fn compaction_inputs<'a>(
         entries: impl IntoIterator<Item = &'a ShardEntry>,
         schema: &SchemaDescriptor,
@@ -218,7 +199,7 @@ impl ShardIndex {
         let mut inputs = CompactionInputs::default();
         for e in entries {
             inputs.shards.push(e.shard.rebind(schema)?);
-            inputs.max_lsn = inputs.max_lsn.max(e.max_lsn);
+            inputs.newest = inputs.newest.max(e.newest);
             inputs.bytes += e.shard.file_len();
         }
         Ok(inputs)
@@ -228,8 +209,7 @@ impl ShardIndex {
     /// `guards` as [`compact::merge_and_route`] defines them, then retire the
     /// entries `drop_sources` removes. Answers how many output shards it wrote.
     ///
-    /// Nothing is mutated until every output shard has been written *and*
-    /// reopened, so a failure leaves the index exactly as it was.
+    /// A failure registers nothing and unlinks every output it wrote.
     fn compact_into(
         &mut self,
         inputs: CompactionInputs,
@@ -238,21 +218,18 @@ impl ShardIndex {
         kind: CompactionKind,
         drop_sources: impl FnOnce(&mut Self) -> Vec<ShardEntry>,
     ) -> Result<usize, StorageError> {
-        let CompactionInputs { shards, max_lsn, bytes: in_bytes } = inputs;
-        self.compact_seq += 1;
-        let compact_seq = self.compact_seq;
-
-        let outputs = compact::merge_and_route(
-            &shards,
-            guards,
-            &self.schema,
-            compact::Output {
-                dir: &self.output_dir,
-                compact_seq,
-                skip_pk_filter: self.skip_pk_filter,
-            },
-        )?;
-        let opened = self.open_outputs(&outputs, max_lsn)?;
+        let CompactionInputs { shards, newest, bytes: in_bytes } = inputs;
+        let schema = self.schema;
+        let mut opened: Vec<(PkBuf, ShardEntry)> = Vec::with_capacity(guards.len());
+        let merged = compact::merge_and_route(&shards, guards, &schema, |&(guard_key, skeleton), batch| {
+            let opts = ShardWriteOpts { skeleton, ..ShardWriteOpts::COMPACTION };
+            opened.push((guard_key, self.write_shard(&batch, opts, Some(newest))?));
+            Ok(())
+        });
+        if let Err(e) = merged {
+            self.retire(opened.into_iter().map(|(_, entry)| entry));
+            return Err(e);
+        }
         super::cstats::record(
             kind,
             in_bytes,
@@ -351,7 +328,7 @@ impl ShardIndex {
 
     /// The L1 guard whose fold costs least: the narrowest key span, and so the
     /// fewest terminal guards to merge with. Write recency would be degenerate
-    /// here — one L0 fold stamps every destination guard with the same `max_lsn`.
+    /// here — one L0 fold stamps every destination guard with the same `newest`.
     fn cheapest_l1_guard_to_drain(&self) -> Option<usize> {
         let guards = &self.levels[0].guards;
         (0..guards.len()).min_by_key(|&gi| {
@@ -610,7 +587,7 @@ impl ShardIndex {
     /// the push-down runs at most once. The fixpoint across calls is the skeleton
     /// floor — or, for a dropping store, an empty one, since a drop leaves no
     /// residue to stop at.
-    pub(crate) fn enforce_capacity(&mut self) -> Result<(), StorageError> {
+    pub(super) fn enforce_capacity(&mut self) -> Result<(), StorageError> {
         let Some(cap) = self.budget.cap() else {
             return Ok(());
         };
@@ -622,7 +599,7 @@ impl ShardIndex {
                 .iter()
                 .enumerate()
                 .filter(|(_, g)| !g.dehydrated())
-                .min_by_key(|(_, g)| g.newest_lsn())
+                .min_by_key(|(_, g)| g.newest())
                 .map(|(gi, _)| gi);
             if let Some(gi) = victim {
                 match self.budget {

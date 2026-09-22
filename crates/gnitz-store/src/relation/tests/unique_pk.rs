@@ -1,7 +1,7 @@
 use super::enforce_unique_pk;
 use crate::schema::TypeCode;
-use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
-use crate::test_support::{make_batch_opk, opk_pk, pk_payload_schema, wide_row};
+use crate::storage::Batch;
+use crate::test_support::{make_batch_opk, opk_pk, pk_payload_schema, scratch_table, wide_row};
 use gnitz_expr::RowSource;
 
 /// `enforce_unique_pk` keys its intra-batch state, its store probe and the
@@ -66,13 +66,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
         let name = case.name;
         let schema = pk_payload_schema(case.pk_types);
         let dir = tempfile::tempdir().unwrap();
-        let mut pt = Table::new(
-            dir.path().to_str().unwrap(),
-            schema,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap();
+        let mut pt = scratch_table(dir.path().to_str().unwrap(), schema);
 
         let k1 = opk_pk(&schema, case.k1);
         let k2 = opk_pk(&schema, case.k2);
@@ -139,13 +133,7 @@ fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
 
     // A store holding exactly one row, at k0.
     let dir = tempfile::tempdir().unwrap();
-    let mut pt = Table::new(
-        dir.path().to_str().unwrap(),
-        schema,
-        RecoverySource::Rederive { resume_at: None },
-        StoreBudgets::default(),
-    )
-    .unwrap();
+    let mut pt = scratch_table(dir.path().to_str().unwrap(), schema);
     let seed = enforce_unique_pk(&pt, &schema, make_batch_opk(&schema, &[(&key(0), 1, 700)]));
     pt.ingest_owned_batch(seed).unwrap();
 

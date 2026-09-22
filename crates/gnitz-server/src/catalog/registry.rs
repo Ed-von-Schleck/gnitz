@@ -194,7 +194,7 @@ impl CatalogEngine {
     /// in one barrier.
     pub(crate) fn flush_all_system_tables(&mut self) -> Result<(), String> {
         self.set_sequence(SEQ_ID_NEXT_ID, self.next_id as u64)?;
-        Ok(self.registry.checkpoint_system()?)
+        Ok(self.registry.checkpoint_system(self.system_zone)?)
     }
 
     /// Load the next catalog id stored in `_sequences`, and latch the registry's

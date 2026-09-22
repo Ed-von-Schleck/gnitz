@@ -50,7 +50,8 @@ fn batch_sync_waits_out_a_short_submit() {
     assert!(r.submission().is_empty(), "every SQE was submitted");
     assert!(r.completion().is_empty(), "every CQE was reaped");
 
-    batch_sync(&mut ring, &files, DATASYNC).expect("a second batch on the same ring");
+    batch_sync_with(&mut ring, &files, DATASYNC, |r, want| r.submit_and_wait(want))
+        .expect("a second batch on the same ring");
 }
 
 /// Two full chunks plus a tail, through one ring.

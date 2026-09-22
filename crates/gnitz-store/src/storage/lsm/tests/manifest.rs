@@ -6,15 +6,14 @@ use gnitz_wire::write_u64_le;
 /// 8-byte guard key), so every field shape round-trips.
 fn sample(count: usize) -> Manifest {
     Manifest {
-        compact_seq: 11,
-        checkpoint_gen: 5,
+        stamp: ManifestStamp { checkpoint_gen: 5, replay_floor: 11 },
         run_bytes: 9 << 20,
         entries: (0..count)
             .map(|i| {
                 let level = (i % 2) as u64;
                 ManifestEntry {
-                    name: format!("shard_{i}.db"),
-                    max_lsn: 100 + i as u64,
+                    seq: 200 + i as u64,
+                    newest: 100 + i as u64,
                     level,
                     guard_key: if level == 0 {
                         PkBuf::zeroed(0)
@@ -85,7 +84,7 @@ fn trailing_bytes_report_checksum_mismatch() {
 
 #[test]
 fn every_byte_past_the_identity_is_inside_the_digest() {
-    // Names, levels, guard keys, LSNs and the header counters have no other
+    // Seqs, levels, guard keys, stamps and the header words have no other
     // check, so the sweep is over every byte rather than a chosen few.
     let mut buf = encode(&sample(3));
     let span = IDENTITY..buf.len();
@@ -106,7 +105,7 @@ fn read_roundtrips_a_prepared_manifest() {
 
     for count in [0usize, 3] {
         let m = sample(count);
-        // The barrier's `flush_commit` step, minus the fsyncs a round-trip does
+        // The barrier's publish step, minus the fsyncs a round-trip does
         // not observe.
         prepare(d, &encode(&m)).unwrap().commit().unwrap();
         assert_eq!(read(d).unwrap(), Some(m), "count={count}");

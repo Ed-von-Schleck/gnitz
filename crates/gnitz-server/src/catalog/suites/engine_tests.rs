@@ -97,7 +97,7 @@ fn test_orphaned_metadata_recovery() {
                 ),
             )
             .unwrap();
-        let _ = engine.registry.checkpoint_system();
+        let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
     }
 
@@ -180,7 +180,7 @@ fn test_user_sequence_durable_roundtrip() {
         assert_eq!(base, 1);
         engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
         assert_eq!(engine.sequence_value(user_seq), Some(64));
-        let _ = engine.registry.checkpoint_system();
+        let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -293,8 +293,8 @@ fn test_sequence_gap_recovery() {
         write_col_tab_row(&mut cbb, &col_def("id", TypeCode::U64).col_tab_row(250, 0), 1);
         engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
-        let _ = engine.registry.checkpoint_system();
-        let _ = engine.registry.checkpoint_system();
+        let _ = engine.registry.checkpoint_system(engine.system_zone);
+        let _ = engine.registry.checkpoint_system(engine.system_zone);
         engine.close();
     }
 
@@ -424,7 +424,7 @@ fn test_ddl_sync() {
     bb.begin_row(100u128, 1); // sid=100
     bb.put_string("synced");
     bb.end_row();
-    engine.ddl_sync(SCHEMA_TAB_ID, 0, bb.finish()).unwrap();
+    engine.ddl_sync(SCHEMA_TAB_ID, bb.finish()).unwrap();
 
     // Hooks should have registered the schema
     assert!(engine.has_schema("synced"));
@@ -433,64 +433,39 @@ fn test_ddl_sync() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── zone_pins_survive_a_flush_and_reopen ─────────────────────────────
+// ── the_newest_applied_zone_is_every_familys_replay_floor ──────────────
 
+/// `close` also writes the next-id `_sequences` row outside any zone, which must
+/// not move a floor.
 #[test]
-fn zone_pins_survive_a_flush_and_reopen() {
-    // Invariant: `pin_queued_to_zone` pins every family a zone applied to that
-    // zone's LSN, and the pin is what the families flush — so after a reopen
-    // `system_flushed_lsns` still dedups every zone recovery would replay.
-    use crate::catalog::sys_tables::{COL_TAB_ID, SCHEMA_TAB_ID, TABLE_TAB_ID};
+fn the_newest_applied_zone_is_every_familys_replay_floor() {
+    use crate::catalog::sys_tables::TABLE_TAB_ID;
 
     let dir = temp_dir("catalog_zone_lsn");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let current =
-        |engine: &CatalogEngine, id: i64| engine.registry.relation_or_err(id).map_or(0, Relation::current_lsn);
+    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
 
-    // Zone 5: create a schema. SCHEMA_TAB pinned to lsn=5.
     let _ = engine.drain_pending_broadcasts();
     engine.create_schema("z").unwrap();
-    engine.pin_queued_to_zone(5);
-    assert_eq!(current(&engine, SCHEMA_TAB_ID), 5);
-
-    // Zone 7: create a table. TABLE_TAB and COL_TAB pinned to lsn=7;
-    // SCHEMA_TAB stays at 5 (untouched in this zone).
+    engine.mark_zone_applied(5);
     let _ = engine.drain_pending_broadcasts();
-    let cols = vec![col_def("id", TypeCode::U64), col_def("val", TypeCode::U64)];
     engine.create_table("z.t", &cols, &[0]).unwrap();
-    engine.pin_queued_to_zone(7);
-    assert_eq!(current(&engine, TABLE_TAB_ID), 7);
-    assert_eq!(current(&engine, COL_TAB_ID), 7);
-    assert_eq!(
-        current(&engine, SCHEMA_TAB_ID),
-        5,
-        "SCHEMA_TAB stays at the most recent zone that touched it"
-    );
-
-    // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
+    engine.mark_zone_applied(7);
     let _ = engine.drain_pending_broadcasts();
     engine.create_table("z.t2", &cols, &[0]).unwrap();
-    engine.pin_queued_to_zone(9);
-    assert_eq!(current(&engine, TABLE_TAB_ID), 9);
-    assert_eq!(current(&engine, COL_TAB_ID), 9);
-
-    // system_flushed_lsns covers every system table, and only those.
-    let map = engine.registry.system_flushed_lsns();
-    assert_eq!(map.get(&SCHEMA_TAB_ID), Some(&5));
-    assert_eq!(map.get(&TABLE_TAB_ID), Some(&9));
-    assert_eq!(map.get(&COL_TAB_ID), Some(&9));
-    assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
-    // max_system_lsn is at least the highest zone LSN observed.
-    assert!(engine.registry.max_system_lsn() >= 9);
+    engine.mark_zone_applied(9);
+    assert_eq!(engine.system_zone, 9);
 
     engine.close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let map = engine.registry.system_flushed_lsns();
-    assert!(map[&TABLE_TAB_ID] >= 9, "TABLE_TAB's flush must carry zone 9: {map:?}");
+    let map = engine.registry.system_replay_floors();
+    assert!(map.contains_key(&TABLE_TAB_ID));
+    assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
     assert!(
-        map[&SCHEMA_TAB_ID] >= 5,
-        "SCHEMA_TAB's flush must carry zone 5: {map:?}"
+        map.values().all(|&floor| floor == 9),
+        "every family flushed zone 9: {map:?}"
     );
+    assert_eq!(engine.system_zone, 9);
 
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
@@ -498,27 +473,23 @@ fn zone_pins_survive_a_flush_and_reopen() {
 
 // ── replayed_ddl_sync_group_is_not_replayed_after_a_flush ────────────
 
-/// A DdlSync group recovery re-applies must pin its family like a live zone does:
-/// a crash between the boot flush and the SAL reset replays the tail again, and
-/// only a flushed LSN at or above the group's keeps it from applying twice.
+/// A crash between the boot flush and the SAL reset replays the tail again; the
+/// flushed floor is what keeps a re-applied group from applying twice.
 #[test]
 fn replayed_ddl_sync_group_is_not_replayed_after_a_flush() {
     let dir = temp_dir("catalog_ddl_sync_pin");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let mut unreplayed = CatalogEngine::open_master(&dir, 1).unwrap();
 
     let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     bb.begin_row(100u128, 1);
     bb.put_string("synced");
     bb.end_row();
-    engine.ddl_sync(SCHEMA_TAB_ID, 500, bb.finish()).unwrap();
+    unreplayed.stage(SCHEMA_TAB_ID, 500, bb.finish()).unwrap();
 
-    engine.close();
+    unreplayed.replay().unwrap().close();
     let engine = CatalogEngine::open(&dir, 1).unwrap();
-    let flushed = engine.registry.system_flushed_lsns()[&SCHEMA_TAB_ID];
-    assert!(
-        flushed >= 500,
-        "the flushed SCHEMA_TAB must dedup the group at lsn 500, got {flushed}"
-    );
+    let flushed = engine.registry.system_replay_floors()[&SCHEMA_TAB_ID];
+    assert_eq!(flushed, 500, "the flushed SCHEMA_TAB must dedup the group at lsn 500");
     assert!(engine.has_schema("synced"));
 
     drop(engine);
@@ -539,7 +510,6 @@ fn test_master_holds_no_user_store() {
     assert!(!engine.registry.residency().owns_stores());
     let entry = engine.registry.relation_or_err(tid).unwrap();
     assert!(!entry.cursor().valid, "the master's copy of a user store reads empty");
-    assert_eq!(entry.current_lsn(), 0);
     for family in [SysFamily::Schema, SysFamily::Table, SysFamily::Column] {
         assert!(
             engine.sys_relation(family).cursor().valid,

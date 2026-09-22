@@ -81,13 +81,10 @@ impl CatalogEngine {
         self.fire_hooks(family, &applied)
     }
 
-    /// Apply one DdlSync group and pin its family to the group's zone LSN. Never
-    /// queues.
-    pub(crate) fn ddl_sync(&mut self, table_id: i64, zone_lsn: u64, batch: Batch) -> Result<(), String> {
+    /// Apply one DdlSync group. Never queues.
+    pub(crate) fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
-        self.apply_family(family, batch)?;
-        self.registry.pin_lsn(table_id, zone_lsn);
-        Ok(())
+        self.apply_family(family, batch)
     }
 
     // -- System table accessors ------------------------------------------------
@@ -99,15 +96,17 @@ impl CatalogEngine {
             .expect("every system family is registered at open")
     }
 
-    // -- Broadcast queue, zone pin, directory sweep -----------------------------
+    // -- Broadcast queue, applied zone, directory sweep -------------------------
 
-    /// Pin every queued family to `zone_lsn`. Called before anything awaits: a
-    /// checkpoint round holding a `SalExcl` can flush the system tables before the
-    /// zone is emitted.
-    pub(crate) fn pin_queued_to_zone(&mut self, zone_lsn: u64) {
-        for (family, _) in &self.pending_broadcasts {
-            self.registry.pin_lsn(family.id(), zone_lsn);
-        }
+    /// Record that the system families hold every row of zone `zone_lsn`, before
+    /// awaiting the SAL: a checkpoint holding it flushes with this floor.
+    pub(crate) fn mark_zone_applied(&mut self, zone_lsn: u64) {
+        self.system_zone = self.system_zone.max(zone_lsn);
+    }
+
+    /// The newest SAL zone applied to the system families.
+    pub(crate) fn system_zone(&self) -> u64 {
+        self.system_zone
     }
 
     /// Catalog families are applied in memory but not yet committed to the SAL.

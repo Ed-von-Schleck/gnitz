@@ -20,7 +20,7 @@ mod circuit_state;
 mod dirs;
 mod ingest;
 mod store;
-mod store_lsn;
+mod store_lifecycle;
 mod unique_pk;
 
 pub use circuit_state::{CircuitState, StateIdx, StateLayout};
@@ -317,11 +317,6 @@ impl Relation {
     /// The net weight at `key`, and the live row if there is one.
     pub fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
         self.store.live_row_at(key)
-    }
-
-    /// This relation's store LSN counter; `0` where this process holds no store.
-    pub fn current_lsn(&self) -> u64 {
-        self.store.current_lsn()
     }
 
     /// Whether this store came back from a checkpoint manifest at its open.

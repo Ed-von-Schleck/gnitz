@@ -5,23 +5,22 @@ use std::collections::HashSet;
 
 use super::STAGING_SUFFIX;
 
-/// Basename prefix both grammars share.
+/// Every shard basename's prefix.
 pub(super) const SHARD_PREFIX: &str = "shard_";
 
-/// Flat spill/barrier shard basename: `shard_{lsn}.db`.
-pub(super) fn spill_shard_name(lsn: u64) -> String {
-    format!("{SHARD_PREFIX}{lsn}.db")
+/// The basename of the shard drawn at `seq`: `shard_{seq}.db`.
+pub(super) fn shard_name(seq: u64) -> String {
+    format!("{SHARD_PREFIX}{seq}.db")
 }
 
-/// Compaction-output shard basename: `shard_{seq}_P{part}.db`. `compact_seq`
-/// never repeats within a store: the manifest carries it across a restart.
-pub(super) fn compact_shard_name(compact_seq: u64, part: usize) -> String {
-    format!("{SHARD_PREFIX}{compact_seq}_P{part}.db")
+/// The path of the shard drawn at `seq` in the store at `dir`.
+pub(super) fn shard_path(dir: &str, seq: u64) -> String {
+    format!("{dir}/{}", shard_name(seq))
 }
 
 /// Remove every staging file and every shard not in `keep` from `dir`,
 /// best-effort.
-pub(super) fn remove_stale_files(dir: &str, keep: &HashSet<&str>) {
+pub(super) fn remove_stale_files(dir: &str, keep: &HashSet<String>) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             if let Some(name) = entry.file_name().to_str() {

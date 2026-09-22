@@ -19,7 +19,6 @@ use super::seek::pk_group_end;
 use super::shard_index::{ShardBudget, ShardIndex};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
-use super::StagedFile;
 use crate::schema::key::{pk_bytes_eq, pk_in_range, pk_ranges_overlap, probe_key, PkBuf};
 use crate::schema::payload_order::{with_payload_cmp, PayloadOrder};
 use crate::schema::SchemaDescriptor;
@@ -83,8 +82,8 @@ impl StoreBudgets {
 /// `Table::new` and the boot rebuild read, so they cannot disagree.
 ///
 /// This controls recovery, not the flush path: between checkpoints every table
-/// keeps its overflow in the RAM tier, and the checkpoint barrier folds it into a
-/// durable shard only for `SalReplay` tables.
+/// keeps its overflow in the RAM tier, and the checkpoint barrier folds this tier
+/// into one durable shard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RecoverySource {
     /// The tail is recovered by replaying the fsynced SAL over the shards loaded
@@ -99,18 +98,6 @@ pub(crate) enum RecoverySource {
         /// verdict turns on more than the generation.
         resume_at: Option<u64>,
     },
-}
-
-// ---------------------------------------------------------------------------
-// Two-phase flush API
-// ---------------------------------------------------------------------------
-
-/// A publish `flush_prepare` staged and `flush_commit` completes.
-pub(in crate::storage) struct FlushWork {
-    pub(in crate::storage) manifest: StagedFile,
-    pub(in crate::storage) bytes: Vec<u8>,
-    /// Fsynced once `manifest` is renamed.
-    pub(in crate::storage) dirs: Vec<std::path::PathBuf>,
 }
 
 /// Index of the first candidate in `pool` (pool order) whose payload group nets
@@ -147,22 +134,23 @@ pub(crate) struct Table {
     /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
     memtable: RunSet,
     /// Flushed runs held in heap instead of on disk. Populated for **every**
-    /// table on ingest overflow (`flush_to_ram`), bounded by
+    /// table on ingest overflow (`fold_to_ram`), bounded by
     /// [`StoreBudgets`]'s RAM-tier ceiling (spill). The checkpoint barrier folds
-    /// this tier into one durable shard for `SalReplay` tables.
+    /// this tier into one durable shard.
     ram_tier: RunSet,
     /// The disk tier, and the one owner of this store's schema and directory.
     shard_index: ShardIndex,
 
     recovery_source: RecoverySource,
 
-    current_lsn: u64,
+    /// The replay floor of the manifest this open loaded; 0 without one.
+    replay_floor: u64,
 
     /// True when this open reloaded a generation-matching checkpointed manifest
     /// instead of starting empty.
     resumed_from_checkpoint: bool,
 
-    /// Set by [`Self::hold_in_ram`]: the RAM tier folds past its budget but never
+    /// Set by [`Self::hold_in_ram`]: the RAM tier grows past its budget and never
     /// persists.
     held_in_ram: bool,
 
@@ -182,6 +170,8 @@ pub(crate) struct Table {
 }
 
 mod flush;
+
+pub(crate) use flush::flush_barrier;
 
 #[cfg(test)]
 mod bench_flush;
@@ -211,7 +201,7 @@ impl Table {
             ram_tier: RunSet::new(budgets.ram_tier_bytes),
             shard_index: ShardIndex::new(dir, schema, budgets.shard, rederived),
             recovery_source,
-            current_lsn: 1,
+            replay_floor: 0,
             resumed_from_checkpoint: false,
             held_in_ram: false,
             retract_scratch: Cell::new(Vec::new()),
@@ -226,7 +216,7 @@ impl Table {
             RecoverySource::Rederive { resume_at: None } => None,
             // Rebuilt from its sources, so damage is erased rather than fatal.
             RecoverySource::Rederive { resume_at: Some(want) } => match super::manifest::read(dir) {
-                Ok(m) => m.filter(|m| m.checkpoint_gen == want),
+                Ok(m) => m.filter(|m| m.stamp.checkpoint_gen == want),
                 Err(e @ StorageError::Io(_)) => return Err(e),
                 Err(_) => None,
             },
@@ -239,7 +229,7 @@ impl Table {
             table.unlink_manifest()?;
         }
         table.shard_index.install(loaded.as_ref())?;
-        table.current_lsn = table.shard_index.max_lsn() + 1;
+        table.replay_floor = loaded.as_ref().map_or(0, |m| m.stamp.replay_floor);
         table.resumed_from_checkpoint = rederived && loaded.is_some();
 
         Ok(table)
@@ -341,31 +331,16 @@ impl Table {
             return Ok(());
         }
         self.cached_full_scan.set(None);
-
-        // `current_lsn` names the next spill/barrier shard.
-        self.current_lsn += 1;
-
         self.memtable.push(Rc::new(batch), &self.shard_index.schema);
         if self.memtable.is_full() {
-            self.flush_to_ram()?;
+            self.fold_to_ram()?;
         }
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    // Flush
-    // ------------------------------------------------------------------
-
-    /// The next-shard LSN counter: seeded `max_lsn + 1` at open, bumped on every
-    /// ingest, raised by [`Self::pin_lsn`].
-    pub(crate) fn current_lsn(&self) -> u64 {
-        self.current_lsn
-    }
-
-    /// Raise the LSN counter to `lsn`. Never lowers it, which would reuse a live
-    /// shard name.
-    pub(crate) fn pin_lsn(&mut self, lsn: u64) {
-        self.current_lsn = self.current_lsn.max(lsn);
+    /// The replay floor of the manifest this open loaded; 0 without one.
+    pub(crate) fn replay_floor(&self) -> u64 {
+        self.replay_floor
     }
 
     // ------------------------------------------------------------------
@@ -584,26 +559,6 @@ impl Table {
         pool.clear();
         self.retract_scratch.set(pool);
         (total_w, row)
-    }
-
-    // ------------------------------------------------------------------
-    // Compaction
-    // ------------------------------------------------------------------
-
-    /// Run L0→L1+ compaction if the disk tier crossed its threshold. Publishes no
-    /// manifest: the barrier is the sole publish point.
-    fn compact_if_needed(&mut self) -> Result<(), StorageError> {
-        if !self.shard_index.should_compact() {
-            return Ok(());
-        }
-        self.shard_index.run_compact()
-    }
-
-    /// The barrier's step once `bytes` is durable: record it, and unlink the
-    /// shards compaction superseded (best-effort; a survivor is retried).
-    pub(super) fn published_durably(&mut self, bytes: Vec<u8>) {
-        self.durable_manifest = Some(bytes);
-        self.shard_index.try_cleanup();
     }
 }
 

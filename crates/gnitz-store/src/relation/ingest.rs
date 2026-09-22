@@ -3,7 +3,7 @@
 
 use super::{Relation, RelationKind, RelationRegistry, SecondaryIndex, Store};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, StorageError, StoreError, Table};
+use crate::storage::{Batch, ManifestStamp, StorageError, StoreError, Table};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
@@ -163,11 +163,11 @@ impl RelationRegistry {
         };
         let feed = entry.delta.as_deref_mut().expect("capture implies a feed");
         if let Err(e) = feed.ingest_owned_batch(stamped) {
-            // Logged, not fatal: the round is captured and the spill retries next
-            // tick, where a restart would erase every retained round instead.
+            // Logged, not fatal: the round is captured and the next spill retries,
+            // where a restart would erase every retained round instead.
             gnitz_error!(
-                "relation: delta-store spill failed (view_id={}, round={}): {} — the round is \
-                 held in RAM and retried on the next tick; the feed is intact",
+                "relation: delta-store spill failed (view_id={}, round={}): {} — the spill or \
+                 its upkeep failed; the next spill retries it; the feed is intact",
                 id,
                 round,
                 e,
@@ -178,13 +178,14 @@ impl RelationRegistry {
 
     // ── Flush / checkpoint collection ───────────────────────────────────
 
-    /// Fold `id`'s store memtable into its RAM tier: no manifest publish, no
+    /// Fold `id`'s store memtable into its RAM tier, which past its ceiling also
+    /// spills it, compacts and runs the capacity sweep: no manifest publish, no
     /// barrier, and nothing of the relation's indexes. Unregistered is an `Err`.
     pub fn fold_to_ram(&mut self, id: i64) -> Result<(), StoreError> {
         let entry = self.relation_mut_or_err(id)?;
         entry
             .store
-            .flush_to_ram()
+            .fold_to_ram()
             .map_err(|e| StoreError::storage(format!("fold relation {id} to RAM"), e))
     }
 
@@ -214,13 +215,17 @@ impl RelationRegistry {
 
     /// The base round: every user store that is not rederived, in one barrier.
     pub fn checkpoint_base(&mut self) -> Result<(), StoreError> {
-        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| !t.is_rederived()), 0)
-            .map_err(|e| StoreError::storage("base flush", e))
+        crate::storage::flush_barrier(
+            self.collect_user_tables().filter(|t| !t.is_rederived()),
+            Default::default(),
+        )
+        .map_err(|e| StoreError::storage("base flush", e))
     }
 
     /// The system round: every system family's store, in one barrier.
-    pub fn checkpoint_system(&mut self) -> Result<(), StoreError> {
-        crate::storage::flush_barrier(self.collect_system_tables(), 0)
+    pub fn checkpoint_system(&mut self, replay_floor: u64) -> Result<(), StoreError> {
+        let stamp = ManifestStamp { replay_floor, ..Default::default() };
+        crate::storage::flush_barrier(self.collect_system_tables(), stamp)
             .map_err(|e| StoreError::storage("system catalog flush", e))
     }
 
@@ -230,11 +235,13 @@ impl RelationRegistry {
         &mut self,
         state: impl IntoIterator<Item = &'s mut crate::relation::CircuitState>,
     ) -> Result<(), StoreError> {
-        let generation = self.resume_generation;
+        let stamp = ManifestStamp {
+            checkpoint_gen: self.resume_generation,
+            ..Default::default()
+        };
         let traces = state.into_iter().flat_map(|s| s.tables_mut());
-        crate::storage::flush_barrier(traces, generation)
-            .map_err(|e| StoreError::storage("ephemeral trace flush", e))?;
-        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| t.is_rederived()), generation)
+        crate::storage::flush_barrier(traces, stamp).map_err(|e| StoreError::storage("ephemeral trace flush", e))?;
+        crate::storage::flush_barrier(self.collect_user_tables().filter(|t| t.is_rederived()), stamp)
             .map_err(|e| StoreError::storage("ephemeral output flush", e))
     }
 }

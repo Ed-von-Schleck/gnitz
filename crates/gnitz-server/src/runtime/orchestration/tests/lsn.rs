@@ -1,15 +1,11 @@
 use super::*;
 
-/// Overlapping reservations get distinct, strictly-monotone zones; a
-/// drifted family counter (floor) lifts the next zone past itself and a
-/// lower floor never lowers one.
+/// Overlapping reservations get distinct, strictly-monotone zones.
 #[test]
-fn reserve_is_monotone_and_dominates_the_floor() {
+fn reserve_is_monotone() {
     let lsns = ZoneLsnAllocator::new(100);
-    assert_eq!(lsns.reserve(0), 101, "first zone is high-water + 1");
-    assert_eq!(lsns.reserve(0), 102, "second zone steps past the first");
-    assert_eq!(lsns.reserve(150), 151, "a drifted floor lifts the zone past it");
-    assert_eq!(lsns.reserve(10), 152, "a low floor never lowers the next zone");
+    assert_eq!(lsns.reserve(), 101, "first zone is high-water + 1");
+    assert_eq!(lsns.reserve(), 102, "second zone steps past the first");
 }
 
 /// Publish is monotone-max: a later zone's fsync completing first must not
@@ -17,7 +13,7 @@ fn reserve_is_monotone_and_dominates_the_floor() {
 #[test]
 fn publish_is_monotone_max() {
     let lsns = ZoneLsnAllocator::new(100);
-    let (a, b) = (lsns.reserve(0), lsns.reserve(0));
+    let (a, b) = (lsns.reserve(), lsns.reserve());
     lsns.publish(b);
     assert_eq!(lsns.published(), b);
     lsns.publish(a);

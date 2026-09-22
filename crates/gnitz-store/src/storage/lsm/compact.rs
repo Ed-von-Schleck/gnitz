@@ -2,16 +2,16 @@
 //! per-guard output shards.
 //!
 //! [`merge_and_route`] orchestrates — verify → merge → route → column-first
-//! scatter → one output shard per guard run.
+//! scatter → one output batch per guard run, handed to the caller to write.
 //! The merge kernel itself is the shared
 //! [`run_merge`](super::merge::run_merge), which owns the (PK, payload) total
 //! order; this module only drives it and materializes survivors.
 
+use super::batch::Batch;
 use super::error::StorageError;
 use super::merge::prorated_blob_cap;
 use super::merge::run_merge;
 use super::scatter::UnifiedSet;
-use super::shard_file::ShardWriteOpts;
 use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
 use crate::schema::SchemaDescriptor;
@@ -55,35 +55,16 @@ fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec
         .collect()
 }
 
-/// Where one compaction's outputs go: the directory and the sequence value
-/// `naming::compact_shard_name` needs, plus whether the store they belong to is ever point-probed by PK. They
-/// travel together and are decided together, by `ShardIndex::compact_into`.
-pub(super) struct Output<'a> {
-    pub dir: &'a str,
-    pub compact_seq: u64,
-    pub skip_pk_filter: bool,
-}
-
-/// Compact `shards` across `guards`: verify every input's body, run the N-way
-/// (PK, payload) merge
-/// into a survivor buffer, route each survivor to its guard, and write one
-/// column-first output shard per non-empty guard into `dest.dir`, named by the
-/// compaction grammar (`naming::compact_shard_name`).
-///
-/// Each destination is a `(guard_key, skeleton)` pair: a set flag writes that
-/// guard's slice as a payload-free skeleton shard (one `(PK, Σweight)` row per
-/// key) under [`skeleton_schema`] instead of the full-width form. A guard whose
-/// keys all cancel writes no shard, skeleton or not.
-///
-/// Returns `(guard_key, path)` per written shard in increasing guard-index order.
-/// On a write error every shard already written this call is removed before
-/// returning `Err` (atomic-or-nothing).
+/// Merge `shards` by (PK, payload) and hand `emit` each `(guard_key, skeleton)`
+/// destination's non-empty slice as one batch, in guard order. A skeleton
+/// destination's batch is one `(PK, Σweight)` row per key, under
+/// [`skeleton_schema`].
 pub(super) fn merge_and_route(
     shards: &[MappedShard],
     guards: &[(PkBuf, bool)],
     schema: &SchemaDescriptor,
-    dest: Output<'_>,
-) -> Result<Vec<(PkBuf, String)>, StorageError> {
+    mut emit: impl FnMut(&(PkBuf, bool), Batch) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
     // An empty guard list would drop every survivor on the floor while the caller
     // went on to clear the source tier — silent data loss, so reject it.
     assert!(!guards.is_empty(), "merge_and_route requires at least one guard");
@@ -116,17 +97,16 @@ pub(super) fn merge_and_route(
         .chain(std::iter::once(survivors.len()))
         .collect();
 
-    // Phase 2 — one shard per guard, each scattered column-at-a-time from its
+    // Phase 2 — one batch per guard, each scattered column-at-a-time from its
     // contiguous survivor slice.
     let set = UnifiedSet::of(shards, schema);
     let nsurv = survivors.len();
-    let mut out: Vec<(PkBuf, String)> = Vec::with_capacity(guards.len());
 
     // Only built when some destination guard is dehydrated; a hydrated store
     // never derives it.
     let skel_schema = guards.iter().any(|&(_, s)| s).then(|| skeleton_schema(schema));
 
-    for (g, &(guard_key, skeleton)) in guards.iter().enumerate() {
+    for (g, dest @ &(_, skeleton)) in guards.iter().enumerate() {
         let bucket = &survivors[bounds[g]..bounds[g + 1]];
         if bucket.is_empty() {
             continue;
@@ -136,11 +116,6 @@ pub(super) fn merge_and_route(
         if folded.as_ref().is_some_and(|f| f.is_empty()) {
             continue;
         }
-        let path = format!(
-            "{}/{}",
-            dest.dir,
-            super::naming::compact_shard_name(dest.compact_seq, g)
-        );
         // A skeleton guard writes its folded rows under the PK-only schema; a
         // hydrated one writes the bucket at full width.
         let (wschema, rows, blob_cap) = match &folded {
@@ -153,12 +128,6 @@ pub(super) fn merge_and_route(
             ),
             None => (schema, bucket, prorated_blob_cap(total_blob, nsurv, bucket.len())),
         };
-        // A zero-payload skeleton schema has no payload region to pack.
-        let opts = ShardWriteOpts {
-            skeleton: folded.is_some(),
-            skip_pk_filter: dest.skip_pk_filter,
-            ..ShardWriteOpts::COMPACTION
-        };
         let mut batch = set.materialize(wschema, rows, blob_cap);
         if folded.is_some() {
             // The fused pass copied the *source's* payload null bits, which mean
@@ -166,18 +135,9 @@ pub(super) fn merge_and_route(
             // `ENCODING_CONSTANT` — 8 bytes for the whole file.
             batch.null_bmp_data_mut().fill(0);
         }
-        let written = batch.write_as_shard(&path, opts);
-        if let Err(e) = written {
-            // Roll back this call's shards so a compaction that cannot finalize
-            // leaves the source tier intact.
-            for (_, f) in &out {
-                let _ = std::fs::remove_file(f);
-            }
-            return Err(e);
-        }
-        out.push((guard_key, path));
+        emit(dest, batch)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

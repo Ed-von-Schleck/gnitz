@@ -7,17 +7,25 @@ use crate::schema::MAX_PK_BYTES;
 use gnitz_wire::{Reader, Writer};
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 13;
+const VERSION: u64 = 14;
 
 const MANIFEST_FILE: &str = "manifest.bin";
+
+/// The words a publish writes beside the shard set, for its caller to read back
+/// at the next open.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ManifestStamp {
+    /// The ephemeral round's resume generation.
+    pub checkpoint_gen: u64,
+    /// The system round's SAL replay floor.
+    pub replay_floor: u64,
+}
 
 /// One store's published shard set and the counters that must survive a
 /// restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Manifest {
-    pub compact_seq: u64,
-    /// The ephemeral round's generation; a base publish stamps 0.
-    pub checkpoint_gen: u64,
+    pub stamp: ManifestStamp,
     /// The shard index's `R`. Stored, not derived: a guard of one distinct key
     /// outgrows `R` and cannot be split, so no shard size recovers it.
     pub run_bytes: u64,
@@ -27,9 +35,10 @@ pub(crate) struct Manifest {
 /// One live shard. Its PK bounds are re-derived at open, so not stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ManifestEntry {
-    /// The shard's basename inside the store's directory.
-    pub name: String,
-    pub max_lsn: u64,
+    /// The seq that names the shard.
+    pub seq: u64,
+    /// The highest seq whose rows the shard holds.
+    pub newest: u64,
     /// 0 = L0.
     pub level: u64,
     /// The guard the shard sits under; width 0 at L0.
@@ -41,14 +50,11 @@ pub(crate) fn encode(m: &Manifest) -> Vec<u8> {
     let mut w = Writer::with_capacity(64 * (1 + m.entries.len()));
     w.u64(MAGIC)
         .u64(VERSION)
-        .u64(m.compact_seq)
-        .u64(m.checkpoint_gen)
+        .u64(m.stamp.checkpoint_gen)
+        .u64(m.stamp.replay_floor)
         .u64(m.run_bytes);
     for e in &m.entries {
-        w.u64(e.max_lsn)
-            .u64(e.level)
-            .bytes32(e.guard_key.pk_bytes())
-            .bytes32(e.name.as_bytes());
+        w.u64(e.seq).u64(e.newest).u64(e.level).bytes32(e.guard_key.pk_bytes());
     }
     let mut buf = w.into_vec();
     let digest = gnitz_wire::checksum(&buf);
@@ -75,21 +81,22 @@ fn decode(buf: &[u8]) -> Result<Manifest, StorageError> {
 
 fn decode_body(r: &mut Reader) -> Result<Manifest, String> {
     let mut m = Manifest {
-        compact_seq: r.u64()?,
-        checkpoint_gen: r.u64()?,
+        stamp: ManifestStamp {
+            checkpoint_gen: r.u64()?,
+            replay_floor: r.u64()?,
+        },
         run_bytes: r.u64()?,
         entries: Vec::new(),
     };
     while r.remaining() > 0 {
-        let (max_lsn, level) = (r.u64()?, r.u64()?);
+        let (seq, newest, level) = (r.u64()?, r.u64()?, r.u64()?);
         let key = r.bytes32()?;
         if key.len() > MAX_PK_BYTES {
             return Err("guard key too wide".into());
         }
-        let name = std::str::from_utf8(r.bytes32()?).map_err(|e| e.to_string())?;
         m.entries.push(ManifestEntry {
-            name: name.to_owned(),
-            max_lsn,
+            seq,
+            newest,
             level,
             guard_key: PkBuf::from_bytes(key),
         });

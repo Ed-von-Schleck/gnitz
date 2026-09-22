@@ -28,7 +28,6 @@ use crate::runtime::reactor::WriteGuard;
 use crate::runtime::sal::SalExcl;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
-use gnitz_store::relation::Relation;
 use gnitz_store::storage::Batch;
 use gnitz_wire::{PkColList, WireFault};
 
@@ -204,11 +203,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
     }
 
     // Reserve the zone LSN but do NOT publish it until fsync confirms
-    // durability. A DDL bundle writes arbitrary system families, so the floor is
-    // `max_system_lsn` — the zone must dominate every system family's counter
-    // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
-    // the zone on recovery).
-    let zone_lsn = shared.lsn_alloc.reserve(shared.cat().registry.max_system_lsn());
+    // durability.
+    let zone_lsn = shared.lsn_alloc.reserve();
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
@@ -272,7 +268,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, body: &[u8]) -> Result<(u64, usize), 
         });
     }
     ingest_res?;
-    shared.cat_mut().pin_queued_to_zone(zone_lsn);
+    shared.cat_mut().mark_zone_applied(zone_lsn);
 
     // SAL emission window: broadcast each queued family under the shared
     // zone_lsn, commit the zone, then fsync. A failure here is unrecoverable —
@@ -384,14 +380,7 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         let mut excl = shared.disp().sal().lock().await;
 
         let (base, delta) = shared.cat().reserve_user_sequence(seq_id, count)?;
-        // Above the counter of `_sequences`, the one family this zone writes.
-        let zone_lsn = shared.lsn_alloc.reserve(
-            shared
-                .cat()
-                .registry
-                .relation(SysFamily::Sequence.id())
-                .map_or(0, Relation::current_lsn),
-        );
+        let zone_lsn = shared.lsn_alloc.reserve();
 
         // A sys_sequences advance is a pure system-table write (no view tick,
         // no rollback); a hook failure on a well-formed 2-row delta is an
@@ -399,7 +388,7 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
             gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
         }
-        shared.cat_mut().pin_queued_to_zone(zone_lsn);
+        shared.cat_mut().mark_zone_applied(zone_lsn);
 
         // SAL emission under the still-held `SalExcl`; the fdatasync SQE is
         // submitted synchronously. Both guards drop as this block ends, before

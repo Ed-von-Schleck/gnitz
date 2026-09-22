@@ -469,8 +469,7 @@ async fn commit_pushes(shared: &Rc<Shared>, mut pushes: Vec<PendingPush>, txns: 
         let disp = shared.disp();
         let mut excl = disp.sal().lock().await;
 
-        // Floor 0: a user-table push pins no system-family counter.
-        let zone_lsn = shared.lsn_alloc.reserve(0);
+        let zone_lsn = shared.lsn_alloc.reserve();
 
         // Nothing laid out inside the scope is visible until it commits, so a
         // transaction that runs out of SAL space part-way can take its earlier

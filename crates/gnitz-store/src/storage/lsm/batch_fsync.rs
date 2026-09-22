@@ -1,6 +1,6 @@
-//! Multi-table durable flush barrier.
+//! Batched fsync of many files: one io_uring submission per chunk, with a
+//! blocking fallback where the host denies io_uring.
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -10,7 +10,6 @@ use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types, IoUring};
 
 use super::super::error::StorageError;
-use super::table::{FlushWork, Table};
 
 /// The fds one sync batch opens, and the ring's SQ size.
 const FD_CHUNK_THRESHOLD: usize = 256;
@@ -20,48 +19,9 @@ const DATASYNC: FsyncFlags = FsyncFlags::DATASYNC;
 /// Set once this host has denied `io_uring_setup`.
 static IO_URING_DENIED: AtomicBool = AtomicBool::new(false);
 
-/// Flush every table in `tables`, stamping each published manifest
-/// `checkpoint_gen`.
-pub(crate) fn flush_barrier<'a>(
-    tables: impl IntoIterator<Item = &'a mut Table>,
-    checkpoint_gen: u64,
-) -> Result<(), StorageError> {
-    let mut work: Vec<(&'a mut Table, FlushWork)> = Vec::new();
-    for t in tables {
-        if let Some(w) = t.flush_prepare(checkpoint_gen)? {
-            work.push((t, w));
-        }
-    }
-    if work.is_empty() {
-        return Ok(());
-    }
-    let mut ring = new_ring()?;
-    // Every unsynced shard and every staged manifest, before any rename.
-    sync_paths(
-        &mut ring,
-        work.iter()
-            .flat_map(|(t, w)| t.unsynced_paths().chain([w.manifest.tmp_path()])),
-        DATASYNC,
-    )?;
-    let mut dirs = BTreeSet::new();
-    let mut published = Vec::with_capacity(work.len());
-    for (t, w) in work {
-        t.flush_commit(w.manifest)?;
-        dirs.extend(w.dirs);
-        published.push((t, w.bytes));
-    }
-    // A rename is metadata: a full fsync, not fdatasync.
-    sync_paths(&mut ring, &dirs, FsyncFlags::empty())?;
-    // Only now can a superseded compaction input go: every manifest naming it is durable.
-    for (t, bytes) in published {
-        t.published_durably(bytes);
-    }
-    Ok(())
-}
-
 /// The ring, or `None` for blocking fsync: where this host denies io_uring, or
 /// `GNITZ_DISABLE_IO_URING` is set.
-fn new_ring() -> Result<Option<IoUring>, StorageError> {
+pub(super) fn new_ring() -> Result<Option<IoUring>, StorageError> {
     if IO_URING_DENIED.load(Relaxed) || gnitz_foundation::env::env_flag("GNITZ_DISABLE_IO_URING", false) {
         return Ok(None);
     }
@@ -77,8 +37,9 @@ fn new_ring() -> Result<Option<IoUring>, StorageError> {
     }
 }
 
-/// Sync `paths`, [`FD_CHUNK_THRESHOLD`] open files at a time.
-fn sync_paths<P: AsRef<Path>>(
+/// Sync `paths`, [`FD_CHUNK_THRESHOLD`] open files at a time; `DATASYNC` in
+/// `flags` selects fdatasync.
+pub(super) fn sync_paths<P: AsRef<Path>>(
     ring: &mut Option<IoUring>,
     paths: impl IntoIterator<Item = P>,
     flags: FsyncFlags,
@@ -90,17 +51,12 @@ fn sync_paths<P: AsRef<Path>>(
             .take(FD_CHUNK_THRESHOLD)
             .map(File::open)
             .collect::<Result<_, _>>()?;
-        batch_sync(ring, &files, flags)?;
+        batch_sync_with(ring, &files, flags, |r, want| r.submit_and_wait(want))?;
     }
     Ok(())
 }
 
-/// Sync every file in `files`; `DATASYNC` in `flags` selects fdatasync.
-fn batch_sync(ring: &mut Option<IoUring>, files: &[File], flags: FsyncFlags) -> Result<(), StorageError> {
-    batch_sync_with(ring, files, flags, |r, want| r.submit_and_wait(want))
-}
-
-/// [`batch_sync`] with the submit call injectable, for tests.
+/// Sync every file in `files`, with the submit call injectable for tests.
 fn batch_sync_with(
     ring: &mut Option<IoUring>,
     files: &[File],
@@ -139,5 +95,5 @@ fn batch_sync_with(
 }
 
 #[cfg(test)]
-#[path = "tests/flush_barrier.rs"]
+#[path = "tests/batch_fsync.rs"]
 mod tests;

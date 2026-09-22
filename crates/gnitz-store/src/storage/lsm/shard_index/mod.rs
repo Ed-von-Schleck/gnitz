@@ -1,4 +1,5 @@
-//! FLSM Shard Index: manages shard lifecycle, compaction, and manifest I/O.
+//! FLSM Shard Index: the one shard writer — shard lifecycle, naming, the PK
+//! filter policy, compaction, and the manifest.
 //!
 //! Split into the in-memory index + compaction trigger ([`index`]) and the
 //! manifest serialize/load/recover path ([`persist`]). The shared types
@@ -129,6 +130,17 @@ impl ShardIndex {
     pub(crate) fn level_shape(&self) -> (usize, [usize; FLSM_LEVELS]) {
         (self.l0.len(), std::array::from_fn(|i| self.levels[i].guards.len()))
     }
+
+    /// Basenames of the shards registered below L0: every compaction output and
+    /// terminal run, where an L0 shard is a spill.
+    pub(crate) fn level_shard_names(&self) -> Vec<String> {
+        self.levels
+            .iter()
+            .flat_map(|l| &l.guards)
+            .flat_map(|g| &g.entries)
+            .map(|e| super::naming::shard_name(e.seq))
+            .collect()
+    }
 }
 
 /// Guarded levels below L0 — L1 and L2.
@@ -168,7 +180,8 @@ pub(super) fn guard_slot<T>(guards: &[T], key: &[u8], gk: impl Fn(&T) -> &[u8]) 
 pub(super) struct CompactionInputs {
     /// This compaction's own handles on the inputs' mappings.
     shards: Vec<MappedShard>,
-    max_lsn: u64,
+    /// The highest `newest` over the inputs, which every output inherits.
+    newest: u64,
     /// Registered bytes of the inputs — the amplification bench's read side,
     /// taken from the entries rather than re-`stat`ed off the paths.
     bytes: u64,
@@ -177,7 +190,10 @@ pub(super) struct CompactionInputs {
 pub(super) struct ShardEntry {
     shard: Rc<MappedShard>,
     filename: String,
-    max_lsn: u64,
+    /// The seq that names this shard.
+    seq: u64,
+    /// The highest seq whose rows this shard holds: its write recency.
+    newest: u64,
     pk_min: PkBuf,
     pk_max: PkBuf,
     /// Named by a published manifest, which the barrier fdatasyncs a file before
@@ -189,7 +205,8 @@ impl ShardEntry {
     pub(crate) fn open(
         path: &str,
         schema: &SchemaDescriptor,
-        max_lsn: u64,
+        seq: u64,
+        newest: u64,
         published: bool,
     ) -> Result<Self, StorageError> {
         let shard = Rc::new(MappedShard::open(path, schema)?);
@@ -198,7 +215,8 @@ impl ShardEntry {
         Ok(ShardEntry {
             shard,
             filename: path.to_string(),
-            max_lsn,
+            seq,
+            newest,
             pk_min,
             pk_max,
             published,
@@ -240,13 +258,13 @@ impl LevelGuard {
         self.entries.iter().all(|e| e.shard.is_skeleton())
     }
 
-    /// When this guard was last written, as the newest LSN over its entries. The
-    /// only recency signal the tree carries; the capacity sweep orders its
+    /// When this guard was last written, as the newest stamp over its entries.
+    /// The only recency signal the tree carries; the capacity sweep orders its
     /// victims by it.
-    fn newest_lsn(&self) -> u64 {
+    fn newest(&self) -> u64 {
         self.entries
             .iter()
-            .map(|e| e.max_lsn)
+            .map(|e| e.newest)
             .max()
             .expect("a guard holds at least one shard")
     }
@@ -383,11 +401,8 @@ pub(super) struct ShardIndex {
     l0: Vec<ShardEntry>,
     levels: [FLSMLevel; FLSM_LEVELS],
 
-    /// Source of every output shard's basename. Each output-emitting compaction
-    /// draws a fresh value, and the manifest header carries it across a restart,
-    /// so no two of this table's output shards ever share a basename. Unique, not
-    /// dense: a compaction that fails after drawing one burns it.
-    compact_seq: u64,
+    /// The last seq drawn; a shard is named by its seq.
+    shard_seq: u64,
     pending_deletions: Vec<String>,
     /// `R`, the unit every byte target is stated in: the running max of the
     /// registered L0 bytes one `run_compact` consumed, floored at
@@ -399,9 +414,9 @@ pub(super) struct ShardIndex {
     budget: ShardBudget,
     /// The highest key any drop removed. Zero until the first drop.
     dropped_max: PkBuf,
-    /// Passed to every compaction's write. Held rather than derived from the
-    /// input shards: a derivation would let one filterless input turn the filter
-    /// off for this table's whole descendant line, permanently and invisibly.
+    /// Passed to every shard write. Held rather than derived from the input
+    /// shards: a derivation would let one filterless input turn the filter off
+    /// for this table's whole descendant line, permanently and invisibly.
     skip_pk_filter: bool,
 }
 
@@ -420,20 +435,13 @@ impl ShardIndex {
             schema,
             l0: Vec::new(),
             levels: std::array::from_fn(|_| FLSMLevel::new()),
-            compact_seq: 0,
+            shard_seq: 0,
             pending_deletions: Vec::new(),
             l0_run_bytes: MIN_GUARD_BYTES,
             budget,
             dropped_max: PkBuf::zeroed(schema.pk_stride()),
             skip_pk_filter,
         }
-    }
-
-    /// Whether this store's writes skip the PK filter. Every write reads it
-    /// here — the spill path and compaction must agree, or a store's shards
-    /// disagree about whether a probe can trust them.
-    pub(super) fn skip_pk_filter(&self) -> bool {
-        self.skip_pk_filter
     }
 
     /// Test helper: flip the filter off for a store that would otherwise build

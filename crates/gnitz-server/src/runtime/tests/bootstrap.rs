@@ -51,7 +51,7 @@ mod staging {
     use gnitz_wire::TypeCode;
 
     const SAL_SIZE: usize = 1 << 20;
-    /// Above every family's flushed LSN after a one-DDL session.
+    /// Above every family's replay floor after a one-DDL session.
     const ZONE_LSN: u64 = 1_000;
 
     fn cols() -> Vec<crate::catalog::ColumnDef> {

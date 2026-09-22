@@ -1,20 +1,74 @@
-//! [`Table`]'s flush path: the overflow fold and spill, and the barrier's prepare/commit.
+//! [`Table`]'s flush path: the overflow fold and spill, and the multi-table
+//! durable flush barrier.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use io_uring::types::FsyncFlags;
+
 use super::super::batch::Batch;
+use super::super::batch_fsync::{new_ring, sync_paths};
 use super::super::error::StorageError;
-use super::super::manifest;
-use super::super::shard_file;
-use super::{FlushWork, Table};
+use super::super::manifest::{self, ManifestStamp};
+use super::super::StagedFile;
+use super::Table;
+
+/// A publish [`Table::flush_prepare`] staged and [`flush_barrier`] completes.
+pub(super) struct FlushWork {
+    manifest: StagedFile,
+    bytes: Vec<u8>,
+    /// Fsynced once `manifest` is renamed.
+    dirs: Vec<PathBuf>,
+}
+
+/// Durably publish every table in `tables`, each manifest carrying `stamp`.
+pub(crate) fn flush_barrier<'a>(
+    tables: impl IntoIterator<Item = &'a mut Table>,
+    stamp: ManifestStamp,
+) -> Result<(), StorageError> {
+    let mut work: Vec<(&'a mut Table, FlushWork)> = Vec::new();
+    for t in tables {
+        if let Some(w) = t.flush_prepare(stamp)? {
+            work.push((t, w));
+        }
+    }
+    if work.is_empty() {
+        return Ok(());
+    }
+    let mut ring = new_ring()?;
+    // Every unsynced shard and every staged manifest, before any rename.
+    sync_paths(
+        &mut ring,
+        work.iter()
+            .flat_map(|(t, w)| t.shard_index.unsynced_paths().chain([w.manifest.tmp_path()])),
+        FsyncFlags::DATASYNC,
+    )?;
+    let mut dirs = BTreeSet::new();
+    let mut published = Vec::with_capacity(work.len());
+    for (t, w) in work {
+        // The rename publishes every shard the manifest names.
+        w.manifest.commit()?;
+        t.shard_index.clear_unsynced();
+        dirs.extend(w.dirs);
+        published.push((t, w.bytes));
+    }
+    // A rename is metadata: a full fsync, not fdatasync.
+    sync_paths(&mut ring, &dirs, FsyncFlags::empty())?;
+    // No durable manifest names a superseded shard any more.
+    for (t, bytes) in published {
+        t.durable_manifest = Some(bytes);
+        t.shard_index.try_cleanup();
+    }
+    Ok(())
+}
 
 impl Table {
     /// The base round's barrier over this one table.
     #[cfg(test)]
     pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
         assert!(!self.is_rederived(), "the base round never visits a rederived table");
-        super::super::flush_barrier::flush_barrier([&mut *self], 0)
+        flush_barrier([&mut *self], ManifestStamp::default())
     }
 
     // ------------------------------------------------------------------
@@ -33,42 +87,43 @@ impl Table {
 
     /// Fold the memtable into the RAM tier, spilling the tier to an unsynced
     /// shard only if its net state is still over the ceiling.
-    pub(crate) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn fold_to_ram(&mut self) -> Result<(), StorageError> {
         self.fold_memtable_into_ram_tier();
-        if !self.ram_tier.is_full() {
+        if self.held_in_ram || !self.ram_tier.is_full() {
             return Ok(());
         }
         let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) else {
             return Ok(());
         };
-        if self.held_in_ram || !self.ram_tier.is_full() {
+        // The fold's cancellation can bring the tier back under its ceiling.
+        if !self.ram_tier.is_full() {
             return Ok(());
         }
-        self.persist_ram_tier(run)
+        self.spill_ram_tier(run)
     }
 
     // ------------------------------------------------------------------
-    // Barrier / durable flush (two-phase)
+    // Barrier prepare
     // ------------------------------------------------------------------
 
     /// Fold memtable and RAM tier into one shard and stage the manifest naming
     /// it; `None` when that manifest is the one this process last made durable.
-    pub(in crate::storage) fn flush_prepare(&mut self, checkpoint_gen: u64) -> Result<Option<FlushWork>, StorageError> {
+    pub(super) fn flush_prepare(&mut self, stamp: ManifestStamp) -> Result<Option<FlushWork>, StorageError> {
         // Fold-first, then one shard.
         self.fold_memtable_into_ram_tier();
         if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
-            self.persist_ram_tier(run)?;
+            self.spill_ram_tier(run)?;
         }
-        let bytes = manifest::encode(&self.shard_index.manifest(checkpoint_gen));
+        let bytes = manifest::encode(&self.shard_index.manifest(stamp));
         if self.durable_manifest.as_deref() == Some(&bytes[..]) {
             debug_assert!(
-                self.unsynced_paths().next().is_none(),
+                self.shard_index.unsynced_paths().next().is_none(),
                 "a durable manifest names an unsynced shard"
             );
             return Ok(None);
         }
         let first_publish = self.durable_manifest.is_none();
-        // Unknown until `published_durably`: a failed publish may have renamed.
+        // Unknown until the barrier records it: a failed publish may have renamed.
         self.durable_manifest = None;
         let manifest = manifest::prepare(&self.shard_index.output_dir, &bytes)?;
         // A first publish also makes the store's and its relation's directory entries durable.
@@ -82,54 +137,15 @@ impl Table {
         Ok(Some(FlushWork { manifest, bytes, dirs }))
     }
 
-    /// Every live shard no published manifest names yet.
-    pub(in crate::storage) fn unsynced_paths(&self) -> impl Iterator<Item = &str> {
-        self.shard_index.unsynced_paths()
-    }
-
-    /// Write the RAM tier's folded run as an unsynced shard and move it from heap
-    /// to the shard index.
-    fn persist_ram_tier(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
-        let shard_name = super::super::naming::spill_shard_name(self.current_lsn);
-        let lsn_max = self.current_lsn - 1;
-        // So a reopen seeds `current_lsn` above every spill name.
-        let final_full = format!("{}/{}", self.shard_index.output_dir, shard_name);
-        debug_assert!(
-            !Path::new(&final_full).exists(),
-            "a second shard at one LSN would replace the first"
-        );
-
-        // Write failed: heap still owns `run`; no on-disk residue.
-        run.write_as_shard(
-            &final_full,
-            // L0 spill/checkpoint shards stay plain (no FoR packing), and carry
-            // a PK filter only where something point-probes this store.
-            shard_file::ShardWriteOpts {
-                skip_pk_filter: self.shard_index.skip_pk_filter(),
-                ..Default::default()
-            },
-        )?;
-
-        if let Err(e) = self.shard_index.add_unsynced_shard(&final_full, lsn_max) {
-            // Registration failed: unlink the shard we wrote, keep heap intact.
-            let _ = std::fs::remove_file(&final_full);
-            return Err(e);
-        }
-
-        // Commit: the run is on disk and registered — safe to drop from heap.
+    /// Move the RAM tier's folded run to an unsynced L0 shard, then run the disk
+    /// tier's upkeep.
+    fn spill_ram_tier(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
+        self.shard_index.append_l0_run(&run)?;
         self.ram_tier.clear();
-        // The capacity sweep below can dehydrate or drop live rows, so this is
-        // where the materialized scan stops being a copy of the row set.
+        // Free the spilled rows before compaction allocates.
+        drop(run);
+        // The sweep in `maintain` can dehydrate or drop live rows.
         self.cached_full_scan.set(None);
-
-        self.compact_if_needed()?;
-        self.shard_index.enforce_capacity()
-    }
-
-    /// Rename the staged manifest into place, marking every shard it names published.
-    pub(in crate::storage) fn flush_commit(&mut self, manifest: super::super::StagedFile) -> Result<(), StorageError> {
-        manifest.commit()?;
-        self.shard_index.clear_unsynced();
-        Ok(())
+        self.shard_index.maintain()
     }
 }

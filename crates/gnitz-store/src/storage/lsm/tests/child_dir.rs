@@ -62,8 +62,10 @@ fn ownership_follows_the_launched_count() {
 fn stamp(dir: &str, generation: u64) {
     std::fs::create_dir_all(dir).unwrap();
     let m = manifest::Manifest {
-        compact_seq: 0,
-        checkpoint_gen: generation,
+        stamp: manifest::ManifestStamp {
+            checkpoint_gen: generation,
+            ..Default::default()
+        },
         run_bytes: 0,
         entries: Vec::new(),
     };
