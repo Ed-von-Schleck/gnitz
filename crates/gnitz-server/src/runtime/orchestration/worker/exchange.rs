@@ -53,51 +53,15 @@ impl WorkerProcess {
         }
     }
 
-    /// Publish this worker's exchange partition as a train of frames inside
-    /// [`ipc::FRAME_CAP`] — the bound every other producer already holds itself
-    /// to. What a frame carries is [`exchange_frame`]'s; this only cuts rows.
+    /// Publish this worker's exchange partition as a train of frames.
     fn publish_exchange(&self, view_id: i64, batch: &Batch, source_id: i64, pad: bool) {
         let block = crate::catalog::encode_schema_block(batch.schema());
-        let frame = |last| exchange_frame(view_id, source_id, &block, last, pad);
-
-        // Whole and unsplit off the source batch — no sub-batch, no per-row
-        // German-string walk — which is the path a real payload takes: a
-        // 65,536-row chunk at 100 B/row is 6.5 MB against a 64 MiB frame.
-        let whole = ipc::WireMsg {
-            data: ipc::WireData::Whole(batch),
-            ..frame(true)
-        };
-        if whole.size() <= ipc::FRAME_CAP {
-            self.w2m_writer.send_msg(W2M_EXCHANGE_RING_ID, &whole);
-            return;
-        }
-
-        // An empty partition fits above, so this loop has rows, and
-        // `wire_chunk_within` yields at least one — so it terminates.
-        let overhead = frame(false).size();
-        let mut next_row = 0;
-        while next_row < batch.len() {
-            let (chunk, size) = batch.wire_chunk_within(next_row, overhead, ipc::FRAME_CAP);
-            if size > ipc::FRAME_CAP {
-                // One row too wide to frame. A reply faults its client with
-                // `oversized_reply`; an exchange has no client to fault.
-                gnitz_fatal_abort!(
-                    "worker: exchange row {} of view_id={} encodes to {} bytes, past the {} byte frame cap",
-                    next_row,
-                    view_id,
-                    size,
-                    ipc::FRAME_CAP,
-                );
-            }
-            let start = next_row;
-            next_row += chunk.rows();
-            self.w2m_writer.send_msg(
-                W2M_EXCHANGE_RING_ID,
-                &ipc::WireMsg {
-                    data: ipc::WireData::of_chunk(batch, start, &chunk),
-                    ..frame(next_row == batch.len())
-                },
-            );
+        let sent = reply::send_train(&self.w2m_writer, W2M_EXCHANGE_RING_ID, batch, ipc::FRAME_CAP, |last| {
+            exchange_frame(view_id, source_id, &block, last, pad)
+        });
+        // An exchange has no client to fault.
+        if let Err(fault) = sent {
+            gnitz_fatal_abort!("worker: exchange partition of view_id={view_id}: {fault}");
         }
     }
 }

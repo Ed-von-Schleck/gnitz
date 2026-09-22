@@ -742,12 +742,11 @@ impl W2mWriter {
     }
 
     /// Send a bare control frame: a status and optional error text, no schema
-    /// and no rows. Every ACK and error reply on the ring has this shape, and it
-    /// ends whatever train it answers.
+    /// and no rows. Every ACK and error reply on the ring has this shape.
     pub fn send_status(&self, target_id: u64, request_id: u32, status: gnitz_wire::WireStatus, text: &[u8]) {
         let msg = WireMsg {
             target_id,
-            flags: gnitz_wire::WireFlags::train_frame(0, true),
+            flags: gnitz_wire::WireFlags::default(),
             status,
             blob: text,
             ..Default::default()

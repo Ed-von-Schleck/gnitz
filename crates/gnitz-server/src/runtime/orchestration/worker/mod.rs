@@ -159,45 +159,12 @@ pub struct WorkerProcess {
     w2m_writer: W2mWriter,
     exchange: WorkerExchangeHandler,
     pending_deltas: HashMap<i64, Batch>,
-    /// FIFO queue of in-progress chunked reply trains. Two clients can run two
-    /// large requests concurrently (connections are independent reactor tasks
-    /// and `handle_scan` holds only the catalog read lock), so a scalar slot
-    /// would let the second train overwrite the first and hang its master-side
-    /// drain forever.
-    ///
-    /// Trains drain strictly FIFO — the front train finishes before the next
-    /// starts. Do NOT interleave streams round-robin: the master drains one
-    /// request's train at a time, so an interleaved second train's frames
-    /// would sit parked in the master's scan queue holding un-released ring slots;
-    /// `release_cursor` (released in ring order, `w2m.rs`) could then never
-    /// pass them, the ring fills, the worker blocks in `W2mWriter::send_msg`, and the
-    /// cluster deadlocks. FIFO is deadlock-free: every fan-out writes its
-    /// group under a `SalExcl`, so all worker queues
-    /// share one global request order; each master task drains workers in
-    /// ascending index order; the earliest-ordered awaited train always has
-    /// its frames at the front of some worker's queue with a live consumer.
-    ///
-    /// A train's chunks are emitted ONLY from `drain_sal` / `run` — never from
-    /// `do_exchange_wait`'s inline dispatch loop. That loop can ENQUEUE trains
-    /// (the Scan/seek/gather arms run inline inside a wait too); they must stay
-    /// queued until the exchange completes. Emitting there would let
-    /// `W2mWriter::send_msg` block on a full W2M ring — full because the queued
-    /// train's master-side consumer paces a slow client TCP connection — while
-    /// the `ExchangeRelay` this worker is waiting for sits unread in the SAL:
-    /// the join would stall indefinitely on an unrelated slow client.
-    /// Queued-but-unemitted is safe; the relay does not depend on any train
-    /// draining.
-    ///
-    /// A reply that fits ONE frame is not a train and does go out from inside
-    /// the wait, taking one ring slot the master drains immediately — where a
-    /// train's later chunks would wait on a consumer this worker is blocking.
+    /// Reply trains, one frame emitted per SAL drain, front first: the master
+    /// reads one lease at a time and a ring frees only in order.
     pending_streams: VecDeque<PendingScan>,
-    /// Per-frame wire budget for every reply train and for the pre-flight key
-    /// train: [`ipc::FRAME_CAP`] in production, since every frame reaches the
-    /// client verbatim. `GNITZ_REPLY_FRAME_BUDGET` (read once at construction)
-    /// shrinks it so e2e tests exercise multi-frame trains with small tables; a
-    /// larger value is ignored. A frame that cannot be built inside `FRAME_CAP`
-    /// even at one row is the only reply-size failure left.
+    /// Per-frame wire budget of every reply train: [`ipc::FRAME_CAP`], or less
+    /// under `GNITZ_REPLY_FRAME_BUDGET`, so tests reach multi-frame trains on
+    /// small tables.
     reply_frame_budget: usize,
 }
 
@@ -224,16 +191,16 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
     }
 }
 
-/// Where one reply goes and how: the relation it names, the request id the
-/// master reactor routes it by, and whether it must reach the ring in request
-/// order. `dispatch_inner` resolves them together, so no reply helper takes them
-/// apart — and no arm can forget the ordering directive its group carried.
-#[derive(Clone, Copy, Default)]
+/// Where one reply goes and how, read off its request.
+#[derive(Clone, Copy)]
 struct ReplyRoute {
     target_id: u64,
+    /// The id the master routes the reply by.
     request_id: u32,
     /// Queue the reply behind earlier trains even when it fits one frame.
     fifo: bool,
+    /// The request's schema version, which every frame of the reply echoes.
+    schema_version: u16,
 }
 
 impl WorkerProcess {
@@ -279,9 +246,7 @@ impl WorkerProcess {
         self.send_ack(0, ready_request_id);
 
         loop {
-            // Skip the SAL wait while a chunked reply train is in progress: the
-            // queued state drives the next drain_sal to emit the next chunk
-            // immediately.
+            // A queued train emits its next frame without waiting on the SAL.
             if self.pending_streams.is_empty() {
                 self.w2m_writer.sal_park().park(|| self.sal_reader.is_empty());
             }
@@ -292,14 +257,8 @@ impl WorkerProcess {
 
     /// Process all pending SAL message groups. Shutdown `_exit`s inline.
     fn drain_sal(&mut self) {
-        // Emit the next chunk of the FRONT pending train before draining new
-        // SAL messages. One chunk per drain_sal pass; `send_msg` provides
-        // backpressure. Single-frame replies for other requests still go out
-        // immediately between chunks (distinct ring-prefix request ids; the
-        // master reactor routes per id).
-        if !self.pending_streams.is_empty() {
-            self.emit_pending_scan_chunk();
-        }
+        // One frame per pass, so requests keep being served between frames.
+        self.emit_pending_scan_chunk();
         while let Some((msg, wire)) = self.sal_reader.next() {
             self.dispatch_top_level(&msg, wire);
             // Replay whatever an exchange wait deferred — a tick or a delta read
@@ -420,12 +379,11 @@ impl WorkerProcess {
         } = req;
         let hdr = decoded.control.hdr;
         let target_id = hdr.target_id as i64;
-        // The version the reader holds: the one the master negotiated for it.
-        let client_version = hdr.flags.schema_version;
         let route = ReplyRoute {
             target_id: hdr.target_id,
             request_id,
             fifo,
+            schema_version: hdr.flags.schema_version,
         };
         let blob: Vec<u8> = std::mem::take(&mut decoded.control.blob);
         let batch = decoded.data_batch;
@@ -508,13 +466,12 @@ impl WorkerProcess {
 
             SalMessageKind::Scan => {
                 let result = self.cat().scan(target_id)?;
-                let (block, version) = self.cat().negotiated_schema_block(target_id, client_version);
-                self.send_shared_scan_response(route, result, block, version);
+                self.send_reply(route, result);
                 Ok(())
             }
 
-            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &blob, client_version),
-            SalMessageKind::DeltaRead => self.answer_delta_read(route, hdr.arg1, hdr.arg0, &blob, client_version),
+            SalMessageKind::ScanSpec => self.answer_scan_spec(route, &blob),
+            SalMessageKind::DeltaRead => self.answer_delta_read(route, hdr.arg1, hdr.arg0, &blob),
 
             SalMessageKind::UniquePreflight => {
                 let cols = self
@@ -596,19 +553,14 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// Answer one `ReadSpec` read, streaming the keeper back without a schema block.
-    fn answer_scan_spec(
-        &mut self,
-        route: ReplyRoute,
-        blob: &[u8],
-        client_version: u16,
-    ) -> Result<(), gnitz_wire::WireFault> {
+    /// Answer one `ReadSpec` read, streaming the keeper back.
+    fn answer_scan_spec(&mut self, route: ReplyRoute, blob: &[u8]) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
         let (spec, reply_block) = gnitz_wire::ReadSpec::decode(blob).map_err(|e| format!("scan_spec: {e}"))?;
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self.cat().scan_spec(target_id, spec, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, None, client_version);
+        self.send_reply(route, keeper);
         Ok(())
     }
 
@@ -619,13 +571,12 @@ impl WorkerProcess {
         after_tick: u64,
         cut_tick: u64,
         reply_block: &[u8],
-        client_version: u16,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block)
             .map_err(|e| format!("delta_read: reply schema block: {e}"))?;
         let keeper = self.cat().delta_read(target_id, after_tick, cut_tick, &reply_schema)?;
-        self.send_shared_scan_response(route, keeper, None, client_version);
+        self.send_reply(route, keeper);
         Ok(())
     }
 
@@ -759,7 +710,7 @@ impl WorkerProcess {
                 keys.extend_from_slice(batch.get_pk_bytes(i));
             }
             let result = self.cat().registry.gather_bytes(target_id, keys, ref_col)?;
-            self.send_scan_response(route, result, None, 0);
+            self.send_reply(route, result);
             return Ok(());
         }
         match lookup {
@@ -812,7 +763,7 @@ impl WorkerProcess {
                     }
                     result
                 };
-                self.send_scan_response(route, result, None, 0);
+                self.send_reply(route, result);
                 Ok(())
             }
             HasPkLookup::PrimaryKey => {
@@ -826,7 +777,7 @@ impl WorkerProcess {
                         result.push_key_row(pkb, 1);
                     }
                 }
-                self.send_scan_response(route, result, None, 0);
+                self.send_reply(route, result);
                 Ok(())
             }
         }

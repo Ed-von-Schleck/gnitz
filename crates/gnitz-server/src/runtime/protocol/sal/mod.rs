@@ -149,6 +149,10 @@ impl WorkerSet {
         WorkerSet(self.0 | 1 << w)
     }
 
+    pub(crate) const fn without(self, w: usize) -> Self {
+        WorkerSet(self.0 & !(1 << w))
+    }
+
     pub(crate) const fn within(self, nw: usize) -> Self {
         WorkerSet(self.0 & low_bits_mask(nw))
     }

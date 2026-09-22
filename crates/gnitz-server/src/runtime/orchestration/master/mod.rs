@@ -160,13 +160,14 @@ pub(crate) struct ScanCut<'d> {
 }
 
 impl<'d> ScanCut<'d> {
-    /// Lease a reply id for `set`, then write the group `write` builds on it.
+    /// Lease a reply id for `set`, then write the `kind` group `write` builds on it.
     pub(crate) fn push(
         &mut self,
+        kind: SalMessageKind,
         set: WorkerSet,
         write: impl FnOnce(&SalExcl<'d>, GroupTargets) -> Result<(), WireFault>,
     ) -> Result<(), WireFault> {
-        let lease = self.disp.reactor.lease_train(set);
+        let lease = self.disp.reactor.lease_train(set, kind);
         debug_assert!(lease.workers().len() > 0, "every read owes at least one reply");
         write(
             &self.excl,
@@ -186,7 +187,7 @@ impl<'d> ScanCut<'d> {
         let bound = group.kind.carries_read_bound().then_some(group.template.blob);
         let schema = self.disp.schema_desc_for(group.template.target_id as i64);
         let route = route_read(&schema, bound, self.disp.num_workers());
-        self.push(route.set, |excl, targets| {
+        self.push(group.kind, route.set, |excl, targets| {
             excl.write(&DirectGroup {
                 extras: route.per_worker.as_deref(),
                 targets,

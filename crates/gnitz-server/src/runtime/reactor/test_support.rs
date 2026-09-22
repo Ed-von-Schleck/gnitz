@@ -1,8 +1,5 @@
-//! Helpers shared by the reactor's test suites.
-//!
-//! Private to `reactor` and visible to every module under it, so a suite
-//! attached to `conn`, `io` or `futures` reaches the same fixtures without any
-//! of them becoming crate API.
+//! Helpers shared by the reactor's test suites; the `pub(crate)` ones also serve
+//! suites elsewhere that drive a reactor over test rings.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -57,12 +54,17 @@ impl Reactor {
     pub(crate) fn route_w2m_for_test(&self) {
         self.drain_all_w2m();
     }
+
+    /// Worker `w`'s W2M release cursor.
+    pub(crate) fn release_cursor_for_test(&self, w: usize) -> u64 {
+        self.inner.w2m.release_cursor(w)
+    }
 }
 
 /// A reactor over `n` fresh W2M rings, with the writer of each. The rings
 /// are leaked: a `W2mSlot` a failing assert leaves routed writes through its
 /// ring on drop, so never unmapping makes teardown order irrelevant.
-pub(super) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
+pub(crate) fn reactor_with_rings(n: usize) -> (Reactor, Vec<W2mWriter>) {
     let ptrs: Vec<*mut u8> = (0..n)
         .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) }.leak())
         .collect();

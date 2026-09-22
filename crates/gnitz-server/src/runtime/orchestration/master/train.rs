@@ -4,90 +4,29 @@
 use super::*;
 
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::worker_fault;
-use crate::runtime::w2m::W2mSlot;
 use gnitz_store::storage::{MemBatch, MAX_BATCH_REGIONS};
-use gnitz_wire::control::DecodedControl;
 
-/// A decode failure on one frame of a reply train, named after the verb `what`.
-fn decode_err(slot: &W2mSlot, what: &str, e: &str) -> WireFault {
-    format!("{what}: worker {}: decode error: {e}", slot.worker).into()
-}
-
-/// One worker's frames on a lease, in order, ending at the one flagged `scan_last`.
-pub(super) struct Train<'l> {
-    lease: &'l TrainLease,
-    worker: usize,
-    what: &'l str,
-    done: bool,
-}
-
-impl<'l> Train<'l> {
-    pub(super) fn new(lease: &'l TrainLease, worker: usize, what: &'l str) -> Self {
-        Train { lease, worker, what, done: false }
-    }
-
-    /// The next frame and its header, `None` past the terminal one; `Err` on a
-    /// fault frame. Dropping the lease discards the rest.
-    pub(super) async fn next(&mut self) -> Result<Option<(W2mSlot, DecodedControl)>, WireFault> {
-        if self.done {
-            return Ok(None);
-        }
-        let slot = self.lease.next_frame(self.worker).await;
-        let ctrl = slot.control();
-        if let Some(f) = ctrl.fault() {
-            return Err(worker_fault(self.worker, self.what, f));
-        }
-        self.done = ctrl.hdr.flags.scan_last;
-        Ok(Some((slot, ctrl)))
-    }
-
-    /// `slot`'s rows decoded against `expected`.
-    pub(super) fn rows<'a>(
-        &self,
-        slot: &'a W2mSlot,
-        ctrl: &DecodedControl,
-        expected: &SchemaDescriptor,
-        offsets: &'a mut [usize; MAX_BATCH_REGIONS],
-    ) -> Result<Option<MemBatch<'a>>, WireFault> {
-        wire::decode_train_frame(slot.bytes(), ctrl, expected, offsets).map_err(|e| decode_err(slot, self.what, &e))
-    }
-}
-
-/// Drain every reply train of `lease` in reply order, handing `on_batch` each
-/// non-empty frame's rows. A block-less frame decodes against `expected`; a frame
-/// whose own block disagrees with it — a worker lagging a DDL — is an error.
-pub(super) async fn drain_index_scan(
+/// Hand `on_batch` the rows of every frame of `lease`, workers in ascending order,
+/// each decoded against `expected`.
+pub(super) async fn drain_rows(
     lease: &TrainLease,
-    what: &str,
     expected: &SchemaDescriptor,
     mut on_batch: impl FnMut(&MemBatch<'_>) -> Result<(), WireFault>,
 ) -> Result<(), WireFault> {
-    for w in lease.workers().iter() {
-        let mut train = Train::new(lease, w, what);
-        while let Some((slot, ctrl)) = train.next().await? {
-            let mut offsets = [0usize; MAX_BATCH_REGIONS];
-            if let Some(mb) = train
-                .rows(&slot, &ctrl, expected, &mut offsets)?
-                .filter(|mb| !mb.is_empty())
-            {
-                on_batch(&mb)?;
-            }
-        }
+    while let Some(f) = lease.next().await? {
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        on_batch(&f.rows(expected, &mut offsets))?;
     }
     Ok(())
 }
 
-/// Forward every reply train of `lease` to `peer` in reply order, skipping frames
-/// that carry nothing the client reads. Stops at the first failed send, which
-/// closes the peer; `Err` on the first worker fault, leaving the rest undrained.
+/// Forward every frame of `lease` that carries rows to `peer`, workers in ascending
+/// order. Stops at the first failed send, which closes the peer; `Err` on the first
+/// worker fault, leaving the rest undrained.
 pub(crate) async fn forward_scan(peer: &Peer, lease: &TrainLease) -> Result<(), WireFault> {
-    for w in lease.workers().iter() {
-        let mut train = Train::new(lease, w, "scan");
-        while let Some((slot, ctrl)) = train.next().await? {
-            if (ctrl.data.is_some() || ctrl.schema.is_some()) && peer.send(slot).await.is_err() {
-                return Ok(());
-            }
+    while let Some(f) = lease.next().await? {
+        if peer.send(f.slot).await.is_err() {
+            return Ok(());
         }
     }
     Ok(())

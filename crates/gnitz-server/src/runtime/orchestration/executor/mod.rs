@@ -1562,7 +1562,7 @@ async fn read_lock(
 
 /// The preliminary schema-only frame — carrying `continuation`, the
 /// `server_version`, and the captured wire block — that precedes a scan's data
-/// frames on a schema-cache miss, in place of one schema block per worker.
+/// frames on a schema-cache miss.
 fn prelim_schema_msg(tid: i64, server_version: u16, block: &[u8]) -> ipc::WireMsg<'_> {
     ipc::WireMsg {
         target_id: tid as u64,
@@ -1753,8 +1753,7 @@ fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
 /// [`CatalogEngine::negotiated_schema_block`] answered, carried to the deferred Phase-2 emit.
 struct ScanMultiRelPlan {
     tid: i64,
-    /// Stamped into the preliminary frame, and handed to the workers as their
-    /// effective client version so they omit their own schema blocks.
+    /// Stamped into the preliminary frame and onto the read, whose frames echo it.
     server_version: u16,
     /// The wire schema block to emit before this relation's train, present iff
     /// the client's cached version missed.

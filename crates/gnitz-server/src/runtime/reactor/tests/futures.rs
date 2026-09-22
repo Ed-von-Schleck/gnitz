@@ -103,7 +103,7 @@ fn fsync_submit_flushes_sqe_before_returning() {
 fn a_train_route_queues_past_worker_count_in_arrival_order() {
     const N: usize = 100; // > MAX_WORKERS
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_train(WorkerSet::ALL);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
     for i in 0..N {
         let msg = crate::runtime::wire::WireMsg {
             target_id: 100 + i as u64,
@@ -114,14 +114,14 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
     r.drain_all_w2m();
 
     for i in 0..N {
-        let f = try_poll_once(lease.next_frame(0)).expect("a routed frame resolves on the first poll");
+        let f = try_poll_once(lease.next_slot(0)).expect("a routed frame resolves on the first poll");
         let tag = gnitz_wire::control::peek_control_block(f.bytes())
             .unwrap()
             .hdr
             .target_id;
         assert_eq!(tag, 100 + i as u64, "frame {i} delivered in arrival order");
     }
-    assert!(try_poll_once(lease.next_frame(0)).is_none(), "the queue is drained");
+    assert!(try_poll_once(lease.next_slot(0)).is_none(), "the queue is drained");
 }
 
 /// Dropping a train lease releases the frames it still holds, and a frame for
@@ -129,20 +129,20 @@ fn a_train_route_queues_past_worker_count_in_arrival_order() {
 #[test]
 fn a_dropped_lease_releases_held_and_late_frames() {
     let (r, writers) = reactor_with_rings(1);
-    let lease = r.lease_train(WorkerSet::ALL);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
     let id = lease.id();
     writers[0].send_msg(id, &Default::default());
     r.drain_all_w2m();
 
-    let held = r.inner.w2m.release_cursor(0);
+    let held = r.release_cursor_for_test(0);
     drop(lease);
     assert!(r.inner.trains.borrow().is_empty());
-    assert!(r.inner.w2m.release_cursor(0) > held, "the held frame is released");
+    assert!(r.release_cursor_for_test(0) > held, "the held frame is released");
 
     writers[0].send_msg(id, &Default::default());
-    let late = r.inner.w2m.release_cursor(0);
+    let late = r.release_cursor_for_test(0);
     r.drain_all_w2m();
-    assert!(r.inner.w2m.release_cursor(0) > late, "the late frame is released");
+    assert!(r.release_cursor_for_test(0) > late, "the late frame is released");
     assert!(r.inner.trains.borrow().is_empty(), "and routes nothing");
 }
 
@@ -161,7 +161,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     let ptr = region.ptr();
 
     let r = make_reactor_over(Rc::new(W2mReceiver::new(vec![ptr])));
-    let lease = r.lease_train(WorkerSet::ALL);
+    let lease = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
     let id = lease.id();
     let writer = W2mWriter::new(ptr);
 
@@ -201,7 +201,7 @@ fn a_dropped_lease_unblocks_a_streaming_writer() {
     r.drain_all_w2m();
 
     assert_eq!(
-        r.inner.w2m.release_cursor(0),
+        r.release_cursor_for_test(0),
         r.inner.w2m.write_cursor(0),
         "every emitted slot must be freed (release_cursor reaches write_cursor)",
     );

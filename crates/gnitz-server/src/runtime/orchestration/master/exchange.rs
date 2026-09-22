@@ -8,8 +8,7 @@
 //!
 //! A worker publishes its partition as a `FRAME_CAP`-bounded train (see
 //! `worker/exchange.rs`), so a worker's list holds several frames and only the
-//! terminal one — flagged `scan_last`, the engine's one train-end rule — reports
-//! the worker.
+//! terminal one — flagged `scan_last` — reports the worker.
 //!
 //! Rounds are orchestration policy, which is why this sits here rather than in
 //! the reactor that delivers the frames.
@@ -108,17 +107,11 @@ impl ExchangeAccumulator {
             return None;
         }
         let round = self.rounds.remove(&key).unwrap();
-        let schema = match round.schema {
-            Some(s) => s,
-            None => {
-                gnitz_warn!(
-                    "exchange: no schema received for (view_id={}, source_id={})",
-                    vid,
-                    source_id
-                );
-                return None;
-            }
-        };
+        let schema = round.schema.unwrap_or_else(|| {
+            gnitz_fatal_abort!(
+                "exchange: (view_id={vid}, source_id={source_id}) completed with no schema block — ring corrupt"
+            )
+        });
         Some(PendingRelay {
             view_id: vid,
             payloads: round.payloads,

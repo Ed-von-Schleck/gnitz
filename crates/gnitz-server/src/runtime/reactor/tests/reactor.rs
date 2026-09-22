@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::test_support::*;
 use super::*;
-use crate::runtime::sal::WorkerSet;
+use crate::runtime::sal::{SalMessageKind, WorkerSet};
 use crate::runtime::test_support::{fork_child, try_poll_once};
 use gnitz_wire::{WireFault, WireStatus};
 
@@ -24,7 +24,7 @@ fn a_lease_routes_consecutive_ids_until_dropped() {
     assert!(ids.windows(2).all(|p| p[1] == p[0] + 1), "consecutive: {ids:?}");
     assert_eq!(sorted(r.inner.acks.borrow().keys().copied().collect()), ids);
 
-    let train = r.lease_train(WorkerSet::one(1));
+    let train = r.lease_train(WorkerSet::one(1), SalMessageKind::Scan);
     assert_eq!(train.id(), ids[3] + 1, "the next lease starts past the last");
     assert_eq!(train.workers().iter().collect::<Vec<_>>(), vec![1]);
     assert_eq!(
@@ -166,8 +166,8 @@ fn acks_parks_only_on_the_first_unanswered_id() {
 fn trains_idle_waits_for_the_last_train_lease() {
     let (r, _writers) = reactor_with_rings(1);
     let (first, second, acks) = (
-        r.lease_train(WorkerSet::ALL),
-        r.lease_train(WorkerSet::ALL),
+        r.lease_train(WorkerSet::ALL, SalMessageKind::Scan),
+        r.lease_train(WorkerSet::ALL, SalMessageKind::Scan),
         r.lease_acks(1, "test"),
     );
     let mut idle = std::pin::pin!(r.trains_idle());
@@ -210,7 +210,7 @@ fn lease_ids_wrap_below_the_exchange_id_and_skip_live_ids() {
     );
 
     r.inner.next_request_id.set(2);
-    let skipped = r.lease_train(WorkerSet::ALL);
+    let skipped = r.lease_train(WorkerSet::ALL, SalMessageKind::Scan);
     assert_eq!(skipped.id(), 3, "a live lease's ids are skipped");
 
     r.inner.next_request_id.set(u32::MAX - 1);

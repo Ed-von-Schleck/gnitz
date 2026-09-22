@@ -327,7 +327,7 @@ impl MasterDispatcher {
         } = relay;
 
         let cat = self.cat();
-        let sources: Vec<&Batch> = payloads.iter().flatten().filter(|b| !b.is_empty()).collect();
+        let sources: Vec<&Batch> = payloads.iter().flatten().collect();
         let num_workers = self.num_workers();
 
         let meta = cat.dag.view_meta(view_id)?;

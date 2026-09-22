@@ -1,11 +1,9 @@
 use crate::catalog::encode_schema_block;
-use crate::runtime::wire::{
-    decode_sal_slot, decode_train_frame, decode_wire_ipc, validate_schema_match, WireData, WireMsg,
-};
+use crate::runtime::wire::{decode_sal_slot, decode_wire_ipc, validate_schema_match, WireData, WireMsg};
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk, MAX_BATCH_REGIONS};
-use gnitz_wire::control::{peek_control_block, CTRL_HEADER_SIZE};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, WireChunk};
+use gnitz_wire::control::CTRL_HEADER_SIZE;
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
 use gnitz_wire::{ClientVerb, WireFlags, WireStatus};
@@ -349,11 +347,10 @@ fn a_range_chunk_frames_identically_to_the_same_rows_whole() {
     }
 }
 
-/// A continuation frame (a data block, no schema block) decodes against a
-/// schema hint, and not without one.
+/// A continuation frame (a data block, no schema block) does not decode without
+/// a schema.
 #[test]
-fn continuation_frame_decoded_with_schema_hint() {
-    let sd = simple_schema();
+fn continuation_frame_does_not_decode_without_a_schema() {
     let batch = make_blobless_batch(4);
 
     // Encode a continuation frame: no schema, `continuation` set.
@@ -371,17 +368,6 @@ fn continuation_frame_decoded_with_schema_hint() {
         decode_wire_ipc(&buf).is_err(),
         "decode_wire_ipc should fail for continuation frame without schema"
     );
-
-    // With a hint it decodes, every region sliced by the same rows.
-    let ctrl = peek_control_block(&buf).expect("control header");
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let decoded = decode_train_frame(&buf, &ctrl, &sd, &mut offsets).expect("decode with schema hint");
-    let b = decoded.as_ref().expect("data_batch");
-    assert_eq!(b.len(), 4);
-    for i in 0..4usize {
-        assert_eq!(gnitz_wire::widen_pk_be(b.get_pk_bytes(i)), i as u128);
-        assert_eq!(b.get_weight(i), i as i64 + 1, "row {i} weight");
-    }
 }
 
 #[test]

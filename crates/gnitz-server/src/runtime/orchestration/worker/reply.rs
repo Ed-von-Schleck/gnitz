@@ -1,7 +1,9 @@
-//! Worker W2M response framing: the `WorkerProcess` reply helpers, and the
-//! `PendingScan` train they queue when a reply outgrows one frame.
+//! Worker W2M framing: the `WorkerProcess` reply helpers, the `PendingScan`
+//! train they queue, and the frame cutter every train is sent through.
 
 use super::*;
+
+use std::borrow::Borrow;
 
 use ipc::{WireData, WireMsg, FRAME_CAP};
 
@@ -14,69 +16,28 @@ use ipc::{WireData, WireMsg, FRAME_CAP};
 pub(super) struct PendingScan {
     pub(super) batch: Rc<Batch>,
     pub(super) route: ReplyRoute,
-    /// The block the first frame carries; `None` emits no schema at all.
-    pub(super) prebuilt_schema: Option<Rc<Vec<u8>>>,
-    pub(super) server_version: u16,
-    /// Rows already emitted. `0` ⇒ the next frame still owes the schema block.
+    /// Rows already emitted.
     pub(super) next_row: usize,
 }
 
 /// One frame of a worker reply, but for its payload.
-fn reply_frame<'a>(route: ReplyRoute, block: Option<&'a [u8]>, server_version: u16, last: bool) -> WireMsg<'a> {
+fn reply_frame(route: ReplyRoute, last: bool) -> WireMsg<'static> {
     WireMsg {
         target_id: route.target_id,
-        flags: WireFlags::train_frame(server_version, last),
-        schema_block: block,
+        flags: WireFlags::train_frame(route.schema_version, last),
         ..Default::default()
     }
 }
 
 impl PendingScan {
-    /// This train's next frame, but for its payload and its terminal flag —
-    /// which `emit_next` can only set once it has sized the chunk.
-    fn base_frame(&self) -> WireMsg<'_> {
-        // The schema block rides the first frame only.
-        let block = (self.next_row == 0)
-            .then(|| self.prebuilt_schema.as_deref().map(Vec::as_slice))
-            .flatten();
-        reply_frame(self.route, block, self.server_version, false)
-    }
-
     /// Emit this train's next frame, returning whether more remain.
     fn emit_next(&mut self, w2m: &W2mWriter, budget: usize) -> Result<bool, gnitz_wire::WireFault> {
-        if self.next_row == 0
-            && emit_whole_if_fits(
-                w2m,
-                self.route,
-                self.prebuilt_schema.as_deref().map(Vec::as_slice),
-                self.server_version,
-                &self.batch,
-                budget,
-            )
-        {
-            self.next_row = self.batch.len();
-            return Ok(false);
-        }
-        let base = self.base_frame();
-        let overhead = base.size();
-        let start = self.next_row;
-        let (chunk, size) = self.batch.wire_chunk_within(start, overhead, budget);
-        // Over `budget` only at one row, since `budget <= FRAME_CAP`; over
-        // FRAME_CAP there is nothing left to narrow.
-        if size > FRAME_CAP {
-            return Err(oversized_reply(size));
-        }
-        let has_more = start + chunk.rows() < self.batch.len();
-        w2m.send_msg(
-            self.route.request_id,
-            &WireMsg {
-                flags: WireFlags::train_frame(self.server_version, !has_more),
-                data: WireData::of_chunk(&self.batch, start, &chunk),
-                ..base
-            },
-        );
-        self.next_row = start + chunk.rows();
-        Ok(has_more)
+        let route = self.route;
+        let end = send_train_frame(w2m, route.request_id, &self.batch, self.next_row, budget, |last| {
+            reply_frame(route, last)
+        })?;
+        self.next_row = end;
+        Ok(end < self.batch.len())
     }
 }
 
@@ -93,132 +54,113 @@ impl WorkerProcess {
             .send_status(0, request_id, fault.status, fault.text.as_bytes());
     }
 
-    /// Reply with an **owned** `batch`: one frame when it fits, otherwise queued
-    /// and split, a frame per `drain_sal` pass. A STRING-column result splits
-    /// like any other.
-    ///
-    /// The fit is tested by reference, so the single-frame case never reaches
-    /// `Rc::new`. A `route.fifo` reply is queued even when it fits.
-    pub(super) fn send_scan_response(
-        &mut self,
-        route: ReplyRoute,
-        batch: Batch,
-        block: Option<Rc<Vec<u8>>>,
-        version: u16,
-    ) {
+    /// Reply with `batch`: one frame now when it fits and `route.fifo` is clear,
+    /// else a train queued behind the others.
+    pub(super) fn send_reply(&mut self, route: ReplyRoute, batch: impl Borrow<Batch> + Into<Rc<Batch>>) {
         if !route.fifo
             && emit_whole_if_fits(
                 &self.w2m_writer,
-                route,
-                block.as_deref().map(Vec::as_slice),
-                version,
-                &batch,
+                route.request_id,
+                batch.borrow(),
                 self.reply_frame_budget,
+                |last| reply_frame(route, last),
             )
         {
             return;
         }
-        self.queue_train(route, Rc::new(batch), block, version);
+        self.pending_streams
+            .push_back(PendingScan { batch: batch.into(), route, next_row: 0 });
     }
 
-    /// [`Self::send_scan_response`] for a batch already behind an `Rc` — a cached
-    /// full-scan snapshot, or a `ReadSpec` reply that may be one.
-    pub(super) fn send_shared_scan_response(
-        &mut self,
-        route: ReplyRoute,
-        batch: Rc<Batch>,
-        block: Option<Rc<Vec<u8>>>,
-        version: u16,
-    ) {
-        if !route.fifo
-            && emit_whole_if_fits(
-                &self.w2m_writer,
-                route,
-                block.as_deref().map(Vec::as_slice),
-                version,
-                &batch,
-                self.reply_frame_budget,
-            )
-        {
-            return;
-        }
-        self.queue_train(route, batch, block, version);
-    }
-
-    /// Queue a reply that did not go out whole, for `emit_pending_scan_chunk` to
-    /// split one frame per `drain_sal` pass.
-    fn queue_train(
-        &mut self,
-        route: ReplyRoute,
-        batch: Rc<Batch>,
-        prebuilt_schema: Option<Rc<Vec<u8>>>,
-        server_version: u16,
-    ) {
-        self.pending_streams.push_back(PendingScan {
-            batch,
-            route,
-            prebuilt_schema,
-            server_version,
-            next_row: 0,
-        });
-    }
-
-    /// Emit one frame of the FRONT pending train, popping it once its terminal
-    /// frame is sent or it faults. Called at the top of every `drain_sal` pass
-    /// (see the `pending_streams` field doc for why emission is FIFO and
-    /// confined there). A mid-train fault is deliverable: `parse_train_header`
-    /// errors on any non-zero status, so every drain aborts the train.
+    /// Emit the front train's next frame. A train that ends or faults is popped;
+    /// a fault answers its request instead.
     pub(super) fn emit_pending_scan_chunk(&mut self) {
-        let budget = self.reply_frame_budget;
-        // Disjoint field borrows: the train stays in place across the send.
         let Some(train) = self.pending_streams.front_mut() else {
             return;
         };
-        let outcome = train.emit_next(&self.w2m_writer, budget);
         let request_id = train.route.request_id;
-        if !matches!(outcome, Ok(true)) {
-            self.pending_streams.pop_front();
-        }
-        if let Err(fault) = outcome {
-            self.send_fault(&fault, request_id);
+        match train.emit_next(&self.w2m_writer, self.reply_frame_budget) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.pending_streams.pop_front();
+            }
+            Err(fault) => {
+                self.pending_streams.pop_front();
+                self.send_fault(&fault, request_id);
+            }
         }
     }
 }
 
 /// Emit `batch` whole as one terminal frame if it fits `budget` — heap and all,
-/// over the source batch, so no sub-batch is built. `false` means it must be
-/// split into a train. By reference, so an owned reply can be tested for fit
-/// before anything decides whether it needs an `Rc`.
-fn emit_whole_if_fits(
+/// over the source batch, so no sub-batch is built. `frame(last)` builds all but
+/// the payload.
+fn emit_whole_if_fits<'a>(
     w2m: &W2mWriter,
-    route: ReplyRoute,
-    block: Option<&[u8]>,
-    server_version: u16,
-    batch: &Batch,
+    req: u32,
+    batch: &'a Batch,
     budget: usize,
+    frame: impl Fn(bool) -> WireMsg<'a>,
 ) -> bool {
     let msg = WireMsg {
         data: WireData::Whole(batch),
-        ..reply_frame(route, block, server_version, true)
+        ..frame(true)
     };
-    // A row-less train has no data block to shrink, so it goes at any budget.
     if !batch.is_empty() && msg.size() > budget {
         return false;
     }
-    w2m.send_msg(route.request_id, &msg);
+    w2m.send_msg(req, &msg);
     true
 }
 
-/// A reply frame one row wide that still exceeds what a client can read. The
-/// row count is already at its floor, so there is nothing left to narrow.
-fn oversized_reply(sz: usize) -> gnitz_wire::WireFault {
-    gnitz_wire::WireFault::from(crate::runtime::wire::oversized_frame_message(sz))
+/// Send the frame of `batch` that starts at row `start`, flagged last when it
+/// reaches the end; `Ok` is the row after it. `Err` is a row too wide for any
+/// frame.
+fn send_train_frame<'a>(
+    w2m: &W2mWriter,
+    req: u32,
+    batch: &'a Batch,
+    start: usize,
+    budget: usize,
+    frame: impl Fn(bool) -> WireMsg<'a>,
+) -> Result<usize, gnitz_wire::WireFault> {
+    if start == 0 && emit_whole_if_fits(w2m, req, batch, budget, &frame) {
+        return Ok(batch.len());
+    }
+    let (chunk, size) = batch.wire_chunk_within(start, frame(false).size(), budget);
+    if size > FRAME_CAP {
+        return Err(crate::runtime::wire::oversized_frame_message(size).into());
+    }
+    let end = start + chunk.rows();
+    w2m.send_msg(
+        req,
+        &WireMsg {
+            data: WireData::of_chunk(batch, start, &chunk),
+            ..frame(end == batch.len())
+        },
+    );
+    Ok(end)
 }
 
-/// Stream `keys` to the master as a train over `frame_schema`, one span per
-/// row's PK region, `chunk_rows` spans in RAM at a time. An empty producer
-/// still sends the one terminal frame the master's drain waits for. Sends
-/// synchronously, so the caller must hold no queued train.
+/// Send all of `batch` now, as frames within `budget`.
+pub(super) fn send_train<'a>(
+    w2m: &W2mWriter,
+    req: u32,
+    batch: &'a Batch,
+    budget: usize,
+    frame: impl Fn(bool) -> WireMsg<'a>,
+) -> Result<(), gnitz_wire::WireFault> {
+    let mut start = 0;
+    loop {
+        start = send_train_frame(w2m, req, batch, start, budget, &frame)?;
+        if start == batch.len() {
+            return Ok(());
+        }
+    }
+}
+
+/// Send `keys` to the master as one train over `frame_schema`, a span per row's
+/// PK region, `chunk_rows` spans in RAM at a time.
 pub(crate) fn send_unique_preflight_keys(
     w2m_writer: &W2mWriter,
     target_id: u64,
@@ -228,10 +170,13 @@ pub(crate) fn send_unique_preflight_keys(
     chunk_rows: usize,
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {
-    let route = ReplyRoute { target_id, request_id, fifo: false };
-    // The synthetic schema has no version.
-    let frame = |last| reply_frame(route, None, 0, last);
-    let overhead = frame(false).size();
+    let route = ReplyRoute {
+        target_id,
+        request_id,
+        fifo: false,
+        // The synthetic schema has no version.
+        schema_version: 0,
+    };
     let mut chunk = Batch::with_capacity(frame_schema, keys.remaining().min(chunk_rows));
     loop {
         chunk.clear();
@@ -239,22 +184,10 @@ pub(crate) fn send_unique_preflight_keys(
             chunk.push_key_row(keys.next().expect("producer lends `remaining` spans"), 1);
         }
         let drained = keys.remaining() == 0;
-        let mut start = 0;
-        loop {
-            let (cut, _) = chunk.wire_chunk_within(start, overhead, budget);
-            let end = start + cut.rows();
-            w2m_writer.send_msg(
-                request_id,
-                &WireMsg {
-                    data: WireData::of_chunk(&chunk, start, &cut),
-                    ..frame(drained && end == chunk.len())
-                },
-            );
-            start = end;
-            if start == chunk.len() {
-                break;
-            }
-        }
+        send_train(w2m_writer, request_id, &chunk, budget, |last| {
+            reply_frame(route, drained && last)
+        })
+        .expect("a key span fits a frame");
         if drained {
             break;
         }

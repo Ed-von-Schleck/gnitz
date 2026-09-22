@@ -7,13 +7,12 @@
 
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::wire::{self, unique_preflight_wire_schema, FRAME_CAP};
+use crate::runtime::wire::{unique_preflight_wire_schema, FRAME_CAP};
 use crate::runtime::worker::send_unique_preflight_keys;
 use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{KeyProducer, SpillSort};
-use gnitz_wire::control::peek_control_block;
 use gnitz_wire::type_code;
 use gnitz_wire::WireStatus;
 
@@ -75,7 +74,7 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
             slot.internal_req_id, expected_req_id as u32,
             "ring prefix must carry the request id",
         );
-        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        let ctrl = slot.control();
         assert_eq!(ctrl.hdr.status, WireStatus::Ok);
         assert!(
             ctrl.hdr.flags.continuation,
@@ -87,8 +86,10 @@ fn drain_train(receiver: &W2mReceiver, frame_schema: &SchemaDescriptor, expected
             "no pre-flight frame carries a schema block: the master builds it"
         );
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let batch = wire::decode_train_frame(slot.bytes(), &ctrl, frame_schema, &mut offsets).expect("frame decodes");
-        if let Some(mb) = batch {
+        if let Some(data) = ctrl.data.clone() {
+            let mb =
+                gnitz_store::storage::decode_mem_batch_from_wal_block(&slot.bytes()[data], frame_schema, &mut offsets)
+                    .expect("frame decodes");
             for i in 0..mb.len() {
                 keys.push(PkBuf::from_bytes(mb.get_pk_bytes(i)));
             }
@@ -154,7 +155,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
     with_test_ring(|writer, receiver| {
         send_unique_preflight_keys(writer, 77, &frame_schema, 7, FRAME_CAP, 4, &mut producer_of(&[]));
         let slot = receiver.try_read_slot(0).expect("terminal frame");
-        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        let ctrl = slot.control();
         assert_eq!(ctrl.hdr.status, WireStatus::Ok);
         assert!(ctrl.hdr.flags.scan_last, "single frame must be terminal");
         assert!(ctrl.data.is_none(), "no data on empty train");

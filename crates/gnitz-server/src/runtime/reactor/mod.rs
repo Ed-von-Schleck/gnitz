@@ -28,12 +28,14 @@ mod runloop;
 mod sync;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::reactor_with_rings;
 mod uring;
 mod wake_queue;
 
 pub(crate) use conn::{PeerGone, SendBody};
 
-pub(crate) use futures::{worker_fault, AckLease, TrainLease};
+pub(crate) use futures::{AckLease, TrainFrame, TrainLease};
 use futures::{AckRoute, TimerFuture, TrainRoute};
 use runloop::{RunQueue, REACTOR_RUN_QUEUE};
 use wake_queue::WakeQueue;

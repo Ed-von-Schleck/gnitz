@@ -1,13 +1,17 @@
 //! Reactor futures: the W2M routes of [`AckLease`] and [`TrainLease`], and the
 //! futures woken by a routed frame or a passed deadline.
 
+use std::ops::Range;
+
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::{decode_mem_batch_from_wal_block, MemBatch, MAX_BATCH_REGIONS};
 use gnitz_wire::WireFault;
 
 use super::*;
-use crate::runtime::sal::WorkerSet;
+use crate::runtime::sal::{SalMessageKind, WorkerSet};
 
 /// Worker `w`'s fault `f`, its text naming the worker and `op`.
-pub(crate) fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
+fn worker_fault(w: usize, op: &str, f: WireFault) -> WireFault {
     WireFault {
         text: format!("worker {w}: {op}: {}", f.text),
         ..f
@@ -127,9 +131,9 @@ impl Reactor {
         }
     }
 
-    /// One request id, answered by a train of frames from every worker in `set`.
-    /// See [`TrainLease`].
-    pub(crate) fn lease_train(&self, set: WorkerSet) -> TrainLease {
+    /// One request id, answered by a train of frames from every worker in `set`,
+    /// written for `kind`. See [`TrainLease`].
+    pub(crate) fn lease_train(&self, set: WorkerSet, kind: SalMessageKind) -> TrainLease {
         let set = set.within(self.inner.w2m.num_workers());
         let id = self.alloc_request_ids(1);
         let queues = (0..set.len()).map(|_| WakeQueue::default()).collect();
@@ -138,6 +142,8 @@ impl Reactor {
             inner: Rc::clone(&self.inner),
             id,
             workers: set,
+            left: Cell::new(set),
+            kind,
         }
     }
 
@@ -240,8 +246,35 @@ impl Drop for AckLease {
 pub(crate) struct TrainLease {
     inner: Rc<ReactorShared>,
     id: u32,
-    /// Its route's `set`.
+    /// The set its route was built over.
     workers: WorkerSet,
+    /// The workers whose terminal frame has not been read.
+    left: Cell<WorkerSet>,
+    /// What the lease was written for, named in every fault it reports.
+    kind: SalMessageKind,
+}
+
+/// One frame of a train that carries rows. `slot` pins its ring bytes.
+pub(crate) struct TrainFrame {
+    pub(crate) slot: W2mSlot,
+    data: Range<usize>,
+}
+
+impl TrainFrame {
+    /// The frame's rows under `schema`, aborting on failure: the ring is trusted.
+    pub(crate) fn rows<'a>(
+        &'a self,
+        schema: &SchemaDescriptor,
+        offsets: &'a mut [usize; MAX_BATCH_REGIONS],
+    ) -> MemBatch<'a> {
+        match decode_mem_batch_from_wal_block(&self.slot.bytes()[self.data.clone()], schema, offsets) {
+            Ok(mb) => mb,
+            Err(e) => gnitz_fatal_abort!(
+                "w2m: worker={} train frame does not decode under the reader's schema: {e}",
+                self.slot.worker
+            ),
+        }
+    }
 }
 
 impl TrainLease {
@@ -255,8 +288,41 @@ impl TrainLease {
         self.workers
     }
 
-    /// Worker `w`'s next frame.
-    pub(crate) async fn next_frame(&self, w: usize) -> W2mSlot {
+    /// Worker `w`'s next frame that carries rows, `None` once its train has ended;
+    /// `Err` on a fault frame.
+    pub(crate) async fn next_of(&self, w: usize) -> Result<Option<TrainFrame>, WireFault> {
+        while self.left.get().contains(w) {
+            let slot = self.next_slot(w).await;
+            let ctrl = slot.control();
+            if let Some(f) = ctrl.fault() {
+                return Err(worker_fault(w, &format!("{:?}", self.kind), f));
+            }
+            debug_assert!(
+                ctrl.schema.is_none(),
+                "worker {w}: a reply frame carries a schema block"
+            );
+            if ctrl.hdr.flags.scan_last {
+                self.left.set(self.left.get().without(w));
+            }
+            if let Some(data) = ctrl.data {
+                return Ok(Some(TrainFrame { slot, data }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The next frame that carries rows, workers in ascending order.
+    pub(crate) async fn next(&self) -> Result<Option<TrainFrame>, WireFault> {
+        while let Some(w) = self.left.get().iter().next() {
+            if let Some(f) = self.next_of(w).await? {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Worker `w`'s next routed slot.
+    async fn next_slot(&self, w: usize) -> W2mSlot {
         std::future::poll_fn(|cx| {
             let mut trains = self.inner.trains.borrow_mut();
             let route = trains.get_mut(&self.id).expect("a leased id is routed");

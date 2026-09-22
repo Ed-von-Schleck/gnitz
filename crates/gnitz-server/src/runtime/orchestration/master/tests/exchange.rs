@@ -25,10 +25,9 @@ fn control(view_id: i64, source_id: i64, flags: WireFlags) -> DecodedControl {
 }
 
 /// One worker's TERMINAL exchange frame — the whole report when the partition
-/// fits one frame. Only the first worker of a round carries a schema here; `pad`
-/// is the backfill pad bit (steady-state exchanges leave `flags.backfill_pad`
+/// fits one frame. `pad` is the backfill pad bit (steady-state exchanges leave `flags.backfill_pad`
 /// clear).
-fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> DecodedWire {
+fn make_wire(view_id: i64, source_id: i64, pad: bool) -> DecodedWire {
     DecodedWire {
         control: control(
             view_id,
@@ -38,7 +37,7 @@ fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> Deco
                 ..WireFlags::train_frame(0, true)
             },
         ),
-        schema: with_schema.then(u64_pk_only),
+        schema: Some(u64_pk_only()),
         data_batch: None,
     }
 }
@@ -80,32 +79,12 @@ fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> Decoded
 fn round_completes_on_the_last_worker_with_all_pad_anded() {
     for (pads, want_all_pad) in [([true, true], true), ([true, false], false), ([false, false], false)] {
         let mut acc = ExchangeAccumulator::new(2);
-        assert!(
-            acc.process(0, make_wire(7, 3, true, pads[0])).is_none(),
-            "one of two workers"
-        );
+        assert!(acc.process(0, make_wire(7, 3, pads[0])).is_none(), "one of two workers");
         let relay = acc
-            .process(1, make_wire(7, 3, false, pads[1]))
+            .process(1, make_wire(7, 3, pads[1]))
             .expect("the last worker completes the round");
         assert_eq!((relay.view_id, relay.source_id, relay.all_pad), (7, 3, want_all_pad));
     }
-}
-
-/// A round nobody sent a schema for is dropped rather than relayed — and dropped
-/// whole: the same `(view, source)` opens a fresh round afterwards.
-#[test]
-fn schema_less_round_is_dropped_and_the_key_reopens() {
-    let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire(5, 0, false, false)).is_none());
-    assert!(
-        acc.process(1, make_wire(5, 0, false, false)).is_none(),
-        "a schema-less round must not relay"
-    );
-    assert!(acc.process(0, make_wire(5, 0, true, false)).is_none());
-    assert!(
-        acc.process(1, make_wire(5, 0, false, false)).is_some(),
-        "the dropped round left nothing behind for the next one to complete against"
-    );
 }
 
 /// A view with two sources opens one round per source: worker 0 reporting for
@@ -113,19 +92,19 @@ fn schema_less_round_is_dropped_and_the_key_reopens() {
 #[test]
 fn rounds_are_keyed_by_source_id() {
     let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire(42, 100, true, false)).is_none());
+    assert!(acc.process(0, make_wire(42, 100, false)).is_none());
     assert!(
-        acc.process(1, make_wire(42, 200, true, false)).is_none(),
+        acc.process(1, make_wire(42, 200, false)).is_none(),
         "a different source's worker must not complete source 100's round"
     );
     assert_eq!(
-        acc.process(1, make_wire(42, 100, false, false))
+        acc.process(1, make_wire(42, 100, false))
             .expect("source 100's round completes on its second worker")
             .source_id,
         100
     );
     assert_eq!(
-        acc.process(0, make_wire(42, 200, false, false))
+        acc.process(0, make_wire(42, 200, false))
             .expect("source 200's round was still open")
             .source_id,
         200

@@ -15,7 +15,7 @@ use rustc_hash::FxHashSet;
 use super::*;
 
 use super::scatter::{with_group, with_worker_indices};
-use super::train::drain_index_scan;
+use super::train::drain_rows;
 use crate::catalog::{FkEdge, RowConstraints};
 use crate::runtime::orchestration::TxnFamily;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
@@ -482,7 +482,7 @@ async fn execute_probe_burst(
                             .enumerate()
                             .filter(|(_, rows)| !rows.is_empty())
                             .fold(WorkerSet::EMPTY, |set, (w, _)| set.with(w));
-                        cut.push(holders, |excl, t| {
+                        cut.push(SalMessageKind::HasPk, holders, |excl, t| {
                             with_group(&check.batch, idx, &check.schema, group(t), |g| excl.write(g))
                         })
                     })?,
@@ -499,8 +499,8 @@ async fn execute_probe_burst(
         })
         .await?;
 
-    for (i, lease) in leases.iter().enumerate() {
-        drain_index_scan(lease, "pipeline", checks[i].reply_schema(), |b| sink(i, b)).await?;
+    for (i, (lease, check)) in leases.iter().zip(checks).enumerate() {
+        drain_rows(lease, check.reply_schema(), |b| sink(i, b)).await?;
     }
     Ok(())
 }

@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
-use gnitz_store::storage::{Batch, Layout, MemBatch, WireChunk, MAX_BATCH_REGIONS};
+use gnitz_store::storage::{Batch, Layout, WireChunk, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block, DecodedControl};
 use gnitz_wire::{WireFlags, WireStatus};
 
@@ -223,20 +223,11 @@ impl<'a> WireMsg<'a> {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Validate that a peer-supplied schema descriptor matches the expected one.
-/// Applied at every trust boundary where rows are decoded against a descriptor
-/// the sender chose (client INSERT frames, worker reply trains) — batch append
-/// helpers do not validate shape, so an unguarded mismatch turns into
-/// misinterpreted bytes handed onward.
+/// `Err` naming the first differing column unless `wire` is `expected`.
 pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDescriptor) -> Result<(), String> {
     if wire == expected {
         return Ok(());
     }
-    // `==` is the verdict; the scan only *names* the first differing column and
-    // restates no field list — `SchemaColumn: PartialEq` covers every field, and
-    // `Debug` renders exactly the fields `PartialEq` compares. Every error path
-    // that surfaces this string does so to a human, and a 65-column schema is not
-    // diffable by eye.
     let at = (wire.num_columns() == expected.num_columns())
         .then(|| (0..wire.num_columns()).find(|&i| wire.columns[i] != expected.columns[i]))
         .flatten()
@@ -244,17 +235,8 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
     Err(format!("Schema mismatch{at}: expected {expected:?}, got {wire:?}"))
 }
 
-/// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
-/// columns of `idx_schema`, all marked PK. Its `pk_stride` is exactly
-/// `idx_key_size`, so the OPK leading-key span fills that PK region verbatim —
-/// built per-index because no single fixed-width column can represent a
-/// composite (e.g. 24-byte) span. The one definition shared by the worker's
-/// encoder (`send_unique_preflight_keys`) and the master's merge decoder, so the
-/// frame layout agrees by construction.
-///
-/// `idx_schema` must come from `make_index_schema`, whose columns are all
-/// non-nullable — which is what satisfies the constructor's non-nullable-PK
-/// assertion.
+/// Wire schema of a unique pre-flight reply frame: the leading `n_promoted`
+/// columns of `idx_schema`, all PK, so a row's PK region is one indexed-key span.
 pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
     let cols = &idx_schema.columns[..n_promoted];
     let pks: Vec<u32> = (0..n_promoted as u32).collect();
@@ -302,26 +284,6 @@ pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, String> {
     Ok(decoded)
 }
 
-/// One frame of a worker train, borrowed from `data`. A frame carrying its own
-/// schema block must carry `expected`.
-pub(crate) fn decode_train_frame<'a>(
-    data: &'a [u8],
-    control: &DecodedControl,
-    expected: &SchemaDescriptor,
-    offsets: &'a mut [usize; MAX_BATCH_REGIONS],
-) -> Result<Option<MemBatch<'a>>, String> {
-    let mut block_schema = None;
-    let data_block = decode_schema_into(data, control, &mut block_schema)?;
-    if let Some(s) = &block_schema {
-        validate_schema_match(s, expected)?;
-    }
-    let Some(r) = data_block else { return Ok(None) };
-    let schema = block_schema.as_ref().unwrap_or(expected);
-    let mb =
-        gnitz_store::storage::decode_mem_batch_from_wal_block(&data[r], schema, offsets).map_err(str::to_string)?;
-    Ok(Some(mb))
-}
-
 /// Install an engine-authored frame's layout claim: its `batch_consolidated`
 /// bit is real, and skipping the re-fold is the point of sending it, so the batch
 /// is raised off `Raw`. `certify_layout`
@@ -339,19 +301,6 @@ fn certify_engine_frame(decoded: &mut DecodedWire) {
     }
 }
 
-/// Decode a frame's own schema block into `out`, and hand back the extent of
-/// its data block.
-fn decode_schema_into(
-    data: &[u8],
-    control: &DecodedControl,
-    out: &mut Option<SchemaDescriptor>,
-) -> Result<Option<std::ops::Range<usize>>, String> {
-    if let Some(r) = &control.schema {
-        *out = Some(decode_schema_block(&data[r.clone()])?);
-    }
-    Ok(control.data.clone())
-}
-
 /// A frame decoded into its `DecodedWire`, every field built in the slot it
 /// stays in rather than assembled from a returned tuple.
 fn decode_frame(
@@ -361,8 +310,12 @@ fn decode_frame(
     decode: impl FnOnce(&[u8], &SchemaDescriptor) -> Result<Batch, &'static str>,
 ) -> Result<DecodedWire, String> {
     let mut out = DecodedWire { control, schema: None, data_batch: None };
-    let data_block = decode_schema_into(data, &out.control, &mut out.schema)?;
-    let Some(r) = data_block else { return Ok(out) };
+    if let Some(r) = &out.control.schema {
+        out.schema = Some(decode_schema_block(&data[r.clone()])?);
+    }
+    let Some(r) = out.control.data.clone() else {
+        return Ok(out);
+    };
 
     let (block_schema, batch) = (&out.schema, &mut out.data_batch);
     let schema = block_schema

@@ -1,9 +1,7 @@
 use super::*;
-use crate::catalog::PUBLIC_SCHEMA_ID;
 use crate::runtime::sal::fixtures::bare_message;
 use crate::runtime::w2m::{self, W2mReceiver};
-use crate::test_support::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema};
-use gnitz_store::relation::Relation;
+use crate::test_support::{make_batch_raw, make_schema_u64_i64, u64_pk_schema};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::BatchBuilder;
@@ -24,7 +22,7 @@ fn pending_deltas_accumulate_per_relation() {
     assert_eq!(pending[&200].len(), 1, "a different table gets its own entry");
 }
 
-/// Every reply helper (`send_ack`, `send_scan_response`, `send_fault`) publishes
+/// Every reply helper (`send_ack`, `send_reply`, `send_fault`) publishes
 /// on the ring prefix of the request id it was handed.
 #[test]
 fn send_helpers_publish_on_the_request_id() {
@@ -37,9 +35,8 @@ fn send_helpers_publish_on_the_request_id() {
     let req_resp: u32 = 0xCAFE_BABE;
     let req_err: u32 = 0x7FFF_FFFE;
     wp.send_ack(7, req_ack);
-    // No block, so no catalog is consulted: this test has none (null catalog pointer).
     let schema = make_schema_u64_i64();
-    wp.send_scan_response(route(8, req_resp), Batch::empty_with_schema(&schema), None, 0);
+    wp.send_reply(route(8, req_resp), Batch::empty_with_schema(&schema));
     wp.send_fault(&gnitz_wire::WireFault::from("boom"), req_err);
 
     let decoded_ids: Vec<u32> = walk_frames(region_ptr).iter().map(|(id, _)| *id).collect();
@@ -62,7 +59,12 @@ fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerPro
 /// The reply route every helper below takes, in the order `dispatch_inner`
 /// resolves it. Inline-emitting; [`fifo_route`] is the queued twin.
 fn route(target_id: u64, request_id: u32) -> ReplyRoute {
-    ReplyRoute { target_id, request_id, fifo: false }
+    ReplyRoute {
+        target_id,
+        request_id,
+        fifo: false,
+        schema_version: 0,
+    }
 }
 
 /// [`route`] for a group the master wrote as one of several.
@@ -224,6 +226,28 @@ fn exchange_relay_inside_exchange() {
             .is_some(),
         "a key-matching relay must short-circuit out of the dispatcher with its batch"
     );
+}
+
+/// A request dispatched inside an exchange wait leaves a queued train unsent: a
+/// slow client can fill the ring, and a worker blocked on it would never read
+/// the relay it waits for.
+#[test]
+fn a_queued_train_is_not_emitted_inside_an_exchange_wait() {
+    let (region, writer) = ring_and_writer();
+    let ptr = region.ptr();
+    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+    wp.send_reply(fifo_route(1, 5), make_n_row_batch(make_schema_u64_i64(), 3));
+
+    let relay = encode_relay_frame(200, 0, &make_schema_u64_i64());
+    assert!(wp
+        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::ExchangeRelay, 200), relay)
+        .is_none());
+    assert!(wp
+        .dispatch_in_eval((100, 5), &bare_message(SalMessageKind::Tick, 999), tick_frame(999, 7))
+        .is_none());
+
+    assert_eq!(wp.pending_streams.front().map(|t| t.next_row), Some(0));
+    assert!(walk_frames(ptr).is_empty());
 }
 
 /// ExchangeRelay at TopLevel is a protocol bug — it can only arrive
@@ -414,12 +438,11 @@ fn consume_one(ptr: *mut u8) -> Vec<u8> {
     frame
 }
 
-/// Wire size of a frame carrying `count` rows of `schema`, with an optional
-/// schema block — the budget that fits exactly that many rows.
-fn frame_size(schema: SchemaDescriptor, count: usize, prebuilt: Option<&[u8]>) -> usize {
+/// Wire size of a frame carrying `count` rows of `schema` — the budget that fits
+/// exactly that many rows.
+fn frame_size(schema: SchemaDescriptor, count: usize) -> usize {
     ipc::WireMsg {
         data: ipc::WireData::Whole(&make_n_row_batch(schema, count)),
-        schema_block: prebuilt,
         ..Default::default()
     }
     .size()
@@ -435,10 +458,8 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         ("padded", make_n_row_batch(padded_schema(), 40)),
     ] {
         let schema = *batch.schema();
-        let block = Rc::new(crate::catalog::encode_schema_block(&schema));
-        let per_row = frame_size(schema, 2, None) - frame_size(schema, 1, None);
-        // Room for four rows beside the schema block on the first frame.
-        let budget = frame_size(schema, 4, Some(block.as_slice()));
+        let per_row = frame_size(schema, 2) - frame_size(schema, 1);
+        let budget = frame_size(schema, 4);
 
         let (region, writer) = ring_and_writer();
         let ptr = region.ptr();
@@ -447,8 +468,6 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch),
             route: route(1, 5),
-            prebuilt_schema: Some(block),
-            server_version: 0,
             next_row: 0,
         });
         let mut passes = 0;
@@ -476,8 +495,6 @@ fn train_frames_fill_the_budget_to_within_one_row() {
     }
 }
 
-/// First (and only) PendingScan chunk — next_row == 0, so the prebuilt schema
-/// block must appear in the frame and decode_wire_ipc must succeed without a hint.
 /// `force_fifo` is the whole difference between a splittable reply emitting
 /// inline and the same reply queueing through `pending_streams` — which is what
 /// puts a multi-scan's relations on the ring in request order. Either way its
@@ -491,7 +508,7 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
         let r = if force_fifo { fifo_route(1, 3) } else { route(1, 3) };
-        wp.send_shared_scan_response(r, Rc::new(make_n_row_batch(schema, 5)), None, 0);
+        wp.send_reply(r, Rc::new(make_n_row_batch(schema, 5)));
 
         if force_fifo {
             assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
@@ -507,11 +524,15 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         assert!(ctrl.hdr.flags.continuation);
 
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let decoded = ipc::decode_train_frame(&data, &ctrl, &schema, &mut offsets).expect("decode with schema hint");
-        let b = decoded.as_ref().expect("data block");
+        let b = gnitz_store::storage::decode_mem_batch_from_wal_block(
+            &data[ctrl.data.clone().expect("data block")],
+            &schema,
+            &mut offsets,
+        )
+        .expect("decode with schema hint");
         assert_eq!(b.len(), 5);
         for i in 0..5usize {
-            assert_eq!(mem_pk(b, i), i as u128);
+            assert_eq!(mem_pk(&b, i), i as u128);
         }
     }
 }
@@ -539,7 +560,7 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_shared_scan_response(fifo_route(1, 5), Rc::clone(&batch), None, 0);
+    wp.send_reply(fifo_route(1, 5), Rc::clone(&batch));
     assert_eq!(wp.pending_streams.len(), 1, "force_fifo queues even a fitting reply");
     assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
@@ -576,11 +597,9 @@ fn walk_frames(ptr: *mut u8) -> Vec<(u32, Vec<u8>)> {
     out
 }
 
-/// A batch of `count` decodable all-zero rows — used to cross a wire-size
-/// limit without writing that many real bytes.
 /// Two queued trains drain strictly FIFO: every frame of train A
-/// (multi-chunk, terminal `scan_last`) precedes train B's, and B's
-/// first chunk carries B's own schema block.
+/// (multi-chunk, terminal `scan_last`) precedes train B's, and each queued
+/// train's frames echo its own route's `schema_version`.
 #[test]
 fn pending_streams_drain_two_trains_fifo() {
     let schema_a = make_schema_u64_i64();
@@ -595,28 +614,21 @@ fn pending_streams_drain_two_trains_fifo() {
     );
     let batch_a = make_n_row_batch(schema_a, 10);
     let batch_b = make_n_row_batch(schema_b, 5);
-    let block_a = Rc::new(crate::catalog::encode_schema_block(&schema_a));
-    let block_b = Rc::new(crate::catalog::encode_schema_block(&schema_b));
 
-    // Budget: exactly the first chunk's size at 4 rows (A's schema block
-    // included), so train A's 10 rows span at least two frames.
-    let budget = frame_size(schema_a, 4, Some(block_a.as_slice()));
+    // Budget: exactly 4 of A's rows, so train A's 10 rows span several frames.
+    let budget = frame_size(schema_a, 4);
 
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_a),
-        route: route(1, 11),
-        prebuilt_schema: Some(block_a),
-        server_version: 0,
+        route: ReplyRoute { schema_version: 7, ..route(1, 11) },
         next_row: 0,
     });
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_b),
-        route: route(2, 22),
-        prebuilt_schema: Some(block_b),
-        server_version: 0,
+        route: ReplyRoute { schema_version: 9, ..route(2, 22) },
         next_row: 0,
     });
 
@@ -638,36 +650,30 @@ fn pending_streams_drain_two_trains_fifo() {
     let last_a = frames.iter().rposition(|(req, _)| *req == 11).unwrap();
     assert!(last_a < first_b, "train A's frames must FULLY precede train B's");
 
-    // Per train: every frame is a continuation, only the last is terminal,
-    // the chunks cover every row exactly once, and the FIRST chunk carries
-    // that train's own schema block (decodes standalone with its column
-    // count; continuations decode only against the train's schema hint).
-    for (req, schema, ncols, total_rows) in [(11u32, &schema_a, 2usize, 10usize), (22u32, &schema_b, 3usize, 5usize)] {
+    for (req, schema, version, total_rows) in [(11u32, &schema_a, 7u16, 10usize), (22u32, &schema_b, 9u16, 5usize)] {
         let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
         let mut rows = 0usize;
         for (i, (_, bytes)) in train.iter().enumerate() {
             let ctrl = gnitz_wire::control::peek_control_block(bytes).expect("ctrl");
             assert!(ctrl.hdr.flags.continuation);
+            assert!(ctrl.schema.is_none(), "a reply frame carries no schema block");
+            assert_eq!(
+                ctrl.hdr.flags.schema_version, version,
+                "the frame echoes its route's version"
+            );
             let is_last = i == train.len() - 1;
             assert_eq!(
                 ctrl.hdr.flags.scan_last, is_last,
                 "scan_last only on the train's terminal chunk"
             );
-            if i == 0 {
-                let decoded = ipc::decode_wire_ipc(bytes).expect("first chunk must decode standalone");
-                let s = decoded.schema.expect("first chunk carries a schema block");
-                assert_eq!(s.num_columns(), ncols, "the block is this train's schema");
-                rows += decoded.data_batch.map(|b| b.len()).unwrap_or(0);
-            } else {
-                assert!(
-                    ipc::decode_wire_ipc(bytes).is_err(),
-                    "a continuation carries no schema block, so it cannot decode standalone"
-                );
-                let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-                let decoded = ipc::decode_train_frame(bytes, &ctrl, schema, &mut offsets)
-                    .expect("continuation decodes against the schema hint");
-                rows += decoded.map(|b| b.len()).unwrap_or(0);
-            }
+            let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
+            let b = gnitz_store::storage::decode_mem_batch_from_wal_block(
+                &bytes[ctrl.data.clone().expect("data block")],
+                schema,
+                &mut offsets,
+            )
+            .expect("every frame decodes against the train's schema");
+            rows += b.len();
         }
         assert_eq!(rows, total_rows, "the train's chunks cover all rows exactly once");
     }
@@ -684,7 +690,7 @@ fn an_oversized_reply_enqueues_a_train() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(3, 5), batch, None, 0);
+    wp.send_reply(route(3, 5), batch);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
     assert_eq!(ps.next_row, 0);
@@ -708,7 +714,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = 512;
-    wp.send_scan_response(route(1, 5), batch, None, 0);
+    wp.send_reply(route(1, 5), batch);
 
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
@@ -740,7 +746,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(1, 5), batch, None, 0);
+    wp.send_reply(route(1, 5), batch);
     assert_eq!(
         wp.pending_streams.len(),
         1,
@@ -782,7 +788,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = budget;
-    wp.send_scan_response(route(1, 5), source, None, 0);
+    wp.send_reply(route(1, 5), source);
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
         wp.emit_pending_scan_chunk();
@@ -806,54 +812,16 @@ fn a_long_string_train_reassembles_with_its_weights() {
             "scan_last only on the terminal frame"
         );
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let decoded = ipc::decode_train_frame(bytes, &ctrl, &schema, &mut offsets)
-            .expect("every frame decodes against the client's own schema");
-        let b = decoded.as_ref().expect("data block");
+        let b = gnitz_store::storage::decode_mem_batch_from_wal_block(
+            &bytes[ctrl.data.clone().expect("data block")],
+            &schema,
+            &mut offsets,
+        )
+        .expect("every frame decodes against the client's own schema");
         for r in 0..b.len() {
-            got.push((mem_pk(b, r), b.get_weight(r), gnitz_expr::payload_string(b, r, 0)));
+            got.push((mem_pk(&b, r), b.get_weight(r), gnitz_expr::payload_string(&b, r, 0)));
         }
     }
     let want: Vec<(u128, i64, String)> = rows.iter().map(|(k, v)| (*k as u128, 1i64, v.clone())).collect();
     assert_eq!(got, want, "the train reassembles to the source, weights included");
-}
-
-/// A projected schema cached under the table's id would decode a later table
-/// reply at the wrong stride.
-#[test]
-fn a_reader_held_reply_carries_no_block_at_version_0() {
-    let dir = crate::test_support::scratch_dir("worker", "reader_held_reply");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![
-        col_def("id", type_code::U64),
-        col_def("a", type_code::U64),
-        col_def("b", type_code::U64),
-    ];
-    let tid = crate::catalog::FIRST_USER_TABLE_ID;
-    engine
-        .register_table(tid, PUBLIC_SCHEMA_ID, "tproj", &cols, &[0])
-        .unwrap();
-    let table_schema = engine.registry.relation(tid).map(Relation::schema).unwrap();
-    let projected = gnitz_store::schema::project_schema(&table_schema, &[1]).unwrap();
-
-    let (region, writer) = ring_and_writer();
-    let ptr = region.ptr();
-    let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
-
-    let small = Batch::zeroed(&projected, 2);
-    wp.send_scan_response(route(tid as u64, 5), small, None, 0);
-    let frames = walk_frames(ptr);
-    assert_eq!(frames.len(), 1);
-    let ctrl = gnitz_wire::control::peek_control_block(&frames[0].1).unwrap();
-    assert!(ctrl.schema.is_none(), "a fitting reply ships no block");
-    assert_eq!(ctrl.hdr.flags.schema_version, 0);
-
-    let rows = (ipc::FRAME_CAP / 32) + 4096;
-    let big = Batch::zeroed(&projected, rows);
-    wp.send_scan_response(route(tid as u64, 6), big, None, 0);
-    assert_eq!(wp.pending_streams.len(), 1);
-    let ps = wp.pending_streams.front().unwrap();
-    assert!(ps.prebuilt_schema.is_none(), "a queued train ships no block");
-    assert_eq!(ps.server_version, 0);
-
-    engine.close();
 }

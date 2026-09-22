@@ -8,93 +8,45 @@
 
 use super::*;
 
-use super::train::Train;
+use std::ops::Range;
+
 use super::unique_filter::UNIQUE_FILTER_CAP;
-use crate::runtime::w2m::W2mSlot;
+use crate::runtime::reactor::TrainFrame;
 use gnitz_store::relation::Relation;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::storage::MAX_BATCH_REGIONS;
-use gnitz_wire::control::DecodedControl;
 
-/// The `what` every unique pre-flight frame error is prefixed with.
-const OP_UNIQUE_PREFLIGHT: &str = "unique pre-flight";
-
-/// Per-worker state for one sorted-key stream in `merge_index_scan`.
-///
-/// The frame's key region is an offset into the pinned ring slot rather than a
-/// borrowed view, so there is no self-reference and no drop-order contract.
+/// One worker's sorted spans in `merge_index_scan`: the frame being read, which
+/// pins its ring bytes, and the byte range of its unread keys inside them.
 struct PreflightKeyStream<'l> {
-    /// The worker's train this reads.
-    train: Train<'l>,
-    /// The frame currently being read; pins its ring bytes until replaced.
-    slot: Option<W2mSlot>,
-    /// Byte offset of the frame's PK region into the slot, and its key count;
-    /// zeroed for an empty frame. The stride is `frame_schema.pk_stride()` for
-    /// every frame of every train, so it is not recorded here.
-    pk_off: usize,
-    count: usize,
-    /// Cursor into the current frame's keys.
-    row: usize,
+    lease: &'l TrainLease,
+    w: usize,
+    frame: Option<TrainFrame>,
+    keys: Range<usize>,
 }
 
-impl<'l> PreflightKeyStream<'l> {
-    fn new(train: Train<'l>) -> Self {
-        PreflightKeyStream {
-            train,
-            slot: None,
-            pk_off: 0,
-            count: 0,
-            row: 0,
-        }
-    }
-
-    /// Install `slot` as the current frame, locating its key region.
-    /// An undecodable frame is an immediate `Err` — the caller unwinds to the
-    /// scan lease's drop, which discards the undrained trains.
-    fn attach_frame(
-        &mut self,
-        slot: W2mSlot,
-        ctrl: &DecodedControl,
-        frame_schema: &SchemaDescriptor,
-    ) -> Result<(), WireFault> {
-        self.row = 0;
-        self.count = 0;
-        let mut offsets = [0usize; MAX_BATCH_REGIONS];
-        let batch = self.train.rows(&slot, ctrl, frame_schema, &mut offsets)?;
-        let bytes = slot.bytes();
-        if let Some(mb) = batch {
-            let pk = mb.pk();
-            // `pk` points inside `bytes`, which `slot` owns for as long as it is
-            // held; record where, then let the view go.
-            self.pk_off = pk.as_ptr() as usize - bytes.as_ptr() as usize;
-            self.count = mb.len();
-        }
-        self.slot = Some(slot);
-        Ok(())
-    }
-
-    /// The key at `row` of the current frame.
-    fn key_at(&self, row: usize, pk_stride: usize) -> PkBuf {
-        let bytes = self.slot.as_ref().expect("frame attached").bytes();
-        let start = self.pk_off + row * pk_stride;
-        PkBuf::from_bytes(&bytes[start..start + pk_stride])
-    }
-
-    /// Yield this worker's next span, pulling continuation frames on demand.
-    /// Returns `Ok(None)` once the train is terminal.
+impl PreflightKeyStream<'_> {
+    /// Yield this worker's next span, pulling frames on demand. Returns
+    /// `Ok(None)` once the train has ended.
     async fn next_key(&mut self, frame_schema: &SchemaDescriptor) -> Result<Option<PkBuf>, WireFault> {
-        let pk_stride = frame_schema.pk_stride();
+        let stride = frame_schema.pk_stride();
         loop {
-            if self.row < self.count {
-                let key = self.key_at(self.row, pk_stride);
-                self.row += 1;
-                return Ok(Some(key));
+            if let Some(f) = &self.frame {
+                if !self.keys.is_empty() {
+                    let s = self.keys.start;
+                    self.keys.start += stride;
+                    return Ok(Some(PkBuf::from_bytes(&f.slot.bytes()[s..s + stride])));
+                }
             }
-            let Some((slot, ctrl)) = self.train.next().await? else {
-                self.slot = None; // release the ring slot at the train's end
+            self.frame = None; // release the ring slot before waiting on the next
+            let Some(f) = self.lease.next_of(self.w).await? else {
                 return Ok(None);
             };
-            self.attach_frame(slot, &ctrl, frame_schema)?;
+            let mut offsets = [0usize; MAX_BATCH_REGIONS];
+            let mb = f.rows(frame_schema, &mut offsets);
+            let start = mb.pk().as_ptr() as usize - f.slot.bytes().as_ptr() as usize;
+            self.keys = start..start + mb.len() * stride;
+            self.frame = Some(f);
         }
     }
 }
@@ -143,22 +95,9 @@ impl PreflightAccumulator {
     }
 }
 
-/// Streaming k-way merge over the per-worker SORTED key streams of a unique
-/// pre-flight fan-out. Master memory is `O(num_workers)`; frame bytes the merge
-/// has not reached stay in the per-worker W2M rings.
-///
-/// **The wire is byte-transparent for a span of any width.** A frame's whole PK
-/// region IS the OPK leading-key span (`pk_stride == idx_key_size`), read
-/// verbatim as a `PkBuf`, and both sides build `frame_schema` from the same
-/// inputs — so nothing here decodes a column or takes a catalog lock.
-///
-/// One adjacent-equal check catches both duplicate classes: two equal keys from
-/// one worker pop consecutively out of its sorted run, and the same value held
-/// by two workers surfaces as two equal heads.
-///
-/// Returns on the FIRST error and on the first duplicate without draining the
-/// rest — the caller's scan lease drop discards the undrained trains at the
-/// ring boundary, as it does for `drain_index_scan`.
+/// Streaming k-way merge over the workers' sorted span trains, holding one frame
+/// per worker, stopping at the first error or duplicate. Equal spans pop
+/// adjacently whether one worker or two hold them.
 async fn merge_index_scan(
     scan: &TrainLease,
     frame_schema: &SchemaDescriptor,
@@ -169,12 +108,9 @@ async fn merge_index_scan(
     let mut streams: Vec<PreflightKeyStream> = scan
         .workers()
         .iter()
-        .map(|w| PreflightKeyStream::new(Train::new(scan, w, OP_UNIQUE_PREFLIGHT)))
+        .map(|w| PreflightKeyStream { lease: scan, w, frame: None, keys: 0..0 })
         .collect();
 
-    // Ordered by (span, stream index) — byte-lexicographic via `PkBuf: Ord` —
-    // so equal spans pop adjacently whichever workers hold them. The tie-break
-    // is the stream's position in `streams`.
     let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(streams.len());
     for (i, s) in streams.iter_mut().enumerate() {
         if let Some(key) = s.next_key(frame_schema).await? {

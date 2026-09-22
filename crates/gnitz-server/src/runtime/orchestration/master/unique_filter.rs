@@ -8,7 +8,7 @@
 
 use rustc_hash::FxHashSet;
 
-use super::train::drain_index_scan;
+use super::train::drain_rows;
 use super::*;
 use gnitz_store::schema::key::{probe_key, PkBuf};
 use gnitz_store::schema::IndexKeySpec;
@@ -187,21 +187,18 @@ impl MasterDispatcher {
             return Ok(());
         }
         let schema = self.schema_desc_for(table_id);
-        // The reader holds the table's current schema, so no worker ships a block.
-        let schema_version = self.cat().schema_version_of(table_id);
 
         let lease = self
             .scan(DirectGroup {
                 template: wire::WireMsg {
                     target_id: table_id as u64,
-                    flags: WireFlags { schema_version, ..Default::default() },
                     ..Default::default()
                 },
                 ..DirectGroup::new(SalMessageKind::Scan)
             })
             .await?;
 
-        drain_index_scan(&lease, "scan", &schema, |mb| {
+        drain_rows(&lease, &schema, |mb| {
             let mut filters = self.unique_filters.borrow_mut();
             for (cols, spec) in &missing {
                 if let Some(filter) = filters.get_mut(&(table_id, *cols)) {
